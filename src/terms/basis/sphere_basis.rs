@@ -643,22 +643,41 @@ pub(crate) fn build_spherical_harmonic_basis(
     // L=4, m=2), making REML optimize against an artificially tiny physical
     // penalty. Keep the raw operator with normalization_scale=1 so optimizer
     // lambdas are physical lambdas for this smooth.
+    // Split the diagonal Laplace-Beltrami curvature penalty into two blocks that
+    // carry SEPARATE smoothing parameters (#1246, polar high-latitude quality):
+    //   * Primary  — the low-frequency signal band (degree l <= 2), penalized by
+    //                [l(l+1)]^(m+1). This is the part that carries genuine sphere
+    //                signal (the degree-2 sectoral/zonal truth), so its lambda must
+    //                stay moderate enough to fit it.
+    //   * Tail     — the high-degree modes (l > 2), penalized by [l(l+1)]^(m+2).
+    //                These modes carry no low-degree signal; under a SINGLE shared
+    //                lambda the optimizer had to keep the curvature penalty small
+    //                enough to fit the real degree-2 band, which left the degree>2
+    //                tail under-suppressed. The residual high-degree wiggle then
+    //                concentrated in the sparsely sampled polar latitude bands,
+    //                degrading the polar RMSE relative to the equator (ratio>1.4).
+    // Giving the tail its OWN smoothing parameter lets REML drive it independently:
+    // for a low-degree truth it crushes the noise-only tail (no signal there to
+    // protect) without over-shrinking the degree-2 signal, evening out the
+    // latitude-band error profile. For a genuinely high-degree truth REML keeps the
+    // tail lambda moderate, so signal recovery is preserved.
     let mut penalty = Array2::<f64>::zeros((p, p));
+    let mut tail = Array2::<f64>::zeros((p, p));
     let mut col = 0usize;
     for l in 1..=l_max {
         let laplace = l as f64 * (l as f64 + 1.0);
-        let eig = if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
-            0.0
-        } else if l <= 2 {
-            laplace.powi((spec.penalty_order + 1) as i32)
-        } else {
-            laplace.powi((spec.penalty_order + 2) as i32)
-        };
         for _ in 0..(2 * l + 1) {
-            penalty[[col, col]] = eig;
+            if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
+                // unpenalized low-degree span
+            } else if l <= 2 {
+                penalty[[col, col]] = laplace.powi((spec.penalty_order + 1) as i32);
+            } else {
+                tail[[col, col]] = laplace.powi((spec.penalty_order + 2) as i32);
+            }
             col += 1;
         }
     }
+    let has_tail = l_max > 2;
     // Double-penalty shrinkage lives on the primary penalty's null space.
     // The harmonic basis omits the constant mode, so the unpenalized Wahba
     // low-degree span is exactly the l <= SPHERE_UNPENALIZED_LOW_DEGREE block.
@@ -708,6 +727,7 @@ pub(crate) fn build_spherical_harmonic_basis(
     let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[transform.clone()]);
     let design = gauge.restrict_design(&design);
     let penalty = gauge.restrict_penalty(&penalty);
+    let tail = gauge.restrict_penalty(&tail);
     let ridge = gauge.restrict_penalty(&ridge);
 
     let mut candidates = vec![PenaltyCandidate {
@@ -718,6 +738,19 @@ pub(crate) fn build_spherical_harmonic_basis(
         kronecker_factors: None,
         op: None,
     }];
+    if has_tail {
+        // Independent smoothing parameter for the degree>2 curvature tail. Keep
+        // the raw physical roughness operator (normalization_scale=1) so the
+        // optimizer lambda stays a physical lambda, matching the primary block.
+        candidates.push(PenaltyCandidate {
+            matrix: tail,
+            nullspace_dim_hint: 0,
+            source: PenaltySource::Other("SphereHarmonicHighDegreeTail".to_string()),
+            normalization_scale: 1.0,
+            kronecker_factors: None,
+            op: None,
+        });
+    }
     if spec.double_penalty {
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {

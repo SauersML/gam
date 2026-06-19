@@ -1026,6 +1026,276 @@ mod tests {
         assert_relative_eq!(result.s_transformed[[1, 1]], 0.0, epsilon = 1e-9);
     }
 
+    /// End-to-end CROSS-BACKEND consistency regression for #1344.
+    ///
+    /// The white-box test above proves the sparse-native inner penalty carries
+    /// the shrinkage floor *by construction*. It does NOT demonstrate the
+    /// property #1344 is actually about: that the sparse-native and dense PIRLS
+    /// backends, fed the SAME model, SELECT THE SAME smoothing parameter λ and
+    /// report the SAME EDF.
+    ///
+    /// `penalty_shrinkage_floor` folds a ρ-independent ridge `shrinkage·P_range`
+    /// into the penalized range of `S_λ`, and the reparam engine reports the
+    /// determinant of the *floored* penalty to REML. Before the fix the
+    /// sparse-native backend solved its inner penalized Hessian `H = XᵀWX + S`
+    /// on the bare `S_λ` (no shrinkage) while still reporting the floored
+    /// `log_det` to REML — an internally inconsistent objective that shifts the
+    /// REML optimum, so sparse-native selected a different λ (and EDF) than
+    /// dense for the same model. Because the backend a model lands on is decided
+    /// purely by penalized-Hessian density, two statistically identical models
+    /// could get materially different fits.
+    ///
+    /// This test fits ONE penalized GAM end-to-end through the full REML outer
+    /// loop (`optimize_external_design`) twice. The ONLY difference is the
+    /// storage class of the design matrix:
+    ///
+    ///   * a `faer` `SparseColMat` → routes to the **sparse-native** backend;
+    ///   * the bit-identical numbers as a dense `Array2` → routes to the
+    ///     **dense-transformed** backend.
+    ///
+    /// It first ASSERTS, via the real routing oracle
+    /// `should_use_sparse_native_pirls`, that the sparse design genuinely takes
+    /// `SparseNative` and the dense design genuinely takes `DenseTransformed` —
+    /// so the comparison cannot silently degenerate into dense-vs-dense. Both
+    /// fits use the SAME non-zero `penalty_shrinkage_floor` and a
+    /// second-difference penalty whose 2-D null space ({constant, linear}) gives
+    /// the penalized-range energy that makes the floor fire (the exact condition
+    /// the issue says triggers the bug "on every sparse-native fit whose penalty
+    /// carries penalized range energy").
+    ///
+    /// Then it asserts the REML-selected λ (relative 1e-3 in log space) and
+    /// `edf_total` (absolute 1e-2) agree across backends. The two backends use
+    /// different internal reparameterizations and independent outer optimizers,
+    /// so byte-identity is not expected; but the SELECTED model is a property of
+    /// the (now shared) REML objective, not of the linear-algebra basis, so λ
+    /// and EDF must agree to optimizer tolerance. Disagreement means the two
+    /// backends are optimizing different objectives — exactly the #1344 bug — so
+    /// this test FAILS rather than being weakened.
+    #[test]
+    pub(crate) fn sparse_native_and_dense_select_same_lambda_under_shrinkage_floor() {
+        use crate::smooth::BlockwisePenalty;
+        use crate::solver::estimate::{ExternalOptimOptions, optimize_external_design};
+
+        // --- Fixture: a banded "local-support" (B-spline-like) design so the
+        // penalized Hessian is sparse enough for the sparse copy to take the
+        // sparse-native path, with a 2nd-difference penalty that carries
+        // penalized-range energy so the shrinkage floor fires. p is chosen large
+        // enough that the banded H sits well below SPARSE_NATIVE_MAX_H_DENSITY.
+        let n = 300usize;
+        let p = 60usize;
+
+        // Deterministic LCG normal so the fixture is bit-reproducible.
+        struct Lcg {
+            s: u64,
+        }
+        impl Lcg {
+            fn unit(&mut self) -> f64 {
+                self.s = self
+                    .s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((self.s >> 33) as f64 + 1.0) / ((1u64 << 31) as f64 + 1.0)
+            }
+            fn normal(&mut self) -> f64 {
+                let u1 = self.unit().max(1.0e-300);
+                let u2 = self.unit();
+                (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+            }
+        }
+
+        // Banded tent design: each row has <= 3 consecutive nonzeros.
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            let t = (i as f64) * ((p - 1) as f64) / ((n - 1) as f64);
+            let c = t.floor() as isize;
+            let frac = t - c as f64;
+            let w3 = [
+                0.5 * (1.0 - frac).powi(2),
+                0.5 + frac - frac * frac,
+                0.5 * frac * frac,
+            ];
+            for (k, &wv) in w3.iter().enumerate() {
+                let col = c - 1 + k as isize;
+                if (0..p as isize).contains(&col) {
+                    x[[i, col as usize]] = wv;
+                }
+            }
+        }
+
+        // Second-difference penalty DᵀD (null space {constant, linear}).
+        let m = p - 2;
+        let mut d = Array2::<f64>::zeros((m, p));
+        for r in 0..m {
+            d[[r, r]] = 1.0;
+            d[[r, r + 1]] = -2.0;
+            d[[r, r + 2]] = 1.0;
+        }
+        let penalty = d.t().dot(&d);
+
+        // Smooth truth + moderate noise.
+        let mut beta_true = Array1::<f64>::zeros(p);
+        for j in 0..p {
+            let u = j as f64 / (p - 1) as f64;
+            beta_true[j] = (3.0 * std::f64::consts::PI * u).sin() + 0.5 * u;
+        }
+        let mut rng = Lcg { s: 0xC0FFEE_1344 };
+        let mut y = x.dot(&beta_true);
+        for yi in y.iter_mut() {
+            *yi += 0.15 * rng.normal();
+        }
+        let w = Array1::<f64>::ones(n);
+        let offset = Array1::<f64>::zeros(n);
+
+        // A clearly non-zero shrinkage floor so any backend-specific omission of
+        // the ridge dominates the REML optimum (the default 1e-6 also fires).
+        let shrinkage_floor = 1e-3;
+
+        // --- ROUTING ORACLE: prove the two storage classes take the two
+        // backends BEFORE comparing fits. The penalty fed to the oracle is the
+        // λ-weighted penalty at the seed (λ scale is immaterial to the sparsity
+        // pattern that drives the density gate). ---
+        let x_dense_design: DesignMatrix = x.clone().into();
+        let mut triplets: Vec<Triplet<usize, usize, f64>> = Vec::new();
+        for i in 0..n {
+            for j in 0..p {
+                let v = x[[i, j]];
+                if v != 0.0 {
+                    triplets.push(Triplet::new(i, j, v));
+                }
+            }
+        }
+        let x_sparse_mat = SparseColMat::try_new_from_triplets(n, p, &triplets)
+            .expect("banded sparse design assembles");
+        let x_sparse_design: DesignMatrix = x_sparse_mat.clone().into();
+
+        let mut ws = PirlsWorkspace::new(n, p, 0, 0);
+        let sparse_decision =
+            should_use_sparse_native_pirls(&mut ws, &x_sparse_design, &penalty, None, None);
+        assert_eq!(
+            sparse_decision.path,
+            PirlsLinearSolvePath::SparseNative,
+            "fixture invariant: the sparse design MUST route to sparse-native \
+             (reason={}, density={:?}); otherwise this is a vacuous dense-vs-dense \
+             comparison. Lower p or widen the band if the penalized-Hessian \
+             density crept above the gate.",
+            sparse_decision.reason,
+            sparse_decision.density_h_est
+        );
+        let dense_decision =
+            should_use_sparse_native_pirls(&mut ws, &x_dense_design, &penalty, None, None);
+        assert_eq!(
+            dense_decision.path,
+            PirlsLinearSolvePath::DenseTransformed,
+            "fixture invariant: the dense design MUST route to the dense backend \
+             (reason={})",
+            dense_decision.reason
+        );
+
+        // --- Fit the SAME model through both backends via the full REML loop. ---
+        let opts = |floor: f64| ExternalOptimOptions {
+            family: LikelihoodSpec::new(
+                ResponseFamily::Gaussian,
+                InverseLink::Standard(StandardLink::Identity),
+            ),
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: true,
+            skip_rho_posterior_inference: false,
+            max_iter: 200,
+            // Tight inner tolerance so the REML criterion driving λ selection is
+            // evaluated at the converged β̂ for BOTH backends; loose tolerance
+            // would let backend-specific warm-start residue mask or fake a gap.
+            tol: 1e-11,
+            nullspace_dims: vec![2],
+            linear_constraints: None,
+            firth_bias_reduction: None,
+            penalty_shrinkage_floor: Some(floor),
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+            persist_warm_start_disk: false,
+        };
+
+        let sparse_res = optimize_external_design(
+            y.view(),
+            w.view(),
+            x_sparse_mat,
+            offset.view(),
+            vec![BlockwisePenalty::new(0..p, penalty.clone())],
+            &opts(shrinkage_floor),
+        )
+        .expect("sparse-native external fit must succeed");
+
+        let dense_res = optimize_external_design(
+            y.view(),
+            w.view(),
+            x.clone(),
+            offset.view(),
+            vec![BlockwisePenalty::new(0..p, penalty.clone())],
+            &opts(shrinkage_floor),
+        )
+        .expect("dense external fit must succeed");
+
+        let sparse_edf = sparse_res
+            .inference
+            .as_ref()
+            .map(|i| i.edf_total)
+            .expect("sparse fit reports edf");
+        let dense_edf = dense_res
+            .inference
+            .as_ref()
+            .map(|i| i.edf_total)
+            .expect("dense fit reports edf");
+
+        eprintln!(
+            "[#1344] sparse-native: lambda={:?} edf={:.6} reml={:.6}",
+            sparse_res.lambdas.as_slice().unwrap(),
+            sparse_edf,
+            sparse_res.reml_score
+        );
+        eprintln!(
+            "[#1344] dense:         lambda={:?} edf={:.6} reml={:.6}",
+            dense_res.lambdas.as_slice().unwrap(),
+            dense_edf,
+            dense_res.reml_score
+        );
+
+        assert_eq!(sparse_res.lambdas.len(), dense_res.lambdas.len());
+        assert_eq!(sparse_res.lambdas.len(), 1, "single penalty block ⇒ one λ");
+
+        // The optimum must be a genuine interior point (not a boundary, where the
+        // comparison would be vacuous). exp(±12) are the outer search bounds.
+        let sparse_log = sparse_res.lambdas[0].ln();
+        assert!(
+            sparse_log.is_finite() && sparse_log.abs() < 11.0,
+            "selected λ must be an interior optimum, got log λ = {sparse_log}"
+        );
+
+        // (1) Selected smoothing parameter agrees across backends (log space).
+        let log_sparse = sparse_res.lambdas[0].ln();
+        let log_dense = dense_res.lambdas[0].ln();
+        let rel_log_diff = (log_sparse - log_dense).abs() / (1.0 + log_dense.abs());
+        assert!(
+            rel_log_diff < 1e-3,
+            "cross-backend λ divergence (#1344): sparse-native log λ = {log_sparse:.8}, \
+             dense log λ = {log_dense:.8}, relative log-difference = {rel_log_diff:.3e} \
+             exceeds 1e-3. The backends are selecting different smoothing \
+             parameters for the same model — different REML objectives — which is \
+             exactly the bug #1344 closed."
+        );
+
+        // (2) Reported EDF agrees across backends.
+        let edf_diff = (sparse_edf - dense_edf).abs();
+        assert!(
+            edf_diff < 1e-2,
+            "cross-backend EDF divergence (#1344): sparse-native edf = {sparse_edf:.6}, \
+             dense edf = {dense_edf:.6}, |Δ| = {edf_diff:.3e} exceeds 1e-2"
+        );
+    }
+
     #[test]
     pub(crate) fn sparse_penalized_assembly_matches_dense_diagonal_case() {
         let triplets = vec![

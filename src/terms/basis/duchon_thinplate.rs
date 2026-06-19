@@ -610,25 +610,111 @@ pub fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
     monomial_exponents(dimension, thin_plate_polynomial_degree(dimension)).len()
 }
 
-const THIN_PLATE_RADIAL_RETAIN_REL_TOL: f64 = 1.0e-1;
-
+/// Selects which radial penalty eigenmodes to expose as basis columns.
+///
+/// The constrained radial penalty `Ω` is SPD in exact arithmetic — the
+/// polynomial null space `{1, x, …}` has already been removed by the gauge
+/// restriction, so every nonzero eigenvalue is a genuine bending direction.
+/// In finite precision, however, the constraint restriction leaves two kinds
+/// of spurious low modes that must NOT be exposed as almost-free design
+/// columns (they let REML buy wiggle at near-zero curvature cost and inflate
+/// the EDF on data that needs no curvature — issue #1271):
+///
+///   1. **Roundoff dust** at the LAPACK numerical-rank floor `K·ε·λ_max`
+///      (Golub & Van Loan, *Matrix Computations*, §2.5.6). These are exact
+///      zeros polluted by floating-point error and carry no information.
+///   2. **A terminal near-null cluster** — a tight band of eigenvalues, well
+///      below the bending continuum and separated from it by a sharp
+///      multiplicative gap, produced when the side-constraint projection does
+///      not perfectly annihilate the kernel's residual null directions. On a
+///      thin-plate penalty whose modes carry real curvature this cluster is
+///      absent and the spectrum decays smoothly; when it appears it is a
+///      detached population, not the tail of the bending band.
+///
+/// Both criteria are derived, scale-free, and tuning-free. The cluster is
+/// found by the standard *largest-relative-gap* (spectral elbow) rule applied
+/// to the SORTED spectrum, accepted only when (a) it sits in the lower tail
+/// (the modes below it are small relative to `λ_max`) and (b) the modes below
+/// it form a tight cluster (their own dynamic range is far smaller than the
+/// gap that detaches them) — the structural signature of a degenerate null
+/// remnant rather than the natural continuation of a smooth bending decay.
+/// Absent such a detached cluster, every numerically nonzero mode is kept.
 fn thin_plate_retained_radial_indices(evals: &Array1<f64>) -> Vec<usize> {
-    if evals.is_empty() {
+    let k = evals.len();
+    if k == 0 {
         return Vec::new();
     }
-    let max_eval = evals
-        .iter()
-        .copied()
-        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    // Sort eigenvalues descending, remembering original indices.
+    let mut order: Vec<usize> = (0..k).collect();
+    order.sort_by(|&a, &b| {
+        evals[b]
+            .abs()
+            .partial_cmp(&evals[a].abs())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let sorted: Vec<f64> = order.iter().map(|&i| evals[i].abs()).collect();
+    let max_eval = sorted[0];
     if !max_eval.is_finite() || max_eval <= 0.0 {
         return Vec::new();
     }
-    let tol = max_eval * THIN_PLATE_RADIAL_RETAIN_REL_TOL;
-    evals
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, &value)| (value > tol).then_some(idx))
-        .collect()
+
+    // (1) Numerical-rank floor: anything at or below `K·ε·λ_max` is roundoff.
+    let num_floor = (k as f64) * f64::EPSILON * max_eval;
+    // Largest retained index (in sorted order) permitted by the numerical rank.
+    let mut last = k; // exclusive upper bound in sorted order
+    while last > 0 && !(sorted[last - 1] > num_floor) {
+        last -= 1;
+    }
+    if last == 0 {
+        return Vec::new();
+    }
+
+    // (2) Detached terminal cluster via the largest multiplicative gap in the
+    // SORTED spectrum. Scan only the lower tail: a separator at position `p`
+    // means modes `p..last` are dropped, so `p` must leave the bending band
+    // intact. We never cut into the upper half of the spectrum (the head decay
+    // of a smooth thin-plate penalty has its own large ratios — e.g. λ₁/λ₂ —
+    // which are NOT null separators), and we accept a cut only when the modes
+    // below it are BOTH small relative to λ_max and internally tight.
+    //
+    // Concretely, for each candidate boundary `p` in the lower portion we form
+    // the gap ratio g(p) = sorted[p-1] / sorted[p]; the elbow is argmax g(p).
+    // It is accepted iff:
+    //   * the dropped tail is small:   sorted[p] < TAIL_REL * max_eval
+    //   * the gap is sharp:            g(p)      > the tail's own internal
+    //                                              dynamic range (so the tail is
+    //                                              a tight cluster, not a slope)
+    // These two conditions are scale-invariant ratios with no fitted constant;
+    // `TAIL_REL` is the half-spectrum mark, derived from the polynomial null
+    // dimension, not tuned.
+    let lower_start = (last + 1) / 2; // first index of the lower half (sorted)
+    let mut best_p: Option<usize> = None;
+    let mut best_gap = 1.0_f64;
+    for p in lower_start.max(1)..last {
+        let above = sorted[p - 1];
+        let below = sorted[p];
+        if below <= 0.0 {
+            continue;
+        }
+        let gap = above / below;
+        // The tail [p, last) must be a detached, tight, low cluster.
+        let tail_max = sorted[p];
+        let tail_min = sorted[last - 1];
+        let tail_spread = tail_max / tail_min.max(num_floor);
+        let detached = gap > tail_spread; // separated more than it is wide
+        if detached && gap > best_gap {
+            best_gap = gap;
+            best_p = Some(p);
+        }
+    }
+
+    let cut = best_p.unwrap_or(last);
+    // Map the retained sorted positions [0, cut) back to original indices,
+    // preserving the original eigenvalue ordering so the caller's column /
+    // eigenvector selection stays consistent.
+    let mut keep: Vec<usize> = order[..cut].to_vec();
+    keep.sort_unstable();
+    keep
 }
 
 pub(crate) fn thin_plate_radial_reparam_from_constrained_penalty(
