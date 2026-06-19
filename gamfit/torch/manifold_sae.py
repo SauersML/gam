@@ -870,7 +870,7 @@ class _SparsityLayer(nn.Module):
         best_rule: tuple[int, int, float] | None = None
         for i in range(d):
             xi = xn[:, i]
-            for j in range(i, d):
+            for j in range(i + 1, d):
                 feature = xi * xn[:, j]
                 threshold = feature.median()
                 assign = (feature > threshold).to(torch.long)
@@ -1026,22 +1026,29 @@ class _SparsityLayer(nn.Module):
             # differentiable quantity below; the hard routing is straight-through.
             soft = torch.softmax(balanced_log_resp, dim=-1)
 
-            # Confident global anchors (issue #1282). Direction clustering handles
-            # disjoint ambient subspaces; a quadratic union-of-subspaces split
-            # handles the signed energy-degenerate fixture where raw energies and
-            # line directions are ambiguous. Both are accepted only when balanced
-            # and high-margin, then cached for the run; otherwise the residual-EM
-            # commitment path below owns the routing.
+            # Confident global anchors (issue #1282). The signed quadratic
+            # union-of-subspaces split is tested first for two-atom models
+            # because noisy signed-circle batches can make line clustering look
+            # confident even though the line split is a phase partition, not a
+            # manifold partition. The quadratic search uses only off-diagonal
+            # cross terms, so it cannot fall back to the old raw squared-energy
+            # shortcut. Direction clustering remains the path for disjoint
+            # ambient subspaces where no signed cross-term rule is confident.
+            # Both anchors are accepted only when balanced and high-margin, then
+            # cached for the run; otherwise the residual-EM commitment path below
+            # owns the routing.
             if (
                 self.training
                 and not self._global_anchor_ready
                 and self.n_atoms >= 2
             ):
-                anchor, confident = self._direction_cluster_anchor(
-                    x.detach(), self.n_atoms
-                )
-                if not confident:
+                anchor, confident = (None, False)
+                if self.n_atoms == 2:
                     anchor, confident = self._quadratic_subspace_anchor(x.detach())
+                if not confident:
+                    anchor, confident = self._direction_cluster_anchor(
+                        x.detach(), self.n_atoms
+                    )
                 self._global_anchor = anchor if confident else None
                 self._global_anchor_ready = True
             anchor = self._global_anchor
