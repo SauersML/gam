@@ -190,12 +190,6 @@ pub struct SpectralCoreset {
     pub certificate: CoresetCertificate,
 }
 
-impl SpectralCoreset {
-    pub fn into_indices_weights(self) -> (Vec<usize>, Vec<f64>) {
-        (self.indices, self.weights)
-    }
-}
-
 /// Deterministic Batson-Spielman-Srivastava spectral row coreset.
 ///
 /// Each input item is a small row factor `R_i` with contribution
@@ -204,16 +198,7 @@ impl SpectralCoreset {
 /// algorithm whitens the factors into that effective space, then applies the
 /// standard two-barrier BSS potential update with deterministic row-index
 /// tie-breaking. Per-row dense `H_i` blocks are never materialized.
-pub fn bss_spectral_coreset<'a, I>(
-    rows: I,
-    target_eps: f64,
-) -> Result<(Vec<usize>, Vec<f64>), String>
-where
-    I: IntoIterator<Item = ArrayView2<'a, f64>>,
-{
-    Ok(bss_spectral_coreset_certified(rows, target_eps)?.into_indices_weights())
-}
-
+///
 /// Deterministic BSS spectral row coreset with the attached certificate.
 pub fn bss_spectral_coreset_certified<'a, I>(
     rows: I,

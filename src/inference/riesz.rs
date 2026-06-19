@@ -241,12 +241,6 @@ fn weighted_row_mean(
     Ok(gradient)
 }
 
-pub fn point_evaluation_gradient(
-    design_row: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, EstimationError> {
-    SmoothFunctional::PointEvaluation { design_row }.gradient()
-}
-
 fn validate_input(input: &RieszInput<'_>) -> Result<(), EstimationError> {
     let p = input.beta.len();
     let n = input.row_scores.nrows();

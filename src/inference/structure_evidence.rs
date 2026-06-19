@@ -323,15 +323,6 @@ impl PredictablePluginEProcess {
             log_lik_null_sup_on_batch,
         ))
     }
-
-    pub fn absorb_batch(
-        &mut self,
-        log_lik_alternative_prefit: f64,
-        log_lik_null_sup_on_batch: f64,
-    ) {
-        self.try_absorb_batch(log_lik_alternative_prefit, log_lik_null_sup_on_batch)
-            .expect("PredictablePluginEProcess received invalid log evidence");
-    }
 }
 
 impl Default for PredictablePluginEProcess {
