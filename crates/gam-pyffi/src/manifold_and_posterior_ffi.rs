@@ -4900,14 +4900,15 @@ fn pyffi_duchon_kernel_constraint_nullspace(
     .map_err(|err| format!("failed to build Duchon kernel constraint nullspace: {err}"))
 }
 
-/// Parse the optional ``nullspace_order`` keyword on the primitive Duchon
-/// bindings. ``None`` falls back to the legacy default derived from ``m``
-/// (so existing call sites stay bit-identical). Accepted strings:
+/// Parse the ``nullspace_order`` keyword on the primitive Duchon bindings.
+/// Accepted strings:
 /// ``"zero"`` (constant nullspace), ``"linear"`` (constant + linear),
 /// or ``"degree<k>"`` for k ≥ 2 (polynomials of total degree ≤ k).
-fn parse_nullspace_order(raw: Option<&str>, m: usize) -> PyResult<DuchonNullspaceOrder> {
+fn parse_nullspace_order(raw: Option<&str>) -> PyResult<DuchonNullspaceOrder> {
     let Some(raw) = raw else {
-        return Ok(duchon_nullspace_from_m(m));
+        return Err(py_value_error(
+            "nullspace_order is required; pass 'zero', 'linear', or 'degree<k>'".to_string(),
+        ));
     };
     let trimmed = raw.trim();
     let lower = trimmed.to_ascii_lowercase();
@@ -4967,13 +4968,12 @@ struct DuchonHybridConfig {
 ///   triplet.
 fn resolve_duchon_hybrid_config(
     dim: usize,
-    m: usize,
     length_scale: Option<f64>,
     nullspace_order: Option<&str>,
     explicit_power: Option<f64>,
     max_op: usize,
 ) -> PyResult<DuchonHybridConfig> {
-    let requested_nullspace = parse_nullspace_order(nullspace_order, m)?;
+    let requested_nullspace = parse_nullspace_order(nullspace_order)?;
     let (resolved_nullspace, auto_power) =
         resolve_duchon_orders(dim, requested_nullspace, max_op, length_scale);
     let power = explicit_power.unwrap_or(auto_power as f64);

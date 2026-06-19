@@ -1842,7 +1842,7 @@ fn duchon_basis_with_jet<'py>(
     m = 2,
     periodic_per_axis = None,
     length_scale = None,
-    nullspace_order = None,
+    nullspace_order = "linear",
     power = None,
 ))]
 fn duchon_basis_with_jets<'py>(
@@ -1887,7 +1887,6 @@ fn duchon_basis_with_jets<'py>(
     // differentiate the *same* matrix the forward builds.
     let cfg = resolve_duchon_hybrid_config(
         d,
-        m,
         length_scale,
         nullspace_order,
         power,
@@ -2198,7 +2197,7 @@ fn basis_with_jet<'py>(
     m = 2,
     periodic_per_axis = None,
     length_scale = None,
-    nullspace_order = None,
+    nullspace_order = "linear",
     power = None,
 ))]
 fn duchon_basis<'py>(
@@ -2241,10 +2240,9 @@ fn duchon_basis<'py>(
     // ``max_op = 0`` and construct the spec with all three operator
     // penalties Disabled. This makes documented defaults (e.g. d=2 m=2
     // thin-plate, d=3 m=2 generalized TPS) succeed without forcing the
-    // caller to pass ``power`` / ``nullspace_order`` themselves.
+    // caller to pass ``power`` themselves.
     let cfg = resolve_duchon_hybrid_config(
         d,
-        m,
         length_scale,
         nullspace_order,
         power,
@@ -2380,7 +2378,7 @@ fn duchon_operator_penalties<'py>(
     period = None,
     periodic_per_axis = None,
     length_scale = None,
-    nullspace_order = None,
+    nullspace_order = "linear",
     power = None,
 ))]
 fn duchon_function_norm_penalty<'py>(
@@ -2431,12 +2429,8 @@ fn duchon_function_norm_penalty<'py>(
             )?;
             (cfg.length_scale, cfg.nullspace_order, cfg.power)
         }
-        None if length_scale.is_none() && nullspace_order.is_none() => {
-            let (default_nullspace, default_power) = duchon_cubic_default(d);
-            (None, default_nullspace, default_power)
-        }
         None => {
-            let cfg = resolve_duchon_hybrid_config(d, m, length_scale, nullspace_order, None, 0)?;
+            let cfg = resolve_duchon_hybrid_config(d, length_scale, nullspace_order, None, 0)?;
             (cfg.length_scale, cfg.nullspace_order, cfg.power)
         }
     };
