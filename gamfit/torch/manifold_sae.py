@@ -763,8 +763,35 @@ class _SparsityLayer(nn.Module):
             # avg-one-active-atom top-k contract and the closed-form lane's hard
             # assignment). Gradients always flow through the soft responsibilities
             # (straight-through on the hard part).
-            soft = torch.softmax(-relative_residual / tau, dim=-1)
-            hard = self._topk_mask(-relative_residual)
+            #
+            # A plain residual softmax is not enough on energy-degenerate data
+            # (issue #1282): from the near-symmetric random init both atoms
+            # reconstruct every row equally poorly, so the responsibilities are
+            # ~uniform and there is no force partitioning the rows. One atom then
+            # captures *both* manifolds as a blended union while the other decays
+            # into an equidistant garbage-collector — great reconstruction R²,
+            # chance routing (the exact #1282 failure mode). The closed-form lane
+            # avoids this by reseeding a collapsed atom onto a *distinct* residual
+            # principal component (``reseed_atoms_onto_distinct_residual_pcs``),
+            # i.e. it enforces that the atoms occupy disjoint residual subspaces.
+            #
+            # The gradient-path analogue is a *balanced* E-step: regularize the
+            # per-atom usage toward the uniform marginal (1/F of the rows each) so
+            # neither atom is allowed to own everything. This is the standard
+            # optimal-transport / Sinkhorn cure for mixture-of-experts collapse
+            # and is fully geometry-agnostic — it keys only on reconstruction
+            # residual, never on input coordinate geometry. We solve per-atom
+            # log-bias potentials ``b_k`` so the balanced responsibilities
+            # ``r[n,k] ∝ exp(-(residual[n,k] - tau·b_k)/tau)`` have equal column
+            # marginals, then anneal to the hard top-1 of the *balanced* score as
+            # tau -> tau_min. At the symmetric init the balance term breaks the
+            # degeneracy deterministically (each atom is pushed to claim a
+            # distinct half of the rows); once the atoms specialize the residuals
+            # dominate and the bias is a vanishing correction.
+            log_resp = -relative_residual / tau
+            balanced_log_resp = self._sinkhorn_balance(log_resp)
+            soft = torch.softmax(balanced_log_resp, dim=-1)
+            hard = self._topk_mask(balanced_log_resp)
             hard_ste = hard + soft - soft.detach()
             if self._tau_start > self.tau_min:
                 progress = (self._tau_start - tau) / (self._tau_start - self.tau_min)
@@ -776,6 +803,47 @@ class _SparsityLayer(nn.Module):
             responsibilities = self._topk_mask(-relative_residual)
 
         return code * responsibilities
+
+    @staticmethod
+    def _sinkhorn_balance(
+        log_scores: torch.Tensor, *, iters: int = 12
+    ) -> torch.Tensor:
+        """Add per-atom log-bias potentials so atom usage is balanced.
+
+        ``log_scores[n, k]`` are the unnormalized log-responsibilities of row
+        ``n`` for atom ``k`` (already temperature-scaled). We add a per-column
+        (per-atom) potential ``b_k`` and renormalize each row so the resulting
+        responsibilities ``softmax_k(log_scores + b)`` have equal column sums
+        (each atom claims ``N/F`` of the total assignment mass). This is the
+        Sinkhorn projection of the row-stochastic responsibility matrix onto the
+        doubly-balanced transport polytope with a uniform atom marginal; a few
+        fixed-point sweeps converge it. The potentials are computed under
+        ``no_grad`` and treated as constants in the M-step — they only steer the
+        *assignment*, the reconstruction gradient still flows through the
+        residual-driven ``log_scores``.
+        """
+        n_atoms = log_scores.shape[-1]
+        if n_atoms < 2:
+            return log_scores
+        with torch.no_grad():
+            bias = torch.zeros(
+                n_atoms, dtype=log_scores.dtype, device=log_scores.device
+            )
+            target = torch.log(
+                torch.tensor(
+                    1.0 / float(n_atoms),
+                    dtype=log_scores.dtype,
+                    device=log_scores.device,
+                )
+            )
+            for _ in range(iters):
+                resp = torch.softmax(log_scores + bias, dim=-1)
+                # Mean assignment mass per atom (row-marginal already 1).
+                usage = resp.mean(dim=0).clamp_min(1e-12)
+                # Multiplicative Sinkhorn update toward the uniform marginal.
+                bias = bias + (target - torch.log(usage))
+                bias = bias - bias.mean()
+        return log_scores + bias
 
     def compose_code(self, assignments: torch.Tensor, amp: torch.Tensor) -> torch.Tensor:
         """Per-atom latent code ``z`` from gate ``assignments`` and ``amp``.
