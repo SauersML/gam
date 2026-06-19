@@ -866,32 +866,66 @@ class _SparsityLayer(nn.Module):
 
         best_assign: torch.Tensor | None = None
         best_resid: torch.Tensor | None = None
-        second_resid: torch.Tensor | None = None
         best_rule: tuple[int, int, float] | None = None
+        # Best residual achieved by any *other* (i, j) cross-term feature. The
+        # high-margin uniqueness check compares across distinct features, not
+        # across the two thresholds of the same feature (which are correlated),
+        # so it never rejects the winner just because its own median/sign
+        # candidate is a near-tie.
+        second_resid: float | None = None
         for i in range(d):
             xi = xn[:, i]
             for j in range(i + 1, d):
                 feature = xi * xn[:, j]
-                threshold = feature.median()
-                assign = (feature > threshold).to(torch.long)
-                count1 = int(assign.sum().item())
-                if min(count1, n - count1) < min_count:
+                # Two candidate thresholds per signed cross term:
+                #  * the batch median, which balances the split when the
+                #    feature distribution is symmetric, and
+                #  * exactly zero, the SIGN of the cross product, which is the
+                #    geometrically exact boundary for a sign-coupled
+                #    union-of-subspaces split (e.g. the #1282 energy-degenerate
+                #    fixture: x_1*x_3 = s^2 >= 0 on one circle, -s^2 <= 0 on the
+                #    other). The median of such a feature is NOT zero — s^2 for
+                #    uniform phase is right-skewed, so the pooled median drifts
+                #    off the true boundary and misroutes the small-|sin| rows
+                #    (the seed-dependent collapse the reopen audit caught). The
+                #    sign threshold is invariant to label balance and noise, so
+                #    it is robust across seeds. We evaluate both and keep the
+                #    candidate with the lower subspace residual.
+                median = float(feature.median().item())
+                feature_best: float | None = None
+                feature_best_assign: torch.Tensor | None = None
+                feature_best_threshold = 0.0
+                for threshold in (median, 0.0):
+                    assign = (feature > threshold).to(torch.long)
+                    count1 = int(assign.sum().item())
+                    if min(count1, n - count1) < min_count:
+                        continue
+                    resid = split_residual(assign)
+                    if resid is None:
+                        continue
+                    resid_val = float(resid.item())
+                    if feature_best is None or resid_val < feature_best:
+                        feature_best = resid_val
+                        feature_best_assign = assign
+                        feature_best_threshold = float(threshold)
+                if feature_best is None or feature_best_assign is None:
                     continue
-                resid = split_residual(assign)
-                if resid is None:
-                    continue
-                if best_resid is None or bool(resid < best_resid):
-                    second_resid = best_resid
-                    best_resid = resid
-                    best_assign = assign
-                    best_rule = (i, j, float(threshold.item()))
-                elif second_resid is None or bool(resid < second_resid):
-                    second_resid = resid
+                if best_resid is None or feature_best < best_resid:
+                    # Demote the previous champion to the cross-feature runner-up.
+                    if best_resid is not None and (
+                        second_resid is None or best_resid < second_resid
+                    ):
+                        second_resid = best_resid
+                    best_resid = feature_best
+                    best_assign = feature_best_assign
+                    best_rule = (i, j, feature_best_threshold)
+                elif second_resid is None or feature_best < second_resid:
+                    second_resid = feature_best
 
         if best_assign is None or best_resid is None or second_resid is None:
             return None, False
-        best = float(best_resid.item())
-        second = float(second_resid.item())
+        best = float(best_resid)
+        second = float(second_resid)
         # The accepted split must be both absolutely low-residual on normalized
         # circle-like rows and uniquely better than the next deterministic split.
         confident = best <= 0.05 and second >= max(3.0 * best, best + 0.02)
