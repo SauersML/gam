@@ -205,10 +205,6 @@ path = "examples/sae_perf_harness.rs"
 name = "cyl_family_repro"
 path = "examples/cyl_family_repro.rs"
 
-[[example]]
-name = "surv979_repro"
-path = "examples/surv979_repro.rs"
-
 [profile.release]
 lto = "thin"
 codegen-units = 1

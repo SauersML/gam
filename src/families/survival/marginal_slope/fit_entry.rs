@@ -2,40 +2,6 @@
 
 use super::*;
 
-/// #979 profiling: process-wide accumulators for the survival marginal-slope
-/// inner-solve work, so the dominant cost is visible in a single stderr line
-/// even when no `log` backend is installed (e.g. the quality test harness).
-/// Always-on but O(1) per inner solve — negligible overhead.
-pub(crate) mod surv979_prof {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    pub(crate) static INNER_FIT_CALLS: AtomicU64 = AtomicU64::new(0);
-    pub(crate) static INNER_FIT_CYCLES: AtomicU64 = AtomicU64::new(0);
-    pub(crate) static OUTER_EVAL_CALLS: AtomicU64 = AtomicU64::new(0);
-    pub(crate) static MAX_INNER_CYCLES: AtomicU64 = AtomicU64::new(0);
-    pub(crate) fn reset() {
-        INNER_FIT_CALLS.store(0, Ordering::Relaxed);
-        INNER_FIT_CYCLES.store(0, Ordering::Relaxed);
-        OUTER_EVAL_CALLS.store(0, Ordering::Relaxed);
-        MAX_INNER_CYCLES.store(0, Ordering::Relaxed);
-    }
-    pub(crate) fn note_inner_fit(cycles: usize) {
-        INNER_FIT_CALLS.fetch_add(1, Ordering::Relaxed);
-        INNER_FIT_CYCLES.fetch_add(cycles as u64, Ordering::Relaxed);
-        MAX_INNER_CYCLES.fetch_max(cycles as u64, Ordering::Relaxed);
-    }
-    pub(crate) fn note_outer_eval() {
-        OUTER_EVAL_CALLS.fetch_add(1, Ordering::Relaxed);
-    }
-    pub(crate) fn snapshot() -> (u64, u64, u64, u64) {
-        (
-            INNER_FIT_CALLS.load(Ordering::Relaxed),
-            INNER_FIT_CYCLES.load(Ordering::Relaxed),
-            OUTER_EVAL_CALLS.load(Ordering::Relaxed),
-            MAX_INNER_CYCLES.load(Ordering::Relaxed),
-        )
-    }
-}
-
 pub fn fit_survival_marginal_slope_terms(
     data: ArrayView2<'_, f64>,
     spec: SurvivalMarginalSlopeTermSpec,
@@ -43,7 +9,6 @@ pub fn fit_survival_marginal_slope_terms(
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<SurvivalMarginalSlopeFitResult, String> {
     let fit_started = std::time::Instant::now();
-    surv979_prof::reset();
     let mut spec = spec;
     validate_spec(&spec)?;
     if spec.base_link != InverseLink::Standard(StandardLink::Probit) {
@@ -2095,7 +2060,6 @@ pub fn fit_survival_marginal_slope_terms(
             sigma_hint.replace(sigma);
             let family = make_family(&designs[0], &designs[1], sigma, FlexActivation::On);
             let fit = inner_fit(&family, &blocks, options)?;
-            surv979_prof::note_inner_fit(fit.inner_cycles);
             let mut hints_mut = hints.borrow_mut();
             if let Some(block) = fit.block_states.first() {
                 hints_mut.time_beta = Some(block.beta.clone());
@@ -2118,7 +2082,7 @@ pub fn fit_survival_marginal_slope_terms(
                 }
             }
             log::info!(
-                "[survival-marginal-slope/outer-inner-fit] end elapsed={:.3}s inner_cycles={} pirls_status={:?} #979prof",
+                "[survival-marginal-slope/outer-inner-fit] end elapsed={:.3}s inner_cycles={} pirls_status={:?}",
                 eval_started.elapsed().as_secs_f64(),
                 fit.inner_cycles,
                 fit.pirls_status,
@@ -2185,7 +2149,6 @@ pub fn fit_survival_marginal_slope_terms(
             };
             let eval_id = outer_eval_counter.get();
             outer_eval_counter.set(eval_id.wrapping_add(1));
-            surv979_prof::note_outer_eval();
             let mut outer_options =
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
             outer_options.outer_eval_context = Some(crate::custom_family::OuterEvalContext {
@@ -2261,7 +2224,6 @@ pub fn fit_survival_marginal_slope_terms(
             let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             let eval_id = outer_eval_counter.get();
             outer_eval_counter.set(eval_id.wrapping_add(1));
-            surv979_prof::note_outer_eval();
             let mut outer_options =
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
             outer_options.outer_eval_context = Some(crate::custom_family::OuterEvalContext {
@@ -2291,30 +2253,25 @@ pub fn fit_survival_marginal_slope_terms(
         },
         crate::families::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
     );
-    {
-        // #979 profiling: emit the inner-solve work breakdown on BOTH the
-        // success and the error path (the inner-solve non-convergence abort
-        // returns Err before any outer-solve-end success log), so the dominant
-        // cost / failure stage is always visible in the verify log.
-        let (inner_calls, inner_cycles, outer_evals, max_cycles) = surv979_prof::snapshot();
-        let outcome = match &solved {
-            Ok(s) => format!(
-                "outcome=ok outer_iters={} outer_converged={}",
-                s.fit.outer_iterations, s.fit.outer_converged
-            ),
-            Err(e) => format!("outcome=ERR reason={e}"),
-        };
-        eprintln!(
-            "[#979prof] survival marginal-slope fit n={n} total_elapsed={:.2}s \
-             inner_fit_calls={inner_calls} total_inner_cycles={inner_cycles} \
-             max_inner_cycles={max_cycles} outer_eval_calls={outer_evals} {outcome}",
-            fit_started.elapsed().as_secs_f64(),
-        );
-    }
-    let mut solved = solved?;
+    // Log the outer-solve outcome on BOTH paths: the inner-solve non-convergence
+    // abort (#979/#1040) returns Err before the success log below, so without
+    // this the failure stage would be invisible to a `log` backend.
+    let mut solved = match solved {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!(
+                "[survival-marginal-slope/outer] solve FAILED n={n} elapsed={:.3}s reason={e}",
+                fit_started.elapsed().as_secs_f64(),
+            );
+            return Err(e);
+        }
+    };
     log::info!(
-        "[survival-marginal-slope/outer] solve end elapsed={:.3}s",
+        "[survival-marginal-slope/outer] solve end n={n} elapsed={:.3}s outer_iters={} inner_cycles={} outer_converged={}",
         fit_started.elapsed().as_secs_f64(),
+        solved.fit.outer_iterations,
+        solved.fit.inner_cycles,
+        solved.fit.outer_converged,
     );
     // Never-fail outer escalation (#808), mirroring the bernoulli/custom-family
     // path (`fit_custom_family`, src/families/custom_family.rs): when the outer
