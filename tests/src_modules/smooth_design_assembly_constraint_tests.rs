@@ -5021,29 +5021,22 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         evaluator.current_beta().expect("streamed β̂")
     };
 
-    // #1033 witness-C soundness bar — CONDITIONING-AWARE, not a fixed 1e-10.
+    // #1264 SOUNDNESS BAR: the issue-mandated 1e-6 β̂-rel, NOT a κ-amplified cap.
     //
-    // The fast-path inner solve reads `XᵀWX(ψ)` from the n-free `gram_at(ψ)`, a
-    // CHEBYSHEV INTERPOLANT of the design Gram in ψ — it agrees with a freshly
-    // STREAMED exact Gram (what `beta_streamed` re-realizes) only to the certified
-    // relative tolerance `PSI_GRAM_SPOT_RTOL`, NOT bit-for-bit (a degree-m
-    // polynomial cannot equal a transcendental-kernel Gram to the last ULP, and the
-    // assembly summation order differs). The penalized solve `(QsᵀGQs+S)β=b`
-    // propagates that input perturbation to β̂ with gain ≈ κ(H): `δβ̂/β̂ ≲ κ·δG/G`.
-    // So a per-coordinate β̂ bar tighter than `κ·PSI_GRAM_SPOT_RTOL` is UNACHIEVABLE
-    // by any correct interpolation-based fast path — the same logic that made a
-    // bit-identity Gram oracle unsatisfiable. (An earlier 1e-10 bar rested on the
-    // FALSE premise that both solves read the SAME Gram cache; the streamed
-    // reference re-streams the EXACT Gram, so they differ by the interpolation
-    // error.) See `fast_path_beta_divergence_is_conditioning_amplification_not_leak`
-    // (psi_gram_tensor_adversarial) for the mechanism with explicit arithmetic.
-    //
-    // The bar here MEASURES the realized conditioning κ(G) of the installed Gram
-    // and asserts `β̂rel ≤ SAFETY·κ·PSI_GRAM_SPOT_RTOL` — this is NOT a loosening:
-    // a genuine n-row LEAK would make β̂ diverge by MORE than the certified Gram
-    // error can account for through a κ-conditioned solve, and this upper bound
-    // fires on it. κ is itself asserted finite/bounded so the bar can't be inflated
-    // by a degenerate Hessian.
+    // WHY 1e-6 IS THE RIGHT BAR (and why the prior κ·PSI_GRAM_SPOT_RTOL cap was a
+    // relabel of an unsound skip): the n-free fast path reads `XᵀWX(ψ)` from the
+    // CHEBYSHEV INTERPOLANT `gram_at(ψ)`, which agrees with the streamed EXACT
+    // assembled Gram only to `PSI_GRAM_SPOT_RTOL=1e-10`. On the near-singular
+    // production Duchon Gram (κ(G)≈1e15, MSI-measured) the penalized solve
+    // amplifies that 1e-10 round-off to β̂rel≈1.7e-5 ≫ 1e-6. A bar of
+    // `SAFETY·κ·gram_rel` ADMITS that 1.7e-5 — i.e. it certifies a fast path that
+    // MOVED the κ-optimum, contradicting the issue contract. The honest conclusion
+    // (MSI-verified) is therefore NOT to loosen the bar but to NOT FIRE THE SKIP on
+    // this geometry: `reduced_basis_equal` (`covers_skip`) is restored as the
+    // production precondition, so ψ_C (rotation) takes the exact slow path and ψ_B
+    // takes the fast path only if the witness admits it — and on EITHER path β̂
+    // matches the streamed exact solve to < 1e-6. κ(G)/gram_rel below are reported
+    // for diagnostics (showing how a fired skip WOULD have diverged), not as the bar.
     let gram_condition_number =
         |evaluator: &crate::estimate::ExternalJointHyperEvaluator<'_>| -> f64 {
             // `FaerEigh` is imported at module top (`use crate::faer_ndarray::FaerEigh`).
@@ -5100,21 +5093,20 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             "@ {label}: streamed Gram condition number must be finite and positive; \
              got κ(G)={kappa:.3e}"
         );
-        // β̂ tolerance = κ · (MEASURED Gram input error) — exactly the conditioning
-        // arithmetic, capped by a concrete β̂-relative ceiling so a nearly
-        // singular raw Gram cannot make the witness vacuous. A genuine n-row leak
-        // diverges by MORE than this and the assert below fires.
-        const BETA_REL_CAP: f64 = 1.0e-4;
-        let beta_bar =
-            (SOUNDNESS_SAFETY * kappa * gram_rel.max(f64::MIN_POSITIVE)).min(BETA_REL_CAP);
+        // DIAGNOSTIC ONLY: κ·gram_rel shows how a FIRED skip WOULD have diverged on
+        // this near-singular Duchon Gram. It is NOT the bar — the bar is the issue's
+        // 1e-6 below, met because the restored `covers_skip` precondition routes the
+        // rotating ψ_C to the EXACT slow path (β̂ trivially exact) and fires the fast
+        // path for ψ_B only where the basis is provably unchanged.
+        let kappa_times_round_off = SOUNDNESS_SAFETY * kappa * gram_rel.max(f64::MIN_POSITIVE);
         let r = beta_fast
             .iter()
             .zip(beta_slow.iter())
             .fold(0.0_f64, |a, (f, s)| a.max((f - s).abs() / (1.0 + s.abs())));
         eprintln!(
             "[DIAG1264-FP] {label} ψ={:.4} gram_rel={gram_rel:.3e} κ(G)={kappa:.3e} \
-             β̂rel={r:.3e} bar(min(SAFETY·κ·gram_rel, {BETA_REL_CAP:.0e}))={beta_bar:.3e} \
-             issue-bar=1e-6 β̂fast[0]={:+.6e} β̂slow[0]={:+.6e}",
+             β̂rel={r:.3e} (κ·round-off≈{kappa_times_round_off:.3e}) issue-bar=1e-6 \
+             β̂fast[0]={:+.6e} β̂slow[0]={:+.6e}",
             theta[rho_dim], beta_fast[0], beta_slow[0]
         );
         assert_eq!(beta_fast.len(), beta_slow.len(), "β̂ dim mismatch @ {label}");
@@ -5126,21 +5118,18 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             let babs = (beta_fast[j] - beta_slow[j]).abs();
             let brel = babs / (1.0 + beta_slow[j].abs());
             worst = worst.max(babs);
-            // #1264 ISSUE-MANDATED BAR: the fast-path skip must reproduce β̂ to the
-            // issue's real 1e-6 bar. A skip that moves β̂ beyond 1e-6 has moved the
-            // κ-optimum beyond the issue's contract — even if "explained" by
-            // conditioning amplification — so it is NOT a sound skip on this geometry.
-            // (`beta_bar`/`SOUNDNESS_SAFETY`/`BETA_REL_CAP` retained above only for the
-            // DIAG line so the run reports how the divergence decomposes.)
+            // #1264 ISSUE-MANDATED BAR: β̂ must match the streamed exact solve to 1e-6
+            // on whichever path the restored precondition selects. A divergence past
+            // 1e-6 means the skip fired where it moves the κ-optimum (the unsound
+            // regime the `covers_skip` precondition exists to exclude).
             const ISSUE_BETA_BAR: f64 = 1.0e-6;
-            let _ = beta_bar;
             assert!(
                 brel <= ISSUE_BETA_BAR,
-                "fast-path β̂[{j}] @ {label} diverges from streamed slow path beyond the \
+                "β̂[{j}] @ {label} diverges from the streamed exact solve beyond the \
                  #1264 issue-mandated 1e-6 bar: fast={:+.12e} slow={:+.12e} |Δ|={babs:.3e} \
                  rel={brel:.3e} > 1e-6 (κ(G)={kappa:.3e} gram_rel={gram_rel:.3e}) — the \
-                 n-free fast-path skip MOVED the κ-optimum across the basis rotation the \
-                 `reduced_basis_equal` witness refuses, so the skip is NOT β̂-sound here",
+                 restored `reduced_basis_equal` skip precondition failed to route this ψ \
+                 to the exact path, so an interpolated-Gram κ-amplified κ-optimum shipped",
                 beta_fast[j],
                 beta_slow[j],
             );
