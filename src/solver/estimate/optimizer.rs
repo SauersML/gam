@@ -1090,7 +1090,18 @@ where
             &outer_result.rho,
             RemlInnerCapGuardArm::MixtureSas,
         )?;
-        let final_rho = outer_result.rho.slice(s![..k]).to_owned();
+        let final_rho = {
+            let mut fr = outer_result.rho.slice(s![..k]).to_owned();
+            // DIAGNOSTIC ONLY (#1347): clamp every rho axis to a fixed value to
+            // read off the EDF gam produces at a forced (e.g. mgcv-matching) lambda.
+            if let Ok(v) = std::env::var("DIAG1347_FIXRHO") {
+                if let Ok(val) = v.parse::<f64>() {
+                    fr.fill(val);
+                    eprintln!("[DIAG1347_FIXRHO] forcing all rho axes to {val}");
+                }
+            }
+            fr
+        };
         let final_mix_state = if use_mixture {
             let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
             Some(
