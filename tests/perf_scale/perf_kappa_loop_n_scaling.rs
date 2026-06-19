@@ -391,6 +391,8 @@ fn kappa_outer_loop_is_n_independent() {
     // this counter; the issue accepts n-independence after that initial pass.
     let ns = [1_000usize, 4_000, 16_000, 64_000, 256_000, 320_000];
     let mut kappa_phase = Vec::with_capacity(ns.len());
+    let mut kappa_calls = Vec::with_capacity(ns.len());
+    let mut kappa_resets = Vec::with_capacity(ns.len());
 
     eprintln!(
         "[kappa-n-scaling] {:>9}  {:>10}  {:>12}  {:>12}  {:>9}  {:>9}  {:>6}  {:>6}  {:>6}  {:>9}  {:>9}  {:>9}",
@@ -412,7 +414,10 @@ fn kappa_outer_loop_is_n_independent() {
         let timing = kappa.kappa_timing.unwrap();
         let phase = timing.trial_total_s().max(0.0);
         let callback_avg = kappa.kappa_callback_avg_s().unwrap_or(0.0).max(0.0);
+        let calls = timing.cost_calls + timing.eval_calls + timing.efs_calls;
         kappa_phase.push(phase);
+        kappa_calls.push(calls);
+        kappa_resets.push(timing.slow_path_resets);
         eprintln!(
             "[kappa-n-scaling] {n:>9}  {:>10.4}  {:>12.4}  {:>12.4}  {:>9}  {:>9}  {:>6}  {:>6}  {:>6}  {:>9.4}  {:>9.4}  {:>9.4}",
             kappa.wall_s,
@@ -429,26 +434,57 @@ fn kappa_outer_loop_is_n_independent() {
         );
     }
 
-    let first = kappa_phase.first().copied().unwrap_or(0.0).max(1e-3);
-    let last = kappa_phase.last().copied().unwrap_or(0.0).max(1e-3);
-    let n_ratio = (ns.last().unwrap() / ns.first().unwrap()) as f64; // 256
-    let phase_ratio = last / first;
+    // #1033 acceptance is PER-CALLBACK k-only cost, not summed wall-time. The
+    // architectural invariant the issue states is: "the rho/kappa/psi outer loop
+    // manipulates only k×k objects (O(k³) per trial = microseconds)". A SUMMED
+    // total (count × per-call) can stay bounded while each call is still O(n), or
+    // grow merely because the optimizer took more (cheap) steps — neither tells
+    // us whether a callback touches only k-dim objects. The honest discriminant
+    // is the AVERAGE callback cost: it must stay flat as n grows, since a single
+    // n-free trial costs O(D²k³) regardless of n. So the asserted quantity is the
+    // per-callback average, decomposed below.
+    let callback_avg: Vec<f64> = kappa_phase
+        .iter()
+        .zip(&kappa_calls)
+        .map(|(&total, &calls)| if calls == 0 { 0.0 } else { total / calls as f64 })
+        .collect();
+    let first_cb = callback_avg.first().copied().unwrap_or(0.0).max(1e-6);
+    let last_cb = callback_avg.last().copied().unwrap_or(0.0).max(1e-6);
+    let n_ratio = (ns.last().unwrap() / ns.first().unwrap()) as f64; // 320
+    let cb_ratio = last_cb / first_cb;
+    // Summed total reported for context (the OLD, weaker metric) — not asserted.
+    let first_sum = kappa_phase.first().copied().unwrap_or(0.0).max(1e-3);
+    let last_sum = kappa_phase.last().copied().unwrap_or(0.0).max(1e-3);
     eprintln!(
-        "[kappa-n-scaling] n grew {n_ratio:.0}× ; kappa callback sum grew {phase_ratio:.2}× \
-         (n-independent ⇒ ~1×, n-linear ⇒ ~{n_ratio:.0}×)"
+        "[kappa-n-scaling] n grew {n_ratio:.0}× ; PER-CALLBACK avg grew {cb_ratio:.2}× \
+         (n-independent ⇒ ~1×, n-linear ⇒ ~{n_ratio:.0}×) ; summed-total grew {:.2}× (context only)",
+        last_sum / first_sum
     );
-    // n-independence bar: the structured κ-trial callback sum must NOT scale with
-    // n. A truly n-free outer loop holds the post-setup callback phase ~flat
-    // (ratio ~1, drifting only with fixed k-dimensional trial work and timing
-    // noise); an O(n) regression would track `n_ratio`. Gate at a generous
-    // absolute ceiling well below linear — 8× across a 256× n increase is ~n^0.37,
-    // still decisively sub-linear and safely above shared-node timing jitter, so
-    // this is a real O(n)-regression tripwire rather than a calibrated timing
-    // bound.
+    // SOUNDNESS GATE: the n-free skip must actually fire across the sweep. If the
+    // design-revision skip falls through to the O(n) reset_surface lane, the
+    // slow-path reset count climbs with n. The skip must be armed at the largest
+    // n exactly as it is at the smallest — otherwise the "n-free" claim is empty.
+    let resets_first = kappa_resets.first().copied().unwrap_or(0);
+    let resets_last = kappa_resets.last().copied().unwrap_or(0);
     assert!(
-        phase_ratio <= 8.0,
-        "kappa outer-loop callback sum grew {phase_ratio:.2}× across a {n_ratio:.0}× \
-         increase in n — the #1033 PsiGramTensor sufficient-statistic lane \
-         regressed to an O(n) per-trial pass"
+        resets_last <= resets_first.saturating_add(2),
+        "slow_path_resets climbed from {resets_first} (n={}) to {resets_last} (n={}) — the \
+         #1033 n-free skip is NOT firing at large n; every moved-ψ trial re-enters the \
+         O(n) reset_surface/design-realization lane, so the per-callback cost cannot be \
+         n-independent",
+        ns.first().unwrap(),
+        ns.last().unwrap()
+    );
+    // n-independence bar: the PER-CALLBACK average must NOT scale with n. A truly
+    // n-free outer loop holds each callback at fixed O(D²k³) k-space work, so the
+    // average drifts only with shared-node timing jitter. An O(n) regression
+    // tracks `n_ratio`. Gate at 8× across a 320× n increase (~n^0.36) — decisively
+    // sub-linear, safely above shared-node noise, a real O(n)-regression tripwire.
+    assert!(
+        cb_ratio <= 8.0,
+        "kappa outer-loop PER-CALLBACK average grew {cb_ratio:.2}× across a {n_ratio:.0}× \
+         increase in n — the #1033 PsiGramTensor sufficient-statistic lane is still doing \
+         O(n) work inside each trial callback (the architectural invariant requires each \
+         hyperparameter trial to touch only k×k objects)"
     );
 }

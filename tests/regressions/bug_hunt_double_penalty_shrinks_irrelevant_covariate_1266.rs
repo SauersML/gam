@@ -39,8 +39,8 @@ fn irrelevant_covariate_dataset(seed: u64, n: usize) -> gam::data::EncodedDatase
     let noise = Normal::new(0.0, 0.3).expect("normal");
     let rows: Vec<StringRecord> = (0..n)
         .map(|_| {
-            let x = unit.sample(&mut rng);
-            let z = unit.sample(&mut rng);
+            let x: f64 = unit.sample(&mut rng);
+            let z: f64 = unit.sample(&mut rng);
             let y = (6.0 * x).sin() + noise.sample(&mut rng);
             StringRecord::from(vec![x.to_string(), z.to_string(), y.to_string()])
         })
