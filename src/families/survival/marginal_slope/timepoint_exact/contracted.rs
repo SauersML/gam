@@ -161,6 +161,159 @@ impl SurvivalMarginalSlopeFamily {
         Ok(Array2::<f64>::from_shape_vec((p, p), flat).map_err(|e| e.to_string())?)
     }
 
+    /// Batched third-order contraction along the `primary.total` primary basis
+    /// directions `{e_j}`, sharing the single direction-INDEPENDENT base build
+    /// (intercept solve + cached partition + base timepoint exact) across all
+    /// `j`. Because the third contraction `D_dir H` is exactly linear in `dir`
+    /// (see `cpu_oracle_third_contraction`, where every dir-dependent term is
+    /// first order), the contraction along an arbitrary primary direction `u`
+    /// equals `Σ_j u[j] · basis[j]`. The batched all-axes Jeffreys path uses
+    /// this to assemble all `p` coefficient axes from one per-row base build
+    /// instead of rebuilding the base once per axis (gam#979 / #1040).
+    pub(crate) fn row_flex_primary_third_basis_contractions(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        self.ensure_scalar_flex_exact_score_geometry(
+            "row_flex_primary_third_basis_contractions",
+        )?;
+        let primary = flex_primary_slices(self);
+        let p = primary.total;
+
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let q0 = q_geom.q0;
+        let q1 = q_geom.q1;
+        let qd1 = q_geom.qd1;
+        let g = block_states[2].eta[row];
+        let beta_h = self.flex_score_beta(block_states)?;
+        let beta_w = self.flex_link_beta(block_states)?;
+        let o_infl = self.influence_index_offset(row, block_states)?;
+
+        if survival_derivative_guard_violated(qd1, self.derivative_guard) {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival third basis monotonicity violated at row {row}: qd1={qd1:.3e}"
+                ),
+            }
+            .into());
+        }
+
+        let (a0, d0) = self.solve_row_survival_intercept_with_slot(
+            q0,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Entry)),
+        )?;
+        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+            q1,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Exit)),
+        )?;
+
+        let entry_cached = self.build_cached_partition(&primary, a0, g, beta_h, beta_w)?;
+        let exit_cached = self.build_cached_partition(&primary, a1, g, beta_h, beta_w)?;
+
+        let entry = self.compute_survival_timepoint_exact_from_cached(
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            d0,
+            beta_h,
+            beta_w,
+            o_infl,
+            false,
+            &entry_cached,
+        )?;
+        let exit = self.compute_survival_timepoint_exact_from_cached(
+            row,
+            &primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            d1,
+            beta_h,
+            beta_w,
+            o_infl,
+            true,
+            &exit_cached,
+        )?;
+
+        if !exit.chi.is_finite() || exit.chi <= 0.0 {
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival third basis row {row}: non-positive chi1={:.3e}",
+                    exit.chi,
+                ),
+            }
+            .into());
+        }
+
+        let entry_b = block10_pack_base(&entry);
+        let exit_b = block10_pack_base(&exit);
+
+        let mut basis = Vec::with_capacity(p);
+        for j in 0..p {
+            let mut dir = Array1::<f64>::zeros(p);
+            dir[j] = 1.0;
+            let entry_ext = self.compute_survival_timepoint_directional_exact_from_cached(
+                row,
+                &primary,
+                q0,
+                primary.q0,
+                a0,
+                g,
+                beta_h,
+                beta_w,
+                &entry_cached,
+                &dir,
+                false,
+            )?;
+            let exit_ext = self.compute_survival_timepoint_directional_exact_from_cached(
+                row,
+                &primary,
+                q1,
+                primary.q1,
+                a1,
+                g,
+                beta_h,
+                beta_w,
+                &exit_cached,
+                &dir,
+                true,
+            )?;
+            let entry_d = block10_pack_dir(&entry_ext);
+            let exit_d = block10_pack_dir(&exit_ext);
+            let dir_vec: Vec<f64> = dir.to_vec();
+            let inputs =
+                crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10ThirdInputs {
+                    p,
+                    qd1_index: primary.qd1,
+                    qd1,
+                    w: self.weights[row],
+                    d: self.event[row],
+                    dir: &dir_vec,
+                    entry_base: &entry_b,
+                    exit_base: &exit_b,
+                    entry_ext: &entry_d,
+                    exit_ext: &exit_d,
+                };
+            let flat =
+                crate::families::survival::marginal_slope::gpu::cpu_oracle_third_contraction(
+                    &inputs,
+                )?;
+            basis.push(Array2::<f64>::from_shape_vec((p, p), flat).map_err(|e| e.to_string())?);
+        }
+        Ok(basis)
+    }
+
     /// Fourth-order directional contraction for the flexible survival path.
     ///
     /// The mixed second-directional timepoint transport is carried exactly
@@ -388,6 +541,157 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
         Ok(out)
+    }
+
+    /// Batched fourth-order contraction along `(dir_u, e_j)` for the fixed
+    /// first direction `dir_u` and each primary basis direction `e_j`, sharing
+    /// the direction-independent base build AND the `dir_u`-only extensions
+    /// across all `j`. The fourth contraction `D²H[u,v]` is bilinear, hence
+    /// linear in the second direction `v`, so the contraction along
+    /// `(dir_u, w)` for an arbitrary primary `w` equals `Σ_j w[j] · basis[j]`.
+    /// The batched second-directional all-axes Jeffreys path uses this to
+    /// assemble all `p` coefficient axes from one per-row base build (gam#979).
+    pub(crate) fn row_flex_primary_fourth_basis_contractions(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        dir_u: &Array1<f64>,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        self.ensure_scalar_flex_exact_score_geometry(
+            "row_flex_primary_fourth_basis_contractions",
+        )?;
+        let primary = flex_primary_slices(self);
+        let p = primary.total;
+        if dir_u.len() != p {
+            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
+                reason: format!(
+                    "survival fourth basis: dir_u length {} != {p}",
+                    dir_u.len(),
+                ),
+            }
+            .into());
+        }
+
+        let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+        let q0 = q_geom.q0;
+        let q1 = q_geom.q1;
+        let qd1 = q_geom.qd1;
+        let g = block_states[2].eta[row];
+        let beta_h = self.flex_score_beta(block_states)?;
+        let beta_w = self.flex_link_beta(block_states)?;
+        let o_infl = self.influence_index_offset(row, block_states)?;
+
+        if survival_derivative_guard_violated(qd1, self.derivative_guard) {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival fourth basis monotonicity violated at row {row}: qd1={qd1:.3e}"
+                ),
+            }
+            .into());
+        }
+
+        let (a0, d0) = self.solve_row_survival_intercept_with_slot(
+            q0,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Entry)),
+        )?;
+        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+            q1,
+            g,
+            beta_h,
+            beta_w,
+            Some((row, SurvivalInterceptSlotKind::Exit)),
+        )?;
+
+        let entry_cached = self.build_cached_partition(&primary, a0, g, beta_h, beta_w)?;
+        let exit_cached = self.build_cached_partition(&primary, a1, g, beta_h, beta_w)?;
+
+        let entry_base = self.compute_survival_timepoint_exact_from_cached(
+            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, o_infl, false, &entry_cached,
+        )?;
+        let exit_base = self.compute_survival_timepoint_exact_from_cached(
+            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, o_infl, true, &exit_cached,
+        )?;
+
+        if !exit_base.chi.is_finite() || exit_base.chi <= 0.0 {
+            return Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "survival fourth basis row {row}: non-positive chi1={:.3e}",
+                    exit_base.chi,
+                ),
+            }
+            .into());
+        }
+
+        // dir_u-only extensions: shared across every second-direction basis e_j.
+        let entry_ext_u = self.compute_survival_timepoint_directional_exact_from_cached(
+            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, &entry_cached, dir_u, false,
+        )?;
+        let exit_ext_u = self.compute_survival_timepoint_directional_exact_from_cached(
+            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, &exit_cached, dir_u, true,
+        )?;
+
+        let entry_b = block10_pack_base(&entry_base);
+        let exit_b = block10_pack_base(&exit_base);
+        let entry_d1 = block10_pack_dir(&entry_ext_u);
+        let exit_d1 = block10_pack_dir(&exit_ext_u);
+        let dir_u_vec: Vec<f64> = dir_u.to_vec();
+
+        let mut basis = Vec::with_capacity(p);
+        for j in 0..p {
+            let mut dir_v = Array1::<f64>::zeros(p);
+            dir_v[j] = 1.0;
+            let entry_ext_v = self.compute_survival_timepoint_directional_exact_from_cached(
+                row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, &entry_cached, &dir_v, false,
+            )?;
+            let exit_ext_v = self.compute_survival_timepoint_directional_exact_from_cached(
+                row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, &exit_cached, &dir_v, true,
+            )?;
+            let entry_bi = self.compute_survival_timepoint_bidirectional_exact_from_cached(
+                row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, &entry_cached, dir_u, &dir_v,
+            )?;
+            let exit_bi = self.compute_survival_timepoint_bidirectional_exact_from_cached(
+                row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, &exit_cached, dir_u, &dir_v,
+            )?;
+            let entry_d2 = block10_pack_dir(&entry_ext_v);
+            let exit_d2 = block10_pack_dir(&exit_ext_v);
+            let entry_bi_p = block10_pack_bi(&entry_bi);
+            let exit_bi_p = block10_pack_bi(&exit_bi);
+            let dir_v_vec: Vec<f64> = dir_v.to_vec();
+            let inputs =
+                crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10FourthInputs {
+                    p,
+                    qd1_index: primary.qd1,
+                    qd1,
+                    w: self.weights[row],
+                    d: self.event[row],
+                    dir_u: &dir_u_vec,
+                    dir_v: &dir_v_vec,
+                    entry_base: &entry_b,
+                    exit_base: &exit_b,
+                    entry_ext_u: &entry_d1,
+                    entry_ext_v: &entry_d2,
+                    exit_ext_u: &exit_d1,
+                    exit_ext_v: &exit_d2,
+                    entry_bi: &entry_bi_p,
+                    exit_bi: &exit_bi_p,
+                };
+            let flat =
+                crate::families::survival::marginal_slope::gpu::cpu_oracle_fourth_contraction(
+                    &inputs,
+                )
+                .map_err(|e| format!("block10 fourth basis contraction: {e}"))?;
+            let mut out = Array2::<f64>::zeros((p, p));
+            for u in 0..p {
+                for v in 0..p {
+                    out[[u, v]] = flat[u * p + v];
+                }
+            }
+            basis.push(out);
+        }
+        Ok(basis)
     }
 
     pub(crate) fn row_primary_third_contracted_general(

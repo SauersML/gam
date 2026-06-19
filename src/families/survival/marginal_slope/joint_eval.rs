@@ -1434,6 +1434,68 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Exact first directional derivative for flex without timewiggle.
     /// J is constant (no wiggle), so DH[d] = J^T T[u^d] J + Σ (Hu^d)_r K_r.
+    /// Scatter one row's directional-derivative primary quantities
+    /// (`primary_gradient` = directional change of the primary gradient, i.e.
+    /// `H_primary · u`; `primary_hessian` = directional change of the primary
+    /// Hessian) through the q-geometry / identity-block pullback into the joint
+    /// `acc`. This is the per-row inner body shared by both the
+    /// first-directional (`t_ud`, `h_ud`) and second-directional (`q_de`,
+    /// `gamma`) flex-no-wiggle paths, and by the batched all-axes Jeffreys
+    /// override — so the three callers cannot drift.
+    pub(crate) fn accumulate_directional_joint_hessian_row(
+        &self,
+        row: usize,
+        slices: &BlockSlices,
+        q_geom: &SurvivalMarginalSlopeDynamicRow,
+        identity_blocks: &[(std::ops::Range<usize>, std::ops::Range<usize>)],
+        primary_gradient: ndarray::ArrayView1<'_, f64>,
+        primary_hessian: ndarray::ArrayView2<'_, f64>,
+        acc: &mut Array2<f64>,
+    ) -> Result<(), String> {
+        // Core q-geometry pullback (Hessian only)
+        self.accumulate_dynamic_q_core_hessian(
+            row,
+            slices,
+            q_geom,
+            primary_gradient,
+            primary_hessian,
+            acc,
+        )?;
+        // Identity block Hessian: cross + diagonal + cross-cross
+        for (primary_range, joint_range) in identity_blocks {
+            for local in 0..primary_range.len() {
+                self.accumulate_identity_primary_cross_hessian(
+                    row,
+                    slices,
+                    q_geom,
+                    primary_hessian.slice(s![0..N_PRIMARY, primary_range.start + local]),
+                    joint_range,
+                    local,
+                    acc,
+                )?;
+            }
+            self.add_dense_submatrix(
+                acc,
+                joint_range,
+                joint_range,
+                primary_hessian.slice(s![primary_range.clone(), primary_range.clone()]),
+            );
+        }
+        for li in 0..identity_blocks.len() {
+            for ri in li + 1..identity_blocks.len() {
+                let (lp, lj) = &identity_blocks[li];
+                let (rp, rj) = &identity_blocks[ri];
+                self.add_dense_symmetric_cross_submatrix(
+                    acc,
+                    lj,
+                    rj,
+                    primary_hessian.slice(s![lp.clone(), rp.clone()]),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn exact_newton_joint_hessian_directional_derivative_flex_no_wiggle(
         &self,
         block_states: &[ParameterBlockState],
@@ -1467,47 +1529,15 @@ impl SurvivalMarginalSlopeFamily {
                     let t_ud =
                         self.row_flex_primary_third_contracted_exact(row, block_states, &u_d)?;
                     let h_ud = h_pi.dot(&u_d);
-                    // Core q-geometry pullback (Hessian only)
-                    self.accumulate_dynamic_q_core_hessian(
+                    self.accumulate_directional_joint_hessian_row(
                         row,
                         &slices,
                         &q_geom,
+                        &identity_blocks,
                         h_ud.view(),
                         t_ud.view(),
                         &mut acc,
                     )?;
-                    // Identity block Hessian: cross + diagonal + cross-cross
-                    for (primary_range, joint_range) in &identity_blocks {
-                        for local in 0..primary_range.len() {
-                            self.accumulate_identity_primary_cross_hessian(
-                                row,
-                                &slices,
-                                &q_geom,
-                                t_ud.slice(s![0..N_PRIMARY, primary_range.start + local]),
-                                joint_range,
-                                local,
-                                &mut acc,
-                            )?;
-                        }
-                        self.add_dense_submatrix(
-                            &mut acc,
-                            joint_range,
-                            joint_range,
-                            t_ud.slice(s![primary_range.clone(), primary_range.clone()]),
-                        );
-                    }
-                    for li in 0..identity_blocks.len() {
-                        for ri in li + 1..identity_blocks.len() {
-                            let (lp, lj) = &identity_blocks[li];
-                            let (rp, rj) = &identity_blocks[ri];
-                            self.add_dense_symmetric_cross_submatrix(
-                                &mut acc,
-                                lj,
-                                rj,
-                                t_ud.slice(s![lp.clone(), rp.clone()]),
-                            );
-                        }
-                    }
                     Ok(acc)
                 },
             )
@@ -1559,45 +1589,15 @@ impl SurvivalMarginalSlopeFamily {
                         self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
                     let gamma = t_d.dot(&ue);
                     // Hessian-only: accumulate q-core + identity block Hessian
-                    self.accumulate_dynamic_q_core_hessian(
+                    self.accumulate_directional_joint_hessian_row(
                         row,
                         &slices,
                         &q_geom,
+                        &identity_blocks,
                         gamma.view(),
                         q_de.view(),
                         &mut acc,
                     )?;
-                    for (primary_range, joint_range) in &identity_blocks {
-                        for local in 0..primary_range.len() {
-                            self.accumulate_identity_primary_cross_hessian(
-                                row,
-                                &slices,
-                                &q_geom,
-                                q_de.slice(s![0..N_PRIMARY, primary_range.start + local]),
-                                joint_range,
-                                local,
-                                &mut acc,
-                            )?;
-                        }
-                        self.add_dense_submatrix(
-                            &mut acc,
-                            joint_range,
-                            joint_range,
-                            q_de.slice(s![primary_range.clone(), primary_range.clone()]),
-                        );
-                    }
-                    for li in 0..identity_blocks.len() {
-                        for ri in li + 1..identity_blocks.len() {
-                            let (lp, lj) = &identity_blocks[li];
-                            let (rp, rj) = &identity_blocks[ri];
-                            self.add_dense_symmetric_cross_submatrix(
-                                &mut acc,
-                                lj,
-                                rj,
-                                q_de.slice(s![lp.clone(), rp.clone()]),
-                            );
-                        }
-                    }
                     Ok(acc)
                 },
             )
@@ -1608,6 +1608,147 @@ impl SurvivalMarginalSlopeFamily {
                     Ok(a)
                 },
             )?;
+        Ok(result)
+    }
+
+    /// Batched all-canonical-axis first directional Hessian derivatives for the
+    /// flex-no-wiggle path. Returns one joint `p_total × p_total` matrix per
+    /// coefficient axis `a`, each equal to
+    /// `exact_newton_joint_hessian_directional_derivative(e_a)` — but built in a
+    /// single pass over rows that pays the expensive direction-independent base
+    /// build (intercept solve + cached partition + base timepoint exact) ONCE
+    /// per row instead of once per (row, axis). Exactness follows from the
+    /// linearity of the third contraction in its direction (gam#979 / #1040).
+    pub(crate) fn jeffreys_first_directional_all_axes_flex_no_wiggle(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let slices = block_slices(self, block_states);
+        let primary = flex_primary_slices(self);
+        let p_total = slices.total;
+        let p_prim = primary.total;
+        let identity_blocks = flex_identity_block_pairs(&primary, &slices);
+        let zero_init = || vec![Array2::<f64>::zeros((p_total, p_total)); p_total];
+        let result = (0..self.n)
+            .into_par_iter()
+            .try_fold(zero_init, |mut accs, row| -> Result<Vec<Array2<f64>>, String> {
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                let h_pi = self
+                    .compute_row_flex_primary_gradient_hessian_exact(
+                        row,
+                        block_states,
+                        &q_geom,
+                        &primary,
+                    )?
+                    .2;
+                let basis = self.row_flex_primary_third_basis_contractions(row, block_states)?;
+                for a in 0..p_total {
+                    let mut e_a = Array1::<f64>::zeros(p_total);
+                    e_a[a] = 1.0;
+                    let u_a = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                        row,
+                        block_states,
+                        &slices,
+                        &q_geom,
+                        &e_a,
+                    )?;
+                    let mut t_ua = Array2::<f64>::zeros((p_prim, p_prim));
+                    for j in 0..p_prim {
+                        let c = u_a[j];
+                        if c != 0.0 {
+                            t_ua.scaled_add(c, &basis[j]);
+                        }
+                    }
+                    let h_ua = h_pi.dot(&u_a);
+                    self.accumulate_directional_joint_hessian_row(
+                        row,
+                        &slices,
+                        &q_geom,
+                        &identity_blocks,
+                        h_ua.view(),
+                        t_ua.view(),
+                        &mut accs[a],
+                    )?;
+                }
+                Ok(accs)
+            })
+            .try_reduce(zero_init, |mut a, b| -> Result<_, String> {
+                for (dst, src) in a.iter_mut().zip(b.iter()) {
+                    *dst += src;
+                }
+                Ok(a)
+            })?;
+        Ok(result)
+    }
+
+    /// Batched all-canonical-axis second directional Hessian derivatives for the
+    /// flex-no-wiggle path, with the first direction `d_beta_u` fixed. Returns
+    /// one joint matrix per coefficient axis `a`, each equal to
+    /// `exact_newton_joint_hessiansecond_directional_derivative(d_beta_u, e_a)` —
+    /// built in a single pass over rows that pays the base build and the
+    /// `d_beta_u`-only extension ONCE per row. Exactness follows from the
+    /// bilinearity of the fourth contraction (linear in the second direction).
+    pub(crate) fn jeffreys_second_directional_all_axes_flex_no_wiggle(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_beta_u: &Array1<f64>,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let slices = block_slices(self, block_states);
+        let primary = flex_primary_slices(self);
+        let p_total = slices.total;
+        let p_prim = primary.total;
+        let identity_blocks = flex_identity_block_pairs(&primary, &slices);
+        let zero_init = || vec![Array2::<f64>::zeros((p_total, p_total)); p_total];
+        let result = (0..self.n)
+            .into_par_iter()
+            .try_fold(zero_init, |mut accs, row| -> Result<Vec<Array2<f64>>, String> {
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                let ud = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                    row,
+                    block_states,
+                    &slices,
+                    &q_geom,
+                    d_beta_u,
+                )?;
+                let t_d = self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
+                let basis =
+                    self.row_flex_primary_fourth_basis_contractions(row, block_states, &ud)?;
+                for a in 0..p_total {
+                    let mut e_a = Array1::<f64>::zeros(p_total);
+                    e_a[a] = 1.0;
+                    let u_a = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                        row,
+                        block_states,
+                        &slices,
+                        &q_geom,
+                        &e_a,
+                    )?;
+                    let mut q_de = Array2::<f64>::zeros((p_prim, p_prim));
+                    for j in 0..p_prim {
+                        let c = u_a[j];
+                        if c != 0.0 {
+                            q_de.scaled_add(c, &basis[j]);
+                        }
+                    }
+                    let gamma = t_d.dot(&u_a);
+                    self.accumulate_directional_joint_hessian_row(
+                        row,
+                        &slices,
+                        &q_geom,
+                        &identity_blocks,
+                        gamma.view(),
+                        q_de.view(),
+                        &mut accs[a],
+                    )?;
+                }
+                Ok(accs)
+            })
+            .try_reduce(zero_init, |mut a, b| -> Result<_, String> {
+                for (dst, src) in a.iter_mut().zip(b.iter()) {
+                    *dst += src;
+                }
+                Ok(a)
+            })?;
         Ok(result)
     }
 

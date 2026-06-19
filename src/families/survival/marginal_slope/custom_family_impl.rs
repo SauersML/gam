@@ -431,6 +431,22 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             return Ok(None);
         }
 
+        // Batched path (gam#979 / #1040): the flex-no-wiggle directional Hessian
+        // derivative is linear in the direction, so all `p` canonical-axis
+        // derivatives share one per-row direction-INDEPENDENT base build
+        // (intercept solve + cached partition + base timepoint exact). The
+        // per-axis fan-out below rebuilt that O(n) base `p` times per cycle —
+        // the dominant survival-MS REML cost. Build it once per row and close
+        // every axis by linear combination over the primary basis.
+        if !self.per_z_logslope_active()
+            && self.effective_flex_active(block_states)?
+            && !self.flex_timewiggle_active()
+        {
+            return Ok(Some(
+                self.jeffreys_first_directional_all_axes_flex_no_wiggle(block_states)?,
+            ));
+        }
+
         let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
@@ -464,6 +480,23 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             && !self.joint_hessian_is_structurally_coupled(block_states)?
         {
             return Ok(None);
+        }
+
+        // Batched path (gam#979 / #1040): the flex-no-wiggle SECOND directional
+        // Hessian derivative is bilinear, hence linear in the per-axis second
+        // direction, so all `p` canonical-axis derivatives share one per-row
+        // base build plus the single `d_beta_u`-only extension. The per-axis
+        // fan-out below rebuilt that O(n) base `p` times per perturbation.
+        if !self.per_z_logslope_active()
+            && self.effective_flex_active(block_states)?
+            && !self.flex_timewiggle_active()
+        {
+            return Ok(Some(
+                self.jeffreys_second_directional_all_axes_flex_no_wiggle(
+                    block_states,
+                    d_beta_u_flat,
+                )?,
+            ));
         }
 
         let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
