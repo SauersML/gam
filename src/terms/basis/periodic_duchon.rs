@@ -1011,14 +1011,6 @@ pub fn duchon_cubic_default(dim: usize) -> (DuchonNullspaceOrder, f64) {
 /// coefficient-space penalty scales by `α²`. The null-space ridge penalizes the
 /// affine trend's slope (mean-free: the constant is absorbed by the model
 /// intercept) so the trend is not left fully unpenalized.
-/// #1271 DECISIVE PROBE (TEMPORARY — revert to `false` before merge). When
-/// `true`, the Duchon native penalty factory suppresses the
-/// `DoublePenaltyNullspace` trend ridge so the polynomial null space {1,x} is
-/// genuinely unpenalized (mgcv-style clean 2-dim tp null space). Used only to
-/// measure how much of the #1271 tp linear over-fit is the trend ridge vs the
-/// Primary RKHS curvature penalty. Compile-time const, NOT an env/runtime toggle.
-const DIAG_1271_DISABLE_TREND_RIDGE: bool = true;
-
 pub(crate) fn duchon_native_penalty_candidates(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
@@ -1116,21 +1108,12 @@ pub(crate) fn duchon_native_penalty_candidates(
         0,
         PenaltySource::Primary,
     ));
-    // #1271 DECISIVE PROBE (TEMPORARY — revert before merge): suppress the
-    // DoublePenaltyNullspace trend ridge so the polynomial null space {1,x} is
-    // genuinely unpenalized (matching mgcv's clean 2-dim tp null space). This
-    // lets REML smooth the radial block to ∞ for free; the prediction is
-    // edf_total -> ~2.0 and penalty_rank=18 nullspace_dim=2. Gated on an
-    // env-free compile-time const so production behavior is untouched unless
-    // this probe const is flipped on for the diagnostic build.
-    if !DIAG_1271_DISABLE_TREND_RIDGE {
-        if let Some(shrink) = shrink {
-            out.push(normalize_penalty_candidate(
-                shrink,
-                0,
-                PenaltySource::DoublePenaltyNullspace,
-            ));
-        }
+    if let Some(shrink) = shrink {
+        out.push(normalize_penalty_candidate(
+            shrink,
+            0,
+            PenaltySource::DoublePenaltyNullspace,
+        ));
     }
     Ok(out)
 }
