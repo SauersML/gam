@@ -1174,6 +1174,54 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
 
     let constrained_kernel_cols = kernel_constrained.ncols();
 
+    // [#1347 DIAG — log-only, revert before landing] Compare the current
+    // knot-Gram penalty spectrum Λ(Ω_c) against the generalized-eigenproblem
+    // spectrum μ of Ω_c v = μ G_c v, where G_c = (K·Z)ᵀ(K·Z) is the realized
+    // DATA-design Gram. μ = bending-energy per unit data-variance = mgcv's
+    // effective penalty. If μ has a cliff (clean gap) while Λ smears, the fix
+    // is the generalized reparam.
+    if std::env::var("DIAG1347_GENEIG").is_ok() && constrained_kernel_cols > 1 {
+        let g_c = symmetrize_penalty(&fast_atb(&kernel_constrained, &kernel_constrained));
+        // Whiten by G_c: solve via its Cholesky-like eigen-whitening.
+        if let Ok((g_evals, g_evecs)) = FaerEigh::eigh(&g_c, Side::Lower) {
+            let gmax = g_evals.iter().cloned().fold(0.0_f64, f64::max);
+            let floor = gmax * 1e-12;
+            // W = G_c^{-1/2} via eigendecomposition (drop near-null G directions).
+            let mut w = Array2::<f64>::zeros((constrained_kernel_cols, constrained_kernel_cols));
+            for j in 0..constrained_kernel_cols {
+                let gj = g_evals[j];
+                if gj > floor {
+                    let inv_sqrt = 1.0 / gj.sqrt();
+                    for i in 0..constrained_kernel_cols {
+                        w[[i, j]] = g_evecs[[i, j]] * inv_sqrt;
+                    }
+                }
+            }
+            // M = Wᵀ Ω_c W ; eig(M) = μ.
+            let wt_omega = fast_atb(&w, &omega_constrained);
+            let m = symmetrize_penalty(&fast_ab(&wt_omega, &w));
+            if let Ok((mu, _)) = FaerEigh::eigh(&m, Side::Lower) {
+                let mut mu_desc: Vec<f64> = mu.iter().cloned().map(|v| v.max(0.0)).collect();
+                mu_desc.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let mumax = mu_desc.first().cloned().unwrap_or(1.0).max(1e-300);
+                let mu_norm: Vec<String> =
+                    mu_desc.iter().map(|v| format!("{:.4e}", v / mumax)).collect();
+                let mut lam_desc: Vec<f64> = {
+                    let (mut e, _) = FaerEigh::eigh(&omega_constrained, Side::Lower)
+                        .unwrap_or((Array1::zeros(0), Array2::zeros((0, 0))));
+                    e.iter_mut().for_each(|v| *v = v.max(0.0));
+                    e.to_vec()
+                };
+                lam_desc.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let lmax = lam_desc.first().cloned().unwrap_or(1.0).max(1e-300);
+                let lam_norm: Vec<String> =
+                    lam_desc.iter().map(|v| format!("{:.4e}", v / lmax)).collect();
+                eprintln!("[#1347 DIAG] Λ(Ω_c) normalized desc = {lam_norm:?}");
+                eprintln!("[#1347 DIAG] μ(gen-eig Ω_c v=μ G_c v) normalized desc = {mu_norm:?}");
+            }
+        }
+    }
+
     // Radial penalty eigenspace reparameterization. Eigendecompose
     // Ω_constrained = V Λ V' and rotate the radial design columns into the
     // same basis. This preserves the TPS model space while making the bending
