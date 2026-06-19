@@ -67,24 +67,22 @@ pub const PSI_GRAM_CERT_RTOL: f64 = 1.0e-9;
 /// Relative agreement required at the off-node Gram spot checks.
 pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
 
-/// Relative agreement required of the analytic ψ-DERIVATIVE `dgram_dpsi`
-/// against a high-order (Richardson-validated) finite difference of the exactly
-/// rebuilt Gram, used to certify the full gradient window.
+/// DEPRECATED / NOT LOAD-BEARING (kept only to avoid breaking external
+/// references). It was the relative bar of a Richardson-FD analytic-derivative
+/// pre-filter that briefly gated the gradient sub-window (#1216, commit
+/// 6d72d7597 relaxed it 1e-9→1e-6). That FD-oracle path was SUPERSEDED: the
+/// gradient window is now set to the full value window whenever the value-lane
+/// off-node `spot_check` (the assembled Gram vs an exact off-node rebuild,
+/// [`PSI_GRAM_SPOT_RTOL`] = 1e-10) passes — a TIGHTER, n-free certificate that
+/// does not depend on any finite-difference reference. So no 1e-6 gradient bar
+/// is live: the analytic `∂G/∂ψ` shares the certified value representation and
+/// the gradient lane rides the value certificate. See `build`/`spot_check`.
 ///
-/// #1216: on the WIDE STANDARDIZED geometry default 1-D fits use (#1215) the
-/// value-lane Chebyshev tail plateaus at the realized design's precision floor
-/// (~2.3e-11 of column scale at m=65; see [`PSI_GRAM_CERT_RTOL`]). The analytic
-/// ψ-derivative shares that representation, and the derivative reconstruction
-/// weights the tail coefficients by `T_d′ ∼ d`, so the analytic `∂G/∂ψ` is
-/// realizable only to ~`2e-8` relative on this geometry — NOT 1e-11. An over-
-/// tight 1e-11 sub-window certificate is therefore unreachable (the gradient
-/// lane stayed disabled, falling back to the exact slab and never exercising the
-/// n-free ψ-derivative path the gates require). This rtol is set to the
-/// achievable gradient precision (~`2e-8`) with margin, while staying well
-/// inside BOTH the downstream outer-gradient bar (~1e-7) and the gates'
-/// cross-lane 1e-5 bar — so the certified gradient is bit-tight for every
-/// consumer. The authoritative accuracy gate remains the end-to-end gradient
-/// comparison (gates) and the off-node value spot check, not this pre-filter.
+/// (Historical #1216 note: on the wide standardized geometry default 1-D fits
+/// use, the value-lane Chebyshev tail plateaus at ~2.3e-11 and the `T_d′∼d`-
+/// weighted derivative reconstruction at ~2e-8, so the original 1e-9 FD self-
+/// convergence guard was unreachable — that FD scheme was retired rather than
+/// loosened-to-pass.)
 pub const PSI_GRAM_GRAD_SPOT_RTOL: f64 = 1.0e-6;
 
 /// Node-count escalation ladder for the expansion build (degree = nodes − 1).
