@@ -729,12 +729,27 @@ impl<'a> RemlState<'a> {
             }
         };
 
-        let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
-            self.y,
-            &pirls_result.finalmu,
-            &pirls_result.likelihood,
-            self.weights,
-        );
+        // For the Gaussian family the omitting-constants log-likelihood is
+        // exactly `-0.5 * deviance` for any phi (deviance = Σ w·(y-μ)²/phi,
+        // log-lik = Σ -0.5·w·(y-μ)²/phi). PIRLS already carries the k-space
+        // `deviance` on `pirls_result`, computed from the sufficient statistics
+        // on the #1033 ψ-tensor fast path where `finalmu` is a STALE reference
+        // surface (`= offset`). Recomputing the log-likelihood from `finalmu`
+        // here would (a) cost an O(n) row reduction every outer trial and
+        // (b) read the stale rows, yielding a β̂/ψ-independent wrong value.
+        // Reuse the cached deviance to stay n-free AND correct; this is
+        // bit-identical to the recompute whenever the rows are live. Non-
+        // Gaussian families never arm the n-free cache, so they recompute.
+        let log_likelihood = if is_gaussian_identity {
+            -0.5 * pirls_result.deviance
+        } else {
+            crate::pirls::calculate_loglikelihood_omitting_constants(
+                self.y,
+                &pirls_result.finalmu,
+                &pirls_result.likelihood,
+                self.weights,
+            )
+        };
 
         // Construct barrier config for monotonicity constraints when no
         // active-set projection is in effect (barrier indices are in the
@@ -847,12 +862,23 @@ impl<'a> RemlState<'a> {
             )
         };
 
-        let log_likelihood = crate::pirls::calculate_loglikelihood_omitting_constants(
-            self.y,
-            &pirls_result.finalmu,
-            &pirls_result.likelihood,
-            self.weights,
-        );
+        // Gaussian: omitting-constants log-likelihood ≡ -0.5·deviance for any
+        // phi. PIRLS carries the k-space `deviance` on the result; on the #1033
+        // ψ-tensor fast path `finalmu` is a STALE reference surface (= offset),
+        // so recomputing from it would be an O(n) row reduction AND a wrong,
+        // β̂/ψ-independent value. Reuse the cached deviance: n-free + correct,
+        // bit-identical to the recompute when the rows are live. Non-Gaussian
+        // families never arm the n-free cache, so they keep the row recompute.
+        let log_likelihood = if is_gaussian_identity {
+            -0.5 * pirls_result.deviance
+        } else {
+            crate::pirls::calculate_loglikelihood_omitting_constants(
+                self.y,
+                &pirls_result.finalmu,
+                &pirls_result.likelihood,
+                self.weights,
+            )
+        };
 
         // Construct barrier config for monotonicity constraints.
         // The sparse path operates in the original (non-reparameterized)
@@ -1570,8 +1596,13 @@ impl<'a> RemlState<'a> {
                 .map(|r| format!("{:.3e}", r.exp()))
                 .collect::<Vec<_>>()
                 .join(",");
+            let rss = pirls_result.deviance;
+            let pen = pirls_result.stable_penalty_term;
+            let dp = rss + pen;
+            let pedf = pirls_result.edf;
             log::info!(
                 "[#1271-diag] path=orig p={p} penalty_rank={pr} nullspace_dim={nd} \
+                 rss={rss:.6} pen={pen:.6} Dp={dp:.6} pirls_edf={pedf:.4} \
                  logS={ls:.6} logH={lh:.6} half_diff={hd:.6} \
                  h_above1={ha} h_min={hmin:.3e} h_max={hmax:.3e} \
                  rho=[{rho_str}] lambda=[{lam_str}]",
