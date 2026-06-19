@@ -3750,11 +3750,39 @@ fn evaluate_non_affine_cell_simd<const COMPUTE_VALUE: bool>(
     evaluate_non_affine_cell_with_rule::<COMPUTE_VALUE>(cell, max_degree, &GL_NODES, &GL_WEIGHTS)
 }
 
-#[inline]
-fn evaluate_non_affine_cell_terminal_value(cell: DenestedCubicCell) -> f64 {
-    let (_, value_integral) =
-        evaluate_non_affine_cell_with_rule::<true>(cell, 0, &GL_NODES, &GL_WEIGHTS);
-    value_integral
+/// Value-only evaluation of a non-affine cell on the terminal 384-node rule.
+///
+/// Returns the cell probability integral `∫ exp(-½z²)·Φ(η(z)) dz` (pre the
+/// `1/√τ` normalization) computed bit-for-bit like the value branch of
+/// [`evaluate_non_affine_cell_with_rule`]: the non-fused node map
+/// `z = center + half_width·node`, the expanded (non-Horner)
+/// `η = c0 + c1·z + c2·z² + c3·z³`, the unscaled GL weight, a scalar
+/// `exp(-½z²)`, a plain `+=` in ascending node order, and a single trailing
+/// `·half_width`. The terminal rule has 384 nodes (divisible by 4), so the
+/// general kernel's value path never takes its scalar tail — this loop walks
+/// the same nodes in the same order and therefore reproduces the reference
+/// erfc-noise realization the `1e-13` value contract pins down.
+///
+/// Computing this through `evaluate_non_affine_cell_with_rule::<true>` at
+/// `max_degree = 0` would additionally run the 4-wide SIMD `exp(-q)` moment
+/// sweep and a moment accumulation on every node only to discard the moment
+/// vector. The survival marginal-slope fit evaluates a value per non-affine
+/// partition cell, so that discarded moment work is the dominant waste in the
+/// per-cell pass; this evaluator does only the work the value needs.
+fn evaluate_non_affine_cell_value_terminal(cell: DenestedCubicCell) -> f64 {
+    let center = 0.5 * (cell.left + cell.right);
+    let half_width = 0.5 * (cell.right - cell.left);
+    let c0 = cell.c0;
+    let c1 = cell.c1;
+    let c2 = cell.c2;
+    let c3 = cell.c3;
+    let mut value_integral = 0.0_f64;
+    for (&node, &weight) in GL_NODES.iter().zip(GL_WEIGHTS.iter()) {
+        let z = center + half_width * node;
+        let eta = c0 + c1 * z + c2 * z * z + c3 * z * z * z;
+        value_integral += weight * (-0.5 * z * z).exp() * normal_cdf(eta);
+    }
+    value_integral * half_width
 }
 
 fn evaluate_non_affine_cell_state(
@@ -3763,7 +3791,7 @@ fn evaluate_non_affine_cell_state(
     max_degree: usize,
 ) -> Result<CellMomentState, String> {
     let (moments, _) = evaluate_non_affine_cell_simd::<false>(cell, max_degree);
-    let value_integral = evaluate_non_affine_cell_terminal_value(cell);
+    let value_integral = evaluate_non_affine_cell_value_terminal(cell);
     // Reference structure: `value_integral * half_width / sqrt(TAU)`. The
     // half_width factor is already applied inside the rule evaluator, so divide
     // by sqrt(TAU) here (a true division, NOT multiply-by-reciprocal) to
