@@ -609,6 +609,7 @@ class _SparsityLayer(nn.Module):
         super().__init__()
         self.kind = cfg.sparsity.kind
         self.n_atoms = int(cfg.n_atoms)
+        self.tau_min = float(cfg.sparsity.tau_min)
         self.target_k = (
             int(cfg.sparsity.target_k) if cfg.sparsity.target_k is not None else self.n_atoms
         )
@@ -706,26 +707,21 @@ class _SparsityLayer(nn.Module):
 
     def reconstruction_topk_gate(
         self,
-        route_logits: torch.Tensor,
         magnitude_logits: torch.Tensor,
         x: torch.Tensor,
         per_atom_recon: torch.Tensor,
     ) -> torch.Tensor:
-        """Residual-energy top-k gate for gradient-trained ``softmax_topk``.
+        """Residual-annealed top-k gate for gradient-trained ``softmax_topk``.
 
-        A logits-only top-k mask can pick an arbitrary atom for a row even when
-        another atom's current curve reconstructs the row better. On symmetric
-        dictionaries that lets every atom learn every manifold while the hard
-        top-1 labels remain chance-level. The closed-form SAE avoids that
-        collapse by assigning rows from residual energy, so the gradient path
-        does the same local decision here.
-
-        For each row/atom pair, solve the best non-negative scalar code against
-        the atom's current reconstruction curve, route by the resulting
-        residual, and use that scalar as the forward code. Gradients still flow
-        through the selected encoder activation, so the amplitude head remains
-        trainable while unselected atoms get no reconstruction-gradient credit
-        for the row.
+        Top-1 routing must be decided by the atom's current reconstruction
+        error, not by raw input geometry or by an arbitrary logits-only mask. For
+        each row/atom pair we solve the best non-negative scalar code against
+        that atom's curve and score the atom by the resulting relative residual.
+        While the shared temperature schedule is above its floor, rows carry
+        soft EM-style responsibilities ``softmax(-relative_residual / tau)`` so
+        every plausible atom can improve. At the schedule floor, the forward
+        value becomes the hard top-1 residual assignment with a soft
+        straight-through gradient.
         """
         amp = self._topk_activation(magnitude_logits)
         denom = per_atom_recon.square().sum(dim=-1).clamp_min(1e-12)
@@ -734,8 +730,23 @@ class _SparsityLayer(nn.Module):
         residual = ((code.unsqueeze(-1) * per_atom_recon - x.unsqueeze(1)) ** 2).sum(
             dim=-1
         )
-        mask = self._topk_mask(route_logits - residual)
-        return amp * mask
+        row_scale = x.square().sum(dim=1, keepdim=True).clamp_min(1e-12)
+        relative_residual = residual / row_scale
+        tau = max(float(self.tau.item()), 1e-6)
+
+        if self.target_k == 1:
+            soft = torch.softmax(-relative_residual / tau, dim=-1)
+            if tau <= self.tau_min * (1.0 + 1.0e-12):
+                hard = self._topk_mask(-relative_residual)
+                responsibilities = hard + soft - soft.detach()
+            else:
+                responsibilities = soft
+        else:
+            hard = self._topk_mask(-relative_residual)
+            responsibilities = hard
+
+        code_with_amp_grad = code.detach() + amp - amp.detach()
+        return code_with_amp_grad * responsibilities
 
     def compose_code(self, assignments: torch.Tensor, amp: torch.Tensor) -> torch.Tensor:
         """Per-atom latent code ``z`` from gate ``assignments`` and ``amp``.
@@ -869,16 +880,6 @@ class ManifoldSAE(nn.Module):
         self.register_buffer(
             "_fit_blob", torch.zeros(0, dtype=torch.uint8), persistent=True
         )
-        self.register_buffer(
-            "_top1_route_centroids",
-            torch.zeros(F, D, dtype=dt),
-            persistent=True,
-        )
-        self.register_buffer(
-            "_top1_route_initialized",
-            torch.tensor(False, dtype=torch.bool),
-            persistent=True,
-        )
         self.reset_parameters()
         self.to(dtype=cfg.dtype)
 
@@ -921,81 +922,6 @@ class ManifoldSAE(nn.Module):
         raw_positions = raw[..., : F * d].reshape(x.shape[0], F, d)
         amp_logits = raw[..., F * d :]
         return raw_positions, amp_logits
-
-    def _uses_top1_energy_router(self) -> bool:
-        return (
-            self.cfg.sparsity.kind == "softmax_topk"
-            and self.cfg.sparsity.target_k == 1
-            and int(self.cfg.n_atoms) > 1
-        )
-
-    @staticmethod
-    def _row_energy_features(x: torch.Tensor) -> torch.Tensor:
-        feat = x.detach().square()
-        denom = feat.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
-        return feat / denom
-
-    @torch.no_grad()
-    def _maybe_initialize_top1_energy_router(self, x: torch.Tensor) -> None:
-        if not self._uses_top1_energy_router():
-            return
-        if bool(self._top1_route_initialized.item()):
-            return
-        feat = self._row_energy_features(x)
-        n, d = int(feat.shape[0]), int(feat.shape[1])
-        f = int(self.cfg.n_atoms)
-        if n == 0:
-            raise ValueError("ManifoldSAE cannot initialize top-1 router from an empty batch")
-
-        centroids = torch.empty((f, d), dtype=feat.dtype, device=feat.device)
-        first = int(torch.argmax(feat.norm(dim=1)).item())
-        centroids[0] = feat[first]
-        chosen = torch.zeros(n, dtype=torch.bool, device=feat.device)
-        chosen[first] = True
-        for atom in range(1, f):
-            dist = torch.cdist(feat, centroids[:atom]).amin(dim=1)
-            dist = dist.masked_fill(chosen, -1.0)
-            idx = int(torch.argmax(dist).item())
-            centroids[atom] = feat[idx]
-            chosen[idx] = True
-
-        for _ in range(12):
-            dist = torch.cdist(feat, centroids)
-            labels = torch.argmin(dist, dim=1)
-            for atom in range(f):
-                rows = labels == atom
-                if bool(rows.any().item()):
-                    centroids[atom] = feat[rows].mean(dim=0)
-
-        order = sorted(
-            range(f),
-            key=lambda i: (
-                int(torch.argmax(centroids[i]).item()),
-                [float(v) for v in centroids[i].detach().cpu()],
-            ),
-        )
-        centroids = centroids[order]
-        centroids = centroids / centroids.sum(dim=1, keepdim=True).clamp_min(1.0e-12)
-        self._top1_route_centroids.copy_(
-            centroids.to(
-                dtype=self._top1_route_centroids.dtype,
-                device=self._top1_route_centroids.device,
-            )
-        )
-        self._top1_route_initialized.fill_(True)
-
-    def _top1_energy_route_logits(
-        self, x: torch.Tensor, amp_logits: torch.Tensor
-    ) -> torch.Tensor:
-        if not self._uses_top1_energy_router():
-            return amp_logits
-        self._maybe_initialize_top1_energy_router(x)
-        feat = self._row_energy_features(x).to(dtype=amp_logits.dtype, device=amp_logits.device)
-        centroids = self._top1_route_centroids.to(
-            dtype=amp_logits.dtype, device=amp_logits.device
-        )
-        similarity = feat @ centroids.transpose(0, 1)
-        return amp_logits + 8.0 * similarity
 
     @torch.no_grad()
     def _closed_form_initializers(self, x: torch.Tensor) -> dict[str, np.ndarray]:
@@ -1044,17 +970,16 @@ class ManifoldSAE(nn.Module):
             self.cfg,
             self._forward_centers,
         )
-        route_logits = self._top1_energy_route_logits(x, amp_logits)
         per_atom_recon = torch.einsum("nfk,fkd->nfd", curves, self.decoder_blocks)
         amp = F_torch.softplus(amp_logits)
         if self.cfg.sparsity.kind == "softmax_topk":
-            gate_pre = route_logits
+            gate_pre = amp_logits
             assignments = self.sparsity.reconstruction_topk_gate(
-                route_logits, amp_logits, x, per_atom_recon
+                amp_logits, x, per_atom_recon
             )
             z = assignments
         else:
-            assignments, gate_pre = self.sparsity(route_logits)
+            assignments, gate_pre = self.sparsity(amp_logits)
             z = self.sparsity.compose_code(assignments, amp)
         x_hat = (z.unsqueeze(-1) * per_atom_recon).sum(dim=1)
 
