@@ -3442,7 +3442,8 @@ impl LatentBinaryFamily {
             if wi <= MIN_WEIGHT {
                 continue;
             }
-            let row = self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
+            let row =
+                self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
             let (row_log_survival, survival_gradient, survival_hessian) =
                 latent_survival_row_primary_gradient_hessian(
                     &self.quadctx,
@@ -3518,7 +3519,8 @@ impl LatentBinaryFamily {
             if wi <= MIN_WEIGHT {
                 continue;
             }
-            let row = self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
+            let row =
+                self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
             let (row_log_survival, survival_gradient, _) =
                 latent_survival_row_primary_gradient_hessian(
                     &self.quadctx,
@@ -3568,7 +3570,8 @@ impl LatentBinaryFamily {
             if wi <= MIN_WEIGHT {
                 continue;
             }
-            let row = self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
+            let row =
+                self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
             let (row_log_survival, survival_gradient, survival_hessian) =
                 latent_survival_row_primary_gradient_hessian(
                     &self.quadctx,
@@ -3636,7 +3639,8 @@ impl LatentBinaryFamily {
             if wi <= MIN_WEIGHT {
                 continue;
             }
-            let row = self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
+            let row =
+                self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
             let (row_log_survival, survival_gradient, survival_hessian) =
                 latent_survival_row_primary_gradient_hessian(
                     &self.quadctx,
@@ -3899,7 +3903,8 @@ impl LatentJointHessianFamily for LatentBinaryFamily {
             if wi <= MIN_WEIGHT {
                 continue;
             }
-            let row = self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
+            let row =
+                self.build_right_censored_row_at(row_idx, q_entry[row_idx], q_exit[row_idx])?;
             let (row_log_survival, survival_gradient, survival_hessian) =
                 latent_survival_row_primary_gradient_hessian(
                     &self.quadctx,

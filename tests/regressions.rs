@@ -70,8 +70,6 @@ mod bug_hunt_dispersion_location_scale_generate_predict_variance_agreement;
 mod bug_hunt_double_penalty_inflates_edf_instead_of_shrinking;
 #[path = "regressions/bug_hunt_double_penalty_shrinks_irrelevant_covariate_1266.rs"]
 mod bug_hunt_double_penalty_shrinks_irrelevant_covariate_1266;
-#[path = "regressions/spline_scan_1266_lambda_probe.rs"]
-mod spline_scan_1266_lambda_probe;
 #[path = "regressions/bug_hunt_estimate_external_family_and_links.rs"]
 mod bug_hunt_estimate_external_family_and_links;
 #[path = "regressions/bug_hunt_evidence_gaussian_reml_topology.rs"]
@@ -332,6 +330,8 @@ mod smooth_fit_term_collection_bug_hunt_2_3;
 mod solver_gpu_pirls_bug_hunt;
 #[path = "regressions/sparse_exact_bug_hunt.rs"]
 mod sparse_exact_bug_hunt;
+#[path = "regressions/spline_scan_1266_lambda_probe.rs"]
+mod spline_scan_1266_lambda_probe;
 #[path = "regressions/te_formula_dispatch_issue_154.rs"]
 mod te_formula_dispatch_issue_154;
 #[path = "regressions/thin_plate_workspace_equivalence_regression.rs"]

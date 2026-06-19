@@ -2876,9 +2876,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     first_attempt_trial_objective,
                     prev_rejected_first_attempt_objective,
                 ) {
-                    (true, Some(current), Some(prev))
-                        if current.to_bits() == prev.to_bits() =>
-                    {
+                    (true, Some(current), Some(prev)) if current.to_bits() == prev.to_bits() => {
                         consecutive_identical_rejected_cycles =
                             consecutive_identical_rejected_cycles.saturating_add(1);
                     }
@@ -2892,8 +2890,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     prev_rejected_first_attempt_objective = None;
                 }
                 if consecutive_held_rejected_cycles >= FULLY_REJECTED_STALL_MAX_CYCLES
-                    || consecutive_identical_rejected_cycles
-                        >= IDENTICAL_REJECTED_STALL_MAX_CYCLES
+                    || consecutive_identical_rejected_cycles >= IDENTICAL_REJECTED_STALL_MAX_CYCLES
                 {
                     let last_math_summary = last_joint_math
                         .as_ref()

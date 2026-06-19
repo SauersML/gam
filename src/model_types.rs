@@ -664,6 +664,7 @@ impl PenaltySpec {
 
 pub(crate) mod result_types;
 
+pub(crate) use result_types::CERTIFICATE_RAIL_MARGIN;
 pub use result_types::{
     AdaptiveRegularizationOptions, BlockRole, CriterionCertificate, FitArtifacts, FitGeometry,
     FitInference, FitOptions, FittedBlock, FittedLinkState, UnifiedFitResult,
@@ -671,5 +672,4 @@ pub use result_types::{
     saved_mixture_state_from_fit, saved_sas_state_from_fit, validate_all_finite,
     validate_dense_hessian_export, validate_explicit_dense_hessian_for_whitening,
 };
-pub(crate) use result_types::CERTIFICATE_RAIL_MARGIN;
 pub(crate) use result_types::{ensure_finite_scalar_estimation, validate_all_finite_estimation};

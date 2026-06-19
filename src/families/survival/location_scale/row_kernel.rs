@@ -2109,13 +2109,13 @@ impl SurvivalLocationScaleFamily {
             ) {
                 Self::clglog_exit_pair(u1, deriv_log_scale)
             } else {
-                let surv = Self::exact_survival_neglog_derivatives_fourth_rescaled(
-                    &self.inverse_link,
-                    u1,
-                )
-                .map_err(|e| {
-                    format!("inverse-link survival evaluation failed at row {row} exit: {e}")
-                })?;
+                let surv =
+                    Self::exact_survival_neglog_derivatives_fourth_rescaled(&self.inverse_link, u1)
+                        .map_err(|e| {
+                            format!(
+                                "inverse-link survival evaluation failed at row {row} exit: {e}"
+                            )
+                        })?;
 
                 let pdf = Self::exact_log_pdf_derivatives_rescaled(
                     &self.inverse_link,

@@ -386,9 +386,7 @@ fn compute_alo_diagnostics_from_pirls_impl(
 /// Newton closure would only add an O(n) nonlinear solve to diagnostics and
 /// quality sweeps without changing the answer, so it is excluded here and falls
 /// back to the (exact, for this family) one-step formula.
-fn alo_link_needs_exact_curvature_refinement(
-    likelihood: &crate::types::GlmLikelihoodSpec,
-) -> bool {
+fn alo_link_needs_exact_curvature_refinement(likelihood: &crate::types::GlmLikelihoodSpec) -> bool {
     use crate::types::ResponseFamily;
     matches!(
         (&likelihood.spec.response, likelihood.link_function()),
@@ -469,20 +467,20 @@ fn compute_alo_diagnostics_from_pirls_inner(
     // ALO.
     let canonical_scale: Option<Array1<f64>> =
         if alo_link_needs_exact_curvature_refinement(&base.likelihood) {
-        let mut c = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            let dmu = base.solve_dmu_deta[i];
-            let w_h = base.finalweights[i];
-            c[i] = if dmu.abs() <= ALO_DENOMINATOR_MIN || !dmu.is_finite() || !w_h.is_finite() {
-                f64::NAN
-            } else {
-                w_h / dmu
-            };
-        }
-        Some(c)
-    } else {
-        None
-    };
+            let mut c = Array1::<f64>::zeros(n);
+            for i in 0..n {
+                let dmu = base.solve_dmu_deta[i];
+                let w_h = base.finalweights[i];
+                c[i] = if dmu.abs() <= ALO_DENOMINATOR_MIN || !dmu.is_finite() || !w_h.is_finite() {
+                    f64::NAN
+                } else {
+                    w_h / dmu
+                };
+            }
+            Some(c)
+        } else {
+            None
+        };
 
     let inv_link_for_closure = base.likelihood.spec.link.clone();
     let score_curvature_closure = canonical_scale.as_ref().map(|scale| {

@@ -348,9 +348,8 @@ pub fn r_package_available(pkg: &str) -> bool {
     // a missing package for this narrowly-scoped environmental gate: callers
     // that use the gate still assert their tool-free gam quality bars and skip
     // only the external-reference arm.
-    let script = format!(
-        "cat(if (requireNamespace(\"{pkg}\", quietly = TRUE)) \"1\\n\" else \"0\\n\")"
-    );
+    let script =
+        format!("cat(if (requireNamespace(\"{pkg}\", quietly = TRUE)) \"1\\n\" else \"0\\n\")");
     let output = match Command::new("Rscript")
         .arg("--vanilla")
         .arg("-e")

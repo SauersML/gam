@@ -446,7 +446,13 @@ fn kappa_outer_loop_is_n_independent() {
     let callback_avg: Vec<f64> = kappa_phase
         .iter()
         .zip(&kappa_calls)
-        .map(|(&total, &calls)| if calls == 0 { 0.0 } else { total / calls as f64 })
+        .map(|(&total, &calls)| {
+            if calls == 0 {
+                0.0
+            } else {
+                total / calls as f64
+            }
+        })
         .collect();
     let first_cb = callback_avg.first().copied().unwrap_or(0.0).max(1e-6);
     let last_cb = callback_avg.last().copied().unwrap_or(0.0).max(1e-6);

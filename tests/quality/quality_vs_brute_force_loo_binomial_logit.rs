@@ -96,7 +96,10 @@ fn solve_spd(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
                 sum -= l[[i, k]] * l[[j, k]];
             }
             if i == j {
-                assert!(sum > 0.0, "leave-i-out Hessian not SPD at pivot {i}: {sum:.3e}");
+                assert!(
+                    sum > 0.0,
+                    "leave-i-out Hessian not SPD at pivot {i}: {sum:.3e}"
+                );
                 l[[i, j]] = sum.sqrt();
             } else {
                 l[[i, j]] = sum / l[[j, j]];
@@ -373,7 +376,10 @@ fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
                 beta[k] -= step[k];
             }
         }
-        assert!(converged, "frozen-λ leave-{i}-out Newton refit did not converge");
+        assert!(
+            converged,
+            "frozen-λ leave-{i}-out Newton refit did not converge"
+        );
         let xi = &xrows[i];
         let mut dot = offset[i];
         for k in 0..p {

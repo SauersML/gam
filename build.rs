@@ -3161,7 +3161,12 @@ fn scan_for_msi_infra_leaks(root: &Path) {
          scripts belong under /Users/user/, not in the repo. Offenders:"
     );
     for (rel, lineno, needle) in &offenders {
-        eprintln!("  {}:{} contains banned string `{}`", rel.display(), lineno, needle);
+        eprintln!(
+            "  {}:{} contains banned string `{}`",
+            rel.display(),
+            lineno,
+            needle
+        );
         println!(
             "cargo:warning=banned MSI/SLURM infra leak: {}:{} contains `{}`",
             rel.display(),

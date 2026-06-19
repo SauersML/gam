@@ -996,11 +996,7 @@ mod tests {
         let gram = result.e_transformed.t().dot(&result.e_transformed);
         for i in 0..p {
             for j in 0..p {
-                assert_relative_eq!(
-                    gram[[i, j]],
-                    result.s_transformed[[i, j]],
-                    epsilon = 1e-9
-                );
+                assert_relative_eq!(gram[[i, j]], result.s_transformed[[i, j]], epsilon = 1e-9);
             }
         }
 
