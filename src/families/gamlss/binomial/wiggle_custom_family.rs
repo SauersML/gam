@@ -154,7 +154,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        let (n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
+        let (_n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
         binomial_location_scale_ll_only(
             &self.y,
             &self.weights,
@@ -183,7 +183,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let Some(subsample) = options.outer_score_subsample.as_ref() else {
             return self.log_likelihood_only(block_states);
         };
-        let (n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
+        let (_n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
         use rayon::iter::ParallelIterator;
         let link_kind = &self.link_kind;
         let ll: Result<f64, String> = subsample
