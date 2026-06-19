@@ -647,6 +647,19 @@ class _SparsityLayer(nn.Module):
         # break expert collapse before the residual EM takes over. Geometry-
         # agnostic: keyed only on the reconstruction residual.
         self._commit_steps = max(60, int(0.25 * int(cfg.sparsity.tau_steps)))
+        # #1282 persistent per-row assignment accumulator (EMA of soft
+        # responsibilities / commitment one-hots). At high reconstruction R² the
+        # instantaneous per-atom residual carries almost no routing information
+        # (a shared flexible encoder lets either atom reconstruct either manifold
+        # by choosing a different phase), so a hard top-1 read off the *current*
+        # residual drifts to noise after the commitment window releases. The
+        # accumulator remembers the partition the strong early signal
+        # established and the hard forward/reported assignment is its argmax, so
+        # the washed-out late residual cannot overwrite it. Lazily sized to the
+        # (stable full-batch) row count on first use; reset if the row count
+        # changes (e.g. a different batch / out-of-sample call).
+        self._assign_ema: torch.Tensor | None = None
+        self._assign_ema_beta = 0.97
 
     @torch.no_grad()
     def advance_temperature(self) -> None:
@@ -798,37 +811,38 @@ class _SparsityLayer(nn.Module):
             # dominate and the bias is a vanishing correction.
             log_resp = -relative_residual / tau
             balanced_log_resp = self._sinkhorn_balance(log_resp)
+            # `soft` is the residual-driven E-step that carries the
+            # reconstruction gradient to the decoders (M-step). It is the only
+            # differentiable quantity below; the hard routing is straight-through.
             soft = torch.softmax(balanced_log_resp, dim=-1)
 
-            commit = self._matching_pursuit_commit(relative_residual, step)
-            if commit is not None:
-                # Sequential matching-pursuit commitment window (issue #1282).
-                #
-                # The balanced EM keeps atom *usage* even but, from the
-                # near-symmetric random init, gradient descent still settles
-                # into expert collapse: one atom owns a manifold while the other
-                # becomes an equidistant garbage-collector blend (great
-                # reconstruction R², chance routing). Balancing usage alone
-                # cannot break this because a specialist + a blend already
-                # satisfy the 1/F marginal.
-                #
-                # The closed-form lane breaks the identical symmetry by *greedy*
-                # residual seeding (``reseed_atoms_onto_distinct_residual_pcs``):
-                # fit one atom, then seed the next onto what the first leaves.
-                # We port that as an assignment schedule, with no parameter
-                # surgery (so Adam's per-parameter momentum stays consistent):
-                # during the early window atom 0 is committed to *all* rows so
-                # it fits the dominant structure (a whole circle), then each
-                # later atom is committed to the rows the already-committed atoms
-                # reconstruct *worst* — the current residual — so it is forced
-                # onto the distinct leftover manifold. Routing keys only on the
-                # reconstruction residual (no input-geometry shortcut). The
-                # commitment is the hard forward assignment; gradients flow
-                # through the soft residual responsibilities (straight-through),
-                # so the magnitude code still trains the decoder shape/scale.
-                hard = commit
-            else:
-                hard = self._topk_mask(balanced_log_resp)
+            # Sequential matching-pursuit commitment (issue #1282). Only engaged
+            # when the per-atom residual is *degenerate* — i.e. the atoms are
+            # nearly indistinguishable on every row, the energy-degenerate
+            # failure mode. On disjoint manifolds the residual already separates
+            # the circles, pure balanced EM routes them perfectly, and forcing a
+            # commitment only injects entanglement, so the detector keeps it off.
+            commit = None
+            if step is not None and step < self._commit_steps:
+                spread = self._residual_spread(relative_residual)
+                if spread < 0.5:
+                    commit = self._matching_pursuit_commit(relative_residual, step)
+
+            # Persistent per-row assignment accumulator. At high reconstruction
+            # R² the instantaneous residual carries little routing signal (the
+            # shared encoder lets either atom fit either manifold by re-phasing),
+            # so a hard top-1 read off the current residual drifts to noise. The
+            # EMA remembers the partition established by the strong early signal
+            # (commitment one-hots, then early soft responsibilities) and the
+            # hard forward/reported assignment is its argmax — the washed-out
+            # late residual decays into, but cannot overwrite, the accumulator.
+            target_signal = commit if commit is not None else soft.detach()
+            ema = self._update_assign_ema(target_signal)
+            hard = self._topk_mask(ema if ema is not None else balanced_log_resp)
+
+            # Straight-through: forward value is the hard (persistent) routing,
+            # gradient flows through the soft residual responsibilities so the
+            # decoder shape/scale still trains on the rows each atom owns.
             hard_ste = hard + soft - soft.detach()
             if commit is not None:
                 progress = 1.0
@@ -894,6 +908,53 @@ class _SparsityLayer(nn.Module):
         onehot = torch.zeros(n, f, dtype=dtype, device=device)
         onehot[torch.arange(n, device=device), assign] = 1.0
         return onehot
+
+    @staticmethod
+    def _residual_spread(relative_residual: torch.Tensor) -> float:
+        """Mean per-row separation of the per-atom residuals (issue #1282).
+
+        Returns the mean over rows of ``(max_k r - min_k r) / mean_k r``. Large
+        when the atoms reconstruct a row very differently (disjoint manifolds:
+        the residual already routes), small when every atom reconstructs every
+        row about equally well (energy-degenerate: residual routing is
+        ambiguous and the commitment is needed). Detached scalar; never affects
+        gradients.
+        """
+        rr = relative_residual.detach()
+        if rr.shape[-1] < 2:
+            return 0.0
+        rmin = rr.min(dim=-1).values
+        rmax = rr.max(dim=-1).values
+        rmean = rr.mean(dim=-1).clamp_min(1e-12)
+        return float(((rmax - rmin) / rmean).mean().item())
+
+    def _update_assign_ema(
+        self, signal: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        """EMA-accumulate the per-row assignment signal; return the accumulator.
+
+        ``signal`` is an ``(N, F)`` non-negative per-row distribution (a
+        commitment one-hot or the soft responsibilities). The accumulator is
+        lazily sized to ``N`` and reset whenever the row count changes (a
+        different batch / out-of-sample call has no training history, so its
+        routing falls back to the instantaneous residual). Only updated while
+        training; in eval the accumulator is read but not advanced. Returns the
+        current accumulator, or ``None`` if there is no history for this batch.
+        """
+        if signal is None or not self.training:
+            # No update; return the accumulator only if it matches this batch.
+            ema = self._assign_ema
+            if ema is not None and signal is not None and ema.shape == signal.shape:
+                return ema
+            return None
+        sig = signal.detach()
+        ema = self._assign_ema
+        if ema is None or ema.shape != sig.shape:
+            self._assign_ema = sig.clone()
+            return self._assign_ema
+        beta = self._assign_ema_beta
+        self._assign_ema = beta * ema + (1.0 - beta) * sig
+        return self._assign_ema
 
     @staticmethod
     def _sinkhorn_balance(
