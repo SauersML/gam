@@ -1,6 +1,17 @@
-use gam::terms::basis::{BasisOptions, Dense, KnotSource, create_basis};
+use gam::terms::basis::periodic_bspline_first_derivative_nd;
 use ndarray::array;
 
+/// The production cyclic/periodic B-spline first derivative
+/// (`periodic_bspline_first_derivative_nd`) must be exactly periodic: evaluating
+/// at `x` and at `x + period` must yield the same derivative row.
+///
+/// This is the real cyclic-derivative path used in production (the periodic
+/// closed form that `basis_with_jet` / `PeriodicSplineCurve::evaluate_derivative`
+/// consume). It wraps its own input into the base period internally
+/// (`wrap_periodic_phase`), so periodicity is a property of the basis itself —
+/// it does NOT depend on the open-basis derivative evaluator wrapping its eval
+/// point (that geometric wrap incorrectly fired for non-periodic open knots and
+/// corrupted boundary spans, gam#1348; it was removed).
 #[test]
 fn cyclic_bspline_first_derivative_periodicity_breaks() {
     let degree = 3usize;
@@ -8,56 +19,23 @@ fn cyclic_bspline_first_derivative_periodicity_breaks() {
     let end = 1.0;
     let num_basis = 8usize;
     let period = end - start;
-    let h = period / num_basis as f64;
-    let total_knots = num_basis + 2 * degree + 1;
-    let knots = ndarray::Array1::from_iter(
-        (0..total_knots).map(|i| start + (i as f64 - degree as f64) * h),
-    );
 
-    // Keep both `x` and `x + period` inside the degree-padded knot support
-    // `[-degree*h, (num_basis + degree)*h]` so the raw open-basis derivative is a
-    // genuine translate of itself across the period (the property the modular
-    // fold below relies on). With max support `(num_basis + degree)*h`, `x +
-    // period` stays in support iff `x < degree * h` = 0.375 here.
-    let x = array![0.123456789, 0.311111111];
-    let x_shifted = x.mapv(|v| v + period);
-
-    let (b0, _) = create_basis::<Dense>(
-        x.view(),
-        KnotSource::Provided(knots.view()),
-        degree,
-        BasisOptions::first_derivative(),
-    )
-    .expect("basis should build at x");
-    let (b1, _) = create_basis::<Dense>(
-        x_shifted.view(),
-        KnotSource::Provided(knots.view()),
-        degree,
-        BasisOptions::first_derivative(),
-    )
-    .expect("basis should build at x+period");
-
-    // The extended (open-knot) basis has `total_knots - degree - 1` columns,
-    // which for a cyclic layout is `num_basis + degree` — NOT `2 * num_basis`.
-    // Fold exactly as the production cyclic evaluator does
-    // (`cyclic[j % num_basis] += extended[j]`, see
-    // `evaluate_bspline_basis_chunk` in src/terms/basis/bspline_eval.rs), then
-    // compare the folded derivative rows at `x` and `x + period`. Periodicity of
-    // the folded first derivative follows from translation invariance of the
-    // uniform B-spline derivative basis under the modular wrap.
-    let ncols = b0.ncols();
-    assert_eq!(ncols, num_basis + degree, "extended basis column count");
-    for i in 0..b0.nrows() {
-        let mut folded0 = vec![0.0_f64; num_basis];
-        let mut folded1 = vec![0.0_f64; num_basis];
-        for j in 0..ncols {
-            folded0[j % num_basis] += b0[[i, j]];
-            folded1[j % num_basis] += b1[[i, j]];
-        }
+    // Span the circle, including points in the seam spans where a non-periodic
+    // open basis would differ from its period-shifted self.
+    for &x in &[0.0, 0.05, 0.123_456_789, 0.311_111_111, 0.5, 0.77, 0.999] {
+        let t0 = array![[x]];
+        let t1 = array![[x + period]];
+        let d0 = periodic_bspline_first_derivative_nd(t0.view(), (start, end), degree, num_basis)
+            .expect("periodic derivative at x");
+        let d1 = periodic_bspline_first_derivative_nd(t1.view(), (start, end), degree, num_basis)
+            .expect("periodic derivative at x+period");
         for j in 0..num_basis {
             assert!(
-                (folded0[j] - folded1[j]).abs() < 1e-12,
-                "bug: cyclic B-spline first derivative is not periodic after fold-back"
+                (d0[[0, j, 0]] - d1[[0, j, 0]]).abs() < 1e-10,
+                "bug: cyclic B-spline first derivative is not periodic at x={x}, col {j}: \
+                 {} vs {}",
+                d0[[0, j, 0]],
+                d1[[0, j, 0]]
             );
         }
     }

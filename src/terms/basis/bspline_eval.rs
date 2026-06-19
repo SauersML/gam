@@ -362,45 +362,6 @@ pub(crate) fn has_clamped_bspline_boundaries(knotview: ArrayView1<f64>, degree: 
 }
 
 #[inline]
-pub(crate) fn periodic_unclamped_derivative_eval_point(
-    x: f64,
-    knotview: ArrayView1<f64>,
-    degree: usize,
-) -> f64 {
-    if has_clamped_bspline_boundaries(knotview, degree) {
-        return x;
-    }
-    let num_basis = knotview.len().saturating_sub(degree + 1);
-    let Some(periodic_cols) = num_basis.checked_sub(degree) else {
-        return x;
-    };
-    if periodic_cols == 0 || knotview.len() < 2 {
-        return x;
-    }
-
-    let h = knotview[1] - knotview[0];
-    if !(h.is_finite() && h > KNOT_SPAN_DEGENERACY_FLOOR) {
-        return x;
-    }
-    let scale = (knotview[knotview.len() - 1] - knotview[0]).abs().max(1.0);
-    let tol = KNOT_SPAN_DEGENERACY_FLOOR * scale;
-    if knotview
-        .iter()
-        .zip(knotview.iter().skip(1))
-        .any(|(&left, &right)| ((right - left) - h).abs() > tol)
-    {
-        return x;
-    }
-
-    let start = knotview[degree];
-    let period = h * periodic_cols as f64;
-    if !(start.is_finite() && period.is_finite() && period > 0.0) {
-        return x;
-    }
-    wrap_to_period(x, start, period)
-}
-
-#[inline]
 pub(crate) fn one_sided_derivative_eval_point(
     x: f64,
     knotview: ArrayView1<f64>,
@@ -596,11 +557,12 @@ pub(crate) fn evaluate_splines_derivative_sparse_intowith_lower(
     }
     lowervalues[..num_basis_lower].fill(0.0);
 
-    let x_eval = one_sided_derivative_eval_point(
-        periodic_unclamped_derivative_eval_point(x, knotview, degree),
-        knotview,
-        degree,
-    );
+    // Non-periodic (open/clamped) B-spline derivative: evaluate at the raw point.
+    // No periodic wrap here — wrapping is only correct for a genuinely cyclic
+    // basis, whose evaluator pre-wraps its input data into the base period before
+    // calling this path (`create_cyclic_bspline_basis_dense`). Wrapping an open
+    // basis's eval point corrupts the boundary spans (gam#1348).
+    let x_eval = one_sided_derivative_eval_point(x, knotview, degree);
     internal::evaluate_splines_at_point_full_support_into(
         x_eval,
         degree - 1,

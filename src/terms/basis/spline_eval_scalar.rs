@@ -833,16 +833,14 @@ pub fn evaluate_bspline_derivative_scalar_into(
         *v = 0.0;
     }
 
-    let x_eval = one_sided_derivative_eval_point(
-        periodic_unclamped_derivative_eval_point(x, knot_vector, degree),
-        knot_vector,
-        degree,
-    );
+    // Non-periodic (open/clamped) B-spline derivative: evaluate at the raw point.
+    // The eval point must NOT be wrapped modulo a period for an open basis — a
+    // periodic wrap moves a boundary-span point onto unrelated interior columns
+    // and breaks agreement with the value basis (gam#1348). Genuinely cyclic
+    // bases pre-wrap their input data into the base period before reaching here.
+    let x_eval = one_sided_derivative_eval_point(x, knot_vector, degree);
 
     // Evaluate lower-degree (k-1) basis functions on the full knot support.
-    // Cyclic fold-back constructs intentionally use the exterior support spans
-    // of a uniform knot vector; clamping here collapses `x + period` onto the
-    // right modeling boundary and breaks derivative periodicity.
     internal::evaluate_splines_at_point_full_support_into(
         x_eval,
         degree - 1,
@@ -1148,11 +1146,10 @@ pub(crate) fn evaluate_bspline_derivative_recurrence_into(
             minimum_degree: derivative_order,
         });
     }
-    let x = if depth == 0 {
-        periodic_unclamped_derivative_eval_point(x, knot_vector, degree)
-    } else {
-        x
-    };
+    // No periodic wrap of the eval point for an open/clamped basis: wrapping is
+    // only correct for a cyclic basis (whose evaluator pre-wraps its input), and
+    // applying it here would corrupt the boundary spans of every higher-order
+    // derivative the same way the first-derivative path was corrupted (gam#1348).
 
     // Order 1 is the base case: it is computed directly from the plain
     // degree-`degree` basis rather than from a lower-order derivative.
