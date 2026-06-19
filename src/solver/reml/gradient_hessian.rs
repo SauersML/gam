@@ -2996,24 +2996,7 @@ impl<'a> RemlState<'a> {
         let n = d_array.len();
         let mut e_array = Array1::<f64>::zeros(n);
 
-        let link_function = self.config.link_function();
-        let inverse_link = if let Some(state) = self.runtime_mixture_link_state.clone() {
-            InverseLink::Mixture(state)
-        } else if let Some(state) = self.runtime_sas_link_state {
-            if matches!(link_function, LinkFunction::BetaLogistic) {
-                InverseLink::BetaLogistic(state)
-            } else {
-                InverseLink::Sas(state)
-            }
-        } else {
-            // SAFETY: when neither mixture nor sas state is present, the
-            // configured link is necessarily one of the five legal
-            // `StandardLink` variants — Sas/BetaLogistic always carry state.
-            InverseLink::Standard(
-                StandardLink::try_from(link_function)
-                    .expect("state-bearing link without runtime state in hessian_cde_arrays"),
-            )
-        };
+        let inverse_link = self.runtime_inverse_link();
 
         // Use the same saturation contract as PIRLS observed-Hessian
         // assembly.  If PIRLS evaluated W_obs at a clamped eta, the
@@ -5930,21 +5913,7 @@ impl<'a> RemlState<'a> {
             // materially slow subsequent PIRLS convergence.
             if cached.cache_compacted {
                 let mut pirls_config = self.config.as_pirls_config();
-                pirls_config.link_kind =
-                    if let Some(state) = self.runtime_mixture_link_state.clone() {
-                        InverseLink::Mixture(state)
-                    } else if let Some(state) = self.runtime_sas_link_state {
-                        if matches!(self.config.link_function(), LinkFunction::BetaLogistic) {
-                            InverseLink::BetaLogistic(state)
-                        } else {
-                            InverseLink::Sas(state)
-                        }
-                    } else {
-                        InverseLink::Standard(
-                            StandardLink::try_from(self.config.link_function())
-                                .expect("state-bearing link without runtime state"),
-                        )
-                    };
+                pirls_config.link_kind = self.runtime_inverse_link();
                 return Ok(Arc::new(cached.rehydrate_after_reml_cache(
                     self.x(),
                     self.y,
@@ -6029,20 +5998,7 @@ impl<'a> RemlState<'a> {
                     if outer_cap > 0 { outer_cap as i64 } else { -1 },
                 );
             }
-            pirls_config.link_kind = if let Some(state) = self.runtime_mixture_link_state.clone() {
-                InverseLink::Mixture(state)
-            } else if let Some(state) = self.runtime_sas_link_state {
-                if matches!(self.config.link_function(), LinkFunction::BetaLogistic) {
-                    InverseLink::BetaLogistic(state)
-                } else {
-                    InverseLink::Sas(state)
-                }
-            } else {
-                InverseLink::Standard(
-                    StandardLink::try_from(self.config.link_function())
-                        .expect("state-bearing link without runtime state"),
-                )
-            };
+            pirls_config.link_kind = self.runtime_inverse_link();
             // Negative-Binomial λ-search θ freeze (#1082). With θ estimated,
             // the inner solver re-derives θ from each outer iterate's warm-start
             // η, so the NB working response / deviance / penalty-logdet — and
@@ -6519,20 +6475,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<Arc<PirlsResult>, EstimationError> {
         let mut pirls_config = self.config.as_pirls_config();
-        pirls_config.link_kind = if let Some(state) = self.runtime_mixture_link_state.clone() {
-            InverseLink::Mixture(state)
-        } else if let Some(state) = self.runtime_sas_link_state {
-            if matches!(self.config.link_function(), LinkFunction::BetaLogistic) {
-                InverseLink::BetaLogistic(state)
-            } else {
-                InverseLink::Sas(state)
-            }
-        } else {
-            InverseLink::Standard(
-                StandardLink::try_from(self.config.link_function())
-                    .expect("state-bearing link without runtime state"),
-            )
-        };
+        pirls_config.link_kind = self.runtime_inverse_link();
         // Pin the same λ-search-frozen NB θ the outer loop converged under
         // (#1082), so the rho-uncertainty sigma-point criterion is evaluated on
         // the identical stationary surface F(ρ) = REML(ρ, θ_frozen) rather than
