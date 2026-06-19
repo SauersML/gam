@@ -641,13 +641,12 @@ class _SparsityLayer(nn.Module):
         # the FFI accessor rather than re-deriving the decay in Python.
         self._schedule = cfg.sparsity.gumbel_schedule()
         self._init_alpha = float(cfg.sparsity.init_alpha)
-        # #1282 committed-assignment window. Commit each atom to a fixed balanced
-        # row partition for the first ~15% of the anneal (but at least 40 steps),
-        # re-rolled in a few sub-blocks, to break expert collapse before the
-        # residual EM takes over. Geometry-agnostic: keyed only on a fixed seed.
-        self._commit_steps = max(40, int(0.15 * int(cfg.sparsity.tau_steps)))
-        self._commit_rerolls = 4
-        self._commit_seed = 0x1282 * 2654435761 + int(cfg.n_atoms)
+        # #1282 sequential matching-pursuit commitment window. For the first
+        # ~25% of the anneal (>=60 steps) atoms are introduced one at a time and
+        # each new atom is committed to the worst-reconstructed residual rows, to
+        # break expert collapse before the residual EM takes over. Geometry-
+        # agnostic: keyed only on the reconstruction residual.
+        self._commit_steps = max(60, int(0.25 * int(cfg.sparsity.tau_steps)))
 
     @torch.no_grad()
     def advance_temperature(self) -> None:
@@ -801,33 +800,32 @@ class _SparsityLayer(nn.Module):
             balanced_log_resp = self._sinkhorn_balance(log_resp)
             soft = torch.softmax(balanced_log_resp, dim=-1)
 
-            commit = self._commitment_onehot(x, step)
+            commit = self._matching_pursuit_commit(relative_residual, step)
             if commit is not None:
-                # Committed-assignment window (issue #1282). The balanced EM
-                # keeps usage even but, from the near-symmetric random init,
-                # gradient descent still settles into expert collapse: one atom
-                # owns a manifold while the other becomes an equidistant
-                # garbage-collector blend (great reconstruction R², chance
-                # routing). Balancing usage alone cannot break this because a
-                # specialist + a blend already satisfy the 1/F marginal.
+                # Sequential matching-pursuit commitment window (issue #1282).
                 #
-                # The closed-form lane breaks the identical symmetry by seeding
-                # each atom onto a *distinct* residual subspace (matching
-                # pursuit). The gradient-path analogue, with no parameter
-                # surgery (so Adam's per-parameter momentum stays consistent),
-                # is to *commit* each atom to a fixed, balanced, disjoint slice
-                # of rows for an early window: the reconstruction gradient then
-                # differentiates the atoms' decoders by the genuinely different
-                # rows they are fed, and once they have specialized the
-                # residual-driven EM below re-routes the rest. The commitment is
-                # the hard forward assignment; gradients flow through the soft
-                # residual responsibilities (straight-through), so the magnitude
-                # code still trains the decoder shape/scale. The partition is a
-                # fixed deterministic permutation (no dependence on the symmetric
-                # residuals, no input-geometry shortcut), re-rolled across a few
-                # sub-blocks so a slice that happens to mix manifolds is
-                # corrected by the next roll — the analogue of the closed-form
-                # lane's ``pc_pair_offset`` multi-start rotation.
+                # The balanced EM keeps atom *usage* even but, from the
+                # near-symmetric random init, gradient descent still settles
+                # into expert collapse: one atom owns a manifold while the other
+                # becomes an equidistant garbage-collector blend (great
+                # reconstruction R², chance routing). Balancing usage alone
+                # cannot break this because a specialist + a blend already
+                # satisfy the 1/F marginal.
+                #
+                # The closed-form lane breaks the identical symmetry by *greedy*
+                # residual seeding (``reseed_atoms_onto_distinct_residual_pcs``):
+                # fit one atom, then seed the next onto what the first leaves.
+                # We port that as an assignment schedule, with no parameter
+                # surgery (so Adam's per-parameter momentum stays consistent):
+                # during the early window atom 0 is committed to *all* rows so
+                # it fits the dominant structure (a whole circle), then each
+                # later atom is committed to the rows the already-committed atoms
+                # reconstruct *worst* — the current residual — so it is forced
+                # onto the distinct leftover manifold. Routing keys only on the
+                # reconstruction residual (no input-geometry shortcut). The
+                # commitment is the hard forward assignment; gradients flow
+                # through the soft residual responsibilities (straight-through),
+                # so the magnitude code still trains the decoder shape/scale.
                 hard = commit
             else:
                 hard = self._topk_mask(balanced_log_resp)
@@ -845,41 +843,56 @@ class _SparsityLayer(nn.Module):
 
         return code * responsibilities
 
-    def _commitment_onehot(
-        self, x: torch.Tensor, step: int | None
+    def _matching_pursuit_commit(
+        self, relative_residual: torch.Tensor, step: int | None
     ) -> torch.Tensor | None:
-        """Hard balanced row->atom one-hot during the early commitment window.
+        """Greedy residual commitment one-hot for the early window (issue #1282).
 
-        Returns ``(N, F)`` one-hot assignments for ``step`` inside the
-        commitment window, else ``None`` (the residual EM owns the assignment).
-        The partition is a fixed deterministic permutation of the rows split
-        into ``F`` equal contiguous blocks, re-rolled across ``_commit_rerolls``
-        sub-windows so a partition that happens to mix manifolds is replaced by
-        a different one before the EM takes over. It depends only on a fixed
-        seed and the row count — never on the (symmetric) residuals or the input
-        coordinate geometry — so it breaks the init symmetry without smuggling
-        in a geometry shortcut.
+        Returns ``(N, F)`` hard assignments inside the commitment window, else
+        ``None`` (the residual EM owns the assignment). The schedule emulates the
+        closed-form lane's greedy residual seeding: atom 0 is committed to *all*
+        rows so it fits the dominant structure, then atoms are *introduced one at
+        a time*; when atom ``j`` enters, it claims the rows whose current
+        best-of-already-introduced relative residual is largest (the worst-
+        reconstructed share), forcing it onto the leftover manifold. The share
+        each new atom claims grows to ``1/F`` of the rows. Keys only on the
+        reconstruction residual — no input-geometry shortcut.
+
+        ``relative_residual`` is ``(N, F)`` per-atom scale-free residual.
         """
         if step is None or self.target_k != 1 or self.n_atoms < 2:
             return None
         if step >= self._commit_steps:
             return None
-        n = int(x.shape[0])
-        f = int(self.n_atoms)
-        # Which re-roll sub-window are we in.
-        block = min(
-            self._commit_rerolls - 1,
-            (step * self._commit_rerolls) // max(1, self._commit_steps),
-        )
-        g = torch.Generator(device="cpu")
-        g.manual_seed(int(self._commit_seed) + 7919 * int(block))
-        perm = torch.randperm(n, generator=g)
-        # Balanced contiguous split of the permuted rows across the F atoms.
-        atom_of_sorted = (torch.arange(n) * f) // n  # 0..F-1, balanced
-        assign = torch.empty(n, dtype=torch.long)
-        assign[perm] = atom_of_sorted
-        onehot = torch.zeros(n, f, dtype=x.dtype, device=x.device)
-        onehot[torch.arange(n), assign.to(x.device)] = 1.0
+        n, f = relative_residual.shape
+        dtype, device = relative_residual.dtype, relative_residual.device
+        # How many atoms have been "introduced" by this step: ramp 1 -> F across
+        # the window, holding the full set for the last third so the rivals'
+        # decoders settle before the EM takes over.
+        frac = step / max(1, self._commit_steps)
+        introduced = 1 + int(min(f - 1, (frac * 1.5) * (f - 1) + 1e-9))
+        introduced = max(1, min(f, introduced))
+        rr = relative_residual.detach()
+        # Each row goes to the introduced atom that reconstructs it best, but we
+        # cap each atom's share to keep the commitment balanced and force the
+        # newest atom to actually take rows (rather than the incumbent keeping
+        # everything). Concretely: rank rows by how much better the *newest*
+        # introduced atom is than the best incumbent, and hand the newest atom
+        # its balanced quota of the rows it most wants.
+        assign = rr[:, :introduced].argmin(dim=1)
+        if introduced >= 2:
+            newest = introduced - 1
+            incumbent_best = rr[:, : introduced - 1].min(dim=1).values
+            # Preference of each row for the newest atom (lower residual = more).
+            advantage = incumbent_best - rr[:, newest]
+            quota = n // f  # balanced share per atom
+            # Give the newest atom the `quota` rows it most prefers, even if an
+            # incumbent currently reconstructs them marginally better, so it is
+            # guaranteed a distinct committed subset to specialize on.
+            take = torch.topk(advantage, k=min(quota, n)).indices
+            assign[take] = newest
+        onehot = torch.zeros(n, f, dtype=dtype, device=device)
+        onehot[torch.arange(n, device=device), assign] = 1.0
         return onehot
 
     @staticmethod

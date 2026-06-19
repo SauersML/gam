@@ -252,6 +252,12 @@ pub struct ObservationInterval<'a> {
     /// cannot report values outside the family support. [`ResponseBounds::UNBOUNDED`]
     /// for real-line responses (the band is passed through unchanged).
     pub bounds: ResponseBounds,
+    /// Optional precomputed skew-aware **equal-tailed** band `(lower, upper)`.
+    /// When `Some`, it replaces the symmetric `μ ± z·σ` construction (the
+    /// dispersion location-scale skewed families route their per-row equal-tailed
+    /// quantiles here, #817/#1193/#1194). When `None`, the symmetric band is built
+    /// from `noise_sd`.
+    pub override_band: Option<(Array1<f64>, Array1<f64>)>,
 }
 
 /// Static metadata threaded into every [`PredictUncertaintyResult`].
@@ -290,6 +296,12 @@ pub fn assemble_uncertainty_result(
     let (eta_lower, eta_upper) = eta_interval.endpoints(&eta, &eta_standard_error, z);
     let (mean_lower, mean_upper) = mean_bounds(&eta_lower, &eta_upper, &mean, z, method)?;
     let (observation_lower, observation_upper) = match observation {
+        // A skew-aware predictor (dispersion location-scale) supplies its
+        // equal-tailed band directly; use it verbatim (already support-clamped).
+        Some(ObservationInterval {
+            override_band: Some((lower, upper)),
+            ..
+        }) => (Some(lower), Some(upper)),
         Some(obs) => {
             // A prediction (observation) interval covers a *future* response
             // `Y = μ + ε` at the query point. The point `μ̂` is itself estimated
@@ -530,6 +542,34 @@ pub trait PredictionTransform {
         assert!(std::mem::size_of_val(input) > 0);
         Ok(None)
     }
+
+    /// Optional skew-aware **equal-tailed** observation band, built per row.
+    ///
+    /// The default (`None`) leaves the observation interval to the generic
+    /// symmetric `μ ± z·√(SE(μ̂)² + σ²)` construction (correct for symmetric
+    /// response families and the Gaussian location-scale identity link). A
+    /// heteroscedastic *dispersion* location-scale predictor whose response is
+    /// skewed (Gamma/NB/Beta/Tweedie + `noise_formula`) overrides this to return
+    /// equal-tailed quantiles of its per-row moment-matched predictive — the
+    /// two-block sibling of [`family_observation_band`] (#817/#1193/#1194). When
+    /// `Some`, the returned `(lower, upper)` replaces the symmetric band in both
+    /// the full-uncertainty and posterior-mean drivers; when `None`, the symmetric
+    /// path is used.
+    ///
+    /// `mean` / `mean_se` are the per-row point and its standard error already
+    /// computed by the driver; `z_lower` / `z_upper` are the per-row tail
+    /// multipliers (the same masses the symmetric band would target).
+    fn observation_band(
+        &self,
+        input: &PredictInput,
+        mean: &Array1<f64>,
+        mean_se: &Array1<f64>,
+        z_lower: &Array1<f64>,
+        z_upper: &Array1<f64>,
+    ) -> Result<Option<(Array1<f64>, Array1<f64>)>, EstimationError> {
+        let _ = (input, mean, mean_se, z_lower, z_upper);
+        Ok(None)
+    }
 }
 
 /// Build the [`MeanBoundMethod`] selected by a transform's [`ResponseInterval`]
@@ -599,6 +639,16 @@ pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
     } else {
         None
     };
+    // A skew-aware predictor (the dispersion location-scale families) builds an
+    // equal-tailed band per row from its moment-matched predictive; when present
+    // it replaces the symmetric `μ ± z·σ` construction below (#817/#1193/#1194).
+    let override_band = if options.includeobservation_interval {
+        let z = validated_central_z(options.confidence_level)?;
+        let z_row = Array1::from_elem(state.mean.len(), z);
+        transform.observation_band(input, &state.mean, &mean_se, &z_row, &z_row)?
+    } else {
+        None
+    };
     assemble_uncertainty_result(
         options.confidence_level,
         state.eta,
@@ -614,6 +664,7 @@ pub fn predict_full_uncertainty_generic<T: PredictionTransform>(
             // location-scale identity link, `[0, 1]` for threshold-scale
             // probability families).
             bounds: transform.bounds(),
+            override_band,
         }),
         UncertaintyProvenance {
             covariance_mode_requested: options.covariance_mode,
@@ -713,7 +764,19 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
 
     if options.include_observation_interval {
         let z = validated_central_z(level)?;
-        match transform.observation_noise(input)? {
+        let z_row = Array1::from_elem(result.mean.len(), z);
+        // A skew-aware dispersion location-scale predictor builds an equal-tailed
+        // band per row from its moment-matched predictive (#817/#1193/#1194). When
+        // present it replaces the symmetric `μ ± z·σ(x)` band below, so the
+        // posterior-mean API matches the full-uncertainty API on the same skewed
+        // fit instead of emitting a symmetric band.
+        let skew_band =
+            transform.observation_band(input, &result.mean, &mean_se, &z_row, &z_row)?;
+        match (skew_band, transform.observation_noise(input)?) {
+            (Some((lower, upper)), _) => {
+                result.observation_lower = Some(lower);
+                result.observation_upper = Some(upper);
+            }
             // Heteroscedastic location-scale / dispersion predictors carry a
             // *per-row* observation noise σ(x) driven by their second linear
             // predictor (the scale / log-precision submodel). The fit-level
@@ -724,8 +787,9 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
             // predictive band from the per-row noise instead, using the same
             // `μ ± z·√(SE(μ̂)² + σ(x)²)` convention and response-support clamp
             // the full-uncertainty driver uses, so the two prediction-interval
-            // APIs agree on the same fit.
-            Some(noise_sd) => {
+            // APIs agree on the same fit. (The Gaussian location-scale band is
+            // genuinely symmetric, so it keeps this arm.)
+            (None, Some(noise_sd)) => {
                 let bounds = transform.bounds();
                 let predictive_se = Array1::from_iter(
                     mean_se
@@ -745,8 +809,7 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
             // the fit-level scalar dispersion is the correct observation noise,
             // and `family_observation_band` additionally applies the skew-aware
             // Gamma predictive arm for the right-skewed positive families.
-            None => {
-                let z_row = Array1::from_elem(result.eta.len(), z);
+            (None, None) => {
                 let etavar = result.eta_standard_error.mapv(|s| s * s);
                 let (obs_lower, obs_upper) = family_observation_band(
                     &transform.response_family(),
@@ -954,6 +1017,7 @@ mod parity_tests {
             Some(ObservationInterval {
                 noise_sd: &sigma,
                 bounds: ResponseBounds::UNBOUNDED,
+                override_band: None,
             }),
             UncertaintyProvenance {
                 covariance_mode_requested: InferenceCovarianceMode::Conditional,

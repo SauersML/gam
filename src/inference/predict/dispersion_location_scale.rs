@@ -229,6 +229,73 @@ impl PredictionTransform for DispersionLocationScalePredictor {
     ) -> Result<Option<Array1<f64>>, EstimationError> {
         self.noise_sd(input).map(Some)
     }
+
+    /// Skew-aware **equal-tailed** observation band for the dispersion
+    /// location-scale skewed families (Gamma/NB/Beta/Tweedie), the two-block
+    /// sibling of the standard-path `family_observation_band` (#817/#1193/#1194).
+    ///
+    /// A symmetric `μ ± z·√(SE(μ̂)² + σ(x)²)` band gets the width right but the
+    /// *shape* wrong on a skewed response: each tail mis-covers (the upper tail
+    /// under-covers ~2× on a right-skewed Gamma). This instead reads each row's
+    /// own precision `φ(x) = exp(eta_d(x))`, forms the per-row response variance
+    /// `Var(Y | μ(x), φ(x))` and the per-row family dispersion parameter, and
+    /// builds the band from equal-tailed quantiles of a moment-matched predictive
+    /// in the response's own family — exactly the single-block construction, with
+    /// the scalar dispersion replaced by the fitted per-row `φ(x)`.
+    fn observation_band(
+        &self,
+        input: &PredictInput,
+        mean: &Array1<f64>,
+        mean_se: &Array1<f64>,
+        z_lower: &Array1<f64>,
+        z_upper: &Array1<f64>,
+    ) -> Result<Option<(Array1<f64>, Array1<f64>)>, EstimationError> {
+        let precision = self.precision(input)?;
+        let response = &self.likelihood.response;
+        if mean.len() != precision.len() {
+            return Ok(None);
+        }
+        // Per-row response variance `Var(Y | μ, φ)` and the per-row dispersion in
+        // the family's natural units (NB θ, Tweedie φ; Gamma/Beta ignore it). The
+        // moment-matched predictive then carries each row's exact conditional law,
+        // widened only by that row's estimation SE.
+        let n = mean.len();
+        let mut response_var = Array1::<f64>::zeros(n);
+        let mut dispersion = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let mu = mean[i];
+            let prec = precision[i];
+            let (var, disp) = match response {
+                ResponseFamily::NegativeBinomial { .. } => (mu + mu * mu / prec, prec),
+                ResponseFamily::Gamma => (mu * mu / prec, prec),
+                ResponseFamily::Beta { .. } => (mu * (1.0 - mu) / (1.0 + prec), prec),
+                // Tweedie precision is `1/φ`, so `φ = 1/prec` enters both the
+                // variance law and the compound-distribution quantile.
+                ResponseFamily::Tweedie { p } => {
+                    let phi = 1.0 / prec.max(f64::MIN_POSITIVE);
+                    (phi * mu.powf(*p), phi)
+                }
+                // Any other response is not a dispersion location-scale family;
+                // leave the band to the symmetric driver.
+                _ => return Ok(None),
+            };
+            response_var[i] = var.max(0.0);
+            dispersion[i] = disp;
+        }
+        let (lower, upper) = family_observation_band_per_row(
+            response,
+            mean,
+            mean_se,
+            &response_var,
+            &dispersion,
+            z_lower,
+            z_upper,
+        );
+        Ok(match (lower, upper) {
+            (Some(lo), Some(hi)) => Some((lo, hi)),
+            _ => None,
+        })
+    }
 }
 
 impl PredictableModel for DispersionLocationScalePredictor {

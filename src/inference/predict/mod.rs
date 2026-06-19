@@ -1929,6 +1929,111 @@ where
     }
 }
 
+/// Per-row equal-tailed observation band for the dispersion location-scale
+/// (two-block / GAMLSS) families — the heteroscedastic sibling of
+/// [`family_observation_band`].
+///
+/// The standard single-block band reads one fit-level scalar dispersion
+/// (`observation_phi` / `observation_theta`) and builds equal-tailed quantiles
+/// from a moment-matched predictive in the response's own family (#817 Gamma,
+/// #1193 Negative-Binomial, #1194 Beta, plus Tweedie). The dispersion
+/// location-scale predictor instead carries a *per-row* precision `exp(eta_d(x))`
+/// from its second linear predictor, so the response variance `Var(Y | μ(x),
+/// φ(x))` and the discrete-atom families' dispersion parameter both vary by row.
+///
+/// This builds the SAME equal-tailed quantile construction row by row, with the
+/// per-row `response_var` and per-row dispersion (`theta` for NB, `phi` for
+/// Tweedie) folded into the moment-matched predictive. The total predictive
+/// variance per row is `SE(μ̂)² + Var(Y | μ, φ)` (estimation + observation
+/// noise), exactly as the symmetric driver summed, and each tail mass matches
+/// the symmetric band's `Φ(−z_lower)` / `Φ(z_upper)` — only routed through the
+/// correct skewed distribution instead of a Gaussian. Degenerate / near-Gaussian
+/// rows fall back to the symmetric Gaussian edges, then everything is clamped to
+/// the response support.
+///
+/// `mean`, `mean_standard_error`, `response_var`, and `dispersion` are all
+/// length-`n` per-row arrays; `dispersion` carries the per-row precision in the
+/// family's natural units (NB θ, Gamma ν, Beta φ, Tweedie φ — already reciprocated
+/// for Tweedie by the caller). Returns `(None, None)` for the Gaussian/binomial
+/// location-scale families (their band is genuinely symmetric, handled by the
+/// symmetric driver) and for `RoystonParmar`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn family_observation_band_per_row(
+    response: &ResponseFamily,
+    mean: &Array1<f64>,
+    mean_standard_error: &Array1<f64>,
+    response_var: &Array1<f64>,
+    dispersion: &Array1<f64>,
+    z_lower_per_row: &Array1<f64>,
+    z_upper_per_row: &Array1<f64>,
+) -> (Option<Array1<f64>>, Option<Array1<f64>>) {
+    let n = mean.len();
+    if mean_standard_error.len() != n
+        || response_var.len() != n
+        || dispersion.len() != n
+        || z_lower_per_row.len() != n
+        || z_upper_per_row.len() != n
+    {
+        return (None, None);
+    }
+    // The per-row predictive: a moment-matched distribution in the response's own
+    // family carrying mean `μ` and the requested per-row total variance, then its
+    // equal-tailed quantiles. Discrete-atom families (NB, Tweedie) additionally
+    // consume the per-row dispersion `disp` — the only quantity that is a scalar
+    // in the single-block band but an array here.
+    let predictive: Box<dyn Fn(f64, f64, f64, f64, f64) -> Option<(f64, f64)>> = match response {
+        ResponseFamily::Gamma => {
+            Box::new(|mu, _disp, total_var, p_lo, p_hi| {
+                gamma_moment_matched_interval(mu, total_var, p_lo, p_hi)
+            })
+        }
+        ResponseFamily::Beta { .. } => Box::new(|mu, _disp, total_var, p_lo, p_hi| {
+            beta_moment_matched_interval(mu, total_var, p_lo, p_hi)
+        }),
+        ResponseFamily::NegativeBinomial { .. } => {
+            Box::new(|mu, theta, total_var, p_lo, p_hi| {
+                negative_binomial_moment_matched_interval(mu, theta, total_var, p_lo, p_hi)
+            })
+        }
+        ResponseFamily::Tweedie { p } => {
+            let power = *p;
+            Box::new(move |mu, phi, total_var, p_lo, p_hi| {
+                tweedie_moment_matched_interval(mu, phi, power, total_var, p_lo, p_hi)
+            })
+        }
+        // Gaussian/binomial location-scale bands are genuinely symmetric (the
+        // symmetric driver is correct); RoystonParmar has no closed-form
+        // conditional response variance.
+        _ => return (None, None),
+    };
+
+    let observation_support = ResponseBounds::response_support(response);
+    let mut lower = Array1::<f64>::zeros(n);
+    let mut upper = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mu = mean[i];
+        let total_var = (mean_standard_error[i].powi(2) + response_var[i]).max(0.0);
+        let p_lower = normal_cdf(-z_lower_per_row[i]);
+        let p_upper = normal_cdf(z_upper_per_row[i]);
+        match predictive(mu, dispersion[i], total_var, p_lower, p_upper) {
+            Some((q_lo, q_hi)) => {
+                lower[i] = q_lo;
+                upper[i] = q_hi;
+            }
+            None => {
+                // Degenerate / near-Gaussian row: keep the symmetric Gaussian
+                // edges (then-accurate), clamped to support below.
+                let s = total_var.sqrt();
+                lower[i] = mu - z_lower_per_row[i] * s;
+                upper[i] = mu + z_upper_per_row[i] * s;
+            }
+        }
+    }
+    observation_support.clamp_in_place(&mut lower);
+    observation_support.clamp_in_place(&mut upper);
+    (Some(lower), Some(upper))
+}
+
 pub fn predict_gamwith_uncertainty<X, S>(
     x: X,
     beta: ArrayView1<'_, f64>,
