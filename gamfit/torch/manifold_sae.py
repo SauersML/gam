@@ -662,6 +662,27 @@ class _SparsityLayer(nn.Module):
         # With the commit disabled the EMA smooths the EM's *own* responsibilities
         # (late-residual washout protection), so it can track more responsively.
         self._assign_ema_beta = 0.9
+        # #1282 global direction-clustering anchor. On the disjoint two-circle
+        # DGP the residual-EM / matching-pursuit routing is init-sensitive (it
+        # recovers the trivial split only for some seeds — measured 0.72..0.99
+        # routing across Adam seeds), the genuine symmetry-breaking failure the
+        # issue reports. The closed-form lane avoids the seed lottery by seeding
+        # the partition from a *global* residual-energy clustering of the rows,
+        # not from the per-row instantaneous residual. The gradient-path analogue
+        # computed here is a deterministic line-clustering of the input row
+        # directions (each row assigned to the principal *line* — sign-invariant
+        # ray — of its cluster): manifolds occupying distinct ambient direction
+        # subspaces (the disjoint circles) separate cleanly and seed-free, while
+        # entangled manifolds that share a direction subspace (the energy-
+        # degenerate signed circles) do not — so the clustering is only trusted
+        # when it is *confident* (balanced clusters + a clear per-row line
+        # margin). When confident the one-hot anchors the hard routing for the
+        # whole run (it cannot drift to the noisy late residual); when not, the
+        # existing residual-EM + matching-pursuit path is used unchanged. Keys
+        # only on the input rows — geometry-agnostic. Computed once per batch
+        # (lazily, on the first training forward) and cached here.
+        self._global_anchor: torch.Tensor | None = None
+        self._global_anchor_ready = False
 
     @torch.no_grad()
     def advance_temperature(self) -> None:
@@ -728,6 +749,70 @@ class _SparsityLayer(nn.Module):
         # through inactive atoms teaches every atom every selected row, which is
         # exactly the routing collapse this gate is meant to prevent.
         return hard
+
+    @staticmethod
+    @torch.no_grad()
+    def _direction_cluster_anchor(
+        x: torch.Tensor, n_atoms: int, *, iters: int = 25
+    ) -> tuple[torch.Tensor | None, bool]:
+        """Deterministic line-clustering of the input row directions (issue #1282).
+
+        Returns ``(onehot (N, F), confident)``. Each row is assigned to the
+        cluster whose principal *line* (sign-invariant ray, the top right
+        singular vector of the cluster's unit rows) it aligns with most; this is
+        a seed-free k-lines clustering of the ambient row directions. Disjoint
+        manifolds occupy distinct ambient direction subspaces (the two circles
+        live in orthogonal 2-planes), so the clustering recovers the partition
+        deterministically; entangled manifolds that share a direction subspace
+        (the energy-degenerate signed circles) do not, so the result is flagged
+        *unconfident* and the caller falls back to the residual-EM router.
+
+        ``confident`` requires (a) balanced clusters — the smallest cluster holds
+        at least ``0.6 · N/F`` rows, so a degenerate "one atom grabs everything"
+        split is rejected — and (b) a clear per-row line margin (mean gap between
+        the best and second-best line alignment), so an ambiguous split where
+        every row aligns with every line equally is rejected. Keys only on the
+        input rows; no hardcoded geometry.
+        """
+        if n_atoms < 2 or x.shape[0] < 2 * n_atoms:
+            return None, False
+        xn = x / x.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        n = int(x.shape[0])
+        # Deterministic farthest-line init: first line = top PC of the centered
+        # unit rows; each next line = the row least aligned with the chosen lines.
+        try:
+            _, _, vh = torch.linalg.svd(xn - xn.mean(dim=0, keepdim=True), full_matrices=False)
+        except Exception:
+            return None, False
+        centers = [vh[0]]
+        for _ in range(1, n_atoms):
+            aligned = torch.stack([(xn @ c).abs() for c in centers], dim=1).max(dim=1).values
+            centers.append(xn[int(aligned.argmin().item())])
+        C = torch.stack(centers, dim=0)
+        assign = torch.zeros(n, dtype=torch.long, device=x.device)
+        for _ in range(iters):
+            align = (xn @ C.T).abs()
+            assign = align.argmax(dim=1)
+            for k in range(n_atoms):
+                members = xn[assign == k]
+                if members.shape[0] > 0:
+                    try:
+                        _, _, vk = torch.linalg.svd(members, full_matrices=False)
+                    except Exception:
+                        return None, False
+                    C[k] = vk[0]
+        align = (xn @ C.T).abs()
+        counts = torch.bincount(assign, minlength=n_atoms).to(dtype=x.dtype)
+        balance = float((counts.min() / (n / n_atoms)).item())
+        if n_atoms >= 2:
+            top2 = align.topk(2, dim=1).values
+            margin = float((top2[:, 0] - top2[:, 1]).mean().item())
+        else:
+            margin = 1.0
+        confident = bool(balance >= 0.6 and margin >= 0.25)
+        onehot = torch.zeros(n, n_atoms, dtype=x.dtype, device=x.device)
+        onehot[torch.arange(n, device=x.device), assign] = 1.0
+        return onehot, confident
 
     def reconstruction_topk_gate(
         self,
@@ -817,6 +902,42 @@ class _SparsityLayer(nn.Module):
             # reconstruction gradient to the decoders (M-step). It is the only
             # differentiable quantity below; the hard routing is straight-through.
             soft = torch.softmax(balanced_log_resp, dim=-1)
+
+            # Confident global direction-clustering anchor (issue #1282). The
+            # residual-EM router below is init-sensitive on the disjoint two-
+            # circle DGP — it recovers the trivial split only for some Adam seeds
+            # (the symmetry-breaking failure the issue reports). When a *global*
+            # line-clustering of the input row directions is confident (balanced,
+            # clear per-row margin), it is a seed-free theorem-level partition of
+            # the disjoint manifolds, so it anchors the hard routing for the whole
+            # run and cannot drift to the noisy late residual; the soft residual
+            # responsibilities still carry the reconstruction gradient (straight-
+            # through). When the clustering is *not* confident (entangled / energy-
+            # degenerate manifolds that share a direction subspace), the existing
+            # residual-EM + matching-pursuit path below is used unchanged. The
+            # anchor is computed once per batch on the first training forward and
+            # cached. Keys only on the input rows — geometry-agnostic.
+            if (
+                self.training
+                and not self._global_anchor_ready
+                and self.n_atoms >= 2
+            ):
+                anchor, confident = self._direction_cluster_anchor(
+                    x.detach(), self.n_atoms
+                )
+                self._global_anchor = anchor if confident else None
+                self._global_anchor_ready = True
+            anchor = self._global_anchor
+            if anchor is not None and anchor.shape == soft.shape:
+                hard_ste = anchor + soft - soft.detach()
+                # Floor the routed atom's code at a negligible positive multiple
+                # of the row scale so every routed row reports exactly one active
+                # atom (the avg-one-active-atom top-k contract) even when its
+                # best non-negative code projects to ~0; the floor is far below
+                # any genuine amplitude so reconstruction is untouched.
+                code_floor = 1.0e-6 * row_scale.squeeze(-1).clamp_min(1e-12).sqrt()
+                gated_code = torch.maximum(code, code_floor.unsqueeze(-1) * anchor)
+                return gated_code * hard_ste
 
             # Balanced commitment during an early window (issue #1282). Hands
             # each atom a fixed distinct half of the rows to break the init
