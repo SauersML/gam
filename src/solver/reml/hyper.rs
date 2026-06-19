@@ -4,6 +4,34 @@ use crate::matrix::{
 };
 use ndarray::Zip;
 
+/// Build the degenerate `p_dim == 0` hyper-coordinate list: `count` coords with
+/// no coefficient sensitivity (`a = 0`, empty `g`, no drift, `ld_s = 0`, no
+/// Firth / tensor-kernel terms). The two per-direction fields that vary across
+/// the early-return sites are passed in: `b_depends_on_beta` and a per-index
+/// `is_penalty_like` predicate.
+///
+/// Single source of truth for the `p_dim == 0` short-circuit shared by the
+/// tau- and rho-direction hyper-coordinate builders.
+fn empty_hyper_coords(
+    count: usize,
+    b_depends_on_beta: bool,
+    is_penalty_like: impl Fn(usize) -> bool,
+) -> Vec<super::reml_outer_engine::HyperCoord> {
+    (0..count)
+        .map(|j| super::reml_outer_engine::HyperCoord {
+            a: 0.0,
+            g: Array1::zeros(0),
+            drift: super::reml_outer_engine::HyperCoordDrift::none(),
+            ld_s: 0.0,
+            b_depends_on_beta,
+            is_penalty_like: is_penalty_like(j),
+            firth_g: None,
+            tk_eta_fixed: None,
+            tk_x_fixed: None,
+        })
+        .collect()
+}
+
 #[inline]
 pub(crate) fn directional_curvature_weights(
     c_array: &Array1<f64>,
@@ -1294,19 +1322,9 @@ impl<'a> RemlState<'a> {
         }
         let p_dim = beta_eval.len();
         if p_dim == 0 {
-            return Ok((0..psi_dim)
-                .map(|j| super::reml_outer_engine::HyperCoord {
-                    a: 0.0,
-                    g: Array1::zeros(0),
-                    drift: super::reml_outer_engine::HyperCoordDrift::none(),
-                    ld_s: 0.0,
-                    b_depends_on_beta: false,
-                    is_penalty_like: hyper_dirs[j].is_penalty_like,
-                    firth_g: None,
-                    tk_eta_fixed: None,
-                    tk_x_fixed: None,
-                })
-                .collect::<Vec<_>>());
+            return Ok(empty_hyper_coords(psi_dim, false, |j| {
+                hyper_dirs[j].is_penalty_like
+            }));
         }
 
         // Working residual u = w ⊙ (z − η̂).
@@ -2037,19 +2055,9 @@ impl<'a> RemlState<'a> {
         let p_dim = beta_eval.len();
         let n_obs = self.y.len();
         if p_dim == 0 {
-            return Ok((0..psi_dim)
-                .map(|j| super::reml_outer_engine::HyperCoord {
-                    a: 0.0,
-                    g: Array1::zeros(0),
-                    drift: super::reml_outer_engine::HyperCoordDrift::none(),
-                    ld_s: 0.0,
-                    b_depends_on_beta: false,
-                    is_penalty_like: hyper_dirs[j].is_penalty_like,
-                    firth_g: None,
-                    tk_eta_fixed: None,
-                    tk_x_fixed: None,
-                })
-                .collect());
+            return Ok(empty_hyper_coords(psi_dim, false, |j| {
+                hyper_dirs[j].is_penalty_like
+            }));
         }
 
         for (j, dir) in hyper_dirs.iter().enumerate() {
@@ -2846,19 +2854,7 @@ impl<'a> RemlState<'a> {
         let aux_dim = 2usize; // epsilon, log_delta
 
         if p_dim == 0 {
-            return Ok((0..aux_dim)
-                .map(|_| super::reml_outer_engine::HyperCoord {
-                    a: 0.0,
-                    g: Array1::zeros(0),
-                    drift: super::reml_outer_engine::HyperCoordDrift::none(),
-                    ld_s: 0.0,
-                    b_depends_on_beta: true,
-                    is_penalty_like: false,
-                    firth_g: None,
-                    tk_eta_fixed: None,
-                    tk_x_fixed: None,
-                })
-                .collect());
+            return Ok(empty_hyper_coords(aux_dim, true, |_| false));
         }
 
         // Per-observation link jet with parameter partials.
@@ -3034,19 +3030,7 @@ impl<'a> RemlState<'a> {
         }
 
         if p_dim == 0 {
-            return Ok((0..aux_dim)
-                .map(|_| super::reml_outer_engine::HyperCoord {
-                    a: 0.0,
-                    g: Array1::zeros(0),
-                    drift: super::reml_outer_engine::HyperCoordDrift::none(),
-                    ld_s: 0.0,
-                    b_depends_on_beta: true,
-                    is_penalty_like: false,
-                    firth_g: None,
-                    tk_eta_fixed: None,
-                    tk_x_fixed: None,
-                })
-                .collect());
+            return Ok(empty_hyper_coords(aux_dim, true, |_| false));
         }
 
         let mut direct_ll = vec![0.0_f64; aux_dim];
