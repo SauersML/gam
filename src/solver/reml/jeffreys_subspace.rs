@@ -1484,30 +1484,45 @@ impl JeffreysHphiDriftBase {
             }
         }
         // The β-FIXED per-axis base: `Ṽ_a = Vᵀ D_a V` and `Ψ ∘ Ṽ_a`, formed from
-        // the `p` supplied first directional derivatives `Hdot[e_a]`. The cheap
-        // per-axis reduction (`Ṽ_a` rotation + row writes) is serial over the
-        // index-ordered axes, so the prepared base is bit-identical regardless of
-        // how the `{Hdot[e_a]}` were obtained (per-axis closure or batched hook).
+        // the `p` supplied first directional derivatives `Hdot[e_a]`. The per-axis
+        // reduction (`Ṽ_a = Vᵀ (Z_Jᵀ Hdot[e_a] Z_J)_sym V` + row writes) is
+        // INDEPENDENT across axes and writes into the DISJOINT row `a` of
+        // `a_rows`/`aw_rows`, so fanning it over rayon is bit-identical to the
+        // index-ordered serial sweep (no cross-axis reduction). The dominant cost
+        // is the two dense GEMMs per axis (`p×m·p×p·p×m`), so this collapses the
+        // serial O(p) Gram-reduction sweep that dominated the large-`p`
+        // marginal-slope path (#979).
         let z_owned = z_j.to_owned();
         let mut a_rows = Array2::<f64>::zeros((p, m * m));
         let mut aw_rows = Array2::<f64>::zeros((p, m * m));
-        for (a, hdot_a) in hdots.into_iter().enumerate() {
-            let d_a_raw = z_j.t().dot(&hdot_a.dot(&z_j));
-            let mut d_a = Array2::<f64>::zeros((m, m));
-            for i in 0..m {
-                for j in 0..m {
-                    d_a[[i, j]] = 0.5 * (d_a_raw[[i, j]] + d_a_raw[[j, i]]);
-                }
-            }
-            let a_a = evecs.t().dot(&d_a).dot(&evecs);
-            let mut col = 0usize;
-            for i in 0..m {
-                for j in 0..m {
-                    a_rows[[a, col]] = a_a[[i, j]];
-                    aw_rows[[a, col]] = psi[[i, j]] * a_a[[i, j]];
-                    col += 1;
-                }
-            }
+        {
+            use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+            let hdots: Vec<Array2<f64>> = hdots;
+            a_rows
+                .axis_iter_mut(ndarray::Axis(0))
+                .into_par_iter()
+                .zip(aw_rows.axis_iter_mut(ndarray::Axis(0)).into_par_iter())
+                .zip(hdots.into_par_iter())
+                .for_each(|((mut a_row, mut aw_row), hdot_a)| {
+                    crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                        let d_a_raw = z_j.t().dot(&hdot_a.dot(&z_j));
+                        let mut d_a = Array2::<f64>::zeros((m, m));
+                        for i in 0..m {
+                            for j in 0..m {
+                                d_a[[i, j]] = 0.5 * (d_a_raw[[i, j]] + d_a_raw[[j, i]]);
+                            }
+                        }
+                        let a_a = evecs.t().dot(&d_a).dot(&evecs);
+                        let mut col = 0usize;
+                        for i in 0..m {
+                            for j in 0..m {
+                                a_row[col] = a_a[[i, j]];
+                                aw_row[col] = psi[[i, j]] * a_a[[i, j]];
+                                col += 1;
+                            }
+                        }
+                    });
+                });
         }
         Ok(Some(JeffreysHphiDriftBase {
             p,
@@ -1728,39 +1743,58 @@ impl JeffreysHphiDriftBase {
                 ));
             }
         }
-        // Reconstruct Ṽ_a (m × m) from the flattened base row for the rotation terms.
-        let mut a_a = Array2::<f64>::zeros((m, m));
-        for (a, pert_hdot_a) in pert_hdots.into_iter().enumerate() {
-            {
-                let mut col = 0usize;
-                for i in 0..m {
-                    for j in 0..m {
-                        a_a[[i, j]] = a_rows[[a, col]];
-                        col += 1;
-                    }
-                }
-            }
+        // Per axis: reconstruct Ṽ_a (m × m) from the flattened base row, reduce the
+        // δ-dependent second derivative `∂D_a = Z_Jᵀ (∂Hdot[e_a]) Z_J`, form δṼ_a,
+        // and write rows `da_rows[a,:]`/`dw_rows[a,:]`. Each axis is INDEPENDENT and
+        // writes its OWN disjoint row (the shared `rotation`/`dpsi`/`psi`/`evecs`
+        // are read-only), so this is bit-identical to the serial index-ordered
+        // sweep. The two dense GEMMs per axis are the dominant cost, so the rayon
+        // fan-out collapses the per-direction O(p) reduction (#979/#1082).
+        {
+            use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+            da_rows
+                .axis_iter_mut(ndarray::Axis(0))
+                .into_par_iter()
+                .zip(dw_rows.axis_iter_mut(ndarray::Axis(0)).into_par_iter())
+                .zip(a_rows.axis_iter(ndarray::Axis(0)).into_par_iter())
+                .zip(pert_hdots.into_par_iter())
+                .for_each(|(((mut da_row, mut dw_row), a_flat), pert_hdot_a)| {
+                    crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                        let mut a_a = Array2::<f64>::zeros((m, m));
+                        {
+                            let mut col = 0usize;
+                            for i in 0..m {
+                                for j in 0..m {
+                                    a_a[[i, j]] = a_flat[col];
+                                    col += 1;
+                                }
+                            }
+                        }
 
-            let d_a_pert_raw = z_j.t().dot(&pert_hdot_a.dot(&z_j)); // Z_Jᵀ (∂Hdot[e_a]) Z_J
-            let mut d_a_pert = Array2::<f64>::zeros((m, m));
-            for i in 0..m {
-                for j in 0..m {
-                    d_a_pert[[i, j]] = 0.5 * (d_a_pert_raw[[i, j]] + d_a_pert_raw[[j, i]]);
-                }
-            }
+                        let d_a_pert_raw = z_j.t().dot(&pert_hdot_a.dot(&z_j)); // Z_Jᵀ (∂Hdot[e_a]) Z_J
+                        let mut d_a_pert = Array2::<f64>::zeros((m, m));
+                        for i in 0..m {
+                            for j in 0..m {
+                                d_a_pert[[i, j]] =
+                                    0.5 * (d_a_pert_raw[[i, j]] + d_a_pert_raw[[j, i]]);
+                            }
+                        }
 
-            // δṼ_a = Vᵀ (∂D_a) V + Ṽ_a C − C Ṽ_a.
-            let da_a =
-                evecs.t().dot(&d_a_pert).dot(evecs) + &a_a.dot(&rotation) - &rotation.dot(&a_a);
+                        // δṼ_a = Vᵀ (∂D_a) V + Ṽ_a C − C Ṽ_a.
+                        let da_a = evecs.t().dot(&d_a_pert).dot(evecs) + &a_a.dot(&rotation)
+                            - &rotation.dot(&a_a);
 
-            let mut col = 0usize;
-            for i in 0..m {
-                for j in 0..m {
-                    da_rows[[a, col]] = da_a[[i, j]];
-                    dw_rows[[a, col]] = dpsi[[i, j]] * a_a[[i, j]] + psi[[i, j]] * da_a[[i, j]];
-                    col += 1;
-                }
-            }
+                        let mut col = 0usize;
+                        for i in 0..m {
+                            for j in 0..m {
+                                da_row[col] = da_a[[i, j]];
+                                dw_row[col] =
+                                    dpsi[[i, j]] * a_a[[i, j]] + psi[[i, j]] * da_a[[i, j]];
+                                col += 1;
+                            }
+                        }
+                    });
+                });
         }
 
         // δH_Φ_raw[a,b] = −½ (⟨vec(δΨ∘Ṽ_a + Ψ∘δṼ_a), vec(Ṽ_b)⟩ + ⟨vec(Ψ∘Ṽ_a), vec(δṼ_b)⟩).
