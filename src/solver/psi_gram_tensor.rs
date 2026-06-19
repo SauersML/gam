@@ -581,16 +581,16 @@ impl PsiGramTensor {
         // FD error, not the analytic reconstruction error, and refuses at every
         // scan point (the analytic ψ-derivative is itself bit-tight, sharing the
         // certified value representation). Fix: Richardson-validate the reference.
-        // Compute the FD at `h` and `h/2`; (1) require the two to AGREE to
-        // `FD_CONVERGED_RTOL` — only then is the reference converged enough to be
-        // a trustworthy oracle at this ψ (near the explosive large-ψ edge they
-        // disagree → honestly leave that ψ uncertified), and (2) use the
-        // Richardson extrapolant `(16·fd(h/2) − fd(h))/15` (O(h⁶) truncation) as
-        // the reference, pushing the reference error well below the rtol where it
-        // IS converged. `h` stays window-relative but smaller, balancing the
-        // O(h⁶) truncation against the O(ε/h) rounding floor.
+        // Compute the FD at `h` and `h/2`; (1) require the two to AGREE to the
+        // same relative scale as the analytic derivative certificate — only then
+        // is the reference converged enough to be a trustworthy oracle at this ψ
+        // (near the explosive large-ψ edge they disagree → honestly leave that ψ
+        // uncertified), and (2) use the Richardson extrapolant `(16·fd(h/2) −
+        // fd(h))/15` (O(h⁶) truncation) as the reference. `h` stays window-
+        // relative but smaller, balancing the O(h⁶) truncation against the
+        // O(ε/h) rounding floor.
         // FD-OK: FD-audit certificate (Richardson-validated FD reference certifying the analytic ψ-derivative)
-        const FD_CONVERGED_RTOL: f64 = 1e-9; // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
+        const FD_CONVERGED_RTOL: f64 = PSI_GRAM_GRAD_SPOT_RTOL; // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
         let h = (span * 2e-4).max(1e-6).min(span / 16.0);
         if !(h.is_finite() && h > 0.0) {
             self.grad_psi_lo = f64::NAN;
