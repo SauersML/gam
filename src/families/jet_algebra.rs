@@ -273,7 +273,7 @@ mod tests {
                 dirs3[2] = q;
                 let jet3 = nonlinear_dirjet_program(p, &dirs3);
                 assert_close(
-                    jet3.coeff(jet3.full_mask()),
+                    jet3.coeff(jet3.coeffs.len() - 1),
                     third[a][b],
                     &format!("third contraction ({a},{b})"),
                 );
@@ -285,7 +285,7 @@ mod tests {
                 dirs4[3] = w;
                 let jet4 = nonlinear_dirjet_program(p, &dirs4);
                 assert_close(
-                    jet4.coeff(jet4.full_mask()),
+                    jet4.coeff(jet4.coeffs.len() - 1),
                     fourth[a][b],
                     &format!("fourth contraction ({a},{b})"),
                 );
