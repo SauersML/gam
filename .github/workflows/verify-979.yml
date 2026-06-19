@@ -62,7 +62,7 @@ jobs:
           CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: "off"
         run: |
           set -uo pipefail
-          echo "verifying #979 at $(git rev-parse HEAD)"
+          echo "verifying #979 close gates at $(git rev-parse HEAD)"
           cargo test --release --test survival \
             survival_marginal_slope_matern_logslope_converges_within_budget -- --nocapture
           cargo test --release \
