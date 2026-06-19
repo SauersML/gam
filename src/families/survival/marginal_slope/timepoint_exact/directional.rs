@@ -355,6 +355,62 @@ impl SurvivalMarginalSlopeFamily {
         for u in 0..p {
             a_u[u] = -f_u[u] * inv_f_a;
         }
+        let a_dir = a_u.dot(dir);
+        let dir_g = if primary.g < p { dir[primary.g] } else { 0.0 };
+        if b != 0.0 {
+            for cell_entry in &cached.cells {
+                let cell = cell_entry.neg_cell;
+                let fixed = &cell_entry.fixed;
+                let part = &cell_entry.partition_cell;
+                let edge_vel = |axis: usize,
+                                edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                z: f64|
+                 -> f64 {
+                    match edge {
+                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                            let direct_g = if axis == primary.g { z } else { 0.0 };
+                            -(a_u[axis] + direct_g) / b
+                        }
+                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                    }
+                };
+                let flux = |axis: usize, poly: &[f64]| -> f64 {
+                    let v_r = edge_vel(axis, part.right_edge, cell.right);
+                    let v_l = edge_vel(axis, part.left_edge, cell.left);
+                    let right = if v_r != 0.0 {
+                        v_r * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                            cell, poly, cell.right,
+                        )
+                    } else {
+                        0.0
+                    };
+                    let left = if v_l != 0.0 {
+                        v_l * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                            cell, poly, cell.left,
+                        )
+                    } else {
+                        0.0
+                    };
+                    right - left
+                };
+                for u in 0..p {
+                    let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                    for v in u..p {
+                        let boundary = flux(v, &neg_coeff_u);
+                        let boundary = if u == v {
+                            boundary
+                        } else {
+                            let neg_coeff_v = fixed.coeff_u[v].map(|value| -value);
+                            boundary + flux(u, &neg_coeff_v)
+                        };
+                        f_uv[[u, v]] += boundary;
+                        if u != v {
+                            f_uv[[v, u]] += boundary;
+                        }
+                    }
+                }
+            }
+        }
         let mut a_uv = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
@@ -365,9 +421,7 @@ impl SurvivalMarginalSlopeFamily {
                 a_uv[[v, u]] = val;
             }
         }
-        let a_dir = a_u.dot(dir);
         let a_u_dir = a_uv.dot(dir);
-        let dir_g = if primary.g < p { dir[primary.g] } else { 0.0 };
         if b != 0.0 && (a_dir != 0.0 || dir_g != 0.0) {
             for cell_entry in &cached.cells {
                 let neg_cell = cell_entry.neg_cell;
