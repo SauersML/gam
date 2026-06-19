@@ -399,6 +399,61 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
     );
 }
 
+/// #1033 MICRO read (2 points, n=1k vs 2k): the smallest discriminant of
+/// n-independence. Per-callback cost flat ⇒ n-free; tracking the 2× n ⇒ O(n).
+/// Finishes in seconds — a development-loop probe, NOT the close gate (the full
+/// 1k→16k/320k ladders are). No bar tightening here vs the headline ≤8× / flat
+/// reset contract; this just surfaces the ratio fast.
+#[test]
+fn kappa_micro_2point_n_independence() {
+    let (aniso, bounds) = (false, (1e-2, 1e2));
+    let warm = run_fit(1000, true, aniso, bounds)
+        .unwrap_or_else(|reason| panic!("[kappa-micro] warm iso-κ fit failed ({reason})"));
+    eprintln!("[kappa-micro] warm-up primed caches in {:.4}s", warm.wall_s);
+
+    let ns = [1_000usize, 2_000];
+    let mut cb = Vec::new();
+    let mut resets = Vec::new();
+    for &n in &ns {
+        let kappa = run_kappa_trial_seconds(n, aniso, bounds).unwrap();
+        let timing = kappa.kappa_timing.unwrap();
+        let calls = (timing.cost_calls + timing.eval_calls + timing.efs_calls).max(1);
+        let per_cb = timing.trial_total_s().max(0.0) / calls as f64;
+        cb.push(per_cb.max(1e-6));
+        resets.push(timing.slow_path_resets);
+        eprintln!(
+            "[kappa-micro] n={n:>5}  per_callback_s={per_cb:.5}  resets={}  \
+             miss(shape/value/grad/pen/rev/2nd/oth)={}/{}/{}/{}/{}/{}/{}",
+            timing.slow_path_resets,
+            timing.nfree_miss_shape,
+            timing.nfree_miss_value,
+            timing.nfree_miss_gradient,
+            timing.nfree_miss_penalty,
+            timing.nfree_miss_revision,
+            timing.nfree_miss_second_order,
+            timing.nfree_miss_other,
+        );
+    }
+    let ratio = cb[1] / cb[0];
+    eprintln!(
+        "[kappa-micro] n grew 2× ; PER-CALLBACK grew {ratio:.2}× \
+         (n-independent ⇒ ~1×, O(n) ⇒ ~2×) ; resets {}→{}",
+        resets[0], resets[1]
+    );
+    // Sub-linear tripwire at 2× n: an O(n) regression tracks ~2×; a flat n-free
+    // loop holds ~1×. Gate well below 2× and require resets not to climb.
+    assert!(
+        resets[1] <= resets[0].saturating_add(1),
+        "[kappa-micro] slow_path_resets climbed {}→{} — n-free skip not firing",
+        resets[0], resets[1]
+    );
+    assert!(
+        ratio <= 1.6,
+        "[kappa-micro] per-callback grew {ratio:.2}× across a 2× n increase — \
+         the #1033 outer loop is still doing O(n) work per trial"
+    );
+}
+
 #[test]
 fn kappa_outer_loop_is_n_independent() {
     // ISOTROPIC path (`aniso=false`, `aniso_log_scales=None`): the single
