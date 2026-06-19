@@ -4243,17 +4243,7 @@ fn gaussian_reml_fit_blocks_forward<'py>(
                     "init_rhos[{block}] must be finite; got {value}"
                 )));
             }
-            let lambdas: Vec<f64> = rv.iter().map(|rho| rho.exp()).collect();
-            if let Some((block, value)) = lambdas
-                .iter()
-                .enumerate()
-                .find(|(_, value)| !value.is_finite() || **value <= 0.0)
-            {
-                return Err(py_value_error(format!(
-                    "exp(init_rhos[{block}]) must be finite and positive; got {value}"
-                )));
-            }
-            Some(lambdas)
+            Some(rv.iter().copied().collect())
         }
         None => None,
     };
@@ -4723,7 +4713,7 @@ fn gaussian_reml_fit_with_constraints_forward<'py>(
         persist_warm_start_disk: false,
     };
 
-    let heuristic_owned: Option<Vec<f64>> = init_log_lambda.map(|rho| vec![rho.exp()]);
+    let heuristic_owned: Option<Vec<f64>> = init_log_lambda.map(|rho| vec![rho]);
 
     let x_owned = x_view.to_owned();
     let x_for_active = x_owned.clone();

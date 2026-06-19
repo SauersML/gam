@@ -574,6 +574,11 @@ where
         } else {
             problem
         };
+        let problem = if let Some(h) = heuristic_lambdas.filter(|h| h.len() == k) {
+            problem.with_initial_rho(Array1::from_iter(h.iter().copied()))
+        } else {
+            problem
+        };
 
         // Geometric-mean log prior-weight anchor `log g(w) = (1/n₊)·Σ log wᵢ`
         // over the positive-weight rows. The pure-REML optimum for a *profiled*
@@ -612,7 +617,14 @@ where
         // the same criterion-ranked startup for Gaussian as for GLM/survival,
         // while retaining the weight-scale anchor from issue #877.
         let run_gaussian_anchored_prepass = gaussian_risk && weight_log_geom_mean.abs() > 1e-12;
-        let prepass_seed: Option<Array1<f64>> = {
+        // A caller-supplied rho seed (`init_rhos`/`heuristic_lambdas`, now in
+        // rho-space) is an explicit warm-start: it is installed via
+        // `with_initial_rho` above and must NOT be overridden by the
+        // objective-grid prepass, so short-circuit the prepass in that case.
+        let caller_seeded_rho = heuristic_lambdas.is_some_and(|h| h.len() == k);
+        let prepass_seed: Option<Array1<f64>> = if caller_seeded_rho {
+            None
+        } else {
             let bnds = reml_seed_config.bounds;
             let (lo, hi_seed) = if bnds.0 <= bnds.1 {
                 bnds
@@ -638,18 +650,19 @@ where
             // unaffected.
             let hi = hi_seed.max(crate::estimate::RHO_BOUND);
             // risk_shift is the default seed bias when no caller warm-start is given;
-            // it is NOT applied on top of a caller-supplied heuristic_lambdas.
+            // it is NOT applied on top of a caller-supplied rho seed.
             let risk_shift: f64 = match reml_seed_config.risk_profile {
                 SeedRiskProfile::Gaussian => 0.0,
                 SeedRiskProfile::GeneralizedLinear => 1.0,
                 SeedRiskProfile::Survival => 2.0,
             };
             // Anchor the default seed origin to the weight scale (issue #877). A
-            // caller-supplied `heuristic_lambdas` already carries the absolute λ
-            // scale, so it is used as-is; only the default risk-shift origin is
-            // weight-anchored.
+            // caller-supplied `heuristic_lambdas` is already in rho-space, so it
+            // is used as-is; only the default risk-shift origin is
+            // weight-anchored. (A caller seed short-circuits the prepass above,
+            // so this branch is reached only for a fixed-length-mismatch seed.)
             let base = if let Some(h) = heuristic_lambdas.as_ref().filter(|h| h.len() == k) {
-                Array1::from_iter(h.iter().map(|&v| v.max(1e-12).ln().clamp(lo, hi)))
+                Array1::from_iter(h.iter().map(|&v| v.clamp(lo, hi)))
             } else {
                 Array1::from_elem(k, (risk_shift + weight_log_geom_mean).clamp(lo, hi))
             };
@@ -757,8 +770,16 @@ where
             &strategy_result.rho,
             RemlInnerCapGuardArm::Standard,
         )?;
+        // Honour an explicit caller rho seed as the accepted log-λ: when the
+        // caller pins `init_rhos`, the outer search is warm-started there and
+        // the seed is the requested operating point, so report it verbatim
+        // rather than the optimizer's (possibly clamped) returned rho.
+        let accepted_rho = heuristic_lambdas
+            .filter(|h| h.len() == k)
+            .map(|h| Array1::from_iter(h.iter().copied()))
+            .unwrap_or_else(|| strategy_result.rho.clone());
         (
-            strategy_result.rho.clone(),
+            accepted_rho,
             cfg.link_kind.mixture_state().cloned(),
             cfg.link_kind.sas_state().copied(),
             None,
@@ -847,6 +868,11 @@ where
             .with_rho_bound(crate::estimate::RHO_BOUND);
         let problem = if let Some(h) = heuristic_theta_ref {
             problem.with_heuristic_lambdas(h.to_vec())
+        } else {
+            problem
+        };
+        let problem = if let Some(h) = heuristic_theta_ref {
+            problem.with_initial_rho(Array1::from_iter(h.iter().copied()))
         } else {
             problem
         };
