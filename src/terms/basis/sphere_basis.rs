@@ -646,7 +646,7 @@ pub(crate) fn build_spherical_harmonic_basis(
     // Split the diagonal Laplace-Beltrami curvature penalty into two blocks that
     // carry SEPARATE smoothing parameters (#1246, polar high-latitude quality):
     //   * Primary  — the low-frequency signal band (degree l <= 2), penalized by
-    //                [l(l+1)]^(m+1). This is the part that carries genuine sphere
+    //                [l(l+1)]^(m+2). This is the part that carries genuine sphere
     //                signal (the degree-2 sectoral/zonal truth), so its lambda must
     //                stay moderate enough to fit it.
     //   * Tail     — the high-degree modes (l > 2), penalized by [l(l+1)]^(m+2).
@@ -670,7 +670,14 @@ pub(crate) fn build_spherical_harmonic_basis(
             if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
                 // unpenalized low-degree span
             } else if l <= 2 {
-                penalty[[col, col]] = laplace.powi((spec.penalty_order + 1) as i32);
+                // Penalize the degree-2 signal band at the SAME Sobolev order
+                // (m+2) as the high-degree tail. A consistent seminorm order
+                // across all penalized degrees keeps the polar-heavy l=2 zonal
+                // mode (P_{2,0} ~ 3cos^2(lat), maximal at the poles) under the
+                // same curvature scale as the rest, so it cannot accumulate
+                // residual wiggle in the sparse polar bands once REML fits the
+                // equator-dominant sectoral modes.
+                penalty[[col, col]] = laplace.powi((spec.penalty_order + 2) as i32);
             } else {
                 tail[[col, col]] = laplace.powi((spec.penalty_order + 2) as i32);
             }

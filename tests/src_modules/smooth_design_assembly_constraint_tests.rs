@@ -4897,23 +4897,47 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // the skipped fast path re-keys only the Gaussian Gram cache + penalty (k×k),
     // never reads the frozen `self.x`, so β̂ stays bit-identical to the streamed
     // slow path EVEN across the basis rotation the witness refuses.
+    // #1264 SOUNDNESS CONTRACT (restored to the d9294a3fa design). The n-free fast
+    // path installs the Chebyshev-interpolated Gram `gram_at(ψ)` (≤ 1e-10 relative
+    // to the streamed EXACT assembled Gram). On this production Duchon geometry the
+    // raw Gram is near-singular (κ(G)≈1e15, MSI-measured), so that 1e-10 round-off
+    // amplifies through the penalized solve to β̂rel≈1.7e-5 — 17× the issue's 1e-6
+    // bar — WHENEVER the skip fires off the interpolation nodes. The post-close
+    // `82cf6049f` "stale-penalty-not-stale-basis" theory (which fired the skip
+    // across the basis rotation, gated only on the n-free VALUE window) was
+    // empirically REFUTED: a real MSI run showed the 1.7e-5 divergence at a ψ the
+    // value gate admits. So the skip is sound ONLY where the reduced basis is
+    // provably unchanged — the `reduced_basis_equal` window (`covers_skip`), now
+    // restored as the production precondition. This test certifies the restored
+    // contract: the fast path is taken ⇔ `covers_skip(ψ)` admits it, and on
+    // WHICHEVER path runs the converged β̂ matches a fresh streamed solve to < 1e-6.
     let skip_b = tensor_eval.psi_gram_tensor_covers_skip(psi_b);
     let skip_c = tensor_eval.psi_gram_tensor_covers_skip(psi_c);
-    // Both trials are inside the n-free VALUE window — the condition the
-    // production gate now uses to fire the skip.
     let covers_b = tensor_eval.psi_gram_tensor_covers(psi_b);
     let covers_c = tensor_eval.psi_gram_tensor_covers(psi_c);
-    if std::env::var("DIAG1216").is_ok() {
-        eprintln!(
-            "[DIAG1216-FP] pinned ψ_a={psi_a:.5}  ψ_b={psi_b:.5} covers={covers_b} \
-             basis_equal={skip_b}  ψ_c={psi_c:.5} covers={covers_c} basis_equal={skip_c}"
-        );
-    }
+    eprintln!(
+        "[DIAG1264-FP] pinned ψ_a={psi_a:.5}  ψ_b={psi_b:.5} value_covers={covers_b} \
+         reduced_basis_equal={skip_b}  ψ_c={psi_c:.5} value_covers={covers_c} \
+         reduced_basis_equal={skip_c}"
+    );
     assert!(
         covers_b && covers_c,
-        "both moved trials must lie inside the certified value window so the n-free \
-         skip gate can fire; ψ_b={psi_b:.6} (covers={covers_b}) ψ_c={psi_c:.6} \
-         (covers={covers_c})"
+        "both moved trials must lie inside the certified value window (the necessary \
+         condition for the skip gate to even consider firing); ψ_b={psi_b:.6} \
+         (covers={covers_b}) ψ_c={psi_c:.6} (covers={covers_c})"
+    );
+    // ψ_C is the LARGE move toward the low edge where the radial-kernel reduced
+    // basis ROTATES, so `reduced_basis_equal` must REFUSE it — the restored
+    // precondition then routes ψ_C to the exact streamed slow path (correctness
+    // over speed). If a future fixture change makes the low-edge ψ stop rotating,
+    // this fires: pick a ψ_C further toward the edge.
+    assert!(
+        !skip_c,
+        "ψ_C={psi_c:.6} must GENUINELY rotate the reduced basis (reduced_basis_equal \
+         must REFUSE the pin↔ψ_C pair) so this test exercises the rotation case the \
+         restored precondition must route to the exact slow path; if this fires the \
+         standardized fixture's low-edge basis stopped rotating — pick a ψ_C further \
+         toward the edge"
     );
     let installed_gram =
         |e: &crate::estimate::ExternalJointHyperEvaluator<'_>| -> ndarray::Array2<f64> {
@@ -4924,53 +4948,38 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
                 .clone()
         };
 
-    // Trial 2 (ψ_B): value-covered ⇒ the production gate fires the skip (no
-    // slow-path reset), regardless of the basis-equality witness verdict.
+    // Trial 2 (ψ_B): the skip fires ⇔ the witness admits it. Either way β̂ is
+    // certified to < 1e-6 below — if the skip fires it must be exact; if it is
+    // refused the exact slow path runs (a reset advances) and β̂ is trivially exact.
     let before_b = tensor_eval.slow_path_reset_count();
     let (c_b, _g_b, beta_b) =
         eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b), false);
     let g_fast_b = installed_gram(&tensor_eval);
     let after_b = tensor_eval.slow_path_reset_count();
+    let reset_b = after_b - before_b;
     assert_eq!(
-        after_b - before_b,
-        0,
-        "ψ_B is value-covered, so the #1033 skip gate must take the design-revision \
-         fast path with no slow-path reset"
+        reset_b == 0,
+        skip_b,
+        "ψ_B fast-path engagement must match the `reduced_basis_equal` verdict: \
+         covers_skip={skip_b} but slow_path_resets={reset_b} (0 ⇒ skip fired)"
     );
 
-    // Trial 3 (ψ_C): the ROTATION case — `reduced_basis_equal` REFUSES it
-    // (skip_c={skip_c}) yet the value-covered skip gate still fires the fast path.
-    // The β̂ bit-identity check below is the load-bearing soundness proof that the
-    // rotated-basis skip never changes the κ-optimum.
-    //
-    // SOUNDNESS WITNESS (#1033 witness-C): the entire point of the #1033 fix is
-    // that dropping `reduced_basis_equal` as a skip precondition is sound EVEN WHEN
-    // THE BASIS GENUINELY ROTATES. If ψ_C did not actually rotate the reduced basis
-    // (witness would ADMIT it), this trial would prove nothing about the rotation
-    // case and the gate would be vacuous — a silent pass that masks the open gap.
-    // Assert ψ_C is a real rotation (the witness REFUSES it) so the bit-identity
-    // proof below is non-vacuous. If a future fixture change makes the low-edge ψ
-    // stop rotating the basis, this fires and tells us to pick a more rotated ψ_C
-    // rather than passing on a degenerate fixture.
-    assert!(
-        !skip_c,
-        "ψ_C={psi_c:.6} must GENUINELY rotate the reduced basis (reduced_basis_equal \
-         must REFUSE the pin↔ψ_C pair) so the bit-identity check below is a real \
-         rotated-basis soundness proof, not a vacuous same-basis pass; if this fires \
-         the standardized fixture's low-edge basis stopped rotating — pick a ψ_C \
-         further toward the edge"
-    );
+    // Trial 3 (ψ_C): the ROTATION case. The witness REFUSES it (asserted above), so
+    // the restored precondition MUST route it to the exact slow path — exactly one
+    // reset. This is the load-bearing #1264 guard: the skip does NOT fire across the
+    // rotation, so the κ-amplified β̂ mismatch (1.7e-5) cannot ship.
     let before_c = tensor_eval.slow_path_reset_count();
     let (c_c, _g_c, beta_c) =
         eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c), false);
     let g_fast_c = installed_gram(&tensor_eval);
     let after_c = tensor_eval.slow_path_reset_count();
+    let reset_c = after_c - before_c;
     assert_eq!(
-        after_c - before_c,
-        0,
-        "ψ_C is value-covered, so the #1033 skip gate must take the fast path with no \
-         slow-path reset EVEN across the basis rotation the witness refuses \
-         (reduced_basis_equal={skip_c})"
+        reset_c, 1,
+        "ψ_C ROTATES the reduced basis (reduced_basis_equal REFUSES it), so the \
+         restored #1264 skip precondition MUST take the exact slow path (exactly one \
+         reset) — NOT the n-free fast path, which would amplify the interpolated-Gram \
+         round-off into a β̂rel≈1.7e-5 wrong κ-optimum; got resets={reset_c}"
     );
 
     assert!(

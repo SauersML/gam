@@ -1066,8 +1066,12 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         // Gate on the n-free VALUE coverage (the condition under which the cache
         // re-key fires) rather than the stricter `reduced_basis_equal` witness,
         // which refused sound rotated-basis skips and forced the O(n) fallback.
+        // #1264: cost-only fast path gates on the `reduced_basis_equal` skip
+        // window too (see `prepare_eval_state`) — the value probe installs the
+        // same Chebyshev-interpolated Gram, so firing it across a basis rotation
+        // on the near-singular production Gram moves the κ-optimum past 1e-6.
         let skip_window_allows_fast_path = match (self.psi_gram_tensor.is_some(), theta.len()) {
-            (true, len) if len == rho_dim + 1 => self.psi_gram_tensor_covers(theta[rho_dim]),
+            (true, len) if len == rho_dim + 1 => self.psi_gram_tensor_covers_skip(theta[rho_dim]),
             _ => true,
         };
         let fast_path = match (design_revision, self.last_canonical_revision) {
