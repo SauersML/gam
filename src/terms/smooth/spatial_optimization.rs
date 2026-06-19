@@ -6560,7 +6560,7 @@ where
         use crate::outer_subsample::OuterScoreSubsample;
         let k = k_target.min(n_total);
         if k == 0 || n_total == 0 {
-            return OuterScoreSubsample::new(Vec::new(), n_total, seed);
+            return OuterScoreSubsample::from_uniform_inclusion_mask(Vec::new(), n_total, seed);
         }
         // Reservoir-free deterministic pick: linear congruential walk
         // over a shuffled index set; for the pilot, a fast Floyd-style
@@ -6581,7 +6581,7 @@ where
         }
         mask.sort_unstable();
         mask.dedup();
-        OuterScoreSubsample::new(mask, n_total, seed)
+        OuterScoreSubsample::from_uniform_inclusion_mask(mask, n_total, seed)
     }
 
     let current_row_set: std::cell::RefCell<crate::outer_subsample::RowSet> = if use_staged_kappa {

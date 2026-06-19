@@ -31,7 +31,7 @@
 //!    whose `request: FitRequest` carries a pub `options: BlockwiseFitOptions`
 //!    on the `GaussianLocationScale` variant.
 //! 2. We pattern-match-and-mutate that field to install an
-//!    `OuterScoreSubsample::new(mask, n_full, seed)`, which sets the uniform
+//!    `OuterScoreSubsample::from_uniform_inclusion_mask(mask, n_full, seed)`, which sets the uniform
 //!    HT weight w = n_full / m on every retained row.
 //! 3. `fit_model(request)` returns `FitResult::GaussianLocationScale(fit)`,
 //!    from which we read `fit.fit.reml_score`, `fit.fit.beta`, and
@@ -116,7 +116,7 @@ fn run_fit(req: FitRequest<'_>) -> FitSummary {
 }
 
 /// Build a uniform 50% subsample over `n_full` rows with deterministic seed.
-/// Uses `OuterScoreSubsample::new`, which assigns w_i = n_full / m to every
+/// Uses `OuterScoreSubsample::from_uniform_inclusion_mask`, which assigns w_i = n_full / m to every
 /// retained row — the HT inverse-inclusion weight under uniform sampling, so
 /// Σ_{i in mask} w_i · s_i is unbiased for Σ_i s_i.
 fn uniform_half_subsample(n_full: usize, seed: u64) -> OuterScoreSubsample {
@@ -130,7 +130,7 @@ fn uniform_half_subsample(n_full: usize, seed: u64) -> OuterScoreSubsample {
     }
     let mut mask: Vec<usize> = indices[..m].to_vec();
     mask.sort_unstable();
-    OuterScoreSubsample::new(mask, n_full, seed)
+    OuterScoreSubsample::from_uniform_inclusion_mask(mask, n_full, seed)
 }
 
 #[test]

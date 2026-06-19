@@ -27,11 +27,12 @@ use std::sync::Arc;
 /// `n_full / |mask|` is biased in those strata).
 ///
 /// `weight_scale` is retained as a *diagnostic* (mean of `w_i` across the
-/// mask). It equals the legacy `n_full / |mask|` when all rows share a
-/// uniform weight (the common case for caller-supplied masks via
-/// [`OuterScoreSubsample::new`]); it can drift from that value under the
-/// stratified builder's rare-stratum boost. It is not the per-row scaling
-/// factor — consumers must read `rows[i].weight` for HT correctness.
+/// mask). It equals `n_full / |mask|` when all rows share a uniform inclusion
+/// probability (the caller-supplied-mask case represented by
+/// [`OuterScoreSubsample::from_uniform_inclusion_mask`]); it can drift from
+/// that value under the stratified builder's rare-stratum boost. It is not the
+/// per-row scaling factor — consumers must read `rows[i].weight` for HT
+/// correctness.
 ///
 /// # Horvitz–Thompson contract
 ///
@@ -66,11 +67,11 @@ pub struct OuterScoreSubsample {
 }
 
 impl OuterScoreSubsample {
-    /// Wrap a precomputed mask with the legacy uniform `n_full / m` weight
-    /// per row. The caller is responsible for sortedness and uniqueness;
-    /// `build_outer_score_subsample` is the canonical (per-stratum HT)
-    /// builder.
-    pub fn new(mask: Vec<usize>, n_full: usize, seed: u64) -> Self {
+    /// Wrap a precomputed mask sampled with a uniform inclusion probability,
+    /// assigning each selected row the inverse-inclusion weight `n_full / m`.
+    /// The caller is responsible for sortedness and uniqueness;
+    /// `build_outer_score_subsample` remains the stratified per-row HT builder.
+    pub fn from_uniform_inclusion_mask(mask: Vec<usize>, n_full: usize, seed: u64) -> Self {
         let m = mask.len();
         let w = if m == 0 {
             1.0

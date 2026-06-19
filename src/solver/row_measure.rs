@@ -143,7 +143,11 @@ mod tests {
 
     #[test]
     fn subsample_id_matches_for_same_arc() {
-        let s = Arc::new(OuterScoreSubsample::new(vec![1, 3, 5], 10, 42));
+        let s = Arc::new(OuterScoreSubsample::from_uniform_inclusion_mask(
+            vec![1, 3, 5],
+            10,
+            42,
+        ));
         let a = RowSubsampleMask::subsample(Arc::clone(&s));
         let b = RowSubsampleMask::subsample(Arc::clone(&s));
         assert_eq!(a.id, b.id);
@@ -151,8 +155,16 @@ mod tests {
 
     #[test]
     fn subsample_id_differs_for_different_arcs() {
-        let s1 = Arc::new(OuterScoreSubsample::new(vec![1, 3, 5], 10, 42));
-        let s2 = Arc::new(OuterScoreSubsample::new(vec![1, 3, 5], 10, 42));
+        let s1 = Arc::new(OuterScoreSubsample::from_uniform_inclusion_mask(
+            vec![1, 3, 5],
+            10,
+            42,
+        ));
+        let s2 = Arc::new(OuterScoreSubsample::from_uniform_inclusion_mask(
+            vec![1, 3, 5],
+            10,
+            42,
+        ));
         let a = RowSubsampleMask::subsample(s1);
         let b = RowSubsampleMask::subsample(s2);
         // Different Arc allocations ⇒ different ids; this is intentional
@@ -171,7 +183,11 @@ mod tests {
 
     #[test]
     fn indices_and_weights_subsample() {
-        let s = Arc::new(OuterScoreSubsample::new(vec![0, 2], 4, 7));
+        let s = Arc::new(OuterScoreSubsample::from_uniform_inclusion_mask(
+            vec![0, 2],
+            4,
+            7,
+        ));
         let rm = RowSubsampleMask::subsample(s);
         let (idx, w) = rm.indices_and_weights(4);
         assert_eq!(idx, vec![0, 2]);

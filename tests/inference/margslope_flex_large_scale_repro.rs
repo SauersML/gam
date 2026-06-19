@@ -208,7 +208,9 @@ fn flex_full_outer_completes_under_budget_683() {
         outer_max_iter: 3,
         compute_covariance: false,
         screen_initial_rho: false,
-        outer_score_subsample: Some(Arc::new(OuterScoreSubsample::new(outer_mask, n, 683))),
+        outer_score_subsample: Some(Arc::new(OuterScoreSubsample::from_uniform_inclusion_mask(
+            outer_mask, n, 683,
+        ))),
         auto_outer_subsample: false,
         ..BlockwiseFitOptions::default()
     };

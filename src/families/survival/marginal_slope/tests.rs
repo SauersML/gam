@@ -348,11 +348,9 @@ fn survival_log_likelihood_subsample_full_equals_unsampled() {
         .expect("baseline ll (no subsample)");
 
     let mut opts_full = BlockwiseFitOptions::default();
-    opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        (0..n).collect(),
-        n,
-        0xDEADBEEF,
-    )));
+    opts_full.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask((0..n).collect(), n, 0xDEADBEEF),
+    ));
     let with_full_mask = family
         .log_likelihood_only_with_options(&states, &opts_full)
         .expect("ll with mask=full");
@@ -378,11 +376,9 @@ fn survival_log_likelihood_subsample_half_scales_correctly() {
     let m = even_mask.len();
 
     let mut opts_half = BlockwiseFitOptions::default();
-    opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        even_mask.clone(),
-        n,
-        0xCAFE,
-    )));
+    opts_half.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask(even_mask.clone(), n, 0xCAFE),
+    ));
     let scaled = family
         .log_likelihood_only_with_options(&states, &opts_half)
         .expect("ll with mask=even");
@@ -5339,11 +5335,9 @@ fn survival_sigma_psi_terms_subsample_full_equals_unsampled() {
         .expect("some");
 
     let mut opts_full = BlockwiseFitOptions::default();
-    opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        (0..n).collect(),
-        n,
-        0xDEADBEEF,
-    )));
+    opts_full.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask((0..n).collect(), n, 0xDEADBEEF),
+    ));
     let with_full = family
         .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_full)
         .expect("with full mask")
@@ -5369,11 +5363,9 @@ fn survival_sigma_psi_terms_subsample_half_scales_correctly() {
     let m = even_mask.len();
 
     let mut opts_half = BlockwiseFitOptions::default();
-    opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        even_mask.clone(),
-        n,
-        0xCAFE,
-    )));
+    opts_half.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask(even_mask.clone(), n, 0xCAFE),
+    ));
     let scaled = family
         .sigma_exact_joint_psi_terms_with_options(&states, &specs, &opts_half)
         .expect("scaled")
@@ -5410,11 +5402,9 @@ fn survival_sigma_psi_second_order_subsample_full_equals_unsampled() {
         .expect("some");
 
     let mut opts_full = BlockwiseFitOptions::default();
-    opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        (0..n).collect(),
-        n,
-        0xDEADBEEF,
-    )));
+    opts_full.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask((0..n).collect(), n, 0xDEADBEEF),
+    ));
     let with_full = family
         .sigma_exact_joint_psisecond_order_terms_with_options(&states, &opts_full)
         .expect("with full mask")
@@ -5439,11 +5429,9 @@ fn survival_sigma_psi_second_order_subsample_half_scales_correctly() {
     let m = even_mask.len();
 
     let mut opts_half = BlockwiseFitOptions::default();
-    opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        even_mask.clone(),
-        n,
-        0xCAFE,
-    )));
+    opts_half.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask(even_mask.clone(), n, 0xCAFE),
+    ));
     let scaled = family
         .sigma_exact_joint_psisecond_order_terms_with_options(&states, &opts_half)
         .expect("scaled")
@@ -5482,11 +5470,9 @@ fn survival_sigma_psihessian_directional_derivative_subsample_full_equals_unsamp
         .expect("some");
 
     let mut opts_full = BlockwiseFitOptions::default();
-    opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        (0..n).collect(),
-        n,
-        0xDEADBEEF,
-    )));
+    opts_full.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask((0..n).collect(), n, 0xDEADBEEF),
+    ));
     let with_full = family
         .sigma_exact_joint_psihessian_directional_derivative_with_options(
             &states,
@@ -5513,11 +5499,9 @@ fn survival_sigma_psihessian_directional_derivative_subsample_half_scales_correc
     let m = even_mask.len();
 
     let mut opts_half = BlockwiseFitOptions::default();
-    opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        even_mask.clone(),
-        n,
-        0xCAFE,
-    )));
+    opts_half.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask(even_mask.clone(), n, 0xCAFE),
+    ));
     let scaled = family
         .sigma_exact_joint_psihessian_directional_derivative_with_options(
             &states,
@@ -5699,11 +5683,9 @@ fn survival_psi_terms_inner_subsample_full_equals_unsampled() {
         .expect("some");
 
     let mut opts_full = BlockwiseFitOptions::default();
-    opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        (0..n).collect(),
-        n,
-        0xDEADBEEF,
-    )));
+    opts_full.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask((0..n).collect(), n, 0xDEADBEEF),
+    ));
     let with_full = family
         .psi_terms_inner_with_options(&states, &derivative_blocks, 0, None, &opts_full)
         .expect("with full mask")
@@ -5729,11 +5711,9 @@ fn survival_psi_terms_inner_subsample_half_scales_correctly() {
     let m = even_mask.len();
 
     let mut opts_half = BlockwiseFitOptions::default();
-    opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        even_mask.clone(),
-        n,
-        0xCAFE,
-    )));
+    opts_half.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask(even_mask.clone(), n, 0xCAFE),
+    ));
     let scaled = family
         .psi_terms_inner_with_options(&states, &derivative_blocks, 0, None, &opts_half)
         .expect("scaled")
@@ -5829,7 +5809,9 @@ fn survival_psi_terms_inner_batched_subsample_matches_per_axis() {
 
     let even_mask: Vec<usize> = (0..n).filter(|i| i % 2 == 0).collect();
     let mut opts = BlockwiseFitOptions::default();
-    opts.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(even_mask, n, 0xC0FFEE)));
+    opts.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::from_uniform_inclusion_mask(
+        even_mask, n, 0xC0FFEE,
+    )));
 
     let per_axis_0 = family
         .psi_terms_inner_with_options(&states, &derivative_blocks, 0, None, &opts)
@@ -5890,11 +5872,9 @@ fn survival_psi_second_order_terms_inner_subsample_full_equals_unsampled() {
         .expect("some");
 
     let mut opts_full = BlockwiseFitOptions::default();
-    opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        (0..n).collect(),
-        n,
-        0xDEADBEEF,
-    )));
+    opts_full.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask((0..n).collect(), n, 0xDEADBEEF),
+    ));
     let with_full = family
         .psi_second_order_terms_inner_with_options(
             &states,
@@ -5927,11 +5907,9 @@ fn survival_psi_second_order_terms_inner_subsample_half_scales_correctly() {
     let m = even_mask.len();
 
     let mut opts_half = BlockwiseFitOptions::default();
-    opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        even_mask.clone(),
-        n,
-        0xCAFE,
-    )));
+    opts_half.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask(even_mask.clone(), n, 0xCAFE),
+    ));
     let scaled = family
         .psi_second_order_terms_inner_with_options(
             &states,
@@ -5987,11 +5965,9 @@ fn survival_psi_hessian_directional_derivative_subsample_full_equals_unsampled()
         .expect("some");
 
     let mut opts_full = BlockwiseFitOptions::default();
-    opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        (0..n).collect(),
-        n,
-        0xDEADBEEF,
-    )));
+    opts_full.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask((0..n).collect(), n, 0xDEADBEEF),
+    ));
     let with_full = family
         .psi_hessian_directional_derivative_with_options(
             &states,
@@ -6023,11 +5999,9 @@ fn survival_psi_hessian_directional_derivative_subsample_half_scales_correctly()
     let m = even_mask.len();
 
     let mut opts_half = BlockwiseFitOptions::default();
-    opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        even_mask.clone(),
-        n,
-        0xCAFE,
-    )));
+    opts_half.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask(even_mask.clone(), n, 0xCAFE),
+    ));
     let scaled = family
         .psi_hessian_directional_derivative_with_options(
             &states,
@@ -6130,11 +6104,9 @@ fn survival_psi_hessian_directional_derivative_operator_subsample_full_equals_un
     let baseline_dense = baseline.to_dense();
 
     let mut opts_full = BlockwiseFitOptions::default();
-    opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        (0..n).collect(),
-        n,
-        0xDEADBEEF,
-    )));
+    opts_full.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask((0..n).collect(), n, 0xDEADBEEF),
+    ));
     let with_full = family
         .psi_hessian_directional_derivative_operator_with_options(
             &states,
@@ -6167,11 +6139,9 @@ fn survival_psi_hessian_directional_derivative_operator_subsample_half_scales_co
     let m = even_mask.len();
 
     let mut opts_half = BlockwiseFitOptions::default();
-    opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        even_mask.clone(),
-        n,
-        0xCAFE,
-    )));
+    opts_half.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask(even_mask.clone(), n, 0xCAFE),
+    ));
     let scaled = family
         .psi_hessian_directional_derivative_operator_with_options(
             &states,
@@ -6501,11 +6471,9 @@ fn survival_jointhessian_flex_no_wiggle_operator_subsample_full_equals_unsampled
     let baseline_dense = baseline.to_dense();
 
     let mut opts_full = BlockwiseFitOptions::default();
-    opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        (0..n).collect(),
-        n,
-        0xDEADBEEF,
-    )));
+    opts_full.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask((0..n).collect(), n, 0xDEADBEEF),
+    ));
     let with_full = family
         .exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle_with_options(
             &states,
@@ -6540,11 +6508,9 @@ fn survival_jointhessian_flex_no_wiggle_operator_subsample_half_scales_correctly
     let m = even_mask.len();
 
     let mut opts_half = BlockwiseFitOptions::default();
-    opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        even_mask.clone(),
-        n,
-        0xCAFE,
-    )));
+    opts_half.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask(even_mask.clone(), n, 0xCAFE),
+    ));
     let scaled = family
         .exact_newton_joint_hessian_directional_derivative_operator_flex_no_wiggle_with_options(
             &states,

@@ -20,11 +20,9 @@ fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_full_equal
         .expect("some");
 
     let mut opts_full = BlockwiseFitOptions::default();
-    opts_full.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        (0..n).collect(),
-        n,
-        0xDEADBEEF,
-    )));
+    opts_full.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask((0..n).collect(), n, 0xDEADBEEF),
+    ));
     let with_full = family
         .exact_newton_joint_hessian_directional_derivative_from_cache_with_options(
             &states,
@@ -60,7 +58,7 @@ fn bernoulli_jointhessian_batched_directional_operators_match_single_direction_p
         .collect();
 
     let mut opts = BlockwiseFitOptions::default();
-    opts.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+    opts.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::from_uniform_inclusion_mask(
         (0..n).step_by(2).collect(),
         n,
         0xB47C,
@@ -430,7 +428,7 @@ fn bernoulli_flex_paired_subsample_ll_delta_sign_matches_full_ll() {
         .expect("full trial ll");
 
     let mut opts = BlockwiseFitOptions::default();
-    opts.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
+    opts.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::from_uniform_inclusion_mask(
         (0..96).step_by(2).collect(),
         96,
         0x5EED5EED,
@@ -926,11 +924,9 @@ fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_half_scale
     let m = even_mask.len();
 
     let mut opts_half = BlockwiseFitOptions::default();
-    opts_half.outer_score_subsample = Some(Arc::new(OuterScoreSubsample::new(
-        even_mask.clone(),
-        n,
-        0xCAFE,
-    )));
+    opts_half.outer_score_subsample = Some(Arc::new(
+        OuterScoreSubsample::from_uniform_inclusion_mask(even_mask.clone(), n, 0xCAFE),
+    ));
     let scaled = family
         .exact_newton_joint_hessian_directional_derivative_from_cache_with_options(
             &states,
