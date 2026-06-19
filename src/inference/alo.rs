@@ -214,16 +214,43 @@ impl fmt::Display for AloExactScalarError {
     }
 }
 
+/// Maximum number of step halvings in the backtracking line search that
+/// globalizes the scalar Newton iteration. `2^{-40}` shrinks a unit step well
+/// below `ALO_EXACT_SCALAR_TOL` relative to any η of practical magnitude, so a
+/// row that cannot make progress within this budget is genuinely stalled rather
+/// than merely under-damped.
+const ALO_EXACT_SCALAR_BACKTRACKS: usize = 40;
+
 #[inline]
 fn alo_eta_exact_frozen_curvature(
     eta_hat: f64,
     a_ii: f64,
-    one_step: f64,
     score_curvature: &dyn Fn(f64) -> (f64, f64),
 ) -> Result<f64, AloExactScalarError> {
-    let mut eta = one_step;
-    let mut last_residual = f64::NAN;
-    for _ in 0..ALO_EXACT_SCALAR_MAX_ITERS {
+    // Residual of the leave-i-out fixed point η = η̂ + a_ii ℓ'(η):
+    //   r(η) = η − η̂ − a_ii ℓ'(η),     r'(η) = 1 − a_ii ℓ''(η) = jac.
+    // For an exponential-family NLL score ℓ'(η) = c_i(μ(η) − y) on a non-linear
+    // (e.g. log) link the curvature ℓ''(η) = c_i μ'(η) grows without bound, so
+    // r(η) is concave with an interior maximum where the weighted leverage
+    // a_ii ℓ'' passes 1 (jac = 0): the leave-i-out root that limits to η̂ as
+    // a_ii → 0 sits on the jac > 0 branch anchored at η̂, while beyond the
+    // maximum r turns over and diverges as μ(η) explodes.
+    //
+    // Two safeguards make the scalar solve globally convergent to that root:
+    //
+    //   1. Anchor the iteration at η̂ itself, not at the classical one-step ALO
+    //      predictor. At η̂ the weighted leverage a_ii ℓ''(η̂) < 1, so jac ≈ 1
+    //      and we start strictly inside the correct basin; the brute-force
+    //      n-fold reference solves the identical fixed point anchored at η̂.
+    //      Seeding at the one-step predictor instead can land a high-leverage
+    //      row *past* the interior maximum on the runaway branch, from which no
+    //      Newton iteration returns (Poisson/log row 198: η ≈ 6.3, r ≈ −577).
+    //
+    //   2. Backtrack on the merit ½r(η)². The Newton direction d = −r/jac
+    //      satisfies (½r²)'·d = r·jac·(−r/jac) = −r² < 0 for any finite nonzero
+    //      jac, so halving the step until |r| strictly decreases never leaves
+    //      the basin even if a full step would overshoot the maximum.
+    let residual_and_jac = |eta: f64| -> Result<(f64, f64), AloExactScalarError> {
         let (ell_prime, ell_double) = score_curvature(eta);
         if !ell_prime.is_finite() || !ell_double.is_finite() {
             return Err(AloExactScalarError::NonFiniteScoreCurvature {
@@ -232,29 +259,53 @@ fn alo_eta_exact_frozen_curvature(
                 ell_double,
             });
         }
-        let residual = eta - eta_hat - a_ii * ell_prime;
-        last_residual = residual;
+        Ok((eta - eta_hat - a_ii * ell_prime, 1.0 - a_ii * ell_double))
+    };
+
+    let mut eta = eta_hat;
+    let (mut residual, mut jac) = residual_and_jac(eta)?;
+    for _ in 0..ALO_EXACT_SCALAR_MAX_ITERS {
         if residual.abs() <= ALO_EXACT_SCALAR_TOL {
             return Ok(eta);
         }
-        let jac = 1.0 - a_ii * ell_double;
         if jac.abs() <= ALO_DENOMINATOR_MIN || !jac.is_finite() {
             return Err(AloExactScalarError::DegenerateJacobian { eta, jacobian: jac });
         }
-        let next = eta - residual / jac;
-        if !next.is_finite() {
+        let step = residual / jac;
+        if !step.is_finite() {
             return Err(AloExactScalarError::NonFiniteStep {
                 eta,
                 residual,
                 jacobian: jac,
-                next,
+                next: eta - step,
             });
         }
-        eta = next;
+        // Backtracking line search: take the longest damped Newton step
+        // 2^{-k} that strictly reduces the merit |r|. A non-finite trial
+        // (score/curvature evaluated in the runaway branch) is treated as no
+        // improvement and rejected, so the search retreats toward η̂.
+        let mut t = 1.0;
+        let mut advanced = false;
+        for _ in 0..ALO_EXACT_SCALAR_BACKTRACKS {
+            let trial = eta - t * step;
+            if let Ok((r_trial, j_trial)) = residual_and_jac(trial) {
+                if r_trial.abs() < residual.abs() {
+                    eta = trial;
+                    residual = r_trial;
+                    jac = j_trial;
+                    advanced = true;
+                    break;
+                }
+            }
+            t *= 0.5;
+        }
+        if !advanced {
+            break;
+        }
     }
     Err(AloExactScalarError::MaxIterations {
         iterations: ALO_EXACT_SCALAR_MAX_ITERS,
-        residual: last_residual,
+        residual,
         eta,
     })
 }
@@ -891,16 +942,17 @@ fn compute_alo_from_input_inner(input: &AloInput) -> Result<AloDiagnostics, AloE
                 w_s[i],
                 denom_raw,
             );
-            // When the family score/curvature evaluator is supplied, refine the
-            // single-Newton-step ALO to the exact frozen-curvature leave-i-out
-            // predictor. a_ii here is the unweighted influence x_i^T H^{-1} x_i
-            // (= x_hinv_x_diag[i]); the per-row curvature W_H[i] = ℓ_i''(η̂_i) is
-            // folded into the scalar fixed point via score_curvature.
+            // When the family score/curvature evaluator is supplied, solve the
+            // exact frozen-curvature leave-i-out fixed point (anchored at η̂_i,
+            // the basin that limits to the in-sample fit) instead of taking the
+            // single Newton step. a_ii here is the unweighted influence
+            // x_i^T H^{-1} x_i (= x_hinv_x_diag[i]); the per-row curvature
+            // W_H[i] = ℓ_i''(η̂_i) is folded into the scalar fixed point via
+            // score_curvature. Non-canonical links fall back to `one_step`.
             let v = if let Some(score_curvature) = input.score_curvature {
                 alo_eta_exact_frozen_curvature(
                     eta_hat[i],
                     x_hinv_x_diag[i],
-                    one_step,
                     &|eta| score_curvature(i, eta),
                 )
                 .map_err(|err| AloError::LooComputationFailed {
@@ -1965,15 +2017,14 @@ mod tests {
     fn alo_exact_frozen_curvature_converges_to_fixed_point() {
         let eta_hat = 1.0;
         let a_ii = 0.4;
-        let got =
-            alo_eta_exact_frozen_curvature(eta_hat, a_ii, eta_hat, &|eta| (0.5 * (eta - 2.0), 0.5))
-                .expect("linear scalar fixed point should converge in one Newton step");
+        let got = alo_eta_exact_frozen_curvature(eta_hat, a_ii, &|eta| (0.5 * (eta - 2.0), 0.5))
+            .expect("linear scalar fixed point should converge in one Newton step");
         assert!((got - 0.75).abs() < 1e-12);
     }
 
     #[test]
     fn alo_exact_frozen_curvature_reports_nonconvergence() {
-        let err = alo_eta_exact_frozen_curvature(0.0, 1.0, 0.0, &|eta| (eta + 1.0, 0.0))
+        let err = alo_eta_exact_frozen_curvature(0.0, 1.0, &|eta| (eta + 1.0, 0.0))
             .expect_err("constant residual should exhaust the scalar iteration budget");
         let AloExactScalarError::MaxIterations { iterations, .. } = err else {
             panic!("constant residual must report MaxIterations, got {err:?}");
