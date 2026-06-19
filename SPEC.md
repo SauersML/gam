@@ -1,8 +1,5 @@
 # Project Specification
 
-These are project-level engineering constraints. They are intentionally
-stricter than the public docs because they guide implementation choices.
-
 - Autodiff is never used outside of tests as hand-derived derivatives
   enable performance optimizations. Exception: external libraries may use
   autodiff internally, for example PyTorch.
