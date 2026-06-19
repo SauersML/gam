@@ -491,6 +491,14 @@ pub struct BlockwiseFitOptions {
     /// `None` preserves the legacy coupling (`rel_cost = outer_tol`) for every
     /// existing caller byte-for-byte.
     pub outer_rel_cost_tol: Option<f64>,
+    /// Lower box bound for smoothing coordinates ρ = log λ.
+    ///
+    /// The default preserves the historical custom-family domain
+    /// `λ >= exp(-10)`. Families with known calibration failures at the
+    /// near-zero penalty boundary can raise this lower bound without changing
+    /// the upper effective-df cap or adding family-specific branches inside the
+    /// optimizer.
+    pub rho_lower_bound: f64,
     pub minweight: f64,
     pub ridge_floor: f64,
     /// Shared ridge semantics used by solve/quadratic/logdet terms.
@@ -654,6 +662,7 @@ impl Default for BlockwiseFitOptions {
             outer_max_iter: 60,
             outer_tol: 1e-5,
             outer_rel_cost_tol: None,
+            rho_lower_bound: -10.0,
             minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
             // `ridge_floor` is an ExplicitPrior in the canonical
             // stabilization ledger taxonomy (`StabilizationKind::ExplicitPrior`):

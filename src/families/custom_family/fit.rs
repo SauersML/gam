@@ -923,7 +923,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // converged β is unbiased (cf. the #747 solver-only ridge). This is the
         // λ-upper-side dual of the #752 full-subspace logdet work.
         .with_bounds(
-            Array1::<f64>::from_elem(n_rho, -10.0),
+            Array1::<f64>::from_elem(n_rho, options.rho_lower_bound),
             effective_df_floor_rho_upper_bounds(specs, &label_layout, n_rho, 10.0),
         );
     // Install the seed-screening cap only when initial-rho screening is
