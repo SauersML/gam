@@ -831,7 +831,7 @@ class _SparsityLayer(nn.Module):
             # the harmonic-confined atom to a degenerate averaged plane.
             commit = None
             if step is not None and step < self._commit_steps:
-                commit = self._matching_pursuit_commit(relative_residual, step)
+                commit = self._matching_pursuit_commit(x, per_atom_recon, code, step)
 
             # Persistent per-row assignment accumulator. At high reconstruction
             # R² the instantaneous residual carries little routing signal (the
@@ -863,52 +863,71 @@ class _SparsityLayer(nn.Module):
         return code * responsibilities
 
     def _matching_pursuit_commit(
-        self, relative_residual: torch.Tensor, step: int | None
+        self,
+        x: torch.Tensor,
+        per_atom_recon: torch.Tensor,
+        code: torch.Tensor,
+        step: int | None,
     ) -> torch.Tensor | None:
-        """Fixed balanced row->atom commitment one-hot for the early window (#1282).
+        """Residual-PC commitment one-hot for the early window (issue #1282).
 
-        Returns ``(N, F)`` hard assignments inside the commitment window, else
-        ``None`` (the residual EM owns the assignment). The partition is a fixed
-        deterministic permutation of the rows split into ``F`` equal contiguous
-        blocks, re-rolled across a few sub-windows so a partition that happens to
-        mix manifolds is replaced before the EM takes over (the analogue of the
-        closed-form lane's ``pc_pair_offset`` multi-start rotation). It depends
-        only on a fixed seed and the row count — never on the (symmetric)
-        residuals or the input coordinate geometry — so it breaks the init
-        symmetry without a geometry shortcut.
+        Deterministic, seed-free port of the closed-form lane's
+        ``reseed_atoms_onto_distinct_residual_pcs``: it splits the rows by the
+        *sign of the top principal component of the residual* that atom 0 leaves,
+        which geometry forces to be separated by manifold — so the partition is a
+        theorem, not a seed lottery (a fixed random balanced split hands each
+        atom a ~50/50 manifold mix, and whether the EM later un-mixes it is
+        seed-dependent — the failure this replaces).
 
-        Crucially this is a *balanced random* commitment, not a greedy
-        matching-pursuit one: under the decoder-harmonic confinement
-        (``decoder_harmonic_penalty``) a greedy schedule that feeds atom 0 *all*
-        rows first drives it to the degenerate averaged 2-plane (the signed
-        channels cancel) — a blend the harmonic penalty then freezes. A balanced
-        random split instead hands each atom a distinct half from the start;
-        with the harmonic penalty confining each atom to one 2-plane the
-        reconstruction gradient specializes them onto distinct manifolds, and the
-        persistent assignment EMA preserves that partition past the window. This
-        combination (balanced commit + EMA + harmonic) is the one that routes the
-        energy-degenerate circles while leaving the disjoint case perfect.
+        Two phases inside the window:
 
-        ``relative_residual`` supplies only the shape/dtype/device; the partition
-        is residual-independent by design (the residual is uninformative at the
-        symmetric init this commitment exists to escape).
+        * Phase 1 (``step < _commit_steps // 2``): commit *all* rows to atom 0.
+          With the decoder-harmonic penalty ON (``decoder_harmonic_penalty``),
+          atom 0 is confined to a single 2-plane, so fitting it to the union of
+          two manifolds collapses it to their *shared* averaged plane (the
+          components that differ in sign between the manifolds cancel to zero).
+          Atom 0 therefore leaves a residual whose dominant direction is exactly
+          the sign-separated difference between the manifolds.
+
+        * Phase 2 (rest of window): commit each row to atom 1 if its residual
+          projects positively onto that dominant residual PC, else to atom 0.
+          For the energy-degenerate circles this is the channel-3 sign split
+          (``+s`` vs ``−s``); for disjoint circles it is the distinct-2-plane
+          split. The only arbitrary freedom is the global atom0<->atom1 label,
+          which the routing metric is invariant to.
+
+        Keys only on the reconstruction residual covariance — geometry-agnostic
+        (no hardcoded knowledge of circles or coordinate-energy profiles).
         """
-        if step is None or self.target_k != 1 or self.n_atoms < 2:
+        if step is None or self.target_k != 1 or self.n_atoms != 2:
             return None
         if step >= self._commit_steps:
             return None
-        n, f = relative_residual.shape
-        device, dtype = relative_residual.device, relative_residual.dtype
-        rerolls = 4
-        block = min(rerolls - 1, (step * rerolls) // max(1, self._commit_steps))
-        g = torch.Generator(device="cpu")
-        g.manual_seed(int(self._commit_seed) + 7919 * int(block))
-        perm = torch.randperm(n, generator=g)
-        atom_of_sorted = (torch.arange(n) * f) // n  # balanced 0..F-1
-        assign = torch.empty(n, dtype=torch.long)
-        assign[perm] = atom_of_sorted
+        n = int(x.shape[0])
+        f = int(self.n_atoms)
+        device, dtype = x.device, x.dtype
+        # Phase 1: atom 0 fits everything (harmonic confines it to the shared
+        # averaged plane, so its residual carries the manifold difference).
+        if step < max(1, self._commit_steps // 2):
+            onehot = torch.zeros(n, f, dtype=dtype, device=device)
+            onehot[:, 0] = 1.0
+            return onehot
+        # Phase 2: split rows by the sign of the top residual PC of atom 0's fit.
+        with torch.no_grad():
+            resid0 = code[:, 0:1] * per_atom_recon[:, 0, :] - x  # (N, D)
+            rd = resid0 - resid0.mean(dim=0, keepdim=True)
+            try:
+                _, _, vh = torch.linalg.svd(rd, full_matrices=False)
+            except Exception:
+                return None
+            proj = rd @ vh[0]  # (N,) projection on the leading residual PC
+            assign = (proj > 0).to(torch.long)  # atom 1 where positive, else 0
+            # Guard against a degenerate all-one-side split (no signal): fall back
+            # to a balanced median split on the projection so both atoms get rows.
+            if int(assign.sum().item()) in (0, n):
+                assign = (proj > proj.median()).to(torch.long)
         onehot = torch.zeros(n, f, dtype=dtype, device=device)
-        onehot[torch.arange(n, device=device), assign.to(device)] = 1.0
+        onehot[torch.arange(n, device=device), assign] = 1.0
         return onehot
 
     def _update_assign_ema(
