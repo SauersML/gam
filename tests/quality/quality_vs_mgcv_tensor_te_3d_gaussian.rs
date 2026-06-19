@@ -5,11 +5,12 @@
 //! OBJECTIVE METRIC ASSERTED: truth recovery. The grid is generated noise-free
 //! from a closed-form surface `f(x1,x2,x3)`, so the true mean at every training
 //! point is known exactly. The primary pass criterion is
-//!   RMSE(gam_fitted, f) <= 3% of the truth's signal range,
-//! i.e. gam reconstructs the surface to a small fraction of its amplitude.
-//! `mgcv` is fit on the identical data and printed as calibration context on the
-//! same accuracy metric. We never assert "gam == mgcv's fit"; matching a peer
-//! tool's fit is not a quality claim.
+//!   RMSE(gam_fitted, f) <= 0.5% of the truth's signal range,
+//! i.e. gam reconstructs the surface to a tiny fraction of its amplitude. `mgcv`
+//! is fit on the identical data and demoted to a BASELINE TO MATCH-OR-BEAT on
+//! that same accuracy metric: gam's recovery RMSE must be no worse than 1.10x
+//! mgcv's. We never assert "gam == mgcv's fit"; matching a peer tool's noisy
+//! output is not a quality claim. (We still print rel_l2 vs mgcv for context.)
 //!
 //! 3-D tensor products are the gateway to higher-dimensional smoothing. They
 //! are algebraically identical to 2-D tensors but stress dimension-handling
@@ -156,21 +157,25 @@ fn gam_te_3d_recovers_nonadditive_surface() {
     );
 
     // PRIMARY claim: gam reconstructs the non-additive truth. With a noise-free,
-    // smooth signal representable by k=5 cubic margins, a correct 3-D tensor
-    // should land within a few percent of the signal amplitude. The x1:x2:x3
-    // cross term is unrepresentable additively, so clearing this bar means the
-    // Kronecker interaction blocks are constructed, penalized and centered
-    // correctly; any dropped margin / wrong Kronecker order would leave the
-    // cross term unrecovered and push this RMSE far past the bar.
-    let recovery_bar = 0.03 * signal_range;
+    // smooth signal comfortably representable by k=5 cubic margins, a correct
+    // 3-D tensor interpolates the surface to well under 0.5% of its amplitude.
+    // The x1:x2:x3 cross term is unrepresentable additively, so clearing this
+    // bar means the Kronecker interaction blocks are constructed, penalized and
+    // centered correctly; any dropped margin / wrong Kronecker order would leave
+    // the cross term unrecovered and push this RMSE far past the bar.
+    let recovery_bar = 0.005 * signal_range;
     assert!(
         gam_rmse <= recovery_bar,
         "gam fails to recover the 3-D tensor surface: rmse={gam_rmse:.5} > bar={recovery_bar:.5} \
-         (3% of signal_range={signal_range:.4})"
+         (0.5% of signal_range={signal_range:.4})"
     );
 
+    // SECONDARY claim: match-or-beat the mature reference ON ACCURACY. gam's
+    // recovery error must be no worse than 1.10x mgcv's on the identical data.
     assert!(
-        mgcv_rmse.is_finite(),
-        "mgcv context fit emitted a non-finite truth RMSE: {mgcv_rmse:.5}"
+        gam_rmse <= mgcv_rmse * 1.10,
+        "gam's surface-recovery error must match-or-beat mgcv: \
+         gam_rmse={gam_rmse:.5} > 1.10 * mgcv_rmse={:.5}",
+        mgcv_rmse * 1.10
     );
 }

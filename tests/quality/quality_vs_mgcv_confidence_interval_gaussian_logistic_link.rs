@@ -76,10 +76,11 @@ use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIter
 use std::f64::consts::PI;
 
 /// Number of independent Bernoulli response replicates drawn on the fixed
-/// design. Forty replicates at N=600 still pool 24,000 coverage trials, so the
-/// Monte-Carlo error is far below the asserted calibration window while keeping
-/// the quality test under the 360s wall-clock budget.
-const N_REPLICATES: usize = 40;
+/// design. Pooled across the grid this gives a low-Monte-Carlo-error estimate
+/// of the across-the-function coverage expectation. The replicate fits are
+/// fanned across rayon (see the parallel loop below), so the full budget is
+/// affordable inside the 360s wall-clock.
+const N_REPLICATES: usize = 60;
 
 /// Fixed design size. Chosen so a 1½-cycle non-saturating logit smooth is
 /// resolvable by REML (EDF ≈ 8–9) — the regime where the Nychka coverage
