@@ -4887,17 +4887,6 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         "first eval at a fresh revision must take the slow path exactly once"
     );
 
-    // ψ_B stays a small step off the interior pin (reduced basis essentially
-    // unchanged — the `reduced_basis_equal` witness would ADMIT it). ψ_C is the
-    // LARGE move toward the low edge where the radial-kernel reduced basis has
-    // ROTATED, so the witness `reduced_basis_equal` REFUSES it. Both lie inside
-    // the certified VALUE window, so under the #1033 reduced-basis-rotation fix
-    // the production skip gate (now keyed on n-free VALUE coverage, not the
-    // pairwise basis-equality witness) fires the design-realization skip for
-    // BOTH — including ψ_C across the rotation. The soundness this exercises:
-    // the skipped fast path re-keys only the Gaussian Gram cache + penalty (k×k),
-    // never reads the frozen `self.x`, so β̂ stays bit-identical to the streamed
-    // slow path EVEN across the basis rotation the witness refuses.
     // #1264 SOUNDNESS CONTRACT (restored to the d9294a3fa design). The n-free fast
     // path installs the Chebyshev-interpolated Gram `gram_at(ψ)` (≤ 1e-10 relative
     // to the streamed EXACT assembled Gram). On this production Duchon geometry the

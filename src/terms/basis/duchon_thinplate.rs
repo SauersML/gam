@@ -687,15 +687,6 @@ fn thin_plate_retained_radial_indices(evals: &Array1<f64>) -> Vec<usize> {
     // These two conditions are scale-invariant ratios with no fitted constant;
     // `TAIL_REL` is the half-spectrum mark, derived from the polynomial null
     // dimension, not tuned.
-    // DIAGNOSTIC ONLY (#1271): env-gated relative-magnitude cutoff to map the
-    // EDF-vs-cutoff and lidar-vs-cutoff tradeoff. Removed before the fix lands.
-    if let Some(v) = std::env::var_os("DIAG1271_RELTOL") {
-        if let Some(tol) = v.to_str().and_then(|s| s.parse::<f64>().ok()) {
-            let thr = max_eval * tol;
-            let keep: Vec<usize> = (0..k).filter(|&i| evals[i].abs() > thr).collect();
-            return keep;
-        }
-    }
     let lower_start = (last + 1) / 2; // first index of the lower half (sorted)
     let mut best_p: Option<usize> = None;
     let mut best_gap = 1.0_f64;
