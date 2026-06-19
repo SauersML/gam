@@ -3,17 +3,17 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::{env, fs};
 
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR must be set"));
     fs::write(out_dir.join("lint_errors.rs"), "").expect("failed to write lint_errors.rs");
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock must be after the Unix epoch")
-        .as_secs();
-    println!("cargo:rustc-env=GAM_BUILD_TIMESTAMP={timestamp}");
+    // NOTE: do NOT emit a wall-clock `cargo:rustc-env=GAM_BUILD_TIMESTAMP=<now>`.
+    // Cargo records every build-script `rustc-env` in the crate fingerprint, so a
+    // value that changes on every run makes the `gam` lib fingerprint dirty on
+    // EVERY build — forcing a full recompile of gam + all downstream test crates
+    // (~4min) regardless of whether any source changed, and defeating any shared
+    // warm target. The variable was consumed nowhere in the tree, so it is removed.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=src/terms/analytic_penalties/manifest.rs");
 
