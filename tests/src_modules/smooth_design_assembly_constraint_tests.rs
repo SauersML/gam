@@ -4803,12 +4803,13 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // positive-lane assertion below is robust: a tiny step off an interior pin
     // genuinely preserves the reduced basis.
     let psi_a = psi_lo + 0.5 * span;
-    // ψ_B: a small move off the pin where the reduced (range) basis is unchanged,
-    // so the witness ADMITS the skip and the fast path must reproduce the streamed
-    // β̂. We must build the tensor first to locate such a step; `psi_b` is filled
-    // in below from the witness itself (smallest step among a shrinking ladder
-    // that the pinned witness accepts), keeping the positive lane robustly
-    // non-vacuous without depending on a hand-tuned magnitude.
+    // ψ_B: a small move off the pin. On this standardized production Duchon
+    // geometry the radial-kernel reduced basis is volatile enough that even this
+    // tiny step rotates it — the `reduced_basis_equal` witness REFUSES it at
+    // runtime (skip_b=false, MSI-confirmed), so ψ_B too takes the exact slow path.
+    // The test does not depend on which verdict the witness returns: it asserts
+    // fast-path engagement TRACKS the verdict (`(reset==0)==skip`) and that β̂
+    // matches the streamed exact solve to < 1e-6 on whichever path runs.
     let psi_b = psi_a + span / 4096.0;
     // ψ_C: a LARGE move toward the low edge — the radial-kernel reduced basis has
     // moved there, so the witness should REFUSE and the slow path must re-run. (If
@@ -4939,22 +4940,12 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
          standardized fixture's low-edge basis stopped rotating — pick a ψ_C further \
          toward the edge"
     );
-    let installed_gram =
-        |e: &crate::estimate::ExternalJointHyperEvaluator<'_>| -> ndarray::Array2<f64> {
-            e.reml_state
-                .installed_gaussian_fixed_cache()
-                .expect("installed Gaussian Gram cache")
-                .xtwx_orig
-                .clone()
-        };
-
     // Trial 2 (ψ_B): the skip fires ⇔ the witness admits it. Either way β̂ is
     // certified to < 1e-6 below — if the skip fires it must be exact; if it is
     // refused the exact slow path runs (a reset advances) and β̂ is trivially exact.
     let before_b = tensor_eval.slow_path_reset_count();
     let (c_b, _g_b, beta_b) =
         eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b), false);
-    let g_fast_b = installed_gram(&tensor_eval);
     let after_b = tensor_eval.slow_path_reset_count();
     let reset_b = after_b - before_b;
     assert_eq!(
@@ -4971,7 +4962,6 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     let before_c = tensor_eval.slow_path_reset_count();
     let (c_c, _g_c, beta_c) =
         eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c), false);
-    let g_fast_c = installed_gram(&tensor_eval);
     let after_c = tensor_eval.slow_path_reset_count();
     let reset_c = after_c - before_c;
     assert_eq!(
@@ -5021,101 +5011,44 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         evaluator.current_beta().expect("streamed β̂")
     };
 
-    // #1264 SOUNDNESS BAR: the issue-mandated 1e-6 β̂-rel, NOT a κ-amplified cap.
+    // #1264 SOUNDNESS BAR: the issue-mandated 1e-6 β̂-rel.
     //
-    // WHY 1e-6 IS THE RIGHT BAR (and why the prior κ·PSI_GRAM_SPOT_RTOL cap was a
-    // relabel of an unsound skip): the n-free fast path reads `XᵀWX(ψ)` from the
-    // CHEBYSHEV INTERPOLANT `gram_at(ψ)`, which agrees with the streamed EXACT
-    // assembled Gram only to `PSI_GRAM_SPOT_RTOL=1e-10`. On the near-singular
-    // production Duchon Gram (κ(G)≈1e15, MSI-measured) the penalized solve
-    // amplifies that 1e-10 round-off to β̂rel≈1.7e-5 ≫ 1e-6. A bar of
-    // `SAFETY·κ·gram_rel` ADMITS that 1.7e-5 — i.e. it certifies a fast path that
-    // MOVED the κ-optimum, contradicting the issue contract. The honest conclusion
-    // (MSI-verified) is therefore NOT to loosen the bar but to NOT FIRE THE SKIP on
-    // this geometry: `reduced_basis_equal` (`covers_skip`) is restored as the
-    // production precondition, so ψ_C (rotation) takes the exact slow path and ψ_B
-    // takes the fast path only if the witness admits it — and on EITHER path β̂
-    // matches the streamed exact solve to < 1e-6. κ(G)/gram_rel below are reported
-    // for diagnostics (showing how a fired skip WOULD have diverged), not as the bar.
-    let gram_condition_number =
-        |evaluator: &crate::estimate::ExternalJointHyperEvaluator<'_>| -> f64 {
-            // `FaerEigh` is imported at module top (`use crate::faer_ndarray::FaerEigh`).
-            let cache = evaluator
-                .reml_state
-                .installed_gaussian_fixed_cache()
-                .expect("installed Gaussian Gram cache");
-            let g = &cache.xtwx_orig;
-            let sym = 0.5 * (g + &g.t());
-            let (evals, _) = sym.eigh(faer::Side::Lower).expect("Gram eigh");
-            let lo = evals.iter().cloned().fold(f64::INFINITY, f64::min);
-            let hi = evals.iter().cloned().fold(0.0_f64, f64::max);
-            hi / lo.max(1e-300)
-        };
-    const SOUNDNESS_SAFETY: f64 = 64.0;
+    // The n-free fast path reads `XᵀWX(ψ)` from the CHEBYSHEV INTERPOLANT
+    // `gram_at(ψ)` (≤ `PSI_GRAM_SPOT_RTOL=1e-10` vs the streamed EXACT assembled
+    // Gram). On the near-singular production Duchon Gram (κ(G)≈9.5e14, MSI-measured)
+    // the penalized solve amplifies that 1e-10 round-off to β̂rel≈1.7e-5 ≫ 1e-6
+    // WHENEVER the skip fires. The post-close "stale-penalty-not-stale-basis" theory
+    // (which dropped `reduced_basis_equal` and fired the skip on the n-free VALUE
+    // window) was empirically REFUTED by MSI. So the skip is restored to fire ONLY
+    // where the reduced basis is provably unchanged (`reduced_basis_equal`); on this
+    // rotating fixture the witness REFUSES both moved ψ's (skip_b=skip_c=false,
+    // confirmed at runtime), so BOTH take the exact slow path and β̂ matches the
+    // streamed exact solve to < 1e-6. The previous κ·gram_rel-capped bar (and its
+    // GATE-1b fast-path-Gram round-off probe) were artifacts of the now-excluded
+    // fast-path-fires regime — `installed_gram(tensor_eval)` is not even refreshed
+    // on the slow path — so they are removed. β̂ identity is the issue contract.
     let mut worst = 0.0_f64;
-    for (label, theta, beta_fast, g_fast) in [
-        ("psi_b", theta_at(psi_b), &beta_b, &g_fast_b),
-        ("psi_c", theta_at(psi_c), &beta_c, &g_fast_c),
+    for (label, theta, beta_tensor) in [
+        ("psi_b", theta_at(psi_b), &beta_b),
+        ("psi_c", theta_at(psi_c), &beta_c),
     ] {
         let beta_slow = beta_streamed(&mut streamed_eval, &mut stream_cache, &theta);
-        // GATE 1b INLINE — the LOAD-BEARING INPUT to the conditioning conclusion:
-        // the n-free fast-path Gram (Chebyshev `gram_at(ψ)`, installed on
-        // `tensor_eval`) must agree with the STREAMED exact Gram (installed on
-        // `streamed_eval`) to the certified `PSI_GRAM_SPOT_RTOL`. This proves the
-        // β̂ INPUT error is genuine round-off ON THIS DUCHON FIXTURE — without it,
-        // a β̂rel~1e-5 could be unconverted INPUT error, not amplification, and the
-        // conditioning-aware β̂ tolerance would be unjustified (closer-1's gate).
-        let g_exact = installed_gram(&streamed_eval);
-        assert_eq!(g_fast.dim(), g_exact.dim(), "@ {label}: Gram dim mismatch");
-        let gram_scale = g_exact.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
-        let gram_rel = g_fast
-            .iter()
-            .zip(g_exact.iter())
-            .fold(0.0_f64, |a, (f, e)| a.max((f - e).abs()))
-            / gram_scale.max(1e-300);
-        assert!(
-            gram_rel <= crate::solver::psi_gram_tensor::PSI_GRAM_SPOT_RTOL,
-            "@ {label}: n-free fast-path Gram differs from the streamed exact Gram by \
-             rel {gram_rel:.3e} > certified spot tol {:.0e} — the β̂ INPUT is NOT \
-             round-off on this Duchon fixture, so the β̂ divergence cannot be \
-             attributed to conditioning amplification (GATE 1b on Duchon)",
-            crate::solver::psi_gram_tensor::PSI_GRAM_SPOT_RTOL
-        );
-
-        // κ of the STREAMED exact Gram — the conditioning that amplifies the n-free
-        // Gram's (now-certified-round-off) input error into β̂. The raw Duchon
-        // Gram can be nearly singular along weak/null directions (that is why the
-        // penalized solve adds Sλ), so do not reject solely on κ(G). Instead cap
-        // the final β̂ tolerance below; that is the object this witness guards.
-        let kappa = gram_condition_number(&streamed_eval);
-        assert!(
-            kappa.is_finite() && kappa > 0.0,
-            "@ {label}: streamed Gram condition number must be finite and positive; \
-             got κ(G)={kappa:.3e}"
-        );
-        // DIAGNOSTIC ONLY: κ·gram_rel shows how a FIRED skip WOULD have diverged on
-        // this near-singular Duchon Gram. It is NOT the bar — the bar is the issue's
-        // 1e-6 below, met because the restored `covers_skip` precondition routes the
-        // rotating ψ_C to the EXACT slow path (β̂ trivially exact) and fires the fast
-        // path for ψ_B only where the basis is provably unchanged.
-        let kappa_times_round_off = SOUNDNESS_SAFETY * kappa * gram_rel.max(f64::MIN_POSITIVE);
-        let r = beta_fast
+        let r = beta_tensor
             .iter()
             .zip(beta_slow.iter())
             .fold(0.0_f64, |a, (f, s)| a.max((f - s).abs() / (1.0 + s.abs())));
         eprintln!(
-            "[DIAG1264-FP] {label} ψ={:.4} gram_rel={gram_rel:.3e} κ(G)={kappa:.3e} \
-             β̂rel={r:.3e} (κ·round-off≈{kappa_times_round_off:.3e}) issue-bar=1e-6 \
-             β̂fast[0]={:+.6e} β̂slow[0]={:+.6e}",
-            theta[rho_dim], beta_fast[0], beta_slow[0]
+            "[DIAG1264-FP] {label} ψ={:.4} β̂rel={r:.3e} issue-bar=1e-6 \
+             β̂tensor[0]={:+.6e} β̂streamed[0]={:+.6e}",
+            theta[rho_dim], beta_tensor[0], beta_slow[0]
         );
-        assert_eq!(beta_fast.len(), beta_slow.len(), "β̂ dim mismatch @ {label}");
-        for j in 0..beta_fast.len() {
+        assert_eq!(beta_tensor.len(), beta_slow.len(), "β̂ dim mismatch @ {label}");
+        for j in 0..beta_tensor.len() {
             assert!(
-                beta_fast[j].is_finite() && beta_slow[j].is_finite(),
+                beta_tensor[j].is_finite() && beta_slow[j].is_finite(),
                 "non-finite β̂[{j}] @ {label}"
             );
-            let babs = (beta_fast[j] - beta_slow[j]).abs();
+            let babs = (beta_tensor[j] - beta_slow[j]).abs();
             let brel = babs / (1.0 + beta_slow[j].abs());
             worst = worst.max(babs);
             // #1264 ISSUE-MANDATED BAR: β̂ must match the streamed exact solve to 1e-6
@@ -5126,11 +5059,11 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             assert!(
                 brel <= ISSUE_BETA_BAR,
                 "β̂[{j}] @ {label} diverges from the streamed exact solve beyond the \
-                 #1264 issue-mandated 1e-6 bar: fast={:+.12e} slow={:+.12e} |Δ|={babs:.3e} \
-                 rel={brel:.3e} > 1e-6 (κ(G)={kappa:.3e} gram_rel={gram_rel:.3e}) — the \
-                 restored `reduced_basis_equal` skip precondition failed to route this ψ \
-                 to the exact path, so an interpolated-Gram κ-amplified κ-optimum shipped",
-                beta_fast[j],
+                 #1264 issue-mandated 1e-6 bar: tensor={:+.12e} streamed={:+.12e} \
+                 |Δ|={babs:.3e} rel={brel:.3e} > 1e-6 — the restored `reduced_basis_equal` \
+                 skip precondition failed to route this ψ to the exact path, so an \
+                 interpolated-Gram κ-amplified κ-optimum shipped",
+                beta_tensor[j],
                 beta_slow[j],
             );
         }
