@@ -535,23 +535,16 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         tensor.reduced_basis_equal(psi_ref, psi)
     }
 
-    /// True when the design-revision fast path of [`Self::prepare_eval_state`]
-    /// would fire for `design_revision` — i.e. a prior eval has already pinned
-    /// `last_canonical_revision` to this exact realizer revision, so the next
-    /// `evaluate_with_order` at this revision will SKIP `reset_surface` (and the
-    /// n×k `apply_to_design` reconditioning) and instead re-install the ψ-keyed
-    /// `GaussianFixedCache` onto the existing surface (#1033).
-    ///
-    /// The spatial κ caller (`SpatialJointContext::eval_full`) consults this
-    /// BEFORE deciding to skip its own `ensure_theta` design re-realization: it
-    /// may only suppress the per-trial O(n·k) design rebuild when the evaluator
-    /// will take that fast path, because the fast path is exactly the lane that
-    /// keeps the (now intentionally stale) reference surface while serving the
-    /// trial's value + gradient n-free from the certified tensor. When this is
-    /// `false` the caller MUST realize the design so the slow path's
-    /// `reset_surface` rebuilds a faithful surface.
-    pub(crate) fn design_revision_fast_path_armed(&self, design_revision: u64) -> bool {
-        self.last_canonical_revision == Some(design_revision)
+    /// Revision of the canonical surface pinned by the last slow-path
+    /// `reset_surface`, if any. The spatial κ caller passes this revision back
+    /// on certified n-free value/gradient probes so [`Self::prepare_eval_state`]
+    /// and [`Self::prepare_eval_state_cost_only`] take their design-revision fast
+    /// paths even if the caller-side realizer revision has since advanced on an
+    /// unrelated miss. The fast path re-keys the Gaussian Gram and `S(ψ)` from
+    /// k-space statistics, so it intentionally reuses this pinned surface rather
+    /// than requiring equality with the current realizer revision (#1033).
+    pub(crate) fn nfree_fast_path_revision(&self) -> Option<u64> {
+        self.last_canonical_revision
     }
 
     /// Return the most-recently converged inner β from the last PIRLS solve, if

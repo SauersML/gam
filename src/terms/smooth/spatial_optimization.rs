@@ -2525,25 +2525,26 @@ impl<'d> SpatialJointContext<'d> {
         //   (c) this eval is gradient-only (`!allow_second_order`) — the exact
         //       outer-Hessian `B_j` path DOES read the slab, so a Hessian trial
         //       must keep a faithful (freshly realized) design, and
-        //   (d) the evaluator's design-revision fast path is ARMED at the
-        //       current realizer revision (`design_revision_fast_path_armed`) —
-        //       i.e. a prior slow-path eval already pinned a faithful reference
-        //       surface at this revision, which `prepare_eval_state` will reuse
-        //       while re-installing the ψ-keyed cache,
+        //   (d) the evaluator has a pinned canonical slow-path revision — i.e.
+        //       a prior slow-path eval already built a faithful reference surface,
+        //       which `prepare_eval_state` will reuse while re-installing the
+        //       ψ-keyed cache,
         // we SKIP `ensure_theta`. The realizer revision then does not advance, so
-        // `prepare_eval_state` takes its design-revision fast path: it skips
-        // `reset_surface` + the n×k `apply_to_design`, keeps the (intentionally
-        // stale) reference surface, and re-keys the `GaussianFixedCache` to this
-        // ψ. The hyper_dirs built below are a pure function of (data, frozen
-        // spec, column layout) — ψ-invariant — so they are bit-identical whether
-        // or not the design was re-realized, and the tensor branch never reads
-        // their n×k slab anyway. Net: criterion + gradient + inner solve come
-        // from k-space statistics only, with no per-trial O(n·k) pass.
+        // `prepare_eval_state` takes its design-revision fast path by receiving
+        // that pinned revision back: it skips `reset_surface` + the n×k
+        // `apply_to_design`, keeps the reference surface, and re-keys the
+        // `GaussianFixedCache` to this ψ. The hyper_dirs built below are a pure
+        // function of (data, frozen spec, column layout) — ψ-invariant — so they
+        // are bit-identical whether or not the design was re-realized, and the
+        // tensor branch never reads their n×k slab anyway. Net: criterion +
+        // gradient + inner solve come from k-space statistics only, with no
+        // per-trial O(n·k) pass.
         //
         // When ANY gate clause fails (non-Gaussian, off-window, off the gradient
-        // sub-window, a Hessian eval, or the fast path not yet armed) we realize
-        // the design as before so the slow path rebuilds a faithful surface — the
-        // existing exact lane runs UNCHANGED.
+        // sub-window, a Hessian eval, or no pinned canonical surface yet) we
+        // realize the design as before so the slow path rebuilds a faithful
+        // surface — the existing exact lane runs unchanged.
+        let nfree_fast_path_revision = self.evaluator.nfree_fast_path_revision();
         let skip_design_realization = !allow_second_order && theta.len() == self.rho_dim + 1 && {
             let psi = theta[self.rho_dim];
             self.evaluator.psi_gram_tensor_covers(psi)
@@ -2581,9 +2582,7 @@ impl<'d> SpatialJointContext<'d> {
                     // rebuilt EXACTLY and n-free on the fast path, else the inner
                     // solve would pair XᵀWX(ψ_new) with the stale S(ψ_old).
                     && self.evaluator.supports_nfree_penalty_rekey()
-                    && self
-                        .evaluator
-                        .design_revision_fast_path_armed(self.cache.design_revision())
+                    && nfree_fast_path_revision.is_some()
         };
         if skip_design_realization {
             log::debug!(
@@ -2620,7 +2619,11 @@ impl<'d> SpatialJointContext<'d> {
             self.cache.hyper_dirs_for_current_design(self.data, kind)?
         };
 
-        let design_revision = Some(self.cache.design_revision());
+        let design_revision = if skip_design_realization {
+            nfree_fast_path_revision
+        } else {
+            Some(self.cache.design_revision())
+        };
         // #1033 penalty lane: stage the EXACT n-free `S(ψ)` for this trial so the
         // evaluator's design-revision fast path can re-key the kept reference
         // surface without `reset_surface`. Built from the FROZEN basis geometry
@@ -2749,18 +2752,16 @@ impl<'d> SpatialJointContext<'d> {
         // tensor's value lane (`XᵀWX(ψ)/XᵀW(y−offset)(ψ)`), which the inner
         // Gaussian PLS reads n-free from the ψ-keyed `GaussianFixedCache`. So when
         // the single design-moving ψ is covered for the VALUE lane and the
-        // evaluator's design-revision fast path is armed at the current realizer
-        // revision, skip the n×k design re-realization: the realizer revision
-        // stays pinned, `evaluate_cost_only` takes its `prepare_eval_state_cost_only`
-        // fast path (which skips `reset_surface` + the n×k `apply_to_design` and
-        // re-keys the cache to this probe's ψ), and the probe cost comes from
-        // k-space statistics only. Line-search probes are the bulk of the κ-loop
-        // per-trial work, so this is the dominant n-flat lever. Unlike the
-        // gradient path the value lane spans the FULL certified window, but the
-        // probe still skips `reset_surface`, so it must also stay inside the
-        // reduced-basis-equality skip sub-window. Any miss (non-Gaussian, off-window,
-        // off-skip-window, fast path not yet armed) realizes the design and runs
-        // the exact streamed probe unchanged.
+        // evaluator has a pinned canonical slow-path revision, skip the n×k
+        // design re-realization: `evaluate_cost_only` receives that pinned
+        // revision, takes its `prepare_eval_state_cost_only` fast path (which
+        // skips `reset_surface` + the n×k `apply_to_design` and re-keys the cache
+        // to this probe's ψ), and the probe cost comes from k-space statistics
+        // only. Line-search probes are the bulk of the κ-loop per-trial work, so
+        // this is the dominant n-flat lever. Any miss (non-Gaussian, off-window,
+        // missing penalty re-key support, or no pinned surface yet) realizes the
+        // design and runs the exact streamed probe unchanged.
+        let nfree_fast_path_revision = self.evaluator.nfree_fast_path_revision();
         let skip_value_realization = theta.len() == self.rho_dim + 1 && {
             let psi = theta[self.rho_dim];
             self.evaluator.psi_gram_tensor_covers(psi)
@@ -2780,9 +2781,7 @@ impl<'d> SpatialJointContext<'d> {
                     // EXACTLY and n-free; otherwise its cost would use the stale
                     // S(ψ_old) and mis-rank the line search.
                     && self.evaluator.supports_nfree_penalty_rekey()
-                    && self
-                        .evaluator
-                        .design_revision_fast_path_armed(self.cache.design_revision())
+                    && nfree_fast_path_revision.is_some()
         };
         if !skip_value_realization && self.cache.ensure_theta(theta).is_err() {
             return f64::INFINITY;
@@ -2828,7 +2827,11 @@ impl<'d> SpatialJointContext<'d> {
             self.evaluator.stage_glm_first_step_gram(None);
             self.evaluator.stage_glm_psi_gram_deriv(None);
         }
-        let design_revision = Some(self.cache.design_revision());
+        let design_revision = if skip_value_realization {
+            nfree_fast_path_revision
+        } else {
+            Some(self.cache.design_revision())
+        };
         let cost_label = self.kind.label();
         let result = {
             let design = self.cache.design();
