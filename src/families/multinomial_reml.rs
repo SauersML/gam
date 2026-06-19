@@ -1030,8 +1030,7 @@ impl MultinomialFamily {
                         for a in 0..m {
                             let pa = probs_full[[row, a]];
                             let row_a = a * p;
-                            let jaa =
-                                w * (ddp[a] - 2.0 * ddp[a] * pa - 2.0 * dp_u[a] * dp_v[a]);
+                            let jaa = w * (ddp[a] - 2.0 * ddp[a] * pa - 2.0 * dp_u[a] * dp_v[a]);
                             if jaa != 0.0 {
                                 for i in 0..p {
                                     let xi = design[[row, i]];
@@ -2377,7 +2376,8 @@ mod tests {
             .expect("workspace batched second-directional operators must succeed");
         assert_eq!(batched.len(), pairs.len());
 
-        for (pair_idx, ((u, v), maybe_operator)) in pairs.iter().zip(batched.into_iter()).enumerate()
+        for (pair_idx, ((u, v), maybe_operator)) in
+            pairs.iter().zip(batched.into_iter()).enumerate()
         {
             let dense = maybe_operator
                 .expect("workspace must return a second-directional operator")
