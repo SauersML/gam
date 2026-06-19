@@ -7482,13 +7482,26 @@ pub(crate) fn rank_deficient_euclidean_outer_gradient_objective() -> SaeManifold
 /// well-conditioned and `H_tβ = 0` so the singularity is purely in β. The
 /// chart gauge orbit cannot reach this direction (#1051).
 pub(crate) fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
-    // Well-conditioned latent block (single row, dim 1).
-    let htt = ArrowFactorSlab::from_blocks(vec![array![[1.0_f64]]]);
+    // The latent block must be dimensionally consistent with the paired
+    // objective `rank_deficient_euclidean_outer_gradient_objective` so the
+    // channel-null candidates (whose full length is the objective's
+    // `n·q + β_dim`) survive the `dir.len() == full_len` guard in
+    // `outer_gradient_arrow_solver`. That objective has n = 4 data rows and
+    // `row_block_dim q = 1` (one latent axis, K = 1 softmax ⇒ no assignment
+    // coord), so `delta_t_len` must be `n·q = 4`. A mismatched single-row cache
+    // makes `full_len = 5` while the candidates have length 8, silently
+    // dropping every channel-null direction and re-introducing the bug.
+    let htt = ArrowFactorSlab::from_blocks(vec![
+        array![[1.0_f64]],
+        array![[1.0_f64]],
+        array![[1.0_f64]],
+        array![[1.0_f64]],
+    ]);
     // β dim = m · p = 2 · 2 = 4, laid out (col, out_col) row-major like
     // `dense_step_gauge_vector_from_field`. Make output channel 1 (indices
     // 1 and 3) near-null: its lower-Cholesky pivot is 1e-7, so the
     // min/max pivot ratio falls below the 1e-12 floor and the conditioning
-    // path engages. H_tβ = 0 (zero Dense block) decouples β from latent.
+    // path engages. H_tβ = 0 (zero Dense blocks) decouples β from latent.
     let schur = array![
         [1.0_f64, 0.0, 0.0, 0.0],
         [0.0, 1.0e-7, 0.0, 0.0],
@@ -7504,12 +7517,20 @@ pub(crate) fn rank_deficient_beta_outer_gradient_cache() -> ArrowFactorCache {
         ridge_t: 0.0,
         ridge_beta: 0.0,
         htbeta: ArrowHtbetaCache::Dense {
-            blocks: Arc::from(vec![Array2::<f64>::zeros((1, 4))].into_boxed_slice()),
+            blocks: Arc::from(
+                vec![
+                    Array2::<f64>::zeros((1, 4)),
+                    Array2::<f64>::zeros((1, 4)),
+                    Array2::<f64>::zeros((1, 4)),
+                    Array2::<f64>::zeros((1, 4)),
+                ]
+                .into_boxed_slice(),
+            ),
             estimated_bytes: 0,
         },
-        d: 1,
-        row_dims: Arc::from(vec![1usize].into_boxed_slice()),
-        row_offsets: Arc::from(vec![0usize, 1usize].into_boxed_slice()),
+        d: 4,
+        row_dims: Arc::from(vec![1usize, 1usize, 1usize, 1usize].into_boxed_slice()),
+        row_offsets: Arc::from(vec![0usize, 1usize, 2usize, 3usize, 4usize].into_boxed_slice()),
         k: 4,
         manifold_mode_fingerprint: 0,
         row_hessian_fingerprint: 0,
@@ -7540,7 +7561,7 @@ pub(crate) fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() 
     // inverse divides by the 1e-7 pivot and explodes; the deflated solve is
     // bounded at the Hessian scale.
     let beta_null_rhs = array![0.0_f64, 0.0, 0.0, 1.0]; // output channel 1, col 1.
-    let rhs_t = Array1::<f64>::zeros(1);
+    let rhs_t = Array1::<f64>::zeros(cache.delta_t_len());
     let plain = cache
         .full_inverse_apply(rhs_t.view(), beta_null_rhs.view())
         .expect("plain solve")
