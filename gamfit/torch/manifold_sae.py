@@ -1086,6 +1086,13 @@ class ManifoldSAE(nn.Module):
         self.sparsity = _SparsityLayer(cfg)
         self.log_lambda = nn.Parameter(torch.zeros(F, dtype=dt))
 
+        # #1282 decoder-harmonic smoothness weight. The training loss scales
+        # `regularization()` by a small coefficient (~1e-5); this internal weight
+        # lifts the harmonic (h>=2) smoothness term to an effective magnitude
+        # that actually suppresses decoder snaking while leaving the fundamental
+        # ellipse free. See `decoder_harmonic_penalty`.
+        self._harmonic_penalty_weight = 5.0e3
+
         # Decoder orthogonality penalty: Rust ``block_orthogonality`` descriptor.
         # The penalty operates on a flat target of shape ``(n_eff, latent_dim)``
         # and treats ``groups`` as a partition of the latent (column) axis. We
@@ -1643,9 +1650,58 @@ class ManifoldSAE(nn.Module):
         """Rust-backed sparsity penalty value at ``logits``."""
         return self.sparsity.penalty(logits)
 
+    def decoder_harmonic_penalty(self) -> torch.Tensor:
+        """Low-frequency smoothness prior on each atom's circle decoder (#1282).
+
+        A circle atom's decoder maps the periodic basis ``[DC, cos θ, sin θ,
+        cos 2θ, sin 2θ, …]`` to ``R^D``; with the fundamental alone its curve is
+        an affine image of the circle — an ellipse confined to a single affine
+        2-plane. The higher harmonics let the curve leave that 2-plane and
+        *snake* through 4-space, so one atom can pass near two different circles
+        at different phases (issue #1282): reconstruction stays excellent
+        (R² ≈ 0.99) but the per-atom reconstruction residual no longer
+        distinguishes the manifolds and top-1 routing collapses to chance.
+
+        Two manifolds that occupy distinct 2-planes (e.g. the energy-degenerate
+        signed circles ``(c,s,c,±s)``) cannot both lie in one fundamental-only
+        atom's 2-plane, so penalizing the harmonics ``h ≥ 2`` of the decoder
+        forces each atom onto a single 2-plane — hence a single manifold —
+        making the residual genuinely informative and routing well-posed. It is
+        a pure smoothness prior (the same ``h⁴`` scaling the Rust periodic basis
+        builds for its own penalty), keyed on nothing about the data: the true
+        manifolds are pure fundamental circles, so it leaves reconstruction (and
+        the disjoint case) untouched while removing only the snaking capacity the
+        true circles never use.
+
+        Only well-defined for the ``circle`` manifold with the standard odd-K
+        ``[DC, {sinθ,cosθ}, {sin2θ,cos2θ}, …]`` layout (row index == basis
+        column == harmonic), where ``decoder_blocks`` rows ``>= 3`` are the
+        harmonics ``h >= 2``; returns zero otherwise.
+        """
+        K = int(self.cfg.n_basis_per_atom)
+        if self.cfg.atom_manifold != "circle" or K != 1 + 2 * ((K - 1) // 2):
+            return self.decoder_blocks.new_zeros(())
+        if K < 4:  # no harmonics beyond the fundamental to penalize
+            return self.decoder_blocks.new_zeros(())
+        total = self.decoder_blocks.new_zeros(())
+        # rows: 0=DC, 1,2=h1 (fundamental, free), then (sin,cos) pairs for h>=2.
+        for h in range(2, (K - 1) // 2 + 1):
+            sin_row = 1 + 2 * (h - 1)
+            cos_row = sin_row + 1
+            w = float(h) ** 4  # graduated smoothness weight (Rust convention)
+            total = total + w * (
+                self.decoder_blocks[:, sin_row, :].square().sum()
+                + self.decoder_blocks[:, cos_row, :].square().sum()
+            )
+        return self._harmonic_penalty_weight * total
+
     def regularization(self, logits: torch.Tensor | None = None) -> torch.Tensor:
         """Sum of Rust-backed regularizers used by the loss."""
-        reg = self.decoder_ortho_penalty() + self.decoder_monotonicity_penalty()
+        reg = (
+            self.decoder_ortho_penalty()
+            + self.decoder_monotonicity_penalty()
+            + self.decoder_harmonic_penalty()
+        )
         if logits is not None:
             reg = reg + self.sparsity_penalty(logits)
         return reg
