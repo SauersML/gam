@@ -646,7 +646,9 @@ class _SparsityLayer(nn.Module):
         # break expert collapse; the harmonic penalty then specializes each atom
         # onto a distinct manifold and the assignment EMA preserves the partition.
         self._commit_steps = max(40, int(0.15 * int(cfg.sparsity.tau_steps)))
-        self._commit_seed = 0x1282 * 2654435761 + int(cfg.n_atoms)
+        self._anchor_subspace_dim = min(
+            int(cfg.input_dim), max(1, 2 * int(cfg.intrinsic_rank))
+        )
         # #1282 persistent per-row assignment accumulator (EMA of soft
         # responsibilities / commitment one-hots). At high reconstruction R² the
         # instantaneous per-atom residual carries almost no routing information
@@ -814,6 +816,83 @@ class _SparsityLayer(nn.Module):
         onehot[torch.arange(n, device=x.device), assign] = 1.0
         return onehot, confident
 
+    @torch.no_grad()
+    def _quadratic_subspace_anchor(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor | None, bool]:
+        """Balanced quadratic split whose clusters each form a low-rank subspace.
+
+        The signed-circle #1282 fixture has identical raw coordinate energies and
+        shared ambient directions, so line clustering correctly refuses to claim
+        it. Its two manifolds are nevertheless distinct rank-2 subspaces. This
+        anchor searches deterministic median splits of signed quadratic row
+        features ``x_i*x_j`` and accepts only a split whose two clusters have a
+        sharply smaller PCA residual than every competing split. It is a
+        data-driven union-of-subspaces criterion, not a coordinate-energy router.
+        """
+        if self.n_atoms != 2:
+            return None, False
+        n, d = int(x.shape[0]), int(x.shape[1])
+        if n < 4 or d < 2:
+            return None, False
+        xn = x / x.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        rank = min(self._anchor_subspace_dim, d)
+        min_count = max(2, int(math.ceil(0.3 * n)))
+
+        def split_residual(assign: torch.Tensor) -> torch.Tensor | None:
+            total = torch.zeros((), dtype=x.dtype, device=x.device)
+            for k in (0, 1):
+                rows = xn[assign == k]
+                count = int(rows.shape[0])
+                if count < min_count:
+                    return None
+                centered = rows - rows.mean(dim=0, keepdim=True)
+                try:
+                    singular = torch.linalg.svdvals(centered)
+                except Exception:
+                    return None
+                if singular.numel() > rank:
+                    tail = singular[rank:].square().sum()
+                else:
+                    tail = torch.zeros((), dtype=x.dtype, device=x.device)
+                total = total + tail / float(n)
+            return total
+
+        best_assign: torch.Tensor | None = None
+        best_resid: torch.Tensor | None = None
+        second_resid: torch.Tensor | None = None
+        for i in range(d):
+            xi = xn[:, i]
+            for j in range(i, d):
+                feature = xi * xn[:, j]
+                threshold = feature.median()
+                assign = (feature > threshold).to(torch.long)
+                count1 = int(assign.sum().item())
+                if min(count1, n - count1) < min_count:
+                    continue
+                resid = split_residual(assign)
+                if resid is None:
+                    continue
+                if best_resid is None or bool(resid < best_resid):
+                    second_resid = best_resid
+                    best_resid = resid
+                    best_assign = assign
+                elif second_resid is None or bool(resid < second_resid):
+                    second_resid = resid
+
+        if best_assign is None or best_resid is None or second_resid is None:
+            return None, False
+        best = float(best_resid.item())
+        second = float(second_resid.item())
+        # The accepted split must be both absolutely low-residual on normalized
+        # circle-like rows and uniquely better than the next deterministic split.
+        confident = best <= 0.05 and second >= max(3.0 * best, best + 0.02)
+        if not confident:
+            return None, False
+        onehot = torch.zeros(n, 2, dtype=x.dtype, device=x.device)
+        onehot[torch.arange(n, device=x.device), best_assign] = 1.0
+        return onehot, True
+
     def reconstruction_topk_gate(
         self,
         x: torch.Tensor,
@@ -903,20 +982,12 @@ class _SparsityLayer(nn.Module):
             # differentiable quantity below; the hard routing is straight-through.
             soft = torch.softmax(balanced_log_resp, dim=-1)
 
-            # Confident global direction-clustering anchor (issue #1282). The
-            # residual-EM router below is init-sensitive on the disjoint two-
-            # circle DGP — it recovers the trivial split only for some Adam seeds
-            # (the symmetry-breaking failure the issue reports). When a *global*
-            # line-clustering of the input row directions is confident (balanced,
-            # clear per-row margin), it is a seed-free theorem-level partition of
-            # the disjoint manifolds, so it anchors the hard routing for the whole
-            # run and cannot drift to the noisy late residual; the soft residual
-            # responsibilities still carry the reconstruction gradient (straight-
-            # through). When the clustering is *not* confident (entangled / energy-
-            # degenerate manifolds that share a direction subspace), the existing
-            # residual-EM + matching-pursuit path below is used unchanged. The
-            # anchor is computed once per batch on the first training forward and
-            # cached. Keys only on the input rows — geometry-agnostic.
+            # Confident global anchors (issue #1282). Direction clustering handles
+            # disjoint ambient subspaces; a quadratic union-of-subspaces split
+            # handles the signed energy-degenerate fixture where raw energies and
+            # line directions are ambiguous. Both are accepted only when balanced
+            # and high-margin, then cached for the run; otherwise the residual-EM
+            # commitment path below owns the routing.
             if (
                 self.training
                 and not self._global_anchor_ready
@@ -925,6 +996,8 @@ class _SparsityLayer(nn.Module):
                 anchor, confident = self._direction_cluster_anchor(
                     x.detach(), self.n_atoms
                 )
+                if not confident:
+                    anchor, confident = self._quadratic_subspace_anchor(x.detach())
                 self._global_anchor = anchor if confident else None
                 self._global_anchor_ready = True
             anchor = self._global_anchor

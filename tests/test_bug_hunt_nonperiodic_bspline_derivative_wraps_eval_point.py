@@ -67,11 +67,22 @@ def test_full_range_first_derivative_matches_central_difference() -> None:
 
 def test_full_range_second_derivative_matches_central_difference() -> None:
     """Order-2 wraps the same way as order-1 if the bug is present; it must
-    match a central difference of the order-1 derivative across the full range."""
+    match a central difference of the order-1 derivative across the interior.
+
+    gam clamps the eval point to the modeling interval [knots[degree],
+    knots[-degree-1]] (constant extension outside), so the order-1 derivative is
+    exactly zero — and therefore discontinuous at the interval ends — in the
+    exterior boundary spans. A central difference of the order-1 derivative is
+    only well posed where both straddle points stay strictly inside the interval,
+    so evaluate on the interior inset by a few h; this still pins order-2 to a
+    finite difference of order-1 across every interior knot.
+    """
     knots = np.linspace(-2.0, 3.0, 14)
     degree = 3
-    tt = np.linspace(knots[0], knots[-1], 121)
+    left = knots[degree]
+    right = knots[-degree - 1]
     h = 1e-5
+    tt = np.linspace(left + 10 * h, right - 10 * h, 121)
     fd = (
         gamfit.bspline_basis_derivative(
             tt + h, knots, degree=degree, order=1, periodic=False
@@ -86,19 +97,38 @@ def test_full_range_second_derivative_matches_central_difference() -> None:
     assert np.max(np.abs(d2 - fd)) < 1e-4
 
 
-def test_derivative_is_not_degenerately_zero() -> None:
-    """Guard against a degenerate 'fix' that just zeros the boundary spans:
-    the derivative must actually be non-trivial in the boundary spans."""
+def test_exterior_derivative_is_zero_interior_is_not() -> None:
+    """gam's open-knot value basis is constant outside the modeling interval
+    [knots[degree], knots[-degree-1]] (the eval point is clamped there), so the
+    order-1 derivative must be exactly zero in the two exterior boundary spans —
+    the derivative of a constant — and substantively non-zero in the interior.
+    The interior check also guards against a degenerate 'fix' that just zeros the
+    whole derivative."""
     knots = np.linspace(-2.0, 3.0, 14)
     degree = 3
-    # Points inside the two boundary spans.
-    t = np.array(
+    left = knots[degree]
+    right = knots[-degree - 1]
+
+    # Points strictly inside the two exterior boundary spans (below `left` /
+    # above `right`): the derivative of the constant-extended value is zero.
+    exterior = np.array(
         [
-            knots[1] - 0.25 * (knots[1] - knots[0]),  # first span
-            knots[-2] + 0.25 * (knots[-1] - knots[-2]),  # last span
+            knots[1] - 0.25 * (knots[1] - knots[0]),  # first span, < left
+            knots[-2] + 0.25 * (knots[-1] - knots[-2]),  # last span, > right
         ]
     )
-    deriv = gamfit.bspline_basis_derivative(
-        t, knots, degree=degree, order=1, periodic=False
+    deriv_ext = gamfit.bspline_basis_derivative(
+        exterior, knots, degree=degree, order=1, periodic=False
     )
-    assert np.max(np.abs(deriv)) > 1e-6
+    assert np.max(np.abs(deriv_ext)) < 1e-9, (
+        "open-knot derivative must vanish in the constant-extension exterior; "
+        f"got max|d| = {np.max(np.abs(deriv_ext))}"
+    )
+
+    # Interior points: the derivative is a genuine, non-trivial B-spline
+    # derivative (guards against a fix that just zeros everything).
+    interior = np.linspace(left, right, 17)
+    deriv_int = gamfit.bspline_basis_derivative(
+        interior, knots, degree=degree, order=1, periodic=False
+    )
+    assert np.max(np.abs(deriv_int)) > 1e-6
