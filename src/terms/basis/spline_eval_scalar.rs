@@ -558,23 +558,15 @@ pub fn evaluate_ispline_scalarwith_scratch(
         let left_local = &mut scratch.left_local[..support];
         left_local.fill(0.0);
         scratch.left_inner.ensure_degree(bs_degree);
-        let left_start = internal::evaluate_splines_sparse_into(
+        let left_offsets = &mut scratch.left_offsets[..num_bspline_basis];
+        internal::cumulative_bspline_offsets_into(
             left,
             bs_degree,
             knot_vector,
             left_local,
             &mut scratch.left_inner,
+            left_offsets,
         );
-        let left_offsets = &mut scratch.left_offsets[..num_bspline_basis];
-        let mut left_running = 0.0_f64;
-        for offset in (0..support).rev() {
-            let j = left_start + offset;
-            if j >= num_bspline_basis {
-                continue;
-            }
-            left_running += left_local[offset];
-            left_offsets[j] = left_running;
-        }
         for j in 1..num_bspline_basis {
             let value = 1.0 - left_offsets[j];
             out[j - 1] = if value.abs() <= 1e-15 { 0.0 } else { value };
@@ -631,23 +623,15 @@ pub fn evaluate_ispline_scalarwith_scratch(
     let left_local = &mut scratch.left_local[..support];
     left_local.fill(0.0);
     scratch.left_inner.ensure_degree(bs_degree);
-    let left_start = internal::evaluate_splines_sparse_into(
+    let left_offsets = &mut scratch.left_offsets[..num_bspline_basis];
+    internal::cumulative_bspline_offsets_into(
         left,
         bs_degree,
         knot_vector,
         left_local,
         &mut scratch.left_inner,
+        left_offsets,
     );
-    let left_offsets = &mut scratch.left_offsets[..num_bspline_basis];
-    let mut left_running = 0.0_f64;
-    for offset in (0..support).rev() {
-        let j = left_start + offset;
-        if j >= num_bspline_basis {
-            continue;
-        }
-        left_running += left_local[offset];
-        left_offsets[j] = left_running;
-    }
     for j in 1..num_bspline_basis {
         let out_idx = j - 1;
         out[out_idx] -= left_offsets[j];
@@ -1021,23 +1005,15 @@ pub(crate) fn create_ispline_dense(
     // Left-boundary cumulative constants for anchoring I_j(left)=0.
     let mut left_local = vec![0.0_f64; support];
     let mut left_scratch = internal::BsplineScratch::new(bs_degree);
-    let left_start = internal::evaluate_splines_sparse_into(
+    let mut left_offsets = vec![0.0_f64; num_bspline_basis];
+    internal::cumulative_bspline_offsets_into(
         left,
         bs_degree,
         knot_vector,
         &mut left_local,
         &mut left_scratch,
+        &mut left_offsets,
     );
-    let mut left_offsets = vec![0.0_f64; num_bspline_basis];
-    let mut left_running = 0.0_f64;
-    for offset in (0..support).rev() {
-        let j = left_start + offset;
-        if j >= num_bspline_basis {
-            continue;
-        }
-        left_running += left_local[offset];
-        left_offsets[j] = left_running;
-    }
 
     // Outside the knot domain the I-spline saturates: every basis is anchored
     // at 0 at `left` and reaches its right-cumulative mass (≈ 1 minus the

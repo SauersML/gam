@@ -404,3 +404,33 @@ pub(super) fn evaluate_splines_sparse_into(
 
     mu.saturating_sub(degree)
 }
+
+/// Evaluate the sparse B-spline support at `x` and write its right-cumulative
+/// sums into `offsets`, indexed by global basis column.
+///
+/// This is the I-spline left-boundary anchoring kernel: column `j` receives the
+/// total active mass at and to the right of `j` within the support block. The
+/// caller must pre-zero `offsets` (length = number of B-spline columns) and
+/// supply `local` of length `degree + 1` as scratch. Columns outside
+/// `offsets.len()` are skipped.
+#[inline]
+pub(super) fn cumulative_bspline_offsets_into(
+    x: f64,
+    degree: usize,
+    knots: ArrayView1<f64>,
+    local: &mut [f64],
+    scratch: &mut BsplineScratch,
+    offsets: &mut [f64],
+) {
+    let support = degree + 1;
+    let start = evaluate_splines_sparse_into(x, degree, knots, local, scratch);
+    let mut running = 0.0_f64;
+    for offset in (0..support).rev() {
+        let j = start + offset;
+        if j >= offsets.len() {
+            continue;
+        }
+        running += local[offset];
+        offsets[j] = running;
+    }
+}
