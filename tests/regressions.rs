@@ -68,6 +68,8 @@ mod bug_hunt_diagnose_drops_response_column;
 mod bug_hunt_dispersion_location_scale_generate_predict_variance_agreement;
 #[path = "regressions/bug_hunt_double_penalty_inflates_edf_instead_of_shrinking.rs"]
 mod bug_hunt_double_penalty_inflates_edf_instead_of_shrinking;
+#[path = "regressions/bug_hunt_double_penalty_shrinks_irrelevant_covariate_1266.rs"]
+mod bug_hunt_double_penalty_shrinks_irrelevant_covariate_1266;
 #[path = "regressions/spline_scan_1266_lambda_probe.rs"]
 mod spline_scan_1266_lambda_probe;
 #[path = "regressions/bug_hunt_estimate_external_family_and_links.rs"]
