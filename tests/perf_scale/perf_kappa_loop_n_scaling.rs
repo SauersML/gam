@@ -342,6 +342,16 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
             timing.eval_total_s,
             timing.efs_total_s
         );
+        eprintln!(
+            "[kappa-fast-ladder-miss] n={n} shape={} value={} gradient={} penalty={} revision={} second_order={} other={}",
+            timing.nfree_miss_shape,
+            timing.nfree_miss_value,
+            timing.nfree_miss_gradient,
+            timing.nfree_miss_penalty,
+            timing.nfree_miss_revision,
+            timing.nfree_miss_second_order,
+            timing.nfree_miss_other,
+        );
     }
 
     let first = kappa_phase.first().copied().unwrap_or(0.0).max(1e-3);
@@ -431,6 +441,16 @@ fn kappa_outer_loop_is_n_independent() {
             timing.cost_total_s,
             timing.eval_total_s,
             timing.efs_total_s
+        );
+        eprintln!(
+            "[kappa-n-scaling-miss] n={n} shape={} value={} gradient={} penalty={} revision={} second_order={} other={}",
+            timing.nfree_miss_shape,
+            timing.nfree_miss_value,
+            timing.nfree_miss_gradient,
+            timing.nfree_miss_penalty,
+            timing.nfree_miss_revision,
+            timing.nfree_miss_second_order,
+            timing.nfree_miss_other,
         );
     }
 

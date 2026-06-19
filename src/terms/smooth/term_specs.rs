@@ -2227,6 +2227,13 @@ pub struct SpatialLengthScaleOptimizationTiming {
     pub efs_total_s: f64,
     pub slow_path_resets: u64,
     pub design_revision_delta: u64,
+    pub nfree_miss_shape: u64,
+    pub nfree_miss_value: u64,
+    pub nfree_miss_gradient: u64,
+    pub nfree_miss_penalty: u64,
+    pub nfree_miss_revision: u64,
+    pub nfree_miss_second_order: u64,
+    pub nfree_miss_other: u64,
     pub optim_total_s: f64,
 }
 

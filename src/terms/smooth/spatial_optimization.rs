@@ -2340,7 +2340,54 @@ struct SpatialJointContext<'d> {
     frozen_glm_tensor_attempted: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct NfreeSkipGateStatus {
+    shape: bool,
+    value: bool,
+    gradient: bool,
+    penalty: bool,
+    revision: bool,
+    second_order: bool,
+}
+
+impl NfreeSkipGateStatus {
+    fn would_skip(self, require_gradient: bool) -> bool {
+        self.shape
+            && self.value
+            && (!require_gradient || self.gradient)
+            && self.penalty
+            && self.revision
+            && !self.second_order
+    }
+}
+
 impl<'d> SpatialJointContext<'d> {
+    fn nfree_skip_gate_status(
+        &self,
+        theta: &Array1<f64>,
+        allow_second_order: bool,
+        require_gradient: bool,
+    ) -> NfreeSkipGateStatus {
+        let shape = theta.len() == self.rho_dim + 1;
+        let (value, gradient) = if shape {
+            let psi = theta[self.rho_dim];
+            (
+                self.evaluator.psi_gram_tensor_covers(psi),
+                !require_gradient || self.evaluator.psi_gram_tensor_covers_gradient(psi),
+            )
+        } else {
+            (false, false)
+        };
+        NfreeSkipGateStatus {
+            shape,
+            value,
+            gradient,
+            penalty: self.evaluator.supports_nfree_penalty_rekey(),
+            revision: self.evaluator.nfree_fast_path_revision().is_some(),
+            second_order: allow_second_order,
+        }
+    }
+
     fn frozen_glm_working_state(
         &self,
         beta: &Array1<f64>,
@@ -3279,6 +3326,13 @@ fn run_exact_joint_spatial_optimization(
     let kphase_cost_total_s = std::cell::Cell::new(0.0);
     let kphase_eval_total_s = std::cell::Cell::new(0.0);
     let kphase_efs_total_s = std::cell::Cell::new(0.0);
+    let kphase_nfree_miss_shape = std::cell::Cell::new(0u64);
+    let kphase_nfree_miss_value = std::cell::Cell::new(0u64);
+    let kphase_nfree_miss_gradient = std::cell::Cell::new(0u64);
+    let kphase_nfree_miss_penalty = std::cell::Cell::new(0u64);
+    let kphase_nfree_miss_revision = std::cell::Cell::new(0u64);
+    let kphase_nfree_miss_second_order = std::cell::Cell::new(0u64);
+    let kphase_nfree_miss_other = std::cell::Cell::new(0u64);
     let kphase_optim_start = std::time::Instant::now();
     let kphase_log_kappa_dim = coord_dim;
     let kphase_slow_resets_start = ctx.evaluator.slow_path_reset_count();
@@ -3335,7 +3389,45 @@ fn run_exact_joint_spatial_optimization(
                       order: OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
         let t0 = std::time::Instant::now();
+        let allow_second_order_for_call = matches!(order, OuterEvalOrder::ValueGradientHessian)
+            && analytic_outer_hessian_available;
+        let gate = ctx.nfree_skip_gate_status(theta, allow_second_order_for_call, true);
+        let resets_before = ctx.evaluator.slow_path_reset_count();
         let raw = ctx.eval_full(theta, order, analytic_outer_hessian_available);
+        let reset_delta = ctx
+            .evaluator
+            .slow_path_reset_count()
+            .saturating_sub(resets_before);
+        if reset_delta > 0 {
+            if !gate.shape {
+                kphase_nfree_miss_shape.set(kphase_nfree_miss_shape.get() + reset_delta);
+            }
+            if gate.shape && !gate.value {
+                kphase_nfree_miss_value.set(kphase_nfree_miss_value.get() + reset_delta);
+            }
+            if gate.shape && gate.value && !gate.gradient {
+                kphase_nfree_miss_gradient.set(kphase_nfree_miss_gradient.get() + reset_delta);
+            }
+            if gate.shape && gate.value && gate.gradient && !gate.penalty {
+                kphase_nfree_miss_penalty.set(kphase_nfree_miss_penalty.get() + reset_delta);
+            }
+            if gate.shape && gate.value && gate.gradient && gate.penalty && !gate.revision {
+                kphase_nfree_miss_revision.set(kphase_nfree_miss_revision.get() + reset_delta);
+            }
+            if gate.shape
+                && gate.value
+                && gate.gradient
+                && gate.penalty
+                && gate.revision
+                && gate.second_order
+            {
+                kphase_nfree_miss_second_order
+                    .set(kphase_nfree_miss_second_order.get() + reset_delta);
+            }
+            if gate.would_skip(true) {
+                kphase_nfree_miss_other.set(kphase_nfree_miss_other.get() + reset_delta);
+            }
+        }
         let elapsed_s = t0.elapsed().as_secs_f64();
         kphase_eval_calls.set(kphase_eval_calls.get() + 1);
         kphase_eval_total_s.set(kphase_eval_total_s.get() + elapsed_s);
@@ -3378,7 +3470,30 @@ fn run_exact_joint_spatial_optimization(
         &mut ctx,
         |ctx: &mut &mut SpatialJointContext<'_>, theta: &Array1<f64>| {
             let t0 = std::time::Instant::now();
+            let gate = ctx.nfree_skip_gate_status(theta, false, false);
+            let resets_before = ctx.evaluator.slow_path_reset_count();
             let cost = ctx.eval_cost(theta);
+            let reset_delta = ctx
+                .evaluator
+                .slow_path_reset_count()
+                .saturating_sub(resets_before);
+            if reset_delta > 0 {
+                if !gate.shape {
+                    kphase_nfree_miss_shape.set(kphase_nfree_miss_shape.get() + reset_delta);
+                }
+                if gate.shape && !gate.value {
+                    kphase_nfree_miss_value.set(kphase_nfree_miss_value.get() + reset_delta);
+                }
+                if gate.shape && gate.value && !gate.penalty {
+                    kphase_nfree_miss_penalty.set(kphase_nfree_miss_penalty.get() + reset_delta);
+                }
+                if gate.shape && gate.value && gate.penalty && !gate.revision {
+                    kphase_nfree_miss_revision.set(kphase_nfree_miss_revision.get() + reset_delta);
+                }
+                if gate.would_skip(false) {
+                    kphase_nfree_miss_other.set(kphase_nfree_miss_other.get() + reset_delta);
+                }
+            }
             let elapsed_s = t0.elapsed().as_secs_f64();
             kphase_cost_calls.set(kphase_cost_calls.get() + 1);
             kphase_cost_total_s.set(kphase_cost_total_s.get() + elapsed_s);
@@ -3459,7 +3574,7 @@ fn run_exact_joint_spatial_optimization(
         .design_revision()
         .saturating_sub(kphase_design_revision_start);
     log::info!(
-        "[KAPPA-PHASE-SUMMARY] log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} slow_path_resets={} design_revision_delta={} optim_total_s={:.4}",
+        "[KAPPA-PHASE-SUMMARY] log_kappa_dim={} n_cost={} cost_total_s={:.4} n_eval={} eval_total_s={:.4} n_efs={} efs_total_s={:.4} slow_path_resets={} design_revision_delta={} nfree_miss_shape={} nfree_miss_value={} nfree_miss_gradient={} nfree_miss_penalty={} nfree_miss_revision={} nfree_miss_second_order={} nfree_miss_other={} optim_total_s={:.4}",
         kphase_log_kappa_dim,
         kphase_cost_calls.get(),
         kphase_cost_total_s.get(),
@@ -3469,6 +3584,13 @@ fn run_exact_joint_spatial_optimization(
         kphase_efs_total_s.get(),
         kphase_slow_resets,
         kphase_design_revision_delta,
+        kphase_nfree_miss_shape.get(),
+        kphase_nfree_miss_value.get(),
+        kphase_nfree_miss_gradient.get(),
+        kphase_nfree_miss_penalty.get(),
+        kphase_nfree_miss_revision.get(),
+        kphase_nfree_miss_second_order.get(),
+        kphase_nfree_miss_other.get(),
         kphase_total_s,
     );
     let timing = SpatialLengthScaleOptimizationTiming {
@@ -3481,6 +3603,13 @@ fn run_exact_joint_spatial_optimization(
         efs_total_s: kphase_efs_total_s.get(),
         slow_path_resets: kphase_slow_resets,
         design_revision_delta: kphase_design_revision_delta,
+        nfree_miss_shape: kphase_nfree_miss_shape.get(),
+        nfree_miss_value: kphase_nfree_miss_value.get(),
+        nfree_miss_gradient: kphase_nfree_miss_gradient.get(),
+        nfree_miss_penalty: kphase_nfree_miss_penalty.get(),
+        nfree_miss_revision: kphase_nfree_miss_revision.get(),
+        nfree_miss_second_order: kphase_nfree_miss_second_order.get(),
+        nfree_miss_other: kphase_nfree_miss_other.get(),
         optim_total_s: kphase_total_s,
     };
     if !result.converged {
@@ -6851,6 +6980,13 @@ where
         efs_total_s: kphase_efs_total_s.get(),
         slow_path_resets: 0,
         design_revision_delta: 0,
+        nfree_miss_shape: 0,
+        nfree_miss_value: 0,
+        nfree_miss_gradient: 0,
+        nfree_miss_penalty: 0,
+        nfree_miss_revision: 0,
+        nfree_miss_second_order: 0,
+        nfree_miss_other: 0,
         optim_total_s: kphase_total_s,
     };
 
