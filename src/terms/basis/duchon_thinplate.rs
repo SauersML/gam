@@ -651,6 +651,15 @@ pub(crate) fn thin_plate_radial_reparam_from_constrained_penalty(
             *value = 0.0;
         }
     }
+    if std::env::var_os("DIAG1271_FULL").is_some() {
+        let mut sorted: Vec<f64> = evals.iter().copied().collect();
+        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        eprintln!(
+            "[DIAG1271_FULL] n_evals={} full_radial_eigvals(desc)={:?}",
+            sorted.len(),
+            sorted.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>()
+        );
+    }
     let keep = thin_plate_retained_radial_indices(&evals);
     Ok((evecs.select(Axis(1), &keep), evals.select(Axis(0), &keep)))
 }
