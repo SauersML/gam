@@ -608,10 +608,14 @@ fn fit_expectile_laws(
 ///   random effects, no by-variables / factor interactions;
 /// - that smooth is a plain 1-D B-spline whose penalty order is compatible
 ///   with the exact scan and whose null space is unshrunk
-///   (`double_penalty=false`). The default double-penalty smooth carries a
-///   second Marra-Wood null-space ridge; the scan's diffuse polynomial null
-///   space is unpenalized, so routing that form here would silently drop one of
-///   the model's penalties (#1266);
+///   (`double_penalty=false`). `double_penalty` (mgcv `select = TRUE`) on a free
+///   B-spline emits a second REML coordinate — the Marra & Wood (2011) null-space
+///   shrinkage block — that the scan cannot represent (its polynomial null space
+///   is an improper diffuse prior it can never shrink); routing such a fit
+///   through the scan would silently drop that penalty and select λ from the
+///   bending penalty alone, which is exactly the EDF inflation #1266 reports.
+///   Those fits fall through to the dense two-rho path, which owns both penalties
+///   jointly;
 /// - the offset is identically zero and every weight is finite and positive;
 /// - at least 3 distinct finite abscissae (the scan's diffuse rank plus one).
 ///
@@ -682,6 +686,23 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
     // smoother (#1044) handles the m−1 partially-diffuse leading nodes for all
     // m ≤ MAX_ORDER; m > MAX_ORDER falls through to the dense path.
     let order = bspec.penalty_order;
+    // Double-penalty (mgcv `select = TRUE`) is NOT representable by the scan and
+    // must fall through to the dense two-rho path (#1266). On a free B-spline the
+    // double penalty emits a *second* REML coordinate — the Marra & Wood (2011)
+    // null-space shrinkage block `Z Zᵀ` (see `bspline_penalty_candidates`) —
+    // whose entire purpose is to let REML shrink the unpenalized `{1, x, …}`
+    // polynomial null space toward `EDF → 0` for an unsupported term. The scan,
+    // by construction, carries that null space as an *improper diffuse* prior it
+    // can never shrink (its EDF floor is the null-space dimension `order`), so
+    // routing a `double_penalty` fit through it silently DROPS the second penalty
+    // and selects λ from the single bending penalty alone. The scan's own exact
+    // diffuse REML then genuinely prefers a mildly wiggly fit at finite λ for
+    // some noise realizations (an interior REML optimum, EDF ≈ 3–4), which is the
+    // EDF inflation #1266 reports. The dense path owns both penalties jointly and
+    // its outer REML, seeded into the over-smoothing basin, drives the null space
+    // out (EDF → null-space dim) when the data are truly polynomial. Excluding
+    // `double_penalty` here keeps such a fit on the dense path; single-penalty
+    // and boundary-conditioned single-penalty B-splines keep the exact O(n) scan.
     if !(1..=3).contains(&order)
         || bspec.degree != 2 * order - 1
         || bspec.double_penalty

@@ -579,12 +579,28 @@ fn detection_falls_through_for_ineligible_shapes() {
     let data = encode_xy(&x, &y);
     let cfg = gaussian_config();
 
-    // Default s(x) carries the double (null-space shrinkage) penalty — a
-    // different posterior from the pure λ∫f″² spline, so it must NOT route.
+    // Default s(x) carries the double (null-space shrinkage) penalty. That
+    // second penalty — the Marra & Wood (2011) null-space ridge that lets REML
+    // shrink the unpenalized polynomial null space toward EDF→0 (mgcv
+    // `select = TRUE`) — is NOT representable by the scan, whose null space is an
+    // improper diffuse prior it can never shrink. Routing a double-penalty fit
+    // through the scan silently drops that penalty and inflates EDF (#1266), so
+    // it must fall through to the dense two-rho path that owns both penalties.
     let default_s = fit_spline_scan_from_formula("y ~ s(x)", &data, &cfg).expect("materialize");
     assert!(
         default_s.is_none(),
-        "double-penalty default s(x) must fall through to the standard path"
+        "double-penalty default s(x) must fall through to the dense two-rho path (#1266)"
+    );
+
+    // The single-penalty smooth, by contrast, IS the exact scan's shape: it has
+    // only the bending penalty and a genuinely unpenalized polynomial null space,
+    // which the scan integrates exactly in O(n). It stays on the scan.
+    let single_penalty =
+        fit_spline_scan_from_formula("y ~ s(x, double_penalty=false)", &data, &cfg)
+            .expect("materialize");
+    assert!(
+        single_penalty.is_some(),
+        "single-penalty s(x) must route through the exact scan"
     );
 
     // Extra parametric term ⇒ not the single-smooth problem.
