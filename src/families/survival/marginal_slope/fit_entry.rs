@@ -1709,9 +1709,15 @@ pub fn fit_survival_marginal_slope_terms(
         .is_some_and(|loaded| {
             crate::solver::rho_optimizer::cache_entry_would_help_outer(&loaded, setup.rho_dim())
         });
-    if outer_cache_seed_available {
+    if outer_cache_seed_available || n < 1_000 {
+        let reason = if outer_cache_seed_available {
+            "outer-cache-seed-present"
+        } else {
+            "tiny-fit"
+        };
         log::info!(
-            "[survival-marginal-slope/pilot] skip reason=outer-cache-seed-present n={} rho_dim={}",
+            "[survival-marginal-slope/pilot] skip reason={} n={} rho_dim={}",
+            reason,
             n,
             setup.rho_dim(),
         );
