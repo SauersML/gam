@@ -131,47 +131,10 @@ pub trait AtomFrameSketch {
     /// [`AtomFrameSketch::atom_sketch`] representatives the LSH tables were
     /// built from (#994).
     ///
-    /// Implementors whose atoms share one projection `R` (the default sketch,
-    /// and the post-#972 Grassmann-frame sketch) **must** override this with
-    /// the exact `normalize(R · d)` — `O(p · s)` per query, touching no atom,
-    /// and exactly the cosine-LSH probe the sign-signature tables expect.
-    ///
-    /// The default is the legacy fallback for frame sources with *per-atom*
-    /// projections only: average the masked per-atom query projections over a
-    /// deterministic stratified `O(√K)` subset of atoms and renormalize. It
-    /// concentrates on the shared-projection direction only when the sampled
-    /// frames are spread near-isotropically — on coherent atom clusters it
-    /// degrades (the #994 defect) — so it exists for trait-compatibility, not
-    /// as a recommendation.
-    fn query_sketch(&self, direction: ArrayView1<f64>) -> Array1<f64> {
-        let sketch_dim = self.sketch_dim();
-        let num = self.num_atoms();
-        if num == 0 {
-            return Array1::<f64>::zeros(sketch_dim);
-        }
-        let sample = ((num as f64).sqrt().ceil() as usize).clamp(1, num);
-        let stride = (num / sample).max(1);
-        let mut acc = Array1::<f64>::zeros(sketch_dim);
-        let mut count = 0usize;
-        let mut id = 0usize;
-        while id < num {
-            let q = self.project_direction(id, direction);
-            if q.len() == sketch_dim {
-                for (a, &v) in acc.iter_mut().zip(q.iter()) {
-                    *a += v;
-                }
-                count += 1;
-            }
-            id += stride;
-        }
-        if count > 0 {
-            for a in acc.iter_mut() {
-                *a /= count as f64;
-            }
-        }
-        normalize_in_place(&mut acc);
-        acc
-    }
+    /// Implementors must return the exact cosine-LSH probe for their sketching
+    /// policy. For the shared-projection sketch this is `normalize(R · d)`,
+    /// `O(p · s)` per query, touching no atom.
+    fn query_sketch(&self, direction: ArrayView1<f64>) -> Array1<f64>;
 }
 
 // ---------------------------------------------------------------------------
