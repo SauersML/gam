@@ -36,6 +36,11 @@ fn main() {
         return;
     }
 
+    // HARD ban (always fatal, independent of the demoted aggregate scanner
+    // below): no tracked file may leak the absolute MSI scratch path segment or
+    // the SLURM batch directive keyword. Run first and exit(1) on any hit.
+    scan_for_msi_infra_leaks(&manifest_dir);
+
     emit_python_penalty_manifest(&manifest_dir)
         .expect("failed to emit Python analytic-penalty manifest");
 
@@ -3102,6 +3107,69 @@ fn collect_repo_files(root: &Path) -> &'static [PathBuf] {
     REPO_FILES
         .get_or_init(|| read_git_index_tracked_files(root))
         .as_slice()
+}
+
+/// The two MSI/SLURM infra leak needles, assembled from fragments so this
+/// file's own source text never contains either banned string verbatim (the
+/// scanner would otherwise flag itself). `needle_a` = the absolute MSI scratch
+/// path segment; `needle_b` = the SLURM batch directive keyword.
+fn msi_leak_needles() -> [String; 2] {
+    let needle_a = format!("projects{}standard", "/");
+    let needle_b = format!("{}BATCH", "S");
+    [needle_a, needle_b]
+}
+
+/// HARD-FAIL ban: no git-tracked file (source OR not) may contain the absolute
+/// MSI scratch path segment or the SLURM batch directive keyword. These are
+/// cluster-local infra leaks (absolute compute-node paths + SLURM job
+/// directives) that must never be committed — MSI/sbatch scripts live under
+/// /Users/user/, not in the repo. Scans only tracked text files (from the git
+/// index), skips binaries, and fails the build naming every offender. This is
+/// a separate, always-fatal gate — independent of the demoted aggregate
+/// ban-scanner below — so the leak can never ship.
+fn scan_for_msi_infra_leaks(root: &Path) {
+    let needles = msi_leak_needles();
+    let mut offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    for rel in collect_repo_files(root) {
+        let path = root.join(rel);
+        let content = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+        // Skip files that are not valid UTF-8 text (binaries can't carry the
+        // ASCII needles meaningfully and lossy-decoding them wastes time).
+        let text = match std::str::from_utf8(&content) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        for (lineno, line) in text.lines().enumerate() {
+            for needle in &needles {
+                if line.contains(needle.as_str()) {
+                    offenders.push((rel.clone(), lineno + 1, needle.clone()));
+                }
+            }
+        }
+    }
+    if offenders.is_empty() {
+        return;
+    }
+    eprintln!(
+        "\n=== BANNED MSI/SLURM INFRA LEAK in tracked file(s) ===\n\
+         No tracked file may contain the absolute MSI scratch path segment or the \
+         SLURM batch directive keyword. These are cluster-local infra leaks; MSI/sbatch \
+         scripts belong under /Users/user/, not in the repo. Offenders:"
+    );
+    for (rel, lineno, needle) in &offenders {
+        eprintln!("  {}:{} contains banned string `{}`", rel.display(), lineno, needle);
+        println!(
+            "cargo:warning=banned MSI/SLURM infra leak: {}:{} contains `{}`",
+            rel.display(),
+            lineno,
+            needle
+        );
+    }
+    std::process::exit(1);
 }
 
 /// Resolve the path of `.git/index`, following the worktree pointer if `.git`

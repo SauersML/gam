@@ -188,16 +188,11 @@ azuser@/
 # Internal dev/MSI tooling — not for the public repo
 /dev/
 
-<<<<<<< Updated upstream
 # Stray nested working-copy of the repo an agent left in-tree; never track
 # (orphan gitlink with no .gitmodules accidentally swept in by git add -A,
 # broke the build.rs line-count audit). Ignore so it can not be re-added.
 /gam_saetrain/
-=======
-# stray agent-created training scratch dir — must not exist
-gam_saetrain/
 gam_saetrain
->>>>>>> Stashed changes
 
 # build/scratch logs agents leave behind (must never get git-add -A'd)
 *.err
@@ -208,3 +203,10 @@ slurm-*.out
 gam-target*/
 gam_env.sh
 *.trace
+
+# MSI / SLURM infra is NOT part of this repo. Cluster sbatch scripts, absolute
+# scratch paths, and SLURM directives live under /Users/user/ (e.g.
+# /Users/user/msi_test.sh), never in the tree. The build.rs ban-scanner hard-
+# fails the build on any tracked file containing the banned cluster strings.
+scripts/*verify*fresh*.sh
+*.sbatch
