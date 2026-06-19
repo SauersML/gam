@@ -5098,18 +5098,16 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         const BETA_REL_CAP: f64 = 1.0e-4;
         let beta_bar =
             (SOUNDNESS_SAFETY * kappa * gram_rel.max(f64::MIN_POSITIVE)).min(BETA_REL_CAP);
-        if std::env::var("DIAG1216").is_ok() {
-            let r = beta_fast
-                .iter()
-                .zip(beta_slow.iter())
-                .fold(0.0_f64, |a, (f, s)| a.max((f - s).abs() / (1.0 + s.abs())));
-            eprintln!(
-                "[DIAG1216-FP] {label} ψ={:.4} gram_rel={gram_rel:.3e} κ(G)={kappa:.3e} \
-                 β̂rel={r:.3e} bar(min(SAFETY·κ·gram_rel, {BETA_REL_CAP:.0e}))={beta_bar:.3e} \
-                 β̂fast[0]={:+.6e} β̂slow[0]={:+.6e}",
-                theta[rho_dim], beta_fast[0], beta_slow[0]
-            );
-        }
+        let r = beta_fast
+            .iter()
+            .zip(beta_slow.iter())
+            .fold(0.0_f64, |a, (f, s)| a.max((f - s).abs() / (1.0 + s.abs())));
+        eprintln!(
+            "[DIAG1264-FP] {label} ψ={:.4} gram_rel={gram_rel:.3e} κ(G)={kappa:.3e} \
+             β̂rel={r:.3e} bar(min(SAFETY·κ·gram_rel, {BETA_REL_CAP:.0e}))={beta_bar:.3e} \
+             issue-bar=1e-6 β̂fast[0]={:+.6e} β̂slow[0]={:+.6e}",
+            theta[rho_dim], beta_fast[0], beta_slow[0]
+        );
         assert_eq!(beta_fast.len(), beta_slow.len(), "β̂ dim mismatch @ {label}");
         for j in 0..beta_fast.len() {
             assert!(
@@ -5119,16 +5117,21 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             let babs = (beta_fast[j] - beta_slow[j]).abs();
             let brel = babs / (1.0 + beta_slow[j].abs());
             worst = worst.max(babs);
+            // #1264 ISSUE-MANDATED BAR: the fast-path skip must reproduce β̂ to the
+            // issue's real 1e-6 bar. A skip that moves β̂ beyond 1e-6 has moved the
+            // κ-optimum beyond the issue's contract — even if "explained" by
+            // conditioning amplification — so it is NOT a sound skip on this geometry.
+            // (`beta_bar`/`SOUNDNESS_SAFETY`/`BETA_REL_CAP` retained above only for the
+            // DIAG line so the run reports how the divergence decomposes.)
+            const ISSUE_BETA_BAR: f64 = 1.0e-6;
+            let _ = beta_bar;
             assert!(
-                brel <= beta_bar.max(1e-12),
-                "fast-path β̂[{j}] @ {label} diverges from streamed slow path BY MORE \
-                 than conditioning amplification of the MEASURED Gram input error \
-                 explains: fast={:+.12e} slow={:+.12e} |Δ|={babs:.3e} rel={brel:.3e} > \
-                 bar {beta_bar:.3e} (= min({BETA_REL_CAP:.0e}, \
-                 {SOUNDNESS_SAFETY}·κ(G)={kappa:.3e}·gram_rel={gram_rel:.3e})) \
-                 — gram_rel is certified ≤ round-off above, so a β̂ divergence exceeding \
-                 κ·gram_rel is the signature of an n-row (`self.x`) LEAK into β̂ across \
-                 the rotation, NOT interpolation conditioning",
+                brel <= ISSUE_BETA_BAR,
+                "fast-path β̂[{j}] @ {label} diverges from streamed slow path beyond the \
+                 #1264 issue-mandated 1e-6 bar: fast={:+.12e} slow={:+.12e} |Δ|={babs:.3e} \
+                 rel={brel:.3e} > 1e-6 (κ(G)={kappa:.3e} gram_rel={gram_rel:.3e}) — the \
+                 n-free fast-path skip MOVED the κ-optimum across the basis rotation the \
+                 `reduced_basis_equal` witness refuses, so the skip is NOT β̂-sound here",
                 beta_fast[j],
                 beta_slow[j],
             );
@@ -5145,8 +5148,8 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         "[psi-gram-tensor #1033/#1264] pairwise reduced-basis-equality witness: \
          skip(ψ_b)={skip_b} skip(ψ_c={psi_c:.4} ROTATED)={skip_c}, \
          slow_path_reset_count={}, worst |Δβ̂| vs streamed slow path = {worst:.3e} \
-         (≤ the 1e-10 #1033 witness-C soundness bar — bit-identical across the basis \
-         rotation the witness refuses)",
+         (asserted ≤ the #1264 issue-mandated 1e-6 β̂-rel bar across the basis rotation \
+         the witness refuses)",
         tensor_eval.slow_path_reset_count()
     );
 }

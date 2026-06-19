@@ -21,18 +21,31 @@
 //!     out-of-sample-honest predictive signal.
 //!
 //! BASELINE TO MATCH-OR-BEAT (objective accuracy, not "same fit"):
-//!   * exact brute-force LOO — refit the GAM `n` times, dropping observation `i`,
-//!     and read off `eta_hat^{(-i)}(x_i)`. This is the unimpeachable mathematical
-//!     oracle for *any* ALO method (the EXACT quantity ALO approximates), so it is
-//!     ground truth, not a peer tool. We assert gam's ALO predicts at least as
-//!     accurately out of sample as the exact oracle: ALO log-loss <= exact-LOO
-//!     log-loss * 1.02.
+//!   * exact FROZEN-λ brute-force LOO — the exact leave-one-out predictor of the
+//!     SAME penalized system ALO approximates: smoothing parameters λ and the
+//!     penalty block S(λ) are held at the full fit's converged values, and for
+//!     each held-out row i the dropped-row stationarity condition
+//!       Σ_{j≠i}(μ_j − y_j) x_j + S β₋ᵢ = 0
+//!     is solved exactly by Newton from gam's own converged geometry, reading off
+//!     η̃_i = x_iᵀ β₋ᵢ. This is the unimpeachable mathematical oracle for *any*
+//!     frozen-λ ALO method (the EXACT quantity ALO approximates), so it is ground
+//!     truth, not a peer tool.
 //!
-//! GROUND-TRUTH CORRECTNESS (kept — exact LOO is the analytic quantity ALO
-//! approximates, not a noisy peer-tool fit): the corrected predictors must agree
-//! element-wise with exact LOO. A genuine error in the ALO algebra would both
-//! blow up this agreement and degrade the predictive metric above; keeping it
-//! pins down *where* a regression came from.
+//!     ESTIMAND ALIGNMENT (why frozen-λ, not a per-fold re-selected-λ refit). ALO
+//!     holds H and λ FROZEN at the full-fit value; it is leave-one-out *at fixed
+//!     smoothing*. A naive oracle that re-runs `fit_from_formula` per fold would
+//!     re-run REML and re-select λ on each n−1 subsample — a DIFFERENT estimand
+//!     (LOO-with-λ-reselected). On a small penalized fit λ is volatile fold to
+//!     fold, so that oracle disagrees with ALO by ~20% in relative L2 for reasons
+//!     that are NOT an ALO-algebra defect. We therefore benchmark ALO against the
+//!     frozen-λ exact LOO, the only quantity ALO can be held to element-wise.
+//!
+//! GROUND-TRUTH CORRECTNESS (kept — the frozen-λ exact LOO is the analytic
+//! quantity ALO approximates, not a noisy peer-tool fit): the corrected
+//! predictors must agree element-wise with it to the LOO predictive scale. A
+//! genuine error in the ALO algebra would both blow up this agreement and degrade
+//! the predictive metric above; keeping it pins down *where* a regression came
+//! from.
 //!
 //! We use Binomial/logit — the canonical GLM case. The logit link is canonical,
 //! so the IRLS working weights equal the Fisher information and ALO's one-step
@@ -61,6 +74,50 @@ const HEART_CSV: &str = concat!(
 );
 
 const FORMULA: &str = "DEATH_EVENT ~ s(ejection_fraction)";
+
+/// Solve the SPD system `A x = b` by dense Cholesky (A = L Lᵀ). The frozen-λ
+/// leave-i-out Hessian Σ_{j≠i} w_j x_j x_jᵀ + S(λ) is SPD (Fisher weights ≥ 0
+/// plus a positive penalty/stabilisation ridge), so this is the exact solver for
+/// the brute-force oracle. Panics on a non-positive pivot (a non-SPD Hessian is
+/// itself a real defect worth failing on).
+fn solve_spd(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
+    let p = a.nrows();
+    assert_eq!(p, a.ncols(), "solve_spd requires a square matrix");
+    let mut l = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        for j in 0..=i {
+            let mut sum = a[[i, j]];
+            for k in 0..j {
+                sum -= l[[i, k]] * l[[j, k]];
+            }
+            if i == j {
+                assert!(sum > 0.0, "leave-i-out Hessian not SPD at pivot {i}: {sum:.3e}");
+                l[[i, j]] = sum.sqrt();
+            } else {
+                l[[i, j]] = sum / l[[j, j]];
+            }
+        }
+    }
+    // Forward solve L y = b.
+    let mut yv = Array1::<f64>::zeros(p);
+    for i in 0..p {
+        let mut sum = b[i];
+        for k in 0..i {
+            sum -= l[[i, k]] * yv[k];
+        }
+        yv[i] = sum / l[[i, i]];
+    }
+    // Back solve Lᵀ x = y.
+    let mut xv = Array1::<f64>::zeros(p);
+    for i in (0..p).rev() {
+        let mut sum = yv[i];
+        for k in (i + 1)..p {
+            sum -= l[[k, i]] * xv[k];
+        }
+        xv[i] = sum / l[[i, i]];
+    }
+    xv
+}
 
 /// Fit the binomial/logit smooth and return the fitted `UnifiedFitResult`
 /// together with the frozen term spec needed to rebuild the design.
@@ -93,29 +150,6 @@ fn eta_at_point(
     let design =
         build_term_collection_design(grid.view(), spec).expect("rebuild design at held-out point");
     design.design.apply(beta)[0]
-}
-
-/// Build a leave-one-out copy of the encoded dataset with row `drop` removed.
-/// Schema, headers, and column kinds are preserved verbatim so the refit uses
-/// an identical basis/family/link to the full fit.
-fn dataset_without_row(ds: &EncodedDataset, drop: usize) -> EncodedDataset {
-    let n = ds.values.nrows();
-    let p = ds.values.ncols();
-    let mut values = Array2::<f64>::zeros((n - 1, p));
-    let mut out = 0usize;
-    for i in 0..n {
-        if i == drop {
-            continue;
-        }
-        values.row_mut(out).assign(&ds.values.row(i));
-        out += 1;
-    }
-    EncodedDataset {
-        headers: ds.headers.clone(),
-        values,
-        schema: ds.schema.clone(),
-        column_kinds: ds.column_kinds.clone(),
-    }
 }
 
 /// Mean held-out binomial deviance (log-loss) of a linear predictor `eta`
@@ -204,13 +238,115 @@ fn alo_eta_tilde_matches_exact_loo_binomial_logit() {
     let alo_eta_tilde: Vec<f64> = alo.eta_tilde.to_vec();
     assert_eq!(alo_eta_tilde.len(), n, "ALO eta_tilde length mismatch");
 
-    // ---- exact LOO oracle: refit n times, hold out i, read eta(x_i) -------
-    let mut exact_loo: Vec<f64> = Vec::with_capacity(n);
+    // ---- exact FROZEN-λ LOO oracle from gam's own converged geometry --------
+    // The full fit's PIRLS artifact carries the consistent transformed design X,
+    // the dense penalized Hessian H = XᵀWX + S(λ), the Fisher weights W (==
+    // observed information for the canonical logit link), the working response z,
+    // the linear predictor η̂ and the offset o — all at the converged λ. We
+    // recover the penalty block exactly as S = H − XᵀWX, then for each held-out
+    // row solve the dropped-row nonlinear stationarity condition
+    //   Σ_{j≠i}(μ_j − y_j) x_j + S β₋ᵢ = 0,   μ_j = logistic(η_j)
+    // by Newton, reading η̃_i = x_iᵀ β₋ᵢ. λ and S are FROZEN (no per-fold REML),
+    // so this is precisely the estimand ALO approximates. (Reading η̃ in the
+    // transformed coordinate frame is exact: design·β in the original frame and
+    // X·β in the transformed frame are the same scalar linear predictor.)
+    let pirls = full_fit
+        .artifacts
+        .pirls
+        .as_ref()
+        .expect("binomial GAM fit must expose PIRLS geometry");
+    let x_arc = pirls
+        .x_transformed
+        .try_to_dense_arc("frozen-λ LOO needs dense transformed design")
+        .expect("dense transformed design");
+    let xmat = x_arc.as_ref();
+    let h = pirls
+        .dense_stabilizedhessian_transformed("frozen-λ LOO needs dense penalized Hessian")
+        .expect("dense penalized Hessian");
+    let p = xmat.ncols();
+    assert_eq!(xmat.nrows(), n, "transformed design row count mismatch");
+    assert_eq!(h.nrows(), p, "Hessian must be p x p");
+    // Canonical logit: Hessian weights == score weights == μ(1−μ).
+    let w_hess: Vec<f64> = pirls.final_weights_signed().view().to_vec();
+    let w: Vec<f64> = pirls.solve_weights_psd().view().to_vec();
+    let wh_ws_max_diff = max_abs_diff(&w_hess, &w);
+    assert!(
+        wh_ws_max_diff < 1e-9,
+        "canonical logit must have Hessian weights == score weights: max|Δ|={wh_ws_max_diff:.3e}"
+    );
+    let offset = pirls.final_offset.to_vec();
+    let xrows: Vec<Vec<f64>> = (0..n).map(|i| xmat.row(i).to_vec()).collect();
+
+    // Recover S = H − XᵀW X (W = diag(μ̂)); the full-data gradient
+    // Σ_j(μ̂_j − y_j) x_j + S β̂ then vanishes at the converged β̂.
+    let mut s_penalty = h.clone();
+    {
+        let mut xtwx = Array2::<f64>::zeros((p, p));
+        for j in 0..n {
+            let wj = w[j];
+            let xj = &xrows[j];
+            for r in 0..p {
+                let wjr = wj * xj[r];
+                let hrow = xtwx.row_mut(r).into_slice().unwrap();
+                for cc in 0..p {
+                    hrow[cc] += wjr * xj[cc];
+                }
+            }
+        }
+        s_penalty -= &xtwx;
+    }
+
+    // β̂ in the transformed frame (consistent with X and S above).
+    let beta_full: Array1<f64> = full_fit.beta_transformed.as_ref().to_owned();
+    assert_eq!(beta_full.len(), p, "transformed beta length mismatch");
+
+    let logistic = |e: f64| 1.0 / (1.0 + (-e).exp());
+    let mut exact_loo: Vec<f64> = vec![0.0; n];
     for i in 0..n {
-        let loo_ds = dataset_without_row(&ds, i);
-        let (loo_fit, loo_spec) = fit_binomial_logit(&loo_ds);
-        let eta_i = eta_at_point(&loo_fit.beta, &loo_spec, n_headers, pred_idx, x[i]);
-        exact_loo.push(eta_i);
+        let mut beta = beta_full.clone();
+        let mut converged = false;
+        for _ in 0..100usize {
+            // grad = Σ_{j≠i}(μ_j − y_j) x_j + S β ; hess = Σ_{j≠i} μ_j(1−μ_j) x_j x_jᵀ + S
+            let mut grad = s_penalty.dot(&beta);
+            let mut hess = s_penalty.clone();
+            for j in 0..n {
+                if j == i {
+                    continue;
+                }
+                let xj = &xrows[j];
+                let mut eta_j = offset[j];
+                for k in 0..p {
+                    eta_j += xj[k] * beta[k];
+                }
+                let mu_j = logistic(eta_j);
+                let wj = mu_j * (1.0 - mu_j);
+                let resid = mu_j - y[j];
+                for r in 0..p {
+                    grad[r] += resid * xj[r];
+                    let wjr = wj * xj[r];
+                    let hrow = hess.row_mut(r).into_slice().unwrap();
+                    for cc in 0..p {
+                        hrow[cc] += wjr * xj[cc];
+                    }
+                }
+            }
+            let gnorm = grad.dot(&grad).sqrt();
+            if gnorm < 1e-10 {
+                converged = true;
+                break;
+            }
+            let step = solve_spd(&hess, &grad);
+            for k in 0..p {
+                beta[k] -= step[k];
+            }
+        }
+        assert!(converged, "frozen-λ leave-{i}-out Newton refit did not converge");
+        let xi = &xrows[i];
+        let mut dot = offset[i];
+        for k in 0..p {
+            dot += xi[k] * beta[k];
+        }
+        exact_loo[i] = dot;
     }
 
     // ---- in-sample predictor eta_hat(x_i) (predictive-honesty baseline) ----
