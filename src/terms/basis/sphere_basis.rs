@@ -352,7 +352,11 @@ fn build_wahba_decomposed_design(
                 SPHERE_UNPENALIZED_LOW_DEGREE,
                 radians,
             );
-            debug_assert_eq!(raw_low.ncols(), low_degree_centers.ncols());
+            assert_eq!(
+                raw_low.ncols(),
+                low_degree_centers.ncols(),
+                "low-degree spherical harmonic design width must match its centers"
+            );
             let low_design = raw_low;
             kernel_design -= &low_design.dot(kernel_low_projection);
             hstack_dense(kernel_design.view(), low_design.view())

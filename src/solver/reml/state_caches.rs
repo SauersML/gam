@@ -2082,7 +2082,11 @@ impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
         let m = self.block_lambdas.len();
         let n = self.eta_hat.len();
         let n_draws = draws.ncols();
-        debug_assert_eq!(draws.nrows(), m);
+        assert_eq!(
+            draws.nrows(),
+            m,
+            "posterior displacement draw rows must match smoothing block count"
+        );
 
         // δ-columns: Δ = V_b · T  (p × n_draws). Cheap (O(p·m·n_draws)) and kept
         // identical to the serial `block_vecs.dot(t)` per column.
