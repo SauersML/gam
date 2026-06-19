@@ -542,9 +542,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // ~120 s of wall-clock per outer ρ-evaluation that the outer
         // optimizer will reject anyway. The signature is exact and local:
         // (i) every trust attempt this cycle was rejected by SOME path —
-        // model, likelihood, OR objective (the three counters partition the
-        // JOINT_TRUST_MAX_ATTEMPTS attempts), so `model_rejects +
-        // likelihood_rejects + objective_rejects == JOINT_TRUST_MAX_ATTEMPTS`,
+        // model, likelihood, objective, OR feasibility (the four counters
+        // partition the JOINT_TRUST_MAX_ATTEMPTS attempts), so `model_rejects +
+        // likelihood_rejects + objective_rejects + feasibility_rejects ==
+        // JOINT_TRUST_MAX_ATTEMPTS`,
         // AND (ii) the joint trust radius has NOT shrunk relative to the
         // previous fully-rejected cycle. Condition (i) was originally
         // objective-only (`objective_rejects == MAX`, others 0), which never
@@ -1902,6 +1903,26 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let mut model_rejects = 0usize;
             let mut likelihood_rejects = 0usize;
             let mut objective_rejects = 0usize;
+            // Feasibility-path rejections (gam#979 survival monotone cone). The two
+            // constrained-path `continue`s — the `apply_joint_feasibility_limit`
+            // α-crush `Err` (current iterate infeasible / no positive step) and the
+            // `project_point_strictly_into_feasible_cone` `None` (degenerate /
+            // empty-interior cone at this trial) — consume a trust attempt but were
+            // NOT counted by any of model/likelihood/objective. On the survival
+            // marginal-slope monotone-cone pathology this is the DOMINANT reject
+            // path (the trial step keeps crossing the binding time-derivative cone
+            // at slack≈0), so `model + likelihood + objective < MAX_ATTEMPTS`
+            // ALWAYS, `all_attempts_rejected` was permanently false, and the
+            // fully-rejected stall guard below NEVER armed — the inner joint-Newton
+            // spun to `inner_loop_hard_ceiling` every outer ρ-evaluation (the 1322 s
+            // hang; #1040). A feasibility rejection IS a "no descent the local model
+            // can reconcile at this β" signal exactly like an objective rejection,
+            // so counting it restores the partition invariant
+            // `model + likelihood + objective + feasibility == MAX_ATTEMPTS` the
+            // stall guard relies on. Off the constrained pathology this counter
+            // stays 0 (those `continue`s are never taken on a feasible/unconstrained
+            // arm), so every converging fit is byte-identical.
+            let mut feasibility_rejects = 0usize;
             let mut first_likelihood_reject: Option<String> = None;
             // Fixed-point signature for the fully-rejected stall guard. The
             // FIRST trust attempt of a cycle evaluates the proposal at the
@@ -2091,6 +2112,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     && apply_joint_feasibility_limit(family, &states, &ranges, &mut trial_delta)
                         .is_err()
                 {
+                    feasibility_rejects += 1;
                     joint_trust_radius = shrink_active_joint_block_trust_radii(
                         &mut joint_block_trust_radii,
                         &block_step_norms,
@@ -2135,6 +2157,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 // (gam#979). Without this an infeasible trial would
                                 // reach the next cycle's `check_linear_feasibility`
                                 // QP gate and hard-error.
+                                feasibility_rejects += 1;
                                 joint_trust_radius = shrink_active_joint_block_trust_radii(
                                     &mut joint_block_trust_radii,
                                     &block_step_norms,
@@ -2762,7 +2785,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let line_search_elapsed = line_search_started.elapsed();
             if accepted && converged {
                 log::info!(
-                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
+                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=true hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} reject_feasibility={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
                     cycle,
                     hessian_and_qp_elapsed.as_secs_f64(),
                     line_search_elapsed.as_secs_f64(),
@@ -2770,6 +2793,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     model_rejects,
                     likelihood_rejects,
                     objective_rejects,
+                    feasibility_rejects,
                     first_likelihood_reject.as_deref().unwrap_or("none"),
                     cycle_started.elapsed().as_secs_f64(),
                 );
@@ -2790,7 +2814,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // the next cycle's Newton proposal will be evaluated under
                 // a tighter L2 bound without any parallel adaptation here.
                 log::info!(
-                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
+                    "[PIRLS/joint-Newton/cycle-summary] cycle={} accepted=false hessian_qp={:.3}s line_search={:.3}s line_search_attempts={} reject_model={} reject_likelihood={} reject_objective={} reject_feasibility={} first_likelihood_reject={} grad_reload=0.000s total={:.3}s",
                     cycle,
                     hessian_and_qp_elapsed.as_secs_f64(),
                     line_search_elapsed.as_secs_f64(),
@@ -2798,6 +2822,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     model_rejects,
                     likelihood_rejects,
                     objective_rejects,
+                    feasibility_rejects,
                     first_likelihood_reject.as_deref().unwrap_or("none"),
                     cycle_started.elapsed().as_secs_f64(),
                 );
@@ -2839,8 +2864,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // Fully-rejected stall guard. See the constant declaration
                 // at the top of this function for the full rationale. The
                 // condition is: every trust attempt this cycle was rejected by
-                // SOME path (model OR likelihood OR objective; the three reject
-                // counters partition the JOINT_TRUST_MAX_ATTEMPTS attempts) AND
+                // SOME path (model OR likelihood OR objective OR feasibility; the
+                // four reject counters partition the JOINT_TRUST_MAX_ATTEMPTS
+                // attempts) AND
                 // the joint trust radius did not shrink relative to the previous
                 // fully-rejected cycle. Both together prove the next cycle's
                 // Newton system, trust radius, and trust-region search are
@@ -2858,7 +2884,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // full rejection by the likelihood path at a collapsed trust
                 // radius is the same numerically-flat-no-descent stall as a
                 // full objective rejection; counting either lets the guard fire.
-                let all_attempts_rejected = model_rejects + likelihood_rejects + objective_rejects
+                let all_attempts_rejected = model_rejects
+                    + likelihood_rejects
+                    + objective_rejects
+                    + feasibility_rejects
                     == JOINT_TRUST_MAX_ATTEMPTS;
                 let radius_held_since_last_reject = match prev_rejected_trust_radius {
                     Some(prev) => {
