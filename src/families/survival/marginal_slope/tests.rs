@@ -2626,6 +2626,124 @@ fn debug_flex_directional_quantities_fd_localize() {
     );
 }
 
+/// gam#932/#979 coupling probe: is the production BASE Hessian cross
+/// `H[g, w0]` / `H[w0, w0]` (the marginal↔logslope coupling the #979 inner
+/// Newton uses) consistent with an INDEPENDENT finite-difference of the
+/// production gradient? If the base Hessian is wrong, that is the #979 root and
+/// the #932 directional third inherits it. Uses the SAME nonzero-deviation
+/// fixture as `flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation`.
+#[test]
+#[ignore = "debug FD-of-gradient base-Hessian probe for #932/#979 marginal/logslope coupling"]
+fn debug_flex_base_hessian_vs_gradient_fd() {
+    let score_runtime = test_deviation_runtime();
+    let link_runtime = test_deviation_runtime();
+    let h_dim = score_runtime.basis_dim();
+    let w_dim = link_runtime.basis_dim();
+    let z_row = 0.3_f64;
+    let q0v = -0.25_f64;
+    let q1v = 0.7_f64;
+    let qd1v = 0.9_f64;
+    let gv = 0.4_f64;
+    let weight = 0.85_f64;
+    let event = 1.0_f64;
+    let beta_h0: Vec<f64> = (0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())).collect();
+    let beta_w0: Vec<f64> = (0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())).collect();
+
+    let make = |g: f64, beta_h: &[f64], beta_w: &[f64]| {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![event]),
+            weights: Arc::new(array![weight]),
+            z: Arc::new(array![z_row].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            offset_entry: Arc::new(array![q0v]),
+            offset_exit: Arc::new(array![q1v]),
+            derivative_offset_exit: Arc::new(array![qd1v]),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        let bs = vec![
+            ParameterBlockState { beta: Array1::zeros(1), eta: array![0.0] },
+            ParameterBlockState { beta: Array1::zeros(0), eta: array![0.0] },
+            ParameterBlockState { beta: Array1::zeros(0), eta: array![g] },
+            ParameterBlockState { beta: Array1::from(beta_h.to_vec()), eta: array![0.0] },
+            ParameterBlockState { beta: Array1::from(beta_w.to_vec()), eta: array![0.0] },
+        ];
+        (family, bs)
+    };
+
+    let (family, bs) = make(gv, &beta_h0, &beta_w0);
+    let primary = flex_primary_slices(&family);
+    let g = primary.g;
+    let w0 = primary.w.clone().unwrap().start;
+    let q1 = primary.q1;
+
+    // Production gradient + Hessian at the base point.
+    let grad_hess = |g: f64, beta_h: &[f64], beta_w: &[f64]| -> (Array1<f64>, Array2<f64>) {
+        let (fam, bsl) = make(g, beta_h, beta_w);
+        let qg = fam.row_dynamic_q_geometry(0, &bsl).unwrap();
+        let pr = flex_primary_slices(&fam);
+        let (_, grad, hess) = fam
+            .compute_row_flex_primary_gradient_hessian_exact(0, &bsl, &qg, &pr)
+            .unwrap();
+        (grad, hess)
+    };
+    let (_g0, hess0) = grad_hess(gv, &beta_h0, &beta_w0);
+
+    // Independent FD of the gradient along g to get H[*, g].
+    let grad_at_g = |s: f64| -> Array1<f64> { grad_hess(gv + s, &beta_h0, &beta_w0).0 };
+    let fd_col_g = |h: f64| -> Array1<f64> {
+        let coarse = (&grad_at_g(h) - &grad_at_g(-h)) / (2.0 * h);
+        let fine = (&grad_at_g(h * 0.5) - &grad_at_g(-h * 0.5)) / h;
+        (&fine * 4.0 - &coarse) / 3.0
+    };
+    // Independent FD of the gradient along w0 to get H[*, w0].
+    let grad_at_w0 = |s: f64| -> Array1<f64> {
+        let mut bw = beta_w0.clone();
+        bw[0] += s;
+        grad_hess(gv, &beta_h0, &bw).0
+    };
+    let fd_col_w0 = |h: f64| -> Array1<f64> {
+        let coarse = (&grad_at_w0(h) - &grad_at_w0(-h)) / (2.0 * h);
+        let fine = (&grad_at_w0(h * 0.5) - &grad_at_w0(-h * 0.5)) / h;
+        (&fine * 4.0 - &coarse) / 3.0
+    };
+    let hg = fd_col_g(2e-3);
+    let hw = fd_col_w0(2e-3);
+    for &(u, name) in &[(g, "g"), (w0, "w0"), (q1, "q1")] {
+        eprintln!(
+            "BASE-HESS col-g [{name}]: production H[{u},{g}]={:+.8e} fd_grad={:+.8e} gap={:.2e}",
+            hess0[[u, g]], hg[u], (hess0[[u, g]] - hg[u]).abs()
+        );
+    }
+    for &(u, name) in &[(g, "g"), (w0, "w0"), (q1, "q1")] {
+        eprintln!(
+            "BASE-HESS col-w0 [{name}]: production H[{u},{w0}]={:+.8e} fd_grad={:+.8e} gap={:.2e}",
+            hess0[[u, w0]], hw[u], (hess0[[u, w0]] - hw[u]).abs()
+        );
+    }
+    eprintln!(
+        "symmetry check: H[g,w0]={:+.8e} H[w0,g]={:+.8e} fd col-g[w0]={:+.8e} fd col-w0[g]={:+.8e}",
+        hess0[[g, w0]], hess0[[w0, g]], hg[w0], hw[g]
+    );
+}
+
 #[test]
 fn link_flex_family_supports_second_order_exact_outer_path() {
     let score_runtime = test_deviation_runtime();
