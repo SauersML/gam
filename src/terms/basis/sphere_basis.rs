@@ -2175,7 +2175,20 @@ pub(crate) fn build_duchon_native_penalty_psi_derivatives(
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power_as_usize();
     let dim = centers.ncols();
-    let z = kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
+    let mut z = kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
+    // #1355: fold the frozen data-metric reparam `Z' = Z·V` so the penalty
+    // ψ-derivatives project in the SAME rotated radial basis as the forward
+    // penalty (`Vᵀ Ω(ψ) V`), staying bit-consistent with the design.
+    if let Some(v) = spec.radial_reparam.as_ref() {
+        if v.nrows() != z.ncols() {
+            crate::bail_dim_basis!(
+                "Duchon frozen radial reparam shape {:?} does not match constrained kernel dimension {}",
+                v.dim(),
+                z.ncols()
+            );
+        }
+        z = fast_ab(&z, v);
+    }
     let kernel_cols = z.ncols();
     let poly_cols = polynomial_block_from_order(centers, effective_nullspace_order).ncols();
     let total_cols = kernel_cols + poly_cols;

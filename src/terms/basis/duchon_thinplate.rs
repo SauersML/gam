@@ -362,7 +362,24 @@ fn build_duchon_basis_uncached(
         // A FRESH `V` is computed only when no frozen reparam was supplied
         // (`frozen_radial_reparam` already folded above on the replay paths). At
         // that point `kernel_transform` is still the raw `Z`.
-        if frozen_radial_reparam.is_none() {
+        //
+        // The reparam is gated to the native-Gram-only configuration (no active
+        // mass/tension/stiffness operator penalties): those operators build
+        // their own collocation Grams in the un-rotated `Z` frame, so rotating
+        // only the native penalty would desync the operator penalty columns.
+        // Operators are off for the default `duchon(x1,x2)` (the #1355 collapse),
+        // so this gate keeps the fix scoped to where it is needed and sound.
+        let operators_active = matches!(
+            spec.operator_penalties.mass,
+            OperatorPenaltySpec::Active { .. }
+        ) || matches!(
+            spec.operator_penalties.tension,
+            OperatorPenaltySpec::Active { .. }
+        ) || matches!(
+            spec.operator_penalties.stiffness,
+            OperatorPenaltySpec::Active { .. }
+        );
+        if frozen_radial_reparam.is_none() && !operators_active {
             let kernel_cols = kernel_transform.ncols();
             if kernel_cols > 0 {
                 // Build the un-rotated constrained kernel design once, take its

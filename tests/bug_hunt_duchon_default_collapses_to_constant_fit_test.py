@@ -7,19 +7,22 @@ The collapse was *data-realization dependent and deterministic per seed*: at
 ``n=300`` on a smooth low-noise surface, seeds 0, 2, 4, 7 collapsed while their
 neighbours fit cleanly (R²≈0.998).
 
-Root cause (now fixed) was in the OUTER smoothing-parameter optimizer, not the
-penalty or the REML objective. The grid prepass correctly seeds the good basin
-(``compute_cost([3,30,3,3]) ≈ -232``, a clean R²≈0.998 / EDF≈72 fit), but the
-ARC outer loop then evaluates an over-smoothing corner ``[30,29.95,-30,-30]``
-whose REML cost is ``≈ +588`` (~820 units WORSE). At that corner two of the four
-duchon operator penalties (Primary / trend-ridge / mass / tension) rail at the
-λ→0 lower bound while the others rail at λ→∞, shrinking the fit to its mean. The
-cost-stall guard's ``lower_bound_outward_active_count`` saw the two λ→0 axes and
-classified the corner as a near-separable (multinomial, #1082/#1237) bound-
-stationary KKT point, and ``observe_constrained_stationary`` then UNCONDITIONALLY
-overwrote the good best-so-far with this far-worse corner and reported
-convergence. The fix only adopts a constrained-stationary probe when it does not
-materially regress the best feasible iterate already in hand.
+Root cause (now fixed): the default Duchon ``Primary`` penalty was the raw
+native reproducing-norm knot-Gram ``α²·Zᵀ K_CC Z`` — a cliff-less Mercer
+spectrum whose smallest eigenvalues are genuine low-curvature bending directions
+that nonetheless carry large variance over the data. Under a single REML ``λ``
+those near-null modes cost almost nothing yet absorb EDF freely, leaving a flat
+REML profile whose over-smoothed ``λ → ∞`` corner is a spurious optimum the outer
+optimizer slides into on certain data clouds (shrinking every smooth coordinate
+AND the affine null space to EDF = 1). The thin-plate path already cured the same
+pathology in #1347 by reparameterizing in the realized DATA METRIC — solving the
+generalized eigenproblem ``Ω_c v = μ G_c v`` with ``G_c = (K Z)ᵀ(K Z)`` so the
+spectrum becomes curvature-per-unit-data-variance (mgcv's sharp cliff). The fix
+routes the Duchon kernel block through that SAME data-metric reparam: it folds
+the ``G_c``-orthonormal generalized eigenbasis ``V`` into the constrained kernel
+transform (``Z' = Z·V``) so the realized design ``K·Z·V`` rotates into that basis
+and the native penalty becomes the diagonal ``diag(μ)``, and freezes ``V`` so
+predict / κ-trial / ψ-derivative rebuilds replay the exact fit-time rotation.
 
 The matern collapse in #1357 is a distinct mechanism (the isotropic-κ outer
 optimization axis) and is intentionally not covered here.

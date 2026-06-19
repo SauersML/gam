@@ -91,11 +91,17 @@ fn try_build_spatial_term_log_kappa_derivative(
                 centers,
                 identifiability_transform,
                 operator_collocation_points,
+                radial_reparam,
                 ..
             } = &smooth_term.metadata
             else {
                 return Ok(None);
             };
+            // #1355: replay the frozen data-metric reparam into the derivative
+            // spec so the ψ-derivative arms assemble in the rotated radial basis.
+            if spec_local.radial_reparam.is_none() {
+                spec_local.radial_reparam = radial_reparam.clone();
+            }
             crate::basis::build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
                 x.view(),
                 &spec_local,
@@ -4147,6 +4153,7 @@ fn freeze_smooth_basis_from_metadata(
                 identifiability_transform,
                 input_scales: meta_scales,
                 aniso_log_scales: meta_aniso,
+                radial_reparam,
                 ..
             },
         ) => {
@@ -4169,6 +4176,10 @@ fn freeze_smooth_basis_from_metadata(
             s.aniso_log_scales = meta_aniso.clone();
             s.periodic = meta_periodic.clone();
             *input_scales = meta_scales.clone();
+            // #1355: persist the frozen data-metric radial reparam so the
+            // predict-time / κ-trial rebuild replays the EXACT fit-time rotated
+            // radial basis (a fresh `V` from predict rows would differ).
+            s.radial_reparam = radial_reparam.clone();
         }
         (
             SmoothBasisSpec::Sphere { spec: s, .. },
@@ -5304,6 +5315,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 nullspace_order,
                 aniso_log_scales,
                 input_scales,
+                radial_reparam,
                 ..
             } => {
                 let mut spec = match &termspec.basis {
@@ -5325,6 +5337,9 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 spec.power = *power;
                 spec.nullspace_order = *nullspace_order;
                 spec.aniso_log_scales = aniso_log_scales.clone();
+                // #1355: replay the frozen data-metric reparam so the n-free
+                // penalty ψ-derivative matches the rotated forward penalty.
+                spec.radial_reparam = radial_reparam.clone();
                 if spec.length_scale.is_none() {
                     return Err(
                         "Duchon n-free penalty derivative requires a hybrid length-scale"
