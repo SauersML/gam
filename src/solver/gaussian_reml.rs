@@ -2698,53 +2698,27 @@ fn refine_best_grid_cell(prepared: &GaussianRemlPrepared, grid: &[(f64, f64)]) -
     if best_idx == 0 || best_idx + 1 == grid.len() {
         return Some(grid[best_idx].0);
     }
-    Some(golden_section_rho(
-        |rho| prepared.evaluate(rho).cost,
+    // The best interior grid cell brackets a genuine REML minimum (its cost is
+    // below both neighbours), so the objective gradient changes sign across
+    // `[grid[i-1], grid[i+1]]`. Refine to that stationary point (∂V/∂ρ = 0)
+    // rather than minimising the cost with a golden section: the cost-based
+    // search only locates ρ to ~√ε of the cell (~1e-8), whereas the
+    // grad-sign-change branch already contributes stationary candidates
+    // converged to GRAD_TOL (~1e-12). When both target the same minimum, the
+    // ~1e-16 cost ordering between a 1e-8-accurate and a 1e-12-accurate ρ is
+    // numerical noise, so `min_by(cost)` used to pick between two ρ values
+    // ~1e-8 apart essentially at random — making the selected λ̂ a
+    // non-smooth function of the design X (its ~1e-8 jumps wrecked the
+    // closed-form REML reverse-mode VJP's agreement with finite differences).
+    // Returning the stationary point makes every interior candidate a
+    // GRAD_TOL-accurate root, so the residual selection jitter collapses to
+    // ~1e-12 and λ̂(X) is smooth to the IFT gradient.
+    Some(refine_stationary_rho(
+        prepared,
         grid[best_idx - 1].0,
         grid[best_idx + 1].0,
+        grid[best_idx].0,
     ))
-}
-
-fn golden_section_rho<F>(mut cost: F, mut lo: f64, mut hi: f64) -> f64
-where
-    F: FnMut(f64) -> f64,
-{
-    const INV_PHI: f64 = 0.618_033_988_749_894_8;
-    const INV_PHI2: f64 = 0.381_966_011_250_105_1;
-    lo = lo.clamp(RHO_LOWER, RHO_UPPER);
-    hi = hi.clamp(RHO_LOWER, RHO_UPPER);
-    if !(lo.is_finite() && hi.is_finite()) || lo >= hi {
-        return lo.min(hi).clamp(RHO_LOWER, RHO_UPPER);
-    }
-    let mut x1 = lo + INV_PHI2 * (hi - lo);
-    let mut x2 = lo + INV_PHI * (hi - lo);
-    let mut f1 = cost(x1);
-    let mut f2 = cost(x2);
-    for _ in 0..80 {
-        if (hi - lo).abs() <= 1.0e-10 * (1.0 + 0.5 * (lo.abs() + hi.abs())) {
-            break;
-        }
-        if !f1.is_finite() || (f2.is_finite() && f2 < f1) {
-            lo = x1;
-            x1 = x2;
-            f1 = f2;
-            x2 = lo + INV_PHI * (hi - lo);
-            f2 = cost(x2);
-        } else {
-            hi = x2;
-            x2 = x1;
-            f2 = f1;
-            x1 = lo + INV_PHI2 * (hi - lo);
-            f1 = cost(x1);
-        }
-    }
-    let mid = 0.5 * (lo + hi);
-    [(lo, cost(lo)), (mid, cost(mid)), (hi, cost(hi))]
-        .into_iter()
-        .filter(|(_, c)| c.is_finite())
-        .min_by(|(_, a), (_, b)| a.total_cmp(b))
-        .map(|(rho, _)| rho)
-        .unwrap_or(mid)
 }
 
 fn fill_weighted_rhs_no_alloc(
@@ -2902,20 +2876,24 @@ fn optimize_rho_no_alloc(
         let refined = if best_idx == 0 || best_idx + 1 == grid.len() {
             grid[best_idx].0
         } else {
-            golden_section_rho(
-                |rho| {
-                    evaluate_reml_parts(
-                        cache,
-                        ywy,
-                        projected_rhs_squared,
-                        n_observations,
-                        n_outputs,
-                        rho,
-                    )
-                    .cost
-                },
+            // Refine the best interior grid cell to the REML stationary point
+            // (∂V/∂ρ = 0) rather than the golden-section cost minimum, mirroring
+            // the allocating `refine_best_grid_cell`. A cost-based search locates
+            // ρ only to ~1e-8, which competed against the GRAD_TOL-accurate
+            // (~1e-12) stationary candidates in the cost `min_by` below and made
+            // the selected λ̂ jump ~1e-8 with the design — a non-smoothness the
+            // closed-form REML VJP could not match under finite differences.
+            // (Keeping both optimizers' refinement identical preserves their
+            // allocating/no-alloc bit-for-bit parity.)
+            refine_stationary_rho_no_alloc(
+                cache,
+                ywy,
+                projected_rhs_squared,
+                n_observations,
+                n_outputs,
                 grid[best_idx - 1].0,
                 grid[best_idx + 1].0,
+                grid[best_idx].0,
             )
         };
         consider_rho_no_alloc(
