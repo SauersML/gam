@@ -286,12 +286,35 @@ pub(crate) fn apply_dense_bspline_extrapolation(
     if num_basis_functions == 0 {
         return Ok(());
     }
-    if !has_clamped_bspline_boundaries(knotview, degree) {
-        return Ok(());
-    }
 
     let left = knotview[degree];
     let right = knotview[num_basis_functions];
+    if !(left.is_finite() && right.is_finite() && left < right) {
+        return Ok(());
+    }
+
+    // Open (unclamped) knots: the value evaluator clamps the eval point to the
+    // modeling interval `[knots[degree], knots[num_basis]]` (constant extension —
+    // there is no linear extension because `has_clamped_bspline_boundaries` is
+    // false). A constant function has zero derivative, so BOTH the first and
+    // second derivative must be zero in the exterior spans. Without this, the
+    // dense derivative path leaves the raw mathematical B-spline derivative in the
+    // boundary spans (nonzero), which no longer matches a finite difference of the
+    // constant-extended value basis (gam#1348). The genuine cyclic basis never
+    // reaches here (it pre-wraps its input into the base period).
+    if !has_clamped_bspline_boundaries(knotview, degree) {
+        if matches!(
+            eval_kind,
+            BasisEvalKind::FirstDerivative | BasisEvalKind::SecondDerivative
+        ) {
+            for (i, &x) in data.iter().enumerate() {
+                if x < left || x > right {
+                    basis_matrix.row_mut(i).fill(0.0);
+                }
+            }
+        }
+        return Ok(());
+    }
 
     if matches!(eval_kind, BasisEvalKind::FirstDerivative) {
         let num_basis_lower = knotview.len().saturating_sub(degree);
