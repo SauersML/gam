@@ -298,10 +298,8 @@ fn gam_poisson_tensor_recovers_true_mean_surface_on_real_data() {
         family: Some("poisson".to_string()),
         ..FitConfig::default()
     };
-    let __t_gam = std::time::Instant::now();
     let result =
         fit_from_formula("numvisit ~ te(age, badh)", &train_ds, &cfg).expect("gam poisson te fit");
-    eprintln!("PROBE_GAM_FIT_SECS={:.2}", __t_gam.elapsed().as_secs_f64());
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for poisson(log) + te() on real data");
     };
@@ -322,7 +320,6 @@ fn gam_poisson_tensor_recovers_true_mean_surface_on_real_data() {
     // ---- fit the SAME model on TRAIN with mgcv, predict the SAME TEST ------
     // bs="ps" margins match gam's te() construction (cubic B-spline + 2nd-order
     // penalty). The test columns ride along padded; only the first k are read.
-    let __t_r = std::time::Instant::now();
     let r = run_r(
         &[
             Column::new("age", &train_age),
@@ -351,7 +348,6 @@ fn gam_poisson_tensor_recovers_true_mean_surface_on_real_data() {
         emit("test_pred", as.numeric(predict(m, newdata = newd, type = "response")))
         "#,
     );
-    eprintln!("PROBE_R_SUBPROCESS_SECS={:.2}", __t_r.elapsed().as_secs_f64());
     let mgcv_test_mean = r.vector("test_pred");
     let mgcv_edf = r.scalar("edf");
     assert_eq!(
