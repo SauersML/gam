@@ -816,17 +816,21 @@ class _SparsityLayer(nn.Module):
             # differentiable quantity below; the hard routing is straight-through.
             soft = torch.softmax(balanced_log_resp, dim=-1)
 
-            # Sequential matching-pursuit commitment (issue #1282). Only engaged
-            # when the per-atom residual is *degenerate* — i.e. the atoms are
-            # nearly indistinguishable on every row, the energy-degenerate
-            # failure mode. On disjoint manifolds the residual already separates
-            # the circles, pure balanced EM routes them perfectly, and forcing a
-            # commitment only injects entanglement, so the detector keeps it off.
+            # Sequential matching-pursuit commitment during an early window
+            # (issue #1282). This breaks the init symmetry by forcing the two
+            # atoms onto *distinct* manifolds: atom 0 fits one circle first, then
+            # atom 1 is committed to the rows atom 0 reconstructs worst. The
+            # decoder-harmonic smoothness penalty (``decoder_harmonic_penalty``)
+            # confines each atom to a single 2-plane, so once committed an atom
+            # genuinely *cannot* also fit the other manifold — the residual stays
+            # informative and the partition holds after the window releases
+            # (earlier, with snaking decoders, the committed routing decayed).
+            # It is safe on disjoint manifolds too: atom 0 fits one circle, the
+            # other circle's rows are its worst residual, so atom 1 is committed
+            # to them — the same partition pure EM finds, no entanglement.
             commit = None
             if step is not None and step < self._commit_steps:
-                spread = self._residual_spread(relative_residual)
-                if spread < 0.5:
-                    commit = self._matching_pursuit_commit(relative_residual, step)
+                commit = self._matching_pursuit_commit(relative_residual, step)
 
             # Persistent per-row assignment accumulator. At high reconstruction
             # R² the instantaneous residual carries little routing signal (the
@@ -908,25 +912,6 @@ class _SparsityLayer(nn.Module):
         onehot = torch.zeros(n, f, dtype=dtype, device=device)
         onehot[torch.arange(n, device=device), assign] = 1.0
         return onehot
-
-    @staticmethod
-    def _residual_spread(relative_residual: torch.Tensor) -> float:
-        """Mean per-row separation of the per-atom residuals (issue #1282).
-
-        Returns the mean over rows of ``(max_k r - min_k r) / mean_k r``. Large
-        when the atoms reconstruct a row very differently (disjoint manifolds:
-        the residual already routes), small when every atom reconstructs every
-        row about equally well (energy-degenerate: residual routing is
-        ambiguous and the commitment is needed). Detached scalar; never affects
-        gradients.
-        """
-        rr = relative_residual.detach()
-        if rr.shape[-1] < 2:
-            return 0.0
-        rmin = rr.min(dim=-1).values
-        rmax = rr.max(dim=-1).values
-        rmean = rr.mean(dim=-1).clamp_min(1e-12)
-        return float(((rmax - rmin) / rmean).mean().item())
 
     def _update_assign_ema(
         self, signal: torch.Tensor | None
