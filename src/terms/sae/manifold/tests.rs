@@ -7555,6 +7555,88 @@ pub(crate) fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() 
     );
 }
 
+/// #1273 regression — the gradient lane (`eval` / `OuterEvalOrder::ValueAnd
+/// Gradient`) must NOT hard-abort when the analytic outer gradient is undefined
+/// at a finite-cost ρ whose joint Hessian is near-singular-but-valid (the
+/// circle/torus topology the issue reports: a flat direction outside both the
+/// chart gauge orbit and the penalised decoder β-null that the Faddeev-Popov
+/// deflation recovers). Before the fix the singular-Hessian conditioning error
+/// (`outer_gradient_conditioning_error`: "min/max pivot ratio … < floor")
+/// `?`-propagated out of `eval` as `RemlOptimizationFailed`, which the outer
+/// cascade surfaced as a `RemlConvergenceError`. After the fix the finite-cost ρ
+/// is descended with a central finite-difference outer gradient of the REML value
+/// path, so `eval` returns a finite `(cost, ∇f)` pair and the optimiser makes
+/// progress instead of aborting.
+///
+/// The test exercises BOTH halves of the fix deterministically and in unit time:
+/// (1) the conditioning gate genuinely rejects a near-singular cache that no
+/// gauge/β-null deflation can recover (the bug's precondition — without it the
+/// analytic path would just succeed and the fallback never run), and (2) the
+/// finite-difference fallback that `eval` now invokes returns a finite outer
+/// gradient on the same objective.
+#[test]
+pub(crate) fn gradient_lane_finite_difference_fallback_recovers_singular_outer_gradient_1273() {
+    let objective = warmstart_test_objective();
+    // Precondition: a near-singular joint Hessian whose sub-floor pivot is NOT
+    // explained by any chart-gauge / decoder-β-null direction — so the analytic
+    // outer-gradient solver REJECTS it. This is the exact condition the issue's
+    // pivot-ratio gate trips on; before the fix it aborted the whole outer fit.
+    let singular_cache = near_singular_outer_gradient_cache();
+    assert!(
+        SaeManifoldTerm::outer_gradient_conditioning_error(&singular_cache).is_err(),
+        "fixture precondition: the cache must trip the pivot-ratio floor (#1273)"
+    );
+    assert!(
+        objective
+            .term
+            .outer_gradient_arrow_solver(&singular_cache, objective.current_rho.lambda_smooth())
+            .is_err(),
+        "fixture precondition: the analytic outer gradient must REJECT this \
+         near-singular cache (no matching gauge/β-null to deflate) — this is the \
+         path that aborted the outer fit before #1273"
+    );
+    // The fix: at such a finite-cost ρ the gradient lane descends with the
+    // central finite-difference outer gradient of the value path instead of
+    // aborting. The fallback must return a finite, correctly-sized gradient.
+    let fd = objective
+        .finite_difference_outer_gradient(&objective.current_rho)
+        .expect("finite-difference outer-gradient fallback must succeed (#1273)");
+    assert_eq!(
+        fd.len(),
+        objective.current_rho.to_flat().len(),
+        "FD outer gradient length must match the ρ dimension"
+    );
+    assert!(
+        fd.iter().all(|g| g.is_finite()),
+        "FD outer-gradient fallback must be finite (a usable descent direction, \
+         never NaN/Inf) so BFGS can cross the flat valley; got {fd:?}"
+    );
+    // It must be a genuine descent instrument, not a degenerate zero vector: at
+    // this non-stationary entry ρ the value path has a real smoothing slope.
+    assert!(
+        fd.iter().any(|g| g.abs() > 1.0e-9),
+        "FD outer-gradient fallback must carry a nonzero descent component at a \
+         non-stationary ρ; got an all-zero vector {fd:?}"
+    );
+
+    // And the gradient lane (`eval`) the fix guards must still return a finite,
+    // ρ-sized `(cost, ∇f)` end-to-end — the recovery wiring is on the same code
+    // path the well-conditioned analytic case takes, so it must not regress it.
+    let mut objective = warmstart_test_objective();
+    let rho_flat = objective.current_rho.to_flat();
+    let eval = objective
+        .eval(&rho_flat)
+        .expect("gradient lane must return a finite (cost, gradient) pair (#1273 wiring)");
+    assert!(
+        eval.cost.is_finite()
+            && eval.gradient.len() == rho_flat.len()
+            && eval.gradient.iter().all(|g| g.is_finite()),
+        "gradient lane must yield a finite, ρ-sized outer gradient; got cost={}, grad={:?}",
+        eval.cost,
+        eval.gradient
+    );
+}
+
 #[test]
 pub(crate) fn deflated_solver_matches_plain_solve_when_no_gauge_is_installed() {
     let cache = diagonal_latent_cache(&[2.0_f64, 5.0, 7.0]);

@@ -1275,6 +1275,70 @@ impl SaeManifoldOuterObjective {
             logdet_enclosure_gap: None,
         })
     }
+
+    /// #1273 — central finite-difference outer-ρ gradient of the REML value
+    /// path, used ONLY as a descent-direction fallback when the analytic outer
+    /// gradient is numerically undefined at a finite-cost ρ (a near-singular but
+    /// valid joint Hessian — e.g. a circle/torus topology whose data is lower-
+    /// dimensional than the latent basis, so a genuine flat direction lives
+    /// outside both the chart gauge orbit and the penalised decoder β-null that
+    /// the Faddeev-Popov deflation recovers).
+    ///
+    /// This is the SAME value path (`reml_criterion`) the optimality certificate
+    /// finite-differences to audit the analytic gradient, so it is exact-REML
+    /// clean: the FD never produces the cost the fit consumes (the gradient lane
+    /// returns the analytic REML value), it only supplies a usable direction so
+    /// the outer optimiser can cross the flat valley instead of aborting. Each
+    /// ρ-coordinate is differenced independently with a step scaled to the
+    /// coordinate magnitude (`probe_step`), on a cold clone of the pristine
+    /// baseline term so the probes never alias the live converged warm state.
+    /// A non-finite probe falls back to a zero component on that axis, which
+    /// simply omits a descent contribution there rather than poisoning the step.
+    pub(crate) fn finite_difference_outer_gradient(
+        &self,
+        rho_state: &SaeManifoldRho,
+    ) -> Result<Array1<f64>, String> {
+        let rho_flat = rho_state.to_flat();
+        let n = rho_flat.len();
+        let h = probe_step(rho_flat.view());
+        let mut gradient = Array1::<f64>::zeros(n);
+        if !(h.is_finite() && h > 0.0) {
+            return Ok(gradient);
+        }
+        let mut probe_term = self.baseline_term.clone();
+        let value_at = |term: &mut SaeManifoldTerm, flat: &Array1<f64>| -> Option<f64> {
+            let rho = self.baseline_rho.from_flat(flat.view());
+            let value = term
+                .reml_criterion(
+                    self.target.view(),
+                    &rho,
+                    self.registry.as_ref(),
+                    self.inner_max_iter,
+                    self.learning_rate,
+                    self.ridge_ext_coord,
+                    self.ridge_beta,
+                )
+                .ok()
+                .map(|(cost, _loss)| cost);
+            value.filter(|v| v.is_finite())
+        };
+        for i in 0..n {
+            let mut plus = rho_flat.clone();
+            plus[i] += h;
+            let mut minus = rho_flat.clone();
+            minus[i] -= h;
+            if let (Some(vp), Some(vm)) = (
+                value_at(&mut probe_term, &plus),
+                value_at(&mut probe_term, &minus),
+            ) {
+                let derivative = (vp - vm) / (2.0 * h);
+                if derivative.is_finite() {
+                    gradient[i] = derivative;
+                }
+            }
+        }
+        Ok(gradient)
+    }
 }
 
 impl OuterObjective for SaeManifoldOuterObjective {
@@ -1362,21 +1426,62 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 self.ridge_beta,
             )
             .map_err(EstimationError::RemlOptimizationFailed)?;
-        let solver = self
+        // #1273 — the analytic outer gradient is built from the undamped joint
+        // Hessian via `outer_gradient_arrow_solver`, whose Faddeev-Popov gauge
+        // deflation recovers near-null directions that lie in the closed-form
+        // chart gauge orbit or the penalised decoder β-null. On a circle/torus
+        // topology whose data is intrinsically lower-dimensional than the latent
+        // (`atom_topology="circle"` with `d_atom=2`: a 1-D ring embedded in a 2-D
+        // torus basis), the joint Hessian carries a genuine near-singular-but-
+        // valid direction OUTSIDE both deflation sets — its min pivot is tiny but
+        // strictly positive (≈1.2e-10) while the max is ≈2.3e5, so the analytic
+        // gradient's pivot-ratio gate (`outer_gradient_conditioning_error`)
+        // legitimately reports "joint Hessian numerically singular" and the solver
+        // refuses. Before the fix this `?`-propagated as `RemlOptimizationFailed`,
+        // aborting the WHOLE outer optimisation: every BFGS gradient point was
+        // refused, the line search stalled into consecutive infeasible probes, and
+        // the seed cascade rejected every seed → `RemlConvergenceError`.
+        //
+        // The cost at this ρ is still the EXACT REML criterion (it factorised
+        // fine; only the gradient's pivot ratio tripped the gate), so the point is
+        // feasible, not infeasible. Recover by descending it with a CENTRAL
+        // finite-difference outer gradient of the same value path — the identical
+        // FD instrument the optimality certificate already uses to audit the
+        // analytic gradient (`certificates::probe_*`), here used as a descent
+        // direction only when the analytic path is numerically undefined. This is
+        // exact-REML-policy clean: the FD does not produce the cost (the returned
+        // cost is the analytic REML value), it only supplies a usable direction so
+        // BFGS can cross the flat valley instead of aborting. The well-conditioned
+        // path is byte-for-byte unchanged: the analytic solver succeeds there and
+        // this fallback is never reached.
+        let analytic = self
             .term
             .outer_gradient_arrow_solver(&cache, rho_state.lambda_smooth())
-            .map_err(EstimationError::RemlOptimizationFailed)?;
-        let components = self
-            .term
-            .analytic_outer_rho_gradient_components(
-                self.target.view(),
-                &rho_state,
-                &loss,
-                &cache,
-                &solver,
-            )
-            .map_err(EstimationError::RemlOptimizationFailed)?;
-        let gradient = components.gradient();
+            .and_then(|solver| {
+                self.term.analytic_outer_rho_gradient_components(
+                    self.target.view(),
+                    &rho_state,
+                    &loss,
+                    &cache,
+                    &solver,
+                )
+            });
+        let gradient = match analytic {
+            Ok(components) => components.gradient(),
+            Err(analytic_err) => {
+                if !cost.is_finite() {
+                    return Err(EstimationError::RemlOptimizationFailed(analytic_err));
+                }
+                log::info!(
+                    "[SAE/#1273] analytic outer gradient undefined at a finite-cost ρ \
+                     ({analytic_err}); descending with a central finite-difference outer \
+                     gradient of the value path so the near-singular flat valley is crossed \
+                     instead of aborting the outer optimisation"
+                );
+                self.finite_difference_outer_gradient(&rho_state)
+                    .map_err(EstimationError::RemlOptimizationFailed)?
+            }
+        };
         let beta_hat = self.term.flatten_beta();
         // #1206 — the gradient lane (`OuterEvalOrder::ValueAndGradient`, consumed
         // by the outer BFGS Armijo line search) MUST return a cost whose gradient
