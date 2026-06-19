@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: verify-979-${{ github.ref }}
+  group: verify-979-${{ github.sha }}
   cancel-in-progress: false
 
 permissions:
