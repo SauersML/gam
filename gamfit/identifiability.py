@@ -617,10 +617,10 @@ def _one_fit(
     learning_rate: float,
     seed: int,
     torch_mod: Any,
-) -> tuple[Any, Any, float, float, float]:
+) -> tuple[Any, Any, float, float]:
     """Run one inner-loop fit at fixed scalar weights.
 
-    Returns ``(encoder, decoder_W, rss, total_penalty, evidence)``. The
+    Returns ``(encoder, decoder_W, rss, total_penalty)``. The
     encoder is the trained ``nn.Sequential``; ``decoder_W`` is a numpy array
     of shape ``(P, n_supervised + n_free)``.
     """

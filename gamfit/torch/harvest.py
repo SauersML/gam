@@ -245,7 +245,7 @@ def _capture_activations(
     model: torch.nn.Module,
     hook_module: torch.nn.Module,
     inputs: Any,
-) -> tuple[torch.Tensor, Callable[[torch.Tensor], torch.Tensor]]:
+) -> tuple[torch.Tensor, Callable[[torch.Tensor, int], torch.Tensor]]:
     """Run ``model(inputs)`` capturing the output of ``hook_module``.
 
     Returns ``(acts, logits_from_acts)`` where ``acts`` is the detached hook-site
