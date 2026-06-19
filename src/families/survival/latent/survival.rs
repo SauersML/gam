@@ -1948,34 +1948,6 @@ impl LatentSurvivalFamily {
         )
     }
 
-    /// Assemble the per-row [`LatentSurvivalRow`] for a row treated as a pure
-    /// right-censored survival contribution: the exit time is the censoring
-    /// boundary (`q_right = q_exit`), the exit hazard derivative is the unit
-    /// reference (`qdot_exit = 1.0`), and the right / post-exit unloaded
-    /// quantities vanish. Used by the survival-only pullback reductions
-    /// (gradient, Hessian, third-order) that previously inlined this exact
-    /// `RightCensored` construction. Behavior is unchanged.
-    fn build_right_censored_row_at(
-        &self,
-        row_idx: usize,
-        q_entry: f64,
-        q_exit: f64,
-    ) -> Result<LatentSurvivalRow, LatentSurvivalError> {
-        build_latent_survival_row(
-            row_idx,
-            self.hazard_loading,
-            LatentSurvivalEventType::RightCensored,
-            q_entry,
-            q_exit,
-            1.0,
-            q_exit,
-            self.unloaded_mass_entry[row_idx],
-            self.unloaded_mass_exit[row_idx],
-            0.0,
-            0.0,
-        )
-    }
-
     fn joint_slices(&self) -> LatentSurvivalJointSlices {
         let p_time = self.x_time_exit.ncols();
         let p_mean = self.x_mean.ncols();
@@ -3264,6 +3236,32 @@ fn binary_from_log_survival(
 }
 
 impl LatentBinaryFamily {
+    /// Assemble the per-row [`LatentSurvivalRow`] for a row treated as a pure
+    /// right-censored survival contribution (exit time is the censoring
+    /// boundary, unit exit-hazard derivative, no right / post-exit unloaded
+    /// mass). Shared by every per-row binary-from-survival pullback reduction;
+    /// behavior is identical to the previously inlined `RightCensored` call.
+    fn build_right_censored_row_at(
+        &self,
+        row_idx: usize,
+        q_entry: f64,
+        q_exit: f64,
+    ) -> Result<LatentSurvivalRow, LatentSurvivalError> {
+        build_latent_survival_row(
+            row_idx,
+            self.hazard_loading,
+            LatentSurvivalEventType::RightCensored,
+            q_entry,
+            q_exit,
+            1.0,
+            q_exit,
+            self.unloaded_mass_entry[row_idx],
+            self.unloaded_mass_exit[row_idx],
+            0.0,
+            0.0,
+        )
+    }
+
     fn joint_slices(&self) -> LatentSurvivalJointSlices {
         let p_time = self.x_time_exit.ncols();
         let p_mean = self.x_mean.ncols();
