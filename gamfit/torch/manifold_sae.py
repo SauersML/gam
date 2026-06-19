@@ -610,6 +610,9 @@ class _SparsityLayer(nn.Module):
         self.kind = cfg.sparsity.kind
         self.n_atoms = int(cfg.n_atoms)
         self.tau_min = float(cfg.sparsity.tau_min)
+        # Annealing start for the deterministic-annealing router's soft->hard
+        # forward interpolation (see ``reconstruction_topk_gate``).
+        self._tau_start = float(cfg.sparsity.tau_start)
         self.target_k = (
             int(cfg.sparsity.target_k) if cfg.sparsity.target_k is not None else self.n_atoms
         )
@@ -707,46 +710,72 @@ class _SparsityLayer(nn.Module):
 
     def reconstruction_topk_gate(
         self,
-        magnitude_logits: torch.Tensor,
         x: torch.Tensor,
         per_atom_recon: torch.Tensor,
     ) -> torch.Tensor:
-        """Residual-annealed top-k gate for gradient-trained ``softmax_topk``.
+        """Residual deterministic-annealing EM gate for gradient-trained ``softmax_topk``.
 
-        Top-1 routing must be decided by the atom's current reconstruction
-        error, not by raw input geometry or by an arbitrary logits-only mask. For
-        each row/atom pair we solve the best non-negative scalar code against
-        that atom's curve and score the atom by the resulting relative residual.
-        While the shared temperature schedule is above its floor, rows carry
-        soft EM-style responsibilities ``softmax(-relative_residual / tau)`` so
-        every plausible atom can improve. At the schedule floor, the forward
-        value becomes the hard top-1 residual assignment with a soft
-        straight-through gradient.
+        Top-1 routing must be decided by the atom's current *reconstruction
+        error*, not by raw input geometry (the prior ``#1282`` patch keyed on
+        ``x**2 / sum(x**2)``, a shortcut that only separates manifolds with
+        distinct coordinate-energy profiles and collapses on energy-degenerate
+        data) and not by an arbitrary logits-only top-k mask (which picks a
+        near-random atom at the symmetric init, so reconstruction gradients teach
+        every atom every row and both atoms collapse to a shared blend).
+
+        For each row/atom pair we solve the best non-negative scalar code against
+        that atom's curve and score the atom by the resulting relative residual
+        (normalized by the row energy so the temperature is scale-comparable).
+        These residuals drive a deterministic-annealing E-step: soft EM-style
+        responsibilities ``softmax(-relative_residual / tau)`` annealed through
+        the existing ``tau`` schedule. Early (``tau`` near ``tau_start``) the
+        forward gate is the soft responsibility-weighted code, so the M-step
+        differentiates the atoms gently from a near-symmetric init; as
+        ``tau -> tau_min`` the forward interpolates to the committed hard top-1
+        winner — one active atom per row (the top-k one-hot contract and the
+        closed-form lane's hard assignment). Gradients always flow through the
+        soft responsibilities (straight-through on the hard part), so routing
+        stays differentiable and depends only on the reconstruction fit.
         """
-        amp = self._topk_activation(magnitude_logits)
+        # Best non-negative scalar code per row/atom against that atom's curve,
+        # and the residual it leaves. The code carries the SAE magnitude and is
+        # *not* detached, so reconstruction gradients train the decoder's shape
+        # and scale directly.
         denom = per_atom_recon.square().sum(dim=-1).clamp_min(1e-12)
         code = (per_atom_recon * x.unsqueeze(1)).sum(dim=-1) / denom
         code = code.clamp_min(0.0)
         residual = ((code.unsqueeze(-1) * per_atom_recon - x.unsqueeze(1)) ** 2).sum(
             dim=-1
         )
+        # Per-row scale-free relative residual: normalize by the row energy so
+        # the annealing temperature is comparable across rows of different
+        # magnitude and tau alone controls assignment hardness.
         row_scale = x.square().sum(dim=1, keepdim=True).clamp_min(1e-12)
         relative_residual = residual / row_scale
         tau = max(float(self.tau.item()), 1e-6)
 
         if self.target_k == 1:
+            # Deterministic-annealing EM responsibilities. Early (large tau) the
+            # gate is the *soft* responsibility-weighted code, so the M-step
+            # differentiates the atoms gently from a near-symmetric init; the
+            # forward interpolates toward the committed hard top-1 winner as
+            # tau -> tau_min, where it is one-hot to numerical tolerance (the
+            # avg-one-active-atom top-k contract and the closed-form lane's hard
+            # assignment). Gradients always flow through the soft responsibilities
+            # (straight-through on the hard part).
             soft = torch.softmax(-relative_residual / tau, dim=-1)
-            if tau <= self.tau_min * (1.0 + 1.0e-12):
-                hard = self._topk_mask(-relative_residual)
-                responsibilities = hard + soft - soft.detach()
-            else:
-                responsibilities = soft
-        else:
             hard = self._topk_mask(-relative_residual)
-            responsibilities = hard
+            hard_ste = hard + soft - soft.detach()
+            if self._tau_start > self.tau_min:
+                progress = (self._tau_start - tau) / (self._tau_start - self.tau_min)
+            else:
+                progress = 1.0
+            progress = float(min(max(progress, 0.0), 1.0))
+            responsibilities = (1.0 - progress) * soft + progress * hard_ste
+        else:
+            responsibilities = self._topk_mask(-relative_residual)
 
-        code_with_amp_grad = code.detach() + amp - amp.detach()
-        return code_with_amp_grad * responsibilities
+        return code * responsibilities
 
     def compose_code(self, assignments: torch.Tensor, amp: torch.Tensor) -> torch.Tensor:
         """Per-atom latent code ``z`` from gate ``assignments`` and ``amp``.
@@ -975,7 +1004,7 @@ class ManifoldSAE(nn.Module):
         if self.cfg.sparsity.kind == "softmax_topk":
             gate_pre = amp_logits
             assignments = self.sparsity.reconstruction_topk_gate(
-                amp_logits, x, per_atom_recon
+                x, per_atom_recon
             )
             z = assignments
         else:
