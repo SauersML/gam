@@ -7,6 +7,46 @@
 
 use super::*;
 
+fn moving_density_boundary_flux(
+    axis: usize,
+    primary: &FlexPrimarySlices,
+    a_u: &Array1<f64>,
+    entry: &CachedCellEntry,
+    poly: &[f64],
+    b: f64,
+) -> f64 {
+    if b == 0.0 {
+        return 0.0;
+    }
+    let cell = entry.partition_cell.cell;
+    let edge_velocity = |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+        match edge {
+            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                let direct_g = if axis == primary.g { z } else { 0.0 };
+                -(a_u[axis] + direct_g) / b
+            }
+            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+        }
+    };
+    let v_r = edge_velocity(entry.partition_cell.right_edge, cell.right);
+    let v_l = edge_velocity(entry.partition_cell.left_edge, cell.left);
+    let right = if v_r != 0.0 {
+        v_r * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+            cell, poly, cell.right,
+        )
+    } else {
+        0.0
+    };
+    let left = if v_l != 0.0 {
+        v_l * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+            cell, poly, cell.left,
+        )
+    } else {
+        0.0
+    };
+    right - left
+}
+
 impl SurvivalMarginalSlopeFamily {
     pub(crate) fn compute_survival_timepoint_first_order_exact(
         &self,
@@ -98,11 +138,12 @@ impl SurvivalMarginalSlopeFamily {
                         &chi_u_poly,
                         &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly),
                     );
-                    d_u[u] = exact_kernel::cell_polynomial_integral_from_moments(
-                        &integrand,
-                        &state.moments,
-                        "survival D_t first derivative",
-                    )?;
+                    d_u[u] =
+                        exact_kernel::cell_polynomial_integral_from_moments(
+                            &integrand,
+                            &state.moments,
+                            "survival D_t first derivative",
+                        )? + moving_density_boundary_flux(u, primary, &a_u, entry, &chi_poly, b);
                 }
                 Ok(d_u)
             })
@@ -362,11 +403,12 @@ impl SurvivalMarginalSlopeFamily {
                         &chi_u_poly,
                         &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly),
                     );
-                    d_u[u] = exact_kernel::cell_polynomial_integral_from_moments(
-                        &integrand,
-                        &state.moments,
-                        "survival D_t first derivative",
-                    )?;
+                    d_u[u] =
+                        exact_kernel::cell_polynomial_integral_from_moments(
+                            &integrand,
+                            &state.moments,
+                            "survival D_t first derivative",
+                        )? + moving_density_boundary_flux(u, primary, &a_u, entry, &chi_poly, b);
                 }
                 Ok(d_u)
             })
@@ -380,49 +422,25 @@ impl SurvivalMarginalSlopeFamily {
 
         if b != 0.0 {
             for entry in &cached.cells {
-                let cell = entry.neg_cell;
-                let part = &entry.partition_cell;
                 let fixed = &entry.fixed;
-                let edge_vel = |axis: usize,
-                                edge: crate::families::cubic_cell_kernel::PartitionEdge,
-                                z: f64|
-                 -> f64 {
-                    match edge {
-                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
-                            let direct_g = if axis == primary.g { z } else { 0.0 };
-                            -(a_u[axis] + direct_g) / b
-                        }
-                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
-                    }
-                };
-                let flux = |axis: usize, poly: &[f64]| -> f64 {
-                    let v_r = edge_vel(axis, part.right_edge, cell.right);
-                    let v_l = edge_vel(axis, part.left_edge, cell.left);
-                    let right = if v_r != 0.0 {
-                        v_r * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
-                            cell, poly, cell.right,
-                        )
-                    } else {
-                        0.0
-                    };
-                    let left = if v_l != 0.0 {
-                        v_l * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
-                            cell, poly, cell.left,
-                        )
-                    } else {
-                        0.0
-                    };
-                    right - left
-                };
                 for u in 0..p {
                     let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
                     for v in u..p {
-                        let boundary = flux(v, &neg_coeff_u);
+                        let boundary =
+                            moving_density_boundary_flux(v, primary, &a_u, entry, &neg_coeff_u, b);
                         let boundary = if u == v {
                             boundary
                         } else {
                             let neg_coeff_v = fixed.coeff_u[v].map(|value| -value);
-                            boundary + flux(u, &neg_coeff_v)
+                            boundary
+                                + moving_density_boundary_flux(
+                                    u,
+                                    primary,
+                                    &a_u,
+                                    entry,
+                                    &neg_coeff_v,
+                                    b,
+                                )
                         };
                         f_uv[[u, v]] += boundary;
                         if u != v {
@@ -636,53 +654,25 @@ impl SurvivalMarginalSlopeFamily {
                                 "survival D_t second derivative",
                             )?;
                             let boundary = if b != 0.0 {
-                                let part = &entry.partition_cell;
-                                let edge_vel =
-                                    |axis: usize,
-                                     edge: crate::families::cubic_cell_kernel::PartitionEdge,
-                                     z: f64|
-                                     -> f64 {
-                                        match edge {
-                                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing {
-                                                ..
-                                            } => {
-                                                let direct_g =
-                                                    if axis == primary.g { z } else { 0.0 };
-                                                -(a_u[axis] + direct_g) / b
-                                            }
-                                            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(
-                                                _,
-                                            ) => 0.0,
-                                        }
-                                    };
-                                let flux = |axis: usize, poly: &[f64]| -> f64 {
-                                    let v_r = edge_vel(axis, part.right_edge, cell.right);
-                                    let v_l = edge_vel(axis, part.left_edge, cell.left);
-                                    let right = if v_r != 0.0 {
-                                        v_r * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
-                                            cell,
-                                            poly,
-                                            cell.right,
-                                        )
-                                    } else {
-                                        0.0
-                                    };
-                                    let left = if v_l != 0.0 {
-                                        v_l * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
-                                            cell,
-                                            poly,
-                                            cell.left,
-                                        )
-                                    } else {
-                                        0.0
-                                    };
-                                    right - left
-                                };
-                                let uv = flux(v, &d_u_integrand_poly[u]);
+                                let uv = moving_density_boundary_flux(
+                                    v,
+                                    primary,
+                                    &a_u,
+                                    entry,
+                                    &d_u_integrand_poly[u],
+                                    b,
+                                );
                                 if u == v {
                                     uv
                                 } else {
-                                    uv + flux(u, &d_u_integrand_poly[v])
+                                    uv + moving_density_boundary_flux(
+                                        u,
+                                        primary,
+                                        &a_u,
+                                        entry,
+                                        &d_u_integrand_poly[v],
+                                        b,
+                                    )
                                 }
                             } else {
                                 0.0

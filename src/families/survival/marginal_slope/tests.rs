@@ -2646,8 +2646,12 @@ fn debug_flex_base_hessian_vs_gradient_fd() {
     let gv = 0.4_f64;
     let weight = 0.85_f64;
     let event = 1.0_f64;
-    let beta_h0: Vec<f64> = (0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())).collect();
-    let beta_w0: Vec<f64> = (0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())).collect();
+    let beta_h0: Vec<f64> = (0..h_dim)
+        .map(|k| 0.04 * ((k as f64 + 1.3).sin()))
+        .collect();
+    let beta_w0: Vec<f64> = (0..w_dim)
+        .map(|k| 0.035 * ((k as f64 + 0.7).cos()))
+        .collect();
 
     let make = |g: f64, beta_h: &[f64], beta_w: &[f64]| {
         let family = SurvivalMarginalSlopeFamily {
@@ -2679,11 +2683,26 @@ fn debug_flex_base_hessian_vs_gradient_fd() {
             auto_subsample_last_rho: Arc::new(Mutex::new(None)),
         };
         let bs = vec![
-            ParameterBlockState { beta: Array1::zeros(1), eta: array![0.0] },
-            ParameterBlockState { beta: Array1::zeros(0), eta: array![0.0] },
-            ParameterBlockState { beta: Array1::zeros(0), eta: array![g] },
-            ParameterBlockState { beta: Array1::from(beta_h.to_vec()), eta: array![0.0] },
-            ParameterBlockState { beta: Array1::from(beta_w.to_vec()), eta: array![0.0] },
+            ParameterBlockState {
+                beta: Array1::zeros(1),
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(0),
+                eta: array![g],
+            },
+            ParameterBlockState {
+                beta: Array1::from(beta_h.to_vec()),
+                eta: array![0.0],
+            },
+            ParameterBlockState {
+                beta: Array1::from(beta_w.to_vec()),
+                eta: array![0.0],
+            },
         ];
         (family, bs)
     };
@@ -2729,18 +2748,25 @@ fn debug_flex_base_hessian_vs_gradient_fd() {
     for &(u, name) in &[(g, "g"), (w0, "w0"), (q1, "q1")] {
         eprintln!(
             "BASE-HESS col-g [{name}]: production H[{u},{g}]={:+.8e} fd_grad={:+.8e} gap={:.2e}",
-            hess0[[u, g]], hg[u], (hess0[[u, g]] - hg[u]).abs()
+            hess0[[u, g]],
+            hg[u],
+            (hess0[[u, g]] - hg[u]).abs()
         );
     }
     for &(u, name) in &[(g, "g"), (w0, "w0"), (q1, "q1")] {
         eprintln!(
             "BASE-HESS col-w0 [{name}]: production H[{u},{w0}]={:+.8e} fd_grad={:+.8e} gap={:.2e}",
-            hess0[[u, w0]], hw[u], (hess0[[u, w0]] - hw[u]).abs()
+            hess0[[u, w0]],
+            hw[u],
+            (hess0[[u, w0]] - hw[u]).abs()
         );
     }
     eprintln!(
         "symmetry check: H[g,w0]={:+.8e} H[w0,g]={:+.8e} fd col-g[w0]={:+.8e} fd col-w0[g]={:+.8e}",
-        hess0[[g, w0]], hess0[[w0, g]], hg[w0], hw[g]
+        hess0[[g, w0]],
+        hess0[[w0, g]],
+        hg[w0],
+        hw[g]
     );
 
     // VALUE-FD gradient: differentiate the row NLL scalar VALUE directly to get
@@ -2771,23 +2797,23 @@ fn debug_flex_base_hessian_vs_gradient_fd() {
     };
     eprintln!(
         "VALUE-FD grad[g]: production={:+.8e} fd_value={:+.8e} gap={:.2e}",
-        grad0[g], fd_val_g(2e-3), (grad0[g] - fd_val_g(2e-3)).abs()
+        grad0[g],
+        fd_val_g(2e-3),
+        (grad0[g] - fd_val_g(2e-3)).abs()
     );
     eprintln!(
         "VALUE-FD grad[w0]: production={:+.8e} fd_value={:+.8e} gap={:.2e}",
-        grad0[w0], fd_val_w0(2e-3), (grad0[w0] - fd_val_w0(2e-3)).abs()
+        grad0[w0],
+        fd_val_w0(2e-3),
+        (grad0[w0] - fd_val_w0(2e-3)).abs()
     );
 }
 
-/// gam#932/#979: isolate WHICH logslope (g) first-sensitivity is wrong by
-/// finite-differencing the production exit-timepoint scalars (eta, chi, d) along
-/// g and comparing to production's analytic eta_u[g]/chi_u[g]/d_u[g]. d_u is an
-/// INTEGRAL over the calibration partition whose cell boundaries (link-knot
-/// crossings z=(tau-a)/b) move with b=g; if a Leibniz boundary term is missing,
-/// d_u[g] is wrong while eta_u[g]/chi_u[g] (point-evaluated) are right.
+/// gam#932/#979: the logslope first-sensitivity must include the Leibniz
+/// boundary term for density-normalization cells whose link-knot crossings move
+/// with g.
 #[test]
-#[ignore = "debug logslope first-sensitivity FD probe for #932/#979"]
-fn debug_flex_logslope_first_sensitivity_fd() {
+fn flex_logslope_first_sensitivity_matches_fd() {
     let score_runtime = test_deviation_runtime();
     let link_runtime = test_deviation_runtime();
     let h_dim = score_runtime.basis_dim();
@@ -2799,8 +2825,12 @@ fn debug_flex_logslope_first_sensitivity_fd() {
     let gv = 0.4_f64;
     let weight = 0.85_f64;
     let event = 1.0_f64;
-    let beta_h0: Vec<f64> = (0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())).collect();
-    let beta_w0: Vec<f64> = (0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())).collect();
+    let beta_h0: Vec<f64> = (0..h_dim)
+        .map(|k| 0.04 * ((k as f64 + 1.3).sin()))
+        .collect();
+    let beta_w0: Vec<f64> = (0..w_dim)
+        .map(|k| 0.035 * ((k as f64 + 0.7).cos()))
+        .collect();
 
     let make = |g: f64| {
         let family = SurvivalMarginalSlopeFamily {
@@ -2844,12 +2874,25 @@ fn debug_flex_logslope_first_sensitivity_fd() {
         let fam = make(gg);
         let (a1, d1) = fam
             .solve_row_survival_intercept_with_slot(
-                q1v, gg, Some(&bh), Some(&bw),
+                q1v,
+                gg,
+                Some(&bh),
+                Some(&bw),
                 Some((0, SurvivalInterceptSlotKind::Exit)),
             )
             .expect("exit intercept");
         fam.compute_survival_timepoint_exact(
-            0, &primary, q1v, primary.q1, a1, gg, d1, Some(&bh), Some(&bw), 0.0, true,
+            0,
+            &primary,
+            q1v,
+            primary.q1,
+            a1,
+            gg,
+            d1,
+            Some(&bh),
+            Some(&bw),
+            0.0,
+            true,
         )
         .expect("exit base")
     };
@@ -2859,17 +2902,26 @@ fn debug_flex_logslope_first_sensitivity_fd() {
         let f = (sel(&base_at(gv + h * 0.5)) - sel(&base_at(gv - h * 0.5))) / h;
         (4.0 * f - c) / 3.0
     };
-    eprintln!(
-        "LOGSLOPE-SENS d_u[g]: prod={:+.8e} fd_d={:+.8e} gap={:.2e}",
-        b0.d_u[g], fd(&|b| b.d, 2e-3), (b0.d_u[g] - fd(&|b| b.d, 2e-3)).abs()
+    let fd_d = fd(&|b| b.d, 2e-3);
+    let fd_eta = fd(&|b| b.eta, 2e-3);
+    let fd_chi = fd(&|b| b.chi, 2e-3);
+    assert!(
+        (b0.d_u[g] - fd_d).abs() <= 5e-4 * fd_d.abs().max(1.0),
+        "d_u[g] production={:+.8e} fd={:+.8e}",
+        b0.d_u[g],
+        fd_d
     );
-    eprintln!(
-        "LOGSLOPE-SENS eta_u[g]: prod={:+.8e} fd_eta={:+.8e} gap={:.2e}",
-        b0.eta_u[g], fd(&|b| b.eta, 2e-3), (b0.eta_u[g] - fd(&|b| b.eta, 2e-3)).abs()
+    assert!(
+        (b0.eta_u[g] - fd_eta).abs() <= 5e-4 * fd_eta.abs().max(1.0),
+        "eta_u[g] production={:+.8e} fd={:+.8e}",
+        b0.eta_u[g],
+        fd_eta
     );
-    eprintln!(
-        "LOGSLOPE-SENS chi_u[g]: prod={:+.8e} fd_chi={:+.8e} gap={:.2e}",
-        b0.chi_u[g], fd(&|b| b.chi, 2e-3), (b0.chi_u[g] - fd(&|b| b.chi, 2e-3)).abs()
+    assert!(
+        (b0.chi_u[g] - fd_chi).abs() <= 5e-4 * fd_chi.abs().max(1.0),
+        "chi_u[g] production={:+.8e} fd={:+.8e}",
+        b0.chi_u[g],
+        fd_chi
     );
 }
 
