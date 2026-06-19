@@ -360,8 +360,14 @@ pub(crate) fn joint_setup(
     initial_sigma: Option<f64>,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> ExactJointHyperSetup {
-    let marginal_terms = spatial_length_scale_term_indices(marginalspec);
-    let logslope_terms = spatial_length_scale_term_indices(logslopespec);
+    let (marginal_terms, logslope_terms) = if kappa_options.enabled {
+        (
+            spatial_length_scale_term_indices(marginalspec),
+            spatial_length_scale_term_indices(logslopespec),
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
     let core_len = time_penalties + marginal_penalties + logslope_penalties;
     let rho_dim = core_len + extra_rho0.len();
     let mut rho0vec = Array1::<f64>::zeros(rho_dim);
