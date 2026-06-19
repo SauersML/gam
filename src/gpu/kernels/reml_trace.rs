@@ -647,7 +647,7 @@ where
                 z[i] = rademacher_entry(seed.0, k_idx as u64, i as u64);
             }
             // Solve H w = z by unpreconditioned CG.
-            cg_solve(&mut hvp, &z, &mut w, rel_tol, PCG_HVP_MAX_ITERS);
+            cg_solve(&mut hvp, &z, &mut w, PCG_HVP_REL_TOL, PCG_HVP_MAX_ITERS);
 
             // Reduce q_{j,k} = z^T H_j w for each derivative. Mirrors the
             // dense reference in `evidence_derivatives_hutchinson_cpu`.
@@ -705,11 +705,15 @@ where
         let mut worst_ratio = 0.0_f64;
         for j in 0..d {
             let mean = q_sums[j] / n;
-            // Sample variance (divide-by-N for the population estimator,
-            // matches `reduce_mean_stderr`'s convention used in the dense
-            // path; the K factor in the denominator below converts it to
-            // the standard error of the running mean).
-            let var = (q_sq_sums[j] / n - mean * mean).max(0.0);
+            // Population variance E[X²] − E[X]², then scaled by n/(n−1)
+            // (Bessel's correction) to match `reduce_mean_stderr` which
+            // divides by K−1.  For n=1 the correction is skipped.
+            let var_pop = (q_sq_sums[j] / n - mean * mean).max(0.0);
+            let var = if n > 1.0 {
+                var_pop * n / (n - 1.0)
+            } else {
+                var_pop
+            };
             let s = var.sqrt();
             last_traces[j] = mean;
             last_stderrs[j] = s;
