@@ -1635,6 +1635,7 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
         for &jitter in &jitter_schedule {
             let mut candidate = scaled.clone();
             if jitter > 0.0 {
+                let n = candidate.nrows();
                 for i in 0..n {
                     candidate[[i, i]] += jitter;
                 }
