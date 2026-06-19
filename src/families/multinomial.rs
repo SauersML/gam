@@ -216,7 +216,6 @@ const MULTINOMIAL_OUTER_REML_TOL: f64 = 1e-7;
 /// refit. Keep enough iterations for ordinary interior fits to certify quickly,
 /// but hand slow/non-interior probes to the proper-prior refit promptly.
 const MULTINOMIAL_UNBIASED_PROBE_OUTER_MAX_ITER: usize = 20;
-const MULTINOMIAL_FIRTH_REFIT_OUTER_MAX_ITER: usize = 20;
 
 fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
     let mut best = (0.0_f64, 0usize, 0usize);
@@ -1331,10 +1330,20 @@ pub fn fit_penalized_multinomial_formula(
     unbiased_probe_options.outer_max_iter = unbiased_probe_options
         .outer_max_iter
         .min(MULTINOMIAL_UNBIASED_PROBE_OUTER_MAX_ITER);
-    let mut firth_refit_options = options.clone();
-    firth_refit_options.outer_max_iter = firth_refit_options
-        .outer_max_iter
-        .min(MULTINOMIAL_FIRTH_REFIT_OUTER_MAX_ITER);
+    // The FINAL accepted Firth/Jeffreys refit runs to the caller's full outer
+    // budget: it is the result we ship, so it must reach the genuine REML
+    // optimum, not a truncated iterate. The near-separable penguin refit that
+    // motivated #1082's wall-clock concern is now halted honestly at its true
+    // bound optimum by the KKT-stationary-at-bound guard
+    // (`CostStallGuard`, #1082 / 64711ed82) and the Newton-decrement residual
+    // certificate (363af9b56 / 2c9580b1f): on separable data the outer ARC
+    // certifies and stops early on its own, so no artificial iteration cap is
+    // needed to land in budget. On non-separable data (e.g. the
+    // `vgam_smooth_by_factor` double-penalty arm) the refit needs the caller's
+    // full budget to converge, which a `.min(20)` cap would cut off — accepting
+    // a non-converged fit, which is dishonest. So the refit keeps `options`
+    // unchanged. Only the discarded unbiased separation probe above is capped.
+    let firth_refit_options = &options;
 
     let fit = match fit_custom_family_with_rho_prior(
         &family,
@@ -1366,7 +1375,7 @@ pub fn fit_penalized_multinomial_formula(
             fit_custom_family_with_rho_prior(
                 &firth_family,
                 &blocks,
-                &firth_refit_options,
+                firth_refit_options,
                 crate::types::RhoPrior::Flat,
             )
             .map_err(|err| {
