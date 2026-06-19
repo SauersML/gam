@@ -2261,21 +2261,24 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
 }
 
 #[test]
-#[ignore = "debug FD-localization harness for #932/#979 flex directional third"]
 fn debug_flex_directional_quantities_fd_localize() {
     // FD-localize WHICH directional timepoint quantity (eta_uv_dir / chi_uv_dir
     // / d_uv_dir) disagrees with a central difference of its base counterpart
-    // along `dir`, on the zero-deviation rigid fixture where the exit timepoint
-    // depends only on (q1, g). Prints per-quantity, per-(u,v) absolute gaps.
+    // along `dir`. Fixture is aligned to
+    // `flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation`
+    // so the printed per-(u,v) gaps map directly onto the failing third[g,w0]
+    // (contract g). Prints per-quantity, per-(u,v) absolute gaps. Pure
+    // diagnostic: no assertions, so it is always green; read --nocapture
+    // stderr for the localization.
     let score_runtime = test_deviation_runtime();
     let link_runtime = test_deviation_runtime();
     let event = 1.0_f64;
-    let weight = 0.75_f64;
-    let z_row = -0.2_f64;
-    let q0v = -0.4_f64;
-    let q1v = 0.6_f64;
-    let qd1v = 0.85_f64;
-    let gv = 0.32_f64;
+    let weight = 0.85_f64;
+    let z_row = 0.3_f64;
+    let q0v = -0.25_f64;
+    let q1v = 0.7_f64;
+    let qd1v = 0.9_f64;
+    let gv = 0.4_f64;
 
     let family = SurvivalMarginalSlopeFamily {
         n: 1,
