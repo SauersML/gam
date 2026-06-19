@@ -680,6 +680,92 @@ pub(crate) fn thin_plate_radial_reparam_from_constrained_penalty(
     Ok((evecs.select(Axis(1), &keep), evals.select(Axis(0), &keep)))
 }
 
+/// Thin-plate radial reparameterization in the **realized data metric** (#1347).
+///
+/// The penalty is the polyharmonic bending energy `Ω_c = Zᵀ K_CC Z` (the RKHS
+/// reproducing-norm Gram on the constrained kernel coefficients). gam's old
+/// reparam eigendecomposed `Ω_c` alone, laying its raw eigenvalues on the
+/// penalty diagonal. But the constraint `Z` has already quotiented out the
+/// `{1, x}` polynomial null space, so `Ω_c` is full-rank with a smooth Mercer
+/// tail and **no cliff** — its smallest eigenvalues are genuine low-curvature
+/// bending directions that nonetheless carry large variance over the data.
+/// Under a single REML `λ` those near-null modes cost almost nothing yet absorb
+/// EDF freely, over-fitting near-linear data (mean EDF ≈ 5.3 vs mgcv ≈ 2.1).
+///
+/// mgcv's TPRS instead penalizes bending energy **relative to the realized
+/// design metric** — equivalently it solves the generalized eigenproblem
+///
+/// ```text
+///   Ω_c v = μ G_c v ,   G_c = (K Z)ᵀ (K Z)
+/// ```
+///
+/// where `G_c` is the Gram of the realized constrained kernel design columns.
+/// The eigenvalue `μ = (vᵀ Ω_c v)/(vᵀ G_c v)` is curvature per unit
+/// data-variance: it spreads the spectrum the way mgcv's does (top mode, a
+/// `0.77` second mode, then a clean geometric cliff to the tail), so a single
+/// `λ` can no longer buy near-free wiggle. The returned eigenvectors `V` are
+/// `G_c`-orthonormal (`Vᵀ G_c V = I`), so the rotated design `K Z V` has an
+/// identity Gram and the penalty is exactly `diag(μ) = Vᵀ Ω_c V` — which the
+/// frozen-replay / length-scale paths already recover via `diag(Vᵀ Ω_c V)`, so
+/// no downstream change is needed. The model space `span(K Z V) = span(K Z)` is
+/// unchanged (`V` is invertible), preserving full nonlinear capacity.
+pub(crate) fn thin_plate_radial_reparam_data_metric(
+    omega_constrained: &Array2<f64>,
+    design_gram: &Array2<f64>,
+) -> Result<(Array2<f64>, Array1<f64>), BasisError> {
+    let k = omega_constrained.nrows();
+    if k != omega_constrained.ncols() || design_gram.nrows() != k || design_gram.ncols() != k {
+        crate::bail_dim_basis!(
+            "thin-plate data-metric reparam requires square k×k Ω_c and G_c: Ω_c={:?}, G_c={:?}",
+            omega_constrained.dim(),
+            design_gram.dim()
+        );
+    }
+    if k == 0 {
+        return Ok((Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0)));
+    }
+    // Whiten by G_c: G_c = U_g D_g U_gᵀ ; W = U_g D_g^{-1/2} (drop near-null G_c
+    // directions, which are design columns with no realized data support).
+    let g_sym = symmetrize_penalty(design_gram);
+    let (g_evals, g_evecs) = FaerEigh::eigh(&g_sym, Side::Lower).map_err(BasisError::LinalgError)?;
+    let gmax = g_evals.iter().copied().fold(0.0_f64, |a, b| a.max(b.abs()));
+    if !gmax.is_finite() || gmax <= 0.0 {
+        // Degenerate design Gram: fall back to the plain bending eigenbasis.
+        return thin_plate_radial_reparam_from_constrained_penalty(omega_constrained);
+    }
+    let g_floor = (k as f64) * f64::EPSILON * gmax;
+    let mut cols: Vec<usize> = Vec::with_capacity(k);
+    for j in 0..k {
+        if g_evals[j] > g_floor {
+            cols.push(j);
+        }
+    }
+    let m = cols.len();
+    if m == 0 {
+        return thin_plate_radial_reparam_from_constrained_penalty(omega_constrained);
+    }
+    let mut w = Array2::<f64>::zeros((k, m));
+    for (c, &j) in cols.iter().enumerate() {
+        let inv_sqrt = 1.0 / g_evals[j].sqrt();
+        for i in 0..k {
+            w[[i, c]] = g_evecs[[i, j]] * inv_sqrt;
+        }
+    }
+    // M = Wᵀ Ω_c W (m×m), eig(M) = (μ, P). Generalized eigenvectors V = W P.
+    let omega_sym = symmetrize_penalty(omega_constrained);
+    let wt_omega = fast_atb(&w, &omega_sym);
+    let m_mat = symmetrize_penalty(&fast_ab(&wt_omega, &w));
+    let (mut mu, p_mat) = FaerEigh::eigh(&m_mat, Side::Lower).map_err(BasisError::LinalgError)?;
+    for value in mu.iter_mut() {
+        if *value < 0.0 {
+            *value = 0.0;
+        }
+    }
+    let v_full = fast_ab(&w, &p_mat); // k×m, G_c-orthonormal columns
+    let keep = thin_plate_retained_radial_indices(&mu);
+    Ok((v_full.select(Axis(1), &keep), mu.select(Axis(0), &keep)))
+}
+
 pub(crate) fn thin_plate_radial_reparam_from_centers(
     centers: ArrayView2<'_, f64>,
     length_scale: f64,
@@ -1274,7 +1360,12 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
     } else if constrained_kernel_cols == 0 {
         (Array2::<f64>::zeros((0, 0)), Array1::<f64>::zeros(0))
     } else {
-        thin_plate_radial_reparam_from_constrained_penalty(&omega_constrained)?
+        // #1347: reparameterize in the realized data metric so the bending
+        // spectrum acquires mgcv's cliff (curvature per unit data-variance),
+        // rather than the cliff-less raw knot-Gram spectrum that lets REML buy
+        // near-free wiggle on near-linear data. G_c = (K Z)ᵀ (K Z).
+        let design_gram = symmetrize_penalty(&fast_atb(&kernel_constrained, &kernel_constrained));
+        thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?
     };
     let kernel_cols = radial_eigvals.len();
     let total_cols = kernel_cols + poly_cols;
