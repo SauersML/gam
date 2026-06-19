@@ -133,7 +133,7 @@ jobs:
             # distro binary snapshot lacks resolves from source instead of failing
             # as "not available for this version of R".
             options(repos = c(POSIT = posit, CRAN = "https://cloud.r-project.org"))
-            pkgs <- c("mgcv","survival","gamlss","gamlss.dist","gamlss.cens",
+            pkgs <- c("mgcv","survival","gamlss","gamlss.data","gamlss.dist","gamlss.cens",
                       "flexsurv","rstpm2","VGAM","nnet","MASS","ordinal","betareg",
                       "scam","splines2","cmprsk","lme4","nlme","fields","gss","GpGp",
                       "gsl","quantreg","mlt","tram","basefun","loo","jsonlite",
@@ -154,6 +154,21 @@ jobs:
                 try(install.packages(p, type = "source",
                                      repos = "https://cloud.r-project.org"), silent=TRUE)
             }
+            # These are required by the always-on stack verification below. Do
+            # not let a swallowed install error defer the failure until the
+            # load-check step, where the real CRAN/source-build error is gone.
+            core <- c("mgcv","survival","gamlss","gamlss.data","gamlss.dist")
+            core_missing <- core[!vapply(core, requireNamespace, logical(1), quietly=TRUE)]
+            if (length(core_missing)) {
+              cat("installing required R refs explicitly:",
+                  paste(core_missing, collapse=", "), "\n")
+              install.packages(core_missing, dependencies = TRUE,
+                               repos = "https://cloud.r-project.org")
+            }
+            core_missing <- core[!vapply(core, requireNamespace, logical(1), quietly=TRUE)]
+            if (length(core_missing))
+              stop("required R reference packages still missing: ",
+                   paste(core_missing, collapse=", "))
             cat("installed R packages:\n")
             for (p in pkgs) cat(sprintf("  %-14s %s\n", p, requireNamespace(p, quietly=TRUE)))
           '
