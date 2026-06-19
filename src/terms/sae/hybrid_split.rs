@@ -498,7 +498,7 @@ where
         // `build_atom_candidates` falls back to the proxy.
         let coords_col = coords
             .view()
-            .into_shape((coords.len(), 1))
+            .into_shape_with_order((coords.len(), 1))
             .ok()
             .map(|v| v.to_owned());
         let curved_phi = match (atom.basis_evaluator.as_ref(), coords_col.as_ref()) {

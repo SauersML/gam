@@ -6765,7 +6765,6 @@ fn build_single_local_smooth_term(
         .collect::<Vec<_>>();
     let use_box_reparam =
         term.shape != ShapeConstraint::None && shape_uses_box_reparameterization(&term.basis);
-    let mut coefficient_transform_for_constraints: Option<Array2<f64>> = None;
     if let Some((order, sign)) = shape_order_and_sign(term.shape)
         && use_box_reparam
     {
@@ -6811,7 +6810,6 @@ fn build_single_local_smooth_term(
         } else {
             cumulative_sum_transform_matrix(p_local, order, sign)
         };
-        coefficient_transform_for_constraints = Some(t.clone());
         // Coefficient-side transform: wrap the design in an operator that
         // applies T on the coefficient side, preserving sparsity/operator
         // structure of the inner design.
