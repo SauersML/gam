@@ -94,19 +94,6 @@ pub struct DenseSpectralOperator {
 }
 
 impl DenseSpectralOperator {
-    pub fn reg_eigenvalue(&self, k: usize) -> f64 {
-        self.reg_eigenvalues[k]
-    }
-    pub fn eigenvector_entry(&self, i: usize, k: usize) -> f64 {
-        self.eigenvectors[[i, k]]
-    }
-    /// Whether eigenpair `k` is active in the operator's logdet, traces,
-    /// and solves. Under `PseudoLogdetMode::Smooth` this is always `true`;
-    /// under `HardPseudo` it is `false` when `σ_k ≤ ε`.
-    pub fn eigenpair_active(&self, k: usize) -> bool {
-        self.active_mask[k]
-    }
-
     /// Create from a symmetric matrix (may be indefinite or singular).
     ///
     /// The eigendecomposition is computed once. Eigenvalues are smoothly

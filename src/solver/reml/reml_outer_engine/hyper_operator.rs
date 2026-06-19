@@ -12,12 +12,6 @@ pub(crate) fn as_weighted(op: &dyn HyperOperator) -> Option<&WeightedHyperOperat
     op.as_any().downcast_ref::<WeightedHyperOperator>()
 }
 
-pub(crate) fn as_sparse_directional(
-    op: &dyn HyperOperator,
-) -> Option<&SparseDirectionalHyperOperator> {
-    op.as_any().downcast_ref::<SparseDirectionalHyperOperator>()
-}
-
 pub(crate) trait DriftDerivTraceExt {
     fn trace_logdet(&self, hop: &dyn HessianOperator) -> f64;
 
