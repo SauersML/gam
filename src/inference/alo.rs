@@ -374,18 +374,26 @@ fn compute_alo_diagnostics_from_pirls_impl(
     compute_alo_diagnostics_from_pirls_inner(base, y, link).map_err(EstimationError::from)
 }
 
-/// True when the fitted GLM uses its canonical link, so that the row NLL score
-/// and curvature satisfy `ℓ_i'(η) = c_i(μ(η)−y_i)` and `ℓ_i''(η) = c_i μ'(η)`
+/// True when the fitted GLM uses a *curved* canonical link, so that the row NLL
+/// score and curvature satisfy `ℓ_i'(η) = c_i(μ(η)−y_i)` and `ℓ_i''(η) = c_i μ'(η)`
 /// with a single per-row scale `c_i = (prior weight)/φ`. This is the exact
 /// condition under which the frozen-curvature ALO scalar fixed point matches
 /// the leave-`i`-out refit; only these families enable the exact refinement.
-fn alo_link_is_canonical(likelihood: &crate::types::GlmLikelihoodSpec) -> bool {
+///
+/// Gaussian identity is canonical too, but its per-row curvature is *constant*
+/// (`μ'(η) ≡ 1`), so the classical Sherman–Morrison one-step ALO is already the
+/// exact frozen-Hessian leave-`i`-out solution. Routing it through the scalar
+/// Newton closure would only add an O(n) nonlinear solve to diagnostics and
+/// quality sweeps without changing the answer, so it is excluded here and falls
+/// back to the (exact, for this family) one-step formula.
+fn alo_link_needs_exact_curvature_refinement(
+    likelihood: &crate::types::GlmLikelihoodSpec,
+) -> bool {
     use crate::types::ResponseFamily;
     matches!(
         (&likelihood.spec.response, likelihood.link_function()),
         (ResponseFamily::Binomial, LinkFunction::Logit)
             | (ResponseFamily::Poisson, LinkFunction::Log)
-            | (ResponseFamily::Gaussian, LinkFunction::Identity)
     )
 }
 
@@ -459,7 +467,8 @@ fn compute_alo_diagnostics_from_pirls_inner(
     // (saturated / near-separation) get c_i = NaN, which makes the exact solver
     // reject that row explicitly rather than substituting the classical one-step
     // ALO.
-    let canonical_scale: Option<Array1<f64>> = if alo_link_is_canonical(&base.likelihood) {
+    let canonical_scale: Option<Array1<f64>> =
+        if alo_link_needs_exact_curvature_refinement(&base.likelihood) {
         let mut c = Array1::<f64>::zeros(n);
         for i in 0..n {
             let dmu = base.solve_dmu_deta[i];
