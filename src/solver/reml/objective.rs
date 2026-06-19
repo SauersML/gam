@@ -1166,9 +1166,7 @@ impl<'a> RemlState<'a> {
         // Poisson / Gamma / SAS / GAMLSS noise blocks / …) gets the intrinsic
         // object unconditionally.
         let (hessian_logdet_correction, penalty_subspace_trace) =
-            if matches!(hessian_mode, PseudoLogdetMode::Smooth)
-                && (c_nontrivial || std::env::var_os("DIAG1347_INTRINSIC").is_some())
-            {
+            if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 let (log_det_h_plus, kernel) =
                     Self::intrinsic_hessian_pseudo_logdet_parts(h_for_operator.as_ref())?;
                 (
@@ -1489,9 +1487,7 @@ impl<'a> RemlState<'a> {
         // was the wrong object, and why `tr(H_pen⁺ Ḣ)` is exact for every
         // drift including moving-subspace ψ directions).
         let (hessian_logdet_correction, penalty_subspace_trace) =
-            if matches!(hessian_mode, PseudoLogdetMode::Smooth)
-                && (c_nontrivial || std::env::var_os("DIAG1347_INTRINSIC").is_some())
-            {
+            if matches!(hessian_mode, PseudoLogdetMode::Smooth) && c_nontrivial {
                 let (log_det_h_plus, kernel) =
                     Self::intrinsic_hessian_pseudo_logdet_parts(&h_total_original)?;
                 (

@@ -774,42 +774,10 @@ where
         // caller pins `init_rhos`, the outer search is warm-started there and
         // the seed is the requested operating point, so report it verbatim
         // rather than the optimizer's (possibly clamped) returned rho.
-        let mut accepted_rho = heuristic_lambdas
+        let accepted_rho = heuristic_lambdas
             .filter(|h| h.len() == k)
             .map(|h| Array1::from_iter(h.iter().copied()))
             .unwrap_or_else(|| strategy_result.rho.clone());
-        // DIAGNOSTIC ONLY (#1347): clamp ONLY axis 0 (the radial bending penalty)
-        // to a forced value, leaving the nullspace-ridge axis at its REML optimum,
-        // to read the radial EDF gam produces at a fixed radial lambda.
-        if let Ok(v) = std::env::var("DIAG1347_FIXRHO0") {
-            if let Ok(val) = v.parse::<f64>() {
-                if !accepted_rho.is_empty() {
-                    accepted_rho[0] = val;
-                    eprintln!("[DIAG1347_FIXRHO0] axis0 forced to {val}, rest={:?}", accepted_rho.iter().skip(1).collect::<Vec<_>>());
-                }
-            }
-        }
-        if let Ok(v) = std::env::var("DIAG1347_FIXRHO") {
-            if let Ok(val) = v.parse::<f64>() {
-                accepted_rho.fill(val);
-            }
-        }
-        if std::env::var_os("DIAG1347_COSTGRID").is_some() {
-            // gam REML cost over a grid of axis-0 (radial) rho, holding the other
-            // axes at the accepted optimum. Reveals where gam's REML truly minimizes.
-            let base = accepted_rho.clone();
-            let mut line = String::from("[DIAG1347_COSTGRID] axis0 rho->cost:");
-            for r0 in [3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0] {
-                let mut probe = base.clone();
-                if !probe.is_empty() {
-                    probe[0] = r0;
-                }
-                let c = reml_state.compute_cost(&probe).unwrap_or(f64::NAN);
-                line.push_str(&format!(" {r0}={c:.4}"));
-            }
-            eprintln!("{line}");
-            eprintln!("[DIAG1347_COSTGRID] accepted_rho={:?}", accepted_rho.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>());
-        }
         (
             accepted_rho,
             cfg.link_kind.mixture_state().cloned(),
@@ -1122,18 +1090,7 @@ where
             &outer_result.rho,
             RemlInnerCapGuardArm::MixtureSas,
         )?;
-        let final_rho = {
-            let mut fr = outer_result.rho.slice(s![..k]).to_owned();
-            // DIAGNOSTIC ONLY (#1347): clamp every rho axis to a fixed value to
-            // read off the EDF gam produces at a forced (e.g. mgcv-matching) lambda.
-            if let Ok(v) = std::env::var("DIAG1347_FIXRHO") {
-                if let Ok(val) = v.parse::<f64>() {
-                    fr.fill(val);
-                    eprintln!("[DIAG1347_FIXRHO] forcing all rho axes to {val}");
-                }
-            }
-            fr
-        };
+        let final_rho = outer_result.rho.slice(s![..k]).to_owned();
         let final_mix_state = if use_mixture {
             let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
             Some(

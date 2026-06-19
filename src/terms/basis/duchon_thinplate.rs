@@ -1149,18 +1149,6 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
         let zt_o = fast_atb(&z, &omega);
         symmetrize_penalty(&fast_ab(&zt_o, &z))
     };
-    if std::env::var_os("DIAG1347").is_some() {
-        if let Ok((ev, _)) = FaerEigh::eigh(&omega_constrained, Side::Lower) {
-            let mut sv: Vec<f64> = ev.iter().copied().collect();
-            sv.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-            let knot_min = knots.column(0).iter().copied().fold(f64::INFINITY, f64::min);
-            let knot_max = knots.column(0).iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            eprintln!(
-                "[DIAG1347] d={d} k={k} length_scale={length_scale:.4e} knot_span=[{knot_min:.4},{knot_max:.4}] omega_constrained_eigs(desc)={:?}",
-                sv.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>()
-            );
-        }
-    }
     let omega_psd = validate_psd_penalty(
         &omega_constrained,
         &format!("thin_plate bending penalty (dimension={d})"),
