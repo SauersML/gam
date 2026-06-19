@@ -221,10 +221,11 @@ const MULTINOMIAL_UNBIASED_PROBE_OUTER_MAX_ITER: usize = 20;
 /// boundary-overfit surface or switching to Firth bias on finite data.
 const MULTINOMIAL_FORMULA_MIN_LAMBDA: f64 = 2.0e-4;
 
-/// Sparse minority classes need a stronger lower λ floor: with fewer rows in a
-/// class, the softmax Fisher surface is less able to calibrate boundary-hugging
-/// smooths on held-out data. Better-supported classes keep the lower floor so
-/// the fit remains flexible enough to recover the separating boundary.
+/// Sparse minority classes need a stronger lower lambda floor: with fewer rows
+/// in a class, the softmax Fisher surface is less able to calibrate
+/// boundary-hugging smooths on held-out data. Better-supported classes keep the
+/// lower floor so the fit remains flexible enough to recover the separating
+/// boundary.
 const MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_COUNT: f64 = 50.0;
 const MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA: f64 = 1.0e-3;
 
