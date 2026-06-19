@@ -758,10 +758,19 @@ fn emit_python_penalty_manifest(manifest_dir: &Path) -> std::io::Result<()> {
         output.push_str("    },\n");
     }
     output.push_str(")\n");
-    fs::write(
-        manifest_dir.join("gamfit").join("_penalties_manifest.py"),
-        output,
-    )
+    // Write ONLY when the content actually changed. This file is declared as a
+    // `cargo:rerun-if-changed` input, so unconditionally rewriting it on every
+    // build advances its mtime and makes cargo mark `gam` Dirty on the NEXT
+    // build ("the file `gamfit/_penalties_manifest.py` has changed") — forcing a
+    // full recompile even with no source change. The content guard breaks that
+    // self-invalidation loop (mirrors the ban-history ledger writer).
+    let manifest_path = manifest_dir.join("gamfit").join("_penalties_manifest.py");
+    if let Ok(existing) = fs::read_to_string(&manifest_path) {
+        if existing == output {
+            return Ok(());
+        }
+    }
+    fs::write(manifest_path, output)
 }
 
 fn penalty_manifest_source_for_type(registry: &str, rust_type: &str) -> std::io::Result<String> {
