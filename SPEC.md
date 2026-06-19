@@ -33,3 +33,4 @@ stricter than the public docs because they guide implementation choices.
 - Large changes are acceptable when they materially improve the code.
 - XFAIL tests are not allowed. A failing test should always indicate
   problematic behavior.
+- The goal of this project is never to copy existing reference implementations.
