@@ -447,6 +447,23 @@ pub fn compile_with_dual_metric(
         let w_s = &scaled_s[idx];
         let p_b = w_h.ncols();
 
+        // A zero-width block owns no raw columns, so it cannot alias against any
+        // anchor and is trivially identifiable. Emit an empty compiled block and
+        // skip the structural/curvature passes: their residual Grams are 0×0 and
+        // yield no positive eigenspace, which the `anchor_h.ncols() == 0`
+        // first-block guards below would otherwise mis-report as `FullyAliased`
+        // even though there is nothing to alias. This mirrors the empty block a
+        // fully-absorbed later block compiles to, with no demotions to record
+        // (there are no columns) and no change to the running anchors.
+        if p_b == 0 {
+            compiled.push(CompiledBlock {
+                t_lw: Array2::<f64>::zeros((0, 0)),
+                anchor_correction: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
+                r_lw: Some(Array2::<f64>::zeros((raw_anchor_h.ncols(), 0))),
+            });
+            continue;
+        }
+
         // Pass 1 (structural): residualise W^S_b against cumulative
         // structural anchor; eigendecompose the structural residual Gram
         // and keep only directions with non-zero structural mass → D
@@ -1243,6 +1260,20 @@ pub fn compile_from_raw_grams(
 
     for (idx, range_b) in raw_block_ranges.iter().enumerate() {
         let p_b = range_b.end - range_b.start;
+        // A zero-width block owns no raw columns. It contributes no compiled
+        // degrees of freedom and — having no columns — cannot alias against any
+        // anchor, so it is trivially identifiable. Emit an empty compiled range
+        // and skip the structural/curvature analysis: a 0×0 residual Gram has no
+        // positive eigenspace, which the first-block guard below would otherwise
+        // mis-report as `FullyAliased` even though there is literally nothing to
+        // alias. This mirrors the empty range a fully-absorbed later block
+        // already compiles to (see the `q_plus.ncols() == 0` / `u_mat.ncols() == 0`
+        // branches), keeping `kept_width + dropped_count == raw_width` exact.
+        if p_b == 0 {
+            let at = t_cum.ncols();
+            compiled_block_ranges.push(at..at);
+            continue;
+        }
         // Slice gram columns/rows by raw block range. P_bᵀ K X = rows
         // range_b of K X. K^S T and K^H T are full-rows products.
         // 1) Structural rank step.
@@ -2764,6 +2795,40 @@ mod tests {
                 .all(|v| v.abs() <= 1.0e-12),
             "zero-width block must not retain raw coefficient directions in T"
         );
+    }
+
+    /// A zero-width *first* block has no columns to alias and must compile to
+    /// an empty range with the remaining blocks intact — not abort with
+    /// `FullyAliased`. Regression for the survival location-scale lognormal AFT
+    /// pre-fit channel-aware audit, whose `time_transform` block collapses to
+    /// zero free coefficients under the parametric AFT reduction and previously
+    /// crashed the fit ("block of width 0 has zero structural span").
+    #[test]
+    fn compile_from_raw_grams_zero_width_first_block_is_identifiable() {
+        let n = 12;
+        let empty = Array2::<f64>::zeros((n, 0));
+        let b =
+            Array2::from_shape_fn((n, 2), |(i, j)| ((i + 1) as f64 * (j + 1) as f64 * 0.23).cos());
+        let w = Array1::ones(n);
+        let (gram_h, gram_struct, raw_ranges) = scalar_grams_two_block(&empty, &b, &w);
+        let map = compile_from_raw_grams(
+            &gram_h,
+            &gram_struct,
+            &raw_ranges,
+            &[BlockOrder::Marginal, BlockOrder::Logslope],
+        )
+        .expect("zero-width first block must be trivially identifiable, not FullyAliased");
+        assert_eq!(
+            map.compiled_block_ranges[0].len(),
+            0,
+            "empty first block keeps zero columns"
+        );
+        assert_eq!(
+            map.compiled_block_ranges[1].len(),
+            2,
+            "the second block keeps its full structural rank"
+        );
+        assert_eq!(map.raw_from_compiled.dim(), (2, 2));
     }
 
     #[test]
