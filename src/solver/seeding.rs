@@ -621,21 +621,17 @@ where
     if n_smooths <= 6 {
         // Per-axis refinement around the best isotropic point. The ±3 steps
         // resolve a mild per-coordinate imbalance; the explicit saturation
-        // target (`bnds.1`, the over-smoothing upper bound) reaches the corner
-        // where ONE penalty is fully active while the others stay at the
-        // refined anchor. That asymmetric corner is the correct REML optimum
-        // for a double-penalty (Marra–Wood null-space shrinkage) smooth whose
-        // signal lives in one penalty's null space (gam#1266): the wiggliness
-        // penalty must saturate (its range block → 0 EDF) while the null-space
-        // ridge stays low (retain the supported trend). The isotropic grid only
-        // moves all coordinates together, so without a per-axis saturation
-        // probe this corner is unreachable and the outer EFS, started from the
-        // best diagonal seed, stalls at an under-penalized λ and inflates EDF.
-        // Probing it here is criterion-ranked — it is only adopted when it
-        // strictly lowers the true REML/LAML cost — so it can never displace a
-        // genuinely better interior optimum, and it leaves single-penalty and
-        // well-balanced fits byte-identical (the saturated candidate simply
-        // loses the comparison).
+        // target (`bnds.1`, the over-smoothing upper bound) reaches asymmetric
+        // corners where selected penalty blocks are fully active while the
+        // others stay at the refined anchor. Those corners are load-bearing for
+        // double-penalty (Marra-Wood null-space shrinkage) smooths (#1266): an
+        // unsupported term must be allowed to send BOTH its wiggliness and
+        // null-space coordinates high, while a supported sibling term remains
+        // free. The isotropic grid only moves all coordinates together, so it
+        // cannot express "shrink s(z), keep s(x)". Probing these corners is
+        // criterion-ranked — a candidate is adopted only when it strictly lowers
+        // the true REML/LAML cost — so a genuinely better interior optimum or
+        // supported smooth simply wins the comparison.
         let saturation = clamp_to_bounds(bnds.1, bnds);
         for axis in 0..n_smooths {
             let anchor = best_seed.clone();
@@ -656,6 +652,19 @@ where
                     best_cost = Some(c);
                     best_seed = candidate;
                 }
+            }
+        }
+        for start in 0..n_smooths.saturating_sub(1) {
+            let anchor = best_seed.clone();
+            let mut candidate = anchor;
+            candidate[start] = saturation;
+            candidate[start + 1] = saturation;
+            if let Some(c) = eval_cost(&candidate)
+                && c.is_finite()
+                && best_cost.map(|b| c < b).unwrap_or(true)
+            {
+                best_cost = Some(c);
+                best_seed = candidate;
             }
         }
     }
@@ -737,6 +746,17 @@ mod tests {
             retreat_idx <= 2,
             "retreat seed should be available before broader exploratory seeds: {retreat_idx}"
         );
+    }
+
+    #[test]
+    fn objective_grid_can_seed_adjacent_pair_oversmoothing_corner() {
+        let base = Array1::zeros(4);
+        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 4, |rho| {
+            let supported_cost = 0.1 * (rho[0].powi(2) + rho[1].powi(2));
+            let unsupported_gap = (rho[2] - 12.0).powi(2) + (rho[3] - 12.0).powi(2);
+            Some(supported_cost + unsupported_gap)
+        });
+        assert_eq!(selected.to_vec(), vec![0.0, 0.0, 12.0, 12.0]);
     }
 
     #[test]
