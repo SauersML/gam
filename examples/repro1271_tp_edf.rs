@@ -60,6 +60,27 @@ fn main() {
             inf.edf_by_block,
             fit.fit.lambdas.to_vec(),
         );
+        if seed == 1 {
+            // Penalty spectrum (the diagonal radial-eigenvalue penalty for tp).
+            for bp in &fit.design.penalties {
+                let s = &bp.local;
+                let (rows, cols) = s.dim();
+                if rows == cols && rows > 1 {
+                    let mut diag: Vec<f64> = (0..rows).map(|i| s[[i, i]]).collect();
+                    diag.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                    println!("  [spectrum] block {:?} dim={rows} diag(desc)={:?}", bp.col_range,
+                        diag.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>());
+                }
+            }
+            // Per-coefficient EDF = diag of the influence (hat) matrix in coef space.
+            if let Some(infl) = inf.coefficient_influence.as_ref() {
+                let p = infl.nrows().min(infl.ncols());
+                let per: Vec<f64> = (0..p).map(|i| infl[[i, i]]).collect();
+                let total: f64 = per.iter().sum();
+                println!("  [per-coef-edf] sum={total:.4} diag={:?}",
+                    per.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>());
+            }
+        }
     }
     let mean = edfs.iter().sum::<f64>() / edfs.len() as f64;
     println!("EDF mean = {mean:.4}  (mgcv ~= 2.10)");
