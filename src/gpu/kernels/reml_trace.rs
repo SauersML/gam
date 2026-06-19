@@ -626,18 +626,23 @@ where
     let mut z = vec![0.0_f64; p];
     let mut w = vec![0.0_f64; p];
 
-    // Per-derivative running sums of q and q² for online mean / SE.
-    let mut q_sums = vec![0.0_f64; d];
-    let mut q_sq_sums = vec![0.0_f64; d];
+    // Per-derivative Welford accumulators (running mean and sum-of-squared
+    // deviations M2) for a numerically stable online mean / sample variance.
+    // The naive one-pass form E[q²] − E[q]² catastrophically cancels when the
+    // per-probe q cluster far from zero with small spread — exactly the
+    // near-converged regime the stopping rule cares about — so we track M2
+    // directly to match the two-pass `reduce_mean_stderr` without that loss.
+    let mut q_means = vec![0.0_f64; d];
+    let mut q_m2 = vec![0.0_f64; d];
 
     for &k_target in &SCHEDULE {
         // Re-run from scratch at each schedule step — CRN guarantees the
         // first min(K_prev, K_target) probes are bit-identical, so the
         // estimator is monotone in expectation across schedule extensions.
-        for s in q_sums.iter_mut() {
+        for s in q_means.iter_mut() {
             *s = 0.0;
         }
-        for s in q_sq_sums.iter_mut() {
+        for s in q_m2.iter_mut() {
             *s = 0.0;
         }
 
@@ -696,24 +701,23 @@ where
                         acc
                     }
                 };
-                q_sums[j] += q;
-                q_sq_sums[j] += q * q;
+                // Welford update with the 1-based probe count (k_idx + 1).
+                let count = (k_idx + 1) as f64;
+                let delta = q - q_means[j];
+                q_means[j] += delta / count;
+                let delta2 = q - q_means[j];
+                q_m2[j] += delta * delta2;
             }
         }
 
         let n = k_target as f64;
         let mut worst_ratio = 0.0_f64;
         for j in 0..d {
-            let mean = q_sums[j] / n;
-            // Population variance E[X²] − E[X]², then scaled by n/(n−1)
-            // (Bessel's correction) to match `reduce_mean_stderr` which
-            // divides by K−1.  For n=1 the correction is skipped.
-            let var_pop = (q_sq_sums[j] / n - mean * mean).max(0.0);
-            let var = if n > 1.0 {
-                var_pop * n / (n - 1.0)
-            } else {
-                var_pop
-            };
+            let mean = q_means[j];
+            // Sample variance M2 / (K−1) — Bessel's correction, matching the
+            // two-pass `reduce_mean_stderr` exactly (no one-pass cancellation).
+            // For K = 1 there is no spread to estimate, so the variance is 0.
+            let var = if n > 1.0 { q_m2[j] / (n - 1.0) } else { 0.0 };
             let s = var.sqrt();
             last_traces[j] = mean;
             last_stderrs[j] = s;
@@ -2009,6 +2013,67 @@ mod tests {
         );
         // logdet is intentionally NaN on the HVP path.
         assert!(hvp_evidence.logdet_hessian.is_nan());
+    }
+
+    #[test]
+    fn block_2_7_hvp_stderr_matches_dense_reduce_mean_stderr() {
+        // The HVP path's `stderrs` must use the SAME estimator convention as
+        // the dense path's `reduce_mean_stderr`: the Bessel-corrected (K−1)
+        // sample standard deviation of the per-probe q values. We force both
+        // paths to run the full K=128 schedule (rel_tol below any achievable
+        // ratio) so the comparison is at identical probe counts on identical
+        // CRN probes. The only residual difference is the inner solve (exact
+        // Cholesky vs CG@1e-6), which keeps the q values — and hence the SDs —
+        // agreeing to a tight relative tolerance.
+        let p = 36;
+        let h = make_spd(p, 0.6);
+        let a = random_dense_sym(p, 0x5151);
+        let seed = ProbeSeed(0xBEEF);
+        let force_full_schedule = 1e-12_f64;
+
+        let dense = evidence_traces_adaptive(
+            h.view(),
+            vec![DerivativeHessian::Dense(a.view())],
+            None,
+            seed,
+            force_full_schedule,
+            HUTCHINSON_ADAPTIVE_TAU_REL,
+        )
+        .expect("dense ok");
+
+        let h_clone = h.clone();
+        let hvp = evidence_traces_adaptive_hvp(
+            p,
+            |v: &[f64], out: &mut [f64]| {
+                for r in 0..p {
+                    let mut acc = 0.0_f64;
+                    for c in 0..p {
+                        acc += h_clone[[r, c]] * v[c];
+                    }
+                    out[r] = acc;
+                }
+            },
+            vec![DerivativeHessian::Dense(a.view())],
+            None,
+            seed,
+            force_full_schedule,
+            HUTCHINSON_ADAPTIVE_TAU_REL,
+        )
+        .expect("hvp ok");
+
+        // Both ran the full schedule, so probe counts match exactly.
+        assert_eq!(dense.probe_count, 128);
+        assert_eq!(hvp.probe_count, dense.probe_count);
+
+        let sd_dense = dense.stderrs[0];
+        let sd_hvp = hvp.stderrs[0];
+        assert!(sd_dense > 0.0, "dense SD should be positive, got {sd_dense}");
+        let rel = (sd_hvp - sd_dense).abs() / sd_dense;
+        assert!(
+            rel <= 1e-3,
+            "HVP SD {sd_hvp} disagrees with dense reduce_mean_stderr SD {sd_dense} \
+             (rel {rel}); the two paths must share the Bessel-corrected (K−1) convention"
+        );
     }
 
     #[test]
