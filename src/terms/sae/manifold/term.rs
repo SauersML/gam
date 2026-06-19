@@ -23,35 +23,6 @@ pub(crate) const SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR: f64 = 1.0e-8;
 /// Matches the `1e-9` relative rank cutoff used across the codebase.
 pub(crate) const SAE_DECODER_BETA_NULL_RELATIVE_FLOOR: f64 = 1.0e-9;
 
-/// Largest decoder (`β`) block dimension for which the outer-gradient
-/// conditioning path may additionally probe the β coordinate basis for a
-/// near-null subspace of the joint Hessian (issue #1051, #1095).
-///
-/// The closed-form gauge orbit ([`SaeManifoldTerm::dense_step_gauge_vectors`])
-/// only covers the *chart* reparametrisation freedom (constant + linear
-/// coordinate fields). It does NOT cover a **rank-deficient decoder design** —
-/// e.g. a euclidean-1D atom fit to a straight line in a `p = 2` ambient leaves
-/// the decoder column space rank-1, so one decoder direction is unidentified by
-/// the data and the joint Hessian acquires a near-null direction that lives in
-/// the β block, not the gauge orbit. That direction is exactly a Faddeev-Popov
-/// gauge of the *same* kind (a flat direction of the evidence quotient), so it
-/// is deflated identically — but only after the β basis is admitted as a
-/// deflation candidate. The dense `k×k` Rayleigh eigendecomposition that
-/// resolves it is `O(k³)`, so it is gated to moderate β blocks; large-`p`
-/// LLM-scale fits keep the pure gauge-orbit path untouched (they reach low
-/// decoder rank through the Grassmann frame, which reduces the border width
-/// from `M·p` to `M·r` where `r ≪ p`, so `k ≤ M·r` is always small). PCA-
-/// reduced fits (p ≈ 32–128) with the Grassmann frame active can have
-/// `k = M·r` up to ~512 (e.g. m=8 basis fns, p=32, r=8 → k=64, but for
-/// m=16 → k=128, m=32 → k=256); 512 covers all typical small-atom PCA cases
-/// while keeping the O(k³) cost ≈ 0.13B ops — negligible next to the solve.
-///
-/// #1273: the outer-gradient deflation no longer probes the raw unit-β basis
-/// (it now uses the penalty-aware `decoder_beta_null_directions`), so this
-/// dimension cap is retained for the documented contract / other call sites.
-#[allow(dead_code)]
-pub(crate) const SAE_OUTER_GRADIENT_BETA_NULL_PROBE_MAX_DIM: usize = 512;
-
 /// Nominal curvature-homotopy `η` step (#1007): the tracker covers `η ∈ [0, 1]`
 /// in this many equal predictor-corrector waypoints when the branch is clean.
 /// Five waypoints is a few corrector solves — far cheaper than the multi-seed
