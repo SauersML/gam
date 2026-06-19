@@ -6464,6 +6464,36 @@ pub trait BlockExcessTarget {
             (excess, None)
         }
     }
+
+    /// Batched [`Self::excess_with_displaced_neg_score`] over many whitened
+    /// draws at once.
+    ///
+    /// `draws` holds one draw per COLUMN (shape `block_dim() × n_draws`); the
+    /// returned vector has one `(excess, Option<displaced_neg_score>)` entry per
+    /// column, in column order, EXACTLY matching a per-column call to
+    /// [`Self::excess_with_displaced_neg_score`]. The only thing batching is
+    /// allowed to change is HOW the shared linear algebra is computed (a single
+    /// BLAS-3 matrix–matrix product over all columns instead of `n_draws`
+    /// separate matrix–vector products), never WHAT is computed: the per-draw
+    /// excess, feasibility verdict, and per-row score must be the same values
+    /// the serial path produces (to floating-point reassociation tolerance).
+    ///
+    /// The default impl preserves the per-column behavior exactly; the GLM
+    /// implementor overrides it to share the `X · V_b` and `X · Δ` products
+    /// across all draws (#784 hot path, #1082).
+    fn excess_with_displaced_neg_score_batch(
+        &self,
+        draws: &Array2<f64>,
+    ) -> Vec<(f64, Option<Array1<f64>>)> {
+        let n_draws = draws.ncols();
+        let mut out = Vec::with_capacity(n_draws);
+        let mut t = Array1::<f64>::zeros(draws.nrows());
+        for s in 0..n_draws {
+            t.assign(&draws.column(s));
+            out.push(self.excess_with_displaced_neg_score(&t));
+        }
+        out
+    }
 }
 
 /// Self-normalized importance-weighted moments of the per-draw gradient
@@ -6718,15 +6748,27 @@ pub fn block_sampled_marginal_correction<T: BlockExcessTarget>(
     let mut e_tt_acc = Array2::<f64>::zeros((m, m));
     let mut e_ngs_acc = Array1::<f64>::zeros(n_obs);
     let mut e_t_ngs_acc = Array2::<f64>::zeros((n_obs, m));
-    let mut t = Array1::<f64>::zeros(m);
-    for _ in 0..n_draws {
+
+    // Pre-generate ALL whitened draws into the columns of `draws` (m × n_draws)
+    // in the EXACT same RNG order as the serial loop (draw 0: r=0..m, draw 1:
+    // r=0..m, …). The per-draw design matvec `s = X_t·(V_b·t_s)` is then batched
+    // into two BLAS-3 products over all columns at once (the #1082 hot path),
+    // instead of n_draws separate BLAS-2 matvecs — the draws, seed, budget, and
+    // importance weights are byte-for-byte unchanged; only the matvecs are
+    // reassociated into a GEMM.
+    let mut draws = Array2::<f64>::zeros((m, n_draws));
+    for s in 0..n_draws {
+        let mut col = draws.column_mut(s);
         for r in 0..m {
             let z = sample_standard_normal(&mut rng);
-            t[r] = z * inv_sqrt_lambda[r];
+            col[r] = z * inv_sqrt_lambda[r];
         }
-        // Fused: one design matvec + one inverse-link jet sweep yields both the
-        // excess (weight) and the displaced per-row score (moment channels).
-        let (excess, displaced_ngs) = target.excess_with_displaced_neg_score(&t);
+    }
+    let batched = target.excess_with_displaced_neg_score_batch(&draws);
+
+    let mut t = Array1::<f64>::zeros(m);
+    for (sidx, (excess, displaced_ngs)) in batched.into_iter().enumerate() {
+        t.assign(&draws.column(sidx));
         if !excess.is_finite() {
             continue;
         }

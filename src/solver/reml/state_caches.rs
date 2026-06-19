@@ -2054,4 +2054,117 @@ impl crate::inference::hmc::BlockExcessTarget for Gam784BlockTarget<'_> {
             (excess, None)
         }
     }
+
+    /// Batched excess + displaced score over all importance draws (#784/#1082
+    /// hot path). The per-draw cost of [`Self::excess_with_displaced_neg_score`]
+    /// is dominated by the design matvec `s = X_t · δ` (O(n·p)), repeated
+    /// `n_draws` times (up to 4096). Those matvecs share the SAME design `X_t`
+    /// and the SAME block frame `V_b`, so they batch into two dense matrix–matrix
+    /// products (BLAS-3) instead of `n_draws` matrix–vector products (BLAS-2):
+    ///
+    /// ```text
+    ///   Δ = V_b · T            (p × n_draws)   T = draws (m × n_draws)
+    ///   S = X_t · Δ            (n × n_draws)   one big GEMM, the win
+    /// ```
+    ///
+    /// Column `s` of `S` is exactly `fast_av(X_t, V_b · t_s)` — the same vector
+    /// the serial path forms — and everything downstream (the inverse-link jet
+    /// sweep, deviance, penalty-score and curvature terms) is then computed
+    /// per-column with byte-for-byte the same arithmetic as the serial
+    /// `excess_with_displaced_neg_score`. Only the matvec→GEMM reassociation can
+    /// perturb `S` (faer reduces the inner `p`-sum the same way per output
+    /// element regardless of the RHS column count, so this is at the level of
+    /// floating-point reassociation, not a different estimator).
+    fn excess_with_displaced_neg_score_batch(
+        &self,
+        draws: &Array2<f64>,
+    ) -> Vec<(f64, Option<Array1<f64>>)> {
+        let m = self.block_lambdas.len();
+        let n = self.eta_hat.len();
+        let n_draws = draws.ncols();
+        debug_assert_eq!(draws.nrows(), m);
+
+        // δ-columns: Δ = V_b · T  (p × n_draws). Cheap (O(p·m·n_draws)) and kept
+        // identical to the serial `block_vecs.dot(t)` per column.
+        let delta_all = crate::faer_ndarray::fast_ab(&self.block_vecs, draws);
+        // s-columns: S = X_t · Δ  (n × n_draws). THE batched matvec — one GEMM
+        // replacing `n_draws` separate `fast_av(x_transformed, δ_s)` calls.
+        let s_all = crate::faer_ndarray::fast_ab(self.x_transformed, &delta_all);
+
+        // Family constants mirrored from `excess_with_displaced_neg_score`.
+        let spec_response = reml_spec(&self.likelihood).response.clone();
+        let family = pirls::weight_family_for_glm_likelihood(&self.likelihood);
+        let fam_scale = match &spec_response {
+            ResponseFamily::Gaussian | ResponseFamily::Tweedie { .. } => {
+                1.0 / self.likelihood.fixed_phi().unwrap_or(1.0)
+            }
+            _ => 1.0,
+        };
+        const BINOMIAL_MU_EPS: f64 = 1e-12;
+        const MU_FLOOR: f64 = 1e-10;
+        let is_binomial = matches!(spec_response, ResponseFamily::Binomial);
+
+        let mut out = Vec::with_capacity(n_draws);
+        let mut mu_disp = Array1::<f64>::zeros(n);
+        let mut ngs = Array1::<f64>::zeros(n);
+        let mut delta = Array1::<f64>::zeros(self.block_vecs.nrows());
+        'draw: for sidx in 0..n_draws {
+            let s_col = s_all.column(sidx);
+            ngs.fill(0.0);
+            // One jet sweep at η̂ + s, identical to the serial fused path.
+            for i in 0..n {
+                let eta_i = self.eta_hat[i] + s_col[i];
+                let jet = match crate::mixture_link::inverse_link_jet_for_inverse_link(
+                    &self.inverse_link,
+                    eta_i,
+                ) {
+                    Ok(jet) => jet,
+                    Err(_) => {
+                        out.push((f64::INFINITY, None));
+                        continue 'draw;
+                    }
+                };
+                mu_disp[i] = jet.mu;
+                let mu_c = if is_binomial {
+                    jet.mu.clamp(BINOMIAL_MU_EPS, 1.0 - BINOMIAL_MU_EPS)
+                } else {
+                    jet.mu.max(MU_FLOOR)
+                };
+                let v = pirls::variance_jet_for_weight_family(family, mu_c).v;
+                if v.is_finite() && v > 0.0 {
+                    let d_dev_d_mu =
+                        -2.0 * self.prior_weights[i] * (self.y[i] - mu_c) / v * fam_scale;
+                    ngs[i] = d_dev_d_mu * jet.d1 / (2.0 * self.phi);
+                }
+            }
+
+            let dev_disp = crate::pirls::calculate_deviance(
+                self.y.view(),
+                &mu_disp,
+                &self.likelihood,
+                self.prior_weights.view(),
+            );
+            if !dev_disp.is_finite() {
+                out.push((f64::INFINITY, None));
+                continue;
+            }
+            let neg_loglik_diff = (dev_disp - self.base_deviance) / (2.0 * self.phi);
+            delta.assign(&delta_all.column(sidx));
+            let mut penalty_term = 0.0_f64;
+            for (score, &lam) in self.penalty_scores.iter().zip(self.lambdas.iter()) {
+                penalty_term += lam * score.dot(&delta);
+            }
+            let mut curv = 0.0_f64;
+            for i in 0..n {
+                curv += self.weights_obs[i] * s_col[i] * s_col[i];
+            }
+            let excess = neg_loglik_diff + penalty_term - 0.5 * curv;
+            if excess.is_finite() {
+                out.push((excess, Some(ngs.clone())));
+            } else {
+                out.push((excess, None));
+            }
+        }
+        out
+    }
 }

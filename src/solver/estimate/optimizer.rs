@@ -1485,32 +1485,6 @@ where
         outer_result.final_grad_norm.unwrap_or(0.0)
     };
 
-    if std::env::var_os("DIAG1271_RHO").is_some() {
-        // Probe the REML objective at the selected rho and at rho shifted toward
-        // heavier smoothing along every axis. If V decreases as rho grows, the
-        // optimizer did NOT reach the heavy-smoothing minimum (selection bug);
-        // if V increases, gam is genuinely at its REML optimum (model/criterion
-        // differs from mgcv, not a selection failure).
-        let v_at = |r: &Array1<f64>| -> f64 {
-            reml_state.compute_cost(r).unwrap_or(f64::NAN)
-        };
-        let v0 = v_at(&final_rho);
-        eprintln!(
-            "[DIAG1271_RHO] final_rho={:?} grad_norm={finalgrad_norm:.3e} V(rho)={v0:.6}",
-            final_rho.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>()
-        );
-        // Shift ONLY axis 0 (the radial bending penalty), holding others fixed,
-        // to isolate whether heavier radial smoothing lowers the REML cost.
-        for axis in 0..final_rho.len() {
-            let mut line = format!("[DIAG1271_RHO]   axis{axis}: ");
-            for d in [1.0, 2.0, 4.0, 8.0] {
-                let mut shifted = final_rho.clone();
-                shifted[axis] += d;
-                line.push_str(&format!(" V(+{d})={:.4}", v_at(&shifted)));
-            }
-            eprintln!("{line}");
-        }
-    }
 
     if opts.compute_inference {
         penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
