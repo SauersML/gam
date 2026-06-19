@@ -1942,7 +1942,7 @@ pub(crate) fn fit_survival_transformation_model(
             // plain quadratic `λ βᵀSβ`; a non-zero centering would need an offset
             // the survival PenaltyBlock does not model, so such blocks are left to
             // the ridge rather than mis-applied.
-            for cov_penalty in &covariate_design.penalties {
+            for (penalty_idx, cov_penalty) in covariate_design.penalties.iter().enumerate() {
                 let cr = &cov_penalty.col_range;
                 let block_dim = cr.end - cr.start;
                 let matches_dims = cov_penalty.local.nrows() == block_dim
@@ -1956,7 +1956,11 @@ pub(crate) fn fit_survival_transformation_model(
                         matrix: cov_penalty.local.clone(),
                         lambda: 1e-2,
                         range: (p_time_total + cr.start)..(p_time_total + cr.end),
-                        nullspace_dim: 0,
+                        nullspace_dim: covariate_design
+                            .nullspace_dims
+                            .get(penalty_idx)
+                            .copied()
+                            .unwrap_or(0),
                     });
                 }
             }
