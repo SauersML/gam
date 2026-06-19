@@ -215,6 +215,12 @@ const MULTINOMIAL_OUTER_REML_TOL: f64 = 1e-7;
 /// but hand slow/non-interior probes to the proper-prior refit promptly.
 const MULTINOMIAL_UNBIASED_PROBE_OUTER_MAX_ITER: usize = 20;
 
+/// Formula-path smoothing parameters below this level are effectively at the
+/// zero-penalty boundary for the penguin-scale multinomial fixtures. Treat that
+/// as separation/overfit evidence and use the Firth refit rather than accepting
+/// a collapsed unbiased surface with poor held-out calibration.
+const MULTINOMIAL_FORMULA_LAMBDA_COLLAPSE_FLOOR: f64 = 1.0e-4;
+
 fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
     let mut best = (0.0_f64, 0usize, 0usize);
     for ((row, active_class), &value) in eta.indexed_iter() {
@@ -310,6 +316,27 @@ fn multinomial_formula_separation_evidence(block_states: &[ParameterBlockState])
         }
     }
     None
+}
+
+fn multinomial_formula_lambda_collapse_evidence(
+    fit: &crate::model_types::UnifiedFitResult,
+) -> Option<String> {
+    let mut min_lambda = f64::INFINITY;
+    let mut min_at = 0usize;
+    for (idx, &lambda) in fit.lambdas.iter().enumerate() {
+        if !lambda.is_finite() {
+            return Some(format!("non-finite smoothing parameter lambda[{idx}] = {lambda}"));
+        }
+        if lambda < min_lambda {
+            min_lambda = lambda;
+            min_at = idx;
+        }
+    }
+    (min_lambda < MULTINOMIAL_FORMULA_LAMBDA_COLLAPSE_FLOOR).then(|| {
+        format!(
+            "collapsed smoothing parameter lambda[{min_at}] = {min_lambda:.6e} < {MULTINOMIAL_FORMULA_LAMBDA_COLLAPSE_FLOOR:.1e}"
+        )
+    })
 }
 
 /// Inputs to [`fit_penalized_multinomial`].
@@ -1352,12 +1379,14 @@ pub fn fit_penalized_multinomial_formula(
         Ok(unbiased_fit)
             if unbiased_fit.outer_converged
                 && multinomial_formula_separation_evidence(&unbiased_fit.block_states)
-                    .is_none() =>
+                    .is_none()
+                && multinomial_formula_lambda_collapse_evidence(&unbiased_fit).is_none() =>
         {
             unbiased_fit
         }
         Ok(unresolved_fit)
-            if multinomial_formula_separation_evidence(&unresolved_fit.block_states).is_none() =>
+            if multinomial_formula_separation_evidence(&unresolved_fit.block_states).is_none()
+                && multinomial_formula_lambda_collapse_evidence(&unresolved_fit).is_none() =>
         {
             match fit_custom_family_with_rho_prior(
                 &family,
@@ -1370,7 +1399,9 @@ pub fn fit_penalized_multinomial_formula(
                         && multinomial_formula_separation_evidence(
                             &full_unbiased_fit.block_states,
                         )
-                        .is_none() =>
+                        .is_none()
+                        && multinomial_formula_lambda_collapse_evidence(&full_unbiased_fit)
+                            .is_none() =>
                 {
                     full_unbiased_fit
                 }
@@ -1379,6 +1410,7 @@ pub fn fit_penalized_multinomial_formula(
                         Ok(full_fit) => multinomial_formula_separation_evidence(
                             &full_fit.block_states,
                         )
+                        .or_else(|| multinomial_formula_lambda_collapse_evidence(full_fit))
                         .unwrap_or_else(|| {
                             format!(
                                 "full unbiased-criterion REML solve did not converge after {} outer iterations",
@@ -1398,6 +1430,7 @@ pub fn fit_penalized_multinomial_formula(
                 Ok(unresolved_fit) => multinomial_formula_separation_evidence(
                     &unresolved_fit.block_states,
                 )
+                .or_else(|| multinomial_formula_lambda_collapse_evidence(unresolved_fit))
                 .unwrap_or_else(|| {
                     format!(
                         "unbiased-criterion REML probe did not converge after {} outer iterations",
