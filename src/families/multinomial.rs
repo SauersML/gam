@@ -210,7 +210,7 @@ const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
 const MULTINOMIAL_OUTER_REML_TOL: f64 = 1e-7;
 
 /// The first multinomial formula solve is a separation probe: it is accepted
-/// when the unbiased REML criterion returns a finite interior iterate.
+/// when the unbiased REML criterion converges to a finite interior iterate.
 /// Near-separable data such as the penguin fixture otherwise spend the caller's
 /// full outer budget on an iterate that is discarded before the Firth/Jeffreys
 /// refit. Keep enough iterations for ordinary interior fits to certify quickly,
@@ -1315,7 +1315,7 @@ pub fn fit_penalized_multinomial_formula(
     };
     // ── Conditional Firth/Jeffreys engagement (#715 arm (b) / #753) ──────────
     // Attempt 1: the unbiased criterion (Jeffreys disarmed above). If the
-    // returned mode is finite and interior, it is the exact penalized-REML
+    // returned mode is converged, finite, and interior, it is the exact penalized-REML
     // optimum with zero Firth bias — accept it (this is the synthetic-arm /
     // interior-data path, #715 arm (a)). If the solve FAILS (e.g. the
     // (quasi-)separated penguins geometry where `(H + S_λ)v ≈ 0` along
@@ -1343,16 +1343,23 @@ pub fn fit_penalized_multinomial_formula(
         crate::types::RhoPrior::Flat,
     ) {
         Ok(unbiased_fit)
-            if multinomial_formula_separation_evidence(&unbiased_fit.block_states).is_none() =>
+            if unbiased_fit.outer_converged
+                && multinomial_formula_separation_evidence(&unbiased_fit.block_states)
+                    .is_none() =>
         {
             unbiased_fit
         }
         first_attempt => {
             let evidence = match &first_attempt {
-                Ok(saturated_fit) => {
-                    multinomial_formula_separation_evidence(&saturated_fit.block_states)
-                        .expect("non-interior arm is only reachable with separation evidence")
-                }
+                Ok(unresolved_fit) => multinomial_formula_separation_evidence(
+                    &unresolved_fit.block_states,
+                )
+                .unwrap_or_else(|| {
+                    format!(
+                        "unbiased-criterion REML probe did not converge after {} outer iterations",
+                        unresolved_fit.outer_iterations
+                    )
+                }),
                 Err(err) => format!("unbiased-criterion REML solve failed: {err}"),
             };
             let firth_family = family.clone().with_joint_jeffreys_term(true);
