@@ -579,12 +579,13 @@ fn detection_falls_through_for_ineligible_shapes() {
     let data = encode_xy(&x, &y);
     let cfg = gaussian_config();
 
-    // Default s(x) carries the double (null-space shrinkage) penalty — a
-    // different posterior from the pure λ∫f″² spline, so it must NOT route.
+    // Default s(x) carries the double (null-space shrinkage) penalty, but for
+    // this lone Gaussian 1-D spline the exact scan owns the diffuse polynomial
+    // null space directly and is the canonical route (#1266).
     let default_s = fit_spline_scan_from_formula("y ~ s(x)", &data, &cfg).expect("materialize");
     assert!(
-        default_s.is_none(),
-        "double-penalty default s(x) must fall through to the dense path"
+        default_s.is_some(),
+        "double-penalty default s(x) must route through the exact scan"
     );
 
     // Extra parametric term ⇒ not the single-smooth problem.

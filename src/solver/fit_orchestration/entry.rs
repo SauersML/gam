@@ -606,12 +606,11 @@ fn fit_expectile_laws(
 ///   dims;
 /// - the term collection is exactly one smooth term — no linear terms, no
 ///   random effects, no by-variables / factor interactions;
-/// - that smooth is a plain 1-D cubic (degree 3) B-spline with a single
-///   order-2 penalty (`double_penalty=false` — the default `s(x)` adds a
-///   second null-space shrinkage penalty, which the scan's diffuse `{1, x}`
-///   null space deliberately does NOT shrink, so it is not the same
-///   posterior and is excluded), open (non-cyclic) boundary, free endpoint
-///   conditions, and no shape constraint;
+/// - that smooth is a plain 1-D B-spline whose penalty order is compatible
+///   with the exact scan. `double_penalty=true` is accepted for this structural
+///   shape: the scan owns the canonical diffuse polynomial null space directly
+///   instead of materializing the extra null-space shrinkage block that drives
+///   the dense/sparse two-rho EDF inflation in #1266;
 /// - the offset is identically zero and every weight is finite and positive;
 /// - at least 3 distinct finite abscissae (the scan's diffuse rank plus one).
 ///
@@ -684,7 +683,6 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
     let order = bspec.penalty_order;
     if !(1..=3).contains(&order)
         || bspec.degree != 2 * order - 1
-        || bspec.double_penalty
         || !bspec.boundary_conditions.is_free()
         || !matches!(bspec.boundary, crate::basis::OneDimensionalBoundary::Open)
         || matches!(
