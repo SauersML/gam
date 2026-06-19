@@ -61,7 +61,21 @@ impl BinomialLocationScaleWiggleFamily {
         &self,
         block_states: &'a [ParameterBlockState],
     ) -> Result<(usize, &'a Array1<f64>, &'a Array1<f64>, &'a Array1<f64>), String> {
-        let (n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
+        validate_block_count::<GamlssError>(
+            "BinomialLocationScaleWiggleFamily",
+            3,
+            block_states.len(),
+        )?;
+        let n = self.y.len();
+        let eta_t = &block_states[Self::BLOCK_T].eta;
+        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
+        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
+        if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
+            return Err(GamlssError::DimensionMismatch {
+                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
+            }
+            .into());
+        }
         Ok((n, eta_t, eta_ls, etaw))
     }
 
