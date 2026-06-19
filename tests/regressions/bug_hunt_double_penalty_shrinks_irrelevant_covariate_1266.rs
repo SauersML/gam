@@ -35,7 +35,7 @@ use rand_distr::{Distribution, Normal, Uniform};
 /// signal whatsoever, so a `select = TRUE` smooth on it must shrink out.
 fn irrelevant_covariate_dataset(seed: u64, n: usize) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
-    let unit = Uniform::new(0.0, 1.0).expect("uniform");
+    let unit = Uniform::new(0.0_f64, 1.0).expect("uniform");
     let noise = Normal::new(0.0, 0.3).expect("normal");
     let rows: Vec<StringRecord> = (0..n)
         .map(|_| {
