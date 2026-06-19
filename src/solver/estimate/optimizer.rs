@@ -1485,6 +1485,27 @@ where
         outer_result.final_grad_norm.unwrap_or(0.0)
     };
 
+    if std::env::var_os("DIAG1271_RHO").is_some() {
+        // Probe the REML objective at the selected rho and at rho shifted toward
+        // heavier smoothing along every axis. If V decreases as rho grows, the
+        // optimizer did NOT reach the heavy-smoothing minimum (selection bug);
+        // if V increases, gam is genuinely at its REML optimum (model/criterion
+        // differs from mgcv, not a selection failure).
+        let v_at = |r: &Array1<f64>| -> f64 {
+            reml_state.compute_cost(r).unwrap_or(f64::NAN)
+        };
+        let v0 = v_at(&final_rho);
+        let mut probe = String::new();
+        for d in [1.0, 2.0, 4.0, 8.0, 16.0] {
+            let shifted = &final_rho + d;
+            probe.push_str(&format!(" V(rho+{d})={:.6}", v_at(&shifted)));
+        }
+        eprintln!(
+            "[DIAG1271_RHO] final_rho={:?} grad_norm={finalgrad_norm:.3e} V(rho)={v0:.6}{probe}",
+            final_rho.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>()
+        );
+    }
+
     if opts.compute_inference {
         penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
         let p_cov = penalized_hessian.nrows();
