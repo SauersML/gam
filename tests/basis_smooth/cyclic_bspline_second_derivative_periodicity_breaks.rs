@@ -24,14 +24,24 @@ fn cyclic_bspline_second_derivative_periodicity_breaks() {
         Array1::from_iter((0..total_knots).map(|i| start + (i as f64 - degree as f64) * h_knot));
 
     // Interior modeling domain of the open basis: [knots[degree], knots[num_basis]].
+    // gam clamps the eval point to this interval (constant extension outside), so
+    // the open-knot value is constant — and hence the first derivative is exactly
+    // zero — in the exterior boundary spans (gam#1348). The first derivative is
+    // therefore DISCONTINUOUS at `left`/`right`, so a central difference of the
+    // first derivative is only well posed when both straddle points `tt ± fd_h`
+    // stay strictly inside `[left, right]`. Inset the evaluation grid by a few
+    // `fd_h` so the FD never crosses the boundary discontinuity; this still pins
+    // the analytic second derivative to a finite difference of the first
+    // derivative across the entire interior, including every interior knot.
+    let fd_h = 1e-5;
     let left = knots[degree];
     let right = knots[num_basis];
+    let inset = 10.0 * fd_h;
+    let lo = left + inset;
+    let hi = right - inset;
     let n = 121usize;
-    let tt = Array1::from_iter(
-        (0..n).map(|i| left + (right - left) * (i as f64) / ((n - 1) as f64)),
-    );
+    let tt = Array1::from_iter((0..n).map(|i| lo + (hi - lo) * (i as f64) / ((n - 1) as f64)));
 
-    let fd_h = 1e-5;
     let tt_plus = tt.mapv(|v| v + fd_h);
     let tt_minus = tt.mapv(|v| v - fd_h);
 
