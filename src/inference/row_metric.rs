@@ -172,6 +172,29 @@ impl RowMetric {
         Self::from_factors(MetricProvenance::OutputFisher { rank }, u, p, rank, 0.0)
     }
 
+    /// Downstream-influence output-Fisher metric: per-row factors `U_n ∈
+    /// ℝ^{p × rank}` whose `M_n = U_n U_nᵀ` is the aggregated output Fisher of
+    /// position `n` over the **future** positions it reaches through the KV path
+    /// ([`MetricProvenance::OutputFisherDownstream`], #980 mechanism 2). The
+    /// factor layout is identical to [`Self::output_fisher`]; only the
+    /// provenance tag (and hence the scientific reading) differs. Whitens
+    /// nothing, drives the gauge / lens / enrichment exactly as the
+    /// same-position metric does — the consuming machinery is provenance-generic
+    /// (see [`Self::is_output_fisher_like`]).
+    pub fn output_fisher_downstream(
+        u: Arc<Array2<f64>>,
+        p: usize,
+        rank: usize,
+    ) -> Result<Self, String> {
+        Self::from_factors(
+            MetricProvenance::OutputFisherDownstream { rank },
+            u,
+            p,
+            rank,
+            0.0,
+        )
+    }
+
     /// Like [`Self::output_fisher`] but with a **solver-only** Tikhonov floor
     /// `δ ≥ 0`. The floor is recorded for solver helpers only; every
     /// criterion-facing method (`quad_form`, `whiten_residual`, `fisher_mass`)

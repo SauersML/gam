@@ -823,6 +823,41 @@ pub(crate) fn spectral_map_symmetric(
     Ok(fast_abt(&fast_ab(&evecs, &diag), &evecs))
 }
 
+/// Thin singular value decomposition of a tall matrix `Y` (`n × k`, `n ≥ k`)
+/// via the symmetric eigendecomposition of the small `k × k` Gram matrix
+/// `YᵀY = V Σ² Vᵀ`: returns `(U, σ, V)` with `Y = U diag(σ) Vᵀ`, where `U` is
+/// `n × k` with orthonormal columns spanning `range(Y)`, `σ` holds the singular
+/// values, and `V` is `k × k` orthogonal. Forming the Gram keeps the
+/// eigenproblem at the small dimension `k`; the two products that carry the
+/// large ambient dimension `n` (`YᵀY` and `U = Y V Σ⁻¹`) are GPU-dispatched.
+///
+/// A numerically-zero singular value (`σ ≤ GEOMETRY_EPS`) leaves the
+/// corresponding `U` column zero rather than dividing through. Callers that
+/// require full rank (e.g. [`polar_factor`]) reject it, while callers for which
+/// a rank-deficient input is admissible (the Grassmann/Stiefel geodesic, where
+/// a zero singular value is a vanishing principal angle) keep the zero column.
+pub(crate) fn thin_svd_gram(
+    y: &Array2<f64>,
+) -> GeometryResult<(Array2<f64>, Array1<f64>, Array2<f64>)> {
+    use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+    let (n, k) = y.dim();
+    let gram = fast_atb(y, y);
+    let (evals, v) = jacobi_symmetric(&gram)?;
+    let yv = fast_ab(y, &v);
+    let mut sigma = Array1::<f64>::zeros(k);
+    let mut u = Array2::<f64>::zeros((n, k));
+    for j in 0..k {
+        sigma[j] = evals[j].max(0.0).sqrt();
+        if sigma[j] > GEOMETRY_EPS {
+            let inv_sigma = 1.0 / sigma[j];
+            for i in 0..n {
+                u[[i, j]] = yv[[i, j]] * inv_sigma;
+            }
+        }
+    }
+    Ok((u, sigma, v))
+}
+
 /// Frobenius-nearest matrix with orthonormal columns: the orthogonal factor `U`
 /// of the polar decomposition `Y = U P`, with `UᵀU = Iₖ` and `P` symmetric
 /// positive-definite. For a tall `Y` (`n × k`, `n ≥ k`) this is
@@ -833,10 +868,12 @@ pub(crate) fn spectral_map_symmetric(
 /// genuine nearest point, unlike the QR retraction `qf(Y)`, which only agrees
 /// to first order.
 ///
-/// `(YᵀY)^{-1/2}` is formed from the symmetric spectral map of the `k × k` Gram
-/// matrix. A non-positive Gram eigenvalue means `Y` has rank `< k`, where the
-/// nearest orthonormal frame is not unique; that is surfaced as a
-/// [`GeometryError::Singular`] rather than returning an arbitrary frame.
+/// Computed as `U Vᵀ` from the thin SVD `Y = U Σ Vᵀ` ([`thin_svd_gram`]), which
+/// equals `Y (YᵀY)^{-1/2}` and shares the Gram eigendecomposition with the
+/// geodesic SVD. A non-positive Gram eigenvalue (`σ² ≤ GEOMETRY_EPS`) means `Y`
+/// has rank `< k`, where the nearest orthonormal frame is not unique; that is
+/// surfaced as a [`GeometryError::Singular`] rather than returning an arbitrary
+/// frame.
 pub(crate) fn polar_factor(y: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     let (n, k) = y.dim();
     if n < k {
@@ -849,17 +886,13 @@ pub(crate) fn polar_factor(y: &Array2<f64>) -> GeometryResult<Array2<f64>> {
             "polar factor requires finite entries",
         ));
     }
-    let gram = y.t().dot(y);
-    let inv_sqrt = spectral_map_symmetric(&gram, |lam| {
-        if !lam.is_finite() || lam <= GEOMETRY_EPS {
-            Err(GeometryError::Singular(
-                "polar factor is undefined for a rank-deficient matrix",
-            ))
-        } else {
-            Ok(1.0 / lam.sqrt())
-        }
-    })?;
-    Ok(y.dot(&inv_sqrt))
+    let (u, sigma, v) = thin_svd_gram(y)?;
+    if !sigma.iter().all(|&s| s * s > GEOMETRY_EPS) {
+        return Err(GeometryError::Singular(
+            "polar factor is undefined for a rank-deficient matrix",
+        ));
+    }
+    Ok(u.dot(&v.t()))
 }
 
 /// Dense matrix exponential `exp(A)` via scaling-and-squaring with a truncated

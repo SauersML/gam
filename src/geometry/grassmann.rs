@@ -3,6 +3,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use crate::geometry::manifold::{
     GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten,
     from_flat, identity, inverse, jacobi_symmetric, projected_standard_basis_tangent, qr_thin,
+    thin_svd_gram,
 };
 use crate::geometry::sphere::SphereManifold;
 
@@ -51,31 +52,6 @@ impl GrassmannManifold {
         (self.k == 1).then(|| SphereManifold::new(self.n - 1))
     }
 
-    fn compact_svd_from_tangent(
-        &self,
-        tangent: &Array2<f64>,
-    ) -> GeometryResult<(Array2<f64>, Array1<f64>, Array2<f64>)> {
-        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
-        // ΔᵀΔ (k×n · n×k) and the left singular vectors U = Δ·V·Σ⁻¹ (n×k · k×k)
-        // both carry the large ambient dimension n; GPU-dispatch via fast_atb/ab.
-        let gram = fast_atb(tangent, tangent);
-        let (evals, v) = jacobi_symmetric(&gram)?;
-        let mut sigma = Array1::<f64>::zeros(self.k);
-        // U = Δ·V first (n×k), then scale each column j by 1/σ_j (skipping the
-        // numerically-zero singular values, exactly as the per-column form did).
-        let tangent_v = fast_ab(tangent, &v);
-        let mut u = Array2::<f64>::zeros((self.n, self.k));
-        for j in 0..self.k {
-            sigma[j] = evals[j].max(0.0).sqrt();
-            if sigma[j] > GEOMETRY_EPS {
-                let inv_sigma = 1.0 / sigma[j];
-                for i in 0..self.n {
-                    u[[i, j]] = tangent_v[[i, j]] * inv_sigma;
-                }
-            }
-        }
-        Ok((u, sigma, v))
-    }
 }
 
 impl RiemannianManifold for GrassmannManifold {
@@ -106,7 +82,7 @@ impl RiemannianManifold for GrassmannManifold {
             self.n,
             self.k,
         )?;
-        let (u, sigma, v) = self.compact_svd_from_tangent(&tangent)?;
+        let (u, sigma, v) = thin_svd_gram(&tangent)?;
         let mut cos_d = Array2::<f64>::zeros((self.k, self.k));
         let mut sin_d = Array2::<f64>::zeros((self.k, self.k));
         for i in 0..self.k {
@@ -257,7 +233,7 @@ impl RiemannianManifold for GrassmannManifold {
         let to = point_along.row(point_along.nrows() - 1);
         let y = from_flat(from, self.n, self.k)?;
         let direction = from_flat(self.log_map(from, to)?.view(), self.n, self.k)?;
-        let (u, sigma, v) = self.compact_svd_from_tangent(&direction)?;
+        let (u, sigma, v) = thin_svd_gram(&direction)?;
         let h = from_flat(self.project_tangent(from, vec)?.view(), self.n, self.k)?;
 
         let mut cos_d = Array2::<f64>::zeros((self.k, self.k));

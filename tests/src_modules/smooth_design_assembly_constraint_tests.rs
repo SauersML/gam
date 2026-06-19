@@ -1085,6 +1085,7 @@ fn build_smooth_design_accepts_monotone_duchon_1dwith_linear_constraints() {
         basis: SmoothBasisSpec::Duchon {
             feature_cols: vec![0],
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                 length_scale: Some(0.9),
@@ -1713,6 +1714,7 @@ fn hierarchical_smooth_ownership_is_order_independent_for_bspline_and_duchon() {
         basis: SmoothBasisSpec::Duchon {
             feature_cols: vec![0, 1],
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                 length_scale: Some(1.0),
@@ -1828,6 +1830,7 @@ fn freeze_roundtrip_preserves_hierarchical_smooth_transforms() {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0, 1],
                     spec: DuchonBasisSpec {
+                        radial_reparam: None,
                         periodic: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                         length_scale: Some(1.0),
@@ -2118,6 +2121,7 @@ fn frozen_spatial_replay_preserves_standardized_length_scale_compensation() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                     length_scale: Some(1.4),
@@ -2245,6 +2249,7 @@ fn duchon_linear_nullspace_builds_and_reports_nullspace_dim() {
         basis: SmoothBasisSpec::Duchon {
             feature_cols: (0..d).collect(),
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                 length_scale: Some(0.9),
@@ -2284,6 +2289,7 @@ fn joint_duchon_orderzero_raw_smooth_build_preserves_unconstrained_basis() {
         basis: SmoothBasisSpec::Duchon {
             feature_cols: (0..d).collect(),
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                 length_scale: Some(1.0),
@@ -2335,6 +2341,7 @@ fn term_collection_joint_duchon_carries_frozen_transform_into_metadata() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: Some(1.0),
@@ -3509,6 +3516,7 @@ fn iso_kappa_fd_variant_driver(
         SmoothBasisSpec::Duchon {
             feature_cols: vec![0],
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                 length_scale: Some(1.0),
@@ -3780,6 +3788,7 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     length_scale: Some(1.0),
@@ -3960,6 +3969,7 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     length_scale: Some(1.0),
@@ -4311,6 +4321,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     length_scale: Some(1.0),
@@ -4664,6 +4675,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     length_scale: Some(1.0),
@@ -5136,6 +5148,7 @@ fn build_duchon_probit_setup() -> DuchonProbitSetup {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     length_scale: Some(1.0),
@@ -5510,6 +5523,7 @@ fn iso_kappa_duchon_dx_dpsi_matches_fd() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                     length_scale: Some(1.0),
@@ -6186,6 +6200,7 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                     length_scale: Some(0.9),
@@ -6782,6 +6797,7 @@ fn exact_duchon_log_kappa_derivative_uses_feature_columns_only() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 7 },
                     length_scale: Some(0.7),
@@ -7050,6 +7066,7 @@ fn duchon_terms_participate_in_kappa_optimization() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: Some(0.9),
@@ -7133,6 +7150,7 @@ fn pure_duchon_scale_dimensions_seed_geometry_but_enroll_no_hyper_axis() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     length_scale: None,
@@ -7213,6 +7231,7 @@ fn pure_duchon_from_length_scales_aniso_is_isotropic_single_psi() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1, 2],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::UserProvided(array![
                         [0.0, 0.0, 0.0],
@@ -7261,6 +7280,7 @@ fn explicit_duchon_aniso_length_scale_is_locked_kappa() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1, 2],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::UserProvided(array![
                         [0.0, 0.0, 0.0],
@@ -7461,6 +7481,7 @@ fn pure_duchon_aniso_fit_optimizes_without_introducing_hybrid_scale() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1, 2],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                     length_scale: None,

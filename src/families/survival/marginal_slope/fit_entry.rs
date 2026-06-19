@@ -2057,7 +2057,7 @@ pub fn fit_survival_marginal_slope_terms(
         initial_family.outer_derivative_policy(&initial_blocks, psi_dim, options)
     };
     let exact_spatial_outer_tol = kappa_options_ref.rel_tol.max(1e-6);
-    let mut solved = optimize_spatial_length_scale_exact_joint(
+    let solved = optimize_spatial_length_scale_exact_joint(
         data,
         &[marginalspec_boot.clone(), logslopespec_boot.clone()],
         &[marginal_terms.clone(), logslope_terms.clone()],
@@ -2290,23 +2290,32 @@ pub fn fit_survival_marginal_slope_terms(
             Ok(eval.efs_eval)
         },
         crate::families::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
-    )?;
+    );
+    {
+        // #979 profiling: emit the inner-solve work breakdown on BOTH the
+        // success and the error path (the inner-solve non-convergence abort
+        // returns Err before any outer-solve-end success log), so the dominant
+        // cost / failure stage is always visible in the verify log.
+        let (inner_calls, inner_cycles, outer_evals, max_cycles) = surv979_prof::snapshot();
+        let outcome = match &solved {
+            Ok(s) => format!(
+                "outcome=ok outer_iters={} outer_converged={}",
+                s.fit.outer_iterations, s.fit.outer_converged
+            ),
+            Err(e) => format!("outcome=ERR reason={e}"),
+        };
+        eprintln!(
+            "[#979prof] survival marginal-slope fit n={n} total_elapsed={:.2}s \
+             inner_fit_calls={inner_calls} total_inner_cycles={inner_cycles} \
+             max_inner_cycles={max_cycles} outer_eval_calls={outer_evals} {outcome}",
+            fit_started.elapsed().as_secs_f64(),
+        );
+    }
+    let mut solved = solved?;
     log::info!(
         "[survival-marginal-slope/outer] solve end elapsed={:.3}s",
         fit_started.elapsed().as_secs_f64(),
     );
-    {
-        let (inner_calls, inner_cycles, outer_evals, max_cycles) = surv979_prof::snapshot();
-        eprintln!(
-            "[#979prof] survival marginal-slope fit n={n} total_elapsed={:.2}s \
-             inner_fit_calls={inner_calls} total_inner_cycles={inner_cycles} \
-             max_inner_cycles={max_cycles} outer_eval_calls={outer_evals} \
-             outer_iters={} outer_converged={}",
-            fit_started.elapsed().as_secs_f64(),
-            solved.fit.outer_iterations,
-            solved.fit.outer_converged,
-        );
-    }
     // Never-fail outer escalation (#808), mirroring the bernoulli/custom-family
     // path (`fit_custom_family`, src/families/custom_family.rs): when the outer
     // smoothing optimizer cannot CERTIFY convergence we do NOT hard-error.

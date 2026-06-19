@@ -170,6 +170,7 @@ fn duchon_sae_atom_basis_matches_build_duchon_design() {
         let d = centers.ncols();
         let order = DuchonNullspaceOrder::Linear;
         let spec = DuchonBasisSpec {
+            radial_reparam: None,
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: None,
             power: 0.0,
@@ -2113,6 +2114,7 @@ fn test_cyclic_duchon_matches_at_period_boundary() {
     let x = Array2::from_shape_vec((5, 1), vec![0.0, 0.2, 0.5, 0.8, 1.0]).unwrap();
     let centers = Array2::from_shape_vec((6, 1), (0..6).map(|i| i as f64 / 6.0).collect()).unwrap();
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(centers),
         periodic: None,
         length_scale: Some(0.25),
@@ -3764,6 +3766,7 @@ fn test_geometric_constraint_transform_dimensions() {
 fn test_build_duchon_basisfreezes_default_spatial_identifiability() {
     let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
         length_scale: Some(1.0),
@@ -3815,6 +3818,7 @@ fn test_build_duchon_basis_default_identifiability_is_orthogonal_to_parametric_b
         [0.25, 0.75]
     ];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
         length_scale: Some(1.0),
@@ -3864,6 +3868,7 @@ fn test_build_scale_free_duchon_basis_centered_spring_triplet() {
         [1.0, 1.0, 1.0]
     ];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
         length_scale: None,
@@ -4000,6 +4005,7 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant() {
         [1.0, 1.0, 1.0]
     ];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
         periodic: None,
         length_scale: None,
@@ -4022,6 +4028,7 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant_1d() {
     assert!(file!().ends_with(".rs"));
     let data = array![[0.0], [0.5], [1.0], [1.5], [2.0], [2.5], [3.0], [3.5]];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
         length_scale: None,
         power: 0.0,
@@ -4055,6 +4062,7 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant_2d() {
         [1.0, 0.5]
     ];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
         length_scale: None,
         power: 0.0,
@@ -4102,6 +4110,7 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant_4d() {
         [0.9, 0.6, 0.4, 0.1]
     ];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 16 },
         length_scale: None,
         power: 1.0,
@@ -4146,6 +4155,7 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant_4d_fractional_s(
         [0.5, 0.75, 0.25, 0.5]
     ];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
         length_scale: None,
         power: 1.5,
@@ -4180,6 +4190,7 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant_2d_fractional_s(
         [1.0, 0.5]
     ];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
         length_scale: None,
         power: 0.5,
@@ -4232,6 +4243,7 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant_8d_fractional_s(
         }
     }
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 30 },
         length_scale: None,
         power: 3.5,
@@ -4772,6 +4784,7 @@ fn test_matern_closed_form_gates_when_divergent() {
 fn test_build_duchon_basis_linear_nullspace_uses_full_hilbert_scale() {
     let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
         length_scale: Some(1.0),
@@ -4816,6 +4829,7 @@ fn test_duchon_zero_nullspace_uses_closed_form() {
         [0.5, 0.0],
     ];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
         length_scale: Some(1.0),
@@ -4841,6 +4855,7 @@ fn test_duchon_linear_nullspace_uses_collocation() {
     // three penalties stay active and PSD.
     let data = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [0.5, 0.5]];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
         length_scale: Some(1.0),
@@ -4872,6 +4887,7 @@ fn hybrid_duchon_fractional_default_d4_rejects_realized_nonfinite_kernel() {
         [1.0, 1.0, 1.0, 1.0],
     ];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
         length_scale: Some(1.0),
         power: 1.5,
@@ -6208,6 +6224,7 @@ fn test_duchon_log_kappa_derivative_matchesfd_lengthscale_one() {
     let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
     let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
         length_scale: Some(1.0),
@@ -6253,6 +6270,7 @@ fn test_duchon_design_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
         data[[i, 0]] = i as f64 / (n as f64 - 1.0);
     }
     let mut spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
         length_scale: Some(1.0),
@@ -6339,6 +6357,7 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
         data[[i, 0]] = i as f64 / (n as f64 - 1.0);
     }
     let mut spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
         length_scale: Some(1.0),
@@ -6412,6 +6431,7 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear_no_ident() {
         data[[i, 0]] = i as f64 / (n as f64 - 1.0);
     }
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
         length_scale: Some(1.0),
@@ -6460,6 +6480,7 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear() {
         data[[i, 0]] = i as f64 / (n as f64 - 1.0);
     }
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
         length_scale: Some(1.0),
@@ -6539,6 +6560,7 @@ fn test_duchon_log_kappa_derivative_matchesfd() {
     let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
     let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
         length_scale: Some(0.9),
@@ -6618,6 +6640,7 @@ fn test_periodic_duchon_log_kappa_derivative_matchesfd() {
     let data = array![[0.05], [0.4], [1.2], [2.1], [3.4], [4.8], [5.5], [6.2]];
     let centers = array![[0.0], [0.9], [2.0], [3.3], [4.7], [6.3]];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(centers),
         periodic: None,
         length_scale: Some(0.8),

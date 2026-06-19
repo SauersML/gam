@@ -4552,6 +4552,38 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     block_stationarity_norms,
                     last_math_summary,
                 );
+                // Record a structured KKT-refusal report at the stall iterate so
+                // the bubbled IntegrationFailed error carries the per-block
+                // residual breakdown + H_pen spectrum instead of the opaque
+                // "no joint Newton math snapshot" string (gam#979/#1040). This is
+                // the dominant non-convergence exit for the survival
+                // marginal-slope monotone-cone DGP; without a report the cause of
+                // the abort is invisible past serialization.
+                cycles_done = cycle + 1;
+                let report = compute_kkt_refusal_report(
+                    cycle,
+                    &states,
+                    specs,
+                    &s_lambdas,
+                    &ranges,
+                    cached_joint_gradient.as_ref(),
+                    &cached_active_sets,
+                    &block_constraints,
+                    Some(&joint_hessian_source),
+                    total_p,
+                    ridge,
+                    options.ridge_policy,
+                    accepted_step_inf,
+                    step_inf,
+                    joint_trust_radius,
+                    residual_tol,
+                    objective_tol,
+                    step_tol,
+                    objective_change,
+                    residual,
+                    last_joint_math.as_ref(),
+                );
+                last_kkt_refusal_report = Some(report);
                 converged = false;
                 break;
             }

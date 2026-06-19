@@ -40,7 +40,7 @@ pub use optimizer::{RiemannianLBFGS, RiemannianObjective, RiemannianTrustRegion}
 pub use product::ProductManifold;
 pub use response_geometry::{
     ResponseCurvatureFit, ResponseManifold, fit_response_curvature, response_curvature_criterion,
-    response_exp_map, response_frechet_mean, response_log_map,
+    response_exp_map, response_frechet_mean, response_log_map, response_projection_residual,
 };
 pub use spd::{SpdManifold, spd_frechet_mean};
 pub use sphere::SphereManifold;

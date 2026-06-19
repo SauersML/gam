@@ -72,6 +72,7 @@ fn pure_duchon_aniso_penalties_stay_symmetric_through_freeze_and_cache() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1, 2],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 5 },
                     length_scale: None,
@@ -220,6 +221,7 @@ fn exact_joint_two_block_spatial_length_scale_freezes_duchon_centers() {
         basis: SmoothBasisSpec::Duchon {
             feature_cols: vec![0, 1],
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 8 },
                 length_scale: Some(length_scale),
@@ -290,6 +292,7 @@ fn joint_build_and_cache_rebuild_frozen_pure_duchon_blocks() {
         basis: SmoothBasisSpec::Duchon {
             feature_cols: (0..d).collect(),
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 periodic: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
                 length_scale: None,
@@ -1370,6 +1373,7 @@ fn pure_duchon_skips_operator_triplet_adaptive_overlay() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 16 },
                     length_scale: None,
                     power: 0.0,
@@ -1785,6 +1789,7 @@ fn exact_spatial_adaptive_1dobjective_profile_has_finite_gradient_lambda_surface
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 31 },
                     length_scale: Some(1.0),
@@ -1911,6 +1916,7 @@ fn high_center_duchon_fit_ignores_unavailable_spatial_adaptive_overlay() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 120 },
                     length_scale: Some(1.0),
@@ -2151,6 +2157,7 @@ fn extracted_duchon_spatial_runtime_cache_matches_normalized_design_penalties() 
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 11 },
                     length_scale: Some(0.8),
@@ -2315,6 +2322,7 @@ fn adaptive_hyper_derivative_dispatch_matches_reference() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     periodic: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 15 },
                     length_scale: Some(0.9),

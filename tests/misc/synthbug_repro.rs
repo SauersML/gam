@@ -119,6 +119,7 @@ fn local_synth_copd_like_duchon_orth_to_parametric() {
         basis: SmoothBasisSpec::Duchon {
             feature_cols: pc_cols.clone(),
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 center_strategy: CenterStrategy::FarthestPoint {
                     num_centers: DUCHON_CENTERS,
                 },
