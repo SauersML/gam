@@ -644,47 +644,56 @@ pub(crate) fn build_spherical_harmonic_basis(
     // penalty. Keep the raw operator with normalization_scale=1 so optimizer
     // lambdas are physical lambdas for this smooth.
     // Split the diagonal Laplace-Beltrami curvature penalty into two blocks that
-    // carry SEPARATE smoothing parameters (#1246, polar high-latitude quality):
-    //   * Primary  — the low-frequency signal band (degree l <= 2), penalized by
-    //                [l(l+1)]^(m+2). This is the part that carries genuine sphere
-    //                signal (the degree-2 sectoral/zonal truth), so its lambda must
-    //                stay moderate enough to fit it.
-    //   * Tail     — the high-degree modes (l > 2), penalized by [l(l+1)]^(m+2).
-    //                These modes carry no low-degree signal; under a SINGLE shared
-    //                lambda the optimizer had to keep the curvature penalty small
-    //                enough to fit the real degree-2 band, which left the degree>2
-    //                tail under-suppressed. The residual high-degree wiggle then
-    //                concentrated in the sparsely sampled polar latitude bands,
-    //                degrading the polar RMSE relative to the equator (ratio>1.4).
-    // Giving the tail its OWN smoothing parameter lets REML drive it independently:
-    // for a low-degree truth it crushes the noise-only tail (no signal there to
-    // protect) without over-shrinking the degree-2 signal, evening out the
-    // latitude-band error profile. For a genuinely high-degree truth REML keeps the
-    // tail lambda moderate, so signal recovery is preserved.
+    // carry SEPARATE smoothing parameters (#1246, polar high-latitude quality).
+    // The decisive observation is that REML re-selects each block's lambda, so
+    // changing a penalty's SCALE within a block is absorbed by lambda and cannot
+    // move the fit; only a STRUCTURAL split into an independently-tuned block can.
+    //
+    //   * Primary (equator-supported signal) — the degree-2 NON-zonal modes
+    //     (m != 0: the sectoral/tesseral harmonics Y_{2,+-2}=x^2-y^2, xy and
+    //     Y_{2,+-1}). Their basis functions carry a cos(lat) factor, so they
+    //     VANISH at the poles and concentrate their amplitude near the equator.
+    //     This is where the genuine low-degree sphere signal lives, so REML must
+    //     keep this lambda moderate enough to fit it.
+    //   * Tail (polar-supported / noise) — every ZONAL mode (m = 0, P_{l,0}) for
+    //     l >= 2 PLUS the entire high-degree band (l > 2, all m). The zonal modes
+    //     P_{l,0}(sin lat) reach their largest magnitude AT the poles, and the
+    //     high-degree modes carry no low-degree signal. Under a single shared
+    //     lambda the optimizer had to keep the curvature penalty small enough to
+    //     fit the equator-dominant sectoral signal, which left these polar-heavy
+    //     modes under-suppressed; their residual wiggle then piled up in the
+    //     sparsely sampled polar latitude bands (south-polar/equator RMSE ratio
+    //     > 1.4). Routing them to their OWN smoothing parameter lets REML drive
+    //     this block independently: for a low-degree truth it crushes the
+    //     polar-heavy noise band (no equatorial signal to protect) while leaving
+    //     the equator-supported sectoral signal untouched, evening out the
+    //     latitude-band error profile. For a genuinely high-degree truth REML
+    //     keeps the tail lambda moderate, so signal recovery and the predict
+    //     boundedness guarantees are preserved.
     let mut penalty = Array2::<f64>::zeros((p, p));
     let mut tail = Array2::<f64>::zeros((p, p));
     let mut col = 0usize;
     for l in 1..=l_max {
         let laplace = l as f64 * (l as f64 + 1.0);
-        for _ in 0..(2 * l + 1) {
+        let eig = laplace.powi((spec.penalty_order + 2) as i32);
+        // Column layout per degree l: [sin(l*phi)P_{l,l} .. sin(phi)P_{l,1},
+        // P_{l,0}, cos(phi)P_{l,1} .. cos(l*phi)P_{l,l}], so the local index `l`
+        // (0-based) within the (2l+1)-wide block is the zonal m=0 column.
+        for local in 0..(2 * l + 1) {
+            let is_zonal = local == l;
             if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
                 // unpenalized low-degree span
-            } else if l <= 2 {
-                // Penalize the degree-2 signal band at the SAME Sobolev order
-                // (m+2) as the high-degree tail. A consistent seminorm order
-                // across all penalized degrees keeps the polar-heavy l=2 zonal
-                // mode (P_{2,0} ~ 3cos^2(lat), maximal at the poles) under the
-                // same curvature scale as the rest, so it cannot accumulate
-                // residual wiggle in the sparse polar bands once REML fits the
-                // equator-dominant sectoral modes.
-                penalty[[col, col]] = laplace.powi((spec.penalty_order + 2) as i32);
+            } else if l > 2 || is_zonal {
+                // polar-supported / noise band -> independent tail lambda
+                tail[[col, col]] = eig;
             } else {
-                tail[[col, col]] = laplace.powi((spec.penalty_order + 2) as i32);
+                // equator-supported degree-2 sectoral/tesseral signal
+                penalty[[col, col]] = eig;
             }
             col += 1;
         }
     }
-    let has_tail = l_max > 2;
+    let has_tail = tail.diag().iter().any(|&v| v > 0.0);
     // Double-penalty shrinkage lives on the primary penalty's null space.
     // The harmonic basis omits the constant mode, so the unpenalized Wahba
     // low-degree span is exactly the l <= SPHERE_UNPENALIZED_LOW_DEGREE block.
