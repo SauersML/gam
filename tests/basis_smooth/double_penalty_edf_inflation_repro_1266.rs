@@ -215,3 +215,93 @@ fn double_penalty_edf_inflation_localization_1266() {
         "double-penalty fits must converge to finite EDF"
     );
 }
+
+/// Noise-only DGP: `y = N(0, 0.3)` and an irrelevant uniform covariate `z`.
+/// The truth has NO dependence on `z`, so an `s(z)` smooth is unsupported and a
+/// correct double penalty must shrink it toward `EDF → 0` — and certainly never
+/// ABOVE the single-penalty EDF.
+fn irrelevant_dgp(n: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
+    let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+    let mut next = || {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        (state.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut data = Array2::<f64>::zeros((n, 1));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let z = next(); // irrelevant covariate
+        let u1 = next().max(1e-12);
+        let u2 = next();
+        let g = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+        data[[i, 0]] = z;
+        y[i] = 0.3 * g; // pure noise — no dependence on z
+    }
+    (data, y)
+}
+
+/// #1266 CONTRACT GATE. Enabling the Marra–Wood double penalty can only ADD
+/// shrinkage capacity, so an UNSUPPORTED smooth's effective d.o.f. under the
+/// double penalty must never EXCEED its single-penalty d.o.f.:
+/// `mean(EDF_on) ≤ mean(EDF_off)`.
+///
+/// The bug: the default `Normal(0, sd=3)` ρ-prior (the prior the gamfit formula
+/// / orchestration path resolves to via `canonical_standard_fit_options`) caps
+/// each log-λ. For a double-penalty term that cap pulls BOTH the wiggliness and
+/// null-space log-λ back toward 0, so REML settles at a point that leaves the
+/// term under-shrunk — its EDF lands ABOVE the single-penalty EDF (the #1266
+/// inflation, ~4.6 vs ~2.0 on this DGP). The fix lifts the cap off
+/// Gaussian-identity B-spline double-penalty selection coordinates (flat prior,
+/// matching mgcv `select=TRUE`), restoring the contract.
+///
+/// Runs the same `Normal(0, sd=3)` prior the formula path uses (NOT the flat
+/// prior of the localisation probe above), so it actually exercises the
+/// regression — a flat-prior fit would pass even without the fix.
+#[test]
+fn double_penalty_does_not_inflate_unsupported_edf_1266() {
+    let n = 800usize;
+    let likelihood = LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(StandardLink::Identity),
+    );
+    let opts = FitOptions {
+        rho_prior: RhoPrior::Normal {
+            mean: 0.0,
+            sd: 3.0,
+        },
+        penalty_shrinkage_floor: Some(1e-6),
+        ..fit_options()
+    };
+    let mut on_vals = Vec::new();
+    let mut off_vals = Vec::new();
+    for seed in 100..105u64 {
+        let (data, y) = irrelevant_dgp(n, seed);
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let edf = |double_penalty: bool| -> f64 {
+            fit_term_collection_forspec(
+                data.view(),
+                y.view(),
+                weights.view(),
+                offset.view(),
+                &bspline_spec(double_penalty),
+                likelihood.clone(),
+                &opts,
+            )
+            .expect("fit")
+            .fit
+            .edf_total()
+            .expect("edf")
+        };
+        on_vals.push(edf(true));
+        off_vals.push(edf(false));
+    }
+    let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len() as f64;
+    let (on, off) = (mean(&on_vals), mean(&off_vals));
+    assert!(
+        on <= off + 1e-8,
+        "double penalty must not inflate EDF on an unsupported smooth: \
+         mean(EDF_on)={on:.4} > mean(EDF_off)={off:.4} (on={on_vals:?}, off={off_vals:?})"
+    );
+}

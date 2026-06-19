@@ -1838,7 +1838,13 @@ fn fit_term_collection_on_realized_design(
             options,
         );
     }
-    let base_fit_opts = adaptive_fit_options_base(options, design);
+    let mut base_fit_opts = adaptive_fit_options_base(options, design);
+    // Lift the log-λ cap off any Marra–Wood double-penalty selection coordinates
+    // (Gaussian-identity `s(x, bs=ps)`-style fits) so the null-space block can
+    // shrink an unsupported term out instead of leaving it under-penalised
+    // (#1266). Length-safe: only fires when ρ aligns 1:1 with the penalty
+    // blocks (see `relax_double_penalty_rho_prior`).
+    base_fit_opts.rho_prior = relax_double_penalty_rho_prior(options, &family, design);
     let fitted = FittedTermCollection {
         fit: fit_gamwith_heuristic_lambdas(
             design.design.clone(),
@@ -4151,6 +4157,116 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     };
     enforce_term_constraint_feasibility(&fitted.design, &fitted.fit)?;
     Ok(fitted)
+}
+
+/// Relax the per-coordinate ρ-prior for terms running in Marra–Wood
+/// double-penalty selection mode (#1266).
+///
+/// The default ρ-prior is a `Normal { mean: 0, sd: 3 }` cap on each log-λ — a
+/// stabiliser that keeps ordinary smoothing parameters from drifting to
+/// degenerate extremes (gam#893/#1196). For a smooth carrying a
+/// `DoublePenaltyNullspace` block (`double_penalty = True`, the default `s(...)`
+/// — analogous to mgcv `select = TRUE`) that cap is actively wrong: the whole
+/// purpose of the second penalty is to let REML drive an *unsupported* term to
+/// `EDF → 0`, which needs both the wiggliness and null-space log-λ to grow
+/// large. The `ρ²/(2·9)` cap pulls them back toward 0, so REML settles at a
+/// point that leaves the term under-shrunk — the smooth's EDF comes out ABOVE
+/// the single-penalty (`double_penalty = False`) EDF instead of at or below it,
+/// the exact contract violation in #1266. mgcv's `select = TRUE` applies no
+/// such cap to the selection coordinates, and the lower-level term-collection
+/// fits already converge correctly under a flat prior.
+///
+/// We therefore rewrite the prior to `Independent`, holding the base prior on
+/// every ordinary coordinate but switching the coordinates of any
+/// double-penalty term to `Flat`. Single-penalty terms are byte-for-byte
+/// unchanged, and an already-`Flat`/already-`Independent` base prior, or a
+/// design with no double-penalty block, is returned untouched.
+fn relax_double_penalty_rho_prior(
+    options: &FitOptions,
+    family: &LikelihoodSpec,
+    design: &TermCollectionDesign,
+) -> crate::types::RhoPrior {
+    use crate::terms::basis::{BasisMetadata, PenaltySource};
+    let base = &options.rho_prior;
+    // Only a single scalar prior that actually caps log-λ needs relaxing;
+    // `Flat` already imposes no cap and `Independent` is assumed caller-built.
+    if matches!(
+        base,
+        crate::types::RhoPrior::Flat | crate::types::RhoPrior::Independent(_)
+    ) {
+        return base.clone();
+    }
+    // LENGTH SAFETY (load-bearing). The per-coordinate `Independent` prior is
+    // validated against the FULL outer ρ vector and a length disagreement
+    // saturates the prior to `+∞`, breaking the fit. ρ aligns 1:1 with the
+    // penalty blocks in `design.penaltyinfo` ONLY when the fit introduces no
+    // auxiliary trailing ρ coordinates. Such coordinates come from
+    //   * non-Gaussian dispersion / non-identity link machinery,
+    //   * SAS ε/δ and mixture-link parameters,
+    //   * spatial κ length-scale optimisation (Matérn / Duchon / thin-plate).
+    // Gate the relaxation to the Gaussian-identity, link-aux-free, κ-free case —
+    // exactly the `s(x, bs=ps)`-style fit in #1266 — where the 1:1 alignment is
+    // guaranteed. Every other fit keeps the base prior unchanged.
+    let gaussian_identity = matches!(family.response, crate::types::ResponseFamily::Gaussian)
+        && matches!(
+            family.link,
+            crate::types::InverseLink::Standard(crate::types::StandardLink::Identity)
+        );
+    let has_link_aux = options.sas_link.is_some()
+        || options.optimize_sas
+        || options.mixture_link.is_some()
+        || options.optimize_mixture;
+    let has_spatial_kappa = design.smooth.terms.iter().any(|t| {
+        matches!(
+            t.metadata,
+            BasisMetadata::ThinPlate { .. }
+                | BasisMetadata::Matern { .. }
+                | BasisMetadata::Duchon { .. }
+        )
+    });
+    if !gaussian_identity || has_link_aux || has_spatial_kappa {
+        return base.clone();
+    }
+    let coords = &design.penaltyinfo;
+    if coords.is_empty() {
+        return base.clone();
+    }
+    // Names of 1-D B-spline terms (`bs=ps`/`bspline`/`cs`, the issue scope) that
+    // own a null-space shrinkage block, i.e. are in Marra–Wood selection mode.
+    let bspline_terms: std::collections::HashSet<&str> = design
+        .smooth
+        .terms
+        .iter()
+        .filter(|t| matches!(t.metadata, BasisMetadata::BSpline1D { .. }))
+        .map(|t| t.name.as_str())
+        .collect();
+    let selection_terms: std::collections::HashSet<&str> = coords
+        .iter()
+        .filter(|info| matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace))
+        .filter_map(|info| info.termname.as_deref())
+        .filter(|name| bspline_terms.contains(name))
+        .collect();
+    if selection_terms.is_empty() {
+        return base.clone();
+    }
+    // Every penalty coordinate a selection term owns (wiggliness AND null-space)
+    // is freed to `Flat` so REML can drive the whole term out; all other
+    // coordinates keep the base prior.
+    let per_coord = coords
+        .iter()
+        .map(|info| {
+            let in_selection = info
+                .termname
+                .as_deref()
+                .is_some_and(|name| selection_terms.contains(name));
+            if in_selection {
+                crate::types::RhoPrior::Flat
+            } else {
+                base.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    crate::types::RhoPrior::Independent(per_coord)
 }
 
 fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign) -> FitOptions {
