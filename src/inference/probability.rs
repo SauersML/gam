@@ -511,6 +511,63 @@ fn negative_binomial_cdf_at(k: f64, theta: f64, prob: f64) -> f64 {
     beta_reg(theta, k + 1.0, prob.clamp(0.0, 1.0))
 }
 
+/// Smallest integer `k` with `cdf(k) ≥ p`, found by a geometric bracket grown
+/// from `seed` followed by an integer bisection (invariant `cdf(lo) < p ≤
+/// cdf(hi)`). `cdf` must be a monotone non-decreasing lower-tail CDF on the
+/// non-negative integers. Returns `+∞` if the upper bracket grows past the
+/// `1e18` finite-arithmetic backstop without reaching `p`.
+///
+/// Shared root finder for the discrete count quantiles (Negative-Binomial,
+/// Poisson): both seed a normal approximation on their own moments and then run
+/// this identical bracket-and-bisect. Callers must already have handled the
+/// `cdf(0) ≥ p` zero-atom short-circuit.
+fn count_quantile_bracket_bisect(cdf: impl Fn(f64) -> f64, seed: f64, p: f64) -> f64 {
+    let mut lo: f64;
+    let mut hi: f64;
+    if cdf(seed) >= p {
+        hi = seed;
+        lo = 0.0;
+        // Tighten `lo` upward toward `hi` so the bisection starts narrow.
+        let mut step = 1.0;
+        let mut cand = seed - 1.0;
+        while cand > 0.0 && cdf(cand) >= p {
+            hi = cand;
+            step *= 2.0;
+            cand = seed - step;
+        }
+        if cand > 0.0 {
+            lo = cand; // CDF(cand) < p
+        }
+    } else {
+        lo = seed; // CDF(seed) < p
+        let mut step = 1.0;
+        let mut cand = seed + 1.0;
+        // CDF → 1 as k → ∞ and p < 1, so this terminates; the cap is a
+        // finite-arithmetic backstop (returns an effectively infinite edge).
+        while cdf(cand) < p {
+            lo = cand;
+            step *= 2.0;
+            cand = seed + step;
+            if cand > 1.0e18 {
+                return f64::INFINITY;
+            }
+        }
+        hi = cand;
+    }
+
+    // Bisection for the smallest integer k with CDF(k) ≥ p, maintaining the
+    // invariant CDF(lo) < p ≤ CDF(hi).
+    while hi - lo > 1.0 {
+        let mid = (lo + (hi - lo) / 2.0).floor();
+        if cdf(mid) >= p {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    hi
+}
+
 /// Quantile (inverse CDF) of a Negative-Binomial with mean `μ ≥ 0` and
 /// dispersion `θ > 0` at probability `p ∈ (0, 1)`: the smallest integer count
 /// `k ≥ 0` with `P(Y ≤ k) ≥ p`, returned as an `f64`.
@@ -556,50 +613,7 @@ pub fn negative_binomial_quantile(p: f64, mu: f64, theta: f64) -> f64 {
     // CDF(lo) < p (starts at 0, which failed the short-circuit) and `hi`
     // satisfies CDF(hi) ≥ p. Grow geometrically from the seed in whichever
     // direction is needed.
-    let mut lo: f64;
-    let mut hi: f64;
-    if cdf(seed) >= p {
-        hi = seed;
-        lo = 0.0;
-        // Tighten `lo` upward toward `hi` so the bisection starts narrow.
-        let mut step = 1.0;
-        let mut cand = seed - 1.0;
-        while cand > 0.0 && cdf(cand) >= p {
-            hi = cand;
-            step *= 2.0;
-            cand = seed - step;
-        }
-        if cand > 0.0 {
-            lo = cand; // CDF(cand) < p
-        }
-    } else {
-        lo = seed; // CDF(seed) < p
-        let mut step = 1.0;
-        let mut cand = seed + 1.0;
-        // CDF → 1 as k → ∞ and p < 1, so this terminates; the cap is a
-        // finite-arithmetic backstop (returns an effectively infinite edge).
-        while cdf(cand) < p {
-            lo = cand;
-            step *= 2.0;
-            cand = seed + step;
-            if cand > 1.0e18 {
-                return f64::INFINITY;
-            }
-        }
-        hi = cand;
-    }
-
-    // Bisection for the smallest integer k with CDF(k) ≥ p, maintaining the
-    // invariant CDF(lo) < p ≤ CDF(hi).
-    while hi - lo > 1.0 {
-        let mid = (lo + (hi - lo) / 2.0).floor();
-        if cdf(mid) >= p {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-    hi
+    count_quantile_bracket_bisect(&cdf, seed, p)
 }
 
 /// Equal-tailed predictive interval for a Negative-Binomial count response whose
@@ -706,49 +720,7 @@ pub fn poisson_quantile(p: f64, mu: f64) -> f64 {
     // CDF(lo) < p (starts at 0, which failed the short-circuit) and `hi`
     // satisfies CDF(hi) ≥ p. Grow geometrically from the seed in whichever
     // direction is needed.
-    let mut lo: f64;
-    let mut hi: f64;
-    if cdf(seed) >= p {
-        hi = seed;
-        lo = 0.0;
-        let mut step = 1.0;
-        let mut cand = seed - 1.0;
-        while cand > 0.0 && cdf(cand) >= p {
-            hi = cand;
-            step *= 2.0;
-            cand = seed - step;
-        }
-        if cand > 0.0 {
-            lo = cand; // CDF(cand) < p
-        }
-    } else {
-        lo = seed; // CDF(seed) < p
-        let mut step = 1.0;
-        let mut cand = seed + 1.0;
-        // CDF → 1 as k → ∞ and p < 1, so this terminates; the cap is a
-        // finite-arithmetic backstop (returns an effectively infinite edge).
-        while cdf(cand) < p {
-            lo = cand;
-            step *= 2.0;
-            cand = seed + step;
-            if cand > 1.0e18 {
-                return f64::INFINITY;
-            }
-        }
-        hi = cand;
-    }
-
-    // Bisection for the smallest integer k with CDF(k) ≥ p, maintaining the
-    // invariant CDF(lo) < p ≤ CDF(hi).
-    while hi - lo > 1.0 {
-        let mid = (lo + (hi - lo) / 2.0).floor();
-        if cdf(mid) >= p {
-            hi = mid;
-        } else {
-            lo = mid;
-        }
-    }
-    hi
+    count_quantile_bracket_bisect(&cdf, seed, p)
 }
 
 /// Equal-tailed predictive interval for a Poisson count response whose
