@@ -876,6 +876,18 @@ pub fn evaluate_bspline_derivative_scalar_into(
     Ok(())
 }
 
+/// Per-basis M-spline normalization scales `(degree + 1) / (t_{i+d+1} - t_i)`.
+///
+/// The M-spline is the B-spline rescaled so each basis integrates to one over
+/// its support; this factor is the shared normalization used by both the dense
+/// and sparse builders.
+fn mspline_scales(knot_vector: ArrayView1<f64>, degree: usize, num_basis: usize) -> Vec<f64> {
+    let order = (degree + 1) as f64;
+    (0..num_basis)
+        .map(|i| order / (knot_vector[i + degree + 1] - knot_vector[i]))
+        .collect()
+}
+
 pub(crate) fn create_mspline_dense(
     data: ArrayView1<f64>,
     knot_vector: ArrayView1<f64>,
@@ -890,12 +902,7 @@ pub(crate) fn create_mspline_dense(
     let mut local = vec![0.0; support];
     let left = knot_vector[degree];
     let right = knot_vector[num_basis];
-    let order = (degree + 1) as f64;
-    let mut scales = vec![0.0; num_basis];
-    for i in 0..num_basis {
-        let span = knot_vector[i + degree + 1] - knot_vector[i];
-        scales[i] = order / span;
-    }
+    let scales = mspline_scales(knot_vector, degree, num_basis);
 
     for (row_i, &x) in data.iter().enumerate() {
         if x < left || x > right {
@@ -932,12 +939,7 @@ pub(crate) fn create_mspline_sparse(
     let mut local = vec![0.0; support];
     let left = knot_vector[degree];
     let right = knot_vector[ncols];
-    let order = (degree + 1) as f64;
-    let mut scales = vec![0.0; ncols];
-    for i in 0..ncols {
-        let span = knot_vector[i + degree + 1] - knot_vector[i];
-        scales[i] = order / span;
-    }
+    let scales = mspline_scales(knot_vector, degree, ncols);
 
     let mut triplets: Vec<Triplet<usize, usize, f64>> =
         Vec::with_capacity(nrows.saturating_mul(support));
