@@ -774,10 +774,18 @@ where
         // caller pins `init_rhos`, the outer search is warm-started there and
         // the seed is the requested operating point, so report it verbatim
         // rather than the optimizer's (possibly clamped) returned rho.
-        let accepted_rho = heuristic_lambdas
+        let mut accepted_rho = heuristic_lambdas
             .filter(|h| h.len() == k)
             .map(|h| Array1::from_iter(h.iter().copied()))
             .unwrap_or_else(|| strategy_result.rho.clone());
+        // DIAGNOSTIC ONLY (#1347): clamp every rho axis to a forced value to read
+        // off the EDF gam produces at a fixed (e.g. mgcv-matching) lambda.
+        if let Ok(v) = std::env::var("DIAG1347_FIXRHO") {
+            if let Ok(val) = v.parse::<f64>() {
+                accepted_rho.fill(val);
+                eprintln!("[DIAG1347_FIXRHO] standard-arm rho forced to {val}");
+            }
+        }
         (
             accepted_rho,
             cfg.link_kind.mixture_state().cloned(),
