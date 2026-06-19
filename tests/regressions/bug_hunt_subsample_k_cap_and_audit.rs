@@ -123,6 +123,9 @@ fn h1c_maybe_install_honors_outer_work_per_k_unit_argument() {
         12,
         "h1c-test",
         SURVIVAL_WORK_PER_K_UNIT,
+        30_000,
+        10_000,
+        1_000,
     )
     .expect("auto-subsample should install at large-scale n");
 

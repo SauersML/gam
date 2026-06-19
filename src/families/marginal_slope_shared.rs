@@ -899,6 +899,9 @@ pub struct AutoOuterSubsampleOptions {
     /// ~220_000; we use 250_000 as a conservative upper bound. With
     /// `AUTO_OUTER_WORK_BUDGET = 5×10⁸` that caps K at ~2_000.
     pub outer_work_per_k_unit: u64,
+    /// Absolute floor on the chosen K after the noise/work caps are combined.
+    /// Default [`AUTO_OUTER_MIN_K_FLOOR`].
+    pub min_k_floor: usize,
 }
 
 /// Half-billion outer-derivative work units per evaluation. Picked so the
@@ -952,6 +955,7 @@ impl Default for AutoOuterSubsampleOptions {
             target_fraction: 0.10,
             seed: 0xA075_8A8B_1ED5_5B5C,
             outer_work_per_k_unit: 1,
+            min_k_floor: AUTO_OUTER_MIN_K_FLOOR,
         }
     }
 }
@@ -999,8 +1003,8 @@ impl AutoOuterSubsampleOptions {
         } else {
             AutoOuterCapReason::Noise
         };
-        if k < AUTO_OUTER_MIN_K_FLOOR {
-            k = AUTO_OUTER_MIN_K_FLOOR;
+        if k < self.min_k_floor {
+            k = self.min_k_floor;
             cap_reason = AutoOuterCapReason::Floor;
         }
         if k > n {
@@ -1088,6 +1092,9 @@ pub fn maybe_install_auto_outer_subsample(
     phase1_budget: usize,
     family_label: &'static str,
     outer_work_per_k_unit: u64,
+    min_n_for_auto: usize,
+    min_k: usize,
+    min_k_floor: usize,
 ) -> Option<crate::custom_family::BlockwiseFitOptions> {
     if options.outer_score_subsample.is_some() || !options.auto_outer_subsample {
         return None;
@@ -1136,6 +1143,9 @@ pub fn maybe_install_auto_outer_subsample(
     // family's intended K≈2_000. That ~9× inflation drove the
     // documented 8h large-scale hang (exit 137 from resource exhaustion).
     let auto_options = AutoOuterSubsampleOptions {
+        min_n_for_auto,
+        min_k,
+        min_k_floor,
         outer_work_per_k_unit: outer_work_per_k_unit.max(1),
         ..AutoOuterSubsampleOptions::default()
     };

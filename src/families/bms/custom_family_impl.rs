@@ -276,6 +276,9 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
                 // against pathological per-row cost regressions, not to
                 // change today's nominal K.
                 50_000,
+                30_000,
+                10_000,
+                1_000,
             ) {
                 Some(cloned) => {
                     owned_options = cloned;

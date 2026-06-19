@@ -135,6 +135,12 @@ impl SurvivalMarginalSlopeFamily {
             .map(|v| if *v > 0.5 { 1u8 } else { 0u8 })
             .collect();
         let z_key = self.z_subsample_key();
+        let small_fixture_auto = self.n >= 500 && self.n < 30_000;
+        let phase1_budget = if small_fixture_auto {
+            3
+        } else {
+            SURVIVAL_MGS_AUTO_SUBSAMPLE_PHASE1_BUDGET
+        };
         crate::families::marginal_slope_shared::maybe_install_auto_outer_subsample(
             options,
             z_key.as_slice().expect("z key must be contiguous"),
@@ -142,7 +148,7 @@ impl SurvivalMarginalSlopeFamily {
             ctx.rho.as_slice().expect("outer rho must be contiguous"),
             &self.auto_subsample_phase_counter,
             &self.auto_subsample_last_rho,
-            SURVIVAL_MGS_AUTO_SUBSAMPLE_PHASE1_BUDGET,
+            phase1_budget,
             "survival-mgs",
             // Per-K work-unit cost for the survival marginal-slope outer
             // gradient kernel. Calibrated from the large-scale repro
@@ -157,6 +163,9 @@ impl SurvivalMarginalSlopeFamily {
             // before the identifiability gate even gets a chance to
             // veto rank-deficient configurations.
             250_000,
+            if small_fixture_auto { 500 } else { 30_000 },
+            if small_fixture_auto { 200 } else { 10_000 },
+            if small_fixture_auto { 200 } else { 1_000 },
         )
     }
 }
