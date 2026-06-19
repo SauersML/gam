@@ -149,6 +149,16 @@ pub fn reml_laml_evaluate(
                 + (denom / 2.0) * (2.0 * std::f64::consts::PI * phi).ln()
                 - solution.gaussian_weight_log_sum_half;
 
+            if std::env::var_os("DIAG1271_COST").is_some() {
+                eprintln!(
+                    "[DIAG1271_COST] dp_c={dp_c:.4} phi={phi:.6e} fit={:.4} log|H|={log_det_h:.4} log|S|+={log_det_s:.4} half(logH-logS)={:.4} norm={:.4} denom={denom:.1} nulldim={:.3} penquad={penalty_quad_value:.4} | cost={cost:.4}",
+                    dp_c / (2.0 * phi),
+                    0.5 * (log_det_h - log_det_s),
+                    (denom / 2.0) * (2.0 * std::f64::consts::PI * phi).ln(),
+                    solution.nullspace_dim,
+                );
+            }
+
             (cost, phi, dp_cgrad, dp_cgrad2)
         }
         DispersionHandling::Fixed {
