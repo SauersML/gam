@@ -187,14 +187,12 @@ fn multinomial_formula_use_outer_hessian(total_rho_dim: usize) -> bool {
 }
 
 /// Logit magnitude beyond which fitted probabilities are saturated at ordinary
-/// double precision diagnostic scale. If a multinomial Newton solve exhausts
-/// its iteration budget at this scale, the returned iterate is a separation
-/// artifact, not a finite MLE. The formula REML path also reads this threshold
-/// as the separation-EVIDENCE gate that arms the Jeffreys/Firth proper prior
-/// for a second, Firth-bounded solve (#715/#753): a logit at this scale means
-/// `p(1−p) < 1.4e-11`, so the softmax Fisher weight `W = diag(p) − ppᵀ` has
-/// collapsed on that row and the likelihood supplies no usable curvature on
-/// the penalty-null directions feeding it.
+/// double precision diagnostic scale. The bare fixed-λ driver has no outer REML
+/// state and still uses this threshold to reject a non-converged saturated
+/// iterate as a separation artifact. The formula REML path does not use this as
+/// a Firth trigger: with smoothing parameters selected, a finite saturated
+/// surface can be the valid near-separated optimum that should be scored
+/// directly.
 const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
 
 /// Calibrated convergence tolerance for the OUTER REML/LAML smoothing-parameter
@@ -294,20 +292,14 @@ fn multinomial_formula_separation_diagnostic(
 /// arm" split:
 ///
 /// * a NON-FINITE logit — the inner linear algebra blew up along an unbounded
-///   direction; or
-/// * a SATURATED logit, `|η| ≥` [`MULTINOMIAL_SEPARATION_ETA_THRESHOLD`] —
-///   at that scale `p(1−p) < 1.4e-11`, the likelihood curvature on the rows
-///   driving that logit has collapsed, and the "mode" the unbiased criterion
-///   reports is an artifact of the iteration budget, not a finite MLE.
+///   direction.
 ///
 /// Returns `Some(description)` naming the witnessing logit when evidence is
-/// found, `None` for a finite interior fit (which is then accepted as-is, with
-/// zero Firth bias). A FAILED unbiased solve (`Err` from the rho-prior driver,
-/// e.g. "no startup seed passed") is the third evidence form and is handled
+/// found, `None` for a finite fit (which is then accepted as-is, with zero
+/// Firth bias). A FAILED unbiased solve (`Err` from the rho-prior driver, e.g.
+/// "no startup seed passed") is the second evidence form and is handled
 /// directly at the call site in [`fit_penalized_multinomial_formula`].
 fn multinomial_formula_separation_evidence(block_states: &[ParameterBlockState]) -> Option<String> {
-    let mut max_abs = 0.0_f64;
-    let mut max_at = (0usize, 0usize);
     for (active_class, state) in block_states.iter().enumerate() {
         for (row, &value) in state.eta.iter().enumerate() {
             if !value.is_finite() {
@@ -315,19 +307,9 @@ fn multinomial_formula_separation_evidence(block_states: &[ParameterBlockState])
                     "non-finite logit eta[row {row}, active class {active_class}] = {value}"
                 ));
             }
-            if value.abs() > max_abs {
-                max_abs = value.abs();
-                max_at = (row, active_class);
-            }
         }
     }
-    (max_abs >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD).then(|| {
-        format!(
-            "saturated logit |eta[row {}, active class {}]| = {max_abs:.3} >= {MULTINOMIAL_SEPARATION_ETA_THRESHOLD} \
-             (softmax Fisher weight collapsed on the separating rows)",
-            max_at.0, max_at.1
-        )
-    })
+    None
 }
 
 /// Inputs to [`fit_penalized_multinomial`].
@@ -988,13 +970,11 @@ fn scale_multinomial_formula_penalty(penalty: PenaltyMatrix, scale: f64) -> Pena
 /// declared non-converged after only `max_iter` cycles (#715).
 ///
 /// The Jeffreys/Firth proper prior is engaged CONDITIONALLY: attempt 1 runs
-/// the unbiased penalized-REML criterion; only on separation evidence (a
-/// failed solve, a non-finite logit, or a saturated `|η| ≥ 25` logit — see
-/// [`multinomial_formula_separation_evidence`]) is the fit re-solved once with
-/// the full-span Firth prior armed, which bounds the penalty-null directions
-/// no smoothing parameter can (`S v = 0` ⇒ `(H + S_λ) v = H v → 0` under
-/// softmax saturation, the #715 real-data "all REML startup seeds rejected"
-/// mechanism).
+/// the unbiased penalized-REML criterion; only on separation evidence (a failed
+/// solve or a non-finite logit; see [`multinomial_formula_separation_evidence`])
+/// is the fit re-solved once with the full-span Firth prior armed, which bounds
+/// the penalty-null directions no smoothing parameter can (`S v = 0` ⇒
+/// `(H + S_λ) v = H v → 0` when the softmax likelihood has no finite mode).
 ///
 /// The categorical response column is recognised via the dataset schema
 /// (`ColumnKindTag::Categorical`); reference class = last level. Returns a
@@ -1319,13 +1299,13 @@ pub fn fit_penalized_multinomial_formula(
     // interior-data path, #715 arm (a)). If the solve FAILS (e.g. the
     // (quasi-)separated penguins geometry where `(H + S_λ)v ≈ 0` along
     // penalty-null directions for EVERY ρ rejects every REML startup seed) or
-    // SUCCEEDS only at a saturated artifact (|η| past the diagnostic
-    // threshold), that is direct separation evidence: re-solve once with the
-    // full-span Jeffreys/Firth proper prior armed, which supplies the O(1)
-    // curvature on the quotient-null subspace that smoothing parameters
-    // mathematically cannot (`Sv = 0` ⇒ λ never touches `v`). The Firth refit
-    // is the accepted result for separated data — finite, Firth-bounded
-    // coefficients with calibrated probabilities (83debb24b contract).
+    // returns a non-finite artifact, that is direct separation evidence:
+    // re-solve once with the full-span Jeffreys/Firth proper prior armed, which
+    // supplies the O(1) curvature on the quotient-null subspace that smoothing
+    // parameters mathematically cannot (`Sv = 0` ⇒ λ never touches `v`). The
+    // Firth refit is the accepted result only when the unbiased formula solve
+    // failed or blew up; finite formula-path logits can be large on valid
+    // near-separated optima and should not be shrunk toward the uniform simplex.
     let mut unbiased_probe_options = options.clone();
     unbiased_probe_options.outer_max_iter = unbiased_probe_options
         .outer_max_iter
@@ -1384,11 +1364,10 @@ pub fn fit_penalized_multinomial_formula(
                 crate::types::RhoPrior::Flat,
             ) {
                 Ok(full_unbiased_fit)
-                    if full_unbiased_fit.outer_converged
-                        && multinomial_formula_separation_evidence(
-                            &full_unbiased_fit.block_states,
-                        )
-                        .is_none() =>
+                    if multinomial_formula_separation_evidence(
+                        &full_unbiased_fit.block_states,
+                    )
+                    .is_none() =>
                 {
                     full_unbiased_fit
                 }
@@ -1971,7 +1950,7 @@ mod fisher_override_tests {
     }
 
     #[test]
-    fn separation_evidence_gate_arms_firth_only_on_saturation_or_blowup() {
+    fn separation_evidence_gate_arms_firth_only_on_blowup() {
         // Interior fit: finite logits well inside the saturation threshold ⇒ NO
         // separation evidence ⇒ the unbiased criterion's mode is accepted as-is
         // and the Firth/Jeffreys prior stays disarmed (#715 arm (a): no 1/K
@@ -1991,10 +1970,9 @@ mod fisher_override_tests {
             "an interior finite mode must not arm the Firth refit"
         );
 
-        // Saturated logit at the diagnostic threshold ⇒ the softmax Fisher
-        // weight has collapsed on that row ⇒ separation evidence ⇒ Firth refit
-        // (#715 arm (b): penalty-null directions need a proper prior, no λ can
-        // bound them).
+        // Saturated but finite logits are valid formula-path modes on
+        // near-separated real data. They must not arm the Firth refit because
+        // the Jeffreys pull can over-regularize the held-out probabilities.
         let saturated = vec![
             ParameterBlockState {
                 beta: Array1::from_vec(vec![1.0, 2.0]),
@@ -2005,15 +1983,13 @@ mod fisher_override_tests {
                 eta: Array1::from_vec(vec![1.0, 25.5, -0.1]),
             },
         ];
-        let evidence = multinomial_formula_separation_evidence(&saturated)
-            .expect("a saturated |eta| >= 25 logit is separation evidence");
         assert!(
-            evidence.contains("saturated logit") && evidence.contains("row 1"),
-            "evidence must name the witnessing saturated logit, got {evidence}"
+            multinomial_formula_separation_evidence(&saturated).is_none(),
+            "a finite saturated formula-mode logit must not arm the Firth refit"
         );
 
         // Non-finite logit ⇒ inner blow-up along an unbounded direction ⇒
-        // separation evidence (strictly stronger than saturation).
+        // separation evidence.
         let blown_up = vec![ParameterBlockState {
             beta: Array1::from_vec(vec![1.0, 2.0]),
             eta: Array1::from_vec(vec![0.2, f64::NAN, -7.0]),
@@ -2025,8 +2001,8 @@ mod fisher_override_tests {
             "evidence must name the non-finite logit, got {evidence}"
         );
 
-        // Just-below-threshold logits stay interior: the gate is the documented
-        // MULTINOMIAL_SEPARATION_ETA_THRESHOLD boundary, not a softer heuristic.
+        // Large finite logits below the fixed-lambda diagnostic threshold are
+        // likewise accepted on the formula path.
         let near = vec![ParameterBlockState {
             beta: Array1::from_vec(vec![1.0, 2.0]),
             eta: Array1::from_vec(vec![0.2, 24.9, -24.9]),
