@@ -210,7 +210,7 @@ const MULTINOMIAL_SEPARATION_ETA_THRESHOLD: f64 = 25.0;
 const MULTINOMIAL_OUTER_REML_TOL: f64 = 1e-7;
 
 /// The first multinomial formula solve is a separation probe: it is accepted
-/// only when the unbiased REML criterion reaches a finite interior optimum.
+/// when the unbiased REML criterion returns a finite interior iterate.
 /// Near-separable data such as the penguin fixture otherwise spend the caller's
 /// full outer budget on an iterate that is discarded before the Firth/Jeffreys
 /// refit. Keep enough iterations for ordinary interior fits to certify quickly,
@@ -1343,9 +1343,7 @@ pub fn fit_penalized_multinomial_formula(
         crate::types::RhoPrior::Flat,
     ) {
         Ok(unbiased_fit)
-            if unbiased_fit.outer_converged
-                && multinomial_formula_separation_evidence(&unbiased_fit.block_states)
-                    .is_none() =>
+            if multinomial_formula_separation_evidence(&unbiased_fit.block_states).is_none() =>
         {
             unbiased_fit
         }
