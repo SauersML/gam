@@ -1378,6 +1378,86 @@ where
             edf_by_block[kk] = edf_k;
         }
 
+        // Reconcile the EDF accounting with the influence matrix F = H⁻¹X'WX.
+        //
+        // The block-trace channel above factorizes the TRANSFORMED stabilized
+        // Hessian with a bespoke 10×-escalation ridge loop. On rank-deficient
+        // spatial-smooth corners (degenerate-Hessian thin-plate fits) that loop
+        // can take an enormous ridge, inflating Σ tr_kk toward `p` and collapsing
+        // `edf_total = p − Σ tr_kk` onto its floor `mp` (e.g. 1.0 for a single
+        // smooth) even though the fitted surface — and the influence matrix `F`
+        // that the prediction, dispersion, and per-term EDF all consume — has
+        // legitimately spent ~70 EDF (issue #1356). The authoritative model
+        // definition of EDF is the influence-matrix trace; the per-term EDF
+        // (`FitResult::per_term_edf`) reads `tr(F)` over each block. Recompute the
+        // per-block penalty traces from the SAME rank-revealing inverse `F` uses
+        // (`matrix_inversewith_regularization` of the original-basis Hessian), so
+        // `edf_total = p − Σ tr_kk = tr(F)`, `Σ edf_by_block = edf_total`, and the
+        // total can never fall below a single term's own EDF. Done before the
+        // dispersion `σ̂² = RSS/(n − edf_total)` is formed so it, too, uses the
+        // honest effective d.f. (the trace-channel collapse otherwise biased
+        // σ̂² high → inflated SEs on the same seeds).
+        //
+        // Per-block traces `tr_kk = λ_kk·tr(H⁻¹ S_kk)` are basis-invariant; map
+        // each canonical block's penalty root into the original coefficient basis
+        // (`root_orig = Qs · root_t`) and contract against the original-basis
+        // inverse. Restricted to small models (where the dense inverse `F` itself
+        // is formed); large models keep the trace-channel value.
+        {
+            let p_orig = pirls_res.reparam_result.qs.nrows();
+            const COV_FULL_INVERSE_MAX_P: usize = 10_000;
+            if p_orig <= COV_FULL_INVERSE_MAX_P {
+                let h_orig = map_hessian_to_original_basis(&pirls_res)?;
+                if let Some(h_inv) =
+                    matrix_inversewith_regularization(&h_orig, "edf reconciliation")
+                {
+                    let qs = &pirls_res.reparam_result.qs;
+                    let p_t = qs.ncols();
+                    let mut traces_f = vec![0.0f64; k];
+                    for (kk, cp) in pirls_res
+                        .reparam_result
+                        .canonical_transformed
+                        .iter()
+                        .enumerate()
+                    {
+                        if kk >= lambdas.len() {
+                            continue;
+                        }
+                        let r = &cp.col_range;
+                        let rank = cp.rank();
+                        let mut root_t = Array2::<f64>::zeros((p_t, rank));
+                        for col in 0..rank {
+                            for row in 0..cp.block_dim() {
+                                root_t[[r.start + row, col]] = cp.root[[col, row]];
+                            }
+                        }
+                        // S_kk = Rᵀ R; λ_kk·tr(H⁻¹ S_kk) = λ_kk·Σ_col (R_col)ᵀ H⁻¹ R_col.
+                        let root_orig = qs.dot(&root_t); // p_orig × rank
+                        let sol = h_inv.dot(&root_orig); // H⁻¹ R
+                        let mut frob = 0.0f64;
+                        for col in 0..rank {
+                            for row in 0..p_orig {
+                                frob += sol[[row, col]] * root_orig[[row, col]];
+                            }
+                        }
+                        traces_f[kk] = lambdas[kk] * frob;
+                    }
+                    edf_total = (p_orig as f64 - kahan_sum(traces_f.iter().copied()))
+                        .clamp(mp, p_orig as f64);
+                    penalty_block_trace.clone_from(&traces_f);
+                    for (kk, cp) in pirls_res
+                        .reparam_result
+                        .canonical_transformed
+                        .iter()
+                        .enumerate()
+                    {
+                        let p_k = cp.rank() as f64;
+                        edf_by_block[kk] = (p_k - traces_f[kk]).clamp(0.0, p_k);
+                    }
+                }
+            }
+        }
+
         // O(n⁻¹) frequentist bias correction vector b̂ = H⁻¹ S(λ̂)(β̂ - μ).
         // Computed in transformed PIRLS basis (where the factorization above lives)
         // and then mapped to the original coefficient basis via Qs.

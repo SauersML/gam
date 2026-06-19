@@ -143,6 +143,104 @@ mod per_term_edf_tests {
 
         assert_eq!(edf, 28.0);
     }
+
+    /// Single-smooth thin-plate model whose EDF channels agree: `edf_total`
+    /// equals the influence-matrix trace `tr(F)` and is consistent with the
+    /// single smooth term's own per-term EDF. Guards issue #1356, where the
+    /// trace channel (`p − Σ tr_kk` from an over-ridged TRANSFORMED Hessian)
+    /// collapsed `edf_total` onto its `1.0` floor while the per-term influence
+    /// trace legitimately reported ~71 EDF — the total fell *below* a single
+    /// term's EDF, which is structurally impossible for a sum of non-negative
+    /// per-term contributions. After the optimizer reconciles both channels to
+    /// the same rank-revealing inverse, `edf_total ≥ max per-term EDF` holds.
+    fn fit_single_thinplate_consistent_edf() -> UnifiedFitResult {
+        // p = 11: one intercept column (index 0, unpenalised, EDF 1) plus a
+        // 10-coefficient thin-plate block that has spent 7 EDF (F diagonal 0.7).
+        let p = 11usize;
+        let mut influence = Array2::<f64>::zeros((p, p));
+        influence[[0, 0]] = 1.0; // intercept: full degree of freedom
+        for j in 1..p {
+            influence[[j, j]] = 0.7; // smooth block: Σ = 7.0 EDF
+        }
+        let edf_total: f64 = (0..p).map(|j| influence[[j, j]]).sum(); // tr(F) = 8.0
+        let beta = Array1::zeros(p);
+        UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: beta.clone(),
+                role: BlockRole::Mean,
+                edf: edf_total,
+                lambdas: Array1::from_vec(vec![1.0]),
+            }],
+            log_lambdas: Array1::zeros(1),
+            lambdas: Array1::from_vec(vec![1.0]),
+            likelihood_family: Some(LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            used_device: false,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: Some(0.0),
+            standard_deviation: 1.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference: Some(FitInference {
+                // tr_kk over the single penalty block = dim − edf = 10 − 7 = 3.
+                edf_by_block: vec![7.0],
+                penalty_block_trace: vec![3.0],
+                edf_total,
+                smoothing_correction: None,
+                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(
+                    eye(p),
+                ),
+                working_weights: Array1::ones(1),
+                working_response: Array1::zeros(1),
+                reparam_qs: None,
+                dispersion: Dispersion::Estimated(1.0),
+                beta_covariance: None,
+                beta_standard_errors: None,
+                beta_covariance_corrected: None,
+                beta_standard_errors_corrected: None,
+                beta_covariance_frequentist: None,
+                coefficient_influence: Some(influence),
+                weighted_gram: None,
+                bias_correction_beta: None,
+            }),
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: crate::pirls::PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: FitArtifacts::default(),
+            inner_cycles: 0,
+        })
+    }
+
+    #[test]
+    fn edf_total_never_below_a_single_terms_edf() {
+        let fit = fit_single_thinplate_consistent_edf();
+
+        // The single thin-plate smooth term (coeff columns 1..11, one penalty
+        // block at cursor 0) reports its influence-matrix EDF.
+        let term_edf = fit.per_term_edf(1..11, 0, 1);
+        let edf_total = fit.edf_total().expect("edf_total present");
+
+        // #1356 invariant: a sum of non-negative per-term EDF contributions can
+        // never be smaller than any one of them.
+        assert!(
+            edf_total + 1e-9 >= term_edf,
+            "edf_total ({edf_total}) fell below a single term's EDF ({term_edf})"
+        );
+        // And both channels read the same influence matrix, so the smooth term
+        // is the model total minus the intercept's one degree of freedom.
+        assert!((term_edf - 7.0).abs() < 1e-9, "term_edf = {term_edf}");
+        assert!((edf_total - 8.0).abs() < 1e-9, "edf_total = {edf_total}");
+    }
 }
 
 /// Standardized-disagreement gate: the audit flags inconsistency when the
