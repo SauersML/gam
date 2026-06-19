@@ -109,10 +109,7 @@ fn dispersion_location_scale_observation_band_is_skewed_not_symmetric() {
     let headers = vec!["x".to_string(), "y".to_string()];
     let records: Vec<csv::StringRecord> = (0..xtr.len())
         .map(|i| {
-            csv::StringRecord::from(vec![
-                format!("{:.17e}", xtr[i]),
-                format!("{:.17e}", ytr[i]),
-            ])
+            csv::StringRecord::from(vec![format!("{:.17e}", xtr[i]), format!("{:.17e}", ytr[i])])
         })
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, records).expect("encode gamma data");

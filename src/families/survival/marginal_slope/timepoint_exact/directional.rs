@@ -512,8 +512,7 @@ impl SurvivalMarginalSlopeFamily {
                             let z_dir = -(a_dir + z * dir_g) / b;
                             let axis_g = if axis == primary.g { 1.0 } else { 0.0 };
                             let z_axis = -(a_u[axis] + z * axis_g) / b;
-                            let z_axis_dir =
-                                -(a_u_dir[axis] + z_dir * axis_g + z_axis * dir_g) / b;
+                            let z_axis_dir = -(a_u_dir[axis] + z_dir * axis_g + z_axis * dir_g) / b;
                             (z_axis, z_axis_dir, z_dir)
                         }
                         crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
@@ -523,8 +522,7 @@ impl SurvivalMarginalSlopeFamily {
                 };
                 let density_z_derivative = |poly: &[f64], z: f64| -> f64 {
                     let eta = neg_cell.eta(z);
-                    let eta_z =
-                        neg_cell.c1 + 2.0 * neg_cell.c2 * z + 3.0 * neg_cell.c3 * z * z;
+                    let eta_z = neg_cell.c1 + 2.0 * neg_cell.c2 * z + 3.0 * neg_cell.c3 * z * z;
                     let amp = eval_poly_slice(poly, z);
                     let amp_z = eval_poly_derivative_slice(poly, z);
                     let q_z = z + eta * eta_z;
@@ -545,11 +543,11 @@ impl SurvivalMarginalSlopeFamily {
                                 return 0.0;
                             }
                             z_axis_dir
-                                * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
-                                    neg_cell, poly, z,
-                                )
-                                + z_axis * density_dir_integrand(poly, poly_dir, z)
-                                + z_axis * z_dir * density_z_derivative(poly, z)
+                            * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                neg_cell, poly, z,
+                            )
+                            + z_axis * density_dir_integrand(poly, poly_dir, z)
+                            + z_axis * z_dir * density_z_derivative(poly, z)
                         };
                     eval_edge(part.right_edge, neg_cell.right)
                         - eval_edge(part.left_edge, neg_cell.left)

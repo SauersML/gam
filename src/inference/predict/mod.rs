@@ -1982,19 +1982,15 @@ pub(crate) fn family_observation_band_per_row(
     // consume the per-row dispersion `disp` — the only quantity that is a scalar
     // in the single-block band but an array here.
     let predictive: Box<dyn Fn(f64, f64, f64, f64, f64) -> Option<(f64, f64)>> = match response {
-        ResponseFamily::Gamma => {
-            Box::new(|mu, _disp, total_var, p_lo, p_hi| {
-                gamma_moment_matched_interval(mu, total_var, p_lo, p_hi)
-            })
-        }
+        ResponseFamily::Gamma => Box::new(|mu, _disp, total_var, p_lo, p_hi| {
+            gamma_moment_matched_interval(mu, total_var, p_lo, p_hi)
+        }),
         ResponseFamily::Beta { .. } => Box::new(|mu, _disp, total_var, p_lo, p_hi| {
             beta_moment_matched_interval(mu, total_var, p_lo, p_hi)
         }),
-        ResponseFamily::NegativeBinomial { .. } => {
-            Box::new(|mu, theta, total_var, p_lo, p_hi| {
-                negative_binomial_moment_matched_interval(mu, theta, total_var, p_lo, p_hi)
-            })
-        }
+        ResponseFamily::NegativeBinomial { .. } => Box::new(|mu, theta, total_var, p_lo, p_hi| {
+            negative_binomial_moment_matched_interval(mu, theta, total_var, p_lo, p_hi)
+        }),
         ResponseFamily::Tweedie { p } => {
             let power = *p;
             Box::new(move |mu, phi, total_var, p_lo, p_hi| {

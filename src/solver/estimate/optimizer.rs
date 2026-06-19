@@ -1485,7 +1485,6 @@ where
         outer_result.final_grad_norm.unwrap_or(0.0)
     };
 
-
     if opts.compute_inference {
         penalized_hessian = map_hessian_to_original_basis(&pirls_res)?;
         let p_cov = penalized_hessian.nrows();

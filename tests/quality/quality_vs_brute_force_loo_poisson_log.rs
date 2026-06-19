@@ -394,7 +394,10 @@ fn alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log() {
                 "frozen-curvature leave-{i}-out Jacobian degenerate: {jac:.3e}"
             );
             eta_fc -= residual / jac;
-            assert!(eta_fc.is_finite(), "frozen-curvature leave-{i}-out diverged");
+            assert!(
+                eta_fc.is_finite(),
+                "frozen-curvature leave-{i}-out diverged"
+            );
         }
         assert!(
             fc_converged,

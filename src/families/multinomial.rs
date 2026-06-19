@@ -1358,7 +1358,8 @@ pub fn fit_penalized_multinomial_formula(
     ) {
         Ok(unbiased_fit)
             if unbiased_fit.outer_converged
-                && multinomial_formula_separation_evidence(&unbiased_fit.block_states).is_none() =>
+                && multinomial_formula_separation_evidence(&unbiased_fit.block_states)
+                    .is_none() =>
         {
             unbiased_fit
         }

@@ -266,10 +266,7 @@ fn double_penalty_does_not_inflate_unsupported_edf_1266() {
         InverseLink::Standard(StandardLink::Identity),
     );
     let opts = FitOptions {
-        rho_prior: RhoPrior::Normal {
-            mean: 0.0,
-            sd: 3.0,
-        },
+        rho_prior: RhoPrior::Normal { mean: 0.0, sd: 3.0 },
         penalty_shrinkage_floor: Some(1e-6),
         ..fit_options()
     };
