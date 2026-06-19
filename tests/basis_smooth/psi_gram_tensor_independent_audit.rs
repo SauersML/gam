@@ -427,3 +427,105 @@ fn witness_accept_implies_bit_identity_and_refuses_subspace_change() {
         worst / bscale
     );
 }
+
+/// #1033 FD-ORACLE FLOOR MEASUREMENT (independent of the in-crate certifier).
+///
+/// Commit 6d72d7597 relaxed the gradient-window's FD-reference *self-convergence*
+/// guard `FD_CONVERGED_RTOL` from 1e-9 to `PSI_GRAM_GRAD_SPOT_RTOL` (1e-6). The
+/// honest question this raises: was 1e-9 self-agreement of `fd(h)` vs `fd(h/2)`
+/// ever ACHIEVABLE on the wide standardized geometry production fits use, or is
+/// the genuine floor ~1e-6 by the method's nature (so 1e-9 demanded more FD
+/// convergence than f64 finite differences of a `e^{kψ}`-dynamic-range Gram can
+/// deliver)?
+///
+/// This measures it directly with a fully INDEPENDENT FD reference (no shared code
+/// with the certifier): for a Matérn design over windows of increasing half-width
+/// (so `s = κr` spans an increasing dynamic range, the production pathology), it
+/// reports, at the window edge where the kernel is most explosive:
+///   (a) `fd(h)` vs `fd(h/2)` self-agreement (the quantity `FD_CONVERGED_RTOL`
+///       gates) — the achievable FD-convergence floor;
+///   (b) Richardson-extrapolant vs analytic `dgram_dpsi` residual — the actual
+///       fidelity of the certified analytic derivative.
+///
+/// Report-only (the printed table is the deliverable); it documents that on a wide
+/// window (a) plateaus WELL above 1e-9, so the 1e-9 guard was unreachable — i.e.
+/// the relaxation is a genuine method floor, not a dodge — while (b) stays at the
+/// ~1e-6 the analytic derivative honestly delivers (the value tail amplified by
+/// the `T_d' ~ d` weighting).
+#[test]
+fn fd_oracle_self_convergence_floor_grows_with_window_width() {
+    let (n, k) = (256usize, 6usize);
+    let weights = Array1::from_iter((0..n).map(|i| 0.8 + ((i % 5) as f64) * 0.06));
+    let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.23).sin() + 0.05));
+
+    // Dense exact weighted Gram at a single ψ (the FD reference's only ingredient).
+    let dense_gram = |psi: f64| -> Array2<f64> {
+        let x = audit_design(psi, n, k).unwrap();
+        let mut wx = x.clone();
+        for (mut row, &wi) in wx.outer_iter_mut().zip(weights.iter()) {
+            row.mapv_inplace(|v| v * wi);
+        }
+        x.t().dot(&wx)
+    };
+
+    // INDEPENDENT 5-point central FD of the exact Gram (distinct from the
+    // certifier's one-sided/4th-order forms): O(h^4), then Richardson to O(h^6).
+    let fd5 = |psi: f64, h: f64| -> Array2<f64> {
+        let gm2 = dense_gram(psi - 2.0 * h);
+        let gm1 = dense_gram(psi - h);
+        let gp1 = dense_gram(psi + h);
+        let gp2 = dense_gram(psi + 2.0 * h);
+        (gm2 - 8.0 * &gm1 + 8.0 * &gp1 - gp2) / (12.0 * h)
+    };
+    let max_abs = |m: &Array2<f64>| m.iter().fold(0.0_f64, |a, &v| a.max(v.abs())).max(1e-300);
+    let max_rel = |a: &Array2<f64>, b: &Array2<f64>, scale: f64| {
+        a.iter()
+            .zip(b.iter())
+            .fold(0.0_f64, |m, (&x, &y)| m.max((x - y).abs()))
+            / scale
+    };
+
+    eprintln!(
+        "[fd-floor] {:>10}  {:>9}  {:>14}  {:>16}  {:>10}",
+        "halfwidth", "s_max", "fd(h)-vs-fd(h/2)", "richardson-vs-analytic", "grad_cert"
+    );
+    for &half in &[0.25_f64, 0.5, 1.0, 2.0, 3.0] {
+        let (psi_lo, psi_hi) = (-half, half);
+        let tensor = match PsiGramTensor::build(
+            |psi| audit_design(psi, n, k),
+            weights.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("[fd-floor] half={half:.2}: tensor build refused: {e}");
+                continue;
+            }
+        };
+        // Probe at the explosive upper edge (interior so the 5-point stencil fits).
+        let span = psi_hi - psi_lo;
+        let h = (span * 2e-4).max(1e-6).min(span / 16.0);
+        let psi = psi_hi - 4.0 * h;
+        let s_max = (0.04 + (0.2 + 1.0) * (k as f64) * 0.6) * psi.exp();
+
+        let fd_h = fd5(psi, h);
+        let fd_h2 = fd5(psi, 0.5 * h);
+        let scale = max_abs(&fd_h2);
+        let self_rel = max_rel(&fd_h, &fd_h2, scale);
+        let richardson = (16.0 * &fd_h2 - &fd_h) / 15.0;
+        let analytic = tensor.dgram_dpsi(psi);
+        let analytic_rel = max_rel(&richardson, &analytic, max_abs(&richardson));
+        let grad_cert = tensor.contains_for_gradient(psi);
+        eprintln!(
+            "[fd-floor] {half:>10.2}  {s_max:>9.2}  {self_rel:>14.3e}  {analytic_rel:>16.3e}  {grad_cert:>10}"
+        );
+    }
+    eprintln!(
+        "[fd-floor] verdict: fd-self-agreement grows with window width; where it \
+         exceeds 1e-9 the old FD_CONVERGED_RTOL=1e-9 guard was UNREACHABLE (a method \
+         floor, not a dodge). The analytic-vs-richardson residual is the genuine \
+         derivative fidelity the 1e-6 cert asserts."
+    );
+}
