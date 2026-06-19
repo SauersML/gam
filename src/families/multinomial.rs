@@ -217,9 +217,27 @@ const MULTINOMIAL_UNBIASED_PROBE_OUTER_MAX_ITER: usize = 20;
 
 /// Formula-path smoothing parameters below this level are effectively at the
 /// zero-penalty boundary for penguin-scale multinomial fixtures. Keep the
-/// unbiased REML optimizer inside this lower box bound instead of accepting a
+/// unbiased REML optimizer inside a lower box bound instead of accepting a
 /// boundary-overfit surface or switching to Firth bias on finite data.
 const MULTINOMIAL_FORMULA_MIN_LAMBDA: f64 = 2.0e-4;
+
+/// Sparse minority classes need a stronger lower λ floor: with fewer rows in a
+/// class, the softmax Fisher surface is less able to calibrate boundary-hugging
+/// smooths on held-out data. Better-supported classes keep the lower floor so
+/// the fit remains flexible enough to recover the separating boundary.
+const MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_COUNT: f64 = 50.0;
+const MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA: f64 = 1.0e-3;
+
+fn multinomial_formula_min_lambda(y_one_hot: ArrayView2<'_, f64>) -> f64 {
+    let min_class_count = (0..y_one_hot.ncols())
+        .map(|class| y_one_hot.column(class).sum())
+        .fold(f64::INFINITY, f64::min);
+    if min_class_count < MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_COUNT {
+        MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA
+    } else {
+        MULTINOMIAL_FORMULA_MIN_LAMBDA
+    }
+}
 
 fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
     let mut best = (0.0_f64, 0usize, 0usize);
@@ -316,6 +334,40 @@ fn multinomial_formula_separation_evidence(block_states: &[ParameterBlockState])
         }
     }
     None
+}
+
+/// Extra evidence used only for a NON-CONVERGED capped unbiased probe.
+///
+/// A converged finite saturated formula fit is still a valid optimum and must be
+/// scored without Firth bias. A capped probe that failed to converge while it
+/// already carries separation-scale logits is different: spending the full
+/// unbiased outer budget on the same lambda-to-zero surface is the #1082
+/// timeout. Route that case straight to the proper-prior refit.
+fn multinomial_formula_unresolved_probe_separation_evidence(
+    block_states: &[ParameterBlockState],
+) -> Option<String> {
+    if let Some(evidence) = multinomial_formula_separation_evidence(block_states) {
+        return Some(evidence);
+    }
+
+    let mut best = (0.0_f64, 0usize, 0usize);
+    for (active_class, state) in block_states.iter().enumerate() {
+        for (row, &value) in state.eta.iter().enumerate() {
+            let abs = value.abs();
+            if abs > best.0 {
+                best = (abs, row, active_class);
+            }
+        }
+    }
+    if best.0 >= MULTINOMIAL_SEPARATION_ETA_THRESHOLD {
+        Some(format!(
+            "separation-scale finite logit |eta[row {}, active class {}]| = {:.3e} \
+             after capped unbiased probe",
+            best.1, best.2, best.0
+        ))
+    } else {
+        None
+    }
 }
 
 /// Inputs to [`fit_penalized_multinomial`].
@@ -1248,7 +1300,7 @@ pub fn fit_penalized_multinomial_formula(
         outer_max_iter,
         outer_tol,
         outer_rel_cost_tol,
-        rho_lower_bound: MULTINOMIAL_FORMULA_MIN_LAMBDA.ln(),
+        rho_lower_bound: multinomial_formula_min_lambda(y_one_hot.view()).ln(),
         ridge_floor: MULTINOMIAL_FORMULA_RIDGE_FLOOR,
         // #747: the stabilization floor is SOLVER-ONLY — it keeps the inner
         // joint-Newton linear solve finite during screening (bounding the step
@@ -1362,6 +1414,21 @@ pub fn fit_penalized_multinomial_formula(
                     .is_none() =>
         {
             unbiased_fit
+        }
+        Ok(unresolved_fit)
+            if multinomial_formula_unresolved_probe_separation_evidence(
+                &unresolved_fit.block_states,
+            )
+            .is_some() =>
+        {
+            let evidence = multinomial_formula_unresolved_probe_separation_evidence(
+                &unresolved_fit.block_states,
+            )
+            .expect("guard established unresolved-probe separation evidence");
+            run_firth_refit(format!(
+                "unbiased-criterion REML probe did not converge after {} outer iterations; {evidence}",
+                unresolved_fit.outer_iterations
+            ))?
         }
         Ok(unresolved_fit)
             if multinomial_formula_separation_evidence(&unresolved_fit.block_states).is_none() =>
@@ -2020,6 +2087,42 @@ mod fisher_override_tests {
         assert!(
             multinomial_formula_separation_evidence(&near).is_none(),
             "logits below the saturation threshold must not arm the Firth refit"
+        );
+    }
+
+    #[test]
+    fn unresolved_probe_evidence_arms_firth_on_saturated_finite_logits() {
+        let saturated = vec![
+            ParameterBlockState {
+                beta: Array1::from_vec(vec![1.0, 2.0]),
+                eta: Array1::from_vec(vec![0.2, 4.0, -7.0]),
+            },
+            ParameterBlockState {
+                beta: Array1::from_vec(vec![-1.0, 3.0]),
+                eta: Array1::from_vec(vec![1.0, 25.5, -0.1]),
+            },
+        ];
+
+        assert!(
+            multinomial_formula_separation_evidence(&saturated).is_none(),
+            "a converged finite saturated formula optimum remains unbiased"
+        );
+        let evidence = multinomial_formula_unresolved_probe_separation_evidence(&saturated)
+            .expect("a non-converged saturated probe should arm the Firth refit");
+        assert!(
+            evidence.contains("separation-scale finite logit")
+                && evidence.contains("row 1")
+                && evidence.contains("active class 1"),
+            "unresolved-probe evidence should name the saturated channel, got {evidence}"
+        );
+
+        let near = vec![ParameterBlockState {
+            beta: Array1::from_vec(vec![1.0, 2.0]),
+            eta: Array1::from_vec(vec![0.2, 24.9, -24.9]),
+        }];
+        assert!(
+            multinomial_formula_unresolved_probe_separation_evidence(&near).is_none(),
+            "finite logits below the separation threshold still get the full unbiased retry"
         );
     }
 
