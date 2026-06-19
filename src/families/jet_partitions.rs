@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static COMPOSE_UNARY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static MUL_CALLS: AtomicU64 = AtomicU64::new(0);
-pub static ROW_NEGLOG_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
 pub(crate) struct MultiDirJet {
@@ -49,10 +48,6 @@ impl MultiDirJet {
         Self {
             coeffs: vec![base, d1, d2, d12],
         }
-    }
-
-    pub(crate) fn full_mask(&self) -> usize {
-        self.coeffs.len() - 1
     }
 
     pub(crate) fn coeff(&self, mask: usize) -> f64 {
