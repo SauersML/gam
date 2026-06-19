@@ -142,6 +142,8 @@ mod bug_hunt_logit_integrated_deriv_small_sigma;
 mod bug_hunt_logit_integrated_mean_large_sigma;
 #[path = "regressions/bug_hunt_main_does_not_compile_at_head.rs"]
 mod bug_hunt_main_does_not_compile_at_head;
+#[path = "regressions/bug_hunt_matern_2d_default_collapse_1357.rs"]
+mod bug_hunt_matern_2d_default_collapse_1357;
 #[path = "regressions/bug_hunt_matern_2d_kappa_nonconvergence.rs"]
 mod bug_hunt_matern_2d_kappa_nonconvergence;
 #[path = "regressions/bug_hunt_matern_aniso_input_loc.rs"]

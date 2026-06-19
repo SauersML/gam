@@ -3253,6 +3253,24 @@ const KERNEL_RANGE_MIN_DIAMETER_FRACTION: f64 = 2.0;
 /// capped here to keep the basis geometry well-conditioned.
 const KERNEL_RANGE_MAX_SPACING_MULTIPLE: f64 = 1e2;
 
+/// Matérn-only ceiling on the kernel length scale, as a fraction of the maximum
+/// pairwise distance `r_max` (i.e. the data diameter in the standardized kernel
+/// space). The generic kernel-range floor `KERNEL_RANGE_MIN_DIAMETER_FRACTION`
+/// permits length scales up to `r_max / 2` ≈ half the data diameter, where a
+/// compactly-decaying Matérn kernel (ν ≥ 3/2) is already nearly flat across the
+/// whole point cloud. At that flat corner every kernel column collapses onto the
+/// polynomial nullspace and REML then shrinks the entire smooth onto its
+/// intercept (#1357: EDF → 1, predict returns a constant surface). Unlike the
+/// pure-Duchon path — whose `r²log r` / `r^{2m-d}` head has no intrinsic decay
+/// length and stays informative at large scale — the Matérn radial kernel's
+/// finite range makes a too-large length scale genuinely uninformative. So the
+/// Matérn isotropic-κ outer optimizer caps the length scale at the data-derived
+/// default fraction (mirroring `DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION`
+/// in the term builder): κ may sharpen the kernel but can never flatten it past
+/// the informative default, keeping the kernel block from going degenerate while
+/// REML still learns the smoothing penalty on top.
+const MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.15;
+
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
 ///
 /// When geometry is unavailable (e.g., fewer than 2 distinct points), falls
@@ -3322,8 +3340,22 @@ fn spatial_term_psi_bounds(
     // The nullspace already carries constant/linear low-frequency structure,
     // so cap the kernel range at the diameter scale instead of letting the
     // optimizer enter a numerically degenerate basis geometry.
-    let psi_lo_data = (KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max).ln();
+    let mut psi_lo_data = (KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max).ln();
     let psi_hi_data = (KERNEL_RANGE_MAX_SPACING_MULTIPLE / r_min).ln();
+    // #1357: for the Matérn kernel specifically, do not let the isotropic-κ
+    // optimizer flatten the kernel past the data-derived default length scale.
+    // ψ = log κ = −log(length_scale), so the largest admissible length scale is
+    // the smallest admissible ψ; raise that floor to `1 / (frac · r_max)` so the
+    // kernel range never exceeds `frac · r_max` (the informative default). The
+    // generic floor `2 / r_max` admits length scales up to `r_max / 2`, where the
+    // compactly-decaying Matérn kernel is flat across the whole cloud and REML
+    // collapses the smooth to its intercept. Duchon / TPS keep the generic floor
+    // (their kernels stay informative at large scale).
+    if let SmoothBasisSpec::Matern { .. } = &term.basis {
+        let matern_psi_lo =
+            (1.0 / (MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION * r_max)).ln();
+        psi_lo_data = psi_lo_data.max(matern_psi_lo);
+    }
     // Intersect with the options window so min/max_length_scale remain hard caps.
     let psi_lo = psi_lo_data.max(fallback.0);
     let psi_hi = psi_hi_data.min(fallback.1);

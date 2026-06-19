@@ -2165,17 +2165,64 @@ fn try_exact_joint_spatial_length_scale_optimization(
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
     let log_kappa_star =
         SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, dims_per_term);
-    let resolvedspec = log_kappa_star.apply_tospec(resolvedspec, spatial_terms)?;
+    // Keep a handle on the baseline geometry spec before shadowing `resolvedspec`
+    // with the κ-optimized spec, so the #1357 degenerate-corner guard below can
+    // fall back to the frozen baseline.
+    let baseline_spec = resolvedspec;
+    let optimized_spec = log_kappa_star.apply_tospec(resolvedspec, spatial_terms)?;
     let optimized = fit_term_collection_forspecwith_heuristic_lambdas(
         data,
         y,
         weights,
         offset,
-        &resolvedspec,
+        &optimized_spec,
         rho_star.as_slice(),
-        family,
+        family.clone(),
         options,
     )?;
+
+    // #1357 degenerate-corner guard. In the flat (ρ, κ) valley the joint
+    // optimizer can certify a κ at which the kernel block goes nearly flat and
+    // REML then shrinks the whole smooth onto its intercept (EDF → the null
+    // floor, prediction returns a constant surface). Such a corner can carry a
+    // *better* profiled REML cost than the informative baseline — the
+    // smoothing-correction trace flips between the near-boundary cubature and
+    // first-order branches across draws, so the `joint_final_value` ≤
+    // `baseline_score` gate above does not catch it. The frozen baseline
+    // geometry (the data-derived default length scale with its own REML-seeded
+    // λ) keeps the kernel informative, so when the joint optimum has collapsed
+    // to the null while the baseline has materially more effective DOF, reject
+    // the optimum and keep the baseline. This never blocks a genuine refinement:
+    // the baseline is only preferred when the joint candidate is degenerate.
+    let optimized_edf = optimized.fit.inference.as_ref().map(|inf| inf.edf_total);
+    if let Some(opt_edf) = optimized_edf
+        && opt_edf < SPATIAL_COLLAPSE_EDF_FLOOR
+    {
+        let baseline = fit_frozen_baseline_geometry(
+            data,
+            y,
+            weights,
+            offset,
+            baseline_spec,
+            best,
+            family.clone(),
+            options,
+            baseline_score,
+            Some(kappa_timing),
+        )?;
+        let baseline_edf = baseline.fit.inference.as_ref().map(|inf| inf.edf_total);
+        if let Some(base_edf) = baseline_edf
+            && base_edf >= opt_edf + SPATIAL_COLLAPSE_EDF_MARGIN
+        {
+            log::info!(
+                "[spatial-kappa] joint candidate collapsed to the null (edf={opt_edf:.3}); \
+                 baseline geometry retains edf={base_edf:.3} — keeping the frozen baseline",
+            );
+            return Ok(Some(baseline));
+        }
+        // Baseline is no better (both genuinely near-null, or baseline lacks
+        // inference): keep the optimized candidate via the normal path below.
+    }
 
     // Stamp reml_score with joint_final_value so downstream consumers see a
     // score consistent with the gate decision; the refit serves as a
@@ -2185,13 +2232,24 @@ fn try_exact_joint_spatial_length_scale_optimization(
     let optimized_result = FittedTermCollectionWithSpec {
         fit,
         design: optimized.design,
-        resolvedspec,
+        resolvedspec: optimized_spec,
         adaptive_diagnostics: optimized.adaptive_diagnostics,
         kappa_timing: Some(kappa_timing),
     };
 
     Ok(Some(optimized_result))
 }
+
+/// EDF below this is treated as an intercept-only / null collapse of the spatial
+/// smooth (#1357): the model has shed essentially all effective degrees of
+/// freedom beyond a handful of unpenalized coordinates.
+const SPATIAL_COLLAPSE_EDF_FLOOR: f64 = 2.5;
+
+/// A non-degenerate baseline must carry at least this much more effective DOF
+/// than the collapsed joint candidate before the baseline is preferred (#1357),
+/// so genuinely-near-null surfaces (where both fits agree there is no signal)
+/// are left untouched.
+const SPATIAL_COLLAPSE_EDF_MARGIN: f64 = 1.0;
 
 /// Re-fit at the frozen baseline geometry — the REML-seeded length scales and
 /// heuristic λ already certified in `best` — and stamp the certified baseline
@@ -2204,8 +2262,8 @@ fn try_exact_joint_spatial_length_scale_optimization(
 /// started from, so it is always valid — the joint step can only ever improve on
 /// it, never block it.
 ///
-/// The refit is a β/inference harvester at `best`'s lambdas and the frozen
-/// `resolvedspec`; the score that geometry was certified at is
+/// The refit is a β/inference harvester at the frozen baseline `resolvedspec`;
+/// the score that geometry was certified at is
 /// `baseline_score = fit_score(&best.fit)`. We stamp that certified value rather
 /// than the harvest's own re-derived `reml_score`, which drifts because the
 /// harvest runs the full-inference option set (and re-runs the adaptive spatial
@@ -2216,6 +2274,18 @@ fn try_exact_joint_spatial_length_scale_optimization(
 /// geometry spuriously reads as "the optimizer made the score worse" and aborts
 /// an otherwise-valid fit. Stamping keeps the returned score consistent with the
 /// gate decision that selected this geometry, identical to the optimized branch.
+///
+/// #1357: the harvest warm-starts REML from `best.fit.lambdas` (reproducing the
+/// certified baseline cheaply), but on the flat (ρ, κ) Matérn valley that warm
+/// start can slide the ρ search into a degenerate basin that collapses the smooth
+/// onto its intercept (EDF → 1) even though `best` at the same geometry is
+/// healthy — the double-penalty nullspace-shrinkage block of `best`'s λ sits near
+/// the shrink-out corner, and the relaxed log-λ cap then lets it run away. When
+/// the warm-started harvest collapses far below `best`'s certified EDF, refit the
+/// same geometry from scratch (no λ seed, exactly how `best` was produced); the
+/// scratch fit recovers the healthy baseline. This retry only fires on the
+/// collapse pathology, so warm-starting's speed/uniformity is preserved for every
+/// non-degenerate fallback.
 #[allow(clippy::too_many_arguments)]
 fn fit_frozen_baseline_geometry(
     data: ArrayView2<'_, f64>,
@@ -2236,9 +2306,28 @@ fn fit_frozen_baseline_geometry(
         offset,
         resolvedspec,
         best.fit.lambdas.as_slice(),
-        family,
+        family.clone(),
         options,
     )?;
+    // #1357 collapse retry: if the warm-started harvest shed essentially all of
+    // `best`'s certified effective DOF (a flat-valley collapse onto the
+    // intercept), re-derive λ from scratch — `best` itself was fit from scratch
+    // and is healthy, so the scratch harvest reproduces it.
+    let best_edf = best.fit.inference.as_ref().map(|inf| inf.edf_total);
+    let baseline_edf = baseline.fit.inference.as_ref().map(|inf| inf.edf_total);
+    let baseline = match (best_edf, baseline_edf) {
+        (Some(best_edf), Some(base_edf))
+            if base_edf < SPATIAL_COLLAPSE_EDF_FLOOR
+                && best_edf >= base_edf + SPATIAL_COLLAPSE_EDF_MARGIN =>
+        {
+            log::info!(
+                "[spatial-kappa] warm-started frozen baseline collapsed (edf={base_edf:.3}) \
+                 below the certified baseline (edf={best_edf:.3}); refitting from scratch",
+            );
+            fit_term_collection_forspec(data, y, weights, offset, resolvedspec, family, options)?
+        }
+        _ => baseline,
+    };
     let mut fit = baseline.fit;
     fit.reml_score = baseline_score;
     Ok(FittedTermCollectionWithSpec {
