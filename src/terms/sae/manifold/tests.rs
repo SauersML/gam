@@ -7445,10 +7445,15 @@ pub(crate) fn rank_deficient_euclidean_outer_gradient_objective() -> SaeManifold
         phi[[row, 1]] = coords[[row, 0]];
         jet[[row, 1, 0]] = 1.0; // d/dt of the linear column.
     }
-    // p = 2 ambient, but the decoder column space is rank 1 (columns are
-    // proportional: column 1 = 2 · column 0), so the second output channel
-    // is unidentified — the line lives on a 1-D subspace of R².
-    let decoder = array![[1.0_f64, 2.0], [0.5, 1.0]];
+    // p = 2 ambient, but the decoder maps only into output channel 0 (its
+    // second column is identically zero), so the reconstruction `Φ·B` lives on
+    // the 1-D subspace `{x : x₁ = 0}` of R² and output channel 1 is genuinely
+    // unidentified. The decoder's right-singular null vector is then exactly the
+    // channel-1 axis `(0, 1)`, matching the near-null direction the joint-Hessian
+    // cache below places on that axis (β indices 1 and 3). This is the rank-1
+    // decoder column-span deficiency `decoder_channel_null_directions` must
+    // recover (#1051/#1273).
+    let decoder = array![[1.0_f64, 0.0], [0.5, 0.0]];
     let atom = SaeManifoldAtom::new(
         "euclidean_line",
         SaeAtomBasisKind::EuclideanPatch,

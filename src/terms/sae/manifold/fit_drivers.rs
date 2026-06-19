@@ -996,6 +996,94 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
+    /// Deflation candidates for a rank-deficient decoder **column span** (the
+    /// ambient output-channel deficiency #1051/#1273 — distinct from the
+    /// basis-column deficiency [`Self::decoder_beta_null_directions`] handles).
+    ///
+    /// [`Self::decoder_beta_null_directions`] is channel-free: it replicates a
+    /// single `M_k`-vector basis-null across all `p` output channels, so it can
+    /// only see a basis column the data never excites (e.g. an unused `t²`
+    /// monomial). It is structurally blind to a decoder whose `p` output
+    /// channels are linearly dependent — a rank-deficient `B_k` (M_k × p) whose
+    /// realised reconstruction `Φ_k B_k` lives on a proper subspace of `R^p`.
+    /// Then an entire ambient channel direction `c ∈ R^p` orthogonal to the
+    /// decoder's row space is unidentified, and the joint Hessian carries a
+    /// genuine near-null direction OUTSIDE both the chart gauge orbit and the
+    /// basis-null span. This is the rank-1-decoder-line geometry the
+    /// circle/Euclidean demos hit (#1273): the outer gate saw a sub-floor pivot
+    /// it had no candidate to deflate and rejected the trial ρ with
+    /// `RemlConvergenceError`.
+    ///
+    /// We emit one full-length candidate per (atom, sub-floor ambient channel,
+    /// basis row): the ambient channel direction `c` placed at that basis row's
+    /// coefficient slot, lifted into the `(n·q + β)` coordinate. The shared
+    /// Gram-Schmidt + Rayleigh-floor pass in the outer-gradient solver keeps
+    /// only the candidates that are genuinely flat against the actual cached
+    /// Hessian, so a full-rank decoder contributes nothing.
+    pub(crate) fn decoder_channel_null_directions(&self) -> Result<Vec<Array1<f64>>, String> {
+        let p = self.output_dim();
+        let n = self.n_obs();
+        let q = self.assignment.row_block_dim();
+        let beta_dim = self.beta_dim();
+        let total_len = n * q + beta_dim;
+        if p == 0 || beta_dim == 0 {
+            return Ok(Vec::new());
+        }
+        let beta_offsets = self.beta_offsets();
+        let mut out = Vec::new();
+        for atom_idx in 0..self.k_atoms() {
+            let atom = &self.atoms[atom_idx];
+            let m = atom.basis_size();
+            if m == 0 {
+                continue;
+            }
+            // Right-singular vectors of `B_k` (M_k × p) span the ambient
+            // channel space; those with a sub-floor singular value are the
+            // unrealised output channels (the decoder's column-span deficiency).
+            let (_u, sv, vt_opt) = match atom.decoder_coefficients.svd(false, true) {
+                Ok(parts) => parts,
+                Err(_) => continue,
+            };
+            let Some(vt) = vt_opt else {
+                continue;
+            };
+            let max_sv = sv.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+            // Relative cutoff on the SINGULAR values (the channel curvature
+            // scales like the square of the decoder singular value, so this is
+            // the sqrt of the curvature-scale floor used elsewhere).
+            let sv_floor = SAE_DECODER_BETA_NULL_RELATIVE_FLOOR.sqrt() * max_sv;
+            let beta_base = n * q + beta_offsets[atom_idx];
+            // `vt` is the thin right factor with `rank = min(m, p)` rows, each a
+            // length-`p` ambient channel direction. A channel is realised iff it
+            // has an above-floor singular value; a sub-floor (or zero) singular
+            // value marks an unidentified output channel of the rank-deficient
+            // decoder.
+            for c_idx in 0..vt.nrows() {
+                let realised = c_idx < sv.len() && max_sv > 0.0 && sv[c_idx] > sv_floor;
+                if realised {
+                    continue;
+                }
+                let channel = vt.row(c_idx);
+                if channel.len() != p {
+                    continue;
+                }
+                let norm_sq = channel.iter().map(|v| v * v).sum::<f64>();
+                if !(norm_sq.is_finite() && norm_sq > 1.0e-24) {
+                    continue;
+                }
+                // One candidate per basis row carrying this ambient channel.
+                for col in 0..m {
+                    let mut dir = Array1::<f64>::zeros(total_len);
+                    for out_col in 0..p {
+                        dir[beta_base + col * p + out_col] = channel[out_col];
+                    }
+                    out.push(dir);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn quotient_newton_step_norm_sq(
         &self,
         delta_ext_coord: ArrayView1<'_, f64>,
@@ -1044,7 +1132,14 @@ impl SaeManifoldTerm {
         let gauges = self
             .dense_step_gauge_vectors()?
             .into_iter()
-            .chain(self.decoder_beta_null_directions(penalized_gram_scale)?);
+            .chain(self.decoder_beta_null_directions(penalized_gram_scale)?)
+            // #1051/#1273: project out the decoder column-span null too, so the
+            // inner convergence measure and the outer-gradient deflation
+            // quotient the SAME identified subspace — otherwise a rank-deficient
+            // decoder whose only remaining motion is an unidentified ambient
+            // channel reads as converged by the step gate yet non-stationary by
+            // the gradient gate, burning the inner refine budget.
+            .chain(self.decoder_channel_null_directions()?);
         for mut gauge in gauges {
             for basis in &orthonormal {
                 let coeff = gauge.dot(basis);

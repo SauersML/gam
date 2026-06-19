@@ -5955,6 +5955,20 @@ impl SaeManifoldTerm {
                 raw_gauges.push(dir);
             }
         }
+        // #1051/#1273: also admit the decoder COLUMN-SPAN null (an unrealised
+        // ambient output channel of a rank-deficient decoder), which the
+        // channel-free basis-null above structurally cannot represent. The
+        // rank-1-decoder-line geometry (e.g. a 1-D euclidean line in p=2
+        // ambient: decoder column rank 1 of 2) puts the joint Hessian's
+        // sub-floor pivot entirely in one output channel; without this
+        // candidate the outer gate had nothing to deflate it with and rejected
+        // the trial ρ. The Rayleigh floor below still prunes any candidate that
+        // is not genuinely flat against the cached Hessian.
+        for dir in self.decoder_channel_null_directions()? {
+            if dir.len() == full_len {
+                raw_gauges.push(dir);
+            }
+        }
         if raw_gauges.is_empty() {
             return Err(conditioning_err);
         }
