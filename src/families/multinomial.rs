@@ -856,9 +856,11 @@ pub struct MultinomialSmoothSignificance {
 
 /// One-hot-encode the categorical response column and return both the
 /// encoding and the captured level names. The level order matches the order
-/// recorded in the dataset schema, which is itself the order of first
-/// appearance during inferred-schema construction — so it is stable and
-/// deterministic across runs (no silent class permutation).
+/// recorded in the dataset schema, which is the canonical (lexicographically
+/// sorted) factor order produced by inferred-schema construction (#1319) — so
+/// it is a deterministic function of the label *set*, independent of training
+/// row order (no silent class permutation under a row shuffle), and matches the
+/// R `factor()` / pandas `Categorical` convention.
 fn one_hot_categorical_response(
     data: &EncodedDataset,
     y_col: usize,
