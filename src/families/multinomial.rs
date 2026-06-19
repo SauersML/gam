@@ -1304,8 +1304,10 @@ pub fn fit_penalized_multinomial_formula(
     // supplies the O(1) curvature on the quotient-null subspace that smoothing
     // parameters mathematically cannot (`Sv = 0` ⇒ λ never touches `v`). The
     // Firth refit is the accepted result only when the unbiased formula solve
-    // failed or blew up; finite formula-path logits can be large on valid
-    // near-separated optima and should not be shrunk toward the uniform simplex.
+    // failed, did not converge on its full budget, or blew up; finite
+    // formula-path logits can be large on valid near-separated optima and
+    // should not be shrunk toward the uniform simplex once the unbiased outer
+    // solve has actually certified.
     let mut unbiased_probe_options = options.clone();
     unbiased_probe_options.outer_max_iter = unbiased_probe_options
         .outer_max_iter
@@ -1364,10 +1366,11 @@ pub fn fit_penalized_multinomial_formula(
                 crate::types::RhoPrior::Flat,
             ) {
                 Ok(full_unbiased_fit)
-                    if multinomial_formula_separation_evidence(
-                        &full_unbiased_fit.block_states,
-                    )
-                    .is_none() =>
+                    if full_unbiased_fit.outer_converged
+                        && multinomial_formula_separation_evidence(
+                            &full_unbiased_fit.block_states,
+                        )
+                        .is_none() =>
                 {
                     full_unbiased_fit
                 }
