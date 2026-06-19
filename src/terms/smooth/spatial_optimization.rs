@@ -6699,10 +6699,20 @@ where
                     if !cost.is_finite() {
                         return Ok(OuterEval::infeasible(theta.len()));
                     }
+                    // Symmetric with the non-finite-cost guard above: a non-finite
+                    // gradient marks this θ as infeasible just as a non-finite cost
+                    // does (e.g. degenerate tied / zero-gap survival times drive the
+                    // analytic exact-joint gradient channel to NaN/Inf). Return the
+                    // bounded infeasible sentinel so the outer optimizer rejects the
+                    // step and shrinks its trust region — instead of hard-failing the
+                    // entire REML fit and handing the driver an unbroken stream of
+                    // objective failures whose recovery path deepens once per outer
+                    // step until the worker stack overflows (the survival
+                    // location-scale path is the one that routes through this analytic
+                    // gradient, which is why it crashed where the cost-only paths only
+                    // stall).
                     if grad.iter().any(|v| !v.is_finite()) {
-                        return Err(EstimationError::RemlOptimizationFailed(
-                            "n-block exact-joint gradient contained non-finite values".to_string(),
-                        ));
+                        return Ok(OuterEval::infeasible(theta.len()));
                     }
                     return Ok(OuterEval {
                         cost,
@@ -6760,10 +6770,20 @@ where
                     if !cost.is_finite() {
                         return Ok(OuterEval::infeasible(theta.len()));
                     }
+                    // Symmetric with the non-finite-cost guard above: a non-finite
+                    // gradient marks this θ as infeasible just as a non-finite cost
+                    // does (e.g. degenerate tied / zero-gap survival times drive the
+                    // analytic exact-joint gradient channel to NaN/Inf). Return the
+                    // bounded infeasible sentinel so the outer optimizer rejects the
+                    // step and shrinks its trust region — instead of hard-failing the
+                    // entire REML fit and handing the driver an unbroken stream of
+                    // objective failures whose recovery path deepens once per outer
+                    // step until the worker stack overflows (the survival
+                    // location-scale path is the one that routes through this analytic
+                    // gradient, which is why it crashed where the cost-only paths only
+                    // stall).
                     if grad.iter().any(|v| !v.is_finite()) {
-                        return Err(EstimationError::RemlOptimizationFailed(
-                            "n-block exact-joint gradient contained non-finite values".to_string(),
-                        ));
+                        return Ok(OuterEval::infeasible(theta.len()));
                     }
                     Ok(OuterEval {
                         cost,
