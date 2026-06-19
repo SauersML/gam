@@ -1388,8 +1388,12 @@ pub fn fit_penalized_multinomial_formula(
     let firth_refit_options = &options;
 
     let run_firth_refit = |evidence: String| {
+        if std::env::var("GAM_MULTI_PROFILE").is_ok() {
+            eprintln!("[multi-profile] FIRTH refit armed; evidence={evidence}");
+        }
+        let __ft = std::time::Instant::now();
         let firth_family = family.clone().with_joint_jeffreys_term(true);
-        fit_custom_family_with_rho_prior(
+        let __r = fit_custom_family_with_rho_prior(
             &firth_family,
             &blocks,
             firth_refit_options,
@@ -1400,9 +1404,22 @@ pub fn fit_penalized_multinomial_formula(
                 "multinomial REML: Firth/Jeffreys-armed refit (separation evidence: \
                  {evidence}) failed: {err}"
             ))
-        })
+        });
+        if std::env::var("GAM_MULTI_PROFILE").is_ok() {
+            if let Ok(f) = &__r {
+                eprintln!(
+                    "[multi-profile] FIRTH refit DONE in {:.1}s outer_iters={} converged={}",
+                    __ft.elapsed().as_secs_f64(),
+                    f.outer_iterations,
+                    f.outer_converged
+                );
+            }
+        }
+        __r
     };
 
+    let __dbg_t = std::env::var("GAM_MULTI_PROFILE").is_ok();
+    let __t0 = std::time::Instant::now();
     let fit = match fit_custom_family_with_rho_prior(
         &family,
         &blocks,
@@ -1484,6 +1501,17 @@ pub fn fit_penalized_multinomial_formula(
             run_firth_refit(evidence)?
         }
     };
+    if __dbg_t {
+        eprintln!(
+            "[multi-profile] TOTAL fit-path {:.1}s final outer_iters={} inner_cycles={} D={} p_per_class={} m={}",
+            __t0.elapsed().as_secs_f64(),
+            fit.outer_iterations,
+            fit.inner_cycles,
+            total_rho_dim,
+            fit.blocks.first().map(|b| b.beta.len()).unwrap_or(0),
+            m
+        );
+    }
     if let Some(err) = multinomial_formula_separation_diagnostic(
         fit.inner_cycles,
         fit.outer_iterations,

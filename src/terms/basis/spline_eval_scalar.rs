@@ -833,12 +833,16 @@ pub fn evaluate_bspline_derivative_scalar_into(
         *v = 0.0;
     }
 
-    // Non-periodic (open/clamped) B-spline derivative: evaluate at the raw point.
-    // The eval point must NOT be wrapped modulo a period for an open basis — a
-    // periodic wrap moves a boundary-span point onto unrelated interior columns
-    // and breaks agreement with the value basis (gam#1348). Genuinely cyclic
-    // bases pre-wrap their input data into the base period before reaching here.
-    let x_eval = one_sided_derivative_eval_point(x, knot_vector, degree);
+    // Non-periodic (open/clamped) B-spline derivative. Clamp the eval point to the
+    // modeling interval `[knots[degree], knots[num_basis]]`, exactly as the value
+    // evaluator does, so the derivative is the derivative of the SAME value basis
+    // (linear extension => constant derivative in the exterior spans). The eval
+    // point must NOT be wrapped modulo a period for an open basis — a periodic wrap
+    // moved a boundary-span point onto unrelated interior columns and broke
+    // agreement with the value basis (gam#1348). Genuinely cyclic bases pre-wrap
+    // their input data into the base period before reaching here.
+    let x_clamped = clamp_eval_point_to_modeling_interval(x, knot_vector, degree);
+    let x_eval = one_sided_derivative_eval_point(x_clamped, knot_vector, degree);
 
     // Evaluate lower-degree (k-1) basis functions on the full knot support.
     internal::evaluate_splines_at_point_full_support_into(
@@ -1146,10 +1150,17 @@ pub(crate) fn evaluate_bspline_derivative_recurrence_into(
             minimum_degree: derivative_order,
         });
     }
-    // No periodic wrap of the eval point for an open/clamped basis: wrapping is
-    // only correct for a cyclic basis (whose evaluator pre-wraps its input), and
-    // applying it here would corrupt the boundary spans of every higher-order
-    // derivative the same way the first-derivative path was corrupted (gam#1348).
+    // Clamp the top-level eval point to the modeling interval, matching the value
+    // evaluator, so every higher-order derivative shares the value basis's boundary
+    // semantics (linear extension => the order-k derivative is the boundary value of
+    // that derivative in the exterior spans). No periodic wrap for an open/clamped
+    // basis: wrapping is only correct for a cyclic basis (whose evaluator pre-wraps
+    // its input) and corrupted the boundary spans here (gam#1348).
+    let x = if depth == 0 {
+        clamp_eval_point_to_modeling_interval(x, knot_vector, degree)
+    } else {
+        x
+    };
 
     // Order 1 is the base case: it is computed directly from the plain
     // degree-`degree` basis rather than from a lower-order derivative.

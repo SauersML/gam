@@ -361,6 +361,31 @@ pub(crate) fn has_clamped_bspline_boundaries(knotview: ArrayView1<f64>, degree: 
     left_clamped && right_clamped
 }
 
+/// Clamp a B-spline derivative evaluation point to the modeling interval
+/// `[knots[degree], knots[num_basis]]`, mirroring the value evaluator's clamp
+/// (`evaluate_splines_at_point_into`). Outside that interval the non-periodic
+/// value basis is a linear extension, so its derivative is the constant boundary
+/// derivative — which is exactly what evaluating at the clamped endpoint yields.
+/// Keeping the derivative's boundary semantics identical to the value's is what
+/// makes the analytic derivative equal a finite difference of the value (gam#1348).
+#[inline]
+pub(crate) fn clamp_eval_point_to_modeling_interval(
+    x: f64,
+    knotview: ArrayView1<f64>,
+    degree: usize,
+) -> f64 {
+    let num_basis = knotview.len().saturating_sub(degree + 1);
+    if num_basis == 0 {
+        return x;
+    }
+    let left = knotview[degree];
+    let right = knotview[num_basis];
+    if !left.is_finite() || !right.is_finite() || left >= right {
+        return x;
+    }
+    x.clamp(left, right)
+}
+
 #[inline]
 pub(crate) fn one_sided_derivative_eval_point(
     x: f64,
@@ -557,11 +582,15 @@ pub(crate) fn evaluate_splines_derivative_sparse_intowith_lower(
     }
     lowervalues[..num_basis_lower].fill(0.0);
 
-    // Non-periodic (open/clamped) B-spline derivative: evaluate at the raw point.
-    // No periodic wrap here — wrapping is only correct for a genuinely cyclic
-    // basis, whose evaluator pre-wraps its input data into the base period before
-    // calling this path (`create_cyclic_bspline_basis_dense`). Wrapping an open
-    // basis's eval point corrupts the boundary spans (gam#1348).
+    // Non-periodic (open/clamped) B-spline derivative. The eval point is clamped
+    // to the modeling interval `[knots[degree], knots[num_basis]]`, exactly as the
+    // value evaluator does (`evaluate_splines_at_point_into`), so the analytic
+    // derivative is the derivative of the SAME non-periodic value basis — including
+    // its linear extension in the boundary/exterior spans, where the value is
+    // linear and the derivative is therefore constant. No periodic wrap: wrapping
+    // moved boundary-span points onto unrelated interior columns and broke
+    // value/derivative agreement (gam#1348). Genuinely cyclic bases pre-wrap their
+    // own input data into the base period before reaching this path.
     let x_eval = one_sided_derivative_eval_point(x, knotview, degree);
     internal::evaluate_splines_at_point_full_support_into(
         x_eval,
