@@ -36,6 +36,12 @@ fn main() {
         return;
     }
 
+    // HARD ban (always fatal): the workspace lint level for `warnings` MUST be
+    // `deny`. A demotion to `warn` (or anything else) lets pre-existing warnings
+    // ride along and silently rots the tree. This is non-negotiable and cannot
+    // be waived by a comment in Cargo.toml — assert it here and exit(1) otherwise.
+    assert_warnings_are_denied(&manifest_dir);
+
     // HARD ban (always fatal, independent of the demoted aggregate scanner
     // below): no tracked file may leak the absolute MSI scratch path segment or
     // the SLURM batch directive keyword. Run first and exit(1) on any hit.
@@ -693,6 +699,63 @@ fn main() {
         total_rows,
         sections.len()
     );
+}
+
+/// Assert that the workspace-root `Cargo.toml` pins `[lints.rust] warnings`
+/// to `deny`. Any other level (`warn`, `allow`, missing) lets warnings
+/// accumulate; that is a build failure, not a soft signal. Comments in
+/// Cargo.toml cannot waive this — the policy lives here.
+fn assert_warnings_are_denied(manifest_dir: &Path) {
+    let cargo_toml = manifest_dir.join("Cargo.toml");
+    let content = fs::read_to_string(&cargo_toml)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", cargo_toml.display()));
+
+    // Find the `[lints.rust]` section and read its `warnings` value.
+    let mut in_lints_rust = false;
+    let mut found_level: Option<String> = None;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_lints_rust = line == "[lints.rust]";
+            continue;
+        }
+        if !in_lints_rust {
+            continue;
+        }
+        let code = line.split('#').next().unwrap_or("").trim();
+        if let Some(rest) = code.strip_prefix("warnings") {
+            let rest = rest.trim_start();
+            if let Some(value) = rest.strip_prefix('=') {
+                // Accept both `warnings = "deny"` and the table form
+                // `warnings = { level = "deny", ... }`.
+                let value = value.trim();
+                let level = if let Some(idx) = value.find("level") {
+                    value[idx..]
+                        .split('=')
+                        .nth(1)
+                        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_string())
+                } else {
+                    Some(value.trim_matches('"').trim_matches('\'').to_string())
+                };
+                found_level = level;
+                break;
+            }
+        }
+    }
+
+    match found_level.as_deref() {
+        Some("deny") => {}
+        Some(other) => panic!(
+            "[lints.rust] warnings MUST be \"deny\", found \"{other}\" in {}. \
+             Restore `warnings = \"deny\"`; warnings are not permitted to accumulate.",
+            cargo_toml.display()
+        ),
+        None => panic!(
+            "[lints.rust] warnings = \"deny\" is missing from {}. \
+             It MUST be present and set to \"deny\".",
+            cargo_toml.display()
+        ),
+    }
 }
 
 #[derive(Clone)]

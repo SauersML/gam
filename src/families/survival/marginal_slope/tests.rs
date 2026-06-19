@@ -2779,6 +2779,100 @@ fn debug_flex_base_hessian_vs_gradient_fd() {
     );
 }
 
+/// gam#932/#979: isolate WHICH logslope (g) first-sensitivity is wrong by
+/// finite-differencing the production exit-timepoint scalars (eta, chi, d) along
+/// g and comparing to production's analytic eta_u[g]/chi_u[g]/d_u[g]. d_u is an
+/// INTEGRAL over the calibration partition whose cell boundaries (link-knot
+/// crossings z=(tau-a)/b) move with b=g; if a Leibniz boundary term is missing,
+/// d_u[g] is wrong while eta_u[g]/chi_u[g] (point-evaluated) are right.
+#[test]
+#[ignore = "debug logslope first-sensitivity FD probe for #932/#979"]
+fn debug_flex_logslope_first_sensitivity_fd() {
+    let score_runtime = test_deviation_runtime();
+    let link_runtime = test_deviation_runtime();
+    let h_dim = score_runtime.basis_dim();
+    let w_dim = link_runtime.basis_dim();
+    let z_row = 0.3_f64;
+    let q0v = -0.25_f64;
+    let q1v = 0.7_f64;
+    let qd1v = 0.9_f64;
+    let gv = 0.4_f64;
+    let weight = 0.85_f64;
+    let event = 1.0_f64;
+    let beta_h0: Vec<f64> = (0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())).collect();
+    let beta_w0: Vec<f64> = (0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())).collect();
+
+    let make = |g: f64| {
+        let family = SurvivalMarginalSlopeFamily {
+            n: 1,
+            event: Arc::new(array![event]),
+            weights: Arc::new(array![weight]),
+            z: Arc::new(array![z_row].insert_axis(Axis(1))),
+            score_covariance: unit_score_covariance(),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+            offset_entry: Arc::new(array![q0v]),
+            offset_exit: Arc::new(array![q1v]),
+            derivative_offset_exit: Arc::new(array![qd1v]),
+            marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+            logslope_surface_ranges: empty_logslope_surface_ranges(),
+            score_warp: Some(score_runtime.clone()),
+            link_dev: Some(link_runtime.clone()),
+            influence_absorber: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+        family
+    };
+    let family = make(gv);
+    let primary = flex_primary_slices(&family);
+    let g = primary.g;
+    let bh = Array1::from(beta_h0.clone());
+    let bw = Array1::from(beta_w0.clone());
+
+    // Exit-timepoint base struct with eta_u/chi_u/d_u and scalars eta/chi/d.
+    let base_at = |gg: f64| -> SurvivalFlexTimepointExact {
+        let fam = make(gg);
+        let (a1, d1) = fam
+            .solve_row_survival_intercept_with_slot(
+                q1v, gg, Some(&bh), Some(&bw),
+                Some((0, SurvivalInterceptSlotKind::Exit)),
+            )
+            .expect("exit intercept");
+        fam.compute_survival_timepoint_exact(
+            0, &primary, q1v, primary.q1, a1, gg, d1, Some(&bh), Some(&bw), 0.0, true,
+        )
+        .expect("exit base")
+    };
+    let b0 = base_at(gv);
+    let fd = |sel: &dyn Fn(&SurvivalFlexTimepointExact) -> f64, h: f64| -> f64 {
+        let c = (sel(&base_at(gv + h)) - sel(&base_at(gv - h))) / (2.0 * h);
+        let f = (sel(&base_at(gv + h * 0.5)) - sel(&base_at(gv - h * 0.5))) / h;
+        (4.0 * f - c) / 3.0
+    };
+    eprintln!(
+        "LOGSLOPE-SENS d_u[g]: prod={:+.8e} fd_d={:+.8e} gap={:.2e}",
+        b0.d_u[g], fd(&|b| b.d, 2e-3), (b0.d_u[g] - fd(&|b| b.d, 2e-3)).abs()
+    );
+    eprintln!(
+        "LOGSLOPE-SENS eta_u[g]: prod={:+.8e} fd_eta={:+.8e} gap={:.2e}",
+        b0.eta_u[g], fd(&|b| b.eta, 2e-3), (b0.eta_u[g] - fd(&|b| b.eta, 2e-3)).abs()
+    );
+    eprintln!(
+        "LOGSLOPE-SENS chi_u[g]: prod={:+.8e} fd_chi={:+.8e} gap={:.2e}",
+        b0.chi_u[g], fd(&|b| b.chi, 2e-3), (b0.chi_u[g] - fd(&|b| b.chi, 2e-3)).abs()
+    );
+}
+
 #[test]
 fn link_flex_family_supports_second_order_exact_outer_path() {
     let score_runtime = test_deviation_runtime();
