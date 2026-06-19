@@ -4249,6 +4249,22 @@ fn relax_double_penalty_rho_prior(
     if selection_terms.is_empty() {
         return base.clone();
     }
+    // WELL-IDENTIFICATION GATE (#1089 vs #1266). The ρ-prior is two things at
+    // once: a #1266-harmful cap on the selection log-λ, AND a #1089-load-bearing
+    // stabiliser that makes the outer REML loop terminate on an *under-determined*
+    // double-penalty design (gam#893/#1196/#1089: the n=30 five-`ps` wine fit has
+    // p ≈ 51 > n, so without the prior the outer criterion is flat/degenerate in
+    // ρ-space and the loop never certifies a stationary point). Only lift the cap
+    // when the data comfortably over-determines the model (`n ≥ 2·p`), so the
+    // unregularised REML problem is well-posed on its own; otherwise keep the
+    // base prior so the loop still converges. The #1266 selection cases
+    // (`y ~ s(x) + s(z)`, n=800, p ≈ 40) clear this by ~20×; the #1089 wine fit
+    // (n < p) does not and keeps its stabiliser.
+    let n_obs = design.design.nrows();
+    let p_total = design.design.ncols();
+    if n_obs < 2 * p_total {
+        return base.clone();
+    }
     // Every penalty coordinate a selection term owns (wiggliness AND null-space)
     // is freed to `Flat` so REML can drive the whole term out; all other
     // coordinates keep the base prior.
