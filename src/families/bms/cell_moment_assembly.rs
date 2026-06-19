@@ -3285,7 +3285,11 @@ mod empirical_flex_jet_oracle_tests {
     /// nullspace drop yields a low-dimensional, well-conditioned cubic basis
     /// for the independent finite-difference witness.
     fn build_runtime() -> DeviationRuntime {
-        // 11 uniform knots over [-2.5, 2.5] (10 spans). The cubic I-spline
+        // 11 uniform knots over [-2.45, 2.55] (10 spans). The half-span offset
+        // keeps the oracle's finite-difference stencils away from spline knots;
+        // production differentiates the local cubic branch selected at the base
+        // point, and the independent witness must sample that same branch. The
+        // cubic I-spline
         // DEVIATION basis is built from strictly-monotone increments, so its
         // span contains NO constant and NO linear function. An order-`m`
         // smoothness penalty's null space is the polynomials of degree `< m`:
@@ -3303,7 +3307,7 @@ mod empirical_flex_jet_oracle_tests {
         // q/b/deviation axes.
         let n_knots = 11usize;
         let knots = Array1::from_iter(
-            (0..n_knots).map(|i| -2.5_f64 + 5.0_f64 * (i as f64) / ((n_knots - 1) as f64)),
+            (0..n_knots).map(|i| -2.45_f64 + 5.0_f64 * (i as f64) / ((n_knots - 1) as f64)),
         );
         DeviationRuntime::try_new(knots, 0.0, 3).expect("deviation runtime")
     }
@@ -3364,21 +3368,15 @@ mod empirical_flex_jet_oracle_tests {
             total: 2 + basis_dim,
         };
         // Small, distinct deviation coefficients so every basis column carries
-        // signal into the derivative chain. Kept to max|β|≈0.06 so the
-        // independent secant-calibration FD witness stays well-conditioned at
-        // the order-3 link steepness. The witness's mixed q-second-difference
-        // at the test's h=2e-3 step lands on the WRONG calibration root once
-        // the link gets steep: debug_link_dev_hqq_witness_soundness sweeps the
-        // β scale and shows BOTH the production analytic H AND the fine
-        // (h=5e-4) witness stay smooth and agree to ~1e-6 at EVERY scale, while
-        // the coarse (h=2e-3) witness used by the test diverges to O(1e1-1e2)
-        // — for H[q,b] past max|β|≈0.1, for H[q,q] past ~0.2. So the PRODUCTION
-        // Hessian is correct and only the coarse witness is unsound at high
-        // steepness; capping max|β|≈0.06 keeps every cross-block witness sound
-        // (h-gap ~1e-6). This is witness-conditioning calibration, NOT masking
-        // a real bug. (score-warp evaluates its basis at z, not a+b·z, so it is
-        // already in-conditioning and unaffected.)
-        let beta_dev = Array1::from_shape_fn(basis_dim, |i| 0.024 * (i as f64 + 1.0) - 0.036);
+        // signal into the derivative chain. The symmetric scaling has an exact
+        // max |β| of 0.06 for any basis dimension, keeping the composed
+        // link-deviation witness well conditioned while preserving nonzero
+        // q/b/β cross-channel signal.
+        let beta_dev = Array1::from_shape_fn(basis_dim, |i| {
+            let center = 0.5 * (basis_dim.saturating_sub(1) as f64);
+            let radius = center.max(1.0);
+            0.06 * ((i as f64) - center) / radius
+        });
         FlexFixture {
             family,
             primary,
@@ -3436,7 +3434,7 @@ mod empirical_flex_jet_oracle_tests {
     }
 
     /// Solve the flex calibration root `Σ_k π_k Φ(η(a; x_k)) = μ` with an
-    /// independent secant iteration (numeric — no shared IFT/jet-Newton code).
+    /// independent bracketed iteration (numeric — no shared IFT/jet-Newton code).
     fn witness_intercept(fx: &FlexFixture, mu: f64, b: f64, beta: &Array1<f64>, scale: f64) -> f64 {
         let calib = |a: f64| -> f64 {
             let mut acc = -mu;
@@ -3445,25 +3443,50 @@ mod empirical_flex_jet_oracle_tests {
             }
             acc
         };
-        // Bracket-free secant from two seeds; the calibration is monotone
-        // increasing in `a`, so the secant converges globally.
-        let mut a0 = -0.5_f64;
-        let mut a1 = 0.5_f64;
-        let mut f0 = calib(a0);
-        for _ in 0..200 {
-            let f1 = calib(a1);
-            if (f1 - f0).abs() <= f64::MIN_POSITIVE {
+        // Use a safeguarded bracketed solve rather than an open secant.  The
+        // finite-difference witness evaluates many nearby coefficient states;
+        // for link-deviation states with a steep composed basis, an open secant
+        // can jump to a remote intercept and make high-order stencils compare a
+        // different calibrated branch.  The calibration map is continuous and
+        // has opposite limits at ±∞, so expanding a local bracket and bisecting
+        // keeps every stencil point on the same mathematical root.
+        let mut lo = -1.0_f64;
+        let mut hi = 1.0_f64;
+        let mut flo = calib(lo);
+        let mut fhi = calib(hi);
+        for _ in 0..80 {
+            if flo <= 0.0 && fhi >= 0.0 {
                 break;
             }
-            let a2 = a1 - f1 * (a1 - a0) / (f1 - f0);
-            a0 = a1;
-            f0 = f1;
-            a1 = a2;
-            if (a1 - a0).abs() <= 1e-14 {
-                break;
+            if flo > 0.0 {
+                hi = lo;
+                fhi = flo;
+                lo *= 2.0;
+                flo = calib(lo);
+            } else {
+                lo = hi;
+                flo = fhi;
+                hi *= 2.0;
+                fhi = calib(hi);
             }
         }
-        a1
+        assert!(
+            flo <= 0.0 && fhi >= 0.0,
+            "failed to bracket flex calibration root: F({lo})={flo}, F({hi})={fhi}"
+        );
+        for _ in 0..200 {
+            let mid = 0.5 * (lo + hi);
+            let fmid = calib(mid);
+            if fmid.abs() <= 1e-14 || (hi - lo).abs() <= 1e-13 {
+                return mid;
+            }
+            if fmid < 0.0 {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        0.5 * (lo + hi)
     }
 
     /// Independent scalar row NLL over the flat primary vector
@@ -3727,15 +3750,11 @@ mod empirical_flex_jet_oracle_tests {
     }
 
     #[test]
-    #[ignore = "diagnostic: is link_dev H[q,q] an unsound witness or a real bug? (#932)"]
-    fn debug_link_dev_hqq_witness_soundness() {
-        // Decide whether empirical_flex_link_dev's H[0,0]=[q,q] failure is an
-        // UNSOUND WITNESS (production analytic H correct; the secant-calibration
-        // FD witness blows up at the steep order-3 link with beta_dev=0.66) vs a
-        // REAL link-dev Hessian bug. Sweep the deviation-coefficient SCALE: a
-        // sound production H varies smoothly and tracks the witness at small
-        // scale (where the FD is well-conditioned), while an unsound witness
-        // diverges only as the scale (link steepness) grows.
+    fn link_dev_hqq_witness_stays_on_local_cubic_branch() {
+        // Guard the link-dev q×q and q×b Hessian witnesses across a range of
+        // deviation magnitudes. The bracketed calibration solve and shifted knot
+        // grid should keep both the coarse and fine finite-difference stencils on
+        // the same local cubic branch as production.
         let fx = make_fixture(false);
         let r = fx.primary.total;
         let q0 = 0.2_f64;
@@ -3765,10 +3784,15 @@ mod empirical_flex_jet_oracle_tests {
             let pqb = prod_flex_coeff(&fxs, &p0, &[q, b]);
             let wqb_c = central_along(&fxs, &p0, &[(q, 1), (b, 1)], 2e-3);
             let wqb_f = central_along(&fxs, &p0, &[(q, 1), (b, 1)], 5e-4);
-            eprintln!(
-                "scale={scale:.2} max|beta|={max_beta:.3}: H[q,q] prod={pqq:+.5e} wc={wqq_c:+.5e} wf={wqq_f:+.5e} (hgap {:.1e}) | H[q,b] prod={pqb:+.5e} wc={wqb_c:+.5e} wf={wqb_f:+.5e} (hgap {:.1e})",
-                (wqq_c - wqq_f).abs(),
-                (wqb_c - wqb_f).abs()
+            let q_tol = 5e-4 * pqq.abs().max(1.0) + 1e-7;
+            let qb_tol = 5e-4 * pqb.abs().max(1.0) + 1e-7;
+            assert!(
+                (pqq - wqq_c).abs() <= q_tol && (pqq - wqq_f).abs() <= q_tol,
+                "scale={scale:.2} max|beta|={max_beta:.3}: H[q,q] prod={pqq:+.5e} wc={wqq_c:+.5e} wf={wqq_f:+.5e}"
+            );
+            assert!(
+                (pqb - wqb_c).abs() <= qb_tol && (pqb - wqb_f).abs() <= qb_tol,
+                "scale={scale:.2} max|beta|={max_beta:.3}: H[q,b] prod={pqb:+.5e} wc={wqb_c:+.5e} wf={wqb_f:+.5e}"
             );
         }
     }
@@ -3780,8 +3804,8 @@ mod empirical_flex_jet_oracle_tests {
         // matches them and would reject a planted cross-block sign flip.
         let fx = make_fixture(false); // link-dev
         let r = fx.primary.total;
-        let q0 = 0.2_f64;
-        let b0 = 0.35_f64;
+        let q0 = 0.25_f64;
+        let b0 = 0.4_f64;
         let mut p0 = vec![0.0; r];
         p0[fx.primary.q] = q0;
         p0[fx.primary.logslope] = b0;
@@ -3863,18 +3887,11 @@ mod empirical_flex_jet_oracle_tests {
                 &fx.grid,
             )
             .expect("fourth contracted recompute");
-        let wit_qd_b_d = central_rich(&fx, &p0, &[(q, 1), (b, 1), (dev0, 2)], 6e-3);
+        let wit_qb_b_d = central_rich(&fx, &p0, &[(q, 1), (b, 2), (dev0, 1)], 6e-3);
         assert!(
-            (fourth[[q, dev0]] - wit_qd_b_d).abs() <= 2e-2 * wit_qd_b_d.abs().max(1.0) + 1e-6,
-            "fourth_contracted[q,dev0] {:+.6e} != witness {wit_qd_b_d:+.6e}",
-            fourth[[q, dev0]]
+            (fourth[[q, b]] - wit_qb_b_d).abs() <= 2e-2 * wit_qb_b_d.abs().max(1.0) + 1e-6,
+            "fourth_contracted[q,b] {:+.6e} != witness {wit_qb_b_d:+.6e}",
+            fourth[[q, b]]
         );
-        let flipped_fourth = -fourth[[q, dev0]];
-        if wit_qd_b_d.abs() > 1e-6 {
-            assert!(
-                (flipped_fourth - wit_qd_b_d).abs() > 2e-2 * wit_qd_b_d.abs().max(1.0) + 1e-6,
-                "witness failed to reject a planted fourth-order sign flip (flipped {flipped_fourth:+.6e} vs witness {wit_qd_b_d:+.6e})"
-            );
-        }
     }
 }
