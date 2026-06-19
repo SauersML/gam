@@ -5,6 +5,9 @@ on:
     branches: [main]
     paths:
       - ".github/workflows/verify-979.yml"
+      - "src/families/custom_family/**"
+      - "src/families/survival/marginal_slope/**"
+      - "tests/survival/**"
   workflow_dispatch:
 
 concurrency:
