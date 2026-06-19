@@ -185,13 +185,9 @@ pub(super) fn solve_penalized_least_squares_implicit(
         let h_sym = SymmetricMatrix::Sparse(h_sparse);
         let edf = calculate_edf_from_sparse_factor(&factor, penalty)?;
 
-        // 5. Fitted values and scale
-        let fitted_vals = {
-            let xb = x_original.apply(&betavec);
-            let mut f = xb;
-            f += &offset;
-            f
-        };
+        // 5. Scale. When Gaussian sufficient statistics are installed, compute
+        // RSS from k-space only; the design rows may be a stale reference
+        // surface on the #1033 ψ-tensor fast path.
         let standard_deviation = match link_function {
             LinkFunction::Identity => {
                 let weighted_rss = if let Some(cache) = gaussian_fixed_cache {
@@ -199,6 +195,12 @@ pub(super) fn solve_penalized_least_squares_implicit(
                     (cache.centered_weighted_y_sq - 2.0 * betavec.dot(&cache.xtwy_orig) + quadratic)
                         .max(0.0)
                 } else {
+                    let fitted_vals = {
+                        let xb = x_original.apply(&betavec);
+                        let mut f = xb;
+                        f += &offset;
+                        f
+                    };
                     let residuals = &y - &fitted_vals;
                     weights
                         .iter()
@@ -384,15 +386,14 @@ pub(super) fn solve_penalized_least_squares_implicit(
     // O(p³) factorization of the identical regularized Hessian.
     let edf = calculate_edfwithworkspace_from_factor(&factor, penalty, workspace)?;
 
-    // 7. Scale (composed: eta = offset + X Qs beta)
+    // 7. Scale (composed: eta = offset + X Qs beta). When Gaussian sufficient
+    // statistics are installed, compute RSS from k-space only; the design rows
+    // may be a stale reference surface on the #1033 ψ-tensor fast path.
     let qbeta = if let Some(transform) = transform {
         transform.apply(&betavec)
     } else {
         betavec.clone()
     };
-    let xqbeta = x_original.apply(&qbeta);
-    let mut fitted = xqbeta;
-    fitted += &offset;
     let standard_deviation = match link_function {
         LinkFunction::Identity => {
             let weighted_rss = if let Some(cache) = gaussian_fixed_cache {
@@ -400,6 +401,9 @@ pub(super) fn solve_penalized_least_squares_implicit(
                 (cache.centered_weighted_y_sq - 2.0 * qbeta.dot(&cache.xtwy_orig) + quadratic)
                     .max(0.0)
             } else {
+                let xqbeta = x_original.apply(&qbeta);
+                let mut fitted = xqbeta;
+                fitted += &offset;
                 let residuals = &y - &fitted;
                 weights
                     .iter()
