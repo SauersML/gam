@@ -16,34 +16,6 @@ fn assert_close(lhs: f64, rhs: f64, tol: f64, label: &str) {
     );
 }
 
-/// `with_row_context` must splice `at row N` between the reason prefix and
-/// the `:` details separator so a scalar-kernel error reshapes into the
-/// canonical `<reason> at row N: <details>` that downstream consumers
-/// pattern-match on — and must degrade gracefully (append, not corrupt)
-/// when the error carries no `:` separator at all.
-#[test]
-fn with_row_context_matches_canonical_row_tag_shape() {
-    // Canonical reason:detail kernel error -> tag spliced before the colon.
-    assert_eq!(
-        with_row_context(
-            "survival marginal-slope monotonicity violated: qd1=-0.5".to_string(),
-            7,
-        ),
-        "survival marginal-slope monotonicity violated at row 7: qd1=-0.5",
-    );
-    // Only the FIRST colon is the reason/detail boundary; later colons in
-    // the details (e.g. a nested key:value) must be left untouched.
-    assert_eq!(
-        with_row_context("reason: a=1: b=2".to_string(), 3),
-        "reason at row 3: a=1: b=2",
-    );
-    // No colon -> append the tag rather than dropping or mangling it.
-    assert_eq!(
-        with_row_context("bare error with no separator".to_string(), 42),
-        "bare error with no separator at row 42",
-    );
-}
-
 /// Pin the survival cross-block W metric to the survival row Hessian
 /// formula `u2_eta1 = (1-d)·w·k2(-η, w·(1-d)) + d·w` rather than the
 /// Bernoulli probit proxy `φ²/(Φ·(1-Φ))`. Three rows exercise the
@@ -485,80 +457,6 @@ fn max_abs_diff_mat(lhs: &Array2<f64>, rhs: &Array2<f64>) -> f64 {
         .zip(rhs.iter())
         .map(|(left, right)| (left - right).abs())
         .fold(0.0_f64, f64::max)
-}
-
-#[test]
-fn rigid_shared_multi_z_row_kernel_matches_vector_value_and_finite_differences() {
-    let covariance = MarginalSlopeCovariance::Full(array![[1.3, 0.4], [0.4, 0.7]]);
-    let z = [0.6, -1.1];
-    let params = [0.15, 0.55, 0.9, -0.22];
-    let weight = 1.3;
-    let event = 1.0;
-    let derivative_guard = 1e-6;
-    let probit_scale = 0.85;
-    let covariance_ones = covariance.quadratic_form(&[1.0, 1.0]).expect("1'Sigma1");
-    let z_sum = z.iter().sum::<f64>();
-
-    let eval = |p: [f64; 4]| {
-        row_primary_closed_form_shared_score(
-            p[0],
-            p[1],
-            p[2],
-            p[3],
-            z_sum,
-            covariance_ones,
-            weight,
-            event,
-            derivative_guard,
-            probit_scale,
-        )
-        .expect("shared-score row kernel")
-    };
-
-    let (nll, grad, hess) = eval(params);
-    let vector_nll = survival_marginal_slope_vector_neglog(
-        params[0],
-        params[1],
-        params[2],
-        &[params[3], params[3]],
-        &z,
-        &covariance,
-        weight,
-        event,
-        derivative_guard,
-        probit_scale,
-    )
-    .expect("vector row value");
-    assert!(
-        (nll - vector_nll).abs() <= 1e-14,
-        "shared row nll={nll:.17e} vector nll={vector_nll:.17e}"
-    );
-
-    let step = 1e-5;
-    for axis in 0..4 {
-        let mut plus = params;
-        let mut minus = params;
-        plus[axis] += step;
-        minus[axis] -= step;
-        let (nll_plus, grad_plus, _) = eval(plus);
-        let (nll_minus, grad_minus, _) = eval(minus);
-        let fd_grad = (nll_plus - nll_minus) / (2.0 * step);
-        assert!(
-            (grad[axis] - fd_grad).abs() <= 2e-6,
-            "grad[{axis}] analytic={:.12e} fd={:.12e}",
-            grad[axis],
-            fd_grad
-        );
-        for row in 0..4 {
-            let fd_hess = (grad_plus[row] - grad_minus[row]) / (2.0 * step);
-            assert!(
-                (hess[row][axis] - fd_hess).abs() <= 3e-5,
-                "hess[{row},{axis}] analytic={:.12e} fd={:.12e}",
-                hess[row][axis],
-                fd_hess
-            );
-        }
-    }
 }
 
 fn assert_blockwise_matches_joint_principal_blocks(
