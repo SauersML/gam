@@ -1345,6 +1345,22 @@ pub fn fit_penalized_multinomial_formula(
     // unchanged. Only the discarded unbiased separation probe above is capped.
     let firth_refit_options = &options;
 
+    let run_firth_refit = |evidence: String| {
+        let firth_family = family.clone().with_joint_jeffreys_term(true);
+        fit_custom_family_with_rho_prior(
+            &firth_family,
+            &blocks,
+            firth_refit_options,
+            crate::types::RhoPrior::Flat,
+        )
+        .map_err(|err| {
+            EstimationError::InvalidInput(format!(
+                "multinomial REML: Firth/Jeffreys-armed refit (separation evidence: \
+                 {evidence}) failed: {err}"
+            ))
+        })
+    };
+
     let fit = match fit_custom_family_with_rho_prior(
         &family,
         &blocks,
@@ -1357,6 +1373,43 @@ pub fn fit_penalized_multinomial_formula(
                     .is_none() =>
         {
             unbiased_fit
+        }
+        Ok(unresolved_fit)
+            if multinomial_formula_separation_evidence(&unresolved_fit.block_states).is_none() =>
+        {
+            match fit_custom_family_with_rho_prior(
+                &family,
+                &blocks,
+                &options,
+                crate::types::RhoPrior::Flat,
+            ) {
+                Ok(full_unbiased_fit)
+                    if full_unbiased_fit.outer_converged
+                        && multinomial_formula_separation_evidence(
+                            &full_unbiased_fit.block_states,
+                        )
+                        .is_none() =>
+                {
+                    full_unbiased_fit
+                }
+                full_attempt => {
+                    let evidence = match &full_attempt {
+                        Ok(full_fit) => multinomial_formula_separation_evidence(
+                            &full_fit.block_states,
+                        )
+                        .unwrap_or_else(|| {
+                            format!(
+                                "full unbiased-criterion REML solve did not converge after {} outer iterations",
+                                full_fit.outer_iterations
+                            )
+                        }),
+                        Err(err) => {
+                            format!("full unbiased-criterion REML solve failed: {err}")
+                        }
+                    };
+                    run_firth_refit(evidence)?
+                }
+            }
         }
         first_attempt => {
             let evidence = match &first_attempt {
@@ -1371,19 +1424,7 @@ pub fn fit_penalized_multinomial_formula(
                 }),
                 Err(err) => format!("unbiased-criterion REML solve failed: {err}"),
             };
-            let firth_family = family.clone().with_joint_jeffreys_term(true);
-            fit_custom_family_with_rho_prior(
-                &firth_family,
-                &blocks,
-                firth_refit_options,
-                crate::types::RhoPrior::Flat,
-            )
-            .map_err(|err| {
-                EstimationError::InvalidInput(format!(
-                    "multinomial REML: Firth/Jeffreys-armed refit (separation evidence: \
-                     {evidence}) failed: {err}"
-                ))
-            })?
+            run_firth_refit(evidence)?
         }
     };
     if let Some(err) = multinomial_formula_separation_diagnostic(
