@@ -10,6 +10,8 @@ mod arrow_schur_bug_hunt;
 mod bernoulli_marginal_slope_bug_hunt_1;
 #[path = "regressions/bug_hunt_1089_small_n_gaussian_double_penalty_terminates.rs"]
 mod bug_hunt_1089_small_n_gaussian_double_penalty_terminates;
+#[path = "regressions/bug_hunt_1344_sparse_native_dense_lambda_consistency.rs"]
+mod bug_hunt_1344_sparse_native_dense_lambda_consistency;
 #[path = "regressions/bug_hunt_874_cyclic_bs_cc_outer_loop_terminates.rs"]
 mod bug_hunt_874_cyclic_bs_cc_outer_loop_terminates;
 #[path = "regressions/bug_hunt_979_gaussian_duchon_inference_nuts_not_quadratic.rs"]
