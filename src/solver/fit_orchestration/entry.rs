@@ -132,12 +132,12 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
             .map_err(wrap_solver_err),
     }
 }
-/// Resolve the [`crate::solver::resource::ResourcePolicy`] backing term construction
+/// Resolve the [`crate::resource::ResourcePolicy`] backing term construction
 /// for a given [`FitConfig`] + dataset.
 ///
 /// If the caller hasn't supplied an explicit policy override, derive one from
 /// the shape of the problem via
-/// [`crate::solver::resource::ResourcePolicy::for_problem`]. At large scale (n_rows
+/// [`crate::resource::ResourcePolicy::for_problem`]. At large scale (n_rows
 /// >= 100k or the marginal-slope large-scale path active) this returns
 /// > `analytic_operator_required` so that any silent dense materialization in
 /// > the term-construction layer fails fast rather than allocating tens of GiB;
@@ -150,16 +150,16 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
 pub(crate) fn resolved_resource_policy(
     config: &FitConfig,
     data: &Dataset,
-    hints: crate::solver::resource::ProblemHints,
-) -> crate::solver::resource::ResourcePolicy {
+    hints: crate::resource::ProblemHints,
+) -> crate::resource::ResourcePolicy {
     if let Some(p) = config.resource_policy.clone() {
         return p;
     }
-    crate::solver::resource::ResourcePolicy::for_problem(data.values.nrows(), 0, hints)
+    crate::resource::ResourcePolicy::for_problem(data.values.nrows(), 0, hints)
 }
 
-pub(crate) fn marginal_slope_hints(config: &FitConfig) -> crate::solver::resource::ProblemHints {
-    crate::solver::resource::ProblemHints {
+pub(crate) fn marginal_slope_hints(config: &FitConfig) -> crate::resource::ProblemHints {
+    crate::resource::ProblemHints {
         marginal_slope_large_scale_active: config.logslope_formula.is_some()
             || config.z_column.is_some(),
     }

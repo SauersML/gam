@@ -338,7 +338,7 @@ fn survival_primary_g_fourth_cell_partials_are_zero() {
 
 #[test]
 fn survival_log_likelihood_subsample_full_equals_unsampled() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_closed_form_test_family(n);
     let states = closed_form_block_states(&family, 0.25);
@@ -369,7 +369,7 @@ fn survival_log_likelihood_subsample_full_equals_unsampled() {
 
 #[test]
 fn survival_log_likelihood_subsample_half_scales_correctly() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_closed_form_test_family(n);
     let states = closed_form_block_states(&family, 0.25);
@@ -5327,7 +5327,7 @@ fn rel_diff_array2_survival(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
 
 #[test]
 fn survival_sigma_psi_terms_subsample_full_equals_unsampled() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_closed_form_test_family(n);
     let states = closed_form_block_states(&family, 0.25);
@@ -5359,7 +5359,7 @@ fn survival_sigma_psi_terms_subsample_full_equals_unsampled() {
 
 #[test]
 fn survival_sigma_psi_terms_subsample_half_scales_correctly() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_closed_form_test_family(n);
     let states = closed_form_block_states(&family, 0.25);
@@ -5399,7 +5399,7 @@ fn survival_sigma_psi_terms_subsample_half_scales_correctly() {
 
 #[test]
 fn survival_sigma_psi_second_order_subsample_full_equals_unsampled() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_closed_form_test_family(n);
     let states = closed_form_block_states(&family, 0.25);
@@ -5430,7 +5430,7 @@ fn survival_sigma_psi_second_order_subsample_full_equals_unsampled() {
 
 #[test]
 fn survival_sigma_psi_second_order_subsample_half_scales_correctly() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_closed_form_test_family(n);
     let states = closed_form_block_states(&family, 0.25);
@@ -5469,7 +5469,7 @@ fn survival_sigma_psi_second_order_subsample_half_scales_correctly() {
 
 #[test]
 fn survival_sigma_psihessian_directional_derivative_subsample_full_equals_unsampled() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_closed_form_test_family(n);
     let states = closed_form_block_states(&family, 0.25);
@@ -5502,7 +5502,7 @@ fn survival_sigma_psihessian_directional_derivative_subsample_full_equals_unsamp
 
 #[test]
 fn survival_sigma_psihessian_directional_derivative_subsample_half_scales_correctly() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_sigma_aware_closed_form_test_family(n);
     let states = closed_form_block_states(&family, 0.25);
@@ -5687,7 +5687,7 @@ fn block_psi_test_dual_derivative_blocks(
 
 #[test]
 fn survival_psi_terms_inner_subsample_full_equals_unsampled() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -5719,7 +5719,7 @@ fn survival_psi_terms_inner_subsample_full_equals_unsampled() {
 
 #[test]
 fn survival_psi_terms_inner_subsample_half_scales_correctly() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -5821,7 +5821,7 @@ fn survival_psi_terms_inner_batched_matches_per_axis() {
 fn survival_psi_terms_inner_batched_subsample_matches_per_axis() {
     // Same equivalence under a half-row Horvitz-Thompson mask, exercising
     // the per-row weight branch of the batched fast path.
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -5878,7 +5878,7 @@ fn survival_psi_terms_inner_batched_subsample_matches_per_axis() {
 
 #[test]
 fn survival_psi_second_order_terms_inner_subsample_full_equals_unsampled() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -5917,7 +5917,7 @@ fn survival_psi_second_order_terms_inner_subsample_full_equals_unsampled() {
 
 #[test]
 fn survival_psi_second_order_terms_inner_subsample_half_scales_correctly() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -5971,7 +5971,7 @@ fn survival_psi_second_order_terms_inner_subsample_half_scales_correctly() {
 
 #[test]
 fn survival_psi_hessian_directional_derivative_subsample_full_equals_unsampled() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -6009,7 +6009,7 @@ fn survival_psi_hessian_directional_derivative_subsample_full_equals_unsampled()
 
 #[test]
 fn survival_psi_hessian_directional_derivative_subsample_half_scales_correctly() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -6107,7 +6107,7 @@ fn survival_psi_workspace_hessian_directional_derivative_is_operator_and_matches
 
 #[test]
 fn survival_psi_hessian_directional_derivative_operator_subsample_full_equals_unsampled() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -6153,7 +6153,7 @@ fn survival_psi_hessian_directional_derivative_operator_subsample_full_equals_un
 
 #[test]
 fn survival_psi_hessian_directional_derivative_operator_subsample_half_scales_correctly() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -6480,7 +6480,7 @@ fn step6_joint_beta_pullback_matches_cpu_dense_assembly_flex_no_wiggle() {
 
 #[test]
 fn survival_jointhessian_flex_no_wiggle_operator_subsample_full_equals_unsampled() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 40usize;
     let family = make_flex_no_wiggle_test_family(n);
     let states = flex_no_wiggle_test_block_states(&family);
@@ -6525,7 +6525,7 @@ fn survival_jointhessian_flex_no_wiggle_operator_subsample_full_equals_unsampled
 
 #[test]
 fn survival_jointhessian_flex_no_wiggle_operator_subsample_half_scales_correctly() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 40usize;
     let family = make_flex_no_wiggle_test_family(n);
     let states = flex_no_wiggle_test_block_states(&family);

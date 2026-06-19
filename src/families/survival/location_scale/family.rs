@@ -37,7 +37,7 @@ pub(crate) struct SurvivalLocationScaleFamily {
     /// time-derivative `−1/t`, so `u = inv_sigma·(log t − η_t) = (log t − μ)/σ`
     /// and the event Jacobian gains `−log σ − log t`. `None` everywhere else.
     pub(crate) location_log_time: Option<LocationLogTimeOffset>,
-    pub(crate) policy: crate::solver::resource::ResourcePolicy,
+    pub(crate) policy: crate::resource::ResourcePolicy,
 }
 
 /// The σ-scaled log-t AFT location baseline (issue #892), applied to the `q`

@@ -580,7 +580,7 @@ pub fn conservative_secondary_centers(n: usize, d: usize) -> usize {
 /// Returned by [`plan_spatial_basis`]. Captures the resolved center count,
 /// final basis dimension `p`, the dense byte cost for the value matrix and
 /// each derivative tier, and a recommended storage mode that is consistent
-/// with the supplied [`crate::solver::resource::ResourcePolicy`].
+/// with the supplied [`crate::resource::ResourcePolicy`].
 #[derive(Clone, Debug)]
 pub struct SpatialBasisPlan {
     pub n: usize,
@@ -632,7 +632,7 @@ pub fn plan_spatial_basis(
     requested_centers: CenterCountRequest,
     nullspace_order: DuchonNullspaceOrder,
     scale_dims: bool,
-    policy: &crate::solver::resource::ResourcePolicy,
+    policy: &crate::resource::ResourcePolicy,
 ) -> Result<SpatialBasisPlan, BasisError> {
     if n == 0 {
         crate::bail_invalid_basis!("plan_spatial_basis: n must be >= 1");
@@ -672,10 +672,10 @@ pub fn plan_spatial_basis(
 
     // 4. Pick storage mode based on policy.
     let recommended_storage = match policy.derivative_storage_mode {
-        crate::solver::resource::DerivativeStorageMode::AnalyticOperatorRequired => {
+        crate::resource::DerivativeStorageMode::AnalyticOperatorRequired => {
             SpatialStorageMode::OperatorOnly
         }
-        crate::solver::resource::DerivativeStorageMode::MaterializeIfSmall => {
+        crate::resource::DerivativeStorageMode::MaterializeIfSmall => {
             let budget = policy.max_single_materialization_bytes;
             if derivative_axes == 0 {
                 if dense_design_bytes <= budget {
@@ -696,7 +696,7 @@ pub fn plan_spatial_basis(
                 }
             }
         }
-        crate::solver::resource::DerivativeStorageMode::DiagnosticsOnly => {
+        crate::resource::DerivativeStorageMode::DiagnosticsOnly => {
             // Diagnostic mode still prefers analytic storage for correctness.
             SpatialStorageMode::OperatorOnly
         }
@@ -1822,7 +1822,7 @@ pub fn should_use_implicit_operators_with_policy(
     n: usize,
     p: usize,
     d: usize,
-    policy: &crate::solver::resource::ResourcePolicy,
+    policy: &crate::resource::ResourcePolicy,
 ) -> bool {
     // Each first-derivative matrix is (n x p) f64 → n*p*8 bytes.
     // We need D of them for first derivatives, D for second diag, plus
@@ -1845,7 +1845,7 @@ pub(crate) fn should_cache_implicit_radial_components(
     n: usize,
     k: usize,
     n_axes: usize,
-    policy: &crate::solver::resource::ResourcePolicy,
+    policy: &crate::resource::ResourcePolicy,
 ) -> bool {
     implicit_radial_cache_bytes(n, k, n_axes) <= policy.max_operator_cache_bytes
 }
@@ -1860,11 +1860,11 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
     // first- and second-order dense bytes fit under the single-materialization
     // byte budget. `DiagnosticsOnly` is treated like `MaterializeIfSmall` for
     // this guard: it permits dense materialization under the same byte cap.
-    let policy = crate::solver::resource::ResourcePolicy::default_library();
+    let policy = crate::resource::ResourcePolicy::default_library();
     let budget = policy.max_single_materialization_bytes;
     let needed = first.saturating_add(second);
     match policy.derivative_storage_mode {
-        crate::solver::resource::DerivativeStorageMode::AnalyticOperatorRequired => {
+        crate::resource::DerivativeStorageMode::AnalyticOperatorRequired => {
             // SAFETY: this assertion helper exists specifically to enforce
             // the large-scale invariant that spatial-PC Duchon derivative
             // designs never persist as dense `Array2<f64>` storage. When the
@@ -1878,8 +1878,8 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
                 second as f64 / (1024.0 * 1024.0),
             );
         }
-        crate::solver::resource::DerivativeStorageMode::MaterializeIfSmall
-        | crate::solver::resource::DerivativeStorageMode::DiagnosticsOnly => {
+        crate::resource::DerivativeStorageMode::MaterializeIfSmall
+        | crate::resource::DerivativeStorageMode::DiagnosticsOnly => {
             assert!(
                 needed <= budget,
                 "spatial PC Duchon derivative designs would exceed the single-materialization budget; refused persistent dense derivative materialization (n={n}, p={p}, d_pc={d_pc}, first_order={:.1} MiB, second_order={:.1} MiB, budget={:.1} MiB)",
@@ -1929,7 +1929,7 @@ pub(crate) fn dense_design_bytes(n: usize, p: usize) -> usize {
 pub(crate) fn should_use_lazy_spatial_design(
     n: usize,
     p: usize,
-    policy: &crate::solver::resource::ResourcePolicy,
+    policy: &crate::resource::ResourcePolicy,
 ) -> bool {
     dense_design_bytes(n, p) > policy.max_single_materialization_bytes
 }

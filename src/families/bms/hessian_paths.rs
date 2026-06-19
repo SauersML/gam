@@ -1157,7 +1157,7 @@ fn try_gpu_xt_diag_y<SX: ndarray::Data<Elem = f64>, SY: ndarray::Data<Elem = f64
 }
 
 pub(super) fn new_cell_moment_lru_cache(
-    policy: &crate::solver::resource::ResourcePolicy,
+    policy: &crate::resource::ResourcePolicy,
 ) -> Arc<exact_kernel::CellMomentLruCache> {
     let budget = policy.max_single_materialization_bytes;
     // The cell-moment memo holds many small entries and is consulted by every

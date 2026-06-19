@@ -60,7 +60,7 @@ pub struct ClosedFormPenaltyOperator {
     /// plain `OnceLock` here would deadlock if `dense_form` is first hit
     /// concurrently from inside an outer par_iter. See
     /// `feedback_oncelock_rayon_deadlock`.
-    cached_dense: crate::solver::resource::RayonSafeOnce<Array2<f64>>,
+    cached_dense: crate::resource::RayonSafeOnce<Array2<f64>>,
 }
 
 // Cloning the operator resets its cache so the new instance rebuilds on first
@@ -80,7 +80,7 @@ impl Clone for ClosedFormPenaltyOperator {
             polynomial_block_cols: self.polynomial_block_cols,
             outer_identifiability: self.outer_identifiability.clone(),
             diagonal_epsilon: self.diagonal_epsilon,
-            cached_dense: crate::solver::resource::RayonSafeOnce::new(),
+            cached_dense: crate::resource::RayonSafeOnce::new(),
         }
     }
 }
@@ -128,7 +128,7 @@ impl ClosedFormPenaltyOperator {
             polynomial_block_cols,
             outer_identifiability: outer_identifiability.cloned(),
             diagonal_epsilon,
-            cached_dense: crate::solver::resource::RayonSafeOnce::new(),
+            cached_dense: crate::resource::RayonSafeOnce::new(),
         }
     }
 

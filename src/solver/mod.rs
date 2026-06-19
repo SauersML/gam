@@ -19,10 +19,6 @@ pub mod measure_jet_gram_cache;
 pub mod mixture_link;
 pub(crate) mod objective_base;
 pub mod orthogonal_reparam;
-/// Back-compat re-export: the outer-loop row subsample + `RowSet` moved DOWN to
-/// the crate-root `crate::outer_subsample` lower layer (#1135). Existing
-/// `crate::solver::outer_subsample::*` paths keep resolving.
-pub use crate::outer_subsample;
 pub(crate) mod parallel_strategy;
 pub(crate) mod persistent_warm_start;
 pub mod pirls;
@@ -30,10 +26,6 @@ pub(crate) mod priority_selection;
 pub mod protocol;
 pub mod psi_gram_tensor;
 pub mod residual_cascade;
-/// Back-compat re-export: resource-policy types moved to the crate-root
-/// `crate::resource` lower layer to break the `families → solver::resource`
-/// back-edge (#1135). Existing `crate::solver::resource::*` paths keep working.
-pub use crate::resource;
 pub mod fit_orchestration;
 pub mod rho_optimizer;
 pub(crate) mod riemannian_retraction;

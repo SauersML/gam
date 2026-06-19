@@ -8,7 +8,7 @@
 // `DenseDesignMatrix::Lazy` — small data densifies cleanly, large-scale
 // densification is rejected with a precise error message naming the operator.
 
-use gam::solver::resource::{
+use gam::resource::{
     DerivativeStorageMode, ProblemHints, ResourcePolicy, STRICT_POLICY_NROWS_THRESHOLD,
 };
 

@@ -24,7 +24,7 @@
 //!    Gaussian proposal's quadratic cancels to the whitened norm, giving
 //!    `log w_m = −criterion(ρ_m) + criterion(ρ̂) + ½‖z_m‖²` (the `criterion(ρ̂)`
 //!    shift makes the weights self-normalized and finite).
-//! 4. Pareto-smooth the weights ([`crate::inference::psis`]) and read the
+//! 4. Pareto-smooth the weights ([`crate::psis`]) and read the
 //!    Zhang–Stephens tail shape `k̂`. `k̂ < 0.5` ⇒ the plug-in + first-order
 //!    correction answer is **certified** adequate; `0.5 ≤ k̂ ≤ 0.7` ⇒ usable as
 //!    a self-normalized importance correction; `k̂ > 0.7` ⇒ the Laplace proposal
@@ -35,7 +35,7 @@
 //! run.
 
 use crate::estimate::EstimationError;
-use crate::inference::psis::pareto_smooth_weights;
+use crate::psis::pareto_smooth_weights;
 use crate::solver::rho_optimizer::OuterObjective;
 use ndarray::{Array1, Array2};
 
@@ -860,7 +860,7 @@ where
     let l_inv = whitening_factor_from_outer_hessian(outer_hessian)?;
     let m = n_samples
         .unwrap_or(DEFAULT_M)
-        .max(2 * crate::inference::psis::MIN_TAIL_COUNT);
+        .max(2 * crate::psis::MIN_TAIL_COUNT);
 
     let mut rng = DetNormal::new(CERTIFICATE_SEED);
     let mut raw_weights: Vec<f64> = Vec::with_capacity(m);

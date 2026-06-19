@@ -42,7 +42,7 @@ use crate::smooth::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
-use crate::solver::outer_subsample::WeightedOuterRow;
+use crate::outer_subsample::WeightedOuterRow;
 use crate::types::{InverseLink, StandardLink, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};

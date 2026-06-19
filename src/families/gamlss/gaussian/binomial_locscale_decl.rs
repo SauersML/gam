@@ -15,7 +15,7 @@ pub struct BinomialLocationScaleFamily {
     /// per-call materialization decision) made during exact-Newton joint psi
     /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
     /// when the family is built without an explicit policy.
-    pub policy: crate::solver::resource::ResourcePolicy,
+    pub policy: crate::resource::ResourcePolicy,
 }
 
 /// Both Binomial location-scale families plug into the unified
@@ -30,7 +30,7 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
             type Direction = LocationScaleJointPsiDirection;
             const LABEL: &'static str = $label;
 
-            fn ws_policy(&self) -> &crate::solver::resource::ResourcePolicy {
+            fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
                 &self.policy
             }
 
@@ -48,7 +48,7 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
                 psi_index: usize,
                 design_loc: &Array2<f64>,
                 design_scale: &Array2<f64>,
-                policy: &crate::solver::resource::ResourcePolicy,
+                policy: &crate::resource::ResourcePolicy,
             ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
                 self.exact_newton_joint_psi_direction(
                     block_states,
@@ -68,7 +68,7 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
                 psi_b: &LocationScaleJointPsiDirection,
                 design_loc: &Array2<f64>,
                 design_scale: &Array2<f64>,
-                subsample: Option<&[crate::solver::outer_subsample::WeightedOuterRow]>,
+                subsample: Option<&[crate::outer_subsample::WeightedOuterRow]>,
             ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
                 assert!(subsample.is_none());
                 self.exact_newton_joint_psisecond_order_terms_from_parts(
@@ -88,7 +88,7 @@ macro_rules! impl_binomial_location_scale_joint_psi_family {
                 d_beta_flat: &Array1<f64>,
                 design_loc: &Array2<f64>,
                 design_scale: &Array2<f64>,
-                subsample: Option<&[crate::solver::outer_subsample::WeightedOuterRow]>,
+                subsample: Option<&[crate::outer_subsample::WeightedOuterRow]>,
             ) -> Result<Array2<f64>, String> {
                 assert!(subsample.is_none());
                 self.exact_newton_joint_psihessian_directional_derivative_from_parts(

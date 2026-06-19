@@ -54,7 +54,7 @@ pub(crate) fn materialize_location_scale<'a>(
     let policy = resolved_resource_policy(
         config,
         data,
-        crate::solver::resource::ProblemHints::default(),
+        crate::resource::ProblemHints::default(),
     );
     let meanspec = build_termspec_with_geometry_and_overrides(
         &parsed.terms,

@@ -671,13 +671,13 @@ impl BernoulliMarginalSlopeFamily {
             row_contexts,
             row_cell_moments,
             cell_family_forest,
-            row_cell_moments_d15: crate::solver::resource::RayonSafeOnce::new(),
-            row_cell_moments_d21: crate::solver::resource::RayonSafeOnce::new(),
+            row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
+            row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
             row_primary_hessians: RowPrimaryEvalCache::Empty,
-            rigid_third_full: crate::solver::resource::RayonSafeOnce::new(),
-            rigid_fourth_full: crate::solver::resource::RayonSafeOnce::new(),
-            flex_axis_third_tensors: crate::solver::resource::RayonSafeOnce::new(),
-            flex_axis_fourth_tensors: crate::solver::resource::RayonSafeOnce::new(),
+            rigid_third_full: crate::resource::RayonSafeOnce::new(),
+            rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
+            flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
+            flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
             full_data_outer_rows: std::sync::OnceLock::new(),
         })
     }
@@ -3266,7 +3266,7 @@ impl BernoulliMarginalSlopeFamily {
         // global row), then build only the requested row on first touch.
         let slots = cache.flex_axis_third_tensors.get_or_compute(|| {
             (0..self.y.len())
-                .map(|_| crate::solver::resource::RayonSafeOnce::new())
+                .map(|_| crate::resource::RayonSafeOnce::new())
                 .collect::<Vec<_>>()
         });
         let stored = slots[row].get_or_compute(|| -> Result<FlexAxisThirdRowTensors, String> {
@@ -3312,7 +3312,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         let slots = cache.flex_axis_fourth_tensors.get_or_compute(|| {
             (0..self.y.len())
-                .map(|_| crate::solver::resource::RayonSafeOnce::new())
+                .map(|_| crate::resource::RayonSafeOnce::new())
                 .collect::<Vec<_>>()
         });
         let stored = slots[row].get_or_compute(|| -> Result<FlexAxisFourthRowTensors, String> {

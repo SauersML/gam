@@ -1,5 +1,5 @@
 use crate::probability::normal_cdf;
-use crate::solver::resource::{ByteLruCache, ResidentBytes};
+use crate::resource::{ByteLruCache, ResidentBytes};
 use smallvec::{SmallVec, smallvec};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;

@@ -1155,7 +1155,7 @@ impl BinomialLocationScaleFamily {
         psi_index: usize,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-        policy: &crate::solver::resource::ResourcePolicy,
+        policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         let Some(parts) = locscale_joint_psi_direction_parts(
             block_states,

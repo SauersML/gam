@@ -32,7 +32,7 @@
 use crate::custom_family::{CustomFamilyBlockPsiDerivative, ParameterBlockSpec};
 use crate::families::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
 use crate::families::jet_partitions::MultiDirJet;
-use crate::solver::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
+use crate::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
 use ndarray::{Array1, Array2, Axis};
 use std::ops::Range;
 use std::sync::Arc;

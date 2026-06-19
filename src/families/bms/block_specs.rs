@@ -1658,7 +1658,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
     spec: BernoulliMarginalSlopeTermSpec,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
-    policy: &crate::solver::resource::ResourcePolicy,
+    policy: &crate::resource::ResourcePolicy,
 ) -> Result<BernoulliMarginalSlopeFitResult, String> {
     let mut spec = spec;
     let data_view = data;
@@ -2555,7 +2555,7 @@ pub fn fit_bernoulli_marginal_slope_terms(
                 joint_hyper_options_for_outer_tolerance(options, exact_spatial_outer_tol);
             if let crate::families::row_kernel::RowSet::Subsample { rows, n_full } = row_set {
                 let subsample =
-                    crate::solver::outer_subsample::OuterScoreSubsample::from_weighted_rows(
+                    crate::outer_subsample::OuterScoreSubsample::from_weighted_rows(
                         rows.as_ref().clone(),
                         *n_full,
                         0,

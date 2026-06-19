@@ -70,7 +70,7 @@ pub(crate) use crate::smooth::{
     freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
-pub(crate) use crate::solver::resource::{MatrixMaterializationError, ResourcePolicy};
+pub(crate) use crate::resource::{MatrixMaterializationError, ResourcePolicy};
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut2, s};
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::sync::{Arc, Mutex, OnceLock};

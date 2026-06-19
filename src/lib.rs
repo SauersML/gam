@@ -116,27 +116,23 @@ pub mod linalg;
 pub mod model_types;
 /// Lower-layer outer-iteration row-subsampling/chunking primitives (RowSet,
 /// ARROW_ROW_CHUNK). Hosted at the crate root so `families` can name them
-/// without importing up into `solver`; `crate::solver::outer_subsample` is a
-/// back-compat re-export.
+/// without importing up into `solver`.
 pub mod outer_subsample;
 /// Lower-layer Pareto-smoothed importance-sampling primitive. Self-contained
 /// (no solver/inference deps); hosted at the crate root so `solver` and a
 /// relocated `rho_uncertainty` can depend on it downward (#1135).
-/// `crate::inference::psis` remains a back-compat re-export.
 pub mod psis;
 pub mod reml_contracts;
 pub mod report;
 /// Lower-layer resource-policy/materialization-budget types. Hosted at the
 /// crate root (not under `solver`) so the `families` layer can name them
-/// without importing *up* into `solver` (#1135). `crate::solver::resource`
-/// remains a back-compat re-export.
+/// without importing *up* into `solver` (#1135).
 pub mod resource;
 pub(crate) mod rho_prior_eval;
 /// Lower-layer ρ-uncertainty (PSIS-on-ρ) diagnostic. Depends only on the
 /// lower-layer `crate::psis`; hosted at the crate root so `solver` (its primary
 /// consumer) can depend on it downward instead of importing *up* into
-/// `inference` (#1135). `crate::inference::rho_uncertainty` remains a
-/// back-compat re-export.
+/// `inference` (#1135).
 pub mod rho_uncertainty;
 pub mod solver;
 /// Lower-layer outer-objective contract (the `OuterHessianOperator` trait,

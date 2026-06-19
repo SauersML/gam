@@ -96,14 +96,14 @@ pub(super) struct BernoulliRigidRowKernel {
     /// Holds an `Arc` to the (possibly globally-shared, same-β) tensor so a
     /// cross-eval hit in [`shared_rigid_tensor_store`] is stored here once and
     /// then served `O(1)` to every ψ-axis operator that consults this kernel.
-    pub(super) third_full_cache: crate::solver::resource::RayonSafeOnce<Arc<RigidThirdFull>>,
+    pub(super) third_full_cache: crate::resource::RayonSafeOnce<Arc<RigidThirdFull>>,
     /// Per-row uncontracted fourth-derivative tensor — the outer-Hessian
     /// analogue of `third_full_cache`. The second-directional-derivative
     /// operator's trace path touches every row × (u, v) pair; with this
     /// cache the heavy 8-direction empirical jet (or closed-form 5-component
     /// build) runs at most once per row, leaving each pair with a cheap
     /// [`contract_fourth_full`] bilinear.
-    pub(super) fourth_full_cache: crate::solver::resource::RayonSafeOnce<Arc<RigidFourthFull>>,
+    pub(super) fourth_full_cache: crate::resource::RayonSafeOnce<Arc<RigidFourthFull>>,
 }
 
 impl BernoulliRigidRowKernel {
@@ -116,8 +116,8 @@ impl BernoulliRigidRowKernel {
             family,
             block_states,
             slices,
-            third_full_cache: crate::solver::resource::RayonSafeOnce::new(),
-            fourth_full_cache: crate::solver::resource::RayonSafeOnce::new(),
+            third_full_cache: crate::resource::RayonSafeOnce::new(),
+            fourth_full_cache: crate::resource::RayonSafeOnce::new(),
         }
     }
 

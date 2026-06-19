@@ -45,7 +45,7 @@ impl BinomialLocationScaleWiggleHessianWorkspace {
     /// are independent of the per-row weights and remain unchanged.
     pub(crate) fn apply_outer_subsample(
         &mut self,
-        rows: &[crate::solver::outer_subsample::WeightedOuterRow],
+        rows: &[crate::outer_subsample::WeightedOuterRow],
     ) {
         let n = self.pieces.coeff_tt.len();
         let mut mask_tt = Array1::<f64>::zeros(n);

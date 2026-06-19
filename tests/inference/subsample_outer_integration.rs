@@ -10,7 +10,7 @@
 use gam::families::marginal_slope_shared::{
     build_outer_score_subsample, outer_row_indices, outer_row_weights_by_index,
 };
-use gam::solver::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
+use gam::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
 
 #[test]
 fn build_outer_score_subsample_is_deterministic_per_seed() {

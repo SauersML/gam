@@ -74,7 +74,7 @@ use crate::model_types::EstimationError;
 use crate::solver::fit_orchestration::{
     FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,
 };
-use crate::solver::resource::ProblemHints;
+use crate::resource::ProblemHints;
 use crate::terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design,

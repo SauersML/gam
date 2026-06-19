@@ -32,7 +32,7 @@ use crate::smooth::{
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
     TensorBSplinePenaltyDecomposition, TensorBSplineSpec, TermCollectionSpec,
 };
-use crate::solver::resource::ResourcePolicy;
+use crate::resource::ResourcePolicy;
 use crate::types::ColIdx;
 
 /// Fraction of the data bounding-box diameter used as the default Matérn
@@ -4401,7 +4401,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("periodic boundary should build");
         let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4438,7 +4438,7 @@ mod tests {
                 &ds,
                 &col_map,
                 &mut notes,
-                &crate::solver::resource::ResourcePolicy::default_library(),
+                &crate::resource::ResourcePolicy::default_library(),
             )
             .unwrap_or_else(|err| panic!("bs='{selector}' must build a 1-D smooth, got: {err:?}"));
             let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4485,7 +4485,7 @@ mod tests {
                 &ds,
                 &col_map,
                 &mut notes,
-                &crate::solver::resource::ResourcePolicy::default_library(),
+                &crate::resource::ResourcePolicy::default_library(),
             )
             .unwrap_or_else(|err| {
                 panic!("`{formula}` must degree-reduce, not error; got: {err:?}")
@@ -4545,7 +4545,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("monotone smooth should build");
         assert_eq!(
@@ -4560,7 +4560,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes_bad,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect_err("bogus shape must error");
         assert!(
@@ -4590,7 +4590,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("build sphere termspec");
         let SmoothBasisSpec::Sphere { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4621,7 +4621,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("build default duchon termspec");
         let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4649,7 +4649,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("build hybrid duchon termspec");
         let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4776,7 +4776,7 @@ mod tests {
                 &ds,
                 &col_map,
                 &mut notes,
-                &crate::solver::resource::ResourcePolicy::default_library(),
+                &crate::resource::ResourcePolicy::default_library(),
             )
             .unwrap_or_else(|err| panic!("fs k={k} should degree-reduce, got: {err:?}"));
             let SmoothBasisSpec::FactorSmooth { spec } = &terms.smooth_terms[0].basis else {
@@ -4846,7 +4846,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("build tensor terms");
         let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4910,7 +4910,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("build tensor with binary margin");
         let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4974,7 +4974,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("build tensor terms with per-margin k");
         let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -5022,7 +5022,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("build tensor terms without per-margin k");
         assert!(
@@ -5055,7 +5055,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("build multi-smooth terms");
         let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -5096,7 +5096,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::solver::resource::ResourcePolicy::default_library(),
+            &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("build multi-smooth terms");
         let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {

@@ -2775,7 +2775,7 @@ pub(crate) fn crossfit_score_calibration(
     data: &Dataset,
     col_map: &HashMap<String, usize>,
     recipe: Option<&CtnStage1Recipe>,
-    policy: &crate::solver::resource::ResourcePolicy,
+    policy: &crate::resource::ResourcePolicy,
 ) -> Result<Option<CrossFitScoreCalibration>, String> {
     let Some(recipe) = recipe else {
         return Ok(None);

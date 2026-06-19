@@ -24,7 +24,7 @@
 mod margslope_flex_equivalence;
 
 use gam::families::custom_family::BlockwiseFitOptions;
-use gam::solver::outer_subsample::OuterScoreSubsample;
+use gam::outer_subsample::OuterScoreSubsample;
 use margslope_flex_equivalence::{
     build_large_scale_shape_problem, cycle_capped_options, fit_problem,
 };

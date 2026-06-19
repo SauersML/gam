@@ -105,7 +105,7 @@ pub struct BernoulliMarginalSlopeFitRequest<'a> {
     pub spec: BernoulliMarginalSlopeTermSpec,
     pub options: BlockwiseFitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
-    pub policy: crate::solver::resource::ResourcePolicy,
+    pub policy: crate::resource::ResourcePolicy,
 }
 
 pub struct SurvivalMarginalSlopeFitRequest<'a> {
@@ -436,10 +436,10 @@ pub struct FitConfig {
     /// large workloads, `Off` pins execution to CPU kernels, and `Force` fails
     /// loudly when a requested GPU kernel has no compiled backend.
     pub gpu_policy: crate::gpu::GpuPolicy,
-    /// Optional override of the [`crate::solver::resource::ResourcePolicy`] used when
+    /// Optional override of the [`crate::resource::ResourcePolicy`] used when
     /// planning spatial bases (TPS / Matern / Duchon) during term construction.
     /// When `None`, the default-library policy is used.
-    pub resource_policy: Option<crate::solver::resource::ResourcePolicy>,
+    pub resource_policy: Option<crate::resource::ResourcePolicy>,
 
     /// Optional per-group metadata supplied by the caller. Fitting ignores this
     /// field; saved-model builders pass it through so deployment consumers can

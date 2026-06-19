@@ -60,7 +60,7 @@ pub struct GaussianLocationScaleWiggleFamily {
     /// per-call materialization decision) made during exact-Newton joint psi
     /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
     /// when the family is built without an explicit policy.
-    pub policy: crate::solver::resource::ResourcePolicy,
+    pub policy: crate::resource::ResourcePolicy,
     pub(crate) cached_row_scalars:
         std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
 }
@@ -489,7 +489,7 @@ impl GaussianLocationScaleWiggleFamily {
         psi_index: usize,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        policy: &crate::solver::resource::ResourcePolicy,
+        policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         let Some(parts) = locscale_joint_psi_direction_parts(
             block_states,
@@ -2656,7 +2656,7 @@ impl GaussianLocationScaleWiggleHessianWorkspace {
     /// likelihood only through `q = η_μ + η_w` (no σ-chain).
     pub(crate) fn apply_outer_subsample(
         &mut self,
-        rows: &[crate::solver::outer_subsample::WeightedOuterRow],
+        rows: &[crate::outer_subsample::WeightedOuterRow],
     ) {
         let n = self.pieces.coeff_mm.len();
         let mut mask_mm = Array1::<f64>::zeros(n);

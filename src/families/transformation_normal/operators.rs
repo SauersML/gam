@@ -559,7 +559,7 @@ impl TransformationNormalPsiHessianOperator {
         let n = self.family.response_val_basis.nrows();
         let p_cov = self.family.covariate_design.ncols();
         let policy = ResourcePolicy::default_library();
-        let rows_per_chunk = crate::solver::resource::rows_for_target_bytes(
+        let rows_per_chunk = crate::resource::rows_for_target_bytes(
             policy.row_chunk_target_bytes,
             p_cov.saturating_mul(axes.len() + 1).max(1),
         )
@@ -707,7 +707,7 @@ pub(crate) struct TransformationNormalPsiDhMatrixFreeOperator {
     // (see `feedback_oncelock_rayon_deadlock`). `RayonSafeOnce` keeps the
     // init lock-free; racers redundantly compute but `set()` discards the
     // losers.
-    pub(crate) dense_cache: crate::solver::resource::RayonSafeOnce<Array2<f64>>,
+    pub(crate) dense_cache: crate::resource::RayonSafeOnce<Array2<f64>>,
 }
 
 impl TransformationNormalPsiDhMatrixFreeOperator {
@@ -726,7 +726,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
             op,
             axis,
             row_quantities,
-            dense_cache: crate::solver::resource::RayonSafeOnce::new(),
+            dense_cache: crate::resource::RayonSafeOnce::new(),
         }
     }
 
@@ -805,7 +805,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
             .saturating_mul(2)
             .saturating_add(p_resp.saturating_mul(rank).saturating_mul(2))
             .max(1);
-        let rows_per_chunk = crate::solver::resource::rows_for_target_bytes(
+        let rows_per_chunk = crate::resource::rows_for_target_bytes(
             policy.row_chunk_target_bytes,
             live_cols,
         )
@@ -855,7 +855,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
         let op = self.tensor_op();
         let policy = ResourcePolicy::default_library();
         let live_cols = p_cov.saturating_mul(2).max(1);
-        let rows_per_chunk = crate::solver::resource::rows_for_target_bytes(
+        let rows_per_chunk = crate::resource::rows_for_target_bytes(
             policy.row_chunk_target_bytes,
             live_cols,
         )
@@ -905,7 +905,7 @@ impl TransformationNormalPsiDhMatrixFreeOperator {
             .saturating_mul(2)
             .saturating_add(p_resp.saturating_mul(rank).saturating_mul(2))
             .max(1);
-        let rows_per_chunk = crate::solver::resource::rows_for_target_bytes(
+        let rows_per_chunk = crate::resource::rows_for_target_bytes(
             policy.row_chunk_target_bytes,
             live_cols,
         )
@@ -1188,7 +1188,7 @@ impl TransformationNormalPsiPsiHessianOperator {
         let n = self.family.response_val_basis.nrows();
         let p_cov = self.family.covariate_design.ncols();
         let policy = ResourcePolicy::default_library();
-        let rows_per_chunk = crate::solver::resource::rows_for_target_bytes(
+        let rows_per_chunk = crate::resource::rows_for_target_bytes(
             policy.row_chunk_target_bytes,
             p_cov.saturating_mul(n_axes + 2).max(1),
         )

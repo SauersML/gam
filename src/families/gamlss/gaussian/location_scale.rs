@@ -13,7 +13,7 @@ pub struct GaussianLocationScaleFamily {
     /// per-call materialization decision) made during exact-Newton joint psi
     /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
     /// when the family is built without an explicit policy.
-    pub policy: crate::solver::resource::ResourcePolicy,
+    pub policy: crate::resource::ResourcePolicy,
     /// Cached per-observation row scalars keyed by 6-element fingerprint
     /// (first, mid, last elements of both eta vectors).
     /// Avoids recomputing O(n) scalars K+ times per REML gradient/Hessian evaluation.
@@ -422,7 +422,7 @@ impl GaussianLocationScaleFamily {
         psi_index: usize,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        policy: &crate::solver::resource::ResourcePolicy,
+        policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         let Some(parts) = locscale_joint_psi_direction_parts(
             block_states,
@@ -630,7 +630,7 @@ impl GaussianLocationScaleFamily {
         dir_j: &LocationScaleJointPsiDirection,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        subsample: Option<&[crate::solver::outer_subsample::WeightedOuterRow]>,
+        subsample: Option<&[crate::outer_subsample::WeightedOuterRow]>,
     ) -> Result<crate::custom_family::ExactNewtonJointPsiSecondOrderTerms, String> {
         let second_drifts = self.exact_newton_joint_psisecond_design_drifts(
             block_states,
@@ -779,7 +779,7 @@ impl GaussianLocationScaleFamily {
         d_beta_flat: &Array1<f64>,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        subsample: Option<&[crate::solver::outer_subsample::WeightedOuterRow]>,
+        subsample: Option<&[crate::outer_subsample::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String> {
         let etamu = &block_states[Self::BLOCK_MU].eta;
         let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;

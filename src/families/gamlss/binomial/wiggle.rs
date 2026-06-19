@@ -17,7 +17,7 @@ pub struct BinomialLocationScaleWiggleFamily {
     /// per-call materialization decision) made during exact-Newton joint psi
     /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
     /// when the family is built without an explicit policy.
-    pub policy: crate::solver::resource::ResourcePolicy,
+    pub policy: crate::resource::ResourcePolicy,
 }
 
 impl BinomialLocationScaleWiggleFamily {
@@ -326,7 +326,7 @@ impl BinomialLocationScaleWiggleFamily {
         psi_index: usize,
         x_t: &Array2<f64>,
         x_ls: &Array2<f64>,
-        policy: &crate::solver::resource::ResourcePolicy,
+        policy: &crate::resource::ResourcePolicy,
     ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         let Some(parts) = locscale_joint_psi_direction_parts(
             block_states,

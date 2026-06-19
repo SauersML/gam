@@ -69,7 +69,7 @@ pub(crate) fn materialize_standard<'a>(
     let policy = resolved_resource_policy(
         config,
         term_data,
-        crate::solver::resource::ProblemHints::default(),
+        crate::resource::ProblemHints::default(),
     );
     let spec = build_termspec_with_geometry_and_overrides(
         &term_parsed.terms,

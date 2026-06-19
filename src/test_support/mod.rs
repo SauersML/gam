@@ -6,7 +6,7 @@ pub mod reference;
 
 use crate::families::custom_family::{ParameterBlockSpec, PenaltyMatrix};
 use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
-use crate::solver::resource::MatrixMaterializationError;
+use crate::resource::MatrixMaterializationError;
 use ndarray::{Array1, Array2, Axis, array, s};
 use std::ops::Range;
 use std::sync::Arc;

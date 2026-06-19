@@ -24,7 +24,7 @@
 use std::sync::Arc;
 
 use crate::custom_family::BlockwiseFitOptions;
-use crate::solver::outer_subsample::OuterScoreSubsample;
+use crate::outer_subsample::OuterScoreSubsample;
 
 /// Identifier-carrying handle for a single row subsample mask.
 ///
@@ -129,7 +129,7 @@ fn hash_subsample(mask: &Arc<OuterScoreSubsample>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
 
     #[test]
     fn full_data_id_is_stable_per_n() {

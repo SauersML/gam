@@ -184,7 +184,7 @@ impl BinomialLocationScaleHessianWorkspace {
     /// joint Hessian.
     pub(crate) fn apply_outer_subsample(
         &mut self,
-        rows: &[crate::solver::outer_subsample::WeightedOuterRow],
+        rows: &[crate::outer_subsample::WeightedOuterRow],
     ) {
         let n = self.coeff_tt.len();
         let mut mask_tt = Array1::<f64>::zeros(n);

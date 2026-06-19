@@ -28,7 +28,7 @@
 
 use crate::estimate::UnifiedFitResult;
 use crate::inference::alo::AloDiagnostics;
-use crate::inference::psis::pareto_smooth_weights;
+use crate::psis::pareto_smooth_weights;
 use crate::types::{GlmLikelihoodSpec, LikelihoodSpec};
 use ndarray::{Array1, ArrayView1, ArrayView2};
 

@@ -232,7 +232,7 @@ impl DenseOrOperator<'_> {
 /// materializer's error so callers can pin which block failed.
 pub(crate) fn dense_block_from_spec<'a>(
     spec: &'a ParameterBlockSpec,
-    material_policy: &crate::solver::resource::MaterializationPolicy,
+    material_policy: &crate::resource::MaterializationPolicy,
     materialization_label: &str,
 ) -> Result<Cow<'a, Array2<f64>>, String> {
     match spec.design.as_dense_ref() {
@@ -261,7 +261,7 @@ pub(crate) fn dense_locscale_block_designs_fromspecs<'a>(
     primary_block_idx: usize,
     log_sigma_block_idx: usize,
     primary_label: &str,
-    material_policy: &crate::solver::resource::MaterializationPolicy,
+    material_policy: &crate::resource::MaterializationPolicy,
 ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
     if specs.len() != expected_count {
         return Err(GamlssError::DimensionMismatch {
@@ -297,7 +297,7 @@ pub(crate) fn dense_locscale_block_designs_cached<'a>(
     family_name: &str,
     short_family_name: &str,
     primary_label: &str,
-    material_policy: &crate::solver::resource::MaterializationPolicy,
+    material_policy: &crate::resource::MaterializationPolicy,
 ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
     let primary_design = primary_design
         .ok_or_else(|| format!("{family_name} exact path is missing {primary_label} design"))?;
@@ -363,7 +363,7 @@ pub(crate) fn locscale_joint_psi_direction_parts(
     expected_blocks: usize,
     family_name: &str,
     primary_label: &str,
-    policy: &crate::solver::resource::ResourcePolicy,
+    policy: &crate::resource::ResourcePolicy,
 ) -> Result<Option<LocScalePsiDirectionParts>, String> {
     validate_block_count::<GamlssError>(family_name, expected_blocks, block_states.len())?;
     if derivative_blocks.len() != expected_blocks {
@@ -450,7 +450,7 @@ pub(crate) struct LocScalePsiDriftConfig<'a> {
     pub(crate) log_sigma_block_idx: usize,
     pub(crate) family_name: &'a str,
     pub(crate) primary_label: &'a str,
-    pub(crate) policy: &'a crate::solver::resource::ResourcePolicy,
+    pub(crate) policy: &'a crate::resource::ResourcePolicy,
 }
 
 pub(crate) fn locscale_joint_psisecond_design_drifts(
@@ -532,7 +532,7 @@ pub(crate) fn psi_psi_map_to_drift_slots(
     n: usize,
     p: usize,
     label: &str,
-    policy: &crate::solver::resource::ResourcePolicy,
+    policy: &crate::resource::ResourcePolicy,
 ) -> Result<
     (
         Option<crate::custom_family::CustomFamilyPsiSecondDesignAction>,
@@ -567,7 +567,7 @@ pub(crate) fn dense_block_or_operator<'a>(
     n: usize,
     p: usize,
     budget_bytes: usize,
-    policy: &crate::solver::resource::ResourcePolicy,
+    policy: &crate::resource::ResourcePolicy,
 ) -> DenseOrOperator<'a> {
     if let Some(dense) = design.as_dense_ref() {
         return DenseOrOperator::Borrowed(dense);

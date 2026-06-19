@@ -127,7 +127,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
     let policy = resolved_resource_policy(
         config,
         data,
-        crate::solver::resource::ProblemHints {
+        crate::resource::ProblemHints {
             marginal_slope_large_scale_active: true,
         },
     );

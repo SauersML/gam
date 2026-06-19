@@ -2588,7 +2588,7 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
         );
     }
 
-    let policy = crate::solver::resource::ResourcePolicy::default_library();
+    let policy = crate::resource::ResourcePolicy::default_library();
     let force_operator = radial_kind.is_duchon_family();
     let dense_derivatives_exceed_budget =
         should_use_implicit_operators_with_policy(n, p_final, dim, &policy);
@@ -2824,7 +2824,7 @@ pub(crate) fn build_scalar_design_psi_derivatives_shared(
         );
     }
 
-    let policy = crate::solver::resource::ResourcePolicy::default_library();
+    let policy = crate::resource::ResourcePolicy::default_library();
     let force_operator = radial_kind.is_duchon_family();
     let dense_derivatives_exceed_budget =
         should_use_implicit_operators_with_policy(n, p_final, 1, &policy);

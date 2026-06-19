@@ -2998,7 +2998,7 @@ mod empirical_rigid_jet_oracle_tests {
         grid: EmpiricalZGrid,
     ) -> BernoulliMarginalSlopeFamily {
         let n = y.len();
-        let policy = crate::solver::resource::ResourcePolicy::default_library();
+        let policy = crate::resource::ResourcePolicy::default_library();
         let dummy = || {
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
                 n, 1,
@@ -3319,7 +3319,7 @@ mod empirical_flex_jet_oracle_tests {
         // One observation row carrying the latent score / response / weight the
         // kernel reads at `self.{z,y,weights}[row]`.
         let n = 1usize;
-        let policy = crate::solver::resource::ResourcePolicy::default_library();
+        let policy = crate::resource::ResourcePolicy::default_library();
         let dummy = || {
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
                 n, 1,

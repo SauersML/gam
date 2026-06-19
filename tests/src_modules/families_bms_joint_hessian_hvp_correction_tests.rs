@@ -2,7 +2,7 @@
 
 #[test]
 fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_full_equals_unsampled() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);
@@ -41,7 +41,7 @@ fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_full_equal
 
 #[test]
 fn bernoulli_jointhessian_batched_directional_operators_match_single_direction_path() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
 
     let n = 200usize;
     let family = make_block_psi_test_family(n);
@@ -411,7 +411,7 @@ fn bernoulli_value_cell_moments_use_shared_lru() {
 
 #[test]
 fn bernoulli_flex_paired_subsample_ll_delta_sign_matches_full_ll() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
 
     let (family, old_states) = make_flex_hvp_cache_test_family(96);
     let mut trial_states = old_states.clone();
@@ -614,13 +614,13 @@ fn bernoulli_flex_hvp_cache_matches_uncached_path_small_case() {
         row_contexts: cached.row_contexts.clone(),
         row_cell_moments: None,
         cell_family_forest: None,
-        row_cell_moments_d15: crate::solver::resource::RayonSafeOnce::new(),
-        row_cell_moments_d21: crate::solver::resource::RayonSafeOnce::new(),
+        row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
+        row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
         row_primary_hessians: RowPrimaryEvalCache::Empty,
-        rigid_third_full: crate::solver::resource::RayonSafeOnce::new(),
-        rigid_fourth_full: crate::solver::resource::RayonSafeOnce::new(),
-        flex_axis_third_tensors: crate::solver::resource::RayonSafeOnce::new(),
-        flex_axis_fourth_tensors: crate::solver::resource::RayonSafeOnce::new(),
+        rigid_third_full: crate::resource::RayonSafeOnce::new(),
+        rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
+        flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
+        flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
         full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let direction =
@@ -688,18 +688,18 @@ fn bernoulli_flex_tiled_hvp_cache_matches_host_cache_small_case() {
         row_contexts: host_cache.row_contexts.clone(),
         row_cell_moments: host_cache.row_cell_moments.clone(),
         cell_family_forest: None,
-        row_cell_moments_d15: crate::solver::resource::RayonSafeOnce::new(),
-        row_cell_moments_d21: crate::solver::resource::RayonSafeOnce::new(),
+        row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
+        row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
         row_primary_hessians: RowPrimaryEvalCache::Tiled(RowPrimaryEvalTiles::new(
             family.y.len(),
             r,
             5,
             tiles,
         )),
-        rigid_third_full: crate::solver::resource::RayonSafeOnce::new(),
-        rigid_fourth_full: crate::solver::resource::RayonSafeOnce::new(),
-        flex_axis_third_tensors: crate::solver::resource::RayonSafeOnce::new(),
-        flex_axis_fourth_tensors: crate::solver::resource::RayonSafeOnce::new(),
+        rigid_third_full: crate::resource::RayonSafeOnce::new(),
+        rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
+        flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
+        flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
         full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let direction =
@@ -776,13 +776,13 @@ fn bernoulli_flex_hvp_cache_timing_large_scale_shape_pattern() {
         row_contexts: cached.row_contexts.clone(),
         row_cell_moments: None,
         cell_family_forest: None,
-        row_cell_moments_d15: crate::solver::resource::RayonSafeOnce::new(),
-        row_cell_moments_d21: crate::solver::resource::RayonSafeOnce::new(),
+        row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
+        row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
         row_primary_hessians: RowPrimaryEvalCache::Empty,
-        rigid_third_full: crate::solver::resource::RayonSafeOnce::new(),
-        rigid_fourth_full: crate::solver::resource::RayonSafeOnce::new(),
-        flex_axis_third_tensors: crate::solver::resource::RayonSafeOnce::new(),
-        flex_axis_fourth_tensors: crate::solver::resource::RayonSafeOnce::new(),
+        rigid_third_full: crate::resource::RayonSafeOnce::new(),
+        rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
+        flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
+        flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
         full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let directions: Vec<_> = (0..4)
@@ -910,7 +910,7 @@ fn bernoulli_large_scale_outer_derivatives_keep_analytic_hessian_route() {
 
 #[test]
 fn bernoulli_jointhessian_directional_derivative_from_cache_subsample_half_scales_correctly() {
-    use crate::solver::outer_subsample::OuterScoreSubsample;
+    use crate::outer_subsample::OuterScoreSubsample;
     let n = 200usize;
     let family = make_block_psi_test_family(n);
     let states = block_psi_test_block_states(&family, 0.15, 0.25);

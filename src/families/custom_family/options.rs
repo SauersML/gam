@@ -536,7 +536,7 @@ pub struct BlockwiseFitOptions {
     /// consulted only by outer-only call sites. Default `None` preserves the
     /// full-data behavior. Wrapping in `Arc` keeps `Clone` cheap across the
     /// many places `BlockwiseFitOptions` is duplicated per-eval.
-    pub outer_score_subsample: Option<Arc<crate::solver::outer_subsample::OuterScoreSubsample>>,
+    pub outer_score_subsample: Option<Arc<crate::outer_subsample::OuterScoreSubsample>>,
     /// Gate for marginal-slope families to auto-derive a stratified
     /// outer-score subsample at large scale (see
     /// [`crate::families::marginal_slope_shared::auto_outer_score_subsample`]).

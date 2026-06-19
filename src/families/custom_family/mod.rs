@@ -56,7 +56,7 @@ pub(crate) use crate::solver::estimate::reml::reml_outer_engine::{
 pub(crate) use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
-pub(crate) use crate::solver::resource::{DerivativeStorageMode, ResourcePolicy};
+pub(crate) use crate::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use crate::types::{RidgeDeterminantMode, RidgePolicy};
 pub(crate) use faer::Side;
 pub(crate) use joint_newton::whitened_spectrum;

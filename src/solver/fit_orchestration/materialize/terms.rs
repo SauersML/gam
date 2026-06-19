@@ -15,7 +15,7 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     col_map: &HashMap<String, usize>,
     inference_notes: &mut Vec<String>,
     scale_dimensions: bool,
-    policy: &crate::solver::resource::ResourcePolicy,
+    policy: &crate::resource::ResourcePolicy,
     smooth_overrides: Option<&JsonValue>,
 ) -> Result<TermCollectionSpec, WorkflowError> {
     let mut spec = build_termspec(terms, data, col_map, inference_notes, policy)?;

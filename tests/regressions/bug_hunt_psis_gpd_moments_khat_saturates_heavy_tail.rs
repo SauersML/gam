@@ -33,7 +33,7 @@
 //! Root cause: src/inference/psis.rs:88 (`fit_gpd_moments`).
 //! Related: #513, #514, #515 (other numerical-fidelity bugs in inference).
 
-use gam::inference::psis::fit_gpd_moments;
+use gam::psis::fit_gpd_moments;
 
 /// Exact GPD(k, σ) quantile: x(u) = σ·((1-u)^(-k) - 1)/k for k != 0.
 fn gpd_quantile(u: f64, k: f64, sigma: f64) -> f64 {
