@@ -307,6 +307,8 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
     // Small ladder: 1k → 16k (16×). Enough to read the slope; ~2–3 min total.
     let ns = [1_000usize, 4_000, 16_000];
     let mut kappa_phase = Vec::with_capacity(ns.len());
+    let mut kappa_calls = Vec::with_capacity(ns.len());
+    let mut kappa_resets = Vec::with_capacity(ns.len());
     eprintln!(
         "[kappa-fast-ladder] {:>9}  {:>10}  {:>12}  {:>12}  {:>9}  {:>9}  {:>6}  {:>6}  {:>6}  {:>9}  {:>9}  {:>9}",
         "n",
@@ -327,7 +329,10 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
         let timing = kappa.kappa_timing.unwrap();
         let phase = timing.trial_total_s().max(0.0);
         let callback_avg = kappa.kappa_callback_avg_s().unwrap_or(0.0).max(0.0);
+        let calls = timing.cost_calls + timing.eval_calls + timing.efs_calls;
         kappa_phase.push(phase);
+        kappa_calls.push(calls);
+        kappa_resets.push(timing.slow_path_resets);
         eprintln!(
             "[kappa-fast-ladder] {n:>9}  {:>10.4}  {:>12.4}  {:>12.4}  {:>9}  {:>9}  {:>6}  {:>6}  {:>6}  {:>9.4}  {:>9.4}  {:>9.4}",
             kappa.wall_s,
@@ -354,19 +359,43 @@ fn kappa_outer_loop_is_n_independent_fast_ladder() {
         );
     }
 
-    let first = kappa_phase.first().copied().unwrap_or(0.0).max(1e-3);
-    let last = kappa_phase.last().copied().unwrap_or(0.0).max(1e-3);
+    let callback_avg: Vec<f64> = kappa_phase
+        .iter()
+        .zip(&kappa_calls)
+        .map(|(&total, &calls)| {
+            if calls == 0 {
+                0.0
+            } else {
+                total / calls as f64
+            }
+        })
+        .collect();
+    let first_cb = callback_avg.first().copied().unwrap_or(0.0).max(1e-6);
+    let last_cb = callback_avg.last().copied().unwrap_or(0.0).max(1e-6);
+    let first_sum = kappa_phase.first().copied().unwrap_or(0.0).max(1e-3);
+    let last_sum = kappa_phase.last().copied().unwrap_or(0.0).max(1e-3);
     let n_ratio = (ns.last().unwrap() / ns.first().unwrap()) as f64; // 16
-    let phase_ratio = last / first;
+    let cb_ratio = last_cb / first_cb;
     eprintln!(
-        "[kappa-fast-ladder] n grew {n_ratio:.0}× ; kappa callback sum grew {phase_ratio:.2}× \
-         (n-independent ⇒ ~1×, n-linear ⇒ ~{n_ratio:.0}×) — fast #1033 close-signal"
+        "[kappa-fast-ladder] n grew {n_ratio:.0}× ; PER-CALLBACK avg grew {cb_ratio:.2}× \
+         (n-independent ⇒ ~1×, n-linear ⇒ ~{n_ratio:.0}×) ; summed-total grew {:.2}× \
+         (context only) — fast #1033 close-signal",
+        last_sum / first_sum
+    );
+    let resets_first = kappa_resets.first().copied().unwrap_or(0);
+    let resets_last = kappa_resets.last().copied().unwrap_or(0);
+    assert!(
+        resets_last <= resets_first.saturating_add(1),
+        "slow_path_resets climbed from {resets_first} (n={}) to {resets_last} (n={}) — \
+         the fast #1033 read still sees the O(n) reset_surface/design-realization lane",
+        ns.first().unwrap(),
+        ns.last().unwrap()
     );
     assert!(
-        phase_ratio <= 8.0,
-        "kappa outer-loop callback sum grew {phase_ratio:.2}× across a {n_ratio:.0}× \
-         increase in n — the #1033 n-free skip is still falling to an O(n) \
-         per-trial pass across the reduced-basis rotation (fast-ladder read)"
+        cb_ratio <= 8.0,
+        "kappa outer-loop PER-CALLBACK average grew {cb_ratio:.2}× across a {n_ratio:.0}× \
+         increase in n — the #1033 n-free skip is still doing O(n) work inside a \
+         trial callback (fast-ladder read)"
     );
 }
 
