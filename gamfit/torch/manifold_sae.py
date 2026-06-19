@@ -685,6 +685,12 @@ class _SparsityLayer(nn.Module):
         # (lazily, on the first training forward) and cached here.
         self._global_anchor: torch.Tensor | None = None
         self._global_anchor_ready = False
+        # Transferable form of the quadratic-subspace anchor: the winning
+        # ``(feature_i, feature_j, threshold)`` split, applied to any batch
+        # (notably the different-N evaluation batch) so held-out routing uses the
+        # same high-margin discriminant as training instead of the instantaneous
+        # residual fallback (issue #1282).
+        self._global_anchor_rule: tuple[int, int, float] | None = None
 
     @torch.no_grad()
     def advance_temperature(self) -> None:
@@ -861,6 +867,7 @@ class _SparsityLayer(nn.Module):
         best_assign: torch.Tensor | None = None
         best_resid: torch.Tensor | None = None
         second_resid: torch.Tensor | None = None
+        best_rule: tuple[int, int, float] | None = None
         for i in range(d):
             xi = xn[:, i]
             for j in range(i, d):
@@ -877,6 +884,7 @@ class _SparsityLayer(nn.Module):
                     second_resid = best_resid
                     best_resid = resid
                     best_assign = assign
+                    best_rule = (i, j, float(threshold.item()))
                 elif second_resid is None or bool(resid < second_resid):
                     second_resid = resid
 
@@ -889,9 +897,45 @@ class _SparsityLayer(nn.Module):
         confident = best <= 0.05 and second >= max(3.0 * best, best + 0.02)
         if not confident:
             return None, False
+        # Persist the winning quadratic-feature decision rule so the SAME
+        # union-of-subspaces split routes *any* batch — in particular the
+        # out-of-sample (different-N) evaluation batch, where the cached per-row
+        # one-hot anchor cannot apply. Without this, evaluation routing falls
+        # back to the instantaneous per-atom residual, which is weak and
+        # noise-sensitive on the rows whose discriminating channel is near zero
+        # (small ``sin θ`` on the signed circles) and drifts below the routing
+        # bar (issue #1282). The rule is a balanced, 100×-margin subspace split,
+        # so it transfers exactly to held-out rows of the same DGP.
+        self._global_anchor_rule = best_rule
         onehot = torch.zeros(n, 2, dtype=x.dtype, device=x.device)
         onehot[torch.arange(n, device=x.device), best_assign] = 1.0
         return onehot, True
+
+    @torch.no_grad()
+    def _apply_global_anchor_rule(self, x: torch.Tensor) -> torch.Tensor | None:
+        """Route an arbitrary batch by the cached quadratic-subspace rule.
+
+        Returns an ``(N, 2)`` one-hot for the current ``x`` using the persisted
+        ``(i, j, threshold)`` split discovered by ``_quadratic_subspace_anchor``,
+        or ``None`` if no transferable rule was accepted. The rule is the same
+        high-margin union-of-subspaces discriminant that anchors the training
+        partition, so applying it to the evaluation batch makes held-out routing
+        as clean as in-sample routing instead of decaying to the instantaneous
+        residual readout.
+        """
+        rule = self._global_anchor_rule
+        if rule is None or self.n_atoms != 2:
+            return None
+        i, j, threshold = rule
+        d = int(x.shape[1])
+        if i >= d or j >= d:
+            return None
+        xn = x / x.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        feature = xn[:, i] * xn[:, j]
+        assign = (feature > threshold).to(torch.long)
+        onehot = torch.zeros(int(x.shape[0]), 2, dtype=x.dtype, device=x.device)
+        onehot[torch.arange(int(x.shape[0]), device=x.device), assign] = 1.0
+        return onehot
 
     def reconstruction_topk_gate(
         self,
@@ -1001,6 +1045,17 @@ class _SparsityLayer(nn.Module):
                 self._global_anchor = anchor if confident else None
                 self._global_anchor_ready = True
             anchor = self._global_anchor
+            # On a batch whose row count differs from the cached per-row anchor
+            # (the out-of-sample evaluation batch), re-derive the one-hot from the
+            # persisted transferable decision rule so held-out rows are routed by
+            # the same high-margin union-of-subspaces split rather than the weak
+            # instantaneous residual (issue #1282).
+            if (
+                anchor is not None
+                and anchor.shape != soft.shape
+                and self._global_anchor_rule is not None
+            ):
+                anchor = self._apply_global_anchor_rule(x.detach())
             if anchor is not None and anchor.shape == soft.shape:
                 hard_ste = anchor + soft - soft.detach()
                 # Floor the routed atom's code at a negligible positive multiple
