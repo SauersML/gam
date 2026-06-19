@@ -2202,6 +2202,119 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         prod_hess[[gi, wi0]],
         witness_h_gw
     );
+    {
+        let beta_h_arr = Array1::from(beta_h0.clone());
+        let beta_w_arr = Array1::from(beta_w0.clone());
+        let tp_diag = |label: &str, q: f64, q_index: usize| {
+            let (a, d) = family
+                .solve_row_survival_intercept_with_slot(
+                    q,
+                    gv,
+                    Some(&beta_h_arr),
+                    Some(&beta_w_arr),
+                    Some((
+                        0,
+                        if q_index == primary.q0 {
+                            SurvivalInterceptSlotKind::Entry
+                        } else {
+                            SurvivalInterceptSlotKind::Exit
+                        },
+                    )),
+                )
+                .expect("diagnostic intercept");
+            let cached = family
+                .build_cached_partition(&primary, a, gv, Some(&beta_h_arr), Some(&beta_w_arr))
+                .expect("diagnostic cached partition");
+            let base = family
+                .compute_survival_timepoint_exact_from_cached(
+                    0,
+                    &primary,
+                    q,
+                    q_index,
+                    a,
+                    gv,
+                    d,
+                    Some(&beta_h_arr),
+                    Some(&beta_w_arr),
+                    0.0,
+                    q_index == primary.q1,
+                    &cached,
+                )
+                .expect("diagnostic base timepoint");
+            let ext = family
+                .compute_survival_timepoint_directional_exact_from_cached(
+                    0,
+                    &primary,
+                    q,
+                    q_index,
+                    a,
+                    gv,
+                    Some(&beta_h_arr),
+                    Some(&beta_w_arr),
+                    &cached,
+                    &unit(gi),
+                    q_index == primary.q1,
+                )
+                .expect("diagnostic directional timepoint");
+            let base_at = |s: f64| -> SurvivalFlexTimepointExact {
+                let g = gv + s;
+                let (a, d) = family
+                    .solve_row_survival_intercept_with_slot(
+                        q,
+                        g,
+                        Some(&beta_h_arr),
+                        Some(&beta_w_arr),
+                        Some((
+                            0,
+                            if q_index == primary.q0 {
+                                SurvivalInterceptSlotKind::Entry
+                            } else {
+                                SurvivalInterceptSlotKind::Exit
+                            },
+                        )),
+                    )
+                    .expect("diagnostic perturbed intercept");
+                let cached = family
+                    .build_cached_partition(&primary, a, g, Some(&beta_h_arr), Some(&beta_w_arr))
+                    .expect("diagnostic perturbed cached partition");
+                family
+                    .compute_survival_timepoint_exact_from_cached(
+                        0,
+                        &primary,
+                        q,
+                        q_index,
+                        a,
+                        g,
+                        d,
+                        Some(&beta_h_arr),
+                        Some(&beta_w_arr),
+                        0.0,
+                        q_index == primary.q1,
+                        &cached,
+                    )
+                    .expect("diagnostic perturbed base timepoint")
+            };
+            let fd = |sel: &dyn Fn(&SurvivalFlexTimepointExact) -> f64, h: f64| -> f64 {
+                let coarse = (sel(&base_at(h)) - sel(&base_at(-h))) / (2.0 * h);
+                let fine = (sel(&base_at(h * 0.5)) - sel(&base_at(-h * 0.5))) / h;
+                (4.0 * fine - coarse) / 3.0
+            };
+            eprintln!(
+                "#932 {label} [g,w0] eta_uv {:+.6e} fd {:+.6e}; chi_uv {:+.6e} fd {:+.6e}; d_uv {:+.6e} fd {:+.6e}; base eta_uv {:+.6e} chi_uv {:+.6e} d_uv {:+.6e}",
+                ext.eta_uv_dir[[gi, wi0]],
+                fd(&|b| b.eta_uv[[gi, wi0]], 2e-3),
+                ext.chi_uv_dir[[gi, wi0]],
+                fd(&|b| b.chi_uv[[gi, wi0]], 2e-3),
+                ext.d_uv_dir[[gi, wi0]],
+                fd(&|b| b.d_uv[[gi, wi0]], 2e-3),
+                base.eta_uv[[gi, wi0]],
+                base.chi_uv[[gi, wi0]],
+                base.d_uv[[gi, wi0]],
+            );
+        };
+        tp_diag("entry", q0v, primary.q0);
+        tp_diag("exit", q1v, primary.q1);
+    }
 
     // ── Third order: production D_dir H[u,v] vs witness ∂³ along (u,v,dir) ───
     // Contract along the logslope axis g; check cross blocks touching the
