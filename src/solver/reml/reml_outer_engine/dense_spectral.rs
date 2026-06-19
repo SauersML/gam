@@ -648,49 +648,6 @@ impl HessianOperator for DenseSpectralOperator {
                 .sum::<f64>()
     }
 
-    fn trace_hinv_block_local(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> f64 {
-        // tr(H_reg⁻¹ A) = Σ (A·W ⊙ W) for block-local A.
-        let w_block = self.w_factor.slice(ndarray::s![start..end, ..]);
-        let aw = block.dot(&w_block);
-        scale
-            * aw.iter()
-                .zip(w_block.iter())
-                .map(|(&a, &w)| a * w)
-                .sum::<f64>()
-    }
-
-    fn trace_hinv_block_local_cross(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> f64 {
-        // tr(H⁻¹ A H⁻¹ A) where A = scale · embed(block, start, end) and
-        // `block` is the symmetric (b × b) local matrix.
-        //
-        // H⁻¹ = W W^T, so the symmetric block is
-        //   H⁻¹_block = W_block · W_block^T,   W_block = W[start..end, :].
-        // For block-local A, only the [start..end, start..end] sub-block of
-        //   H⁻¹ A H⁻¹ A
-        // contributes nonzero diagonal entries:
-        //   tr(H⁻¹ A H⁻¹ A) = scale² · tr( (H⁻¹_block · B)² )
-        //                    = scale² · tr( (W_block^T B W_block)² )
-        // (cyclic on the rank-sized symmetric M = W_block^T B W_block, then
-        // tr(M²) = ||M||_F² because B is symmetric so M is symmetric).
-        let w_block = self.w_factor.slice(ndarray::s![start..end, ..]);
-        let bw = block.dot(&w_block); // (b × rank)
-        let m = w_block.t().dot(&bw); // (rank × rank), symmetric for symmetric block
-        let scale_sq = scale * scale;
-        scale_sq * m.iter().map(|&v| v * v).sum::<f64>()
-    }
-
     fn trace_logdet_operator(&self, op: &dyn HyperOperator) -> f64 {
         if log::log_enabled!(log::Level::Info) {
             let start = std::time::Instant::now();
@@ -739,23 +696,6 @@ impl HessianOperator for DenseSpectralOperator {
         }
         let hp_j = self.projected_operator(&self.eigenvectors, h_j);
         self.trace_logdet_hessian_cross_rotated(&hp_i, &hp_j)
-    }
-
-    fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
-        let n = matrices.len();
-        let rotated = matrices
-            .iter()
-            .map(|matrix| self.rotate_to_eigenbasis(matrix))
-            .collect::<Vec<_>>();
-        let mut out = Array2::<f64>::zeros((n, n));
-        for i in 0..n {
-            for j in i..n {
-                let value = self.trace_logdet_hessian_cross_rotated(&rotated[i], &rotated[j]);
-                out[[i, j]] = value;
-                out[[j, i]] = value;
-            }
-        }
-        out
     }
 
     fn active_rank(&self) -> usize {

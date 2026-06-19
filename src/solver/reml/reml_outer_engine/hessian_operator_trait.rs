@@ -110,25 +110,6 @@ pub trait HessianOperator: Send + Sync {
         self.trace_hinv_product(&op.to_dense())
     }
 
-    /// Efficient computation of tr(H₊⁻¹ Hₖ) for the third-derivative contraction.
-    ///
-    /// For non-Gaussian families, Hₖ = Aₖ + Xᵀ diag(c ⊙ Xvₖ) X where
-    /// vₖ = H⁻¹(Aₖβ̂). This method allows backends to compute the contraction
-    /// efficiently without forming the full p×p correction matrix.
-    ///
-    /// Default implementation: forms the correction and calls `trace_hinv_product`.
-    fn trace_hinv_h_k(
-        &self,
-        a_k: &Array2<f64>,
-        third_deriv_correction: Option<&Array2<f64>>,
-    ) -> f64 {
-        let base = self.trace_hinv_product(a_k);
-        match third_deriv_correction {
-            Some(c) => base + self.trace_hinv_product(c),
-            None => base,
-        }
-    }
-
     /// H⁻¹ v — linear solve using the active decomposition.
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64>;
 
@@ -365,20 +346,6 @@ pub trait HessianOperator: Send + Sync {
         }
     }
 
-    /// Efficient computation of tr(G_ε(H) B_k) for an operator-backed Hessian drift,
-    /// optionally plus the dense third-derivative correction.
-    fn trace_logdet_h_k_operator(
-        &self,
-        b_k: &dyn HyperOperator,
-        third_deriv_correction: Option<&Array2<f64>>,
-    ) -> f64 {
-        let base = self.trace_logdet_operator(b_k);
-        match third_deriv_correction {
-            Some(c) => base + self.trace_logdet_gradient(c),
-            None => base,
-        }
-    }
-
     /// tr(G_ε(H) · A_block) where A_block is a p_block × p_block matrix
     /// embedded at rows/columns [start..end].
     ///
@@ -402,52 +369,6 @@ pub trait HessianOperator: Send + Sync {
             }
         }
         self.trace_logdet_gradient(&full)
-    }
-
-    /// tr(H₊⁻¹ · A_block) where A_block is embedded at [start..end].
-    /// Same block-local optimization as `trace_logdet_block_local`.
-    fn trace_hinv_block_local(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> f64 {
-        let p = self.dim();
-        let mut full = Array2::<f64>::zeros((p, p));
-        let bs = end - start;
-        for i in 0..bs {
-            for j in 0..bs {
-                full[[start + i, start + j]] = scale * block[[i, j]];
-            }
-        }
-        self.trace_hinv_product(&full)
-    }
-
-    /// tr(H⁻¹ A H⁻¹ A) for a block-local penalty matrix A embedded at [start..end].
-    ///
-    /// `block` is the p_block × p_block local penalty matrix and `scale` is the
-    /// smoothing parameter (λ_k). The full A = scale · embed(block, start, end).
-    ///
-    /// Default implementation materializes the full p×p matrix and delegates to
-    /// `trace_hinv_product_cross`. The `DenseSpectralOperator` override uses
-    /// W-factor slicing for O(rank × block_size × (block_size + p)) work.
-    fn trace_hinv_block_local_cross(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> f64 {
-        let p = self.dim();
-        let bs = end - start;
-        let mut full = Array2::<f64>::zeros((p, p));
-        for i in 0..bs {
-            for j in 0..bs {
-                full[[start + i, start + j]] = scale * block[[i, j]];
-            }
-        }
-        self.trace_hinv_product_cross(&full, &full)
     }
 
     /// Cross-trace for the logdet Hessian:
@@ -492,26 +413,6 @@ pub trait HessianOperator: Send + Sync {
         h_j: &dyn HyperOperator,
     ) -> f64 {
         self.trace_logdet_hessian_cross(&h_i.to_dense(), &h_j.to_dense())
-    }
-
-    /// Batched cross traces for the logdet Hessian:
-    /// `cross[i,j] = trace_logdet_hessian_cross(H_i, H_j)`.
-    ///
-    /// The default implementation applies `trace_logdet_hessian_cross`
-    /// pairwise. Dense spectral backends override this to rotate each drift
-    /// into the eigenbasis once and reuse the same divided-difference kernel
-    /// across all pairs.
-    fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
-        let n = matrices.len();
-        let mut out = Array2::<f64>::zeros((n, n));
-        for i in 0..n {
-            for j in i..n {
-                let value = self.trace_logdet_hessian_cross(matrices[i], matrices[j]);
-                out[[i, j]] = value;
-                out[[j, i]] = value;
-            }
-        }
-        out
     }
 
     /// Number of active dimensions (rank of pseudo-inverse).

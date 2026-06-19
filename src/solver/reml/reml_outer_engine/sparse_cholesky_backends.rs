@@ -193,182 +193,6 @@ impl SparseCholeskyOperator {
         Ok(solved)
     }
 
-    pub(crate) fn fill_scaled_block_columns(
-        block: &Array2<f64>,
-        scale: f64,
-        block_start: usize,
-        local_col_start: usize,
-        cols: usize,
-        mut rhs_block: ndarray::ArrayViewMut2<'_, f64>,
-    ) {
-        let block_end = block_start + block.nrows();
-        let source = block.slice(ndarray::s![.., local_col_start..local_col_start + cols]);
-        let mut target = rhs_block.slice_mut(ndarray::s![block_start..block_end, ..cols]);
-        if scale == 1.0 {
-            target.assign(&source);
-        } else {
-            Zip::from(target)
-                .and(source)
-                .for_each(|dst, &value| *dst = scale * value);
-        }
-    }
-
-    pub(crate) fn trace_hinv_block_local_exact(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> f64 {
-        if scale == 0.0 {
-            return 0.0;
-        }
-        assert_eq!(block.nrows(), end - start);
-        let t_start = std::time::Instant::now();
-        let block_size = end - start;
-        let chunk = Self::OPERATOR_SOLVE_CHUNK.min(block_size.max(1));
-        let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
-        let mut trace = 0.0;
-        let mut local_col_start = 0usize;
-
-        while local_col_start < block_size {
-            let cols = (block_size - local_col_start).min(chunk);
-            Self::fill_scaled_block_columns(
-                block,
-                scale,
-                start,
-                local_col_start,
-                cols,
-                rhs_block.view_mut(),
-            );
-            let diagonal_sum = if cols == chunk {
-                crate::linalg::sparse_exact::solve_sparse_spdmulti_diagonal_sum(
-                    &self.factor,
-                    &rhs_block,
-                    start + local_col_start,
-                )
-            } else {
-                let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]);
-                crate::linalg::sparse_exact::solve_sparse_spdmulti_diagonal_sum(
-                    &self.factor,
-                    &rhs_view,
-                    start + local_col_start,
-                )
-            };
-            trace += diagonal_sum.unwrap_or_else(|e| {
-                // SAFETY: same invariant as `trace_hinv_operator_exact`
-                // above — `self.factor` is the validated SPD factor;
-                // sparse-SPD multi-RHS solves only fail on factor
-                // corruption, which `SparseCholeskyOperator`'s
-                // construction invariant forbids.
-                // SAFETY: self.factor is validated SPD; block-local solve only fails on factor corruption.
-                reml_contract_panic(format!(
-                    "SparseCholeskyOperator exact block-local trace solve failed: {e}"
-                ))
-            });
-            local_col_start += cols;
-        }
-
-        let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
-        if elapsed_ms > REML_TRACE_SLOW_LOG_MS {
-            log::info!(
-                "[REML-trace] block_local_exact | n_dim={} | block={} | {:.1}ms",
-                self.n_dim,
-                block_size,
-                elapsed_ms
-            );
-        }
-        trace
-    }
-
-    pub(crate) fn solve_block_local_rows_exact(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> Result<Array2<f64>, String> {
-        assert_eq!(block.nrows(), end - start);
-        let block_size = end - start;
-        let chunk = Self::OPERATOR_SOLVE_CHUNK.min(block_size.max(1));
-        let mut solved = Array2::<f64>::zeros((block_size, block_size));
-        if scale == 0.0 {
-            return Ok(solved);
-        }
-        let mut rhs_block = Array2::<f64>::zeros((self.n_dim, chunk));
-        let mut local_col_start = 0usize;
-
-        while local_col_start < block_size {
-            let cols = (block_size - local_col_start).min(chunk);
-            Self::fill_scaled_block_columns(
-                block,
-                scale,
-                start,
-                local_col_start,
-                cols,
-                rhs_block.view_mut(),
-            );
-            let solved_block = if cols == chunk {
-                crate::linalg::sparse_exact::solve_sparse_spdmulti_rows(
-                    &self.factor,
-                    &rhs_block,
-                    start,
-                    end,
-                )
-            } else {
-                let rhs_view = rhs_block.slice(ndarray::s![.., ..cols]);
-                crate::linalg::sparse_exact::solve_sparse_spdmulti_rows(
-                    &self.factor,
-                    &rhs_view,
-                    start,
-                    end,
-                )
-            }
-            .map_err(|e| {
-                format!(
-                    "SparseCholeskyOperator::solve_block_local_rows_exact multi-solve failed: {e}"
-                )
-            })?;
-            solved
-                .slice_mut(ndarray::s![.., local_col_start..local_col_start + cols])
-                .assign(&solved_block);
-            local_col_start += cols;
-        }
-
-        Ok(solved)
-    }
-
-    pub(crate) fn trace_hinv_block_local_cross_exact(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> f64 {
-        let t_start = std::time::Instant::now();
-        let solved = self
-            .solve_block_local_rows_exact(block, scale, start, end)
-            // SAFETY: same SPD-factor invariant as the trace solves above
-            // — `self.factor` is the validated SPD factorization;
-            // failure here means factor corruption, forbidden by the
-            // `SparseCholeskyOperator` construction invariant.
-            .unwrap_or_else(|e| {
-                // SAFETY: self.factor is validated SPD; cross solve only fails on factor corruption.
-                panic!("SparseCholeskyOperator exact block-local cross solve failed: {e}")
-            });
-        let result = trace_matrix_product(&solved, &solved);
-        let elapsed_ms = t_start.elapsed().as_secs_f64() * 1000.0;
-        if elapsed_ms > REML_TRACE_SLOW_LOG_MS {
-            log::info!(
-                "[REML-trace] block_local_cross_exact | n_dim={} | block={} | {:.1}ms",
-                self.n_dim,
-                end - start,
-                elapsed_ms
-            );
-        }
-        result
-    }
-
     pub(crate) fn trace_hinv_matrix_operator_cross_exact(
         &self,
         matrix: &Array2<f64>,
@@ -650,35 +474,6 @@ impl HessianOperator for SparseCholeskyOperator {
         self.trace_hinv_operator(op)
     }
 
-    fn trace_hinv_block_local(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> f64 {
-        if let Some(ref taka) = self.takahashi {
-            assert_eq!(block.nrows(), end - start);
-            return scale * Self::takahashi_block_trace(taka, block, start);
-        }
-        self.trace_hinv_block_local_exact(block, scale, start, end)
-    }
-
-    fn trace_hinv_block_local_cross(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> f64 {
-        if let Some(ref taka) = self.takahashi {
-            assert_eq!(block.nrows(), end - start);
-            let za = Self::takahashi_left_multiply_block(taka, block, start);
-            return scale * scale * trace_matrix_product(&za, &za);
-        }
-        self.trace_hinv_block_local_cross_exact(block, scale, start, end)
-    }
-
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
         // SAFETY: `self.factor` is the validated SPD Cholesky factor stored
         // at construction time; a triangular solve against an already-built
@@ -928,14 +723,6 @@ impl HessianOperator for BlockCoupledOperator {
         self.inner.trace_hinv_product(a)
     }
 
-    fn trace_hinv_h_k(
-        &self,
-        a_k: &Array2<f64>,
-        third_deriv_correction: Option<&Array2<f64>>,
-    ) -> f64 {
-        self.inner.trace_hinv_h_k(a_k, third_deriv_correction)
-    }
-
     fn trace_logdet_gradient(&self, a: &Array2<f64>) -> f64 {
         self.inner.trace_logdet_gradient(a)
     }
@@ -958,21 +745,6 @@ impl HessianOperator for BlockCoupledOperator {
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
         self.inner.trace_logdet_hessian_cross(h_i, h_j)
-    }
-
-    fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
-        self.inner.trace_logdet_hessian_crosses(matrices)
-    }
-
-    fn trace_hinv_block_local_cross(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> f64 {
-        self.inner
-            .trace_hinv_block_local_cross(block, scale, start, end)
     }
 
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
@@ -1485,11 +1257,6 @@ impl HessianOperator for MatrixFreeSpdOperator {
     ) -> f64 {
         self.exact_dense_spectral()
             .trace_logdet_hessian_cross_operator(h_i, h_j)
-    }
-
-    fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
-        self.exact_dense_spectral()
-            .trace_logdet_hessian_crosses(matrices)
     }
 
     fn active_rank(&self) -> usize {

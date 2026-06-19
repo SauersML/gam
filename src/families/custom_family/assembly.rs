@@ -187,14 +187,6 @@ impl HessianOperator for FirstOrderTraceSkipOperator {
         self.inner.trace_hinv_operator(op)
     }
 
-    fn trace_hinv_h_k(
-        &self,
-        a_k: &Array2<f64>,
-        third_deriv_correction: Option<&Array2<f64>>,
-    ) -> f64 {
-        self.inner.trace_hinv_h_k(a_k, third_deriv_correction)
-    }
-
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
         self.inner.solve(rhs)
     }
@@ -278,19 +270,6 @@ impl HessianOperator for FirstOrderTraceSkipOperator {
         }
     }
 
-    fn trace_logdet_h_k_operator(
-        &self,
-        b_k: &dyn HyperOperator,
-        third_deriv_correction: Option<&Array2<f64>>,
-    ) -> f64 {
-        if self.consume_first_order_trace() {
-            0.0
-        } else {
-            self.inner
-                .trace_logdet_h_k_operator(b_k, third_deriv_correction)
-        }
-    }
-
     fn trace_logdet_block_local(
         &self,
         block: &Array2<f64>,
@@ -304,27 +283,6 @@ impl HessianOperator for FirstOrderTraceSkipOperator {
             self.inner
                 .trace_logdet_block_local(block, scale, start, end)
         }
-    }
-
-    fn trace_hinv_block_local(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> f64 {
-        self.inner.trace_hinv_block_local(block, scale, start, end)
-    }
-
-    fn trace_hinv_block_local_cross(
-        &self,
-        block: &Array2<f64>,
-        scale: f64,
-        start: usize,
-        end: usize,
-    ) -> f64 {
-        self.inner
-            .trace_hinv_block_local_cross(block, scale, start, end)
     }
 
     fn trace_logdet_hessian_cross(&self, h_i: &Array2<f64>, h_j: &Array2<f64>) -> f64 {
@@ -346,10 +304,6 @@ impl HessianOperator for FirstOrderTraceSkipOperator {
         h_j: &dyn HyperOperator,
     ) -> f64 {
         self.inner.trace_logdet_hessian_cross_operator(h_i, h_j)
-    }
-
-    fn trace_logdet_hessian_crosses(&self, matrices: &[&Array2<f64>]) -> Array2<f64> {
-        self.inner.trace_logdet_hessian_crosses(matrices)
     }
 
     fn active_rank(&self) -> usize {
