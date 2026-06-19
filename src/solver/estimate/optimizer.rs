@@ -1495,15 +1495,21 @@ where
             reml_state.compute_cost(r).unwrap_or(f64::NAN)
         };
         let v0 = v_at(&final_rho);
-        let mut probe = String::new();
-        for d in [1.0, 2.0, 4.0, 8.0, 16.0] {
-            let shifted = &final_rho + d;
-            probe.push_str(&format!(" V(rho+{d})={:.6}", v_at(&shifted)));
-        }
         eprintln!(
-            "[DIAG1271_RHO] final_rho={:?} grad_norm={finalgrad_norm:.3e} V(rho)={v0:.6}{probe}",
+            "[DIAG1271_RHO] final_rho={:?} grad_norm={finalgrad_norm:.3e} V(rho)={v0:.6}",
             final_rho.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>()
         );
+        // Shift ONLY axis 0 (the radial bending penalty), holding others fixed,
+        // to isolate whether heavier radial smoothing lowers the REML cost.
+        for axis in 0..final_rho.len() {
+            let mut line = format!("[DIAG1271_RHO]   axis{axis}: ");
+            for d in [1.0, 2.0, 4.0, 8.0] {
+                let mut shifted = final_rho.clone();
+                shifted[axis] += d;
+                line.push_str(&format!(" V(+{d})={:.4}", v_at(&shifted)));
+            }
+            eprintln!("{line}");
+        }
     }
 
     if opts.compute_inference {
