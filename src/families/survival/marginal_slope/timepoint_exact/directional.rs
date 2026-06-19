@@ -422,7 +422,7 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
         let a_u_dir = a_uv.dot(dir);
-        if b != 0.0 && (a_dir != 0.0 || dir_g != 0.0) {
+        if b != 0.0 {
             for cell_entry in &cached.cells {
                 let neg_cell = cell_entry.neg_cell;
                 let fixed = &cell_entry.fixed;
@@ -438,9 +438,6 @@ impl SurvivalMarginalSlopeFamily {
                     };
                 let v_right = edge_velocity(part.right_edge, neg_cell.right);
                 let v_left = edge_velocity(part.left_edge, neg_cell.left);
-                if v_right == 0.0 && v_left == 0.0 {
-                    continue;
-                }
 
                 let boundary = |neg_r: &[f64], neg_s: &[f64], neg_rs: &[f64]| -> f64 {
                     let right = if v_right != 0.0 {
@@ -469,6 +466,54 @@ impl SurvivalMarginalSlopeFamily {
                     };
                     right - left
                 };
+                let edge_axis = |axis: usize,
+                                 edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                 z: f64|
+                 -> (f64, f64, f64) {
+                    match edge {
+                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                            let z_dir = -(a_dir + z * dir_g) / b;
+                            let axis_g = if axis == primary.g { 1.0 } else { 0.0 };
+                            let z_axis = -(a_u[axis] + z * axis_g) / b;
+                            let z_axis_dir =
+                                -(a_u_dir[axis] + z_dir * axis_g + z_axis * dir_g) / b;
+                            (z_axis, z_axis_dir, z_dir)
+                        }
+                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
+                            (0.0, 0.0, 0.0)
+                        }
+                    }
+                };
+                let density_z_derivative = |poly: &[f64], z: f64| -> f64 {
+                    let eta = neg_cell.eta(z);
+                    let eta_z =
+                        neg_cell.c1 + 2.0 * neg_cell.c2 * z + 3.0 * neg_cell.c3 * z * z;
+                    let amp = eval_poly_slice(poly, z);
+                    let amp_z = eval_poly_derivative_slice(poly, z);
+                    let q_z = z + eta * eta_z;
+                    (amp_z - amp * q_z) * (-neg_cell.q(z)).exp() / std::f64::consts::TAU
+                };
+                let axis_flux_dir = |axis: usize, poly: &[f64], poly_dir: &[f64]| -> f64 {
+                    let eval_edge = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                     z: f64|
+                     -> f64 {
+                        let (z_axis, z_axis_dir, z_dir) = edge_axis(axis, edge, z);
+                        if z_axis == 0.0 && z_axis_dir == 0.0 && z_dir == 0.0 {
+                            return 0.0;
+                        }
+                        z_axis_dir
+                            * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                neg_cell, poly, z,
+                            )
+                            + z_axis
+                                * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                    neg_cell, poly_dir, z,
+                                )
+                            + z_axis * z_dir * density_z_derivative(poly, z)
+                    };
+                    eval_edge(part.right_edge, neg_cell.right)
+                        - eval_edge(part.left_edge, neg_cell.left)
+                };
 
                 let neg_dc_da = fixed.dc_da.map(|val| -val);
                 let neg_dc_daa = fixed.dc_daa.map(|val| -val);
@@ -476,13 +521,43 @@ impl SurvivalMarginalSlopeFamily {
                 for u in 0..p {
                     let neg_coeff_u = fixed.coeff_u[u].map(|val| -val);
                     let neg_coeff_au = fixed.coeff_au[u].map(|val| -val);
+                    let mut neg_coeff_u_dir = [0.0; 4];
+                    for c in 0..p {
+                        if dir[c] == 0.0 {
+                            continue;
+                        }
+                        let sc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
+                        for k in 0..4 {
+                            neg_coeff_u_dir[k] -= sc[k] * dir[c];
+                        }
+                    }
+                    for k in 0..4 {
+                        neg_coeff_u_dir[k] -= a_dir * fixed.coeff_au[u][k];
+                    }
                     f_au_dir[u] += boundary(&neg_dc_da, &neg_coeff_u, &neg_coeff_au);
                     for v in u..p {
                         let neg_coeff_v = fixed.coeff_u[v].map(|val| -val);
+                        let mut neg_coeff_v_dir = [0.0; 4];
+                        for c in 0..p {
+                            if dir[c] == 0.0 {
+                                continue;
+                            }
+                            let sc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, v, c);
+                            for k in 0..4 {
+                                neg_coeff_v_dir[k] -= sc[k] * dir[c];
+                            }
+                        }
+                        for k in 0..4 {
+                            neg_coeff_v_dir[k] -= a_dir * fixed.coeff_au[v][k];
+                        }
                         let neg_sc_uv = self
                             .cell_pair_second_coeff(primary, &fixed.coeff_bu, u, v)
                             .map(|val| -val);
-                        let bval = boundary(&neg_coeff_u, &neg_coeff_v, &neg_sc_uv);
+                        let mut bval = boundary(&neg_coeff_u, &neg_coeff_v, &neg_sc_uv);
+                        bval += axis_flux_dir(v, &neg_coeff_u, &neg_coeff_u_dir);
+                        if u != v {
+                            bval += axis_flux_dir(u, &neg_coeff_v, &neg_coeff_v_dir);
+                        }
                         f_uv_dir[[u, v]] += bval;
                         if u != v {
                             f_uv_dir[[v, u]] += bval;
