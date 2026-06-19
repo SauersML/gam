@@ -8,7 +8,7 @@
 //! to per-row score / Hessian sums.
 
 use gam::families::marginal_slope_shared::{
-    build_outer_score_subsample, outer_row_indices, outer_row_weights_by_index, outer_score_scale,
+    build_outer_score_subsample, outer_row_indices, outer_row_weights_by_index,
 };
 use gam::solver::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
 
@@ -32,13 +32,7 @@ fn outer_row_indices_and_weights_round_trip_to_full_n_when_no_subsample() {
     use gam::families::custom_family::BlockwiseFitOptions;
     let opts = BlockwiseFitOptions::default();
     let n = 100;
-    // Full-data path: legacy global scale is 1.0 and per-row HT weights
-    // are all 1.0 (no subsample).
-    let scale = outer_score_scale(&opts, n);
-    assert!(
-        (scale - 1.0).abs() < 1e-12,
-        "no-subsample scale must be 1.0"
-    );
+    // Full-data path: per-row HT weights are all 1.0 (no subsample).
     let weights = outer_row_weights_by_index(&opts, n);
     assert_eq!(weights.len(), n);
     for (i, w) in weights.iter().enumerate() {

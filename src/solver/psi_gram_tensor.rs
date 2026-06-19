@@ -67,24 +67,6 @@ pub const PSI_GRAM_CERT_RTOL: f64 = 1.0e-9;
 /// Relative agreement required at the off-node Gram spot checks.
 pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
 
-/// DEPRECATED / NOT LOAD-BEARING (kept only to avoid breaking external
-/// references). It was the relative bar of a Richardson-FD analytic-derivative
-/// pre-filter that briefly gated the gradient sub-window (#1216, commit
-/// 6d72d7597 relaxed it 1e-9→1e-6). That FD-oracle path was SUPERSEDED: the
-/// gradient window is now set to the full value window whenever the value-lane
-/// off-node `spot_check` (the assembled Gram vs an exact off-node rebuild,
-/// [`PSI_GRAM_SPOT_RTOL`] = 1e-10) passes — a TIGHTER, n-free certificate that
-/// does not depend on any finite-difference reference. So no 1e-6 gradient bar
-/// is live: the analytic `∂G/∂ψ` shares the certified value representation and
-/// the gradient lane rides the value certificate. See `build`/`spot_check`.
-///
-/// (Historical #1216 note: on the wide standardized geometry default 1-D fits
-/// use, the value-lane Chebyshev tail plateaus at ~2.3e-11 and the `T_d′∼d`-
-/// weighted derivative reconstruction at ~2e-8, so the original 1e-9 FD self-
-/// convergence guard was unreachable — that FD scheme was retired rather than
-/// loosened-to-pass.)
-pub const PSI_GRAM_GRAD_SPOT_RTOL: f64 = 1.0e-6;
-
 /// Node-count escalation ladder for the expansion build (degree = nodes − 1).
 ///
 /// The top rung sizes to WIDE trial windows: Chebyshev coefficients of the
@@ -135,8 +117,9 @@ pub struct PsiGramTensor {
     psi_lo: f64,
     psi_hi: f64,
     /// Certified gradient window over which the ANALYTIC ψ-derivative
-    /// `dgram_dpsi` reproduces the exact design derivative to
-    /// [`PSI_GRAM_GRAD_SPOT_RTOL`] (#1033b gradient lane). For the #1033
+    /// `dgram_dpsi` reproduces the exact design derivative. The gradient lane
+    /// rides the value-lane off-node certificate [`PSI_GRAM_SPOT_RTOL`]
+    /// (#1033b gradient lane). For the #1033
     /// sufficient-statistic outer loop this must cover the full optimizer
     /// window; otherwise callers do not arm the n-free kappa search.
     ///

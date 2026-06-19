@@ -1366,30 +1366,6 @@ pub fn outer_row_indices(
     }
 }
 
-/// Diagnostic: mean per-row HT weight across the subsample (or 1.0 in the
-/// no-subsample / full-data path). Equals the legacy `n_full / |mask|`
-/// global rescale when all retained rows share a uniform weight; differs
-/// from it under the stratified builder's rare-stratum boost.
-///
-/// Consumers must not use this as a per-row scaling factor when
-/// `OuterScoreSubsample::has_variable_weights()` is true — the unbiased
-/// estimator multiplies each row by `outer_row_weights_by_index(opts, n)[i]`,
-/// not by this scalar. Retained for backward-compatible tests over uniformly
-/// weighted masks (e.g. callers that build `OuterScoreSubsample::new`).
-#[inline]
-pub fn outer_score_scale(opts: &crate::custom_family::BlockwiseFitOptions, n: usize) -> f64 {
-    match opts.outer_score_subsample.as_ref() {
-        Some(s) => {
-            assert_eq!(
-                s.n_full, n,
-                "outer-score subsample full-data length must match caller length"
-            );
-            s.weight_scale
-        }
-        None => 1.0,
-    }
-}
-
 /// Per-row HT-weighted iteration: returns one `WeightedOuterRow` per
 /// retained row when a subsample is active; otherwise returns
 /// `(index, weight = 1.0, stratum = 0)` for every row in `0..n`.

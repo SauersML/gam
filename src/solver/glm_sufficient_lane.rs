@@ -309,8 +309,8 @@ impl FrozenWeightGramTensor {
     /// directly into `∂G/∂ψ` (since `∂(XᵀWX)/∂ψ = X_τᵀW X + XᵀW X_τ` is LINEAR in
     /// `W`). The downstream outer REML gradient contracts `∂G/∂ψ` through `H⁻¹`
     /// and `β̂`, so to stay below the `1e-7` outer-gradient bar with margin (the
-    /// same discipline as [`crate::solver::psi_gram_tensor::PSI_GRAM_GRAD_SPOT_RTOL`]
-    /// `= 1e-11` for the Gaussian lane) the gradient channel must only fire when
+    /// same discipline as [`crate::solver::psi_gram_tensor::PSI_GRAM_SPOT_RTOL`]
+    /// for the Gaussian lane) the gradient channel must only fire when
     /// the converged `W` is within a TIGHT relative drift of the frozen `W`.
     pub const GRADIENT_WEIGHT_DRIFT_RTOL: f64 = 1.0e-9;
 
