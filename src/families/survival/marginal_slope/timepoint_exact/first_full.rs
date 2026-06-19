@@ -7,6 +7,26 @@
 
 use super::*;
 
+/// Velocity of a moving link-knot crossing boundary `z_e = (τ − a)/b` under a
+/// unit step in primary `axis`: `∂z_e/∂θ_axis = -(a_u[axis] + z_e·[axis==g])/b`.
+/// Fixed (non-crossing) edges do not move, so their velocity is zero.
+fn crossing_edge_velocity(
+    axis: usize,
+    primary: &FlexPrimarySlices,
+    a_u: &Array1<f64>,
+    edge: crate::families::cubic_cell_kernel::PartitionEdge,
+    z: f64,
+    b: f64,
+) -> f64 {
+    match edge {
+        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+            let direct_g = if axis == primary.g { z } else { 0.0 };
+            -(a_u[axis] + direct_g) / b
+        }
+        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+    }
+}
+
 fn moving_density_boundary_flux(
     axis: usize,
     primary: &FlexPrimarySlices,
@@ -19,17 +39,22 @@ fn moving_density_boundary_flux(
         return 0.0;
     }
     let cell = entry.partition_cell.cell;
-    let edge_velocity = |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
-        match edge {
-            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
-                let direct_g = if axis == primary.g { z } else { 0.0 };
-                -(a_u[axis] + direct_g) / b
-            }
-            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
-        }
-    };
-    let v_r = edge_velocity(entry.partition_cell.right_edge, cell.right);
-    let v_l = edge_velocity(entry.partition_cell.left_edge, cell.left);
+    let v_r = crossing_edge_velocity(
+        axis,
+        primary,
+        a_u,
+        entry.partition_cell.right_edge,
+        cell.right,
+        b,
+    );
+    let v_l = crossing_edge_velocity(
+        axis,
+        primary,
+        a_u,
+        entry.partition_cell.left_edge,
+        cell.left,
+        b,
+    );
     let right = if v_r != 0.0 {
         v_r * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
             cell, poly, cell.right,
@@ -44,6 +69,72 @@ fn moving_density_boundary_flux(
     } else {
         0.0
     };
+    right - left
+}
+
+/// z-derivative of the boundary density integrand `P(z) = poly(z)·exp(-q(z))/2π`:
+/// `P'(z) = [poly'(z) − poly(z)·q'(z)]·exp(-q(z))/2π`, with `q'(z) = z + η(z)·η'(z)`.
+fn density_boundary_integrand_z_derivative(
+    cell: crate::families::cubic_cell_kernel::DenestedCubicCell,
+    poly: &[f64],
+    z: f64,
+) -> f64 {
+    let eta = cell.eta(z);
+    let eta_prime = cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
+    let q_prime = z + eta * eta_prime;
+    let mut poly_prime = vec![0.0; poly.len().max(1)];
+    for k in 1..poly.len() {
+        poly_prime[k - 1] = poly[k] * (k as f64);
+    }
+    let base = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(cell, poly, z);
+    let deriv =
+        crate::families::cubic_cell_kernel::cell_density_boundary_integrand(cell, &poly_prime, z);
+    deriv - q_prime * base
+}
+
+/// Second-order self-flux for the density normalization `D` along the moving
+/// link-knot crossing boundaries: the part of `∂²D/∂θ_u∂θ_v` that survives
+/// `∂_v B_u` beyond the once-differentiated integrand flux already accumulated
+/// (`moving_density_boundary_flux`). Here `B_u = Σ_e ε_e v_e^{(u)}·P_base(z_e)`
+/// with `P_base` the `chi_poly`-weighted boundary density, so
+/// `∂_v B_u = Σ_e ε_e [ (∂_v v_e^{(u)})·P_base + v_e^{(u)}·v_e^{(v)}·P_base'(z_e) ]`.
+/// The cross piece `v_e^{(u)}·P_{base,v}(z_e)` is already covered by the
+/// `d_u_integrand_poly` interior flux, so only the velocity-acceleration and
+/// boundary double-motion self-terms are added here.
+#[allow(clippy::too_many_arguments)]
+fn moving_density_boundary_self_flux_pair(
+    u: usize,
+    v: usize,
+    primary: &FlexPrimarySlices,
+    a_u: &Array1<f64>,
+    a_uv: f64,
+    entry: &CachedCellEntry,
+    base_poly: &[f64],
+    b: f64,
+) -> f64 {
+    if b == 0.0 {
+        return 0.0;
+    }
+    let cell = entry.partition_cell.cell;
+    let edge_term = |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+        match edge {
+            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                let vu = crossing_edge_velocity(u, primary, a_u, edge, z, b);
+                let vv = crossing_edge_velocity(v, primary, a_u, edge, z, b);
+                // ∂_v v_e^{(u)} = -(a_uv + v_e^{(v)}·[u==g])/b - v_e^{(u)}·[v==g]/b.
+                let dvu_dv = -(a_uv + if u == primary.g { vv } else { 0.0 }) / b
+                    - if v == primary.g { vu / b } else { 0.0 };
+                let p_base = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                    cell, base_poly, z,
+                );
+                let p_base_z = density_boundary_integrand_z_derivative(cell, base_poly, z);
+                dvu_dv * p_base + vu * vv * p_base_z
+            }
+            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+        }
+    };
+    let right = edge_term(entry.partition_cell.right_edge, cell.right);
+    let left = edge_term(entry.partition_cell.left_edge, cell.left);
     right - left
 }
 
@@ -662,7 +753,7 @@ impl SurvivalMarginalSlopeFamily {
                                     &d_u_integrand_poly[u],
                                     b,
                                 );
-                                if u == v {
+                                let flux = if u == v {
                                     uv
                                 } else {
                                     uv + moving_density_boundary_flux(
@@ -673,7 +764,36 @@ impl SurvivalMarginalSlopeFamily {
                                         &d_u_integrand_poly[v],
                                         b,
                                     )
-                                }
+                                };
+                                // Second-order self-terms from differentiating the
+                                // first-order moving boundary `B_u` (velocity
+                                // acceleration + boundary double-motion). The
+                                // first-order density boundary integrand is the
+                                // `chi_poly`-weighted base density, so the same
+                                // poly anchors the self-flux. Symmetrized over the
+                                // (u→v) / (v→u) orderings since ∂_v v^{(u)} is not
+                                // u↔v symmetric.
+                                let self_uv = moving_density_boundary_self_flux_pair(
+                                    u,
+                                    v,
+                                    primary,
+                                    &a_u,
+                                    a_uv[[u, v]],
+                                    entry,
+                                    &chi_poly,
+                                    b,
+                                );
+                                let self_vu = moving_density_boundary_self_flux_pair(
+                                    v,
+                                    u,
+                                    primary,
+                                    &a_u,
+                                    a_uv[[u, v]],
+                                    entry,
+                                    &chi_poly,
+                                    b,
+                                );
+                                flux + 0.5 * (self_uv + self_vu)
                             } else {
                                 0.0
                             };
