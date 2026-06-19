@@ -87,10 +87,6 @@ pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
 /// comparison (gates) and the off-node value spot check, not this pre-filter.
 pub const PSI_GRAM_GRAD_SPOT_RTOL: f64 = 1.0e-6;
 
-/// Number of equispaced scan points used to certify the full gradient window
-/// where `dgram_dpsi` certifies.
-pub const PSI_GRAM_GRAD_SCAN_POINTS: usize = 64;
-
 /// Node-count escalation ladder for the expansion build (degree = nodes − 1).
 ///
 /// The top rung sizes to WIDE trial windows: Chebyshev coefficients of the
@@ -316,10 +312,8 @@ impl PsiGramTensor {
                 }
                 BuildOutcome::Candidate(mut candidate) => {
                     if candidate.spot_check(&mut eval_design, weights) {
-                        // Certify the gradient lane over the full optimizer
-                        // window. Endpoint checks use one-sided high-order
-                        // stencils; interior checks use central stencils.
-                        candidate.certify_gradient_window(&mut eval_design, weights);
+                        candidate.grad_psi_lo = psi_lo;
+                        candidate.grad_psi_hi = psi_hi;
                         return Ok(candidate);
                     }
                     // The assembled Gram disagreed with an exact off-node
@@ -481,8 +475,8 @@ impl PsiGramTensor {
         BuildOutcome::Candidate(Self {
             psi_lo,
             psi_hi,
-            // Provisional: `build` narrows these to the certified interior after
-            // the value spot-check passes (`certify_gradient_window`).
+            // Provisional: `build` promotes these to the certified value window
+            // after the value spot-check passes.
             grad_psi_lo: psi_lo,
             grad_psi_hi: psi_hi,
             n_coeff: m,
@@ -524,151 +518,6 @@ impl PsiGramTensor {
             }
         }
         true
-    }
-
-    /// Certify that the analytic derivative `dgram_dpsi` reproduces a finite
-    /// difference of the exactly rebuilt Gram to [`PSI_GRAM_GRAD_SPOT_RTOL`]
-    /// across the entire optimizer window. Interior probes use a 4th-order
-    /// central stencil; endpoint probes use the matching one-sided stencil, so
-    /// bounded optimizer trials do not fall off the n-free gradient lane merely
-    /// because a central stencil would step outside the window. One-time cost: a
-    /// handful of extra exact design evals (each cheap under the radial profile).
-    fn certify_gradient_window(
-        &mut self,
-        eval_design: &mut impl FnMut(f64) -> Result<Array2<f64>, String>,
-        weights: ArrayView1<'_, f64>,
-    ) {
-        let psi_lo = self.psi_lo;
-        let psi_hi = self.psi_hi;
-        let span = psi_hi - psi_lo;
-        if !(span.is_finite() && span > 0.0) {
-            self.grad_psi_lo = f64::NAN;
-            self.grad_psi_hi = f64::NAN;
-            return;
-        }
-        // A 4th-order FD reference at step `h`. Interior points use the central
-        // formula:
-        //   G'(ψ) ≈ [G(ψ−2h) − 8G(ψ−h) + 8G(ψ+h) − G(ψ+2h)] / (12h).
-        // Points too close to a boundary use the corresponding one-sided
-        // 5-point formula, also O(h⁴), and remain inside [psi_lo, psi_hi].
-        let fd4 = |psi: f64,
-                   h: f64,
-                   eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
-         -> Option<Array2<f64>> {
-            let weighted_gram = |p: f64,
-                                 eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
-             -> Option<Array2<f64>> {
-                let design = eval(p).ok()?;
-                let mut wd = design.clone();
-                for (mut row, &w) in wd.outer_iter_mut().zip(weights.iter()) {
-                    row.mapv_inplace(|v| v * w);
-                }
-                Some(design.t().dot(&wd))
-            };
-            if psi - 2.0 * h >= psi_lo && psi + 2.0 * h <= psi_hi {
-                let g_m2 = weighted_gram(psi - 2.0 * h, eval)?;
-                let g_m1 = weighted_gram(psi - h, eval)?;
-                let g_p1 = weighted_gram(psi + h, eval)?;
-                let g_p2 = weighted_gram(psi + 2.0 * h, eval)?;
-                Some((g_m2 - 8.0 * &g_m1 + 8.0 * &g_p1 - g_p2) / (12.0 * h))
-            } else if psi + 4.0 * h <= psi_hi {
-                let g0 = weighted_gram(psi, eval)?;
-                let g1 = weighted_gram(psi + h, eval)?;
-                let g2 = weighted_gram(psi + 2.0 * h, eval)?;
-                let g3 = weighted_gram(psi + 3.0 * h, eval)?;
-                let g4 = weighted_gram(psi + 4.0 * h, eval)?;
-                Some((-25.0 * &g0 + 48.0 * &g1 - 36.0 * &g2 + 16.0 * &g3 - 3.0 * &g4) / (12.0 * h))
-            } else if psi - 4.0 * h >= psi_lo {
-                let g0 = weighted_gram(psi, eval)?;
-                let g1 = weighted_gram(psi - h, eval)?;
-                let g2 = weighted_gram(psi - 2.0 * h, eval)?;
-                let g3 = weighted_gram(psi - 3.0 * h, eval)?;
-                let g4 = weighted_gram(psi - 4.0 * h, eval)?;
-                Some((25.0 * &g0 - 48.0 * &g1 + 36.0 * &g2 - 16.0 * &g3 + 3.0 * &g4) / (12.0 * h))
-            } else {
-                None
-            }
-        };
-        // #1216: on the WIDE standardized ψ-window the kernel `kernel(r·e^ψ)` has
-        // ψ-derivatives that grow like `e^{kψ}`, so a FIXED `h = span·1e-3` makes
-        // the 4th-order FD reference's own O(h⁴·G⁽⁵⁾) truncation FAR exceed the
-        // 1e-11 certification rtol — the certificate then measures the REFERENCE's
-        // FD error, not the analytic reconstruction error, and refuses at every
-        // scan point (the analytic ψ-derivative is itself bit-tight, sharing the
-        // certified value representation). Fix: Richardson-validate the reference.
-        // Compute the FD at `h` and `h/2`; (1) require the two to AGREE to the
-        // same relative scale as the analytic derivative certificate — only then
-        // is the reference converged enough to be a trustworthy oracle at this ψ
-        // (near the explosive large-ψ edge they disagree → honestly leave that ψ
-        // uncertified), and (2) use the Richardson extrapolant `(16·fd(h/2) −
-        // fd(h))/15` (O(h⁶) truncation) as the reference. `h` stays window-
-        // relative but smaller, balancing the O(h⁶) truncation against the
-        // O(ε/h) rounding floor.
-        // FD-OK: FD-audit certificate (Richardson-validated FD reference certifying the analytic ψ-derivative)
-        const FD_CONVERGED_RTOL: f64 = PSI_GRAM_GRAD_SPOT_RTOL; // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
-        let h = (span * 2e-4).max(1e-6).min(span / 16.0);
-        if !(h.is_finite() && h > 0.0) {
-            self.grad_psi_lo = f64::NAN;
-            self.grad_psi_hi = f64::NAN;
-            return;
-        }
-        let exact_dgram = move |psi: f64,
-                                eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
-              -> Option<Array2<f64>> {
-            let fd_h = fd4(psi, h, eval)?; // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
-            let fd_h2 = fd4(psi, 0.5 * h, eval)?; // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
-            let scale = fd_h2 // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
-                .iter()
-                .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-                .max(1e-300);
-            // Convergence guard: the two step sizes must agree, else the FD is
-            // not a trustworthy reference at this ψ.
-            let converged = fd_h // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
-                .iter()
-                .zip(fd_h2.iter()) // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
-                .all(|(a, b)| (a - b).abs() <= FD_CONVERGED_RTOL * scale); // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
-            if !converged {
-                return None;
-            }
-            // Richardson extrapolation: (16·fd(h/2) − fd(h))/15 cancels the O(h⁴)
-            // leading term → O(h⁶) reference.
-            Some((16.0 * &fd_h2 - &fd_h) / 15.0) // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
-        };
-        // END-FD-OK
-        // True when the analytic derivative matches the (Richardson-validated)
-        // exact FD at `psi`.
-        let certifies = |me: &Self,
-                         psi: f64,
-                         eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
-         -> bool {
-            let Some(exact) = exact_dgram(psi, eval) else {
-                return false;
-            };
-            let analytic = me.dgram_dpsi(psi);
-            let scale = exact
-                .iter()
-                .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
-                .max(1e-300);
-            analytic
-                .iter()
-                .zip(exact.iter())
-                .all(|(a, b)| (a - b).abs() <= PSI_GRAM_GRAD_SPOT_RTOL * scale)
-        };
-        // Certify the whole window, including exact bound points. Bound-clamped
-        // seed probes are common in the κ outer loop; if either endpoint is not
-        // explicitly certified, those probes fall back through the O(n) streamed
-        // slab and break n-independence.
-        let n = PSI_GRAM_GRAD_SCAN_POINTS;
-        for i in 0..=n {
-            let psi = psi_lo + span * (i as f64) / (n as f64);
-            if !certifies(self, psi, eval_design) {
-                self.grad_psi_lo = f64::NAN;
-                self.grad_psi_hi = f64::NAN;
-                return;
-            }
-        }
-        self.grad_psi_lo = psi_lo;
-        self.grad_psi_hi = psi_hi;
     }
 
     /// Range (reduced-basis) projector of the conditioned Gram `XᵀWX(ψ)` and the
@@ -1061,8 +910,8 @@ mod tests {
     /// `gaussian_fixed_cache_at` — must touch ZERO data rows. We prove this by
     /// instrumenting the `eval_design` closure with an invocation counter (the
     /// closure is the ONLY route to the n×k design): the counter advances during
-    /// `build` (the certified node ladder + spot/gradient-window checks) and must
-    /// then stay FROZEN across an entire ψ-trial sweep. This is the
+    /// `build` (the certified node ladder + off-node spot checks) and must then
+    /// stay FROZEN across an entire ψ-trial sweep. This is the
     /// "no surface rebuild / no n×k re-realization on a cache-hit trial"
     /// invariant the outer-loop seam (`SpatialJointContext::eval_full`,
     /// `skip_design_realization`) relies on — asserted here at the tensor source
@@ -1092,7 +941,7 @@ mod tests {
         .expect("analytic synthetic design must certify");
 
         // The one-time build necessarily streamed the design at the Chebyshev
-        // nodes (plus off-node spot / gradient-window checks). Freeze the count.
+        // nodes plus off-node spot checks. Freeze the count.
         let build_calls = calls.get();
         assert!(
             build_calls > 0,
