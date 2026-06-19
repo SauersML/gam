@@ -635,41 +635,41 @@ fn test_family(
 }
 
 #[test]
-fn validate_spec_rejects_nonstructural_time_block() {
+fn validate_spec_rejects_coordinate_cone_without_guard_offset() {
     let spec = SurvivalMarginalSlopeTermSpec {
-            age_entry: array![0.0, 0.0],
-            age_exit: array![1.0, 1.0],
-            event_target: array![0.0, 1.0],
-            weights: array![1.0, 1.0],
-            z: array![-1.0, 1.0].insert_axis(Axis(1)),
-            base_link: InverseLink::Standard(StandardLink::Probit),
-            marginalspec: empty_termspec(),
-            marginal_offset: Array1::zeros(2),
-            frailty: FrailtySpec::None,
-            derivative_guard: 1e-4,
-            time_block: TimeBlockInput {
-                design_entry: DesignMatrix::from(Array2::zeros((2, 1))),
-                design_exit: DesignMatrix::from(Array2::zeros((2, 1))),
-                design_derivative_exit: DesignMatrix::from(Array2::ones((2, 1))),
-                offset_entry: Array1::zeros(2),
-                offset_exit: Array1::zeros(2),
-                derivative_offset_exit: Array1::zeros(2),
-                time_monotonicity: crate::families::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
-                ..base_time_block()
-            },
-            timewiggle_block: None,
-            logslopespec: empty_termspec(),
-            logslopespecs: None,
-            logslope_offset: Array1::zeros(2),
-            score_warp: None,
-            link_dev: None,
-            score_influence_jacobian: None,
-            latent_z_policy: LatentZPolicy::default(),
-        };
+        age_entry: array![0.0, 0.0],
+        age_exit: array![1.0, 1.0],
+        event_target: array![0.0, 1.0],
+        weights: array![1.0, 1.0],
+        z: array![-1.0, 1.0].insert_axis(Axis(1)),
+        base_link: InverseLink::Standard(StandardLink::Probit),
+        marginalspec: empty_termspec(),
+        marginal_offset: Array1::zeros(2),
+        frailty: FrailtySpec::None,
+        derivative_guard: 1e-4,
+        time_block: TimeBlockInput {
+            design_entry: DesignMatrix::from(Array2::zeros((2, 1))),
+            design_exit: DesignMatrix::from(Array2::zeros((2, 1))),
+            design_derivative_exit: DesignMatrix::from(Array2::ones((2, 1))),
+            offset_entry: Array1::zeros(2),
+            offset_exit: Array1::zeros(2),
+            derivative_offset_exit: Array1::zeros(2),
+            time_monotonicity: crate::families::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
+            ..base_time_block()
+        },
+        timewiggle_block: None,
+        logslopespec: empty_termspec(),
+        logslopespecs: None,
+        logslope_offset: Array1::zeros(2),
+        score_warp: None,
+        link_dev: None,
+        score_influence_jacobian: None,
+        latent_z_policy: LatentZPolicy::default(),
+    };
 
-    let err = validate_spec(&spec).expect_err("non-structural time block should fail");
+    let err = validate_spec(&spec).expect_err("coordinate cone without guard offset should fail");
     assert!(
-        err.contains("requires a row-constraint or structural-I-spline time block"),
+        err.contains("coordinate-cone time block requires derivative offset >= guard"),
         "unexpected error: {err}"
     );
 }

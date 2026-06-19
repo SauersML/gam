@@ -1288,14 +1288,14 @@ pub fn fit_survival_marginal_slope_terms(
         .as_ref()
         .map(|timewiggle| time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree))
         .transpose()?;
-    // Under `StructuralISpline` the base + wiggle both ride a γ ≥ 0
-    // coordinate cone — the row-wise `D γ + o ≥ guard` generator is
-    // vacuous (I-spline derivatives ≥ 0, offsets already absorb `guard`)
-    // and would duplicate information into the active-set KKT system.
-    // We emit a single `p_total × p_total` identity-cone instead so the
-    // existing active-set machinery treats the whole time block uniformly.
+    // Coordinate-cone time bases already encode monotonicity as β >= 0:
+    // validation proved D >= 0 and offsets absorb the derivative guard. Emitting
+    // row-wise `D β + o >= guard` constraints here duplicates the same condition
+    // as hundreds of dense rows and forces the generic active-set QP path. Use
+    // a single identity cone instead so the custom-family solver recognizes the
+    // simple lower-bound problem.
     let time_linear_constraints = match spec.time_block.time_monotonicity {
-        crate::families::survival::location_scale::TimeBlockMonotonicity::StructuralISpline => {
+        monotonicity if monotonicity.is_coordinate_cone() => {
             let p_total = design_exit.ncols();
             LinearInequalityConstraints::from_per_coordinate_lower_bounds(&Array1::<f64>::zeros(
                 p_total,
