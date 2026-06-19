@@ -94,15 +94,23 @@ pub(crate) fn resolve_external_family(
         | (ResponseFamily::Binomial, LinkFunction::CLogLog)
         | (ResponseFamily::Binomial, LinkFunction::Sas)
         | (ResponseFamily::Binomial, LinkFunction::BetaLogistic) => true,
-        (ResponseFamily::Beta { .. }, LinkFunction::Logit) => false,
+        // Beta regression with a constant precision φ is a genuine-dispersion
+        // mean family on par with Gamma/Tweedie/Negative-Binomial: the inner
+        // P-IRLS carries its full fixed-φ Fisher information and the outer loop
+        // estimates φ by the Pearson moment estimator (`estimate_beta_phi_from_eta`,
+        // mirroring the Tweedie φ / Gamma shape / NegBin θ locks). A
+        // `noise_formula` upgrades it to a dispersion-location-scale model that
+        // smooths log φ; without one, the external GLM route fits the mean with
+        // a single estimated φ exactly as betareg does by default.
+        (ResponseFamily::Beta { .. }, LinkFunction::Logit) => true,
         _ => false,
     };
     if !external_glm_supported {
         crate::bail_invalid_estim!(
             "optimize_external_design requires a supported standard GLM family/link; got {}. \
              The external-design route supports Gaussian(identity), Binomial(logit/probit/cloglog/SAS/Beta-Logistic), \
-             and Poisson/Gamma/Tweedie/Negative-Binomial(log). Beta regression is a dispersion-family model; \
-             use the formula location-scale route with noise_formula for Beta precision modeling",
+             Beta(logit), and Poisson/Gamma/Tweedie/Negative-Binomial(log). For Beta precision modeling \
+             add a noise_formula to upgrade to the dispersion-location-scale route",
             family.pretty_name(),
         );
     }

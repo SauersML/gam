@@ -209,9 +209,8 @@ where
         );
     }
     // Validate the external-design family/link policy before looking at response
-    // support so unsupported routes (for example Beta regression, whose
-    // formula path owns the precision channel) report the routing problem
-    // instead of a secondary y-domain violation.
+    // support so an unsupported family/link (for example a non-canonical link)
+    // reports the routing problem instead of a secondary y-domain violation.
     super::external_options::resolve_external_family(
         &resolved_family,
         Some(opts.firth_bias_reduction),
