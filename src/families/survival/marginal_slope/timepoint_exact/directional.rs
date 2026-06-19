@@ -741,63 +741,91 @@ impl SurvivalMarginalSlopeFamily {
                 + eval_coeff4_at(&fixed_tau_a_dir, z_obs);
         }
 
+        let chi_jet = MultiDirJet::bilinear(chi_val, chi_dir, 0.0, 0.0);
+        let eta_aa_jet = MultiDirJet::bilinear(eta_aa, eta_aa_dir, 0.0, 0.0);
+        let eta_aaa_jet = MultiDirJet::bilinear(eta_aaa, eta_aaa_dir, 0.0, 0.0);
+        let mut a_u_jets = Vec::with_capacity(p);
+        let mut tau_jets = Vec::with_capacity(p);
+        let mut tau_a_jets = Vec::with_capacity(p);
+        for u in 0..p {
+            a_u_jets.push(MultiDirJet::bilinear(a_u[u], a_u_dir[u], 0.0, 0.0));
+            tau_jets.push(MultiDirJet::bilinear(tau[u], tau_dir[u], 0.0, 0.0));
+            tau_a_jets.push(MultiDirJet::bilinear(tau_a[u], tau_a_dir[u], 0.0, 0.0));
+        }
+
         let mut eta_uv = Array2::<f64>::zeros((p, p));
         let mut chi_uv = Array2::<f64>::zeros((p, p));
         let mut eta_uv_dir = Array2::<f64>::zeros((p, p));
         let mut chi_uv_dir = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
-                let r_uv = self.observed_fixed_eta_second_partial(
-                    primary, &obs, row, u, v, z_obs, u_obs, a, b,
-                )?;
-                let chi_uv_fixed = self
-                    .observed_fixed_chi_second_partial(primary, &obs, u, v, z_obs, u_obs, a, b)?;
-                let r_uv_dir = self.observed_fixed_eta_second_partial_dir(
-                    primary, &obs, u, v, z_obs, u_obs, a, b, a_dir, dir, beta_w,
-                )?;
-                let chi_uv_fixed_dir = self.observed_fixed_chi_second_partial_dir(
-                    primary, u, v, z_obs, u_obs, a_dir, dir,
-                )?;
+                let a_uv_jet = MultiDirJet::bilinear(a_uv[[u, v]], a_uv_dir[[u, v]], 0.0, 0.0);
+                let a_u_prod = a_u_jets[u].mul(&a_u_jets[v]);
+                let r_uv_jet = MultiDirJet::bilinear(
+                    eval_coeff4_at(
+                        &g_jet.pair_from_b_family(g_jet.b_first, u, v, COEFF_SUPPORT_GHW),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_from_b_family(g_jet.ab_first, u, v, COEFF_SUPPORT_GW),
+                        z_obs,
+                    ) * a_dir
+                        + eval_coeff4_at(
+                            &g_jet.pair_directional_from_bb_family(
+                                g_jet.bb_first,
+                                u,
+                                v,
+                                dir,
+                                COEFF_SUPPORT_GHW,
+                            ),
+                            z_obs,
+                        ),
+                    0.0,
+                    0.0,
+                );
+                let chi_uv_fixed_jet = MultiDirJet::bilinear(
+                    eval_coeff4_at(
+                        &g_jet.pair_from_b_family(g_jet.ab_first, u, v, COEFF_SUPPORT_GW),
+                        z_obs,
+                    ),
+                    eval_coeff4_at(
+                        &g_jet.pair_from_b_family(g_jet.aab_first, u, v, COEFF_SUPPORT_GW),
+                        z_obs,
+                    ) * a_dir
+                        + eval_coeff4_at(
+                            &g_jet.pair_directional_from_bb_family(
+                                g_jet.abb_first,
+                                u,
+                                v,
+                                dir,
+                                COEFF_SUPPORT_GW,
+                            ),
+                            z_obs,
+                        ),
+                    0.0,
+                    0.0,
+                );
+                let eta_uv_jet = chi_jet
+                    .mul(&a_uv_jet)
+                    .add(&eta_aa_jet.mul(&a_u_prod))
+                    .add(&tau_jets[u].mul(&a_u_jets[v]))
+                    .add(&tau_jets[v].mul(&a_u_jets[u]))
+                    .add(&r_uv_jet);
+                let chi_uv_jet = eta_aa_jet
+                    .mul(&a_uv_jet)
+                    .add(&eta_aaa_jet.mul(&a_u_prod))
+                    .add(&tau_a_jets[u].mul(&a_u_jets[v]))
+                    .add(&tau_a_jets[v].mul(&a_u_jets[u]))
+                    .add(&chi_uv_fixed_jet);
 
-                let eta_base = chi_val * a_uv[[u, v]]
-                    + eta_aa * a_u[u] * a_u[v]
-                    + tau[u] * a_u[v]
-                    + tau[v] * a_u[u]
-                    + r_uv;
-                eta_uv[[u, v]] = eta_base;
-                eta_uv[[v, u]] = eta_base;
-
-                let chi_base = eta_aa * a_uv[[u, v]]
-                    + eta_aaa * a_u[u] * a_u[v]
-                    + tau_a[u] * a_u[v]
-                    + tau_a[v] * a_u[u]
-                    + chi_uv_fixed;
-                chi_uv[[u, v]] = chi_base;
-                chi_uv[[v, u]] = chi_base;
-
-                let eta_val = chi_dir * a_uv[[u, v]]
-                    + chi_val * a_uv_dir[[u, v]]
-                    + eta_aa_dir * a_u[u] * a_u[v]
-                    + eta_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v])
-                    + tau_dir[u] * a_u[v]
-                    + tau[u] * a_u_dir[v]
-                    + tau_dir[v] * a_u[u]
-                    + tau[v] * a_u_dir[u]
-                    + r_uv_dir;
-                eta_uv_dir[[u, v]] = eta_val;
-                eta_uv_dir[[v, u]] = eta_val;
-
-                let chi_v = eta_aa_dir * a_uv[[u, v]]
-                    + eta_aa * a_uv_dir[[u, v]]
-                    + eta_aaa_dir * a_u[u] * a_u[v]
-                    + eta_aaa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v])
-                    + tau_a_dir[u] * a_u[v]
-                    + tau_a[u] * a_u_dir[v]
-                    + tau_a_dir[v] * a_u[u]
-                    + tau_a[v] * a_u_dir[u]
-                    + chi_uv_fixed_dir;
-                chi_uv_dir[[u, v]] = chi_v;
-                chi_uv_dir[[v, u]] = chi_v;
+                eta_uv[[u, v]] = eta_uv_jet.coeff(0);
+                eta_uv[[v, u]] = eta_uv[[u, v]];
+                chi_uv[[u, v]] = chi_uv_jet.coeff(0);
+                chi_uv[[v, u]] = chi_uv[[u, v]];
+                eta_uv_dir[[u, v]] = eta_uv_jet.coeff(1);
+                eta_uv_dir[[v, u]] = eta_uv_dir[[u, v]];
+                chi_uv_dir[[u, v]] = chi_uv_jet.coeff(1);
+                chi_uv_dir[[v, u]] = chi_uv_dir[[u, v]];
             }
         }
         let eta_u_dir = eta_uv.dot(dir);
