@@ -135,11 +135,17 @@ impl SurvivalMarginalSlopeFamily {
             .map(|v| if *v > 0.5 { 1u8 } else { 0u8 })
             .collect();
         let z_key = self.z_subsample_key();
+        let tiny_fixture_auto = self.n >= 500 && self.n < 1_000;
         let small_fixture_auto = self.n >= 500 && self.n < 30_000;
+        let secondary_strata = if tiny_fixture_auto {
+            None
+        } else {
+            Some(event_secondary.as_slice())
+        };
         crate::families::marginal_slope_shared::maybe_install_auto_outer_subsample(
             options,
             z_key.as_slice().expect("z key must be contiguous"),
-            Some(&event_secondary),
+            secondary_strata,
             ctx.rho.as_slice().expect("outer rho must be contiguous"),
             &self.auto_subsample_phase_counter,
             &self.auto_subsample_last_rho,
@@ -159,8 +165,20 @@ impl SurvivalMarginalSlopeFamily {
             // veto rank-deficient configurations.
             250_000,
             if small_fixture_auto { 500 } else { 30_000 },
-            if small_fixture_auto { 200 } else { 10_000 },
-            if small_fixture_auto { 200 } else { 1_000 },
+            if tiny_fixture_auto {
+                100
+            } else if small_fixture_auto {
+                200
+            } else {
+                10_000
+            },
+            if tiny_fixture_auto {
+                100
+            } else if small_fixture_auto {
+                200
+            } else {
+                1_000
+            },
         )
     }
 }
