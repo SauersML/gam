@@ -219,7 +219,7 @@ const MULTINOMIAL_UNBIASED_PROBE_OUTER_MAX_ITER: usize = 20;
 /// zero-penalty boundary for penguin-scale multinomial fixtures. Keep the
 /// unbiased REML optimizer inside this lower box bound instead of accepting a
 /// boundary-overfit surface or switching to Firth bias on finite data.
-const MULTINOMIAL_FORMULA_MIN_LAMBDA: f64 = 1.0e-3;
+const MULTINOMIAL_FORMULA_MIN_LAMBDA: f64 = 2.0e-4;
 
 fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
     let mut best = (0.0_f64, 0usize, 0usize);
