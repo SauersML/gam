@@ -3403,6 +3403,165 @@ mod tests {
         assert!(out.value < 0.0, "quartic penalty must shrink block mass");
     }
 
+    /// A block target whose excess and per-row score are driven by real design
+    /// matvecs `s = X·(V_b·t)` — the SAME structure as the production
+    /// `Gam784BlockTarget` — so it can compute those matvecs either serially
+    /// (one `fast_av` per draw) or batched (one GEMM over all draws), toggled by
+    /// `batched`. The two must yield a bit-for-bit (to FP-reassociation
+    /// tolerance) identical correction: that is exactly the #1082 batching
+    /// contract — GEMM changes HOW the matvec is computed, never WHAT.
+    struct MatvecBlock {
+        lambdas: Array1<f64>,
+        x: Array2<f64>,
+        v_b: Array2<f64>,
+        y: Array1<f64>,
+        batched: bool,
+    }
+    impl MatvecBlock {
+        fn s_of(&self, t: &Array1<f64>) -> Array1<f64> {
+            let delta = self.v_b.dot(t);
+            crate::faer_ndarray::fast_av(&self.x, &delta)
+        }
+        // A smooth, finite, family-like excess + per-row score built from `s`.
+        fn excess_and_ngs(&self, s: &Array1<f64>) -> (f64, Array1<f64>) {
+            let mut excess = 0.0;
+            let mut ngs = Array1::<f64>::zeros(s.len());
+            for i in 0..s.len() {
+                let mu = (self.y[i] + s[i]).tanh();
+                excess += 0.5 * s[i] * s[i] - 0.1 * mu;
+                ngs[i] = mu - self.y[i];
+            }
+            (excess, ngs)
+        }
+    }
+    impl super::BlockExcessTarget for MatvecBlock {
+        fn block_dim(&self) -> usize {
+            self.lambdas.len()
+        }
+        fn rho_dim(&self) -> usize {
+            self.lambdas.len()
+        }
+        fn block_curvatures(&self) -> &Array1<f64> {
+            &self.lambdas
+        }
+        fn excess(&self, t: &Array1<f64>) -> f64 {
+            self.excess_and_ngs(&self.s_of(t)).0
+        }
+        fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
+            t.mapv(|x| 0.01 * x)
+        }
+        fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64> {
+            self.excess_and_ngs(&self.s_of(t)).1
+        }
+        fn base_neg_score(&self) -> Array1<f64> {
+            self.excess_and_ngs(&self.s_of(&Array1::zeros(self.block_dim())))
+                .1
+        }
+        fn excess_with_displaced_neg_score_batch(
+            &self,
+            draws: &Array2<f64>,
+        ) -> Vec<(f64, Option<Array1<f64>>)> {
+            if !self.batched {
+                // Serial reference: per-column, exactly the default path.
+                let mut out = Vec::with_capacity(draws.ncols());
+                let mut t = Array1::<f64>::zeros(draws.nrows());
+                for s in 0..draws.ncols() {
+                    t.assign(&draws.column(s));
+                    out.push(self.excess_with_displaced_neg_score(&t));
+                }
+                return out;
+            }
+            // Batched: Δ = V_b·T then S = X·Δ as two GEMMs, then per-column.
+            let delta_all = crate::faer_ndarray::fast_ab(&self.v_b, draws);
+            let s_all = crate::faer_ndarray::fast_ab(&self.x, &delta_all);
+            (0..draws.ncols())
+                .map(|c| {
+                    let (e, ngs) = self.excess_and_ngs(&s_all.column(c).to_owned());
+                    if e.is_finite() {
+                        (e, Some(ngs))
+                    } else {
+                        (e, None)
+                    }
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn block_sampled_marginal_batched_matches_serial_matvec() {
+        // Real design / block-frame matvecs, large enough that the GEMM path is
+        // actually taken (n, p ≥ faer threshold). The batched override must give
+        // the same correction value, ρ-gradient, and moments as the serial path.
+        let n = 80usize;
+        let p = 40usize;
+        let m = 3usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        for i in 0..n {
+            for j in 0..p {
+                x[(i, j)] = ((i * 7 + j * 13) % 11) as f64 * 0.05 - 0.25;
+            }
+        }
+        let mut v_b = Array2::<f64>::zeros((p, m));
+        for i in 0..p {
+            for r in 0..m {
+                v_b[(i, r)] = ((i * 3 + r * 5) % 7) as f64 * 0.1 - 0.3;
+            }
+        }
+        let y: Array1<f64> = (0..n).map(|i| ((i % 5) as f64) * 0.2).collect();
+        let lambdas = array![2.0, 1.0, 0.5];
+
+        let serial = super::block_sampled_marginal_correction(&MatvecBlock {
+            lambdas: lambdas.clone(),
+            x: x.clone(),
+            v_b: v_b.clone(),
+            y: y.clone(),
+            batched: false,
+        })
+        .expect("serial");
+        let batched = super::block_sampled_marginal_correction(&MatvecBlock {
+            lambdas,
+            x,
+            v_b,
+            y,
+            batched: true,
+        })
+        .expect("batched");
+
+        assert_eq!(serial.n_draws, batched.n_draws);
+        assert!(
+            (serial.value - batched.value).abs() <= 1e-10 * (1.0 + serial.value.abs()),
+            "value serial {} vs batched {}",
+            serial.value,
+            batched.value
+        );
+        for k in 0..serial.rho_gradient.len() {
+            assert!(
+                (serial.rho_gradient[k] - batched.rho_gradient[k]).abs()
+                    <= 1e-10 * (1.0 + serial.rho_gradient[k].abs()),
+                "rho_gradient[{k}] serial {} vs batched {}",
+                serial.rho_gradient[k],
+                batched.rho_gradient[k]
+            );
+        }
+        let ms = serial.moments.expect("serial moments");
+        let mb = batched.moments.expect("batched moments");
+        for (a, b) in ms.e_t.iter().zip(mb.e_t.iter()) {
+            assert!((a - b).abs() <= 1e-10 * (1.0 + a.abs()), "e_t {a} vs {b}");
+        }
+        for (a, b) in ms.e_neg_score.iter().zip(mb.e_neg_score.iter()) {
+            assert!(
+                (a - b).abs() <= 1e-10 * (1.0 + a.abs()),
+                "e_neg_score {a} vs {b}"
+            );
+        }
+        for (a, b) in ms.e_t_neg_score.iter().zip(mb.e_t_neg_score.iter()) {
+            assert!(
+                (a - b).abs() <= 1e-10 * (1.0 + a.abs()),
+                "e_t_neg_score {a} vs {b}"
+            );
+        }
+    }
+
     #[test]
     fn logit_pg_rao_blackwell_returns_finite_terms() {
         let x = array![[1.0, 0.2], [1.0, -0.1], [1.0, 1.2], [1.0, -0.7]];
