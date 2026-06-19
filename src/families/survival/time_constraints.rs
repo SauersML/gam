@@ -73,14 +73,13 @@ impl GuardPolicy {
 /// must clear the guard from its offset alone.
 ///
 /// Both families compare `offset + tol(offset, guard) ≥ guard` (equivalently
-/// `guard − offset ≤ tol`). They historically used different slack factors of
-/// the same shape `factor · (1 + max(|offset|, |guard|))`; the variants below
-/// preserve each family's choice exactly while naming the distinction.
+/// `guard − offset ≤ tol`). They use different slack factors of the same shape
+/// `factor · (1 + max(|offset|, |guard|))`; the variants below name the active
+/// policy directly.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FeasibilityTolerance {
-    /// `1e-12 · (1 + max(|offset|, |guard|))` — `survival_location_scale`'s
-    /// historical absolute slack.
-    LegacyAbsolute,
+    /// `1e-12 · (1 + max(|offset|, |guard|))`.
+    AbsoluteScaled,
     /// `256 · f64::EPSILON · (1 + max(|offset|, |guard|))` —
     /// `survival_marginal_slope`'s epsilon-scaled slack.
     EpsilonScaled,
@@ -91,7 +90,7 @@ impl FeasibilityTolerance {
     fn slack(self, offset: f64, guard: f64) -> f64 {
         let scale = 1.0 + offset.abs().max(guard.abs());
         match self {
-            FeasibilityTolerance::LegacyAbsolute => 1e-12 * scale,
+            FeasibilityTolerance::AbsoluteScaled => 1e-12 * scale,
             FeasibilityTolerance::EpsilonScaled => 256.0 * f64::EPSILON * scale,
         }
     }
@@ -239,7 +238,7 @@ mod tests {
 
     const LS_POLICY: GuardConstraintPolicy = GuardConstraintPolicy {
         guard_policy: GuardPolicy::NonNegative,
-        feasibility: FeasibilityTolerance::LegacyAbsolute,
+        feasibility: FeasibilityTolerance::AbsoluteScaled,
     };
     const MS_POLICY: GuardConstraintPolicy = GuardConstraintPolicy {
         guard_policy: GuardPolicy::Positive,
