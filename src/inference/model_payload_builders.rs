@@ -713,30 +713,56 @@ pub struct SurvivalMarginalSlopeInputs<'a> {
     pub influence_absorber_width: Option<usize>,
 }
 
-/// Assemble the canonical survival marginal-slope payload — single source of
-/// truth for that Royston-Parmar / Gaussian-residual on-disk contract.
-pub fn assemble_survival_marginal_slope_payload(
-    inputs: SurvivalMarginalSlopeInputs<'_>,
-    source: SavedModelSourceMetadata,
+/// Construct a Royston-Parmar survival [`FittedModelPayload`] through the
+/// canonical `Survival` family scaffold shared by every RP on-disk contract
+/// (marginal-slope, transformation, location-scale): the identity-link
+/// `RoystonParmar` likelihood, the persisted likelihood label, and the
+/// `fit_result` / `data_schema` install. Callers supply the two variants that
+/// differ — `survival_distribution` and `frailty` — and then set their own
+/// family-specific fields on the returned payload.
+fn new_royston_parmar_survival_payload(
+    formula: String,
+    fit_result: UnifiedFitResult,
+    data_schema: DataSchema,
+    survival_likelihood_label: &str,
+    survival_distribution: Option<ResidualDistribution>,
+    frailty: crate::families::survival::lognormal_kernel::FrailtySpec,
 ) -> FittedModelPayload {
     let mut payload = FittedModelPayload::new(
         MODEL_PAYLOAD_VERSION,
-        inputs.formula,
+        formula,
         ModelKind::Survival,
         FittedFamily::Survival {
             likelihood: LikelihoodSpec::new(
                 ResponseFamily::RoystonParmar,
                 InverseLink::Standard(StandardLink::Identity),
             ),
-            survival_likelihood: Some(inputs.survival_likelihood_label.clone()),
-            survival_distribution: Some(ResidualDistribution::Gaussian),
-            frailty: inputs.frailty,
+            survival_likelihood: Some(survival_likelihood_label.to_string()),
+            survival_distribution,
+            frailty,
         },
         ResponseFamily::RoystonParmar.name().to_string(),
     );
-    payload.unified = Some(inputs.fit_result.clone());
-    payload.fit_result = Some(inputs.fit_result);
-    payload.data_schema = Some(inputs.data_schema);
+    payload.unified = Some(fit_result.clone());
+    payload.fit_result = Some(fit_result);
+    payload.data_schema = Some(data_schema);
+    payload
+}
+
+/// Assemble the canonical survival marginal-slope payload — single source of
+/// truth for that Royston-Parmar / Gaussian-residual on-disk contract.
+pub fn assemble_survival_marginal_slope_payload(
+    inputs: SurvivalMarginalSlopeInputs<'_>,
+    source: SavedModelSourceMetadata,
+) -> FittedModelPayload {
+    let mut payload = new_royston_parmar_survival_payload(
+        inputs.formula,
+        inputs.fit_result,
+        inputs.data_schema,
+        &inputs.survival_likelihood_label,
+        Some(ResidualDistribution::Gaussian),
+        inputs.frailty,
+    );
     payload.survival_entry = inputs.survival_entry;
     payload.survival_exit = Some(inputs.survival_exit);
     payload.survival_event = Some(inputs.survival_event);
@@ -819,24 +845,14 @@ pub fn assemble_survival_transformation_payload(
     inputs: SurvivalTransformationInputs,
     source: SavedModelSourceMetadata,
 ) -> FittedModelPayload {
-    let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
+    let mut payload = new_royston_parmar_survival_payload(
         inputs.formula,
-        ModelKind::Survival,
-        FittedFamily::Survival {
-            likelihood: LikelihoodSpec::new(
-                ResponseFamily::RoystonParmar,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
-            survival_likelihood: Some(inputs.survival_likelihood_label.clone()),
-            survival_distribution: None,
-            frailty: crate::families::survival::lognormal_kernel::FrailtySpec::None,
-        },
-        ResponseFamily::RoystonParmar.name().to_string(),
+        inputs.fit_result,
+        inputs.data_schema,
+        &inputs.survival_likelihood_label,
+        None,
+        crate::families::survival::lognormal_kernel::FrailtySpec::None,
     );
-    payload.unified = Some(inputs.fit_result.clone());
-    payload.fit_result = Some(inputs.fit_result);
-    payload.data_schema = Some(inputs.data_schema);
     payload.survival_entry = inputs.survival_entry;
     payload.survival_exit = Some(inputs.survival_exit);
     payload.survival_event = Some(inputs.survival_event);
@@ -920,24 +936,14 @@ pub fn assemble_survival_location_scale_payload(
 ) -> FittedModelPayload {
     let survival_distribution =
         residual_distribution_from_inverse_link(&inputs.fitted_inverse_link);
-    let mut payload = FittedModelPayload::new(
-        MODEL_PAYLOAD_VERSION,
+    let mut payload = new_royston_parmar_survival_payload(
         inputs.formula,
-        ModelKind::Survival,
-        FittedFamily::Survival {
-            likelihood: LikelihoodSpec::new(
-                ResponseFamily::RoystonParmar,
-                InverseLink::Standard(StandardLink::Identity),
-            ),
-            survival_likelihood: Some(inputs.survival_likelihood_label.clone()),
-            survival_distribution,
-            frailty: crate::families::survival::lognormal_kernel::FrailtySpec::None,
-        },
-        ResponseFamily::RoystonParmar.name().to_string(),
+        inputs.fit_result,
+        inputs.data_schema,
+        &inputs.survival_likelihood_label,
+        survival_distribution,
+        crate::families::survival::lognormal_kernel::FrailtySpec::None,
     );
-    payload.unified = Some(inputs.fit_result.clone());
-    payload.fit_result = Some(inputs.fit_result);
-    payload.data_schema = Some(inputs.data_schema);
     payload.link = Some(inputs.fitted_inverse_link);
     payload.linkwiggle_degree = inputs.linkwiggle_degree;
     payload.linkwiggle_knots = inputs.linkwiggle_knots;
