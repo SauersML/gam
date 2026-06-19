@@ -818,13 +818,22 @@ pub fn lorentz_exp_origin(
     let norm = norm_sq.sqrt().max(ORIGIN_EPS);
     let s = sqrt_negc * norm;
     // Cap the argument fed to `cosh`/`sinh`. For `s` beyond ~710 these
-    // overflow to `inf`, giving an `inf/(inf+1) = NaN` ball point downstream;
-    // mathematically the hyperboloid point's spatial/temporal ratio is
-    // `tanh(s) -> 1`, so capping at `EXP_SATURATION_CAP` (where `tanh` already
-    // reads `1 - BOUNDARY_EPS` in f64) keeps the lift finite and lands on the
-    // same clamped boundary the Poincaré path produces. `from_lorentz` then
-    // projects strictly interior, so the composed decode never NaNs.
-    let s_eval = s.min(EXP_SATURATION_CAP);
+    // overflow to `inf`, giving an `inf/(inf+1) = NaN` ball point downstream,
+    // so `s_eval` must be bounded well below that. Choosing the right cap also
+    // fixes where near-boundary embeddings saturate. By this module's identity
+    // `y^{Lorentz}(v) = exp_0^{Poincare}(v / 2)`, the downstream `from_lorentz`
+    // maps this hyperboloid point to ball radius
+    // `sinh(s_eval)/(cosh(s_eval)+1) = tanh(s_eval / 2)` — the EFFECTIVE
+    // Poincaré argument is HALF of `s_eval`. To land the decoded radius on the
+    // same open-ball boundary `1 - BOUNDARY_EPS` that the Poincaré path
+    // (`exp_coeff`, which clamps `tanh(s)`) produces, we need
+    // `tanh(s_eval / 2) = 1 - BOUNDARY_EPS`, i.e. `s_eval / 2 =
+    // EXP_SATURATION_CAP`, hence the cap is `2 * EXP_SATURATION_CAP`
+    // (≈ 12.206 — still far below the ~710 cosh/sinh overflow threshold).
+    // Capping at `EXP_SATURATION_CAP` instead would saturate at
+    // `tanh(EXP_SATURATION_CAP / 2) ≈ 0.9955`, a factor of ~2 too early.
+    // `from_lorentz` then projects strictly interior, so the decode never NaNs.
+    let s_eval = s.min(2.0 * EXP_SATURATION_CAP);
     let mut out = Array1::<f64>::zeros(d + 1);
     out[0] = s_eval.cosh() / sqrt_negc;
     // Radial scaling stays in the original (uncapped) tangent direction: the
@@ -1358,6 +1367,61 @@ mod tests {
                 "lorentz decode must stay strictly interior (curvature \
                  {curvature}): sqrt(k)|y| = {}",
                 sqrt_negc * norm
+            );
+        }
+    }
+
+    #[test]
+    fn lorentz_exp_saturates_at_same_boundary_as_poincare() {
+        // Regression for #1349. The Lorentz decode path used to cap its exp
+        // argument at `EXP_SATURATION_CAP`, but `from_lorentz` maps the
+        // hyperboloid point to ball radius `tanh(s_eval / 2)` (the module's
+        // identity `y^{Lorentz}(v) = exp_0^{Poincare}(v / 2)`). So capping at
+        // `EXP_SATURATION_CAP` saturated the radius at `tanh(cap / 2) ≈ 0.9955`
+        // — a factor of ~2 too early — instead of `1 - BOUNDARY_EPS`. The cap is
+        // now `2 * EXP_SATURATION_CAP` so both decoders land on the same
+        // boundary.
+        let curvature = -1.0_f64;
+        let sqrt_negc = (-curvature).sqrt();
+        // A fixed unit direction in R^4, scaled to several large norms. With
+        // curvature -1 the radial exp argument is `s = norm`; the saturation
+        // cap is `2 * EXP_SATURATION_CAP ≈ 12.206`, so every norm here sits
+        // deep in the saturated (capped) regime where the radius must pin to
+        // `1 - BOUNDARY_EPS`. The OLD cap of `EXP_SATURATION_CAP ≈ 6.103` would
+        // instead saturate at `tanh(6.103 / 2) ≈ 0.9955`, failing this test.
+        let raw = array![0.3_f64, -0.5, 0.7, 0.2];
+        let raw_norm = raw.iter().map(|x| x * x).sum::<f64>().sqrt();
+        for &target_norm in &[20.0_f64, 50.0, 100.0] {
+            let v: Array1<f64> = raw.mapv(|x| x * target_norm / raw_norm);
+
+            // (a) The Lorentz decode is the SAME function as the Poincaré exp at
+            // half the tangent: `from_lorentz(lorentz_exp_origin(v))` must match
+            // `exp_origin(v / 2)` to ~1e-9 (radius times sqrt(-c)). This holds
+            // because both saturate identically once their (shared) effective
+            // argument exceeds the cap.
+            let x_h = lorentz_exp_origin(v.view(), curvature).expect("lorentz exp");
+            let y_lorentz = from_lorentz(x_h.view(), curvature).expect("from_lorentz");
+            let v_half: Array1<f64> = v.mapv(|x| x * 0.5);
+            let y_poincare = exp_origin(v_half.view(), curvature).expect("exp");
+            let r_lorentz = sqrt_negc * y_lorentz.iter().map(|q| q * q).sum::<f64>().sqrt();
+            let r_poincare = sqrt_negc * y_poincare.iter().map(|q| q * q).sum::<f64>().sqrt();
+            assert!(
+                (r_lorentz - r_poincare).abs() < 1.0e-9,
+                "lorentz vs poincare(v/2) radius mismatch at norm {target_norm}: \
+                 {r_lorentz} vs {r_poincare}"
+            );
+
+            // (b) The saturated radius reaches `1 - BOUNDARY_EPS`, NOT ~0.9955.
+            assert!(
+                (r_lorentz - (1.0 - BOUNDARY_EPS)).abs() < 1.0e-9,
+                "saturated lorentz radius must reach 1 - BOUNDARY_EPS \
+                 ({}), got {r_lorentz} at norm {target_norm}",
+                1.0 - BOUNDARY_EPS
+            );
+            assert!(
+                r_lorentz > 0.999,
+                "saturated radius {r_lorentz} must be near 1, not the old ~0.9955 \
+                 (norm {target_norm})"
             );
         }
     }
