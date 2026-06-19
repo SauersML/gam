@@ -228,6 +228,8 @@ mod quality_vs_mgcv_tensor_te_3d_gaussian;
 mod quality_vs_mgcv_tensor_ti_2d_gaussian;
 #[path = "quality/quality_vs_mgcv_tensor_tp_2d_gaussian.rs"]
 mod quality_vs_mgcv_tensor_tp_2d_gaussian;
+#[path = "quality/diag_1271_logdet_probe.rs"]
+mod diag_1271_logdet_probe;
 #[path = "quality/quality_vs_mgcv_thin_plate_1d.rs"]
 mod quality_vs_mgcv_thin_plate_1d;
 #[path = "quality/quality_vs_mgcv_thin_plate_by_factor.rs"]

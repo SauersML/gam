@@ -1177,6 +1177,51 @@ impl<'a> RemlState<'a> {
                 (0.0, None)
             };
 
+        // #1271 diagnostic: dump the REML logdet internals at every dense
+        // evaluation so the rank/logdet mechanism is visible in the test log.
+        // Pure logging — no numeric behavior change. Routed through `log::info!`
+        // so it is harmless in production (default off) and captured by a
+        // test-installed logger in the #1271 probe.
+        if log::log_enabled!(log::Level::Info) {
+            use crate::faer_ndarray::FaerEigh;
+            use faer::Side;
+            let h_logdet = hessian_op.logdet();
+            let (h_above_one, h_min, h_max) = match h_for_operator.as_ref().eigh(Side::Lower) {
+                Ok((evals, _)) => {
+                    let above = evals.iter().filter(|&&s| s > 1.0).count();
+                    let mn = evals.iter().copied().fold(f64::INFINITY, f64::min);
+                    let mx = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    (above as i64, mn, mx)
+                }
+                Err(_) => (-1, f64::NAN, f64::NAN),
+            };
+            let rho_str = rho
+                .iter()
+                .map(|r| format!("{r:.4}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let lam_str = rho
+                .iter()
+                .map(|r| format!("{:.3e}", r.exp()))
+                .collect::<Vec<_>>()
+                .join(",");
+            log::info!(
+                "[#1271-diag] p={p} penalty_rank={pr} nullspace_dim={nd} \
+                 logS={ls:.6} logH={lh:.6} half_diff={hd:.6} \
+                 h_above1={ha} h_min={hmin:.3e} h_max={hmax:.3e} \
+                 rho=[{rho_str}] lambda=[{lam_str}]",
+                p = h_for_operator.ncols(),
+                pr = penalty_rank,
+                nd = nullspace_dim,
+                ls = penalty_logdet.value,
+                lh = h_logdet,
+                hd = 0.5 * (h_logdet - penalty_logdet.value),
+                ha = h_above_one,
+                hmin = h_min,
+                hmax = h_max,
+            );
+        }
+
         let ctx =
             self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
         Ok(self.finish_assembly(
