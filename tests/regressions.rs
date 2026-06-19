@@ -66,6 +66,8 @@ mod bug_hunt_decoder_incoherence_hvp_is_gauss_newton_not_exact;
 mod bug_hunt_diagnose_drops_response_column;
 #[path = "regressions/bug_hunt_dispersion_location_scale_generate_predict_variance_agreement.rs"]
 mod bug_hunt_dispersion_location_scale_generate_predict_variance_agreement;
+#[path = "regressions/bug_hunt_dispersion_location_scale_observation_interval_symmetric_1346.rs"]
+mod bug_hunt_dispersion_location_scale_observation_interval_symmetric_1346;
 #[path = "regressions/bug_hunt_double_penalty_inflates_edf_instead_of_shrinking.rs"]
 mod bug_hunt_double_penalty_inflates_edf_instead_of_shrinking;
 #[path = "regressions/bug_hunt_double_penalty_shrinks_irrelevant_covariate_1266.rs"]
