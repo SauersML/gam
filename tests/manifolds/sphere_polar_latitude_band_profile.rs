@@ -14,11 +14,6 @@ use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
 const TAU: f64 = std::f64::consts::TAU;
-// The training noise in this verifier is sigma=0.10. A ratio-only oracle is
-// unstable once both the equator and the comparison band are already much
-// smaller than the noise floor; #1246's artifact was a visible absolute polar
-// error, not a harmless ratio between tiny residuals.
-const SMALL_BAND_RMSE: f64 = 0.02;
 
 fn low_degree_truth(lat: f64, lon: f64) -> f64 {
     let (sin_lon, cos_lon) = lon.sin_cos();
@@ -122,11 +117,10 @@ fn sphere_polar_latitude_band_profile_remains_even_for_both_engines() {
             }
             let ratio = rmse / equator.max(1e-12);
             assert!(
-                ratio < 1.4 || rmse < SMALL_BAND_RMSE,
+                ratio < 1.4,
                 "{label} sphere fit degraded in {band}: rmse={rmse:.4}, \
                  equator={equator:.4}, ratio={ratio:.2}; #1246 requires \
-                 the fix to hold across latitude bands, not only one oracle band \
-                 unless the absolute band error is already < {SMALL_BAND_RMSE:.2}"
+                 the fix to hold across latitude bands, not only one oracle band"
             );
         }
     }
