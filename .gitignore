@@ -153,6 +153,11 @@ m.report.html
 # Local agent workflow scripts (per-machine, not shared via the repo).
 .claude/workflows/
 
+# Codex local worker state and worktrees.
+.codex-issue-workers/
+.codex-worker-logs/
+.codex-worktrees/
+
 # Generated data + fitted models for scripts/geometric_shapes_demo.py
 scripts/geometric_shapes_demo_data/
 
