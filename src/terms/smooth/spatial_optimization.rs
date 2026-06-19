@@ -2372,7 +2372,8 @@ impl<'d> SpatialJointContext<'d> {
         let (value, gradient) = if shape {
             let psi = theta[self.rho_dim];
             (
-                self.evaluator.psi_gram_tensor_covers(psi),
+                self.evaluator.psi_gram_tensor_covers(psi)
+                    && self.evaluator.psi_gram_tensor_covers_skip(psi),
                 !require_gradient || self.evaluator.psi_gram_tensor_covers_gradient(psi),
             )
         } else {
