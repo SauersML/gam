@@ -519,6 +519,38 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             .is_some_and(|t| t.contains(psi))
     }
 
+    /// True when the design-realization SKIP to `psi` is β̂-SOUND given the
+    /// reference surface pinned at the last slow-path reset (#1264). Restored
+    /// after the "stale-penalty-not-stale-basis" theory was empirically refuted:
+    /// MSI measured β̂rel≈1.7e-5 (17× the issue's 1e-6 bar) when the n-free κ skip
+    /// fires on production Duchon geometry — EVEN at a ψ the n-free VALUE window
+    /// admits — because the inner penalized solve `(QsᵀGQs+S)β=b` is run in the
+    /// CONDITIONED reduced basis, and that basis ROTATES with ψ on the near-
+    /// singular radial Gram (κ(G)≈9.5e14). The skip installs the Chebyshev-
+    /// interpolated `gram_at(ψ)` (≤1e-10 vs the streamed exact Gram), and when the
+    /// reduced basis at the trial ψ differs from the reference surface's basis the
+    /// κ-amplified round-off moves the shipped κ-optimum past 1e-6.
+    ///
+    /// So the skip is sound ONLY where the reduced basis is provably unchanged:
+    /// the gauge-invariant range-projector witness `reduced_basis_equal(psi_ref,
+    /// psi)` against the pinning ψ recorded at the last slow-path reset. Without a
+    /// recorded pinning ψ (no reset yet) the skip is refused. Value coverage alone
+    /// is NOT sufficient — this is the load-bearing #1264 soundness gate.
+    pub(crate) fn psi_gram_tensor_covers_skip(&self, psi: f64) -> bool {
+        let Some(tensor) = self.psi_gram_tensor.as_ref() else {
+            return false;
+        };
+        if !tensor.contains(psi) {
+            return false;
+        }
+        // The pinning ψ must itself be in-window for its reference projector to be
+        // a valid comparison point; otherwise refuse (forces the exact slow path).
+        let Some(psi_ref) = self.last_reset_psi.filter(|p| tensor.contains(*p)) else {
+            return false;
+        };
+        tensor.reduced_basis_equal(psi_ref, psi)
+    }
+
     /// Revision of the canonical surface pinned by the last slow-path
     /// `reset_surface`, if any. The spatial κ caller passes this revision back
     /// on certified n-free value/gradient probes so [`Self::prepare_eval_state`]
