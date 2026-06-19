@@ -331,6 +331,25 @@ NON_BLOCKING_FAILURE_CONTENDERS = {
     "r_mgcv",
     "r_mgcv_gaulss",
     "r_mgcv_coxph",
+    # External survival comparison references, none of which is the system
+    # under test (that is `rust_gamlss_survival`, gated separately by the
+    # required-contender check below). Like the mgcv lanes above, these
+    # third-party stacks routinely hit numerical failures on degenerate
+    # survival data we don't control — e.g. R `survival::coxph` aborting with
+    # "NA/NaN/Inf in foreign function call (arg 5)" / "NaNs produced" inside
+    # `coxpenal.fit` on tied/ill-conditioned times. Surface those rows in the
+    # diagnostic output, but don't fail the whole shard for an external
+    # library's fit failure.
+    "r_survival_coxph",
+    "r_glmnet_cox",
+    "python_sksurv_rsf",
+    "python_sksurv_coxnet",
+    "python_sksurv_gb_coxph",
+    "python_sksurv_componentwise_gb_coxph",
+    "python_lifelines_coxph_enet",
+    "python_lifelines_weibull_aft",
+    "python_lifelines_lognormal_aft",
+    "python_xgboost_aft",
 }
 _BENCH_CI_PROFILE = os.environ.get("BENCH_CI_PROFILE", "full").strip().lower() or "full"
 _LEAN_PROFILE_EXCLUDED_CONTENDERS = {
