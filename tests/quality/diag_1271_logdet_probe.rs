@@ -94,16 +94,32 @@ fn diag_1271_dump_reml_logdet_internals() {
     let inf = fit.fit.inference.as_ref().expect("inference present");
     let edf_total = inf.edf_total;
     let edf_by_block = inf.edf_by_block.clone();
+    let block_trace = inf.penalty_block_trace.clone();
 
-    // Penalty inventory: how many penalties ship, their col_range/dim.
+    // Path-independent decisive numbers from the public fit: the SELECTED
+    // smoothing parameters (small λ = under-smoothing/genuine cost bug;
+    // large λ + high EDF = EDF-reporting bug) and the per-penalty influence
+    // trace tr_kk = λ_kk·tr(H⁻¹ S_kk) (which penalty does the EDF work).
+    let lambdas: Vec<f64> = fit.fit.lambdas.to_vec();
+    let log_lambdas: Vec<f64> = fit.fit.log_lambdas.to_vec();
+
+    // Penalty inventory: how many penalties ship, their col_range/dim, plus the
+    // per-penalty λ, ρ=ln λ, and trace aligned 1:1 (lambdas / penalty_block_trace
+    // are in penalty order, same as fit.design.penalties).
     let mut pen_summary = String::new();
     for (i, bp) in fit.design.penalties.iter().enumerate() {
         let (r, c) = bp.local.dim();
+        let lam = lambdas.get(i).copied().unwrap_or(f64::NAN);
+        let rho = log_lambdas.get(i).copied().unwrap_or(f64::NAN);
+        let tr = block_trace.get(i).copied().unwrap_or(f64::NAN);
         pen_summary.push_str(&format!(
-            "\n    penalty[{i}] col_range={:?} dim={}x{}",
-            bp.col_range, r, c
+            "\n    penalty[{i}] col_range={:?} dim={r}x{c} lambda={lam:.6e} rho={rho:.4} trace={tr:.4}",
+            bp.col_range
         ));
     }
+    pen_summary.push_str(&format!(
+        "\n    ALL lambdas={lambdas:?}\n    ALL log_lambdas(rho)={log_lambdas:?}\n    ALL block_trace={block_trace:?}"
+    ));
 
     // Drain the captured per-evaluation diagnostic trace.
     let lines = DIAG_LINES.lock().map(|g| g.clone()).unwrap_or_default();
