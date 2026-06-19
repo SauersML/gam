@@ -2830,6 +2830,13 @@ impl<'d> SpatialJointContext<'d> {
                     && self.evaluator.supports_nfree_penalty_rekey()
                     && nfree_fast_path_revision.is_some()
         };
+        if theta.len() == self.rho_dim + 1
+            && self.evaluator.has_psi_gram_tensor()
+            && !self.evaluator.psi_gram_tensor_covers(theta[self.rho_dim])
+        {
+            self.cache.store_cost_at(theta, f64::INFINITY);
+            return f64::INFINITY;
+        }
         if !skip_value_realization && self.cache.ensure_theta(theta).is_err() {
             return f64::INFINITY;
         }

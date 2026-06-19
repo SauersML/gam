@@ -531,6 +531,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.last_canonical_revision
     }
 
+    pub(crate) fn has_psi_gram_tensor(&self) -> bool {
+        self.psi_gram_tensor.is_some()
+    }
+
     /// Return the most-recently converged inner β from the last PIRLS solve, if
     /// it is finite and the right dimension. Used by `SpatialJointContext` to
     /// warm-start successive outer evaluations instead of cold-starting PIRLS
