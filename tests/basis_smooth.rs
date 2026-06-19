@@ -66,6 +66,8 @@ mod bspline_partition_unity_degree_5;
 mod cyclic_bspline_first_derivative_periodicity_breaks;
 #[path = "basis_smooth/nonperiodic_bspline_derivative_no_wrap.rs"]
 mod nonperiodic_bspline_derivative_no_wrap;
+#[path = "basis_smooth/open_knot_derivative_sparse_scalar_consistency.rs"]
+mod open_knot_derivative_sparse_scalar_consistency;
 #[path = "basis_smooth/cyclic_bspline_second_derivative_periodicity_breaks.rs"]
 mod cyclic_bspline_second_derivative_periodicity_breaks;
 #[path = "basis_smooth/cyclic_duchon_torus_containment.rs"]

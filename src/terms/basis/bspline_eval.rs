@@ -409,6 +409,48 @@ pub(crate) fn clamp_eval_point_to_modeling_interval(
     x.clamp(left, right)
 }
 
+/// True when `x` lies strictly outside the modeling interval of an *open*
+/// (non-clamped) knot vector, where the analytic B-spline derivative of every
+/// order must be zero.
+///
+/// The boundary extension differs by knot geometry, and the derivative has to
+/// follow whatever the value basis does so that it equals a finite difference of
+/// the value (gam#1348):
+///
+/// * **Open / unclamped** knots — the value evaluator clamps its argument to
+///   `[t[degree], t[num_basis]]` and holds the value *constant* outside it
+///   (`has_clamped_bspline_boundaries` is false, so the dense builder applies no
+///   linear extension). A constant has zero derivative, so the exterior
+///   derivative is zero — this returns `true`.
+/// * **Clamped** knots — the value is extended *linearly* past the boundary, so
+///   the exterior derivative is the nonzero boundary slope obtained by evaluating
+///   at the clamped endpoint. This returns `false`, leaving the existing
+///   clamp-and-evaluate path in charge.
+///
+/// The dense builder already zeroes the open-knot exterior in
+/// [`apply_dense_bspline_extrapolation`]; this predicate lets the *per-point*
+/// sparse, scalar, and recurrence evaluators do the same, so every derivative
+/// path agrees with the value basis — not just the dense one the public
+/// `bspline_basis_derivative` happens to use. (Genuinely cyclic bases pre-wrap
+/// their input into the base period and never reach here.)
+#[inline]
+pub(crate) fn open_knot_derivative_exterior_is_zero(
+    x: f64,
+    knotview: ArrayView1<f64>,
+    degree: usize,
+) -> bool {
+    let num_basis = knotview.len().saturating_sub(degree + 1);
+    if num_basis == 0 {
+        return false;
+    }
+    let left = knotview[degree];
+    let right = knotview[num_basis];
+    if !(left.is_finite() && right.is_finite() && left < right) {
+        return false;
+    }
+    (x < left || x > right) && !has_clamped_bspline_boundaries(knotview, degree)
+}
+
 #[inline]
 pub(crate) fn one_sided_derivative_eval_point(
     x: f64,
@@ -605,15 +647,22 @@ pub(crate) fn evaluate_splines_derivative_sparse_intowith_lower(
     }
     lowervalues[..num_basis_lower].fill(0.0);
 
-    // Non-periodic (open/clamped) B-spline derivative. The eval point is clamped
-    // to the modeling interval `[knots[degree], knots[num_basis]]`, exactly as the
-    // value evaluator does (`evaluate_splines_at_point_into`), so the analytic
-    // derivative is the derivative of the SAME non-periodic value basis — including
-    // its linear extension in the boundary/exterior spans, where the value is
-    // linear and the derivative is therefore constant. No periodic wrap: wrapping
-    // moved boundary-span points onto unrelated interior columns and broke
-    // value/derivative agreement (gam#1348). Genuinely cyclic bases pre-wrap their
-    // own input data into the base period before reaching this path.
+    // Non-periodic (open/clamped) B-spline derivative, kept consistent with the
+    // value basis so it equals a finite difference of the value (gam#1348). On an
+    // *open* knot vector the value is held constant outside the modeling interval,
+    // so the exterior derivative is zero — the dense builder enforces this in
+    // `apply_dense_bspline_extrapolation`, and the per-point sparse path (used
+    // directly for open knots, which never take the clamped extrapolation
+    // fallback in `SparseStorage::build`) must do the same or a P-spline
+    // derivative design disagrees with its own value in the boundary spans.
+    // Clamped knots extend linearly and keep their nonzero boundary slope, so the
+    // guard intentionally fires only for the open-knot exterior. No periodic wrap:
+    // wrapping moved boundary-span points onto unrelated interior columns;
+    // genuinely cyclic bases pre-wrap their input into the base period upstream.
+    if open_knot_derivative_exterior_is_zero(x, knotview, degree) {
+        values.fill(0.0);
+        return 0;
+    }
     let x_eval = one_sided_derivative_eval_point(x, knotview, degree);
     internal::evaluate_splines_at_point_full_support_into(
         x_eval,

@@ -70,8 +70,24 @@ fn cyclic_bspline_second_derivative_periodicity_breaks() {
     assert_eq!(d2.ncols(), num_basis + degree, "extended basis column count");
 
     let mut max_abs = 0.0_f64;
+    // A central difference of `d1` only approximates `d2` where the spline value
+    // is a single smooth polynomial across the whole stencil `[x-fd_h, x+fd_h]`.
+    // It is NOT a valid oracle when the stencil straddles a knot: at the
+    // modeling-interval edges the open-knot `d1` drops to zero in the
+    // constant-extension exterior (a one-sided ~1/h spike), and at every interior
+    // knot the cubic's third derivative jumps (an O(h·jump) corner error in `d2`).
+    // Skip any sample whose stencil reaches a knot; the smooth interior samples
+    // (the vast majority) must match tightly. Same knot-skip rationale as
+    // `bspline_derivative_fd_oracle.rs`.
+    let near_knot = |x: f64| knots.iter().any(|&k| (x - k).abs() <= 2.0 * fd_h);
     let mut any_nonzero = false;
+    let mut checked = 0usize;
     for i in 0..tt.len() {
+        let x = tt[i];
+        if x - fd_h < left || x + fd_h > right || near_knot(x) {
+            continue;
+        }
+        checked += 1;
         for j in 0..d2.ncols() {
             let fd = (v_plus[[i, j]] - v_minus[[i, j]]) / (2.0 * fd_h);
             let diff = (d2[[i, j]] - fd).abs();
@@ -83,6 +99,7 @@ fn cyclic_bspline_second_derivative_periodicity_breaks() {
             }
         }
     }
+    assert!(checked > 100, "too few interior oracle sites ({checked})");
     assert!(
         any_nonzero,
         "degenerate fix: open-knot second derivative is identically zero"
