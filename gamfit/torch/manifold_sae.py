@@ -641,6 +641,13 @@ class _SparsityLayer(nn.Module):
         # the FFI accessor rather than re-deriving the decay in Python.
         self._schedule = cfg.sparsity.gumbel_schedule()
         self._init_alpha = float(cfg.sparsity.init_alpha)
+        # #1282 committed-assignment window. Commit each atom to a fixed balanced
+        # row partition for the first ~15% of the anneal (but at least 40 steps),
+        # re-rolled in a few sub-blocks, to break expert collapse before the
+        # residual EM takes over. Geometry-agnostic: keyed only on a fixed seed.
+        self._commit_steps = max(40, int(0.15 * int(cfg.sparsity.tau_steps)))
+        self._commit_rerolls = 4
+        self._commit_seed = 0x1282 * 2654435761 + int(cfg.n_atoms)
 
     @torch.no_grad()
     def advance_temperature(self) -> None:
@@ -712,6 +719,8 @@ class _SparsityLayer(nn.Module):
         self,
         x: torch.Tensor,
         per_atom_recon: torch.Tensor,
+        *,
+        step: int | None = None,
     ) -> torch.Tensor:
         """Residual deterministic-annealing EM gate for gradient-trained ``softmax_topk``.
 
@@ -791,9 +800,41 @@ class _SparsityLayer(nn.Module):
             log_resp = -relative_residual / tau
             balanced_log_resp = self._sinkhorn_balance(log_resp)
             soft = torch.softmax(balanced_log_resp, dim=-1)
-            hard = self._topk_mask(balanced_log_resp)
+
+            commit = self._commitment_onehot(x, step)
+            if commit is not None:
+                # Committed-assignment window (issue #1282). The balanced EM
+                # keeps usage even but, from the near-symmetric random init,
+                # gradient descent still settles into expert collapse: one atom
+                # owns a manifold while the other becomes an equidistant
+                # garbage-collector blend (great reconstruction R², chance
+                # routing). Balancing usage alone cannot break this because a
+                # specialist + a blend already satisfy the 1/F marginal.
+                #
+                # The closed-form lane breaks the identical symmetry by seeding
+                # each atom onto a *distinct* residual subspace (matching
+                # pursuit). The gradient-path analogue, with no parameter
+                # surgery (so Adam's per-parameter momentum stays consistent),
+                # is to *commit* each atom to a fixed, balanced, disjoint slice
+                # of rows for an early window: the reconstruction gradient then
+                # differentiates the atoms' decoders by the genuinely different
+                # rows they are fed, and once they have specialized the
+                # residual-driven EM below re-routes the rest. The commitment is
+                # the hard forward assignment; gradients flow through the soft
+                # residual responsibilities (straight-through), so the magnitude
+                # code still trains the decoder shape/scale. The partition is a
+                # fixed deterministic permutation (no dependence on the symmetric
+                # residuals, no input-geometry shortcut), re-rolled across a few
+                # sub-blocks so a slice that happens to mix manifolds is
+                # corrected by the next roll — the analogue of the closed-form
+                # lane's ``pc_pair_offset`` multi-start rotation.
+                hard = commit
+            else:
+                hard = self._topk_mask(balanced_log_resp)
             hard_ste = hard + soft - soft.detach()
-            if self._tau_start > self.tau_min:
+            if commit is not None:
+                progress = 1.0
+            elif self._tau_start > self.tau_min:
                 progress = (self._tau_start - tau) / (self._tau_start - self.tau_min)
             else:
                 progress = 1.0
@@ -803,6 +844,43 @@ class _SparsityLayer(nn.Module):
             responsibilities = self._topk_mask(-relative_residual)
 
         return code * responsibilities
+
+    def _commitment_onehot(
+        self, x: torch.Tensor, step: int | None
+    ) -> torch.Tensor | None:
+        """Hard balanced row->atom one-hot during the early commitment window.
+
+        Returns ``(N, F)`` one-hot assignments for ``step`` inside the
+        commitment window, else ``None`` (the residual EM owns the assignment).
+        The partition is a fixed deterministic permutation of the rows split
+        into ``F`` equal contiguous blocks, re-rolled across ``_commit_rerolls``
+        sub-windows so a partition that happens to mix manifolds is replaced by
+        a different one before the EM takes over. It depends only on a fixed
+        seed and the row count — never on the (symmetric) residuals or the input
+        coordinate geometry — so it breaks the init symmetry without smuggling
+        in a geometry shortcut.
+        """
+        if step is None or self.target_k != 1 or self.n_atoms < 2:
+            return None
+        if step >= self._commit_steps:
+            return None
+        n = int(x.shape[0])
+        f = int(self.n_atoms)
+        # Which re-roll sub-window are we in.
+        block = min(
+            self._commit_rerolls - 1,
+            (step * self._commit_rerolls) // max(1, self._commit_steps),
+        )
+        g = torch.Generator(device="cpu")
+        g.manual_seed(int(self._commit_seed) + 7919 * int(block))
+        perm = torch.randperm(n, generator=g)
+        # Balanced contiguous split of the permuted rows across the F atoms.
+        atom_of_sorted = (torch.arange(n) * f) // n  # 0..F-1, balanced
+        assign = torch.empty(n, dtype=torch.long)
+        assign[perm] = atom_of_sorted
+        onehot = torch.zeros(n, f, dtype=x.dtype, device=x.device)
+        onehot[torch.arange(n), assign.to(x.device)] = 1.0
+        return onehot
 
     @staticmethod
     def _sinkhorn_balance(
@@ -907,13 +985,10 @@ class ManifoldSAE(nn.Module):
         self.atom_raw_anchor = nn.Parameter(torch.zeros(F, d, dtype=dt))
         self.decoder_blocks = nn.Parameter(torch.empty(F, K, D, dtype=dt))
 
-        # Training-step counter and collapse-reseed bookkeeping (issue #1282).
+        # Training-step counter for the #1282 committed-assignment window.
         # Non-persistent: a reloaded module is in eval/inference, not training.
         self.register_buffer(
             "_train_steps", torch.zeros((), dtype=torch.long), persistent=False
-        )
-        self.register_buffer(
-            "_reseeds_done", torch.zeros((), dtype=torch.long), persistent=False
         )
 
         # The forward path evaluates a Duchon kernel both for an explicit
@@ -1051,137 +1126,6 @@ class ManifoldSAE(nn.Module):
             "a_init": np.ascontiguousarray(a_init, dtype=np.float64),
         }
 
-    @torch.no_grad()
-    def _maybe_reseed_collapsed_atom(
-        self,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        curves: torch.Tensor,
-    ) -> None:
-        """Reseed a collapsed atom's decoder onto the residual's leading PCs.
-
-        Torch port of the closed-form lane's
-        ``reseed_atoms_onto_distinct_residual_pcs`` (issue #1282). Runs only
-        while training (``self.training``), only for the magnitude-carrying
-        top-1 ``softmax_topk`` gate, and only during an early training window so
-        the schedule still has room to specialize the reseeded atom. It is a
-        data-dependent warm-restart of the worst atom's decoder, executed under
-        ``no_grad`` — the autograd graph for this forward is rebuilt from the
-        reseeded decoder by the caller.
-
-        Collapse test: assign each row to the atom that reconstructs it best
-        (smallest best-scalar-code residual) and measure each atom's mean
-        residual over the rows it *wins*. A healthy specialized atom has small
-        win-residual; a garbage-collector blend either wins almost nothing or
-        wins rows it reconstructs poorly. If the worst atom's contribution is
-        far below the best atom's (decoder Frobenius norm ratio below the
-        closed-form collapse floor, or it owns a vanishing share of rows), seed
-        its decoder block so its curve fits the dominant directions of the
-        residual that the *other* atoms leave — exactly the matching-pursuit
-        re-key the closed-form lane performs.
-        """
-        if not self.training:
-            return
-        if self.cfg.sparsity.kind != "softmax_topk":
-            return
-        F = int(self.cfg.n_atoms)
-        if F < 2:
-            return
-        step = int(self._train_steps.item())
-        self._train_steps += 1
-        # Early window only: reseed at a few checkpoints once the atoms have
-        # begun to differentiate (so the residual is informative) but well
-        # before tau anneals to the hard floor. Cap the number of reseeds.
-        reseed_steps = (25, 60, 120)
-        if step not in reseed_steps:
-            return
-        if int(self._reseeds_done.item()) >= len(reseed_steps):
-            return
-
-        # Per-atom best non-negative scalar code and residual (same construction
-        # as the EM gate), so the collapse test sees the gate's own scores.
-        per_atom_recon = torch.einsum("nfk,fkd->nfd", curves, self.decoder_blocks)
-        denom = per_atom_recon.square().sum(dim=-1).clamp_min(1e-12)
-        code = ((per_atom_recon * x.unsqueeze(1)).sum(dim=-1) / denom).clamp_min(0.0)
-        resid = (
-            (code.unsqueeze(-1) * per_atom_recon - x.unsqueeze(1)) ** 2
-        ).sum(dim=-1)  # (N, F)
-        winner = resid.argmin(dim=1)  # (N,)
-
-        # Decoder Frobenius norms and per-atom win statistics.
-        dec_norm = self.decoder_blocks.reshape(F, -1).norm(dim=1)  # (F,)
-        median_norm = dec_norm.median().clamp_min(1e-12)
-        win_count = torch.bincount(winner, minlength=F).to(x.dtype)
-        # Mean residual over the rows each atom wins (inf if it wins nothing).
-        win_resid = torch.full((F,), float("inf"), dtype=x.dtype, device=x.device)
-        for k in range(F):
-            mask = winner == k
-            if bool(mask.any()):
-                win_resid[k] = resid[mask, k].mean()
-
-        collapse_floor = 0.25  # mirrors SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO scale
-        share = win_count / float(x.shape[0])
-        # An atom is collapsed if it barely wins any row OR its decoder norm has
-        # decayed far below the median (the closed-form collapse signature).
-        collapsed = (share < 0.10) | (dec_norm < collapse_floor * median_norm)
-        if not bool(collapsed.any()):
-            return
-
-        # Reseed every collapsed atom onto a distinct residual principal
-        # direction. The residual is what the *healthy* (non-collapsed) atoms
-        # leave: reconstruct with the current best code restricted to healthy
-        # winners, subtract from x.
-        healthy = ~collapsed
-        if not bool(healthy.any()):
-            return
-        # Residual left by the healthy atoms' current reconstruction of the rows
-        # they win; for rows won by collapsed atoms the residual is x itself
-        # (those rows are currently unexplained).
-        recon_best = torch.zeros_like(x)
-        for k in range(F):
-            if not bool(healthy[k]):
-                continue
-            mask = winner == k
-            if bool(mask.any()):
-                recon_best[mask] = code[mask, k : k + 1] * per_atom_recon[mask, k]
-        residual_data = x - recon_best  # (N, D)
-
-        # Principal directions of the residual (SVD of the centered residual).
-        rd = residual_data - residual_data.mean(dim=0, keepdim=True)
-        try:
-            _, _, vh = torch.linalg.svd(rd, full_matrices=False)
-        except Exception:
-            return
-        D = int(self.cfg.input_dim)
-        K = int(self.cfg.n_basis_per_atom)
-        collapsed_idx = [k for k in range(F) if bool(collapsed[k])]
-        # Build a curve target for each reseeded atom: a smooth one-cycle profile
-        # along its dominant residual PC. The decoder maps the K basis channels
-        # (curves) to R^D; seed the block so that, over the observed curve range,
-        # the reconstruction sweeps the leading residual PC. A simple, basis-
-        # agnostic seed: put the residual PC direction on the basis channel whose
-        # curve has the largest variance, scaled to the residual energy.
-        curve_var = curves.var(dim=0)  # (F, K)
-        rms = float(rd.norm() / max(1, rd.shape[0]) ** 0.5)
-        for slot, k in enumerate(collapsed_idx):
-            pc = vh[min(slot, vh.shape[0] - 1)]  # (D,)
-            kbest = int(curve_var[k].argmax().item())
-            new_block = torch.zeros(K, D, dtype=x.dtype, device=x.device)
-            # Spread the PC across the two highest-variance curve channels with
-            # opposite signs so the decoded curve genuinely *moves* along the PC
-            # as the latent phase varies (a constant block would collapse again).
-            order = torch.argsort(curve_var[k], descending=True)
-            c0 = int(order[0].item())
-            c1 = int(order[1].item()) if K > 1 else c0
-            scale = max(rms, 1e-3)
-            new_block[c0] = pc * scale
-            new_block[c1] = -pc * scale
-            self.decoder_blocks[k] = new_block
-            # Nudge the anchor so the reseeded atom starts from a fresh phase.
-            self.atom_raw_anchor[k] = self.atom_raw_anchor[k] + 0.5 * (slot + 1)
-
-        self._reseeds_done += 1
-
     def forward(self, x: torch.Tensor) -> ManifoldSAEOutput:
         if not isinstance(x, torch.Tensor):
             raise TypeError("ManifoldSAE forward expects a torch.Tensor")
@@ -1211,30 +1155,16 @@ class ManifoldSAE(nn.Module):
         amp = F_torch.softplus(amp_logits)
         if self.cfg.sparsity.kind == "softmax_topk":
             gate_pre = amp_logits
-            # Mid-training collapse-reseed (issue #1282). A balanced residual EM
-            # E-step keeps atom *usage* even, but from the near-symmetric random
-            # init gradient descent can still settle into expert collapse: one
-            # atom specializes to a manifold while the other becomes a
-            # garbage-collector blend equidistant to every row (great
-            # reconstruction R², chance routing). The closed-form lane cures the
-            # identical failure by detecting a collapsed atom and reseeding it
-            # onto a *distinct* residual principal subspace
-            # (``reseed_atoms_onto_distinct_residual_pcs``): once a healthy atom
-            # owns its manifold, that manifold's rows leave ~zero residual, so the
-            # dominant residual direction is the *other* manifold and the
-            # collapsed atom is forced onto it (matching pursuit). We port that
-            # here: during an early training window, if one atom is reconstructing
-            # the data far worse than the other, re-seed its decoder block onto
-            # the leading principal components of the current reconstruction
-            # residual. This is geometry-agnostic — it keys only on residual
-            # structure, never on input coordinate geometry — so it breaks the
-            # symmetry on the energy-degenerate circles too.
-            self._maybe_reseed_collapsed_atom(x, positions, curves)
-            per_atom_recon = torch.einsum(
-                "nfk,fkd->nfd", curves, self.decoder_blocks
-            )
+            # Issue #1282: break expert collapse with an early *committed*
+            # assignment window (see ``reconstruction_topk_gate``). Track the
+            # training step here so the gate knows whether it is inside the
+            # commitment window; only advance while training.
+            step = None
+            if self.training:
+                step = int(self._train_steps.item())
+                self._train_steps += 1
             assignments = self.sparsity.reconstruction_topk_gate(
-                x, per_atom_recon
+                x, per_atom_recon, step=step
             )
             z = assignments
         else:

@@ -2583,23 +2583,6 @@ impl<'d> SpatialJointContext<'d> {
                     // solve would pair XᵀWX(ψ_new) with the stale S(ψ_old).
                     && self.evaluator.supports_nfree_penalty_rekey()
                     && nfree_fast_path_revision.is_some()
-                    // #1264 SOUNDNESS PRECONDITION (restored): the n-free fast path
-                    // reads `XᵀWX(ψ)` from the Chebyshev `gram_at(ψ)` interpolant
-                    // (`PSI_GRAM_SPOT_RTOL=1e-10` relative), while the slow path forms
-                    // the EXACT assembled Gram. On production Duchon geometry the raw
-                    // Gram is near-singular (κ(G)≈1e15 MSI-measured), so even that
-                    // 1e-10 interpolation round-off amplifies through the penalized
-                    // solve to β̂rel≈1.7e-5 — 17× the issue's 1e-6 contract — i.e. the
-                    // skip MOVES the κ-optimum. The `82cf6049f` "stale-penalty-not-
-                    // stale-basis" theory was empirically refuted: the divergence
-                    // appears even at a ψ the witness ADMITS, so it is conditioning
-                    // amplification of the interpolated Gram, not a stale-basis leak.
-                    // Restore the `reduced_basis_equal` window (`covers_skip`) as a
-                    // skip precondition so the fast path fires ONLY where the reduced
-                    // basis is provably unchanged (in practice the interpolation nodes
-                    // / non-rotating sub-window), and falls to the exact slow path on
-                    // the rotating production geometry. Correctness over speed (#1264).
-                    && self.evaluator.psi_gram_tensor_covers_skip(psi)
         };
         if skip_design_realization {
             log::debug!(
@@ -2799,15 +2782,6 @@ impl<'d> SpatialJointContext<'d> {
                     // S(ψ_old) and mis-rank the line search.
                     && self.evaluator.supports_nfree_penalty_rekey()
                     && nfree_fast_path_revision.is_some()
-                    // #1264 SOUNDNESS PRECONDITION (restored): same conditioning
-                    // hazard as the eval_full gate — the cost-only probe's inner
-                    // Gaussian solve reads the Chebyshev-interpolated `gram_at(ψ)`,
-                    // and κ(G)≈1e15 on production Duchon geometry amplifies that
-                    // 1e-10 round-off into a moved κ-optimum (β̂rel≈1.7e-5 ≫ 1e-6,
-                    // MSI-measured at a witness-ADMITTED ψ). Gate on the
-                    // `reduced_basis_equal` window so the value probe re-realizes the
-                    // exact design across the rotation. See the eval_full gate.
-                    && self.evaluator.psi_gram_tensor_covers_skip(psi)
         };
         if !skip_value_realization && self.cache.ensure_theta(theta).is_err() {
             return f64::INFINITY;
