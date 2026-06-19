@@ -97,6 +97,7 @@ fn pc16_duchon_smooth(name: &str) -> SmoothTermSpec {
         basis: SmoothBasisSpec::Duchon {
             feature_cols: (0..LARGE_SCALE_SHAPE_PC_DIM).collect(),
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 24 },
                 length_scale: Some(1.0),
                 power: 8.0,

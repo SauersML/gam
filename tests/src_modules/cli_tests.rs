@@ -2669,6 +2669,7 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0],
                     spec: DuchonBasisSpec {
+                        radial_reparam: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                         length_scale: Some(1.0),
                         power: 1.0,
@@ -2689,6 +2690,7 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![1],
                     spec: DuchonBasisSpec {
+                        radial_reparam: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                         length_scale: Some(1.0),
                         power: 1.0,
@@ -2709,6 +2711,7 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![2],
                     spec: DuchonBasisSpec {
+                        radial_reparam: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                         length_scale: Some(1.0),
                         power: 1.0,
@@ -2844,6 +2847,7 @@ fn warns_for_linear_terms_overlappingwith_smoothvariables() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0, 1, 2],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     length_scale: Some(1.0),
                     power: 1.0,
@@ -2883,6 +2887,7 @@ fn warns_for_nested_smooth_terms_with_hierarchical_ownership() {
                 basis: SmoothBasisSpec::Duchon {
                     feature_cols: vec![0, 1],
                     spec: DuchonBasisSpec {
+                        radial_reparam: None,
                         center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                         length_scale: Some(1.0),
                         power: 1.0,

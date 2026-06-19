@@ -142,6 +142,7 @@ fn duchon_aniso_pc_spec(name: &str, pc_dim: usize, k_centers: usize) -> TermColl
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: (0..pc_dim).collect(),
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint {
                         num_centers: k_centers,
                     },

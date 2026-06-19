@@ -40,6 +40,7 @@ fn duchon_pc_term(name: &str, d: usize, centers: usize, power: usize) -> SmoothT
         basis: SmoothBasisSpec::Duchon {
             feature_cols: (0..d).collect(),
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 center_strategy: CenterStrategy::FarthestPoint {
                     num_centers: centers,
                 },

@@ -12,6 +12,7 @@ fn log_kappa_derivative_matrix_is_symmetric() {
     )
     .unwrap();
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
         length_scale: Some(1.2),

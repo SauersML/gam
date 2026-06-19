@@ -64,6 +64,7 @@ fn synthetic_data(n: usize, d: usize, seed: u64) -> Array2<f64> {
 /// The DEFAULT non-periodic Euclidean Duchon spec (the all-on Hilbert scale).
 fn default_duchon_spec(k: usize) -> DuchonBasisSpec {
     DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: k },
         periodic: None,
         length_scale: None,

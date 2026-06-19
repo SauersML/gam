@@ -1762,6 +1762,7 @@ fn duchon_basis_with_jet<'py>(
 
     let requested_nullspace = duchon_nullspace_from_m(m);
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
         length_scale: None,
         power: 0.0,
@@ -2259,6 +2260,7 @@ fn duchon_basis<'py>(
     // builder (cylinder/torus chord-distance polyharmonic).
     if any_periodic {
         let spec = DuchonBasisSpec {
+            radial_reparam: None,
             center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
             length_scale: spec_length_scale,
             power: spec_power,
@@ -2274,6 +2276,7 @@ fn duchon_basis<'py>(
         return Ok(built.design.to_dense().into_pyarray(py).unbind());
     }
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(ctrs.to_owned()),
         length_scale: spec_length_scale,
         power: spec_power,
@@ -2437,6 +2440,7 @@ fn duchon_function_norm_penalty<'py>(
     // builder (cylinder/torus chord-distance polyharmonic).
     if any_periodic {
         let spec = DuchonBasisSpec {
+            radial_reparam: None,
             center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
             length_scale: spec_length_scale,
             power: spec_power,
@@ -2474,6 +2478,7 @@ fn duchon_function_norm_penalty<'py>(
         return Ok(penalty.into_pyarray(py).unbind());
     }
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
         length_scale: spec_length_scale,
         power: spec_power,
@@ -5762,6 +5767,7 @@ fn build_latent_duchon_design(
         }
     });
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(center_matrix.clone()),
         length_scale: None,
         power: resolved_power as f64,

@@ -12,6 +12,7 @@ fn workspace_variant_matches_nonworkspace_result() {
     )
     .unwrap();
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
         length_scale: Some(1.3),

@@ -13,6 +13,7 @@ fn anisotropic_build_handles_dominant_axis_without_instability() {
     )
     .unwrap();
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
         length_scale: Some(1.0),

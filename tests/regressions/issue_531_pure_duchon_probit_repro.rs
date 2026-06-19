@@ -64,6 +64,7 @@ fn duchon_pc3(name: &str) -> SmoothTermSpec {
         basis: SmoothBasisSpec::Duchon {
             feature_cols: (1..4).collect(),
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
                 length_scale: None,
                 power: 0.0,

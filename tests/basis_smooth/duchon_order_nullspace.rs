@@ -86,6 +86,7 @@ fn duchon_spec(
     identifiability: SpatialIdentifiability,
 ) -> DuchonBasisSpec {
     DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: k },
         periodic: None,
         length_scale: None,

@@ -67,6 +67,7 @@ fn synthetic_data(n: usize, d: usize, seed: u64) -> Array2<f64> {
 /// the all-on behavior at build time.
 fn default_duchon_spec(k: usize, d: usize) -> DuchonBasisSpec {
     DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::FarthestPoint { num_centers: k },
         periodic: None,
         length_scale: None,

@@ -73,6 +73,7 @@ fn spec_1d(aniso: bool) -> TermCollectionSpec {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: vec![0],
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
                     periodic: None,
                     length_scale: Some(1.0),

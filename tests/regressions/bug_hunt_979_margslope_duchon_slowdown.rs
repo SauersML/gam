@@ -54,6 +54,7 @@ fn duchon2_smooth(name: &str, centers: usize) -> SmoothTermSpec {
         basis: SmoothBasisSpec::Duchon {
             feature_cols: vec![0, 1],
             spec: DuchonBasisSpec {
+                radial_reparam: None,
                 center_strategy: CenterStrategy::FarthestPoint {
                     num_centers: centers,
                 },

@@ -18,6 +18,7 @@ fn mixed_periodicity_auto_dispatch_matches_manual_path() {
     // exercises the supported pure case to assert the auto-vs-manual dispatch
     // equivalence it is named for.
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: Some(vec![Some(1.0), None]),
         length_scale: None,

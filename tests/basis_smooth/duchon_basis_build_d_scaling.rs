@@ -37,6 +37,7 @@ fn build_data(n: usize, d: usize) -> Array2<f64> {
 fn duchon_spec(d: usize) -> DuchonBasisSpec {
     let (nullspace_order, power) = duchon_cubic_default(d);
     DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: default_spatial_center_strategy(CENTERS, d),
         periodic: None,
         length_scale: None,

@@ -76,6 +76,7 @@ fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: Ducho
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 36 },
                     length_scale: None,
                     power: power as f64,
@@ -167,6 +168,7 @@ fn duchon_fit_term_collection_gaussian_simulated_10dwith_exact_adaptive_regulari
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 10 },
                     length_scale: None,
                     power: 2.0,
@@ -293,6 +295,7 @@ fn duchon_2d_aniso_gaussian_fits_successfully() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
                     // Hybrid Duchon (length_scale is Some) -- required for aniso.
                     length_scale: Some(1.0),
@@ -436,6 +439,7 @@ fn duchon_2d_aniso_binomial_fits_successfully() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 4 },
                     // Hybrid Duchon (length_scale is Some) -- required for aniso.
                     length_scale: Some(1.0),
@@ -578,6 +582,7 @@ fn duchon_2d_scale_dimensions_does_not_abort_on_clean_data_issue_382() {
             basis: SmoothBasisSpec::Duchon {
                 feature_cols: (0..d).collect(),
                 spec: DuchonBasisSpec {
+                    radial_reparam: None,
                     center_strategy: CenterStrategy::FarthestPoint { num_centers: 15 },
                     // Hybrid Duchon (length_scale is Some) — required for aniso.
                     length_scale: Some(1.0),

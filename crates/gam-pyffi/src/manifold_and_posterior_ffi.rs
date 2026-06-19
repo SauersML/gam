@@ -4157,6 +4157,7 @@ fn duchon_basis_1d_impl(
     let data = column_array(t);
     let center_matrix = column_array(centers);
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(center_matrix),
         periodic: None,
         length_scale: None,

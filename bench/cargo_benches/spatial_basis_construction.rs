@@ -40,6 +40,7 @@ fn bench_spatial_basis_construction(c: &mut Criterion) {
 
     c.bench_function("duchon_basis_design_kernel_large_nk", |b| {
         let spec = DuchonBasisSpec {
+            radial_reparam: None,
             center_strategy: CenterStrategy::UserProvided(centers.clone()),
             length_scale: Some(1.5),
             power: 2.0,

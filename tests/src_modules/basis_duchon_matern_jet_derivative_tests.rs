@@ -356,6 +356,7 @@ fn test_duchon_public_second_derivative_matchesfd_of_public_first_derivative() {
     let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
     let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
         length_scale: Some(0.9),
@@ -409,6 +410,7 @@ fn test_pure_duchon_default_tuple_rejects_insufficient_nullspace() {
     let data = array![[0.0, 0.1], [0.2, 0.0], [0.4, 0.2], [0.6, 0.4], [0.8, 0.5]];
     let centers = data.slice(s![0..4, ..]).to_owned();
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers),
         length_scale: None,
@@ -445,6 +447,7 @@ fn test_pure_duchon_default_counterexample_is_rejected() {
     );
 
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
         length_scale: None,

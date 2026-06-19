@@ -4926,6 +4926,7 @@ fn sae_build_duchon_atom(
     let dim = centers.ncols();
     let m: usize = sae_duchon_atom_m(dim);
     let spec = DuchonBasisSpec {
+        radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
         length_scale: None,
         power: 0.0,
