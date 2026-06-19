@@ -7,6 +7,15 @@ use approx::assert_relative_eq;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::array;
 
+/// Local scalar closeness assertion used throughout this module's exactness
+/// gates. Asserts `|lhs - rhs| <= tol`, reporting both operands on failure.
+fn assert_close(lhs: f64, rhs: f64, tol: f64, label: &str) {
+    assert!(
+        (lhs - rhs).abs() <= tol,
+        "{label} mismatch: lhs={lhs:.12e}, rhs={rhs:.12e}, tol={tol:.3e}"
+    );
+}
+
 /// `with_row_context` must splice `at row N` between the reason prefix and
 /// the `:` details separator so a scalar-kernel error reshapes into the
 /// canonical `<reason> at row N: <details>` that downstream consumers
