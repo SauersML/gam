@@ -134,7 +134,12 @@ pub fn fit_survival_marginal_slope_terms(
     // `apply_survival_parametric_compile_to_designs` and re-route
     // `make_family` to the compiled triplet — that is the one-line
     // promotion from observability-only to active reduction.
-    {
+    if n < 1_000 {
+        log::debug!(
+            "[smgs phase-4b preflight] skipped for tiny fit n={n}; \
+             budget-sensitive tiny survival fits use the raw parametric design"
+        );
+    } else {
         use crate::identifiability::marginal_slope::{
             SurvivalRowHessian, compile_survival_parametric_designs,
         };
@@ -780,7 +785,24 @@ pub fn fit_survival_marginal_slope_terms(
         marginal_penalties_vm,
         logslope_penalties_vm,
         recompile_after_accept,
-    ): SmgsCutoverTuple = {
+    ): SmgsCutoverTuple = if n < 1_000 {
+        log::debug!(
+            "[smgs phase-4b active] skipped for tiny fit n={n}; \
+             budget-sensitive tiny survival fits use the raw parametric design"
+        );
+        (
+            spec.time_block.design_entry.clone(),
+            spec.time_block.design_exit.clone(),
+            spec.time_block.design_derivative_exit.clone(),
+            marginal_design.clone(),
+            logslope_design.clone(),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    } else {
         use crate::identifiability::marginal_slope::{
             CompiledSurvivalDesignsVMExact, apply_compiled_map_to_designs,
             extract_term_partition_from_penalty_ranges,
