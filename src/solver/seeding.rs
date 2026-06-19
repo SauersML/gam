@@ -634,12 +634,36 @@ where
     }
 
     if n_smooths <= 6 {
-        let per_axis_shifts: [f64; 2] = [-3.0, 3.0];
+        // Per-axis refinement around the best isotropic point. The ±3 steps
+        // resolve a mild per-coordinate imbalance; the explicit saturation
+        // target (`bnds.1`, the over-smoothing upper bound) reaches the corner
+        // where ONE penalty is fully active while the others stay at the
+        // refined anchor. That asymmetric corner is the correct REML optimum
+        // for a double-penalty (Marra–Wood null-space shrinkage) smooth whose
+        // signal lives in one penalty's null space (gam#1266): the wiggliness
+        // penalty must saturate (its range block → 0 EDF) while the null-space
+        // ridge stays low (retain the supported trend). The isotropic grid only
+        // moves all coordinates together, so without a per-axis saturation
+        // probe this corner is unreachable and the outer EFS, started from the
+        // best diagonal seed, stalls at an under-penalized λ and inflates EDF.
+        // Probing it here is criterion-ranked — it is only adopted when it
+        // strictly lowers the true REML/LAML cost — so it can never displace a
+        // genuinely better interior optimum, and it leaves single-penalty and
+        // well-balanced fits byte-identical (the saturated candidate simply
+        // loses the comparison).
+        let saturation = clamp_to_bounds(bnds.1, bnds);
         for axis in 0..n_smooths {
             let anchor = best_seed.clone();
-            for &delta in &per_axis_shifts {
+            let mut targets = vec![
+                clamp_to_bounds(anchor[axis] - 3.0, bnds),
+                clamp_to_bounds(anchor[axis] + 3.0, bnds),
+            ];
+            if (anchor[axis] - saturation).abs() > 1e-9 {
+                targets.push(saturation);
+            }
+            for target in targets {
                 let mut candidate = anchor.clone();
-                candidate[axis] = clamp_to_bounds(anchor[axis] + delta, bnds);
+                candidate[axis] = target;
                 if let Some(c) = eval_cost(&candidate)
                     && c.is_finite()
                     && best_cost.map(|b| c < b).unwrap_or(true)

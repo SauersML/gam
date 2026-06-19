@@ -614,11 +614,29 @@ where
         let run_gaussian_anchored_prepass = gaussian_risk && weight_log_geom_mean.abs() > 1e-12;
         let prepass_seed: Option<Array1<f64>> = {
             let bnds = reml_seed_config.bounds;
-            let (lo, hi) = if bnds.0 <= bnds.1 {
+            let (lo, hi_seed) = if bnds.0 <= bnds.1 {
                 bnds
             } else {
                 (bnds.1, bnds.0)
             };
+            // The criterion-ranked prepass evaluates the TRUE REML/LAML cost, so
+            // it is safe — and necessary — to let it explore the full
+            // over-smoothing range the outer optimizer itself can reach
+            // (`RHO_BOUND`), not just the narrower default seed-placement band.
+            // A double-penalty (null-space-shrinkage) smooth on data living in
+            // one penalty's null space has its global REML optimum at a LARGE
+            // wiggliness λ (range block fully smoothed), often beyond the seed
+            // band; the cost surface also has a shallower local optimum at a
+            // moderate λ that leaves wiggle under-penalized (EDF inflated,
+            // gam#1266). If the prepass cannot seed past that local optimum, the
+            // outer EFS — which only takes cost-improving steps — relaxes back
+            // into it. Widening only the upper (over-smoothing) bound lets the
+            // prepass place the seed in the correct high-λ basin; the lower
+            // (under-smoothing) bound stays at the default so we never seed an
+            // overfit origin. The seed is still only adopted when it strictly
+            // lowers the REML cost, so well-balanced and single-penalty fits are
+            // unaffected.
+            let hi = hi_seed.max(crate::estimate::RHO_BOUND);
             // risk_shift is the default seed bias when no caller warm-start is given;
             // it is NOT applied on top of a caller-supplied heuristic_lambdas.
             let risk_shift: f64 = match reml_seed_config.risk_profile {
