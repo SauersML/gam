@@ -918,6 +918,114 @@ mod tests {
         assert_eq!(decision.reason, "constraints_present");
     }
 
+    /// Regression for the sparse-native vs dense REML λ-selection divergence
+    /// (#1266 class): the sparse-native reparam result MUST carry the same
+    /// penalty (with the `penalty_shrinkage_floor` ridge folded in) that the
+    /// engine's reported `log_det`/`det1` are the determinant of. Building the
+    /// sparse-native inner penalty from the bare λ-weighted canonical sum (the
+    /// old behaviour) dropped the shrinkage ridge, so the inner penalized
+    /// Hessian `H = XᵀWX + S` and the EDF were evaluated on `S_λ` while the REML
+    /// penalty-logdet term used `S_λ + shrinkage·P_range` — an internally
+    /// inconsistent objective that biased λ relative to the dense/Kronecker
+    /// backends.
+    ///
+    /// Asserts, with a deliberately large shrinkage floor so the effect is
+    /// unambiguous: (1) the result's penalty root and Gram are mutually
+    /// consistent (`Eᵀ E == s_transformed`), and (2) the penalty actually
+    /// carries the shrinkage ridge on the penalized direction (i.e. it is NOT
+    /// the bare λ-weighted sum) — so the inner solve is on the same penalty as
+    /// the reported `log_det`.
+    #[test]
+    pub(crate) fn sparse_native_reparam_folds_shrinkage_floor_into_penalty() {
+        use crate::construction::{
+            CanonicalPenalty, EngineDims, stable_reparameterization_engine_canonical,
+        };
+        use ndarray::array;
+
+        // p = 2 coefficients, a rank-1 penalty that penalizes the first
+        // coordinate only (root = [[1, 0]]). The second coordinate is the
+        // penalty null space.
+        let p = 2usize;
+        let root = array![[1.0, 0.0]];
+        let local = root.t().dot(&root);
+        let canonical = vec![CanonicalPenalty {
+            root: root.clone(),
+            col_range: 0..p,
+            total_dim: p,
+            nullity: 1,
+            local,
+            prior_mean: Array1::zeros(p),
+            positive_eigenvalues: Vec::new(),
+            op: None,
+        }];
+        let lambdas = [3.0f64];
+        // A large shrinkage floor so the ridge is clearly visible against the
+        // λ-weighted eigenvalue.
+        let shrinkage_floor = Some(1e-2);
+
+        let base = stable_reparameterization_engine_canonical(
+            &canonical,
+            &lambdas,
+            EngineDims::new(p, canonical.len()),
+            None,
+            shrinkage_floor,
+        )
+        .expect("engine should succeed for a well-formed rank-1 penalty");
+
+        // The shrinkage ridge must be non-zero for this fixture (otherwise the
+        // test would not exercise the regression).
+        assert!(
+            base.penalty_shrinkage_ridge > 0.0,
+            "fixture must trigger a non-zero shrinkage ridge, got {}",
+            base.penalty_shrinkage_ridge
+        );
+
+        let result = super::loop_driver::build_sparse_native_reparam_result(
+            base.clone(),
+            &canonical,
+            &lambdas,
+            p,
+        );
+
+        // (0) sparse-native always reports identity Qs.
+        assert_eq!(result.qs, Array2::<f64>::eye(p));
+
+        // (1) Root/Gram consistency: EᵀE == s_transformed. This is what makes
+        // the augmented EDF solve and the inner penalized Hessian live on one
+        // penalty.
+        let gram = result.e_transformed.t().dot(&result.e_transformed);
+        for i in 0..p {
+            for j in 0..p {
+                assert_relative_eq!(
+                    gram[[i, j]],
+                    result.s_transformed[[i, j]],
+                    epsilon = 1e-9
+                );
+            }
+        }
+
+        // (2) The penalty carries the shrinkage ridge on the penalized
+        // direction: s_transformed[0,0] == λ·1 + shrinkage_ridge (NOT the bare
+        // λ = 3.0 the old code produced).
+        let bare = lambdas[0]; // λ · root²  on the penalized coordinate
+        assert!(
+            result.s_transformed[[0, 0]] > bare + 0.5 * base.penalty_shrinkage_ridge,
+            "penalized direction must include the shrinkage ridge: \
+             s[0,0]={} should exceed bare λ={} by ~ridge={}",
+            result.s_transformed[[0, 0]],
+            bare,
+            base.penalty_shrinkage_ridge
+        );
+        assert_relative_eq!(
+            result.s_transformed[[0, 0]],
+            bare + base.penalty_shrinkage_ridge,
+            epsilon = 1e-9
+        );
+
+        // The null-space coordinate stays unpenalized (no spurious ridge there).
+        assert_relative_eq!(result.s_transformed[[1, 1]], 0.0, epsilon = 1e-9);
+    }
+
     #[test]
     pub(crate) fn sparse_penalized_assembly_matches_dense_diagonal_case() {
         let triplets = vec![
