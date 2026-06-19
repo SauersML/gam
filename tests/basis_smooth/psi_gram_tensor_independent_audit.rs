@@ -498,9 +498,9 @@ fn fd_oracle_self_convergence_floor_grows_with_window_width() {
             psi_lo,
             psi_hi,
         ) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("[fd-floor] half={half:.2}: tensor build refused: {e}");
+            Some(t) => t,
+            None => {
+                eprintln!("[fd-floor] half={half:.2}: tensor build refused");
                 continue;
             }
         };
