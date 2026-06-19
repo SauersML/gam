@@ -737,23 +737,6 @@ pub(crate) fn thin_plate_radial_reparam_from_constrained_penalty(
             *value = 0.0;
         }
     }
-    if let Some(path) = std::env::var_os("DIAG1271_FULL") {
-        use std::io::Write as _;
-        let mut sorted: Vec<f64> = evals.iter().copied().collect();
-        sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-        let line = format!(
-            "[DIAG1271_FULL] n_evals={} full_radial_eigvals(desc)={:?}\n",
-            sorted.len(),
-            sorted.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>()
-        );
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = f.write_all(line.as_bytes());
-        }
-    }
     let keep = thin_plate_retained_radial_indices(&evals);
     Ok((evecs.select(Axis(1), &keep), evals.select(Axis(0), &keep)))
 }
