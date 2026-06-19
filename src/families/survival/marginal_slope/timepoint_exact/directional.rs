@@ -562,13 +562,7 @@ impl SurvivalMarginalSlopeFamily {
 
         let mut tau_dir = Array1::<f64>::zeros(p);
         let mut tau_a_dir = Array1::<f64>::zeros(p);
-        let mut rho_dir = Array1::<f64>::zeros(p);
         for u in 0..p {
-            let fixed_rho_dir =
-                g_jet.param_directional_from_b_family(g_jet.b_first, u, dir, COEFF_SUPPORT_GHW);
-            rho_dir[u] = eval_coeff4_at(&g_jet.a_first[u], z_obs) * a_dir
-                + eval_coeff4_at(&fixed_rho_dir, z_obs);
-
             let fixed_tau_dir =
                 g_jet.param_directional_from_b_family(g_jet.ab_first, u, dir, COEFF_SUPPORT_GW);
             tau_dir[u] = eval_coeff4_at(&g_jet.aa_first[u], z_obs) * a_dir
@@ -580,23 +574,39 @@ impl SurvivalMarginalSlopeFamily {
                 + eval_coeff4_at(&fixed_tau_a_dir, z_obs);
         }
 
-        let mut eta_u_dir = Array1::<f64>::zeros(p);
-        let mut chi_u_dir = Array1::<f64>::zeros(p);
-        for u in 0..p {
-            eta_u_dir[u] = chi_dir * a_u[u] + chi_val * a_u_dir[u] + rho_dir[u];
-            chi_u_dir[u] = eta_aa_dir * a_u[u] + eta_aa * a_u_dir[u] + tau_a_dir[u];
-        }
-
+        let mut eta_uv = Array2::<f64>::zeros((p, p));
+        let mut chi_uv = Array2::<f64>::zeros((p, p));
         let mut eta_uv_dir = Array2::<f64>::zeros((p, p));
         let mut chi_uv_dir = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
+                let r_uv = self.observed_fixed_eta_second_partial(
+                    primary, &obs, row, u, v, z_obs, u_obs, a, b,
+                )?;
+                let chi_uv_fixed = self
+                    .observed_fixed_chi_second_partial(primary, &obs, u, v, z_obs, u_obs, a, b)?;
                 let r_uv_dir = self.observed_fixed_eta_second_partial_dir(
                     primary, &obs, u, v, z_obs, u_obs, a, b, a_dir, dir, beta_w,
                 )?;
                 let chi_uv_fixed_dir = self.observed_fixed_chi_second_partial_dir(
                     primary, u, v, z_obs, u_obs, a_dir, dir,
                 )?;
+
+                let eta_base = chi_val * a_uv[[u, v]]
+                    + eta_aa * a_u[u] * a_u[v]
+                    + tau[u] * a_u[v]
+                    + tau[v] * a_u[u]
+                    + r_uv;
+                eta_uv[[u, v]] = eta_base;
+                eta_uv[[v, u]] = eta_base;
+
+                let chi_base = eta_aa * a_uv[[u, v]]
+                    + eta_aaa * a_u[u] * a_u[v]
+                    + tau_a[u] * a_u[v]
+                    + tau_a[v] * a_u[u]
+                    + chi_uv_fixed;
+                chi_uv[[u, v]] = chi_base;
+                chi_uv[[v, u]] = chi_base;
 
                 let eta_val = chi_dir * a_uv[[u, v]]
                     + chi_val * a_uv_dir[[u, v]]
@@ -623,6 +633,8 @@ impl SurvivalMarginalSlopeFamily {
                 chi_uv_dir[[v, u]] = chi_v;
             }
         }
+        let eta_u_dir = eta_uv.dot(dir);
+        let chi_u_dir = chi_uv.dot(dir);
 
         // D_u_dir: directional derivative of the density normalization first derivative.
         let d_u_dir_cell_accums = cached
