@@ -1753,8 +1753,13 @@ fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
     let stale_seed = array![0.0, 0.0];
     guard.observe_seed(&stale_seed, 1.0, 2.0);
 
+    // Genuine near-separable case: the REML criterion decreases monotonically
+    // toward the λ→0 lower bound, so the bound probe carries a cost AT OR BELOW
+    // the seed. It is the certificate-bearing optimum and must be published with
+    // a converged verdict — superseding the (non-stationary, higher raw-cost)
+    // seed.
     let boundary_probe = array![-10.0, -10.0];
-    let verdict = guard.observe_constrained_stationary(&boundary_probe, 1.25, 0.0);
+    let verdict = guard.observe_constrained_stationary(&boundary_probe, 0.5, 0.0);
     assert!(
         matches!(verdict, CostStallVerdict::Converged),
         "a finite constrained-stationary separation probe should halt immediately"
@@ -1769,9 +1774,67 @@ fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
         published.rho, boundary_probe,
         "publish the KKT-certified boundary probe, not the older raw-cost best"
     );
-    assert_eq!(published.value, 1.25);
+    assert_eq!(published.value, 0.5);
     assert_eq!(published.grad_norm, 0.0);
     assert!(published.converged);
+}
+
+/// #1355 regression: a constrained-stationary (lower-bound separation) probe
+/// that REGRESSES materially on the best feasible iterate must NOT be adopted.
+///
+/// For a multi-penalty RKHS smooth (duchon/matern) an over-smoothing collapse
+/// corner — some operator penalties railed at the λ→0 lower bound, OTHERS railed
+/// at the λ→∞ upper bound shrinking the fit to a bare constant — passes the
+/// `lower_bound_outward_active_count` separation test yet has a REML cost far
+/// worse than the interior optimum the optimizer already found (typically the
+/// grid-prepass seed). Adopting it published a degenerate EDF≈1 constant fit.
+/// The guard must keep the strictly-better incumbent instead.
+#[test]
+fn constrained_stationary_probe_does_not_discard_better_incumbent() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
+    // A good interior fit (the prepass seed): low cost, but still has a residual
+    // outer gradient (not yet certified stationary).
+    let good_seed = array![3.0, 30.0, 3.0, 3.0];
+    guard.observe_seed(&good_seed, -231.86, 18.4);
+
+    // The collapse corner: two axes pinned at the λ→0 lower bound (looks like a
+    // separation probe) while two more rail at λ→∞; its cost is hundreds of
+    // units WORSE than the incumbent.
+    let collapse_corner = array![30.0, 29.95, -30.0, -30.0];
+    let verdict = guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0);
+
+    // The probe regresses, so the guard must NOT halt-and-publish it as the
+    // optimum on this single observation; it folds in as an ordinary
+    // non-improving step (the window has not yet filled).
+    assert!(
+        matches!(verdict, CostStallVerdict::Continue),
+        "a constrained-stationary probe that regresses the incumbent must not be \
+         adopted as the optimum"
+    );
+    assert!(
+        exit.lock().unwrap().is_none(),
+        "no exit should be published while the better incumbent is retained"
+    );
+
+    // Driving the no-improvement window to its limit halts on the GOOD
+    // incumbent, never on the collapse corner.
+    let _ = guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0);
+    let final_verdict = guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0);
+    assert!(
+        !matches!(final_verdict, CostStallVerdict::Continue),
+        "the stall window should eventually fill and halt"
+    );
+    let published = exit
+        .lock()
+        .unwrap()
+        .take()
+        .expect("incumbent best published on stall");
+    assert_eq!(
+        published.rho, good_seed,
+        "halt back to the good interior incumbent, not the collapse corner"
+    );
+    assert_eq!(published.value, -231.86);
 }
 
 #[test]

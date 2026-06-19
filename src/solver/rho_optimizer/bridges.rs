@@ -380,6 +380,30 @@ impl CostStallGuard {
         if !value.is_finite() {
             return CostStallVerdict::Continue;
         }
+        // A lower-bound separation probe is the certificate-bearing optimum ONLY
+        // when it does not REGRESS the best feasible iterate already seen. In the
+        // genuine near-separable case (#1082/#1237) the criterion decreases
+        // monotonically toward the λ→0 bound, so the probe carries the lowest
+        // cost and this guard is a no-op. But the SAME local test
+        // (`lower_bound_outward_active_count`) also fires at an over-smoothing
+        // collapse corner of a multi-penalty RKHS smooth (duchon/matern, #1355):
+        // there a couple of operator penalties rail at the λ→0 LOWER bound (so
+        // they look "separation-stationary") while OTHER penalties rail at the
+        // λ→∞ UPPER bound and shrink the fit to a bare constant. Such a corner is
+        // a spurious local KKT point whose REML cost is far WORSE than the
+        // interior optimum the optimizer already passed through (commonly the
+        // grid-prepass seed). Unconditionally adopting it discards that better
+        // iterate and publishes a degenerate EDF≈1 constant fit. Only adopt the
+        // probe when it does not regress the incumbent best.
+        let regresses = self.best_value.is_finite()
+            && value > self.best_value + self.rel_tol * (1.0 + self.best_value.abs());
+        if regresses {
+            // Spurious corner: keep the better incumbent. Fold the probe in as an
+            // ordinary (non-improving) observation so `best_rho`/`best_grad_norm`
+            // are preserved and the stall logic halts back to that incumbent
+            // rather than to this corner.
+            return self.observe(rho, value, grad_norm);
+        }
         self.infeasible_streak = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
         self.best_value = value;
