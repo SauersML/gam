@@ -794,6 +794,22 @@ where
                 accepted_rho.fill(val);
             }
         }
+        if std::env::var_os("DIAG1347_COSTGRID").is_some() {
+            // gam REML cost over a grid of axis-0 (radial) rho, holding the other
+            // axes at the accepted optimum. Reveals where gam's REML truly minimizes.
+            let base = accepted_rho.clone();
+            let mut line = String::from("[DIAG1347_COSTGRID] axis0 rho->cost:");
+            for r0 in [3.0, 5.0, 7.0, 9.0, 11.0, 13.0, 15.0] {
+                let mut probe = base.clone();
+                if !probe.is_empty() {
+                    probe[0] = r0;
+                }
+                let c = reml_state.compute_cost(&probe).unwrap_or(f64::NAN);
+                line.push_str(&format!(" {r0}={c:.4}"));
+            }
+            eprintln!("{line}");
+            eprintln!("[DIAG1347_COSTGRID] accepted_rho={:?}", accepted_rho.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>());
+        }
         (
             accepted_rho,
             cfg.link_kind.mixture_state().cloned(),
