@@ -523,7 +523,9 @@ impl PsiGramTensor {
         eval_design: &mut impl FnMut(f64) -> Result<Array2<f64>, String>,
         weights: ArrayView1<'_, f64>,
     ) {
-        let span = self.psi_hi - self.psi_lo;
+        let psi_lo = self.psi_lo;
+        let psi_hi = self.psi_hi;
+        let span = psi_hi - psi_lo;
         if !(span.is_finite() && span > 0.0) {
             self.grad_psi_lo = f64::NAN;
             self.grad_psi_hi = f64::NAN;
@@ -548,20 +550,20 @@ impl PsiGramTensor {
                 }
                 Some(design.t().dot(&wd))
             };
-            if psi - 2.0 * h >= self.psi_lo && psi + 2.0 * h <= self.psi_hi {
+            if psi - 2.0 * h >= psi_lo && psi + 2.0 * h <= psi_hi {
                 let g_m2 = weighted_gram(psi - 2.0 * h, eval)?;
                 let g_m1 = weighted_gram(psi - h, eval)?;
                 let g_p1 = weighted_gram(psi + h, eval)?;
                 let g_p2 = weighted_gram(psi + 2.0 * h, eval)?;
                 Some((g_m2 - 8.0 * &g_m1 + 8.0 * &g_p1 - g_p2) / (12.0 * h))
-            } else if psi + 4.0 * h <= self.psi_hi {
+            } else if psi + 4.0 * h <= psi_hi {
                 let g0 = weighted_gram(psi, eval)?;
                 let g1 = weighted_gram(psi + h, eval)?;
                 let g2 = weighted_gram(psi + 2.0 * h, eval)?;
                 let g3 = weighted_gram(psi + 3.0 * h, eval)?;
                 let g4 = weighted_gram(psi + 4.0 * h, eval)?;
                 Some((-25.0 * &g0 + 48.0 * &g1 - 36.0 * &g2 + 16.0 * &g3 - 3.0 * &g4) / (12.0 * h))
-            } else if psi - 4.0 * h >= self.psi_lo {
+            } else if psi - 4.0 * h >= psi_lo {
                 let g0 = weighted_gram(psi, eval)?;
                 let g1 = weighted_gram(psi - h, eval)?;
                 let g2 = weighted_gram(psi - 2.0 * h, eval)?;
@@ -642,15 +644,15 @@ impl PsiGramTensor {
         // sufficient-statistic kappa search on a partial gradient lane.
         let n = PSI_GRAM_GRAD_SCAN_POINTS;
         for i in 0..=n {
-            let psi = self.psi_lo + span * (i as f64) / (n as f64);
+            let psi = psi_lo + span * (i as f64) / (n as f64);
             if !certifies(self, psi, eval_design) {
                 self.grad_psi_lo = f64::NAN;
                 self.grad_psi_hi = f64::NAN;
                 return;
             }
         }
-        self.grad_psi_lo = self.psi_lo;
-        self.grad_psi_hi = self.psi_hi;
+        self.grad_psi_lo = psi_lo;
+        self.grad_psi_hi = psi_hi;
     }
 
     /// Locate the design-realization skip sub-window `[skip_psi_lo,
