@@ -129,8 +129,8 @@ def test_softmax_top1_routes_energy_degenerate_signed_circles() -> None:
     # Seed 7 previously bypassed the transferable quadratic split through a
     # noisy but "confident" line-clustering anchor and collapsed to ~0.79 routing.
     torch.manual_seed(7)
-    train, train_truth = _two_energy_degenerate_sign_coupled_circles(256, seed=12820)
-    test, test_truth = _two_energy_degenerate_sign_coupled_circles(128, seed=12821)
+    train, train_truth = _two_energy_degenerate_sign_coupled_circles(256, seed=7)
+    test, test_truth = _two_energy_degenerate_sign_coupled_circles(128, seed=8)
 
     cfg = gt.ManifoldSAEConfig(
         input_dim=4,
