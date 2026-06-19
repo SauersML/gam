@@ -747,6 +747,45 @@ pub(crate) fn scatter_joint_active_set(
     per_block
 }
 
+pub(crate) fn augment_active_sets_with_tight_constraint_rows(
+    block_active_sets: &mut Vec<Option<Vec<usize>>>,
+    block_constraints: &[Option<LinearInequalityConstraints>],
+    states: &[ParameterBlockState],
+    slack_tol: f64,
+) -> usize {
+    if block_active_sets.len() != block_constraints.len() {
+        block_active_sets.resize(block_constraints.len(), None);
+    }
+    let mut added = 0usize;
+    let tol = slack_tol.max(0.0);
+    for (b, constraints_opt) in block_constraints.iter().enumerate() {
+        let Some(constraints) = constraints_opt else {
+            continue;
+        };
+        let Some(state) = states.get(b) else {
+            continue;
+        };
+        if constraints.a.ncols() != state.beta.len() {
+            continue;
+        }
+        let active = block_active_sets[b].get_or_insert_with(Vec::new);
+        for row in 0..constraints.a.nrows() {
+            let slack = constraints.a.row(row).dot(&state.beta) - constraints.b[row];
+            if slack.is_finite() && slack <= tol && !active.contains(&row) {
+                active.push(row);
+                added += 1;
+            }
+        }
+        if active.is_empty() {
+            block_active_sets[b] = None;
+        } else {
+            active.sort_unstable();
+            active.dedup();
+        }
+    }
+    added
+}
+
 /// Assemble the **active rows** of the joint linear inequality constraint
 /// matrix into a single `(k_active × total_p)` block, suitable for the
 /// unified evaluator's constraint-aware kernel.

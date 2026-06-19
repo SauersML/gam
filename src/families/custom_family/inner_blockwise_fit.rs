@@ -2717,6 +2717,18 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         cached_active_sets =
                             scatter_joint_active_set(joint_active_set, &block_constraints);
                     }
+                    let tight_rows_added = augment_active_sets_with_tight_constraint_rows(
+                        &mut cached_active_sets,
+                        &block_constraints,
+                        &states,
+                        crate::solver::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
+                    );
+                    if tight_rows_added > 0 {
+                        log::info!(
+                            "[PIRLS/joint-Newton] added {tight_rows_added} tight constraint row(s) \
+                             to the cached active set after accepted constrained step"
+                        );
+                    }
                     last_joint_math = Some(joint_math);
                     last_accepted_hit_joint_trust_boundary = step_hit_trust_boundary;
                     accepted = true;
