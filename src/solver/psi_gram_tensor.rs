@@ -185,10 +185,11 @@ pub struct PsiGramTensor {
 }
 
 /// One ladder rung's outcome: a hard evaluation failure aborts the whole
-/// build (no larger rung can fix a non-finite design), an uncertified tail
-/// escalates to the next rung, and a candidate proceeds to the spot check.
+/// build (no larger rung can fix a non-finite design) and carries the reason,
+/// an uncertified tail escalates to the next rung, and a candidate proceeds to
+/// the spot check.
 enum BuildOutcome {
-    EvalFailed,
+    EvalFailed(String),
     TailNotCertified,
     Candidate(PsiGramTensor),
 }
@@ -303,19 +304,34 @@ impl PsiGramTensor {
         z: ArrayView1<'_, f64>,
         psi_lo: f64,
         psi_hi: f64,
-    ) -> Option<Self> {
+    ) -> Result<Self, String> {
         if !(psi_lo.is_finite() && psi_hi.is_finite()) || psi_hi <= psi_lo {
-            return None;
+            return Err(format!(
+                "ψ window must be finite with psi_hi > psi_lo (got [{psi_lo}, {psi_hi}])"
+            ));
         }
+        // Track the largest rung that produced a candidate but failed to
+        // certify (tail or off-node spot check). If the whole ladder is
+        // exhausted without an accepted candidate this drives a reason that
+        // distinguishes "not analytic enough in ψ" from "evaluation failed".
+        let mut last_uncertified: Option<usize> = None;
         for &m in PSI_GRAM_NODE_LADDER.iter() {
             match Self::build_at(&mut eval_design, weights, z, psi_lo, psi_hi, m) {
                 // An exact evaluation failed or was non-finite somewhere in
-                // the window — no larger rung can fix that.
-                BuildOutcome::EvalFailed => return None,
+                // the window — no larger rung can fix that, so abort with the
+                // underlying reason rather than swallowing it as a bare refusal.
+                BuildOutcome::EvalFailed(why) => {
+                    return Err(format!(
+                        "exact design evaluation failed at ladder rung m={m}: {why}"
+                    ));
+                }
                 // Tail not yet below the certificate at this rung: escalate.
                 // (Conflating this with EvalFailed would kill the ladder at
                 // its first — intentionally coarse — rung.)
-                BuildOutcome::TailNotCertified => continue,
+                BuildOutcome::TailNotCertified => {
+                    last_uncertified = Some(m);
+                    continue;
+                }
                 BuildOutcome::Candidate(mut candidate) => {
                     if candidate.spot_check(&mut eval_design, weights) {
                         // Certify the gradient lane over the full optimizer
@@ -325,12 +341,25 @@ impl PsiGramTensor {
                         // Narrow the design-revision skip lane to the
                         // reduced-basis-equality interior (#1264).
                         candidate.compute_skip_window();
-                        return Some(candidate);
+                        return Ok(candidate);
                     }
+                    // The assembled Gram disagreed with an exact off-node
+                    // rebuild at this rung; a denser rung may still certify, so
+                    // escalate rather than abort.
+                    last_uncertified = Some(m);
                 }
             }
         }
-        None
+        let top_rung = PSI_GRAM_NODE_LADDER.last().copied().unwrap_or(0);
+        Err(match last_uncertified {
+            Some(m) => format!(
+                "Chebyshev series did not certify within the node ladder (reached rung \
+                 m={m}, top rung {top_rung}): the design is not analytic enough in ψ over \
+                 [{psi_lo}, {psi_hi}] (a kink or non-finite curvature), so the n-free \
+                 tensor is refused and the exact per-trial path must be used"
+            ),
+            None => "empty Chebyshev node ladder".to_string(),
+        })
     }
 
     fn build_at(
@@ -348,22 +377,33 @@ impl PsiGramTensor {
             let x = (std::f64::consts::PI * (2 * i + 1) as f64 / (2 * m) as f64).cos();
             *x_slot = x;
             let psi = 0.5 * (psi_lo + psi_hi) + 0.5 * (psi_hi - psi_lo) * x;
-            let Ok(design) = eval_design(psi) else {
-                return BuildOutcome::EvalFailed;
+            let design = match eval_design(psi) {
+                Ok(design) => design,
+                Err(why) => {
+                    return BuildOutcome::EvalFailed(format!(
+                        "design evaluation refused at node ψ={psi:.6}: {why}"
+                    ));
+                }
             };
             if design.iter().any(|v| !v.is_finite()) {
-                return BuildOutcome::EvalFailed;
+                return BuildOutcome::EvalFailed(format!(
+                    "design at node ψ={psi:.6} contains a non-finite entry"
+                ));
             }
             designs.push(design);
         }
         let (n, k) = designs[0].dim();
-        if designs.iter().any(|d| d.dim() != (n, k))
-            || weights.len() != n
-            || z.len() != n
-            || n == 0
-            || k == 0
-        {
-            return BuildOutcome::EvalFailed;
+        if designs.iter().any(|d| d.dim() != (n, k)) {
+            return BuildOutcome::EvalFailed(format!(
+                "design dimensions vary across ψ nodes (first node is {n}×{k})"
+            ));
+        }
+        if weights.len() != n || z.len() != n || n == 0 || k == 0 {
+            return BuildOutcome::EvalFailed(format!(
+                "incompatible build inputs: design {n}×{k}, weights.len()={}, z.len()={}",
+                weights.len(),
+                z.len()
+            ));
         }
         // First-kind discrete orthogonality: coefficient slabs
         //   X_d = (γ_d / m) Σ_i X(ψ_i) T_d(x_i),  γ_0 = 1, γ_d = 2.
@@ -1498,7 +1538,7 @@ mod tests {
             1.0,
         );
         assert!(
-            tensor.is_none(),
+            tensor.is_err(),
             "kinked design must fail the tail-decay/spot-check certificates"
         );
     }

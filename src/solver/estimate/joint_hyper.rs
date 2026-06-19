@@ -405,12 +405,19 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             psi_hi,
         );
         match tensor {
-            Some(tensor) => {
+            Ok(tensor) => {
                 self.psi_gram_tensor = Some(std::sync::Arc::new(tensor));
                 self.psi_gram_anchor_correction = None;
                 true
             }
-            None => false,
+            Err(why) => {
+                // The n-free ψ-Gram tensor declined to attach; the caller falls
+                // back to the exact per-trial design path. Record WHY so the
+                // fast-path coverage (#1264/#1216) is diagnosable instead of a
+                // silent non-attachment.
+                log::debug!("ψ-Gram tensor not attached over [{psi_lo}, {psi_hi}]: {why}");
+                false
+            }
         }
     }
 

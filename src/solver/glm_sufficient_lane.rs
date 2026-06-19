@@ -197,7 +197,8 @@ impl FrozenWeightGramTensor {
             weighted_z.view(),
             psi_lo,
             psi_hi,
-        )?;
+        )
+        .ok()?;
         Some(Self {
             inner,
             frozen_w: frozen_w.to_owned(),
