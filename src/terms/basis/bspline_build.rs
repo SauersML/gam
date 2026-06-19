@@ -1190,15 +1190,7 @@ pub(crate) struct PsdSpectralSummary {
 }
 
 pub(crate) fn symmetrize_penalty(penalty: &Array2<f64>) -> Array2<f64> {
-    let mut sym = penalty.clone();
-    for i in 0..sym.nrows() {
-        for j in 0..i {
-            let v = 0.5 * (sym[[i, j]] + sym[[j, i]]);
-            sym[[i, j]] = v;
-            sym[[j, i]] = v;
-        }
-    }
-    sym
+    crate::matrix::symmetrize(penalty)
 }
 
 /// Project a (nearly-)symmetric matrix to the PSD cone by clamping

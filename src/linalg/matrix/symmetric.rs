@@ -326,6 +326,14 @@ pub fn symmetrize_in_place(matrix: &mut Array2<f64>) {
     }
 }
 
+/// Allocating variant of [`symmetrize_in_place`]: return `0.5 * (M + Mᵀ)`.
+///
+/// Same canonical "average the transpose" cleanup, returning a fresh matrix
+/// for callers that must keep the original intact.
+pub fn symmetrize(matrix: &Array2<f64>) -> Array2<f64> {
+    (matrix + &matrix.t()) * 0.5
+}
+
 /// PSD-precondition Gram: `XᵀWX` with `w ≥ 0`.
 ///
 /// Use for Fisher-scoring / canonical-link IRLS, where the working weights are

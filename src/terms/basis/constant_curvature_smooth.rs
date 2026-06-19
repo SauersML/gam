@@ -687,7 +687,7 @@ pub fn build_constant_curvature_basis(
 /// the symmetric kernel Gram; the κ-derivative blocks inherit the same exact
 /// symmetrization the value path applies before normalization).
 pub(crate) fn symmetrize(m: &Array2<f64>) -> Array2<f64> {
-    (m + &m.t()) * 0.5
+    crate::matrix::symmetrize(m)
 }
 
 /// Map a single primary-penalty κ-derivative onto the active penalty list by

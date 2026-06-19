@@ -1623,7 +1623,7 @@ pub(crate) fn transform_closed_form_raw_block(
 }
 
 pub(crate) fn symmetrize(matrix: &Array2<f64>) -> Array2<f64> {
-    (matrix + &matrix.t().to_owned()) * 0.5
+    crate::matrix::symmetrize(matrix)
 }
 
 /// Centered design Gram: `(D − 1 μ')^T (D − 1 μ')` where `μ_j` is the
