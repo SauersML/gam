@@ -1132,8 +1132,21 @@ pub(crate) fn build_duchon_design_psi_derivativeswithworkspace(
     let s_order = spec.power_as_usize();
     let kappa = 1.0 / length_scale;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
-    let z_kernel =
+    let mut z_kernel =
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
+    // #1355: fold the frozen data-metric reparam `Z' = Z·V` so the design
+    // ψ-derivatives assemble in the SAME rotated radial basis as the forward
+    // design and penalty (bit-consistent nonlinear/hybrid Duchon arm).
+    if let Some(v) = spec.radial_reparam.as_ref() {
+        if v.nrows() != z_kernel.ncols() {
+            crate::bail_dim_basis!(
+                "Duchon frozen radial reparam shape {:?} does not match constrained kernel dimension {}",
+                v.dim(),
+                z_kernel.ncols()
+            );
+        }
+        z_kernel = fast_ab(&z_kernel, v);
+    }
     let poly_cols = polynomial_block_from_order(data, effective_nullspace_order).ncols();
     let p_padded = z_kernel.ncols() + poly_cols;
     if let Some(zf) = identifiability_transform
@@ -1437,6 +1450,7 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
     power: f64,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
+    radial_reparam: Option<&Array2<f64>>,
     workspace: &mut BasisWorkspace,
 ) -> Result<DuchonBasisDesign, BasisError> {
     let n = data.nrows();
@@ -1481,7 +1495,24 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
     // Z spans null(Q^T), where Q contains polynomial side conditions at centers.
     // Reparameterizing alpha = Z gamma enforces conditional-PD constraints once
     // and yields free-parameter penalty gamma^T (Z^T K_CC Z) gamma.
-    let z = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
+    let z_raw = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
+    // #1355: fold the frozen data-metric radial reparameterization `V` into the
+    // constrained kernel transform (`Z' = Z·V`) so the realized design columns
+    // `K·Z·V` rotate into the `G_c`-orthonormal generalized eigenbasis. Applied
+    // here identically to the penalty assembly keeps design and penalty
+    // bit-consistent at fit, predict, and κ-trial time.
+    let z = if let Some(v) = radial_reparam {
+        if v.nrows() != z_raw.ncols() {
+            crate::bail_dim_basis!(
+                "Duchon radial reparam shape {:?} does not match constrained kernel dimension {}",
+                v.dim(),
+                z_raw.ncols()
+            );
+        }
+        fast_ab(&z_raw, v)
+    } else {
+        z_raw
+    };
 
     let coeffs = length_scale.map(|ls| {
         duchon_partial_fraction_coeffs(
@@ -1790,6 +1821,7 @@ pub(crate) fn build_cyclic_duchon_basis_1dwithworkspace(
             input_scales: None,
             aniso_log_scales: None,
             operator_collocation_points: None,
+            radial_reparam: None,
         },
         kronecker_factored: None,
         ops,

@@ -200,7 +200,7 @@ fn build_duchon_basis_uncached(
         spec.power
     };
     validate_duchon_kernel_orders(spec.length_scale, p_order, validation_power, data.ncols())?;
-    let kernel_transform = kernel_constraint_nullspace(
+    let mut kernel_transform = kernel_constraint_nullspace(
         centers.view(),
         effective_nullspace_order,
         &mut workspace.cache,
@@ -209,6 +209,24 @@ fn build_duchon_basis_uncached(
     let base_cols = kernel_transform.ncols() + poly_cols;
     let dense_bytes = dense_design_bytes(data.nrows(), base_cols);
     let use_lazy = should_use_lazy_spatial_design(data.nrows(), base_cols, workspace.policy());
+    // #1355: data-metric radial reparameterization `V`, frozen into metadata so
+    // predict / κ-trial rebuilds replay the exact fit-time rotated radial basis.
+    // A FROZEN `V` (predict / κ-trial / replay) is folded into the constrained
+    // kernel transform on EVERY path so the design stays consistent with the
+    // frozen penalty. A FRESH `V` is computed only on the dense cold path; the
+    // lazy/streaming cold path keeps the original constrained basis (`None`).
+    let mut frozen_radial_reparam: Option<Array2<f64>> = None;
+    if let Some(v) = spec.radial_reparam.as_ref() {
+        if v.nrows() != kernel_transform.ncols() {
+            crate::bail_dim_basis!(
+                "Duchon frozen radial reparam shape {:?} does not match constrained kernel dimension {}",
+                v.dim(),
+                kernel_transform.ncols()
+            );
+        }
+        kernel_transform = fast_ab(&kernel_transform, v);
+        frozen_radial_reparam = Some(v.clone());
+    }
     let (design, identifiability_transform) = if use_lazy {
         // log::info! — deliberate memory-saving choice, not an anomaly.
         log::info!(
@@ -334,6 +352,52 @@ fn build_duchon_basis_uncached(
         };
         (design, identifiability_transform)
     } else {
+        // #1355: dense path applies the data-metric radial reparameterization
+        // `V` (mirroring the thin-plate Wood-TPRS reparam) so the native
+        // penalty's cliff-less Mercer spectrum is replaced by the
+        // curvature-per-unit-data-variance spectrum (mgcv's cliff), removing the
+        // REML over-smoothing collapse to EDF = 1. `V` is frozen at the cold
+        // build and replayed verbatim from `spec.radial_reparam` on the
+        // predict / κ-trial paths.
+        // A FRESH `V` is computed only when no frozen reparam was supplied
+        // (`frozen_radial_reparam` already folded above on the replay paths). At
+        // that point `kernel_transform` is still the raw `Z`.
+        if frozen_radial_reparam.is_none() {
+            let kernel_cols = kernel_transform.ncols();
+            if kernel_cols > 0 {
+                // Build the un-rotated constrained kernel design once, take its
+                // realized Gram `G_c = (K·Z)ᵀ(K·Z)`, and solve the generalized
+                // eigenproblem `Ω_c v = μ G_c v` with `Ω_c = α²·ZᵀK_CC Z`.
+                let raw = build_duchon_basis_designwithworkspace(
+                    data,
+                    centers.view(),
+                    spec.length_scale,
+                    spec.power,
+                    effective_nullspace_order,
+                    aniso.as_deref(),
+                    None,
+                    workspace,
+                )?;
+                let kernel_block = raw.basis.slice(s![.., 0..kernel_cols]);
+                let design_gram = symmetrize_penalty(&fast_atb(&kernel_block, &kernel_block));
+                let omega_constrained = duchon_constrained_bending_penalty(
+                    centers.view(),
+                    spec.length_scale,
+                    spec.power,
+                    effective_nullspace_order,
+                    aniso.as_deref(),
+                    &kernel_transform,
+                )?;
+                let (v, _mu) =
+                    thin_plate_radial_reparam_data_metric(&omega_constrained, &design_gram)?;
+                // A degenerate reparam (no retained modes) would gut the basis;
+                // only adopt `V` when it preserves at least one radial column.
+                if v.ncols() > 0 {
+                    kernel_transform = fast_ab(&kernel_transform, &v);
+                    frozen_radial_reparam = Some(v);
+                }
+            }
+        }
         let d = build_duchon_basis_designwithworkspace(
             data,
             centers.view(),
@@ -341,6 +405,7 @@ fn build_duchon_basis_uncached(
             spec.power,
             effective_nullspace_order,
             aniso.as_deref(),
+            frozen_radial_reparam.as_ref(),
             workspace,
         )?;
         let basis = d.basis;
@@ -427,6 +492,7 @@ fn build_duchon_basis_uncached(
             input_scales: None,
             aniso_log_scales: aniso,
             operator_collocation_points,
+            radial_reparam: frozen_radial_reparam,
         },
         kronecker_factored: None,
     })
@@ -461,6 +527,7 @@ pub(crate) fn duchon_penalties_at_length_scale(
     power: f64,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
+    radial_reparam: Option<&Array2<f64>>,
     length_scale: Option<f64>,
     workspace: &mut BasisWorkspace,
 ) -> Result<(Vec<Array2<f64>>, Vec<usize>), BasisError> {
@@ -470,8 +537,20 @@ pub(crate) fn duchon_penalties_at_length_scale(
     let effective_nullspace_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let aniso = auto_seed_aniso_contrasts(centers, aniso_log_scales);
     // n-free kernel-constraint nullspace (from centers; cached on the workspace).
-    let kernel_transform =
+    let mut kernel_transform =
         kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
+    // #1355: fold the frozen data-metric reparam `Z' = Z·V` so the κ-trial
+    // penalty `Z'ᵀ K_CC(ψ) Z' = diag(μ(ψ))` matches the rotated design.
+    if let Some(v) = radial_reparam {
+        if v.nrows() != kernel_transform.ncols() {
+            crate::bail_dim_basis!(
+                "Duchon frozen radial reparam shape {:?} does not match constrained kernel dimension {}",
+                v.dim(),
+                kernel_transform.ncols()
+            );
+        }
+        kernel_transform = fast_ab(&kernel_transform, v);
+    }
     // Polynomial column count: `C(d+r, r)`, independent of the row count, so the
     // n-free centers-based form equals the cold build's data-based `.ncols()`.
     let poly_cols = polynomial_block_from_order(centers, effective_nullspace_order).ncols();

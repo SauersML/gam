@@ -649,6 +649,7 @@ pub(crate) fn build_periodic_duchon_basis_1d(
             input_scales: None,
             aniso_log_scales: None,
             operator_collocation_points: None,
+            radial_reparam: None,
         },
         kronecker_factored: None,
     })
@@ -901,6 +902,7 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
             input_scales: None,
             aniso_log_scales: None,
             operator_collocation_points: None,
+            radial_reparam: None,
         },
         kronecker_factored: None,
     })
@@ -1011,25 +1013,27 @@ pub fn duchon_cubic_default(dim: usize) -> (DuchonNullspaceOrder, f64) {
 /// coefficient-space penalty scales by `α²`. The null-space ridge penalizes the
 /// affine trend's slope (mean-free: the constant is absorbed by the model
 /// intercept) so the trend is not left fully unpenalized.
-pub(crate) fn duchon_native_penalty_candidates(
+/// The constrained native bending penalty `Ω_c = α² · Zᵀ K_CC Z` (m×m, in the
+/// kernel-coefficient frame, pre-identifiability). This is exactly the `omega`
+/// block that `duchon_native_penalty_candidates` builds; it is exposed so the
+/// data-metric radial reparameterization (#1355) can solve the generalized
+/// eigenproblem `Ω_c v = μ G_c v` against the realized design Gram `G_c`.
+pub(crate) fn duchon_constrained_bending_penalty(
     centers: ArrayView2<'_, f64>,
     length_scale: Option<f64>,
     power: f64,
     nullspace_order: DuchonNullspaceOrder,
     aniso_log_scales: Option<&[f64]>,
     kernel_transform: &Array2<f64>,
-    outer_identifiability: Option<&Array2<f64>>,
-    poly_cols: usize,
-) -> Result<Vec<PenaltyCandidate>, BasisError> {
+) -> Result<Array2<f64>, BasisError> {
     let dim = centers.ncols();
     if dim == 0 {
         crate::bail_invalid_basis!(
-            "duchon_native_penalty_candidates: centers must have at least one column"
+            "duchon_constrained_bending_penalty: centers must have at least one column"
         );
     }
     let k = centers.nrows();
     let z = kernel_transform;
-    let n_kernel = z.ncols();
     let p_order = duchon_p_from_nullspace_order(nullspace_order);
     let s_int = duchon_power_to_usize(power);
     let pure = length_scale.is_none();
@@ -1077,14 +1081,41 @@ pub(crate) fn duchon_native_penalty_candidates(
         }
     })?;
 
+    let amp2 = kernel_amp * kernel_amp;
+    let zt_k = fast_atb(z, &center_kernel);
+    Ok(fast_ab(&zt_k, z).mapv(|v| v * amp2))
+}
+
+pub(crate) fn duchon_native_penalty_candidates(
+    centers: ArrayView2<'_, f64>,
+    length_scale: Option<f64>,
+    power: f64,
+    nullspace_order: DuchonNullspaceOrder,
+    aniso_log_scales: Option<&[f64]>,
+    kernel_transform: &Array2<f64>,
+    outer_identifiability: Option<&Array2<f64>>,
+    poly_cols: usize,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!(
+            "duchon_native_penalty_candidates: centers must have at least one column"
+        );
+    }
+    let z = kernel_transform;
+    let n_kernel = z.ncols();
+
     // ω = α² · Zᵀ K_CC Z, embedded in the kernel block of the
     // (n_kernel + poly) pre-identifiability frame (polynomial columns carry no
     // native roughness), then mapped through the outer identifiability `T`.
-    let amp2 = kernel_amp * kernel_amp;
-    let omega = {
-        let zt_k = fast_atb(z, &center_kernel);
-        fast_ab(&zt_k, z).mapv(|v| v * amp2)
-    };
+    let omega = duchon_constrained_bending_penalty(
+        centers,
+        length_scale,
+        power,
+        nullspace_order,
+        aniso_log_scales,
+        z,
+    )?;
     let n_pre = n_kernel + poly_cols;
     let mut primary_pre = Array2::<f64>::zeros((n_pre, n_pre));
     primary_pre

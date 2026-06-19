@@ -2286,6 +2286,7 @@ pub(crate) fn prepare_duchon_derivative_contextwithworkspace(
         spec.power,
         spec.nullspace_order,
         spec.aniso_log_scales.as_deref(),
+        None,
         workspace,
     )?;
     let identifiability_transform = spatial_identifiability_transform_from_design(

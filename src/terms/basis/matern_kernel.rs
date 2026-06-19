@@ -60,6 +60,7 @@ pub fn build_thin_plate_basiswithworkspace(
             aniso_log_scales: None,
             operator_penalties: DuchonOperatorPenaltySpec::default(),
             boundary: OneDimensionalBoundary::Open,
+            radial_reparam: None,
         };
         log::info!(
             "thin-plate basis auto-promoted to hybrid Duchon ({:?}, s={}) in d={}: \

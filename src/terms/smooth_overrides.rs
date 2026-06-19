@@ -1203,6 +1203,7 @@ mod tests {
             aniso_log_scales: None,
             operator_penalties: Default::default(),
             boundary: OneDimensionalBoundary::Open,
+            radial_reparam: None,
         }
     }
 

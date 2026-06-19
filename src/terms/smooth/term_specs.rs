@@ -4362,6 +4362,7 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
             input_scales,
             aniso_log_scales,
             operator_collocation_points,
+            radial_reparam,
         } => BasisMetadata::Duchon {
             centers,
             length_scale,
@@ -4372,6 +4373,7 @@ fn freeze_raw_spatial_metadata(metadata: BasisMetadata, raw_cols: usize) -> Basi
             input_scales,
             aniso_log_scales,
             operator_collocation_points,
+            radial_reparam,
         },
         other => other,
     }

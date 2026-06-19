@@ -1412,6 +1412,11 @@ pub enum BasisMetadata {
         /// caches can rebuild the exact same operator rows instead of guessing
         /// from centers.
         operator_collocation_points: Option<Array2<f64>>,
+        /// Data-metric radial reparameterization `V` (#1355). When `Some`, the
+        /// constrained kernel transform is folded to `Z·V` so predict-time and
+        /// κ-trial rebuilds replay the exact fit-time rotated radial basis.
+        /// `None` on the lazy/streaming path (original constrained basis).
+        radial_reparam: Option<Array2<f64>>,
     },
     Pca {
         feature_cols: Vec<usize>,

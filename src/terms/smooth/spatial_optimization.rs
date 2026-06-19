@@ -3955,6 +3955,7 @@ fn freeze_smooth_basis_from_metadata(
                 identifiability_transform,
                 input_scales: meta_scales,
                 aniso_log_scales: meta_aniso,
+                radial_reparam: meta_radial_reparam,
                 ..
             },
         ) => {
@@ -3980,6 +3981,7 @@ fn freeze_smooth_basis_from_metadata(
                     aniso_log_scales: meta_aniso.clone(),
                     operator_penalties: Default::default(),
                     boundary: OneDimensionalBoundary::Open,
+                    radial_reparam: meta_radial_reparam.clone(),
                 },
                 input_scales: meta_scales.clone(),
             };
@@ -5125,6 +5127,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 nullspace_order,
                 aniso_log_scales,
                 input_scales,
+                radial_reparam,
                 ..
             } => {
                 let operator_penalties = match &termspec.basis {
@@ -5151,6 +5154,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     *power,
                     *nullspace_order,
                     aniso_log_scales.as_deref(),
+                    radial_reparam.as_ref(),
                     effective_ls,
                     &mut self.basisworkspace,
                 )

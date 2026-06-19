@@ -229,6 +229,7 @@ pub(super) fn build_shape_constraint_design_1d(
                 nullspace_order,
                 identifiability_transform,
                 aniso_log_scales,
+                radial_reparam,
                 ..
             },
         ) => {
@@ -247,6 +248,7 @@ pub(super) fn build_shape_constraint_design_1d(
                 aniso_log_scales: aniso_log_scales.clone(),
                 operator_penalties: spec.operator_penalties.clone(),
                 boundary: spec.boundary.clone(),
+                radial_reparam: radial_reparam.clone(),
             };
             build_duchon_basis(grid_2d.view(), &evalspec)?
                 .design

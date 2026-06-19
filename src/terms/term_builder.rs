@@ -2825,6 +2825,7 @@ pub fn build_smooth_basis(
                     } else {
                         OneDimensionalBoundary::Open
                     },
+                    radial_reparam: None,
                 },
                 input_scales: None,
             })
