@@ -1033,20 +1033,66 @@ class _SparsityLayer(nn.Module):
             onehot = torch.zeros(n, f, dtype=dtype, device=device)
             onehot[:, 0] = 1.0
             return onehot
-        # Phase 2: split rows by the sign of the top residual PC of atom 0's fit.
+        # Phase 2: split by the sign of the top residual PC of atom 0's fit, then
+        # refine by *per-atom reconstruction residual* as the decoders specialize.
+        #
+        # The bare residual-PC sign split is a seed-free partition for manifolds
+        # that occupy distinct residual directions (disjoint circles), but it
+        # collapses to chance on the energy-degenerate signed circles
+        # ``(c,s,c,±s)``: once atom 0 settles on the shared averaged plane its
+        # residual is ``±s`` along the single channel-3 line, and the sign of that
+        # projection is ``sign(±s)`` — entangled with the phase ``sin θ`` rather
+        # than with the manifold label, so the partition is ~50/50 (issue #1282).
+        # The discriminator that *is* manifold-clean is which curve reconstructs a
+        # row better once the two atoms have specialized: the ``+s`` curve fits a
+        # ``+s`` row at residual ~0 but a ``-s`` row leaves ``2s`` in channel 3 (it
+        # cannot match both signs at one phase), so the per-atom reconstruction
+        # residual separates the manifolds where the residual *sign* cannot. We
+        # therefore use the PC-sign split only to *seed* atom-1's differentiation
+        # (so it leaves the random init and starts reconstructing one signed
+        # branch) and, once atom 1 carries a real curve, route each row to the
+        # atom with the smaller current reconstruction residual — recomputed every
+        # step, so the commit tracks (and reinforces) the decoders as they
+        # specialize instead of freezing the noisy sign seed. This is the
+        # gradient-path analogue of the closed-form lane's residual-energy
+        # assignment, and it matches the eval-time per-atom-residual readout so the
+        # committed train routing and the reported routing agree. A balance guard
+        # forbids either atom from owning every row (the collapse the commit
+        # exists to prevent). Keys only on the reconstruction residual —
+        # geometry-agnostic (no hardcoded knowledge of circles or channels).
         with torch.no_grad():
-            resid0 = code[:, 0:1] * per_atom_recon[:, 0, :] - x  # (N, D)
-            rd = resid0 - resid0.mean(dim=0, keepdim=True)
-            try:
-                _, _, vh = torch.linalg.svd(rd, full_matrices=False)
-            except Exception:
-                return None
-            proj = rd @ vh[0]  # (N,) projection on the leading residual PC
-            assign = (proj > 0).to(torch.long)  # atom 1 where positive, else 0
-            # Guard against a degenerate all-one-side split (no signal): fall back
-            # to a balanced median split on the projection so both atoms get rows.
-            if int(assign.sum().item()) in (0, n):
-                assign = (proj > proj.median()).to(torch.long)
+            # Per-row, per-atom best non-negative scalar fit residual.
+            resid = (
+                (code.unsqueeze(-1) * per_atom_recon - x.unsqueeze(1)) ** 2
+            ).sum(dim=-1)  # (N, F)
+            # Seed window: atom 1 is still near its random init for the first few
+            # phase-2 steps, so its residual is meaningless; use the residual-PC
+            # sign split to push atom 1 toward one signed branch first.
+            phase1_end = max(1, self._commit_steps // 2)
+            seed_steps = max(2, (self._commit_steps - phase1_end) // 4)
+            if step < phase1_end + seed_steps:
+                resid0 = code[:, 0:1] * per_atom_recon[:, 0, :] - x  # (N, D)
+                rd = resid0 - resid0.mean(dim=0, keepdim=True)
+                try:
+                    _, _, vh = torch.linalg.svd(rd, full_matrices=False)
+                except Exception:
+                    return None
+                proj = rd @ vh[0]
+                assign = (proj > 0).to(torch.long)
+                if int(assign.sum().item()) in (0, n):
+                    assign = (proj > proj.median()).to(torch.long)
+            else:
+                # Residual-energy assignment: each row to the atom that currently
+                # reconstructs it best. Balance guard: if the argmin sends fewer
+                # than a quarter of the rows to either atom, split the rows by the
+                # *residual gap* median instead so both atoms keep a populated
+                # half (a degenerate all-one-atom split carries no specialization
+                # signal — the exact collapse this commit prevents).
+                gap = resid[:, 0] - resid[:, 1]  # >0 ⇒ atom 1 fits better
+                assign = (gap > 0).to(torch.long)
+                count1 = int(assign.sum().item())
+                if min(count1, n - count1) < n // 4:
+                    assign = (gap > gap.median()).to(torch.long)
         onehot = torch.zeros(n, f, dtype=dtype, device=device)
         onehot[torch.arange(n, device=device), assign] = 1.0
         return onehot
