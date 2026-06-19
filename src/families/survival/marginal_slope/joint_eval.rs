@@ -445,15 +445,9 @@ impl SurvivalMarginalSlopeFamily {
                         &primary,
                     )?
                 } else {
-                    let (nll, grad_arr, _) = self.row_primary_closed_form_rigid(
-                        row,
-                        q_geom.q0,
-                        q_geom.q1,
-                        q_geom.qd1,
-                        block_states,
-                        self.probit_frailty_scale(),
-                    )?;
-                    (nll, Array1::from_vec(grad_arr.to_vec()))
+                    let (nll, grad, _) =
+                        self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
+                    (nll, grad)
                 };
                 acc.0 -= row_nll;
                 self.accumulate_dynamic_q_core_gradient_first_order(

@@ -26,19 +26,85 @@ impl SurvivalMarginalSlopeRowKernel {
     }
 }
 
+pub(crate) fn rigid_row_kernel_primaries(
+    family: &SurvivalMarginalSlopeFamily,
+    block_states: &[ParameterBlockState],
+    row: usize,
+) -> Result<[f64; 4], String> {
+    let q_geom = family.row_dynamic_q_values(row, block_states)?;
+    Ok([q_geom.q0, q_geom.q1, q_geom.qd1, block_states[2].eta[row]])
+}
+
+pub(crate) fn rigid_row_kernel_nll_tower(
+    family: &SurvivalMarginalSlopeFamily,
+    block_states: &[ParameterBlockState],
+    row: usize,
+    p: &[crate::families::jet_tower::Tower4<4>; 4],
+    context: &str,
+) -> Result<crate::families::jet_tower::Tower4<4>, String> {
+    use crate::families::jet_tower::Tower4;
+
+    let wi = family.weights[row];
+    let di = family.event[row];
+    let (z_sum, covariance_ones) = family.exact_shared_score_summary(row, block_states, context)?;
+    let probit_scale = family.probit_frailty_scale();
+
+    let q0 = p[0];
+    let q1 = p[1];
+    let qd1 = p[2];
+    let g = p[3];
+
+    let observed_g = g * probit_scale;
+    let one_plus_b2 = observed_g * observed_g * covariance_ones + 1.0;
+    let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.v));
+
+    let eta0 = q0 * c + observed_g * z_sum;
+    let eta1 = q1 * c + observed_g * z_sum;
+    let ad1 = qd1 * c;
+
+    let qd1_lower = family.time_derivative_lower_bound();
+    if survival_derivative_guard_violated(qd1.v, qd1_lower) {
+        return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+            reason: format!(
+                "survival marginal-slope monotonicity violated at row {row}: raw time derivative={:.3e} must be at least derivative_guard={:.3e}; transformed time derivative={:.3e}",
+                qd1.v, qd1_lower, ad1.v
+            ),
+        }
+        .into());
+    }
+
+    let neg_eta0 = -eta0;
+    let entry = neg_eta0
+        .compose_unary(unary_derivatives_neglog_phi(neg_eta0.v, wi))
+        .scale(-1.0);
+
+    let neg_eta1 = -eta1;
+    let exit = neg_eta1.compose_unary(unary_derivatives_neglog_phi(neg_eta1.v, wi * (1.0 - di)));
+
+    let event_density = if di > 0.0 {
+        eta1.compose_unary(unary_derivatives_log_normal_pdf(eta1.v))
+            .scale(-wi * di)
+    } else {
+        Tower4::<4>::zero()
+    };
+
+    let time_deriv = if di > 0.0 {
+        ad1.compose_unary(unary_derivatives_log(ad1.v))
+            .scale(-wi * di)
+    } else {
+        Tower4::<4>::zero()
+    };
+
+    Ok(exit + entry + event_density + time_deriv)
+}
+
 impl crate::families::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRowKernel {
     fn n_rows(&self) -> usize {
         self.family.n
     }
 
     fn primaries(&self, row: usize) -> Result<[f64; 4], String> {
-        let q_geom = self.family.row_dynamic_q_values(row, &self.block_states)?;
-        Ok([
-            q_geom.q0,
-            q_geom.q1,
-            q_geom.qd1,
-            self.block_states[2].eta[row],
-        ])
+        rigid_row_kernel_primaries(&self.family, &self.block_states, row)
     }
 
     fn row_nll(
@@ -46,65 +112,13 @@ impl crate::families::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRowKe
         row: usize,
         p: &[crate::families::jet_tower::Tower4<4>; 4],
     ) -> Result<crate::families::jet_tower::Tower4<4>, String> {
-        use crate::families::jet_tower::Tower4;
-
-        let wi = self.family.weights[row];
-        let di = self.family.event[row];
-        let (z_sum, covariance_ones) = self.family.exact_shared_score_summary(
-            row,
+        rigid_row_kernel_nll_tower(
+            &self.family,
             &self.block_states,
+            row,
+            p,
             "survival marginal-slope rigid row tower",
-        )?;
-        let probit_scale = self.family.probit_frailty_scale();
-
-        let q0 = p[0];
-        let q1 = p[1];
-        let qd1 = p[2];
-        let g = p[3];
-
-        let observed_g = g * probit_scale;
-        let one_plus_b2 = observed_g * observed_g * covariance_ones + 1.0;
-        let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.v));
-
-        let eta0 = q0 * c + observed_g * z_sum;
-        let eta1 = q1 * c + observed_g * z_sum;
-        let ad1 = qd1 * c;
-
-        let qd1_lower = self.family.time_derivative_lower_bound();
-        if survival_derivative_guard_violated(qd1.v, qd1_lower) {
-            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
-                reason: format!(
-                    "survival marginal-slope monotonicity violated at row {row}: raw time derivative={:.3e} must be at least derivative_guard={:.3e}; transformed time derivative={:.3e}",
-                    qd1.v, qd1_lower, ad1.v
-                ),
-            }
-            .into());
-        }
-
-        let neg_eta0 = -eta0;
-        let entry = neg_eta0
-            .compose_unary(unary_derivatives_neglog_phi(neg_eta0.v, wi))
-            .scale(-1.0);
-
-        let neg_eta1 = -eta1;
-        let exit =
-            neg_eta1.compose_unary(unary_derivatives_neglog_phi(neg_eta1.v, wi * (1.0 - di)));
-
-        let event_density = if di > 0.0 {
-            eta1.compose_unary(unary_derivatives_log_normal_pdf(eta1.v))
-                .scale(-wi * di)
-        } else {
-            Tower4::<4>::zero()
-        };
-
-        let time_deriv = if di > 0.0 {
-            ad1.compose_unary(unary_derivatives_log(ad1.v))
-                .scale(-wi * di)
-        } else {
-            Tower4::<4>::zero()
-        };
-
-        Ok(exit + entry + event_density + time_deriv)
+        )
     }
 }
 

@@ -38,9 +38,8 @@ impl SurvivalMarginalSlopeFamily {
             return total;
         }
         // True fast path: K=1 keeps the original scalar closed form; K>1
-        // uses the covariance-aware vector likelihood. Exact rigid
-        // gradient/Hessian paths below use the same c(a)=sqrt(1+r'Sigma r)
-        // algebra through `row_primary_closed_form_rigid`.
+        // uses the covariance-aware vector likelihood. Rigid derivative
+        // paths are derived from the RowNllProgram tower.
         let guard = self.derivative_guard;
         let probit_scale = self.probit_frailty_scale();
         let score_dim = self.score_dim();

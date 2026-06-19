@@ -447,35 +447,6 @@ pub(crate) struct TimewiggleMarginalPsiRowLift {
     pub(crate) psi_row: Array1<f64>,
 }
 
-pub(crate) fn unit_primary_direction(idx: usize) -> Array1<f64> {
-    let mut out = Array1::<f64>::zeros(N_PRIMARY);
-    out[idx] = 1.0;
-    out
-}
-
-/// Returns a reference to the static unit-direction table (one Array1<f64>
-/// per primary axis). Reusing these references avoids per-row heap
-/// allocations in third/fourth-order contracted assemblies, where the inner
-/// loop calls into the row-directional kernel 10 (third-order) or 10
-/// (fourth-order) times per row.
-pub(crate) fn unit_primary_direction_table() -> &'static [Array1<f64>; N_PRIMARY] {
-    use std::sync::OnceLock;
-    static TABLE: OnceLock<[Array1<f64>; N_PRIMARY]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        [
-            unit_primary_direction(0),
-            unit_primary_direction(1),
-            unit_primary_direction(2),
-            unit_primary_direction(3),
-        ]
-    })
-}
-
-#[inline]
-pub(crate) fn unit_primary_direction_ref(idx: usize) -> &'static Array1<f64> {
-    &unit_primary_direction_table()[idx]
-}
-
 /// Returns a reference to the static zero direction in primary space
 /// (an `Array1::zeros(N_PRIMARY)`). Used by sigma-jet contractions to
 /// avoid the per-call `Array1::zeros(primary_dim)` allocation storm in

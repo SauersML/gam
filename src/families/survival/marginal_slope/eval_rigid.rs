@@ -5,59 +5,6 @@
 use super::*;
 
 impl SurvivalMarginalSlopeFamily {
-    pub(crate) fn row_primary_closed_form_rigid(
-        &self,
-        row: usize,
-        q0: f64,
-        q1: f64,
-        qd1: f64,
-        block_states: &[ParameterBlockState],
-        probit_scale: f64,
-    ) -> Result<(f64, [f64; N_PRIMARY], [[f64; N_PRIMARY]; N_PRIMARY]), String> {
-        let logslope_eta = &block_states[2].eta;
-        let k = self.score_dim();
-        if k == 1 {
-            return row_primary_closed_form(
-                q0,
-                q1,
-                qd1,
-                logslope_eta[row],
-                self.z[[row, 0]],
-                self.weights[row],
-                self.event[row],
-                self.derivative_guard,
-                probit_scale,
-            )
-            .map_err(|err| with_row_context(err, row));
-        }
-        if logslope_eta.len() != self.n {
-            return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-                reason: format!(
-                    "survival marginal-slope exact rigid row calculus for K={k} requires one shared log-slope surface (eta len n={}); got eta len {}. Per-z log-slope derivatives require a {}-primary row kernel.",
-                    self.n,
-                    logslope_eta.len(),
-                    3 + k
-                ),
-            }
-            .into());
-        }
-        let (z_sum, covariance_ones) =
-            self.exact_shared_score_summary(row, block_states, "row_primary_closed_form_rigid")?;
-        row_primary_closed_form_shared_score(
-            q0,
-            q1,
-            qd1,
-            logslope_eta[row],
-            z_sum,
-            covariance_ones,
-            self.weights[row],
-            self.event[row],
-            self.derivative_guard,
-            probit_scale,
-        )
-        .map_err(|err| with_row_context(err, row))
-    }
-
     pub(crate) fn ensure_scalar_flex_exact_score_geometry(
         &self,
         context: &str,

@@ -411,7 +411,7 @@ impl SurvivalMarginalSlopeFamily {
         dir_v: ArrayView1<'_, f64>,
     ) -> Result<Array2<f64>, String> {
         // Batched path delegating to the shared k=6 jet helper.
-        let r = self.row_primary_fourth_contracted_batched(row, block_states, dir_u, dir_v)?;
+        let r = self.row_primary_fourth_contracted_tower(row, block_states, dir_u, dir_v)?;
         let mut out = Array2::<f64>::zeros((N_PRIMARY, N_PRIMARY));
         for a in 0..N_PRIMARY {
             for b in 0..N_PRIMARY {

@@ -1020,11 +1020,6 @@ pub(crate) fn row_primary_closed_form_shared_score(
 }
 
 // ── Eval cache ────────────────────────────────────────────────────────
-//
-// Third and fourth order contracted derivatives for the outer REML path
-// continue to use the MultiDirJet engine via row_neglog_directional.
-// That path is called O(n_rho²) times, not O(n × inner_iters) times,
-// so the jet overhead is acceptable there.
 
 #[derive(Clone)]
 pub(crate) struct RowPrimaryBase {
