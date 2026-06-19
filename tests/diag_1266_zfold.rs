@@ -76,4 +76,7 @@ fn diag_1266_zfold_dump() {
             ll.to_vec(),
         );
     }
+    // Force nextest to surface the captured stdout above (it shows output only
+    // on failure). This is a DIAGNOSTIC, never a gate.
+    panic!("DIAG1266 intentional fail to surface stdout under nextest");
 }
