@@ -1220,6 +1220,29 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
                 eprintln!("[#1347 DIAG] μ(gen-eig Ω_c v=μ G_c v) normalized desc = {mu_norm:?}");
             }
         }
+        // Stiffness ∫(f'')² via collocated D2 on the knots (1D r³: φ''=6|r|).
+        // S_stiff = Zᵀ (D2ᵀ D2) Z, collocated at the knots themselves.
+        if d == 1 {
+            let kk = knots.nrows();
+            let mut d2 = Array2::<f64>::zeros((kk, kk)); // [colloc=knot_i, center=knot_j]
+            for i in 0..kk {
+                for j in 0..kk {
+                    let r = (knots[[i, 0]] - knots[[j, 0]]).abs();
+                    d2[[i, j]] = 6.0 * r;
+                }
+            }
+            let s_full = symmetrize_penalty(&fast_atb(&d2, &d2)); // D2ᵀD2 (kernel frame)
+            let s_stiff = symmetrize_penalty(&fast_ab(&fast_atb(&z, &s_full), &z)); // ZᵀSZ
+            if let Ok((mut e, _)) = FaerEigh::eigh(&s_stiff, Side::Lower) {
+                e.iter_mut().for_each(|v| *v = v.max(0.0));
+                let mut sd: Vec<f64> = e.to_vec();
+                sd.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let smax = sd.first().cloned().unwrap_or(1.0).max(1e-300);
+                let s_norm: Vec<String> =
+                    sd.iter().map(|v| format!("{:.4e}", v / smax)).collect();
+                eprintln!("[#1347 DIAG] stiffness Λ(Zᵀ D2ᵀD2 Z) normalized desc = {s_norm:?}");
+            }
+        }
     }
 
     // Radial penalty eigenspace reparameterization. Eigendecompose
