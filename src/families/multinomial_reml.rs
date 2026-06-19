@@ -942,6 +942,170 @@ impl MultinomialFamily {
         Ok(out)
     }
 
+    /// Assemble `D²_beta H[u_j, v_j]` for an arbitrary batch of coefficient
+    /// direction pairs in one shared probability/design row sweep.
+    ///
+    /// The exact outer Hessian asks for one correction per ρ-pair, where both
+    /// directions are mode responses rather than canonical axes. The old
+    /// workspace default delegated each pair to
+    /// [`Self::second_directional_fisher_jet`] plus `dense_block_xtwx`, rebuilding
+    /// the same softmax probabilities and design Gram scatter for every pair.
+    /// This fused path keeps the singular formula but amortizes the row walk
+    /// across the whole `K(K+1)/2` pair batch (#1082).
+    fn assemble_second_directional_derivatives_from_probs(
+        &self,
+        probs_full: ArrayView2<'_, f64>,
+        pairs: &[(Array1<f64>, Array1<f64>)],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+
+        let n_pairs = pairs.len();
+        if n_pairs == 0 {
+            return Ok(Vec::new());
+        }
+        let n = self.weights.len();
+        let p = self.design.ncols();
+        let m = self.active_classes();
+        let dim = m * p;
+        for (idx, (u, v)) in pairs.iter().enumerate() {
+            if u.len() != dim || v.len() != dim {
+                return Err(format!(
+                    "MultinomialFamily batched second-directional pair {idx} lengths {} and {} != (K-1)·P = {dim}",
+                    u.len(),
+                    v.len()
+                ));
+            }
+        }
+
+        let design = self.design.view();
+        let flat = (0..n)
+            .into_par_iter()
+            .fold(
+                || vec![0.0_f64; n_pairs * dim * dim],
+                |mut acc, row| {
+                    let w = self.weights[row];
+                    if w == 0.0 {
+                        return acc;
+                    }
+                    let mut d_eta_u = vec![0.0_f64; m];
+                    let mut d_eta_v = vec![0.0_f64; m];
+                    let mut dp_u = vec![0.0_f64; m];
+                    let mut dp_v = vec![0.0_f64; m];
+                    let mut ddp = vec![0.0_f64; m];
+
+                    for (pair_idx, (u, v)) in pairs.iter().enumerate() {
+                        let mut s_u = 0.0_f64;
+                        let mut s_v = 0.0_f64;
+                        for a in 0..m {
+                            let base = a * p;
+                            let mut eta_u = 0.0_f64;
+                            let mut eta_v = 0.0_f64;
+                            for i in 0..p {
+                                let x = design[[row, i]];
+                                eta_u += x * u[base + i];
+                                eta_v += x * v[base + i];
+                            }
+                            d_eta_u[a] = eta_u;
+                            d_eta_v[a] = eta_v;
+                            s_u += probs_full[[row, a]] * eta_u;
+                            s_v += probs_full[[row, a]] * eta_v;
+                        }
+
+                        for a in 0..m {
+                            let pa = probs_full[[row, a]];
+                            dp_u[a] = pa * (d_eta_u[a] - s_u);
+                            dp_v[a] = pa * (d_eta_v[a] - s_v);
+                        }
+
+                        let mut ds_u_dv = 0.0_f64;
+                        for a in 0..m {
+                            ds_u_dv += dp_v[a] * d_eta_u[a];
+                        }
+                        for a in 0..m {
+                            let pa = probs_full[[row, a]];
+                            ddp[a] = dp_v[a] * (d_eta_u[a] - s_u) - pa * ds_u_dv;
+                        }
+
+                        let pair_base = pair_idx * dim * dim;
+                        for a in 0..m {
+                            let pa = probs_full[[row, a]];
+                            let row_a = a * p;
+                            let jaa =
+                                w * (ddp[a] - 2.0 * ddp[a] * pa - 2.0 * dp_u[a] * dp_v[a]);
+                            if jaa != 0.0 {
+                                for i in 0..p {
+                                    let xi = design[[row, i]];
+                                    if xi == 0.0 {
+                                        continue;
+                                    }
+                                    let scaled = jaa * xi;
+                                    let out_row = pair_base + (row_a + i) * dim;
+                                    for j in 0..p {
+                                        acc[out_row + row_a + j] += scaled * design[[row, j]];
+                                    }
+                                }
+                            }
+
+                            for b in (a + 1)..m {
+                                let pb = probs_full[[row, b]];
+                                let jab = -w
+                                    * (ddp[a] * pb
+                                        + dp_u[a] * dp_v[b]
+                                        + dp_v[a] * dp_u[b]
+                                        + pa * ddp[b]);
+                                if jab == 0.0 {
+                                    continue;
+                                }
+                                let row_b = b * p;
+                                for i in 0..p {
+                                    let xi = design[[row, i]];
+                                    if xi == 0.0 {
+                                        continue;
+                                    }
+                                    let scaled = jab * xi;
+                                    let out_a = pair_base + (row_a + i) * dim;
+                                    let out_b = pair_base + (row_b + i) * dim;
+                                    for j in 0..p {
+                                        let xj = design[[row, j]];
+                                        let value = scaled * xj;
+                                        acc[out_a + row_b + j] += value;
+                                        acc[out_b + row_a + j] += value;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    acc
+                },
+            )
+            .reduce(
+                || vec![0.0_f64; n_pairs * dim * dim],
+                |mut a, b| {
+                    for (av, bv) in a.iter_mut().zip(b.iter()) {
+                        *av += *bv;
+                    }
+                    a
+                },
+            );
+
+        let mut out = Vec::with_capacity(n_pairs);
+        for pair_idx in 0..n_pairs {
+            let start = pair_idx * dim * dim;
+            let mut mat =
+                Array2::<f64>::from_shape_vec((dim, dim), flat[start..start + dim * dim].to_vec())
+                    .expect("batched second-directional buffer is dim·dim");
+            for i in 0..dim {
+                for j in (i + 1)..dim {
+                    let avg = 0.5 * (mat[[i, j]] + mat[[j, i]]);
+                    mat[[i, j]] = avg;
+                    mat[[j, i]] = avg;
+                }
+            }
+            out.push(mat);
+        }
+        Ok(out)
+    }
+
     #[cfg(test)]
     fn assemble_directional_derivatives(
         &self,
@@ -1730,6 +1894,20 @@ impl ExactNewtonJointHessianWorkspace for MultinomialHessianWorkspace {
                 d_beta_v,
             )
     }
+
+    fn second_directional_derivative_operators(
+        &self,
+        d_beta_pairs: &[(Array1<f64>, Array1<f64>)],
+    ) -> Result<Vec<Option<Arc<dyn HyperOperator>>>, String> {
+        self.family
+            .assemble_second_directional_derivatives_from_probs(self.probs.view(), d_beta_pairs)?
+            .into_iter()
+            .map(|matrix| {
+                Some(Arc::new(DenseMatrixHyperOperator { matrix }) as Arc<dyn HyperOperator>)
+            })
+            .map(Ok)
+            .collect()
+    }
 }
 
 #[cfg(test)]
@@ -2146,6 +2324,75 @@ mod tests {
                     assert!(
                         (a - b).abs() <= 1e-12 * (1.0 + b.abs()),
                         "operator direction {dir_idx} entry ({r},{c}): {a} != {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn workspace_batched_second_directional_pairs_match_per_pair() {
+        // The exact outer Hessian sends arbitrary mode-response pairs through
+        // `second_directional_derivative_operators`. This is the #1082 penguin
+        // hot path: all pair corrections must be fused without changing the
+        // old per-pair second-directional operator values.
+        let family = toy_family(10, 4, 4);
+        let p = family.design.ncols();
+        let m = family.active_classes();
+        let n = family.weights.len();
+        let dim = m * p;
+        let design = family.design.view();
+        let block_states: Vec<ParameterBlockState> = (0..m)
+            .map(|a| {
+                let beta = Array1::<f64>::from_shape_fn(p, |i| {
+                    0.11 * ((a + 3) as f64) - 0.06 * ((i + 2) as f64).cos()
+                });
+                let eta = Array1::<f64>::from_shape_fn(n, |row| {
+                    (0..p).map(|i| design[[row, i]] * beta[i]).sum()
+                });
+                ParameterBlockState { beta, eta }
+            })
+            .collect();
+        let specs = family.build_block_specs();
+        let workspace = family
+            .exact_newton_joint_hessian_workspace(&block_states, &specs)
+            .expect("workspace build must succeed")
+            .expect("workspace must be present");
+        let pairs: Vec<(Array1<f64>, Array1<f64>)> = (0..7)
+            .map(|seed| {
+                let u = Array1::<f64>::from_shape_fn(dim, |idx| {
+                    0.19 * ((seed + idx + 1) as f64).sin()
+                        + 0.05 * ((2 * seed + idx + 3) as f64).cos()
+                });
+                let v = Array1::<f64>::from_shape_fn(dim, |idx| {
+                    -0.17 * ((seed + 2 * idx + 5) as f64).cos()
+                        + 0.04 * ((seed + idx + 7) as f64).sin()
+                });
+                (u, v)
+            })
+            .collect();
+
+        let batched = workspace
+            .second_directional_derivative_operators(&pairs)
+            .expect("workspace batched second-directional operators must succeed");
+        assert_eq!(batched.len(), pairs.len());
+
+        for (pair_idx, ((u, v), maybe_operator)) in pairs.iter().zip(batched.into_iter()).enumerate()
+        {
+            let dense = maybe_operator
+                .expect("workspace must return a second-directional operator")
+                .to_dense();
+            let per_pair = family
+                .exact_newton_joint_hessiansecond_directional_derivative(&block_states, u, v)
+                .expect("per-pair second-directional must succeed")
+                .expect("per-pair second-directional must be present");
+            for r in 0..dim {
+                for c in 0..dim {
+                    let a = dense[[r, c]];
+                    let b = per_pair[[r, c]];
+                    assert!(
+                        (a - b).abs() <= 1e-10 * (1.0 + b.abs()),
+                        "pair {pair_idx} entry ({r},{c}): batched {a} != per-pair {b}"
                     );
                 }
             }
