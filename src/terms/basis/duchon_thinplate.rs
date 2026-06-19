@@ -614,107 +614,46 @@ pub fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
 ///
 /// The constrained radial penalty `Ω` is SPD in exact arithmetic — the
 /// polynomial null space `{1, x, …}` has already been removed by the gauge
-/// restriction, so every nonzero eigenvalue is a genuine bending direction.
-/// In finite precision, however, the constraint restriction leaves two kinds
-/// of spurious low modes that must NOT be exposed as almost-free design
-/// columns (they let REML buy wiggle at near-zero curvature cost and inflate
-/// the EDF on data that needs no curvature — issue #1271):
+/// restriction, so every nonzero eigenvalue is a genuine bending direction
+/// and must be retained (this matches mgcv's thin-plate construction, which
+/// keeps all `k − M` radial modes and relies on REML, not basis truncation,
+/// to set the effective degrees of freedom). The only modes that are NOT
+/// real curvature directions are **roundoff dust**: eigenvalues at or below
+/// the LAPACK numerical-rank floor `K·ε·λ_max` (Golub & Van Loan, *Matrix
+/// Computations*, §2.5.6) are exact zeros polluted by floating-point error
+/// from the constraint restriction and carry no information.
 ///
-///   1. **Roundoff dust** at the LAPACK numerical-rank floor `K·ε·λ_max`
-///      (Golub & Van Loan, *Matrix Computations*, §2.5.6). These are exact
-///      zeros polluted by floating-point error and carry no information.
-///   2. **A terminal near-null cluster** — a tight band of eigenvalues, well
-///      below the bending continuum and separated from it by a sharp
-///      multiplicative gap, produced when the side-constraint projection does
-///      not perfectly annihilate the kernel's residual null directions. On a
-///      thin-plate penalty whose modes carry real curvature this cluster is
-///      absent and the spectrum decays smoothly; when it appears it is a
-///      detached population, not the tail of the bending band.
-///
-/// Both criteria are derived, scale-free, and tuning-free. The cluster is
-/// found by the standard *largest-relative-gap* (spectral elbow) rule applied
-/// to the SORTED spectrum, accepted only when (a) it sits in the lower tail
-/// (the modes below it are small relative to `λ_max`) and (b) the modes below
-/// it form a tight cluster (their own dynamic range is far smaller than the
-/// gap that detaches them) — the structural signature of a degenerate null
-/// remnant rather than the natural continuation of a smooth bending decay.
-/// Absent such a detached cluster, every numerically nonzero mode is kept.
+/// The threshold is therefore the standard numerical-rank floor — derived,
+/// scale-free, and tuning-free. It deliberately does NOT prune low-but-real
+/// bending modes by magnitude: doing so was the #1271 hill-climb (a swept
+/// `max_eval·tol` cutoff) that over-pruned the nonlinear arms (lidar /
+/// by-factor truth recovery collapsed) while still missing the linear EDF
+/// bar. The genuine over-fit on near-linear data is a REML smoothing issue
+/// (the diagonalised radial penalty's wide eigenvalue spread under a single
+/// `λ` leaves a flat REML profile, so the outer optimiser terminates at an
+/// interior `λ` that under-smooths), not a basis-rank issue — pruning cannot
+/// fix it without destroying the bending capacity real data needs.
 fn thin_plate_retained_radial_indices(evals: &Array1<f64>) -> Vec<usize> {
     let k = evals.len();
     if k == 0 {
         return Vec::new();
     }
-    // Sort eigenvalues descending, remembering original indices.
-    let mut order: Vec<usize> = (0..k).collect();
-    order.sort_by(|&a, &b| {
-        evals[b]
-            .abs()
-            .partial_cmp(&evals[a].abs())
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let sorted: Vec<f64> = order.iter().map(|&i| evals[i].abs()).collect();
-    let max_eval = sorted[0];
+    let max_eval = evals
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()));
     if !max_eval.is_finite() || max_eval <= 0.0 {
         return Vec::new();
     }
-
-    // (1) Numerical-rank floor: anything at or below `K·ε·λ_max` is roundoff.
+    // Numerical-rank floor: anything at or below `K·ε·λ_max` is roundoff dust
+    // from the gauge restriction, not a real bending mode. Everything above it
+    // is genuine curvature and is kept.
     let num_floor = (k as f64) * f64::EPSILON * max_eval;
-    // Largest retained index (in sorted order) permitted by the numerical rank.
-    let mut last = k; // exclusive upper bound in sorted order
-    while last > 0 && !(sorted[last - 1] > num_floor) {
-        last -= 1;
-    }
-    if last == 0 {
-        return Vec::new();
-    }
-
-    // (2) Detached terminal cluster via the largest multiplicative gap in the
-    // SORTED spectrum. Scan only the lower tail: a separator at position `p`
-    // means modes `p..last` are dropped, so `p` must leave the bending band
-    // intact. We never cut into the upper half of the spectrum (the head decay
-    // of a smooth thin-plate penalty has its own large ratios — e.g. λ₁/λ₂ —
-    // which are NOT null separators), and we accept a cut only when the modes
-    // below it are BOTH small relative to λ_max and internally tight.
-    //
-    // Concretely, for each candidate boundary `p` in the lower portion we form
-    // the gap ratio g(p) = sorted[p-1] / sorted[p]; the elbow is argmax g(p).
-    // It is accepted iff:
-    //   * the dropped tail is small:   sorted[p] < TAIL_REL * max_eval
-    //   * the gap is sharp:            g(p)      > the tail's own internal
-    //                                              dynamic range (so the tail is
-    //                                              a tight cluster, not a slope)
-    // These two conditions are scale-invariant ratios with no fitted constant;
-    // `TAIL_REL` is the half-spectrum mark, derived from the polynomial null
-    // dimension, not tuned.
-    let lower_start = (last + 1) / 2; // first index of the lower half (sorted)
-    let mut best_p: Option<usize> = None;
-    let mut best_gap = 1.0_f64;
-    for p in lower_start.max(1)..last {
-        let above = sorted[p - 1];
-        let below = sorted[p];
-        if below <= 0.0 {
-            continue;
-        }
-        let gap = above / below;
-        // The tail [p, last) must be a detached, tight, low cluster.
-        let tail_max = sorted[p];
-        let tail_min = sorted[last - 1];
-        let tail_spread = tail_max / tail_min.max(num_floor);
-        let detached = gap > tail_spread; // separated more than it is wide
-        if detached && gap > best_gap {
-            best_gap = gap;
-            best_p = Some(p);
-        }
-    }
-
-    let cut = best_p.unwrap_or(last);
-    // Map the retained sorted positions [0, cut) back to original indices,
-    // preserving the original eigenvalue ordering so the caller's column /
-    // eigenvector selection stays consistent.
-    let mut keep: Vec<usize> = order[..cut].to_vec();
-    keep.sort_unstable();
-    keep
+    evals
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &value)| (value.abs() > num_floor).then_some(idx))
+        .collect()
 }
 
 pub(crate) fn thin_plate_radial_reparam_from_constrained_penalty(
@@ -2263,14 +2202,15 @@ mod retained_radial_indices_tests {
 
     // The eigenvalue spectra below were captured from the live thin-plate
     // builder (`s(x, bs="tp", k=20)`) on the #1271 regression data. They lock
-    // in the *derived* selection behaviour: keep every genuine bending mode,
-    // drop only a detached near-null cluster — no tuned magnitude threshold.
+    // in the derived selection behaviour: keep EVERY numerically-real bending
+    // mode (matching mgcv, which truncates only at the numerical-rank floor),
+    // dropping only sub-floor roundoff dust — no tuned magnitude cutoff.
 
     #[test]
     fn linear_data_spectrum_keeps_every_mode() {
-        // Purely linear DGP: the constrained radial penalty decays smoothly
-        // with NO detached low cluster, so nothing beyond the numerical floor
-        // is spurious. REML (not pruning) drives the EDF down on linear data.
+        // Purely linear DGP: every eigenvalue is far above the numerical floor,
+        // so all are genuine curvature directions and must be kept. REML (not
+        // basis truncation) is responsible for the EDF on linear data.
         let evals = Array1::from_vec(vec![
             885.4, 119.98, 26.287, 10.030, 5.066, 2.330, 1.3953, 0.67709, 0.46814, 0.34210,
             0.26488, 0.17895, 0.14514,
@@ -2279,41 +2219,22 @@ mod retained_radial_indices_tests {
         assert_eq!(
             keep.len(),
             evals.len(),
-            "smooth (no-cluster) spectrum must retain all numerically real modes"
+            "all numerically real modes must be retained"
         );
     }
 
     #[test]
-    fn lidar_spectrum_drops_only_detached_null_cluster() {
-        // Real lidar fit: a smooth bending band (15 modes, 1212 -> 0.137) then
-        // a sharp ~3x gap into a tight 3-mode cluster (~0.045, 0.042, 0.038)
-        // that the constraint projection failed to annihilate. The elbow rule
-        // must drop exactly those 3 and keep the 15 bending modes.
+    fn lidar_spectrum_keeps_every_real_mode() {
+        // Real lidar fit: the smallest eigenvalues (~0.04) are still ~12 orders
+        // of magnitude above the numerical floor (K*eps*lambda_max ~ 5e-12), so
+        // they are real bending modes and are kept — pruning them by magnitude
+        // was the #1271 over-prune that collapsed the nonlinear truth recovery.
         let evals = Array1::from_vec(vec![
             1212.2, 144.94, 37.270, 15.529, 6.0768, 3.5845, 1.8094, 1.1058, 0.73002, 0.43701,
             0.33814, 0.23136, 0.18267, 0.15702, 0.13654, 0.044936, 0.041844, 0.038235,
         ]);
         let keep = thin_plate_retained_radial_indices(&evals);
-        assert_eq!(
-            keep.len(),
-            15,
-            "must keep the 15-mode bending band and drop the 3 detached near-null modes"
-        );
-        // The retained set must be exactly the 15 largest (indices 0..15 here,
-        // since the input is already descending).
-        assert_eq!(keep, (0..15).collect::<Vec<usize>>());
-    }
-
-    #[test]
-    fn lidar_spectrum_high_curvature_variant_drops_three() {
-        // Same dataset, the high-amplitude lidar arm: band 1.2e4 -> 1.44, then
-        // a 3x gap into {0.47, 0.40, 0.35}. Identical structural verdict.
-        let evals = Array1::from_vec(vec![
-            12150.0, 1758.1, 401.88, 157.29, 68.959, 36.126, 19.252, 11.533, 7.4731, 4.9983,
-            3.5362, 2.5345, 2.0843, 1.6395, 1.4437, 0.47063, 0.40472, 0.34763,
-        ]);
-        let keep = thin_plate_retained_radial_indices(&evals);
-        assert_eq!(keep.len(), 15, "drop the detached 3-mode null cluster");
+        assert_eq!(keep.len(), evals.len(), "every above-floor mode is kept");
     }
 
     #[test]
