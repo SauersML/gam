@@ -16,16 +16,21 @@
 //!      would violate this; a genuine hold-out cannot.
 //!
 //! GROUND-TRUTH CORRECTNESS (kept — this is correctness vs an exact quantity,
-//! not "same as a peer tool"). ALO is a Sherman–Morrison rank-1 shortcut for the
-//! leave-one-out predictor of the converged penalized weighted-least-squares
-//! system at fixed smoothing parameters λ. The *exact* mathematical definition
-//! of that quantity is the exhaustive n-fold refit of the same system with row i
-//! removed. We compute that brute force from gam's own converged geometry and
-//! require ALO to equal it to solver round-off. There is no peer tool here: the
-//! exhaustive refit is the analytic ground truth ALO is derived from, so the
-//! match is an objective correctness statement (covered by the spec's
-//! "reference IS mathematical ground truth — exact brute-force LOO refits"
-//! exception), reported alongside the predictive metrics above.
+//! not "same as a peer tool"). ALO is the EXACT frozen-CURVATURE leave-one-out
+//! predictor of the converged penalized system at fixed smoothing parameters λ:
+//! it holds the penalized Hessian H = XᵀWX + S(λ) FROZEN and solves the dropped-
+//! row stationarity reduced to the scalar fixed point η̃_i = η̂_i + h_i(μ(η̃_i)−y_i)
+//! with h_i = x_iᵀ H⁻¹ x_i (off-row curvature frozen, held-out row's score exact).
+//! The unimpeachable correctness identity is therefore ALO == an independently
+//! reconstructed frozen-curvature fixed point, to solver round-off (`eta_fc_rel`
+//! below). We ALSO report the exhaustive frozen-λ *re-curved* n-fold refit (which
+//! rebuilds the off-row curvature at each dropped optimum): ALO tracks it closely
+//! but only to within the genuine O(p/n) off-row-curvature estimand gap, not to
+//! round-off — so the round-off identity is asserted against the frozen-curvature
+//! oracle, the re-curved refit only to the predictive scale. Neither is a peer
+//! tool (both are analytic ground truth ALO is derived from), covered by the
+//! spec's "reference IS mathematical ground truth — exact brute-force LOO refits"
+//! exception, reported alongside the predictive metrics above.
 //!
 //! Why fix the converged working model rather than re-running full PIRLS + REML
 //! per fold: ALO approximates leave-one-out *at the converged linearisation and
@@ -346,6 +351,15 @@ fn alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log() {
     let mut brute_eta_tilde = vec![0.0_f64; n];
     let mut brute_leverage = vec![0.0_f64; n];
     let mut brute_se_bayes = vec![0.0_f64; n];
+    // EXACT frozen-CURVATURE LOO — the precise quantity ALO computes: the off-row
+    // penalized Hessian H is held FROZEN at its full-fit value and the dropped-row
+    // stationarity reduces to the scalar fixed point
+    //   η̃_i = η̂_i + h_i (μ(η̃_i) − y_i),   h_i = x_iᵀ H⁻¹ x_i,   μ(η)=exp(η),
+    // (canonical Poisson/log: c_i = w_i/μ'(η̂_i) = 1). Reconstructed independently
+    // here via a dense H⁻¹ leverage solve and a 1-D Newton iteration; ALO must
+    // match it to solver round-off (a strictly stronger claim than the re-curved
+    // refit comparison below, which carries an O(p/n) off-row-curvature gap).
+    let mut frozen_curv_eta_tilde = vec![0.0_f64; n];
     for i in 0..n {
         let xi: Array1<f64> = x.row(i).to_owned();
 
@@ -357,6 +371,36 @@ fn alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log() {
         }
         brute_leverage[i] = w[i] * x_hinv_x;
         brute_se_bayes[i] = (phi * x_hinv_x).max(0.0).sqrt();
+
+        // Frozen-curvature scalar fixed point anchored at η̂_i = o_i + x_iᵀ β̂.
+        let h_i = x_hinv_x;
+        let mut eta_hat_i = offset[i];
+        for k in 0..p {
+            eta_hat_i += xi[k] * beta_full[k];
+        }
+        let mut eta_fc = eta_hat_i;
+        let mut fc_converged = false;
+        for _ in 0..100usize {
+            let mu = eta_fc.exp();
+            let residual = eta_fc - eta_hat_i - h_i * (mu - y[i]);
+            if residual.abs() <= 1e-12 {
+                fc_converged = true;
+                break;
+            }
+            // ℓ_i''(η) = μ'(η) = exp(η); Newton Jacobian 1 − h_i μ(η).
+            let jac = 1.0 - h_i * mu;
+            assert!(
+                jac.abs() > 1e-12 && jac.is_finite(),
+                "frozen-curvature leave-{i}-out Jacobian degenerate: {jac:.3e}"
+            );
+            eta_fc -= residual / jac;
+            assert!(eta_fc.is_finite(), "frozen-curvature leave-{i}-out diverged");
+        }
+        assert!(
+            fc_converged,
+            "frozen-curvature leave-{i}-out scalar fixed point did not converge"
+        );
+        frozen_curv_eta_tilde[i] = eta_fc;
 
         // Exact hold-out refit: H₋ᵢ = H − w_i x_i x_iᵀ , RHS₋ᵢ = c − w_i(z_i−o_i)x_i.
         let mut h_minus = h.clone();
@@ -506,6 +550,10 @@ fn alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log() {
     // The classical one-step (linearised working-model) drop vs the same truth —
     // the benchmark the frozen-curvature refinement must improve upon.
     let onestep_true_rel = relative_l2(&brute_eta_tilde, &true_eta_tilde);
+    // ALO vs the EXACT frozen-curvature LOO (the identical scalar fixed point ALO
+    // solves) — a round-off correctness identity, not an approximation.
+    let eta_fc_rel = relative_l2(alo_eta, &frozen_curv_eta_tilde);
+    let eta_fc_max = max_abs_diff(alo_eta, &frozen_curv_eta_tilde);
     let se_corr = pearson(alo_se, &brute_se_bayes);
     let se_max_diff = max_abs_diff(alo_se, &brute_se_bayes);
 
@@ -516,7 +564,8 @@ fn alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log() {
          deviance in-sample={dev_in_sample:.4} LOO={dev_loo:.4}\n  \
          GROUND-TRUTH  leverage max|Δ|={lev_max_diff:.3e} pearson={lev_corr:.6}  \
          eta_tilde(vs true refit) rel_l2={eta_rel:.3e} pearson={eta_corr:.6} \
-         (one-step vs true refit rel_l2={onestep_true_rel:.3e})  \
+         (one-step vs true refit rel_l2={onestep_true_rel:.3e}; \
+         vs frozen-curvature rel_l2={eta_fc_rel:.3e} max|Δ|={eta_fc_max:.3e})  \
          se_bayes max|Δ|={se_max_diff:.3e} pearson={se_corr:.5}",
         100.0 * loo_truth_frac
     );
@@ -602,6 +651,22 @@ fn alo_loo_recovers_truth_and_matches_exact_brute_force_poisson_log() {
     assert!(
         eta_corr > 0.99999,
         "ALO eta_tilde must be near-perfectly correlated with the true LOO refit: pearson={eta_corr:.6}"
+    );
+    // EXACT-ESTIMAND IDENTITY: ALO IS the frozen-curvature scalar fixed point, so
+    // it must equal the independently-reconstructed frozen-curvature LOO to solver
+    // round-off — a far tighter and more precise correctness claim than the
+    // re-curved-refit comparison above (which carries the legitimate O(p/n)
+    // off-row-curvature estimand gap). This pins the ALO algebra to its EXACT
+    // analytic definition; a real defect would break it well before the 1e-2 bar.
+    assert!(
+        eta_fc_rel < 1e-6,
+        "ALO eta_tilde must equal the exact frozen-curvature LOO to round-off: \
+         rel_l2={eta_fc_rel:.3e} max|Δ|={eta_fc_max:.3e}"
+    );
+    assert!(
+        eta_fc_max < 1e-6,
+        "ALO eta_tilde worst-case deviation from the exact frozen-curvature LOO: \
+         max|Δ|={eta_fc_max:.3e}"
     );
 
     // Bayesian SE √(φ x_iᵀ H⁻¹ x_i): ALO and the reference form the IDENTICAL
