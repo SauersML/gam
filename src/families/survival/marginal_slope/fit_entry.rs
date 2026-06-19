@@ -2268,7 +2268,12 @@ pub fn fit_survival_marginal_slope_terms(
     // post-cutover bindings (designs, make_family, build_blocks, the
     // outer solve closures), which is outside the surgical scope of this
     // hook; the diagnostic is the principled stop here.
-    if let Some(ref ctx) = recompile_after_accept {
+    if n < 1_000 {
+        log::debug!(
+            "[smgs phase-4b recompile-after-accept] skipped for tiny fit n={n}; \
+             diagnostic-only post-convergence recompile is reserved for larger fits"
+        );
+    } else if let Some(ref ctx) = recompile_after_accept {
         let recompile_started = std::time::Instant::now();
         // Lift compiled β → raw β when the cutover fired. Otherwise the
         // block_states already carry raw-width β.
