@@ -330,8 +330,7 @@ pub trait HessianOperator: Send + Sync {
         self.trace_logdet_gradient(&op.to_dense())
     }
 
-    /// Efficient computation of tr(G_ε(H) Hₖ) for the logdet gradient,
-    /// analogous to `trace_hinv_h_k` but using the logdet gradient operator.
+    /// Efficient computation of tr(G_ε(H) Hₖ) for the logdet gradient.
     ///
     /// Default implementation: forms the correction and calls `trace_logdet_gradient`.
     fn trace_logdet_h_k(
