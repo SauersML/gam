@@ -419,13 +419,6 @@ pub(crate) fn weighted_normal_equations(
 /// near-singular cycles — strictly cheaper than the full eigh and short-circuiting
 /// on the first PD factorization. The resulting shift makes `H_pen + δI` PD,
 /// which is exactly what the downstream solve requires.
-pub(crate) fn exact_newton_stabilizing_shift(
-    lhs_dense: &Array2<f64>,
-    ridge_floor: f64,
-) -> Option<f64> {
-    stabilizing_shift_core(lhs_dense, lhs_dense, ridge_floor)
-}
-
 /// Stabilizing shift for a penalized joint Hessian `combined = H_data + S` whose
 /// penalty `S` is positive-semidefinite by construction.
 ///
@@ -458,12 +451,9 @@ pub(crate) fn exact_newton_stabilizing_shift_psd_penalized(
     stabilizing_shift_core(combined, gershgorin_src, ridge_floor)
 }
 
-/// Shared engine for the stabilizing-shift helpers. `cholesky_test` is the matrix
+/// Shared engine for the stabilizing-shift helper. `cholesky_test` is the matrix
 /// that must end up positive definite; `gershgorin_src` is the matrix whose
-/// Gershgorin disc lower-bounds `λ_min`. The two coincide for the plain
-/// [`exact_newton_stabilizing_shift`]; they differ when a PSD penalty lets us
-/// bound the shift by the data Hessian alone
-/// ([`exact_newton_stabilizing_shift_psd_penalized`]).
+/// Gershgorin disc lower-bounds `λ_min`.
 fn stabilizing_shift_core(
     cholesky_test: &Array2<f64>,
     gershgorin_src: &Array2<f64>,

@@ -4444,11 +4444,11 @@ pub(crate) fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction()
     let joint_mode_diagonal_ridge = 0.0_f64; // policy: ridge NOT in objective
     // `stabilized_joint_solver_diagonal_ridge` consults the family only
     // for `use_exact_newton_strict_spd`, which defaults to false; we
-    // simulate that branch by computing the shift directly via
-    // `exact_newton_stabilizing_shift`.
+    // simulate that branch by computing the live PSD-penalized shift with
+    // the same source matrix.
     let mut lhs = h_nll.clone();
     add_joint_penalty_to_matrix(&mut lhs, &ranges, &s_lambdas, base, None);
-    let shift = exact_newton_stabilizing_shift(&lhs, ridge_floor)
+    let shift = exact_newton_stabilizing_shift_psd_penalized(&lhs, &lhs, ridge_floor)
         .expect("indefinite Hessian must yield a positive stabilizing shift");
     assert!(
         shift > 0.9,
