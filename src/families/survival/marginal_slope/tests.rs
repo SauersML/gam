@@ -1258,7 +1258,7 @@ fn rigid_row_kernel_propagates_nan_signed_margin_errors() {
 /// mirrors the verified directional path in
 /// `row_neglog_directional_with_scale_jet` term for term — so every
 /// derivative channel is exact by construction and the oracle audit below
-/// is a true correctness proof of the hand kernel.
+/// is a true correctness proof of the production kernel.
 struct SurvivalMarginalSlopeRigidNllProgram {
     primaries: Vec<[f64; 4]>,
     z: Vec<f64>,
@@ -1387,14 +1387,14 @@ fn oracle_rigid_family(
 
 /// #932 universal oracle on the ONLY production `RowKernel` impl.
 ///
-/// Audits every channel the hand-written `SurvivalMarginalSlopeRowKernel`
+/// Audits every channel the production `SurvivalMarginalSlopeRowKernel`
 /// emits — value / gradient / Hessian / `row_third_contracted(dir)` /
 /// `row_fourth_contracted(u, v)` — against the single-expression
 /// `RowNllProgram<4>`-derived tower truth, over several fixture rows
 /// (mixed event/censored, with and without Gaussian frailty so the probit
 /// scale ≠ 1) and several random direction vectors. The cross blocks that
 /// #736's sign flip corrupted are contracted explicitly. Agreement here is
-/// the proof the hand kernel is correct; the planted-flip test in
+/// the proof the production kernel is correct; the planted-flip test in
 /// `jet_tower` proves the same harness is loud on disagreement.
 #[test]
 fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
@@ -1468,13 +1468,13 @@ fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
             let tower = evaluate_program(&program, row).expect("tower evaluation");
 
             let (value, gradient, hessian) =
-                RowKernel::row_kernel(&kernel, row).expect("hand kernel value/grad/hess");
+                RowKernel::row_kernel(&kernel, row).expect("production kernel value/grad/hess");
 
             let third: Vec<([f64; 4], [[f64; 4]; 4])> = dirs
                 .iter()
                 .map(|dir| {
                     let claim = RowKernel::row_third_contracted(&kernel, row, dir)
-                        .expect("hand kernel third");
+                        .expect("production kernel third");
                     (*dir, claim)
                 })
                 .collect();
@@ -1485,7 +1485,7 @@ fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
                 .map(|(i, u)| {
                     let v = dirs[(i + 1) % dirs.len()];
                     let claim = RowKernel::row_fourth_contracted(&kernel, row, u, &v)
-                        .expect("hand kernel fourth");
+                        .expect("production kernel fourth");
                     (*u, v, claim)
                 })
                 .collect();
@@ -1500,7 +1500,7 @@ fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
 
             verify_kernel_channels(&tower, &claims, 1e-9).unwrap_or_else(|e| {
                     panic!(
-                        "frailty {frailty:?} row {row}: hand RowKernel disagrees with #932 jet-tower truth: {e}"
+                        "frailty {frailty:?} row {row}: production RowKernel disagrees with #932 jet-tower truth: {e}"
                     )
                 });
         }

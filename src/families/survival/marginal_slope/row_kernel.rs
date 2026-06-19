@@ -26,6 +26,88 @@ impl SurvivalMarginalSlopeRowKernel {
     }
 }
 
+impl crate::families::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRowKernel {
+    fn n_rows(&self) -> usize {
+        self.family.n
+    }
+
+    fn primaries(&self, row: usize) -> Result<[f64; 4], String> {
+        let q_geom = self.family.row_dynamic_q_values(row, &self.block_states)?;
+        Ok([
+            q_geom.q0,
+            q_geom.q1,
+            q_geom.qd1,
+            self.block_states[2].eta[row],
+        ])
+    }
+
+    fn row_nll(
+        &self,
+        row: usize,
+        p: &[crate::families::jet_tower::Tower4<4>; 4],
+    ) -> Result<crate::families::jet_tower::Tower4<4>, String> {
+        use crate::families::jet_tower::Tower4;
+
+        let wi = self.family.weights[row];
+        let di = self.family.event[row];
+        let (z_sum, covariance_ones) = self.family.exact_shared_score_summary(
+            row,
+            &self.block_states,
+            "survival marginal-slope rigid row tower",
+        )?;
+        let probit_scale = self.family.probit_frailty_scale();
+
+        let q0 = p[0];
+        let q1 = p[1];
+        let qd1 = p[2];
+        let g = p[3];
+
+        let observed_g = g * probit_scale;
+        let one_plus_b2 = observed_g * observed_g * covariance_ones + 1.0;
+        let c = one_plus_b2.compose_unary(unary_derivatives_sqrt(one_plus_b2.v));
+
+        let eta0 = q0 * c + observed_g * z_sum;
+        let eta1 = q1 * c + observed_g * z_sum;
+        let ad1 = qd1 * c;
+
+        let qd1_lower = self.family.time_derivative_lower_bound();
+        if survival_derivative_guard_violated(qd1.v, qd1_lower) {
+            return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
+                reason: format!(
+                    "survival marginal-slope monotonicity violated at row {row}: raw time derivative={:.3e} must be at least derivative_guard={:.3e}; transformed time derivative={:.3e}",
+                    qd1.v, qd1_lower, ad1.v
+                ),
+            }
+            .into());
+        }
+
+        let neg_eta0 = -eta0;
+        let entry = neg_eta0
+            .compose_unary(unary_derivatives_neglog_phi(neg_eta0.v, wi))
+            .scale(-1.0);
+
+        let neg_eta1 = -eta1;
+        let exit =
+            neg_eta1.compose_unary(unary_derivatives_neglog_phi(neg_eta1.v, wi * (1.0 - di)));
+
+        let event_density = if di > 0.0 {
+            eta1.compose_unary(unary_derivatives_log_normal_pdf(eta1.v))
+                .scale(-wi * di)
+        } else {
+            Tower4::<4>::zero()
+        };
+
+        let time_deriv = if di > 0.0 {
+            ad1.compose_unary(unary_derivatives_log(ad1.v))
+                .scale(-wi * di)
+        } else {
+            Tower4::<4>::zero()
+        };
+
+        Ok(exit + entry + event_density + time_deriv)
+    }
+}
+
 impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     fn n_rows(&self) -> usize {
         self.family.n
@@ -35,23 +117,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     }
 
     fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
-        let beta_time = &self.block_states[0].beta;
-        let q0 = self.family.design_entry.dot_row(row, beta_time)
-            + self.family.offset_entry[row]
-            + self.block_states[1].eta[row];
-        let q1 = self.family.design_exit.dot_row(row, beta_time)
-            + self.family.offset_exit[row]
-            + self.block_states[1].eta[row];
-        let qd1 = self.family.design_derivative_exit.dot_row(row, beta_time)
-            + self.family.derivative_offset_exit[row];
-        self.family.row_primary_closed_form_rigid(
-            row,
-            q0,
-            q1,
-            qd1,
-            &self.block_states,
-            self.family.probit_frailty_scale(),
-        )
+        crate::families::jet_tower::derived_row_kernel(self, row)
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 4] {
@@ -188,13 +254,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     }
 
     fn row_third_contracted(&self, row: usize, dir: &[f64; 4]) -> Result<[[f64; 4]; 4], String> {
-        // Batched path: one k=5 MultiDirJet [e_0..e_3, dir] covers all 6
-        // off-diagonal (a,b) entries via mask reads; 4 small k=3 jets handle
-        // diagonal ∂²_{e_a} ∂_{dir} entries. Replaces the legacy 10 separate
-        // calls into row_neglog_directional_refs.
-        let dir_view = ndarray::aview1(&dir[..]);
-        self.family
-            .row_primary_third_contracted_batched(row, &self.block_states, dir_view)
+        crate::families::jet_tower::derived_third_contracted(self, row, dir)
     }
 
     fn row_fourth_contracted(
@@ -203,13 +263,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         dir_u: &[f64; 4],
         dir_v: &[f64; 4],
     ) -> Result<[[f64; 4]; 4], String> {
-        // Batched path: one k=6 MultiDirJet [e_0..e_3, dir_u, dir_v] covers
-        // the 6 off-diagonal (a,b) entries; 4 k=4 jets handle the diagonal
-        // ∂²_{e_a} ∂_{dir_u} ∂_{dir_v} entries.
-        let u_view = ndarray::aview1(&dir_u[..]);
-        let v_view = ndarray::aview1(&dir_v[..]);
-        self.family
-            .row_primary_fourth_contracted_batched(row, &self.block_states, u_view, v_view)
+        crate::families::jet_tower::derived_fourth_contracted(self, row, dir_u, dir_v)
     }
 }
 
