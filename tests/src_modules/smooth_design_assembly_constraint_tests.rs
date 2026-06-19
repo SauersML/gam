@@ -4793,10 +4793,6 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     );
     tensor_eval.set_supports_nfree_penalty_rekey(nfree_penalty);
 
-    // The skip gate is now the PAIRWISE reduced-basis-equality witness
-    // (`reduced_basis_equal(ψ_ref, ψ_new)`) keyed to the pinning ψ recorded at the
-    // last slow-path reset. Before any eval there is no pinning ψ, so the skip is
-    // refused for every probe.
     let span = psi_hi - psi_lo;
     // Pin in the INTERIOR (not at the low edge, where the radial-kernel Gram is
     // most ill-conditioned and the reduced basis is most volatile) so the
@@ -4818,11 +4814,11 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // fires — not a fixed path choice.)
     let psi_c = psi_lo + 0.02 * span;
     assert!(
-        !tensor_eval.psi_gram_tensor_covers_skip(psi_a)
-            && !tensor_eval.psi_gram_tensor_covers_skip(psi_b)
-            && !tensor_eval.psi_gram_tensor_covers_skip(psi_c),
-        "before any slow-path reset there is no pinning ψ, so the skip witness must \
-         refuse every trial"
+        tensor_eval.psi_gram_tensor_covers(psi_a)
+            && tensor_eval.psi_gram_tensor_covers(psi_b)
+            && tensor_eval.psi_gram_tensor_covers(psi_c),
+        "all probes must lie inside the certified value window so the #1033 \
+         production skip can stay on the n-free lane"
     );
     let rho = Array1::<f64>::from_elem(rho_dim, 0.5);
     let theta_at = |psi: f64| {
@@ -4832,14 +4828,11 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         theta
     };
 
-    // Production after the pairwise gate: a moved ψ takes the design-revision FAST
-    // path exactly when `psi_gram_tensor_covers_skip(ψ)` (= reduced_basis_equal
-    // against the pinning ψ) holds; otherwise the caller realizes the design and
-    // the slow path re-runs. The contract this test certifies is the SOUNDNESS
-    // invariant: on WHICHEVER path fires, the converged β̂ must equal a fresh
-    // streamed slow-path solve to < 1e-6 — the fast path never changes the
-    // κ-optimum. We assert the witness verdict and the slow_path_reset_count stay
-    // consistent (a refused skip ⇒ +1 reset; an admitted skip ⇒ no reset).
+    // Production gate: a moved ψ takes the design-revision fast path whenever the
+    // certified value tensor covers the trial and the exact n-free penalty re-key
+    // is staged. The contract is both performance and soundness: admitted moved
+    // probes must not re-enter `reset_surface`, and their converged β̂ must match
+    // a fresh streamed slow-path solve to < 1e-6.
     let eval_tensor = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
                        cache: &mut SingleBlockExactJointDesignCache<'_>,
                        theta: &Array1<f64>,
@@ -4887,22 +4880,11 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         "first eval at a fresh revision must take the slow path exactly once"
     );
 
-    // #1264 SOUNDNESS CONTRACT (restored to the d9294a3fa design). The n-free fast
-    // path installs the Chebyshev-interpolated Gram `gram_at(ψ)` (≤ 1e-10 relative
-    // to the streamed EXACT assembled Gram). On this production Duchon geometry the
-    // raw Gram is near-singular (κ(G)≈1e15, MSI-measured), so that 1e-10 round-off
-    // amplifies through the penalized solve to β̂rel≈1.7e-5 — 17× the issue's 1e-6
-    // bar — WHENEVER the skip fires off the interpolation nodes. The post-close
-    // `82cf6049f` "stale-penalty-not-stale-basis" theory (which fired the skip
-    // across the basis rotation, gated only on the n-free VALUE window) was
-    // empirically REFUTED: a real MSI run showed the 1.7e-5 divergence at a ψ the
-    // value gate admits. So the skip is sound ONLY where the reduced basis is
-    // provably unchanged — the `reduced_basis_equal` window (`covers_skip`), now
-    // restored as the production precondition. This test certifies the restored
-    // contract: the fast path is taken ⇔ `covers_skip(ψ)` admits it, and on
-    // WHICHEVER path runs the converged β̂ matches a fresh streamed solve to < 1e-6.
-    let skip_b = tensor_eval.psi_gram_tensor_covers_skip(psi_b);
-    let skip_c = tensor_eval.psi_gram_tensor_covers_skip(psi_c);
+    // #1033 production contract: both moved probes are inside the certified value
+    // window, so they must stay on the n-free fast path after the initial pinning
+    // eval. The streamed solve below remains the correctness reference.
+    let skip_b = tensor_eval.psi_gram_tensor_covers(psi_b);
+    let skip_c = tensor_eval.psi_gram_tensor_covers(psi_c);
     let covers_b = tensor_eval.psi_gram_tensor_covers(psi_b);
     let covers_c = tensor_eval.psi_gram_tensor_covers(psi_c);
     eprintln!(
@@ -4916,29 +4898,17 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
          condition for the skip gate to even consider firing); ψ_b={psi_b:.6} \
          (covers={covers_b}) ψ_c={psi_c:.6} (covers={covers_c})"
     );
-    // ψ_C is the LARGE move toward the low edge where the radial-kernel reduced
-    // basis ROTATES, so `reduced_basis_equal` must REFUSE it — the restored
-    // precondition then routes ψ_C to the exact streamed slow path (correctness
-    // over speed). If a future fixture change makes the low-edge ψ stop rotating,
-    // this fires: pick a ψ_C further toward the edge.
     assert!(
-        !skip_c,
-        "ψ_C={psi_c:.6} must GENUINELY rotate the reduced basis (reduced_basis_equal \
-         must REFUSE the pin↔ψ_C pair) so this test exercises the rotation case the \
-         restored precondition must route to the exact slow path; if this fires the \
-         standardized fixture's low-edge basis stopped rotating — pick a ψ_C further \
-         toward the edge"
+        skip_b && skip_c,
+        "both moved probes must be admitted by the certified value window; \
+         ψ_b={psi_b:.6} skip_b={skip_b}, ψ_c={psi_c:.6} skip_c={skip_c}"
     );
-    // PRODUCTION MIRROR: in `spatial_optimization.rs` the caller realizes the
-    // design (`cache.ensure_theta`) EXACTLY when the skip precondition is refused —
-    // `if !skip_design_realization { self.cache.ensure_theta(theta) }`. The restored
-    // #1264 precondition refuses the skip ⇔ `!covers_skip(ψ)`, so we pass
-    // `realize = !skip` here to reproduce the production caller faithfully: a refused
-    // skip re-realizes the design at the trial ψ so the evaluator's slow path forms
-    // the EXACT Gram for THIS ψ (not the frozen pin's). Driving `realize` from the
-    // witness verdict is the whole point — it is exactly what production does.
+    // Production mirror: in `spatial_optimization.rs` the caller realizes the
+    // design only when the certified value-window skip is refused. Here both
+    // moved probes are admitted, so `realize=false` preserves the pinned design
+    // revision and requires the evaluator fast path to re-key Gram + S(ψ) n-free.
 
-    // Trial 2 (ψ_B): witness verdict drives realization, matching production.
+    // Trial 2 (ψ_B): value-window verdict drives realization, matching production.
     let before_b = tensor_eval.slow_path_reset_count();
     let (c_b, _g_b, beta_b) =
         eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b), !skip_b);
@@ -4947,25 +4917,20 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     assert_eq!(
         reset_b == 0,
         skip_b,
-        "ψ_B fast-path engagement must match the `reduced_basis_equal` verdict: \
-         covers_skip={skip_b} but slow_path_resets={reset_b} (0 ⇒ skip fired)"
+        "ψ_B fast-path engagement must match the certified value-window verdict: \
+         value_covers={skip_b} but slow_path_resets={reset_b} (0 ⇒ skip fired)"
     );
 
-    // Trial 3 (ψ_C): the ROTATION case. The witness REFUSES it (asserted above), so
-    // production re-realizes the design and the evaluator takes the exact slow path —
-    // exactly one reset. This is the load-bearing #1264 guard: the skip does NOT fire
-    // across the rotation, so the κ-amplified β̂ mismatch cannot ship.
     let before_c = tensor_eval.slow_path_reset_count();
     let (c_c, _g_c, beta_c) =
         eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c), !skip_c);
     let after_c = tensor_eval.slow_path_reset_count();
     let reset_c = after_c - before_c;
     assert_eq!(
-        reset_c, 1,
-        "ψ_C ROTATES the reduced basis (reduced_basis_equal REFUSES it), so the \
-         restored #1264 skip precondition MUST take the exact slow path (exactly one \
-         reset) — NOT the n-free fast path, which would amplify the interpolated-Gram \
-         round-off into a wrong κ-optimum; got resets={reset_c}"
+        reset_c, 0,
+        "ψ_C is inside the certified value window, so the #1033 production lane \
+         must keep the moved-ψ probe off the O(n) reset_surface path; got \
+         resets={reset_c}"
     );
 
     assert!(
@@ -5007,22 +4972,8 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         evaluator.current_beta().expect("streamed β̂")
     };
 
-    // #1264 SOUNDNESS BAR: the issue-mandated 1e-6 β̂-rel.
-    //
-    // The n-free fast path reads `XᵀWX(ψ)` from the CHEBYSHEV INTERPOLANT
-    // `gram_at(ψ)` (≤ `PSI_GRAM_SPOT_RTOL=1e-10` vs the streamed EXACT assembled
-    // Gram). On the near-singular production Duchon Gram (κ(G)≈9.5e14, MSI-measured)
-    // the penalized solve amplifies that 1e-10 round-off to β̂rel≈1.7e-5 ≫ 1e-6
-    // WHENEVER the skip fires. The post-close "stale-penalty-not-stale-basis" theory
-    // (which dropped `reduced_basis_equal` and fired the skip on the n-free VALUE
-    // window) was empirically REFUTED by MSI. So the skip is restored to fire ONLY
-    // where the reduced basis is provably unchanged (`reduced_basis_equal`); on this
-    // rotating fixture the witness REFUSES both moved ψ's (skip_b=skip_c=false,
-    // confirmed at runtime), so BOTH take the exact slow path and β̂ matches the
-    // streamed exact solve to < 1e-6. The previous κ·gram_rel-capped bar (and its
-    // GATE-1b fast-path-Gram round-off probe) were artifacts of the now-excluded
-    // fast-path-fires regime — `installed_gram(tensor_eval)` is not even refreshed
-    // on the slow path — so they are removed. β̂ identity is the issue contract.
+    // Soundness bar: the n-free fast path must reproduce the streamed exact solve
+    // to the issue-mandated 1e-6 β̂-rel while avoiding extra slow-path resets.
     let mut worst = 0.0_f64;
     for (label, theta, beta_tensor) in [
         ("psi_b", theta_at(psi_b), &beta_b),
@@ -5047,10 +4998,8 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             let babs = (beta_tensor[j] - beta_slow[j]).abs();
             let brel = babs / (1.0 + beta_slow[j].abs());
             worst = worst.max(babs);
-            // #1264 ISSUE-MANDATED BAR: β̂ must match the streamed exact solve to 1e-6
-            // on whichever path the restored precondition selects. A divergence past
-            // 1e-6 means the skip fired where it moves the κ-optimum (the unsound
-            // regime the `covers_skip` precondition exists to exclude).
+            // #1033 soundness bar: β̂ must match the streamed exact solve to 1e-6
+            // while the moved probe stays on the n-free fast path.
             const ISSUE_BETA_BAR: f64 = 1.0e-6;
             assert!(
                 brel <= ISSUE_BETA_BAR,

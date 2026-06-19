@@ -291,8 +291,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// Record the pinning ψ frozen by a slow-path `reset_surface` (#1264): the
     /// single design-moving ψ when `theta` carries one (`theta.len() == rho_dim +
     /// 1`), else `None` (multi-ψ / no-ψ fits have no single-ψ witness). The
-    /// reduced-basis witness remains available through `psi_gram_tensor_covers_skip`,
-    /// while the #1033 n-free production lane gates on the certified value window.
+    /// #1033 n-free production lane gates on the certified value window.
     fn record_reset_psi(&mut self, theta: &Array1<f64>, rho_dim: usize) {
         self.last_reset_psi = if theta.len() == rho_dim + 1 {
             Some(theta[rho_dim])
@@ -518,28 +517,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.psi_gram_tensor
             .as_ref()
             .is_some_and(|t| t.contains(psi))
-    }
-
-    /// True when a certified ψ-Gram tensor is installed AND the design-revision
-    /// fast-path skip to `psi` is SOUND given the reduced-basis reference surface
-    /// frozen at the last slow-path reset ψ (`last_reset_psi`) (#1264, #1216 item
-    /// 3). The skip re-keys the Gram + penalty on the frozen reference surface;
-    /// it reproduces the exact slow-path β̂ only when the realized reduced basis
-    /// (the range / null split of the conditioned data Gram) at the pinning ψ is
-    /// still valid at `psi`. On the wide standardized window the radial-kernel
-    /// reduced subspace can rotate with ψ; a skip across that rotation pairs a
-    /// stale reduced basis with a re-keyed Gram and yields a wrong β̂. The pairwise
-    /// witness [`PsiGramTensor::reduced_basis_equal`] compares the gauge-invariant
-    /// range projectors at the two ψ's n-free; the skip fires only where they
-    /// span the same subspace. Without a recorded pinning ψ the skip is refused.
-    pub(crate) fn psi_gram_tensor_covers_skip(&self, psi: f64) -> bool {
-        let Some(tensor) = self.psi_gram_tensor.as_ref() else {
-            return false;
-        };
-        let Some(psi_ref) = self.last_reset_psi else {
-            return false;
-        };
-        tensor.reduced_basis_equal(psi_ref, psi)
     }
 
     /// Revision of the canonical surface pinned by the last slow-path
