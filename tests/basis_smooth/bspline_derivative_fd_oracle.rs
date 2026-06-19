@@ -145,6 +145,53 @@ fn bspline_derivatives_1_through_4_match_central_finite_differences() {
 }
 
 #[test]
+fn bspline_derivative_matches_fd_on_uniform_open_knots() {
+    // Regression for gam#1348: on a UNIFORM OPEN (unclamped) knot vector
+    // — e.g. `linspace(a, b, m)` with no repeated boundary knots — the
+    // non-periodic first derivative must equal the central finite difference
+    // of the non-periodic value basis, including in the two boundary spans.
+    //
+    // The previous code ran the derivative evaluation point through a
+    // `periodic_unclamped_derivative_eval_point` helper that, for a uniform
+    // open vector, computed `period = h*(num_basis-degree)` and wrapped the
+    // point as if the basis were cyclic. The value path never wraps (it clamps
+    // to the interior), so the wrapped derivative landed on disjoint columns and
+    // disagreed with the FD of the value in the boundary spans.
+    let degree = 3usize;
+    // Uniform OPEN knot vector on [0, 1] with no boundary repeats.
+    let knots = Array1::<f64>::linspace(0.0, 1.0, 12);
+    let n = knots.len() - degree - 1;
+
+    // Sample across the whole interior domain [knots[degree], knots[n]],
+    // deliberately including the first and last *interior* spans where the bug
+    // manifested. Stay a stencil-width clear of every knot so the central
+    // difference straddles a single polynomial piece.
+    let left = knots[degree];
+    let right = knots[n];
+    let h = 1e-6_f64;
+    let mut x = left + 3.0 * h;
+    while x < right - 3.0 * h {
+        let near_knot = knots
+            .iter()
+            .any(|&t| (x - t).abs() <= 3.0 * h && t > left && t < right);
+        if !near_knot {
+            let an = analytic(x, knots.view(), degree, 1);
+            for i in 0..n {
+                let fd = fd_col(x, knots.view(), degree, i, 1, h);
+                let diff = (an[i] - fd).abs();
+                let tol = 1e-5 + 1e-4 * an[i].abs();
+                assert!(
+                    diff <= tol,
+                    "uniform-open knots, i={i} x={x}: analytic={} fd={fd} |diff|={diff} tol={tol}",
+                    an[i],
+                );
+            }
+        }
+        x += (right - left) / 53.0;
+    }
+}
+
+#[test]
 fn bspline_derivative_partition_of_unity_sums_to_zero() {
     // The B-spline columns sum to 1 everywhere on the clamped interior, so
     // every derivative order must sum to exactly 0 across columns. This is an
