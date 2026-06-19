@@ -2090,8 +2090,6 @@ pub fn fit_survival_marginal_slope_terms(
             }
             let sigma = sigma_from_theta(theta);
             sigma_hint.replace(sigma);
-            let family = make_family(&designs[0], &designs[1], sigma, FlexActivation::On);
-            let derivative_blocks = get_derivative_blocks(theta, specs, designs)?;
             // Preserve ValueOnly probes and request the Hessian exactly when
             // this realized family advertised analytic joint second-order
             // support.
@@ -2100,6 +2098,12 @@ pub fn fit_survival_marginal_slope_terms(
                     EvalMode::ValueAndGradient
                 }
                 other => other,
+            };
+            let family = make_family(&designs[0], &designs[1], sigma, FlexActivation::On);
+            let derivative_blocks = if matches!(effective_mode, EvalMode::ValueOnly) {
+                Arc::new(vec![Vec::new(); blocks.len()])
+            } else {
+                get_derivative_blocks(theta, specs, designs)?
             };
             let eval_id = outer_eval_counter.get();
             outer_eval_counter.set(eval_id.wrapping_add(1));
