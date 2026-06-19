@@ -575,6 +575,17 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         const FULLY_REJECTED_STALL_MAX_CYCLES: usize = 8;
         let mut prev_rejected_trust_radius: Option<f64> = None;
         let mut consecutive_held_rejected_cycles: usize = 0;
+        // Byte-identical fixed-point detector for the fully-rejected stall.
+        // Tracks the first-attempt trial objective of the previous fully-
+        // rejected cycle; when the current fully-rejected cycle reproduces it
+        // bit-for-bit the iterate is provably stationary at the f64 floor (the
+        // n≈3e5 marginal/logslope coupling case where the line search rejects
+        // every step on a 1-ULP cross-path round-off gap and β reverts
+        // identically each cycle). One repeat is conclusive, so the guard fires
+        // after two such cycles regardless of the `radius_held` heuristic.
+        let mut prev_rejected_first_attempt_objective: Option<f64> = None;
+        let mut consecutive_identical_rejected_cycles: usize = 0;
+        const IDENTICAL_REJECTED_STALL_MAX_CYCLES: usize = 2;
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
         // Cross-cycle cache of the joint Jeffreys/Firth triple `(β_key, ∇Φ, H_Φ)`
         // (gam#729/#826/#808). Computing `(∇Φ, H_Φ)` costs `p` family
@@ -1892,6 +1903,25 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let mut likelihood_rejects = 0usize;
             let mut objective_rejects = 0usize;
             let mut first_likelihood_reject: Option<String> = None;
+            // Fixed-point signature for the fully-rejected stall guard. The
+            // FIRST trust attempt of a cycle evaluates the proposal at the
+            // pre-cycle β (the attempt that has not yet shrunk the radius), so
+            // its trial objective is a deterministic function of (β, S, λ)
+            // alone. On a fully-rejected cycle β is reverted to that same
+            // pre-cycle value, so if two consecutive fully-rejected cycles
+            // report a *byte-identical* first-attempt trial objective the next
+            // cycle's entire Newton system, trust-region search, and reject
+            // outcome are provably byte-identical — the iterate is at an exact
+            // fixed point and every further cycle is a pure no-op. This is
+            // strictly stronger evidence than the `radius_held` heuristic (which
+            // can keep resetting while the boundary block's radius oscillates),
+            // so it lets the guard fire in two cycles instead of grinding to the
+            // 8-cycle held-radius count or the hard ceiling. Captured only on
+            // the first attempt; a successful first-attempt likelihood-reject
+            // leaves it `None` (and the early-exit reject path captures it
+            // explicitly below) so a non-finite trial cannot masquerade as a
+            // fixed point.
+            let mut first_attempt_trial_objective: Option<f64> = None;
             // Coalesce consecutive trust-region attempts whose accept/reject
             // outcome and numeric signature round to the same values, so a long
             // run of identical retries collapses into a single "attempts a..b
@@ -2431,6 +2461,12 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     }
                 };
                 let trialobjective = -trial_ll + trial_penalty;
+                if trust_attempt == 0 && trialobjective.is_finite() {
+                    // Deterministic fixed-point signature (see declaration). The
+                    // first attempt evaluates at the unshrunk pre-cycle β, so this
+                    // value identifies the iterate exactly.
+                    first_attempt_trial_objective = Some(trialobjective);
+                }
                 // Row measure observed by the trial objective at β + δ. The
                 // line-search helper above runs under `coefficient_line_search_options`,
                 // which now preserves `outer_score_subsample` and disables
@@ -2827,7 +2863,38 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     consecutive_held_rejected_cycles = 0;
                 }
                 prev_rejected_trust_radius = Some(joint_trust_radius);
-                if consecutive_held_rejected_cycles >= FULLY_REJECTED_STALL_MAX_CYCLES {
+                // Byte-identical fixed-point detector. A fully-rejected cycle
+                // whose first-attempt trial objective reproduces the previous
+                // fully-rejected cycle's value bit-for-bit proves β reverted to
+                // the same iterate and the Newton system is identical, so every
+                // further cycle is a provable no-op. This is stronger than the
+                // held-radius count and fires in two cycles, fixing the n≈3e5
+                // marginal/logslope grind where the held-radius path's off-by-one
+                // let the inner solve spin past the wall-clock budget (gam#979).
+                match (
+                    all_attempts_rejected,
+                    first_attempt_trial_objective,
+                    prev_rejected_first_attempt_objective,
+                ) {
+                    (true, Some(current), Some(prev))
+                        if current.to_bits() == prev.to_bits() =>
+                    {
+                        consecutive_identical_rejected_cycles =
+                            consecutive_identical_rejected_cycles.saturating_add(1);
+                    }
+                    _ => {
+                        consecutive_identical_rejected_cycles = 0;
+                    }
+                }
+                if all_attempts_rejected {
+                    prev_rejected_first_attempt_objective = first_attempt_trial_objective;
+                } else {
+                    prev_rejected_first_attempt_objective = None;
+                }
+                if consecutive_held_rejected_cycles >= FULLY_REJECTED_STALL_MAX_CYCLES
+                    || consecutive_identical_rejected_cycles
+                        >= IDENTICAL_REJECTED_STALL_MAX_CYCLES
+                {
                     let last_math_summary = last_joint_math
                         .as_ref()
                         .map(|math| {
@@ -2844,17 +2911,30 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             )
                         })
                         .unwrap_or_else(|| "last_newton_math=<none>".to_string());
+                    let stall_trigger = if consecutive_identical_rejected_cycles
+                        >= IDENTICAL_REJECTED_STALL_MAX_CYCLES
+                    {
+                        format!(
+                            "byte-identical first-attempt trial objective for {} consecutive \
+                             fully-rejected cycles (exact fixed point)",
+                            consecutive_identical_rejected_cycles
+                        )
+                    } else {
+                        format!(
+                            "{} consecutive fully-rejected cycles with joint trust radius held",
+                            consecutive_held_rejected_cycles
+                        )
+                    };
                     log::warn!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | fully-rejected stall \
                          early-exit: every trust-region attempt rejected (by any of the model / \
-                         likelihood / objective paths) for {} consecutive cycles with joint trust \
-                         radius held at {:.3e} throughout. Reverted β + held trust radius mean the \
-                         next cycle's Newton step is byte-identical to this one's; no descent \
-                         direction is reachable from this iterate under the current local model. \
-                         {}. Checking identified-subspace stationarity before declaring \
-                         non-convergence.",
+                         likelihood / objective paths) — {} at joint trust radius {:.3e}. Reverted β \
+                         + identical Newton system mean the next cycle's step is byte-identical to \
+                         this one's; no descent direction is reachable from this iterate under the \
+                         current local model. {}. Checking identified-subspace stationarity before \
+                         declaring non-convergence.",
                         cycle,
-                        consecutive_held_rejected_cycles,
+                        stall_trigger,
                         joint_trust_radius,
                         last_math_summary,
                     );
@@ -2985,6 +3065,11 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // forward a stale radius snapshot from the previous reject streak.
             prev_rejected_trust_radius = None;
             consecutive_held_rejected_cycles = 0;
+            // An accepted step moved β, so the fixed-point signature is stale;
+            // reset it so a later reject streak compares only consecutive
+            // fully-rejected cycles at the SAME iterate.
+            prev_rejected_first_attempt_objective = None;
+            consecutive_identical_rejected_cycles = 0;
             // Accepted-cycle timing breakdown is debug-only. The per-cycle
             // info line below already includes total cycle time; emitting a
             // four-phase split on every verbose cycle adds a redundant info
