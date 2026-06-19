@@ -2742,6 +2742,41 @@ fn debug_flex_base_hessian_vs_gradient_fd() {
         "symmetry check: H[g,w0]={:+.8e} H[w0,g]={:+.8e} fd col-g[w0]={:+.8e} fd col-w0[g]={:+.8e}",
         hess0[[g, w0]], hess0[[w0, g]], hg[w0], hw[g]
     );
+
+    // VALUE-FD gradient: differentiate the row NLL scalar VALUE directly to get
+    // the TRUE gradient[g] / grad[w0], pinning WHICH production gradient
+    // component is wrong (the Hessian asymmetry above proves one of them is).
+    let (grad0, _) = grad_hess(gv, &beta_h0, &beta_w0);
+    let value_at = |g: f64, beta_w: &[f64]| -> f64 {
+        let (fam, bsl) = make(g, &beta_h0, beta_w);
+        fam.row_neglog_flex_value(0, &bsl).unwrap()
+    };
+    let fd_val_g = |h: f64| -> f64 {
+        let c = (value_at(gv + h, &beta_w0) - value_at(gv - h, &beta_w0)) / (2.0 * h);
+        let f = (value_at(gv + h * 0.5, &beta_w0) - value_at(gv - h * 0.5, &beta_w0)) / h;
+        (4.0 * f - c) / 3.0
+    };
+    let fd_val_w0 = |h: f64| -> f64 {
+        let mut bp = beta_w0.clone();
+        let mut bm = beta_w0.clone();
+        bp[0] += h;
+        bm[0] -= h;
+        let c = (value_at(gv, &bp) - value_at(gv, &bm)) / (2.0 * h);
+        let mut bp2 = beta_w0.clone();
+        let mut bm2 = beta_w0.clone();
+        bp2[0] += h * 0.5;
+        bm2[0] -= h * 0.5;
+        let f = (value_at(gv, &bp2) - value_at(gv, &bm2)) / h;
+        (4.0 * f - c) / 3.0
+    };
+    eprintln!(
+        "VALUE-FD grad[g]: production={:+.8e} fd_value={:+.8e} gap={:.2e}",
+        grad0[g], fd_val_g(2e-3), (grad0[g] - fd_val_g(2e-3)).abs()
+    );
+    eprintln!(
+        "VALUE-FD grad[w0]: production={:+.8e} fd_value={:+.8e} gap={:.2e}",
+        grad0[w0], fd_val_w0(2e-3), (grad0[w0] - fd_val_w0(2e-3)).abs()
+    );
 }
 
 #[test]
