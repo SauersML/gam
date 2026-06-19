@@ -28,6 +28,37 @@ fn irrelevant_covariate_dataset(seed: u64, n: usize) -> gam::data::EncodedDatase
     .expect("encode")
 }
 
+/// log|H| via a plain Cholesky (H = L Lᵀ ⇒ log|H| = 2 Σ log L_ii). Returns None
+/// if H is not numerically PD (shouldn't happen at a converged penalized mode).
+fn chol_logdet(h: &ndarray::Array2<f64>) -> Option<f64> {
+    let n = h.nrows();
+    if n == 0 || h.ncols() != n {
+        return None;
+    }
+    let mut l = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            let mut s = h[[i, j]];
+            for k in 0..j {
+                s -= l[i * n + k] * l[j * n + k];
+            }
+            if i == j {
+                if s <= 0.0 {
+                    return None;
+                }
+                l[i * n + j] = s.sqrt();
+            } else {
+                l[i * n + j] = s / l[j * n + j];
+            }
+        }
+    }
+    let mut ld = 0.0;
+    for i in 0..n {
+        ld += 2.0 * l[i * n + i].ln();
+    }
+    Some(ld)
+}
+
 fn term_edf_and_penalty_cursor(fit: &FitResult, needle: &str) -> (f64, usize, usize) {
     let FitResult::Standard(std_fit) = fit else {
         panic!("expected standard fit");
@@ -68,11 +99,18 @@ fn diag_1266_zfold_dump() {
         let ll = &u.log_lambdas;
         let z_rho: Vec<f64> = (z_cur..z_cur + z_k).map(|i| ll[i]).collect();
         let x_rho: Vec<f64> = (x_cur..x_cur + x_k).map(|i| ll[i]).collect();
+        let log_h = u
+            .geometry
+            .as_ref()
+            .and_then(|g| chol_logdet(g.penalized_hessian.as_array()));
         println!(
-            "DIAG1266 seed={seed} converged={} iters={} gnorm={:?} | x_edf={x_edf:.4} x_rho={x_rho:?} | z_edf={z_edf:.4} z_rho={z_rho:?} | all_loglam={:?}",
+            "DIAG1266 seed={seed} converged={} iters={} gnorm={:?} reml={:.4} pen_term={:.4} log|H|={:?} | x_edf={x_edf:.4} x_rho={x_rho:?} | z_edf={z_edf:.4} z_rho={z_rho:?} | all_loglam={:?}",
             u.outer_converged,
             u.outer_iterations,
             u.outer_gradient_norm,
+            u.reml_score,
+            u.stable_penalty_term,
+            log_h,
             ll.to_vec(),
         );
     }
