@@ -152,24 +152,6 @@ pub struct PsiGramTensor {
     /// only when endpoint-aware checks certify this whole interval.
     grad_psi_lo: f64,
     grad_psi_hi: f64,
-    /// Reduced-basis-equality sub-window `[skip_psi_lo, skip_psi_hi] ⊆
-    /// [psi_lo, psi_hi]` over which the #1033 design-revision FAST PATH (which
-    /// skips `reset_surface` and re-keys only the Gram + penalty on a surface
-    /// pinned at a reference ψ) is SOUND (#1264).
-    ///
-    /// The fast path keeps the conditioned reduced design / null-space basis
-    /// frozen at the revision-pinning ψ and only swaps in `gram_at(ψ_new)` and
-    /// `S(ψ_new)`. That is exact only while the RRQR rank and pivot frame used by
-    /// the reduced basis are unchanged. On the WIDE standardized window (#1215)
-    /// the radial-kernel frame can pivot while the conditioning ratio still looks
-    /// tame, so a conditioning-only gate silently pairs a stale reduced basis
-    /// with a re-keyed Gram → a wrong β̂. Gram-derived RRQR rank/permutation is
-    /// only a necessary condition and has shipped β̂-rel ≈ 7.8e-2 on the
-    /// standardized gate fixture. Until the caller can prove the realized
-    /// reduced basis itself is equal, this sub-window is deliberately empty and
-    /// callers must take the full `reset_surface` slow path for moving-ψ trials.
-    skip_psi_lo: f64,
-    skip_psi_hi: f64,
     /// Number of Chebyshev coefficients (degree + 1).
     n_coeff: usize,
     k: usize,
@@ -338,9 +320,6 @@ impl PsiGramTensor {
                         // window. Endpoint checks use one-sided high-order
                         // stencils; interior checks use central stencils.
                         candidate.certify_gradient_window(&mut eval_design, weights);
-                        // Narrow the design-revision skip lane to the
-                        // reduced-basis-equality interior (#1264).
-                        candidate.compute_skip_window();
                         return Ok(candidate);
                     }
                     // The assembled Gram disagreed with an exact off-node
@@ -506,10 +485,6 @@ impl PsiGramTensor {
             // the value spot-check passes (`certify_gradient_window`).
             grad_psi_lo: psi_lo,
             grad_psi_hi: psi_hi,
-            // Provisional: `build` narrows these to the reduced-basis-equality
-            // interior after the spot-check passes (`compute_skip_window`).
-            skip_psi_lo: psi_lo,
-            skip_psi_hi: psi_hi,
             n_coeff: m,
             k,
             gram,
@@ -696,20 +671,6 @@ impl PsiGramTensor {
         self.grad_psi_hi = psi_hi;
     }
 
-    /// Locate the design-realization skip sub-window `[skip_psi_lo,
-    /// skip_psi_hi]`, and store it (#1264).
-    ///
-    /// The skip is sound for the full certified value window because the
-    /// Gaussian ψ-tensor cache marks its surface rows as stale. The Gaussian
-    /// identity short-circuit then consumes `(G(ψ), r(ψ), y'Wy)` for the solve,
-    /// data gradient, deviance, and log-likelihood instead of applying the
-    /// retained reference rows. The caller separately gates on exact n-free
-    /// penalty re-keying, so `S(ψ)` is refreshed before the inner solve.
-    fn compute_skip_window(&mut self) {
-        self.skip_psi_lo = self.psi_lo;
-        self.skip_psi_hi = self.psi_hi;
-    }
-
     /// Range (reduced-basis) projector of the conditioned Gram `XᵀWX(ψ)` and the
     /// numerical rank, computed n-free from the k-space tensor. The reduced basis
     /// the inner penalized solve forms is the column span of the eigenvectors of
@@ -800,20 +761,6 @@ impl PsiGramTensor {
     /// True when `psi` lies inside the certified window.
     pub fn contains(&self, psi: f64) -> bool {
         psi.is_finite() && psi >= self.psi_lo && psi <= self.psi_hi
-    }
-
-    /// True when `psi` lies inside the precomputed single-ψ reduced-basis-equality
-    /// sub-window. This window is deliberately empty (the skip's soundness is a
-    /// PAIRWISE property of `(ψ_ref, ψ_new)` — see [`Self::reduced_basis_equal`]),
-    /// so this accessor never fires. Retained only as the legacy single-ψ shape;
-    /// callers gate the design-revision skip on the pairwise witness against their
-    /// pinning ψ.
-    pub fn contains_for_skip(&self, psi: f64) -> bool {
-        psi.is_finite()
-            && self.skip_psi_lo.is_finite()
-            && self.skip_psi_hi.is_finite()
-            && psi >= self.skip_psi_lo
-            && psi <= self.skip_psi_hi
     }
 
     /// True when `psi` lies inside the certified gradient window where the
