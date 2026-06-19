@@ -641,14 +641,12 @@ class _SparsityLayer(nn.Module):
         # the FFI accessor rather than re-deriving the decay in Python.
         self._schedule = cfg.sparsity.gumbel_schedule()
         self._init_alpha = float(cfg.sparsity.init_alpha)
-        # #1282 hard-commitment window. DISABLED (0): under the decoder-harmonic
-        # confinement any hard commit that feeds an atom a *mixed* row set drives
-        # it to the degenerate averaged 2-plane (channel signs cancel), which is
-        # worse than no commit. Symmetry is instead broken at decoder init
-        # (``_break_decoder_symmetry``) and resolved by harmonic-confined
-        # balanced Sinkhorn EM, which never passes through a blend. Kept as a
-        # knob (the machinery remains) but off by default.
-        self._commit_steps = 0
+        # #1282 balanced-commitment window. For the first ~15% of the anneal
+        # (>=40 steps) commit each atom to a fixed balanced row partition to
+        # break expert collapse; the harmonic penalty then specializes each atom
+        # onto a distinct manifold and the assignment EMA preserves the partition.
+        self._commit_steps = max(40, int(0.15 * int(cfg.sparsity.tau_steps)))
+        self._commit_seed = 0x1282 * 2654435761 + int(cfg.n_atoms)
         # #1282 persistent per-row assignment accumulator (EMA of soft
         # responsibilities / commitment one-hots). At high reconstruction R² the
         # instantaneous per-atom residual carries almost no routing information
@@ -820,18 +818,17 @@ class _SparsityLayer(nn.Module):
             # differentiable quantity below; the hard routing is straight-through.
             soft = torch.softmax(balanced_log_resp, dim=-1)
 
-            # Sequential matching-pursuit commitment during an early window
-            # (issue #1282). This breaks the init symmetry by forcing the two
-            # atoms onto *distinct* manifolds: atom 0 fits one circle first, then
-            # atom 1 is committed to the rows atom 0 reconstructs worst. The
-            # decoder-harmonic smoothness penalty (``decoder_harmonic_penalty``)
-            # confines each atom to a single 2-plane, so once committed an atom
-            # genuinely *cannot* also fit the other manifold — the residual stays
-            # informative and the partition holds after the window releases
-            # (earlier, with snaking decoders, the committed routing decayed).
-            # It is safe on disjoint manifolds too: atom 0 fits one circle, the
-            # other circle's rows are its worst residual, so atom 1 is committed
-            # to them — the same partition pure EM finds, no entanglement.
+            # Balanced commitment during an early window (issue #1282). Hands
+            # each atom a fixed distinct half of the rows to break the init
+            # symmetry. The decoder-harmonic penalty
+            # (``decoder_harmonic_penalty``) confines each atom to a single
+            # 2-plane, so the reconstruction gradient specializes the committed
+            # atoms onto distinct manifolds, and the assignment EMA below
+            # preserves the partition after the window releases. Safe on disjoint
+            # manifolds (the EM recovers the trivial split). This balanced commit
+            # + harmonic + EMA is the combination that routes the energy-
+            # degenerate circles; a greedy matching-pursuit commit instead drives
+            # the harmonic-confined atom to a degenerate averaged plane.
             commit = None
             if step is not None and step < self._commit_steps:
                 commit = self._matching_pursuit_commit(relative_residual, step)
@@ -868,53 +865,50 @@ class _SparsityLayer(nn.Module):
     def _matching_pursuit_commit(
         self, relative_residual: torch.Tensor, step: int | None
     ) -> torch.Tensor | None:
-        """Greedy residual commitment one-hot for the early window (issue #1282).
+        """Fixed balanced row->atom commitment one-hot for the early window (#1282).
 
         Returns ``(N, F)`` hard assignments inside the commitment window, else
-        ``None`` (the residual EM owns the assignment). The schedule emulates the
-        closed-form lane's greedy residual seeding: atom 0 is committed to *all*
-        rows so it fits the dominant structure, then atoms are *introduced one at
-        a time*; when atom ``j`` enters, it claims the rows whose current
-        best-of-already-introduced relative residual is largest (the worst-
-        reconstructed share), forcing it onto the leftover manifold. The share
-        each new atom claims grows to ``1/F`` of the rows. Keys only on the
-        reconstruction residual — no input-geometry shortcut.
+        ``None`` (the residual EM owns the assignment). The partition is a fixed
+        deterministic permutation of the rows split into ``F`` equal contiguous
+        blocks, re-rolled across a few sub-windows so a partition that happens to
+        mix manifolds is replaced before the EM takes over (the analogue of the
+        closed-form lane's ``pc_pair_offset`` multi-start rotation). It depends
+        only on a fixed seed and the row count — never on the (symmetric)
+        residuals or the input coordinate geometry — so it breaks the init
+        symmetry without a geometry shortcut.
 
-        ``relative_residual`` is ``(N, F)`` per-atom scale-free residual.
+        Crucially this is a *balanced random* commitment, not a greedy
+        matching-pursuit one: under the decoder-harmonic confinement
+        (``decoder_harmonic_penalty``) a greedy schedule that feeds atom 0 *all*
+        rows first drives it to the degenerate averaged 2-plane (the signed
+        channels cancel) — a blend the harmonic penalty then freezes. A balanced
+        random split instead hands each atom a distinct half from the start;
+        with the harmonic penalty confining each atom to one 2-plane the
+        reconstruction gradient specializes them onto distinct manifolds, and the
+        persistent assignment EMA preserves that partition past the window. This
+        combination (balanced commit + EMA + harmonic) is the one that routes the
+        energy-degenerate circles while leaving the disjoint case perfect.
+
+        ``relative_residual`` supplies only the shape/dtype/device; the partition
+        is residual-independent by design (the residual is uninformative at the
+        symmetric init this commitment exists to escape).
         """
         if step is None or self.target_k != 1 or self.n_atoms < 2:
             return None
         if step >= self._commit_steps:
             return None
         n, f = relative_residual.shape
-        dtype, device = relative_residual.dtype, relative_residual.device
-        # How many atoms have been "introduced" by this step: ramp 1 -> F across
-        # the window, holding the full set for the last third so the rivals'
-        # decoders settle before the EM takes over.
-        frac = step / max(1, self._commit_steps)
-        introduced = 1 + int(min(f - 1, (frac * 1.5) * (f - 1) + 1e-9))
-        introduced = max(1, min(f, introduced))
-        rr = relative_residual.detach()
-        # Each row goes to the introduced atom that reconstructs it best, but we
-        # cap each atom's share to keep the commitment balanced and force the
-        # newest atom to actually take rows (rather than the incumbent keeping
-        # everything). Concretely: rank rows by how much better the *newest*
-        # introduced atom is than the best incumbent, and hand the newest atom
-        # its balanced quota of the rows it most wants.
-        assign = rr[:, :introduced].argmin(dim=1)
-        if introduced >= 2:
-            newest = introduced - 1
-            incumbent_best = rr[:, : introduced - 1].min(dim=1).values
-            # Preference of each row for the newest atom (lower residual = more).
-            advantage = incumbent_best - rr[:, newest]
-            quota = n // f  # balanced share per atom
-            # Give the newest atom the `quota` rows it most prefers, even if an
-            # incumbent currently reconstructs them marginally better, so it is
-            # guaranteed a distinct committed subset to specialize on.
-            take = torch.topk(advantage, k=min(quota, n)).indices
-            assign[take] = newest
+        device, dtype = relative_residual.device, relative_residual.dtype
+        rerolls = 4
+        block = min(rerolls - 1, (step * rerolls) // max(1, self._commit_steps))
+        g = torch.Generator(device="cpu")
+        g.manual_seed(int(self._commit_seed) + 7919 * int(block))
+        perm = torch.randperm(n, generator=g)
+        atom_of_sorted = (torch.arange(n) * f) // n  # balanced 0..F-1
+        assign = torch.empty(n, dtype=torch.long)
+        assign[perm] = atom_of_sorted
         onehot = torch.zeros(n, f, dtype=dtype, device=device)
-        onehot[torch.arange(n, device=device), assign] = 1.0
+        onehot[torch.arange(n, device=device), assign.to(device)] = 1.0
         return onehot
 
     def _update_assign_ema(
@@ -1148,40 +1142,6 @@ class ManifoldSAE(nn.Module):
         nn.init.normal_(self.atom_raw_anchor, mean=0.0, std=s)
         nn.init.normal_(self.decoder_blocks, mean=0.0, std=s)
         nn.init.zeros_(self.log_lambda)
-        self._break_decoder_symmetry()
-
-    @torch.no_grad()
-    def _break_decoder_symmetry(self) -> None:
-        """Seed each circle atom's fundamental onto a distinct 2-plane (#1282).
-
-        At the symmetric random init both atoms are interchangeable, so balanced
-        Sinkhorn EM has no signal for *which* atom should take which manifold and
-        the pair can collapse onto a shared blend. The decoder-harmonic penalty
-        confines each atom to a single 2-plane but does not choose the plane.
-        Break the tie deterministically (and geometry-agnostically) by biasing
-        each atom's fundamental rows — ``cos θ`` (row 2) and ``sin θ`` (row 1) —
-        toward a *distinct* pair of ambient coordinate axes, so atom ``f`` starts
-        on the 2-plane ``span{e_{2f}, e_{2f+1}}`` (mod D). The harmonic penalty
-        then locks each atom into its own plane and the EM discovers the matching
-        rows, without ever forcing an atom to fit a mixed (averaged-plane) row
-        set. Only meaningful for the circle layout (row 1 = sinθ, row 2 = cosθ);
-        a no-op otherwise.
-        """
-        if self.cfg.atom_manifold != "circle":
-            return
-        K = int(self.cfg.n_basis_per_atom)
-        if K < 3:  # need the DC + fundamental rows
-            return
-        F, D = int(self.cfg.n_atoms), int(self.cfg.input_dim)
-        s = float(self.cfg.init_scale)
-        mag = max(s, 0.1)
-        for f in range(F):
-            a0 = (2 * f) % D
-            a1 = (2 * f + 1) % D
-            self.decoder_blocks[f, 2].zero_()
-            self.decoder_blocks[f, 1].zero_()
-            self.decoder_blocks[f, 2, a0] = mag  # cos θ along axis a0
-            self.decoder_blocks[f, 1, a1] = mag  # sin θ along axis a1
 
     @property
     def _forward_centers(self) -> torch.Tensor | None:
