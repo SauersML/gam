@@ -403,14 +403,6 @@ impl<'a> RemlState<'a> {
             );
             return false;
         }
-        if self.has_repeated_penalty_col_range() {
-            log::info!(
-                "[standard-GAM] declining analytic outer Hessian for repeated penalty \
-                 col_range layout (k={}); routing to first-order REML gradient",
-                self.canonical_penalties.len(),
-            );
-            return false;
-        }
         // The Tierney-Kadane fallback gate is no longer needed: the analytic
         // TK value, first ρ-derivative, AND second ρ-derivative paths are
         // implemented in `tierney_kadane_terms`, which now populates the
@@ -452,19 +444,6 @@ impl<'a> RemlState<'a> {
             return false;
         }
         true
-    }
-
-    pub(crate) fn has_repeated_penalty_col_range(&self) -> bool {
-        for (idx, lhs) in self.canonical_penalties.iter().enumerate() {
-            for rhs in &self.canonical_penalties[idx + 1..] {
-                if lhs.col_range.start == rhs.col_range.start
-                    && lhs.col_range.end == rhs.col_range.end
-                {
-                    return true;
-                }
-            }
-        }
-        false
     }
 
     /// Whether the Tierney-Kadane outer correction (its value, ρ-gradient, and

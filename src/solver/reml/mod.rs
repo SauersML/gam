@@ -618,6 +618,38 @@ mod tests {
         .expect("state")
     }
 
+    #[test]
+    fn repeated_penalty_ranges_keep_analytic_outer_hessian() {
+        let y = array![0.2, -0.1, 0.3, 0.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![[1.0, -0.7], [1.0, -0.2], [1.0, 0.3], [1.0, 0.9]];
+        let offset = Array1::<f64>::zeros(y.len());
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
+        let p = x.ncols();
+        let canonical = vec![
+            crate::construction::CanonicalPenalty::from_dense_root(array![[0.0, 1.0]], p),
+            crate::construction::CanonicalPenalty::from_dense_root(array![[1.0, 0.0]], p),
+        ];
+        let state = RemlState::newwith_offset(
+            y.view(),
+            x,
+            w.view(),
+            offset.view(),
+            canonical,
+            p,
+            &cfg,
+            Some(vec![1, 1]),
+            None,
+            None,
+        )
+        .expect("state");
+
+        assert!(
+            state.analytic_outer_hessian_enabled(),
+            "double-penalty-style repeated coefficient ranges must still route to exact Hessian"
+        );
+    }
+
     pub(crate) fn poisson_log_glm_spec() -> GlmLikelihoodSpec {
         GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
             ResponseFamily::Poisson,
