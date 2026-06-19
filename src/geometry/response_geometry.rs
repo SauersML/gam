@@ -25,7 +25,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::constant_curvature::ConstantCurvature;
 use crate::geometry::manifold::{
-    flatten, from_flat, polar_factor, spectral_map_symmetric, sym, RiemannianManifold,
+    flatten, from_flat, jacobi_symmetric, spectral_map_symmetric, sym, RiemannianManifold,
     GEOMETRY_EPS,
 };
 use crate::geometry::{GeometryError, GeometryResult, GrassmannManifold, SpdManifold, StiefelManifold};
@@ -346,48 +346,65 @@ impl ResponseManifold {
         }
     }
 
-    /// Nearest-point projection of an arbitrary ambient row onto the manifold,
-    /// in the flat ambient coordinates. Unlike [`log_point`](Self::log_point) —
-    /// which is gatekept to *genuine* manifold points on both arguments — this
-    /// accepts an off-manifold `value` and returns the closest manifold point
-    /// under the ambient (Euclidean / Frobenius) metric. It is the primitive
-    /// behind [`response_projection_residual`]: how far an observation sits from
-    /// a *candidate* response geometry.
+    /// Euclidean / Frobenius distance from an arbitrary ambient row to the
+    /// candidate response geometry, in flat ambient coordinates — the extrinsic
+    /// constraint-violation distance behind [`response_projection_residual`].
     ///
-    /// Exact projections are available for every fittable response geometry:
-    /// * Poincaré ball — radial clamp into the ball ([`project_into_ball`]).
-    /// * SPD cone — symmetrise, then clamp eigenvalues to `≥ 0` (the Higham
-    ///   nearest-PSD projector); the residual is the norm of the discarded
-    ///   negative-eigenvalue part.
-    /// * `Gr(k, n)` / `St(k, n)` — the polar factor of the `n × k` frame
-    ///   ([`polar_factor`]), i.e. the Frobenius-nearest orthonormal frame. For
-    ///   `k = 1` this reduces to radial normalisation (the sphere `S^{n-1}`).
+    /// Unlike [`log_point`](Self::log_point), which is gatekept to *genuine*
+    /// manifold points on both arguments, this accepts off-manifold `value`. The
+    /// distance is computed in closed form per geometry and is **well-defined for
+    /// every input** — there is no rank-deficiency error path, because the
+    /// distance to a set is defined even where the nearest point is not unique:
     ///
-    /// Only the non-fittable [`ConstantCurvature`](Self::ConstantCurvature)
-    /// variant, which is never produced by the response-geometry resolver,
-    /// lacks an ambient projector and errors here.
-    fn project_point(&self, value: ArrayView1<'_, f64>) -> GeometryResult<Array1<f64>> {
+    /// * `Gr(k, n)` / `St(k, n)` — distance to the orthonormal-frame set,
+    ///   `√Σ_i (σ_i − 1)²` with `σ_i = √max(λ_i(YᵀY), 0)` the singular values of
+    ///   the `n × k` frame `Y`. Exact for every rank (`σ_i = 0` columns
+    ///   contribute `1` each). Grassmann and Stiefel coincide because this module
+    ///   represents Grassmann points by frames — it is a *representation*
+    ///   distance, not a subspace/principal-angle distance.
+    /// * SPD cone — distance to the *closed* PSD cone,
+    ///   `√(‖skew(A)‖_F² + Σ_{λ_i<0} λ_i²)` with `λ_i` the eigenvalues of the
+    ///   symmetric part `sym(A)`. This is the infimum distance to the open SPD
+    ///   cone; a zero distance means PSD, **not** strictly PD.
+    /// * Poincaré ball — distance to the *manifold* open ball of radius
+    ///   `R = 1/√(−c)`: `max(0, ‖x‖ − R)`. (This uses the true radius `R`, not
+    ///   the slightly smaller numerical safety radius used when projecting points
+    ///   for a fit, so interior points score exactly zero.)
+    /// * `ConstantCurvature` — distance to the chart *domain*: `0` for `κ ≥ 0`
+    ///   (chart is all of `ℝ^d`), else `max(0, ‖x‖ − 1/√(−κ))`. The curvature
+    ///   lives in the metric, not the domain, so this is a domain-admissibility
+    ///   check only and carries little curvature information.
+    fn manifold_residual(&self, value: ArrayView1<'_, f64>) -> GeometryResult<f64> {
         match self {
-            Self::Poincare { curvature, .. } => {
-                crate::geometry::poincare::project_into_ball(value, *curvature)
+            Self::Poincare { curvature, .. } => ball_domain_residual(value, *curvature),
+            Self::ConstantCurvature { kappa, .. } => {
+                if *kappa >= 0.0 {
+                    Ok(0.0)
+                } else {
+                    ball_domain_residual(value, *kappa)
+                }
             }
             Self::Spd { n } => {
                 let mat = from_flat(value, *n, *n)?;
                 let symm = sym(&mat);
                 let psd = spectral_map_symmetric(&symm, |lam| Ok(lam.max(0.0)))?;
-                Ok(flatten(&psd))
+                // Distance to the closed PSD cone, measured against the original
+                // (skew included) input so the skew-symmetric part is counted.
+                Ok(frobenius_distance(value, flatten(&psd).view()))
             }
             Self::Grassmann { k, n } | Self::Stiefel { k, n } => {
-                // Project onto the orthonormal-frame representative set via the
-                // polar factor — the exact Frobenius-nearest frame, valid for
-                // all k. For k = 1 this is the radial normalisation onto the
-                // sphere; rank-deficient frames surface a Singular error.
+                use crate::linalg::faer_ndarray::fast_atb;
                 let frame = from_flat(value, *n, *k)?;
-                Ok(flatten(&polar_factor(&frame)?))
+                let gram = fast_atb(&frame, &frame);
+                let (evals, _) = jacobi_symmetric(&gram)?;
+                let mut sq = 0.0_f64;
+                for &lam in evals.iter() {
+                    let sigma = lam.max(0.0).sqrt();
+                    let d = sigma - 1.0;
+                    sq += d * d;
+                }
+                Ok(sq.sqrt())
             }
-            Self::ConstantCurvature { .. } => Err(GeometryError::InvalidPoint(
-                "projection residual is not implemented for the ConstantCurvature response geometry",
-            )),
         }
     }
 
@@ -488,42 +505,100 @@ pub fn response_exp_map(
     Ok(out)
 }
 
-/// Per-row distance from ambient observations to a *candidate* response
-/// manifold — a shape-plausibility diagnostic for geometric-smooth model
-/// selection.
+/// Numerically-stable Euclidean norm `‖v‖₂`, scaled by the largest-magnitude
+/// entry so the squared sum cannot overflow for large but finite inputs.
+fn scaled_l2_norm(v: ArrayView1<'_, f64>) -> f64 {
+    let mut scale = 0.0_f64;
+    for &x in v.iter() {
+        let a = x.abs();
+        if a > scale {
+            scale = a;
+        }
+    }
+    if scale == 0.0 {
+        return 0.0;
+    }
+    let mut ssq = 0.0_f64;
+    for &x in v.iter() {
+        let t = x / scale;
+        ssq += t * t;
+    }
+    scale * ssq.sqrt()
+}
+
+/// Numerically-stable Frobenius distance `‖a − b‖₂` over equal-length flat
+/// vectors, scaled by the largest entrywise difference to avoid overflow.
+fn frobenius_distance(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
+    let mut scale = 0.0_f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let d = (x - y).abs();
+        if d > scale {
+            scale = d;
+        }
+    }
+    if scale == 0.0 {
+        return 0.0;
+    }
+    let mut ssq = 0.0_f64;
+    for (x, y) in a.iter().zip(b.iter()) {
+        let t = (x - y) / scale;
+        ssq += t * t;
+    }
+    scale * ssq.sqrt()
+}
+
+/// Distance from `value` to the open ball of radius `R = 1/√(−c)` (`c < 0`):
+/// `max(0, ‖value‖ − R)`, the true Euclidean infimum distance to the ball.
+/// Errors if the curvature is not a finite negative number.
+fn ball_domain_residual(value: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<f64> {
+    if !curvature.is_finite() || curvature >= 0.0 {
+        return Err(GeometryError::InvalidPoint(
+            "ball distance requires a finite negative curvature",
+        ));
+    }
+    let radius = (-curvature).sqrt().recip();
+    Ok((scaled_l2_norm(value) - radius).max(0.0))
+}
+
+/// Per-row extrinsic distance from ambient observations to a *candidate*
+/// response geometry — a coordinate-dependent constraint / closure-distance
+/// diagnostic.
 ///
 /// What this is (and is not)
 /// -------------------------
-/// This is **not** the post-fit on/off-manifold membership signal. That signal
-/// comes from a fitted geometric smooth: the residual of an observation against
-/// the *surface gam infers*, plus its posterior predictive density. This
-/// function answers the earlier, cheaper question that gates *which* topology
-/// is worth fitting: given a candidate response geometry (e.g. one proposed by
-/// an external embedding/discovery stage), how far do the raw observations sit
-/// from that geometry's manifold? Aggregated per candidate, it feeds the
-/// shape-selection comparison alongside REML/LAML and held-out predictive
-/// density — and crucially that comparison must include the null/simpler-
-/// topology candidates, so a confidently-wrong proposal cannot win unchecked.
+/// This is a cheap, pre-fit **constraint-violation** measure: given a candidate
+/// response geometry, how far does each raw row sit from that geometry's
+/// extrinsic representation (the unit-norm frame, the PSD cone, the Poincaré
+/// ball)? It is **not** the post-fit on/off-manifold membership signal (which
+/// comes from a fitted geometric smooth's residual and posterior predictive
+/// density), and it is **not** a universal cross-geometry model-selection score:
+/// it measures extrinsic constraint violation *in a chosen coordinate chart*,
+/// not intrinsic topology or curvature. Different candidate geometries have
+/// different chart codimensions (a full-dimensional Poincaré/`κ ≥ 0` chart can
+/// score zero trivially), so residuals are not directly comparable across
+/// candidates without a noise model and per-candidate calibration. Use it as a
+/// fast per-candidate gate, with candidate-specific thresholds.
 ///
 /// What it computes
 /// ----------------
-/// For each ambient row `x` it forms the nearest manifold point under the
-/// ambient (Euclidean / Frobenius) metric via [`project_point`] — a genuine
-/// projection that, unlike `log_map`, accepts off-manifold input — and returns:
+/// For each ambient row `x`, [`manifold_residual`](Self::manifold_residual)
+/// returns the closed-form distance to the candidate geometry (well-defined for
+/// every input and every rank — see that method for the per-geometry formulas),
+/// and this returns:
 ///
-/// * `residual[i] = ‖x - project(x)‖`              — absolute distance-to-manifold
-/// * `relative[i] = residual[i] / (‖x‖ + eps)`     — scale-free off-manifold fraction
+/// * `residual[i]` — the absolute distance-to-geometry (zero for genuinely
+///   admissible rows; for the matrix manifolds, exact to machine precision).
+/// * `relative[i] = residual[i] / (‖x‖ + eps)` — the distance normalised by the
+///   row's ambient magnitude. **Note:** this is dimensionless but *not*
+///   scale-invariant for the fixed-radius geometries (Stiefel/Grassmann/ball)
+///   and is *not* bounded by `1` (it diverges as `‖x‖ → 0`); it is scale-free
+///   only for the homogeneous SPD cone. Treat it as `input_norm_relative`, not
+///   an off-manifold fraction.
 ///
-/// `residual` is the honest orthogonal displacement off the candidate shape
-/// (zero for on-manifold rows, to machine precision); `relative` normalises it
-/// by the ambient magnitude so rows of different scale are comparable in a
-/// membership-style threshold or an aggregate score.
-///
-/// Unlike [`response_log_map`], **no base point is needed**: nearest-point
-/// projection is base-independent. `values` is `(n_rows, ambient)`; both
-/// returned arrays are `(n_rows,)`. Every fittable response geometry has an
-/// exact ambient projector (see [`project_point`]); only the non-fittable
-/// `ConstantCurvature` variant returns a descriptive error.
+/// Unlike [`response_log_map`], **no base point is needed**. `values` is
+/// `(n_rows, ambient)`; both returned arrays are `(n_rows,)`. Every fittable
+/// response geometry — including `ConstantCurvature` — has a closed-form
+/// distance, so no variant errors on a valid, finite input.
 pub fn response_projection_residual(
     manifold: ResponseManifold,
     values: ArrayView2<'_, f64>,
@@ -543,19 +618,17 @@ pub fn response_projection_residual(
     let mut relative = Array1::<f64>::zeros(n_rows);
     for row in 0..n_rows {
         let value = values.row(row);
-        let proj = manifold
-            .project_point(value)
-            .map_err(|e| format!("response geometry projection (row {row}): {e}"))?;
-        let mut sq = 0.0_f64;
-        let mut ambient_sq = 0.0_f64;
-        for (xi, pi) in value.iter().zip(proj.iter()) {
-            let d = xi - pi;
-            sq += d * d;
-            ambient_sq += xi * xi;
+        let dist = manifold
+            .manifold_residual(value)
+            .map_err(|e| format!("response geometry residual (row {row}): {e}"))?;
+        let rel = dist / (scaled_l2_norm(value) + GEOMETRY_EPS);
+        if !dist.is_finite() || !rel.is_finite() {
+            return Err(format!(
+                "response geometry residual (row {row}) is non-finite"
+            ));
         }
-        let dist = sq.sqrt();
         residual[row] = dist;
-        relative[row] = dist / (ambient_sq.sqrt() + GEOMETRY_EPS);
+        relative[row] = rel;
     }
     Ok((residual, relative))
 }
@@ -1676,15 +1749,25 @@ mod tests {
         assert!((sres[0] - 1.0).abs() < 1e-9, "got {}", sres[0]);
         assert!((srel[0] - 1.0 / 2.0_f64.sqrt()).abs() < 1e-9);
 
-        // Poincaré ball (c = −1): a point outside the ball clamps radially to
-        // the boundary. [3,0] ⇒ distance ≈ 3 − (1 − BOUNDARY_EPS).
+        // Poincaré ball (c = −1, true radius R = 1): the distance to the open
+        // ball is max(0, ‖x‖ − R). [3,0] ⇒ exactly 2 (not 3 − (1 − BOUNDARY_EPS)
+        // — the diagnostic uses the manifold radius, not the safety radius).
         let p = ResponseManifold::Poincare {
             dim: 2,
             curvature: -1.0,
         };
         let pv = array![[3.0, 0.0]];
         let (pres, _prel) = response_projection_residual(p, pv.view()).expect("poincare");
-        assert!(pres[0] > 1.9 && pres[0] < 2.0001, "got {}", pres[0]);
+        assert!((pres[0] - 2.0).abs() < 1e-12, "got {}", pres[0]);
+
+        // A different curvature (c = −4, R = 1/2): [2,0] ⇒ 2 − 0.5 = 1.5.
+        let p4 = ResponseManifold::Poincare {
+            dim: 2,
+            curvature: -4.0,
+        };
+        let (p4res, _) =
+            response_projection_residual(p4, array![[2.0, 0.0]].view()).expect("poincare c=-4");
+        assert!((p4res[0] - 1.5).abs() < 1e-12, "got {}", p4res[0]);
     }
 
     #[test]
@@ -1725,8 +1808,8 @@ mod tests {
 
     #[test]
     fn projection_residual_supports_k_greater_than_one_frames() {
-        // k > 1 frames are projected via the polar factor (exact Frobenius-
-        // nearest orthonormal frame). St(2,3), ambient = 6, row-major n×k.
+        // k > 1 frames use the closed form √Σ(σ_i − 1)². St(2,3), ambient = 6,
+        // row-major n×k.
         let manifold = ResponseManifold::Stiefel { k: 2, n: 3 };
 
         // An orthonormal frame [e1 | e2] is its own nearest point ⇒ residual 0.
@@ -1734,16 +1817,15 @@ mod tests {
         let (resid_on, _) = response_projection_residual(manifold, on.view()).expect("on");
         assert!(resid_on[0] < 1e-9, "orthonormal frame should be ~0, got {}", resid_on[0]);
 
-        // Scale the first column by 2: Y = [2·e1 | e2]. YᵀY = diag(4,1), so the
-        // polar factor restores [e1 | e2] and the distance is ‖Y − U‖_F = 1,
-        // with relative = 1/‖Y‖_F = 1/√5.
+        // Scale the first column by 2: Y = [2·e1 | e2]. YᵀY = diag(4,1) ⇒
+        // σ = (2,1), distance √((2−1)²+(1−1)²) = 1, relative = 1/‖Y‖_F = 1/√5.
         let off = array![[2.0, 0.0, 0.0, 1.0, 0.0, 0.0]];
         let (resid_off, rel_off) =
             response_projection_residual(manifold, off.view()).expect("off");
         assert!((resid_off[0] - 1.0).abs() < 1e-9, "got {}", resid_off[0]);
         assert!((rel_off[0] - 1.0 / 5.0_f64.sqrt()).abs() < 1e-9, "got {}", rel_off[0]);
 
-        // Grassmann(2,4) accepts a k>1 frame identically (same polar projector).
+        // Grassmann(2,4) gives the identical score for the same frame data.
         let g = ResponseManifold::Grassmann { k: 2, n: 4 };
         let g_on = array![[1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]];
         let (g_resid, _) = response_projection_residual(g, g_on.view()).expect("grassmann");
@@ -1751,30 +1833,116 @@ mod tests {
     }
 
     #[test]
-    fn projection_residual_errors_only_for_nonfittable_constant_curvature() {
-        // ConstantCurvature is never produced by the response-geometry resolver
-        // and has no ambient projector wired in, so it errors descriptively
-        // rather than returning an approximate distance.
-        let manifold = ResponseManifold::ConstantCurvature {
-            dim: 3,
-            kappa: 1.0,
-        };
-        let vals = array![[0.1, 0.2, 0.3]];
-        let err = response_projection_residual(manifold, vals.view())
-            .expect_err("ConstantCurvature must error");
-        assert!(
-            err.contains("ConstantCurvature"),
-            "error should name the geometry: {err}"
-        );
+    fn projection_residual_handles_nontrivial_eigenvectors() {
+        // A frame whose Gram is NOT diagonal, so the singular values come from a
+        // genuine eigendecomposition. Y = [[1,1],[0,1],[0,0]] (St(2,3)):
+        // YᵀY = [[1,1],[1,2]], eigenvalues (3±√5)/2, σ = ((1+√5)/2, (√5−1)/2).
+        // distance² = (σ₁−1)² + (σ₂−1)².
+        let manifold = ResponseManifold::Stiefel { k: 2, n: 3 };
+        let y = array![[1.0, 1.0, 0.0, 1.0, 0.0, 0.0]]; // row-major rows [1,1],[0,1],[0,0]
+        let (resid, _) = response_projection_residual(manifold, y.view()).expect("frame");
+        let s5 = 5.0_f64.sqrt();
+        let sig1 = (1.0 + s5) / 2.0;
+        let sig2 = (s5 - 1.0) / 2.0;
+        let expect = ((sig1 - 1.0).powi(2) + (sig2 - 1.0).powi(2)).sqrt();
+        assert!((resid[0] - expect).abs() < 1e-9, "got {} want {}", resid[0], expect);
     }
 
     #[test]
-    fn polar_factor_is_rejected_for_rank_deficient_frames() {
-        // A rank-deficient frame (two identical columns) has no unique nearest
-        // orthonormal frame, so the projector surfaces a Singular error rather
-        // than fabricating an arbitrary one.
+    fn projection_residual_is_defined_for_rank_deficient_frames() {
+        // A rank-deficient frame has a well-defined distance even though the
+        // nearest orthonormal frame is not unique — distance to a compact set is
+        // always defined, so this must NOT error. Two identical columns e1 give
+        // YᵀY = [[1,1],[1,1]], σ = (√2, 0), distance √((√2−1)²+(0−1)²) = √(4−2√2).
         let manifold = ResponseManifold::Stiefel { k: 2, n: 3 };
         let degenerate = array![[1.0, 1.0, 0.0, 0.0, 0.0, 0.0]]; // both columns = e1
-        assert!(response_projection_residual(manifold, degenerate.view()).is_err());
+        let (resid, _) =
+            response_projection_residual(manifold, degenerate.view()).expect("rank-deficient ok");
+        let expect = (4.0 - 2.0 * 2.0_f64.sqrt()).sqrt(); // ≈ 1.0823922
+        assert!((resid[0] - expect).abs() < 1e-9, "got {} want {}", resid[0], expect);
+
+        // Minimal case: zero vector on the sphere (Gr(1,3)). Every unit vector is
+        // a nearest point and the distance is exactly 1 — also must not error.
+        let sphere = ResponseManifold::Grassmann { k: 1, n: 3 };
+        let (zres, _) =
+            response_projection_residual(sphere, array![[0.0, 0.0, 0.0]].view()).expect("zero");
+        assert!((zres[0] - 1.0).abs() < 1e-12, "got {}", zres[0]);
+    }
+
+    #[test]
+    fn projection_residual_handles_tiny_full_rank_frame() {
+        // A tiny but full-rank frame must NOT be rejected as rank-deficient: the
+        // distance is scale-correct. Y = 1e-7·[e1 | e2] (St(2,3)) ⇒ σ = (1e-7,
+        // 1e-7), distance √2·(1 − 1e-7) ≈ 1.41421342.
+        let manifold = ResponseManifold::Stiefel { k: 2, n: 3 };
+        let tiny = array![[1e-7, 0.0, 0.0, 1e-7, 0.0, 0.0]];
+        let (resid, _) = response_projection_residual(manifold, tiny.view()).expect("tiny ok");
+        let expect = 2.0_f64.sqrt() * (1.0 - 1e-7);
+        assert!((resid[0] - expect).abs() < 1e-9, "got {} want {}", resid[0], expect);
+    }
+
+    #[test]
+    fn projection_residual_spd_nonsymmetric_and_singular() {
+        // Non-symmetric input: A = [[1,1],[-1,1]] has sym(A) = I (no negative
+        // part), but the distance to the PSD cone still counts the skew part:
+        // ‖A − I‖_F = √2.
+        let spd = ResponseManifold::Spd { n: 2 };
+        let asym = array![[1.0, 1.0, -1.0, 1.0]]; // row-major [[1,1],[-1,1]]
+        let (ares, _) = response_projection_residual(spd, asym.view()).expect("nonsym");
+        assert!((ares[0] - 2.0_f64.sqrt()).abs() < 1e-9, "got {}", ares[0]);
+
+        // A singular PSD matrix diag(1,0) is in the closed cone ⇒ distance 0
+        // (even though it is not strictly positive definite).
+        let singular = array![[1.0, 0.0, 0.0, 0.0]];
+        let (sres, _) = response_projection_residual(spd, singular.view()).expect("singular psd");
+        assert!(sres[0] < 1e-12, "singular PSD should be ~0, got {}", sres[0]);
+    }
+
+    #[test]
+    fn projection_residual_poincare_interior_shell_is_zero() {
+        // A point in the numerical safety shell R_safe < ‖x‖ < R is a genuine
+        // interior point of the manifold ball, so it must score exactly 0 — the
+        // diagnostic uses the true radius, not the projection safety radius.
+        let p = ResponseManifold::Poincare {
+            dim: 2,
+            curvature: -1.0,
+        };
+        let shell = array![[0.999999, 0.0]]; // inside R = 1, outside R_safe ≈ 0.99999
+        let (resid, _) = response_projection_residual(p, shell.view()).expect("shell");
+        assert!(resid[0] < 1e-12, "interior point must be 0, got {}", resid[0]);
+    }
+
+    #[test]
+    fn projection_residual_handles_constant_curvature_domain() {
+        // ConstantCurvature is a fittable response geometry produced by the
+        // resolver/parser, so it must return a closed-form distance, not error.
+        // κ ≥ 0: chart is all of ℝ^d ⇒ every finite row scores 0.
+        let pos = ResponseManifold::parse("constant_curvature(dim=3,kappa=1.0)", 3)
+            .expect("parse constant_curvature");
+        assert!(matches!(pos, ResponseManifold::ConstantCurvature { .. }));
+        let (pres, _) =
+            response_projection_residual(pos, array![[0.1, 9.0, -100.0]].view()).expect("kappa>=0");
+        assert!(pres[0] < 1e-12, "κ≥0 finite row must be 0, got {}", pres[0]);
+
+        // κ < 0: chart is the ball of radius 1/√(−κ). For κ = −1, R = 1, so a
+        // point of norm 3 is at distance 2; an interior point is at 0.
+        let neg = ResponseManifold::ConstantCurvature {
+            dim: 2,
+            kappa: -1.0,
+        };
+        let (nres, _) =
+            response_projection_residual(neg, array![[3.0, 0.0], [0.2, 0.1]].view()).expect("kappa<0");
+        assert!((nres[0] - 2.0).abs() < 1e-12, "got {}", nres[0]);
+        assert!(nres[1] < 1e-12, "interior row must be 0, got {}", nres[1]);
+    }
+
+    #[test]
+    fn projection_residual_accepts_empty_batch() {
+        // A zero-row batch is valid and returns empty arrays for every geometry.
+        let manifold = ResponseManifold::Spd { n: 2 }; // ambient = 4
+        let empty = Array2::<f64>::zeros((0, 4));
+        let (resid, rel) = response_projection_residual(manifold, empty.view()).expect("empty");
+        assert_eq!(resid.len(), 0);
+        assert_eq!(rel.len(), 0);
     }
 }

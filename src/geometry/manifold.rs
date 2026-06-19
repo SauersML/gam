@@ -832,10 +832,9 @@ pub(crate) fn spectral_map_symmetric(
 /// large ambient dimension `n` (`YᵀY` and `U = Y V Σ⁻¹`) are GPU-dispatched.
 ///
 /// A numerically-zero singular value (`σ ≤ GEOMETRY_EPS`) leaves the
-/// corresponding `U` column zero rather than dividing through. Callers that
-/// require full rank (e.g. [`polar_factor`]) reject it, while callers for which
-/// a rank-deficient input is admissible (the Grassmann/Stiefel geodesic, where
-/// a zero singular value is a vanishing principal angle) keep the zero column.
+/// corresponding `U` column zero rather than dividing through, which is what the
+/// Grassmann/Stiefel geodesic needs (a zero singular value is a vanishing
+/// principal angle); a caller requiring full rank inspects `σ` itself.
 pub(crate) fn thin_svd_gram(
     y: &Array2<f64>,
 ) -> GeometryResult<(Array2<f64>, Array1<f64>, Array2<f64>)> {
@@ -856,43 +855,6 @@ pub(crate) fn thin_svd_gram(
         }
     }
     Ok((u, sigma, v))
-}
-
-/// Frobenius-nearest matrix with orthonormal columns: the orthogonal factor `U`
-/// of the polar decomposition `Y = U P`, with `UᵀU = Iₖ` and `P` symmetric
-/// positive-definite. For a tall `Y` (`n × k`, `n ≥ k`) this is
-/// `U = Y (YᵀY)^{-1/2}`, the orthogonal projection of `Y` onto the Stiefel
-/// manifold `St(k, n)` — and hence onto the orthonormal-frame representative
-/// set of the Grassmannian `Gr(k, n)` — under the Frobenius norm. So
-/// `‖Y − U‖_F` is the *exact* distance from `Y` to that manifold. This is the
-/// genuine nearest point, unlike the QR retraction `qf(Y)`, which only agrees
-/// to first order.
-///
-/// Computed as `U Vᵀ` from the thin SVD `Y = U Σ Vᵀ` ([`thin_svd_gram`]), which
-/// equals `Y (YᵀY)^{-1/2}` and shares the Gram eigendecomposition with the
-/// geodesic SVD. A non-positive Gram eigenvalue (`σ² ≤ GEOMETRY_EPS`) means `Y`
-/// has rank `< k`, where the nearest orthonormal frame is not unique; that is
-/// surfaced as a [`GeometryError::Singular`] rather than returning an arbitrary
-/// frame.
-pub(crate) fn polar_factor(y: &Array2<f64>) -> GeometryResult<Array2<f64>> {
-    let (n, k) = y.dim();
-    if n < k {
-        return Err(GeometryError::InvalidPoint(
-            "polar factor requires a tall matrix (n >= k)",
-        ));
-    }
-    if !y.iter().all(|v| v.is_finite()) {
-        return Err(GeometryError::InvalidPoint(
-            "polar factor requires finite entries",
-        ));
-    }
-    let (u, sigma, v) = thin_svd_gram(y)?;
-    if !sigma.iter().all(|&s| s * s > GEOMETRY_EPS) {
-        return Err(GeometryError::Singular(
-            "polar factor is undefined for a rank-deficient matrix",
-        ));
-    }
-    Ok(u.dot(&v.t()))
 }
 
 /// Dense matrix exponential `exp(A)` via scaling-and-squaring with a truncated
