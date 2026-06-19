@@ -2239,9 +2239,11 @@ mod retained_radial_indices_tests {
 
     #[test]
     fn pure_roundoff_modes_are_dropped() {
-        // A mode at the K*eps*lambda_max numerical floor is roundoff dust.
+        // A mode below the K*eps*lambda_max numerical floor is roundoff dust.
+        // Here K=5, lambda_max=1e3 => floor = 5*eps*1e3; put the dust an order
+        // of magnitude below that floor.
         let big = 1.0e3;
-        let dust = 18.0 * f64::EPSILON * big * 0.5; // below the floor
+        let dust = 0.1 * 5.0 * f64::EPSILON * big; // well below the K*eps*max floor
         let evals = Array1::from_vec(vec![big, 100.0, 10.0, 1.0, dust]);
         let keep = thin_plate_retained_radial_indices(&evals);
         assert_eq!(keep.len(), 4, "the sub-floor roundoff mode must be pruned");
