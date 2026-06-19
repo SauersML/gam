@@ -778,12 +778,20 @@ where
             .filter(|h| h.len() == k)
             .map(|h| Array1::from_iter(h.iter().copied()))
             .unwrap_or_else(|| strategy_result.rho.clone());
-        // DIAGNOSTIC ONLY (#1347): clamp every rho axis to a forced value to read
-        // off the EDF gam produces at a fixed (e.g. mgcv-matching) lambda.
+        // DIAGNOSTIC ONLY (#1347): clamp ONLY axis 0 (the radial bending penalty)
+        // to a forced value, leaving the nullspace-ridge axis at its REML optimum,
+        // to read the radial EDF gam produces at a fixed radial lambda.
+        if let Ok(v) = std::env::var("DIAG1347_FIXRHO0") {
+            if let Ok(val) = v.parse::<f64>() {
+                if !accepted_rho.is_empty() {
+                    accepted_rho[0] = val;
+                    eprintln!("[DIAG1347_FIXRHO0] axis0 forced to {val}, rest={:?}", accepted_rho.iter().skip(1).collect::<Vec<_>>());
+                }
+            }
+        }
         if let Ok(v) = std::env::var("DIAG1347_FIXRHO") {
             if let Ok(val) = v.parse::<f64>() {
                 accepted_rho.fill(val);
-                eprintln!("[DIAG1347_FIXRHO] standard-arm rho forced to {val}");
             }
         }
         (
