@@ -7280,8 +7280,14 @@ pub(crate) fn refresh_isometry_caches_pairs_each_penalty_to_its_own_atom() {
 /// Build a minimal single-atom periodic SAE outer objective for the
 /// warm-start contract tests (gam#577 / gam#579).
 pub(crate) fn warmstart_test_objective() -> SaeManifoldOuterObjective {
+    // `PeriodicHarmonicEvaluator::new(3)` produces the SAME 3-column Fourier
+    // basis `[1, sin(2πt), cos(2πt)]` and first jet as `periodic_basis`, plus
+    // the analytic second jet that `logdet_theta_adjoint` (the softmax
+    // assignment adjoint) needs. Installing it lets the full `eval` gradient
+    // lane run instead of erroring on a missing second-jet evaluator.
+    let evaluator = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
     let coords = array![[0.10], [0.35], [0.62], [0.88]];
-    let (phi, jet) = periodic_basis(&coords);
+    let (phi, jet) = evaluator.evaluate(coords.view()).unwrap();
     let atom = SaeManifoldAtom::new(
         "periodic",
         SaeAtomBasisKind::Periodic,
@@ -7293,7 +7299,9 @@ pub(crate) fn warmstart_test_objective() -> SaeManifoldOuterObjective {
         // Mild ridge-like smoothness penalty so the inner solve is PD.
         Array2::<f64>::eye(3),
     )
-    .unwrap();
+    .unwrap()
+    .with_basis_evaluator(evaluator.clone())
+    .with_basis_second_jet(evaluator);
     let assignment = SaeAssignment::from_blocks_with_mode(
         // Nonzero assignment mass so H_tt carries genuine data curvature.
         array![[0.9_f64], [0.8], [0.7], [0.6]],
