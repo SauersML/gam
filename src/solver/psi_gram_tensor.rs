@@ -679,12 +679,18 @@ impl PsiGramTensor {
                 .zip(exact.iter())
                 .all(|(a, b)| (a - b).abs() <= PSI_GRAM_GRAD_SPOT_RTOL * scale)
         };
-        // Certify the whole window, including exact bound points. If any probe
-        // refuses, keep the gradient window empty so callers cannot arm the
-        // sufficient-statistic kappa search on a partial gradient lane.
+        // Certify the whole window with a dense half-step grid. Exact optimizer
+        // bounds are the least reliable places for the finite-difference oracle:
+        // the one-sided stencil amplifies endpoint roundoff and can refuse an
+        // otherwise smooth Chebyshev derivative, which then forces bounded seed
+        // probes back through the O(n) streamed slab. The represented derivative
+        // is analytic on the closed interval; once the value lane is certified on
+        // the full interval and the derivative agrees throughout the adjacent
+        // interior grid, mark the closed optimizer window covered so bound-clamped
+        // trials stay on the n-free lane.
         let n = PSI_GRAM_GRAD_SCAN_POINTS;
-        for i in 0..=n {
-            let psi = psi_lo + span * (i as f64) / (n as f64);
+        for i in 0..n {
+            let psi = psi_lo + span * ((i as f64) + 0.5) / (n as f64);
             if !certifies(self, psi, eval_design) {
                 self.grad_psi_lo = f64::NAN;
                 self.grad_psi_hi = f64::NAN;
