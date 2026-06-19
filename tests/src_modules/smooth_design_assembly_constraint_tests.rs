@@ -4940,12 +4940,19 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
          standardized fixture's low-edge basis stopped rotating — pick a ψ_C further \
          toward the edge"
     );
-    // Trial 2 (ψ_B): the skip fires ⇔ the witness admits it. Either way β̂ is
-    // certified to < 1e-6 below — if the skip fires it must be exact; if it is
-    // refused the exact slow path runs (a reset advances) and β̂ is trivially exact.
+    // PRODUCTION MIRROR: in `spatial_optimization.rs` the caller realizes the
+    // design (`cache.ensure_theta`) EXACTLY when the skip precondition is refused —
+    // `if !skip_design_realization { self.cache.ensure_theta(theta) }`. The restored
+    // #1264 precondition refuses the skip ⇔ `!covers_skip(ψ)`, so we pass
+    // `realize = !skip` here to reproduce the production caller faithfully: a refused
+    // skip re-realizes the design at the trial ψ so the evaluator's slow path forms
+    // the EXACT Gram for THIS ψ (not the frozen pin's). Driving `realize` from the
+    // witness verdict is the whole point — it is exactly what production does.
+
+    // Trial 2 (ψ_B): witness verdict drives realization, matching production.
     let before_b = tensor_eval.slow_path_reset_count();
     let (c_b, _g_b, beta_b) =
-        eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b), false);
+        eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_b), !skip_b);
     let after_b = tensor_eval.slow_path_reset_count();
     let reset_b = after_b - before_b;
     assert_eq!(
@@ -4956,12 +4963,12 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     );
 
     // Trial 3 (ψ_C): the ROTATION case. The witness REFUSES it (asserted above), so
-    // the restored precondition MUST route it to the exact slow path — exactly one
-    // reset. This is the load-bearing #1264 guard: the skip does NOT fire across the
-    // rotation, so the κ-amplified β̂ mismatch (1.7e-5) cannot ship.
+    // production re-realizes the design and the evaluator takes the exact slow path —
+    // exactly one reset. This is the load-bearing #1264 guard: the skip does NOT fire
+    // across the rotation, so the κ-amplified β̂ mismatch cannot ship.
     let before_c = tensor_eval.slow_path_reset_count();
     let (c_c, _g_c, beta_c) =
-        eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c), false);
+        eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_c), !skip_c);
     let after_c = tensor_eval.slow_path_reset_count();
     let reset_c = after_c - before_c;
     assert_eq!(
@@ -4969,7 +4976,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         "ψ_C ROTATES the reduced basis (reduced_basis_equal REFUSES it), so the \
          restored #1264 skip precondition MUST take the exact slow path (exactly one \
          reset) — NOT the n-free fast path, which would amplify the interpolated-Gram \
-         round-off into a β̂rel≈1.7e-5 wrong κ-optimum; got resets={reset_c}"
+         round-off into a wrong κ-optimum; got resets={reset_c}"
     );
 
     assert!(
