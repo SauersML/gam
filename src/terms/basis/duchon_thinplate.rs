@@ -2255,3 +2255,84 @@ pub fn auto_centers_1d_equal_mass(
     flat.sort_by(f64::total_cmp);
     Ok(Array1::from_vec(flat))
 }
+
+#[cfg(test)]
+mod retained_radial_indices_tests {
+    use super::thin_plate_retained_radial_indices;
+    use ndarray::Array1;
+
+    // The eigenvalue spectra below were captured from the live thin-plate
+    // builder (`s(x, bs="tp", k=20)`) on the #1271 regression data. They lock
+    // in the *derived* selection behaviour: keep every genuine bending mode,
+    // drop only a detached near-null cluster — no tuned magnitude threshold.
+
+    #[test]
+    fn linear_data_spectrum_keeps_every_mode() {
+        // Purely linear DGP: the constrained radial penalty decays smoothly
+        // with NO detached low cluster, so nothing beyond the numerical floor
+        // is spurious. REML (not pruning) drives the EDF down on linear data.
+        let evals = Array1::from_vec(vec![
+            885.4, 119.98, 26.287, 10.030, 5.066, 2.330, 1.3953, 0.67709, 0.46814, 0.34210,
+            0.26488, 0.17895, 0.14514,
+        ]);
+        let keep = thin_plate_retained_radial_indices(&evals);
+        assert_eq!(
+            keep.len(),
+            evals.len(),
+            "smooth (no-cluster) spectrum must retain all numerically real modes"
+        );
+    }
+
+    #[test]
+    fn lidar_spectrum_drops_only_detached_null_cluster() {
+        // Real lidar fit: a smooth bending band (15 modes, 1212 -> 0.137) then
+        // a sharp ~3x gap into a tight 3-mode cluster (~0.045, 0.042, 0.038)
+        // that the constraint projection failed to annihilate. The elbow rule
+        // must drop exactly those 3 and keep the 15 bending modes.
+        let evals = Array1::from_vec(vec![
+            1212.2, 144.94, 37.270, 15.529, 6.0768, 3.5845, 1.8094, 1.1058, 0.73002, 0.43701,
+            0.33814, 0.23136, 0.18267, 0.15702, 0.13654, 0.044936, 0.041844, 0.038235,
+        ]);
+        let keep = thin_plate_retained_radial_indices(&evals);
+        assert_eq!(
+            keep.len(),
+            15,
+            "must keep the 15-mode bending band and drop the 3 detached near-null modes"
+        );
+        // The retained set must be exactly the 15 largest (indices 0..15 here,
+        // since the input is already descending).
+        assert_eq!(keep, (0..15).collect::<Vec<usize>>());
+    }
+
+    #[test]
+    fn lidar_spectrum_high_curvature_variant_drops_three() {
+        // Same dataset, the high-amplitude lidar arm: band 1.2e4 -> 1.44, then
+        // a 3x gap into {0.47, 0.40, 0.35}. Identical structural verdict.
+        let evals = Array1::from_vec(vec![
+            12150.0, 1758.1, 401.88, 157.29, 68.959, 36.126, 19.252, 11.533, 7.4731, 4.9983,
+            3.5362, 2.5345, 2.0843, 1.6395, 1.4437, 0.47063, 0.40472, 0.34763,
+        ]);
+        let keep = thin_plate_retained_radial_indices(&evals);
+        assert_eq!(keep.len(), 15, "drop the detached 3-mode null cluster");
+    }
+
+    #[test]
+    fn pure_roundoff_modes_are_dropped() {
+        // A mode at the K*eps*lambda_max numerical floor is roundoff dust.
+        let big = 1.0e3;
+        let dust = 18.0 * f64::EPSILON * big * 0.5; // below the floor
+        let evals = Array1::from_vec(vec![big, 100.0, 10.0, 1.0, dust]);
+        let keep = thin_plate_retained_radial_indices(&evals);
+        assert_eq!(keep.len(), 4, "the sub-floor roundoff mode must be pruned");
+        assert!(!keep.contains(&4));
+    }
+
+    #[test]
+    fn empty_and_singleton_spectra_are_handled() {
+        assert!(thin_plate_retained_radial_indices(&Array1::from_vec(vec![])).is_empty());
+        assert_eq!(
+            thin_plate_retained_radial_indices(&Array1::from_vec(vec![5.0])),
+            vec![0]
+        );
+    }
+}
