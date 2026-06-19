@@ -1708,7 +1708,7 @@ def duchon_basis(
     m: int = 2,
     periodic_per_axis: Any = None,
     length_scale: float | None = None,
-    nullspace_order: str | None = None,
+    nullspace_order: str = "linear",
     power: float | None = None,
 ) -> Any:
     """Evaluate the Duchon m-spline basis at ``points`` against ``centers``.
@@ -1736,9 +1736,8 @@ def duchon_basis(
         hybrid kernel keeps the polynomial nullspace order **linear in d**
         (a single dim+1 column block), letting the same basis scale cleanly
         to d=8, 16, 32, 64 without ratcheting the nullspace.
-    nullspace_order : optional string. ``"zero"`` (constant nullspace),
+    nullspace_order : string, default ``"linear"``. ``"zero"`` (constant nullspace),
         ``"linear"`` (constant + linear), or ``"degree<k>"`` for k ≥ 2.
-        ``None`` (default) uses the binding's Duchon order resolver.
     power : optional float. Riesz spectral power ``s``. ``None`` (default)
         auto-resolves the minimum admissible ``s`` for the requested
         ``nullspace_order`` and dimension (matches the formula API).
@@ -1803,7 +1802,7 @@ def duchon_basis(
                 m_i,
                 periodic_arg,
                 None if length_scale is None else float(length_scale),
-                None if nullspace_order is None else str(nullspace_order),
+                str(nullspace_order),
                 None if power is None else float(power),
             ),
             dtype=float,
@@ -2122,7 +2121,7 @@ def duchon_function_norm_penalty(
     period: float | None = None,
     periodic_per_axis: Any = None,
     length_scale: float | None = None,
-    nullspace_order: str | None = None,
+    nullspace_order: str = "linear",
     power: float | None = None,
 ) -> Any:
     """Single-λ smoothness penalty matrix for the cubic (r³) Duchon basis.
@@ -2153,9 +2152,8 @@ def duchon_function_norm_penalty(
         scale-free pure Duchon spectrum. A positive value enables the
         hybrid (Matérn-blended) spectrum, keeping the polynomial nullspace
         order **linear in d** for clean scaling to d=8, 16, 32, 64.
-    nullspace_order : optional string. ``"zero"``, ``"linear"``, or
-        ``"degree<k>"`` (k ≥ 2). ``None`` (default) uses the binding's Duchon
-        order resolver.
+    nullspace_order : string, default ``"linear"``. ``"zero"``, ``"linear"``,
+        or ``"degree<k>"`` (k ≥ 2).
     power : optional float. Riesz spectral power ``s``. ``None`` (default)
         auto-resolves the minimum admissible ``s``.
 
@@ -2210,7 +2208,7 @@ def duchon_function_norm_penalty(
             period=float(period) if period is not None else None,
             periodic_per_axis=per_list,
             length_scale=None if length_scale is None else float(length_scale),
-            nullspace_order=None if nullspace_order is None else str(nullspace_order),
+            nullspace_order=str(nullspace_order),
             power=None if power is None else float(power),
         )
     except Exception as exc:

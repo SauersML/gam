@@ -2421,7 +2421,6 @@ fn duchon_function_norm_penalty<'py>(
         Some(explicit_power) => {
             let cfg = resolve_duchon_hybrid_config(
                 d,
-                m,
                 length_scale,
                 nullspace_order,
                 Some(explicit_power),
