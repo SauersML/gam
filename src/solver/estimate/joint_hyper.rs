@@ -487,11 +487,11 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     }
 
     /// True when a certified ψ-Gram tensor is installed AND `psi` lies inside
-    /// its certified GRADIENT sub-window — i.e. the n-free k-space ψ-derivatives
+    /// its certified GRADIENT window — i.e. the n-free k-space ψ-derivatives
     /// `(∂G/∂ψ, ∂b/∂ψ)` will serve the Gaussian gradient HyperCoord, so the
-    /// caller's per-trial n×k ∂X/∂ψ slab is redundant (#1033). The value lane
-    /// (`contains`) spans the full window; the gradient lane is the narrower
-    /// interior where the Chebyshev derivative reconstruction is bit-tight.
+    /// caller's per-trial n×k ∂X/∂ψ slab is redundant (#1033). For the
+    /// sufficient-statistic kappa search this covers the full optimizer window;
+    /// otherwise the caller does not arm the n-free outer loop.
     pub(crate) fn psi_gram_tensor_covers_gradient(&self, psi: f64) -> bool {
         self.psi_gram_tensor
             .as_ref()
@@ -647,18 +647,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         );
         // Install the conditioned-frame EXACT ANALYTIC ψ-derivatives so the
         // Gaussian ψ-gradient HyperCoord is assembled from these k×k objects
-        // instead of the n×k ∂X/∂ψ slab — but ONLY on the certified gradient
-        // SUB-window `contains_for_gradient`. Differentiating the Chebyshev value
-        // interpolant AMPLIFIES its interpolation error (`T_d′ ∼ d²`), so near the
-        // large-ψ window edges the analytic ψ-derivative GENUINELY fails the
-        // certification tolerance even though the VALUE reconstruction still
-        // certifies there — this is a real accuracy boundary, not a certification
-        // artifact. Outside the sub-window we return `false` (no tensor derivative
-        // installed): the caller then computes the EXACT STREAMED ψ-gradient from
-        // the realized n×k ∂X/∂ψ slab for that trial (O(n) for the rare edge evals;
-        // most κ trials land interior). Every gradient is therefore EXACT —
-        // analytic in the interior, exact-streamed at the edges — never an
-        // approximation (no finite difference in production).
+        // instead of the n×k ∂X/∂ψ slab. The #1033 sufficient-statistic kappa
+        // search is armed only when this certified gradient window spans the
+        // full optimizer bounds, so measured trials cannot fall back to a
+        // streamed edge-gradient pass.
         if tensor.contains_for_gradient(psi)
             && self.reml_state.install_gaussian_psi_gram_deriv(Arc::new((
                 tensor.dgram_dpsi(psi),
@@ -671,10 +663,9 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
             );
             true
         } else {
-            // Outside the certified gradient sub-window (or the derivative shape
-            // refused). Clear any derivative pair left from a prior in-sub-window ψ
-            // so the gradient lane computes the EXACT streamed slab for this trial
-            // rather than reusing a stale derivative carried over on the fast path.
+            // Outside the certified gradient window (or if the derivative shape
+            // refused). Clear any derivative pair left from a prior ψ so a
+            // non-armed exact path does not reuse a stale derivative.
             self.reml_state.clear_gaussian_psi_gram_deriv();
             false
         }

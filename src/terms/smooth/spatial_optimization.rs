@@ -2519,7 +2519,7 @@ impl<'d> SpatialJointContext<'d> {
         // `(∂G/∂ψ, ∂b/∂ψ)` tensor derivatives — never the n×k ∂X/∂ψ slab. So when
         //   (a) this is the single design-moving ψ coordinate (`rho_dim + 1`),
         //   (b) the certified ψ-Gram tensor covers ψ for BOTH the value lane
-        //       (`psi_gram_tensor_covers`) AND the gradient sub-window
+        //       (`psi_gram_tensor_covers`) AND the gradient window
         //       (`psi_gram_tensor_covers_gradient`) — so neither channel reads
         //       the realized rows,
         //   (c) this eval is gradient-only (`!allow_second_order`) — the exact
@@ -2548,18 +2548,11 @@ impl<'d> SpatialJointContext<'d> {
             let psi = theta[self.rho_dim];
             self.evaluator.psi_gram_tensor_covers(psi)
                     // #1033 gradient coverage: the skip serves the ψ-gradient n-free
-                    // only where the analytic Chebyshev derivative is CERTIFIED
-                    // (`contains_for_gradient`). Differentiating the value interpolant
-                    // amplifies its error (`T_d′ ∼ d²`), so near the window edges the
-                    // analytic derivative genuinely fails the gradient tolerance even
-                    // though the value still certifies — a real accuracy boundary. For
-                    // those edge ψ the gradient must come from the EXACT streamed n×k
-                    // ∂X/∂ψ slab, which needs the realized design at this ψ, so the
-                    // skip is refused there (whole design realized → exact value AND
-                    // gradient). Most κ trials land interior (inside the sub-window) →
-                    // n-free; only the rare edge evals pay O(n), and every gradient is
-                    // EXACT (analytic interior, exact-streamed at edges) — no
-                    // production finite difference.
+                    // only where the analytic Chebyshev derivative is CERTIFIED.
+                    // The kappa sufficient-statistic outer loop is routed here only
+                    // when the certified gradient window spans the entire optimizer
+                    // bounds, so a measured trial cannot pay an edge streamed
+                    // ∂X/∂ψ pass after the initial priming eval.
                     && self.evaluator.psi_gram_tensor_covers_gradient(psi)
                     // #1033 (reduced-basis rotation, supersedes #1264 gate): the
                     // Gaussian-identity inner solve the skip serves reads its data
@@ -3105,6 +3098,20 @@ fn run_exact_joint_spatial_optimization(
                 "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
                  in-window trials assemble Gaussian sufficient statistics n-free"
             );
+            let gradient_covers_full_window = evaluator.psi_gram_tensor_covers_gradient(psi_lo)
+                && evaluator.psi_gram_tensor_covers_gradient(psi_hi);
+            if gradient_covers_full_window {
+                log::info!(
+                    "[{label}] certified ψ-gram tensor gradient lane covers the full \
+                     optimizer window [{psi_lo:.3}, {psi_hi:.3}]"
+                );
+            } else {
+                log::info!(
+                    "[{label}] ψ-gram tensor value lane certified, but the gradient lane \
+                     does not cover the full optimizer window [{psi_lo:.3}, {psi_hi:.3}]; \
+                     keeping exact streamed kappa routing"
+                );
+            }
             // #1033 penalty lane: ψ also moves the penalty `S(ψ)` (the
             // Duchon/ThinPlate Hilbert scale is an analytic function of the
             // length-scale, built from the FROZEN basis CENTERS — not the data
@@ -3157,6 +3164,8 @@ fn run_exact_joint_spatial_optimization(
         // uncertified window), where it still pays O(n) per Hessian but keeps the
         // quality-sensitive exact second-order path.
         if attached
+            && evaluator.psi_gram_tensor_covers_gradient(psi_lo)
+            && evaluator.psi_gram_tensor_covers_gradient(psi_hi)
             && evaluator.supports_nfree_penalty_rekey()
             && cache.supports_nfree_gradient_only_routing()
         {
