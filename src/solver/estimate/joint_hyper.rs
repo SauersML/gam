@@ -290,9 +290,9 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
 
     /// Record the pinning ψ frozen by a slow-path `reset_surface` (#1264): the
     /// single design-moving ψ when `theta` carries one (`theta.len() == rho_dim +
-    /// 1`), else `None` (multi-ψ / no-ψ fits have no single-ψ skip witness). The
-    /// design-revision fast path certifies its skip against this ψ via
-    /// `psi_gram_tensor_covers_skip`.
+    /// 1`), else `None` (multi-ψ / no-ψ fits have no single-ψ witness). The
+    /// reduced-basis witness remains available through `psi_gram_tensor_covers_skip`,
+    /// while the #1033 n-free production lane gates on the certified value window.
     fn record_reset_psi(&mut self, theta: &Array1<f64>, rho_dim: usize) {
         self.last_reset_psi = if theta.len() == rho_dim + 1 {
             Some(theta[rho_dim])
