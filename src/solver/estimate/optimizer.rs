@@ -432,15 +432,7 @@ where
     reml_state.setwarm_start_original_beta(warm_start_beta);
 
     let reml_seed_config = external_reml_seed_config(k, cfg.link_function());
-    let reml_tol = {
-        let base = cfg.reml_convergence_tolerance;
-        // DIAGNOSTIC ONLY (#1271): env override to test whether tightening the
-        // outer REML stop pulls the tp under-smoothing toward mgcv parity.
-        match std::env::var("DIAG1271_REMLTOL").ok().and_then(|s| s.parse::<f64>().ok()) {
-            Some(v) if v.is_finite() && v > 0.0 => v,
-            _ => base,
-        }
-    };
+    let reml_tol = cfg.reml_convergence_tolerance;
     let reml_max_iter = opts.max_iter;
     let outer_eval_idx = AtomicUsize::new(0usize);
     let mixture_optspec = if opts.optimize_mixture {
