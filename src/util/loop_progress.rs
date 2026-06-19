@@ -52,12 +52,4 @@ impl LoopProgress {
             emit(progress, elapsed as f64 / 1.0e9);
         }
     }
-
-    pub fn progress(&self) -> usize {
-        self.progress.load(Ordering::Relaxed)
-    }
-
-    pub fn elapsed_secs(&self) -> f64 {
-        self.started.elapsed().as_secs_f64()
-    }
 }
