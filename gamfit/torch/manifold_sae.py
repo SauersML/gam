@@ -641,12 +641,14 @@ class _SparsityLayer(nn.Module):
         # the FFI accessor rather than re-deriving the decay in Python.
         self._schedule = cfg.sparsity.gumbel_schedule()
         self._init_alpha = float(cfg.sparsity.init_alpha)
-        # #1282 sequential matching-pursuit commitment window. For the first
-        # ~25% of the anneal (>=60 steps) atoms are introduced one at a time and
-        # each new atom is committed to the worst-reconstructed residual rows, to
-        # break expert collapse before the residual EM takes over. Geometry-
-        # agnostic: keyed only on the reconstruction residual.
-        self._commit_steps = max(60, int(0.25 * int(cfg.sparsity.tau_steps)))
+        # #1282 hard-commitment window. DISABLED (0): under the decoder-harmonic
+        # confinement any hard commit that feeds an atom a *mixed* row set drives
+        # it to the degenerate averaged 2-plane (channel signs cancel), which is
+        # worse than no commit. Symmetry is instead broken at decoder init
+        # (``_break_decoder_symmetry``) and resolved by harmonic-confined
+        # balanced Sinkhorn EM, which never passes through a blend. Kept as a
+        # knob (the machinery remains) but off by default.
+        self._commit_steps = 0
         # #1282 persistent per-row assignment accumulator (EMA of soft
         # responsibilities / commitment one-hots). At high reconstruction R² the
         # instantaneous per-atom residual carries almost no routing information
@@ -659,7 +661,9 @@ class _SparsityLayer(nn.Module):
         # (stable full-batch) row count on first use; reset if the row count
         # changes (e.g. a different batch / out-of-sample call).
         self._assign_ema: torch.Tensor | None = None
-        self._assign_ema_beta = 0.97
+        # With the commit disabled the EMA smooths the EM's *own* responsibilities
+        # (late-residual washout protection), so it can track more responsively.
+        self._assign_ema_beta = 0.9
 
     @torch.no_grad()
     def advance_temperature(self) -> None:
@@ -1144,6 +1148,40 @@ class ManifoldSAE(nn.Module):
         nn.init.normal_(self.atom_raw_anchor, mean=0.0, std=s)
         nn.init.normal_(self.decoder_blocks, mean=0.0, std=s)
         nn.init.zeros_(self.log_lambda)
+        self._break_decoder_symmetry()
+
+    @torch.no_grad()
+    def _break_decoder_symmetry(self) -> None:
+        """Seed each circle atom's fundamental onto a distinct 2-plane (#1282).
+
+        At the symmetric random init both atoms are interchangeable, so balanced
+        Sinkhorn EM has no signal for *which* atom should take which manifold and
+        the pair can collapse onto a shared blend. The decoder-harmonic penalty
+        confines each atom to a single 2-plane but does not choose the plane.
+        Break the tie deterministically (and geometry-agnostically) by biasing
+        each atom's fundamental rows — ``cos θ`` (row 2) and ``sin θ`` (row 1) —
+        toward a *distinct* pair of ambient coordinate axes, so atom ``f`` starts
+        on the 2-plane ``span{e_{2f}, e_{2f+1}}`` (mod D). The harmonic penalty
+        then locks each atom into its own plane and the EM discovers the matching
+        rows, without ever forcing an atom to fit a mixed (averaged-plane) row
+        set. Only meaningful for the circle layout (row 1 = sinθ, row 2 = cosθ);
+        a no-op otherwise.
+        """
+        if self.cfg.atom_manifold != "circle":
+            return
+        K = int(self.cfg.n_basis_per_atom)
+        if K < 3:  # need the DC + fundamental rows
+            return
+        F, D = int(self.cfg.n_atoms), int(self.cfg.input_dim)
+        s = float(self.cfg.init_scale)
+        mag = max(s, 0.1)
+        for f in range(F):
+            a0 = (2 * f) % D
+            a1 = (2 * f + 1) % D
+            self.decoder_blocks[f, 2].zero_()
+            self.decoder_blocks[f, 1].zero_()
+            self.decoder_blocks[f, 2, a0] = mag  # cos θ along axis a0
+            self.decoder_blocks[f, 1, a1] = mag  # sin θ along axis a1
 
     @property
     def _forward_centers(self) -> torch.Tensor | None:
