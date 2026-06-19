@@ -1577,14 +1577,39 @@ impl<'a> RemlState<'a> {
             use crate::faer_ndarray::FaerEigh;
             use faer::Side;
             let h_logdet = hessian_op.logdet();
-            let (h_above_one, h_min, h_max) = match h_total_original.eigh(Side::Lower) {
+            let (h_above_one, h_min, h_max, h_eig_str) = match h_total_original.eigh(Side::Lower) {
                 Ok((evals, _)) => {
                     let above = evals.iter().filter(|&&s| s > 1.0).count();
                     let mn = evals.iter().copied().fold(f64::INFINITY, f64::min);
                     let mx = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                    (above as i64, mn, mx)
+                    let mut sorted: Vec<f64> = evals.to_vec();
+                    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    let s = sorted
+                        .iter()
+                        .map(|v| format!("{v:.3e}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    (above as i64, mn, mx, s)
                 }
-                Err(_) => (-1, f64::NAN, f64::NAN),
+                Err(_) => (-1, f64::NAN, f64::NAN, String::from("err")),
+            };
+            // Penalty Sλ = EᵀE eigenvalues (the SAME e_for_logdet that feeds
+            // log|S|+). Sorted spectrum is basis-invariant; compare per-mode λ·d_i
+            // against the sorted H spectrum to see which modes are data-dominated
+            // (high EDF: λ·d ≪ H eig) vs penalty-crushed (λ·d ≈ H eig).
+            let s_eig_str = {
+                let s_lambda = e_for_logdet.t().dot(e_for_logdet);
+                match s_lambda.eigh(Side::Lower) {
+                    Ok((mut evals, _)) => {
+                        let v = evals.as_slice_mut().unwrap();
+                        v.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                        v.iter()
+                            .map(|x| format!("{x:.3e}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    }
+                    Err(_) => String::from("err"),
+                }
             };
             let rho_str = rho
                 .iter()
@@ -1605,7 +1630,7 @@ impl<'a> RemlState<'a> {
                  rss={rss:.6} pen={pen:.6} Dp={dp:.6} pirls_edf={pedf:.4} \
                  logS={ls:.6} logH={lh:.6} half_diff={hd:.6} \
                  h_above1={ha} h_min={hmin:.3e} h_max={hmax:.3e} \
-                 rho=[{rho_str}] lambda=[{lam_str}]",
+                 rho=[{rho_str}] lambda=[{lam_str}]\n  H_eig=[{h_eig_str}]\n  Slam_eig=[{s_eig_str}]",
                 p = beta.len(),
                 pr = penalty_rank,
                 nd = nullspace_dim,
