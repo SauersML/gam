@@ -238,13 +238,7 @@ impl<'a> StableSolver<'a> {
         }
 
         // Numerical solves can leave tiny asymmetry; enforce symmetry explicitly.
-        for i in 0..p {
-            for j in (i + 1)..p {
-                let avg = 0.5 * (inv[[i, j]] + inv[[j, i]]);
-                inv[[i, j]] = avg;
-                inv[[j, i]] = avg;
-            }
-        }
+        symmetrize_in_place(&mut inv);
         assert_eq!(regularized.nrows(), p);
         Some(inv)
     }

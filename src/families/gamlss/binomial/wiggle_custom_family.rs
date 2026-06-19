@@ -72,21 +72,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     }
 
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleWiggleFamily",
-            3,
-            block_states.len(),
-        )?;
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch {
-                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
-            }
-            .into());
-        }
+        let (n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
 
         let core = binomial_location_scale_core(
             &self.y,
@@ -168,21 +154,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
     }
 
     fn log_likelihood_only(&self, block_states: &[ParameterBlockState]) -> Result<f64, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleWiggleFamily",
-            3,
-            block_states.len(),
-        )?;
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch {
-                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
-            }
-            .into());
-        }
+        let (n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
         binomial_location_scale_ll_only(
             &self.y,
             &self.weights,
@@ -211,21 +183,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let Some(subsample) = options.outer_score_subsample.as_ref() else {
             return self.log_likelihood_only(block_states);
         };
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleWiggleFamily",
-            3,
-            block_states.len(),
-        )?;
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch {
-                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
-            }
-            .into());
-        }
+        let (n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
         use rayon::iter::ParallelIterator;
         let link_kind = &self.link_kind;
         let ll: Result<f64, String> = subsample
@@ -469,21 +427,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         //   qww  = 0,         dqww  = 0
         //
         // Implementation below follows these formulas exactly block-by-block.
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleWiggleFamily",
-            3,
-            block_states.len(),
-        )?;
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch {
-                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
-            }
-            .into());
-        }
+        let (n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
 
         let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
             return Ok(None);
@@ -591,21 +535,7 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        validate_block_count::<GamlssError>(
-            "BinomialLocationScaleWiggleFamily",
-            3,
-            block_states.len(),
-        )?;
-        let n = self.y.len();
-        let eta_t = &block_states[Self::BLOCK_T].eta;
-        let eta_ls = &block_states[Self::BLOCK_LOG_SIGMA].eta;
-        let etaw = &block_states[Self::BLOCK_WIGGLE].eta;
-        if eta_t.len() != n || eta_ls.len() != n || etaw.len() != n || self.weights.len() != n {
-            return Err(GamlssError::DimensionMismatch {
-                reason: "BinomialLocationScaleWiggleFamily input size mismatch".to_string(),
-            }
-            .into());
-        }
+        let (n, eta_t, eta_ls, etaw) = self.validated_block_etas(block_states)?;
 
         let Some((x_t, x_ls)) = self.exact_joint_dense_block_designs(None)? else {
             return Ok(None);

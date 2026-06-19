@@ -1614,14 +1614,7 @@ impl<S: Data<Elem = f64>> FaerEigh for ArrayBase<S, Ix2> {
         }
 
         let mut repaired = owned.clone();
-        let n = repaired.nrows();
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let avg = 0.5 * (repaired[[i, j]] + repaired[[j, i]]);
-                repaired[[i, j]] = avg;
-                repaired[[j, i]] = avg;
-            }
-        }
+        crate::matrix::symmetrize_in_place(&mut repaired);
 
         let scale = repaired
             .iter()

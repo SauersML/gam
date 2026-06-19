@@ -1,0 +1,392 @@
+diff --git a/src/solver/estimate/joint_hyper.rs b/src/solver/estimate/joint_hyper.rs
+index 3aef15c69..a92839d2d 100644
+--- a/src/solver/estimate/joint_hyper.rs
++++ b/src/solver/estimate/joint_hyper.rs
+@@ -487,11 +487,11 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
+     }
+ 
+     /// True when a certified ψ-Gram tensor is installed AND `psi` lies inside
+-    /// its certified GRADIENT sub-window — i.e. the n-free k-space ψ-derivatives
++    /// its certified GRADIENT window — i.e. the n-free k-space ψ-derivatives
+     /// `(∂G/∂ψ, ∂b/∂ψ)` will serve the Gaussian gradient HyperCoord, so the
+-    /// caller's per-trial n×k ∂X/∂ψ slab is redundant (#1033). The value lane
+-    /// (`contains`) spans the full window; the gradient lane is the narrower
+-    /// interior where the Chebyshev derivative reconstruction is bit-tight.
++    /// caller's per-trial n×k ∂X/∂ψ slab is redundant (#1033). For the
++    /// sufficient-statistic kappa search this covers the full optimizer window;
++    /// otherwise the caller does not arm the n-free outer loop.
+     pub(crate) fn psi_gram_tensor_covers_gradient(&self, psi: f64) -> bool {
+         self.psi_gram_tensor
+             .as_ref()
+@@ -513,28 +513,6 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
+             .is_some_and(|t| t.contains(psi))
+     }
+ 
+-    /// True when a certified ψ-Gram tensor is installed AND the design-revision
+-    /// fast-path skip to `psi` is SOUND given the reduced-basis reference surface
+-    /// frozen at the last slow-path reset ψ (`last_reset_psi`) (#1264, #1216 item
+-    /// 3). The skip re-keys the Gram + penalty on the frozen reference surface;
+-    /// it reproduces the exact slow-path β̂ only when the realized reduced basis
+-    /// (the range / null split of the conditioned data Gram) at the pinning ψ is
+-    /// still valid at `psi`. On the wide standardized window the radial-kernel
+-    /// reduced subspace can rotate with ψ; a skip across that rotation pairs a
+-    /// stale reduced basis with a re-keyed Gram and yields a wrong β̂. The pairwise
+-    /// witness [`PsiGramTensor::reduced_basis_equal`] compares the gauge-invariant
+-    /// range projectors at the two ψ's n-free; the skip fires only where they
+-    /// span the same subspace. Without a recorded pinning ψ the skip is refused.
+-    pub(crate) fn psi_gram_tensor_covers_skip(&self, psi: f64) -> bool {
+-        let Some(tensor) = self.psi_gram_tensor.as_ref() else {
+-            return false;
+-        };
+-        let Some(psi_ref) = self.last_reset_psi else {
+-            return false;
+-        };
+-        tensor.reduced_basis_equal(psi_ref, psi)
+-    }
+-
+     /// True when the design-revision fast path of [`Self::prepare_eval_state`]
+     /// would fire for `design_revision` — i.e. a prior eval has already pinned
+     /// `last_canonical_revision` to this exact realizer revision, so the next
+@@ -647,18 +625,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
+         );
+         // Install the conditioned-frame EXACT ANALYTIC ψ-derivatives so the
+         // Gaussian ψ-gradient HyperCoord is assembled from these k×k objects
+-        // instead of the n×k ∂X/∂ψ slab — but ONLY on the certified gradient
+-        // SUB-window `contains_for_gradient`. Differentiating the Chebyshev value
+-        // interpolant AMPLIFIES its interpolation error (`T_d′ ∼ d²`), so near the
+-        // large-ψ window edges the analytic ψ-derivative GENUINELY fails the
+-        // certification tolerance even though the VALUE reconstruction still
+-        // certifies there — this is a real accuracy boundary, not a certification
+-        // artifact. Outside the sub-window we return `false` (no tensor derivative
+-        // installed): the caller then computes the EXACT STREAMED ψ-gradient from
+-        // the realized n×k ∂X/∂ψ slab for that trial (O(n) for the rare edge evals;
+-        // most κ trials land interior). Every gradient is therefore EXACT —
+-        // analytic in the interior, exact-streamed at the edges — never an
+-        // approximation (no finite difference in production).
++        // instead of the n×k ∂X/∂ψ slab. The #1033 sufficient-statistic kappa
++        // search is armed only when this certified gradient window spans the
++        // full optimizer bounds, so measured trials cannot fall back to a
++        // streamed edge-gradient pass.
+         if tensor.contains_for_gradient(psi)
+             && self.reml_state.install_gaussian_psi_gram_deriv(Arc::new((
+                 tensor.dgram_dpsi(psi),
+@@ -671,10 +641,9 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
+             );
+             true
+         } else {
+-            // Outside the certified gradient sub-window (or the derivative shape
+-            // refused). Clear any derivative pair left from a prior in-sub-window ψ
+-            // so the gradient lane computes the EXACT streamed slab for this trial
+-            // rather than reusing a stale derivative carried over on the fast path.
++            // Outside the certified gradient window (or if the derivative shape
++            // refused). Clear any derivative pair left from a prior ψ so a
++            // non-armed exact path does not reuse a stale derivative.
+             self.reml_state.clear_gaussian_psi_gram_deriv();
+             false
+         }
+diff --git a/src/solver/psi_gram_tensor.rs b/src/solver/psi_gram_tensor.rs
+index 1c5e5ed8c..c873df60c 100644
+--- a/src/solver/psi_gram_tensor.rs
++++ b/src/solver/psi_gram_tensor.rs
+@@ -69,7 +69,7 @@ pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
+ 
+ /// Relative agreement required of the analytic ψ-DERIVATIVE `dgram_dpsi`
+ /// against a high-order (Richardson-validated) finite difference of the exactly
+-/// rebuilt Gram, used to certify the interior gradient sub-window.
++/// rebuilt Gram, used to certify the full gradient window.
+ ///
+ /// #1216: on the WIDE STANDARDIZED geometry default 1-D fits use (#1215) the
+ /// value-lane Chebyshev tail plateaus at the realized design's precision floor
+@@ -87,8 +87,8 @@ pub const PSI_GRAM_SPOT_RTOL: f64 = 1.0e-10;
+ /// comparison (gates) and the off-node value spot check, not this pre-filter.
+ pub const PSI_GRAM_GRAD_SPOT_RTOL: f64 = 1.0e-6;
+ 
+-/// Number of equispaced scan points (per side) used to locate the interior
+-/// gradient sub-window where `dgram_dpsi` certifies.
++/// Number of equispaced scan points used to certify the full gradient window
++/// where `dgram_dpsi` certifies.
+ pub const PSI_GRAM_GRAD_SCAN_POINTS: usize = 64;
+ 
+ /// Node-count escalation ladder for the expansion build (degree = nodes − 1).
+@@ -140,9 +140,11 @@ pub const PSI_GRAM_SKIP_PROJ_ATOL: f64 = 1.0e-7;
+ pub struct PsiGramTensor {
+     psi_lo: f64,
+     psi_hi: f64,
+-    /// Interior sub-window `[grad_psi_lo, grad_psi_hi] ⊆ [psi_lo, psi_hi]` over
+-    /// which the ANALYTIC ψ-derivative `dgram_dpsi` reproduces the exact design
+-    /// derivative to [`PSI_GRAM_GRAD_SPOT_RTOL`] (#1033b gradient lane).
++    /// Certified gradient window over which the ANALYTIC ψ-derivative
++    /// `dgram_dpsi` reproduces the exact design derivative to
++    /// [`PSI_GRAM_GRAD_SPOT_RTOL`] (#1033b gradient lane). For the #1033
++    /// sufficient-statistic outer loop this must cover the full optimizer
++    /// window; otherwise callers do not arm the n-free kappa search.
+     ///
+     /// The value reconstruction `gram_at` is certified over the FULL window
+     /// (`T_d ≤ 1` everywhere), but the derivative reconstruction amplifies the
+@@ -319,8 +321,9 @@ impl PsiGramTensor {
+                 BuildOutcome::TailNotCertified => continue,
+                 BuildOutcome::Candidate(mut candidate) => {
+                     if candidate.spot_check(&mut eval_design, weights) {
+-                        // Narrow the gradient sub-window to the certified
+-                        // interior (the value lane keeps the full window).
++                        // Certify the gradient lane over the full optimizer
++                        // window. Endpoint checks use one-sided high-order
++                        // stencils; interior checks use central stencils.
+                         candidate.certify_gradient_window(&mut eval_design, weights);
+                         // Narrow the design-revision skip lane to the
+                         // reduced-basis-equality interior (#1264).
+@@ -511,20 +514,29 @@ impl PsiGramTensor {
+         true
+     }
+ 
+-    /// Locate the largest centered interior interval where the analytic
+-    /// derivative `dgram_dpsi` reproduces a central finite difference of the
+-    /// exactly rebuilt Gram to [`PSI_GRAM_GRAD_SPOT_RTOL`], and store it as the
+-    /// gradient sub-window. Scans inward symmetrically from both endpoints; the
+-    /// value lane (`gram_at`) is unaffected. One-time cost: a handful of extra
+-    /// exact design evals (each cheap under the radial profile).
++    /// Certify that the analytic derivative `dgram_dpsi` reproduces a finite
++    /// difference of the exactly rebuilt Gram to [`PSI_GRAM_GRAD_SPOT_RTOL`]
++    /// across the entire optimizer window. Interior probes use a 4th-order
++    /// central stencil; endpoint probes use the matching one-sided stencil, so
++    /// bounded optimizer trials do not fall off the n-free gradient lane merely
++    /// because a central stencil would step outside the window. One-time cost: a
++    /// handful of extra exact design evals (each cheap under the radial profile).
+     fn certify_gradient_window(
+         &mut self,
+         eval_design: &mut impl FnMut(f64) -> Result<Array2<f64>, String>,
+         weights: ArrayView1<'_, f64>,
+     ) {
+         let span = self.psi_hi - self.psi_lo;
+-        // A 4th-order central FD reference at step `h`:
+-        //   G'(ψ) ≈ [G(ψ−2h) − 8G(ψ−h) + 8G(ψ+h) − G(ψ+2h)] / (12h),  err O(h⁴).
++        if !(span.is_finite() && span > 0.0) {
++            self.grad_psi_lo = f64::NAN;
++            self.grad_psi_hi = f64::NAN;
++            return;
++        }
++        // A 4th-order FD reference at step `h`. Interior points use the central
++        // formula:
++        //   G'(ψ) ≈ [G(ψ−2h) − 8G(ψ−h) + 8G(ψ+h) − G(ψ+2h)] / (12h).
++        // Points too close to a boundary use the corresponding one-sided
++        // 5-point formula, also O(h⁴), and remain inside [psi_lo, psi_hi].
+         let fd4 = |psi: f64,
+                    h: f64,
+                    eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
+@@ -539,11 +551,29 @@ impl PsiGramTensor {
+                 }
+                 Some(design.t().dot(&wd))
+             };
+-            let g_m2 = weighted_gram(psi - 2.0 * h, eval)?;
+-            let g_m1 = weighted_gram(psi - h, eval)?;
+-            let g_p1 = weighted_gram(psi + h, eval)?;
+-            let g_p2 = weighted_gram(psi + 2.0 * h, eval)?;
+-            Some((g_m2 - 8.0 * &g_m1 + 8.0 * &g_p1 - g_p2) / (12.0 * h))
++            if psi - 2.0 * h >= self.psi_lo && psi + 2.0 * h <= self.psi_hi {
++                let g_m2 = weighted_gram(psi - 2.0 * h, eval)?;
++                let g_m1 = weighted_gram(psi - h, eval)?;
++                let g_p1 = weighted_gram(psi + h, eval)?;
++                let g_p2 = weighted_gram(psi + 2.0 * h, eval)?;
++                Some((g_m2 - 8.0 * &g_m1 + 8.0 * &g_p1 - g_p2) / (12.0 * h))
++            } else if psi + 4.0 * h <= self.psi_hi {
++                let g0 = weighted_gram(psi, eval)?;
++                let g1 = weighted_gram(psi + h, eval)?;
++                let g2 = weighted_gram(psi + 2.0 * h, eval)?;
++                let g3 = weighted_gram(psi + 3.0 * h, eval)?;
++                let g4 = weighted_gram(psi + 4.0 * h, eval)?;
++                Some((-25.0 * &g0 + 48.0 * &g1 - 36.0 * &g2 + 16.0 * &g3 - 3.0 * &g4) / (12.0 * h))
++            } else if psi - 4.0 * h >= self.psi_lo {
++                let g0 = weighted_gram(psi, eval)?;
++                let g1 = weighted_gram(psi - h, eval)?;
++                let g2 = weighted_gram(psi - 2.0 * h, eval)?;
++                let g3 = weighted_gram(psi - 3.0 * h, eval)?;
++                let g4 = weighted_gram(psi - 4.0 * h, eval)?;
++                Some((25.0 * &g0 - 48.0 * &g1 + 36.0 * &g2 - 16.0 * &g3 + 3.0 * &g4) / (12.0 * h))
++            } else {
++                None
++            }
+         };
+         // #1216: on the WIDE standardized ψ-window the kernel `kernel(r·e^ψ)` has
+         // ψ-derivatives that grow like `e^{kψ}`, so a FIXED `h = span·1e-3` makes
+@@ -562,7 +592,12 @@ impl PsiGramTensor {
+         // O(h⁶) truncation against the O(ε/h) rounding floor.
+         // FD-OK: FD-audit certificate (Richardson-validated FD reference certifying the analytic ψ-derivative)
+         const FD_CONVERGED_RTOL: f64 = 1e-9; // fd-ok: FD-audit oracle certifying analytic dGram/dpsi window; result gates analytic path, not used in Gram math
+-        let h = (span * 2e-4).max(1e-6);
++        let h = (span * 2e-4).max(1e-6).min(span / 16.0);
++        if !(h.is_finite() && h > 0.0) {
++            self.grad_psi_lo = f64::NAN;
++            self.grad_psi_hi = f64::NAN;
++            return;
++        }
+         let exact_dgram = move |psi: f64,
+                                 eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
+               -> Option<Array2<f64>> {
+@@ -592,10 +627,6 @@ impl PsiGramTensor {
+                          psi: f64,
+                          eval: &mut dyn FnMut(f64) -> Result<Array2<f64>, String>|
+          -> bool {
+-            // Keep the widest stencil (ψ ± 2h) strictly inside the window.
+-            if psi - 2.0 * h <= me.psi_lo || psi + 2.0 * h >= me.psi_hi {
+-                return false;
+-            }
+             let Some(exact) = exact_dgram(psi, eval) else {
+                 return false;
+             };
+@@ -609,35 +640,20 @@ impl PsiGramTensor {
+                 .zip(exact.iter())
+                 .all(|(a, b)| (a - b).abs() <= PSI_GRAM_GRAD_SPOT_RTOL * scale)
+         };
+-        // Scan inward from each endpoint to the first certified point.
++        // Certify the whole window, including exact bound points. If any probe
++        // refuses, keep the gradient window empty so callers cannot arm the
++        // sufficient-statistic kappa search on a partial gradient lane.
+         let n = PSI_GRAM_GRAD_SCAN_POINTS;
+-        let mut lo = self.psi_hi;
+-        let mut hi = self.psi_lo;
+-        let mut found = false;
+         for i in 0..=n {
+             let psi = self.psi_lo + span * (i as f64) / (n as f64);
+-            if certifies(self, psi, eval_design) {
+-                lo = psi;
+-                found = true;
+-                break;
+-            }
+-        }
+-        for i in (0..=n).rev() {
+-            let psi = self.psi_lo + span * (i as f64) / (n as f64);
+-            if certifies(self, psi, eval_design) {
+-                hi = psi;
+-                break;
++            if !certifies(self, psi, eval_design) {
++                self.grad_psi_lo = f64::NAN;
++                self.grad_psi_hi = f64::NAN;
++                return;
+             }
+         }
+-        if found && hi > lo {
+-            self.grad_psi_lo = lo;
+-            self.grad_psi_hi = hi;
+-        } else {
+-            // No certified interior: disable the gradient lane entirely
+-            // (empty sub-window) — callers keep the exact slab gradient.
+-            self.grad_psi_lo = f64::NAN;
+-            self.grad_psi_hi = f64::NAN;
+-        }
++        self.grad_psi_lo = self.psi_lo;
++        self.grad_psi_hi = self.psi_hi;
+     }
+ 
+     /// Locate the design-realization skip sub-window `[skip_psi_lo,
+@@ -760,10 +776,10 @@ impl PsiGramTensor {
+             && psi <= self.skip_psi_hi
+     }
+ 
+-    /// True when `psi` lies inside the certified gradient sub-window — the
+-    /// region where the analytic ψ-derivative is bit-tight against the exact
+-    /// design derivative (#1033b). Outside it (near the window edges) callers
+-    /// must keep the exact slab gradient.
++    /// True when `psi` lies inside the certified gradient window where the
++    /// analytic ψ-derivative is bit-tight against the exact design derivative
++    /// (#1033b). The n-free kappa outer loop is armed only when this covers the
++    /// full optimizer bounds.
+     pub fn contains_for_gradient(&self, psi: f64) -> bool {
+         psi.is_finite()
+             && self.grad_psi_lo.is_finite()
+diff --git a/src/terms/smooth/spatial_optimization.rs b/src/terms/smooth/spatial_optimization.rs
+index 1f6d25ae1..f9d50e5be 100644
+--- a/src/terms/smooth/spatial_optimization.rs
++++ b/src/terms/smooth/spatial_optimization.rs
+@@ -2519,7 +2519,7 @@ impl<'d> SpatialJointContext<'d> {
+         // `(∂G/∂ψ, ∂b/∂ψ)` tensor derivatives — never the n×k ∂X/∂ψ slab. So when
+         //   (a) this is the single design-moving ψ coordinate (`rho_dim + 1`),
+         //   (b) the certified ψ-Gram tensor covers ψ for BOTH the value lane
+-        //       (`psi_gram_tensor_covers`) AND the gradient sub-window
++        //       (`psi_gram_tensor_covers`) AND the gradient window
+         //       (`psi_gram_tensor_covers_gradient`) — so neither channel reads
+         //       the realized rows,
+         //   (c) this eval is gradient-only (`!allow_second_order`) — the exact
+@@ -2548,18 +2548,11 @@ impl<'d> SpatialJointContext<'d> {
+             let psi = theta[self.rho_dim];
+             self.evaluator.psi_gram_tensor_covers(psi)
+                     // #1033 gradient coverage: the skip serves the ψ-gradient n-free
+-                    // only where the analytic Chebyshev derivative is CERTIFIED
+-                    // (`contains_for_gradient`). Differentiating the value interpolant
+-                    // amplifies its error (`T_d′ ∼ d²`), so near the window edges the
+-                    // analytic derivative genuinely fails the gradient tolerance even
+-                    // though the value still certifies — a real accuracy boundary. For
+-                    // those edge ψ the gradient must come from the EXACT streamed n×k
+-                    // ∂X/∂ψ slab, which needs the realized design at this ψ, so the
+-                    // skip is refused there (whole design realized → exact value AND
+-                    // gradient). Most κ trials land interior (inside the sub-window) →
+-                    // n-free; only the rare edge evals pay O(n), and every gradient is
+-                    // EXACT (analytic interior, exact-streamed at edges) — no
+-                    // production finite difference.
++                    // only where the analytic Chebyshev derivative is CERTIFIED.
++                    // The kappa sufficient-statistic outer loop is routed here only
++                    // when the certified gradient window spans the entire optimizer
++                    // bounds, so a measured trial cannot pay an edge streamed
++                    // ∂X/∂ψ pass after the initial priming eval.
+                     && self.evaluator.psi_gram_tensor_covers_gradient(psi)
+                     // #1033 (reduced-basis rotation, supersedes #1264 gate): the
+                     // Gaussian-identity inner solve the skip serves reads its data
+@@ -3075,9 +3068,8 @@ fn run_exact_joint_spatial_optimization(
+     // off-window trials, or any other ineligibility silently keep the exact
+     // streamed path (same numbers, the tensor is certified to
+     // PSI_GRAM_SPOT_RTOL against the exact rebuild).
+-    let nfree_penalty_capable = coord_dim == 1
+-        && family.is_gaussian_identity()
+-        && ctx.cache.supports_nfree_penalty_rekey();
++    let nfree_penalty_capable =
++        coord_dim == 1 && family.is_gaussian_identity() && ctx.cache.supports_nfree_penalty_rekey();
+     if nfree_penalty_capable {
+         let psi_lo = lower[rho_dim];
+         let psi_hi = upper[rho_dim];
+@@ -3105,6 +3097,20 @@ fn run_exact_joint_spatial_optimization(
+                 "[{label}] certified ψ-gram tensor over [{psi_lo:.3}, {psi_hi:.3}]: \
+                  in-window trials assemble Gaussian sufficient statistics n-free"
+             );
++            let gradient_covers_full_window = evaluator.psi_gram_tensor_covers_gradient(psi_lo)
++                && evaluator.psi_gram_tensor_covers_gradient(psi_hi);
++            if gradient_covers_full_window {
++                log::info!(
++                    "[{label}] certified ψ-gram tensor gradient lane covers the full \
++                     optimizer window [{psi_lo:.3}, {psi_hi:.3}]"
++                );
++            } else {
++                log::info!(
++                    "[{label}] ψ-gram tensor value lane certified, but the gradient lane \
++                     does not cover the full optimizer window [{psi_lo:.3}, {psi_hi:.3}]; \
++                     keeping exact streamed kappa routing"
++                );
++            }
+             // #1033 penalty lane: ψ also moves the penalty `S(ψ)` (the
+             // Duchon/ThinPlate Hilbert scale is an analytic function of the
+             // length-scale, built from the FROZEN basis CENTERS — not the data
+@@ -3157,6 +3163,8 @@ fn run_exact_joint_spatial_optimization(
+         // uncertified window), where it still pays O(n) per Hessian but keeps the
+         // quality-sensitive exact second-order path.
+         if attached
++            && evaluator.psi_gram_tensor_covers_gradient(psi_lo)
++            && evaluator.psi_gram_tensor_covers_gradient(psi_hi)
+             && evaluator.supports_nfree_penalty_rekey()
+             && cache.supports_nfree_gradient_only_routing()
+         {
+@@ -3246,11 +3254,12 @@ fn run_exact_joint_spatial_optimization(
+         }
+     }
+ 
+-    let kphase_prime_order = if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
+-        OuterEvalOrder::ValueGradientHessian
+-    } else {
+-        OuterEvalOrder::ValueAndGradient
+-    };
++    let kphase_prime_order =
++        if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
++            OuterEvalOrder::ValueGradientHessian
++        } else {
++            OuterEvalOrder::ValueAndGradient
++        };
+     let kphase_prime_start = std::time::Instant::now();
+     let _ = ctx.eval_full(theta0, kphase_prime_order, analytic_outer_hessian_available)?;
+     log::info!(

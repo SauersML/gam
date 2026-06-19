@@ -1,0 +1,9 @@
+tools:
+    shell:
+        allow:
+            - source *
+            - python *
+            - which gh
+            - gh *
+            - codex cloud list *
+            - node *
