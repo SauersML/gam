@@ -592,6 +592,46 @@ impl SurvivalMarginalSlopeFamily {
                     eval_edge(part.right_edge, neg_cell.right)
                         - eval_edge(part.left_edge, neg_cell.left)
                 };
+                // `G_z = w_z = -q_z·w` (G = w, constant integrand g≡1), reusing
+                // the directional block's `density_z_derivative` at poly=[1].
+                let density_w_z = |z: f64| -> f64 { density_z_derivative(&[1.0], z) };
+                // `D_dir(G_z) = D_dir(-q_z·w)`. With `q_z = z + η·η_z`,
+                // `D_dir(q_z) = η_dir·η_z + η·η_z_dir` (z is the integration
+                // variable, `D_dir(z)=0`), and `D_dir(w) = -η·η_dir·w` (since
+                // `D_dir(q) = η·η_dir`). Hence
+                // `D_dir(G_z) = [-(η_dir·η_z + η·η_z_dir) + q_z·η·η_dir]·w`.
+                // `η_dir`/`η_z_dir` come from the directional cell-coefficient
+                // shift `neg_cell_dir` already assembled above.
+                let density_w_z_dir = |z: f64| -> f64 {
+                    let eta = neg_cell.eta(z);
+                    let eta_z = neg_cell.c1 + 2.0 * neg_cell.c2 * z + 3.0 * neg_cell.c3 * z * z;
+                    let eta_dir = eval_poly_slice(&neg_cell_dir, z);
+                    let eta_z_dir = eval_poly_derivative_slice(&neg_cell_dir, z);
+                    let q_z = z + eta * eta_z;
+                    let w = (-neg_cell.q(z)).exp() / std::f64::consts::TAU;
+                    (-(eta_dir * eta_z + eta * eta_z_dir) + q_z * eta * eta_dir) * w
+                };
+                // `D_dir(G_z·z_u·z_v)` self-flux, the directional derivative of the
+                // base block's `self_flux` (gam#932). By Leibniz,
+                // `D_dir(G_z·z_u·z_v) = D_dir(G_z)·z_u·z_v
+                //   + G_z·(z_u_dir·z_v + z_u·z_v_dir)`,
+                // with `z_u = z_axis(u)`, `z_u_dir = z_axis_dir(u)` from
+                // `edge_axis`. Symmetric in u,v → added once (like base self_flux),
+                // summed right−left over the crossing edges.
+                let self_flux_dir = |u: usize, v: usize| -> f64 {
+                    let eval_edge =
+                        |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+                            let (zu, zu_dir, _) = edge_axis(u, edge, z);
+                            let (zv, zv_dir, _) = edge_axis(v, edge, z);
+                            if zu == 0.0 && zu_dir == 0.0 && zv == 0.0 && zv_dir == 0.0 {
+                                return 0.0;
+                            }
+                            density_w_z_dir(z) * zu * zv
+                                + density_w_z(z) * (zu_dir * zv + zu * zv_dir)
+                        };
+                    eval_edge(part.right_edge, neg_cell.right)
+                        - eval_edge(part.left_edge, neg_cell.left)
+                };
 
                 f_a_dir += first_boundary(&neg_dc_da);
                 f_aa_dir += boundary(&neg_dc_da, &neg_dc_da, &neg_dc_daa);
@@ -636,6 +676,10 @@ impl SurvivalMarginalSlopeFamily {
                         if u != v {
                             bval += axis_flux_dir(u, &neg_coeff_v, &neg_coeff_v_dir);
                         }
+                        // `D_dir(G_z·z_u·z_v)` self-flux: directional derivative of
+                        // the base block's symmetric `self_flux`, added once to both
+                        // triangles (gam#932).
+                        bval += self_flux_dir(u, v);
                         f_uv_dir[[u, v]] += bval;
                         if u != v {
                             f_uv_dir[[v, u]] += bval;
