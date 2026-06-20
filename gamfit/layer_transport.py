@@ -14,6 +14,10 @@ layer_transport_ladder
     Fit every adjacent and two-hop transport map across a ladder of layers,
     with the composition law ``h_{l->l+2} =? h_{l+1->l+2} o h_{l->l+1}``
     tested per triple.
+fit_transport
+    Fit one transport map and return a live, invertible ``FittedTransport``
+    object (``eval``/``derivative``/``eval_with_variance``/``invert`` + report)
+    rather than the summary dict, so callers can form ``g_B o g_A^-1``.
 """
 
 from __future__ import annotations
@@ -59,6 +63,34 @@ def layer_transport_fit(
         topology_to,
         int(layer_from),
         int(layer_to),
+    )
+
+
+def fit_transport(
+    coords_from: Any,
+    coords_to: Any,
+    topology_from: str = "circle",
+    topology_to: str = "circle",
+) -> Any:
+    """Fit a transport map and return a live, invertible ``FittedTransport``.
+
+    Unlike :func:`layer_transport_fit` (which returns a summary dict), this
+    returns the map itself. The returned object exposes ``eval(t)``,
+    ``derivative(t)``, ``eval_with_variance(t)``, and ``invert(y)`` (each over a
+    1-D coordinate array), a ``report(layer_from=0, layer_to=1)`` dict, and the
+    summary properties ``topology_from``/``topology_to``/``topology_preserved``/
+    ``degree``/``isometry_defect``. ``invert`` is the piece that lets a caller
+    compose ``g_B o g_A^-1`` from two fitted transports.
+
+    ``coords_from[i]`` and ``coords_to[i]`` must coordinatize the same
+    observation in the source and target charts; topologies are ``"circle"`` or
+    ``"interval"``.
+    """
+    return rust_module().fit_transport(
+        _as_coord_array(coords_from, "coords_from"),
+        _as_coord_array(coords_to, "coords_to"),
+        topology_from,
+        topology_to,
     )
 
 

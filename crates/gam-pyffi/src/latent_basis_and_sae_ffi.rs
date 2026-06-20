@@ -3977,6 +3977,124 @@ fn layer_transport_fit(
     Ok(layer_transport_report_to_pydict(py, &report)?.unbind())
 }
 
+/// A fitted inter-chart transport map `h: t_from ↦ t_to`, exposed as a live,
+/// **invertible** object. Where [`layer_transport_fit`] returns only the
+/// evidence dict, this carries the map itself: callers can `eval`,
+/// `derivative`, `eval_with_variance`, and `invert` it — the transport algebra
+/// needed to form `g_B ∘ g_A⁻¹` from two fitted transports. Construct with
+/// [`fit_transport`]; the summary properties mirror the dict keys.
+#[pyclass(module = "gamfit._rust", name = "FittedTransport")]
+pub struct PyFittedTransport {
+    inner: gam::inference::layer_transport::FittedTransport,
+}
+
+#[pymethods]
+impl PyFittedTransport {
+    /// Evaluate `h(t)` (wrapped to `[0, 2π)` on circle targets).
+    fn eval<'py>(
+        &self,
+        py: Python<'py>,
+        t: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Py<PyArray1<f64>>> {
+        let out = self.inner.eval(t.as_array()).map_err(PyValueError::new_err)?;
+        Ok(out.into_pyarray(py).unbind())
+    }
+
+    /// Evaluate the chart-coordinate derivative `h′(t)`.
+    fn derivative<'py>(
+        &self,
+        py: Python<'py>,
+        t: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Py<PyArray1<f64>>> {
+        let out = self
+            .inner
+            .derivative(t.as_array())
+            .map_err(PyValueError::new_err)?;
+        Ok(out.into_pyarray(py).unbind())
+    }
+
+    /// Evaluate `h(t)` and its pointwise delta-method variance as `(values,
+    /// variances)`.
+    fn eval_with_variance<'py>(
+        &self,
+        py: Python<'py>,
+        t: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<(Py<PyArray1<f64>>, Py<PyArray1<f64>>)> {
+        let (values, variances) = self
+            .inner
+            .eval_with_variance(t.as_array())
+            .map_err(PyValueError::new_err)?;
+        Ok((
+            values.into_pyarray(py).unbind(),
+            variances.into_pyarray(py).unbind(),
+        ))
+    }
+
+    /// Invert: for each target coordinate `y`, the source coordinate `t` with
+    /// `eval([t]) == y`. Requires a topology-preserving (fold-free) map and
+    /// rejects out-of-image interval targets.
+    fn invert<'py>(
+        &self,
+        py: Python<'py>,
+        y: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Py<PyArray1<f64>>> {
+        let out = self
+            .inner
+            .invert(y.as_array())
+            .map_err(PyValueError::new_err)?;
+        Ok(out.into_pyarray(py).unbind())
+    }
+
+    /// The full evidence payload — same keys as [`layer_transport_fit`]'s dict.
+    #[pyo3(signature = (layer_from = 0, layer_to = 1))]
+    fn report(&self, py: Python<'_>, layer_from: usize, layer_to: usize) -> PyResult<Py<PyDict>> {
+        let report = self.inner.report(layer_from, layer_to);
+        Ok(layer_transport_report_to_pydict(py, &report)?.unbind())
+    }
+
+    #[getter]
+    fn topology_from(&self) -> &'static str {
+        self.inner.topology_from.name()
+    }
+    #[getter]
+    fn topology_to(&self) -> &'static str {
+        self.inner.topology_to.name()
+    }
+    #[getter]
+    fn topology_preserved(&self) -> bool {
+        self.inner.topology_preserved
+    }
+    #[getter]
+    fn degree(&self) -> Option<i32> {
+        self.inner.degree
+    }
+    #[getter]
+    fn isometry_defect(&self) -> f64 {
+        self.inner.isometry_defect
+    }
+}
+
+/// Fit an inter-chart transport map `t_to = h(t_from)` and return it as a live,
+/// invertible [`PyFittedTransport`] (rather than the summary dict that
+/// [`layer_transport_fit`] returns). `coords_from[i]` and `coords_to[i]`
+/// coordinatize the same observation in the source and target charts;
+/// topologies are `"circle"` or `"interval"`.
+#[pyfunction(signature = (coords_from, coords_to, topology_from = "circle", topology_to = "circle"))]
+fn fit_transport(
+    coords_from: PyReadonlyArray1<'_, f64>,
+    coords_to: PyReadonlyArray1<'_, f64>,
+    topology_from: &str,
+    topology_to: &str,
+) -> PyResult<PyFittedTransport> {
+    let from = coords_from.as_array();
+    let to = coords_to.as_array();
+    let topo_from = parse_chart_topology(topology_from, from)?;
+    let topo_to = parse_chart_topology(topology_to, to)?;
+    let inner = gam::inference::layer_transport::fit_transport_map(from, to, topo_from, topo_to)
+        .map_err(PyValueError::new_err)?;
+    Ok(PyFittedTransport { inner })
+}
+
 /// Fit a whole ladder of layer charts: every adjacent transport map plus
 /// every two-hop map with the composition-law test
 /// `h_{l→l+2} ≟ h_{l+1→l+2} ∘ h_{l→l+1}` attached (issue #1013). `coords` is
