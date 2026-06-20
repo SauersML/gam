@@ -1942,18 +1942,6 @@ fn summary_smooth_terms(
         penalty_cursor += k;
         let smooth_test = if term.shape == ShapeConstraint::None {
             cov_forwald.and_then(|cov| {
-                if std::env::var("GAM_DBG_1360").is_ok() {
-                    let r = term.coeff_range.clone();
-                    let blk = cov.slice(ndarray::s![r.clone(), r.clone()]).to_owned();
-                    let (evals, _) = <ndarray::Array2<f64> as gam::faer_ndarray::FaerEigh>::eigh(blk.clone(), faer::Side::Lower).unwrap();
-                    let bb = fit.beta.slice(ndarray::s![r.clone()]).to_owned();
-                    eprintln!("[DBG1360] term={} range={:?} edf={:.3} nulldim={} corrected={}",
-                        term.name, r, edf, term.nullspace_dims.iter().copied().sum::<usize>(),
-                        fit.beta_covariance_corrected().is_some());
-                    eprintln!("[DBG1360]   block diag={:?}", blk.diag().to_vec());
-                    eprintln!("[DBG1360]   eigvals={:?}", evals.to_vec());
-                    eprintln!("[DBG1360]   beta={:?}", bb.to_vec());
-                }
                 // The summary table is built from representative inputs reconstructed
                 // from saved feature ranges (not the original training rows).
                 wood_smooth_test(SmoothTestInput {
