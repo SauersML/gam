@@ -1737,6 +1737,71 @@ mod tests {
         );
     }
 
+    /// The survival crossing-edge position tower `z_edge = (τ − a(θ)) / b`,
+    /// `b = exp(g)`, built from the intercept tower `a(θ)` (here a stand-in)
+    /// and the seeded slope `g`, reproduces taylor-jet's exact hand-path
+    /// boundary-velocity formulas:
+    ///   z_u   = −(a_u + [u==g]·z) / b
+    ///   z_uv  = −(a_uv + [u==g]·z_v + [v==g]·z_u) / b
+    /// This pins the bridge between `implicit_solve` and
+    /// `cell_moving_boundary_flux_tower`: the boundary jet that the production
+    /// flex path hand-codes (and dropped `z_uv` from) is exactly `∂²` of this
+    /// tower. K=3 reduced frame: slot 0 = a-axis carrier (an arbitrary smooth
+    /// a(θ) with nonzero a_u/a_uv), slot 1 = g (the log-slope), slot 2 unused.
+    #[test]
+    fn crossing_edge_tower_matches_handpath_velocity_formulas() {
+        const TAU: f64 = 1.3; // the link-knot crossing threshold τ
+        let g_idx = 1usize;
+        let g0 = 0.85_f64; // the slope value b (the g-primary IS the slope)
+        // Stand-in intercept tower a(θ): nonzero value, gradient, Hessian in the
+        // two live axes so a_u and a_uv are both exercised. (In production this
+        // comes from implicit_solve; here we plant known derivatives.)
+        let mut a = Tower4::<3>::constant(0.45);
+        a.g[0] = 0.7;
+        a.g[1] = -0.3;
+        a.h[0][0] = 0.25;
+        a.h[0][1] = 0.11;
+        a.h[1][0] = 0.11;
+        a.h[1][1] = -0.08;
+
+        // In the survival flex frame the slope `b` IS the g-primary directly
+        // (the directional code passes `g` as `b`, and ∂z/∂g uses ∂b/∂g = 1):
+        // z_edge = (τ − a) / b with b seeded as the g-axis variable.
+        let b = Tower4::<3>::variable(g0, g_idx);
+        let z_edge = (Tower4::<3>::constant(TAU) - a) / b;
+
+        let bv = g0;
+        let z0 = z_edge.v;
+        assert!((z0 - (TAU - 0.45) / bv).abs() < 1e-12);
+
+        // z_u = −(a_u + [u==g]·z) / b.
+        for u in 0..2 {
+            let direct = if u == g_idx { z0 } else { 0.0 };
+            let want = -(a.g[u] + direct) / bv;
+            assert!(
+                (z_edge.g[u] - want).abs() < 1e-10,
+                "z_u[{u}] {:+.8e} vs hand formula {:+.8e}",
+                z_edge.g[u],
+                want
+            );
+        }
+        // z_uv = −(a_uv + [u==g]·z_v + [v==g]·z_u) / b, using the tower's own
+        // first-order z_v/z_u (already verified above).
+        for u in 0..2 {
+            for v in 0..2 {
+                let cross = if u == g_idx { z_edge.g[v] } else { 0.0 }
+                    + if v == g_idx { z_edge.g[u] } else { 0.0 };
+                let want = -(a.h[u][v] + cross) / bv;
+                assert!(
+                    (z_edge.h[u][v] - want).abs() < 1e-10,
+                    "z_uv[{u}][{v}] {:+.8e} vs hand formula {:+.8e}",
+                    z_edge.h[u][v],
+                    want
+                );
+            }
+        }
+    }
+
     /// The oracle harness catches a planted #736-style sign flip in a
     /// cross block and reports the channel by name.
     #[test]
