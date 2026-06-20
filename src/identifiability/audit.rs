@@ -1138,7 +1138,8 @@ fn audit_identifiability_impl(
         p_total,
         block_priority_summary.join(", "),
     );
-    let tiered = priority_tiered_rank_from_gram(&joint_gram_aug, &col_priority, joint_rank_m_rows, alpha);
+    let tiered =
+        priority_tiered_rank_from_gram(&joint_gram_aug, &col_priority, joint_rank_m_rows, alpha);
     log::info!(
         "[STAGE] identifiability audit: joint priority-tiered RRQR end rank={}/{} elapsed={:.3}s",
         tiered.rank,
@@ -1147,8 +1148,7 @@ fn audit_identifiability_impl(
     );
     let joint_rank = tiered.rank;
     let joint_rank_tol = tiered.rank_tol;
-    let demoted_joint_cols: Vec<usize> =
-        tiered.column_permutation[tiered.rank..].to_vec();
+    let demoted_joint_cols: Vec<usize> = tiered.column_permutation[tiered.rank..].to_vec();
 
     // Pairwise overlap report on the joint design's normalised
     // columns. O(p_total² · n) — fine at GAM smooth widths. We only

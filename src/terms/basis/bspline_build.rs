@@ -208,9 +208,9 @@ pub fn build_bspline_basis_1d(
                 )
             };
         let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-            filter_active_penalty_candidates_with_ops(
-            renormalize_constrained_penalty_candidates(transformed_candidates),
-        )?;
+            filter_active_penalty_candidates_with_ops(renormalize_constrained_penalty_candidates(
+                transformed_candidates,
+            ))?;
         return Ok(BasisBuildResult {
             design,
             penalties,
@@ -314,9 +314,9 @@ pub fn build_bspline_basis_1d(
                 Some(chunk),
             )?;
         let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-            filter_active_penalty_candidates_with_ops(
-            renormalize_constrained_penalty_candidates(transformed_candidates),
-        )?;
+            filter_active_penalty_candidates_with_ops(renormalize_constrained_penalty_candidates(
+                transformed_candidates,
+            ))?;
         return Ok(BasisBuildResult {
             design,
             penalties,
@@ -613,9 +613,9 @@ pub fn build_bspline_basis_1d(
             )
         };
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(
-            renormalize_constrained_penalty_candidates(transformed_candidates),
-        )?;
+        filter_active_penalty_candidates_with_ops(renormalize_constrained_penalty_candidates(
+            transformed_candidates,
+        ))?;
     Ok(BasisBuildResult {
         design,
         penalties,

@@ -1457,25 +1457,30 @@ impl SurvivalLocationScaleFamily {
                 .ok_or_else(|| "joint d_beta must be contiguous".to_string())?;
             // Distinct ordered permutations of a (possibly repeated) index
             // triple — the support of the fully symmetric g‴ tensor.
-            let contract3 =
-                |g3d: &mut [[f64; SLS_ROW_K]; SLS_ROW_K],
-                 idx: [usize; 3],
-                 v: f64,
-                 dch: &[f64; SLS_ROW_K]| {
-                    const PERMS: [[usize; 3]; 6] =
-                        [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
-                    let mut seen: [(usize, usize, usize); 6] = [(usize::MAX, 0, 0); 6];
-                    let mut n_seen = 0usize;
-                    for pm in PERMS {
-                        let key = (idx[pm[0]], idx[pm[1]], idx[pm[2]]);
-                        if seen[..n_seen].contains(&key) {
-                            continue;
-                        }
-                        seen[n_seen] = key;
-                        n_seen += 1;
-                        g3d[key.0][key.1] += v * dch[key.2];
+            let contract3 = |g3d: &mut [[f64; SLS_ROW_K]; SLS_ROW_K],
+                             idx: [usize; 3],
+                             v: f64,
+                             dch: &[f64; SLS_ROW_K]| {
+                const PERMS: [[usize; 3]; 6] = [
+                    [0, 1, 2],
+                    [0, 2, 1],
+                    [1, 0, 2],
+                    [1, 2, 0],
+                    [2, 0, 1],
+                    [2, 1, 0],
+                ];
+                let mut seen: [(usize, usize, usize); 6] = [(usize::MAX, 0, 0); 6];
+                let mut n_seen = 0usize;
+                for pm in PERMS {
+                    let key = (idx[pm[0]], idx[pm[1]], idx[pm[2]]);
+                    if seen[..n_seen].contains(&key) {
+                        continue;
                     }
-                };
+                    seen[n_seen] = key;
+                    n_seen += 1;
+                    g3d[key.0][key.1] += v * dch[key.2];
+                }
+            };
             let g_contrib = (0..self.n)
                 .into_par_iter()
                 .fold(
@@ -1503,10 +1508,11 @@ impl SurvivalLocationScaleFamily {
                         gp[8] = e * p[3];
                         // g″ (symmetric channel Hessian).
                         let mut g2 = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
-                        let set2 = |t: &mut [[f64; SLS_ROW_K]; SLS_ROW_K], a: usize, b: usize, v: f64| {
-                            t[a][b] = v;
-                            t[b][a] = v;
-                        };
+                        let set2 =
+                            |t: &mut [[f64; SLS_ROW_K]; SLS_ROW_K], a: usize, b: usize, v: f64| {
+                                t[a][b] = v;
+                                t[b][a] = v;
+                            };
                         set2(&mut g2, 3, 8, e);
                         set2(&mut g2, 3, 6, -e * p[8]);
                         set2(&mut g2, 5, 6, e);

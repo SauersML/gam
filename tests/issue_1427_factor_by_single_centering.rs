@@ -79,8 +79,8 @@ fn factor_by_level_keeps_k_minus_one_smooth_columns() {
     //   total = L + L*(K-1) = L*K.
     // The #1427 double-centering bug gives K-2 per level, i.e. total = L*(K-1).
     const L: usize = 3;
-    let byfit = fit_from_formula(&format!("y ~ s(x, by=g, k={K})"), &data, &cfg)
-        .expect("by-factor fit ok");
+    let byfit =
+        fit_from_formula(&format!("y ~ s(x, by=g, k={K})"), &data, &cfg).expect("by-factor fit ok");
     let total = ncols(&byfit);
 
     let non_smooth = L; // intercept + (L-1) treatment contrasts

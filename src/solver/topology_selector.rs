@@ -1700,15 +1700,14 @@ mod tests {
                 density_provider: trivial_provider(),
             },
         ];
-        let verdict =
-            adjudicate_cross_class_race(
-                8,
-                near,
-                STACKING_CV_FOLDS,
-                STACKING_CV_SEED,
-                StackingConfig::default(),
-            )
-            .expect("same-class race");
+        let verdict = adjudicate_cross_class_race(
+            8,
+            near,
+            STACKING_CV_FOLDS,
+            STACKING_CV_SEED,
+            StackingConfig::default(),
+        )
+        .expect("same-class race");
         assert!(!verdict.is_cross_class);
         assert_eq!(verdict.winner_index, 0);
         let escalation = verdict
@@ -1734,15 +1733,14 @@ mod tests {
                 density_provider: trivial_provider(),
             },
         ];
-        let verdict_far =
-            adjudicate_cross_class_race(
-                8,
-                far,
-                STACKING_CV_FOLDS,
-                STACKING_CV_SEED,
-                StackingConfig::default(),
-            )
-            .expect("same-class race");
+        let verdict_far = adjudicate_cross_class_race(
+            8,
+            far,
+            STACKING_CV_FOLDS,
+            STACKING_CV_SEED,
+            StackingConfig::default(),
+        )
+        .expect("same-class race");
         assert_eq!(verdict_far.winner_index, 0);
         assert!(
             verdict_far.insufficient_margin.is_none(),
@@ -1800,10 +1798,7 @@ mod tests {
 
         // Flatten a partition into a per-sample fold-of-sample vector so two
         // foldings can be compared sample-by-sample regardless of fold order.
-        fn fold_of_sample(
-            n: usize,
-            partition: &[(Vec<usize>, Vec<usize>)],
-        ) -> Vec<Option<usize>> {
+        fn fold_of_sample(n: usize, partition: &[(Vec<usize>, Vec<usize>)]) -> Vec<Option<usize>> {
             let mut assign = vec![None; n];
             for (fold, (_train, eval)) in partition.iter().enumerate() {
                 for &i in eval {
@@ -1836,7 +1831,10 @@ mod tests {
         // seed, so existing seed-less call sites keep their deterministic folding.
         assert_eq!(
             fold_of_sample(N, &deterministic_cv_folds(N, FOLDS)),
-            fold_of_sample(N, &deterministic_cv_folds_seeded(N, FOLDS, STACKING_CV_SEED)),
+            fold_of_sample(
+                N,
+                &deterministic_cv_folds_seeded(N, FOLDS, STACKING_CV_SEED)
+            ),
             "deterministic_cv_folds must equal the default-seeded folding"
         );
     }

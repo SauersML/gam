@@ -1248,8 +1248,7 @@ pub fn canonicalize_penalty_spec(
     // own `rank` / `nullity` / `negative_dim` about which directions are
     // penalized, unpenalized, or non-PSD (#1425).
     let tolerance = analysis.tol;
-    let classes =
-        crate::basis::SpectralClassification::new(&analysis.eigenvalues, tolerance);
+    let classes = crate::basis::SpectralClassification::new(&analysis.eigenvalues, tolerance);
     let rank_k = classes.rank();
     debug_assert_eq!(rank_k, analysis.rank);
 

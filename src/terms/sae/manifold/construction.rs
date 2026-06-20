@@ -3794,7 +3794,11 @@ impl SaeManifoldTerm {
                     .max()
                     .unwrap_or(0)
                     .max(1);
-                let max_q_row = (0..n).map(|r| layout.row_q_active(r)).max().unwrap_or(q).max(1);
+                let max_q_row = (0..n)
+                    .map(|r| layout.row_q_active(r))
+                    .max()
+                    .unwrap_or(q)
+                    .max(1);
                 (max_active, max_q_row)
             }
             None => (k_atoms, q),
@@ -4277,92 +4281,94 @@ impl SaeManifoldTerm {
                     let mut weighted_phi: Vec<(usize, Vec<f64>)> =
                         Vec::with_capacity(row_active.len());
                     if !fixed_decoder {
-                    for &atom_idx in row_active {
-                        let atom = &self.atoms[atom_idx];
-                        let atom_beta_off = beta_offsets[atom_idx];
-                        let m = atom.basis_size();
-                        let a_k = assignments[atom_idx];
-                        let mut wphi = Vec::with_capacity(m);
-                        for basis_col in 0..m {
-                            let phi = atom.basis_values[[row, basis_col]];
-                            // #991 design-honesty seam, β leg: the `√w_row` here pairs
-                            // with the `√w_row` on the residual (β gradient =
-                            // `a·φ · M r` ⇒ w_row) and with itself (β Gram `G` and the
-                            // htbeta Kronecker capture ⇒ w_row). `1.0` when unweighted.
-                            let w = a_k * phi * sqrt_row_w;
-                            a_phi.push((atom_beta_off + basis_col * p, w));
-                            wphi.push(w);
-                        }
-                        weighted_phi.push((atom_idx, wphi));
-                    }
-                    // β data-fit gradient `gᵦ += J_βᵀ M_n r_n`. The β-Jacobian is
-                    // `J_β = φ_nᵀ ⊗ I_p`, so `J_βᵀ M_n r_n = φ_n ⊗ (M_n r_n)` —
-                    // contract the basis weight `a·φ` against the p-space metric-applied
-                    // residual `error_metric` (= `M_n r_n`), the SAME whitening the value
-                    // path and t-block share. When not whitening, `error_metric == error`
-                    // and this is byte-identical to the historical `J_βᵀ r`.
-                    for &(beta_base_i, j_beta_i) in a_phi.iter() {
-                        if j_beta_i == 0.0 {
-                            continue;
-                        }
-                        for out_col in 0..p {
-                            gb_delta
-                                .push((beta_base_i + out_col, j_beta_i * error_metric[out_col]));
-                            // No dense hbb write — the sparse `G ⊗ I_p` op installed
-                            // after the loop carries the data-fit GN β-Hessian.
-                        }
-                    }
-                    if frames_engaged {
                         for &atom_idx in row_active {
                             let atom = &self.atoms[atom_idx];
+                            let atom_beta_off = beta_offsets[atom_idx];
                             let m = atom.basis_size();
                             let a_k = assignments[atom_idx];
+                            let mut wphi = Vec::with_capacity(m);
                             for basis_col in 0..m {
                                 let phi = atom.basis_values[[row, basis_col]];
+                                // #991 design-honesty seam, β leg: the `√w_row` here pairs
+                                // with the `√w_row` on the residual (β gradient =
+                                // `a·φ · M r` ⇒ w_row) and with itself (β Gram `G` and the
+                                // htbeta Kronecker capture ⇒ w_row). `1.0` when unweighted.
                                 let w = a_k * phi * sqrt_row_w;
-                                if w == 0.0 {
-                                    continue;
-                                }
-                                let c_base = frame_projection.border_offsets[atom_idx]
-                                    + basis_col * frame_projection.ranks[atom_idx];
-                                for c in 0..q_row {
-                                    let mut hrow = block.htbeta.row_mut(c);
-                                    let hrow_slice =
-                                        hrow.as_slice_mut().expect("htbeta row is contiguous");
-                                    for out_col in 0..p {
-                                        let value = local_jac_row[[c, out_col]] * w;
-                                        frame_projection.accumulate_output_project(
-                                            atom_idx, c_base, out_col, value, hrow_slice,
-                                        );
+                                a_phi.push((atom_beta_off + basis_col * p, w));
+                                wphi.push(w);
+                            }
+                            weighted_phi.push((atom_idx, wphi));
+                        }
+                        // β data-fit gradient `gᵦ += J_βᵀ M_n r_n`. The β-Jacobian is
+                        // `J_β = φ_nᵀ ⊗ I_p`, so `J_βᵀ M_n r_n = φ_n ⊗ (M_n r_n)` —
+                        // contract the basis weight `a·φ` against the p-space metric-applied
+                        // residual `error_metric` (= `M_n r_n`), the SAME whitening the value
+                        // path and t-block share. When not whitening, `error_metric == error`
+                        // and this is byte-identical to the historical `J_βᵀ r`.
+                        for &(beta_base_i, j_beta_i) in a_phi.iter() {
+                            if j_beta_i == 0.0 {
+                                continue;
+                            }
+                            for out_col in 0..p {
+                                gb_delta.push((
+                                    beta_base_i + out_col,
+                                    j_beta_i * error_metric[out_col],
+                                ));
+                                // No dense hbb write — the sparse `G ⊗ I_p` op installed
+                                // after the loop carries the data-fit GN β-Hessian.
+                            }
+                        }
+                        if frames_engaged {
+                            for &atom_idx in row_active {
+                                let atom = &self.atoms[atom_idx];
+                                let m = atom.basis_size();
+                                let a_k = assignments[atom_idx];
+                                for basis_col in 0..m {
+                                    let phi = atom.basis_values[[row, basis_col]];
+                                    let w = a_k * phi * sqrt_row_w;
+                                    if w == 0.0 {
+                                        continue;
+                                    }
+                                    let c_base = frame_projection.border_offsets[atom_idx]
+                                        + basis_col * frame_projection.ranks[atom_idx];
+                                    for c in 0..q_row {
+                                        let mut hrow = block.htbeta.row_mut(c);
+                                        let hrow_slice =
+                                            hrow.as_slice_mut().expect("htbeta row is contiguous");
+                                        for out_col in 0..p {
+                                            let value = local_jac_row[[c, out_col]] * w;
+                                            frame_projection.accumulate_output_project(
+                                                atom_idx, c_base, out_col, value, hrow_slice,
+                                            );
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    // Data-fit GN β-Hessian: accumulate the channel-independent block
-                    // `G[μ_i, μ_j] += (a_k φ_k)[μ_i] (a_{k'} φ_{k'})[μ_j]` into the
-                    // sparse per-atom-pair map (the `out_col` dimension is carried by
-                    // `I_p`). Only co-occurring `(atom_i, atom_j)` pairs are touched.
-                    for ai in 0..weighted_phi.len() {
-                        let (atom_i, ref wphi_i) = weighted_phi[ai];
-                        let m_i = wphi_i.len();
-                        for aj in 0..weighted_phi.len() {
-                            let (atom_j, ref wphi_j) = weighted_phi[aj];
-                            let m_j = wphi_j.len();
-                            let blk = g_blocks
-                                .entry((atom_i, atom_j))
-                                .or_insert_with(|| Array2::<f64>::zeros((m_i, m_j)));
-                            for li in 0..m_i {
-                                let wi = wphi_i[li];
-                                if wi == 0.0 {
-                                    continue;
-                                }
-                                for lj in 0..m_j {
-                                    blk[[li, lj]] += wi * wphi_j[lj];
+                        // Data-fit GN β-Hessian: accumulate the channel-independent block
+                        // `G[μ_i, μ_j] += (a_k φ_k)[μ_i] (a_{k'} φ_{k'})[μ_j]` into the
+                        // sparse per-atom-pair map (the `out_col` dimension is carried by
+                        // `I_p`). Only co-occurring `(atom_i, atom_j)` pairs are touched.
+                        for ai in 0..weighted_phi.len() {
+                            let (atom_i, ref wphi_i) = weighted_phi[ai];
+                            let m_i = wphi_i.len();
+                            for aj in 0..weighted_phi.len() {
+                                let (atom_j, ref wphi_j) = weighted_phi[aj];
+                                let m_j = wphi_j.len();
+                                let blk = g_blocks
+                                    .entry((atom_i, atom_j))
+                                    .or_insert_with(|| Array2::<f64>::zeros((m_i, m_j)));
+                                for li in 0..m_i {
+                                    let wi = wphi_i[li];
+                                    if wi == 0.0 {
+                                        continue;
+                                    }
+                                    for lj in 0..m_j {
+                                        blk[[li, lj]] += wi * wphi_j[lj];
+                                    }
                                 }
                             }
                         }
-                    }
                     } // #1407 end `if !fixed_decoder` β-tier accumulation
                     let (kron_a_phi, kron_jac) = if !frames_engaged && !fixed_decoder {
                         // Flatten local_jac_row row-major into a plain Vec<f64> (q_row * p entries).
@@ -4450,8 +4456,11 @@ impl SaeManifoldTerm {
                             let htt_e = sys.rows[row_idx].htt.clone();
                             sys.rows[row_idx].gt =
                                 manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
-                            sys.rows[row_idx].htt = manifold_i
-                                .riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
+                            sys.rows[row_idx].htt = manifold_i.riemannian_hessian_matrix(
+                                t_i,
+                                gt_e.view(),
+                                htt_e.view(),
+                            );
                         }
                     }
                 }
@@ -6968,9 +6977,10 @@ impl SaeManifoldTerm {
                         let mut rhs_t = Array1::<f64>::zeros(total_t);
                         let rhs_beta = Array1::<f64>::zeros(cache.k);
                         rhs_t[cache.row_offsets[i] + k] = 1.0;
-                        let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
-                            format!("assignment_log_strength_hessian_trace: {err}")
-                        })?;
+                        let solved =
+                            solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
+                                format!("assignment_log_strength_hessian_trace: {err}")
+                            })?;
                         for j in 0..n {
                             if j == i {
                                 continue;
@@ -8273,8 +8283,7 @@ impl SaeManifoldTerm {
                     let j_wk = channels.z_jac[row * k_atoms + atom];
                     let c_wk = channels.logit_curvature[row * k_atoms + atom];
                     // term A + term B.
-                    gamma_t[t_index] +=
-                        0.5 * dd_k * j_wk * jt_hinv_j + d_k * c_wk * x_k.t[t_index];
+                    gamma_t[t_index] += 0.5 * dd_k * j_wk * jt_hinv_j + d_k * c_wk * x_k.t[t_index];
                 }
             }
         }
@@ -8343,7 +8352,8 @@ impl SaeManifoldTerm {
                 let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
                 Some((
                     crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
-                        k_atoms, temperature,
+                        k_atoms,
+                        temperature,
                     ),
                     scale,
                 ))
@@ -8430,13 +8440,17 @@ impl SaeManifoldTerm {
                 let h_entropy = penalty.row_dense_hessian(&row_logits, *scale);
                 let g_fisher = penalty.row_fisher_metric(&row_logits, *scale);
                 for (a, va) in jets.vars.iter().enumerate() {
-                    let SaeLocalRowVar::Logit { atom: ka } = *va else { continue };
+                    let SaeLocalRowVar::Logit { atom: ka } = *va else {
+                        continue;
+                    };
                     if ka >= assignment_dim {
                         continue;
                     }
                     let mut acc = 0.0_f64;
                     for (b, vb) in jets.vars.iter().enumerate() {
-                        let SaeLocalRowVar::Logit { atom: kb } = *vb else { continue };
+                        let SaeLocalRowVar::Logit { atom: kb } = *vb else {
+                            continue;
+                        };
                         if kb >= assignment_dim {
                             continue;
                         }
@@ -8448,7 +8462,9 @@ impl SaeManifoldTerm {
 
             // (3) periodic ARD: ΔC_coord = (V'' − max(V'',0)) = min(V'',0), diagonal.
             for (a, va) in jets.vars.iter().enumerate() {
-                let SaeLocalRowVar::Coord { atom, axis } = *va else { continue };
+                let SaeLocalRowVar::Coord { atom, axis } = *va else {
+                    continue;
+                };
                 if rho.log_ard[atom].is_empty() {
                     continue;
                 }
@@ -8485,24 +8501,26 @@ impl SaeManifoldTerm {
         solver: &DeflatedArrowSolver<'_>,
         rhs: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
-        let x0 = solver.solve(rhs.t.view(), rhs.beta.view()).map_err(|err| {
-            format!("solve_exact_stationarity: B inverse: {err}")
-        })?;
-        let mut x = SaeArrowVector { t: x0.t.clone(), beta: x0.beta.clone() };
+        let x0 = solver
+            .solve(rhs.t.view(), rhs.beta.view())
+            .map_err(|err| format!("solve_exact_stationarity: B inverse: {err}"))?;
+        let mut x = SaeArrowVector {
+            t: x0.t.clone(),
+            beta: x0.beta.clone(),
+        };
         // Fixed-point Neumann iteration with B⁻¹ preconditioner.
         const MAX_ITERS: usize = 24;
         const REL_TOL: f64 = 1.0e-10;
-        let x0_norm = x0
-            .t
-            .iter()
-            .chain(x0.beta.iter())
-            .fold(0.0_f64, |m, &v| m.max(v.abs()))
-            .max(1.0);
+        let x0_norm =
+            x0.t.iter()
+                .chain(x0.beta.iter())
+                .fold(0.0_f64, |m, &v| m.max(v.abs()))
+                .max(1.0);
         for _ in 0..MAX_ITERS {
             let dc = self.apply_exact_hessian_minus_b(rho, target, cache, &x)?;
-            let corr = solver.solve(dc.t.view(), dc.beta.view()).map_err(|err| {
-                format!("solve_exact_stationarity: B preconditioner: {err}")
-            })?;
+            let corr = solver
+                .solve(dc.t.view(), dc.beta.view())
+                .map_err(|err| format!("solve_exact_stationarity: B preconditioner: {err}"))?;
             let mut max_delta = 0.0_f64;
             for idx in 0..x.t.len() {
                 let next = x0.t[idx] - corr.t[idx];
@@ -8590,8 +8608,7 @@ impl SaeManifoldTerm {
         // biased by `(B⁻¹ − A⁻¹)`.
         for coord in 0..n_params {
             let rhs = self.outer_rho_gradient_ift_rhs(rho, target, coord, cache)?;
-            let solved =
-                self.solve_exact_stationarity(rho, target, cache, solver, &rhs)?;
+            let solved = self.solve_exact_stationarity(rho, target, cache, solver, &rhs)?;
             let mut dot = 0.0_f64;
             for idx in 0..gamma.t.len() {
                 dot += gamma.t[idx] * solved.t[idx];

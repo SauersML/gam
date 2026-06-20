@@ -1170,8 +1170,7 @@ fn canonicalize_for_identifiability_inner(
             // the per-block `effective_dim` sums to the rank the drop convention
             // kept, i.e. the audit's own joint_rank verdict — the quantity the
             // strict invariant ultimately certifies `T` preserved.
-            let audit_kept_rank: usize =
-                audit.blocks.iter().map(|b| b.effective_dim).sum();
+            let audit_kept_rank: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
 
             log::info!(
                 "[CANON] post-T invariant ({} convention): \
