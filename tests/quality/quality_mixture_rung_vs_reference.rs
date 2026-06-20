@@ -70,8 +70,8 @@
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig, fit_gaussian_mixture};
 use gam::solver::topology_selector::{
     AutoTopologyKind, CrossClassCandidate, EvidenceCertification, HeldOutDensityProvider,
-    MIXTURE_K_LADDER, STACKING_CV_FOLDS, adjudicate_cross_class_race, fit_mixture_rung,
-    mixture_density_provider,
+    MIXTURE_K_LADDER, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
+    fit_mixture_rung, mixture_density_provider,
 };
 use gam::test_support::reference::{Column, run_python};
 use ndarray::{Array2, ArrayView2};
@@ -377,8 +377,14 @@ fn cluster_regime_gam_selects_mixture_and_recovers_k_match_or_beat_sklearn() {
     // gam cross-class adjudication: must headline the mixture rung.
     let candidates = build_cross_class_candidates(data.view(), cfg);
     let verdict =
-        adjudicate_cross_class_race(N, candidates, STACKING_CV_FOLDS, StackingConfig::default())
-            .expect("cross-class race adjudicates on cluster data");
+        adjudicate_cross_class_race(
+            N,
+            candidates,
+            STACKING_CV_FOLDS,
+            STACKING_CV_SEED,
+            StackingConfig::default(),
+        )
+        .expect("cross-class race adjudicates on cluster data");
 
     let winner_name = &verdict.candidate_names[verdict.winner_index];
     assert!(
@@ -431,8 +437,14 @@ fn circle_regime_gam_selects_smooth_circle_not_mixture_via_interpolated_holdout(
     // --- METRIC 3 (HEADLINE): cross-class verdict picks the smooth circle. ---
     let candidates = build_cross_class_candidates(data.view(), cfg);
     let verdict =
-        adjudicate_cross_class_race(N, candidates, STACKING_CV_FOLDS, StackingConfig::default())
-            .expect("cross-class race adjudicates on circle data");
+        adjudicate_cross_class_race(
+            N,
+            candidates,
+            STACKING_CV_FOLDS,
+            STACKING_CV_SEED,
+            StackingConfig::default(),
+        )
+        .expect("cross-class race adjudicates on circle data");
 
     assert!(
         verdict.is_cross_class,

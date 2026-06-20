@@ -34,7 +34,7 @@
 use gam::solver::evidence::StackingConfig;
 use gam::solver::topology_selector::{
     AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    STACKING_CV_FOLDS, adjudicate_cross_class_race,
+    STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
 };
 use ndarray::{Array2, ArrayView2};
 
@@ -304,6 +304,7 @@ fn run_bottom_rung(data: &Array2<f64>) -> LadderOutcome {
         data.nrows(),
         candidates,
         STACKING_CV_FOLDS,
+        STACKING_CV_SEED,
         StackingConfig::default(),
     )
     .expect("same-class adjudication must succeed");
@@ -352,6 +353,7 @@ fn run_bottom_rung(data: &Array2<f64>) -> LadderOutcome {
         data.nrows(),
         stack_candidates,
         STACKING_CV_FOLDS,
+        STACKING_CV_SEED,
         StackingConfig::default(),
     )
     .expect("cross-class adjudication must succeed");

@@ -14,7 +14,8 @@
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
 use gam::solver::topology_selector::{
     AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    MIXTURE_K_LADDER, STACKING_CV_FOLDS, adjudicate_cross_class_race, fit_mixture_rung,
+    MIXTURE_K_LADDER, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
+    fit_mixture_rung,
 };
 use ndarray::{Array2, ArrayView2};
 
@@ -196,6 +197,7 @@ fn run_race(data: &Array2<f64>) -> RaceOutcome {
         data.nrows(),
         candidates,
         STACKING_CV_FOLDS,
+        STACKING_CV_SEED,
         StackingConfig::default(),
     )
     .expect("cross-class adjudication must succeed");
@@ -372,6 +374,7 @@ fn same_class_race_keeps_evidence_headline() {
         data.nrows(),
         candidates,
         STACKING_CV_FOLDS,
+        STACKING_CV_SEED,
         StackingConfig::default(),
     )
     .expect("same-class adjudication");

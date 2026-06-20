@@ -59,6 +59,13 @@ pub const MIXTURE_K_LADDER: &[usize] = &[1, 2, 3, 5, 7, 9];
 /// predictive log-density table for cross-class stacking. Fixed (no flag).
 pub const STACKING_CV_FOLDS: usize = 5;
 
+/// Default seed mixed into the deterministic CV fold assignment for cross-class
+/// stacking. Matches the pyo3 `seed = 11` default of `adjudicate_atom_shape`, so
+/// the FFI default and the in-tree default produce the identical (deterministic)
+/// folding. Different seeds yield different — but still deterministic — foldings;
+/// the same seed always reproduces the same folding (#1386).
+pub const STACKING_CV_SEED: u64 = 11;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AutoTopologyKind {
     Euclidean,
@@ -1132,15 +1139,55 @@ fn gather_rows(data: ArrayView2<'_, f64>, idx: &[usize]) -> Array2<f64> {
 
 /// Deterministic contiguous `folds`-way CV partition of `0..n` (no clock
 /// randomness). Returns, for each fold, `(train_indices, eval_indices)`.
+///
+/// Uses the default stacking seed ([`STACKING_CV_SEED`]); see
+/// [`deterministic_cv_folds_seeded`] for the seed-reproducible variant (#1386).
 pub fn deterministic_cv_folds(n: usize, folds: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
+    deterministic_cv_folds_seeded(n, folds, STACKING_CV_SEED)
+}
+
+/// SplitMix64 finalizer — a full-avalanche integer hash. Pure and deterministic:
+/// it never touches the clock or any RNG state, so the folding it drives is
+/// reproducible for a given `(seed, index)` and decorrelated across seeds.
+#[inline]
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// Deterministic, seed-reproducible `folds`-way CV partition of `0..n` (no clock
+/// randomness). The eval fold of sample `i` is `hash(seed, i) % folds`, so:
+///   - the same `seed` always reproduces the identical folding (deterministic),
+///   - different seeds give different (still-deterministic) foldings.
+///
+/// This is the seam that makes the `adjudicate_atom_shape` `seed=` kwarg
+/// functional (#1386): it is mixed into the held-out CV partition rather than
+/// being a silent no-op. Returns, for each fold, `(train_indices, eval_indices)`,
+/// dropping any fold whose train or eval set is empty.
+pub fn deterministic_cv_folds_seeded(
+    n: usize,
+    folds: usize,
+    seed: u64,
+) -> Vec<(Vec<usize>, Vec<usize>)> {
     let folds = folds.clamp(2, n.max(2));
+    // Precompute the seed-mixed fold of every sample once.
+    let assign: Vec<usize> = (0..n)
+        .map(|i| {
+            // Mix the seed with the index through a full-avalanche hash so the
+            // partition genuinely depends on both. The modulo keeps fold sizes
+            // balanced in expectation while remaining deterministic.
+            (splitmix64(seed ^ splitmix64(i as u64)) % folds as u64) as usize
+        })
+        .collect();
     let mut out = Vec::with_capacity(folds);
     for f in 0..folds {
         let mut train = Vec::new();
         let mut eval = Vec::new();
-        for i in 0..n {
-            // Strided assignment is deterministic and balances fold sizes.
-            if i % folds == f {
+        for (i, &fold) in assign.iter().enumerate() {
+            if fold == f {
                 eval.push(i);
             } else {
                 train.push(i);
@@ -1162,12 +1209,13 @@ pub fn deterministic_cv_folds(n: usize, folds: usize) -> Vec<(Vec<usize>, Vec<us
 pub fn build_cv_log_density_table(
     n: usize,
     folds: usize,
+    seed: u64,
     providers: &[HeldOutDensityProvider<'_>],
 ) -> Result<Array2<f64>, String> {
     if providers.is_empty() {
         return Err("stacking table requires at least one candidate provider".to_string());
     }
-    let partition = deterministic_cv_folds(n, folds);
+    let partition = deterministic_cv_folds_seeded(n, folds, seed);
     if partition.is_empty() {
         return Err("stacking CV partition is empty (n too small for folds)".to_string());
     }
@@ -1359,10 +1407,16 @@ pub struct InsufficientRaceMargin {
 /// [`AutoTopologyKind::Union`]). When cross-class,
 /// the headline switches to stacking over a selection-time CV held-out
 /// log-density table; otherwise the headline is the rank-aware evidence winner.
+/// `seed` is mixed into the deterministic CV fold assignment (#1386): the same
+/// seed reproduces the identical held-out folding, different seeds give
+/// different — but still deterministic — foldings. It only affects the
+/// cross-class (stacking) path; same-class races are winner-take-all on evidence
+/// and ignore it. Pass [`STACKING_CV_SEED`] for the default folding.
 pub fn adjudicate_cross_class_race(
     n: usize,
     candidates: Vec<CrossClassCandidate<'_>>,
     folds: usize,
+    seed: u64,
     stacking_config: StackingConfig,
 ) -> Result<CrossClassRaceVerdict, String> {
     if candidates.is_empty() {
@@ -1435,7 +1489,7 @@ pub fn adjudicate_cross_class_race(
     // Cross-class: build the selection-time held-out density table and stack.
     let providers: Vec<HeldOutDensityProvider<'_>> =
         candidates.into_iter().map(|c| c.density_provider).collect();
-    let table = build_cv_log_density_table(n, folds, &providers)?;
+    let table = build_cv_log_density_table(n, folds, seed, &providers)?;
     let stacking = solve_stacking_weights(table.view(), stacking_config)?;
     // Headline winner = max stacking weight (most predictive mass).
     let mut winner_index = 0usize;
@@ -1647,8 +1701,14 @@ mod tests {
             },
         ];
         let verdict =
-            adjudicate_cross_class_race(8, near, STACKING_CV_FOLDS, StackingConfig::default())
-                .expect("same-class race");
+            adjudicate_cross_class_race(
+                8,
+                near,
+                STACKING_CV_FOLDS,
+                STACKING_CV_SEED,
+                StackingConfig::default(),
+            )
+            .expect("same-class race");
         assert!(!verdict.is_cross_class);
         assert_eq!(verdict.winner_index, 0);
         let escalation = verdict
@@ -1675,8 +1735,14 @@ mod tests {
             },
         ];
         let verdict_far =
-            adjudicate_cross_class_race(8, far, STACKING_CV_FOLDS, StackingConfig::default())
-                .expect("same-class race");
+            adjudicate_cross_class_race(
+                8,
+                far,
+                STACKING_CV_FOLDS,
+                STACKING_CV_SEED,
+                StackingConfig::default(),
+            )
+            .expect("same-class race");
         assert_eq!(verdict_far.winner_index, 0);
         assert!(
             verdict_far.insufficient_margin.is_none(),
@@ -1710,6 +1776,7 @@ mod tests {
             8,
             candidates,
             STACKING_CV_FOLDS,
+            STACKING_CV_SEED,
             StackingConfig::default(),
         )
         .expect("same-class race");
@@ -1717,6 +1784,61 @@ mod tests {
             .insufficient_margin
             .expect("lead inside the coreset transfer margin must be flagged");
         assert!((escalation.required_margin - required).abs() < 1e-9);
+    }
+
+    /// #1386: the `seed` mixed into the cross-class CV folding is functional, not
+    /// a silent no-op. The same seed must reproduce the identical fold
+    /// assignment, and two different seeds must produce a different assignment
+    /// for at least one sample (while both remain deterministic). This test FAILS
+    /// when the seed is ignored (a pure `i % folds` rule is seed-independent, so
+    /// the two-seed inequality below can never hold) and PASSES once the seed is
+    /// genuinely threaded into the fold rule.
+    #[test]
+    fn cv_folds_are_seed_reproducible_and_seed_varying() {
+        const N: usize = 40;
+        const FOLDS: usize = 5;
+
+        // Flatten a partition into a per-sample fold-of-sample vector so two
+        // foldings can be compared sample-by-sample regardless of fold order.
+        fn fold_of_sample(
+            n: usize,
+            partition: &[(Vec<usize>, Vec<usize>)],
+        ) -> Vec<Option<usize>> {
+            let mut assign = vec![None; n];
+            for (fold, (_train, eval)) in partition.iter().enumerate() {
+                for &i in eval {
+                    assign[i] = Some(fold);
+                }
+            }
+            assign
+        }
+
+        // (a) Reproducible: the same seed gives the identical fold assignment.
+        let a1 = deterministic_cv_folds_seeded(N, FOLDS, 11);
+        let a2 = deterministic_cv_folds_seeded(N, FOLDS, 11);
+        assert_eq!(
+            fold_of_sample(N, &a1),
+            fold_of_sample(N, &a2),
+            "same seed must reproduce the identical CV folding"
+        );
+
+        // (b) Seed-varying: two different seeds must differ for at least one
+        // sample. If the seed were ignored this assertion could never pass.
+        let b = deterministic_cv_folds_seeded(N, FOLDS, 12);
+        assert_ne!(
+            fold_of_sample(N, &a1),
+            fold_of_sample(N, &b),
+            "different seeds must produce different fold assignments (seed must \
+             not be a no-op)"
+        );
+
+        // The default-seed convenience wrapper agrees with the explicit default
+        // seed, so existing seed-less call sites keep their deterministic folding.
+        assert_eq!(
+            fold_of_sample(N, &deterministic_cv_folds(N, FOLDS)),
+            fold_of_sample(N, &deterministic_cv_folds_seeded(N, FOLDS, STACKING_CV_SEED)),
+            "deterministic_cv_folds must equal the default-seeded folding"
+        );
     }
 
     /// The unified certificate ladder (#16): `EvidenceCertification::race_verdict`
