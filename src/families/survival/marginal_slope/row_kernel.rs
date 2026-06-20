@@ -73,12 +73,33 @@ pub(crate) fn rigid_row_kernel_nll_tower(
         .into());
     }
 
+    // Mirror the exact closed-form contract
+    // (`signed_probit_neglog_derivatives_up_to_fourth`): the saturated `+∞`
+    // tail is the legitimate zero-survival limit, but `-∞`/NaN signed margins
+    // are domain failures that must surface as an error rather than being
+    // masked into a NaN/∞-laden derivative stack by `unary_derivatives_neglog_phi`.
+    // The guard respects zero weight (those terms drop out entirely).
+    let reject_nonfinite_margin = |margin: f64, weight: f64| -> Result<(), String> {
+        if weight != 0.0 && margin != f64::INFINITY && !margin.is_finite() {
+            Err(SurvivalMarginalSlopeError::NumericalFailure {
+                reason: format!(
+                    "non-finite signed margin in rigid survival marginal-slope row tower at row {row}: {margin}"
+                ),
+            }
+            .into())
+        } else {
+            Ok(())
+        }
+    };
+
     let neg_eta0 = -eta0;
+    reject_nonfinite_margin(neg_eta0.v, wi)?;
     let entry = neg_eta0
         .compose_unary(unary_derivatives_neglog_phi(neg_eta0.v, wi))
         .scale(-1.0);
 
     let neg_eta1 = -eta1;
+    reject_nonfinite_margin(neg_eta1.v, wi * (1.0 - di))?;
     let exit = neg_eta1.compose_unary(unary_derivatives_neglog_phi(neg_eta1.v, wi * (1.0 - di)));
 
     let event_density = if di > 0.0 {

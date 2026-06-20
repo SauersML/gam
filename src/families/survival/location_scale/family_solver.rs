@@ -389,7 +389,7 @@ impl SurvivalLocationScaleFamily {
                 product_parallelism,
             ) + safe_fast_xt_diag_x_with_parallelism(
                 &dynamic.time_jac_deriv,
-                &q.h_time_d,
+                &(-&q.h_time_d),
                 product_parallelism,
             ))
         };
@@ -632,7 +632,7 @@ impl SurvivalLocationScaleFamily {
 
         let h_time = mxtwxd(&dynamic.time_jac_entry, &(-&q.h_time_h0), row_mask)
             + mxtwxd(&dynamic.time_jac_exit, &(-&q.h_time_h1), row_mask)
-            + mxtwxd(&dynamic.time_jac_deriv, &q.h_time_d, row_mask);
+            + mxtwxd(&dynamic.time_jac_deriv, &(-&q.h_time_d), row_mask);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &h_time);
 
         if let Some(x_t_deriv) = x_threshold_deriv {
@@ -730,14 +730,14 @@ impl SurvivalLocationScaleFamily {
             row_mask,
         )? + mxtwx(
             &self.x_time_deriv,
-            &(&q.h_time_d * &q.dqdot_t),
+            &(-&q.h_time_d * &q.dqdot_t),
             x_threshold_exit,
             row_mask,
         )?;
         if let Some(x_t_deriv) = x_threshold_deriv {
             h_ht += &mxtwx(
                 &self.x_time_deriv,
-                &(&q.h_time_d * &q.dqdot_td),
+                &(-&q.h_time_d * &q.dqdot_td),
                 x_t_deriv,
                 row_mask,
             )?;
@@ -756,14 +756,14 @@ impl SurvivalLocationScaleFamily {
             row_mask,
         )? + mxtwx(
             &self.x_time_deriv,
-            &(&q.h_time_d * &q.dqdot_ls),
+            &(-&q.h_time_d * &q.dqdot_ls),
             x_log_sigma_exit,
             row_mask,
         )?;
         if let Some(x_ls_deriv) = x_log_sigma_deriv {
             h_hl += &mxtwx(
                 &self.x_time_deriv,
-                &(&q.h_time_d * &q.dqdot_lsd),
+                &(-&q.h_time_d * &q.dqdot_lsd),
                 x_ls_deriv,
                 row_mask,
             )?;
@@ -908,7 +908,7 @@ impl SurvivalLocationScaleFamily {
 
             let h_hw = mxtwx(&self.x_time_entry, &(-&q.h_time_h0), xw_entry, row_mask)?
                 + mxtwx(&self.x_time_exit, &(-&q.h_time_h1), xw_exit, row_mask)?
-                + mxtwx(&self.x_time_deriv, &q.h_time_d, xw_qdot, row_mask)?;
+                + mxtwx(&self.x_time_deriv, &(-&q.h_time_d), xw_qdot, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[0], w_offset, &h_hw);
         }
 
@@ -1158,11 +1158,16 @@ impl SurvivalLocationScaleFamily {
         //
         //   H_tt = X_entry'·diag(-h_time_h0)·X_entry
         //        + X_exit' ·diag(-h_time_h1)·X_exit
-        //        + X_deriv'·diag(+h_time_d)·X_deriv
+        //        + X_deriv'·diag(-h_time_d)·X_deriv
         //
-        // with h_time_h0 = w·r'(u0)     (= ∂²ℓ/∂h0²),
-        //      h_time_h1 = w·event_mix  (= ∂²ℓ/∂h1²),
-        //      h_time_d  = -w·d·(d2logg) (= -∂²ℓ/∂d_raw²).
+        // with h_time_h0 = +∂²ℓ/∂h0²,
+        //      h_time_h1 = +∂²ℓ/∂h1²,
+        //      h_time_d  = +∂²ℓ/∂d_raw².
+        // (All three are stored as +∂²ℓ because h_time_* = -tower.h[i][i]
+        // where the tower is the NLL, so the NLL Hessian negates each
+        // uniformly. The historical comment claimed h_time_d carried an
+        // extra sign; that was stale after the tower migration and produced
+        // a sign-flipped time-deriv self-term — gam#1396.)
         //
         // Differentiating H_tt along Δβ_t (with Δh0 = X_entry·Δβ_t,
         // Δh1 = X_exit·Δβ_t, Δd = X_deriv·Δβ_t, and q0/q1 invariant in

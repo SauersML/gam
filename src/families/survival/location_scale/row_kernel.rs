@@ -1441,12 +1441,14 @@ impl SurvivalLocationScaleFamily {
                     let r_deriv = -row.grad_time_eta_d;
                     // NLL Hessian on (h0,h1,d_raw): diagonal because the row likelihood
                     // factors through (u0, u1, g) which are functionally independent
-                    // in (h0, h1, d_raw). Signs follow the exact-joint Hessian assembly
-                    // which uses (−h_time_h0, −h_time_h1, +h_time_d) for the NLL block.
+                    // in (h0, h1, d_raw). All three index second derivatives are
+                    // stored as +∂²ℓ (h_time_* = -tower.h[i][i], tower = NLL), so the
+                    // NLL curvature negates each uniformly: (−h_time_h0, −h_time_h1,
+                    // −h_time_d).
                     let mut curv = [[0.0_f64; 3]; 3];
                     curv[0][0] = -row.h_time_h0;
                     curv[1][1] = -row.h_time_h1;
-                    curv[2][2] = row.h_time_d;
+                    curv[2][2] = -row.h_time_d;
                     Ok((i, r_entry, r_exit, r_deriv, curv))
                 },
             )
