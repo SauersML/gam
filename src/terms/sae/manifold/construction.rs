@@ -3589,10 +3589,20 @@ impl SaeManifoldTerm {
             .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
         let dense_beta_curvature = admission_plan.direct_admitted
             && !(frames_engaged && beta_dim > dense_beta_penalty_probe_max_dim);
+        // #1406: the dense per-row cross-block slab `block.htbeta` is only WRITTEN
+        // (line ~4243) and READ by the solver when `frames_engaged` (the factored
+        // full-B path, which installs NO matrix-free row operator → the solver's
+        // `sys_htbeta_apply_row` falls back to the dense slab). On the
+        // `!frames_engaged` path the cross block is carried entirely by the
+        // matrix-free Kronecker operator (`set_row_htbeta_operator`, ~line 4491);
+        // `activate_dense_htbeta_supplement` is never called, so the solver never
+        // touches `block.htbeta`. Allocating it at `beta_dim = K·M·p` there is the
+        // ~6 TiB high-K leak (#1405/#1406): allocate ZERO columns instead. Frames
+        // still use the (much smaller) factored border width.
         let row_htbeta_dim = if frames_engaged {
             self.factored_border_dim()
         } else {
-            beta_dim
+            0
         };
         // Build the Arrow-Schur system: heterogeneous row dims when a compact
         // layout is active, uniform `q` otherwise.
@@ -4427,17 +4437,23 @@ impl SaeManifoldTerm {
                         // uniform-q rows.
                         let gt_e = sys.rows[row_idx].gt.clone();
                         let htt_e = sys.rows[row_idx].htt.clone();
-                        let htbeta_e = sys.rows[row_idx].htbeta.clone();
                         sys.rows[row_idx].gt =
                             manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
                         sys.rows[row_idx].htt =
                             manifold_i.riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
-                        sys.rows[row_idx].htbeta = manifold_i
-                            .project_matrix_columns_to_gradient_tangent(
-                                t_i,
-                                gt_e.view(),
-                                htbeta_e.view(),
-                            );
+                        // #1406: only the frames path holds a real dense `htbeta`
+                        // slab; the matrix-free path leaves it 0-width (the
+                        // cross-block geometry is applied to `kron_jac` below), so
+                        // projecting a zero-column matrix is a no-op we skip.
+                        if frames_engaged {
+                            let htbeta_e = sys.rows[row_idx].htbeta.clone();
+                            sys.rows[row_idx].htbeta = manifold_i
+                                .project_matrix_columns_to_gradient_tangent(
+                                    t_i,
+                                    gt_e.view(),
+                                    htbeta_e.view(),
+                                );
+                        }
                         // Kronecker local-Jacobian column projection (full-B path
                         // only), using the SAME pre-projection gradient `gt_e` so
                         // the cross-block geometry matches the dense branch.
