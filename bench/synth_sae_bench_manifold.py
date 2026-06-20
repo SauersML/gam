@@ -331,7 +331,17 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
     rows, cols, matching = _match_directions(learned_dirs, synth.dictionary)
     if rows.size:
         mcc = float(np.mean(np.abs(np.sum(learned_dirs[rows] * synth.dictionary[cols], axis=1))))
-        uniqueness = float(len(set(int(c) for c in cols)) / max(len(rows), 1))
+        # One-to-one recovery match fraction (#1413). The old
+        # `len(set(cols)) / len(rows)` was tautologically 1: Hungarian
+        # (linear_sum_assignment) and the greedy fallback both enforce unique
+        # columns, so every non-empty match yielded 1.0 regardless of how
+        # duplicated the dictionary was. Span the denominator over the larger
+        # of the live-learned and ground-truth feature counts so duplicate /
+        # excess learned features (which shrink the one-to-one match count) and
+        # unrecovered truth features both pull the score below 1.
+        n_learned = int(learned_dirs.shape[0])
+        n_truth = int(synth.dictionary.shape[0])
+        uniqueness = float(rows.shape[0] / max(n_learned, n_truth))
         precision, recall, f1 = _probing_metrics_for_matches(
             fit,
             test_payload,
@@ -417,7 +427,7 @@ def _benchmark_notes() -> dict[str, Any]:
             "synthsaebench": [
                 "GT-MCC-style absolute-cosine feature recovery",
                 "GT-F1-style matched-latent firing precision/recall/F1",
-                "feature uniqueness",
+                "feature recovery (one-to-one match fraction)",
             ],
             "saebench_compatible_synthetic": [
                 "sparse-probing analogue on matched ground-truth features",

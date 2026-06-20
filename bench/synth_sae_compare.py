@@ -7,7 +7,7 @@ the same direct ground-truth metrics:
 
 * reconstruction R2
 * decoder/feature MCC using Hungarian matching
-* feature uniqueness
+* feature recovery (one-to-one match fraction)
 * matched-latent firing precision/recall/F1
 
 The manifold row uses the repo's public ``gamfit.sae_manifold_fit`` API. The
@@ -184,7 +184,17 @@ def _score(
     if rows.size:
         matched_cos = np.abs(np.sum(dirs[rows] * truth_dirs[cols], axis=1))
         mcc = float(np.mean(matched_cos))
-        uniqueness = float(len(set(int(c) for c in cols)) / max(len(rows), 1))
+        # One-to-one recovery match fraction (#1413). The old
+        # `len(set(cols)) / len(rows)` was tautologically 1: Hungarian
+        # (linear_sum_assignment) and the greedy fallback both enforce unique
+        # columns, so every non-empty match yielded 1.0 regardless of how
+        # duplicated the dictionary was. Span the denominator over the larger
+        # of the live-learned and ground-truth feature counts so duplicate /
+        # excess learned features (which shrink the one-to-one match count) and
+        # unrecovered truth features both pull the score below 1.
+        n_learned = int(dirs.shape[0])
+        n_truth = int(truth_dirs.shape[0])
+        uniqueness = float(rows.shape[0] / max(n_learned, n_truth))
         live_train = train_latents[:, live]
         live_test = test_latents[:, live]
         metrics = [_best_f1(live_test[:, int(row)], test_fire[:, int(col)]) for row, col in zip(rows, cols)]
