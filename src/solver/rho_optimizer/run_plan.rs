@@ -1002,6 +1002,48 @@ pub(crate) fn run_outer_with_plan(
                                 last_solution.final_value,
                                 last_solution.final_gradient_norm.unwrap_or(f64::NAN),
                             );
+                            // Budget exhaustion (#1371): the optimizer hands back
+                            // its LAST iterate, which on a flat REML valley can be
+                            // a degenerate box corner the trajectory wandered to
+                            // on an indefinite ρ-Hessian step — e.g. `ρ_nullspace
+                            // → +∞` on a `bs="ps"` double-penalty smooth, which
+                            // shrinks the null-space ridge `Z Zᵀ` so hard that a
+                            // genuine, strongly-supported linear trend is
+                            // annihilated and the fit collapses to a flat constant
+                            // (edf_total→1). The cost-stall guard tracked the best
+                            // FEASIBLE iterate the trajectory actually evaluated
+                            // and published it to `cost_stall_exit`; never return
+                            // an iterate whose REML objective is worse than one the
+                            // optimizer already passed through. Mirrors the
+                            // separation-corner regression guard in
+                            // `CostStallGuard::observe_constrained_stationary`
+                            // (#1355); here it covers the budget-exhaustion exit.
+                            let best_exit =
+                                cost_stall_exit.lock().ok().and_then(|slot| slot.clone());
+                            if let Some(best) = best_exit {
+                                let last_value = last_solution.final_value;
+                                let best_is_strictly_better = best.value.is_finite()
+                                    && (!last_value.is_finite() || best.value < last_value);
+                                if best_is_strictly_better {
+                                    log::warn!(
+                                        "[OUTER] {context}: ARC budget-exhaustion last iterate \
+                                         (value={:.6e}) is worse than the best feasible iterate \
+                                         seen (value={:.6e}); returning the best iterate so a \
+                                         degenerate box-corner does not over-shrink a supported \
+                                         penalty direction (#1371).",
+                                        last_value,
+                                        best.value,
+                                    );
+                                    return Ok(outer_result_with_gradient_norm(
+                                        best.rho,
+                                        best.value,
+                                        best.iterations,
+                                        Some(best.grad_norm),
+                                        false,
+                                        *the_plan,
+                                    ));
+                                }
+                            }
                             Ok(solution_into_outer_result(*last_solution, false, *the_plan))
                         }
                         Err(ArcError::ObjectiveFailed { message })
