@@ -334,8 +334,6 @@ mod smooth_fit_term_collection_bug_hunt_2_3;
 mod solver_gpu_pirls_bug_hunt;
 #[path = "regressions/sparse_exact_bug_hunt.rs"]
 mod sparse_exact_bug_hunt;
-#[path = "regressions/spline_scan_1266_lambda_probe.rs"]
-mod spline_scan_1266_lambda_probe;
 #[path = "regressions/te_formula_dispatch_issue_154.rs"]
 mod te_formula_dispatch_issue_154;
 #[path = "regressions/thin_plate_workspace_equivalence_regression.rs"]
