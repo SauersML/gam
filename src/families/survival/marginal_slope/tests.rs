@@ -1945,13 +1945,26 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         let d = acc.abs();
         (a, d)
     };
-    // χ1 = ∂η1/∂a at the observed node (FD of the observed index in a).
+    // linkdev'(u) from the link runtime's analytic first-derivative design —
+    // the EXACT slope of the link deviation, no finite difference.
+    let linkdev_prime_eval = |beta_w: &[f64], u: f64| -> f64 {
+        let row = link_runtime
+            .first_derivative_design(&array![u])
+            .expect("link-dev first-derivative basis row");
+        row.row(0).iter().zip(beta_w).map(|(b, c)| b * c).sum()
+    };
+    // χ1 = ∂η1/∂a at the observed node. The index is
+    // a + g·z + g·warp(z) + linkdev(a + g·z), so ∂/∂a = 1 + linkdev'(a + g·z)
+    // exactly. An earlier eps=1e-6 central FD here inherited the same amplified
+    // ~5e-11 cancellation noise #979 removed from the intercept density: each
+    // index value carries ~1e-16 absolute round-off, the FD divides the
+    // difference by 2eps=2e-6, and the third-order witness stencils then
+    // multiply that floor by ~1/h³≈5e7. Taking the slope analytically removes
+    // that amplified noise so the witness third derivatives are limited only by
+    // the (Richardson-extrapolated) truncation of the scalar NLL itself.
     let observed_eta_chi = |a: f64, g: f64, beta_h: &[f64], beta_w: &[f64]| -> (f64, f64) {
         let eta = index(a, g, beta_h, beta_w, z_row);
-        let eps = 1e-6;
-        let chi = (index(a + eps, g, beta_h, beta_w, z_row)
-            - index(a - eps, g, beta_h, beta_w, z_row))
-            / (2.0 * eps);
+        let chi = 1.0 + linkdev_prime_eval(beta_w, a + g * z_row);
         (eta, chi)
     };
     // Independent scalar survival flex row NLL over the primary vector.
