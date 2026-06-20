@@ -3389,45 +3389,82 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         result.penalties_cross_provider = Some(cross_provider);
     }
 
-    if dim > 1 && !result.penalties_first.is_empty() {
+    if dim > 1 {
         // The forward anisotropic Matérn design uses the CENTERED contrast
         // metric `w_a = exp(2·(η_a − mean(η)))` (see `centered_aniso_metric_weights`
         // / `aniso_distance`): a uniform shift of every η_a leaves the mean-
         // subtracted weights — and therefore the whole design, kernel, and
         // penalty — unchanged. The optimizer's per-axis ψ-coordinate is the raw
         // η_a, so the criterion is invariant along the all-ones direction and
-        // the analytic penalty derivative w.r.t. raw η_a must be the centering
-        // projection of the per-axis ψ-derivative:
+        // the analytic FIRST derivative w.r.t. raw η_a must be the centering
+        // projection of the per-axis centered-ψ derivative:
         //
-        //   ∂S/∂η_a = ∂S/∂ψ_a − (1/d) Σ_b ∂S/∂ψ_b   (η_a − mean(η) chain rule).
+        //   ∂F/∂η_a = ∂F/∂ψ_a − (1/d) Σ_b ∂F/∂ψ_b   (η_a − mean(η) chain rule).
         //
-        // The per-axis builders above produce `∂S/∂ψ_a`, treating each centered
-        // contrast as independent; subtracting the mean across axes removes the
-        // spurious common-mode. (#1259: the previous code added back a
-        // `scalar_share = (1/d)·∂S/∂log κ` term, which is the gradient of a
-        // GLOBAL length-scale move — but the centered forward design makes a
-        // uniform η shift a no-op, not a log-κ change, so that add-back injected
-        // a fake all-ones gradient component. The FD-audit of the outer REML
-        // criterion flagged it as a per-axis analytic≠FD desync that misdirected
-        // the κ-optimizer off the true signal-axis contrast.)
+        // The per-axis builders produce `∂F/∂ψ_a`, treating each centered
+        // contrast as independent; subtracting the cross-axis mean removes the
+        // spurious common-mode. This MUST be applied to BOTH the design first
+        // derivatives (`design_first`, which feed the data-fit / deviance and the
+        // `½log|H+Sλ|` H-side of the outer REML gradient) AND the penalty first
+        // derivatives (`penalties_first`). Previously only the penalty side was
+        // centered, so the FULL outer gradient w.r.t. raw η disagreed with a
+        // central FD of the criterion by the un-centered design common-mode
+        // (#1376: the eta-contrast FD audit saw analytic ≈ ∂/∂ψ_a while FD ≈
+        // ∂/∂η_a = ½(∂/∂ψ_0 − ∂/∂ψ_1) for d=2, a large per-component gap even
+        // though the contrast itself is invariant to the common mode).
+        //
+        // (#1259: an earlier version of the penalty centering instead added back
+        // a `scalar_share = (1/d)·∂S/∂log κ` term — the gradient of a GLOBAL
+        // length-scale move — but the centered forward design makes a uniform η
+        // shift a no-op, not a log-κ change, so that add-back injected a fake
+        // all-ones gradient component; the centering projection here is the
+        // correct chain rule.)
         let inv_dim = 1.0 / dim as f64;
-        let num_blocks = result.penalties_first[0].len();
-        for block in 0..num_blocks {
-            let mut eta_mean = Array2::<f64>::zeros(result.penalties_first[0][block].raw_dim());
+
+        // Center the per-axis DESIGN first derivatives across axes.
+        if !result.design_first.is_empty() {
+            if result.design_first.len() != dim {
+                return Err(BasisError::InvalidInput(format!(
+                    "Matérn aniso design first-derivative axis count {} != dim {dim}",
+                    result.design_first.len()
+                )));
+            }
+            let mut design_mean = Array2::<f64>::zeros(result.design_first[0].raw_dim());
             for axis in 0..dim {
-                if result.penalties_first[axis][block].raw_dim()
-                    != result.penalties_first[0][block].raw_dim()
-                {
+                if result.design_first[axis].raw_dim() != result.design_first[0].raw_dim() {
                     return Err(BasisError::InvalidInput(format!(
-                        "Matérn aniso raw-psi penalty derivative shape mismatch on axis {axis}, block {block}"
+                        "Matérn aniso raw-psi design derivative shape mismatch on axis {axis}"
                     )));
                 }
-                eta_mean += &result.penalties_first[axis][block];
+                design_mean += &result.design_first[axis];
             }
-            eta_mean.mapv_inplace(|value| value * inv_dim);
+            design_mean.mapv_inplace(|value| value * inv_dim);
             for axis in 0..dim {
-                result.penalties_first[axis][block] =
-                    &result.penalties_first[axis][block] - &eta_mean;
+                result.design_first[axis] = &result.design_first[axis] - &design_mean;
+            }
+        }
+
+        // Center the per-axis PENALTY first derivatives across axes.
+        if !result.penalties_first.is_empty() {
+            let num_blocks = result.penalties_first[0].len();
+            for block in 0..num_blocks {
+                let mut eta_mean =
+                    Array2::<f64>::zeros(result.penalties_first[0][block].raw_dim());
+                for axis in 0..dim {
+                    if result.penalties_first[axis][block].raw_dim()
+                        != result.penalties_first[0][block].raw_dim()
+                    {
+                        return Err(BasisError::InvalidInput(format!(
+                            "Matérn aniso raw-psi penalty derivative shape mismatch on axis {axis}, block {block}"
+                        )));
+                    }
+                    eta_mean += &result.penalties_first[axis][block];
+                }
+                eta_mean.mapv_inplace(|value| value * inv_dim);
+                for axis in 0..dim {
+                    result.penalties_first[axis][block] =
+                        &result.penalties_first[axis][block] - &eta_mean;
+                }
             }
         }
     }
