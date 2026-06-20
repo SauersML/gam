@@ -1926,7 +1926,7 @@ impl SaeManifoldTerm {
     /// `atom_idx` is out of range, is rejected so a stale/mismatched payload
     /// cannot silently corrupt the reconstruction. Pass an empty slice (or never
     /// call this) for an all-curved OOS reconstruction.
-    pub(crate) fn set_hybrid_linear_images(
+    pub fn set_hybrid_linear_images(
         &mut self,
         images: Vec<crate::terms::sae::hybrid_split::AtomLinearImage>,
     ) -> Result<(), String> {

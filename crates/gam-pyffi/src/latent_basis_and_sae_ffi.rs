@@ -2650,8 +2650,9 @@ fn sae_manifold_fit_inner<'py>(
     // #1230 — whether structure search actually changed the model (a landed
     // birth/fission/fusion or a demoted death). When it did, the pre-search
     // joint-Hessian shape bands assembled above are stale and must be recomputed
-    // from the final post-search per-atom inner fits (below).
-    let mut structure_changed = false;
+    // from the final post-search per-atom inner fits (below). Assigned by the
+    // (only non-diverging) Ok arm of the search below; the Err arm returns early.
+    let structure_changed;
     let structure_search_json = {
         // Per-round harvest breadth derived from the fitted K (magic-by-default):
         // propose at most a handful of each move kind, scaled gently with the
@@ -6399,6 +6400,34 @@ fn sae_manifold_predict_oos<'py>(
             ridge_ext_coord,
         )
         .map_err(py_value_error)?;
+
+    // #1228/#1233 — attach the trained dictionary's hybrid-collapsed straight
+    // sub-models (passed from the train-side `hybrid_split` report as
+    // `(atom_idx, t_bar, b0, b1)`) so the held-out reconstruction below decodes
+    // each verdict-linear d=1 slot by the SAME linear image the training
+    // reconstruction used, instead of silently falling back to the curved
+    // decoder. Attached AFTER the latent solve — the collapse is a post-fit
+    // reconstruction policy (exactly as on the train side, where it rides on the
+    // `hybrid_split_report`), so it must not perturb the frozen-decoder Newton
+    // solve above — and BEFORE `fitted` / the top-k assembler read the
+    // reconstruction. `set_hybrid_linear_images` validates each image's slot
+    // index, channel count, and d=1 eligibility, surfacing a stale/mismatched
+    // payload loudly rather than corrupting the reconstruction. `None`/empty ⇒
+    // all-curved OOS reconstruction (the prior behaviour).
+    if let Some(images) = hybrid_linear_images {
+        let images: Vec<gam::terms::sae::hybrid_split::AtomLinearImage> = images
+            .into_iter()
+            .map(
+                |(atom_idx, t_bar, b0, b1)| gam::terms::sae::hybrid_split::AtomLinearImage {
+                    atom_idx,
+                    t_bar,
+                    b0: b0.as_array().to_owned(),
+                    b1: b1.as_array().to_owned(),
+                },
+            )
+            .collect();
+        term.set_hybrid_linear_images(images).map_err(py_value_error)?;
+    }
 
     // Do NOT reseed the logits here. The pre-solve seed above puts each row in
     // the right basin; `run_fixed_decoder_arrow_schur` then jointly optimizes

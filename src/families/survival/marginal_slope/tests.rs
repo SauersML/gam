@@ -2489,24 +2489,52 @@ fn debug_flex_directional_quantities_fd_localize() {
         let fd_s = |p: f64, m: f64| (p - m) / (2.0 * hh);
         eprintln!(
             "INPUT chi_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | eta_aa_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | eta_aaa_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
-            inb.chi_dir, fd_s(plus.chi_base, minus.chi_base), (inb.chi_dir - fd_s(plus.chi_base, minus.chi_base)).abs(),
-            inb.eta_aa_dir, fd_s(plus.eta_aa_base, minus.eta_aa_base), (inb.eta_aa_dir - fd_s(plus.eta_aa_base, minus.eta_aa_base)).abs(),
-            inb.eta_aaa_dir, fd_s(plus.eta_aaa_base, minus.eta_aaa_base), (inb.eta_aaa_dir - fd_s(plus.eta_aaa_base, minus.eta_aaa_base)).abs(),
+            inb.chi_dir,
+            fd_s(plus.chi_base, minus.chi_base),
+            (inb.chi_dir - fd_s(plus.chi_base, minus.chi_base)).abs(),
+            inb.eta_aa_dir,
+            fd_s(plus.eta_aa_base, minus.eta_aa_base),
+            (inb.eta_aa_dir - fd_s(plus.eta_aa_base, minus.eta_aa_base)).abs(),
+            inb.eta_aaa_dir,
+            fd_s(plus.eta_aaa_base, minus.eta_aaa_base),
+            (inb.eta_aaa_dir - fd_s(plus.eta_aaa_base, minus.eta_aaa_base)).abs(),
         );
         for &u in &[q1, g, w0] {
             eprintln!(
                 "INPUT[{u}] tau_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | tau_a_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | a_u_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
-                inb.tau_dir[u], fd_s(plus.tau_base[u], minus.tau_base[u]), (inb.tau_dir[u] - fd_s(plus.tau_base[u], minus.tau_base[u])).abs(),
-                inb.tau_a_dir[u], fd_s(plus.tau_a_base[u], minus.tau_a_base[u]), (inb.tau_a_dir[u] - fd_s(plus.tau_a_base[u], minus.tau_a_base[u])).abs(),
-                inb.a_u_dir[u], fd_s(plus.a_u_base[u], minus.a_u_base[u]), (inb.a_u_dir[u] - fd_s(plus.a_u_base[u], minus.a_u_base[u])).abs(),
+                inb.tau_dir[u],
+                fd_s(plus.tau_base[u], minus.tau_base[u]),
+                (inb.tau_dir[u] - fd_s(plus.tau_base[u], minus.tau_base[u])).abs(),
+                inb.tau_a_dir[u],
+                fd_s(plus.tau_a_base[u], minus.tau_a_base[u]),
+                (inb.tau_a_dir[u] - fd_s(plus.tau_a_base[u], minus.tau_a_base[u])).abs(),
+                inb.a_u_dir[u],
+                fd_s(plus.a_u_base[u], minus.a_u_base[u]),
+                (inb.a_u_dir[u] - fd_s(plus.a_u_base[u], minus.a_u_base[u])).abs(),
             );
         }
         for &(u, v) in &[(g, g), (g, w0), (w0, w0)] {
             eprintln!(
                 "INPUT[{u},{v}] a_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | r_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | chi_uv_fixed_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
-                inb.a_uv_dir[[u, v]], fd_s(plus.a_uv_base[[u, v]], minus.a_uv_base[[u, v]]), (inb.a_uv_dir[[u, v]] - fd_s(plus.a_uv_base[[u, v]], minus.a_uv_base[[u, v]])).abs(),
-                inb.r_uv_dir[[u, v]], fd_s(plus.r_uv_base[[u, v]], minus.r_uv_base[[u, v]]), (inb.r_uv_dir[[u, v]] - fd_s(plus.r_uv_base[[u, v]], minus.r_uv_base[[u, v]])).abs(),
-                inb.chi_uv_fixed_dir[[u, v]], fd_s(plus.chi_uv_fixed_base[[u, v]], minus.chi_uv_fixed_base[[u, v]]), (inb.chi_uv_fixed_dir[[u, v]] - fd_s(plus.chi_uv_fixed_base[[u, v]], minus.chi_uv_fixed_base[[u, v]])).abs(),
+                inb.a_uv_dir[[u, v]],
+                fd_s(plus.a_uv_base[[u, v]], minus.a_uv_base[[u, v]]),
+                (inb.a_uv_dir[[u, v]] - fd_s(plus.a_uv_base[[u, v]], minus.a_uv_base[[u, v]]))
+                    .abs(),
+                inb.r_uv_dir[[u, v]],
+                fd_s(plus.r_uv_base[[u, v]], minus.r_uv_base[[u, v]]),
+                (inb.r_uv_dir[[u, v]] - fd_s(plus.r_uv_base[[u, v]], minus.r_uv_base[[u, v]]))
+                    .abs(),
+                inb.chi_uv_fixed_dir[[u, v]],
+                fd_s(
+                    plus.chi_uv_fixed_base[[u, v]],
+                    minus.chi_uv_fixed_base[[u, v]]
+                ),
+                (inb.chi_uv_fixed_dir[[u, v]]
+                    - fd_s(
+                        plus.chi_uv_fixed_base[[u, v]],
+                        minus.chi_uv_fixed_base[[u, v]]
+                    ))
+                .abs(),
             );
         }
         // #932 DECISIVE: is the BASE intercept-solve constraint Hessian `f_uv`
@@ -2517,12 +2545,13 @@ fn debug_flex_directional_quantities_fd_localize() {
         // exact moment-jet channels above) proves the bug lives in the f_uv base
         // boundary, which feeds a_uv -> a_u_dir -> the third[g,w0] error.
         for &v in &[q1, g, w0] {
-            let fuv_dir_analytic: f64 =
-                (0..p).map(|uu| inb.f_uv_base[[uu, v]] * dir[uu]).sum();
+            let fuv_dir_analytic: f64 = (0..p).map(|uu| inb.f_uv_base[[uu, v]] * dir[uu]).sum();
             let fu_fd = fd_s(plus.f_u_base[v], minus.f_u_base[v]);
             eprintln!(
                 "INPUT f_uv[*,{v}]·dir analytic {:+.6e} fd(f_u[{v}]) {:+.6e} gap {:.2e}",
-                fuv_dir_analytic, fu_fd, (fuv_dir_analytic - fu_fd).abs(),
+                fuv_dir_analytic,
+                fu_fd,
+                (fuv_dir_analytic - fu_fd).abs(),
             );
         }
         let fa_fd = fd_s(plus.f_a_base, minus.f_a_base);

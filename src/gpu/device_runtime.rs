@@ -321,9 +321,18 @@ mod module_path_lock_tests {
 
     #[test]
     fn gpu_device_runtime_module_path_is_canonical() {
-        // Resolving `GpuRuntime` through the `device_runtime` module path
-        // pins the honest name; if the module is renamed this stops compiling.
-        let _ = crate::gpu::device_runtime::GpuRuntime::is_available();
+        // Bind the `is_available` accessor through the canonical `device_runtime`
+        // module path as a `fn() -> bool`; this fails to compile if the module is
+        // renamed or the accessor's signature drifts, and (unlike calling it)
+        // never probes the GPU at test time.
+        let accessor: fn() -> bool = crate::gpu::device_runtime::GpuRuntime::is_available;
+        let accessor_name = std::any::type_name_of_val(&accessor);
+        assert!(
+            accessor_name.contains("bool"),
+            "is_available must resolve as a `fn() -> bool` accessor (got {accessor_name})"
+        );
+        // The fully-qualified type name of `GpuRuntime` carries the module path,
+        // so asserting it contains `device_runtime` locks the honest name.
         let type_name = std::any::type_name::<crate::gpu::device_runtime::GpuRuntime>();
         assert!(
             type_name.contains("device_runtime"),
