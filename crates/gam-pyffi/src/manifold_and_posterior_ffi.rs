@@ -1917,8 +1917,41 @@ fn summary_smooth_terms(
             p_value: None,
         });
     }
+    // `design.smooth.terms[i].coeff_range` is SMOOTH-LOCAL (it starts at 0 for
+    // the first smooth term), but `fit.beta` / `cov_forwald` /
+    // `coefficient_influence` are in GLOBAL coefficient coordinates. The smooth
+    // block is preceded by the intercept, any linear terms, and any random
+    // effects, so every smooth-local range must be shifted by `smooth_start` —
+    // the first global column owned by the smooth block — before it is used to
+    // slice a global array. Omitting this offset slices the wrong block (it lands
+    // one-plus columns early, straddling the preceding term), which silently
+    // inflated the per-term Wald χ² for a boundary-penalised smooth: a near-null
+    // term was judged against the high-leverage tail coefficient of the strong
+    // co-term, giving a ~100% false-positive p-value (#1360). The same offset is
+    // applied in `smooth_term_column_ranges` for coefficient provenance.
+    let smooth_start = design
+        .intercept_range
+        .end
+        .max(
+            design
+                .linear_ranges
+                .iter()
+                .map(|(_, r)| r.end)
+                .max()
+                .unwrap_or(0),
+        )
+        .max(
+            design
+                .random_effect_ranges
+                .iter()
+                .map(|(_, r)| r.end)
+                .max()
+                .unwrap_or(0),
+        );
     for term in &design.smooth.terms {
         let k = term.penalties_local.len();
+        let coeff_range =
+            (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
         // Per-term EDF as the influence-matrix trace over the term's coefficient
         // block, NOT the legacy `Σ_kk edf_by_block` per-penalty sum. For a tensor
         // product `te`/`ti` (and anisotropic / adaptive smooths) several penalty
@@ -1926,29 +1959,17 @@ fn summary_smooth_terms(
         // double-counts and reports a per-term EDF exceeding the model total and
         // the design column count (#1219 fixed the in-process summary; #1277 is
         // this persisted-model path the Python API reads via `summary()`).
-        let edf = fit.per_term_edf(term.coeff_range.clone(), penalty_cursor, k);
+        let edf = fit.per_term_edf(coeff_range.clone(), penalty_cursor, k);
         penalty_cursor += k;
         let smooth_test = if term.shape == ShapeConstraint::None {
             cov_forwald.and_then(|cov| {
-                if std::env::var("GAM_DBG_1360").is_ok() {
-                    let r = term.coeff_range.clone();
-                    let blk = cov.slice(ndarray::s![r.clone(), r.clone()]).to_owned();
-                    let (evals, _) = <ndarray::Array2<f64> as gam::faer_ndarray::FaerEigh>::eigh(blk.clone(), faer::Side::Lower).unwrap();
-                    let bb = fit.beta.slice(ndarray::s![r.clone()]).to_owned();
-                    eprintln!("[DBG1360] term={} range={:?} edf={:.3} nulldim={} corrected={}",
-                        term.name, r, edf, term.nullspace_dims.iter().copied().sum::<usize>(),
-                        fit.beta_covariance_corrected().is_some());
-                    eprintln!("[DBG1360]   block diag={:?}", blk.diag().to_vec());
-                    eprintln!("[DBG1360]   eigvals={:?}", evals.to_vec());
-                    eprintln!("[DBG1360]   beta={:?}", bb.to_vec());
-                }
                 // The summary table is built from representative inputs reconstructed
                 // from saved feature ranges (not the original training rows).
                 wood_smooth_test(SmoothTestInput {
                     beta: fit.beta.view(),
                     covariance: cov,
                     influence_matrix: fit.coefficient_influence(),
-                    coeff_range: term.coeff_range.clone(),
+                    coeff_range: coeff_range.clone(),
                     edf,
                     nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),
                     residual_df,
