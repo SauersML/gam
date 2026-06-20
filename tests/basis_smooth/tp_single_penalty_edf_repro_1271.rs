@@ -64,6 +64,22 @@ fn linear_dgp(n: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
     (data, y)
 }
 
+/// Identical to [`fit_options`] but takes the ρ-prior from `RhoPrior::default()`
+/// — the prior the formula / FFI / CLI fit pipeline resolves to. This is the
+/// angle the #1271 over-fit actually manifested through: the prior-localisation
+/// repro above pins `RhoPrior::Flat` explicitly and so was blind to the bug,
+/// which lived entirely in the DEFAULT. Pre-fix the default was a symmetric
+/// `Normal{mean:0, sd:3}` cap on log-λ that pulled λ̂ down off the REML optimum
+/// on null-space (linear) data; post-fix it is `Flat` (the firth one-sided
+/// barrier), so this fit collapses to the affine truth like mgcv. Reverting the
+/// default back to a two-sided cap re-fails this gate.
+fn fit_options_default_prior() -> FitOptions {
+    FitOptions {
+        rho_prior: RhoPrior::default(),
+        ..fit_options()
+    }
+}
+
 /// k=20 thin-plate, matching mgcv's `s(x,bs="tp",k=20)`. `length_scale = 0.0`
 /// is the auto-init sentinel (the term-builder default) — the data-derived
 /// length-scale is then OPTIMIZED as a spatial hyper-axis.
@@ -175,5 +191,53 @@ fn tp_single_penalty_edf_inflation_1271() {
         mean(&single_vals) < 3.0,
         "tp single-penalty over-fits linear data: mean EDF={:.4}, per-seed={single_vals:?}",
         mean(&single_vals)
+    );
+}
+
+/// #1271 ROOT-CAUSE GATE (the angle the bug actually shipped through). Fit the
+/// identical `s(x, bs="tp", k=20)` single-penalty model on exactly-linear data
+/// but with the ρ-prior taken from `RhoPrior::default()` — the prior the formula
+/// / FFI / CLI pipeline resolves to. Pre-fix the default was a symmetric
+/// `Normal{0,3}` cap that left mean EDF ≈ 4.9 (mgcv 2.1); post-fix the default is
+/// `Flat`, so λ̂ reaches the REML optimum and EDF collapses to ≈ 2. The
+/// `RhoPrior::Flat` repro above could not catch this because it overrode the
+/// default. A regression to a two-sided cap re-inflates EDF here.
+#[test]
+fn tp_single_penalty_default_prior_does_not_overfit_1271() {
+    let n = 800usize;
+    let likelihood = LikelihoodSpec::new(
+        ResponseFamily::Gaussian,
+        InverseLink::Standard(StandardLink::Identity),
+    );
+    let opts = fit_options_default_prior();
+
+    let mut edfs = Vec::new();
+    for seed in 0..5u64 {
+        let (data, y) = linear_dgp(n, seed);
+        let weights = Array1::ones(n);
+        let offset = Array1::zeros(n);
+        let fit = fit_term_collection_forspec(
+            data.view(),
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &tp_spec(false),
+            likelihood.clone(),
+            &opts,
+        )
+        .expect("tp single-penalty fit (default prior)");
+        edfs.push(fit.fit.edf_total().unwrap_or(f64::NAN));
+    }
+    let mean = edfs.iter().sum::<f64>() / edfs.len() as f64;
+    eprintln!("[1271-default-prior] mean EDF={mean:.4} per-seed={edfs:?}");
+    assert!(
+        edfs.iter().all(|v| v.is_finite()),
+        "default-prior tp fits must converge to finite EDF, got {edfs:?}"
+    );
+    assert!(
+        mean < 3.0,
+        "tp single-penalty over-fits linear data UNDER THE DEFAULT ρ-prior: mean EDF={mean:.4} \
+         (expected ~2, mgcv ~2.10); the default must not cap log-λ off the REML optimum on \
+         null-space signal (#1271). per-seed={edfs:?}"
     );
 }

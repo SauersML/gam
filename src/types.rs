@@ -421,7 +421,23 @@ pub enum RhoPrior {
 
 impl Default for RhoPrior {
     fn default() -> Self {
-        Self::Normal { mean: 0.0, sd: 3.0 }
+        // The principled "no information was supplied" default is `Flat`, which
+        // the REML/LAML runtime resolves to the firth-default *one-sided* barrier
+        // (`firth_default_barrier_terms`): byte-identically flat on the identified
+        // side `ρ ≥ −2 ln(upper)` and only a convex wall against the `λ → 0`
+        // under-smoothing degeneracy below it. That is the zero-downside
+        // stabiliser the legacy symmetric `Normal { mean: 0, sd: 3 }` cap was an
+        // over-correction for: the Normal cap's `ρ²/(2·9)` pull is two-sided, so
+        // it also fights the *large* λ that REML correctly wants whenever the
+        // signal lives in the penalty null space (a straight line under a
+        // thin-plate / P-spline bending penalty). There the deviance is flat in λ
+        // as λ → ∞, the cap dominates, and λ̂ settles at an interior point that
+        // leaves spurious wiggle — gam#1271 (single-penalty tp, EDF ≈ 4.9 vs
+        // mgcv 2.1) and gam#1266 (double-penalty, which already had to special-
+        // case the cap away). mgcv applies no such cap; `Flat` + the firth wall
+        // matches that prior-free REML while still bounding the `λ → 0` corner
+        // the cap was introduced (gam#893/#1196) to guard.
+        Self::Flat
     }
 }
 

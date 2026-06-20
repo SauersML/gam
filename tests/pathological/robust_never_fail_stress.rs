@@ -87,9 +87,10 @@ fn dataset(headers: &[&str], rows: Vec<Vec<String>>) -> gam::data::EncodedDatase
 }
 
 fn cfg(family: &str) -> FitConfig {
-    // The formula path's default ρ-prior is `Normal{0,3}` (not the `Flat`
-    // sentinel), so the firth-general PC default does not fire — the always-on
-    // robustness machinery contributes the Jeffreys curvature effect.
+    // The formula path's default ρ-prior is `Flat` (gam#1271), which the runtime
+    // resolves to the firth-general one-sided barrier: byte-flat on the
+    // identified side and a convex wall only against the `λ → 0` corner, so every
+    // fit here still lands at a bounded, finite optimum.
     FitConfig {
         family: Some(family.to_string()),
         ..FitConfig::default()

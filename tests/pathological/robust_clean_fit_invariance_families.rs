@@ -27,11 +27,13 @@
 //! request, not a formula).
 //!
 //! TOLERANCE RATIONALE. Each fit runs through `fit_from_formula`, whose ρ-prior
-//! defaults to `Normal{mean:0, sd:3}` — NOT the `Flat` sentinel — so the
-//! firth-general PC-hyperprior default (which fires only on `Flat`) is NOT
-//! triggered. The self-limiting Jeffreys term contributes only the `O(1/n)` Firth
-//! nudge at these sample sizes, so the clean fit lands at a bounded, finite
-//! optimum.
+//! defaults to `Flat` (gam#1271). The runtime resolves `Flat` to the
+//! firth-general one-sided barrier, which is byte-identically flat on the
+//! identified side (`ρ ≥ −2 ln(upper)`) — so a clean, well-identified fit pays
+//! nothing for it and lands at the same bounded, finite optimum plain REML
+//! would, while the wall still bounds the `λ → 0` corner. The self-limiting
+//! Jeffreys term contributes only the `O(1/n)` Firth nudge at these sample
+//! sizes.
 //!
 //! Deterministic: fixed-seed LCG, no time / unseeded RNG.
 
@@ -77,9 +79,10 @@ struct CleanFit {
 }
 
 fn base_cfg(family: &str) -> FitConfig {
-    // The formula path's default ρ-prior is `Normal{0,3}` (NOT the `Flat`
-    // sentinel), so the firth-general PC-hyperprior default does not fire — the
-    // always-on Jeffreys term contributes only the self-limiting O(1/n) nudge.
+    // The formula path's default ρ-prior is `Flat` (gam#1271), resolved to the
+    // firth-general one-sided barrier — byte-flat on the identified side, so a
+    // clean fit is unchanged from plain REML and the always-on Jeffreys term
+    // contributes only the self-limiting O(1/n) nudge.
     FitConfig {
         family: Some(family.to_string()),
         ..FitConfig::default()
