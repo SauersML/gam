@@ -801,6 +801,11 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
             row_idx,
             options.tolerate_ill_conditioning,
             deflation.row(row_idx),
+            // The presence of an installed `row_gauge_deflation` marks this as the
+            // SAE manifold evidence path, which opts into spectral discovery of a
+            // flat per-row H_tt direction (intrinsic-dimension deficiency, #1273)
+            // even when THIS row's supplied gauge list is empty/non-spanning.
+            true,
         )?;
         count += result.gauge_deflated_directions;
         blocks.push(result.factor);

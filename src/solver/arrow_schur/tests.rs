@@ -1035,8 +1035,9 @@ pub(crate) fn evidence_row_spectral_deflates_indefinite_non_gauge_block_at_unit_
     // gauge passed in) now SUCCEEDS on this block via spectral deflation
     // rather than refusing — so the SAE driver gets a finite, BIAS-FREE
     // evidence cache and never falls back to a ρ-dependent ridge.
-    let factored = factor_one_row_result(&indef, 0.0, d, 0, true, std::slice::from_ref(&gauge_e1))
-        .expect("undamped evidence factor must condition the indefinite block by deflation");
+    let factored =
+        factor_one_row_result(&indef, 0.0, d, 0, true, std::slice::from_ref(&gauge_e1), true)
+            .expect("undamped evidence factor must condition the indefinite block by deflation");
     for a in 0..d {
         assert!(
             factored.factor[[a, a]].is_finite() && factored.factor[[a, a]] > 0.0,
@@ -1057,7 +1058,7 @@ pub(crate) fn evidence_row_spectral_deflates_indefinite_non_gauge_block_at_unit_
     pd.htbeta = indef.htbeta.clone();
     pd.gt = array![0.0_f64, 0.0, 0.0];
 
-    let result = factor_one_row_result(&pd, 0.0, d, 0, true, std::slice::from_ref(&gauge_e1))
+    let result = factor_one_row_result(&pd, 0.0, d, 0, true, std::slice::from_ref(&gauge_e1), true)
         .expect("undamped evidence factor must succeed on the genuinely-PD stationary block");
     // Exactly one gauge direction deflated; the non-gauge spectrum is
     // factored as-is (no ridge), so L Lᵀ reproduces H_tt on the two genuine
@@ -1093,6 +1094,102 @@ pub(crate) fn evidence_row_spectral_deflates_indefinite_non_gauge_block_at_unit_
         (reconstructed[[1, 1]] - (1.0 + 1.0e-10)).abs() < 1.0e-9,
         "deflated gauge direction must carry exactly the +1 unit stiffness; got {}",
         reconstructed[[1, 1]]
+    );
+}
+
+/// #1273 regression — the SAE evidence path must recover a per-row `H_tt`
+/// that is rank-deficient because the atom's data is intrinsically LOWER-
+/// dimensional than its chart (the reported circle/torus case: a 1-D ring
+/// embedded in a 2-D torus harmonic basis), even when THIS row carries NO
+/// supplied gauge direction that spans the flat direction.
+///
+/// This block has a genuine FLAT tangent direction (a numerically-zero
+/// eigenvalue along e_1) but is otherwise PD and finite — the REML cost is
+/// valid; the per-row tangent Hessian simply has a null direction from the
+/// intrinsic-dimension deficiency, NOT a broken/NaN state. Before the fix the
+/// undamped evidence factor's spectral discovery-deflation was gated behind
+/// `!row_gauges.is_empty()`, so a row whose flat direction was intrinsic-
+/// dimension deficiency (not a supplied rotation/phase gauge) hit the hard
+/// "H_tt is non-PD at base ridge" refusal — which the SAE driver surfaced all
+/// the way out as the issue's `RemlConvergenceError`. After the fix the SAE
+/// evidence path (`allow_spectral_deflation = true`) DISCOVERS the flat
+/// direction from the block's own eigendecomposition and unit-stiffness
+/// deflates it (a ρ-independent `log 1 = 0`), so the factorization SUCCEEDS
+/// with no gauge supplied and no ρ-dependent ridge bias.
+#[test]
+pub(crate) fn evidence_row_recovers_intrinsic_dimension_flat_block_without_gauge_1273() {
+    let d = 2usize; // d_atom = 2 chart.
+    let k = 1usize; // K = 1 atom.
+
+    // A 2-D chart over 1-D ring data: the tangent Hessian is PD along the
+    // ring direction (e_0, curvature 3.0) and FLAT along the ambient
+    // direction the data never explores (e_1, curvature exactly 0). This is
+    // the genuine rank-1 deficiency `H_tt` carries on the #1273 geometry; it
+    // is finite and not indefinite, so the REML cost at this ρ is valid — the
+    // factorization must NOT abort.
+    let mut flat = ArrowRowBlock::new(d, k);
+    flat.htt = array![[3.0_f64, 0.0], [0.0, 0.0]];
+    flat.htbeta = array![[1.0_f64], [0.5]];
+    flat.gt = array![0.0_f64, 0.0];
+
+    // Precondition: the undamped (ridge_t = 0) Cholesky genuinely REFUSES the
+    // flat block — without this the factorization would just succeed and the
+    // fix would not be exercised. With NO supplied gauge AND spectral
+    // deflation withheld (the pre-#1273 behaviour the empty-gauge gate forced
+    // on this row), the block is rejected as non-PD.
+    let refused = factor_one_row_result(&flat, 0.0, d, 0, true, &[], false);
+    assert!(
+        refused.is_err(),
+        "fixture precondition: the rank-deficient flat H_tt must be refused by \
+         the undamped evidence factor when spectral deflation is withheld and no \
+         gauge is supplied — the exact pre-#1273 abort"
+    );
+
+    // The fix: the SAE evidence path opts into spectral discovery-deflation,
+    // which finds the flat e_1 direction from the block's own
+    // eigendecomposition and stiffens it to unit curvature, producing an SPD
+    // factor — so the factorization SUCCEEDS with no gauge supplied and the
+    // #1273 fit no longer aborts on this legitimately-flat geometry.
+    let recovered = factor_one_row_result(&flat, 0.0, d, 0, true, &[], true).expect(
+        "spectral deflation must recover the intrinsic-dimension flat H_tt block on \
+         the SAE evidence path even with no supplied gauge (#1273)",
+    );
+    assert_eq!(
+        recovered.gauge_deflated_directions, 1,
+        "exactly the single intrinsic-dimension flat direction must be deflated"
+    );
+    // The factor must be a valid SPD Cholesky (finite, positive pivots).
+    for a in 0..d {
+        assert!(
+            recovered.factor[[a, a]].is_finite() && recovered.factor[[a, a]] > 0.0,
+            "recovered evidence factor must have a finite positive pivot at {a}; got {}",
+            recovered.factor[[a, a]]
+        );
+    }
+    // The genuine ring direction e_0 is preserved exactly (no ridge bias); the
+    // deflated flat direction e_1 carries exactly the +1 unit stiffness
+    // (`log 1 = 0`, ρ-independent), NOT a magic ridge constant.
+    let l = &recovered.factor;
+    let mut recon = Array2::<f64>::zeros((d, d));
+    for i in 0..d {
+        for j in 0..d {
+            let mut acc = 0.0_f64;
+            for kk in 0..d {
+                acc += l[[i, kk]] * l[[j, kk]];
+            }
+            recon[[i, j]] = acc;
+        }
+    }
+    assert!(
+        (recon[[0, 0]] - 3.0).abs() < 1.0e-12,
+        "genuine ring direction e_0 must be preserved exactly; got {}",
+        recon[[0, 0]]
+    );
+    assert!(
+        (recon[[1, 1]] - 1.0).abs() < 1.0e-9,
+        "the intrinsic-dimension flat direction e_1 must be unit-stiffness \
+         deflated to exactly +1 (log 1 = 0, ρ-independent), NOT ridge-damped; got {}",
+        recon[[1, 1]]
     );
 }
 

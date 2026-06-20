@@ -586,8 +586,23 @@ pub(crate) fn factor_one_row(
     row_idx: usize,
     tolerate_ill_conditioning: bool,
 ) -> Result<Array2<f64>, ArrowSchurError> {
-    factor_one_row_result(row, ridge_t, d, row_idx, tolerate_ill_conditioning, &[])
-        .map(|result| result.factor)
+    // Generic / non-evidence callers (CPU/GPU `factor_blocks`, the system.rs
+    // assembly loops) supply no gauge directions AND do not install a row-gauge
+    // deflation, so they must NOT spectrally discover-and-deflate a flat
+    // direction — a genuinely non-PD block has to surface as a typed error for
+    // their outer ridge/rebuild handling. Only the SAE evidence path that
+    // installs a `row_gauge_deflation` (via `factor_blocks_for_system`) opts
+    // into spectral deflation.
+    factor_one_row_result(
+        row,
+        ridge_t,
+        d,
+        row_idx,
+        tolerate_ill_conditioning,
+        &[],
+        false,
+    )
+    .map(|result| result.factor)
 }
 
 pub(crate) fn factor_one_row_result(
@@ -597,6 +612,7 @@ pub(crate) fn factor_one_row_result(
     row_idx: usize,
     tolerate_ill_conditioning: bool,
     row_gauges: &[Array1<f64>],
+    allow_spectral_deflation: bool,
 ) -> Result<ArrowRowFactorResult, ArrowSchurError> {
     // Dimension mismatches in caller-supplied row blocks must surface as a
     // typed error rather than aborting the process. The BA/SAE assembler can
@@ -727,25 +743,40 @@ pub(crate) fn factor_one_row_result(
                             // so criterion derivatives stay exact on the quotient.
                             return Ok(deflated);
                         }
-                        // #1117/#1118 — the offending direction is NOT a supplied
-                        // gauge vector: under K>1 IBP/softmax row-sharing the
+                        // #1117/#1118/#1273 — the offending direction is NOT a
+                        // supplied gauge vector. Two distinct geometries reach
+                        // here: (a) under K>1 IBP/softmax row-sharing the
                         // logit×coordinate Gauss-Newton cross term drives an
-                        // eigenvalue of this row's H_tt negative (or numerically
-                        // flat) at a direction the closed-form gauge orbit does
-                        // not span. DISCOVER it from the block's own symmetric
-                        // eigendecomposition and deflate it at the SAME unit
-                        // stiffness (eigenvalue → +1), so its evidence
-                        // contribution is the ρ-independent constant log 1 = 0.
-                        // This replaces the previous ridge-damped evidence
+                        // eigenvalue of this row's H_tt negative at a direction the
+                        // closed-form gauge orbit does not span; and (b) — the
+                        // #1273 circle/torus case — a single atom whose data is
+                        // intrinsically LOWER-dimensional than its chart (a 1-D ring
+                        // embedded in a 2-D torus harmonic basis) has a genuine FLAT
+                        // tangent direction: H_tt is rank-deficient even though the
+                        // REML cost is finite and valid. In (b) the supplied row
+                        // gauge is only the rotation/phase orbit, which does NOT span
+                        // the intrinsic-dimension flat direction, so that row's gauge
+                        // list can be empty (or non-spanning) yet a valid quotient
+                        // factor exists. In BOTH cases DISCOVER the offending
+                        // direction from the block's own symmetric eigendecomposition
+                        // and deflate it at the SAME unit stiffness (eigenvalue → +1),
+                        // so its evidence contribution is the ρ-independent constant
+                        // log 1 = 0. This replaces the previous ridge-damped evidence
                         // fallback, whose ½·log|I + ridge·H_tt⁻¹| bias was
                         // ρ-DEPENDENT and therefore desynced the outer REML value
                         // (which saw it) from the analytic ρ-gradient (built for
                         // the undamped Laplace log-det, which did not) — the
                         // multi-atom outer line-search non-convergence (#1117).
-                        // The undamped exact Cholesky still owns every genuinely
-                        // PD block (this arm is reached only on a refused factor),
-                        // so K=1 and any PD K>1 row are bit-for-bit unchanged.
-                        if !row_gauges.is_empty()
+                        //
+                        // The undamped exact Cholesky still owns every genuinely PD
+                        // block (this arm is reached only on a refused factor), and
+                        // only the SAE evidence path opts into spectral discovery
+                        // (`allow_spectral_deflation`); generic callers keep the
+                        // strict non-PD refusal. The previous `!row_gauges.is_empty()`
+                        // gate spuriously withheld this recovery from a row whose
+                        // flat direction was intrinsic-dimension deficiency rather
+                        // than a supplied gauge — exactly the #1273 abort.
+                        if allow_spectral_deflation
                             && let Some(deflated) = factor_spectral_deflated_evidence_row(row, d)
                         {
                             return Ok(deflated);
