@@ -701,15 +701,10 @@ fn main() {
     );
 }
 
-/// Check that the workspace-root `Cargo.toml` pins `[lints.rust] warnings`
-/// to `deny`, the eventual policy (warnings must not accumulate). While the
-/// in-flight dead-code cleanup tracked under #1288 is unfinished, the crate
-/// legitimately carries dead-code warnings on not-yet-wired paths, so the
-/// repo ships `warnings = "warn"` deliberately (see the Cargo.toml comment).
-/// Hard-failing the build here when the documented, intended state is `warn`
-/// only breaks ALL verification for everyone; so this emits a visible
-/// `cargo:warning` nag to restore `deny` rather than panicking. Flip back to a
-/// hard failure once #1288's dead-code cleanup lands and `deny` builds clean.
+/// Assert that the workspace-root `Cargo.toml` pins `[lints.rust] warnings`
+/// to `deny`. Any other level (`warn`, `allow`, missing) lets warnings
+/// accumulate; that is a build failure, not a soft signal. Comments in
+/// Cargo.toml cannot waive this — the policy lives here.
 fn assert_warnings_are_denied(manifest_dir: &Path) {
     let cargo_toml = manifest_dir.join("Cargo.toml");
     let content = fs::read_to_string(&cargo_toml)
@@ -750,15 +745,14 @@ fn assert_warnings_are_denied(manifest_dir: &Path) {
 
     match found_level.as_deref() {
         Some("deny") => {}
-        Some(other) => println!(
-            "cargo:warning=[lints.rust] warnings is \"{other}\" in {}, not \"deny\". \
-             This is the intended TEMPORARY state until #1288's dead-code cleanup lands; \
-             restore `warnings = \"deny\"` once it builds clean so warnings cannot accumulate.",
+        Some(other) => panic!(
+            "[lints.rust] warnings MUST be \"deny\", found \"{other}\" in {}. \
+             Restore `warnings = \"deny\"`; warnings are not permitted to accumulate.",
             cargo_toml.display()
         ),
-        None => println!(
-            "cargo:warning=[lints.rust] warnings is unset in {}; it should be restored to \
-             \"deny\" once #1288's dead-code cleanup lands.",
+        None => panic!(
+            "[lints.rust] warnings = \"deny\" is missing from {}. \
+             It MUST be present and set to \"deny\".",
             cargo_toml.display()
         ),
     }
