@@ -310,6 +310,54 @@ impl DomainBasis {
         }
     }
 
+    /// Polynomial degree of `h′` on each knot span: the basis degree minus one
+    /// (a cubic spline derivative is piecewise quadratic).
+    fn derivative_poly_degree(&self) -> usize {
+        let degree = match self {
+            DomainBasis::Periodic(spec) => spec.degree,
+            DomainBasis::Open { degree, .. } => *degree,
+        };
+        degree.saturating_sub(1)
+    }
+
+    /// Sorted distinct breakpoints bounding the polynomial pieces of `h′` over
+    /// the active domain `[lo, hi]`. Within each `[breakpoints[k],
+    /// breakpoints[k+1]]` span the derivative is a single polynomial of degree
+    /// [`Self::derivative_poly_degree`], which is what the exact monotonicity
+    /// certificate reconstructs and checks. For the open basis these are the
+    /// distinct interior+boundary knots; for the periodic basis they are the
+    /// uniform cardinal-B-spline segment boundaries over `[0, 2π]`.
+    fn derivative_breakpoints(&self) -> Vec<f64> {
+        match self {
+            DomainBasis::Periodic(spec) => {
+                // Cardinal periodic B-splines on `[origin, origin+period]` have
+                // `num_basis` uniform segments; the derivative is a separate
+                // polynomial on each.
+                let n_seg = spec.num_basis.max(1);
+                (0..=n_seg)
+                    .map(|k| spec.origin + spec.period * k as f64 / n_seg as f64)
+                    .collect()
+            }
+            DomainBasis::Open { knots, degree } => {
+                let lo = knots[*degree];
+                let hi = knots[knots.len() - 1 - degree];
+                let mut breaks: Vec<f64> = Vec::with_capacity(knots.len());
+                for &k in knots.iter() {
+                    if k > lo + 0.0 && k < hi {
+                        breaks.push(k);
+                    }
+                }
+                breaks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                breaks.dedup_by(|a, b| (*a - *b).abs() <= f64::EPSILON * hi.abs().max(1.0));
+                let mut out = Vec::with_capacity(breaks.len() + 2);
+                out.push(lo);
+                out.extend(breaks.into_iter().filter(|&k| k > lo && k < hi));
+                out.push(hi);
+                out
+            }
+        }
+    }
+
     fn derivative_rows(&self, t: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
         let projected = t.mapv(|v| self.project(v));
         match self {
@@ -647,6 +695,236 @@ impl FittedTransport {
         Ok(rows.dot(&self.beta).mapv(|v| v + slope))
     }
 
+    /// Pre-wrap map value `slope·t + offset + g(t)` at a single point — the
+    /// strictly monotone (when fold-free) handle that [`Self::eval`] wraps for
+    /// circle targets and [`Self::invert`] bisects on.
+    fn raw_at(&self, t: f64) -> Result<f64, String> {
+        let arr = Array1::from_elem(1, t);
+        let smooth = self.basis.value_rows(arr.view())?.dot(&self.beta)[0];
+        Ok(self.linear_slope() * t + self.rotation_offset + smooth)
+    }
+
+    /// `orientation·h′` at the supplied source-chart coordinates.
+    fn oriented_derivative_at(&self, t: &[f64], orientation: f64) -> Result<Vec<f64>, String> {
+        let arr = Array1::from_vec(t.to_vec());
+        let rows = self.basis.derivative_rows(arr.view())?;
+        let slope = self.linear_slope();
+        Ok((0..t.len())
+            .map(|i| orientation * (rows.row(i).dot(&self.beta) + slope))
+            .collect())
+    }
+
+    /// Exactly certify that `h` is strictly monotone over the whole source
+    /// domain, returning the certified orientation (+1 increasing, −1
+    /// decreasing) or an `Err` describing where monotonicity fails.
+    ///
+    /// Unlike [`Self::topology_preserved`], which only samples `h′` on a fixed
+    /// 512-point grid and so can miss a fold *between* grid samples, this is a
+    /// span-exact certificate. On each knot span `h′` is a single polynomial of
+    /// degree `d = `[`DomainBasis::derivative_poly_degree`]` (cubic spline ⇒
+    /// quadratic). A degree-`d` polynomial is determined by `d + 1` samples, so
+    /// per span we sample `h′` at `d + 1` equally-spaced abscissae, reconstruct
+    /// the polynomial by finite differences, locate its interior critical
+    /// points in closed form, and require `orientation·h′ > 0` at the span
+    /// endpoints **and** every interior critical point. To stay sound even if a
+    /// basis is not an exact polynomial of the assumed degree on a span (e.g. a
+    /// row-normalized periodic basis whose row-sum is not a partition of unity),
+    /// the reconstruction is verified against an independent interior sample;
+    /// any mismatch falls back to refusing the span.
+    fn certify_strict_monotonicity(&self) -> Result<f64, String> {
+        let (lo, hi) = match self.topology_from {
+            ChartTopology::Circle => (0.0, TAU),
+            ChartTopology::Interval { lo, hi } => (lo, hi),
+        };
+        // Orientation from the endpoint span of the pre-wrap map, matching the
+        // sign convention `invert` bisects with.
+        let raw_lo = self.raw_at(lo)?;
+        let raw_hi = self.raw_at(hi)?;
+        let orientation = if raw_hi >= raw_lo { 1.0 } else { -1.0 };
+
+        let deg = self.basis.derivative_poly_degree().max(1);
+        let breaks = self.basis.derivative_breakpoints();
+        // Restrict the breakpoints to the active domain (the periodic segment
+        // grid already coincides with `[lo, hi]`).
+        for window in breaks.windows(2) {
+            let (a, b) = (window[0], window[1]);
+            if !(b > a) {
+                continue;
+            }
+            let span = b - a;
+            // Reconstruction abscissae: `deg + 1` equally spaced nodes on the
+            // closed span (sampling strictly inside avoids the knot where two
+            // pieces meet and the open-basis derivative can be one-sided).
+            let pad = span * 1.0e-9;
+            let n_nodes = deg + 1;
+            let nodes: Vec<f64> = (0..n_nodes)
+                .map(|i| {
+                    let s = if n_nodes == 1 {
+                        0.5
+                    } else {
+                        i as f64 / (n_nodes - 1) as f64
+                    };
+                    (a + pad) + (span - 2.0 * pad) * s
+                })
+                .collect();
+            let values = self.oriented_derivative_at(&nodes, orientation)?;
+
+            // Polynomial in the local coordinate u = (t - nodes[0]) / step,
+            // reconstructed by Newton forward differences on the equally-spaced
+            // nodes. Coefficients in the monomial basis of u are recovered for
+            // the closed-form critical-point search.
+            let step = if n_nodes > 1 {
+                nodes[1] - nodes[0]
+            } else {
+                span
+            };
+            let coeffs = monomial_from_equispaced(&values);
+
+            // Sound guard: verify the reconstruction reproduces an independent
+            // interior sample (deliberately off the reconstruction nodes — the
+            // equispaced nodes never land on a 0.37 fraction). If the basis is
+            // not exactly polynomial of the assumed degree on this span, refuse
+            // rather than trust the fit.
+            let probe_t = a + 0.37 * span;
+            let probe_u = (probe_t - nodes[0]) / step;
+            let probe_recon = eval_monomial(&coeffs, probe_u);
+            let probe_actual = self.oriented_derivative_at(&[probe_t], orientation)?[0];
+            let scale = probe_actual.abs().max(1.0);
+            if (probe_recon - probe_actual).abs() > 1.0e-6 * scale {
+                return Err(format!(
+                    "transport monotonicity certificate could not reconstruct h′ on the \
+                     span [{a}, {b}] (reconstruction {probe_recon} vs actual {probe_actual}); \
+                     refusing to certify"
+                ));
+            }
+
+            // Require positivity at the closed-span endpoints.
+            for &edge in &[a, b] {
+                let u = (edge - nodes[0]) / step;
+                let v = eval_monomial(&coeffs, u);
+                if !(v > 0.0) {
+                    return Err(format!(
+                        "transport map is not strictly monotone: orientation·h′ = {v} ≤ 0 at \
+                         t = {edge}"
+                    ));
+                }
+            }
+            // Require positivity at every interior critical point of the
+            // polynomial within the span.
+            for u_crit in monomial_critical_points(&coeffs) {
+                let t_crit = nodes[0] + u_crit * step;
+                if t_crit > a && t_crit < b {
+                    let v = eval_monomial(&coeffs, u_crit);
+                    if !(v > 0.0) {
+                        return Err(format!(
+                            "transport map folds: orientation·h′ = {v} ≤ 0 at interior \
+                             extremum t = {t_crit}"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(orientation)
+    }
+
+    /// Invert the transport: for each target-chart coordinate `y`, return the
+    /// source-chart coordinate `t` with `eval([t]) == y`.
+    ///
+    /// Requires a strictly monotone, fold-free map (a degree-±1 cover for
+    /// circle charts, a homeomorphism for intervals), so the inverse is
+    /// single-valued; otherwise this errors rather than picking an arbitrary
+    /// branch. Monotonicity is established with [`Self::certify_strict_monotonicity`]
+    /// — a span-exact polynomial certificate, **not** the sampled
+    /// `topology_preserved` diagnostic, which can miss a narrow fold between its
+    /// grid samples. Non-finite targets are rejected. Interval targets reject a
+    /// `y` outside the fitted image (scale-aware tolerance); circle targets
+    /// accept any `y` (the pre-wrap map covers a full `2π`). The root is found
+    /// by monotone bisection on the pre-wrap map `raw_at`, which converges to
+    /// f64 precision (~53 significand bits) in the source coordinate after on
+    /// the order of 50 iterations.
+    ///
+    /// This is the exact inverse of [`Self::eval`] and the missing half of the
+    /// transport algebra alongside [`composition_defect`]: it is what lets a
+    /// caller form `g_B ∘ g_A⁻¹` from two fitted transports.
+    pub fn invert(&self, y: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err("transport inverse targets must be finite".to_string());
+        }
+        // Span-exact strict-monotonicity certificate; supersedes the sampled
+        // `topology_preserved` flag, which can pass over a between-sample fold.
+        let _orientation = self.certify_strict_monotonicity()?;
+        let (lo, hi) = match self.topology_from {
+            ChartTopology::Circle => (0.0, TAU),
+            ChartTopology::Interval { lo, hi } => (lo, hi),
+        };
+        // The pre-wrap map is strictly monotone over [lo, hi]; the endpoints
+        // anchor its orientation and image span.
+        let raw_lo = self.raw_at(lo)?;
+        let raw_hi = self.raw_at(hi)?;
+        let increasing = raw_hi > raw_lo;
+        let (raw_min, raw_max) = if increasing {
+            (raw_lo, raw_hi)
+        } else {
+            (raw_hi, raw_lo)
+        };
+        // Scale-aware image tolerance: an absolute 1e-9 would wrongly accept a
+        // target well outside a tiny image (e.g. [0, 1e-8]).
+        let scale = raw_min.abs().max(raw_max.abs()).max(1.0);
+        let tol = 32.0 * f64::EPSILON * scale;
+
+        // One reusable single-element buffer for the bisection probes (rebuilt
+        // basis rows on every probe otherwise allocated a fresh `Array1`).
+        let mut probe = Array1::<f64>::zeros(1);
+        let mut raw_at_into = |t: f64| -> Result<f64, String> {
+            probe[0] = t;
+            let smooth = self.basis.value_rows(probe.view())?.dot(&self.beta)[0];
+            Ok(self.linear_slope() * t + self.rotation_offset + smooth)
+        };
+
+        let mut out = Array1::<f64>::zeros(y.len());
+        for (idx, &yi) in y.iter().enumerate() {
+            // Target value in the pre-wrap coordinate.
+            let target = match self.topology_to {
+                ChartTopology::Interval { .. } => {
+                    if yi < raw_min - tol || yi > raw_max + tol {
+                        return Err(format!(
+                            "transport inverse target {yi} is outside the fitted image \
+                             [{raw_min}, {raw_max}]"
+                        ));
+                    }
+                    yi.clamp(raw_min, raw_max)
+                }
+                ChartTopology::Circle => {
+                    // The pre-wrap map covers exactly 2π; shift wrap_tau(y) by
+                    // the unique integer multiple of 2π that lands in the image.
+                    let ywrapped = wrap_tau(yi);
+                    let m = ((raw_min - ywrapped) / TAU).ceil();
+                    ywrapped + TAU * m
+                }
+            };
+            // Monotone bisection on the pre-wrap map over [lo, hi]; stop once
+            // the bracket is below the source-coordinate precision floor (f64
+            // bisection stagnates well before 100 iterations).
+            let (mut a, mut b) = (lo, hi);
+            let width_floor = f64::EPSILON * hi.abs().max(lo.abs()).max(1.0);
+            for _ in 0..100 {
+                if (b - a) <= width_floor {
+                    break;
+                }
+                let mid = 0.5 * (a + b);
+                let rm = raw_at_into(mid)?;
+                let go_right = if increasing { rm < target } else { rm > target };
+                if go_right {
+                    a = mid;
+                } else {
+                    b = mid;
+                }
+            }
+            out[idx] = 0.5 * (a + b);
+        }
+        Ok(out)
+    }
+
     /// Package the fit as a [`LayerTransportReport`] for the given layer pair
     /// (composition fields empty; see [`LayerTransportReport::with_composition`]).
     pub fn report(&self, layer_from: usize, layer_to: usize) -> LayerTransportReport {
@@ -925,6 +1203,146 @@ pub struct CompositionDefectReport {
     pub p_value: f64,
 }
 
+/// Recover the monomial coefficients (ascending: `c[0] + c[1]·u + …`) of the
+/// degree-`(values.len()−1)` polynomial that interpolates `values` at the
+/// integer abscissae `u = 0, 1, …, values.len()−1`. Used by the strict
+/// monotonicity certificate to reconstruct `h′` on a knot span from equally
+/// spaced samples. Exact for the polynomial pieces of a B-spline derivative.
+fn monomial_from_equispaced(values: &[f64]) -> Vec<f64> {
+    let n = values.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Newton forward differences Δ^k f[0] over the equally spaced nodes.
+    let mut diffs: Vec<f64> = values.to_vec();
+    let mut fwd = vec![0.0_f64; n];
+    fwd[0] = diffs[0];
+    for k in 1..n {
+        for i in 0..(n - k) {
+            diffs[i] = diffs[i + 1] - diffs[i];
+        }
+        fwd[k] = diffs[0];
+    }
+    // Newton form p(u) = Σ_k Δ^k f[0] · C(u, k), with the falling-factorial
+    // binomial C(u, k) = u(u−1)…(u−k+1)/k!. Accumulate into monomial coeffs.
+    let mut coeffs = vec![0.0_f64; n];
+    // poly tracks the expanded C(u,k)·k!  = Π_{j<k}(u − j); divide by k! via the
+    // running factorial.
+    let mut poly = vec![0.0_f64; n];
+    poly[0] = 1.0;
+    let mut poly_len = 1usize;
+    let mut factorial = 1.0_f64;
+    for k in 0..n {
+        if k > 0 {
+            factorial *= k as f64;
+        }
+        let scale = fwd[k] / factorial;
+        for (i, &p) in poly.iter().take(poly_len).enumerate() {
+            coeffs[i] += scale * p;
+        }
+        // Multiply running product by (u − k): poly ← poly·(u − k).
+        if k + 1 < n {
+            let mut next = vec![0.0_f64; poly_len + 1];
+            for i in 0..poly_len {
+                next[i + 1] += poly[i]; // u · poly
+                next[i] -= (k as f64) * poly[i]; // −k · poly
+            }
+            for i in 0..=poly_len {
+                poly[i] = next[i];
+            }
+            poly_len += 1;
+        }
+    }
+    coeffs
+}
+
+/// Evaluate an ascending monomial polynomial at `u` (Horner).
+fn eval_monomial(coeffs: &[f64], u: f64) -> f64 {
+    coeffs.iter().rev().fold(0.0_f64, |acc, &c| acc * u + c)
+}
+
+/// Interior critical points (roots of the derivative) of an ascending monomial
+/// polynomial, in the local `u` coordinate. Returns the closed-form roots for
+/// degree ≤ 2 derivatives (i.e. cubic-spline pieces, the production path);
+/// higher-degree derivatives fall back to a robust bisection root-isolation so
+/// the certificate stays exact-enough (a missed extremum can only make the
+/// certificate stricter, never falsely accept a fold, because the endpoints and
+/// every sign change found are still checked). For the cubic transport splines
+/// the polynomial is quadratic and this is the single vertex.
+fn monomial_critical_points(coeffs: &[f64]) -> Vec<f64> {
+    // Derivative coefficients: d/du Σ c_k u^k = Σ k·c_k u^{k−1}.
+    let n = coeffs.len();
+    if n <= 1 {
+        return Vec::new();
+    }
+    let deriv: Vec<f64> = (1..n).map(|k| k as f64 * coeffs[k]).collect();
+    // deriv is ascending of length n−1 (degree n−2).
+    match deriv.len() {
+        0 => Vec::new(),
+        1 => Vec::new(), // constant derivative: no critical point
+        2 => {
+            // Linear b + a·u = 0 (a = deriv[1]).
+            let (b, a) = (deriv[0], deriv[1]);
+            if a.abs() <= f64::MIN_POSITIVE {
+                Vec::new()
+            } else {
+                vec![-b / a]
+            }
+        }
+        3 => {
+            // Quadratic c + b·u + a·u² = 0.
+            let (c, b, a) = (deriv[0], deriv[1], deriv[2]);
+            if a.abs() <= f64::MIN_POSITIVE {
+                if b.abs() <= f64::MIN_POSITIVE {
+                    Vec::new()
+                } else {
+                    vec![-c / b]
+                }
+            } else {
+                let disc = b * b - 4.0 * a * c;
+                if disc < 0.0 {
+                    Vec::new()
+                } else {
+                    let s = disc.sqrt();
+                    vec![(-b + s) / (2.0 * a), (-b - s) / (2.0 * a)]
+                }
+            }
+        }
+        _ => {
+            // General fallback: scan for sign changes of the derivative on a
+            // dense [0, deg] grid and bisect each bracket. Conservative.
+            let lo = 0.0;
+            let hi = (coeffs.len() - 1) as f64;
+            let steps = 256;
+            let mut roots = Vec::new();
+            let f = |u: f64| eval_monomial(&deriv, u);
+            let mut prev_u = lo;
+            let mut prev_v = f(lo);
+            for i in 1..=steps {
+                let u = lo + (hi - lo) * i as f64 / steps as f64;
+                let v = f(u);
+                if prev_v == 0.0 {
+                    roots.push(prev_u);
+                } else if prev_v * v < 0.0 {
+                    let (mut a, mut b) = (prev_u, u);
+                    for _ in 0..60 {
+                        let m = 0.5 * (a + b);
+                        if f(a) * f(m) <= 0.0 {
+                            b = m;
+                        } else {
+                            a = m;
+                        }
+                    }
+                    roots.push(0.5 * (a + b));
+                }
+                prev_u = u;
+                prev_v = v;
+            }
+            roots
+        }
+    }
+}
+
 /// Uniform evaluation grid over a chart domain.
 fn domain_grid(topology: ChartTopology, n: usize) -> Array1<f64> {
     match topology {
@@ -1173,4 +1591,304 @@ pub fn transport_ladder(
     }
 
     Ok(TransportLadderReport { adjacent, two_hop })
+}
+
+#[cfg(test)]
+mod invert_tests {
+    use super::*;
+    use ndarray::Array1;
+
+    fn interval(lo: f64, hi: f64) -> ChartTopology {
+        ChartTopology::Interval { lo, hi }
+    }
+
+    #[test]
+    fn invert_round_trips_interval_transport() {
+        // A strictly increasing nonlinear warp on [0,1] → [0,1] with derivative
+        // bounded away from zero: to = (t + 0.25·sin(2πt)/(2π)) normalized, whose
+        // h′ = 1 + 0.25·cos(2πt) ∈ [0.75, 1.25] never approaches zero.
+        let n = 64;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let to: Array1<f64> =
+            from.mapv(|t| t + 0.25 * (TAU * t).sin() / TAU);
+        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
+            .expect("fit");
+        assert!(ft.topology_preserved, "monotone warp should preserve topology");
+
+        let probe = Array1::from_iter((1..10).map(|i| i as f64 / 10.0));
+        // eval ∘ invert and invert ∘ eval both return identity.
+        let fwd = ft.eval(probe.view()).expect("eval");
+        let back = ft.invert(fwd.view()).expect("invert");
+        for i in 0..probe.len() {
+            assert!(
+                (back[i] - probe[i]).abs() < 1e-6,
+                "round-trip failed: t={} back={}",
+                probe[i],
+                back[i]
+            );
+        }
+        let re_eval = ft.eval(back.view()).expect("eval");
+        for i in 0..fwd.len() {
+            assert!((re_eval[i] - fwd[i]).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn invert_round_trips_decreasing_interval_transport() {
+        // Orientation-reversing homeomorphism with derivative bounded away from
+        // zero: to = 1 - 0.5·from - 0.5·from² on [0,1] (h′ = -0.5 - from ≤ -0.5).
+        let n = 64;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let to: Array1<f64> = from.mapv(|t| 1.0 - 0.5 * t - 0.5 * t * t);
+        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
+            .expect("fit");
+        assert!(ft.topology_preserved);
+        let probe = Array1::from_iter((1..10).map(|i| i as f64 / 10.0));
+        let fwd = ft.eval(probe.view()).expect("eval");
+        let back = ft.invert(fwd.view()).expect("invert");
+        for i in 0..probe.len() {
+            assert!((back[i] - probe[i]).abs() < 1e-6, "t={} back={}", probe[i], back[i]);
+        }
+    }
+
+    #[test]
+    fn invert_round_trips_circle_transport() {
+        // Degree-1 circle cover: a rotation plus a fold-free wiggle.
+        let n = 128;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| TAU * i as f64 / n as f64));
+        let to: Array1<f64> = from.mapv(|t| wrap_tau(t + 0.3 + 0.2 * t.sin()));
+        let ft = fit_transport_map(from.view(), to.view(), ChartTopology::Circle, ChartTopology::Circle)
+            .expect("fit");
+        assert!(ft.topology_preserved, "degree {:?}", ft.degree);
+
+        let probe = Array1::from_iter((0..7).map(|i| TAU * (i as f64 + 0.5) / 7.0));
+        let fwd = ft.eval(probe.view()).expect("eval");
+        let back = ft.invert(fwd.view()).expect("invert");
+        for i in 0..probe.len() {
+            // Compare modulo 2π.
+            let d = wrap_pi(back[i] - probe[i]).abs();
+            assert!(d < 1e-5, "probe={} back={} d={}", probe[i], back[i], d);
+        }
+    }
+
+    #[test]
+    fn invert_rejects_target_outside_interval_image() {
+        // Image of `to = 0.5·from` is ~[0, 0.5]; y = 0.9 is outside it.
+        let n = 32;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let to: Array1<f64> = from.mapv(|t| 0.5 * t);
+        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
+            .expect("fit");
+        assert!(ft.invert(Array1::from_elem(1, 0.9).view()).is_err());
+    }
+
+    /// Build a `FittedTransport` on an interval whose pre-wrap map interpolates
+    /// `h` by an unpenalized least-squares spline fit (so a deliberately narrow
+    /// fold in `h` survives into the coefficients, unlike a REML fit which would
+    /// smooth it away). Fields irrelevant to `eval`/`derivative`/`invert` are
+    /// filled with sound placeholders.
+    fn fitted_from_target(
+        from: ArrayView1<'_, f64>,
+        target: ArrayView1<'_, f64>,
+        lo: f64,
+        hi: f64,
+    ) -> FittedTransport {
+        let basis = DomainBasis::build(interval(lo, hi), from).expect("basis");
+        let design = basis.value_rows(from).expect("design");
+        let m = design.ncols();
+        // Normal equations XᵀX β = Xᵀy with a tiny ridge for conditioning only.
+        let mut xtx = design.t().dot(&design);
+        let xty = design.t().dot(&target);
+        let diag = (0..m).map(|i| xtx[[i, i]].abs()).fold(1.0_f64, f64::max);
+        for i in 0..m {
+            xtx[[i, i]] += 1e-10 * diag;
+        }
+        let (evals, evecs) = xtx.eigh(Side::Lower).expect("eigh");
+        let rotated = evecs.t().dot(&xty);
+        let mut beta = Array1::<f64>::zeros(m);
+        for i in 0..m {
+            let d = evals[i].max(f64::MIN_POSITIVE);
+            let c = rotated[i] / d;
+            for j in 0..m {
+                beta[j] += evecs[[j, i]] * c;
+            }
+        }
+        FittedTransport {
+            topology_from: interval(lo, hi),
+            topology_to: interval(lo, hi),
+            degree: None,
+            degree_concentration: None,
+            rotation_offset: 0.0,
+            beta,
+            covariance: Array2::<f64>::zeros((m, m)),
+            smoothing_lambda: 0.0,
+            edf: 0.0,
+            noise_variance: 1.0,
+            n_obs: from.len(),
+            isometry_defect: 0.0,
+            isometry_defect_se: 0.0,
+            topology_preserved: true,
+            min_directional_derivative: 1.0,
+            residual_rms: 0.0,
+            basis,
+        }
+    }
+
+    /// Reviewer's between-grid fold reproducer: h(t) = (t−0.5)³/3 − (0.4/511)²·t
+    /// hides a narrow fold between the 512-point certification-grid samples.
+    /// `topology_preserved` (the sampled diagnostic) reads true, yet a dense
+    /// grid finds orientation·h′ < 0 — the span-exact certificate that `invert`
+    /// now gates on must reject the fit.
+    #[test]
+    fn invert_rejects_between_grid_fold() {
+        let n = 256;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let eps = 0.4 / 511.0;
+        let target: Array1<f64> = from.mapv(|t| (t - 0.5).powi(3) / 3.0 - eps * eps * t);
+        let mut ft = fitted_from_target(from.view(), target.view(), 0.0, 1.0);
+
+        // Confirm the fold is genuinely between the 512-pt certification grid:
+        // recompute the sampled diagnostic the production fit uses.
+        let grid = domain_grid(interval(0.0, 1.0), FOLD_CHECK_GRID);
+        let grid_d = ft.derivative(grid.view()).expect("grid deriv");
+        let mean = grid_d.iter().sum::<f64>() / grid_d.len() as f64;
+        let orientation = if mean < 0.0 { -1.0 } else { 1.0 };
+        let min_grid = grid_d
+            .iter()
+            .map(|&v| orientation * v)
+            .fold(f64::INFINITY, f64::min);
+        // Dense grid (10× finer) to expose the hidden fold.
+        let dense = Array1::from_iter((0..5120).map(|i| i as f64 / 5119.0));
+        let dense_d = ft.derivative(dense.view()).expect("dense deriv");
+        let min_dense = dense_d
+            .iter()
+            .map(|&v| orientation * v)
+            .fold(f64::INFINITY, f64::min);
+        ft.topology_preserved = min_grid > 0.0;
+        ft.min_directional_derivative = min_grid;
+        assert!(
+            min_grid > 0.0 && min_dense < 0.0,
+            "fixture must hide a between-grid fold: min on 512-grid={min_grid}, \
+             min on dense grid={min_dense}"
+        );
+
+        // The span-exact certificate must reject it even though the sampled
+        // diagnostic passed.
+        let res = ft.invert(Array1::from_elem(1, 0.0).view());
+        assert!(
+            res.is_err(),
+            "between-grid fold must be rejected by the span-exact certificate \
+             (topology_preserved={}, min_grid={min_grid}, min_dense={min_dense})",
+            ft.topology_preserved
+        );
+    }
+
+    #[test]
+    fn invert_rejects_non_finite_targets() {
+        let n = 64;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let to: Array1<f64> = from.mapv(|t| 0.5 * t);
+        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
+            .expect("fit");
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                ft.invert(Array1::from_elem(1, bad).view()).is_err(),
+                "non-finite target {bad} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn invert_image_tolerance_is_scale_aware() {
+        // Image of `to = 1e-8·from` is ~[0, 1e-8]. A target 5% outside it must
+        // be rejected, not silently clamped, under the scale-aware tolerance
+        // (the old absolute 1e-9 would have accepted it).
+        let n = 64;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let scale = 1.0e-8;
+        let to: Array1<f64> = from.mapv(|t| scale * t);
+        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
+            .expect("fit");
+        let outside = 1.05e-8;
+        assert!(
+            ft.invert(Array1::from_elem(1, outside).view()).is_err(),
+            "target {outside} is 5% outside the [0, {scale}] image and must be rejected"
+        );
+        // A target inside the image still round-trips.
+        let inside = 0.5e-8;
+        let t = ft.invert(Array1::from_elem(1, inside).view()).expect("invert inside");
+        let re = ft.eval(t.view()).expect("eval");
+        assert!((re[0] - inside).abs() < 1e-3 * scale);
+    }
+
+    #[test]
+    fn invert_round_trips_degree_minus_one_circle() {
+        // Orientation-reversing degree −1 circle cover: a reflection plus a
+        // fold-free wiggle.
+        let n = 128;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| TAU * i as f64 / n as f64));
+        let to: Array1<f64> = from.mapv(|t| wrap_tau(-t + 0.4 + 0.15 * t.sin()));
+        let ft = fit_transport_map(from.view(), to.view(), ChartTopology::Circle, ChartTopology::Circle)
+            .expect("fit");
+        assert_eq!(ft.degree, Some(-1), "expected a degree −1 cover");
+        assert!(ft.topology_preserved, "degree {:?}", ft.degree);
+        let probe = Array1::from_iter((0..7).map(|i| TAU * (i as f64 + 0.5) / 7.0));
+        let fwd = ft.eval(probe.view()).expect("eval");
+        let back = ft.invert(fwd.view()).expect("invert");
+        for i in 0..probe.len() {
+            let d = wrap_pi(back[i] - probe[i]).abs();
+            assert!(d < 1e-5, "probe={} back={} d={}", probe[i], back[i], d);
+        }
+    }
+
+    #[test]
+    fn invert_round_trips_circle_seam_and_interval_endpoints() {
+        // Circle seam: invert a target near 0/2π.
+        let n = 128;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| TAU * i as f64 / n as f64));
+        let to: Array1<f64> = from.mapv(|t| wrap_tau(t + 0.3 + 0.2 * t.sin()));
+        let ft = fit_transport_map(from.view(), to.view(), ChartTopology::Circle, ChartTopology::Circle)
+            .expect("fit");
+        assert!(ft.topology_preserved);
+        for seam in [1e-9, TAU - 1e-9, 0.0] {
+            let t = ft.invert(Array1::from_elem(1, seam).view()).expect("invert seam");
+            let re = ft.eval(t.view()).expect("eval");
+            let d = wrap_pi(re[0] - wrap_tau(seam)).abs();
+            assert!(d < 1e-6, "seam={seam} re={} d={d}", re[0]);
+        }
+
+        // Interval endpoints: invert the image endpoints exactly.
+        let m = 64;
+        let ifrom: Array1<f64> = Array1::from_iter((0..m).map(|i| i as f64 / (m as f64 - 1.0)));
+        let ito: Array1<f64> = ifrom.mapv(|t| t + 0.25 * (TAU * t).sin() / TAU);
+        let ift =
+            fit_transport_map(ifrom.view(), ito.view(), interval(0.0, 1.0), interval(0.0, 1.0))
+                .expect("fit");
+        let raw_lo = ift.raw_at(0.0).expect("raw lo");
+        let raw_hi = ift.raw_at(1.0).expect("raw hi");
+        for &edge in &[raw_lo, raw_hi] {
+            let t = ift.invert(Array1::from_elem(1, edge).view()).expect("invert endpoint");
+            assert!(t[0] >= -1e-9 && t[0] <= 1.0 + 1e-9, "endpoint t={}", t[0]);
+            let re = ift.eval(t.view()).expect("eval");
+            assert!((re[0] - edge).abs() < 1e-6, "edge={edge} re={}", re[0]);
+        }
+    }
+
+    #[test]
+    fn monomial_reconstruction_is_exact_for_quadratic() {
+        // The certificate's polynomial reconstruction must be exact on the
+        // quadratic pieces of a cubic-spline derivative.
+        let coeffs_true = [0.7_f64, -1.3, 2.1]; // 0.7 − 1.3u + 2.1u²
+        let values: Vec<f64> = (0..3)
+            .map(|i| eval_monomial(&coeffs_true, i as f64))
+            .collect();
+        let recon = monomial_from_equispaced(&values);
+        for (a, b) in recon.iter().zip(coeffs_true.iter()) {
+            assert!((a - b).abs() < 1e-12, "recon {a} vs {b}");
+        }
+        // Vertex of 2.1u² − 1.3u + 0.7 is at u = 1.3 / (2·2.1).
+        let crit = monomial_critical_points(&recon);
+        assert_eq!(crit.len(), 1);
+        assert!((crit[0] - 1.3 / 4.2).abs() < 1e-12);
+    }
 }
