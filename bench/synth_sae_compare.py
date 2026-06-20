@@ -7,8 +7,7 @@ the same direct ground-truth metrics:
 
 * reconstruction R2
 * decoder/feature MCC using Hungarian matching
-* feature uniqueness (SynthSAEBench argmax-collision definition)
-* direction recovery precision/recall/F1 (quality-aware coverage)
+* feature uniqueness
 * matched-latent firing precision/recall/F1
 
 The manifold row uses the repo's public ``gamfit.sae_manifold_fit`` API. The
@@ -30,7 +29,6 @@ import torch
 
 import gamfit
 from gamfit._binding import rust_module
-from _synth_sae_metrics import feature_uniqueness, recovery_scores
 from synth_sae_bench_manifold import SynthConfig, SynthSAEBenchData
 
 
@@ -48,9 +46,6 @@ class ModelResult:
     test_r2: float
     mcc: float
     feature_uniqueness: float
-    direction_recovery_precision: float
-    direction_recovery_recall: float
-    direction_recovery_f1: float
     probing_precision: float
     probing_recall: float
     probing_f1: float
@@ -137,6 +132,29 @@ def _best_f1(score: np.ndarray, truth: np.ndarray) -> tuple[float, float, float]
     return best
 
 
+def _match(decoder_dirs: np.ndarray, truth_dirs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    sim = np.abs(decoder_dirs @ truth_dirs.T)
+    try:
+        from scipy.optimize import linear_sum_assignment
+
+        rows, cols = linear_sum_assignment(-sim)
+        return np.asarray(rows, dtype=int), np.asarray(cols, dtype=int)
+    except Exception:
+        pairs: list[tuple[int, int]] = []
+        used_r: set[int] = set()
+        used_c: set[int] = set()
+        for flat in np.argsort(sim, axis=None)[::-1]:
+            row, col = np.unravel_index(int(flat), sim.shape)
+            if int(row) in used_r or int(col) in used_c:
+                continue
+            pairs.append((int(row), int(col)))
+            used_r.add(int(row))
+            used_c.add(int(col))
+            if len(pairs) == min(sim.shape):
+                break
+        return np.array([p[0] for p in pairs], dtype=int), np.array([p[1] for p in pairs], dtype=int)
+
+
 def _score(
     *,
     model_name: str,
@@ -158,22 +176,21 @@ def _score(
     norms = np.linalg.norm(decoder_dirs, axis=1)
     live = norms > 1e-10
     dirs = decoder_dirs[live] / np.maximum(norms[live, None], 1e-10)
-    # Three distinct ground-truth measurements (see bench/_synth_sae_metrics.py
-    # and #1413): uniqueness is the SynthSAEBench argmax-collision score, while
-    # MCC and the direction-recovery precision/recall/F1 come from the optimal
-    # one-to-one matching. The old `len(set(cols)) / len(rows)` was always 1.0
-    # because Hungarian/greedy never reuse columns.
-    uniqueness = feature_uniqueness(dirs, truth_dirs)
-    rec = recovery_scores(dirs, truth_dirs)
-    rows, cols = rec.rows, rec.cols
+    if dirs.size == 0:
+        rows = np.array([], dtype=int)
+        cols = np.array([], dtype=int)
+    else:
+        rows, cols = _match(dirs, truth_dirs)
     if rows.size:
-        mcc = rec.mcc
+        matched_cos = np.abs(np.sum(dirs[rows] * truth_dirs[cols], axis=1))
+        mcc = float(np.mean(matched_cos))
+        uniqueness = float(len(set(int(c) for c in cols)) / max(len(rows), 1))
         live_train = train_latents[:, live]
         live_test = test_latents[:, live]
         metrics = [_best_f1(live_test[:, int(row)], test_fire[:, int(col)]) for row, col in zip(rows, cols)]
         precision, recall, f1 = (float(np.mean([m[i] for m in metrics])) for i in range(3))
     else:
-        mcc = precision = recall = f1 = 0.0
+        mcc = uniqueness = precision = recall = f1 = 0.0
         live_train = np.zeros((train_x.shape[0], 0))
         live_test = np.zeros((test_x.shape[0], 0))
     return ModelResult(
@@ -189,9 +206,6 @@ def _score(
         test_r2=_r2(test_x, test_recon),
         mcc=mcc,
         feature_uniqueness=uniqueness,
-        direction_recovery_precision=rec.precision,
-        direction_recovery_recall=rec.recall,
-        direction_recovery_f1=rec.f1,
         probing_precision=precision,
         probing_recall=recall,
         probing_f1=f1,
