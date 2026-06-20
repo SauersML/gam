@@ -380,8 +380,8 @@ fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
         "expected two eta-axis psi_kappa components; got blocks: {:?}",
         comps.iter().map(|c| &c.0).collect::<Vec<_>>()
     );
-    let (_, g_signal, fd_signal, gap_signal) = eta_comps[0];
-    let (_, g_noise, fd_noise, gap_noise) = eta_comps[1];
+    let (_, g_signal, fd_signal, _) = eta_comps[0];
+    let (_, g_noise, fd_noise, _) = eta_comps[1];
     let analytic_contrast = g_signal - g_noise;
     let fd_contrast = fd_signal - fd_noise;
     eprintln!(
