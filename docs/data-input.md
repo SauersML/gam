@@ -41,6 +41,9 @@ enforced in `stringify_cell`:
 1. `None` is rejected.
 2. NaN floats and empty strings are rejected.
 
+Error messages include column name and row number when available, making
+data debugging straightforward: `column 'x' has NaN at row 42`.
+
 Booleans become `"1"` / `"0"`. Numbers use `repr()`. Other values are
 passed through `str(...)`. The engine handles numeric coercion from
 strings; explicit casting to float is unnecessary.
