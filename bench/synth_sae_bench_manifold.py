@@ -27,6 +27,7 @@ import numpy as np
 
 import gamfit
 from gamfit._binding import rust_module
+from _synth_sae_metrics import feature_uniqueness, recovery_scores
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,9 @@ class BenchmarkMetrics:
     test_r2: float
     mcc: float
     feature_uniqueness: float
+    direction_recovery_precision: float
+    direction_recovery_recall: float
+    direction_recovery_f1: float
     probing_precision: float
     probing_recall: float
     probing_f1: float
@@ -220,34 +224,6 @@ def _learned_components(fit: gamfit.ManifoldSAE) -> tuple[np.ndarray, np.ndarray
     return np.vstack(directions), np.column_stack(activations)
 
 
-def _match_directions(learned: np.ndarray, truth: np.ndarray) -> tuple[np.ndarray, np.ndarray, str]:
-    if learned.size == 0:
-        return np.array([], dtype=int), np.array([], dtype=int), "none"
-    sim = np.abs(learned @ truth.T)
-    try:
-        from scipy.optimize import linear_sum_assignment  # type: ignore
-
-        rows, cols = linear_sum_assignment(-sim)
-        return np.asarray(rows, dtype=int), np.asarray(cols, dtype=int), "hungarian"
-    except Exception:
-        pairs: list[tuple[int, int]] = []
-        used_rows: set[int] = set()
-        used_cols: set[int] = set()
-        flat_order = np.argsort(sim, axis=None)[::-1]
-        for flat in flat_order:
-            row, col = np.unravel_index(int(flat), sim.shape)
-            if int(row) in used_rows or int(col) in used_cols:
-                continue
-            pairs.append((int(row), int(col)))
-            used_rows.add(int(row))
-            used_cols.add(int(col))
-            if len(used_rows) == min(sim.shape):
-                break
-        rows = np.array([r for r, _c in pairs], dtype=int)
-        cols = np.array([c for _r, c in pairs], dtype=int)
-        return rows, cols, "greedy"
-
-
 def _best_f1(score: np.ndarray, truth: np.ndarray) -> tuple[float, float, float]:
     y = np.asarray(truth, dtype=bool)
     s = np.abs(np.asarray(score, dtype=float))
@@ -328,10 +304,16 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
     test_recon = np.asarray(test_payload["fitted"], dtype=float)
     learned_test = _component_scores_from_payload(fit, test_payload)
     learned_dirs, learned_train = _learned_components(fit)
-    rows, cols, matching = _match_directions(learned_dirs, synth.dictionary)
+    # Three distinct ground-truth measurements (see bench/_synth_sae_metrics.py
+    # and #1413): uniqueness is the SynthSAEBench argmax-collision score, while
+    # MCC and the direction-recovery precision/recall/F1 come from the optimal
+    # one-to-one matching. The old `len(set(cols)) / len(rows)` was always 1.0
+    # because Hungarian/greedy never reuse columns.
+    uniqueness = feature_uniqueness(learned_dirs, synth.dictionary)
+    rec = recovery_scores(learned_dirs, synth.dictionary)
+    rows, cols, matching = rec.rows, rec.cols, rec.matching
     if rows.size:
-        mcc = float(np.mean(np.abs(np.sum(learned_dirs[rows] * synth.dictionary[cols], axis=1))))
-        uniqueness = float(len(set(int(c) for c in cols)) / max(len(rows), 1))
+        mcc = rec.mcc
         precision, recall, f1 = _probing_metrics_for_matches(
             fit,
             test_payload,
@@ -341,7 +323,6 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
         )
     else:
         mcc = 0.0
-        uniqueness = 0.0
         precision = recall = f1 = 0.0
     score_seconds = time.perf_counter() - t1
 
@@ -365,6 +346,9 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
         test_r2=_r2(test_x, np.asarray(test_recon, dtype=float)),
         mcc=mcc,
         feature_uniqueness=uniqueness,
+        direction_recovery_precision=rec.precision,
+        direction_recovery_recall=rec.recall,
+        direction_recovery_f1=rec.f1,
         probing_precision=precision,
         probing_recall=recall,
         probing_f1=f1,
@@ -385,6 +369,9 @@ def _summarize(metrics: list[BenchmarkMetrics]) -> dict[str, Any]:
         "test_r2",
         "mcc",
         "feature_uniqueness",
+        "direction_recovery_precision",
+        "direction_recovery_recall",
+        "direction_recovery_f1",
         "probing_precision",
         "probing_recall",
         "probing_f1",
@@ -415,9 +402,10 @@ def _benchmark_notes() -> dict[str, Any]:
                 "learned_l0",
             ],
             "synthsaebench": [
-                "GT-MCC-style absolute-cosine feature recovery",
+                "GT-MCC-style absolute-cosine feature recovery (Hungarian matched pairs)",
                 "GT-F1-style matched-latent firing precision/recall/F1",
-                "feature uniqueness",
+                "feature uniqueness (argmax-collision: #distinct best matches / n_learned)",
+                "direction recovery precision/recall/F1 (quality-aware matched cosine mass)",
             ],
             "saebench_compatible_synthetic": [
                 "sparse-probing analogue on matched ground-truth features",
