@@ -421,23 +421,23 @@ pub enum RhoPrior {
 
 impl Default for RhoPrior {
     fn default() -> Self {
-        // The principled "no information was supplied" default is `Flat`, which
-        // the REML/LAML runtime resolves to the firth-default *one-sided* barrier
-        // (`firth_default_barrier_terms`): byte-identically flat on the identified
-        // side `ρ ≥ −2 ln(upper)` and only a convex wall against the `λ → 0`
-        // under-smoothing degeneracy below it. That is the zero-downside
-        // stabiliser the legacy symmetric `Normal { mean: 0, sd: 3 }` cap was an
-        // over-correction for: the Normal cap's `ρ²/(2·9)` pull is two-sided, so
-        // it also fights the *large* λ that REML correctly wants whenever the
-        // signal lives in the penalty null space (a straight line under a
-        // thin-plate / P-spline bending penalty). There the deviance is flat in λ
-        // as λ → ∞, the cap dominates, and λ̂ settles at an interior point that
-        // leaves spurious wiggle — gam#1271 (single-penalty tp, EDF ≈ 4.9 vs
-        // mgcv 2.1) and gam#1266 (double-penalty, which already had to special-
-        // case the cap away). mgcv applies no such cap; `Flat` + the firth wall
-        // matches that prior-free REML while still bounding the `λ → 0` corner
-        // the cap was introduced (gam#893/#1196) to guard.
-        Self::Flat
+        // A weakly-informative `Normal{mean:0, sd:3}` cap on each log-λ. It is
+        // load-bearing as a #1089/#893/#1196 stabiliser: on an under-determined
+        // design (p ≳ n) the outer REML criterion is flat/degenerate in ρ-space
+        // and the loop never certifies a stationary point without this curvature.
+        //
+        // It is, however, ALSO a two-sided cap, which fights the large λ that
+        // REML correctly wants whenever a smooth's signal lives in its penalty
+        // null space (a straight line under a bending penalty) — gam#1266
+        // (double-penalty) and gam#1271 (single-penalty tp/ps/cr). Those cases
+        // are handled by lifting the cap to the firth-default one-sided barrier
+        // for the SMOOTHING coordinates of WELL-DETERMINED Gaussian-identity fits
+        // (`n ≥ 2·p`), where REML stands on its own — see
+        // `relax_smoothing_rho_prior` in `terms::smooth::design_construction`.
+        // The cap is kept (this default) for under-determined / non-Gaussian
+        // fits and for length-scale (κ) coordinates, which are NOT smoothing
+        // parameters and have no `λ → 0` degeneracy for the firth wall to bound.
+        Self::Normal { mean: 0.0, sd: 3.0 }
     }
 }
 
