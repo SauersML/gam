@@ -189,38 +189,10 @@ pub(crate) fn build_model_summary(
             basis_note: None,
         });
     }
-    // `design.smooth.terms[i].coeff_range` is SMOOTH-LOCAL (starts at 0 for the
-    // first smooth term); `fit.beta` / `cov_forwald` / `coefficient_influence`
-    // are GLOBAL. The smooth block follows the intercept, linear terms, and
-    // random effects, so each smooth-local range must be shifted by
-    // `smooth_start` before slicing a global array. Without the shift the slice
-    // lands `smooth_start` columns early and straddles the preceding term,
-    // inflating the per-term Wald χ² of a boundary-penalised smooth (#1360).
-    let smooth_start = design
-        .intercept_range
-        .end
-        .max(
-            design
-                .linear_ranges
-                .iter()
-                .map(|(_, r)| r.end)
-                .max()
-                .unwrap_or(0),
-        )
-        .max(
-            design
-                .random_effect_ranges
-                .iter()
-                .map(|(_, r)| r.end)
-                .max()
-                .unwrap_or(0),
-        );
     for term in &design.smooth.terms {
         let k = term.penalties_local.len();
         let term_penalty_start = penalty_cursor;
-        let coeff_range =
-            (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
-        let edf = fit.per_term_edf(coeff_range.clone(), penalty_cursor, k);
+        let edf = fit.per_term_edf(term.coeff_range.clone(), penalty_cursor, k);
         penalty_cursor += k;
         let smooth_test = if term.shape == gam::smooth::ShapeConstraint::None {
             cov_forwald.and_then(|cov| {
@@ -228,7 +200,7 @@ pub(crate) fn build_model_summary(
                     beta: fit.beta.view(),
                     covariance: cov,
                     influence_matrix: fit.coefficient_influence(),
-                    coeff_range: coeff_range.clone(),
+                    coeff_range: term.coeff_range.clone(),
                     edf,
                     nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),
                     residual_df,

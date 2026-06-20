@@ -312,6 +312,13 @@ pub(crate) struct DebugEtaUvInputs {
     pub(crate) a_uv_base: Array2<f64>,
     pub(crate) r_uv_base: Array2<f64>,
     pub(crate) chi_uv_fixed_base: Array2<f64>,
+    // #932 intercept-solve calibration residual `F` jets: the base `f_u`/`f_uv`
+    // (θ-derivatives of the constraint `F(a,θ)=0`) and `f_a`, so the harness can
+    // FD `f_u` along dir and compare to `f_uv·dir`, isolating whether the base
+    // `f_uv` boundary (the implicit intercept Hessian source) is inexact.
+    pub(crate) f_a_base: f64,
+    pub(crate) f_u_base: Array1<f64>,
+    pub(crate) f_uv_base: Array2<f64>,
 }
 
 pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {

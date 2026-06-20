@@ -2953,6 +2953,48 @@ pub(crate) fn giant_host_working_set_plan_flips_to_matrix_free_before_dense_allo
 }
 
 #[test]
+pub(crate) fn matrix_free_plan_admits_when_in_core_budget_collapses_to_zero() {
+    // On a memory-starved / oversubscribed box (or a cgroup whose
+    // `available − reserve` underflows), `sae_host_in_core_budget_from_available`
+    // can return a budget of 0. Before the streaming floor, that rejected EVERY
+    // plan — including the chunked matrix-free fallback whose peak is bounded by
+    // the chunk window — so `admitted_or_error` failed with "exceeds budget 0
+    // bytes" and the whole SAE fit aborted at K=1 (the real-OLMo CPU ladder
+    // wall). The matrix-free streaming path must stay admittable for a small
+    // working set regardless of the collapsed in-core budget.
+    let n_obs = 508usize;
+    let total_basis = 6usize;
+    let k_atoms = 1usize;
+    let d_max = 1usize;
+    let border_dim = 32usize;
+    let plan = sae_streaming_plan_from_budget(
+        n_obs,
+        total_basis,
+        k_atoms,
+        d_max,
+        border_dim,
+        0, // in-core budget collapsed to zero
+        SAE_CPU_L2_CACHE_BYTES * SAE_CHUNK_CACHE_MULTIPLE,
+        0, // host-available also reported as zero
+    );
+    // The dense direct plan is correctly refused (it can OOM and the budget is 0).
+    assert!(!plan.direct_admitted);
+    assert!(plan.streaming);
+    // But the bounded matrix-free streaming plan IS admitted against the absolute
+    // streaming floor, so the fit can proceed instead of aborting.
+    assert!(
+        plan.estimated_matrix_free_peak_bytes <= SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES,
+        "tiny working set must fit the streaming floor: peak={}",
+        plan.estimated_matrix_free_peak_bytes
+    );
+    assert!(
+        plan.matrix_free_admitted,
+        "matrix-free streaming must be admitted at zero in-core budget"
+    );
+    assert!(plan.admitted_or_error(n_obs, border_dim, k_atoms).is_ok());
+}
+
+#[test]
 pub(crate) fn sparse_active_layout_work_scales_with_active_atoms_not_total_k() {
     let n = 3;
     let k_atoms = 100_000;

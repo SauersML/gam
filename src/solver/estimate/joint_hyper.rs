@@ -543,12 +543,19 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         if !tensor.contains(psi) {
             return false;
         }
-        // The pinning ψ must itself be in-window for its reference projector to be
-        // a valid comparison point; otherwise refuse (forces the exact slow path).
+        // The pinning ψ must itself be in-window for its reference rank to be a
+        // valid comparison point; otherwise refuse (forces the exact slow path).
         let Some(psi_ref) = self.last_reset_psi.filter(|p| tensor.contains(*p)) else {
             return false;
         };
-        tensor.reduced_basis_equal(psi_ref, psi)
+        // #1033: the anchor-corrected re-key makes the Gram exact at psi_ref, so
+        // the skip is β̂-sound across a basis ROTATION within a fixed rank as long
+        // as the move stays inside the calibrated radius. The old
+        // `reduced_basis_equal` projector witness refused every rotation (even
+        // sound small moves), pinning the κ loop to the O(n) slow path on
+        // production Duchon geometry; `reduced_basis_skip_sound` gates on the
+        // genuine requirement (rank match) plus that move radius instead.
+        tensor.reduced_basis_skip_sound(psi_ref, psi)
     }
 
     /// Revision of the canonical surface pinned by the last slow-path

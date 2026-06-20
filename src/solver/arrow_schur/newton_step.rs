@@ -377,10 +377,18 @@ pub fn solve_with_lm_escalation_inner(
     for attempt in 0..=DEFAULT_PROXIMAL_MAX_ATTEMPTS {
         let damped_ridge_t = ridge_t + proximal_ridge;
         let damped_ridge_beta = ridge_beta + proximal_ridge;
-        match solve_arrow_newton_step_artifacts(sys, damped_ridge_t, damped_ridge_beta, options) {
-            Ok(mut step) => {
-                step.pcg_diagnostics.ridge_escalations = escalations;
-                return Ok((step.delta_t, step.delta_beta, step.pcg_diagnostics));
+        // Route through `_core` (not `_artifacts`) so the #1017 device seam is
+        // reachable: on a dense Direct-mode SAE/LLM system whose (rows, k) shape
+        // clears the dispatch policy, `_core` runs the per-step Arrow-Schur
+        // factor+solve on the device, then falls through bit-identically to the
+        // CPU path on any non-admission or device decline. `_artifacts` is the
+        // CPU-only assembly entry and bypasses that seam, so the SAE inner loop
+        // (the one consumer of this escalation helper) never saw the GPU. The
+        // returned `(Δt, Δβ, diagnostics)` contract is identical.
+        match solve_arrow_newton_step_core(sys, damped_ridge_t, damped_ridge_beta, options) {
+            Ok((delta_t, delta_beta, mut pcg_diagnostics)) => {
+                pcg_diagnostics.ridge_escalations = escalations;
+                return Ok((delta_t, delta_beta, pcg_diagnostics));
             }
             Err(err) => {
                 let recoverable = matches!(

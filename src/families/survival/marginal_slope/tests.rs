@@ -2509,6 +2509,27 @@ fn debug_flex_directional_quantities_fd_localize() {
                 inb.chi_uv_fixed_dir[[u, v]], fd_s(plus.chi_uv_fixed_base[[u, v]], minus.chi_uv_fixed_base[[u, v]]), (inb.chi_uv_fixed_dir[[u, v]] - fd_s(plus.chi_uv_fixed_base[[u, v]], minus.chi_uv_fixed_base[[u, v]])).abs(),
             );
         }
+        // #932 DECISIVE: is the BASE intercept-solve constraint Hessian `f_uv`
+        // exact? Compare the analytic directional `f_uv·dir` (the g-column of the
+        // base Hessian, contracted along dir) to a central FD of the base `f_u`
+        // along dir. They must agree iff `f_uv` is the true second θ-derivative of
+        // F. Also FD `f_a` to confirm the inv_f_a factor. A large gap here (vs the
+        // exact moment-jet channels above) proves the bug lives in the f_uv base
+        // boundary, which feeds a_uv -> a_u_dir -> the third[g,w0] error.
+        for &v in &[q1, g, w0] {
+            let fuv_dir_analytic: f64 =
+                (0..p).map(|uu| inb.f_uv_base[[uu, v]] * dir[uu]).sum();
+            let fu_fd = fd_s(plus.f_u_base[v], minus.f_u_base[v]);
+            eprintln!(
+                "INPUT f_uv[*,{v}]·dir analytic {:+.6e} fd(f_u[{v}]) {:+.6e} gap {:.2e}",
+                fuv_dir_analytic, fu_fd, (fuv_dir_analytic - fu_fd).abs(),
+            );
+        }
+        let fa_fd = fd_s(plus.f_a_base, minus.f_a_base);
+        eprintln!(
+            "INPUT f_a base {:+.6e} fd(f_a along dir) {:+.6e}",
+            inb.f_a_base, fa_fd,
+        );
     }
     // Per-term d_uv_dir localization at the (w0,w0) probe block: FD each base
     // term integral T_i (from the directional struct's debug_d_uv_terms.0) and

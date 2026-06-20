@@ -23,6 +23,18 @@ pub(crate) const SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER: usize = 32;
 /// 1/8 of available and a fixed 256 MiB floor before computing the budget.
 pub(crate) const SAE_HOST_MEMORY_RESERVE_FRACTION_DENOMINATOR: usize = 8;
 pub(crate) const SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES: usize = 256 * 1024 * 1024;
+
+/// Absolute floor for the *matrix-free streaming* admission test. The chunked
+/// matrix-free plan exists precisely to bound peak memory by the chunk window
+/// rather than the full problem, so it must stay admittable even when the
+/// in-core budget collapses to ~0 (memory-starved / oversubscribed box, or a
+/// cgroup whose `available − reserve` underflows to zero). A starved box can
+/// always afford a few chunk windows plus the border vector workspace; gating
+/// streaming on the same budget as the dense direct plan would refuse the one
+/// plan that was designed to run there. The dense direct path keeps gating on
+/// the real budget — it can genuinely OOM — so this floor only ever relaxes the
+/// streaming fallback, never admits a full-batch in-core solve.
+pub(crate) const SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SaeStreamingPlan {
     pub streaming: bool,
@@ -74,7 +86,15 @@ pub(crate) fn sae_streaming_plan_from_budget(
                 .saturating_mul(SAE_MATRIX_FREE_VECTOR_WORKSPACE_MULTIPLIER),
         );
     let direct_admitted = direct_peak_bytes <= in_core_budget_bytes;
-    let matrix_free_admitted = matrix_free_peak_bytes <= in_core_budget_bytes;
+    // The matrix-free streaming plan is the bounded-memory fallback: its peak is
+    // the chunk window plus the row-cross and border-vector workspace, not the
+    // full batch. Admit it against the larger of the in-core budget and an
+    // absolute streaming floor so a starved box (budget collapsed to ~0) can
+    // still run the plan that was designed for exactly that regime. The direct
+    // (dense, full-batch) admission above is intentionally NOT floored — it can
+    // OOM, so it stays gated on the real budget.
+    let matrix_free_budget = in_core_budget_bytes.max(SAE_MIN_STREAMING_BUDGET_FLOOR_BYTES);
+    let matrix_free_admitted = matrix_free_peak_bytes <= matrix_free_budget;
     let rows_per_chunk = (chunk_window_bytes / per_row_bytes).max(SAE_MIN_STREAMING_CHUNK_ROWS);
     SaeStreamingPlan {
         streaming: !direct_admitted,

@@ -1746,6 +1746,9 @@ impl SurvivalMarginalSlopeFamily {
                     a_uv_base: a_uv.clone(),
                     r_uv_base: r_uv_base_dbg,
                     chi_uv_fixed_base: chi_uv_fixed_base_dbg,
+                    f_a_base: f_a,
+                    f_u_base: f_u.clone(),
+                    f_uv_base: f_uv.clone(),
                 },
             ),
         })

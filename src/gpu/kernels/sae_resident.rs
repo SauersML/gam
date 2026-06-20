@@ -1614,6 +1614,65 @@ mod tests {
         }
     }
 
+    /// #1017 fit-path parity (CPU-runnable). The resident inner solve and the
+    /// PRODUCTION arrow-Schur inner solve (`solve_arrow_newton_step_core`, the
+    /// entry the SAE joint fit reaches through `solve_with_lm_escalation_inner`)
+    /// must reach the SAME `(t, β)` minimiser on the same bordered quadratic.
+    ///
+    /// This is the cross-implementation parity behind wiring the device seam into
+    /// the SAE inner loop: `solve_arrow_newton_step_core` now carries the #1017
+    /// device-Schur seam (and falls through bit-identically to its CPU path off
+    /// CUDA), and the resident workspace's `cpu_reference_fit` runs the same
+    /// bordered-quadratic Newton loop. For an exact quadratic a single Newton
+    /// step from `z = 0` is `Δz = −H⁻¹ g₀ = z*`, so the production one-step
+    /// solution and the resident converged fit are the same point. Asserting they
+    /// agree pins that routing the production inner solve through the device-aware
+    /// `_core` (which a GPU host then offloads) does not move the fit. Runs on the
+    /// CPU build box — no CUDA required.
+    #[test]
+    fn resident_inner_solve_matches_production_arrow_core() {
+        use crate::solver::arrow_schur::{ArrowSolveOptions, solve_arrow_newton_step_core};
+
+        let ws = small_fixture(0x1017_F17);
+        let opts = DeviceResidentInnerOptions::default();
+
+        // Resident workspace converged fit (re-factoring CPU reference loop).
+        let resident = ws.cpu_reference_fit(&opts).expect("resident cpu fit");
+        assert!(
+            resident.converged,
+            "resident reference must converge on the PD quadratic"
+        );
+
+        // Production arrow path: one Newton step on the same system from z = 0.
+        // `_core` is the device-aware entry; on this CPU box it runs the dense
+        // CPU solve, the exact path the GPU host would fall back to on decline.
+        let sys = ws.to_arrow_system();
+        let (delta_t, delta_beta, _diag) = solve_arrow_newton_step_core(
+            &sys,
+            opts.initial_ridge_t,
+            opts.initial_ridge_beta,
+            &ArrowSolveOptions::direct(),
+        )
+        .expect("production arrow-core solve");
+
+        // z = 0 + Δz solves the quadratic exactly; compare to the resident fit.
+        let t_scale = resident.t.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
+        let b_scale = resident.beta.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
+        let mut max_rel = 0.0_f64;
+        for (prod, res) in delta_t.iter().zip(resident.t.iter()) {
+            max_rel = max_rel.max((prod - res).abs() / t_scale);
+        }
+        for (prod, res) in delta_beta.iter().zip(resident.beta.iter()) {
+            max_rel = max_rel.max((prod - res).abs() / b_scale);
+        }
+        assert!(
+            max_rel < 1e-9,
+            "resident inner fit and production arrow-core solve must agree on the \
+             same quadratic (rel {max_rel:e}); wiring the device seam into the SAE \
+             inner loop must not move the fit"
+        );
+    }
+
     /// #1017 residency-isolating per-solve bench. The full-fit bench
     /// ([`gpu_residency_wallclock_bench`]) runs an exact quadratic that converges
     /// in ONE Newton step, so the resident frame is built once and solved once —
