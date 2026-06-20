@@ -30,7 +30,7 @@ import torch
 
 import gamfit
 from gamfit._binding import rust_module
-from _synth_sae_metrics import feature_uniqueness, recovery_scores
+from _synth_sae_metrics import feature_uniqueness, n_firing_latents, recovery_scores
 from synth_sae_bench_manifold import SynthConfig, SynthSAEBenchData
 
 
@@ -52,6 +52,8 @@ class ModelResult:
     direction_recovery_recall: float
     direction_recovery_f1: float
     direction_recovery_jaccard: float
+    n_latent_slots: int
+    n_firing_latents: int
     probing_precision: float
     probing_recall: float
     probing_f1: float
@@ -170,6 +172,13 @@ def _score(
     uniqueness = feature_uniqueness(dirs, truth_dirs)
     rec = recovery_scores(dirs, truth_dirs, n_learned_total=int(decoder_dirs.shape[0]))
     rows, cols = rec.rows, rec.cols
+    # Functional (activation-based) dead-latent accounting (#1435): a latent
+    # with a nonzero decoder direction that never fires on the eval set is
+    # functionally dead -- wasted capacity the geometric (decoder-norm) live
+    # check above misses. n_latent_slots is the architectural width; the gap
+    # n_latent_slots - n_firing_latents is the functional dead count.
+    n_slots = int(decoder_dirs.shape[0])
+    n_firing = n_firing_latents(test_latents)
     if rows.size:
         mcc = rec.mcc
         live_train = train_latents[:, live]
@@ -197,6 +206,8 @@ def _score(
         direction_recovery_recall=rec.recall,
         direction_recovery_f1=rec.f1,
         direction_recovery_jaccard=rec.jaccard,
+        n_latent_slots=n_slots,
+        n_firing_latents=n_firing,
         probing_precision=precision,
         probing_recall=recall,
         probing_f1=f1,
@@ -372,7 +383,7 @@ def _availability() -> dict[str, bool]:
 
 
 def _summarize(rows: list[ModelResult]) -> dict[str, Any]:
-    metrics = ["train_r2", "test_r2", "mcc", "probing_f1", "learned_l0_test", "seconds"]
+    metrics = ["train_r2", "test_r2", "mcc", "probing_f1", "learned_l0_test", "n_firing_latents", "seconds"]
     out: dict[str, Any] = {}
     for model in sorted({r.model for r in rows}):
         model_rows = [r for r in rows if r.model == model]

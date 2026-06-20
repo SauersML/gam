@@ -18,7 +18,9 @@ from itertools import permutations
 from _synth_sae_metrics import (
     _hungarian_max_numpy,
     feature_uniqueness,
+    firing_latent_mask,
     match_directions,
+    n_firing_latents,
     recovery_scores,
 )
 
@@ -158,6 +160,44 @@ def test_empty_learned_is_zero() -> None:
     rec = recovery_scores(empty, truth)
     assert (rec.mcc, rec.precision, rec.recall, rec.f1) == (0.0, 0.0, 0.0, 0.0)
     assert rec.rows.size == 0
+
+
+def test_functional_dead_latents_differ_from_geometric() -> None:
+    # #1435: a latent with a nonzero decoder direction that NEVER fires on the
+    # eval set is functionally dead, even though it is geometrically live.
+    # 4 latents x 6 samples; latent index 1 never exceeds the 1e-8 threshold.
+    activations = np.array(
+        [
+            [1.0, 0.0, 0.5, 0.0],
+            [0.0, 0.0, 0.3, 0.0],
+            [2.0, 0.0, 0.0, 1.1],
+            [0.7, 0.0, 0.9, 0.0],
+            [0.0, 0.0, 0.2, 0.8],
+            [1.3, 0.0, 0.6, 0.4],
+        ],
+        dtype=float,
+    )
+    mask = firing_latent_mask(activations)
+    assert mask.tolist() == [True, False, True, True]
+    assert n_firing_latents(activations) == 3
+    # functional dead count = 4 slots - 3 firing
+    assert 4 - n_firing_latents(activations) == 1
+
+
+def test_firing_threshold_respected() -> None:
+    # A latent firing only below the threshold is treated as dead at that
+    # threshold (consistency with the learned_l0 |a|>1e-8 convention).
+    activations = np.array([[1e-9, 1.0], [2e-9, 0.0]], dtype=float)
+    assert n_firing_latents(activations, threshold=1e-8) == 1
+    assert n_firing_latents(activations, threshold=0.0) == 2
+
+
+def test_firing_empty_and_1d() -> None:
+    assert n_firing_latents(np.zeros((5, 0))) == 0
+    assert firing_latent_mask(np.zeros((5, 0))).size == 0
+    # 1-D treated as a single latent.
+    assert n_firing_latents(np.zeros(5)) == 0
+    assert n_firing_latents(np.array([0.0, 0.0, 0.5])) == 1
 
 
 def main() -> None:
