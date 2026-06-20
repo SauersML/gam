@@ -923,6 +923,51 @@ pub fn substitute_intercept<const K1: usize, const K: usize>(
     out
 }
 
+/// The exact θ-derivative tower of a moving-LIMIT integral's BOUNDARY
+/// contribution: given the edge-position tower `z_edge(θ)` over the `K`
+/// primaries and the integrand `B` evaluated-and-differentiated at the edge
+/// value as the stack `b_stack = [B(z₀), B′(z₀), B″(z₀), B‴(z₀)]`
+/// (`z₀ = z_edge.v`), returns the tower of `Φ(z_edge(θ))` where `Φ′ = B`.
+///
+/// Rationale: `∂_θ ∫^{z_edge(θ)} B(z) dz = Φ(z_edge(θ))` with `Φ` an
+/// antiderivative of `B`, so the boundary part of every θ-derivative of the
+/// integral is just the composition `Φ ∘ z_edge` — whose Faà di Bruno
+/// expansion carries, at one stroke, EVERY Leibniz boundary term the
+/// hand-written flux dropped: the first-order `B·z_u`, the second-order
+/// `B′·z_u·z_v + B·z_uv` (the `G_z·z_u·z_v` self-flux AND the previously
+/// dropped `G·z_uv`), and the full third/fourth-order continuations. The
+/// VALUE channel of the returned tower is meaningless (`Φ` is only defined up
+/// to a constant); callers read only the derivative channels and pair this
+/// with the interior moment-integral value separately.
+///
+/// `b_stack` holds `B` and its first three z-derivatives; the antiderivative
+/// `Φ` contributes only as the order-≥1 channels, so `compose_unary` receives
+/// `[0, B, B′, B″, B‴]` — the leading `0` is the discarded `Φ(z₀)` slot.
+pub fn moving_limit_boundary_tower<const K: usize>(
+    z_edge: &Tower4<K>,
+    b_stack: [f64; 4],
+) -> Tower4<K> {
+    z_edge.compose_unary([0.0, b_stack[0], b_stack[1], b_stack[2], b_stack[3]])
+}
+
+/// The boundary-flux derivative tower of a single moving cell integral
+/// `∫_{z_L(θ)}^{z_R(θ)} B dz`: `Φ(z_R(θ)) − Φ(z_L(θ))`, assembled from the
+/// two edge towers and the integrand stacks at each edge. The returned
+/// tower's derivative channels are the EXACT moving-boundary contribution to
+/// every θ-derivative of the cell integral, to fourth order, with no term
+/// hand-omitted. A `Fixed` (non-moving) edge passes a `z_edge` whose
+/// derivative channels are all zero, contributing nothing — matching the
+/// production `edge_vel = 0` short-circuit.
+pub fn cell_moving_boundary_flux_tower<const K: usize>(
+    z_right: &Tower4<K>,
+    b_stack_right: [f64; 4],
+    z_left: &Tower4<K>,
+    b_stack_left: [f64; 4],
+) -> Tower4<K> {
+    moving_limit_boundary_tower(z_right, b_stack_right)
+        - moving_limit_boundary_tower(z_left, b_stack_left)
+}
+
 // ── The program seam ─────────────────────────────────────────────────
 
 /// A family's row negative log-likelihood written ONCE over tower scalars.
@@ -1613,6 +1658,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The moving-boundary flux tower reproduces every θ-derivative of a
+    /// moving-limit integral, INCLUDING the second-order `B·z_uv` term the
+    /// hand-written flux dropped (#932). The edge `z_R(θ) = θ₀ + θ₁²` has a
+    /// genuinely nonzero `∂²z_R/∂θ₁² = 2`, so a combinator that omitted
+    /// `B·z_uv` would miss the [1][1] Hessian entry. Truth = central FD of the
+    /// closed-form integral `∫₀^{z_R} e^{−z²/2} dz = √(π/2)·erf(z_R/√2)`.
+    #[test]
+    fn moving_boundary_flux_carries_b_zuv_term() {
+        use std::f64::consts::PI;
+        let b = |z: f64| (-0.5 * z * z).exp(); // integrand B(z)
+        // Antiderivative-based closed-form integral I(z_R) = ∫₀^{z_R} B dz.
+        let integral = |z_r: f64| (PI / 2.0).sqrt() * libm::erf(z_r / 2.0_f64.sqrt());
+        let z_r = |th: [f64; 2]| th[0] + th[1] * th[1];
+        let th0 = [0.7_f64, 0.5_f64];
+
+        // Edge tower z_R(θ) over K=2 primaries: value + exact derivatives.
+        let mut z_edge = Tower4::<2>::constant(z_r(th0));
+        z_edge.g[0] = 1.0; // ∂z_R/∂θ₀ = 1
+        z_edge.g[1] = 2.0 * th0[1]; // ∂z_R/∂θ₁ = 2θ₁
+        z_edge.h[1][1] = 2.0; // ∂²z_R/∂θ₁² = 2  (the z_uv the old flux dropped)
+
+        // Integrand stack [B, B′, B″, B‴] at z₀: B′=−z·B, B″=(z²−1)·B,
+        // B‴=(3z−z³)·B.
+        let z0 = z_edge.v;
+        let b0 = b(z0);
+        let stack = [b0, -z0 * b0, (z0 * z0 - 1.0) * b0, (3.0 * z0 - z0 * z0 * z0) * b0];
+        let flux = moving_limit_boundary_tower(&z_edge, stack);
+
+        // FD truth of the integral's derivatives.
+        let h = 1e-4;
+        let tol = 1e-6;
+        for i in 0..2 {
+            let mut up = th0;
+            let mut dn = th0;
+            up[i] += h;
+            dn[i] -= h;
+            let fd_g = (integral(z_r(up)) - integral(z_r(dn))) / (2.0 * h);
+            assert!(
+                (flux.g[i] - fd_g).abs() <= tol * fd_g.abs().max(1.0),
+                "flux_g[{i}]: analytic {:+.8e} fd {:+.8e}",
+                flux.g[i],
+                fd_g
+            );
+        }
+        // The decisive entry: ∂²I/∂θ₁² = B′·(z_θ₁)² + B·z_θ₁θ₁. With z_θ₁=2θ₁=1
+        // and z_θ₁θ₁=2, the B·z_uv contribution is B(z₀)·2 — omitting it would
+        // leave the [1][1] entry short by exactly 2·B(z₀).
+        let grad1_at = |th: [f64; 2]| -> f64 {
+            let mut up = th;
+            let mut dn = th;
+            up[1] += h;
+            dn[1] -= h;
+            (integral(z_r(up)) - integral(z_r(dn))) / (2.0 * h)
+        };
+        let mut up = th0;
+        let mut dn = th0;
+        up[1] += h;
+        dn[1] -= h;
+        let fd_h11 = (grad1_at(up) - grad1_at(dn)) / (2.0 * h);
+        assert!(
+            (flux.h[1][1] - fd_h11).abs() <= 1e-3 * fd_h11.abs().max(1.0),
+            "flux_h[1][1] (carries B·z_uv): analytic {:+.8e} fd {:+.8e}",
+            flux.h[1][1],
+            fd_h11
+        );
+        // Explicit witness that the B·z_uv term is present and material:
+        // analytic h[1][1] minus the pure (z_u)² part must equal B·z_uv = 2·B₀.
+        let pure_zu2 = stack[1] * z_edge.g[1] * z_edge.g[1];
+        let b_zuv = flux.h[1][1] - pure_zu2;
+        assert!(
+            (b_zuv - b0 * 2.0).abs() < 1e-10,
+            "B·z_uv term {:+.8e} != B₀·z_uv {:+.8e}",
+            b_zuv,
+            b0 * 2.0
+        );
     }
 
     /// The oracle harness catches a planted #736-style sign flip in a
