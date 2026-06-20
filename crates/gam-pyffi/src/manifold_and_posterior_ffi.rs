@@ -1917,6 +1917,16 @@ fn summary_smooth_terms(
             p_value: None,
         });
     }
+    // `SmoothTerm::coeff_range` is block-local; the global coefficient layout is
+    // [intercept | linear | random | smooth], so each block must be shifted by
+    // `smooth_start` before indexing the global `fit.beta` / covariance /
+    // influence matrix. The rebuilt design replays the frozen basis, so its
+    // column counts and `smooth_start` match the trained fit exactly; only this
+    // offset (omitted in the #1360 defect) was missing.
+    let smooth_start = design
+        .design
+        .ncols()
+        .saturating_sub(design.smooth.total_smooth_cols());
     for term in &design.smooth.terms {
         let k = term.penalties_local.len();
         // Per-term EDF as the influence-matrix trace over the term's coefficient
@@ -1926,7 +1936,9 @@ fn summary_smooth_terms(
         // double-counts and reports a per-term EDF exceeding the model total and
         // the design column count (#1219 fixed the in-process summary; #1277 is
         // this persisted-model path the Python API reads via `summary()`).
-        let edf = fit.per_term_edf(term.coeff_range.clone(), penalty_cursor, k);
+        let global_range =
+            (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
+        let edf = fit.per_term_edf(global_range.clone(), penalty_cursor, k);
         penalty_cursor += k;
         let smooth_test = if term.shape == ShapeConstraint::None {
             cov_forwald.and_then(|cov| {
@@ -1948,9 +1960,9 @@ fn summary_smooth_terms(
                     beta: fit.beta.view(),
                     covariance: cov,
                     influence_matrix: fit.coefficient_influence(),
-                    coeff_range: term.coeff_range.clone(),
+                    coeff_range: global_range.clone(),
                     edf,
-                    nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),
+                    nullspace_dim: term.wald_unpenalized_dim(),
                     residual_df,
                     scale,
                 })

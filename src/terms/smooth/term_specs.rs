@@ -839,6 +839,82 @@ impl SmoothTerm {
             &rot.rotation,
         ))
     }
+
+    /// Dimension of the **joint** null space of this term's active penalties:
+    /// the coefficient directions penalized by *no* penalty. The smooth-component
+    /// Wald test ([`crate::inference::smooth_test::wood_smooth_test`]) treats this
+    /// many leading coefficients as genuine unpenalized fixed effects and tests
+    /// them at full rank; the remainder is the penalized sub-block tested with a
+    /// rank-`≈EDF` truncated pseudo-inverse.
+    ///
+    /// Because every penalty block `S_k` is positive semi-definite,
+    /// `vᵀ(Σ_k S_k)v = Σ_k vᵀ S_k v = 0` iff `S_k v = 0` for *every* `k`; the
+    /// joint null space is therefore exactly `null(Σ_k S_k)`, of dimension
+    /// `p_local − rank(Σ_k S_k)`. This is the **intersection** of the per-penalty
+    /// null spaces, not their sum.
+    ///
+    /// Summing the per-penalty `nullspace_dims` instead (the historical defect
+    /// behind #1360) *unions* the null spaces and badly over-counts: a
+    /// double-penalty smooth carries a bending penalty (null space = its
+    /// polynomial part) plus a complementary null-space ridge (which penalizes
+    /// exactly that polynomial part), so the two null spaces are disjoint and the
+    /// joint null space is empty — yet the per-penalty dims sum to nearly
+    /// `p_local`. Feeding that inflated count to the Wald test makes it test
+    /// almost the whole shrunk block at full rank, manufacturing overwhelming
+    /// "significance" for a term the fit drove to ~0 EDF.
+    pub fn wald_unpenalized_dim(&self) -> usize {
+        use crate::faer_ndarray::FaerEigh;
+        let p_local = self.coeff_range.len();
+        if p_local == 0 {
+            return 0;
+        }
+        if self.penalties_local.is_empty() {
+            // No penalty ⇒ a wholly unpenalized (fixed-effect) block.
+            return p_local;
+        }
+        // Sum the penalties that are materialized as full `p_local × p_local`
+        // blocks (the common smooth case). The covariance block the Wald test
+        // slices lives in this same coefficient basis (post joint-null rotation),
+        // so the rank is computed in the right metric.
+        let mut s_total = Array2::<f64>::zeros((p_local, p_local));
+        let mut materialized = 0usize;
+        for s in &self.penalties_local {
+            if s.nrows() == p_local && s.ncols() == p_local {
+                s_total += s;
+                materialized += 1;
+            }
+        }
+        if materialized == self.penalties_local.len() {
+            let symmetric = {
+                let transpose = s_total.t().to_owned();
+                (&s_total + &transpose) * 0.5
+            };
+            if let Ok((evals, _)) = symmetric.eigh(faer::Side::Lower) {
+                let max_abs = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+                if max_abs == 0.0 {
+                    // All penalties identically zero ⇒ unpenalized block.
+                    return p_local;
+                }
+                let tol = max_abs * (p_local as f64) * 1e-12;
+                let rank = evals.iter().filter(|&&v| v > tol).count();
+                return p_local.saturating_sub(rank);
+            }
+        }
+        // Conservative fallback when a penalty is not a materialized full block
+        // (e.g. a Kronecker tensor factor): with ≥2 active penalties the joint
+        // null space is almost always empty (the only over-rejecting direction);
+        // with a single penalty it is exactly that penalty's own null space.
+        if self.penalties_local.len() >= 2 {
+            0
+        } else {
+            self.nullspace_dims
+                .iter()
+                .copied()
+                .min()
+                .unwrap_or(0)
+                .min(p_local)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
