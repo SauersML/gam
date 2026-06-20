@@ -1329,7 +1329,22 @@ pub(crate) fn duchon_constrained_bending_penalty(
 
     let amp2 = kernel_amp * kernel_amp;
     let zt_k = fast_atb(z, &center_kernel);
-    Ok(fast_ab(&zt_k, z).mapv(|v| v * amp2))
+    let omega = fast_ab(&zt_k, z).mapv(|v| v * amp2);
+
+    // gam#1424 — the hybrid (Duchon–Matérn) kernel value is assembled from an
+    // ALTERNATING partial-fraction expansion (polyharmonic blocks `r^{2m−d}`
+    // minus Matérn `r^ν K_ν(κr)` blocks). At high dimension / high spectral
+    // power `s` the two families are individually enormous and nearly cancel,
+    // so the constrained bending energy sits at the float noise floor and
+    // rounding pushes the smallest eigenvalues materially negative (d=16, s=7:
+    // λ_min ≈ −0.26 after normalization). The exact kernel's spectral density is
+    // nonnegative, so the constrained Gram is positive semidefinite in exact
+    // arithmetic — the negative modes are pure cancellation artifacts on the
+    // near-null directions. Project onto the PSD cone to restore the kernel's
+    // known mathematical property (and the API's SPD-penalty contract). In the
+    // well-conditioned low-d regimes the spectrum is already nonnegative to
+    // machine precision, so this is a no-op there.
+    Ok(project_penalty_to_psd_cone(&symmetrize_penalty(&omega)))
 }
 
 pub(crate) fn duchon_native_penalty_candidates(
