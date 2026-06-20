@@ -278,7 +278,8 @@ pub(crate) struct LocationScaleJointPsiWorkspace<F: LocationScaleJointPsiFamily>
     pub(crate) design_loc: Arc<Array2<f64>>,
     pub(crate) design_scale: Arc<Array2<f64>>,
     pub(crate) psi_directions: ExactNewtonJointPsiDirectCache<F::Direction>,
-    pub(crate) outer_score_subsample: Option<Arc<crate::outer_subsample::OuterScoreSubsample>>,
+    pub(crate) outer_score_subsample:
+        Option<Arc<crate::outer_subsample::OuterScoreSubsample>>,
 }
 
 impl<F: LocationScaleJointPsiFamily> LocationScaleJointPsiWorkspace<F> {
@@ -339,7 +340,9 @@ impl<F: LocationScaleJointPsiFamily> LocationScaleJointPsiWorkspace<F> {
         })
     }
 
-    pub(crate) fn subsample_rows(&self) -> Option<&[crate::outer_subsample::WeightedOuterRow]> {
+    pub(crate) fn subsample_rows(
+        &self,
+    ) -> Option<&[crate::outer_subsample::WeightedOuterRow]> {
         self.outer_score_subsample
             .as_ref()
             .map(|s| s.rows.as_ref().as_slice())

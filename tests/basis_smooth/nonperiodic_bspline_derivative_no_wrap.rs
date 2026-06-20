@@ -78,10 +78,7 @@ fn nonperiodic_bspline_first_derivative_matches_central_difference() {
             }
         }
     }
-    assert!(
-        any_nonzero,
-        "degenerate: open-knot first derivative is identically zero"
-    );
+    assert!(any_nonzero, "degenerate: open-knot first derivative is identically zero");
     assert!(
         max_abs < 1e-5,
         "open-knot B-spline 1st derivative disagrees with central diff of value \

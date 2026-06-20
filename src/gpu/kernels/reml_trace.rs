@@ -2067,10 +2067,7 @@ mod tests {
 
         let sd_dense = dense.stderrs[0];
         let sd_hvp = hvp.stderrs[0];
-        assert!(
-            sd_dense > 0.0,
-            "dense SD should be positive, got {sd_dense}"
-        );
+        assert!(sd_dense > 0.0, "dense SD should be positive, got {sd_dense}");
         let rel = (sd_hvp - sd_dense).abs() / sd_dense;
         assert!(
             rel <= 1e-3,

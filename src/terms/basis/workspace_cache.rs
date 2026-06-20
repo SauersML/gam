@@ -34,7 +34,8 @@ pub(crate) struct OwnedDataCacheKey {
 #[derive(Debug)]
 pub(crate) struct BasisCacheContext {
     pub(crate) constraint_nullspace: ConstraintNullspaceCache,
-    pub(crate) owned_data: crate::resource::ByteLruCache<OwnedDataCacheKey, Arc<Array2<f64>>>,
+    pub(crate) owned_data:
+        crate::resource::ByteLruCache<OwnedDataCacheKey, Arc<Array2<f64>>>,
 }
 
 impl BasisCacheContext {

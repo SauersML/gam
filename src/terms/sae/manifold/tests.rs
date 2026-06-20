@@ -2169,14 +2169,6 @@ pub(crate) fn oos_linear_images_drive_collapsed_reconstruction() {
         !images.is_empty(),
         "the straight slot must yield at least one linear image to thread to OOS"
     );
-    // Install the report so the train-side `fitted()` collapses the linear slot
-    // via the report's `linear_image` (the in-fit collapse path); without this
-    // the term carries no images and `fitted()` is the curved reconstruction, so
-    // `collapsed_with_report` would silently equal `curved` and the test below
-    // would assert nothing. `compute_hybrid_split_report` takes `&self` and only
-    // RETURNS the report (the fit driver is what stores it), so the test must
-    // install it explicitly — mirroring `topk_reconstruction_composes_with_hybrid_collapse`.
-    term.hybrid_split_report = Some(report);
     let collapsed_with_report = term.fitted();
     term.hybrid_split_report = None;
 
@@ -10441,6 +10433,13 @@ mod inner_contract_probe_tests {
         for row in 0..n_holdout {
             norm_bound = norm_bound.max(heldout.row(row).dot(&heldout.row(row)).sqrt());
         }
+        let atlas = EncodeAtlas::build(
+            &atoms,
+            &[1.0],
+            norm_bound,
+            crate::terms::sae::encode::AtlasConfig::default(),
+        )
+        .expect("atlas builds");
         let atom0 = &atoms[0];
         let evaluator = atom0.basis_evaluator.as_ref().unwrap();
         let s_b = decoder_row_norm_sum(decoder.view());

@@ -5427,10 +5427,45 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         r_anchored -= &r_interp_a;
         let rhs_anchored_res = vec_rel(&r_anchored, &r_exact);
 
+        // PENALTY attribution: with Gram AND RHS machine-exact, a non-zero β̂ floor
+        // must come from the only remaining input — the penalty S(ψ) VALUES (the
+        // reduced-basis split is value-dependent). Compare S_staged (n-free re-key,
+        // canonical_penalties_at, the object the forced/production skip installs)
+        // to S_streamed (realized design penalties, the slow-path truth) as dense
+        // p×p sums of the block-local matrices placed at their col_range.
+        let p_cols = stream_cache.design().design.ncols();
+        let to_dense_canonical =
+            |pens: &[crate::construction::CanonicalPenalty]| -> Array2<f64> {
+                let mut s = Array2::<f64>::zeros((p_cols, p_cols));
+                for cp in pens {
+                    let r = &cp.col_range;
+                    s.slice_mut(ndarray::s![r.start..r.end, r.start..r.end])
+                        .scaled_add(1.0, &cp.local);
+                }
+                s
+            };
+        let (staged_pens, _) = tensor_cache
+            .canonical_penalties_at(&theta_at(psi))
+            .expect("staged canonical penalties");
+        let s_staged = to_dense_canonical(&staged_pens);
+        // stream_cache was just realized at ψ by beta_streamed → its design carries
+        // the realized S(ψ) blocks.
+        let mut s_streamed = Array2::<f64>::zeros((p_cols, p_cols));
+        for bp in &stream_cache.design().penalties {
+            let r = &bp.col_range;
+            s_streamed
+                .slice_mut(ndarray::s![r.start..r.end, r.start..r.end])
+                .scaled_add(1.0, &bp.local);
+        }
+        let pen_res = frob_rel(&s_staged, &s_streamed);
+        let pen_blocks_staged = staged_pens.len();
+        let pen_blocks_streamed = stream_cache.design().penalties.len();
+
         eprintln!(
             "[DIAG1033-FORCE] frac={f:+.5} psi={psi:.5} covers_skip={gate} forced_β̂rel={rel:.3e} \
              gram_interp_res={interp_res:.3e} gram_anchored_res={anchored_res:.3e} \
-             rhs_interp_res={rhs_interp_res:.3e} rhs_anchored_res={rhs_anchored_res:.3e} {}",
+             rhs_interp_res={rhs_interp_res:.3e} rhs_anchored_res={rhs_anchored_res:.3e} \
+             pen_res={pen_res:.3e} pen_blocks={pen_blocks_staged}/{pen_blocks_streamed} {}",
             if rel <= 1e-6 { "SOUND(≤1e-6)" } else { "UNSOUND(>1e-6)" }
         );
         // Re-pin at ψ_A after each forced trial so every measurement is a move

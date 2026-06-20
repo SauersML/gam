@@ -246,19 +246,18 @@ fn irrelevant_dgp(n: usize, seed: u64) -> (Array2<f64>, Array1<f64>) {
 /// double penalty must never EXCEED its single-penalty d.o.f.:
 /// `mean(EDF_on) ≤ mean(EDF_off)`.
 ///
-/// The bug: a `Normal(0, sd=3)` ρ-prior caps each log-λ. For a double-penalty
-/// term that cap pulls BOTH the wiggliness and null-space log-λ back toward 0,
-/// so REML settles at a point that leaves the term under-shrunk — its EDF lands
-/// ABOVE the single-penalty EDF (the #1266 inflation, ~4.6 vs ~2.0 on this DGP).
-/// The fix lifts the cap off Gaussian-identity B-spline double-penalty selection
-/// coordinates (flat prior, matching mgcv `select=TRUE`), restoring the contract.
+/// The bug: the default `Normal(0, sd=3)` ρ-prior (the prior the gamfit formula
+/// / orchestration path resolves to via `canonical_standard_fit_options`) caps
+/// each log-λ. For a double-penalty term that cap pulls BOTH the wiggliness and
+/// null-space log-λ back toward 0, so REML settles at a point that leaves the
+/// term under-shrunk — its EDF lands ABOVE the single-penalty EDF (the #1266
+/// inflation, ~4.6 vs ~2.0 on this DGP). The fix lifts the cap off
+/// Gaussian-identity B-spline double-penalty selection coordinates (flat prior,
+/// matching mgcv `select=TRUE`), restoring the contract.
 ///
-/// NOTE (gam#1271): the formula/orchestration default ρ-prior is now `Flat`, so
-/// in production this contract holds without the relaxation firing at all. This
-/// gate still pins the EXPLICIT-`Normal(0, sd=3)`-base relaxation path
-/// (`relax_double_penalty_rho_prior`) — the safety net for a user who opts into
-/// a capping prior while running double-penalty selection — by constructing that
-/// prior directly, so a flat-prior fit could not vacuously pass it.
+/// Runs the same `Normal(0, sd=3)` prior the formula path uses (NOT the flat
+/// prior of the localisation probe above), so it actually exercises the
+/// regression — a flat-prior fit would pass even without the fix.
 #[test]
 fn double_penalty_does_not_inflate_unsupported_edf_1266() {
     let n = 800usize;

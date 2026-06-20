@@ -40,24 +40,14 @@ fn clamped_knots(degree: usize, internal: &[f64], span: f64) -> Array1<f64> {
     Array1::from(k)
 }
 
-fn dense_derivative(
-    t: &Array1<f64>,
-    knots: &Array1<f64>,
-    degree: usize,
-    order: usize,
-) -> Array2<f64> {
+fn dense_derivative(t: &Array1<f64>, knots: &Array1<f64>, degree: usize, order: usize) -> Array2<f64> {
     let options = if order == 1 {
         BasisOptions::first_derivative()
     } else {
         BasisOptions::second_derivative()
     };
-    let (b, _) = create_basis::<Dense>(
-        t.view(),
-        KnotSource::Provided(knots.view()),
-        degree,
-        options,
-    )
-    .expect("dense derivative");
+    let (b, _) = create_basis::<Dense>(t.view(), KnotSource::Provided(knots.view()), degree, options)
+        .expect("dense derivative");
     (*b).clone()
 }
 
@@ -72,13 +62,9 @@ fn sparse_derivative_dense(
     } else {
         BasisOptions::second_derivative()
     };
-    let (sparse, _) = create_basis::<Sparse>(
-        t.view(),
-        KnotSource::Provided(knots.view()),
-        degree,
-        options,
-    )
-    .expect("sparse derivative");
+    let (sparse, _) =
+        create_basis::<Sparse>(t.view(), KnotSource::Provided(knots.view()), degree, options)
+            .expect("sparse derivative");
     let mut dense = Array2::<f64>::zeros((sparse.nrows(), sparse.ncols()));
     let (symbolic, values) = sparse.parts();
     let col_ptr = symbolic.col_ptr();
@@ -104,9 +90,7 @@ fn sparse_open_knot_derivative_matches_dense_including_exterior() {
         let right = knots[num_basis];
 
         // Points across the FULL knot range: interior + both exterior spans.
-        let t = Array1::from_iter(
-            (0..97).map(|i| knots[0] + (knots[knots.len() - 1] - knots[0]) * i as f64 / 96.0),
-        );
+        let t = Array1::from_iter((0..97).map(|i| knots[0] + (knots[knots.len() - 1] - knots[0]) * i as f64 / 96.0));
 
         for order in [1usize, 2] {
             let dense = dense_derivative(&t, &knots, degree, order);
@@ -124,17 +108,13 @@ fn sparse_open_knot_derivative_matches_dense_including_exterior() {
                     // Both paths must be exactly zero in the exterior.
                     for j in 0..sparse.ncols() {
                         assert_eq!(
-                            sparse[[i, j]],
-                            0.0,
+                            sparse[[i, j]], 0.0,
                             "degree={degree} order={order}: sparse derivative nonzero at exterior x={x}, col {j}"
                         );
                     }
                 }
             }
-            assert!(
-                exterior_checked,
-                "degree={degree}: no exterior sample points"
-            );
+            assert!(exterior_checked, "degree={degree}: no exterior sample points");
             assert!(
                 max_diff < 1e-12,
                 "degree={degree} order={order}: sparse and dense open-knot derivative disagree by {max_diff}"
@@ -157,8 +137,7 @@ fn scalar_open_knot_derivative_zero_exterior_fd_interior() {
     let value_col = |x: f64, i: usize| -> f64 {
         let mut out = vec![0.0; num_basis];
         let mut scratch = SplineScratch::new(degree);
-        evaluate_bspline_basis_scalar(x, knots.view(), degree, &mut out, &mut scratch)
-            .expect("value");
+        evaluate_bspline_basis_scalar(x, knots.view(), degree, &mut out, &mut scratch).expect("value");
         out[i]
     };
 
@@ -166,26 +145,14 @@ fn scalar_open_knot_derivative_zero_exterior_fd_interior() {
     let mut d2 = vec![0.0; num_basis];
 
     // Exterior: every order is exactly zero.
-    for &x in &[
-        knots[0],
-        knots[1],
-        0.5 * (knots[0] + left),
-        right + 0.3,
-        knots[knots.len() - 1],
-    ] {
+    for &x in &[knots[0], knots[1], 0.5 * (knots[0] + left), right + 0.3, knots[knots.len() - 1]] {
         if x >= left && x <= right {
             continue;
         }
         evaluate_bspline_derivative_scalar(x, knots.view(), degree, &mut d1).expect("d1");
         evaluate_bsplinesecond_derivative_scalar(x, knots.view(), degree, &mut d2).expect("d2");
-        assert!(
-            d1.iter().all(|&v| v == 0.0),
-            "scalar d1 nonzero at exterior x={x}: {d1:?}"
-        );
-        assert!(
-            d2.iter().all(|&v| v == 0.0),
-            "scalar d2 nonzero at exterior x={x}: {d2:?}"
-        );
+        assert!(d1.iter().all(|&v| v == 0.0), "scalar d1 nonzero at exterior x={x}: {d1:?}");
+        assert!(d2.iter().all(|&v| v == 0.0), "scalar d2 nonzero at exterior x={x}: {d2:?}");
     }
 
     // Interior: first derivative matches the value's central difference.
@@ -227,8 +194,7 @@ fn clamped_knot_exterior_derivative_is_boundary_slope_not_zero() {
 
     // Right boundary slope: derivative just inside vs. an exterior point both
     // resolve to the boundary slope under linear extension.
-    evaluate_bspline_derivative_scalar(right, knots.view(), degree, &mut at_boundary)
-        .expect("d@right");
+    evaluate_bspline_derivative_scalar(right, knots.view(), degree, &mut at_boundary).expect("d@right");
     evaluate_bspline_derivative_scalar(right + 0.7, knots.view(), degree, &mut at_exterior)
         .expect("d@exterior");
 
@@ -248,8 +214,7 @@ fn clamped_knot_exterior_derivative_is_boundary_slope_not_zero() {
     }
 
     // Same on the left side.
-    evaluate_bspline_derivative_scalar(left, knots.view(), degree, &mut at_boundary)
-        .expect("d@left");
+    evaluate_bspline_derivative_scalar(left, knots.view(), degree, &mut at_boundary).expect("d@left");
     evaluate_bspline_derivative_scalar(left - 0.7, knots.view(), degree, &mut at_exterior)
         .expect("d@left-exterior");
     for i in 0..num_basis {

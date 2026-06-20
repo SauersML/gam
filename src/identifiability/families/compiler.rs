@@ -2807,9 +2807,8 @@ mod tests {
     fn compile_from_raw_grams_zero_width_first_block_is_identifiable() {
         let n = 12;
         let empty = Array2::<f64>::zeros((n, 0));
-        let b = Array2::from_shape_fn((n, 2), |(i, j)| {
-            ((i + 1) as f64 * (j + 1) as f64 * 0.23).cos()
-        });
+        let b =
+            Array2::from_shape_fn((n, 2), |(i, j)| ((i + 1) as f64 * (j + 1) as f64 * 0.23).cos());
         let w = Array1::ones(n);
         let (gram_h, gram_struct, raw_ranges) = scalar_grams_two_block(&empty, &b, &w);
         let map = compile_from_raw_grams(

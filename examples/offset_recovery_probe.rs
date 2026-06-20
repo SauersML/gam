@@ -24,9 +24,7 @@ struct Lcg {
 }
 impl Lcg {
     fn new(seed: u64) -> Self {
-        Self {
-            state: seed.wrapping_add(0x9E3779B97F4A7C15),
-        }
+        Self { state: seed.wrapping_add(0x9E3779B97F4A7C15) }
     }
     fn next_u32(&mut self) -> u32 {
         self.state = self
@@ -107,10 +105,7 @@ fn main() {
         y_no_offset.push(rng2.poisson(mu_ref));
     }
 
-    let pcfg = FitConfig {
-        family: Some("poisson".to_string()),
-        ..FitConfig::default()
-    };
+    let pcfg = FitConfig { family: Some("poisson".to_string()), ..FitConfig::default() };
 
     // (B) reference: no offset, E==1 data
     eprintln!("== (B) reference no-offset (E==1) ==");

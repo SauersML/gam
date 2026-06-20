@@ -25,12 +25,10 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::geometry::constant_curvature::ConstantCurvature;
 use crate::geometry::manifold::{
-    GEOMETRY_EPS, RiemannianManifold, flatten, from_flat, jacobi_symmetric, spectral_map_symmetric,
-    sym,
+    flatten, from_flat, jacobi_symmetric, spectral_map_symmetric, sym, RiemannianManifold,
+    GEOMETRY_EPS,
 };
-use crate::geometry::{
-    GeometryError, GeometryResult, GrassmannManifold, SpdManifold, StiefelManifold,
-};
+use crate::geometry::{GeometryError, GeometryResult, GrassmannManifold, SpdManifold, StiefelManifold};
 
 /// Split a parenthesised `key=value, key=value` parameter list into trimmed,
 /// lower-cased `(key, value)` pairs. An empty list is valid (`spd()`).
@@ -1715,8 +1713,8 @@ mod tests {
             ),
         ];
         for (manifold, values) in cases {
-            let (resid, rel) =
-                response_projection_residual(manifold, values.view()).expect("projection residual");
+            let (resid, rel) = response_projection_residual(manifold, values.view())
+                .expect("projection residual");
             for row in 0..values.nrows() {
                 assert!(
                     resid[row] < 1e-9,
@@ -1799,11 +1797,7 @@ mod tests {
         let (resid_on, _) = response_projection_residual(manifold, on.view()).expect("on");
         let (resid_off, _) = response_projection_residual(manifold, off.view()).expect("off");
 
-        assert!(
-            resid_on[0] < 1e-9,
-            "on-manifold should be ~0, got {}",
-            resid_on[0]
-        );
+        assert!(resid_on[0] < 1e-9, "on-manifold should be ~0, got {}", resid_on[0]);
         assert!(
             resid_off[0] > 1e-2 && resid_off[0] > resid_on[0],
             "off-manifold distance ({}) must clearly exceed on-manifold ({})",
@@ -1821,22 +1815,15 @@ mod tests {
         // An orthonormal frame [e1 | e2] is its own nearest point ⇒ residual 0.
         let on = array![[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]];
         let (resid_on, _) = response_projection_residual(manifold, on.view()).expect("on");
-        assert!(
-            resid_on[0] < 1e-9,
-            "orthonormal frame should be ~0, got {}",
-            resid_on[0]
-        );
+        assert!(resid_on[0] < 1e-9, "orthonormal frame should be ~0, got {}", resid_on[0]);
 
         // Scale the first column by 2: Y = [2·e1 | e2]. YᵀY = diag(4,1) ⇒
         // σ = (2,1), distance √((2−1)²+(1−1)²) = 1, relative = 1/‖Y‖_F = 1/√5.
         let off = array![[2.0, 0.0, 0.0, 1.0, 0.0, 0.0]];
-        let (resid_off, rel_off) = response_projection_residual(manifold, off.view()).expect("off");
+        let (resid_off, rel_off) =
+            response_projection_residual(manifold, off.view()).expect("off");
         assert!((resid_off[0] - 1.0).abs() < 1e-9, "got {}", resid_off[0]);
-        assert!(
-            (rel_off[0] - 1.0 / 5.0_f64.sqrt()).abs() < 1e-9,
-            "got {}",
-            rel_off[0]
-        );
+        assert!((rel_off[0] - 1.0 / 5.0_f64.sqrt()).abs() < 1e-9, "got {}", rel_off[0]);
 
         // Grassmann(2,4) gives the identical score for the same frame data.
         let g = ResponseManifold::Grassmann { k: 2, n: 4 };
@@ -1858,12 +1845,7 @@ mod tests {
         let sig1 = (1.0 + s5) / 2.0;
         let sig2 = (s5 - 1.0) / 2.0;
         let expect = ((sig1 - 1.0).powi(2) + (sig2 - 1.0).powi(2)).sqrt();
-        assert!(
-            (resid[0] - expect).abs() < 1e-9,
-            "got {} want {}",
-            resid[0],
-            expect
-        );
+        assert!((resid[0] - expect).abs() < 1e-9, "got {} want {}", resid[0], expect);
     }
 
     #[test]
@@ -1877,12 +1859,7 @@ mod tests {
         let (resid, _) =
             response_projection_residual(manifold, degenerate.view()).expect("rank-deficient ok");
         let expect = (4.0 - 2.0 * 2.0_f64.sqrt()).sqrt(); // ≈ 1.0823922
-        assert!(
-            (resid[0] - expect).abs() < 1e-9,
-            "got {} want {}",
-            resid[0],
-            expect
-        );
+        assert!((resid[0] - expect).abs() < 1e-9, "got {} want {}", resid[0], expect);
 
         // Minimal case: zero vector on the sphere (Gr(1,3)). Every unit vector is
         // a nearest point and the distance is exactly 1 — also must not error.
@@ -1901,12 +1878,7 @@ mod tests {
         let tiny = array![[1e-7, 0.0, 0.0, 1e-7, 0.0, 0.0]];
         let (resid, _) = response_projection_residual(manifold, tiny.view()).expect("tiny ok");
         let expect = 2.0_f64.sqrt() * (1.0 - 1e-7);
-        assert!(
-            (resid[0] - expect).abs() < 1e-9,
-            "got {} want {}",
-            resid[0],
-            expect
-        );
+        assert!((resid[0] - expect).abs() < 1e-9, "got {} want {}", resid[0], expect);
     }
 
     #[test]
@@ -1923,11 +1895,7 @@ mod tests {
         // (even though it is not strictly positive definite).
         let singular = array![[1.0, 0.0, 0.0, 0.0]];
         let (sres, _) = response_projection_residual(spd, singular.view()).expect("singular psd");
-        assert!(
-            sres[0] < 1e-12,
-            "singular PSD should be ~0, got {}",
-            sres[0]
-        );
+        assert!(sres[0] < 1e-12, "singular PSD should be ~0, got {}", sres[0]);
     }
 
     #[test]
@@ -1941,11 +1909,7 @@ mod tests {
         };
         let shell = array![[0.999999, 0.0]]; // inside R = 1, outside R_safe ≈ 0.99999
         let (resid, _) = response_projection_residual(p, shell.view()).expect("shell");
-        assert!(
-            resid[0] < 1e-12,
-            "interior point must be 0, got {}",
-            resid[0]
-        );
+        assert!(resid[0] < 1e-12, "interior point must be 0, got {}", resid[0]);
     }
 
     #[test]
@@ -1966,8 +1930,8 @@ mod tests {
             dim: 2,
             kappa: -1.0,
         };
-        let (nres, _) = response_projection_residual(neg, array![[3.0, 0.0], [0.2, 0.1]].view())
-            .expect("kappa<0");
+        let (nres, _) =
+            response_projection_residual(neg, array![[3.0, 0.0], [0.2, 0.1]].view()).expect("kappa<0");
         assert!((nres[0] - 2.0).abs() < 1e-12, "got {}", nres[0]);
         assert!(nres[1] < 1e-12, "interior row must be 0, got {}", nres[1]);
     }

@@ -446,8 +446,7 @@ fn kappa_micro_2point_n_independence() {
     assert!(
         resets[1] <= resets[0].saturating_add(1),
         "[kappa-micro] slow_path_resets climbed {}→{} — n-free skip not firing",
-        resets[0],
-        resets[1]
+        resets[0], resets[1]
     );
     assert!(
         ratio <= 1.6,

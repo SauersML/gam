@@ -74,6 +74,8 @@ mod bug_hunt_double_penalty_inflates_edf_instead_of_shrinking;
 mod bug_hunt_double_penalty_shrinks_irrelevant_covariate_1266;
 #[path = "regressions/bug_hunt_estimate_external_family_and_links.rs"]
 mod bug_hunt_estimate_external_family_and_links;
+#[path = "regressions/bug_hunt_summary_penalty_cursor_skips_unpenalized_re.rs"]
+mod bug_hunt_summary_penalty_cursor_skips_unpenalized_re;
 #[path = "regressions/bug_hunt_evidence_gaussian_reml_topology.rs"]
 mod bug_hunt_evidence_gaussian_reml_topology;
 #[path = "regressions/bug_hunt_factor_smooth_degree_shrink_predict_replay.rs"]

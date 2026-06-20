@@ -1986,6 +1986,22 @@ impl SaeManifoldTerm {
             if ev >= SAE_DICTIONARY_COLLAPSE_EV_FLOOR {
                 return Ok(());
             }
+            // #1026 keep-best multi-start: the current (pre-reseed) state is a
+            // candidate basin. A blind reseed can replace it with a STRICTLY worse
+            // basin (real OLMo K=4: the seed explains EV 0.127 but successive
+            // reseeds fall to −1.01), so before perturbing, retain this state as
+            // the incumbent whenever its EV beats the best seen this optimization.
+            // On budget exhaustion we restore the incumbent rather than leaving the
+            // last (often catastrophic) reseed — a multi-start must never return a
+            // basin worse than one it already visited.
+            if ev.is_finite()
+                && self
+                    .best_cocollapse_incumbent
+                    .as_ref()
+                    .is_none_or(|(best_ev, _)| ev > *best_ev)
+            {
+                self.best_cocollapse_incumbent = Some((ev, self.snapshot_mutable_state()));
+            }
             // Co-collapsed: every decoder is ≈0 TOGETHER. Reseed ALL atoms onto
             // DISTINCT residual PCs — keeping no "anchor", because in a true
             // co-collapse the "strongest" atom is itself degenerate, so there is no
@@ -2016,6 +2032,22 @@ impl SaeManifoldTerm {
             // OLMo EV ~0.22 / ~0.40) and can only ADD basin-escape attempts to an
             // already-failed dictionary.
             if self.dictionary_cocollapse_reseeds >= SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET {
+                // Multi-start budget spent. #1026: restore the BEST basin seen
+                // across all reseeds (including the original seed) before giving up
+                // — the current state is the last reseed, which the keep-best
+                // ledger may show was strictly worse than an earlier attempt. This
+                // converts the catastrophic-last-reseed outcome (EV −1.01) back to
+                // the best basin found (EV 0.127), so the evidence-gated structure
+                // search ranks the dictionary's real best, not its worst attempt.
+                if let Some((best_ev, best_state)) = self.best_cocollapse_incumbent.take() {
+                    if best_ev > ev {
+                        self.restore_mutable_state(&best_state);
+                        log::warn!(
+                            "SaeManifoldTerm: dictionary co-collapse multi-start budget spent; \
+                             restoring best basin (EV={best_ev:.4}) over last reseed (EV={ev:.4})"
+                        );
+                    }
+                }
                 // Multi-start budget spent: record a terminal event for each atom
                 // once and leave the keep-or-kill verdict to the evidence-gated
                 // structure search, exactly as the per-atom arm does on its budget.

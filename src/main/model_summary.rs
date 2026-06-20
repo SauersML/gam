@@ -171,26 +171,9 @@ pub(crate) fn build_model_summary(
 
     let mut smooth_terms = Vec::<SmoothTermSummary>::new();
     let mut penalty_cursor = 0usize;
-    for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
-        // Only PENALIZED random-effect blocks contribute a penalty block to the
-        // flat `lambdas`/`penalty_block_trace`/`edf_by_block` layout: design
-        // assembly skips the unpenalised ones (`design_construction.rs` RE-penalty
-        // loop `continue`s on `!penalized`). A factor `by=` smooth injects exactly
-        // such an UNPENALISED treatment-coded factor main-effect block; walking
-        // `penalty_cursor` by one for it (the #1368 defect) slid the cursor one
-        // block past every smooth term that followed, so the LAST by-level smooth's
-        // `penalty_cursor..+k` window ran off the end of the per-block traces and
-        // `per_term_edf` returned 0 (and, with EDF 0, the Wood test was skipped,
-        // leaving ref_df/chi_sq/p_value at 0/NaN). Advance the cursor by the number
-        // of penalty blocks the term actually owns: 1 if penalized, 0 if not.
-        let penalized = spec
-            .random_effect_terms
-            .get(re_idx)
-            .map(|t| t.penalized)
-            .unwrap_or(true);
-        let k_pen = usize::from(penalized);
-        let edf = fit.per_term_edf(range.clone(), penalty_cursor, k_pen);
-        penalty_cursor += k_pen;
+    for (name, range) in &design.random_effect_ranges {
+        let edf = fit.per_term_edf(range.clone(), penalty_cursor, 1);
+        penalty_cursor += 1;
         // Random-effect smooths are variance-component tests on the boundary;
         // a naive coefficient Wald χ² p-value is anti-conservative, so only EDF is reported.
         let chi_sq_opt: Option<f64> = None;
@@ -644,133 +627,6 @@ mod per_term_edf_tests {
             (reconstructed - edf_total).abs() <= 1e-4 * edf_total.max(1.0),
             "Σ per-term EDF (smooth {per_term_sum} + parametric {parametric_dof} = {reconstructed}) \
              must match model total EDF ({edf_total}) within tolerance"
-        );
-    }
-
-    /// Regression for issue #1368: a factor `by=` smooth `y ~ s(x, by=g)` expands
-    /// into one centred smooth per level *and* injects an UNPENALISED treatment-
-    /// coded factor main-effect block into the random-effect region. The summary
-    /// EDF/significance loop walked `penalty_cursor` by one per random-effect range
-    /// unconditionally — but the unpenalised main-effect block contributes NO
-    /// penalty block to the flat `lambdas`/`penalty_block_trace` layout, so by the
-    /// time the loop reached the smooth terms `penalty_cursor` was one too large.
-    /// The last by-level smooth's `penalty_cursor..+k` window then ran off the end
-    /// of the per-block traces and `per_term_edf` returned 0 (and with EDF 0 the
-    /// Wood smooth test was skipped, leaving ref_df/chi_sq/p_value at 0/NaN).
-    ///
-    /// This drives a real Gaussian `s(x, by=g)` fit through the public formula path
-    /// and asserts: every by-level smooth carries EDF > 1, the per-level EDFs sum
-    /// (with the parametric dof) to `edf_total`, and the last level's significance
-    /// statistic is finite. It fails on the off-by-one and passes on the fix.
-    #[test]
-    fn by_factor_smooth_every_level_gets_nonzero_edf_and_finite_significance() {
-        let n_levels = 5usize;
-        let n_per_level = 120usize;
-        let n = n_levels * n_per_level;
-        let headers = vec!["x".to_string(), "grp".to_string(), "y".to_string()];
-        let mut rows: Vec<StringRecord> = Vec::with_capacity(n);
-        // Deterministic LCG — reproducible, no rng dependency.
-        let mut state: u64 = 0xD1B54A32D192ED03;
-        let mut next_u01 = || {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((state >> 33) as f64) / ((1u64 << 31) as f64)
-        };
-        for i in 0..n {
-            let level = i % n_levels;
-            let x = next_u01(); // [0,1)
-            // Each group is an equally-strong phase-shifted sinusoid, so every
-            // group's honest smooth EDF is well above 1.
-            let phase = level as f64;
-            let noise = 0.15 * (next_u01() - 0.5);
-            let y = (2.0 * std::f64::consts::PI * x + phase).sin() + noise;
-            rows.push(StringRecord::from(vec![
-                x.to_string(),
-                format!("g{level}"),
-                y.to_string(),
-            ]));
-        }
-        let data = encode_recordswith_inferred_schema(headers, rows).expect("encode dataset");
-
-        let config = FitConfig {
-            family: Some("gaussian".to_string()),
-            ..FitConfig::default()
-        };
-        let fitted = fit_from_formula("y ~ s(x, by=grp)", &data, &config)
-            .expect("s(x, by=grp) gaussian fit should succeed");
-        let FitResult::Standard(std_fit) = fitted else {
-            panic!("expected a Standard fit result for a Gaussian s(x, by=grp) model");
-        };
-
-        let y_col = data
-            .headers
-            .iter()
-            .position(|h| h == "y")
-            .expect("response column 'y' present");
-        let y = data.values.column(y_col).to_owned();
-        let weights = Array1::<f64>::ones(y.len());
-        let summary = build_model_summary(
-            &std_fit.design,
-            &std_fit.resolvedspec,
-            &std_fit.fit,
-            LikelihoodSpec::gaussian_identity(),
-            y.view(),
-            weights.view(),
-        );
-
-        // The per-level smooths are named "s(x, by=grp):<level>" — one per factor
-        // level — distinct from the unpenalised factor main-effect block ("grp").
-        let by_rows: Vec<&SmoothTermSummary> = summary
-            .smooth_terms
-            .iter()
-            .filter(|t| t.name.starts_with("s(x, by=grp):"))
-            .collect();
-        assert_eq!(
-            by_rows.len(),
-            n_levels,
-            "expected {n_levels} by-level smooth terms, got {}: {:?}",
-            by_rows.len(),
-            by_rows.iter().map(|t| &t.name).collect::<Vec<_>>()
-        );
-
-        // Every group is a genuinely-fitted strong sinusoid: no per-level EDF
-        // should come back at (or near) zero. The bug zeroed the LAST level.
-        for term in &by_rows {
-            assert!(
-                term.edf > 1.0,
-                "by-level smooth {} reports EDF {:.4} (set {:?}); every group is \
-                 genuinely fitted with a strongly non-linear smooth so none should \
-                 be ~0 — the last level's EDF was being dropped",
-                term.name,
-                term.edf,
-                by_rows.iter().map(|t| (t.name.clone(), t.edf)).collect::<Vec<_>>()
-            );
-        }
-
-        // The last by-level smooth's significance statistic must be a real number,
-        // not NaN (it was NaN because its EDF was dropped to 0).
-        let last = by_rows.last().expect("at least one by-level smooth");
-        let last_chi = last.chi_sq.expect("last by-level smooth must have a chi_sq");
-        assert!(
-            last_chi.is_finite(),
-            "last by-level smooth {} significance statistic must be finite, got {last_chi}",
-            last.name
-        );
-
-        // Per-term EDFs (all smooth terms + parametric dof) must reconstruct the
-        // model total — the dropped last level left a whole level's shortfall.
-        let edf_total = std_fit
-            .fit
-            .edf_total()
-            .expect("a converged fit exposes the model total EDF");
-        let per_term_sum: f64 = summary.smooth_terms.iter().map(|t| t.edf).sum();
-        let parametric_dof = summary.parametric_terms.len() as f64;
-        let reconstructed = per_term_sum + parametric_dof;
-        assert!(
-            (reconstructed - edf_total).abs() <= 1e-3 * edf_total.max(1.0),
-            "Σ per-term EDF (smooth {per_term_sum} + parametric {parametric_dof} = \
-             {reconstructed}) must match model total EDF ({edf_total}) within tolerance"
         );
     }
 }

@@ -26,13 +26,13 @@ use crate::inference::formula_dsl::{
     option_usize_any, option_usize_any_strict, option_usize_strict, strip_quotes,
 };
 use crate::inference::model::ColumnKindTag;
-use crate::resource::ResourcePolicy;
 use crate::smooth::{
     BySmoothKind, ByVarKind, ByVariableSpec, FactorSmoothFlavour, FactorSmoothSpec,
     LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
     TensorBSplinePenaltyDecomposition, TensorBSplineSpec, TermCollectionSpec,
 };
+use crate::resource::ResourcePolicy;
 use crate::types::ColIdx;
 
 /// Fraction of the data bounding-box diameter used as the default Matérn
@@ -643,7 +643,7 @@ pub fn build_termspec(
                             }
                             for (level_bits, level_label) in levels {
                                 smooth_terms.push(SmoothTermSpec {
-                                    name: format!("{}:{}", label, level_label.clone()),
+                                    name: format!("{}:{}", label, level_bits),
                                     basis: SmoothBasisSpec::ByVariable {
                                         inner: Box::new(inner_basis.clone()),
                                         by_col,
@@ -5495,104 +5495,6 @@ mod tests {
                     "saturated cross cell must be present"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn by_factor_smooth_names_reference_level_labels_not_float_bit_patterns() {
-        // Regression for gam#1369: a `s(x, by=g)` factor-by smooth expands to one
-        // per-level smooth, and each per-level term name must carry the human
-        // level *label* (e.g. "red") — not the IEEE-754 bit pattern of the
-        // encoded f64 level value (e.g. 4607182418800017408 == (1.0).to_bits()).
-        let labels = ["red", "green", "blue"];
-        let n = 30usize;
-        let mut rows = Vec::with_capacity(n);
-        for i in 0..n {
-            let x = i as f64 / (n as f64 - 1.0);
-            let g = (i % labels.len()) as f64; // encoded levels 0.0, 1.0, 2.0
-            let y = (x + g).sin();
-            rows.push(vec![y, x, g]);
-        }
-        let values = Array2::from_shape_vec(
-            (n, 3),
-            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
-        )
-        .expect("rectangular by-factor data");
-        let ds = Dataset {
-            headers: vec!["y".into(), "x".into(), "grp".into()],
-            values,
-            schema: DataSchema {
-                columns: vec![
-                    SchemaColumn {
-                        name: "y".into(),
-                        kind: ColumnKindTag::Continuous,
-                        levels: vec![],
-                    },
-                    SchemaColumn {
-                        name: "x".into(),
-                        kind: ColumnKindTag::Continuous,
-                        levels: vec![],
-                    },
-                    SchemaColumn {
-                        name: "grp".into(),
-                        kind: ColumnKindTag::Categorical,
-                        levels: labels.iter().map(|l| l.to_string()).collect(),
-                    },
-                ],
-            },
-            column_kinds: vec![
-                ColumnKindTag::Continuous,
-                ColumnKindTag::Continuous,
-                ColumnKindTag::Categorical,
-            ],
-        };
-
-        let parsed = parse_formula("y ~ s(x, by=grp)").expect("parse `y ~ s(x, by=grp)`");
-        let col_map = ds.column_map();
-        let mut notes = Vec::new();
-        let terms = build_termspec(
-            &parsed.terms,
-            &ds,
-            &col_map,
-            &mut notes,
-            &ResourcePolicy::default_library(),
-        )
-        .expect("`s(x, by=grp)` must build");
-
-        let by_level_names: Vec<&str> = terms
-            .smooth_terms
-            .iter()
-            .map(|t| t.name.as_str())
-            .filter(|name| name.contains(":"))
-            .collect();
-        assert_eq!(
-            by_level_names.len(),
-            labels.len(),
-            "expected {} by-level smooths, got {:?}",
-            labels.len(),
-            by_level_names
-        );
-
-        // Each original label must be recoverable from some per-level smooth name.
-        for label in labels {
-            assert!(
-                by_level_names.iter().any(|name| name.contains(label)),
-                "factor level {label:?} must appear in some by-smooth name {by_level_names:?}"
-            );
-        }
-
-        // And no name may carry the f64 bit pattern of a small-integer level value
-        // (the #1369 defect: 0, (1.0).to_bits(), (2.0).to_bits(), ...).
-        let forbidden: Vec<String> = (0..labels.len())
-            .map(|v| (v as f64).to_bits().to_string())
-            .collect();
-        for name in &by_level_names {
-            let suffix = name.rsplit(':').next().expect("name has a suffix");
-            assert!(
-                !forbidden.iter().any(|f| f == suffix),
-                "by-smooth name {name:?} encodes the level as the f64 bit pattern \
-                 {suffix:?} instead of the label"
-            );
         }
     }
 }

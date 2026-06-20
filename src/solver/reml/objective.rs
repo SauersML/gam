@@ -1203,6 +1203,51 @@ impl<'a> RemlState<'a> {
                 (0.0, None)
             };
 
+        // #1271 diagnostic: dump the REML logdet internals at every dense
+        // evaluation so the rank/logdet mechanism is visible in the test log.
+        // Pure logging — no numeric behavior change. Routed through `log::info!`
+        // so it is harmless in production (default off) and captured by a
+        // test-installed logger in the #1271 probe.
+        if log::log_enabled!(log::Level::Info) {
+            use crate::faer_ndarray::FaerEigh;
+            use faer::Side;
+            let h_logdet = hessian_op.logdet();
+            let (h_above_one, h_min, h_max) = match h_for_operator.as_ref().eigh(Side::Lower) {
+                Ok((evals, _)) => {
+                    let above = evals.iter().filter(|&&s| s > 1.0).count();
+                    let mn = evals.iter().copied().fold(f64::INFINITY, f64::min);
+                    let mx = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    (above as i64, mn, mx)
+                }
+                Err(_) => (-1, f64::NAN, f64::NAN),
+            };
+            let rho_str = rho
+                .iter()
+                .map(|r| format!("{r:.4}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let lam_str = rho
+                .iter()
+                .map(|r| format!("{:.3e}", r.exp()))
+                .collect::<Vec<_>>()
+                .join(",");
+            log::info!(
+                "[#1271-diag] p={p} penalty_rank={pr} nullspace_dim={nd} \
+                 logS={ls:.6} logH={lh:.6} half_diff={hd:.6} \
+                 h_above1={ha} h_min={hmin:.3e} h_max={hmax:.3e} \
+                 rho=[{rho_str}] lambda=[{lam_str}]",
+                p = h_for_operator.ncols(),
+                pr = penalty_rank,
+                nd = nullspace_dim,
+                ls = penalty_logdet.value,
+                lh = h_logdet,
+                hd = 0.5 * (h_logdet - penalty_logdet.value),
+                ha = h_above_one,
+                hmin = h_min,
+                hmax = h_max,
+            );
+        }
+
         let ctx =
             self.build_dense_derivative_context(pirls_result, bundle, &free_basis_opt, true)?;
         Ok(self.finish_assembly(
@@ -1523,6 +1568,80 @@ impl<'a> RemlState<'a> {
             } else {
                 (0.0, None)
             };
+
+        // #1271 diagnostic (twin of the build_dense_assembly probe): this is the
+        // path the unconstrained Gaussian tp fit actually takes. Dump REML
+        // logdet internals per dense original-basis evaluation. Pure logging via
+        // log::info! (default-off in production, no numeric behavior change).
+        if log::log_enabled!(log::Level::Info) {
+            use crate::faer_ndarray::FaerEigh;
+            use faer::Side;
+            let h_logdet = hessian_op.logdet();
+            let (h_above_one, h_min, h_max, h_eig_str) = match h_total_original.eigh(Side::Lower) {
+                Ok((evals, _)) => {
+                    let above = evals.iter().filter(|&&s| s > 1.0).count();
+                    let mn = evals.iter().copied().fold(f64::INFINITY, f64::min);
+                    let mx = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let mut sorted: Vec<f64> = evals.to_vec();
+                    sorted.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                    let s = sorted
+                        .iter()
+                        .map(|v| format!("{v:.3e}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    (above as i64, mn, mx, s)
+                }
+                Err(_) => (-1, f64::NAN, f64::NAN, String::from("err")),
+            };
+            // Penalty Sλ = EᵀE eigenvalues (the SAME e_for_logdet that feeds
+            // log|S|+). Sorted spectrum is basis-invariant; compare per-mode λ·d_i
+            // against the sorted H spectrum to see which modes are data-dominated
+            // (high EDF: λ·d ≪ H eig) vs penalty-crushed (λ·d ≈ H eig).
+            let s_eig_str = {
+                let s_lambda = e_for_logdet.t().dot(e_for_logdet);
+                match s_lambda.eigh(Side::Lower) {
+                    Ok((mut evals, _)) => {
+                        let v = evals.as_slice_mut().unwrap();
+                        v.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+                        v.iter()
+                            .map(|x| format!("{x:.3e}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    }
+                    Err(_) => String::from("err"),
+                }
+            };
+            let rho_str = rho
+                .iter()
+                .map(|r| format!("{r:.4}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            let lam_str = rho
+                .iter()
+                .map(|r| format!("{:.3e}", r.exp()))
+                .collect::<Vec<_>>()
+                .join(",");
+            let rss = pirls_result.deviance;
+            let pen = pirls_result.stable_penalty_term;
+            let dp = rss + pen;
+            let pedf = pirls_result.edf;
+            log::info!(
+                "[#1271-diag] path=orig p={p} penalty_rank={pr} nullspace_dim={nd} \
+                 rss={rss:.6} pen={pen:.6} Dp={dp:.6} pirls_edf={pedf:.4} \
+                 logS={ls:.6} logH={lh:.6} half_diff={hd:.6} \
+                 h_above1={ha} h_min={hmin:.3e} h_max={hmax:.3e} \
+                 rho=[{rho_str}] lambda=[{lam_str}]\n  H_eig=[{h_eig_str}]\n  Slam_eig=[{s_eig_str}]",
+                p = beta.len(),
+                pr = penalty_rank,
+                nd = nullspace_dim,
+                ls = penalty_logdet.value,
+                lh = h_logdet,
+                hd = 0.5 * (h_logdet - penalty_logdet.value),
+                ha = h_above_one,
+                hmin = h_min,
+                hmax = h_max,
+            );
+        }
 
         let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
         Ok(self.finish_assembly(

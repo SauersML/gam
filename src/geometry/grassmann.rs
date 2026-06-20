@@ -51,6 +51,7 @@ impl GrassmannManifold {
     fn as_sphere(&self) -> Option<SphereManifold> {
         (self.k == 1).then(|| SphereManifold::new(self.n - 1))
     }
+
 }
 
 impl RiemannianManifold for GrassmannManifold {

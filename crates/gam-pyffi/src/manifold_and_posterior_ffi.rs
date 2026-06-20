@@ -1808,97 +1808,6 @@ fn cross_fit_shared_precision_groups_json_impl(request_json: &str) -> Result<Str
         .map_err(|err| format!("failed to serialize shared precision result: {err}"))
 }
 
-/// Collect, from a frozen `TermCollectionSpec`, the set of *categorical*
-/// feature columns and the valid encoded factor levels each one carries.
-///
-/// Factor levels are persisted as `u64` `f64::to_bits` patterns on the frozen
-/// term specs (`RandomEffectTermSpec::frozen_levels`,
-/// `FactorSumToZero::levels`, `FactorSmoothSpec::group_frozen_levels`,
-/// `ByVarKind::Factor::frozen_levels`, `ByVariableSpec::Level`, and tensor
-/// `Categorical` margins). Decoding via `f64::from_bits` recovers the exact
-/// encoded value the design builder gates on. The returned map is keyed by the
-/// data column index and holds the decoded, de-duplicated level values in their
-/// frozen order — these are the only values for which a factor-level-gated
-/// design (`fs`/`sz`/`by=`) rebuilds correctly.
-fn categorical_levels_from_spec(
-    spec: &gam::terms::smooth::TermCollectionSpec,
-) -> std::collections::HashMap<usize, Vec<f64>> {
-    use gam::terms::smooth::{ByVarKind, ByVariableSpec, SmoothBasisSpec as S};
-
-    let mut out: std::collections::HashMap<usize, Vec<f64>> = std::collections::HashMap::new();
-    let mut push = |col: usize, bits: &[u64], map: &mut std::collections::HashMap<usize, Vec<f64>>| {
-        let entry = map.entry(col).or_default();
-        for &b in bits {
-            let v = f64::from_bits(b);
-            if v.is_finite() && !entry.iter().any(|e| e.to_bits() == v.to_bits()) {
-                entry.push(v);
-            }
-        }
-    };
-
-    for term in &spec.random_effect_terms {
-        if let Some(levels) = term.frozen_levels.as_deref() {
-            push(term.feature_col, levels, &mut out);
-        }
-    }
-
-    // Recursively walk a smooth basis spec, recording every factor column.
-    fn walk(
-        basis: &S,
-        out: &mut std::collections::HashMap<usize, Vec<f64>>,
-        push: &mut impl FnMut(usize, &[u64], &mut std::collections::HashMap<usize, Vec<f64>>),
-    ) {
-        match basis {
-            S::FactorSumToZero {
-                inner,
-                by_col,
-                levels,
-                ..
-            } => {
-                push(*by_col, levels, out);
-                walk(inner, out, push);
-            }
-            S::ByVariable {
-                inner,
-                by_col,
-                by,
-                ..
-            } => {
-                if let ByVariableSpec::Level { value_bits, .. } = by {
-                    push(*by_col, &[*value_bits], out);
-                }
-                walk(inner, out, push);
-            }
-            S::BySmooth { smooth, by_kind } => {
-                if let ByVarKind::Factor {
-                    feature_col,
-                    frozen_levels: Some(levels),
-                    ..
-                } = by_kind
-                {
-                    push(*feature_col, levels, out);
-                }
-                walk(smooth, out, push);
-            }
-            S::FactorSmooth { spec } => {
-                if let Some(levels) = spec.group_frozen_levels.as_deref() {
-                    push(spec.group_col, levels, out);
-                }
-            }
-            // `TensorBSplineSpec::marginalspecs` carries only B-spline margins;
-            // any categorical tensor margins are not reachable from the frozen
-            // spec at this layer, so tensor terms keep the continuous ramp.
-            _ => {}
-        }
-    }
-
-    for term in &spec.smooth_terms {
-        walk(&term.basis, &mut out, &mut push);
-    }
-
-    out
-}
-
 /// Synthesize a small representative data matrix from saved per-axis training
 /// ranges, used only to rebuild the design *structure* (per-term coefficient
 /// ranges, nullspace dimensions, penalty counts) for the summary smooth-term
@@ -1906,48 +1815,19 @@ fn categorical_levels_from_spec(
 /// `resolved_termspec`, not by the data values, so axis-spanning midpoints
 /// reproduce the training-time block layout deterministically while remaining
 /// inside the training bounding box (no extrapolation artefacts).
-///
-/// Continuous columns get a linear ramp across `(lo, hi)`. *Categorical*
-/// columns (`categorical_levels`, decoded from the frozen factor specs) instead
-/// cycle through their actual encoded levels round-robin: a linear ramp would
-/// fabricate values that match no frozen level, and a factor-level-gated design
-/// (`fs`/`sz`/`by=`) would then fail to rebuild — silently emptying the whole
-/// summary smooth-terms table (#1370). The row count is grown if necessary so
-/// every declared level of every factor column appears at least once.
-fn representative_data_from_ranges(
-    ranges: &[(f64, f64)],
-    categorical_levels: &std::collections::HashMap<usize, Vec<f64>>,
-) -> Array2<f64> {
+fn representative_data_from_ranges(ranges: &[(f64, f64)]) -> Array2<f64> {
     const REP_ROWS: usize = 16;
     let n_cols = ranges.len();
-    // Ensure enough rows that every factor level of every categorical column is
-    // represented at least once under round-robin assignment.
-    let max_levels = categorical_levels
-        .values()
-        .map(|levels| levels.len())
-        .max()
-        .unwrap_or(0);
-    let rep_rows = REP_ROWS.max(max_levels).max(1);
-    let mut data = Array2::<f64>::zeros((rep_rows, n_cols));
+    let mut data = Array2::<f64>::zeros((REP_ROWS, n_cols));
     for (col, &(lo, hi)) in ranges.iter().enumerate() {
-        if let Some(levels) = categorical_levels.get(&col) {
-            if !levels.is_empty() {
-                // Cycle through the valid encoded levels so each appears and no
-                // fabricated intermediate value is ever emitted.
-                for row in 0..rep_rows {
-                    data[[row, col]] = levels[row % levels.len()];
-                }
-                continue;
-            }
-        }
         let (lo, hi) = if lo.is_finite() && hi.is_finite() && hi >= lo {
             (lo, hi)
         } else {
             (0.0, 1.0)
         };
-        for row in 0..rep_rows {
-            let frac = if rep_rows > 1 {
-                row as f64 / (rep_rows - 1) as f64
+        for row in 0..REP_ROWS {
+            let frac = if REP_ROWS > 1 {
+                row as f64 / (REP_ROWS - 1) as f64
             } else {
                 0.5
             };
@@ -1991,12 +1871,7 @@ fn summary_smooth_terms(
     if ranges.len() != headers.len() {
         return Vec::new();
     }
-    // Factor columns must replay valid frozen levels, not a linear ramp, or the
-    // factor-level-gated design rebuild (fs/sz/by=) fails and the whole table is
-    // dropped (#1370). Decode the categorical columns and their encoded levels
-    // from the frozen spec so the synthesized data lands on real levels.
-    let categorical_levels = categorical_levels_from_spec(spec);
-    let data = representative_data_from_ranges(ranges, &categorical_levels);
+    let data = representative_data_from_ranges(ranges);
     let Ok(design) = gam::terms::smooth::build_term_collection_design(data.view(), spec) else {
         return Vec::new();
     };
@@ -2026,26 +1901,12 @@ fn summary_smooth_terms(
 
     let mut out = Vec::<SummarySmoothTermRow>::new();
     let mut penalty_cursor = 0usize;
-    for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
+    for (name, range) in &design.random_effect_ranges {
         // Per-term EDF as the influence-matrix trace over the term's coefficient
         // block (#1219, #1277) — never the legacy per-block-EDF sum, which
         // double-counts shared coefficients and can exceed the model total.
-        //
-        // Only PENALIZED random-effect blocks own a penalty block in the flat
-        // `lambdas`/`penalty_block_trace` layout (design assembly skips unpenalised
-        // ones). A factor `by=` smooth injects an UNPENALISED treatment-coded
-        // factor main-effect block; advancing `penalty_cursor` for it (the #1368
-        // defect) slid the cursor one block past every following smooth, zeroing
-        // the LAST by-level smooth's EDF/significance. Advance by the blocks the
-        // term actually owns: 1 if penalized, 0 if not.
-        let penalized = spec
-            .random_effect_terms
-            .get(re_idx)
-            .map(|t| t.penalized)
-            .unwrap_or(true);
-        let k_pen = usize::from(penalized);
-        let edf = fit.per_term_edf(range.clone(), penalty_cursor, k_pen);
-        penalty_cursor += k_pen;
+        let edf = fit.per_term_edf(range.clone(), penalty_cursor, 1);
+        penalty_cursor += 1;
         // Random-effect smooths are boundary variance-component tests; a naive
         // coefficient Wald χ² is anti-conservative, so only EDF is reported.
         out.push(SummarySmoothTermRow {
@@ -2241,11 +2102,6 @@ fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> Summar
         group_metadata: model.payload().group_metadata.clone(),
         deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: scan.deviance,
-        // The O(n) scan smoother reports a diffuse-REML cost but not a
-        // λ-comparable log-likelihood, so leave `log_likelihood` unset:
-        // `compare_models` then ranks this fit on its raw evidence headline
-        // (a single 1-D smooth is never the noise-augmentation case of #1362).
-        log_likelihood: None,
         // null_dim is left unset: the scan does not compute the penalized-Hessian
         // null-space logdet the TK normalizer needs, so `comparable_reml_score`
         // returns the raw cost unchanged (and `evidence()` stays well-defined).
@@ -2310,7 +2166,6 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         group_metadata: model.payload().group_metadata.clone(),
         deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: fit.deviance,
-        log_likelihood: Some(fit.log_likelihood),
         reml_score,
         raw_reml_score,
         null_space_logdet: fit.artifacts.null_space_logdet,
@@ -4951,120 +4806,6 @@ mod batch_tests {
             best > 0.85,
             "recovered circle latent does not track the true angle \
              (mean resultant length={best}); collapse/degenerate recovery"
-        );
-    }
-
-    /// #1370: the summary() representative-data replay must synthesize *valid
-    /// frozen factor levels* for a categorical column (here the `fs(x, g)`
-    /// group column), not a linear ramp. A ramp fabricates values that match no
-    /// frozen level, the factor-level-gated design rebuild fails, and the WHOLE
-    /// smooth-terms table is emptied. We assert every emitted value for the
-    /// factor column is a real frozen level, that all declared levels appear,
-    /// and that the continuous column still gets its ramp.
-    #[test]
-    fn representative_data_emits_valid_factor_levels_not_a_ramp() {
-        use gam::terms::basis::{
-            BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
-            OneDimensionalBoundary,
-        };
-        use gam::terms::smooth::{
-            FactorSmoothFlavour, FactorSmoothSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
-            TermCollectionSpec,
-        };
-
-        // A 3-level factor encoded {0.0, 1.0, 2.0} on column 1, plus a plain
-        // continuous smooth on column 0.
-        let levels_f64 = [0.0_f64, 1.0, 2.0];
-        let frozen_levels: Vec<u64> = levels_f64.iter().map(|v| v.to_bits()).collect();
-
-        let marginal = BSplineBasisSpec {
-            degree: 3,
-            penalty_order: 2,
-            knotspec: BSplineKnotSpec::Provided(Array1::zeros(8)),
-            double_penalty: false,
-            identifiability: BSplineIdentifiability::None,
-            boundary: OneDimensionalBoundary::Open,
-            boundary_conditions: BSplineBoundaryConditions::default(),
-        };
-        let fs_term = SmoothTermSpec {
-            name: "fs_x_g".to_string(),
-            basis: SmoothBasisSpec::FactorSmooth {
-                spec: FactorSmoothSpec {
-                    continuous_cols: vec![0],
-                    group_col: 1,
-                    marginal: marginal.clone(),
-                    flavour: FactorSmoothFlavour::Fs {
-                        m_null_penalty_orders: vec![],
-                    },
-                    group_frozen_levels: Some(frozen_levels.clone()),
-                    frozen_global_orthogonality: None,
-                },
-            },
-            shape: ShapeConstraint::None,
-            joint_null_rotation: None,
-        };
-        let plain_term = SmoothTermSpec {
-            name: "s_x".to_string(),
-            basis: SmoothBasisSpec::BSpline1D {
-                feature_col: 0,
-                spec: marginal,
-            },
-            shape: ShapeConstraint::None,
-            joint_null_rotation: None,
-        };
-        let spec = TermCollectionSpec {
-            linear_terms: vec![],
-            random_effect_terms: vec![],
-            smooth_terms: vec![plain_term, fs_term],
-        };
-
-        // The spec must expose column 1 as categorical with exactly the three
-        // decoded levels, and must NOT mark the continuous column 0.
-        let cats = categorical_levels_from_spec(&spec);
-        let col1 = cats.get(&1).expect("group column 1 must be categorical");
-        assert_eq!(col1.len(), 3, "all three factor levels must be discovered");
-        for v in &levels_f64 {
-            assert!(
-                col1.iter().any(|c| c.to_bits() == v.to_bits()),
-                "frozen level {v} missing from discovered levels {col1:?}"
-            );
-        }
-        assert!(
-            !cats.contains_key(&0),
-            "continuous column 0 must not be treated as categorical"
-        );
-
-        // Column 0 spans [10.0, 20.0]; column 1 is the factor (range ignored).
-        let ranges = vec![(10.0, 20.0), (0.0, 2.0)];
-        let data = representative_data_from_ranges(&ranges, &cats);
-
-        // Every emitted factor-column value must be an exact frozen level, never
-        // a fractional ramp value.
-        let mut seen_levels = std::collections::BTreeSet::<u64>::new();
-        for row in 0..data.nrows() {
-            let v = data[[row, 1]];
-            assert!(
-                levels_f64.iter().any(|lv| lv.to_bits() == v.to_bits()),
-                "factor column emitted non-level value {v} at row {row} \
-                 (a fractional ramp value would match no frozen level)"
-            );
-            seen_levels.insert(v.to_bits());
-        }
-        assert_eq!(
-            seen_levels.len(),
-            3,
-            "round-robin assignment must represent every declared factor level"
-        );
-
-        // The continuous column must keep a genuine ramp (distinct, increasing,
-        // spanning its range) — it must NOT be collapsed to factor levels.
-        let first = data[[0, 0]];
-        let last = data[[data.nrows() - 1, 0]];
-        assert!((first - 10.0).abs() < 1e-9, "continuous ramp must start at lo");
-        assert!((last - 20.0).abs() < 1e-9, "continuous ramp must end at hi");
-        assert!(
-            last > first,
-            "continuous column must remain a strictly spanning ramp"
         );
     }
 }

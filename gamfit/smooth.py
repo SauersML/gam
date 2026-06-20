@@ -292,7 +292,7 @@ class Duchon(Smooth):
         return duchon_evaluate_numpy(self, coords)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
-        out = Smooth.to_rust_descriptor(self)
+        out = super().to_rust_descriptor()
         if self.centers is not None:
             if isinstance(self.centers, int):
                 out["n_centers"] = int(self.centers)
@@ -343,7 +343,7 @@ class BSpline(Smooth):
         return bspline_evaluate_numpy(self, coords)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
-        out = Smooth.to_rust_descriptor(self)
+        out = super().to_rust_descriptor()
         if self.knots is not None:
             if isinstance(self.knots, int):
                 out["n_knots"] = int(self.knots)
@@ -391,7 +391,7 @@ class TensorBSpline(Smooth):
         return tensor_bspline_evaluate_numpy(self, coords)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
-        out = Smooth.to_rust_descriptor(self)
+        out = super().to_rust_descriptor()
         out["marginals"] = [m.to_rust_descriptor() for m in self.marginals]
         return out
 
@@ -456,7 +456,7 @@ class Matern(Smooth):
         return matern_evaluate_numpy(self, coords)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
-        out = Smooth.to_rust_descriptor(self)
+        out = super().to_rust_descriptor()
         if self.centers is not None:
             if isinstance(self.centers, int):
                 out["n_centers"] = int(self.centers)
@@ -525,7 +525,7 @@ class MeasureJet(Smooth):
     double_penalty: bool | None = None
 
     def to_rust_descriptor(self) -> dict[str, Any]:
-        out = Smooth.to_rust_descriptor(self)
+        out = super().to_rust_descriptor()
         if self.centers is not None:
             out["centers"] = _array_to_list(self.centers)
         if self.n_centers is not None:
@@ -636,7 +636,7 @@ class Pca(Smooth):
         return pca_evaluate_numpy(self, coords)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
-        out = Smooth.to_rust_descriptor(self)
+        out = super().to_rust_descriptor()
         if self.K is not None:
             out["K"] = int(self.K)
         if self.basis is not None:
@@ -770,7 +770,7 @@ class Sphere(Smooth):
         return sphere_evaluate(self, coords)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
-        out = Smooth.to_rust_descriptor(self)
+        out = super().to_rust_descriptor()
         out["n_centers"] = int(self.n_centers)
         out["penalty_order"] = int(self.penalty_order)
         out["kernel"] = str(self.kernel)
@@ -856,7 +856,7 @@ class PeriodicSplineCurve(Smooth):
         return periodic_curve_evaluate_numpy(self, coords_np)
 
     def to_rust_descriptor(self) -> dict[str, Any]:
-        out = Smooth.to_rust_descriptor(self)
+        out = super().to_rust_descriptor()
         out["n_knots"] = int(self.n_knots)
         out["degree"] = int(self.degree)
         out["output_dim"] = int(self.output_dim)
@@ -984,7 +984,7 @@ class Categorical(Smooth):
     SUPPORTED_BACKENDS: ClassVar[frozenset[str]] = frozenset()
 
     def to_rust_descriptor(self) -> dict[str, Any]:
-        out = Smooth.to_rust_descriptor(self)
+        out = super().to_rust_descriptor()
         if self.levels is not None:
             out["levels"] = _array_to_list(self.levels)
         out["n_levels"] = int(self.n_levels)

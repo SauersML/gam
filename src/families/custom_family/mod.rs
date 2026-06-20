@@ -41,7 +41,6 @@ pub(crate) use crate::reml_contracts::{
     DenseMatrixHyperOperator, DriftDerivResult, FixedDriftDerivFn, HyperCoord, HyperCoordDrift,
     HyperCoordPair, HyperOperator,
 };
-pub(crate) use crate::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use crate::solver::active_set::{
     project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
 };
@@ -57,6 +56,7 @@ pub(crate) use crate::solver::estimate::reml::reml_outer_engine::{
 pub(crate) use crate::solver::estimate::{
     FitGeometry, ensure_finite_scalar_estimation, validate_all_finite_estimation,
 };
+pub(crate) use crate::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use crate::types::{RidgeDeterminantMode, RidgePolicy};
 pub(crate) use faer::Side;
 pub(crate) use joint_newton::whitened_spectrum;

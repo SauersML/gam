@@ -2090,7 +2090,7 @@ fn collect_smooth_extrapolation_axes(
     n_training_headers: usize,
     out: &mut std::collections::HashSet<usize>,
 ) {
-    use crate::smooth::{BySmoothKind, SmoothBasisSpec};
+    use crate::smooth::SmoothBasisSpec;
     let push = |col: usize, out: &mut std::collections::HashSet<usize>| {
         if col < n_training_headers {
             out.insert(col);
@@ -2128,25 +2128,9 @@ fn collect_smooth_extrapolation_axes(
                 push(c, out);
             }
         }
-        // A varying-coefficient `ByVariable` smooth fits `z·f(x)`: the inner
-        // smooth's basis axes (`x`) linear-extend / decay as usual, and a
-        // NUMERIC by-column (`z`) is a pure linear multiplier — the prediction
-        // is exactly affine in `z` (intercept + z·f(x)). Clipping `z` to its
-        // training range would plateau the varying-coefficient effect outside
-        // [min z, max z] and silently collapse the natural z=0 baseline onto
-        // z=min, so the by-column must be exempt from the predict-time clip
-        // just like a parametric linear axis. A `Level` (factor) by-column is
-        // categorical and is already skipped by the Continuous-kind gate, so it
-        // needs no exemption here.
-        SmoothBasisSpec::ByVariable {
-            inner, by_col, kind, ..
-        } => {
-            collect_smooth_extrapolation_axes(inner, n_training_headers, out);
-            if matches!(kind, BySmoothKind::Numeric) {
-                push(*by_col, out);
-            }
-        }
-        SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+        // Wrappers delegate to the inner smooth they modulate / replicate.
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
             collect_smooth_extrapolation_axes(inner, n_training_headers, out)
         }
         SmoothBasisSpec::BySmooth { smooth, .. } => {

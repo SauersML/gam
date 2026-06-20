@@ -67,11 +67,7 @@ fn cyclic_bspline_second_derivative_periodicity_breaks() {
     )
     .expect("second derivative");
 
-    assert_eq!(
-        d2.ncols(),
-        num_basis + degree,
-        "extended basis column count"
-    );
+    assert_eq!(d2.ncols(), num_basis + degree, "extended basis column count");
 
     let mut max_abs = 0.0_f64;
     // A central difference of `d1` only approximates `d2` where the spline value

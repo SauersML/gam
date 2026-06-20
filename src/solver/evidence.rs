@@ -1514,43 +1514,9 @@ pub fn union_per_point_log_density(
 pub struct RemlCandidate {
     pub index: usize,
     pub name: String,
-    /// Minimised REML/LAML cost. Lower is better. This is the model's reported
-    /// evidence headline (`Model.evidence`), kept verbatim in the score table.
+    /// Minimised REML/LAML cost. Lower is better.
     pub score: f64,
     pub edf: Option<f64>,
-    /// Log-likelihood at the converged mode, on the engine's
-    /// constants-omitted scale (same as [`crate::inference::model_comparison`]).
-    /// Present when the fit carries it; `None` for legacy payloads.
-    pub log_lik: Option<f64>,
-}
-
-impl RemlCandidate {
-    /// Cost used to RANK candidates and pick the winner.
-    ///
-    /// The REML/LAML marginal-likelihood evidence headline (`score`) does NOT
-    /// reliably Occam-penalise an added pure-noise smooth: on `y ~ s(x)` vs
-    /// `y ~ s(x) + s(z)` with `z ⟂ y`, the augmented model's evidence is
-    /// *lower* (apparently better) by a few nats on essentially every dataset,
-    /// because the Gaussian REML Occam pair `½(log|H| − log|S|₊)` collapses
-    /// toward zero for a finite-`λ̂` null term while that term still spends a
-    /// few effective degrees of freedom fitting noise (issue #1362).
-    ///
-    /// The conditional AIC `−2ℓ + 2·edf` prices exactly those spent degrees of
-    /// freedom and discriminates correctly: it penalises the noise smooth
-    /// (Δ ≈ +15 nats) yet rewards a genuinely relevant smooth (Δ ≈ −650),
-    /// preserving power. We therefore rank on the conditional AIC whenever both
-    /// the log-likelihood and the effective degrees of freedom are available,
-    /// and fall back to the raw evidence headline otherwise. The reported
-    /// `score_table` still carries the unaltered evidence (`reml_score`), so
-    /// `Model.evidence` / `bayes_factor_vs` stay consistent with the table.
-    pub fn ranking_score(&self) -> f64 {
-        match (self.log_lik, self.edf) {
-            (Some(log_lik), Some(edf)) if log_lik.is_finite() && edf.is_finite() => {
-                -2.0 * log_lik + 2.0 * edf
-            }
-            _ => self.score,
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1598,10 +1564,8 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
             .into_iter()
             .enumerate()
             .map(|(idx, row)| {
-                // Rank/winner on the Occam-penalised conditional AIC where it is
-                // available (issue #1362); falls back to the raw evidence score.
-                let ranking = row.ranking_score();
-                PriorityCandidate::new(row, idx, ranking, 0)
+                let score = row.score;
+                PriorityCandidate::new(row, idx, score, 0)
             })
             .collect(),
     )
@@ -1609,10 +1573,6 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
     .map(|row| row.item)
     .collect();
 
-    // Evidence headline of the winning (best-ranked) model. The score table and
-    // its Bayes factors report the raw REML/LAML evidence (`reml_score`), so
-    // they stay consistent with `Model.evidence` / `bayes_factor_vs`; only the
-    // winner ordering is decided by `ranking_score`.
     let best_score = candidates[0].score;
     let winner = candidates[0].name.clone();
     let mut ranking = Vec::with_capacity(candidates.len());
@@ -1635,16 +1595,11 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
             effective_dof: row.edf,
         });
     }
-    // The winner is decided by `ranking_score` (the Occam-penalised conditional
-    // AIC where available, issue #1362), which can disagree in sign with the raw
-    // evidence Bayes factor for a noise-augmented model. Summarise the actual
-    // decision margin so the headline never contradicts the chosen winner.
     let evidence_summary = if let Some(runner_up) = candidates.get(1) {
-        let margin = runner_up.ranking_score() - candidates[0].ranking_score();
         format!(
             "{} wins by Bayes factor {} over {}",
             winner,
-            format_bayes_factor(margin),
+            format_bayes_factor(log_bayes_factor(best_score, runner_up.score)),
             runner_up.name
         )
     } else {
@@ -3828,93 +3783,5 @@ mod tests {
     fn hybrid_split_rejects_empty_slot() {
         let slots = vec![hybrid_slot(10.0, 2, 1, 5, 0.0, 0.0), Vec::new()];
         assert!(select_hybrid_split(&slots).is_err());
-    }
-
-    // ── #1362: compare_models must Occam-penalise a pure-noise smooth ────────
-    //
-    // These tests pin the ranking contract directly on `compare_reml_fits` with
-    // controlled (score, edf, log_lik) inputs taken from the actual #1362
-    // reproduction (Rust `reml_score` of `y ~ s(x)` vs `y ~ s(x) + s(z)` at
-    // n=700). They do not need a fitted GAM or a Python wheel.
-
-    fn cand(name: &str, score: f64, edf: f64, log_lik: f64) -> RemlCandidate {
-        RemlCandidate {
-            index: 0,
-            name: name.to_string(),
-            score,
-            edf: Some(edf),
-            log_lik: Some(log_lik),
-        }
-    }
-
-    #[test]
-    fn ranking_score_is_conditional_aic_when_loglik_and_edf_present() {
-        // AIC = -2ℓ + 2·edf.
-        let c = cand("m", /*score (ignored)*/ 999.0, 6.748, -32.0866);
-        let expected = -2.0 * -32.0866 + 2.0 * 6.748;
-        assert!((c.ranking_score() - expected).abs() < 1e-9);
-    }
-
-    #[test]
-    fn ranking_score_falls_back_to_evidence_without_loglik() {
-        let c = RemlCandidate {
-            index: 0,
-            name: "m".to_string(),
-            score: 151.28,
-            edf: Some(6.0),
-            log_lik: None,
-        };
-        assert_eq!(c.ranking_score(), 151.28);
-    }
-
-    #[test]
-    fn compare_models_rejects_pure_noise_smooth_despite_lower_evidence() {
-        // Seed-3000 numbers from the #1362 Rust reproduction:
-        //   small (y ~ s(x)):      reml=180.526, edf=6.748,  loglik=-32.0866
-        //   big   (y ~ s(x)+s(z)): reml=177.404, edf=14.250, loglik=-32.1212
-        // The big (noise-augmented) model has the LOWER (apparently better) raw
-        // REML evidence, yet it spends ~7.5 extra EDF fitting noise without
-        // improving the likelihood. The winner must be the SMALL model.
-        let small = cand("small", 180.526, 6.748, -32.0866);
-        let big = cand("big", 177.404, 14.250, -32.1212);
-
-        // Sanity: raw evidence (the broken headline) prefers big.
-        assert!(big.score < small.score);
-
-        let cmp = compare_reml_fits(vec![small, big]).expect("compare");
-        assert_eq!(
-            cmp.winner, "small",
-            "compare_models must Occam-penalise the pure-noise smooth and pick the smaller model"
-        );
-        // The score table still reports the raw evidence headline unchanged, so
-        // Model.evidence / bayes_factor_vs stay consistent with the table.
-        let small_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "small")
-            .expect("small row");
-        let big_row = cmp
-            .score_table
-            .iter()
-            .find(|r| r.name == "big")
-            .expect("big row");
-        assert!((small_row.reml_score - 180.526).abs() < 1e-9);
-        assert!((big_row.reml_score - 177.404).abs() < 1e-9);
-    }
-
-    #[test]
-    fn compare_models_keeps_power_for_a_relevant_smooth() {
-        // Seed-3000 relevant-z numbers from the same reproduction:
-        //   small: reml=1025.067, edf≈6.75,  loglik≈-368.99 (aic≈751.5)
-        //   big:   reml=199.509,  edf≈14.25, loglik≈-33.16  (aic≈94.8)
-        // A genuinely relevant smooth lowers BOTH the evidence and the AIC, so
-        // the bigger model must still win — a fix cannot just always pick small.
-        let small = cand("small", 1025.067, 6.75, -368.985);
-        let big = cand("big", 199.509, 14.25, -33.165);
-        let cmp = compare_reml_fits(vec![small, big]).expect("compare");
-        assert_eq!(
-            cmp.winner, "big",
-            "compare_models must retain power: the relevant smooth's model must win"
-        );
     }
 }

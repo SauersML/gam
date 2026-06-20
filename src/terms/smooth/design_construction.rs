@@ -1841,13 +1841,12 @@ fn fit_term_collection_on_realized_design(
         );
     }
     let mut base_fit_opts = adaptive_fit_options_base(options, design);
-    // Lift the symmetric log-λ cap off the smoothing coordinates of
-    // well-determined Gaussian-identity B-spline / thin-plate / tensor smooths so
-    // REML can drive λ to the value the data wants — including λ → ∞ when a
-    // term's signal lives in its penalty null space (#1271 single-penalty tp/ps,
-    // #1266 double-penalty selection). Length-safe: only fires when the inner ρ
-    // aligns 1:1 with the penalty blocks (see `relax_smoothing_rho_prior`).
-    base_fit_opts.rho_prior = relax_smoothing_rho_prior(options, &family, design);
+    // Lift the log-λ cap off any Marra–Wood double-penalty selection coordinates
+    // (Gaussian-identity `s(x, bs=ps)`-style fits) so the null-space block can
+    // shrink an unsupported term out instead of leaving it under-penalised
+    // (#1266). Length-safe: only fires when ρ aligns 1:1 with the penalty
+    // blocks (see `relax_double_penalty_rho_prior`).
+    base_fit_opts.rho_prior = relax_double_penalty_rho_prior(options, &family, design);
     let fitted = FittedTermCollection {
         fit: fit_gamwith_heuristic_lambdas(
             design.design.clone(),
@@ -4184,12 +4183,12 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 /// double-penalty term to `Flat`. Single-penalty terms are byte-for-byte
 /// unchanged, and an already-`Flat`/already-`Independent` base prior, or a
 /// design with no double-penalty block, is returned untouched.
-fn relax_smoothing_rho_prior(
+fn relax_double_penalty_rho_prior(
     options: &FitOptions,
     family: &LikelihoodSpec,
     design: &TermCollectionDesign,
 ) -> crate::types::RhoPrior {
-    use crate::terms::basis::BasisMetadata;
+    use crate::terms::basis::{BasisMetadata, PenaltySource};
     let base = &options.rho_prior;
     // Only a single scalar prior that actually caps log-λ needs relaxing;
     // `Flat` already imposes no cap and `Independent` is assumed caller-built.
@@ -4201,20 +4200,15 @@ fn relax_smoothing_rho_prior(
     }
     // LENGTH SAFETY (load-bearing). The per-coordinate `Independent` prior is
     // validated against the FULL outer ρ vector and a length disagreement
-    // saturates the prior to `+∞`, breaking the fit. The ρ vector this prior is
-    // attached to (the inner REML fit at a *fixed* realized design) aligns 1:1
-    // with the penalty blocks in `design.penaltyinfo` ONLY when the fit
-    // introduces no auxiliary trailing ρ coordinates. Such coordinates come from
+    // saturates the prior to `+∞`, breaking the fit. ρ aligns 1:1 with the
+    // penalty blocks in `design.penaltyinfo` ONLY when the fit introduces no
+    // auxiliary trailing ρ coordinates. Such coordinates come from
     //   * non-Gaussian dispersion / non-identity link machinery,
     //   * SAS ε/δ and mixture-link parameters,
-    //   * spatial κ length-scale optimisation that actually moves κ.
-    // Gate to the Gaussian-identity, link-aux-free case. Spatial κ optimisation
-    // (Matérn / Duchon / sphere / curvature / measure-jet) genuinely appends a
-    // moving log-κ coordinate AND needs the cap to stabilise it, so bail if any
-    // such term is present. Thin-plate is the exception: its length-scale is a
-    // pure radial SCALE that REML cannot identify (the κ optimiser converges to
-    // a no-op, leaving `n_params = penalty-block count`), so it adds no trailing
-    // coordinate and is safe to relax alongside the B-spline family.
+    //   * spatial κ length-scale optimisation (Matérn / Duchon / thin-plate).
+    // Gate the relaxation to the Gaussian-identity, link-aux-free, κ-free case —
+    // exactly the `s(x, bs=ps)`-style fit in #1266 — where the 1:1 alignment is
+    // guaranteed. Every other fit keeps the base prior unchanged.
     let gaussian_identity = matches!(family.response, crate::types::ResponseFamily::Gaussian)
         && matches!(
             family.link,
@@ -4224,80 +4218,66 @@ fn relax_smoothing_rho_prior(
         || options.optimize_sas
         || options.mixture_link.is_some()
         || options.optimize_mixture;
-    let has_moving_kappa = design.smooth.terms.iter().any(|t| {
+    let has_spatial_kappa = design.smooth.terms.iter().any(|t| {
         matches!(
             t.metadata,
-            BasisMetadata::Matern { .. }
+            BasisMetadata::ThinPlate { .. }
+                | BasisMetadata::Matern { .. }
                 | BasisMetadata::Duchon { .. }
-                | BasisMetadata::Sphere { .. }
-                | BasisMetadata::SphereHarmonics { .. }
-                | BasisMetadata::ConstantCurvature { .. }
-                | BasisMetadata::MeasureJet { .. }
         )
     });
-    if !gaussian_identity || has_link_aux || has_moving_kappa {
+    if !gaussian_identity || has_link_aux || has_spatial_kappa {
         return base.clone();
     }
     let coords = &design.penaltyinfo;
     if coords.is_empty() {
         return base.clone();
     }
-    // WELL-IDENTIFICATION GATE (#1089). The ρ-prior is two things at once: a
-    // #1266/#1271-harmful symmetric cap on each smoothing log-λ, AND a
-    // #1089-load-bearing stabiliser that makes the outer REML loop terminate on
-    // an *under-determined* design (gam#893/#1196/#1089: the n=30 five-`ps` wine
-    // fit has p ≈ 51 > n, so without the cap's curvature the outer criterion is
-    // flat/degenerate in ρ-space and the loop never certifies a stationary
-    // point). Only lift the cap when the data comfortably over-determines the
-    // model (`n ≥ 2·p`), so the unregularised REML problem is well-posed on its
-    // own; otherwise keep the base prior. The #1266/#1271 cases (n ≈ 800,
-    // p ≈ 20–40) clear this by ≥20×; the #1089 wine fit (n < p) keeps its cap.
+    // Names of 1-D B-spline terms (`bs=ps`/`bspline`/`cs`, the issue scope) that
+    // own a null-space shrinkage block, i.e. are in Marra–Wood selection mode.
+    let bspline_terms: std::collections::HashSet<&str> = design
+        .smooth
+        .terms
+        .iter()
+        .filter(|t| matches!(t.metadata, BasisMetadata::BSpline1D { .. }))
+        .map(|t| t.name.as_str())
+        .collect();
+    let selection_terms: std::collections::HashSet<&str> = coords
+        .iter()
+        .filter(|info| matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace))
+        .filter_map(|info| info.termname.as_deref())
+        .filter(|name| bspline_terms.contains(name))
+        .collect();
+    if selection_terms.is_empty() {
+        return base.clone();
+    }
+    // WELL-IDENTIFICATION GATE (#1089 vs #1266). The ρ-prior is two things at
+    // once: a #1266-harmful cap on the selection log-λ, AND a #1089-load-bearing
+    // stabiliser that makes the outer REML loop terminate on an *under-determined*
+    // double-penalty design (gam#893/#1196/#1089: the n=30 five-`ps` wine fit has
+    // p ≈ 51 > n, so without the prior the outer criterion is flat/degenerate in
+    // ρ-space and the loop never certifies a stationary point). Only lift the cap
+    // when the data comfortably over-determines the model (`n ≥ 2·p`), so the
+    // unregularised REML problem is well-posed on its own; otherwise keep the
+    // base prior so the loop still converges. The #1266 selection cases
+    // (`y ~ s(x) + s(z)`, n=800, p ≈ 40) clear this by ~20×; the #1089 wine fit
+    // (n < p) does not and keeps its stabiliser.
     let n_obs = design.design.nrows();
     let p_total = design.design.ncols();
     if n_obs < 2 * p_total {
         return base.clone();
     }
-    // Relaxable terms: penalized smooths whose smoothing log-λ the symmetric cap
-    // wrongly bounds when the term's signal lives in its penalty null space — a
-    // straight line under a bending penalty drives λ → ∞ but the cap pulls it
-    // back, leaving spurious wiggle. mgcv caps neither. This is exactly the
-    // B-spline family (`ps`/`cr`/`cs`/`bs`, BSpline1D), thin-plate (`tp`), and
-    // tensor-B-spline (`te`/`ti`) smooths — single- AND double-penalty (#1266 is
-    // the double-penalty case, #1271 the single-penalty `tp`/`ps`). EVERY penalty
-    // coordinate such a term owns (bending wiggliness AND any null-space
-    // shrinkage) is freed to `Flat`, which the runtime resolves to the
-    // firth-default one-sided barrier: no high-λ cap, but still a convex wall
-    // against the `λ → 0` under-smoothing degeneracy.
-    let relaxable_terms: std::collections::HashSet<&str> = design
-        .smooth
-        .terms
-        .iter()
-        .filter(|t| {
-            matches!(
-                t.metadata,
-                BasisMetadata::BSpline1D { .. }
-                    | BasisMetadata::ThinPlate { .. }
-                    | BasisMetadata::TensorBSpline { .. }
-            )
-        })
-        .map(|t| t.name.as_str())
-        .collect();
-    let any_relaxed = coords.iter().any(|info| {
-        info.termname
-            .as_deref()
-            .is_some_and(|name| relaxable_terms.contains(name))
-    });
-    if !any_relaxed {
-        return base.clone();
-    }
+    // Every penalty coordinate a selection term owns (wiggliness AND null-space)
+    // is freed to `Flat` so REML can drive the whole term out; all other
+    // coordinates keep the base prior.
     let per_coord = coords
         .iter()
         .map(|info| {
-            let relax = info
+            let in_selection = info
                 .termname
                 .as_deref()
-                .is_some_and(|name| relaxable_terms.contains(name));
-            if relax {
+                .is_some_and(|name| selection_terms.contains(name));
+            if in_selection {
                 crate::types::RhoPrior::Flat
             } else {
                 base.clone()

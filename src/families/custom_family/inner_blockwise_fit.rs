@@ -2884,9 +2884,11 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // full rejection by the likelihood path at a collapsed trust
                 // radius is the same numerically-flat-no-descent stall as a
                 // full objective rejection; counting either lets the guard fire.
-                let all_attempts_rejected =
-                    model_rejects + likelihood_rejects + objective_rejects + feasibility_rejects
-                        == JOINT_TRUST_MAX_ATTEMPTS;
+                let all_attempts_rejected = model_rejects
+                    + likelihood_rejects
+                    + objective_rejects
+                    + feasibility_rejects
+                    == JOINT_TRUST_MAX_ATTEMPTS;
                 let radius_held_since_last_reject = match prev_rejected_trust_radius {
                     Some(prev) => {
                         joint_trust_radius.is_finite()
@@ -3047,6 +3049,83 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         if stall_range_residual.is_finite() {
                             min_certified_residual =
                                 min_certified_residual.min(stall_range_residual);
+                        }
+                        converged = true;
+                        break;
+                    }
+                    // FULL-RANK FIXED-POINT FALLBACK (gam#979 survival marginal-slope).
+                    //
+                    // The range-space certificate above returns `None` when
+                    // `projected_residual_range_space_inf` finds `nullity == 0`:
+                    // at the REML optimum ρ the penalty `S(λ)` lifts the
+                    // gauge-flat marginal≈logslope alias direction (the n≈133
+                    // heart-failure fit's 0.956-overlap confound) to an
+                    // eigenvalue just ABOVE the `1e-10·λ_max` rank cutoff, so
+                    // H_pen reads numerically full-rank and there is no null
+                    // space to project the residual onto. The previous code then
+                    // declared non-convergence and ABORTED the whole fit — even
+                    // though the iterate is a provably-stationary penalized
+                    // optimum whose residual is floored at a small multiple of
+                    // tol by the near-singular conditioning, NOT by a reachable
+                    // descent direction.
+                    //
+                    // The honest discriminator is the SAME conjunction the
+                    // fully-rejected stall is built on, asserted explicitly so a
+                    // genuine non-convergence (a fit stalled FAR from tol with
+                    // real reducible range-space mass) still exits unconverged:
+                    //   (a) the joint trust radius has collapsed to its `1e-12`
+                    //       floor — no smaller step is representable;
+                    //   (b) `FULLY_REJECTED_STALL_MAX_CYCLES` consecutive cycles
+                    //       (or a byte-identical first-attempt objective) were
+                    //       fully rejected — β reverts identically, so the next
+                    //       step is bit-for-bit the same: a fixed point;
+                    //   (c) the last accepted Newton model was essentially exact
+                    //       (`trust_ratio ≈ 1` and scalar relative model error
+                    //       below `inner_tol`) — the quadratic model has nothing
+                    //       left to reduce.
+                    // Only when all three hold AND the best residual the solve
+                    // actually achieved is within the same `4×residual_tol` band
+                    // the sibling identified-subspace certificates use (lines
+                    // ~4497 / ~4659) AND the objective is flat do we certify. A
+                    // fit stalled at, say, 10×tol with reducible mass fails the
+                    // `best_residual_seen ≤ 4×tol` gate and still aborts.
+                    const FIXED_POINT_TRUST_RADIUS_CEIL: f64 = 1e-9;
+                    let model_exact = last_joint_math
+                        .as_ref()
+                        .map(|math| {
+                            (math.trust_ratio - 1.0).abs() <= 0.5
+                                && math.scalar_model_relative_error() <= inner_tol.max(1e-6)
+                        })
+                        .unwrap_or(false);
+                    let provable_fixed_point = joint_trust_radius <= FIXED_POINT_TRUST_RADIUS_CEIL
+                        && (consecutive_held_rejected_cycles >= FULLY_REJECTED_STALL_MAX_CYCLES
+                            || consecutive_identical_rejected_cycles
+                                >= IDENTICAL_REJECTED_STALL_MAX_CYCLES)
+                        && model_exact;
+                    if provable_fixed_point
+                        && last_cycle_obj_change_below_tol
+                        && best_residual_seen.is_finite()
+                        && best_residual_seen <= 4.0 * last_residual_tol
+                    {
+                        log::info!(
+                            "[PIRLS/joint-Newton convergence] cycle {:>3} | fully-rejected stall \
+                             resolved as full-rank fixed-point KKT convergence (gam#979): trust \
+                             radius collapsed to {:.3e} (≤ floor), {} consecutive fully-rejected \
+                             cycles, last Newton model exact (ρ≈1, scalar_relerr small), and the \
+                             objective is flat — a provably-stationary penalized optimum. H_pen reads \
+                             full-rank at the optimal ρ (the gauge-flat alias eigenvalue sits above \
+                             the rank cutoff), so the range-space certificate has no null space to \
+                             project; the best achieved KKT residual {:.3e} ≤ 4×tol {:.3e} is the \
+                             near-singular conditioning floor, not reducible descent — returning \
+                             converged.",
+                            cycle,
+                            joint_trust_radius,
+                            consecutive_held_rejected_cycles,
+                            best_residual_seen,
+                            4.0 * last_residual_tol,
+                        );
+                        if best_residual_seen.is_finite() {
+                            min_certified_residual = min_certified_residual.min(best_residual_seen);
                         }
                         converged = true;
                         break;
