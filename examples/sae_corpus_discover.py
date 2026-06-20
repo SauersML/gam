@@ -21,8 +21,8 @@ harvest command to generate one) when nothing qualifies.
 
 USAGE (on an MSI compute node):
   python examples/sae_corpus_discover.py \
-      --candidate /projects/standard/hsiehph/sauer354/olmo_data/base/activations.npy:25 \
-      --candidate /projects/standard/hsiehph/sauer354/olmo_data/instruct \
+      --candidate $PROJECTS/olmo_data/base/activations.npy:25 \
+      --candidate $PROJECTS/olmo_data/instruct \
       --min-d-model 2048
 """
 from __future__ import annotations
