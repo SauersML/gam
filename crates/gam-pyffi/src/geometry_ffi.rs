@@ -6843,14 +6843,6 @@ struct PosteriorPredictPayload {
     link_spec: Option<String>,
 }
 
-fn eta_bands_from_matrix(
-    eta: ArrayView2<'_, f64>,
-    family_kind: &str,
-    level: f64,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>), String> {
-    posterior_bands::eta_bands_from_matrix(eta, family_kind, level)
-}
-
 fn posterior_credible_interval_impl(
     samples_flat: Vec<f64>,
     n_draws: usize,

@@ -1,4 +1,4 @@
-//! KKT-residual ρ corrections and the shared REML derivative workspace.
+//! KKT-residual θ corrections and the shared REML derivative workspace.
 //!
 //! Holds the precomputed gradient-pass intermediates threaded into the dense
 //! Hessian assembler, the active-upper-ρ box mask, the residual solve kernel,
@@ -21,11 +21,6 @@ pub(crate) struct RemlDerivativeWorkspace<'a> {
     pub coord_corrections: &'a [Option<DriftDerivResult>],
 }
 
-pub(crate) struct KktRhoCorrections {
-    pub(crate) gradient: Array1<f64>,
-    pub(crate) hessian: Option<Array2<f64>>,
-}
-
 /// The KKT-residual correction over the FULL θ = (ρ ‖ ψ) coordinate set.
 ///
 /// `gradient` is `k_outer = k + ext_dim` long; `hessian`, when present, is the
@@ -38,8 +33,8 @@ pub(crate) struct KktThetaCorrections {
 }
 
 /// Exact derivatives of the Newton/IFT residual correction `C(θ) = −½ r(θ)ᵀ K
-/// r(θ)`, `K = H⁻¹`, over the FULL θ = (ρ ‖ ψ) coordinate set — the cross-ρψ
-/// and ψψ generalization of [`compute_kkt_residual_rho_corrections`].
+/// r(θ)`, `K = H⁻¹`, over the FULL θ = (ρ ‖ ψ) coordinate set covering the ρρ,
+/// cross-ρψ, and ψψ blocks uniformly.
 ///
 /// At fixed β̂ each coordinate `i` contributes a score derivative `r_i = ∂_θᵢ r`
 /// and a frozen Hessian drift `A_i = ∂_θᵢ H|_β̂`:
@@ -66,7 +61,7 @@ pub(crate) struct KktThetaCorrections {
 /// `active[i]` masks a coordinate at an active upper box bound (only ρ
 /// coordinates can be masked; the ψ entries are always `false`): a masked
 /// coordinate freezes (its θ does not move), so its row/column correction is
-/// zero, exactly as in the ρ-only path.
+/// zero.
 pub(crate) fn compute_kkt_residual_theta_corrections<F>(
     hop: &dyn HessianOperator,
     subspace: Option<&PenaltySubspaceTrace>,
@@ -242,65 +237,4 @@ pub(crate) fn active_upper_rho_mask(rho: &[f64]) -> Vec<bool> {
             upper.is_finite() && value >= upper - 1.0e-8
         })
         .collect()
-}
-
-/// ρ-only entry point for the Newton/IFT residual correction
-/// `C(ρ) = −½ r(ρ)ᵀ K r(ρ)`, `K = H⁻¹` — now a thin marshalling shim over the
-/// full-θ [`compute_kkt_residual_theta_corrections`].
-///
-/// At fixed β̂ the ρ ingredients are `r_i = a_i = λ_iS_iβ̂` and the frozen drift
-/// `A_i[v] = λ_iS_i v`; this builds them and forwards to the generalized
-/// calculus, so there is exactly ONE implementation of the `C_i`/`C_ij`
-/// algebra (the no-parallel-math rule). Retained so the ρ-isolation pins
-/// (`ift_gradient_correction_with_zero_projected_residual_is_zero`,
-/// `ift_rho_upper_bound_masks_residual_correction_direction`) keep guarding the
-/// ρ contract directly while the production path uses the full-θ form.
-pub(crate) fn compute_kkt_residual_rho_corrections(
-    solution: &InnerSolution<'_>,
-    hop: &dyn HessianOperator,
-    lambdas: &[f64],
-    penalty_a_k_betas: &[Array1<f64>],
-    residual: &Array1<f64>,
-    include_hessian: bool,
-    upper_active_rho: &[bool],
-) -> Result<KktRhoCorrections, String> {
-    let k = penalty_a_k_betas.len();
-    if lambdas.len() != k || solution.penalty_coords.len() != k {
-        return Err(RemlError::DimensionMismatch {
-            reason: format!(
-                "KKT rho correction dimension mismatch: lambdas={} coords={} rhs={}",
-                lambdas.len(),
-                solution.penalty_coords.len(),
-                k
-            ),
-        }
-        .into());
-    }
-    if upper_active_rho.len() != k {
-        return Err(RemlError::DimensionMismatch {
-            reason: format!(
-                "KKT rho correction active-bound mask mismatch: mask={} rhs={}",
-                upper_active_rho.len(),
-                k
-            ),
-        }
-        .into());
-    }
-    let subspace = solution.penalty_subspace_trace.as_deref();
-    let drift_apply = |idx: usize, v: &Array1<f64>| -> Array1<f64> {
-        solution.penalty_coords[idx].scaled_matvec(v, lambdas[idx])
-    };
-    let theta = compute_kkt_residual_theta_corrections(
-        hop,
-        subspace,
-        penalty_a_k_betas,
-        drift_apply,
-        residual,
-        include_hessian,
-        upper_active_rho,
-    )?;
-    Ok(KktRhoCorrections {
-        gradient: theta.gradient,
-        hessian: theta.hessian,
-    })
 }

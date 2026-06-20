@@ -208,6 +208,8 @@ mod tensor_3d_smooth_robust;
 mod tensor_clamped_margin;
 #[path = "basis_smooth/thin_plate_integration.rs"]
 mod thin_plate_integration;
+#[path = "basis_smooth/tp_single_penalty_edf_repro_1271.rs"]
+mod tp_single_penalty_edf_repro_1271;
 #[path = "basis_smooth/ti_tensor_interaction_smooth.rs"]
 mod ti_tensor_interaction_smooth;
 #[path = "basis_smooth/weighted_blockwise_penalty_sum_rejects_negative_weights.rs"]

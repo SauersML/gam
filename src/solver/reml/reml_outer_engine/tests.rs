@@ -1289,7 +1289,7 @@ pub(crate) fn value_gradient_hessian_prefers_family_supplied_outer_operator() {
 //   [reml_laml envelope-gradient consistency] |g|∞ = 9.669e16 ... |cost|
 //     = 3.480e5  ratio 4.14e3  → gradient suppressed → seed rejected.
 //
-// BUG-1 (math, compute_kkt_residual_rho_corrections @ ~unified.rs:8500):
+// BUG-1 (math, compute_kkt_residual_theta_corrections @ ~unified.rs:8500):
 //   At cert exit, the projected KKT residual r_proj ≈ 0 (multiplier
 //   captured by active set). Then q = H⁻¹·r_proj = 0, so the gradient
 //   correction `-aᵀ_k q + ½ qᵀA_k q` is identically zero. The cert's
@@ -1323,11 +1323,16 @@ pub(crate) fn ift_gradient_correction_with_zero_projected_residual_is_zero() {
     let penalty_a_k_betas = vec![array![0.3, -0.7, 0.0], array![0.0, 0.0, 0.5]];
     let zero_residual = Array1::<f64>::zeros(hop.dim());
 
-    let corrections = compute_kkt_residual_rho_corrections(
-        &solution,
+    // ρ-only contract over the live full-θ correction: r_i = a_i = λ_i S_i β̂,
+    // frozen drift A_i[v] = λ_i S_i v.
+    let drift_apply = |idx: usize, v: &Array1<f64>| -> Array1<f64> {
+        solution.penalty_coords[idx].scaled_matvec(v, lambdas[idx])
+    };
+    let corrections = compute_kkt_residual_theta_corrections(
         &hop,
-        &lambdas,
+        solution.penalty_subspace_trace.as_deref(),
         &penalty_a_k_betas,
+        drift_apply,
         &zero_residual,
         true,
         &[false, false],
@@ -1364,11 +1369,15 @@ pub(crate) fn ift_rho_upper_bound_masks_residual_correction_direction() {
     let penalty_a_k_betas = vec![array![0.3, -0.7, 0.0], array![0.0, 0.0, 0.5]];
     let residual = array![0.2, -0.3, 0.4];
 
-    let corrections = compute_kkt_residual_rho_corrections(
-        &solution,
+    // ρ-only contract over the live full-θ correction (drift A_i[v] = λ_i S_i v).
+    let drift_apply = |idx: usize, v: &Array1<f64>| -> Array1<f64> {
+        solution.penalty_coords[idx].scaled_matvec(v, lambdas[idx])
+    };
+    let corrections = compute_kkt_residual_theta_corrections(
         &hop,
-        &lambdas,
+        solution.penalty_subspace_trace.as_deref(),
         &penalty_a_k_betas,
+        drift_apply,
         &residual,
         true,
         &[false, true],
@@ -6044,7 +6053,7 @@ pub(crate) fn ift_correction_vanishes_at_exact_kkt() {
 /// Regression test for issue #197.
 ///
 /// When ρ_k is pinned at its upper bound the IFT block
-/// (`compute_kkt_residual_rho_corrections`) already projects out the
+/// (`compute_kkt_residual_theta_corrections`) already projects out the
 /// gradient (sets it to 0). Prior to the #197 fix the main envelope
 /// block kept the trace term `½·tr(K·λ_k S_k)`, the penalty quadratic
 /// `½·λ_k β'S_kβ` and the `½·∂log|S|/∂ρ_k` term — yielding a non-zero

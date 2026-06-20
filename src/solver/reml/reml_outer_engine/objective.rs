@@ -916,7 +916,7 @@ pub fn reml_laml_evaluate(
             // When ρ_k has been pinned at its upper bound by the outer
             // bound-constrained solver, the IFT mode response `v_k` is
             // already zeroed above and the IFT residual correction in
-            // `compute_kkt_residual_rho_corrections` is masked to 0 for
+            // `compute_kkt_residual_theta_corrections` is masked to 0 for
             // this coord. The envelope main block must use the SAME
             // gradient-projection convention — otherwise the trace term
             // `½·tr(K·λ_k S_k)` and the penalty quadratic `½·λ_k β'S_kβ`
@@ -1042,7 +1042,7 @@ pub fn reml_laml_evaluate(
     // `+½ qᵀA_kq` term is second-order in the KKT residual but is required if
     // the analytic gradient is to be the derivative of the corrected scalar
     // objective. The Hessian builder receives the corresponding second
-    // derivative from `compute_kkt_residual_rho_corrections` so ARC sees one
+    // derivative from `compute_kkt_residual_theta_corrections` so ARC sees one
     // coherent objective model instead of an envelope Hessian for a corrected
     // value/gradient pair.
     //
@@ -1274,7 +1274,7 @@ pub fn reml_laml_evaluate(
     // the same gradient the correction was supposed to have repaired,
     // and when `‖r_proj‖∞ ≈ 0` (the cert-exit contract) the correction
     // `-aᵀ_k q + ½ qᵀA_k q` with `q = H⁻¹·r ≡ 0` is identically zero
-    // (see `compute_kkt_residual_rho_corrections`). Active-constraint
+    // (see `compute_kkt_residual_theta_corrections`). Active-constraint
     // cases are handled before reaching here by the tangent-space
     // dispatch at the top of this function (`try_tangent_projected_evaluate`,
     // refs Wood 2011 §4; Wood–Pya–Säfken 2016 §3; Marra–Wood 2012 §2).

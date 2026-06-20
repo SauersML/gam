@@ -21,7 +21,7 @@ fn diag_1271_tp_spectrum_and_edf_profile() {
     let x: Array1<f64> = Array1::linspace(0.0, 1.0, n);
     let data = x.clone().insert_axis(ndarray::Axis(1));
 
-    let basis = create_thin_plate_spline_basis_with_knot_count(data.view(), 20)
+    let (basis, _) = create_thin_plate_spline_basis_with_knot_count(data.view(), 20)
         .expect("tp basis builds");
 
     let x_design = &basis.basis;
@@ -67,14 +67,13 @@ fn diag_1271_tp_spectrum_and_edf_profile() {
         }
     }
     let btp = b.t().dot(&p);
-    let btp_abs: f64 = btp.iter().map(|v| v.abs()).sum();
+    let btp_abs: f64 = btp.iter().map(|v: &f64| v.abs()).sum();
     println!(
         "[diag] BᵀB diag-dev-from-1 sum={btb_diag_dev:.3e} offdiag-sum={btb_offdiag:.3e}  BᵀP abs-sum={btp_abs:.3e}"
     );
 
     // EDF-vs-λ profile (full design including unpenalized poly null space).
-    let mut s_full = Array2::<f64>::zeros((x_design.ncols(), x_design.ncols()));
-    s_full.slice_mut(s![0..kcols, 0..kcols]).assign(s_bend);
+    let s_full = s_bend.clone();
     println!("[diag] EDF(λ) profile:");
     for &rho in &[0.0_f64, 2.0, 4.0, 6.0, 7.0, 8.0, 10.0, 12.0, 15.0, 20.0] {
         let lambda = rho.exp();
