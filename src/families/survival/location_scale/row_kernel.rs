@@ -141,6 +141,11 @@ pub(crate) struct SurvivalJointQuantities {
     pub(crate) d2qdot_ls: Array1<f64>,
     pub(crate) d2qdot_lstd: Array1<f64>,
     pub(crate) d2qdot_lslsd: Array1<f64>,
+    pub(crate) d3qdot_tls_ls: Array1<f64>,
+    pub(crate) d3qdot_tls_lsd: Array1<f64>,
+    pub(crate) d3qdot_td_ls_ls: Array1<f64>,
+    pub(crate) d3qdot_ls_ls_ls: Array1<f64>,
+    pub(crate) d3qdot_ls_ls_lsd: Array1<f64>,
 }
 
 pub(crate) struct SurvivalJointPsiDirection {
@@ -1324,6 +1329,11 @@ impl SurvivalLocationScaleFamily {
             d2qdot_ls: dynamic.d2qdot_ls,
             d2qdot_lstd: dynamic.d2qdot_lstd,
             d2qdot_lslsd: dynamic.d2qdot_lslsd,
+            d3qdot_tls_ls: dynamic.d3qdot_tls_ls,
+            d3qdot_tls_lsd: dynamic.d3qdot_tls_lsd,
+            d3qdot_td_ls_ls: dynamic.d3qdot_td_ls_ls,
+            d3qdot_ls_ls_ls: dynamic.d3qdot_ls_ls_ls,
+            d3qdot_ls_ls_lsd: dynamic.d3qdot_ls_ls_lsd,
         })
     }
 
