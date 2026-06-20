@@ -5311,6 +5311,46 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         1.0 / 4.0,
         -0.48, // large move toward low edge (psi ≈ psi_lo + 0.02*span)
     ];
+    // ATTRIBUTION: realize the EXACT design at ψ to get XᵀWX_exact(ψ) (n-cost is
+    // fine — diagnostic), so we can separate the Gram INTERPOLATION residual from
+    // the inner-solve β̂ error, and test whether the ANCHOR correction
+    // (gram_at(ψ) + [exact(ψ_a) − gram_at(ψ_a)]) actually drives the Gram exact as
+    // the move → 0. Frobenius rel residual of two k×k Grams.
+    let frob_rel = |a: &Array2<f64>, b: &Array2<f64>| -> f64 {
+        let num: f64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let den: f64 = b.iter().map(|y| y * y).sum::<f64>().sqrt().max(1e-300);
+        num / den
+    };
+    // Exact XᵀWX(ψ) from a freshly realized design in the SAME conditioned frame
+    // the tensor was built in (build_cache used conditioning.apply_to_design).
+    let exact_gram_at = |psi: f64| -> Array2<f64> {
+        let mut c = make_cache();
+        let mut th = theta0.clone();
+        th[rho_dim] = psi;
+        c.ensure_theta(&th).expect("ensure_theta exact");
+        let x = c.design().design.to_dense();
+        let mut wx = x.clone();
+        for (mut row, &wi) in wx.outer_iter_mut().zip(weights.iter()) {
+            row.mapv_inplace(|v| v * wi);
+        }
+        x.t().dot(&wx)
+    };
+    // Clone the tensor Arc so the Gram accessor does not hold a borrow of
+    // `tensor_eval` across the loop's `&mut tensor_eval` eval calls.
+    let tensor_arc = tensor_eval
+        .psi_gram_tensor
+        .as_ref()
+        .expect("tensor attached")
+        .clone();
+    let tensor_gram_at = |psi: f64| -> Array2<f64> { tensor_arc.gram_at(psi) };
+    let g_interp_a = tensor_gram_at(psi_a);
+    let g_exact_a = exact_gram_at(psi_a);
+
     let mut worst_forced = 0.0_f64;
     for &f in &fracs {
         let psi = psi_a + f * span;
@@ -5329,9 +5369,23 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
             .zip(beta_slow.iter())
             .fold(0.0_f64, |a, (g, s)| a.max((g - s).abs() / (1.0 + s.abs())));
         worst_forced = worst_forced.max(rel);
+
+        // ATTRIBUTION: Gram residuals at ψ. interp = ‖gram_at(ψ)−exact(ψ)‖_F;
+        // anchored = ‖[gram_at(ψ)+exact(ψ_a)−gram_at(ψ_a)]−exact(ψ)‖_F. If the
+        // anchored residual → 0 as the move → 0 but β̂rel does NOT, the floor is
+        // downstream of the Gram (inner-solve frame / penalty re-key), not the
+        // interpolation; if the anchored residual itself floors, it is the Gram.
+        let g_interp = tensor_gram_at(psi);
+        let g_exact = exact_gram_at(psi);
+        let interp_res = frob_rel(&g_interp, &g_exact);
+        let mut g_anchored = g_interp.clone();
+        g_anchored += &g_exact_a;
+        g_anchored -= &g_interp_a;
+        let anchored_res = frob_rel(&g_anchored, &g_exact);
+
         eprintln!(
             "[DIAG1033-FORCE] frac={f:+.5} psi={psi:.5} covers_skip={gate} forced_β̂rel={rel:.3e} \
-             {}",
+             gram_interp_res={interp_res:.3e} gram_anchored_res={anchored_res:.3e} {}",
             if rel <= 1e-6 { "SOUND(≤1e-6)" } else { "UNSOUND(>1e-6)" }
         );
         // Re-pin at ψ_A after each forced trial so every measurement is a move
