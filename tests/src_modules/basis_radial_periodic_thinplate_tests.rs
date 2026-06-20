@@ -1794,11 +1794,25 @@ fn test_build_bspline_basis_1d_quantile_uses_divided_difference_penalty() {
     let g = penalty_greville_abscissae_for_knots(knots, spec.degree)
         .unwrap()
         .expect("quantile knots should trigger Greville scaling");
-    let expected =
+    let expected_raw =
         create_difference_penalty_matrix(built_design.ncols(), spec.penalty_order, Some(g.view()))
             .unwrap();
+    // The shipped penalty is Frobenius-normalized in the constrained coordinate
+    // frame (#1364/#1365/#1366): `λ` multiplies `S/‖S‖_F` so it shares the
+    // unit-Frobenius scale used by cr / duchon / tensor. This test certifies the
+    // *operator* — that quantile knots trigger the Greville-scaled divided-
+    // difference penalty — so compare against the same Greville-scaled penalty
+    // normalized the same way (identity identifiability leaves the shipped block
+    // exactly the normalized raw penalty).
+    let expected_norm = expected_raw.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let expected = expected_raw.mapv(|v| v / expected_norm);
 
     let got = &built.penalties[0];
+    let got_norm = got.iter().map(|v| v * v).sum::<f64>().sqrt();
+    assert!(
+        (got_norm - 1.0).abs() < 1e-9,
+        "shipped quantile penalty is not Frobenius-normalized: ‖S‖_F={got_norm:.6e}"
+    );
     let mut max_abs = 0.0_f64;
     for i in 0..got.nrows() {
         for j in 0..got.ncols() {
@@ -1807,7 +1821,7 @@ fn test_build_bspline_basis_1d_quantile_uses_divided_difference_penalty() {
     }
     assert!(
         max_abs < 1e-10,
-        "quantile penalty mismatch: max_abs_diff={max_abs:.3e}"
+        "quantile penalty mismatch (normalized Greville divided-difference): max_abs_diff={max_abs:.3e}"
     );
 }
 
