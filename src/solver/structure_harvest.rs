@@ -815,6 +815,30 @@ fn topology_candidates_for_dim(
     Ok(specs)
 }
 
+/// Rank-aware Laplace negative log evidence of a penalized candidate fit, on the
+/// smooth-rung scale shared by [`fit_topology_candidate`].
+///
+/// ```text
+/// raw_reml = ½·SSE + ½·log|H| − ½·log|S_pen|+
+/// ```
+///
+/// `sse` is the weighted Gaussian deviance (unit dispersion); `log_det_h` is the
+/// penalized-Hessian logdet `log|Φᵀ W Φ + S|`; `penalty_log_det` is the penalty
+/// pseudo-logdet `log|S_pen|+` (the sum of `ln` over the NON-NULL eigenvalues of
+/// the roughness Gram `S`). The `−½·log|S_pen|+` term is the prior normalizer
+/// that the rank-aware Laplace marginal likelihood requires — without it the
+/// `+½·log|H|` parameter price has no prior normalization to (partially) cancel
+/// it, so an over-flexible candidate is under-penalized (#1374). This mirrors the
+/// canonical [`crate::solver::evidence::laplace_evidence`]
+/// (`F + ½·log|H| − ½·log|S_pen|+ − …`); the `−½·(dim H − rank S)·log(2π)` and
+/// null-space terms it also carries are applied separately by the shared TK
+/// normalizer (`crate::solver::topology_selector::tk_normalized_score`), so they
+/// must NOT be duplicated here.
+#[inline]
+fn topology_candidate_raw_reml(sse: f64, log_det_h: f64, penalty_log_det: f64) -> f64 {
+    0.5 * sse + 0.5 * log_det_h - 0.5 * penalty_log_det
+}
+
 /// Fit one topology candidate to the birth target `Y` (`n × p`) over `weights`
 /// (`n`, the candidate's per-row reconstruction mass) by penalized least
 /// squares, and return its TK evidence inputs + the realized fit handle.
@@ -823,9 +847,10 @@ fn topology_candidates_for_dim(
 /// the scale the #1026 curved-vs-linear rung and the smooth-term topology race
 /// use, so it is commensurable under the shared TK normalizer:
 ///
-/// * `raw_reml = ½·(weighted residual SSE) + ½·log|Φᵀ W Φ + S|` — the rank-aware
-///   Laplace negative log evidence of the penalized fit (data-fit deviance + the
-///   Hessian logdet that prices the parameters against the effective sample).
+/// * `raw_reml = ½·(weighted residual SSE) + ½·log|Φᵀ W Φ + S| − ½·log|S|+` — the
+///   rank-aware Laplace negative log evidence of the penalized fit (data-fit
+///   deviance + the Hessian logdet that prices the parameters against the
+///   effective sample − the penalty pseudo-logdet prior normalizer, #1374).
 /// * `null_dim` / `null_space_logdet` — the roughness Gram's null space (the
 ///   unpenalized polynomial/constant directions) and its Hessian logdet over that
 ///   null space, the gauge-invariance term the TK normalizer subtracts.
@@ -970,11 +995,6 @@ fn fit_topology_candidate(
         log_det_h += ev.ln();
     }
 
-    // Rank-aware Laplace negative log evidence on the smooth-rung scale:
-    // ½·SSE (the Gaussian deviance, unit dispersion — the constant cancels in the
-    // TK race) + ½·log|H|.
-    let raw_reml = 0.5 * sse + 0.5 * log_det_h;
-
     // Null space of the roughness Gram S (the unpenalized constant/polynomial
     // directions): null_dim = nullity(S), and the null-space Hessian logdet is
     // the logdet of H restricted to ker(S). Over ker(S), H = Φᵀ W Φ (+ridge) — the
@@ -992,6 +1012,26 @@ fn fit_topology_candidate(
         .map(|(i, _)| i)
         .collect();
     let null_dim = null_cols.len();
+
+    // Penalty pseudo-logdet log|S_pen|+ — the prior normalizer of the rank-aware
+    // Laplace evidence: the sum of ln over the NON-NULL eigenvalues of the
+    // roughness Gram S (the same `s_tol` null-space cut used above). Mirrors the
+    // canonical `evidence::laplace_evidence`. Without subtracting it (#1374) the
+    // ½·log|H| parameter price has no prior normalization to (partially) cancel
+    // it, so the candidate is under-penalized for added flexibility.
+    let penalty_log_det: f64 = s_evals
+        .iter()
+        .filter(|&&v| v > s_tol)
+        .map(|&v| v.ln())
+        .sum();
+
+    // Rank-aware Laplace negative log evidence on the smooth-rung scale:
+    // ½·SSE (the Gaussian deviance, unit dispersion — the constant cancels in the
+    // TK race) + ½·log|H| − ½·log|S_pen|+ (the prior normalizer). The −½·(dim H −
+    // rank S)·log(2π) and null-space terms the canonical Laplace evidence also
+    // carries are applied separately by the shared TK normalizer
+    // (`tk_normalized_score`), so they are NOT duplicated here.
+    let raw_reml = topology_candidate_raw_reml(sse, log_det_h, penalty_log_det);
     let null_space_logdet = if null_dim == 0 {
         None
     } else {
@@ -1901,6 +1941,60 @@ mod tests {
     };
     use ndarray::Array2;
     use std::sync::Arc;
+
+    /// #1374: the per-candidate rank-aware Laplace evidence must include the
+    /// prior normalizer `−½·log|S_pen|+` (the pseudo-determinant = product of the
+    /// NON-NULL eigenvalues of the penalty `S`). The OLD (buggy) formula was
+    /// `½·SSE + ½·log|H|`; the corrected one subtracts `½·log|S_pen|+`. This test
+    /// builds a small known `sse`, `H`, and penalty `S` with a one-dimensional
+    /// null space and asserts the helper equals the corrected value — i.e. it
+    /// differs from the old value by exactly `−½·log|S_pen|+`.
+    #[test]
+    fn topology_candidate_raw_reml_includes_penalty_logdet_1374() {
+        // A diagonal penalty S = diag(2, 3, 0): one null direction (the 0), two
+        // non-null eigenvalues {2, 3}. Pseudo-logdet log|S|+ = ln 2 + ln 3.
+        let s_evals = [2.0_f64, 3.0_f64, 0.0_f64];
+        let s_max = s_evals.iter().fold(0.0_f64, |acc, &v| acc.max(v));
+        let s_tol = 1e-9 * (1.0 + s_max);
+        let penalty_log_det: f64 = s_evals
+            .iter()
+            .filter(|&&v| v > s_tol)
+            .map(|&v| v.ln())
+            .sum();
+        let expected_penalty_log_det = 2.0_f64.ln() + 3.0_f64.ln();
+        assert!(
+            (penalty_log_det - expected_penalty_log_det).abs() < 1e-12,
+            "penalty pseudo-logdet must sum ln over non-null eigenvalues only: \
+             got {penalty_log_det}, want {expected_penalty_log_det}"
+        );
+
+        // Known data-fit deviance and Hessian logdet.
+        let sse = 4.0_f64;
+        let log_det_h = 1.5_f64; // log|H| for some SPD H; value is opaque here.
+
+        let new_value = topology_candidate_raw_reml(sse, log_det_h, penalty_log_det);
+        let old_buggy_value = 0.5 * sse + 0.5 * log_det_h; // missing the −½·log|S|+ term
+
+        // The corrected value must differ from the old one by EXACTLY −½·log|S|+.
+        assert!(
+            (new_value - (old_buggy_value - 0.5 * penalty_log_det)).abs() < 1e-12,
+            "corrected raw_reml must equal old value − ½·log|S|+: \
+             new={new_value}, old={old_buggy_value}, log|S|+={penalty_log_det}"
+        );
+
+        // And it must NOT equal the old (buggy) value (log|S|+ > 0 here).
+        assert!(
+            (new_value - old_buggy_value).abs() > 1e-6,
+            "corrected raw_reml must differ from the buggy ½·SSE+½·log|H| formula"
+        );
+
+        // Full closed-form check of the corrected Laplace evidence.
+        let expected = 0.5 * sse + 0.5 * log_det_h - 0.5 * (2.0_f64.ln() + 3.0_f64.ln());
+        assert!(
+            (new_value - expected).abs() < 1e-12,
+            "raw_reml = ½·SSE + ½·log|H| − ½·log|S|+: got {new_value}, want {expected}"
+        );
+    }
 
     /// A high active logit (atom routes strongly on the row) and a low one
     /// (atom is dormant). With the `ACTIVE_SUPPORT_REL_FLOOR / K` threshold a
