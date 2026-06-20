@@ -3733,18 +3733,39 @@ impl SaeManifoldTerm {
             pub(crate) jac_white: Vec<f64>,
             pub(crate) decoded_scratch: Vec<f64>,
         }
+        // #1410: size the per-worker scratch by the COMPACT row dimensions, not
+        // full `K`/`q`. With a compact layout the assembly only ever touches each
+        // row's active atoms (≤ `max_active`) and its compact tangent block
+        // (≤ `max_q_row`); allocating `decoded` at `k_atoms·p` and `jac_white` at
+        // `q·max(w_dim,p)` was the per-worker `O(K)` blow-up (≈11 GiB/worker at
+        // K=100k, p=5120 — and `map_init` gives every Rayon worker its own copy).
+        // Without a layout the dense path needs full `k_atoms`/`q`. `decoded` rows
+        // are addressed by COMPACT SLOT in the compact branch below (the dense
+        // branch keeps global-atom rows), so the row count is the max active set.
+        let (decoded_rows, scratch_q) = match row_layout.as_ref() {
+            Some(layout) => {
+                let max_active = (0..n)
+                    .map(|r| layout.active_atoms[r].len())
+                    .max()
+                    .unwrap_or(0)
+                    .max(1);
+                let max_q_row = (0..n).map(|r| layout.row_q_active(r)).max().unwrap_or(q).max(1);
+                (max_active, max_q_row)
+            }
+            None => (k_atoms, q),
+        };
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let row_results: Vec<SaeAssemblyRow> = (0..n)
             .into_par_iter()
             .map_init(
                 || RowScratch {
-                    decoded: Array2::<f64>::zeros((k_atoms, p)),
+                    decoded: Array2::<f64>::zeros((decoded_rows, p)),
                     dg_buf: vec![0.0_f64; p],
                     fitted: Array1::<f64>::zeros(p),
                     error: Array1::<f64>::zeros(p),
                     error_white: vec![0.0_f64; w_dim],
                     error_metric: Array1::<f64>::zeros(p),
-                    jac_white: vec![0.0_f64; q * w_dim.max(p)],
+                    jac_white: vec![0.0_f64; scratch_q * w_dim.max(p)],
                     decoded_scratch: vec![0.0_f64; p],
                 },
                 |scratch, row| -> Result<SaeAssemblyRow, String> {
@@ -3772,12 +3793,16 @@ impl SaeManifoldTerm {
                         row_layout.as_ref().map(|l| l.active_atoms[row].as_slice());
                     match row_active_owned {
                         Some(active) => {
-                            for &atom_idx in active {
+                            // #1410: `decoded` is a compact (max_active × p) buffer
+                            // here; index it by the active-set SLOT `j` (the same
+                            // index the compact tangent block / `coord_starts` use),
+                            // NOT the global `atom_idx`.
+                            for (j, &atom_idx) in active.iter().enumerate() {
                                 let a_k = assignments[atom_idx];
                                 self.atoms[atom_idx]
                                     .fill_decoded_row(row, decoded_scratch.as_mut_slice());
                                 for out_col in 0..p {
-                                    decoded[[atom_idx, out_col]] = decoded_scratch[out_col];
+                                    decoded[[j, out_col]] = decoded_scratch[out_col];
                                     fitted[out_col] += a_k * decoded_scratch[out_col];
                                 }
                             }
@@ -3863,7 +3888,8 @@ impl SaeManifoldTerm {
                                     k,
                                     logit_k: logits_row[k],
                                     a_k: assignments[k],
-                                    decoded_k: decoded.row(k),
+                                    // #1410: compact slot `j`, not global atom `k`.
+                                    decoded_k: decoded.row(j),
                                     fitted: fitted.view(),
                                     ibp_prior: ibp_prior_slice,
                                     compact_index: j,
