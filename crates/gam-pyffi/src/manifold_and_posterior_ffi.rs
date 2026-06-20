@@ -2025,7 +2025,26 @@ fn summary_smooth_terms(
     };
 
     let mut out = Vec::<SummarySmoothTermRow>::new();
-    let mut penalty_cursor = 0usize;
+    // The fit's GLOBAL penalty layout (and thus `penalty_block_trace`) opens with a
+    // single shared `LinearTermRidge` block IFF any linear term has
+    // `double_penalty=true` (`design_construction.rs`). Random-effect and smooth
+    // penalty blocks follow it. Seeding `penalty_cursor` at 0 ignored that leading
+    // block, sliding every per-term trace window off by one whenever a penalized
+    // linear term was present; on this persisted / column-conditioned path `F` is
+    // nulled, so `per_term_edf` falls back to the `penalty_block_trace` window and
+    // the off-by-one corrupts every per-term EDF (#1372). Start the cursor PAST any
+    // leading `LinearTermRidge` block by counting it in the recorded global ordering
+    // rather than re-deriving it.
+    let mut penalty_cursor = design
+        .penaltyinfo
+        .iter()
+        .filter(|info| {
+            matches!(
+                &info.penalty.source,
+                gam::basis::PenaltySource::Other(s) if s == "LinearTermRidge"
+            )
+        })
+        .count();
     for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
         // Per-term EDF as the influence-matrix trace over the term's coefficient
         // block (#1219, #1277) — never the legacy per-block-EDF sum, which

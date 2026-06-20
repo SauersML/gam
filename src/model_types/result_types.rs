@@ -363,6 +363,136 @@ mod per_term_edf_tests {
         );
     }
 
+    /// Build a fit whose GLOBAL penalty layout opens with a shared
+    /// `LinearTermRidge` block (trace `lead_trace`) followed by `block_traces`
+    /// further penalty blocks, with NO influence matrix recorded — so
+    /// `per_term_edf` reads the `penalty_block_trace` fallback window, the exact
+    /// path the persisted / column-conditioned summary builders hit.
+    fn fit_with_leading_linear_ridge(lead_trace: f64, block_traces: &[f64]) -> UnifiedFitResult {
+        let mut traces = vec![lead_trace];
+        traces.extend_from_slice(block_traces);
+        let n_blocks = traces.len();
+        let p = 1 + 10 * block_traces.len().max(1);
+        let lambdas = Array1::from_vec(vec![1.0; n_blocks]);
+        UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: Array1::zeros(p),
+                role: BlockRole::Mean,
+                edf: p as f64,
+                lambdas: lambdas.clone(),
+            }],
+            log_lambdas: Array1::zeros(n_blocks),
+            lambdas,
+            likelihood_family: Some(LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            used_device: false,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: Some(0.0),
+            standard_deviation: 1.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference: Some(FitInference {
+                edf_by_block: vec![0.0; n_blocks],
+                penalty_block_trace: traces,
+                edf_total: p as f64,
+                smoothing_correction: None,
+                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
+                working_weights: Array1::ones(1),
+                working_response: Array1::zeros(1),
+                reparam_qs: None,
+                dispersion: Dispersion::Estimated(1.0),
+                beta_covariance: None,
+                beta_standard_errors: None,
+                beta_covariance_corrected: None,
+                beta_standard_errors_corrected: None,
+                beta_covariance_frequentist: None,
+                // No influence matrix: forces the per-block-trace fallback where
+                // `penalty_cursor` keys into `penalty_block_trace`.
+                coefficient_influence: None,
+                weighted_gram: None,
+                bias_correction_beta: None,
+            }),
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: crate::pirls::PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: FitArtifacts::default(),
+            inner_cycles: 0,
+        })
+    }
+
+    /// Regression for issue #1372. The fit's global penalty order is
+    /// `[LinearTermRidge (trace 0.9), s(x) smooth (trace 3.0)]` (a `double_penalty`
+    /// linear term emits the leading shared ridge). For the dim-10 smooth block the
+    /// summary builders must seed `penalty_cursor` PAST that leading ridge: the
+    /// CORRECT cursor=1 reads trace[1]=3.0 → EDF = 10 − 3.0 = 7.0, whereas the
+    /// BUGGY cursor=0 reads trace[0]=0.9 → 9.1. With `coefficient_influence=None`
+    /// the bug is unmasked (small dense fits route through the influence matrix and
+    /// never hit this path).
+    #[test]
+    fn summary_penalty_cursor_skips_leading_linear_ridge() {
+        let fit = fit_with_leading_linear_ridge(0.9, &[3.0]);
+        let smooth_range = 1..11; // 10-column smooth block past the intercept
+        let tol = 1e-9;
+
+        // BUGGY cursor (0): reads the leading LinearTermRidge trace (0.9).
+        let buggy = fit.per_term_edf(smooth_range.clone(), 0, 1);
+        assert!(
+            (buggy - 9.1).abs() < tol,
+            "buggy cursor=0 should read trace[0]=0.9 → EDF 9.1, got {buggy}"
+        );
+
+        // FIXED cursor (1): seeded past the leading LinearTermRidge block.
+        let leading_linear_ridge = 1usize;
+        let fixed = fit.per_term_edf(smooth_range, leading_linear_ridge, 1);
+        assert!(
+            (fixed - 7.0).abs() < tol,
+            "cursor seeded past LinearTermRidge should read trace[1]=3.0 → EDF 7.0, got {fixed}"
+        );
+    }
+
+    /// Defect B coverage for issue #1372: with the global order
+    /// `[LinearTermRidge (0.9), <unpenalised RE: 0 blocks>, s(x) (trace 3.0)]`, the
+    /// summary cursor must (a) skip the leading ridge AND (b) NOT advance over the
+    /// unpenalised RE term. Combined, the smooth's cursor lands at 1 (the ridge
+    /// occupies index 0; the RE term owns no penalty block) → trace[1]=3.0 → EDF
+    /// 7.0. Advancing for the RE term (cursor=2) would run off the 2-block trace and
+    /// collapse the EDF to 0.
+    #[test]
+    fn summary_penalty_cursor_skips_leading_ridge_and_unpenalised_re() {
+        let fit = fit_with_leading_linear_ridge(0.9, &[3.0]);
+        let smooth_range = 11..21; // smooth block after the RE block's coefficients
+        let tol = 1e-9;
+
+        // Replay the summary walk: seed past the leading LinearTermRidge, then the
+        // unpenalised RE term owns 0 penalty blocks (does not advance the cursor).
+        let mut cursor = 1usize; // past LinearTermRidge
+        let re_penalized = false;
+        cursor += usize::from(re_penalized); // Defect B: +0 for unpenalised RE
+        let edf = fit.per_term_edf(smooth_range.clone(), cursor, 1);
+        assert!(
+            (edf - 7.0).abs() < tol,
+            "cursor past ridge + unpenalised RE should read trace[1]=3.0 → EDF 7.0, got {edf}"
+        );
+
+        // Sanity: the Defect-B-buggy walk (advance over the unpenalised RE) runs off
+        // the end of the 2-block trace and `per_term_edf` collapses to 0.
+        let buggy = fit.per_term_edf(smooth_range, 2, 1);
+        assert!(
+            buggy <= tol,
+            "buggy cursor=2 should run off the trace and zero the EDF, got {buggy}"
+        );
+    }
+
     #[test]
     fn edf_total_never_below_a_single_terms_edf() {
         let fit = fit_single_thinplate_consistent_edf();
