@@ -69,8 +69,7 @@ use super::{
     BasisBuildResult, BasisError, BasisMetadata, BasisPsiDerivativeBundle,
     BasisPsiDerivativeResult, BasisPsiSecondDerivativeResult, CenterStrategy, PenaltyCandidate,
     PenaltyInfo, PenaltySource, filter_active_penalty_candidates_with_ops, normalize_penalty,
-    normalize_penaltywith_psi_derivatives, select_centers_by_strategy,
-    weighted_coefficient_sum_to_zero_transform,
+    select_centers_by_strategy, weighted_coefficient_sum_to_zero_transform,
 };
 
 /// Realized-design identifiability policy for the constant-curvature smooth.

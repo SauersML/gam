@@ -323,7 +323,7 @@ mod module_path_lock_tests {
     fn gpu_device_runtime_module_path_is_canonical() {
         // Resolving `GpuRuntime` through the `device_runtime` module path
         // pins the honest name; if the module is renamed this stops compiling.
-        drop(crate::gpu::device_runtime::GpuRuntime::is_available());
+        _ = crate::gpu::device_runtime::GpuRuntime::is_available();
         let type_name = std::any::type_name::<crate::gpu::device_runtime::GpuRuntime>();
         assert!(
             type_name.contains("device_runtime"),

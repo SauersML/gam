@@ -10697,7 +10697,7 @@ mod inner_contract_probe_tests {
         for row in 0..n_holdout {
             norm_bound = norm_bound.max(heldout.row(row).dot(&heldout.row(row)).sqrt());
         }
-        let atlas = EncodeAtlas::build(
+        let _atlas = EncodeAtlas::build(
             &atoms,
             &[1.0],
             norm_bound,

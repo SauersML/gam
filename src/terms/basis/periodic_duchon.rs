@@ -953,7 +953,7 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
     centers: Array2<f64>,
     periodic_per_axis: &[bool],
     periods: &[f64],
-    workspace: &mut BasisWorkspace,
+    _workspace: &mut BasisWorkspace,
 ) -> Result<BasisBuildResult, BasisError> {
     let d = data.ncols();
     if d == 0 {

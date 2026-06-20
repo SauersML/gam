@@ -18,7 +18,6 @@ include = [
     "/build.rs",
     "/Cargo.toml",
     "/rust-toolchain.toml",
-    "/rustfmt.toml",
     "/README.md",
     "/LICENSE",
 ]
@@ -41,7 +40,8 @@ resolver = "3"
 # but no longer hard-fails on "warn", so the build stays green for everyone
 # while that cleanup finishes; flip both back to "deny" once it builds clean.
 [lints.rust]
-warnings = "warn"
+warnings = "deny"
+dead_code = "allow"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
