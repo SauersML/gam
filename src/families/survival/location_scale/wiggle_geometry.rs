@@ -50,11 +50,6 @@ pub(crate) struct SurvivalDynamicGeometryRowsMut<'a> {
     pub(crate) d2qdot_ls: &'a mut [f64],
     pub(crate) d2qdot_lstd: &'a mut [f64],
     pub(crate) d2qdot_lslsd: &'a mut [f64],
-    pub(crate) d3qdot_tls_ls: &'a mut [f64],
-    pub(crate) d3qdot_tls_lsd: &'a mut [f64],
-    pub(crate) d3qdot_td_ls_ls: &'a mut [f64],
-    pub(crate) d3qdot_ls_ls_ls: &'a mut [f64],
-    pub(crate) d3qdot_ls_ls_lsd: &'a mut [f64],
 }
 
 impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
@@ -90,11 +85,6 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
         let (d2qdot_ls_l, d2qdot_ls_r) = self.d2qdot_ls.split_at_mut(mid);
         let (d2qdot_lstd_l, d2qdot_lstd_r) = self.d2qdot_lstd.split_at_mut(mid);
         let (d2qdot_lslsd_l, d2qdot_lslsd_r) = self.d2qdot_lslsd.split_at_mut(mid);
-        let (d3qdot_tls_ls_l, d3qdot_tls_ls_r) = self.d3qdot_tls_ls.split_at_mut(mid);
-        let (d3qdot_tls_lsd_l, d3qdot_tls_lsd_r) = self.d3qdot_tls_lsd.split_at_mut(mid);
-        let (d3qdot_td_ls_ls_l, d3qdot_td_ls_ls_r) = self.d3qdot_td_ls_ls.split_at_mut(mid);
-        let (d3qdot_ls_ls_ls_l, d3qdot_ls_ls_ls_r) = self.d3qdot_ls_ls_ls.split_at_mut(mid);
-        let (d3qdot_ls_ls_lsd_l, d3qdot_ls_ls_lsd_r) = self.d3qdot_ls_ls_lsd.split_at_mut(mid);
 
         (
             Self {
@@ -124,11 +114,6 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
                 d2qdot_ls: d2qdot_ls_l,
                 d2qdot_lstd: d2qdot_lstd_l,
                 d2qdot_lslsd: d2qdot_lslsd_l,
-                d3qdot_tls_ls: d3qdot_tls_ls_l,
-                d3qdot_tls_lsd: d3qdot_tls_lsd_l,
-                d3qdot_td_ls_ls: d3qdot_td_ls_ls_l,
-                d3qdot_ls_ls_ls: d3qdot_ls_ls_ls_l,
-                d3qdot_ls_ls_lsd: d3qdot_ls_ls_lsd_l,
             },
             Self {
                 q_exit: q_exit_r,
@@ -157,11 +142,6 @@ impl<'a> SurvivalDynamicGeometryRowsMut<'a> {
                 d2qdot_ls: d2qdot_ls_r,
                 d2qdot_lstd: d2qdot_lstd_r,
                 d2qdot_lslsd: d2qdot_lslsd_r,
-                d3qdot_tls_ls: d3qdot_tls_ls_r,
-                d3qdot_tls_lsd: d3qdot_tls_lsd_r,
-                d3qdot_td_ls_ls: d3qdot_td_ls_ls_r,
-                d3qdot_ls_ls_ls: d3qdot_ls_ls_ls_r,
-                d3qdot_ls_ls_lsd: d3qdot_ls_ls_lsd_r,
             },
         )
     }
@@ -268,11 +248,6 @@ pub(crate) fn fill_survival_dynamic_geometry_rows_serial(
         rows.d2qdot_ls[offset] = exit_dyn.qdot_ll;
         rows.d2qdot_lstd[offset] = exit_dyn.qdot_lstd;
         rows.d2qdot_lslsd[offset] = exit_dyn.qdot_llsd;
-        rows.d3qdot_tls_ls[offset] = exit_dyn.qdot_tll;
-        rows.d3qdot_tls_lsd[offset] = exit_dyn.qdot_tlsd_ls;
-        rows.d3qdot_td_ls_ls[offset] = exit_dyn.qdot_tdll;
-        rows.d3qdot_ls_ls_ls[offset] = exit_dyn.qdot_lll;
-        rows.d3qdot_ls_ls_lsd[offset] = exit_dyn.qdot_llsd_ls;
     }
 }
 
@@ -297,11 +272,6 @@ pub(crate) struct SurvivalDynamicQScalars {
     pub(crate) qdot_ll: f64,
     pub(crate) qdot_lstd: f64,
     pub(crate) qdot_llsd: f64,
-    pub(crate) qdot_tll: f64,
-    pub(crate) qdot_tlsd_ls: f64,
-    pub(crate) qdot_tdll: f64,
-    pub(crate) qdot_lll: f64,
-    pub(crate) qdot_llsd_ls: f64,
 }
 
 #[derive(Clone)]
@@ -349,11 +319,6 @@ pub(crate) struct SurvivalDynamicGeometry {
     pub(crate) d2qdot_ls: Array1<f64>,
     pub(crate) d2qdot_lstd: Array1<f64>,
     pub(crate) d2qdot_lslsd: Array1<f64>,
-    pub(crate) d3qdot_tls_ls: Array1<f64>,
-    pub(crate) d3qdot_tls_lsd: Array1<f64>,
-    pub(crate) d3qdot_td_ls_ls: Array1<f64>,
-    pub(crate) d3qdot_ls_ls_ls: Array1<f64>,
-    pub(crate) d3qdot_ls_ls_lsd: Array1<f64>,
     pub(crate) wiggle_basis_exit: Option<Array2<f64>>,
     pub(crate) wiggle_basis_entry: Option<Array2<f64>>,
     pub(crate) wiggle_basis_d1_exit: Option<Array2<f64>>,
@@ -553,45 +518,6 @@ pub(crate) fn compose_survival_dynamic_q(
         ),
         qdot_lstd: safe_sum2(safe_product(m2, safe_product(a, b)), safe_product(m1, c)),
         qdot_llsd: safe_sum2(safe_product(m2, safe_product(b, b)), safe_product(m1, d)),
-        qdot_tll: safe_sum3(
-            safe_product(m3, safe_product(a, safe_product(b, r))),
-            safe_product(
-                m2,
-                safe_sum3(
-                    safe_product(e, r),
-                    safe_product(c, r_ls),
-                    safe_product(d, r_t),
-                ),
-            ),
-            safe_product(m1, safe_product(-e, eta_ls_deriv)),
-        ),
-        qdot_tlsd_ls: safe_sum3(
-            safe_product(m3, safe_product(a, safe_product(b, b))),
-            safe_product(m2, safe_sum2(safe_product(a, d), 2.0 * safe_product(b, c))),
-            safe_product(m1, e),
-        ),
-        qdot_tdll: safe_sum3(
-            safe_product(m3, safe_product(a, safe_product(b, b))),
-            safe_product(m2, safe_sum2(safe_product(a, d), 2.0 * safe_product(b, c))),
-            safe_product(m1, e),
-        ),
-        qdot_lll: safe_sum3(
-            safe_product(m3, safe_product(safe_product(b, b), safe_product(b, r))),
-            safe_product(
-                m2,
-                safe_sum3(
-                    safe_product(f, r),
-                    safe_product(3.0 * d, r_ls),
-                    safe_product(3.0 * b, r_ll),
-                ),
-            ),
-            safe_product(m1, -r_ll),
-        ),
-        qdot_llsd_ls: safe_sum3(
-            safe_product(m3, safe_product(b, safe_product(b, b))),
-            safe_product(m2, 3.0 * safe_product(b, d)),
-            safe_product(m1, f),
-        ),
     }
 }
 
@@ -793,11 +719,6 @@ impl SurvivalLocationScaleFamily {
         let mut d2qdot_ls = Array1::<f64>::zeros(n);
         let mut d2qdot_lstd = Array1::<f64>::zeros(n);
         let mut d2qdot_lslsd = Array1::<f64>::zeros(n);
-        let mut d3qdot_tls_ls = Array1::<f64>::zeros(n);
-        let mut d3qdot_tls_lsd = Array1::<f64>::zeros(n);
-        let mut d3qdot_td_ls_ls = Array1::<f64>::zeros(n);
-        let mut d3qdot_ls_ls_ls = Array1::<f64>::zeros(n);
-        let mut d3qdot_ls_ls_lsd = Array1::<f64>::zeros(n);
 
         let dynamic_row_inputs = SurvivalDynamicGeometryRowInputs {
             eta_t_exit: eta_t_exit.view(),
@@ -883,21 +804,6 @@ impl SurvivalLocationScaleFamily {
             d2qdot_lslsd: d2qdot_lslsd
                 .as_slice_mut()
                 .expect("d2qdot_lslsd must be contiguous"),
-            d3qdot_tls_ls: d3qdot_tls_ls
-                .as_slice_mut()
-                .expect("d3qdot_tls_ls must be contiguous"),
-            d3qdot_tls_lsd: d3qdot_tls_lsd
-                .as_slice_mut()
-                .expect("d3qdot_tls_lsd must be contiguous"),
-            d3qdot_td_ls_ls: d3qdot_td_ls_ls
-                .as_slice_mut()
-                .expect("d3qdot_td_ls_ls must be contiguous"),
-            d3qdot_ls_ls_ls: d3qdot_ls_ls_ls
-                .as_slice_mut()
-                .expect("d3qdot_ls_ls_ls must be contiguous"),
-            d3qdot_ls_ls_lsd: d3qdot_ls_ls_lsd
-                .as_slice_mut()
-                .expect("d3qdot_ls_ls_lsd must be contiguous"),
         };
         fill_survival_dynamic_geometry_rows(dynamic_rows, 0, &dynamic_row_inputs);
 
@@ -975,11 +881,6 @@ impl SurvivalLocationScaleFamily {
             d2qdot_ls,
             d2qdot_lstd,
             d2qdot_lslsd,
-            d3qdot_tls_ls,
-            d3qdot_tls_lsd,
-            d3qdot_td_ls_ls,
-            d3qdot_ls_ls_ls,
-            d3qdot_ls_ls_lsd,
             wiggle_basis_exit: wiggle_exit.as_ref().map(|w| w.basis.clone()),
             wiggle_basis_entry: wiggle_entry.as_ref().map(|w| w.basis.clone()),
             wiggle_basis_d1_exit: wiggle_exit.as_ref().map(|w| w.basis_d1.clone()),
