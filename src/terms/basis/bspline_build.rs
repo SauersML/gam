@@ -138,11 +138,20 @@ pub fn build_bspline_basis_1d(
         // is likewise a SINGLE-penalty smooth for the same reason. Emit only the
         // wiggliness penalty for the cyclic basis regardless of `double_penalty`:
         // there is no free polynomial null space left to shrink.
+        //
+        // Frobenius-normalize the cyclic wiggliness penalty (recording the norm
+        // in `normalization_scale`) so its smoothing parameter `λ` is on the same
+        // unit-Frobenius scale as every other basis (cr / duchon / tensor / the
+        // open-knot ps path, #1365). The shipped design penalty is `β'(S/c)β`; a
+        // raw `S` (scale 1.0) put `λ` on a basis-dependent scale and the outer
+        // λ-search heuristics under-smoothed exactly as for the open ps single
+        // penalty. Fit-invariant at the REML optimum (only `λ̂` rescales by `c`).
+        let (s_bend_norm, s_bend_scale) = normalize_penalty(&s_bend_raw);
         let penalties_raw = vec![PenaltyCandidate {
-            matrix: s_bend_raw.clone(),
+            matrix: s_bend_norm,
             nullspace_dim_hint: 1,
             source: PenaltySource::Primary,
-            normalization_scale: 1.0,
+            normalization_scale: s_bend_scale,
             kronecker_factors: None,
             op: None,
         }];
