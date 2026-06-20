@@ -247,6 +247,11 @@ struct SummaryPayload {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     deployment_extensions: Vec<SavedDeploymentExtension>,
     deviance: f64,
+    /// Log-likelihood at the converged mode (engine constants-omitted scale).
+    /// Carried so `compare_models` can form the Occam-penalised conditional AIC
+    /// it ranks on (issue #1362). Optional for forward/backward compatibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    log_likelihood: Option<f64>,
     reml_score: f64,
     raw_reml_score: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3399,6 +3404,8 @@ const RAW_REML_SCORE_KEYS: &[&str] = &["raw_reml_score"];
 
 const EDF_KEYS: &[&str] = &["edf_total", "edf", "effective_dof"];
 
+const LOG_LIK_KEYS: &[&str] = &["log_likelihood", "loglik", "log_lik"];
+
 const PENALTY_RANK_KEYS: &[&str] = &["penalty_rank", "rank_s", "rank_S", "cache_penalty_rank"];
 
 const NULL_DIM_KEYS: &[&str] = &["null_dim"];
@@ -3488,6 +3495,7 @@ fn compare_reml_fits(
             name,
             score: extract_reml_score_from_view(py, &view)?,
             edf: extract_edf_from_view(py, &view)?,
+            log_lik: extract_log_lik_from_view(&view)?,
         });
     }
 
@@ -3669,6 +3677,14 @@ fn extract_edf_from_view(_py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<Op
             py_value_to_float_or_sum(&value).map(Some)
         }
     }
+}
+
+/// Log-likelihood at the converged mode, used by `compare_models` to form the
+/// Occam-penalised conditional AIC that decides the winner (issue #1362).
+/// `None` when the fit payload predates the field — the comparison then falls
+/// back to the raw REML/LAML evidence headline.
+fn extract_log_lik_from_view(view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
+    extract_float_metadata_from_view(view, LOG_LIK_KEYS)
 }
 
 fn extract_float_metadata_from_view(
