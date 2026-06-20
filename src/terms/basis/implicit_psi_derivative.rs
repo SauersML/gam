@@ -2819,6 +2819,21 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
     )
     .with_psi_scale_share(psi_scale_share);
 
+    // gam#1376 — install the raw-η mean-centering on the operator BEFORE it is
+    // used (operator-only matvecs OR dense materialization below). The combo
+    // machinery applies (I − 11ᵀ/d) to BOTH the first derivative and the
+    // second (`PᵀH^ψP`), so every design derivative this function emits — the
+    // operator's matvecs, the materialized dense `design_first` /
+    // `design_second_diag`, and the cross-second derivatives the consumer pulls
+    // from the operator — is in the SAME raw-η gauge. Centering the operator
+    // before `materialize_*` is what makes the dense (small-n) path
+    // PᵀHP-consistent with the operator (large-n) path; the dense first/diag
+    // blocks come out already centered, so NO separate per-axis mean-subtraction
+    // is applied downstream (that would double-center).
+    if center_for_raw_eta {
+        op = op.with_raw_eta_centering();
+    }
+
     if operator_only {
         // Operator is the SOLE derivative source here (dense blocks empty), so it
         // must carry the raw-η centering itself (gam#1376). In the dense+operator

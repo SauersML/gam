@@ -658,12 +658,31 @@ pub fn build_constant_curvature_basis(
     let design = crate::matrix::DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
         gauge.restrict_design(&raw_design),
     ));
-    let (penalty_norm, c_primary) = normalize_penalty(&((&penalty + &penalty.t()) * 0.5));
+    // Keep the RKHS penalty RAW (the symmetric kernel Gram zᵀKz) with
+    // normalization_scale = 1, rather than Frobenius-normalizing it. The Gram's
+    // eigenvalues ARE the physical RKHS roughness energies of each coefficient
+    // direction: the smoothest functions (the low-degree / degree-1 signal) sit
+    // in the genuinely tiny-eigenvalue directions, while wiggly functions sit in
+    // the large ones — a spread of many orders of magnitude. Frobenius-
+    // normalizing divides the whole operator by ‖·‖_F (dominated by the large
+    // wiggly eigenvalues), which compresses that spread and inflates the
+    // smallest eigenvalues relative to their natural scale. REML's scale-
+    // sensitive λ heuristics then drive a single λ high enough to suppress the
+    // wiggly directions and, because the smooth directions are no longer
+    // proportionally tiny, over-shrink the recoverable low-degree signal
+    // (planted degree-1 sphere harmonic recovered at only R²≈0.84). Keeping the
+    // raw physical operator (scale = 1, matching the sphere-harmonic Laplace-
+    // Beltrami penalty) lets REML act on true roughness, leaving the smooth
+    // signal essentially unpenalized while still shrinking the wiggly tail —
+    // raising recovery toward the unconstrained RKHS ceiling. The penalty stays
+    // exactly proportional to zᵀKz, so the constrained-kernel-Gram contract is
+    // unchanged.
+    let penalty_sym = (&penalty + &penalty.t()) * 0.5;
     let mut candidates = vec![PenaltyCandidate {
-        matrix: penalty_norm,
+        matrix: penalty_sym,
         nullspace_dim_hint: 0,
         source: PenaltySource::Primary,
-        normalization_scale: c_primary,
+        normalization_scale: 1.0,
         kronecker_factors: None,
         op: None,
     }];
@@ -815,29 +834,29 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
     let design_first = gauge.restrict_design(&dk_dc);
     let design_second_diag = gauge.restrict_design(&dkk_dc);
 
-    // Penalty κ-jets: S_raw = symm(zᵀ K(centers,centers) z). Rebuild the value
-    // penalty (and its normalization constant) from the SAME path the value
-    // builder used so the quotient-rule normalization derivatives are exact.
-    let (k_cc, dk_cc, dkk_cc) = constant_curvature_kernel_kappa_jets_scaled(
+    // Penalty κ-jets: S = symm(zᵀ K(centers,centers) z), kept RAW (no Frobenius
+    // normalization) exactly as the value builder now does (scale = 1). The raw
+    // symmetric penalty's κ-derivatives are therefore the symmetrized restricted
+    // kernel κ-jets DIRECTLY — there is no normalization quotient rule to
+    // propagate, which also removes the κ-dependent ‖S‖_F factor that the
+    // normalized form had to differentiate.
+    let (_k_cc, dk_cc, dkk_cc) = constant_curvature_kernel_kappa_jets_scaled(
         centers.view(),
         centers.view(),
         spec.kappa,
         l_jet,
     )?;
-    let s_raw = symmetrize(&gauge.restrict_penalty(&k_cc));
-    let s_raw_first = symmetrize(&gauge.restrict_penalty(&dk_cc));
-    let s_raw_second = symmetrize(&gauge.restrict_penalty(&dkk_cc));
-    let (_s_norm, s_norm_first, s_norm_second, _c) =
-        normalize_penaltywith_psi_derivatives(&s_raw, &s_raw_first, &s_raw_second);
+    let s_first = symmetrize(&gauge.restrict_penalty(&dk_cc));
+    let s_second = symmetrize(&gauge.restrict_penalty(&dkk_cc));
 
     // Align the single primary-penalty derivative with the realized active
     // penalty list (primary always; ridge only when double_penalty, and
     // κ-independent). Rebuild the realized basis once to read `penaltyinfo`.
     let base = build_constant_curvature_basis(data, spec)?;
     let penalties_derivative =
-        active_constant_curvature_penalty_derivatives(&base.penaltyinfo, &s_norm_first)?;
+        active_constant_curvature_penalty_derivatives(&base.penaltyinfo, &s_first)?;
     let penaltiessecond_derivative =
-        active_constant_curvature_penalty_derivatives(&base.penaltyinfo, &s_norm_second)?;
+        active_constant_curvature_penalty_derivatives(&base.penaltyinfo, &s_second)?;
 
     Ok(BasisPsiDerivativeBundle {
         first: BasisPsiDerivativeResult {
