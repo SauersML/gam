@@ -208,7 +208,9 @@ pub fn build_bspline_basis_1d(
                 )
             };
         let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-            filter_active_penalty_candidates_with_ops(transformed_candidates)?;
+            filter_active_penalty_candidates_with_ops(
+            renormalize_constrained_penalty_candidates(transformed_candidates),
+        )?;
         return Ok(BasisBuildResult {
             design,
             penalties,
@@ -312,7 +314,9 @@ pub fn build_bspline_basis_1d(
                 Some(chunk),
             )?;
         let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-            filter_active_penalty_candidates_with_ops(transformed_candidates)?;
+            filter_active_penalty_candidates_with_ops(
+            renormalize_constrained_penalty_candidates(transformed_candidates),
+        )?;
         return Ok(BasisBuildResult {
             design,
             penalties,
@@ -609,7 +613,9 @@ pub fn build_bspline_basis_1d(
             )
         };
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
-        filter_active_penalty_candidates_with_ops(transformed_candidates)?;
+        filter_active_penalty_candidates_with_ops(
+            renormalize_constrained_penalty_candidates(transformed_candidates),
+        )?;
     Ok(BasisBuildResult {
         design,
         penalties,
@@ -1336,7 +1342,16 @@ pub fn analyze_penalty_block_with_op(
     let (sym, evals, evecs) = spectral_summary(penalty)?;
     let tol = spectral_tolerance(&sym, &evals);
     let rank = evals.iter().filter(|&&ev| ev > tol).count();
-    let nullity = sym.nrows().saturating_sub(rank);
+    // The penalty null space is the set of directions on which the penalty
+    // carries no curvature, i.e. eigenvalues within tolerance of *zero*
+    // (`|ev| <= tol`). A genuinely negative eigenvalue (`ev < -tol`) is an
+    // O(1) direction of *negative* curvature — a non-PSD penalty — and must
+    // NOT be folded into the null space. Counting `ev <= tol` (the old
+    // convention) silently classified such negative eigendirections as null,
+    // so the canonical root dropped genuine negative curvature into the
+    // absorbed parametric block (#1425). Match `estimate_penalty_nullity`,
+    // which already keys nullity on `|ev| <= tol`.
+    let nullity = evals.iter().filter(|&&ev| ev.abs() <= tol).count();
     let max_abs_eigenvalue = evals
         .iter()
         .copied()
@@ -1376,11 +1391,15 @@ pub(crate) fn nullspace_basis_from_block(block: &CanonicalPenaltyBlock) -> Optio
     if block.nullity == 0 {
         return None;
     }
+    // Null directions are eigenvalues within tolerance of zero (`|ev| <= tol`),
+    // NOT every eigenvalue `<= tol`: the latter sweeps up genuinely *negative*
+    // eigenvalues (negative curvature, a non-PSD penalty) and would absorb them
+    // into the parametric block as if they were unpenalized (#1425).
     let null_idx: Vec<usize> = block
         .eigenvalues
         .iter()
         .enumerate()
-        .filter_map(|(i, &ev)| (ev <= block.tol).then_some(i))
+        .filter_map(|(i, &ev)| (ev.abs() <= block.tol).then_some(i))
         .collect();
     if null_idx.is_empty() {
         return None;
@@ -1459,7 +1478,12 @@ pub fn compute_joint_null_rotation(
     }
     let (sym, evals, evecs) = spectral_summary(&s_sum)?;
     let tol = spectral_tolerance(&sym, &evals);
-    let joint_nullity = evals.iter().filter(|&&ev| ev <= tol).count();
+    // Joint null directions are within tolerance of zero (`|ev| <= tol`). A
+    // genuinely negative joint eigenvalue (`ev < -tol`) is negative curvature,
+    // not an unpenalized direction, and must NOT be absorbed into the parametric
+    // block — counting `ev <= tol` swept such directions into the trailing
+    // absorbed columns (#1425).
+    let joint_nullity = evals.iter().filter(|&&ev| ev.abs() <= tol).count();
     if joint_nullity == 0 {
         return Ok(None);
     }
@@ -1475,8 +1499,8 @@ pub fn compute_joint_null_rotation(
     order.sort_by(|&a, &b| {
         let ev_a = evals[a];
         let ev_b = evals[b];
-        let null_a = ev_a <= tol;
-        let null_b = ev_b <= tol;
+        let null_a = ev_a.abs() <= tol;
+        let null_b = ev_b.abs() <= tol;
         match (null_a, null_b) {
             (false, true) => std::cmp::Ordering::Less,
             (true, false) => std::cmp::Ordering::Greater,
@@ -1580,6 +1604,38 @@ pub fn filter_active_penalty_candidates_with_ops(
         active_null_eigenvectors,
         active_ops,
     ))
+}
+
+/// Re-normalize already-constrained 1-D B-spline penalty candidates to unit
+/// Frobenius norm *in the constrained coordinate frame*.
+///
+/// The raw (pre-identifiability) wiggliness/ridge penalty is Frobenius-normalized
+/// at construction, but the sum-to-zero identifiability transform `Zᵀ S Z`
+/// perturbs `‖S‖_F` away from 1 (open `bs="ps"` order-2 drifts to ≈0.99967). The
+/// block the REML smoothing parameter `λ` actually multiplies is the *shipped*,
+/// constrained penalty, and the REML objective is evaluated entirely in
+/// constrained coordinates — so the shipped penalty must carry unit Frobenius
+/// norm *there*, matching `normalize_penalty_in_constrained_space` used by
+/// cr / duchon / tensor (the #1364/#1365/#1366/#1401 normalization class).
+/// Normalizing only the raw penalty (before the constraint) leaves `λ` on a
+/// slightly basis-dependent scale; this folds the residual constraint-transform
+/// factor out so `‖S‖_F = 1` in the frame that REML scores.
+///
+/// Fit-invariant at the REML optimum: rescaling `S → S/c` only rescales the
+/// recorded `λ̂` by `c`. Scaling a block never changes its rank, so this cannot
+/// alter which penalties `filter_active_penalty_candidates_with_ops` keeps
+/// active; the `> 1e-12` guard only avoids dividing a numerically-zero block.
+fn renormalize_constrained_penalty_candidates(
+    mut candidates: Vec<PenaltyCandidate>,
+) -> Vec<PenaltyCandidate> {
+    for candidate in &mut candidates {
+        let frob = candidate.matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if frob.is_finite() && frob > 1e-12 {
+            candidate.matrix.mapv_inplace(|v| v / frob);
+            candidate.normalization_scale *= frob;
+        }
+    }
+    candidates
 }
 
 pub(crate) fn validated_kronecker_factors(

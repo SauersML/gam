@@ -91,21 +91,19 @@ fn single_penalty_bspline_penalties_are_frobenius_normalized() {
         );
         // The single active wiggliness block must be Frobenius-normalized so its
         // λ shares the unit-Frobenius scale used by cr / duchon / tensor. The
-        // builder normalizes the raw penalty to ‖S‖_F = 1 BEFORE the
-        // identifiability reparameterization `S → Tᵀ S T`; the constraint
-        // transform `T` is near-orthonormal but not exactly norm-preserving, so
-        // the shipped block's norm is O(1) but not bit-exactly 1 (e.g. ~0.9997
-        // for the sum-to-zero ps block). The discriminating fact is the order of
-        // magnitude: a normalized penalty stays O(1) through `T`, whereas a raw
-        // un-normalized difference penalty would be O(10–10³). Assert the
-        // shipped norm is within a small factor of 1 — tight enough to catch a
-        // raw-scale leak, loose enough to admit the constraint transform.
+        // builder normalizes the raw penalty BEFORE the identifiability
+        // reparameterization `S → Tᵀ S T`, and then re-normalizes the *shipped,
+        // constrained* block (the matrix `λ` actually multiplies and that REML
+        // scores) to unit Frobenius — so the certified norm must be bit-exactly
+        // 1, not merely O(1). An un-normalized difference penalty would land at
+        // O(10–10³); the pre-#1401 raw-only normalization left it at ≈0.9997.
         let n = frob(&built.penalties[0]);
         assert!(
-            (0.5..2.0).contains(&n),
-            "{label}: penalty is NOT Frobenius-normalized: ‖S‖_F = {n:.6e} (expected O(1) ≈ 1). \
-             An un-normalized penalty puts λ on a basis-dependent scale and mis-calibrates \
-             REML's λ-search (the #1364/#1365 defect class)."
+            (n - 1.0).abs() < 1e-10,
+            "{label}: penalty is NOT Frobenius-normalized: ‖S‖_F = {n:.12e} (expected 1.0). \
+             The shipped, constrained penalty must carry unit Frobenius norm in the frame REML \
+             scores, or λ sits on a basis-dependent scale and mis-calibrates REML's λ-search \
+             (the #1364/#1365/#1401 defect class)."
         );
     }
 }
