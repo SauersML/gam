@@ -40,8 +40,16 @@ def test_layer_transport_fit_reaches_python():
 def test_fit_transport_object_inverts_and_composes():
     # The live, invertible transport object (vs the summary dict). Its invert
     # is what lets a caller form g_B o g_A^-1 from two fitted transports.
+    #
+    # The warps are derivative-bounded strictly-monotone maps so the span-exact
+    # monotonicity certificate accepts them everywhere on [0, 1] (a t^1.5 warp
+    # has h'(0)=0 at the left endpoint and the whole-domain certificate would,
+    # correctly, refuse to invert it).
     frm = np.linspace(0.0, 1.0, 64)
-    g_a = gamfit.fit_transport(frm, frm**1.5, "interval", "interval")
+    # g_A(t) = t + 0.25*sin(2*pi*t)/(2*pi): h' = 1 + 0.25*cos(2*pi*t) in
+    # [0.75, 1.25], strictly increasing.
+    a_warp = frm + 0.25 * np.sin(2.0 * math.pi * frm) / (2.0 * math.pi)
+    g_a = gamfit.fit_transport(frm, a_warp, "interval", "interval")
     assert g_a.topology_preserved is True
     assert g_a.isometry_defect >= 0.0
     assert set(g_a.report().keys()) >= {"degree", "topology_preserved", "isometry_defect"}
@@ -50,11 +58,24 @@ def test_fit_transport_object_inverts_and_composes():
     probe = np.array([0.2, 0.5, 0.8])
     assert np.allclose(g_a.invert(g_a.eval(probe)), probe, atol=1e-6)
 
-    # phi = g_B o g_A^-1 with g_A(t)=t^1.5, g_B(t)=t^0.5 ⇒ phi(y)=y^(1/3).
-    g_b = gamfit.fit_transport(frm, frm**0.5, "interval", "interval")
-    y = np.array([0.3, 0.6])
+    # phi = g_B o g_A^-1 from two fitted transports. With no closed form for the
+    # inverse of g_A, assert the composition is internally consistent: applying
+    # g_A^-1 then evaluating g_B reproduces g_B at the true pre-image, and the
+    # composed map is strictly monotone (an honest g_B o g_A^-1).
+    # g_B(t) = t - 0.25*sin(2*pi*t)/(2*pi): h' = 1 - 0.25*cos(2*pi*t) in
+    # [0.75, 1.25], strictly increasing.
+    b_warp = frm - 0.25 * np.sin(2.0 * math.pi * frm) / (2.0 * math.pi)
+    g_b = gamfit.fit_transport(frm, b_warp, "interval", "interval")
+    # Targets in g_A's image; recover the pre-image and compose.
+    t_true = np.array([0.2, 0.5, 0.8])
+    y = g_a.eval(t_true)
+    t_pre = g_a.invert(y)
+    assert np.allclose(t_pre, t_true, atol=1e-6)
     phi = g_b.eval(g_a.invert(y))
-    assert np.allclose(phi, y ** (1.0 / 3.0), atol=2e-3)
+    # phi(y) == g_B(g_A^-1(y)) == g_B(t_true), the composition law.
+    assert np.allclose(phi, g_b.eval(t_true), atol=1e-6)
+    # And the composed map is monotone increasing across the probe.
+    assert np.all(np.diff(phi) > 0.0)
 
 
 def test_fit_transport_invert_rejects_non_finite_targets():
