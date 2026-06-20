@@ -93,6 +93,7 @@ impl SaeManifoldTerm {
             evidence_gauge_deflation_reanchors: 0,
             evidence_gauge_deflation_last_delta_sign: 0,
             dictionary_cocollapse_reseeds: 0,
+            best_cocollapse_incumbent: None,
             hybrid_split_report: None,
             atom_inner_fits: None,
             oos_linear_images: None,
@@ -1926,7 +1927,13 @@ impl SaeManifoldTerm {
     /// `atom_idx` is out of range, is rejected so a stale/mismatched payload
     /// cannot silently corrupt the reconstruction. Pass an empty slice (or never
     /// call this) for an all-curved OOS reconstruction.
-    pub(crate) fn set_hybrid_linear_images(
+    ///
+    /// `pub` (not `pub(crate)`): this is part of the FFI surface — the gam-pyffi
+    /// crate calls it from `latent_basis_and_sae_ffi.rs` to attach a trained
+    /// dictionary's hybrid-linear images to an OOS reconstruction term (#1228).
+    /// Downgrading it to `pub(crate)` breaks the gam-pyffi cdylib build with
+    /// E0624 (the gam lib still compiles, so the lib build does not catch it).
+    pub fn set_hybrid_linear_images(
         &mut self,
         images: Vec<crate::terms::sae::hybrid_split::AtomLinearImage>,
     ) -> Result<(), String> {

@@ -280,6 +280,16 @@ pub struct SaeManifoldTerm {
     /// ledger in [`Self::collapse_events`] because a co-collapse reseed is a
     /// whole-dictionary multi-start, not a per-atom second chance.
     pub(crate) dictionary_cocollapse_reseeds: usize,
+    /// #1026 co-collapse multi-start incumbent: the best (highest reconstruction
+    /// EV) dictionary state seen across the full-dictionary co-collapse reseeds in
+    /// the current optimization, with that EV. A blind reseed sequence can land in
+    /// a strictly WORSE basin than the seed it replaced (real OLMo K=4: EV 0.127 →
+    /// −1.01 across reseeds), so the multi-start must RETAIN the best basin and
+    /// restore it when the reseed budget is spent, instead of keeping the last
+    /// (often catastrophic) attempt. `None` until the first co-collapse reseed;
+    /// reset to `None` alongside [`Self::dictionary_cocollapse_reseeds`] at the
+    /// start of each outer optimization.
+    pub(crate) best_cocollapse_incumbent: Option<(f64, SaeManifoldMutableState)>,
     /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
     /// converges. Each eligible `d = 1` atom's fitted curved image is adjudicated
@@ -331,6 +341,10 @@ impl Clone for SaeManifoldTerm {
             evidence_gauge_deflation_reanchors: self.evidence_gauge_deflation_reanchors,
             evidence_gauge_deflation_last_delta_sign: self.evidence_gauge_deflation_last_delta_sign,
             dictionary_cocollapse_reseeds: self.dictionary_cocollapse_reseeds,
+            // Transient in-fit multi-start incumbent — not part of the persisted
+            // term identity (like `border_hbb_workspace`); a fresh clone starts
+            // with no incumbent and rebuilds it if it re-enters co-collapse.
+            best_cocollapse_incumbent: None,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
             oos_linear_images: self.oos_linear_images.clone(),

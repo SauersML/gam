@@ -138,11 +138,20 @@ pub fn build_bspline_basis_1d(
         // is likewise a SINGLE-penalty smooth for the same reason. Emit only the
         // wiggliness penalty for the cyclic basis regardless of `double_penalty`:
         // there is no free polynomial null space left to shrink.
+        //
+        // Frobenius-normalize the cyclic wiggliness penalty (recording the norm
+        // in `normalization_scale`) so its smoothing parameter `λ` is on the same
+        // unit-Frobenius scale as every other basis (cr / duchon / tensor / the
+        // open-knot ps path, #1365). The shipped design penalty is `β'(S/c)β`; a
+        // raw `S` (scale 1.0) put `λ` on a basis-dependent scale and the outer
+        // λ-search heuristics under-smoothed exactly as for the open ps single
+        // penalty. Fit-invariant at the REML optimum (only `λ̂` rescales by `c`).
+        let (s_bend_norm, s_bend_scale) = normalize_penalty(&s_bend_raw);
         let penalties_raw = vec![PenaltyCandidate {
-            matrix: s_bend_raw.clone(),
+            matrix: s_bend_norm,
             nullspace_dim_hint: 1,
             source: PenaltySource::Primary,
-            normalization_scale: 1.0,
+            normalization_scale: s_bend_scale,
             kronecker_factors: None,
             op: None,
         }];
@@ -1631,16 +1640,28 @@ fn bspline_penalty_candidates(
         None
     };
 
-    // Without an active null-space block, preserve the historical single-penalty
-    // geometry exactly: the bending penalty ships un-normalized with scale 1.0,
-    // so `double_penalty = False` (and boundary-conditioned) fits are byte-for-
-    // byte unchanged.
+    // Without an active null-space block, still Frobenius-normalize the bending
+    // penalty (recording the norm in `normalization_scale`) exactly the way the
+    // double-penalty branch below and the cr / duchon / constant-curvature /
+    // tensor paths already do. The shipped design penalty is `β'(S/c)β`; the
+    // REML smoothing parameter `λ` multiplies that *normalized* block, and the
+    // outer optimizer's λ-search (log-λ brackets, seed screening, the implicit
+    // prior on λ) is calibrated for a unit-Frobenius penalty. Shipping the raw
+    // `S` (scale 1.0) put `λ` on a basis-dependent scale, so REML stopped at a
+    // smaller effective `λ` and failed to fully shrink the penalty null space:
+    // `s(x, bs="ps")` over-fit data whose signal is the null space (a straight
+    // line), landing at EDF ~5 with spurious curvature while the normalized
+    // `bs="cr"` correctly collapsed to EDF ≈ 2 on the same data (#1365). At the
+    // REML optimum the fit is invariant to this normalization (only the recorded
+    // `λ̂` rescales by `c`); it just removes the scale miscalibration of the
+    // λ-search heuristics.
     let Some(shrinkage) = shrinkage else {
+        let (bend_norm, bend_scale) = normalize_penalty(s_bend_raw);
         return Ok(vec![PenaltyCandidate {
-            matrix: s_bend_raw.clone(),
+            matrix: bend_norm,
             nullspace_dim_hint: 0,
             source: PenaltySource::Primary,
-            normalization_scale: 1.0,
+            normalization_scale: bend_scale,
             kronecker_factors: None,
             op: None,
         }]);

@@ -1299,6 +1299,17 @@ pub struct StreamingArrowSchur {
     /// [`ArrowFactorCache::arrow_log_det`] path (which carries the exact
     /// Woodbury). See the #1038 streaming note.
     pub(crate) ibp_cross_row_active: bool,
+    /// SAE manifold evidence-path per-row gauge deflation, copied from the
+    /// source [`ArrowSchurSystem::row_gauge_deflation`] (#1273/#1377). When
+    /// present, the streaming per-row factor MUST apply the SAME spectral
+    /// discovery-and-deflation of an intrinsic-dimension-flat `H_tt^(i)`
+    /// direction (eigenvalue → +1, ρ-independent `log 1 = 0` evidence) that the
+    /// dense [`factor_blocks_for_system`] path applies, or the two routes report
+    /// different log-determinants for the SAME system — the cross-route
+    /// invariant `streaming_logdet == full_logdet` would break (the #1377
+    /// regression: #1273 wired the deflation into the dense path only). `None`
+    /// for every non-evidence caller, which keeps the strict non-PD refusal.
+    pub(crate) row_gauge_deflation: Option<ArrowRowGaugeDeflation>,
 }
 
 impl std::fmt::Debug for StreamingArrowSchur {
@@ -1343,6 +1354,7 @@ impl StreamingArrowSchur {
             htbeta_transpose_matvec: None,
             tolerate_ill_conditioning: false,
             ibp_cross_row_active: false,
+            row_gauge_deflation: None,
         }
     }
 
@@ -1395,7 +1407,47 @@ impl StreamingArrowSchur {
         streaming.htbeta_matvec = htbeta_matvec;
         streaming.htbeta_transpose_matvec = sys.htbeta_transpose_matvec.clone();
         streaming.ibp_cross_row_active = sys.ibp_cross_row.is_some();
+        // Carry the SAE evidence-path per-row gauge deflation so the streaming
+        // per-row factor matches the dense `factor_blocks_for_system` exactly
+        // (#1377): without it, a row with an intrinsic-dimension-flat `H_tt`
+        // would deflate on the dense path but be refused / log-det-divergent on
+        // the streaming path, breaking `streaming_logdet == full_logdet`.
+        streaming.row_gauge_deflation = sys.row_gauge_deflation.clone();
         streaming
+    }
+
+    /// Factor one streaming row's `H_tt^(i)`, applying the SAME per-row gauge /
+    /// spectral deflation the dense [`factor_blocks_for_system`] path applies
+    /// when this is the SAE manifold evidence path (an installed
+    /// `row_gauge_deflation`). For every non-evidence caller this is exactly the
+    /// generic [`factor_one_row`] (strict non-PD refusal), so PD blocks are
+    /// bit-for-bit unchanged. Routing both the dense and streaming per-row
+    /// factors through the identical recovery is what keeps their
+    /// log-determinants identical (#1273/#1377).
+    fn factor_row(
+        &self,
+        row: &ArrowRowBlock,
+        ridge_t: f64,
+        di: usize,
+        row_idx: usize,
+    ) -> Result<Array2<f64>, ArrowSchurError> {
+        match self.row_gauge_deflation.as_ref() {
+            Some(deflation) => factor_one_row_result(
+                row,
+                ridge_t,
+                di,
+                row_idx,
+                self.tolerate_ill_conditioning,
+                deflation.row(row_idx),
+                // Evidence path: opt into spectral discovery of an
+                // intrinsic-dimension-flat direction even when this row's
+                // supplied gauge list is empty/non-spanning — matching the
+                // `allow_spectral_deflation = true` the dense path passes.
+                true,
+            )
+            .map(|result| result.factor),
+            None => factor_one_row(row, ridge_t, di, row_idx, self.tolerate_ill_conditioning),
+        }
     }
 
     /// Build the `(di × k)` cross-block for `row_idx` on demand.
@@ -1526,8 +1578,7 @@ impl StreamingArrowSchur {
                 let di = row.htt.nrows();
                 this.validate_row(row_idx, &row)?;
                 let htbeta = this.row_htbeta(row_idx, &row, di);
-                let factor =
-                    factor_one_row(&row, ridge_t, di, row_idx, this.tolerate_ill_conditioning)?;
+                let factor = this.factor_row(&row, ridge_t, di, row_idx)?;
                 let v = backend.solve_block_vector(factor.view(), row.gt.view());
                 for c in 0..di {
                     let vc = v[c];
@@ -1584,8 +1635,7 @@ impl StreamingArrowSchur {
                 let di = row.htt.nrows();
                 self.validate_row(row_idx, &row)?;
                 let htbeta = self.row_htbeta(row_idx, &row, di);
-                let factor =
-                    factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
+                let factor = self.factor_row(&row, ridge_t, di, row_idx)?;
                 let v = backend.solve_block_vector(factor.view(), row.gt.view());
                 for c in 0..di {
                     let vc = v[c];
@@ -1653,8 +1703,7 @@ impl StreamingArrowSchur {
                 let di = row.htt.nrows();
                 self.validate_row(row_idx, &row)?;
                 let htbeta = self.row_htbeta(row_idx, &row, di);
-                let factor =
-                    factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
+                let factor = self.factor_row(&row, ridge_t, di, row_idx)?;
                 for axis in 0..di {
                     log_det_tt += 2.0 * factor[[axis, axis]].ln();
                 }
@@ -1774,8 +1823,7 @@ impl StreamingArrowSchur {
                 let row = (self.row_builder)(row_idx)?;
                 let di = row.htt.nrows();
                 self.validate_row(row_idx, &row)?;
-                let factor =
-                    factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
+                let factor = self.factor_row(&row, ridge_t, di, row_idx)?;
                 let mut htbeta_delta = Array1::<f64>::zeros(di);
                 if let Some(op) = self.htbeta_matvec.as_ref() {
                     op(row_idx, delta_beta, &mut htbeta_delta);
@@ -1826,8 +1874,7 @@ impl StreamingArrowSchur {
                     let row = (self.row_builder)(row_idx)?;
                     let di = row.htt.nrows();
                     self.validate_row(row_idx, &row)?;
-                    let factor =
-                        factor_one_row(&row, ridge_t, di, row_idx, self.tolerate_ill_conditioning)?;
+                    let factor = self.factor_row(&row, ridge_t, di, row_idx)?;
                     // `H_tβ^(i) Δβ`: route through the procedural operator when
                     // present (no dense slab), else through the dense slab.
                     let mut htbeta_delta = Array1::<f64>::zeros(di);

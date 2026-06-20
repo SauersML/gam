@@ -1058,8 +1058,23 @@ pub fn create_difference_penalty_matrix(
 
         // If using non-uniform knots, apply divided difference scaling:
         // D^{(o)}_i = D^{(o)}_i / (xi_{i+o} - xi_i)
+        //
+        // The raw divided-difference divisor `g[i+o] - g[i]` carries the units
+        // of the covariate, so a pure rescaling `g -> c*g` (a change of physical
+        // units for `x`) would multiply every divisor by `c` and hence scale the
+        // resulting penalty `S = DᵀD` by `c^(-2*order)`. That makes the smooth
+        // NOT scale-equivariant: REML would select a different `lambda` and the
+        // fit would drift purely from the abscissa magnitude (#1364). The
+        // divided difference's *purpose* is to weight each row by the relative
+        // local span (so non-uniform knots approximate a derivative penalty),
+        // which is an inherently dimensionless notion. We therefore normalize
+        // each order's spans by their geometric-mean span at that order, so the
+        // divisor is a unitless local/typical-span ratio: invariant to a global
+        // rescaling of `x` and identically `1` for uniform knots (recovering the
+        // plain integer-difference penalty).
         if let Some(g) = greville_abscissae {
             let nrows = d.nrows();
+            let mut log_span_sum = 0.0_f64;
             for i in 0..nrows {
                 let span = g[i + o] - g[i];
                 if span.abs() <= KNOT_SPAN_DEGENERACY_FLOOR {
@@ -1070,6 +1085,13 @@ pub fn create_difference_penalty_matrix(
                         g[i]
                     )));
                 }
+                log_span_sum += span.abs().ln();
+            }
+            // Geometric mean of the spans at this order; scales as `c` under
+            // `g -> c*g`, so dividing each span by it cancels the units exactly.
+            let ref_span = (log_span_sum / nrows as f64).exp();
+            for i in 0..nrows {
+                let span = (g[i + o] - g[i]) / ref_span;
                 let mut row = d.row_mut(i);
                 row /= span;
             }

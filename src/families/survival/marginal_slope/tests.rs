@@ -2489,24 +2489,52 @@ fn debug_flex_directional_quantities_fd_localize() {
         let fd_s = |p: f64, m: f64| (p - m) / (2.0 * hh);
         eprintln!(
             "INPUT chi_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | eta_aa_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | eta_aaa_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
-            inb.chi_dir, fd_s(plus.chi_base, minus.chi_base), (inb.chi_dir - fd_s(plus.chi_base, minus.chi_base)).abs(),
-            inb.eta_aa_dir, fd_s(plus.eta_aa_base, minus.eta_aa_base), (inb.eta_aa_dir - fd_s(plus.eta_aa_base, minus.eta_aa_base)).abs(),
-            inb.eta_aaa_dir, fd_s(plus.eta_aaa_base, minus.eta_aaa_base), (inb.eta_aaa_dir - fd_s(plus.eta_aaa_base, minus.eta_aaa_base)).abs(),
+            inb.chi_dir,
+            fd_s(plus.chi_base, minus.chi_base),
+            (inb.chi_dir - fd_s(plus.chi_base, minus.chi_base)).abs(),
+            inb.eta_aa_dir,
+            fd_s(plus.eta_aa_base, minus.eta_aa_base),
+            (inb.eta_aa_dir - fd_s(plus.eta_aa_base, minus.eta_aa_base)).abs(),
+            inb.eta_aaa_dir,
+            fd_s(plus.eta_aaa_base, minus.eta_aaa_base),
+            (inb.eta_aaa_dir - fd_s(plus.eta_aaa_base, minus.eta_aaa_base)).abs(),
         );
         for &u in &[q1, g, w0] {
             eprintln!(
                 "INPUT[{u}] tau_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | tau_a_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | a_u_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
-                inb.tau_dir[u], fd_s(plus.tau_base[u], minus.tau_base[u]), (inb.tau_dir[u] - fd_s(plus.tau_base[u], minus.tau_base[u])).abs(),
-                inb.tau_a_dir[u], fd_s(plus.tau_a_base[u], minus.tau_a_base[u]), (inb.tau_a_dir[u] - fd_s(plus.tau_a_base[u], minus.tau_a_base[u])).abs(),
-                inb.a_u_dir[u], fd_s(plus.a_u_base[u], minus.a_u_base[u]), (inb.a_u_dir[u] - fd_s(plus.a_u_base[u], minus.a_u_base[u])).abs(),
+                inb.tau_dir[u],
+                fd_s(plus.tau_base[u], minus.tau_base[u]),
+                (inb.tau_dir[u] - fd_s(plus.tau_base[u], minus.tau_base[u])).abs(),
+                inb.tau_a_dir[u],
+                fd_s(plus.tau_a_base[u], minus.tau_a_base[u]),
+                (inb.tau_a_dir[u] - fd_s(plus.tau_a_base[u], minus.tau_a_base[u])).abs(),
+                inb.a_u_dir[u],
+                fd_s(plus.a_u_base[u], minus.a_u_base[u]),
+                (inb.a_u_dir[u] - fd_s(plus.a_u_base[u], minus.a_u_base[u])).abs(),
             );
         }
         for &(u, v) in &[(g, g), (g, w0), (w0, w0)] {
             eprintln!(
                 "INPUT[{u},{v}] a_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | r_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | chi_uv_fixed_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
-                inb.a_uv_dir[[u, v]], fd_s(plus.a_uv_base[[u, v]], minus.a_uv_base[[u, v]]), (inb.a_uv_dir[[u, v]] - fd_s(plus.a_uv_base[[u, v]], minus.a_uv_base[[u, v]])).abs(),
-                inb.r_uv_dir[[u, v]], fd_s(plus.r_uv_base[[u, v]], minus.r_uv_base[[u, v]]), (inb.r_uv_dir[[u, v]] - fd_s(plus.r_uv_base[[u, v]], minus.r_uv_base[[u, v]])).abs(),
-                inb.chi_uv_fixed_dir[[u, v]], fd_s(plus.chi_uv_fixed_base[[u, v]], minus.chi_uv_fixed_base[[u, v]]), (inb.chi_uv_fixed_dir[[u, v]] - fd_s(plus.chi_uv_fixed_base[[u, v]], minus.chi_uv_fixed_base[[u, v]])).abs(),
+                inb.a_uv_dir[[u, v]],
+                fd_s(plus.a_uv_base[[u, v]], minus.a_uv_base[[u, v]]),
+                (inb.a_uv_dir[[u, v]] - fd_s(plus.a_uv_base[[u, v]], minus.a_uv_base[[u, v]]))
+                    .abs(),
+                inb.r_uv_dir[[u, v]],
+                fd_s(plus.r_uv_base[[u, v]], minus.r_uv_base[[u, v]]),
+                (inb.r_uv_dir[[u, v]] - fd_s(plus.r_uv_base[[u, v]], minus.r_uv_base[[u, v]]))
+                    .abs(),
+                inb.chi_uv_fixed_dir[[u, v]],
+                fd_s(
+                    plus.chi_uv_fixed_base[[u, v]],
+                    minus.chi_uv_fixed_base[[u, v]]
+                ),
+                (inb.chi_uv_fixed_dir[[u, v]]
+                    - fd_s(
+                        plus.chi_uv_fixed_base[[u, v]],
+                        minus.chi_uv_fixed_base[[u, v]]
+                    ))
+                .abs(),
             );
         }
         // #932 DECISIVE: is the BASE intercept-solve constraint Hessian `f_uv`
@@ -2517,18 +2545,37 @@ fn debug_flex_directional_quantities_fd_localize() {
         // exact moment-jet channels above) proves the bug lives in the f_uv base
         // boundary, which feeds a_uv -> a_u_dir -> the third[g,w0] error.
         for &v in &[q1, g, w0] {
-            let fuv_dir_analytic: f64 =
-                (0..p).map(|uu| inb.f_uv_base[[uu, v]] * dir[uu]).sum();
+            let fuv_dir_analytic: f64 = (0..p).map(|uu| inb.f_uv_base[[uu, v]] * dir[uu]).sum();
             let fu_fd = fd_s(plus.f_u_base[v], minus.f_u_base[v]);
             eprintln!(
                 "INPUT f_uv[*,{v}]·dir analytic {:+.6e} fd(f_u[{v}]) {:+.6e} gap {:.2e}",
-                fuv_dir_analytic, fu_fd, (fuv_dir_analytic - fu_fd).abs(),
+                fuv_dir_analytic,
+                fu_fd,
+                (fuv_dir_analytic - fu_fd).abs(),
             );
         }
         let fa_fd = fd_s(plus.f_a_base, minus.f_a_base);
         eprintln!(
             "INPUT f_a base {:+.6e} fd(f_a along dir) {:+.6e}",
             inb.f_a_base, fa_fd,
+        );
+        // #932 f_au CERTIFICATION: FD(f_a) along dir=e_g = the TOTAL f_au[g]
+        // (includes crossing-edge motion since the FD re-solves the partition).
+        // Compare to the analytic moments-only f_au_base·dir = f_au_base[g]. The
+        // GAP is exactly the missing f_au moving-boundary term derived for #932
+        // (W_a·z_u + W_u·z_a + W_z·z_a·z_u + W·z_au, z_a=-1/b, z_ag=1/b²). A
+        // nonzero gap certifies the term is real and gives its magnitude/sign for
+        // the jet-932 tower to match.
+        let fau_dir_analytic: f64 = (0..p).map(|uu| inb.f_au_base[uu] * dir[uu]).sum();
+        eprintln!(
+            "INPUT f_au·dir(moments-only) {:+.6e} fd(f_a)=f_au[g]_total {:+.6e} BOUNDARY-GAP {:.3e}",
+            fau_dir_analytic,
+            fa_fd,
+            (fau_dir_analytic - fa_fd).abs(),
+        );
+        eprintln!(
+            "INPUT f_aa base(moments-only) {:+.6e}  [derived boundary corr = 2·W_a·z_a + W_z·z_a², z_a=-1/b]",
+            inb.f_aa_base,
         );
     }
     // Per-term d_uv_dir localization at the (w0,w0) probe block: FD each base
@@ -2695,7 +2742,7 @@ fn debug_flex_base_hessian_vs_gradient_fd() {
         (family, bs)
     };
 
-    let (family, bs) = make(gv, &beta_h0, &beta_w0);
+    let (family, _) = make(gv, &beta_h0, &beta_w0);
     let primary = flex_primary_slices(&family);
     let g = primary.g;
     let w0 = primary.w.clone().unwrap().start;
@@ -2820,7 +2867,10 @@ fn flex_logslope_first_sensitivity_matches_fd() {
         .map(|k| 0.035 * ((k as f64 + 0.7).cos()))
         .collect();
 
-    let make = |g: f64| {
+    // The family carries no logslope value (g is a free parameter supplied to the
+    // intercept solve / timepoint evaluation downstream), so this builder takes
+    // no g: the FD below varies g through `base_at`, which passes it directly.
+    let make = || {
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![event]),
@@ -2851,7 +2901,7 @@ fn flex_logslope_first_sensitivity_matches_fd() {
         };
         family
     };
-    let family = make(gv);
+    let family = make();
     let primary = flex_primary_slices(&family);
     let g = primary.g;
     let bh = Array1::from(beta_h0.clone());
@@ -2859,7 +2909,7 @@ fn flex_logslope_first_sensitivity_matches_fd() {
 
     // Exit-timepoint base struct with eta_u/chi_u/d_u and scalars eta/chi/d.
     let base_at = |gg: f64| -> SurvivalFlexTimepointExact {
-        let fam = make(gg);
+        let fam = make();
         let (a1, d1) = fam
             .solve_row_survival_intercept_with_slot(
                 q1v,
@@ -7395,6 +7445,90 @@ fn block10_cpu_oracle_fourth_contraction_matches_family_shared_fixtures() {
             let actual = b10_fourth_oracle_from_family(&family, &block_states, dir_u, dir_v);
             assert_eq!(actual.len(), expected.nrows() * expected.ncols());
             b10_assert_parity(&actual, &expected, fixture.label);
+        }
+    }
+}
+
+/// The batched all-canonical-axis first directional Hessian derivatives
+/// (gam#979 / #1040) must reproduce, axis by axis, the per-axis flex-no-wiggle
+/// directional derivative they replace — the batched path only reorders the
+/// expensive direction-independent base build out of the per-axis loop and
+/// closes each axis by linearity of the third contraction.
+#[test]
+fn jeffreys_first_directional_all_axes_flex_no_wiggle_matches_per_axis() {
+    for &fixture in B10_PARITY_FIXTURES {
+        let (family, block_states) = b10_flex_family_for_parity(fixture);
+        let slices = block_slices(&family, &block_states);
+        let p = slices.total;
+        let batched = family
+            .jeffreys_first_directional_all_axes_flex_no_wiggle(&block_states)
+            .unwrap_or_else(|err| panic!("{}: batched first all-axes failed: {err}", fixture.label));
+        assert_eq!(batched.len(), p, "{}: axis count", fixture.label);
+        for a in 0..p {
+            let mut e_a = Array1::<f64>::zeros(p);
+            e_a[a] = 1.0;
+            let expected = family
+                .exact_newton_joint_hessian_directional_derivative_flex_no_wiggle(
+                    &block_states,
+                    &e_a,
+                )
+                .unwrap_or_else(|err| {
+                    panic!("{} axis {a}: per-axis first failed: {err}", fixture.label)
+                });
+            assert_eq!(batched[a].dim(), expected.dim(), "{} axis {a} dim", fixture.label);
+            for (g, e) in batched[a].iter().zip(expected.iter()) {
+                let tol = 1e-9 + 1e-7 * e.abs();
+                assert!(
+                    (g - e).abs() <= tol,
+                    "{} axis {a}: batched {g} vs per-axis {e} (tol {tol})",
+                    fixture.label
+                );
+            }
+        }
+    }
+}
+
+/// Same contract for the batched second directional all-axes path: with the
+/// first direction fixed, each axis matches the per-axis flex-no-wiggle second
+/// directional derivative (linearity of the fourth contraction in the second
+/// direction).
+#[test]
+fn jeffreys_second_directional_all_axes_flex_no_wiggle_matches_per_axis() {
+    for &fixture in B10_PARITY_FIXTURES {
+        let (family, block_states) = b10_flex_family_for_parity(fixture);
+        let slices = block_slices(&family, &block_states);
+        let p = slices.total;
+        let d_u: Array1<f64> = (0..p)
+            .map(|k| 0.13 + 0.05 * ((k as f64 + 1.0).sin()))
+            .collect::<Vec<_>>()
+            .into();
+        let batched = family
+            .jeffreys_second_directional_all_axes_flex_no_wiggle(&block_states, &d_u)
+            .unwrap_or_else(|err| {
+                panic!("{}: batched second all-axes failed: {err}", fixture.label)
+            });
+        assert_eq!(batched.len(), p, "{}: axis count", fixture.label);
+        for a in 0..p {
+            let mut e_a = Array1::<f64>::zeros(p);
+            e_a[a] = 1.0;
+            let expected = family
+                .exact_newton_joint_hessiansecond_directional_derivative_flex_no_wiggle(
+                    &block_states,
+                    &d_u,
+                    &e_a,
+                )
+                .unwrap_or_else(|err| {
+                    panic!("{} axis {a}: per-axis second failed: {err}", fixture.label)
+                });
+            assert_eq!(batched[a].dim(), expected.dim(), "{} axis {a} dim", fixture.label);
+            for (g, e) in batched[a].iter().zip(expected.iter()) {
+                let tol = 1e-9 + 1e-7 * e.abs();
+                assert!(
+                    (g - e).abs() <= tol,
+                    "{} axis {a}: batched {g} vs per-axis {e} (tol {tol})",
+                    fixture.label
+                );
+            }
         }
     }
 }

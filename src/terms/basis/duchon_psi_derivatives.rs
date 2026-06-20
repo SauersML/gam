@@ -1796,11 +1796,17 @@ pub(crate) fn build_cyclic_duchon_basis_1dwithworkspace(
     } else {
         s_kernel
     };
+    // Frobenius-normalize the cyclic roughness penalty so its smoothing
+    // parameter shares the unit-Frobenius scale of every other basis (cr /
+    // duchon / tensor / open-and-cyclic ps, #1365); a raw operator (scale 1.0)
+    // would put `λ` on a basis-dependent scale and miscalibrate the outer
+    // λ-search. Fit-invariant at the REML optimum (only `λ̂` rescales by `c`).
+    let (s_final_norm, s_final_scale) = normalize_penalty(&s_final);
     let candidates = vec![PenaltyCandidate {
-        matrix: s_final,
+        matrix: s_final_norm,
         nullspace_dim_hint: 1,
         source: PenaltySource::Primary,
-        normalization_scale: 1.0,
+        normalization_scale: s_final_scale,
         kronecker_factors: None,
         op: None,
     }];

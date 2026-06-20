@@ -136,8 +136,14 @@ static LOGGER: StderrInfoLogger = StderrInfoLogger;
 fn main() {
     gam::init_parallelism();
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
-    let n: usize = 1500;
-    let centers: usize = 4;
+    let n: usize = std::env::var("REPRO_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1500);
+    let centers: usize = std::env::var("REPRO_CENTERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
     let (data, spec) = build(n, centers);
     let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
         data: data.view(),

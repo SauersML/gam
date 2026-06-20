@@ -5311,6 +5311,78 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         1.0 / 4.0,
         -0.48, // large move toward low edge (psi ≈ psi_lo + 0.02*span)
     ];
+    // ATTRIBUTION: realize the EXACT design at ψ to get XᵀWX_exact(ψ) (n-cost is
+    // fine — diagnostic), so we can separate the Gram INTERPOLATION residual from
+    // the inner-solve β̂ error, and test whether the ANCHOR correction
+    // (gram_at(ψ) + [exact(ψ_a) − gram_at(ψ_a)]) actually drives the Gram exact as
+    // the move → 0. Frobenius rel residual of two k×k Grams.
+    let frob_rel = |a: &Array2<f64>, b: &Array2<f64>| -> f64 {
+        let num: f64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let den: f64 = b.iter().map(|y| y * y).sum::<f64>().sqrt().max(1e-300);
+        num / den
+    };
+    // Exact XᵀWX(ψ) from a freshly realized design in the SAME conditioned frame
+    // the tensor was built in (build_cache used conditioning.apply_to_design).
+    let exact_gram_at = |psi: f64| -> Array2<f64> {
+        let mut c = make_cache();
+        let mut th = theta0.clone();
+        th[rho_dim] = psi;
+        c.ensure_theta(&th).expect("ensure_theta exact");
+        let x = c.design().design.to_dense();
+        let mut wx = x.clone();
+        for (mut row, &wi) in wx.outer_iter_mut().zip(weights.iter()) {
+            row.mapv_inplace(|v| v * wi);
+        }
+        x.t().dot(&wx)
+    };
+    // Exact RHS XᵀW(y−offset) from the realized design (the object the streamed
+    // inner solve forms). β̂ depends on this too; the earlier 1e-13 check only
+    // covered the Gram, not the RHS.
+    let exact_rhs_at = |psi: f64| -> Array1<f64> {
+        let mut c = make_cache();
+        let mut th = theta0.clone();
+        th[rho_dim] = psi;
+        c.ensure_theta(&th).expect("ensure_theta exact");
+        let x = c.design().design.to_dense();
+        let mut wz = Array1::<f64>::zeros(x.nrows());
+        for ((s, &wi), (&yi, &oi)) in wz
+            .iter_mut()
+            .zip(weights.iter())
+            .zip(y.iter().zip(offset.iter()))
+        {
+            *s = wi * (yi - oi);
+        }
+        x.t().dot(&wz)
+    };
+    let vec_rel = |a: &Array1<f64>, b: &Array1<f64>| -> f64 {
+        let num: f64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let den: f64 = b.iter().map(|y| y * y).sum::<f64>().sqrt().max(1e-300);
+        num / den
+    };
+    // Clone the tensor Arc so the Gram accessor does not hold a borrow of
+    // `tensor_eval` across the loop's `&mut tensor_eval` eval calls.
+    let tensor_arc = tensor_eval
+        .psi_gram_tensor
+        .as_ref()
+        .expect("tensor attached")
+        .clone();
+    let tensor_gram_at = |psi: f64| -> Array2<f64> { tensor_arc.gram_at(psi) };
+    let tensor_rhs_at = |psi: f64| -> Array1<f64> { tensor_arc.rhs_at(psi) };
+    let g_interp_a = tensor_gram_at(psi_a);
+    let g_exact_a = exact_gram_at(psi_a);
+    let r_interp_a = tensor_rhs_at(psi_a);
+    let r_exact_a = exact_rhs_at(psi_a);
+
     let mut worst_forced = 0.0_f64;
     for &f in &fracs {
         let psi = psi_a + f * span;
@@ -5329,9 +5401,71 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
             .zip(beta_slow.iter())
             .fold(0.0_f64, |a, (g, s)| a.max((g - s).abs() / (1.0 + s.abs())));
         worst_forced = worst_forced.max(rel);
+
+        // ATTRIBUTION: Gram residuals at ψ. interp = ‖gram_at(ψ)−exact(ψ)‖_F;
+        // anchored = ‖[gram_at(ψ)+exact(ψ_a)−gram_at(ψ_a)]−exact(ψ)‖_F. If the
+        // anchored residual → 0 as the move → 0 but β̂rel does NOT, the floor is
+        // downstream of the Gram (inner-solve frame / penalty re-key), not the
+        // interpolation; if the anchored residual itself floors, it is the Gram.
+        let g_interp = tensor_gram_at(psi);
+        let g_exact = exact_gram_at(psi);
+        let interp_res = frob_rel(&g_interp, &g_exact);
+        let mut g_anchored = g_interp.clone();
+        g_anchored += &g_exact_a;
+        g_anchored -= &g_interp_a;
+        let anchored_res = frob_rel(&g_anchored, &g_exact);
+
+        // RHS attribution: the inner solve needs XᵀW(y−offset) too. Compare the
+        // tensor interp + anchored RHS to the exact realized RHS. If the Gram is
+        // machine-exact but β̂ floors, the RHS (or penalty) is the remaining
+        // suspect.
+        let r_interp = tensor_rhs_at(psi);
+        let r_exact = exact_rhs_at(psi);
+        let rhs_interp_res = vec_rel(&r_interp, &r_exact);
+        let mut r_anchored = r_interp.clone();
+        r_anchored += &r_exact_a;
+        r_anchored -= &r_interp_a;
+        let rhs_anchored_res = vec_rel(&r_anchored, &r_exact);
+
+        // PENALTY attribution: with Gram AND RHS machine-exact, a non-zero β̂ floor
+        // must come from the only remaining input — the penalty S(ψ) VALUES (the
+        // reduced-basis split is value-dependent). Compare S_staged (n-free re-key,
+        // canonical_penalties_at, the object the forced/production skip installs)
+        // to S_streamed (realized design penalties, the slow-path truth) as dense
+        // p×p sums of the block-local matrices placed at their col_range.
+        let p_cols = stream_cache.design().design.ncols();
+        let to_dense_canonical =
+            |pens: &[crate::construction::CanonicalPenalty]| -> Array2<f64> {
+                let mut s = Array2::<f64>::zeros((p_cols, p_cols));
+                for cp in pens {
+                    let r = &cp.col_range;
+                    s.slice_mut(ndarray::s![r.start..r.end, r.start..r.end])
+                        .scaled_add(1.0, &cp.local);
+                }
+                s
+            };
+        let (staged_pens, _) = tensor_cache
+            .canonical_penalties_at(&theta_at(psi))
+            .expect("staged canonical penalties");
+        let s_staged = to_dense_canonical(&staged_pens);
+        // stream_cache was just realized at ψ by beta_streamed → its design carries
+        // the realized S(ψ) blocks.
+        let mut s_streamed = Array2::<f64>::zeros((p_cols, p_cols));
+        for bp in &stream_cache.design().penalties {
+            let r = &bp.col_range;
+            s_streamed
+                .slice_mut(ndarray::s![r.start..r.end, r.start..r.end])
+                .scaled_add(1.0, &bp.local);
+        }
+        let pen_res = frob_rel(&s_staged, &s_streamed);
+        let pen_blocks_staged = staged_pens.len();
+        let pen_blocks_streamed = stream_cache.design().penalties.len();
+
         eprintln!(
             "[DIAG1033-FORCE] frac={f:+.5} psi={psi:.5} covers_skip={gate} forced_β̂rel={rel:.3e} \
-             {}",
+             gram_interp_res={interp_res:.3e} gram_anchored_res={anchored_res:.3e} \
+             rhs_interp_res={rhs_interp_res:.3e} rhs_anchored_res={rhs_anchored_res:.3e} \
+             pen_res={pen_res:.3e} pen_blocks={pen_blocks_staged}/{pen_blocks_streamed} {}",
             if rel <= 1e-6 { "SOUND(≤1e-6)" } else { "UNSOUND(>1e-6)" }
         );
         // Re-pin at ψ_A after each forced trial so every measurement is a move

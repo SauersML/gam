@@ -839,6 +839,97 @@ impl SmoothTerm {
             &rot.rotation,
         ))
     }
+
+    /// Dimension of the **joint** null space of this term's active penalties:
+    /// the coefficient directions penalized by *no* penalty. The smooth-component
+    /// Wald test ([`crate::inference::smooth_test::wood_smooth_test`]) treats this
+    /// many leading coefficients as genuine unpenalized fixed effects and tests
+    /// them at full rank; the remainder is the penalized sub-block tested with a
+    /// rank-`≈EDF` truncated pseudo-inverse.
+    ///
+    /// Because every penalty block `S_k` is positive semi-definite,
+    /// `vᵀ(Σ_k S_k)v = Σ_k vᵀ S_k v = 0` iff `S_k v = 0` for *every* `k`; the
+    /// joint null space is therefore exactly `null(Σ_k S_k)`, of dimension
+    /// `p_local − rank(Σ_k S_k)`. This is the **intersection** of the per-penalty
+    /// null spaces, not their sum.
+    ///
+    /// Summing the per-penalty `nullspace_dims` instead (the historical defect
+    /// behind #1360) *unions* the null spaces and badly over-counts: a
+    /// double-penalty smooth carries a bending penalty (null space = its
+    /// polynomial part) plus a complementary null-space ridge (which penalizes
+    /// exactly that polynomial part), so the two null spaces are disjoint and the
+    /// joint null space is empty — yet the per-penalty dims sum to nearly
+    /// `p_local`. Feeding that inflated count to the Wald test makes it test
+    /// almost the whole shrunk block at full rank, manufacturing overwhelming
+    /// "significance" for a term the fit drove to ~0 EDF.
+    pub fn wald_unpenalized_dim(&self) -> usize {
+        joint_unpenalized_dim(
+            self.coeff_range.len(),
+            &self.penalties_local,
+            &self.nullspace_dims,
+        )
+    }
+}
+
+/// Numeric core of [`SmoothTerm::wald_unpenalized_dim`]: the dimension of the
+/// joint null space `∩_k null(S_k) = null(Σ_k S_k)` of a term's local penalty
+/// blocks, with a conservative fallback when a penalty is not materialized as a
+/// full `p_local × p_local` matrix (e.g. a Kronecker tensor factor).
+pub(crate) fn joint_unpenalized_dim(
+    p_local: usize,
+    penalties_local: &[Array2<f64>],
+    nullspace_dims: &[usize],
+) -> usize {
+    use crate::faer_ndarray::FaerEigh;
+    if p_local == 0 {
+        return 0;
+    }
+    if penalties_local.is_empty() {
+        // No penalty ⇒ a wholly unpenalized (fixed-effect) block.
+        return p_local;
+    }
+    // Sum the penalties that are materialized as full `p_local × p_local`
+    // blocks (the common smooth case). The covariance block the Wald test
+    // slices lives in this same coefficient basis (post joint-null rotation),
+    // so the rank is computed in the right metric.
+    let mut s_total = Array2::<f64>::zeros((p_local, p_local));
+    let mut materialized = 0usize;
+    for s in penalties_local {
+        if s.nrows() == p_local && s.ncols() == p_local {
+            s_total += s;
+            materialized += 1;
+        }
+    }
+    if materialized == penalties_local.len() {
+        let symmetric = {
+            let transpose = s_total.t().to_owned();
+            (&s_total + &transpose) * 0.5
+        };
+        if let Ok((evals, _)) = symmetric.eigh(faer::Side::Lower) {
+            let max_abs = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            if max_abs == 0.0 {
+                // All penalties identically zero ⇒ unpenalized block.
+                return p_local;
+            }
+            let tol = max_abs * (p_local as f64) * 1e-12;
+            let rank = evals.iter().filter(|&&v| v > tol).count();
+            return p_local.saturating_sub(rank);
+        }
+    }
+    // Conservative fallback when a penalty is not a materialized full block
+    // (e.g. a Kronecker tensor factor): with ≥2 active penalties the joint
+    // null space is almost always empty (the only over-rejecting direction);
+    // with a single penalty it is exactly that penalty's own null space.
+    if penalties_local.len() >= 2 {
+        0
+    } else {
+        nullspace_dims
+            .iter()
+            .copied()
+            .min()
+            .unwrap_or(0)
+            .min(p_local)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2086,6 +2177,63 @@ impl KroneckerPenaltySystem {
             }
         }
         (logdet, rank, grad, hess)
+    }
+}
+
+#[cfg(test)]
+mod joint_unpenalized_dim_tests {
+    use super::joint_unpenalized_dim;
+    use ndarray::{Array2, array};
+
+    #[test]
+    fn no_penalty_is_fully_unpenalized() {
+        assert_eq!(joint_unpenalized_dim(4, &[], &[]), 4);
+    }
+
+    #[test]
+    fn single_penalty_returns_its_own_null_space() {
+        // A 3×3 penalty that penalizes only the last coordinate ⇒ 2-dim null
+        // space (the first two coordinates are unpenalized).
+        let s = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 5.0]];
+        assert_eq!(joint_unpenalized_dim(3, std::slice::from_ref(&s), &[2]), 2);
+    }
+
+    #[test]
+    fn complementary_double_penalty_has_empty_joint_null_space() {
+        // The #1360 case in miniature: a "bending" penalty that leaves the
+        // first coordinate (its 2-dim... here 1-dim) null, plus a
+        // complementary "null-space ridge" that penalizes exactly that
+        // coordinate. Per-penalty null dims are {1, 2} and sum to 3 (≈ p),
+        // but the INTERSECTION is empty: every coordinate is penalized by
+        // someone, so the joint unpenalized dim is 0.
+        let bending = array![[0.0, 0.0, 0.0], [0.0, 4.0, 0.0], [0.0, 0.0, 4.0]];
+        let ridge = array![[2.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]];
+        assert_eq!(joint_unpenalized_dim(3, &[bending, ridge], &[1, 2]), 0);
+    }
+
+    #[test]
+    fn partial_overlap_keeps_shared_null_direction() {
+        // Two penalties that BOTH leave coordinate 0 unpenalized ⇒ the shared
+        // null direction survives the intersection (joint unpenalized dim 1),
+        // even though naively summing the per-penalty dims would give 4.
+        let a = array![[0.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 0.0]];
+        let b = array![[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 3.0]];
+        assert_eq!(joint_unpenalized_dim(3, &[a, b], &[2, 2]), 1);
+    }
+
+    #[test]
+    fn non_materialized_penalty_falls_back_conservatively() {
+        // A penalty whose stored block is not p_local × p_local (e.g. a
+        // Kronecker tensor factor). With ≥2 penalties the conservative joint
+        // dim is 0 (never over-rejecting).
+        let full: Array2<f64> = array![[0.0, 0.0], [0.0, 1.0]];
+        let factor: Array2<f64> = array![[1.0]]; // wrong shape for p_local=2
+        assert_eq!(
+            joint_unpenalized_dim(2, &[full, factor.clone()], &[1, 0]),
+            0
+        );
+        // With a single non-materialized penalty, fall back to its own null dim.
+        assert_eq!(joint_unpenalized_dim(4, std::slice::from_ref(&factor), &[2]), 2);
     }
 }
 

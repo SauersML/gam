@@ -189,10 +189,22 @@ pub(crate) fn build_model_summary(
             basis_note: None,
         });
     }
+    // `SmoothTerm::coeff_range` is block-local (0-based within the smooth block);
+    // the global coefficient layout is [intercept | linear | random | smooth], so
+    // every term's block must be shifted by `smooth_start` before indexing the
+    // global `fit.beta` / covariance / influence matrix. Omitting this offset
+    // (the #1360 defect) slid each smooth's window one-per-preceding-column off,
+    // folding the intercept and a neighbouring term's coefficients into the test.
+    let smooth_start = design
+        .design
+        .ncols()
+        .saturating_sub(design.smooth.total_smooth_cols());
     for term in &design.smooth.terms {
         let k = term.penalties_local.len();
         let term_penalty_start = penalty_cursor;
-        let edf = fit.per_term_edf(term.coeff_range.clone(), penalty_cursor, k);
+        let global_range =
+            (smooth_start + term.coeff_range.start)..(smooth_start + term.coeff_range.end);
+        let edf = fit.per_term_edf(global_range.clone(), penalty_cursor, k);
         penalty_cursor += k;
         let smooth_test = if term.shape == gam::smooth::ShapeConstraint::None {
             cov_forwald.and_then(|cov| {
@@ -200,9 +212,9 @@ pub(crate) fn build_model_summary(
                     beta: fit.beta.view(),
                     covariance: cov,
                     influence_matrix: fit.coefficient_influence(),
-                    coeff_range: term.coeff_range.clone(),
+                    coeff_range: global_range.clone(),
                     edf,
-                    nullspace_dim: term.nullspace_dims.iter().copied().sum::<usize>(),
+                    nullspace_dim: term.wald_unpenalized_dim(),
                     residual_df,
                     scale: if scale_is_estimated {
                         SmoothTestScale::Estimated

@@ -567,7 +567,13 @@ pub trait PredictionTransform {
         z_lower: &Array1<f64>,
         z_upper: &Array1<f64>,
     ) -> Result<Option<(Array1<f64>, Array1<f64>)>, EstimationError> {
-        let _ = (input, mean, mean_se, z_lower, z_upper);
+        // Default: no skew-aware band. The generic symmetric construction is
+        // used instead. Validate the per-row inputs the driver hands every
+        // transform so an overriding impl and this default agree on shape.
+        assert!(std::mem::size_of_val(input) > 0);
+        assert_eq!(mean.len(), mean_se.len());
+        assert_eq!(mean.len(), z_lower.len());
+        assert_eq!(mean.len(), z_upper.len());
         Ok(None)
     }
 }

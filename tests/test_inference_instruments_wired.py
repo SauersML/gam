@@ -37,6 +37,87 @@ def test_layer_transport_fit_reaches_python():
     assert report["isometry_defect_se"] >= 0.0
 
 
+def test_fit_transport_object_inverts_and_composes():
+    # The live, invertible transport object (vs the summary dict). Its invert
+    # is what lets a caller form g_B o g_A^-1 from two fitted transports.
+    #
+    # The warps are derivative-bounded strictly-monotone maps so the span-exact
+    # monotonicity certificate accepts them everywhere on [0, 1] (a t^1.5 warp
+    # has h'(0)=0 at the left endpoint and the whole-domain certificate would,
+    # correctly, refuse to invert it).
+    frm = np.linspace(0.0, 1.0, 64)
+    # g_A(t) = t + 0.25*sin(2*pi*t)/(2*pi): h' = 1 + 0.25*cos(2*pi*t) in
+    # [0.75, 1.25], strictly increasing.
+    a_warp = frm + 0.25 * np.sin(2.0 * math.pi * frm) / (2.0 * math.pi)
+    g_a = gamfit.fit_transport(frm, a_warp, "interval", "interval")
+    assert g_a.topology_preserved is True
+    assert g_a.isometry_defect >= 0.0
+    assert set(g_a.report().keys()) >= {"degree", "topology_preserved", "isometry_defect"}
+
+    # eval / invert round-trip.
+    probe = np.array([0.2, 0.5, 0.8])
+    assert np.allclose(g_a.invert(g_a.eval(probe)), probe, atol=1e-6)
+
+    # phi = g_B o g_A^-1 from two fitted transports. With no closed form for the
+    # inverse of g_A, assert the composition is internally consistent: applying
+    # g_A^-1 then evaluating g_B reproduces g_B at the true pre-image, and the
+    # composed map is strictly monotone (an honest g_B o g_A^-1).
+    # g_B(t) = t - 0.25*sin(2*pi*t)/(2*pi): h' = 1 - 0.25*cos(2*pi*t) in
+    # [0.75, 1.25], strictly increasing.
+    b_warp = frm - 0.25 * np.sin(2.0 * math.pi * frm) / (2.0 * math.pi)
+    g_b = gamfit.fit_transport(frm, b_warp, "interval", "interval")
+    # Targets in g_A's image; recover the pre-image and compose.
+    t_true = np.array([0.2, 0.5, 0.8])
+    y = g_a.eval(t_true)
+    t_pre = g_a.invert(y)
+    assert np.allclose(t_pre, t_true, atol=1e-6)
+    phi = g_b.eval(g_a.invert(y))
+    # phi(y) == g_B(g_A^-1(y)) == g_B(t_true), the composition law.
+    assert np.allclose(phi, g_b.eval(t_true), atol=1e-6)
+    # And the composed map is monotone increasing across the probe.
+    assert np.all(np.diff(phi) > 0.0)
+
+
+def test_fit_transport_invert_rejects_non_finite_targets():
+    # The #1361 finiteness guard, exercised through the Python API: a non-finite
+    # inverse target must raise ValueError rather than silently returning a
+    # boundary coordinate.
+    frm = np.linspace(0.0, 1.0, 64)
+    g = gamfit.fit_transport(frm, 0.5 * frm, "interval", "interval")
+    for bad in (np.nan, np.inf, -np.inf):
+        with pytest.raises(ValueError):
+            g.invert(np.array([bad]))
+
+
+def test_fit_transport_invert_rejects_folded_map():
+    # A non-topology-preserving (folded) fit must refuse to invert. The target
+    # is non-monotone in the source coordinate, so the fitted map folds and the
+    # span-exact monotonicity certificate rejects the inverse.
+    frm = np.linspace(0.0, 1.0, 200)
+    # A clear fold: rises then falls (a non-monotone, fold-bearing map).
+    target = np.sin(2.0 * math.pi * frm)
+    lo, hi = float(target.min()), float(target.max())
+    g = gamfit.fit_transport(frm, target, "interval", "interval")
+    assert g.topology_preserved is False
+    with pytest.raises(ValueError):
+        g.invert(np.array([0.5 * (lo + hi)]))
+
+
+def test_fit_transport_degree_minus_one_circle_round_trips():
+    # A degree -1 (orientation-reversing) circle cover must invert correctly
+    # through the Python API.
+    t = np.linspace(0.0, 2.0 * math.pi, 256, endpoint=False)
+    s = (-t + 0.4 + 0.15 * np.sin(t)) % (2.0 * math.pi)
+    g = gamfit.fit_transport(t, s, "circle", "circle")
+    assert g.degree == -1
+    assert g.topology_preserved is True
+    probe = (np.arange(7) + 0.5) * (2.0 * math.pi / 7.0)
+    back = g.invert(g.eval(probe))
+    # Compare modulo 2π.
+    d = np.abs((back - probe + math.pi) % (2.0 * math.pi) - math.pi)
+    assert np.all(d < 1e-4)
+
+
 def test_structure_discovery_gate_and_certificate():
     # split-LR log e-value is just the likelihood gap.
     assert gamfit.split_likelihood_log_e(-8.0, -10.0) == pytest.approx(2.0)
