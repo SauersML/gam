@@ -647,6 +647,90 @@ impl FittedTransport {
         Ok(rows.dot(&self.beta).mapv(|v| v + slope))
     }
 
+    /// Pre-wrap map value `slope·t + offset + g(t)` at a single point — the
+    /// strictly monotone (when fold-free) handle that [`Self::eval`] wraps for
+    /// circle targets and [`Self::invert`] bisects on.
+    fn raw_at(&self, t: f64) -> Result<f64, String> {
+        let arr = Array1::from_elem(1, t);
+        let smooth = self.basis.value_rows(arr.view())?.dot(&self.beta)[0];
+        Ok(self.linear_slope() * t + self.rotation_offset + smooth)
+    }
+
+    /// Invert the transport: for each target-chart coordinate `y`, return the
+    /// source-chart coordinate `t` with `eval([t]) == y`.
+    ///
+    /// Requires a topology-preserving map (fold-free and monotone — a degree-±1
+    /// cover for circle charts, a homeomorphism for intervals), so the inverse
+    /// is single-valued; otherwise this errors rather than picking an arbitrary
+    /// branch. Interval targets reject a `y` outside the fitted image; circle
+    /// targets accept any `y` (the pre-wrap map covers a full `2π`). The root is
+    /// found by monotone bisection on the pre-wrap map `raw_at`, converging to
+    /// ~`(hi − lo)/2¹⁰⁰` in the source coordinate.
+    ///
+    /// This is the exact inverse of [`Self::eval`] and the missing half of the
+    /// transport algebra alongside [`composition_defect`]: it is what lets a
+    /// caller form `g_B ∘ g_A⁻¹` from two fitted transports.
+    pub fn invert(&self, y: ArrayView1<'_, f64>) -> Result<Array1<f64>, String> {
+        if !self.topology_preserved {
+            return Err(
+                "transport inverse requires a topology-preserving (fold-free, monotone) map"
+                    .to_string(),
+            );
+        }
+        let (lo, hi) = match self.topology_from {
+            ChartTopology::Circle => (0.0, TAU),
+            ChartTopology::Interval { lo, hi } => (lo, hi),
+        };
+        // The pre-wrap map is strictly monotone over [lo, hi]; the endpoints
+        // anchor its orientation and image span.
+        let raw_lo = self.raw_at(lo)?;
+        let raw_hi = self.raw_at(hi)?;
+        let increasing = raw_hi > raw_lo;
+        let (raw_min, raw_max) = if increasing {
+            (raw_lo, raw_hi)
+        } else {
+            (raw_hi, raw_lo)
+        };
+        const TOL: f64 = 1.0e-9;
+
+        let mut out = Array1::<f64>::zeros(y.len());
+        for (idx, &yi) in y.iter().enumerate() {
+            // Target value in the pre-wrap coordinate.
+            let target = match self.topology_to {
+                ChartTopology::Interval { .. } => {
+                    if yi < raw_min - TOL || yi > raw_max + TOL {
+                        return Err(format!(
+                            "transport inverse target {yi} is outside the fitted image \
+                             [{raw_min}, {raw_max}]"
+                        ));
+                    }
+                    yi.clamp(raw_min, raw_max)
+                }
+                ChartTopology::Circle => {
+                    // The pre-wrap map covers exactly 2π; shift wrap_tau(y) by
+                    // the unique integer multiple of 2π that lands in the image.
+                    let ywrapped = wrap_tau(yi);
+                    let m = ((raw_min - ywrapped) / TAU).ceil();
+                    ywrapped + TAU * m
+                }
+            };
+            // Monotone bisection on raw_at over [lo, hi].
+            let (mut a, mut b) = (lo, hi);
+            for _ in 0..100 {
+                let mid = 0.5 * (a + b);
+                let rm = self.raw_at(mid)?;
+                let go_right = if increasing { rm < target } else { rm > target };
+                if go_right {
+                    a = mid;
+                } else {
+                    b = mid;
+                }
+            }
+            out[idx] = 0.5 * (a + b);
+        }
+        Ok(out)
+    }
+
     /// Package the fit as a [`LayerTransportReport`] for the given layer pair
     /// (composition fields empty; see [`LayerTransportReport::with_composition`]).
     pub fn report(&self, layer_from: usize, layer_to: usize) -> LayerTransportReport {
@@ -1173,4 +1257,91 @@ pub fn transport_ladder(
     }
 
     Ok(TransportLadderReport { adjacent, two_hop })
+}
+
+#[cfg(test)]
+mod invert_tests {
+    use super::*;
+    use ndarray::Array1;
+
+    fn interval(lo: f64, hi: f64) -> ChartTopology {
+        ChartTopology::Interval { lo, hi }
+    }
+
+    #[test]
+    fn invert_round_trips_interval_transport() {
+        // A strictly increasing nonlinear warp on [0,1] → [0,1].
+        let n = 64;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let to: Array1<f64> = from.mapv(|t| t.powf(1.5));
+        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
+            .expect("fit");
+        assert!(ft.topology_preserved, "monotone warp should preserve topology");
+
+        let probe = Array1::from_iter((1..10).map(|i| i as f64 / 10.0));
+        // eval ∘ invert and invert ∘ eval both return identity.
+        let fwd = ft.eval(probe.view()).expect("eval");
+        let back = ft.invert(fwd.view()).expect("invert");
+        for i in 0..probe.len() {
+            assert!(
+                (back[i] - probe[i]).abs() < 1e-6,
+                "round-trip failed: t={} back={}",
+                probe[i],
+                back[i]
+            );
+        }
+        let re_eval = ft.eval(back.view()).expect("eval");
+        for i in 0..fwd.len() {
+            assert!((re_eval[i] - fwd[i]).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn invert_round_trips_decreasing_interval_transport() {
+        // Orientation-reversing homeomorphism with derivative bounded away from
+        // zero: to = 1 - 0.5·from - 0.5·from² on [0,1] (h′ = -0.5 - from ≤ -0.5).
+        let n = 64;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let to: Array1<f64> = from.mapv(|t| 1.0 - 0.5 * t - 0.5 * t * t);
+        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
+            .expect("fit");
+        assert!(ft.topology_preserved);
+        let probe = Array1::from_iter((1..10).map(|i| i as f64 / 10.0));
+        let fwd = ft.eval(probe.view()).expect("eval");
+        let back = ft.invert(fwd.view()).expect("invert");
+        for i in 0..probe.len() {
+            assert!((back[i] - probe[i]).abs() < 1e-6, "t={} back={}", probe[i], back[i]);
+        }
+    }
+
+    #[test]
+    fn invert_round_trips_circle_transport() {
+        // Degree-1 circle cover: a rotation plus a fold-free wiggle.
+        let n = 128;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| TAU * i as f64 / n as f64));
+        let to: Array1<f64> = from.mapv(|t| wrap_tau(t + 0.3 + 0.2 * t.sin()));
+        let ft = fit_transport_map(from.view(), to.view(), ChartTopology::Circle, ChartTopology::Circle)
+            .expect("fit");
+        assert!(ft.topology_preserved, "degree {:?}", ft.degree);
+
+        let probe = Array1::from_iter((0..7).map(|i| TAU * (i as f64 + 0.5) / 7.0));
+        let fwd = ft.eval(probe.view()).expect("eval");
+        let back = ft.invert(fwd.view()).expect("invert");
+        for i in 0..probe.len() {
+            // Compare modulo 2π.
+            let d = wrap_pi(back[i] - probe[i]).abs();
+            assert!(d < 1e-5, "probe={} back={} d={}", probe[i], back[i], d);
+        }
+    }
+
+    #[test]
+    fn invert_rejects_target_outside_interval_image() {
+        // Image of `to = 0.5·from` is ~[0, 0.5]; y = 0.9 is outside it.
+        let n = 32;
+        let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
+        let to: Array1<f64> = from.mapv(|t| 0.5 * t);
+        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
+            .expect("fit");
+        assert!(ft.invert(Array1::from_elem(1, 0.9).view()).is_err());
+    }
 }
