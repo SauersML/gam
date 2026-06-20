@@ -101,21 +101,43 @@ pub fn wood_smooth_test(input: SmoothTestInput<'_>) -> Option<SmoothTestResult> 
     let pen_dim = k.saturating_sub(null_dim);
 
     let mut statistic = 0.0;
+    // Effective rank of the statistic: the number of covariance directions
+    // actually summed across the null and penalized sub-blocks. The χ²/F
+    // reference d.f. is floored at this count so a boundary-shrunk term (whose
+    // Wood influence-trace d.f. collapses toward 0) is never judged against a
+    // degenerate ~0-d.f. reference — the mechanism that turned a *zero* Wald
+    // statistic into p≈0 for a term the fit removed (#1360).
+    let mut rank_used = 0usize;
     if null_dim > 0 {
         let beta_null = beta.slice(s![0..null_dim]).to_owned();
         let cov_null = cov.slice(s![0..null_dim, 0..null_dim]).to_owned();
-        statistic += full_rank_quadratic(&beta_null, &cov_null)?;
+        let (q, used) = full_rank_quadratic(&beta_null, &cov_null)?;
+        statistic += q;
+        rank_used += used;
     }
     if pen_dim > 0 {
         let beta_pen = beta.slice(s![null_dim..k]).to_owned();
         let cov_pen = cov.slice(s![null_dim..k, null_dim..k]).to_owned();
         let rank = truncated_rank(input.edf - null_dim as f64, pen_dim);
         if rank > 0 {
-            statistic += truncated_quadratic(&beta_pen, &cov_pen, rank)?;
+            let (q, used) = truncated_quadratic(&beta_pen, &cov_pen, rank)?;
+            statistic += q;
+            rank_used += used;
         }
     }
 
-    let ref_df = reference_df(input.influence_matrix, start, end).unwrap_or(input.edf.max(1e-12));
+    if rank_used == 0 {
+        // No estimable direction in the block (every covariance eigenmode is
+        // numerically null): the term carries no testable signal.
+        return None;
+    }
+    // Wood (2013) influence-trace participation d.f. when available, but never
+    // below `rank_used`. The historical fallback to `edf` collapsed to ~0 for a
+    // shrunk term, making `χ²_{ref_df→0}` degenerate.
+    let ref_df = match reference_df(input.influence_matrix, start, end) {
+        Some(rd) if rd.is_finite() && rd > 0.0 => rd.max(rank_used as f64),
+        _ => rank_used as f64,
+    };
     if !statistic.is_finite() || statistic < 0.0 || !ref_df.is_finite() || ref_df <= 0.0 {
         return None;
     }
@@ -161,11 +183,17 @@ fn block(matrix: &Array2<f64>, start: usize, end: usize) -> Option<Array2<f64>> 
     Some(matrix.slice(s![start..end, start..end]).to_owned())
 }
 
-fn full_rank_quadratic(beta: &Array1<f64>, cov: &Array2<f64>) -> Option<f64> {
+fn full_rank_quadratic(beta: &Array1<f64>, cov: &Array2<f64>) -> Option<(f64, usize)> {
     truncated_quadratic(beta, cov, beta.len())
 }
 
-fn truncated_quadratic(beta: &Array1<f64>, cov: &Array2<f64>, rank: usize) -> Option<f64> {
+/// Returns the rank-`rank` truncated Wald quadratic together with the number of
+/// covariance directions (eigenmodes above the relative tolerance) that were
+/// actually summed into it. The `used` count is the *effective rank of the
+/// statistic*: it can fall below `rank` when the covariance subblock is itself
+/// rank-deficient. Callers fold it into the χ² reference degrees of freedom so
+/// the tail probability is never evaluated against a degenerate ~0 d.f.
+fn truncated_quadratic(beta: &Array1<f64>, cov: &Array2<f64>, rank: usize) -> Option<(f64, usize)> {
     if beta.is_empty() || cov.nrows() != beta.len() || cov.ncols() != beta.len() || rank == 0 {
         return None;
     }
@@ -192,7 +220,7 @@ fn truncated_quadratic(beta: &Array1<f64>, cov: &Array2<f64>, rank: usize) -> Op
             break;
         }
     }
-    (used > 0 && q.is_finite()).then_some(q.max(0.0))
+    (used > 0 && q.is_finite()).then_some((q.max(0.0), used))
 }
 
 fn reference_df(influence: Option<&Array2<f64>>, start: usize, end: usize) -> Option<f64> {
@@ -306,5 +334,80 @@ mod tests {
                 base.p_value
             );
         }
+    }
+
+    /// A term the fit drove to the penalty boundary (coefficients ≈ 0, EDF → 0)
+    /// must read as *not* significant. The defect (#1360): the reference d.f.
+    /// fell back to `edf` and collapsed toward 0, so the χ² tail of a *zero*
+    /// statistic evaluated at ~0 d.f. degenerated to p ≈ 0 — an overwhelming
+    /// false positive for a term that was removed. The reference d.f. is now
+    /// floored at the rank actually summed (≥ 1), so a zero statistic returns
+    /// p ≈ 1.
+    #[test]
+    fn boundary_shrunk_term_is_not_significant() {
+        // Near-zero coefficients with a well-conditioned (non-degenerate)
+        // covariance: the Wald statistic is ~0 regardless of how the reference
+        // d.f. is formed.
+        let beta = array![1e-9, -2e-9, 5e-10];
+        let cov = array![[0.04, 0.0, 0.0], [0.0, 0.05, 0.0], [0.0, 0.0, 0.06]];
+        // A degenerate influence block (sign-flipped near-zero leverages) so the
+        // Wood trace correction is unavailable and the fallback is exercised.
+        let f = array![[1e-9, 0.0, 0.0], [0.0, -1e-9, 0.0], [0.0, 0.0, 1e-12]];
+        for scale in [SmoothTestScale::Known, SmoothTestScale::Estimated] {
+            let out = wood_smooth_test(SmoothTestInput {
+                beta: beta.view(),
+                covariance: &cov,
+                influence_matrix: Some(&f),
+                coeff_range: 0..3,
+                edf: 1e-6,
+                nullspace_dim: 0,
+                residual_df: 500.0,
+                scale,
+            })
+            .expect("boundary term still produces a result");
+            assert!(
+                out.ref_df >= 1.0,
+                "reference d.f. must not collapse below the tested rank: {}",
+                out.ref_df
+            );
+            assert!(
+                out.statistic < 1e-6,
+                "boundary statistic should be ~0: {}",
+                out.statistic
+            );
+            assert!(
+                out.p_value > 0.5,
+                "shrunk boundary term must not be significant (p={}, scale={:?})",
+                out.p_value,
+                scale
+            );
+        }
+    }
+
+    /// Flooring the reference d.f. at the tested rank must not weaken a genuinely
+    /// significant term: a large statistic with a healthy influence block keeps
+    /// its small p-value (the floor only raises a *degenerate* sub-1 d.f.).
+    #[test]
+    fn floor_does_not_blunt_a_real_signal() {
+        let beta = array![6.0, -5.0];
+        let cov = array![[1.0, 0.0], [0.0, 1.0]];
+        let f = array![[0.9, 0.0], [0.0, 0.9]];
+        let out = wood_smooth_test(SmoothTestInput {
+            beta: beta.view(),
+            covariance: &cov,
+            influence_matrix: Some(&f),
+            coeff_range: 0..2,
+            edf: 2.0,
+            nullspace_dim: 2,
+            residual_df: 500.0,
+            scale: SmoothTestScale::Known,
+        })
+        .expect("smooth test");
+        assert!(out.statistic > 40.0, "statistic={}", out.statistic);
+        assert!(
+            out.p_value < 1e-6,
+            "a strong term must stay significant: p={}",
+            out.p_value
+        );
     }
 }
