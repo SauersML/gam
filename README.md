@@ -383,7 +383,7 @@ this," a PR that's mostly wrong but sparks the right fix — all of it
 helps. The only real failure is a good thought that never gets sent
 because the friction felt too high.
 
-Open a [pull request](https://github.com/SauersML/gam/pulls) or an
+Great PRs will often consider SPEC.md. Open a [pull request](https://github.com/SauersML/gam/pulls) or an
 [issue](https://github.com/SauersML/gam/issues) — bugs, features,
 questions, wild ideas. That's the whole process.
 
