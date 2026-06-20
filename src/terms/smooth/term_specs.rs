@@ -5978,6 +5978,32 @@ fn build_pca_smooth_basis(
     })
 }
 
+/// A factor-level `by=` wrapper owns the model-space centering of its inner
+/// smooth: it gates the raw/structurally-constrained basis to the level rows
+/// and then centers that gated block exactly once against the level indicator
+/// (`build_parametric_constraint_block_for_term` in `design_construction`).
+/// Leaving the inner B-spline's default pooled weighted-sum-to-zero active here
+/// would impose two generically-independent constraints — the pooled column
+/// moment `m = Σ_h m_h` and the per-level moment `m_g` — so a raw `k`-column
+/// basis collapses to `k-2` columns per level instead of `k-1`, deleting one
+/// genuine nonconstant spline direction *before REML runs* (#1427). The group
+/// main effect carries only the constant, so it cannot restore that direction.
+///
+/// Only the *default model-space* centering is deferred. Explicit structural or
+/// frozen transforms (`RemoveLinearTrend`, `OrthogonalToDesignColumns`,
+/// `FrozenTransform`, `None`) are user/structural choices and are preserved
+/// verbatim.
+fn defer_inner_model_centering_to_factor_level_wrapper(basis: &mut SmoothBasisSpec) {
+    if let SmoothBasisSpec::BSpline1D { spec, .. } = basis
+        && matches!(
+            spec.identifiability,
+            BSplineIdentifiability::WeightedSumToZero { .. }
+        )
+    {
+        spec.identifiability = BSplineIdentifiability::None;
+    }
+}
+
 fn apply_by_variable_to_local_build(
     mut built: LocalSmoothTermBuild,
     data: ArrayView2<'_, f64>,
@@ -6579,9 +6605,19 @@ fn build_single_local_smooth_term(
     } = &term.basis
     {
         ensure_by_variable_specs_match(kind, by, &term.name)?;
+        let mut inner_basis = (**inner).clone();
+        // Factor-level `by=` owns model-space centering (it centers the gated
+        // block against the level indicator downstream). Defer the inner
+        // basis's default pooled centering so the level block is not
+        // double-centered down to `k-2` columns (#1427). Numeric-by smooths are
+        // untouched: they are not row-gated to a level and keep ordinary
+        // intercept centering.
+        if matches!(by, ByVariableSpec::Level { .. }) {
+            defer_inner_model_centering_to_factor_level_wrapper(&mut inner_basis);
+        }
         let inner_term = SmoothTermSpec {
             name: term.name.clone(),
-            basis: (**inner).clone(),
+            basis: inner_basis,
             shape: term.shape,
             joint_null_rotation: None,
         };

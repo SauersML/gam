@@ -28,13 +28,21 @@ use gam::terms::basis::{
 };
 use ndarray::Array2;
 
-/// Evaluation data: a 4×4 grid (16 rows). Fewer rows than centers (see below).
+/// Evaluation data: a 6×6 grid (36 rows). `n = 36 >= k = 28` so the Matérn
+/// `matern_rank_reduce_centers` RRQR pruning is a genuine no-op — it only prunes
+/// when the realized `n × k` kernel block is column-rank-deficient, and a
+/// well-spread 36-row cloud supports all 28 center columns. (An earlier 4×4
+/// `n = 16 < k = 28` grid was rank-deficient: RRQR legitimately dropped the
+/// near-duplicate center columns, so the near-null eigenspace — and the
+/// `DoublePenaltyNullspace` shrinkage block this test exercises — disappeared in
+/// the value build while the derivative build still sized to the full center
+/// set, the exact desync this fixture must avoid.)
 fn dataset() -> Array2<f64> {
     let mut rows = Vec::new();
-    for i in 0..4 {
-        for j in 0..4 {
-            rows.push(i as f64 / 3.0);
-            rows.push(j as f64 / 3.0);
+    for i in 0..6 {
+        for j in 0..6 {
+            rows.push(i as f64 / 5.0);
+            rows.push(j as f64 / 5.0);
         }
     }
     Array2::from_shape_vec((rows.len() / 2, 2), rows).unwrap()
@@ -60,11 +68,13 @@ const NEAR_DUP_OFFSET: f64 = 1.0e-5;
 /// eigenspace in the projected kernel Gram, so the `DoublePenaltyNullspace`
 /// shrinkage block is reliably emitted at any moderate κ.
 ///
-/// `k = 28 > n = 16`, so the Matérn `matern_rank_reduce_centers` RRQR pruning is
-/// skipped (it requires `n >= k`): the value build and the derivative build use
-/// the SAME center set, keeping their penalty-block lists index-aligned. This
-/// also mirrors the production iso-κ regime, where the FrozenTransform pins the
-/// centers so no κ-dependent reduction runs during the optimization.
+/// `k = 28` with `n = 36 >= k` (see [`dataset`]): the realized `n × k` Matérn
+/// kernel block is full column rank, so `matern_rank_reduce_centers` keeps every
+/// center. The value build and the derivative build therefore use the SAME
+/// (un-reduced) center set, keeping their penalty-block lists index-aligned and
+/// the near-duplicate-induced near-null eigenspace intact. This also mirrors the
+/// production iso-κ regime, where the FrozenTransform pins the centers so no
+/// κ-dependent reduction runs during the optimization.
 fn centers() -> Array2<f64> {
     let mut rows = Vec::new();
     for i in 0..5 {

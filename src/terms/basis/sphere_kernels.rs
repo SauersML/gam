@@ -241,8 +241,49 @@ pub(crate) fn wahba_sphere_kernel_from_cos_simd_kind(
 }
 
 /// Spectral derivative of the Sobolev sphere kernel w.r.t. `cos gamma`.
+/// Exact closed-form derivative `dK_m^{Sobolev}/d(cos gamma)` for
+/// `m in {1, 2, 3}`, differentiating the SAME polylogarithm closed forms used
+/// by [`wahba_sphere_kernel_sobolev_closed_form`] so the design jet aligns with
+/// the forward design to full precision (the slowly-convergent spectral
+/// derivative series below was accurate enough for the kernel VALUE but lost
+/// ~1.8 relative error on its DERIVATIVE at low `m`).
+///
+/// With `u = (1 - cos gamma)/2`, `du/d(cos gamma) = -1/2`:
+///   m=1: K = (-ln u - 1)/(4π)              ⇒ dK/du = -1/(4π u)
+///   m=2: K = (Li₂(1-u) + 1 - π²/6)/(4π)    ⇒ dK/du = ln(u)/((1-u)·4π)
+///   m=3: K = (-2Li₃(u) - Li₂(1-u) + ln(u)·Li₂(u) + 2ζ₃ + π²/6 - 2)/(4π)
+///        ⇒ dK/du = [-Li₂(u)/u - ln(u)/(1-u) - ln(u)·ln(1-u)/u]/(4π)
+/// using d Li₂(z)/dz = -ln(1-z)/z and d Li₃(z)/dz = Li₂(z)/z.
+#[inline]
+fn wahba_sphere_kernel_sobolev_closed_form_derivative_dcos(cos_gamma: f64, m: usize) -> f64 {
+    let cos_g = cos_gamma.clamp(-1.0, 1.0);
+    let four_pi = 4.0 * std::f64::consts::PI;
+    let u = ((1.0 - cos_g) * 0.5).max(f64::EPSILON * 1.0e-4);
+    let one_minus_u = (1.0 - u).max(f64::EPSILON * 1.0e-4);
+    let dk_du = match m {
+        1 => -1.0 / (four_pi * u),
+        2 => u.ln() / (one_minus_u * four_pi),
+        3 => {
+            let li2_u = dilog_unit(u);
+            (-li2_u / u - u.ln() / one_minus_u - u.ln() * one_minus_u.ln() / u) / four_pi
+        }
+        _ => unreachable!("closed-form Sobolev derivative only defined for m in {{1,2,3}}"),
+    };
+    // du/d(cos gamma) = -1/2.
+    dk_du * (-0.5)
+}
+
 pub(crate) fn wahba_sphere_kernel_sobolev_derivative_dcos(x: f64, m: usize) -> f64 {
     const POLE_LIMIT_THRESHOLD: f64 = 1.0e-10;
+
+    // m in {1,2,3} use the exact polylog closed-form derivative so the jet
+    // matches the closed-form forward kernel; m=4 falls back to the spectral
+    // series (the forward m=4 kernel is itself spectral). Stay on the spectral
+    // path near the poles where the closed forms have integrable log/1/u
+    // singularities that the bounded-derivative pole limit handles cleanly.
+    if (1..=3).contains(&m) && x.clamp(-1.0, 1.0).abs() <= 1.0 - POLE_LIMIT_THRESHOLD {
+        return wahba_sphere_kernel_sobolev_closed_form_derivative_dcos(x, m);
+    }
 
     let l_max = match m {
         1 => 4096_usize,

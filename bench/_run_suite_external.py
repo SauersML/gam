@@ -1642,6 +1642,21 @@ def run_external_r_brms_cv(scenario: typing.Any, *, ds: dict[str, typing.Any] | 
     if not mu_formula:
         return None
 
+    # Per-fold wall-clock cap for the brms MCMC fit (#1390). The brms
+    # contender runs full Bayesian sampling (4 chains x 2000 iter) per CV
+    # fold; on the larger panels (e.g. us48_demand_31day) the five folds
+    # together overran the 42-minute per-shard GNU `timeout`, which then
+    # SIGKILLed the whole shard (exit 124) AFTER gam had already finished —
+    # discarding every result in the shard with no per-fold attribution.
+    # Bounding each fold turns a slow/hung brms fold into a recorded, visible
+    # per-fold failure instead. brms is in NON_BLOCKING_FAILURE_CONTENDERS, so
+    # a capped fold does NOT fail the shard; the gam result and all other
+    # contenders are preserved. Default 1500s (25 min) keeps the worst-case
+    # 5-fold serial brms run inside the shard budget while leaving headroom for
+    # the gam lane; override with BENCH_BRMS_FOLD_TIMEOUT_SEC (0 disables and
+    # falls back to the global BENCH_CMD_TIMEOUT_SEC).
+    brms_fold_timeout = _env_int("BENCH_BRMS_FOLD_TIMEOUT_SEC", 1500)
+
     with _workspace_tempdir(prefix="gam_bench_r_brms_cv_") as td:
         td_path = Path(td)
         data_path = td_path / "data.json"
@@ -1791,6 +1806,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     str(test_idx_path),
                 ],
                 cwd=ROOT,
+                timeout_sec=brms_fold_timeout if brms_fold_timeout > 0 else None,
             )
             if code != 0:
                 return {

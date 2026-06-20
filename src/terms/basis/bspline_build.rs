@@ -1336,7 +1336,16 @@ pub fn analyze_penalty_block_with_op(
     let (sym, evals, evecs) = spectral_summary(penalty)?;
     let tol = spectral_tolerance(&sym, &evals);
     let rank = evals.iter().filter(|&&ev| ev > tol).count();
-    let nullity = sym.nrows().saturating_sub(rank);
+    // The penalty null space is the set of directions on which the penalty
+    // carries no curvature, i.e. eigenvalues within tolerance of *zero*
+    // (`|ev| <= tol`). A genuinely negative eigenvalue (`ev < -tol`) is an
+    // O(1) direction of *negative* curvature — a non-PSD penalty — and must
+    // NOT be folded into the null space. Counting `ev <= tol` (the old
+    // convention) silently classified such negative eigendirections as null,
+    // so the canonical root dropped genuine negative curvature into the
+    // absorbed parametric block (#1425). Match `estimate_penalty_nullity`,
+    // which already keys nullity on `|ev| <= tol`.
+    let nullity = evals.iter().filter(|&&ev| ev.abs() <= tol).count();
     let max_abs_eigenvalue = evals
         .iter()
         .copied()
@@ -1376,11 +1385,15 @@ pub(crate) fn nullspace_basis_from_block(block: &CanonicalPenaltyBlock) -> Optio
     if block.nullity == 0 {
         return None;
     }
+    // Null directions are eigenvalues within tolerance of zero (`|ev| <= tol`),
+    // NOT every eigenvalue `<= tol`: the latter sweeps up genuinely *negative*
+    // eigenvalues (negative curvature, a non-PSD penalty) and would absorb them
+    // into the parametric block as if they were unpenalized (#1425).
     let null_idx: Vec<usize> = block
         .eigenvalues
         .iter()
         .enumerate()
-        .filter_map(|(i, &ev)| (ev <= block.tol).then_some(i))
+        .filter_map(|(i, &ev)| (ev.abs() <= block.tol).then_some(i))
         .collect();
     if null_idx.is_empty() {
         return None;
@@ -1459,7 +1472,12 @@ pub fn compute_joint_null_rotation(
     }
     let (sym, evals, evecs) = spectral_summary(&s_sum)?;
     let tol = spectral_tolerance(&sym, &evals);
-    let joint_nullity = evals.iter().filter(|&&ev| ev <= tol).count();
+    // Joint null directions are within tolerance of zero (`|ev| <= tol`). A
+    // genuinely negative joint eigenvalue (`ev < -tol`) is negative curvature,
+    // not an unpenalized direction, and must NOT be absorbed into the parametric
+    // block — counting `ev <= tol` swept such directions into the trailing
+    // absorbed columns (#1425).
+    let joint_nullity = evals.iter().filter(|&&ev| ev.abs() <= tol).count();
     if joint_nullity == 0 {
         return Ok(None);
     }
@@ -1475,8 +1493,8 @@ pub fn compute_joint_null_rotation(
     order.sort_by(|&a, &b| {
         let ev_a = evals[a];
         let ev_b = evals[b];
-        let null_a = ev_a <= tol;
-        let null_b = ev_b <= tol;
+        let null_a = ev_a.abs() <= tol;
+        let null_b = ev_b.abs() <= tol;
         match (null_a, null_b) {
             (false, true) => std::cmp::Ordering::Less,
             (true, false) => std::cmp::Ordering::Greater,

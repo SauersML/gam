@@ -93,8 +93,20 @@ fn kappa_one_kernel_uses_great_circle_distance() {
         for j in 0..pts.nrows() {
             let p = embed(pts[(i, 0)], pts[(i, 1)]);
             let q = embed(pts[(j, 0)], pts[(j, 1)]);
-            let cosang = (p[0] * q[0] + p[1] * q[1] + p[2] * q[2]).clamp(-1.0, 1.0);
-            let angle = cosang.acos();
+            // Great-circle angle via atan2(|p×q|, p·q). This is accurate for
+            // small angles (including the exact-zero self-distance on the
+            // diagonal), where `acos(p·q)` suffers catastrophic cancellation:
+            // for unit vectors `p·q = 1 - 2.1e-8` rounds to acos ≈ 2e-4 rather
+            // than 0, which is the analytically correct geodesic self-distance.
+            let dot = p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
+            let cross = [
+                p[1] * q[2] - p[2] * q[1],
+                p[2] * q[0] - p[0] * q[2],
+                p[0] * q[1] - p[1] * q[0],
+            ];
+            let cross_norm =
+                (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+            let angle = cross_norm.atan2(dot);
             let expected = (-angle / LENGTH_SCALE).exp();
             assert!(
                 (k[(i, j)] - expected).abs() < 1e-10,
@@ -262,8 +274,18 @@ fn penalty_is_constrained_kernel_gram() {
         let s: f64 = z.column(col).sum();
         assert!(s.abs() < 1e-10, "constraint column {col} sum {s}");
     }
-    // Realized design = K(data, centers)·z.
-    let raw = constant_curvature_kernel_matrix(pts.view(), pts.view(), kappa, LENGTH_SCALE)
+    // Realized design = K(data, centers)·z. The build evaluates the kernel at
+    // the κ-invariant EFFECTIVE length L(κ) (the #944 fill-invariance fix), NOT
+    // at the κ=0 reference length stored in the metadata, so the reconstruction
+    // must use the same L(κ). At κ=0 the two coincide; here κ=0.4 so they differ.
+    let ell_eff = gam::basis::constant_curvature_effective_length(
+        pts.view(),
+        pts.view(),
+        LENGTH_SCALE,
+        kappa,
+    )
+    .expect("effective length");
+    let raw = constant_curvature_kernel_matrix(pts.view(), pts.view(), kappa, ell_eff)
         .expect("raw kernel");
     let expected_design = raw.dot(z);
     let design = built.design.to_dense();

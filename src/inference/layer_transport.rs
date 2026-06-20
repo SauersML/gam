@@ -852,7 +852,7 @@ impl FittedTransport {
         }
         // Span-exact strict-monotonicity certificate; supersedes the sampled
         // `topology_preserved` flag, which can pass over a between-sample fold.
-        let _orientation = self.certify_strict_monotonicity()?;
+        self.certify_strict_monotonicity()?;
         let (lo, hi) = match self.topology_from {
             ChartTopology::Circle => (0.0, TAU),
             ChartTopology::Interval { lo, hi } => (lo, hi),

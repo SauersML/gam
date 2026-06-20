@@ -1295,7 +1295,7 @@ impl SaeManifoldOuterObjective {
     /// baseline term so the probes never alias the live converged warm state.
     /// A non-finite probe falls back to a zero component on that axis, which
     /// simply omits a descent contribution there rather than poisoning the step.
-    pub(crate) fn finite_difference_outer_gradient(
+    pub(crate) fn central_difference_outer_gradient(
         &self,
         rho_state: &SaeManifoldRho,
     ) -> Result<Array1<f64>, String> {
@@ -1479,7 +1479,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                      gradient of the value path so the near-singular flat valley is crossed \
                      instead of aborting the outer optimisation"
                 );
-                self.finite_difference_outer_gradient(&rho_state)
+                self.central_difference_outer_gradient(&rho_state)
                     .map_err(EstimationError::RemlOptimizationFailed)?
             }
         };

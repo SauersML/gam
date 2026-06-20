@@ -531,6 +531,10 @@ pub fn build_termspec(
                     .collect::<Result<Vec<_>, _>>()?;
                 let mut inner_options = options.clone();
                 inner_options.remove("by");
+                // `ordered=` is consumed here (ByVarKind::Factor routing) and
+                // must not propagate to the inner basis builder, which has no
+                // allow-list entry for it and would reject it as an unknown option.
+                inner_options.remove("ordered");
                 if is_sz {
                     inner_options.remove("bs");
                     inner_options.remove("type");

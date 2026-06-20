@@ -146,7 +146,10 @@ pub fn build_spherical_spline_basis(
 
 const SPHERE_UNPENALIZED_LOW_DEGREE: usize = 1;
 
-fn harmonic_degree_for_wahba_basis_width(spec: &SphericalSplineBasisSpec, n_rows: usize) -> usize {
+pub(crate) fn harmonic_degree_for_wahba_basis_width(
+    spec: &SphericalSplineBasisSpec,
+    n_rows: usize,
+) -> usize {
     let target = match &spec.center_strategy {
         CenterStrategy::Auto(inner) => match inner.as_ref() {
             CenterStrategy::FarthestPoint { num_centers }
@@ -630,90 +633,46 @@ pub(crate) fn build_spherical_harmonic_basis(
             Ok(())
         })?;
     }
-    // Diagonal Laplace-Beltrami eigenvalue penalty [l(l+1)]^m per (l, m).
-    // Degree-2 modes carry real low-frequency sphere signal, but they still
-    // need primary-penalty shrinkage under noisy finite samples. For explicit
-    // high-degree bases (L > 2), fold an additional [l(l+1)] factor into modes
-    // l > 2 in this same primary block. Keeping that tail shrinkage tied to the
-    // primary lambda prevents REML from fitting dense equatorial noise with
-    // separately under-penalized high-degree modes and then degrading in sparse
-    // polar latitude bands.
+    // Diagonal Laplace-Beltrami curvature penalty [l(l+1)]^order per (l, m).
     //
-    // This is already in the natural coefficient coordinates for the real
-    // spherical harmonics: the basis is orthonormal on S², so X'X/n is O(1)
-    // under uniform sampling, while the diagonal entries are the physical
-    // roughness eigenvalues of the final function. Frobenius-normalizing this
-    // matrix would divide away that meaningful spectral scale (≈1261 for
-    // L=4, m=2), making REML optimize against an artificially tiny physical
-    // penalty. Keep the raw operator with normalization_scale=1 so optimizer
-    // lambdas are physical lambdas for this smooth.
-    // Split the diagonal Laplace-Beltrami curvature penalty into two blocks that
-    // carry SEPARATE smoothing parameters (#1246, polar high-latitude quality).
-    // The decisive observation is that REML re-selects each block's lambda, so
-    // changing a penalty's SCALE within a block is absorbed by lambda and cannot
-    // move the fit; only a STRUCTURAL split into an independently-tuned block can.
+    // The real spherical harmonics diagonalize the Laplace-Beltrami operator on
+    // S²: the degree-l block is an irreducible SO(3) representation with the
+    // single eigenvalue l(l+1), constant across all 2l+1 modes in the block.
+    // Raising every mode in a degree to the SAME power therefore yields a
+    // ROTATION-INVARIANT penalty (it commutes with the SO(3) action), which is
+    // exactly the iterated Laplacian Sobolev seminorm ‖Δ^order f‖². Because the
+    // penalty is rotation-invariant and the sphere area measure is rotation-
+    // invariant, the induced smoothing is latitude-independent by construction:
+    // no pole/equator direction is privileged (#1246). Splitting the curvature
+    // penalty by mode type (e.g. routing zonal m=0 modes to a separate block)
+    // would BREAK this invariance and reintroduce a latitude-dependent error
+    // profile, so the operator is kept as one isotropic block.
     //
-    //   * Primary (equator-supported signal) — the degree-2 NON-zonal modes
-    //     (m != 0: the sectoral/tesseral harmonics Y_{2,+-2}=x^2-y^2, xy and
-    //     Y_{2,+-1}). Their basis functions carry a cos(lat) factor, so they
-    //     VANISH at the poles and concentrate their amplitude near the equator.
-    //     This is where the genuine low-degree sphere signal lives, so REML must
-    //     keep this lambda moderate enough to fit it.
-    //   * Tail (polar-supported / noise) — every ZONAL mode (m = 0, P_{l,0}) for
-    //     l >= 2 PLUS the entire high-degree band (l > 2, all m). The zonal modes
-    //     P_{l,0}(sin lat) reach their largest magnitude AT the poles, and the
-    //     high-degree modes carry no low-degree signal. Under a single shared
-    //     lambda the optimizer had to keep the curvature penalty small enough to
-    //     fit the equator-dominant sectoral signal, which left these polar-heavy
-    //     modes under-suppressed; their residual wiggle then piled up in the
-    //     sparsely sampled polar latitude bands (south-polar/equator RMSE ratio
-    //     > 1.4). Routing them to their OWN smoothing parameter lets REML drive
-    //     this block independently: for a low-degree truth it crushes the
-    //     polar-heavy noise band (no equatorial signal to protect) while leaving
-    //     the equator-supported sectoral signal untouched, evening out the
-    //     latitude-band error profile. For a genuinely high-degree truth REML
-    //     keeps the tail lambda moderate, so signal recovery and the predict
-    //     boundedness guarantees are preserved.
+    // The basis is orthonormal on S², so X'X/n is O(1) under uniform sampling
+    // while the diagonal entries are the physical roughness eigenvalues of the
+    // fitted function. Frobenius-normalizing would divide away that meaningful
+    // spectral scale, making REML optimize against an artificially tiny physical
+    // penalty, so the raw operator is kept with normalization_scale=1 and the
+    // optimizer lambda is a physical lambda for this smooth.
     let mut penalty = Array2::<f64>::zeros((p, p));
-    let mut tail = Array2::<f64>::zeros((p, p));
     let mut col = 0usize;
     for l in 1..=l_max {
         let laplace = l as f64 * (l as f64 + 1.0);
-        let eig = laplace.powi((spec.penalty_order + 2) as i32);
-        // Column layout per degree l: [sin(l*phi)P_{l,l} .. sin(phi)P_{l,1},
-        // P_{l,0}, cos(phi)P_{l,1} .. cos(l*phi)P_{l,l}], so the local index `l`
-        // (0-based) within the (2l+1)-wide block is the zonal m=0 column.
-        for local in 0..(2 * l + 1) {
-            let is_zonal = local == l;
-            if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
-                // unpenalized low-degree span
-            } else if l > 2 || is_zonal {
-                // polar-supported / noise band -> independent tail lambda
-                tail[[col, col]] = eig;
-            } else {
-                // equator-supported degree-2 sectoral/tesseral signal
-                penalty[[col, col]] = eig;
-            }
+        let eig = laplace.powi(spec.penalty_order as i32);
+        for _ in 0..(2 * l + 1) {
+            penalty[[col, col]] = eig;
             col += 1;
         }
     }
-    let has_tail = tail.diag().iter().any(|&v| v > 0.0);
-    // Double-penalty shrinkage lives on the primary penalty's null space.
-    // The harmonic basis omits the constant mode, so the unpenalized Wahba
-    // low-degree span is exactly the l <= SPHERE_UNPENALIZED_LOW_DEGREE block.
-    // Penalizing the complement here would duplicate the curvature penalty and
-    // leave the nominal null-space penalty inert.
+    // The curvature penalty above is full-rank within this basis (every degree
+    // l >= 1 has eigenvalue l(l+1) > 0; the constant mode l=0 is not part of the
+    // harmonic basis), so it has an empty null space. A double-penalty therefore
+    // contributes a uniform isotropic ridge that shrinks all coefficients toward
+    // zero under its own smoothing parameter — the standard mgcv-style extra
+    // shrinkage term — and is only active when explicitly requested.
     let mut ridge = Array2::<f64>::zeros((p, p));
-    {
-        let mut col = 0usize;
-        for l in 1..=l_max {
-            for _ in 0..(2 * l + 1) {
-                if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
-                    ridge[[col, col]] = 1.0;
-                }
-                col += 1;
-            }
-        }
+    for c in 0..p {
+        ridge[[c, c]] = 1.0;
     }
 
     // Realized-design identifiability gauge (#1246). The global smooth
@@ -747,7 +706,6 @@ pub(crate) fn build_spherical_harmonic_basis(
     let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[transform.clone()]);
     let design = gauge.restrict_design(&design);
     let penalty = gauge.restrict_penalty(&penalty);
-    let tail = gauge.restrict_penalty(&tail);
     let ridge = gauge.restrict_penalty(&ridge);
 
     let mut candidates = vec![PenaltyCandidate {
@@ -758,19 +716,6 @@ pub(crate) fn build_spherical_harmonic_basis(
         kronecker_factors: None,
         op: None,
     }];
-    if has_tail {
-        // Independent smoothing parameter for the degree>2 curvature tail. Keep
-        // the raw physical roughness operator (normalization_scale=1) so the
-        // optimizer lambda stays a physical lambda, matching the primary block.
-        candidates.push(PenaltyCandidate {
-            matrix: tail,
-            nullspace_dim_hint: 0,
-            source: PenaltySource::Other("SphereHarmonicHighDegreeTail".to_string()),
-            normalization_scale: 1.0,
-            kronecker_factors: None,
-            op: None,
-        });
-    }
     if spec.double_penalty {
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
@@ -2956,9 +2901,44 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeBundle, BasisError> {
     // Analytic psi derivative assembly for the Matérn basis block.
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
-    let aniso = spec.aniso_log_scales.as_deref();
+    //
+    // The ψ-derivatives MUST be built over the EXACT same realized geometry as
+    // the value build (`build_matern_basiswithworkspace`): the value build
+    // rank-reduces an over-specified center set (`matern_rank_reduce_centers`,
+    // #755), periodic-expands it, and resolves the anisotropy/identifiability
+    // transform over the surviving centers. Re-deriving the centers here from
+    // `select_centers_by_strategy` (un-reduced) produced a derivative penalty
+    // sized to the FULL center set while `base.penaltyinfo` (the active-block
+    // mask + the forward penalty list) is sized to the REDUCED set — an
+    // index/shape desync that crashed the double-penalty ψ-derivative assembly
+    // with an IncompatibleShape matmul and left the FD audit comparing
+    // differently-shaped blocks (the matern double-penalty log-κ FD tests). Pull
+    // the realized centers, transform, and anisotropy from the value build so the
+    // two are byte-consistent by construction.
+    let base = build_matern_basiswithworkspace(data, spec, workspace)?;
+    let (base_centers, base_transform, base_aniso) = match &base.metadata {
+        BasisMetadata::Matern {
+            centers,
+            identifiability_transform,
+            aniso_log_scales,
+            ..
+        } => (
+            centers.clone(),
+            identifiability_transform.clone(),
+            aniso_log_scales.clone(),
+        ),
+        other => {
+            return Err(BasisError::InvalidInput(format!(
+                "Matérn ψ-derivative build expected Matérn metadata, got {:?}",
+                std::mem::discriminant(other)
+            )));
+        }
+    };
+    // Reproduce the value build's periodic expansion of the (reduced) base
+    // centers so the kernel pairs and the realized design columns align.
+    let centers = expand_periodic_centers(&base_centers, spec.periodic.as_deref())?;
+    let z_opt = base_transform;
+    let aniso = base_aniso.as_deref();
     let design_derivatives = build_matern_design_psi_derivatives(
         data,
         centers.view(),
@@ -2969,7 +2949,6 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
         aniso,
     )?;
     let (penalties_derivative, penaltiessecond_derivative) = if spec.double_penalty {
-        let base = build_matern_basiswithworkspace(data, spec, workspace)?;
         let (_, primary_derivative, primarysecond_derivative, _, a_raw, a_raw_psi, a_raw_psi_psi) =
             build_matern_double_penalty_primarywith_psi_derivatives(
                 centers.view(),
@@ -3410,45 +3389,82 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         result.penalties_cross_provider = Some(cross_provider);
     }
 
-    if dim > 1 && !result.penalties_first.is_empty() {
+    if dim > 1 {
         // The forward anisotropic Matérn design uses the CENTERED contrast
         // metric `w_a = exp(2·(η_a − mean(η)))` (see `centered_aniso_metric_weights`
         // / `aniso_distance`): a uniform shift of every η_a leaves the mean-
         // subtracted weights — and therefore the whole design, kernel, and
         // penalty — unchanged. The optimizer's per-axis ψ-coordinate is the raw
         // η_a, so the criterion is invariant along the all-ones direction and
-        // the analytic penalty derivative w.r.t. raw η_a must be the centering
-        // projection of the per-axis ψ-derivative:
+        // the analytic FIRST derivative w.r.t. raw η_a must be the centering
+        // projection of the per-axis centered-ψ derivative:
         //
-        //   ∂S/∂η_a = ∂S/∂ψ_a − (1/d) Σ_b ∂S/∂ψ_b   (η_a − mean(η) chain rule).
+        //   ∂F/∂η_a = ∂F/∂ψ_a − (1/d) Σ_b ∂F/∂ψ_b   (η_a − mean(η) chain rule).
         //
-        // The per-axis builders above produce `∂S/∂ψ_a`, treating each centered
-        // contrast as independent; subtracting the mean across axes removes the
-        // spurious common-mode. (#1259: the previous code added back a
-        // `scalar_share = (1/d)·∂S/∂log κ` term, which is the gradient of a
-        // GLOBAL length-scale move — but the centered forward design makes a
-        // uniform η shift a no-op, not a log-κ change, so that add-back injected
-        // a fake all-ones gradient component. The FD-audit of the outer REML
-        // criterion flagged it as a per-axis analytic≠FD desync that misdirected
-        // the κ-optimizer off the true signal-axis contrast.)
+        // The per-axis builders produce `∂F/∂ψ_a`, treating each centered
+        // contrast as independent; subtracting the cross-axis mean removes the
+        // spurious common-mode. This MUST be applied to BOTH the design first
+        // derivatives (`design_first`, which feed the data-fit / deviance and the
+        // `½log|H+Sλ|` H-side of the outer REML gradient) AND the penalty first
+        // derivatives (`penalties_first`). Previously only the penalty side was
+        // centered, so the FULL outer gradient w.r.t. raw η disagreed with a
+        // central FD of the criterion by the un-centered design common-mode
+        // (#1376: the eta-contrast FD audit saw analytic ≈ ∂/∂ψ_a while FD ≈
+        // ∂/∂η_a = ½(∂/∂ψ_0 − ∂/∂ψ_1) for d=2, a large per-component gap even
+        // though the contrast itself is invariant to the common mode).
+        //
+        // (#1259: an earlier version of the penalty centering instead added back
+        // a `scalar_share = (1/d)·∂S/∂log κ` term — the gradient of a GLOBAL
+        // length-scale move — but the centered forward design makes a uniform η
+        // shift a no-op, not a log-κ change, so that add-back injected a fake
+        // all-ones gradient component; the centering projection here is the
+        // correct chain rule.)
         let inv_dim = 1.0 / dim as f64;
-        let num_blocks = result.penalties_first[0].len();
-        for block in 0..num_blocks {
-            let mut eta_mean = Array2::<f64>::zeros(result.penalties_first[0][block].raw_dim());
+
+        // Center the per-axis DESIGN first derivatives across axes.
+        if !result.design_first.is_empty() {
+            if result.design_first.len() != dim {
+                return Err(BasisError::InvalidInput(format!(
+                    "Matérn aniso design first-derivative axis count {} != dim {dim}",
+                    result.design_first.len()
+                )));
+            }
+            let mut design_mean = Array2::<f64>::zeros(result.design_first[0].raw_dim());
             for axis in 0..dim {
-                if result.penalties_first[axis][block].raw_dim()
-                    != result.penalties_first[0][block].raw_dim()
-                {
+                if result.design_first[axis].raw_dim() != result.design_first[0].raw_dim() {
                     return Err(BasisError::InvalidInput(format!(
-                        "Matérn aniso raw-psi penalty derivative shape mismatch on axis {axis}, block {block}"
+                        "Matérn aniso raw-psi design derivative shape mismatch on axis {axis}"
                     )));
                 }
-                eta_mean += &result.penalties_first[axis][block];
+                design_mean += &result.design_first[axis];
             }
-            eta_mean.mapv_inplace(|value| value * inv_dim);
+            design_mean.mapv_inplace(|value| value * inv_dim);
             for axis in 0..dim {
-                result.penalties_first[axis][block] =
-                    &result.penalties_first[axis][block] - &eta_mean;
+                result.design_first[axis] = &result.design_first[axis] - &design_mean;
+            }
+        }
+
+        // Center the per-axis PENALTY first derivatives across axes.
+        if !result.penalties_first.is_empty() {
+            let num_blocks = result.penalties_first[0].len();
+            for block in 0..num_blocks {
+                let mut eta_mean =
+                    Array2::<f64>::zeros(result.penalties_first[0][block].raw_dim());
+                for axis in 0..dim {
+                    if result.penalties_first[axis][block].raw_dim()
+                        != result.penalties_first[0][block].raw_dim()
+                    {
+                        return Err(BasisError::InvalidInput(format!(
+                            "Matérn aniso raw-psi penalty derivative shape mismatch on axis {axis}, block {block}"
+                        )));
+                    }
+                    eta_mean += &result.penalties_first[axis][block];
+                }
+                eta_mean.mapv_inplace(|value| value * inv_dim);
+                for axis in 0..dim {
+                    result.penalties_first[axis][block] =
+                        &result.penalties_first[axis][block] - &eta_mean;
+                }
             }
         }
     }

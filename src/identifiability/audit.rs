@@ -395,13 +395,16 @@ fn pair_null_sigma(s2_a: f64, s2_b: f64, n: usize) -> f64 {
     let excess = s2 - inv_n;
     // A perfectly uniform column has S2 = 1/n exactly, so the null cosine
     // distribution has zero width (σ = 0). The sequential f64 accumulation of
-    // S2 = Σ φ⁴/(Σ φ²)² leaves a residual on the order of n·ε relative to S2
-    // (≈1.5e-17 for n=1000, S2=1e-3), and √ of that residual is ~3.9e-9 — a
-    // spurious non-zero σ that drags the report/halt thresholds off their
+    // S2 = Σ φ⁴/(Σ φ²)² leaves a residual on the order of machine epsilon
+    // relative to S2 (≈1.5e-17 for n=1000), and √ of that residual is ~3.9e-9
+    // — a spurious non-zero σ that drags the report/halt thresholds off their
     // exact-uniform values (gam#1397). Treat any excess at or below the
-    // sequential-summation rounding scale of S2 as exactly zero before
-    // taking the root. The S2 sum runs over the n column entries, so its
-    // accumulated rounding error is bounded by ~n·ε relative to S2.
+    // relative-rounding scale of S2 as exactly zero before taking the root.
+    // The S2 sum runs over the n column entries, so its accumulated rounding
+    // error is bounded by ~n·EPSILON relative to S2 (the standard sequential-
+    // summation bound). Scale the floor by n accordingly, with a small safety
+    // factor, so the exact-uniform residual (~1.5e-17 at n=1000, S2=1e-3) is
+    // absorbed while a genuine excess (orders of magnitude larger) survives.
     let n_terms = (n as f64).max(1.0);
     let rounding_floor = 16.0 * f64::EPSILON * n_terms * s2.abs().max(inv_n);
     if excess <= rounding_floor {

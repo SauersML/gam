@@ -95,14 +95,8 @@ fn main() {
     init_parallelism();
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
 
-    let n: usize = std::env::var("REPRO_N")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(600);
-    let centers: usize = std::env::var("REPRO_CENTERS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+    let n: usize = 600;
+    let centers: usize = 10;
 
     let data = build_dataset(n);
     let pcs: Vec<String> = (0..N_PCS).map(|i| format!("PC{}", i + 1)).collect();

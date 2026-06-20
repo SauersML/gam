@@ -788,7 +788,7 @@ pub fn implicit_solve<const K1: usize, const K: usize>(
     f: &Tower4<K1>,
     a0: f64,
 ) -> Result<Tower4<K>, String> {
-    debug_assert_eq!(K1, K + 1, "implicit_solve: constraint must carry K+1 vars");
+    assert_eq!(K1, K + 1, "implicit_solve: constraint must carry K+1 vars");
     let f_a = f.g[0];
     if f_a == 0.0 || !f_a.is_finite() {
         return Err(format!(
@@ -860,7 +860,7 @@ pub fn substitute_intercept<const K1: usize, const K: usize>(
     f: &Tower4<K1>,
     a: &Tower4<K>,
 ) -> Tower4<K> {
-    debug_assert_eq!(K1, K + 1);
+    assert_eq!(K1, K + 1);
     // Build the K+1 input towers in θ-space: slot 0 = a(θ), slot i+1 = θ_i.
     // The composite is Σ over ordered label tuples s (|s| ≤ 4) of input
     // indices: (1/|s|!) · f.deriv(s) · Π_{j in s} (inp[s_j] centred) — but
@@ -966,6 +966,70 @@ pub fn cell_moving_boundary_flux_tower<const K: usize>(
 ) -> Tower4<K> {
     moving_limit_boundary_tower(z_right, b_stack_right)
         - moving_limit_boundary_tower(z_left, b_stack_left)
+}
+
+/// Moving-limit boundary tower for a θ-DEPENDENT integrand `G(z; θ)`.
+///
+/// [`moving_limit_boundary_tower`] assumes the integrand depends on θ only
+/// through the moving edge `z_edge(θ)` (a fixed z-derivative `b_stack`). The
+/// marginal-slope flex boundary is richer: the integrand `G(z; θ)` ALSO carries
+/// its own θ-dependence (the density weight `w = e^{−q}/2π` and the cell
+/// integrand coefficients move with η, hence with the primaries), so the
+/// Leibniz expansion of `∂ⁿ_θ ∫^{z_edge(θ)} G(z;θ) dz` mixes edge-motion
+/// derivatives of the limit with θ-derivatives of `G` itself — e.g. at second
+/// order `G·z_uv + G_z·z_u·z_v + G_{θu}·z_v + G_{θv}·z_u` (the four
+/// edge-motion-carrying terms the hand path assembles one by one, including the
+/// `G·z_uv` term the directional path drops).
+///
+/// Mechanization: let `Φ(z; θ)` be the z-antiderivative of `G` (so `Φ_z = G`).
+/// The full upper-limit contribution is `Φ(z_edge(θ); θ)`, and the BOUNDARY
+/// part — everything carrying edge motion — is exactly
+///   `Φ(z_edge(θ); θ) − Φ(z₀; θ)`,
+/// the second term being the pure-integrand-θ part (`∫^{z₀} ∂ⁿ_θ G`) the
+/// interior moment integral already supplies. Both are one
+/// [`substitute_intercept`] of the SAME mixed `(z, θ)` jet of `Φ` (z in slot 0,
+/// θ in slots 1..K): substituting the edge tower gives the full composite,
+/// substituting a frozen constant edge isolates the pure-θ part, and their
+/// difference is the exact boundary flux — every Leibniz term derived by the
+/// substitution algebra, none hand-omitted.
+///
+/// `phi_jet` is the `(K+1)`-variable Taylor jet of `Φ` about `(z₀, θ₀)` with
+/// `z₀ = z_edge.v`: slot 0 is the z-direction (so `phi_jet.g[0] = G(z₀;θ₀)`,
+/// `phi_jet.h[0][0] = G_z`, …) and slots `1..=K` are the primaries θ (carrying
+/// `Φ`'s own θ- and mixed z·θ-derivatives — i.e. the integrand's θ-derivatives
+/// integrated in z, and `G_{θ…}` in the mixed slots). The returned tower's
+/// VALUE channel is 0 by construction (the `Φ(z₀;θ₀)` constants cancel); only
+/// the derivative channels are meaningful, matching the value-less convention of
+/// [`moving_limit_boundary_tower`].
+pub fn moving_limit_boundary_tower_theta_integrand<const K1: usize, const K: usize>(
+    phi_jet: &Tower4<K1>,
+    z_edge: &Tower4<K>,
+) -> Tower4<K> {
+    assert_eq!(
+        K1,
+        K + 1,
+        "moving_limit_boundary_tower_theta_integrand: Φ jet must carry z + K θ-vars"
+    );
+    let frozen_edge = Tower4::<K>::constant(z_edge.v);
+    let full = substitute_intercept(phi_jet, z_edge);
+    let interior = substitute_intercept(phi_jet, &frozen_edge);
+    full - interior
+}
+
+/// Two-edge cell version of [`moving_limit_boundary_tower_theta_integrand`]:
+/// the exact boundary-flux tower of `∫_{z_L(θ)}^{z_R(θ)} G(z;θ) dz` with a
+/// θ-dependent integrand, `Φ(z_R;θ) − Φ(z_L;θ)` minus the pure-θ parts at each
+/// frozen edge. A `Fixed` edge passes a `z_edge` with zero derivative channels,
+/// so its `full` and `interior` substitutions coincide and it contributes
+/// nothing — matching the production `edge_vel = 0` short-circuit.
+pub fn cell_moving_boundary_flux_tower_theta_integrand<const K1: usize, const K: usize>(
+    phi_jet_right: &Tower4<K1>,
+    z_right: &Tower4<K>,
+    phi_jet_left: &Tower4<K1>,
+    z_left: &Tower4<K>,
+) -> Tower4<K> {
+    moving_limit_boundary_tower_theta_integrand(phi_jet_right, z_right)
+        - moving_limit_boundary_tower_theta_integrand(phi_jet_left, z_left)
 }
 
 // ── The program seam ─────────────────────────────────────────────────
@@ -1739,6 +1803,134 @@ mod tests {
             "B·z_uv term {:+.8e} != B₀·z_uv {:+.8e}",
             b_zuv,
             b0 * 2.0
+        );
+    }
+
+    /// `moving_limit_boundary_tower_theta_integrand` reproduces the marginal-slope
+    /// flex boundary closure for a θ-DEPENDENT integrand `G(z;θ)` — the case the
+    /// plain `moving_limit_boundary_tower` cannot express, and the case the
+    /// survival directional/bidirectional paths hand-assemble term-by-term
+    /// (`G·z_uv + G_z·z_u·z_v + G_θu·z_v + G_θv·z_u`, with the directional path
+    /// dropping `G·z_uv`). Two independent oracles:
+    ///   (1) closed-form: the boundary flux of `∫ G dz` is exactly
+    ///       `Φ(z_edge(θ);θ) − Φ(z₀;θ)` (Φ = z-antiderivative of G), whose θ
+    ///       derivatives we take by central FD of the closed form — no jet code.
+    ///   (2) the explicit second-order hand closure, including the `G·z_uv` term,
+    ///       built from the integrand's own (z,θ) partials.
+    /// G(z;θ) = exp(z·θ₀) is genuinely θ-dependent (G_θ₀ = z·e^{zθ₀} ≠ 0), and
+    /// the edge z_edge = z₀ + θ₀ + θ₁² has a real z_uv = ∂²/∂θ₁² = 2, so a
+    /// combinator that dropped either the integrand-θ terms or `G·z_uv` would
+    /// miss a Hessian entry.
+    #[test]
+    fn moving_boundary_theta_integrand_matches_handpath_and_closed_form() {
+        // G(z;θ) = exp(z·θ₀);  Φ(z;θ) = ∫₀^z G = (e^{zθ₀} − 1)/θ₀.
+        let g = |z: f64, t0: f64| (z * t0).exp();
+        let phi = |z: f64, t0: f64| ((z * t0).exp() - 1.0) / t0;
+        let z_r = |th: [f64; 2]| 0.6 + th[0] + th[1] * th[1];
+        let th0 = [0.4_f64, 0.5_f64];
+        let z0 = z_r(th0);
+
+        // Edge tower z_edge(θ) over K=2 primaries.
+        let mut z_edge = Tower4::<2>::constant(z0);
+        z_edge.g[0] = 1.0; // ∂z/∂θ₀
+        z_edge.g[1] = 2.0 * th0[1]; // ∂z/∂θ₁
+        z_edge.h[1][1] = 2.0; // ∂²z/∂θ₁² (the z_uv the directional path drops)
+
+        // Φ's mixed (z, θ) jet over K1 = 3 vars: slot 0 = z, slots 1,2 = θ₀,θ₁.
+        // Built ONCE in tower arithmetic so every (z^i θ^j) partial is exact.
+        let z_var = Tower4::<3>::variable(z0, 0);
+        let t0_var = Tower4::<3>::variable(th0[0], 1);
+        // θ₁ does not enter G/Φ here, but seed it so the jet carries the full
+        // K1 frame (its Φ-derivatives are zero; the z_edge chain supplies all θ₁
+        // motion through slot 0).
+        let _t1_var = Tower4::<3>::variable(th0[1], 2);
+        let phi_jet = ((z_var * t0_var).exp() - 1.0) / t0_var;
+        // Sanity: slot-0 first derivative of Φ IS G(z₀;θ₀).
+        assert!(
+            (phi_jet.g[0] - g(z0, th0[0])).abs() < 1e-12,
+            "Φ_z {:+.8e} != G {:+.8e}",
+            phi_jet.g[0],
+            g(z0, th0[0])
+        );
+
+        let flux = moving_limit_boundary_tower_theta_integrand::<3, 2>(&phi_jet, &z_edge);
+
+        // Value channel is 0 by construction (boundary, not the integral itself).
+        assert!(flux.v.abs() < 1e-12, "boundary value channel {:+.3e}", flux.v);
+
+        // Oracle (1): central FD of the closed-form boundary flux
+        //   Bnd(θ) = Φ(z_edge(θ); θ) − Φ(z₀; θ)   (z₀ FROZEN at the base edge).
+        let bnd = |th: [f64; 2]| phi(z_r(th), th[0]) - phi(z0, th[0]);
+        let h = 1e-4;
+        let tol = 1e-6;
+        for i in 0..2 {
+            let mut up = th0;
+            let mut dn = th0;
+            up[i] += h;
+            dn[i] -= h;
+            let fd_g = (bnd(up) - bnd(dn)) / (2.0 * h);
+            assert!(
+                (flux.g[i] - fd_g).abs() <= tol * fd_g.abs().max(1.0),
+                "boundary_g[{i}] analytic {:+.8e} fd {:+.8e}",
+                flux.g[i],
+                fd_g
+            );
+        }
+        let grad_at = |th: [f64; 2], j: usize| -> f64 {
+            let mut up = th;
+            let mut dn = th;
+            up[j] += h;
+            dn[j] -= h;
+            (bnd(up) - bnd(dn)) / (2.0 * h)
+        };
+        for i in 0..2 {
+            for j in 0..2 {
+                let mut up = th0;
+                let mut dn = th0;
+                up[i] += h;
+                dn[i] -= h;
+                let fd_h = (grad_at(up, j) - grad_at(dn, j)) / (2.0 * h);
+                assert!(
+                    (flux.h[i][j] - fd_h).abs() <= 1e-3 * fd_h.abs().max(1.0),
+                    "boundary_h[{i}][{j}] analytic {:+.8e} fd {:+.8e}",
+                    flux.h[i][j],
+                    fd_h
+                );
+            }
+        }
+
+        // Oracle (2): the explicit second-order hand closure, term by term —
+        // `G·z_uv + G_z·z_u·z_v + G_θu·z_v + G_θv·z_u`. Read G's partials at the
+        // base point directly (no jet): G = e^{zθ₀}, G_z = θ₀·G, G_θ₀ = z·G,
+        // G_θ₁ = 0.
+        let gg = g(z0, th0[0]);
+        let g_z = th0[0] * gg;
+        let g_theta = [z0 * gg, 0.0]; // [G_θ₀, G_θ₁]
+        for i in 0..2 {
+            for j in 0..2 {
+                let z_u = z_edge.g[i];
+                let z_v = z_edge.g[j];
+                let z_uv = z_edge.h[i][j];
+                let hand = gg * z_uv + g_z * z_u * z_v + g_theta[i] * z_v + g_theta[j] * z_u;
+                assert!(
+                    (flux.h[i][j] - hand).abs() < 1e-9,
+                    "boundary_h[{i}][{j}] {:+.8e} != hand closure {:+.8e}",
+                    flux.h[i][j],
+                    hand
+                );
+            }
+        }
+
+        // Decisive: the `G·z_uv` term the directional path DROPS is present and
+        // material in the [1][1] entry (z_uv = 2 there).
+        let pure_no_zuv =
+            g_z * z_edge.g[1] * z_edge.g[1] + 2.0 * g_theta[1] * z_edge.g[1];
+        let g_zuv = flux.h[1][1] - pure_no_zuv;
+        assert!(
+            (g_zuv - gg * 2.0).abs() < 1e-9,
+            "G·z_uv term {:+.8e} != G₀·z_uv {:+.8e}",
+            g_zuv,
+            gg * 2.0
         );
     }
 
