@@ -366,7 +366,17 @@ jobs:
     # GNU `timeout` set a few minutes shorter so a timeout produces a
     # workflow `failure` (not `cancelled`). See "running benchmark shard"
     # below.
-    timeout-minutes: 47
+    #
+    # #1390: a few nightly scenarios run the brms MCMC contender (full
+    # Bayesian sampling, 4 chains x 2000 iter per CV fold). On the larger
+    # daily-demand panels the five serial folds alone overran the default 42m
+    # budget, so the GNU `timeout` killed the whole shard (exit 124) AFTER gam
+    # had finished — discarding every result with no per-fold attribution. The
+    # GH ceiling is therefore set high enough to cover the heavy-MCMC path; the
+    # actual per-scenario budget is enforced by the scenario-aware GNU
+    # `timeout` computed in "Run scenario shard" below, so light scenarios
+    # still fail fast at ~42m.
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       max-parallel: 8
@@ -507,7 +517,25 @@ jobs:
           # several minutes shorter than that ceiling so the shard exits
           # cleanly before GH would auto-cancel; the explicit `exit 1`
           # below ensures the conclusion is `failure`, not `cancelled`.
-          BENCH_SHARD_TIMEOUT="${BENCH_SHARD_TIMEOUT:-42m}"
+          #
+          # #1390: the budget is scenario-aware. Most scenarios keep the 42m
+          # default so a genuinely slow/hung shard still fails fast. The
+          # heavy-MCMC scenarios below run the brms contender (full Bayesian
+          # sampling, 4 chains x 2000 iter per CV fold) on large daily-demand
+          # panels, whose five serial folds alone exceed 42m; they get a larger
+          # explicit budget (paired with the higher GH `timeout-minutes` and
+          # the per-fold BENCH_BRMS_FOLD_TIMEOUT_SEC cap in
+          # bench/_run_suite_external.py) so the full CV completes within budget
+          # instead of being killed mid-MCMC. This raises coverage for those
+          # scenarios; it does not drop any.
+          case "${{ matrix.scenario }}" in
+            us48_demand_31day)
+              BENCH_SHARD_TIMEOUT="${BENCH_SHARD_TIMEOUT:-145m}"
+              ;;
+            *)
+              BENCH_SHARD_TIMEOUT="${BENCH_SHARD_TIMEOUT:-42m}"
+              ;;
+          esac
           set +e
           timeout --signal=TERM --kill-after=30s "${BENCH_SHARD_TIMEOUT}" \
             python3 bench/run_suite.py \
@@ -688,7 +716,25 @@ jobs:
           # several minutes shorter than that ceiling so the shard exits
           # cleanly before GH would auto-cancel; the explicit `exit 1`
           # below ensures the conclusion is `failure`, not `cancelled`.
-          BENCH_SHARD_TIMEOUT="${BENCH_SHARD_TIMEOUT:-42m}"
+          #
+          # #1390: the budget is scenario-aware. Most scenarios keep the 42m
+          # default so a genuinely slow/hung shard still fails fast. The
+          # heavy-MCMC scenarios below run the brms contender (full Bayesian
+          # sampling, 4 chains x 2000 iter per CV fold) on large daily-demand
+          # panels, whose five serial folds alone exceed 42m; they get a larger
+          # explicit budget (paired with the higher GH `timeout-minutes` and
+          # the per-fold BENCH_BRMS_FOLD_TIMEOUT_SEC cap in
+          # bench/_run_suite_external.py) so the full CV completes within budget
+          # instead of being killed mid-MCMC. This raises coverage for those
+          # scenarios; it does not drop any.
+          case "${{ matrix.scenario }}" in
+            us48_demand_31day)
+              BENCH_SHARD_TIMEOUT="${BENCH_SHARD_TIMEOUT:-145m}"
+              ;;
+            *)
+              BENCH_SHARD_TIMEOUT="${BENCH_SHARD_TIMEOUT:-42m}"
+              ;;
+          esac
           set +e
           timeout --signal=TERM --kill-after=30s "${BENCH_SHARD_TIMEOUT}" \
             python3 bench/run_suite.py \

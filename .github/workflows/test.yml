@@ -197,6 +197,11 @@ jobs:
           # leaving a runaway test behind for later iterations.
           INTEGRATION_TEST_TIMEOUT=1800
           LIB_TEST_TIMEOUT=1800
+          # Per-partition cap for the binaries sharded via nextest
+          # `--partition` below (#1393). Higher than the single-binary cap
+          # because a partition can draw several of the known multi-minute
+          # tests at once; still far below the 350-min job backstop.
+          PARTITIONED_BINARY_TIMEOUT=2700
 
           run_capped() {
             local cap="$1"; shift
@@ -222,6 +227,68 @@ jobs:
                 --profile ci --config-file .config/nextest.toml \
                 --config profile.dev.debug=0 --all-features \
                 --build-jobs 1 --test-threads 1 "$@"
+          }
+
+          # #1393: the grouped integration binaries (#1146 folded ~700 former
+          # per-file crates into a handful of aggregator binaries so the gam
+          # rlib links once). A few of those binaries now hold hundreds of
+          # `#[test]`s — `quality` ~427, `basis_smooth` ~292, `manifolds`
+          # ~152 — run SERIALLY (--test-threads 1, the peak-RSS guard). Even
+          # though nextest's per-test slow-timeout (600s) catches any single
+          # hang, the SUM of the legitimately-slow REML/PIRLS/joint-Newton and
+          # R/Python reference-comparison tests in one binary overruns the
+          # 1800s per-binary GNU `timeout`, which SIGKILLs the whole binary
+          # (exit 124/137) BEFORE the per-test summary is printed — so the
+          # whole target fails in bulk with no attribution of which test was
+          # slow. Splitting each oversized binary into nextest `--partition
+          # count:i/N` shards bounds each shard's wall-clock under the cap and
+          # keeps per-test attribution: `--partition` is a pure run-time test
+          # FILTER, so the binary still links exactly once and each shard
+          # reuses it (no extra link, no extra disk). N is sized by the
+          # binary's test count; everything else stays a single shard.
+          partitions_for_binary() {
+            case "$1" in
+              quality)      echo 6 ;;
+              basis_smooth) echo 4 ;;
+              manifolds)    echo 3 ;;
+              perf_scale)   echo 2 ;;
+              identifiability) echo 2 ;;
+              inference)    echo 2 ;;
+              *)            echo 1 ;;
+            esac
+          }
+
+          # Run one integration-test binary, sharding it into N nextest
+          # partitions when partitions_for_binary says so. Each partition gets
+          # its own per-binary wall-clock cap; a failure in any partition marks
+          # the binary failed (without aborting the remaining partitions, to
+          # preserve the no-fail-fast contract within the binary too).
+          run_integration_binary() {
+            local cap="$1"; local name="$2"; shift 2
+            local nparts; nparts="$(partitions_for_binary "$name")"
+            local rc=0
+            if [ "$nparts" -le 1 ]; then
+              run_cargo_test "$cap" --test "$name" "$@" || rc=1
+            else
+              # Each partition carries the full per-binary cap. A partition
+              # holds at most ~(tests/N) of the binary's tests; with the 600s
+              # per-test slow-timeout already bounding any single hang, the cap
+              # only has to cover the SUM of the legitimately-slow tests that
+              # happen to land in one partition. The per-partition cap is held
+              # at PARTITIONED_BINARY_TIMEOUT (> the 1800s single-binary cap)
+              # so a partition that draws several of the known multi-minute
+              # reference-comparison / large-scale solver tests still finishes
+              # and reports per-test results instead of being SIGKILLed; it
+              # stays far under the 350-min job backstop.
+              local i
+              for i in $(seq 1 "$nparts"); do
+                echo "::group::${name} partition ${i}/${nparts}"
+                run_cargo_test "$PARTITIONED_BINARY_TIMEOUT" --test "$name" \
+                  --partition "count:${i}/${nparts}" "$@" || rc=1
+                echo "::endgroup::"
+              done
+            fi
+            return "$rc"
           }
 
           test_status=0
@@ -275,7 +342,7 @@ jobs:
             if [ "$test_name" = "pyffi" ]; then
               extra_filter=(-E 'not test(python_rust_ffi_parity_gaussian_linear_case)')
             fi
-            if ! run_cargo_test "$INTEGRATION_TEST_TIMEOUT" --test "$test_name" "${extra_filter[@]}"; then
+            if ! run_integration_binary "$INTEGRATION_TEST_TIMEOUT" "$test_name" "${extra_filter[@]}"; then
               test_status=1
             fi
             # Prune only the executed test EXECUTABLE to reclaim disk. Do NOT

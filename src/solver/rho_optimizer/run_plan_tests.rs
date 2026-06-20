@@ -1837,6 +1837,110 @@ fn constrained_stationary_probe_keeps_better_incumbent() {
     assert_eq!(published.value, -231.86);
 }
 
+/// #1426 regression: a cost stall whose best-iterate projected gradient is FAR
+/// above the outer tolerance is NOT a flat-valley floor and must NOT be halted
+/// as one. On ~7% of gamma/log datasets at default k the inner PIRLS hit its
+/// iteration cap, leaving the outer objective and analytic gradient
+/// inconsistent: the cost flatlined while the projected gradient stayed at
+/// |g|≈11. The old guard classified that as a `FlatValleyStall`, halted, and
+/// shipped a silent near-unpenalized full-basis overfit. The fixed guard must
+/// instead return `StuckKeepDescending` (no halt) so the optimizer keeps
+/// descending toward the well-penalized optimum, for a bounded number of escapes
+/// before it falls back to a halt so a genuinely pathological surface still
+/// terminates.
+#[test]
+fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
+    let seed = array![0.0, 0.0];
+    // Best iterate has a HUGE residual gradient (the #1426 |g|≈11 signature),
+    // orders of magnitude above the ceiling — the inner solve did not converge.
+    let stuck_grad = 10.9;
+    assert!(
+        stuck_grad > FLAT_VALLEY_STALL_GRAD_CEILING,
+        "test premise: the stuck residual must exceed the flat-valley ceiling"
+    );
+    guard.observe_seed(&seed, 10.0, stuck_grad);
+
+    // Drive the no-improvement window to the stall via infeasible λ→0 probes,
+    // exactly as the outer loop does when ARC/BFGS keep probing the unpenalized
+    // ridge. The third probe fills the window and reaches the stall verdict.
+    let probe = array![-10.0, -10.0];
+    assert!(matches!(
+        guard.observe_infeasible(&probe),
+        CostStallVerdict::Continue
+    ));
+    assert!(matches!(
+        guard.observe_infeasible(&probe),
+        CostStallVerdict::Continue
+    ));
+    let verdict = guard.observe_infeasible(&probe);
+    assert!(
+        matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
+        "a cost stall with |g|≈11 ≫ ceiling must NOT be classified as a \
+         flat-valley floor and halted (#1426); it must keep descending. Got {:?}",
+        std::mem::discriminant(&verdict)
+    );
+    // Crucially: no halt was shipped — the optimizer is allowed to continue.
+    // (The exit cell still tracks the running best via `publish_best_so_far`,
+    // but the verdict did not request a halt.)
+
+    // The escape budget is finite: after STUCK_STALL_MAX_ESCAPES escapes the
+    // guard falls back to a FlatValleyStall halt so the loop still terminates.
+    let mut last = verdict;
+    for _ in 0..(STUCK_STALL_MAX_ESCAPES + 3) {
+        // Re-fill the window each round (each escape reset it).
+        let _ = guard.observe_infeasible(&probe);
+        let _ = guard.observe_infeasible(&probe);
+        last = guard.observe_infeasible(&probe);
+        if matches!(last, CostStallVerdict::FlatValleyStall { .. }) {
+            break;
+        }
+    }
+    assert!(
+        matches!(last, CostStallVerdict::FlatValleyStall { .. }),
+        "after exhausting the bounded escape budget the guard must eventually \
+         halt (reported non-converged) so the loop terminates"
+    );
+    let published = exit
+        .lock()
+        .unwrap()
+        .take()
+        .expect("best published on eventual halt");
+    assert!(
+        !published.converged,
+        "a stuck halt above tolerance must report converged=false (never claim \
+         a converged result with |g| far above tolerance)"
+    );
+}
+
+/// #1426 companion: a GENUINE flat-valley floor — cost flatlined AND the
+/// projected gradient is only modestly above tolerance (well below the ceiling)
+/// — must still halt as a `FlatValleyStall` (the legitimately-flat REML surface
+/// of #1082/#1237). The #1426 escape must not weaken that path.
+#[test]
+fn cost_stall_modestly_above_tolerance_still_halts_as_flat_valley() {
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
+    let seed = array![0.0, 0.0];
+    // Residual modestly above tolerance but BELOW the ceiling: a real flat
+    // valley floor (the surface has genuinely flattened).
+    let valley_grad = FLAT_VALLEY_STALL_GRAD_CEILING * 0.5;
+    guard.observe_seed(&seed, 10.0, valley_grad);
+
+    let probe = array![-10.0, -10.0];
+    let _ = guard.observe_infeasible(&probe);
+    let _ = guard.observe_infeasible(&probe);
+    let verdict = guard.observe_infeasible(&probe);
+    assert!(
+        matches!(verdict, CostStallVerdict::FlatValleyStall { .. }),
+        "a modest residual below the ceiling is a genuine flat-valley floor and \
+         must halt as before (#1082/#1237 unaffected by the #1426 fix)"
+    );
+    let published = exit.lock().unwrap().take().expect("best published");
+    assert!(!published.converged);
+}
+
 #[test]
 fn lower_bound_outward_axes_mark_separation_stationarity() {
     let lower = array![-10.0, -10.0, -10.0, -10.0];

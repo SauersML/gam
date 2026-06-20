@@ -83,13 +83,30 @@ fn time_design() -> Array2<f64> {
     out
 }
 
+/// Marginal covariate `z`, a genuinely INDEPENDENT covariate (not an affine
+/// function of `t`). Using `z = linspace(-1, 1)` made `z = 2t - 1`, so the
+/// whole marginal span `{1, z, z²}` collapsed into time's `{1, t, t²}` span and
+/// marginal aliased time outright — not the scenario these tests intend. A
+/// non-polynomial map (`sin`) keeps `{z, z²}` linearly independent of the
+/// polynomial time basis. Shared with `score_warp_design_aliased` so the
+/// intended marginal↔score_warp duplication is exact.
+fn marginal_covariate() -> Array1<f64> {
+    let t = linspace(0.0, 1.0, N);
+    Array1::from_iter((0..N).map(|i| (2.7 * t[i] + 0.3).sin()))
+}
+
+/// Marginal block: intercept-FREE smooth `{z, z²}` over the independent
+/// covariate `z`. Only the highest-priority block (`time`) carries the global
+/// additive constant; a parametric block that also carried its own `1` column
+/// would share that constant with time and (correctly) forfeit it under gauge
+/// priority. Following the standard sum-to-zero GAM convention here keeps the
+/// only intended aliases the explicit flex-block duplications.
 fn marginal_design() -> Array2<f64> {
-    let z = linspace(-1.0, 1.0, N);
-    let mut out = Array2::<f64>::zeros((N, 3));
+    let z = marginal_covariate();
+    let mut out = Array2::<f64>::zeros((N, 2));
     for i in 0..N {
-        out[[i, 0]] = 1.0;
-        out[[i, 1]] = z[i];
-        out[[i, 2]] = z[i] * z[i];
+        out[[i, 0]] = z[i];
+        out[[i, 1]] = z[i] * z[i];
     }
     out
 }
@@ -104,18 +121,18 @@ fn logslope_design() -> Array2<f64> {
     out
 }
 
-/// score_warp_dev that exactly duplicates marginal column 1 (z-linear).
-/// At gauge_priority=80 < marginal=150, the audit should attribute the
+/// score_warp_dev that exactly duplicates marginal column 0 (the `z` linear
+/// term). At gauge_priority=80 < marginal=150, the audit must attribute the
 /// drop to score_warp_dev, not to marginal.
 fn score_warp_design_aliased() -> Array2<f64> {
-    let z = linspace(-1.0, 1.0, N);
+    let z = marginal_covariate();
     let mut out = Array2::<f64>::zeros((N, 2));
     for i in 0..N {
-        // Column 0: exactly marginal column 1 (z)
+        // Column 0: exactly marginal column 0 (z).
         out[[i, 0]] = z[i];
-        // Column 1: z³ — in the span of marginal's quadratic + linear columns
-        //            (approximately, but let's make it a genuine new direction)
-        out[[i, 1]] = z[i] * z[i] * z[i] - 0.6 * z[i]; // Legendre P3-ish
+        // Column 1: a genuine new direction (cubic-ish in z) the marginal
+        //           block does not span.
+        out[[i, 1]] = z[i] * z[i] * z[i] - 0.6 * z[i];
     }
     out
 }

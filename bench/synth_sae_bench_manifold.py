@@ -27,7 +27,7 @@ import numpy as np
 
 import gamfit
 from gamfit._binding import rust_module
-from _synth_sae_metrics import feature_uniqueness, recovery_scores
+from _synth_sae_metrics import feature_uniqueness, n_firing_latents, recovery_scores
 
 
 @dataclass(frozen=True)
@@ -69,6 +69,9 @@ class BenchmarkMetrics:
     direction_recovery_precision: float
     direction_recovery_recall: float
     direction_recovery_f1: float
+    direction_recovery_jaccard: float
+    n_latent_slots: int
+    n_firing_latents: int
     probing_precision: float
     probing_recall: float
     probing_f1: float
@@ -224,6 +227,29 @@ def _learned_components(fit: gamfit.ManifoldSAE) -> tuple[np.ndarray, np.ndarray
     return np.vstack(directions), np.column_stack(activations)
 
 
+def _manifold_total_slots(fit: gamfit.ManifoldSAE) -> int:
+    """Architectural latent-slot count for a manifold SAE (#1435).
+
+    A manifold SAE allocates ``atoms`` decoder blocks, each expanded over its
+    basis harmonics (``phi.shape[1]``); the intercept row (``row == 0``) carries
+    no direction and is excluded, matching :func:`_learned_components`. The total
+    is ``sum_k (min(n_harmonics_k, block_rows_k) - 1)`` -- the capacity the fit
+    *could* turn into directions, including geometrically-dead (zero-norm) slots
+    that ``_learned_components`` drops. Passing it as the recovery denominator
+    penalizes wasted atom capacity, consistent with how
+    ``synth_sae_compare`` spans the full decoder width.
+    """
+    total = 0
+    for k, block in enumerate(fit.decoder_blocks):
+        basis = fit.basis_specs[k]
+        coords = np.asarray(fit.coords[k], dtype=float)
+        n_harmonics = fit._n_harmonics[k] if k < len(fit._n_harmonics) else 1
+        phi = _basis_values(basis, coords, n_harmonics)
+        # -1: the intercept row (row 0) is never a direction slot.
+        total += max(min(phi.shape[1], block.shape[0]) - 1, 0)
+    return total
+
+
 def _best_f1(score: np.ndarray, truth: np.ndarray) -> tuple[float, float, float]:
     y = np.asarray(truth, dtype=bool)
     s = np.abs(np.asarray(score, dtype=float))
@@ -306,11 +332,19 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
     learned_dirs, learned_train = _learned_components(fit)
     # Three distinct ground-truth measurements (see bench/_synth_sae_metrics.py
     # and #1413): uniqueness is the SynthSAEBench argmax-collision score, while
-    # MCC and the direction-recovery precision/recall/F1 come from the optimal
-    # one-to-one matching. The old `len(set(cols)) / len(rows)` was always 1.0
-    # because Hungarian/greedy never reuse columns.
+    # MCC and the direction-recovery precision/recall/F1/Jaccard come from the
+    # optimal one-to-one matching. The old `len(set(cols)) / len(rows)` was
+    # always 1.0 because the assignment never reuses columns. `_learned_components`
+    # drops zero-norm atom directions; spanning the recovery denominator over the
+    # architectural slot count (atoms x harmonics, excl. intercept) so geometrically
+    # dead atom capacity is penalized, consistent with synth_sae_compare (#1435).
+    n_slots = _manifold_total_slots(fit)
     uniqueness = feature_uniqueness(learned_dirs, synth.dictionary)
-    rec = recovery_scores(learned_dirs, synth.dictionary)
+    rec = recovery_scores(learned_dirs, synth.dictionary, n_learned_total=n_slots)
+    # Functional (activation-based) dead-latent count (#1435): a latent with a
+    # nonzero decoder direction that never fires on the eval set is functionally
+    # dead -- wasted capacity the geometric (decoder-norm) live check misses.
+    n_firing = n_firing_latents(learned_test)
     rows, cols, matching = rec.rows, rec.cols, rec.matching
     if rows.size:
         mcc = rec.mcc
@@ -349,6 +383,9 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
         direction_recovery_precision=rec.precision,
         direction_recovery_recall=rec.recall,
         direction_recovery_f1=rec.f1,
+        direction_recovery_jaccard=rec.jaccard,
+        n_latent_slots=n_slots,
+        n_firing_latents=n_firing,
         probing_precision=precision,
         probing_recall=recall,
         probing_f1=f1,
@@ -372,6 +409,9 @@ def _summarize(metrics: list[BenchmarkMetrics]) -> dict[str, Any]:
         "direction_recovery_precision",
         "direction_recovery_recall",
         "direction_recovery_f1",
+        "direction_recovery_jaccard",
+        "n_latent_slots",
+        "n_firing_latents",
         "probing_precision",
         "probing_recall",
         "probing_f1",
@@ -405,7 +445,7 @@ def _benchmark_notes() -> dict[str, Any]:
                 "GT-MCC-style absolute-cosine feature recovery (Hungarian matched pairs)",
                 "GT-F1-style matched-latent firing precision/recall/F1",
                 "feature uniqueness (argmax-collision: #distinct best matches / n_learned)",
-                "direction recovery precision/recall/F1 (quality-aware matched cosine mass)",
+                "direction recovery precision/recall/F1/Jaccard (quality-aware matched cosine mass)",
             ],
             "saebench_compatible_synthetic": [
                 "sparse-probing analogue on matched ground-truth features",

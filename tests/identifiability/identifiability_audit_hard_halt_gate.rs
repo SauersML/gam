@@ -181,14 +181,17 @@ fn audit_clean_specs_remain_non_fatal() {
 fn audit_partial_overlap_below_threshold_does_not_halt() {
     let n = 64;
     let x = common::linspace_minus_one_to_one(n);
-    // Two columns with overlap ~0.97 (high but below 0.99). The joint
-    // RRQR keeps both because they span 2 dimensions.
+    // Two columns with overlap ~0.986 (high but below the 0.99 ceiling this
+    // test pins). The joint RRQR keeps both because they span 2 dimensions.
+    // The earlier 0.25·x³ perturbation only reached overlap 0.9983, ABOVE the
+    // 0.99 ceiling the test's own guard enforces; a unit cubic term drops the
+    // overlap to ~0.986, the intended "high but partial" regime.
     let mut block_a = Array2::<f64>::zeros((n, 1));
     let mut block_b = Array2::<f64>::zeros((n, 1));
     for i in 0..n {
         block_a[[i, 0]] = x[i];
-        // x + small noise: overlap stays ~0.97-0.98.
-        block_b[[i, 0]] = x[i] + 0.25 * x[i].powi(3);
+        // x + cubic perturbation: overlap stays ~0.986.
+        block_b[[i, 0]] = x[i] + 1.0 * x[i].powi(3);
     }
     let specs = [
         common::spec_from_dense("a", block_a),

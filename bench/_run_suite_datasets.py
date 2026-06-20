@@ -331,7 +331,18 @@ def _workspace_tempdir(prefix: str) -> typing.Any:
     return tempfile.TemporaryDirectory(prefix=prefix, dir=str(BENCH_DIR))
 
 
-def run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
+def run_cmd(cmd: typing.Any, cwd: typing.Any=None, timeout_sec: typing.Any=None) -> typing.Any:
+    # `timeout_sec` overrides the global BENCH_CMD_TIMEOUT_SEC for this one
+    # invocation. It exists so an individual reference contender (e.g. a single
+    # brms MCMC fold) can be bounded well below the per-shard wall budget and
+    # fail just THAT fold — recorded and visible — instead of letting one slow
+    # external fit consume the whole shard's GNU `timeout` and get the shard
+    # killed (exit 124) with no per-fold attribution (#1390).
+    effective_timeout = (
+        float(timeout_sec)
+        if timeout_sec is not None and float(timeout_sec) > 0
+        else (float(_CMD_TIMEOUT_SEC) if _CMD_TIMEOUT_SEC > 0 else 0.0)
+    )
     env = os.environ.copy()
     env.update(_SERIAL_ENV_OVERRIDES)
     env["PYTHONUNBUFFERED"] = "1"
@@ -400,8 +411,8 @@ def run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
     t_hb.start()
     timed_out = False
     try:
-        if _CMD_TIMEOUT_SEC > 0:
-            rc = proc.wait(timeout=float(_CMD_TIMEOUT_SEC))
+        if effective_timeout > 0:
+            rc = proc.wait(timeout=effective_timeout)
         else:
             rc = proc.wait()
     except subprocess.TimeoutExpired:
@@ -419,7 +430,7 @@ def run_cmd(cmd: typing.Any, cwd: typing.Any=None) -> typing.Any:
     t_hb.join(timeout=1.0)
     if timed_out:
         timeout_msg = (
-            f"[HEARTBEAT] command-timeout rc=124 timeout_sec={_CMD_TIMEOUT_SEC} "
+            f"[HEARTBEAT] command-timeout rc=124 timeout_sec={effective_timeout:g} "
             f"pid={proc.pid} cmd='{(' '.join(str(x) for x in cmd[:5]) + (' ...' if len(cmd) > 5 else ''))}'\n"
         )
         err_chars = _append_capped(err_buf, timeout_msg, err_chars)

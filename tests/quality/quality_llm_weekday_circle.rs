@@ -46,8 +46,8 @@ use gam::inference::smooth_test::SmoothTestScale;
 use gam::solver::evidence::{GaussianMixtureConfig, StackingConfig};
 use gam::solver::topology_selector::{
     AutoTopologyKind, CrossClassCandidate, EvidenceCertification, Headline, HeldOutDensityProvider,
-    MIXTURE_K_LADDER, STACKING_CV_FOLDS, adjudicate_cross_class_race, fit_mixture_rung,
-    mixture_density_provider,
+    MIXTURE_K_LADDER, STACKING_CV_FOLDS, STACKING_CV_SEED, adjudicate_cross_class_race,
+    fit_mixture_rung, mixture_density_provider,
 };
 use gam::terms::structure::anova_atom::{BindingNotion, CarveInput, carve, fit_tensor_surface};
 use ndarray::{Array1, Array2, ArrayView2};
@@ -194,6 +194,7 @@ fn race_shape(data: &Array2<f64>) -> ShapeVerdict {
         data.nrows(),
         candidates,
         STACKING_CV_FOLDS,
+        STACKING_CV_SEED,
         StackingConfig::default(),
     )
     .expect("cross-class adjudication must succeed");

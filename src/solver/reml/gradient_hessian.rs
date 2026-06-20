@@ -5918,6 +5918,36 @@ impl<'a> RemlState<'a> {
         // between the two derivations.
         let screening_cap = self.screening_max_inner_iterations.load(Ordering::Relaxed);
         let in_screening = screening_cap > 0;
+        // The shallow (~3-iteration) screening cap ranks candidate ρ by the
+        // partial-fit `min_penalized_deviance` proxy. That proxy is only a
+        // ρ-comparable quality signal when the inner solve descends toward its
+        // optimum at a rate that does not itself depend on ρ — true for the
+        // unconstrained penalized least-squares / P-IRLS Newton solve, which
+        // reaches (near) its minimizer within the cap at every ρ.
+        //
+        // It is FALSE for an inequality-constrained inner solve. With box /
+        // linear shape constraints the inner solver is an active-set QP whose
+        // traversal length varies with ρ: an under-smoothing ρ (the seed that
+        // recovers genuine curvature) must walk OFF the cone vertex / linear
+        // corner and RELEASE many curvature bounds before its penalized
+        // deviance drops, while an over-smoothing ρ sits at the linear corner —
+        // its constrained optimum — from the first iterate. Truncating both at
+        // ~3 iterations therefore makes the under-smoothing seed's proxy look
+        // far worse than its true converged cost, so screening systematically
+        // ranks the flat over-smoothed corner first and the real fit launches
+        // from it. REML then parks at the linear corner (EDF pinned to the
+        // affine null, R²≈0) on a clean convex signal an unconstrained s(x)
+        // recovers — the #1380 collapse, and exactly why it is a sharp SNR×n
+        // cliff (stronger signal lets even a 3-iteration partial solve overtake
+        // the flat seed). The fix is to let each constrained candidate ρ be
+        // judged at its CONVERGED constrained optimum: keep `in_screening`'s
+        // cache/KKT-suppression semantics (these results must still stay out of
+        // cross-call state), but do not apply the iteration cap to the
+        // active-set solve. The other (non-constrained) terms in the same fit
+        // still converge fast, so the screening pass stays cheap.
+        let screening_iteration_cap_applies = in_screening
+            && self.coefficient_lower_bounds.is_none()
+            && self.linear_constraints.is_none();
         // Outer-aware cap: a sibling atomic that only caps the inner Newton
         // iteration count. Unlike `screening_cap`, it does NOT suppress
         // cache writes / warm-start updates / KKT enforcement — it is purely
@@ -5958,7 +5988,7 @@ impl<'a> RemlState<'a> {
             let warm_start_ref = predicted_warm_start.as_ref().or(fallback_warm_start_ref);
             let mut pirls_config = self.config.as_pirls_config();
             let original_cap = pirls_config.max_iterations;
-            if in_screening {
+            if screening_iteration_cap_applies {
                 pirls_config.max_iterations = pirls_config.max_iterations.min(screening_cap);
             }
             if outer_cap > 0 {
@@ -5969,7 +5999,7 @@ impl<'a> RemlState<'a> {
                     "[PIRLS cap] inner_max_iterations={} (full={} screening={} outer={})",
                     pirls_config.max_iterations,
                     original_cap,
-                    if in_screening {
+                    if screening_iteration_cap_applies {
                         screening_cap as i64
                     } else {
                         -1

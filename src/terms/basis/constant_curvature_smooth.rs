@@ -538,6 +538,22 @@ pub(crate) fn data_center_fill_partials(
 /// The partials come from [`data_center_fill_partials`] (exact, riding
 /// `distance_kappa_jet`); the returned jet feeds `constant_curvature_kernel_
 /// kappa_jets_scaled` through the quotient `q = d/L` chain rule.
+///
+/// Public scalar view of the κ-invariant effective kernel length `L(κ)` that the
+/// realized constant-curvature design/penalty are built at (the #944 fill-
+/// invariance fix). The forward build evaluates the geodesic-exponential kernel
+/// at this `L(κ)`, NOT at the κ = 0 reference length `ell_ref`, so any external
+/// consumer reconstructing `K(·)` to compare against the realized design must
+/// use this length. Equals `ell_ref` exactly at κ = 0.
+pub fn constant_curvature_effective_length(
+    data: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    ell_ref: f64,
+    kappa: f64,
+) -> Result<f64, BasisError> {
+    Ok(constant_curvature_effective_length_jet(data, centers, ell_ref, kappa)?.0)
+}
+
 pub(crate) fn constant_curvature_effective_length_jet(
     data: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,

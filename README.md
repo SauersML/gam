@@ -14,7 +14,7 @@ Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>
 
 **Contributions of every kind are welcome** — broken PRs, first-timers,
 AI-written patches, and any feature request, with no guidelines and low
-friction by design. See [Contributing](#contributing).
+friction by design.
 
 ![3D Matérn fit on a noisy 2-D landscape](docs/images/surface_3d_wireframe.png)
 
@@ -383,7 +383,7 @@ this," a PR that's mostly wrong but sparks the right fix — all of it
 helps. The only real failure is a good thought that never gets sent
 because the friction felt too high.
 
-Open a [pull request](https://github.com/SauersML/gam/pulls) or an
+Great PRs will often consider SPEC.md. Open a [pull request](https://github.com/SauersML/gam/pulls) or an
 [issue](https://github.com/SauersML/gam/issues) — bugs, features,
 questions, wild ideas. That's the whole process.
 

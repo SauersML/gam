@@ -111,6 +111,7 @@ fn average_derivative_onestep_corrects_oversmoothed_gaussian_spline() {
                 y: y.view(),
                 mu: mu.view(),
                 beta: beta.view(),
+                penalty: scaled_penalty.view(),
                 penalty_beta: penalty_beta.view(),
             })
             .expect("average derivative functional");

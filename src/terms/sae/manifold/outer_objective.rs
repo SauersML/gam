@@ -114,7 +114,7 @@ impl AmortizedWarmStartTelemetry {
 /// (ψ) coordinates. No analytic outer gradient/Hessian is exposed yet
 /// (task v2 wires the selected-inverse block-trace ρ-gradient), so this
 /// is a cost-only objective and the engine routes it to a derivative-free /
-/// finite-difference outer strategy per the planner.
+/// central-difference outer strategy per the planner.
 pub struct SaeManifoldOuterObjective {
     pub(crate) term: SaeManifoldTerm,
     /// Pristine term to restore from on `reset` (multi-start baseline).
@@ -368,7 +368,7 @@ impl SaeManifoldOuterObjective {
     /// analytic gradient agree *here*, on this data shape, where #901-class
     /// desyncs actually manifest.
     ///
-    /// The finite difference is the *audit instrument*, not an estimator: it
+    /// The numerical secant is the *audit instrument*, not an estimator: it
     /// only checks the production analytic gradient against the production value
     /// path at one point after convergence, so it is fully compatible with the
     /// exact-REML-only policy (see `sae_optimality_certificate`). Cost is four
@@ -1277,7 +1277,7 @@ impl SaeManifoldOuterObjective {
         })
     }
 
-    /// #1273 — central finite-difference outer-ρ gradient of the REML value
+    /// #1273 — central-difference outer-ρ gradient of the REML value
     /// path, used ONLY as a descent-direction fallback when the analytic outer
     /// gradient is numerically undefined at a finite-cost ρ (a near-singular but
     /// valid joint Hessian — e.g. a circle/torus topology whose data is lower-
@@ -1285,61 +1285,129 @@ impl SaeManifoldOuterObjective {
     /// outside both the chart gauge orbit and the penalised decoder β-null that
     /// the Faddeev-Popov deflation recovers).
     ///
-    /// This is the SAME value path (`reml_criterion`) the optimality certificate
-    /// finite-differences to audit the analytic gradient, so it is exact-REML
-    /// clean: the FD never produces the cost the fit consumes (the gradient lane
-    /// returns the analytic REML value), it only supplies a usable direction so
-    /// the outer optimiser can cross the flat valley instead of aborting. Each
-    /// ρ-coordinate is differenced independently with a step scaled to the
-    /// coordinate magnitude (`probe_step`), on a cold clone of the pristine
-    /// baseline term so the probes never alias the live converged warm state.
-    /// A non-finite probe falls back to a zero component on that axis, which
-    /// simply omits a descent contribution there rather than poisoning the step.
+    /// This differences the SAME warm value path (`reml_criterion`) whose value
+    /// the gradient lane reports, so the value and its descent direction belong
+    /// to one function:
+    ///
+    /// * Every probe is evaluated on a FRESH clone of the LIVE warm state
+    ///   (`self.term`, which on the fallback arm already holds the converged
+    ///   inner solve at `rho_state`). `reml_criterion` takes `&mut self` and
+    ///   mutates warm-start/cache state, so a single shared probe term would
+    ///   make the result depend on probe order; a fresh clone per probe keeps
+    ///   every evaluation from an identical snapshot.
+    /// * Each ρ-coordinate uses its own step `probe_step_for(ρ_i)`, not one
+    ///   global step, so a small coordinate is not under-resolved by a large one.
+    /// * The collapse penalty is a discrete wall (`SAE_FIT_DATA_COLLAPSE_COST`);
+    ///   the difference is only meaningful in the smooth flat valley where the
+    ///   wall is inactive, so a probe at or above the wall (or non-finite) is
+    ///   treated as unmeasurable rather than differenced across the barrier.
+    /// * A coordinate that cannot be measured (central ladder, then one-sided,
+    ///   all unmeasurable) yields `Err` — it is NOT reported as a zero (which the
+    ///   optimiser would read as a stationary coordinate and which would poison
+    ///   the BFGS curvature update); the outer step must not proceed on a
+    ///   corrupted direction.
+    // FD-OK: descent-direction-only fallback (#1273); the analytic value path
+    // (`reml_criterion`) remains the single source of truth — this never
+    // produces the cost the fit consumes, only a usable direction across the
+    // near-singular flat valley.
     pub(crate) fn central_difference_outer_gradient(
         &self,
         rho_state: &SaeManifoldRho,
     ) -> Result<Array1<f64>, String> {
         let rho_flat = rho_state.to_flat();
         let n = rho_flat.len();
-        let h = probe_step(rho_flat.view());
-        let mut gradient = Array1::<f64>::zeros(n);
-        if !(h.is_finite() && h > 0.0) {
-            return Ok(gradient);
-        }
-        let mut probe_term = self.baseline_term.clone();
-        let value_at = |term: &mut SaeManifoldTerm, flat: &Array1<f64>| -> Option<f64> {
+        // Snapshot the live warm state once; every probe clones it fresh.
+        let warm_base = self.term.clone();
+        let value_at = |flat: &Array1<f64>| -> Option<f64> {
+            let mut term = warm_base.clone();
             let rho = self.baseline_rho.from_flat(flat.view());
-            let value = term
-                .reml_criterion(
-                    self.target.view(),
-                    &rho,
-                    self.registry.as_ref(),
-                    self.inner_max_iter,
-                    self.learning_rate,
-                    self.ridge_ext_coord,
-                    self.ridge_beta,
-                )
-                .ok()
-                .map(|(cost, _loss)| cost);
-            value.filter(|v| v.is_finite())
+            term.reml_criterion(
+                self.target.view(),
+                &rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+            )
+            .ok()
+            .map(|(cost, _loss)| cost)
+            // Reject probes on/above the discrete collapse wall: differencing
+            // across it is meaningless. Such a probe counts as unmeasurable.
+            .filter(|v| v.is_finite() && *v < SAE_FIT_DATA_COLLAPSE_COST)
         };
+        // Shrink the step toward the valley centre when a probe lands on the
+        // wall / non-finite, before giving up on a coordinate.
+        const LADDER: [f64; 3] = [1.0, 1.0 / 3.0, 1.0 / 10.0];
+        let mut gradient = Array1::<f64>::zeros(n);
         for i in 0..n {
-            let mut plus = rho_flat.clone();
-            plus[i] += h;
-            let mut minus = rho_flat.clone();
-            minus[i] -= h;
-            if let (Some(vp), Some(vm)) = (
-                value_at(&mut probe_term, &plus),
-                value_at(&mut probe_term, &minus),
-            ) {
-                let derivative = (vp - vm) / (2.0 * h);
-                if derivative.is_finite() {
-                    gradient[i] = derivative;
+            let h_i = probe_step_for(rho_flat[i]);
+            if !(h_i.is_finite() && h_i > 0.0) {
+                return Err(format!(
+                    "[SAE/#1273] outer-ρ probe step for coordinate {i} is non-finite \
+                     (ρ_i={}); the point is pathological and the outer step must not \
+                     proceed on a corrupted direction",
+                    rho_flat[i]
+                ));
+            }
+            let mut measured: Option<f64> = None;
+            // Central difference down the step ladder.
+            for &scale in LADDER.iter() {
+                let h = h_i * scale;
+                let mut plus = rho_flat.clone();
+                plus[i] += h;
+                let mut minus = rho_flat.clone();
+                minus[i] -= h;
+                if let (Some(vp), Some(vm)) = (value_at(&plus), value_at(&minus)) {
+                    let derivative = (vp - vm) / (2.0 * h);
+                    if derivative.is_finite() {
+                        measured = Some(derivative);
+                        break;
+                    }
+                }
+            }
+            // One-sided (forward, then backward) at the base step as a last resort.
+            if measured.is_none()
+                && let Some(v0) = value_at(&rho_flat)
+            {
+                let mut plus = rho_flat.clone();
+                plus[i] += h_i;
+                if let Some(vp) = value_at(&plus) {
+                    let d = (vp - v0) / h_i;
+                    if d.is_finite() {
+                        measured = Some(d);
+                    }
+                }
+                if measured.is_none() {
+                    let mut minus = rho_flat.clone();
+                    minus[i] -= h_i;
+                    if let Some(vm) = value_at(&minus) {
+                        let d = (v0 - vm) / h_i;
+                        if d.is_finite() {
+                            measured = Some(d);
+                        }
+                    }
+                }
+            }
+            match measured {
+                Some(d) => gradient[i] = d,
+                // No fake zeros: a genuinely unmeasurable coordinate (every probe
+                // non-finite or on the collapse wall) is propagated, not silently
+                // reported as a stationary component.
+                None => {
+                    return Err(format!(
+                        "[SAE/#1273] outer-ρ gradient unmeasurable in coordinate {i} \
+                         at finite-cost ρ: every central and one-sided probe (step \
+                         ladder from {h_i:.3e}) was non-finite or hit the collapse \
+                         barrier; the outer step must not proceed on a corrupted \
+                         direction"
+                    ));
                 }
             }
         }
         Ok(gradient)
     }
+    // END-FD-OK
 }
 
 impl OuterObjective for SaeManifoldOuterObjective {
@@ -1446,7 +1514,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // The cost at this ρ is still the EXACT REML criterion (it factorised
         // fine; only the gradient's pivot ratio tripped the gate), so the point is
         // feasible, not infeasible. Recover by descending it with a CENTRAL
-        // finite-difference outer gradient of the same value path — the identical
+        // central-difference outer gradient of the same value path — the identical
         // FD instrument the optimality certificate already uses to audit the
         // analytic gradient (`certificates::probe_*`), here used as a descent
         // direction only when the analytic path is numerically undefined. This is
@@ -1475,11 +1543,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 }
                 log::info!(
                     "[SAE/#1273] analytic outer gradient undefined at a finite-cost ρ \
-                     ({analytic_err}); descending with a central finite-difference outer \
+                     ({analytic_err}); descending with a central-difference outer \
                      gradient of the value path so the near-singular flat valley is crossed \
                      instead of aborting the outer optimisation"
                 );
-                self.finite_difference_outer_gradient(&rho_state)
+                self.central_difference_outer_gradient(&rho_state) // fd-ok: analytic outer gradient not cost-consistent here; descent direction only (#1273)
                     .map_err(EstimationError::RemlOptimizationFailed)?
             }
         };

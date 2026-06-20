@@ -259,6 +259,16 @@ pub struct SaeManifoldTerm {
     /// lock-step with the assembled system so the step interpretation cannot
     /// drift from the layout the system was built in.
     pub(crate) last_frames_active: bool,
+    /// #1407: when set, `assemble_arrow_schur` emits ONLY the per-row block-
+    /// diagonal `htt`/`gt` (the data-fit Gauss-Newton + assignment/ARD prior
+    /// curvature and gradient), skipping the entire β decoder tier — the β Gram
+    /// `G`, the `gb` gradient, the matrix-free `H_tβ` Kronecker operator, the
+    /// dense `H_ββ`, and all β-tier analytic penalties. The fixed-decoder encode
+    /// (`run_fixed_decoder_arrow_schur`) freezes the decoder and its per-row step
+    /// reads only `htt`/`gt` (`fixed_decoder_step_from_rows`), so the entire
+    /// `K`-dependent decoder assembly it otherwise computes-and-discards is
+    /// avoided. A transient mode set in lock-step by that driver, not persisted.
+    pub(crate) fixed_decoder_assembly: bool,
     /// Reusable dense β-tier workspace for analytic penalty assembly. SAE
     /// immediately lowers the dense block into a `BetaPenaltyOp`, so the returned
     /// `ArrowSchurSystem` does not need to keep owning the allocation.
@@ -372,6 +382,7 @@ impl Clone for SaeManifoldTerm {
             collapse_events: self.collapse_events.clone(),
             row_loss_weights: self.row_loss_weights.clone(),
             last_frames_active: self.last_frames_active,
+            fixed_decoder_assembly: false,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             certificate_dispersion: self.certificate_dispersion,
             curvature_walk_report: self.curvature_walk_report.clone(),

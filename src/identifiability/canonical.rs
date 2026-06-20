@@ -55,7 +55,9 @@ use crate::identifiability::audit::{
 use crate::identifiability::families::compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
 };
-use crate::linalg::faer_ndarray::{FaerEigh, fast_ata};
+use crate::linalg::faer_ndarray::{
+    FaerEigh, default_rrqr_rank_alpha, fast_ata, rrqr_with_permutation,
+};
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use crate::solver::gauge::Gauge;
 use faer::Side;
@@ -454,6 +456,31 @@ fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize) -> usize {
     let nk = nk_scale.max(p).max(1) as f64;
     let tau = scale * 64.0 * nk * f64::EPSILON;
     evals.iter().filter(|&&l| l > tau).count()
+}
+
+/// Numerical rank of `j` under the σ-space column-pivoted RRQR convention — the
+/// EXACT metric the FLAT identifiability audit (`audit_identifiability`) uses to
+/// decide which joint columns to demote. The flat audit pivots the joint design
+/// with `rrqr_with_permutation` at `default_rrqr_rank_alpha()` and cuts the rank
+/// where the pivot diagonal falls past its relative tolerance; ranking `J_pre`
+/// and `J_can` here with the same routine and the same `alpha` reproduces that
+/// verdict bit-for-bit (the rank depends only on the column geometry). The
+/// post-T invariant must rank under whichever convention CHOSE the drops, and
+/// for the flat path that is this σ-space RRQR — NOT the σ²-Gram eigenspace of
+/// [`audit_convention_rank`], whose cutoff is ~6 orders of magnitude more
+/// lenient and therefore counts near-separable directions the RRQR legitimately
+/// demoted (gam#1391).
+fn flat_audit_convention_rank(j: &Array2<f64>) -> usize {
+    if j.ncols() == 0 || j.nrows() == 0 {
+        return 0;
+    }
+    match rrqr_with_permutation(j, default_rrqr_rank_alpha()) {
+        Ok(rrqr) => rrqr.rank,
+        // RRQR failure: fall back to the structural column count (no demotion),
+        // so a numerical hiccup never manufactures a spurious invariant
+        // violation.
+        Err(_) => j.ncols(),
+    }
 }
 
 fn canonicalize_for_identifiability_inner(
@@ -1108,24 +1135,68 @@ fn canonicalize_for_identifiability_inner(
                 red_col_off += r_i;
             }
 
-            // Rank J_pre and J_can under the SAME σ²-Gram eigenvalue convention
-            // the audit used to DECIDE the drops (`audit_convention_rank`), not
-            // a fresh σ-space RRQR with a different threshold. On near-separable
-            // data the two disagree by ~6 orders of magnitude in the relative-σ
-            // cutoff, so a plain RRQR would count weak directions the audit (by
-            // its own convention) correctly demoted, tripping the invariant on
-            // genuine gauge drops (gam#1220). `nk_scale` mirrors the audit's
-            // tolerance size term: r_map is the (n·k)-stacked row count.
+            // Rank J_pre and J_can under the SAME convention that DECIDED the
+            // column drops — the only way the strict invariant `rank(J_pre) ==
+            // rank(J_can)` is meaningful (gam#1391/#1388, mirroring how gam#1220
+            // aligned the channel-aware path):
+            //
+            //   • CHANNEL-AWARE path — the drops come from the σ²-Gram positive
+            //     eigenspace (`keep_positive_eigenspace`), so we rank with the
+            //     matching σ²-Gram metric (`audit_convention_rank`).
+            //   • FLAT path — the drops come from a σ-space column-pivoted RRQR,
+            //     whose relative cutoff is ~6 orders of magnitude STRICTER than
+            //     the σ²-Gram one. Ranking the flat path with `audit_convention_
+            //     rank` counted near-separable directions the RRQR legitimately
+            //     demoted, so a perfectly faithful column-selection `T` reported
+            //     `rank(J_pre) > rank(J_can)` and tripped a false invariant
+            //     violation (GAMLSS-PS, survival-marginal-slope). Rank it with
+            //     `flat_audit_convention_rank` (the same RRQR + alpha the flat
+            //     audit used) so the two ranks are taken in the drops' own metric.
+            //
+            // `nk_scale` mirrors the audit's tolerance size term: r_map is the
+            // (n·k)-stacked row count.
             let nk_scale = r_map;
-            let rank_j_pre = audit_convention_rank(&j_pre, nk_scale);
-            let rank_j_can = audit_convention_rank(&j_can, nk_scale);
+            let rank_under_drop_convention = |j: &Array2<f64>| -> usize {
+                if use_channel_aware {
+                    audit_convention_rank(j, nk_scale)
+                } else {
+                    flat_audit_convention_rank(j)
+                }
+            };
+            let rank_j_pre = rank_under_drop_convention(&j_pre);
+            let rank_j_can = rank_under_drop_convention(&j_can);
+
+            // Threaded certificate from the audit itself (logged for diagnostics):
+            // the per-block `effective_dim` sums to the rank the drop convention
+            // kept, i.e. the audit's own joint_rank verdict — the quantity the
+            // strict invariant ultimately certifies `T` preserved.
+            let audit_kept_rank: usize =
+                audit.blocks.iter().map(|b| b.effective_dim).sum();
 
             log::info!(
-                "[CANON] post-T invariant (audit σ²-Gram convention): \
+                "[CANON] post-T invariant ({} convention): \
                  rank(J)={rank_j_pre} rank(J_can)={rank_j_can} \
+                 audit_kept_rank={audit_kept_rank} \
                  (p_raw={p_total_raw} p_red={p_total_red} k={k})",
+                if use_channel_aware {
+                    "σ²-Gram"
+                } else {
+                    "σ-space RRQR"
+                },
             );
 
+            // A faithful column-selection `T` removes only directions that the
+            // drop convention already deemed redundant, so the surviving columns
+            // span the SAME rank: `rank(J_pre) == rank(J_can)` in that metric.
+            // Crucially both sides are ranked by the IDENTICAL convention here,
+            // so the comparison is invariant to whatever absolute level that
+            // convention assigns (including any penalty-null directions it counts
+            // equally on both sides) — it isolates exactly the failure mode this
+            // gate guards against: a defective `T` that drops a direction the
+            // convention deemed identifiable, lowering `rank(J_can)` below
+            // `rank(J_pre)`. Comparing across two DIFFERENT conventions (σ²-Gram
+            // for J_pre, the σ-RRQR drop metric implicitly for J_can) was the
+            // gam#1391/#1388 false positive.
             if rank_j_pre != rank_j_can {
                 let block_shapes: Vec<String> = per_block_transform
                     .iter()
@@ -1135,9 +1206,16 @@ fn canonicalize_for_identifiability_inner(
                 return Err(CustomFamilyError::DimensionMismatch {
                     reason: format!(
                         "canonicalize_for_identifiability: post-T rank invariant violated — \
-                         rank(J)={rank_j_pre} but rank(J_can)={rank_j_can} \
-                         (p_raw={p_total_raw} p_red={p_total_red} k={k}); \
-                         this is a bug in T construction; per-block T shapes: [{}]",
+                         under the drop-deciding {} convention rank(J)={rank_j_pre} but \
+                         rank(J_can)={rank_j_can} (audit_kept_rank={audit_kept_rank}, \
+                         p_red={p_total_red}, p_raw={p_total_raw}, k={k}); the column-selection \
+                         T dropped a direction the audit deemed identifiable — a bug in T \
+                         construction; per-block T shapes: [{}]",
+                        if use_channel_aware {
+                            "σ²-Gram"
+                        } else {
+                            "σ-space RRQR"
+                        },
                         block_shapes.join(", "),
                     ),
                 });

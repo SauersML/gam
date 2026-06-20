@@ -740,19 +740,21 @@ fn decompose_kronecker_factors(
         if analysis.rank == 0 {
             return Ok(None);
         }
+        // Build the factor root from ONLY the range (positive-curvature)
+        // directions via the canonical classifier — never the null or
+        // negative-curvature directions (#1425).
+        let factor_classes =
+            crate::basis::SpectralClassification::new(&analysis.eigenvalues, analysis.tol);
         let mut root_j = Array2::zeros((analysis.rank, q_j));
         let mut pos_eigs = Vec::with_capacity(analysis.rank);
-        let mut row_idx = 0;
-        for (i, &eigenval) in analysis.eigenvalues.iter().enumerate() {
-            if eigenval > analysis.tol {
-                let sqrt_ev = eigenval.sqrt();
-                let evec = analysis.eigenvectors.column(i);
-                for (c, &v) in evec.iter().enumerate() {
-                    root_j[[row_idx, c]] = sqrt_ev * v;
-                }
-                pos_eigs.push(eigenval);
-                row_idx += 1;
+        for (row_idx, &i) in factor_classes.range_idx.iter().enumerate() {
+            let eigenval = analysis.eigenvalues[i];
+            let sqrt_ev = eigenval.sqrt();
+            let evec = analysis.eigenvectors.column(i);
+            for (col, &v) in evec.iter().enumerate() {
+                root_j[[row_idx, col]] = sqrt_ev * v;
             }
+            pos_eigs.push(eigenval);
         }
         decomps.push(KroneckerFactorDecomp {
             root: root_j,
@@ -1240,54 +1242,57 @@ pub fn canonicalize_penalty_spec(
         return Ok(None);
     }
 
-    // Reuse eigendecomposition from analyze_penalty_block — no double eigendecomp.
+    // Reuse the eigendecomposition from analyze_penalty_block and route the
+    // range / null / negative-curvature split through the one canonical
+    // classifier, so this root construction cannot disagree with the block's
+    // own `rank` / `nullity` / `negative_dim` about which directions are
+    // penalized, unpenalized, or non-PSD (#1425).
     let tolerance = analysis.tol;
-    let rank_k = analysis.rank;
+    let classes =
+        crate::basis::SpectralClassification::new(&analysis.eigenvalues, tolerance);
+    let rank_k = classes.rank();
+    debug_assert_eq!(rank_k, analysis.rank);
 
+    // Build the penalty root R from ONLY the range directions (positive
+    // curvature): R has one row per range eigenpair, scaled by sqrt(ev), so
+    // RᵀR reconstructs S on range(S). Null directions contribute nothing
+    // (their eigenvalue is zero); negative-curvature directions are NEVER
+    // square-rooted into R (their sqrt is imaginary) and are NOT null — they
+    // are simply dropped from R, exactly as the closed-form Duchon kernels at
+    // high d require to preserve the q_pen / q_null invariant downstream.
     let mut root = Array2::zeros((rank_k, block_dim));
     let mut positive_eigenvalues = Vec::with_capacity(rank_k);
-    let mut row_idx = 0;
-    let mut negative_dim = 0usize;
-    for (i, &eigenval) in analysis.eigenvalues.iter().enumerate() {
-        if eigenval > tolerance {
-            let sqrt_eigenval = eigenval.sqrt();
-            let eigenvec = analysis.eigenvectors.column(i);
-            root.row_mut(row_idx).assign(&(&eigenvec * sqrt_eigenval));
-            positive_eigenvalues.push(eigenval);
-            row_idx += 1;
-        } else if eigenval < -tolerance {
-            // Genuinely negative O(1) curvature (a non-PSD penalty). This is
-            // dropped from the canonical root (its sqrt is undefined) but it is
-            // emphatically NOT a null direction: do not let it be counted toward
-            // `nullity`, or the absorption stage would treat the negative-
-            // curvature direction as unpenalized (#1425). Only |ev| <= tol are
-            // genuine null directions; `analysis.nullity` already keys on that.
-            negative_dim += 1;
-        }
+    for (row_idx, &i) in classes.range_idx.iter().enumerate() {
+        let eigenval = analysis.eigenvalues[i];
+        let eigenvec = analysis.eigenvectors.column(i);
+        root.row_mut(row_idx).assign(&(&eigenvec * eigenval.sqrt()));
+        positive_eigenvalues.push(eigenval);
     }
 
-    // Store the PSD reconstruction R^T R rather than the raw symmetrised input so
-    // the cached `local` matches the rank truncation embedded in `root`. Closed-
-    // form Duchon kernels at high d can leave |O(1)| negative eigenvalues in the
-    // symmetrised input that the canonical root drops; keeping them in `local`
-    // poisons the balanced-sum eigendecomposition and breaks the q_pen / q_null
-    // invariant that downstream stages require. Those dropped negative
-    // directions are tracked in `negative_dim` (above) so they are excluded from
-    // both the range (`root`) and the null space (`nullity`); they are neither.
-    if negative_dim > 0 {
+    // Surface any genuine negative curvature honestly: it is neither range
+    // (dropped from R) nor null (excluded from `nullity`), so it would
+    // otherwise vanish without a trace. A non-PSD penalty reaching this path
+    // is a real geometric fact (e.g. high-d Duchon kernels) the operator
+    // should be able to see.
+    if classes.is_indefinite() {
         log::debug!(
-            "{context}: penalty block idx={idx} has {negative_dim} negative-curvature \
-             eigendirection(s) below -tol={tolerance:e}; dropped from the canonical root \
-             and NOT counted as null space (rank={rank_k}, nullity={})",
-            analysis.nullity
+            "{context}: penalty block idx={idx} carries {} negative-curvature \
+             eigendirection(s) below -tol={tolerance:e}; dropped from the canonical \
+             root and NOT counted as null space (rank={rank_k}, nullity={})",
+            classes.negative_dim(),
+            classes.nullity()
         );
     }
+
+    // Store the PSD reconstruction RᵀR rather than the raw symmetrised input so
+    // the cached `local` matches the rank truncation embedded in `root`
+    // (negative-curvature directions are excluded from both, as above).
     let local = root.t().dot(&root);
     Ok(Some(CanonicalPenalty {
         root,
         col_range,
         total_dim: p,
-        nullity: analysis.nullity,
+        nullity: classes.nullity(),
         local,
         prior_mean,
         positive_eigenvalues,

@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use ndarray::{Array1, Array2, ArrayView2, s};
 
 use crate::families::scale_design::scale_transform_from_payload;
-use crate::families::survival::assemble_competing_risks_cif_from_endpoints;
+use crate::families::survival::{
+    CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints,
+};
 use crate::families::survival::construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset, build_survival_time_basis,
@@ -1036,6 +1038,56 @@ pub fn predict_competing_risks_survival(
     };
     let t_cols = if per_row_eval { 1 } else { eval_times.len() };
 
+    // Refined internal grid for the Aalen-Johansen CIF assembly (gam#1385).
+    //
+    // The discrete AJ increment ΔF_k = S(t_{j-1})·(1−exp(−ΔH_total))·ΔH_k/ΔH_total
+    // assumes the cause-specific hazard *ratio* h_k/h_total is constant within
+    // each interval. On a coarse user grid with differently-shaped competing
+    // hazards that assumption is violated, making the returned CIF a function of
+    // the requested grid resolution (up to ~22% pointwise error) rather than a
+    // pure function of the query time. We assemble AJ on a refined grid (extra
+    // points inserted from 0 to the first user time and between consecutive user
+    // times — cause-specific cumulative hazards are cheap closed-form
+    // evaluate_at calls) and then read CIF/overall-survival back at the user's
+    // requested times. The per-cause hazard/survival/cumulative_hazard returned
+    // to the caller stay on the user grid (those are pointwise and already
+    // grid-independent); only the AJ assembly uses the refinement.
+    //
+    // `refined_times` is strictly increasing and is a superset of `eval_times`;
+    // `user_time_to_refined_index[j]` is the position of the j-th user time
+    // inside `refined_times`. Per-row eval keeps its single-time anchor path.
+    const CIF_REFINE_SUBINTERVALS: usize = 32;
+    let (refined_times, user_time_to_refined_index): (Vec<f64>, Vec<usize>) = if per_row_eval {
+        (Vec::new(), Vec::new())
+    } else {
+        let mut refined: Vec<f64> = Vec::new();
+        let mut user_index: Vec<usize> = Vec::with_capacity(eval_times.len());
+        let mut prev = 0.0_f64;
+        for &t_user in &eval_times {
+            // Insert CIF_REFINE_SUBINTERVALS-1 strictly-interior points in
+            // (prev, t_user], landing exactly on t_user as the last point. Skip
+            // the interior fill for a zero-length gap (duplicate / origin user
+            // time) so `refined` stays strictly increasing.
+            let gap = t_user - prev;
+            if gap > 0.0 {
+                for s in 1..CIF_REFINE_SUBINTERVALS {
+                    let t_mid = prev + gap * (s as f64) / (CIF_REFINE_SUBINTERVALS as f64);
+                    // Guard against ties from floating-point rounding.
+                    if refined.last().is_none_or(|&last| t_mid > last) {
+                        refined.push(t_mid);
+                    }
+                }
+            }
+            if refined.last().is_none_or(|&last| t_user > last) {
+                refined.push(t_user);
+            }
+            user_index.push(refined.len() - 1);
+            prev = t_user;
+        }
+        (refined, user_index)
+    };
+    let refined_cols = refined_times.len();
+
     let saved_timewiggle_by_cause = saved_cause_specific_timewiggles(model, &fit, cause_count)?;
     let cov_rows = (0..n)
         .map(|i| design_row_owned(&cov_design.design, i, "competing-risks covariate row"))
@@ -1050,6 +1102,11 @@ pub fn predict_competing_risks_survival(
     let mut cumulative_hazard = (0..cause_count)
         .map(|_| Array2::<f64>::zeros((n, t_cols)))
         .collect::<Vec<_>>();
+    // Cause-specific cumulative hazards on the refined AJ grid (gam#1385);
+    // unused (zero-width) on the per-row-eval path.
+    let mut cumulative_hazard_refined = (0..cause_count)
+        .map(|_| Array2::<f64>::zeros((n, refined_cols)))
+        .collect::<Vec<_>>();
     let mut linear_predictor = (0..cause_count)
         .map(|_| Array1::<f64>::zeros(n))
         .collect::<Vec<_>>();
@@ -1060,6 +1117,9 @@ pub fn predict_competing_risks_survival(
         hazard: Vec<f64>,
         survival: Vec<f64>,
         cumulative: Vec<f64>,
+        /// Cumulative hazard on the refined AJ grid (gam#1385); empty on the
+        /// per-row-eval path.
+        cumulative_refined: Vec<f64>,
         eta_exit: f64,
     }
 
@@ -1112,6 +1172,7 @@ pub fn predict_competing_risks_survival(
                 hazard: vec![0.0; t_cols],
                 survival: vec![0.0; t_cols],
                 cumulative: vec![0.0; t_cols],
+                cumulative_refined: vec![0.0; refined_cols],
                 eta_exit: 0.0,
             };
             if per_row_eval {
@@ -1139,6 +1200,18 @@ pub fn predict_competing_risks_survival(
                         out.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
                     }
                 }
+                // Refined-grid cumulative hazards for the AJ CIF assembly
+                // (gam#1385). Same closed-form evaluate_at; reuse the exact
+                // user-grid values at the points that coincide so the returned
+                // per-cause cumulative_hazard and the assembly agree at the user
+                // times to the bit.
+                for (jr, &t_query) in refined_times.iter().enumerate() {
+                    out.cumulative_refined[jr] = if t_query <= 0.0 {
+                        0.0
+                    } else {
+                        evaluate_at(t_query)?.1
+                    };
+                }
                 let (eta_t, _, _) = evaluate_at(age_exit[i])?;
                 out.eta_exit = eta_t;
             }
@@ -1153,16 +1226,45 @@ pub fn predict_competing_risks_survival(
             survival[row.cause][[row.row, j]] = row.survival[j];
             cumulative_hazard[row.cause][[row.row, j]] = row.cumulative[j];
         }
+        for jr in 0..refined_cols {
+            cumulative_hazard_refined[row.cause][[row.row, jr]] = row.cumulative_refined[jr];
+        }
     }
 
-    let assembly_times = if per_row_eval {
-        Array1::from_elem(1, 0.0)
-    } else {
-        Array1::from_vec(eval_times.clone())
-    };
-    let assembled =
+    // Assemble the Aalen-Johansen CIF on the refined grid (gam#1385), then read
+    // the result back at the user-requested times so the CIF is grid-resolution
+    // independent. Per-row eval keeps the single-anchor assembly path.
+    let assembled = if per_row_eval {
+        let assembly_times = Array1::from_elem(1, 0.0);
         assemble_competing_risks_cif_from_endpoints(assembly_times.view(), &cumulative_hazard)
-            .map_err(|err| err.to_string())?;
+            .map_err(|err| err.to_string())?
+    } else {
+        let assembly_times = Array1::from_vec(refined_times.clone());
+        let refined_assembled = assemble_competing_risks_cif_from_endpoints(
+            assembly_times.view(),
+            &cumulative_hazard_refined,
+        )
+        .map_err(|err| err.to_string())?;
+        // Project refined CIF / overall-survival columns onto the user grid.
+        let mut cif_user = (0..cause_count)
+            .map(|_| Array2::<f64>::zeros((n, t_cols)))
+            .collect::<Vec<_>>();
+        let mut overall_user = Array2::<f64>::zeros((n, t_cols));
+        for (j_user, &jr) in user_time_to_refined_index.iter().enumerate() {
+            for cause in 0..cause_count {
+                for row in 0..n {
+                    cif_user[cause][[row, j_user]] = refined_assembled.cif[cause][[row, jr]];
+                }
+            }
+            for row in 0..n {
+                overall_user[[row, j_user]] = refined_assembled.overall_survival[[row, jr]];
+            }
+        }
+        CompetingRisksCifResult {
+            cif: cif_user,
+            overall_survival: overall_user,
+        }
+    };
     if assembled.cif.len() != cause_count {
         return Err(format!(
             "competing-risks CIF assembly produced {} endpoint matrices, expected {cause_count}",

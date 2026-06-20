@@ -65,7 +65,19 @@ fn leverage_uniform_column_has_tight_threshold() {
     let col_a: Vec<f64> = vec![1.0; n];
     let s2_a = s2_from_col(&col_a);
     let inv_n = 1.0 / n as f64;
-    let sigma_a = (s2_a - inv_n).max(0.0).sqrt();
+    // σ² = S2 − 1/n is exactly 0 for a uniform column, but the sequential f64
+    // accumulation of S2 leaves an ~n·ε residual whose sqrt inflates to ~3.9e-9
+    // (√ has unbounded relative sensitivity at the origin). The audit's
+    // `pair_null_sigma` floors any excess at or below the n·ε summation scale to
+    // exactly 0 (gam#1397); mirror that here so the test measures the same σ the
+    // audit actually uses.
+    let excess = s2_a - inv_n;
+    let rounding_floor = 16.0 * f64::EPSILON * (n as f64) * s2_a.abs().max(inv_n);
+    let sigma_a = if excess <= rounding_floor {
+        0.0
+    } else {
+        excess.sqrt()
+    };
 
     // For a uniform column S2 = 1/n, so σ = sqrt(1/n - 1/n) = 0.
     // The floor ensures the threshold is 0.10.

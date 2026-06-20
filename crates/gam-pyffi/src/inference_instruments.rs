@@ -1466,7 +1466,7 @@ pub(crate) fn adjudicate_atom_shape<'py>(
         },
     ];
 
-    let verdict = adjudicate_cross_class_race(n, candidates, folds, StackingConfig::default())
+    let verdict = adjudicate_cross_class_race(n, candidates, folds, seed, StackingConfig::default())
         .map_err(py_value_error)?;
 
     // Per-candidate stacking weights (present because the race mixes the

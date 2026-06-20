@@ -982,6 +982,32 @@ pub fn select_thin_plate_knots(
     });
     min_dist2[seed_idx] = 0.0;
 
+    // Lexicographic order on a candidate's COORDINATE VALUES (not its row
+    // index). Farthest-point ties — two unselected points at exactly the same
+    // `min_dist2` to the chosen set — are common on a maximin grid and in
+    // float arithmetic, and breaking them by row index made the selected knot
+    // SET depend on the row order of the data: a pure permutation of the
+    // training rows then produced a different thin-plate basis, a different
+    // design conditioning, and a different REML λ̂ (gam#1378, ~3% curve drift,
+    // while value-anchored cr/ps were bit-identical). Break ties by the
+    // value-lexicographically smallest candidate instead — a pure function of
+    // the data value set — so the knots (and hence the whole fit) are
+    // row-permutation invariant, matching the value-based seed above.
+    let value_less = |i: usize, j: usize| -> bool {
+        for c in 0..d {
+            let vi = data[[i, c]];
+            let vj = data[[j, c]];
+            if vi < vj {
+                return true;
+            }
+            if vi > vj {
+                return false;
+            }
+        }
+        // Exactly equal coordinates: fall back to row index only to keep a
+        // total order (duplicate points are interchangeable in the basis).
+        i < j
+    };
     while selected.len() < num_knots {
         let best_idx = min_dist2
             .par_iter()
@@ -989,7 +1015,7 @@ pub fn select_thin_plate_knots(
             .filter(|(i, _)| !chosen[*i])
             .map(|(i, &cand)| (i, cand))
             .reduce_with(|a, b| {
-                if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
+                if b.1 > a.1 || (b.1 == a.1 && value_less(b.0, a.0)) {
                     b
                 } else {
                     a

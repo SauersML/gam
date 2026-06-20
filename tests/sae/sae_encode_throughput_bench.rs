@@ -309,24 +309,51 @@ fn measure_encode_rows_per_sec(k_atoms: usize) -> f64 {
     let secs = elapsed.as_secs_f64().max(1.0e-12);
     let rows_per_sec = n as f64 / secs;
 
-    // Sanity: the encode produced finite assignments on every active row.
+    // #1412: correctness must require actual SUPPORT RECOVERY, not merely finite
+    // values — a near-zero or uniform encode produces finite assignments but
+    // recovers nothing. Compare the mean assignment mass on PLANTED-ACTIVE atoms
+    // against the mean on inactive atoms: a correct encode concentrates mass on
+    // the planted support, so active mean must clear a positive floor AND
+    // dominate the inactive mean by a clear margin.
     let assignments = term.assignment.assignments();
     let mut active_rows = 0usize;
+    let mut inactive_count = 0usize;
     let mut recovered_mass = 0.0_f64;
+    let mut inactive_mass = 0.0_f64;
     for row in 0..n {
         for k in 0..k_atoms {
+            let a = assignments[[row, k]];
+            assert!(
+                a.is_finite(),
+                "encode produced non-finite assignment at (row={row}, k={k})"
+            );
             if batch.active[k][row] {
                 active_rows += 1;
-                let a = assignments[[row, k]];
-                assert!(
-                    a.is_finite(),
-                    "encode produced non-finite assignment at (row={row}, k={k})"
-                );
                 recovered_mass += a;
+            } else {
+                inactive_count += 1;
+                inactive_mass += a.abs();
             }
         }
     }
     let mean_active_mass = recovered_mass / active_rows.max(1) as f64;
+    let mean_inactive_mass = inactive_mass / inactive_count.max(1) as f64;
+    // Liveness floor: a dead/zero encode (all assignments ~0) must fail. This is
+    // a conservative positive floor — NOT a calibrated reconstruction-quality
+    // bound — so it cannot false-fail a correct-but-normalized encode; the
+    // scale-invariant support-recovery ratio below is the real correctness gate.
+    assert!(
+        mean_active_mass > 1.0e-3,
+        "K={k_atoms}: encode recovered negligible mass on the planted support          (mean active mass {mean_active_mass:.4e} <= 1e-3) — finite-but-empty encode"
+    );
+    // Support recovery (scale-invariant): planted-active atoms must carry clearly
+    // more mass than inactive ones. A uniform encode has active ~ inactive
+    // (ratio ~1) and a dead encode has both ~0 (ratio not > 3), so this rejects
+    // exactly the "fast but wrong" passes the previous finite-only check allowed.
+    assert!(
+        mean_active_mass > 3.0 * mean_inactive_mass,
+        "K={k_atoms}: encode did not recover the planted support          (mean active mass {mean_active_mass:.4} not > 3x mean inactive mass          {mean_inactive_mass:.4})"
+    );
 
     println!(
         "K={k_atoms}: encoded {n} rows in {:.4}s => {rows_per_sec:.1} rows/sec  \
@@ -342,10 +369,17 @@ fn measure_encode_rows_per_sec(k_atoms: usize) -> f64 {
 #[test]
 fn sae_encode_throughput_decision_gate() {
     println!("=== Stage-3 SAE encode throughput benchmark (#988) ===");
+    // #1412 HONESTY: this gate measures a CPU-side per-row encode floor as a
+    // PROXY; it does NOT measure the 100k rows/sec/GPU deployment target and
+    // establishes no CPU→GPU scaling. Clearing the CPU floor is a NECESSARY
+    // (the per-row work is cheap enough to be GPU-amortizable) but NOT a
+    // SUFFICIENT condition for the GPU gate — a real GPU benchmark on the device
+    // seam is required to certify the deployment target. The assertions below
+    // gate only the CPU floor + support-recovery correctness.
     println!(
-        "GPU deployment gate = {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} rows/sec/GPU; \
-         meeting the CPU-scaled floor => exact encode clears the gate on the GPU seam => \
-         Stage-3 amortized surrogate is NEVER built."
+        "GPU deployment gate = {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} rows/sec/GPU \
+         (NOT measured here — CPU floor below is a proxy, not a GPU measurement; \
+         no CPU→GPU scaling is established by this test)."
     );
 
     let rps_small = measure_encode_rows_per_sec(K_SMALL);

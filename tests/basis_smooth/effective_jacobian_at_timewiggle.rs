@@ -2,9 +2,10 @@
 //! (`SmsTimewiggleTimeJacobian` and `SmsTimewiggleMarginalJacobian`) match
 //! central-difference finite differences.
 //!
-//! Setup: n=6 rows, p_base=2 time-base columns, p_tw=2 wiggle columns,
-//! p_m=3 marginal columns, p_g=1 logslope column.  The joint β is
-//!   [β_t_base (2), β_tw (2), β_m (3), β_g (1)] = 8 entries.
+//! Setup: n=6 rows, p_base=2 time-base columns, p_tw=3 wiggle columns
+//! (degree-3 monotone I-spline from an 8-knot clamped vector — the minimal
+//! valid degree-3 wiggle), p_m=3 marginal columns, p_g=1 logslope column.
+//! The joint β is [β_t_base (2), β_tw (3), β_m (3), β_g (1)] = 9 entries.
 //!
 //! We evaluate the Jacobian at a non-trivial β with β_tw ≠ 0, so the
 //! timewiggle corrections are genuinely active.  The logslope β is set to
@@ -22,11 +23,11 @@ use std::sync::Arc;
 
 const N: usize = 6;
 const P_BASE: usize = 2; // non-wiggle time columns
-const P_TW: usize = 2; // wiggle tail columns
-const P_TIME: usize = P_BASE + P_TW; // 4
+const P_TW: usize = 3; // wiggle tail columns (degree-3 I-spline, 8 clamped knots)
+const P_TIME: usize = P_BASE + P_TW; // 5
 const P_M: usize = 3; // marginal columns
 const P_G: usize = 1; // logslope columns
-const P_JOINT: usize = P_TIME + P_M + P_G; // 8
+const P_JOINT: usize = P_TIME + P_M + P_G; // 9
 
 /// Dense n × p_base entry design.
 fn design_entry() -> Array2<f64> {
@@ -76,12 +77,21 @@ fn marginal_offset() -> Array1<f64> {
     Array1::zeros(N)
 }
 
-/// B-spline knots for the wiggle basis.  We need enough knots for `ncols = p_tw = 2`.
-/// degree=3, ncols = n_internal_knots + degree - 1; with n_internal = 0 we
-/// get ncols = degree - 1 = 2.
+/// Clamped knot vector for the degree-3 monotone (I-spline) wiggle basis.
+///
+/// The monotone wiggle integrates a degree-`internal_degree = degree - 1 = 2`
+/// M-spline into a degree-3 value basis, so the low-level builder validates the
+/// knots against `bs_degree = internal_degree + 1 = 3` and requires a *clamped*
+/// vector of at least `2·(bs_degree + 1) = 8` knots. With `len` knots the basis
+/// has `len - bs_degree - 1 - 1 = len - 5` I-spline columns, so the minimal
+/// valid degree-3 wiggle (no internal knots) is an 8-knot clamped vector giving
+/// `P_TW = 3` columns. The earlier `[-3, 3]` two-knot vector was not a valid
+/// clamped knot vector and could never yield a 2-column degree-3 wiggle
+/// (production rejected it with "Insufficient knots for degree 3 spline").
 fn wiggle_knots() -> Array1<f64> {
-    // Boundary knots only (no internal knots): degree-3 wiggle with ncols = 2.
-    Array1::from_vec(vec![-3.0, 3.0])
+    // Clamped degree-3 boundary knots (multiplicity bs_degree + 1 = 4 at each
+    // end), no internal knots ⇒ len = 8 ⇒ P_TW = len - 5 = 3 I-spline columns.
+    Array1::from_vec(vec![-3.0, -3.0, -3.0, -3.0, 3.0, 3.0, 3.0, 3.0])
 }
 
 const WIGGLE_DEGREE: usize = 3;
@@ -91,9 +101,9 @@ fn beta_nonzero() -> Array1<f64> {
     Array1::from_vec(vec![
         // β_t_base (2): small nonzero entries
         0.15, -0.07,
-        // β_tw (2): positive (wiggle monotone constraint requires ≥ 0,
+        // β_tw (3): positive (wiggle monotone constraint requires ≥ 0,
         // but we just need a valid input for the Jacobian)
-        0.20, 0.10, // β_m (3)
+        0.20, 0.10, 0.05, // β_m (3)
         0.05, -0.12, 0.08, // β_g (1): set to 0 so c_i = 1 (simplifies ground truth)
         0.0,
     ])

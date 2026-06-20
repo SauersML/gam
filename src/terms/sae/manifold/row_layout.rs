@@ -80,15 +80,22 @@ impl SaeRowLayout {
 
     /// Mode-agnostic effective active set for dense-weight modes (softmax /
     /// IBP-MAP) at large `K`: keep, per row, the top-`k_active_cap` atoms by
-    /// `|a_{n,k}|` whose magnitude also exceeds `cutoff`.
+    /// `|a_{n,k}|` whose magnitude also exceeds `relative_cutoff · rowpeak`.
+    ///
+    /// #1414: the cutoff is RELATIVE TO EACH ROW'S OWN PEAK `max_k |a_{n,k}|`,
+    /// matching the documented `sparse_active_plan` contract
+    /// (`construction.rs:1763-1766`). A global cutoff (one threshold from the
+    /// whole-dataset peak) would wrongly drop both atoms of a uniformly-small row
+    /// `[0.0009, 0.0008]` just because another row peaks at `1.0`, changing the
+    /// high-`K` compact model.
     ///
     /// `assignments[row]` is the dense length-`K` assignment vector `a_{n,·}`.
     /// The active set is always non-empty (the single largest-magnitude atom is
-    /// retained even if below `cutoff`) so every row keeps a valid block.
+    /// retained even if below cutoff) so every row keeps a valid block.
     pub(crate) fn from_dense_weights(
         assignments: &[Array1<f64>],
         k_active_cap: usize,
-        cutoff: f64,
+        relative_cutoff: f64,
         coord_dims: Vec<usize>,
         coord_offsets_full: Vec<usize>,
     ) -> Self {
@@ -96,23 +103,38 @@ impl SaeRowLayout {
         let mut per_row = Vec::with_capacity(assignments.len());
         for a in assignments {
             let k = a.len();
-            // Rank atoms by descending |a_k|; keep those above cutoff, capped.
+            // #1411: select the top-`cap` atoms by |a_k| in O(K) with a PARTIAL
+            // select (`select_nth_unstable_by`), not a full O(K log K) sort. Only
+            // the cap-sized active prefix matters; its internal order is
+            // irrelevant (sorted at the end). The row peak is a separate O(K) max
+            // scan. End-to-end this keeps support proposal O(K) (single pass +
+            // partial select), the contracted per-token cost the high-K plan
+            // claims, instead of sorting all K per row.
+            let row_peak = a.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+            let cutoff = relative_cutoff * row_peak;
             let mut idx: Vec<usize> = (0..k).collect();
-            idx.sort_by(|&i, &j| {
-                a[j].abs()
-                    .partial_cmp(&a[i].abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            // Partition so the `cap` largest-|a| indices occupy `idx[..cap]`
+            // (unordered within); cheaper than a full sort when `cap << k`.
+            if cap < k {
+                idx.select_nth_unstable_by(cap - 1, |&i, &j| {
+                    a[j].abs()
+                        .partial_cmp(&a[i].abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                idx.truncate(cap);
+            }
             let mut active: Vec<usize> = idx
-                .iter()
-                .copied()
-                .take(cap)
+                .into_iter()
                 .filter(|&k_idx| a[k_idx].abs() > cutoff)
                 .collect();
             if active.is_empty() {
                 // Retain the single largest-magnitude atom so the row block is
                 // never empty (a degenerate empty block would zero the row).
-                if let Some(&top) = idx.first() {
+                let top = (0..k).fold(None::<usize>, |best, i| match best {
+                    Some(b) if a[b].abs() >= a[i].abs() => Some(b),
+                    _ => Some(i),
+                });
+                if let Some(top) = top {
                     active.push(top);
                 }
             }

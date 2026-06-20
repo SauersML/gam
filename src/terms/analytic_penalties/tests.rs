@@ -305,6 +305,59 @@ fn ibp_cross_row_woodbury_d_matches_full_off_diagonal_hessian() {
 }
 
 #[test]
+fn ibp_cross_row_woodbury_dd_and_logit_curvature_match_finite_difference() {
+    // #1416: the θ-adjoint differentiates the cross-row Woodbury block
+    //   W_k = d_k·u_k u_kᵀ,  u_k[i] = J_ik,  d_k = w·s'_k(M_k).
+    // Its θ-derivative needs two new exact channels:
+    //   cross_row_dd[k] = ∂d_k/∂M_k = w·s''_k  (since ∂M_k/∂ℓ_mk = J_mk),
+    //   logit_curvature[i*K+k] = ∂J_ik/∂ℓ_ik = c_ik.
+    // Verify both against central differences of the base channels.
+    let pen = IBPAssignmentPenalty::new(3, 5.0, 0.85, false);
+    let t = array![
+        0.3_f64, -0.2, 0.6, 0.5, 0.1, -0.4, -0.1, 0.7, 0.2, 0.4, -0.3, 0.8
+    ];
+    let rho = Array1::<f64>::zeros(0);
+    let k = pen.k_max;
+    let n = t.len() / k;
+    let ch = pen.hessian_diag_logit_third_channels(t.view(), rho.view());
+    let eps = 1.0e-6;
+    let bumped = |idx: usize, s: f64| {
+        let mut tt = t.clone();
+        tt[idx] += s * eps;
+        pen.hessian_diag_logit_third_channels(tt.view(), rho.view())
+    };
+
+    // logit_curvature[i*K+k] = d(z_jac[i*K+k])/dℓ_ik (only the same logit moves it).
+    let mut max_c = 0.0_f64;
+    for i in 0..n {
+        for col in 0..k {
+            let plus = bumped(i * k + col, 1.0);
+            let minus = bumped(i * k + col, -1.0);
+            let fd = (plus.z_jac[i * k + col] - minus.z_jac[i * k + col]) / (2.0 * eps);
+            let err = (ch.logit_curvature[i * k + col] - fd).abs();
+            max_c = max_c.max(err);
+            assert_abs_diff_eq!(ch.logit_curvature[i * k + col], fd, epsilon = 1.0e-5);
+        }
+    }
+    assert!(max_c < 1.0e-5, "logit_curvature FD max err = {max_c:.3e}");
+
+    // cross_row_dd[k]·J_mk = d(cross_row_d[k])/dℓ_mk for any row m in column k.
+    let mut max_dd = 0.0_f64;
+    for col in 0..k {
+        for m in 0..n {
+            let plus = bumped(m * k + col, 1.0);
+            let minus = bumped(m * k + col, -1.0);
+            let fd = (plus.cross_row_d[col] - minus.cross_row_d[col]) / (2.0 * eps);
+            let analytic = ch.cross_row_dd[col] * ch.z_jac[m * k + col];
+            let err = (analytic - fd).abs();
+            max_dd = max_dd.max(err);
+            assert_abs_diff_eq!(analytic, fd, epsilon = 1.0e-5);
+        }
+    }
+    assert!(max_dd < 1.0e-5, "cross_row_dd·J vs FD max err = {max_dd:.3e}");
+}
+
+#[test]
 fn ibp_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
     let pen = IBPAssignmentPenalty::new(3, 6.0, 0.8, true);
     let t = array![

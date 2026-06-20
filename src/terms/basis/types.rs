@@ -1695,6 +1695,10 @@ pub struct CanonicalPenaltyBlock {
     pub eigenvectors: Array2<f64>,
     pub rank: usize,
     pub nullity: usize,
+    /// Number of genuine negative-curvature eigendirections (`ev < -tol`).
+    /// A non-PSD penalty has `negative_dim > 0`; these directions are
+    /// neither range nor null and are never absorbed as unpenalized (#1425).
+    pub negative_dim: usize,
     pub tol: f64,
     pub iszero: bool,
     /// Optional operator-form handle that is bit-equivalent to `sym_penalty`.
@@ -1721,6 +1725,7 @@ impl std::fmt::Debug for CanonicalPenaltyBlock {
             )
             .field("rank", &self.rank)
             .field("nullity", &self.nullity)
+            .field("negative_dim", &self.negative_dim)
             .field("tol", &self.tol)
             .field("iszero", &self.iszero)
             .field("op", &self.op.as_ref().map(|o| o.dim()))
