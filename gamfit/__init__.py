@@ -325,7 +325,7 @@ from .structure_discovery import (
 )
 from .bartlett import lawley_bartlett_factor, lawley_bartlett_factor_estimated_lambda
 from .full_conformal import glm_full_conformal
-from .layer_transport import layer_transport_fit, layer_transport_ladder
+from .layer_transport import fit_transport, layer_transport_fit, layer_transport_ladder
 from .checkpoint_dynamics import sae_checkpoint_dynamics
 from .geometry import (
     CircleManifold,

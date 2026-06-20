@@ -4168,6 +4168,8 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(sae_streaming_plan, module)?)?;
     module.add_function(wrap_pyfunction!(layer_transport_fit, module)?)?;
     module.add_function(wrap_pyfunction!(layer_transport_ladder, module)?)?;
+    module.add_class::<PyFittedTransport>()?;
+    module.add_function(wrap_pyfunction!(fit_transport, module)?)?;
     module.add_function(wrap_pyfunction!(sae_checkpoint_dynamics, module)?)?;
     inference_instruments::register(module)?;
     module.add_function(wrap_pyfunction!(sae_manifold_assignment_summary, module)?)?;

@@ -37,6 +37,26 @@ def test_layer_transport_fit_reaches_python():
     assert report["isometry_defect_se"] >= 0.0
 
 
+def test_fit_transport_object_inverts_and_composes():
+    # The live, invertible transport object (vs the summary dict). Its invert
+    # is what lets a caller form g_B o g_A^-1 from two fitted transports.
+    frm = np.linspace(0.0, 1.0, 64)
+    g_a = gamfit.fit_transport(frm, frm**1.5, "interval", "interval")
+    assert g_a.topology_preserved is True
+    assert g_a.isometry_defect >= 0.0
+    assert set(g_a.report().keys()) >= {"degree", "topology_preserved", "isometry_defect"}
+
+    # eval / invert round-trip.
+    probe = np.array([0.2, 0.5, 0.8])
+    assert np.allclose(g_a.invert(g_a.eval(probe)), probe, atol=1e-6)
+
+    # phi = g_B o g_A^-1 with g_A(t)=t^1.5, g_B(t)=t^0.5 ⇒ phi(y)=y^(1/3).
+    g_b = gamfit.fit_transport(frm, frm**0.5, "interval", "interval")
+    y = np.array([0.3, 0.6])
+    phi = g_b.eval(g_a.invert(y))
+    assert np.allclose(phi, y ** (1.0 / 3.0), atol=2e-3)
+
+
 def test_structure_discovery_gate_and_certificate():
     # split-LR log e-value is just the likelihood gap.
     assert gamfit.split_likelihood_log_e(-8.0, -10.0) == pytest.approx(2.0)
