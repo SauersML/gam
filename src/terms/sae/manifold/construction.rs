@@ -2614,14 +2614,8 @@ impl SaeManifoldTerm {
         // inner solve closer to the stationary point used for the fold.
         // Advisory only (0 or err falls back to cold); telemetry recorded by
         // outer objective callers when present.
-        let warm_n = self
-            .warm_start_latents_from_amortized_encoder(target, rho)
+        self.warm_start_latents_from_amortized_encoder(target, rho)
             .unwrap_or(0);
-        if warm_n > 0 {
-            eprintln!(
-                "SAE-INNER: warm-started {warm_n} rows for reml_criterion (inner_max_iter={inner_max_iter})"
-            );
-        }
         let (reml, loss) = self.reml_criterion_with_refine_policy(
             target,
             rho,
@@ -5750,11 +5744,6 @@ impl SaeManifoldTerm {
                 || quotient_grad_norm <= grad_tolerance
                 || quotient_step_norm <= step_tolerance
             {
-                let scale = self.inner_iterate_scale();
-                eprintln!(
-                    "SAE-INNER-OK: ‖g‖={grad_norm:.6e} (quot_g={quotient_grad_norm:.6e}) ‖qstep‖={quotient_step_norm:.6e} \
-                     iters~{total_inner_iter} scale={scale:.3e}"
-                );
                 return Ok(cache);
             }
             let refine_limit = Self::refine_iteration_limit(
@@ -5766,14 +5755,9 @@ impl SaeManifoldTerm {
                 saw_refine_progress,
             );
             if total_inner_iter >= refine_limit {
-                // Permanent useful diagnostic for inner solve non-convergence in reml_criterion
-                // (especially relevant for co-training / warm-started paths on difficult rho or manifolds).
-                let scale = self.inner_iterate_scale();
-                eprintln!(
-                    "SAE-INNER-FAIL: ‖g‖={grad_norm:.6e} (quot_g={quotient_grad_norm:.6e} tol={grad_tolerance:.6e}) \
-                     ‖qstep‖={quotient_step_norm:.6e} (raw‖Δ‖={step_norm:.6e} tol={step_tolerance:.6e}) \
-                     after {total_inner_iter} iters, iterate_scale={scale:.3e}, refine_ext={refine_progress_extension}"
-                );
+                // Inner solve did not converge in reml_criterion; the returned
+                // Err below carries the full non-convergence diagnostic
+                // (gradient / quotient-step norms and tolerances) to the caller.
                 return Err(format!(
                     "SaeManifoldTerm::reml_criterion: inner solve did not converge at fixed ρ; \
                      neither the KKT gradient ‖g‖={grad_norm:.6e} (tol {grad_tolerance:.6e}) nor \
@@ -5842,9 +5826,6 @@ impl SaeManifoldTerm {
                 if let Ok((_dt, _db, stationary_cache)) =
                     solve_arrow_newton_step_with_options(&stationary_sys, 0.0, 0.0, options)
                 {
-                    eprintln!(
-                        "SAE-INNER-STALL-OK: accepted at numerical fixed point after objective stall, ‖g‖={grad_norm:.6e}"
-                    );
                     return Ok(stationary_cache);
                 }
                 // Stagnated AND the undamped factor still fails: this is the

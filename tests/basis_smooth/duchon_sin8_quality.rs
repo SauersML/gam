@@ -68,9 +68,9 @@ fn fit_and_predict_diagnostics(
     let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
         .expect("rebuild design from frozen spec");
     let pred = test_design.design.apply(&fit.fit.beta).to_vec();
-    QualityDiagnostics::from_standard_fit(label, &fit)
-        .with_truth_rmse(&pred, truth)
-        .emit();
+    let diagnostics =
+        QualityDiagnostics::from_standard_fit(label, &fit).with_truth_rmse(&pred, truth);
+    eprintln!("{}", diagnostics.report());
     pred
 }
 

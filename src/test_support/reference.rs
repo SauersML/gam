@@ -521,9 +521,6 @@ impl QualityDiagnostics {
         }
         self
     }
-    pub fn emit(&self) {
-        eprintln!("{}", self.report());
-    }
     pub fn report(&self) -> String {
         let mut out = format!("[quality-diagnostics] label={}", self.label);
         if let Some(v) = self.rmse_vs_truth {
