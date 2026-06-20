@@ -167,6 +167,22 @@ pub(crate) enum CostStallVerdict {
     /// available), but the iterate is NOT a stationary optimum and must be
     /// reported `converged = false`.
     FlatValleyStall { residual_grad_norm: f64 },
+    /// The objective has stopped improving over the window but the projected
+    /// gradient at the best iterate is FAR above the outer gradient tolerance
+    /// (`> FLAT_VALLEY_STALL_GRAD_CEILING`). A genuine flat-valley floor is, by
+    /// definition, flat: its residual gradient is at most modestly above the
+    /// convergence tolerance. A residual orders of magnitude above tolerance is
+    /// NOT a flat valley — it is a *stuck* stall, the signature of an
+    /// inconsistent objective/gradient pair (the inner PIRLS did not converge at
+    /// this ρ, so the cached cost and the analytic gradient disagree and no
+    /// line-search direction can make cost progress even though the surface is
+    /// steep). Halting here would ship a near-unpenalized overfit (#1426). The
+    /// guard instead resets the no-improvement window so the optimizer keeps
+    /// descending (the inner solve runs to tighter tolerance at the next
+    /// iterate, restoring a trustworthy gradient), for a bounded number of
+    /// escapes before falling back to a `FlatValleyStall` halt so a genuinely
+    /// pathological surface still terminates.
+    StuckKeepDescending { residual_grad_norm: f64 },
 }
 
 /// Number of consecutive accepted outer iterates with negligible relative
@@ -178,6 +194,36 @@ pub(crate) const COST_STALL_WINDOW: usize = 6;
 pub(crate) const ARC_COST_STALL_WINDOW: usize = 3;
 pub(crate) const COST_STALL_REL_TOL_FLOOR: f64 = 1.0e-7;
 pub(crate) const COST_STALL_PROJECTED_GRAD_FLOOR: f64 = 1.0e-3;
+
+/// Absolute ceiling on the best-iterate projected gradient norm for a cost
+/// stall to be classified as a genuine flat-valley FLOOR (#1426). A flat valley
+/// is, by definition, flat: the REML surface has plateaued AND its residual
+/// gradient is at most modestly above the outer convergence tolerance
+/// (`COST_STALL_PROJECTED_GRAD_FLOOR = 1e-3`); the bound-pinned near-separable
+/// cases (#1082/#1237) certify with projected gradients well under O(1). A cost
+/// stall whose projected gradient is far above this ceiling is NOT a flat valley
+/// — it is a *stuck* stall produced by an inconsistent objective/gradient pair
+/// (the inner PIRLS hit its iteration cap at this ρ, so the cached cost and the
+/// analytic gradient disagree and no line-search direction makes cost progress
+/// even though the surface is steep). Halting on such a stall shipped a silent
+/// near-unpenalized full-basis overfit on ~7% of gamma/log datasets at default
+/// k (#1426). At/above this ceiling the guard refuses to halt and keeps the
+/// optimizer descending (see [`CostStallVerdict::StuckKeepDescending`]).
+///
+/// Set well above the legitimate flat-valley residual band (≲ O(1)) so the
+/// near-separable multinomial / RKHS-collapse halts are unaffected, but far
+/// below the #1426 stuck residual (|g| ≈ 11) so the gamma/log overfit is caught.
+pub(crate) const FLAT_VALLEY_STALL_GRAD_CEILING: f64 = 5.0;
+
+/// Maximum number of consecutive [`CostStallVerdict::StuckKeepDescending`]
+/// escapes the guard grants before it falls back to a [`CostStallVerdict::
+/// FlatValleyStall`] halt (#1426). Each escape resets the no-improvement window
+/// and lets the optimizer take more steps (with the inner solve running to
+/// tighter tolerance), giving it room to climb out of a stuck stall toward the
+/// well-penalized optimum. If the surface is genuinely pathological and the
+/// escapes do not restore descent, the guard eventually halts so the outer loop
+/// still terminates (reported non-converged) rather than grinding to `max_iter`.
+pub(crate) const STUCK_STALL_MAX_ESCAPES: usize = 8;
 
 /// Best iterate captured by a cost-stall convergence, handed from the bridge
 /// (which is moved into `opt::Bfgs`) back to the seed-loop runner via the
@@ -234,6 +280,11 @@ pub(crate) struct CostStallGuard {
     /// iterate (#1082/#1237).
     infeasible_streak: usize,
     accepted_iters: usize,
+    /// Number of [`CostStallVerdict::StuckKeepDescending`] escapes already
+    /// granted on this seed (#1426). Capped at [`STUCK_STALL_MAX_ESCAPES`];
+    /// once exhausted the guard halts a far-above-tolerance stall as an ordinary
+    /// flat-valley floor so the loop still terminates.
+    stuck_escapes: usize,
     /// Shared publication slot read by the seed-loop runner after
     /// `optimizer.run()` returns the sentinel error.
     exit: Arc<Mutex<Option<CostStallExit>>>,
@@ -256,6 +307,7 @@ impl CostStallGuard {
             no_improve_streak: 0,
             infeasible_streak: 0,
             accepted_iters: 0,
+            stuck_escapes: 0,
             exit,
         }
     }
@@ -450,6 +502,46 @@ impl CostStallGuard {
         // BFGS convergence path checks. Otherwise it is a flat-valley floor
         // with residual non-stationarity, reported `converged = false`.
         let converged = best_grad_norm.is_finite() && best_grad_norm <= self.grad_threshold;
+        if converged {
+            if let Ok(mut slot) = self.exit.lock() {
+                *slot = Some(CostStallExit {
+                    rho: best_rho,
+                    value: best_value,
+                    grad_norm: best_grad_norm,
+                    iterations: self.accepted_iters,
+                    converged,
+                });
+            }
+            return CostStallVerdict::Converged;
+        }
+        // #1426: distinguish a genuine flat-valley FLOOR (residual modestly
+        // above tolerance — the surface really has flattened) from a *stuck*
+        // stall whose residual gradient is far above tolerance. A residual far
+        // above `FLAT_VALLEY_STALL_GRAD_CEILING` cannot be a flat valley: the
+        // surface is steep, yet no line-search step makes cost progress because
+        // the inner PIRLS did not converge at this ρ and the cached cost and the
+        // analytic gradient are inconsistent. Halting-and-shipping there yields
+        // the near-unpenalized full-basis overfit. Refuse to halt: reset the
+        // no-improvement window so the optimizer keeps descending (the inner
+        // solve runs to tighter tolerance at the next iterate, restoring a
+        // trustworthy gradient and letting it find the well-penalized optimum),
+        // for a bounded number of escapes before falling back to a halt.
+        let far_above_tolerance =
+            best_grad_norm.is_finite() && best_grad_norm > FLAT_VALLEY_STALL_GRAD_CEILING;
+        if far_above_tolerance && self.stuck_escapes < STUCK_STALL_MAX_ESCAPES {
+            self.stuck_escapes = self.stuck_escapes.saturating_add(1);
+            // Reset BOTH no-progress streaks: the optimizer should be allowed a
+            // fresh window of accepted/infeasible steps to climb out of the
+            // stuck state. Do NOT publish a halt — leave the shared exit cell
+            // tracking the running best (`publish_best_so_far` already keeps it
+            // current) so an eventual budget-exhaustion still recovers a sane
+            // iterate.
+            self.no_improve_streak = 0;
+            self.infeasible_streak = 0;
+            return CostStallVerdict::StuckKeepDescending {
+                residual_grad_norm: best_grad_norm,
+            };
+        }
         if let Ok(mut slot) = self.exit.lock() {
             *slot = Some(CostStallExit {
                 rho: best_rho,
@@ -459,12 +551,8 @@ impl CostStallGuard {
                 converged,
             });
         }
-        if converged {
-            CostStallVerdict::Converged
-        } else {
-            CostStallVerdict::FlatValleyStall {
-                residual_grad_norm: best_grad_norm,
-            }
+        CostStallVerdict::FlatValleyStall {
+            residual_grad_norm: best_grad_norm,
         }
     }
 
@@ -702,6 +790,20 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                 if let Some(guard) = self.cost_stall.as_mut() {
                     match guard.observe_infeasible(x) {
                         CostStallVerdict::Continue => {}
+                        CostStallVerdict::StuckKeepDescending { residual_grad_norm } => {
+                            // #1426: best feasible iterate carries a residual far
+                            // above tolerance — not a flat valley. Keep going.
+                            log::warn!(
+                                "[OUTER] cost-stall STUCK (infeasible BFGS probes, NOT a flat \
+                                 valley): residual |g|={:.3e} far above ceiling {:.3e}; refusing \
+                                 to halt-and-ship and continuing (escape {}/{}, value={:.6e}).",
+                                residual_grad_norm,
+                                FLAT_VALLEY_STALL_GRAD_CEILING,
+                                guard.stuck_escapes,
+                                STUCK_STALL_MAX_ESCAPES,
+                                guard.best_value,
+                            );
+                        }
                         CostStallVerdict::Converged => {
                             log::info!(
                                 "[OUTER] cost-stall convergence (infeasible BFGS probes): {} \
@@ -900,6 +1002,34 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
                 projected_gradient_norm(x, &gradient, self.cost_stall_bounds.as_ref());
             match guard.observe(x, eval.cost, projected_g_norm) {
                 CostStallVerdict::Continue => {}
+                CostStallVerdict::StuckKeepDescending { residual_grad_norm } => {
+                    // #1426: cost flatlined but the projected gradient is far
+                    // above tolerance — a stuck stall from an inconsistent
+                    // (non-converged inner solve) objective/gradient, NOT a flat
+                    // valley. Do NOT halt: keep descending so the optimizer can
+                    // climb out toward the well-penalized optimum. UNCAP the
+                    // inner PIRLS so the next solves run to full tolerance — the
+                    // stuck state is caused by the inner cap stopping PIRLS short
+                    // of its fixed point, leaving the cost and the analytic
+                    // gradient inconsistent; an uncapped solve restores a
+                    // trustworthy gradient the outer step can actually use.
+                    if let Some(feedback) = self.outer_inner_cap.as_ref() {
+                        feedback.cap.store(0, Ordering::Relaxed);
+                    }
+                    log::warn!(
+                        "[OUTER] cost-stall STUCK (NOT a flat valley): REML objective improved \
+                         < {:.3e} (relative) over {} accepted outer steps but the projected \
+                         gradient is FAR above tolerance (|g|={:.3e} > ceiling {:.3e}); refusing \
+                         to halt-and-ship and continuing the descent (escape {}/{}, value={:.6e}).",
+                        guard.rel_tol,
+                        guard.window,
+                        residual_grad_norm,
+                        FLAT_VALLEY_STALL_GRAD_CEILING,
+                        guard.stuck_escapes,
+                        STUCK_STALL_MAX_ESCAPES,
+                        guard.best_value,
+                    );
+                }
                 CostStallVerdict::Converged => {
                     log::info!(
                         "[OUTER] cost-stall convergence: REML objective improved < {:.3e} \
@@ -1322,6 +1452,30 @@ impl OuterSecondOrderBridge<'_> {
         };
         match verdict {
             CostStallVerdict::Continue => None,
+            CostStallVerdict::StuckKeepDescending { residual_grad_norm } => {
+                // #1426: cost flatlined but the projected gradient is far above
+                // tolerance — a stuck stall, not a flat valley. Do not halt ARC.
+                // Uncap the inner PIRLS so the next solves run to full tolerance
+                // and the outer gradient becomes trustworthy (see the BFGS-side
+                // arm for the full rationale).
+                if let Some(feedback) = self.outer_inner_cap.as_ref() {
+                    feedback.cap.store(0, Ordering::Relaxed);
+                }
+                log::warn!(
+                    "[OUTER] ARC cost-stall STUCK (NOT a flat valley): REML objective improved \
+                     < {:.3e} (relative) over {} outer steps but the projected gradient is FAR \
+                     above tolerance (|g|={:.3e} > ceiling {:.3e}); refusing to halt-and-ship \
+                     and continuing the descent (escape {}/{}, value={:.6e}).",
+                    guard.rel_tol,
+                    guard.window,
+                    residual_grad_norm,
+                    FLAT_VALLEY_STALL_GRAD_CEILING,
+                    guard.stuck_escapes,
+                    STUCK_STALL_MAX_ESCAPES,
+                    guard.best_value,
+                );
+                None
+            }
             CostStallVerdict::Converged => {
                 log::info!(
                     "[OUTER] ARC cost-stall convergence: REML objective improved < {:.3e} \
@@ -1368,6 +1522,21 @@ impl OuterSecondOrderBridge<'_> {
         let guard = self.cost_stall.as_mut()?;
         match guard.observe_infeasible(x) {
             CostStallVerdict::Continue => None,
+            CostStallVerdict::StuckKeepDescending { residual_grad_norm } => {
+                // #1426: best feasible iterate carries a residual far above
+                // tolerance — not a flat valley. Keep ARC descending.
+                log::warn!(
+                    "[OUTER] ARC cost-stall STUCK (infeasible run, NOT a flat valley): best \
+                     feasible residual |g|={:.3e} far above ceiling {:.3e}; refusing to \
+                     halt-and-ship and continuing (escape {}/{}, value={:.6e}).",
+                    residual_grad_norm,
+                    FLAT_VALLEY_STALL_GRAD_CEILING,
+                    guard.stuck_escapes,
+                    STUCK_STALL_MAX_ESCAPES,
+                    guard.best_value,
+                );
+                None
+            }
             CostStallVerdict::Converged => {
                 log::info!(
                     "[OUTER] ARC cost-stall convergence (infeasible run): {} consecutive \
