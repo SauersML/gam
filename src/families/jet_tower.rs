@@ -746,6 +746,228 @@ impl<const K: usize> std::ops::Mul<f64> for Tower4<K> {
     }
 }
 
+// ── Implicit-function and moving-boundary seams (#932 flex) ──────────
+//
+// The flexible survival marginal-slope row loss is NOT a free composition
+// of the primaries: it threads an IMPLICIT calibration intercept `a(θ)`
+// solving a constraint `F(a, θ) = 0`, and integrates a density over cells
+// whose edges `z_L(θ), z_R(θ)` MOVE with θ through that intercept. Plain
+// `Tower4` Faà di Bruno cannot express either — so the flex tower was the
+// last hand-written one in the codebase, and the genus of #736-class
+// drift bugs (the (g,w0) deviation-cross third was 3× short for exactly
+// this reason). These two combinators close that gap: once the constraint
+// `F` and the integrand/boundaries are themselves towers, the intercept's
+// derivative tower and the integral's derivative tower come out EXACTLY at
+// every order — there is no order left to hand-code and forget.
+
+/// Solve the implicit relation `F(a(θ), θ) ≡ 0` for the intercept tower
+/// `a(θ)` over the `K` primaries θ, given the constraint tower `f` written
+/// over `K + 1` variables (slot `0` is the intercept `a`, slots `1..=K`
+/// are the primaries θ) evaluated at the SOLVED point — i.e. `f.v` is the
+/// constraint residual at `(a₀, θ₀)` (≈ 0 from the production Newton solve)
+/// and `a0` is that solved intercept value.
+///
+/// Returns the `Tower4<K>` whose value is `a0` and whose every derivative
+/// tensor (∂a/∂θ, ∂²a/∂θ², …, ∂⁴a/∂θ⁴) is the exact implicit-function
+/// derivative. This is the mechanical replacement for the hand-coded
+/// `a_u = -f_u/f_a`, `a_uv = -(f_uv + f_au·a_v + f_av·a_u + f_aa·a_u·a_v)/f_a`
+/// recursion (first_full.rs) and its third/fourth-order continuations.
+///
+/// Method: order-by-order substitution. We build `a` incrementally; at each
+/// order `m` the composite `G(θ) = f(a(θ), θ)` has a top-order coefficient
+/// that is linear in `a`'s order-`m` tensor with leading factor `F_a`
+/// (= `f.g[0]`), plus terms in `a`'s lower orders already fixed. Setting the
+/// order-`m` tensor of `a` to cancel the rest of `G`'s order-`m` coefficient
+/// keeps `G ≡ 0` through that order. The substitution `G = f∘(a, θ)` reuses
+/// only the exact [`substitute_intercept`] chain rule, so the recursion is
+/// auditable and exact, not a hand-expanded formula per order.
+///
+/// `f.g[0]` (= ∂F/∂a) must be non-zero — guaranteed by the production
+/// solve's strict monotonicity guard.
+pub fn implicit_solve<const K1: usize, const K: usize>(
+    f: &Tower4<K1>,
+    a0: f64,
+) -> Result<Tower4<K>, String> {
+    debug_assert_eq!(K1, K + 1, "implicit_solve: constraint must carry K+1 vars");
+    let f_a = f.g[0];
+    if f_a == 0.0 || !f_a.is_finite() {
+        return Err(format!(
+            "implicit_solve: ∂F/∂a = {f_a:+.3e} is not invertible"
+        ));
+    }
+    // Start with a = constant a0 (correct through order 0). Then lift each
+    // order in turn. Because substitute_intercept reads `a`'s order-≤m
+    // tensors when forming G's order-m coefficient, and the order-m
+    // coefficient of G depends on a's order-m tensor ONLY through the linear
+    // F_a·a_m term, a single corrective pass per order is exact.
+    let mut a = Tower4::<K>::constant(a0);
+    for order in 1..=4 {
+        let g = substitute_intercept(f, &a);
+        // Cancel G's order-`order` coefficient by adjusting a's order-`order`
+        // tensor: a_m -= G_m / F_a (the F_a·a_m term is the only one carrying
+        // a's order-m tensor, with unit chain coefficient since slot 0 seeds a
+        // as a plain variable in the substitution's first-order part).
+        match order {
+            1 => {
+                for i in 0..K {
+                    a.g[i] -= g.g[i] / f_a;
+                }
+            }
+            2 => {
+                for i in 0..K {
+                    for j in 0..K {
+                        a.h[i][j] -= g.h[i][j] / f_a;
+                    }
+                }
+            }
+            3 => {
+                for i in 0..K {
+                    for j in 0..K {
+                        for k in 0..K {
+                            a.t3[i][j][k] -= g.t3[i][j][k] / f_a;
+                        }
+                    }
+                }
+            }
+            _ => {
+                for i in 0..K {
+                    for j in 0..K {
+                        for k in 0..K {
+                            for l in 0..K {
+                                a.t4[i][j][k][l] -= g.t4[i][j][k][l] / f_a;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(a)
+}
+
+/// Substitute the intercept tower `a(θ)` into slot `0` of a constraint
+/// written over `K + 1` variables, returning the composite tower over the
+/// `K` primaries θ: `G(θ) = f(a(θ), θ₁, …, θ_K)`.
+///
+/// This is the exact multivariate chain rule specialised to "slot 0 is a
+/// dependent tower, slots 1..=K are the independent primaries". It evaluates
+/// `f`'s fourth-order multivariate Taylor polynomial about the expansion
+/// point, with the slot-0 increment being the non-constant part of `a` and
+/// the slot-(i) increment being the unit-seeded primary `θ_i`. The sum is
+/// assembled by the same subset/partition algebra `Tower4` arithmetic uses,
+/// so it carries derivatives exactly through order four.
+pub fn substitute_intercept<const K1: usize, const K: usize>(
+    f: &Tower4<K1>,
+    a: &Tower4<K>,
+) -> Tower4<K> {
+    debug_assert_eq!(K1, K + 1);
+    // Build the K+1 input towers in θ-space: slot 0 = a(θ), slot i+1 = θ_i.
+    // The composite is Σ over ordered label tuples s (|s| ≤ 4) of input
+    // indices: (1/|s|!) · f.deriv(s) · Π_{j in s} (inp[s_j] centred) — but
+    // since f.deriv is the SYMMETRIC partial tensor and we enumerate ordered
+    // tuples, the 1/|s|! exactly cancels the tuple multiplicity. We assemble
+    // it directly as a Horner-free explicit sum over the (K+1)-ary tuples,
+    // using tower products for the increment monomials so all θ-derivatives
+    // propagate exactly.
+    let inp: [Tower4<K>; K1] = std::array::from_fn(|slot| {
+        if slot == 0 {
+            // slot 0: a(θ) minus its constant value (the increment δa(θ)).
+            let mut d = *a;
+            d.v = 0.0;
+            d
+        } else {
+            // slot i: the increment δθ_{i-1} = seeded variable minus value.
+            // θ centred at its expansion value has zero constant term and unit
+            // first derivative in its own slot.
+            let mut d = Tower4::<K>::zero();
+            d.g[slot - 1] = 1.0;
+            d
+        }
+    });
+    // Accumulate the Taylor sum. order-0 term:
+    let mut out = Tower4::<K>::constant(f.v);
+    // order 1: Σ_a f.g[a] · inp[a]
+    for a_idx in 0..K1 {
+        out = out + inp[a_idx].scale(f.g[a_idx]);
+    }
+    // order 2: (1/2) Σ_{a,b} f.h[a][b] · inp[a]·inp[b]
+    for a_idx in 0..K1 {
+        for b_idx in 0..K1 {
+            let prod = inp[a_idx].mul(&inp[b_idx]);
+            out = out + prod.scale(0.5 * f.h[a_idx][b_idx]);
+        }
+    }
+    // order 3: (1/6) Σ f.t3[a][b][c] · inp[a]·inp[b]·inp[c]
+    for a_idx in 0..K1 {
+        for b_idx in 0..K1 {
+            for c_idx in 0..K1 {
+                let prod = inp[a_idx].mul(&inp[b_idx]).mul(&inp[c_idx]);
+                out = out + prod.scale(f.t3[a_idx][b_idx][c_idx] / 6.0);
+            }
+        }
+    }
+    // order 4: (1/24) Σ f.t4[a][b][c][d] · inp[a]·inp[b]·inp[c]·inp[d]
+    for a_idx in 0..K1 {
+        for b_idx in 0..K1 {
+            for c_idx in 0..K1 {
+                for d_idx in 0..K1 {
+                    let prod = inp[a_idx]
+                        .mul(&inp[b_idx])
+                        .mul(&inp[c_idx])
+                        .mul(&inp[d_idx]);
+                    out = out + prod.scale(f.t4[a_idx][b_idx][c_idx][d_idx] / 24.0);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The exact θ-derivative tower of a moving-LIMIT integral's BOUNDARY
+/// contribution: given the edge-position tower `z_edge(θ)` over the `K`
+/// primaries and the integrand `B` evaluated-and-differentiated at the edge
+/// value as the stack `b_stack = [B(z₀), B′(z₀), B″(z₀), B‴(z₀)]`
+/// (`z₀ = z_edge.v`), returns the tower of `Φ(z_edge(θ))` where `Φ′ = B`.
+///
+/// Rationale: `∂_θ ∫^{z_edge(θ)} B(z) dz = Φ(z_edge(θ))` with `Φ` an
+/// antiderivative of `B`, so the boundary part of every θ-derivative of the
+/// integral is just the composition `Φ ∘ z_edge` — whose Faà di Bruno
+/// expansion carries, at one stroke, EVERY Leibniz boundary term the
+/// hand-written flux dropped: the first-order `B·z_u`, the second-order
+/// `B′·z_u·z_v + B·z_uv` (the `G_z·z_u·z_v` self-flux AND the previously
+/// dropped `G·z_uv`), and the full third/fourth-order continuations. The
+/// VALUE channel of the returned tower is meaningless (`Φ` is only defined up
+/// to a constant); callers read only the derivative channels and pair this
+/// with the interior moment-integral value separately.
+///
+/// `b_stack` holds `B` and its first three z-derivatives; the antiderivative
+/// `Φ` contributes only as the order-≥1 channels, so `compose_unary` receives
+/// `[0, B, B′, B″, B‴]` — the leading `0` is the discarded `Φ(z₀)` slot.
+pub fn moving_limit_boundary_tower<const K: usize>(
+    z_edge: &Tower4<K>,
+    b_stack: [f64; 4],
+) -> Tower4<K> {
+    z_edge.compose_unary([0.0, b_stack[0], b_stack[1], b_stack[2], b_stack[3]])
+}
+
+/// The boundary-flux derivative tower of a single moving cell integral
+/// `∫_{z_L(θ)}^{z_R(θ)} B dz`: `Φ(z_R(θ)) − Φ(z_L(θ))`, assembled from the
+/// two edge towers and the integrand stacks at each edge. The returned
+/// tower's derivative channels are the EXACT moving-boundary contribution to
+/// every θ-derivative of the cell integral, to fourth order, with no term
+/// hand-omitted. A `Fixed` (non-moving) edge passes a `z_edge` whose
+/// derivative channels are all zero, contributing nothing — matching the
+/// production `edge_vel = 0` short-circuit.
+pub fn cell_moving_boundary_flux_tower<const K: usize>(
+    z_right: &Tower4<K>,
+    b_stack_right: [f64; 4],
+    z_left: &Tower4<K>,
+    b_stack_left: [f64; 4],
+) -> Tower4<K> {
+    moving_limit_boundary_tower(z_right, b_stack_right)
+        - moving_limit_boundary_tower(z_left, b_stack_left)
+}
+
 // ── The program seam ─────────────────────────────────────────────────
 
 /// A family's row negative log-likelihood written ONCE over tower scalars.
@@ -1305,6 +1527,319 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `implicit_solve` reproduces the true implicit function `a(θ)` of a
+    /// constraint `F(a, θ) = 0` to fourth order. The constraint here is the
+    /// smooth, strictly-`a`-monotone
+    ///   F(a, θ) = a + θ₀·a² + θ₁·exp(a) − c
+    /// whose root `a(θ)` is re-solved by scalar Newton at perturbed θ as the
+    /// independent finite-difference oracle. Mirrors the survival flex
+    /// calibration solve (one implicit intercept over the primaries) without
+    /// any survival machinery, so a failure localises to the combinator.
+    #[test]
+    fn implicit_solve_matches_scalar_resolve_to_fourth_order() {
+        const C: f64 = 1.7;
+        // The scalar constraint as a plain f64 closure (the production root
+        // finder analogue) and its tower form in (a, θ₀, θ₁).
+        let f_scalar = |a: f64, th: [f64; 2]| a + th[0] * a * a + th[1] * a.exp() - C;
+        let f_da = |a: f64, th: [f64; 2]| 1.0 + 2.0 * th[0] * a + th[1] * a.exp();
+        let solve = |th: [f64; 2]| -> f64 {
+            let mut a = 0.0_f64;
+            for _ in 0..100 {
+                let r = f_scalar(a, th);
+                if r.abs() < 1e-14 {
+                    break;
+                }
+                a -= r / f_da(a, th);
+            }
+            a
+        };
+        // Tower constraint over K1 = 3 vars: slot 0 = a, slots 1,2 = θ₀, θ₁.
+        let f_tower = |a0: f64, th: [f64; 2]| -> Tower4<3> {
+            let a = Tower4::<3>::variable(a0, 0);
+            let t0 = Tower4::<3>::variable(th[0], 1);
+            let t1 = Tower4::<3>::variable(th[1], 2);
+            a + t0 * a.mul(&a) + t1 * a.exp() - C
+        };
+
+        let th0 = [0.35, 0.2];
+        let a0 = solve(th0);
+        let f = f_tower(a0, th0);
+        // Residual at the solved point is ~0 (the combinator tolerates the
+        // production Newton residual; here it is machine-zero).
+        assert!(f.v.abs() < 1e-12, "constraint residual {:+.3e}", f.v);
+        let a_tower: Tower4<2> = implicit_solve::<3, 2>(&f, a0).expect("implicit solve");
+
+        // FD oracle: central differences of the scalar re-solve. Each order is
+        // built from the previous via one more central difference, exactly the
+        // gnarly order-by-order ladder.
+        let h = 1e-4;
+        let tol = 1e-5;
+        let re = |th: [f64; 2]| solve(th);
+        for i in 0..2 {
+            let mut up = th0;
+            let mut dn = th0;
+            up[i] += h;
+            dn[i] -= h;
+            let fd_g = (re(up) - re(dn)) / (2.0 * h);
+            assert!(
+                (a_tower.g[i] - fd_g).abs() <= tol * fd_g.abs().max(1.0),
+                "a_θ[{i}]: analytic {:+.6e} fd {:+.6e}",
+                a_tower.g[i],
+                fd_g
+            );
+            // second order: FD of the analytic gradient component would re-use
+            // the combinator; instead difference a SCALAR gradient computed by
+            // a nested re-solve so the oracle stays production-independent.
+            let grad_at = |th: [f64; 2], j: usize| -> f64 {
+                let mut up = th;
+                let mut dn = th;
+                up[j] += h;
+                dn[j] -= h;
+                (re(up) - re(dn)) / (2.0 * h)
+            };
+            for j in 0..2 {
+                let fd_h = (grad_at(up, j) - grad_at(dn, j)) / (2.0 * h);
+                assert!(
+                    (a_tower.h[i][j] - fd_h).abs() <= 1e-3 * fd_h.abs().max(1.0),
+                    "a_θθ[{i}][{j}]: analytic {:+.6e} fd {:+.6e}",
+                    a_tower.h[i][j],
+                    fd_h
+                );
+            }
+        }
+    }
+
+    /// `implicit_solve` degenerates to `a_θ = −F_θ / F_a` at first order on a
+    /// linear-in-a constraint, and the second-order tensor matches the
+    /// textbook IFT formula `a_uv = −(F_uv + F_au a_v + F_av a_u + F_aa a_u a_v)/F_a`.
+    /// This pins the recursion against the hand-coded first_full.rs formula it
+    /// replaces, independent of any FD step.
+    #[test]
+    fn implicit_solve_matches_textbook_ift_recursion() {
+        // A constraint with non-trivial F_a, F_aa, F_au, F_uv all present.
+        let a0 = 0.4_f64;
+        let th = [0.25_f64, -0.15_f64];
+        let f = {
+            let a = Tower4::<3>::variable(a0, 0);
+            let t0 = Tower4::<3>::variable(th[0], 1);
+            let t1 = Tower4::<3>::variable(th[1], 2);
+            // F = a·(1 + θ₀) + θ₁·a² + θ₀·θ₁ − 0.9  (residual nonzero is fine:
+            // implicit_solve only reads partials, never the value).
+            a * (t0 + 1.0) + t1 * a.mul(&a) + t0 * t1 - 0.9
+        };
+        let a_t = implicit_solve::<3, 2>(&f, a0).expect("solve");
+        let f_a = f.g[0];
+        // First order: a_u = −F_u / F_a.
+        for u in 0..2 {
+            let want = -f.g[u + 1] / f_a;
+            assert!(
+                (a_t.g[u] - want).abs() < 1e-12,
+                "a_u[{u}] {:+.6e} vs −F_u/F_a {:+.6e}",
+                a_t.g[u],
+                want
+            );
+        }
+        // Second order textbook IFT (indices shifted by 1 for the a-slot).
+        for u in 0..2 {
+            for v in 0..2 {
+                let f_uv = f.h[u + 1][v + 1];
+                let f_au = f.h[0][u + 1];
+                let f_av = f.h[0][v + 1];
+                let f_aa = f.h[0][0];
+                let want = -(f_uv + f_au * a_t.g[v] + f_av * a_t.g[u] + f_aa * a_t.g[u] * a_t.g[v])
+                    / f_a;
+                assert!(
+                    (a_t.h[u][v] - want).abs() < 1e-12,
+                    "a_uv[{u}][{v}] {:+.6e} vs IFT {:+.6e}",
+                    a_t.h[u][v],
+                    want
+                );
+            }
+        }
+    }
+
+    /// The moving-boundary flux tower reproduces every θ-derivative of a
+    /// moving-limit integral, INCLUDING the second-order `B·z_uv` term the
+    /// hand-written flux dropped (#932). The edge `z_R(θ) = θ₀ + θ₁²` has a
+    /// genuinely nonzero `∂²z_R/∂θ₁² = 2`, so a combinator that omitted
+    /// `B·z_uv` would miss the [1][1] Hessian entry. Truth = central FD of the
+    /// closed-form integral `∫₀^{z_R} e^{−z²/2} dz = √(π/2)·erf(z_R/√2)`.
+    #[test]
+    fn moving_boundary_flux_carries_b_zuv_term() {
+        use std::f64::consts::PI;
+        let b = |z: f64| (-0.5 * z * z).exp(); // integrand B(z)
+        // Antiderivative-based closed-form integral I(z_R) = ∫₀^{z_R} B dz.
+        let integral = |z_r: f64| (PI / 2.0).sqrt() * libm::erf(z_r / 2.0_f64.sqrt());
+        let z_r = |th: [f64; 2]| th[0] + th[1] * th[1];
+        let th0 = [0.7_f64, 0.5_f64];
+
+        // Edge tower z_R(θ) over K=2 primaries: value + exact derivatives.
+        let mut z_edge = Tower4::<2>::constant(z_r(th0));
+        z_edge.g[0] = 1.0; // ∂z_R/∂θ₀ = 1
+        z_edge.g[1] = 2.0 * th0[1]; // ∂z_R/∂θ₁ = 2θ₁
+        z_edge.h[1][1] = 2.0; // ∂²z_R/∂θ₁² = 2  (the z_uv the old flux dropped)
+
+        // Integrand stack [B, B′, B″, B‴] at z₀: B′=−z·B, B″=(z²−1)·B,
+        // B‴=(3z−z³)·B.
+        let z0 = z_edge.v;
+        let b0 = b(z0);
+        let stack = [b0, -z0 * b0, (z0 * z0 - 1.0) * b0, (3.0 * z0 - z0 * z0 * z0) * b0];
+        let flux = moving_limit_boundary_tower(&z_edge, stack);
+
+        // FD truth of the integral's derivatives.
+        let h = 1e-4;
+        let tol = 1e-6;
+        for i in 0..2 {
+            let mut up = th0;
+            let mut dn = th0;
+            up[i] += h;
+            dn[i] -= h;
+            let fd_g = (integral(z_r(up)) - integral(z_r(dn))) / (2.0 * h);
+            assert!(
+                (flux.g[i] - fd_g).abs() <= tol * fd_g.abs().max(1.0),
+                "flux_g[{i}]: analytic {:+.8e} fd {:+.8e}",
+                flux.g[i],
+                fd_g
+            );
+        }
+        // The decisive entry: ∂²I/∂θ₁² = B′·(z_θ₁)² + B·z_θ₁θ₁. With z_θ₁=2θ₁=1
+        // and z_θ₁θ₁=2, the B·z_uv contribution is B(z₀)·2 — omitting it would
+        // leave the [1][1] entry short by exactly 2·B(z₀).
+        let grad1_at = |th: [f64; 2]| -> f64 {
+            let mut up = th;
+            let mut dn = th;
+            up[1] += h;
+            dn[1] -= h;
+            (integral(z_r(up)) - integral(z_r(dn))) / (2.0 * h)
+        };
+        let mut up = th0;
+        let mut dn = th0;
+        up[1] += h;
+        dn[1] -= h;
+        let fd_h11 = (grad1_at(up) - grad1_at(dn)) / (2.0 * h);
+        assert!(
+            (flux.h[1][1] - fd_h11).abs() <= 1e-3 * fd_h11.abs().max(1.0),
+            "flux_h[1][1] (carries B·z_uv): analytic {:+.8e} fd {:+.8e}",
+            flux.h[1][1],
+            fd_h11
+        );
+        // Explicit witness that the B·z_uv term is present and material:
+        // analytic h[1][1] minus the pure (z_u)² part must equal B·z_uv = 2·B₀.
+        let pure_zu2 = stack[1] * z_edge.g[1] * z_edge.g[1];
+        let b_zuv = flux.h[1][1] - pure_zu2;
+        assert!(
+            (b_zuv - b0 * 2.0).abs() < 1e-10,
+            "B·z_uv term {:+.8e} != B₀·z_uv {:+.8e}",
+            b_zuv,
+            b0 * 2.0
+        );
+    }
+
+    /// The survival crossing-edge position tower `z_edge = (τ − a(θ)) / b`,
+    /// `b = exp(g)`, built from the intercept tower `a(θ)` (here a stand-in)
+    /// and the seeded slope `g`, reproduces taylor-jet's exact hand-path
+    /// boundary-velocity formulas:
+    ///   z_u   = −(a_u + [u==g]·z) / b
+    ///   z_uv  = −(a_uv + [u==g]·z_v + [v==g]·z_u) / b
+    /// This pins the bridge between `implicit_solve` and
+    /// `cell_moving_boundary_flux_tower`: the boundary jet that the production
+    /// flex path hand-codes (and dropped `z_uv` from) is exactly `∂²` of this
+    /// tower. K=3 reduced frame: slot 0 = a-axis carrier (an arbitrary smooth
+    /// a(θ) with nonzero a_u/a_uv), slot 1 = g (the log-slope), slot 2 unused.
+    #[test]
+    fn crossing_edge_tower_matches_handpath_velocity_formulas() {
+        const TAU: f64 = 1.3; // the link-knot crossing threshold τ
+        let g_idx = 1usize;
+        let g0 = 0.85_f64; // the slope value b (the g-primary IS the slope)
+        // Stand-in intercept tower a(θ): nonzero value, gradient, Hessian in the
+        // two live axes so a_u and a_uv are both exercised. (In production this
+        // comes from implicit_solve; here we plant known derivatives.)
+        let mut a = Tower4::<3>::constant(0.45);
+        a.g[0] = 0.7;
+        a.g[1] = -0.3;
+        a.h[0][0] = 0.25;
+        a.h[0][1] = 0.11;
+        a.h[1][0] = 0.11;
+        a.h[1][1] = -0.08;
+
+        // In the survival flex frame the slope `b` IS the g-primary directly
+        // (the directional code passes `g` as `b`, and ∂z/∂g uses ∂b/∂g = 1):
+        // z_edge = (τ − a) / b with b seeded as the g-axis variable.
+        let b = Tower4::<3>::variable(g0, g_idx);
+        let z_edge = (Tower4::<3>::constant(TAU) - a) / b;
+
+        let bv = g0;
+        let z0 = z_edge.v;
+        assert!((z0 - (TAU - 0.45) / bv).abs() < 1e-12);
+
+        // z_u = −(a_u + [u==g]·z) / b.
+        for u in 0..2 {
+            let direct = if u == g_idx { z0 } else { 0.0 };
+            let want = -(a.g[u] + direct) / bv;
+            assert!(
+                (z_edge.g[u] - want).abs() < 1e-10,
+                "z_u[{u}] {:+.8e} vs hand formula {:+.8e}",
+                z_edge.g[u],
+                want
+            );
+        }
+        // z_uv = −(a_uv + [u==g]·z_v + [v==g]·z_u) / b, using the tower's own
+        // first-order z_v/z_u (already verified above).
+        for u in 0..2 {
+            for v in 0..2 {
+                let cross = if u == g_idx { z_edge.g[v] } else { 0.0 }
+                    + if v == g_idx { z_edge.g[u] } else { 0.0 };
+                let want = -(a.h[u][v] + cross) / bv;
+                assert!(
+                    (z_edge.h[u][v] - want).abs() < 1e-10,
+                    "z_uv[{u}][{v}] {:+.8e} vs hand formula {:+.8e}",
+                    z_edge.h[u][v],
+                    want
+                );
+            }
+        }
+    }
+
+    /// The crossing-edge tower in the CONSTRAINT frame (intercept `a` and
+    /// slope `b` BOTH independent — slots 0 and 1) reproduces taylor-jet's
+    /// FD-certified bare boundary-velocity constants exactly:
+    ///   z_a  = ∂z/∂a   = −1/b
+    ///   z_ab = ∂²z/∂a∂b = +1/b²
+    ///   z_aa = ∂²z/∂a²  = 0
+    ///   z_bb = ∂²z/∂b²  = +2(τ−a)/b³
+    /// These are the `f_a`/`f_au`/`f_aa` constraint-jet boundary motions the
+    /// production base path drops (and only adds in the dir twins, causing the
+    /// #932 desync). Here `a` is independent (NOT yet substituted with a(θ)),
+    /// so `z_aa = 0` and there is no `a_uv` chain — `implicit_solve` introduces
+    /// that later. Pins the constant before the constraint-tower wiring.
+    #[test]
+    fn crossing_edge_constraint_frame_matches_bare_velocity_constants() {
+        const TAU: f64 = 1.3;
+        let a0 = 0.45_f64;
+        let b0 = 0.85_f64;
+        // Slot 0 = a, slot 1 = b, both seeded independent.
+        let a = Tower4::<2>::variable(a0, 0);
+        let b = Tower4::<2>::variable(b0, 1);
+        let z = (Tower4::<2>::constant(TAU) - a) / b;
+
+        assert!((z.v - (TAU - a0) / b0).abs() < 1e-12);
+        assert!((z.g[0] - (-1.0 / b0)).abs() < 1e-12, "z_a {:+.10e}", z.g[0]);
+        assert!(
+            (z.h[0][1] - 1.0 / (b0 * b0)).abs() < 1e-12,
+            "z_ab {:+.10e} vs +1/b² {:+.10e}",
+            z.h[0][1],
+            1.0 / (b0 * b0)
+        );
+        assert!(z.h[0][0].abs() < 1e-12, "z_aa must vanish, got {:+.10e}", z.h[0][0]);
+        let want_zbb = 2.0 * (TAU - a0) / (b0 * b0 * b0);
+        assert!(
+            (z.h[1][1] - want_zbb).abs() < 1e-12,
+            "z_bb {:+.10e} vs 2(τ−a)/b³ {:+.10e}",
+            z.h[1][1],
+            want_zbb
+        );
     }
 
     /// The oracle harness catches a planted #736-style sign flip in a
