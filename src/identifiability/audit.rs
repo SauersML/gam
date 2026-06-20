@@ -90,23 +90,11 @@ use ndarray::{Array1, Array2};
 
 use crate::families::custom_family::{FamilyLinearizationState, ParameterBlockSpec};
 use crate::linalg::faer_ndarray::{
-    FaerEigh, RrqrWithPermutation, default_rrqr_rank_alpha, fast_atb,
-    rrqr_from_gram_with_permutation, rrqr_with_permutation,
+    FaerEigh, default_rrqr_rank_alpha, fast_atb, rrqr_with_permutation,
 };
 use crate::solver::estimate::EstimationError;
 
 const DEFAULT_GAUGE_PRIORITY: u8 = 100;
-
-/// Minimum `verdict_margin` (ratio between the closest kept/dropped pivot and the
-/// rank tolerance) at which the Gram-squared joint RRQR is trusted to reproduce
-/// the tall-design rank verdict bit-for-bit. Forming `G = XᵀX` squares the
-/// condition number, so a rank decision sitting right at the tolerance cliff
-/// could in principle flip; when the margin is below this bound the joint RRQR
-/// re-confirms on the full (un-squared) `n × p` design. At biobank scale the
-/// common full-rank-full-width case has a margin many orders of magnitude above
-/// this floor, so the n-row stream is skipped. 1e3 leaves ~3 decimal digits of
-/// head-room before the squared-condition error could move a pivot across `tol`.
-const JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN: f64 = 1.0e3;
 
 /// Lower bound on the cosine that may be reported as an `AliasedPair` when the
 /// per-pair null cosine distribution has little width (σ → 0, i.e. both columns
@@ -379,6 +367,157 @@ pub fn bias_shift_for_pair(z_a: Option<&[f64]>, z_b: Option<&[f64]>, s2_a: f64, 
     let shift = -(mu3 / 2.0) * s2_dominant;
     // Clamp to ±0.5 to keep the band inside [−1, 1].
     shift.clamp(-0.5, 0.5)
+}
+
+/// Result of a gauge-priority-respecting rank-revealing factorization of a
+/// joint design's Gram. Mirrors the shape of [`RrqrWithPermutation`] so it
+/// drops straight into the existing attribution path: `column_permutation`
+/// lists every original joint-column index, ACCEPTED (kept) columns first in
+/// the order they were pivoted, then DEMOTED columns; `rank` is the count of
+/// accepted columns; `rank_tol` is the absolute pivot tolerance.
+struct PriorityTieredRank {
+    rank: usize,
+    column_permutation: Vec<usize>,
+    rank_tol: f64,
+}
+
+/// Rank-revealing factorization of a joint design's Gram `G = JᵀJ (+ SᵀS)` that
+/// honors `gauge_priority`: a higher-priority block's column is NEVER demoted in
+/// favor of a collinear lower-priority block's column.
+///
+/// # Why a bespoke factorization
+///
+/// faer's `col_piv_qr` (used by both `rrqr_with_permutation` and
+/// `rrqr_from_gram_with_permutation`) pivots purely by RESIDUAL NORM: at each
+/// step it selects the not-yet-pivoted column with the largest residual,
+/// regardless of any caller-supplied column order. Pre-permuting the columns
+/// into descending-priority order therefore does NOT make priority govern the
+/// kept/dropped decision — col-piv QR immediately re-sorts by norm, so a
+/// higher-priority block whose columns carry a SMALLER norm than a collinear
+/// lower-priority block is the one demoted (gam: the dynamic-wiggle block,
+/// priority 100, lost all 6 columns to a priority-80 spatial block). The
+/// gauge-priority contract — "the lower-priority block absorbs the alias drop" —
+/// is unrepresentable through a single norm-pivoted QR.
+///
+/// # The factorization
+///
+/// Pivoted Cholesky on the Gram, constrained to descending priority TIERS. The
+/// rank/pivot sequence of col-piv QR depends only on the column inner products
+/// (the Gram), so a pivoted Cholesky on `G` reproduces the same per-pivot
+/// residual magnitudes — but here we restrict each pivot choice to the highest
+/// remaining priority tier, so all acceptable higher-priority columns are
+/// committed to the kept basis BEFORE any lower-priority column is considered.
+/// A lower-priority column is then accepted only if it still has residual norm
+/// above tolerance AFTER projecting out every kept higher-or-equal-priority
+/// column — i.e. it carries a genuinely new direction — and demoted otherwise.
+/// Within one tier the choice is the standard largest-residual greedy pivot, so
+/// numerical robustness inside a block matches col-piv QR.
+///
+/// `d[j]` tracks the current squared residual norm of column `j` (Schur
+/// complement diagonal); `g[i][j]` is the running Schur-complemented Gram. The
+/// tolerance matches the tall/`gram` RRQR paths exactly:
+/// `rank_alpha · ε · max(m_rows, p) · max(√d_max⁰, 1)` where `√d_max⁰` is the
+/// largest initial residual norm (= leading pivot magnitude `|R[0,0]|`).
+fn priority_tiered_rank_from_gram(
+    gram: &Array2<f64>,
+    col_priority: &[u8],
+    m_rows: usize,
+    rank_alpha: f64,
+) -> PriorityTieredRank {
+    let p = gram.ncols();
+    if p == 0 {
+        return PriorityTieredRank {
+            rank: 0,
+            column_permutation: Vec::new(),
+            rank_tol: 0.0,
+        };
+    }
+    // Working Schur-complement copy of the Gram and its diagonal residuals.
+    let mut g = gram.clone();
+    let mut d: Vec<f64> = (0..p).map(|j| g[[j, j]].max(0.0)).collect();
+    // Leading pivot magnitude = largest initial column norm = max √diagonal.
+    let leading_diag = d.iter().cloned().fold(0.0_f64, f64::max).sqrt();
+    let tol = rank_alpha * f64::EPSILON * (m_rows.max(p).max(1) as f64) * leading_diag.max(1.0);
+    let tol_sq = tol * tol;
+
+    // Distinct priority tiers in DESCENDING order (highest first). A column is
+    // only eligible to pivot once every higher tier is exhausted.
+    let mut tiers: Vec<u8> = col_priority.to_vec();
+    tiers.sort_unstable_by(|a, b| b.cmp(a));
+    tiers.dedup();
+
+    let mut accepted: Vec<usize> = Vec::with_capacity(p);
+    let mut demoted: Vec<usize> = Vec::new();
+    let mut decided = vec![false; p];
+
+    for &tier in &tiers {
+        loop {
+            // Largest-residual undecided column WITHIN this tier.
+            let mut pivot: Option<usize> = None;
+            let mut best = tol_sq;
+            for j in 0..p {
+                if decided[j] || col_priority[j] != tier {
+                    continue;
+                }
+                if d[j] > best {
+                    best = d[j];
+                    pivot = Some(j);
+                }
+            }
+            let Some(k) = pivot else { break };
+            // Accept column k and eliminate it (one pivoted-Cholesky step):
+            // Schur-complement the remaining columns against k.
+            decided[k] = true;
+            accepted.push(k);
+            let pivot_val = d[k];
+            if pivot_val <= 0.0 {
+                continue;
+            }
+            // Row k of the current Schur Gram gives the coupling g[k][j].
+            // Update g[i][j] -= g[i][k]*g[k][j]/pivot_val for undecided i,j,
+            // and refresh residual diagonals d[j].
+            let col_k: Vec<f64> = (0..p).map(|i| g[[i, k]]).collect();
+            for i in 0..p {
+                if decided[i] {
+                    continue;
+                }
+                let gik = col_k[i];
+                if gik == 0.0 {
+                    continue;
+                }
+                let factor = gik / pivot_val;
+                for j in 0..p {
+                    if decided[j] {
+                        continue;
+                    }
+                    g[[i, j]] -= factor * col_k[j];
+                }
+            }
+            for j in 0..p {
+                if !decided[j] {
+                    d[j] = g[[j, j]].max(0.0);
+                }
+            }
+        }
+        // Every remaining undecided column in this tier has residual ≤ tol:
+        // it lies in the span of the already-accepted (higher-or-equal-priority)
+        // columns, so it is demoted here — never displacing a higher-priority one.
+        for j in 0..p {
+            if !decided[j] && col_priority[j] == tier {
+                decided[j] = true;
+                demoted.push(j);
+            }
+        }
+    }
+
+    let rank = accepted.len();
+    let mut column_permutation = accepted;
+    column_permutation.extend(demoted);
+    PriorityTieredRank {
+        rank,
+        column_permutation,
+        rank_tol: tol,
+    }
 }
 
 /// Per-pair null cosine concentration scale.
@@ -916,43 +1055,16 @@ fn audit_identifiability_impl(
                 .map_or(0, |_| col_offsets[idx + 1] - col_offsets[idx])
         })
         .sum();
-    // The tall penalty-augmented design `[X_joint; S_blockdiag]` is only needed
-    // for the bit-exact tall-RRQR FALLBACK (near-tolerance-cliff verdicts). The
-    // primary Gram path never materialises it — at biobank scale that avoids
-    // building a second n×p matrix on the hot path — so it is wrapped in a
-    // closure and built on demand. (`block_structural_penalty_dense` returns a
-    // p_block-square `S`, stacked as its own rows.)
-    let build_x_joint_rank_input = || -> Array2<f64> {
-        if n_penalty_rows == 0 {
-            x_joint.clone()
-        } else {
-            let mut aug = Array2::<f64>::zeros((r_joint + n_penalty_rows, p_total));
-            aug.slice_mut(ndarray::s![..r_joint, ..]).assign(&x_joint);
-            let mut row = r_joint;
-            for (idx, s_opt) in block_penalties.iter().enumerate() {
-                let start = col_offsets[idx];
-                let end = col_offsets[idx + 1];
-                if let Some(s) = s_opt {
-                    let h = end - start;
-                    aug.slice_mut(ndarray::s![row..row + h, start..end])
-                        .assign(s);
-                    row += h;
-                }
-            }
-            aug
-        }
-    };
-
-    // Gram of the penalty-augmented joint design, `Gₐ = x_joint_rank_inputᵀ ·
-    // x_joint_rank_input`. Because the penalty rows are stacked block-diagonally
-    // beneath `x_joint`, this equals `Xᵀ·X + Σ_block Sᵀ·S` placed into the owning
-    // block's diagonal sub-square: no second n-row stream is needed — we add the
-    // tiny per-block `SᵀS` (p_block × p_block) onto the already-computed
-    // `joint_gram`. `rrqr_from_gram_with_permutation` runs col-piv QR on a square
-    // root of this Gram, reproducing the EXACT pivot order and per-pivot |R[i,i]|
-    // (and hence the rank cut) of col-piv QR on the tall `x_joint_rank_input`,
-    // since both depend only on the column inner products. The `m_rows` it needs
-    // for the tolerance scaling is the tall row count `n + n_penalty_rows`.
+    // Gram of the penalty-augmented joint design, `Gₐ = [X_joint; S_blockdiag]ᵀ ·
+    // [X_joint; S_blockdiag]`. Because the penalty rows are stacked block-
+    // diagonally beneath `x_joint`, this equals `Xᵀ·X + Σ_block Sᵀ·S` placed into
+    // the owning block's diagonal sub-square: no second n-row stream is needed —
+    // we add the tiny per-block `SᵀS` (p_block × p_block) onto the already-
+    // computed `joint_gram`. `priority_tiered_rank_from_gram` runs a priority-
+    // tiered pivoted Cholesky on this Gram; its rank cut equals col-piv QR on the
+    // tall `[X_joint; S_blockdiag]` (both depend only on the column inner
+    // products). The `m_rows` it needs for the tolerance scaling is the tall row
+    // count `r_joint + n_penalty_rows`.
     let joint_gram_aug: Array2<f64> = if n_penalty_rows == 0 {
         joint_gram.clone()
     } else {
@@ -973,247 +1085,70 @@ fn audit_identifiability_impl(
     };
     let joint_rank_m_rows = r_joint + n_penalty_rows;
 
-    // Per-joint-column gauge priority, inherited from the owning block.
-    // RRQR uses greedy column pivoting: at each step it picks the
-    // remaining column with the largest residual norm. When two
-    // columns carry the same direction (alias) the residual norms are
-    // identical after the earlier of the two enters the kept set, so
-    // RRQR's choice of "which one to keep" is determined by the order
-    // it scans columns. We exploit that by presenting columns in
-    // descending-priority order: high-priority columns are scanned
-    // first and enter the kept set first, so when an alias collapses
-    // it is the lower-priority block's column that gets demoted into
-    // the trailing rank-deficient space.
-    //
-    // For survival marginal-slope this realises the gauge-ownership
-    // contract: a shared affine direction between time_surface (high
-    // priority) and marginal_surface (lower) is dropped from
-    // marginal_surface, not from time_surface; a shared deviation
-    // direction between marginal_surface and score_warp_dev (lowest)
-    // is dropped from score_warp_dev. With all priorities equal (the
-    // default = 100) `priority_perm` is the identity (stable sort
-    // preserves spec order), so legacy callers see no behaviour
-    // change.
-    //
-    // LOAD-BEARING: this reorder is NOT dead code even though every
-    // built-in family happens to assemble specs in descending priority
-    // order.  Three active use cases require the non-identity path:
-    //
-    //   1. Custom families via the Python API — Python callers build
-    //      `ParameterBlockSpec` lists and pass them to
-    //      `audit_identifiability` without any pre-sort guarantee.
-    //      Priority ownership (which block loses the shared direction)
-    //      must be honoured regardless of the list order.
-    //
-    //   2. `bms/install_flex.rs` drives RRQR through this function
-    //      for the cross-block identifiability check during BMS flex
-    //      installation.  The anchor blocks (priority=200) are pushed
-    //      before the candidate (priority=100), which is descending,
-    //      but callers that add flex blocks interleaved with anchors
-    //      could arrive in non-descending order.
-    //
-    //   3. The `audit_priority_perm_invariance` integration tests
-    //      explicitly pass scrambled spec lists (e.g. [low=80,
-    //      high=200, mid=150]) to verify the rank verdict and drop
-    //      attribution are invariant under spec-list permutation.
-    //      Those tests would fail if this branch were removed, because
-    //      RRQR on natural column order of [low, high, mid] would
-    //      offer the alias to "low" first — which is the WRONG block.
-    //
-    // The identity fast-path (`priority_perm_is_identity`) is kept so
-    // that the common case (all specs already in descending order)
-    // avoids an O(p_total) copy of `x_joint`.
-    let mut priority_perm: Vec<usize> = (0..p_total).collect();
+    // The gauge-ownership contract is realised by `priority_tiered_rank_from_gram`
+    // below, which pivots strictly within descending gauge_priority tiers (NOT by
+    // a column reorder fed to a norm-pivoted QR, which would ignore it). This is
+    // invariant to spec-list order — Python custom families, `bms/install_flex.rs`,
+    // and the `audit_priority_perm_invariance` tests all pass scrambled spec lists
+    // and must see the SAME verdict and drop attribution. For survival
+    // marginal-slope it drops the shared affine direction from marginal_surface
+    // (not the higher-priority time_surface) and the shared deviation direction
+    // from score_warp_dev (the lowest priority); with all priorities equal the
+    // factorization degenerates to a single ordinary pivoted-Cholesky tier, so
+    // legacy equal-priority callers are unaffected.
     let col_block_idx: Vec<usize> = (0..specs.len())
         .flat_map(|i| std::iter::repeat(i).take(col_offsets[i + 1] - col_offsets[i]))
         .collect();
-    priority_perm.sort_by(|&a, &b| {
-        let pa = specs[col_block_idx[a]].gauge_priority;
-        let pb = specs[col_block_idx[b]].gauge_priority;
-        pb.cmp(&pa).then_with(|| a.cmp(&b))
-    });
-    let priority_perm_is_identity = priority_perm
+    // Per-joint-column gauge priority, inherited from the owning block.
+    let col_priority: Vec<u8> = col_block_idx
         .iter()
-        .enumerate()
-        .all(|(new_j, &old_j)| new_j == old_j);
+        .map(|&bi| specs[bi].gauge_priority)
+        .collect();
 
-    // Column-pivoted RRQR on the joint design. The pivot permutation
-    // names which original columns were demoted past the rank
-    // threshold, so we can attribute each dropped column back to its
-    // (block, local_col) origin deterministically. `rrqr_with_permutation`
-    // uses the same `RRQR_RANK_ALPHA · ε · max(m,n) · leading`
-    // tolerance as the per-block diagonal counter above, so the joint
-    // verdict and the per-block diagnostics are tolerance-consistent.
-    let rrqr_started = std::time::Instant::now();
-    if priority_perm_is_identity {
-        log::info!(
-            "[STAGE] identifiability audit: joint RRQR start n={} p_total={} priority_reorder=false",
-            n,
-            p_total,
-        );
-    } else {
-        // The priority permutation actually changes column order — log which
-        // blocks are being reordered so production runs can confirm the
-        // canonical-gauge path is exercised.  This surfaces in logs even
-        // at INFO level so it's always visible without debug builds.
-        let block_priority_summary: Vec<String> = specs
-            .iter()
-            .map(|s| format!("{}={}", s.name, s.gauge_priority))
-            .collect();
-        log::info!(
-            "[STAGE] identifiability audit: joint RRQR start n={} p_total={} \
-             priority_reorder=true blocks=[{}]",
-            n,
-            p_total,
-            block_priority_summary.join(", "),
-        );
-    }
-    // RRQR runs on the penalty-augmented joint: the rank and the demoted-column
-    // attribution reflect `ker(J) ∩ ker(S)`, not raw `ker(J)`.
+    // GAUGE-PRIORITY-RESPECTING rank-revealing factorization of the
+    // penalty-augmented joint Gram. The rank and the demoted-column attribution
+    // reflect `ker(J) ∩ ker(S)`, not raw `ker(J)`, because the Gram is
+    // `JᵀJ + SᵀS`.
     //
-    // PRIMARY PATH — Gram-squared col-piv QR (`rrqr_from_gram_with_permutation`).
-    // Col-piv QR's pivot order, per-pivot |R[i,i]| magnitudes, and rank cut depend
-    // ONLY on the column inner products, i.e. on the Gram `Gₐ = x_joint_rank_inputᵀ
-    // · x_joint_rank_input` (= `joint_gram_aug`, already assembled with NO second
-    // n-row stream). Running col-piv QR on a `p × p` square root of `Gₐ` therefore
-    // reproduces the tall path's rank/permutation exactly in exact arithmetic, in
-    // O(p³) instead of O(n·p²). The priority reorder becomes a symmetric
-    // permutation of `Gₐ` (both rows and columns), which is the Gram of the
-    // column-permuted design — bit-equivalent to permuting the tall columns.
-    //
-    // FALLBACK — squaring the design squares the condition number, so a rank
-    // decision sitting at the tolerance cliff could flip. `verdict_margin` reports
-    // how far the closest kept/dropped pivot sits from `tol`; when it is below
-    // `JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN` we re-run the exact tall RRQR on the
-    // un-squared `n × p` design so the verdict stays bit-exact. The biobank
-    // full-rank-full-width common case has a margin many orders of magnitude above
-    // the floor, so the n-row stream is skipped entirely.
+    // A plain column-pivoted QR (faer `col_piv_qr`, used by both
+    // `rrqr_with_permutation` and `rrqr_from_gram_with_permutation`) pivots by
+    // RESIDUAL NORM and ignores any caller-supplied column order, so merely
+    // pre-sorting columns into descending-priority order does NOT make priority
+    // govern which block keeps a shared direction — col-piv QR re-sorts by norm
+    // and a higher-priority block whose columns carry a smaller norm than a
+    // collinear lower-priority block is the one demoted (gam: the dynamic-wiggle
+    // block at priority 100 lost all 6 of its columns to a priority-80 spatial
+    // block, surfacing as "dynamic wiggle design col mismatch: got 6, expected
+    // 0"). `priority_tiered_rank_from_gram` instead pivots strictly within
+    // descending priority TIERS, committing every acceptable higher-priority
+    // column to the kept basis before any lower-priority column is considered, so
+    // the lower-priority block always absorbs the alias drop — the canonical-
+    // gauge contract this audit is built on. It returns the demoted columns in
+    // ORIGINAL joint-column indices, so no priority<->original remap is needed.
     let alpha = default_rrqr_rank_alpha();
-    let gram_for_rrqr: Array2<f64> = if priority_perm_is_identity {
-        joint_gram_aug.clone()
-    } else {
-        // Symmetric permutation: Gₚ[new_a, new_b] = Gₐ[perm[new_a], perm[new_b]].
-        let mut gp = Array2::<f64>::zeros((p_total, p_total));
-        for (new_a, &old_a) in priority_perm.iter().enumerate() {
-            for (new_b, &old_b) in priority_perm.iter().enumerate() {
-                gp[[new_a, new_b]] = joint_gram_aug[[old_a, old_b]];
-            }
-        }
-        gp
-    };
-    let gram_rrqr = rrqr_from_gram_with_permutation(&gram_for_rrqr, joint_rank_m_rows, alpha)
-        .map_err(|e| {
-            EstimationError::LayoutError(format!(
-                "identifiability audit joint Gram RRQR failed: {e:?}"
-            ))
-        })?;
-    // Exact-duplicate guard (gam#933): the Gram-squared rank verdict squares the
-    // condition number, so a pair of *exactly* collinear cross-block columns
-    // (|cosine| = 1, e.g. an anchor `x` aliased by a callback-owned `x`) can be
-    // mis-counted as full rank -- the pivot that should be 0 floats above the
-    // relative tolerance in squared coordinates, and `verdict_margin` is large
-    // and confidently wrong, so it never trips the near-cliff tall fallback.
-    // The downstream MAP-uniqueness eigendecomposition (un-squared) then catches
-    // the exact null and the whole canonicalisation fails. Cheaply pre-scan the
-    // (already-computed) joint Gram for any cross-block exact-duplicate pair
-    // (|cosine| > 1 - 1e-8) and, if one exists, force the exact tall RRQR on the
-    // un-squared `[J; S]` design, which demotes the duplicate correctly. The
-    // scan reads only `joint_gram` (no new n-row stream) and early-exits on the
-    // first hit, so it is negligible on the full-rank common case.
-    let has_exact_cross_block_duplicate = {
-        let mut found = false;
-        'scan: for a in 0..p_total {
-            let gaa = joint_gram[[a, a]];
-            if gaa <= 0.0 {
-                continue;
-            }
-            for b in (a + 1)..p_total {
-                if col_block_idx[a] == col_block_idx[b] {
-                    continue;
-                }
-                let gbb = joint_gram[[b, b]];
-                if gbb <= 0.0 {
-                    continue;
-                }
-                let cosine = joint_gram[[a, b]] / (gaa * gbb).sqrt();
-                if cosine.abs() > 1.0 - 1.0e-8 {
-                    found = true;
-                    break 'scan;
-                }
-            }
-        }
-        found
-    };
-    let use_gram = gram_rrqr.verdict_margin >= JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN
-        && !has_exact_cross_block_duplicate;
-    let rrqr: RrqrWithPermutation = if use_gram {
-        log::info!(
-            "[STAGE] identifiability audit: joint RRQR path=gram verdict_margin={:.3e} \
-             (skipped n-row stream)",
-            gram_rrqr.verdict_margin,
-        );
-        RrqrWithPermutation {
-            rank: gram_rrqr.rank,
-            column_permutation: gram_rrqr.column_permutation,
-            leading_diag_abs: gram_rrqr.leading_diag_abs,
-            rank_tol: gram_rrqr.rank_tol,
-        }
-    } else {
-        // Near-cliff verdict OR an exact cross-block duplicate (gam#933):
-        // re-confirm on the exact tall (un-squared) design, which does not
-        // square the condition number and demotes exact aliases correctly.
-        log::info!(
-            "[STAGE] identifiability audit: joint RRQR path=tall (gram verdict_margin={:.3e} \
-             vs floor {:.1e}, exact_cross_block_duplicate={}; re-confirming on n×p design)",
-            gram_rrqr.verdict_margin,
-            JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN,
-            has_exact_cross_block_duplicate,
-        );
-        let x_joint_rank_input = build_x_joint_rank_input();
-        if priority_perm_is_identity {
-            rrqr_with_permutation(&x_joint_rank_input, alpha).map_err(|e| {
-                EstimationError::LayoutError(format!(
-                    "identifiability audit joint RRQR failed: {e:?}"
-                ))
-            })?
-        } else {
-            let m_rows = x_joint_rank_input.nrows();
-            let mut x_priority = Array2::<f64>::zeros((m_rows, p_total));
-            for (new_j, &old_j) in priority_perm.iter().enumerate() {
-                x_priority
-                    .column_mut(new_j)
-                    .assign(&x_joint_rank_input.column(old_j));
-            }
-            rrqr_with_permutation(&x_priority, alpha).map_err(|e| {
-                EstimationError::LayoutError(format!(
-                    "identifiability audit joint RRQR (priority-ordered) failed: {e:?}"
-                ))
-            })?
-        }
-    };
+    let rrqr_started = std::time::Instant::now();
+    let block_priority_summary: Vec<String> = specs
+        .iter()
+        .map(|s| format!("{}={}", s.name, s.gauge_priority))
+        .collect();
     log::info!(
-        "[STAGE] identifiability audit: joint RRQR end rank={}/{} elapsed={:.3}s",
-        rrqr.rank,
+        "[STAGE] identifiability audit: joint priority-tiered RRQR start n={} p_total={} \
+         blocks=[{}]",
+        n,
+        p_total,
+        block_priority_summary.join(", "),
+    );
+    let tiered = priority_tiered_rank_from_gram(&joint_gram_aug, &col_priority, joint_rank_m_rows, alpha);
+    log::info!(
+        "[STAGE] identifiability audit: joint priority-tiered RRQR end rank={}/{} elapsed={:.3}s",
+        tiered.rank,
         p_total,
         rrqr_started.elapsed().as_secs_f64(),
     );
-    let joint_rank = rrqr.rank;
-    let joint_rank_tol = rrqr.rank_tol;
-    // RRQR's `column_permutation` indexes into the matrix it actually
-    // saw. If we reordered by priority, map those back to original
-    // joint-column indices so downstream block-attribution stays
-    // correct.
-    let map_to_original = |reordered_idx: usize| -> usize {
-        if priority_perm_is_identity {
-            reordered_idx
-        } else {
-            priority_perm[reordered_idx]
-        }
-    };
-    let demoted_joint_cols: Vec<usize> = rrqr.column_permutation[rrqr.rank..]
-        .iter()
-        .map(|&j| map_to_original(j))
-        .collect();
+    let joint_rank = tiered.rank;
+    let joint_rank_tol = tiered.rank_tol;
+    let demoted_joint_cols: Vec<usize> =
+        tiered.column_permutation[tiered.rank..].to_vec();
 
     // Pairwise overlap report on the joint design's normalised
     // columns. O(p_total² · n) — fine at GAM smooth widths. We only
