@@ -2654,8 +2654,13 @@ impl SaeManifoldTerm {
         for _ in 0..max_iter {
             self.advance_temperature_schedule()?;
             let pre_step_loss = self.loss(target, rho)?;
-            let sys = self
-                .assemble_arrow_schur(target, rho, analytic_penalties)
+            // #1407: assemble ONLY the per-row htt/gt block-diagonal — the frozen
+            // decoder makes the entire β tier (G/gb/htbeta/hbb/β-penalties) dead
+            // work. `fixed_decoder_step_from_rows` below reads only htt/gt.
+            self.fixed_decoder_assembly = true;
+            let sys_result = self.assemble_arrow_schur(target, rho, analytic_penalties);
+            self.fixed_decoder_assembly = false;
+            let sys = sys_result
                 .map_err(|err| format!("SaeManifoldTerm::run_fixed_decoder_arrow_schur: {err}"))?;
             let pre_step_total =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;

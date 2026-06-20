@@ -86,6 +86,7 @@ impl SaeManifoldTerm {
             collapse_events: Vec::new(),
             row_loss_weights: None,
             last_frames_active: false,
+            fixed_decoder_assembly: false,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             certificate_dispersion: None,
             curvature_walk_report: None,
@@ -3583,11 +3584,18 @@ impl SaeManifoldTerm {
         // cleanly. When `frames_engaged` is false, EVERY β-tier object below is
         // assembled bit-for-bit as the historical full-`B` path.
         let frames_engaged = self.any_frame_active() && !whitens_likelihood;
+        // #1407: fixed-decoder mode skips the entire β decoder tier (G/gb/htbeta
+        // operator/hbb/β-penalties); only per-row htt/gt are produced.
+        let fixed_decoder = self.fixed_decoder_assembly;
         let admission_plan = self
             .streaming_plan()
             .admitted_or_error(self.n_obs(), self.output_dim(), self.k_atoms())
             .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
-        let dense_beta_curvature = admission_plan.direct_admitted
+        // #1407: fixed-decoder builds NO dense β-Hessian (hbb) — force the
+        // empty-hbb system constructor so no `beta_dim × beta_dim` workspace is
+        // taken (the early return skips `reclaim_border_hbb_workspace`).
+        let dense_beta_curvature = !fixed_decoder
+            && admission_plan.direct_admitted
             && !(frames_engaged && beta_dim > dense_beta_penalty_probe_max_dim);
         // #1406: the dense per-row cross-block slab `block.htbeta` is only WRITTEN
         // (line ~4243) and READ by the solver when `frames_engaged` (the factored
@@ -3599,9 +3607,11 @@ impl SaeManifoldTerm {
         // touches `block.htbeta`. Allocating it at `beta_dim = K·M·p` there is the
         // ~6 TiB high-K leak (#1405/#1406): allocate ZERO columns instead. Frames
         // still use the (much smaller) factored border width.
-        let row_htbeta_dim = if frames_engaged {
+        let row_htbeta_dim = if frames_engaged && !fixed_decoder {
             self.factored_border_dim()
         } else {
+            // #1406/#1407: matrix-free path and fixed-decoder mode hold no dense
+            // cross-block slab (fixed-decoder skips the β tier entirely).
             0
         };
         // Build the Arrow-Schur system: heterogeneous row dims when a compact
@@ -4221,12 +4231,17 @@ impl SaeManifoldTerm {
                         Some(layout) => layout.active_atoms[row].as_slice(),
                         None => &all_atoms_index,
                     };
+                    // #1407: in fixed-decoder mode the β tier is not assembled at
+                    // all — leave gb_delta/g_blocks empty and kron None. htt/gt
+                    // (built above) are the only outputs the frozen-decoder step
+                    // consumes.
                     let mut a_phi: Vec<(usize, f64)> = Vec::with_capacity(row_active.len() * 4);
                     // Per-active-atom weighted basis row `a_k · φ_k[·]`, retained so the
                     // data Gram blocks can be accumulated as clean per-atom-pair outer
                     // products `(a_k φ_k) (a_{k'} φ_{k'})ᵀ`.
                     let mut weighted_phi: Vec<(usize, Vec<f64>)> =
                         Vec::with_capacity(row_active.len());
+                    if !fixed_decoder {
                     for &atom_idx in row_active {
                         let atom = &self.atoms[atom_idx];
                         let atom_beta_off = beta_offsets[atom_idx];
@@ -4313,7 +4328,8 @@ impl SaeManifoldTerm {
                             }
                         }
                     }
-                    let (kron_a_phi, kron_jac) = if !frames_engaged {
+                    } // #1407 end `if !fixed_decoder` β-tier accumulation
+                    let (kron_a_phi, kron_jac) = if !frames_engaged && !fixed_decoder {
                         // Flatten local_jac_row row-major into a plain Vec<f64> (q_row * p entries).
                         let mut jac_flat = vec![0.0_f64; q_row * p];
                         for c in 0..q_row {
@@ -4360,7 +4376,7 @@ impl SaeManifoldTerm {
                     }
                 }
             }
-            if !frames_engaged {
+            if !frames_engaged && !fixed_decoder {
                 kron_a_phi.push(
                     row_result
                         .kron_a_phi
@@ -4373,6 +4389,44 @@ impl SaeManifoldTerm {
                 );
             }
             sys.rows[row] = row_result.block;
+        }
+        // #1407: fixed-decoder early return. The per-row htt/gt are now fully
+        // assembled (data GN + assignment/ARD prior). Apply only the htt/gt
+        // Riemannian projection (the decoder/β tier is intentionally absent), then
+        // return the block-diagonal system. `fixed_decoder_step_from_rows` reads
+        // only `rows[*].htt`/`gt` + `row_offsets`, so no β-tier object is needed.
+        if fixed_decoder {
+            match row_layout.as_ref() {
+                None => {
+                    // Dense uniform-q: project htt/gt (and the 0-width htbeta, a
+                    // no-op) through the ext-coord manifold.
+                    self.apply_sae_riemannian_geometry(&mut sys);
+                }
+                Some(layout) => {
+                    // Compact heterogeneous-q: project each row's htt/gt at its
+                    // own ext-coord point, mirroring the full path's compact
+                    // Riemannian block (htbeta is 0-width here, so skipped).
+                    if !self.ext_coord_manifold().is_euclidean() {
+                        for row_idx in 0..n {
+                            let (manifold_i, point_i) =
+                                self.compact_row_ext_manifold_and_point(row_idx, layout);
+                            let t_i = point_i.view();
+                            let gt_e = sys.rows[row_idx].gt.clone();
+                            let htt_e = sys.rows[row_idx].htt.clone();
+                            sys.rows[row_idx].gt =
+                                manifold_i.project_gradient_to_tangent(t_i, gt_e.view());
+                            sys.rows[row_idx].htt = manifold_i
+                                .riemannian_hessian_matrix(t_i, gt_e.view(), htt_e.view());
+                        }
+                    }
+                }
+            }
+            if let Some(deflation) = self.row_gauge_deflation_for_layout(row_layout.as_ref()) {
+                sys.set_row_gauge_deflation(deflation);
+            }
+            self.last_row_layout = row_layout;
+            self.last_frames_active = frames_engaged;
+            return Ok(sys);
         }
         // Apply Riemannian geometry to the per-row row blocks (htt, gt) and
         // also to the per-row Kronecker local Jacobians stored in kron_jac.
