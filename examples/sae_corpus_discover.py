@@ -19,10 +19,10 @@ found, so an sbatch can `eval` the discovered `--npy/--pt`+`--olmo-layer` flags
 straight into `sae_ev_vs_k_olmo.py`. Exit 3 + a `MISSING` line (with the
 harvest command to generate one) when nothing qualifies.
 
-USAGE (on an MSI compute node):
+USAGE (on a compute node):
   python examples/sae_corpus_discover.py \
-      --candidate /projects/standard/hsiehph/sauer354/olmo_data/base/activations.npy:25 \
-      --candidate /projects/standard/hsiehph/sauer354/olmo_data/instruct \
+      --candidate <data-root>/olmo_data/base/activations.npy:25 \
+      --candidate <data-root>/olmo_data/instruct \
       --min-d-model 2048
 """
 from __future__ import annotations
