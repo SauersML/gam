@@ -114,7 +114,7 @@ impl AmortizedWarmStartTelemetry {
 /// (ψ) coordinates. No analytic outer gradient/Hessian is exposed yet
 /// (task v2 wires the selected-inverse block-trace ρ-gradient), so this
 /// is a cost-only objective and the engine routes it to a derivative-free /
-/// finite-difference outer strategy per the planner.
+/// central-difference outer strategy per the planner.
 pub struct SaeManifoldOuterObjective {
     pub(crate) term: SaeManifoldTerm,
     /// Pristine term to restore from on `reset` (multi-start baseline).
@@ -368,7 +368,7 @@ impl SaeManifoldOuterObjective {
     /// analytic gradient agree *here*, on this data shape, where #901-class
     /// desyncs actually manifest.
     ///
-    /// The finite difference is the *audit instrument*, not an estimator: it
+    /// The numerical secant is the *audit instrument*, not an estimator: it
     /// only checks the production analytic gradient against the production value
     /// path at one point after convergence, so it is fully compatible with the
     /// exact-REML-only policy (see `sae_optimality_certificate`). Cost is four
@@ -1277,7 +1277,7 @@ impl SaeManifoldOuterObjective {
         })
     }
 
-    /// #1273 — central finite-difference outer-ρ gradient of the REML value
+    /// #1273 — central-difference outer-ρ gradient of the REML value
     /// path, used ONLY as a descent-direction fallback when the analytic outer
     /// gradient is numerically undefined at a finite-cost ρ (a near-singular but
     /// valid joint Hessian — e.g. a circle/torus topology whose data is lower-
@@ -1286,7 +1286,7 @@ impl SaeManifoldOuterObjective {
     /// the Faddeev-Popov deflation recovers).
     ///
     /// This is the SAME value path (`reml_criterion`) the optimality certificate
-    /// finite-differences to audit the analytic gradient, so it is exact-REML
+    /// central-differences to audit the analytic gradient, so it is exact-REML
     /// clean: the FD never produces the cost the fit consumes (the gradient lane
     /// returns the analytic REML value), it only supplies a usable direction so
     /// the outer optimiser can cross the flat valley instead of aborting. Each
@@ -1295,7 +1295,7 @@ impl SaeManifoldOuterObjective {
     /// baseline term so the probes never alias the live converged warm state.
     /// A non-finite probe falls back to a zero component on that axis, which
     /// simply omits a descent contribution there rather than poisoning the step.
-    pub(crate) fn finite_difference_outer_gradient(
+    pub(crate) fn central_difference_outer_gradient(
         &self,
         rho_state: &SaeManifoldRho,
     ) -> Result<Array1<f64>, String> {
@@ -1446,7 +1446,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // The cost at this ρ is still the EXACT REML criterion (it factorised
         // fine; only the gradient's pivot ratio tripped the gate), so the point is
         // feasible, not infeasible. Recover by descending it with a CENTRAL
-        // finite-difference outer gradient of the same value path — the identical
+        // central-difference outer gradient of the same value path — the identical
         // FD instrument the optimality certificate already uses to audit the
         // analytic gradient (`certificates::probe_*`), here used as a descent
         // direction only when the analytic path is numerically undefined. This is
@@ -1475,11 +1475,11 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 }
                 log::info!(
                     "[SAE/#1273] analytic outer gradient undefined at a finite-cost ρ \
-                     ({analytic_err}); descending with a central finite-difference outer \
+                     ({analytic_err}); descending with a central-difference outer \
                      gradient of the value path so the near-singular flat valley is crossed \
                      instead of aborting the outer optimisation"
                 );
-                self.finite_difference_outer_gradient(&rho_state)
+                self.central_difference_outer_gradient(&rho_state)
                     .map_err(EstimationError::RemlOptimizationFailed)?
             }
         };

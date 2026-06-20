@@ -3858,20 +3858,24 @@ pub(crate) fn sae_row_layout_from_dense_weights_top_k_and_cutoff() {
     let coord_dims = vec![2usize, 1, 2];
     let coord_offsets_full = vec![3usize, 5, 6];
     let assignments = vec![
-        // Row 0: weights [0.7, 0.01, 0.29]; cutoff 0.05, cap 2 ⇒ {0, 2}.
+        // Row 0: weights [0.7, 0.01, 0.29]; row peak 0.7, cutoff
+        // 0.05·0.7 = 0.035, cap 2 ⇒ {0, 2} (0.01 is below cutoff).
         Array1::from_vec(vec![0.7, 0.01, 0.29]),
-        // Row 1: weights [0.001, 0.002, 0.0005]; all below cutoff ⇒ keep
-        // single largest-magnitude atom {1}.
+        // Row 1 (#1414): uniformly small weights [0.001, 0.002, 0.0005].
+        // Row-relative cutoff 0.05·0.002 = 1e-4 keeps the two above it
+        // (atoms 1 and 0), NOT a single atom — a GLOBAL cutoff against
+        // row 0's peak (0.035) would have wrongly dropped this whole row to
+        // its single largest atom. Cap 2 ⇒ {0, 1}.
         Array1::from_vec(vec![0.001, 0.002, 0.0005]),
     ];
     let layout =
         SaeRowLayout::from_dense_weights(&assignments, 2, 0.05, coord_dims, coord_offsets_full);
     assert_eq!(layout.active_atoms[0], vec![0, 2]);
-    assert_eq!(layout.active_atoms[1], vec![1]);
+    assert_eq!(layout.active_atoms[1], vec![0, 1]);
     // Row 0 compact dim = |{0,2}| + d_0 + d_2 = 2 + 2 + 2 = 6.
     assert_eq!(layout.row_q_active(0), 6);
-    // Row 1 compact dim = 1 + d_1 = 1 + 1 = 2.
-    assert_eq!(layout.row_q_active(1), 2);
+    // Row 1 compact dim = |{0,1}| + d_0 + d_1 = 2 + 2 + 1 = 5.
+    assert_eq!(layout.row_q_active(1), 5);
     // expand_row round-trip for row 0: compact [logit0, logit2, t0_0,
     // t0_1, t2_0, t2_1] → full-q with zeros for inactive atom 1.
     let compact = vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -7863,8 +7867,8 @@ pub(crate) fn gradient_lane_finite_difference_fallback_recovers_singular_outer_g
     // central finite-difference outer gradient of the value path instead of
     // aborting. The fallback must return a finite, correctly-sized gradient.
     let fd = objective
-        .finite_difference_outer_gradient(&objective.current_rho)
-        .expect("finite-difference outer-gradient fallback must succeed (#1273)");
+        .central_difference_outer_gradient(&objective.current_rho)
+        .expect("central-difference outer-gradient fallback must succeed (#1273)");
     assert_eq!(
         fd.len(),
         objective.current_rho.to_flat().len(),

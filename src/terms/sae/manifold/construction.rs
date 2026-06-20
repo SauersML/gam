@@ -3537,17 +3537,17 @@ impl SaeManifoldTerm {
                                 assignments_all
                                     .push(self.assignment.try_assignments_row_for_rho(row, rho)?);
                             }
-                            // Absolute cutoff = relative_cutoff · max row peak, so a
-                            // single threshold drops sub-1e-3 mass across all rows.
-                            let peak = assignments_all
-                                .iter()
-                                .flat_map(|a| a.iter())
-                                .fold(0.0_f64, |m, &v| m.max(v.abs()));
-                            let cutoff = relative_cutoff * peak;
+                            // #1414: pass the RELATIVE cutoff through;
+                            // `from_dense_weights` applies it per row against that
+                            // row's own peak `max_k |a_{n,k}|`, matching the
+                            // documented `sparse_active_plan` contract. A single
+                            // global threshold (relative_cutoff · whole-dataset
+                            // peak) wrongly drops every atom of a uniformly-small
+                            // row when another row peaks high.
                             Some(SaeRowLayout::from_dense_weights(
                                 &assignments_all,
                                 k_active_cap,
-                                cutoff,
+                                relative_cutoff,
                                 coord_dims.clone(),
                                 self.assignment.coord_offsets(),
                             ))
@@ -4040,8 +4040,17 @@ impl SaeManifoldTerm {
                             // (unchanged) EXACT gradient, substituting its curvature with
                             // the Fisher metric only conditions the Newton step and the
                             // Laplace normalizer's curvature operator — it does NOT move the
-                            // optimum (a fixed-prior curvature majorization, exactly like
-                            // the ARD `prior.hess.max(0.0)` precedent ~line 3848).
+                            // optimum. #1419: this is a PSD curvature SURROGATE, NOT a
+                            // Loewner majorizer — `G − H_entropy` can be indefinite (e.g.
+                            // K=2, a=(0.95,0.05): G₁₁=0.0475 < H₁₁=0.0784). A true diagonal
+                            // majorizer (`psd_majorizer_abs_row_sums`, the Gershgorin
+                            // `D_kk = Σ_j|H_kj|`) exists, but it carries a non-smooth `abs(·)`
+                            // and is diagonal, which would split the smooth dense θ-adjoint
+                            // (`row_fisher_metric_logit_derivative`) off the assembled
+                            // operator. Because the optimum is unmoved (exact gradient) the
+                            // surrogate need only be PSD and smooth, not a majorizer; the
+                            // dense Gershgorin route is reserved for MM-descent paths that
+                            // genuinely require `G ⪰ H`.
                             //
                             // Softmax uses the REDUCED K−1 free-logit chart (the last
                             // reference logit is fixed at 0, `assignment_coord_dim() = K−1`).
@@ -4727,21 +4736,40 @@ impl SaeManifoldTerm {
         //     `D`-coefficient — NOT sign-definite, hence the consumer's
         //     indefinite-capacitance LU);
         //   * `entries[(i,k)] = (global_t_index, k, z'_ik)` with `z'_ik =
-        //     z_jac[i·K + k]` and `global_t_index = sys.row_offsets[i] + k`. IBP
-        //     is a DENSE assignment mode (`assignment_coord_dim() = K`,
-        //     `last_row_layout = None`), so atom `k`'s logit slot is local
-        //     position `k` of row `i`'s block — exactly the `(base + pos)` index
-        //     the gradient path records in `ibp_logit_sites`
-        //     (`row_vars_for_cache_row` maps `vars[atom] = Logit { atom }`). This
-        //     pins the `U`-column convention bit-for-bit to the consumer.
+        //     z_jac[i·K + k]`. For the DENSE layout (`assignment_coord_dim() = K`,
+        //     `last_row_layout = None`) atom `k`'s logit slot is local position `k`
+        //     of row `i`'s block, so `global_t_index = sys.row_offsets[i] + k`. For
+        //     the COMPACT layout (#1420) only the row's active atoms are
+        //     coordinates and atom `k` lives at local position `pos` of
+        //     `active_atoms[row]`, so `global_t_index = sys.row_offsets[i] + pos`.
+        //     Both pin the `U`-column convention bit-for-bit to the consumer's
+        //     `ibp_logit_sites`/`row_vars_for_cache_row` slot mapping.
         if let Some(channels) = ibp_assignment_third_channels(&self.assignment, rho)? {
             let mut entries: Vec<(usize, usize, f64)> = Vec::with_capacity(n * k_atoms);
             for row in 0..n {
                 let start = row * k_atoms;
                 let g_base = sys.row_offsets[row];
-                for k in 0..k_atoms {
-                    let z_prime = channels.z_jac[start + k];
-                    entries.push((g_base + k, k, z_prime));
+                match row_layout.as_ref() {
+                    // #1420: compact layout — the local logit slot `pos` (not the
+                    // global atom index `k`) is the t-coordinate. Atom `k`'s logit
+                    // lives at local position `pos` of `active_atoms[row]`, so emit
+                    // `(g_base + pos, atom, z_jac[row·K + atom])` for the active set
+                    // only. Using `g_base + k` would attach atom `k`'s derivative to
+                    // the wrong slot (and run out of range for compact rows),
+                    // violating the `IbpCrossRowSource` contract.
+                    Some(layout) => {
+                        for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
+                            let z_prime = channels.z_jac[start + atom];
+                            entries.push((g_base + pos, atom, z_prime));
+                        }
+                    }
+                    // Dense layout: atom `k`'s logit slot is local position `k`.
+                    None => {
+                        for k in 0..k_atoms {
+                            let z_prime = channels.z_jac[start + k];
+                            entries.push((g_base + k, k, z_prime));
+                        }
+                    }
                 }
             }
             let source = IbpCrossRowSource {
@@ -5079,7 +5107,18 @@ impl SaeManifoldTerm {
         Ok(evals.iter().filter(|&&v| v > tol).count())
     }
 
-    /// True REML criterion for the SAE term at a FIXED ρ.
+    /// Penalised quasi-Laplace evidence score for the SAE term at a FIXED ρ.
+    ///
+    /// #1421: this is NOT a true normalized-prior REML/evidence objective. The
+    /// assignment priors (softmax entropy, JumpReLU) have NO finite normalizer:
+    /// for softmax the reference-logit chart sends `P(ℓ)→0` as a free logit →±∞
+    /// so `∫ e^{−λP} dℓ = ∞`, and JumpReLU's bounded penalty `0<P<λ` keeps
+    /// `e^{−λP}` bounded below over an unbounded domain, also divergent. There is
+    /// therefore no ρ-independent assignment-prior normalizer that can be dropped
+    /// as a constant. The smoothing-penalty `−½log|λS|_+` term IS a genuine
+    /// (proper-Gaussian) REML normalizer and is kept exactly; the rest is a
+    /// penalized quasi-Laplace score (Laplace curvature term `½log|H|` around the
+    /// inner optimum), which the engine minimizes over ρ.
     ///
     /// Runs the inner `(t, β)` arrow-Schur Newton solve to convergence at the
     /// supplied ρ (with NO in-loop ARD update — ρ is owned by the engine),
@@ -5103,10 +5142,13 @@ impl SaeManifoldTerm {
     /// normaliser `−½ log|λ S|_+` restricted to its ρ-dependent part: `S_k` is
     /// shared across all `p` decoder output channels (the `⊗ I_p` Kronecker
     /// structure), so `log|λ S|_+ = p·rank(S)·log λ + p·log|S|_+`, and the
-    /// `½ p·log|S|_+` piece is ρ-independent. ALL ρ-independent additive
-    /// constants (the `2π` Laplace constant, the base `½ p·log|S|_+` penalty
-    /// logdet, the assignment-prior normaliser) are DROPPED here: they shift
-    /// `V` by a constant and do not affect the ρ-argmin the engine seeks.
+    /// `½ p·log|S|_+` piece is ρ-independent. The ρ-independent additive
+    /// constants that ARE dropped here (they shift `V` by a constant and do not
+    /// affect the ρ-argmin) are the `2π` Laplace constant and the base
+    /// `½ p·log|S|_+` penalty logdet. #1421: NO assignment-prior normalizer is
+    /// dropped, because none exists (softmax/JumpReLU priors are improper — see
+    /// the doc on this function): the quasi-Laplace score simply omits a
+    /// normalizer that is not a finite constant.
     ///
     /// Returns `(V, loss)` so the engine can both rank ρ and surface the inner
     /// loss breakdown.
@@ -6764,6 +6806,56 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        // #1416: the IBP prior Hessian is `H_p = d·J Jᵀ + diag(s, c)`, where the
+        // rank-one `d·J Jᵀ` couples EVERY row pair `(i, j)` in a column `k`
+        // through the shared empirical mass `M_k`. The assembled `H` carries the
+        // full `H_full = H₀' + U D Uᵀ` (Woodbury, construction.rs:4710-4752), and
+        // for fixed alpha the entire IBP prior scales with `λ = eᵖ`, so
+        // `∂H_p/∂ρ = H_p`. The diagonal loop above already captures the `i = j`
+        // self terms (the `d·J_ik²` summand lives in `hdiag`); this pass adds the
+        // omitted off-diagonal `½·d_k·Σ_{i≠j}(H⁻¹)_{ik,jk}·J_ik·J_jk`. Only IBP
+        // has the cross-row rank-one source; for other diagonal modes
+        // `ibp_assignment_third_channels` returns `None` and the trace stays the
+        // pure diagonal contraction. (IBP fixed-alpha uses the dense `None`
+        // layout, so atom `k`'s logit slot is local position `k`.)
+        if self.last_row_layout.is_none() {
+            if let Some(channels) = ibp_assignment_third_channels(&self.assignment, rho)? {
+                let n = self.n_obs();
+                let total_t = cache.delta_t_len();
+                let mut cross = 0.0_f64;
+                for k in 0..k_atoms {
+                    let d_k = channels.cross_row_d[k];
+                    if d_k == 0.0 {
+                        continue;
+                    }
+                    for i in 0..n {
+                        let j_ik = channels.z_jac[i * k_atoms + k];
+                        if j_ik == 0.0 {
+                            continue;
+                        }
+                        // (H⁻¹) column at row `i`'s logit-`k` slot.
+                        let mut rhs_t = Array1::<f64>::zeros(total_t);
+                        let rhs_beta = Array1::<f64>::zeros(cache.k);
+                        rhs_t[cache.row_offsets[i] + k] = 1.0;
+                        let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
+                            format!("assignment_log_strength_hessian_trace: {err}")
+                        })?;
+                        for j in 0..n {
+                            if j == i {
+                                continue;
+                            }
+                            let j_jk = channels.z_jac[j * k_atoms + k];
+                            if j_jk == 0.0 {
+                                continue;
+                            }
+                            let inv_ij = solved.t[cache.row_offsets[j] + k];
+                            cross += d_k * inv_ij * j_ik * j_jk;
+                        }
+                    }
+                }
+                trace += cross;
+            }
+        }
         Ok(0.5 * trace)
     }
 
@@ -7465,10 +7557,12 @@ impl SaeManifoldTerm {
                 let activation =
                     crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
                 let slope = activation * (1.0 - activation);
-                2.0 * rho.lambda_sparse()
+                // #1415: P(ℓ)=λσ((ℓ−θ)/τ); P''(ℓ)=(λ/τ²)s(1−2a) so the third
+                // derivative is P'''(ℓ)=(λ/τ³)·s·(1−6a+6a²), because
+                // d/dℓ[s(1−2a)] = (1/τ)s[(1−2a)²−2s] = (1/τ)s(1−6a+6a²).
+                rho.lambda_sparse()
                     * slope
-                    * slope
-                    * (1.0 - 2.0 * activation)
+                    * (1.0 - 6.0 * activation + 6.0 * activation * activation)
                     * inv_tau
                     * inv_tau
                     * inv_tau
@@ -7656,11 +7750,16 @@ impl SaeManifoldTerm {
                 }
             }
         }
-        // IBP `hessian_diag` logit third-derivative channels (#1006), exact for
-        // the diagonal/quasi-Laplace assignment curvature this assembly actually
-        // factors. The full IBP Hessian also has per-column cross-row rank-one
-        // terms; those are omitted from H and therefore from this adjoint until
-        // the evidence factor grows the matching Woodbury correction.
+        // IBP `hessian_diag` logit third-derivative channels (#1006). The full
+        // IBP Hessian also has per-column cross-row rank-one terms
+        // `H_(i,k),(j,k) = d_k·J_ik·J_jk`; these ARE now carried in `H` via the
+        // #1038 Woodbury source (`IbpCrossRowSource`, construction.rs:4710-4752),
+        // and the ρ-trace differentiates them (#1416,
+        // `assignment_log_strength_hessian_trace`). In this θ-adjoint the
+        // empirical-`M_k` channel below contracts the shared-mass coupling; the
+        // direct `∂/∂ℓ_w (d_k·J_ik·J_jk)` cross-row Woodbury derivative is not yet
+        // assembled here because the `c_w = ∂²z/∂ℓ²` and `e = ∂²s/∂M²` channels it
+        // needs are not exposed by `IbpHessianDiagThirdChannels` (#1416 residual).
         let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho)?;
         let k_atoms = self.k_atoms();
         // #1038 softmax entropy: the dense per-row entropy Hessian written into
@@ -7877,6 +7976,18 @@ impl SaeManifoldTerm {
 
         explicit[0] = assignment_prior_log_strength_derivative(&self.assignment, rho)
             + self.learnable_ibp_forward_alpha_data_derivative(rho, target)?;
+        // #1417 RESIDUAL: for LEARNABLE IBP alpha the forward assignments
+        // `a_ik = σ(ℓ/τ)(α/(α+1))^k` carry an explicit α-dependence
+        // (`∂a_ik/∂logα = a_ik·k/(α+1)`), so the data Gauss-Newton blocks
+        // `H_ββ`, `H_tβ`, `H_tt` and the IBP Woodbury source all depend on logα.
+        // The complete `logdet_trace[0]` for learnable alpha is therefore
+        //   ½ tr(H⁻¹ ∂H_prior/∂logα) + ½ tr(H⁻¹ ∂H_data/∂logα),
+        // but only the first (assignment-prior) trace is assembled below; the
+        // explicit data-block α-derivative trace is NOT yet contracted here. The
+        // loss-VALUE α-derivative IS complete (`learnable_ibp_forward_*` above);
+        // only the logdet α-trace of the data blocks is incomplete. For FIXED
+        // alpha this term is identically zero, so the fixed-alpha gradient is
+        // exact; the gap is confined to the learnable-alpha path.
         logdet_trace[0] = self.assignment_log_strength_hessian_trace(rho, cache, solver)?;
 
         explicit[1] = loss.smoothness;
@@ -7900,6 +8011,22 @@ impl SaeManifoldTerm {
         }
 
         let gamma = self.logdet_theta_adjoint(rho, cache, solver)?;
+        // #1418 RESIDUAL: the implicit-function correction is
+        //   −½·Γᵀ·θ̂_ρ ,  θ̂_ρ = −A⁻¹ g_ρ ,
+        // where `A = ∇²_θθ L` is the EXACT stationarity Jacobian of the inner fit
+        // (data residual curvature, exact softmax entropy Hessian, exact periodic
+        // ARD curvature). The matrix the `solver` actually factors is `B` (the
+        // assembled evidence/Newton operator: Gauss-Newton data curvature `JᵀJ`
+        // with the softmax Fisher metric and `max(V'',0)` ARD majorizers in place
+        // of the exact curvatures). The `½log|B|` Laplace term in the value path
+        // is built from `B`, so `Γ = ½tr(B⁻¹ ∂B/∂θ)` is consistent; but the
+        // implicit step `θ̂_ρ` is governed by the TRUE Jacobian `A`, not `B`. Using
+        // `solver.solve` here applies `B⁻¹ g_ρ`, which equals the exact `A⁻¹ g_ρ`
+        // ONLY when `B = A` (zero residual curvature so `JᵀJ` is the full data
+        // Hessian, and the entropy/ARD curvatures are at their PSD-exact points).
+        // Assembling and factoring a separate exact `A` for this single adjoint
+        // solve is the complete fix; it is not done here to avoid a second,
+        // independently-factored Hessian path. The bias is `−½Γᵀ(B⁻¹−A⁻¹)g_ρ`.
         for coord in 0..n_params {
             let rhs = self.outer_rho_gradient_ift_rhs(rho, target, coord, cache)?;
             let solved = solver.solve(rhs.t.view(), rhs.beta.view()).map_err(|err| {

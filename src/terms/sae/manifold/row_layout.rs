@@ -80,15 +80,22 @@ impl SaeRowLayout {
 
     /// Mode-agnostic effective active set for dense-weight modes (softmax /
     /// IBP-MAP) at large `K`: keep, per row, the top-`k_active_cap` atoms by
-    /// `|a_{n,k}|` whose magnitude also exceeds `cutoff`.
+    /// `|a_{n,k}|` whose magnitude also exceeds `relative_cutoff · rowpeak`.
+    ///
+    /// #1414: the cutoff is RELATIVE TO EACH ROW'S OWN PEAK `max_k |a_{n,k}|`,
+    /// matching the documented `sparse_active_plan` contract
+    /// (`construction.rs:1763-1766`). A global cutoff (one threshold from the
+    /// whole-dataset peak) would wrongly drop both atoms of a uniformly-small row
+    /// `[0.0009, 0.0008]` just because another row peaks at `1.0`, changing the
+    /// high-`K` compact model.
     ///
     /// `assignments[row]` is the dense length-`K` assignment vector `a_{n,·}`.
     /// The active set is always non-empty (the single largest-magnitude atom is
-    /// retained even if below `cutoff`) so every row keeps a valid block.
+    /// retained even if below cutoff) so every row keeps a valid block.
     pub(crate) fn from_dense_weights(
         assignments: &[Array1<f64>],
         k_active_cap: usize,
-        cutoff: f64,
+        relative_cutoff: f64,
         coord_dims: Vec<usize>,
         coord_offsets_full: Vec<usize>,
     ) -> Self {
@@ -103,6 +110,9 @@ impl SaeRowLayout {
                     .partial_cmp(&a[i].abs())
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
+            // Row-relative absolute cutoff = relative_cutoff · this row's peak.
+            let row_peak = idx.first().map_or(0.0, |&top| a[top].abs());
+            let cutoff = relative_cutoff * row_peak;
             let mut active: Vec<usize> = idx
                 .iter()
                 .copied()
