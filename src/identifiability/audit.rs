@@ -392,7 +392,24 @@ pub fn bias_shift_for_pair(z_a: Option<&[f64]>, z_b: Option<&[f64]>, s2_a: f64, 
 fn pair_null_sigma(s2_a: f64, s2_b: f64, n: usize) -> f64 {
     let inv_n = if n == 0 { 0.0 } else { 1.0 / n as f64 };
     let s2 = s2_a.max(s2_b);
-    (s2 - inv_n).max(0.0).sqrt()
+    let excess = s2 - inv_n;
+    // The null cosine variance is σ² = S2 − 1/n, an EXACT identity: a perfectly
+    // uniform column has S2 = 1/n, so its null distribution has zero width. The
+    // identity is computed from S2 = Σ φ⁴/(Σ φ²)², whose sequential f64
+    // accumulation carries a rounding error bounded by ~n·ε relative to S2
+    // (the standard summation bound). For a uniform column that residual is on
+    // the order of 1.5e-17 at n=1000, S2=1e-3 — and because √ has unbounded
+    // relative sensitivity at the origin, √(residual) inflates to ~3.9e-9, a
+    // spurious σ that pulls the report/halt thresholds off their exact-uniform
+    // values (gam#1397). The σ² identity is only meaningful above its own
+    // accumulation noise, so we treat any excess at or below the summation
+    // rounding scale as the exact zero it represents before taking the root.
+    let n_terms = (n as f64).max(1.0);
+    let rounding_floor = 16.0 * f64::EPSILON * n_terms * s2.abs().max(inv_n);
+    if excess <= rounding_floor {
+        return 0.0;
+    }
+    excess.sqrt()
 }
 
 /// Overlap threshold above which an `AliasedPair` is reported.
@@ -1266,7 +1283,29 @@ fn audit_identifiability_impl(
     // O(1) lookup `joint_gram[[ja, jb]]` instead of an O(n) scalar pass, so the
     // pairwise scan is O(p²) scalar bookkeeping over the shared GEMM. The single
     // n-row stream now feeds BOTH the rank verdict and the overlap scan.
+    // The pairwise scan produces TWO independent classifications per cross-block
+    // column pair, because reporting and halting answer different questions and
+    // must not be coupled:
+    //
+    //   • `aliased_pairs` (REPORT band) — human-facing diagnostics. Floored at
+    //     `REPORT_FLOOR_NEAR_EXACT` (0.95) so that ordinary moderate correlation
+    //     between two distinct, fully-identifiable basis functions is not paraded
+    //     as an alias.
+    //   • `halt_pairs` (HALT band) — the structural fittability verdict. A pure
+    //     leverage-scaled K·σ band with NO near-exact floor, because the question
+    //     "is this design fittable?" has nothing to do with whether the overlap is
+    //     visually near 1: for a tightly-concentrated null (high n_eff) a cosine of
+    //     0.71 is already many σ outside the null and unfittable, while for a wide
+    //     null (low n_eff) even 0.9 is ordinary sampling noise.
+    //
+    // The halt band can — and routinely does — sit BELOW the report floor (e.g.
+    // n_eff≈200 → halt half-width ≈0.71 < 0.95). Deriving the halt verdict by
+    // filtering the REPORTED set therefore silently discards exactly the pairs in
+    // the (halt, report) gap that are unfittable yet below the diagnostic floor
+    // (gam#1397). Each band is computed directly from the cosine here, so the two
+    // verdicts are fully decoupled.
     let mut aliased_pairs: Vec<AliasedPair> = Vec::new();
+    let mut halt_pairs: Vec<AliasedPair> = Vec::new();
     let n_block_pairs = specs.len().saturating_mul(specs.len().saturating_sub(1)) / 2;
     for a_block_idx in 0..specs.len() {
         let a_start = col_offsets[a_block_idx];
@@ -1306,23 +1345,32 @@ fn audit_identifiability_impl(
                     // Bias shift: non-zero when exactly one block carries
                     // row-scaling (or the two scalings differ).
                     let shift = bias_shift_for_pair(z_a, z_b, s2_ja, s2_jb);
-                    let report_half_width =
-                        pair_report_threshold(s2_ja, s2_jb, n, total_cross_pairs);
-                    let report_flag = cosine_outside_null_band(cosine, shift, report_half_width);
                     // Store the unsigned |cosine| in AliasedPair.overlap for
                     // backwards compatibility and human-readable diagnostics.
-                    // Also store `shift` so the halt-threshold check can apply
-                    // the same directional correction.
+                    // Store `shift` so each band applies the same directional
+                    // (skewness) correction to the null mean.
                     let overlap = cosine.abs();
-                    if report_flag {
-                        aliased_pairs.push(AliasedPair {
-                            block_a: specs[a_block_idx].name.clone(),
-                            block_b: specs[b_block_idx].name.clone(),
-                            direction_a: ja - a_start,
-                            direction_b: jb - b_start,
-                            overlap,
-                            bias_shift: shift,
-                        });
+                    let make_pair = || AliasedPair {
+                        block_a: specs[a_block_idx].name.clone(),
+                        block_b: specs[b_block_idx].name.clone(),
+                        direction_a: ja - a_start,
+                        direction_b: jb - b_start,
+                        overlap,
+                        bias_shift: shift,
+                    };
+                    // REPORT band (diagnostics, floored at the near-exact-alias
+                    // boundary).
+                    let report_half_width =
+                        pair_report_threshold(s2_ja, s2_jb, n, total_cross_pairs);
+                    if cosine_outside_null_band(cosine, shift, report_half_width) {
+                        aliased_pairs.push(make_pair());
+                    }
+                    // HALT band (structural fittability, pure leverage K·σ with
+                    // no near-exact floor). Computed directly from the same cosine
+                    // so it is independent of the report verdict (gam#1397).
+                    let halt_half_width = pair_halt_threshold(s2_ja, s2_jb, n);
+                    if cosine_outside_null_band(cosine, shift, halt_half_width) {
+                        halt_pairs.push(make_pair());
                     }
                 }
             }
@@ -1583,46 +1631,28 @@ fn audit_identifiability_impl(
         .enumerate()
         .map(|(i, s)| (s.name.as_str(), i))
         .collect();
-    let hard_alias_pair = aliased_pairs
+    // The halt band has already been resolved during the pairwise scan
+    // (`halt_pairs`, gam#1397): every member is a cross-block pair whose
+    // bias-corrected cosine clears the leverage-scaled halt half-width, computed
+    // directly from the cosine and therefore decoupled from the report floor.
+    // The ONLY remaining question for a hard halt is gauge-resolvability: a pair
+    // is unfittable iff its two blocks carry the SAME gauge_priority, because
+    // then no ordering exists to decide which block forfeits the shared
+    // direction. Distinct priorities are resolved deterministically by the
+    // priority-ordered RRQR (the lower-priority column is demoted), so they never
+    // halt.
+    let hard_alias_pair = halt_pairs
         .iter()
         .filter(|p| {
             let pa = block_priority
                 .get(p.block_a.as_str())
                 .copied()
-                .unwrap_or(100);
+                .unwrap_or(DEFAULT_GAUGE_PRIORITY);
             let pb = block_priority
                 .get(p.block_b.as_str())
                 .copied()
-                .unwrap_or(100);
-            // Same priority → ambiguous → halt.
-            // Distinct priorities → canonical-gauge resolves → do not halt.
-            if pa != pb {
-                return false;
-            }
-            // Compute per-pair halt threshold from stored S2 values.
-            let ja = block_name_to_idx
-                .get(p.block_a.as_str())
-                .map(|&bi| col_offsets[bi] + p.direction_a)
-                .unwrap_or(0);
-            let jb = block_name_to_idx
-                .get(p.block_b.as_str())
-                .map(|&bi| col_offsets[bi] + p.direction_b)
-                .unwrap_or(0);
-            let halt_half_width = pair_halt_threshold(
-                col_s2.get(ja).copied().unwrap_or(1.0),
-                col_s2.get(jb).copied().unwrap_or(1.0),
-                n,
-            );
-            // Bias-corrected halt check: we stored overlap = |cosine| and
-            // bias_shift = shift.  The exact test would be |cosine − shift| ≥
-            // halt_half_width, but we only have |cosine|.  Using a conservative
-            // lower bound |overlap − |shift|| ensures we only fire when the
-            // cosine is genuinely outside the null band regardless of sign.
-            // For exact aliases (overlap ≈ 1) this always fires; for moderate
-            // overlaps the shift must be large enough to displace the cosine
-            // inside the null band before we withhold the halt.
-            let conservative_deviation = (p.overlap - p.bias_shift.abs()).abs();
-            conservative_deviation >= halt_half_width
+                .unwrap_or(DEFAULT_GAUGE_PRIORITY);
+            pa == pb
         })
         .max_by(|a, b| {
             a.overlap
@@ -2120,7 +2150,10 @@ pub fn audit_identifiability_channel_aware(
     // above the reporting threshold. Compute on the (n·K, p_total)
     // weighted joint W where W_b = sqrt(K^S) · J_b. With K^S = I,
     // sqrt(K^S) = I and W_b is just J_b flattened to (n·K, p_b).
-    let aliased_pairs = channel_aware_aliased_pairs(
+    let ScannedAliasPairs {
+        reported: aliased_pairs,
+        halt: halt_pairs,
+    } = channel_aware_aliased_pairs(
         &geometry.gram_struct,
         &geometry.col_norms,
         &geometry.col_s2,
@@ -2173,38 +2206,21 @@ pub fn audit_identifiability_channel_aware(
         .map(|(i, s)| (s.name.as_str(), i))
         .collect();
     let ca_col_s2 = &geometry.col_s2;
-    let hard_alias_pair = aliased_pairs
+    // `halt_pairs` already cleared the leverage-scaled halt band in the scan,
+    // decoupled from the report floor (gam#1397). The only remaining gate is
+    // gauge-resolvability: same priority → no ordering to pick a loser → halt.
+    let hard_alias_pair = halt_pairs
         .iter()
         .filter(|p| {
             let pa = block_priority_ca
                 .get(p.block_a.as_str())
                 .copied()
-                .unwrap_or(100);
+                .unwrap_or(DEFAULT_GAUGE_PRIORITY);
             let pb = block_priority_ca
                 .get(p.block_b.as_str())
                 .copied()
-                .unwrap_or(100);
-            if pa != pb {
-                return false;
-            }
-            let ja = block_name_to_idx_ca
-                .get(p.block_a.as_str())
-                .map(|&bi| col_offsets[bi] + p.direction_a)
-                .unwrap_or(0);
-            let jb = block_name_to_idx_ca
-                .get(p.block_b.as_str())
-                .map(|&bi| col_offsets[bi] + p.direction_b)
-                .unwrap_or(0);
-            let halt_half_width = pair_halt_threshold(
-                ca_col_s2.get(ja).copied().unwrap_or(1.0),
-                ca_col_s2.get(jb).copied().unwrap_or(1.0),
-                n * k,
-            );
-            // Channel-aware path: bias_shift is always 0 (set when pair is
-            // created in channel_aware_aliased_pairs), so this is just
-            // p.overlap >= halt_half_width, matching the pre-skewness logic.
-            let conservative_deviation = (p.overlap - p.bias_shift.abs()).abs();
-            conservative_deviation >= halt_half_width
+                .unwrap_or(DEFAULT_GAUGE_PRIORITY);
+            pa == pb
         })
         .max_by(|a, b| {
             a.overlap
@@ -2501,6 +2517,16 @@ fn channel_aware_penalty_aware_joint_rank(
 /// Returns one [`AliasedPair`] per cross-block column-pair whose
 /// normalised `|wᵀ w'|` exceeds the per-pair leverage-based report
 /// threshold (`pair_report_threshold`), in `(block_a < block_b)` order.
+/// Result of a single cross-block pairwise scan: the REPORT-band pairs
+/// (diagnostics) and the HALT-band pairs (structural fittability), classified
+/// independently so the hard-halt verdict is never gated on the diagnostic
+/// report floor (gam#1397). Mirrors the flat path's `aliased_pairs` / `halt_pairs`
+/// split for the channel-aware path.
+struct ScannedAliasPairs {
+    reported: Vec<AliasedPair>,
+    halt: Vec<AliasedPair>,
+}
+
 fn channel_aware_aliased_pairs(
     gram_struct: &Array2<f64>,
     col_norms: &[f64],
@@ -2508,10 +2534,13 @@ fn channel_aware_aliased_pairs(
     col_offsets: &[usize],
     specs: &[ParameterBlockSpec],
     n_design_rows: usize,
-) -> Result<Vec<AliasedPair>, EstimationError> {
+) -> Result<ScannedAliasPairs, EstimationError> {
     let p_total = *col_offsets.last().unwrap_or(&0);
     if p_total == 0 || n_design_rows == 0 {
-        return Ok(Vec::new());
+        return Ok(ScannedAliasPairs {
+            reported: Vec::new(),
+            halt: Vec::new(),
+        });
     }
     // Total cross-block pairs for Bonferroni correction.
     let total_cross_pairs: usize = {
@@ -2525,10 +2554,15 @@ fn channel_aware_aliased_pairs(
         }
         cnt.max(1)
     };
-    // Pairwise scan: for every joint column pair (a < b) with both
-    // norms positive, compute |wᵀw'| / (‖w‖·‖w'‖) and emit if above
-    // the per-pair leverage-based reporting threshold.
-    let mut pairs: Vec<AliasedPair> = Vec::new();
+    // Pairwise scan: for every cross-block joint column pair (a < b) with both
+    // norms positive, compute |wᵀw'| / (‖w‖·‖w'‖) and classify it into the
+    // REPORT band (≥ leverage report threshold, floored at the near-exact
+    // boundary) and, independently, the HALT band (≥ leverage halt threshold,
+    // no near-exact floor). The two bands are decoupled — the halt band can sit
+    // below the report floor for high-n_eff columns — so a structurally
+    // unfittable same-priority pair below the diagnostic floor still halts.
+    let mut reported: Vec<AliasedPair> = Vec::new();
+    let mut halt: Vec<AliasedPair> = Vec::new();
     for a in 0..p_total {
         if col_norms[a] <= 0.0 {
             continue;
@@ -2539,33 +2573,38 @@ fn channel_aware_aliased_pairs(
             }
             let dot = gram_struct[[a, b]];
             let overlap = (dot.abs() / (col_norms[a] * col_norms[b])).min(1.0);
+            let (block_a_idx, dir_a) = locate_block_column(col_offsets, a)?;
+            let (block_b_idx, dir_b) = locate_block_column(col_offsets, b)?;
+            if block_a_idx == block_b_idx {
+                // Within-block aliasing is a separate concern (per-block QR
+                // catches it); the cross-block scan only reports inter-block
+                // pairs.
+                continue;
+            }
+            let make_pair = || AliasedPair {
+                block_a: specs[block_a_idx].name.clone(),
+                block_b: specs[block_b_idx].name.clone(),
+                direction_a: dir_a,
+                direction_b: dir_b,
+                overlap,
+                // Channel-aware path: no row-scaling bias correction; the
+                // channel weighting already accounts for per-block structure,
+                // and the row Jacobian operators are not parameterised through
+                // RowScaledJacobian here.
+                bias_shift: 0.0,
+            };
             let report_thr =
                 pair_report_threshold(col_s2[a], col_s2[b], n_design_rows, total_cross_pairs);
             if overlap >= report_thr {
-                let (block_a_idx, dir_a) = locate_block_column(col_offsets, a)?;
-                let (block_b_idx, dir_b) = locate_block_column(col_offsets, b)?;
-                if block_a_idx == block_b_idx {
-                    // Within-block aliasing is a separate concern
-                    // (per-block QR catches it); the cross-block scan
-                    // only reports inter-block pairs.
-                    continue;
-                }
-                pairs.push(AliasedPair {
-                    block_a: specs[block_a_idx].name.clone(),
-                    block_b: specs[block_b_idx].name.clone(),
-                    direction_a: dir_a,
-                    direction_b: dir_b,
-                    overlap,
-                    // Channel-aware path: no row-scaling bias correction;
-                    // the channel weighting already accounts for per-block
-                    // structure, and the row Jacobian operators are not
-                    // parameterised through RowScaledJacobian here.
-                    bias_shift: 0.0,
-                });
+                reported.push(make_pair());
+            }
+            let halt_thr = pair_halt_threshold(col_s2[a], col_s2[b], n_design_rows);
+            if overlap >= halt_thr {
+                halt.push(make_pair());
             }
         }
     }
-    Ok(pairs)
+    Ok(ScannedAliasPairs { reported, halt })
 }
 
 /// Summary of one audit-drift check: the rank verdict at the current β

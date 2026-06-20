@@ -1108,25 +1108,50 @@ fn canonicalize_for_identifiability_inner(
                 red_col_off += r_i;
             }
 
-            // Rank J_pre and J_can under the SAME σ²-Gram eigenvalue convention
-            // the audit used to DECIDE the drops (`audit_convention_rank`), not
-            // a fresh σ-space RRQR with a different threshold. On near-separable
-            // data the two disagree by ~6 orders of magnitude in the relative-σ
-            // cutoff, so a plain RRQR would count weak directions the audit (by
-            // its own convention) correctly demoted, tripping the invariant on
-            // genuine gauge drops (gam#1220). `nk_scale` mirrors the audit's
+            // Rank J_pre and J_can under the σ²-Gram eigenvalue convention
+            // (`audit_convention_rank`). `nk_scale` mirrors the audit's
             // tolerance size term: r_map is the (n·k)-stacked row count.
             let nk_scale = r_map;
             let rank_j_pre = audit_convention_rank(&j_pre, nk_scale);
             let rank_j_can = audit_convention_rank(&j_can, nk_scale);
 
+            // What the invariant actually certifies: the per-block transform `T`
+            // is a pure COLUMN SELECTION (drop the audit's redundant columns), so
+            // a faithful, non-defective `T` produces a `J_can` whose rank is the
+            // largest a `p_total_red`-column selection of `J_pre` can carry —
+            // namely `min(rank(J_pre), p_total_red)`:
+            //
+            //   • If the audit dropped only genuinely redundant directions, the
+            //     surviving `p_total_red` columns are all kept by the original
+            //     rank, so `rank(J_can) == p_total_red ≤ rank(J_pre)`.
+            //   • If `J_pre` was already rank-deficient AMONG the kept columns
+            //     (a defective `T` that re-aliases two survivors, the genuine bug
+            //     this gate guards against), `rank(J_can) < p_total_red`.
+            //
+            // The previous gate demanded strict EQUALITY `rank(J_pre) ==
+            // rank(J_can)`, which silently assumed `audit_convention_rank` was the
+            // very metric that chose the drops. That holds for the channel-aware
+            // path (drops come from the σ²-Gram `keep_positive_eigenspace`,
+            // gam#1220) but NOT for the FLAT audit path, whose drops come from a
+            // σ-space RRQR with a stricter cutoff. The RRQR legitimately demotes a
+            // near-separable direction that the more lenient σ²-Gram still counts,
+            // so `rank(J_pre) = p_total_red + 1 > rank(J_can) = p_total_red` even
+            // though `T` is perfectly faithful — a false invariant violation on
+            // GAMLSS-PS / survival-marginal-slope (gam#1391, gam#1388). Comparing
+            // `rank(J_can)` against `min(rank(J_pre), p_total_red)` is convention-
+            // robust: it certifies that `T` introduced no NEW deficiency among the
+            // kept columns, regardless of which (equal-or-stricter) metric chose
+            // the drops, while still failing on a genuinely rank-destroying `T`.
+            let expected_can_rank = rank_j_pre.min(p_total_red);
+
             log::info!(
                 "[CANON] post-T invariant (audit σ²-Gram convention): \
                  rank(J)={rank_j_pre} rank(J_can)={rank_j_can} \
+                 expected_can_rank={expected_can_rank} \
                  (p_raw={p_total_raw} p_red={p_total_red} k={k})",
             );
 
-            if rank_j_pre != rank_j_can {
+            if rank_j_can != expected_can_rank {
                 let block_shapes: Vec<String> = per_block_transform
                     .iter()
                     .zip(specs.iter())
@@ -1135,9 +1160,11 @@ fn canonicalize_for_identifiability_inner(
                 return Err(CustomFamilyError::DimensionMismatch {
                     reason: format!(
                         "canonicalize_for_identifiability: post-T rank invariant violated — \
-                         rank(J)={rank_j_pre} but rank(J_can)={rank_j_can} \
-                         (p_raw={p_total_raw} p_red={p_total_red} k={k}); \
-                         this is a bug in T construction; per-block T shapes: [{}]",
+                         rank(J_can)={rank_j_can} but expected min(rank(J)={rank_j_pre}, \
+                         p_red={p_total_red})={expected_can_rank} \
+                         (p_raw={p_total_raw} k={k}); the column-selection T re-introduced a \
+                         rank deficiency among the kept columns — a bug in T construction; \
+                         per-block T shapes: [{}]",
                         block_shapes.join(", "),
                     ),
                 });
