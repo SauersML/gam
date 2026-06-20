@@ -378,6 +378,14 @@ impl CostStallGuard {
     /// best-so-far publication can resurrect an older non-stationary iterate and
     /// report `converged=false`. In that separation case the current feasible
     /// probe is the certificate-bearing point and should be returned directly.
+    ///
+    /// `grad_norm` MUST be the bound-PROJECTED gradient norm at the probe, not a
+    /// presumed zero: the constrained-KKT certificate holds only when the pull on
+    /// the railed axes is the *whole* residual. The projected norm retains any
+    /// INTERIOR (feasible-descent) component, so `publish_stall` certifies
+    /// `converged` iff the probe is genuinely stationary in the feasible subspace
+    /// (#1426 — a flat-valley overfit that merely rails a couple of axes is
+    /// reported NON-converged rather than certified behind a fake zero).
     pub(crate) fn observe_constrained_stationary(
         &mut self,
         rho: &Array1<f64>,
@@ -1297,7 +1305,18 @@ impl OuterSecondOrderBridge<'_> {
         let guard = self.cost_stall.as_mut()?;
         let projected_g_norm = projected_gradient_norm(x, &eval.gradient, bounds.as_ref());
         let verdict = if separation_bound_stationary {
-            guard.observe_constrained_stationary(x, eval.cost, 0.0)
+            // #1426: certify the constrained-stationary fast-path with the REAL
+            // bound-projected gradient norm, not a hardcoded 0.0. The projection
+            // (`projected_gradient_norm`) already zeros the out-of-bounds pull on
+            // the railed separation axes, so a genuine λ→0 separation
+            // (#1082/#1237) still presents ‖g_proj‖ ≈ 0 and is certified
+            // converged exactly as before. But a flat-valley OVERFIT that merely
+            // *looks* separated on a couple of railed axes while retaining a large
+            // INTERIOR (feasible-descent) gradient component — the Gamma/log λ→0
+            // ridge of #1426 — keeps that interior mass in ‖g_proj‖, so
+            // `publish_stall` honestly returns FlatValleyStall / converged=false
+            // instead of shipping the overfit silently behind a fake zero.
+            guard.observe_constrained_stationary(x, eval.cost, projected_g_norm)
         } else {
             guard.observe(x, eval.cost, projected_g_norm)
         };
