@@ -259,7 +259,22 @@ fn build_duchon_basis_uncached(
         } else {
             None
         };
-        let poly_block = polynomial_block_from_order(data, effective_nullspace_order);
+        // Translation-invariant polynomial frame (#1375): build the explicit
+        // poly null-space columns at coordinates centered by the center-cloud
+        // per-axis mean, matching `build_duchon_basis_designwithworkspace` (dense
+        // path) and the side-condition `Z` (centered inside
+        // `kernel_constraint_nullspace`). The kernel block reads `data − centers`
+        // differences, so it is already translation-invariant and stays raw.
+        let center_mean: Vec<f64> = (0..d)
+            .map(|c| centers.column(c).sum() / (centers.nrows().max(1) as f64))
+            .collect();
+        let mut data_centered = data.to_owned();
+        for c in 0..d {
+            let mu = center_mean[c];
+            data_centered.column_mut(c).mapv_inplace(|v| v - mu);
+        }
+        let poly_block =
+            polynomial_block_from_order(data_centered.view(), effective_nullspace_order);
         let kernel_amp = duchon_kernel_amplification(
             centers.view(),
             length_scale,

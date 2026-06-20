@@ -1491,10 +1491,39 @@ pub(crate) fn build_duchon_basis_designwithworkspace(
     };
     validate_duchon_kernel_orders(length_scale, p_order, validation_power, d)?;
 
-    let poly_block = polynomial_block_from_order(data, nullspace_order);
+    // Translation-invariant polynomial frame (#1375, mirroring the #1269 tp fix).
+    // The Duchon kernel reads only coordinate *differences* `data − centers`, so
+    // the `K·Z` block is already invariant to a covariate translation `x → x + b`.
+    // The polynomial null-space block `P = {1, x, x², …}` (appended as explicit
+    // unpenalized design columns) and the side-condition `P(centers)ᵀα = 0` that
+    // defines `Z`, however, are assembled at the *absolute* coordinate. With a
+    // large covariate mean the `{1, x}` columns become near-collinear, the design
+    // ill-conditions, and REML λ-selection lands in a slightly different basin —
+    // moving the fit even though `{1, x − x̄}` spans the same model space. Subtract
+    // the CENTER-CLOUD per-axis mean from both `data` and `centers` before every
+    // polynomial / side-condition assembly so the polynomial frame is
+    // location-standardized. The mean is a fixed property of the frozen
+    // (`UserProvided`) centers — recomputed identically at predict — and under
+    // `x → x + b` the centers (selected from the data) shift by the same `b`, so
+    // the centred coordinate, hence the whole basis, is invariant.
+    let center_mean: Vec<f64> = (0..d)
+        .map(|c| centers.column(c).sum() / (k.max(1) as f64))
+        .collect();
+    let mut data_centered = data.to_owned();
+    for c in 0..d {
+        let mu = center_mean[c];
+        data_centered.column_mut(c).mapv_inplace(|v| v - mu);
+    }
+
+    let poly_block = polynomial_block_from_order(data_centered.view(), nullspace_order);
     // Z spans null(Q^T), where Q contains polynomial side conditions at centers.
     // Reparameterizing alpha = Z gamma enforces conditional-PD constraints once
     // and yields free-parameter penalty gamma^T (Z^T K_CC Z) gamma.
+    // `kernel_constraint_nullspace` centers `centers` by the same center-cloud
+    // mean internally (#1375), so the side-condition factorisation matches the
+    // centered polynomial design columns above and is translation-stable; this is
+    // the SAME `Z` the penalty path assembles, keeping design and penalty
+    // consistent.
     let z_raw = kernel_constraint_nullspace(centers, nullspace_order, &mut workspace.cache)?;
     // #1355: fold the frozen data-metric radial reparameterization `V` into the
     // constrained kernel transform (`Z' = Z·V`) so the realized design columns

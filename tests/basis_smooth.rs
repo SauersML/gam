@@ -70,6 +70,8 @@ mod cyclic_bspline_second_derivative_periodicity_breaks;
 mod cyclic_duchon_torus_containment;
 #[path = "basis_smooth/difference_smooth_formula.rs"]
 mod difference_smooth_formula;
+#[path = "basis_smooth/double_penalty_annihilates_linear_trend_1371.rs"]
+mod double_penalty_annihilates_linear_trend_1371;
 #[path = "basis_smooth/double_penalty_edf_inflation_repro_1266.rs"]
 mod double_penalty_edf_inflation_repro_1266;
 #[path = "basis_smooth/double_penalty_retains_linear_trend_1371.rs"]
@@ -102,6 +104,8 @@ mod duchon_scale_and_memory;
 mod duchon_sin8_quality;
 #[path = "basis_smooth/duchon_structural_seminorms.rs"]
 mod duchon_structural_seminorms;
+#[path = "basis_smooth/duchon_translation_invariance_1375.rs"]
+mod duchon_translation_invariance_1375;
 #[path = "basis_smooth/effective_jacobian_at_bms_marginal_slope.rs"]
 mod effective_jacobian_at_bms_marginal_slope;
 #[path = "basis_smooth/effective_jacobian_at_gamlss.rs"]
