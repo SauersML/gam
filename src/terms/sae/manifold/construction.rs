@@ -3525,6 +3525,41 @@ impl SaeManifoldTerm {
                     coord_dims.clone(),
                     self.assignment.coord_offsets(),
                 )),
+                // #1408/#1409 PLAN (NOT yet implemented — documented precisely;
+                // deferred because the clean fix is a coordinated 3-site change
+                // whose value↔gradient coherence cannot be confirmed without the
+                // FD contract gates, and a partial version would desync them).
+                //
+                // Softmax currently never engages the compact top-k layout, so a
+                // `top_k`-capped softmax still optimizes all K atoms and the FFI
+                // truncates only AFTER the full-K fit (#1409,
+                // latent_basis_and_sae_ffi.rs ~2833/6392). To fold top-k into the
+                // optimization:
+                //   1. Return `Some(SaeRowLayout::from_dense_weights(softmax a_·,
+                //      k_active_cap = top_k.min(plan cap), relative_cutoff))` here,
+                //      exactly like the IBP branch below (the active set is the
+                //      per-row top-k softmax weights).
+                //   2. COMPACT CURVATURE (the load-bearing correctness step): the
+                //      compact branch must NOT write the `assignment_hdiag`
+                //      diagonal for softmax — that diagonal is the INDEFINITE exact
+                //      entropy Hessian (#1190), which drives the block non-PD. It
+                //      must instead write the ACTIVE×ACTIVE principal sub-block of
+                //      the Fisher metric `G = scale·(diag(a) − a aᵀ)` (PSD because
+                //      every principal submatrix of a PSD matrix is PSD), mirroring
+                //      the dense `softmax_dense` path. The full-K softmax
+                //      normalization is retained when forming `a` (the gate map),
+                //      so dropped tail logits contribute negligible (`O(a)`) mass.
+                //   3. COHERENCE: the logdet (`assignment_log_strength_hessian_trace`
+                //      softmax branch) and the θ-adjoint (`softmax_dense_adjoint`,
+                //      currently gated on the dense `None` layout) must BOTH be
+                //      extended to contract the SAME active-sub-block Fisher metric
+                //      and its `row_fisher_metric_logit_derivative` over the compact
+                //      logit slots — otherwise value, log|H|, and Γ desync (the
+                //      bug class `criterion_atoms.rs` exists to kill). This is the
+                //      part that needs the FD/contract gates to certify.
+                // #1409's hard-k-sparse softmax inner problem is then exactly the
+                // compact top-k layout fit; the FFI post-hoc truncation collapses
+                // to a no-op (the optimum is already k-sparse).
                 AssignmentMode::Softmax { .. } => None,
                 AssignmentMode::IBPMap { .. } => {
                     match self.sparse_active_plan() {
