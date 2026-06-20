@@ -8168,11 +8168,16 @@ impl SaeManifoldTerm {
     ///      `min(V'',0)` (the indefinite tail past a quarter period).
     /// `ΔC` is the sum of exactly these three deltas, each built from the SAME
     /// jets / penalty curvatures the assembly and the θ-adjoint use, so
-    /// `A = B + ΔC` is the one true Hessian. Restricted to the isotropic
-    /// (`row_metric == None`) path, where `jets.first/second` live in plain output
-    /// space and the √w-scaled residual `error` contracts `jets.second` to give
-    /// `w·r·∂²f` exactly; under an estimated whitening metric the jet whitening
-    /// convention differs, so the caller falls back to `B` there.
+    /// `A = B + ΔC` is the one true Hessian. Exact on BOTH the isotropic and the
+    /// whitened-metric paths: the data fit is `½ r_nᵀ M_n r_n`, so the residual
+    /// curvature is `Σ_out (M_n r_n)_out·∂²f_out/∂θ_a∂θ_b` — contract the
+    /// metric-applied √w-scaled residual `error_metric = √w·M_n r_n` (the SAME
+    /// quantity the assembly's β-tier gradient uses) against the RAW second jets
+    /// `jets.second`/`jets.beta_deriv` (the same raw-jet convention the whole
+    /// θ-adjoint and the Gauss-Newton `htt = J̃J̃ᵀ = J M Jᵀ` assembly use). On the
+    /// isotropic path `M_n = I` so `error_metric = √w·r` and `J M Jᵀ = JJᵀ`,
+    /// recovering the plain case. The softmax / ARD deltas are logit/coord-space
+    /// prior curvatures and carry no output metric, so they are path-independent.
     fn apply_exact_hessian_minus_b(
         &self,
         rho: &SaeManifoldRho,
@@ -8219,9 +8224,13 @@ impl SaeManifoldTerm {
             t: Array1::<f64>::zeros(total_t),
             beta: Array1::<f64>::zeros(cache.k),
         };
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
         let mut decoded = vec![0.0_f64; p];
         let mut fitted = Array1::<f64>::zeros(p);
-        let mut error = vec![0.0_f64; p];
+        let mut error = Array1::<f64>::zeros(p);
         for row in 0..n {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
@@ -8237,7 +8246,11 @@ impl SaeManifoldTerm {
             )?;
             let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
 
-            // √w-scaled per-row residual `r = √w·(fitted − target)` (isotropic).
+            // √w-scaled metric-applied per-row residual `error_metric = √w·M_n r_n`
+            // (the SAME object the assembly's β-tier gradient contracts). The
+            // data-fit `½ r_nᵀ M_n r_n` has residual curvature `Σ (M_n r_n)·∂²f`,
+            // so this is exactly the residual contracted against the raw `∂²f`
+            // jets. `M_n = I` on the isotropic path ⇒ `error_metric = √w·r`.
             fitted.fill(0.0);
             for k in 0..k_atoms {
                 self.atoms[k].fill_decoded_row(row, &mut decoded);
@@ -8249,6 +8262,10 @@ impl SaeManifoldTerm {
             for out_col in 0..p {
                 error[out_col] = sqrt_row_w * (fitted[out_col] - target[[row, out_col]]);
             }
+            let error_metric: Vec<f64> = match self.row_metric.as_ref() {
+                Some(metric) if whitens => metric.apply_metric_row(row, error.view()),
+                _ => error.to_vec(),
+            };
 
             // Local t-slice of `v` for this row.
             let v_t: Vec<f64> = (0..q).map(|c| v.t[base + c]).collect();
@@ -8257,7 +8274,7 @@ impl SaeManifoldTerm {
             for a in 0..q {
                 let mut acc = 0.0_f64;
                 for b in 0..q {
-                    let r_ab = sae_dot(&error, &jets.second[a][b]);
+                    let r_ab = sae_dot(&error_metric, &jets.second[a][b]);
                     acc += r_ab * v_t[b];
                 }
                 out.t[base + a] += acc;
@@ -8266,7 +8283,7 @@ impl SaeManifoldTerm {
             //      `jets.beta_deriv[a][β]` = ∂(∂f/∂β_β)/∂θ_a (the mixed second jet).
             for a in 0..q {
                 for (beta_pos, channel) in border.iter().enumerate() {
-                    let r_ab = sae_dot(&error, &jets.beta_deriv[a][beta_pos]);
+                    let r_ab = sae_dot(&error_metric, &jets.beta_deriv[a][beta_pos]);
                     // t row picks up β leg of v; β row picks up t leg of v.
                     out.t[base + a] += r_ab * v.beta[channel.index];
                     out.beta[channel.index] += r_ab * v_t[a];
@@ -8326,8 +8343,9 @@ impl SaeManifoldTerm {
     /// series `Σ_m (−B⁻¹ΔC)^m x_0`; it converges because `B` is the
     /// stability-conditioned approximation of `A` (`‖B⁻¹ΔC‖ < 1` near the
     /// optimum). Each step costs one matrix-free `ΔC` matvec and one `B⁻¹` solve
-    /// — no second factorization. Falls back to the plain `B⁻¹ rhs` (one step)
-    /// under an estimated whitening metric, where the jet convention differs.
+    /// — no second factorization. Exact on both the isotropic and the
+    /// whitened-metric paths (`apply_exact_hessian_minus_b` contracts the
+    /// metric-applied residual against the raw second jets in either case).
     fn solve_exact_stationarity(
         &self,
         rho: &SaeManifoldRho,
@@ -8340,15 +8358,6 @@ impl SaeManifoldTerm {
             format!("solve_exact_stationarity: B inverse: {err}")
         })?;
         let mut x = SaeArrowVector { t: x0.t.clone(), beta: x0.beta.clone() };
-        let whitens = self
-            .row_metric
-            .as_ref()
-            .is_some_and(|metric| metric.whitens_likelihood());
-        if whitens {
-            // Jet whitening convention differs under an estimated metric; the
-            // exact-A correction is not assembled there — use B⁻¹ (one step).
-            return Ok(x);
-        }
         // Fixed-point Neumann iteration with B⁻¹ preconditioner.
         const MAX_ITERS: usize = 24;
         const REL_TOL: f64 = 1.0e-10;
