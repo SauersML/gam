@@ -7905,6 +7905,70 @@ pub(crate) fn gradient_lane_finite_difference_fallback_recovers_singular_outer_g
     );
 }
 
+/// #1437 — the #1273 central-difference fallback's *failure mode* changed in
+/// #1431 (merged `c2553caf1`): an unmeasurable coordinate used to silently leave
+/// `gradient[i] = 0.0` (a fake "stationary" signal that poisoned BFGS curvature);
+/// it now returns a hard `Err`. The normal-fallback test above covers the
+/// success path, but nothing asserted the new honest-failure behaviour, so a
+/// regression to the fake-zero convention would go undetected.
+///
+/// A non-finite outer-ρ coordinate makes `probe_step_for(ρ_i)` non-finite
+/// (`1e-4 · |ρ_i|.max(1.0) = 1e-4 · ∞ = ∞`), tripping the function's first guard
+/// and returning `Err`. This deterministically exercises the Err arm without
+/// needing to construct a fully collapsed value path.
+#[test]
+pub(crate) fn central_difference_outer_gradient_errs_on_pathological_rho_no_fake_zero_1273() {
+    let objective = warmstart_test_objective();
+    // `from_flat` performs no validation (it is a plain struct copy), so an ∞
+    // coordinate survives into the probe-step computation.
+    let mut flat = objective.current_rho.to_flat();
+    flat[0] = f64::INFINITY;
+    let pathological = objective.baseline_rho.from_flat(flat.view());
+    let result = objective.central_difference_outer_gradient(&pathological);
+    assert!(
+        result.is_err(),
+        "#1431/#1437: an unmeasurable (non-finite-ρ) coordinate must propagate an \
+         Err, not a zero-padded fake-stationary direction; got {:?}",
+        result.ok()
+    );
+    // The error must be descriptive (carries the #1273 tag / coordinate), not a
+    // bare empty string, so the outer optimisation log can distinguish it.
+    let msg = result.unwrap_err();
+    assert!(
+        !msg.is_empty(),
+        "the Err must carry a descriptive reason for the aborted outer step; got empty"
+    );
+}
+
+/// #1437 — per-probe fresh-clone isolation (the other half of the #1273
+/// soundness rewrite): each probe differentiates a *fresh* clone of the snapshot
+/// warm state, so the gradient is deterministic across repeated calls and does
+/// not accumulate/leak warm-start cache state from a prior evaluation. Before
+/// #1431 one shared `&mut` probe term was reused across plus/minus/all
+/// coordinates, making the result order/state dependent.
+#[test]
+pub(crate) fn central_difference_outer_gradient_is_deterministic_under_per_probe_isolation_1273() {
+    let objective = warmstart_test_objective();
+    let g1 = objective
+        .central_difference_outer_gradient(&objective.current_rho)
+        .expect("FD fallback must succeed on the well-conditioned warmstart objective (#1273)");
+    let g2 = objective
+        .central_difference_outer_gradient(&objective.current_rho)
+        .expect("repeat FD fallback call must succeed (#1273)");
+    assert_eq!(
+        g1.len(),
+        g2.len(),
+        "FD outer gradient length must be stable across calls"
+    );
+    assert!(
+        g1.iter()
+            .zip(g2.iter())
+            .all(|(a, b)| (a - b).abs() <= 1e-12),
+        "#1273 per-probe isolation: repeated FD outer-gradient evaluations must be \
+         identical (no shared &mut state between probes); got {g1:?} vs {g2:?}"
+    );
+}
+
 #[test]
 pub(crate) fn deflated_solver_matches_plain_solve_when_no_gauge_is_installed() {
     let cache = diagonal_latent_cache(&[2.0_f64, 5.0, 7.0]);
