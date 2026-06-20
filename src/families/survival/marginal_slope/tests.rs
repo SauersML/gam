@@ -2559,6 +2559,24 @@ fn debug_flex_directional_quantities_fd_localize() {
             "INPUT f_a base {:+.6e} fd(f_a along dir) {:+.6e}",
             inb.f_a_base, fa_fd,
         );
+        // #932 f_au CERTIFICATION: FD(f_a) along dir=e_g = the TOTAL f_au[g]
+        // (includes crossing-edge motion since the FD re-solves the partition).
+        // Compare to the analytic moments-only f_au_base·dir = f_au_base[g]. The
+        // GAP is exactly the missing f_au moving-boundary term derived for #932
+        // (W_a·z_u + W_u·z_a + W_z·z_a·z_u + W·z_au, z_a=-1/b, z_ag=1/b²). A
+        // nonzero gap certifies the term is real and gives its magnitude/sign for
+        // the jet-932 tower to match.
+        let fau_dir_analytic: f64 = (0..p).map(|uu| inb.f_au_base[uu] * dir[uu]).sum();
+        eprintln!(
+            "INPUT f_au·dir(moments-only) {:+.6e} fd(f_a)=f_au[g]_total {:+.6e} BOUNDARY-GAP {:.3e}",
+            fau_dir_analytic,
+            fa_fd,
+            (fau_dir_analytic - fa_fd).abs(),
+        );
+        eprintln!(
+            "INPUT f_aa base(moments-only) {:+.6e}  [derived boundary corr = 2·W_a·z_a + W_z·z_a², z_a=-1/b]",
+            inb.f_aa_base,
+        );
     }
     // Per-term d_uv_dir localization at the (w0,w0) probe block: FD each base
     // term integral T_i (from the directional struct's debug_d_uv_terms.0) and
