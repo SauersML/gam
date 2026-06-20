@@ -1,3 +1,88 @@
+## v0.3.119 — gam 0.3.119 / gamfit 0.1.221 (2026-06-20)
+
+crates.io + PyPI release. Ships the open-issue bug-fix wave landed since
+gamfit 0.1.220: smoothing-parameter calibration across all 1-D and cyclic
+bases, complexity-aware model comparison, thin-plate / Duchon penalty
+consistency, survival self-flux geometry, the manifold-SAE OOS reconstruction
+fix, and a large dead-code / CI-hygiene cleanup. Highlights:
+
+**Smoothing-parameter calibration (penalty normalization)**
+- **#1365 / #1366**: every 1-D B-spline bending/ridge penalty — open *and*
+  cyclic `bs="ps"` / `bs="cc"`, across penalty orders — is now Frobenius-
+  normalized *in the constrained (post-identifiability) frame*, matching the
+  `cr` / Duchon / tensor bases. REML's `λ` multiplies the shipped, constrained
+  block, so an un-normalized `S` put `λ` on a basis-dependent scale and the
+  outer search under-/over-smoothed: `s(x,bs="ps")` over-fit linear data at
+  EDF ≈ 5 with spurious curvature while normalized `bs="cr"` collapsed to
+  EDF ≈ 2 on identical data. Fit-invariant at the REML optimum (only the
+  recorded `λ̂` rescales). Certified by
+  `tests/audit_penalty_normalization_scale_equivariance.rs`.
+- **#1357**: keep the default 2-D Matérn smooth from collapsing to a constant.
+- **#1356**: reconcile `edf_total` with the influence-matrix EDF for degenerate
+  thin-plate Hessians.
+
+**Model comparison**
+- **#1362**: `compare_models` ranks/selects the winner on the Occam-penalized
+  conditional AIC (`−2ℓ + 2·edf`) whenever the log-likelihood and EDF are
+  available, instead of the raw REML/LAML evidence headline. The marginal
+  likelihood under-penalizes an added pure-noise smooth (a finite-`λ̂` null
+  smooth still spends EDF fitting noise), so a noise-augmented `y ~ s(x) + s(z)`
+  with `z ⟂ y` no longer beats `y ~ s(x)`. The `score_table` still reports the
+  unaltered evidence, so `Model.evidence` / `bayes_factor_vs` stay consistent.
+
+**Thin-plate / Duchon**
+- **#1266**: fix double-penalty EDF inflation in the tensor/thin-plate path.
+- **#1347**: reparameterize the thin-plate bending penalty in the data metric;
+  drop the dead env-gated penalty-spectrum diagnostics.
+- **#1355**: make the Duchon data-metric reparameterization bit-consistent
+  across the ψ-derivative and predict paths; stop ARC cost-stall from
+  publishing a worse over-smoothing corner.
+
+**Smooth-term inference**
+- **#1360**: align the smooth-term Wald test and reported EDF to the global
+  coefficient block, and floor the smooth-test reference d.f. at the tested
+  rank (with unit tests).
+
+**Survival**
+- **#932 / #979**: add the second-order self-flux to the flex density Hessian
+  boundary and derive the observed flex directional crosses with jets; harden
+  the #979 inner-solve (feasibility-path rejection counting in the joint-Newton
+  stall guard, non-finite exact-joint gradients rejected as infeasible rather
+  than aborting).
+
+**Manifold-SAE**
+- **#1228 / #1233**: the trained dictionary's hybrid-collapsed straight
+  sub-models are now actually threaded through the held-out
+  (`sae_manifold_predict_oos`) reconstruction — the FFI advertised and the
+  Python wheel passed `hybrid_linear_images`, but the argument was dropped, so
+  out-of-sample `reconstruct()` of a hybrid-collapsed dictionary silently fell
+  back to the curved decoder instead of matching the train-side reconstruction.
+- **#1026**: corpus-discovery locator for the full-width EV-vs-K acceptance
+  ladder; held-out EV frontier runner.
+- **#1273**: deflate the decoder column-span null in the SAE outer gradient and
+  make the REML outer engine robust to a near-singular circle-topology joint
+  Hessian.
+- **#1282**: anchor signed-circle top-1 routing on the sign boundary (not the
+  batch median); prefer the signed quadratic anchor.
+
+**Tensor smooths & formula DSL**
+- **#1279 / #1283 / #1284**: accept tensor-tuple `k` syntax, fix tensor smooth
+  Python syntax, and improve smooth-parameter syntax-error diagnostics.
+
+**REML / numerics**
+- **#1033**: n-free Gaussian REML cost log-likelihood from the cached deviance;
+  ψ-Gram certification on standardized geometry; skip stale row predictions for
+  the cached Gaussian PLS.
+- **#1354**: use `PCG_HVP_REL_TOL` for the inner CG solve and apply Bessel
+  correction to the HVP variance.
+
+**Maintenance**
+- **#1288**: large dead-code sweep — removed vestigial REML operators/accessors,
+  unused convenience wrappers, debug-only guards, and legacy constructors.
+- Build / CI hygiene: restored the `cargo fmt` gate (fixer-agent code had landed
+  unformatted, hard-failing Rust CI before it could reach the test phase) and
+  cleared the in-window compiler-warning cruft.
+
 ## v0.3.118 — gam 0.3.118 / gamfit 0.1.219 (2026-06-17)
 
 crates.io + PyPI release. The `gam` crate is bumped 0.3.117 → 0.3.118: this is a
