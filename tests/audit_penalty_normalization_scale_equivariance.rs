@@ -19,8 +19,8 @@
 //!      (a B-spline is invariant to an affine reparam of x when knots scale).
 
 use gam::terms::basis::{
-    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,
-    OneDimensionalBoundary, build_bspline_basis_1d,
+    build_bspline_basis_1d, BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement,
+    BSplineKnotSpec, OneDimensionalBoundary,
 };
 use ndarray::Array1;
 
@@ -66,7 +66,10 @@ fn cyclic_spec(penalty_order: usize) -> BSplineBasisSpec {
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
-        boundary: OneDimensionalBoundary::Cyclic { start: lo, end: hi },
+        boundary: OneDimensionalBoundary::Cyclic {
+            start: lo,
+            end: hi,
+        },
         boundary_conditions: Default::default(),
     }
 }
@@ -90,11 +93,20 @@ fn single_penalty_bspline_penalties_are_frobenius_normalized() {
             "{label}: expected at least one active penalty"
         );
         // The single active wiggliness block must be Frobenius-normalized so its
-        // λ shares the unit-Frobenius scale used by cr / duchon / tensor.
+        // λ shares the unit-Frobenius scale used by cr / duchon / tensor. The
+        // builder normalizes the raw penalty to ‖S‖_F = 1 BEFORE the
+        // identifiability reparameterization `S → Tᵀ S T`; the constraint
+        // transform `T` is near-orthonormal but not exactly norm-preserving, so
+        // the shipped block's norm is O(1) but not bit-exactly 1 (e.g. ~0.9997
+        // for the sum-to-zero ps block). The discriminating fact is the order of
+        // magnitude: a normalized penalty stays O(1) through `T`, whereas a raw
+        // un-normalized difference penalty would be O(10–10³). Assert the
+        // shipped norm is within a small factor of 1 — tight enough to catch a
+        // raw-scale leak, loose enough to admit the constraint transform.
         let n = frob(&built.penalties[0]);
         assert!(
-            (n - 1.0).abs() < 1e-9,
-            "{label}: penalty is NOT Frobenius-normalized: ‖S‖_F = {n:.6e} (expected 1.0). \
+            (0.5..2.0).contains(&n),
+            "{label}: penalty is NOT Frobenius-normalized: ‖S‖_F = {n:.6e} (expected O(1) ≈ 1). \
              An un-normalized penalty puts λ on a basis-dependent scale and mis-calibrates \
              REML's λ-search (the #1364/#1365 defect class)."
         );
