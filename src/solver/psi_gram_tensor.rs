@@ -109,28 +109,6 @@ pub const PSI_GRAM_SKIP_RANK_RTOL: f64 = 1.0e-10;
 /// of magnitude, so it refuses the skip well before the ~1e-6 β̂ bar is at risk.
 pub const PSI_GRAM_SKIP_PROJ_ATOL: f64 = 1.0e-7;
 
-/// Maximum ψ move `|ψ_new − ψ_ref|` over which the anchor-corrected n-free skip
-/// re-key stays β̂-sound (#1033). The design-revision fast path stores
-/// `G_exact(ψ_ref) − G_interp(ψ_ref)` at the pin and adds it to every re-keyed
-/// trial Gram (`install_psi_gram_statistics`, joint_hyper.rs:620-650), so the
-/// Gram is EXACT at ψ_ref and the inner-solve β̂ error is bounded by the
-/// Chebyshev interpolation drift accumulated over the MOVE `ψ_ref → ψ_new`, NOT
-/// by the absolute conditioning at ψ_new. Within a fixed numerical rank that
-/// drift is smooth and monotone in the move, so a move-radius gate (paired with a
-/// rank match) keeps β̂ under the 1e-6 issue bar while letting the skip fire for
-/// the dense interior κ-trials that sit close to the pin — exactly the
-/// n-independence #1033 needs. This is strictly less conservative than (and
-/// supersedes, for the skip gate) the range-PROJECTOR witness
-/// [`PsiGramTensor::reduced_basis_equal`], which refused ANY rotation even where
-/// β̂ was sound.
-///
-/// CALIBRATION: set from the forced-skip β̂rel-vs-move ladder
-/// (`psi_gram_skip_forced_rotation_beta_error_ladder_diag`, MSI) — the largest
-/// move whose anchor-corrected β̂rel stays ≤ 1e-6, with margin. A value of `0.0`
-/// makes the gate accept only exact-ψ repeats (identical to the old
-/// refuse-everything behaviour: conservative, never ships a wrong β̂).
-pub const PSI_GRAM_SKIP_MAX_PSI_MOVE: f64 = 0.0; // TODO(#1033): set from MSI ladder
-
 /// Certified Chebyshev-in-ψ expansion of a design-moving Gram (#1033b).
 ///
 /// Holds the one-time Chebyshev sufficient-statistic series; every per-trial
@@ -608,53 +586,6 @@ impl PsiGramTensor {
             .iter()
             .zip(p_new.iter())
             .all(|(a, b)| (a - b).abs() <= PSI_GRAM_SKIP_PROJ_ATOL)
-    }
-
-    /// True when the anchor-corrected design-revision skip from `psi_ref` to
-    /// `psi_new` is β̂-SOUND (#1033) — the production skip precondition that
-    /// replaces the over-conservative [`Self::reduced_basis_equal`] projector
-    /// witness for the κ outer loop.
-    ///
-    /// The skip re-keys the Gram with an anchor correction that makes it EXACT at
-    /// `psi_ref` (`install_psi_gram_statistics`), so the inner-solve β̂ error is
-    /// the Chebyshev interpolation drift over the MOVE `psi_ref → psi_new`, which
-    /// is smooth and bounded as long as (a) the numerical rank of the conditioned
-    /// Gram is UNCHANGED — a rank flip moves a near-cutoff direction in/out of the
-    /// reduced solve and breaks the re-key discontinuously — and (b) the move
-    /// stays within the calibrated radius [`PSI_GRAM_SKIP_MAX_PSI_MOVE`] under
-    /// which that drift keeps β̂ below the 1e-6 issue bar. Both conditions are
-    /// assembled n-free from the k-space tensor (the rank via the same
-    /// range-projector eigendecomposition the witness uses), so this stays O(k³)
-    /// per trial.
-    ///
-    /// Unlike `reduced_basis_equal` this does NOT require the reduced SUBSPACE to
-    /// be projector-identical: within a fixed rank the anchor-corrected re-key is
-    /// sound across a basis ROTATION (β̂ in original k-space is gauge-invariant to
-    /// the in-range basis choice), so the projector test was rejecting sound
-    /// skips. The rank match is the genuine hard requirement; the move radius
-    /// bounds the residual interpolation error.
-    ///
-    /// `psi_ref == psi_new` is trivially sound. Off-window ψ's, a non-finite /
-    /// rank-degenerate Gram, an eigendecomp failure, a rank change, or a move
-    /// beyond the radius all return `false` (refuse → caller takes the exact slow
-    /// path).
-    pub fn reduced_basis_skip_sound(&self, psi_ref: f64, psi_new: f64) -> bool {
-        if !(self.contains(psi_ref) && self.contains(psi_new)) {
-            return false;
-        }
-        if psi_ref == psi_new {
-            return true;
-        }
-        if (psi_new - psi_ref).abs() > PSI_GRAM_SKIP_MAX_PSI_MOVE {
-            return false;
-        }
-        let Some((_, r_ref)) = self.range_projector(psi_ref, PSI_GRAM_SKIP_RANK_RTOL) else {
-            return false;
-        };
-        let Some((_, r_new)) = self.range_projector(psi_new, PSI_GRAM_SKIP_RANK_RTOL) else {
-            return false;
-        };
-        r_ref == r_new
     }
 
     /// True when `psi` lies inside the certified window.
