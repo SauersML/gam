@@ -2059,8 +2059,29 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
                 }
             }
         }
+        // Coalesce repeated axes before building stencils. A coordinate that
+        // appears as two separate order-1 entries would be differenced by
+        // COMPOSING two independent ±h shifts, i.e. 0.25·[f(x+2h) − 2f(x) +
+        // f(x−2h)] — a second difference at the DOUBLED step 2h, whose leading
+        // O(h²) truncation is ~16× that of the compact 3-point order-2 stencil
+        // [(-1,1),(0,-2),(1,1)] at step h. Richardson extrapolation cancels the
+        // leading term in both cases, but the residual O(h⁴) constant inherits
+        // the same blow-up, so a cross-derivative that hits one axis twice
+        // (e.g. the ∂³/∂g²∂β_w block, axes [(g,1),(β_w,1),(g,1)]) drifts far
+        // enough to break the tight third-order gate while every all-distinct
+        // block stays well inside it. Summing the orders of repeated indices
+        // keeps each coordinate on its tightest single stencil at step h, so
+        // the witness is a faithful ground truth for repeated-axis blocks too.
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(axes.len());
+        for &(idx, ord) in axes {
+            if let Some(slot) = merged.iter_mut().find(|(i, _)| *i == idx) {
+                slot.1 += ord;
+            } else {
+                merged.push((idx, ord));
+            }
+        }
         let mut total_order = 0usize;
-        let stencils: Vec<(usize, &'static [(i64, f64)])> = axes
+        let stencils: Vec<(usize, &'static [(i64, f64)])> = merged
             .iter()
             .map(|&(idx, ord)| {
                 total_order += ord;
