@@ -757,6 +757,14 @@ impl SurvivalMarginalSlopeFamily {
         let mut chi_uv = Array2::<f64>::zeros((p, p));
         let mut eta_uv_dir = Array2::<f64>::zeros((p, p));
         let mut chi_uv_dir = Array2::<f64>::zeros((p, p));
+        #[cfg(test)]
+        let mut r_uv_dir_dbg = Array2::<f64>::zeros((p, p));
+        #[cfg(test)]
+        let mut chi_uv_fixed_dir_dbg = Array2::<f64>::zeros((p, p));
+        #[cfg(test)]
+        let mut r_uv_base_dbg = Array2::<f64>::zeros((p, p));
+        #[cfg(test)]
+        let mut chi_uv_fixed_base_dbg = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
                 let a_uv_jet = MultiDirJet::bilinear(a_uv[[u, v]], a_uv_dir[[u, v]], 0.0, 0.0);
@@ -826,6 +834,17 @@ impl SurvivalMarginalSlopeFamily {
                 eta_uv_dir[[v, u]] = eta_uv_dir[[u, v]];
                 chi_uv_dir[[u, v]] = chi_uv_jet.coeff(1);
                 chi_uv_dir[[v, u]] = chi_uv_dir[[u, v]];
+                #[cfg(test)]
+                {
+                    r_uv_dir_dbg[[u, v]] = r_uv_jet.coeff(1);
+                    r_uv_dir_dbg[[v, u]] = r_uv_jet.coeff(1);
+                    chi_uv_fixed_dir_dbg[[u, v]] = chi_uv_fixed_jet.coeff(1);
+                    chi_uv_fixed_dir_dbg[[v, u]] = chi_uv_fixed_jet.coeff(1);
+                    r_uv_base_dbg[[u, v]] = r_uv_jet.coeff(0);
+                    r_uv_base_dbg[[v, u]] = r_uv_jet.coeff(0);
+                    chi_uv_fixed_base_dbg[[u, v]] = chi_uv_fixed_jet.coeff(0);
+                    chi_uv_fixed_base_dbg[[v, u]] = chi_uv_fixed_jet.coeff(0);
+                }
             }
         }
         let eta_u_dir = eta_uv.dot(dir);
@@ -1706,6 +1725,29 @@ impl SurvivalMarginalSlopeFamily {
             d_uv_dir,
             #[cfg(test)]
             debug_d_uv_terms,
+            #[cfg(test)]
+            debug_eta_uv_inputs: Some(
+                crate::families::survival::marginal_slope::primary_geometry::DebugEtaUvInputs {
+                    chi_dir,
+                    eta_aa_dir,
+                    eta_aaa_dir,
+                    tau_dir: tau_dir.clone(),
+                    tau_a_dir: tau_a_dir.clone(),
+                    a_u_dir: a_u_dir.clone(),
+                    a_uv_dir: a_uv_dir.clone(),
+                    r_uv_dir: r_uv_dir_dbg,
+                    chi_uv_fixed_dir: chi_uv_fixed_dir_dbg,
+                    chi_base: chi_val,
+                    eta_aa_base: eta_aa,
+                    eta_aaa_base: eta_aaa,
+                    tau_base: tau.clone(),
+                    tau_a_base: tau_a.clone(),
+                    a_u_base: a_u.clone(),
+                    a_uv_base: a_uv.clone(),
+                    r_uv_base: r_uv_base_dbg,
+                    chi_uv_fixed_base: chi_uv_fixed_base_dbg,
+                },
+            ),
         })
     }
 }

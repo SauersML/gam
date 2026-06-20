@@ -277,6 +277,41 @@ pub(crate) struct SurvivalFlexTimepointDirectionalExact {
     /// builds; `None` otherwise.
     #[cfg(test)]
     pub(crate) debug_d_uv_terms: Option<([f64; 5], [f64; 5])>,
+    /// #932 debug: directional channels of the interior `eta_uv`/`chi_uv` jet
+    /// INPUTS, so the FD-localizer can pin which input's dir channel under-counts
+    /// the (g,w0)/(g,g) interior cross. Indexed by primary; matrices full p×p.
+    /// `(a_uv_dir, tau_dir, tau_a_dir, a_u_dir, chi_dir, eta_aa_dir, eta_aaa_dir,
+    /// r_uv_dir, chi_uv_fixed_dir)`. Populated only in test builds.
+    #[cfg(test)]
+    pub(crate) debug_eta_uv_inputs: Option<DebugEtaUvInputs>,
+}
+
+/// #932 FD-localizer bundle: directional channels of the interior second-order
+/// jet inputs, used only by `debug_flex_directional_quantities_fd_localize`.
+#[cfg(test)]
+pub(crate) struct DebugEtaUvInputs {
+    pub(crate) chi_dir: f64,
+    pub(crate) eta_aa_dir: f64,
+    pub(crate) eta_aaa_dir: f64,
+    pub(crate) tau_dir: Array1<f64>,
+    pub(crate) tau_a_dir: Array1<f64>,
+    pub(crate) a_u_dir: Array1<f64>,
+    pub(crate) a_uv_dir: Array2<f64>,
+    /// `r_uv_dir[[u,v]]` = directional channel of the eta_uv fixed cross.
+    pub(crate) r_uv_dir: Array2<f64>,
+    /// `chi_uv_fixed_dir[[u,v]]` = directional channel of the chi_uv fixed cross.
+    pub(crate) chi_uv_fixed_dir: Array2<f64>,
+    // Base (non-directional) values of the same inputs, so the harness can FD
+    // each base along dir and compare to the dir channel above.
+    pub(crate) chi_base: f64,
+    pub(crate) eta_aa_base: f64,
+    pub(crate) eta_aaa_base: f64,
+    pub(crate) tau_base: Array1<f64>,
+    pub(crate) tau_a_base: Array1<f64>,
+    pub(crate) a_u_base: Array1<f64>,
+    pub(crate) a_uv_base: Array2<f64>,
+    pub(crate) r_uv_base: Array2<f64>,
+    pub(crate) chi_uv_fixed_base: Array2<f64>,
 }
 
 pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {

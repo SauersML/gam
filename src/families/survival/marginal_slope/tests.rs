@@ -2444,6 +2444,72 @@ fn debug_flex_directional_quantities_fd_localize() {
             (ext.d_u_dir[u] - d_u_fd_fine).abs()
         );
     }
+    // ── #932 interior-input isolation: FD each eta_uv/chi_uv jet INPUT's base
+    // along dir at the (g,g) and (g,w0) blocks and compare to its production
+    // directional channel. Whichever input's dir channel disagrees with the FD
+    // of its own base is the undercounted term feeding eta_uv_dir/chi_uv_dir.
+    {
+        let inputs_at = |s: f64| -> DebugEtaUvInputs {
+            let q = q1v + s * dir[primary.q1];
+            let gg = gv + s * dir[primary.g];
+            let (a, _d) = family
+                .solve_row_survival_intercept_with_slot(
+                    q,
+                    gg,
+                    Some(&beta_h),
+                    Some(&beta_w),
+                    Some((0, SurvivalInterceptSlotKind::Exit)),
+                )
+                .expect("input-probe intercept");
+            family
+                .build_cached_partition(&primary, a, gg, Some(&beta_h), Some(&beta_w))
+                .and_then(|cached| {
+                    family.compute_survival_timepoint_directional_exact_from_cached(
+                        0,
+                        &primary,
+                        q,
+                        primary.q1,
+                        a,
+                        gg,
+                        Some(&beta_h),
+                        Some(&beta_w),
+                        &cached,
+                        &dir,
+                        true,
+                    )
+                })
+                .expect("input-probe dir")
+                .debug_eta_uv_inputs
+                .expect("debug inputs")
+        };
+        let inb = ext.debug_eta_uv_inputs.as_ref().expect("debug inputs");
+        let hh = 2e-3_f64;
+        let plus = inputs_at(hh);
+        let minus = inputs_at(-hh);
+        let fd_s = |p: f64, m: f64| (p - m) / (2.0 * hh);
+        eprintln!(
+            "INPUT chi_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | eta_aa_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | eta_aaa_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
+            inb.chi_dir, fd_s(plus.chi_base, minus.chi_base), (inb.chi_dir - fd_s(plus.chi_base, minus.chi_base)).abs(),
+            inb.eta_aa_dir, fd_s(plus.eta_aa_base, minus.eta_aa_base), (inb.eta_aa_dir - fd_s(plus.eta_aa_base, minus.eta_aa_base)).abs(),
+            inb.eta_aaa_dir, fd_s(plus.eta_aaa_base, minus.eta_aaa_base), (inb.eta_aaa_dir - fd_s(plus.eta_aaa_base, minus.eta_aaa_base)).abs(),
+        );
+        for &u in &[q1, g, w0] {
+            eprintln!(
+                "INPUT[{u}] tau_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | tau_a_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | a_u_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
+                inb.tau_dir[u], fd_s(plus.tau_base[u], minus.tau_base[u]), (inb.tau_dir[u] - fd_s(plus.tau_base[u], minus.tau_base[u])).abs(),
+                inb.tau_a_dir[u], fd_s(plus.tau_a_base[u], minus.tau_a_base[u]), (inb.tau_a_dir[u] - fd_s(plus.tau_a_base[u], minus.tau_a_base[u])).abs(),
+                inb.a_u_dir[u], fd_s(plus.a_u_base[u], minus.a_u_base[u]), (inb.a_u_dir[u] - fd_s(plus.a_u_base[u], minus.a_u_base[u])).abs(),
+            );
+        }
+        for &(u, v) in &[(g, g), (g, w0), (w0, w0)] {
+            eprintln!(
+                "INPUT[{u},{v}] a_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | r_uv_dir prod {:+.6e} fd {:+.6e} gap {:.2e} | chi_uv_fixed_dir prod {:+.6e} fd {:+.6e} gap {:.2e}",
+                inb.a_uv_dir[[u, v]], fd_s(plus.a_uv_base[[u, v]], minus.a_uv_base[[u, v]]), (inb.a_uv_dir[[u, v]] - fd_s(plus.a_uv_base[[u, v]], minus.a_uv_base[[u, v]])).abs(),
+                inb.r_uv_dir[[u, v]], fd_s(plus.r_uv_base[[u, v]], minus.r_uv_base[[u, v]]), (inb.r_uv_dir[[u, v]] - fd_s(plus.r_uv_base[[u, v]], minus.r_uv_base[[u, v]])).abs(),
+                inb.chi_uv_fixed_dir[[u, v]], fd_s(plus.chi_uv_fixed_base[[u, v]], minus.chi_uv_fixed_base[[u, v]]), (inb.chi_uv_fixed_dir[[u, v]] - fd_s(plus.chi_uv_fixed_base[[u, v]], minus.chi_uv_fixed_base[[u, v]])).abs(),
+            );
+        }
+    }
     // Per-term d_uv_dir localization at the (w0,w0) probe block: FD each base
     // term integral T_i (from the directional struct's debug_d_uv_terms.0) and
     // compare to the analytic dir term integral T_i_dir (debug_d_uv_terms.1).
