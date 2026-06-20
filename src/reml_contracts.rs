@@ -14,7 +14,7 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 #[cold]
 fn reml_contract_panic(message: impl Into<String>) -> ! {
-    panic!("{}", message.into())
+    std::panic::panic_any(message.into())
 }
 
 /// Evaluation mode for the unified evaluator.
