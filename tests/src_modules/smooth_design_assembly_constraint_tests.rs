@@ -5340,6 +5340,35 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         }
         x.t().dot(&wx)
     };
+    // Exact RHS XᵀW(y−offset) from the realized design (the object the streamed
+    // inner solve forms). β̂ depends on this too; the earlier 1e-13 check only
+    // covered the Gram, not the RHS.
+    let exact_rhs_at = |psi: f64| -> Array1<f64> {
+        let mut c = make_cache();
+        let mut th = theta0.clone();
+        th[rho_dim] = psi;
+        c.ensure_theta(&th).expect("ensure_theta exact");
+        let x = c.design().design.to_dense();
+        let mut wz = Array1::<f64>::zeros(x.nrows());
+        for ((s, &wi), (&yi, &oi)) in wz
+            .iter_mut()
+            .zip(weights.iter())
+            .zip(y.iter().zip(offset.iter()))
+        {
+            *s = wi * (yi - oi);
+        }
+        x.t().dot(&wz)
+    };
+    let vec_rel = |a: &Array1<f64>, b: &Array1<f64>| -> f64 {
+        let num: f64 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let den: f64 = b.iter().map(|y| y * y).sum::<f64>().sqrt().max(1e-300);
+        num / den
+    };
     // Clone the tensor Arc so the Gram accessor does not hold a borrow of
     // `tensor_eval` across the loop's `&mut tensor_eval` eval calls.
     let tensor_arc = tensor_eval
@@ -5348,8 +5377,11 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         .expect("tensor attached")
         .clone();
     let tensor_gram_at = |psi: f64| -> Array2<f64> { tensor_arc.gram_at(psi) };
+    let tensor_rhs_at = |psi: f64| -> Array1<f64> { tensor_arc.rhs_at(psi) };
     let g_interp_a = tensor_gram_at(psi_a);
     let g_exact_a = exact_gram_at(psi_a);
+    let r_interp_a = tensor_rhs_at(psi_a);
+    let r_exact_a = exact_rhs_at(psi_a);
 
     let mut worst_forced = 0.0_f64;
     for &f in &fracs {
@@ -5383,9 +5415,22 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         g_anchored -= &g_interp_a;
         let anchored_res = frob_rel(&g_anchored, &g_exact);
 
+        // RHS attribution: the inner solve needs XᵀW(y−offset) too. Compare the
+        // tensor interp + anchored RHS to the exact realized RHS. If the Gram is
+        // machine-exact but β̂ floors, the RHS (or penalty) is the remaining
+        // suspect.
+        let r_interp = tensor_rhs_at(psi);
+        let r_exact = exact_rhs_at(psi);
+        let rhs_interp_res = vec_rel(&r_interp, &r_exact);
+        let mut r_anchored = r_interp.clone();
+        r_anchored += &r_exact_a;
+        r_anchored -= &r_interp_a;
+        let rhs_anchored_res = vec_rel(&r_anchored, &r_exact);
+
         eprintln!(
             "[DIAG1033-FORCE] frac={f:+.5} psi={psi:.5} covers_skip={gate} forced_β̂rel={rel:.3e} \
-             gram_interp_res={interp_res:.3e} gram_anchored_res={anchored_res:.3e} {}",
+             gram_interp_res={interp_res:.3e} gram_anchored_res={anchored_res:.3e} \
+             rhs_interp_res={rhs_interp_res:.3e} rhs_anchored_res={rhs_anchored_res:.3e} {}",
             if rel <= 1e-6 { "SOUND(≤1e-6)" } else { "UNSOUND(>1e-6)" }
         );
         // Re-pin at ψ_A after each forced trial so every measurement is a move
