@@ -1249,6 +1249,92 @@ fn survival_ls_joint_jet_tower_oracle_body() {
     }
 }
 
+/// The hand-derived analytic joint-Hessian directional derivative
+/// (`exact_newton_joint_hessian_directional_derivative_from_parts`, the path
+/// that is always taken because `row_kernel_directional_supported()` is
+/// hard-disabled) must agree with the jet-tower-certified generic row-kernel
+/// directional derivative on a FULLY TIME-VARYING family — i.e. with the
+/// derivative threshold/log-sigma channels (the velocity / `qdot` coordinate)
+/// live. The pre-existing FD coverage only exercises non-time-varying
+/// fixtures, where the velocity coordinate is inert, so it cannot witness a
+/// dropped `qdot` third-order contribution.
+#[test]
+fn survival_ls_joint_directional_derivative_matches_tower_time_varying() {
+    let join_result = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(survival_ls_joint_directional_derivative_time_varying_body)
+        .expect("spawn wide-stack directional-derivative thread")
+        .join();
+    assert!(
+        join_result.is_ok(),
+        "survival LS joint directional-derivative time-varying oracle thread must complete"
+    );
+}
+
+fn survival_ls_joint_directional_derivative_time_varying_body() {
+    use crate::families::row_kernel::{RowSet, row_kernel_directional_derivative_generic};
+
+    let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+        [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+        [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+    ];
+    let event = [1.0, 1.0, 1.0, 0.35];
+    let weight = [1.0, 1.2, 1.1, 1.3];
+
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let inverse_link = residual_distribution_inverse_link(distribution);
+        let family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+        let states = survival_ls_joint_oracle_states(&primaries);
+        let q = family
+            .collect_joint_quantities(&states)
+            .expect("collect joint quantities");
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("dynamic geometry");
+        let kernel = SurvivalLsRowKernel {
+            family: &family,
+            q: &q,
+            dynamic: &dynamic,
+            deriv_log_scale: 0.0,
+            offsets: family.joint_block_offsets(),
+        };
+        for direction in [
+            array![0.7, -0.5, 0.9],
+            array![-1.1, 0.8, 0.3],
+            array![0.4, 1.2, -0.6],
+            array![1.0, 0.0, 0.0],
+            array![0.0, 1.0, 0.0],
+            array![0.0, 0.0, 1.0],
+        ] {
+            let dir_slice = direction.as_slice().expect("contiguous direction");
+            let reference =
+                row_kernel_directional_derivative_generic(&kernel, &RowSet::All, dir_slice)
+                    .expect("tower-certified directional derivative");
+            let hand = family
+                .exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
+                    &direction, &q, &dynamic, 0.0,
+                )
+                .expect("hand directional derivative")
+                .expect("hand directional derivative present");
+            assert_eq!(reference.dim(), hand.dim(), "directional dH shape");
+            for ((a, b), &want) in reference.indexed_iter() {
+                let got = hand[[a, b]];
+                assert!(
+                    (got - want).abs() <= 1e-7 * (1.0 + want.abs()),
+                    "{distribution:?} dir={direction} joint directional dH[{a}][{b}] mismatch: \
+                     hand={got} tower-reference={want}"
+                );
+            }
+        }
+    }
+}
+
 /// #921: the `RowKernel<9>` repackaging must reproduce the bespoke joint
 /// assembly bit-for-bit. We build a non-time-varying, non-wiggle fixture
 /// (the config the kernel covers), then assert the generic row-kernel engine

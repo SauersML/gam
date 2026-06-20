@@ -1062,7 +1062,6 @@ impl SurvivalLocationScaleFamily {
 
         let delta_h0 = dynamic.time_jac_entry.dot(&time_dir);
         let delta_h1 = dynamic.time_jac_exit.dot(&time_dir);
-        let delta_d = dynamic.time_jac_deriv.dot(&time_dir);
         let delta_t_exit = self.x_threshold.matrixvectormultiply(&threshold_dir);
         let delta_ls_exit = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir);
         let deltaw = match (self.x_link_wiggle.as_ref(), wiggle_dir.as_ref()) {
@@ -1187,10 +1186,13 @@ impl SurvivalLocationScaleFamily {
         let du1 = &delta_h1 + &delta_q_exit;
         let dh_h0 = &q.d_h_h0 * &du0;
         let dh_h1 = &q.d_h_h1 * &du1;
-        let dh_d = &q.d_h_d * &delta_d;
+        // The d_raw (event-Jacobian g) self-term and every other velocity
+        // coordinate contribution are added below as a single complete
+        // g-coordinate pullback pass; the old `time_jac_deriv·(d_h_d·Δd)`
+        // term covered only the Δd (pure-time) slice of that coupling and is
+        // therefore folded into the general pass instead.
         let d_h_time = mxtwxd(&dynamic.time_jac_entry, &(-&dh_h0), row_mask)
-            + mxtwxd(&dynamic.time_jac_exit, &(-&dh_h1), row_mask)
-            + mxtwxd(&dynamic.time_jac_deriv, &dh_d, row_mask);
+            + mxtwxd(&dynamic.time_jac_exit, &(-&dh_h1), row_mask);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &d_h_time);
 
         if let Some(x_t_en) = x_threshold_entry.as_ref() {
@@ -1410,6 +1412,122 @@ impl SurvivalLocationScaleFamily {
             let d_h_h0w = mxtwx(&self.x_time_entry, &(-&dh_h0), xw_dense, row_mask)?;
             let d_h_h1w = mxtwx(&self.x_time_exit, &(-&dh_h1), xw_dense, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[0], w_offset, &(d_h_h0w + d_h_h1w));
+        }
+
+        // Velocity coordinate (event Jacobian g = d_raw + qdot) directional
+        // Hessian derivative. The block assembly above differentiates only the
+        // two q-index coordinates u0, u1; g couples the d_raw, threshold, and
+        // log-σ channels through qdot and contributes its own third-order term
+        // to every coefficient block it touches. In channel space g is the
+        // closed form
+        //     g = ch2 + e·(ch3·ch8 − ch5),   e = exp(−ch6),
+        // with ch2 = d_raw, ch3 = η_t exit, ch5 = η_t deriv, ch6 = η_logσ
+        // exit, ch8 = η_logσ deriv. Writing φ′ = ∂ℓ/∂g (d1_qdot1),
+        // φ″ = ∂²ℓ/∂g² (d2_qdot1), φ‴ = ∂³ℓ/∂g³ (d_h_d), the contribution of g
+        // to the NLL-Hessian directional derivative ∂(−∂²ℓ)/∂β·Δβ is
+        //   −[ φ‴(g′·Δ) g′⊗g′ + φ″(g″[Δ]⊗g′ + g′⊗g″[Δ])
+        //      + φ″(g′·Δ) g″ + φ′ g‴[Δ] ],
+        // pulled back to coefficient space through the row's channel designs.
+        // Censored rows carry event_weight 0 ⇒ φ′=φ″=φ‴=0 and contribute
+        // nothing (which also keeps g′ off any row where qdot is irrelevant).
+        {
+            use crate::families::row_kernel::RowKernel;
+            use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            let kernel = self.survival_ls_row_kernel_rescaled(q, dynamic, deriv_log_scale);
+            let d_beta_slice = d_beta_flat
+                .as_slice()
+                .ok_or_else(|| "joint d_beta must be contiguous".to_string())?;
+            // Distinct ordered permutations of a (possibly repeated) index
+            // triple — the support of the fully symmetric g‴ tensor.
+            let contract3 =
+                |g3d: &mut [[f64; SLS_ROW_K]; SLS_ROW_K],
+                 idx: [usize; 3],
+                 v: f64,
+                 dch: &[f64; SLS_ROW_K]| {
+                    const PERMS: [[usize; 3]; 6] =
+                        [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+                    let mut seen: [(usize, usize, usize); 6] = [(usize::MAX, 0, 0); 6];
+                    let mut n_seen = 0usize;
+                    for pm in PERMS {
+                        let key = (idx[pm[0]], idx[pm[1]], idx[pm[2]]);
+                        if seen[..n_seen].contains(&key) {
+                            continue;
+                        }
+                        seen[n_seen] = key;
+                        n_seen += 1;
+                        g3d[key.0][key.1] += v * dch[key.2];
+                    }
+                };
+            let g_contrib = (0..self.n)
+                .into_par_iter()
+                .fold(
+                    || Array2::<f64>::zeros((p_total, p_total)),
+                    |mut acc, row| {
+                        let w = row_mask.map_or(1.0, |m| m[row]);
+                        if w == 0.0 {
+                            return acc;
+                        }
+                        let l1 = w * q.d1_qdot1[row];
+                        let l2 = w * q.d2_qdot1[row];
+                        let l3 = w * q.d_h_d[row];
+                        if l1 == 0.0 && l2 == 0.0 && l3 == 0.0 {
+                            return acc;
+                        }
+                        let p = kernel.row_primary_values(row);
+                        let e = (-p[6]).exp();
+                        let dd = p[3] * p[8] - p[5];
+                        // g′ (channel gradient), supported on {2,3,5,6,8}.
+                        let mut gp = [0.0_f64; SLS_ROW_K];
+                        gp[2] = 1.0;
+                        gp[3] = e * p[8];
+                        gp[5] = -e;
+                        gp[6] = -e * dd;
+                        gp[8] = e * p[3];
+                        // g″ (symmetric channel Hessian).
+                        let mut g2 = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
+                        let set2 = |t: &mut [[f64; SLS_ROW_K]; SLS_ROW_K], a: usize, b: usize, v: f64| {
+                            t[a][b] = v;
+                            t[b][a] = v;
+                        };
+                        set2(&mut g2, 3, 8, e);
+                        set2(&mut g2, 3, 6, -e * p[8]);
+                        set2(&mut g2, 5, 6, e);
+                        g2[6][6] = e * dd;
+                        set2(&mut g2, 6, 8, -e * p[3]);
+                        let dch = kernel.jacobian_action(row, d_beta_slice);
+                        let gpd: f64 = (0..SLS_ROW_K).map(|c| gp[c] * dch[c]).sum();
+                        let mut g2d = [0.0_f64; SLS_ROW_K];
+                        for (a, slot) in g2d.iter_mut().enumerate() {
+                            *slot = (0..SLS_ROW_K).map(|c| g2[a][c] * dch[c]).sum();
+                        }
+                        // g‴[Δ] from the five symmetric third-derivative groups.
+                        let mut g3d = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
+                        contract3(&mut g3d, [3, 6, 8], -e, &dch);
+                        contract3(&mut g3d, [3, 6, 6], e * p[8], &dch);
+                        contract3(&mut g3d, [5, 6, 6], -e, &dch);
+                        contract3(&mut g3d, [6, 6, 6], -e * dd, &dch);
+                        contract3(&mut g3d, [6, 6, 8], e * p[3], &dch);
+                        let mut t_g = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
+                        for a in 0..SLS_ROW_K {
+                            for b in 0..SLS_ROW_K {
+                                t_g[a][b] = -(l3 * gpd * gp[a] * gp[b]
+                                    + l2 * (g2d[a] * gp[b] + gp[a] * g2d[b])
+                                    + l2 * gpd * g2[a][b]
+                                    + l1 * g3d[a][b]);
+                            }
+                        }
+                        kernel.add_pullback_hessian(row, &t_g, &mut acc);
+                        acc
+                    },
+                )
+                .reduce(
+                    || Array2::<f64>::zeros((p_total, p_total)),
+                    |mut a, b| {
+                        a += &b;
+                        a
+                    },
+                );
+            joint += &g_contrib;
         }
 
         Ok(Some(joint))
