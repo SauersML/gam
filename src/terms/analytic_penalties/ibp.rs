@@ -198,6 +198,7 @@ impl IBPAssignmentPenalty {
         let mut z_jac = Array1::<f64>::zeros(len);
         let mut local_logit_third = Array1::<f64>::zeros(len);
         let mut m_channel = Array1::<f64>::zeros(len);
+        let mut logit_curvature = Array1::<f64>::zeros(len);
         for row in 0..n {
             let start = row * self.k_max;
             for k in 0..self.k_max {
@@ -212,6 +213,7 @@ impl IBPAssignmentPenalty {
                 local_logit_third[start + k] = self.weight * jac * dz_h;
                 m_channel[start + k] = self.weight
                     * (score_second_derivative[k] * jac * jac + score_derivative[k] * c_ik);
+                logit_curvature[start + k] = c_ik;
             }
         }
 
@@ -226,8 +228,11 @@ impl IBPAssignmentPenalty {
         // diagonal `hessian_diag` and the `m_channel`/`local_logit_third` third
         // tensor — the issue's one-operator non-negotiable.
         let mut cross_row_d = Array1::<f64>::zeros(self.k_max);
+        let mut cross_row_dd = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
             cross_row_d[k] = self.weight * score_derivative[k];
+            // ∂d_k/∂M_k = w·∂s'_k/∂M_k = w·s''_k.
+            cross_row_dd[k] = self.weight * score_second_derivative[k];
         }
 
         IbpHessianDiagThirdChannels {
@@ -236,6 +241,8 @@ impl IBPAssignmentPenalty {
             local_logit_third,
             m_channel,
             cross_row_d,
+            cross_row_dd,
+            logit_curvature,
         }
     }
 
@@ -378,6 +385,16 @@ pub struct IbpHessianDiagThirdChannels {
     /// Woodbury update `d_k·u_k·u_kᵀ` (full outer product, `i=j` included).
     /// Length `K`.
     pub cross_row_d: Array1<f64>,
+    /// `cross_row_dd[k] = w·s''_k = ∂d_k/∂M_k`: the empirical-mass derivative of
+    /// the column Woodbury coefficient (#1416). Since `d_k = w·s'_k(M_k)` and
+    /// `∂M_k/∂ℓ_wk = J_wk`, the θ-derivative of the rank-one block carries
+    /// `∂d_k/∂ℓ_wk = cross_row_dd[k]·J_wk`. Length `K`.
+    pub cross_row_dd: Array1<f64>,
+    /// `logit_curvature[i*K+k] = c_ik = ∂J_ik/∂ℓ_ik = z(1−z)(1−2z)/τ²`: the
+    /// per-logit second derivative of the concrete map (#1416). The
+    /// cross-row rank-one block's `J_ik` factors depend on `ℓ_ik`, so its
+    /// θ-derivative carries `∂J_ik/∂ℓ_wk = δ_iw·c_ik`. Row-major `N·K`.
+    pub logit_curvature: Array1<f64>,
 }
 
 impl AnalyticPenalty for IBPAssignmentPenalty {

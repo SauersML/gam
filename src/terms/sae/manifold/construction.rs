@@ -6925,6 +6925,150 @@ impl SaeManifoldTerm {
         Ok(total)
     }
 
+    /// #1417: exact `½ tr(H⁻¹ ∂H_data/∂logα)` for LEARNABLE IBP alpha.
+    ///
+    /// The forward assignment is `a_ik = σ(ℓ_ik/τ)·π_k(α)` with
+    /// `π_k(α) = (α/(α+1))^k`, so `∂logπ_k/∂logα = k/(α+1)`. EVERY data-Jacobian
+    /// column for atom `k` — the logit-JVP row (carries one `π_k`), the
+    /// coordinate rows (carry one `a_k`), and the β-leg (`a_k·φ`) — carries
+    /// exactly ONE `a_k`/`π_k` factor (`σ(ℓ/τ)` is α-independent). Hence each
+    /// Jacobian column scales as `∂J_·k/∂logα = (k/(α+1))·J_·k`, and the data
+    /// Hessian block for the atom pair `(k_a, k_b)` scales as
+    ///   ∂H_data[a,b]/∂logα = ((k_a + k_b)/(α+1))·H_data[a,b].
+    /// Therefore the exact data-block contribution to the α-logdet trace is
+    ///   ½ tr(H⁻¹ ∂H_data/∂logα)
+    ///     = ½/(α+1) · Σ_{a,b} (k_a + k_b)·(H⁻¹)_{ba}·H_data[a,b],
+    /// over the full joint `(t, β)` index set. `H_data[a,b]` is the data-fit
+    /// Gauss-Newton block built from the SAME `row_jets_for_logdet` first-jets the
+    /// θ-adjoint uses (`H_tt = ⟨J_a,J_b⟩`, `H_tβ = ⟨J_a,J_β⟩`, `H_ββ = ⟨J_β,J_β'⟩`),
+    /// and `(H⁻¹)` is contracted through the same per-row selected-inverse blocks.
+    /// This closes the learnable-α gradient: combined with the prior-Hessian
+    /// trace (`assignment_log_strength_hessian_trace`) the full
+    /// `½ tr(H⁻¹ ∂H/∂logα)` is now assembled. For FIXED alpha (and non-IBP modes)
+    /// this is identically zero.
+    pub(crate) fn learnable_ibp_data_logdet_alpha_trace(
+        &self,
+        rho: &SaeManifoldRho,
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+    ) -> Result<f64, String> {
+        let AssignmentMode::IBPMap {
+            learnable_alpha: true,
+            ..
+        } = self.assignment.mode
+        else {
+            return Ok(0.0);
+        };
+        let alpha = self
+            .assignment
+            .mode
+            .resolved_ibp_alpha(rho)
+            .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
+        let inv_alpha1 = 1.0 / (alpha + 1.0);
+        let n = self.n_obs();
+        let total_t = cache.delta_t_len();
+        let second_jets = self.atom_second_jets()?;
+        let border = self.border_channels_for_cache(cache)?;
+
+        // β-tier selected inverse `(H⁻¹)_ββ` (shared across rows): one solve per
+        // β coordinate, exactly as the θ-adjoint builds `beta_inv`.
+        let mut beta_inv = Array2::<f64>::zeros((cache.k, cache.k));
+        if cache.k > 0 {
+            let rhs_t = Array1::<f64>::zeros(total_t);
+            for col in 0..cache.k {
+                let mut rhs_beta = Array1::<f64>::zeros(cache.k);
+                rhs_beta[col] = 1.0;
+                let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
+                    format!("learnable_ibp_data_logdet_alpha_trace: beta inverse: {err}")
+                })?;
+                for r in 0..cache.k {
+                    beta_inv[[r, col]] = solved.beta[r];
+                }
+            }
+        }
+        // Atom index of each β border channel (the `k_b` weight for the β leg).
+        let border_atom: Vec<usize> = border.iter().map(|c| c.atom).collect();
+
+        let mut trace = 0.0_f64;
+        for row in 0..n {
+            let q = cache.row_dims[row];
+            let base = cache.row_offsets[row];
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            let jets = self.row_jets_for_logdet(
+                rho,
+                row,
+                vars,
+                assignments.view(),
+                &second_jets,
+                &border,
+            )?;
+            // Atom index (k-weight) of each local t-var.
+            let var_atom: Vec<usize> = jets
+                .vars
+                .iter()
+                .map(|v| match *v {
+                    SaeLocalRowVar::Logit { atom } => atom,
+                    SaeLocalRowVar::Coord { atom, .. } => atom,
+                })
+                .collect();
+
+            // Per-row selected inverse blocks `(H⁻¹)_tt` (q×q) and `(H⁻¹)_tβ`.
+            let mut inv_vv = Array2::<f64>::zeros((q, q));
+            let mut inv_vbeta = Array2::<f64>::zeros((q, cache.k));
+            for col in 0..q {
+                let mut rhs_t = Array1::<f64>::zeros(total_t);
+                let rhs_beta = Array1::<f64>::zeros(cache.k);
+                rhs_t[base + col] = 1.0;
+                let solved = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
+                    format!("learnable_ibp_data_logdet_alpha_trace: selected inverse: {err}")
+                })?;
+                for r in 0..q {
+                    inv_vv[[r, col]] = solved.t[base + r];
+                }
+                for b in 0..cache.k {
+                    inv_vbeta[[col, b]] = solved.beta[b];
+                }
+            }
+
+            // t–t block: Σ_{a,b} (k_a + k_b)·(H⁻¹)_{ba}·⟨J_a, J_b⟩.
+            for a in 0..q {
+                for b in 0..q {
+                    let h_ab = sae_dot(&jets.first[a], &jets.first[b]);
+                    if h_ab == 0.0 {
+                        continue;
+                    }
+                    let kw = (var_atom[a] + var_atom[b]) as f64;
+                    trace += kw * inv_vv[[b, a]] * h_ab;
+                }
+            }
+            // t–β and β–t blocks: appear symmetrically, contract once with the
+            // factor 2 (H, H⁻¹ symmetric; `(H⁻¹)_βt = (H⁻¹)_tβᵀ`).
+            for a in 0..q {
+                for (beta_pos, channel) in border.iter().enumerate() {
+                    let h_ab = sae_dot(&jets.first[a], &jets.beta[beta_pos]);
+                    if h_ab == 0.0 {
+                        continue;
+                    }
+                    let kw = (var_atom[a] + border_atom[beta_pos]) as f64;
+                    trace += 2.0 * kw * inv_vbeta[[a, channel.index]] * h_ab;
+                }
+            }
+            // β–β block: Σ_{β,β'} (k_β + k_β')·(H⁻¹)_{β'β}·⟨J_β, J_β'⟩.
+            for (beta_i, channel_i) in border.iter().enumerate() {
+                for (beta_j, channel_j) in border.iter().enumerate() {
+                    let h_ab = sae_dot(&jets.beta[beta_i], &jets.beta[beta_j]);
+                    if h_ab == 0.0 {
+                        continue;
+                    }
+                    let kw = (border_atom[beta_i] + border_atom[beta_j]) as f64;
+                    trace += kw * beta_inv[[channel_i.index, channel_j.index]] * h_ab;
+                }
+            }
+        }
+        Ok(0.5 * inv_alpha1 * trace)
+    }
+
     pub(crate) fn add_learnable_ibp_forward_alpha_data_rhs(
         &self,
         rho: &SaeManifoldRho,
@@ -7752,14 +7896,16 @@ impl SaeManifoldTerm {
         }
         // IBP `hessian_diag` logit third-derivative channels (#1006). The full
         // IBP Hessian also has per-column cross-row rank-one terms
-        // `H_(i,k),(j,k) = d_k·J_ik·J_jk`; these ARE now carried in `H` via the
-        // #1038 Woodbury source (`IbpCrossRowSource`, construction.rs:4710-4752),
-        // and the ρ-trace differentiates them (#1416,
-        // `assignment_log_strength_hessian_trace`). In this θ-adjoint the
-        // empirical-`M_k` channel below contracts the shared-mass coupling; the
-        // direct `∂/∂ℓ_w (d_k·J_ik·J_jk)` cross-row Woodbury derivative is not yet
-        // assembled here because the `c_w = ∂²z/∂ℓ²` and `e = ∂²s/∂M²` channels it
-        // needs are not exposed by `IbpHessianDiagThirdChannels` (#1416 residual).
+        // `H_(i,k),(j,k) = d_k·J_ik·J_jk`; these ARE carried in `H` via the #1038
+        // Woodbury source (`IbpCrossRowSource`, construction.rs:4710-4752), the
+        // ρ-trace differentiates them (#1416,
+        // `assignment_log_strength_hessian_trace`), AND this θ-adjoint now
+        // differentiates them exactly too: the empirical-`M_k` channel below
+        // contracts the shared-mass coupling of the DIAGONAL curvature, and the
+        // cross-row Woodbury pass (further below, using `cross_row_dd` and
+        // `logit_curvature`) contracts the `∂/∂ℓ_w (d_k·J_ik·J_jk)` rank-one
+        // derivative — so value, logdet, ρ-trace, and θ-adjoint all differentiate
+        // the one operator `H = H₀ + Σ_k d_k u_k u_kᵀ`.
         let ibp_channels = ibp_assignment_third_channels(&self.assignment, rho)?;
         let k_atoms = self.k_atoms();
         // #1038 softmax entropy: the dense per-row entropy Hessian written into
@@ -7946,12 +8092,293 @@ impl SaeManifoldTerm {
             for &(row, atom, t_index, _inv_diag) in &ibp_logit_sites {
                 gamma_t[t_index] += col_coeff[atom] * channels.z_jac[row * k_atoms + atom];
             }
+
+            // #1416: the EXACT cross-row Woodbury derivative of Γ. The assembled
+            // `H` carries the per-column rank-one block `W_k = d_k·u_k u_kᵀ` with
+            // `u_k` the J-weighted column indicator (`u_k[slot(i,k)] = J_ik`) and
+            // `d_k = w·s'_k` (`cross_row_d[k]`). Both `d_k` (through `M_k`) and the
+            // `u_k` entries (through `ℓ_ik`) depend on the logits, so
+            //   ∂W_k/∂ℓ_wk = dd_k·J_wk·u_k u_kᵀ
+            //               + d_k·c_wk·(e_w u_kᵀ + u_k e_wᵀ),
+            // where `dd_k = ∂d_k/∂M_k = w·s''_k` (`cross_row_dd[k]`),
+            // `c_wk = ∂J_wk/∂ℓ_wk` (`logit_curvature`), and `e_w` is the unit
+            // vector at row `w`'s logit-`k` slot. Contracting `½ tr(H⁻¹ ∂W_k/∂ℓ_wk)`:
+            //   Γ_wk += ½·dd_k·J_wk·(u_kᵀ H⁻¹ u_k)        (term A: e·J_w·(JᵀH⁻¹J))
+            //         +    d_k·c_wk·(H⁻¹ u_k)_{slot(w,k)}  (term B: 2d·c_w·(H⁻¹J)_w).
+            // Both `u_kᵀ H⁻¹ u_k = (JᵀH⁻¹J)_k` and the vector `(H⁻¹ u_k) = (H⁻¹J)_·k`
+            // come from ONE solve per column, `x_k = H⁻¹ u_k` — so the adjoint
+            // differentiates the SAME `H = H₀ + Σ_k W_k` the value/logdet use,
+            // closing the one-operator contract on the rank-one block too.
+            //
+            // Group the column sites once (the layout is mode-agnostic: dense or
+            // compact, `ibp_logit_sites` already carries each active logit's
+            // global t-index), then per column build `u_k`, solve, and distribute.
+            let total_t = cache.delta_t_len();
+            let mut col_sites: Vec<Vec<(usize, usize)>> = vec![Vec::new(); k_atoms];
+            for &(row, atom, t_index, _inv_diag) in &ibp_logit_sites {
+                col_sites[atom].push((row, t_index));
+            }
+            for atom in 0..k_atoms {
+                let d_k = channels.cross_row_d[atom];
+                let dd_k = channels.cross_row_dd[atom];
+                if col_sites[atom].is_empty() || (d_k == 0.0 && dd_k == 0.0) {
+                    continue;
+                }
+                // u_k as a full t-RHS: J at each active logit-k slot.
+                let mut rhs_t = Array1::<f64>::zeros(total_t);
+                let rhs_beta = Array1::<f64>::zeros(cache.k);
+                for &(row, t_index) in &col_sites[atom] {
+                    rhs_t[t_index] = channels.z_jac[row * k_atoms + atom];
+                }
+                let x_k = solver.solve(rhs_t.view(), rhs_beta.view()).map_err(|err| {
+                    format!("logdet_theta_adjoint: IBP cross-row Woodbury solve: {err}")
+                })?;
+                // (JᵀH⁻¹J)_k = u_kᵀ x_k.
+                let mut jt_hinv_j = 0.0_f64;
+                for &(row, t_index) in &col_sites[atom] {
+                    jt_hinv_j += channels.z_jac[row * k_atoms + atom] * x_k.t[t_index];
+                }
+                for &(row, t_index) in &col_sites[atom] {
+                    let j_wk = channels.z_jac[row * k_atoms + atom];
+                    let c_wk = channels.logit_curvature[row * k_atoms + atom];
+                    // term A + term B.
+                    gamma_t[t_index] +=
+                        0.5 * dd_k * j_wk * jt_hinv_j + d_k * c_wk * x_k.t[t_index];
+                }
+            }
         }
 
         Ok(SaeArrowVector {
             t: gamma_t,
             beta: gamma_beta,
         })
+    }
+
+    /// #1418: apply the EXACT stationarity-Jacobian correction `ΔC·v = (A − B)·v`
+    /// to a joint `(t, β)` vector, matrix-free and per row.
+    ///
+    /// `A = ∇²_θθ L` is the true inner-fit Hessian; `B` is the assembled
+    /// evidence/Newton operator the solver factors. They differ ONLY by the three
+    /// curvature substitutions the assembly makes for stability:
+    ///   1. data: `B` uses Gauss-Newton `J̃J̃ᵀ`, dropping the residual curvature
+    ///      `R[a,b] = Σ_out r_out·∂²f_out/∂θ_a∂θ_b` (t–t via `jets.second`, t–β via
+    ///      `jets.beta_deriv`; the decoder is linear in β so the β–β block is 0);
+    ///   2. softmax: `B` uses the Fisher metric `G`, dropping `H_entropy − G`;
+    ///   3. periodic ARD: `B` uses `max(V'',0)`, dropping the negative part
+    ///      `min(V'',0)` (the indefinite tail past a quarter period).
+    /// `ΔC` is the sum of exactly these three deltas, each built from the SAME
+    /// jets / penalty curvatures the assembly and the θ-adjoint use, so
+    /// `A = B + ΔC` is the one true Hessian. Restricted to the isotropic
+    /// (`row_metric == None`) path, where `jets.first/second` live in plain output
+    /// space and the √w-scaled residual `error` contracts `jets.second` to give
+    /// `w·r·∂²f` exactly; under an estimated whitening metric the jet whitening
+    /// convention differs, so the caller falls back to `B` there.
+    fn apply_exact_hessian_minus_b(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        v: &SaeArrowVector,
+    ) -> Result<SaeArrowVector, String> {
+        let p = self.output_dim();
+        let n = self.n_obs();
+        let k_atoms = self.k_atoms();
+        let total_t = cache.delta_t_len();
+        let second_jets = self.atom_second_jets()?;
+        let border = self.border_channels_for_cache(cache)?;
+        let row_loss_w = self.row_loss_weights.as_deref();
+        let ard_axis_periods: Vec<Vec<Option<f64>>> = self
+            .assignment
+            .coords
+            .iter()
+            .map(|coord| coord.effective_axis_periods())
+            .collect();
+
+        // Optional softmax exact-entropy-minus-Fisher delta operator.
+        let softmax_delta: Option<(
+            crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty,
+            f64,
+        )> = match self.assignment.mode {
+            AssignmentMode::Softmax {
+                temperature,
+                sparsity,
+            } if k_atoms > 1 => {
+                let inv_tau = 1.0 / temperature;
+                let scale = rho.lambda_sparse() * sparsity * inv_tau * inv_tau;
+                Some((
+                    crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
+                        k_atoms, temperature,
+                    ),
+                    scale,
+                ))
+            }
+            _ => None,
+        };
+
+        let mut out = SaeArrowVector {
+            t: Array1::<f64>::zeros(total_t),
+            beta: Array1::<f64>::zeros(cache.k),
+        };
+        let mut decoded = vec![0.0_f64; p];
+        let mut fitted = Array1::<f64>::zeros(p);
+        let mut error = vec![0.0_f64; p];
+        for row in 0..n {
+            let q = cache.row_dims[row];
+            let base = cache.row_offsets[row];
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            let jets = self.row_jets_for_logdet(
+                rho,
+                row,
+                vars,
+                assignments.view(),
+                &second_jets,
+                &border,
+            )?;
+            let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
+
+            // √w-scaled per-row residual `r = √w·(fitted − target)` (isotropic).
+            fitted.fill(0.0);
+            for k in 0..k_atoms {
+                self.atoms[k].fill_decoded_row(row, &mut decoded);
+                let a_k = assignments[k];
+                for out_col in 0..p {
+                    fitted[out_col] += a_k * decoded[out_col];
+                }
+            }
+            for out_col in 0..p {
+                error[out_col] = sqrt_row_w * (fitted[out_col] - target[[row, out_col]]);
+            }
+
+            // Local t-slice of `v` for this row.
+            let v_t: Vec<f64> = (0..q).map(|c| v.t[base + c]).collect();
+
+            // (1a) residual curvature, t–t: ΔC_tt[a,b] = ⟨r, ∂²f_ab⟩.
+            for a in 0..q {
+                let mut acc = 0.0_f64;
+                for b in 0..q {
+                    let r_ab = sae_dot(&error, &jets.second[a][b]);
+                    acc += r_ab * v_t[b];
+                }
+                out.t[base + a] += acc;
+            }
+            // (1b) residual curvature, t–β and β–t: ΔC_tβ[a,β] = ⟨r, ∂²f_aβ⟩.
+            //      `jets.beta_deriv[a][β]` = ∂(∂f/∂β_β)/∂θ_a (the mixed second jet).
+            for a in 0..q {
+                for (beta_pos, channel) in border.iter().enumerate() {
+                    let r_ab = sae_dot(&error, &jets.beta_deriv[a][beta_pos]);
+                    // t row picks up β leg of v; β row picks up t leg of v.
+                    out.t[base + a] += r_ab * v.beta[channel.index];
+                    out.beta[channel.index] += r_ab * v_t[a];
+                }
+            }
+
+            // (2) softmax: ΔC_logit = scale·(H_entropy − G) over the free logits.
+            if let Some((penalty, scale)) = softmax_delta.as_ref() {
+                let assignment_dim = self.assignment.assignment_coord_dim();
+                let row_logits: Vec<f64> = (0..k_atoms)
+                    .map(|k| self.assignment.logits[[row, k]])
+                    .collect();
+                let h_entropy = penalty.row_dense_hessian(&row_logits, *scale);
+                let g_fisher = penalty.row_fisher_metric(&row_logits, *scale);
+                for (a, va) in jets.vars.iter().enumerate() {
+                    let SaeLocalRowVar::Logit { atom: ka } = *va else { continue };
+                    if ka >= assignment_dim {
+                        continue;
+                    }
+                    let mut acc = 0.0_f64;
+                    for (b, vb) in jets.vars.iter().enumerate() {
+                        let SaeLocalRowVar::Logit { atom: kb } = *vb else { continue };
+                        if kb >= assignment_dim {
+                            continue;
+                        }
+                        acc += (h_entropy[[ka, kb]] - g_fisher[[ka, kb]]) * v_t[b];
+                    }
+                    out.t[base + a] += acc;
+                }
+            }
+
+            // (3) periodic ARD: ΔC_coord = (V'' − max(V'',0)) = min(V'',0), diagonal.
+            for (a, va) in jets.vars.iter().enumerate() {
+                let SaeLocalRowVar::Coord { atom, axis } = *va else { continue };
+                if rho.log_ard[atom].is_empty() {
+                    continue;
+                }
+                let alpha = SaeManifoldRho::stable_exp_strength(rho.log_ard[atom][axis]);
+                let t_val = self.assignment.coords[atom].row(row)[axis];
+                let prior = ArdAxisPrior::eval(alpha, t_val, ard_axis_periods[atom][axis]);
+                let neg = prior.hess.min(0.0);
+                if neg != 0.0 {
+                    out.t[base + a] += neg * v_t[a];
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// #1418: solve `A x = rhs` for the EXACT stationarity Jacobian
+    /// `A = ∇²_θθ L`, using the assembled `B` factorization (`solver`) as
+    /// preconditioner and the matrix-free correction `ΔC = A − B`
+    /// ([`Self::apply_exact_hessian_minus_b`]).
+    ///
+    /// Since `A = B + ΔC`, `A x = rhs ⟺ x = B⁻¹ rhs − B⁻¹(ΔC x)`. The
+    /// fixed-point `x_{m+1} = x_0 − B⁻¹(ΔC x_m)`, `x_0 = B⁻¹ rhs`, is the Neumann
+    /// series `Σ_m (−B⁻¹ΔC)^m x_0`; it converges because `B` is the
+    /// stability-conditioned approximation of `A` (`‖B⁻¹ΔC‖ < 1` near the
+    /// optimum). Each step costs one matrix-free `ΔC` matvec and one `B⁻¹` solve
+    /// — no second factorization. Falls back to the plain `B⁻¹ rhs` (one step)
+    /// under an estimated whitening metric, where the jet convention differs.
+    fn solve_exact_stationarity(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        solver: &DeflatedArrowSolver<'_>,
+        rhs: &SaeArrowVector,
+    ) -> Result<SaeArrowVector, String> {
+        let x0 = solver.solve(rhs.t.view(), rhs.beta.view()).map_err(|err| {
+            format!("solve_exact_stationarity: B inverse: {err}")
+        })?;
+        let mut x = SaeArrowVector { t: x0.t.clone(), beta: x0.beta.clone() };
+        let whitens = self
+            .row_metric
+            .as_ref()
+            .is_some_and(|metric| metric.whitens_likelihood());
+        if whitens {
+            // Jet whitening convention differs under an estimated metric; the
+            // exact-A correction is not assembled there — use B⁻¹ (one step).
+            return Ok(x);
+        }
+        // Fixed-point Neumann iteration with B⁻¹ preconditioner.
+        const MAX_ITERS: usize = 24;
+        const REL_TOL: f64 = 1.0e-10;
+        let x0_norm = x0
+            .t
+            .iter()
+            .chain(x0.beta.iter())
+            .fold(0.0_f64, |m, &v| m.max(v.abs()))
+            .max(1.0);
+        for _ in 0..MAX_ITERS {
+            let dc = self.apply_exact_hessian_minus_b(rho, target, cache, &x)?;
+            let corr = solver.solve(dc.t.view(), dc.beta.view()).map_err(|err| {
+                format!("solve_exact_stationarity: B preconditioner: {err}")
+            })?;
+            let mut max_delta = 0.0_f64;
+            for idx in 0..x.t.len() {
+                let next = x0.t[idx] - corr.t[idx];
+                max_delta = max_delta.max((next - x.t[idx]).abs());
+                x.t[idx] = next;
+            }
+            for idx in 0..x.beta.len() {
+                let next = x0.beta[idx] - corr.beta[idx];
+                max_delta = max_delta.max((next - x.beta[idx]).abs());
+                x.beta[idx] = next;
+            }
+            if max_delta <= REL_TOL * x0_norm {
+                break;
+            }
+        }
+        Ok(x)
     }
 
     /// Analytic SAE REML outer-ρ gradient components at the already converged
@@ -7976,19 +8403,18 @@ impl SaeManifoldTerm {
 
         explicit[0] = assignment_prior_log_strength_derivative(&self.assignment, rho)
             + self.learnable_ibp_forward_alpha_data_derivative(rho, target)?;
-        // #1417 RESIDUAL: for LEARNABLE IBP alpha the forward assignments
-        // `a_ik = σ(ℓ/τ)(α/(α+1))^k` carry an explicit α-dependence
-        // (`∂a_ik/∂logα = a_ik·k/(α+1)`), so the data Gauss-Newton blocks
-        // `H_ββ`, `H_tβ`, `H_tt` and the IBP Woodbury source all depend on logα.
-        // The complete `logdet_trace[0]` for learnable alpha is therefore
-        //   ½ tr(H⁻¹ ∂H_prior/∂logα) + ½ tr(H⁻¹ ∂H_data/∂logα),
-        // but only the first (assignment-prior) trace is assembled below; the
-        // explicit data-block α-derivative trace is NOT yet contracted here. The
-        // loss-VALUE α-derivative IS complete (`learnable_ibp_forward_*` above);
-        // only the logdet α-trace of the data blocks is incomplete. For FIXED
-        // alpha this term is identically zero, so the fixed-alpha gradient is
-        // exact; the gap is confined to the learnable-alpha path.
-        logdet_trace[0] = self.assignment_log_strength_hessian_trace(rho, cache, solver)?;
+        // #1417: the FULL `½ tr(H⁻¹ ∂H/∂logα)` for the assignment coordinate.
+        // For LEARNABLE IBP alpha the forward assignments `a_ik = σ(ℓ/τ)·π_k(α)`
+        // carry an explicit α-dependence (`∂logπ_k/∂logα = k/(α+1)`), so BOTH the
+        // assignment-prior Hessian AND the data Gauss-Newton blocks
+        // `H_ββ`, `H_tβ`, `H_tt` depend on logα. We assemble both traces:
+        //   • prior:  `assignment_log_strength_hessian_trace`,
+        //   • data:   `learnable_ibp_data_logdet_alpha_trace` (#1417), using the
+        //             exact `(k_a+k_b)/(α+1)` block-scaling identity.
+        // For FIXED alpha (and non-IBP modes) the data term is identically zero,
+        // so the fixed-alpha gradient is unchanged and exact.
+        logdet_trace[0] = self.assignment_log_strength_hessian_trace(rho, cache, solver)?
+            + self.learnable_ibp_data_logdet_alpha_trace(rho, cache, solver)?;
 
         explicit[1] = loss.smoothness;
         logdet_trace[1] = 0.5
@@ -8011,27 +8437,21 @@ impl SaeManifoldTerm {
         }
 
         let gamma = self.logdet_theta_adjoint(rho, cache, solver)?;
-        // #1418 RESIDUAL: the implicit-function correction is
-        //   −½·Γᵀ·θ̂_ρ ,  θ̂_ρ = −A⁻¹ g_ρ ,
-        // where `A = ∇²_θθ L` is the EXACT stationarity Jacobian of the inner fit
-        // (data residual curvature, exact softmax entropy Hessian, exact periodic
-        // ARD curvature). The matrix the `solver` actually factors is `B` (the
-        // assembled evidence/Newton operator: Gauss-Newton data curvature `JᵀJ`
-        // with the softmax Fisher metric and `max(V'',0)` ARD majorizers in place
-        // of the exact curvatures). The `½log|B|` Laplace term in the value path
-        // is built from `B`, so `Γ = ½tr(B⁻¹ ∂B/∂θ)` is consistent; but the
-        // implicit step `θ̂_ρ` is governed by the TRUE Jacobian `A`, not `B`. Using
-        // `solver.solve` here applies `B⁻¹ g_ρ`, which equals the exact `A⁻¹ g_ρ`
-        // ONLY when `B = A` (zero residual curvature so `JᵀJ` is the full data
-        // Hessian, and the entropy/ARD curvatures are at their PSD-exact points).
-        // Assembling and factoring a separate exact `A` for this single adjoint
-        // solve is the complete fix; it is not done here to avoid a second,
-        // independently-factored Hessian path. The bias is `−½Γᵀ(B⁻¹−A⁻¹)g_ρ`.
+        // #1418: the implicit-function correction is `−½·Γᵀ·θ̂_ρ` with
+        // `θ̂_ρ = −A⁻¹ g_ρ`, where `A = ∇²_θθ L` is the EXACT stationarity
+        // Jacobian of the inner fit — data residual curvature, exact softmax
+        // entropy Hessian, exact periodic ARD curvature. The matrix the `solver`
+        // factors is `B` (Gauss-Newton data curvature, softmax Fisher metric,
+        // `max(V'',0)` ARD majorizers): the `½log|B|` Laplace term is consistent
+        // with `Γ = ½tr(B⁻¹ ∂B/∂θ)`, but the implicit step is governed by `A`.
+        // `solve_exact_stationarity` applies the TRUE `A⁻¹` via a B⁻¹-
+        // preconditioned Neumann fixed point (`A = B + ΔC`,
+        // `ΔC = apply_exact_hessian_minus_b`), so the correction is no longer
+        // biased by `(B⁻¹ − A⁻¹)`.
         for coord in 0..n_params {
             let rhs = self.outer_rho_gradient_ift_rhs(rho, target, coord, cache)?;
-            let solved = solver.solve(rhs.t.view(), rhs.beta.view()).map_err(|err| {
-                format!("analytic_outer_rho_gradient_components: full_inverse_apply: {err}")
-            })?;
+            let solved =
+                self.solve_exact_stationarity(rho, target, cache, solver, &rhs)?;
             let mut dot = 0.0_f64;
             for idx in 0..gamma.t.len() {
                 dot += gamma.t[idx] * solved.t[idx];
