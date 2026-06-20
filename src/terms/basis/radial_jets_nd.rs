@@ -1000,6 +1000,21 @@ pub fn build_duchon_basis_design_and_jets(
         }
     }
 
+    // gam#1422 / gam#1423 — the mixed-periodicity forward now builds the design
+    // and penalty from the ADDITIVE per-axis PSD reproducing kernel
+    // (`mixed_periodicity_additive_kernel`) with a non-periodic-only polynomial
+    // null space. Mirror that EXACTLY here so prediction / position-API jets
+    // stay consistent with the realized design (and remain seam-wrapping).
+    if any_periodic {
+        return mixed_periodicity_additive_design_and_jets(
+            t,
+            centers,
+            nullspace_order,
+            periodic_per_axis,
+            periods,
+        );
+    }
+
     let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
     let kernel_nullspace_order = if any_periodic {
         DuchonNullspaceOrder::Zero
@@ -1271,6 +1286,169 @@ pub fn build_duchon_basis_design_and_jets(
                             }
                         }
                         hess[[row, n_kernel + col, a, c]] = value;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((phi_design, jet, hess))
+}
+
+/// Design + input-location jets for the ADDITIVE mixed-periodicity Duchon
+/// kernel (gam#1422 / gam#1423). The kernel is the sum of per-axis PSD
+/// reproducing kernels (periodic Bernoulli on periodic axes, 1-D Sobolev on
+/// non-periodic axes); it is separable, so its gradient is per-axis and its
+/// Hessian is diagonal. The null space is the polynomials of total degree
+/// ``< m`` in the NON-periodic coordinates only. This mirrors
+/// `build_duchon_basis_mixed_periodicity` exactly so prediction matches the
+/// realized design and the periodic axes wrap cleanly at the seam.
+fn mixed_periodicity_additive_design_and_jets(
+    t: ArrayView2<'_, f64>,
+    centers: ArrayView2<'_, f64>,
+    nullspace_order: DuchonNullspaceOrder,
+    periodic_per_axis: &[bool],
+    periods: &[f64],
+) -> Result<(Array2<f64>, Array3<f64>, Array4<f64>), BasisError> {
+    let dim = centers.ncols();
+    let n_rows = t.nrows();
+    let n_centers = centers.nrows();
+    let m = duchon_p_from_nullspace_order(nullspace_order);
+    let axis_bounds =
+        crate::basis::mixed_periodicity_axis_bounds(centers, periodic_per_axis);
+
+    // Non-periodic-only polynomial null space `Z = null(Pᵀ)`.
+    let poly_block_centers =
+        crate::basis::mixed_periodicity_nullspace_poly_block(centers, m, periodic_per_axis);
+    let z = kernel_constraint_nullspace_from_matrix(poly_block_centers.view())?;
+    let n_kernel = z.ncols();
+
+    // Non-periodic axis order + monomial exponents over the non-periodic axes
+    // (used for the explicit polynomial columns + their jet/Hessian).
+    let nonperiodic_axes: Vec<usize> =
+        (0..dim).filter(|&j| !periodic_per_axis[j]).collect();
+    let max_degree = m.saturating_sub(1);
+    let exps = monomial_exponents(nonperiodic_axes.len(), max_degree);
+    let n_poly = exps.len();
+
+    // --- value / first / second (diagonal) of the additive kernel ---
+    let mut value = Array2::<f64>::zeros((n_rows, n_centers));
+    let mut grad = Array3::<f64>::zeros((n_rows, n_centers, dim));
+    let mut hdiag = Array3::<f64>::zeros((n_rows, n_centers, dim));
+    for n in 0..n_rows {
+        for k in 0..n_centers {
+            let (v, g, h) = crate::basis::mixed_periodicity_additive_kernel_jet(
+                t.row(n),
+                centers.row(k),
+                m,
+                periodic_per_axis,
+                periods,
+                &axis_bounds,
+            )?;
+            value[[n, k]] = v;
+            for a in 0..dim {
+                grad[[n, k, a]] = g[a];
+                hdiag[[n, k, a]] = h[a];
+            }
+        }
+    }
+
+    // --- design = [value·Z, P(t)] ---
+    let kernel_design = fast_ab(&value, &z);
+    let poly_design =
+        crate::basis::mixed_periodicity_nullspace_poly_block(t, m, periodic_per_axis);
+    if poly_design.ncols() != n_poly {
+        crate::bail_dim_basis!(
+            "mixed-periodicity additive jets: polynomial block has {} columns but expected {n_poly}",
+            poly_design.ncols()
+        );
+    }
+    let mut phi_design = Array2::<f64>::zeros((n_rows, n_kernel + n_poly));
+    phi_design
+        .slice_mut(s![.., ..n_kernel])
+        .assign(&kernel_design);
+    if n_poly > 0 {
+        phi_design
+            .slice_mut(s![.., n_kernel..])
+            .assign(&poly_design);
+    }
+
+    // --- jet (J): kernel block projects grad by Z; polynomial block is the
+    // monomial gradient in the non-periodic coordinates. ---
+    let mut jet = Array3::<f64>::zeros((n_rows, n_kernel + n_poly, dim));
+    for axis in 0..dim {
+        let projected = grad.index_axis(Axis(2), axis).dot(&z);
+        jet.slice_mut(s![.., ..n_kernel, axis]).assign(&projected);
+    }
+    if n_poly > 0 {
+        for (col, alpha) in exps.iter().enumerate() {
+            for (local_axis, &deriv_axis) in nonperiodic_axes.iter().enumerate() {
+                let power = alpha[local_axis];
+                if power == 0 {
+                    continue;
+                }
+                for row in 0..n_rows {
+                    let mut val = power as f64;
+                    for (la, &ax) in nonperiodic_axes.iter().enumerate() {
+                        let mut e = alpha[la];
+                        if la == local_axis {
+                            e = e.saturating_sub(1);
+                        }
+                        if e != 0 {
+                            val *= t[[row, ax]].powi(e as i32);
+                        }
+                    }
+                    jet[[row, n_kernel + col, deriv_axis]] = val;
+                }
+            }
+        }
+    }
+
+    // --- Hessian (H): the kernel is separable so its Hessian is DIAGONAL in
+    // the axes (∂²K/∂x_a∂x_c = δ_{ac} R_a''). Project the diagonal by Z. The
+    // polynomial Hessian is the monomial second derivative in non-periodic
+    // coordinates. ---
+    let mut hess = Array4::<f64>::zeros((n_rows, n_kernel + n_poly, dim, dim));
+    for a in 0..dim {
+        let slab = hdiag.index_axis(Axis(2), a);
+        let projected = slab.dot(&z);
+        hess.slice_mut(s![.., ..n_kernel, a, a]).assign(&projected);
+    }
+    if n_poly > 0 {
+        for (col, alpha) in exps.iter().enumerate() {
+            for (la_a, &axis_a) in nonperiodic_axes.iter().enumerate() {
+                let coeff_a = alpha[la_a];
+                if coeff_a == 0 {
+                    continue;
+                }
+                for (la_c, &axis_c) in nonperiodic_axes.iter().enumerate() {
+                    let coeff_c = if la_a == la_c {
+                        alpha[la_c].saturating_sub(1)
+                    } else {
+                        alpha[la_c]
+                    };
+                    if la_a != la_c && coeff_c == 0 {
+                        continue;
+                    }
+                    let lead = (coeff_a as f64) * (coeff_c as f64);
+                    if lead == 0.0 {
+                        continue;
+                    }
+                    for row in 0..n_rows {
+                        let mut val = lead;
+                        for (la, &ax) in nonperiodic_axes.iter().enumerate() {
+                            let mut e = alpha[la];
+                            if la == la_a {
+                                e = e.saturating_sub(1);
+                            }
+                            if la == la_c {
+                                e = e.saturating_sub(1);
+                            }
+                            if e != 0 {
+                                val *= t[[row, ax]].powi(e as i32);
+                            }
+                        }
+                        hess[[row, n_kernel + col, axis_a, axis_c]] = val;
                     }
                 }
             }

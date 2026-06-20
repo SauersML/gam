@@ -370,6 +370,268 @@ pub(crate) fn periodic_duchon_kernel_bernoulli_triplet(
     Ok((phi, dphi_dr, d2phi_dr2))
 }
 
+/// Scaled Bernoulli function ``kᵥ(t) = Bᵥ(t) / ν!`` and its first derivative
+/// ``k'ᵥ(t) = B'ᵥ(t)/ν! = Bᵥ₋₁(t)/(ν−1)! = kᵥ₋₁(t)`` for the degrees the
+/// mixed-periodicity Sobolev kernel needs (``ν ∈ {0,1,2,3,4}``).
+///
+/// These are the standard Sobolev-spline reproducing-kernel building blocks
+/// (Wahba 1990; Gu, *Smoothing Spline ANOVA*). ``Bᵥ`` is the (ordinary, not
+/// periodised) Bernoulli polynomial:
+///   ``B₀=1``, ``B₁=t−½``, ``B₂=t²−t+1/6``, ``B₃=t³−(3/2)t²+(1/2)t``,
+///   ``B₄=t⁴−2t³+t²−1/30``.
+fn scaled_bernoulli_value_and_derivative(nu: usize, t: f64) -> Result<(f64, f64), BasisError> {
+    // (value of Bᵥ(t), value of B'ᵥ(t)=ν·Bᵥ₋₁(t)); we then divide by ν!.
+    let (bv, dbv) = match nu {
+        0 => (1.0, 0.0),
+        1 => (t - 0.5, 1.0),
+        2 => (t * t - t + 1.0 / 6.0, 2.0 * t - 1.0),
+        3 => {
+            let t2 = t * t;
+            (t2 * t - 1.5 * t2 + 0.5 * t, 3.0 * t2 - 3.0 * t + 0.5)
+        }
+        4 => {
+            let t2 = t * t;
+            (
+                t2 * t2 - 2.0 * t2 * t + t2 - 1.0 / 30.0,
+                4.0 * t2 * t - 6.0 * t2 + 2.0 * t,
+            )
+        }
+        other => {
+            crate::bail_invalid_basis!(
+                "mixed-periodicity Sobolev kernel needs Bernoulli degree ν ≤ 4; got {other}"
+            )
+        }
+    };
+    let factorial = (1..=nu).map(|v| v as f64).product::<f64>();
+    Ok((bv / factorial, dbv / factorial))
+}
+
+/// Penalised part of the 1-D Sobolev (smoothing-spline) reproducing kernel of
+/// order ``m`` on ``[0, 1]`` for a NON-periodic axis:
+///
+/// ```text
+///     R(x, y) = kₘ(x) kₘ(y) + (−1)^{m−1} k_{2m}(|x − y|)
+/// ```
+///
+/// with ``kᵥ(t) = Bᵥ(t)/ν!`` (Wahba 1990; Gu 2013, the ``R₁`` reproducing
+/// kernel of the seminorm ``∫ (f^{(m)})²``). This kernel is **positive
+/// semidefinite** and its null space is exactly the polynomials of degree
+/// ``< m`` — precisely the unpenalised directions the cylinder/torus Duchon
+/// nullspace must contain on a non-periodic axis (gam#1423). Using it as the
+/// per-axis factor (instead of the conditionally-PD chord-polyharmonic kernel)
+/// is what restores positive semidefiniteness to the mixed-periodicity penalty
+/// (gam#1422).
+///
+/// The caller passes the RAW axis coordinates ``x, y`` together with the
+/// per-axis ``(lo, hi)`` from the centers; both are affine-mapped to ``[0, 1]``
+/// so ``Bᵥ`` is evaluated on its canonical domain and the same map is replayed
+/// identically at prediction time.
+fn nonperiodic_sobolev_kernel_1d(
+    x: f64,
+    y: f64,
+    m: usize,
+    lo: f64,
+    hi: f64,
+) -> Result<f64, BasisError> {
+    if m == 0 {
+        crate::bail_invalid_basis!("non-periodic Sobolev kernel order m must be at least 1");
+    }
+    let span = (hi - lo).max(1e-300);
+    let xs = ((x - lo) / span).clamp(0.0, 1.0);
+    let ys = ((y - lo) / span).clamp(0.0, 1.0);
+    let (kx, _) = scaled_bernoulli_value_and_derivative(m, xs)?;
+    let (ky, _) = scaled_bernoulli_value_and_derivative(m, ys)?;
+    let diff = (xs - ys).abs();
+    let sign = if m % 2 == 1 { 1.0 } else { -1.0 };
+    let k2m = even_bernoulli_polynomial(2 * m, diff)? / factorial_f64(2 * m);
+    Ok(kx * ky + sign * k2m)
+}
+
+/// Radial-style jet ``(R, ∂R/∂x, ∂²R/∂x²)`` of
+/// [`nonperiodic_sobolev_kernel_1d`] w.r.t. the first (data) coordinate ``x``,
+/// for the prediction/position-API path. Derivatives carry the chain-rule
+/// ``1/span`` factor from the affine map to ``[0, 1]``; the ``|x − y|`` term's
+/// first derivative picks up ``sign(x − y)`` (its second derivative is the even
+/// Bernoulli second derivative, continuous across ``x = y``).
+pub(crate) fn nonperiodic_sobolev_kernel_1d_triplet(
+    x: f64,
+    y: f64,
+    m: usize,
+    lo: f64,
+    hi: f64,
+) -> Result<(f64, f64, f64), BasisError> {
+    if m == 0 {
+        crate::bail_invalid_basis!("non-periodic Sobolev kernel order m must be at least 1");
+    }
+    let span = (hi - lo).max(1e-300);
+    let xs = ((x - lo) / span).clamp(0.0, 1.0);
+    let ys = ((y - lo) / span).clamp(0.0, 1.0);
+    let (kx, dkx) = scaled_bernoulli_value_and_derivative(m, xs)?;
+    let (ky, _) = scaled_bernoulli_value_and_derivative(m, ys)?;
+    // d/dx [kₘ(xs)] = k'ₘ(xs)/span; d²/dx² = k''ₘ(xs)/span². k''ₘ = kₘ₋₂ etc.;
+    // reuse the even-Bernoulli second-derivative only via the |x−y| term and
+    // build kₘ's second derivative from the (m−1) scaled-Bernoulli derivative.
+    let (_, d2kx_inner) = if m >= 1 {
+        scaled_bernoulli_value_and_derivative(m.saturating_sub(1), xs)?
+    } else {
+        (0.0, 0.0)
+    };
+    let sign = if m % 2 == 1 { 1.0 } else { -1.0 };
+    let diff = xs - ys;
+    let adiff = diff.abs();
+    let (b1, b2) = even_bernoulli_polynomial_derivatives(2 * m, adiff)?;
+    let fac2m = factorial_f64(2 * m);
+    let k2m = even_bernoulli_polynomial(2 * m, adiff)? / fac2m;
+    let dsign = if diff >= 0.0 { 1.0 } else { -1.0 };
+
+    let value = kx * ky + sign * k2m;
+    // ∂/∂x: kₘ'(xs)·ky/span + sign·(B'_{2m}(|d|)/((2m)!))·sgn(d)/span
+    let d1 = (dkx * ky / span) + sign * (b1 / fac2m) * dsign / span;
+    // ∂²/∂x²: kₘ''(xs)·ky/span² + sign·B''_{2m}(|d|)/((2m)!)/span²
+    // kₘ''(xs) = (d/dxs) k'ₘ(xs) = (d/dxs) kₘ₋₁(xs) = k'ₘ₋₁(xs) = d2kx_inner.
+    let d2 = (d2kx_inner * ky / (span * span)) + sign * (b2 / fac2m) / (span * span);
+    Ok((value, d1, d2))
+}
+
+#[inline]
+fn factorial_f64(n: usize) -> f64 {
+    (1..=n).map(|v| v as f64).product::<f64>()
+}
+
+/// Per-axis ``[lo, hi]`` bounds of the centers along every NON-periodic axis,
+/// used to affine-map that axis to ``[0, 1]`` for the Sobolev kernel. Periodic
+/// axes carry a placeholder (their kernel uses the period, not these bounds).
+/// Mirrored byte-for-byte between the forward builder and the prediction/jet
+/// path so the realized design and the frozen-center replay agree.
+pub(crate) fn mixed_periodicity_axis_bounds(
+    centers: ArrayView2<'_, f64>,
+    periodic_per_axis: &[bool],
+) -> Vec<(f64, f64)> {
+    let d = centers.ncols();
+    (0..d)
+        .map(|j| {
+            if periodic_per_axis[j] {
+                (0.0, 1.0)
+            } else {
+                let col = centers.column(j);
+                let lo = col.iter().fold(f64::INFINITY, |a, &b| a.min(b));
+                let hi = col.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+                (lo, hi)
+            }
+        })
+        .collect()
+}
+
+/// Additive mixed-periodicity Duchon kernel value
+/// ``K(x, c) = Σ_j R_j(x_j, c_j)``, the sum of per-axis positive-semidefinite
+/// reproducing kernels: the periodic Bernoulli Green's function on periodic
+/// axes and the 1-D Sobolev kernel on non-periodic axes. As a SUM of PSD
+/// kernels it is PSD, and its null space is the polynomials of degree ``< m``
+/// in the non-periodic coordinates only (constants on the periodic axes),
+/// which is exactly the correct cylinder/torus Duchon null space
+/// (gam#1422 / gam#1423). This replaces the conditionally-PD
+/// polyharmonic-of-chord-distance kernel.
+pub(crate) fn mixed_periodicity_additive_kernel(
+    x: ArrayView1<'_, f64>,
+    c: ArrayView1<'_, f64>,
+    m: usize,
+    periodic_per_axis: &[bool],
+    periods: &[f64],
+    axis_bounds: &[(f64, f64)],
+) -> Result<f64, BasisError> {
+    let d = x.len();
+    let mut acc = 0.0_f64;
+    for j in 0..d {
+        acc += if periodic_per_axis[j] {
+            let r = periodic_distance_1d(x[j], c[j], periods[j]);
+            periodic_duchon_kernel_bernoulli(r, m, periods[j])?
+        } else {
+            let (lo, hi) = axis_bounds[j];
+            nonperiodic_sobolev_kernel_1d(x[j], c[j], m, lo, hi)?
+        };
+    }
+    Ok(acc)
+}
+
+/// Per-axis value + first/second self-derivative of the additive
+/// mixed-periodicity kernel for one ``(x, c)`` pair. Because the kernel is the
+/// SUM of per-axis 1-D kernels, the gradient w.r.t. ``x`` is per-axis
+/// (``∂K/∂x_a = R_a'(x_a, c_a)``, no cross terms) and the Hessian is DIAGONAL
+/// (``∂²K/∂x_a∂x_c = δ_{ac} R_a''``). Returns ``(value, grad_a, hess_aa)`` with
+/// length-``d`` per-axis vectors, so the caller can assemble the input-location
+/// jet/Hessian directly. This is the exact analytic derivative of
+/// [`mixed_periodicity_additive_kernel`].
+#[allow(clippy::type_complexity)]
+pub(crate) fn mixed_periodicity_additive_kernel_jet(
+    x: ArrayView1<'_, f64>,
+    c: ArrayView1<'_, f64>,
+    m: usize,
+    periodic_per_axis: &[bool],
+    periods: &[f64],
+    axis_bounds: &[(f64, f64)],
+) -> Result<(f64, Vec<f64>, Vec<f64>), BasisError> {
+    let d = x.len();
+    let mut value = 0.0_f64;
+    let mut grad = vec![0.0_f64; d];
+    let mut hess = vec![0.0_f64; d];
+    for a in 0..d {
+        let (v, d1, d2) = if periodic_per_axis[a] {
+            // The Bernoulli triplet differentiates w.r.t. the unsigned radial
+            // distance `r = |x_a − c_a|` reduced mod period; convert to the
+            // derivative w.r.t. `x_a` via the chain rule (sign of the reduced
+            // signed offset). The second derivative is sign-independent.
+            let p = periods[a];
+            let signed = {
+                let raw = (x[a] - c[a]).rem_euclid(p);
+                if raw > 0.5 * p { raw - p } else { raw }
+            };
+            let r = signed.abs();
+            let (phi, dphi_dr, d2phi_dr2) = periodic_duchon_kernel_bernoulli_triplet(r, m, p)?;
+            let dsign = if signed >= 0.0 { 1.0 } else { -1.0 };
+            (phi, dphi_dr * dsign, d2phi_dr2)
+        } else {
+            let (lo, hi) = axis_bounds[a];
+            nonperiodic_sobolev_kernel_1d_triplet(x[a], c[a], m, lo, hi)?
+        };
+        value += v;
+        grad[a] = d1;
+        hess[a] = d2;
+    }
+    Ok((value, grad, hess))
+}
+
+/// Polynomial side-condition block for the mixed-periodicity Duchon null space:
+/// monomials of total degree ``< m`` in the NON-periodic coordinates only
+/// (periodic axes contribute only the constant, which is the degree-0 monomial
+/// shared by all axes). For the cylinder ``(θ periodic, y free)`` with ``m = 2``
+/// this yields ``{1, y}`` — so ``f(θ, y) = a + b y`` is correctly unpenalised
+/// (gam#1423).
+pub(crate) fn mixed_periodicity_nullspace_poly_block(
+    points: ArrayView2<'_, f64>,
+    m: usize,
+    periodic_per_axis: &[bool],
+) -> Array2<f64> {
+    let n = points.nrows();
+    let nonperiodic_axes: Vec<usize> = (0..points.ncols())
+        .filter(|&j| !periodic_per_axis[j])
+        .collect();
+    let max_degree = m.saturating_sub(1);
+    // Monomial exponents of total degree ≤ (m−1) over the non-periodic axes.
+    let exps = monomial_exponents(nonperiodic_axes.len(), max_degree);
+    let mut block = Array2::<f64>::zeros((n, exps.len()));
+    for (col, exp) in exps.iter().enumerate() {
+        for row in 0..n {
+            let mut value = 1.0_f64;
+            for (local_axis, &power) in exp.iter().enumerate() {
+                let axis = nonperiodic_axes[local_axis];
+                value *= points[[row, axis]].powi(power as i32);
+            }
+            block[[row, col]] = value;
+        }
+    }
+    block
+}
+
 /// Drop centers that periodically identify with the leftmost anchor.
 ///
 /// When the user describes a closed periodic lattice by including BOTH
@@ -655,81 +917,36 @@ pub(crate) fn build_periodic_duchon_basis_1d(
     })
 }
 
-/// Per-pair generalized distance for the mixed-periodicity Duchon basis.
+/// Build a multi-dimensional Duchon basis with per-axis periodicity
+/// (cylinder ``(True, False)``, torus ``(True, True)``, …).
 ///
-/// For each axis ``j``:
-///   * **periodic** axis with period ``P_j``: ``d_j(x, y) = (P_j / π) · sin(π·(x − y)/P_j)``,
-///     the chord distance on the circle of circumference ``P_j``. The chord
-///     metric recovers the Euclidean limit ``d_j → x − y`` as ``P_j → ∞`` and
-///     is invariant under the periodic identification ``x ≡ x + P_j``.
-///   * **non-periodic** axis: ``d_j(x, y) = x − y``.
+/// ## Construction (gam#1422 / gam#1423)
 ///
-/// Then ``r = sqrt(Σ d_j²)``. This is the cylinder/torus "extrinsic chord"
-/// distance — the same metric used implicitly by the spherical S² basis when
-/// embedding in ℝ³. The radial polyharmonic kernel φ(r) defined on this
-/// distance yields a positive-definite kernel on the mixed-periodicity
-/// product manifold whose nullspace contains the constant function.
-#[inline]
-pub(crate) fn duchon_mixed_periodicity_distance(
-    x: ArrayView1<'_, f64>,
-    y: ArrayView1<'_, f64>,
-    periodic_per_axis: &[bool],
-    periods: &[f64],
-) -> f64 {
-    let d = x.len();
-    assert_eq!(d, y.len());
-    assert_eq!(d, periodic_per_axis.len());
-    assert_eq!(d, periods.len());
-    let mut acc = 0.0_f64;
-    for j in 0..d {
-        let delta = if periodic_per_axis[j] {
-            let p = periods[j];
-            // Chord distance on circle of circumference P_j.
-            (p / std::f64::consts::PI) * (std::f64::consts::PI * (x[j] - y[j]) / p).sin()
-        } else {
-            x[j] - y[j]
-        };
-        acc += delta * delta;
-    }
-    acc.sqrt()
-}
-
-/// Build a multi-dimensional Duchon basis with per-axis periodicity.
+/// The penalty is built from an **additive tensor (ANOVA) reproducing
+/// kernel** — the sum of per-axis positive-semidefinite 1-D reproducing
+/// kernels — NOT the polyharmonic kernel evaluated at the cylinder/torus
+/// chord distance. The chord-polyharmonic kernel is only *conditionally*
+/// positive-definite (PD orthogonal to the chord-embedding linear span), so
+/// projecting out only the constants leaves indefinite linear modes and the
+/// center Gram ``Ω = Zᵀ K Z`` carries large negative eigenvalues (gam#1422).
 ///
-/// Generalizes the 1D `build_periodic_duchon_basis_1d` to mixed-periodicity
-/// settings (cylinder ``(True, False)``, torus ``(True, True)``, etc.) by:
+///   * **periodic** axis (period ``P_j``): the periodic Bernoulli Green's
+///     function ``(−1)^{m+1} B_{2m}(Δ/P_j)`` ([`periodic_duchon_kernel_bernoulli`]),
+///     which is PSD (every Fourier coefficient ``∝ 1/n^{2m} > 0``) with null
+///     space ``{constants}``.
+///   * **non-periodic** axis: the 1-D Sobolev smoothing-spline reproducing
+///     kernel ([`nonperiodic_sobolev_kernel_1d`]), which is PSD with null
+///     space the polynomials of degree ``< m``.
 ///
-///   1. Replacing the Euclidean per-pair distance with a generalized
-///      cylinder/torus distance: for periodic axes use the chord distance
-///      on the circle ``(P_j/π) · sin(π·(x−y)/P_j)``; for non-periodic axes
-///      use the plain difference (see [`duchon_mixed_periodicity_distance`]).
-///   2. Evaluating the radial polyharmonic Duchon kernel
-///      ``φ(r) = c · r^(2m − d)`` (or ``r^(2m−d) · log r`` in the log case)
-///      at the generalized distance. The polyharmonic coefficient ``c`` is
-///      computed by [`PolyharmonicBlockCoeff::new(m, d)`].
-///   3. Forcing the constraint nullspace to ``{constants}`` (the only
-///      polynomial that is periodic on every periodic axis). This mirrors
-///      the 1D periodic path.
-///   4. Returning a single Primary penalty matrix
-///      ``Ω = Zᵀ · K_centers · Z`` (the kernel-Gram identity).
-///
-/// Notes
-/// -----
-/// * **Math (1D)**: for ``d = 1`` with one periodic axis, this path uses the
-///   polyharmonic-of-chord-distance kernel
-///   ``c · |(P/π) sin(π Δ/P)|^(2m − 1)``. This is the principled
-///   generalization on the circle and is also the kernel the pyffi
-///   dispatcher uses for the 1D periodic case; the older Bernoulli
-///   Green's-function ``B_{2m}(Δ/P)`` builder is no longer dispatched
-///   from pyffi.
-/// * **Nullspace audit**: a more principled choice for the cylinder
-///   (``d = 2``, axis 0 periodic, axis 1 non-periodic) is the polynomial
-///   nullspace ``{1, x_1, x_1², …, x_1^{m−1}}`` — polynomials in the
-///   non-periodic axes only, of total degree ``< m``. We keep
-///   ``{constants}`` here to match the existing periodic-Duchon convention
-///   and avoid widening the polynomial-block construction; users who need
-///   richer null spaces on the non-periodic factor can layer a separate
-///   tensor smooth.
+/// The total center kernel ``K_CC = Σ_j R_j`` is PSD (sum of PSD), and its
+/// null space is the polynomials of total degree ``< m`` in the **non-periodic
+/// coordinates only** (periodic coordinates contribute only constants) — the
+/// correct cylinder/torus Duchon null space (gam#1423). We build
+/// ``Z = null(Pᵀ)`` from that polynomial block ([`mixed_periodicity_nullspace_poly_block`]),
+/// append the matching unpenalised polynomial columns to the design, and form
+/// the single Primary penalty ``Ω = Zᵀ K_CC Z``, which is PSD by congruence.
+/// The per-axis kernels are evaluated on each axis's own coordinate, so the
+/// design wraps cleanly at every periodic seam.
 pub(crate) fn build_duchon_basis_mixed_periodicity(
     data: ArrayView2<'_, f64>,
     spec: &DuchonBasisSpec,
@@ -784,31 +1001,38 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
     }
 
     let user_m = duchon_p_from_nullspace_order(spec.nullspace_order);
-    // Force constant-only nullspace (only periodic-in-every-axis polynomial).
-    let effective_nullspace_order = DuchonNullspaceOrder::Zero;
     let s_order_int = 0usize;
     validate_duchon_kernel_orders(None, user_m, s_order_int as f64, d)?;
 
-    let z = kernel_constraint_nullspace(
-        centers.view(),
-        effective_nullspace_order,
-        &mut workspace.cache,
-    )?;
-    let kernel_cols = z.ncols();
-
-    // Polyharmonic kernel coefficient for radial order ``m_kernel`` in
-    // ``d`` dimensions. We use ``m_kernel = user_m`` so the kernel
-    // smoothness order tracks the user's requested ``m``, not the
-    // (forced-to-constant) nullspace order.
-    let m_kernel = pure_duchon_block_order(user_m, s_order_int as f64);
-    let ppc = PolyharmonicBlockCoeff::new(m_kernel, d);
+    // gam#1422 / gam#1423 — PSD mixed-periodicity Duchon via an ADDITIVE
+    // tensor (ANOVA) reproducing kernel, NOT the conditionally-PD
+    // polyharmonic-of-chord-distance kernel. The center Gram is the sum of
+    // per-axis positive-semidefinite reproducing kernels: the periodic
+    // Bernoulli Green's function on periodic axes (PSD, null = constants) and
+    // the 1-D Sobolev kernel on non-periodic axes (PSD, null = polynomials of
+    // degree < m). The sum is PSD (sum of PSD), and its null space is the
+    // polynomials of degree < m in the NON-periodic coordinates only — exactly
+    // the cylinder/torus Duchon null space. We build `Z` from that null space
+    // (`{1, y, …}` on the cylinder), append the matching polynomial columns to
+    // the design (so `a + b·y` is representable AND unpenalised), and form
+    // `Ω = Zᵀ K_CC Z`, which is PSD by congruence.
+    let axis_bounds = mixed_periodicity_axis_bounds(centers.view(), periodic_per_axis);
 
     let centers_owned = centers.clone();
     let k_centers = centers_owned.nrows();
     let n_data = data.nrows();
 
-    // Row-parallel raw kernel: K[i, j] = φ(r_mixed(x_i, c_j)).
+    // Non-periodic-only polynomial side condition → translation-aware null
+    // space `Z = null(Pᵀ)`. For the cylinder (m=2) `P = [1, y]`.
+    let poly_block_centers =
+        mixed_periodicity_nullspace_poly_block(centers_owned.view(), user_m, periodic_per_axis);
+    let z = kernel_constraint_nullspace_from_matrix(poly_block_centers.view())?;
+    let kernel_cols = z.ncols();
+    let n_poly = poly_block_centers.ncols();
+
+    // Row-parallel additive kernel: K[i, j] = Σ_a R_a(x_i[a], c_j[a]).
     let mut raw_kernel = Array2::<f64>::zeros((n_data, k_centers));
+    let kernel_err: std::sync::Mutex<Option<BasisError>> = std::sync::Mutex::new(None);
     raw_kernel
         .axis_chunks_iter_mut(ndarray::Axis(0), 1024)
         .into_par_iter()
@@ -819,34 +1043,53 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
                 let i = row_offset + local_i;
                 let x_row = data.row(i);
                 for j in 0..k_centers {
-                    let c_row = centers_owned.row(j);
-                    let r =
-                        duchon_mixed_periodicity_distance(x_row, c_row, periodic_per_axis, periods);
-                    out_row[j] = ppc.eval(r);
+                    match mixed_periodicity_additive_kernel(
+                        x_row,
+                        centers_owned.row(j),
+                        user_m,
+                        periodic_per_axis,
+                        periods,
+                        &axis_bounds,
+                    ) {
+                        Ok(v) => out_row[j] = v,
+                        Err(e) => {
+                            *kernel_err.lock().unwrap() = Some(e);
+                            return;
+                        }
+                    }
                 }
             }
         });
+    if let Some(e) = kernel_err.into_inner().unwrap() {
+        return Err(e);
+    }
 
-    // Design = [raw_kernel @ z, ones] (constant column carries the
-    // constant-only nullspace).
+    // Design = [K @ Z, P(data)] — the kernel columns plus the explicit
+    // unpenalised polynomial columns (in the non-periodic coordinates only).
     let design_kernel = fast_ab(&raw_kernel, &z);
-    let mut basis = Array2::<f64>::zeros((n_data, kernel_cols + 1));
+    let poly_block_data =
+        mixed_periodicity_nullspace_poly_block(data, user_m, periodic_per_axis);
+    let mut basis = Array2::<f64>::zeros((n_data, kernel_cols + n_poly));
     basis
         .slice_mut(s![.., 0..kernel_cols])
         .assign(&design_kernel);
-    basis.column_mut(kernel_cols).fill(1.0);
+    basis
+        .slice_mut(s![.., kernel_cols..kernel_cols + n_poly])
+        .assign(&poly_block_data);
 
-    // Penalty: Ω = Zᵀ K_centers Z (kernel-Gram identity in the projected
-    // basis), padded with a zero row/col for the constant column.
+    // Penalty: Ω = Zᵀ K_CC Z (kernel-Gram identity in the projected basis),
+    // padded with zero rows/cols for the unpenalised polynomial columns. PSD
+    // because K_CC is PSD and Z is real (congruence preserves PSD).
     let mut center_kernel = Array2::<f64>::zeros((k_centers, k_centers));
     fill_symmetric_from_row_kernel(&mut center_kernel, |i, j| {
-        let r = duchon_mixed_periodicity_distance(
+        mixed_periodicity_additive_kernel(
             centers_owned.row(i),
             centers_owned.row(j),
+            user_m,
             periodic_per_axis,
             periods,
-        );
-        Ok(ppc.eval(r))
+            &axis_bounds,
+        )
     })?;
     let omega = fast_ab(&fast_atb(&z, &center_kernel), &z);
     let mut penalty = Array2::<f64>::zeros((basis.ncols(), basis.ncols()));
@@ -897,7 +1140,10 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
                     .collect(),
             ),
             power: spec.power,
-            nullspace_order: effective_nullspace_order,
+            // Record the user's requested order so the prediction/jet replay
+            // rebuilds the SAME non-periodic-only polynomial null space and the
+            // SAME order-`m` additive kernel (gam#1423).
+            nullspace_order: spec.nullspace_order,
             identifiability_transform,
             input_scales: None,
             aniso_log_scales: None,
