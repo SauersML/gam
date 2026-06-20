@@ -1802,6 +1802,46 @@ mod tests {
         }
     }
 
+    /// The crossing-edge tower in the CONSTRAINT frame (intercept `a` and
+    /// slope `b` BOTH independent — slots 0 and 1) reproduces taylor-jet's
+    /// FD-certified bare boundary-velocity constants exactly:
+    ///   z_a  = ∂z/∂a   = −1/b
+    ///   z_ab = ∂²z/∂a∂b = +1/b²
+    ///   z_aa = ∂²z/∂a²  = 0
+    ///   z_bb = ∂²z/∂b²  = +2(τ−a)/b³
+    /// These are the `f_a`/`f_au`/`f_aa` constraint-jet boundary motions the
+    /// production base path drops (and only adds in the dir twins, causing the
+    /// #932 desync). Here `a` is independent (NOT yet substituted with a(θ)),
+    /// so `z_aa = 0` and there is no `a_uv` chain — `implicit_solve` introduces
+    /// that later. Pins the constant before the constraint-tower wiring.
+    #[test]
+    fn crossing_edge_constraint_frame_matches_bare_velocity_constants() {
+        const TAU: f64 = 1.3;
+        let a0 = 0.45_f64;
+        let b0 = 0.85_f64;
+        // Slot 0 = a, slot 1 = b, both seeded independent.
+        let a = Tower4::<2>::variable(a0, 0);
+        let b = Tower4::<2>::variable(b0, 1);
+        let z = (Tower4::<2>::constant(TAU) - a) / b;
+
+        assert!((z.v - (TAU - a0) / b0).abs() < 1e-12);
+        assert!((z.g[0] - (-1.0 / b0)).abs() < 1e-12, "z_a {:+.10e}", z.g[0]);
+        assert!(
+            (z.h[0][1] - 1.0 / (b0 * b0)).abs() < 1e-12,
+            "z_ab {:+.10e} vs +1/b² {:+.10e}",
+            z.h[0][1],
+            1.0 / (b0 * b0)
+        );
+        assert!(z.h[0][0].abs() < 1e-12, "z_aa must vanish, got {:+.10e}", z.h[0][0]);
+        let want_zbb = 2.0 * (TAU - a0) / (b0 * b0 * b0);
+        assert!(
+            (z.h[1][1] - want_zbb).abs() < 1e-12,
+            "z_bb {:+.10e} vs 2(τ−a)/b³ {:+.10e}",
+            z.h[1][1],
+            want_zbb
+        );
+    }
+
     /// The oracle harness catches a planted #736-style sign flip in a
     /// cross block and reports the channel by name.
     #[test]
