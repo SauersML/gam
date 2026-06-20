@@ -468,63 +468,17 @@ pub fn build_termspec(
                 kind,
                 options,
             } => {
-                let mut smooth_vars = vars.clone();
+                let smooth_vars = vars.clone();
                 let by_name = options.get("by").cloned();
-                let bs_name = options
-                    .get("bs")
-                    .or_else(|| options.get("type"))
-                    .map(|v| v.to_ascii_lowercase());
-                let is_sz = matches!(
-                    bs_name.as_deref(),
-                    Some("sz") | Some("sum-to-zero") | Some("sum_to_zero")
-                );
-                // For a sum-to-zero factor smooth, identify the categorical
-                // factor AMONG the supplied variables rather than assuming a
-                // fixed position. mgcv's `s(x, fac, bs="sz")` is
-                // continuous-first (the factor acts like a `by=` producing
-                // sum-to-zero per-level deviations), exactly like `bs="fs"`,
-                // whose builder already detects the factor by column kind. We
-                // mirror that here so `s(x, g, bs="sz")` and `s(g, x, ...)` both
-                // resolve `g` as the factor — one consistent convention across
-                // factor-smooth families.
-                let sz_factor_var: Option<String> = if is_sz {
-                    if vars.len() < 2 {
-                        return Err(format!(
-                            "bs=sz smooth '{}' expects a categorical factor and one or more smooth variables",
-                            label
-                        )
-                        .into());
-                    }
-                    let mut factor_positions = vars.iter().enumerate().filter(|(_, v)| {
-                        resolve_col(col_map, v).is_ok_and(|c| {
-                            matches!(ds.column_kinds.get(c), Some(ColumnKindTag::Categorical))
-                        })
-                    });
-                    let factor_pos = factor_positions.next().map(|(idx, _)| idx);
-                    if factor_positions.next().is_some() {
-                        return Err(format!(
-                            "bs=sz smooth '{}' expects exactly one categorical factor among its variables; found more than one",
-                            label
-                        )
-                        .into());
-                    }
-                    let Some(factor_pos) = factor_pos else {
-                        return Err(format!(
-                            "bs=sz smooth '{}' requires one categorical factor variable; none of its variables is categorical",
-                            label
-                        )
-                        .into());
-                    };
-                    smooth_vars = vars
-                        .iter()
-                        .enumerate()
-                        .filter(|(idx, _)| *idx != factor_pos)
-                        .map(|(_, v)| v.clone())
-                        .collect();
-                    Some(vars[factor_pos].clone())
-                } else {
-                    None
-                };
+                // `bs="sz"` (sum-to-zero), like `bs="fs"`/`bs="re"`, is a
+                // factor-smooth family handled natively by `build_smooth_basis`'s
+                // fs/sz/re path: it detects the categorical factor among the
+                // variables and emits a `SmoothBasisSpec::FactorSmooth { Sz }`
+                // with the correct single-penalty marginal and modest default
+                // basis. Route sz straight through `build_smooth_basis` rather
+                // than intercepting it into a legacy `FactorSumToZero` envelope
+                // here (which left `sz(fac, x)` mis-typed as `FactorSumToZero`
+                // instead of the expected `FactorSmooth { Sz }`).
                 let cols = smooth_vars
                     .iter()
                     .map(|v| resolve_col(col_map, v))
@@ -535,42 +489,6 @@ pub fn build_termspec(
                 // must not propagate to the inner basis builder, which has no
                 // allow-list entry for it and would reject it as an unknown option.
                 inner_options.remove("ordered");
-                if is_sz {
-                    inner_options.remove("bs");
-                    inner_options.remove("type");
-                    // mgcv's `bs="sz"` is a SINGLE-penalty smooth: the marginal
-                    // wiggliness penalty is replicated across levels and the
-                    // marginal's polynomial null space (the per-level linear
-                    // trend, once centred) is left UNPENALISED, exactly as the
-                    // default thin-plate marginal leaves its null space free.
-                    // gam's 1-D smooth otherwise defaults to a double penalty
-                    // (an added null-space shrinkage ridge, mgcv `select=TRUE`
-                    // semantics). Replicated across the sz deviation blocks that
-                    // extra ridge shrinks every level's linear-trend deviation
-                    // toward zero — signal that the truth carries (e.g. the
-                    // linear projection of sin(2*pi*x) is non-zero) — so REML
-                    // over-shrinks the per-level deviations and truth recovery
-                    // degrades relative to mgcv's free null space. Force the
-                    // inner marginal to a single penalty so the per-level null
-                    // space stays free, matching mgcv's sz construction. An
-                    // explicit user `double_penalty=` still wins.
-                    inner_options
-                        .entry("double_penalty".to_string())
-                        .or_insert_with(|| "false".to_string());
-                    // A `bs="sz"` factor smooth shares ONE marginal replicated
-                    // across the level-deviation blocks, so — exactly like `fs` —
-                    // the pooled knot heuristic over-equips it (~24 functions vs
-                    // mgcv's sz default k=10) and REML over-fits the shared shape
-                    // (gam#903: gam 0.068 vs mgcv 0.046 truth RMSE). The inner
-                    // smooth is built as a plain 1-D smooth below, which would
-                    // otherwise take the full pooled basis, so inject mgcv's
-                    // modest default here. An explicit user `k`/`basis_dim` wins
-                    // (it precedes `basis_dim` in the basis-count lookup, and
-                    // `or_insert` leaves a user `basis_dim` untouched).
-                    inner_options
-                        .entry("basis_dim".to_string())
-                        .or_insert_with(|| FACTOR_SMOOTH_DEFAULT_BASIS_DIM.to_string());
-                }
                 // Pop the shape constraint before `build_smooth_basis` runs so
                 // it never reaches the per-kind `validate_known_options`
                 // allow-lists (the constraint is a property of the smooth term,
@@ -591,30 +509,7 @@ pub fn build_termspec(
                     policy,
                     smooth_coordinate_count,
                 )?;
-                if let Some(factor_var) = sz_factor_var {
-                    // `factor_var` was already confirmed categorical when it was
-                    // selected above; resolve its column for the level scan.
-                    let by_col = resolve_col(col_map, &factor_var)?;
-                    let mut levels: Vec<u64> = ds
-                        .values
-                        .column(by_col)
-                        .iter()
-                        .map(|v| v.to_bits())
-                        .collect();
-                    levels.sort_unstable();
-                    levels.dedup();
-                    smooth_terms.push(SmoothTermSpec {
-                        name: label.clone(),
-                        basis: SmoothBasisSpec::FactorSumToZero {
-                            inner: Box::new(inner_basis),
-                            by_col,
-                            levels,
-                            frozen_global_orthogonality: None,
-                        },
-                        shape,
-                        joint_null_rotation: None,
-                    });
-                } else if let Some(by_name) = by_name {
+                if let Some(by_name) = by_name {
                     let by_col = resolve_col(col_map, &by_name)?;
                     match ds.column_kinds.get(by_col).copied().ok_or_else(|| {
                         format!("internal column-kind lookup failed for by variable '{by_name}'")
