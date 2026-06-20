@@ -39,7 +39,7 @@ fn summarize(label: &str, fit: &Result<FitResult, gam::WorkflowError>) {
                 println!("  >>> {label}: SILENTLY WRONG FIT (non-finite output, no error)");
             }
         }
-        Ok(other) => println!("{label}: OK non-standard fit {other:?}"),
+        Ok(_) => println!("{label}: OK non-standard fit"),
         Err(e) => println!("{label}: ERR (clean) {e:?}"),
     }
 }
