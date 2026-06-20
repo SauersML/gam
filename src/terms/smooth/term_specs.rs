@@ -6019,6 +6019,154 @@ fn apply_by_variable_to_local_build(
     Ok(built)
 }
 
+/// Build the local smooth term for a `BySmooth` spec, which unifies numeric-by
+/// and factor-by modulation into a single `SmoothTermSpec`.
+///
+/// For a **numeric** by-variable the inner smooth is built once and every row
+/// is multiplied by the by-column value (identical to `ByVariable::Numeric`).
+///
+/// For a **factor** by-variable the inner smooth is built once and gated per
+/// level into side-by-side column blocks, producing a `n × (L * p)` design
+/// matrix.  The penalties are block-diagonalised (one copy of the inner penalty
+/// per level) exactly as `build_factor_smooth` does for `bs="fs"/"sz"`.
+fn build_by_smooth_local(
+    data: ArrayView2<'_, f64>,
+    term: &SmoothTermSpec,
+    smooth: &SmoothBasisSpec,
+    by_kind: &ByVarKind,
+    workspace: &mut crate::basis::BasisWorkspace,
+) -> Result<LocalSmoothTermBuild, BasisError> {
+    let inner_term = SmoothTermSpec {
+        name: term.name.clone(),
+        basis: (*smooth).clone(),
+        shape: term.shape,
+        joint_null_rotation: None,
+    };
+    let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
+
+    match by_kind {
+        ByVarKind::Numeric { feature_col } => {
+            let inner_meta = inner.metadata.clone();
+            let mut built = apply_by_variable_to_local_build(
+                inner,
+                data,
+                *feature_col,
+                &ByVariableSpec::Numeric,
+                &term.name,
+            )?;
+            built.metadata = BasisMetadata::BySmooth {
+                inner: Box::new(inner_meta),
+                by_col: *feature_col,
+                levels: None,
+                ordered: false,
+            };
+            Ok(built)
+        }
+        ByVarKind::Factor {
+            feature_col,
+            frozen_levels,
+            ordered,
+        } => {
+            // Collect factor levels: prefer the frozen set (replay path), else
+            // scan the data column (first-fit path).
+            let level_bits: Vec<u64> = if let Some(fl) = frozen_levels {
+                fl.clone()
+            } else {
+                let col = data.column(*feature_col);
+                let mut seen = BTreeSet::<u64>::new();
+                for &v in col.iter() {
+                    if v.is_finite() {
+                        seen.insert(v.to_bits());
+                    }
+                }
+                seen.into_iter().collect()
+            };
+            let n_levels = level_bits.len();
+            if n_levels == 0 {
+                crate::bail_invalid_basis!(
+                    "by-factor smooth term '{}': factor column {} has no observed levels",
+                    term.name,
+                    feature_col
+                );
+            }
+            let p = inner.dim;
+            let q = n_levels * p;
+            let n = data.nrows();
+
+            let inner_dense = inner
+                .design
+                .try_to_dense_by_chunks("by-factor smooth design gating")
+                .map_err(BasisError::InvalidInput)?;
+
+            // Gate each level into its own p-wide column block.
+            let mut combined = Array2::<f64>::zeros((n, q));
+            for (lvl_idx, &bits) in level_bits.iter().enumerate() {
+                let col_start = lvl_idx * p;
+                for row in 0..n {
+                    if data[[row, *feature_col]].to_bits() == bits {
+                        combined
+                            .slice_mut(s![row, col_start..col_start + p])
+                            .assign(&inner_dense.row(row));
+                    }
+                }
+            }
+
+            // Build block-diagonal penalties: one copy of the inner penalty per
+            // level, matching the block-column layout of the combined design.
+            let inner_meta = inner.metadata.clone();
+            let n_penalties = inner.penalties.len();
+            let mut penalties = Vec::<Array2<f64>>::with_capacity(n_penalties);
+            let mut penaltyinfo = Vec::<PenaltyInfo>::with_capacity(n_penalties);
+            for (pen_pos, s_inner) in inner.penalties.iter().enumerate() {
+                let mut s_big = Array2::<f64>::zeros((q, q));
+                for lvl in 0..n_levels {
+                    let off = lvl * p;
+                    s_big
+                        .slice_mut(s![off..off + p, off..off + p])
+                        .assign(s_inner);
+                }
+                let (s_big, scale) = normalize_penalty_in_constrained_space(&s_big);
+                let mut info = inner.penaltyinfo[pen_pos].clone();
+                info.original_index = pen_pos;
+                info.normalization_scale *= scale;
+                info.nullspace_dim_hint = info.nullspace_dim_hint.saturating_mul(n_levels);
+                info.kronecker_factors = None;
+                penalties.push(s_big);
+                penaltyinfo.push(info);
+            }
+
+            let nullspaces = inner
+                .nullspaces
+                .iter()
+                .map(|&ns| ns.saturating_mul(n_levels))
+                .collect::<Vec<_>>();
+            let null_eigenvectors = vec![None; penalties.len()];
+            let ops = vec![None; penalties.len()];
+
+            Ok(LocalSmoothTermBuild {
+                dim: q,
+                design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(combined)),
+                penalties,
+                ops,
+                nullspaces,
+                null_eigenvectors,
+                joint_null_rotation: None,
+                penaltyinfo,
+                pre_dropped_penaltyinfo: inner.pre_dropped_penaltyinfo,
+                metadata: BasisMetadata::BySmooth {
+                    inner: Box::new(inner_meta),
+                    by_col: *feature_col,
+                    levels: Some(level_bits),
+                    ordered: *ordered,
+                },
+                linear_constraints: None,
+                box_reparam: false,
+                kronecker_factored: None,
+            })
+        }
+    }
+}
+
 fn ensure_by_variable_specs_match(
     kind: &BySmoothKind,
     by: &ByVariableSpec,
@@ -6439,6 +6587,12 @@ fn build_single_local_smooth_term(
         };
         let built = build_single_local_smooth_term(data, &inner_term, workspace)?;
         return apply_by_variable_to_local_build(built, data, *by_col, by, &term.name);
+    }
+
+    // BySmooth: a `by=` smooth that unifies numeric or factor modulation into a
+    // single term.  Lower it here so the downstream match does not need an arm.
+    if let SmoothBasisSpec::BySmooth { smooth, by_kind } = &term.basis {
+        return build_by_smooth_local(data, term, smooth, by_kind, workspace);
     }
 
     let mut shape_axis_col: Option<usize> = None;
