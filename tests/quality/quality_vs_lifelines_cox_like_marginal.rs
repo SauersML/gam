@@ -405,6 +405,10 @@ test = pd.DataFrame({
     "sex": np.asarray(df["te_sex"], dtype=float),
     "age": np.asarray(df["te_age"], dtype=float),
 })
+# The ragged-column harness pads shorter columns with NaN out to the longest
+# column (here the train columns). Drop those padding rows so the held-out
+# frame has exactly the test rows the Rust side scores.
+test = test[np.isfinite(test["ejection_fraction"])].reset_index(drop=True)
 
 cph = CoxPHFitter()
 cph.fit(train, duration_col="time", event_col="event")
