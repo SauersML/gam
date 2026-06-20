@@ -552,8 +552,7 @@ pub fn build_termspec(
                                     smooth: Box::new(inner_basis),
                                     by_kind: ByVarKind::Factor {
                                         feature_col: by_col,
-                                        ordered: option_bool(options, "ordered")
-                                            .unwrap_or(false),
+                                        ordered: option_bool(options, "ordered").unwrap_or(false),
                                         frozen_levels: Some(frozen_levels),
                                     },
                                 },

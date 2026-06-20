@@ -65,32 +65,67 @@ fn diag_numrobust() {
 
     // AXIS 1: extreme y scale (1e8) and tiny y scale (1e-8).
     let y_big: Vec<f64> = base_y.iter().map(|y| y * 1e8).collect();
-    summarize("y_scale_1e8", &fit_from_formula("y ~ s(x)", &dataset_xy(base_x.clone(), y_big), &cfg));
+    summarize(
+        "y_scale_1e8",
+        &fit_from_formula("y ~ s(x)", &dataset_xy(base_x.clone(), y_big), &cfg),
+    );
     let y_small: Vec<f64> = base_y.iter().map(|y| y * 1e-8).collect();
-    summarize("y_scale_1e-8", &fit_from_formula("y ~ s(x)", &dataset_xy(base_x.clone(), y_small), &cfg));
+    summarize(
+        "y_scale_1e-8",
+        &fit_from_formula("y ~ s(x)", &dataset_xy(base_x.clone(), y_small), &cfg),
+    );
 
     // AXIS 2: extreme x scale.
     let x_big: Vec<f64> = base_x.iter().map(|x| x * 1e8).collect();
-    summarize("x_scale_1e8", &fit_from_formula("y ~ s(x)", &dataset_xy(x_big, base_y.clone()), &cfg));
+    summarize(
+        "x_scale_1e8",
+        &fit_from_formula("y ~ s(x)", &dataset_xy(x_big, base_y.clone()), &cfg),
+    );
     let x_small: Vec<f64> = base_x.iter().map(|x| x * 1e-8).collect();
-    summarize("x_scale_1e-8", &fit_from_formula("y ~ s(x)", &dataset_xy(x_small, base_y.clone()), &cfg));
+    summarize(
+        "x_scale_1e-8",
+        &fit_from_formula("y ~ s(x)", &dataset_xy(x_small, base_y.clone()), &cfg),
+    );
 
     // AXIS 3: zero-variance y (all identical).
     let y_const: Vec<f64> = vec![3.5; n];
-    summarize("y_zero_variance", &fit_from_formula("y ~ s(x)", &dataset_xy(base_x.clone(), y_const), &cfg));
+    summarize(
+        "y_zero_variance",
+        &fit_from_formula("y ~ s(x)", &dataset_xy(base_x.clone(), y_const), &cfg),
+    );
 
     // AXIS 4: single unique x (collinear / degenerate design).
     let x_const: Vec<f64> = vec![0.5; n];
-    summarize("x_single_value", &fit_from_formula("y ~ s(x)", &dataset_xy(x_const, base_y.clone()), &cfg));
+    summarize(
+        "x_single_value",
+        &fit_from_formula("y ~ s(x)", &dataset_xy(x_const, base_y.clone()), &cfg),
+    );
 
     // AXIS 5: tiny n.
-    summarize("n2", &fit_from_formula("y ~ s(x)", &dataset_xy(vec![0.1, 0.9], vec![1.0, 2.0]), &cfg));
-    summarize("n3", &fit_from_formula("y ~ s(x)", &dataset_xy(vec![0.1, 0.5, 0.9], vec![1.0, 0.5, 2.0]), &cfg));
+    summarize(
+        "n2",
+        &fit_from_formula(
+            "y ~ s(x)",
+            &dataset_xy(vec![0.1, 0.9], vec![1.0, 2.0]),
+            &cfg,
+        ),
+    );
+    summarize(
+        "n3",
+        &fit_from_formula(
+            "y ~ s(x)",
+            &dataset_xy(vec![0.1, 0.5, 0.9], vec![1.0, 0.5, 2.0]),
+            &cfg,
+        ),
+    );
 
     // AXIS 6: x with a single huge outlier (heavy leverage).
     let mut x_out = base_x.clone();
     x_out[0] = 1e12;
-    summarize("x_outlier_1e12", &fit_from_formula("y ~ s(x)", &dataset_xy(x_out, base_y.clone()), &cfg));
+    summarize(
+        "x_outlier_1e12",
+        &fit_from_formula("y ~ s(x)", &dataset_xy(x_out, base_y.clone()), &cfg),
+    );
 
     // AXIS 7: y with one Inf/NaN — should be a CLEAN error not a panic/silent.
     let mut y_inf = base_y.clone();

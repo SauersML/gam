@@ -1856,7 +1856,11 @@ mod tests {
         let flux = moving_limit_boundary_tower_theta_integrand::<3, 2>(&phi_jet, &z_edge);
 
         // Value channel is 0 by construction (boundary, not the integral itself).
-        assert!(flux.v.abs() < 1e-12, "boundary value channel {:+.3e}", flux.v);
+        assert!(
+            flux.v.abs() < 1e-12,
+            "boundary value channel {:+.3e}",
+            flux.v
+        );
 
         // Oracle (1): central FD of the closed-form boundary flux
         //   Bnd(θ) = Φ(z_edge(θ); θ) − Φ(z₀; θ)   (z₀ FROZEN at the base edge).
@@ -1923,8 +1927,7 @@ mod tests {
 
         // Decisive: the `G·z_uv` term the directional path DROPS is present and
         // material in the [1][1] entry (z_uv = 2 there).
-        let pure_no_zuv =
-            g_z * z_edge.g[1] * z_edge.g[1] + 2.0 * g_theta[1] * z_edge.g[1];
+        let pure_no_zuv = g_z * z_edge.g[1] * z_edge.g[1] + 2.0 * g_theta[1] * z_edge.g[1];
         let g_zuv = flux.h[1][1] - pure_no_zuv;
         assert!(
             (g_zuv - gg * 2.0).abs() < 1e-9,

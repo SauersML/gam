@@ -376,15 +376,14 @@ fn cluster_regime_gam_selects_mixture_and_recovers_k_match_or_beat_sklearn() {
 
     // gam cross-class adjudication: must headline the mixture rung.
     let candidates = build_cross_class_candidates(data.view(), cfg);
-    let verdict =
-        adjudicate_cross_class_race(
-            N,
-            candidates,
-            STACKING_CV_FOLDS,
-            STACKING_CV_SEED,
-            StackingConfig::default(),
-        )
-        .expect("cross-class race adjudicates on cluster data");
+    let verdict = adjudicate_cross_class_race(
+        N,
+        candidates,
+        STACKING_CV_FOLDS,
+        STACKING_CV_SEED,
+        StackingConfig::default(),
+    )
+    .expect("cross-class race adjudicates on cluster data");
 
     let winner_name = &verdict.candidate_names[verdict.winner_index];
     assert!(
@@ -436,15 +435,14 @@ fn circle_regime_gam_selects_smooth_circle_not_mixture_via_interpolated_holdout(
 
     // --- METRIC 3 (HEADLINE): cross-class verdict picks the smooth circle. ---
     let candidates = build_cross_class_candidates(data.view(), cfg);
-    let verdict =
-        adjudicate_cross_class_race(
-            N,
-            candidates,
-            STACKING_CV_FOLDS,
-            STACKING_CV_SEED,
-            StackingConfig::default(),
-        )
-        .expect("cross-class race adjudicates on circle data");
+    let verdict = adjudicate_cross_class_race(
+        N,
+        candidates,
+        STACKING_CV_FOLDS,
+        STACKING_CV_SEED,
+        StackingConfig::default(),
+    )
+    .expect("cross-class race adjudicates on circle data");
 
     assert!(
         verdict.is_cross_class,

@@ -354,7 +354,10 @@ fn ibp_cross_row_woodbury_dd_and_logit_curvature_match_finite_difference() {
             assert_abs_diff_eq!(analytic, fd, epsilon = 1.0e-5);
         }
     }
-    assert!(max_dd < 1.0e-5, "cross_row_dd·J vs FD max err = {max_dd:.3e}");
+    assert!(
+        max_dd < 1.0e-5,
+        "cross_row_dd·J vs FD max err = {max_dd:.3e}"
+    );
 }
 
 #[test]
