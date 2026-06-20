@@ -148,6 +148,43 @@ pub(crate) struct SurvivalJointQuantities {
     pub(crate) d3qdot_ls_ls_lsd: Array1<f64>,
 }
 
+/// Per-row negative-log-likelihood **curvatures** of the three functionally
+/// independent time-channel indices `(h0, h1, d_raw)` — i.e. the diagonal of
+/// the row NLL Hessian in time-channel space.
+///
+/// The stored `SurvivalJointQuantities` fields (`h_time_h0`, `h_time_h1`,
+/// `h_time_d`) all hold the *log-likelihood* second derivatives `+∂²ℓ/∂·²`
+/// (they are `-tower.h[i][i]` of the NLL jet, double-negated). The NLL Hessian
+/// negates each **uniformly** — `H = -∂²ℓ`. Historically each assembly site
+/// hand-applied that minus per channel, and one site drifted to `+h_time_d`,
+/// flipping the event-Jacobian (`g`) self-term and every `g`-coupled
+/// cross-block term (gam#1396). This type makes the sign live in exactly one
+/// place: the three channels are negated together at construction, so a
+/// per-channel sign skew is structurally unrepresentable.
+pub(crate) struct TimeChannelNllCurvatures {
+    /// `-∂²ℓ/∂h0²` (entry-survival channel).
+    pub(crate) h0: Array1<f64>,
+    /// `-∂²ℓ/∂h1²` (exit-survival/event-density channel).
+    pub(crate) h1: Array1<f64>,
+    /// `-∂²ℓ/∂d_raw²` (event-Jacobian `g = d_raw + qdot` channel).
+    pub(crate) d: Array1<f64>,
+}
+
+impl SurvivalJointQuantities {
+    /// Build the time-channel NLL curvature triple, applying the `H = -∂²ℓ`
+    /// negation once and uniformly across `(h0, h1, d_raw)`. Every diagonal
+    /// time-channel Hessian assembly site (block-diagonal time-time, full-joint
+    /// time-time, and the `g`-coupled time×{threshold,log_sigma,wiggle} cross
+    /// blocks) consumes this so the three channels can never disagree on sign.
+    pub(crate) fn time_channel_nll_curvatures(&self) -> TimeChannelNllCurvatures {
+        TimeChannelNllCurvatures {
+            h0: -&self.h_time_h0,
+            h1: -&self.h_time_h1,
+            d: -&self.h_time_d,
+        }
+    }
+}
+
 pub(crate) struct SurvivalJointPsiDirection {
     pub(crate) x_t_exit_psi: Option<Array2<f64>>,
     pub(crate) x_t_entry_psi: Option<Array2<f64>>,
@@ -1360,13 +1397,13 @@ impl SurvivalLocationScaleFamily {
     ///   ∂²(−ell_i)/∂dRaw² =   w_i d / g²
     ///
     /// The fields `grad_time_eta_*` / `h_time_*` produced by
-    /// [`Self::row_derivatives`] are the corresponding log-likelihood (not
-    /// NLL) partials; we negate `grad_time_eta_*` and the entry/exit second
-    /// derivatives (`h_time_h0`, `h_time_h1`) to recover the NLL convention.
-    /// The derivative-channel Hessian field `h_time_d` is already stored in
-    /// NLL sign (the joint Hessian builder uses `+h_time_d` whereas it uses
-    /// `−h_time_h0` / `−h_time_h1` for entry/exit; see the exact joint
-    /// `safe_fast_xt_diag_x` assembly).
+    /// [`Self::row_derivatives`] are log-likelihood (not NLL) partials. All
+    /// three time channels (h0, h1, d_raw) are stored as `+∂ℓ`/`+∂²ℓ`, so the
+    /// NLL gradient/curvature negates each **uniformly**. This site delegates
+    /// that to [`SurvivalRowDerivatives::time_channel_nll_gradient`] /
+    /// [`SurvivalRowDerivatives::time_channel_nll_curvature_diag`], which own
+    /// the sign in one place (gam#1396 — a prior `+h_time_d` outlier here and
+    /// in the joint assembler flipped the event-Jacobian self-term).
     pub(crate) fn offset_channel_geometry(
         &self,
         block_states: &[ParameterBlockState],
@@ -1434,21 +1471,17 @@ impl SurvivalLocationScaleFamily {
                     let Some(row) = self.row_derivatives(i, state)? else {
                         return Ok((i, 0.0, 0.0, 0.0, [[0.0; 3]; 3]));
                     };
-                    // Convert ℓ-partials (h_time_*, grad_time_eta_*) to NLL partials.
-                    // grad_time_eta_* hold ∂ℓ/∂{h0,h1,d_raw}; ∂NLL/∂o = −∂ℓ/∂h.
-                    let r_entry = -row.grad_time_eta_h0;
-                    let r_exit = -row.grad_time_eta_h1;
-                    let r_deriv = -row.grad_time_eta_d;
-                    // NLL Hessian on (h0,h1,d_raw): diagonal because the row likelihood
-                    // factors through (u0, u1, g) which are functionally independent
-                    // in (h0, h1, d_raw). All three index second derivatives are
-                    // stored as +∂²ℓ (h_time_* = -tower.h[i][i], tower = NLL), so the
-                    // NLL curvature negates each uniformly: (−h_time_h0, −h_time_h1,
-                    // −h_time_d).
+                    // NLL gradient + curvature on the three time channels
+                    // (h0, h1, d_raw). Both helpers own the `-∂ℓ`/`-∂²ℓ` sign
+                    // so the channels are negated uniformly (gam#1396); the
+                    // row likelihood factors through the independent indices
+                    // (u0, u1, g), so the curvature is diagonal.
+                    let [r_entry, r_exit, r_deriv] = row.time_channel_nll_gradient();
+                    let curv_diag = row.time_channel_nll_curvature_diag();
                     let mut curv = [[0.0_f64; 3]; 3];
-                    curv[0][0] = -row.h_time_h0;
-                    curv[1][1] = -row.h_time_h1;
-                    curv[2][2] = -row.h_time_d;
+                    curv[0][0] = curv_diag[0];
+                    curv[1][1] = curv_diag[1];
+                    curv[2][2] = curv_diag[2];
                     Ok((i, r_entry, r_exit, r_deriv, curv))
                 },
             )

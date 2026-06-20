@@ -378,18 +378,22 @@ impl SurvivalLocationScaleFamily {
         };
 
         let assemble_h_time = || -> Result<Array2<f64>, String> {
-            // Time-time block (mirrors line 5846-5849 in the joint assembly).
+            // Time-time block: the diagonal of the row NLL Hessian in
+            // time-channel space, pulled back through the three time Jacobians.
+            // The `-∂²ℓ` sign is applied once and uniformly by the curvature
+            // helper (gam#1396).
+            let nll = q.time_channel_nll_curvatures();
             Ok(safe_fast_xt_diag_x_with_parallelism(
                 &dynamic.time_jac_entry,
-                &(-&q.h_time_h0),
+                &nll.h0,
                 product_parallelism,
             ) + safe_fast_xt_diag_x_with_parallelism(
                 &dynamic.time_jac_exit,
-                &(-&q.h_time_h1),
+                &nll.h1,
                 product_parallelism,
             ) + safe_fast_xt_diag_x_with_parallelism(
                 &dynamic.time_jac_deriv,
-                &(-&q.h_time_d),
+                &nll.d,
                 product_parallelism,
             ))
         };
@@ -630,9 +634,13 @@ impl SurvivalLocationScaleFamily {
             Ok(())
         };
 
-        let h_time = mxtwxd(&dynamic.time_jac_entry, &(-&q.h_time_h0), row_mask)
-            + mxtwxd(&dynamic.time_jac_exit, &(-&q.h_time_h1), row_mask)
-            + mxtwxd(&dynamic.time_jac_deriv, &(-&q.h_time_d), row_mask);
+        // Time-time block: NLL Hessian diagonal in time-channel space. The
+        // `-∂²ℓ` sign is owned by the curvature helper so all three channels
+        // negate together (gam#1396).
+        let nll_time = q.time_channel_nll_curvatures();
+        let h_time = mxtwxd(&dynamic.time_jac_entry, &nll_time.h0, row_mask)
+            + mxtwxd(&dynamic.time_jac_exit, &nll_time.h1, row_mask)
+            + mxtwxd(&dynamic.time_jac_deriv, &nll_time.d, row_mask);
         assign_symmetric_block(&mut joint, offsets[0], offsets[0], &h_time);
 
         if let Some(x_t_deriv) = x_threshold_deriv {
@@ -718,52 +726,56 @@ impl SurvivalLocationScaleFamily {
             assign_symmetric_block(&mut joint, offsets[1], offsets[2], &h_tl);
         }
 
+        // Time × threshold cross block: each time channel's NLL curvature
+        // (`nll_time.{h0,h1,d}`, already carrying the `-∂²ℓ` sign) times the
+        // threshold chain factor `∂{u0,u1,g}/∂η_t`.
         let mut h_ht = mxtwx(
             &self.x_time_entry,
-            &(-&q.h_time_h0 * q.dq_t_entry.as_ref().unwrap()),
+            &(&nll_time.h0 * q.dq_t_entry.as_ref().unwrap()),
             x_threshold_entry,
             row_mask,
         )? + mxtwx(
             &self.x_time_exit,
-            &(-&q.h_time_h1 * &q.dq_t),
+            &(&nll_time.h1 * &q.dq_t),
             x_threshold_exit,
             row_mask,
         )? + mxtwx(
             &self.x_time_deriv,
-            &(-&q.h_time_d * &q.dqdot_t),
+            &(&nll_time.d * &q.dqdot_t),
             x_threshold_exit,
             row_mask,
         )?;
         if let Some(x_t_deriv) = x_threshold_deriv {
             h_ht += &mxtwx(
                 &self.x_time_deriv,
-                &(-&q.h_time_d * &q.dqdot_td),
+                &(&nll_time.d * &q.dqdot_td),
                 x_t_deriv,
                 row_mask,
             )?;
         }
         assign_symmetric_block(&mut joint, offsets[0], offsets[1], &h_ht);
 
+        // Time × log-σ cross block: same structure, log-σ chain factor.
         let mut h_hl = mxtwx(
             &self.x_time_entry,
-            &(-&q.h_time_h0 * q.dq_ls_entry.as_ref().unwrap()),
+            &(&nll_time.h0 * q.dq_ls_entry.as_ref().unwrap()),
             x_log_sigma_entry,
             row_mask,
         )? + mxtwx(
             &self.x_time_exit,
-            &(-&q.h_time_h1 * &q.dq_ls),
+            &(&nll_time.h1 * &q.dq_ls),
             x_log_sigma_exit,
             row_mask,
         )? + mxtwx(
             &self.x_time_deriv,
-            &(-&q.h_time_d * &q.dqdot_ls),
+            &(&nll_time.d * &q.dqdot_ls),
             x_log_sigma_exit,
             row_mask,
         )?;
         if let Some(x_ls_deriv) = x_log_sigma_deriv {
             h_hl += &mxtwx(
                 &self.x_time_deriv,
-                &(-&q.h_time_d * &q.dqdot_lsd),
+                &(&nll_time.d * &q.dqdot_lsd),
                 x_ls_deriv,
                 row_mask,
             )?;
@@ -906,9 +918,12 @@ impl SurvivalLocationScaleFamily {
             }
             assign_symmetric_block(&mut joint, offsets[2], w_offset, &h_lw);
 
-            let h_hw = mxtwx(&self.x_time_entry, &(-&q.h_time_h0), xw_entry, row_mask)?
-                + mxtwx(&self.x_time_exit, &(-&q.h_time_h1), xw_exit, row_mask)?
-                + mxtwx(&self.x_time_deriv, &(-&q.h_time_d), xw_qdot, row_mask)?;
+            // Time × time-wiggle cross block: time-channel NLL curvatures
+            // pulled back through the wiggle bases (the wiggle modulates the
+            // same three time channels, so its chain factor is the identity).
+            let h_hw = mxtwx(&self.x_time_entry, &nll_time.h0, xw_entry, row_mask)?
+                + mxtwx(&self.x_time_exit, &nll_time.h1, xw_exit, row_mask)?
+                + mxtwx(&self.x_time_deriv, &nll_time.d, xw_qdot, row_mask)?;
             assign_symmetric_block(&mut joint, offsets[0], w_offset, &h_hw);
         }
 
@@ -1156,18 +1171,16 @@ impl SurvivalLocationScaleFamily {
         // diagonal base assembly (assemble_joint_hessian_from_quantities)
         // is
         //
-        //   H_tt = X_entry'·diag(-h_time_h0)·X_entry
-        //        + X_exit' ·diag(-h_time_h1)·X_exit
-        //        + X_deriv'·diag(-h_time_d)·X_deriv
+        //   H_tt = X_entry'·diag(nll.h0)·X_entry
+        //        + X_exit' ·diag(nll.h1)·X_exit
+        //        + X_deriv'·diag(nll.d )·X_deriv
         //
-        // with h_time_h0 = +∂²ℓ/∂h0²,
-        //      h_time_h1 = +∂²ℓ/∂h1²,
-        //      h_time_d  = +∂²ℓ/∂d_raw².
-        // (All three are stored as +∂²ℓ because h_time_* = -tower.h[i][i]
-        // where the tower is the NLL, so the NLL Hessian negates each
-        // uniformly. The historical comment claimed h_time_d carried an
-        // extra sign; that was stale after the tower migration and produced
-        // a sign-flipped time-deriv self-term — gam#1396.)
+        // where (nll.h0, nll.h1, nll.d) = SurvivalJointQuantities::
+        // time_channel_nll_curvatures() = (-∂²ℓ/∂h0², -∂²ℓ/∂h1², -∂²ℓ/∂d_raw²).
+        // All three stored h_time_* hold +∂²ℓ (h_time_* = -tower.h[i][i],
+        // tower = NLL), so the curvature helper negates them uniformly. A prior
+        // stale convention used +h_time_d here, flipping the time-deriv
+        // self-term — gam#1396; the helper now owns the sign in one place.
         //
         // Differentiating H_tt along Δβ_t (with Δh0 = X_entry·Δβ_t,
         // Δh1 = X_exit·Δβ_t, Δd = X_deriv·Δβ_t, and q0/q1 invariant in
