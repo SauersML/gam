@@ -3452,6 +3452,10 @@ const RAW_REML_SCORE_KEYS: &[&str] = &["raw_reml_score"];
 const EDF_KEYS: &[&str] = &["edf_total", "edf", "effective_dof"];
 
 const LOG_LIK_KEYS: &[&str] = &["log_likelihood", "loglik", "log_lik"];
+// Response-family tag, used only by the compare_models comparability guard
+// (#1384). `family_name` is the SummaryPayload field; the aliases cover a
+// dict / .evidence object that exposes it under a shorter key.
+const FAMILY_KEYS: &[&str] = &["family_name", "family"];
 
 const PENALTY_RANK_KEYS: &[&str] = &["penalty_rank", "rank_s", "rank_S", "cache_penalty_rank"];
 
@@ -3543,6 +3547,7 @@ fn compare_reml_fits(
             score: extract_reml_score_from_view(py, &view)?,
             edf: extract_edf_from_view(py, &view)?,
             log_lik: extract_log_lik_from_view(&view)?,
+            family: extract_family_from_view(&view)?,
         });
     }
 
@@ -3732,6 +3737,43 @@ fn extract_edf_from_view(_py: Python<'_>, view: &RemlFitView<'_>) -> PyResult<Op
 /// back to the raw REML/LAML evidence headline.
 fn extract_log_lik_from_view(view: &RemlFitView<'_>) -> PyResult<Option<f64>> {
     extract_float_metadata_from_view(view, LOG_LIK_KEYS)
+}
+
+/// Response-family tag of a candidate fit, for the compare_models comparability
+/// guard (#1384). `None` when the fit does not expose one (legacy payloads),
+/// which the guard treats as unconstrained.
+fn extract_family_from_view(view: &RemlFitView<'_>) -> PyResult<Option<String>> {
+    extract_string_metadata_from_view(view, FAMILY_KEYS)
+}
+
+/// String-valued metadata lookup over the same SavedSummary-JSON / PythonObject
+/// fallback chain as [`extract_float_metadata_from_view`].
+fn extract_string_metadata_from_view(
+    view: &RemlFitView<'_>,
+    keys: &[&str],
+) -> PyResult<Option<String>> {
+    match view {
+        RemlFitView::SavedSummary(payload) => Ok(json_lookup_str(payload, keys)),
+        RemlFitView::PythonObject(_) => {
+            let Some(value) = extract_py_metadata_value(view, keys)? else {
+                return Ok(None);
+            };
+            value.extract::<String>().map(Some)
+        }
+    }
+}
+
+/// First string value found under any of `keys` in a SavedSummary JSON payload.
+fn json_lookup_str(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let object = payload.as_object()?;
+    for key in keys {
+        if let Some(value) = object.get(*key) {
+            if let Some(s) = value.as_str() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn extract_float_metadata_from_view(

@@ -1522,6 +1522,12 @@ pub struct RemlCandidate {
     /// constants-omitted scale (same as [`crate::inference::model_comparison`]).
     /// Present when the fit carries it; `None` for legacy payloads.
     pub log_lik: Option<f64>,
+    /// Response-family tag (e.g. "gaussian", "gamma", "binomial"). Carried so
+    /// `compare_reml_fits` can REFUSE to rank fits whose REML/LAML scores are on
+    /// incomparable base measures (a cross-family comparison is meaningless;
+    /// #1384). `None` for legacy payloads that did not record it — those are not
+    /// guarded (back-compatible), but every current FFI candidate carries it.
+    pub family: Option<String>,
 }
 
 impl RemlCandidate {
@@ -1592,6 +1598,29 @@ pub fn log_bayes_factor(reml_score_a: f64, reml_score_b: f64) -> f64 {
 pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlComparison, String> {
     if candidates.is_empty() {
         return Err("compare_models requires at least one fit".to_string());
+    }
+    // Fail-loud comparability guard (#1384): REML/LAML evidence scores are only
+    // comparable across fits of the SAME response family — a Gaussian score and
+    // a Gamma score live on different log-density base measures, so their
+    // difference is not a Bayes factor. Ranking them anyway returns a confident
+    // but meaningless winner. Refuse when two candidates carry DIFFERENT family
+    // tags. Candidates with no family tag (`None`, legacy payloads) are not
+    // constrained, so this never spuriously rejects an older saved model.
+    {
+        let mut seen_family: Option<&str> = None;
+        for cand in &candidates {
+            if let Some(fam) = cand.family.as_deref() {
+                match seen_family {
+                    None => seen_family = Some(fam),
+                    Some(prev) if prev != fam => {
+                        return Err(format!(
+                            "compare_models: cannot compare fits of different response families                              ('{prev}' vs '{fam}'); their REML/LAML evidence scores are on                              incomparable base measures. Compare models fit to the same response                              under the same family."
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
     }
     candidates = rank_priority_candidates(
         candidates
@@ -3844,6 +3873,7 @@ mod tests {
             score,
             edf: Some(edf),
             log_lik: Some(log_lik),
+            family: None,
         }
     }
 
@@ -3863,6 +3893,7 @@ mod tests {
             score: 151.28,
             edf: Some(6.0),
             log_lik: None,
+            family: None,
         };
         assert_eq!(c.ranking_score(), 151.28);
     }
