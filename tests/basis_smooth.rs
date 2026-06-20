@@ -72,6 +72,8 @@ mod cyclic_duchon_torus_containment;
 mod difference_smooth_formula;
 #[path = "basis_smooth/double_penalty_edf_inflation_repro_1266.rs"]
 mod double_penalty_edf_inflation_repro_1266;
+#[path = "basis_smooth/double_penalty_retains_linear_trend_1371.rs"]
+mod double_penalty_retains_linear_trend_1371;
 #[path = "basis_smooth/duchon_ard_quality.rs"]
 mod duchon_ard_quality;
 #[path = "basis_smooth/duchon_basis_build_d_scaling.rs"]

@@ -622,6 +622,11 @@ where
         // `with_initial_rho` above and must NOT be overridden by the
         // objective-grid prepass, so short-circuit the prepass in that case.
         let caller_seeded_rho = heuristic_lambdas.is_some_and(|h| h.len() == k);
+        // The grid prepass's lowest-cost sample, kept for the #1371
+        // release-and-rerank guard even when it is not adopted as the initial
+        // seed (i.e. the grid did not strictly move). It is a known-good lower
+        // bound on the achievable REML cost, scored with the SAME functional.
+        let mut release_rerank_seed: Option<Array1<f64>> = None;
         let prepass_seed: Option<Array1<f64>> = if caller_seeded_rho {
             None
         } else {
@@ -676,6 +681,11 @@ where
             // weight-anchored path — whenever the anchored `base` is itself
             // offset from the unanchored origin (so the shifted optimum is
             // actually seeded even if the coarse grid leaves `base` unchanged).
+            // Record the grid's best sample for the release-and-rerank guard
+            // unconditionally — whether or not it is strong enough to override
+            // the optimizer's own cold start, it is still a scored lower bound
+            // the certified optimum must not be worse than (#1371).
+            release_rerank_seed = Some(refined.clone());
             let grid_moved = refined
                 .iter()
                 .zip(base.iter())
@@ -754,8 +764,58 @@ where
         // same `warm_start_beta` slot the publisher reads from.
         let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
 
-        let strategy_result = problem.run(&mut obj, "standard REML")?;
+        let mut strategy_result = problem.run(&mut obj, "standard REML")?;
         drop(obj);
+        // #1371 release-and-rerank guard. The continuation oversmoothing
+        // warm-start can deliver the inner β on the high-λ null-space
+        // "annihilation" shelf of a double-penalty smooth: there the
+        // null-space coefficients are already shrunk to ~0, so the deviance
+        // ρ-gradient vanishes (∂dev/∂ρ_null → 0) AND the Occam terms
+        // (½ tr(H⁻¹ ∂H/∂ρ) − ½ λ tr(S⁺ S_k)) cancel, leaving the analytic
+        // outer gradient ≈ 0. ARC then certifies that point as a stationary
+        // optimum even though its REML cost is FAR ABOVE a point the seed
+        // prepass already evaluated — driving a genuinely-supported null-space
+        // direction (a real linear trend, gam#1371) to EDF → 0. The seed
+        // prepass's grid-refined seed is a known-good lower bound on the cost
+        // (it was scored with the SAME `compute_cost`), so if the certified
+        // optimum is strictly worse than it, re-rank to the seed: re-running
+        // the inner solve there installs the correct β̂. This cannot regress a
+        // fit whose optimum genuinely IS the high-λ corner (gam#1266: an
+        // unsupported term shrinking out) — there the corner is the
+        // lowest-cost point, no cheaper seed exists, and the guard is a no-op.
+        if let Some(seed) = release_rerank_seed.as_ref() {
+            // Order matters: evaluate the SEED first, then the converged ρ, so
+            // that the no-op path leaves `reml_state`'s cached β̂ at
+            // `strategy_result.rho` (the value the downstream cap-guard / final
+            // assembly expect). The seed eval is a non-fatal probe — a guard
+            // must never break an otherwise-successful fit, so a seed that fails
+            // to evaluate simply skips the comparison. The converged-ρ eval uses
+            // `?` because that IS the fit's operating point; if it cannot be
+            // evaluated the fit is genuinely broken. It also restores β̂ to
+            // `strategy_result.rho` after the seed probe.
+            let cost_seed = reml_state.compute_cost(seed).ok();
+            let cost_converged = reml_state.compute_cost(&strategy_result.rho)?;
+            // Strict relative improvement so a numerically-equal seed (the
+            // common case where the optimizer reached the seed's basin) is left
+            // untouched and the fit stays byte-identical.
+            let floor = 1e-6 * (1.0 + cost_converged.abs());
+            if let Some(cost_seed) = cost_seed.filter(|c| c.is_finite())
+                && cost_converged.is_finite()
+                && cost_seed < cost_converged - floor
+            {
+                log::info!(
+                    "[OUTER] #1371 release-and-rerank: certified ρ cost {cost_converged:.6e} \
+                     exceeds the prepass seed cost {cost_seed:.6e}; adopting the seed \
+                     (false high-λ stationary shelf escaped)"
+                );
+                strategy_result.rho = seed.clone();
+                strategy_result.converged = true;
+                // Re-run the inner solve at the adopted seed so the cached β̂
+                // matches the reported ρ (the no-op path already leaves β̂ at
+                // `strategy_result.rho`).
+                reml_state.compute_cost(&strategy_result.rho)?;
+            }
+        }
         // Convergence guard for the outer-aware inner-PIRLS schedule
         // (path #3): the BFGS bridge stores a coarsen-then-tighten cap
         // into `reml_state.outer_inner_cap` on every accepted gradient
