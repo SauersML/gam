@@ -3702,16 +3702,8 @@ mod empirical_flex_jet_oracle_tests {
         let b_t = Tower4::<3>::variable(b0, 1);
         let beta0_t = Tower4::<3>::variable(beta0_0, 2);
         let z = fx.family.z[0];
-        let eta = witness_eta_tower::<3>(
-            fx,
-            &a_tower,
-            &b_t,
-            &beta0_t,
-            &beta,
-            z,
-            basis_arg(z),
-            scale,
-        );
+        let eta =
+            witness_eta_tower::<3>(fx, &a_tower, &b_t, &beta0_t, &beta, z, basis_arg(z), scale);
         let signed = eta.scale(2.0 * fx.family.y[0] - 1.0);
         signed.compose_unary(unary_derivatives_neglog_phi(signed.v, fx.family.weights[0]))
     }

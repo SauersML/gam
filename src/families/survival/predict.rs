@@ -12,9 +12,6 @@ use std::collections::HashMap;
 use ndarray::{Array1, Array2, ArrayView2, s};
 
 use crate::families::scale_design::scale_transform_from_payload;
-use crate::families::survival::{
-    CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints,
-};
 use crate::families::survival::construction::{
     SurvivalBaselineConfig, SurvivalBaselineTarget, SurvivalLikelihoodMode,
     SurvivalTimeBuildOutput, add_survival_time_derivative_guard_offset, build_survival_time_basis,
@@ -25,6 +22,9 @@ use crate::families::survival::construction::{
     survival_derivative_guard_for_likelihood, survival_likelihood_modename,
 };
 use crate::families::survival::lognormal_kernel::FrailtySpec;
+use crate::families::survival::{
+    CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints,
+};
 use crate::families::wiggle::buildwiggle_block_input_from_knots;
 use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, SavedBaselineTimeWiggleRuntime,

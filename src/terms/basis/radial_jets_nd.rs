@@ -1314,8 +1314,7 @@ fn mixed_periodicity_additive_design_and_jets(
     let n_rows = t.nrows();
     let n_centers = centers.nrows();
     let m = duchon_p_from_nullspace_order(nullspace_order);
-    let axis_bounds =
-        crate::basis::mixed_periodicity_axis_bounds(centers, periodic_per_axis);
+    let axis_bounds = crate::basis::mixed_periodicity_axis_bounds(centers, periodic_per_axis);
 
     // Non-periodic-only polynomial null space `Z = null(Pᵀ)`.
     let poly_block_centers =
@@ -1325,8 +1324,7 @@ fn mixed_periodicity_additive_design_and_jets(
 
     // Non-periodic axis order + monomial exponents over the non-periodic axes
     // (used for the explicit polynomial columns + their jet/Hessian).
-    let nonperiodic_axes: Vec<usize> =
-        (0..dim).filter(|&j| !periodic_per_axis[j]).collect();
+    let nonperiodic_axes: Vec<usize> = (0..dim).filter(|&j| !periodic_per_axis[j]).collect();
     let max_degree = m.saturating_sub(1);
     let exps = monomial_exponents(nonperiodic_axes.len(), max_degree);
     let n_poly = exps.len();
@@ -1355,8 +1353,7 @@ fn mixed_periodicity_additive_design_and_jets(
 
     // --- design = [value·Z, P(t)] ---
     let kernel_design = fast_ab(&value, &z);
-    let poly_design =
-        crate::basis::mixed_periodicity_nullspace_poly_block(t, m, periodic_per_axis);
+    let poly_design = crate::basis::mixed_periodicity_nullspace_poly_block(t, m, periodic_per_axis);
     if poly_design.ncols() != n_poly {
         crate::bail_dim_basis!(
             "mixed-periodicity additive jets: polynomial block has {} columns but expected {n_poly}",

@@ -76,7 +76,10 @@ fn psd_penalty_has_empty_negative_class() {
     let penalty = diag_penalty(&[4.0, 2.0, 1.0, 0.0]);
     let block = analyze_penalty_block(&penalty).expect("analyze");
 
-    assert_eq!(block.negative_dim, 0, "a PSD penalty has no negative curvature");
+    assert_eq!(
+        block.negative_dim, 0,
+        "a PSD penalty has no negative curvature"
+    );
     assert_eq!(block.rank, 3, "three positive eigenvalues");
     assert_eq!(block.nullity, 1, "one null direction");
     assert_eq!(

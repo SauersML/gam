@@ -1067,8 +1067,7 @@ pub(crate) fn build_duchon_basis_mixed_periodicity(
     // Design = [K @ Z, P(data)] — the kernel columns plus the explicit
     // unpenalised polynomial columns (in the non-periodic coordinates only).
     let design_kernel = fast_ab(&raw_kernel, &z);
-    let poly_block_data =
-        mixed_periodicity_nullspace_poly_block(data, user_m, periodic_per_axis);
+    let poly_block_data = mixed_periodicity_nullspace_poly_block(data, user_m, periodic_per_axis);
     let mut basis = Array2::<f64>::zeros((n_data, kernel_cols + n_poly));
     basis
         .slice_mut(s![.., 0..kernel_cols])

@@ -3499,8 +3499,7 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         if !result.penalties_first.is_empty() {
             let num_blocks = result.penalties_first[0].len();
             for block in 0..num_blocks {
-                let mut eta_mean =
-                    Array2::<f64>::zeros(result.penalties_first[0][block].raw_dim());
+                let mut eta_mean = Array2::<f64>::zeros(result.penalties_first[0][block].raw_dim());
                 for axis in 0..dim {
                     if result.penalties_first[axis][block].raw_dim()
                         != result.penalties_first[0][block].raw_dim()
