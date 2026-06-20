@@ -170,10 +170,45 @@ pub(crate) fn build_model_summary(
     }
 
     let mut smooth_terms = Vec::<SmoothTermSummary>::new();
-    let mut penalty_cursor = 0usize;
-    for (name, range) in &design.random_effect_ranges {
-        let edf = fit.per_term_edf(range.clone(), penalty_cursor, 1);
-        penalty_cursor += 1;
+    // The fit's GLOBAL penalty layout (and thus `penalty_block_trace`) opens with a
+    // single shared `LinearTermRidge` block IFF any linear term has
+    // `double_penalty=true` (`design_construction.rs`). Random-effect and smooth
+    // penalty blocks follow it. Seeding `penalty_cursor` at 0 ignored that leading
+    // block, sliding every per-term trace window off by one whenever a penalized
+    // linear term was present and masking the bug only on small dense fits (where
+    // `per_term_edf` reads the influence matrix instead, #1372). Start the cursor
+    // PAST any leading `LinearTermRidge` block by counting it in the recorded
+    // global ordering rather than re-deriving it.
+    let mut penalty_cursor = design
+        .penaltyinfo
+        .iter()
+        .filter(|info| {
+            matches!(
+                &info.penalty.source,
+                gam::basis::PenaltySource::Other(s) if s == "LinearTermRidge"
+            )
+        })
+        .count();
+    for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
+        // Only PENALIZED random-effect blocks contribute a penalty block to the
+        // flat `lambdas`/`penalty_block_trace`/`edf_by_block` layout: design
+        // assembly skips the unpenalised ones (`design_construction.rs` RE-penalty
+        // loop `continue`s on `!penalized`). A factor `by=` smooth injects exactly
+        // such an UNPENALISED treatment-coded factor main-effect block; walking
+        // `penalty_cursor` by one for it (the #1368 defect) slid the cursor one
+        // block past every smooth term that followed, so the LAST by-level smooth's
+        // `penalty_cursor..+k` window ran off the end of the per-block traces and
+        // `per_term_edf` returned 0 (and, with EDF 0, the Wood test was skipped,
+        // leaving ref_df/chi_sq/p_value at 0/NaN). Advance the cursor by the number
+        // of penalty blocks the term actually owns: 1 if penalized, 0 if not.
+        let penalized = spec
+            .random_effect_terms
+            .get(re_idx)
+            .map(|t| t.penalized)
+            .unwrap_or(true);
+        let k_pen = usize::from(penalized);
+        let edf = fit.per_term_edf(range.clone(), penalty_cursor, k_pen);
+        penalty_cursor += k_pen;
         // Random-effect smooths are variance-component tests on the boundary;
         // a naive coefficient Wald χ² p-value is anti-conservative, so only EDF is reported.
         let chi_sq_opt: Option<f64> = None;

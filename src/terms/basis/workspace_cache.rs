@@ -178,6 +178,29 @@ pub(crate) fn kernel_constraint_nullspace(
 ) -> Result<Array2<f64>, BasisError> {
     let effective_order = duchon_effective_nullspace_order(centers, order);
     let degraded = effective_order != order;
+    // Translation-invariant side-condition frame (#1375, mirroring the #1269 tp
+    // fix). `Z = null(P(centers)ᵀ)` is mathematically invariant to subtracting a
+    // per-axis constant from `centers` (the polynomial columns `{1, x, …}` and
+    // `{1, x − x̄, …}` span the same space, so `P` has the same column space and
+    // `P^T` the same null space), but the RRQR pivoting that materialises `Z`
+    // drifts under a large coordinate mean — landing on a different orthonormal
+    // basis of the SAME null space, which would desync the design `K·Z` from the
+    // penalty `ZᵀK_CC Z` across a covariate translation. Subtract the center-cloud
+    // per-axis mean so the factorisation is location-standardized; both a raw and
+    // an already-centered caller then produce bit-identical `Z`. The mean is a
+    // fixed property of the (frozen `UserProvided`) centers, replayed identically
+    // at predict.
+    let k = centers.nrows();
+    let d = centers.ncols();
+    let center_mean: Vec<f64> = (0..d)
+        .map(|c| centers.column(c).sum() / (k.max(1) as f64))
+        .collect();
+    let mut centers_centered = centers.to_owned();
+    for c in 0..d {
+        let mu = center_mean[c];
+        centers_centered.column_mut(c).mapv_inplace(|v| v - mu);
+    }
+    let centers = centers_centered.view();
     let key = ConstraintNullspaceCacheKey {
         centersrows: centers.nrows(),
         centers_cols: centers.ncols(),

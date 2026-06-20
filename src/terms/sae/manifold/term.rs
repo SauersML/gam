@@ -179,6 +179,30 @@ pub(crate) const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
 pub(crate) const SAE_FINAL_EV_DEGRADATION_TOL: f64 = 1.0e-3;
 
 pub(crate) const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
+
+/// #1026 decoder-repulsion conditioner strength. Small fixed weight on the
+/// collinearity-gated cross-decoder repulsion that injects POSITIVE curvature in
+/// the inter-atom co-collapse direction. It is a conditioner/separator, not a
+/// primary objective term: it is identically zero (value, gradient, curvature)
+/// unless two atom decoders exceed
+/// [`SAE_DECODER_REPULSION_COLLINEARITY_GATE`], so it is a strict no-op for
+/// well-separated atoms and for `K = 1`. Without it the SAE joint inner Newton
+/// solve has NO inter-atom repulsion (data-fit is independent per atom given the
+/// soft assignment), so at `K >= 4` on real residual geometry two atoms drift
+/// onto the same decoder direction, the per-row `H_tt` block goes near-singular,
+/// the reduced β-Schur over-subtracts and goes indefinite, and the inner solve
+/// never converges (#1026).
+pub(crate) const SAE_DECODER_REPULSION_STRENGTH: f64 = 1.0e-3;
+
+/// #1026 normalized collinearity score
+/// `s_jk = ‖B_jB_kᵀ‖²_F / (‖B_j‖²_F·‖B_k‖²_F)` at/above which the decoder
+/// repulsion engages. Below this the smoothstep gate is exactly 0 (zero penalty
+/// / gradient / curvature), so healthy fits whose atoms point in distinct
+/// directions never activate the term. `s_jk` is scale-free in each decoder's
+/// magnitude (it measures ANGLE, not norm) so it cannot fight the data-fit's
+/// choice of decoder scale.
+pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
+
 /// Full SAE-manifold term.
 #[derive(Debug)]
 pub struct SaeManifoldTerm {
@@ -290,7 +314,21 @@ pub struct SaeManifoldTerm {
     /// reset to `None` alongside [`Self::dictionary_cocollapse_reseeds`] at the
     /// start of each outer optimization.
     pub(crate) best_cocollapse_incumbent: Option<(f64, SaeManifoldMutableState)>,
-    /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
+    /// #1026 decoder-repulsion gate, frozen per assembly (lagged-diffusivity
+    /// discipline, exactly like [`SaeManifoldAtom::smooth_penalty`]): the
+    /// symmetric `(K, K)` matrix of collinearity gate weights
+    /// `gate(s_jk)·SAE_DECODER_REPULSION_STRENGTH` computed from the decoder
+    /// state at assembly entry. Both the assembly (gradient into `gb`, PSD
+    /// curvature into `hbb`) and the line-search value path
+    /// ([`Self::penalized_objective_total`]) read THIS frozen gate, so the
+    /// repulsion's value, gradient, and curvature stay mutually consistent
+    /// across a Newton step even as the trial decoders move (the cross-Gram
+    /// quadratic moves with the trial; only the gate weight is frozen). `None`
+    /// when no repulsion is active (`K < 2`, or every pair below the gate
+    /// threshold — the strict no-op case). Refreshed at the same chokepoint as
+    /// the smoothness Gram; not part of the persisted term identity (Clone
+    /// starts `None`).
+    pub(crate) decoder_repulsion_gate: Option<Array2<f64>>,    /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
     /// converges. Each eligible `d = 1` atom's fitted curved image is adjudicated
     /// against its straight (linear special-case) sub-model on the common
@@ -345,6 +383,8 @@ impl Clone for SaeManifoldTerm {
             // term identity (like `border_hbb_workspace`); a fresh clone starts
             // with no incumbent and rebuilds it if it re-enters co-collapse.
             best_cocollapse_incumbent: None,
+            // Transient per-assembly frozen gate — rebuilt at the next assembly.
+            decoder_repulsion_gate: None,
             hybrid_split_report: self.hybrid_split_report.clone(),
             atom_inner_fits: self.atom_inner_fits.clone(),
             oos_linear_images: self.oos_linear_images.clone(),

@@ -94,6 +94,7 @@ impl SaeManifoldTerm {
             evidence_gauge_deflation_last_delta_sign: 0,
             dictionary_cocollapse_reseeds: 0,
             best_cocollapse_incumbent: None,
+            decoder_repulsion_gate: None,
             hybrid_split_report: None,
             atom_inner_fits: None,
             oos_linear_images: None,
@@ -3160,6 +3161,10 @@ impl SaeManifoldTerm {
                 .analytic_penalty_value_total(analytic_registry, penalty_scale)
                 .map_err(|err| format!("SaeManifoldTerm::penalized_objective_total: {err}"))?;
         }
+        // #1026 — decoder-repulsion value, on the SAME frozen gate the assembly
+        // used, so the line search sees the term the Newton step optimizes. 0
+        // unless two atoms are near-collinear (the no-op case).
+        total += self.decoder_repulsion_value(penalty_scale);
         Ok(total)
     }
 
@@ -3371,6 +3376,11 @@ impl SaeManifoldTerm {
         for atom in &mut self.atoms {
             atom.refresh_intrinsic_smooth_penalty();
         }
+        // #1026 — freeze the decoder-repulsion collinearity gate at the SAME
+        // assembly chokepoint as the smoothness Gram, so the repulsion's
+        // gradient/curvature (assembled below) and its value (read by the
+        // line-search `penalized_objective_total`) share one frozen gate.
+        self.refresh_decoder_repulsion_gate();
         let n = self.n_obs();
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
@@ -4526,6 +4536,13 @@ impl SaeManifoldTerm {
                     factored_row_projection,
                 )
                 .map_err(|err| format!("SaeManifoldTerm::assemble_arrow_schur: {err}"))?;
+        }
+        // #1026 — decoder repulsion (collinearity-gated, registry-independent):
+        // accumulate into the full-`B` β-tier here, BEFORE the frame transform,
+        // so a framed system carries it identically to the analytic β penalties.
+        // No-op unless two atoms are near-collinear (the frozen gate is `None`).
+        if self.add_sae_decoder_repulsion(&mut sys, penalty_scale, dense_beta_curvature) {
+            beta_penalty_assembly.record_curvature(dense_beta_curvature);
         }
         if frames_engaged {
             // ── #972 / #977 T1 — FACTORED β-tier transform ──────────────────

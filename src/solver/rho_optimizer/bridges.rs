@@ -277,6 +277,9 @@ impl CostStallGuard {
         self.no_improve_streak = 0;
         self.infeasible_streak = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
+        // Seed the shared exit cell so the budget-exhaustion path always has a
+        // feasible best to fall back to, even if no later step improves (#1371).
+        self.publish_best_so_far();
     }
 
     /// Fold one accepted-iterate `(ρ, cost, ‖g‖)` into the guard. Returns a
@@ -308,6 +311,10 @@ impl CostStallGuard {
             self.best_value = value;
             self.best_rho = Some(rho.clone());
             self.best_grad_norm = grad_norm;
+            // Keep the shared exit cell tracking the best feasible iterate so the
+            // ARC budget-exhaustion path can recover it instead of the optimizer's
+            // last (possibly degenerate-corner) iterate (#1371).
+            self.publish_best_so_far();
         }
         // KKT-stationary-at-bound (#1082/#1237). On a near-separable multinomial
         // the outer REML criterion keeps decreasing as λ→0, so several log-λ
@@ -450,6 +457,42 @@ impl CostStallGuard {
             CostStallVerdict::FlatValleyStall {
                 residual_grad_norm: best_grad_norm,
             }
+        }
+    }
+
+    /// Publish the running best feasible iterate to the shared exit cell WITHOUT
+    /// halting the optimizer (the verdict is discarded). Called on every accepted
+    /// step that improves the best so the cell continuously tracks "best feasible
+    /// iterate seen so far".
+    ///
+    /// This is the load-bearing hook for the ARC budget-exhaustion path
+    /// (#1371). When ARC hits `max_iter` the seed-loop runner gets back only the
+    /// optimizer's LAST iterate, which on a flat REML valley can be a degenerate
+    /// box corner the trajectory wandered to (e.g. `ρ_nullspace → +∞` on a
+    /// double-penalty smooth, which annihilates a genuine null-space linear
+    /// trend and collapses the fit to a flat constant). Whenever this cell is
+    /// populated, the runner returns the better of {last iterate, published best}
+    /// — never returning an iterate whose REML objective is worse than one the
+    /// optimizer already evaluated. Same spirit as the `observe_constrained_
+    /// stationary` "do not adopt a corner that regresses the incumbent best"
+    /// guard (#1355); here it covers the budget-exhaustion exit rather than the
+    /// separation-probe exit.
+    fn publish_best_so_far(&mut self) {
+        let Some(best_rho) = self.best_rho.clone() else {
+            return;
+        };
+        if !self.best_value.is_finite() {
+            return;
+        }
+        let converged = self.best_grad_norm.is_finite() && self.best_grad_norm <= self.grad_threshold;
+        if let Ok(mut slot) = self.exit.lock() {
+            *slot = Some(CostStallExit {
+                rho: best_rho,
+                value: self.best_value,
+                grad_norm: self.best_grad_norm,
+                iterations: self.accepted_iters,
+                converged,
+            });
         }
     }
 }
