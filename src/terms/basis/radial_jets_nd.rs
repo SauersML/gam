@@ -2111,25 +2111,51 @@ pub fn spherical_spline_design_jet(
             found: centers.nrows(),
         });
     }
-    let z = match &spec.identifiability {
-        SphericalSplineIdentifiability::FrozenTransform { transform } => {
-            if transform.nrows() != centers.nrows() {
-                crate::bail_dim_basis!(
-                    "frozen spherical identifiability transform mismatch: {} centers but transform has {} rows",
-                    centers.nrows(),
-                    transform.nrows()
-                );
-            }
-            transform.clone()
-        }
-        SphericalSplineIdentifiability::CenterSumToZero => Array2::<f64>::eye(centers.nrows()),
-    };
-    let raw_jet = spherical_wahba_kernel_jet_with_kind(
+    // The Wahba (Sobolev) forward design is the low-degree *decomposed* design,
+    // not the raw kernel design: `[ raw_kernel·kernel_basis −
+    // low·kernel_low_projection | low ]` (see `build_wahba_decomposed_design`).
+    // Build the matching decomposed jet so it aligns column-for-column with the
+    // forward design (width = decomposed width, not centers.nrows()).
+    let center_kernel = spherical_wahba_kernel_matrix_with_kind(
+        centers.view(),
+        centers.view(),
+        spec.penalty_order,
+        spec.radians,
+        spec.wahba_kernel,
+    )?;
+    let decomposition =
+        wahba_low_degree_decomposition(centers.view(), spec.radians, center_kernel.view())?;
+    let raw_kernel_jet = spherical_wahba_kernel_jet_with_kind(
         data,
         centers.view(),
         spec.penalty_order,
         spec.radians,
         spec.wahba_kernel,
     )?;
-    Ok(apply_identifiability_to_jet(&raw_jet, &z))
+    let low_jet = if decomposition.low_degree_centers.is_some() {
+        Some(spherical_harmonic_jet(
+            data,
+            SPHERE_UNPENALIZED_LOW_DEGREE,
+            spec.radians,
+        )?)
+    } else {
+        None
+    };
+    let decomposed_jet =
+        build_wahba_decomposed_jet(&raw_kernel_jet, low_jet.as_ref(), &decomposition);
+    let raw_width = decomposed_jet.shape()[1];
+    let z = match &spec.identifiability {
+        SphericalSplineIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != raw_width {
+                crate::bail_dim_basis!(
+                    "frozen spherical identifiability transform mismatch: {} raw basis columns but transform has {} rows",
+                    raw_width,
+                    transform.nrows()
+                );
+            }
+            transform.clone()
+        }
+        SphericalSplineIdentifiability::CenterSumToZero => Array2::<f64>::eye(raw_width),
+    };
+    Ok(apply_identifiability_to_jet(&decomposed_jet, &z))
 }
