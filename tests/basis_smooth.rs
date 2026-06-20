@@ -64,10 +64,6 @@ mod bspline_partition_unity_degree_4;
 mod bspline_partition_unity_degree_5;
 #[path = "basis_smooth/cyclic_bspline_first_derivative_periodicity_breaks.rs"]
 mod cyclic_bspline_first_derivative_periodicity_breaks;
-#[path = "basis_smooth/nonperiodic_bspline_derivative_no_wrap.rs"]
-mod nonperiodic_bspline_derivative_no_wrap;
-#[path = "basis_smooth/open_knot_derivative_sparse_scalar_consistency.rs"]
-mod open_knot_derivative_sparse_scalar_consistency;
 #[path = "basis_smooth/cyclic_bspline_second_derivative_periodicity_breaks.rs"]
 mod cyclic_bspline_second_derivative_periodicity_breaks;
 #[path = "basis_smooth/cyclic_duchon_torus_containment.rs"]
@@ -138,6 +134,10 @@ mod matern_nu_sweep_easy_truth;
 mod matern_quality_batch_e;
 #[path = "basis_smooth/mspline_ispline_scalar_identity_bug.rs"]
 mod mspline_ispline_scalar_identity_bug;
+#[path = "basis_smooth/nonperiodic_bspline_derivative_no_wrap.rs"]
+mod nonperiodic_bspline_derivative_no_wrap;
+#[path = "basis_smooth/open_knot_derivative_sparse_scalar_consistency.rs"]
+mod open_knot_derivative_sparse_scalar_consistency;
 #[path = "basis_smooth/penalized_complexity_prior.rs"]
 mod penalized_complexity_prior;
 #[path = "basis_smooth/penalty_joint_nullspace_check.rs"]
@@ -208,10 +208,10 @@ mod tensor_3d_smooth_robust;
 mod tensor_clamped_margin;
 #[path = "basis_smooth/thin_plate_integration.rs"]
 mod thin_plate_integration;
-#[path = "basis_smooth/tp_single_penalty_edf_repro_1271.rs"]
-mod tp_single_penalty_edf_repro_1271;
 #[path = "basis_smooth/ti_tensor_interaction_smooth.rs"]
 mod ti_tensor_interaction_smooth;
+#[path = "basis_smooth/tp_single_penalty_edf_repro_1271.rs"]
+mod tp_single_penalty_edf_repro_1271;
 #[path = "basis_smooth/weighted_blockwise_penalty_sum_rejects_negative_weights.rs"]
 mod weighted_blockwise_penalty_sum_rejects_negative_weights;
 #[path = "basis_smooth/wiggle_penalty_orders_do_not_drop_requested_orders.rs"]

@@ -3199,11 +3199,8 @@ impl TransformationNormalFamily {
 
     pub(crate) fn scop_psi_pair_rows_per_chunk(&self, p_cov: usize) -> usize {
         let policy = ResourcePolicy::default_library();
-        crate::resource::rows_for_target_bytes(
-            policy.row_chunk_target_bytes,
-            4 * p_cov.max(1),
-        )
-        .max(1)
+        crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, 4 * p_cov.max(1))
+            .max(1)
     }
 
     pub(crate) fn scop_psi_pair_cov_chunks(

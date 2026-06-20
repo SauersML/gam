@@ -1035,9 +1035,16 @@ pub(crate) fn evidence_row_spectral_deflates_indefinite_non_gauge_block_at_unit_
     // gauge passed in) now SUCCEEDS on this block via spectral deflation
     // rather than refusing — so the SAE driver gets a finite, BIAS-FREE
     // evidence cache and never falls back to a ρ-dependent ridge.
-    let factored =
-        factor_one_row_result(&indef, 0.0, d, 0, true, std::slice::from_ref(&gauge_e1), true)
-            .expect("undamped evidence factor must condition the indefinite block by deflation");
+    let factored = factor_one_row_result(
+        &indef,
+        0.0,
+        d,
+        0,
+        true,
+        std::slice::from_ref(&gauge_e1),
+        true,
+    )
+    .expect("undamped evidence factor must condition the indefinite block by deflation");
     for a in 0..d {
         assert!(
             factored.factor[[a, a]].is_finite() && factored.factor[[a, a]] > 0.0,

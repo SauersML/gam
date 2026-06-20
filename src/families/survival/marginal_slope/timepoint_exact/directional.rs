@@ -619,16 +619,16 @@ impl SurvivalMarginalSlopeFamily {
                 // `edge_axis`. Symmetric in u,v → added once (like base self_flux),
                 // summed right−left over the crossing edges.
                 let self_flux_dir = |u: usize, v: usize| -> f64 {
-                    let eval_edge =
-                        |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
-                            let (zu, zu_dir, _) = edge_axis(u, edge, z);
-                            let (zv, zv_dir, _) = edge_axis(v, edge, z);
-                            if zu == 0.0 && zu_dir == 0.0 && zv == 0.0 && zv_dir == 0.0 {
-                                return 0.0;
-                            }
-                            density_w_z_dir(z) * zu * zv
-                                + density_w_z(z) * (zu_dir * zv + zu * zv_dir)
-                        };
+                    let eval_edge = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                     z: f64|
+                     -> f64 {
+                        let (zu, zu_dir, _) = edge_axis(u, edge, z);
+                        let (zv, zv_dir, _) = edge_axis(v, edge, z);
+                        if zu == 0.0 && zu_dir == 0.0 && zv == 0.0 && zv_dir == 0.0 {
+                            return 0.0;
+                        }
+                        density_w_z_dir(z) * zu * zv + density_w_z(z) * (zu_dir * zv + zu * zv_dir)
+                    };
                     eval_edge(part.right_edge, neg_cell.right)
                         - eval_edge(part.left_edge, neg_cell.left)
                 };

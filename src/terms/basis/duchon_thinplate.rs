@@ -823,7 +823,8 @@ pub(crate) fn thin_plate_radial_reparam_data_metric(
     // Whiten by G_c: G_c = U_g D_g U_gᵀ ; W = U_g D_g^{-1/2} (drop near-null G_c
     // directions, which are design columns with no realized data support).
     let g_sym = symmetrize_penalty(design_gram);
-    let (g_evals, g_evecs) = FaerEigh::eigh(&g_sym, Side::Lower).map_err(BasisError::LinalgError)?;
+    let (g_evals, g_evecs) =
+        FaerEigh::eigh(&g_sym, Side::Lower).map_err(BasisError::LinalgError)?;
     let gmax = g_evals.iter().copied().fold(0.0_f64, |a, b| a.max(b.abs()));
     if !gmax.is_finite() || gmax <= 0.0 {
         // Degenerate design Gram: fall back to the plain bending eigenbasis.

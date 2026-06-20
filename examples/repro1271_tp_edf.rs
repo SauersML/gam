@@ -67,8 +67,11 @@ fn main() {
                 if rows == cols && rows > 1 {
                     let mut diag: Vec<f64> = (0..rows).map(|i| s[[i, i]]).collect();
                     diag.sort_by(|a, b| b.partial_cmp(a).unwrap());
-                    println!("  [spectrum] block {:?} dim={rows} diag(desc)={:?}", bp.col_range,
-                        diag.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>());
+                    println!(
+                        "  [spectrum] block {:?} dim={rows} diag(desc)={:?}",
+                        bp.col_range,
+                        diag.iter().map(|v| format!("{v:.4e}")).collect::<Vec<_>>()
+                    );
                 }
             }
             // Per-coefficient EDF = diag of the influence (hat) matrix in coef space.
@@ -76,8 +79,10 @@ fn main() {
                 let p = infl.nrows().min(infl.ncols());
                 let per: Vec<f64> = (0..p).map(|i| infl[[i, i]]).collect();
                 let total: f64 = per.iter().sum();
-                println!("  [per-coef-edf] sum={total:.4} diag={:?}",
-                    per.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>());
+                println!(
+                    "  [per-coef-edf] sum={total:.4} diag={:?}",
+                    per.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>()
+                );
             }
         }
     }

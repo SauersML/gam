@@ -723,7 +723,10 @@ fn resolve_external_family_accepts_constant_precision_beta_regression() {
         None,
     )
     .expect("external-design policy must accept constant-precision beta regression");
-    assert!(!firth, "beta regression does not request Firth bias reduction");
+    assert!(
+        !firth,
+        "beta regression does not request Firth bias reduction"
+    );
     assert!(
         spec.scale.beta_phi_is_estimated(),
         "beta φ must be flagged for joint estimation, got {:?}",

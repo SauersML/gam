@@ -26,13 +26,13 @@ use crate::inference::formula_dsl::{
     option_usize_any, option_usize_any_strict, option_usize_strict, strip_quotes,
 };
 use crate::inference::model::ColumnKindTag;
+use crate::resource::ResourcePolicy;
 use crate::smooth::{
     BySmoothKind, ByVarKind, ByVariableSpec, FactorSmoothFlavour, FactorSmoothSpec,
     LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
     SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
     TensorBSplinePenaltyDecomposition, TensorBSplineSpec, TermCollectionSpec,
 };
-use crate::resource::ResourcePolicy;
 use crate::types::ColIdx;
 
 /// Fraction of the data bounding-box diameter used as the default Matérn

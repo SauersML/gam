@@ -10,6 +10,8 @@ mod bc_quality_batch_b;
 mod broad_sweep_batch_h;
 #[path = "quality/broad_sweep_batch_i.rs"]
 mod broad_sweep_batch_i;
+#[path = "quality/diag_1271_logdet_probe.rs"]
+mod diag_1271_logdet_probe;
 #[path = "quality/feature_correctness_sweep.rs"]
 mod feature_correctness_sweep;
 #[path = "quality/fit_quality_stress.rs"]
@@ -228,8 +230,6 @@ mod quality_vs_mgcv_tensor_te_3d_gaussian;
 mod quality_vs_mgcv_tensor_ti_2d_gaussian;
 #[path = "quality/quality_vs_mgcv_tensor_tp_2d_gaussian.rs"]
 mod quality_vs_mgcv_tensor_tp_2d_gaussian;
-#[path = "quality/diag_1271_logdet_probe.rs"]
-mod diag_1271_logdet_probe;
 #[path = "quality/quality_vs_mgcv_thin_plate_1d.rs"]
 mod quality_vs_mgcv_thin_plate_1d;
 #[path = "quality/quality_vs_mgcv_thin_plate_by_factor.rs"]
