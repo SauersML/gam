@@ -1247,6 +1247,7 @@ pub fn canonicalize_penalty_spec(
     let mut root = Array2::zeros((rank_k, block_dim));
     let mut positive_eigenvalues = Vec::with_capacity(rank_k);
     let mut row_idx = 0;
+    let mut negative_dim = 0usize;
     for (i, &eigenval) in analysis.eigenvalues.iter().enumerate() {
         if eigenval > tolerance {
             let sqrt_eigenval = eigenval.sqrt();
@@ -1254,6 +1255,14 @@ pub fn canonicalize_penalty_spec(
             root.row_mut(row_idx).assign(&(&eigenvec * sqrt_eigenval));
             positive_eigenvalues.push(eigenval);
             row_idx += 1;
+        } else if eigenval < -tolerance {
+            // Genuinely negative O(1) curvature (a non-PSD penalty). This is
+            // dropped from the canonical root (its sqrt is undefined) but it is
+            // emphatically NOT a null direction: do not let it be counted toward
+            // `nullity`, or the absorption stage would treat the negative-
+            // curvature direction as unpenalized (#1425). Only |ev| <= tol are
+            // genuine null directions; `analysis.nullity` already keys on that.
+            negative_dim += 1;
         }
     }
 
@@ -1262,7 +1271,17 @@ pub fn canonicalize_penalty_spec(
     // form Duchon kernels at high d can leave |O(1)| negative eigenvalues in the
     // symmetrised input that the canonical root drops; keeping them in `local`
     // poisons the balanced-sum eigendecomposition and breaks the q_pen / q_null
-    // invariant that downstream stages require.
+    // invariant that downstream stages require. Those dropped negative
+    // directions are tracked in `negative_dim` (above) so they are excluded from
+    // both the range (`root`) and the null space (`nullity`); they are neither.
+    if negative_dim > 0 {
+        log::debug!(
+            "{context}: penalty block idx={idx} has {negative_dim} negative-curvature \
+             eigendirection(s) below -tol={tolerance:e}; dropped from the canonical root \
+             and NOT counted as null space (rank={rank_k}, nullity={})",
+            analysis.nullity
+        );
+    }
     let local = root.t().dot(&root);
     Ok(Some(CanonicalPenalty {
         root,

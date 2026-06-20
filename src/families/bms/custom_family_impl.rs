@@ -92,29 +92,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             .max(self.coefficient_gradient_cost(specs));
         let dense_available = self.outer_hyper_hessian_dense_available(specs);
         let hvp_available = self.outer_hyper_hessian_hvp_available(specs);
-        // FLEX (`score_warp` / `link_dev`) is the large-scale #979 wall-clock
-        // path. The generic outer-Hessian "operator" is exact, but its build
-        // still precomputes K^2 callback/cross-trace tables and the contracted
-        // ψψ matvec still streams every output ψ row. At n>=30k the exact
-        // gradient path is the bounded route: it keeps the same objective and
-        // analytic first derivative, uses the BMS row-subsampled pilot schedule,
-        // and avoids the K^2 Jeffreys/outer-Hessian setup entirely.
-        if flex_active
-            && (self.y.len() >= crate::custom_family::OuterDerivativePolicy::STAGED_KAPPA_TRIGGER_N
-                || !hvp_available)
-        {
-            if log_exact_work(self.y.len()) {
-                log::info!(
-                    "[BMS outer-derivative-policy] n={} p={} flex=true order=First reason=flex-outer-hessian-k2-cost dense_available={} outer_hvp_available={} coefficient_work={}",
-                    self.y.len(),
-                    specs.iter().map(|spec| spec.design.ncols()).sum::<usize>(),
-                    dense_available,
-                    hvp_available,
-                    coefficient_work,
-                );
-            }
-            return ExactOuterDerivativeOrder::First;
-        }
+        // FLEX (`score_warp` / `link_dev`) advertises the EXACT matrix-free
+        // profiled outer θ-HVP just like the rigid path: the operator is
+        // assembled from the family's directional-derivative kernels and
+        // reuses the flex row stream once per Hv (near-gradient cost), so the
+        // outer Newton/ARC loop converges in a couple of iterations rather
+        // than the several full-inner-resolve BFGS line searches a first-order
+        // demotion would pay. The REML/LAML optimum is unchanged; only the
+        // outer optimizer geometry improves. When the HVP operator is not
+        // available we still fall through to the gradient-only route below.
         if !dense_available && !hvp_available {
             if log_exact_work(self.y.len()) {
                 log::info!(
@@ -194,10 +180,12 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         }
         // #979: BMS startup seed screening runs real inner solves. With the
         // default multi-seed pool, large marginal-slope fits can spend minutes
-        // rejecting equivalent seeds before the first outer step. The solver
-        // already budgets one seed for this family; generate exactly one so the
-        // expensive screening cascade is skipped rather than paid and discarded.
-        config.max_seeds = 1;
+        // rejecting equivalent seeds before the first outer step. Keep the
+        // principled GLM candidate grid alive (the symmetric over-/under-smooth
+        // stability anchors at rho={2,4} that startup validation relies on),
+        // but budget exactly one screened start so only a single inner solve
+        // is paid at startup rather than the full screening cascade.
+        config.max_seeds = 6;
         config.seed_budget = 1;
         // Two cycles is below the observed KKT reachability floor for
         // marginal-slope startup seeds: it rejects every candidate, then pays

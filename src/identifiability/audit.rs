@@ -392,7 +392,25 @@ pub fn bias_shift_for_pair(z_a: Option<&[f64]>, z_b: Option<&[f64]>, s2_a: f64, 
 fn pair_null_sigma(s2_a: f64, s2_b: f64, n: usize) -> f64 {
     let inv_n = if n == 0 { 0.0 } else { 1.0 / n as f64 };
     let s2 = s2_a.max(s2_b);
-    (s2 - inv_n).max(0.0).sqrt()
+    let excess = s2 - inv_n;
+    // A perfectly uniform column has S2 = 1/n exactly, so the null cosine
+    // distribution has zero width (σ = 0). The sequential f64 accumulation of
+    // S2 = Σ φ⁴/(Σ φ²)² leaves a residual on the order of machine epsilon
+    // relative to S2 (≈1.5e-17 for n=1000), and √ of that residual is ~3.9e-9
+    // — a spurious non-zero σ that drags the report/halt thresholds off their
+    // exact-uniform values (gam#1397). Treat any excess at or below the
+    // relative-rounding scale of S2 as exactly zero before taking the root.
+    // The S2 sum runs over the n column entries, so its accumulated rounding
+    // error is bounded by ~n·EPSILON relative to S2 (the standard sequential-
+    // summation bound). Scale the floor by n accordingly, with a small safety
+    // factor, so the exact-uniform residual (~1.5e-17 at n=1000, S2=1e-3) is
+    // absorbed while a genuine excess (orders of magnitude larger) survives.
+    let n_terms = (n as f64).max(1.0);
+    let rounding_floor = 16.0 * f64::EPSILON * n_terms * s2.abs().max(inv_n);
+    if excess <= rounding_floor {
+        return 0.0;
+    }
+    excess.sqrt()
 }
 
 /// Overlap threshold above which an `AliasedPair` is reported.
@@ -1267,6 +1285,19 @@ fn audit_identifiability_impl(
     // pairwise scan is O(p²) scalar bookkeeping over the shared GEMM. The single
     // n-row stream now feeds BOTH the rank verdict and the overlap scan.
     let mut aliased_pairs: Vec<AliasedPair> = Vec::new();
+    // Halt candidates are evaluated INDEPENDENTLY of the report band. The
+    // report threshold floors at `REPORT_FLOOR_NEAR_EXACT` (0.95) so that
+    // ordinary moderate correlations between distinct, fully-identifiable
+    // basis functions are not surfaced as aliases. The HALT threshold, by
+    // contrast, is a pure leverage-scaled K·σ band that can sit BELOW that
+    // report floor for high-n_eff (tightly-concentrated null) columns: e.g.
+    // n_eff≈200 gives a halt half-width ≈0.71. A genuinely unfittable
+    // same-priority pair whose overlap lands in (halt_thr, report_floor)
+    // must still halt even though it is never reported. Gating the hard-halt
+    // scan on `aliased_pairs` (the reported set) silently dropped exactly
+    // those pairs (gam#1397). We therefore collect halt candidates here,
+    // directly from the halt band, regardless of `report_flag`.
+    let mut halt_pairs: Vec<AliasedPair> = Vec::new();
     let n_block_pairs = specs.len().saturating_mul(specs.len().saturating_sub(1)) / 2;
     for a_block_idx in 0..specs.len() {
         let a_start = col_offsets[a_block_idx];
@@ -1316,6 +1347,23 @@ fn audit_identifiability_impl(
                     let overlap = cosine.abs();
                     if report_flag {
                         aliased_pairs.push(AliasedPair {
+                            block_a: specs[a_block_idx].name.clone(),
+                            block_b: specs[b_block_idx].name.clone(),
+                            direction_a: ja - a_start,
+                            direction_b: jb - b_start,
+                            overlap,
+                            bias_shift: shift,
+                        });
+                    }
+                    // Independent halt-band evaluation (gam#1397): a pair whose
+                    // bias-corrected cosine clears the leverage-scaled HALT
+                    // half-width is a hard-halt candidate even when it falls
+                    // below the (higher) report floor. The fatal decision below
+                    // still only halts a candidate when the two blocks share a
+                    // gauge_priority (no ordering can resolve the alias).
+                    let halt_half_width = pair_halt_threshold(s2_ja, s2_jb, n);
+                    if cosine_outside_null_band(cosine, shift, halt_half_width) {
+                        halt_pairs.push(AliasedPair {
                             block_a: specs[a_block_idx].name.clone(),
                             block_b: specs[b_block_idx].name.clone(),
                             direction_a: ja - a_start,
@@ -1583,7 +1631,7 @@ fn audit_identifiability_impl(
         .enumerate()
         .map(|(i, s)| (s.name.as_str(), i))
         .collect();
-    let hard_alias_pair = aliased_pairs
+    let hard_alias_pair = halt_pairs
         .iter()
         .filter(|p| {
             let pa = block_priority
@@ -1596,33 +1644,10 @@ fn audit_identifiability_impl(
                 .unwrap_or(100);
             // Same priority → ambiguous → halt.
             // Distinct priorities → canonical-gauge resolves → do not halt.
-            if pa != pb {
-                return false;
-            }
-            // Compute per-pair halt threshold from stored S2 values.
-            let ja = block_name_to_idx
-                .get(p.block_a.as_str())
-                .map(|&bi| col_offsets[bi] + p.direction_a)
-                .unwrap_or(0);
-            let jb = block_name_to_idx
-                .get(p.block_b.as_str())
-                .map(|&bi| col_offsets[bi] + p.direction_b)
-                .unwrap_or(0);
-            let halt_half_width = pair_halt_threshold(
-                col_s2.get(ja).copied().unwrap_or(1.0),
-                col_s2.get(jb).copied().unwrap_or(1.0),
-                n,
-            );
-            // Bias-corrected halt check: we stored overlap = |cosine| and
-            // bias_shift = shift.  The exact test would be |cosine − shift| ≥
-            // halt_half_width, but we only have |cosine|.  Using a conservative
-            // lower bound |overlap − |shift|| ensures we only fire when the
-            // cosine is genuinely outside the null band regardless of sign.
-            // For exact aliases (overlap ≈ 1) this always fires; for moderate
-            // overlaps the shift must be large enough to displace the cosine
-            // inside the null band before we withhold the halt.
-            let conservative_deviation = (p.overlap - p.bias_shift.abs()).abs();
-            conservative_deviation >= halt_half_width
+            // `halt_pairs` already cleared the leverage-scaled halt band in
+            // the pairwise scan (independent of the report floor, gam#1397),
+            // so the only remaining gate here is gauge-resolvability.
+            pa == pb
         })
         .max_by(|a, b| {
             a.overlap
