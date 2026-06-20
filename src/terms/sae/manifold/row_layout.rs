@@ -103,26 +103,38 @@ impl SaeRowLayout {
         let mut per_row = Vec::with_capacity(assignments.len());
         for a in assignments {
             let k = a.len();
-            // Rank atoms by descending |a_k|; keep those above cutoff, capped.
-            let mut idx: Vec<usize> = (0..k).collect();
-            idx.sort_by(|&i, &j| {
-                a[j].abs()
-                    .partial_cmp(&a[i].abs())
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            // Row-relative absolute cutoff = relative_cutoff · this row's peak.
-            let row_peak = idx.first().map_or(0.0, |&top| a[top].abs());
+            // #1411: select the top-`cap` atoms by |a_k| in O(K) with a PARTIAL
+            // select (`select_nth_unstable_by`), not a full O(K log K) sort. Only
+            // the cap-sized active prefix matters; its internal order is
+            // irrelevant (sorted at the end). The row peak is a separate O(K) max
+            // scan. End-to-end this keeps support proposal O(K) (single pass +
+            // partial select), the contracted per-token cost the high-K plan
+            // claims, instead of sorting all K per row.
+            let row_peak = a.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
             let cutoff = relative_cutoff * row_peak;
+            let mut idx: Vec<usize> = (0..k).collect();
+            // Partition so the `cap` largest-|a| indices occupy `idx[..cap]`
+            // (unordered within); cheaper than a full sort when `cap << k`.
+            if cap < k {
+                idx.select_nth_unstable_by(cap - 1, |&i, &j| {
+                    a[j].abs()
+                        .partial_cmp(&a[i].abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                idx.truncate(cap);
+            }
             let mut active: Vec<usize> = idx
-                .iter()
-                .copied()
-                .take(cap)
+                .into_iter()
                 .filter(|&k_idx| a[k_idx].abs() > cutoff)
                 .collect();
             if active.is_empty() {
                 // Retain the single largest-magnitude atom so the row block is
                 // never empty (a degenerate empty block would zero the row).
-                if let Some(&top) = idx.first() {
+                let top = (0..k).fold(None::<usize>, |best, i| match best {
+                    Some(b) if a[b].abs() >= a[i].abs() => Some(b),
+                    _ => Some(i),
+                });
+                if let Some(top) = top {
                     active.push(top);
                 }
             }
