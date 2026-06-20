@@ -2695,7 +2695,7 @@ fn debug_flex_base_hessian_vs_gradient_fd() {
         (family, bs)
     };
 
-    let (family, bs) = make(gv, &beta_h0, &beta_w0);
+    let (family, _) = make(gv, &beta_h0, &beta_w0);
     let primary = flex_primary_slices(&family);
     let g = primary.g;
     let w0 = primary.w.clone().unwrap().start;
@@ -2820,7 +2820,10 @@ fn flex_logslope_first_sensitivity_matches_fd() {
         .map(|k| 0.035 * ((k as f64 + 0.7).cos()))
         .collect();
 
-    let make = |g: f64| {
+    // The family carries no logslope value (g is a free parameter supplied to the
+    // intercept solve / timepoint evaluation downstream), so this builder takes
+    // no g: the FD below varies g through `base_at`, which passes it directly.
+    let make = || {
         let family = SurvivalMarginalSlopeFamily {
             n: 1,
             event: Arc::new(array![event]),
@@ -2851,7 +2854,7 @@ fn flex_logslope_first_sensitivity_matches_fd() {
         };
         family
     };
-    let family = make(gv);
+    let family = make();
     let primary = flex_primary_slices(&family);
     let g = primary.g;
     let bh = Array1::from(beta_h0.clone());
@@ -2859,7 +2862,7 @@ fn flex_logslope_first_sensitivity_matches_fd() {
 
     // Exit-timepoint base struct with eta_u/chi_u/d_u and scalars eta/chi/d.
     let base_at = |gg: f64| -> SurvivalFlexTimepointExact {
-        let fam = make(gg);
+        let fam = make();
         let (a1, d1) = fam
             .solve_row_survival_intercept_with_slot(
                 q1v,
