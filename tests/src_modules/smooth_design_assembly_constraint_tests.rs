@@ -5058,6 +5058,301 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     );
 }
 
+/// #1033 FRONTIER DIAGNOSTIC (report-only): quantify the frozen-Qs re-key β̂
+/// error across a basis ROTATION at the CURRENT (513-node) ψ-Gram tensor.
+///
+/// The production κ skip is gated on `reduced_basis_equal(psi_ref, psi)` (#1264),
+/// which REFUSES across the near-singular radial Gram's basis rotation — so the
+/// skip never fires on production iso-1D Duchon geometry and the κ loop stays
+/// O(n) (MSI job 11336439: per-callback cost 45× across 256× n). Whether that
+/// gate is FUNDAMENTAL or merely OVER-CONSERVATIVE depends on a quantity the
+/// existing tests never measure directly: with the deep 513-node tensor, how big
+/// is the frozen-Qs re-key β̂ error when the skip is FORCED across the rotation?
+///
+/// This test FORCES the skip (realize=false) at a ladder of ψ moves off an
+/// interior pin — exactly the path `covers_skip` refuses — and prints β̂rel vs a
+/// fresh streamed exact solve at each. It asserts only that the harness ran
+/// (non-degenerate β̂); the printed `β̂rel` ladder is the deliverable. Reading:
+///   • β̂rel ≤ 1e-6 everywhere ⇒ the 513-node interpolant made the rotation
+///     SOUND; the `reduced_basis_equal` gate is now over-conservative and can be
+///     replaced by a direct n-free residual self-check → the skip would fire and
+///     #1033 closes on this geometry.
+///   • β̂rel grows with the move size, plateauing ~1e-5 ⇒ the wall is the
+///     interpolation-residual × Gram-conditioning product (κ(G)≈9.5e14), not the
+///     basis frame; the fix is deeper tensor precision / a re-projected re-key,
+///     not a gate tweak. Either way the number pins the frontier.
+#[test]
+fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
+    use crate::solver::rho_optimizer::OuterEvalOrder;
+
+    let n = 600usize;
+    let mut data = Array2::<f64>::zeros((n, 1));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let t = i as f64 / (n as f64 - 1.0);
+        data[[i, 0]] = t;
+        let signal = 1.2 * (2.0 * std::f64::consts::PI * t).sin() + 0.4 * (t - 0.5);
+        let noise = 0.15 * (((i as f64) * 12.9898).sin() * 43758.547).fract();
+        y[i] = signal + noise;
+    }
+    let weights = Array1::<f64>::ones(n);
+    let offset = Array1::<f64>::zeros(n);
+    let family = LikelihoodSpec::gaussian_identity();
+
+    let spec = TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            name: "forced_skip_diag".to_string(),
+            basis: SmoothBasisSpec::Duchon {
+                feature_cols: vec![0],
+                spec: DuchonBasisSpec {
+                    radial_reparam: None,
+                    periodic: None,
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers: 12 },
+                    length_scale: Some(1.0),
+                    power: 1.0,
+                    nullspace_order: DuchonNullspaceOrder::Linear,
+                    identifiability: SpatialIdentifiability::default(),
+                    aniso_log_scales: None,
+                    operator_penalties: DuchonOperatorPenaltySpec::all_active(),
+                    boundary: OneDimensionalBoundary::Open,
+                },
+                input_scales: None, // PRODUCTION standardized geometry.
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+
+    let design = build_term_collection_design(data.view(), &spec).expect("design");
+    let frozen = freeze_term_collection_from_design(&spec, &design).expect("freeze");
+    let frozen_design = build_term_collection_design(data.view(), &frozen).expect("frozen design");
+    let spatial_terms = spatial_length_scale_term_indices(&frozen);
+    let dims_per_term = spatial_dims_per_term(&frozen, &spatial_terms);
+    let rho_dim = frozen_design.penalties.len();
+    let kappa_options = SpatialLengthScaleOptimizationOptions::default();
+    let log_kappa0 =
+        SpatialLogKappaCoords::from_length_scales(&frozen, &spatial_terms, &kappa_options);
+    let log_kappa_lower = SpatialLogKappaCoords::lower_bounds_from_data(
+        data.view(),
+        &frozen,
+        &spatial_terms,
+        &kappa_options,
+    );
+    let log_kappa_upper = SpatialLogKappaCoords::upper_bounds_from_data(
+        data.view(),
+        &frozen,
+        &spatial_terms,
+        &kappa_options,
+    );
+    let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
+    const JOINT_RHO_BOUND: f64 = 12.0;
+    let setup = ExactJointHyperSetup::new(
+        Array1::<f64>::zeros(rho_dim),
+        Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
+        Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
+        log_kappa0.clone(),
+        log_kappa_lower.clone(),
+        log_kappa_upper.clone(),
+    );
+    let theta0 = setup.theta0();
+    let lower = setup.lower();
+    let upper = setup.upper();
+    let psi_lo = lower[rho_dim];
+    let psi_hi = upper[rho_dim];
+    let z = Array1::from_iter(y.iter().zip(offset.iter()).map(|(yi, oi)| yi - oi));
+    let external_opts = external_opts_for_design(
+        &family,
+        &frozen_design,
+        &FitOptions {
+            compute_inference: false,
+            max_iter: 200,
+            tol: 1e-12,
+            penalty_shrinkage_floor: None,
+            ..FitOptions::default()
+        },
+    );
+
+    let make_eval = || {
+        crate::estimate::ExternalJointHyperEvaluator::new(
+            y.view(),
+            weights.view(),
+            &frozen_design.design,
+            offset.view(),
+            &frozen_design.penalties,
+            &external_opts,
+            "forced_skip_diag",
+        )
+        .expect("evaluator")
+    };
+    let make_cache = || {
+        SingleBlockExactJointDesignCache::new(
+            data.view(),
+            frozen.clone(),
+            frozen_design.clone(),
+            spatial_terms.clone(),
+            rho_dim,
+            dims_per_term.clone(),
+        )
+        .expect("design cache")
+    };
+
+    let mut tensor_eval = make_eval();
+    let mut tensor_cache = make_cache();
+    let attached = {
+        let mut build_cache = make_cache();
+        let theta_probe_base = theta0.clone();
+        tensor_eval.build_and_set_psi_gram_tensor(
+            |psi| {
+                let mut theta_probe = theta_probe_base.clone();
+                theta_probe[rho_dim] = psi;
+                build_cache.ensure_theta(&theta_probe)?;
+                Ok(build_cache.design().design.clone())
+            },
+            weights.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+    };
+    assert!(attached, "tensor must certify for a non-vacuous diagnostic");
+    let nfree_penalty = tensor_cache.supports_nfree_penalty_rekey();
+    assert!(nfree_penalty, "frozen Duchon term must admit exact n-free S(ψ)");
+    tensor_eval.set_supports_nfree_penalty_rekey(nfree_penalty);
+
+    let span = psi_hi - psi_lo;
+    let psi_a = psi_lo + 0.5 * span; // interior pin
+    let rho = Array1::<f64>::from_elem(rho_dim, 0.5);
+    let theta_at = |psi: f64| {
+        let mut theta = Array1::<f64>::zeros(rho_dim + 1);
+        theta.slice_mut(s![..rho_dim]).assign(&rho);
+        theta[rho_dim] = psi;
+        theta
+    };
+
+    let eval_tensor = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+                       cache: &mut SingleBlockExactJointDesignCache<'_>,
+                       theta: &Array1<f64>,
+                       realize: bool|
+     -> Array1<f64> {
+        if realize {
+            cache.ensure_theta(theta).expect("ensure_theta");
+        }
+        let hyper_dirs = cache
+            .hyper_dirs_for_current_design(data.view(), SpatialHyperKind::Isotropic)
+            .expect("hyper_dirs");
+        let penalty = cache
+            .canonical_penalties_at(theta)
+            .expect("exact n-free S(ψ) rebuild");
+        evaluator.stage_fast_path_penalty(Some(penalty));
+        evaluate_joint_reml_outer_eval_at_theta(
+            evaluator,
+            cache.design(),
+            theta,
+            rho_dim,
+            hyper_dirs,
+            None,
+            OuterEvalOrder::ValueAndGradient,
+            Some(cache.design_revision()),
+        )
+        .expect("tensor eval");
+        evaluator.current_beta().expect("converged inner β̂")
+    };
+
+    // Pin the reference surface at ψ_A (slow path runs once, records psi_ref).
+    let beta_a = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_a), true);
+    assert!(beta_a.iter().all(|v| v.is_finite()), "pin β̂ finite");
+    assert_eq!(tensor_eval.slow_path_reset_count(), 1, "one pinning reset");
+
+    // Fresh streamed reference (always re-realizes ⇒ exact n-row solve).
+    let mut streamed_eval = make_eval();
+    let mut stream_cache = make_cache();
+    let beta_streamed = |evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+                         cache: &mut SingleBlockExactJointDesignCache<'_>,
+                         theta: &Array1<f64>|
+     -> Array1<f64> {
+        cache.ensure_theta(theta).expect("ensure_theta");
+        let hyper = try_build_spatial_log_kappa_hyper_dirs(
+            data.view(),
+            cache.spec(),
+            cache.design(),
+            &spatial_terms,
+        )
+        .unwrap()
+        .unwrap();
+        evaluate_joint_reml_outer_eval_at_theta(
+            evaluator,
+            cache.design(),
+            theta,
+            rho_dim,
+            hyper,
+            None,
+            OuterEvalOrder::ValueAndGradient,
+            Some(cache.design_revision()),
+        )
+        .expect("streamed eval");
+        evaluator.current_beta().expect("streamed β̂")
+    };
+
+    eprintln!(
+        "[DIAG1033-FORCE] 513-node tensor; pin ψ_a={psi_a:.5} window=[{psi_lo:.4},{psi_hi:.4}] span={span:.4}"
+    );
+    eprintln!("[DIAG1033-FORCE] frac_of_span  psi  covers_skip(gate)  forced_skip_β̂rel_vs_streamed");
+    // Sweep ψ moves off the pin, from tiny to a large rotation toward the
+    // ill-conditioned low edge. For each: print the GATE verdict, then FORCE the
+    // skip (realize=false) and measure β̂rel against a fresh streamed solve.
+    let fracs = [
+        1.0 / 4096.0,
+        1.0 / 512.0,
+        1.0 / 64.0,
+        1.0 / 16.0,
+        1.0 / 8.0,
+        1.0 / 4.0,
+        -0.48, // large move toward low edge (psi ≈ psi_lo + 0.02*span)
+    ];
+    let mut worst_forced = 0.0_f64;
+    for &f in &fracs {
+        let psi = psi_a + f * span;
+        if !tensor_eval.psi_gram_tensor_covers(psi) {
+            eprintln!("[DIAG1033-FORCE] frac={f:+.5} psi={psi:.5} OUT-OF-VALUE-WINDOW (skipped)");
+            continue;
+        }
+        let gate = tensor_eval.psi_gram_tensor_covers_skip(psi);
+        // FORCE the skip: realize=false re-keys G(ψ)+S(ψ) onto the frozen ψ_A
+        // surface exactly as the skip would, regardless of the gate verdict.
+        let beta_forced =
+            eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi), false);
+        let beta_slow = beta_streamed(&mut streamed_eval, &mut stream_cache, &theta_at(psi));
+        let rel = beta_forced
+            .iter()
+            .zip(beta_slow.iter())
+            .fold(0.0_f64, |a, (g, s)| a.max((g - s).abs() / (1.0 + s.abs())));
+        worst_forced = worst_forced.max(rel);
+        eprintln!(
+            "[DIAG1033-FORCE] frac={f:+.5} psi={psi:.5} covers_skip={gate} forced_β̂rel={rel:.3e} \
+             {}",
+            if rel <= 1e-6 { "SOUND(≤1e-6)" } else { "UNSOUND(>1e-6)" }
+        );
+        // Re-pin at ψ_A after each forced trial so every measurement is a move
+        // off the SAME reference (a forced skip does not advance the pin, but a
+        // streamed-cache realize did; restore the tensor cache's surface).
+        let _ = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_a), true);
+    }
+    eprintln!(
+        "[DIAG1033-FORCE] worst forced-skip β̂rel across the move ladder = {worst_forced:.3e} \
+         (≤1e-6 ⇒ gate over-conservative, replace with residual self-check; \
+         growing-to-~1e-5 ⇒ interpolation×conditioning wall, needs deeper tensor)"
+    );
+    // Report-only: the printed ladder is the deliverable. Only guard the harness
+    // produced finite, non-degenerate β̂ (a collapsed solve would make the ratio
+    // meaningless).
+    assert!(
+        worst_forced.is_finite(),
+        "forced-skip β̂rel ladder must be finite to be a usable measurement"
+    );
+}
+
 #[test]
 fn iso_kappa_duchon_binomial_logit_fd() {
     let (pass, worst, violations) =
