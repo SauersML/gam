@@ -788,7 +788,7 @@ pub fn implicit_solve<const K1: usize, const K: usize>(
     f: &Tower4<K1>,
     a0: f64,
 ) -> Result<Tower4<K>, String> {
-    debug_assert_eq!(K1, K + 1, "implicit_solve: constraint must carry K+1 vars");
+    assert_eq!(K1, K + 1, "implicit_solve: constraint must carry K+1 vars");
     let f_a = f.g[0];
     if f_a == 0.0 || !f_a.is_finite() {
         return Err(format!(
@@ -860,7 +860,7 @@ pub fn substitute_intercept<const K1: usize, const K: usize>(
     f: &Tower4<K1>,
     a: &Tower4<K>,
 ) -> Tower4<K> {
-    debug_assert_eq!(K1, K + 1);
+    assert_eq!(K1, K + 1);
     // Build the K+1 input towers in θ-space: slot 0 = a(θ), slot i+1 = θ_i.
     // The composite is Σ over ordered label tuples s (|s| ≤ 4) of input
     // indices: (1/|s|!) · f.deriv(s) · Π_{j in s} (inp[s_j] centred) — but
