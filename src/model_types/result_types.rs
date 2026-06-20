@@ -221,6 +221,148 @@ mod per_term_edf_tests {
         })
     }
 
+    /// Build a fit that mirrors a factor `by=` smooth's penalty layout for the
+    /// fallback (no influence matrix) `per_term_edf` channel that the persisted /
+    /// FFI summary path uses. `n_levels` centred by-smooths each own ONE penalty
+    /// block (`penalty_block_trace = 5` over a dim-20 block → EDF 15); the
+    /// UNPENALISED treatment-coded factor main-effect block the `by=` expansion
+    /// injects owns NO penalty block, so `penalty_block_trace.len() == n_levels`
+    /// — strictly less than the number of summary rows (1 RE + n_levels smooths).
+    fn fit_by_factor_penalty_layout(n_levels: usize) -> UnifiedFitResult {
+        let dim = 20usize;
+        let trace_per_block = 5.0_f64; // each by-smooth spends dim − trace = 15 EDF
+        let traces = vec![trace_per_block; n_levels];
+        let edf_per_smooth = dim as f64 - trace_per_block;
+        // 1 unpenalised factor main effect (4 EDF, say) + n_levels × 15 smooth EDF.
+        let edf_total = 4.0 + n_levels as f64 * edf_per_smooth;
+        let p = 1 + dim * n_levels;
+        let lambdas = Array1::from_vec(vec![1.0; n_levels]);
+        UnifiedFitResult::new_for_test_unchecked(UnifiedFitResultParts {
+            blocks: vec![FittedBlock {
+                beta: Array1::zeros(p),
+                role: BlockRole::Mean,
+                edf: edf_total,
+                lambdas: lambdas.clone(),
+            }],
+            log_lambdas: Array1::zeros(n_levels),
+            lambdas,
+            likelihood_family: Some(LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: LogLikelihoodNormalization::Full,
+            log_likelihood: 0.0,
+            deviance: 0.0,
+            reml_score: 0.0,
+            stable_penalty_term: 0.0,
+            penalized_objective: 0.0,
+            used_device: false,
+            outer_iterations: 0,
+            outer_converged: true,
+            outer_gradient_norm: Some(0.0),
+            standard_deviation: 1.0,
+            covariance_conditional: None,
+            covariance_corrected: None,
+            inference: Some(FitInference {
+                edf_by_block: vec![edf_per_smooth; n_levels],
+                penalty_block_trace: traces,
+                edf_total,
+                smoothing_correction: None,
+                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
+                working_weights: Array1::ones(1),
+                working_response: Array1::zeros(1),
+                reparam_qs: None,
+                dispersion: Dispersion::Estimated(1.0),
+                beta_covariance: None,
+                beta_standard_errors: None,
+                beta_covariance_corrected: None,
+                beta_standard_errors_corrected: None,
+                beta_covariance_frequentist: None,
+                // No influence matrix: forces the `|coeff_range| − Σ tr_kk`
+                // per-block-trace channel, where the `penalty_cursor` walk matters.
+                coefficient_influence: None,
+                weighted_gram: None,
+                bias_correction_beta: None,
+            }),
+            fitted_link: FittedLinkState::Standard(None),
+            geometry: None,
+            block_states: Vec::new(),
+            pirls_status: crate::pirls::PirlsStatus::Converged,
+            max_abs_eta: 0.0,
+            constraint_kkt: None,
+            artifacts: FitArtifacts::default(),
+            inner_cycles: 0,
+        })
+    }
+
+    /// Regression for issue #1368. The summary smooth-term loop walks a
+    /// `penalty_cursor` across the flat penalty-block layout. A factor `by=`
+    /// smooth injects an UNPENALISED treatment-coded factor main-effect random
+    /// block that owns NO penalty block; advancing the cursor for it slides every
+    /// following by-level smooth's `penalty_cursor..+k` trace window one block
+    /// down, so the LAST level's slice runs off the end of `penalty_block_trace`
+    /// and `per_term_edf` returns 0 (then the EDF-0 term gets a NaN significance).
+    ///
+    /// This reproduces the exact cursor walk against the fallback per-block-trace
+    /// channel: the BUGGY cursor (advance +1 for the unpenalised RE block) zeroes
+    /// the last level; the FIXED cursor (advance +0 for an unpenalised block, the
+    /// number of penalty blocks it actually owns) gives every level its EDF and
+    /// recovers the per-term sum to within tolerance of `edf_total`.
+    #[test]
+    fn by_factor_unpenalised_main_effect_does_not_zero_last_level_edf() {
+        let n_levels = 5usize;
+        let dim = 20usize;
+        let fit = fit_by_factor_penalty_layout(n_levels);
+        let smooth_start = 1; // global layout: [unpenalised RE block(1) | smooths]
+        let expected_per_smooth = 15.0_f64;
+        let tol = 1e-9;
+
+        // ── BUGGY walk: the unpenalised RE block advances the cursor by 1. ──
+        let mut buggy_cursor = 0usize;
+        buggy_cursor += 1; // RE block treated as owning one penalty block
+        let mut buggy_edfs = Vec::new();
+        for level in 0..n_levels {
+            let start = smooth_start + level * dim;
+            let edf = fit.per_term_edf(start..(start + dim), buggy_cursor, 1);
+            buggy_cursor += 1;
+            buggy_edfs.push(edf);
+        }
+        // The defect: the last by-level smooth's trace window runs off the end of
+        // `penalty_block_trace` (len = n_levels) and collapses to 0 EDF.
+        assert!(
+            buggy_edfs.last().copied().unwrap() <= tol,
+            "expected the buggy cursor to zero the last level's EDF, got {:?}",
+            buggy_edfs
+        );
+
+        // ── FIXED walk: the unpenalised RE block owns 0 penalty blocks. ──
+        let mut cursor = 0usize;
+        let re_penalized = false; // the injected factor main effect is unpenalised
+        cursor += usize::from(re_penalized); // advance by blocks actually owned (0)
+        let mut edfs = Vec::new();
+        for level in 0..n_levels {
+            let start = smooth_start + level * dim;
+            let edf = fit.per_term_edf(start..(start + dim), cursor, 1);
+            cursor += 1;
+            edfs.push(edf);
+        }
+        // Every level — including the last — now reports its honest EDF.
+        for (level, &edf) in edfs.iter().enumerate() {
+            assert!(
+                (edf - expected_per_smooth).abs() < tol,
+                "level {level} EDF {edf} != expected {expected_per_smooth} (set {edfs:?})"
+            );
+            assert!(edf > 1.0, "level {level} EDF {edf} must be well above 1");
+        }
+        // The per-term EDFs (smooths + the unpenalised main-effect dof) reconstruct
+        // the model total — the dropped last level previously left a 15-EDF gap.
+        let main_effect_edf = 4.0_f64; // the unpenalised RE block's full dof
+        let reconstructed: f64 = edfs.iter().sum::<f64>() + main_effect_edf;
+        let edf_total = fit.edf_total().expect("edf_total present");
+        assert!(
+            (reconstructed - edf_total).abs() < 1e-6,
+            "Σ per-term EDF ({reconstructed}) must match edf_total ({edf_total})"
+        );
+    }
+
     #[test]
     fn edf_total_never_below_a_single_terms_edf() {
         let fit = fit_single_thinplate_consistent_edf();

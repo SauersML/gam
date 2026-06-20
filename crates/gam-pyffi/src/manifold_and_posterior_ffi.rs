@@ -2026,12 +2026,26 @@ fn summary_smooth_terms(
 
     let mut out = Vec::<SummarySmoothTermRow>::new();
     let mut penalty_cursor = 0usize;
-    for (name, range) in &design.random_effect_ranges {
+    for (re_idx, (name, range)) in design.random_effect_ranges.iter().enumerate() {
         // Per-term EDF as the influence-matrix trace over the term's coefficient
         // block (#1219, #1277) — never the legacy per-block-EDF sum, which
         // double-counts shared coefficients and can exceed the model total.
-        let edf = fit.per_term_edf(range.clone(), penalty_cursor, 1);
-        penalty_cursor += 1;
+        //
+        // Only PENALIZED random-effect blocks own a penalty block in the flat
+        // `lambdas`/`penalty_block_trace` layout (design assembly skips unpenalised
+        // ones). A factor `by=` smooth injects an UNPENALISED treatment-coded
+        // factor main-effect block; advancing `penalty_cursor` for it (the #1368
+        // defect) slid the cursor one block past every following smooth, zeroing
+        // the LAST by-level smooth's EDF/significance. Advance by the blocks the
+        // term actually owns: 1 if penalized, 0 if not.
+        let penalized = spec
+            .random_effect_terms
+            .get(re_idx)
+            .map(|t| t.penalized)
+            .unwrap_or(true);
+        let k_pen = usize::from(penalized);
+        let edf = fit.per_term_edf(range.clone(), penalty_cursor, k_pen);
+        penalty_cursor += k_pen;
         // Random-effect smooths are boundary variance-component tests; a naive
         // coefficient Wald χ² is anti-conservative, so only EDF is reported.
         out.push(SummarySmoothTermRow {
