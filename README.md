@@ -14,7 +14,7 @@ Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>
 
 **Contributions of every kind are welcome** — broken PRs, first-timers,
 AI-written patches, and any feature request, with no guidelines and low
-friction by design. See [Contributing](#contributing).
+friction by design.
 
 ![3D Matérn fit on a noisy 2-D landscape](docs/images/surface_3d_wireframe.png)
 
