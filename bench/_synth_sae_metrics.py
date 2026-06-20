@@ -151,6 +151,35 @@ def feature_uniqueness(learned: np.ndarray, truth: np.ndarray) -> float:
     return float(np.unique(best).size / learned.shape[0])
 
 
+def firing_latent_mask(activations: np.ndarray, threshold: float = 1e-8) -> np.ndarray:
+    """Functional dead-latent mask (SynthSAEBench): a latent is *live* if it
+    fires (``|activation| > threshold``) on at least one sample of the evaluation
+    set.
+
+    Unlike geometric deadness (zero decoder norm), a latent with a nonzero decoder
+    direction that never activates is *functionally* dead -- wasted capacity that a
+    decoder-norm check misses (#1435). Returns a 1-D boolean mask whose length is
+    the latent count (``activations`` columns). Empty input returns an empty mask;
+    a 1-D array is treated as a single latent.
+    """
+    a = np.abs(np.asarray(activations, dtype=float))
+    if a.size == 0:
+        return np.empty(0, dtype=bool)
+    if a.ndim == 1:
+        a = a[:, None]
+    return np.any(a > threshold, axis=0)
+
+
+def n_firing_latents(activations: np.ndarray, threshold: float = 1e-8) -> int:
+    """Count of latents that fire on at least one evaluation sample.
+
+    Functional (activation-based) live count, complementing the geometric
+    (decoder-norm) live count. ``n_slots - n_firing_latents`` is the functional
+    dead count (#1435).
+    """
+    return int(firing_latent_mask(activations, threshold).sum())
+
+
 @dataclass(frozen=True)
 class RecoveryScores:
     """Quality-aware one-to-one recovery plus the matched-pair MCC.
