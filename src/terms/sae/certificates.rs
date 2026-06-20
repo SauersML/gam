@@ -174,6 +174,18 @@ pub fn probe_step(rho_hat: ArrayView1<'_, f64>) -> f64 {
     BASE * scale
 }
 
+/// Per-coordinate probe step for a single outer-ρ axis.
+///
+/// [`probe_step`] collapses the whole vector to one global step
+/// (`1e-4 · max_i|ρ_i|`), which under-resolves a small coordinate whenever some
+/// other axis is large. When differencing one axis at a time, scale the step to
+/// that coordinate's own magnitude, with a unit floor so a near-zero coordinate
+/// still gets a usable step.
+pub fn probe_step_for(rho_i: f64) -> f64 {
+    const BASE: f64 = 1e-4;
+    BASE * rho_i.abs().max(1.0)
+}
+
 /// Samples of the criterion **value path** taken at the four probe points
 /// around `ρ̂` along the unit direction `v`, plus the analytic directional
 /// derivative — everything the certificate needs, with no dependence on the
