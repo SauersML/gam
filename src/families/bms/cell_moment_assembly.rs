@@ -3474,10 +3474,16 @@ mod empirical_flex_jet_oracle_tests {
             flo <= 0.0 && fhi >= 0.0,
             "failed to bracket flex calibration root: F({lo})={flo}, F({hi})={fhi}"
         );
+        // Drive the bracket to (near) f64 resolution. The high-order Richardson
+        // stencils below divide by a small `h^order`, so the root must be
+        // resolved as tightly as the arithmetic allows or per-stencil root noise
+        // (not production error) would dominate the finest Romberg level. A
+        // width floor of `~1e-15·max(1,|mid|)` is the tightest a bisection can
+        // distinguish in f64; 200 halvings of a width-2 bracket reach it easily.
         for _ in 0..200 {
             let mid = 0.5 * (lo + hi);
             let fmid = calib(mid);
-            if fmid.abs() <= 1e-14 || (hi - lo).abs() <= 1e-13 {
+            if fmid == 0.0 || (hi - lo).abs() <= 1e-15 * mid.abs().max(1.0) {
                 return mid;
             }
             if fmid < 0.0 {
@@ -3565,11 +3571,31 @@ mod empirical_flex_jet_oracle_tests {
         raw / h.powi(total_order as i32)
     }
 
-    /// Richardson O(h⁴) wrapper over `central_along`.
+    /// Romberg (double-Richardson) O(h⁶) wrapper over `central_along`.
+    ///
+    /// The single-Richardson `(4·fine − coarse)/3` cancels only the leading
+    /// `O(h²)` truncation term, leaving `O(h⁴)`. For the stiffest link-deviation
+    /// channels — where one axis is the marginal-link map `q(η)` (itself a
+    /// nonlinear inverse-probit composition) and the deviation basis enters the
+    /// composed observed index `u = a + b·z` *through the implicit calibrated
+    /// intercept* — the 6th/8th derivatives are large enough that the residual
+    /// `O(h⁴)` term of a single Richardson level still reaches O(10%) on the
+    /// mixed 4th-order `[q,b,β,β]` coefficient at the coarse `h` these tensor
+    /// stencils must use. (The shallower score-warp composition — basis at the
+    /// fixed node `z`, not at `u` — is unaffected, which is why only the
+    /// link-dev quad needs the extra level.) Production AD is exact; the witness
+    /// just needs enough Richardson levels to expose that. Add a second level:
+    /// build the `O(h⁴)` estimate at `h` and `h/2` and combine with the `16/15`
+    /// Romberg weights to cancel `O(h⁴)` too, leaving `O(h⁶)`.
     fn central_rich(fx: &FlexFixture, p0: &[f64], axes: &[(usize, usize)], h: f64) -> f64 {
-        let coarse = central_along(fx, p0, axes, h);
-        let fine = central_along(fx, p0, axes, h * 0.5);
-        (4.0 * fine - coarse) / 3.0
+        let rich = |step: f64| -> f64 {
+            let coarse = central_along(fx, p0, axes, step);
+            let fine = central_along(fx, p0, axes, step * 0.5);
+            (4.0 * fine - coarse) / 3.0
+        };
+        let r_coarse = rich(h);
+        let r_fine = rich(h * 0.5);
+        (16.0 * r_fine - r_coarse) / 15.0
     }
 
     /// Production flex jet along a list of unit primary directions; returns the
