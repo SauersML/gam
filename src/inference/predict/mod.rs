@@ -406,8 +406,18 @@ impl UncertaintyCovarianceSource for PredictionCovarianceWithScale<'_> {
     }
 
     fn resolved_fitted_link_state(&self, family: &LikelihoodSpec) -> Option<FittedLinkState> {
-        assert!(std::mem::size_of_val(family) > 0);
-        None
+        // A raw covariance-plus-scale wrapper carries no fitted adaptive-link
+        // state; every link variant resolves to `None` here and is handled by
+        // the family's own `InverseLink`. Matched exhaustively (mirroring the
+        // bare `Array2` source) so a new adaptive link cannot silently slip
+        // through as `None` without review.
+        match &family.link {
+            InverseLink::Standard(_)
+            | InverseLink::LatentCLogLog(_)
+            | InverseLink::Sas(_)
+            | InverseLink::BetaLogistic(_)
+            | InverseLink::Mixture(_) => None,
+        }
     }
 
     fn observation_phi(&self) -> Option<f64> {
