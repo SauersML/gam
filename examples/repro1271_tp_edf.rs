@@ -41,8 +41,7 @@ fn main() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let formula =
-        std::env::var("REPRO_FORMULA").unwrap_or_else(|_| "y ~ s(x, bs=\"tp\", k=20)".to_string());
+    let formula = "y ~ s(x, bs=\"tp\", k=20)".to_string();
     println!("formula: {formula}");
     let mut edfs = Vec::new();
     for seed in [1u64, 2, 3, 4, 5] {

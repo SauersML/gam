@@ -47,8 +47,7 @@ fn main() {
         return;
     }
 
-    let visible = std::env::var("CUDA_VISIBLE_DEVICES").unwrap_or_else(|_| "<unset>".into());
-    println!("MULTIGPU CUDA_VISIBLE_DEVICES={visible} N={N} M={M} K={K}");
+    println!("MULTIGPU N={N} M={M} K={K}");
 
     // Warm up the driver / cuBLAS handles + autoderived size gate.
     let _ = gam::gpu::linalg_dispatch::try_fast_xt_diag_x(phis[0].view(), weights[0].view());

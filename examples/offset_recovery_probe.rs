@@ -145,7 +145,9 @@ fn main() {
         "\nVERDICT (A offset recovers truth within {tol}): {}",
         if ok_a { "PASS" } else { "FAIL <-- BUG" }
     );
-    if !ok_a {
-        std::process::exit(3);
-    }
+    assert!(
+        ok_a,
+        "offset recovery FAILED: (A) supplied-offset fit did not recover truth \
+         (b0={b0_a:+.4}, b1={b1_a:+.4}; true b0={b0_true}, b1={b1_true}) within tol={tol}"
+    );
 }
