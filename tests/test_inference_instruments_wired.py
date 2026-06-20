@@ -57,6 +57,46 @@ def test_fit_transport_object_inverts_and_composes():
     assert np.allclose(phi, y ** (1.0 / 3.0), atol=2e-3)
 
 
+def test_fit_transport_invert_rejects_non_finite_targets():
+    # The #1361 finiteness guard, exercised through the Python API: a non-finite
+    # inverse target must raise ValueError rather than silently returning a
+    # boundary coordinate.
+    frm = np.linspace(0.0, 1.0, 64)
+    g = gamfit.fit_transport(frm, 0.5 * frm, "interval", "interval")
+    for bad in (np.nan, np.inf, -np.inf):
+        with pytest.raises(ValueError):
+            g.invert(np.array([bad]))
+
+
+def test_fit_transport_invert_rejects_folded_map():
+    # A non-topology-preserving (folded) fit must refuse to invert. The target
+    # is non-monotone in the source coordinate, so the fitted map folds and the
+    # span-exact monotonicity certificate rejects the inverse.
+    frm = np.linspace(0.0, 1.0, 200)
+    # A clear fold: rises then falls (a non-monotone, fold-bearing map).
+    target = np.sin(2.0 * math.pi * frm)
+    lo, hi = float(target.min()), float(target.max())
+    g = gamfit.fit_transport(frm, target, "interval", "interval")
+    assert g.topology_preserved is False
+    with pytest.raises(ValueError):
+        g.invert(np.array([0.5 * (lo + hi)]))
+
+
+def test_fit_transport_degree_minus_one_circle_round_trips():
+    # A degree -1 (orientation-reversing) circle cover must invert correctly
+    # through the Python API.
+    t = np.linspace(0.0, 2.0 * math.pi, 256, endpoint=False)
+    s = (-t + 0.4 + 0.15 * np.sin(t)) % (2.0 * math.pi)
+    g = gamfit.fit_transport(t, s, "circle", "circle")
+    assert g.degree == -1
+    assert g.topology_preserved is True
+    probe = (np.arange(7) + 0.5) * (2.0 * math.pi / 7.0)
+    back = g.invert(g.eval(probe))
+    # Compare modulo 2π.
+    d = np.abs((back - probe + math.pi) % (2.0 * math.pi) - math.pi)
+    assert np.all(d < 1e-4)
+
+
 def test_structure_discovery_gate_and_certificate():
     # split-LR log e-value is just the likelihood gap.
     assert gamfit.split_likelihood_log_e(-8.0, -10.0) == pytest.approx(2.0)
