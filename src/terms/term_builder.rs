@@ -641,31 +641,35 @@ pub fn build_termspec(
                                     frozen_levels: None,
                                 });
                             }
-                            for (level_bits, level_label) in levels {
-                                smooth_terms.push(SmoothTermSpec {
-                                    name: format!("{}:{}", label, level_bits),
-                                    basis: SmoothBasisSpec::ByVariable {
-                                        inner: Box::new(inner_basis.clone()),
-                                        by_col,
-                                        kind: BySmoothKind::Level { level_bits },
-                                        by: ByVariableSpec::Level {
-                                            value_bits: level_bits,
-                                            label: level_label,
-                                        },
+                            // Route to a single BySmooth::Factor term with
+                            // frozen levels pre-populated from the training data.
+                            // Design building later gates each level into its own
+                            // column block (see build_by_smooth_local in term_specs).
+                            let frozen_levels: Vec<u64> =
+                                levels.iter().map(|(bits, _)| *bits).collect();
+                            smooth_terms.push(SmoothTermSpec {
+                                name: label.clone(),
+                                basis: SmoothBasisSpec::BySmooth {
+                                    smooth: Box::new(inner_basis),
+                                    by_kind: ByVarKind::Factor {
+                                        feature_col: by_col,
+                                        ordered: option_bool(options, "ordered")
+                                            .unwrap_or(false),
+                                        frozen_levels: Some(frozen_levels),
                                     },
-                                    shape,
-                                    joint_null_rotation: None,
-                                });
-                            }
+                                },
+                                shape,
+                                joint_null_rotation: None,
+                            });
                         }
                         ColumnKindTag::Binary | ColumnKindTag::Continuous => {
                             smooth_terms.push(SmoothTermSpec {
                                 name: label.clone(),
-                                basis: SmoothBasisSpec::ByVariable {
-                                    inner: Box::new(inner_basis),
-                                    by_col,
-                                    kind: BySmoothKind::Numeric,
-                                    by: ByVariableSpec::Numeric,
+                                basis: SmoothBasisSpec::BySmooth {
+                                    smooth: Box::new(inner_basis),
+                                    by_kind: ByVarKind::Numeric {
+                                        feature_col: by_col,
+                                    },
                                 },
                                 shape,
                                 joint_null_rotation: None,
