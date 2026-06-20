@@ -1793,10 +1793,14 @@ fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
 fn constrained_stationary_probe_keeps_better_incumbent() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
-    // A good interior fit (the prepass seed): low cost, but still has a residual
-    // outer gradient (not yet certified stationary).
+    // A good interior fit (the prepass seed): low cost on a genuinely flat
+    // valley floor — a residual outer gradient modestly above tolerance but
+    // below FLAT_VALLEY_STALL_GRAD_CEILING (not yet certified stationary, yet a
+    // legitimate flat-valley floor rather than a #1426 stuck stall, so the guard
+    // halts-and-publishes it rather than escaping to keep descending).
     let good_seed = array![3.0, 30.0, 3.0, 3.0];
-    guard.observe_seed(&good_seed, -231.86, 18.4);
+    let good_seed_grad = FLAT_VALLEY_STALL_GRAD_CEILING * 0.5;
+    guard.observe_seed(&good_seed, -231.86, good_seed_grad);
 
     // The collapse corner: two axes pinned at the λ→0 lower bound (looks like a
     // separation probe) while two more rail at λ→∞; its cost is hundreds of
@@ -1812,10 +1816,17 @@ fn constrained_stationary_probe_keeps_better_incumbent() {
         "a constrained-stationary probe that regresses the incumbent must not be \
          adopted as the optimum"
     );
-    assert!(
-        exit.lock().unwrap().is_none(),
-        "no exit should be published while the better incumbent is retained"
-    );
+    // `observe_seed` seeds the shared exit cell with the feasible best (#1371),
+    // so the cell tracks the GOOD incumbent — never the regressing corner —
+    // while the no-improvement window is still filling.
+    {
+        let cell = exit.lock().unwrap();
+        let best = cell.as_ref().expect("seed best tracked in exit cell");
+        assert_eq!(
+            best.rho, good_seed,
+            "the exit cell must track the good incumbent, not the regressing corner"
+        );
+    }
 
     // Driving the no-improvement window to its limit halts on the GOOD
     // incumbent, never on the collapse corner.

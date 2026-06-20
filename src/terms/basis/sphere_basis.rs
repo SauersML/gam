@@ -144,7 +144,7 @@ pub fn build_spherical_spline_basis(
     })
 }
 
-const SPHERE_UNPENALIZED_LOW_DEGREE: usize = 1;
+pub(crate) const SPHERE_UNPENALIZED_LOW_DEGREE: usize = 1;
 
 pub(crate) fn harmonic_degree_for_wahba_basis_width(
     spec: &SphericalSplineBasisSpec,
@@ -278,14 +278,14 @@ fn orthonormal_complement(q: ArrayView2<'_, f64>, rel_tol: f64) -> Array2<f64> {
     out
 }
 
-struct WahbaLowDegreeDecomposition {
-    kernel_basis: Array2<f64>,
-    low_degree_centers: Option<Array2<f64>>,
-    kernel_low_projection: Option<Array2<f64>>,
-    low_degree_cols: usize,
+pub(crate) struct WahbaLowDegreeDecomposition {
+    pub(crate) kernel_basis: Array2<f64>,
+    pub(crate) low_degree_centers: Option<Array2<f64>>,
+    pub(crate) kernel_low_projection: Option<Array2<f64>>,
+    pub(crate) low_degree_cols: usize,
 }
 
-fn wahba_low_degree_decomposition(
+pub(crate) fn wahba_low_degree_decomposition(
     centers: ArrayView2<'_, f64>,
     radians: bool,
     center_kernel: ArrayView2<'_, f64>,
@@ -365,6 +365,57 @@ fn build_wahba_decomposed_design(
             hstack_dense(kernel_design.view(), low_design.view())
         }
         _ => kernel_design,
+    }
+}
+
+/// Build the DESIGN jet `∂Φ/∂(lat, lon)` of the Wahba decomposed design,
+/// matching the exact column layout of [`build_wahba_decomposed_design`].
+///
+/// The forward decomposed design is the linear map
+///   `[ raw_kernel·kernel_basis − low·kernel_low_projection | low ]`
+/// of the per-row evaluated kernel and low-degree harmonic functions, so its
+/// derivative w.r.t. each angular axis is the SAME linear map applied to the
+/// per-row jets:
+///   `kernel_jet = raw_kernel_jet·kernel_basis − low_jet·kernel_low_projection`,
+///   `out_jet    = [ kernel_jet | low_jet ]`.
+/// Without the low-degree split (centers ≤ low span) the design is just
+/// `raw_kernel·kernel_basis`, so the jet is `raw_kernel_jet·kernel_basis`.
+pub(crate) fn build_wahba_decomposed_jet(
+    raw_kernel_jet: &Array3<f64>,
+    low_jet: Option<&Array3<f64>>,
+    decomposition: &WahbaLowDegreeDecomposition,
+) -> Array3<f64> {
+    let n = raw_kernel_jet.shape()[0];
+    match (
+        &decomposition.kernel_low_projection,
+        low_jet,
+        &decomposition.low_degree_centers,
+    ) {
+        (Some(kernel_low_projection), Some(low_jet), Some(_)) => {
+            let kernel_cols = decomposition.kernel_basis.ncols();
+            let low_cols = decomposition.low_degree_cols;
+            let mut out = Array3::<f64>::zeros((n, kernel_cols + low_cols, 2));
+            for axis in 0..2 {
+                let raw_axis = raw_kernel_jet.index_axis(ndarray::Axis(2), axis);
+                let low_axis = low_jet.index_axis(ndarray::Axis(2), axis);
+                let kernel_axis =
+                    raw_axis.dot(&decomposition.kernel_basis) - low_axis.dot(kernel_low_projection);
+                out.slice_mut(s![.., 0..kernel_cols, axis])
+                    .assign(&kernel_axis);
+                out.slice_mut(s![.., kernel_cols.., axis]).assign(&low_axis);
+            }
+            out
+        }
+        _ => {
+            let kernel_cols = decomposition.kernel_basis.ncols();
+            let mut out = Array3::<f64>::zeros((n, kernel_cols, 2));
+            for axis in 0..2 {
+                let raw_axis = raw_kernel_jet.index_axis(ndarray::Axis(2), axis);
+                let projected = raw_axis.dot(&decomposition.kernel_basis);
+                out.slice_mut(s![.., .., axis]).assign(&projected);
+            }
+            out
+        }
     }
 }
 
