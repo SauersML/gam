@@ -973,6 +973,20 @@ fn fit_topology_candidate(
     // Rank-aware Laplace negative log evidence on the smooth-rung scale:
     // ½·SSE (the Gaussian deviance, unit dispersion — the constant cancels in the
     // TK race) + ½·log|H|.
+    //
+    // NOTE (#1374, the `−½·log|S_pen|+` penalty pseudo-determinant is
+    // INTENTIONALLY OMITTED): a within-model marginal likelihood also carries
+    // `−½·log|S_pen|+` (see `solver::evidence::laplace_evidence`). It is left out
+    // HERE because this `raw_reml` is consumed ONLY by the cross-BASIS born-atom
+    // topology race (`select_topology_with_fit` → `tk_normalized_score`,
+    // `PerEffectiveDim`-normalized), never as a single-model evidence.
+    // `log|S_pen|+` is computed per-candidate from each basis's OWN penalty, whose
+    // eigenvalue scale is basis-arbitrary (a circle's curvature penalty is not on
+    // the same scale as a line's), so it is NOT commensurable across competing
+    // topologies — adding it flips the cross-basis winner (it broke
+    // `birth_topology_race_assigns_circle_vs_line_by_evidence`). Cross-candidate
+    // complexity is already priced by the per-effective-dim scale, so the correct
+    // race score on this path is `½·SSE + ½·log|H|`.
     let raw_reml = 0.5 * sse + 0.5 * log_det_h;
 
     // Null space of the roughness Gram S (the unpenalized constant/polynomial
