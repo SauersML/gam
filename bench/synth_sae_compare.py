@@ -8,7 +8,7 @@ the same direct ground-truth metrics:
 * reconstruction R2
 * decoder/feature MCC using Hungarian matching
 * feature uniqueness (SynthSAEBench argmax-collision definition)
-* direction recovery precision/recall/F1 (quality-aware coverage)
+* direction recovery precision/recall/F1/Jaccard (quality-aware coverage)
 * matched-latent firing precision/recall/F1
 
 The manifold row uses the repo's public ``gamfit.sae_manifold_fit`` API. The
@@ -51,6 +51,7 @@ class ModelResult:
     direction_recovery_precision: float
     direction_recovery_recall: float
     direction_recovery_f1: float
+    direction_recovery_jaccard: float
     probing_precision: float
     probing_recall: float
     probing_f1: float
@@ -160,11 +161,14 @@ def _score(
     dirs = decoder_dirs[live] / np.maximum(norms[live, None], 1e-10)
     # Three distinct ground-truth measurements (see bench/_synth_sae_metrics.py
     # and #1413): uniqueness is the SynthSAEBench argmax-collision score, while
-    # MCC and the direction-recovery precision/recall/F1 come from the optimal
-    # one-to-one matching. The old `len(set(cols)) / len(rows)` was always 1.0
-    # because Hungarian/greedy never reuse columns.
+    # MCC and the direction-recovery precision/recall/F1/Jaccard come from the
+    # optimal one-to-one matching. The old `len(set(cols)) / len(rows)` was
+    # always 1.0 because the assignment never reuses columns. The recovery
+    # denominator spans *all* decoder slots (decoder_dirs.shape[0], incl. dead
+    # zero-norm ones) so wasted width is penalized; dead rows carry no matching
+    # mass, so this only affects the denominator.
     uniqueness = feature_uniqueness(dirs, truth_dirs)
-    rec = recovery_scores(dirs, truth_dirs)
+    rec = recovery_scores(dirs, truth_dirs, n_learned_total=int(decoder_dirs.shape[0]))
     rows, cols = rec.rows, rec.cols
     if rows.size:
         mcc = rec.mcc
@@ -192,6 +196,7 @@ def _score(
         direction_recovery_precision=rec.precision,
         direction_recovery_recall=rec.recall,
         direction_recovery_f1=rec.f1,
+        direction_recovery_jaccard=rec.jaccard,
         probing_precision=precision,
         probing_recall=recall,
         probing_f1=f1,

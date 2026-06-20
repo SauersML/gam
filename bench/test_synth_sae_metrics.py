@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import numpy as np
 
+from itertools import permutations
+
 from _synth_sae_metrics import (
+    _hungarian_max_numpy,
     feature_uniqueness,
     match_directions,
     recovery_scores,
@@ -24,6 +27,19 @@ def _orthonormal(n: int, d: int, seed: int = 0) -> np.ndarray:
     rng = np.random.default_rng(seed)
     q, _ = np.linalg.qr(rng.standard_normal((d, n)))
     return q.T[:n]
+
+
+def _brute_force_max_mass(sim: np.ndarray) -> float:
+    """Optimal one-to-one matched mass by exhaustive search (small matrices)."""
+    n, m = sim.shape
+    if min(n, m) == 0:
+        return 0.0
+    if n <= m:
+        best = 0.0
+        for cols in permutations(range(m), n):
+            best = max(best, float(sum(sim[r, c] for r, c in enumerate(cols))))
+        return best
+    return _brute_force_max_mass(sim.T)
 
 
 def _old_width_ratio(learned: np.ndarray, truth: np.ndarray) -> float:
@@ -90,6 +106,49 @@ def test_undercomplete_lowers_recall() -> None:
     assert rec.precision > 0.99  # the 6 it has are perfect
     assert rec.recall < 0.7  # but 4 truth features are unrecovered
     assert abs(rec.recall - 0.6) < 1e-6
+
+
+def test_exact_hungarian_beats_greedy() -> None:
+    # The old greedy fallback took 0.9 then was forced to 0.0 (mass 0.9); the
+    # optimal assignment takes both 0.8s (mass 1.6). The exact matcher must find
+    # the optimum.
+    sim = np.array([[0.9, 0.8], [0.8, 0.0]])
+    rows, cols = _hungarian_max_numpy(sim)
+    assert abs(sim[rows, cols].sum() - 1.6) < 1e-12
+
+
+def test_hungarian_matches_brute_force() -> None:
+    rng = np.random.default_rng(11)
+    for _ in range(40):
+        n = int(rng.integers(1, 6))
+        m = int(rng.integers(1, 6))
+        sim = rng.random((n, m))
+        rows, cols = _hungarian_max_numpy(sim)
+        assert rows.shape[0] == min(n, m)
+        assert np.unique(cols).size == cols.size  # one-to-one
+        got = float(sim[rows, cols].sum())
+        assert abs(got - _brute_force_max_mass(sim)) < 1e-9
+
+
+def test_jaccard_one_only_for_perfect_bijection() -> None:
+    truth = _orthonormal(10, 16, seed=20)
+    assert recovery_scores(truth.copy(), truth).jaccard > 0.999
+    # Equal width but all-duplicate: Jaccard collapses well below 1.
+    dup = np.repeat(truth[:1], 10, axis=0)
+    assert recovery_scores(dup, truth).jaccard < 0.2
+
+
+def test_dead_slots_penalized_via_total_count() -> None:
+    # 10 perfect + 6 dead (zero-norm) decoder slots. Matching is over the 10
+    # live dirs (mass ~10), but counting all 16 slots in L penalizes the dead
+    # capacity, exactly as a width-16 SAE recovering 10 truths should be scored.
+    truth = _orthonormal(10, 32, seed=21)
+    live = truth.copy()
+    rec_live = recovery_scores(live, truth)  # default L = live count
+    rec_total = recovery_scores(live, truth, n_learned_total=16)
+    assert rec_live.precision > 0.999  # ignoring dead capacity -> perfect
+    assert abs(rec_total.precision - 10.0 / 16.0) < 1e-6  # dead capacity penalized
+    assert abs(rec_total.cardinality_ceiling - 10.0 / 16.0) < 1e-6
 
 
 def test_empty_learned_is_zero() -> None:

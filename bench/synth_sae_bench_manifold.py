@@ -69,6 +69,7 @@ class BenchmarkMetrics:
     direction_recovery_precision: float
     direction_recovery_recall: float
     direction_recovery_f1: float
+    direction_recovery_jaccard: float
     probing_precision: float
     probing_recall: float
     probing_f1: float
@@ -306,9 +307,12 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
     learned_dirs, learned_train = _learned_components(fit)
     # Three distinct ground-truth measurements (see bench/_synth_sae_metrics.py
     # and #1413): uniqueness is the SynthSAEBench argmax-collision score, while
-    # MCC and the direction-recovery precision/recall/F1 come from the optimal
-    # one-to-one matching. The old `len(set(cols)) / len(rows)` was always 1.0
-    # because Hungarian/greedy never reuse columns.
+    # MCC and the direction-recovery precision/recall/F1/Jaccard come from the
+    # optimal one-to-one matching. The old `len(set(cols)) / len(rows)` was
+    # always 1.0 because the assignment never reuses columns. `_learned_components`
+    # already drops zero-norm atom directions, and a manifold SAE has no single
+    # well-defined "total slot" count (atoms x harmonics), so the recovery
+    # denominator is the live direction count here.
     uniqueness = feature_uniqueness(learned_dirs, synth.dictionary)
     rec = recovery_scores(learned_dirs, synth.dictionary)
     rows, cols, matching = rec.rows, rec.cols, rec.matching
@@ -349,6 +353,7 @@ def run_one(args: argparse.Namespace, seed: int) -> BenchmarkMetrics:
         direction_recovery_precision=rec.precision,
         direction_recovery_recall=rec.recall,
         direction_recovery_f1=rec.f1,
+        direction_recovery_jaccard=rec.jaccard,
         probing_precision=precision,
         probing_recall=recall,
         probing_f1=f1,
@@ -372,6 +377,7 @@ def _summarize(metrics: list[BenchmarkMetrics]) -> dict[str, Any]:
         "direction_recovery_precision",
         "direction_recovery_recall",
         "direction_recovery_f1",
+        "direction_recovery_jaccard",
         "probing_precision",
         "probing_recall",
         "probing_f1",
@@ -405,7 +411,7 @@ def _benchmark_notes() -> dict[str, Any]:
                 "GT-MCC-style absolute-cosine feature recovery (Hungarian matched pairs)",
                 "GT-F1-style matched-latent firing precision/recall/F1",
                 "feature uniqueness (argmax-collision: #distinct best matches / n_learned)",
-                "direction recovery precision/recall/F1 (quality-aware matched cosine mass)",
+                "direction recovery precision/recall/F1/Jaccard (quality-aware matched cosine mass)",
             ],
             "saebench_compatible_synthetic": [
                 "sparse-probing analogue on matched ground-truth features",
