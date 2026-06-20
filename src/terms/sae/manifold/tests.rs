@@ -1756,6 +1756,112 @@ pub(crate) fn decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3() {
     );
 }
 
+/// #1026 keep-best multi-start: the full-dictionary co-collapse reseed is a
+/// bounded multi-start over distinct residual subspaces, but successive reseeds
+/// can land in STRICTLY WORSE basins (real OLMo K=4: the seed explains EV 0.127
+/// while later reseeds fall to −1.0). A multi-start must return the BEST basin it
+/// visited, never the last. The guard retains the highest-EV state seen across
+/// the reseeds and restores it once the reseed budget is spent, so the final
+/// dictionary EV is no worse than the best intermediate attempt.
+#[test]
+pub(crate) fn co_collapse_multistart_restores_best_basin_not_last_reseed() {
+    // Same co-collapsed K=3 periodic dictionary as
+    // `decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3`, driven
+    // through the WHOLE reseed budget so the budget-exhaustion restore fires.
+    let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];
+    let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45], [0.10]];
+    let coords2 = array![[0.25], [0.40], [0.75], [0.05], [0.60], [0.85]];
+    let (phi0, jet0) = periodic_basis(&coords0);
+    let (phi1, jet1) = periodic_basis(&coords1);
+    let (phi2, jet2) = periodic_basis(&coords2);
+    let make_atom = |name: &str, phi: Array2<f64>, jet: Array3<f64>, scale: f64| {
+        SaeManifoldAtom::new(
+            name,
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            Array2::<f64>::from_elem((3, 3), scale),
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator))
+    };
+    let atom0 = make_atom("periodic0", phi0, jet0, 1.0e-5);
+    let atom1 = make_atom("periodic1", phi1, jet1, 1.2e-5);
+    let atom2 = make_atom("periodic2", phi2, jet2, 0.8e-5);
+    let logits = array![
+        [0.7, -0.2, 0.3],
+        [0.1, 0.4, -0.1],
+        [-0.3, 0.5, 0.2],
+        [0.6, -0.1, 0.4],
+        [0.2, 0.3, -0.2],
+        [0.4, 0.1, 0.5]
+    ];
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords0, coords1, coords2],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ],
+        AssignmentMode::softmax(0.8),
+    )
+    .unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom0, atom1, atom2], assignment).unwrap();
+    let target = array![
+        [0.40, -0.10, 0.05],
+        [-0.20, 0.35, -0.15],
+        [0.10, 0.05, 0.30],
+        [0.25, -0.30, -0.05],
+        [-0.15, 0.20, 0.18],
+        [0.30, 0.12, -0.22]
+    ];
+    let rho = SaeManifoldRho::new(
+        (-0.3_f64).exp().ln(),
+        0.7_f64.ln(),
+        vec![
+            array![0.9_f64.ln()],
+            array![1.0_f64.ln()],
+            array![1.1_f64.ln()],
+        ],
+    );
+
+    // Drive the guard once per "outer iteration" through the whole multi-start
+    // budget plus the budget-exhaustion call, recording the dictionary EV the
+    // guard observes at the start of each call (the candidate basin it may bank).
+    // The guard reseeds in place, so each call's pre-reseed EV is a distinct
+    // multi-start attempt; the best of these is what the final state must match.
+    let mut best_seen = f64::NEG_INFINITY;
+    for iteration in 0..=SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET {
+        let ev_at_entry = term
+            .dictionary_reconstruction_ev(target.view(), &rho)
+            .expect("EV evaluates");
+        if ev_at_entry < SAE_DICTIONARY_COLLAPSE_EV_FLOOR {
+            best_seen = best_seen.max(ev_at_entry);
+        }
+        term.enforce_decoder_norm_guard(target.view(), iteration, &rho)
+            .expect("co-collapse guard must recover, not error");
+    }
+
+    // After the budget is spent the guard has restored the best basin it banked,
+    // so the final dictionary EV is at least the best attempt seen — never the
+    // (possibly catastrophic) last reseed.
+    let ev_final = term
+        .dictionary_reconstruction_ev(target.view(), &rho)
+        .expect("EV evaluates");
+    assert!(
+        best_seen.is_finite(),
+        "test precondition: at least one co-collapsed attempt must be observed"
+    );
+    assert!(
+        ev_final >= best_seen - 1e-9,
+        "multi-start must return its BEST basin, not the last reseed: \
+         final EV={ev_final:.6} < best seen={best_seen:.6}"
+    );
+}
+
 /// #976 distinct-basin lever: the co-collapse multi-start reseed must read a
 /// DIFFERENT principal subspace on each retry. The PC-pair rotation offset (=
 /// the 0-based retry index) shifts which residual PC pair each periodic atom
