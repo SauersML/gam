@@ -152,10 +152,8 @@ fn duchon_smooth_is_rotation_invariant() {
             let (dx, dz) = (x - cx, z - cz);
             (cx + c * dx - sn * dz, cz + sn * dx + c * dz)
         };
-        let (rx, rz): (Vec<f64>, Vec<f64>) =
-            s.x.iter().zip(&s.z).map(|(&x, &z)| rot(x, z)).unzip();
-        let (rgx, rgz): (Vec<f64>, Vec<f64>) =
-            gx.iter().zip(&gz).map(|(&x, &z)| rot(x, z)).unzip();
+        let (rx, rz): (Vec<f64>, Vec<f64>) = s.x.iter().zip(&s.z).map(|(&x, &z)| rot(x, z)).unzip();
+        let (rgx, rgz): (Vec<f64>, Vec<f64>) = gx.iter().zip(&gz).map(|(&x, &z)| rot(x, z)).unzip();
         let (edf_r, pred_r) = fit_and_predict(&rx, &rz, &s.y, &rgx, &rgz);
         let dp = pred0
             .iter()
@@ -179,7 +177,10 @@ fn duchon_smooth_is_rotation_invariant() {
          should be exactly invariant.",
         100.0 * worst_pred / sr
     );
-    assert!(worst_edf < 1e-3, "Duchon ds EDF not rotation-invariant: {worst_edf:.3e}");
+    assert!(
+        worst_edf < 1e-3,
+        "Duchon ds EDF not rotation-invariant: {worst_edf:.3e}"
+    );
 }
 
 #[test]
@@ -226,5 +227,8 @@ fn duchon_smooth_is_permutation_invariant() {
          (center-selection tie-break / RRQR pivot / summation order).",
         100.0 * dp / sr
     );
-    assert!(de < 1e-6, "Duchon ds EDF not permutation-invariant: {de:.3e}");
+    assert!(
+        de < 1e-6,
+        "Duchon ds EDF not permutation-invariant: {de:.3e}"
+    );
 }

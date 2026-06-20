@@ -19,9 +19,9 @@
 //!     penalty is not mistakenly "fixed" as a leak.
 
 use gam::basis::{
-    build_duchon_basiswithworkspace, build_spherical_spline_basis, BasisWorkspace, CenterStrategy,
-    DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, OneDimensionalBoundary,
-    SpatialIdentifiability, SphereMethod, SphericalSplineBasisSpec,
+    BasisWorkspace, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder,
+    DuchonOperatorPenaltySpec, OneDimensionalBoundary, SpatialIdentifiability, SphereMethod,
+    SphericalSplineBasisSpec, build_duchon_basiswithworkspace, build_spherical_spline_basis,
 };
 use ndarray::Array2;
 
@@ -37,8 +37,7 @@ fn cyclic_duchon_penalty_is_frobenius_normalized() {
     // One periodic covariate on [0, 1) with user-provided centers, mirroring the
     // periodic-Duchon construction the build path already exercises.
     let x = Array2::from_shape_vec((5, 1), vec![0.0, 0.2, 0.5, 0.8, 1.0]).unwrap();
-    let centers =
-        Array2::from_shape_vec((6, 1), (0..6).map(|i| i as f64 / 6.0).collect()).unwrap();
+    let centers = Array2::from_shape_vec((6, 1), (0..6).map(|i| i as f64 / 6.0).collect()).unwrap();
     let spec = DuchonBasisSpec {
         radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(centers),
@@ -49,7 +48,10 @@ fn cyclic_duchon_penalty_is_frobenius_normalized() {
         identifiability: SpatialIdentifiability::None,
         aniso_log_scales: None,
         operator_penalties: DuchonOperatorPenaltySpec::default(),
-        boundary: OneDimensionalBoundary::Cyclic { start: 0.0, end: 1.0 },
+        boundary: OneDimensionalBoundary::Cyclic {
+            start: 0.0,
+            end: 1.0,
+        },
     };
     let mut workspace = BasisWorkspace::default();
     let built = build_duchon_basiswithworkspace(x.view(), &spec, &mut workspace)
@@ -93,7 +95,11 @@ fn harmonic_sphere_penalty_is_intentionally_not_frobenius_normalized() {
         identifiability: Default::default(),
     };
     let built = build_spherical_spline_basis(data.view(), &spec).expect("sphere harmonic basis");
-    assert_eq!(built.penalties.len(), 1, "harmonic sphere ships one penalty");
+    assert_eq!(
+        built.penalties.len(),
+        1,
+        "harmonic sphere ships one penalty"
+    );
     let n = frob(&built.penalties[0]);
     // The largest physical eigenvalue at L=3, m=2 is [3*4]^2 = 144, so ‖S‖_F is
     // on the order of 100+. The point is that it is intentionally NOT ~1: the

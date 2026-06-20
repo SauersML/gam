@@ -74,8 +74,6 @@ mod bug_hunt_double_penalty_inflates_edf_instead_of_shrinking;
 mod bug_hunt_double_penalty_shrinks_irrelevant_covariate_1266;
 #[path = "regressions/bug_hunt_estimate_external_family_and_links.rs"]
 mod bug_hunt_estimate_external_family_and_links;
-#[path = "regressions/bug_hunt_summary_penalty_cursor_skips_unpenalized_re.rs"]
-mod bug_hunt_summary_penalty_cursor_skips_unpenalized_re;
 #[path = "regressions/bug_hunt_evidence_gaussian_reml_topology.rs"]
 mod bug_hunt_evidence_gaussian_reml_topology;
 #[path = "regressions/bug_hunt_factor_smooth_degree_shrink_predict_replay.rs"]
@@ -230,6 +228,8 @@ mod bug_hunt_sphere_pole_not_single_valued;
 mod bug_hunt_standard_normal_quantile_upper_tail_precision;
 #[path = "regressions/bug_hunt_subsample_k_cap_and_audit.rs"]
 mod bug_hunt_subsample_k_cap_and_audit;
+#[path = "regressions/bug_hunt_summary_penalty_cursor_skips_unpenalized_re.rs"]
+mod bug_hunt_summary_penalty_cursor_skips_unpenalized_re;
 #[path = "regressions/bug_hunt_survival_location_scale_exact_newton_workspace_state_reuse.rs"]
 mod bug_hunt_survival_location_scale_exact_newton_workspace_state_reuse;
 #[path = "regressions/bug_hunt_survival_location_scale_smooth_block_gradient_mismatch.rs"]

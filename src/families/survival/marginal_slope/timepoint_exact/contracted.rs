@@ -175,9 +175,7 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<Vec<Array2<f64>>, String> {
-        self.ensure_scalar_flex_exact_score_geometry(
-            "row_flex_primary_third_basis_contractions",
-        )?;
+        self.ensure_scalar_flex_exact_score_geometry("row_flex_primary_third_basis_contractions")?;
         let primary = flex_primary_slices(self);
         let p = primary.total;
 
@@ -557,17 +555,12 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         dir_u: &Array1<f64>,
     ) -> Result<Vec<Array2<f64>>, String> {
-        self.ensure_scalar_flex_exact_score_geometry(
-            "row_flex_primary_fourth_basis_contractions",
-        )?;
+        self.ensure_scalar_flex_exact_score_geometry("row_flex_primary_fourth_basis_contractions")?;
         let primary = flex_primary_slices(self);
         let p = primary.total;
         if dir_u.len() != p {
             return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
-                reason: format!(
-                    "survival fourth basis: dir_u length {} != {p}",
-                    dir_u.len(),
-                ),
+                reason: format!("survival fourth basis: dir_u length {} != {p}", dir_u.len(),),
             }
             .into());
         }
@@ -609,10 +602,32 @@ impl SurvivalMarginalSlopeFamily {
         let exit_cached = self.build_cached_partition(&primary, a1, g, beta_h, beta_w)?;
 
         let entry_base = self.compute_survival_timepoint_exact_from_cached(
-            row, &primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, o_infl, false, &entry_cached,
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            d0,
+            beta_h,
+            beta_w,
+            o_infl,
+            false,
+            &entry_cached,
         )?;
         let exit_base = self.compute_survival_timepoint_exact_from_cached(
-            row, &primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, o_infl, true, &exit_cached,
+            row,
+            &primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            d1,
+            beta_h,
+            beta_w,
+            o_infl,
+            true,
+            &exit_cached,
         )?;
 
         if !exit_base.chi.is_finite() || exit_base.chi <= 0.0 {
@@ -627,10 +642,30 @@ impl SurvivalMarginalSlopeFamily {
 
         // dir_u-only extensions: shared across every second-direction basis e_j.
         let entry_ext_u = self.compute_survival_timepoint_directional_exact_from_cached(
-            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, &entry_cached, dir_u, false,
+            row,
+            &primary,
+            q0,
+            primary.q0,
+            a0,
+            g,
+            beta_h,
+            beta_w,
+            &entry_cached,
+            dir_u,
+            false,
         )?;
         let exit_ext_u = self.compute_survival_timepoint_directional_exact_from_cached(
-            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, &exit_cached, dir_u, true,
+            row,
+            &primary,
+            q1,
+            primary.q1,
+            a1,
+            g,
+            beta_h,
+            beta_w,
+            &exit_cached,
+            dir_u,
+            true,
         )?;
 
         let entry_b = block10_pack_base(&entry_base);
@@ -644,16 +679,56 @@ impl SurvivalMarginalSlopeFamily {
             let mut dir_v = Array1::<f64>::zeros(p);
             dir_v[j] = 1.0;
             let entry_ext_v = self.compute_survival_timepoint_directional_exact_from_cached(
-                row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, &entry_cached, &dir_v, false,
+                row,
+                &primary,
+                q0,
+                primary.q0,
+                a0,
+                g,
+                beta_h,
+                beta_w,
+                &entry_cached,
+                &dir_v,
+                false,
             )?;
             let exit_ext_v = self.compute_survival_timepoint_directional_exact_from_cached(
-                row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, &exit_cached, &dir_v, true,
+                row,
+                &primary,
+                q1,
+                primary.q1,
+                a1,
+                g,
+                beta_h,
+                beta_w,
+                &exit_cached,
+                &dir_v,
+                true,
             )?;
             let entry_bi = self.compute_survival_timepoint_bidirectional_exact_from_cached(
-                row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, &entry_cached, dir_u, &dir_v,
+                row,
+                &primary,
+                q0,
+                primary.q0,
+                a0,
+                g,
+                beta_h,
+                beta_w,
+                &entry_cached,
+                dir_u,
+                &dir_v,
             )?;
             let exit_bi = self.compute_survival_timepoint_bidirectional_exact_from_cached(
-                row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, &exit_cached, dir_u, &dir_v,
+                row,
+                &primary,
+                q1,
+                primary.q1,
+                a1,
+                g,
+                beta_h,
+                beta_w,
+                &exit_cached,
+                dir_u,
+                &dir_v,
             )?;
             let entry_d2 = block10_pack_dir(&entry_ext_v);
             let exit_d2 = block10_pack_dir(&exit_ext_v);

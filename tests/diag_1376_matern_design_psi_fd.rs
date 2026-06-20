@@ -10,8 +10,8 @@
 //! NOT a gate — run with --nocapture.
 
 use gam::terms::basis::{
-    build_matern_basis, build_matern_basis_log_kappa_derivatives, CenterStrategy, MaternBasisSpec,
-    MaternNu,
+    CenterStrategy, MaternBasisSpec, MaternNu, build_matern_basis,
+    build_matern_basis_log_kappa_derivatives,
 };
 use ndarray::Array2;
 
@@ -51,7 +51,9 @@ fn diag_matern_design_log_kappa_derivative_vs_fd() {
         let bundle = build_matern_basis_log_kappa_derivatives(data.view(), &spec)
             .expect("analytic matern design derivative builds");
         let analytic = match bundle.implicit_operator.as_ref() {
-            Some(op) => op.materialize_first(0).expect("materialize design derivative"),
+            Some(op) => op
+                .materialize_first(0)
+                .expect("materialize design derivative"),
             None => bundle.first.design_derivative.clone(),
         };
 

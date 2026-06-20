@@ -484,7 +484,8 @@ impl CostStallGuard {
         if !self.best_value.is_finite() {
             return;
         }
-        let converged = self.best_grad_norm.is_finite() && self.best_grad_norm <= self.grad_threshold;
+        let converged =
+            self.best_grad_norm.is_finite() && self.best_grad_norm <= self.grad_threshold;
         if let Ok(mut slot) = self.exit.lock() {
             *slot = Some(CostStallExit {
                 rho: best_rho,

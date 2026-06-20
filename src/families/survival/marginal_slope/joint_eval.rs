@@ -1631,47 +1631,51 @@ impl SurvivalMarginalSlopeFamily {
         let zero_init = || vec![Array2::<f64>::zeros((p_total, p_total)); p_total];
         let result = (0..self.n)
             .into_par_iter()
-            .try_fold(zero_init, |mut accs, row| -> Result<Vec<Array2<f64>>, String> {
-                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                let h_pi = self
-                    .compute_row_flex_primary_gradient_hessian_exact(
-                        row,
-                        block_states,
-                        &q_geom,
-                        &primary,
-                    )?
-                    .2;
-                let basis = self.row_flex_primary_third_basis_contractions(row, block_states)?;
-                for a in 0..p_total {
-                    let mut e_a = Array1::<f64>::zeros(p_total);
-                    e_a[a] = 1.0;
-                    let u_a = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
-                        row,
-                        block_states,
-                        &slices,
-                        &q_geom,
-                        &e_a,
-                    )?;
-                    let mut t_ua = Array2::<f64>::zeros((p_prim, p_prim));
-                    for j in 0..p_prim {
-                        let c = u_a[j];
-                        if c != 0.0 {
-                            t_ua.scaled_add(c, &basis[j]);
+            .try_fold(
+                zero_init,
+                |mut accs, row| -> Result<Vec<Array2<f64>>, String> {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let h_pi = self
+                        .compute_row_flex_primary_gradient_hessian_exact(
+                            row,
+                            block_states,
+                            &q_geom,
+                            &primary,
+                        )?
+                        .2;
+                    let basis =
+                        self.row_flex_primary_third_basis_contractions(row, block_states)?;
+                    for a in 0..p_total {
+                        let mut e_a = Array1::<f64>::zeros(p_total);
+                        e_a[a] = 1.0;
+                        let u_a = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                            row,
+                            block_states,
+                            &slices,
+                            &q_geom,
+                            &e_a,
+                        )?;
+                        let mut t_ua = Array2::<f64>::zeros((p_prim, p_prim));
+                        for j in 0..p_prim {
+                            let c = u_a[j];
+                            if c != 0.0 {
+                                t_ua.scaled_add(c, &basis[j]);
+                            }
                         }
+                        let h_ua = h_pi.dot(&u_a);
+                        self.accumulate_directional_joint_hessian_row(
+                            row,
+                            &slices,
+                            &q_geom,
+                            &identity_blocks,
+                            h_ua.view(),
+                            t_ua.view(),
+                            &mut accs[a],
+                        )?;
                     }
-                    let h_ua = h_pi.dot(&u_a);
-                    self.accumulate_directional_joint_hessian_row(
-                        row,
-                        &slices,
-                        &q_geom,
-                        &identity_blocks,
-                        h_ua.view(),
-                        t_ua.view(),
-                        &mut accs[a],
-                    )?;
-                }
-                Ok(accs)
-            })
+                    Ok(accs)
+                },
+            )
             .try_reduce(zero_init, |mut a, b| -> Result<_, String> {
                 for (dst, src) in a.iter_mut().zip(b.iter()) {
                     *dst += src;
@@ -1701,48 +1705,52 @@ impl SurvivalMarginalSlopeFamily {
         let zero_init = || vec![Array2::<f64>::zeros((p_total, p_total)); p_total];
         let result = (0..self.n)
             .into_par_iter()
-            .try_fold(zero_init, |mut accs, row| -> Result<Vec<Array2<f64>>, String> {
-                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
-                let ud = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
-                    row,
-                    block_states,
-                    &slices,
-                    &q_geom,
-                    d_beta_u,
-                )?;
-                let t_d = self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
-                let basis =
-                    self.row_flex_primary_fourth_basis_contractions(row, block_states, &ud)?;
-                for a in 0..p_total {
-                    let mut e_a = Array1::<f64>::zeros(p_total);
-                    e_a[a] = 1.0;
-                    let u_a = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+            .try_fold(
+                zero_init,
+                |mut accs, row| -> Result<Vec<Array2<f64>>, String> {
+                    let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                    let ud = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
                         row,
                         block_states,
                         &slices,
                         &q_geom,
-                        &e_a,
+                        d_beta_u,
                     )?;
-                    let mut q_de = Array2::<f64>::zeros((p_prim, p_prim));
-                    for j in 0..p_prim {
-                        let c = u_a[j];
-                        if c != 0.0 {
-                            q_de.scaled_add(c, &basis[j]);
+                    let t_d =
+                        self.row_flex_primary_third_contracted_exact(row, block_states, &ud)?;
+                    let basis =
+                        self.row_flex_primary_fourth_basis_contractions(row, block_states, &ud)?;
+                    for a in 0..p_total {
+                        let mut e_a = Array1::<f64>::zeros(p_total);
+                        e_a[a] = 1.0;
+                        let u_a = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                            row,
+                            block_states,
+                            &slices,
+                            &q_geom,
+                            &e_a,
+                        )?;
+                        let mut q_de = Array2::<f64>::zeros((p_prim, p_prim));
+                        for j in 0..p_prim {
+                            let c = u_a[j];
+                            if c != 0.0 {
+                                q_de.scaled_add(c, &basis[j]);
+                            }
                         }
+                        let gamma = t_d.dot(&u_a);
+                        self.accumulate_directional_joint_hessian_row(
+                            row,
+                            &slices,
+                            &q_geom,
+                            &identity_blocks,
+                            gamma.view(),
+                            q_de.view(),
+                            &mut accs[a],
+                        )?;
                     }
-                    let gamma = t_d.dot(&u_a);
-                    self.accumulate_directional_joint_hessian_row(
-                        row,
-                        &slices,
-                        &q_geom,
-                        &identity_blocks,
-                        gamma.view(),
-                        q_de.view(),
-                        &mut accs[a],
-                    )?;
-                }
-                Ok(accs)
-            })
+                    Ok(accs)
+                },
+            )
             .try_reduce(zero_init, |mut a, b| -> Result<_, String> {
                 for (dst, src) in a.iter_mut().zip(b.iter()) {
                     *dst += src;

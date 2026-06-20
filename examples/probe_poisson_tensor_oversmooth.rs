@@ -81,13 +81,7 @@ fn encode_columns(headers: &[&str], columns: &[&[f64]]) -> gam::data::EncodedDat
 }
 
 /// Fit `y ~ te(x, z, k=[6,6])` for the given family; return (edf, eta_rmse_vs_truth).
-fn fit_te(
-    family: &str,
-    x: &[f64],
-    z: &[f64],
-    y: &[f64],
-    eta_true: &[f64],
-) -> (f64, f64, Vec<f64>) {
+fn fit_te(family: &str, x: &[f64], z: &[f64], y: &[f64], eta_true: &[f64]) -> (f64, f64, Vec<f64>) {
     let data = encode_columns(&["x", "z", "y"], &[x, z, y]);
     let col = data.column_map();
     let xi = col["x"];
@@ -153,7 +147,9 @@ fn main() {
     let mean_inv_sqrt_mu: f64 =
         eta_true.iter().map(|&e| 1.0 / e.exp().sqrt()).sum::<f64>() / n as f64;
     println!("n={n}  matched Gaussian eta-noise sd ~ {mean_inv_sqrt_mu:.3}");
-    println!("seed | GAUSS edf  rmse | POIS edf  rmse   (truth needs a few df; fixture mgcv edf=10.83, gam=6.90)");
+    println!(
+        "seed | GAUSS edf  rmse | POIS edf  rmse   (truth needs a few df; fixture mgcv edf=10.83, gam=6.90)"
+    );
     let (mut ge_s, mut gr_s, mut pe_s, mut pr_s) = (0.0, 0.0, 0.0, 0.0);
     let seeds = 8u64;
     for seed in 1u64..=seeds {
@@ -185,6 +181,10 @@ fn main() {
         pe_s / f,
         pr_s / f
     );
-    println!("(If POIS edf << GAUSS edf and POIS rmse >> GAUSS rmse on the SAME surface => family-path over-smoothing.)");
-    println!("([..] = selected per-margin lambdas; larger lambda = more smoothing. Poisson lambda >> Gaussian lambda confirms family over-selection.)");
+    println!(
+        "(If POIS edf << GAUSS edf and POIS rmse >> GAUSS rmse on the SAME surface => family-path over-smoothing.)"
+    );
+    println!(
+        "([..] = selected per-margin lambdas; larger lambda = more smoothing. Poisson lambda >> Gaussian lambda confirms family over-selection.)"
+    );
 }

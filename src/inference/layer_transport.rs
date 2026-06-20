@@ -1609,11 +1609,18 @@ mod invert_tests {
         // h′ = 1 + 0.25·cos(2πt) ∈ [0.75, 1.25] never approaches zero.
         let n = 64;
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
-        let to: Array1<f64> =
-            from.mapv(|t| t + 0.25 * (TAU * t).sin() / TAU);
-        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
-            .expect("fit");
-        assert!(ft.topology_preserved, "monotone warp should preserve topology");
+        let to: Array1<f64> = from.mapv(|t| t + 0.25 * (TAU * t).sin() / TAU);
+        let ft = fit_transport_map(
+            from.view(),
+            to.view(),
+            interval(0.0, 1.0),
+            interval(0.0, 1.0),
+        )
+        .expect("fit");
+        assert!(
+            ft.topology_preserved,
+            "monotone warp should preserve topology"
+        );
 
         let probe = Array1::from_iter((1..10).map(|i| i as f64 / 10.0));
         // eval ∘ invert and invert ∘ eval both return identity.
@@ -1640,14 +1647,24 @@ mod invert_tests {
         let n = 64;
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
         let to: Array1<f64> = from.mapv(|t| 1.0 - 0.5 * t - 0.5 * t * t);
-        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
-            .expect("fit");
+        let ft = fit_transport_map(
+            from.view(),
+            to.view(),
+            interval(0.0, 1.0),
+            interval(0.0, 1.0),
+        )
+        .expect("fit");
         assert!(ft.topology_preserved);
         let probe = Array1::from_iter((1..10).map(|i| i as f64 / 10.0));
         let fwd = ft.eval(probe.view()).expect("eval");
         let back = ft.invert(fwd.view()).expect("invert");
         for i in 0..probe.len() {
-            assert!((back[i] - probe[i]).abs() < 1e-6, "t={} back={}", probe[i], back[i]);
+            assert!(
+                (back[i] - probe[i]).abs() < 1e-6,
+                "t={} back={}",
+                probe[i],
+                back[i]
+            );
         }
     }
 
@@ -1657,8 +1674,13 @@ mod invert_tests {
         let n = 128;
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| TAU * i as f64 / n as f64));
         let to: Array1<f64> = from.mapv(|t| wrap_tau(t + 0.3 + 0.2 * t.sin()));
-        let ft = fit_transport_map(from.view(), to.view(), ChartTopology::Circle, ChartTopology::Circle)
-            .expect("fit");
+        let ft = fit_transport_map(
+            from.view(),
+            to.view(),
+            ChartTopology::Circle,
+            ChartTopology::Circle,
+        )
+        .expect("fit");
         assert!(ft.topology_preserved, "degree {:?}", ft.degree);
 
         let probe = Array1::from_iter((0..7).map(|i| TAU * (i as f64 + 0.5) / 7.0));
@@ -1677,8 +1699,13 @@ mod invert_tests {
         let n = 32;
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
         let to: Array1<f64> = from.mapv(|t| 0.5 * t);
-        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
-            .expect("fit");
+        let ft = fit_transport_map(
+            from.view(),
+            to.view(),
+            interval(0.0, 1.0),
+            interval(0.0, 1.0),
+        )
+        .expect("fit");
         assert!(ft.invert(Array1::from_elem(1, 0.9).view()).is_err());
     }
 
@@ -1788,8 +1815,13 @@ mod invert_tests {
         let n = 64;
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
         let to: Array1<f64> = from.mapv(|t| 0.5 * t);
-        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
-            .expect("fit");
+        let ft = fit_transport_map(
+            from.view(),
+            to.view(),
+            interval(0.0, 1.0),
+            interval(0.0, 1.0),
+        )
+        .expect("fit");
         for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             assert!(
                 ft.invert(Array1::from_elem(1, bad).view()).is_err(),
@@ -1807,8 +1839,13 @@ mod invert_tests {
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
         let scale = 1.0e-8;
         let to: Array1<f64> = from.mapv(|t| scale * t);
-        let ft = fit_transport_map(from.view(), to.view(), interval(0.0, 1.0), interval(0.0, 1.0))
-            .expect("fit");
+        let ft = fit_transport_map(
+            from.view(),
+            to.view(),
+            interval(0.0, 1.0),
+            interval(0.0, 1.0),
+        )
+        .expect("fit");
         let outside = 1.05e-8;
         assert!(
             ft.invert(Array1::from_elem(1, outside).view()).is_err(),
@@ -1816,7 +1853,9 @@ mod invert_tests {
         );
         // A target inside the image still round-trips.
         let inside = 0.5e-8;
-        let t = ft.invert(Array1::from_elem(1, inside).view()).expect("invert inside");
+        let t = ft
+            .invert(Array1::from_elem(1, inside).view())
+            .expect("invert inside");
         let re = ft.eval(t.view()).expect("eval");
         assert!((re[0] - inside).abs() < 1e-3 * scale);
     }
@@ -1828,8 +1867,13 @@ mod invert_tests {
         let n = 128;
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| TAU * i as f64 / n as f64));
         let to: Array1<f64> = from.mapv(|t| wrap_tau(-t + 0.4 + 0.15 * t.sin()));
-        let ft = fit_transport_map(from.view(), to.view(), ChartTopology::Circle, ChartTopology::Circle)
-            .expect("fit");
+        let ft = fit_transport_map(
+            from.view(),
+            to.view(),
+            ChartTopology::Circle,
+            ChartTopology::Circle,
+        )
+        .expect("fit");
         assert_eq!(ft.degree, Some(-1), "expected a degree −1 cover");
         assert!(ft.topology_preserved, "degree {:?}", ft.degree);
         let probe = Array1::from_iter((0..7).map(|i| TAU * (i as f64 + 0.5) / 7.0));
@@ -1847,11 +1891,18 @@ mod invert_tests {
         let n = 128;
         let from: Array1<f64> = Array1::from_iter((0..n).map(|i| TAU * i as f64 / n as f64));
         let to: Array1<f64> = from.mapv(|t| wrap_tau(t + 0.3 + 0.2 * t.sin()));
-        let ft = fit_transport_map(from.view(), to.view(), ChartTopology::Circle, ChartTopology::Circle)
-            .expect("fit");
+        let ft = fit_transport_map(
+            from.view(),
+            to.view(),
+            ChartTopology::Circle,
+            ChartTopology::Circle,
+        )
+        .expect("fit");
         assert!(ft.topology_preserved);
         for seam in [1e-9, TAU - 1e-9, 0.0] {
-            let t = ft.invert(Array1::from_elem(1, seam).view()).expect("invert seam");
+            let t = ft
+                .invert(Array1::from_elem(1, seam).view())
+                .expect("invert seam");
             let re = ft.eval(t.view()).expect("eval");
             let d = wrap_pi(re[0] - wrap_tau(seam)).abs();
             assert!(d < 1e-6, "seam={seam} re={} d={d}", re[0]);
@@ -1861,13 +1912,19 @@ mod invert_tests {
         let m = 64;
         let ifrom: Array1<f64> = Array1::from_iter((0..m).map(|i| i as f64 / (m as f64 - 1.0)));
         let ito: Array1<f64> = ifrom.mapv(|t| t + 0.25 * (TAU * t).sin() / TAU);
-        let ift =
-            fit_transport_map(ifrom.view(), ito.view(), interval(0.0, 1.0), interval(0.0, 1.0))
-                .expect("fit");
+        let ift = fit_transport_map(
+            ifrom.view(),
+            ito.view(),
+            interval(0.0, 1.0),
+            interval(0.0, 1.0),
+        )
+        .expect("fit");
         let raw_lo = ift.raw_at(0.0).expect("raw lo");
         let raw_hi = ift.raw_at(1.0).expect("raw hi");
         for &edge in &[raw_lo, raw_hi] {
-            let t = ift.invert(Array1::from_elem(1, edge).view()).expect("invert endpoint");
+            let t = ift
+                .invert(Array1::from_elem(1, edge).view())
+                .expect("invert endpoint");
             assert!(t[0] >= -1e-9 && t[0] <= 1.0 + 1e-9, "endpoint t={}", t[0]);
             let re = ift.eval(t.view()).expect("eval");
             assert!((re[0] - edge).abs() < 1e-6, "edge={edge} re={}", re[0]);

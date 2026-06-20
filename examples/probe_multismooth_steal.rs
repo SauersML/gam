@@ -112,7 +112,9 @@ fn main() {
 
     // Fixed test grid in x (uniform on [0,1]); z on test set is irrelevant to the
     // truth, so set z_test = x_test (the strongest case for "z is a valid proxy").
-    let x_test: Vec<f64> = (0..n_test).map(|i| (i as f64 + 0.5) / n_test as f64).collect();
+    let x_test: Vec<f64> = (0..n_test)
+        .map(|i| (i as f64 + 0.5) / n_test as f64)
+        .collect();
     let f_test: Vec<f64> = x_test.iter().map(|&x| truth(x)).collect();
 
     for &rho in &[0.0_f64, 0.6, 0.9, 0.98] {
@@ -177,9 +179,7 @@ fn main() {
                 steals += 1;
             }
             let flag = if stole { " <-- STEAL" } else { "" };
-            println!(
-                "{seed:>4} | {ex_edf:8.3} | {ez_edf:8.3} | {edf:9.3} | {test_rmse:9.4}{flag}"
-            );
+            println!("{seed:>4} | {ex_edf:8.3} | {ez_edf:8.3} | {edf:9.3} | {test_rmse:9.4}{flag}");
         }
         let mean_rmse = test_rmses.iter().sum::<f64>() / test_rmses.len() as f64;
         let max_rmse = test_rmses.iter().cloned().fold(0.0_f64, f64::max);
