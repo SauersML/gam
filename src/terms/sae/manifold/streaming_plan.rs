@@ -70,16 +70,31 @@ pub(crate) fn sae_streaming_plan_from_budget(
         .saturating_mul(border_dim)
         .saturating_mul(SAE_BYTES_PER_F64);
     let row_block_dim = k_atoms.saturating_mul(1usize.saturating_add(d_max));
+    // DIRECT (dense) path: the per-row cross block is materialized at the full
+    // `border_dim = Σ_k M_k · p` width, so its footprint is `N · q · border_dim`.
     let row_cross_bytes = n_obs
         .saturating_mul(row_block_dim)
         .saturating_mul(border_dim)
+        .saturating_mul(SAE_BYTES_PER_F64);
+    // #1405/#1406: the MATRIX-FREE path does NOT materialize that dense
+    // `(q × border_dim)` slab — the Kronecker operator stores only the per-row
+    // `kron_jac` (the `q × p` local Jacobian) plus the sparse `kron_a_phi`
+    // support, an `O(N · q · p)` footprint, NOT `O(N · q · K·M·p)`. Predicting
+    // the dense `row_cross_bytes` here is the spurious ~6 TiB working-set the
+    // high-K throughput plan aborted on (#1405). Use the true matrix-free cross
+    // footprint `N · q · p` (p = border_dim / total_basis, since
+    // border_dim = Σ_k M_k · p and total_basis = Σ_k M_k).
+    let p_out = border_dim / total_basis.max(1);
+    let matrix_free_cross_bytes = n_obs
+        .saturating_mul(row_block_dim)
+        .saturating_mul(p_out)
         .saturating_mul(SAE_BYTES_PER_F64);
     let direct_peak_bytes = full_batch_bytes
         .saturating_add(row_cross_bytes)
         .saturating_add(dense_schur_bytes);
     let matrix_free_peak_bytes = chunk_window_bytes
         .min(full_batch_bytes.max(per_row_bytes))
-        .saturating_add(row_cross_bytes)
+        .saturating_add(matrix_free_cross_bytes)
         .saturating_add(
             border_dim
                 .saturating_mul(SAE_BYTES_PER_F64)
