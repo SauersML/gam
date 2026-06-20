@@ -127,9 +127,10 @@ fn main() {
     // Constant-predictor baseline RMSE (truth std around its mean on the test set).
     let tvals: Vec<f64> = (0..nte).map(|i| truth(xte[i], yte[i], zte[i])).collect();
     let mt: f64 = tvals.iter().sum::<f64>() / nte as f64;
-    let const_rmse =
-        (tvals.iter().map(|v| (v - mt) * (v - mt)).sum::<f64>() / nte as f64).sqrt();
-    println!("3-D te(x,y,z,k=[5,5,5]) recovery; n_train={n}, n_test={nte}, const-predictor RMSE={const_rmse:.4}");
+    let const_rmse = (tvals.iter().map(|v| (v - mt) * (v - mt)).sum::<f64>() / nte as f64).sqrt();
+    println!(
+        "3-D te(x,y,z,k=[5,5,5]) recovery; n_train={n}, n_test={nte}, const-predictor RMSE={const_rmse:.4}"
+    );
     println!("seed | te edf  heldRMSE | tp edf  heldRMSE | te/tp ratio");
     let noise = 0.15;
     let seeds = 4u64;
@@ -140,10 +141,26 @@ fn main() {
         let resp: Vec<f64> = (0..n)
             .map(|i| truth(xtr[i], ytr_v[i], ztr[i]) + noise * rng.next_normal())
             .collect();
-        let (tee, ter) =
-            fit_score("r ~ te(x, y, z, k=[5,5,5])", &xtr, &ytr_v, &ztr, &resp, &xte, &yte, &zte);
-        let (tpe, tpr) =
-            fit_score("r ~ s(x, y, z, bs='tp')", &xtr, &ytr_v, &ztr, &resp, &xte, &yte, &zte);
+        let (tee, ter) = fit_score(
+            "r ~ te(x, y, z, k=[5,5,5])",
+            &xtr,
+            &ytr_v,
+            &ztr,
+            &resp,
+            &xte,
+            &yte,
+            &zte,
+        );
+        let (tpe, tpr) = fit_score(
+            "r ~ s(x, y, z, bs='tp')",
+            &xtr,
+            &ytr_v,
+            &ztr,
+            &resp,
+            &xte,
+            &yte,
+            &zte,
+        );
         ter_s += ter;
         tpr_s += tpr;
         println!(
@@ -159,5 +176,7 @@ fn main() {
         ter_s / tpr_s,
         (ter_s / f) / const_rmse
     );
-    println!("(Correct: te heldRMSE << const RMSE, and te/tp ratio ~1 (not 2x+ worse). te/const ~1 => 3-D te collapsed.)");
+    println!(
+        "(Correct: te heldRMSE << const RMSE, and te/tp ratio ~1 (not 2x+ worse). te/const ~1 => 3-D te collapsed.)"
+    );
 }

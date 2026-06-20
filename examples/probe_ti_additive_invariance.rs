@@ -140,7 +140,9 @@ fn main() {
     let (xte, zte) = mk_grid(0.5);
     let n = xtr.len();
     let noise_sd = 0.25;
-    println!("ADDITIVE truth f(x)+g(z) = sin(x)+z^2, NO interaction; n_train={n}, noise_sd={noise_sd}");
+    println!(
+        "ADDITIVE truth f(x)+g(z) = sin(x)+z^2, NO interaction; n_train={n}, noise_sd={noise_sd}"
+    );
     println!("seed |   A: s+s edf  heldRMSE |  B: s+s+ti edf  heldRMSE | B-A RMSE delta");
     let (mut ea_s, mut ra_s, mut eb_s, mut rb_s) = (0.0, 0.0, 0.0, 0.0);
     let seeds = 8u64;
@@ -152,7 +154,11 @@ fn main() {
         let (ea, ra) = fit_and_score("y ~ s(x) + s(z)", &xtr, &ztr, &ytr, &xte, &zte);
         let (eb, rb) = fit_and_score(
             "y ~ s(x) + s(z) + ti(x, z, k=[6,6])",
-            &xtr, &ztr, &ytr, &xte, &zte,
+            &xtr,
+            &ztr,
+            &ytr,
+            &xte,
+            &zte,
         );
         ea_s += ea;
         ra_s += ra;
@@ -173,5 +179,7 @@ fn main() {
         (rb_s - ra_s) / f
     );
     println!("(Correct ti(): B edf ~= A edf and B heldRMSE ~= A heldRMSE. If B edf >> A edf or");
-    println!(" B heldRMSE >> A heldRMSE on ADDITIVE truth => ti() leaks main effects / over-fits.)");
+    println!(
+        " B heldRMSE >> A heldRMSE on ADDITIVE truth => ti() leaks main effects / over-fits.)"
+    );
 }

@@ -30,6 +30,7 @@ use crate::families::survival::lognormal_kernel::FrailtySpec;
 use crate::families::wiggle::initializewiggle_knots_from_seed;
 use crate::matrix::{DesignMatrix, SymmetricMatrix};
 use crate::model_types::UnifiedFitResult;
+use crate::outer_subsample::WeightedOuterRow;
 use crate::pirls::LinearInequalityConstraints;
 use crate::probability::{
     normal_cdf, normal_logcdf, normal_pdf, signed_probit_logcdf_and_mills_ratio,
@@ -42,7 +43,6 @@ use crate::smooth::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
-use crate::outer_subsample::WeightedOuterRow;
 use crate::types::{InverseLink, StandardLink, WigglePenaltyConfig};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};

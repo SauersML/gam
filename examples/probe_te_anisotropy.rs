@@ -142,9 +142,15 @@ fn main() {
     let g = |_x: f64, z: f64| (5.0 * z).sin();
     let g_full = |x: f64, z: f64| 0.15 * x + (5.0 * z).sin();
     let _ = (f, g);
-    println!("te(x,z,k=[10,10]) ANISOTROPY: f wiggly-in-x flat-in-z; g=swap. n_train={n}, noise={noise}");
-    println!("Expect: f => lambda_z >> lambda_x ; g => lambda_x >> lambda_z (lambda ordering tracks the wiggly axis)");
-    println!("seed | f: lam_x     lam_z    edf   rmse | g: lam_x     lam_z    edf   rmse | f wig_axis g wig_axis");
+    println!(
+        "te(x,z,k=[10,10]) ANISOTROPY: f wiggly-in-x flat-in-z; g=swap. n_train={n}, noise={noise}"
+    );
+    println!(
+        "Expect: f => lambda_z >> lambda_x ; g => lambda_x >> lambda_z (lambda ordering tracks the wiggly axis)"
+    );
+    println!(
+        "seed | f: lam_x     lam_z    edf   rmse | g: lam_x     lam_z    edf   rmse | f wig_axis g wig_axis"
+    );
     let seeds = 6u64;
     let (mut okf, mut okg) = (0, 0);
     for seed in 1u64..=seeds {
@@ -158,8 +164,16 @@ fn main() {
         let (fx, fz, fe, fr) = fit_te(&xtr, &ztr, &yf, &xte, &zte, &f_full);
         let (gx, gz, ge, gr) = fit_te(&xtr, &ztr, &yg, &xte, &zte, &g_full);
         // f wiggly in x => expect lam_z > lam_x ; g wiggly in z => expect lam_x > lam_z.
-        let f_axis = if fz > fx { "z-smooth(OK)" } else { "x-smooth(BAD)" };
-        let g_axis = if gx > gz { "x-smooth(OK)" } else { "z-smooth(BAD)" };
+        let f_axis = if fz > fx {
+            "z-smooth(OK)"
+        } else {
+            "x-smooth(BAD)"
+        };
+        let g_axis = if gx > gz {
+            "x-smooth(OK)"
+        } else {
+            "z-smooth(BAD)"
+        };
         if fz > fx {
             okf += 1;
         }
@@ -171,5 +185,7 @@ fn main() {
         );
     }
     println!("SUMMARY: f correct-ordering {okf}/{seeds}, g correct-ordering {okg}/{seeds}");
-    println!("(If the lambda ordering does NOT flip when the wiggly axis flips => te() margin-balance is broken / not anisotropic.)");
+    println!(
+        "(If the lambda ordering does NOT flip when the wiggly axis flips => te() margin-balance is broken / not anisotropic.)"
+    );
 }

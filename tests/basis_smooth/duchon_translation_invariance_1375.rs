@@ -74,8 +74,7 @@ fn duchon_xz_spec() -> DuchonBasisSpec {
 /// own coefficient space), materialized for `data` under the shared spec.
 fn design_and_penalty(data: &Array2<f64>) -> (Array2<f64>, Array2<f64>) {
     let spec = duchon_xz_spec();
-    let result =
-        build_duchon_basis(data.view(), &spec).expect("build_duchon_basis must succeed");
+    let result = build_duchon_basis(data.view(), &spec).expect("build_duchon_basis must succeed");
     let design: Array2<f64> = result
         .design
         .try_to_dense_arc("duchon translation-invariance test")

@@ -118,7 +118,10 @@ fn main() {
         let yg: Vec<f64> = f.iter().map(|&fi| fi + sigma * rng.next_normal()).collect();
 
         // Poisson: eta = a0_pois + f, mu = exp(eta).
-        let yp: Vec<f64> = f.iter().map(|&fi| rng.poisson((a0_pois + fi).exp())).collect();
+        let yp: Vec<f64> = f
+            .iter()
+            .map(|&fi| rng.poisson((a0_pois + fi).exp()))
+            .collect();
 
         // Binomial (bernoulli): eta = a0_binom + f, p = logistic(eta). a0_binom=0
         // keeps p in [0.21,0.79] so both classes always appear (no degenerate

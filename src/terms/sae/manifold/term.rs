@@ -328,7 +328,8 @@ pub struct SaeManifoldTerm {
     /// threshold — the strict no-op case). Refreshed at the same chokepoint as
     /// the smoothness Gram; not part of the persisted term identity (Clone
     /// starts `None`).
-    pub(crate) decoder_repulsion_gate: Option<Array2<f64>>,    /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
+    pub(crate) decoder_repulsion_gate: Option<Array2<f64>>,
+    /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
     /// converges. Each eligible `d = 1` atom's fitted curved image is adjudicated
     /// against its straight (linear special-case) sub-model on the common

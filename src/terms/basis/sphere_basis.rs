@@ -2175,7 +2175,8 @@ pub(crate) fn build_duchon_native_penalty_psi_derivatives(
     let p_order = duchon_p_from_nullspace_order(effective_nullspace_order);
     let s_order = spec.power_as_usize();
     let dim = centers.ncols();
-    let mut z = kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
+    let mut z =
+        kernel_constraint_nullspace(centers, effective_nullspace_order, &mut workspace.cache)?;
     // #1355: fold the frozen data-metric reparam `Z' = Z·V` so the penalty
     // ψ-derivatives project in the SAME rotated radial basis as the forward
     // penalty (`Vᵀ Ω(ψ) V`), staying bit-consistent with the design.

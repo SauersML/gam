@@ -69,9 +69,7 @@ fn build_dataset(n: usize) -> gam::inference::data::EncodedDataset {
         let entry = 40.0 + 5.0 * next_unit(&mut st);
         let followup = 0.5 + 8.0 * next_unit(&mut st);
         let exit = entry + followup;
-        let score = 0.3 * prs
-            + 0.4 * pcs[0]
-            - 0.3 * pcs.get(1).copied().unwrap_or(0.0)
+        let score = 0.3 * prs + 0.4 * pcs[0] - 0.3 * pcs.get(1).copied().unwrap_or(0.0)
             + 0.2 * pcs.get(2).copied().unwrap_or(0.0)
             + 0.15 * sex
             + 0.2 * next_gauss(&mut st);
@@ -109,10 +107,7 @@ fn main() {
     let data = build_dataset(n);
     let pcs: Vec<String> = (0..N_PCS).map(|i| format!("PC{}", i + 1)).collect();
     let duchon_term = format!("duchon({}, centers={}, order=1)", pcs.join(", "), centers);
-    let formula = format!(
-        "Surv(entry_age, exit_age, event) ~ {} + sex",
-        duchon_term
-    );
+    let formula = format!("Surv(entry_age, exit_age, event) ~ {} + sex", duchon_term);
     let config = FitConfig {
         survival_likelihood: "marginal-slope".to_string(),
         z_column: Some("prs_z".to_string()),

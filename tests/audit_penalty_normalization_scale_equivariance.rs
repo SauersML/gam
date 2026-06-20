@@ -19,8 +19,8 @@
 //!      (a B-spline is invariant to an affine reparam of x when knots scale).
 
 use gam::terms::basis::{
-    build_bspline_basis_1d, BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement,
-    BSplineKnotSpec, OneDimensionalBoundary,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,
+    OneDimensionalBoundary, build_bspline_basis_1d,
 };
 use ndarray::Array1;
 
@@ -66,10 +66,7 @@ fn cyclic_spec(penalty_order: usize) -> BSplineBasisSpec {
         },
         double_penalty: false,
         identifiability: BSplineIdentifiability::None,
-        boundary: OneDimensionalBoundary::Cyclic {
-            start: lo,
-            end: hi,
-        },
+        boundary: OneDimensionalBoundary::Cyclic { start: lo, end: hi },
         boundary_conditions: Default::default(),
     }
 }

@@ -126,9 +126,18 @@ fn diag_1271_dump_reml_logdet_internals() {
 
     let mut report = String::new();
     report.push_str("\n==================== #1271 REML LOGDET PROBE ====================\n");
-    report.push_str(&format!("num_penalties={}{}\n", fit.design.penalties.len(), pen_summary));
-    report.push_str(&format!("FINAL edf_total={edf_total:.6} edf_by_block={edf_by_block:?}\n"));
-    report.push_str(&format!("captured {} dense REML evaluations:\n", lines.len()));
+    report.push_str(&format!(
+        "num_penalties={}{}\n",
+        fit.design.penalties.len(),
+        pen_summary
+    ));
+    report.push_str(&format!(
+        "FINAL edf_total={edf_total:.6} edf_by_block={edf_by_block:?}\n"
+    ));
+    report.push_str(&format!(
+        "captured {} dense REML evaluations:\n",
+        lines.len()
+    ));
     for l in &lines {
         report.push_str("  ");
         report.push_str(l);

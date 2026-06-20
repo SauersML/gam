@@ -7496,7 +7496,9 @@ fn jeffreys_first_directional_all_axes_flex_no_wiggle_matches_per_axis() {
         let p = slices.total;
         let batched = family
             .jeffreys_first_directional_all_axes_flex_no_wiggle(&block_states)
-            .unwrap_or_else(|err| panic!("{}: batched first all-axes failed: {err}", fixture.label));
+            .unwrap_or_else(|err| {
+                panic!("{}: batched first all-axes failed: {err}", fixture.label)
+            });
         assert_eq!(batched.len(), p, "{}: axis count", fixture.label);
         for a in 0..p {
             let mut e_a = Array1::<f64>::zeros(p);
@@ -7509,7 +7511,12 @@ fn jeffreys_first_directional_all_axes_flex_no_wiggle_matches_per_axis() {
                 .unwrap_or_else(|err| {
                     panic!("{} axis {a}: per-axis first failed: {err}", fixture.label)
                 });
-            assert_eq!(batched[a].dim(), expected.dim(), "{} axis {a} dim", fixture.label);
+            assert_eq!(
+                batched[a].dim(),
+                expected.dim(),
+                "{} axis {a} dim",
+                fixture.label
+            );
             for (g, e) in batched[a].iter().zip(expected.iter()) {
                 let tol = 1e-9 + 1e-7 * e.abs();
                 assert!(
@@ -7554,7 +7561,12 @@ fn jeffreys_second_directional_all_axes_flex_no_wiggle_matches_per_axis() {
                 .unwrap_or_else(|err| {
                     panic!("{} axis {a}: per-axis second failed: {err}", fixture.label)
                 });
-            assert_eq!(batched[a].dim(), expected.dim(), "{} axis {a} dim", fixture.label);
+            assert_eq!(
+                batched[a].dim(),
+                expected.dim(),
+                "{} axis {a} dim",
+                fixture.label
+            );
             for (g, e) in batched[a].iter().zip(expected.iter()) {
                 let tol = 1e-9 + 1e-7 * e.abs();
                 assert!(

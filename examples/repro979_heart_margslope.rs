@@ -8,9 +8,7 @@
 //! Run:
 //!   RUST_LOG=info cargo run --profile release-dev --example repro979_heart_margslope 2>&1 | tee /tmp/heart979.log
 
-use gam::{
-    FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema,
-};
+use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
 use ndarray::Array2;
 use std::path::Path;
 use std::time::Instant;
@@ -75,7 +73,9 @@ fn main() {
         ..FitConfig::default()
     };
 
-    eprintln!("[979-HEART] starting survival marginal-slope fit n_train={n_train} (HEAD #979 hang repro)");
+    eprintln!(
+        "[979-HEART] starting survival marginal-slope fit n_train={n_train} (HEAD #979 hang repro)"
+    );
     let start = Instant::now();
     let result = fit_from_formula("Surv(time, DEATH_EVENT) ~ sex + age", &ds_train, &cfg);
     let elapsed = start.elapsed().as_secs_f64();

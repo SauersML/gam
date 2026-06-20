@@ -1648,8 +1648,8 @@ mod tests {
                 let f_au = f.h[0][u + 1];
                 let f_av = f.h[0][v + 1];
                 let f_aa = f.h[0][0];
-                let want = -(f_uv + f_au * a_t.g[v] + f_av * a_t.g[u] + f_aa * a_t.g[u] * a_t.g[v])
-                    / f_a;
+                let want =
+                    -(f_uv + f_au * a_t.g[v] + f_av * a_t.g[u] + f_aa * a_t.g[u] * a_t.g[v]) / f_a;
                 assert!(
                     (a_t.h[u][v] - want).abs() < 1e-12,
                     "a_uv[{u}][{v}] {:+.6e} vs IFT {:+.6e}",
@@ -1685,7 +1685,12 @@ mod tests {
         // B‴=(3z−z³)·B.
         let z0 = z_edge.v;
         let b0 = b(z0);
-        let stack = [b0, -z0 * b0, (z0 * z0 - 1.0) * b0, (3.0 * z0 - z0 * z0 * z0) * b0];
+        let stack = [
+            b0,
+            -z0 * b0,
+            (z0 * z0 - 1.0) * b0,
+            (3.0 * z0 - z0 * z0 * z0) * b0,
+        ];
         let flux = moving_limit_boundary_tower(&z_edge, stack);
 
         // FD truth of the integral's derivatives.
@@ -1832,7 +1837,11 @@ mod tests {
             z.h[0][1],
             1.0 / (b0 * b0)
         );
-        assert!(z.h[0][0].abs() < 1e-12, "z_aa must vanish, got {:+.10e}", z.h[0][0]);
+        assert!(
+            z.h[0][0].abs() < 1e-12,
+            "z_aa must vanish, got {:+.10e}",
+            z.h[0][0]
+        );
         let want_zbb = 2.0 * (TAU - a0) / (b0 * b0 * b0);
         assert!(
             (z.h[1][1] - want_zbb).abs() < 1e-12,

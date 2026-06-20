@@ -22,8 +22,8 @@
 //! penalty construction itself.
 
 use gam::terms::basis::{
-    build_bspline_basis_1d, BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement,
-    BSplineKnotSpec, OneDimensionalBoundary,
+    BSplineBasisSpec, BSplineIdentifiability, BSplineKnotPlacement, BSplineKnotSpec,
+    OneDimensionalBoundary, build_bspline_basis_1d,
 };
 use ndarray::Array1;
 
@@ -65,11 +65,7 @@ fn pspline_design_and_penalty_are_scale_equivariant() {
     };
 
     let base = build(1.0);
-    let base_design = base
-        .design
-        .as_dense_ref()
-        .expect("dense design")
-        .to_owned();
+    let base_design = base.design.as_dense_ref().expect("dense design").to_owned();
     assert!(!base.penalties.is_empty(), "expected at least one penalty");
     let base_pen = base.penalties[0].clone();
 
@@ -80,15 +76,27 @@ fn pspline_design_and_penalty_are_scale_equivariant() {
     for &c in &scales[1..] {
         let r = build(c);
         let d = r.design.as_dense_ref().expect("dense design");
-        assert_eq!(d.dim(), base_design.dim(), "design shape changed with scale");
+        assert_eq!(
+            d.dim(),
+            base_design.dim(),
+            "design shape changed with scale"
+        );
 
         // The B-spline columns at the (correspondingly scaled) data points must
         // be identical to those at scale 1 -- a B-spline is invariant to an
         // affine reparam of its abscissa when the knots scale with it.
-        let dd = (d - &base_design).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let dd = (d - &base_design)
+            .iter()
+            .fold(0.0_f64, |m, v| m.max(v.abs()));
         let pen = &r.penalties[0];
-        assert_eq!(pen.dim(), base_pen.dim(), "penalty shape changed with scale");
-        let dp = (pen - &base_pen).iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert_eq!(
+            pen.dim(),
+            base_pen.dim(),
+            "penalty shape changed with scale"
+        );
+        let dp = (pen - &base_pen)
+            .iter()
+            .fold(0.0_f64, |m, v| m.max(v.abs()));
 
         if dd > worst_design {
             worst_design = dd;

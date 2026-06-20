@@ -50,13 +50,7 @@ impl Lcg {
 
 /// Fit `y ~ group(g)` on grouped data; return gam's tau2_hat (sample variance of
 /// predicted per-group deviations).
-fn fit_tau2(
-    n_groups: usize,
-    per_group: usize,
-    tau2_true: f64,
-    sigma: f64,
-    seed: u64,
-) -> f64 {
+fn fit_tau2(n_groups: usize, per_group: usize, tau2_true: f64, sigma: f64, seed: u64) -> f64 {
     let mut rng = Lcg::new(seed);
     let tau = tau2_true.sqrt();
     let mut b = vec![0.0; n_groups];

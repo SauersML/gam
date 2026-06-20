@@ -194,9 +194,9 @@ mod per_term_edf_tests {
                 penalty_block_trace: vec![3.0],
                 edf_total,
                 smoothing_correction: None,
-                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(
-                    eye(p),
-                ),
+                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(
+                    p,
+                )),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,
@@ -266,7 +266,9 @@ mod per_term_edf_tests {
                 penalty_block_trace: traces,
                 edf_total,
                 smoothing_correction: None,
-                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
+                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(
+                    p,
+                )),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,
@@ -403,7 +405,9 @@ mod per_term_edf_tests {
                 penalty_block_trace: traces,
                 edf_total: p as f64,
                 smoothing_correction: None,
-                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(p)),
+                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(
+                    p,
+                )),
                 working_weights: Array1::ones(1),
                 working_response: Array1::zeros(1),
                 reparam_qs: None,
