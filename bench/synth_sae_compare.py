@@ -383,7 +383,7 @@ def _availability() -> dict[str, bool]:
 
 
 def _summarize(rows: list[ModelResult]) -> dict[str, Any]:
-    metrics = ["train_r2", "test_r2", "mcc", "probing_f1", "learned_l0_test", "seconds"]
+    metrics = ["train_r2", "test_r2", "mcc", "probing_f1", "learned_l0_test", "n_firing_latents", "seconds"]
     out: dict[str, Any] = {}
     for model in sorted({r.model for r in rows}):
         model_rows = [r for r in rows if r.model == model]
