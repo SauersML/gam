@@ -1862,6 +1862,96 @@ pub(crate) fn co_collapse_multistart_restores_best_basin_not_last_reseed() {
     );
 }
 
+/// #1026 decoder-repulsion gate safety: the collinearity gate must be a STRICT
+/// no-op for well-separated atoms (orthogonal decoders → gate `None`, so no
+/// value/gradient/curvature is added and healthy fits are byte-identical) and
+/// must ENGAGE for near-collinear atoms (the co-collapse geometry it conditions).
+/// Built on a K=2 periodic fixture whose decoders we set directly.
+#[test]
+pub(crate) fn decoder_repulsion_gate_off_when_separated_on_when_collinear() {
+    let coords0 = array![[0.05], [0.20], [0.55], [0.80], [0.35], [0.65]];
+    let coords1 = array![[0.15], [0.30], [0.65], [0.90], [0.45], [0.10]];
+    let (phi0, jet0) = periodic_basis(&coords0);
+    let (phi1, jet1) = periodic_basis(&coords1);
+    // Periodic basis is M=3 wide; output p=3. Build two atoms; decoders set below.
+    let make_atom = |name: &str, phi: Array2<f64>, jet: Array3<f64>, decoder: Array2<f64>| {
+        SaeManifoldAtom::new(
+            name,
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            decoder,
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator))
+    };
+    let logits = array![
+        [0.7, -0.2],
+        [0.1, 0.4],
+        [-0.3, 0.5],
+        [0.6, -0.1],
+        [0.2, 0.3],
+        [0.4, 0.1]
+    ];
+    let build = |dec0: Array2<f64>, dec1: Array2<f64>| {
+        let atom0 = make_atom("periodic0", phi0.clone(), jet0.clone(), dec0);
+        let atom1 = make_atom("periodic1", phi1.clone(), jet1.clone(), dec1);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits.clone(),
+            vec![coords0.clone(), coords1.clone()],
+            vec![
+                LatentManifold::Circle { period: 1.0 },
+                LatentManifold::Circle { period: 1.0 },
+            ],
+            AssignmentMode::softmax(0.8),
+        )
+        .unwrap();
+        SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap()
+    };
+
+    // ORTHOGONAL decoders: atom0 writes output channel 0, atom1 writes channel 1.
+    // Their cross-Gram B_0 B_1ᵀ = 0 ⇒ s_01 = 0 ⇒ gate exactly 0 ⇒ field `None`.
+    let mut dec0 = Array2::<f64>::zeros((3, 3));
+    dec0[[0, 0]] = 1.0;
+    let mut dec1 = Array2::<f64>::zeros((3, 3));
+    dec1[[0, 1]] = 1.0;
+    let mut sep = build(dec0, dec1);
+    sep.refresh_decoder_repulsion_gate();
+    assert!(
+        sep.decoder_repulsion_gate.is_none(),
+        "orthogonal decoders must leave the repulsion gate OFF (strict no-op): {:?}",
+        sep.decoder_repulsion_gate
+    );
+    assert_eq!(
+        sep.decoder_repulsion_value(1.0),
+        0.0,
+        "orthogonal decoders must contribute zero repulsion value"
+    );
+
+    // COLLINEAR decoders: both atoms write the SAME output channel 0 with the
+    // same basis-row pattern ⇒ s_01 = 1 ⇒ gate fully engaged ⇒ field `Some`.
+    let mut dec0c = Array2::<f64>::zeros((3, 3));
+    dec0c[[0, 0]] = 1.0;
+    let mut dec1c = Array2::<f64>::zeros((3, 3));
+    dec1c[[0, 0]] = 1.0;
+    let mut col = build(dec0c, dec1c);
+    col.refresh_decoder_repulsion_gate();
+    let gate = col
+        .decoder_repulsion_gate
+        .as_ref()
+        .expect("collinear decoders must ENGAGE the repulsion gate");
+    assert!(
+        gate[[0, 1]] > 0.0 && gate[[1, 0]] > 0.0,
+        "engaged gate must be positive and symmetric: {gate:?}"
+    );
+    assert!(
+        col.decoder_repulsion_value(1.0) > 0.0,
+        "collinear decoders must contribute positive repulsion value"
+    );
+}
+
 /// #976 distinct-basin lever: the co-collapse multi-start reseed must read a
 /// DIFFERENT principal subspace on each retry. The PC-pair rotation offset (=
 /// the 0-based retry index) shifts which residual PC pair each periodic atom

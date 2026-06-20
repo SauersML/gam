@@ -36,6 +36,168 @@ impl SaeManifoldTerm {
         Some(per_fit)
     }
 
+    /// #1026 — refresh the frozen per-assembly decoder-repulsion gate from the
+    /// current decoder state. Lagged-diffusivity discipline (mirrors
+    /// [`SaeManifoldAtom::refresh_intrinsic_smooth_penalty`]): the gate WEIGHT is
+    /// frozen here at assembly entry so the assembly's gradient/curvature and the
+    /// line-search value path use the same gate even as trial decoders move.
+    ///
+    /// The per-pair weight is `SAE_DECODER_REPULSION_STRENGTH · gate(s_jk)` with
+    /// the normalized collinearity score
+    /// `s_jk = ‖B_jB_kᵀ‖²_F / (‖B_j‖²_F·‖B_k‖²_F)` and a C1 smoothstep gate that
+    /// is exactly 0 below [`SAE_DECODER_REPULSION_COLLINEARITY_GATE`]. The gate is
+    /// stored as the symmetric matrix the [`DecoderIncoherencePenalty`] operator
+    /// reads as `coactivation` (its `pair_weight` is `½(W[j,k]+W[k,j])`, and a
+    /// symmetric matrix makes that exactly `W[j,k]`). When `K < 2`, or no pair is
+    /// near-collinear, the gate is `None` — the strict no-op.
+    pub(crate) fn refresh_decoder_repulsion_gate(&mut self) {
+        let k_atoms = self.k_atoms();
+        if k_atoms < 2 {
+            self.decoder_repulsion_gate = None;
+            return;
+        }
+        // Per-atom squared Frobenius decoder norms.
+        let norm_sq: Vec<f64> = self
+            .atoms
+            .iter()
+            .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
+            .collect();
+        let mut gate = Array2::<f64>::zeros((k_atoms, k_atoms));
+        let mut any_active = false;
+        let s0 = SAE_DECODER_REPULSION_COLLINEARITY_GATE;
+        for j in 0..k_atoms {
+            for k in (j + 1)..k_atoms {
+                // Both decoders need a usable scale; a ~zero decoder has no
+                // direction to be collinear with, so leave the pair at 0 (the
+                // decoder-norm / mass guards own that degeneracy, not this term).
+                if !(norm_sq[j] > 0.0 && norm_sq[k] > 0.0) {
+                    continue;
+                }
+                // Cross-Gram Frobenius energy ‖B_jB_kᵀ‖²_F = Σ_{a,b} C[a,b]² with
+                // C[a,b] = Σ_o B_j[a,o]·B_k[b,o]; normalized by the two norms it
+                // is the squared cosine of the decoder row-spaces ∈ [0, 1].
+                let bj = &self.atoms[j].decoder_coefficients;
+                let bk = &self.atoms[k].decoder_coefficients;
+                let (m_j, p) = (bj.nrows(), bj.ncols());
+                let m_k = bk.nrows();
+                if bk.ncols() != p {
+                    continue;
+                }
+                let mut cross_sq = 0.0_f64;
+                for a in 0..m_j {
+                    for b in 0..m_k {
+                        let mut c = 0.0_f64;
+                        for o in 0..p {
+                            c += bj[[a, o]] * bk[[b, o]];
+                        }
+                        cross_sq += c * c;
+                    }
+                }
+                let s_jk = cross_sq / (norm_sq[j] * norm_sq[k]);
+                // C1 smoothstep gate: 0 below s0, smooth ramp to 1 at s=1.
+                let gate_value = if s_jk <= s0 {
+                    0.0
+                } else {
+                    let t = ((s_jk - s0) / (1.0 - s0)).clamp(0.0, 1.0);
+                    t * t * (3.0 - 2.0 * t)
+                };
+                if gate_value > 0.0 {
+                    let w = SAE_DECODER_REPULSION_STRENGTH * gate_value;
+                    gate[[j, k]] = w;
+                    gate[[k, j]] = w;
+                    any_active = true;
+                }
+            }
+        }
+        self.decoder_repulsion_gate = if any_active { Some(gate) } else { None };
+    }
+
+    /// #1026 — build the [`DecoderIncoherencePenalty`] operator for the frozen
+    /// repulsion gate, or `None` when no repulsion is active. Reuses the existing
+    /// analytic gradient + PSD majorizer; only the gate (fed as `coactivation`)
+    /// and a fixed non-learnable strength differ from a user incoherence penalty.
+    pub(crate) fn live_decoder_repulsion_penalty(&self) -> Option<DecoderIncoherencePenalty> {
+        let gate = self.decoder_repulsion_gate.as_ref()?;
+        let k_atoms = self.k_atoms();
+        if k_atoms < 2 || gate.dim() != (k_atoms, k_atoms) {
+            return None;
+        }
+        let p = self.output_dim();
+        let block_sizes: Vec<usize> = self.atoms.iter().map(|atom| atom.basis_size()).collect();
+        let m_total: usize = block_sizes.iter().sum();
+        if m_total == 0 || p == 0 {
+            return None;
+        }
+        // The operator multiplies its quadratic by `weight·pair_weight`; we want
+        // the effective per-pair weight to be exactly `gate[j,k]` (which already
+        // folds in SAE_DECODER_REPULSION_STRENGTH), so pass weight=1 and feed the
+        // gate as the (non-negative, symmetric) coactivation matrix.
+        DecoderIncoherencePenalty::new(
+            PsiSlice {
+                range: 0..m_total * p,
+                latent_dim: Some(m_total),
+            },
+            block_sizes,
+            p,
+            gate.clone(),
+            1.0,
+            false,
+        )
+        .ok()
+    }
+
+    /// #1026 — accumulate the frozen-gate decoder repulsion's gradient into
+    /// `sys.gb` and its PSD curvature into `sys.hbb`, in the full-`B` β layout
+    /// (so the frame transform, if engaged, picks it up exactly like the analytic
+    /// β penalties). No-op (returns `false`, nothing written) when no repulsion is
+    /// active. Mirrors the `DecoderIncoherence` branch of `add_sae_beta_penalty`;
+    /// the penalty is non-learnable so the (empty) rho slice is inert.
+    pub(crate) fn add_sae_decoder_repulsion(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        penalty_scale: f64,
+        dense_beta_curvature: bool,
+    ) -> bool {
+        let Some(per_fit) = self.live_decoder_repulsion_penalty() else {
+            return false;
+        };
+        let beta_dim = self.beta_dim();
+        let target_beta = self.flatten_beta();
+        let rho_local = Array1::<f64>::zeros(0);
+        let grad = per_fit.grad_target(target_beta.view(), rho_local.view());
+        for j in 0..beta_dim {
+            sys.gb[j] += penalty_scale * grad[j];
+        }
+        if !dense_beta_curvature {
+            return true;
+        }
+        let mut probe = Array1::<f64>::zeros(beta_dim);
+        for j in 0..beta_dim {
+            probe.fill(0.0);
+            probe[j] = 1.0;
+            let hv = per_fit.psd_majorizer_hvp(target_beta.view(), rho_local.view(), probe.view());
+            for i in 0..beta_dim {
+                sys.hbb[[i, j]] += penalty_scale * hv[i];
+            }
+        }
+        true
+    }
+
+    /// #1026 — penalized-objective contribution of the frozen-gate decoder
+    /// repulsion at the current decoders. Reads the SAME frozen gate the
+    /// assembly used (via [`Self::live_decoder_repulsion_penalty`]), so the
+    /// line-search value is consistent with the step's gradient/curvature. 0 when
+    /// no repulsion is active.
+    pub(crate) fn decoder_repulsion_value(&self, penalty_scale: f64) -> f64 {
+        let Some(per_fit) = self.live_decoder_repulsion_penalty() else {
+            return 0.0;
+        };
+        let target_beta = self.flatten_beta();
+        let rho_local = Array1::<f64>::zeros(0);
+        use crate::terms::analytic_penalties::AnalyticPenalty;
+        penalty_scale * per_fit.value(target_beta.view(), rho_local.view())
+    }
+
     pub(crate) fn live_mechanism_sparsity_penalties(
         &self,
         base: &Arc<MechanismSparsityPenalty>,
