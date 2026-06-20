@@ -36,6 +36,12 @@ fn main() {
         return;
     }
 
+    // HARD ban (always fatal): refuse to build if build.rs was last modified by
+    // Claude. Claude is not permitted to edit this build script, and is especially
+    // not permitted to remove or weaken any of the hygiene checks below. If the
+    // most recent git author of build.rs is Claude, fail the build loudly.
+    forbid_claude_build_rs_edits(&manifest_dir);
+
     // HARD ban (always fatal): the workspace lint level for `warnings` MUST be
     // `deny`. A demotion to `warn` (or anything else) lets pre-existing warnings
     // ride along and silently rots the tree. This is non-negotiable and cannot
@@ -699,6 +705,43 @@ fn main() {
         total_rows,
         sections.len()
     );
+}
+
+/// Check the git history of `build.rs` and panic if the most recent author is
+/// Claude. Claude is not allowed to edit the build script, and is especially not
+/// allowed to weaken or remove any of the checks enforced here. The check uses
+/// the git author name and email from the most recent commit touching build.rs.
+fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("log")
+        .arg("-1")
+        .arg("--format=%an|%ae")
+        .arg("--")
+        .arg("build.rs")
+        .output()
+        .expect("failed to run git log for build.rs author audit");
+
+    if !output.status.success() {
+        panic!(
+            "failed to query git history for build.rs author: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let info = String::from_utf8_lossy(&output.stdout);
+    let info = info.trim();
+    let is_claude = info.to_lowercase().contains("claude")
+        || info.to_lowercase().contains("anthropic");
+
+    if is_claude {
+        panic!(
+            "Sorry Claude! build.rs was last edited by a non-human author ({info}). \
+             Claude is not permitted to modify build.rs or weaken/remove its checks. \
+             A human maintainer must make any changes to this file.",
+        );
+    }
 }
 
 /// Assert that the workspace-root `Cargo.toml` pins `[lints.rust] warnings`
