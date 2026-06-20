@@ -319,6 +319,11 @@ pub(crate) struct DebugEtaUvInputs {
     pub(crate) f_a_base: f64,
     pub(crate) f_u_base: Array1<f64>,
     pub(crate) f_uv_base: Array2<f64>,
+    // #932 f_au/f_aa moving-boundary certification (a-cross calibration jets).
+    // The harness FDs `f_a` along dir vs analytic `f_au·dir` to certify the
+    // derived a-channel boundary corrections (z_a=-1/b, z_ag=1/b², z_aa=0).
+    pub(crate) f_au_base: Array1<f64>,
+    pub(crate) f_aa_base: f64,
 }
 
 pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {
