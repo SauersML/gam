@@ -13,11 +13,7 @@ use gam::terms::sae::encode::EncodeResult;
 fn clean_criterion() -> CriterionCertificate {
     CriterionCertificate {
         grad_norm: 1e-9,
-        analytic_directional: 2.0,
-        fd_directional: 2.0,
-        fd_error: 1e-6,
-        agreement_z: 0.0,
-        fd_step: 1e-4,
+        analytic_directional: 1e-9,
         hessian_pd: Some(true),
         lambdas_railed: Vec::new(),
     }

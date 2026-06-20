@@ -3344,63 +3344,6 @@ fn run_exact_joint_spatial_optimization(
     // Gated strictly to diagnostic-sized problems (auto-derived from the
     // realized (n, θ_dim), no flag) so it never taxes a production fit. The
     // same gate the n-block driver uses.
-    // FD-OK: FD-audit of the analytic outer gradient (small-problem gate, never feeds the optimizer)
-    const OUTER_FD_AUDIT_MAX_N: usize = 4_000; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-    const OUTER_FD_AUDIT_MAX_THETA_DIM: usize = 32; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-    let n_total = data.nrows();
-    let outer_fd_audit_eligible = analytic_outer_hessian_available // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        && n_total <= OUTER_FD_AUDIT_MAX_N // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        && theta_dim <= OUTER_FD_AUDIT_MAX_THETA_DIM; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-    log::warn!(
-        "[OUTER-FD-AUDIT/spatial-exact-joint] gate eligible={outer_fd_audit_eligible} \
-         analytic_grad={analytic_outer_hessian_available} n_total={n_total} \
-         theta_dim={theta_dim} rho_dim={rho_dim} psi_dim={coord_dim}"
-    );
-    if outer_fd_audit_eligible {
-        // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        let audit = (|| -> Result<crate::solver::rho_optimizer::OuterGradientFdAudit, String> {
-            let mut eval_at = |theta: &Array1<f64>,
-                               mode: crate::solver::estimate::reml::reml_outer_engine::EvalMode|
-             -> Result<
-                (
-                    f64,
-                    Array1<f64>,
-                    crate::solver::rho_optimizer::HessianResult,
-                ),
-                String,
-            > {
-                use crate::solver::estimate::reml::reml_outer_engine::EvalMode;
-                let order = if matches!(mode, EvalMode::ValueGradientHessian) {
-                    OuterEvalOrder::ValueGradientHessian
-                } else {
-                    OuterEvalOrder::Value
-                };
-                ctx.eval_full(theta, order, analytic_outer_hessian_available)
-                    .map_err(|e| format!("fd-audit eval_full: {e}"))
-            };
-            let rho_dim_audit = rho_dim;
-            let label_fn = move |i: usize| -> String {
-                if i < rho_dim_audit {
-                    format!("rho[{i}]")
-                } else {
-                    format!("psi_kappa[{}]", i - rho_dim_audit)
-                }
-            };
-            crate::solver::rho_optimizer::outer_gradient_fd_audit(
-                // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-                theta0,
-                1e-4,
-                label_fn,
-                &mut eval_at,
-            )
-        })();
-        // END-FD-OK
-        match audit {
-            Ok(audit) => audit.log_verdict("spatial-exact-joint"),
-            Err(e) => log::warn!("[OUTER-FD-AUDIT/spatial-exact-joint] skipped: {e}"),
-        }
-    }
-
     let kphase_prime_order = if analytic_outer_hessian_available && !suppress_outer_hessian_for_nfree {
         OuterEvalOrder::ValueGradientHessian
     } else {

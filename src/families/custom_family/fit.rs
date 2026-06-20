@@ -1355,63 +1355,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // never on a healthy fit: gating it by size alone (the original #1040 gate)
     // taxed EVERY production custom-family fit — for `bernoulli-marginal-slope`
     // at n=1500, n_rho=6 it was ~39% of the wall clock (13 phantom evals) on a
-    // fit that converged cleanly with nothing to diagnose (gam#979). A
-    // certified-converged outer result has, by definition, no desync to find, so
-    // the audit only fires when `problem.run` returned `Err` or a non-converged
-    // result — exactly when the #1040 verdict is actionable.
-    let outer_needs_audit = match &outer_result {
-        Ok(result) => !result.converged,
-        Err(_) => true,
-    };
-    if outer_needs_audit {
-        // FD-OK: FD-audit of the analytic custom-family outer gradient (small-problem gate, never feeds the optimizer)
-        const OUTER_FD_AUDIT_MAX_N: usize = 4_000; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        const OUTER_FD_AUDIT_MAX_RHO_DIM: usize = 32; // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        let audit_n = specs.iter().map(|s| s.design.nrows()).max().unwrap_or(0);
-        if n_rho >= 1 && n_rho <= OUTER_FD_AUDIT_MAX_RHO_DIM && audit_n <= OUTER_FD_AUDIT_MAX_N {
-            // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-            log::warn!(
-                "[OUTER-FD-AUDIT/custom-family] outer did not certify convergence; running desync/identifiability audit n={audit_n} n_rho={n_rho} need_outer_hessian={need_outer_hessian}"
-            );
-            let mut eval_at = |rho: &Array1<f64>,
-                               mode: EvalMode|
-             -> Result<
-                (
-                    f64,
-                    Array1<f64>,
-                    crate::solver::rho_optimizer::HessianResult,
-                ),
-                String,
-            > {
-                let e = outerobjectivegradienthessian_labeled(
-                    family,
-                    specs,
-                    &outer_options,
-                    &label_layout,
-                    rho,
-                    None,
-                    &rho_prior,
-                    mode,
-                )?;
-                if !e.inner_converged {
-                    return Err("inner solve did not converge at audit rho".to_string());
-                }
-                Ok((e.objective, e.gradient, e.outer_hessian))
-            };
-            match crate::solver::rho_optimizer::outer_gradient_fd_audit(
-                // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-                &rho0,
-                1e-4,
-                |i| format!("rho[{i}]"),
-                &mut eval_at,
-            ) {
-                Ok(audit) => audit.log_verdict("custom-family"),
-                Err(e) => log::warn!("[OUTER-FD-AUDIT/custom-family] skipped: {e}"),
-            }
-        }
-        // END-FD-OK
-    }
-
     let last_error_detail = obj
         .state
         .last_error

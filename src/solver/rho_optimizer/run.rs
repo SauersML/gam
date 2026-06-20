@@ -1099,63 +1099,11 @@ pub(crate) fn audit_first_order_optimality(
             return None;
         }
     };
-    // Central-difference step on the optimal ε^(1/3) scale, sized to the
-    // iterate so saturated ρ (|ρ| up to rho_bound) keeps θ̂±2hv resolvable.
-    let theta_scale = theta.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-    let step = f64::EPSILON.cbrt() * (1.0 + theta_scale);
-
-    let mut probe = |scale: f64| -> Option<f64> {
-        let point = theta + &(scale * &direction);
-        match obj.eval_cost(&point) {
-            Ok(value) if value.is_finite() => Some(value),
-            Ok(value) => {
-                log::debug!(
-                    "[CERTIFICATE] {context}: audit probe at θ̂{scale:+.3e}·v returned \
-                     non-finite criterion value {value}; certificate skipped"
-                );
-                None
-            }
-            Err(err) => {
-                log::debug!(
-                    "[CERTIFICATE] {context}: audit probe at θ̂{scale:+.3e}·v failed ({err}); \
-                     certificate skipped"
-                );
-                None
-            }
-        }
-    };
-    let f_plus_h = probe(step)?;
-    let f_minus_h = probe(-step)?;
-    let f_plus_2h = probe(2.0 * step)?;
-    let f_minus_2h = probe(-2.0 * step)?;
-
-    let d_h = (f_plus_h - f_minus_h) / (2.0 * step);
-    let d_2h = (f_plus_2h - f_minus_2h) / (4.0 * step);
-    // FD-OK: FD-audit certificate construction (Richardson FD oracle auditing the analytic gradient, never feeds the optimizer)
-    let fd_directional = (4.0 * d_h - d_2h) / 3.0; // fd-ok: FD-audit certificate, not in math path
-    // Error bar: the Richardson residual measures truncation + value-path
-    // noise (inner-solve tolerance) empirically; the roundoff bound floors
-    // it when the residual is accidentally tiny.
-    let value_scale = f_plus_h
-        .abs()
-        .max(f_minus_h.abs())
-        .max(f_plus_2h.abs())
-        .max(f_minus_2h.abs());
-    let roundoff = f64::EPSILON * (1.0 + value_scale) / step;
-    let fd_error = (d_h - d_2h).abs().max(roundoff); // fd-ok: FD-audit certificate, not in math path
-
     let analytic_directional = gradient.dot(&direction);
     let grad_norm = gradient.dot(gradient).sqrt();
-    let agreement_z = (analytic_directional - fd_directional).abs() / fd_error; // fd-ok: FD-audit certificate, not in math path
-
     let certificate = CriterionCertificate {
         grad_norm,
         analytic_directional,
-        fd_directional, // fd-ok: FD-audit certificate, not in math path
-        fd_error,       // fd-ok: FD-audit certificate, not in math path
-        agreement_z,
-        fd_step: step, // fd-ok: FD-audit certificate, not in math path
-        // END-FD-OK
         hessian_pd: result
             .final_hessian
             .as_ref()

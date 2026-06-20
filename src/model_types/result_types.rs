@@ -519,19 +519,14 @@ mod per_term_edf_tests {
     }
 }
 
-/// Standardized-disagreement gate: the audit flags inconsistency when the
-/// analytic and FD directional derivatives differ by more than this many FD
-/// error bars (and also fail the relative gate).
-pub(crate) const CERTIFICATE_Z_GATE: f64 = 4.0;
-
-/// Relative agreement gate: differences below this fraction of the larger
-/// directional derivative are consistent regardless of the (possibly
-/// underestimated) FD error bar.
-pub(crate) const CERTIFICATE_RELATIVE_GATE: f64 = 1e-3;
-
 /// ρ margin (in log-λ units) within which an outer smoothing coordinate
 /// counts as railed against its box bound.
 pub(crate) const CERTIFICATE_RAIL_MARGIN: f64 = 0.5;
+
+/// Projected gradient-norm floor below which the returned optimum counts as a
+/// stationary point of the analytic objective (#1440: the analytic gradient is
+/// authoritative — there is no longer a runtime FD oracle to cross-check it).
+pub(crate) const CERTIFICATE_GRAD_NORM_FLOOR: f64 = 1e-6;
 
 /// First-order optimality certificate: gradient-vs-objective FD audit at the
 /// returned optimum (#934).
@@ -547,22 +542,6 @@ pub struct CriterionCertificate {
     pub grad_norm: f64,
     /// Analytic directional derivative ∇F(θ̂)·v along the audit direction.
     pub analytic_directional: f64,
-    // FD-OK: this certificate STORES a finite-difference oracle of the criterion
-    // value solely to AUDIT the analytic directional derivative against it (the
-    // analytic path is authoritative); the FD never feeds the optimizer.
-    /// Richardson-extrapolated central difference of the criterion VALUE
-    /// path along the same direction: (4·D_h − D_2h)/3 from the h and 2h
-    /// central-difference pairs.
-    pub fd_directional: f64, // fd-ok: FD-audit certificate, not in math path
-    /// Error bar on `fd_directional`: the Richardson residual |D_h − D_2h|
-    /// (which absorbs both truncation and inner-solve value noise) floored
-    /// by the central-difference roundoff bound ε·|F|/h.
-    pub fd_error: f64, // fd-ok: FD-audit certificate, not in math path
-    /// |analytic − fd| / fd_error — standardized disagreement.
-    pub agreement_z: f64,
-    /// Base central-difference step h along the unit direction.
-    pub fd_step: f64, // fd-ok: FD-audit certificate, not in math path
-    // END-FD-OK
     /// Whether the final outer Hessian is positive definite at θ̂, when the
     /// solver tracked one (`None` when no final Hessian was available).
     pub hessian_pd: Option<bool>,
@@ -572,22 +551,19 @@ pub struct CriterionCertificate {
 }
 
 impl CriterionCertificate {
-    /// Whether the analytic directional derivative agrees with the finite
-    /// difference of the actual criterion value at the optimum.
+    /// Whether the returned point is a genuine stationary point of the analytic
+    /// objective on its FREE (box-interior) subspace: the analytic directional
+    /// derivative along the free-subspace audit direction vanishes. Railed
+    /// coordinates legitimately carry a nonzero KKT gradient, so they are
+    /// reported separately (`lambdas_railed`) rather than failing this check.
+    /// (#1440 removed the runtime finite-difference oracle that previously
+    /// cross-checked the analytic gradient — the analytic path is authoritative
+    /// and verified by tests, not re-audited with FD in production.)
     pub fn first_order_consistent(&self) -> bool {
-        // FD-OK: audit comparison of the analytic directional derivative against
-        // the stored finite-difference oracle; this is the certificate check, not
-        // a computational FD path.
-        let diff = (self.analytic_directional - self.fd_directional).abs(); // fd-ok: FD-audit certificate, not in math path
-        let scale = self
-            .analytic_directional
-            .abs()
-            .max(self.fd_directional.abs()); // fd-ok: FD-audit certificate, not in math path
-        diff <= (CERTIFICATE_Z_GATE * self.fd_error).max(CERTIFICATE_RELATIVE_GATE * scale) // fd-ok: FD-audit certificate, not in math path
-        // END-FD-OK
+        self.analytic_directional.abs() <= CERTIFICATE_GRAD_NORM_FLOOR
     }
 
-    /// Whether every audited fact is clean: gradient matches objective, no
+    /// Whether every audited fact is clean: gradient vanishes, no
     /// definiteness failure, no railed smoothing coordinate.
     pub fn is_clean(&self) -> bool {
         self.first_order_consistent()
@@ -598,14 +574,8 @@ impl CriterionCertificate {
     /// One-line human-readable rendering for logs and reports.
     pub fn summary(&self) -> String {
         format!(
-            // FD-OK: human-readable summary of the audit certificate's stored
-            // FD oracle fields; reporting only, no FD computation here.
-            "grad·v={:.6e} fd·v={:.6e}±{:.1e} z={:.2} |g|={:.3e} hessian_pd={} railed={:?} → {}",
+            "grad·v={:.6e} |g|={:.3e} hessian_pd={} railed={:?} → {}",
             self.analytic_directional,
-            self.fd_directional, // fd-ok: FD-audit certificate, not in math path
-            self.fd_error,       // fd-ok: FD-audit certificate, not in math path
-            // END-FD-OK
-            self.agreement_z,
             self.grad_norm,
             match self.hessian_pd {
                 Some(true) => "yes",
@@ -616,7 +586,7 @@ impl CriterionCertificate {
             if self.first_order_consistent() {
                 "consistent"
             } else {
-                "GRADIENT-OBJECTIVE DESYNC"
+                "NON-STATIONARY"
             },
         )
     }

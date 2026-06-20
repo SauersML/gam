@@ -55,9 +55,6 @@ pub struct EdfBlockRow {
 /// never re-derives policy.
 pub struct CriterionCertificateRow {
     pub analytic_directional: f64,
-    pub fd_directional: f64, // fd-ok: FD-audit certificate, not in math path
-    pub fd_error: f64,       // fd-ok: FD-audit certificate, not in math path
-    pub agreement_z: f64,
     pub grad_norm: f64,
     pub hessian_pd: Option<bool>,
     pub lambdas_railed: Vec<usize>,
@@ -393,18 +390,15 @@ pub fn render_html(input: &ReportInput) -> Result<String, String> {
         let cert_value = if cert.clean {
             format!(
                 "<span class=\"conv-ok\">consistent</span> \
-                 (grad\u{00B7}v={:.3e}, fd\u{00B7}v={:.3e}\u{00B1}{:.1e}, z={:.2})",
+                 (grad\u{00B7}v={:.3e})",
                 cert.analytic_directional,
-                cert.fd_directional, // fd-ok: FD-audit certificate, not in math path
-                cert.fd_error,       // fd-ok: FD-audit certificate, not in math path
-                cert.agreement_z     // fd-ok: FD-audit certificate, not in math path
             )
         } else {
             let mut flags = Vec::new();
             if !cert.consistent {
                 flags.push(format!(
-                    "gradient\u{2194}objective desync (grad\u{00B7}v={:.3e} vs fd\u{00B7}v={:.3e}\u{00B1}{:.1e}, z={:.2})",
-                    cert.analytic_directional, cert.fd_directional, cert.fd_error, cert.agreement_z // fd-ok: FD-audit certificate, not in math path
+                    "non-stationary (grad\u{00B7}v={:.3e})",
+                    cert.analytic_directional
                 ));
             }
             if cert.hessian_pd == Some(false) {
