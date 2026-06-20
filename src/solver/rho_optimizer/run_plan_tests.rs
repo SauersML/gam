@@ -1790,7 +1790,7 @@ fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
 /// grid-prepass seed). Adopting it published a degenerate EDF≈1 constant fit.
 /// The guard must keep the strictly-better incumbent instead.
 #[test]
-fn constrained_stationary_probe_does_not_discard_better_incumbent() {
+fn constrained_stationary_probe_keeps_better_incumbent() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let mut guard = CostStallGuard::new(1.0e-6, 3, 1.0e-3, exit.clone());
     // A good interior fit (the prepass seed): low cost, but still has a residual
