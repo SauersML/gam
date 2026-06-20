@@ -393,6 +393,43 @@ impl SurvivalMarginalSlopeFamily {
                     };
                     right - left
                 };
+                // ∂_z of the bare calibration density weight `w(z)=exp(-q(z))/2π`,
+                // i.e. `w_z = -q_z·w` with `q_z = z + η(z)·η_z(z)`. This is the
+                // `density_z_derivative` of the directional reference block below
+                // specialised to the constant integrand `g≡1` (G = w itself).
+                let density_w_z = |z: f64| -> f64 {
+                    let eta = cell.eta(z);
+                    let eta_z = cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
+                    let q_z = z + eta * eta_z;
+                    -q_z * (-cell.q(z)).exp() / std::f64::consts::TAU
+                };
+                // Self-flux `G_z·z_u·z_v` of the moving-boundary second derivative
+                // (G = w). The Leibniz expansion of `∂_v∂_u ∫_{zL(θ)}^{zR(θ)} w dz`
+                // carries, per edge, `∂_uG·z_v + ∂_vG·z_u + G_z·z_u·z_v + G·z_uv`.
+                // The first two terms are the `flux(·)` pair above; this closure
+                // supplies the missing `G_z·z_u·z_v` self-flux (symmetric in u,v).
+                // The remaining `G·z_uv` term carries the bare continuous density
+                // `w` (not the cell-discontinuous integrand coefficients), so it
+                // telescope-cancels across each shared interior link-knot crossing
+                // and is dropped (gam#932). z_u/z_v reuse the crossing edge
+                // velocities `edge_vel`.
+                let self_flux = |u: usize, v: usize| -> f64 {
+                    let zu_r = edge_vel(u, part.right_edge, cell.right);
+                    let zv_r = edge_vel(v, part.right_edge, cell.right);
+                    let zu_l = edge_vel(u, part.left_edge, cell.left);
+                    let zv_l = edge_vel(v, part.left_edge, cell.left);
+                    let right = if zu_r != 0.0 && zv_r != 0.0 {
+                        zu_r * zv_r * density_w_z(cell.right)
+                    } else {
+                        0.0
+                    };
+                    let left = if zu_l != 0.0 && zv_l != 0.0 {
+                        zu_l * zv_l * density_w_z(cell.left)
+                    } else {
+                        0.0
+                    };
+                    right - left
+                };
                 for u in 0..p {
                     let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
                     for v in u..p {
@@ -403,6 +440,9 @@ impl SurvivalMarginalSlopeFamily {
                             let neg_coeff_v = fixed.coeff_u[v].map(|value| -value);
                             boundary + flux(u, &neg_coeff_v)
                         };
+                        // `G_z·z_u·z_v` is a single symmetric term, added once
+                        // (unlike the asymmetric `flux` pair) to both triangles.
+                        let boundary = boundary + self_flux(u, v);
                         f_uv[[u, v]] += boundary;
                         if u != v {
                             f_uv[[v, u]] += boundary;
