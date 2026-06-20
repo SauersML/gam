@@ -3158,7 +3158,7 @@ impl DerivativeStorageBackend for ZeroDerivativeMatrix {
         &self,
         qs: &Array2<f64>,
         free_basis_opt: Option<&Array2<f64>>,
-        _u: &Array1<f64>,
+        u: &Array1<f64>,
     ) -> Result<Array1<f64>, EstimationError> {
         if self.cols != qs.nrows() {
             crate::bail_invalid_estim!(
@@ -3168,11 +3168,11 @@ impl DerivativeStorageBackend for ZeroDerivativeMatrix {
             );
         }
         let cols = free_basis_opt.map_or(qs.ncols(), |z| z.ncols());
-        if _u.len() != cols {
+        if u.len() != cols {
             crate::bail_invalid_estim!(
                 "zero design derivative transformed forward width mismatch: expected {}, vector={}",
                 cols,
-                _u.len()
+                u.len()
             );
         }
         Ok(Array1::<f64>::zeros(self.rows))
