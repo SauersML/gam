@@ -36,10 +36,11 @@ fn main() {
         return;
     }
 
-    // HARD ban (always fatal): refuse to build if build.rs was last modified by
-    // Claude. Claude is not permitted to edit this build script, and is especially
-    // not permitted to remove or weaken any of the hygiene checks below. If the
-    // most recent git author of build.rs is Claude, fail the build loudly.
+    // HARD ban (always fatal): Claude may not edit build.rs alone. If the most
+    // recent git author of build.rs is Claude, the change must be a co-authored
+    // human collaboration. The checks in this file are not to be weakened or
+    // removed under any circumstances; a human maintainer must approve and commit
+    // any modification to this build script.
     forbid_claude_build_rs_edits(&manifest_dir);
 
     // HARD ban (always fatal): the workspace lint level for `warnings` MUST be
@@ -707,10 +708,17 @@ fn main() {
     );
 }
 
-/// Check the git history of `build.rs` and panic if the most recent author is
-/// Claude. Claude is not allowed to edit the build script, and is especially not
-/// allowed to weaken or remove any of the checks enforced here. The check uses
-/// the git author name and email from the most recent commit touching build.rs.
+/// Check the git history of `build.rs` and panic if the most recent commit was
+/// made by Claude without a human co-author. Claude is allowed to propose
+/// changes to this file only in collaboration with a human; the final commit must
+/// carry a human author name/email. The checks in this file are not to be weakened
+/// or removed under any circumstances, and any edit here requires human review
+/// and sign-off.
+///
+/// The heuristic is simple and practical: the most recent commit author name or
+/// email must not be Claude/Anthropic. A human co-author should be the commit
+/// author; `Co-Authored-By` alone is intentionally not enough because git log
+/// `%an` returns the primary author of the commit.
 fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
     let output = Command::new("git")
         .arg("-C")
@@ -738,8 +746,10 @@ fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
     if is_claude {
         panic!(
             "Sorry Claude! build.rs was last edited by a non-human author ({info}). \
-             Claude is not permitted to modify build.rs or weaken/remove its checks. \
-             A human maintainer must make any changes to this file.",
+             Claude may propose changes to build.rs, but only a human may author the \
+             commit. The checks in this file are not to be weakened or removed under \
+             any circumstances. Please have a human maintainer re-commit any needed \
+             change to build.rs.",
         );
     }
 }
