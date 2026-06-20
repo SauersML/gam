@@ -2121,6 +2121,9 @@ fn scan_summary_payload(model: &FittedModel, scan: &ScanIntrospection) -> Summar
         group_metadata: model.payload().group_metadata.clone(),
         deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: scan.deviance,
+        // Scan-routed models do not retain the λ-comparable log-likelihood, so
+        // leave `log_likelihood` unset.
+        log_likelihood: None,
         // null_dim is left unset: the scan does not compute the penalized-Hessian
         // null-space logdet the TK normalizer needs, so `comparable_reml_score`
         // returns the raw cost unchanged (and `evidence()` stays well-defined).
@@ -2185,6 +2188,7 @@ fn summary_json_impl(model_bytes: &[u8]) -> Result<String, String> {
         group_metadata: model.payload().group_metadata.clone(),
         deployment_extensions: model.payload().deployment_extensions.clone(),
         deviance: fit.deviance,
+        log_likelihood: Some(fit.log_likelihood),
         reml_score,
         raw_reml_score,
         null_space_logdet: fit.artifacts.null_space_logdet,
