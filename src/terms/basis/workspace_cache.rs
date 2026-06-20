@@ -367,10 +367,34 @@ pub(crate) fn build_matern_operator_penalty_candidates(
 /// spectral test (the cold-build / non-frozen behavior). Returns the emitted
 /// candidate list together with the realized decision so the caller can record
 /// it into the basis metadata for the freeze step.
+/// True when every entry of `m` is finite. A non-finite projected kernel Gram
+/// or shrinkage projector must never be turned into a penalty: its root feeds
+/// the λ-weighted range block whose eigensolve hard-rejects non-finite input
+/// ("range penalty block contains non-finite entries", gam#1379). On certain
+/// 1-D `matern(x)` / `bs="gp"` data geometries the projected kernel Gram is
+/// numerically degenerate enough that the eigensolver returns non-finite
+/// near-null eigenvectors, so the spectral-projector shrinkage block comes back
+/// non-finite; we drop that block rather than poison the whole penalty.
+fn matrix_all_finite(m: &Array2<f64>) -> bool {
+    m.iter().all(|v| v.is_finite())
+}
+
 pub(crate) fn matern_double_penalty_candidates_with_decision(
     primary: &Array2<f64>,
     frozen: Option<bool>,
 ) -> Result<(Vec<PenaltyCandidate>, bool), BasisError> {
+    // gam#1379 — guard the Primary projected kernel Gram itself. It is `Zᵀ K Z`
+    // with a finite Matérn kernel `K`, so it is finite in exact arithmetic; if a
+    // degenerate trial geometry made it non-finite we cannot ship it as a
+    // penalty (the range-block eigensolve would abort the fit). Surface a clear
+    // basis error instead of an opaque downstream "non-finite range penalty".
+    if !matrix_all_finite(primary) {
+        crate::bail_invalid_basis!(
+            "Matérn double-penalty primary kernel Gram is non-finite; the projected \
+             kernel `Zᵀ K Z` could not be formed at this length scale (degenerate \
+             geometry). Widen the data spread, change the length scale, or drop the term."
+        );
+    }
     let mut candidates = vec![normalize_penalty_candidate(
         primary.clone(),
         0,
@@ -378,7 +402,10 @@ pub(crate) fn matern_double_penalty_candidates_with_decision(
     )];
     let survived = match frozen {
         Some(forced) => {
-            if forced && let Some(shrinkage) = build_nullspace_shrinkage_penalty(primary)? {
+            if forced
+                && let Some(shrinkage) = build_nullspace_shrinkage_penalty(primary)?
+                && matrix_all_finite(&shrinkage.sym_penalty)
+            {
                 candidates.push(normalize_penalty_candidate(
                     shrinkage.sym_penalty,
                     0,
@@ -398,7 +425,9 @@ pub(crate) fn matern_double_penalty_candidates_with_decision(
             }
         }
         None => {
-            if let Some(shrinkage) = build_nullspace_shrinkage_penalty(primary)? {
+            if let Some(shrinkage) = build_nullspace_shrinkage_penalty(primary)?
+                && matrix_all_finite(&shrinkage.sym_penalty)
+            {
                 candidates.push(normalize_penalty_candidate(
                     shrinkage.sym_penalty,
                     0,

@@ -2901,9 +2901,44 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
     workspace: &mut BasisWorkspace,
 ) -> Result<BasisPsiDerivativeBundle, BasisError> {
     // Analytic psi derivative assembly for the Matérn basis block.
-    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
-    let z_opt = matern_identifiability_transform(centers.view(), &spec.identifiability)?;
-    let aniso = spec.aniso_log_scales.as_deref();
+    //
+    // The ψ-derivatives MUST be built over the EXACT same realized geometry as
+    // the value build (`build_matern_basiswithworkspace`): the value build
+    // rank-reduces an over-specified center set (`matern_rank_reduce_centers`,
+    // #755), periodic-expands it, and resolves the anisotropy/identifiability
+    // transform over the surviving centers. Re-deriving the centers here from
+    // `select_centers_by_strategy` (un-reduced) produced a derivative penalty
+    // sized to the FULL center set while `base.penaltyinfo` (the active-block
+    // mask + the forward penalty list) is sized to the REDUCED set — an
+    // index/shape desync that crashed the double-penalty ψ-derivative assembly
+    // with an IncompatibleShape matmul and left the FD audit comparing
+    // differently-shaped blocks (the matern double-penalty log-κ FD tests). Pull
+    // the realized centers, transform, and anisotropy from the value build so the
+    // two are byte-consistent by construction.
+    let base = build_matern_basiswithworkspace(data, spec, workspace)?;
+    let (base_centers, base_transform, base_aniso) = match &base.metadata {
+        BasisMetadata::Matern {
+            centers,
+            identifiability_transform,
+            aniso_log_scales,
+            ..
+        } => (
+            centers.clone(),
+            identifiability_transform.clone(),
+            aniso_log_scales.clone(),
+        ),
+        other => {
+            return Err(BasisError::InvalidInput(format!(
+                "Matérn ψ-derivative build expected Matérn metadata, got {:?}",
+                std::mem::discriminant(other)
+            )));
+        }
+    };
+    // Reproduce the value build's periodic expansion of the (reduced) base
+    // centers so the kernel pairs and the realized design columns align.
+    let centers = expand_periodic_centers(&base_centers, spec.periodic.as_deref())?;
+    let z_opt = base_transform;
+    let aniso = base_aniso.as_deref();
     let design_derivatives = build_matern_design_psi_derivatives(
         data,
         centers.view(),
@@ -2914,7 +2949,6 @@ pub fn build_matern_basis_log_kappa_derivativeswithworkspace(
         aniso,
     )?;
     let (penalties_derivative, penaltiessecond_derivative) = if spec.double_penalty {
-        let base = build_matern_basiswithworkspace(data, spec, workspace)?;
         let (_, primary_derivative, primarysecond_derivative, _, a_raw, a_raw_psi, a_raw_psi_psi) =
             build_matern_double_penalty_primarywith_psi_derivatives(
                 centers.view(),
