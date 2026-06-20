@@ -1909,6 +1909,17 @@ pub fn spherical_spline_design_jet(
         }
         return spherical_harmonic_jet(data, l_max, spec.radians);
     }
+    // The Pseudo Wahba kernel forward build routes through the harmonic basis
+    // (see `build_spherical_spline_basis`), so its design jet must mirror that
+    // routing — degree-mapped harmonic columns — rather than the raw Wahba
+    // kernel jet, or the analytic jet would have a different column count than
+    // the forward design it is meant to differentiate.
+    if matches!(spec.wahba_kernel, SphereWahbaKernel::Pseudo) {
+        let l_max = spec
+            .max_degree
+            .unwrap_or_else(|| harmonic_degree_for_wahba_basis_width(spec, data.nrows()));
+        return spherical_harmonic_jet(data, l_max, spec.radians);
+    }
     validate_lat_lon_matrix(data, "spherical spline jet", spec.radians)?;
     let centers = match realized_center_strategy(&spec.center_strategy) {
         CenterStrategy::FarthestPoint { num_centers } => {

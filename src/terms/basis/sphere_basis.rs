@@ -146,7 +146,10 @@ pub fn build_spherical_spline_basis(
 
 const SPHERE_UNPENALIZED_LOW_DEGREE: usize = 1;
 
-fn harmonic_degree_for_wahba_basis_width(spec: &SphericalSplineBasisSpec, n_rows: usize) -> usize {
+pub(crate) fn harmonic_degree_for_wahba_basis_width(
+    spec: &SphericalSplineBasisSpec,
+    n_rows: usize,
+) -> usize {
     let target = match &spec.center_strategy {
         CenterStrategy::Auto(inner) => match inner.as_ref() {
             CenterStrategy::FarthestPoint { num_centers }
@@ -630,90 +633,46 @@ pub(crate) fn build_spherical_harmonic_basis(
             Ok(())
         })?;
     }
-    // Diagonal Laplace-Beltrami eigenvalue penalty [l(l+1)]^m per (l, m).
-    // Degree-2 modes carry real low-frequency sphere signal, but they still
-    // need primary-penalty shrinkage under noisy finite samples. For explicit
-    // high-degree bases (L > 2), fold an additional [l(l+1)] factor into modes
-    // l > 2 in this same primary block. Keeping that tail shrinkage tied to the
-    // primary lambda prevents REML from fitting dense equatorial noise with
-    // separately under-penalized high-degree modes and then degrading in sparse
-    // polar latitude bands.
+    // Diagonal Laplace-Beltrami curvature penalty [l(l+1)]^order per (l, m).
     //
-    // This is already in the natural coefficient coordinates for the real
-    // spherical harmonics: the basis is orthonormal on S², so X'X/n is O(1)
-    // under uniform sampling, while the diagonal entries are the physical
-    // roughness eigenvalues of the final function. Frobenius-normalizing this
-    // matrix would divide away that meaningful spectral scale (≈1261 for
-    // L=4, m=2), making REML optimize against an artificially tiny physical
-    // penalty. Keep the raw operator with normalization_scale=1 so optimizer
-    // lambdas are physical lambdas for this smooth.
-    // Split the diagonal Laplace-Beltrami curvature penalty into two blocks that
-    // carry SEPARATE smoothing parameters (#1246, polar high-latitude quality).
-    // The decisive observation is that REML re-selects each block's lambda, so
-    // changing a penalty's SCALE within a block is absorbed by lambda and cannot
-    // move the fit; only a STRUCTURAL split into an independently-tuned block can.
+    // The real spherical harmonics diagonalize the Laplace-Beltrami operator on
+    // S²: the degree-l block is an irreducible SO(3) representation with the
+    // single eigenvalue l(l+1), constant across all 2l+1 modes in the block.
+    // Raising every mode in a degree to the SAME power therefore yields a
+    // ROTATION-INVARIANT penalty (it commutes with the SO(3) action), which is
+    // exactly the iterated Laplacian Sobolev seminorm ‖Δ^order f‖². Because the
+    // penalty is rotation-invariant and the sphere area measure is rotation-
+    // invariant, the induced smoothing is latitude-independent by construction:
+    // no pole/equator direction is privileged (#1246). Splitting the curvature
+    // penalty by mode type (e.g. routing zonal m=0 modes to a separate block)
+    // would BREAK this invariance and reintroduce a latitude-dependent error
+    // profile, so the operator is kept as one isotropic block.
     //
-    //   * Primary (equator-supported signal) — the degree-2 NON-zonal modes
-    //     (m != 0: the sectoral/tesseral harmonics Y_{2,+-2}=x^2-y^2, xy and
-    //     Y_{2,+-1}). Their basis functions carry a cos(lat) factor, so they
-    //     VANISH at the poles and concentrate their amplitude near the equator.
-    //     This is where the genuine low-degree sphere signal lives, so REML must
-    //     keep this lambda moderate enough to fit it.
-    //   * Tail (polar-supported / noise) — every ZONAL mode (m = 0, P_{l,0}) for
-    //     l >= 2 PLUS the entire high-degree band (l > 2, all m). The zonal modes
-    //     P_{l,0}(sin lat) reach their largest magnitude AT the poles, and the
-    //     high-degree modes carry no low-degree signal. Under a single shared
-    //     lambda the optimizer had to keep the curvature penalty small enough to
-    //     fit the equator-dominant sectoral signal, which left these polar-heavy
-    //     modes under-suppressed; their residual wiggle then piled up in the
-    //     sparsely sampled polar latitude bands (south-polar/equator RMSE ratio
-    //     > 1.4). Routing them to their OWN smoothing parameter lets REML drive
-    //     this block independently: for a low-degree truth it crushes the
-    //     polar-heavy noise band (no equatorial signal to protect) while leaving
-    //     the equator-supported sectoral signal untouched, evening out the
-    //     latitude-band error profile. For a genuinely high-degree truth REML
-    //     keeps the tail lambda moderate, so signal recovery and the predict
-    //     boundedness guarantees are preserved.
+    // The basis is orthonormal on S², so X'X/n is O(1) under uniform sampling
+    // while the diagonal entries are the physical roughness eigenvalues of the
+    // fitted function. Frobenius-normalizing would divide away that meaningful
+    // spectral scale, making REML optimize against an artificially tiny physical
+    // penalty, so the raw operator is kept with normalization_scale=1 and the
+    // optimizer lambda is a physical lambda for this smooth.
     let mut penalty = Array2::<f64>::zeros((p, p));
-    let mut tail = Array2::<f64>::zeros((p, p));
     let mut col = 0usize;
     for l in 1..=l_max {
         let laplace = l as f64 * (l as f64 + 1.0);
-        let eig = laplace.powi((spec.penalty_order + 2) as i32);
-        // Column layout per degree l: [sin(l*phi)P_{l,l} .. sin(phi)P_{l,1},
-        // P_{l,0}, cos(phi)P_{l,1} .. cos(l*phi)P_{l,l}], so the local index `l`
-        // (0-based) within the (2l+1)-wide block is the zonal m=0 column.
-        for local in 0..(2 * l + 1) {
-            let is_zonal = local == l;
-            if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
-                // unpenalized low-degree span
-            } else if l > 2 || is_zonal {
-                // polar-supported / noise band -> independent tail lambda
-                tail[[col, col]] = eig;
-            } else {
-                // equator-supported degree-2 sectoral/tesseral signal
-                penalty[[col, col]] = eig;
-            }
+        let eig = laplace.powi(spec.penalty_order as i32);
+        for _ in 0..(2 * l + 1) {
+            penalty[[col, col]] = eig;
             col += 1;
         }
     }
-    let has_tail = tail.diag().iter().any(|&v| v > 0.0);
-    // Double-penalty shrinkage lives on the primary penalty's null space.
-    // The harmonic basis omits the constant mode, so the unpenalized Wahba
-    // low-degree span is exactly the l <= SPHERE_UNPENALIZED_LOW_DEGREE block.
-    // Penalizing the complement here would duplicate the curvature penalty and
-    // leave the nominal null-space penalty inert.
+    // The curvature penalty above is full-rank within this basis (every degree
+    // l >= 1 has eigenvalue l(l+1) > 0; the constant mode l=0 is not part of the
+    // harmonic basis), so it has an empty null space. A double-penalty therefore
+    // contributes a uniform isotropic ridge that shrinks all coefficients toward
+    // zero under its own smoothing parameter — the standard mgcv-style extra
+    // shrinkage term — and is only active when explicitly requested.
     let mut ridge = Array2::<f64>::zeros((p, p));
-    {
-        let mut col = 0usize;
-        for l in 1..=l_max {
-            for _ in 0..(2 * l + 1) {
-                if l <= SPHERE_UNPENALIZED_LOW_DEGREE {
-                    ridge[[col, col]] = 1.0;
-                }
-                col += 1;
-            }
-        }
+    for c in 0..p {
+        ridge[[c, c]] = 1.0;
     }
 
     // Realized-design identifiability gauge (#1246). The global smooth
@@ -747,7 +706,6 @@ pub(crate) fn build_spherical_harmonic_basis(
     let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[transform.clone()]);
     let design = gauge.restrict_design(&design);
     let penalty = gauge.restrict_penalty(&penalty);
-    let tail = gauge.restrict_penalty(&tail);
     let ridge = gauge.restrict_penalty(&ridge);
 
     let mut candidates = vec![PenaltyCandidate {
@@ -758,19 +716,6 @@ pub(crate) fn build_spherical_harmonic_basis(
         kronecker_factors: None,
         op: None,
     }];
-    if has_tail {
-        // Independent smoothing parameter for the degree>2 curvature tail. Keep
-        // the raw physical roughness operator (normalization_scale=1) so the
-        // optimizer lambda stays a physical lambda, matching the primary block.
-        candidates.push(PenaltyCandidate {
-            matrix: tail,
-            nullspace_dim_hint: 0,
-            source: PenaltySource::Other("SphereHarmonicHighDegreeTail".to_string()),
-            normalization_scale: 1.0,
-            kronecker_factors: None,
-            op: None,
-        });
-    }
     if spec.double_penalty {
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {

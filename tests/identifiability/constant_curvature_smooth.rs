@@ -93,8 +93,20 @@ fn kappa_one_kernel_uses_great_circle_distance() {
         for j in 0..pts.nrows() {
             let p = embed(pts[(i, 0)], pts[(i, 1)]);
             let q = embed(pts[(j, 0)], pts[(j, 1)]);
-            let cosang = (p[0] * q[0] + p[1] * q[1] + p[2] * q[2]).clamp(-1.0, 1.0);
-            let angle = cosang.acos();
+            // Great-circle angle via atan2(|p×q|, p·q). This is accurate for
+            // small angles (including the exact-zero self-distance on the
+            // diagonal), where `acos(p·q)` suffers catastrophic cancellation:
+            // for unit vectors `p·q = 1 - 2.1e-8` rounds to acos ≈ 2e-4 rather
+            // than 0, which is the analytically correct geodesic self-distance.
+            let dot = p[0] * q[0] + p[1] * q[1] + p[2] * q[2];
+            let cross = [
+                p[1] * q[2] - p[2] * q[1],
+                p[2] * q[0] - p[0] * q[2],
+                p[0] * q[1] - p[1] * q[0],
+            ];
+            let cross_norm =
+                (cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2]).sqrt();
+            let angle = cross_norm.atan2(dot);
             let expected = (-angle / LENGTH_SCALE).exp();
             assert!(
                 (k[(i, j)] - expected).abs() < 1e-10,
