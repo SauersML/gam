@@ -436,13 +436,52 @@ pub fn canonicalize_for_identifiability(
 ///
 /// `nk_scale` mirrors the audit's tolerance size term
 /// `(n·K).max(p).max(1)` (`keep_positive_eigenspace`).
-fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize) -> usize {
+///
+/// PENALTY AUGMENTATION (channel-aware analogue of the flat #1391 fix). The
+/// channel-aware audit does NOT decide its kept rank from the bare data Gram: it
+/// ranks the PENALTY-AUGMENTED Gram `JᵀJ + Σ_block SᵀS`
+/// (`channel_aware_penalty_aware_joint_rank` in `audit.rs`), so a direction that
+/// is data-WEAK but penalty-ANCHORED — e.g. the wiggliness-penalised null modes a
+/// softmax channel shares once the cross-class σ²-coupling thins their data
+/// signal — is counted as identifiable and KEPT. Ranking the bare `J_can` here
+/// undercounts exactly those kept directions, so a faithful column-selection `T`
+/// reports `rank(J_can) < p_red` and trips a FALSE invariant violation
+/// (multinomial `s(x) + s(x, by=g)`, rank 28 vs p_red 30). Augmenting with the
+/// same reduced per-block structural penalties realigns the verification metric
+/// with the audit's drop convention — the bare data Gram is recovered when no
+/// block is penalised, so unpenalised channel-aware fits are unaffected.
+fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize, blocks: &[FlatRankBlock]) -> usize {
     let p = j.ncols();
     if p == 0 || j.nrows() == 0 {
         return 0;
     }
     // G = JᵀJ (p × p), symmetric PSD — same Gram the audit eigendecomposes.
-    let gram = fast_ata(j);
+    let mut gram = fast_ata(j);
+    // Augment block-diagonally with each block's SᵀS, exactly as the audit's
+    // `channel_aware_penalty_aware_joint_rank` builds its augmented Gram. Only
+    // applied when the declared block widths tile the design columns; otherwise
+    // fall back to the bare Gram (no spurious augmentation).
+    let declared: usize = blocks.iter().map(|b| b.width).sum();
+    let mut n_penalty_rows = 0usize;
+    if declared == p {
+        let mut col_off = 0usize;
+        for b in blocks {
+            if let Some(s) = b.structural_penalty.as_ref()
+                && s.nrows() == b.width
+                && s.ncols() == b.width
+                && b.width > 0
+            {
+                let sts = fast_atb(s, s);
+                let mut sub = gram.slice_mut(ndarray::s![
+                    col_off..col_off + b.width,
+                    col_off..col_off + b.width
+                ]);
+                sub += &sts;
+                n_penalty_rows += b.width;
+            }
+            col_off += b.width;
+        }
+    }
     let (evals, _) = match gram.eigh(Side::Lower) {
         Ok(ev) => ev,
         // Eigendecomposition failure: fall back to the structural column count
@@ -454,7 +493,9 @@ fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize) -> usize {
     let trace: f64 = (0..p).map(|i| gram[[i, i]].max(0.0)).sum();
     let scale = lambda_max.max(trace);
     // RANK_REVEAL_EPS_SLACK = 64.0 in families::compiler — kept in sync here.
-    let nk = nk_scale.max(p).max(1) as f64;
+    // The penalty rows enlarge the audit's tall-design row count, mirroring
+    // `rank_of_gram(.., n_design_rows + n_penalty_rows)` in the audit.
+    let nk = nk_scale.saturating_add(n_penalty_rows).max(p).max(1) as f64;
     let tau = scale * 64.0 * nk * f64::EPSILON;
     evals.iter().filter(|&&l| l > tau).count()
 }
@@ -1260,7 +1301,7 @@ fn canonicalize_for_identifiability_inner(
                 })
                 .collect();
             let rank_j_can = if use_channel_aware {
-                audit_convention_rank(&j_can, nk_scale)
+                audit_convention_rank(&j_can, nk_scale, &flat_blocks_can)
             } else {
                 flat_audit_convention_rank(&j_can, &flat_blocks_can)
             };
@@ -2114,7 +2155,7 @@ mod tests {
 
         // The single joint eigendecomposition counts the near-separable column:
         // J_pre is full rank under `audit_convention_rank`.
-        let rank_pre = audit_convention_rank(&j_pre, nk_scale);
+        let rank_pre = audit_convention_rank(&j_pre, nk_scale, &[]);
         assert_eq!(
             rank_pre, p_total,
             "fixture must make the joint eigendecomposition count the near-separable \
@@ -2132,7 +2173,7 @@ mod tests {
             }
         }
 
-        let rank_can = audit_convention_rank(&j_can, nk_scale);
+        let rank_can = audit_convention_rank(&j_can, nk_scale, &[]);
 
         // OLD compare (full J_pre vs reduced J_can) WOULD have tripped: the joint
         // eigendecomposition over-counts J_pre relative to the reduced design.
