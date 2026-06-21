@@ -2364,8 +2364,6 @@ fn scan_for_cargo_feature_entries(
         let mut in_features = false;
         for (idx, line) in content.lines().enumerate() {
             let trimmed = line.trim();
-            // Strip TOML `#` comments (TOML has no string-literal `#`
-            // confusion at line scope worth handling here).
             let code_part = match trimmed.find('#') {
                 Some(p) => trimmed[..p].trim_end(),
                 None => trimmed,
