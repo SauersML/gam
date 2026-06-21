@@ -2032,6 +2032,11 @@ mod tests {
     use super::*;
     use ndarray::{array, s};
 
+    /// Local mirror of the audit's `JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN` fallback
+    /// threshold, used only by the regression tests below to assert the verdict
+    /// margin lands on the correct side of the cliff. Kept in sync by value (1e3).
+    const JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST: f64 = 1.0e3;
+
     #[test]
     fn rrqr_nullspace_basis_is_orthonormal_and_annihilates_transpose() {
         let a = array![[1.0, 0.0], [1.0, 0.0], [0.0, 2.0], [0.0, 0.0],];
@@ -2428,9 +2433,3 @@ mod tests {
         );
     }
 }
-
-/// Local mirror of the audit's `JOINT_GRAM_RRQR_MIN_VERDICT_MARGIN` fallback
-/// threshold, used only by the regression tests above to assert the verdict
-/// margin lands on the correct side of the cliff. Kept in sync by value (1e3).
-#[cfg(test)]
-const JOINT_GRAM_RRQR_TRUST_MARGIN_FOR_TEST: f64 = 1.0e3;
