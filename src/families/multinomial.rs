@@ -252,8 +252,7 @@ fn multinomial_formula_min_lambda(y_one_hot: ArrayView2<'_, f64>) -> f64 {
     if !min_class_count.is_finite() || min_class_count <= 0.0 {
         return MULTINOMIAL_FORMULA_MIN_LAMBDA;
     }
-    let information_scale =
-        (MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_COUNT / min_class_count).max(1.0);
+    let information_scale = (MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_COUNT / min_class_count).max(1.0);
     (MULTINOMIAL_FORMULA_MIN_LAMBDA * information_scale).clamp(
         MULTINOMIAL_FORMULA_MIN_LAMBDA,
         MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA,
@@ -1947,13 +1946,20 @@ mod fisher_override_tests {
         assert!((floor_for_min_count(50) - MULTINOMIAL_FORMULA_MIN_LAMBDA).abs() < 1e-18);
         assert!((floor_for_min_count(200) - MULTINOMIAL_FORMULA_MIN_LAMBDA).abs() < 1e-18);
         // Very sparse (count <= c0*base/sparse = 10) clamps to the strong floor.
-        assert!((floor_for_min_count(10) - MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA).abs() < 1e-18);
-        assert!((floor_for_min_count(5) - MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA).abs() < 1e-18);
+        assert!(
+            (floor_for_min_count(10) - MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA).abs() < 1e-18
+        );
+        assert!(
+            (floor_for_min_count(5) - MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA).abs() < 1e-18
+        );
         // No cliff at the old hard threshold: 49 vs 50 differ by < 5% (the old
         // step jumped 5x). Floor is monotone non-increasing in support.
         let f49 = floor_for_min_count(49);
         let f50 = floor_for_min_count(50);
-        assert!(f49 >= f50 && f49 <= f50 * 1.05, "floor must be continuous across c0, got {f49} vs {f50}");
+        assert!(
+            f49 >= f50 && f49 <= f50 * 1.05,
+            "floor must be continuous across c0, got {f49} vs {f50}"
+        );
         let f25 = floor_for_min_count(25);
         assert!(
             f25 > f50 && f25 < floor_for_min_count(10),

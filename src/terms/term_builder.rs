@@ -28,10 +28,10 @@ use crate::inference::formula_dsl::{
 use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
 use crate::smooth::{
-    ByVarKind, FactorSmoothFlavour, FactorSmoothSpec,
-    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
-    TensorBSplinePenaltyDecomposition, TensorBSplineSpec, TermCollectionSpec,
+    ByVarKind, FactorSmoothFlavour, FactorSmoothSpec, LinearCoefficientGeometry, LinearTermSpec,
+    RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
+    TensorBSplineIdentifiability, TensorBSplinePenaltyDecomposition, TensorBSplineSpec,
+    TermCollectionSpec,
 };
 use crate::types::ColIdx;
 
@@ -547,19 +547,20 @@ pub fn build_termspec(
                             // unpenalized treatment-coded main effect, which would
                             // double-represent the factor (two `g` design blocks +
                             // a spurious extra smoothing parameter).
-                            let penalized_group_owner_present = terms.iter().any(|other| match other {
-                                ParsedTerm::RandomEffect { name } => name == &by_name,
-                                ParsedTerm::Linear {
-                                    name,
-                                    explicit: false,
-                                    ..
-                                } if name == &by_name => col_map
-                                    .get(name)
-                                    .and_then(|c| ds.column_kinds.get(*c).copied())
-                                    .map(|kind| matches!(kind, ColumnKindTag::Categorical))
-                                    .unwrap_or(false),
-                                _ => false,
-                            });
+                            let penalized_group_owner_present =
+                                terms.iter().any(|other| match other {
+                                    ParsedTerm::RandomEffect { name } => name == &by_name,
+                                    ParsedTerm::Linear {
+                                        name,
+                                        explicit: false,
+                                        ..
+                                    } if name == &by_name => col_map
+                                        .get(name)
+                                        .and_then(|c| ds.column_kinds.get(*c).copied())
+                                        .map(|kind| matches!(kind, ColumnKindTag::Categorical))
+                                        .unwrap_or(false),
+                                    _ => false,
+                                });
                             // Add an unpenalized treatment-coded fixed main
                             // effect for a standalone factor-by smooth, unless
                             // the same factor already has an explicit
@@ -570,9 +571,7 @@ pub fn build_termspec(
                             // owner of level offsets; adding a no-pooling fixed
                             // factor effect would bypass random-effect
                             // shrinkage and degrade BLUP-style predictions.
-                            if !random_terms
-                                .iter()
-                                .any(|rt| rt.name == by_name)
+                            if !random_terms.iter().any(|rt| rt.name == by_name)
                                 && !penalized_group_owner_present
                             {
                                 random_terms.push(RandomEffectTermSpec {
@@ -2179,8 +2178,7 @@ pub fn build_smooth_basis(
             // `k`/`centers` still takes full effect via `parse_countwith_basis_alias`.
             let default_centers = if cols.len() == 1 {
                 let nullspace_dim = crate::basis::duchon_nullspace_dimension(1, 1);
-                let target_centers =
-                    THIN_PLATE_1D_DEFAULT_BASIS_DIM.saturating_sub(nullspace_dim);
+                let target_centers = THIN_PLATE_1D_DEFAULT_BASIS_DIM.saturating_sub(nullspace_dim);
                 plan.centers.min(target_centers.max(1))
             } else {
                 plan.centers

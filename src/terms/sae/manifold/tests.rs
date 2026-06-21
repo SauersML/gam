@@ -3894,6 +3894,36 @@ pub(crate) fn sae_row_layout_from_dense_weights_top_k_and_cutoff() {
     assert_eq!(full[7], 6.0);
 }
 
+// #1450 — large-K (K=100000) end-to-end `from_dense_weights` coverage.
+#[test]
+pub(crate) fn from_dense_weights_large_k_support_proposal_1450() {
+    let (k_atoms, d, k_true, n) = (100_000_usize, 1, 4, 4);
+    let planted: Vec<usize> = (0..k_true).map(|j| j * k_atoms / k_true).collect();
+    let assignments: Vec<Array1<f64>> = (0..n)
+        .map(|row| {
+            let mut a = vec![1e-9_f64; k_atoms];
+            for (i, &atom) in planted.iter().enumerate() {
+                a[atom] = 0.2 + 0.01 * (row + i) as f64;
+            }
+            Array1::from_vec(a)
+        })
+        .collect();
+    let coord_offsets: Vec<usize> = (0..k_atoms).map(|k| k_atoms + k).collect();
+    let layout = SaeRowLayout::from_dense_weights(
+        &assignments,
+        k_true,
+        1e-3,
+        vec![d; k_atoms],
+        coord_offsets,
+    );
+    for row in 0..n {
+        assert_eq!(layout.active_atoms[row], planted, "row {row} wrong atoms");
+        assert_eq!(layout.row_q_active(row), k_true + k_true * d);
+    }
+    let compact_work: usize = (0..n).map(|r| layout.row_q_active(r).pow(2)).sum();
+    assert!(compact_work < n * (k_atoms * (1 + d)).pow(2) / 1_000_000);
+}
+
 /// MechanismSparsityPenalty must reach the SAE arrow-Schur system's
 /// `gb` (beta-tier gradient) when its target slice is shaped to match a
 /// single-atom decoder block (M, p_out). The group lasso over rows of

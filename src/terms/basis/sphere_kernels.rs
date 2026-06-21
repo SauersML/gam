@@ -272,9 +272,9 @@ fn wahba_sphere_kernel_sobolev_closed_form_derivative_dcos(cos_gamma: f64, m: us
         // any other `m` is a caller-contract violation (a programming error,
         // not runtime data), and panicking surfaces it instead of returning a
         // silently-wrong derivative.
-        other => panic!(
-            "closed-form Sobolev derivative only defined for m in {{1,2,3}}; got m={other}"
-        ),
+        other => {
+            panic!("closed-form Sobolev derivative only defined for m in {{1,2,3}}; got m={other}")
+        }
     };
     // du/d(cos gamma) = -1/2.
     dk_du * (-0.5)

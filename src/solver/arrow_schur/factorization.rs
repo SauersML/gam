@@ -720,10 +720,8 @@ pub(crate) fn factor_one_row_result(
                     // knife-edge a route lands on.
                     if ridge_t == 0.0 && allow_spectral_deflation {
                         let kappa_est = cholesky_factor_kappa_estimate(&factor);
-                        if !cholesky_factor_passes_safe_inversion(
-                            &factor, d, diag_scale, kappa_est,
-                        ) && let Some(deflated) =
-                            factor_spectral_deflated_evidence_row(row, d)
+                        if !cholesky_factor_passes_safe_inversion(&factor, d, diag_scale, kappa_est)
+                            && let Some(deflated) = factor_spectral_deflated_evidence_row(row, d)
                         {
                             return Ok(deflated);
                         }

@@ -903,7 +903,13 @@ impl BernoulliMarginalSlopeFamily {
             for _ in 0..4 {
                 let scalar_a = MultiDirJet::constant(0, intercept_root);
                 let (f, f_a) = self.empirical_flex_calibration_jets(
-                    primary, &scalar_a, &scalar_mu, &scalar_b, beta_h, beta_w, scalar_dirs,
+                    primary,
+                    &scalar_a,
+                    &scalar_mu,
+                    &scalar_b,
+                    beta_h,
+                    beta_w,
+                    scalar_dirs,
                     grid,
                 )?;
                 let d = f_a.coeff(0);
