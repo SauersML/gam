@@ -566,6 +566,20 @@ impl PsiGramTensor {
     /// `psi_ref == psi_new` (a repeat trial at the same ψ) is trivially sound.
     /// Off-window ψ's, a non-finite / rank-degenerate Gram, or any eigendecomp
     /// failure return `false` (refuse the skip → caller takes the slow path).
+    ///
+    /// HONEST FRONTIER LIMIT (#1033). This witness is deliberately conservative,
+    /// and on PRODUCTION spatial geometry it almost never returns `true` for
+    /// `psi_ref != psi_new`: the realized reduced basis is built from RRQR pivots
+    /// on the actual n×k design, and the conditioned data-Gram range subspace
+    /// genuinely ROTATES with ψ even when the rank is fixed (the "rotation wall").
+    /// So the n-free design-revision skip the kappa outer loop wants to arm rarely
+    /// fires off-diagonal here — this is a known architectural limit, NOT a bug in
+    /// this gate. Refusing the skip is the SOUND outcome (the caller falls back to
+    /// the exact slow path); a future fix needs an n-reproducible reduced basis,
+    /// not a looser tolerance on this projector test. Do not weaken
+    /// `PSI_GRAM_SKIP_PROJ_ATOL` / `PSI_GRAM_SKIP_RANK_RTOL` to force more skips:
+    /// a forced skip across a rotated subspace reintroduces the ~7.8e-2 β̂
+    /// regression this witness exists to prevent.
     pub fn reduced_basis_equal(&self, psi_ref: f64, psi_new: f64) -> bool {
         if !(self.contains(psi_ref) && self.contains(psi_new)) {
             return false;
