@@ -106,11 +106,10 @@ fn fit_kappa_hat(kappa_star: f64, seed: u64) -> f64 {
 // basin defect. Fix landed this run: anchor the criterion-ranked objective-grid
 // prepass at the warm seed so the inner λ-solve jumps into the correct high-λ
 // basin, adopting the grid result only when it strictly lowers the true REML cost
-// (healthy warm-started fits byte-identical). Kept `#[ignore]`d ONLY because the
-// landing run could not compile-verify (MSI/VPN down) — un-ignore in a follow-up
-// once a full build confirms this contract passes.
+// (healthy warm-started fits byte-identical). This contract runs unconditionally
+// in CI: re-`#[ignore]`ing it would only hide a future regression behind a skip,
+// which the ban gate forbids and which is exactly the failure mode #1464 was.
 #[test]
-#[ignore = "#1464: inner-λ basin fix landed; un-ignore after build-verification"]
 fn curv_full_fit_identifies_curvature_sign_on_mirror_datasets() {
     init_parallelism();
 
