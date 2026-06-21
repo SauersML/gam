@@ -28,9 +28,8 @@ pub enum GpuError {
     /// Runtime throughput calibration produced an unusable measurement
     /// (non-positive elapsed time, non-finite GB/s or GFLOPS).
     CalibrationFailed { reason: String },
-    /// The requested GPU code path is recognized but not yet implemented.
-    /// Used by milestone-by-milestone kernel rollouts: callers treat this
-    /// as a sentinel to fall back to the CPU path silently (no panic, no
+    /// The requested GPU code path has no device kernel on this build. Callers
+    /// treat this as a sentinel to fall back to the CPU path silently (no panic,
     /// error log, just an info line). Distinct from `DriverCallFailed` so
     /// the dispatcher can tell "kernel not landed yet" apart from "device
     /// said no". Carries a short reason for diagnostics, e.g. the kernel

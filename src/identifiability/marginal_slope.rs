@@ -2562,10 +2562,9 @@ mod tests {
     ///   (4) reports `joint_rank` = (raw_total - 1).
     ///
     /// This validates the Phase-4b construction-time orthogonalisation
-    /// path on the survival K=4 row primary state without requiring
-    /// the SMGS construction site to be wired yet (which is what the
-    /// active sibling integration handles). The shape of the result
-    /// is the contract the SMGS wiring will assert against.
+    /// path on the survival K=4 row primary state without the SMGS construction
+    /// hook the active sibling integration provides. The shape of the result is
+    /// the contract the SMGS wiring will assert against.
     #[test]
     fn compile_survival_three_block_with_shared_constant_drops_one_direction() {
         use crate::identifiability::families::compiler::compile;

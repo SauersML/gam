@@ -58,7 +58,8 @@
 //!   opt-out; the caller is responsible for separately providing a unique
 //!   inner minimum (e.g. via a custom penalty).
 //!
-//! `IsometryToReference` is deferred to a follow-up (see proposal §4(b)).
+//! `LatentIdMode` does not expose `IsometryToReference` today (proposal §4(b));
+//! use `AuxPrior` or a future isometry prior for gauge fixing.
 
 use crate::solver::latent_cache::LatentRetractionRegistry;
 use crate::terms::basis::{BasisError, RadialScalarKind};

@@ -1453,8 +1453,6 @@ impl BernoulliMarginalSlopeFamily {
         //    without any cross-context copying.
         #[cfg(target_os = "linux")]
         let cell_moments_device: Option<cudarc::driver::CudaSlice<f64>> = if build_device_moments {
-            #[cfg(debug_assertions)]
-            use crate::gpu::kernels::cubic_cell::CubicCellMomentStatus;
             use crate::gpu::kernels::cubic_cell::{
                 CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
                 CubicCellMomentResidency, try_build_cubic_cell_derivative_moments,

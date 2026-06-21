@@ -2646,10 +2646,9 @@ pub fn maybe_log_audit_drift(
     // We pass `family_scalars` as the `channel_hessian` field indirectly:
     // the flat audit calls `effective_jacobian_at` for each block, which
     // internally reads from `family_scalars` when the block has a
-    // `jacobian_callback`.  The W refresh is not wired through the flat
-    // audit (which uses no W); the drift detection here is purely structural
-    // (rank of J(β)), not curvature-weighted.  That is the correct
-    // identifiability check: structural rank is what tells you whether the
+    // `jacobian_callback`.  The flat audit omits W refresh (no W matrix); the
+    // drift detection here is purely structural (rank of J(β)), not
+    // curvature-weighted.  That is the correct identifiability check: structural
     // model is locally identified at β.
     let p_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
     let beta_for_state: Vec<f64> = if beta_current.len() == p_total {

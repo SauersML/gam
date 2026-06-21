@@ -1693,7 +1693,7 @@ impl JacobiPreconditioner {
 ///   overlapping columns averaged by partition-of-unity weights.
 ///
 /// ```text
-/// Future variants (not yet wired, see #299):
+/// Future variants (see #299):
 ///   DiagAssembledSchwarz { overlap: usize },
 ///   SparseIncompleteCholesky,
 /// ```

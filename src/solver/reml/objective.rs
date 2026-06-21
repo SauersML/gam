@@ -1626,9 +1626,9 @@ impl<'a> RemlState<'a> {
     /// GLM derivative design, and the penalty coordinates all in the same
     /// (original) basis, restoring cost–gradient consistency. The only path
     /// that still needs `build_dense_assembly` is the monotonicity/active-set
-    /// branch, where `free_basis_opt` already rotates everything into a
-    /// reduced QS subspace (and the original-basis penalty-coord fast path
-    /// isn't wired through the projected `Z` matrix yet).
+    /// branch, where `free_basis_opt` already rotates everything into a reduced QS
+    /// subspace (penalty-coord fast path uses `build_dense_assembly` there because
+    /// the projected-`Z` original-basis route is unavailable in that subspace).
     pub(crate) fn build_auto_assembly(
         &self,
         rho: &Array1<f64>,

@@ -277,11 +277,11 @@ fn proposal(term: &SaeManifoldTerm, mv: StructureMove, trigger: f64) -> MoveProp
 ///   coordinate prior).
 /// * **Fusions** from the top co-activation pairs by symmetric code dependence.
 /// * **Fission audits** from absorption-suspect pairs (high conditional
-///   asymmetry). The within-atom substructure carve (#907 mixture race / #975
-///   `carve`) that would refine the audit is NOT yet wired (its fit-side inputs
-///   land with #993); until then the audit proposes a fission whose acceptance
-///   the e-gate owns, and the absent carve is recorded loudly via
-///   [`HarvestReport::fission_carve_skipped`] rather than silently dropped.
+///   asymmetry). Fit-side inputs for the within-atom substructure carve (#907
+///   mixture race / #975 `carve`) land with #993; until those inputs exist the
+///   audit proposes a fission whose acceptance the e-gate owns, and the absent
+///   carve is recorded loudly via [`HarvestReport::fission_carve_skipped`]
+///   rather than silently dropped.
 /// * **Births** from the whitened residual-factor subspace: the residuals are
 ///   fed to [`StructuredResidualModel::fit`], whose factor directions
 ///   ([`StructuredResidualModel::factor`]) are the birth candidates, ranked by
@@ -364,9 +364,8 @@ pub fn harvest_move_proposals(
     // Keep the most-suspect (lowest significance) audit per parent atom.
     fission_atoms.sort_by(|x, y| x.1.total_cmp(&y.1).then(x.0.cmp(&y.0)));
     fission_atoms.dedup_by_key(|(atom, _)| *atom);
-    // The within-atom carve that would refine each audit is not yet wired
-    // (#993): record the skip loudly. The fission proposal still rides; the
-    // e-gate decides acceptance.
+    // Fit-side inputs for the #993 within-atom carve are absent here: record the
+    // skip loudly. The fission proposal still rides; the e-gate decides acceptance.
     let fission_carve_skipped = !fission_atoms.is_empty();
     for &(atom, significance) in fission_atoms.iter().take(params.max_fissions) {
         proposals.push(proposal(
@@ -2208,7 +2207,7 @@ mod tests {
     /// Oracle (#997 trigger): a planted ABSORPTION (A⊇B: B's support nests
     /// inside A's) produces a FISSION audit on the parent A (high conditional
     /// asymmetry, parent conditional ≈ 1), and the `fission_carve_skipped` flag
-    /// is recorded loudly (the #993 within-atom carve is not yet wired).
+    /// is recorded loudly (`fission_carve_skipped`; #993 carve absent on this path).
     #[test]
     fn planted_absorption_harvests_fission_audit_with_loud_carve_skip() {
         // Atom 0 (parent) active on rows ≡ 0 mod 2 PLUS rows ≡ 1 mod 4; atom 1

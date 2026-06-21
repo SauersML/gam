@@ -2335,7 +2335,7 @@ impl TermCollectionDesign {
             .filter_map(|t| t.kronecker_factored.as_ref())
             .collect();
         if kron_terms.len() != 1 {
-            return None; // 0 or multiple Kronecker terms — not supported yet
+            return None; // fast path requires exactly one Kronecker term
         }
         let kron = kron_terms[0];
         // Only use the Kronecker path when the model is purely this tensor term
