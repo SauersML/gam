@@ -876,21 +876,131 @@ impl BernoulliMarginalSlopeFamily {
             marginal.mu4,
         ]);
         let b_jet = Self::primary_component_jet(n_dirs, b, directions, primary.logslope)?;
-        let intercept_root = row_ctx.intercept;
+
+        // Tighten the seed to a genuine scalar root of `F(a,θ₀) = 0` before the
+        // derivative lift (task §B item 1). The order-by-order implicit-function
+        // recursion below NEVER touches the order-0 (value) channel, so it cannot
+        // correct a non-root seed: a residual `r = F(a₀,θ₀) ≠ 0` would expand the
+        // wrong level set `F = r` and inject an O(r)·F_ai/F_a² contamination into
+        // the derivative channels. The production scalar solve already converges
+        // `row_ctx.intercept` tightly, but a handful of scalar Newton steps here
+        // are cheap (order-0 channels only) and make the genuine-root precondition
+        // hold by CONSTRUCTION at 4th-derivative grade rather than relying on the
+        // upstream tolerance being tight enough for fourth-order coefficients.
+        let mut intercept_root = row_ctx.intercept;
+        {
+            let scalar_dirs: &[ArrayView1<'_, f64>] = &[];
+            let scalar_b = Self::primary_component_jet(0, b, scalar_dirs, primary.logslope)?;
+            let scalar_mu = Self::primary_component_jet(0, q, scalar_dirs, primary.q)?
+                .compose_unary([
+                    marginal.mu,
+                    marginal.mu1,
+                    marginal.mu2,
+                    marginal.mu3,
+                    marginal.mu4,
+                ]);
+            let scalar_root_tol = 1e-12 * (1.0 + intercept_root.abs());
+            for _ in 0..4 {
+                let scalar_a = MultiDirJet::constant(0, intercept_root);
+                let (f, f_a) = self.empirical_flex_calibration_jets(
+                    primary, &scalar_a, &scalar_mu, &scalar_b, beta_h, beta_w, scalar_dirs,
+                    grid,
+                )?;
+                let d = f_a.coeff(0);
+                if !(d.is_finite() && d > 0.0) {
+                    return Err(format!(
+                        "empirical flex scalar refinement has invalid F_a={d} (row {row})"
+                    ));
+                }
+                let residual = f.coeff(0);
+                intercept_root -= residual / d;
+                if residual.abs() <= scalar_root_tol {
+                    break;
+                }
+            }
+        }
+
+        // Lift the calibrated intercept's derivative tower by the exact
+        // implicit-function recursion (docs/jet_tower_cutover_derivations.md §B),
+        // NOT a value-pinned Newton iteration.
+        //
+        // The defect §B identifies in the prior pinned-Newton loop: it took a
+        // full-jet Newton step `A -= F·(1/F_a)` each pass and then RESET the
+        // constant channel `A.coeffs[0] = intercept_root`. That step is exact for
+        // the derivative channels ONLY if `intercept_root` is already an exact
+        // root of `F(a,θ₀) = 0`; a nonzero scalar residual `r = F(a₀,θ₀)` injects
+        // an O(r)·F_ai/F_a² contamination into the first-derivative channel (and
+        // compounds at higher orders through the un-recursed terms).
+        //
+        // The exact recursion instead builds the order-by-order substitution of
+        // §B. With `A` carrying the running intercept tower (so the calibration
+        // jet `F = F(A,θ)` is the composed residual `substitute_intercept(F,A)`),
+        // the order-m coefficient of `F` depends on the order-m coefficient of
+        // `A` ONLY through the single linear term `D·A_{(m)}` with `D = F_a.v`;
+        // every other contribution involves strictly lower-order (already-fixed)
+        // tensors of `A`. So sweeping orders `m = 1..=n_dirs` and subtracting
+        // `F_{(m)}/D` from each order-m coefficient of `A` cancels that order's
+        // residual exactly without disturbing any lower order. The recursion
+        // never touches order 0, so it requires (and below asserts) a genuine
+        // scalar root at `intercept_root`.
         let mut a_jet = MultiDirJet::constant(n_dirs, intercept_root);
-        for _ in 0..6 {
+
+        // Order-by-order implicit-function lift. Pass `m` recomputes the composed
+        // residual against the lower orders fixed by passes `1..m`, then cancels
+        // every order-`m` coefficient. `n_dirs` passes are exact (each direction
+        // contributes one bit; the highest mask has `n_dirs` set bits). The
+        // first pass's residual doubles as the genuine-root precondition check.
+        let root_tol = 1e-9 * (1.0 + intercept_root.abs());
+        for order in 1..=n_dirs {
             let (f, f_a) = self.empirical_flex_calibration_jets(
                 primary, &a_jet, &mu_jet, &b_jet, beta_h, beta_w, directions, grid,
             )?;
-            if !(f_a.coeff(0).is_finite() && f_a.coeff(0) > 0.0) {
+            let d = f_a.coeff(0);
+            if !(d.is_finite() && d > 0.0) {
                 return Err(format!(
-                    "empirical flex calibration jet has invalid F_a={}",
-                    f_a.coeff(0)
+                    "empirical flex calibration jet has invalid F_a={d}"
                 ));
             }
-            let inv_f_a = f_a.compose_unary(unary_derivatives_reciprocal(f_a.coeff(0)));
-            a_jet = a_jet.add(&f.mul(&inv_f_a).scale(-1.0));
-            a_jet.coeffs[0] = intercept_root;
+            // Genuine-root precondition (checked on the first, undisturbed pass).
+            // The production scalar solve (`empirical_intercept_from_marginal`)
+            // converges the log-space residual to ~1e-13, so the linear-space
+            // residual `r = Σ π_k Φ(η_k) − μ` here is far below this
+            // 4th-derivative-grade floor; the check makes any future seed
+            // regression LOUD rather than silently expanding the wrong level set
+            // `F = r` instead of the root curve `F = 0` (§B preconditions). The
+            // recursion never touches order 0, so a non-root seed cannot be
+            // corrected here — it must be rejected.
+            if order == 1 && !(f.coeff(0).abs() <= root_tol) {
+                return Err(format!(
+                    "empirical flex intercept is not a genuine calibration root: \
+                     residual={:.3e} > {root_tol:.3e} at a={intercept_root:.6} (row {row})",
+                    f.coeff(0)
+                ));
+            }
+            for mask in 0..a_jet.coeffs.len() {
+                if mask.count_ones() as usize == order {
+                    a_jet.coeffs[mask] -= f.coeff(mask) / d;
+                }
+            }
+        }
+
+        // Composed-residual post-check (§B, mandatory). After the lift every
+        // derivative channel of `F(A,θ)` must vanish; only the value channel may
+        // carry the (already-bounded) seed residual `r`. A nonzero higher-order
+        // channel would mean an arithmetic regression in the recursion silently
+        // shipping a level-set expansion — make it loud.
+        let (g, g_a) = self.empirical_flex_calibration_jets(
+            primary, &a_jet, &mu_jet, &b_jet, beta_h, beta_w, directions, grid,
+        )?;
+        let resid_tol = 1e-7 * (1.0 + g_a.coeff(0).abs());
+        for mask in 1..g.coeffs.len() {
+            let resid = g.coeff(mask);
+            if !(resid.abs() <= resid_tol) {
+                return Err(format!(
+                    "empirical flex intercept lift left residual {resid:.3e} in channel \
+                     0b{mask:b} (> {resid_tol:.3e}) at row {row}"
+                ));
+            }
         }
 
         let (eta_observed, _) = self.empirical_flex_eta_and_eta_a_jet_at_z(
@@ -2273,20 +2383,6 @@ impl BernoulliMarginalSlopeFamily {
         cell: exact_kernel::DenestedCubicCell,
         max_degree: usize,
     ) -> Result<exact_kernel::CellMomentState, String> {
-        // When a deviation runtime (score-warp / linkwiggle) is active the
-        // denested-partition cells are a function of the *row's* converged
-        // intercept and slope, so their `(c0..c3, left, right)` fingerprints are
-        // effectively row-unique. The fit-lifetime cross-row LRU then runs at
-        // ~0.1% hit rate at large scale while pinning multiple GiB of resident
-        // moment entries and serialising every row behind its mutex (insert +
-        // eviction churn). Intra-β reuse of a single row's moments is already
-        // served by the per-row `degree9_cells` cache and the
-        // `RowCellMomentsBundle`; the cross-row layer buys nothing here. Skip it
-        // and evaluate uncached — bit-identical to a cold LRU miss, which still
-        // honours the affine tail-cell memo inside `evaluate_cell_moments`.
-        if self.flex_active() {
-            return exact_kernel::evaluate_cell_moments(cell, max_degree);
-        }
         exact_kernel::evaluate_cell_moments_cached(
             cell,
             max_degree,
@@ -2301,14 +2397,6 @@ impl BernoulliMarginalSlopeFamily {
         cell: exact_kernel::DenestedCubicCell,
         max_degree: usize,
     ) -> Result<exact_kernel::CellDerivativeMomentState, String> {
-        // See `evaluate_cell_moments_lru`: under an active deviation runtime the
-        // cross-row LRU never amortises (row-unique cell fingerprints), so it is
-        // pure resident-memory and lock overhead. Evaluate uncached — identical
-        // to a cold LRU miss, which is exactly what the cached path computes via
-        // `evaluate_cell_derivative_moments_uncached` on a miss.
-        if self.flex_active() {
-            return exact_kernel::evaluate_cell_derivative_moments_uncached(cell, max_degree);
-        }
         exact_kernel::evaluate_cell_derivative_moments_cached(
             cell,
             max_degree,
