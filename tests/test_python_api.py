@@ -2417,3 +2417,96 @@ def test_survival_prediction_concordance_recovers_known_ordering() -> None:
         event_times, events, risk_score=np.ones(3, dtype=float)
     )
     assert c_tie == 0.5, f"constant risk score must give 0.5; got {c_tie}"
+
+
+def _equivalence_training_frame() -> pd.DataFrame:
+    rng = np.random.default_rng(20240601)
+    n = 200
+    x = np.linspace(-3.0, 3.0, n)
+    z = rng.normal(0.0, 1.0, n)
+    y = 0.7 * x - 0.4 * z + np.sin(x) + rng.normal(0.0, 0.05, n)
+    return pd.DataFrame({"y": y, "x": x, "z": z})
+
+
+def _equivalence_prediction_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {"x": np.linspace(-2.5, 2.5, 13), "z": np.linspace(-1.0, 1.0, 13)}
+    )
+
+
+def test_fit_on_dask_matches_fit_on_equivalent_pandas() -> None:
+    """Load-bearing: fitting + predicting on a Dask frame must produce the
+    same coefficients and predictions as the identical data as pandas. The
+    Dask frame is materialized to pandas internally, so the fit must be
+    bit-for-bit identical, not merely close."""
+    dd = pytest.importorskip("dask.dataframe")
+
+    pandas_frame = _equivalence_training_frame()
+    dask_frame = dd.from_pandas(pandas_frame, npartitions=4)
+
+    formula = "y ~ s(x) + z"
+    model_pandas = gamfit.fit(pandas_frame, formula)
+    model_dask = gamfit.fit(dask_frame, formula)
+
+    coef_pandas = np.asarray(
+        model_pandas.summary().coefficients_frame()["estimate"], dtype=float
+    )
+    coef_dask = np.asarray(
+        model_dask.summary().coefficients_frame()["estimate"], dtype=float
+    )
+    np.testing.assert_array_equal(coef_dask, coef_pandas)
+
+    grid = _equivalence_prediction_frame()
+    pred_pandas = np.asarray(model_pandas.predict(grid), dtype=float)
+    # Predict on a Dask grid too, exercising the dask input path on predict.
+    pred_dask = np.asarray(
+        model_dask.predict(dd.from_pandas(grid, npartitions=3)), dtype=float
+    )
+    np.testing.assert_array_equal(pred_dask, pred_pandas)
+
+
+def test_predict_return_type_dask_round_trips_values() -> None:
+    dd = pytest.importorskip("dask.dataframe")
+
+    model = gamfit.fit(_equivalence_training_frame(), "y ~ s(x) + z")
+    grid = _equivalence_prediction_frame()
+
+    dict_pred = model.predict(grid, return_type="dict")
+    dask_pred = model.predict(grid, return_type="dask")
+
+    assert isinstance(dask_pred, dd.DataFrame)
+    materialized = dask_pred.compute()
+    np.testing.assert_allclose(
+        np.asarray(materialized["mean"], dtype=float),
+        np.asarray(dict_pred["mean"], dtype=float),
+    )
+
+
+def test_fit_on_spss_matches_fit_on_direct_pandas() -> None:
+    """A write_sav -> read_spss round trip must fit identically to the
+    original in-memory pandas frame."""
+    prs = pytest.importorskip("pyreadstat")
+
+    import os
+    import tempfile
+
+    pandas_frame = _equivalence_training_frame()
+    formula = "y ~ s(x) + z"
+    model_pandas = gamfit.fit(pandas_frame, formula)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "train.sav")
+        prs.write_sav(pandas_frame, path)
+        spss_frame = gamfit.read_spss(path)
+
+    model_spss = gamfit.fit(spss_frame, formula)
+
+    coef_pandas = np.asarray(
+        model_pandas.summary().coefficients_frame()["estimate"], dtype=float
+    )
+    coef_spss = np.asarray(
+        model_spss.summary().coefficients_frame()["estimate"], dtype=float
+    )
+    # SPSS stores float64 exactly, so the round trip must reproduce the fit
+    # to within floating-point noise.
+    np.testing.assert_allclose(coef_spss, coef_pandas, rtol=1e-9, atol=1e-9)

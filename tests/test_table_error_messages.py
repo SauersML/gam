@@ -109,3 +109,40 @@ def test_dask_error_message_includes_context() -> None:
     error_msg = str(exc_info.value)
     assert "x" in error_msg, f"Expected column name 'x' in error: {error_msg}"
     assert "row 3" in error_msg, f"Expected row 3 in error: {error_msg}"
+
+
+def test_dask_nan_in_later_partition_reports_global_row() -> None:
+    """A NaN that falls in a later Dask partition must still report the row
+    number in the materialized (global) frame, not a partition-local index."""
+    pd = pytest.importorskip("pandas")
+    dd = pytest.importorskip("dask.dataframe")
+
+    from gamfit._tables import normalize_table
+
+    # NaN at global row 4 (1-indexed); 4 partitions put it in the last one.
+    pdf = pd.DataFrame({
+        "x": [1.0, 2.0, 3.0, float("nan")],
+        "y": [10.0, 20.0, 30.0, 40.0],
+    })
+    ddf = dd.from_pandas(pdf, npartitions=4)
+
+    with pytest.raises(ValueError) as exc_info:
+        normalize_table(ddf)
+
+    error_msg = str(exc_info.value)
+    assert "x" in error_msg, error_msg
+    assert "row 4" in error_msg, error_msg
+
+
+def test_dask_empty_frame_is_rejected() -> None:
+    """An empty Dask DataFrame must raise the same empty-table error as pandas."""
+    pd = pytest.importorskip("pandas")
+    dd = pytest.importorskip("dask.dataframe")
+
+    from gamfit._tables import normalize_table
+
+    empty = pd.DataFrame({"x": pd.Series([], dtype="float64")})
+    ddf = dd.from_pandas(empty, npartitions=1)
+
+    with pytest.raises(ValueError, match="table data cannot be empty"):
+        normalize_table(ddf)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any, cast
 
 SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow", "dask"}
@@ -172,12 +173,15 @@ def categorical_dtype_columns(data: Any, kind: str) -> frozenset[str]:
 def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
     kind = detect_table_kind(data)
     if kind == "pandas":
-        names = [str(column) for column in data.columns]
-        reject_duplicate_column_names(names, kind)
-        return (
-            {name: data.iloc[:, index].tolist() for index, name in enumerate(names)},
-            kind,
-        )
+        return _pandas_table_columns(data, kind), kind
+    if kind == "dask":
+        # The Rust FFI consumes in-memory columns, so fitting a Dask frame
+        # requires materializing it. Do that with a SINGLE compute() — one pass
+        # over the task graph yields one pandas frame — rather than a per-column
+        # compute() (which re-runs the whole graph once per column). The
+        # resulting pandas frame then reuses the exact pandas extraction path.
+        pdf = data.compute()
+        return _pandas_table_columns(pdf, kind), kind
     if kind == "polars":
         names = [str(column) for column in data.columns]
         reject_duplicate_column_names(names, kind)
@@ -190,15 +194,6 @@ def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
         reject_duplicate_column_names(names, kind)
         return (
             {name: data.column(index).to_pylist() for index, name in enumerate(names)},
-            kind,
-        )
-    if kind == "dask":
-        # Dask DataFrame: use to_numpy() for efficient conversion, or compute() + tolist()
-        # Note: This will materialize the entire DataFrame in memory
-        names = [str(name) for name in data.columns]
-        reject_duplicate_column_names(names, kind)
-        return (
-            {name: data[name].compute().tolist() for name in names},
             kind,
         )
     if kind == "numpy":
@@ -219,6 +214,18 @@ def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
     raise TypeError(
         "unsupported table input; use pandas, polars, pyarrow, dask, numpy, a mapping, a list of records, or a 2D row sequence"
     )
+
+
+def _pandas_table_columns(data: Any, kind: str) -> dict[str, list[Any]]:
+    """Extract columns from an in-memory pandas DataFrame as Python lists.
+
+    Shared by the ``pandas`` path and the ``dask`` path (which materializes its
+    frame to pandas once via ``compute()``). ``kind`` is carried only so the
+    duplicate-column error message names the original input library.
+    """
+    names = [str(column) for column in data.columns]
+    reject_duplicate_column_names(names, kind)
+    return {name: data.iloc[:, index].tolist() for index, name in enumerate(names)}
 
 
 def restore_output_table(
@@ -264,7 +271,8 @@ def restore_output_table(
 
         import pandas as pd
 
-        return dd.dataframe.from_pandas(pd.DataFrame(columns))
+        # npartitions is required on older Dask versions.
+        return dd.dataframe.from_pandas(pd.DataFrame(columns), npartitions=1)
     raise ValueError(f"unsupported return_type '{target}'")
 
 
@@ -295,10 +303,18 @@ def detect_table_kind(data: Any) -> str:
     if np is not None and isinstance(data, np.ndarray):
         return "numpy"
 
-    # Dask DataFrame detection
-    dd = _try_import("dask")
-    if dd is not None and hasattr(dd, "dataframe") and isinstance(data, dd.dataframe.DataFrame):
-        return "dask"
+    # Dask DataFrame detection. Only attempt the (relatively heavy) dask import
+    # when the object actually originates from dask, so the common non-dask
+    # inputs above (and mappings / record lists below) never pay an import
+    # attempt on every call.
+    if type(data).__module__.split(".", 1)[0] == "dask":
+        dd = _try_import("dask")
+        if (
+            dd is not None
+            and hasattr(dd, "dataframe")
+            and isinstance(data, dd.dataframe.DataFrame)
+        ):
+            return "dask"
 
     return "unknown"
 
@@ -507,8 +523,11 @@ def read_spss(path: str | Path) -> Any:
     Returns
     -------
     pandas.DataFrame
-        DataFrame with the SPSS data. Categorical columns from SPSS are
-        preserved as pandas Categorical dtype.
+        DataFrame with the SPSS data. Value-labelled SPSS variables (the usual
+        way SPSS encodes categoricals: numeric codes plus a label map) are
+        decoded to their string labels and returned as pandas Categorical
+        dtype, so they flow into ``gamfit.fit`` as by-variables rather than as
+        numeric codes.
 
     Raises
     ------
@@ -525,5 +544,10 @@ def read_spss(path: str | Path) -> Any:
         raise ImportError(
             "read_spss requires pyreadstat. Install it with: pip install pyreadstat"
         )
-    df, _metadata = prs.read_sav(path, formats_as_category=True)
+    # apply_value_formats decodes labelled numeric codes to their labels;
+    # formats_as_category then returns those labelled columns as pandas
+    # Categorical so the engine treats them as by-variables, not numbers.
+    df, _metadata = prs.read_sav(
+        path, apply_value_formats=True, formats_as_category=True
+    )
     return df
