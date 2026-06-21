@@ -1,0 +1,70 @@
+name: Owed-Work Issue Ledger
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * *"
+
+permissions:
+  issues: read
+  contents: read
+
+jobs:
+  enforce-ledger:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enforce owed-work issue ledger
+        run: |
+          set -euo pipefail
+          LEDGER="ban_owed_work_issues.txt"
+
+          if [ ! -f "$LEDGER" ]; then
+            echo "Ledger file '$LEDGER' not present; nothing to enforce. Passing."
+            exit 0
+          fi
+
+          echo "Reading owed-work ledger from '$LEDGER'."
+
+          open_issues=""
+          checked=0
+
+          while IFS= read -r raw || [ -n "$raw" ]; do
+            line="${raw%%#*}"
+            line="$(printf '%s' "$line" | tr -d '[:space:]')"
+            [ -z "$line" ] && continue
+
+            num="$(printf '%s' "$raw" | grep -oE '[0-9]+' | head -n1 || true)"
+            [ -z "$num" ] && continue
+
+            checked=$((checked + 1))
+            state="$(gh issue view "$num" --repo "${{ github.repository }}" --json state -q .state 2>/dev/null || echo UNKNOWN)"
+            echo "Issue #$num -> $state"
+
+            if [ "$state" = "OPEN" ]; then
+              open_issues="$open_issues $num"
+            fi
+          done < "$LEDGER"
+
+          echo "Checked $checked ledger issue(s)."
+
+          if [ -n "$open_issues" ]; then
+            echo ""
+            echo "FAIL: the following owed-work issues are still OPEN:"
+            for n in $open_issues; do
+              echo "  - issue #$n"
+            done
+            echo ""
+            echo "The owed work for each issue above must be FINISHED and the issue CLOSED."
+            echo "Rewording or deleting the in-code comment does NOT clear this gate;"
+            echo "the issue number is the key, and an open issue is proof the work is unfinished."
+            exit 1
+          fi
+
+          echo "All ledger issues are closed. Owed-work gate passes."
