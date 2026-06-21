@@ -747,15 +747,6 @@ pub(super) fn unary_derivatives_normal_pdf(x: f64) -> [f64; 5] {
     ]
 }
 
-pub(super) fn unary_derivatives_reciprocal(x: f64) -> [f64; 5] {
-    let x1 = x.max(1e-300);
-    let x2 = x1 * x1;
-    let x3 = x2 * x1;
-    let x4 = x3 * x1;
-    let x5 = x4 * x1;
-    [1.0 / x1, -1.0 / x2, 2.0 / x3, -6.0 / x4, 24.0 / x5]
-}
-
 /// Streaming log-sum-exp update: accumulate `exp(log_term)` into a running
 /// `(log_max, sum)` pair representing `Σ exp(log_term_i) = exp(log_max) · sum`.
 ///
