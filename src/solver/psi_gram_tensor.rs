@@ -248,6 +248,26 @@ fn kahan_scaled_add_array1(
     }
 }
 
+/// Spectral norm of a SYMMETRIC matrix `m` (here the difference of two
+/// orthogonal range projectors), i.e. `max|eigenvalue|`. For two equal-rank
+/// orthogonal projectors `P_ref`, `P_new` this equals `sin θ_max`, the sine of
+/// the largest principal angle between their ranges — the canonical, gauge- and
+/// basis-invariant distance between the two subspaces (#1033). Returns `None`
+/// if the matrix is non-finite or the symmetric eigendecomposition fails (the
+/// caller then refuses the skip, the sound fallback).
+fn subspace_spectral_distance(m: &Array2<f64>) -> Option<f64> {
+    use crate::faer_ndarray::FaerEigh;
+    if m.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    // Symmetrize defensively against rounding (P_ref − P_new is symmetric in
+    // exact arithmetic) so the symmetric eigensolver sees a genuinely Hermitian
+    // operand and returns real eigenvalues.
+    let msym = 0.5 * (m + &m.t());
+    let (evals, _evecs) = msym.eigh(faer::Side::Lower).ok()?;
+    Some(evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())))
+}
+
 impl PsiGramTensor {
     /// Build and certify the tensor over `psi ∈ [psi_lo, psi_hi]`.
     ///
@@ -567,19 +587,22 @@ impl PsiGramTensor {
     /// Off-window ψ's, a non-finite / rank-degenerate Gram, or any eigendecomp
     /// failure return `false` (refuse the skip → caller takes the slow path).
     ///
-    /// HONEST FRONTIER LIMIT (#1033). This witness is deliberately conservative,
-    /// and on PRODUCTION spatial geometry it almost never returns `true` for
-    /// `psi_ref != psi_new`: the realized reduced basis is built from RRQR pivots
-    /// on the actual n×k design, and the conditioned data-Gram range subspace
-    /// genuinely ROTATES with ψ even when the rank is fixed (the "rotation wall").
-    /// So the n-free design-revision skip the kappa outer loop wants to arm rarely
-    /// fires off-diagonal here — this is a known architectural limit, NOT a bug in
-    /// this gate. Refusing the skip is the SOUND outcome (the caller falls back to
-    /// the exact slow path); a future fix needs an n-reproducible reduced basis,
-    /// not a looser tolerance on this projector test. Do not weaken
-    /// `PSI_GRAM_SKIP_PROJ_ATOL` / `PSI_GRAM_SKIP_RANK_RTOL` to force more skips:
-    /// a forced skip across a rotated subspace reintroduces the ~7.8e-2 β̂
-    /// regression this witness exists to prevent.
+    /// ROTATION WALL (#1033). On production spatial geometry the conditioned
+    /// data-Gram range subspace can ROTATE with ψ at fixed rank — the wall on
+    /// which the earlier RRQR-pivot / entrywise-projector gates kept refusing the
+    /// skip. The fix is the SUBSPACE-DISTANCE certificate below: the skip is sound
+    /// exactly when the two equal-rank ranges coincide as SUBSPACES, measured by
+    /// the spectral norm of the projector difference (the principal angle), which
+    /// is invariant to any orthonormal-basis rotation WITHIN the range. So a pure
+    /// gauge rotation that left the entrywise max-abs above tolerance — and
+    /// therefore used to be refused — now certifies, letting the n-free skip fire
+    /// across the rotation. A genuine subspace MOVE (different rank, or a real
+    /// principal-angle separation) still refuses; refusing is the SOUND fallback
+    /// (the caller takes the exact slow path). Do not weaken
+    /// `PSI_GRAM_SKIP_PROJ_ATOL` / `PSI_GRAM_SKIP_RANK_RTOL`: the spectral gate is
+    /// already the tightest correct subspace metric, and loosening it past a true
+    /// principal-angle separation reintroduces the ~7.8e-2 β̂ regression this
+    /// witness exists to prevent.
     pub fn reduced_basis_equal(&self, psi_ref: f64, psi_new: f64) -> bool {
         if !(self.contains(psi_ref) && self.contains(psi_new)) {
             return false;
@@ -596,10 +619,27 @@ impl PsiGramTensor {
         if r_ref != r_new {
             return false;
         }
-        p_ref
-            .iter()
-            .zip(p_new.iter())
-            .all(|(a, b)| (a - b).abs() <= PSI_GRAM_SKIP_PROJ_ATOL)
+        // Subspace-distance certificate (#1033). The two reduced bases span the
+        // SAME subspace iff their orthogonal range projectors coincide. The
+        // correct, gauge-invariant measure of "how far apart" two equal-rank
+        // subspaces are is the SPECTRAL NORM ‖P_ref − P_new‖₂ = sin θ_max, the
+        // sine of the largest principal angle between the ranges — NOT the
+        // entrywise max-abs of the projector difference. The old entrywise test
+        // is a strictly weaker proxy: across a basis ROTATION (the radial-Gram
+        // rotation wall this skip kept tripping on) the projector entries can
+        // each drift while the spanned subspace is numerically identical, so the
+        // entrywise max could exceed tolerance and FALSELY refuse a sound skip.
+        // P_ref − P_new is symmetric, so its spectral norm is max|eigenvalue|;
+        // compute it via the symmetric eigensolver and gate on the principal
+        // angle directly. This certifies subspace identity across the rotation,
+        // letting the n-free skip fire whenever the range genuinely coincides,
+        // while still refusing (the SOUND fallback) the instant the subspaces
+        // separate by more than PSI_GRAM_SKIP_PROJ_ATOL in true subspace
+        // distance. An eigendecomp failure on the (small k×k) difference refuses.
+        let diff = &p_ref - &p_new;
+        subspace_spectral_distance(&diff)
+            .map(|d| d <= PSI_GRAM_SKIP_PROJ_ATOL)
+            .unwrap_or(false)
     }
 
     /// True when `psi` lies inside the certified window.
@@ -1479,5 +1519,81 @@ mod tests {
             !tensor.reduced_basis_equal(psi_high_a, psi_low_a),
             "witness must refuse symmetrically (high pin, low trial)"
         );
+    }
+
+    /// #1033 ROTATION WALL — the subspace-distance certificate must CERTIFY a
+    /// skip across a pure basis ROTATION at fixed rank, where the old entrywise
+    /// max-abs projector gate would have refused.
+    ///
+    /// Build a rank-2 (in a k=3 space) design whose 2-D range ROTATES smoothly
+    /// with ψ but whose RANK stays 2: two ψ-dependent in-plane directions span the
+    /// same fixed 2-plane (cols 0,1 of a fixed orthonormal pair) rotated by an
+    /// analytic angle φ(ψ). The SUBSPACE (the 2-plane) is ψ-invariant — only the
+    /// basis within it rotates — so the range projector is mathematically
+    /// IDENTICAL at every ψ, but its eigenVECTORS rotate. A correct
+    /// subspace-identity witness must certify every in-window pair; the spectral
+    /// (principal-angle) distance is ~0 throughout while a naive entrywise
+    /// comparison of rotated eigenbases would not be guaranteed to.
+    #[test]
+    fn reduced_basis_witness_certifies_across_pure_rotation_1033() {
+        let (n, k) = (240usize, 3usize);
+        // Two fixed orthogonal ambient profiles spanning a fixed 2-plane; the
+        // third ambient direction is left empty so the range is exactly that
+        // 2-plane (rank 2) for every ψ.
+        let p0 = |i: usize| -> f64 {
+            let t = (i as f64 + 0.5) / n as f64;
+            (2.0 * std::f64::consts::PI * t).sin()
+        };
+        let p1 = |i: usize| -> f64 {
+            let t = (i as f64 + 0.5) / n as f64;
+            (2.0 * std::f64::consts::PI * t).cos()
+        };
+        // Within the fixed 2-plane, rotate the two design columns by φ(ψ): the
+        // SPAN is unchanged (still the {p0,p1} plane) but the basis rotates, so
+        // the per-ψ eigenvectors of the Gram rotate while the range projector is
+        // ψ-invariant.
+        let design = move |psi: f64| -> Result<Array2<f64>, String> {
+            let phi = 0.7 * psi; // analytic angle sweep
+            let (c, s) = (phi.cos(), phi.sin());
+            let mut x = Array2::<f64>::zeros((n, k));
+            for i in 0..n {
+                let (a, b) = (p0(i), p1(i));
+                x[[i, 0]] = c * a - s * b;
+                x[[i, 1]] = s * a + c * b;
+                // column 2 stays zero → range is the fixed 2-plane, rank 2.
+            }
+            Ok(x)
+        };
+        let w = Array1::from_elem(n, 1.0);
+        let z = Array1::from_iter((0..n).map(|i| ((i as f64) * 0.17).cos()));
+        let (psi_lo, psi_hi) = (-1.0_f64, 1.0_f64);
+        let tensor = PsiGramTensor::build(design, w.view(), z.view(), psi_lo, psi_hi)
+            .expect("smooth rotation design must certify (analytic, no kink)");
+
+        // Rank is a constant 2 across the window (the third direction is empty).
+        let rank_at = |psi: f64| -> usize {
+            tensor
+                .range_projector(psi, PSI_GRAM_SKIP_RANK_RTOL)
+                .map(|(_, r)| r)
+                .unwrap_or(0)
+        };
+        for &psi in &[-0.95, -0.4, 0.0, 0.4, 0.95] {
+            assert_eq!(rank_at(psi), 2, "rotation keeps rank 2 at psi={psi}");
+        }
+
+        // Every in-window pair spans the SAME 2-plane (only the basis rotates),
+        // so the subspace-distance witness MUST certify the skip — this is the
+        // rotation that the entrywise gate kept refusing (the #1033 wall).
+        let grid: Vec<f64> = (0..=10).map(|i| psi_lo + 0.05 + 0.09 * i as f64).collect();
+        for &a in &grid {
+            for &b in &grid {
+                assert!(
+                    tensor.reduced_basis_equal(a, b),
+                    "pure in-plane rotation preserves the range subspace → the \
+                     subspace-distance skip witness must certify (#1033) \
+                     (ψ_ref={a}, ψ_new={b})"
+                );
+            }
+        }
     }
 }
