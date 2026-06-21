@@ -502,12 +502,15 @@ impl SurvivalMarginalSlopeFamily {
             // intercept-solve a_uv Hessian (gam#932/#1454): f_uv received its
             // θ-axis flux above while f_aa/f_au did not. Mirror the f_uv pair
             // structure with one axis = a (using the negated-coeff convention
-            // the base cell kernels use): f_aa picks up the symmetric a/a flux
-            // (2·flux_a(∂c/∂a)); f_au[u] picks up flux_a(∂c/∂u) + flux_u(∂c/∂a).
+            // the base cell kernels use): f_au[u] picks up flux_a(∂c/∂u) +
+            // flux_u(∂c/∂a); f_aa picks up the (a,a) flux (see the diagonal
+            // convention note at the loop body).
             for entry in &cached.cells {
                 let fixed = &entry.fixed;
                 let neg_dc_da = fixed.dc_da.map(|value| -value);
-                f_aa += 2.0 * moving_density_boundary_flux_a(entry, &neg_dc_da, b);
+                // Diagonal (a,a): mirror the f_uv[[u,u]] diagonal convention
+                // (the symmetric flux pair added ONCE, not doubled).
+                f_aa += moving_density_boundary_flux_a(entry, &neg_dc_da, b);
                 for u in 0..p {
                     let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
                     f_au[u] += moving_density_boundary_flux_a(entry, &neg_coeff_u, b)
