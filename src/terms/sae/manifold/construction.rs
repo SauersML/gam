@@ -6189,6 +6189,23 @@ impl SaeManifoldTerm {
             return Err(conditioning_err);
         }
 
+        // The conditioning gate has already flagged a near-singular joint Hessian
+        // (`conditioning_err`). Below we attempt to attribute that flatness to the
+        // closed-form gauge orbit (chart step gauges) plus the penalty-aware
+        // decoder-null directions and deflate it. When NO such deflatable
+        // direction can be recovered, the flat subspace is genuinely
+        // non-identifiable -- a degenerate direction OUTSIDE the gauge orbit -- a
+        // diagnosis distinct from the raw pivot-ratio conditioning trip. Both
+        // classes are #1273 FD-eligible, but surfacing the gauge-degenerate case
+        // as its own [`OuterGradientError::NonIdentifiable`] keeps the diagnostic
+        // distinction the FD-eligibility contract is built around.
+        let non_identifiable_err = OuterGradientError::NonIdentifiable {
+            reason: format!(
+                "near-singular joint Hessian with no deflatable gauge/decoder-null \
+                 direction (max pivot {max_pivot:.3e})"
+            ),
+        };
+
         let full_len = cache.delta_t_len() + cache.k;
         let mut raw_gauges = Vec::new();
         for gauge in self
@@ -6246,7 +6263,7 @@ impl SaeManifoldTerm {
             }
         }
         if raw_gauges.is_empty() {
-            return Err(conditioning_err);
+            return Err(non_identifiable_err);
         }
 
         let mut gauge_span: Vec<Array1<f64>> = Vec::new();
@@ -6268,7 +6285,7 @@ impl SaeManifoldTerm {
             gauge_span.push(gauge);
         }
         if gauge_span.is_empty() {
-            return Err(conditioning_err);
+            return Err(non_identifiable_err);
         }
 
         let span_rank = gauge_span.len();
@@ -6354,7 +6371,7 @@ impl SaeManifoldTerm {
             }
         }
         if orthonormal.is_empty() {
-            return Err(conditioning_err);
+            return Err(non_identifiable_err);
         }
 
         // Quotient-geometry gauge fixing: add stiffness only along the closed-form
