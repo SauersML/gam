@@ -1423,86 +1423,81 @@ pub fn fit_penalized_multinomial_formula(
         })
     };
 
-    let fit = match fit_custom_family_with_rho_prior(
+    // #1082: the capped unbiased probe and the (separable-path) Firth decision
+    // are driven by separation scans over the full P×M logit block. The previous
+    // match recomputed `multinomial_formula_separation_evidence` /
+    // `..._unresolved_probe_separation_evidence` in BOTH the match guard AND the
+    // arm body — three to four full logit walks per fit, paid on the hot
+    // near-separable penguin path where this branch fires every iterate. Run the
+    // probe once, evaluate each scan once into a binding, and branch on the
+    // precomputed results. Behaviour is identical (same scans, same order of
+    // precedence: converged-interior, unresolved-probe-separation,
+    // no-separation-needs-full-solve, otherwise-Firth); only the duplicate
+    // O(n·classes) scans are removed.
+    let probe_attempt = fit_custom_family_with_rho_prior(
         &family,
         &blocks,
         &unbiased_probe_options,
         crate::types::RhoPrior::Flat,
-    ) {
-        Ok(unbiased_fit)
-            if unbiased_fit.outer_converged
-                && multinomial_formula_separation_evidence(&unbiased_fit.block_states)
-                    .is_none() =>
-        {
-            unbiased_fit
-        }
-        Ok(unresolved_fit)
-            if multinomial_formula_unresolved_probe_separation_evidence(
-                &unresolved_fit.block_states,
-            )
-            .is_some() =>
-        {
-            let evidence = multinomial_formula_unresolved_probe_separation_evidence(
-                &unresolved_fit.block_states,
-            )
-            .expect("guard established unresolved-probe separation evidence");
-            run_firth_refit(format!(
-                "unbiased-criterion REML probe did not converge after {} outer iterations; {evidence}",
-                unresolved_fit.outer_iterations
-            ))?
-        }
-        Ok(unresolved_fit)
-            if multinomial_formula_separation_evidence(&unresolved_fit.block_states).is_none() =>
-        {
-            match fit_custom_family_with_rho_prior(
-                &family,
-                &blocks,
-                &options,
-                crate::types::RhoPrior::Flat,
-            ) {
-                Ok(full_unbiased_fit)
-                    if full_unbiased_fit.outer_converged
-                        && multinomial_formula_separation_evidence(
+    );
+    let fit = match probe_attempt {
+        Ok(probe_fit) => {
+            let separation = multinomial_formula_separation_evidence(&probe_fit.block_states);
+            if probe_fit.outer_converged && separation.is_none() {
+                // Interior, converged, no separation: accept the probe directly.
+                probe_fit
+            } else if let Some(evidence) =
+                multinomial_formula_unresolved_probe_separation_evidence(&probe_fit.block_states)
+            {
+                // Non-converged probe already carrying separation-scale logits:
+                // hand straight to the proper-prior Firth refit (do not spend the
+                // full unbiased budget grinding the λ→0 separable ridge).
+                run_firth_refit(format!(
+                    "unbiased-criterion REML probe did not converge after {} outer iterations; {evidence}",
+                    probe_fit.outer_iterations
+                ))?
+            } else if separation.is_none() {
+                // Interior but the capped probe ran out of iterations without
+                // certifying: re-solve at the caller's full outer budget.
+                match fit_custom_family_with_rho_prior(
+                    &family,
+                    &blocks,
+                    &options,
+                    crate::types::RhoPrior::Flat,
+                ) {
+                    Ok(full_unbiased_fit) => {
+                        let full_separation = multinomial_formula_separation_evidence(
                             &full_unbiased_fit.block_states,
-                        )
-                        .is_none() =>
-                {
-                    full_unbiased_fit
-                }
-                full_attempt => {
-                    let evidence = match &full_attempt {
-                        Ok(full_fit) => multinomial_formula_separation_evidence(
-                            &full_fit.block_states,
-                        )
-                        .unwrap_or_else(|| {
-                            format!(
-                                "full unbiased-criterion REML solve did not converge after {} outer iterations",
-                                full_fit.outer_iterations
-                            )
-                        }),
-                        Err(err) => {
-                            format!("full unbiased-criterion REML solve failed: {err}")
+                        );
+                        if full_unbiased_fit.outer_converged && full_separation.is_none() {
+                            full_unbiased_fit
+                        } else {
+                            let evidence = full_separation.unwrap_or_else(|| {
+                                format!(
+                                    "full unbiased-criterion REML solve did not converge after {} outer iterations",
+                                    full_unbiased_fit.outer_iterations
+                                )
+                            });
+                            run_firth_refit(evidence)?
                         }
-                    };
-                    run_firth_refit(evidence)?
+                    }
+                    Err(err) => run_firth_refit(format!(
+                        "full unbiased-criterion REML solve failed: {err}"
+                    ))?,
                 }
-            }
-        }
-        first_attempt => {
-            let evidence = match &first_attempt {
-                Ok(unresolved_fit) => multinomial_formula_separation_evidence(
-                    &unresolved_fit.block_states,
-                )
-                .unwrap_or_else(|| {
+            } else {
+                // Probe converged (or capped) but shows interior separation
+                // evidence: Firth refit using the already-computed scan.
+                let evidence = separation.unwrap_or_else(|| {
                     format!(
                         "unbiased-criterion REML probe did not converge after {} outer iterations",
-                        unresolved_fit.outer_iterations
+                        probe_fit.outer_iterations
                     )
-                }),
-                Err(err) => format!("unbiased-criterion REML solve failed: {err}"),
-            };
-            run_firth_refit(evidence)?
+                });
+                run_firth_refit(evidence)?
+            }
         }
+        Err(err) => run_firth_refit(format!("unbiased-criterion REML solve failed: {err}"))?,
     };
     if let Some(err) = multinomial_formula_separation_diagnostic(
         fit.inner_cycles,
