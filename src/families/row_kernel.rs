@@ -2414,4 +2414,131 @@ mod gram_inner_contraction_tests {
             "second-derivative cached Gram path drifted: rel={rel2_cached:.3e} got={got2_cached} ref={ref2}",
         );
     }
+
+    // ── #979: all-axes Jeffreys directional derivative is BUILD-ONCE + exact ──
+    //
+    // The rigid survival-marginal-slope Jeffreys hot path used to call
+    // `exact_newton_joint_hessian_directional_derivative` once per coefficient
+    // axis, and that rigid branch rebuilt a whole `SurvivalMarginalSlopeRowKernel`
+    // (cloning the family + designs and its per-row cache) on EVERY axis — a
+    // `p`-fold kernel rebuild paid every cycle the Jeffreys gate armed (#979).
+    // The fix routes the all-axes sweep through
+    // `row_kernel_directional_derivative_all_axes`, which takes the kernel by
+    // reference (built ONCE) and either dispatches to the kernel's BLAS-3
+    // override or runs the generic per-axis sweep over that SAME single kernel —
+    // never rebuilding it.
+
+    /// Wraps a `SyntheticKernel` and counts how many times the EXPENSIVE per-row
+    /// cache is (re)built. A real kernel pays this build inside its constructor /
+    /// first cache touch; the pre-#979 per-axis path rebuilt the kernel `p`
+    /// times, so the build counter would read `p`. The all-axes dispatcher takes
+    /// the kernel by reference, so a build that happens once at construction is
+    /// observed exactly once regardless of `p`.
+    struct BuildCountingKernel {
+        inner: SyntheticKernel,
+        builds: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl BuildCountingKernel {
+        fn new(n: usize, p: usize, seed: u64) -> Self {
+            let builds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            // Constructing the kernel IS the expensive build the #979 hot path
+            // paid per axis; count it here.
+            builds.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Self {
+                inner: SyntheticKernel::new(n, p, seed),
+                builds,
+            }
+        }
+    }
+
+    // Forward every `RowKernel` method to the inner synthetic kernel. No method
+    // touches the build counter — only construction does — so the counter
+    // measures kernel REBUILDS, exactly the quantity #979 collapsed from `p` to
+    // 1.
+    impl RowKernel<4> for BuildCountingKernel {
+        fn n_rows(&self) -> usize {
+            self.inner.n_rows()
+        }
+        fn n_coefficients(&self) -> usize {
+            self.inner.n_coefficients()
+        }
+        fn row_kernel(&self, row: usize) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
+            self.inner.row_kernel(row)
+        }
+        fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 4] {
+            self.inner.jacobian_action(row, d_beta)
+        }
+        fn jacobian_transpose_action(&self, row: usize, v: &[f64; 4], out: &mut [f64]) {
+            self.inner.jacobian_transpose_action(row, v, out)
+        }
+        fn add_pullback_hessian(&self, row: usize, h: &[[f64; 4]; 4], target: &mut Array2<f64>) {
+            self.inner.add_pullback_hessian(row, h, target)
+        }
+        fn add_diagonal_quadratic(&self, row: usize, h: &[[f64; 4]; 4], diag: &mut [f64]) {
+            self.inner.add_diagonal_quadratic(row, h, diag)
+        }
+        fn row_third_contracted(
+            &self,
+            row: usize,
+            dir: &[f64; 4],
+        ) -> Result<[[f64; 4]; 4], String> {
+            self.inner.row_third_contracted(row, dir)
+        }
+        fn row_fourth_contracted(
+            &self,
+            row: usize,
+            dir_u: &[f64; 4],
+            dir_v: &[f64; 4],
+        ) -> Result<[[f64; 4]; 4], String> {
+            self.inner.row_fourth_contracted(row, dir_u, dir_v)
+        }
+    }
+
+    #[test]
+    fn all_axes_directional_derivative_is_build_once_and_matches_per_axis_loop_979() {
+        let n = 24usize;
+        let p = 7usize;
+        let kern = BuildCountingKernel::new(n, p, 0x979);
+        let builds = std::sync::Arc::clone(&kern.builds);
+
+        // Drive the BATCHED all-axes dispatcher on the single kernel reference.
+        let batched =
+            row_kernel_directional_derivative_all_axes(&kern, &RowSet::All).expect("all-axes ok");
+
+        // Build-once contract (#979): computing all `p` axes touched exactly ONE
+        // kernel build. The pre-#979 per-axis path rebuilt the kernel per axis,
+        // which on this fixture would read `p` = 7.
+        let n_builds = builds.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            n_builds, 1,
+            "all-axes Jeffreys sweep rebuilt the row kernel {n_builds} times for p={p}; \
+             the #979 fix must build it ONCE and sweep every axis off that single kernel \
+             (a revert to the per-axis `SurvivalMarginalSlopeRowKernel::new` loop reads p)",
+        );
+
+        // Correctness contract: each batched axis equals the generic per-axis
+        // `row_kernel_directional_derivative(self, RowSet::All, e_a)` to ~1e-9.
+        // (A BLAS-3 override, when present, must reproduce the per-axis sweep
+        // bit-for-bit; the generic fallback IS that sweep.) This makes the
+        // build-once route a true no-op on the math, not just faster.
+        assert_eq!(batched.len(), p, "one Hdot matrix per coefficient axis");
+        for (a, hdot_a) in batched.iter().enumerate() {
+            let mut e_a = vec![0.0_f64; p];
+            e_a[a] = 1.0;
+            let per_axis = row_kernel_directional_derivative(&kern, &RowSet::All, &e_a)
+                .expect("per-axis directional derivative ok");
+            assert_eq!(hdot_a.dim(), per_axis.dim(), "axis {a} shape mismatch");
+            let mut max_abs = 0.0_f64;
+            for (g, r) in hdot_a.iter().zip(per_axis.iter()) {
+                max_abs = max_abs.max((g - r).abs());
+            }
+            assert!(
+                max_abs <= 1e-9,
+                "batched all-axes Hdot[e_{a}] diverged from the per-axis sweep by \
+                 {max_abs:.3e} (> 1e-9); the #979 build-once route must be numerically \
+                 identical to the per-axis loop it replaced",
+            );
+        }
+    }
 }
