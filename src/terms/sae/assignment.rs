@@ -560,7 +560,7 @@ pub(crate) fn canonicalize_softmax_logits(logits: &mut Array2<f64>) {
 /// sampling sense. The geometric form coincides with the prior means of a
 /// Beta(α, 1) stick-breaking construction, which is the motivation for the
 /// schedule, but no sticks are drawn here.
-pub(crate) fn ibp_stick_breaking_prior(k_atoms: usize, alpha: f64) -> Array1<f64> {
+pub(crate) fn ordered_geometric_shrinkage_prior(k_atoms: usize, alpha: f64) -> Array1<f64> {
     // Accumulate the geometric schedule `π_k = ratio^k` in LOG space so the
     // prior stays a finite *soft* weight even for large `K`. The naive product
     // `acc *= ratio` underflows to exact `0.0` once `ratio^k < f64::MIN_POSITIVE`
@@ -583,7 +583,7 @@ pub(crate) fn ibp_stick_breaking_prior(k_atoms: usize, alpha: f64) -> Array1<f64
 /// stick-breaking prior mass. With tied logits the prior dominates and yields
 /// strictly decreasing activations in atom index.
 pub fn ibp_map_row(logits: ArrayView1<'_, f64>, temperature: f64, alpha: f64) -> Array1<f64> {
-    let prior = ibp_stick_breaking_prior(logits.len(), alpha);
+    let prior = ordered_geometric_shrinkage_prior(logits.len(), alpha);
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
         out[i] = crate::linalg::utils::stable_logistic(logits[i] / temperature) * prior[i];
@@ -603,7 +603,7 @@ pub fn ibp_map_row_value_grad(
     temperature: f64,
     alpha: f64,
 ) -> (Array1<f64>, Array1<f64>) {
-    let prior = ibp_stick_breaking_prior(logits.len(), alpha);
+    let prior = ordered_geometric_shrinkage_prior(logits.len(), alpha);
     let inv_tau = 1.0 / temperature;
     let mut value = Array1::<f64>::zeros(logits.len());
     let mut grad = Array1::<f64>::zeros(logits.len());

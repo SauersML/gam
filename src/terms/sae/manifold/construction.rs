@@ -3852,7 +3852,7 @@ impl SaeManifoldTerm {
                     .mode
                     .resolved_ibp_alpha(rho)
                     .ok_or_else(|| "IBP assignment alpha resolution failed".to_string())?;
-                Some(ibp_stick_breaking_prior(k_atoms, alpha).to_vec())
+                Some(ordered_geometric_shrinkage_prior(k_atoms, alpha).to_vec())
             }
             _ => None,
         };
@@ -7205,7 +7205,7 @@ impl SaeManifoldTerm {
             .resolved_ibp_alpha(rho)
             .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
         let k_atoms = self.k_atoms();
-        let prior = ibp_stick_breaking_prior(k_atoms, alpha);
+        let prior = ordered_geometric_shrinkage_prior(k_atoms, alpha);
         let mut dprior = Array1::<f64>::zeros(k_atoms);
         for k in 0..k_atoms {
             dprior[k] = prior[k] * k as f64 / (alpha + 1.0);
@@ -7419,7 +7419,7 @@ impl SaeManifoldTerm {
             .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
         let k_atoms = self.k_atoms();
         let p = self.output_dim();
-        let prior = ibp_stick_breaking_prior(k_atoms, alpha);
+        let prior = ordered_geometric_shrinkage_prior(k_atoms, alpha);
         let mut dprior = Array1::<f64>::zeros(k_atoms);
         for k in 0..k_atoms {
             dprior[k] = prior[k] * k as f64 / (alpha + 1.0);
@@ -7668,7 +7668,7 @@ impl SaeManifoldTerm {
                     .mode
                     .resolved_ibp_alpha(rho)
                     .unwrap_or(alpha);
-                let prior = ibp_stick_breaking_prior(k_atoms, effective_alpha);
+                let prior = ordered_geometric_shrinkage_prior(k_atoms, effective_alpha);
                 let inv_tau = 1.0 / temperature;
                 for (idx, var) in vars.iter().enumerate() {
                     let SaeLocalRowVar::Logit { atom } = *var else {
@@ -7819,7 +7819,7 @@ impl SaeManifoldTerm {
                         inv_tau: 1.0 / temperature,
                     },
                     vec![0.0; k_atoms],
-                    ibp_stick_breaking_prior(k_atoms, effective_alpha).to_vec(),
+                    ordered_geometric_shrinkage_prior(k_atoms, effective_alpha).to_vec(),
                 )
             }
             AssignmentMode::JumpReLU {
