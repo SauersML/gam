@@ -2273,6 +2273,20 @@ impl BernoulliMarginalSlopeFamily {
         cell: exact_kernel::DenestedCubicCell,
         max_degree: usize,
     ) -> Result<exact_kernel::CellMomentState, String> {
+        // When a deviation runtime (score-warp / linkwiggle) is active the
+        // denested-partition cells are a function of the *row's* converged
+        // intercept and slope, so their `(c0..c3, left, right)` fingerprints are
+        // effectively row-unique. The fit-lifetime cross-row LRU then runs at
+        // ~0.1% hit rate at large scale while pinning multiple GiB of resident
+        // moment entries and serialising every row behind its mutex (insert +
+        // eviction churn). Intra-β reuse of a single row's moments is already
+        // served by the per-row `degree9_cells` cache and the
+        // `RowCellMomentsBundle`; the cross-row layer buys nothing here. Skip it
+        // and evaluate uncached — bit-identical to a cold LRU miss, which still
+        // honours the affine tail-cell memo inside `evaluate_cell_moments`.
+        if self.flex_active() {
+            return exact_kernel::evaluate_cell_moments(cell, max_degree);
+        }
         exact_kernel::evaluate_cell_moments_cached(
             cell,
             max_degree,
@@ -2287,6 +2301,14 @@ impl BernoulliMarginalSlopeFamily {
         cell: exact_kernel::DenestedCubicCell,
         max_degree: usize,
     ) -> Result<exact_kernel::CellDerivativeMomentState, String> {
+        // See `evaluate_cell_moments_lru`: under an active deviation runtime the
+        // cross-row LRU never amortises (row-unique cell fingerprints), so it is
+        // pure resident-memory and lock overhead. Evaluate uncached — identical
+        // to a cold LRU miss, which is exactly what the cached path computes via
+        // `evaluate_cell_derivative_moments_uncached` on a miss.
+        if self.flex_active() {
+            return exact_kernel::evaluate_cell_derivative_moments_uncached(cell, max_degree);
+        }
         exact_kernel::evaluate_cell_derivative_moments_cached(
             cell,
             max_degree,
