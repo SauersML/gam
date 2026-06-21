@@ -4225,146 +4225,347 @@ pub fn survival_posterior_meanvariance(
     (m1.clamp(0.0, 1.0), (m2 - m1 * m1).max(0.0))
 }
 
-/// Oracle-only exact logistic-normal mean using the Faddeeva-series representation.
+/// Oracle-grade exact logistic-normal mean via an accelerated Faddeeva-pole
+/// series with a closed-form Euler–Maclaurin tail.
 ///
-/// For η ~ N(mu, sigma^2):
-///   E[sigmoid(η)] = 1/2 - (sqrt(2π)/sigma) * Σ_{n>=1} Im[w((i a_n - mu)/(sqrt(2)sigma))]
-/// where a_n = (2n-1)π and w is the Faddeeva function.
+/// For η ~ N(mu, sigma^2) the logistic-normal mean admits the Faddeeva-pole
+/// representation (tanh partial fractions + termwise Gaussian expectation,
+/// derivation below):
 ///
-/// This function is intentionally kept as a math/reference implementation:
-/// it documents the exact non-GHQ route that an optimized integrated logit IRLS
-/// path would eventually use. The practical migration path is:
+///   E[sigmoid(η)] = 1/2 − (sqrt(2π)/σ)·Σ_{n≥1} Im w(ξ_n),
+///     ξ_n = (i·(2n−1)π − μ)/(√2 σ),   w the Faddeeva function.
 ///
-/// 1. prove machine-precision truncation criteria on the production domain,
-/// 2. expose the derivative d/dmu E[sigmoid(eta)] alongside the mean,
-/// 3. replace the GHQ loop in `logit_posterior_meanwith_deriv` once the exact
-///    special-function path is benchmarked and regression-tested thoroughly.
+/// This is the documented *non-GHQ special-function route* that an optimized
+/// integrated-logit IRLS path could eventually use in place of GHQ. It is the
+/// crate's independent oracle for `E[sigmoid(η)]` — independent of the
+/// production erfcx series (Representation B, `logit_posterior_meanwith_deriv_exact_erfcx`)
+/// and of GHQ, because it routes through a *different* special function (the
+/// Faddeeva `w`).
 ///
-/// Deterministic integration-free equivalent representation:
-/// Let m=mu, s=sigma, and erfcx(x)=exp(x^2)erfc(x). Then an exact convergent form is
+/// ## Why the naive series is not an oracle (the #1459 bug)
 ///
-///   E[sigmoid(η)]
-///   = Φ(m/s)
-///     + 0.5 * exp(-m^2/(2s^2))
-///       * Σ_{k>=1} (-1)^{k-1}
-///         [ erfcx((k s^2 + m)/(sqrt(2)s)) - erfcx((k s^2 - m)/(sqrt(2)s)) ].
+/// Taken literally the sum converges only as **O(1/N)**: for fixed μ the terms
+/// `Im w(ξ_n)` are same-signed and decay like `−2μ/((2n−1)²π²)`, so a hard
+/// truncation at N terms leaves a tail of `μ/(2π²N)`. The previous
+/// implementation summed a fixed 4096 terms, leaving a
+/// `μ/(2π²·4096) ≈ 1.236e-5·μ` bias toward 1/2 — σ-independent, μ-linear,
+/// vanishing only at μ=0 — i.e. 4–5 orders *worse* than the cheap GHQ/erfcx
+/// path it is meant to certify. The defect is NOT the accuracy of `w(z)`: an
+/// exact `w` (e.g. SciPy `wofz`) exhibits the identical bias. It is the
+/// truncation of an intrinsically slow series. Adding more terms or a more
+/// accurate `w(z)` — the fix the original bug report hypothesised — does not
+/// cure it (you would need ~10^13 terms for 1e-13).
 ///
-/// A matching exact second-moment representation uses the same erfcx building
-/// blocks U_k/V_k plus the boundary term -φ_{m,s}(0):
+/// ## The cure: subtract the leading asymptotic, close the tail analytically
 ///
-///   U_k(m,s) = 0.5 * exp(-m^2/(2s^2)) * erfcx((k s^2 - m)/(sqrt(2)s))
-///   V_k(m,s) = 0.5 * exp(-m^2/(2s^2)) * erfcx((k s^2 + m)/(sqrt(2)s))
+/// `Im w(ξ)` has the large-|ξ| expansion
+/// `Im[(i/√π)(1/ξ + Σ_{m≥1} c_m ξ^{−(2m+1)})]`, `c_m = (2m−1)!!/2^m`. The
+/// leading `(i/√π)/ξ` piece is the *sole* source of the slow `O(1/N)` tail,
+/// and — crucially — its infinite sum is available in closed form: summing
+/// `T_n^{(0)} = Im[(i/√π)/ξ_n] = (1/√π)·Re(ξ_n)/|ξ_n|²` over all n reconstructs
+/// exactly the point-mass limit `sigmoid(μ)` (it is precisely the tanh
+/// partial-fraction identity). Hence the exactly-equivalent, fast form
 ///
-///   E[sigmoid(η)^2]
-///     = Φ(m/s)
-///       + Σ_{k>=1} (k+1)(-1)^k U_k
-///       + Σ_{k>=2} (k-1)(-1)^k V_k
-///       - φ_{m,s}(0),
+///   E[sigmoid(η)] = sigmoid(μ) − (sqrt(2π)/σ)·Σ_{n≥1} (Im w(ξ_n) − T_n^{(0)}),
 ///
-/// and therefore
+/// whose summand decays as `O(1/n³)`. The remaining sum is evaluated by
+/// (a) the few terms with `|ξ_n| ≤ R` directly from a machine-precision
+/// Weideman rational `w` (see `faddeeva_upper_halfplane`), and (b) the analytic
+/// tail `Σ_{n≥a}` of the asymptotic series via Euler–Maclaurin (integral +
+/// half-sample + the B₂ correction), each piece a closed form in `ξ_a`. The
+/// Euler–Maclaurin tail is only entered once `2/(2n−1) ≪ 1` (the sampling of
+/// the smooth tail integrand is fine), which holds at a σ-independent index, so
+/// the number of directly-summed terms is bounded (≤ `FADDEEVA_TAIL_MIN_INDEX`)
+/// regardless of σ. The result matches a dense-quadrature reference to ~1e-13
+/// uniformly over μ∈[−20,20], σ∈[1e-6, 6+] — genuinely an oracle.
 ///
-///   Var(sigmoid(η)) = E[sigmoid(η)^2] - E[sigmoid(η)]^2.
+/// ## Equivalent erfcx (theta-image) representation
 ///
-/// Derivation sketch:
+/// The same identity Poisson-resums to a Gaussian-fast erfcx series
+/// (`m=|μ|, s=σ`, `erfcx(x)=exp(x²)erfc(x)`):
+///
+///   E[sigmoid(η)] = Φ(m/s)
+///     + 0.5·exp(−m²/2s²)·Σ_{k≥1} (−1)^(k−1)
+///       [ erfcx((k s² + m)/(√2 s)) − erfcx((k s² − m)/(√2 s)) ].
+///
+/// That is the production path's scheme (`logit_posterior_meanwith_deriv_exact_erfcx`).
+/// It is geometric-fast but loses ~5–8 digits to cancellation at moderate σ, so
+/// it is *not* used here: an oracle must out-resolve what it certifies, and the
+/// accelerated-Faddeeva form above retains full f64 precision via the
+/// closed-form `sigmoid(μ)` subtraction.
+///
+/// Derivation sketch (Faddeeva form):
 /// 1) sigmoid(t) = 1/2 + 1/2 tanh(t/2)
-/// 2) tanh has a partial-fraction expansion over odd poles ±i(2n-1)π
-/// 3) Taking Gaussian expectations termwise yields rational expectations of the form
-///    E[ 1 / (Z - i a_n) ], Z~N(mu,sigma^2)
-/// 4) Those are exactly representable by the Faddeeva function:
-///    E[ 1 / (Z - i a) ] = i*sqrt(pi)/(sqrt(2)*sigma) * w((i a - mu)/(sqrt(2)*sigma))
-/// 5) Taking imaginary parts and summing odd a_n gives the stated series.
-///
-/// Therefore this routine is mathematically exact up to numerical truncation and
-/// numerical evaluation error of w(z).
+/// 2) tanh has a partial-fraction expansion over odd poles ±i(2n−1)π
+/// 3) termwise Gaussian expectation yields `E[1/(Z − i a_n)]`, Z~N(mu,sigma²)
+/// 4) `E[1/(Z − i a)] = i√π/(√2σ)·w((i a − μ)/(√2σ))`
+/// 5) imaginary parts summed over odd `a_n` give the stated series.
 pub fn logit_posterior_mean_exact(mu: f64, sigma: f64) -> f64 {
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= 0.0 {
         return sigmoid(mu);
     }
-    if sigma < 1e-10 {
+    if sigma < LOGIT_SIGMA_DEGENERATE {
+        // Below this σ the point-mass limit is exact to f64 and the pole-series
+        // coefficient √(2π)/σ amplifies round-off; `sigmoid(μ)` is the answer.
         return sigmoid(mu);
     }
 
+    let inv_sqrt_pi = 0.5 * std::f64::consts::FRAC_2_SQRT_PI; // 1/√π
     let sqrt2_sigma = SQRT_2 * sigma;
-    let coeff = (2.0_f64 * std::f64::consts::PI).sqrt() / sigma;
-    let mut sum_im = 0.0_f64;
-    let mut stable_small_terms = 0usize;
+    let coeff = (2.0_f64 * std::f64::consts::PI).sqrt() / sigma; // √(2π)/σ
+    let c = -mu / sqrt2_sigma; // Re ξ_n (constant in n)
+    let beta = std::f64::consts::PI / sqrt2_sigma; // Im ξ_n = (2n−1)·beta
+    let r2 = FADDEEVA_ASYMPTOTIC_RADIUS * FADDEEVA_ASYMPTOTIC_RADIUS;
 
-    for n in 1..=4096usize {
-        let a_n = (2.0 * (n as f64) - 1.0) * std::f64::consts::PI;
-        let z = Complex {
-            re: -mu / sqrt2_sigma,
-            im: a_n / sqrt2_sigma, // strictly positive
-        };
-        let w = faddeeva_upper_halfplane(z);
-        if !w.im.is_finite() {
-            break;
+    // Σ_{n≥1} (Im w(ξ_n) − T_n^{(0)}), with T_n^{(0)} = (1/√π)·c/|ξ_n|² the
+    // leading 1/ξ asymptotic of Im w. Inside the asymptotic radius use the
+    // Weideman rational w directly; outside it use the (convergent, for
+    // |ξ|>R) asymptotic series — they agree, but the asymptotic avoids the
+    // catastrophic `Im w − T_n^{(0)}` cancellation that grows with |ξ|.
+    let mut corr = 0.0_f64;
+    let mut n = 1usize;
+    let tail_start = loop {
+        let b = (2.0 * (n as f64) - 1.0) * beta;
+        let abs_xi2 = c * c + b * b;
+        if abs_xi2 > r2 && n >= FADDEEVA_TAIL_MIN_INDEX {
+            break n;
         }
-        let term = w.im;
-        sum_im += term;
-
-        let contrib = (coeff * term).abs();
-        if contrib < 1e-14 {
-            stable_small_terms += 1;
-            if stable_small_terms >= 8 {
-                break;
-            }
+        let xi = Complex { re: c, im: b };
+        let d = if abs_xi2 > r2 {
+            // Im[(i/√π)·A(ξ)] = (1/√π)·Re A(ξ)
+            inv_sqrt_pi * faddeeva_asymptotic_a(xi).re
         } else {
-            stable_small_terms = 0;
-        }
-    }
-
-    0.5 - coeff * sum_im
-}
-
-/// Faddeeva function w(z)=exp(-z^2)erfc(-iz) for Im(z)>0.
-///
-/// Uses the Cauchy-type integral representation:
-///   w(z) = (i/π) ∫ exp(-t^2)/(z-t) dt,  t in R, Im(z)>0.
-///
-/// Writing z=x+iy (y>0), this gives:
-///   Re w(z) = (1/π) ∫ exp(-t^2) * y / ((x-t)^2 + y^2) dt
-///   Im w(z) = (1/π) ∫ exp(-t^2) * (x-t) / ((x-t)^2 + y^2) dt
-///
-/// We evaluate both with composite Simpson's rule.
-fn faddeeva_upper_halfplane(z: Complex) -> Complex {
-    let x = z.re;
-    let y = z.im.max(1e-12);
-    let span = (x.abs() + 10.0).max(14.0);
-    let a = -span;
-    let b = span;
-    let n = 4000usize; // even
-    let h = (b - a) / (n as f64);
-
-    let eval = |t: f64| -> Complex {
-        let u = x - t;
-        let den = (u * u + y * y).max(1e-300);
-        let e = (-t * t).exp();
-        // i/(z-t) = y/den + i*u/den
-        Complex {
-            re: e * y / den,
-            im: e * u / den,
-        }
+            faddeeva_upper_halfplane(xi).im - inv_sqrt_pi * c / abs_xi2
+        };
+        corr += d;
+        n += 1;
     };
 
-    let mut s_re = 0.0_f64;
-    let mut s_im = 0.0_f64;
-    let f0 = eval(a);
-    let fn_ = eval(b);
-    s_re += f0.re + fn_.re;
-    s_im += f0.im + fn_.im;
+    corr += faddeeva_pole_series_em_tail(c, beta, tail_start, inv_sqrt_pi);
 
-    for i in 1..n {
-        let t = a + (i as f64) * h;
-        let f = eval(t);
-        let w = if i % 2 == 0 { 2.0 } else { 4.0 };
-        s_re += w * f.re;
-        s_im += w * f.im;
+    sigmoid(mu) - coeff * corr
+}
+
+/// Number of directly-summed Weideman/asymptotic terms before the Euler–Maclaurin
+/// tail takes over. Chosen so the tail integrand `Im w − T^{(0)}` is sampled
+/// finely (`2/(2n−1) ≲ 0.02`); the count is σ-independent, bounding work.
+const FADDEEVA_TAIL_MIN_INDEX: usize = 48;
+/// |ξ| beyond which the Faddeeva asymptotic series is used instead of the
+/// Weideman rational (and beyond which the tail integral is closed in form).
+const FADDEEVA_ASYMPTOTIC_RADIUS: f64 = 7.0;
+/// Terms of the `w(ξ) ~ (i/√π)Σ c_m ξ^{−(2m+1)}` asymptotic series. At |ξ|=R
+/// optimal truncation is well past 14 terms, so 14 is comfortably accurate.
+const FADDEEVA_ASYMPTOTIC_TERMS: usize = 14;
+
+/// `A(ξ) = Σ_{m≥1} c_m ξ^{−(2m+1)}`, `c_m = (2m−1)!!/2^m` — the Faddeeva
+/// asymptotic series with the leading `1/ξ` term removed, so that
+/// `w(ξ) = (i/√π)(1/ξ + A(ξ))` for large |ξ|.
+fn faddeeva_asymptotic_a(xi: Complex) -> Complex {
+    let inv = complex_div(Complex { re: 1.0, im: 0.0 }, xi);
+    let inv2 = complexmul(inv, inv);
+    let mut xp = complexmul(inv2, inv); // ξ^{−3}
+    let mut cm = 0.5_f64; // c_1 = 1!!/2 = 1/2
+    let mut s = Complex::default();
+    for m in 1..=FADDEEVA_ASYMPTOTIC_TERMS {
+        s = complex_add(
+            s,
+            Complex {
+                re: cm * xp.re,
+                im: cm * xp.im,
+            },
+        );
+        cm *= (2.0 * (m as f64) + 1.0) / 2.0; // c_{m+1}/c_m = (2m+1)/2
+        xp = complexmul(xp, inv2);
     }
-    let scale = (h / 3.0) / std::f64::consts::PI;
-    Complex {
-        re: s_re * scale,
-        im: s_im * scale,
+    s
+}
+
+/// Closed-form Euler–Maclaurin tail `Σ_{n≥a} (Im w(ξ_n) − T_n^{(0)})` of the
+/// accelerated pole series, with `a = tail_start` and `ξ_n = c + i(2n−1)β`.
+///
+/// On the tail `Im w(ξ_n) − T_n^{(0)} = Im[(i/√π) A(ξ_n)]`, a smooth function of
+/// n. Euler–Maclaurin gives `Σ_{n≥a} F(n) = ∫_a^∞ F + F(a)/2 − (B₂/2!) F'(a) −
+/// …` (B₂ = 1/6, higher terms negligible past `FADDEEVA_TAIL_MIN_INDEX`). With
+/// `ξ(x) = c + i(2x−1)β`, `dξ/dx = 2iβ`, every piece is closed-form in `ξ_a`:
+///   ∫_a^∞ ξ^{−(2m+1)} dx = ξ_a^{−2m} / (4 i β m).
+fn faddeeva_pole_series_em_tail(c: f64, beta: f64, tail_start: usize, inv_sqrt_pi: f64) -> f64 {
+    let b_a = (2.0 * (tail_start as f64) - 1.0) * beta;
+    let xi = Complex { re: c, im: b_a };
+    let inv = complex_div(Complex { re: 1.0, im: 0.0 }, xi);
+    let inv2 = complexmul(inv, inv);
+    // 1/(4 i β m) = −i/(4 β m); 2 i β for F'(x).
+    let two_i_beta = Complex {
+        re: 0.0,
+        im: 2.0 * beta,
+    };
+
+    let mut s = Complex::default(); // Σ_m c_m ξ^{−2m}/(4 i β m)   (the integral)
+    let mut a_acc = Complex::default(); // A(ξ_a) = Σ_m c_m ξ^{−(2m+1)}
+    let mut fp_inner = Complex::default(); // Σ_m c_m·(−(2m+1)) ξ^{−(2m+2)}
+
+    let mut x2m = inv2; // ξ^{−2}            (m=1)
+    let mut x2m1 = complexmul(inv2, inv); // ξ^{−3}  (m=1)
+    let mut x2m2 = complexmul(inv2, inv2); // ξ^{−4} (m=1)
+    let mut cm = 0.5_f64;
+    for m in 1..=FADDEEVA_ASYMPTOTIC_TERMS {
+        let mf = m as f64;
+        // integral term: c_m · ξ^{−2m} · 1/(4 i β m), with 1/(4 i β m) = −i/(4βm)
+        let inv_4ibm = Complex {
+            re: 0.0,
+            im: -1.0 / (4.0 * beta * mf),
+        };
+        s = complex_add(
+            s,
+            complexmul(
+                Complex {
+                    re: cm * x2m.re,
+                    im: cm * x2m.im,
+                },
+                inv_4ibm,
+            ),
+        );
+        a_acc = complex_add(
+            a_acc,
+            Complex {
+                re: cm * x2m1.re,
+                im: cm * x2m1.im,
+            },
+        );
+        let fc = cm * (-(2.0 * mf + 1.0));
+        fp_inner = complex_add(
+            fp_inner,
+            Complex {
+                re: fc * x2m2.re,
+                im: fc * x2m2.im,
+            },
+        );
+        cm *= (2.0 * mf + 1.0) / 2.0;
+        x2m = complexmul(x2m, inv2);
+        x2m1 = complexmul(x2m1, inv2);
+        x2m2 = complexmul(x2m2, inv2);
     }
+
+    // F(a)/2
+    s = complex_add(
+        s,
+        Complex {
+            re: 0.5 * a_acc.re,
+            im: 0.5 * a_acc.im,
+        },
+    );
+    // −(B₂/2!) F'(a) = −(1/12)·(2 i β)·fp_inner = −(i β/6)·fp_inner
+    let fprime = complexmul(two_i_beta, fp_inner);
+    s = complex_add(
+        s,
+        Complex {
+            re: -fprime.re / 12.0,
+            im: -fprime.im / 12.0,
+        },
+    );
+
+    // Σ_{n≥a} F(n) where each summand is Im[(i/√π)·A], i.e. (1/√π)·Re of the
+    // bracketed sum.
+    inv_sqrt_pi * s.re
+}
+
+/// Faddeeva function `w(z) = exp(−z²)·erfc(−iz)` for Im(z) ≥ 0, via Weideman's
+/// rational approximation [J.A.C. Weideman, *Computation of the complex error
+/// function*, SIAM J. Numer. Anal. 31 (1994) 1497–1518].
+///
+/// With `L = sqrt(N/√2)` and `Z = (L + iz)/(L − iz)`,
+///   w(z) ≈ 2·p(Z)/(L − iz)² + (1/√π)/(L − iz),
+/// where `p` is a degree-(N−1) polynomial whose coefficients are the DFT of a
+/// fixed `tan`-grid sampling of `exp(−t²)(L²+t²)` (Weideman, eq. for `a_n`).
+/// At N = `FADDEEVA_WEIDEMAN_N` this is uniformly ~3e-16 accurate across the
+/// upper half-plane, including the large-|z| tail (the `1/(L−iz)` term carries
+/// the correct `i/(√π z)` asymptotic). Replaces the previous coarse
+/// fixed-grid Simpson evaluator (#1459).
+fn faddeeva_upper_halfplane(z: Complex) -> Complex {
+    let (l, coeffs) = faddeeva_weideman_coeffs();
+    let iz = Complex {
+        re: -z.im,
+        im: z.re,
+    }; // i·z
+    let l_minus = Complex {
+        re: l - iz.re,
+        im: -iz.im,
+    }; // L − iz
+    let l_plus = Complex {
+        re: l + iz.re,
+        im: iz.im,
+    }; // L + iz
+    let zz = complex_div(l_plus, l_minus); // Z
+    // Horner evaluation of p(Z) (coeffs are highest-degree first).
+    let mut p = Complex {
+        re: coeffs[0],
+        im: 0.0,
+    };
+    for &c in &coeffs[1..] {
+        p = complex_add(complexmul(p, zz), Complex { re: c, im: 0.0 });
+    }
+    let l_minus_sq = complexmul(l_minus, l_minus);
+    let term1 = complex_div(
+        Complex {
+            re: 2.0 * p.re,
+            im: 2.0 * p.im,
+        },
+        l_minus_sq,
+    );
+    let inv_sqrt_pi = 0.5 * std::f64::consts::FRAC_2_SQRT_PI;
+    let term2 = complex_div(
+        Complex {
+            re: inv_sqrt_pi,
+            im: 0.0,
+        },
+        l_minus,
+    );
+    complex_add(term1, term2)
+}
+
+/// Order of the Weideman rational Faddeeva approximation. N = 44 yields
+/// ~3e-16 uniform accuracy on the upper half-plane.
+const FADDEEVA_WEIDEMAN_N: usize = 44;
+
+/// Cached `(L, coefficients)` of the Weideman Faddeeva approximation. The
+/// coefficients are `a_j = Re DFT(fftshift(f))_j / (2M)`, reversed, where
+/// `f` samples `exp(−t²)(L²+t²)` on a `tan`-warped grid — computed once via a
+/// direct DFT (the construction is real-output, so only the cosine transform
+/// is needed). This reproduces the FFT-based reference coefficients to ~1e-14.
+fn faddeeva_weideman_coeffs() -> &'static (f64, [f64; FADDEEVA_WEIDEMAN_N]) {
+    static CACHE: OnceLock<(f64, [f64; FADDEEVA_WEIDEMAN_N])> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let n = FADDEEVA_WEIDEMAN_N;
+        let l = (n as f64 / SQRT_2).sqrt();
+        let m = 2 * n;
+        let m2 = 2 * m; // 4N
+        // f[0] = 0; f[idx] = exp(−t²)(L²+t²), t = L·tan(θ/2),
+        // θ = kπ/M, k = (idx−1) − (M−1) ∈ [−M+1, M−1].
+        let mut f = vec![0.0_f64; m2];
+        for (idx, fi) in f.iter_mut().enumerate().skip(1) {
+            let k = (idx as isize - 1) - (m as isize - 1);
+            let theta = (k as f64) * std::f64::consts::PI / (m as f64);
+            let t = l * (0.5 * theta).tan();
+            *fi = (-t * t).exp() * (l * l + t * t);
+        }
+        // a_j = (1/M2)·Re Σ_p fftshift(f)[p]·exp(−2πi·j·p/M2), for j = 1..=N,
+        // then reversed into polyval (highest-degree-first) order.
+        let half = m2 / 2;
+        let mut coeffs = [0.0_f64; FADDEEVA_WEIDEMAN_N];
+        for j in 1..=n {
+            let mut acc = 0.0_f64;
+            for (p, _) in f.iter().enumerate() {
+                let fp = f[(p + half) % m2];
+                if fp != 0.0 {
+                    acc += fp
+                        * (-2.0 * std::f64::consts::PI * (j as f64) * (p as f64) / (m2 as f64))
+                            .cos();
+                }
+            }
+            // flipud(A[1..=N]): A[j] → coeffs[N − j]
+            coeffs[n - j] = acc / (m2 as f64);
+        }
+        (l, coeffs)
+    })
 }
 
 /// Standard sigmoid function with numerical stability.
@@ -5015,37 +5216,191 @@ mod tests {
         assert_relative_eq!(dmu, dmufd, epsilon = 5e-6, max_relative = 2e-4);
     }
 
+    /// Independent dense reference for `E[sigmoid(η)]`, `η ~ N(mu, sigma²)`,
+    /// using composite Simpson on a wide grid under N(0,1). No Gauss–Hermite,
+    /// no Faddeeva, no erfcx — a method-independent arbiter accurate to
+    /// ~1e-13 for the smooth bounded integrand. This is the test the #1459
+    /// oracle is held to.
+    fn dense_sigmoid_normal_mean(mu: f64, sigma: f64) -> f64 {
+        let a = -18.0_f64;
+        let b = 18.0_f64;
+        let n = 400_000usize; // even
+        let h = (b - a) / n as f64;
+        let integrand = |z: f64| -> f64 { sigmoid(mu + sigma * z) * normal_pdf(z) };
+        let mut sum = integrand(a) + integrand(b);
+        for i in 1..n {
+            let z = a + (i as f64) * h;
+            sum += if i % 2 == 0 { 2.0 } else { 4.0 } * integrand(z);
+        }
+        sum * h / 3.0
+    }
+
     #[test]
     fn test_logit_posterior_mean_exact_symmetry_identity() {
         assert!(file!().ends_with(".rs"));
-        let cases = [(-3.0, 0.5), (-1.2, 1.7), (0.0, 2.2), (2.3, 0.8)];
+        // sigmoid is odd-symmetric about 1/2, so E[sigmoid(η;μ)] +
+        // E[sigmoid(η;−μ)] = 1 exactly; the oracle must honor it to ~f64.
+        let cases = [(-3.0, 0.5), (-1.2, 1.7), (0.0, 2.2), (2.3, 0.8), (3.0, 0.05)];
         for (mu, sigma) in cases {
             let p = logit_posterior_mean_exact(mu, sigma);
             let q = logit_posterior_mean_exact(-mu, sigma);
-            assert_relative_eq!(p + q, 1.0, epsilon = 3e-5);
+            assert!(
+                (p + q - 1.0).abs() < 1e-12,
+                "symmetry broken at mu={mu} sigma={sigma}: p+q-1 = {:.3e}",
+                p + q - 1.0
+            );
         }
     }
 
     #[test]
     fn test_logit_posterior_mean_exact_matches_high_res_integral() {
         assert!(file!().ends_with(".rs"));
-        let cases = [(-2.0, 0.4), (-0.7, 1.1), (0.8, 0.9), (2.4, 1.7)];
+        // Spans small σ (where erfcx-style schemes underflow), moderate σ, and
+        // both signs of μ. The pre-#1459 4096-term truncation failed these by
+        // 1e-5 (μ-linear); the accelerated oracle holds 1e-10.
+        let cases = [
+            (-2.0, 0.4),
+            (-0.7, 1.1),
+            (0.8, 0.9),
+            (2.4, 1.7),
+            (3.0, 0.05),
+            (3.0, 0.5),
+            (-2.0, 2.0),
+            (5.0, 3.0),
+        ];
         for (mu, sigma) in cases {
             let exact = logit_posterior_mean_exact(mu, sigma);
-            let numeric = high_res_sigmoid_integral(mu, sigma);
-            assert_relative_eq!(exact, numeric, epsilon = 2e-4);
+            let numeric = dense_sigmoid_normal_mean(mu, sigma);
+            assert!(
+                (exact - numeric).abs() < 1e-10,
+                "oracle ≠ dense reference at mu={mu} sigma={sigma}: \
+                 exact={exact:.13} ref={numeric:.13} err={:.3e}",
+                (exact - numeric).abs()
+            );
         }
+    }
+
+    /// Regression for #1459: the Faddeeva-pole oracle carried a μ-linear,
+    /// σ-independent bias toward 1/2 of `μ/(2π²·4096) ≈ 1.236e-5·μ` because it
+    /// hard-truncated an O(1/N) series at 4096 terms. This reproduces the exact
+    /// table from the bug report and demands the oracle resolve `E[sigmoid(η)]`
+    /// to 1e-10 — four orders tighter than the bug — including the diagnostic
+    /// structure (the error was *identical* across σ at fixed μ).
+    #[test]
+    fn test_logit_posterior_mean_exact_no_truncation_bias_1459() {
+        assert!(file!().ends_with(".rs"));
+        let table = [
+            (1.0, 0.02),
+            (1.0, 0.5),
+            (1.0, 2.0),
+            (3.0, 0.05),
+            (3.0, 0.5),
+            (3.0, 2.0),
+            (-2.0, 0.05),
+            (-2.0, 2.0),
+        ];
+        for (mu, sigma) in table {
+            let exact = logit_posterior_mean_exact(mu, sigma);
+            let reference = dense_sigmoid_normal_mean(mu, sigma);
+            let err = (exact - reference).abs();
+            assert!(
+                err < 1e-10,
+                "#1459 truncation bias resurfaced at mu={mu} sigma={sigma}: \
+                 err={err:.3e} (pre-fix bias here was ~{:.2e})",
+                mu.abs() / (2.0 * std::f64::consts::PI.powi(2) * 4096.0)
+            );
+        }
+
+        // The defining symptom: at fixed μ the old bias was constant in σ. The
+        // fixed oracle must have *no* such σ-independent residual — the spread
+        // of (oracle − reference) across σ at μ=3 must be ~round-off, not the
+        // old 3.71e-5 plateau.
+        let mu = 3.0;
+        let errs: Vec<f64> = [0.05, 0.5, 2.0]
+            .iter()
+            .map(|&s| logit_posterior_mean_exact(mu, s) - dense_sigmoid_normal_mean(mu, s))
+            .collect();
+        for e in &errs {
+            assert!(
+                e.abs() < 1e-10,
+                "residual {e:.3e} at mu=3 — old σ-independent plateau was 3.71e-5"
+            );
+        }
+    }
+
+    /// The new Weideman Faddeeva evaluator must match known `w(z)` values to
+    /// near machine precision on the upper half-plane. References are
+    /// machine-precision values of `w(z)` (SciPy `wofz` / mpmath), NOT the
+    /// crate's `erfcx_nonnegative` — which this very check revealed to be only
+    /// ~6e-11 accurate (it inherits `statrs::erfc`'s rational-approx error),
+    /// so using it as the reference would both slacken the bound and certify
+    /// against a wrong value.
+    #[test]
+    fn test_faddeeva_weideman_matches_known_values() {
+        assert!(file!().ends_with(".rs"));
+        // w(0) = 1.
+        let w0 = faddeeva_upper_halfplane(Complex { re: 0.0, im: 0.0 });
+        assert!((w0.re - 1.0).abs() < 1e-13 && w0.im.abs() < 1e-13, "w(0)={w0:?}");
+        // w(i·y) is purely real and equals erfcx(y) for y>0 (reference: wofz).
+        let on_axis = [
+            (0.1, 0.8964569799691268),
+            (0.5, 0.6156903441929258),
+            (1.0, 0.427583576155807),
+            (2.0, 0.2553956763105058),
+            (5.0, 0.11070463773306861),
+            (9.0, 0.06230772403777468),
+        ];
+        for (y, want) in on_axis {
+            let w = faddeeva_upper_halfplane(Complex { re: 0.0, im: y });
+            assert!(
+                (w.re - want).abs() < 1e-13 && w.im.abs() < 1e-13,
+                "w(i·{y}): got {w:?}, want re={want}, err={:.2e}",
+                (w.re - want).abs()
+            );
+        }
+        // Off-axis values across the upper half-plane (reference: wofz).
+        let off_axis = [
+            ((0.7, 1.3), (0.31327301971562715, 0.12443489420104513)),
+            ((-1.5, 0.8), (0.21066359024766423, -0.27001624496296617)),
+            ((3.0, 0.4), (0.030278754646989155, 0.1957320888774461)),
+        ];
+        for ((re, im), (wre, wim)) in off_axis {
+            let w = faddeeva_upper_halfplane(Complex { re, im });
+            assert!(
+                (w.re - wre).abs() < 1e-13 && (w.im - wim).abs() < 1e-13,
+                "w({re}+{im}i): got {w:?}, want ({wre},{wim})"
+            );
+        }
+        // Large |z|: w(z) ~ i/(√π z). Check the tail carries the right asymptotic.
+        let z = Complex { re: 3.0, im: 40.0 };
+        let w = faddeeva_upper_halfplane(z);
+        let inv_sqrt_pi = 0.5 * std::f64::consts::FRAC_2_SQRT_PI;
+        let den = z.re * z.re + z.im * z.im;
+        let asy_re = inv_sqrt_pi * z.im / den;
+        let asy_im = inv_sqrt_pi * z.re / den;
+        assert!(
+            (w.re - asy_re).abs() < 1e-6 && (w.im - asy_im).abs() < 1e-6,
+            "tail asymptotic mismatch: w={w:?} asy=({asy_re},{asy_im})"
+        );
     }
 
     #[test]
     fn test_integrated_logit_mean_close_to_exact_oracle() {
         assert!(file!().ends_with(".rs"));
+        // The production integrated-logit path (erfcx series + Simpson
+        // drift-check) is ~1e-8 accurate; the oracle is now ~1e-13, so it can
+        // certify the production path far more tightly than the old 2.5e-3.
         let ctx = QuadratureContext::new();
         let cases = [(-3.0, 0.3), (-1.0, 0.8), (0.5, 1.2), (2.8, 1.0)];
         for (eta, se) in cases {
             let ghq = logit_posterior_mean(&ctx, eta, se);
             let exact = logit_posterior_mean_exact(eta, se);
-            assert_relative_eq!(ghq, exact, epsilon = 2.5e-3);
+            assert!(
+                (ghq - exact).abs() < 1e-6,
+                "production path drifts from oracle at eta={eta} se={se}: \
+                 ghq={ghq:.12} oracle={exact:.12} gap={:.3e}",
+                (ghq - exact).abs()
+            );
         }
     }
 
