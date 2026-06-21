@@ -476,54 +476,57 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
     }
 }
 
+// ── Tower4<K>: full dense tower as a JetScalar (the all-channels scalar) ─
+
+/// The full dense [`super::jet_tower::Tower4`] is itself a [`JetScalar`]: it
+/// carries EVERY channel, so a row expression written ONCE against [`JetScalar`]
+/// can be evaluated at `Tower4` to obtain the full `(v, g, H, t3, t4)` in one
+/// pass. This is BOTH the #932 oracle ground truth the packed [`Order2`] /
+/// [`OneSeed`] / [`TwoSeed`] scalars are pinned against, AND a production scalar:
+/// a family whose uncontracted third / fourth derivative tensors are needed
+/// (the BMS rigid `third_full` / `fourth_full` caches) evaluates the SAME
+/// generic row-NLL expression at `Tower4` and reads `.t3` / `.t4` off the
+/// result — so the dense tensors come from the single source of truth, not a
+/// separately hand-written jet. The packed scalars serve the consumers that
+/// need only `(v, g, H)` (`Order2`) or one / two contractions
+/// (`OneSeed` / `TwoSeed`) without paying for the dense tensors.
+impl<const K: usize> JetScalar<K> for super::jet_tower::Tower4<K> {
+    fn constant(c: f64) -> Self {
+        super::jet_tower::Tower4::constant(c)
+    }
+    fn variable(x: f64, axis: usize) -> Self {
+        super::jet_tower::Tower4::variable(x, axis)
+    }
+    fn value(&self) -> f64 {
+        self.v
+    }
+    fn add(&self, o: &Self) -> Self {
+        *self + *o
+    }
+    fn sub(&self, o: &Self) -> Self {
+        *self - *o
+    }
+    fn mul(&self, o: &Self) -> Self {
+        super::jet_tower::Tower4::mul(self, o)
+    }
+    fn recip(&self) -> Self {
+        super::jet_tower::Tower4::recip(self)
+    }
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+    fn scale(&self, s: f64) -> Self {
+        super::jet_tower::Tower4::scale(self, s)
+    }
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        super::jet_tower::Tower4::compose_unary(self, d)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::families::jet_tower::{evaluate_program, RowNllProgram, Tower4};
-
-    // ── Tower4<K>: full dense tower as a JetScalar (the all-channels oracle) ─
-
-    /// The full dense [`Tower4`] is itself a [`JetScalar`]: it carries EVERY
-    /// channel, so a row expression written generically can be evaluated at
-    /// `Tower4` to obtain the full `(v, g, H, t3, t4)` in one pass. The #932
-    /// oracle uses it as the ground truth the packed [`Order2`] / [`OneSeed`] /
-    /// [`TwoSeed`] scalars are pinned against via [`Tower4::third_contracted`] /
-    /// `fourth_contracted`. Production families consume the *packed* scalars
-    /// (`Order2` for `(v, g, H)`, `OneSeed`/`TwoSeed` for the contractions); the
-    /// dense all-channels evaluation is only needed as the oracle truth, so this
-    /// impl is test-only.
-    impl<const K: usize> JetScalar<K> for Tower4<K> {
-        fn constant(c: f64) -> Self {
-            Tower4::constant(c)
-        }
-        fn variable(x: f64, axis: usize) -> Self {
-            Tower4::variable(x, axis)
-        }
-        fn value(&self) -> f64 {
-            self.v
-        }
-        fn add(&self, o: &Self) -> Self {
-            *self + *o
-        }
-        fn sub(&self, o: &Self) -> Self {
-            *self - *o
-        }
-        fn mul(&self, o: &Self) -> Self {
-            Tower4::mul(self, o)
-        }
-        fn recip(&self) -> Self {
-            Tower4::recip(self)
-        }
-        fn neg(&self) -> Self {
-            self.scale(-1.0)
-        }
-        fn scale(&self, s: f64) -> Self {
-            Tower4::scale(self, s)
-        }
-        fn compose_unary(&self, d: [f64; 5]) -> Self {
-            Tower4::compose_unary(self, d)
-        }
-    }
 
     /// A small polynomial-plus-unary row expression written ONCE, generically
     /// over `S: JetScalar<2>`, so it can be evaluated against every scalar:

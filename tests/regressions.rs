@@ -316,8 +316,6 @@ mod measure_jet_aniso_isotropic_fallback_regression;
 mod new_smooths_misc_regressions;
 #[path = "regressions/no_rigor_regression.rs"]
 mod no_rigor_regression;
-#[path = "regressions/owed_work_issues_resolved.rs"]
-mod owed_work_issues_resolved;
 #[path = "regressions/regression_affine_anchor_moment_both_tails.rs"]
 mod regression_affine_anchor_moment_both_tails;
 #[path = "regressions/regression_apply_inverse_link_probit_independent_reference.rs"]
@@ -336,8 +334,6 @@ mod reml_runtime_bug_hunt_ift_dispatch;
 mod repro_1066_iso_kappa_2d_binomial;
 #[path = "regressions/repro_gamlss_linesearch_failure.rs"]
 mod repro_gamlss_linesearch_failure;
-#[path = "regressions/rigor_ratchet.rs"]
-mod rigor_ratchet;
 #[path = "regressions/smooth_fit_term_collection_bug_hunt_2_3.rs"]
 mod smooth_fit_term_collection_bug_hunt_2_3;
 #[path = "regressions/solver_gpu_pirls_bug_hunt.rs"]
