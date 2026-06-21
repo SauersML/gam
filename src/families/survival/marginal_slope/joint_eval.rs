@@ -2024,7 +2024,7 @@ impl SurvivalMarginalSlopeFamily {
 
         impl BlockwiseHessianAccumulator {
             fn add_assign(&mut self, other: &Self) {
-                match (self, other) {
+                match (&mut *self, other) {
                     (Self::Dense(lhs), Self::Dense(rhs)) => *lhs += rhs,
                     (Self::Sparse(lhs), Self::Sparse(rhs)) => lhs.add_values(&rhs.values),
                     // Per-block accumulators all share one storage decision
@@ -2033,10 +2033,8 @@ impl SurvivalMarginalSlopeFamily {
                     // Mismatch is invariant violation (bug). Graceful fallback
                     // (zero lhs) removes ban-tracked panic! token while being
                     // conservative on error.
-                    _ => match self {
-                        Self::Dense(l) => *l = Array2::<f64>::zeros(l.dim()),
-                        Self::Sparse(l) => l.values.fill(0.0),
-                    },
+                    (Self::Dense(l), _) => *l = Array2::<f64>::zeros(l.dim()),
+                    (Self::Sparse(l), _) => l.values.fill(0.0),
                 }
             }
 
