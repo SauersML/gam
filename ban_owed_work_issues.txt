@@ -20,5 +20,3 @@
 932   # Taylor-jet scalar algebra: write each family's row log-likelihood once, derive the entire RowKernel derivative tower mechanically
 975   # The carving problem: functional-ANOVA atoms; evidence-adjudicated carving of product manifolds and a statistical test for feature binding
 993   # Make the #975/#984 instruments runnable on real fits: decoder-coefficient covariance, readout-pullback coefficients, ledger ownership
-1408  # Softmax assignment never uses advertised compact high-K row layout
-1409  # top_k is applied only after full-K optimization
