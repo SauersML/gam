@@ -7650,12 +7650,12 @@ pub(crate) fn outer_gradient_solver_rejects_near_singular_cache_without_matching
         .term
         .outer_gradient_arrow_solver(&cache, obj.current_rho.lambda_smooth())
     {
-        Err(err) => err,
+        Err(err) => err.to_string(),
         Ok(..) => panic!("near-singular evidence factor without a matching gauge must reject"),
     };
     assert!(
-        err.contains("analytic outer gradient undefined at this rho"),
-        "guard error must name the undefined analytic-gradient condition; got: {err}"
+        err.contains("joint Hessian numerically singular"),
+        "guard error must name the ill-conditioned joint Hessian; got: {err}"
     );
     assert!(
         err.contains("min/max pivot ratio") && err.contains("floor"),
