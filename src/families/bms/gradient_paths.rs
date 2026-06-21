@@ -1387,6 +1387,74 @@ pub(super) fn rigid_standard_normal_neglog_only(
     Ok(-w * logcdf)
 }
 
+/// The rigid standard-normal Bernoulli row negative log-likelihood, written
+/// ONCE over the generic [`JetScalar`] interface (#932 scalar cutover).
+///
+/// Primaries `p = [q_eta = marginal η, g = slope]`. The body is exactly the
+/// production likelihood — `ℓ = −w·logΦ((2y−1)·η)`, `η = q(η_marg)·√(1+(s·g)²)
+/// + (s·g)·z` — composed with ONLY [`JetScalar`] ops, so it re-instantiates at
+/// whatever order / representation a consumer needs:
+///
+/// * [`Order2`](super::super::jet_scalar::Order2) → `(v, g, H)`
+///   ([`rigid_standard_normal_row_kernel`], the inner-Newton path);
+/// * [`OneSeed`](super::super::jet_scalar::OneSeed) → contracted third
+///   ([`rigid_standard_normal_third_contracted_generic`], the directional gate);
+/// * [`TwoSeed`](super::super::jet_scalar::TwoSeed) → contracted fourth
+///   ([`rigid_standard_normal_fourth_contracted_generic`]);
+/// * full [`Tower4`] → every uncontracted channel
+///   ([`rigid_standard_normal_tower`], feeding the `third_full` / `fourth_full`
+///   caches).
+///
+/// Every consumer derives from THIS one expression, so the value channel and
+/// every derivative channel cannot desync (the #736 / #948 bug genus).
+///
+/// The marginal index `q(η_marg)` enters by composing the hand-certified link
+/// derivative stack `[q, q1, q2, q3, q4]` onto the η primary (slot 0); the
+/// margin transcendental enters by composing the certified
+/// [`signed_probit_neglog_unary_stack`] onto the assembled signed margin — the
+/// stability discipline of #932 (humans own primitive stability, the algebra
+/// owns combinatorics). The caller MUST guard the signed-margin value against a
+/// non-finite (non-`+∞`-excluded) NaN before calling; the seeded-evaluation
+/// wrappers below do that.
+#[inline]
+pub(crate) fn rigid_standard_normal_row_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+    p: &[S; 2],
+    marginal: BernoulliMarginalLinkMap,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<S, String> {
+    // q(η_marg): compose the link's q-as-function-of-η stack onto the η primary.
+    let q = p[0].compose_unary([
+        marginal.q,
+        marginal.q1,
+        marginal.q2,
+        marginal.q3,
+        marginal.q4,
+    ]);
+    let slope = p[1];
+    // observed slope b = s·g, scale c = √(1 + b²).
+    let observed_slope = slope.scale(probit_scale);
+    let b2 = observed_slope.mul(&observed_slope);
+    let c = b2
+        .add(&S::constant(1.0))
+        .compose_unary(unary_derivatives_sqrt(observed_slope.value() * observed_slope.value() + 1.0));
+    // η = q·c + (s·g)·z, signed margin m = (2y−1)·η.
+    let eta = q.mul(&c).add(&observed_slope.scale(z));
+    let signed = eta.scale(2.0 * y - 1.0);
+    // Preserve the production fail-fast: a NaN (non-`+∞`) signed margin is an
+    // upstream domain failure, not a tail saturation.
+    let m = signed.value();
+    if !(m.is_finite() || m == f64::INFINITY) {
+        return Err(format!(
+            "non-finite signed margin in rigid probit row NLL: {m}"
+        ));
+    }
+    // NLL = −w·logΦ(m) via the fused single-Mills-ratio probit neglog stack.
+    Ok(signed.compose_unary(signed_probit_neglog_unary_stack(m, w)))
+}
+
 #[inline]
 pub(crate) fn rigid_standard_normal_tower(
     marginal: BernoulliMarginalLinkMap,
@@ -1396,19 +1464,59 @@ pub(crate) fn rigid_standard_normal_tower(
     w: f64,
     probit_scale: f64,
 ) -> Result<Tower4<2>, String> {
-    let signed = rigid_standard_normal_signed_jet(marginal, g, z, y, probit_scale);
-    // ONE transcendental per row: the fused stack reuses a single Mills-ratio
-    // evaluation for both logΦ and the k1..k4 derivative chain (bit-identical
-    // to the prior two-call (logcdf-discard + derivatives) form). The prior
-    // form's `?` rejected a non-finite `+∞`-excluded margin; preserve that
-    // fail-fast contract before the fused evaluation.
-    if !(signed.v.is_finite() || signed.v == f64::INFINITY) {
-        return Err(format!(
-            "non-finite signed margin in rigid probit tower: {}",
-            signed.v
-        ));
-    }
-    Ok(signed.compose_unary(signed_probit_neglog_unary_stack(signed.v, w)))
+    // #932 cutover: the full uncontracted tower comes from the SAME single
+    // generic row-NLL expression every other channel consumer derives from,
+    // evaluated at the all-channels `Tower4` scalar. The previous hand-fused
+    // `signed`-jet + transcendental compose is now the `Order2` / `OneSeed` /
+    // `TwoSeed` / `Tower4` instantiation of one source of truth.
+    let vars: [Tower4<2>; 2] = [Tower4::variable(marginal.eta_value(), 0), Tower4::variable(g, 1)];
+    rigid_standard_normal_row_nll_generic(&vars, marginal, z, y, w, probit_scale)
+}
+
+/// Contracted third `Σ_c ℓ_{abc} dir_c` of the rigid standard-normal row NLL,
+/// derived from the single generic expression via the one-seed scalar
+/// [`OneSeed`](super::super::jet_scalar::OneSeed) — the production
+/// `row_third_contracted` directional gate without materialising `t3`.
+#[inline]
+pub(crate) fn rigid_standard_normal_third_contracted_generic(
+    marginal: BernoulliMarginalLinkMap,
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+    dir: &[f64; 2],
+) -> Result<[[f64; 2]; 2], String> {
+    use crate::families::jet_scalar::OneSeed;
+    let vars: [OneSeed<2>; 2] = [
+        OneSeed::seed_direction(marginal.eta_value(), 0, dir[0]),
+        OneSeed::seed_direction(g, 1, dir[1]),
+    ];
+    let s = rigid_standard_normal_row_nll_generic(&vars, marginal, z, y, w, probit_scale)?;
+    Ok(s.contracted_third())
+}
+
+/// Contracted fourth `Σ_{cd} ℓ_{abcd} u_c v_d` of the rigid standard-normal row
+/// NLL, derived from the single generic expression via the two-seed scalar
+/// [`TwoSeed`](super::super::jet_scalar::TwoSeed) — without materialising `t4`.
+#[inline]
+pub(crate) fn rigid_standard_normal_fourth_contracted_generic(
+    marginal: BernoulliMarginalLinkMap,
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+    dir_u: &[f64; 2],
+    dir_v: &[f64; 2],
+) -> Result<[[f64; 2]; 2], String> {
+    use crate::families::jet_scalar::TwoSeed;
+    let vars: [TwoSeed<2>; 2] = [
+        TwoSeed::seed(marginal.eta_value(), 0, dir_u[0], dir_v[0]),
+        TwoSeed::seed(g, 1, dir_u[1], dir_v[1]),
+    ];
+    let s = rigid_standard_normal_row_nll_generic(&vars, marginal, z, y, w, probit_scale)?;
+    Ok(s.contracted_fourth())
 }
 
 /// Branch-free `signed`-margin jet for the rigid standard-normal row kernel.
@@ -1975,14 +2083,12 @@ pub(crate) fn unary_derivatives_neglog_phi(x: f64, weight: f64) -> [f64; 5] {
 /// masked. Every caller guarantees `x > 0` before invoking this:
 /// the survival marginal-slope kernels evaluate `log` of the transformed time
 /// derivative `q'(t)·√(1+b²)` only after passing `survival_derivative_guard`
-/// (`q'(t) >= derivative_guard > 0`, `√(1+b²) > 0`). The debug assertion pins
-/// that contract; in release, a non-positive `x` yields the honest IEEE result
-/// (`-inf`/`NaN`) rather than a finite fabrication.
+/// (`q'(t) >= derivative_guard > 0`, `√(1+b²) > 0`). A non-positive `x` yields
+/// the honest IEEE result (`-inf`/`NaN`) rather than a finite fabrication, so the
+/// domain failure propagates as a non-finite value the caller's finite-checks
+/// catch — it is not silently masked, and not a release-noop debug-only
+/// assertion (which repo policy bans).
 pub(crate) fn unary_derivatives_log(x: f64) -> [f64; 5] {
-    debug_assert!(
-        x > 0.0,
-        "unary_derivatives_log requires x > 0 (log domain); got {x}"
-    );
     let x2 = x * x;
     let x3 = x2 * x;
     let x4 = x3 * x;

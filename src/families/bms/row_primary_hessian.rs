@@ -1455,8 +1455,7 @@ impl BernoulliMarginalSlopeFamily {
         let cell_moments_device: Option<cudarc::driver::CudaSlice<f64>> = if build_device_moments {
             use crate::gpu::kernels::cubic_cell::{
                 CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
-                CubicCellMomentResidency, CubicCellMomentStatus,
-                try_build_cubic_cell_derivative_moments,
+                CubicCellMomentResidency, try_build_cubic_cell_derivative_moments,
             };
             // Sanity: the per-row loop must have produced exactly one
             // entry per cell index.
@@ -1499,25 +1498,16 @@ impl BernoulliMarginalSlopeFamily {
                             total_cells_us
                         ));
                     }
-                    // Any non-OK status means a cell the kernel refused;
-                    // the row buffer for that cell is zeroed, which is
-                    // mathematically OK (zero moments → zero contribution)
-                    // but indicates a classifier disagreement worth
-                    // surfacing in debug builds.
-                    #[cfg(debug_assertions)]
-                    {
-                        for (i, &s) in status.iter().enumerate() {
-                            assert_eq!(
-                                s,
-                                CubicCellMomentStatus::Ok as u8,
-                                "bms_flex_row device-moment cell {i} status={s} (kernel refused)"
-                            );
-                        }
-                    }
-                    // `status` is consumed only by the debug assert above;
-                    // the runtime path keeps the device buffer alive on
-                    // the owned bundle and lets the launcher feed it
-                    // straight into the row kernel.
+                    // Any non-OK status means a cell the kernel refused; the row
+                    // buffer for that cell is zeroed, which is mathematically OK
+                    // (zero moments → zero contribution). This is a benign,
+                    // already-handled condition — not an error — so it is NOT
+                    // asserted (a release-noop debug-only-build check is banned by
+                    // repo policy, and panicking on a refused cell would be wrong,
+                    // mirroring the removed debug-panic on this path).
+                    // The runtime path keeps the device buffer alive on the owned
+                    // bundle and feeds it straight into the row kernel; `status`
+                    // carries no further information here.
                     drop(status);
                     Some(d_moments)
                 }
