@@ -12,9 +12,7 @@ which share one engine, one formula DSL, and one on-disk model format.
 
 Docs: <https://gamfit.readthedocs.io/>. PyPI: <https://pypi.org/project/gamfit/>.
 
-**Contributions of every kind are welcome** — broken PRs, first-timers,
-AI-written patches, and any feature request, with no guidelines and low
-friction by design.
+Contributions of every kind are welcome.
 
 ![3D Matérn fit on a noisy 2-D landscape](docs/images/surface_3d_wireframe.png)
 
