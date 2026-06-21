@@ -182,9 +182,25 @@ impl SaeReconstructionRowProgram {
     fn gate_tower<const K: usize>(&self, atom: usize) -> Tower4<K> {
         match self.gate {
             RowGate::Softmax { inv_tau } => {
-                // Build exp(ℓ_j·inv_tau) for every atom that has a free logit
-                // primary, as a tower; atoms without a free logit contribute a
-                // constant exponential (their logit does not move).
+                // Build exp(ℓ_j·inv_tau − shift) for every atom that has a free
+                // logit primary, as a tower; atoms without a free logit
+                // contribute a constant exponential (their logit does not move).
+                //
+                // Stability: softmax is invariant to a common additive constant
+                // in every exponent (`exp(a−s)/Σ exp(b−s) = exp(a)/Σ exp(b)`),
+                // and the higher derivative channels are unchanged because the
+                // shift is a numeric constant (a function of the base logit
+                // *values* only, seeded as a `constant`, not of the tower
+                // variables). We subtract the largest base exponent
+                // `max_j ℓ_j·inv_tau` so the dominant `exp(·)` is `exp(0)=1` and
+                // no term overflows. This mirrors the max-subtraction in the
+                // production `softmax_row`.
+                let shift = self
+                    .logits
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max)
+                    * inv_tau;
                 let mut denom = Tower4::<K>::zero();
                 let mut numer = Tower4::<K>::zero();
                 for j in 0..self.gate_value.len() {
@@ -192,7 +208,11 @@ impl SaeReconstructionRowProgram {
                         Some(slot) => Tower4::<K>::variable(self.logits[j], slot),
                         None => Tower4::<K>::constant(self.logits[j]),
                     };
-                    let ej = lj.scale(inv_tau).exp();
+                    // (ℓ_j·inv_tau − shift): subtracting a constant shifts only
+                    // the value channel, leaving every gradient/Hessian/t3/t4
+                    // channel of the exponent (hence of exp via the chain rule)
+                    // identical to the unshifted form.
+                    let ej = (lj.scale(inv_tau) - shift).exp();
                     if j == atom {
                         numer = ej;
                     }
@@ -205,10 +225,23 @@ impl SaeReconstructionRowProgram {
                     Some(slot) => Tower4::<K>::variable(self.logits[atom], slot),
                     None => Tower4::<K>::constant(self.logits[atom]),
                 };
-                // σ(x) = 1 / (1 + exp(−x)).
+                // σ(x) = 1 / (1 + exp(−x)). Evaluated in a branch-stable form to
+                // avoid overflow of the inner `exp`: the two algebraic identities
+                //   x ≥ 0:  σ(x) = 1 / (1 + exp(−x))      (exp(−x) ∈ (0,1])
+                //   x < 0:  σ(x) = exp(x) / (1 + exp(x))   (exp(x)  ∈ (0,1))
+                // are equal everywhere, so they produce the identical tower in
+                // every derivative channel. The branch is selected on the base
+                // .v of x (a constant for a given row), so it is not a function
+                // of the tower variables and the derivative stack is unchanged.
                 let x = (l - self.gate_shift[atom]).scale(inv_tau);
                 let one = Tower4::<K>::constant(1.0);
-                (one / (one + x.scale(-1.0).exp())).scale(self.gate_scale[atom])
+                let sigma = if x.v >= 0.0 {
+                    one.clone() / (one + x.scale(-1.0).exp())
+                } else {
+                    let ex = x.exp();
+                    ex.clone() / (one + ex)
+                };
+                sigma.scale(self.gate_scale[atom])
             }
         }
     }

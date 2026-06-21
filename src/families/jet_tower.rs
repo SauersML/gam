@@ -784,6 +784,12 @@ impl<const K: usize> std::ops::Mul<f64> for Tower4<K> {
 ///
 /// `f.g[0]` (= ∂F/∂a) must be non-zero — guaranteed by the production
 /// solve's strict monotonicity guard.
+///
+/// The expansion point `a0` must be a genuine root `F(a0, θ0) = 0`: the
+/// substitution recursion below cancels orders 1..=4 of `G = F∘a` but never
+/// touches order 0, so a non-root `a0` would yield the Taylor expansion of
+/// the LEVEL SET `F = F(a0)` through `a0`, not the root curve `F = 0`. This
+/// is guarded explicitly and re-verified by a composed-residual self-check.
 pub fn implicit_solve<const K1: usize, const K: usize>(
     f: &Tower4<K1>,
     a0: f64,
@@ -793,6 +799,27 @@ pub fn implicit_solve<const K1: usize, const K: usize>(
     if f_a == 0.0 || !f_a.is_finite() {
         return Err(format!(
             "implicit_solve: ∂F/∂a = {f_a:+.3e} is not invertible"
+        ));
+    }
+    // The expansion point must be a genuine root of F. The single Newton
+    // correction that would move a0 onto the root is |f.v|/|f_a|; require it
+    // to be negligible relative to the natural scale (1 + |a0|). Guarding the
+    // Newton step (rather than f.v directly) makes the criterion invariant to
+    // the magnitude of f_a / the units of F.
+    let root_tol = 1e-9;
+    if !f.v.is_finite() {
+        return Err(format!(
+            "implicit_solve: F(a0, θ0) = {:+.3e} is not finite",
+            f.v
+        ));
+    }
+    let newton_step = f.v.abs() / f_a.abs();
+    if newton_step > root_tol * (1.0 + a0.abs()) {
+        return Err(format!(
+            "implicit_solve: expansion point a0 = {a0:+.6e} is not a root of F: \
+             F(a0, θ0) = {:+.3e}, Newton correction {newton_step:+.3e} exceeds \
+             root_tol {root_tol:.1e} · (1 + |a0|)",
+            f.v
         ));
     }
     // Start with a = constant a0 (correct through order 0). Then lift each
@@ -841,6 +868,33 @@ pub fn implicit_solve<const K1: usize, const K: usize>(
                 }
             }
         }
+    }
+    // Self-check: the composed residual G = F∘a must vanish through order 4.
+    // By construction orders 1..=4 were cancelled; the value G.v == F(a0,θ0)
+    // is exactly the root requirement guarded above. Re-verify all channels
+    // against a scale-aware floor so any arithmetic regression in the
+    // substitution recursion is loud rather than silently shipping a
+    // level-set expansion.
+    let g = substitute_intercept(f, &a);
+    let resid_tol = 1e-7 * (1.0 + f_a.abs());
+    let mut worst = g.v.abs();
+    for i in 0..K {
+        worst = worst.max(g.g[i].abs());
+        for j in 0..K {
+            worst = worst.max(g.h[i][j].abs());
+            for k in 0..K {
+                worst = worst.max(g.t3[i][j][k].abs());
+                for l in 0..K {
+                    worst = worst.max(g.t4[i][j][k][l].abs());
+                }
+            }
+        }
+    }
+    if !worst.is_finite() || worst > resid_tol {
+        return Err(format!(
+            "implicit_solve: composed residual G = F∘a does not vanish: \
+             worst channel magnitude {worst:+.3e} exceeds tol {resid_tol:.1e}"
+        ));
     }
     Ok(a)
 }
@@ -1122,64 +1176,73 @@ pub struct KernelChannels<const K: usize> {
 /// index, claimed and true values on disagreement — designed as the body
 /// of the per-family CI oracle tests (#932 deployment step 2).
 ///
-/// Tolerance is RELATIVE to a per-channel magnitude floor: each comparison
-/// uses `|claim − truth| ≤ rel_tol · max(|truth|, floor)` where `floor`
-/// is the largest absolute entry of the true channel — so zero entries of
-/// structurally sparse towers don't demand absolute equality, while genuine
-/// sign flips (#736) and dropped channels are loud.
+/// Tolerance is PER ENTRY, mixed absolute/relative: each comparison uses
+/// `|claim − truth| ≤ atol + rel_tol · max(|claim|, |truth|)`. The absolute
+/// floor `atol = rel_tol` lets exact-zero entries of structurally sparse
+/// towers pass without demanding bit-equality, while a tiny cross-block
+/// entry dropped next to a huge one is still caught (it is NOT measured
+/// against the largest entry of the whole channel — there is no per-channel
+/// magnitude floor). Genuine sign flips (#736) and dropped channels are loud.
+///
+/// Non-finite handling is strict: a NaN on either side always fails; an
+/// infinity passes only when both sides are the SAME signed infinity.
 pub fn verify_kernel_channels<const K: usize>(
     tower: &Tower4<K>,
     claims: &KernelChannels<K>,
     rel_tol: f64,
 ) -> Result<(), String> {
-    let check = |label: &str, claim: f64, truth: f64, floor: f64| -> Result<(), String> {
-        let scale = truth.abs().max(floor).max(1e-300);
-        if (claim - truth).abs() > rel_tol * scale {
+    // Absolute floor: reuse rel_tol so a single knob controls both the
+    // relative band and the absolute floor for entries near zero.
+    let atol = rel_tol;
+    let check = |label: &str, claim: f64, truth: f64| -> Result<(), String> {
+        // Non-finite values never silently pass the algebraic comparison
+        // below (any comparison with NaN is false). Handle them explicitly:
+        // NaN on either side always errs; an infinity passes only if both
+        // sides are the identical signed infinity.
+        if !claim.is_finite() || !truth.is_finite() {
+            let agree = claim.is_infinite()
+                && truth.is_infinite()
+                && claim.is_sign_positive() == truth.is_sign_positive();
+            if agree {
+                return Ok(());
+            }
             return Err(format!(
-                "row-kernel oracle: {label} disagrees: claimed {claim:+.12e}, tower {truth:+.12e} (rel_tol {rel_tol:.1e}, scale {scale:.3e})"
+                "row-kernel oracle: {label} non-finite mismatch: claimed {claim:+.12e}, tower {truth:+.12e}"
+            ));
+        }
+        let band = atol + rel_tol * claim.abs().max(truth.abs());
+        if (claim - truth).abs() > band {
+            return Err(format!(
+                "row-kernel oracle: {label} disagrees: claimed {claim:+.12e}, tower {truth:+.12e} (rel_tol {rel_tol:.1e}, atol {atol:.1e}, band {band:.3e})"
             ));
         }
         Ok(())
     };
 
-    check("value", claims.value, tower.v, 1.0)?;
+    check("value", claims.value, tower.v)?;
 
-    let g_floor = tower.g.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
     for a in 0..K {
-        check(
-            &format!("gradient[{a}]"),
-            claims.gradient[a],
-            tower.g[a],
-            g_floor,
-        )?;
+        check(&format!("gradient[{a}]"), claims.gradient[a], tower.g[a])?;
     }
 
-    let h_floor = tower
-        .h
-        .iter()
-        .flatten()
-        .fold(0.0_f64, |m, x| m.max(x.abs()));
     for a in 0..K {
         for b in 0..K {
             check(
                 &format!("hessian[{a}][{b}]"),
                 claims.hessian[a][b],
                 tower.h[a][b],
-                h_floor,
             )?;
         }
     }
 
     for (t_idx, (dir, claim)) in claims.third.iter().enumerate() {
         let truth = tower.third_contracted(dir);
-        let floor = truth.iter().flatten().fold(0.0_f64, |m, x| m.max(x.abs()));
         for a in 0..K {
             for b in 0..K {
                 check(
                     &format!("third[{t_idx}][{a}][{b}]"),
                     claim[a][b],
                     truth[a][b],
-                    floor,
                 )?;
             }
         }
@@ -1187,14 +1250,12 @@ pub fn verify_kernel_channels<const K: usize>(
 
     for (f_idx, (u, w, claim)) in claims.fourth.iter().enumerate() {
         let truth = tower.fourth_contracted(u, w);
-        let floor = truth.iter().flatten().fold(0.0_f64, |m, x| m.max(x.abs()));
         for a in 0..K {
             for b in 0..K {
                 check(
                     &format!("fourth[{f_idx}][{a}][{b}]"),
                     claim[a][b],
                     truth[a][b],
-                    floor,
                 )?;
             }
         }
@@ -1689,9 +1750,13 @@ mod tests {
             let a = Tower4::<3>::variable(a0, 0);
             let t0 = Tower4::<3>::variable(th[0], 1);
             let t1 = Tower4::<3>::variable(th[1], 2);
-            // F = a·(1 + θ₀) + θ₁·a² + θ₀·θ₁ − 0.9  (residual nonzero is fine:
-            // implicit_solve only reads partials, never the value).
-            a * (t0 + 1.0) + t1 * a.mul(&a) + t0 * t1 - 0.9
+            // F = a·(1 + θ₀) + θ₁·a² + θ₀·θ₁ − 0.4385. The constant is chosen so
+            // F(a0, θ0) = 0 exactly at a0 = 0.4, θ = [0.25, −0.15]:
+            //   0.4·1.25 + (−0.15)·0.16 + 0.25·(−0.15) = 0.4385.
+            // implicit_solve requires a genuine root; at the root the level-set
+            // and root-curve derivatives coincide, so the textbook-IFT
+            // assertions below are unaffected.
+            a * (t0 + 1.0) + t1 * a.mul(&a) + t0 * t1 - 0.4385
         };
         let a_t = implicit_solve::<3, 2>(&f, a0).expect("solve");
         let f_a = f.g[0];

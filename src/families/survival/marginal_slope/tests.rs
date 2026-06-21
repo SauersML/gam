@@ -2295,7 +2295,10 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
 }
 
 #[test]
-fn debug_flex_directional_quantities_fd_localize() {
+#[ignore = "pure FD-localization diagnostic for the OPEN directional third[g,w0] \
+            residual (#932): prints per-(u,v) production-vs-FD gaps, asserts nothing. \
+            Convergent assertions live in flex_bidirectional_second_mixed_matches_central_fd."]
+fn diagnostic_flex_directional_quantities_fd_localize() {
     // FD-localize WHICH directional timepoint quantity (eta_uv_dir / chi_uv_dir
     // / d_uv_dir) disagrees with a central difference of its base counterpart
     // along `dir`. Fixture is aligned to
@@ -2692,6 +2695,191 @@ fn debug_flex_directional_quantities_fd_localize() {
         base.eta_uv[[q1, q1]],
         base_at(4e-3).eta_uv[[q1, q1]],
         base_at(-4e-3).eta_uv[[q1, q1]],
+    );
+}
+
+/// Isolation FD certificate for the bidirectional second mixed θ-derivative of
+/// the timepoint moment Hessians (`eta_uv_uv` / `chi_uv_uv` /
+/// `d_uv_uv`). Holds dir1 = e_g (the primary/slope `b`-axis) FIXED and central-
+/// differences the *directional* `eta_uv_dir` / `chi_uv_dir` / `d_uv_dir`
+/// (already contracted along dir1) along dir2 = e_{w0} (a link-deviation axis).
+/// The bidirectional output must equal that FD, because
+/// `eta_uv_uv = D_{dir2} D_{dir1} eta_uv`.
+///
+/// This deliberately targets the (b-direction × w-direction) activation pattern,
+/// which is exactly where the cubic-cell mixed-partial slots of
+/// `compute_survival_timepoint_bidirectional_exact_from_cached` carry the third
+/// `coeff(3)` contribution. It does NOT route through the third/fourth contracted
+/// tower (which dies earlier on the open directional third[g,w0] residual), so it
+/// isolates the bidirectional `d12` terms on their own.
+#[test]
+fn flex_bidirectional_second_mixed_matches_central_fd() {
+    let score_runtime = test_deviation_runtime();
+    let link_runtime = test_deviation_runtime();
+    let event = 1.0_f64;
+    let weight = 0.85_f64;
+    let z_row = 0.3_f64;
+    let q0v = -0.25_f64;
+    let q1v = 0.7_f64;
+    let qd1v = 0.9_f64;
+    let gv = 0.4_f64;
+
+    let family = SurvivalMarginalSlopeFamily {
+        n: 1,
+        event: Arc::new(array![event]),
+        weights: Arc::new(array![weight]),
+        z: Arc::new(array![z_row].insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: None,
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        offset_entry: Arc::new(array![q0v]),
+        offset_exit: Arc::new(array![q1v]),
+        derivative_offset_exit: Arc::new(array![qd1v]),
+        marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        score_warp: Some(score_runtime.clone()),
+        link_dev: Some(link_runtime.clone()),
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: None,
+        time_wiggle_degree: None,
+        time_wiggle_ncols: 0,
+        intercept_warm_starts: None,
+        auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+    };
+    let primary = flex_primary_slices(&family);
+    let p = primary.total;
+    let h_dim = score_runtime.basis_dim();
+    let w_dim = link_runtime.basis_dim();
+    let beta_h: Array1<f64> =
+        Array1::from_iter((0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())));
+    let beta_w: Array1<f64> =
+        Array1::from_iter((0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())));
+
+    let w_range = primary.w.clone().expect("link-dev primary range");
+    let w0 = w_range.start;
+    let g = primary.g;
+    let q1 = primary.q1;
+
+    // dir1 = e_g (the slope/b axis); dir2 = e_{w0} (a link-deviation axis).
+    let mut dir1 = Array1::<f64>::zeros(p);
+    dir1[g] = 1.0;
+    let mut dir2 = Array1::<f64>::zeros(p);
+    dir2[w0] = 1.0;
+
+    // The bidirectional second mixed derivative, contracting (dir1, dir2).
+    let (a1, _d1) = family
+        .solve_row_survival_intercept_with_slot(
+            q1v,
+            gv,
+            Some(&beta_h),
+            Some(&beta_w),
+            Some((0, SurvivalInterceptSlotKind::Exit)),
+        )
+        .expect("exit intercept");
+    let cached = family
+        .build_cached_partition(&primary, a1, gv, Some(&beta_h), Some(&beta_w))
+        .expect("exit cached partition");
+    let bi = family
+        .compute_survival_timepoint_bidirectional_exact_from_cached(
+            0,
+            &primary,
+            q1v,
+            primary.q1,
+            a1,
+            gv,
+            Some(&beta_h),
+            Some(&beta_w),
+            &cached,
+            &dir1,
+            &dir2,
+        )
+        .expect("bidirectional");
+
+    // Central FD of the directional (dir1) quantities along dir2 = e_{w0}: perturb
+    // beta_w[w0_local] by ±s, re-solve a, recompute the directional struct.
+    let w0_local = w0 - w_range.start;
+    let dir_at = |s: f64| -> SurvivalFlexTimepointDirectionalExact {
+        let mut bw = beta_w.clone();
+        bw[w0_local] += s;
+        let (a, _d) = family
+            .solve_row_survival_intercept_with_slot(
+                q1v,
+                gv,
+                Some(&beta_h),
+                Some(&bw),
+                Some((0, SurvivalInterceptSlotKind::Exit)),
+            )
+            .expect("perturbed exit intercept");
+        let cached = family
+            .build_cached_partition(&primary, a, gv, Some(&beta_h), Some(&bw))
+            .expect("perturbed cached partition");
+        family
+            .compute_survival_timepoint_directional_exact_from_cached(
+                0,
+                &primary,
+                q1v,
+                primary.q1,
+                a,
+                gv,
+                Some(&beta_h),
+                Some(&bw),
+                &cached,
+                &dir1,
+                true,
+            )
+            .expect("perturbed directional")
+    };
+    // Richardson-extrapolated central difference (kills the O(h²) term so the
+    // residual reflects the analytic d12 term, not FD truncation).
+    let fd = |sel: &dyn Fn(&SurvivalFlexTimepointDirectionalExact) -> f64, h: f64| -> f64 {
+        let coarse = (sel(&dir_at(h)) - sel(&dir_at(-h))) / (2.0 * h);
+        let fine = (sel(&dir_at(h * 0.5)) - sel(&dir_at(-h * 0.5))) / h;
+        (4.0 * fine - coarse) / 3.0
+    };
+
+    // Probe every (u,v) output pair touching the active axes, plus the diagonal.
+    let probes = [
+        (q1, q1),
+        (g, q1),
+        (g, g),
+        (g, w0),
+        (w0, w0),
+        (q1, w0),
+    ];
+    let mut max_gap = 0.0_f64;
+    for &(u, v) in &probes {
+        let eta_fd = fd(&|e| e.eta_uv_dir[[u, v]], 2e-3);
+        let chi_fd = fd(&|e| e.chi_uv_dir[[u, v]], 2e-3);
+        let d_fd = fd(&|e| e.d_uv_dir[[u, v]], 2e-3);
+        let eta_got = bi.eta_uv_uv[[u, v]];
+        let chi_got = bi.chi_uv_uv[[u, v]];
+        let d_got = bi.d_uv_uv[[u, v]];
+        let eta_gap = (eta_got - eta_fd).abs();
+        let chi_gap = (chi_got - chi_fd).abs();
+        let d_gap = (d_got - d_fd).abs();
+        eprintln!(
+            "[{u},{v}] eta_uv_uv prod {eta_got:+.6e} fd {eta_fd:+.6e} gap {eta_gap:.2e} | chi_uv_uv prod {chi_got:+.6e} fd {chi_fd:+.6e} gap {chi_gap:.2e} | d_uv_uv prod {d_got:+.6e} fd {d_fd:+.6e} gap {d_gap:.2e}"
+        );
+        for (got, fdv, gap) in
+            [(eta_got, eta_fd, eta_gap), (chi_got, chi_fd, chi_gap), (d_got, d_fd, d_gap)]
+        {
+            let scale = fdv.abs().max(got.abs()).max(1.0);
+            let rel = gap / scale;
+            max_gap = max_gap.max(rel);
+        }
+    }
+    assert!(
+        max_gap <= 5e-4,
+        "bidirectional second mixed derivative disagrees with central FD of the \
+         directional quantity along e_w0: max relative gap {max_gap:.3e} (> 5e-4). \
+         A spurious cubic-cell d12 term (4th total (a,b)-partial of a degree-3 \
+         cell polynomial, which must vanish) is the prime suspect."
     );
 }
 

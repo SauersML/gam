@@ -2111,13 +2111,31 @@ pub(crate) fn unary_derivatives_neglog_phi(x: f64, weight: f64) -> [f64; 5] {
     signed_probit_neglog_unary_stack(x, weight)
 }
 
-/// Derivatives of log(x) through 4th order.
+/// Derivatives of `log(x)` through 4th order.
+///
+/// # Contract
+///
+/// `x` must be strictly positive. `log` and its derivatives are undefined at
+/// and below the boundary, so this function does NOT clamp: a previous version
+/// silently replaced `x` by `x.max(1e-300)`, which fabricated enormous finite
+/// derivatives (`1/1e-300` etc.) that are the derivatives of neither `log(x)`
+/// nor `log(max(x, floor))`. Such a non-positive argument signals an upstream
+/// domain failure (e.g. a monotonicity violation) that must surface, not be
+/// masked. Every caller guarantees `x > 0` before invoking this:
+/// the survival marginal-slope kernels evaluate `log` of the transformed time
+/// derivative `q'(t)·√(1+b²)` only after passing `survival_derivative_guard`
+/// (`q'(t) >= derivative_guard > 0`, `√(1+b²) > 0`). The debug assertion pins
+/// that contract; in release, a non-positive `x` yields the honest IEEE result
+/// (`-inf`/`NaN`) rather than a finite fabrication.
 pub(crate) fn unary_derivatives_log(x: f64) -> [f64; 5] {
-    let x1 = x.max(1e-300);
-    let x2 = x1 * x1;
-    let x3 = x2 * x1;
-    let x4 = x3 * x1;
-    [x1.ln(), 1.0 / x1, -1.0 / x2, 2.0 / x3, -6.0 / x4]
+    debug_assert!(
+        x > 0.0,
+        "unary_derivatives_log requires x > 0 (log domain); got {x}"
+    );
+    let x2 = x * x;
+    let x3 = x2 * x;
+    let x4 = x3 * x;
+    [x.ln(), 1.0 / x, -1.0 / x2, 2.0 / x3, -6.0 / x4]
 }
 
 /// Derivatives of log φ(x) = -½x² - ½ln(2π) through 4th order.
