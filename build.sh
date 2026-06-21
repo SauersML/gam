@@ -49,7 +49,12 @@ if [[ -z "${GAM_NO_SCCACHE:-}" ]]; then
       fi
     } >&2 2>&1 || true
   fi
-  command -v sccache >/dev/null 2>&1 && CARGO+=(--config 'build.rustc-wrapper="sccache"')
+  if command -v sccache >/dev/null 2>&1; then
+    CARGO+=(--config 'build.rustc-wrapper="sccache"')
+    # sccache rejects incremental compilation ("prohibited") and cannot cache
+    # it anyway; disable incremental whenever the sccache wrapper is active.
+    export CARGO_INCREMENTAL=0
+  fi
 fi
 # Compact one-line cache summary, in the same telemetry spirit as history.log.
 # No-ops silently when sccache is inactive or its stats format shifts.
