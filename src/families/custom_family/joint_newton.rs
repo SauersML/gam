@@ -3011,6 +3011,46 @@ pub(crate) mod whitened_spectrum {
             m
         }
 
+        /// Achievable objective improvement `½ Σ c_k²/|γ_k|` over modes the raw
+        /// [`newton_decrement`] EXCLUDES but that carry GENUINE (above
+        /// machine-noise) curvature — the weakly-identified band
+        /// `numerical_floor < |γ_k| ≤ null_cutoff` (gam#1449).
+        ///
+        /// [`newton_decrement`] drops every `|γ_k| ≤ null_cutoff` mode as gauge
+        /// null, where `null_cutoff = max(rank_tol·λ_max, numerical_floor)`. That
+        /// is correct for the numerical-rank null space (`|γ_k| ≤
+        /// numerical_floor = λ_max·√p·ε`): such a mode has no resolvable curvature,
+        /// so `c_k²/|γ_k|` is meaningless machine noise and the outer IFT projects
+        /// it out. But on a BADLY-SCALED penalized Hessian `rank_tol·λ_max` can
+        /// grow large enough to also swallow a mode with small-but-REAL curvature
+        /// (`numerical_floor < |γ_k| ≤ rank_tol·λ_max`) AND real signal `c_k` — a
+        /// genuinely weakly-identified direction, not gauge. Its achievable
+        /// improvement `c_k²/(2|γ_k|)` is real and may exceed `objective_tol`, so
+        /// silently excluding it from the convergence decision would certify a
+        /// non-converged iterate.
+        ///
+        /// This sums that real-but-excluded improvement using the
+        /// CONDITIONING-ROBUST floor (`numerical_floor`, the machine-rank cutoff)
+        /// rather than `rank_tol·λ_max`. The decrement certificate fires only when
+        /// it is ALSO `≤ objective_tol`, so a weakly-identified real mode BLOCKS
+        /// premature certification while the genuine numerical null space (below
+        /// `numerical_floor`) still contributes nothing. The STEP is unchanged
+        /// (it keeps dropping the whole `≤ null_cutoff` band); only the stopping
+        /// test is hardened.
+        pub(crate) fn weakly_identified_decrement(&self) -> f64 {
+            let p = self.gamma.len();
+            // Reconstruct the genuine numerical-rank floor used by `decompose`.
+            let numerical_floor = self.lambda_max_abs * (p as f64).sqrt() * f64::EPSILON;
+            let mut acc = 0.0_f64;
+            for k in 0..p {
+                let abs_gamma = self.gamma[k].abs();
+                if abs_gamma > numerical_floor && abs_gamma <= self.null_cutoff {
+                    acc += self.c[k] * self.c[k] / abs_gamma;
+                }
+            }
+            0.5 * acc
+        }
+
         /// Assemble the whitened step `η(λ) = Σ c_k/(γ_k+λ) v_k` over identified
         /// modes and map it back to `δ = D^{-1/2} η`. Returns `(δ, range_rhs_inf,
         /// null_rhs_inf, nullity, lambda_min_positive, reflected_negative_modes,
@@ -3427,6 +3467,49 @@ mod trust_region_subproblem_tests {
         assert!(
             (excluded - 0.5).abs() < 1e-10,
             "excluded near-null residual mass must be observable; got {excluded}"
+        );
+    }
+
+    /// gam#1449: a mode the raw decrement excludes (`|γ| ≤ null_cutoff`) but that
+    /// has GENUINE curvature (above the machine-rank `numerical_floor`) and real
+    /// signal carries real achievable improvement `c²/(2|γ|)` — it must be
+    /// surfaced by `weakly_identified_decrement` so the conditioning-robust gate
+    /// blocks premature certification, while a mode below `numerical_floor` (true
+    /// numerical null) must contribute nothing.
+    #[test]
+    pub(crate) fn weakly_identified_real_mode_blocks_premature_certification() {
+        // λ_max = 1, p = 2 ⇒ numerical_floor = 1·√2·ε ≈ 3.1e-16,
+        // null_cutoff = max(rank_tol·1, floor) = rank_tol (≈ 1e-7).
+        // γ = 1e-10 is in the WEAK band: above numerical_floor, below null_cutoff.
+        let h = array![[1.0, 0.0], [0.0, 1e-10]];
+        let rhs = array![1.0, 0.5];
+        let d = array![1.0, 1.0];
+        let spec = WhitenedHessianSpectrum::decompose(&h, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();
+
+        // The weak mode is excluded from the step and the raw decrement.
+        let raw = spec.newton_decrement();
+        assert!(
+            (raw - 0.5).abs() < 1e-9,
+            "raw decrement excludes the weak mode; got {raw}"
+        );
+
+        // ...but its real achievable improvement c²/(2γ) = 0.25/(2·1e-10) is huge,
+        // so the conditioning-robust decrement is large and blocks the certificate.
+        let weak = spec.weakly_identified_decrement();
+        assert!(
+            weak > 1e8,
+            "weakly-identified real mode must surface its achievable improvement; got {weak}"
+        );
+
+        // A genuine numerical-null mode (below numerical_floor) contributes
+        // nothing: γ = 1e-300 ≪ floor, so it is true gauge, not weakly identified.
+        let h_null = array![[1.0, 0.0], [0.0, 1e-300]];
+        let spec_null =
+            WhitenedHessianSpectrum::decompose(&h_null, &rhs, &d, KKT_REFUSAL_RANK_TOL).unwrap();
+        let weak_null = spec_null.weakly_identified_decrement();
+        assert!(
+            weak_null < 1e-12,
+            "true numerical-null mode must not register as weakly identified; got {weak_null}"
         );
     }
 
