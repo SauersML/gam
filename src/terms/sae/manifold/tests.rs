@@ -7969,6 +7969,42 @@ pub(crate) fn central_difference_outer_gradient_is_deterministic_under_per_probe
     );
 }
 
+/// #1436 — `OuterGradientError::InternalInvariant` must never be FD-eligible,
+/// so an internal-invariant failure propagates as a hard error instead of being
+/// silently masked by a finite-difference descent direction. This is the core
+/// acceptance criterion: shape/indexing bugs, non-finite intermediates, and
+/// violated invariants surface as failures, not plausible-but-wrong FD steps.
+#[test]
+pub(crate) fn outer_gradient_internal_invariant_is_not_fd_eligible_1436() {
+    let ill_conditioned = OuterGradientError::IllConditioned {
+        reason: "near-singular joint Hessian".to_string(),
+    };
+    let non_identifiable = OuterGradientError::NonIdentifiable {
+        reason: "gauge-degenerate direction".to_string(),
+    };
+    let internal = OuterGradientError::InternalInvariant {
+        reason: "shape mismatch".to_string(),
+    };
+    assert!(
+        ill_conditioned.is_fd_eligible(),
+        "IllConditioned must be FD-eligible (#1273)"
+    );
+    assert!(
+        non_identifiable.is_fd_eligible(),
+        "NonIdentifiable must be FD-eligible (#1273)"
+    );
+    assert!(
+        !internal.is_fd_eligible(),
+        "InternalInvariant must NOT be FD-eligible (#1436) — it must propagate"
+    );
+    // The Display output must be descriptive enough for the outer log.
+    assert!(
+        internal.to_string().contains("internal invariant"),
+        "InternalInvariant Display must name the class; got: {}",
+        internal
+    );
+}
+
 #[test]
 pub(crate) fn deflated_solver_matches_plain_solve_when_no_gauge_is_installed() {
     let cache = diagonal_latent_cache(&[2.0_f64, 5.0, 7.0]);
