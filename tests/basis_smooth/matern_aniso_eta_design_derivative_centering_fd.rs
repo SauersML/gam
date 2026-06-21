@@ -125,3 +125,64 @@ fn aniso_design_raw_eta_first_derivative_matches_single_axis_fd() {
         );
     }
 }
+
+/// Companion guard: the analytic aniso DESIGN second-diagonal `∂²X/∂η_a²` (raw-η
+/// gauge) must match a central second difference of the realized design under a
+/// single-axis η bump. The dense design path materializes `design_second_diag`
+/// from a centered implicit operator (`with_raw_eta_centering`), so this pins
+/// that the SECOND-order design channel is in the raw-η gauge — the design
+/// counterpart to the penalty-second centering (#1376). A regression that left
+/// the design seconds in the ψ frame would fail this single-axis FD.
+#[test]
+fn aniso_design_raw_eta_second_diagonal_matches_single_axis_fd() {
+    let data = Array2::from_shape_vec(
+        (8, 3),
+        vec![
+            -1.0, -0.6, 0.2, -0.7, 0.1, -0.4, -0.2, 0.9, 0.5, 0.3, -0.3, 0.8, 0.8, 0.5, -0.1, 1.1,
+            -0.1, 0.4, 1.4, 0.8, -0.7, 0.55, -0.45, 0.15,
+        ],
+    )
+    .unwrap();
+    let eta0 = vec![0.35, -0.20, 0.10];
+    let spec = MaternBasisSpec {
+        center_strategy: CenterStrategy::UserProvided(data.clone()),
+        periodic: None,
+        length_scale: 0.9,
+        nu: MaternNu::ThreeHalves,
+        include_intercept: false,
+        double_penalty: false,
+        identifiability: Default::default(),
+        aniso_log_scales: Some(eta0.clone()),
+        nullspace_shrinkage_survived: None,
+    };
+
+    let deriv = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();
+    let dim = eta0.len();
+    // Small-n materialized path exposes the dense diagonal seconds; if the build
+    // chose the operator-only path (no dense blocks), there is nothing to FD here
+    // (the operator path is already the centered reference oracle), so skip.
+    if deriv.design_second_diag.len() != dim {
+        return;
+    }
+
+    let s0 = realized_design_at(&data, &spec, &eta0);
+    let h = 1e-4;
+    for a in 0..dim {
+        let mut eta_p = eta0.clone();
+        eta_p[a] += h;
+        let mut eta_m = eta0.clone();
+        eta_m[a] -= h;
+        let sp = realized_design_at(&data, &spec, &eta_p);
+        let sm = realized_design_at(&data, &spec, &eta_m);
+        let fd = (&sp - &(&s0 * 2.0) + &sm).mapv(|v| v / (h * h));
+        let analytic = &deriv.design_second_diag[a];
+        assert_eq!(fd.raw_dim(), analytic.raw_dim(), "shape mismatch axis {a}");
+        let scale = analytic.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
+        let max_err = (&fd - analytic).iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        assert!(
+            max_err < 2e-3 * scale.max(1.0),
+            "aniso design raw-η second-diagonal mismatch on axis {a}: max_err={max_err:.3e} \
+             (scale={scale:.3e})"
+        );
+    }
+}

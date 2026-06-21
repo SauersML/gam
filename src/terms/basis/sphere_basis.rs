@@ -3537,14 +3537,19 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
         // apply the projector, then overwrite the diagonal blocks and install a
         // closure cross provider that serves the pre-centered `H_η[a,b]`.
         //
-        // NOTE (design-Hessian gap): the analogous DESIGN second derivatives are
-        // NOT centered here because the dense path emits no design cross-second
-        // blocks (`design_second_cross` is always empty — see
-        // `build_aniso_design_psi_derivatives_shared`), so the full-Hessian
-        // projection is not computable for the design without first adding that
-        // cross computation. The large-n implicit-operator path already centers
-        // both orders (`with_raw_eta_centering`); closing the dense design-Hessian
-        // gap is tracked for a compile-verified follow-up (gam#1376).
+        // Why only the PENALTY here: the DESIGN seconds are ALREADY in the raw-η
+        // gauge. The dense design path
+        // (`build_aniso_design_psi_derivatives_shared`) attaches a centered
+        // `ImplicitDesignPsiDerivative` (`with_raw_eta_centering`) and
+        // materializes `design_second_diag` from it (so the diagonal is centered),
+        // while the consumer pulls the design cross-seconds straight from that same
+        // centered operator (`materialize_second_cross`, which applies the same
+        // `axis_combinations` projection). So `design_second_cross` being empty is
+        // not a gap — it is intentionally sourced from the operator. The penalty
+        // path has NO operator: it builds `penalties_second_diag` and the cross
+        // provider directly in the ψ frame, and the firsts-centering block above
+        // touches only `penalties_first`. This block closes that one remaining gap
+        // so the penalty raw-η Hessian matches the design one.
         if result.penalties_second_diag.len() == dim
             && !result.penalties_second_diag[0].is_empty()
             && let Some(provider) = result.penalties_cross_provider.take()
