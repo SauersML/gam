@@ -55,49 +55,92 @@ pub(crate) fn select_equal_mass_centers(
         pub(crate) end: usize,
     }
 
-    // Recursive equal-mass partition that always splits the leaf along its widest
-    // coordinate dimension. This addresses the root cause of PC1-only slicing by
-    // adapting splits to the local geometry of each partition. Keep all row indices
-    // in a single buffer and sort subranges in-place so center selection stays exact
-    // without allocating fresh index vectors at every split.
+    // Recursive equal-mass partition that splits each leaf along its PRINCIPAL
+    // axis (the leading eigenvector of the leaf covariance), rather than along
+    // its widest *coordinate* axis. An axis-aligned k-d-tree split is NOT
+    // rotation-equivariant: under a rigid rotation of the inputs the per-leaf
+    // coordinate spans change, "the widest coordinate" can flip, and a different
+    // center set results — which is the root cause of #1456 (default
+    // `thinplate(x,z)` drifting under rotation). The principal axis rotates with
+    // the data, so projecting onto it and splitting at the equal-mass median
+    // along that axis selects the SAME points (up to the rotation), making the
+    // low-rank center set rotation-equivariant while staying deterministic and
+    // permutation-invariant. Keep all row indices in a single buffer and sort
+    // subranges in-place so center selection stays exact without allocating fresh
+    // index vectors at every split.
     let mut order: Vec<usize> = (0..n).collect();
     let mut leaves = vec![Leaf { start: 0, end: n }];
 
-    let choose_split_dim = |slice: &[usize]| -> usize {
-        // Score candidate split dimensions in parallel, but keep each dimension's
-        // row scan in serial row order and use the same strict-`>` update rule
-        // (with lowest-dimension tie breaking) as the original greedy splitter.
-        (0..d)
-            .into_par_iter()
-            .map(|j| {
-                let mut minv = f64::INFINITY;
-                let mut maxv = f64::NEG_INFINITY;
-                for &idx in slice {
-                    let v = data[[idx, j]];
-                    if v < minv {
-                        minv = v;
-                    }
-                    if v > maxv {
-                        maxv = v;
-                    }
+    // Leading-eigenvector ("principal") axis of the leaf covariance. The sign of
+    // an eigenvector is arbitrary; we canonicalise it deterministically (largest
+    // |component| made positive, lowest index breaking magnitude ties) so the
+    // sort order — and hence the chosen split — is reproducible. The median
+    // split itself is sign-invariant, but canonicalisation also pins the
+    // tie-break ordering used for points with equal projections. Returns `None`
+    // when the leaf has no usable spread (all eigenvalues ~0), in which case the
+    // caller falls back to a deterministic coordinate-lexicographic order.
+    let principal_axis = |slice: &[usize]| -> Option<Vec<f64>> {
+        let m = slice.len();
+        if m < 2 {
+            return None;
+        }
+        let mut centroid = vec![0.0_f64; d];
+        for &idx in slice {
+            for j in 0..d {
+                centroid[j] += data[[idx, j]];
+            }
+        }
+        let inv = 1.0 / m as f64;
+        for v in &mut centroid {
+            *v *= inv;
+        }
+        // Covariance (d×d, small): symmetric accumulation of centred outer
+        // products. d is the covariate dimension (typically 2 for thinplate).
+        let mut cov = Array2::<f64>::zeros((d, d));
+        for &idx in slice {
+            for a in 0..d {
+                let da = data[[idx, a]] - centroid[a];
+                for b in a..d {
+                    let db = data[[idx, b]] - centroid[b];
+                    cov[[a, b]] += da * db;
                 }
-                let span = maxv - minv;
-                let span = if span.is_nan() {
-                    f64::NEG_INFINITY
-                } else {
-                    span
-                };
-                (j, span)
-            })
-            .reduce_with(|a, b| {
-                if b.1 > a.1 || (b.1 == a.1 && b.0 < a.0) {
-                    b
-                } else {
-                    a
-                }
-            })
-            .map(|(j, _)| j)
-            .unwrap_or(0)
+            }
+        }
+        for a in 0..d {
+            cov[[a, a]] *= inv;
+            for b in (a + 1)..d {
+                cov[[a, b]] *= inv;
+                cov[[b, a]] = cov[[a, b]];
+            }
+        }
+        if cov.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        // `eigh` returns eigenvalues in ascending order, so the principal axis is
+        // the LAST column. Fall back to coordinate order if it cannot factor.
+        let (evals, evecs) = cov.eigh(Side::Lower).ok()?;
+        let last = evals.len().checked_sub(1)?;
+        if !(evals[last] > 0.0) {
+            return None;
+        }
+        let mut axis: Vec<f64> = (0..d).map(|r| evecs[[r, last]]).collect();
+        if axis.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        // Deterministic sign canonicalisation: the dominant-magnitude component
+        // (lowest index wins magnitude ties) is forced non-negative.
+        let mut pivot = 0usize;
+        for r in 1..d {
+            if axis[r].abs() > axis[pivot].abs() {
+                pivot = r;
+            }
+        }
+        if axis[pivot] < 0.0 {
+            for v in &mut axis {
+                *v = -*v;
+            }
+        }
+        Some(axis)
     };
 
     while leaves.len() < num_centers {
@@ -115,11 +158,38 @@ pub(crate) fn select_equal_mass_centers(
         };
 
         let leaf = leaves.swap_remove(pos);
-        let split_dim = choose_split_dim(&order[leaf.start..leaf.end]);
-        order[leaf.start..leaf.end].sort_by(|&a, &b| {
-            let ord = data[[a, split_dim]].total_cmp(&data[[b, split_dim]]);
-            if ord.is_eq() { a.cmp(&b) } else { ord }
-        });
+        let axis = principal_axis(&order[leaf.start..leaf.end]);
+        match axis {
+            Some(axis) => {
+                // Project each row onto the principal axis and sort by the scalar
+                // projection (index tie-break for determinism). The projection
+                // rotates with the data, so this split is rotation-equivariant.
+                order[leaf.start..leaf.end].sort_by(|&a, &b| {
+                    let mut pa = 0.0_f64;
+                    let mut pb = 0.0_f64;
+                    for j in 0..d {
+                        pa += data[[a, j]] * axis[j];
+                        pb += data[[b, j]] * axis[j];
+                    }
+                    let ord = pa.total_cmp(&pb);
+                    if ord.is_eq() { a.cmp(&b) } else { ord }
+                });
+            }
+            None => {
+                // Degenerate leaf (no spread / non-finite covariance): fall back
+                // to a deterministic coordinate-lexicographic order so the split
+                // is still well defined and permutation-invariant.
+                order[leaf.start..leaf.end].sort_by(|&a, &b| {
+                    for j in 0..d {
+                        let ord = data[[a, j]].total_cmp(&data[[b, j]]);
+                        if !ord.is_eq() {
+                            return ord;
+                        }
+                    }
+                    a.cmp(&b)
+                });
+            }
+        }
         let mid = leaf.start + (split_size / 2);
 
         if mid == leaf.start || mid == leaf.end {
@@ -386,4 +456,161 @@ pub(crate) fn select_uniform_grid_centers(
         axes.push(Array::linspace(minv, maxv, points_per_dim));
     }
     cartesian_grid_axes(&axes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic 2-D scatter with a clear, off-axis anisotropy so the
+    /// principal axis is well separated from both coordinate axes. A small
+    /// lattice perturbed by a reproducible pseudo-random jitter; no RNG crate
+    /// needed, fully deterministic across runs.
+    fn make_points() -> Array2<f64> {
+        let n_side = 11usize;
+        let n = n_side * n_side;
+        let mut pts = Array2::<f64>::zeros((n, 2));
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            // xorshift64* — deterministic, no external dependency.
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let v = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            ((v >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        let mut r = 0usize;
+        for i in 0..n_side {
+            for j in 0..n_side {
+                let x = i as f64;
+                // Shear the lattice so its spread is genuinely off both axes,
+                // making the "widest coordinate" choice fragile under rotation.
+                let y = 0.35 * i as f64 + 1.7 * j as f64;
+                pts[[r, 0]] = x + 0.05 * (next() - 0.5);
+                pts[[r, 1]] = y + 0.05 * (next() - 0.5);
+                r += 1;
+            }
+        }
+        pts
+    }
+
+    fn rotate(points: ArrayView2<'_, f64>, theta: f64) -> Array2<f64> {
+        // Rotate about the centroid so the transform is a rigid motion of the
+        // point cloud (a pure orthogonal rotation in the centred frame).
+        let n = points.nrows();
+        let cx = points.column(0).sum() / n as f64;
+        let cy = points.column(1).sum() / n as f64;
+        let (s, c) = theta.sin_cos();
+        let mut out = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let x = points[[i, 0]] - cx;
+            let y = points[[i, 1]] - cy;
+            out[[i, 0]] = c * x - s * y + cx;
+            out[[i, 1]] = s * x + c * y + cy;
+        }
+        out
+    }
+
+    /// Assert two center sets are equal up to ordering, by greedily matching each
+    /// row of `expected` to its nearest row of `actual` and requiring the match
+    /// residual to be below `tol`. Both sets must have the same number of rows.
+    fn assert_center_sets_match(expected: ArrayView2<'_, f64>, actual: ArrayView2<'_, f64>, tol: f64) {
+        assert_eq!(expected.nrows(), actual.nrows(), "center counts differ");
+        let k = expected.nrows();
+        let mut used = vec![false; k];
+        let mut worst = 0.0_f64;
+        for ei in 0..k {
+            let mut best = usize::MAX;
+            let mut best_d2 = f64::INFINITY;
+            for ai in 0..k {
+                if used[ai] {
+                    continue;
+                }
+                let dx = expected[[ei, 0]] - actual[[ai, 0]];
+                let dy = expected[[ei, 1]] - actual[[ai, 1]];
+                let d2 = dx * dx + dy * dy;
+                if d2 < best_d2 {
+                    best_d2 = d2;
+                    best = ai;
+                }
+            }
+            assert!(best != usize::MAX, "no unmatched center available");
+            used[best] = true;
+            worst = worst.max(best_d2.sqrt());
+        }
+        assert!(
+            worst <= tol,
+            "rotation-equivariance violated: worst center match residual {worst:.3e} > tol {tol:.3e}"
+        );
+    }
+
+    /// #1456 regression: the low-rank equal-mass center selection must be
+    /// rotation-EQUIVARIANT. Selecting centers, then rotating the inputs and
+    /// reselecting, must yield the rotation of the original center set. The old
+    /// axis-aligned k-d-tree split fails this (the chosen "widest coordinate"
+    /// flips under rotation, producing a different center set); the principal-axis
+    /// split passes it. Verified for an exact 90° rotation (no rounding) and a
+    /// generic angle.
+    #[test]
+    fn equal_mass_centers_are_rotation_equivariant() {
+        let pts = make_points();
+        let num_centers = 16usize;
+        let base = select_equal_mass_centers(pts.view(), num_centers).unwrap();
+
+        for &theta in &[std::f64::consts::FRAC_PI_2, 0.6435011087932844_f64] {
+            let rotated_pts = rotate(pts.view(), theta);
+            let rotated_centers = select_equal_mass_centers(rotated_pts.view(), num_centers).unwrap();
+            // The expected centers are the rotation of the ORIGINAL selection.
+            let expected = rotate(base.view(), theta);
+            assert_center_sets_match(expected.view(), rotated_centers.view(), 1e-9);
+
+            // The downstream thin-plate penalty (rotation-invariant given fixed
+            // centers) must therefore be unchanged between the original and the
+            // rotated fit, up to tight numerical tolerance.
+            let p0 = super::super::build_thin_plate_penalty_matrix(base.view(), 1.0)
+                .unwrap()
+                .penalty;
+            let p1 = super::super::build_thin_plate_penalty_matrix(rotated_centers.view(), 1.0)
+                .unwrap()
+                .penalty;
+            assert_eq!(p0.dim(), p1.dim(), "penalty dimensions differ under rotation");
+            let mut worst = 0.0_f64;
+            for (a, b) in p0.iter().zip(p1.iter()) {
+                worst = worst.max((a - b).abs());
+            }
+            assert!(
+                worst <= 1e-9,
+                "thin-plate penalty drifted {worst:.3e} under rotation theta={theta}"
+            );
+        }
+    }
+
+    /// Existing invariant we must preserve: center selection is invariant to row
+    /// permutation of the inputs (the selected SET is unchanged when rows are
+    /// reordered). Locks the determinism/permutation-invariance the fix must keep.
+    #[test]
+    fn equal_mass_centers_are_permutation_invariant() {
+        let pts = make_points();
+        let num_centers = 16usize;
+        let base = select_equal_mass_centers(pts.view(), num_centers).unwrap();
+
+        let n = pts.nrows();
+        let mut perm: Vec<usize> = (0..n).collect();
+        // Deterministic shuffle.
+        let mut state: u64 = 0xD1B5_4A32_D192_ED03;
+        for i in (1..n).rev() {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let j = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) % (i as u64 + 1)) as usize;
+            perm.swap(i, j);
+        }
+        let mut permuted = Array2::<f64>::zeros((n, 2));
+        for (new_r, &old_r) in perm.iter().enumerate() {
+            permuted[[new_r, 0]] = pts[[old_r, 0]];
+            permuted[[new_r, 1]] = pts[[old_r, 1]];
+        }
+        let permuted_centers = select_equal_mass_centers(permuted.view(), num_centers).unwrap();
+        assert_center_sets_match(base.view(), permuted_centers.view(), 1e-13);
+    }
 }
