@@ -6276,13 +6276,55 @@ fn build_factor_smooth(
             basis: SmoothBasisSpec::FactorSumToZero {
                 inner: Box::new(inner),
                 by_col: group_col,
-                levels,
+                levels: levels.clone(),
                 frozen_global_orthogonality: None,
             },
             shape: ShapeConstraint::None,
             joint_null_rotation: None,
         };
-        return build_single_local_smooth_term(data, &sz_term, workspace);
+        let mut built = build_single_local_smooth_term(data, &sz_term, workspace)?;
+        // The delegated `FactorSumToZero` build returns the BARE inner B-spline
+        // metadata (`BasisMetadata::BSpline1D`), but the term that owns this
+        // build carries a `SmoothBasisSpec::FactorSmooth { Sz }` spec. Two
+        // things break if we hand that mismatched pair downstream:
+        //   1. `freeze_smooth_basis_from_metadata` matches on (spec, metadata)
+        //      and has no `(FactorSmooth, BSpline1D)` arm, so any refit / spatial
+        //      re-optimization that freezes the basis aborts with a "smooth
+        //      metadata/spec type mismatch" error.
+        //   2. The bare B-spline metadata carries no grouping levels, so a
+        //      predict-time rebuild cannot replay the SAME replicated design.
+        // Re-wrap the marginal geometry as `FactorSmooth` metadata exactly as
+        // the Fs/Re path below does, giving all three factor-smooth flavours a
+        // single, freeze-consistent metadata shape that also pins the levels.
+        let (knots, degree, periodic) = match &built.metadata {
+            BasisMetadata::BSpline1D {
+                knots,
+                periodic,
+                degree,
+                ..
+            } => (
+                knots.clone(),
+                degree.unwrap_or(spec.marginal.degree),
+                *periodic,
+            ),
+            other => {
+                crate::bail_invalid_basis!(
+                    "sz factor smooth term '{}' produced an unexpected marginal metadata variant {:?}",
+                    term_name,
+                    other
+                );
+            }
+        };
+        built.metadata = BasisMetadata::FactorSmooth {
+            continuous_cols: spec.continuous_cols.clone(),
+            group_col,
+            knots,
+            degree,
+            periodic,
+            group_levels: levels,
+            flavour: "sz".to_string(),
+        };
+        return Ok(built);
     }
 
     let levels = resolve_factor_smooth_levels(data, group_col, spec, term_name)?;
