@@ -904,8 +904,10 @@ where
                     let cost_converged = reml_state.compute_cost(&strategy_result.rho).ok();
                     // Restore the cached β̂ to the converged operating point after
                     // the seed probe (the no-op path below expects β̂ at
-                    // `strategy_result.rho`).
-                    let _ = reml_state.compute_cost(&strategy_result.rho);
+                    // `strategy_result.rho`). Propagate any failure rather than
+                    // swallowing it: proceeding with β̂ at the wrong operating
+                    // point would silently corrupt the reported fit.
+                    reml_state.compute_cost(&strategy_result.rho)?;
                     match (cost_seed, cost_converged) {
                         (Some(cs), Some(cc)) if cs.is_finite() && cc.is_finite() => {
                             cc < cs - 1e-6 * (1.0 + cs.abs())
