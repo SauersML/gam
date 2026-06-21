@@ -51,17 +51,16 @@ use crate::families::custom_family::{
 };
 use crate::identifiability::audit::{
     IdentifiabilityAudit, audit_identifiability, audit_identifiability_channel_aware,
-    block_structural_penalty_dense, priority_tiered_rank_from_gram,
+    block_structural_penalty_dense, priority_tiered_rank_from_gram, rank_of_gram,
 };
 use crate::identifiability::families::compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
 };
 use crate::linalg::faer_ndarray::{
-    FaerEigh, default_rrqr_rank_alpha, fast_ata, fast_atb, rrqr_with_permutation,
+    default_rrqr_rank_alpha, fast_ata, fast_atb, rrqr_with_permutation,
 };
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use crate::solver::gauge::Gauge;
-use faer::Side;
 
 enum BlockJacobianSource {
     Callback(Arc<dyn BlockEffectiveJacobian>),
@@ -434,22 +433,30 @@ pub fn canonicalize_for_identifiability(
 /// dropping a column the audit deemed identifiable lowers `rank_audit(J_can)`
 /// below `rank_audit(J)`.
 ///
-/// `nk_scale` mirrors the audit's tolerance size term
-/// `(n·K).max(p).max(1)` (`keep_positive_eigenspace`).
+/// `nk_scale` is the channel-major design row count `n·K` (= `j.nrows()`), the
+/// `n_total` term `rank_of_gram`/`count_rank` use to size their tolerance.
 ///
-/// PENALTY AUGMENTATION (channel-aware analogue of the flat #1391 fix). The
-/// channel-aware audit does NOT decide its kept rank from the bare data Gram: it
-/// ranks the PENALTY-AUGMENTED Gram `JᵀJ + Σ_block SᵀS`
-/// (`channel_aware_penalty_aware_joint_rank` in `audit.rs`), so a direction that
-/// is data-WEAK but penalty-ANCHORED — e.g. the wiggliness-penalised null modes a
-/// softmax channel shares once the cross-class σ²-coupling thins their data
-/// signal — is counted as identifiable and KEPT. Ranking the bare `J_can` here
-/// undercounts exactly those kept directions, so a faithful column-selection `T`
-/// reports `rank(J_can) < p_red` and trips a FALSE invariant violation
-/// (multinomial `s(x) + s(x, by=g)`, rank 28 vs p_red 30). Augmenting with the
-/// same reduced per-block structural penalties realigns the verification metric
-/// with the audit's drop convention — the bare data Gram is recovered when no
-/// block is penalised, so unpenalised channel-aware fits are unaffected.
+/// This verification ranks the PENALTY-AUGMENTED reduced Gram
+/// `J_canᵀJ_can + Σ_block SᵀS` with the AUDIT'S OWN rank function
+/// (`rank_of_gram` → `count_rank`), so the post-T check and the audit's keep
+/// decision use the identical augmentation AND the identical tolerance by
+/// construction — they can no longer disagree on a faithful column-selection `T`.
+/// Two ingredients that the earlier bare-eigenvalue verification dropped, each of
+/// which produced a FALSE "post-T rank invariant violated":
+///   • PENALTY AUGMENTATION (channel-aware analogue of the flat #1391 fix). The
+///     channel-aware audit keeps a direction that is data-WEAK but penalty-
+///     ANCHORED, because it ranks `JᵀJ + Σ SᵀS`
+///     (`channel_aware_penalty_aware_joint_rank`). The bare `J_can` Gram
+///     undercounts exactly those kept directions — e.g. the wiggliness-penalised
+///     null modes a softmax channel shares once the cross-class σ²-coupling thins
+///     their data signal (multinomial `s(x) + s(x, by=g)`: 28 vs p_red 30).
+///   • TOLERANCE MATCH. `count_rank` keeps a singular value `σ=√λ` down to
+///     `rank_alpha·ε·n·σ_max`; the old eigenvalue cutoff `λ > scale·64·n·ε` was
+///     ~ε larger and demoted penalty-covered modes whose `λ` sits between
+///     `ε²λ_max` and `ε·λ_max` (Gaussian survival location-scale: 16 vs p_red 18).
+/// The bare data Gram is recovered when no block is penalised (or the block
+/// layout does not tile the columns), so unpenalised channel-aware fits are
+/// unaffected.
 fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize, blocks: &[FlatRankBlock]) -> usize {
     let p = j.ncols();
     if p == 0 || j.nrows() == 0 {
@@ -482,22 +489,18 @@ fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize, blocks: &[FlatRankBlo
             col_off += b.width;
         }
     }
-    let (evals, _) = match gram.eigh(Side::Lower) {
-        Ok(ev) => ev,
-        // Eigendecomposition failure: fall back to the structural column count
-        // (no demotion), so a numerical hiccup never turns into a spurious
-        // invariant violation.
-        Err(_) => return p,
-    };
-    let lambda_max = evals.iter().cloned().fold(0.0_f64, f64::max).max(0.0);
-    let trace: f64 = (0..p).map(|i| gram[[i, i]].max(0.0)).sum();
-    let scale = lambda_max.max(trace);
-    // RANK_REVEAL_EPS_SLACK = 64.0 in families::compiler — kept in sync here.
-    // The penalty rows enlarge the audit's tall-design row count, mirroring
-    // `rank_of_gram(.., n_design_rows + n_penalty_rows)` in the audit.
-    let nk = nk_scale.saturating_add(n_penalty_rows).max(p).max(1) as f64;
-    let tau = scale * 64.0 * nk * f64::EPSILON;
-    evals.iter().filter(|&&l| l > tau).count()
+    // Rank the augmented Gram with the AUDIT'S OWN singular-value convention
+    // (`rank_of_gram` → `count_rank`), so the post-T verification and the audit's
+    // keep decision share the identical tolerance. The penalty rows enlarge the
+    // tall-design row count exactly as the audit's
+    // `rank_of_gram(.., n_design_rows + n_penalty_rows)` does. The earlier
+    // eigenvalue cutoff `λ > scale·64·n·ε` was ~ε larger than `count_rank`'s
+    // σ-space `rank_alpha·ε·n·σ_max` floor and demoted penalty-covered modes whose
+    // `λ` sits between `ε²λ_max` and `ε·λ_max` (Gaussian survival location-scale:
+    // 16 vs p_red 18). On eigendecomposition failure fall back to the structural
+    // column count (no demotion), so a numerical hiccup never becomes a spurious
+    // violation.
+    rank_of_gram(&gram, nk_scale.saturating_add(n_penalty_rows)).unwrap_or(p)
 }
 
 /// Per-block descriptor for the penalty-augmented priority-tiered rank: the
