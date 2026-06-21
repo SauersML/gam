@@ -1105,16 +1105,6 @@ impl MultinomialFamily {
         Ok(out)
     }
 
-    #[cfg(test)]
-    fn assemble_directional_derivatives(
-        &self,
-        eta: ArrayView2<'_, f64>,
-        directions: &[Array1<f64>],
-    ) -> Result<Vec<Array2<f64>>, String> {
-        let probs = self.row_probabilities(eta);
-        self.assemble_directional_derivatives_from_probs(probs.view(), directions)
-    }
-
     /// Second directional derivative kernel `D²_β H[d_u, d_v]`. Built by
     /// differentiating the first-order kernel along a second direction.
     ///
@@ -1722,7 +1712,7 @@ impl CustomFamily for MultinomialFamily {
     fn joint_jeffreys_information_directional_derivative_all_axes_with_specs(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
     ) -> Result<Option<Vec<Array2<f64>>>, String> {
         // BATCHED all-axes fast path for the Tier-B Jeffreys/Firth loop
         // (#979). The generic trait default queries `Hdot[e_a]` `p = (K−1)·P`
@@ -1736,20 +1726,32 @@ impl CustomFamily for MultinomialFamily {
         // dim×dim clones. Bit-identical to the per-axis route by construction —
         // it is the very function `cached_axis_directional_derivative` fills its
         // memo from, so each returned axis matrix equals the cached clone the
-        // serial loop would have produced. `specs` only steer the trait-default
-        // routing (coupled multinomial always serves from its own coupled joint
-        // derivative); the β-fixed `η` comes from `block_states` exactly as the
-        // per-axis `exact_newton_joint_hessian_directional_derivative` does.
+        // serial loop would have produced. The β-fixed `η` comes from
+        // `block_states` exactly as the per-axis
+        // `exact_newton_joint_hessian_directional_derivative` does.
         let eta = self.collect_eta_matrix(block_states)?;
-        Ok(Some(
-            self.assemble_all_axis_directional_derivatives(eta.view()),
-        ))
+        let axes = self.assemble_all_axis_directional_derivatives(eta.view());
+        // The caller indexes the returned Vec by canonical axis a ∈ 0..p, where
+        // p = Σ spec.design.ncols() is the joint coefficient dimension across the
+        // coupled softmax blocks. Verify the batched assembly produced exactly
+        // that many axes (in canonical order), so a block-structure mismatch
+        // surfaces here instead of as a silent per-axis misalignment in the
+        // Jeffreys `H_Φ` drift.
+        let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+        if axes.len() != p {
+            return Err(format!(
+                "multinomial all-axes Jeffreys derivative produced {} axes but the block specs \
+                 describe p={p} joint coefficients",
+                axes.len()
+            ));
+        }
+        Ok(Some(axes))
     }
 
     fn joint_jeffreys_information_second_directional_all_axes_with_specs(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         d_beta_u_flat: &Array1<f64>,
     ) -> Result<Option<Vec<Array2<f64>>>, String> {
         // BATCHED all-axes SECOND-directional fast path for the Tier-B Jeffreys
@@ -1764,9 +1766,20 @@ impl CustomFamily for MultinomialFamily {
         // per-axis `second_directional_fisher_jet → dense_block_xtwx` route up to
         // row-sum associativity, for a single Gram-assembly cost instead of `p`.
         let eta = self.collect_eta_matrix(block_states)?;
-        Ok(Some(
-            self.assemble_all_axis_second_directional_derivatives(eta.view(), d_beta_u_flat)?,
-        ))
+        let axes =
+            self.assemble_all_axis_second_directional_derivatives(eta.view(), d_beta_u_flat)?;
+        // Same canonical-axis contract as the first-directional batch: the caller
+        // indexes by a ∈ 0..p with p = Σ spec.design.ncols(), so verify the
+        // assembled count matches the block specs before returning.
+        let p: usize = specs.iter().map(|spec| spec.design.ncols()).sum();
+        if axes.len() != p {
+            return Err(format!(
+                "multinomial all-axes second Jeffreys derivative produced {} axes but the block \
+                 specs describe p={p} joint coefficients",
+                axes.len()
+            ));
+        }
+        Ok(Some(axes))
     }
 
     fn exact_newton_joint_hessiansecond_directional_derivative(
@@ -1927,6 +1940,22 @@ mod tests {
     //!    `class_levels` order survives unchanged.
     use super::*;
     use ndarray::array;
+
+    impl MultinomialFamily {
+        /// Test-only convenience wrapper: assemble the batched first-directional
+        /// derivatives directly from `eta`, computing the row probabilities
+        /// internally. Production callers already hold the probabilities and use
+        /// `assemble_directional_derivatives_from_probs`; the parity tests in this
+        /// module drive the family from raw `eta`.
+        fn assemble_directional_derivatives(
+            &self,
+            eta: ArrayView2<'_, f64>,
+            directions: &[Array1<f64>],
+        ) -> Result<Vec<Array2<f64>>, String> {
+            let probs = self.row_probabilities(eta);
+            self.assemble_directional_derivatives_from_probs(probs.view(), directions)
+        }
+    }
 
     fn toy_family(n_obs: usize, p: usize, k: usize) -> MultinomialFamily {
         let y = {
