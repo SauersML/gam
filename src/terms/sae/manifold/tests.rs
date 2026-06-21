@@ -3967,6 +3967,69 @@ pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active(
     assert!(compact_work < dense_work / 1_000_000_000);
 }
 
+/// #1407 — fixed-decoder assembly must skip the ENTIRE decoder β tier. The
+/// frozen-decoder encode path (`run_fixed_decoder_arrow_schur`) reads only the
+/// per-row `htt`/`gt` blocks, so assembling the joint decoder β tier
+/// (`G`/`gb`/`H_tβ`/dense `hbb`/β-penalties) is dead, K-dependent work. The
+/// `fixed_decoder_assembly` flag gates it off; this pins that the assembled
+/// system carries the populated per-row `(htt, gt)` block-diagonal but an EMPTY
+/// β tier (`hbb` reclaimed to `0×0`), versus the full joint assembly which
+/// materialises both. The two assemblies run on the SAME term/ρ so the contrast
+/// is exactly the β-tier work the flag elides.
+#[test]
+pub(crate) fn fixed_decoder_assembly_skips_beta_tier_1407() {
+    let (mut term, target, rho) = small_two_atom_periodic_term();
+
+    // Full joint assembly: the β tier IS built (dense hbb materialised).
+    let full = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("full joint assemble_arrow_schur");
+    assert!(
+        full.hbb.dim().0 > 0 && full.hbb.dim().1 > 0,
+        "full joint assembly must materialise a non-empty dense β-Hessian hbb; \
+         got {:?}",
+        full.hbb.dim()
+    );
+    let n_rows = full.rows.len();
+
+    // Fixed-decoder assembly on the SAME term/ρ: the β tier is elided.
+    term.fixed_decoder_assembly = true;
+    let fixed = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("fixed-decoder assemble_arrow_schur");
+    term.fixed_decoder_assembly = false;
+
+    assert_eq!(
+        fixed.hbb.dim(),
+        (0, 0),
+        "fixed-decoder assembly must build NO dense β-Hessian (the β tier is \
+         dead work when the decoder is frozen); got hbb {:?}",
+        fixed.hbb.dim()
+    );
+    // The per-row latent block-diagonal the fixed-decoder Newton step reads is
+    // still fully populated and finite (same row count as the full assembly).
+    assert_eq!(
+        fixed.rows.len(),
+        n_rows,
+        "fixed-decoder assembly must keep every per-row htt/gt block"
+    );
+    for (i, row) in fixed.rows.iter().enumerate() {
+        assert!(
+            row.htt.iter().all(|v| v.is_finite()) && row.gt.iter().all(|v| v.is_finite()),
+            "fixed-decoder row {i} htt/gt must be finite"
+        );
+        assert_eq!(
+            row.htt.dim().0,
+            row.gt.len(),
+            "fixed-decoder row {i} htt must be square and match gt length"
+        );
+        assert!(
+            row.gt.len() > 0,
+            "fixed-decoder row {i} must carry a non-empty latent block"
+        );
+    }
+}
+
 /// MechanismSparsityPenalty must reach the SAE arrow-Schur system's
 /// `gb` (beta-tier gradient) when its target slice is shaped to match a
 /// single-atom decoder block (M, p_out). The group lasso over rows of
