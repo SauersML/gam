@@ -107,7 +107,9 @@ impl AmortizedWarmStartTelemetry {
 /// main GAM REML path uses, instead of the SAE's deleted forked
 /// `update_ard_reml` fixed-point rule. Each outer eval runs the inner
 /// `(t, β)` arrow-Schur Newton solve at the engine's current ρ and returns
-/// the true REML criterion (see [`SaeManifoldTerm::reml_criterion`]).
+/// the penalised quasi-Laplace evidence criterion (#1421: NOT a true
+/// normalized-prior REML — the assignment priors softmax/JumpReLU are improper
+/// and have no ρ-independent normalizer; see [`SaeManifoldTerm::reml_criterion`]).
 ///
 /// The SAE's outer coordinates ρ are all penalty-like / τ (precisions and
 /// log-smoothing-strengths), so `psi_dim = 0`: there are no design-moving
