@@ -215,3 +215,6 @@ gam_env.sh
 # fails the build on any tracked file containing the banned cluster strings.
 scripts/*verify*fresh*.sh
 *.sbatch
+
+# local CARGO_HOME cache (multi-agent build), never commit
+.cargo/
