@@ -1465,7 +1465,24 @@ where
                     frob += sol[[r.start + row, col]] * rhs[[r.start + row, col]];
                 }
             }
-            traces[kk] = lambdas[kk] * frob;
+            // The per-block penalty trace `tr_kk = λ_kk·tr(H⁻¹ S_kk)` is the
+            // penalized effective d.f. of block `kk`, mathematically confined to
+            // `[0, rank_kk]` (a PSD penalty can absorb at most its own rank). When
+            // the outer REML / spatial-κ optimizer drives a redundant block's
+            // `λ_kk = exp(ρ_kk)` to the finite ceiling (gam#1379: the Matérn kernel
+            // already controls the smoothness a redundant operator block also
+            // penalizes, so REML wants `λ → ∞`), the raw product `λ_kk · frob`
+            // can overflow to `+∞` on the ridge-stabilized inference Hessian even
+            // though the true value is just `rank_kk` — poisoning
+            // `penalty_block_trace[kk]` and tripping the fit-result finiteness
+            // validator (`fit_result.penalty_block_trace[kk] must be finite, got
+            // inf`). Clamp to the valid `[0, rank]` interval so a fully-penalized
+            // direction reads its exact saturated trace `rank_kk` instead of `+∞`.
+            // Ordinary finite traces are inside `[0, rank]` and pass through
+            // unchanged, so non-degenerate fits and their recorded EDF accounting
+            // are bit-identical (the `edf_by_block` channel already clamps the
+            // complementary `rank − trace` to `[0, rank]`).
+            traces[kk] = (lambdas[kk] * frob).clamp(0.0, rank as f64);
         }
         edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
         penalty_block_trace.clone_from(&traces);
@@ -1542,7 +1559,13 @@ where
                                 frob += sol[[row, col]] * root_orig[[row, col]];
                             }
                         }
-                        traces_f[kk] = lambdas[kk] * frob;
+                        // Same `[0, rank]` clamp as the trace-channel path above
+                        // (gam#1379): a ceiling-`λ` redundant block's
+                        // `λ_kk·tr(H⁻¹ S_kk)` can overflow to `+∞` here too; the
+                        // penalized trace is bounded by the block rank, so clamp to
+                        // keep `penalty_block_trace` finite and the EDF accounting
+                        // consistent. Finite in-range traces are untouched.
+                        traces_f[kk] = (lambdas[kk] * frob).clamp(0.0, rank as f64);
                     }
                     edf_total = (p_orig as f64 - kahan_sum(traces_f.iter().copied()))
                         .clamp(mp, p_orig as f64);

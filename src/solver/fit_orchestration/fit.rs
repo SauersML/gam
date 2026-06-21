@@ -991,7 +991,12 @@ fn survival_transformation_edf(
         for j in 0..block_cols {
             trace += sol[[block.range.start + j, j]];
         }
-        let lam_trace = block.lambda * trace;
+        // Per-block penalty trace `λ_kk·tr(H⁻¹ S_kk)` is the penalized EDF of the
+        // block, bounded by `[0, block_cols]`. A ceiling-`λ` redundant block
+        // (gam#1379) can otherwise overflow `λ·trace` to `+∞` on a ridge-
+        // stabilized Hessian; clamp to the valid interval so the stored trace and
+        // EDF stay finite. In-range traces pass through unchanged.
+        let lam_trace = (block.lambda * trace).clamp(0.0, block_cols as f64);
         total_trace += lam_trace;
         penalty_block_trace[kk] = lam_trace;
         edf_by_block[kk] = (block_cols as f64 - lam_trace).clamp(0.0, block_cols as f64);
