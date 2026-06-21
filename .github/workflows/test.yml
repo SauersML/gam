@@ -209,9 +209,11 @@ jobs:
           # job practical on standard runners.
           #
           # PER-TEST timeout: the primary hang catcher is nextest's per-test
-          # slow-timeout (period = 600s, terminate-after = 1) in
-          # .config/nextest.toml — a single `#[test]` that overruns is SIGKILLed
-          # and reported as a FAILURE naming that exact test. nextest builds each
+          # slow-timeout (period = 300s, terminate-after = 2 => named SLOW notice
+          # at 300s, SIGKILL at 600s) in .config/nextest.toml — a single `#[test]`
+          # that overruns is reported SLOW by name at 300s and, if it crosses
+          # 600s, SIGKILLed and reported as a FAILURE naming that exact test
+          # (#1393). nextest builds each
           # tests/*.rs binary (via --test <name>) and the --lib/--bins/--examples
           # set in isolation below, exactly like the previous per-binary cargo
           # test loop, so the serial-link + disk-prune discipline is unchanged.
@@ -287,6 +289,16 @@ jobs:
           # test is attributed within a smaller batch. `--partition` is a pure
           # run-time filter: the binary still links once and each shard reuses
           # it (no extra link, no extra disk).
+          # #1393: every binary the tracked CI runs killed at the 1800s cap
+          # (run 74518830554 and repeats) has a tuned floor here. The previously
+          # un-mapped killed targets — `misc` (holds the multi-minute
+          # `residual_cascade_auto_route_quality::*`), `measure_jet` (the
+          # large-scale margslope/measure-jet repros), and `pathological` (the
+          # degenerate-geometry solver stress) — defaulted to 1 shard at the
+          # 1800s cap and so were the ones bulk-killed before their per-test
+          # summary printed. Give them an explicit shard floor matched to their
+          # known multi-minute tests; the dynamic test-count floor below still
+          # raises any of these further if they grow.
           partitions_for_binary() {
             case "$1" in
               quality)      echo 8 ;;
@@ -295,6 +307,9 @@ jobs:
               perf_scale)   echo 2 ;;
               identifiability) echo 2 ;;
               inference)    echo 2 ;;
+              misc)         echo 2 ;;
+              measure_jet)  echo 2 ;;
+              pathological) echo 2 ;;
               *)            echo 1 ;;
             esac
           }
@@ -451,6 +466,47 @@ jobs:
           #     solver/outer_strategy.rs.
           #   - "no candidate seeds passed outer startup validation" —
           #     aggregate seed-loop error when started_seeds == 0.
+          # #1393: per-test SLOW attribution that survives a bulk target-kill.
+          #
+          # nextest streams a `SLOW [> 300.000s] <binary> <test>` line LIVE the
+          # moment a test crosses the 300s slow-timeout period (and
+          # `TIMEOUT [> 600.000s] ...` / `TERMINATING` when it is SIGKILLed at the
+          # terminate-after multiple), and `run_capped` tees that stream into
+          # /tmp/cargo-test.log as it is produced. So even when a whole target is
+          # killed by the OUTER GNU `timeout` wall-clock cap (exit 124/137) BEFORE
+          # nextest can print its end-of-run summary, every slow/terminated test
+          # that had already crossed 300s is already in the log, named. The issue's
+          # core complaint was that this attribution was buried; here we hoist it
+          # into an explicit, sorted, deduped summary in the job output (and the
+          # step summary) so the real wall-clock drivers are visible at a glance
+          # regardless of whether the target finished cleanly or was bulk-killed.
+          # This is pure log post-processing — it changes no test and no cap.
+          echo "::group::#1393 per-test slow/timeout attribution"
+          slow_lines="$(grep -hoE '(SLOW|TIMEOUT|TERMINATING) +\[[^]]*\] +[^ ]+ +[^ ]+' \
+                          /tmp/cargo-test.log 2>/dev/null | sort -u || true)"
+          if [ -n "$slow_lines" ]; then
+            echo "Tests that crossed the 300s SLOW period (named even if their target was later bulk-killed):"
+            printf '%s\n' "$slow_lines"
+            {
+              echo "### #1393 slow/timeout per-test attribution"
+              echo ""
+              echo '```'
+              printf '%s\n' "$slow_lines"
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            # A wall-clock target-kill with NO slow line means a test hung/summed
+            # under 300s-per-test but over the target cap — flag it so the next
+            # tuning pass knows the 300s notice was too coarse for that target.
+            if grep -q '::error::Test command exceeded' /tmp/cargo-test.log; then
+              echo "::warning::#1393: a target hit its wall-clock cap; cross-reference the SLOW lines above to find the drivers, or finer-shard that target if none are listed."
+            fi
+          elif grep -q '::error::Test command exceeded' /tmp/cargo-test.log; then
+            echo "::warning::#1393: a target was killed at its wall-clock cap but NO test crossed the 300s SLOW period — the cap was reached by the SUM of sub-300s tests. Increase that target's partition count in partitions_for_binary (or lower DYNAMIC_TESTS_PER_PARTITION)."
+          else
+            echo "No test crossed the 300s slow-timeout period."
+          fi
+          echo "::endgroup::"
+
           forbidden='P-IRLS INNER LOOP FAILED|P-IRLS could not certify a valid minimum|P-IRLS separation/non-convergence at current rho|Perfect or quasi-perfect separation detected|seed candidates failed|no candidate seeds passed outer startup validation'
           if [ "$test_status" -ne 0 ]; then
             if grep -nE "$forbidden" /tmp/cargo-test.log; then
