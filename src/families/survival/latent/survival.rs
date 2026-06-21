@@ -1049,13 +1049,30 @@ const LATENT_SURVIVAL_PRIMARY_DIM: usize = 6;
 
 use crate::families::jet_partitions::MultiDirJet as LatentMultiDirJet;
 
+/// Derivatives of `log(x)` through 4th order.
+///
+/// # Contract
+///
+/// `x` must be strictly positive. This function does NOT clamp: a previous
+/// version replaced `x` by `x.max(1e-300)`, which fabricated enormous finite
+/// derivatives (`1/1e-300` etc.) that are the derivatives of neither `log(x)`
+/// nor `log(max(x, floor))` and would silently mask an upstream domain
+/// failure. Both callers guarantee `x > 0`: one composes at the literal `1.0`
+/// (the normalised log-sum base); the other passes `base`, which is gated by
+/// an explicit `base.is_finite() && base > 0.0` check immediately upstream. The
+/// debug assertion pins that contract; in release a non-positive `x` yields the
+/// honest IEEE result (`-inf`/`NaN`) rather than a finite fabrication. For all
+/// valid `x > 0` the output is bit-identical to the previous clamped version.
 #[inline]
 fn latent_unary_derivatives_log(x: f64) -> [f64; 5] {
-    let x1 = x.max(1e-300);
-    let x2 = x1 * x1;
-    let x3 = x2 * x1;
-    let x4 = x3 * x1;
-    [x1.ln(), 1.0 / x1, -1.0 / x2, 2.0 / x3, -6.0 / x4]
+    debug_assert!(
+        x > 0.0,
+        "latent_unary_derivatives_log requires x > 0, got {x}"
+    );
+    let x2 = x * x;
+    let x3 = x2 * x;
+    let x4 = x3 * x;
+    [x.ln(), 1.0 / x, -1.0 / x2, 2.0 / x3, -6.0 / x4]
 }
 
 #[derive(Clone, Copy, Debug)]
