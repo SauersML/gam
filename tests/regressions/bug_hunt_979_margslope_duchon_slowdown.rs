@@ -168,10 +168,9 @@ fn margslope_duchon_above_cliff() {
     // The #979 blowup is in the marginal-slope machinery, not n: a regressed fit
     // pathologically slows even at a moderate n. Default to a CI-affordable n and
     // assert the fit actually COMPLETES with a finite result (the functional half
-    // of the guard); `GAM_HEAVY` restores the full n=2000 cliff repro and adds the
-    // wall-clock budget (shared-CI timing is only meaningful on the cluster).
-    let heavy = false;
-    let n = if heavy { 2000 } else { 600 };
+    // of the guard); The cluster-scale n=2000 cliff repro is a
+    // separate MSI artifact (shared-CI timing is only meaningful on the cluster).
+    let n = 600;
     let centers = 10;
     let (data, spec) = build_margslope(n, centers);
     let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
@@ -210,13 +209,13 @@ fn margslope_duchon_above_cliff() {
             .all(|v| v.is_finite()),
         "margslope Duchon fit produced non-finite coefficients (#979 binary arm)"
     );
-    // Wall-clock cliff repro: only meaningful at full n on the cluster.
-    if heavy {
-        assert!(
-            elapsed < 120.0,
-            "margslope Duchon fit took {elapsed:.1}s at n={n} centers={centers} (budget 120s) — #979 binary slowdown"
-        );
-    }
+    // Wall-clock guard: the #979 binary-arm slowdown is pathological, so even at
+    // the CI-affordable n a healthy fit is far under budget; a >120s fit is the
+    // regression fingerprint.
+    assert!(
+        elapsed < 120.0,
+        "margslope Duchon fit took {elapsed:.1}s at n={n} centers={centers} (budget 120s) — #979 binary slowdown"
+    );
 }
 
 /// Control: the IDENTICAL pure-Duchon basis (centers=10, d=2) fitting a plain
@@ -228,9 +227,8 @@ fn duchon_gaussian_smooth_baseline_is_fast() {
     gam::init_parallelism();
     // Control for `margslope_duchon_above_cliff`. Default to a CI-affordable n and
     // assert the plain Gaussian Duchon fit COMPLETES with finite coefficients;
-    // `GAM_HEAVY` restores the full n=2000 and the ~30s basis-is-cheap budget.
-    let heavy = false;
-    let n = if heavy { 2000 } else { 600 };
+    // The cluster-scale n=2000 run is a separate MSI artifact.
+    let n = 600;
     let centers = 10;
     let (data, _z, y) = simulate(n);
 
@@ -288,11 +286,10 @@ fn duchon_gaussian_smooth_baseline_is_fast() {
         !fit.fit.beta.is_empty() && fit.fit.beta.iter().all(|v| v.is_finite()),
         "plain Gaussian Duchon smooth produced non-finite coefficients (#979 control)"
     );
-    // Wall-clock control: only meaningful at full n on the cluster.
-    if heavy {
-        assert!(
-            elapsed < 30.0,
-            "plain Gaussian Duchon smooth took {elapsed:.1}s at n={n} centers={centers} (budget 30s) — the basis itself must be cheap (#979 control)"
-        );
-    }
+    // Wall-clock control: the plain Duchon basis must stay cheap even at the
+    // CI-affordable n; a >30s fit here is a control-side regression.
+    assert!(
+        elapsed < 30.0,
+        "plain Gaussian Duchon smooth took {elapsed:.1}s at n={n} centers={centers} (budget 30s) — the basis itself must be cheap (#979 control)"
+    );
 }
