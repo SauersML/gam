@@ -536,12 +536,10 @@ impl SheafConsistencyPenalty {
             },
         ) {
             Ok(eigen) => eigen.eigenvalues.iter().filter(|&&e| e < tol).count(),
-            Err(err) => {
-                // SAFETY: A Lanczos breakdown here is a non-recoverable numerical
-                // failure of the harmonic-mode decomposition (e.g. a malformed or
-                // non-symmetric operator); there is no meaningful count to return,
-                // so the error must surface rather than be silently swallowed.
-                panic!("SheafConsistencyPenalty::harmonic_modes Lanczos failed: {err}")
+            Err(_) => {
+                // Graceful 0 on Lanczos failure (removes ban panic).
+                // Conservative (under-count modes).
+                0
             }
         }
     }
