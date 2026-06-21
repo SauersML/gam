@@ -2043,8 +2043,27 @@ fn summary_smooth_terms(
         // Per-term EDF as the influence-matrix trace over the term's coefficient
         // block (#1219, #1277) — never the legacy per-block-EDF sum, which
         // double-counts shared coefficients and can exceed the model total.
-        let edf = fit.per_term_edf(range.clone(), penalty_cursor, 1);
-        penalty_cursor += 1;
+        //
+        // Only PENALIZED, non-empty RE blocks own an entry in the flat
+        // `lambdas`/`penalty_block_trace`/`edf_by_block` layout: design assembly
+        // (`design_construction.rs`) `continue`s its RE-penalty loop on
+        // `range.is_empty() || !penalized`. Advancing the cursor by a fixed 1 per
+        // RE term (the #1368 defect — fixed on the in-process `model_summary.rs`
+        // path but never propagated here) slides `penalty_cursor` one block past
+        // every RE/smooth term that follows an UNPENALIZED RE block (e.g. the
+        // treatment-coded factor main effect a `by=` smooth injects) or an empty
+        // (zero-kept-group) one, so the trailing smooth's `cursor..+k` window runs
+        // off the end of `penalty_block_trace`, `per_term_edf` returns 0, the Wood
+        // test is skipped, and ref_df/chi_sq/p_value collapse to 0/None on the
+        // Python `summary()` path. Mirror BOTH design conditions.
+        let penalized = spec
+            .random_effect_terms
+            .get(re_idx)
+            .map(|t| t.penalized)
+            .unwrap_or(true);
+        let k_pen = usize::from(penalized && !range.is_empty());
+        let edf = fit.per_term_edf(range.clone(), penalty_cursor, k_pen);
+        penalty_cursor += k_pen;
         // Random-effect smooths are boundary variance-component tests; a naive
         // coefficient Wald χ² is anti-conservative, so only EDF is reported.
         out.push(SummarySmoothTermRow {
