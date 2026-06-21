@@ -57,8 +57,8 @@ fn main() {
     assert_warnings_are_denied(&manifest_dir);
 
     // HARD ban (always fatal, independent of the demoted aggregate scanner
-    // below): no tracked file may leak the absolute cluster scratch path segment or
-    // the SLURM batch directive keyword. Run first and exit(1) on any hit.
+    // below): no tracked file may leak the absolute cluster scratch path segment
+    // or the SLURM batch directive keyword. Run first and exit(1) on any hit.
     scan_for_cluster_infra_leaks(&manifest_dir);
 
     emit_python_penalty_manifest(&manifest_dir)
@@ -70,6 +70,12 @@ fn main() {
     scan_for_banned_marker(&manifest_dir, &manifest_dir, needle, &mut todo_offenders);
     let mut todo_history_violations: Vec<(PathBuf, usize, String, String)> = Vec::new();
     run_todo_marker_history_audit(&manifest_dir, needle, &mut todo_history_violations);
+
+    // Deferred-work markers wearing a different label (relabel-evasion of the
+    // bare TODO ban): a `fixme`/`xxx`/`hack` comment lead-in, or a deferral word
+    // carrying an issue ref like `Follow-up (#932):`.
+    let mut deferred_marker_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_deferred_work_markers(&manifest_dir, &manifest_dir, &mut deferred_marker_offenders);
 
     // `#[allow(...)]` / `#![allow(...)]` / `#[expect(...)]` /
     // `#![expect(...)]` ban — any lint, anywhere. Every file-level allow
@@ -348,6 +354,21 @@ fn main() {
         sections.push(Section {
             title: format!("{} marker", needle),
             rows: todo_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !deferred_marker_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "deferred-work marker in disguise (a `fixme`/`xxx`/`hack`/`todo` comment lead-in, \
+                 or a deferral word carrying an issue ref like `Follow-up (#932):`) — a relabelled \
+                 marker is still owed work; implement it or delete the whole note, do not rename \
+                 the marker"
+                    .to_string(),
+            rows: deferred_marker_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -2978,6 +2999,118 @@ fn scan_for_banned_marker(
     });
 }
 
+/// Comment-lead deferred-work markers the bare `TODO` token misses. Flags two
+/// shapes, both high-precision so legitimate prose is never caught:
+///   1. a comment whose lead-in token is itself a pure marker word
+///      (`fixme` / `xxx` / `hack` / `todo`) — these never legitimately begin a
+///      comment;
+///   2. a deferral word carrying an issue reference, e.g. `Follow-up (#932):`,
+///      `Deferred(#41)` — the relabel shape that swaps `TODO(#N)` for a synonym
+///      while keeping the tracker. A bare "follow-up period" or "deferred POTRF
+///      scalar" in prose has no `(#issue)` tail and is NOT matched.
+/// Skips build.rs (it names these words as part of its own contract). The marker
+/// words are assembled from fragments so this scanner's source never carries the
+/// literal tokens it forbids.
+fn scan_for_deferred_work_markers(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    let pure_markers: Vec<String> = vec![
+        format!("{}{}", "fix", "me"),
+        format!("{}{}", "x", "xx"),
+        "hack".to_string(),
+        format!("{}{}", "to", "do"),
+    ];
+    let deferral_words: Vec<String> = vec![
+        format!("{}-{}", "follow", "up"),
+        format!("{}{}", "follow", "up"),
+        format!("{}{}", "de", "ferred"),
+        format!("{}{}", "de", "fer"),
+        "revisit".to_string(),
+        format!("{}{}", "stop", "gap"),
+        "punt".to_string(),
+        format!("{}{}", "t", "bd"),
+        format!("{}{}", "w", "ip"),
+        "later".to_string(),
+        format!("{}{}", "place", "holder"),
+    ];
+    visit_files(root, dir, &mut |rel, content| {
+        if rel.to_string_lossy().replace('\\', "/") == "build.rs" {
+            return;
+        }
+        for (idx, line) in content.lines().enumerate() {
+            let Some(body) = comment_body(line) else {
+                continue;
+            };
+            let body_l = body.to_lowercase();
+            let mut hit = pure_markers.iter().any(|w| lead_token_is(&body_l, w));
+            if !hit {
+                hit = deferral_words.iter().any(|w| {
+                    body_l
+                        .strip_prefix(w.as_str())
+                        .is_some_and(|rest| marker_issue_ref_follows(rest.trim_start()))
+                });
+            }
+            if hit {
+                offenders.push((rel.to_path_buf(), idx + 1, line.trim().to_string()));
+            }
+        }
+    });
+}
+
+/// The text after a line's comment lead-in (`///`, `//!`, `//`, `/**`, `/*`, or
+/// `#`), trimmed; `None` if the line is not a comment. The `#[...]` attribute
+/// form is excluded so Rust attributes are not read as comments.
+fn comment_body(line: &str) -> Option<&str> {
+    let t = line.trim_start();
+    for lead in ["///", "//!", "//", "/**", "/*", "#"] {
+        if let Some(rest) = t.strip_prefix(lead) {
+            if lead == "#" && rest.trim_start().starts_with('[') {
+                return None;
+            }
+            return Some(rest.trim_start());
+        }
+    }
+    None
+}
+
+/// True when `body` (already lowercased) begins with `word` as a whole lead-in
+/// token — the char right after `word` is a non-alphanumeric boundary (or the
+/// body ends). Stops `hack` from matching `hacky`.
+fn lead_token_is(body: &str, word: &str) -> bool {
+    match body.strip_prefix(word) {
+        Some(rest) => rest
+            .chars()
+            .next()
+            .map(|c| !c.is_ascii_alphanumeric())
+            .unwrap_or(true),
+        None => false,
+    }
+}
+
+/// True when `rest` opens with an issue reference: `(` then an optional `#`,
+/// then at least one digit, then `)`. Matches the `(#932)` / `(41)` tail of a
+/// relabelled tracker.
+fn marker_issue_ref_follows(rest: &str) -> bool {
+    let b = rest.as_bytes();
+    if b.first() != Some(&b'(') {
+        return false;
+    }
+    let mut i = 1usize;
+    if b.get(i) == Some(&b'#') {
+        i += 1;
+    }
+    let digits_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits_start {
+        return false;
+    }
+    b.get(i) == Some(&b')')
+}
+
 /// Scan for `#[allow(...)]` / `#![allow(...)]` / `#[expect(...)]` /
 /// `#![expect(...)]` — any lint, anywhere. Every such attribute is an
 /// admission that some lint flagged real code and the author chose to hide
@@ -3373,8 +3506,8 @@ fn collect_repo_files(root: &Path) -> &'static [PathBuf] {
 
 /// The two cluster/SLURM infra leak needles, assembled from fragments so this
 /// file's own source text never contains either banned string verbatim (the
-/// scanner would otherwise flag itself). `needle_a` = the absolute cluster scratch
-/// path segment; `needle_b` = the SLURM batch directive keyword.
+/// scanner would otherwise flag itself). `needle_a` = the absolute cluster
+/// scratch path segment; `needle_b` = the SLURM batch directive keyword.
 fn cluster_leak_needles() -> [String; 2] {
     let needle_a = format!("projects{}standard", "/");
     let needle_b = format!("{}BATCH", "S");
@@ -5182,6 +5315,140 @@ fn line_is_comment_lead(line: &str) -> bool {
     t.starts_with("//") || (t.starts_with('#') && !t.starts_with("#["))
 }
 
+/// Minimum count of *significant* (non-stopword, >=3-char) tokens a recorded
+/// marker description must carry before the fuzzy paraphrase matcher will key on
+/// it. The token-set analogue of `MIN_REWORD_DESCRIPTION_LEN`: too few load-
+/// bearing tokens and an innocent comment could coincidentally overlap.
+const MIN_REWORD_SIGNIFICANT_TOKENS: usize = 5;
+
+/// Fraction of a recorded description's significant tokens that must reappear in
+/// one current comment block for it to count as the same deferred work
+/// resurfacing under a paraphrase. High enough that unrelated prose does not
+/// trip it; low enough that reordering or light rewording does not escape.
+const REWORD_CONTAINMENT_THRESHOLD: f64 = 0.75;
+
+/// A pooled contiguous run of comment-lead lines: its significant-token set, its
+/// lowercased joined text, and the 1-based line where the run begins.
+struct CommentBlock {
+    start_line: usize,
+    tokens: std::collections::HashSet<String>,
+    lower_text: String,
+}
+
+/// True for short, structural words that carry no description signal. Filtered
+/// before measuring token overlap so the ratio reflects the load-bearing
+/// nouns/verbs of the deferred work, not glue words.
+fn reword_is_stopword(t: &str) -> bool {
+    const STOP: &[&str] = &[
+        "the", "and", "for", "this", "that", "with", "from", "into", "over", "each", "can",
+        "will", "its", "are", "was", "were", "has", "have", "had", "not", "but", "use", "uses",
+        "used", "via", "per", "out", "off", "all", "any", "one", "two", "new", "old", "should",
+        "would", "could", "may", "might", "must", "then", "than", "they", "them", "when", "where",
+        "which", "while", "here", "there", "only", "also", "still", "yet", "now", "later", "our",
+        "your", "their", "been", "being", "such", "some", "more", "most", "less", "few",
+    ];
+    STOP.contains(&t)
+}
+
+/// The significant tokens of `text`: lowercased alphanumeric words (via the same
+/// normalizer the exact path uses) with stopwords and sub-3-char tokens dropped.
+fn reword_significant_tokens(text: &str) -> Vec<String> {
+    normalize_marker_text(text)
+        .split(' ')
+        .filter(|t| t.len() >= 3 && !reword_is_stopword(t))
+        .map(|t| t.to_string())
+        .collect()
+}
+
+/// Share of `needle_tokens` present in `haystack`. 1.0 = every described token
+/// resurfaced; 0.0 = none did.
+fn token_set_containment(
+    needle_tokens: &[String],
+    haystack: &std::collections::HashSet<String>,
+) -> f64 {
+    if needle_tokens.is_empty() {
+        return 0.0;
+    }
+    let hit = needle_tokens
+        .iter()
+        .filter(|t| haystack.contains(*t))
+        .count();
+    hit as f64 / needle_tokens.len() as f64
+}
+
+/// True when `lower_text` (an already-lowercased comment block) still speaks in
+/// deferral terms — a relabel synonym or an explicit future marker. Only STRONG
+/// cues count (not bare modals like "can"/"should", which pepper ordinary docs):
+/// the threat is relabelling a marker into *another* deferral note, and a
+/// paraphrase that drops every deferral cue reads as plain documentation of
+/// current state, not an owed-work tracker. This gate keeps the fuzzy matcher
+/// from flagging a past-tense "we did X" note about the now-finished work. Cue
+/// fragments are assembled at runtime so this file never carries the literal
+/// marker tokens it forbids.
+fn comment_block_has_deferral_cue(lower_text: &str) -> bool {
+    let cues: Vec<String> = vec![
+        format!("{}{}", "to", "do"),
+        format!("{}{}", "fix", "me"),
+        format!("{}-{}", "follow", "up"),
+        format!("{}{}", "follow", "up"),
+        format!("{}{}", "de", "fer"),
+        format!("{}{}", "stop", "gap"),
+        format!("{}{}", "place", "holder"),
+        format!("{}{}", "w", "ip"),
+        format!("{}{}", "t", "bd"),
+        "revisit".to_string(),
+        "punt".to_string(),
+        "eventually".to_string(),
+        "someday".to_string(),
+        "pending".to_string(),
+        "unimplemented".to_string(),
+        "incomplete".to_string(),
+        "stub".to_string(),
+        "not yet".to_string(),
+        "for now".to_string(),
+        "to be done".to_string(),
+        "to be implemented".to_string(),
+        "come back".to_string(),
+        "needs to".to_string(),
+        "remains to".to_string(),
+        "yet to".to_string(),
+    ];
+    cues.iter().any(|c| lower_text.contains(c.as_str()))
+}
+
+/// Pool every maximal run of consecutive comment-lead lines in `content` into a
+/// `CommentBlock`. Runs that still literally carry `needle` are skipped — those
+/// are live markers handled by the lexical ban, not relabels. Pooling the whole
+/// run is what defeats the line-break dodge: a description re-wrapped across
+/// several `///` lines lands in one token bag.
+fn comment_blocks_without_marker(content: &str, needle: &str) -> Vec<CommentBlock> {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        if !line_is_comment_lead(lines[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        let mut joined = String::new();
+        while i < lines.len() && line_is_comment_lead(lines[i]) {
+            joined.push(' ');
+            joined.push_str(lines[i]);
+            i += 1;
+        }
+        if joined.contains(needle) {
+            continue;
+        }
+        out.push(CommentBlock {
+            start_line: start + 1,
+            tokens: reword_significant_tokens(&joined).into_iter().collect(),
+            lower_text: joined.to_lowercase(),
+        });
+    }
+    out
+}
+
 /// Detect the rename-evasion: the marker token is gone from its recorded site, but
 /// the *deferred description* it carried still survives in a current comment line
 /// (relabelled — e.g. the `// TODO:` / `# TODO(x):` lead-in swapped for
@@ -5195,15 +5462,35 @@ fn reworded_marker_remnant_survives(
     needle: &str,
 ) -> Option<usize> {
     let description = marker_description(&previous_site.site, needle)?;
-    if description.len() < MIN_REWORD_DESCRIPTION_LEN {
-        return None;
-    }
-    for (idx, line) in current_content.lines().enumerate() {
-        if line.contains(needle) || !line_is_comment_lead(line) {
-            continue;
+
+    // (A) Exact relabel: the normalized description survives verbatim in a
+    // current comment line. Unchanged from the original audit — the char floor
+    // keeps short generic tails from colliding.
+    if description.len() >= MIN_REWORD_DESCRIPTION_LEN {
+        for (idx, line) in current_content.lines().enumerate() {
+            if line.contains(needle) || !line_is_comment_lead(line) {
+                continue;
+            }
+            if normalize_marker_text(line).contains(&description) {
+                return Some(idx + 1);
+            }
         }
-        if normalize_marker_text(line).contains(&description) {
-            return Some(idx + 1);
+    }
+
+    // (B) Paraphrase / re-wrap relabel: the description's significant tokens
+    // resurface (reordered, line-rewrapped, or lightly reworded) across one
+    // contiguous comment block that still speaks in deferral terms. Pooling the
+    // block matches a description split across several `///` lines as a single
+    // bag, defeating the line-break dodge; the strong-cue gate keeps a
+    // past-tense note about the finished work from being read as an owed marker.
+    let needle_tokens = reword_significant_tokens(&description);
+    if needle_tokens.len() >= MIN_REWORD_SIGNIFICANT_TOKENS {
+        for block in comment_blocks_without_marker(current_content, needle) {
+            if token_set_containment(&needle_tokens, &block.tokens) >= REWORD_CONTAINMENT_THRESHOLD
+                && comment_block_has_deferral_cue(&block.lower_text)
+            {
+                return Some(block.start_line);
+            }
         }
     }
     None
@@ -5262,14 +5549,31 @@ fn collect_reworded_marker_sites_from_git_history(
                     let Some(desc) = marker_description(removed_line, needle) else {
                         continue;
                     };
-                    if desc.len() < MIN_REWORD_DESCRIPTION_LEN {
-                        continue;
-                    }
-                    let relabelled = added.iter().any(|added_line| {
-                        !added_line.contains(needle)
-                            && normalize_marker_text(added_line).contains(&desc)
-                    });
-                    if relabelled {
+                    // Exact relabel: a single added line carries the verbatim
+                    // description under a new label (original behaviour).
+                    let exact_relabel = desc.len() >= MIN_REWORD_DESCRIPTION_LEN
+                        && added.iter().any(|added_line| {
+                            !added_line.contains(needle)
+                                && normalize_marker_text(added_line).contains(&desc)
+                        });
+                    // Fuzzy relabel: pool the hunk's added lines (minus any still
+                    // carrying the marker) so a description reworded or rewrapped
+                    // across several added lines is matched as one bag, gated on a
+                    // strong deferral cue exactly as the working-tree path is.
+                    let pooled: String = added
+                        .iter()
+                        .filter(|a| !a.contains(needle))
+                        .map(|a| a.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let needle_tokens = reword_significant_tokens(&desc);
+                    let bag: std::collections::HashSet<String> =
+                        reword_significant_tokens(&pooled).into_iter().collect();
+                    let fuzzy_relabel = needle_tokens.len() >= MIN_REWORD_SIGNIFICANT_TOKENS
+                        && token_set_containment(&needle_tokens, &bag)
+                            >= REWORD_CONTAINMENT_THRESHOLD
+                        && comment_block_has_deferral_cue(&pooled.to_lowercase());
+                    if exact_relabel || fuzzy_relabel {
                         let site = ToDoHistorySite {
                             file: rel.clone(),
                             anchor: FILE_ANCHOR.to_string(),

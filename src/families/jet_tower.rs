@@ -1168,11 +1168,12 @@ pub fn derived_fourth_contracted<const K: usize, P: RowNllProgram<K> + ?Sized>(
 /// gates (doc §A.4). An existing `Tower4`-only [`RowNllProgram`] continues to
 /// work unchanged; new families should prefer this generic trait.
 ///
-/// Follow-up (#932): each existing [`RowNllProgram`] impl can migrate to this
-/// trait by rewriting its `row_nll` body generically over `S: JetScalar<K>` (the bodies
-/// already use only `add`/`sub`/`mul`/`scale`/`exp`/`ln`/… which the generic
-/// trait provides) and deleting the `Tower4`-specialised method, then routing
-/// the directional / joint-Hessian gates through the contracted scalars.
+/// Because a `Tower4`-specialised `row_nll` body uses only
+/// `add`/`sub`/`mul`/`scale`/`exp`/`ln`/… — all of which this trait also
+/// provides — the same body is expressible directly over `S: JetScalar<K>`.
+/// A program written that way needs no `Tower4`-specialised method and routes
+/// the directional and joint-Hessian gates through the contracted scalars from
+/// a single definition.
 pub trait RowNllProgramGeneric<const K: usize>: Send + Sync {
     /// Number of observations the program covers.
     fn n_rows(&self) -> usize;
