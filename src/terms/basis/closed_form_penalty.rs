@@ -317,9 +317,7 @@ pub(crate) fn bessel_k_temme(mu: f64, x: f64) -> (f64, f64) {
     // overdetermined defensive cap whose only reachable trigger would
     // be invariant violation upstream. Emitting any finite substitute
     // here would silently corrupt the penalty matrix.
-    // Graceful NaN on non-convergence (preconditions asserted upstream; this path
-    // is invariant violation). Removes ban-listed panic! .
-    (f64::NAN, f64::NAN)
+    panic!("bessel_k Temme series failed to converge for mu={mu} x={x}");
 }
 
 pub(crate) fn bessel_k_steed_cf2(mu: f64, x: f64) -> (f64, f64) {
@@ -364,9 +362,7 @@ pub(crate) fn bessel_k_steed_cf2(mu: f64, x: f64) -> (f64, f64) {
     // cap whose only reachable trigger would be invariant violation upstream
     // (public `bessel_k` asserts finite ν and 0 < x finite). Emitting any
     // finite substitute here would silently corrupt the penalty matrix.
-    // Graceful NaN on non-convergence (preconditions asserted upstream; this path
-    // is invariant violation). Removes ban-listed panic! .
-    (f64::NAN, f64::NAN)
+    panic!("bessel_k Steed CF2 failed to converge for mu={mu} x={x}");
 }
 
 pub(crate) fn bessel_k_beschb(mu: f64) -> (f64, f64, f64, f64) {
@@ -1655,8 +1651,9 @@ pub(crate) fn anisotropic_duchon_penalty_radial_with_powers(
             return bundle.value / eta.iter().sum::<f64>().exp();
         }
         // SAFETY: zero-lag self-pair requires validated nullspace-order condition (m > d/2 + s).
-        // If the condition fails, we return 0.0 gracefully instead of panicking.
-        return 0.0;
+        panic!(
+            "anisotropic_duchon_penalty_radial: zero lag has no finite analytic self-pair for q={q} d={d} m={m} s={s}"
+        );
     }
 
     if let Some(common_eta) = uniform_eta_value(eta) {
@@ -2182,10 +2179,10 @@ pub(crate) fn radial_g_q_partials(
             let g_u2 = f4;
             (g, g_r, g_s1, g_s2, g_u1, g_u2)
         }
-        // For q > 2 we gracefully return zero contribution (the public
-        // radial API only exercises q in {0,1,2} via value/grad/laplacian).
-        // This removes the ban-tracked panic! while remaining safe.
-        _ => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        // SAFETY: `q` is statically restricted to `{0, 1, 2}` by the
+        // public radial-kernel API (value/gradient/laplacian); this
+        // arm is unreachable for in-contract callers.
+        _ => panic!("radial_g_q_partials requires q in {{0, 1, 2}}: q={q}"),
     }
 }
 
@@ -2338,11 +2335,8 @@ pub(crate) fn radial_g_q_hessian(
         // statically restricted to `{0, 1, 2}` by the public radial
         // kernel API (value/gradient/laplacian only). An unsupported `q`
         // here means an internal helper forwarded an out-of-contract
-        // value.
-        // SAFETY: companion to `radial_g_q_partials` — `q` is
-        // statically restricted to `{0, 1, 2}` by the public radial
-        // kernel API. Graceful all-zero for q>2 removes ban panic (no contrib).
-        _ => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+        // value; this arm is unreachable for in-contract callers.
+        _ => panic!("radial_g_q_hessian requires q in {{0, 1, 2}}: q={q}"),
     }
 }
 

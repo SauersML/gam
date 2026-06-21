@@ -267,9 +267,14 @@ fn wahba_sphere_kernel_sobolev_closed_form_derivative_dcos(cos_gamma: f64, m: us
             let li2_u = dilog_unit(u);
             (-li2_u / u - u.ln() / one_minus_u - u.ln() * one_minus_u.ln() / u) / four_pi
         }
-        // For m outside 1..=3 the caller dispatches to spectral instead; return
-        // neutral 0 here to remove ban-tracked panic while safe (not reached).
-        _ => 0.0,
+        // SAFETY: the sole caller `wahba_sphere_kernel_sobolev_derivative_dcos`
+        // dispatches to this closed form only inside `(1..=3).contains(&m)`, so
+        // any other `m` is a caller-contract violation (a programming error,
+        // not runtime data), and panicking surfaces it instead of returning a
+        // silently-wrong derivative.
+        other => panic!(
+            "closed-form Sobolev derivative only defined for m in {{1,2,3}}; got m={other}"
+        ),
     };
     // du/d(cos gamma) = -1/2.
     dk_du * (-0.5)
