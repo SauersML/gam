@@ -9,13 +9,13 @@ use crate::terms::analytic_penalties::IsometryReference;
 use approx::assert_abs_diff_eq;
 use ndarray::{Array5, array};
 
-/// The overflow-free von-Mises normaliser must (a) agree with the naive
-/// `bessel_i0(η).ln()` / `bessel_i1(η)/bessel_i0(η)` on moderate η where the
-/// naive form is still finite, and (b) stay finite for the large η a
-/// dispersion-inflated ARD seed reaches on a large-norm / ill-conditioned
-/// checkpoint (#1113), where the naive form overflows to `inf` and divides
-/// to `NaN`.
-
+/// Build a production-style K-atom, d=2 periodic (torus = Circle×Circle) SAE
+/// manifold term seeded from REAL activations `z` exactly the way the
+/// production cold path does: PCA-seed the per-atom chart, fit a per-atom
+/// decoder by ridge LSQ on the gated basis, install the analytic torus
+/// evaluator, and assemble the multi-atom assignment with the curved product
+/// manifold on every atom. This is the d>=2 atom regime the #1019 canonical
+/// charts gauge and the #1007 curvature anchor have to identify on real data.
 pub(crate) fn real_data_torus_seed_term(
     z: ArrayView2<'_, f64>,
     k: usize,

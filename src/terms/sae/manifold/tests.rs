@@ -9862,11 +9862,3 @@ pub(crate) fn read_npy_f32_2d(path: &std::path::Path) -> Array2<f64> {
     }
     out
 }
-
-/// Build a production-style K-atom, d=2 periodic (torus = Circle×Circle) SAE
-/// manifold term seeded from REAL activations `z` exactly the way the
-/// production cold path does: PCA-seed the per-atom chart, fit a per-atom
-/// decoder by ridge LSQ on the gated basis, install the analytic torus
-/// evaluator, and assemble the multi-atom assignment with the curved product
-/// manifold on every atom. This is the d>=2 atom regime the #1019 canonical
-/// charts gauge and the #1007 curvature anchor have to identify on real data.
