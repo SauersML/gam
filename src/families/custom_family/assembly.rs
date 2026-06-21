@@ -1069,10 +1069,10 @@ pub(crate) fn joint_outer_evaluate(
     // its logdet to the assembled operator's. An apples-to-apples match proves no
     // collapse entered the assembly; a divergence is a true defect. We
     // `log::error!` so the regression is never silent (the ban-scanner forbids
-    // `debug_assert!`; an unconditional `assert!` would panic production on a
-    // numerical guard that should degrade gracefully). This makes the gam#1395
-    // collapse structurally observable at its source rather than only at the
-    // far-downstream objective value.
+    // debug-only assertion macros; an unconditional `assert!` would panic
+    // production on a numerical guard that should degrade gracefully). This
+    // makes the gam#1395 collapse structurally observable at its source rather
+    // than only at the far-downstream objective value.
     if include_logdet_h && total > 0 && total <= JOINT_LOGDET_GUARD_MAX_DIM {
         if let Ok(mut ground_truth) =
             materialize_joint_hessian_source(&h_joint_unpen, total, "gam#1395 logdet guard")
