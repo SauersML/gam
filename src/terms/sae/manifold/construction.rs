@@ -42,6 +42,44 @@ impl OuterGradientError {
         }
     }
 
+    /// #1451 — classify a `String` error surfaced by the deflation linear-algebra
+    /// path (`apply_cached_arrow_hessian`, `DeflatedArrowSolver::from_orthonormal_gauges`)
+    /// into the correct [`OuterGradientError`] class.
+    ///
+    /// A genuine rank-deficiency / near-singularity failure (a back-solve or
+    /// Cholesky/Woodbury factor that tripped on a finite, correctly-shaped input)
+    /// is a legitimate #1273 conditioning failure and keeps `conditioning_err`
+    /// (`IllConditioned`), so it stays FD-eligible. A shape/dimension mismatch or
+    /// a non-finite intermediate is an internal-invariant defect and MUST
+    /// propagate ([`Self::internal`]) instead of being masked as a
+    /// plausible-but-wrong FD descent direction — exactly the #1436 contract.
+    ///
+    /// The two solver helpers return `String` (not a typed error), so the
+    /// distinction is drawn from the stable markers those helpers emit for their
+    /// shape/non-finite guards (`vector shapes`, `gauge length`, `must be finite`,
+    /// `non-finite`). Everything else — including the `cholesky`/back-solve
+    /// near-singular failures — is treated as a genuine conditioning trip.
+    pub(crate) fn classify_arrow_solver_error(
+        message: &str,
+        conditioning_err: Self,
+    ) -> Self {
+        let lower = message.to_ascii_lowercase();
+        let is_internal = lower.contains("vector shapes")
+            || lower.contains("gauge length")
+            || lower.contains("solution length")
+            || lower.contains("!= cache")
+            || lower.contains("must be finite")
+            || lower.contains("non-finite")
+            || lower.contains("not finite")
+            || lower.contains("nan")
+            || lower.contains("inf");
+        if is_internal {
+            Self::internal(message)
+        } else {
+            conditioning_err
+        }
+    }
+
     /// The exact gate the gradient lane (`SaeManifoldOuterObjective::eval`) uses
     /// to decide whether to descend with the #1273 central-difference fallback
     /// instead of propagating the error as a hard failure.
@@ -6297,7 +6335,16 @@ impl SaeManifoldTerm {
                 gauge_span[col].slice(s![cache.delta_t_len()..]),
             ) {
                 Ok(value) => value,
-                Err(_) => return Err(conditioning_err),
+                // #1451: a shape/dimension mismatch or non-finite intermediate
+                // from the Hessian apply is an internal-invariant defect and MUST
+                // propagate; only a genuine numeric failure on a finite,
+                // correctly-shaped input keeps the FD-eligible conditioning class.
+                Err(err) => {
+                    return Err(OuterGradientError::classify_arrow_solver_error(
+                        &err,
+                        conditioning_err.clone(),
+                    ));
+                }
             };
             let h_flat = flatten_arrow_parts(h_gauge.t.view(), h_gauge.beta.view());
             for row in 0..span_rank {
@@ -6310,6 +6357,18 @@ impl SaeManifoldTerm {
                 h_span[[row, col]] = sym;
                 h_span[[col, row]] = sym;
             }
+        }
+        // #1451: a non-finite entry in the projected gauge Hessian is an
+        // internal-invariant defect (a NaN/Inf intermediate leaked into the
+        // span), not a conditioning failure — it MUST propagate rather than be
+        // masked behind an FD descent. Guard finiteness BEFORE the eigh so only a
+        // genuine decomposition failure on a finite, correctly-shaped matrix keeps
+        // the FD-eligible conditioning class.
+        if !h_span.iter().all(|v| v.is_finite()) {
+            return Err(OuterGradientError::internal(format!(
+                "outer_gradient_arrow_solver: non-finite entry in projected gauge \
+                 Hessian (h_span is {span_rank}x{span_rank})"
+            )));
         }
         let (evals, evecs) = h_span
             .eigh(Side::Lower)
@@ -6378,8 +6437,12 @@ impl SaeManifoldTerm {
         // gauge orbit (Faddeev-Popov style). Components orthogonal to that orbit
         // are identical to the original inverse solve, while gauge components are
         // bounded at the Hessian scale `max_pivot`.
+        // #1451: a shape/length mismatch or non-finite stiffness/intermediate in
+        // the deflated-solver assembly is an internal-invariant defect and MUST
+        // propagate; only a genuine near-singular gauge Woodbury/back-solve keeps
+        // the FD-eligible conditioning class.
         DeflatedArrowSolver::from_orthonormal_gauges(cache, orthonormal, max_pivot)
-            .map_err(|_| conditioning_err)
+            .map_err(|err| OuterGradientError::classify_arrow_solver_error(&err, conditioning_err))
     }
 
     pub(crate) fn outer_gradient_conditioning_error(
@@ -9664,6 +9727,104 @@ mod amortized_encoder_tests {
                     "amplitude[{row},{atom_idx}] must equal the assignment mass"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod outer_gradient_error_classification_1451_tests {
+    use super::OuterGradientError;
+
+    /// #1451 — the three numerical/linear-algebra failure sites inside the
+    /// deflation path (`apply_cached_arrow_hessian`, the projected `h_span.eigh`,
+    /// and `DeflatedArrowSolver::from_orthonormal_gauges`) must distinguish a
+    /// genuine near-singular conditioning trip (FD-eligible `IllConditioned`)
+    /// from an internal-invariant defect — a shape/dimension mismatch or a
+    /// non-finite intermediate — which MUST propagate (`InternalInvariant`, NOT
+    /// FD-eligible).
+    ///
+    /// `OuterGradientError::classify_arrow_solver_error` is the helper all three
+    /// sites route through. Before the #1451 fix every failure there was
+    /// re-labelled `IllConditioned` (the original `conditioning_err`), so the
+    /// shape/non-finite cases below would have been FD-eligible — masking an
+    /// internal defect behind a plausible-but-wrong FD descent direction, exactly
+    /// the regression #1436 set out to eliminate. This test pins that a
+    /// shape/non-finite error classifies to `InternalInvariant` (so it
+    /// propagates) while a genuine finite, correctly-shaped near-singular failure
+    /// stays `IllConditioned` (so it keeps the #1273 FD fallback).
+    #[test]
+    fn classify_arrow_solver_error_routes_shape_and_nonfinite_to_internal_1451() {
+        let conditioning = || OuterGradientError::IllConditioned {
+            reason: "near-singular joint Hessian (min/max pivot ratio 5.3e-16)".to_string(),
+        };
+
+        // Shape/dimension-mismatch markers emitted by the deflation helpers must
+        // classify as InternalInvariant and therefore be NOT FD-eligible.
+        let shape_messages = [
+            "apply_cached_arrow_hessian: vector shapes (t=3, beta=2) != cache shapes (t=4, beta=2)",
+            "DeflatedArrowSolver: gauge length 5 != cache full length 6",
+            "DeflatedArrowSolver: solution length 5 != cache full length 6",
+        ];
+        for msg in shape_messages {
+            let classified =
+                OuterGradientError::classify_arrow_solver_error(msg, conditioning());
+            assert!(
+                matches!(classified, OuterGradientError::InternalInvariant { .. }),
+                "shape mismatch must classify to InternalInvariant (#1451); got {classified}"
+            );
+            assert!(
+                !classified.is_fd_eligible(),
+                "a shape mismatch must NOT be FD-eligible (#1451); got {classified}"
+            );
+            assert!(
+                !classified.admits_fd_fallback(1.0),
+                "a shape mismatch must NOT admit the FD fallback even at finite cost (#1451)"
+            );
+        }
+
+        // Non-finite-intermediate markers must likewise propagate as internal.
+        let nonfinite_messages = [
+            "DeflatedArrowSolver: gauge stiffness must be finite and positive; got NaN",
+            "outer_gradient_arrow_solver: non-finite entry in projected gauge Hessian",
+        ];
+        for msg in nonfinite_messages {
+            let classified =
+                OuterGradientError::classify_arrow_solver_error(msg, conditioning());
+            assert!(
+                matches!(classified, OuterGradientError::InternalInvariant { .. }),
+                "non-finite intermediate must classify to InternalInvariant (#1451); \
+                 got {classified}"
+            );
+            assert!(
+                !classified.is_fd_eligible(),
+                "a non-finite intermediate must NOT be FD-eligible (#1451); got {classified}"
+            );
+        }
+
+        // A genuine near-singular linear-algebra failure on a finite, correctly
+        // shaped input (back-solve / Cholesky/Woodbury factor that tripped on
+        // rank-deficiency) is the legitimate #1273 conditioning case: it must
+        // KEEP IllConditioned and stay FD-eligible.
+        let conditioning_messages = [
+            "DeflatedArrowSolver: gauge Woodbury factor failed: matrix is not positive definite",
+            "DeflatedArrowSolver: gauge back-solve: singular factor",
+        ];
+        for msg in conditioning_messages {
+            let classified =
+                OuterGradientError::classify_arrow_solver_error(msg, conditioning());
+            assert!(
+                matches!(classified, OuterGradientError::IllConditioned { .. }),
+                "a finite, correctly-shaped near-singular failure must KEEP \
+                 IllConditioned (#1451 / #1273); got {classified}"
+            );
+            assert!(
+                classified.is_fd_eligible(),
+                "a genuine conditioning failure must remain FD-eligible (#1273); got {classified}"
+            );
+            assert!(
+                classified.admits_fd_fallback(1.0),
+                "a genuine conditioning failure at finite cost must admit the FD fallback (#1273)"
+            );
         }
     }
 }
