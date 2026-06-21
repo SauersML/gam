@@ -792,7 +792,18 @@ impl LatentIdMode {
     /// builder can reject before fitting, mirroring the existing
     /// `reject_dim_selection_alone` gate.
     pub fn validate(&self) -> Result<(), String> {
-        self.reject_dim_selection_alone();
+        if matches!(self, Self::DimSelection { .. }) {
+            // `DimSelection` alone is rotation-symmetric — not a valid
+            // gauge fix; callers must pair ARD with `AuxPrior`/`Isometry`.
+            // Beautiful unification: return a proper error instead of a
+            // panic guard (removes the tracked ban stub while keeping the
+            // gate).
+            return Err(
+                "LatentIdMode::DimSelection is not a standalone gauge fix; \
+                 pair ARD with AuxPrior or Isometry"
+                    .to_string(),
+            );
+        }
         if let Self::AuxOutcome { head, .. } = self
             && head.effective_labeled_count() <= 0.0
         {
@@ -804,18 +815,6 @@ impl LatentIdMode {
             );
         }
         Ok(())
-    }
-
-    fn reject_dim_selection_alone(&self) {
-        if matches!(self, Self::DimSelection { .. }) {
-            // `DimSelection` alone is rotation-symmetric — not a valid
-            // gauge fix; callers must pair ARD with `AuxPrior`/`Isometry`.
-            // SAFETY: reaching this panic means the builder accepted an
-            // unpaired `DimSelection`, violating the identifiability gate.
-            panic!(
-                "LatentIdMode::DimSelection is not a standalone gauge fix; pair ARD with AuxPrior or Isometry"
-            );
-        }
     }
 }
 
