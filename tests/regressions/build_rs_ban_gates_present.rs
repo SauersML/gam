@@ -27,6 +27,9 @@ pub(crate) fn required_ban_gates() -> Vec<String> {
         format!("scan_for_{}", "banned_substrings"),
         format!("scan_for_{}{}", "deferred_", "work_markers"),
         format!("scan_for_{}", "banned_marker"),
+        // Owed-work-as-prose ban — the gate repeatedly stripped by disguised
+        // commits (25babfc34); the guardian MUST cover it.
+        format!("scan_for_{}{}", "owed_", "work_prose"),
         // Per-line discarded-binding scanner (comment-stripped line scan).
         format!("scan_for_{}", "let_underscore"),
         // Fuzzy comment-block cue detector.
