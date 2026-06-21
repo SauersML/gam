@@ -1274,6 +1274,48 @@ where
         true,
     )?;
 
+    // Negative-Binomial (ρ, θ) joint-stationarity diagnostic (#1082 / audit #6).
+    //
+    // θ is frozen at its seed value for the entire λ search so the REML criterion
+    // `F(ρ) = REML(ρ, θ_frozen)` is a stationary function of ρ; the final accept-
+    // fit above then ML-refreshes θ at the converged η. The selected ρ is NOT
+    // re-optimized for that refreshed θ, so `(ρ*, θ_final)` is only *jointly*
+    // stationary to the extent θ moved little between freeze and refresh. The
+    // one-refresh approximation is sound precisely when that drift is small (θ
+    // governs the variance function, ρ the smoothness — weakly coupled), but that
+    // claim is only checkable if the drift is measured. Surface it: a large drift
+    // means the reported ρ may not be jointly optimal and warrants a full mgcv-
+    // style outer θ↔λ alternation for that fit.
+    if pirls_res.likelihood.negbin_theta_is_estimated() {
+        let frozen_bits = reml_state.frozen_negbin_theta.load(Ordering::Relaxed);
+        if frozen_bits != 0
+            && let Some(theta_final) = pirls_res.likelihood.negbin_theta()
+        {
+            let theta_frozen = f64::from_bits(frozen_bits);
+            if theta_frozen.is_finite() && theta_frozen > 0.0 && theta_final.is_finite() {
+                let rel_drift =
+                    (theta_final - theta_frozen).abs() / theta_frozen.max(f64::MIN_POSITIVE);
+                let drift_pct = rel_drift * 100.0;
+                // 5% relative θ drift: empirically the band beyond which the
+                // ρ-optimum for θ_frozen and θ_final can differ enough to matter.
+                const NEGBIN_THETA_JOINT_DRIFT_WARN: f64 = 5.0e-2;
+                if rel_drift > NEGBIN_THETA_JOINT_DRIFT_WARN {
+                    log::warn!(
+                        "[OUTER] negative-binomial θ drifted {drift_pct:.1}% between λ-search \
+                         freeze (θ={theta_frozen:.6e}) and final refit (θ={theta_final:.6e}); the \
+                         REML-selected ρ was optimized at the frozen θ and may not be jointly \
+                         stationary at θ_final — consider an outer θ↔λ alternation for this fit (#1082)."
+                    );
+                } else {
+                    log::debug!(
+                        "[OUTER] negative-binomial θ joint-stationarity OK: drift {drift_pct:.2}% \
+                         (θ_frozen={theta_frozen:.6e} → θ_final={theta_final:.6e})."
+                    );
+                }
+            }
+        }
+    }
+
     // Map beta back to original basis
     let beta_orig_internal = pirls_res
         .reparam_result

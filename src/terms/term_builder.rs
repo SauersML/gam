@@ -28,10 +28,10 @@ use crate::inference::formula_dsl::{
 use crate::inference::model::ColumnKindTag;
 use crate::resource::ResourcePolicy;
 use crate::smooth::{
-    ByVarKind, FactorSmoothFlavour, FactorSmoothSpec, LinearCoefficientGeometry, LinearTermSpec,
-    RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
-    TensorBSplineIdentifiability, TensorBSplinePenaltyDecomposition, TensorBSplineSpec,
-    TermCollectionSpec,
+    ByVarKind, FactorSmoothFlavour, FactorSmoothSpec,
+    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
+    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
+    TensorBSplinePenaltyDecomposition, TensorBSplineSpec, TermCollectionSpec,
 };
 use crate::types::ColIdx;
 
@@ -2777,108 +2777,20 @@ pub fn build_smooth_basis(
             }
             let dim = cols.len();
 
-            // Genuine thin-plate tensor for explicit `te(..., bs=c('tp','tp',...))`
-            // (#1082). The default `te()` realizes B-spline marginal bases with
-            // 2nd-difference marginal penalties (the arm below). That B-spline
-            // tensor over-smooths a noisy wiggly surface relative to mgcv's
-            // thin-plate tensor: on the gaulss-tensor truth recovery mgcv reaches
-            // RMSE(mu)=0.123 while the B-spline tensor lands at 0.151, because the
-            // difference-penalty REML shrinks the genuine signal harder than
-            // thin-plate bending energy does at n=200 under noise. When the user
-            // EXPLICITLY asks for thin-plate margins (`bs=c('tp',...)`, every
-            // margin tp/tps), honor that by building gam's mature multi-D
-            // thin-plate basis (the same one `s(x,y,bs='tps')` uses — full design /
-            // bending-energy penalty / freeze / predict support) instead of
-            // substituting B-splines. This is a true root fix (match mgcv's
-            // construction), not a tune.
-            //
-            // Scope is strict: it fires ONLY for `te` (not `ti`/`t2`, whose
-            // marginal-sum-to-zero null-space semantics differ) with an explicit
-            // all-thin-plate `bs`/`type` VECTOR and no periodic axes and no
-            // B-spline-only knobs (degree / penalty_order / knot placement — those
-            // signal the user wants the B-spline tensor). Plain `te(x,z)` and every
-            // non-tp margin vector fall straight through to the unchanged B-spline
-            // tensor arm below, so the 7 passing `te_2d_*` tests and
-            // `te_tensor_2d_hifreq` are byte-identical. The only current test that
-            // passes `bs=c('tp','tp')` to gam's `te()` is the gaulss-tensor one.
-            let all_thin_plate_margins = matches!(kind, SmoothKind::Te)
-                && options
-                    .get("bs")
-                    .or_else(|| options.get("type"))
-                    .is_some_and(|raw| {
-                        bs_selector_is_vector(raw) && {
-                            let per_margin = parse_option_list(raw);
-                            per_margin.len() == dim
-                                && per_margin.iter().all(|m| {
-                                    matches!(
-                                        m.trim().to_ascii_lowercase().as_str(),
-                                        "tp" | "tps" | "thinplate" | "thin-plate"
-                                    )
-                                })
-                        }
-                    })
-                && parse_tensor_periodic_axes(options, dim)?.iter().all(|p| !p)
-                && !options.contains_key("degree")
-                && !options.contains_key("penalty_order")
-                && !options.contains_key("knot_placement")
-                && !options.contains_key("knot-placement")
-                && !options.contains_key("knotplacement")
-                // mgcv's `k=c(k1, k2, ...)` is a per-margin marginal-basis-size
-                // request — semantically a B-spline (or other margin) tensor with
-                // each axis carrying its own basis dim — NOT a single multi-D
-                // thin-plate radial budget. The fast path here aggregates the
-                // budget into one `centers` count, so honoring a list-valued `k`
-                // would silently fold the per-margin sizes into one number and
-                // change what the user asked for. Worse, the multi-D thin-plate
-                // path routes `k`/`basis_dim` through `parse_countwith_basis_alias`
-                // which is strict-scalar and would reject `c(5,5)` with a
-                // misleading "not a non-negative integer" diagnostic before the
-                // tensor builder ever sees it (the `quality_vs_lifelines_smooth_
-                // tensor_baseline` failure mode). When `k`/`basis_dim` is a list
-                // literal, fall through to the B-spline tensor arm below so
-                // `parse_tensor_k_list` handles the per-margin sizes correctly.
-                && !k_option_is_list(options);
-            if all_thin_plate_margins {
-                // mgcv's `te(tp,tp)` leaves the tensor null space unpenalized
-                // (`select = FALSE`); the multi-D thin-plate's bending penalty
-                // already spans only the range space and leaves the polynomial
-                // null space free, so no double penalty is added (an explicit
-                // user `double_penalty=`/`select=` still wins, matching the
-                // B-spline tensor arm below).
-                let tp_double_penalty = option_bool(options, "double_penalty").unwrap_or(false);
-                let plan = plan_spatial_basis(
-                    ds.values.nrows(),
-                    dim,
-                    CenterCountRequest::Default,
-                    DuchonNullspaceOrder::Linear,
-                    option_bool(options, "scale_dims").unwrap_or(false),
-                    policy,
-                )
-                .map_err(|e| e.to_string())?;
-                let centers = parse_countwith_basis_alias(
-                    options,
-                    "centers",
-                    cap_default_spatial_centers(options, plan.centers),
-                )?;
-                let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
-                    spatial_center_strategy_for_dimension(centers, dim)
-                } else {
-                    auto_spatial_center_strategy(centers, dim)
-                };
-                return Ok(SmoothBasisSpec::ThinPlate {
-                    feature_cols: cols.to_vec(),
-                    spec: ThinPlateBasisSpec {
-                        center_strategy,
-                        periodic: parse_periodic_axes_option(options, dim)?,
-                        length_scale: option_f64(options, "length_scale").unwrap_or(0.0),
-                        double_penalty: tp_double_penalty,
-                        identifiability: parse_spatial_identifiability(options)
-                            .map_err(|e| e.to_string())?,
-                        radial_reparam: None,
-                    },
-                    input_scales: None,
-                });
-            }
+            // Tensor-product contract (#1082). `te(x1, x2, ...)` ALWAYS builds a
+            // genuine anisotropic tensor product of per-margin bases (the arm
+            // below), exactly as mgcv's `te()` does — one smoothing parameter per
+            // margin, a marginal-Kronecker-sum penalty, and the bilinear null
+            // space left unpenalized under the default `select = FALSE`. A margin
+            // vector `bs=c('tp','tp')` requests a thin-plate FUNCTION SPACE per
+            // axis; the tensor realizes each axis as a 1-D penalized B-spline
+            // margin spanning that same per-axis space (tp/ps/cr/bs/cc all share
+            // it). We deliberately do NOT silently swap the requested tensor for a
+            // single multi-D ISOTROPIC thin-plate radial smooth (`s(x,y,bs='tp')`):
+            // that is a different model — one isotropic smoothing parameter, no
+            // per-margin anisotropy — and substituting it while the user wrote a
+            // tensor formula is dishonest. A user who genuinely wants the isotropic
+            // radial smooth asks for it directly with `s(x1, x2, bs='tp')`.
             // Per-margin basis vector (`bs=c('tp','tp')` / `bs=['ps','cr']`):
             // validate each requested margin is a penalized-spline basis that
             // the tensor product realizes as a 1-D B-spline margin. mgcv's
@@ -3554,26 +3466,6 @@ fn knots_option_is_list(options: &BTreeMap<String, String>) -> bool {
             t.starts_with('[') || t.starts_with("c(") || t.starts_with("C(") || t.starts_with('(')
         })
         .unwrap_or(false)
-}
-
-/// True when any of the `k=`/`basis_dim=` aliases carries a *list* literal
-/// (`[k0, k1, ...]`, `c(k0, k1, ...)`, or `(k0, k1, ...)`) rather than a scalar.
-///
-/// mgcv's tensor smooths take `k=c(k1, k2, ...)` as per-margin basis dims.
-/// Dispatch sites that aggregate `k` into a single integer (e.g. the multi-D
-/// thin-plate radial fast path) must NOT consume a list value — they would
-/// either reject it with a misleading scalar-integer error, or silently fold
-/// the per-margin sizes into one budget and change the smoothing geometry.
-/// The tensor builder's `parse_tensor_k_list` is the correct consumer for the
-/// list form.
-fn k_option_is_list(options: &BTreeMap<String, String>) -> bool {
-    ["k", "basis_dim", "basis-dim", "basisdim"]
-        .iter()
-        .filter_map(|key| options.get(*key))
-        .any(|raw| {
-            let t = raw.trim();
-            t.starts_with('[') || t.starts_with("c(") || t.starts_with("C(") || t.starts_with('(')
-        })
 }
 
 /// Parse `knots=[k0, k1, ...]` (or `c(...)` / `(...)`) into explicit internal
@@ -4851,14 +4743,12 @@ mod tests {
     fn tensor_all_tp_margins_with_per_margin_k_routes_to_bspline_tensor() {
         // `te(x1, x2, bs=c('tp','tp'), k=c(5,5))` is mgcv's per-margin tp tensor
         // with per-margin basis sizes — a tensor product of two 1-D bases, each
-        // of dimension 5. The all-thin-plate fast path that swaps the tensor for
-        // a multi-D thin-plate radial basis aggregates the budget into a single
-        // `centers` count via `parse_countwith_basis_alias`, which is strict-
-        // scalar over `k`/`basis_dim`. Routing `k=c(5,5)` through it would
-        // reject the formula with a "not a non-negative integer" diagnostic
-        // (the `quality_vs_lifelines_smooth_tensor_baseline` failure mode).
-        // With a list-valued `k`, the fast path must defer to the B-spline
-        // tensor arm so `parse_tensor_k_list` honors the per-margin sizes.
+        // of dimension 5. The list-valued `k=c(5,5)` is honored by
+        // `parse_tensor_k_list`, producing one penalized B-spline margin per axis
+        // (each spanning the requested per-axis thin-plate function space). This
+        // is the same anisotropic-tensor routing the scalar/no-`k` case takes —
+        // a `te()` request is ALWAYS a tensor product, never a silent isotropic
+        // thin-plate substitution.
         let ds = continuous_dataset(
             &["y", "x1", "x2"],
             (0..32)
@@ -4900,14 +4790,14 @@ mod tests {
     }
 
     #[test]
-    fn tensor_all_tp_margins_without_per_margin_k_keeps_thin_plate_fast_path() {
-        // The companion to `tensor_all_tp_margins_with_per_margin_k_routes_to_bspline_tensor`:
-        // when the user passes `bs=c('tp','tp')` WITHOUT a list-valued `k`, the
-        // all-thin-plate fast path swaps the per-margin tp tensor for gam's
-        // multi-D thin-plate radial basis (the only test currently exercising
-        // this is `quality_vs_mgcv_gaulss_tensor`). The k-is-list gate must
-        // not regress this routing — only the explicit per-margin-sizes case
-        // should drop through to the B-spline tensor arm.
+    fn tensor_all_tp_margins_without_per_margin_k_builds_anisotropic_tensor() {
+        // `te(x1, x2, bs=c('tp','tp'))` is a tensor-product request and must
+        // build a genuine anisotropic tensor product (one smoothing parameter
+        // per margin), NOT a silently-substituted multi-D isotropic thin-plate
+        // radial smooth — that would be a different model (`s(x1,x2,bs='tp')`).
+        // The routing is now consistent whether or not `k` is list-valued: a tp
+        // margin vector always realizes each axis as a 1-D penalized B-spline
+        // margin spanning the same per-axis thin-plate function space (#1082).
         let ds = continuous_dataset(
             &["y", "x1", "x2"],
             (0..32)
@@ -4928,13 +4818,17 @@ mod tests {
             &crate::resource::ResourcePolicy::default_library(),
         )
         .expect("build tensor terms without per-margin k");
-        assert!(
-            matches!(
-                terms.smooth_terms[0].basis,
-                SmoothBasisSpec::ThinPlate { .. }
-            ),
-            "te(...,bs=c('tp','tp')) without k=c(...) should route to multi-D thin-plate; got {:?}",
-            terms.smooth_terms[0].basis
+        let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!(
+                "te(...,bs=c('tp','tp')) must route to an anisotropic tensor product, not a \
+                 silent isotropic thin-plate substitution; got {:?}",
+                terms.smooth_terms[0].basis
+            );
+        };
+        assert_eq!(
+            spec.marginalspecs.len(),
+            2,
+            "tp tensor must carry one penalized B-spline margin per axis"
         );
     }
 

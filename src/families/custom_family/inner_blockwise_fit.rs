@@ -3757,6 +3757,25 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 && decrement.is_finite()
                 && decrement <= objective_tol
             {
+                // Audit witness (#1082): the residual mass this certificate
+                // EXCLUDES as gauge-null. The decrement bound is sound only when
+                // that excluded mass truly lies on penalty-null directions; if it
+                // is large the certificate may have discarded a weakly-identified
+                // real mode (the `null_cutoff = rank_tol·λ_max` ill-conditioning
+                // edge), so emit it at WARN to keep the decision auditable.
+                let excluded_null_residual = joint_spectrum
+                    .as_ref()
+                    .map(|spectrum| spectrum.null_residual_inf())
+                    .unwrap_or(0.0);
+                if excluded_null_residual > residual_tol.max(1e-6) {
+                    log::warn!(
+                        "[PIRLS/joint-Newton convergence] cycle {cycle:>3} | Newton-decrement \
+                         certificate fired with LARGE excluded near-null residual \
+                         ={excluded_null_residual:.3e} (> tol={residual_tol:.3e}); the stopping \
+                         rule treated this mass as free gauge. Sound iff it lies on genuine \
+                         penalty-null directions — flagged for joint-stationarity audit (#1082)."
+                    );
+                }
                 log::info!(
                     "[PIRLS/joint-Newton convergence] cycle {:>3} | Newton-decrement certificate (gam#1040/#1088/#1082): \
                      residual={:.3e} (tol={:.3e}) stalled above tol for {} cycles on a weakly-identified block (last \

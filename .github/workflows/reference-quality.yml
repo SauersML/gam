@@ -489,7 +489,27 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          echo "Gate: PASSED — every test either met its quality bar or was a non-gated REF_ERROR (${referr})."
+          # REFERENCE-COVERAGE FLOOR. REF_ERROR is non-blaming per-test (it is the
+          # reference env, not a gam result), but the suite's ENTIRE value is the
+          # gam-vs-mature-tool comparison. If the reference environment is broadly
+          # broken, almost no comparison actually ran and the suite measured
+          # nothing — it must NOT report green merely because the gam side did not
+          # crash (the failure mode the #1087 meta-bug warns about). This is an
+          # infrastructure failure (tracked #1070/#1071), reported distinctly from
+          # a gam-side regression, but it still fails the job: a run cannot be
+          # green when more than a quarter of the suite lost its reference.
+          if [ "$N" -gt 0 ] && [ $((referr * 4)) -gt "$N" ]; then
+            echo ""
+            echo "::error::Reference Quality Suite UNTRUSTWORTHY: ${referr}/${N} test(s) lost their reference (>25%); reference environment is broken, so the suite proved almost nothing. Not a gam regression (see #1070/#1071), but the run cannot be green."
+            {
+              echo ""
+              echo "### Gate: FAILED (reference coverage)"
+              echo ""
+              echo "${referr}/${N} tests were REF_ERROR (>25%). The reference R/Python environment is broken; the gam-vs-reference comparison did not run for most of the suite, so a green result here would be meaningless."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Gate: PASSED — every test met its quality bar; reference coverage OK (REF_ERROR=${referr}/${N})."
           { echo ""; echo "### Gate: PASSED"; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload full quality report (always — survives timeout/cancel)

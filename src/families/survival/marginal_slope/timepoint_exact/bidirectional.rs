@@ -982,15 +982,12 @@ impl SurvivalMarginalSlopeFamily {
                 &g_jet.directional_family(g_jet.aaa_first, dir2, COEFF_SUPPORT_GW),
                 z_obs,
             ),
-            eval_coeff4_at(
-                &g_jet.mixed_directional_from_b_family(
-                    g_jet.aab_first,
-                    dir1,
-                    dir2,
-                    COEFF_SUPPORT_GW,
-                ),
-                z_obs,
-            ),
+            // The second mixed (dir1,dir2) derivative of `eta_aaa = ∂³_a η` adds one
+            // more `b`-derivative to the third a-partial, i.e. ∂³_a∂_b∂_w of the cell
+            // coefficient. That is a 4th-order total (a,b)-partial of a degree-3
+            // cell polynomial, so it is identically zero (the old `aab_first`
+            // = ∂²_a∂_b∂_w slot was the `eta_aa` d12 term reused one a-order too low).
+            0.0,
         );
 
         let mut a_u_jets = Vec::with_capacity(p);
@@ -1074,16 +1071,13 @@ impl SurvivalMarginalSlopeFamily {
                     ),
                     z_obs,
                 ),
-                eval_coeff4_at(
-                    &g_jet.param_mixed_from_bb_family(
-                        g_jet.abb_first,
-                        u,
-                        dir1,
-                        dir2,
-                        COEFF_SUPPORT_GW,
-                    ),
-                    z_obs,
-                ),
+                // The second mixed (dir1,dir2) derivative of `tau_a` (base
+                // ∂²_a∂_w for param u) adds two more `b`-derivatives, i.e.
+                // ∂²_a∂²_b∂_w of the cell coefficient — a 4th-order total
+                // (a,b)-partial of a degree-3 cell polynomial, hence identically
+                // zero (the old `abb_first` = ∂_a∂²_b∂_w slot was the `tau` d12
+                // term reused one a-order too low).
+                0.0,
                 0.0,
                 0.0,
                 ad1,
@@ -1203,17 +1197,13 @@ impl SurvivalMarginalSlopeFamily {
                         ),
                         z_obs,
                     ),
-                    eval_coeff4_at(
-                        &g_jet.pair_mixed_from_bbb_family(
-                            g_jet.bbb_first,
-                            u,
-                            v,
-                            dir1,
-                            dir2,
-                            COEFF_SUPPORT_GW,
-                        ),
-                        z_obs,
-                    ),
+                    // `chi_uv_fixed = ∂_a r_uv`, so its second mixed (dir1,dir2)
+                    // derivative is ∂_a∂³_b∂_w of the cell coefficient — a 4th-order
+                    // total (a,b)-partial of a degree-3 cell polynomial, hence
+                    // identically zero (the old `bbb_first` = ∂³_b∂_w slot was the
+                    // `r_uv` d12 term carried over without the extra ∂_a that turns
+                    // it into a vanishing 4th total derivative).
+                    0.0,
                     0.0,
                     0.0,
                     ad1,
@@ -1300,12 +1290,12 @@ impl SurvivalMarginalSlopeFamily {
                     primary_view.directional_family(&fx.coeff_aaau, dir1, COEFF_SUPPORT_GHW);
                 let coeff_aaa_dir2 =
                     primary_view.directional_family(&fx.coeff_aaau, dir2, COEFF_SUPPORT_GHW);
-                let coeff_aaa_dir12 = primary_view.mixed_directional_from_b_family(
-                    &fx.coeff_aabu,
-                    dir1,
-                    dir2,
-                    COEFF_SUPPORT_GHW,
-                );
+                // Second mixed (dir1,dir2) derivative of the ∂³_a cell coefficient =
+                // ∂³_a∂_b∂_w (b,w cross) / ∂³_a∂²_b (b,b cross): both are ≥4th-order
+                // total (a,b)-partials of a degree-3 cell polynomial, hence zero.
+                // (`coeff_aabu` = ∂²_a∂_b∂_w was the `coeff_aa` d12 family reused one
+                // a-order too low.)
+                let coeff_aaa_dir12 = zero4;
 
                 let eta_poly_jet = coeff4_composite_bilinear(
                     &eta_base,
@@ -1408,13 +1398,12 @@ impl SurvivalMarginalSlopeFamily {
                         dir2,
                         COEFF_SUPPORT_GHW,
                     );
-                    let coeff_aau_dir12 = primary_view.param_mixed_from_bb_family(
-                        &fx.coeff_abbu,
-                        u,
-                        dir1,
-                        dir2,
-                        COEFF_SUPPORT_GHW,
-                    );
+                    // Second mixed (dir1,dir2) derivative of the per-param ∂²_a cell
+                    // coefficient = ∂²_a∂²_b∂_w — a 4th-order total (a,b)-partial of
+                    // a degree-3 cell polynomial, hence zero. (`coeff_abbu`
+                    // = ∂_a∂²_b∂_w was the `coeff_au` d12 family reused one a-order
+                    // too low.)
+                    let coeff_aau_dir12 = zero4;
 
                     let coeff_u_fixed_jet = coeff4_fixed_bilinear(
                         &fx.coeff_u[u],
@@ -1497,14 +1486,12 @@ impl SurvivalMarginalSlopeFamily {
                                 dir2,
                                 COEFF_SUPPORT_GHW,
                             ),
-                            &primary_view.pair_mixed_from_bbb_family(
-                                &fx.coeff_bbbu,
-                                u,
-                                v,
-                                dir1,
-                                dir2,
-                                COEFF_SUPPORT_GHW,
-                            ),
+                            // `chi_uv_fixed = ∂_a r_uv`, so its second mixed
+                            // (dir1,dir2) derivative is ∂_a∂³_b∂_w — a 4th-order
+                            // total (a,b)-partial of a degree-3 cell polynomial,
+                            // hence identically zero. (`coeff_bbbu` = ∂³_b∂_w was the
+                            // `r_uv` d12 family carried over without the extra ∂_a.)
+                            &zero4,
                         );
 
                         let eta_uv_poly_jet = poly_add_jets(

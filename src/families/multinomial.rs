@@ -215,29 +215,49 @@ const MULTINOMIAL_OUTER_REML_TOL: f64 = 1e-7;
 /// but hand slow/non-interior probes to the proper-prior refit promptly.
 const MULTINOMIAL_UNBIASED_PROBE_OUTER_MAX_ITER: usize = 20;
 
-/// Formula-path smoothing parameters below this level are effectively at the
-/// zero-penalty boundary for penguin-scale multinomial fixtures. Keep the
-/// unbiased REML optimizer inside a lower box bound instead of accepting a
-/// boundary-overfit surface or switching to Firth bias on finite data.
+/// Flexible lower λ floor for a WELL-SUPPORTED class on the formula path:
+/// smoothing parameters below this level are effectively at the zero-penalty
+/// boundary, so the unbiased REML optimizer is held inside this box bound rather
+/// than accepting a boundary-overfit surface or switching to Firth bias on
+/// finite data. This is the floor in the large-support limit.
 const MULTINOMIAL_FORMULA_MIN_LAMBDA: f64 = 2.0e-4;
 
-/// Sparse minority classes need a stronger lower lambda floor: with fewer rows
-/// in a class, the softmax Fisher surface is less able to calibrate
-/// boundary-hugging smooths on held-out data. Better-supported classes keep the
-/// lower floor so the fit remains flexible enough to recover the separating
-/// boundary.
+/// Strong lower λ floor in the SPARSE-class limit, and the support scale at
+/// which the floor begins to rise. With fewer rows in a class the softmax Fisher
+/// information `JᵀWJ` restricted to that class is smaller, so a boundary-hugging
+/// smooth calibrates worse on held-out data and wants more shrinkage. These two
+/// constants are the empirically-calibrated ENDPOINTS of a continuous
+/// information-scaled floor (see [`multinomial_formula_min_lambda`]); they are
+/// not a hard count threshold.
 const MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_COUNT: f64 = 50.0;
 const MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA: f64 = 1.0e-3;
 
+/// Continuous, information-scaled lower λ floor for the formula path.
+///
+/// The floor scales like the inverse of the minority-class support
+/// (`floor ∝ 1/information ∝ 1/count`), NOT a discontinuous count threshold: a
+/// class with 49 vs 50 rows must not see a 5× jump in its penalty floor. The
+/// form `base · max(1, c0/c)`, clamped to `[base, sparse]`:
+///   * reduces EXACTLY to `base` for well-supported classes (`c ≥ c0`);
+///   * reduces EXACTLY to `sparse` for very sparse classes
+///     (`c ≤ c0·base/sparse`, here `c ≤ 10`);
+///   * interpolates monotonically and continuously between them in the middle.
+/// It anchors on the two empirically-calibrated endpoints while removing the
+/// cliff at `c = c0`. Fixtures whose smallest class has `c ≥ 50` (e.g. penguins)
+/// are unaffected — they sit in the `base` regime exactly as before.
 fn multinomial_formula_min_lambda(y_one_hot: ArrayView2<'_, f64>) -> f64 {
     let min_class_count = (0..y_one_hot.ncols())
         .map(|class| y_one_hot.column(class).sum())
         .fold(f64::INFINITY, f64::min);
-    if min_class_count < MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_COUNT {
-        MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA
-    } else {
-        MULTINOMIAL_FORMULA_MIN_LAMBDA
+    if !min_class_count.is_finite() || min_class_count <= 0.0 {
+        return MULTINOMIAL_FORMULA_MIN_LAMBDA;
     }
+    let information_scale =
+        (MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_COUNT / min_class_count).max(1.0);
+    (MULTINOMIAL_FORMULA_MIN_LAMBDA * information_scale).clamp(
+        MULTINOMIAL_FORMULA_MIN_LAMBDA,
+        MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA,
+    )
 }
 
 fn max_abs_eta_location(eta: ArrayView2<'_, f64>) -> (f64, usize, usize) {
@@ -1904,6 +1924,40 @@ mod fisher_override_tests {
         assert!(
             multinomial_formula_use_outer_hessian(16),
             "D=16 multinomial fits need exact ARC curvature for the #1082 stall halt"
+        );
+    }
+
+    #[test]
+    fn formula_min_lambda_floor_is_continuous_and_information_scaled() {
+        // Build a one-hot label matrix whose smallest class carries `count` rows.
+        fn floor_for_min_count(count: usize) -> f64 {
+            // Two classes: a large one (1000 rows) and a minority one (`count`).
+            let n = 1000 + count;
+            let mut y = Array2::<f64>::zeros((n, 2));
+            for r in 0..1000 {
+                y[[r, 0]] = 1.0;
+            }
+            for r in 1000..n {
+                y[[r, 1]] = 1.0;
+            }
+            multinomial_formula_min_lambda(y.view())
+        }
+
+        // Well-supported (count >= c0=50) sits exactly at the flexible base floor.
+        assert!((floor_for_min_count(50) - MULTINOMIAL_FORMULA_MIN_LAMBDA).abs() < 1e-18);
+        assert!((floor_for_min_count(200) - MULTINOMIAL_FORMULA_MIN_LAMBDA).abs() < 1e-18);
+        // Very sparse (count <= c0*base/sparse = 10) clamps to the strong floor.
+        assert!((floor_for_min_count(10) - MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA).abs() < 1e-18);
+        assert!((floor_for_min_count(5) - MULTINOMIAL_FORMULA_SPARSE_CLASS_MIN_LAMBDA).abs() < 1e-18);
+        // No cliff at the old hard threshold: 49 vs 50 differ by < 5% (the old
+        // step jumped 5x). Floor is monotone non-increasing in support.
+        let f49 = floor_for_min_count(49);
+        let f50 = floor_for_min_count(50);
+        assert!(f49 >= f50 && f49 <= f50 * 1.05, "floor must be continuous across c0, got {f49} vs {f50}");
+        let f25 = floor_for_min_count(25);
+        assert!(
+            f25 > f50 && f25 < floor_for_min_count(10),
+            "mid-support floor must interpolate strictly between the two endpoints"
         );
     }
 

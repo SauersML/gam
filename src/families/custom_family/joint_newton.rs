@@ -2989,6 +2989,28 @@ pub(crate) mod whitened_spectrum {
             0.5 * acc
         }
 
+        /// Infinity-norm of the whitened RHS mass on the SKIPPED near-null modes
+        /// (`|γ_k| ≤ null_cutoff`) — exactly the residual the Newton-decrement
+        /// certificate excludes as free-gauge mass that the outer IFT projects
+        /// out. Surfaced at the convergence certificate so the question "did the
+        /// stopping rule discard a weakly-identified REAL direction?" is
+        /// observable rather than silent: the certificate is sound only when this
+        /// excluded mass genuinely lies on penalty-null gauge directions, so a
+        /// certificate firing with a LARGE `null_residual_inf` is the diagnostic
+        /// witness of the ill-conditioning edge (a real curved+signal mode
+        /// mis-classified as null because `null_cutoff = rank_tol·λ_max` grew with
+        /// the spectrum). It never participates in the stopping decision — it only
+        /// makes the decision auditable.
+        pub(crate) fn null_residual_inf(&self) -> f64 {
+            let mut m = 0.0_f64;
+            for k in 0..self.gamma.len() {
+                if self.gamma[k].abs() <= self.null_cutoff {
+                    m = m.max(self.c[k].abs());
+                }
+            }
+            m
+        }
+
         /// Assemble the whitened step `η(λ) = Σ c_k/(γ_k+λ) v_k` over identified
         /// modes and map it back to `δ = D^{-1/2} η`. Returns `(δ, range_rhs_inf,
         /// null_rhs_inf, nullity, lambda_min_positive, reflected_negative_modes,
@@ -3394,6 +3416,17 @@ mod trust_region_subproblem_tests {
         assert!(
             (decrement - 0.5).abs() < 1e-10,
             "decrement must exclude the near-null gauge mode; got {decrement}"
+        );
+
+        // The mass the decrement excluded must be reported by the audit witness:
+        // the near-null mode here carries rhs component |c| = 0.5, so a
+        // certificate firing on this spectrum is auditably discarding 0.5 of
+        // gauge residual. `null_residual_inf` exposes exactly that, and must NOT
+        // change the (decrement-only) stopping decision.
+        let excluded = spec.null_residual_inf();
+        assert!(
+            (excluded - 0.5).abs() < 1e-10,
+            "excluded near-null residual mass must be observable; got {excluded}"
         );
     }
 
