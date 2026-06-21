@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Extract a SMALL, GitHub-sized, REAL OLMo-activation fixture for the hard e2e
-test (tests/sae/olmo_real_fixture_e2e.py). Run ONCE on MSI where the real
+test (tests/sae/olmo_real_fixture_e2e.py). Run ONCE on the cluster where the real
 activations are staged; commit the two output files under tests/data/.
 
 It projects the REAL OLMo L25 residual-stream activations (635×5120) onto their
@@ -10,7 +10,7 @@ projection of the actual activations), not synthetic — the PCA basis is comput
 from and applied to the genuine cloud, so the fixture preserves the activation
 geometry the manifold-SAE must recover.
 
-USAGE (on MSI, login node ok — tiny):
+USAGE (on the cluster, login node ok — tiny):
   python tests/sae/extract_olmo_fixture.py \
       --data /path/to/scratch/olmo_data/instruct/<rev> \
       --pcs 64 --out-dir tests/data

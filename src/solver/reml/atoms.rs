@@ -1303,7 +1303,7 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // general-direction `dir` and staged `s_dot` channels stay unbuilt until a
 // consumer reads them. Folding `fill_direction` into the deeply-cached
 // `gradient_hessian.rs` per-consumer Ḣ assemblies (deleting them) is the
-// per-pass MSI-FD-verified step against the iso-κ suite, not done here.
+// per-pass cluster-FD-verified step against the iso-κ suite, not done here.
 //
 // LANDED (pass 4 start, ledger item "TK/Jeffreys/prior atoms"):
 // `JeffreysLogdetAtom` ports the universal Jeffreys/Firth term

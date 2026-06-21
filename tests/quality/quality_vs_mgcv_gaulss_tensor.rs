@@ -158,7 +158,7 @@ fn gam_gaulss_tensor_product_matches_mgcv() {
     // context only and never gates this STATISTICAL quality test. A genuine
     // performance budget belongs in a controlled benchmark lane with a fixed
     // machine/profile, not mixed into an accuracy assertion where a slow CI host
-    // could fail a correct fit. (#1082 timing lives in the MSI bench lane.)
+    // could fail a correct fit. (#1082 timing lives in the cluster bench lane.)
     if fit_elapsed.as_secs_f64() > 120.0 {
         eprintln!(
             "gaulss tensor fit slow on this host (NOT a quality failure): elapsed={:.1}s \

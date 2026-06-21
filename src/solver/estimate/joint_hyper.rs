@@ -522,7 +522,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// True when the design-realization SKIP to `psi` is β̂-SOUND given the
     /// reference surface pinned at the last slow-path reset (#1264). Restored
     /// after the "stale-penalty-not-stale-basis" theory was empirically refuted:
-    /// MSI measured β̂rel≈1.7e-5 (17× the issue's 1e-6 bar) when the n-free κ skip
+    /// cluster measured β̂rel≈1.7e-5 (17× the issue's 1e-6 bar) when the n-free κ skip
     /// fires on production Duchon geometry — EVEN at a ψ the n-free VALUE window
     /// admits — because the inner penalized solve `(QsᵀGQs+S)β=b` is run in the
     /// CONDITIONED reduced basis, and that basis ROTATES with ψ on the near-

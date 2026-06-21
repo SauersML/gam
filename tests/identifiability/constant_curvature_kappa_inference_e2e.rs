@@ -208,7 +208,7 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
 /// gate for that fix. Prints the full V_p / deviance / penalty grid for
 /// diagnosis on failure.
 #[test]
-#[ignore = "MSI-only #944 profiled κ grid; runs many fixed-curvature fits"]
+#[ignore = "cluster-only #944 profiled κ grid; runs many fixed-curvature fits"]
 fn vp_grid_identifies_planted_kappa_sign() {
     use gam::smooth::SmoothBasisSpec;
     let options = FitOptions::default();
@@ -301,7 +301,7 @@ fn vp_grid_identifies_planted_kappa_sign() {
 }
 
 #[test]
-#[ignore = "MSI-only #944 e2e curvature inference fit"]
+#[ignore = "cluster-only #944 e2e curvature inference fit"]
 fn spherical_truth_recovers_positive_kappa_and_rejects_flat() {
     let (feats, y) = dataset_on_m_kappa(2000, 2.0, 0.68, 0.02, 0x5151_0001);
     let inf = fit_and_infer(&feats, &y);
@@ -332,7 +332,7 @@ fn spherical_truth_recovers_positive_kappa_and_rejects_flat() {
 }
 
 #[test]
-#[ignore = "MSI-only #944 e2e curvature inference fit"]
+#[ignore = "cluster-only #944 e2e curvature inference fit"]
 fn flat_truth_does_not_reject_flatness() {
     let (feats, y) = dataset_on_m_kappa(2000, 0.0, 0.68, 0.02, 0x5151_0002);
     let inf = fit_and_infer(&feats, &y);
@@ -361,7 +361,7 @@ fn flat_truth_does_not_reject_flatness() {
 }
 
 #[test]
-#[ignore = "MSI-only #944 e2e curvature inference fit"]
+#[ignore = "cluster-only #944 e2e curvature inference fit"]
 fn hyperbolic_truth_recovers_negative_kappa_and_rejects_flat() {
     let (feats, y) = dataset_on_m_kappa(2000, -2.0, 0.68, 0.02, 0x5151_0003);
     let inf = fit_and_infer(&feats, &y);

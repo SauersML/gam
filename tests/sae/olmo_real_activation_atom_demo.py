@@ -20,7 +20,7 @@ low-dimensional curved family will report a cluster / Euclidean verdict, and
 that is itself the finding the structure ladder is designed to surface (the
 wager loses *measurably*, not silently).
 
-DATA (stage on MSI scratch first; see the run spec the driver prints with
+DATA (stage on the cluster scratch first; see the run spec the driver prints with
 `--print-run-spec`):
   - <DATA>/activations.npy   float32 [635, 64, 5120]  last-token residual / prompt / layer
   - <DATA>/prompts.jsonl     635 rows, fields incl. `kind` (38 kinds), `role`, `side`, `entity`
@@ -28,7 +28,7 @@ Memory: reference_olmo_activation_dataset. Azure SAS pull recipe in that note.
 
 USAGE:
   python tests/sae/olmo_real_activation_atom_demo.py --data <DATA_DIR> --layer 25
-  python tests/sae/olmo_real_activation_atom_demo.py --print-run-spec    # MSI sbatch recipe, no data needed
+  python tests/sae/olmo_real_activation_atom_demo.py --print-run-spec    # cluster sbatch recipe, no data needed
 
 EXIT: 0 = a real-activation atom fit completed AND adjudicated (verdict printed,
 whatever it is — circle win OR an honest cluster/Euclidean finding). Non-zero =
@@ -147,7 +147,7 @@ def adjudicate_shape(coords: np.ndarray, k_ladder=(2, 3, 5, 7, 9), folds: int = 
 # ---------------------------------------------------------------------------
 
 RUN_SPEC = """\
-=== #977 real-activation atom demo — MSI run spec (serialize on the GPU lane) ===
+=== #977 real-activation atom demo — cluster run spec (serialize on the GPU lane) ===
 
 STEP 1 — stage data (login node ahl03, submit-only; small download, OK on login):
   cd /path/to/scratch
@@ -157,13 +157,13 @@ STEP 1 — stage data (login node ahl03, submit-only; small download, OK on logi
   # need only: olmo_data/instruct/<rev>/activations.npy + prompts.jsonl  (~13 MB/rev for the L-slice)
 
 STEP 2 — build the wheel on a COMPUTE node (NEVER the login node), CUDA build:
-  sbatch -p msigpu --gres=gpu:a100:1 -t 60 --wrap '
+  sbatch -p <gpu-partition> --gres=gpu:a100:1 -t 60 --wrap '
     source /path/to/scratch/gam_env.sh
     cd /path/to/scratch/gam
     maturin build --release --features gpu -o dist  &&  pip install --force-reinstall dist/*.whl'
 
 STEP 3 — run the demo on a COMPUTE GPU node:
-  sbatch -p msigpu --gres=gpu:a100:1 -t 30 --wrap '
+  sbatch -p <gpu-partition> --gres=gpu:a100:1 -t 30 --wrap '
     source /path/to/scratch/gam_env.sh
     cd /path/to/scratch/gam
     python tests/sae/olmo_real_activation_atom_demo.py \\

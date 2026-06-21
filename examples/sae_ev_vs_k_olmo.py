@@ -40,7 +40,7 @@ GPU REQUIREMENT: the official Qwen 32K-reference comparison needs the full
 K in {8,32,128,512} ladder at token rate. K>=32 is gated on the device-resident
 solver (#1017) + memory work (#1009), so CPU evidence cannot close #1026.
 
-EXAMPLE (OLMo-3-32B base, layer 25, on an MSI compute node):
+EXAMPLE (OLMo-3-32B base, layer 25, on a cluster compute node):
   python examples/sae_ev_vs_k_olmo.py \
       --npy /path/to/scratch/olmo_data/.../base/activations.npy \
       --olmo-layer 25 --pcs 32 --seed 42

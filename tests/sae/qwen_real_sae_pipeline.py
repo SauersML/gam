@@ -240,7 +240,7 @@ def adjudicate_groups(gamfit, codes, groups, W_dec, max_rows, seed, log=print):
 # ---------------------------------------------------------------------------
 
 RUN_SPEC = """\
-=== #977 real Qwen SGD-SAE -> gam-adjudication pipeline — MSI run spec ===
+=== #977 real Qwen SGD-SAE -> gam-adjudication pipeline — cluster run spec ===
 
 Data (already staged):
   /path/to/scratch/qwen_acts/activations/layer_30_residual_post/*.npy
@@ -248,7 +248,7 @@ Data (already staged):
 Build the wheel on a COMPUTE node (never login), then run on an a100:
 
   # STEP 1 (build, if the olmo_venv wheel lacks adjudicate_atom_shape):
-  sbatch -p msigpu --gres=gpu:a100:1 -t 90 --wrap '
+  sbatch -p <gpu-partition> --gres=gpu:a100:1 -t 90 --wrap '
     source /path/to/scratch/gam_env.sh
     export HF_HOME=/path/to/scratch/hf
     export TMPDIR=/path/to/scratch/tmp
@@ -256,7 +256,7 @@ Build the wheel on a COMPUTE node (never login), then run on an a100:
     maturin build --release -o dist && pip install --force-reinstall dist/*.whl'
 
   # STEP 2 (train SAE + adjudicate):
-  sbatch -p msigpu --gres=gpu:a100:1 -t 120 --wrap '
+  sbatch -p <gpu-partition> --gres=gpu:a100:1 -t 120 --wrap '
     source /path/to/scratch/olmo_venv/bin/activate
     export HF_HOME=/path/to/scratch/hf
     export TMPDIR=/path/to/scratch/tmp

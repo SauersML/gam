@@ -7,7 +7,7 @@ activations into a full research-matrix sweep, writing every measured result to
 cluster/euclidean shape verdict is a real finding, not a failure; every cell is
 wrapped in try/except so one bad fit never sinks the run.
 
-The matrix (see the module-level run with --print-run-spec for the exact MSI
+The matrix (see the module-level run with --print-run-spec for the exact cluster
 command):
 
   1. REAL MODELS / multi-layer — manifold-SAE on OLMo L25 (self/qualia) AND
@@ -28,7 +28,7 @@ command):
 
 USAGE:
   python tests/sae/olmo_research_battery.py --data olmo_data/instruct --out olmo_battery_results.json
-  python tests/sae/olmo_research_battery.py --print-run-spec      # MSI srun recipe, no data
+  python tests/sae/olmo_research_battery.py --print-run-spec      # cluster srun recipe, no data
 """
 from __future__ import annotations
 
@@ -402,7 +402,7 @@ def print_summary(results: dict) -> None:
 
 
 RUN_SPEC = """\
-=== #977 OLMo research battery — MSI run spec (overlap on the held A100) ===
+=== #977 OLMo research battery — cluster run spec (overlap on the held A100) ===
 # data already staged at olmo_data/instruct; wheel built by the lead's GPU job.
 srun --overlap --jobid <ALLOC_JOBID> --gres=gpu:a100:1 -t 60 bash -lc '
   source /path/to/scratch/gam_env.sh

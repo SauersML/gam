@@ -1,9 +1,9 @@
 //! #979 LIVE hang repro at TINY scale: the lifelines survival marginal-slope
 //! quality fit (heart-failure real data, n_train≈133) that times out at
-//! 1400s+ on MSI (job 11417349 rc=124). Mirrors the fit in
+//! 1400s+ on the cluster (job 11417349 rc=124). Mirrors the fit in
 //! tests/quality/quality_vs_lifelines_cox_like_marginal.rs exactly, minus the
 //! comparator/concordance scoring, so RUST_LOG=info captures the inner-solve
-//! stall trace locally in seconds-to-minutes instead of a 23-min MSI cycle.
+//! stall trace locally in seconds-to-minutes instead of a 23-min cluster cycle.
 //!
 //! Run:
 //!   RUST_LOG=info cargo run --profile release-dev --example repro979_heart_margslope 2>&1 | tee /tmp/heart979.log

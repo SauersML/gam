@@ -57,9 +57,9 @@ fn main() {
     assert_warnings_are_denied(&manifest_dir);
 
     // HARD ban (always fatal, independent of the demoted aggregate scanner
-    // below): no tracked file may leak the absolute MSI scratch path segment or
+    // below): no tracked file may leak the absolute cluster scratch path segment or
     // the SLURM batch directive keyword. Run first and exit(1) on any hit.
-    scan_for_msi_infra_leaks(&manifest_dir);
+    scan_for_cluster_infra_leaks(&manifest_dir);
 
     emit_python_penalty_manifest(&manifest_dir)
         .expect("failed to emit Python analytic-penalty manifest");
@@ -3371,26 +3371,26 @@ fn collect_repo_files(root: &Path) -> &'static [PathBuf] {
         .as_slice()
 }
 
-/// The two MSI/SLURM infra leak needles, assembled from fragments so this
+/// The two cluster/SLURM infra leak needles, assembled from fragments so this
 /// file's own source text never contains either banned string verbatim (the
-/// scanner would otherwise flag itself). `needle_a` = the absolute MSI scratch
+/// scanner would otherwise flag itself). `needle_a` = the absolute cluster scratch
 /// path segment; `needle_b` = the SLURM batch directive keyword.
-fn msi_leak_needles() -> [String; 2] {
+fn cluster_leak_needles() -> [String; 2] {
     let needle_a = format!("projects{}standard", "/");
     let needle_b = format!("{}BATCH", "S");
     [needle_a, needle_b]
 }
 
 /// HARD-FAIL ban: no git-tracked file (source OR not) may contain the absolute
-/// MSI scratch path segment or the SLURM batch directive keyword. These are
+/// cluster scratch path segment or the SLURM batch directive keyword. These are
 /// cluster-local infra leaks (absolute compute-node paths + SLURM job
-/// directives) that must never be committed — MSI/sbatch scripts live under
+/// directives) that must never be committed — cluster/sbatch scripts live under
 /// /Users/user/, not in the repo. Scans only tracked text files (from the git
 /// index), skips binaries, and fails the build naming every offender. This is
 /// a separate, always-fatal gate — independent of the demoted aggregate
 /// ban-scanner below — so the leak can never ship.
-fn scan_for_msi_infra_leaks(root: &Path) {
-    let needles = msi_leak_needles();
+fn scan_for_cluster_infra_leaks(root: &Path) {
+    let needles = cluster_leak_needles();
     let mut offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     for rel in collect_repo_files(root) {
         let path = root.join(rel);
@@ -3417,9 +3417,9 @@ fn scan_for_msi_infra_leaks(root: &Path) {
         return;
     }
     eprintln!(
-        "\n=== BANNED MSI/SLURM INFRA LEAK in tracked file(s) ===\n\
-         No tracked file may contain the absolute MSI scratch path segment or the \
-         SLURM batch directive keyword. These are cluster-local infra leaks; MSI/sbatch \
+        "\n=== BANNED cluster/SLURM INFRA LEAK in tracked file(s) ===\n\
+         No tracked file may contain the absolute cluster scratch path segment or the \
+         SLURM batch directive keyword. These are cluster-local infra leaks; cluster/sbatch \
          scripts belong under /Users/user/, not in the repo. Offenders:"
     );
     for (rel, lineno, needle) in &offenders {
@@ -3430,7 +3430,7 @@ fn scan_for_msi_infra_leaks(root: &Path) {
             needle
         );
         println!(
-            "cargo:warning=banned MSI/SLURM infra leak: {}:{} contains `{}`",
+            "cargo:warning=banned cluster/SLURM infra leak: {}:{} contains `{}`",
             rel.display(),
             lineno,
             needle

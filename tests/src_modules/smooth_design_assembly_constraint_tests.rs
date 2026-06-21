@@ -4643,7 +4643,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
 /// while re-keying the Gram `XᵀWX(ψ)` and penalty `S(ψ)` to the trial ψ. The
 /// streamed slow path re-realizes and RE-PIVOTS the radial-kernel design, so it
 /// forms its solve in a fresh reduced basis. Conditioning-ratio and Gram-derived
-/// RRQR rank/permutation gates were both insufficient on MSI. The fix is the
+/// RRQR rank/permutation gates were both insufficient on the cluster. The fix is the
 /// gauge-invariant range-PROJECTOR witness `reduced_basis_equal(ψ_ref, ψ_new)`,
 /// keyed to the pinning ψ recorded at the last slow-path reset: the skip fires
 /// only where the frozen reduced basis is provably still valid, so production
@@ -4814,7 +4814,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     // ψ_B: a small move off the pin. On this standardized production Duchon
     // geometry the radial-kernel reduced basis is volatile enough that even this
     // tiny step rotates it — the restored `reduced_basis_equal` precondition
-    // REFUSES the skip at runtime (skip_b=false, MSI-confirmed), so ψ_B too routes
+    // REFUSES the skip at runtime (skip_b=false, cluster-confirmed), so ψ_B too routes
     // to the exact β̂-sound slow path. The test asserts fast-path engagement TRACKS
     // the `covers_skip` verdict (`(reset==0)==skip`) and that β̂ matches the
     // streamed exact solve to < 1e-6 on whichever path runs — so it is correct
@@ -5064,7 +5064,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
 /// The production κ skip is gated on `reduced_basis_equal(psi_ref, psi)` (#1264),
 /// which REFUSES across the near-singular radial Gram's basis rotation — so the
 /// skip never fires on production iso-1D Duchon geometry and the κ loop stays
-/// O(n) (MSI job 11336439: per-callback cost 45× across 256× n). Whether that
+/// O(n) (cluster job 11336439: per-callback cost 45× across 256× n). Whether that
 /// gate is FUNDAMENTAL or merely OVER-CONSERVATIVE depends on a quantity the
 /// existing tests never measure directly: with the deep 513-node tensor, how big
 /// is the frozen-Qs re-key β̂ error when the skip is FORCED across the rotation?

@@ -2706,7 +2706,7 @@ impl<'d> SpatialJointContext<'d> {
                     // vs streamed exact). When the trial-ψ basis differs from the
                     // reference surface's, the κ-amplified round-off moves β̂ by
                     // ~1.7e-5 — 17× the issue's 1e-6 bar — EVEN at a ψ the n-free
-                    // VALUE window admits (MSI: β̂rel=1.749e-5 at ψ=2.803). The
+                    // VALUE window admits (cluster: β̂rel=1.749e-5 at ψ=2.803). The
                     // "stale-penalty-not-stale-basis" theory that dropped this gate
                     // was empirically refuted. So the skip is β̂-sound ONLY where the
                     // gauge-invariant range projector is unchanged vs the pinning ψ:
@@ -2906,7 +2906,7 @@ impl<'d> SpatialJointContext<'d> {
                     // #1264 (RESTORED): the value-only line-search probe runs the
                     // SAME conditioned-basis Gaussian solve, so it ships the same
                     // κ-amplified interpolated-Gram β̂ error across a basis rotation
-                    // (MSI: β̂rel≈1.7e-5 ≫ 1e-6). The probe is β̂-sound only where the
+                    // (cluster: β̂rel≈1.7e-5 ≫ 1e-6). The probe is β̂-sound only where the
                     // reduced basis is provably unchanged vs the pinning ψ, exactly
                     // as the eval_full gate. See the eval_full gate for the full
                     // justification; the dropped-precondition "stale-penalty" theory

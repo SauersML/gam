@@ -555,7 +555,7 @@ impl PsiGramTensor {
     /// reduced basis — the range / null split of the conditioned data Gram — is
     /// unchanged. A conditioning-ratio or RRQR rank/permutation gate only bounds
     /// NECESSARY conditions; the reduced SUBSPACE can still rotate while rank and
-    /// pivot order look tame, which is exactly the ~7.8e-2 β̂ regression an MSI run
+    /// pivot order look tame, which is exactly the ~7.8e-2 β̂ regression a cluster run
     /// found. This witness compares the orthogonal RANGE PROJECTORS of the
     /// conditioned Gram at `psi_ref` and `psi_new` (both assembled n-free from the
     /// tensor): the skip is sound only when the numerical ranks match AND the

@@ -2014,7 +2014,7 @@ pub(crate) fn co_collapse_reseed_rotation_explores_distinct_subspaces() {
 /// the collapse basin between runs. Pin that repeated calls on identical input
 /// are bit-identical under the process-default (global Rayon) faer backend, so
 /// the now-rotated multi-start is a fixed pass rather than a coin-flip. (The
-/// cross-thread-count arm is exercised on MSI via RAYON_NUM_THREADS; faer's
+/// cross-thread-count arm is exercised on the cluster via RAYON_NUM_THREADS; faer's
 /// blocked factorizations keep a fixed per-element reduction order, so the
 /// global-state-mutating Seq/Par toggle is deliberately NOT done here — it would
 /// race the rest of the suite's parallel tests.)
@@ -10938,7 +10938,7 @@ mod inner_contract_probe_tests {
     /// — co-adapting the dictionary + λ toward a faithfully-invertible encode can
     /// only help recovery, never regress it.
     ///
-    /// HONEST STATE (#1154, verified MSI job 11151242, 2026-06-17): this guarantee
+    /// HONEST STATE (#1154, verified cluster job 11151242, 2026-06-17): this guarantee
     /// is NOT currently demonstrable on a unit-amplitude held-out encode, and the
     /// test is `#[ignore]`d with the root cause rather than gamed.
     ///
