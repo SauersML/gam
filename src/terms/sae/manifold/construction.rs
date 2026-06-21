@@ -1,5 +1,85 @@
 use super::*;
 
+/// Typed error from the SAE outer-gradient analytic assembly path (#1436).
+///
+/// The `eval()` fallback to `central_difference_outer_gradient` (#1273) must
+/// fire ONLY for the genuine conditioning/identifiability failure modes it
+/// was designed for — a near-singular-but-valid joint Hessian or a gauge-
+/// degenerate direction. Shape/indexing bugs, non-finite intermediates, and
+/// violated internal invariants are [`OuterGradientError::InternalInvariant`]
+/// and MUST propagate as hard errors so regressions surface instead of being
+/// silently masked by an FD descent direction.
+#[derive(Clone, Debug)]
+pub(crate) enum OuterGradientError {
+    /// Expected: near-singular or ill-conditioned joint Hessian at a feasible ρ
+    /// (the genuine #1273 flat-valley case). Eligible for the FD fallback.
+    IllConditioned { reason: String },
+    /// Expected: a non-identifiable / gauge-degenerate direction at this ρ.
+    /// Eligible for the FD fallback.
+    NonIdentifiable { reason: String },
+    /// Unexpected: shape/dimension mismatch, non-finite intermediate, or a
+    /// violated internal invariant. MUST propagate — never fall back to FD.
+    InternalInvariant { reason: String },
+}
+
+impl OuterGradientError {
+    /// Whether this error class is eligible for the #1273 FD fallback (i.e. it
+    /// represents a legitimate conditioning/identifiability failure, not a
+    /// programming/invariant defect).
+    pub(crate) fn is_fd_eligible(&self) -> bool {
+        matches!(
+            self,
+            Self::IllConditioned { .. } | Self::NonIdentifiable { .. }
+        )
+    }
+
+    /// Construct an [`OuterGradientError::InternalInvariant`] from any error
+    /// displayable — the default classification for unexpected assembly failures
+    /// (shape mismatches, non-finite intermediates, violated invariants).
+    pub(crate) fn internal<E: std::fmt::Display>(err: E) -> Self {
+        Self::InternalInvariant {
+            reason: err.to_string(),
+        }
+    }
+
+    /// The exact gate the gradient lane (`SaeManifoldOuterObjective::eval`) uses
+    /// to decide whether to descend with the #1273 central-difference fallback
+    /// instead of propagating the error as a hard failure.
+    ///
+    /// The fallback is admissible ONLY when BOTH hold:
+    /// * the REML cost at this rho is finite (a genuinely feasible point -- the
+    ///   FD supplies a descent direction for a value the analytic path already
+    ///   produced), and
+    /// * the error is a legitimate conditioning/identifiability failure
+    ///   ([`Self::is_fd_eligible`]) -- the genuine #1273 flat-valley case.
+    ///
+    /// A non-finite cost or an [`OuterGradientError::InternalInvariant`] must
+    /// propagate: masking a shape/indexing bug, a non-finite intermediate, or a
+    /// violated invariant behind a plausible-but-wrong FD step is exactly the
+    /// regression #1436 closes. Centralising the decision here (rather than
+    /// inlining the boolean at the call site) makes the `cost x error-class`
+    /// contract a single, directly unit-testable predicate.
+    pub(crate) fn admits_fd_fallback(&self, cost: f64) -> bool {
+        cost.is_finite() && self.is_fd_eligible()
+    }
+}
+
+impl std::fmt::Display for OuterGradientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IllConditioned { reason } => write!(f, "ill-conditioned: {reason}"),
+            Self::NonIdentifiable { reason } => write!(f, "non-identifiable: {reason}"),
+            Self::InternalInvariant { reason } => write!(f, "internal invariant: {reason}"),
+        }
+    }
+}
+
+impl From<OuterGradientError> for String {
+    fn from(e: OuterGradientError) -> String {
+        e.to_string()
+    }
+}
+
 /// Active-set layout override for [`SaeManifoldTerm::assemble_arrow_schur_inner`].
 ///
 /// `None` is the production path: the layout is derived from the assignment mode
@@ -6098,7 +6178,7 @@ impl SaeManifoldTerm {
         &'a self,
         cache: &'a ArrowFactorCache,
         penalized_gram_scale: f64,
-    ) -> Result<DeflatedArrowSolver<'a>, String> {
+    ) -> Result<DeflatedArrowSolver<'a>, OuterGradientError> {
         let Err(conditioning_err) = Self::outer_gradient_conditioning_error(cache) else {
             return Ok(DeflatedArrowSolver::plain(cache));
         };
@@ -6111,7 +6191,10 @@ impl SaeManifoldTerm {
 
         let full_len = cache.delta_t_len() + cache.k;
         let mut raw_gauges = Vec::new();
-        for gauge in self.dense_step_gauge_vectors()? {
+        for gauge in self
+            .dense_step_gauge_vectors()
+            .map_err(OuterGradientError::internal)?
+        {
             if gauge.len() != full_len {
                 continue;
             }
@@ -6137,7 +6220,10 @@ impl SaeManifoldTerm {
         // Gram-Schmidt + Rayleigh + Faddeev-Popov path below; the Rayleigh
         // floor still keeps only genuinely flat (sub-floor) directions, so a
         // well-conditioned decoder is unaffected.
-        for dir in self.decoder_beta_null_directions(penalized_gram_scale)? {
+        for dir in self
+            .decoder_beta_null_directions(penalized_gram_scale)
+            .map_err(OuterGradientError::internal)?
+        {
             if dir.len() == full_len {
                 raw_gauges.push(dir);
             }
@@ -6151,7 +6237,10 @@ impl SaeManifoldTerm {
         // candidate the outer gate had nothing to deflate it with and rejected
         // the trial ρ. The Rayleigh floor below still prunes any candidate that
         // is not genuinely flat against the cached Hessian.
-        for dir in self.decoder_channel_null_directions()? {
+        for dir in self
+            .decoder_channel_null_directions()
+            .map_err(OuterGradientError::internal)?
+        {
             if dir.len() == full_len {
                 raw_gauges.push(dir);
             }
@@ -6278,21 +6367,19 @@ impl SaeManifoldTerm {
 
     pub(crate) fn outer_gradient_conditioning_error(
         cache: &ArrowFactorCache,
-    ) -> Result<(), String> {
+    ) -> Result<(), OuterGradientError> {
         let pivot = arrow_factor_min_pivot(cache);
         let Some(min_pivot) = pivot.min_pivot else {
-            return Err(
-                "analytic outer gradient undefined at this rho: joint Hessian numerically \
-                 singular (no cached Cholesky pivots)"
+            return Err(OuterGradientError::IllConditioned {
+                reason: "joint Hessian numerically singular (no cached Cholesky pivots)"
                     .to_string(),
-            );
+            });
         };
         let Some(max_pivot) = arrow_factor_max_pivot(cache) else {
-            return Err(
-                "analytic outer gradient undefined at this rho: joint Hessian numerically \
-                 singular (no cached Cholesky pivot scale)"
+            return Err(OuterGradientError::IllConditioned {
+                reason: "joint Hessian numerically singular (no cached Cholesky pivot scale)"
                     .to_string(),
-            );
+            });
         };
         let ratio = min_pivot / max_pivot;
         if min_pivot.is_finite()
@@ -6303,12 +6390,12 @@ impl SaeManifoldTerm {
         {
             return Ok(());
         }
-        Err(format!(
-            "analytic outer gradient undefined at this rho: joint Hessian numerically singular \
-             (min/max pivot ratio {ratio:.3e} < floor {floor:.3e}; min pivot {min_pivot:.3e}, \
-             max pivot {max_pivot:.3e})",
-            floor = SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR,
-        ))
+        Err(OuterGradientError::IllConditioned {
+            reason: format!(
+                "joint Hessian numerically singular (min/max pivot ratio {ratio:.3e} < floor {floor:.3e}; min pivot {min_pivot:.3e}, max pivot {max_pivot:.3e})",
+                floor = SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR,
+            ),
+        })
     }
 
     /// Smoothing-penalty Occam normalizer `−½ Σ_k r_k·rank(S_k)·log λ_smooth`
@@ -8552,7 +8639,7 @@ impl SaeManifoldTerm {
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
-    ) -> Result<SaeOuterRhoGradientComponents, String> {
+    ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
         let n_params = rho.to_flat().len();
         let mut explicit = Array1::<f64>::zeros(n_params);
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
@@ -8560,7 +8647,9 @@ impl SaeManifoldTerm {
         let mut third_order_correction = Array1::<f64>::zeros(n_params);
 
         explicit[0] = assignment_prior_log_strength_derivative(&self.assignment, rho)
-            + self.learnable_ibp_forward_alpha_data_derivative(rho, target)?;
+            + self
+                .learnable_ibp_forward_alpha_data_derivative(rho, target)
+                .map_err(OuterGradientError::internal)?;
         // #1417: the FULL `½ tr(H⁻¹ ∂H/∂logα)` for the assignment coordinate.
         // For LEARNABLE IBP alpha the forward assignments `a_ik = σ(ℓ/τ)·π_k(α)`
         // carry an explicit α-dependence (`∂logπ_k/∂logα = k/(α+1)`), so BOTH the
@@ -8571,20 +8660,32 @@ impl SaeManifoldTerm {
         //             exact `(k_a+k_b)/(α+1)` block-scaling identity.
         // For FIXED alpha (and non-IBP modes) the data term is identically zero,
         // so the fixed-alpha gradient is unchanged and exact.
-        logdet_trace[0] = self.assignment_log_strength_hessian_trace(rho, cache, solver)?
-            + self.learnable_ibp_data_logdet_alpha_trace(rho, cache, solver)?;
+        logdet_trace[0] = self
+            .assignment_log_strength_hessian_trace(rho, cache, solver)
+            .map_err(OuterGradientError::internal)?
+            + self
+                .learnable_ibp_data_logdet_alpha_trace(rho, cache, solver)
+                .map_err(OuterGradientError::internal)?;
 
         explicit[1] = loss.smoothness;
         logdet_trace[1] = 0.5
             * self
                 .decoder_smoothness_effective_dof_with_solver(cache, solver, rho.lambda_smooth())
-                .map_err(|err| format!("analytic_outer_rho_gradient_components: {err}"))?;
-        occam[1] = -self.reml_occam_log_lambda_smooth_derivative()?;
+                .map_err(|err| OuterGradientError::InternalInvariant {
+                    reason: format!("analytic_outer_rho_gradient_components: {err}"),
+                })?;
+        occam[1] = -self
+            .reml_occam_log_lambda_smooth_derivative()
+            .map_err(OuterGradientError::internal)?;
 
-        let ard_explicit = self.ard_log_precision_explicit_derivatives(rho)?;
+        let ard_explicit = self
+            .ard_log_precision_explicit_derivatives(rho)
+            .map_err(OuterGradientError::internal)?;
         let ard_trace = self
             .ard_log_precision_hessian_trace(rho, cache, solver)
-            .map_err(|err| format!("analytic_outer_rho_gradient_components: {err}"))?;
+            .map_err(|err| OuterGradientError::InternalInvariant {
+                reason: format!("analytic_outer_rho_gradient_components: {err}"),
+            })?;
         let mut cursor = 2usize;
         for k in 0..rho.log_ard.len() {
             for axis in 0..rho.log_ard[k].len() {
@@ -8594,7 +8695,9 @@ impl SaeManifoldTerm {
             }
         }
 
-        let gamma = self.logdet_theta_adjoint(rho, cache, solver)?;
+        let gamma = self
+            .logdet_theta_adjoint(rho, cache, solver)
+            .map_err(OuterGradientError::internal)?;
         // #1418: the implicit-function correction is `−½·Γᵀ·θ̂_ρ` with
         // `θ̂_ρ = −A⁻¹ g_ρ`, where `A = ∇²_θθ L` is the EXACT stationarity
         // Jacobian of the inner fit — data residual curvature, exact softmax
@@ -8607,8 +8710,12 @@ impl SaeManifoldTerm {
         // `ΔC = apply_exact_hessian_minus_b`), so the correction is no longer
         // biased by `(B⁻¹ − A⁻¹)`.
         for coord in 0..n_params {
-            let rhs = self.outer_rho_gradient_ift_rhs(rho, target, coord, cache)?;
-            let solved = self.solve_exact_stationarity(rho, target, cache, solver, &rhs)?;
+            let rhs = self
+                .outer_rho_gradient_ift_rhs(rho, target, coord, cache)
+                .map_err(OuterGradientError::internal)?;
+            let solved = self
+                .solve_exact_stationarity(rho, target, cache, solver, &rhs)
+                .map_err(OuterGradientError::internal)?;
             let mut dot = 0.0_f64;
             for idx in 0..gamma.t.len() {
                 dot += gamma.t[idx] * solved.t[idx];
@@ -8641,6 +8748,7 @@ impl SaeManifoldTerm {
     ) -> Result<SaeOuterRhoGradientComponents, String> {
         let solver = self.outer_gradient_arrow_solver(cache, rho.lambda_smooth())?;
         self.analytic_outer_rho_gradient_components(target, rho, loss, cache, &solver)
+            .map_err(|e| e.to_string())
     }
 
     /// Compose the SAE LAML criterion as a sum of atoms (#931 SAE pilot).

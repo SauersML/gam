@@ -740,8 +740,8 @@ fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
 
     let info = String::from_utf8_lossy(&output.stdout);
     let info = info.trim();
-    let is_claude = info.to_lowercase().contains("claude")
-        || info.to_lowercase().contains("anthropic");
+    let is_claude =
+        info.to_lowercase().contains("claude") || info.to_lowercase().contains("anthropic");
 
     if is_claude {
         panic!(

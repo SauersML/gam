@@ -27,9 +27,7 @@
 use faer::Side;
 use gam::estimate::{FitOptions, fit_gam};
 use gam::faer_ndarray::FaerCholesky;
-use gam::inference::full_conformal::{
-    ExactFullConformalSubstrate, bernoulli_full_conformal,
-};
+use gam::inference::full_conformal::{ExactFullConformalSubstrate, bernoulli_full_conformal};
 use gam::matrix::DesignMatrix;
 use gam::predict::{
     ConformalCalibrationFold, PredictInput, PredictUncertaintyOptions, StandardPredictor,

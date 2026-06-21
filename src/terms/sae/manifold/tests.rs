@@ -7650,12 +7650,12 @@ pub(crate) fn outer_gradient_solver_rejects_near_singular_cache_without_matching
         .term
         .outer_gradient_arrow_solver(&cache, obj.current_rho.lambda_smooth())
     {
-        Err(err) => err,
+        Err(err) => err.to_string(),
         Ok(..) => panic!("near-singular evidence factor without a matching gauge must reject"),
     };
     assert!(
-        err.contains("analytic outer gradient undefined at this rho"),
-        "guard error must name the undefined analytic-gradient condition; got: {err}"
+        err.contains("joint Hessian numerically singular"),
+        "guard error must name the ill-conditioned joint Hessian; got: {err}"
     );
     assert!(
         err.contains("min/max pivot ratio") && err.contains("floor"),
@@ -7967,6 +7967,95 @@ pub(crate) fn central_difference_outer_gradient_is_deterministic_under_per_probe
         "#1273 per-probe isolation: repeated FD outer-gradient evaluations must be \
          identical (no shared &mut state between probes); got {g1:?} vs {g2:?}"
     );
+}
+
+/// #1436 — `OuterGradientError::InternalInvariant` must never be FD-eligible,
+/// so an internal-invariant failure propagates as a hard error instead of being
+/// silently masked by a finite-difference descent direction. This is the core
+/// acceptance criterion: shape/indexing bugs, non-finite intermediates, and
+/// violated invariants surface as failures, not plausible-but-wrong FD steps.
+#[test]
+pub(crate) fn outer_gradient_internal_invariant_is_not_fd_eligible_1436() {
+    let ill_conditioned = OuterGradientError::IllConditioned {
+        reason: "near-singular joint Hessian".to_string(),
+    };
+    let non_identifiable = OuterGradientError::NonIdentifiable {
+        reason: "gauge-degenerate direction".to_string(),
+    };
+    let internal = OuterGradientError::InternalInvariant {
+        reason: "shape mismatch".to_string(),
+    };
+    assert!(
+        ill_conditioned.is_fd_eligible(),
+        "IllConditioned must be FD-eligible (#1273)"
+    );
+    assert!(
+        non_identifiable.is_fd_eligible(),
+        "NonIdentifiable must be FD-eligible (#1273)"
+    );
+    assert!(
+        !internal.is_fd_eligible(),
+        "InternalInvariant must NOT be FD-eligible (#1436) — it must propagate"
+    );
+    // The Display output must be descriptive enough for the outer log.
+    assert!(
+        internal.to_string().contains("internal invariant"),
+        "InternalInvariant Display must name the class; got: {}",
+        internal
+    );
+}
+
+/// #1436 — exercise the EXACT gate `SaeManifoldOuterObjective::eval` consults,
+/// `OuterGradientError::admits_fd_fallback`, over the full `cost x error-class`
+/// matrix. `is_fd_eligible` alone does not capture the cost interaction the call
+/// site depends on; this pins the composed contract so the FD fallback can never
+/// silently absorb an internal-invariant failure NOR fire at an infeasible
+/// (non-finite-cost) ρ — both must propagate as hard errors.
+#[test]
+pub(crate) fn admits_fd_fallback_only_for_conditioning_at_finite_cost_1436() {
+    let ill = OuterGradientError::IllConditioned {
+        reason: "near-singular joint Hessian".to_string(),
+    };
+    let non_id = OuterGradientError::NonIdentifiable {
+        reason: "gauge-degenerate direction".to_string(),
+    };
+    let internal = OuterGradientError::InternalInvariant {
+        reason: "shape mismatch".to_string(),
+    };
+
+    // Finite cost: only the genuine #1273 conditioning/identifiability classes
+    // admit the FD descent direction.
+    assert!(
+        ill.admits_fd_fallback(1.0),
+        "IllConditioned at a finite-cost ρ must admit the #1273 FD fallback"
+    );
+    assert!(
+        non_id.admits_fd_fallback(1.0),
+        "NonIdentifiable at a finite-cost ρ must admit the #1273 FD fallback"
+    );
+    assert!(
+        !internal.admits_fd_fallback(1.0),
+        "InternalInvariant must NEVER admit the FD fallback, even at a finite \
+         cost (#1436) — it must propagate as a hard error"
+    );
+
+    // Non-finite cost (infeasible point): NOTHING admits FD, not even an
+    // otherwise-eligible conditioning failure — there is no feasible value path
+    // to descend.
+    for bad_cost in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+        assert!(
+            !ill.admits_fd_fallback(bad_cost),
+            "IllConditioned must NOT admit FD at non-finite cost {bad_cost}"
+        );
+        assert!(
+            !non_id.admits_fd_fallback(bad_cost),
+            "NonIdentifiable must NOT admit FD at non-finite cost {bad_cost}"
+        );
+        assert!(
+            !internal.admits_fd_fallback(bad_cost),
+            "InternalInvariant must NOT admit FD at non-finite cost {bad_cost}"
+        );
+    }
 }
 
 #[test]
