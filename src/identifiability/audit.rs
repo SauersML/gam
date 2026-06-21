@@ -375,10 +375,10 @@ pub fn bias_shift_for_pair(z_a: Option<&[f64]>, z_b: Option<&[f64]>, s2_a: f64, 
 /// lists every original joint-column index, ACCEPTED (kept) columns first in
 /// the order they were pivoted, then DEMOTED columns; `rank` is the count of
 /// accepted columns; `rank_tol` is the absolute pivot tolerance.
-struct PriorityTieredRank {
-    rank: usize,
-    column_permutation: Vec<usize>,
-    rank_tol: f64,
+pub(crate) struct PriorityTieredRank {
+    pub(crate) rank: usize,
+    pub(crate) column_permutation: Vec<usize>,
+    pub(crate) rank_tol: f64,
 }
 
 /// Rank-revealing factorization of a joint design's Gram `G = JᵀJ (+ SᵀS)` that
@@ -418,7 +418,7 @@ struct PriorityTieredRank {
 /// tolerance matches the tall/`gram` RRQR paths exactly:
 /// `rank_alpha · ε · max(m_rows, p) · max(√d_max⁰, 1)` where `√d_max⁰` is the
 /// largest initial residual norm (= leading pivot magnitude `|R[0,0]|`).
-fn priority_tiered_rank_from_gram(
+pub(crate) fn priority_tiered_rank_from_gram(
     gram: &Array2<f64>,
     col_priority: &[u8],
     m_rows: usize,
@@ -2799,7 +2799,7 @@ fn locate_block_column(
 /// penalty returns `None`, so its augmented design is just `J` — the gate then
 /// reduces EXACTLY to the historical raw-design rank check, leaving every
 /// unpenalized block/family's verdict unchanged.
-fn block_structural_penalty_dense(spec: &ParameterBlockSpec) -> Option<Array2<f64>> {
+pub(crate) fn block_structural_penalty_dense(spec: &ParameterBlockSpec) -> Option<Array2<f64>> {
     let p = spec.design.ncols();
     if p == 0 || spec.penalties.is_empty() {
         return None;

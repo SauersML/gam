@@ -51,12 +51,13 @@ use crate::families::custom_family::{
 };
 use crate::identifiability::audit::{
     IdentifiabilityAudit, audit_identifiability, audit_identifiability_channel_aware,
+    block_structural_penalty_dense, priority_tiered_rank_from_gram,
 };
 use crate::identifiability::families::compiler::{
     IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
 };
 use crate::linalg::faer_ndarray::{
-    FaerEigh, default_rrqr_rank_alpha, fast_ata, rrqr_with_permutation,
+    FaerEigh, default_rrqr_rank_alpha, fast_ata, fast_atb, rrqr_with_permutation,
 };
 use crate::linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use crate::solver::gauge::Gauge;
@@ -458,29 +459,92 @@ fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize) -> usize {
     evals.iter().filter(|&&l| l > tau).count()
 }
 
-/// Numerical rank of `j` under the σ-space column-pivoted RRQR convention — the
-/// EXACT metric the FLAT identifiability audit (`audit_identifiability`) uses to
-/// decide which joint columns to demote. The flat audit pivots the joint design
-/// with `rrqr_with_permutation` at `default_rrqr_rank_alpha()` and cuts the rank
-/// where the pivot diagonal falls past its relative tolerance; ranking `J_pre`
-/// and `J_can` here with the same routine and the same `alpha` reproduces that
-/// verdict bit-for-bit (the rank depends only on the column geometry). The
-/// post-T invariant must rank under whichever convention CHOSE the drops, and
-/// for the flat path that is this σ-space RRQR — NOT the σ²-Gram eigenspace of
-/// [`audit_convention_rank`], whose cutoff is ~6 orders of magnitude more
-/// lenient and therefore counts near-separable directions the RRQR legitimately
-/// demoted (gam#1391).
-fn flat_audit_convention_rank(j: &Array2<f64>) -> usize {
-    if j.ncols() == 0 || j.nrows() == 0 {
+/// Per-block descriptor for the penalty-augmented priority-tiered rank: the
+/// block's column WIDTH in the joint design, its structural penalty `S` (dense,
+/// `width × width`, `None` when unpenalised), and its `gauge_priority`.
+struct FlatRankBlock {
+    width: usize,
+    structural_penalty: Option<Array2<f64>>,
+    priority: u8,
+}
+
+/// Numerical rank of the joint design `j` under the EXACT convention the FLAT
+/// identifiability audit (`audit_identifiability`) uses to decide which joint
+/// columns to demote.
+///
+/// The flat audit does NOT rank the bare design with a plain column-pivoted RRQR.
+/// It ranks the PENALTY-AUGMENTED joint design `[X_joint; S_blockdiag]` via a
+/// GAUGE-PRIORITY-TIERED pivoted Cholesky on its Gram
+/// `Gₐ = JᵀJ + Σ_block SᵀS` (`priority_tiered_rank_from_gram` on
+/// `joint_gram_aug`). Two ingredients of that convention were missing from the
+/// earlier #1391 fix, which re-ranked the bare `J` with `rrqr_with_permutation`:
+///
+///   • PENALTY AUGMENTATION. For penalized (P-spline / PS) bases the structural
+///     penalty `S` annihilates the smooth's affine null space, so the audit's
+///     `JᵀJ + SᵀS` rank can differ from `rank(J)`. A direction that is
+///     data-full-rank but penalty-null — e.g. a constant shared between a GAMLSS
+///     mu-PS and sigma-PS block — is counted by the bare RRQR yet is exactly the
+///     kind of direction the augmented, priority-tiered audit demotes from the
+///     lower-priority block. The bare RRQR therefore over-counted `rank(J_pre)`,
+///     so a faithful column-selection `T` reported `rank(J_pre) > rank(J_can)`
+///     and tripped a false invariant violation (GAMLSS-PS, gam#1391; survival
+///     marginal-slope, gam#1388).
+///   • PRIORITY TIERING. The audit demotes the alias from the LOWER-priority
+///     block; a norm-pivoted RRQR ignores priority and can keep/drop a different
+///     column, so its rank verdict need not match the audit's drop set.
+///
+/// The post-T invariant ranks the REDUCED design `J_can` with this convention
+/// and certifies it is FULL column rank (`== p_red`): a faithful
+/// column-selection `T` (which removes exactly the audit-demoted columns) leaves
+/// the kept columns independent under this metric, while a defective `T` that
+/// drops a column the audit kept makes `J_can` rank-deficient and is caught.
+fn flat_audit_convention_rank(j: &Array2<f64>, blocks: &[FlatRankBlock]) -> usize {
+    let p = j.ncols();
+    if p == 0 || j.nrows() == 0 {
         return 0;
     }
-    match rrqr_with_permutation(j, default_rrqr_rank_alpha()) {
-        Ok(rrqr) => rrqr.rank,
-        // RRQR failure: fall back to the structural column count (no demotion),
-        // so a numerical hiccup never manufactures a spurious invariant
-        // violation.
-        Err(_) => j.ncols(),
+    // Sum of declared block widths must cover the design columns; if the layout
+    // is inconsistent, fall back to the bare RRQR rank (no spurious demotion).
+    let declared: usize = blocks.iter().map(|b| b.width).sum();
+    if declared != p {
+        return match rrqr_with_permutation(j, default_rrqr_rank_alpha()) {
+            Ok(rrqr) => rrqr.rank,
+            Err(_) => p,
+        };
     }
+
+    // Gram G = JᵀJ (p × p), the same column inner products the audit's
+    // priority-tiered pivoted Cholesky consumes.
+    let mut gram = fast_ata(j);
+
+    // Augment block-diagonally with each block's SᵀS, exactly as
+    // `audit_identifiability` builds `joint_gram_aug`. `n_penalty_rows` mirrors
+    // the audit's tall row count for the tolerance scaling.
+    let mut col_off = 0usize;
+    let mut n_penalty_rows = 0usize;
+    let mut col_priority: Vec<u8> = Vec::with_capacity(p);
+    for b in blocks {
+        for _ in 0..b.width {
+            col_priority.push(b.priority);
+        }
+        if let Some(s) = b.structural_penalty.as_ref() {
+            if s.nrows() == b.width && s.ncols() == b.width && b.width > 0 {
+                let sts = fast_atb(s, s);
+                let mut sub = gram.slice_mut(ndarray::s![
+                    col_off..col_off + b.width,
+                    col_off..col_off + b.width
+                ]);
+                sub += &sts;
+                n_penalty_rows += b.width;
+            }
+        }
+        col_off += b.width;
+    }
+
+    let m_rows = j.nrows() + n_penalty_rows;
+    let tiered =
+        priority_tiered_rank_from_gram(&gram, &col_priority, m_rows, default_rrqr_rank_alpha());
+    tiered.rank
 }
 
 fn canonicalize_for_identifiability_inner(
@@ -1135,68 +1199,95 @@ fn canonicalize_for_identifiability_inner(
                 red_col_off += r_i;
             }
 
-            // Rank J_pre and J_can under the SAME convention that DECIDED the
-            // column drops — the only way the strict invariant `rank(J_pre) ==
-            // rank(J_can)` is meaningful (gam#1391/#1388, mirroring how gam#1220
-            // aligned the channel-aware path):
+            // ── Post-T rank invariant, ANCHORED to the audit certificate ──────
             //
-            //   • CHANNEL-AWARE path — the drops come from the σ²-Gram positive
-            //     eigenspace (`keep_positive_eigenspace`), so we rank with the
-            //     matching σ²-Gram metric (`audit_convention_rank`).
-            //   • FLAT path — the drops come from a σ-space column-pivoted RRQR,
-            //     whose relative cutoff is ~6 orders of magnitude STRICTER than
-            //     the σ²-Gram one. Ranking the flat path with `audit_convention_
-            //     rank` counted near-separable directions the RRQR legitimately
-            //     demoted, so a perfectly faithful column-selection `T` reported
-            //     `rank(J_pre) > rank(J_can)` and tripped a false invariant
-            //     violation (GAMLSS-PS, survival-marginal-slope). Rank it with
-            //     `flat_audit_convention_rank` (the same RRQR + alpha the flat
-            //     audit used) so the two ranks are taken in the drops' own metric.
+            // What the invariant must certify: the column-selection `T` did not
+            // drop a direction the audit deemed identifiable. The audit already
+            // produced its verdict — `audit_kept_rank`, the joint rank it kept
+            // (= sum of per-block `effective_dim`). By construction every dropped
+            // column comes from `audit.dropped_columns`, so the surviving columns
+            // ARE exactly the audit's kept basis and `p_total_red ==
+            // audit_kept_rank`. The faithful-`T` certificate is therefore simply
+            // that the REDUCED design `J_can` is FULL COLUMN RANK under the same
+            // convention that decided the drops:
+            //
+            //     rank_drop_convention(J_can) == p_total_red (== audit_kept_rank)
+            //
+            // A defective `T` that drops a genuinely identifiable direction, or
+            // leaves a redundant one, makes `J_can` rank-DEFICIENT and is caught.
+            //
+            // Why this replaces the earlier `rank(J_pre) == rank(J_can)` compare:
+            // the previous gate ranked the FULL-WIDTH `J_pre` (which still carries
+            // the about-to-be-dropped columns) and compared it to the reduced
+            // `J_can`. That only holds if the drop convention agrees the dropped
+            // columns are redundant — but the convention used in this gate is a
+            // PROXY for the audit's true drop rule, not the rule itself:
+            //
+            //   • CHANNEL-AWARE path — the audit drops via a SEQUENTIAL, per-block
+            //     RESIDUALISED σ²-Gram eigenspace walk (`keep_positive_eigenspace`
+            //     on each block's residual Gram after projecting out the cumulative
+            //     higher-priority anchor, in a structural + curvature two-pass).
+            //     `audit_convention_rank` instead does ONE eigendecomposition of
+            //     the joint `JᵀJ`. A direction that is residual-WEAK (absorbed by a
+            //     higher-priority anchor) but still carries mass in the joint Gram
+            //     is dropped by the walk yet COUNTED by the single joint
+            //     eigendecomposition — so `audit_convention_rank(J_pre)`
+            //     over-counted and a faithful `T` tripped a false `rank(J_pre) >
+            //     rank(J_can)` (GAMLSS-PS wine_gamair/wine_price_vs_temp, gam#1391).
+            //   • FLAT path — the audit drops via the PENALTY-AUGMENTED,
+            //     gauge-priority-tiered rank of `[X_joint; S_blockdiag]`; a bare
+            //     RRQR on the un-augmented `J_pre` over-counted penalty-null shared
+            //     directions (gam#1388/#1391).
+            //
+            // Anchoring to `J_can`'s full-rank certificate sidesteps `J_pre`'s
+            // over-count entirely while keeping the defective-`T` guarantee, and it
+            // uses ONE consistent convention applied to ONE matrix (`J_can`), so
+            // there is no cross-convention comparison left to disagree.
             //
             // `nk_scale` mirrors the audit's tolerance size term: r_map is the
             // (n·k)-stacked row count.
             let nk_scale = r_map;
-            let rank_under_drop_convention = |j: &Array2<f64>| -> usize {
-                if use_channel_aware {
-                    audit_convention_rank(j, nk_scale)
-                } else {
-                    flat_audit_convention_rank(j)
-                }
+            // Per-block descriptors for the flat path's penalty-augmented,
+            // priority-tiered rank of `J_can` — built from the REDUCED specs so
+            // each reduced design is augmented with its pulled-back structural
+            // penalty (VᵀSV) and the gauge priority that drove the audit's drops.
+            let flat_blocks_can: Vec<FlatRankBlock> = reduced_specs
+                .iter()
+                .map(|s| FlatRankBlock {
+                    width: s.design.ncols(),
+                    structural_penalty: block_structural_penalty_dense(s),
+                    priority: s.gauge_priority,
+                })
+                .collect();
+            let rank_j_can = if use_channel_aware {
+                audit_convention_rank(&j_can, nk_scale)
+            } else {
+                flat_audit_convention_rank(&j_can, &flat_blocks_can)
             };
-            let rank_j_pre = rank_under_drop_convention(&j_pre);
-            let rank_j_can = rank_under_drop_convention(&j_can);
 
-            // Threaded certificate from the audit itself (logged for diagnostics):
-            // the per-block `effective_dim` sums to the rank the drop convention
-            // kept, i.e. the audit's own joint_rank verdict — the quantity the
-            // strict invariant ultimately certifies `T` preserved.
+            // Threaded certificate from the audit itself: the per-block
+            // `effective_dim` sums to the rank the drop convention kept — the
+            // audit's own joint_rank verdict, which equals `p_total_red` for a
+            // column-selection `T`.
             let audit_kept_rank: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
 
             log::info!(
                 "[CANON] post-T invariant ({} convention): \
-                 rank(J)={rank_j_pre} rank(J_can)={rank_j_can} \
+                 rank(J_can)={rank_j_can} p_red={p_total_red} \
                  audit_kept_rank={audit_kept_rank} \
-                 (p_raw={p_total_raw} p_red={p_total_red} k={k})",
+                 (p_raw={p_total_raw} k={k})",
                 if use_channel_aware {
                     "σ²-Gram"
                 } else {
-                    "σ-space RRQR"
+                    "σ-space RRQR (penalty-augmented, priority-tiered)"
                 },
             );
 
-            // A faithful column-selection `T` removes only directions that the
-            // drop convention already deemed redundant, so the surviving columns
-            // span the SAME rank: `rank(J_pre) == rank(J_can)` in that metric.
-            // Crucially both sides are ranked by the IDENTICAL convention here,
-            // so the comparison is invariant to whatever absolute level that
-            // convention assigns (including any penalty-null directions it counts
-            // equally on both sides) — it isolates exactly the failure mode this
-            // gate guards against: a defective `T` that drops a direction the
-            // convention deemed identifiable, lowering `rank(J_can)` below
-            // `rank(J_pre)`. Comparing across two DIFFERENT conventions (σ²-Gram
-            // for J_pre, the σ-RRQR drop metric implicitly for J_can) was the
-            // gam#1391/#1388 false positive.
-            if rank_j_pre != rank_j_can {
+            // The faithful-`T` certificate: `J_can` is full column rank under the
+            // drop-deciding convention. A rank-deficient `J_can` means `T` dropped
+            // an identifiable direction (or left a redundant one) — a bug in `T`
+            // construction, NOT a benign reduction.
+            if rank_j_can != p_total_red {
                 let block_shapes: Vec<String> = per_block_transform
                     .iter()
                     .zip(specs.iter())
@@ -1205,15 +1296,15 @@ fn canonicalize_for_identifiability_inner(
                 return Err(CustomFamilyError::DimensionMismatch {
                     reason: format!(
                         "canonicalize_for_identifiability: post-T rank invariant violated — \
-                         under the drop-deciding {} convention rank(J)={rank_j_pre} but \
-                         rank(J_can)={rank_j_can} (audit_kept_rank={audit_kept_rank}, \
-                         p_red={p_total_red}, p_raw={p_total_raw}, k={k}); the column-selection \
-                         T dropped a direction the audit deemed identifiable — a bug in T \
-                         construction; per-block T shapes: [{}]",
+                         under the drop-deciding {} convention the reduced design J_can is \
+                         rank-deficient: rank(J_can)={rank_j_can} but p_red={p_total_red} \
+                         (audit_kept_rank={audit_kept_rank}, p_raw={p_total_raw}, k={k}); the \
+                         column-selection T dropped a direction the audit deemed identifiable \
+                         — a bug in T construction; per-block T shapes: [{}]",
                         if use_channel_aware {
                             "σ²-Gram"
                         } else {
-                            "σ-space RRQR"
+                            "σ-space RRQR (penalty-augmented, priority-tiered)"
                         },
                         block_shapes.join(", "),
                     ),
@@ -1971,6 +2062,174 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1391 regression (function level): the FLAT-path post-T rank convention
+    /// (the σ²-Gram positive-eigenspace metric `audit_convention_rank`) is the
+    /// convention GAMLSS-PS canonicalisation runs (location-scale blocks carry an
+    /// `AdditiveBlockJacobian` with `n_family_outputs = 2`, so the route is
+    /// CHANNEL-AWARE).
+    ///
+    /// The earlier #1391 fix compared `audit_convention_rank(J_pre)` (the FULL,
+    /// pre-reduction joint design) against `audit_convention_rank(J_can)`. But
+    /// `audit_convention_rank` does ONE eigendecomposition of the joint `JᵀJ`,
+    /// whereas the audit drops via a SEQUENTIAL per-block RESIDUALISED eigenspace
+    /// walk. A direction that is residual-weak (absorbed by a higher-priority
+    /// anchor) but still carries mass in the joint Gram is DROPPED by the walk yet
+    /// COUNTED by the single joint eigendecomposition — so `audit_convention_rank`
+    /// over-counts `J_pre` and a faithful column-selection `T` tripped a false
+    /// `rank(J_pre) > rank(J_can)` (wine_gamair trial 22 60→59, wine_price_vs_temp
+    /// trial 26 20→18; gam#1391).
+    ///
+    /// This fixture reproduces exactly that geometry: a near-separable direction
+    /// whose joint-Gram eigenvalue sits ABOVE the σ²-Gram retain cutoff (so the
+    /// single joint eigendecomposition counts it in `J_pre`) but which a faithful
+    /// `T` drops. The test asserts (a) the OLD full-`J_pre` compare WOULD have
+    /// tripped (`rank(J_pre) > rank(J_can)`), and (b) the NEW certificate-anchored
+    /// invariant HOLDS: the reduced `J_can` is full column rank
+    /// (`audit_convention_rank(J_can) == p_red`).
+    #[test]
+    fn post_t_invariant_jcan_full_rank_under_channel_aware_convention_1391() {
+        let n = 96;
+        let x = linspace(n);
+
+        // Joint stacked Jacobian J_pre (n × 6): 5 well-conditioned columns plus
+        // one NEAR-SEPARABLE column whose residual (after projecting the other 5)
+        // sits just above the σ²-Gram retain cutoff, so the single joint
+        // eigendecomposition counts it as full rank (rank 6).
+        let p_total = 6usize;
+        let mut j_pre = Array2::<f64>::zeros((n, p_total));
+        for i in 0..n {
+            let xi = x[i];
+            j_pre[[i, 0]] = 1.0;
+            j_pre[[i, 1]] = xi;
+            j_pre[[i, 2]] = (2.0 * xi).sin();
+            j_pre[[i, 3]] = (3.0 * xi).cos();
+            j_pre[[i, 4]] = xi * xi;
+            // Near-separable: ~equal to column 0 plus a tiny independent wiggle.
+            j_pre[[i, 5]] = 1.0 + 1e-5 * (7.0 * xi).sin();
+        }
+
+        let nk_scale = n;
+
+        // The single joint eigendecomposition counts the near-separable column:
+        // J_pre is full rank under `audit_convention_rank`.
+        let rank_pre = audit_convention_rank(&j_pre, nk_scale);
+        assert_eq!(
+            rank_pre, p_total,
+            "fixture must make the joint eigendecomposition count the near-separable \
+             column in J_pre (rank {rank_pre} != {p_total})"
+        );
+
+        // A faithful column-selection T drops the near-separable column 5 (the
+        // direction the sequential residual walk would absorb). J_can = kept cols.
+        let kept: [usize; 5] = [0, 1, 2, 3, 4];
+        let p_red = kept.len();
+        let mut j_can = Array2::<f64>::zeros((n, p_red));
+        for i in 0..n {
+            for (out, &src) in kept.iter().enumerate() {
+                j_can[[i, out]] = j_pre[[i, src]];
+            }
+        }
+
+        let rank_can = audit_convention_rank(&j_can, nk_scale);
+
+        // OLD compare (full J_pre vs reduced J_can) WOULD have tripped: the joint
+        // eigendecomposition over-counts J_pre relative to the reduced design.
+        assert!(
+            rank_pre > rank_can,
+            "fixture must reproduce the over-count: rank(J_pre)={rank_pre} must \
+             exceed rank(J_can)={rank_can} under the single-eigendecomposition convention"
+        );
+
+        // NEW certificate-anchored invariant: the reduced J_can is FULL column
+        // rank under the drop-deciding convention — the faithful-T guarantee that
+        // no identifiable direction was dropped.
+        assert_eq!(
+            rank_can, p_red,
+            "post-T rank invariant must hold: reduced J_can must be full rank \
+             ({rank_can} != p_red {p_red}) under the channel-aware σ²-Gram convention (#1391)"
+        );
+    }
+
+    /// #1391 (flat path / survival-marginal-slope #1388): the FLAT-path post-T
+    /// rank convention (`flat_audit_convention_rank`) must rank the reduced design
+    /// `J_can` under the SAME penalty-augmented, gauge-priority-tiered metric the
+    /// flat audit used to decide drops — NOT a bare column-pivoted RRQR. A faithful
+    /// column-selection `T` must leave `J_can` full column rank under that metric.
+    #[test]
+    fn flat_audit_convention_rank_jcan_full_rank_penalty_augmented() {
+        let n = 64;
+        let x = linspace(n);
+
+        // Two penalized P-spline blocks (mu, sigma). A 2nd-difference penalty
+        // annihilates the affine part; the reduced sigma block has its (aliased)
+        // constant column dropped. The reduced J_can must be full rank under the
+        // penalty-augmented, priority-tiered convention. mu and sigma use
+        // DISTINCT covariates (`x` vs `z`) so the kept columns are genuinely
+        // independent — the only aliased direction was sigma's constant, already
+        // dropped by the faithful T.
+        let z = Array1::from_iter((0..n).map(|i| (1.7 * x[i]).tanh() + 0.3 * x[i] * x[i]));
+        // mu: constant, linear(x), sin(3x), cos(3x).
+        let mut mu_d = Array2::<f64>::zeros((n, 4));
+        // sigma: constant (DROPPED), linear(z), sin(5z), cos(5z).
+        let mut sigma_d = Array2::<f64>::zeros((n, 4));
+        for i in 0..n {
+            let xi = x[i];
+            let zi = z[i];
+            mu_d[[i, 0]] = 1.0;
+            mu_d[[i, 1]] = xi;
+            mu_d[[i, 2]] = (3.0 * xi).sin();
+            mu_d[[i, 3]] = (3.0 * xi).cos();
+            sigma_d[[i, 0]] = 1.0;
+            sigma_d[[i, 1]] = zi;
+            sigma_d[[i, 2]] = (5.0 * zi).sin();
+            sigma_d[[i, 3]] = (5.0 * zi).cos();
+        }
+
+        // J_can = mu (4 cols) | sigma minus its constant (3 cols): cols
+        // [linear(z), sin(5z), cos(5z)] of sigma.
+        let p_red = 7usize;
+        let mut j_can = Array2::<f64>::zeros((n, p_red));
+        for i in 0..n {
+            for j in 0..4 {
+                j_can[[i, j]] = mu_d[[i, j]];
+            }
+            j_can[[i, 4]] = sigma_d[[i, 1]];
+            j_can[[i, 5]] = sigma_d[[i, 2]];
+            j_can[[i, 6]] = sigma_d[[i, 3]];
+        }
+
+        let mut s = Array2::<f64>::zeros((4, 4));
+        s[[2, 2]] = 1.0;
+        s[[3, 3]] = 1.0;
+        s[[2, 3]] = -1.0;
+        s[[3, 2]] = -1.0;
+        let mut s_red = Array2::<f64>::zeros((3, 3));
+        s_red[[1, 1]] = 1.0;
+        s_red[[2, 2]] = 1.0;
+        s_red[[1, 2]] = -1.0;
+        s_red[[2, 1]] = -1.0;
+
+        let blocks_can = [
+            FlatRankBlock {
+                width: 4,
+                structural_penalty: Some(s),
+                priority: 120,
+            },
+            FlatRankBlock {
+                width: 3,
+                structural_penalty: Some(s_red),
+                priority: 100,
+            },
+        ];
+
+        let rank_can = flat_audit_convention_rank(&j_can, &blocks_can);
+        assert_eq!(
+            rank_can, p_red,
+            "reduced J_can must be full rank ({rank_can} != p_red {p_red}) under the \
+             penalty-augmented, priority-tiered flat convention (#1391/#1388)"
+        );
     }
 
     /// On a clean (non-fatal) configuration with a non-trivial penalty,
