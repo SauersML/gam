@@ -43,6 +43,13 @@ fn main() {
     // any modification to this build script.
     forbid_claude_build_rs_edits(&manifest_dir);
 
+    // HARD ban (always fatal): build.rs must not weaken, bypass, or
+    // environment-gate its OWN hard-fail gates. Introspects this file's source
+    // and aborts if the ban-scanner's terminal exit was removed/made conditional,
+    // if any process exit is env-gated, or if temporary-bypass hack language was
+    // reintroduced. Not to be weakened or removed.
+    forbid_build_rs_self_tampering(&manifest_dir);
+
     // HARD ban (always fatal): the workspace lint level for `warnings` MUST be
     // `deny`. A demotion to `warn` (or anything else) lets pre-existing warnings
     // ride along and silently rots the tree. This is non-negotiable and cannot
@@ -702,6 +709,140 @@ fn main() {
         sections.len()
     );
     std::process::exit(1);
+}
+
+/// HARD self-integrity gate (always fatal): build.rs must not weaken, bypass, or
+/// environment-gate its own hard-fail gates. Reads this file's own source and
+/// panics if it detects any of:
+///   1. the ban-scanner's terminal hard exit removed or made conditional (e.g.
+///      quietly turned into a warning, as happened once and rode `main` for days);
+///   2. any `process::exit` gate guarded by an environment variable;
+///   3. "temporary unblock"-style hack language anywhere in the file.
+///
+/// Every match needle is assembled from fragments at runtime, so this function
+/// never matches its own source. Like the other gates here, it may not be
+/// weakened or removed; a human maintainer must approve any change.
+fn forbid_build_rs_self_tampering(manifest_dir: &Path) {
+    let path = manifest_dir.join("build.rs");
+    let src = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("self-integrity gate: cannot read build.rs at {path:?}: {e}"));
+    let lines: Vec<&str> = src.lines().collect();
+
+    // Needles assembled from fragments so they never appear verbatim below.
+    let render_call = format!("render_report(&{});", "sections");
+    let exit_core_a = format!("std::process::{}(1)", "exit");
+    let exit_core_b = format!("process::{}(1)", "exit");
+    let exit_any = format!("process::{}(", "exit");
+    let env_needles = [
+        format!("env::{}(", "var"),
+        format!("std::{}", "env"),
+        format!("option_{}", "env!"),
+    ];
+
+    // ---- (1) the ban-scanner must end in an UNCONDITIONAL hard exit ----
+    let render_sites: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim() == render_call)
+        .map(|(i, _)| i)
+        .collect();
+    if render_sites.len() != 1 {
+        panic!(
+            "self-integrity gate: expected exactly one `{render_call}` report site, found {}. \
+             The ban-scanner aggregator was moved, duplicated, or removed — restore the single \
+             hard-failing report path.",
+            render_sites.len()
+        );
+    }
+    let r = render_sites[0];
+    let render_indent = lines[r].len() - lines[r].trim_start().len();
+    let branch_starts = [
+        "if ", "} else", "else ", "else{", "match ", "for ", "while ", "loop ", "loop{",
+    ];
+    let mut hard_exit_found = false;
+    for line in &lines[r + 1..] {
+        let t = line.trim();
+        if t.is_empty() || t.starts_with("//") {
+            continue;
+        }
+        let indent = line.len() - line.trim_start().len();
+        if (t.starts_with(exit_core_a.as_str()) || t.starts_with(exit_core_b.as_str()))
+            && indent == render_indent
+        {
+            hard_exit_found = true;
+            break;
+        }
+        if indent < render_indent {
+            // The enclosing function/block closed before any hard exit was reached.
+            break;
+        }
+        if t.starts_with("return") {
+            panic!(
+                "self-integrity gate: a `return` precedes the ban-scanner's hard exit. The \
+                 report path must end in an unconditional process exit, not return early."
+            );
+        }
+        if branch_starts.iter().any(|k| t.starts_with(*k)) {
+            panic!(
+                "self-integrity gate: the ban-scanner's hard exit was made CONDITIONAL by \
+                 `{t}`. The exit must be unconditional — no branch, loop, or env switch may \
+                 guard it."
+            );
+        }
+    }
+    if !hard_exit_found {
+        panic!(
+            "self-integrity gate: the ban-scanner no longer ends in an unconditional process \
+             exit immediately after `{render_call}`. It appears to have been turned into a \
+             warning or otherwise bypassed — restore the hard exit."
+        );
+    }
+
+    // ---- (2) no process-exit gate may be guarded by an environment variable ----
+    for (i, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with("//") {
+            continue;
+        }
+        let is_branch = t.starts_with("if ") || t.contains("else if ");
+        if !is_branch || !env_needles.iter().any(|n| line.contains(n.as_str())) {
+            continue;
+        }
+        let window_end = (i + 40).min(lines.len());
+        for body in &lines[i + 1..window_end] {
+            let bt = body.trim();
+            if bt.starts_with("//") {
+                continue;
+            }
+            if bt.contains(exit_any.as_str()) {
+                panic!(
+                    "self-integrity gate: a process exit is reachable under an \
+                     environment-variable branch (`{t}`). Env-gating a hard-fail gate in \
+                     build.rs is banned — gates must always fire."
+                );
+            }
+        }
+    }
+
+    // ---- (3) no "temporary unblock"-style hack language ----
+    let hack_phrases = [
+        format!("{}{}", "velocity ", "unblock"),
+        format!("{}{}", "temp ", "velocity"),
+        format!("{}{}", "temporarily ", "non-fatal"),
+        format!("{}{}", "temporarily ", "disabled"),
+        format!("{}{}", "demoted from a ", "hard"),
+        format!("{}{}", "do not ", "merge"),
+    ];
+    let lower = src.to_lowercase();
+    for phrase in &hack_phrases {
+        if lower.contains(phrase.as_str()) {
+            panic!(
+                "self-integrity gate: build.rs contains temporary-bypass hack language \
+                 (`{phrase}`). The gates here are not to be temporarily weakened; fix the \
+                 underlying violations instead of weakening a gate."
+            );
+        }
+    }
 }
 
 /// Check the git history of `build.rs` and panic if the most recent commit was
