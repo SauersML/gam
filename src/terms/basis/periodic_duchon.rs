@@ -1330,20 +1330,66 @@ pub(crate) fn duchon_constrained_bending_penalty(
     let zt_k = fast_atb(z, &center_kernel);
     let omega = fast_ab(&zt_k, z).mapv(|v| v * amp2);
 
-    // gam#1424 — the hybrid (Duchon–Matérn) kernel value is assembled from an
-    // ALTERNATING partial-fraction expansion (polyharmonic blocks `r^{2m−d}`
-    // minus Matérn `r^ν K_ν(κr)` blocks). At high dimension / high spectral
-    // power `s` the two families are individually enormous and nearly cancel,
-    // so the constrained bending energy sits at the float noise floor and
-    // rounding pushes the smallest eigenvalues materially negative (d=16, s=7:
-    // λ_min ≈ −0.26 after normalization). The exact kernel's spectral density is
-    // nonnegative, so the constrained Gram is positive semidefinite in exact
-    // arithmetic — the negative modes are pure cancellation artifacts on the
-    // near-null directions. Project onto the PSD cone to restore the kernel's
-    // known mathematical property (and the API's SPD-penalty contract). In the
-    // well-conditioned low-d regimes the spectrum is already nonnegative to
-    // machine precision, so this is a no-op there.
-    Ok(project_penalty_to_psd_cone(&symmetrize_penalty(&omega)))
+    // gam#1424 — the hybrid (Duchon–Matérn) kernel's exact spectral density
+    // `ρ^{-2p}(κ²+ρ²)^{-s}` is nonnegative, so the constrained bending Gram
+    // `Ω_c = α²·Zᵀ K_CC Z` is positive semidefinite in exact arithmetic. The
+    // historical failure was numerical: `duchon_matern_kernel_general_from_distance`
+    // assembled the kernel from an ALTERNATING partial-fraction expansion
+    // (polyharmonic `r^{2m−d}` minus Matérn `r^ν K_ν(κr)` blocks) whose
+    // individually-enormous terms cancel to the float noise floor at high
+    // dimension / spectral power (d=16, s=7: largest block ~1e3, true value
+    // ~1e-13), pushing λ_min to ≈ −0.26 after normalization. That kernel
+    // evaluation now routes through the cancellation-free single-integral form
+    // (`duchon_hybrid_kernel_stable_integral`), so the constrained spectrum is
+    // genuinely nonnegative to machine precision. Rather than silently
+    // projecting (which would mask a true loss of positive-definiteness), we
+    // REJECT a materially-negative spectrum and only clamp float-noise
+    // negatives — per gam#1424's required PSD check before normalization.
+    reject_nonpsd_then_clamp_noise(&symmetrize_penalty(&omega))
+}
+
+/// Enforce the PSD contract on a constrained Duchon bending penalty before
+/// normalization (gam#1424).
+///
+/// The kernel's spectral density is nonnegative, so the constrained Gram must
+/// be PSD in exact arithmetic. A genuinely PSD matrix only ever carries
+/// negative eigenvalues at the float noise floor; those are clamped to zero. A
+/// *materially* negative eigenvalue means the numerical kernel has stopped
+/// representing the stated kernel — that is rejected with a clear, actionable
+/// error rather than masked, because clamping a −0.26 mode silently fabricates
+/// a different penalty.
+fn reject_nonpsd_then_clamp_noise(matrix: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
+    use crate::linalg::faer_ndarray::FaerEigh;
+    use faer::Side;
+    let sym = symmetrize_penalty(matrix);
+    let n = sym.nrows();
+    if n == 0 || n != sym.ncols() {
+        return Ok(sym);
+    }
+    let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).map_err(|e| {
+        BasisError::InvalidInput(format!("Duchon penalty PSD check failed: {e}"))
+    })?;
+    if evals.is_empty() {
+        return Ok(sym);
+    }
+    let max_abs_ev = evals
+        .iter()
+        .copied()
+        .fold(0.0_f64, |acc, v| acc.max(v.abs()));
+    let min_ev = evals.iter().copied().fold(f64::INFINITY, f64::min);
+    // Noise-floor tolerance in eigenvalue units, so uniform scaling of the
+    // penalty does not change the PSD decision (matches `spectral_tolerance`).
+    let tol = (n as f64) * 1e-10 * max_abs_ev;
+    if min_ev < -tol {
+        crate::bail_invalid_basis!(
+            "Duchon constrained penalty is not positive semidefinite: λ_min={min_ev:.6e} \
+             (tol=−{tol:.6e}, λ_max={max_abs_ev:.6e}). The hybrid kernel's spectral density is \
+             nonnegative, so a materially-negative mode indicates the kernel evaluation lost \
+             positive-definiteness numerically (see gam#1424)."
+        );
+    }
+    // λ_min is at the noise floor: clamp the harmless negative residue to zero.
+    Ok(project_penalty_to_psd_cone(&sym))
 }
 
 pub(crate) fn duchon_native_penalty_candidates(
@@ -1579,4 +1625,363 @@ pub(crate) fn duchon_operator_penalty_candidates(
         }
     }
     Ok(candidates)
+}
+
+#[cfg(test)]
+mod mixed_periodicity_psd_tests {
+    //! Regression tests for gam#1422 (mixed-periodicity Duchon penalty must be
+    //! PSD — the additive ANOVA reproducing kernel replaces the conditionally-PD
+    //! polyharmonic-of-chord-distance kernel) and gam#1423 (the cylinder null
+    //! space must contain polynomials of total degree `< m` in the NON-periodic
+    //! coordinates, not just constants).
+    use super::*;
+    use crate::linalg::faer_ndarray::FaerEigh;
+    use faer::Side;
+    use ndarray::{Array2, array};
+
+    fn cylinder_spec() -> DuchonBasisSpec {
+        // m = 2 ⇒ Linear null-space order; pure polyharmonic (no length scale,
+        // power = 0) — the only spectrum the mixed-periodicity path supports.
+        DuchonBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(Array2::<f64>::zeros((0, 0))),
+            periodic: None,
+            length_scale: None,
+            power: 0.0,
+            nullspace_order: DuchonNullspaceOrder::Linear,
+            identifiability: SpatialIdentifiability::None,
+            aniso_log_scales: None,
+            operator_penalties: DuchonOperatorPenaltySpec::default(),
+            boundary: OneDimensionalBoundary::Open,
+            radial_reparam: None,
+        }
+    }
+
+    /// Build the cylinder (`θ` periodic on `[0, 2π]`, `y` free on `[0, 1]`)
+    /// Primary penalty via the public mixed-periodicity driver and return it.
+    fn cylinder_primary_penalty() -> (Array2<f64>, usize) {
+        // Anchor the periodic span to exactly [0, 2π] so the auto-derived period
+        // is the geometric period; this mirrors the Python cylinder fixture.
+        let two_pi = std::f64::consts::TAU;
+        let theta = [
+            0.0, 0.6, 1.2, 1.9, 2.5, 3.1, 3.8, 4.4, 5.0, 5.6, two_pi,
+        ];
+        let y = [
+            0.5, 0.1, 0.9, 0.3, 0.7, 0.2, 0.8, 0.4, 0.6, 0.15, 0.5,
+        ];
+        let mut centers = Array2::<f64>::zeros((theta.len(), 2));
+        for i in 0..theta.len() {
+            centers[[i, 0]] = theta[i];
+            centers[[i, 1]] = y[i];
+        }
+        let mut spec = cylinder_spec();
+        spec.center_strategy = CenterStrategy::UserProvided(centers.clone());
+        let periodic_per_axis = [true, false];
+        let built = build_duchon_basis_mixed_periodicity_auto(
+            centers.view(),
+            &spec,
+            &periodic_per_axis,
+            None,
+        )
+        .expect("cylinder mixed-periodicity basis must build");
+        let idx = built
+            .penaltyinfo
+            .iter()
+            .position(|info| matches!(info.source, PenaltySource::Primary))
+            .expect("cylinder build must emit a Primary penalty");
+        (built.penalties[idx].clone(), centers.nrows())
+    }
+
+    #[test]
+    fn cylinder_penalty_is_symmetric_psd_gam1422() {
+        // gam#1422: with the conditionally-PD chord-polyharmonic kernel this
+        // fixture produced λ_min ≈ −0.426 (3 materially negative eigenvalues).
+        // The additive ANOVA kernel (sum of PSD per-axis reproducing kernels)
+        // is PSD by construction. Tolerance matches the Python
+        // `_assert_symmetric_psd` slack (1e-8); do NOT weaken it.
+        let (penalty, k) = cylinder_primary_penalty();
+        assert_eq!(penalty.nrows(), k);
+        assert_eq!(penalty.ncols(), k);
+        // Symmetry.
+        for i in 0..k {
+            for j in 0..k {
+                assert!(
+                    (penalty[[i, j]] - penalty[[j, i]]).abs() <= 1e-9,
+                    "cylinder penalty must be symmetric at ({i}, {j})"
+                );
+            }
+        }
+        let sym = symmetrize(&penalty);
+        let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
+        let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(
+            lambda_min > -1e-8,
+            "cylinder Duchon penalty not PSD; λ_min = {lambda_min:.3e} (gam#1422)"
+        );
+    }
+
+    #[test]
+    fn torus_penalty_is_psd_gam1422() {
+        // gam#1422: the torus fixture previously gave λ_min ≈ −0.885 (4 negative
+        // eigenvalues). With both axes periodic the additive kernel is the sum of
+        // two PSD Bernoulli-Green kernels, hence PSD.
+        let two_pi = std::f64::consts::TAU;
+        let theta = [0.0, 0.7, 1.5, 2.3, 3.0, 3.9, 4.6, 5.4, two_pi];
+        let phi = [0.0, 1.1, 2.0, 0.4, 3.3, 4.8, 5.9, 2.7, two_pi];
+        let mut centers = Array2::<f64>::zeros((theta.len(), 2));
+        for i in 0..theta.len() {
+            centers[[i, 0]] = theta[i];
+            centers[[i, 1]] = phi[i];
+        }
+        let mut spec = cylinder_spec();
+        spec.center_strategy = CenterStrategy::UserProvided(centers.clone());
+        let periodic_per_axis = [true, true];
+        let built = build_duchon_basis_mixed_periodicity_auto(
+            centers.view(),
+            &spec,
+            &periodic_per_axis,
+            None,
+        )
+        .expect("torus mixed-periodicity basis must build");
+        let idx = built
+            .penaltyinfo
+            .iter()
+            .position(|info| matches!(info.source, PenaltySource::Primary))
+            .expect("torus build must emit a Primary penalty");
+        let sym = symmetrize(&built.penalties[idx]);
+        let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
+        let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(
+            lambda_min > -1e-8,
+            "torus Duchon penalty not PSD; λ_min = {lambda_min:.3e} (gam#1422)"
+        );
+    }
+
+    #[test]
+    fn cylinder_nullspace_contains_one_and_y_gam1423() {
+        // gam#1423: on S¹×ℝ with m = 2 the Duchon null space is {1, y} — both the
+        // constant AND the linear-in-the-nonperiodic-coordinate term have zero
+        // seminorm, so both must be unpenalised. The polynomial block driving the
+        // null space must therefore have exactly 2 columns: a constant column and
+        // a `y` column (NOT a θ column — periodic axes contribute only the
+        // constant).
+        let points = array![
+            [0.0_f64, 0.10],
+            [1.0, 0.40],
+            [2.0, 0.70],
+            [3.0, 0.95],
+        ];
+        let periodic_per_axis = [true, false];
+        let block = mixed_periodicity_nullspace_poly_block(points.view(), 2, &periodic_per_axis);
+        assert_eq!(
+            block.ncols(),
+            2,
+            "cylinder (m=2) null space must be {{1, y}} — 2 columns (gam#1423)"
+        );
+        // One column must be the all-ones constant; another must equal the
+        // non-periodic coordinate `y` (column 1 of `points`). The block does not
+        // depend on θ (column 0).
+        let n = points.nrows();
+        let mut has_const = false;
+        let mut has_y = false;
+        let mut depends_on_theta = false;
+        for col in 0..block.ncols() {
+            let is_const = (0..n).all(|r| (block[[r, col]] - 1.0).abs() < 1e-12);
+            let is_y = (0..n).all(|r| (block[[r, col]] - points[[r, 1]]).abs() < 1e-12);
+            let is_theta = (0..n).all(|r| (block[[r, col]] - points[[r, 0]]).abs() < 1e-12);
+            has_const |= is_const;
+            has_y |= is_y;
+            depends_on_theta |= is_theta && !is_const;
+        }
+        assert!(has_const, "null space must include the constant 1");
+        assert!(has_y, "null space must include the nonperiodic coordinate y (gam#1423)");
+        assert!(
+            !depends_on_theta,
+            "periodic axis θ must contribute only the constant, never a linear θ column"
+        );
+    }
+
+    #[test]
+    fn cylinder_linear_in_y_is_unpenalised_gam1423() {
+        // gam#1423: build the center Gram K_CC and the non-periodic null-space
+        // projector Z, then confirm the linear-in-y direction lies in the kernel
+        // null space — i.e. f(θ, y) = a + b·y has EXACTLY zero penalty energy.
+        let two_pi = std::f64::consts::TAU;
+        let theta = [0.0, 0.7, 1.5, 2.3, 3.0, 3.9, 4.6, 5.4, two_pi];
+        let y = [0.0, 0.2, 0.45, 0.6, 0.3, 0.8, 0.95, 0.1, 0.5];
+        let mut centers = Array2::<f64>::zeros((theta.len(), 2));
+        for i in 0..theta.len() {
+            centers[[i, 0]] = theta[i];
+            centers[[i, 1]] = y[i];
+        }
+        let periodic_per_axis = [true, false];
+        let periods = [two_pi, 1.0];
+        let axis_bounds = mixed_periodicity_axis_bounds(centers.view(), &periodic_per_axis);
+        let k = centers.nrows();
+        let m = 2usize;
+
+        // Z = null(Pᵀ) for P = [1, y].
+        let poly_block =
+            mixed_periodicity_nullspace_poly_block(centers.view(), m, &periodic_per_axis);
+        let z = kernel_constraint_nullspace_from_matrix(poly_block.view())
+            .expect("null-space basis must build");
+
+        // K_CC = additive kernel at center pairs.
+        let mut k_cc = Array2::<f64>::zeros((k, k));
+        fill_symmetric_from_row_kernel(&mut k_cc, |i, j| {
+            mixed_periodicity_additive_kernel(
+                centers.row(i),
+                centers.row(j),
+                m,
+                &periodic_per_axis,
+                &periods,
+                &axis_bounds,
+            )
+        })
+        .expect("center kernel must build");
+
+        // Ω = Zᵀ K_CC Z is the realized penalty in the kernel-coefficient frame.
+        let omega = fast_ab(&fast_atb(&z, &k_cc), &z);
+        let sym = symmetrize(&omega);
+        let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
+        let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+        assert!(
+            lambda_min > -1e-8,
+            "Ω = ZᵀK_CC Z must be PSD; λ_min = {lambda_min:.3e}"
+        );
+
+        // The linear-in-y trend is carried by the explicit polynomial columns
+        // (which receive a zero penalty block), so the kernel-coefficient penalty
+        // Ω never sees it. Confirm directly that evaluating the penalty quadratic
+        // form on the constant and linear-in-y design directions yields zero: any
+        // design coefficient vector that is purely in the polynomial block has
+        // zero penalty because Ω only occupies the kernel block. We model that by
+        // checking that K_CC applied to the {1, y} span sits inside the column
+        // space the polynomial block already spans — i.e. Pᵀ K_CC P has no energy
+        // that Z can pick up. Concretely, Z is orthogonal to {1, y} by
+        // construction, so Zᵀ·(linear-in-y vector) = 0.
+        let ones: Vec<f64> = vec![1.0; k];
+        let yvec: Vec<f64> = (0..k).map(|i| centers[[i, 1]]).collect();
+        for (label, v) in [("constant", &ones), ("linear-in-y", &yvec)] {
+            let mut proj = vec![0.0f64; z.ncols()];
+            for c in 0..z.ncols() {
+                let mut acc = 0.0;
+                for r in 0..k {
+                    acc += z[[r, c]] * v[r];
+                }
+                proj[c] = acc;
+            }
+            let norm: f64 = proj.iter().map(|p| p * p).sum::<f64>().sqrt();
+            assert!(
+                norm < 1e-9,
+                "{label} direction must lie in the unpenalised null space \
+                 (Zᵀv = 0); got ‖Zᵀv‖ = {norm:.3e} (gam#1423)"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod hybrid_high_dim_psd_tests {
+    //! Regression tests for gam#1424: the high-dimensional hybrid
+    //! (Duchon–Matérn) constrained bending penalty must be positive
+    //! semidefinite. Before the fix, the kernel was assembled from an
+    //! alternating partial-fraction sum whose individually-huge polyharmonic /
+    //! Matérn blocks cancelled to the float noise floor; for d=16, p=2, s=7 the
+    //! constrained spectrum was λ_min ≈ −0.264 after normalization. The
+    //! cancellation-free single-integral kernel evaluation
+    //! (`duchon_hybrid_kernel_stable_integral`) restores genuine PSD-ness.
+    use super::*;
+    use crate::linalg::faer_ndarray::FaerEigh;
+    use faer::Side;
+    use ndarray::Array2;
+
+    /// Deterministic pseudo-random centers in `[-1, 1]^d` (no RNG dependency in
+    /// the core crate). A 64-bit SplitMix-style generator seeded from `(d, k)`.
+    fn deterministic_centers(d: usize, k: usize) -> Array2<f64> {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15u64
+            .wrapping_mul(d as u64 + 1)
+            .wrapping_add(k as u64);
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            // Map to (−1, 1).
+            (z as f64 / u64::MAX as f64) * 2.0 - 1.0
+        };
+        let mut c = Array2::<f64>::zeros((k, d));
+        for i in 0..k {
+            for j in 0..d {
+                c[[i, j]] = next();
+            }
+        }
+        c
+    }
+
+    /// Constrained bending-penalty spectrum λ_min for a hybrid Duchon smooth at
+    /// the resolved (p, s) for the given dimension. Mirrors the construction in
+    /// `duchon_native_penalty_candidates` (Z = null(Pᵀ), Ω = α²·ZᵀK_CC Z) but
+    /// stops at the eigenvalues so the test can assert PSD-ness directly.
+    fn hybrid_constrained_lambda_min(d: usize, s_order: usize) -> f64 {
+        let centers = deterministic_centers(d, 4 * d);
+        let nullspace = DuchonNullspaceOrder::Linear; // m = 2 ⇒ p = 2.
+        let effective = duchon_effective_nullspace_order(centers.view(), nullspace);
+        let poly_block = polynomial_block_from_order(centers.view(), effective);
+        let z = kernel_constraint_nullspace_from_matrix(poly_block.view())
+            .expect("kernel null-space basis must build");
+        let omega = duchon_constrained_bending_penalty(
+            centers.view(),
+            Some(1.0),
+            s_order as f64,
+            effective,
+            None,
+            &z,
+        )
+        .expect("hybrid constrained bending penalty must build and pass the PSD check");
+        let sym = symmetrize(&omega);
+        let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).expect("eigh");
+        let max_abs = evals.iter().copied().fold(0.0_f64, |a, v| a.max(v.abs()));
+        let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+        // Report in spectral (scale-relative) units so the assertion is
+        // invariant to the penalty's overall magnitude.
+        lambda_min / max_abs.max(f64::MIN_POSITIVE)
+    }
+
+    #[test]
+    fn hybrid_d16_m2_s7_constrained_spectrum_is_psd_gam1424() {
+        // The exact spectral density ρ^{-2p}(κ²+ρ²)^{-s} is nonnegative, so the
+        // constrained Gram is PSD in exact arithmetic. Before gam#1424 the
+        // partial-fraction kernel evaluation lost every significant digit here
+        // and the normalized λ_min was ≈ −0.264. The stable single-integral
+        // kernel keeps λ_min at the float noise floor. Tolerance is the same
+        // scale-relative noise floor used by the penalty pipeline
+        // (`spectral_tolerance`: n·1e-10); do NOT weaken it.
+        let d = 16;
+        let n = 4 * d; // penalty dimension upper bound (kernel coeff frame).
+        let tol = (n as f64) * 1e-10;
+        let lambda_min_rel = hybrid_constrained_lambda_min(d, 7);
+        assert!(
+            lambda_min_rel >= -tol,
+            "d=16, m=2, s=7 hybrid constrained spectrum not PSD: \
+             λ_min/λ_max = {lambda_min_rel:.6e} (tol = −{tol:.6e}) (gam#1424)"
+        );
+    }
+
+    #[test]
+    fn hybrid_other_high_dims_constrained_spectrum_is_psd_gam1424() {
+        // A spread of high-d hybrid orders that also lost positive-definiteness
+        // through partial-fraction cancellation (d=8: ~7 digits lost; d=12: ~13;
+        // d=10). Each must now be PSD to the float noise floor.
+        for (d, s) in [(8usize, 3usize), (10, 4), (12, 5)] {
+            let n = 4 * d;
+            let tol = (n as f64) * 1e-10;
+            let lambda_min_rel = hybrid_constrained_lambda_min(d, s);
+            assert!(
+                lambda_min_rel >= -tol,
+                "d={d}, m=2, s={s} hybrid constrained spectrum not PSD: \
+                 λ_min/λ_max = {lambda_min_rel:.6e} (tol = −{tol:.6e}) (gam#1424)"
+            );
+        }
+    }
 }

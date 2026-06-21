@@ -1227,18 +1227,6 @@ def test_duchon_function_norm_penalty_2d_low_center_counts_issue_880(
     _assert_symmetric_psd(penalty, f"2D Duchon penalty ({n_centers} centers)")
 
 
-@pytest.mark.xfail(
-    reason="gam#878/#580: the d>=2 mixed-periodicity Duchon penalty uses the "
-    "polyharmonic-of-chord-distance kernel projected onto a CONSTANTS-ONLY "
-    "null space. That kernel is conditionally PD of order m=2 (PD only "
-    "orthogonal to degree-<=1 polynomials), so removing only constants leaves "
-    "the linear directions and the center Gram Omega = Z^T K_chord Z is "
-    "genuinely indefinite (large negative eigenvalues), exactly the 1D "
-    "indefiniteness gam#580 documents. A PSD periodic-Duchon penalty needs a "
-    "different construction (torus/cylinder Green's function), tracked for the "
-    "periodic-Duchon redesign; the non-periodic path (gam#880) is unaffected.",
-    strict=False,
-)
 def test_duchon_function_norm_penalty_2d_cylinder_periodic() -> None:
     """d=2 mixed-periodicity Duchon (cylinder): symmetric, PSD, wraps cleanly."""
     # Spread centers across the periodic axis [0, 2π] (auto-derived period)
@@ -1279,15 +1267,6 @@ def test_duchon_function_norm_penalty_2d_cylinder_periodic() -> None:
     )
 
 
-@pytest.mark.xfail(
-    reason="gam#878/#580: same root cause as the cylinder case — the "
-    "chord-distance polyharmonic kernel projected onto the constants-only null "
-    "space is indefinite for the d>=2 torus (Omega = Z^T K_chord Z carries "
-    "large negative eigenvalues). Needs the torus Green's-function "
-    "construction, tracked for the periodic-Duchon redesign; the non-periodic "
-    "path (gam#880) is unaffected.",
-    strict=False,
-)
 def test_duchon_function_norm_penalty_2d_torus_periodic() -> None:
     """d=2 mixed-periodicity Duchon (torus): symmetric, PSD, wraps cleanly."""
     rng = np.random.default_rng(1)
