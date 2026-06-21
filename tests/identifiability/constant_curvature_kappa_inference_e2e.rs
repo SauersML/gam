@@ -35,8 +35,7 @@ use ndarray::{Array1, Array2};
 /// Number of chart points per fitted dataset. The default is CI-affordable; the
 /// signal is identified by the chart GEOMETRY (radius, noise_sd), not the row
 /// count, so the strong sign-recovery / flatness asserts below hold at the
-/// smaller default. Setting `GAM_HEAVY` restores the full n=2000 used on the
-/// cluster.
+/// smaller default. A cluster-scale n=2000 sweep is a separate MSI artifact.
 fn n_obs() -> usize {
     // Fixed CI-affordable size. The curvature signal is identified by the chart
     // GEOMETRY (radius, noise_sd), not the row count, so the sign-recovery /

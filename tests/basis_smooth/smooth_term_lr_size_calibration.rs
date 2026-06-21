@@ -219,11 +219,11 @@ fn size_se(alpha: f64, reps: usize) -> f64 {
 
 /// THE NULL-SIMULATION SIZE GRID (#939 deliverable 4). Runs a full fit +
 /// constrained null refit per replicate over the grid. By default it runs a
-/// small but still-asserting grid that finishes in CI budget; setting the
-/// `GAM_HEAVY` environment variable expands it to the exhaustive grid
-/// (`n ∈ {30,50,100,200,500}` × both families × both ranks × 600 reps). The
-/// bounded CI sibling below carries the small-n calibration claim; this test
-/// adds the larger-n cells (under `GAM_HEAVY`) without ever being inert.
+/// small but still-asserting grid that finishes in CI budget. The exhaustive
+/// larger-n grid (`n ∈ {30,50,100,200,500}` × both families × both ranks × 600
+/// reps) is a separate MSI artifact, not an env/cfg branch. The bounded CI
+/// sibling below carries the small-n calibration claim; this test adds the
+/// moderate-n cells without ever being inert.
 #[test]
 fn exhaustive_null_simulation_size_grid() {
     init_parallelism();
