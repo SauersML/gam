@@ -3016,11 +3016,12 @@ fn scan_for_deferred_work_markers(
     dir: &Path,
     offenders: &mut Vec<(PathBuf, usize, String)>,
 ) {
+    // `todo` is intentionally omitted — the bare-token TODO scanner already
+    // covers it; listing it here would double-report the same line.
     let pure_markers: Vec<String> = vec![
         format!("{}{}", "fix", "me"),
         format!("{}{}", "x", "xx"),
         "hack".to_string(),
-        format!("{}{}", "to", "do"),
     ];
     let deferral_words: Vec<String> = vec![
         format!("{}-{}", "follow", "up"),
@@ -3089,14 +3090,17 @@ fn lead_token_is(body: &str, word: &str) -> bool {
     }
 }
 
-/// True when `rest` opens with an issue reference: `(` then an optional `#`,
-/// then at least one digit, then `)`. Matches the `(#932)` / `(41)` tail of a
-/// relabelled tracker.
+/// True when `rest` opens with an issue reference: a bracket (`(`, `[`, or `{`)
+/// then an optional `#`, then at least one digit, then the matching close.
+/// Matches the `(#932)` / `[#41]` / `{12}` tail of a relabelled tracker.
 fn marker_issue_ref_follows(rest: &str) -> bool {
     let b = rest.as_bytes();
-    if b.first() != Some(&b'(') {
-        return false;
-    }
+    let close = match b.first() {
+        Some(b'(') => b')',
+        Some(b'[') => b']',
+        Some(b'{') => b'}',
+        _ => return false,
+    };
     let mut i = 1usize;
     if b.get(i) == Some(&b'#') {
         i += 1;
@@ -3108,7 +3112,7 @@ fn marker_issue_ref_follows(rest: &str) -> bool {
     if i == digits_start {
         return false;
     }
-    b.get(i) == Some(&b')')
+    b.get(i) == Some(&close)
 }
 
 /// Scan for `#[allow(...)]` / `#![allow(...)]` / `#[expect(...)]` /
@@ -5386,7 +5390,10 @@ fn token_set_containment(
 /// fragments are assembled at runtime so this file never carries the literal
 /// marker tokens it forbids.
 fn comment_block_has_deferral_cue(lower_text: &str) -> bool {
-    let cues: Vec<String> = vec![
+    use std::sync::OnceLock;
+    static CUES: OnceLock<Vec<String>> = OnceLock::new();
+    let cues = CUES.get_or_init(|| {
+        vec![
         format!("{}{}", "to", "do"),
         format!("{}{}", "fix", "me"),
         format!("{}-{}", "follow", "up"),
@@ -5412,7 +5419,8 @@ fn comment_block_has_deferral_cue(lower_text: &str) -> bool {
         "needs to".to_string(),
         "remains to".to_string(),
         "yet to".to_string(),
-    ];
+        ]
+    });
     cues.iter().any(|c| lower_text.contains(c.as_str()))
 }
 
@@ -5432,10 +5440,24 @@ fn comment_blocks_without_marker(content: &str, needle: &str) -> Vec<CommentBloc
         }
         let start = i;
         let mut joined = String::new();
-        while i < lines.len() && line_is_comment_lead(lines[i]) {
-            joined.push(' ');
-            joined.push_str(lines[i]);
-            i += 1;
+        loop {
+            while i < lines.len() && line_is_comment_lead(lines[i]) {
+                joined.push(' ');
+                joined.push_str(lines[i]);
+                i += 1;
+            }
+            // Bridge blank lines: a description split across comment fragments by
+            // inserting a blank line is still pooled as one block. The block ends
+            // only at a real code line, defeating the blank-line-split dodge.
+            let mut j = i;
+            while j < lines.len() && lines[j].trim().is_empty() {
+                j += 1;
+            }
+            if j > i && j < lines.len() && line_is_comment_lead(lines[j]) {
+                i = j;
+            } else {
+                break;
+            }
         }
         if joined.contains(needle) {
             continue;
