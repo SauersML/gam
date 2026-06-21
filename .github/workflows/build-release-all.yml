@@ -126,6 +126,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # #1458: full history so build.rs author gate resolves real last editor, not HEAD
 
       - name: Free runner disk space
         # ubuntu-latest / ubuntu-22.04 ship with ~14 GB free on /. On

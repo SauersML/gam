@@ -101,6 +101,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # #1458: full history so build.rs author gate resolves real last editor, not HEAD
 
       - name: Set up Python
         uses: actions/setup-python@v5

@@ -124,6 +124,8 @@ jobs:
         platform: ${{ github.event.inputs.scope == 'x86' && fromJSON('[{"runner":"ubuntu-24.04","target":"x86_64"}]') || fromJSON('[{"runner":"ubuntu-24.04","target":"x86_64"},{"runner":"ubuntu-24.04-arm","target":"aarch64"}]') }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # #1458: full history so build.rs author gate resolves real last editor, not HEAD
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
@@ -167,6 +169,8 @@ jobs:
           - { runner: ubuntu-24.04-arm, target: aarch64 }
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # #1458: full history so build.rs author gate resolves real last editor, not HEAD
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
@@ -202,6 +206,8 @@ jobs:
           - { runner: macos-14, target: aarch64 }
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # #1458: full history so build.rs author gate resolves real last editor, not HEAD
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
@@ -233,6 +239,8 @@ jobs:
         target: [x64]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # #1458: full history so build.rs author gate resolves real last editor, not HEAD
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
