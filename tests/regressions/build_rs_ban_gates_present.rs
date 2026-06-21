@@ -41,6 +41,38 @@ pub(crate) fn required_ban_gates() -> Vec<String> {
     ]
 }
 
+/// The ban-scanner's FAILURE-SURFACE teeth: it is not enough that the gate
+/// FUNCTIONS exist — the report emitter that turns a detected violation into a
+/// *fatal-looking* CI signal must also stay intact. Commit `25babfc34` did not
+/// only delete a gate; it LAUNDERED severity: it softened the terminal
+/// "ban-scanner FAILED ... build aborted" summary into an informational
+/// "found ... violations", and stripped the per-offender `error:` / `error —`
+/// prefixes down to decorative rules so an abort reads as a benign note in CI
+/// logs. A future re-laundering of the report emitter would slip past the
+/// function-presence checks above. These tokens pin the teeth so it cannot.
+///
+/// Each token is assembled from fragments so the literal failure-surface string
+/// never appears verbatim in THIS file.
+pub(crate) fn required_failure_surface_teeth() -> Vec<String> {
+    // The em-dash (U+2014) used in the hard-fail summary and section headers.
+    let em_dash = "\u{2014}";
+    vec![
+        // Hard-fail summary token: the scanner's terminal cargo:warning render
+        // emits "ban-scanner FAILED: ... build aborted". Both halves must stay;
+        // softening either to an informational phrasing is severity-laundering.
+        format!("{}{}", "FAIL", "ED"),
+        format!("build {}{}", "abort", "ed"),
+        // Per-offender row prefix: render_report emits its violation rows with
+        // an `error: ` prefix (the leading total line and each "file:line").
+        // Demoting this to a decorative bullet hides offenders in CI output.
+        format!("{}: {{}}", "error"),
+        // Section-header prefix: render_report opens each rule's section with
+        // an `error — ` header. Stripping the `error` keyword launders the
+        // severity of the whole section to a neutral heading.
+        format!("{} {} {{}}", "error", em_dash),
+    ]
+}
+
 #[test]
 pub(crate) fn build_rs_ban_gates_are_all_present() {
     let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"))
@@ -58,5 +90,32 @@ pub(crate) fn build_rs_ban_gates_are_all_present() {
         "build.rs ban gate(s) MISSING — they were stripped; restore them \
          (do not remove ban gates). Missing: {}",
         missing.join(", ")
+    );
+}
+
+/// Guardian for severity-laundering: the ban-scanner's report emitter must keep
+/// rendering a *fatal* failure surface (FAILED / build aborted / error: /
+/// error —), not a softened informational note. This is the exact attack that
+/// commit `25babfc34` performed in addition to deleting a gate.
+#[test]
+pub(crate) fn build_rs_ban_scanner_failure_surface_is_not_laundered() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"))
+        .expect("build.rs must be readable at the crate manifest root");
+
+    let mut missing: Vec<String> = Vec::new();
+    for token in required_failure_surface_teeth() {
+        if !src.contains(&token) {
+            missing.push(token);
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "build.rs ban-scanner FAILURE SURFACE was laundered: token(s) {:?} \
+         missing — the abort must read as a failure (FAILED / build aborted / \
+         error: row-prefix / error \u{2014} section-header), restore it. A \
+         softened informational phrasing makes a fatal abort look benign in CI \
+         logs (this is the severity-laundering half of commit 25babfc34).",
+        missing
     );
 }
