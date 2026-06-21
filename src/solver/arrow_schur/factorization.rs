@@ -689,6 +689,45 @@ pub(crate) fn factor_one_row_result(
                     {
                         return Ok(deflated);
                     }
+                    // #1377 — route-independent intrinsic-dimension-flat recovery.
+                    // At `ridge_t = 0` the undamped per-row Cholesky of a #1273
+                    // intrinsic-dimension-flat block sits on a knife-edge: the
+                    // marginal pivot of the flat direction rounds to a *tiny
+                    // positive* value on one route (Cholesky succeeds → this `Ok`
+                    // arm) and to `≤ 0` on the other (Cholesky fails → the `Err`
+                    // arm below). The `Err` arm already deflates that flat
+                    // direction to UNIT stiffness via
+                    // `factor_spectral_deflated_evidence_row` (`log 1 = 0`
+                    // contribution), but this `Ok` arm previously returned the RAW
+                    // barely-PD factor whose tiny pivot contributes a large
+                    // `2·ln(√ε)` instead. The two memory-budget routes (dense
+                    // `factor_blocks_for_system` vs streaming
+                    // `reduced_schur_and_log_det_tt`) then disagreed on the
+                    // per-row log-det, breaking the streaming-plan identical-logdet
+                    // invariant and surfacing as a NON-PD `H_tt` on whichever route
+                    // landed on the failing side of the edge.
+                    //
+                    // Unify the two arms: when this is the SAE evidence path
+                    // (`allow_spectral_deflation`) and the just-computed factor is
+                    // NOT safely invertible (a near-flat / rank-deficient block, by
+                    // the SAME κ / min-pivot proxy used for the Δβ-accuracy gate
+                    // below), deflate it through the identical spectral recovery the
+                    // `Err` arm uses. A genuinely well-conditioned PD block
+                    // (`λ ≫ floor`) passes the safe-inversion proxy and is returned
+                    // bit-for-bit unchanged, so #1273's recovery and every healthy
+                    // block are untouched — only the marginal flat direction is now
+                    // deflated identically regardless of which side of the pivot
+                    // knife-edge a route lands on.
+                    if ridge_t == 0.0 && allow_spectral_deflation {
+                        let kappa_est = cholesky_factor_kappa_estimate(&factor);
+                        if !cholesky_factor_passes_safe_inversion(
+                            &factor, d, diag_scale, kappa_est,
+                        ) && let Some(deflated) =
+                            factor_spectral_deflated_evidence_row(row, d)
+                        {
+                            return Ok(deflated);
+                        }
+                    }
                     break ArrowRowFactorResult {
                         factor,
                         gauge_deflated_directions: 0,
