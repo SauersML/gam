@@ -66,24 +66,32 @@ const ENCODE_BATCH_ROWS: usize = 4096;
 const K_SMALL: usize = 64;
 const K_LARGE: usize = 1024;
 
-/// **Decision-gate floor (CPU-scaled).** The deployment gate is
-/// `10^5 rows/sec/GPU`. This CPU run has no GPU; a single modern CPU core
-/// running the dense arrow-Schur per-row solve sustains roughly 2–4 orders of
-/// magnitude below a saturated V100 batched kernel (no warp-level batching, no
-/// fused POTRF/TRSM, single-threaded faer Cholesky per row-block). We therefore
-/// set the CPU floor at `2_000 rows/sec` for the K=64 dictionary and scale it
-/// down linearly in K (the per-row data-Gram assembly cost grows with the active
-/// atom support, which grows with K). This floor is NOT trivially true: a naïve
-/// per-row dense `(KM)×(KM)` factorization — i.e. failing to exploit the arrow /
-/// active-set sparsity the production kernel relies on — falls *below* it for
-/// K=1024, so passing certifies the sparse kernel is actually being exercised.
-const CPU_THROUGHPUT_FLOOR_K64_ROWS_PER_SEC: f64 = 2_000.0;
-
 /// The GPU deployment gate, documented here so the decision rule is explicit in
-/// the assertion site. Meeting the CPU floor below is the proxy evidence that
-/// this gate is reachable on the GPU batched-encode seam (and hence that the
-/// Stage-3 amortized surrogate is NEVER built).
+/// the assertion site. The CPU floor below is DERIVED from this target divided by
+/// the documented CPU->GPU scaling, so the CPU-floor verdict and the GPU
+/// projection are one and the same decision (see `CPU_TO_GPU_SCALING` and the
+/// consistency assertion at the gate).
 const GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU: f64 = 1.0e5;
+
+/// Documented, openly-conservative CPU->GPU per-row-encode speedup. The
+/// arrow-Schur per-row solve is embarrassingly parallel across rows; a saturated
+/// datacentre GPU (thousands of FP64 lanes + fused POTRF/TRSM) sustains
+/// conservatively >= 2 orders of magnitude over this single-threaded-equivalent
+/// CPU per-row rate. This is the explicit bridge that turns a CPU-only
+/// measurement into a projected GPU rate; the surrogate decision is derived from
+/// whether `rps_cpu * CPU_TO_GPU_SCALING` clears the GPU gate.
+const CPU_TO_GPU_SCALING: f64 = 100.0;
+
+/// **Decision-gate floor (GPU-target-derived).** #1412: the floor is no longer
+/// an arbitrary CPU number — it is exactly `gate / scaling`, the CPU per-row rate
+/// that, under the documented `CPU_TO_GPU_SCALING`, projects to the
+/// `10^5 rows/sec/GPU` deployment gate. So "CPU rate >= floor" is identical to
+/// "projected GPU rate >= gate": the same, sound decision at both dictionary
+/// sizes. (The earlier `2_000 @ K=64, scaled to 125 @ K=1024` floor was the
+/// #1412 defect — 125 rows/sec * any plausible CPU->GPU factor cannot reach
+/// 10^5, so the old K=1024 floor passed while the deployment target was missed.)
+const CPU_THROUGHPUT_FLOOR_ROWS_PER_SEC: f64 =
+    GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU / CPU_TO_GPU_SCALING;
 
 /// Deterministic Lehmer-style uniform in [0,1) keyed purely by index (no clock).
 fn idx_uniform(seed: u64) -> f64 {
@@ -385,39 +393,62 @@ fn sae_encode_throughput_decision_gate() {
     let rps_small = measure_encode_rows_per_sec(K_SMALL);
     let rps_large = measure_encode_rows_per_sec(K_LARGE);
 
-    // K-scaled CPU floor: the per-row data-Gram assembly cost grows with the
-    // active support's reach into the dictionary, so the steady-state floor is
-    // scaled down from the K=64 anchor proportionally to K. (The active support
-    // per row is fixed at ACTIVE_PER_ROW, but the dense arrow spine the assembly
-    // walks grows with K, so this is the conservative, defensible scaling.)
-    let floor_small = CPU_THROUGHPUT_FLOOR_K64_ROWS_PER_SEC;
-    let floor_large = CPU_THROUGHPUT_FLOOR_K64_ROWS_PER_SEC * (K_SMALL as f64) / (K_LARGE as f64);
+    // #1412: a SINGLE, GPU-target-derived floor at both dictionary sizes. The
+    // floor is gate/scaling, so "CPU rate >= floor" IS "projected GPU rate >=
+    // gate" — the same sound decision. (The old `2000 @ K=64 -> 125 @ K=1024`
+    // K-scaled floor was the defect: 125 rows/sec cannot project to 10^5 under
+    // any plausible CPU->GPU factor, so the K=1024 floor passed while the
+    // deployment target was missed.)
+    let floor = CPU_THROUGHPUT_FLOOR_ROWS_PER_SEC;
+    let projected_gpu_small = rps_small * CPU_TO_GPU_SCALING;
+    let projected_gpu_large = rps_large * CPU_TO_GPU_SCALING;
 
     println!(
-        "DECISION: K={K_SMALL} {rps_small:.1} rows/sec (floor {floor_small:.1}); \
-         K={K_LARGE} {rps_large:.1} rows/sec (floor {floor_large:.1})"
+        "DECISION: K={K_SMALL} {rps_small:.1} rows/sec (floor {floor:.1}, projected GPU \
+         ~{projected_gpu_small:.0}); K={K_LARGE} {rps_large:.1} rows/sec (floor {floor:.1}, \
+         projected GPU ~{projected_gpu_large:.0}); gate {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} \
+         rows/sec/GPU"
     );
-    let surrogate_unneeded = rps_small >= floor_small && rps_large >= floor_large;
+    let surrogate_unneeded = rps_small >= floor && rps_large >= floor;
     println!(
         "Stage-3 amortized surrogate needed? {}",
         if surrogate_unneeded {
-            "NO"
+            "NO (exact encode projects to clear the GPU gate at both K)"
         } else {
-            "YES (exact encode below floor)"
+            "YES (exact encode below the GPU-target-derived floor)"
         }
     );
 
     assert!(
-        rps_small >= floor_small,
-        "K={K_SMALL} exact encode throughput {rps_small:.1} rows/sec is below the CPU decision \
-         floor {floor_small:.1} rows/sec — the exact per-row encode cannot meet the \
-         {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} rows/sec/GPU gate, so a certified Stage-3 \
-         amortized surrogate becomes justified"
+        rps_small >= floor,
+        "K={K_SMALL} exact encode throughput {rps_small:.1} rows/sec is below the \
+         GPU-target-derived floor {floor:.1} rows/sec (= {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} \
+         / {CPU_TO_GPU_SCALING:.0}); at a conservative {CPU_TO_GPU_SCALING:.0}x CPU->GPU speedup the \
+         projected GPU throughput ~{projected_gpu_small:.0} rows/sec/GPU misses the deployment gate, \
+         so a certified Stage-3 amortized surrogate becomes justified"
     );
     assert!(
-        rps_large >= floor_large,
-        "K={K_LARGE} exact encode throughput {rps_large:.1} rows/sec is below the K-scaled CPU \
-         decision floor {floor_large:.1} rows/sec — large-dictionary exact encode misses the \
-         gate, so a certified Stage-3 amortized surrogate becomes justified"
+        rps_large >= floor,
+        "K={K_LARGE} exact encode throughput {rps_large:.1} rows/sec is below the \
+         GPU-target-derived floor {floor:.1} rows/sec; at a conservative {CPU_TO_GPU_SCALING:.0}x \
+         CPU->GPU speedup the projected GPU throughput ~{projected_gpu_large:.0} rows/sec/GPU misses \
+         the {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} rows/sec/GPU gate at the large dictionary, \
+         so a certified Stage-3 amortized surrogate becomes justified"
+    );
+
+    // Internal consistency: because the floor is gate/scaling, the CPU-floor
+    // verdict and the projected-GPU verdict are the SAME decision. Assert that
+    // identity so a future edit that decouples the floor from the gate (the
+    // #1412 defect) cannot silently reintroduce a CPU floor that passes while the
+    // GPU target is missed.
+    let projection_clears_gate = projected_gpu_small
+        >= GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU
+        && projected_gpu_large >= GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU;
+    assert_eq!(
+        surrogate_unneeded, projection_clears_gate,
+        "#1412: the CPU-floor verdict ({surrogate_unneeded}) and the documented \
+         x{CPU_TO_GPU_SCALING:.0} GPU-projection verdict ({projection_clears_gate}) must be the same \
+         decision (the floor is gate/scaling); a divergence means the floor was decoupled from the \
+         {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} rows/sec/GPU gate — the #1412 defect"
     );
 }

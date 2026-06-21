@@ -3190,6 +3190,171 @@ pub(crate) fn matrix_free_plan_admits_when_in_core_budget_collapses_to_zero() {
     assert!(plan.admitted_or_error(n_obs, border_dim, k_atoms).is_ok());
 }
 
+/// Build a `K`-atom softmax SAE term whose per-row logits concentrate on a
+/// planted small support, for the #1450 end-to-end large-K compact-path test.
+///
+/// Every atom is a 1-D `EuclideanPatch` with an `M=2` constant+linear basis and
+/// a distinct decoder direction, so the reconstruction is genuine and the
+/// per-row Arrow-Schur block has a real data-fit Gauss-Newton contribution.
+/// Row `i`'s logits put large mass on its planted active atoms and a uniform
+/// floor on every other atom, so the softmax assignment vector concentrates on
+/// the planted set (the true top-`k` support) while the dropped tail carries
+/// negligible `O(a)` mass — exactly the regime the compact softmax layout
+/// (#1408/#1409) is meant to optimize.
+#[cfg(test)]
+fn planted_softmax_sae_term(
+    n: usize,
+    k_atoms: usize,
+    planted: &[Vec<usize>],
+    p: usize,
+) -> (SaeManifoldTerm, Array2<f64>) {
+    assert_eq!(planted.len(), n);
+    let mut atoms = Vec::with_capacity(k_atoms);
+    let mut coord_blocks = Vec::with_capacity(k_atoms);
+    let mut manifolds = Vec::with_capacity(k_atoms);
+    // Shared constant+linear basis evaluation: column 0 = 1, column 1 = t.
+    let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| (row as f64 / n as f64) - 0.5);
+    for atom_idx in 0..k_atoms {
+        let mut phi = Array2::<f64>::zeros((n, 2));
+        let mut jet = Array3::<f64>::zeros((n, 2, 1));
+        for row in 0..n {
+            phi[[row, 0]] = 1.0;
+            phi[[row, 1]] = coords[[row, 0]];
+            jet[[row, 1, 0]] = 1.0;
+        }
+        // Distinct decoder direction per atom: maps the linear basis column onto
+        // output channel `atom_idx % p` with a small magnitude.
+        let mut decoder = Array2::<f64>::zeros((2, p));
+        decoder[[1, atom_idx % p]] = 0.1 + 0.01 * ((atom_idx % 7) as f64);
+        atoms.push(
+            SaeManifoldAtom::new(
+                format!("atom{atom_idx}"),
+                SaeAtomBasisKind::EuclideanPatch,
+                1,
+                phi,
+                jet,
+                decoder,
+                Array2::<f64>::eye(2),
+            )
+            .unwrap(),
+        );
+        coord_blocks.push(coords.clone());
+        manifolds.push(LatentManifold::Euclidean);
+    }
+    // Logits: a small uniform floor everywhere, large mass on the planted atoms.
+    let mut logits = Array2::<f64>::from_elem((n, k_atoms), -6.0);
+    for (row, active) in planted.iter().enumerate() {
+        for &k in active {
+            logits[[row, k]] = 6.0;
+        }
+    }
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        coord_blocks,
+        manifolds,
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+    let target =
+        Array2::<f64>::from_shape_fn((n, p), |(row, c)| 0.05 * ((row + c) as f64).sin());
+    (term, target)
+}
+
+/// #1450 — end-to-end large-`K` compact-path contract for the softmax SAE
+/// encode: the assignment→support-proposal→assembly path must produce a per-row
+/// block whose dimension tracks the per-row active-atom count `k_active`, NOT
+/// the total `K`, and the assembled support must recover the planted top-`k`
+/// atoms. This drives the REAL paths #1408/#1409 fixed
+/// (`softmax_active_plan` → `from_dense_weights` → compact `assemble_arrow_schur`
+/// in fixed-decoder mode), not a hand-built `from_active_atoms` layout, and at a
+/// `K` (1000) large enough that a full-`K` per-row block would be ~1000× larger.
+#[test]
+pub(crate) fn large_k_softmax_compact_encode_is_o1_per_token_and_recovers_support() {
+    let n = 8usize;
+    let p = 4usize;
+    let top_k = 3usize;
+    // Each row's planted top-`top_k` support, spread across the full K range so a
+    // correct selection must scan all K (not just a prefix).
+    let planted: Vec<Vec<usize>> = (0..n).map(|row| vec![row, 300 + row, 700 + row]).collect();
+
+    // Assemble at two widely-separated K with the SAME k_active and planted
+    // support; the per-row compact dims must be IDENTICAL (n-free / independent
+    // of K) and bounded by O(top_k).
+    let assemble_dims = |k_atoms: usize| -> (Vec<usize>, Vec<Vec<usize>>) {
+        let (mut term, target) = planted_softmax_sae_term(n, k_atoms, &planted, p);
+        // Fold top_k into the OPTIMIZATION (the #1409 fix): softmax now engages
+        // the compact top-`k` row layout instead of a post-fit projection.
+        term.set_softmax_active_cap(Some(top_k));
+        // Fixed-decoder encode assembly (the #1407 path the encoder uses): only
+        // the per-row htt/gt block is produced.
+        term.fixed_decoder_assembly = true;
+        let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k_atoms]);
+        let sys = term
+            .assemble_arrow_schur(target.view(), &rho, None)
+            .expect("compact softmax fixed-decoder assembly must succeed at large K");
+        let dims: Vec<usize> = sys.rows.iter().map(|r| r.htt.nrows()).collect();
+        // Each row's htt must be square and match gt.
+        for r in &sys.rows {
+            assert_eq!(r.htt.nrows(), r.htt.ncols());
+            assert_eq!(r.htt.nrows(), r.gt.len());
+        }
+        let layout = term
+            .last_row_layout
+            .clone()
+            .expect("softmax at large K must engage the COMPACT active-set layout (#1408)");
+        let active: Vec<Vec<usize>> = layout.active_atoms.clone();
+        (dims, active)
+    };
+
+    let (dims_1k, active_1k) = assemble_dims(1_000);
+    let (dims_10k, active_10k) = assemble_dims(10_000);
+
+    // (a) O(1)-per-token / n-free: per-row block dim is bounded by the active
+    // contract `top_k·(1 + d) = top_k·2` for d=1 coords, and is IDENTICAL across
+    // K=1000 and K=10000 (independent of total K). A full-K block would be
+    // `q = (K-1) + K·d`, i.e. ~3000 and ~30000 — orders of magnitude larger.
+    let bound = top_k * (1 + 1); // |active| + Σ d_k  (d_k = 1)
+    for row in 0..n {
+        assert!(
+            dims_1k[row] <= bound,
+            "row {row} K=1000 compact dim {} exceeds O(top_k) bound {bound}",
+            dims_1k[row]
+        );
+        assert_eq!(
+            dims_1k[row], dims_10k[row],
+            "row {row} compact dim must be INDEPENDENT of total K (n-free contract): \
+             K=1000 gave {} but K=10000 gave {}",
+            dims_1k[row], dims_10k[row]
+        );
+    }
+    // The full-K dense block would dwarf the compact one: assert the compact
+    // total work is < 1/100 of the dense block even at the smaller K=1000.
+    let compact_work: usize = dims_1k.iter().map(|&q| q * q).sum();
+    let dense_q = (1_000 - 1) + 1_000; // (K-1) free logits + K coord axes
+    let dense_work = n * dense_q * dense_q;
+    assert!(
+        compact_work * 100 < dense_work,
+        "compact work {compact_work} must be << dense work {dense_work}"
+    );
+
+    // (b) Support recovery: the proposed active set must be exactly the planted
+    // top-`top_k` atoms for every row, at BOTH K (the proposal path scanned the
+    // full K and selected the planted peaks, not an arbitrary prefix).
+    for row in 0..n {
+        let mut expected = planted[row].clone();
+        expected.sort_unstable();
+        assert_eq!(
+            active_1k[row], expected,
+            "row {row} K=1000 active set must recover the planted top-{top_k} support"
+        );
+        assert_eq!(
+            active_10k[row], expected,
+            "row {row} K=10000 active set must recover the planted top-{top_k} support"
+        );
+    }
+}
+
 #[test]
 pub(crate) fn sparse_active_layout_work_scales_with_active_atoms_not_total_k() {
     let n = 3;
@@ -8033,16 +8198,16 @@ pub(crate) fn outer_gradient_internal_invariant_is_not_fd_eligible_1436() {
         reason: "shape mismatch".to_string(),
     };
     assert!(
-        ill_conditioned.is_fd_eligible(),
-        "IllConditioned must be FD-eligible (#1273)"
+        ill_conditioned.is_conditioning_recoverable(),
+        "IllConditioned must be conditioning-recoverable (#1273)"
     );
     assert!(
-        non_identifiable.is_fd_eligible(),
-        "NonIdentifiable must be FD-eligible (#1273)"
+        non_identifiable.is_conditioning_recoverable(),
+        "NonIdentifiable must be conditioning-recoverable (#1273)"
     );
     assert!(
-        !internal.is_fd_eligible(),
-        "InternalInvariant must NOT be FD-eligible (#1436) — it must propagate"
+        !internal.is_conditioning_recoverable(),
+        "InternalInvariant must NOT be conditioning-recoverable (#1436) — it must propagate"
     );
     // The Display output must be descriptive enough for the outer log.
     assert!(
@@ -8053,13 +8218,13 @@ pub(crate) fn outer_gradient_internal_invariant_is_not_fd_eligible_1436() {
 }
 
 /// #1436 — exercise the EXACT gate `SaeManifoldOuterObjective::eval` consults,
-/// `OuterGradientError::admits_fd_fallback`, over the full `cost x error-class`
-/// matrix. `is_fd_eligible` alone does not capture the cost interaction the call
+/// `OuterGradientError::admits_plain_solver_fallback`, over the full `cost x error-class`
+/// matrix. `is_conditioning_recoverable` alone does not capture the cost interaction the call
 /// site depends on; this pins the composed contract so the FD fallback can never
 /// silently absorb an internal-invariant failure NOR fire at an infeasible
 /// (non-finite-cost) ρ — both must propagate as hard errors.
 #[test]
-pub(crate) fn admits_fd_fallback_only_for_conditioning_at_finite_cost_1436() {
+pub(crate) fn admits_plain_solver_fallback_only_for_conditioning_at_finite_cost_1436() {
     let ill = OuterGradientError::IllConditioned {
         reason: "near-singular joint Hessian".to_string(),
     };
@@ -8073,16 +8238,16 @@ pub(crate) fn admits_fd_fallback_only_for_conditioning_at_finite_cost_1436() {
     // Finite cost: only the genuine #1273 conditioning/identifiability classes
     // admit the FD descent direction.
     assert!(
-        ill.admits_fd_fallback(1.0),
-        "IllConditioned at a finite-cost ρ must admit the #1273 FD fallback"
+        ill.admits_plain_solver_fallback(1.0),
+        "IllConditioned at a finite-cost ρ must admit the #1273/#1440 analytic plain-solver fallback"
     );
     assert!(
-        non_id.admits_fd_fallback(1.0),
-        "NonIdentifiable at a finite-cost ρ must admit the #1273 FD fallback"
+        non_id.admits_plain_solver_fallback(1.0),
+        "NonIdentifiable at a finite-cost ρ must admit the #1273/#1440 analytic plain-solver fallback"
     );
     assert!(
-        !internal.admits_fd_fallback(1.0),
-        "InternalInvariant must NEVER admit the FD fallback, even at a finite \
+        !internal.admits_plain_solver_fallback(1.0),
+        "InternalInvariant must NEVER admit the plain-solver fallback, even at a finite \
          cost (#1436) — it must propagate as a hard error"
     );
 
@@ -8091,16 +8256,16 @@ pub(crate) fn admits_fd_fallback_only_for_conditioning_at_finite_cost_1436() {
     // to descend.
     for bad_cost in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
         assert!(
-            !ill.admits_fd_fallback(bad_cost),
-            "IllConditioned must NOT admit FD at non-finite cost {bad_cost}"
+            !ill.admits_plain_solver_fallback(bad_cost),
+            "IllConditioned must NOT admit the plain-solver fallback at non-finite cost {bad_cost}"
         );
         assert!(
-            !non_id.admits_fd_fallback(bad_cost),
-            "NonIdentifiable must NOT admit FD at non-finite cost {bad_cost}"
+            !non_id.admits_plain_solver_fallback(bad_cost),
+            "NonIdentifiable must NOT admit the plain-solver fallback at non-finite cost {bad_cost}"
         );
         assert!(
-            !internal.admits_fd_fallback(bad_cost),
-            "InternalInvariant must NOT admit FD at non-finite cost {bad_cost}"
+            !internal.admits_plain_solver_fallback(bad_cost),
+            "InternalInvariant must NOT admit the plain-solver fallback at non-finite cost {bad_cost}"
         );
     }
 }

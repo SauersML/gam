@@ -6137,35 +6137,45 @@ fn build_by_smooth_local(
                 }
             }
 
-            // Build block-diagonal penalties: one copy of the inner penalty per
-            // level, matching the block-column layout of the combined design.
+            // Build per-level INDEPENDENT penalties (#1427): one copy of each
+            // inner penalty per level, but each confined to that single level's
+            // diagonal block, so every (level, inner-penalty) pair is its OWN
+            // smoothing-parameter coordinate. `s(x, by=g)` selects the per-group
+            // curve wiggliness independently — the design is block-diagonal and
+            // block-separable, so a correct REML must reproduce gamfit's own
+            // independent per-group fits. Tiling a single inner penalty across
+            // every level (as the `bs="fs"` shared-λ random-effect construction
+            // does) collapses all groups onto ONE λ, which cannot match uneven
+            // per-level smoothness and degrades as data grows (under-recovery up
+            // to ~16× at n=2000). Emit `n_levels * n_penalties` blocks instead.
             let inner_meta = inner.metadata.clone();
             let n_penalties = inner.penalties.len();
-            let mut penalties = Vec::<Array2<f64>>::with_capacity(n_penalties);
-            let mut penaltyinfo = Vec::<PenaltyInfo>::with_capacity(n_penalties);
+            let n_blocks = n_penalties.saturating_mul(n_levels);
+            let mut penalties = Vec::<Array2<f64>>::with_capacity(n_blocks);
+            let mut penaltyinfo = Vec::<PenaltyInfo>::with_capacity(n_blocks);
+            let mut nullspaces = Vec::<usize>::with_capacity(n_blocks);
             for (pen_pos, s_inner) in inner.penalties.iter().enumerate() {
-                let mut s_big = Array2::<f64>::zeros((q, q));
                 for lvl in 0..n_levels {
                     let off = lvl * p;
+                    let mut s_big = Array2::<f64>::zeros((q, q));
                     s_big
                         .slice_mut(s![off..off + p, off..off + p])
                         .assign(s_inner);
+                    let (s_big, scale) = normalize_penalty_in_constrained_space(&s_big);
+                    let mut info = inner.penaltyinfo[pen_pos].clone();
+                    // Distinct original_index per (penalty, level) so each λ is a
+                    // separate identifiable coordinate downstream.
+                    info.original_index = pen_pos * n_levels + lvl;
+                    info.normalization_scale *= scale;
+                    // Each block now spans exactly ONE level → per-level nullity,
+                    // not the tiled (× n_levels) hint of the shared construction.
+                    info.kronecker_factors = None;
+                    penalties.push(s_big);
+                    penaltyinfo.push(info);
+                    nullspaces.push(inner.nullspaces[pen_pos]);
                 }
-                let (s_big, scale) = normalize_penalty_in_constrained_space(&s_big);
-                let mut info = inner.penaltyinfo[pen_pos].clone();
-                info.original_index = pen_pos;
-                info.normalization_scale *= scale;
-                info.nullspace_dim_hint = info.nullspace_dim_hint.saturating_mul(n_levels);
-                info.kronecker_factors = None;
-                penalties.push(s_big);
-                penaltyinfo.push(info);
             }
 
-            let nullspaces = inner
-                .nullspaces
-                .iter()
-                .map(|&ns| ns.saturating_mul(n_levels))
-                .collect::<Vec<_>>();
             let null_eigenvectors = vec![None; penalties.len()];
             let ops = vec![None; penalties.len()];
 

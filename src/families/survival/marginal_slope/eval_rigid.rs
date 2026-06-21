@@ -89,11 +89,16 @@ impl SurvivalMarginalSlopeFamily {
         } else {
             Some(event_secondary.as_slice())
         };
+        // The outer ρ is supplied externally via `OuterEvalContext`; a
+        // non-contiguous view here is degenerate but possible. Auto-subsampling
+        // is a pure performance optimization, so fall back to the original
+        // options (full-data eval) rather than panicking.
+        let rho_slice = ctx.rho.as_slice()?;
         crate::families::marginal_slope_shared::maybe_install_auto_outer_subsample(
             options,
             z_key.as_slice().expect("z key must be contiguous"),
             secondary_strata,
-            ctx.rho.as_slice().expect("outer rho must be contiguous"),
+            rho_slice,
             &self.auto_subsample_phase_counter,
             &self.auto_subsample_last_rho,
             SURVIVAL_MGS_AUTO_SUBSAMPLE_PHASE1_BUDGET,

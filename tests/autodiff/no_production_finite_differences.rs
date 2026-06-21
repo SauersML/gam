@@ -37,17 +37,15 @@ const BANNED_PRODUCTION_MARKERS: &[&str] = &[
 /// `terms/sae/manifold/outer_objective.rs` matches regardless of the absolute
 /// prefix. Each entry MUST carry a justification comment.
 const SANCTIONED_FD_FILES: &[&str] = &[
-    // #1273 / #1436 / #1440: SAE outer-ρ optimisation. The real finite-difference
-    // fallback has already been removed — the outer-ρ descent direction is now the
-    // plain analytic `DeflatedArrowSolver::plain` gradient, never differenced. The
-    // ONLY residue is two stale fd-NAMED predicates (`is_fd_eligible`,
-    // `admits_fd_fallback`) that no longer compute any FD; they gate the analytic
-    // plain-solver fallback. These two entries are TEMPORARY: they exist solely so
-    // the `fd_`/`_fd` identifier names do not trip the scanner until the SAE owner
-    // renames them, at which point both entries must be deleted (the membership
-    // test below pins them so the deletion is not forgotten).
-    "terms/sae/manifold/outer_objective.rs",
-    "terms/sae/manifold/construction.rs",
+    // #1273 / #1436 / #1440: the SAE outer-ρ optimisation's finite-difference
+    // fallback is fully removed — the descent direction is now the plain analytic
+    // `DeflatedArrowSolver::plain` gradient, never differenced — AND the two
+    // stale fd-NAMED predicates that gated it have been renamed off the `fd_`/`_fd`
+    // pattern (`is_fd_eligible` → `is_conditioning_recoverable`,
+    // `admits_fd_fallback` → `admits_plain_solver_fallback`). The SAE manifold
+    // files therefore carry no FD and no fd-NAMED identifiers, so they are no
+    // longer allowlisted. The allowlist is empty: there is currently no sanctioned
+    // production finite difference in the tree.
 ];
 
 /// True when `path` is on the [`SANCTIONED_FD_FILES`] allowlist and may
@@ -511,12 +509,13 @@ fn production_code() {
 
 #[test]
 fn sanctioned_fd_allowlist_membership_is_correct() {
-    // The SAE #1273 stale-fd-name site is tracked on the allowlist (temporary,
-    // pending the SAE owner's rename — see SANCTIONED_FD_FILES doc).
-    assert!(fd_ok_markers_allowed(Path::new(
+    // #1440: the SAE #1273 outer-ρ files are NO LONGER allowlisted — the FD
+    // fallback was removed and its fd-NAMED predicates were renamed off the
+    // `fd_`/`_fd` pattern, so the files carry no FD and need no exemption.
+    assert!(!fd_ok_markers_allowed(Path::new(
         "/Users/anyone/gam/src/terms/sae/manifold/outer_objective.rs"
     )));
-    assert!(fd_ok_markers_allowed(Path::new(
+    assert!(!fd_ok_markers_allowed(Path::new(
         "src/terms/sae/manifold/construction.rs"
     )));
     // The FD-audit oracle is NOT whole-file allowlisted: it exempts itself with

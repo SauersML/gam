@@ -24,10 +24,10 @@ pub(crate) enum OuterGradientError {
 }
 
 impl OuterGradientError {
-    /// Whether this error class is eligible for the #1273 FD fallback (i.e. it
-    /// represents a legitimate conditioning/identifiability failure, not a
-    /// programming/invariant defect).
-    pub(crate) fn is_fd_eligible(&self) -> bool {
+    /// Whether this error class is recoverable by the #1273/#1440 analytic
+    /// plain-solver fallback (i.e. it represents a legitimate
+    /// conditioning/identifiability failure, not a programming/invariant defect).
+    pub(crate) fn is_conditioning_recoverable(&self) -> bool {
         matches!(
             self,
             Self::IllConditioned { .. } | Self::NonIdentifiable { .. }
@@ -50,10 +50,11 @@ impl OuterGradientError {
     /// A genuine rank-deficiency / near-singularity failure (a back-solve or
     /// Cholesky/Woodbury factor that tripped on a finite, correctly-shaped input)
     /// is a legitimate #1273 conditioning failure and keeps `conditioning_err`
-    /// (`IllConditioned`), so it stays FD-eligible. A shape/dimension mismatch or
-    /// a non-finite intermediate is an internal-invariant defect and MUST
-    /// propagate ([`Self::internal`]) instead of being masked as a
-    /// plausible-but-wrong FD descent direction — exactly the #1436 contract.
+    /// (`IllConditioned`), so it stays recoverable by the analytic fallback. A
+    /// shape/dimension mismatch or a non-finite intermediate is an
+    /// internal-invariant defect and MUST propagate ([`Self::internal`]) instead
+    /// of being masked as a plausible-but-wrong descent direction — exactly the
+    /// #1436 contract.
     ///
     /// The two solver helpers return `String` (not a typed error), so the
     /// distinction is drawn from the stable markers those helpers emit for their
@@ -82,24 +83,25 @@ impl OuterGradientError {
     }
 
     /// The exact gate the gradient lane (`SaeManifoldOuterObjective::eval`) uses
-    /// to decide whether to descend with the #1273 central-difference fallback
-    /// instead of propagating the error as a hard failure.
+    /// to decide whether to descend with the #1273/#1440 analytic plain-solver
+    /// fallback instead of propagating the error as a hard failure.
     ///
     /// The fallback is admissible ONLY when BOTH hold:
     /// * the REML cost at this rho is finite (a genuinely feasible point -- the
-    ///   FD supplies a descent direction for a value the analytic path already
-    ///   produced), and
+    ///   plain analytic solver supplies a descent direction for a value the
+    ///   analytic path already produced), and
     /// * the error is a legitimate conditioning/identifiability failure
-    ///   ([`Self::is_fd_eligible`]) -- the genuine #1273 flat-valley case.
+    ///   ([`Self::is_conditioning_recoverable`]) -- the genuine #1273 flat-valley
+    ///   case.
     ///
     /// A non-finite cost or an [`OuterGradientError::InternalInvariant`] must
     /// propagate: masking a shape/indexing bug, a non-finite intermediate, or a
-    /// violated invariant behind a plausible-but-wrong FD step is exactly the
+    /// violated invariant behind a plausible-but-wrong step is exactly the
     /// regression #1436 closes. Centralising the decision here (rather than
     /// inlining the boolean at the call site) makes the `cost x error-class`
     /// contract a single, directly unit-testable predicate.
-    pub(crate) fn admits_fd_fallback(&self, cost: f64) -> bool {
-        cost.is_finite() && self.is_fd_eligible()
+    pub(crate) fn admits_plain_solver_fallback(&self, cost: f64) -> bool {
+        cost.is_finite() && self.is_conditioning_recoverable()
     }
 }
 
@@ -206,6 +208,7 @@ impl SaeManifoldTerm {
             row_loss_weights: None,
             last_frames_active: false,
             fixed_decoder_assembly: false,
+            softmax_active_cap: None,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             certificate_dispersion: None,
             curvature_walk_report: None,
@@ -219,6 +222,18 @@ impl SaeManifoldTerm {
             atom_inner_fits: None,
             oos_linear_images: None,
         })
+    }
+
+    /// #1408/#1409 — install the optional hard per-row active-atom cap for
+    /// Softmax mode (threaded from the fit/encode `top_k`). A `Some(k)` with
+    /// `1 <= k < K` makes the Softmax assignment optimize on the COMPACT
+    /// top-`k` row layout (see [`Self::softmax_active_cap`]); `Some(k) >= K`
+    /// and `None` are both no-ops (full support). Non-softmax modes ignore it.
+    pub fn set_softmax_active_cap(&mut self, top_k: Option<usize>) {
+        self.softmax_active_cap = match top_k {
+            Some(k) if k >= 1 && k < self.k_atoms() => Some(k),
+            _ => None,
+        };
     }
 
     /// Install the fitted reconstruction dispersion used by
@@ -1916,6 +1931,35 @@ impl SaeManifoldTerm {
             return None;
         }
         Some((k_active_cap, RELATIVE_CUTOFF))
+    }
+
+    /// #1408/#1409 — per-row active-set plan for the Softmax assignment.
+    ///
+    /// Engages the compact top-`k` row layout when EITHER the user supplied a
+    /// hard `top_k` cap ([`Self::softmax_active_cap`], `1 <= k < K`) OR the
+    /// dense data Gram exceeds the in-core budget (the same memory lever the
+    /// IBP path uses via [`Self::sparse_active_plan`]). The returned
+    /// `k_active_cap` is the tighter of the two, so an explicit `top_k`
+    /// genuinely bounds the optimization even below the memory threshold and a
+    /// large-K budget breach still bounds it when no `top_k` is set. Returns
+    /// `None` (keep the exact full-`K` dense softmax layout) when neither lever
+    /// engages.
+    ///
+    /// The cutoff is the same relative magnitude floor as the budget plan
+    /// (`1e-3` of the row peak); under an explicit `top_k` cap alone (no budget
+    /// breach) it is `0.0` so exactly the top-`k` atoms are retained.
+    pub(crate) fn softmax_active_plan(&self) -> Option<(usize, f64)> {
+        if self.k_atoms() <= 1 {
+            return None;
+        }
+        let budget_plan = self.sparse_active_plan();
+        match (self.softmax_active_cap, budget_plan) {
+            (Some(cap), Some((budget_cap, cutoff))) => Some((cap.min(budget_cap), cutoff)),
+            // Explicit cap only: retain exactly the top-`cap` atoms (no extra
+            // magnitude cutoff beyond the cap).
+            (Some(cap), None) => Some((cap, 0.0)),
+            (None, plan) => plan,
+        }
     }
 
     pub fn flatten_beta(&self) -> Array1<f64> {
@@ -3649,42 +3693,47 @@ impl SaeManifoldTerm {
                     coord_dims.clone(),
                     self.assignment.coord_offsets(),
                 )),
-                // #1408/#1409 PLAN (NOT yet implemented — documented precisely;
-                // deferred because the clean fix is a coordinated 3-site change
-                // whose value↔gradient coherence cannot be confirmed without the
-                // FD contract gates, and a partial version would desync them).
+                // #1408/#1409 — Softmax engages the COMPACT top-`k` row layout
+                // inside the optimization (no longer a post-fit projection).
+                // The active set is each row's top-`k_active_cap` softmax atoms
+                // above the relative cutoff; the cap comes from the user's
+                // `top_k` (`softmax_active_cap`) and/or the in-core memory budget
+                // ([`Self::softmax_active_plan`]). The full-`K` softmax
+                // normalization still forms `a` (the gate map); only the dropped
+                // tail logits, carrying negligible `O(a)` reconstruction mass and
+                // `O(a²)` curvature, leave the per-row block.
                 //
-                // Softmax currently never engages the compact top-k layout, so a
-                // `top_k`-capped softmax still optimizes all K atoms and the FFI
-                // truncates only AFTER the full-K fit (#1409,
-                // latent_basis_and_sae_ffi.rs ~2833/6392). To fold top-k into the
-                // optimization:
-                //   1. Return `Some(SaeRowLayout::from_dense_weights(softmax a_·,
-                //      k_active_cap = top_k.min(plan cap), relative_cutoff))` here,
-                //      exactly like the IBP branch below (the active set is the
-                //      per-row top-k softmax weights).
-                //   2. COMPACT CURVATURE (the load-bearing correctness step): the
-                //      compact branch must NOT write the `assignment_hdiag`
-                //      diagonal for softmax — that diagonal is the INDEFINITE exact
-                //      entropy Hessian (#1190), which drives the block non-PD. It
-                //      must instead write the ACTIVE×ACTIVE principal sub-block of
-                //      the Gershgorin majorizer `D = diag(Σ_j|H_kj|)` (#1419; PSD
-                //      and `D ⪰ H_entropy`), mirroring the dense `softmax_dense`
-                //      path. The full-K softmax normalization is retained when
-                //      forming `a` (the gate map), so dropped tail logits contribute
-                //      negligible (`O(a)`) mass.
-                //   3. COHERENCE: the logdet (`assignment_log_strength_hessian_trace`
-                //      softmax branch) and the θ-adjoint (`softmax_dense_adjoint`,
-                //      currently gated on the dense `None` layout) must BOTH be
-                //      extended to contract the SAME active-sub-block majorizer
-                //      and its `row_psd_majorizer_logit_derivative` over the compact
-                //      logit slots — otherwise value, log|H|, and Γ desync (the
-                //      bug class `criterion_atoms.rs` exists to kill). This is the
-                //      part that needs the FD/contract gates to certify.
-                // #1409's hard-k-sparse softmax inner problem is then exactly the
-                // compact top-k layout fit; the FFI post-hoc truncation collapses
-                // to a no-op (the optimum is already k-sparse).
-                AssignmentMode::Softmax { .. } => None,
+                // Coherence (the load-bearing correctness invariant): the
+                // assembly's softmax curvature branch writes the ACTIVE×ACTIVE
+                // principal sub-block of the Gershgorin Loewner majorizer
+                // `D = diag(Σ_j|H_kj|)` (#1419; PSD and `D ⪰ H_entropy`) on the
+                // compact logit slots — NOT the indefinite `assignment_hdiag`
+                // diagonal. The logdet ρ-trace
+                // (`assignment_log_strength_hessian_trace`) iterates the row's
+                // active logit slots and indexes that SAME majorizer by global
+                // atom, and the θ-adjoint reads its derivative via `jets.vars`
+                // (global-atom indexed), so value, log|H|, and Γ differentiate
+                // ONE operator on the compact support. The FFI's after-the-fit
+                // top-`k` projection is then a no-op at the optimum.
+                AssignmentMode::Softmax { .. } => {
+                    match self.softmax_active_plan() {
+                        Some((k_active_cap, relative_cutoff)) => {
+                            let mut assignments_all = Vec::with_capacity(n);
+                            for row in 0..n {
+                                assignments_all
+                                    .push(self.assignment.try_assignments_row_for_rho(row, rho)?);
+                            }
+                            Some(SaeRowLayout::from_dense_weights(
+                                &assignments_all,
+                                k_active_cap,
+                                relative_cutoff,
+                                coord_dims.clone(),
+                                self.assignment.coord_offsets(),
+                            ))
+                        }
+                        None => None,
+                    }
+                }
                 AssignmentMode::IBPMap { .. } => {
                     match self.sparse_active_plan() {
                         Some((k_active_cap, relative_cutoff)) => {
@@ -3852,7 +3901,7 @@ impl SaeManifoldTerm {
                     .mode
                     .resolved_ibp_alpha(rho)
                     .ok_or_else(|| "IBP assignment alpha resolution failed".to_string())?;
-                Some(ordered_geometric_shrinkage_prior(k_atoms, alpha).to_vec())
+                Some(ibp_stick_breaking_prior(k_atoms, alpha).to_vec())
             }
             _ => None,
         };
@@ -3913,8 +3962,8 @@ impl SaeManifoldTerm {
         // branch keeps global-atom rows), so the row count is the max active set.
         //
         // #1410/#1408: the `None` (full-K) branch below is taken for SOFTMAX,
-        // which still keeps the per-worker `(k_atoms*p)` `decoded` and
-        // `(q*max(w_dim,p))` `jac_white` scratch -- the residual high-K per-worker
+        // which still keeps the per-worker `(k_atoms·p)` `decoded` and
+        // `(q·max(w_dim,p))` `jac_white` scratch — the residual high-K per-worker
         // footprint. It is bounded by the SOFTMAX layout gap (#1408): the dense
         // softmax path genuinely touches every atom (it assembles the full dense
         // entropy Hessian and normalises over all `K`), so the scratch cannot
@@ -4233,9 +4282,32 @@ impl SaeManifoldTerm {
                     let assignment_base = row * k_atoms;
                     if let Some(layout) = row_layout.as_ref() {
                         let active = &layout.active_atoms[row];
+                        // #1408/#1409 softmax compact curvature: the entropy
+                        // Hessian diagonal in `assignment_hdiag` is INDEFINITE,
+                        // so on a compact softmax layout write the Gershgorin
+                        // Loewner majorizer `D_kk = Σ_j|H_kj|` (#1419) — the same
+                        // PSD operator the dense softmax branch writes — at each
+                        // active logit slot. `D` is diagonal, so its active
+                        // principal sub-block is `diag(D_kk : k ∈ active)`; each
+                        // `D_kk` is the FULL-`K` abs-row-sum, so it still
+                        // dominates the active principal sub-block of `H_entropy`
+                        // (a genuine majorizer on the retained support). The
+                        // gradient stays the EXACT entropy gradient (it sets the
+                        // fixed point), so majorizing only conditions the Newton
+                        // step. JumpReLU/IBP keep their (exact) diagonal.
+                        let softmax_majorizer_diag: Option<Vec<f64>> =
+                            softmax_dense.as_ref().map(|(penalty, scale)| {
+                                let row_logits: Vec<f64> = (0..k_atoms)
+                                    .map(|kk| self.assignment.logits[[row, kk]])
+                                    .collect();
+                                penalty.psd_majorizer_abs_row_sums(&row_logits, *scale)
+                            });
                         for (j, &k) in active.iter().enumerate() {
                             block.gt[j] += assignment_grad[assignment_base + k];
-                            block.htt[[j, j]] += assignment_hdiag[assignment_base + k];
+                            match softmax_majorizer_diag.as_ref() {
+                                Some(d) => block.htt[[j, j]] += d[k],
+                                None => block.htt[[j, j]] += assignment_hdiag[assignment_base + k],
+                            }
                         }
                     } else {
                         for free_idx in 0..assignment_dim {
@@ -7052,8 +7124,12 @@ impl SaeManifoldTerm {
         // diagonal). The trace `½ tr(H⁻¹ ∂H/∂ρ)` must therefore contract the
         // dense `∂H/∂ρ` against the per-row selected-inverse BLOCK, mirroring the
         // dense `log|H|` and θ-adjoint — a diagonal-only contraction would
-        // desync the ρ-gradient from the criterion. (Softmax uses the dense
-        // `None` layout, so logit positions index atoms directly.)
+        // desync the ρ-gradient from the criterion. The assembled majorizer
+        // `D = diag(Σ_j|H_kj|)` is itself DIAGONAL (#1419), so the contraction
+        // reduces to `½ Σ_slot (H⁻¹)_{slot,slot}·D_atom`. On the dense `None`
+        // layout the logit slot equals the atom position; on the compact
+        // softmax top-`k` layout (#1408/#1409) the slots are the row's active
+        // atoms — the SAME `D_atom` (full-`K` abs-row-sum) the assembly wrote.
         if let AssignmentMode::Softmax {
             temperature,
             sparsity,
@@ -7068,40 +7144,35 @@ impl SaeManifoldTerm {
                 k_atoms,
                 temperature,
             );
-            // Softmax uses the reduced K−1 free-logit chart: only positions
-            // 0..K−1 are free logit coordinates (last reference logit fixed), and
-            // the reduced `∂H/∂ρ` over the free logits is the top-left
-            // (K−1)×(K−1) submatrix of the full dense block. Contract it against
-            // the matching per-row selected-inverse block.
+            // Softmax uses the reduced K−1 free-logit chart on the dense layout
+            // (last reference logit fixed); the compact layout carries one slot
+            // per active atom. The diagonal selected inverse gives each slot's
+            // (H⁻¹)_{slot,slot}.
             let assignment_dim = self.assignment.assignment_coord_dim();
-            let total_t = cache.delta_t_len();
+            let inv_diag = solver
+                .latent_inverse_diagonal()
+                .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
             let mut trace = 0.0_f64;
             for row in 0..self.n_obs() {
                 let row_base = cache.row_offsets[row];
-                let q = cache.row_dims[row];
-                let logit_dim = assignment_dim.min(q);
                 let row_logits: Vec<f64> = (0..k_atoms)
                     .map(|k| self.assignment.logits[[row, k]])
                     .collect();
-                // ∂H/∂ρ over this row's free-logit block (position j ↔ atom j).
-                // #1419: the assembled curvature block is the Gershgorin majorizer
-                // `D = diag(Σ_j|H_kj|)` (the genuine Loewner majorizer that replaced
-                // the indefinite entropy Hessian). `scale = λ_sparse·sparsity/τ²` is
-                // linear in `λ_sparse = exp(ρ)`, so `∂(scale·D)/∂ρ = scale·D = D`
-                // evaluated at the current scale — differentiate the SAME operator
-                // the assembly and θ-adjoint use so the ρ-gradient stays on one
-                // branch.
-                let dh_rho = penalty.row_psd_majorizer(&row_logits, scale);
-                for kj in 0..logit_dim {
-                    let mut rhs_t = Array1::<f64>::zeros(total_t);
-                    let rhs_beta = Array1::<f64>::zeros(cache.k);
-                    rhs_t[row_base + kj] = 1.0;
-                    let solved = solver
-                        .solve(rhs_t.view(), rhs_beta.view())
-                        .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
-                    for ki in 0..logit_dim {
-                        // trace += (H⁻¹)_{ki,kj} · (∂H/∂ρ)_{kj,ki}; dh_rho symmetric.
-                        trace += solved.t[row_base + ki] * dh_rho[[kj, ki]];
+                // ∂(scale·D)/∂ρ = scale·D (linear in λ_sparse = eᵖ) — the SAME
+                // operator the assembly and θ-adjoint differentiate.
+                let d = penalty.psd_majorizer_abs_row_sums(&row_logits, scale);
+                match self.last_row_layout {
+                    Some(ref layout) => {
+                        for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
+                            trace += inv_diag[row_base + pos] * d[atom];
+                        }
+                    }
+                    None => {
+                        let q = cache.row_dims[row];
+                        let logit_dim = assignment_dim.min(q);
+                        for atom in 0..logit_dim {
+                            trace += inv_diag[row_base + atom] * d[atom];
+                        }
                     }
                 }
             }
@@ -7205,7 +7276,7 @@ impl SaeManifoldTerm {
             .resolved_ibp_alpha(rho)
             .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
         let k_atoms = self.k_atoms();
-        let prior = ordered_geometric_shrinkage_prior(k_atoms, alpha);
+        let prior = ibp_stick_breaking_prior(k_atoms, alpha);
         let mut dprior = Array1::<f64>::zeros(k_atoms);
         for k in 0..k_atoms {
             dprior[k] = prior[k] * k as f64 / (alpha + 1.0);
@@ -7419,7 +7490,7 @@ impl SaeManifoldTerm {
             .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
         let k_atoms = self.k_atoms();
         let p = self.output_dim();
-        let prior = ordered_geometric_shrinkage_prior(k_atoms, alpha);
+        let prior = ibp_stick_breaking_prior(k_atoms, alpha);
         let mut dprior = Array1::<f64>::zeros(k_atoms);
         for k in 0..k_atoms {
             dprior[k] = prior[k] * k as f64 / (alpha + 1.0);
@@ -7668,7 +7739,7 @@ impl SaeManifoldTerm {
                     .mode
                     .resolved_ibp_alpha(rho)
                     .unwrap_or(alpha);
-                let prior = ordered_geometric_shrinkage_prior(k_atoms, effective_alpha);
+                let prior = ibp_stick_breaking_prior(k_atoms, effective_alpha);
                 let inv_tau = 1.0 / temperature;
                 for (idx, var) in vars.iter().enumerate() {
                     let SaeLocalRowVar::Logit { atom } = *var else {
@@ -7819,7 +7890,7 @@ impl SaeManifoldTerm {
                         inv_tau: 1.0 / temperature,
                     },
                     vec![0.0; k_atoms],
-                    ordered_geometric_shrinkage_prior(k_atoms, effective_alpha).to_vec(),
+                    ibp_stick_breaking_prior(k_atoms, effective_alpha).to_vec(),
                 )
             }
             AssignmentMode::JumpReLU {
@@ -9797,12 +9868,12 @@ mod outer_gradient_error_classification_1451_tests {
                 "shape mismatch must classify to InternalInvariant (#1451); got {classified}"
             );
             assert!(
-                !classified.is_fd_eligible(),
-                "a shape mismatch must NOT be FD-eligible (#1451); got {classified}"
+                !classified.is_conditioning_recoverable(),
+                "a shape mismatch must NOT be conditioning-recoverable (#1451); got {classified}"
             );
             assert!(
-                !classified.admits_fd_fallback(1.0),
-                "a shape mismatch must NOT admit the FD fallback even at finite cost (#1451)"
+                !classified.admits_plain_solver_fallback(1.0),
+                "a shape mismatch must NOT admit the plain-solver fallback even at finite cost (#1451)"
             );
         }
 
@@ -9820,15 +9891,15 @@ mod outer_gradient_error_classification_1451_tests {
                  got {classified}"
             );
             assert!(
-                !classified.is_fd_eligible(),
-                "a non-finite intermediate must NOT be FD-eligible (#1451); got {classified}"
+                !classified.is_conditioning_recoverable(),
+                "a non-finite intermediate must NOT be conditioning-recoverable (#1451); got {classified}"
             );
         }
 
         // A genuine near-singular linear-algebra failure on a finite, correctly
         // shaped input (back-solve / Cholesky/Woodbury factor that tripped on
         // rank-deficiency) is the legitimate #1273 conditioning case: it must
-        // KEEP IllConditioned and stay FD-eligible.
+        // KEEP IllConditioned and stay conditioning-recoverable.
         let conditioning_messages = [
             "DeflatedArrowSolver: gauge Woodbury factor failed: matrix is not positive definite",
             "DeflatedArrowSolver: gauge back-solve: singular factor",
@@ -9842,12 +9913,12 @@ mod outer_gradient_error_classification_1451_tests {
                  IllConditioned (#1451 / #1273); got {classified}"
             );
             assert!(
-                classified.is_fd_eligible(),
-                "a genuine conditioning failure must remain FD-eligible (#1273); got {classified}"
+                classified.is_conditioning_recoverable(),
+                "a genuine conditioning failure must remain conditioning-recoverable (#1273); got {classified}"
             );
             assert!(
-                classified.admits_fd_fallback(1.0),
-                "a genuine conditioning failure at finite cost must admit the FD fallback (#1273)"
+                classified.admits_plain_solver_fallback(1.0),
+                "a genuine conditioning failure at finite cost must admit the plain-solver fallback (#1273)"
             );
         }
     }

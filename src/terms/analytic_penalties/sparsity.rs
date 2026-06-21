@@ -132,7 +132,7 @@ impl SoftmaxAssignmentSparsityPenalty {
     /// operator that dominates the dense Hessian's quadratic form — unlike the
     /// raw indefinite diagonal, which is neither PSD nor a faithful stand-in for
     /// the dense operator.
-    fn psd_majorizer_abs_row_sums(&self, row: &[f64], scale: f64) -> Vec<f64> {
+    pub(crate) fn psd_majorizer_abs_row_sums(&self, row: &[f64], scale: f64) -> Vec<f64> {
         let a = self.softmax_row(row);
         let k = self.k_atoms;
         let l: Vec<f64> = (0..k)

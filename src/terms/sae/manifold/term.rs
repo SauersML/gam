@@ -269,6 +269,20 @@ pub struct SaeManifoldTerm {
     /// `K`-dependent decoder assembly it otherwise computes-and-discards is
     /// avoided. A transient mode set in lock-step by that driver, not persisted.
     pub(crate) fixed_decoder_assembly: bool,
+    /// #1408/#1409 — optional hard per-row active-atom cap for Softmax mode,
+    /// threaded from the fit/encode `top_k` argument. When set (and `< K`), the
+    /// Softmax assignment engages the COMPACT top-`k` row layout
+    /// ([`SaeRowLayout::from_dense_weights`]) inside the optimization itself, so
+    /// the Newton assembly/solve and the criterion only ever touch each row's
+    /// top-`k` softmax atoms instead of all `K`. The full-`K` softmax
+    /// normalization is still used to FORM each row's assignment vector `a`
+    /// (the gate map); only the dropped tail logits — carrying negligible
+    /// `O(a)` reconstruction mass and `O(a²)` curvature — are excluded from the
+    /// per-row block. This folds `top_k` into the optimization rather than
+    /// applying it as a post-fit projection (the #1409 defect), and makes the
+    /// FFI's after-the-fact top-`k` projection a no-op at the optimum. `None`
+    /// (the default) keeps the budget-driven engagement only.
+    pub(crate) softmax_active_cap: Option<usize>,
     /// Reusable dense β-tier workspace for analytic penalty assembly. SAE
     /// immediately lowers the dense block into a `BetaPenaltyOp`, so the returned
     /// `ArrowSchurSystem` does not need to keep owning the allocation.
@@ -383,6 +397,9 @@ impl Clone for SaeManifoldTerm {
             row_loss_weights: self.row_loss_weights.clone(),
             last_frames_active: self.last_frames_active,
             fixed_decoder_assembly: false,
+            // Persisted configuration (like the assignment mode), carried across
+            // clones so a cloned term optimizes the same compact top-`k` problem.
+            softmax_active_cap: self.softmax_active_cap,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             certificate_dispersion: self.certificate_dispersion,
             curvature_walk_report: self.curvature_walk_report.clone(),

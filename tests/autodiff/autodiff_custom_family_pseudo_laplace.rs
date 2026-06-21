@@ -317,3 +317,88 @@ fn exact_newton_pseudo_laplace_psigradient_matches_num_dual_band() {
         );
     }
 }
+
+/// Regression guard for gam#1395: the analytic pseudo-Laplace objective must
+/// keep the FULL `0.5·log|H|` Laplace term and not let it collapse.
+///
+/// The reported #1395 failure was a value disagreement
+/// (`analytic=1.004… vs closed_form=1.346…` at psi=-2.0): the `0.5·log|H|`
+/// term (`0.5·ln 2 = 0.346574…`) silently collapsed to ~0.0044 — an effective
+/// Hessian eigenvalue of ~1.0088 instead of the true H=[[2]]. The
+/// `*_matches_num_dual_band` test above already pins `result.objective` to the
+/// num_dual closed form, but it routes through a Rust helper; this test pins
+/// the objective to HARD-CODED constants derived purely from the math
+/// (`objective(psi) = 0.25·psi² + 0.5·ln 2`), so the guard survives even if the
+/// helper were ever changed, and it isolates the log|H| term directly:
+///
+/// * At `psi = 0` the quadratic term vanishes, so the objective is EXACTLY the
+///   log-determinant term `0.5·ln 2`. A collapse to ~0.0044 (the #1395 symptom)
+///   would fail this assertion outright.
+/// * At `psi = -2.0` (the exact point the issue reported) the objective is
+///   `0.25·4 + 0.5·ln 2 = 1.0 + 0.5·ln 2 = 1.346573…`.
+#[test]
+fn pseudo_laplace_objective_keeps_full_logdet_term_1395() {
+    let half_ln2 = 0.5 * std::f64::consts::LN_2;
+
+    let spec = ParameterBlockSpec {
+        name: "psi_block".to_string(),
+        design: gam::matrix::DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(array![[
+            1.0
+        ]])),
+        offset: array![0.0],
+        penalties: vec![],
+        nullspace_dims: vec![],
+        initial_log_lambdas: Array1::zeros(0),
+        initial_beta: Some(array![0.0]),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    };
+    let deriv = CustomFamilyBlockPsiDerivative::new(
+        Some(0),
+        Array2::zeros((1, 1)),
+        Array2::zeros((1, 1)),
+        Some(Vec::new()),
+        None,
+        None,
+        None,
+    );
+    let derivative_blocks = vec![vec![deriv]];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        compute_covariance: false,
+        ridge_floor: 1e-12,
+        ..BlockwiseFitOptions::default()
+    };
+
+    // (psi, expected objective = 0.25·psi² + 0.5·ln 2)
+    let cases = [
+        (0.0_f64, half_ln2),
+        (-2.0_f64, 1.0 + half_ln2),
+        (1.6_f64, 0.25 * 1.6 * 1.6 + half_ln2),
+    ];
+
+    for (psi, expected) in cases {
+        let family = ScalarPseudoLaplacePsiFamily { psi };
+        let result = evaluate_custom_family_joint_hyper(
+            &family,
+            std::slice::from_ref(&spec),
+            &options,
+            &Array1::zeros(0),
+            &derivative_blocks,
+            None,
+            gam::families::custom_family::EvalMode::ValueAndGradient,
+        )
+        .expect("pseudo-laplace psi hyper eval");
+
+        assert!(
+            (result.objective - expected).abs() < 1e-10,
+            "gam#1395 pseudo_laplace psi={psi}: objective={} expected={} \
+             (0.5·log|H| term must NOT collapse below 0.5·ln2={:.6})",
+            result.objective,
+            expected,
+            half_ln2
+        );
+    }
+}

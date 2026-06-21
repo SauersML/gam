@@ -1583,7 +1583,19 @@ pub(crate) fn centered_aniso_log_scale_mean(eta: &[f64]) -> f64 {
 
 #[inline]
 pub(crate) fn centered_aniso_log_scale(value: f64, mean: f64) -> f64 {
-    (value - mean).clamp(-50.0, 50.0)
+    // This bound exists solely to keep the downstream `.exp()` (axis scale and
+    // metric weight) finite. `f64::clamp` leaves NaN as NaN, so a non-finite
+    // contrast (e.g. an `inf − inf` from a degenerate anisotropy `eta`) would
+    // slip through and poison the Gram matrix. Map any non-finite difference to
+    // the saturating bound explicitly; finite inputs take the identical clamp.
+    let centered = value - mean;
+    if centered.is_finite() {
+        centered.clamp(-50.0, 50.0)
+    } else if centered > 0.0 {
+        50.0
+    } else {
+        -50.0
+    }
 }
 
 #[inline]

@@ -1500,11 +1500,9 @@ pub fn fit_survival_marginal_slope_terms(
                 &spec.logslope_offset,
                 rho_logslope,
                 logslope_beta_hint,
-                Arc::from(
-                    z_primary
-                        .as_slice()
-                        .expect("z_primary must be C-contiguous"),
-                ),
+                Arc::from(z_primary.as_slice().ok_or_else(|| {
+                    "z_primary must be C-contiguous to build logslope block".to_string()
+                })?),
                 probit_scale,
             ),
         ];

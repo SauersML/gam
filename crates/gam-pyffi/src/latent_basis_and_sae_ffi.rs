@@ -2556,6 +2556,13 @@ fn sae_manifold_fit_inner<'py>(
     // the first coordinate is a dimensionless log-alpha offset rather than a
     // response-scale penalty strength, so assignment-aware seed scaling leaves it
     // unshifted while still scaling smoothness and ARD.
+    // #1408/#1409 — fold the inference-time `top_k` cap into the OPTIMIZATION:
+    // for Softmax it engages the compact top-`k` row layout so the inner Newton
+    // assembly/solve and the outer ρ criterion only ever touch each row's top-`k`
+    // atoms (the FFI's after-the-fit top-`k` projection below then collapses to a
+    // no-op at the optimum). A no-op for `top_k >= K`, `None`, and non-softmax
+    // modes (set_softmax_active_cap clamps to `1 <= k < K` and ignores non-softmax).
+    base_term.set_softmax_active_cap(top_k);
     let seed_dispersion = base_term
         .seed_reconstruction_dispersion(z_view)
         .map_err(py_value_error)?;
@@ -6376,6 +6383,12 @@ fn sae_manifold_predict_oos<'py>(
         &evaluators,
     )
     .map_err(py_value_error)?;
+    // #1408/#1409 — fold the inference `top_k` cap into the OOS fixed-decoder
+    // encode: for Softmax the frozen-decoder Newton solve below then runs on the
+    // compact top-`k` row layout (htt/gt sized by the row's top-`k` atoms), so
+    // the encode cost tracks k_active rather than full `K`, and the subsequent
+    // top-`k` projection is a no-op at the optimum.
+    term.set_softmax_active_cap(top_k);
     // Global decoder-projection coordinate seed (cold start only). With the
     // decoder frozen, the exact OOS latent of each row is its projection onto
     // the atom's image manifold, `argmin_t ‖x − Φ(t)·B‖²`. That objective is
