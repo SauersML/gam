@@ -37,19 +37,17 @@ const BANNED_PRODUCTION_MARKERS: &[&str] = &[
 /// `terms/sae/manifold/outer_objective.rs` matches regardless of the absolute
 /// prefix. Each entry MUST carry a justification comment.
 const SANCTIONED_FD_FILES: &[&str] = &[
-    // #1273 / #1436: SAE outer-ρ optimisation. The analytic outer gradient
-    // (`analytic_outer_rho_gradient_components`) is provably not cost-consistent
-    // across the near-singular flat valley; the central-difference fallback is a
-    // descent-direction-only last resort, reached ONLY when the analytic path
-    // returns Err at a finite-cost ρ. The returned cost is still the analytic
-    // REML value. This is the #1440 "theoretically impossible to do better than
-    // FD" exception. See `central_difference_outer_gradient`.
+    // #1273 / #1436 / #1440: SAE outer-ρ optimisation. The real finite-difference
+    // fallback has already been removed — the outer-ρ descent direction is now the
+    // plain analytic `DeflatedArrowSolver::plain` gradient, never differenced. The
+    // ONLY residue is two stale fd-NAMED predicates (`is_fd_eligible`,
+    // `admits_fd_fallback`) that no longer compute any FD; they gate the analytic
+    // plain-solver fallback. These two entries are TEMPORARY: they exist solely so
+    // the `fd_`/`_fd` identifier names do not trip the scanner until the SAE owner
+    // renames them, at which point both entries must be deleted (the membership
+    // test below pins them so the deletion is not forgotten).
     "terms/sae/manifold/outer_objective.rs",
     "terms/sae/manifold/construction.rs",
-    // FD-audit oracle: deliberately central-differences the outer criterion to
-    // VERIFY the analytic gradient. Runs only behind `outer_fd_audit_eligible`
-    // gates, never on the fit math path. A diagnostic, not model math.
-    "solver/rho_optimizer/fd_audit.rs",
 ];
 
 /// True when `path` is on the [`SANCTIONED_FD_FILES`] allowlist and may
@@ -513,14 +511,17 @@ fn production_code() {
 
 #[test]
 fn sanctioned_fd_allowlist_membership_is_correct() {
-    // The SAE #1273 fallback site is tracked on the allowlist.
+    // The SAE #1273 stale-fd-name site is tracked on the allowlist (temporary,
+    // pending the SAE owner's rename — see SANCTIONED_FD_FILES doc).
     assert!(fd_ok_markers_allowed(Path::new(
         "/Users/anyone/gam/src/terms/sae/manifold/outer_objective.rs"
     )));
     assert!(fd_ok_markers_allowed(Path::new(
         "src/terms/sae/manifold/construction.rs"
     )));
-    assert!(fd_ok_markers_allowed(Path::new(
+    // The FD-audit oracle is NOT whole-file allowlisted: it exempts itself with
+    // its own `FD-OK:`/`END-FD-OK` region, which the scanner already honours.
+    assert!(!fd_ok_markers_allowed(Path::new(
         "src/solver/rho_optimizer/fd_audit.rs"
     )));
     // Files NOT carrying a documented sanction are not on the allowlist.
