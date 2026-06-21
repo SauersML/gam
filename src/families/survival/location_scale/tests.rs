@@ -1431,6 +1431,21 @@ fn survival_ls_joint_directional_derivative_time_varying_body() {
 /// directly to keep an independent oracle.
 #[test]
 fn survival_ls_row_kernel_matches_bespoke_assembly() {
+    // Row-kernel assembly plus the directional-Hessian FD oracle keep several
+    // dense joint Hessians live on the stack; run on a wide-stack thread like
+    // the other survival-LS jet-tower oracles.
+    let join_result = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(survival_ls_row_kernel_matches_bespoke_assembly_body)
+        .expect("spawn wide-stack row-kernel oracle thread")
+        .join();
+    assert!(
+        join_result.is_ok(),
+        "survival LS row-kernel oracle thread must complete"
+    );
+}
+
+fn survival_ls_row_kernel_matches_bespoke_assembly_body() {
     use crate::families::row_kernel::{
         RowSet, build_row_kernel_cache, row_kernel_directional_derivative, row_kernel_gradient,
         row_kernel_hessian_dense, row_kernel_log_likelihood,
@@ -3348,7 +3363,12 @@ fn survival_log_survival_and_pdf_stacks_match_independent_fd_witness() {
 
             for (k, &analytic) in log_s_analytic.iter().enumerate() {
                 let order = k + 1;
-                let h = if order <= 2 { 1e-3 } else { 3e-3 };
+                let h = match order {
+                    1 | 2 => 1e-3,
+                    3 => 3e-3,
+                    4 => 1e-2,
+                    _ => unreachable!("stencil supports derivative orders 1..=4"),
+                };
                 let fd = central(&log_s_value, eta, order, h);
                 assert!(
                     (analytic - fd).abs() <= 5e-4 * analytic.abs().max(1.0) + 1e-6,
@@ -3363,7 +3383,12 @@ fn survival_log_survival_and_pdf_stacks_match_independent_fd_witness() {
             }
             for (k, &analytic) in log_pdf_analytic.iter().enumerate() {
                 let order = k + 1;
-                let h = if order <= 2 { 1e-3 } else { 3e-3 };
+                let h = match order {
+                    1 | 2 => 1e-3,
+                    3 => 3e-3,
+                    4 => 1e-2,
+                    _ => unreachable!("stencil supports derivative orders 1..=4"),
+                };
                 let fd = central(&log_pdf_value, eta, order, h);
                 assert!(
                     (analytic - fd).abs() <= 5e-4 * analytic.abs().max(1.0) + 1e-6,
