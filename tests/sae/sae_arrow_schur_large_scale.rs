@@ -296,11 +296,25 @@ fn hbb_shape_matches_beta_dim() {
         .assemble_arrow_schur(f.target.view(), &f.rho, None)
         .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
 
+    // The data-fit β-Hessian is NO LONGER materialised as a dense `(K·M·p)²`
+    // `sys.hbb`. It is installed as the structured `G ⊗ I_p`
+    // (`SparseBlockKroneckerPenaltyOp`) inside the composite penalty operator,
+    // and `assemble_arrow_schur` deliberately reclaims the dense hbb scratch via
+    // `reclaim_border_hbb_workspace`, leaving `sys.hbb` an empty `0×0` workspace
+    // (see `src/terms/sae/manifold/construction.rs`: `reclaim_border_hbb_workspace`
+    // at 1325-1328 and its call sites near the penalty-op install at 4844-4854).
+    // We therefore pin the exact `0×0` workspace shape AND that the structured
+    // penalty operator carries the full `(beta_dim × beta_dim)` β-Hessian.
     assert_eq!(
         sys.hbb.dim(),
-        (beta_dim, beta_dim),
-        "hbb shape mismatch: expected ({beta_dim}, {beta_dim}), got {:?}",
+        (0, 0),
+        "hbb is expected to be the reclaimed 0×0 workspace, got {:?}",
         sys.hbb.dim()
+    );
+    assert_eq!(
+        sys.effective_penalty_op().to_dense().dim(),
+        (beta_dim, beta_dim),
+        "structured penalty op dense shape mismatch: expected ({beta_dim}, {beta_dim})"
     );
     assert_eq!(
         sys.gb.len(),
@@ -414,7 +428,14 @@ fn data_fit_beta_hessian_kronecker_matches_dense_reference() {
 fn row_block_dim_matches_k_times_one_plus_d() {
     let k_atoms = 16usize;
     let d = 1usize;
-    let expected_q = k_atoms * (1 + d); // 32
+    // Softmax stores only `K - 1` assignment coordinates because one reference
+    // logit is fixed (the assignment is a probability simplex with one degree of
+    // freedom removed); see `src/terms/sae/assignment.rs`:
+    // `assignment_coord_dim` (299-308) returns `K - 1` for Softmax, and
+    // `flatten_ext_coords` (413-417) omits the fixed reference logit. The row
+    // block therefore carries `q = (K - 1) + K*d`, not `K*(1 + d)`. For K=16,
+    // d=1: q = 15 + 16 = 31.
+    let expected_q = (k_atoms - 1) + k_atoms * d; // 31
 
     let mut f = build_fixture(k_atoms, 4, d, 500, 2, AssignmentMode::softmax(1.0));
     let sys = f
