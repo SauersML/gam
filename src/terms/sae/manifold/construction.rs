@@ -2,13 +2,14 @@ use super::*;
 
 /// Typed error from the SAE outer-gradient analytic assembly path (#1436).
 ///
-/// The `eval()` fallback to `central_difference_outer_gradient` (#1273) must
-/// fire ONLY for the genuine conditioning/identifiability failure modes it
-/// was designed for — a near-singular-but-valid joint Hessian or a gauge-
-/// degenerate direction. Shape/indexing bugs, non-finite intermediates, and
-/// violated internal invariants are [`OuterGradientError::InternalInvariant`]
-/// and MUST propagate as hard errors so regressions surface instead of being
-/// silently masked by an FD descent direction.
+/// The `eval()` analytic fallback (#1273/#1440: the plain undeflated analytic
+/// outer gradient, NOT a finite difference) must fire ONLY for the genuine
+/// conditioning/identifiability failure modes it was designed for — a
+/// near-singular-but-valid joint Hessian or a gauge-degenerate direction.
+/// Shape/indexing bugs, non-finite intermediates, and violated internal
+/// invariants are [`OuterGradientError::InternalInvariant`] and MUST propagate
+/// as hard errors so regressions surface instead of being silently masked by a
+/// degraded descent direction.
 #[derive(Clone, Debug)]
 pub(crate) enum OuterGradientError {
     /// Expected: near-singular or ill-conditioned joint Hessian at a feasible ρ
@@ -6367,7 +6368,6 @@ impl SaeManifoldTerm {
             .eigh(Side::Lower)
             .map_err(|_| conditioning_err.clone())?;
         let strict_gauge_floor = SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR * max_pivot;
-        let fallback_gauge_floor = SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR.sqrt() * max_pivot;
         let mut orthonormal: Vec<Array1<f64>> = Vec::new();
         for eig_idx in 0..evals.len() {
             let rayleigh = evals[eig_idx];
@@ -6392,14 +6392,26 @@ impl SaeManifoldTerm {
             orthonormal.push(direction);
         }
         if orthonormal.is_empty() {
+            // #1273/#1440: the conditioning gate has ALREADY certified a
+            // near-singular joint Hessian (`conditioning_err`), so a genuine flat
+            // direction exists inside the assembled gauge/decoder-null span even
+            // when no projected-Hessian eigenvector cleared the strict or the
+            // `fallback_gauge_floor` Rayleigh band. Rather than declining
+            // (which historically routed the outer step to a finite-difference
+            // descent direction — the FD instrument #1440 removes), deflate the
+            // SMALLEST-Rayleigh eigenvector of the projected gauge Hessian
+            // UNCONDITIONALLY. That eigenvector is the least-curvature member of
+            // the validated gauge span (a Faddeev-Popov gauge candidate), so the
+            // Tikhonov stiffness `max_pivot` in `from_orthonormal_gauges` bounds
+            // its contribution at the Hessian scale and the components orthogonal
+            // to it are byte-for-byte the plain analytic inverse solve. This keeps
+            // the descent direction fully ANALYTIC (a projected/damped gradient),
+            // never a differenced value path.
             let mut best_idx = None;
             let mut best_rayleigh = f64::INFINITY;
             for eig_idx in 0..evals.len() {
                 let rayleigh = evals[eig_idx];
-                if rayleigh.is_finite()
-                    && rayleigh < best_rayleigh
-                    && rayleigh <= fallback_gauge_floor
-                {
+                if rayleigh.is_finite() && rayleigh < best_rayleigh {
                     best_idx = Some(eig_idx);
                     best_rayleigh = rayleigh;
                 }

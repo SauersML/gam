@@ -7896,32 +7896,30 @@ pub(crate) fn outer_gradient_solver_deflates_rank_deficient_decoder_beta_null() 
     );
 }
 
-/// #1273 regression — the gradient lane (`eval` / `OuterEvalOrder::ValueAnd
-/// Gradient`) must NOT hard-abort when the analytic outer gradient is undefined
-/// at a finite-cost ρ whose joint Hessian is near-singular-but-valid (the
-/// circle/torus topology the issue reports: a flat direction outside both the
-/// chart gauge orbit and the penalised decoder β-null that the Faddeev-Popov
-/// deflation recovers). Before the fix the singular-Hessian conditioning error
-/// (`outer_gradient_conditioning_error`: "min/max pivot ratio … < floor")
-/// `?`-propagated out of `eval` as `RemlOptimizationFailed`, which the outer
-/// cascade surfaced as a `RemlConvergenceError`. After the fix the finite-cost ρ
-/// is descended with a central finite-difference outer gradient of the REML value
-/// path, so `eval` returns a finite `(cost, ∇f)` pair and the optimiser makes
-/// progress instead of aborting.
+/// #1273/#1440 regression — the gradient lane (`eval` /
+/// `OuterEvalOrder::ValueAndGradient`) must NOT hard-abort when the
+/// gauge-deflated analytic outer gradient declines at a finite-cost ρ whose
+/// joint Hessian is near-singular-but-valid (the circle/torus topology the
+/// issue reports: a flat direction the Faddeev-Popov deflation legitimately
+/// rejects). Before #1273 the conditioning error `?`-propagated out of `eval`
+/// as `RemlOptimizationFailed` → `RemlConvergenceError`; #1273 recovered it
+/// with a central finite-difference descent of the value path, and #1440
+/// REPLACED that finite-difference instrument with the PLAIN (undeflated)
+/// analytic outer gradient of the same Laplace value. The recovery direction is
+/// now fully analytic — never a differenced value path.
 ///
-/// The test exercises BOTH halves of the fix deterministically and in unit time:
-/// (1) the conditioning gate genuinely rejects a near-singular cache that no
-/// gauge/β-null deflation can recover (the bug's precondition — without it the
-/// analytic path would just succeed and the fallback never run), and (2) the
-/// finite-difference fallback that `eval` now invokes returns a finite outer
-/// gradient on the same objective.
+/// The test exercises both halves deterministically in unit time: (1) the
+/// conditioning gate genuinely rejects a near-singular cache that no gauge/β-null
+/// deflation can recover (the bug's precondition), and (2) `eval` still returns a
+/// finite, ρ-sized `(cost, ∇f)` pair on the same objective (the analytic
+/// recovery wiring), with no regression to the well-conditioned analytic path.
 #[test]
-pub(crate) fn gradient_lane_finite_difference_fallback_recovers_singular_outer_gradient_1273() {
+pub(crate) fn gradient_lane_analytic_fallback_recovers_singular_outer_gradient_1440() {
     let objective = warmstart_test_objective();
     // Precondition: a near-singular joint Hessian whose sub-floor pivot is NOT
     // explained by any chart-gauge / decoder-β-null direction — so the analytic
-    // outer-gradient solver REJECTS it. This is the exact condition the issue's
-    // pivot-ratio gate trips on; before the fix it aborted the whole outer fit.
+    // gauge-deflated outer-gradient solver REJECTS it. This is the exact
+    // condition the issue's pivot-ratio gate trips on.
     let singular_cache = near_singular_outer_gradient_cache();
     assert!(
         SaeManifoldTerm::outer_gradient_conditioning_error(&singular_cache).is_err(),
@@ -7932,42 +7930,19 @@ pub(crate) fn gradient_lane_finite_difference_fallback_recovers_singular_outer_g
             .term
             .outer_gradient_arrow_solver(&singular_cache, objective.current_rho.lambda_smooth())
             .is_err(),
-        "fixture precondition: the analytic outer gradient must REJECT this \
-         near-singular cache (no matching gauge/β-null to deflate) — this is the \
-         path that aborted the outer fit before #1273"
-    );
-    // The fix: at such a finite-cost ρ the gradient lane descends with the
-    // central finite-difference outer gradient of the value path instead of
-    // aborting. The fallback must return a finite, correctly-sized gradient.
-    let fd = objective
-        .central_difference_outer_gradient(&objective.current_rho)
-        .expect("central-difference outer-gradient fallback must succeed (#1273)");
-    assert_eq!(
-        fd.len(),
-        objective.current_rho.to_flat().len(),
-        "FD outer gradient length must match the ρ dimension"
-    );
-    assert!(
-        fd.iter().all(|g| g.is_finite()),
-        "FD outer-gradient fallback must be finite (a usable descent direction, \
-         never NaN/Inf) so BFGS can cross the flat valley; got {fd:?}"
-    );
-    // It must be a genuine descent instrument, not a degenerate zero vector: at
-    // this non-stationary entry ρ the value path has a real smoothing slope.
-    assert!(
-        fd.iter().any(|g| g.abs() > 1.0e-9),
-        "FD outer-gradient fallback must carry a nonzero descent component at a \
-         non-stationary ρ; got an all-zero vector {fd:?}"
+        "fixture precondition: the gauge-deflated analytic outer gradient must          REJECT this near-singular cache (no matching gauge/β-null to deflate)"
     );
 
-    // And the gradient lane (`eval`) the fix guards must still return a finite,
-    // ρ-sized `(cost, ∇f)` end-to-end — the recovery wiring is on the same code
-    // path the well-conditioned analytic case takes, so it must not regress it.
+    // The #1440 fix: at such a finite-cost ρ the gradient lane (`eval`) descends
+    // with the PLAIN analytic outer gradient instead of a finite-difference of
+    // the value path. End-to-end it must still return a finite, ρ-sized
+    // `(cost, ∇f)` — the recovery wiring shares the well-conditioned analytic
+    // path, so it must not regress it.
     let mut objective = warmstart_test_objective();
     let rho_flat = objective.current_rho.to_flat();
     let eval = objective
         .eval(&rho_flat)
-        .expect("gradient lane must return a finite (cost, gradient) pair (#1273 wiring)");
+        .expect("gradient lane must return a finite (cost, gradient) pair (#1440 wiring)");
     assert!(
         eval.cost.is_finite()
             && eval.gradient.len() == rho_flat.len()
@@ -7975,70 +7950,6 @@ pub(crate) fn gradient_lane_finite_difference_fallback_recovers_singular_outer_g
         "gradient lane must yield a finite, ρ-sized outer gradient; got cost={}, grad={:?}",
         eval.cost,
         eval.gradient
-    );
-}
-
-/// #1437 — the #1273 central-difference fallback's *failure mode* changed in
-/// #1431 (merged `c2553caf1`): an unmeasurable coordinate used to silently leave
-/// `gradient[i] = 0.0` (a fake "stationary" signal that poisoned BFGS curvature);
-/// it now returns a hard `Err`. The normal-fallback test above covers the
-/// success path, but nothing asserted the new honest-failure behaviour, so a
-/// regression to the fake-zero convention would go undetected.
-///
-/// A non-finite outer-ρ coordinate makes `probe_step_for(ρ_i)` non-finite
-/// (`1e-4 · |ρ_i|.max(1.0) = 1e-4 · ∞ = ∞`), tripping the function's first guard
-/// and returning `Err`. This deterministically exercises the Err arm without
-/// needing to construct a fully collapsed value path.
-#[test]
-pub(crate) fn central_difference_outer_gradient_errs_on_pathological_rho_no_fake_zero_1273() {
-    let objective = warmstart_test_objective();
-    // `from_flat` performs no validation (it is a plain struct copy), so an ∞
-    // coordinate survives into the probe-step computation.
-    let mut flat = objective.current_rho.to_flat();
-    flat[0] = f64::INFINITY;
-    let pathological = objective.baseline_rho.from_flat(flat.view());
-    let result = objective.central_difference_outer_gradient(&pathological);
-    assert!(
-        result.is_err(),
-        "#1431/#1437: an unmeasurable (non-finite-ρ) coordinate must propagate an \
-         Err, not a zero-padded fake-stationary direction; got {:?}",
-        result.ok()
-    );
-    // The error must be descriptive (carries the #1273 tag / coordinate), not a
-    // bare empty string, so the outer optimisation log can distinguish it.
-    let msg = result.unwrap_err();
-    assert!(
-        !msg.is_empty(),
-        "the Err must carry a descriptive reason for the aborted outer step; got empty"
-    );
-}
-
-/// #1437 — per-probe fresh-clone isolation (the other half of the #1273
-/// soundness rewrite): each probe differentiates a *fresh* clone of the snapshot
-/// warm state, so the gradient is deterministic across repeated calls and does
-/// not accumulate/leak warm-start cache state from a prior evaluation. Before
-/// #1431 one shared `&mut` probe term was reused across plus/minus/all
-/// coordinates, making the result order/state dependent.
-#[test]
-pub(crate) fn central_difference_outer_gradient_is_deterministic_under_per_probe_isolation_1273() {
-    let objective = warmstart_test_objective();
-    let g1 = objective
-        .central_difference_outer_gradient(&objective.current_rho)
-        .expect("FD fallback must succeed on the well-conditioned warmstart objective (#1273)");
-    let g2 = objective
-        .central_difference_outer_gradient(&objective.current_rho)
-        .expect("repeat FD fallback call must succeed (#1273)");
-    assert_eq!(
-        g1.len(),
-        g2.len(),
-        "FD outer gradient length must be stable across calls"
-    );
-    assert!(
-        g1.iter()
-            .zip(g2.iter())
-            .all(|(a, b)| (a - b).abs() <= 1e-12),
-        "#1273 per-probe isolation: repeated FD outer-gradient evaluations must be \
-         identical (no shared &mut state between probes); got {g1:?} vs {g2:?}"
     );
 }
 
