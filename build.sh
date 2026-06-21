@@ -12,6 +12,10 @@ set -uo pipefail
 # Derive the repo root from this script's own location so build.sh is
 # portable (the shared local tree AND a cluster clone), not pinned to one path.
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Optional machine-local build env (kept OUT of the repo): lets a cluster point
+# the linker at a system lib (e.g. MSI OpenBLAS) without baking a host-specific
+# path into the repo. No-op where absent (e.g. macOS/Homebrew finds BLAS itself).
+[ -f "$HOME/.config/gam-build-env" ] && . "$HOME/.config/gam-build-env"
 S="$REPO/.buildd"; mkdir -p "$S"
 LOCK="$S/build.lock"; LOG="$S/last.log"; RESULT="$S/last.code"; HASHFILE="$S/last.hash"; HIST="$S/history.log"
 export CARGO_TARGET_DIR="$REPO/target" CARGO_INCREMENTAL=1   # item-granularity reuse
