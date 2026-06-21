@@ -90,33 +90,35 @@ pub trait JetScalar<const K: usize>: Copy {
     fn scale(&self, s: f64) -> Self;
 
     /// Exact multivariate Faà di Bruno composition `f ∘ self`, given the outer
-    /// derivative stack `d = [f(u), f′(u), f″(u), …]` at `u = self.value()`.
+    /// derivative stack `d = [f(u), f′(u), f″(u), f‴(u), f⁗(u)]` at
+    /// `u = self.value()`.
     ///
-    /// The same `[f64; 5]` stacks the families already write
-    /// (`unary_derivatives_*`, built on erfcx / log_ndtr) plug in directly; each
-    /// scalar consumes only the leading entries its order needs (order-2 reads
-    /// `d[0..=2]`; the directional scalars read one / two beyond their base).
-    /// `d` must carry at least three entries.
-    fn compose_unary(&self, d: &[f64]) -> Self;
+    /// This is the SAME `[f64; 5]` stack shape [`super::jet_tower::Tower4`] and
+    /// the families' `unary_derivatives_*` helpers (built on erfcx / log_ndtr)
+    /// already produce, so those stacks plug in directly. Each scalar consumes
+    /// only the leading entries its order needs (order-2 reads `d[0..=2]`; the
+    /// directional scalars read one / two beyond their base) — the fixed-length
+    /// array makes that windowing total, no length guard required.
+    fn compose_unary(&self, d: [f64; 5]) -> Self;
 
     /// `e^self`. Convenience for tame arguments (see module stability note).
     fn exp(&self) -> Self {
         let e = self.value().exp();
-        self.compose_unary(&[e, e, e, e, e])
+        self.compose_unary([e, e, e, e, e])
     }
 
     /// `ln(self)`. Caller guarantees positivity.
     fn ln(&self) -> Self {
         let u = self.value();
         let r = 1.0 / u;
-        self.compose_unary(&[u.ln(), r, -r * r, 2.0 * r * r * r, -6.0 * r * r * r * r])
+        self.compose_unary([u.ln(), r, -r * r, 2.0 * r * r * r, -6.0 * r * r * r * r])
     }
 
     /// `√self`. Caller guarantees positivity.
     fn sqrt(&self) -> Self {
         let u = self.value();
         let s = u.sqrt();
-        self.compose_unary(&[
+        self.compose_unary([
             s,
             0.5 / s,
             -0.25 / (u * s),
@@ -135,9 +137,9 @@ pub trait JetScalar<const K: usize>: Copy {
 /// therefore bit-identical to both [`super::jet_tower::Tower2`] and the order-≤2
 /// channels of a full [`super::jet_tower::Tower4`] (doc §A.1, "Bit-identity with
 /// the full tower"). The wrapper exists only to satisfy the generic
-/// [`JetScalar`] interface (the slice-typed `compose_unary` / `add` / `sub` /
-/// `neg` / `recip` the trait demands, which `Tower2` does not expose by that
-/// shape) — every channel is delegated to `Tower2` arithmetic unchanged.
+/// [`JetScalar`] interface (the `compose_unary` / `add` / `sub` / `neg` /
+/// `recip` the trait demands, which `Tower2` does not expose by that shape) —
+/// every channel is delegated to `Tower2` arithmetic unchanged.
 #[derive(Clone, Copy, Debug)]
 pub struct Order2<const K: usize>(pub Tower2<K>);
 
@@ -193,12 +195,8 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
     fn scale(&self, s: f64) -> Self {
         Order2(self.0.scale(s))
     }
-    fn compose_unary(&self, d: &[f64]) -> Self {
-        debug_assert!(
-            d.len() >= 3,
-            "Order2::compose_unary needs at least [f, f', f''] (got {})",
-            d.len()
-        );
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        // Order-≤2 reads only [f, f', f''] of the stack.
         Order2(self.0.compose_unary([d[0], d[1], d[2]]))
     }
 }
@@ -211,9 +209,8 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
 /// pass, then contracted with [`super::jet_tower::Tower4::third_contracted`] /
 /// `fourth_contracted`. The contracted scalars ([`OneSeed`] / [`TwoSeed`]) must
 /// agree with these contractions channel-by-channel (the oracle relation #932
-/// asserts). The slice `compose_unary` simply repacks into the dense `[f64; 5]`
-/// stack `Tower4` already consumes (zero-padding shorter stacks, which only
-/// affects orders above the slice length).
+/// asserts). `compose_unary` forwards the `[f64; 5]` stack straight to the
+/// dense [`super::jet_tower::Tower4::compose_unary`] it already consumes.
 impl<const K: usize> JetScalar<K> for Tower4<K> {
     fn constant(c: f64) -> Self {
         Tower4::constant(c)
@@ -242,12 +239,8 @@ impl<const K: usize> JetScalar<K> for Tower4<K> {
     fn scale(&self, s: f64) -> Self {
         Tower4::scale(self, s)
     }
-    fn compose_unary(&self, d: &[f64]) -> Self {
-        let mut stack = [0.0_f64; 5];
-        for (slot, value) in stack.iter_mut().zip(d.iter()) {
-            *slot = *value;
-        }
-        Tower4::compose_unary(self, stack)
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        Tower4::compose_unary(self, d)
     }
 }
 
@@ -329,7 +322,7 @@ impl<const K: usize> JetScalar<K> for OneSeed<K> {
         // the generic compose_unary handles uniformly.
         let r = 1.0 / self.base.value();
         let r2 = r * r;
-        self.compose_unary(&[r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
+        self.compose_unary([r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
     }
     fn neg(&self) -> Self {
         OneSeed {
@@ -343,20 +336,16 @@ impl<const K: usize> JetScalar<K> for OneSeed<K> {
             eps: self.eps.scale(s),
         }
     }
-    fn compose_unary(&self, d: &[f64]) -> Self {
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
         // f(base + ε eps) = f(base) + ε · f'(base)·eps  (ε² = 0). Each factor is
         // an Order2 composition: the base composes with the f-stack, and the
-        // ε-coefficient is the Order2 product of the (shifted) f'-stack applied
-        // to base — i.e. the chain rule `f'(base)` as an Order2 — times eps.
-        // `f'` evaluated as an Order2 over `base` is `base.compose_unary(d[1..])`.
-        debug_assert!(
-            d.len() >= 4,
-            "OneSeed::compose_unary needs at least [f, f', f'', f'''] (got {})",
-            d.len()
-        );
-        let base = self.base.compose_unary(&d[0..3]);
+        // ε-coefficient is the Order2 of the SHIFTED stack (the chain rule
+        // `f'(base)` as an Order2) times eps. Order2 reads only the leading
+        // three entries of whatever stack it is handed, so the trailing slots
+        // are unused padding (the fixed-length array makes the windowing total).
+        let base = self.base.compose_unary([d[0], d[1], d[2], d[3], d[4]]);
         // f'(base) as an Order2 (consumes [f', f'', f''']).
-        let fprime = self.base.compose_unary(&d[1..4]);
+        let fprime = self.base.compose_unary([d[1], d[2], d[3], d[4], d[4]]);
         let eps = fprime.mul(&self.eps);
         OneSeed { base, eps }
     }
@@ -478,7 +467,7 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
     fn recip(&self) -> Self {
         let r = 1.0 / self.base.value();
         let r2 = r * r;
-        self.compose_unary(&[r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
+        self.compose_unary([r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
     }
     fn neg(&self) -> Self {
         TwoSeed {
@@ -496,24 +485,19 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
             eps_del: self.eps_del.scale(s),
         }
     }
-    fn compose_unary(&self, d: &[f64]) -> Self {
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
         // f(s) with s = base + ε eps + δ del + εδ eps_del, ε²=δ²=0:
         //   f(s) = f(base)
         //        + ε · f'(base)·eps
         //        + δ · f'(base)·del
         //        + εδ · ( f''(base)·eps·del + f'(base)·eps_del ).
         // Each f^{(r)}(base) is the Order2 composition of base with the stack
-        // shifted r entries (doc §A.3 composition). compose_unary on Order2
-        // reads d[0..=2] of whatever slice it is handed, so we pass the shifted
-        // windows.
-        debug_assert!(
-            d.len() >= 5,
-            "TwoSeed::compose_unary needs at least [f, f', f'', f''', f''''] (got {})",
-            d.len()
-        );
-        let base = self.base.compose_unary(&d[0..3]);
-        let fprime = self.base.compose_unary(&d[1..4]); // f'(base) as Order2
-        let fsecond = self.base.compose_unary(&d[2..5]); // f''(base) as Order2
+        // shifted r entries (doc §A.3 composition). Order2 reads only the
+        // leading three entries of whatever stack it is handed, so the trailing
+        // padding slots are unused (the fixed-length array makes this total).
+        let base = self.base.compose_unary([d[0], d[1], d[2], d[3], d[4]]);
+        let fprime = self.base.compose_unary([d[1], d[2], d[3], d[4], d[4]]); // f'(base) as Order2
+        let fsecond = self.base.compose_unary([d[2], d[3], d[4], d[4], d[4]]); // f''(base) as Order2
         let eps = fprime.mul(&self.eps);
         let del = fprime.mul(&self.del);
         let eps_del = fsecond
@@ -553,10 +537,16 @@ mod tests {
         fn n_rows(&self) -> usize {
             1
         }
-        fn primaries(&self, _row: usize) -> Result<[f64; 2], String> {
+        fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+            if row >= self.n_rows() {
+                return Err(format!("ExprProgram: row {row} out of range"));
+            }
             Ok(self.p)
         }
-        fn row_nll(&self, _row: usize, p: &[Tower4<2>; 2]) -> Result<Tower4<2>, String> {
+        fn row_nll(&self, row: usize, p: &[Tower4<2>; 2]) -> Result<Tower4<2>, String> {
+            if row >= self.n_rows() {
+                return Err(format!("ExprProgram: row {row} out of range"));
+            }
             Ok(row_expr(p))
         }
     }
