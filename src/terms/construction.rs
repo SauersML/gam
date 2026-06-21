@@ -1250,7 +1250,11 @@ pub fn canonicalize_penalty_spec(
     let tolerance = analysis.tol;
     let classes = crate::basis::SpectralClassification::new(&analysis.eigenvalues, tolerance);
     let rank_k = classes.rank();
-    debug_assert_eq!(rank_k, analysis.rank);
+    assert_eq!(
+        rank_k, analysis.rank,
+        "penalty-root rank disagreement: SpectralClassification rank={rank_k} vs analyze_penalty_block rank={} (#1425 canonical-classifier invariant)",
+        analysis.rank
+    );
 
     // Build the penalty root R from ONLY the range directions (positive
     // curvature): R has one row per range eigenpair, scaled by sqrt(ev), so
