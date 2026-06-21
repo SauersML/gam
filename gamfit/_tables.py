@@ -4,7 +4,7 @@ import importlib
 from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
-SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow"}
+SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow", "dask"}
 
 
 class PredictionResult(dict[str, list[Any]]):
@@ -149,6 +149,18 @@ def categorical_dtype_columns(data: Any, kind: str) -> frozenset[str]:
                 ):
                     out.add(str(field.name))
             return frozenset(out)
+        if kind == "dask":
+            import pandas as pd
+
+            out = set()
+            for name in data.columns:
+                # Dask preserves dtypes, check each column
+                dtype = data[name].dtype
+                if isinstance(dtype, pd.CategoricalDtype) or not (
+                    pd.api.types.is_numeric_dtype(dtype) or pd.api.types.is_bool_dtype(dtype)
+                ):
+                    out.add(str(name))
+            return frozenset(out)
     except Exception:
         # Dtype introspection is a best-effort enhancement; if a library's
         # introspection API shifts, fall back to value-based inference rather
@@ -180,6 +192,15 @@ def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
             {name: data.column(index).to_pylist() for index, name in enumerate(names)},
             kind,
         )
+    if kind == "dask":
+        # Dask DataFrame: use to_numpy() for efficient conversion, or compute() + tolist()
+        # Note: This will materialize the entire DataFrame in memory
+        names = [str(name) for name in data.columns]
+        reject_duplicate_column_names(names, kind)
+        return (
+            {name: data[name].compute().tolist() for name in names},
+            kind,
+        )
     if kind == "numpy":
         return numpy_table_columns(data), kind
     if isinstance(data, Mapping):
@@ -196,7 +217,7 @@ def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
         ):
             return sequence_table_columns(cast("Sequence[Sequence[Any]]", rows_like)), "rows"
     raise TypeError(
-        "unsupported table input; use pandas, pyarrow, numpy, a mapping, a list of records, or a 2D row sequence"
+        "unsupported table input; use pandas, polars, pyarrow, dask, numpy, a mapping, a list of records, or a 2D row sequence"
     )
 
 
@@ -236,13 +257,21 @@ def restore_output_table(
             raise ImportError("return_type 'pyarrow' requires the pyarrow package")
 
         return pa.table(columns)
+    if target == "dask":
+        dd = _try_import("dask")
+        if dd is None:
+            raise ImportError("return_type 'dask' requires the dask package")
+
+        import pandas as pd
+
+        return dd.dataframe.from_pandas(pd.DataFrame(columns))
     raise ValueError(f"unsupported return_type '{target}'")
 
 
 def preferred_output_kind(input_kind: str, training_kind: str | None) -> str:
-    if input_kind in {"pandas", "polars", "numpy", "pyarrow"}:
+    if input_kind in {"pandas", "polars", "numpy", "pyarrow", "dask"}:
         return input_kind
-    if training_kind in {"pandas", "polars", "numpy", "pyarrow"}:
+    if training_kind in {"pandas", "polars", "numpy", "pyarrow", "dask"}:
         return training_kind
     return "dict"
 
@@ -265,6 +294,11 @@ def detect_table_kind(data: Any) -> str:
     np = _try_import("numpy")
     if np is not None and isinstance(data, np.ndarray):
         return "numpy"
+
+    # Dask DataFrame detection
+    dd = _try_import("dask")
+    if dd is not None and hasattr(dd, "dataframe") and isinstance(data, dd.dataframe.DataFrame):
+        return "dask"
 
     return "unknown"
 
@@ -460,3 +494,36 @@ def vector_values(values: Any) -> list[Any]:
     if isinstance(values, Sequence) and not isinstance(values, (str, bytes, bytearray)):
         return list(values)
     raise TypeError("target values must be a 1D array-like sequence")
+
+
+def read_spss(path: str | Path) -> Any:
+    """Read a SPSS `.sav` or `.zsav` file into a pandas DataFrame.
+
+    Parameters
+    ----------
+    path : str or pathlib.Path
+        Path to the SPSS file.
+
+    Returns
+    -------
+    pandas.DataFrame
+        DataFrame with the SPSS data. Categorical columns from SPSS are
+        preserved as pandas Categorical dtype.
+
+    Raises
+    ------
+    ImportError
+        If pyreadstat is not installed.
+
+    Examples
+    --------
+    >>> df = gamfit.read_spss("survey_data.sav")
+    >>> model = gamfit.fit(df, "response ~ s(age) + treatment")
+    """
+    prs = _try_import("pyreadstat")
+    if prs is None:
+        raise ImportError(
+            "read_spss requires pyreadstat. Install it with: pip install pyreadstat"
+        )
+    df, _metadata = prs.read_sav(path, formats_as_category=True)
+    return df

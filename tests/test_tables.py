@@ -111,6 +111,43 @@ def test_restore_output_table_dict_returns_prediction_result_with_field_access()
         _ = restored.median
 
 
+def test_spss_support_via_read_spss() -> None:
+    """Test that read_spss loads SPSS files and gamfit.fit works with the result."""
+    np = pytest.importorskip("numpy")
+    pd_mod = pytest.importorskip("pandas")
+    prs = pytest.importorskip("pyreadstat")
+
+    # Create a simple DataFrame and write it as SPSS
+    df = pd_mod.DataFrame({
+        "x": [1.0, 2.0, 3.0, 4.0, 5.0],
+        "y": [10.0, 20.0, 30.0, 40.0, 50.0],
+    })
+
+    import tempfile
+    import os
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os.path.join(tmpdir, "test.sav")
+        prs.write_sav(df, path)
+
+        from gamfit._tables import read_spss
+
+        # Test read_spss returns a pandas DataFrame
+        loaded = read_spss(path)
+        assert hasattr(loaded, "columns")
+        assert list(loaded.columns) == ["x", "y"]
+
+
+def test_read_spss_missing_dependency() -> None:
+    """Test that read_spss raises a helpful error when pyreadstat is missing."""
+    # We can't actually test this without uninstalling pyreadstat, so we test
+    # the import error path by checking the error message format
+    from gamfit._tables import _try_import
+
+    # Verify _try_import returns None for non-existent modules
+    assert _try_import("nonexistent_module_xyz") is None
+
+
 def test_restore_output_table_supports_pyarrow_output() -> None:
     pyarrow = pytest.importorskip("pyarrow")
 

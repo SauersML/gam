@@ -11,13 +11,26 @@ before crossing the Rust FFI boundary.
 | `pandas.DataFrame` | Columns taken from `df.columns`. |
 | `polars.DataFrame` | Columns taken from `df.columns`. |
 | `pyarrow.Table` | Columns taken from `table.column_names`. |
+| `dask.dataframe.DataFrame` | Lazy parallel DataFrame; materialized via `compute()` during fit. |
 | `numpy.ndarray` (1-D or 2-D) | Columns auto-named `x0`, `x1`, …. 1-D becomes a single column `x0`. |
 | `Mapping[str, sequence]` | Keys are column names, values are 1-D sequences. |
 | `Sequence[Mapping[str, Any]]` | Records. The full set of keys across rows defines the column order; each row must contain every key. |
 | `Sequence[Sequence]` (2-D) | Columns auto-named `x0`, `x1`, …. All rows must have the same width. |
 
-pandas/polars/pyarrow are detected at runtime via `_try_import`. They
+pandas/polars/pyarrow/dask are detected at runtime via `_try_import`. They
 are not required at install time.
+
+SPSS `.sav` files can be loaded with `gamfit.read_spss()`, which returns a
+pandas DataFrame with categorical columns preserved:
+
+```python
+import gamfit
+
+df = gamfit.read_spss("survey_data.sav")
+model = gamfit.fit(df, "response ~ s(age) + treatment")
+```
+
+Categorical columns from SPSS are preserved as pandas Categorical dtype.
 
 Equivalent inputs for a two-column dataset:
 

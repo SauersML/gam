@@ -63,3 +63,49 @@ def test_stringify_cell_direct_call_still_works() -> None:
     # With context (optional improvement)
     assert stringify_cell(3.14, column="test_col") == "3.14"
     assert stringify_cell(42, column="age", row=5) == "42"
+
+
+def test_dask_data_frame_support() -> None:
+    """Dask DataFrames should be accepted as input."""
+    pd = pytest.importorskip("pandas")
+    dd = pytest.importorskip("dask.dataframe")
+
+    # Create a Dask DataFrame from pandas
+    pdf = pd.DataFrame({
+        "x": [1.0, 2.0, 3.0, 4.0, 5.0],
+        "y": [10.0, 20.0, 30.0, 40.0, 50.0],
+    })
+    ddf = dd.from_pandas(pdf, npartitions=2)
+
+    from gamfit._tables import normalize_table, detect_table_kind
+
+    # Test detection
+    assert detect_table_kind(ddf) == "dask"
+
+    # Test normalization (should work)
+    headers, rows, kind = normalize_table(ddf)
+    assert kind == "dask"
+    assert headers == ["x", "y"]
+    assert len(rows) == 5
+
+
+def test_dask_error_message_includes_context() -> None:
+    """Dask DataFrames with NaN should report column and row context."""
+    pd = pytest.importorskip("pandas")
+    dd = pytest.importorskip("dask.dataframe")
+
+    from gamfit._tables import normalize_table
+
+    # Create a Dask DataFrame with NaN
+    pdf = pd.DataFrame({
+        "x": [1.0, 2.0, float("nan"), 4.0],
+        "y": [10.0, 20.0, 30.0, 40.0],
+    })
+    ddf = dd.from_pandas(pdf, npartitions=2)
+
+    with pytest.raises(ValueError) as exc_info:
+        normalize_table(ddf)
+
+    error_msg = str(exc_info.value)
+    assert "x" in error_msg, f"Expected column name 'x' in error: {error_msg}"
+    assert "row 3" in error_msg, f"Expected row 3 in error: {error_msg}"
