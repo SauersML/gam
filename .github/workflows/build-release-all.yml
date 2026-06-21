@@ -23,8 +23,12 @@ env:
   # repo, so warming sccache here is what makes every later run — and, via a
   # shared SCCACHE_BUCKET, local build.sh — start warm instead of cold. sccache
   # keys on flags too, so each matrix target keeps its own entries.
+  # RUSTC_WRAPPER is set per job after a backend probe, not here: sccache aborts
+  # at server startup if its cache backend is unreachable, so an unconditional
+  # wrapper turns a GitHub Actions cache outage into a hard build failure (it
+  # took down every release build during one such outage). See "Enable sccache
+  # only if its cache backend is reachable".
   SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
 
 permissions:
   contents: write
@@ -159,6 +163,22 @@ jobs:
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Enable sccache only if its cache backend is reachable
+        # The compiler cache is a speedup, never a hard build dependency.
+        # sccache runs a storage check when its server starts and aborts the
+        # process if the backend (the GitHub Actions cache) is unreachable;
+        # with RUSTC_WRAPPER=sccache that would fail the build at the first
+        # `cargo` call. Probe the backend once by starting the server and wire
+        # the wrapper in only on success, so an outage degrades to a cold-but-
+        # green build instead of a hard failure.
+        shell: bash
+        run: |
+          if sccache --start-server; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          else
+            echo "::warning::sccache cache backend unreachable; compiling without the compiler cache"
+          fi
 
       - name: Install NVIDIA CUDA Toolkit
         if: matrix.target == 'x86_64-unknown-linux-gnu'
