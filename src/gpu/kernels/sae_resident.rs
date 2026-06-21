@@ -1674,18 +1674,38 @@ mod tests {
         // the relationship is exact, so Δ + z* = 0 to factorisation tolerance.
         let t_scale = resident.t.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
         let b_scale = resident.beta.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
-        let mut max_rel = 0.0_f64;
-        for (prod, res) in delta_t.iter().zip(resident.t.iter()) {
-            max_rel = max_rel.max((prod + res).abs() / t_scale);
+        // #1399: report the t-block and beta-block mismatch SEPARATELY (not one
+        // fused scalar). The two halves localise a divergence: a t-block-only gap
+        // points at the per-row factor / row gradient assembly, a beta-block gap
+        // at the border Schur path — turning the opaque overall rel into an
+        // actionable signal for the resident-vs-production parity divergence.
+        let mut max_rel_t = 0.0_f64;
+        let mut worst_t: Option<(usize, f64, f64)> = None;
+        for (i, (prod, res)) in delta_t.iter().zip(resident.t.iter()).enumerate() {
+            let rel = (prod + res).abs() / t_scale;
+            if rel > max_rel_t {
+                max_rel_t = rel;
+                worst_t = Some((i, *prod, *res));
+            }
         }
-        for (prod, res) in delta_beta.iter().zip(resident.beta.iter()) {
-            max_rel = max_rel.max((prod + res).abs() / b_scale);
+        let mut max_rel_b = 0.0_f64;
+        let mut worst_b: Option<(usize, f64, f64)> = None;
+        for (i, (prod, res)) in delta_beta.iter().zip(resident.beta.iter()).enumerate() {
+            let rel = (prod + res).abs() / b_scale;
+            if rel > max_rel_b {
+                max_rel_b = rel;
+                worst_b = Some((i, *prod, *res));
+            }
         }
+        let max_rel = max_rel_t.max(max_rel_b);
         assert!(
             max_rel < 1e-9,
             "production arrow-core Newton step must be −(resident converged fit) on \
-             the same quadratic (rel {max_rel:e}); wiring the device seam into the \
-             SAE inner loop must not change the system being solved"
+             the same quadratic; wiring the device seam into the SAE inner loop must \
+             not change the system being solved. rel_t={max_rel_t:e} (worst {worst_t:?}: \
+             Δt+t* must be 0), rel_beta={max_rel_b:e} (worst {worst_b:?}: Δβ+β* must \
+             be 0). A t-only gap implicates the per-row factor / row-gradient \
+             assembly; a β-only gap the border Schur path."
         );
     }
 
