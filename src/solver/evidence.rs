@@ -1571,8 +1571,15 @@ pub struct RemlComparison {
 pub struct RankedRow {
     pub name: String,
     pub score: f64,
-    /// Cost gap from the winning model: `score - best_score`.
+    /// Cost gap from the winning model on the SAME scale used to order the
+    /// ranking (`ranking_score`, the Occam-penalised conditional AIC where
+    /// available, issue #1362). The winner is `argmin ranking_score`, so this
+    /// is `>= 0` for every row by construction — it never contradicts the
+    /// declared winner (issue #1465). `score` still carries the raw REML/LAML
+    /// evidence so it stays consistent with `Model.evidence`.
     pub delta: f64,
+    /// Bayes factor of the winner over this row on the ranking scale,
+    /// `exp(delta) >= 1` (issue #1465).
     pub bayes_factor: f64,
     pub edf: Option<f64>,
 }
@@ -1638,17 +1645,31 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
     .map(|row| row.item)
     .collect();
 
-    // Evidence headline of the winning (best-ranked) model. The score table and
-    // its Bayes factors report the raw REML/LAML evidence (`reml_score`), so
-    // they stay consistent with `Model.evidence` / `bayes_factor_vs`; only the
-    // winner ordering is decided by `ranking_score`.
-    let best_score = candidates[0].score;
     let winner = candidates[0].name.clone();
+    // The ranking `delta` / `bayes_factor` must be measured on the SAME scale
+    // that orders the table — the `ranking_score` (Occam-penalised conditional
+    // AIC where available, issue #1362). `candidates[0]` is the winner =
+    // `argmin ranking_score`, so its ranking score IS the minimum; every row's
+    // ranking-scale gap is then `>= 0` and its Bayes factor `>= 1`, never
+    // contradicting the declared winner (issue #1465). Computing these against
+    // the AIC winner's *raw REML* — which is not the minimum raw REML once AIC
+    // and REML disagree — produced negative deltas and Bayes factors < 1 for
+    // non-winner rows.
+    let best_ranking_score = candidates[0].ranking_score();
+    // The raw-REML `score_table` stays on the raw evidence scale (consistent
+    // with `Model.evidence` / `bayes_factor_vs`), but is referenced to the
+    // genuine minimum raw REML so its best-over-model Bayes factors are also
+    // coherent (`>= 1`), rather than to whichever row happens to sit at index 0.
+    let best_raw_score = candidates
+        .iter()
+        .map(|c| c.score)
+        .fold(f64::INFINITY, f64::min);
     let mut ranking = Vec::with_capacity(candidates.len());
     let mut score_table = Vec::with_capacity(candidates.len());
     for row in &candidates {
-        let delta = log_bayes_factor(best_score, row.score);
+        let delta = log_bayes_factor(best_ranking_score, row.ranking_score());
         let bayes_factor = delta.exp();
+        let delta_reml = log_bayes_factor(best_raw_score, row.score);
         ranking.push(RankedRow {
             name: row.name.clone(),
             score: row.score,
@@ -1659,8 +1680,8 @@ pub fn compare_reml_fits(mut candidates: Vec<RemlCandidate>) -> Result<RemlCompa
         score_table.push(ScoreRow {
             name: row.name.clone(),
             reml_score: row.score,
-            delta_reml: delta,
-            bayes_factor_best_over_model: bayes_factor,
+            delta_reml,
+            bayes_factor_best_over_model: delta_reml.exp(),
             effective_dof: row.edf,
         });
     }
