@@ -107,7 +107,14 @@ impl GramJeffreysFamily {
 }
 
 impl CustomFamily for GramJeffreysFamily {
-    fn evaluate(&self, _block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        // A single-block family; the carrier must supply exactly one block state.
+        if block_states.len() != 1 {
+            return Err(format!(
+                "GramJeffreysFamily expects 1 block state, got {}",
+                block_states.len()
+            ));
+        }
         Ok(FamilyEvaluation {
             log_likelihood: 0.0,
             blockworking_sets: vec![],
@@ -121,9 +128,18 @@ impl CustomFamily for GramJeffreysFamily {
     fn joint_jeffreys_information_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        specs: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        // The supplied direction and the block layout must agree with this
+        // single-block family's design width.
+        let p = specs.iter().map(|s| s.design.ncols()).sum::<usize>();
+        if d_beta_flat.len() != p {
+            return Err(format!(
+                "direction length {} != joint coefficient width {p}",
+                d_beta_flat.len()
+            ));
+        }
         let beta = &block_states[0].beta;
         Ok(Some(self.analytic_directional(beta, d_beta_flat)))
     }
@@ -283,12 +299,10 @@ fn jeffreys_all_axes_default_is_the_per_axis_sweep_979() {
     impl CustomFamily for DefaultSweepFamily {
         fn evaluate(
             &self,
-            _block_states: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-            Ok(FamilyEvaluation {
-                log_likelihood: 0.0,
-                blockworking_sets: vec![],
-            })
+            // Delegate to the inner family so the block-count contract is shared.
+            self.inner.evaluate(block_states)
         }
         fn joint_jeffreys_information_directional_derivative_with_specs(
             &self,
