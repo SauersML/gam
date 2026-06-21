@@ -34,6 +34,8 @@ mod quality_mixture_rung_vs_reference;
 mod quality_re_random_slope_partial_pools_to_population;
 #[path = "quality/quality_spline_scan_vs_mgcv.rs"]
 mod quality_spline_scan_vs_mgcv;
+#[path = "quality/quality_ti_anova_scattered_recovers_truth.rs"]
+mod quality_ti_anova_scattered_recovers_truth;
 #[path = "quality/quality_tweedie_dispersion_location_scale_1060.rs"]
 mod quality_tweedie_dispersion_location_scale_1060;
 #[path = "quality/quality_vs_betareg_beta_logit.rs"]
