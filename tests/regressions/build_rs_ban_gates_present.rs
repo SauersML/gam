@@ -119,3 +119,106 @@ pub(crate) fn build_rs_ban_scanner_failure_surface_is_not_laundered() {
         missing
     );
 }
+
+/// Each required ban gate, paired with the OFFENDER VECTOR it fills. The gate is
+/// only live if BOTH (a) `scan_for_<gate>(&manifest_dir, ...)` is INVOKED in
+/// `main()` AND (b) a `<offender>.is_empty()` push guard funnels its offenders
+/// into `sections` (which the unconditional hard-exit then aborts on). A
+/// function-name-present check (the test above) is satisfied by the bare `fn`
+/// DEFINITION alone, so a trojan that deletes only the call or only the
+/// `sections.push` block — leaving the `fn` body in place — would slip past it
+/// while silently neutering the gate. This pins the full chain.
+///
+/// Each token is assembled from fragments so the literal identifiers never
+/// appear verbatim in this source (the build.rs scanners also read test files).
+pub(crate) fn required_gate_wiring() -> Vec<(String, String)> {
+    vec![
+        (
+            format!("scan_for_{}(&manifest", "banned_marker"),
+            format!("todo_{}.is_empty()", "offenders"),
+        ),
+        (
+            format!("scan_for_{}{}(&manifest", "deferred_", "work_markers"),
+            format!("deferred_marker_{}.is_empty()", "offenders"),
+        ),
+        (
+            format!("scan_for_{}{}(&manifest", "owed_", "work_prose"),
+            format!("owed_work_{}.is_empty()", "offenders"),
+        ),
+        (
+            format!("scan_for_{}(&manifest", "let_underscore"),
+            format!("underscore_{}.is_empty()", "offenders"),
+        ),
+        (
+            format!("scan_for_{}(&manifest", "banned_substrings"),
+            format!("substring_{}.is_empty()", "offenders"),
+        ),
+    ]
+}
+
+/// Guardian for SILENT NEUTERING: a ban gate is only enforced if it is both
+/// INVOKED and WIRED into the report `sections` (whose non-empty set triggers the
+/// unconditional hard exit). Pin both halves for the critical gates, and pin a
+/// FLOOR on the total number of `scan_for_*` invocations and `.is_empty()` push
+/// guards so a wholesale strip of gates not individually listed here is also
+/// caught. This closes the call-site / `sections.push` deletion vector that the
+/// function-presence check alone (`build_rs_ban_gates_are_all_present`) cannot
+/// see — the deeper half of the commit-`25babfc34` class of trojan edit.
+#[test]
+pub(crate) fn build_rs_ban_gates_are_invoked_and_wired() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/build.rs"))
+        .expect("build.rs must be readable at the crate manifest root");
+
+    // (a) Each critical gate must be both invoked and funneled into `sections`.
+    let mut broken: Vec<String> = Vec::new();
+    for (invocation, push_guard) in required_gate_wiring() {
+        if !src.contains(&invocation) {
+            broken.push(format!("INVOCATION missing: `{invocation}`"));
+        }
+        if !src.contains(&push_guard) {
+            broken.push(format!("sections.push wiring missing: `{push_guard}`"));
+        }
+    }
+    assert!(
+        broken.is_empty(),
+        "build.rs ban gate WIRING broken — a gate's call site or its \
+         `<offenders>.is_empty()` push into `sections` was removed, silently \
+         neutering it while the `fn` body remains (so the name-presence check \
+         stays green). Restore the full scan->offenders->sections.push->exit \
+         chain. Broken: {broken:?}"
+    );
+
+    // (b) Floor on the total wiring so a wholesale strip of OTHER gates (not
+    // individually pinned above) is also caught. As of this commit build.rs
+    // wires 24 `scan_for_*` invocations and 30+ `.is_empty()` push guards; a
+    // conservative floor rejects a mass deletion without flaking on the routine
+    // addition of new gates.
+    let scan_prefix = format!("scan_{}_", "for");
+    let scan_invocations = src.matches(scan_prefix.as_str()).count();
+    let invocation_token = format!("(&manifest_{}", "dir");
+    let scan_call_sites = src
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            t.starts_with(scan_prefix.as_str()) && l.contains(&invocation_token)
+        })
+        .count();
+    let push_guards = src
+        .matches(&format!(".is_{}()", "empty"))
+        .count();
+    assert!(
+        scan_invocations >= 24,
+        "build.rs `scan_for_*` mentions dropped to {scan_invocations} (floor 24) — \
+         ban gates were stripped en masse"
+    );
+    assert!(
+        scan_call_sites >= 20,
+        "build.rs `scan_for_*(&manifest_dir, ...)` CALL SITES dropped to \
+         {scan_call_sites} (floor 20) — gate invocations were removed from main()"
+    );
+    assert!(
+        push_guards >= 25,
+        "build.rs `.is_empty()` push guards dropped to {push_guards} (floor 25) — \
+         gate offenders are no longer funneled into the abort `sections`"
+    );
+}
