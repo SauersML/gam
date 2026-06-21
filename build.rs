@@ -1391,6 +1391,7 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         // should be deleted. Test-aware (the test build legitimately
         // queries its own configuration).
         ("cfg!(debug_assertions)", "cfg!(debug_assertions)", true),
+        ("cfg(debug_assertions)", "cfg(debug_assertions)", true),
         ("cfg!(test)", "cfg!(test)", true),
         // `Arc::strong_count` / `Arc::weak_count` (and the `Rc` siblings)
         // are documented racy primitives — the value can change between
