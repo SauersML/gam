@@ -789,8 +789,8 @@ impl LatentIdMode {
     /// `AuxOutcome` must carry a non-vacuous head (at least one labeled row)
     /// and composes with ARD — a bare label channel with no axis-selection
     /// under-pins the gauge. Returns the offending reason on failure so the
-    /// builder can reject before fitting, mirroring the existing
-    /// `reject_dim_selection_alone` gate.
+    /// builder can reject before fitting. (The former `reject_dim_selection_alone`
+    /// guard was unified here into the Result path for a panic-free gate.)
     pub fn validate(&self) -> Result<(), String> {
         if matches!(self, Self::DimSelection { .. }) {
             // `DimSelection` alone is rotation-symmetric — not a valid
