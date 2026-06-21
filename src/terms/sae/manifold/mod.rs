@@ -139,6 +139,9 @@ mod term;
 mod tests;
 
 #[cfg(test)]
+mod tests_olmo;
+
+#[cfg(test)]
 mod sae_contract_probe_tests;
 
 pub use arrow_solver::*;

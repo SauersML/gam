@@ -1112,7 +1112,7 @@ pub(crate) fn joint_outer_evaluate(
                                  an operator that does not realize H_unpen + S_lambda + \
                                  scale*H_Phi (collapse / dropped-term / stale-cache class)."
                             );
-                            debug_assert!(
+                            assert!(
                                 gap <= tol,
                                 "gam#1395 logdet collapse guard: assembled joint-Hessian \
                                  logdet={assembled_logdet:.9e} != ground-truth {reference_logdet:.9e} \
