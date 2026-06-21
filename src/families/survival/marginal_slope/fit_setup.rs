@@ -1065,15 +1065,43 @@ pub(crate) fn joint_training_design_preflight(
     // per-block selection matrices `T_i`, then solves on reduced specs and
     // lifts coefficients back via `β_raw = T_i θ`. Aborting here would defeat
     // the canonical reduction.
-    log::info!(
+    //
+    // #1388: on tiny survival benchmarks (e.g. heart_failure, cirrhosis) the
+    // joint design can be *under-determined* — `p_joint > n` — once every
+    // categorical level expands into its own column. The unpenalized joint
+    // Jacobian then has at most `n·k` independent rows, so its rank is capped
+    // strictly below `p_joint`; this is exactly the regime in which the
+    // downstream post-T rank invariant (`rank(J_can) == p_red`) is hardest to
+    // satisfy and where the canonicalization fan-out over many penalty blocks
+    // has been observed to crash before producing a usable model. The deficit
+    // is therefore promoted to a WARN with the `p_joint`-vs-`n`
+    // under-determination made explicit, so the failure is diagnosable from the
+    // log rather than surfacing only as an opaque downstream abort. Fit
+    // behaviour is unchanged: the canonical pipeline remains the authority and
+    // we still return `Ok` so a penalty-identifiable `p_joint > n` model can
+    // proceed.
+    let under_determined = p_joint > n;
+    let underdetermination = if under_determined {
+        format!(" UNDER-DETERMINED: p_joint={p_joint} > n={n} — the unpenalized joint rank is \
+                  capped at min(n, p_joint)={}, identifiability rests entirely on the penalties.",
+                 n.min(p_joint))
+    } else {
+        String::new()
+    };
+    let log_line = format!(
         "[survival-marginal-slope/preflight] joint design W-metric rank-deficient: \
          rank={rank}/{p_joint} (sigma_max={sigma_max:.3e}, rank_tol={rank_tol:.3e}, n={n}, \
-         structural_alias={structural_alias}, alias_directions={alias_count}). \
+         structural_alias={structural_alias}, alias_directions={alias_count}).{underdetermination} \
          Block layout: {block_summary}. Dominant block x column per alias: {dominant_summary}. \
          Canonical-gauge pipeline (gauge_priority: time=200, marginal=150, logslope=120, \
          score_warp=80, link_dev=60) will attribute the alias to lower-priority blocks and \
          proceed with reduced specs.",
         alias_count = alias_idx.len(),
     );
+    if under_determined {
+        log::warn!("{log_line}");
+    } else {
+        log::info!("{log_line}");
+    }
     Ok(())
 }
