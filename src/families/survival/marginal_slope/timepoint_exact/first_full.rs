@@ -7,7 +7,7 @@
 
 use super::*;
 
-fn moving_density_boundary_flux(
+pub(super) fn moving_density_boundary_flux(
     axis: usize,
     primary: &FlexPrimarySlices,
     a_u: &Array1<f64>,
@@ -57,7 +57,7 @@ fn moving_density_boundary_flux(
 /// term — the `a`-axis boundary flux was omitted (gam#932/#1454), the dominant
 /// residual in the intercept-solve `a_uv` Hessian. This mirrors the θ-axis
 /// [`moving_density_boundary_flux`] for the `z_a = −1/b` velocity.
-fn moving_density_boundary_flux_a(
+pub(super) fn moving_density_boundary_flux_a(
     entry: &CachedCellEntry,
     poly: &[f64],
     b: f64,

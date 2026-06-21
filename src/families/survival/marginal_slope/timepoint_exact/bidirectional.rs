@@ -121,6 +121,45 @@ impl SurvivalMarginalSlopeFamily {
             for u in 0..p {
                 au[u] = -f_u[u] * inv;
             }
+            // Moving-boundary flux on the base intercept-Hessian inputs, so this
+            // calibration block's auv (feeding the 4th-order intercept inputs
+            // ad1/ad2/ad12) matches the production first_full.rs / directional.rs
+            // auv. The crossing z=(τ−a)/b moves with a and every θ, so f_aa,
+            // f_au, f_uv each pick up their §D flux; the moment-only base omitted
+            // them (gam#932/#1454). These feed only scalar outputs here, so no
+            // base/dir desync arises.
+            if b != 0.0 {
+                for entry in &cached.cells {
+                    let fx = &entry.fixed;
+                    let da = fx.dc_da.map(|value| -value);
+                    f_aa += super::first_full::moving_density_boundary_flux_a(entry, &da, b);
+                    for u in 0..p {
+                        let cu = fx.coeff_u[u].map(|value| -value);
+                        f_au[u] += super::first_full::moving_density_boundary_flux_a(entry, &cu, b)
+                            + super::first_full::moving_density_boundary_flux(
+                                u, primary, &au, entry, &da, b,
+                            );
+                    }
+                    for u in 0..p {
+                        let cu = fx.coeff_u[u].map(|value| -value);
+                        for v in u..p {
+                            let cv = fx.coeff_u[v].map(|value| -value);
+                            let mut boundary = super::first_full::moving_density_boundary_flux(
+                                v, primary, &au, entry, &cu, b,
+                            );
+                            if u != v {
+                                boundary += super::first_full::moving_density_boundary_flux(
+                                    u, primary, &au, entry, &cv, b,
+                                );
+                            }
+                            f_uv[[u, v]] += boundary;
+                            if u != v {
+                                f_uv[[v, u]] += boundary;
+                            }
+                        }
+                    }
+                }
+            }
             let mut auv = Array2::<f64>::zeros((p, p));
             for u in 0..p {
                 for v in u..p {
