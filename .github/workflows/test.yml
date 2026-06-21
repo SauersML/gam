@@ -299,6 +299,30 @@ jobs:
             esac
           }
 
+          # #1393: the hardcoded partition map above is a TUNED floor, but a
+          # binary that grows new tests (the bug-hunt agent and the
+          # reference-quality waves add `#[test]`s continuously) could silently
+          # outgrow its entry and regress to the bulk 1800s target-kill. Derive a
+          # dynamic floor from the binary's actual test count so growth
+          # auto-shards even when the map is stale: ~120 tests per shard keeps a
+          # shard's summed wall-clock well under the cap. The effective partition
+          # count is the MAX of the tuned map and this dynamic floor — the map can
+          # raise sharding for known-slow binaries, growth can raise it for any
+          # binary, and neither can lower it.
+          DYNAMIC_TESTS_PER_PARTITION=120
+          dynamic_partitions_for_binary() {
+            local name="$1"
+            # `nextest list` is a pure metadata query (no test execution) over the
+            # already-built binary; count its test lines. On any failure fall back
+            # to 1 so the tuned map alone governs.
+            local count
+            count="$(cargo nextest list --test "$name" --all-features \
+                       --message-format human 2>/dev/null \
+                     | grep -cE '^\s' || echo 0)"
+            if ! [ "$count" -gt 0 ] 2>/dev/null; then echo 1; return; fi
+            echo $(( (count + DYNAMIC_TESTS_PER_PARTITION - 1) / DYNAMIC_TESTS_PER_PARTITION ))
+          }
+
           # Run one integration-test binary, sharding it into N nextest
           # partitions when partitions_for_binary says so. Each partition gets
           # its own per-binary wall-clock cap; a failure in any partition marks
@@ -307,6 +331,12 @@ jobs:
           run_integration_binary() {
             local cap="$1"; local name="$2"; shift 2
             local nparts; nparts="$(partitions_for_binary "$name")"
+            # Raise to the growth-driven floor if the binary outgrew its map entry.
+            local dyn; dyn="$(dynamic_partitions_for_binary "$name")"
+            if [ "$dyn" -gt "$nparts" ]; then
+              echo "::notice::${name}: dynamic test-count floor raised partitions ${nparts} -> ${dyn} (#1393 anti-regression)"
+              nparts="$dyn"
+            fi
             local rc=0
             if [ "$nparts" -le 1 ]; then
               run_cargo_test "$cap" --test "$name" "$@" || rc=1
