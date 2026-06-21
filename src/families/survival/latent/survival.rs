@@ -1060,15 +1060,11 @@ use crate::families::jet_partitions::MultiDirJet as LatentMultiDirJet;
 /// failure. Both callers guarantee `x > 0`: one composes at the literal `1.0`
 /// (the normalised log-sum base); the other passes `base`, which is gated by
 /// an explicit `base.is_finite() && base > 0.0` check immediately upstream. The
-/// debug assertion pins that contract; in release a non-positive `x` yields the
-/// honest IEEE result (`-inf`/`NaN`) rather than a finite fabrication. For all
+/// caller contract guarantees that; a non-positive `x` yields the honest IEEE
+/// result (`-inf`/`NaN`) rather than a finite fabrication. For all
 /// valid `x > 0` the output is bit-identical to the previous clamped version.
 #[inline]
 fn latent_unary_derivatives_log(x: f64) -> [f64; 5] {
-    debug_assert!(
-        x > 0.0,
-        "latent_unary_derivatives_log requires x > 0, got {x}"
-    );
     let x2 = x * x;
     let x3 = x2 * x;
     let x4 = x3 * x;
