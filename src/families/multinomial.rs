@@ -1035,6 +1035,44 @@ fn scale_multinomial_formula_penalty(penalty: PenaltyMatrix, scale: f64) -> Pena
     }
 }
 
+/// Build a warm-started copy of `blocks` whose per-block `initial_log_lambdas`
+/// are seeded from a previously-selected flat `log_lambdas` vector (#1082).
+///
+/// The flat `log_lambdas` returned by [`fit_custom_family_with_rho_prior`]
+/// concatenates each block's penalty log-λ in block order — the same order
+/// `build_block_specs()` emits the blocks and the same per-block penalty order
+/// the spec carries — so it splits back across blocks by each block's penalty
+/// count. Warm-starting the OUTER ρ-search from a prior iterate changes only the
+/// optimizer's starting point, never the penalized objective or its optimum, so
+/// the converged fit is identical; it just resumes near the prior iterate
+/// instead of restarting from the cold `init_lambda` seed.
+///
+/// Returns `None` (caller falls back to the cold blocks) if the flat vector does
+/// not have exactly one entry per penalty across all blocks, or carries a
+/// non-finite value — i.e. anything that would make the seed unsafe.
+fn warm_start_blocks_from_log_lambdas(
+    blocks: &[crate::custom_family::ParameterBlockSpec],
+    log_lambdas: &[f64],
+) -> Option<Vec<crate::custom_family::ParameterBlockSpec>> {
+    let total: usize = blocks.iter().map(|b| b.initial_log_lambdas.len()).sum();
+    if total == 0 || log_lambdas.len() != total {
+        return None;
+    }
+    if log_lambdas.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let mut warm = blocks.to_vec();
+    let mut offset = 0usize;
+    for block in warm.iter_mut() {
+        let k = block.initial_log_lambdas.len();
+        for slot in 0..k {
+            block.initial_log_lambdas[slot] = log_lambdas[offset + slot];
+        }
+        offset += k;
+    }
+    Some(warm)
+}
+
 /// Top-level formula-driven multinomial fit.
 ///
 /// Routes through [`fit_custom_family_with_rho_prior`] so the per-active-class
@@ -1459,9 +1497,29 @@ pub fn fit_penalized_multinomial_formula(
             } else if separation.is_none() {
                 // Interior but the capped probe ran out of iterations without
                 // certifying: re-solve at the caller's full outer budget.
+                //
+                // #1082 wall-clock: the capped probe is a strict prefix of this
+                // solve from the same family/seed, so a COLD restart repeats the
+                // probe's outer iterations. WARM-START the re-solve from the ρ the
+                // probe already reached — seed each block's `initial_log_lambdas`
+                // from the probe's selected `log_lambdas` (same block/penalty
+                // order: the flat vector concatenates per-block penalties in block
+                // order, exactly the order `build_block_specs()` emits them). This
+                // changes only the optimizer's STARTING point, never the objective
+                // or its optimum, but lets the full solve resume near the probe's
+                // last iterate instead of crawling up from `init_lambda` again —
+                // removing the probe-iterations double-pay on the non-separable
+                // (e.g. `vgam_smooth_by_factor`) arm. If the probe's λ vector does
+                // not line up with the block layout (it always should), fall back
+                // to the cold `blocks` seed.
+                let warm_blocks = warm_start_blocks_from_log_lambdas(
+                    &blocks,
+                    probe_fit.log_lambdas.as_slice().unwrap_or(&[]),
+                );
+                let resolve_blocks = warm_blocks.as_deref().unwrap_or(&blocks);
                 match fit_custom_family_with_rho_prior(
                     &family,
-                    &blocks,
+                    resolve_blocks,
                     &options,
                     crate::types::RhoPrior::Flat,
                 ) {
