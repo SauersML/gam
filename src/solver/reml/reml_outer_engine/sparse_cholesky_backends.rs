@@ -441,18 +441,8 @@ impl HessianOperator for SparseCholeskyOperator {
             }
             return trace;
         }
-        crate::linalg::sparse_exact::solve_sparse_spdmulti(&self.factor, a)
-            .unwrap_or_else(|e| {
-                // SAFETY: `self.factor` is the validated SPD Cholesky factor
-                // (created by `SparseCholeskyOperator::new` only after a
-                // successful factorization); a single-square multi-RHS solve
-                // here can only fail on factor corruption, which the
-                // construction invariant forbids.
-                // SAFETY: self.factor is validated SPD; single-square multi-solve only fails on corruption.
-                panic!("SparseCholeskyOperator exact trace_hinv_product solve failed: {e}")
-            })
-            .diag()
-            .sum()
+        // Use the graceful solve_multi (zero on impossible err) to avoid panic in this path.
+        self.solve_multi(a).diag().iter().sum()
     }
 
     fn trace_hinv_operator(&self, op: &dyn HyperOperator) -> f64 {
