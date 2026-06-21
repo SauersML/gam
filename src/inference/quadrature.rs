@@ -5289,14 +5289,20 @@ mod tests {
     #[test]
     fn test_logit_posterior_mean_exact_no_truncation_bias_1459() {
         assert!(file!().ends_with(".rs"));
+        // Full Cartesian grid {1,3,-2} x {0.02,0.05,0.5,2.0} (12 cases; salvaged
+        // from PR #1462 by HomunculusLabs — was an 8-case hand-picked subset).
         let table = [
             (1.0, 0.02),
+            (1.0, 0.05),
             (1.0, 0.5),
             (1.0, 2.0),
+            (3.0, 0.02),
             (3.0, 0.05),
             (3.0, 0.5),
             (3.0, 2.0),
+            (-2.0, 0.02),
             (-2.0, 0.05),
+            (-2.0, 0.5),
             (-2.0, 2.0),
         ];
         for (mu, sigma) in table {

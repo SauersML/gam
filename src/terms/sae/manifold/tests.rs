@@ -4070,6 +4070,37 @@ pub(crate) fn sae_row_layout_from_dense_weights_top_k_and_cutoff() {
 /// it constructs a dense K = 100_000 weight vector per row, runs the proposal,
 /// checks support recovery is exact, and pins the compact work to be
 /// independent of K (`q_active` set only by `cap` + active coord dims).
+// #1450 (salvaged from PR #1461 by HomunculusLabs): large-K (K=100000) end-to-end
+// `from_dense_weights` coverage — exact support recovery + K-independent compact work.
+#[test]
+pub(crate) fn from_dense_weights_large_k_support_proposal_1450() {
+    let (k_atoms, d, k_true, n) = (100_000_usize, 1, 4, 4);
+    let planted: Vec<usize> = (0..k_true).map(|j| j * k_atoms / k_true).collect();
+    let assignments: Vec<Array1<f64>> = (0..n)
+        .map(|row| {
+            let mut a = vec![1e-9_f64; k_atoms];
+            for (i, &atom) in planted.iter().enumerate() {
+                a[atom] = 0.2 + 0.01 * (row + i) as f64;
+            }
+            Array1::from_vec(a)
+        })
+        .collect();
+    let coord_offsets: Vec<usize> = (0..k_atoms).map(|k| k_atoms + k).collect();
+    let layout = SaeRowLayout::from_dense_weights(
+        &assignments,
+        k_true,
+        1e-3,
+        vec![d; k_atoms],
+        coord_offsets,
+    );
+    for row in 0..n {
+        assert_eq!(layout.active_atoms[row], planted, "row {row} wrong atoms");
+        assert_eq!(layout.row_q_active(row), k_true + k_true * d);
+    }
+    let compact_work: usize = (0..n).map(|r| layout.row_q_active(r).pow(2)).sum();
+    assert!(compact_work < n * (k_atoms * (1 + d)).pow(2) / 1_000_000);
+}
+
 #[test]
 pub(crate) fn sae_row_layout_from_dense_weights_large_k_work_scales_with_active() {
     let n = 4usize;
