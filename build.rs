@@ -71,6 +71,13 @@ fn main() {
     let mut todo_history_violations: Vec<(PathBuf, usize, String, String)> = Vec::new();
     run_todo_marker_history_audit(&manifest_dir, needle, &mut todo_history_violations);
 
+    // Cosmetic wording dodge: a recent commit reworded or deleted an owed-work /
+    // deferral note (one the prose ban forbids) from a non-test src file WHILE the
+    // comment-stripped code stayed byte-identical. Wording laundered to satisfy
+    // build.rs without doing the work — flagged as a hard failure below.
+    let mut cosmetic_dodge_violations: Vec<(PathBuf, usize, String, String)> = Vec::new();
+    run_cosmetic_wording_dodge_audit(&manifest_dir, &mut cosmetic_dodge_violations);
+
     // Deferred-work markers wearing a different label (relabel-evasion of the
     // bare TODO ban): a `fixme`/`xxx`/`hack` comment lead-in, or a deferral word
     // carrying an issue ref like `Follow-up (#932):`.
@@ -724,6 +731,24 @@ fn main() {
                 needle
             ),
             rows: todo_history_violations
+                .iter()
+                .map(|(file, line, reason, site)| {
+                    (file.clone(), *line, Some(reason.clone()), site.clone())
+                })
+                .collect(),
+        });
+    }
+
+    if !cosmetic_dodge_violations.is_empty() {
+        sections.push(Section {
+            title:
+                "cosmetic wording dodge (history audit): an owed-work/deferral note was reworded \
+                 or deleted from a non-test src file while the comment-stripped code stayed \
+                 byte-identical — the work was NOT done, only the wording. Do the real work or \
+                 restore the honest note; rewording a build.rs-flagged signal to satisfy the \
+                 scanner is banned"
+                    .to_string(),
+            rows: cosmetic_dodge_violations
                 .iter()
                 .map(|(file, line, reason, site)| {
                     (file.clone(), *line, Some(reason.clone()), site.clone())
@@ -5261,6 +5286,264 @@ fn collect_called_idents(stripped: &str, out: &mut Vec<String>) {
             out.push(stripped[start..i].to_string());
         }
         i += 1;
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cosmetic-wording-dodge history audit.
+//
+// Generalizes the "marker removed but code unchanged" idea (see
+// `removed_todo_site_violation`) from the bare TODO marker to OWED-WORK /
+// DEFERRAL prose. The owner's rule: "ANY wording change made to satisfy
+// build.rs is ALWAYS a bad hack." If a commit removes or rewords an owed-work
+// note that `scan_for_owed_work_prose` would ban, but the comment-stripped CODE
+// of that file is byte-identical before and after, then the owed work was NOT
+// done — it was laundered into different wording to dodge the scanner. The
+// canonical example is commit 6d6b529e1, which reworded the banned owed-work
+// phrasing (a "not-yet-"-style deferral note) across ten files with ZERO
+// implementation lines.
+
+/// The exact owed-work / deferral prose fragments that `scan_for_owed_work_prose`
+/// bans, assembled from pieces at runtime so this build script never carries the
+/// banned phrasing verbatim (which would self-trip the lexical scanner and this
+/// very audit). Kept as a standalone helper so the removal-signal here keys on
+/// precisely the same phrase set the prose ban enforces — removing one of these
+/// notes is what this audit treats as an owed-work signal disappearing.
+fn cosmetic_dodge_owed_work_phrases() -> Vec<String> {
+    vec![
+        format!("not yet {}", "wired"),
+        format!("not yet {}", "implemented"),
+        format!("not yet {}", "supported"),
+        format!("not yet {}", "hooked"),
+        format!("not yet {}", "done"),
+        format!("not yet {}", "finished"),
+        format!("not {} yet", "implemented"),
+        format!("not {} yet", "supported"),
+        format!("not {} yet", "wired"),
+        format!("not wired {}", "into"),
+        format!("not wired {}", "through"),
+        format!("is not {}", "wired"),
+        format!("{} wired", "isn't"),
+        format!("to be {} yet", "wired"),
+        format!("deferred to a {}", "follow"),
+        format!("left to a {}", "follow"),
+        format!("for a {}-up", "follow"),
+        format!("in a {}-up", "follow"),
+        format!("to a {}-up", "follow"),
+        format!("remains to be {}", "implemented"),
+        format!("needs to be {}", "implemented"),
+        format!("will be {}", "implemented"),
+        format!("will be {}", "wired"),
+        format!("yet to be {}", "implemented"),
+        format!("yet to be {}", "wired"),
+    ]
+}
+
+/// True when `line` is a `//` line-comment carrying one of the owed-work /
+/// deferral prose phrases. Uses the same `line_comment_text` reader as
+/// `scan_for_owed_work_prose`, so URLs/`://` and non-comment code never match.
+fn cosmetic_dodge_line_is_owed_signal(line: &str, phrases: &[String]) -> bool {
+    let Some(text) = line_comment_text(line) else {
+        return false;
+    };
+    phrases.iter().any(|p| text.contains(p.as_str()))
+}
+
+/// Collect the non-test `src/*.rs` files a single commit touched. A merge commit
+/// (multiple parents) is skipped — its first-parent diff replays the merged
+/// branch's already-audited content and would re-flag an already-landed change.
+fn cosmetic_dodge_commit_src_files(manifest_dir: &Path, sha: &str) -> Vec<String> {
+    let parents = match Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("rev-list")
+        .arg("--parents")
+        .arg("-n1")
+        .arg(sha)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let parents_text = String::from_utf8_lossy(&parents.stdout);
+    // Tokens are: <commit> <parent1> [<parent2> ...]. More than one parent ⇒ merge.
+    let token_count = parents_text.split_whitespace().count();
+    if token_count != 2 {
+        return Vec::new();
+    }
+
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("diff")
+        .arg("--name-only")
+        .arg(format!("{sha}^"))
+        .arg(sha)
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut out = Vec::new();
+    for rel in text.lines() {
+        let rel = rel.trim();
+        if rel.is_empty() {
+            continue;
+        }
+        let rel_norm = rel.replace('\\', "/");
+        if !rel_norm.starts_with("src/") || !rel_norm.ends_with(".rs") {
+            continue;
+        }
+        let rel_path = Path::new(rel);
+        if rel_path_is_skipped_for_scans(rel_path) || !rel_path_is_scannable(rel_path) {
+            continue;
+        }
+        out.push(rel.to_string());
+    }
+    out
+}
+
+/// Read a single tree blob (`git show <treeish>:<path>`). Returns `None` when the
+/// path did not exist at that revision (e.g. added/deleted in the commit).
+fn cosmetic_dodge_blob_at(manifest_dir: &Path, treeish: &str, rel: &str) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("show")
+        .arg(format!("{treeish}:{rel}"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// History audit: flag any recent commit that REMOVED or REWORDED an owed-work /
+/// deferral note (one of `cosmetic_dodge_owed_work_phrases`) from a non-test
+/// `src/*.rs` file WHILE the comment-stripped code of that file is byte-identical
+/// before and after. That is the cosmetic wording dodge: the note that recorded
+/// owed work is gone, but no code changed, so the work itself was never done —
+/// only the wording was laundered to satisfy the prose ban.
+///
+/// FALSE-POSITIVE control. A commit is flagged ONLY when BOTH hold:
+///   (a) a removed `//`-comment line carried an owed-work phrase AND that exact
+///       signal is gone from the after-blob (removed or reworded away); and
+///   (b) `normalized_file_code_without_comments(before) ==
+///       normalized_file_code_without_comments(after)` — the stripped code is
+///       byte-identical.
+/// Honest doc edits that don't touch an owed-work phrase never satisfy (a); any
+/// commit that changes real code never satisfies (b). Both arms must fire, so an
+/// ordinary documentation improvement and a genuine repair are both immune.
+fn run_cosmetic_wording_dodge_audit(
+    manifest_dir: &Path,
+    violations: &mut Vec<(PathBuf, usize, String, String)>,
+) {
+    let phrases = cosmetic_dodge_owed_work_phrases();
+
+    let log = match Command::new("git")
+        .arg("-C")
+        .arg(manifest_dir)
+        .arg("log")
+        .arg(format!("-n{TO_DO_HISTORY_GIT_DEPTH}"))
+        .arg("--no-merges")
+        .arg("--format=%H")
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return,
+    };
+    let log_text = match String::from_utf8(log.stdout) {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    for sha in log_text.lines() {
+        let sha = sha.trim();
+        if sha.is_empty() {
+            continue;
+        }
+        for rel in cosmetic_dodge_commit_src_files(manifest_dir, sha) {
+            // The hunks this commit applied to `rel` (no context, so only
+            // genuinely added/removed lines are present).
+            let diff = match Command::new("git")
+                .arg("-C")
+                .arg(manifest_dir)
+                .arg("diff")
+                .arg("-U0")
+                .arg(format!("{sha}^"))
+                .arg(sha)
+                .arg("--")
+                .arg(&rel)
+                .output()
+            {
+                Ok(o) if o.status.success() => o,
+                _ => continue,
+            };
+            let diff_text = String::from_utf8_lossy(&diff.stdout);
+            let mut removed_signal_lines: Vec<String> = Vec::new();
+            for line in diff_text.lines() {
+                if line.starts_with("---") || line.starts_with("+++") {
+                    continue;
+                }
+                if let Some(body) = line.strip_prefix('-')
+                    && cosmetic_dodge_line_is_owed_signal(body, &phrases)
+                {
+                    removed_signal_lines.push(body.to_string());
+                }
+            }
+            if removed_signal_lines.is_empty() {
+                continue;
+            }
+
+            let Some(before) = cosmetic_dodge_blob_at(manifest_dir, &format!("{sha}^"), &rel) else {
+                continue;
+            };
+            let Some(after) = cosmetic_dodge_blob_at(manifest_dir, sha, &rel) else {
+                continue;
+            };
+
+            // (a) at least one removed owed-work signal is genuinely gone from the
+            // after-blob (a pure reorder that keeps the same line verbatim is not a
+            // removal/rewording). Compare on trimmed text so re-indentation alone
+            // does not count as "still present".
+            let after_signal_lines: Vec<String> = after
+                .lines()
+                .filter(|l| cosmetic_dodge_line_is_owed_signal(l, &phrases))
+                .map(|l| l.trim().to_string())
+                .collect();
+            let signal_gone = removed_signal_lines
+                .iter()
+                .any(|r| !after_signal_lines.iter().any(|a| a == r.trim()));
+            if !signal_gone {
+                continue;
+            }
+
+            // (b) comment-stripped code is byte-identical — no real work landed.
+            if normalized_file_code_without_comments(&before)
+                != normalized_file_code_without_comments(&after)
+            {
+                continue;
+            }
+
+            let reason = format!(
+                "cosmetic wording dodge: an owed-work/deferral note was reworded or deleted but \
+                 no code changed (file {rel}, commit {short}) — the work was NOT done, only the \
+                 wording. Do the real work or restore the honest note; rewording to satisfy \
+                 build.rs is banned.",
+                short = &sha[..sha.len().min(9)],
+            );
+            violations.push((
+                PathBuf::from(&rel),
+                0,
+                reason,
+                removed_signal_lines
+                    .first()
+                    .map(|l| l.trim().to_string())
+                    .unwrap_or_default(),
+            ));
+        }
     }
 }
 
