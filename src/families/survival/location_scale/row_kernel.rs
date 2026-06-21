@@ -141,11 +141,11 @@ pub(crate) struct SurvivalJointQuantities {
     pub(crate) d2qdot_ls: Array1<f64>,
     pub(crate) d2qdot_lstd: Array1<f64>,
     pub(crate) d2qdot_lslsd: Array1<f64>,
-    // NOTE: the 3rd-order qdot maps (d3qdot_tls_ls / _tls_lsd / _td_ls_ls /
-    // _ls_ls_ls / _ls_ls_lsd) were only consumed by the dense `Tower4<9>`
-    // location-scale directional path, which is currently disabled (see
-    // `row_kernel_directional_supported` → false). They are re-added — here and
-    // in `SurvivalDynamicGeometry` — when that path is re-enabled (#932).
+    // NOTE: the only consumer of the 3rd-order qdot maps (d3qdot_tls_ls /
+    // _tls_lsd / _td_ls_ls / _ls_ls_ls / _ls_ls_lsd) is the dense `Tower4<9>`
+    // location-scale directional path, which `row_kernel_directional_supported`
+    // reports as unsupported (returns false). With no live reader, this kernel
+    // and `SurvivalDynamicGeometry` carry no 3rd-order qdot state.
 }
 
 /// Per-row negative-log-likelihood **curvatures** of the three functionally
