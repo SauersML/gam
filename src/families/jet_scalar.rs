@@ -49,16 +49,15 @@
 //! (each scalar consumes the leading entries its order needs), never by
 //! differentiating an unstable primal.
 //!
-//! # Test-only scalars (promoted to production when #932 wires a consumer)
+//! # Test-only scalars (no production consumer in the current build)
 //!
 //! The `JetScalar` trait below is production: it is the bound on
 //! [`super::jet_tower::RowNllProgramGeneric::row_nll_generic`], the seam a family
 //! row loss is written against. The concrete scalars that *consume* it — the
 //! [`super::jet_tower::Tower4`] all-channels impl and the `Order2` / `OneSeed` /
-//! `TwoSeed` order-specific scalars — currently have NO production caller (the
-//! row_nll cutover that would consume them is not wired yet), so they live in the
-//! `#[cfg(test)]` module as the oracle scaffolding they are today. They will be
-//! promoted out of the test module when the #932 row_nll cutover wires a consumer.
+//! `TwoSeed` order-specific scalars — have NO production caller in the current
+//! build, so they live in the `#[cfg(test)]` module as the oracle scaffolding
+//! that pins the contracted scalars against the dense `Tower4` truth.
 
 /// A truncated-Taylor scalar carrying derivatives in `K` primaries.
 ///
@@ -144,11 +143,9 @@ mod tests {
 
     // ── Order-specific oracle scalars (test-only; doc §A.1–A.3) ─────────
     //
-    // These concrete `JetScalar` scalars have no production consumer yet (the
-    // #932 row_nll cutover that would wire one is not done), so they live here
-    // as the oracle scaffolding that pins the contracted scalars against the
-    // dense `Tower4` truth. Promote them to module scope when the cutover wires
-    // a consumer.
+    // These concrete `JetScalar` scalars have no production consumer in the
+    // current build, so they live here as the oracle scaffolding that pins the
+    // contracted scalars against the dense `Tower4` truth.
 
     // ── Order2<K>: value / gradient / Hessian (doc §A.1) ────────────────────
 
