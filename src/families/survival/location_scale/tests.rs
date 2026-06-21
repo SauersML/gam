@@ -784,6 +784,91 @@ fn survival_ls_exact_row_kernel(
         .expect("positive-weight oracle row")
 }
 
+/// Build a single-row survival LS family with the production default
+/// derivative guard (1e-6) for monotonicity-floor probes.
+fn survival_ls_default_guard_unit_family() -> SurvivalLocationScaleFamily {
+    SurvivalLocationScaleFamily {
+        n: 1,
+        y: array![1.0],
+        w: array![1.0],
+        inverse_link: residual_distribution_inverse_link(ResidualDistribution::Gaussian),
+        derivative_guard: DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD,
+        x_time_entry: Arc::new(array![[1.0]]),
+        x_time_exit: Arc::new(array![[1.0]]),
+        x_time_deriv: Arc::new(array![[1.0]]),
+        time_wiggle_knots: None,
+        time_wiggle_degree: None,
+        time_wiggle_ncols: 0,
+        time_linear_constraints: lower_bound_constraints(&array![0.0]),
+        x_threshold: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        x_threshold_entry: None,
+        x_threshold_deriv: None,
+        x_log_sigma: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        x_log_sigma_entry: None,
+        x_log_sigma_deriv: None,
+        x_link_wiggle: None,
+        wiggle_knots: None,
+        wiggle_degree: None,
+        location_log_time: None,
+        policy: crate::resource::ResourcePolicy::default_library(),
+    }
+}
+
+/// #1396 regression: the event Jacobian `g = d_raw + qdot` is formed as a
+/// compensated subtraction of two near-equal-magnitude, opposite-sign operands
+/// (the constrained `d_raw` and the unconstrained threshold/log-σ `qdot`). At a
+/// feasible monotone boundary that cancellation can tip the reconstructed `g` a
+/// hair below zero — strictly smaller in magnitude than the derivative guard —
+/// which the monotonicity check must FLOOR to the guard rather than rejecting as
+/// a non-monotone state (the `heart_failure_structural_time_small` abort). A
+/// genuinely non-monotone state (g negative by far more than the guard) must
+/// still hard-error.
+#[test]
+fn survival_ls_monotonicity_floors_near_cancellation_negative_velocity() {
+    let family = survival_ls_default_guard_unit_family();
+    let guard = family.time_derivative_lower_bound();
+
+    // A near-cancellation that lands g just barely negative: d_raw and qdot are
+    // O(1) and opposite-signed, differing only at the ~1e-7 level — exactly the
+    // boundary-cancellation regime. `row_predictor_state` forms
+    // g = compensated_difference(d_raw, -qdot1) = d_raw + qdot1.
+    let d_raw = 1.0_f64;
+    let qdot1 = -(1.0_f64 + 2.0e-7); // g = d_raw + qdot1 = -2.0e-7, within the guard band
+    let state = family.row_predictor_state(0.1, 0.2, d_raw, -0.3, -0.3, qdot1);
+    assert!(
+        state.g < 0.0 && state.g.abs() < guard,
+        "fixture must produce a tiny-negative velocity inside the guard band: g={}, guard={guard}",
+        state.g,
+    );
+    let kernel = family
+        .exact_row_kernel(0, state)
+        .expect("near-cancellation negative velocity must be floored, not rejected")
+        .expect("positive-weight row");
+    // Floored to the guard ⇒ log(g) = log(guard), finite.
+    assert!(
+        (kernel.log_g - guard.ln()).abs() <= 1e-12,
+        "velocity must be floored to the guard: log_g={}, expected log(guard)={}",
+        kernel.log_g,
+        guard.ln(),
+    );
+
+    // A genuinely non-monotone state (g negative by far more than the guard)
+    // must still be rejected — the floor does not mask real violations.
+    let bad_state = family.row_predictor_state(0.1, 0.2, 1.0, -0.3, -0.3, -1.5);
+    assert!(
+        bad_state.g < -guard,
+        "fixture must produce a large-negative velocity below -guard: g={}",
+        bad_state.g,
+    );
+    let err = family
+        .exact_row_kernel(0, bad_state)
+        .expect_err("a genuinely non-monotone velocity must hard-error");
+    assert!(
+        err.contains("monotonicity violated"),
+        "unexpected error for non-monotone velocity: {err}",
+    );
+}
+
 fn hand_survival_ls_channels(
     inverse_link: &InverseLink,
     row: SurvivalLsLocationScaleRow,
