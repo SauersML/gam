@@ -2110,12 +2110,18 @@ fn log_det_from_chol_lower(l: ArrayView2<'_, f64>) -> f64 {
     let mut acc = 0.0_f64;
     for i in 0..n {
         let d = l[[i, i]];
-        // Guard against negative diagonal (impossible for a valid
-        // Cholesky factor, but protect against caller corruption).
         if d > 0.0 {
             acc += d.ln();
         } else {
-            return f64::NAN;
+            // SAFETY: a valid lower-triangular Cholesky factor has a strictly
+            // positive diagonal by construction. A non-positive diagonal means
+            // the caller passed a corrupted / non-SPD factor — surface it loudly
+            // rather than papering over with a corrupting NaN that silently
+            // poisons the evidence log-det (callers do not check is_nan).
+            panic!(
+                "log_det_from_chol_lower: non-positive Cholesky diagonal {d} at index {i}; \
+                 caller passed a corrupted or non-SPD factor"
+            );
         }
     }
     acc
