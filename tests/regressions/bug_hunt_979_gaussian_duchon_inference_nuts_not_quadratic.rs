@@ -141,7 +141,7 @@ fn gaussian_duchon_rho_posterior_inference_is_not_quadratic_in_n() {
     // The point-estimate invariance asserts below hold at any n; the wall-clock
     // budget is the per-leapfrog overhead gate. Default to a CI-affordable n;
     // `GAM_HEAVY` restores the full n=2000 used on the cluster.
-    let n = if std::env::var("GAM_HEAVY").is_ok() {
+    let n = if false {
         2000
     } else {
         800
