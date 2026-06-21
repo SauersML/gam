@@ -182,3 +182,24 @@ def test_categorical_dtype_columns_pandas_numeric_string_still_categorical() -> 
     columns, kind = table_columns(df)
     categorical = categorical_dtype_columns(df, columns, kind)
     assert "g" in categorical, f"pandas regression guard: {categorical}"
+
+
+def test_normalize_table_dict_numeric_string_stamps_categorical_sentinel() -> None:
+    # End-to-end: a dict numeric-string-label column must reach normalize_table's
+    # row output with the categorical sentinel prefix (so Rust force_categorical
+    # fires), while a float column stays plain numeric text.
+    from gamfit._tables import CATEGORICAL_CELL_SENTINEL, normalize_table
+
+    headers, rows, kind = normalize_table(
+        {"g": ["0", "1", "2"], "y": [1.0, 2.0, 3.0]}
+    )
+    assert kind == "mapping"
+    g_index = headers.index("g")
+    y_index = headers.index("y")
+    for row in rows:
+        assert row[g_index].startswith(CATEGORICAL_CELL_SENTINEL), (
+            f"dict numeric-string cell must carry the categorical sentinel: {row[g_index]!r}"
+        )
+        assert not row[y_index].startswith(CATEGORICAL_CELL_SENTINEL), (
+            f"float column must stay plain numeric: {row[y_index]!r}"
+        )
