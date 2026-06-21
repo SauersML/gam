@@ -2297,7 +2297,9 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
 #[test]
 #[ignore = "pure FD-localization diagnostic for the OPEN directional third[g,w0] \
             residual (#932): prints per-(u,v) production-vs-FD gaps, asserts nothing. \
-            Convergent assertions live in flex_bidirectional_second_mixed_matches_central_fd."]
+            The convergent cubic-degree premise behind the bidirectional d12 fixes is \
+            asserted by cubic_cell_kernel::tests::\
+            link_basis_cell_fourth_ab_partials_vanish_third_are_nonzero."]
 fn diagnostic_flex_directional_quantities_fd_localize() {
     // FD-localize WHICH directional timepoint quantity (eta_uv_dir / chi_uv_dir
     // / d_uv_dir) disagrees with a central difference of its base counterpart
