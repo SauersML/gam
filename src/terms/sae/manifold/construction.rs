@@ -8603,7 +8603,8 @@ impl SaeManifoldTerm {
                 .chain(x0.beta.iter())
                 .fold(0.0_f64, |m, &v| m.max(v.abs()))
                 .max(1.0);
-        for _ in 0..MAX_ITERS {
+        let max_iters = MAX_ITERS;
+        for _ in 0..max_iters {
             let dc = self.apply_exact_hessian_minus_b(rho, target, cache, &x)?;
             let corr = solver
                 .solve(dc.t.view(), dc.beta.view())
