@@ -275,9 +275,21 @@ jobs:
           # FILTER, so the binary still links exactly once and each shard
           # reuses it (no extra link, no extra disk). N is sized by the
           # binary's test count; everything else stays a single shard.
+          # #1082: the `quality` binary holds the multi-minute reference-
+          # comparison tests (tensor-te 2D/3D, poisson, cyclic/torus, CI
+          # coverage, competing-risks, location-scale PIT, and the separable
+          # multinomial smooth-by-factor) that drove the 360s-budget timeouts.
+          # Run serially (--test-threads 1, the peak-RSS guard) several of these
+          # can co-land in one shard and push the shard wall-clock high, which
+          # both lengthens the run and coarsens per-test attribution. Finer
+          # sharding of `quality` (6 -> 8) spreads those known-slow tests across
+          # more shards so each shard's summed wall-clock is lower and a slow
+          # test is attributed within a smaller batch. `--partition` is a pure
+          # run-time filter: the binary still links once and each shard reuses
+          # it (no extra link, no extra disk).
           partitions_for_binary() {
             case "$1" in
-              quality)      echo 6 ;;
+              quality)      echo 8 ;;
               basis_smooth) echo 4 ;;
               manifolds)    echo 3 ;;
               perf_scale)   echo 2 ;;
