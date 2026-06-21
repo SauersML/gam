@@ -2649,7 +2649,7 @@ pub fn maybe_log_audit_drift(
     // `jacobian_callback`.  The flat audit omits W refresh (no W matrix); the
     // drift detection here is purely structural (rank of J(β)), not
     // curvature-weighted.  That is the correct identifiability check: structural
-    // model is locally identified at β.
+    // rank is what tells you whether the model is locally identified at β.
     let p_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
     let beta_for_state: Vec<f64> = if beta_current.len() == p_total {
         beta_current.to_vec()

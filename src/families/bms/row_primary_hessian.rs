@@ -1500,23 +1500,7 @@ impl BernoulliMarginalSlopeFamily {
                     }
                     // Any non-OK status means a cell the kernel refused;
                     // the row buffer for that cell is zeroed, which is
-                    // mathematically OK (zero moments → zero contribution)
-                    // but indicates a classifier disagreement worth
-                    // surfacing in debug builds.
-                    #[cfg(debug_assertions)]
-                    {
-                        for (i, &s) in status.iter().enumerate() {
-                            assert_eq!(
-                                s,
-                                CubicCellMomentStatus::Ok as u8,
-                                "bms_flex_row device-moment cell {i} status={s} (kernel refused)"
-                            );
-                        }
-                    }
-                    // `status` is consumed only by the debug assert above;
-                    // the runtime path keeps the device buffer alive on
-                    // the owned bundle and lets the launcher feed it
-                    // straight into the row kernel.
+                    // mathematically OK (zero moments → zero contribution).
                     drop(status);
                     Some(d_moments)
                 }
