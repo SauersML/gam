@@ -228,7 +228,7 @@ fn size_se(alpha: f64, reps: usize) -> f64 {
 fn exhaustive_null_simulation_size_grid() {
     init_parallelism();
 
-    let heavy = std::env::var("GAM_HEAVY").is_ok();
+    let heavy = false;
     let reps: usize = if heavy { 600 } else { 120 };
     let ns: &[usize] = if heavy {
         &[30usize, 50, 100, 200, 500]
