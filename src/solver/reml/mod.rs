@@ -3221,8 +3221,16 @@ impl DerivativeStorageBackend for ZeroDerivativeMatrix {
     fn penalty_scaled_add_to(
         &self,
         target: &mut Array2<f64>,
-        _amp: f64,
+        amp: f64,
     ) -> Result<(), EstimationError> {
+        // Zero penalty derivative: `amp · 0 = 0`, so `amp` scales nothing and
+        // `target` is left unchanged. Validate it is finite so a bad scale
+        // surfaces here rather than silently no-op'ing on a NaN/inf amplitude.
+        if !amp.is_finite() {
+            crate::bail_invalid_estim!(
+                "zero hyper penalty derivative received non-finite amp={amp}"
+            );
+        }
         if target.nrows() != self.cols || target.ncols() != self.cols {
             crate::bail_invalid_estim!(
                 "zero hyper penalty derivative shape mismatch: target={}x{}, expected {}x{}",
