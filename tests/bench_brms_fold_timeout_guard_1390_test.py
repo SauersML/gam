@@ -64,6 +64,26 @@ def test_brms_cv_driver_caps_each_fold():
     assert "timeout_sec=brms_fold_timeout" in src, (
         "brms fold timeout no longer reaches run_cmd (#1390)"
     )
+    # A capped fold must be tagged as a timeout (rc=124), distinct from a model
+    # failure, so the recorded outcome is attributable.
+    assert '"status": "timeout"' in src or "'status': 'timeout'" in src, (
+        "brms timeout is no longer tagged distinctly from a model failure (#1390)"
+    )
+    assert "code == 124" in src, (
+        "brms timeout no longer keyed off the rc=124 budget-overrun signal (#1390)"
+    )
+
+
+def test_brms_r_script_caps_mcmc_sampling_budget():
+    src = _read("bench/_run_suite_external.py")
+    # The brms MCMC sampling budget must be overridable per #1390 so a heavy
+    # scenario can run a lighter posterior instead of being killed mid-sample.
+    for knob in ("BENCH_BRMS_CHAINS", "BENCH_BRMS_ITER", "BENCH_BRMS_WARMUP"):
+        assert knob in src, f"brms sampling knob {knob} removed (#1390)"
+    # The R fit must consume the overridable values, not the old hardcoded ones.
+    assert "chains = brms_chains" in src, "brms chains no longer overridable (#1390)"
+    assert "iter = brms_iter" in src, "brms iter no longer overridable (#1390)"
+    assert "warmup = brms_warmup" in src, "brms warmup no longer overridable (#1390)"
 
 
 def test_benchmark_workflow_gives_heavy_shard_an_explicit_budget():

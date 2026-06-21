@@ -1705,15 +1705,29 @@ for (cn in feature_cols) {
   test_df[[cn]] <- (test_df[[cn]] - mu) / sdv
 }
 
+# #1390: MCMC sampling budget per fold is overridable so a heavy scenario whose
+# full 4-chain x 2000-iter CV would blow the shard budget can run a lighter,
+# still-valid posterior instead of being killed mid-sample. Defaults reproduce
+# the original 4 chains / 2000 iter / 1000 warmup, so ordinary scenarios are
+# unchanged.
+.env_int <- function(name, default) {
+  v <- suppressWarnings(as.integer(Sys.getenv(name, unset = "")))
+  if (length(v) != 1L || is.na(v) || v <= 0L) default else v
+}
+brms_chains <- .env_int("BENCH_BRMS_CHAINS", 4L)
+brms_iter <- .env_int("BENCH_BRMS_ITER", 2000L)
+brms_warmup <- .env_int("BENCH_BRMS_WARMUP", 1000L)
+if (brms_warmup >= brms_iter) brms_warmup <- as.integer(brms_iter %/% 2L)
+
 t0 <- proc.time()[["elapsed"]]
 fit <- tryCatch(
   brm(
     formula = bf(as.formula(mu_formula), sigma = as.formula(sigma_formula)),
     data = train_df,
     family = gaussian(),
-    chains = 4,
-    iter = 2000,
-    warmup = 1000,
+    chains = brms_chains,
+    iter = brms_iter,
+    warmup = brms_warmup,
     cores = min(4L, max(1L, parallel::detectCores(logical=FALSE))),
     seed = 123,
     control = list(adapt_delta = 0.95, max_treedepth = 12),
