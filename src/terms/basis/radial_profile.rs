@@ -449,4 +449,29 @@ mod tests {
         assert!(RadialProfile::build(&kind, 1.0, 1.0).is_none());
         assert!(RadialProfile::build(&kind, -1.0, 2.0).is_none());
     }
+
+    #[test]
+    pub(crate) fn certify_tail_tol_is_consistent_with_spot_tol() {
+        // gam#1453 regression: the tail-decay certificate must not demand more
+        // precision than the off-grid spot-check it is paired with. Requiring
+        // the Chebyshev tail to fall below a tolerance tighter than the samples'
+        // own accuracy (the case for the high-dimensional Duchon operator core,
+        // whose partial-fraction sum carries cancellation noise) rejects
+        // profiles that are nonetheless accurate to the certificate's own
+        // off-grid bound. The two gates must agree on "accurate enough".
+        assert!(
+            PROFILE_CERT_RTOL.max(PROFILE_SPOT_RTOL) >= PROFILE_SPOT_RTOL,
+            "tail certificate must be at least as permissive as the off-grid \
+             accuracy gate it certifies against"
+        );
+        // The production high-dimensional Duchon profile must certify on its
+        // certifiable window now that the tail gate is consistent (this is the
+        // exact build that previously returned None despite passing off-grid).
+        let kind = production_duchon_kind();
+        assert!(
+            RadialProfile::build(&kind, 1.0, 10.0).is_some(),
+            "production Duchon profile must certify on [1, 10] under the \
+             consistent tail/spot tolerance"
+        );
+    }
 }
