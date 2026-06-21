@@ -1,13 +1,8 @@
 use crate::linalg::faer_ndarray::fast_ata;
 
 use super::*;
-use crate::solver::arrow_schur::{
-    ArrowFactorSlab, ArrowHtbetaCache, ArrowSolverMode, ArrowUndampedFactors, PcgDiagnostics,
-};
-use crate::terms::analytic_penalties::ARDPenalty;
-use crate::terms::analytic_penalties::IsometryReference;
-use approx::assert_abs_diff_eq;
-use ndarray::{Array5, array};
+use crate::terms::sae::manifold::tests::read_npy_f32_2d;
+use ndarray::array;
 
 /// Build a production-style K-atom, d=2 periodic (torus = Circle×Circle) SAE
 /// manifold term seeded from REAL activations `z` exactly the way the

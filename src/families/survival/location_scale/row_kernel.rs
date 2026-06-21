@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct SurvivalExactRowKernel {
     pub(crate) w: f64,
     pub(crate) d: f64,
