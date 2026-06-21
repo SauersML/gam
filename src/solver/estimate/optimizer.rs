@@ -455,7 +455,35 @@ where
     } else {
         0.0
     };
-    let (
+    // Negative-Binomial outer θ↔λ alternation (#1448). With θ estimated, the
+    // λ-search freezes θ (see `frozen_negbin_theta`, #1082) so the REML criterion
+    // `F(ρ) = REML(ρ, θ_frozen)` is stationary in ρ; the final accept-fit then
+    // ML-refreshes θ at the converged η. A *single* freeze→refresh leaves the
+    // selected ρ optimal only for `θ_frozen`, not for the refreshed `θ_final`.
+    // mgcv `nb()` instead alternates θ-estimation and λ-selection to a joint
+    // fixed point. Wrap the ρ-search + accept-fit in a bounded loop: after each
+    // refit, if the NB θ drifted beyond tolerance, re-freeze the search θ at the
+    // refreshed value, reset the surface caches that depend on it, and re-run the
+    // outer ρ search. The cap bounds the work; for every non-NB / user-fixed-θ
+    // fit the loop runs exactly once (the break condition is met immediately), so
+    // those fits are byte-identical to the pre-#1448 single-pass behaviour.
+    //
+    // 5% relative θ drift is the same band the diagnostic (#1082) flagged as the
+    // point beyond which the ρ-optimum for `θ_frozen` and `θ_final` can differ
+    // enough to matter; below it the one-refresh approximation is already joint-
+    // stationary to the criterion's tolerance.
+    const NEGBIN_THETA_JOINT_DRIFT_TOL: f64 = 5.0e-2;
+    const NEGBIN_OUTER_ALTERNATION_MAX_ROUNDS: usize = 8;
+    let mut final_rho;
+    let mut final_mixture_state;
+    let mut final_sas_state;
+    let mut final_mixture_param_covariance;
+    let mut final_sas_param_covariance;
+    let mut outer_result;
+    let mut pirls_res;
+    let mut negbin_alternation_round: usize = 0;
+    loop {
+    (
         final_rho,
         final_mixture_state,
         final_sas_state,
@@ -1207,8 +1235,6 @@ where
             outer_result,
         )
     };
-    // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
-    let iters = std::cmp::max(1, outer_result.iterations);
     // Reuse the Gaussian-Identity XᵀWX cache the outer loop already populated,
     // so the final accept-fit skips the streaming GEMM as well.
     //
@@ -1225,7 +1251,7 @@ where
     } else {
         reml_state.gaussian_fixed_cache_if_eligible()
     };
-    let (pirls_res, _) = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
+    let pirls_res_pair = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
         LogSmoothingParamsView::new(final_rho.view()),
         pirls::PirlsProblem {
             x: reml_state.x(),
@@ -1273,19 +1299,23 @@ where
         // (#769). λ is fixed here, so there is no scale↔λ feedback.
         true,
     )?;
+    pirls_res = pirls_res_pair.0;
 
-    // Negative-Binomial (ρ, θ) joint-stationarity diagnostic (#1082 / audit #6).
+    // Negative-Binomial outer θ↔λ alternation decision (#1448, supersedes the
+    // #1082 drift diagnostic).
     //
-    // θ is frozen at its seed value for the entire λ search so the REML criterion
-    // `F(ρ) = REML(ρ, θ_frozen)` is a stationary function of ρ; the final accept-
-    // fit above then ML-refreshes θ at the converged η. The selected ρ is NOT
-    // re-optimized for that refreshed θ, so `(ρ*, θ_final)` is only *jointly*
-    // stationary to the extent θ moved little between freeze and refresh. The
-    // one-refresh approximation is sound precisely when that drift is small (θ
-    // governs the variance function, ρ the smoothness — weakly coupled), but that
-    // claim is only checkable if the drift is measured. Surface it: a large drift
-    // means the reported ρ may not be jointly optimal and warrants a full mgcv-
-    // style outer θ↔λ alternation for that fit.
+    // θ was frozen at the λ-search value (`frozen_negbin_theta`) so `F(ρ)` is
+    // stationary in ρ; the accept-fit above ML-refreshed θ at the converged η.
+    // If that refreshed θ_final drifted from the search θ_frozen by more than the
+    // joint-stationarity tolerance, the ρ we just selected was optimal for the
+    // OLD θ, not θ_final: re-freeze the search at θ_final, reset the outer seed
+    // state (eval bundle, PIRLS cache, warm-start signals, inner caps — all keyed
+    // to the old θ), and run the ρ search again. Iterate to the (ρ, θ) joint
+    // fixed point or until the round cap, after which we accept the last fit and
+    // log the residual drift. For non-NB / user-fixed-θ fits the criterion below
+    // is never met (θ is not estimated), so the loop breaks on round 0 and the
+    // fit is byte-identical to the pre-#1448 single pass.
+    let mut should_alternate = false;
     if pirls_res.likelihood.negbin_theta_is_estimated() {
         let frozen_bits = reml_state.frozen_negbin_theta.load(Ordering::Relaxed);
         if frozen_bits != 0
@@ -1296,25 +1326,54 @@ where
                 let rel_drift =
                     (theta_final - theta_frozen).abs() / theta_frozen.max(f64::MIN_POSITIVE);
                 let drift_pct = rel_drift * 100.0;
-                // 5% relative θ drift: empirically the band beyond which the
-                // ρ-optimum for θ_frozen and θ_final can differ enough to matter.
-                const NEGBIN_THETA_JOINT_DRIFT_WARN: f64 = 5.0e-2;
-                if rel_drift > NEGBIN_THETA_JOINT_DRIFT_WARN {
-                    log::warn!(
-                        "[OUTER] negative-binomial θ drifted {drift_pct:.1}% between λ-search \
-                         freeze (θ={theta_frozen:.6e}) and final refit (θ={theta_final:.6e}); the \
-                         REML-selected ρ was optimized at the frozen θ and may not be jointly \
-                         stationary at θ_final — consider an outer θ↔λ alternation for this fit (#1082)."
-                    );
+                if rel_drift > NEGBIN_THETA_JOINT_DRIFT_TOL {
+                    if negbin_alternation_round + 1 < NEGBIN_OUTER_ALTERNATION_MAX_ROUNDS {
+                        log::info!(
+                            "[OUTER] negative-binomial θ↔λ alternation round {}: θ drifted \
+                             {drift_pct:.1}% (θ_frozen={theta_frozen:.6e} → θ_final={theta_final:.6e}); \
+                             re-freezing at θ_final and re-running the ρ search (#1448).",
+                            negbin_alternation_round + 1
+                        );
+                        // Re-freeze the λ-search θ at the refreshed value. The
+                        // capture in `solve_for_unified_rho` only writes when the
+                        // frozen slot is 0, so a non-zero value here pins every
+                        // subsequent λ-search inner solve to θ_final rather than
+                        // re-deriving it from the seed η.
+                        reml_state
+                            .frozen_negbin_theta
+                            .store(theta_final.to_bits(), Ordering::Relaxed);
+                        // The cached criterion / factor bundle and warm-start
+                        // signals were all computed at θ_frozen; drop them so the
+                        // next round's ρ search recomputes `F(ρ) = REML(ρ, θ_final)`.
+                        reml_state.reset_outer_seed_state();
+                        should_alternate = true;
+                    } else {
+                        log::warn!(
+                            "[OUTER] negative-binomial θ↔λ alternation hit the round cap \
+                             ({NEGBIN_OUTER_ALTERNATION_MAX_ROUNDS}) with residual θ drift \
+                             {drift_pct:.1}% (θ_frozen={theta_frozen:.6e} → θ_final={theta_final:.6e}); \
+                             accepting the last fit (#1448)."
+                        );
+                    }
                 } else {
                     log::debug!(
-                        "[OUTER] negative-binomial θ joint-stationarity OK: drift {drift_pct:.2}% \
-                         (θ_frozen={theta_frozen:.6e} → θ_final={theta_final:.6e})."
+                        "[OUTER] negative-binomial (ρ, θ) jointly stationary after {} \
+                         alternation round(s): drift {drift_pct:.2}% \
+                         (θ_frozen={theta_frozen:.6e} → θ_final={theta_final:.6e}).",
+                        negbin_alternation_round + 1
                     );
                 }
             }
         }
     }
+    if should_alternate {
+        negbin_alternation_round += 1;
+        continue;
+    }
+    break;
+    } // negbin θ↔λ alternation loop (#1448)
+    // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
+    let iters = std::cmp::max(1, outer_result.iterations);
 
     // Map beta back to original basis
     let beta_orig_internal = pirls_res
