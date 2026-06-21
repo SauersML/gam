@@ -473,6 +473,54 @@ pub(crate) fn rank_seeds_with_screening(
                     ordered.insert(0, flexible);
                 }
             }
+
+            // #1426: also guarantee a HEAVILY-penalized (high-λ) seed is the
+            // SECOND full-budget solve. The flexible-seed promotion above puts
+            // the most under-penalized seed at slot 0; on a non-separable
+            // gamma/log default-k surface that seed lands on the λ→0 ridge whose
+            // inner PIRLS hits its iteration cap, so the outer optimizer cost-
+            // stalls there and reports a NON-CONVERGED near-full-basis overfit
+            // (EDF ≈ k). The expensive multi-start budget for non-Gaussian ARC is
+            // only 2 seeds, and the remaining proxy order tends to place ANOTHER
+            // moderately-flexible seed at slot 1 — so the well-penalized basin
+            // (which converges to the mgcv-like EDF ~8-9 optimum) is never solved
+            // and the overfit ships. Lifting the heaviest INTERIOR seed (largest
+            // Σρ over the leading rho_dim coords, excluding the over-smoothing
+            // boundary seed) to slot 1 makes the budget-2 multi-start span BOTH
+            // basins, so when slot 0 stalls non-converged the heavy seed converges
+            // and its `converged` best wins via `candidate_improves_best`.
+            //
+            // The over-smoothing BOUNDARY seed is deliberately NOT chosen here: it
+            // is a degenerate descent origin (∂V/∂ρ → 0 at the bound, so a TR/
+            // Newton outer solver certifies box stationarity at iter 0 and never
+            // reaches the interior — the #686/#687 over-smoothing trap). It stays
+            // at the tail as the genuine-separation fallback. A well-interior
+            // heavy seed instead descends coordinate-wise into the EDF ~8-9 basin.
+            // Keep-best semantics mean this can only ADD a basin, never worsen the
+            // returned fit: a genuinely separable λ→0 case (#1082) still converges
+            // / best-feasibles at slot 0 and the heavy seed is simply dominated.
+            if non_gaussian && ordered.len() > 2 {
+                let heaviest_idx = ordered
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter(|(_, seed)| !seed_is_oversmoothing_boundary(seed, rho_dim, &upper))
+                    .max_by(|(_, a), (_, b)| rho_sum(a).total_cmp(&rho_sum(b)))
+                    .map(|(idx, _)| idx);
+                if let Some(heaviest_idx) = heaviest_idx
+                    && heaviest_idx > 1
+                {
+                    let heavy = ordered.remove(heaviest_idx);
+                    log::info!(
+                        "[OUTER] {context}: promoted the heaviest interior seed (Σρ={:.3}) to \
+                         the second full-budget slot so a budget-limited non-Gaussian multi-start \
+                         also solves the well-penalized basin (#1426: a non-separable λ→0 stall \
+                         at slot 0 otherwise ships a non-converged full-basis overfit)",
+                        rho_sum(&heavy),
+                    );
+                    ordered.insert(1, heavy);
+                }
+            }
         }
     }
 
@@ -547,5 +595,28 @@ pub(crate) fn should_stop_expensive_multistart_after_best(
                     b.operator_stop_reason,
                     Some(OperatorTrustRegionStopReason::CostStallFlatValley)
                 )
+                // #1426: only stop the expensive multi-start on a flat-valley
+                // best that is a GENUINE near-separable plateau — i.e. its
+                // bound-PROJECTED residual gradient is at most modestly above the
+                // outer tolerance (`<= FLAT_VALLEY_STALL_GRAD_CEILING`). The
+                // separable multinomial / RKHS-collapse cases (#1082/#1237/#1355)
+                // certify with a projected residual well under O(1): no remaining
+                // seed can reach a stationary point the λ→0 MLE provably does not
+                // have, so stopping is correct and saves an expensive second crawl.
+                //
+                // But a flat-valley best whose projected residual is FAR above the
+                // ceiling is NOT separable — it is the #1426 stuck stall: the inner
+                // PIRLS hit its iteration cap at an under-penalized (λ→0) ρ, so the
+                // cached cost is spuriously low and the analytic gradient still
+                // points (strongly) toward more penalization. Such a ρ is a silent
+                // near-full-basis overfit (EDF ≈ k), NOT the answer mgcv converges
+                // to (EDF ~8-9). Stopping here ships that overfit. Refusing to stop
+                // lets the multi-start advance to a more-penalized seed, which
+                // converges to the well-penalized optimum (whose `converged` best
+                // then wins via `candidate_improves_best`). Bounded by the existing
+                // `expensive_seed_limit`, so a genuinely pathological surface still
+                // terminates after a finite number of seeds.
+                && b.final_grad_norm
+                    .is_none_or(|g| g.is_finite() && g <= FLAT_VALLEY_STALL_GRAD_CEILING)
         })
 }
