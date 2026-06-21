@@ -3627,7 +3627,7 @@ impl LatentBinaryFamily {
                             * (g_u[a] * survival_gradient[b] + survival_gradient[a] * g_u[b]);
                 }
             }
-            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary));
+            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary))?;
         }
         Ok(out)
     }
@@ -3736,7 +3736,7 @@ impl LatentBinaryFamily {
                                 + survival_gradient[a] * g_uv[b]);
                 }
             }
-            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary));
+            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary))?;
         }
         Ok(out)
     }
@@ -3939,7 +3939,7 @@ impl LatentJointHessianFamily for LatentBinaryFamily {
             for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
                 primary_hv[a] += binary.outer_scale * survival_gradient[a] * outer_dot;
             }
-            self.add_pullback_primary_gradient(out, row_idx, slices, &primary_hv, wi);
+            self.add_pullback_primary_gradient(out, row_idx, slices, &primary_hv, wi)?;
         }
         Ok(true)
     }
