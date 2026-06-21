@@ -3204,6 +3204,83 @@ mod tests {
     }
 
     #[test]
+    fn compare_reml_fits_delta_and_bayes_factor_never_contradict_winner_gh1465() {
+        // Regression for #1465: the ranking `delta` / `bayes_factor` must be
+        // measured on the SAME scale that orders the table (the Occam-penalised
+        // conditional AIC `ranking_score`), so every row's delta is >= 0 and its
+        // Bayes factor >= 1 — the table must never claim a non-winner beats the
+        // declared winner. The scenario is exactly the case the comparison
+        // exists to handle: AIC and raw REML DISAGREE. `m1` is the AIC winner
+        // but does NOT carry the minimum raw REML (`m2` does) — the noise
+        // extra-term case from the issue.
+        //
+        // `ranking_score` = -2*log_lik + 2*edf; with log_lik = 0 it is `2*edf`,
+        // so the AIC order is m1 < m2 < m3 while the raw-REML order has m2 lowest.
+        let cand = |name: &str, score: f64, edf: f64| RemlCandidate {
+            index: 0,
+            name: name.to_string(),
+            score,
+            edf: Some(edf),
+            log_lik: Some(0.0),
+            family: Some("gaussian".to_string()),
+        };
+        // raw REML : m2 (41.605) < m1 (53.748) < m3 (120.011)
+        // AIC=2*edf: m1 (100)    < m2 (102)    < m3 (130)
+        let candidates = vec![
+            cand("m1", 53.748, 50.0),
+            cand("m2", 41.605, 51.0),
+            cand("m3", 120.011, 65.0),
+        ];
+        let cmp = compare_reml_fits(candidates).expect("comparison");
+
+        assert_eq!(cmp.winner, "m1", "AIC winner");
+        // No ranking row may contradict the declared winner.
+        for row in &cmp.ranking {
+            assert!(
+                row.delta >= 0.0,
+                "ranking delta for {} must be >= 0, got {}",
+                row.name,
+                row.delta
+            );
+            assert!(
+                row.bayes_factor >= 1.0 - 1e-12,
+                "ranking bayes_factor for {} must be >= 1, got {}",
+                row.name,
+                row.bayes_factor
+            );
+        }
+        let winner_row = cmp.ranking.iter().find(|r| r.name == "m1").unwrap();
+        assert!(winner_row.delta.abs() < 1e-12, "winner delta == 0");
+        assert!(
+            (winner_row.bayes_factor - 1.0).abs() < 1e-9,
+            "winner bayes_factor == 1"
+        );
+
+        // The raw-REML score table is referenced to the genuine minimum raw REML
+        // (m2), so its best-over-model Bayes factors are also coherent (>= 1).
+        for row in &cmp.score_table {
+            assert!(
+                row.delta_reml >= 0.0,
+                "score-table delta_reml for {} must be >= 0, got {}",
+                row.name,
+                row.delta_reml
+            );
+            assert!(
+                row.bayes_factor_best_over_model >= 1.0 - 1e-12,
+                "score-table bayes_factor for {} must be >= 1, got {}",
+                row.name,
+                row.bayes_factor_best_over_model
+            );
+        }
+        // m2 carries the minimum raw REML, so its raw delta is exactly 0.
+        let m2 = cmp.score_table.iter().find(|r| r.name == "m2").unwrap();
+        assert!(
+            m2.delta_reml.abs() < 1e-12,
+            "the minimum-raw-REML row has delta_reml 0"
+        );
+    }
+
+    #[test]
     fn cone_of_influence_empty_support_is_empty() {
         let labels = vec![0usize, 0, 1, 1];
         assert!(cone_of_influence(&labels, &[]).is_empty());
