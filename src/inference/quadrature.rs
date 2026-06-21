@@ -76,8 +76,8 @@
 //!    representations (Faddeeva / erfcx series). Those are ideal for the hot
 //!    integrated-IRLS path because they replace per-row GHQ loops with a small,
 //!    deterministic series and exact derivatives with respect to the Gaussian
-//!    mean. This module already contains an oracle-style exact evaluator
-//!    (`logit_posterior_mean_exact`) documenting the mathematics.
+//!    mean. This module contains a high-order GHQ reference evaluator
+//!    (`logit_posterior_mean_exact`) used to certify the production GHQ path;
 //!
 //! 3. Cloglog / survival transforms:
 //!    The complementary log-log mean under Gaussian eta does not simplify to an
@@ -4230,13 +4230,13 @@ pub fn survival_posterior_meanvariance(
 /// Evaluated via a 128-point Gauss-Hermite quadrature of
 ///   E[sigmoid(η)] = (1/√π) ∫ e^{-t²} sigmoid(mu + √2·sigma·t) dt.
 ///
-/// The integrand sigmoid(mu + √2·sigma·t) is analytic on the real line;
-/// Gauss-Hermite quadrature converges geometrically while the nearest complex
-/// pole of the logistic function (odd multiples of iπ, scaled by √2·sigma)
-/// stays far from the real axis relative to the GHQ node span. A 128-point
-/// rule gives sub-1e-7 accuracy across the practical (mu, sigma) range
-/// (verified by `test_logit_posterior_mean_exact_no_mu_linear_bias_1459` over
-/// the full {1,3,-2} × {0.02,0.05,0.5,2.0} grid).
+/// The integrand sigmoid(mu + √2·sigma·t) is analytic on the real line. The
+/// logistic function is meromorphic; its poles in t-space lie at
+/// Im(t) = ±π/(√2 sigma). Gauss-Hermite quadrature converges geometrically
+/// while the poles stay well outside the node span, so a 128-point rule gives
+/// sub-1e-7 accuracy across the practical (mu, sigma) range (verified by
+/// `test_logit_posterior_mean_exact_no_mu_linear_bias_1459` over the full
+/// {1,3,-2} × {0.02,0.05,0.5,2.0} grid).
 ///
 /// This is the certification oracle for the production `logit_posterior_mean`
 /// GHQ path — it uses a higher-order (128-point) rule and independent routing,
@@ -4280,16 +4280,17 @@ pub fn logit_posterior_mean_exact(mu: f64, sigma: f64) -> f64 {
     //
     // The integral E[sigmoid(μ + σZ)] = (1/√π) ∫ e^{-t²} sigmoid(μ + √2σt) dt
     // is a weighted-Gaussian integral. The integrand sigmoid(μ + √2σt) is
-    // analytic on the real line. The logistic function is meromorphic with
-    // complex poles at odd multiples of iπ; the √2σ scaling moves those poles
-    // to ±iπ/(√2σ), so they recede from the real axis as σ GROWS (the large-σ
-    // regime is the well-conditioned one). Gauss-Hermite quadrature converges
-    // geometrically while the nearest complex pole stays well outside the GHQ
-    // node span, so a 128-point rule gives sub-1e-7 accuracy across the
-    // practical (μ, σ) range. This is independent of the production
-    // `logit_posterior_mean` path (which uses a different adaptive GHQ
-    // implementation at lower order), so it remains a valid certification
-    // reference.
+    // analytic on the real line. The logistic function is meromorphic; its
+    // poles in t-space (where μ + √2σ·t = ±iπ(2k+1)) lie at Im(t) = ±π/(√2σ),
+    // so the pole-to-real-axis distance is π/(√2σ). Gauss-Hermite quadrature
+    // converges geometrically while the poles stay well outside the GHQ node
+    // span; a 128-point rule gives sub-1e-7 accuracy across the practical
+    // (μ, σ) range — verified empirically by
+    // `test_logit_posterior_mean_exact_no_mu_linear_bias_1459` over the full
+    // {1,3,-2} × {0.02,0.05,0.5,2.0} grid (which includes σ=2.0). This is
+    // independent of the production `logit_posterior_mean` path (which uses a
+    // different adaptive GHQ implementation at lower order), so it remains a
+    // valid certification reference.
     let rule = compute_gauss_hermite_n(128);
     let sqrt2_sigma = SQRT_2 * sigma;
     let inv_sqrt_pi = 1.0 / std::f64::consts::PI.sqrt();
