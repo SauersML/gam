@@ -87,7 +87,12 @@ def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:
     categorical = categorical_dtype_columns(data, kind)
     rows = [
         [
-            _stringify_marked(columns[header][row_index], header in categorical)
+            _stringify_marked(
+                columns[header][row_index],
+                header in categorical,
+                column=header,
+                row=row_index,
+            )
             for header in headers
         ]
         for row_index in range(row_count)
@@ -95,8 +100,8 @@ def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:
     return headers, rows, kind
 
 
-def _stringify_marked(value: Any, is_categorical: bool) -> str:
-    text = stringify_cell(value)
+def _stringify_marked(value: Any, is_categorical: bool, *, column: str | None = None, row: int | None = None) -> str:
+    text = stringify_cell(value, column=column, row=row)
     if is_categorical:
         return CATEGORICAL_CELL_SENTINEL + text
     return text
@@ -354,18 +359,28 @@ def collect_record_headers(rows: list[Mapping[str, Any]]) -> list[str]:
     return headers
 
 
-def stringify_cell(value: Any) -> str:
+def stringify_cell(value: Any, *, column: str | None = None, row: int | None = None) -> str:
     if isinstance(value, bool):
         return "1" if value else "0"
     if value is None:
-        raise ValueError("table cells cannot be None")
+        if column and row is not None:
+            raise ValueError(f"column '{column}' has None at row {row + 1}")
+        elif column:
+            raise ValueError(f"column '{column}' contains None")
+        else:
+            raise ValueError("table cells cannot be None")
     if isinstance(value, int):
         # bool is handled above; covers Python int and any int subclass
         # (e.g. numpy integers) so the rendered text is always a bare integer.
         return repr(int(value))
     if isinstance(value, float):
         if value != value:
-            raise ValueError("table cells cannot be NaN")
+            if column and row is not None:
+                raise ValueError(f"column '{column}' has NaN at row {row + 1}")
+            elif column:
+                raise ValueError(f"column '{column}' contains NaN")
+            else:
+                raise ValueError("table cells cannot be NaN")
         # float subclasses (e.g. numpy.float64) render via repr() with the
         # type name in NumPy 2.x ("np.float64(-3.0)"), which the Rust core
         # cannot parse and so misclassifies the column as categorical.
@@ -373,7 +388,12 @@ def stringify_cell(value: Any) -> str:
         return repr(float(value))
     text = str(value)
     if not text:
-        raise ValueError("table cells cannot be empty strings")
+        if column and row is not None:
+            raise ValueError(f"column '{column}' has empty string at row {row + 1}")
+        elif column:
+            raise ValueError(f"column '{column}' contains empty string")
+        else:
+            raise ValueError("table cells cannot be empty strings")
     return text
 
 
