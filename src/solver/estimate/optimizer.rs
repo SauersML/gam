@@ -669,7 +669,9 @@ where
         // release-and-rerank guard even when it is not adopted as the initial
         // seed (i.e. the grid did not strictly move). It is a known-good lower
         // bound on the achievable REML cost, scored with the SAME functional.
-        let mut release_rerank_seed: Option<Array1<f64>> = None;
+        // Unconditionally assigned inside the prepass block below (before its
+        // first read by the #1371 guard), so it carries no dead initializer.
+        let release_rerank_seed: Option<Array1<f64>>;
         let prepass_seed: Option<Array1<f64>> = {
             let bnds = reml_seed_config.bounds;
             let (lo, hi_seed) = if bnds.0 <= bnds.1 {
