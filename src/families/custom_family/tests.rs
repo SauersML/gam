@@ -4667,8 +4667,10 @@ pub(crate) fn joint_feasibility_alpha_gate_discriminates_healthy_from_crush() {
     impl CustomFamily for AlphaFamily {
         fn evaluate(
             &self,
-            _block_states: &[ParameterBlockState],
+            block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
+            // Single-block fixture: the engine always passes exactly one block.
+            assert_eq!(block_states.len(), 1);
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
                 blockworking_sets: vec![BlockWorkingSet::ExactNewton {
@@ -4679,10 +4681,14 @@ pub(crate) fn joint_feasibility_alpha_gate_discriminates_healthy_from_crush() {
         }
         fn max_feasible_step_size(
             &self,
-            _block_states: &[ParameterBlockState],
-            _idx: usize,
-            _arr: &Array1<f64>,
+            block_states: &[ParameterBlockState],
+            idx: usize,
+            arr: &Array1<f64>,
         ) -> Result<Option<f64>, String> {
+            // The configured α is returned regardless of the proposed step;
+            // assert the engine hands us a well-formed single-block query.
+            assert!(idx < block_states.len());
+            assert!(!arr.is_empty());
             Ok(self.alpha)
         }
     }
