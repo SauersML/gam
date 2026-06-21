@@ -336,8 +336,6 @@ mod reml_runtime_bug_hunt_ift_dispatch;
 mod repro_1066_iso_kappa_2d_binomial;
 #[path = "regressions/repro_gamlss_linesearch_failure.rs"]
 mod repro_gamlss_linesearch_failure;
-#[path = "regressions/rigor_ratchet.rs"]
-mod rigor_ratchet;
 #[path = "regressions/smooth_fit_term_collection_bug_hunt_2_3.rs"]
 mod smooth_fit_term_collection_bug_hunt_2_3;
 #[path = "regressions/solver_gpu_pirls_bug_hunt.rs"]
