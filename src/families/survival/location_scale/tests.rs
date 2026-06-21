@@ -4230,6 +4230,61 @@ fn joint_exact_newton_score_matches_loglikelihoodfd_near_fitted_non_probit_point
     }
 }
 
+/// #1389 regression: the joint-Hessian directional-derivative velocity (event
+/// Jacobian `g`) pass is skipped before any `p²` allocation when no weighted row
+/// carries live qdot-derivative mass. Censored rows carry event_weight 0, so an
+/// all-censored fixture has `d1_qdot1 = d2_qdot1 = d_h_d = 0` on every row and
+/// the velocity term is identically zero — the skip path must therefore produce
+/// a directional derivative that still matches the finite difference of the
+/// joint gradient (i.e. the skip omits only a zero contribution).
+#[test]
+fn joint_dh_velocity_skip_is_exact_on_all_censored_rows() {
+    let mut family = survival_exact_newton_test_family();
+    // All rows censored ⇒ event_weight 0 on every row ⇒ no velocity mass, so the
+    // #1389 `any_live_qdot` guard short-circuits the velocity pass.
+    family.y = array![0.0, 0.0, 0.0];
+
+    let beta_time = array![0.2];
+    let beta_threshold = array![0.35];
+    let beta_log_sigma = array![-0.15];
+    let states = survival_exact_newton_rebuild_states(&beta_time, &beta_threshold, &beta_log_sigma);
+
+    // Direction perturbs every block so any dropped cross-velocity term would
+    // show up in the comparison.
+    let direction = array![1.0, 1.0, 1.0];
+    let analytic = family
+        .exact_newton_joint_hessian_directional_derivative(&states, &direction)
+        .expect("analytic joint dH")
+        .expect("expected exact joint dH");
+
+    // The directional derivative of the joint NLL Hessian must equal the central
+    // finite difference of that Hessian along `direction`. Because the velocity
+    // pass is skipped (all rows censored), `analytic` carries no velocity term;
+    // the FD-of-Hessian is the independent ground truth, so a match certifies the
+    // skip dropped only a zero contribution.
+    let eps = 1e-6;
+    let hessian_at = |scale: f64| -> Array2<f64> {
+        let bt = &beta_time + scale * direction[0];
+        let bth = &beta_threshold + scale * direction[1];
+        let bls = &beta_log_sigma + scale * direction[2];
+        family
+            .exact_newton_joint_hessian(&survival_exact_newton_rebuild_states(&bt, &bth, &bls))
+            .expect("joint hessian")
+            .expect("expected exact joint hessian")
+    };
+    let fd = (&hessian_at(eps) - &hessian_at(-eps)) / (2.0 * eps);
+    for r in 0..3 {
+        for c in 0..3 {
+            assert!(
+                (analytic[[r, c]] - fd[[r, c]]).abs() <= 5e-4,
+                "all-censored velocity-skip dH[{r}][{c}] mismatch: analytic={} fd={}",
+                analytic[[r, c]],
+                fd[[r, c]],
+            );
+        }
+    }
+}
+
 #[test]
 fn row_derivative_identities_hold_for_non_probit_links() {
     let beta_time = array![0.8153913537182474];
