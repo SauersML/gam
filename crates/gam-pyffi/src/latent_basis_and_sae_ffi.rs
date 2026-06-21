@@ -2855,14 +2855,25 @@ fn sae_manifold_fit_inner<'py>(
             for row in 0..n_obs_local {
                 // Collect (value, atom_idx) pairs; pick the indices of the
                 // largest k_top values. Ties broken by lower atom index.
+                //
+                // #1409: select the top-k_top via an O(K) PARTIAL selection
+                // (`select_nth_unstable_by`) instead of a full O(K log K) sort —
+                // only the kept prefix matters, and the per-token projection runs
+                // once per row at large K. The comparator (value desc, then atom
+                // index asc) is the SAME total order the sort used, so the
+                // partition's first `k_top` elements are exactly the sorted
+                // top-k_top set (identical `keep` mask, including tie-breaking).
                 let mut paired: Vec<(f64, usize)> = (0..k_atoms)
                     .map(|atom_idx| (assignments[[row, atom_idx]], atom_idx))
                     .collect();
-                paired.sort_by(|a, b| {
+                let cmp = |a: &(f64, usize), b: &(f64, usize)| {
                     b.0.partial_cmp(&a.0)
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then(a.1.cmp(&b.1))
-                });
+                };
+                if k_top < k_atoms {
+                    paired.select_nth_unstable_by(k_top - 1, cmp);
+                }
                 let mut keep = vec![false; k_atoms];
                 for &(_, atom_idx) in paired.iter().take(k_top) {
                     keep[atom_idx] = true;

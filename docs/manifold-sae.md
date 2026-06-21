@@ -62,7 +62,7 @@ The full signature, with defaults (keyword-only arguments follow the `*`):
 | `nuclear_norm_weight` | `1.0` | embedding-rank selection penalty |
 | `nuclear_norm_max_rank` | `None` | optional cap on the embedding rank |
 | `decoder_incoherence_weight` | `1.0` | cross-atom incoherence (separability lever) |
-| `top_k` | `None` | cap on per-token active atoms |
+| `top_k` | `None` | cap on per-token active atoms, applied as a **post-fit** hard projection (#1409). Under `softmax` assignment the inner solve still optimises all `K` atoms; `top_k` truncates each token's assignments afterward. It is a sparsity cap on the reported support, **not** a reduction of the fit's per-token compute. (Gate-style modes — `jumprelu` / IBP-MAP — engage the compact active-set layout during the fit.) |
 | `t_init` | `None` | coordinate warm start `(K, N, D_max)` |
 | `a_init` | `None` | assignment-logit warm start `(N, K)` |
 | `tau` | `None` | Gumbel-softmax temperature |
