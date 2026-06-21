@@ -94,8 +94,8 @@ jobs:
             There is no time pressure and no turn budget. If the right
             fix takes ten turns, take ten. If it takes ten thousand turns
             and a week's worth of work compressed into one session, take
-            that. Stay on the issue until the PR is open and the fix is
-            complete. Don't pace yourself, don't pause voluntarily, don't
+            that. Stay on the issue until the fix is complete and pushed to
+            `main` (no branches, no PRs). Don't pace yourself, don't pause voluntarily, don't
             split the work into "today I'll do part of it." Drive it
             straight through to done in this session — but push each
             coherent step to main as you reach it, don't hold the work.
