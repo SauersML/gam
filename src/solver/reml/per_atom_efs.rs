@@ -39,15 +39,15 @@
 //!
 //! 3. **Matrix-free θ-HVP** (#740). For a direction `v` over the border axes,
 //!    `H_outer · v` is computed *without* assembling the O(K²) coordinate-pair
-//!    Hessian. When the family supplies an exact outer-Hessian operator
-//!    (`HessianResult::Operator`), its `matvec` already realizes the
-//!    IFT-corrected action `β̇ = −H⁻¹ (∂g/∂θ)·v` plus the logdet directional
-//!    trace — exactly the #740 product — through one inner solve per matvec.
-//!    When no operator is available we fall back to a central finite difference
-//!    of the outer gradient along `v` (two `eval` calls), which is still
-//!    matrix-free and restricted to the border directions only.
+//!    Hessian. The family's exact outer-Hessian operator
+//!    (`HessianResult::Operator`) `matvec` realizes the IFT-corrected action
+//!    `β̇ = −H⁻¹ (∂g/∂θ)·v` plus the logdet directional trace — exactly the #740
+//!    product — through one inner solve per matvec. When no exact operator is
+//!    available the shared-border correction is deferred to the decoupled
+//!    per-atom step rather than approximated numerically (#1440 removed the
+//!    former central-difference fallback): the θ-HVP is always exact.
 //!
-//! # FD-consistency / reduction to the coupled objective at small K
+//! # Consistency / reduction to the coupled objective at small K
 //!
 //! At small K the per-atom step reduces to exactly the coupled EFS step:
 //! `compute_efs_update` already produces the same per-coordinate
@@ -56,9 +56,8 @@
 //! coupled path uses (it nulls out when `g` is zero). Concretely, when the
 //! border set is the whole ρ-vector (small K), the layer-2 correction is the
 //! exact dense Newton step on `g`, and when `g = 0` (a stationary point of the
-//! coupled objective) every layer's step is zero. This is the property a
-//! finite-difference check on the coupled objective would verify; it is a
-//! design invariant of routing every layer through the same `eval`/`eval_efs`
+//! coupled objective) every layer's step is zero. This stationarity property is
+//! a design invariant of routing every layer through the same `eval`/`eval_efs`
 //! hooks that the dense path consumes, not a separately maintained surrogate.
 
 use crate::linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
@@ -100,12 +99,6 @@ pub(crate) const PER_ATOM_NEGLIGIBLE_STEP: f64 = 1e-12;
 /// the unified EFS path so ULP-level cost noise near a fixed point does not
 /// trigger spurious backtracking.
 pub(crate) const PER_ATOM_COST_DESCENT_TOL: f64 = 1e-12;
-
-/// Finite-difference probe magnitude (in θ-space) for the θ-HVP fallback when
-/// no exact outer-Hessian operator is available. Central difference, so the
-/// error is O(h²); `1e-4` balances truncation against the inner-solve noise
-/// floor of the outer gradient.
-pub(crate) const THETA_HVP_FD_STEP: f64 = 1.0e-4; // fd-ok: FD fallback for theta-HVP when no analytic operator; bounded to border axes only, not hot loop
 
 /// Auto-switch threshold predicate: is this problem in the frontier ρ-scaling
 /// regime where the per-atom decoupled EFS primary should take over from the
@@ -201,7 +194,7 @@ impl SharedBorderTopology {
     /// Axes are sorted and deduplicated; an out-of-range axis is rejected
     /// loudly. A caller passing every axis (`axes == 0..rho_dim`) recovers the
     /// exact dense Newton correction on the full ρ-vector — the small-K
-    /// FD-consistency configuration the module docs describe.
+    /// reduction-to-coupled-objective configuration the module docs describe.
     pub fn with_border_axes(rho_dim: usize, axes: Vec<usize>) -> Result<Self, String> {
         let mut border_axes = axes;
         border_axes.sort_unstable();
@@ -291,134 +284,84 @@ pub(crate) fn sanitize_step(raw: f64) -> f64 {
 /// Matrix-free θ-HVP (#740): `v ↦ H_outer · v` over the full ρ-vector, computed
 /// without assembling the O(K²) coordinate-pair outer Hessian.
 ///
-/// Two realizations, both matrix-free:
+/// Realized purely by the exact outer-Hessian operator: when `eval` exposed a
+/// `HessianResult::Operator`, its `matvec` already realizes the IFT-corrected
+/// action — `−H⁻¹ (∂g/∂θ)·v` plus the logdet directional trace, the #740
+/// product — via one inner solve per matvec. We forward `v` to it directly.
 ///
-/// - **Exact operator.** When `eval` exposed an outer-Hessian operator
-///   (`HessianResult::Operator`), its `matvec` already realizes the
-///   IFT-corrected action — `−H⁻¹ (∂g/∂θ)·v` plus the logdet directional trace,
-///   the #740 product — via one inner solve per matvec. We forward `v` to it
-///   directly.
-/// - **Finite-difference fallback.** With no operator, approximate the action
-///   by a central difference of the outer gradient along `v`:
-///   `H·v ≈ (g(ρ + h·v) − g(ρ − h·v)) / (2h)`. Two `eval` calls, O(h²) error,
-///   still matrix-free and (as used by the border correction) probed only along
-///   the few border directions.
-///
-/// `operator` is the operator captured from the most recent full `eval` at
-/// `rho`; `eval_at` evaluates the outer gradient at an arbitrary ρ for the FD
-/// branch. The returned vector has the full ρ-dimension.
+/// There is no finite-difference fallback (#1440): when the family does not
+/// expose an exact operator the caller defers the shared-border coupled
+/// correction to the decoupled per-atom step rather than approximating the
+/// action numerically, so this function requires an operator whose dimension
+/// matches `v`. The returned vector has the full ρ-dimension.
 pub fn theta_hvp_matrix_free(
-    operator: Option<&Arc<dyn OuterHessianOperator>>,
-    rho: &Array1<f64>,
+    operator: &Arc<dyn OuterHessianOperator>,
     v: &Array1<f64>,
-    mut eval_at: impl FnMut(&Array1<f64>) -> Result<Array1<f64>, EstimationError>,
 ) -> Result<Array1<f64>, EstimationError> {
-    if let Some(op) = operator {
-        if op.dim() == v.len() {
-            return op.matvec(v).map_err(|reason| {
-                EstimationError::RemlOptimizationFailed(format!(
-                    "per-atom θ-HVP operator matvec failed (dim={}): {reason}",
-                    v.len()
-                ))
-            });
-        }
-    }
-
-    // Central-difference fallback along v.
-    let h = THETA_HVP_FD_STEP; // fd-ok: FD fallback for theta-HVP when no analytic operator; bounded to border axes only, not hot loop
-    let v_norm = v.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
-    if v_norm <= PER_ATOM_NEGLIGIBLE_STEP {
-        return Ok(Array1::zeros(v.len()));
-    }
-    let mut plus = rho.clone();
-    let mut minus = rho.clone();
-    for i in 0..rho.len() {
-        plus[i] += h * v[i];
-        minus[i] -= h * v[i];
-    }
-    let g_plus = eval_at(&plus)?;
-    let g_minus = eval_at(&minus)?;
-    if g_plus.len() != v.len() || g_minus.len() != v.len() {
+    if operator.dim() != v.len() {
         return Err(EstimationError::RemlOptimizationFailed(format!(
-            "per-atom θ-HVP FD gradient length mismatch: got ({}, {}), expected {}",
-            g_plus.len(),
-            g_minus.len(),
+            "per-atom θ-HVP operator dim {} != vector len {}",
+            operator.dim(),
             v.len()
         )));
     }
-    let mut hv = Array1::<f64>::zeros(v.len());
-    for i in 0..v.len() {
-        hv[i] = (g_plus[i] - g_minus[i]) / (2.0 * h);
-    }
-    Ok(hv)
+    operator.matvec(v).map_err(|reason| {
+        EstimationError::RemlOptimizationFailed(format!(
+            "per-atom θ-HVP operator matvec failed (dim={}): {reason}",
+            v.len()
+        ))
+    })
 }
 
 /// Assemble the restricted `m × m` outer-Hessian sub-block over the
-/// shared-border axes by probing the matrix-free θ-HVP with the `m` border
+/// shared-border axes by probing the exact matrix-free θ-HVP with the `m` border
 /// basis directions, then symmetrizing.
 ///
 /// This is the only place a dense matrix is formed, and it is `m × m` with
-/// `m ≪ K` (the border count), never `K × K`. When the exact operator is
-/// available each probe is one operator matvec; otherwise each probe is one
-/// central FD pair. The `m` probes are independent, so they fan across rayon —
-/// but only when an exact operator backs them (the FD branch mutates shared
-/// objective state through `eval_at` and must stay sequential).
+/// `m ≪ K` (the border count), never `K × K`. Each probe is one operator
+/// matvec; the `m` probes are independent, so they fan across rayon. An exact
+/// outer-Hessian operator is required (#1440 removed the finite-difference
+/// fallback) — when none is available the caller defers the border correction.
 pub(crate) fn border_hessian_block(
     topology: &SharedBorderTopology,
-    operator: Option<&Arc<dyn OuterHessianOperator>>,
+    operator: &Arc<dyn OuterHessianOperator>,
     rho: &Array1<f64>,
-    eval_grad_at: &(dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError> + Sync),
 ) -> Result<Array2<f64>, EstimationError> {
     let m = topology.border_count();
     let border = topology.border_axes();
     let mut block = Array2::<f64>::zeros((m, m));
 
-    if let Some(op) = operator {
-        if op.dim() == rho.len() {
-            // Exact operator path: probes are independent operator matvecs;
-            // fan across rayon. No OnceLock get_or_init is triggered inside the
-            // probe closure (matvec is a pure linear action on a captured
-            // factorization), so the nested-rayon deadlock rule is satisfied.
-            let cols: Result<Vec<(usize, Array1<f64>)>, EstimationError> = (0..m)
-                .into_par_iter()
-                .map(|j| {
-                    let mut e_j = Array1::<f64>::zeros(rho.len());
-                    e_j[border[j]] = 1.0;
-                    let hv = op.matvec(&e_j).map_err(|reason| {
-                        EstimationError::RemlOptimizationFailed(format!(
-                            "per-atom border θ-HVP operator matvec failed: {reason}"
-                        ))
-                    })?;
-                    Ok((j, hv))
-                })
-                .collect();
-            for (j, hv) in cols? {
-                for (row, &axis) in border.iter().enumerate() {
-                    block[[row, j]] = hv[axis];
-                }
-            }
-        } else {
-            return Err(EstimationError::RemlOptimizationFailed(format!(
-                "per-atom border θ-HVP operator dim {} != rho_dim {}",
-                op.dim(),
-                rho.len()
-            )));
-        }
-    } else {
-        // FD fallback: each probe mutates objective state through eval_grad_at
-        // (one inner solve per ρ), so the probes are sequential. Still
-        // matrix-free and restricted to the m border directions.
-        for j in 0..m {
+    if operator.dim() != rho.len() {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "per-atom border θ-HVP operator dim {} != rho_dim {}",
+            operator.dim(),
+            rho.len()
+        )));
+    }
+    // Exact operator path: probes are independent operator matvecs; fan across
+    // rayon. No OnceLock get_or_init is triggered inside the probe closure
+    // (matvec is a pure linear action on a captured factorization), so the
+    // nested-rayon deadlock rule is satisfied.
+    let cols: Result<Vec<(usize, Array1<f64>)>, EstimationError> = (0..m)
+        .into_par_iter()
+        .map(|j| {
             let mut e_j = Array1::<f64>::zeros(rho.len());
             e_j[border[j]] = 1.0;
-            let hv = theta_hvp_matrix_free(None, rho, &e_j, eval_grad_at)?;
-            for (row, &axis) in border.iter().enumerate() {
-                block[[row, j]] = hv[axis];
-            }
+            let hv = operator.matvec(&e_j).map_err(|reason| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "per-atom border θ-HVP operator matvec failed: {reason}"
+                ))
+            })?;
+            Ok((j, hv))
+        })
+        .collect();
+    for (j, hv) in cols? {
+        for (row, &axis) in border.iter().enumerate() {
+            block[[row, j]] = hv[axis];
         }
     }
 
-    // Symmetrize against round-off / FD asymmetry.
+    // Symmetrize against round-off asymmetry.
     for r in 0..m {
         for c in (r + 1)..m {
             let s = 0.5 * (block[[r, c]] + block[[c, r]]);
@@ -507,16 +450,15 @@ fn solve_shared_border_block(
 /// vanishes for a well-conditioned block.
 pub(crate) fn shared_border_correction(
     topology: &SharedBorderTopology,
-    operator: Option<&Arc<dyn OuterHessianOperator>>,
+    operator: &Arc<dyn OuterHessianOperator>,
     rho: &Array1<f64>,
     gradient: &Array1<f64>,
-    eval_grad_at: &(dyn Fn(&Array1<f64>) -> Result<Array1<f64>, EstimationError> + Sync),
 ) -> Result<Array1<f64>, EstimationError> {
     let m = topology.border_count();
     if m == 0 {
         return Ok(Array1::<f64>::zeros(topology.rho_dim()));
     }
-    let block = border_hessian_block(topology, operator, rho, eval_grad_at)?;
+    let block = border_hessian_block(topology, operator, rho)?;
     solve_shared_border_block(topology, block, gradient)
 }
 
@@ -667,22 +609,8 @@ pub fn run_per_atom_efs(
                         solve_shared_border_block(topology, block, &gradient)
                     }
                     HessianResult::Operator(op) => {
-                        let operator = Some(Arc::clone(op));
-                        let degraded_eval =
-                            |_p: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-                                Err(EstimationError::RemlOptimizationFailed(
-                                    "per-atom border FD probe unavailable without an \
-                                     outer-Hessian operator"
-                                        .to_string(),
-                                ))
-                            };
-                        shared_border_correction(
-                            topology,
-                            operator.as_ref(),
-                            &rho,
-                            &gradient,
-                            &degraded_eval,
-                        )
+                        let operator = Arc::clone(op);
+                        shared_border_correction(topology, &operator, &rho, &gradient)
                     }
                     _ => {
                         log::debug!(
@@ -793,7 +721,7 @@ mod tests {
 
     /// Quadratic mock objective `f(ρ) = ½ (ρ − t)ᵀ A (ρ − t)`.
     ///
-    /// The FD-consistency discipline of the module docs, made executable:
+    /// The consistency discipline of the module docs, made executable:
     /// `eval_efs` returns the **decoupled** per-coordinate step
     /// `−g_i / A_ii` (each coordinate's own Newton step from its own gradient
     /// entry and curvature scale — the shape of `compute_efs_update`), `eval`
@@ -925,7 +853,7 @@ mod tests {
         // arrow-border overlap); the rest are diagonal. With the populated
         // topology and the exact operator the runner must land on the global
         // optimum, and at that optimum the correction nulls (the
-        // FD-consistency invariant: zero outer gradient ⇒ zero step).
+        // stationarity invariant: zero outer gradient ⇒ zero step).
         let dim = 6;
         let mut a = Array2::<f64>::eye(dim) * 2.0;
         a[[0, 1]] = 0.4;
@@ -956,31 +884,21 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn theta_hvp_fd_fallback_matches_the_analytic_action() {
-        // The matrix-free θ-HVP's central-difference branch must reproduce
-        // H·v of the analytic quadratic to O(h²).
+    pub(crate) fn theta_hvp_forwards_exactly_to_the_operator_action() {
+        // The matrix-free θ-HVP forwards `v` to the exact outer-Hessian operator
+        // matvec, reproducing H·v of the analytic quadratic bit-for-bit (#1440:
+        // there is no finite-difference branch to approximate it).
         let a = array![[2.0, 0.3, 0.0], [0.3, 1.5, -0.2], [0.0, -0.2, 4.0]];
-        let target = array![0.5, -1.0, 2.0];
-        let rho = array![1.0, 0.2, -0.7];
         let v = array![0.3, -1.1, 0.9];
-        let grad_at =
-            |p: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(a.dot(&(p - &target))) };
-        let hv = theta_hvp_matrix_free(None, &rho, &v, grad_at).expect("hvp");
         let exact = a.dot(&v);
-        for i in 0..3 {
-            assert!(
-                (hv[i] - exact[i]).abs() < 1e-6,
-                "component {i}: FD {} vs exact {}",
-                hv[i],
-                exact[i]
-            );
-        }
-        // Operator path: forwards to the exact matvec, bit-for-bit.
         let op: Arc<dyn OuterHessianOperator> = Arc::new(QuadraticOperator { a: a.clone() });
-        let hv_op = theta_hvp_matrix_free(Some(&op), &rho, &v, grad_at).expect("op hvp");
+        let hv_op = theta_hvp_matrix_free(&op, &v).expect("op hvp");
         for i in 0..3 {
             assert_eq!(hv_op[i].to_bits(), exact[i].to_bits());
         }
+        // A dimension mismatch is a hard error, not a silent zero.
+        let wrong = array![1.0, 2.0];
+        assert!(theta_hvp_matrix_free(&op, &wrong).is_err());
     }
 
     #[test]
