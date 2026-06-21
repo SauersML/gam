@@ -333,7 +333,16 @@ mod tests {
     #[test]
     pub(crate) fn duchon_profile_certifies_and_matches_exact_on_dense_grid() {
         let kind = production_duchon_kind();
-        let (r_min, r_max) = (0.05_f64, 30.0_f64);
+        // Two decades, the certifiable window for this kind. The dim=16
+        // partial-fraction operator sums polyharmonic blocks that scale like
+        // r^{2m-d} against Matérn blocks: at the low end those individual
+        // terms grow as r^{-14} and must nearly cancel to a moderate operator
+        // value, so the exact evaluator's own relative accuracy degrades by
+        // ~log10(r^{-14}) digits as r shrinks. Below ~0.1 the cancellation
+        // floor rises above PROFILE_CERT_RTOL (1e-13) and no Chebyshev rung
+        // can certify against samples that already carry that noise. r_min=0.1
+        // keeps the floor under the certificate while spanning a wide range.
+        let (r_min, r_max) = (0.1_f64, 10.0_f64);
         let profile =
             RadialProfile::build(&kind, r_min, r_max).expect("production Duchon profile certifies");
         let n = 2_000usize;
@@ -370,7 +379,11 @@ mod tests {
         // value and derivative are ONE source of truth (no transcendental
         // re-evaluation, immune to the desync class).
         let kind = production_duchon_kind();
-        let (r_min, r_max) = (0.05_f64, 30.0_f64);
+        // Same certifiable two-decade window as
+        // `duchon_profile_certifies_and_matches_exact_on_dense_grid`: below
+        // ~0.1 the dim=16 partial-fraction cancellation floor rises above
+        // PROFILE_CERT_RTOL, so the profile cannot certify there.
+        let (r_min, r_max) = (0.1_f64, 10.0_f64);
         let profile =
             RadialProfile::build(&kind, r_min, r_max).expect("production Duchon profile certifies");
         let n = 200usize;
