@@ -4254,9 +4254,37 @@ fn relax_smoothing_rho_prior(
     // p ≈ 20–40) clear this by ≥20×; the #1089 wine fit (n < p) keeps its cap.
     let n_obs = design.design.nrows();
     let p_total = design.design.ncols();
-    if n_obs < 2 * p_total {
-        return base.clone();
-    }
+    // REGIME of the relaxed prior on the relaxable smooth coordinates.
+    //
+    // * WELL-DETERMINED (`n ≥ 2·p`): the unregularised REML problem is well
+    //   posed on its own, so the relaxable coordinates are freed to `Flat`,
+    //   which the runtime resolves to the firth one-sided barrier — byte-flat
+    //   on the identified side (pure REML, exactly mgcv) and only a convex wall
+    //   against the `λ → 0` degeneracy. This is the #1266/#1271 behaviour.
+    //
+    // * UNDER-DETERMINED (`n < 2·p`): the design does NOT over-determine the
+    //   model (the n≈26 five-`ps` wine fit has p > n), so the firth barrier's
+    //   zero curvature on the identified side leaves the outer REML criterion
+    //   flat/degenerate in ρ-space and the loop hits `max_iter` at whatever
+    //   (under-smoothed) λ it last held — EDF rails up to ≈n, the smooths
+    //   interpolate the training rows, and held-out prediction explodes
+    //   (#1392: held-out R² as low as −2.5e6 on `wine_gamair`). The previous
+    //   stabiliser kept the FULL base prior here — a symmetric
+    //   `Normal{mean:0, sd:3}` cap. Its `ρ²/(2·9)` curvature does terminate the
+    //   loop, but it is centred at λ=1 with a tight `sd=3`: at the REML optimum
+    //   `ρ* ≈ 8–15` (heavy smoothing, which an over-parameterised fit needs and
+    //   which mgcv's pure REML reaches), the cap's `ρ*/9` gradient drags λ back
+    //   down by `O(1)` in ρ, pinning the fit in the under-smoothed regime.
+    //
+    //   The fix keeps a stabiliser with strictly positive curvature (so the
+    //   loop still certifies a stationary point — the #1089 requirement) but
+    //   WIDENS it to `sd = RELAX_UNDERDETERMINED_RHO_SD` so its gradient drag at
+    //   the heavily-smoothed optimum is negligible (`ρ*/sd² = O(1/100)`) and
+    //   pure REML — not the prior — chooses λ. The wide symmetric Gaussian is
+    //   weakly informative: ±2σ spans the whole feasible ρ range (`|ρ| ≤ 30`),
+    //   so it adds termination curvature without biasing which λ REML lands on,
+    //   restoring the mgcv-like heavy smoothing on the over-parameterised fit.
+    let underdetermined = n_obs < 2 * p_total;
     // Relaxable terms: penalized smooths whose smoothing log-λ the symmetric cap
     // wrongly bounds when the term's signal lives in its penalty null space — a
     // straight line under a bending penalty drives λ → ∞ but the cap pulls it
@@ -4304,6 +4332,18 @@ fn relax_smoothing_rho_prior(
     if !any_relaxed {
         return base.clone();
     }
+    // Relaxed prior for a relaxable smooth coordinate, chosen by regime (see the
+    // block above): the firth one-sided barrier (`Flat`) when the fit is
+    // well-determined, a wide-but-curved symmetric Gaussian when it is
+    // under-determined and the loop still needs termination curvature.
+    let relaxed_prior = if underdetermined {
+        crate::types::RhoPrior::Normal {
+            mean: 0.0,
+            sd: RELAX_UNDERDETERMINED_RHO_SD,
+        }
+    } else {
+        crate::types::RhoPrior::Flat
+    };
     let per_coord = coords
         .iter()
         .map(|info| {
@@ -4312,7 +4352,7 @@ fn relax_smoothing_rho_prior(
                 .as_deref()
                 .is_some_and(|name| relaxable_terms.contains(name));
             if relax {
-                crate::types::RhoPrior::Flat
+                relaxed_prior.clone()
             } else {
                 base.clone()
             }
@@ -4320,6 +4360,20 @@ fn relax_smoothing_rho_prior(
         .collect::<Vec<_>>();
     crate::types::RhoPrior::Independent(per_coord)
 }
+
+/// Standard deviation of the wide, weakly-informative symmetric `Normal` prior
+/// placed on a relaxable smooth's log-λ coordinates when the fit is
+/// under-determined (`n < 2·p`); see [`relax_smoothing_rho_prior`].
+///
+/// Chosen so that ±2σ spans the entire feasible ρ range (the outer optimiser
+/// bounds `|ρ| ≤ 30`): the prior contributes strictly-positive termination
+/// curvature `1/sd²` to the outer Hessian (the #1089 requirement that the REML
+/// loop certify a stationary point on a `p > n` design) while its gradient drag
+/// at the heavily-smoothed REML optimum is negligible, so pure REML — matching
+/// mgcv — selects λ. Reducing it toward the old `sd = 3` re-introduces the
+/// #1392 under-smoothing drag; widening it further weakens termination
+/// curvature without further benefit.
+const RELAX_UNDERDETERMINED_RHO_SD: f64 = 15.0;
 
 fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign) -> FitOptions {
     FitOptions {

@@ -91,7 +91,6 @@ fn r2(pred: &Array1<f64>, y_test: &[f64]) -> f64 {
 fn run_scenario(
     label: &str,
     formula: &str,
-    feature_cols: &[&str],
     target_col: &str,
     all_cols: &[String],
     all_data: &[Vec<f64>],
@@ -102,15 +101,22 @@ fn run_scenario(
     let test_mask: Vec<bool> = (0..n).map(|i| i % 10 < 3).collect();
     let col_idx = |name: &str| all_cols.iter().position(|c| c == name).unwrap();
     let target_i = col_idx(target_col);
-    let feat_i: Vec<usize> = feature_cols.iter().map(|f| col_idx(f)).collect();
 
+    // `fit.resolvedspec` indexes each smooth's covariate by its ABSOLUTE column
+    // position in the training dataset (`s(s_temp)` in the wine_gamair fit carries
+    // `feature_cols = [4]`, not `[0]`). The held-out design must therefore be built
+    // from rows in the SAME full column layout as the training data — passing only
+    // the formula's feature columns in formula order scrambles which covariate each
+    // smooth reads (`s(s_temp)` would read column 4 = `h_temp`), producing a design
+    // with values ~10³× too large and a spuriously catastrophic held-out R²
+    // (the original #1392 −2.5e6 artifact). Build full-layout test rows instead.
     let mut train_cols: Vec<Vec<f64>> = vec![Vec::new(); all_cols.len()];
-    let mut test_feat: Vec<Vec<f64>> = vec![Vec::new(); feature_cols.len()];
+    let mut test_cols: Vec<Vec<f64>> = vec![Vec::new(); all_cols.len()];
     let mut y_test: Vec<f64> = Vec::new();
     for i in 0..n {
         if test_mask[i] {
-            for (k, &fi) in feat_i.iter().enumerate() {
-                test_feat[k].push(all_data[fi][i]);
+            for c in 0..all_cols.len() {
+                test_cols[c].push(all_data[c][i]);
             }
             y_test.push(all_data[target_i][i]);
         } else {
@@ -138,12 +144,13 @@ fn run_scenario(
         return;
     };
 
-    // Build the test design in the SAME feature-column order the formula uses.
+    // Build the test design in the SAME full column layout as the training data
+    // (the layout `fit.resolvedspec`'s absolute feature-column indices address).
     let n_test = y_test.len();
-    let mut test_rows = Array2::<f64>::zeros((n_test, feature_cols.len()));
-    for (k, col) in test_feat.iter().enumerate() {
+    let mut test_rows = Array2::<f64>::zeros((n_test, all_cols.len()));
+    for (c, col) in test_cols.iter().enumerate() {
         for i in 0..n_test {
-            test_rows[[i, k]] = col[i];
+            test_rows[[i, c]] = col[i];
         }
     }
     let test_design = match build_term_collection_design(test_rows.view(), &fit.resolvedspec) {
@@ -174,7 +181,6 @@ fn main() {
         run_scenario(
             "wine_temp_vs_year",
             "s_temp ~ s(year, bs=\"ps\", k=7)",
-            &["year"],
             "s_temp",
             &cols,
             &data,
@@ -190,7 +196,6 @@ fn main() {
         run_scenario(
             "wine_price_vs_temp",
             "price ~ s(s_temp, bs=\"ps\", k=7)",
-            &["s_temp"],
             "price",
             &cols,
             &data,
@@ -206,7 +211,6 @@ fn main() {
             "price ~ s(s_temp, bs=\"ps\", k=7) + s(year, bs=\"ps\", k=7) \
              + s(h_rain, bs=\"ps\", k=7) + s(w_rain, bs=\"ps\", k=7) \
              + s(h_temp, bs=\"ps\", k=7)",
-            &["s_temp", "year", "h_rain", "w_rain", "h_temp"],
             "price",
             &cols,
             &data,
@@ -214,5 +218,5 @@ fn main() {
         );
     }
 
-    eprintln!("==== expected: wine_gamair strongly negative R2 (over-parameterized) ====");
+    eprintln!("==== wine_gamair held-out R2 should be within the CI gate of mgcv (+0.2338) ====");
 }
