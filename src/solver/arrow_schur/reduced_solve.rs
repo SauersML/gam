@@ -400,6 +400,79 @@ pub(crate) fn matrix_inf_norm(a: &Array2<f64>) -> f64 {
     max_row
 }
 
+/// Spectral positive-definiteness floor for the reduced Schur complement
+/// `S` (#1026 SAE co-collapse SOLVE-path cure).
+///
+/// Reached only after the genuine Cholesky of `S` has REFUSED it (an indefinite
+/// reduced Schur: collapsed atoms drive a per-row `H_tt` near-singular, so the
+/// accumulated `Σ_i H_tβᵀ (H_tt)⁻¹ H_tβ` over-subtracts `H_ββ + ridge_β·I` into a
+/// matrix with a non-positive eigenvalue). Rather than reject and let the LM
+/// loop inflate `ridge_β` over EVERY β direction (the #1026 "crawl"), we
+/// symmetric-eigendecompose `S` and clamp every eigenvalue UP to
+/// `floor·max(λ)`. This is Levenberg–Marquardt restricted to exactly the
+/// indefinite/collapsed subspace: a well-separated positive direction
+/// (`λ ≫ floor·max λ`) keeps its EXACT eigenvalue (`λ.max(floor·max λ) = λ`), so
+/// the Newton step in the healthy β subspace is unchanged, while only the
+/// collapsed directions get the minimal positive stiffness needed for a PD
+/// solve. Returns the floored, symmetric, strictly-PD matrix, or `None` if `S`
+/// has no usable scale (non-finite / all-zero spectrum), in which case the
+/// caller keeps the strict refusal.
+///
+/// Mirrors the per-row evidence floor
+/// [`super::factorization::factor_spectral_deflated_evidence_row`]; the only
+/// difference is the floored VALUE — a small positive `floor·max λ` (Tikhonov,
+/// for an accurate solve) here, vs unit stiffness `+1` (`log 1 = 0`) there (for
+/// the quotient log-det).
+pub(crate) fn spectral_pd_floored_schur(
+    schur: &Array2<f64>,
+    relative_floor: f64,
+) -> Option<Array2<f64>> {
+    let n = schur.nrows();
+    if n == 0 || schur.ncols() != n || !(relative_floor.is_finite() && relative_floor > 0.0) {
+        return None;
+    }
+    // Symmetrise defensively (the assembled Schur is symmetric up to reduction
+    // order; the eig routine assumes exact symmetry).
+    let mut sym = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            let v = 0.5 * (schur[[i, j]] + schur[[j, i]]);
+            if !v.is_finite() {
+                return None;
+            }
+            sym[[i, j]] = v;
+        }
+    }
+    let (evals, evecs) = sym.eigh(Side::Lower).ok()?;
+    let max_abs = evals.iter().fold(
+        0.0_f64,
+        |acc, &v| if v.is_finite() { acc.max(v.abs()) } else { acc },
+    );
+    if !(max_abs.is_finite() && max_abs > 0.0) {
+        return None;
+    }
+    let floor = relative_floor * max_abs;
+    // Reconstruct `Σ_i max(λ_i, floor) v_i v_iᵀ`: clamp every eigenvalue UP to a
+    // strictly positive `floor`. Healthy positive directions (`λ ≫ floor`) are
+    // untouched; non-positive / tiny collapsed directions are lifted to exactly
+    // `floor`. The result is symmetric PD by construction.
+    let mut conditioned = Array2::<f64>::zeros((n, n));
+    for eig_idx in 0..evals.len() {
+        let lambda = evals[eig_idx];
+        let lambda_floored = if lambda.is_finite() { lambda.max(floor) } else { floor };
+        for i in 0..n {
+            let vi = evecs[[i, eig_idx]];
+            if vi == 0.0 {
+                continue;
+            }
+            for j in 0..n {
+                conditioned[[i, j]] += lambda_floored * vi * evecs[[j, eig_idx]];
+            }
+        }
+    }
+    Some(conditioned)
+}
+
 pub(crate) fn solve_dense_reduced_system(
     schur: &Array2<f64>,
     rhs_beta: &Array1<f64>,
@@ -408,7 +481,69 @@ pub(crate) fn solve_dense_reduced_system(
 ) -> Result<(Array1<f64>, Option<Array2<f64>>, PcgDiagnostics), ArrowSchurError> {
     let factor = match cholesky_lower(schur) {
         Ok(factor) => factor,
-        Err(e) => return Err(ArrowSchurError::SchurFactorFailed { reason: e }),
+        Err(e) => {
+            // #1026 — opt-in spectral PD-floor on the indefinite reduced Schur.
+            // When enabled (SAE solve path), condition ONLY the collapsed
+            // directions and re-factor, instead of erroring out and letting the
+            // outer LM loop inflate `ridge_β` over every β direction (the
+            // co-collapse "crawl"). Disabled (default `None`) keeps the strict
+            // refusal so BA / non-SAE callers are bit-for-bit unchanged.
+            match options.schur_pd_floor {
+                Some(relative_floor) => match spectral_pd_floored_schur(schur, relative_floor) {
+                    Some(floored) => match cholesky_lower(&floored) {
+                        Ok(factor) => {
+                            // Solve against the floored (PD) Schur. The healthy β
+                            // subspace keeps its exact eigenvalues, so its Δβ is
+                            // the exact Newton component; only the collapsed
+                            // subspace is minimally damped.
+                            let direct = mixed_precision_reduced_beta(
+                                &floored, &factor, rhs_beta, options,
+                            )
+                            .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));
+                            if step_inside_trust_region(
+                                direct.view(),
+                                options.trust_region.radius,
+                                metric_weights,
+                            ) {
+                                return Ok((direct, Some(factor), PcgDiagnostics::default()));
+                            }
+                            let identity = IdentityPreconditioner;
+                            let (delta, diag) = steihaug_dense_system(
+                                &floored,
+                                rhs_beta,
+                                &identity,
+                                &ArrowPcgOptions {
+                                    max_iterations: options.trust_region.max_iterations,
+                                    relative_tolerance: options
+                                        .trust_region
+                                        .steihaug_relative_tolerance,
+                                },
+                                &options.trust_region,
+                                metric_weights,
+                            )?;
+                            return Ok((delta, Some(factor), diag));
+                        }
+                        Err(floored_err) => {
+                            return Err(ArrowSchurError::SchurFactorFailed {
+                                reason: format!(
+                                    "reduced Schur non-PD ({e}); spectral PD-floor \
+                                     reconstruction still non-PD: {floored_err}"
+                                ),
+                            });
+                        }
+                    },
+                    None => {
+                        return Err(ArrowSchurError::SchurFactorFailed {
+                            reason: format!(
+                                "reduced Schur non-PD ({e}); spectral PD-floor declined \
+                                 (no usable spectrum)"
+                            ),
+                        });
+                    }
+                },
+                None => return Err(ArrowSchurError::SchurFactorFailed { reason: e }),
+            }
+        }
     };
     // Ill-conditioned-but-PD Schur guard. The per-row factor checks reject
     // any single barely-PD H_tt^(i) block, but the reduced Schur complement
@@ -524,7 +659,9 @@ pub fn solve_streaming_reduced_beta(
             Err(err) => {
                 let recoverable = matches!(
                     err,
-                    ArrowSchurError::SchurFactorFailed { .. } | ArrowSchurError::PcgFailed { .. }
+                    ArrowSchurError::SchurFactorFailed { .. }
+                        | ArrowSchurError::PcgFailed { .. }
+                        | ArrowSchurError::UnboundedNegativeCurvature { .. }
                 );
                 last_err = Some(err);
                 if !recoverable || attempt == DEFAULT_PROXIMAL_MAX_ATTEMPTS {
@@ -1709,6 +1846,32 @@ pub enum SchurPreconditionerKind {
 /// exhausted `max_iterations`.
 pub(crate) const PRECOND_ESCALATE_K_THRESHOLD: usize = 100;
 
+/// #1026 matrix-free Schur curvature-floor (the unbounded-PCG analogue of the
+/// dense `spectral_pd_floored_schur`). On `pᵀSp ≤ 0` in the unbounded SAE inner
+/// PCG, the operator ridge is lifted by the minimal amount that restores
+/// positive curvature along the offending direction, plus this fractional
+/// margin (so the next CG iterate sits strictly inside the positive cone, not on
+/// the `0` knife-edge).
+pub(crate) const SCHUR_CURVATURE_FLOOR_MARGIN: f64 = 1.0e-2;
+/// Lower bound on the curvature-floor ridge bump, relative to the rhs scale, so
+/// a `pᵀSp` that rounds to exactly `0` still gets a strictly positive bump.
+pub(crate) const SCHUR_CURVATURE_FLOOR_REL_FLOOR: f64 = 1.0e-12;
+/// Ceiling on the accumulated curvature-floor ridge, relative to the rhs scale.
+/// Beyond this the operator is treated as un-conditionable by a minimal floor
+/// and the recoverable failure is handed to the outer LM loop (which re-forms
+/// the whole system at a heavier ridge). Generous so that a large collapsed
+/// over-subtraction `(H_tβ)²/H_tt` is still reachable.
+pub(crate) const SCHUR_CURVATURE_FLOOR_REL_CEILING: f64 = 1.0e12;
+/// Multiplicative growth for the DIAGONAL-refusal ridge escalation (no
+/// `(curvature, ‖p‖²)` deficit is available there), matching the per-row
+/// `factor_one_row_result` `RIDGE_GROWTH_FACTOR`.
+pub(crate) const SCHUR_CURVATURE_FLOOR_DIAG_GROWTH: f64 = 10.0;
+/// Max curvature-floor ridge-lift attempts before deferring to the outer LM
+/// loop. The diagonal-refusal path grows ×10 per attempt, so this bounds the
+/// reachable ridge at `rhs_scale · 10^(attempts)` — ample for any realistic
+/// over-subtraction while still bounded.
+pub(crate) const SCHUR_CURVATURE_FLOOR_MAX_ATTEMPTS: usize = 24;
+
 /// Cholesky or scalar factor for one cluster of the beta-coefficient graph.
 #[derive(Clone)]
 pub(crate) enum ClusterFactor {
@@ -2112,6 +2275,7 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     backend: &B,
     gpu_matvec: Option<&GpuSchurMatvec>,
     metric_weights: Option<&MetricWeights>,
+    curvature_floor: Option<f64>,
 ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurError> {
     // #1017 CPU residency: stage the per-row reduced-Schur factors `(L_i, Y_i)`
     // (NOT the dense `p×p` block — `di ≪ p`, so the factored form is `O(n·di·p)`
@@ -2126,35 +2290,147 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     } else {
         None
     };
-    let jacobi = JacobiPreconditioner::from_arrow_schur(
-        sys,
-        htt_factors,
-        ridge_beta,
-        backend,
-        resident.as_ref(),
-    )?;
-    let (x0, diag0) = run_pcg_with_preconditioner(
-        sys,
-        htt_factors,
-        ridge_beta,
-        rhs,
-        |r| jacobi.apply(r),
-        pcg,
-        trust,
-        backend,
-        gpu_matvec,
-        metric_weights,
-        resident.as_ref(),
-    )?;
+    // #1026 — curvature-floor retry on the Jacobi tier. The unbounded SAE inner
+    // PCG (trust radius = ∞) fails on `pᵀSp ≤ 0` when the reduced Schur is
+    // indefinite (K≥4 co-collapse: a near-singular per-row `H_tt` over-subtracts
+    // `S`). Instead of letting that failure propagate to the outer LM loop —
+    // which inflates `ridge_β` over EVERY β direction and makes the inner Newton
+    // crawl — floor the OPERATOR by the minimal ridge `δ = |pᵀSp|/‖p‖² · (1+ε)`
+    // that restores positive curvature along the offending direction, rebuild the
+    // Jacobi preconditioner at the lifted ridge, and retry. This is the
+    // matrix-free analogue of the dense `spectral_pd_floored_schur`: the healthy
+    // β subspace (where curvature is already positive) is essentially untouched
+    // by a tiny `δ`, while the collapsed direction gets exactly the stiffness it
+    // needs to make a real descent step. A PD reduced Schur never hits `pᵀSp ≤ 0`,
+    // so this loop is a strict no-op there (bit-for-bit unchanged). Bounded by a
+    // small attempt cap and a relative ridge ceiling; on exhaustion the original
+    // recoverable failure still reaches the outer LM loop.
+    let mut effective_ridge = ridge_beta;
+    let mut x0_diag0: Option<(Array1<f64>, PcgDiagnostics)> = None;
+    let mut last_curvature_err: Option<ArrowSchurError> = None;
+    let rhs_scale = metric_norm(rhs.view(), metric_weights).max(1.0);
+    let ridge_ceiling = ridge_beta.max(SCHUR_CURVATURE_FLOOR_REL_CEILING * rhs_scale);
+    for _attempt in 0..=SCHUR_CURVATURE_FLOOR_MAX_ATTEMPTS {
+        // The Jacobi preconditioner build itself refuses a non-PD Schur diagonal
+        // (`PcgFailed: invalid Schur Jacobi diagonal`) — the SAME co-collapse
+        // signature reached BEFORE the CG loop, since `S_ii = H_ββ,ii − Σ …` goes
+        // negative. Treat that build failure as a curvature deficit too: when the
+        // floor is enabled, lift the ridge and retry; otherwise propagate.
+        let jacobi = match JacobiPreconditioner::from_arrow_schur(
+            sys,
+            htt_factors,
+            effective_ridge,
+            backend,
+            resident.as_ref(),
+        ) {
+            Ok(jacobi) => jacobi,
+            Err(err @ ArrowSchurError::PcgFailed { .. }) => {
+                if curvature_floor.is_none() {
+                    return Err(err);
+                }
+                // A diagonal refusal carries no `(curvature, ‖p‖²)` deficit, and
+                // the over-subtraction magnitude `Σ H_tβᵀ(H_tt)⁻¹H_tβ` is
+                // unbounded relative to `rhs_scale`, so a small additive bump
+                // would crawl. Escalate the ridge MULTIPLICATIVELY (×10, matching
+                // the per-row `factor_one_row_result` RIDGE_GROWTH_FACTOR), seeded
+                // at `rhs_scale`, so even a large deficit (the collapsed
+                // `(H_tβ)²/H_tt` over-subtraction) is reached in a handful of
+                // attempts. The ceiling + attempt cap still bound it; on
+                // exhaustion the recoverable failure reaches the outer LM loop.
+                let next = if effective_ridge > 0.0 {
+                    effective_ridge * SCHUR_CURVATURE_FLOOR_DIAG_GROWTH
+                } else {
+                    rhs_scale
+                };
+                last_curvature_err = Some(err);
+                if !next.is_finite() || next > ridge_ceiling {
+                    break;
+                }
+                effective_ridge = next;
+                continue;
+            }
+            Err(other) => return Err(other),
+        };
+        match run_pcg_with_preconditioner(
+            sys,
+            htt_factors,
+            effective_ridge,
+            rhs,
+            |r| jacobi.apply(r),
+            pcg,
+            trust,
+            backend,
+            gpu_matvec,
+            metric_weights,
+            resident.as_ref(),
+        ) {
+            Ok(result) => {
+                x0_diag0 = Some(result);
+                break;
+            }
+            Err(ArrowSchurError::UnboundedNegativeCurvature {
+                curvature,
+                direction_norm_sq,
+            }) => {
+                // Only floor when the caller opted in (SAE solve path); otherwise
+                // propagate the raw negative-curvature signal so BA / non-SAE
+                // unbounded solves keep their existing failure contract.
+                let Some(relative_floor) = curvature_floor else {
+                    return Err(ArrowSchurError::UnboundedNegativeCurvature {
+                        curvature,
+                        direction_norm_sq,
+                    });
+                };
+                // Minimal ridge to make `pᵀ(S+δI)p = |curvature| + δ·‖p‖² > 0`,
+                // with a margin so the next CG iterate has strictly positive
+                // curvature rather than sitting on the `0` knife-edge.
+                let deficit = if direction_norm_sq > 0.0 {
+                    curvature.abs() / direction_norm_sq
+                } else {
+                    0.0
+                };
+                let bump = (deficit * (1.0 + SCHUR_CURVATURE_FLOOR_MARGIN))
+                    .max(relative_floor.max(SCHUR_CURVATURE_FLOOR_REL_FLOOR) * rhs_scale);
+                let next = (effective_ridge + bump).max(effective_ridge * 2.0);
+                last_curvature_err = Some(ArrowSchurError::UnboundedNegativeCurvature {
+                    curvature,
+                    direction_norm_sq,
+                });
+                if !next.is_finite() || next > ridge_ceiling {
+                    break;
+                }
+                effective_ridge = next;
+            }
+            Err(other) => return Err(other),
+        }
+    }
+    let (x0, diag0) = match x0_diag0 {
+        Some(result) => result,
+        None => {
+            // The curvature floor could not condition the operator within the
+            // ceiling; hand the recoverable failure to the outer LM loop, which
+            // re-forms the system at a heavier ridge.
+            return Err(last_curvature_err.unwrap_or(ArrowSchurError::PcgFailed {
+                reason: "unbounded Schur PCG negative curvature unresolved by curvature floor"
+                    .to_string(),
+            }));
+        }
+    };
     if sys.k <= PRECOND_ESCALATE_K_THRESHOLD || diag0.stopping_reason != PcgStopReason::MaxIter {
         return Ok((x0, diag0));
     }
+    // Escalation tiers reuse the curvature-floored `effective_ridge` so the
+    // operator they precondition is the SAME (PD-floored) one the Jacobi tier
+    // settled on; a still-negative-curvature signal here is handed to the outer
+    // LM loop (it only arises if the floored Jacobi tier merely ran out of
+    // iterations yet a coarser preconditioner still finds an indefinite
+    // direction — rare; the LM loop re-forms at a heavier ridge).
     let cluster =
-        ClusterJacobiPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend)?;
+        ClusterJacobiPreconditioner::from_arrow_schur(sys, htt_factors, effective_ridge, backend)?;
     let (x1, diag1) = run_pcg_with_preconditioner(
         sys,
         htt_factors,
-        ridge_beta,
+        effective_ridge,
         rhs,
         |r| cluster.apply(r),
         pcg,
@@ -2167,12 +2443,17 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
     if diag1.stopping_reason != PcgStopReason::MaxIter {
         return Ok((x1, diag1));
     }
-    let schwarz =
-        AdditiveSchwarzPreconditioner::from_arrow_schur(sys, htt_factors, ridge_beta, backend, 1)?;
+    let schwarz = AdditiveSchwarzPreconditioner::from_arrow_schur(
+        sys,
+        htt_factors,
+        effective_ridge,
+        backend,
+        1,
+    )?;
     let (x2, diag2) = run_pcg_with_preconditioner(
         sys,
         htt_factors,
-        ridge_beta,
+        effective_ridge,
         rhs,
         |r| schwarz.apply(r),
         pcg,
@@ -2322,8 +2603,15 @@ where
             diag.stopping_reason = PcgStopReason::TrustRegion;
             return Ok((step_to_trust_boundary(&x, &r, radius, metric_weights), diag));
         }
-        return Err(ArrowSchurError::PcgFailed {
-            reason: "non-positive preconditioned residual in Schur PCG".to_string(),
+        // Unbounded (radius = ∞) non-positive preconditioned residual: the
+        // reduced Schur is indefinite at the very first direction. Surface the
+        // typed curvature-floor signal so `steihaug_pcg_auto` floors the
+        // operator minimally and retries, instead of failing into a global
+        // `ridge_β` ramp. `rz = rᵀM⁻¹r` is a preconditioner-metric curvature;
+        // report it with the residual norm² as the direction scale.
+        return Err(ArrowSchurError::UnboundedNegativeCurvature {
+            curvature: rz,
+            direction_norm_sq: metric_dot(&r, &r, metric_weights),
         });
     }
     if metric_norm(r.view(), metric_weights) <= tol {
@@ -2345,8 +2633,14 @@ where
                 diag.stopping_reason = PcgStopReason::TrustRegion;
                 return Ok((step_to_trust_boundary(&x, &p, radius, metric_weights), diag));
             }
-            return Err(ArrowSchurError::PcgFailed {
-                reason: "negative curvature in unbounded Schur PCG".to_string(),
+            // Unbounded negative curvature `pᵀSp ≤ 0`: the reduced Schur is
+            // indefinite along `p` (the #1026 co-collapse direction). Surface
+            // the typed signal carrying `pᵀSp` and `‖p‖²` so the caller floors
+            // the operator by the minimal ridge `δ = |pᵀSp|/‖p‖²` (which makes
+            // `pᵀ(S+δI)p = 0⁺`) plus a margin, and retries.
+            return Err(ArrowSchurError::UnboundedNegativeCurvature {
+                curvature: pap,
+                direction_norm_sq: metric_dot(&p, &p, metric_weights),
             });
         }
         let alpha = rz / pap;
@@ -2498,6 +2792,20 @@ pub enum ArrowSchurError {
     /// The BA inexact-step PCG solve failed before producing a usable
     /// Steihaug trust-region step.
     PcgFailed { reason: String },
+    /// The UNBOUNDED (trust-radius = ∞) Schur PCG encountered negative
+    /// curvature `pᵀSp ≤ 0` (or a non-positive preconditioned residual): the
+    /// reduced Schur is indefinite, the #1026 K≥4 co-collapse signature where
+    /// a near-singular per-row `H_tt` over-subtracts `S`. With no trust radius
+    /// there is no boundary to step to, so CG cannot proceed. `curvature` is
+    /// the offending `pᵀSp` and `direction_norm_sq` the `‖p‖²` of the
+    /// negative-curvature direction; the caller floors the operator with the
+    /// minimal ridge `δ = (|curvature|/‖p‖² )·(1+ε)` that restores positive
+    /// curvature along `p` and retries (matrix-free analogue of the dense
+    /// `spectral_pd_floored_schur`), rather than blindly inflating `ridge_β`.
+    UnboundedNegativeCurvature {
+        curvature: f64,
+        direction_norm_sq: f64,
+    },
     /// Adaptive proximal damping could not produce an Armijo-accepted
     /// nonlinear step.
     AdaptiveCorrectionFailed { reason: String },
@@ -2525,6 +2833,15 @@ impl std::fmt::Display for ArrowSchurError {
             ArrowSchurError::PcgFailed { reason } => {
                 write!(f, "arrow-Schur: Schur PCG failed: {reason}")
             }
+            ArrowSchurError::UnboundedNegativeCurvature {
+                curvature,
+                direction_norm_sq,
+            } => write!(
+                f,
+                "arrow-Schur: unbounded Schur PCG hit negative curvature pᵀSp={curvature:e} \
+                 (‖p‖²={direction_norm_sq:e}); reduced Schur is indefinite (co-collapse), \
+                 retry with a curvature-floor ridge"
+            ),
             ArrowSchurError::AdaptiveCorrectionFailed { reason } => {
                 write!(
                     f,

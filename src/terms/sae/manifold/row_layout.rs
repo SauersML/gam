@@ -32,17 +32,21 @@ use super::*;
 /// fit the host / device working-set budget, and the dropped atoms carry
 /// `O(a_{n,k}²)` curvature that is negligible by construction of the cutoff.
 ///
-/// #1408: SOFTMAX does NOT currently engage this compact layout — the
-/// assemble dispatch returns `None` for `AssignmentMode::Softmax` (see
-/// `assemble_arrow_schur` in `construction.rs`), so a softmax fit retains the
-/// full `K`-atom row dimension regardless of `K` or `top_k`. Folding softmax
-/// `top_k` sparsity into the compact solve requires writing the active×active
-/// Gershgorin majorizer sub-block (the softmax entropy curvature is indefinite,
-/// so its raw diagonal cannot be used) AND extending the logdet trace and the
-/// θ-adjoint to contract that SAME majorizer over the compact logit slots, so
-/// value, `log|H|`, and Γ stay coherent — a coordinated change that needs the
-/// FD contract gates to certify. This `struct` already supports the layout; the
-/// softmax engagement is the unfinished half.
+/// #1408: SOFTMAX engages this compact layout when an explicit `top_k`
+/// (`softmax_active_cap`) and/or the in-core memory budget bounds the active
+/// set — the `AssignmentMode::Softmax` arm of `assemble_arrow_schur` consults
+/// [`crate::terms::sae::manifold::SaeManifoldTerm::softmax_active_plan`] and,
+/// on `Some((cap, cutoff))`, builds the active set via
+/// [`Self::from_dense_weights`]. The full-`K` dense softmax layout is retained
+/// only when neither lever engages (no `top_k`, in-budget `K`). Folding softmax
+/// `top_k` into the compact solve required writing the active×active Gershgorin
+/// Loewner majorizer sub-block (#1419; the softmax entropy curvature is
+/// indefinite, so its raw diagonal cannot be used) AND contracting that SAME
+/// majorizer over the compact logit slots in the logdet ρ-trace
+/// (`assignment_log_strength_hessian_trace`) and the θ-adjoint, so value,
+/// `log|H|`, and Γ differentiate one operator on the compact support. That
+/// coordinated change is landed and FD-certified; the FFI's after-the-fit
+/// top-`k` projection is then a no-op at the optimum.
 #[derive(Debug, Clone)]
 pub struct SaeRowLayout {
     /// `active_atoms[row]` — sorted indices of active atoms for that row.

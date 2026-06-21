@@ -250,7 +250,7 @@ def test_advance_temperature_queries_rust_schedule():
 
 def test_ibp_gumbel_forward_applies_stick_breaking_prior():
     # The torch IBP-Gumbel forward must route through the Rust ibp_map kernel so
-    # it applies the stick-breaking prior pi_k = (alpha/(alpha+1))^k and the
+    # it applies the stick-breaking prior pi_k = (alpha/(alpha+1))^(k+1) and the
     # temperature scaling that the closed-form SaeAssignment IBP path uses. A bare
     # sigmoid(logits/tau) would omit pi_k. We pin it by reproducing the Rust
     # value out-of-band and asserting the forward matches bit-for-bit.

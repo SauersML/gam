@@ -370,6 +370,7 @@ impl<'a, A: ArrowSystemAssembler> LatentInnerSolver<'a, A> {
                 | Err(err @ ArrowSchurError::PerRowFactorIllConditioned { .. })
                 | Err(err @ ArrowSchurError::SchurFactorFailed { .. })
                 | Err(err @ ArrowSchurError::PcgFailed { .. })
+                | Err(err @ ArrowSchurError::UnboundedNegativeCurvature { .. })
                 | Err(err @ ArrowSchurError::AdaptiveCorrectionFailed { .. }) => {
                     // Grow ridges; retry without burning an iteration.
                     // The per-row `factor_blocks` already ran an internal

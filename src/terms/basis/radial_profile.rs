@@ -140,24 +140,17 @@ impl RadialProfile {
     pub(crate) fn certify(&self, kind: &RadialScalarKind) -> bool {
         // 1. Tail decay per channel, relative to that channel's own scale.
         //
-        // The Chebyshev tail can never decay below the intrinsic numerical
-        // noise floor of the samples it interpolates. For high-dimensional
-        // Duchon kinds the exact operator core sums sign-alternating
-        // partial-fraction blocks spanning many orders of magnitude
-        // (`duchon_regularized_operator_core`, Kahan-compensated but not
-        // cancellation-free), so the per-node `(q, t)` samples carry a
-        // relative noise floor that can sit between `PROFILE_CERT_RTOL` and
-        // `PROFILE_SPOT_RTOL`. Demanding the tail fall below `1e-13` when the
-        // samples themselves are only good to `~1e-12` rejects profiles that
-        // are nonetheless accurate to the off-grid tolerance we actually
-        // require below — an internally inconsistent bar (gam#1453). Floor the
-        // tail tolerance at the off-grid spot-check tolerance: the tail must
-        // decay to within the accuracy the certificate guarantees, no tighter.
-        // For the clean (Matérn / low-order) kinds whose tail genuinely
-        // reaches `~1e-15` this is a no-op — they pass either way and produce
-        // identical coefficients; it only admits ill-conditioned kinds whose
-        // step-2 off-grid agreement is genuinely within `PROFILE_SPOT_RTOL`.
-        let tail_rtol = PROFILE_CERT_RTOL.max(PROFILE_SPOT_RTOL);
+        // The samples are evaluated through the cancellation-free stable
+        // single-integral operator core (`duchon_hybrid_operator_stable_integral`,
+        // gam#1424 / gam#1453), so even the high-dimensional Duchon `(q, t)`
+        // channels are accurate to ~1e-15 and the Chebyshev tail genuinely
+        // decays below the strict `PROFILE_CERT_RTOL`. This is the real
+        // geometric-decay certificate for an analytic profile — it is NOT
+        // floored at the looser spot-check tolerance (an earlier such floor
+        // rested on the false premise that the operator samples carry an
+        // irreducible ~1e-12 cancellation floor; the stable core removes that
+        // floor at its source, so the strict bar is the right one).
+        let tail_rtol = PROFILE_CERT_RTOL;
         let tail_band = (self.m / 16).max(2);
         for c in &self.coeff {
             let scale = c.iter().fold(0.0_f64, |a, &v| a.max(v.abs()));
@@ -451,27 +444,43 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn certify_tail_tol_is_consistent_with_spot_tol() {
-        // gam#1453 regression: the tail-decay certificate must not demand more
-        // precision than the off-grid spot-check it is paired with. Requiring
-        // the Chebyshev tail to fall below a tolerance tighter than the samples'
-        // own accuracy (the case for the high-dimensional Duchon operator core,
-        // whose partial-fraction sum carries cancellation noise) rejects
-        // profiles that are nonetheless accurate to the certificate's own
-        // off-grid bound. The two gates must agree on "accurate enough".
-        assert!(
-            PROFILE_CERT_RTOL.max(PROFILE_SPOT_RTOL) >= PROFILE_SPOT_RTOL,
-            "tail certificate must be at least as permissive as the off-grid \
-             accuracy gate it certifies against"
-        );
-        // The production high-dimensional Duchon profile must certify on its
-        // certifiable window now that the tail gate is consistent (this is the
-        // exact build that previously returned None despite passing off-grid).
+    pub(crate) fn production_duchon_operator_samples_are_stable_not_cancellation_noisy() {
+        // gam#1453 regression: the production dim=16/s=9 Duchon profile must
+        // certify under the STRICT tail gate (`PROFILE_CERT_RTOL`), because the
+        // operator channels `(q, t)` are now evaluated through the
+        // cancellation-free stable single integral
+        // (`duchon_hybrid_operator_stable_integral`) rather than the
+        // sign-alternating partial-fraction operator core. The old core left
+        // `(q, t)` with ~1e-2 relative noise at dim=16, which no Chebyshev rung
+        // could certify at any tolerance the profile actually guarantees; the
+        // stable core drops that to ~1e-15.
         let kind = production_duchon_kind();
         assert!(
             RadialProfile::build(&kind, 1.0, 10.0).is_some(),
-            "production Duchon profile must certify on [1, 10] under the \
-             consistent tail/spot tolerance"
+            "production Duchon profile must certify on [1, 10] under the strict \
+             tail gate now that the operator core is cancellation-free"
         );
+
+        // Direct evidence that the stable operator core matches central
+        // differences of the (independently stable) kernel value across the
+        // range — i.e. `q = φ′/r` and `t = (φ″ − q)/r²` are right, not merely
+        // self-consistent. The partial-fraction core failed this at ~1e-2.
+        for &r in &[1.3_f64, 2.7, 5.0, 8.0] {
+            let (_phi, q, t) = kind.eval_design_triplet(r).expect("triplet");
+            let h = r * 1.0e-5;
+            let phi = |rr: f64| kind.eval_design_triplet(rr).expect("phi").0;
+            let phi_p = (phi(r + h) - phi(r - h)) / (2.0 * h);
+            let phi_pp = (phi(r + h) - 2.0 * phi(r) + phi(r - h)) / (h * h);
+            let q_fd = phi_p / r;
+            let t_fd = (phi_pp - q_fd) / (r * r);
+            assert!(
+                (q - q_fd).abs() <= 1.0e-6 * q.abs().max(1.0e-300),
+                "q at r={r}: stable={q:e} vs φ′/r central-diff={q_fd:e}"
+            );
+            assert!(
+                (t - t_fd).abs() <= 1.0e-4 * t.abs().max(1.0e-300),
+                "t at r={r}: stable={t:e} vs (φ″−q)/r² central-diff={t_fd:e}"
+            );
+        }
     }
 }

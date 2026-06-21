@@ -1,6 +1,6 @@
 """IBP-MAP stick-breaking prior saturation at high K / low alpha.
 
-The IBP prior weights atoms by ``pi_k = (alpha/(alpha+1))^k`` and applies
+The IBP prior weights atoms by ``pi_k = (alpha/(alpha+1))^(k+1)`` and applies
 it multiplicatively to the IBP-MAP assignments. The capacity test only
 covers K in {1,2,4,8} at the default ``alpha=1.0`` (ratio ~0.5, gentle
 decay). It never probes the pathological regime: high K (10-15) with low

@@ -32,6 +32,25 @@ impl SurvivalMarginalSlopeFamily {
             return Ok(Array2::<f64>::zeros((p, p)));
         }
 
+        let base = self.build_row_flex_third_base_with_states(row, block_states, &primary)?;
+        self.row_flex_third_contract_from_base(&base, dir)
+    }
+
+    /// Build the direction-independent per-row geometry that
+    /// [`Self::row_flex_third_contract_from_base`] reuses across every
+    /// coefficient axis of a Jeffreys all-axes sweep.
+    ///
+    /// The intercept solves, cached partitions, and exact base timepoints
+    /// depend only on the row (its `q`-geometry and the current `β`), not on
+    /// the contraction direction `dir`. Hoisting them out of the per-axis loop
+    /// turns the all-axes flex third contraction from a `p`-fold rebuild into a
+    /// build-once + `p` cheap directional contractions — the #979 flex hot path.
+    pub(crate) fn build_row_flex_third_base_with_states(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        primary: &FlexPrimarySlices,
+    ) -> Result<FlexThirdRowBase, String> {
         let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
         let q0 = q_geom.q0;
         let q1 = q_geom.q1;
@@ -65,12 +84,12 @@ impl SurvivalMarginalSlopeFamily {
             Some((row, SurvivalInterceptSlotKind::Exit)),
         )?;
 
-        let entry_cached = self.build_cached_partition(&primary, a0, g, beta_h, beta_w)?;
-        let exit_cached = self.build_cached_partition(&primary, a1, g, beta_h, beta_w)?;
+        let entry_cached = self.build_cached_partition(primary, a0, g, beta_h, beta_w)?;
+        let exit_cached = self.build_cached_partition(primary, a1, g, beta_h, beta_w)?;
 
         let entry = self.compute_survival_timepoint_exact_from_cached(
             row,
-            &primary,
+            primary,
             q0,
             primary.q0,
             a0,
@@ -84,7 +103,7 @@ impl SurvivalMarginalSlopeFamily {
         )?;
         let exit = self.compute_survival_timepoint_exact_from_cached(
             row,
-            &primary,
+            primary,
             q1,
             primary.q1,
             a1,
@@ -107,29 +126,68 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
 
-        let entry_ext = self.compute_survival_timepoint_directional_exact_from_cached(
+        Ok(FlexThirdRowBase {
             row,
-            &primary,
+            p: primary.total,
+            qd1_index: primary.qd1,
+            qd1,
             q0,
-            primary.q0,
+            q1,
+            q0_index: primary.q0,
+            q1_index: primary.q1,
             a0,
+            a1,
             g,
+            beta_h: beta_h.cloned(),
+            beta_w: beta_w.cloned(),
+            entry_cached,
+            exit_cached,
+            entry_base: block10_pack_base(&entry),
+            exit_base: block10_pack_base(&exit),
+        })
+    }
+
+    /// Contract the third-order tensor of a row against a single direction,
+    /// reusing the direction-independent [`FlexThirdRowBase`]. Only the
+    /// directional timepoint extensions and the Block 10 third-contraction
+    /// assembly are recomputed per axis. Bit-identical to the inline path that
+    /// [`Self::row_flex_primary_third_contracted_exact`] previously ran.
+    pub(crate) fn row_flex_third_contract_from_base(
+        &self,
+        base: &FlexThirdRowBase,
+        dir: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let p = base.p;
+        if dir.iter().all(|v| v.abs() == 0.0) {
+            return Ok(Array2::<f64>::zeros((p, p)));
+        }
+        let primary = flex_primary_slices(self);
+        let beta_h = base.beta_h.as_ref();
+        let beta_w = base.beta_w.as_ref();
+
+        let entry_ext = self.compute_survival_timepoint_directional_exact_from_cached(
+            base.row,
+            &primary,
+            base.q0,
+            base.q0_index,
+            base.a0,
+            base.g,
             beta_h,
             beta_w,
-            &entry_cached,
+            &base.entry_cached,
             dir,
             false,
         )?;
         let exit_ext = self.compute_survival_timepoint_directional_exact_from_cached(
-            row,
+            base.row,
             &primary,
-            q1,
-            primary.q1,
-            a1,
-            g,
+            base.q1,
+            base.q1_index,
+            base.a1,
+            base.g,
             beta_h,
             beta_w,
-            &exit_cached,
+            &base.exit_cached,
             dir,
             true,
         )?;
@@ -138,21 +196,19 @@ impl SurvivalMarginalSlopeFamily {
         // pure assembler in `crate::families::survival::marginal_slope::gpu`.  This is the
         // single source of truth for the third-contraction inner loop —
         // shared with the GPU dispatch path so CPU/GPU cannot drift.
-        let entry_b = block10_pack_base(&entry);
-        let exit_b = block10_pack_base(&exit);
         let entry_d = block10_pack_dir(&entry_ext);
         let exit_d = block10_pack_dir(&exit_ext);
         let dir_vec: Vec<f64> = dir.to_vec();
         let inputs =
             crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10ThirdInputs {
                 p,
-                qd1_index: primary.qd1,
-                qd1,
-                w: self.weights[row],
-                d: self.event[row],
+                qd1_index: base.qd1_index,
+                qd1: base.qd1,
+                w: self.weights[base.row],
+                d: self.event[base.row],
                 dir: &dir_vec,
-                entry_base: &entry_b,
-                exit_base: &exit_b,
+                entry_base: &base.entry_base,
+                exit_base: &base.exit_base,
                 entry_ext: &entry_d,
                 exit_ext: &exit_d,
             };

@@ -947,52 +947,6 @@ impl ImplicitDesignPsiDerivative {
         Ok(self)
     }
 
-    /// Install the mean-centering `axis_combinations` that map the per-axis
-    /// centered-contrast (ψ) derivatives this operator natively produces to the
-    /// RAW per-axis log-scale (η) derivatives the κ-optimizer and the
-    /// outer-gradient FD audit actually use (gam#1376, the large-n mirror of the
-    /// dense `build_matern_basis_log_kappa_aniso_derivatives` centering).
-    ///
-    /// The anisotropic metric uses centered contrasts ψ_a = η_a − mean(η)
-    /// (`centered_aniso_metric_weights` / `aniso_distance`), so a uniform shift
-    /// of every η_a is a no-op and the raw-η derivative is the centering
-    /// projection of the per-axis ψ derivative:
-    ///
-    ///     ∂F/∂η_a = ∂F/∂ψ_a − (1/d) Σ_b ∂F/∂ψ_b,
-    ///
-    /// i.e. axis `a` becomes the linear combination `e_a − (1/d)·1` over the raw
-    /// per-axis contributions. The existing `axis_combinations` machinery
-    /// evaluates exactly that (`transformed_first_kernel_value` contracts the
-    /// combo against the per-axis `s_b`, and `transformed_second_kernel_value`
-    /// the combo-overlap), so installing the centering combos yields BOTH the
-    /// raw-η first derivative AND the consistent raw-η second derivative
-    /// `Pᵀ H^ψ P` (P = I − 11ᵀ/d, symmetric idempotent) on every accessor with
-    /// no call-site change. The combo column-sum is `1 − d·(1/d) = 0`, so the
-    /// `psi_scale_share·coeff_sum·phi` isotropic term correctly vanishes along
-    /// the all-ones direction.
-    ///
-    /// The dense aniso path centers its first-derivative blocks
-    /// (`design_first` / `penalties_first`) in
-    /// `build_matern_basis_log_kappa_aniso_derivatives`; this is the operator
-    /// (large-n) counterpart, and additionally carries the second-derivative
-    /// centering the dense path will gain so the two stay the same gauge.
-    pub(crate) fn with_raw_eta_centering(mut self) -> Self {
-        let d = self.n_axes;
-        if d <= 1 {
-            return self;
-        }
-        let inv_d = 1.0 / d as f64;
-        let combos: Vec<Vec<(usize, f64)>> = (0..d)
-            .map(|a| {
-                (0..d)
-                    .map(|b| (b, if b == a { 1.0 - inv_d } else { -inv_d }))
-                    .collect()
-            })
-            .collect();
-        self.axis_combinations = Some(combos);
-        self
-    }
-
     /// Dimension after kernel constraint + polynomial padding (before full ident).
     pub(crate) fn p_after_pad(&self) -> usize {
         let p_constrained = self.p_constrained();
@@ -2640,16 +2594,18 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
         should_use_implicit_operators_with_policy(n, p_final, dim, &policy);
     let operator_only = force_operator || dense_derivatives_exceed_budget;
     let cache_radial_components = should_cache_implicit_radial_components(n, k, dim, &policy);
-    // gam#1376 — the Matérn anisotropic metric uses CENTERED contrasts
-    // ψ_a = η_a − mean(η), so the raw-η derivative the κ-optimizer/FD-audit use
-    // is the centering projection of the per-axis ψ derivative. The dense path
-    // centers its materialized first-derivative blocks downstream
-    // (`build_matern_basis_log_kappa_aniso_derivatives`); the operator path must
-    // carry the same centering itself (its `design_first` is empty and it is
-    // consumed directly). Install it ONLY for the Matérn family — Duchon η is a
-    // fixed, geometry-derived basis parameter (never a κ-optimizer axis), so its
-    // operator stays in the native per-axis ψ frame.
-    let center_for_raw_eta = matches!(radial_kind, RadialScalarKind::Matern { .. });
+    // gam#1376 — the per-axis ψ derivatives this operator produces are ALREADY
+    // the derivatives w.r.t. the κ-optimizer's raw coordinate, so NO cross-axis
+    // centering projection is installed (for any family). The optimizer's per-
+    // axis coordinate `psi_a` is decoded into both the global length scale
+    // `ℓ = exp(−mean(psi))` and the centered contrast `eta_a = psi_a − mean(psi)`
+    // simultaneously; in the kernel argument `x² = r²/ℓ² = Σ_a exp(2·psi_a)·h_a²`
+    // the `mean(psi)` cancels, so the effective per-axis exponent is the raw
+    // `psi_a` and `∂φ/∂psi_a = q·s_a` is the native per-axis ψ derivative. The
+    // earlier `with_raw_eta_centering` projection annihilated the all-ones
+    // (global-scale) direction and broke the analytic↔FD match (rel≈0.85). The
+    // dense path (`build_matern_basis_log_kappa_aniso_derivatives`) is corrected
+    // identically — it no longer centers downstream.
 
     // ── Streaming path: large scale ─────────────────────────────────────
     // When even the compact radial cache would exceed the operator-cache
@@ -2658,7 +2614,7 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
     // path below caches phi/q/t/s_a without materializing dense derivative
     // matrices.
     if operator_only && !cache_radial_components {
-        let mut op = ImplicitDesignPsiDerivative::new_streaming(
+        let op = ImplicitDesignPsiDerivative::new_streaming(
             shared_owned_data_matrix_from_view(data),
             shared_owned_centers_matrix_from_view(centers),
             eta.to_vec(),
@@ -2667,9 +2623,6 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
             full_ident_transform,
             n_poly,
         );
-        if center_for_raw_eta {
-            op = op.with_raw_eta_centering();
-        }
         return Ok(AnisoBasisPsiDerivatives {
             design_first: Vec::new(),
             design_second_diag: Vec::new(),
@@ -2805,7 +2758,7 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
         )));
     }
 
-    let mut op = ImplicitDesignPsiDerivative::new(
+    let op = ImplicitDesignPsiDerivative::new(
         phi_values,
         q_values,
         t_values,
@@ -2819,30 +2772,16 @@ pub(crate) fn build_aniso_design_psi_derivatives_shared(
     )
     .with_psi_scale_share(psi_scale_share);
 
-    // gam#1376 — install the raw-η mean-centering on the operator BEFORE it is
-    // used (operator-only matvecs OR dense materialization below). The combo
-    // machinery applies (I − 11ᵀ/d) to BOTH the first derivative and the
-    // second (`PᵀH^ψP`), so every design derivative this function emits — the
-    // operator's matvecs, the materialized dense `design_first` /
-    // `design_second_diag`, and the cross-second derivatives the consumer pulls
-    // from the operator — is in the SAME raw-η gauge. Centering the operator
-    // before `materialize_*` is what makes the dense (small-n) path
-    // PᵀHP-consistent with the operator (large-n) path; the dense first/diag
-    // blocks come out already centered, so NO separate per-axis mean-subtraction
-    // is applied downstream (that would double-center).
-    if center_for_raw_eta {
-        op = op.with_raw_eta_centering();
-    }
+    // gam#1376 — the operator stays in the NATIVE per-axis ψ frame (no
+    // `with_raw_eta_centering`): the κ-optimizer coordinate `psi_a` already maps
+    // to the effective per-axis exponent `psi_a` of the kernel argument (the
+    // `mean(psi)` it injects into the centered contrast is exactly cancelled by
+    // the `ℓ = exp(−mean(psi))` it injects into the length scale), so the native
+    // `∂φ/∂psi_a` produced by `materialize_first`/`materialize_second_*` (and by
+    // the operator matvecs) is the correct raw-coordinate derivative. The
+    // earlier centering broke the analytic↔FD match — see the comment above.
 
     if operator_only {
-        // Operator is the SOLE derivative source here (dense blocks empty), so it
-        // must carry the raw-η centering itself (gam#1376). In the dense+operator
-        // mixed path below the operator only supplies cross-second derivatives
-        // and the dense blocks carry the (downstream-centered) first/diag terms,
-        // so it stays in the native ψ frame there to avoid a gauge mismatch.
-        if center_for_raw_eta {
-            op = op.with_raw_eta_centering();
-        }
         return Ok(AnisoBasisPsiDerivatives {
             design_first: Vec::new(),
             design_second_diag: Vec::new(),

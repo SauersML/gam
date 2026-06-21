@@ -550,20 +550,23 @@ pub(crate) fn canonicalize_softmax_logits(logits: &mut Array2<f64>) {
     }
 }
 
-/// Deterministic ordered geometric-shrinkage MAP weights
-/// `π_k = (α/(α+1))^k` for k = 0, .., K-1, with the first atom intentionally
-/// left unshrunk (`π_0 = 1`, the always-available base atom). This is NOT a
-/// sampled or variational Indian-Buffet-Process posterior: it is a fixed,
-/// deterministic per-atom shrinkage schedule that biases assignment mass to
-/// decay geometrically with atom index even when logits are tied. `α` is a
-/// shrinkage rate (larger `α` ⇒ slower decay), not an IBP concentration in the
-/// sampling sense. The geometric form coincides with the prior means of a
-/// Beta(α, 1) stick-breaking construction, which is the motivation for the
-/// schedule, but no sticks are drawn here.
-pub(crate) fn ibp_stick_breaking_prior(k_atoms: usize, alpha: f64) -> Array1<f64> {
-    // Accumulate the geometric schedule `π_k = ratio^k` in LOG space so the
+/// Truncated Indian-Buffet-Process stick-breaking prior *means*
+/// `π_k = E[∏_{j=0}^{k} v_j] = (α/(α+1))^{k+1}` for k = 0, .., K-1, with sticks
+/// `v_j ~ Beta(α, 1)` so `E[v_j] = α/(α+1)`. EVERY atom (including the first,
+/// `π_0 = α/(α+1)`) carries the consistent Beta(α, 1) shrinkage: there is no
+/// special-cased always-on base atom, so `α` behaves as a genuine IBP
+/// concentration — larger `α` ⇒ heavier mass / slower decay, `α → 0` ⇒ all mass
+/// collapses onto nothing, matching the stick-breaking limit. This is the
+/// deterministic MAP / mean-field form of the IBP prior (the closed form the
+/// analytic Newton / Hessian / Woodbury machinery differentiates); no sticks are
+/// *sampled* here, the per-atom weight is the exact expectation of the
+/// stick-breaking product. (#614: previously `π_0 = 1` left the first atom
+/// unshrunk, which is the prior mean of NO stick at all and broke α's role as a
+/// concentration; the consistent product mean restores genuine IBP semantics.)
+pub(crate) fn ordered_geometric_shrinkage_prior(k_atoms: usize, alpha: f64) -> Array1<f64> {
+    // Accumulate the geometric schedule `π_k = ratio^(k+1)` in LOG space so the
     // prior stays a finite *soft* weight even for large `K`. The naive product
-    // `acc *= ratio` underflows to exact `0.0` once `ratio^k < f64::MIN_POSITIVE`
+    // `acc *= ratio` underflows to exact `0.0` once `ratio^(k+1) < f64::MIN_POSITIVE`
     // (e.g. `(0.1/1.1)^320`), which would turn the soft shrinkage prior into a
     // HARD mask: such atoms would receive zero assignment AND zero logit
     // gradient (the gradient is multiplied by `π_k`), so they could never
@@ -573,17 +576,20 @@ pub(crate) fn ibp_stick_breaking_prior(k_atoms: usize, alpha: f64) -> Array1<f64
     let mut out = Array1::<f64>::zeros(k_atoms);
     let log_ratio = (alpha / (alpha + 1.0)).ln();
     for k in 0..k_atoms {
-        let log_pi = (k as f64) * log_ratio;
+        // π_k = (α/(α+1))^{k+1}: the product of (k+1) i.i.d. Beta(α,1) stick
+        // means, so atom 0 is also shrunk by one stick (E[v_0] = α/(α+1)).
+        let log_pi = ((k + 1) as f64) * log_ratio;
         out[k] = log_pi.exp().max(f64::MIN_POSITIVE);
     }
     out
 }
 
 /// IBP-MAP row activations: per-atom sigmoid likelihood times the truncated
-/// stick-breaking prior mass. With tied logits the prior dominates and yields
-/// strictly decreasing activations in atom index.
+/// stick-breaking prior mean `π_k = (α/(α+1))^{k+1}`. With tied logits the prior
+/// dominates and yields strictly decreasing activations in atom index, with the
+/// first atom already shrunk by one Beta(α,1) stick mean (no unshrunk base atom).
 pub fn ibp_map_row(logits: ArrayView1<'_, f64>, temperature: f64, alpha: f64) -> Array1<f64> {
-    let prior = ibp_stick_breaking_prior(logits.len(), alpha);
+    let prior = ordered_geometric_shrinkage_prior(logits.len(), alpha);
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
         out[i] = crate::linalg::utils::stable_logistic(logits[i] / temperature) * prior[i];
@@ -593,8 +599,9 @@ pub fn ibp_map_row(logits: ArrayView1<'_, f64>, temperature: f64, alpha: f64) ->
 
 /// IBP-MAP activations together with the diagonal Jacobian `∂z_k/∂l_k`,
 /// shared with the torch autograd `Function` so the Python IBP-Gumbel path
-/// applies the same stick-breaking prior `π_k` and temperature scaling as the
-/// Rust closed form. With `z_k = σ(l_k/τ)·π_k` the per-atom derivative is
+/// applies the same stick-breaking prior mean `π_k = (α/(α+1))^{k+1}` and
+/// temperature scaling as the Rust closed form. With `z_k = σ(l_k/τ)·π_k` the
+/// per-atom derivative is
 /// `σ(l_k/τ)(1 − σ(l_k/τ))·π_k / τ`; the map is diagonal in `k`, so the
 /// Jacobian is returned as the per-atom diagonal vector.
 #[must_use]
@@ -603,7 +610,7 @@ pub fn ibp_map_row_value_grad(
     temperature: f64,
     alpha: f64,
 ) -> (Array1<f64>, Array1<f64>) {
-    let prior = ibp_stick_breaking_prior(logits.len(), alpha);
+    let prior = ordered_geometric_shrinkage_prior(logits.len(), alpha);
     let inv_tau = 1.0 / temperature;
     let mut value = Array1::<f64>::zeros(logits.len());
     let mut grad = Array1::<f64>::zeros(logits.len());

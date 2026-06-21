@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::families::jet_scalar::{JetScalar, OneSeed, TwoSeed};
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurvivalExactRowKernel {
     pub(crate) w: f64,
@@ -433,20 +435,15 @@ impl SurvivalLsRowKernel<'_> {
         ]
     }
 
-    pub(crate) fn row_nll_tower(
+    /// The row's exact f64 derivative-stack kernel and the nine primary values
+    /// `p` — the scalar-independent inputs the generic row NLL
+    /// ([`sls_row_nll`]) consumes. Computed once per row; reused across every
+    /// `JetScalar` instantiation (value/grad/Hessian, contracted third/fourth).
+    fn row_nll_inputs(
         &self,
         row: usize,
-    ) -> Result<crate::families::jet_tower::Tower4<SLS_ROW_K>, String> {
-        use crate::families::jet_tower::Tower4;
-
+    ) -> Result<([f64; SLS_ROW_K], SurvivalExactRowKernel), String> {
         let p = self.row_primary_values(row);
-        let vars: [Tower4<SLS_ROW_K>; SLS_ROW_K] =
-            std::array::from_fn(|a| Tower4::variable(p[a], a));
-        let inv_sigma_entry = (-vars[7]).exp();
-        let u0 = vars[0] - vars[4] * inv_sigma_entry;
-        let inv_sigma_exit = (-vars[6]).exp();
-        let u1 = vars[1] - vars[3] * inv_sigma_exit;
-        let g = vars[2] + inv_sigma_exit * (vars[3] * vars[8] - vars[5]);
         let state = self.family.row_predictor_state(
             self.dynamic.h_entry[row],
             self.dynamic.h_exit[row],
@@ -459,50 +456,108 @@ impl SurvivalLsRowKernel<'_> {
             .family
             .exact_row_kernel_rescaled(row, state, self.deriv_log_scale)?
             .ok_or_else(|| format!("survival location-scale row {row} has no exact kernel"))?;
+        Ok((p, kernel))
+    }
 
-        let mut nll = u0
-            .compose_unary([
-                kernel.log_s0,
-                -kernel.r0,
-                -kernel.dr0,
-                -kernel.ddr0,
-                -kernel.dddr0,
+    pub(crate) fn row_nll_tower(
+        &self,
+        row: usize,
+    ) -> Result<crate::families::jet_tower::Tower4<SLS_ROW_K>, String> {
+        use crate::families::jet_tower::Tower4;
+
+        let (p, kernel) = self.row_nll_inputs(row)?;
+        let vars: [Tower4<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| Tower4::variable(p[a], a));
+        sls_row_nll(&vars, &kernel)
+    }
+}
+
+/// The survival location-scale row negative log-likelihood, written ONCE over a
+/// generic [`JetScalar<9>`] so a single expression yields every derivative
+/// channel a consumer needs:
+///
+/// * `S = Tower4<9>` → full `(v, g, H, t3, t4)` (the all-channels oracle path,
+///   [`SurvivalLsRowKernel::row_nll_tower`]),
+/// * `S = OneSeed<9>` → the contracted third `Σ_c ℓ_{abc} dir_c` (1.46 KiB/row,
+///   the `RowKernel::row_third_contracted` directional path),
+/// * `S = TwoSeed<9>` → the contracted fourth `Σ_{cd} ℓ_{abcd} u_c v_d`
+///   (2.8 KiB/row, the `RowKernel::row_fourth_contracted` path).
+///
+/// (The packed `Order2<9>` value/grad/Hessian scalar — 728 B — is the base each
+/// of `OneSeed`/`TwoSeed` is built on; it is the channel a future joint-Hessian
+/// cutover would instantiate here once `row_kernel_joint_hessian_supported` is
+/// enabled.)
+///
+/// The nine primary channels are `(h_entry, h_exit, hdot_exit, eta_t_exit,
+/// eta_t_entry, eta_t_deriv, eta_ls_exit, eta_ls_entry, eta_ls_deriv)` — see
+/// [`SurvivalLsRowKernel::row_primary_values`]. From them the survival index
+/// quantities are
+///   `u0 = h_entry − eta_t_entry·e^{−eta_ls_entry}`  (entry / left-truncation),
+///   `u1 = h_exit  − eta_t_exit ·e^{−eta_ls_exit}`   (exit),
+///   `g  = hdot_exit + e^{−eta_ls_exit}·(eta_t_exit·eta_ls_deriv − eta_t_deriv)`
+/// (the event log-density's Jacobian factor), and the NLL is
+///   `w[ logS0(u0) − (1−d)·logS1(u1) − d·(logφ1(u1) + log g(g)) ]`,
+/// each residual-distribution stack `logS/logφ/log g` supplied as a hand-certified
+/// `[f64; 5]` derivative stack on the kernel and entered through
+/// [`JetScalar::compose_unary`]. There is exactly one source for value and every
+/// derivative order (the #736/#932 single-source contract).
+pub(crate) fn sls_row_nll<S: JetScalar<SLS_ROW_K>>(
+    vars: &[S; SLS_ROW_K],
+    kernel: &SurvivalExactRowKernel,
+) -> Result<S, String> {
+    let inv_sigma_entry = vars[7].neg().exp();
+    let u0 = vars[0].sub(&vars[4].mul(&inv_sigma_entry));
+    let inv_sigma_exit = vars[6].neg().exp();
+    let u1 = vars[1].sub(&vars[3].mul(&inv_sigma_exit));
+    let g = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
+
+    let mut nll = u0
+        .compose_unary([
+            kernel.log_s0,
+            -kernel.r0,
+            -kernel.dr0,
+            -kernel.ddr0,
+            -kernel.dddr0,
+        ])
+        .scale(kernel.w);
+    let censored_weight = kernel.w * (1.0 - kernel.d);
+    if censored_weight != 0.0 {
+        nll = nll.add(
+            &u1.compose_unary([
+                kernel.log_s1,
+                -kernel.r1,
+                -kernel.dr1,
+                -kernel.ddr1,
+                -kernel.dddr1,
             ])
-            .scale(kernel.w);
-        let censored_weight = kernel.w * (1.0 - kernel.d);
-        if censored_weight != 0.0 {
-            nll = nll
-                + u1.compose_unary([
-                    kernel.log_s1,
-                    -kernel.r1,
-                    -kernel.dr1,
-                    -kernel.ddr1,
-                    -kernel.dddr1,
-                ])
-                .scale(-censored_weight);
-        }
-        let event_weight = kernel.w * kernel.d;
-        if event_weight != 0.0 {
-            nll = nll
-                + u1.compose_unary([
+            .scale(-censored_weight),
+        );
+    }
+    let event_weight = kernel.w * kernel.d;
+    if event_weight != 0.0 {
+        nll = nll
+            .add(
+                &u1.compose_unary([
                     kernel.logphi1,
                     kernel.dlogphi1,
                     kernel.d2logphi1,
                     kernel.d3logphi1,
                     kernel.d4logphi1,
                 ])
-                .scale(-event_weight)
-                + g.compose_unary([
+                .scale(-event_weight),
+            )
+            .add(
+                &g.compose_unary([
                     kernel.log_g,
                     kernel.d_log_g,
                     kernel.d2_log_g,
                     kernel.d3_log_g,
                     kernel.d4_log_g,
                 ])
-                .scale(-event_weight);
-        }
-        Ok(nll)
+                .scale(-event_weight),
+            );
     }
+    Ok(nll)
 }
 
 /// Materialize `X[row, :]` as a dense length-`ncols` vector (no sparse-aware
@@ -740,7 +795,14 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         row: usize,
         dir: &[f64; SLS_ROW_K],
     ) -> Result<[[f64; SLS_ROW_K]; SLS_ROW_K], String> {
-        Ok(self.row_nll_tower(row)?.third_contracted(dir))
+        // Packed one-seed directional scalar (1.46 KiB/row): the ε-Hessian
+        // channel is exactly `Σ_c ℓ_{abc} dir_c` without materialising the dense
+        // `t3`. Bit-identical to `row_nll_tower(row)?.third_contracted(dir)` by
+        // the `survival_ls_packed_scalar_*` oracle.
+        let (p, kernel) = self.row_nll_inputs(row)?;
+        let vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| OneSeed::seed_direction(p[a], a, dir[a]));
+        Ok(sls_row_nll(&vars, &kernel)?.contracted_third())
     }
 
     fn row_fourth_contracted(
@@ -749,7 +811,13 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         dir_u: &[f64; SLS_ROW_K],
         dir_v: &[f64; SLS_ROW_K],
     ) -> Result<[[f64; SLS_ROW_K]; SLS_ROW_K], String> {
-        Ok(self.row_nll_tower(row)?.fourth_contracted(dir_u, dir_v))
+        // Packed two-seed scalar (2.8 KiB/row): the εδ-Hessian channel is exactly
+        // `Σ_{cd} ℓ_{abcd} u_c v_d` without materialising the dense `t4`.
+        // Bit-identical to `row_nll_tower(row)?.fourth_contracted(u, v)`.
+        let (p, kernel) = self.row_nll_inputs(row)?;
+        let vars: [TwoSeed<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| TwoSeed::seed(p[a], a, dir_u[a], dir_v[a]));
+        Ok(sls_row_nll(&vars, &kernel)?.contracted_fourth())
     }
 }
 
@@ -780,18 +848,22 @@ impl SurvivalLocationScaleFamily {
     /// threshold/log-sigma derivative designs are present.
     #[inline]
     pub(crate) fn row_kernel_directional_supported(&self) -> bool {
-        // The dense `Tower4<9>` directional path materializes a complete
-        // fourth-order tensor over the nine survival location-scale primary
-        // channels. That is the wrong representation here: every row program
-        // builds multiple ~50 KiB tower values and operator chains copy them
-        // by value, which has caused stack overflows and severe timeouts in
-        // exact location-scale survival fits.  The non-wiggle family already
-        // has an exact hand-derived first-directional implementation below
-        // this gate (the same path required for link-wiggle, where the
-        // coefficient-to-primary Jacobian is beta-dependent), so route all
-        // first directional derivatives through that exact implementation
-        // until the generic tower grows a packed/heap-backed tensor layout.
-        false
+        // #932: the directional path no longer builds the dense `Tower4<9>`. The
+        // contracted third/fourth (`row_third_contracted` / `row_fourth_contracted`)
+        // now evaluate the SAME single-sourced row NLL (`sls_row_nll`) through the
+        // PACKED directional scalars `OneSeed<9>` (1.46 KiB) / `TwoSeed<9>`
+        // (2.8 KiB) — the nilpotent ε/δ fold the contraction direction INTO the
+        // differentiation, so only the contracted K×K matrix is carried, never the
+        // full fourth-order tensor. That removes the ~50 KiB per-row tower whose
+        // by-value copies overflowed the stack / timed out the fit (the exact
+        // representation objection this gate was waiting on; module note in
+        // `jet_scalar`). The packed contractions are bit-identical to the dense
+        // `row_nll_tower(row)?.{third,fourth}_contracted(...)` (the
+        // `survival_ls_packed_directional_matches_dense_tower_932` oracle pins this
+        // ≤ 1e-9). Link-wiggle remains a separate carveout
+        // (`row_kernel_supported` gates on `x_link_wiggle.is_none()`), so the
+        // beta-dependent-Jacobian rows still take the hand path below.
+        self.x_link_wiggle.is_none()
     }
 
     pub(crate) fn survival_ls_row_kernel<'a>(

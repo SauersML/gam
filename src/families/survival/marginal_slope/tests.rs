@@ -6314,6 +6314,47 @@ fn survival_jointhessian_flex_no_wiggle_operator_subsample_full_equals_unsampled
     );
 }
 
+/// #979 flex hot path: the build-once all-axes directional-derivative sweep
+/// (`..._flex_no_wiggle_all_axes`) must reproduce calling the single-direction
+/// routine once per coordinate axis. The all-axes path hoists the
+/// direction-independent per-row geometry (intercept solves, cached partitions,
+/// base timepoints) out of the per-axis loop; this asserts the optimization
+/// changes only the cost, never the result. The two paths feed the same per-row
+/// assemblers but run independent rayon reductions, so equality is to a tight
+/// relative tolerance (the same convention the other flex-no-wiggle operator
+/// tests use), not bit-for-bit.
+#[test]
+fn survival_jointhessian_flex_no_wiggle_all_axes_matches_per_axis() {
+    let n = 40usize;
+    let family = make_flex_no_wiggle_test_family(n);
+    let states = flex_no_wiggle_test_block_states(&family);
+    assert!(family.effective_flex_active(&states).unwrap());
+    assert!(!family.flex_timewiggle_active());
+    let slices = block_slices(&family, &states);
+    let p = slices.total;
+    assert!(p >= 2, "test family must exercise multiple axes, got p={p}");
+
+    let all_axes = family
+        .exact_newton_joint_hessian_directional_derivative_flex_no_wiggle_all_axes(&states)
+        .expect("all-axes sweep");
+    assert_eq!(all_axes.len(), p);
+
+    for axis_idx in 0..p {
+        let mut axis = Array1::<f64>::zeros(p);
+        axis[axis_idx] = 1.0;
+        let per_axis = family
+            .exact_newton_joint_hessian_directional_derivative_flex_no_wiggle(&states, &axis)
+            .expect("per-axis directional derivative");
+        let batched = &all_axes[axis_idx];
+        assert_eq!(batched.dim(), per_axis.dim());
+        let rel = rel_diff_array2_survival(batched, &per_axis);
+        assert!(
+            rel < 1e-10,
+            "axis {axis_idx}: build-once all-axes path diverged from per-axis sweep, rel {rel}"
+        );
+    }
+}
+
 #[test]
 fn survival_jointhessian_flex_no_wiggle_operator_subsample_half_scales_correctly() {
     use crate::outer_subsample::OuterScoreSubsample;

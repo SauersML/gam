@@ -454,6 +454,23 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             return Ok(Some(axes));
         }
 
+        // Flex (no time-wiggle, no per-z): route the all-axes sweep through the
+        // build-once path, which constructs the direction-independent per-row
+        // geometry once and contracts it against each axis, rather than the
+        // per-axis loop below that rebuilds that geometry `p` times. This is the
+        // #979 flex marginal-slope hot path. Same per-row assembler as the
+        // per-axis sweep (equal up to the cross-row reduction order).
+        if !self.per_z_logslope_active()
+            && self.effective_flex_active(block_states)?
+            && !self.flex_timewiggle_active()
+        {
+            let axes = self
+                .exact_newton_joint_hessian_directional_derivative_flex_no_wiggle_all_axes(
+                    block_states,
+                )?;
+            return Ok(Some(axes));
+        }
+
         let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)

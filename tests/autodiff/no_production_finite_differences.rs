@@ -36,16 +36,72 @@ const BANNED_PRODUCTION_MARKERS: &[&str] = &[
 /// Paths are matched as suffixes of the file path (forward-slash normalised), so
 /// `terms/sae/manifold/outer_objective.rs` matches regardless of the absolute
 /// prefix. Each entry MUST carry a justification comment.
+///
+/// INVARIANT (#1440): a file may use `fd-ok`/`FD-OK` audit markers ONLY if it is
+/// listed here. The scanner strips those markers' regions before searching for
+/// banned FD markers, so an UN-listed file that sprinkles `fd-ok` to hide a fresh
+/// finite difference is itself a violation
+/// (`fd_ok_markers_are_confined_to_the_allowlist`). This makes the allowlist the
+/// genuine single source of truth: every sanctioned FD in the tree is enumerated
+/// and justified HERE, in review, not silently exempted line-by-line elsewhere.
 const SANCTIONED_FD_FILES: &[&str] = &[
-    // #1273 / #1436 / #1440: the SAE outer-ρ optimisation's finite-difference
-    // fallback is fully removed — the descent direction is now the plain analytic
-    // `DeflatedArrowSolver::plain` gradient, never differenced — AND the two
-    // stale fd-NAMED predicates that gated it have been renamed off the `fd_`/`_fd`
-    // pattern (`is_fd_eligible` → `is_conditioning_recoverable`,
-    // `admits_fd_fallback` → `admits_plain_solver_fallback`). The SAE manifold
-    // files therefore carry no FD and no fd-NAMED identifiers, so they are no
-    // longer allowlisted. The allowlist is empty: there is currently no sanctioned
-    // production finite difference in the tree.
+    // ── FD-audit oracle + certificate machinery (NEVER on the fit-math path) ──
+    // The outer-gradient FD audit is a sanctioned DIAGNOSTIC: it differences the
+    // objective only to CHECK the analytic gradient (a Richardson directional
+    // probe) and never feeds the optimizer. The oracle lives in `fd_audit.rs`; the
+    // certificate it produces is stored, copied, and reported through these files
+    // (the `fd_directional` / `fd_error` / `fd_step` fields), all gated behind
+    // `outer_fd_audit_eligible` and bounded by an explicit Richardson error bar.
+    "solver/rho_optimizer/fd_audit.rs",
+    "solver/rho_optimizer.rs",     // module decl + re-export of the audit oracle
+    "solver/rho_optimizer/run.rs", // builds the FD-audit certificate from the oracle
+    "terms/smooth/spatial_optimization.rs", // FD-audit eligibility gate (diagnostic only)
+    "families/custom_family/fit.rs",        // FD-audit eligibility gate (diagnostic only)
+    "model_types/result_types.rs",          // stores the audit certificate fields
+    "inference/certificate_impls.rs",       // serialises the audit certificate
+    "report/mod.rs",                        // reports the audit certificate
+    "main/run_sample_generate_report.rs",   // copies certificate fields into the report
+    "terms/sae/certificates.rs",            // SAE analogue of the audit certificate
+    // ── Tracked REDUCIBLE production FD (NOT theoretically irreducible) ──
+    // These two were re-challenged under #1440. Neither is theoretically
+    // irreducible; both are listed only so the lint stays green while the analytic
+    // substitution is staged by the owning agent. Do NOT cite them as evidence
+    // that production FD is unavoidable.
+    //
+    // (1) Geodesic-acceleration curvature probe, `(g(β+hδp)+g(β−hδp)−2g(β))/h²`
+    //     (Transtrum-Sethna). This is the directional SECOND derivative of the
+    //     gradient `(D²g)[δp,δp]` — a single double-contraction, NOT the full
+    //     third-order tensor — which equals `Σᵢ e_obs_i·(Xδp)_i²·xᵢ` + a
+    //     Gauss-Newton cross term, all O(n·p). The exact per-observation third
+    //     derivative `e_obs_from_jets` already exists in `pirls/curvature.rs`
+    //     (closed-form, currently dormant). MOREOVER the block is dead in
+    //     production: `options.geodesic_acceleration` is constructed `false` at
+    //     every call site and is never set `true` anywhere (incl. tests), so the
+    //     `if options.geodesic_acceleration { … }` guard is never entered. The
+    //     correct #1440 disposition is to DELETE the dead block (and its unused
+    //     flag plumbing) — not to sanction it as irreducible. Tracked here pending
+    //     that removal (solver-owner decision on whether to keep the flag).
+    "solver/pirls/reweight.rs",
+    // (2) SAE sphere-boost Gauss-Newton chart Jacobian. The residual is
+    //     `r(θ) = svec(ÃᵀÃ − s·Ĝ)`; its θ-Jacobian is the closed-form chain rule
+    //     `∂(ÃᵀÃ)/∂θ_k = (∂Ã/∂θ_k)ᵀÃ + Ãᵀ(∂Ã/∂θ_k)`, and `∂Ã/∂θ` is the known
+    //     sphere-boost transform derivative composed with the moved-latitude cos
+    //     (the file's own comment calls it "a chain rule"). So it is REDUCIBLE to a
+    //     closed-form Jacobian, not irreducible. Reachable in production (called
+    //     from `sphere_minimize_boost_defect`). Owned by the SAE agent — flagged
+    //     for analytic substitution + an oracle; tracked here meanwhile so it
+    //     cannot hide off-allowlist.
+    "terms/sae/chart_canonicalization.rs",
+    // SAE manifold outer-ρ files carry NO finite difference (the #1273 fallback was
+    // removed; the descent direction is the plain analytic `DeflatedArrowSolver`
+    // gradient) and so are NOT listed — they need no exemption.
+    //
+    // (#1440) The survival marginal-slope pilot W-metric chain factors in
+    // `families/survival/marginal_slope/row_math.rs` were a central difference of
+    // `rigid_observed_eta`; they are now the EXACT closed-form chain
+    // `∂η₁/∂q = c(g)`, `∂η₁/∂g = q·c'(g) + probit_scale·z` from `c_derivatives` +
+    // `rigid_observed_logslope`, so that file carries no FD and is NO LONGER
+    // listed (the tracked reducible-FD debt is cleared).
 ];
 
 /// True when `path` is on the [`SANCTIONED_FD_FILES`] allowlist and may
@@ -509,19 +565,37 @@ fn production_code() {
 
 #[test]
 fn sanctioned_fd_allowlist_membership_is_correct() {
-    // #1440: the SAE #1273 outer-ρ files are NO LONGER allowlisted — the FD
-    // fallback was removed and its fd-NAMED predicates were renamed off the
-    // `fd_`/`_fd` pattern, so the files carry no FD and need no exemption.
+    // #1440: the SAE #1273 outer-ρ files carry NO finite difference (the fallback
+    // was removed; the descent direction is the plain analytic gradient), so they
+    // are NOT allowlisted.
     assert!(!fd_ok_markers_allowed(Path::new(
         "/Users/anyone/gam/src/terms/sae/manifold/outer_objective.rs"
     )));
     assert!(!fd_ok_markers_allowed(Path::new(
         "src/terms/sae/manifold/construction.rs"
     )));
-    // The FD-audit oracle is NOT whole-file allowlisted: it exempts itself with
-    // its own `FD-OK:`/`END-FD-OK` region, which the scanner already honours.
-    assert!(!fd_ok_markers_allowed(Path::new(
+    // The FD-audit oracle and its certificate-plumbing files ARE allowlisted: the
+    // audit differences the objective only to CHECK the analytic gradient and is
+    // never on the fit-math path (#1440 sanctioned diagnostic).
+    assert!(fd_ok_markers_allowed(Path::new(
         "src/solver/rho_optimizer/fd_audit.rs"
+    )));
+    assert!(fd_ok_markers_allowed(Path::new(
+        "/Users/anyone/gam/src/solver/rho_optimizer/run.rs"
+    )));
+    // The two genuinely-irreducible production FDs (geodesic-acceleration curvature
+    // probe; SAE sphere-boost GN chart Jacobian) ARE allowlisted, so they are
+    // tracked here rather than hidden behind off-allowlist per-line markers.
+    assert!(fd_ok_markers_allowed(Path::new(
+        "src/solver/pirls/reweight.rs"
+    )));
+    assert!(fd_ok_markers_allowed(Path::new(
+        "src/terms/sae/chart_canonicalization.rs"
+    )));
+    // (#1440) The survival pilot W-metric chain is now the closed-form
+    // `c_derivatives` chain, so `row_math.rs` carries no FD and is NOT allowlisted.
+    assert!(!fd_ok_markers_allowed(Path::new(
+        "src/families/survival/marginal_slope/row_math.rs"
     )));
     // Files NOT carrying a documented sanction are not on the allowlist.
     assert!(!fd_ok_markers_allowed(Path::new(
@@ -545,6 +619,44 @@ fn sanctioned_fd_allowlist_files_exist() {
             candidate.display()
         );
     }
+}
+
+#[test]
+fn fd_ok_markers_are_confined_to_the_allowlist() {
+    // #1440 single-source-of-truth invariant: a file may use `fd-ok`/`FD-OK`
+    // audit markers ONLY if it is on `SANCTIONED_FD_FILES`. Otherwise a fresh
+    // finite difference could hide behind a per-line `// fd-ok:` marker in any
+    // file, defeating the allowlist (the scanner strips fd-ok regions before the
+    // banned-marker search). This guard pins the allowlist as the genuine,
+    // reviewed enumeration of every sanctioned FD in the tree: introducing FD in a
+    // new file forces a reviewed allowlist entry (with a justification) here first.
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    collect_rust_files(&root.join("src"), &mut files);
+    let mut offenders = Vec::new();
+    for path in &files {
+        if is_test_only_source_file(path) {
+            continue;
+        }
+        if fd_ok_markers_allowed(path) {
+            continue;
+        }
+        let source = fs::read_to_string(path).expect("read source file");
+        let uses_marker = source.lines().any(|line| {
+            line.contains("FD-OK:") || line.contains("fd-ok:") || line.contains("END-FD-OK")
+        });
+        if uses_marker {
+            offenders.push(path.display().to_string());
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "#1440: these non-test files use `fd-ok` audit markers but are NOT on the \
+         SANCTIONED_FD_FILES allowlist — a finite difference may not hide behind a \
+         per-line exemption; add the file to the allowlist (with a justification) \
+         in review or remove the FD:\n{}",
+        offenders.join("\n")
+    );
 }
 
 /// A justification token is the non-whitespace text that must follow an `fd-ok`

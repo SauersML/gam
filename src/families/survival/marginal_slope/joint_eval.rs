@@ -1551,6 +1551,80 @@ impl SurvivalMarginalSlopeFamily {
         Ok(result)
     }
 
+    /// Build-once all-axes variant of
+    /// [`Self::exact_newton_joint_hessian_directional_derivative_flex_no_wiggle`].
+    ///
+    /// The Jeffreys all-axes sweep needs the directional joint-Hessian for each
+    /// of the `p` coordinate axes. Calling the single-direction routine `p`
+    /// times rebuilds, per row and per axis, the direction-independent flex
+    /// geometry (`q`-geometry, primary Hessian, intercept solves, cached
+    /// partitions, exact base timepoints) — a `p`-fold redundant cost that is
+    /// the #979 flex marginal-slope hot path. This variant builds that geometry
+    /// once per row (`FlexThirdRowBase` + the primary Hessian) and contracts it
+    /// against each axis, so only the per-axis directional pieces are repeated.
+    /// Each output matrix routes through the same per-row assemblers as the
+    /// corresponding single-axis call (`row_flex_third_contract_from_base` +
+    /// `accumulate_directional_joint_hessian_row`), so it equals that call up to
+    /// the cross-row rayon reduction order.
+    pub(crate) fn exact_newton_joint_hessian_directional_derivative_flex_no_wiggle_all_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let slices = block_slices(self, block_states);
+        let primary = flex_primary_slices(self);
+        let p_total = slices.total;
+        let identity_blocks = flex_identity_block_pairs(&primary, &slices);
+        let zeros = || vec![Array2::<f64>::zeros((p_total, p_total)); p_total];
+        let result = (0..self.n)
+            .into_par_iter()
+            .try_fold(zeros, |mut acc, row| -> Result<Vec<Array2<f64>>, String> {
+                // Direction-independent per-row geometry, built once.
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                let h_pi = self
+                    .compute_row_flex_primary_gradient_hessian_exact(
+                        row,
+                        block_states,
+                        &q_geom,
+                        &primary,
+                    )?
+                    .2;
+                let base =
+                    self.build_row_flex_third_base_with_states(row, block_states, &primary)?;
+                // Per-axis: only the primary-direction pullback, the third
+                // contraction against it, and the row accumulation are repeated.
+                for axis_idx in 0..p_total {
+                    let mut axis = Array1::<f64>::zeros(p_total);
+                    axis[axis_idx] = 1.0;
+                    let u_d = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                        row,
+                        block_states,
+                        &slices,
+                        &q_geom,
+                        &axis,
+                    )?;
+                    let t_ud = self.row_flex_third_contract_from_base(&base, &u_d)?;
+                    let h_ud = h_pi.dot(&u_d);
+                    self.accumulate_directional_joint_hessian_row(
+                        row,
+                        &slices,
+                        &q_geom,
+                        &identity_blocks,
+                        h_ud.view(),
+                        t_ud.view(),
+                        &mut acc[axis_idx],
+                    )?;
+                }
+                Ok(acc)
+            })
+            .try_reduce(zeros, |mut a, b| -> Result<_, String> {
+                for (ai, bi) in a.iter_mut().zip(b.into_iter()) {
+                    *ai += &bi;
+                }
+                Ok(a)
+            })?;
+        Ok(result)
+    }
+
     /// Exact second directional derivative for flex without timewiggle.
     /// J constant ⇒ D²H[d,e] = J^T Q[u^d,u^e] J + Σ (T_d·u^e)_r K_r.
     pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_flex_no_wiggle(

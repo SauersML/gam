@@ -1560,6 +1560,76 @@ fn rigid_standard_normal_tower_path_matches_hand_chain_witness() {
     }
 }
 
+/// #932 single-sourcing contract for the rigid standard-normal RowKernel<2>:
+/// the production uncontracted third- AND fourth-order primary tensors must be
+/// the `.t3`/`.t4` channels of the SAME `Tower4<2>` row jet that delivers value /
+/// gradient / Hessian — i.e. the entire derivative tower is mechanically derived
+/// from one row expression, with no parallel hand-written chain-rule engine.
+///
+/// Before the cutover the fourth tensor was assembled by a separate
+/// `RigidStandardNormalChain` (hand Faà-di-Bruno q-chain) that could silently
+/// drift from the tower (the #736/#947 desync genus). This test pins
+/// `rigid_standard_normal_fourth_full == tower.t4` (and the already-cutover
+/// `rigid_standard_normal_third_full == tower.t3`) to bit identity, so any
+/// reintroduction of a divergent non-tower fourth-order path fails here. The
+/// independent-witness arm (`rigid_standard_normal_tower_path_matches_hand_chain_witness`)
+/// then certifies the tower channels themselves against a fully separate
+/// derivation; together they give prod == tower == hand-witness.
+#[test]
+fn rigid_standard_normal_third_fourth_full_are_single_sourced_from_tower_932() {
+    let link = bernoulli_marginal_slope_probit_link();
+    let eta_grid: [f64; 7] = [-6.0, -2.0, -0.4, 0.0, 0.75, 2.25, 6.0];
+    let g_grid = [-1.4, -0.55, 0.0, 0.8, 1.7];
+    let z_grid = [-2.25, -0.35, 0.4, 2.1];
+    for eta in eta_grid {
+        let marginal = bernoulli_marginal_link_map(&link, eta).expect("marginal map");
+        for g in g_grid {
+            for z in z_grid {
+                for y in [0.0, 1.0] {
+                    for weight in [1.0, 1.3] {
+                        for probit_scale in [1.0, 0.7] {
+                            let tower =
+                                rigid_standard_normal_tower(marginal, g, z, y, weight, probit_scale)
+                                    .expect("tower");
+                            let third =
+                                rigid_standard_normal_third_full(marginal, g, z, y, weight, probit_scale)
+                                    .expect("third");
+                            let fourth = rigid_standard_normal_fourth_full(
+                                marginal,
+                                g,
+                                z,
+                                y,
+                                weight,
+                                probit_scale,
+                            )
+                            .expect("fourth");
+                            for a in 0..2 {
+                                for b in 0..2 {
+                                    for c in 0..2 {
+                                        assert_eq!(
+                                            third[a][b][c], tower.t3[a][b][c],
+                                            "third[{a}][{b}][{c}] not single-sourced from tower.t3 \
+                                             (eta={eta} g={g} z={z} y={y} w={weight} scale={probit_scale})"
+                                        );
+                                        for d in 0..2 {
+                                            assert_eq!(
+                                                fourth[a][b][c][d], tower.t4[a][b][c][d],
+                                                "fourth[{a}][{b}][{c}][{d}] not single-sourced from \
+                                                 tower.t4 (eta={eta} g={g} z={z} y={y} w={weight} \
+                                                 scale={probit_scale})"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn pair_distance(lhs: (f64, f64), rhs: (f64, f64)) -> f64 {
     (lhs.0 - rhs.0).abs() + (lhs.1 - rhs.1).abs()
 }

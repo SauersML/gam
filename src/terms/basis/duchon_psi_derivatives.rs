@@ -309,16 +309,23 @@ pub(crate) fn duchon_radial_jets(
         );
     }
 
-    // Assemble the operator scalars directly from the partial-fraction blocks.
-    // This avoids the unstable off-origin subtraction
-    //   t = (phi_rr - phi_r / r) / r^2
-    // in high dimensions, where phi_rr and phi_r / r can be enormous and nearly
-    // cancel long before the final Duchon operator stays moderate.
-    let generic_jets = duchon_operator_jets_from_primary_core(
-        duchon_regularized_operator_core(r_eval, kappa, k_dim, coeffs)?,
-        r_eval,
-        d,
-    );
+    // Assemble the operator scalars. The partial-fraction operator core
+    //   q = Σ a_m q_m + Σ b_n q_n,  t = Σ … (`duchon_regularized_operator_core`)
+    // is a sign-alternating sum whose blocks individually scale like
+    // r^{2m-d}; in high dimensions each block is ~1e3 while the true operator
+    // scalar is ~1e-13, so f64 loses every digit (gam#1424 / gam#1453). For the
+    // genuine Matérn-blend orders, evaluate `(q, t, t_r, t_rr)` via the same
+    // cancellation-free single integral as the kernel value, differentiated
+    // under the integral sign — each w-slice is one well-conditioned
+    // r^a K_ν(c r) term with no cross-block cancellation. The complementary
+    // orders (s = 0 pure polyharmonic, or 2p ≥ d at low d) keep the direct
+    // partial-fraction core, which has no meaningful cancellation there.
+    let operator_core = if duchon_hybrid_stable_integral_applies(p_order, s_order, k_dim) {
+        duchon_hybrid_operator_stable_integral(r_eval, kappa, p_order, s_order, k_dim)?
+    } else {
+        duchon_regularized_operator_core(r_eval, kappa, k_dim, coeffs)?
+    };
+    let generic_jets = duchon_operator_jets_from_primary_core(operator_core, r_eval, d);
     let mut out = DuchonRadialJets {
         phi,
         ..generic_jets

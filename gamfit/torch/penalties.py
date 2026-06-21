@@ -649,8 +649,9 @@ class _JumpReLUSTEFn(torch.autograd.Function):
 class _IBPMapFn(torch.autograd.Function):
     """IBP-MAP concrete relaxation, value+grad from the Rust source of truth.
 
-    Forward returns ``z_k = σ(l_k/τ) · π_k`` where ``π_k = (α/(α+1))^k`` is the
-    truncated stick-breaking prior; backward multiplies the upstream gradient by
+    Forward returns ``z_k = σ(l_k/τ) · π_k`` where ``π_k = (α/(α+1))^(k+1)`` is
+    the consistent truncated stick-breaking prior mean (every atom shrunk by one
+    Beta(α,1) stick, #614); backward multiplies the upstream gradient by
     the diagonal logit Jacobian ``∂z_k/∂l_k`` that Rust returns. Replacing the
     bare ``sigmoid(logits/τ)`` torch path makes torch IBP-Gumbel agree with the
     closed-form ``SaeAssignment`` IBP-MAP assignments (see

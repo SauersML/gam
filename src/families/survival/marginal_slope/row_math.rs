@@ -230,17 +230,16 @@ pub(crate) fn survival_nonrigid_pilot_eta(
     }
     // Per-row chain factors and IRLS gradient/Hessian along η₁.
     //
-    //   η₁ = q·c(g) + s(g)·z   with c(g) = sqrt(1 + s(g)²), s(g) = observed_logslope(g)
+    //   η₁ = q·c(g) + s(g)·z   with c(g) = √(1 + s(g)²), s(g) = observed_logslope(g)
     //   ∂η₁/∂q = c(g)
     //   ∂η₁/∂g = q·c'(g) + s'(g)·z
     //
-    // The chain factors come from `rigid_observed_eta` via numerical
-    // finite-difference on a tiny step (the parametric closed-form
-    // derivatives live further down in `c_derivatives`; reusing it would
-    // couple this helper to private internals, while finite-difference at
-    // 1e-7 is well within the IRLS pilot's accuracy budget — the result is
-    // just used to weight the W metric, not propagated into a final
-    // coefficient).
+    // The chain factors are the EXACT closed forms from `c_derivatives`
+    // (which returns `(c, c', c'', …)`) and `rigid_observed_logslope`
+    // (`s(g) = probit_scale·g`, so `s'(g) = probit_scale`). They weight the
+    // W metric for the pilot IRLS step and are not propagated into a final
+    // coefficient, but the analytic chain is bit-stable and avoids the
+    // step-size/round-off error of a finite difference.
     let mut chain_q = Array1::<f64>::zeros(n);
     let mut chain_g = Array1::<f64>::zeros(n);
     let mut grad_eta1 = Array1::<f64>::zeros(n);
@@ -248,15 +247,10 @@ pub(crate) fn survival_nonrigid_pilot_eta(
     for i in 0..n {
         let g_i = slope[i];
         let z_i = z_primary[i];
-        // FD-OK: non-propagated IRLS pilot W-metric weight (bounded central FD, never enters a final coefficient)
-        let h_fd: f64 = 1.0e-7; // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
-        chain_q[i] = (rigid_observed_eta(q_exit[i] + h_fd, g_i, z_i, probit_scale) // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
-            - rigid_observed_eta(q_exit[i] - h_fd, g_i, z_i, probit_scale)) // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
-            / (2.0 * h_fd); // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
-        chain_g[i] = (rigid_observed_eta(q_exit[i], g_i + h_fd, z_i, probit_scale) // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
-            - rigid_observed_eta(q_exit[i], g_i - h_fd, z_i, probit_scale)) // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
-            / (2.0 * h_fd); // fd-ok: central difference of rigid_observed_eta; weights W metric only, not propagated into final coefficient
-        // END-FD-OK
+        // ∂η₁/∂q = c(g); ∂η₁/∂g = q·c'(g) + s'(g)·z with s'(g) = probit_scale.
+        let (c, c1, ..) = c_derivatives(g_i, probit_scale);
+        chain_q[i] = c;
+        chain_g[i] = q_exit[i] * c1 + probit_scale * z_i;
         // Row gradient and Hessian along η₁ (mirror
         // `survival_pilot_irls_row_metric_at_eta`'s formula):
         //   censored:  d(-log Φ(-η))/dη at weight w·(1-d). The primitive
@@ -899,4 +893,96 @@ pub(crate) struct RowPrimaryBase {
 
 pub(crate) struct EvalCache {
     pub(crate) row_bases: Vec<RowPrimaryBase>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #1440 cutover oracle: the pilot W-metric chain factors are now the EXACT
+    /// closed forms `∂η₁/∂q = c(g)` and `∂η₁/∂g = q·c'(g) + s'(g)·z`
+    /// (`s'(g) = probit_scale`). They used to be a central finite difference of
+    /// `rigid_observed_eta`; this oracle pins that the analytic substitution agrees
+    /// with that retired FD to ~1e-7 across a grid of (q, g, z, probit_scale), so
+    /// the production FD removal is behaviour-preserving.
+    #[test]
+    fn pilot_chain_factors_match_retired_central_difference() {
+        // The retired finite-difference step (was `h_fd = 1e-7`).
+        let h: f64 = 1.0e-7;
+        let grid_q = [-2.5_f64, -0.4, 0.0, 0.7, 3.1];
+        let grid_g = [-1.8_f64, -0.3, 0.0, 0.9, 2.4];
+        let grid_z = [-1.2_f64, 0.0, 0.5, 2.0];
+        let grid_scale = [0.25_f64, 0.6, 1.0, 1.7];
+
+        let mut max_err_q = 0.0_f64;
+        let mut max_err_g = 0.0_f64;
+        for &probit_scale in &grid_scale {
+            for &q in &grid_q {
+                for &g in &grid_g {
+                    for &z in &grid_z {
+                        // Analytic chain (production path).
+                        let (c, c1, ..) = c_derivatives(g, probit_scale);
+                        let chain_q = c;
+                        let chain_g = q * c1 + probit_scale * z;
+
+                        // Retired central difference of `rigid_observed_eta`.
+                        let fd_q = (rigid_observed_eta(q + h, g, z, probit_scale)
+                            - rigid_observed_eta(q - h, g, z, probit_scale))
+                            / (2.0 * h);
+                        let fd_g = (rigid_observed_eta(q, g + h, z, probit_scale)
+                            - rigid_observed_eta(q, g - h, z, probit_scale))
+                            / (2.0 * h);
+
+                        // Relative comparison (the FD truncation/round-off floor at
+                        // h = 1e-7 is ~1e-7 of the magnitude of the derivative).
+                        let scale_q = chain_q.abs().max(1.0);
+                        let scale_g = chain_g.abs().max(1.0);
+                        max_err_q = max_err_q.max((chain_q - fd_q).abs() / scale_q);
+                        max_err_g = max_err_g.max((chain_g - fd_g).abs() / scale_g);
+                    }
+                }
+            }
+        }
+        assert!(
+            max_err_q < 1.0e-6,
+            "∂η₁/∂q analytic vs retired FD mismatch: max rel err {max_err_q:.3e}"
+        );
+        assert!(
+            max_err_g < 1.0e-6,
+            "∂η₁/∂g analytic vs retired FD mismatch: max rel err {max_err_g:.3e}"
+        );
+    }
+
+    /// Sanity: `c_derivatives` itself is the analytic derivative of
+    /// `rigid_observed_scale` (the `c(g)` the chain reuses), and
+    /// `rigid_observed_logslope` is linear in g with slope `probit_scale`. This
+    /// guards the two ingredients the chain depends on, independent of the chain
+    /// assembly above.
+    #[test]
+    fn c_and_logslope_derivatives_match_central_difference() {
+        let h: f64 = 1.0e-7;
+        for &probit_scale in &[0.3_f64, 0.8, 1.5] {
+            for &g in &[-1.4_f64, -0.2, 0.0, 0.6, 2.0] {
+                let (c, c1, ..) = c_derivatives(g, probit_scale);
+                assert!(
+                    (c - rigid_observed_scale(g, probit_scale)).abs() < 1e-12,
+                    "c(g) must equal rigid_observed_scale"
+                );
+                let fd_c1 = (rigid_observed_scale(g + h, probit_scale)
+                    - rigid_observed_scale(g - h, probit_scale))
+                    / (2.0 * h);
+                assert!(
+                    (c1 - fd_c1).abs() / c1.abs().max(1.0) < 1e-6,
+                    "c'(g) analytic vs FD mismatch at g={g}, scale={probit_scale}: {c1} vs {fd_c1}"
+                );
+                let fd_s = (rigid_observed_logslope(g + h, probit_scale)
+                    - rigid_observed_logslope(g - h, probit_scale))
+                    / (2.0 * h);
+                assert!(
+                    (probit_scale - fd_s).abs() < 1e-6,
+                    "s'(g) must equal probit_scale"
+                );
+            }
+        }
+    }
 }
