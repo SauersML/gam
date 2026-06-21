@@ -1059,11 +1059,11 @@ use crate::families::jet_partitions::MultiDirJet as LatentMultiDirJet;
 /// nor `log(max(x, floor))` and would silently mask an upstream domain
 /// failure. Both callers guarantee `x > 0`: one composes at the literal `1.0`
 /// (the normalised log-sum base); the other passes `base`, which is gated by
-/// an explicit `base.is_finite() && base > 0.0` check immediately upstream.
-/// With both callers honouring the contract there is no in-range clamp; a
-/// non-positive `x` yields the honest IEEE result (`-inf`/`NaN`) rather than a
-/// finite fabrication. For all valid `x > 0` the output is bit-identical to the
-/// previous clamped version.
+/// an explicit `base.is_finite() && base > 0.0` check immediately upstream. A
+/// non-positive `x` therefore never reaches here on any supported path; were
+/// one to, the function returns the honest IEEE result (`-inf`/`NaN`) —
+/// identical in debug and release — rather than a finite fabrication. For all
+/// valid `x > 0` the output is bit-identical to the previous clamped version.
 #[inline]
 fn latent_unary_derivatives_log(x: f64) -> [f64; 5] {
     let x2 = x * x;

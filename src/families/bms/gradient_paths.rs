@@ -1398,9 +1398,9 @@ pub(super) fn rigid_standard_normal_neglog_only(
 /// * [`Order2`](super::super::jet_scalar::Order2) → `(v, g, H)`
 ///   ([`rigid_standard_normal_row_kernel`], the inner-Newton path);
 /// * [`OneSeed`](super::super::jet_scalar::OneSeed) → contracted third
-///   ([`rigid_standard_normal_third_contracted_generic`], the directional gate);
+///   `Σ_c ℓ_{abc} dir_c` without materialising `t3` (the directional gate);
 /// * [`TwoSeed`](super::super::jet_scalar::TwoSeed) → contracted fourth
-///   ([`rigid_standard_normal_fourth_contracted_generic`]);
+///   `Σ_{cd} ℓ_{abcd} u_c v_d` without materialising `t4`;
 /// * full [`Tower4`] → every uncontracted channel
 ///   ([`rigid_standard_normal_tower`], feeding the `third_full` / `fourth_full`
 ///   caches).
@@ -1471,52 +1471,6 @@ pub(crate) fn rigid_standard_normal_tower(
     // `TwoSeed` / `Tower4` instantiation of one source of truth.
     let vars: [Tower4<2>; 2] = [Tower4::variable(marginal.eta_value(), 0), Tower4::variable(g, 1)];
     rigid_standard_normal_row_nll_generic(&vars, marginal, z, y, w, probit_scale)
-}
-
-/// Contracted third `Σ_c ℓ_{abc} dir_c` of the rigid standard-normal row NLL,
-/// derived from the single generic expression via the one-seed scalar
-/// [`OneSeed`](super::super::jet_scalar::OneSeed) — the production
-/// `row_third_contracted` directional gate without materialising `t3`.
-#[inline]
-pub(crate) fn rigid_standard_normal_third_contracted_generic(
-    marginal: BernoulliMarginalLinkMap,
-    g: f64,
-    z: f64,
-    y: f64,
-    w: f64,
-    probit_scale: f64,
-    dir: &[f64; 2],
-) -> Result<[[f64; 2]; 2], String> {
-    use crate::families::jet_scalar::OneSeed;
-    let vars: [OneSeed<2>; 2] = [
-        OneSeed::seed_direction(marginal.eta_value(), 0, dir[0]),
-        OneSeed::seed_direction(g, 1, dir[1]),
-    ];
-    let s = rigid_standard_normal_row_nll_generic(&vars, marginal, z, y, w, probit_scale)?;
-    Ok(s.contracted_third())
-}
-
-/// Contracted fourth `Σ_{cd} ℓ_{abcd} u_c v_d` of the rigid standard-normal row
-/// NLL, derived from the single generic expression via the two-seed scalar
-/// [`TwoSeed`](super::super::jet_scalar::TwoSeed) — without materialising `t4`.
-#[inline]
-pub(crate) fn rigid_standard_normal_fourth_contracted_generic(
-    marginal: BernoulliMarginalLinkMap,
-    g: f64,
-    z: f64,
-    y: f64,
-    w: f64,
-    probit_scale: f64,
-    dir_u: &[f64; 2],
-    dir_v: &[f64; 2],
-) -> Result<[[f64; 2]; 2], String> {
-    use crate::families::jet_scalar::TwoSeed;
-    let vars: [TwoSeed<2>; 2] = [
-        TwoSeed::seed(marginal.eta_value(), 0, dir_u[0], dir_v[0]),
-        TwoSeed::seed(g, 1, dir_u[1], dir_v[1]),
-    ];
-    let s = rigid_standard_normal_row_nll_generic(&vars, marginal, z, y, w, probit_scale)?;
-    Ok(s.contracted_fourth())
 }
 
 /// Branch-free `signed`-margin jet for the rigid standard-normal row kernel.
@@ -2083,11 +2037,10 @@ pub(crate) fn unary_derivatives_neglog_phi(x: f64, weight: f64) -> [f64; 5] {
 /// masked. Every caller guarantees `x > 0` before invoking this:
 /// the survival marginal-slope kernels evaluate `log` of the transformed time
 /// derivative `q'(t)·√(1+b²)` only after passing `survival_derivative_guard`
-/// (`q'(t) >= derivative_guard > 0`, `√(1+b²) > 0`). A non-positive `x` yields
-/// the honest IEEE result (`-inf`/`NaN`) rather than a finite fabrication, so the
-/// domain failure propagates as a non-finite value the caller's finite-checks
-/// catch — it is not silently masked, and not a release-noop debug-only
-/// assertion (which repo policy bans).
+/// (`q'(t) >= derivative_guard > 0`, `√(1+b²) > 0`). A non-positive `x`
+/// therefore never reaches here on any supported path; were one to, the
+/// function returns the honest IEEE result (`-inf`/`NaN`) — identical in debug
+/// and release — rather than a finite fabrication.
 pub(crate) fn unary_derivatives_log(x: f64) -> [f64; 5] {
     let x2 = x * x;
     let x3 = x2 * x;

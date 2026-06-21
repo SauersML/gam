@@ -1498,17 +1498,29 @@ impl BernoulliMarginalSlopeFamily {
                             total_cells_us
                         ));
                     }
-                    // Any non-OK status means a cell the kernel refused; the row
-                    // buffer for that cell is zeroed, which is mathematically OK
-                    // (zero moments → zero contribution). This is a benign,
-                    // already-handled condition — not an error — so it is NOT
-                    // asserted (a release-noop debug-only-build check is banned by
-                    // repo policy, and panicking on a refused cell would be wrong,
-                    // mirroring the removed debug-panic on this path).
-                    // The runtime path keeps the device buffer alive on the owned
-                    // bundle and feeds it straight into the row kernel; `status`
-                    // carries no further information here.
-                    drop(status);
+                    // Any non-OK status means a cell the kernel refused; the
+                    // row buffer for that cell is zeroed, which is mathematically
+                    // OK (zero moments → zero contribution) but indicates a
+                    // classifier disagreement worth surfacing. Surface it with a
+                    // runtime log (identical in debug and release) rather than a
+                    // debug-only panic: the zeroed contribution is benign, so a
+                    // disagreement must not crash one build configuration while
+                    // the other sails through.
+                    let refused = status
+                        .iter()
+                        .filter(|&&s| s != CubicCellMomentStatus::Ok as u8)
+                        .count();
+                    if refused > 0 {
+                        log::info!(
+                            "[BMS row-primary-hessian-cache] device-moment kernel refused \
+                             {refused}/{} cell(s) (status != Ok); their row buffers are zeroed \
+                             (a no-op contribution to the Hessian)",
+                            status.len()
+                        );
+                    }
+                    // The runtime path keeps the device buffer alive on the
+                    // owned bundle and lets the launcher feed it straight into
+                    // the row kernel.
                     Some(d_moments)
                 }
                 degraded => {

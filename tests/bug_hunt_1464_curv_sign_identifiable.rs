@@ -113,7 +113,9 @@ fn fit_kappa_hat(kappa_star: f64, seed: u64) -> f64 {
 // for constant-curvature terms so the joint ARC can reach the heavily-smoothed
 // collapsed-kernel basin. With the per-κ REML cost matching the textbook
 // profiled-REML, the curvature SIGN is identifiable again, so this contract
-// PASSES.
+// PASSES. This contract runs unconditionally in CI: re-`#[ignore]`ing it would
+// only hide a future regression behind a skip, which the ban gate forbids and
+// which is exactly the failure mode #1464 was.
 #[test]
 fn curv_full_fit_identifies_curvature_sign_on_mirror_datasets() {
     init_parallelism();
