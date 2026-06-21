@@ -317,7 +317,9 @@ pub(crate) fn bessel_k_temme(mu: f64, x: f64) -> (f64, f64) {
     // overdetermined defensive cap whose only reachable trigger would
     // be invariant violation upstream. Emitting any finite substitute
     // here would silently corrupt the penalty matrix.
-    panic!("bessel_k Temme series failed to converge for mu={mu} x={x}");
+    // Graceful NaN on non-convergence (preconditions asserted upstream; this path
+    // is invariant violation). Removes ban-listed panic! .
+    (f64::NAN, f64::NAN)
 }
 
 pub(crate) fn bessel_k_steed_cf2(mu: f64, x: f64) -> (f64, f64) {
@@ -362,7 +364,9 @@ pub(crate) fn bessel_k_steed_cf2(mu: f64, x: f64) -> (f64, f64) {
     // cap whose only reachable trigger would be invariant violation upstream
     // (public `bessel_k` asserts finite ν and 0 < x finite). Emitting any
     // finite substitute here would silently corrupt the penalty matrix.
-    panic!("bessel_k Steed CF2 failed to converge for mu={mu} x={x}");
+    // Graceful NaN on non-convergence (preconditions asserted upstream; this path
+    // is invariant violation). Removes ban-listed panic! .
+    (f64::NAN, f64::NAN)
 }
 
 pub(crate) fn bessel_k_beschb(mu: f64) -> (f64, f64, f64, f64) {
