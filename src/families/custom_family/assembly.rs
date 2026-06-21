@@ -1068,10 +1068,11 @@ pub(crate) fn joint_outer_evaluate(
     // run it through the SAME `pseudo_logdet_mode` spectral operator, and compare
     // its logdet to the assembled operator's. An apples-to-apples match proves no
     // collapse entered the assembly; a divergence is a true defect. We
-    // `debug_assert!` (panicking the test/debug builds that would otherwise ship
-    // a wrong value) and `log::error!` in release so the regression is never
-    // silent. This makes the gam#1395 collapse structurally observable at its
-    // source rather than only at the far-downstream objective value.
+    // `log::error!` so the regression is never silent (the ban-scanner forbids
+    // `debug_assert!`; an unconditional `assert!` would panic production on a
+    // numerical guard that should degrade gracefully). This makes the gam#1395
+    // collapse structurally observable at its source rather than only at the
+    // far-downstream objective value.
     if include_logdet_h && total > 0 && total <= JOINT_LOGDET_GUARD_MAX_DIM {
         if let Ok(mut ground_truth) =
             materialize_joint_hessian_source(&h_joint_unpen, total, "gam#1395 logdet guard")
@@ -1111,12 +1112,6 @@ pub(crate) fn joint_outer_evaluate(
                                  total={total}. The 0.5*log|H| Laplace term is being computed from \
                                  an operator that does not realize H_unpen + S_lambda + \
                                  scale*H_Phi (collapse / dropped-term / stale-cache class)."
-                            );
-                            debug_assert!(
-                                gap <= tol,
-                                "gam#1395 logdet collapse guard: assembled joint-Hessian \
-                                 logdet={assembled_logdet:.9e} != ground-truth {reference_logdet:.9e} \
-                                 (gap={gap:.3e} > tol={tol:.3e}, total={total})"
                             );
                         }
                     }

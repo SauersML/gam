@@ -84,7 +84,7 @@ pub(crate) use crate::terms::sae::criterion_atoms::SaeCriterion;
 
 pub(crate) use crate::terms::sae::certificates::{
     CriterionCertificate, DirectionalSamples, certificate_from_samples,
-    deterministic_probe_direction, probe_step, probe_step_for,
+    deterministic_probe_direction, probe_step,
 };
 
 pub(crate) use crate::linalg::faer_ndarray::{
@@ -137,6 +137,9 @@ mod term;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod real_data_tests;
 
 #[cfg(test)]
 mod sae_contract_probe_tests;

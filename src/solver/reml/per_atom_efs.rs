@@ -281,38 +281,6 @@ pub(crate) fn sanitize_step(raw: f64) -> f64 {
     }
 }
 
-/// Matrix-free θ-HVP (#740): `v ↦ H_outer · v` over the full ρ-vector, computed
-/// without assembling the O(K²) coordinate-pair outer Hessian.
-///
-/// Realized purely by the exact outer-Hessian operator: when `eval` exposed a
-/// `HessianResult::Operator`, its `matvec` already realizes the IFT-corrected
-/// action — `−H⁻¹ (∂g/∂θ)·v` plus the logdet directional trace, the #740
-/// product — via one inner solve per matvec. We forward `v` to it directly.
-///
-/// There is no finite-difference fallback (#1440): when the family does not
-/// expose an exact operator the caller defers the shared-border coupled
-/// correction to the decoupled per-atom step rather than approximating the
-/// action numerically, so this function requires an operator whose dimension
-/// matches `v`. The returned vector has the full ρ-dimension.
-pub fn theta_hvp_matrix_free(
-    operator: &Arc<dyn OuterHessianOperator>,
-    v: &Array1<f64>,
-) -> Result<Array1<f64>, EstimationError> {
-    if operator.dim() != v.len() {
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "per-atom θ-HVP operator dim {} != vector len {}",
-            operator.dim(),
-            v.len()
-        )));
-    }
-    operator.matvec(v).map_err(|reason| {
-        EstimationError::RemlOptimizationFailed(format!(
-            "per-atom θ-HVP operator matvec failed (dim={}): {reason}",
-            v.len()
-        ))
-    })
-}
-
 /// Assemble the restricted `m × m` outer-Hessian sub-block over the
 /// shared-border axes by probing the exact matrix-free θ-HVP with the `m` border
 /// basis directions, then symmetrizing.
@@ -700,6 +668,28 @@ pub fn run_per_atom_efs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Matrix-free θ-HVP (#740): `v ↦ H_outer · v` over the full ρ-vector.
+    /// Test-only after #1440 removed the production FD fallback caller; the
+    /// exact-operator matvec path it exercises is still validated here.
+    pub(crate) fn theta_hvp_matrix_free(
+        operator: &Arc<dyn OuterHessianOperator>,
+        v: &Array1<f64>,
+    ) -> Result<Array1<f64>, EstimationError> {
+        if operator.dim() != v.len() {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "per-atom θ-HVP operator dim {} != vector len {}",
+                operator.dim(),
+                v.len()
+            )));
+        }
+        operator.matvec(v).map_err(|reason| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "per-atom θ-HVP operator matvec failed (dim={}): {reason}",
+                v.len()
+            ))
+        })
+    }
     use crate::solver::rho_optimizer::{
         DeclaredHessianForm, Derivative, EfsEval, OuterEval, SeedOutcome,
     };
