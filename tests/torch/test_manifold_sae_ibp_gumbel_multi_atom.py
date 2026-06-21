@@ -13,7 +13,7 @@ Three contracts are pinned here, all for ``K=4``:
    ``test_manifold_sae_parity.test_isometry_backward_grad_matches_rust_grad_jacobian``).
 
 3. Stick-breaking prior decay: with tied logits the per-atom mass falls off
-   geometrically as ``pi_k = (alpha/(alpha+1))^k`` — the defining property of
+   geometrically as ``pi_k = (alpha/(alpha+1))^(k+1)`` — the defining property of
    the IBP prior, which a bare ``sigmoid(logits/tau)`` could never produce.
 
 Note: the geometric-decay identity is a property of the *prior map on tied

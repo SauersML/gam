@@ -1665,10 +1665,13 @@ fn seed_oos_ibp_logits_from_projected_decoder_lsq(
 ) {
     let (n_obs, p_out) = target.dim();
     let k_atoms = term.k_atoms();
+    // Consistent truncated IBP stick-breaking prior mean π_k = (α/(α+1))^(k+1)
+    // (#614): the first atom is also shrunk by one Beta(α,1) stick mean, matching
+    // the closed-form `ordered_geometric_shrinkage_prior` the fitter applies.
     let ratio = alpha / (alpha + 1.0);
     let mut prior = Vec::with_capacity(k_atoms);
     for atom_idx in 0..k_atoms {
-        prior.push(ratio.powi(atom_idx as i32).max(f64::MIN_POSITIVE));
+        prior.push(ratio.powi(atom_idx as i32 + 1).max(f64::MIN_POSITIVE));
     }
     let mut decoded = vec![vec![0.0_f64; p_out]; k_atoms];
     let mut norm_sq = vec![0.0_f64; k_atoms];
@@ -6440,11 +6443,24 @@ fn sae_manifold_predict_oos<'py>(
                 let mut paired: Vec<(f64, usize)> = (0..k_atoms)
                     .map(|atom_idx| (assignments[[row, atom_idx]], atom_idx))
                     .collect();
-                paired.sort_by(|a, b| {
+                // #1409: select the top-`k_top` via an O(K) PARTIAL selection
+                // (`select_nth_unstable_by`) instead of a full O(K log K) sort,
+                // mirroring the train-side projection. Only the kept prefix
+                // matters; the comparator (value desc, then atom index asc) is the
+                // SAME total order the sort used, so the partition's first `k_top`
+                // elements are exactly the sorted top-`k_top` set (identical `keep`
+                // mask, including tie-breaking). With the compact softmax active
+                // cap engaged above this projection is a no-op at the optimum, but
+                // it still touches every row once, so the O(K) selection keeps the
+                // per-row cost off the full-`K` sort path at large `K`.
+                let cmp = |a: &(f64, usize), b: &(f64, usize)| {
                     b.0.partial_cmp(&a.0)
                         .unwrap_or(std::cmp::Ordering::Equal)
                         .then(a.1.cmp(&b.1))
-                });
+                };
+                // `k_top < k_atoms` holds in this block (guarded above), so
+                // `k_top - 1` is a valid pivot index.
+                paired.select_nth_unstable_by(k_top - 1, cmp);
                 let mut keep = vec![false; k_atoms];
                 for &(_, atom_idx) in paired.iter().take(k_top) {
                     keep[atom_idx] = true;

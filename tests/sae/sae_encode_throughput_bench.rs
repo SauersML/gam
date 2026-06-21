@@ -384,6 +384,14 @@ fn sae_encode_throughput_decision_gate() {
     // SUFFICIENT condition for the GPU gate — a real GPU benchmark on the device
     // seam is required to certify the deployment target. The assertions below
     // gate only the CPU floor + support-recovery correctness.
+    //
+    // The CPU rate is also OPTIMISTIC by construction, which is fine for a
+    // necessary-condition proxy but must be stated: the arrow-Schur assembly runs
+    // on the default Rayon pool (multi-core, not a single core); the per-row
+    // coordinates are warm-started near the planted truth; and dictionary build +
+    // warm-start happen before the timer (only the inner Newton loop is timed). So
+    // the measured rows/sec over-states a cold single-core encode — it is a
+    // ceiling on CPU difficulty, not a deployment figure.
     println!(
         "GPU deployment gate = {GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU:.0} rows/sec/GPU \
          (NOT measured here — CPU floor below is a proxy, not a GPU measurement; \

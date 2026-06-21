@@ -2849,8 +2849,9 @@ fn gumbel_schedule_tau(schedule: &Bound<'_, PyDict>, iter: usize) -> PyResult<f6
 
 /// IBP-MAP concrete-relaxation activations and their diagonal logit Jacobian.
 ///
-/// Returns `(z, dz_dl)` where `z_k = σ(l_k/τ) · π_k` (stick-breaking prior
-/// `π_k = (α/(α+1))^k`) and `dz_dl_k = ∂z_k/∂l_k`. The map is diagonal in `k`,
+/// Returns `(z, dz_dl)` where `z_k = σ(l_k/τ) · π_k` (consistent stick-breaking
+/// prior mean `π_k = (α/(α+1))^(k+1)`) and `dz_dl_k = ∂z_k/∂l_k`. The map is
+/// diagonal in `k`,
 /// so torch's autograd `Function` multiplies the upstream gradient elementwise
 /// by `dz_dl`. This is the single source of truth shared with the closed-form
 /// `SaeAssignment` IBP path so torch IBP-Gumbel applies the same prior and

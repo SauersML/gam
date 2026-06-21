@@ -646,18 +646,31 @@ where
         // while retaining the weight-scale anchor from issue #877.
         let run_gaussian_anchored_prepass = gaussian_risk && weight_log_geom_mean.abs() > 1e-12;
         // A caller-supplied rho seed (`init_rhos`/`heuristic_lambdas`, now in
-        // rho-space) is an explicit warm-start: it is installed via
-        // `with_initial_rho` above and must NOT be overridden by the
-        // objective-grid prepass, so short-circuit the prepass in that case.
+        // rho-space) is an explicit warm-start installed via `with_initial_rho`
+        // above. It still ANCHORS the objective-grid prepass below rather than
+        // short-circuiting it: the grid is criterion-ranked and only adopts a
+        // candidate that STRICTLY lowers the true REML/LAML cost, so a healthy
+        // warm seed is returned unchanged (the grid never beats it → byte-
+        // identical behaviour). What the anchor-and-rank rescues is a warm seed
+        // TRAPPED in a shallow under-smoothing local basin: when the design's
+        // kernel collapses (e.g. the constant-curvature `curv()` smooth fitted
+        // at a trial κ on the +chart side — the geodesic-exponential kernel's
+        // off-diagonals → 1, so its global REML optimum is a LARGE λ that the
+        // local outer optimizer, warm-started from the previous-κ λ̂, slides away
+        // from into the spurious low-λ optimum). The shallow optimum's
+        // spuriously-low deviance made the κ outer objective monotone toward the
+        // +chart bound for any curved data (gam#1464 — hyperbolic truth recovered
+        // as spherical); anchoring the global grid at the warm seed lets the
+        // prepass jump into the correct high-λ basin so the per-κ REML cost
+        // matches the textbook profiled-REML and the curvature SIGN is
+        // identifiable. Same machinery as the gam#1266 double-penalty rescue.
         let caller_seeded_rho = heuristic_lambdas.is_some_and(|h| h.len() == k);
         // The grid prepass's lowest-cost sample, kept for the #1371
         // release-and-rerank guard even when it is not adopted as the initial
         // seed (i.e. the grid did not strictly move). It is a known-good lower
         // bound on the achievable REML cost, scored with the SAME functional.
         let mut release_rerank_seed: Option<Array1<f64>> = None;
-        let prepass_seed: Option<Array1<f64>> = if caller_seeded_rho {
-            None
-        } else {
+        let prepass_seed: Option<Array1<f64>> = {
             let bnds = reml_seed_config.bounds;
             let (lo, hi_seed) = if bnds.0 <= bnds.1 {
                 bnds
@@ -675,8 +688,10 @@ where
             // moderate λ that leaves wiggle under-penalized (EDF inflated,
             // gam#1266). If the prepass cannot seed past that local optimum, the
             // outer EFS — which only takes cost-improving steps — relaxes back
-            // into it. Widening only the upper (over-smoothing) bound lets the
-            // prepass place the seed in the correct high-λ basin; the lower
+            // into it. The collapsing-kernel spatial smooth (gam#1464) has the
+            // same shape: the high-λ basin sits beyond a shallow low-λ trap.
+            // Widening only the upper (over-smoothing) bound lets the prepass
+            // place the seed in the correct high-λ basin; the lower
             // (under-smoothing) bound stays at the default so we never seed an
             // overfit origin. The seed is still only adopted when it strictly
             // lowers the REML cost, so well-balanced and single-penalty fits are
@@ -689,11 +704,11 @@ where
                 SeedRiskProfile::GeneralizedLinear => 1.0,
                 SeedRiskProfile::Survival => 2.0,
             };
-            // Anchor the default seed origin to the weight scale (issue #877). A
-            // caller-supplied `heuristic_lambdas` is already in rho-space, so it
-            // is used as-is; only the default risk-shift origin is
-            // weight-anchored. (A caller seed short-circuits the prepass above,
-            // so this branch is reached only for a fixed-length-mismatch seed.)
+            // Anchor the grid at the caller-supplied `heuristic_lambdas` when one
+            // is present (it is already in rho-space, used as-is) — the grid then
+            // searches relative to the warm start and keeps it unless a candidate
+            // is strictly better. Otherwise anchor the default risk-shift origin
+            // to the weight scale (issue #877).
             let base = if let Some(h) = heuristic_lambdas.as_ref().filter(|h| h.len() == k) {
                 Array1::from_iter(h.iter().map(|&v| v.clamp(lo, hi)))
             } else {
@@ -718,7 +733,12 @@ where
                 .iter()
                 .zip(base.iter())
                 .any(|(&a, &b)| (a - b).abs() > 1e-12);
-            if grid_moved || run_gaussian_anchored_prepass {
+            // For a caller-seeded fit, adopt the grid result only when it
+            // STRICTLY moved the warm seed (i.e. found a strictly-cheaper basin);
+            // an unmoved grid leaves the warm start exactly as installed above, so
+            // healthy warm-started fits stay byte-identical. The Gaussian
+            // weight-anchored emit only applies on the non-caller-seeded origin.
+            if grid_moved || (run_gaussian_anchored_prepass && !caller_seeded_rho) {
                 log::info!(
                     "[OUTER] standard REML objective-grid selected seed: {:?} -> {:?}",
                     base.as_slice().unwrap_or(&[]),
@@ -862,10 +882,49 @@ where
         // caller pins `init_rhos`, the outer search is warm-started there and
         // the seed is the requested operating point, so report it verbatim
         // rather than the optimizer's (possibly clamped) returned rho.
-        let accepted_rho = heuristic_lambdas
-            .filter(|h| h.len() == k)
-            .map(|h| Array1::from_iter(h.iter().copied()))
-            .unwrap_or_else(|| strategy_result.rho.clone());
+        //
+        // EXCEPTION (gam#1464): a caller seed that arrives as a warm-start hint
+        // (the spatial-κ sweep reuses the previous-κ λ̂ as `heuristic_lambdas`)
+        // must NOT pin the fit at a seed the optimizer has just been able to
+        // strictly improve on. At a collapsing kernel (the constant-curvature
+        // `curv()` smooth on the +κ side) the warm seed sits in a shallow
+        // under-smoothing basin whose spuriously-low deviance, if reported
+        // verbatim, makes the κ outer objective rail to the +chart bound for any
+        // curved data. The objective-grid prepass and the #1371 release-and-
+        // rerank guard above redirect `strategy_result.rho` into the correct
+        // high-λ basin; defer to that converged ρ whenever it is STRICTLY cheaper
+        // than the caller seed under the same REML cost. A genuine user pin (or a
+        // healthy warm start) converges at the seed, so the seed stays cheapest
+        // and is honoured verbatim, byte-for-byte as before.
+        let accepted_rho = match heuristic_lambdas.filter(|h| h.len() == k) {
+            Some(h) => {
+                let seed = Array1::from_iter(h.iter().copied());
+                let prefer_converged = {
+                    let cost_seed = reml_state.compute_cost(&seed).ok();
+                    let cost_converged = reml_state.compute_cost(&strategy_result.rho).ok();
+                    // Restore the cached β̂ to the converged operating point after
+                    // the seed probe (the no-op path below expects β̂ at
+                    // `strategy_result.rho`).
+                    let _ = reml_state.compute_cost(&strategy_result.rho);
+                    match (cost_seed, cost_converged) {
+                        (Some(cs), Some(cc)) if cs.is_finite() && cc.is_finite() => {
+                            cc < cs - 1e-6 * (1.0 + cs.abs())
+                        }
+                        _ => false,
+                    }
+                };
+                if prefer_converged {
+                    log::info!(
+                        "[OUTER] #1464 warm-seed override: converged ρ is strictly cheaper than \
+                         the caller warm seed; reporting the optimizer's ρ instead of the seed"
+                    );
+                    strategy_result.rho.clone()
+                } else {
+                    seed
+                }
+            }
+            None => strategy_result.rho.clone(),
+        };
         (
             accepted_rho,
             cfg.link_kind.mixture_state().cloned(),

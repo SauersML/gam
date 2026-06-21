@@ -1000,6 +1000,64 @@ mod tests {
     }
 
     #[test]
+    pub(crate) fn reset_outer_seed_state_preserves_frozen_negbin_theta_1448() {
+        // #1448 regression: the NB outer θ↔λ alternation loop
+        // (solver/estimate/optimizer.rs) re-runs the ρ search after each θ
+        // refresh by (a) re-freezing the λ-search θ at θ_final into
+        // `frozen_negbin_theta`, then (b) calling `reset_outer_seed_state()` to
+        // drop the caches keyed to the old θ. Step (b) MUST NOT clear the freeze
+        // set in step (a): the capture in `solve_for_unified_rho` only writes the
+        // frozen slot when it is 0, so if the reset zeroed it the next round would
+        // re-derive θ from the seed η and the loop would never reach the (ρ, θ)
+        // joint fixed point — silently regressing #1448 back to a single
+        // freeze→refresh pass.
+        //
+        // This pins the load-bearing distinction between `reset_outer_seed_state`
+        // (alternation-round reset, freeze SURVIVES) and the surface-refresh reset
+        // (new design, freeze re-zeroed). The end-to-end convergence on a real NB
+        // fit is exercised by the public-API path; here we lock the invariant the
+        // loop depends on, next to `reset_outer_seed_state_clears_pirls_cache`.
+        use std::sync::atomic::Ordering;
+
+        let y = array![0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.5, -0.4],
+            [1.0, 0.0, 0.7],
+            [1.0, 0.4, -0.3],
+            [1.0, 0.9, 0.1],
+            [1.0, 1.3, -0.6],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false);
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+
+        // Simulate the alternation loop's re-freeze step: pin θ_final.
+        let theta_final_bits = 2.5_f64.to_bits();
+        state
+            .frozen_negbin_theta
+            .store(theta_final_bits, Ordering::Relaxed);
+        assert_eq!(
+            state.frozen_negbin_theta.load(Ordering::Relaxed),
+            theta_final_bits,
+            "precondition: the re-freeze stores θ_final into the frozen slot"
+        );
+
+        // The alternation loop's per-round reset.
+        state.reset_outer_seed_state();
+
+        assert_eq!(
+            state.frozen_negbin_theta.load(Ordering::Relaxed),
+            theta_final_bits,
+            "reset_outer_seed_state (alternation-round reset) must PRESERVE the \
+             re-frozen NB θ; clearing it would defeat the #1448 θ↔λ alternation \
+             (the next ρ search would re-derive θ from the seed and never reach \
+             the joint fixed point)"
+        );
+    }
+
+    #[test]
     pub(crate) fn implicit_hyper_design_derivative_respects_full_model_embedding() {
         let operator = ImplicitDesignPsiDerivative::new(
             array![1.0, 2.0, 3.0, 4.0],

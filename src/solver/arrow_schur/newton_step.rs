@@ -397,6 +397,7 @@ pub fn solve_with_lm_escalation_inner(
                         | ArrowSchurError::PerRowFactorIllConditioned { .. }
                         | ArrowSchurError::SchurFactorFailed { .. }
                         | ArrowSchurError::PcgFailed { .. }
+                        | ArrowSchurError::UnboundedNegativeCurvature { .. }
                 );
                 last_err = Some(err);
                 if !recoverable {
@@ -1540,6 +1541,9 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                 &backend,
                 options.gpu_matvec.as_ref(),
                 trust_metric_weights,
+                // #1026 — the same opt-in floor the dense path uses, here gating
+                // the matrix-free unbounded-PCG curvature-floor retry.
+                options.schur_pd_floor,
             )?;
             (delta, None, diag)
         }

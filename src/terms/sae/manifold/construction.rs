@@ -1841,12 +1841,14 @@ impl SaeManifoldTerm {
     /// dense-weight assignment mode, and if so derive the per-row active-atom
     /// cap and magnitude cutoff.
     ///
-    /// #1408: although this plan is mode-agnostic, the `assemble_arrow_schur`
-    /// dispatch consults it ONLY for IBP-MAP. `AssignmentMode::Softmax` returns
-    /// `None` at the dispatch before reaching here, so softmax always keeps the
-    /// full `K`-atom layout (folding softmax `top_k` into the compact solve needs
-    /// the active-sub-block Gershgorin majorizer + coherent logdet/θ-adjoint
-    /// extension — see `SaeRowLayout`'s doc). The decision is auto-derived from
+    /// #1408: this plan is mode-agnostic. `assemble_arrow_schur` consults it
+    /// directly for IBP-MAP, and for `AssignmentMode::Softmax` via
+    /// [`Self::softmax_active_plan`], which tightens it with an explicit `top_k`
+    /// (`softmax_active_cap`). Softmax therefore engages the compact active-set
+    /// layout whenever `top_k` or the budget bounds the active set (the
+    /// active-sub-block Gershgorin majorizer + coherent logdet/θ-adjoint are
+    /// landed — see `SaeRowLayout`'s doc); it keeps the full `K`-atom layout only
+    /// when neither lever engages. The decision is auto-derived from
     /// the problem size and the device/host working-set budget — never a CLI flag
     /// or kwarg. JumpReLU is not handled here (it always uses its structural gate
     /// via [`SaeRowLayout::from_jumprelu`]). The dense Gauss-Newton data Gram `G`
@@ -3901,7 +3903,7 @@ impl SaeManifoldTerm {
                     .mode
                     .resolved_ibp_alpha(rho)
                     .ok_or_else(|| "IBP assignment alpha resolution failed".to_string())?;
-                Some(ibp_stick_breaking_prior(k_atoms, alpha).to_vec())
+                Some(ordered_geometric_shrinkage_prior(k_atoms, alpha).to_vec())
             }
             _ => None,
         };
@@ -7276,10 +7278,13 @@ impl SaeManifoldTerm {
             .resolved_ibp_alpha(rho)
             .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
         let k_atoms = self.k_atoms();
-        let prior = ibp_stick_breaking_prior(k_atoms, alpha);
+        let prior = ordered_geometric_shrinkage_prior(k_atoms, alpha);
         let mut dprior = Array1::<f64>::zeros(k_atoms);
         for k in 0..k_atoms {
-            dprior[k] = prior[k] * k as f64 / (alpha + 1.0);
+            // dπ_k/dρ for π_k = (α/(α+1))^(k+1) (#614 consistent stick-breaking
+            // prior mean): dπ_k/dα = π_k·(k+1)/(α(α+1)), and with α = α₀·exp(ρ)
+            // the log-α chain factor α cancels the 1/α ⇒ dπ_k/dρ = π_k·(k+1)/(α+1).
+            dprior[k] = prior[k] * (k + 1) as f64 / (alpha + 1.0);
         }
         let n = self.n_obs();
         let p = self.output_dim();
@@ -7325,17 +7330,18 @@ impl SaeManifoldTerm {
 
     /// #1417: exact `½ tr(H⁻¹ ∂H_data/∂logα)` for LEARNABLE IBP alpha.
     ///
-    /// The forward assignment is `a_ik = σ(ℓ_ik/τ)·π_k(α)` with
-    /// `π_k(α) = (α/(α+1))^k`, so `∂logπ_k/∂logα = k/(α+1)`. EVERY data-Jacobian
-    /// column for atom `k` — the logit-JVP row (carries one `π_k`), the
-    /// coordinate rows (carry one `a_k`), and the β-leg (`a_k·φ`) — carries
-    /// exactly ONE `a_k`/`π_k` factor (`σ(ℓ/τ)` is α-independent). Hence each
-    /// Jacobian column scales as `∂J_·k/∂logα = (k/(α+1))·J_·k`, and the data
-    /// Hessian block for the atom pair `(k_a, k_b)` scales as
-    ///   ∂H_data[a,b]/∂logα = ((k_a + k_b)/(α+1))·H_data[a,b].
+    /// The forward assignment is `a_ik = σ(ℓ_ik/τ)·π_k(α)` with the #614
+    /// consistent stick-breaking mean `π_k(α) = (α/(α+1))^(k+1)`, so
+    /// `∂logπ_k/∂logα = (k+1)/(α+1)`. EVERY data-Jacobian column for atom `k` —
+    /// the logit-JVP row (carries one `π_k`), the coordinate rows (carry one
+    /// `a_k`), and the β-leg (`a_k·φ`) — carries exactly ONE `a_k`/`π_k` factor
+    /// (`σ(ℓ/τ)` is α-independent). Hence each Jacobian column scales as
+    /// `∂J_·k/∂logα = ((k+1)/(α+1))·J_·k`, and the data Hessian block for the
+    /// atom pair `(k_a, k_b)` scales as
+    ///   ∂H_data[a,b]/∂logα = (((k_a+1) + (k_b+1))/(α+1))·H_data[a,b].
     /// Therefore the exact data-block contribution to the α-logdet trace is
     ///   ½ tr(H⁻¹ ∂H_data/∂logα)
-    ///     = ½/(α+1) · Σ_{a,b} (k_a + k_b)·(H⁻¹)_{ba}·H_data[a,b],
+    ///     = ½/(α+1) · Σ_{a,b} ((k_a+1) + (k_b+1))·(H⁻¹)_{ba}·H_data[a,b],
     /// over the full joint `(t, β)` index set. `H_data[a,b]` is the data-fit
     /// Gauss-Newton block built from the SAME `row_jets_for_logdet` first-jets the
     /// θ-adjoint uses (`H_tt = ⟨J_a,J_b⟩`, `H_tβ = ⟨J_a,J_β⟩`, `H_ββ = ⟨J_β,J_β'⟩`),
@@ -7429,14 +7435,16 @@ impl SaeManifoldTerm {
                 }
             }
 
-            // t–t block: Σ_{a,b} (k_a + k_b)·(H⁻¹)_{ba}·⟨J_a, J_b⟩.
+            // t–t block: Σ_{a,b} (e_a + e_b)·(H⁻¹)_{ba}·⟨J_a, J_b⟩, where the
+            // per-atom log-prior exponent is e_k = k+1 for the #614 consistent
+            // stick-breaking mean π_k = (α/(α+1))^(k+1) (dlogπ_k/dlogα = (k+1)·inv_alpha1).
             for a in 0..q {
                 for b in 0..q {
                     let h_ab = sae_dot(&jets.first[a], &jets.first[b]);
                     if h_ab == 0.0 {
                         continue;
                     }
-                    let kw = (var_atom[a] + var_atom[b]) as f64;
+                    let kw = (var_atom[a] + 1 + var_atom[b] + 1) as f64;
                     trace += kw * inv_vv[[b, a]] * h_ab;
                 }
             }
@@ -7448,7 +7456,7 @@ impl SaeManifoldTerm {
                     if h_ab == 0.0 {
                         continue;
                     }
-                    let kw = (var_atom[a] + border_atom[beta_pos]) as f64;
+                    let kw = (var_atom[a] + 1 + border_atom[beta_pos] + 1) as f64;
                     trace += 2.0 * kw * inv_vbeta[[a, channel.index]] * h_ab;
                 }
             }
@@ -7459,7 +7467,7 @@ impl SaeManifoldTerm {
                     if h_ab == 0.0 {
                         continue;
                     }
-                    let kw = (border_atom[beta_i] + border_atom[beta_j]) as f64;
+                    let kw = (border_atom[beta_i] + 1 + border_atom[beta_j] + 1) as f64;
                     trace += kw * beta_inv[[channel_i.index, channel_j.index]] * h_ab;
                 }
             }
@@ -7490,10 +7498,13 @@ impl SaeManifoldTerm {
             .ok_or_else(|| "learnable IBP alpha resolution failed".to_string())?;
         let k_atoms = self.k_atoms();
         let p = self.output_dim();
-        let prior = ibp_stick_breaking_prior(k_atoms, alpha);
+        let prior = ordered_geometric_shrinkage_prior(k_atoms, alpha);
         let mut dprior = Array1::<f64>::zeros(k_atoms);
         for k in 0..k_atoms {
-            dprior[k] = prior[k] * k as f64 / (alpha + 1.0);
+            // dπ_k/dρ for π_k = (α/(α+1))^(k+1) (#614 consistent stick-breaking
+            // prior mean): dπ_k/dα = π_k·(k+1)/(α(α+1)), and with α = α₀·exp(ρ)
+            // the log-α chain factor α cancels the 1/α ⇒ dπ_k/dρ = π_k·(k+1)/(α+1).
+            dprior[k] = prior[k] * (k + 1) as f64 / (alpha + 1.0);
         }
         let inv_tau = 1.0 / temperature;
         let row_loss_w = self.row_loss_weights.as_deref();
@@ -7739,7 +7750,7 @@ impl SaeManifoldTerm {
                     .mode
                     .resolved_ibp_alpha(rho)
                     .unwrap_or(alpha);
-                let prior = ibp_stick_breaking_prior(k_atoms, effective_alpha);
+                let prior = ordered_geometric_shrinkage_prior(k_atoms, effective_alpha);
                 let inv_tau = 1.0 / temperature;
                 for (idx, var) in vars.iter().enumerate() {
                     let SaeLocalRowVar::Logit { atom } = *var else {
@@ -7890,7 +7901,7 @@ impl SaeManifoldTerm {
                         inv_tau: 1.0 / temperature,
                     },
                     vec![0.0; k_atoms],
-                    ibp_stick_breaking_prior(k_atoms, effective_alpha).to_vec(),
+                    ordered_geometric_shrinkage_prior(k_atoms, effective_alpha).to_vec(),
                 )
             }
             AssignmentMode::JumpReLU {

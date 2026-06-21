@@ -432,8 +432,11 @@ def _fit_dense_periodic_ibp_lsq(
     if vt.shape[0] < 2 * k_atoms:
         return None
 
+    # Truncated IBP stick-breaking prior MEANS pi_k = (alpha/(alpha+1))^(k+1):
+    # every atom (including the first) is shrunk by one Beta(alpha,1) stick mean,
+    # matching the Rust closed form `ordered_geometric_shrinkage_prior` (#614).
     ratio = alpha / (alpha + 1.0)
-    priors = np.asarray([ratio ** k for k in range(k_atoms)], dtype=float)
+    priors = np.asarray([ratio ** (k + 1) for k in range(k_atoms)], dtype=float)
     gate_level = 1.0 / (1.0 + np.exp(-6.0))
     assignments = np.tile(priors * gate_level, (n_obs, 1))
     logits = np.full((n_obs, k_atoms), 6.0 * tau, dtype=float)

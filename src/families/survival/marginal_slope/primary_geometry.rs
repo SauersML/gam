@@ -232,6 +232,34 @@ pub(crate) struct CachedPartitionCells {
     pub(crate) calibration_f_a: f64,
 }
 
+/// Direction-independent per-row state for the flex third-order contraction.
+///
+/// Built once per row by `build_row_flex_third_base_with_states` and reused
+/// across every coefficient axis of a Jeffreys all-axes sweep so the intercept
+/// solves, cached partitions, and exact base timepoints are paid once instead
+/// of `p` times. See `row_flex_third_contract_from_base`.
+pub(crate) struct FlexThirdRowBase {
+    pub(crate) row: usize,
+    pub(crate) p: usize,
+    pub(crate) qd1_index: usize,
+    pub(crate) qd1: f64,
+    pub(crate) q0: f64,
+    pub(crate) q1: f64,
+    pub(crate) q0_index: usize,
+    pub(crate) q1_index: usize,
+    pub(crate) a0: f64,
+    pub(crate) a1: f64,
+    pub(crate) g: f64,
+    pub(crate) beta_h: Option<Array1<f64>>,
+    pub(crate) beta_w: Option<Array1<f64>>,
+    pub(crate) entry_cached: CachedPartitionCells,
+    pub(crate) exit_cached: CachedPartitionCells,
+    pub(crate) entry_base:
+        crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+    pub(crate) exit_base:
+        crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBase,
+}
+
 pub(crate) struct CachedCellEntry {
     pub(crate) partition_cell: exact_kernel::DenestedPartitionCell,
     pub(crate) neg_cell: exact_kernel::DenestedCubicCell,

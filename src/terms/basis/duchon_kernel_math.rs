@@ -1343,6 +1343,146 @@ pub(crate) fn duchon_hybrid_kernel_stable_integral(
     Ok(value)
 }
 
+/// Radial operator scalars `(q, t, t_r, t_rr)` of the hybrid Duchon–Matérn
+/// kernel via the same cancellation-free single integral as
+/// [`duchon_hybrid_kernel_stable_integral`], differentiated under the integral
+/// sign (gam#1424 / gam#1453).
+///
+/// The partial-fraction operator core (`duchon_regularized_operator_core`)
+/// assembles `q, t` as a sign-alternating sum of polyharmonic and Matérn
+/// *operator* blocks. In high dimensions (e.g. d=16, p=1, s=9) each block is
+/// ~1e3 while the true operator scalar is ~1e-13, so f64 loses every
+/// significant digit — Kahan summation fixes accumulation, not the
+/// cancellation between huge opposing terms, leaving `q, t` with ~1e-2 relative
+/// noise. That floor sits above the Chebyshev profile certificate, so the
+/// production profile cannot certify (gam#1453).
+///
+/// This routine instead differentiates the smooth per-`w` integrand
+/// `g(r,w) = 2 (r/(2c))^b K_b(c r)`, `c = κ√w`, in `r`. Each `w`-slice is a
+/// single well-conditioned `r^a K_ν(c r)` term whose `r`-derivatives are exact
+/// (`d/dr[r^a K_ν(c r)] = a r^{a-1} K_ν(c r) − (c/2) r^a (K_{ν-1}+K_{ν+1})`),
+/// so there is no cross-block cancellation. The radial derivatives `φ′…φ⁗`
+/// are integrated against the same `(1-w)^{p-1} w^{s-1}` weight and the
+/// 64-node Gauss–Legendre rule, then the operator scalars are assembled from
+/// the standard radial relations
+/// `q = φ′/r`, `t = q′/r`, `t_r = (q″−t)/r`, `t_rr = q‴/r − 2q″/r² + 2q′/r³`.
+///
+/// Requires the same precondition as the kernel form
+/// ([`duchon_hybrid_stable_integral_applies`]) and `r > 0`.
+pub(crate) fn duchon_hybrid_operator_stable_integral(
+    r: f64,
+    kappa: f64,
+    p_order: usize,
+    s_order: usize,
+    k_dim: usize,
+) -> Result<DuchonRegularizedOperatorCore, BasisError> {
+    assert!(
+        duchon_hybrid_stable_integral_applies(p_order, s_order, k_dim),
+        "duchon_hybrid_operator_stable_integral precondition violated: 2(p+s) > d and 2p < d required (p={p_order}, s={s_order}, d={k_dim})"
+    );
+    assert!(
+        r > 0.0 && r.is_finite(),
+        "duchon_hybrid_operator_stable_integral requires r > 0, got r={r}"
+    );
+    let p = p_order as f64;
+    let s = s_order as f64;
+    let half_d = 0.5 * k_dim as f64;
+    let b = p + s - half_d;
+    let pref = (4.0 * std::f64::consts::PI).powf(-half_d) / (gamma_lanczos(p) * gamma_lanczos(s));
+
+    // Accumulate φ′, φ″, φ‴, φ⁗ across the Gauss–Legendre nodes. (φ itself is
+    // not needed for the operator scalars.)
+    let mut d1 = KahanSum::default();
+    let mut d2 = KahanSum::default();
+    let mut d3 = KahanSum::default();
+    let mut d4 = KahanSum::default();
+
+    for &(w, weight) in gauss_legendre_01_64() {
+        let sqrt_w = w.sqrt();
+        let c = (kappa * sqrt_w).max(1e-300);
+        let z = (c * r).max(1e-300);
+
+        // Smooth integrand g(r) = A · r^b · K_b(c r),  A = 2 (2c)^{-b}.
+        // Differentiate the symbolic term list (coef, a, ν-offset) in r:
+        //   d/dr[c0 r^a K_{b+j}(c r)]
+        //     = c0·a · r^{a-1} K_{b+j}(c r)
+        //       − c0·(c/2) · r^a (K_{b+j-1}(c r) + K_{b+j+1}(c r)).
+        // Four derivatives need ν-offsets in [-4, 4] around b.
+        let a0 = 2.0 * (2.0 * c).powf(-b);
+        let mut terms: Vec<(f64, f64, i32)> = vec![(a0, b, 0)];
+        // Cache K_{b+j}(z) for j ∈ [-4, 4] (K is even in order → use |·|).
+        let bessel = |j: i32| -> Result<f64, BasisError> {
+            bessel_k_real_half_integer_or_integer((b + j as f64).abs(), z)
+        };
+        let evaluate = |terms: &Vec<(f64, f64, i32)>| -> Result<f64, BasisError> {
+            let mut acc = KahanSum::default();
+            for &(c0, a, j) in terms {
+                if c0 == 0.0 {
+                    continue;
+                }
+                acc.add(c0 * r.powf(a) * bessel(j)?);
+            }
+            Ok(acc.sum())
+        };
+
+        let mut slice_derivs = [0.0_f64; 4];
+        for slot in slice_derivs.iter_mut() {
+            // Differentiate the current term list once.
+            let mut next: Vec<(f64, f64, i32)> = Vec::with_capacity(terms.len() * 3);
+            for &(c0, a, j) in &terms {
+                if c0 == 0.0 {
+                    continue;
+                }
+                if a != 0.0 {
+                    next.push((c0 * a, a - 1.0, j));
+                }
+                let half = -c0 * c * 0.5;
+                next.push((half, a, j - 1));
+                next.push((half, a, j + 1));
+            }
+            terms = next;
+            *slot = evaluate(&terms)?;
+        }
+
+        d1.add(weight * (1.0 - w).powf(p - 1.0) * w.powf(s - 1.0) * slice_derivs[0]);
+        d2.add(weight * (1.0 - w).powf(p - 1.0) * w.powf(s - 1.0) * slice_derivs[1]);
+        d3.add(weight * (1.0 - w).powf(p - 1.0) * w.powf(s - 1.0) * slice_derivs[2]);
+        d4.add(weight * (1.0 - w).powf(p - 1.0) * w.powf(s - 1.0) * slice_derivs[3]);
+    }
+
+    let phi1 = pref * d1.sum();
+    let phi2 = pref * d2.sum();
+    let phi3 = pref * d3.sum();
+    let phi4 = pref * d4.sum();
+    if !(phi1.is_finite() && phi2.is_finite() && phi3.is_finite() && phi4.is_finite()) {
+        crate::bail_invalid_basis!(
+            "non-finite Duchon hybrid operator (stable form) at r={r}, p={p_order}, s={s_order}, d={k_dim}"
+        );
+    }
+
+    // Assemble the operator scalars from the radial derivatives. For r > 0
+    // these divisions are removable-singularity quotients of moderate
+    // quantities (no cancellation between blocks remains).
+    let inv_r = 1.0 / r;
+    let q = phi1 * inv_r;
+    // q′ = φ″/r − φ′/r²; q″ = φ‴/r − 2φ″/r² + 2φ′/r³;
+    // q‴ = φ⁗/r − 3φ‴/r² + 6φ″/r³ − 6φ′/r⁴.
+    let q_r = phi2 * inv_r - phi1 * inv_r * inv_r;
+    let q_rr = phi3 * inv_r - 2.0 * phi2 * inv_r * inv_r + 2.0 * phi1 * inv_r * inv_r * inv_r;
+    let q_rrr = phi4 * inv_r - 3.0 * phi3 * inv_r * inv_r + 6.0 * phi2 * inv_r * inv_r * inv_r
+        - 6.0 * phi1 * inv_r * inv_r * inv_r * inv_r;
+    let t = q_r * inv_r;
+    let t_r = q_rr * inv_r - q_r * inv_r * inv_r;
+    let t_rr = q_rrr * inv_r - 2.0 * q_rr * inv_r * inv_r + 2.0 * q_r * inv_r * inv_r * inv_r;
+
+    Ok(DuchonRegularizedOperatorCore {
+        q,
+        t,
+        t_r,
+        t_rr,
+    })
+}
+
 /// Whether the cancellation-free [`duchon_hybrid_kernel_stable_integral`] is
 /// applicable for these orders: a genuine Matérn blend (`s ≥ 1`) whose
 /// single-integral reduction has an integrable `w → 0` endpoint (`2p < d`).

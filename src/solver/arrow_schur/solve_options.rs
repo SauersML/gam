@@ -261,6 +261,36 @@ pub struct ArrowSolveOptions {
     pub tolerate_ill_conditioning: bool,
     /// Arrow solve precision policy. Default is f64-only.
     pub solve_precision: ArrowSolvePrecisionPolicy,
+    /// Optional spectral positive-definiteness floor on the *reduced Schur
+    /// complement* `S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`,
+    /// as a relative fraction of `S`'s largest eigenvalue.
+    ///
+    /// `None` (default) keeps the strict contract: a non-PD `S` errors as
+    /// [`ArrowSchurError::SchurFactorFailed`] so the LM outer loop lifts
+    /// `ridge_beta` globally and re-forms `S`.
+    ///
+    /// `Some(floor)` engages the #1026 SAE co-collapse cure on the SOLVE path:
+    /// when the reduced Schur Cholesky refuses (collapsed atoms drive a per-row
+    /// `H_tt` near-singular, so the accumulated `(H_tt)⁻¹` over-subtracts `S`
+    /// into an INDEFINITE matrix), instead of rejecting and over-damping every
+    /// β direction with a global ridge, symmetric-eigendecompose `S` and clamp
+    /// every eigenvalue UP to `floor·max(λ)`. This is Levenberg–Marquardt
+    /// restricted to exactly the indefinite/collapsed subspace: the
+    /// well-conditioned β directions (`λ ≫ floor·max λ`) are untouched and the
+    /// step in those directions is the exact Newton step, while only the
+    /// collapsed directions receive the minimal damping needed for a PD solve.
+    /// The inner Newton then makes a real descent step rather than crawling
+    /// behind an inflated global ridge. Mirrors the per-row spectral floor the
+    /// evidence path uses for #1377/#1117/#1118
+    /// ([`super::factorization::factor_spectral_deflated_evidence_row`]); the
+    /// difference is the floored value — a small positive `floor·max λ`
+    /// (Tikhonov) for the solve, vs unit stiffness `+1` (`log 1 = 0`) for the
+    /// evidence log-det.
+    ///
+    /// Only consulted by the dense Direct / SqrtBA reduced solve (the only
+    /// caller of [`super::reduced_solve::solve_dense_reduced_system`]); the
+    /// InexactPCG path is unaffected.
+    pub schur_pd_floor: Option<f64>,
 }
 
 impl std::fmt::Debug for ArrowSolveOptions {
@@ -274,6 +304,7 @@ impl std::fmt::Debug for ArrowSolveOptions {
             .field("gpu_matvec", &self.gpu_matvec.is_some())
             .field("tolerate_ill_conditioning", &self.tolerate_ill_conditioning)
             .field("solve_precision", &self.solve_precision)
+            .field("schur_pd_floor", &self.schur_pd_floor)
             .finish()
     }
 }
@@ -349,6 +380,7 @@ impl ArrowSolveOptions {
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
+            schur_pd_floor: None,
         }
     }
 
@@ -364,6 +396,7 @@ impl ArrowSolveOptions {
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
+            schur_pd_floor: None,
         }
     }
 
@@ -378,6 +411,7 @@ impl ArrowSolveOptions {
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
+            schur_pd_floor: None,
         }
     }
 
@@ -392,6 +426,7 @@ impl ArrowSolveOptions {
             gpu_matvec: None,
             tolerate_ill_conditioning: false,
             solve_precision: ArrowSolvePrecisionPolicy::F64Only,
+            schur_pd_floor: None,
         }
     }
 

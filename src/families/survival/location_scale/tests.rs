@@ -1334,15 +1334,131 @@ fn survival_ls_joint_jet_tower_oracle_body() {
     }
 }
 
+/// #932 single-source / packed-scalar contract: the production
+/// `row_third_contracted` / `row_fourth_contracted` (now evaluated through the
+/// PACKED directional scalars `OneSeed<9>` / `TwoSeed<9>` — 1.46 / 2.8 KiB,
+/// never the ~50 KiB dense `Tower4<9>`) must equal the dense-tower contraction
+/// `row_nll_tower(row).{third,fourth}_contracted(...)` to ≤ 1e-9. Both sides
+/// differentiate the SAME single expression (`sls_row_nll`); the only difference
+/// is the carried channel set (nilpotent ε/δ fold the contraction into the
+/// differentiation vs materialising `t3`/`t4` then contracting). A regression
+/// that desyncs the packed path from the dense tower — or reintroduces a
+/// separate hand directional tower — fails here. This is the oracle that lets
+/// `row_kernel_directional_supported()` return true: the memory-bounded packed
+/// path is provably the dense-tower answer.
+#[test]
+fn survival_ls_packed_directional_matches_dense_tower_932() {
+    let join_result = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(survival_ls_packed_directional_matches_dense_tower_body)
+        .expect("spawn wide-stack packed-directional oracle thread")
+        .join();
+    assert!(
+        join_result.is_ok(),
+        "survival LS packed-directional #932 oracle thread must complete"
+    );
+}
+
+fn survival_ls_packed_directional_matches_dense_tower_body() {
+    use crate::families::row_kernel::RowKernel;
+
+    let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+        [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+        [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+    ];
+    let event = [1.0, 0.0, 1.0, 0.35];
+    let weight = [1.0, 0.8, 1.2, 1.3];
+    let n = primaries.len();
+
+    // Dense deterministic directions so every one of the nine channels
+    // participates in every contraction (no dropped/flipped cross block can hide).
+    let dirs: [[f64; SLS_ROW_K]; 3] = [
+        [0.7, -1.3, 0.5, 0.9, -0.6, 0.3, -1.1, 0.4, 0.8],
+        [-0.4, 0.6, -1.1, 0.3, 1.2, -0.7, 0.5, -0.9, 0.2],
+        [1.2, 0.2, -0.7, -0.5, 0.4, 1.0, -0.3, 0.6, -1.2],
+    ];
+
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let inverse_link = residual_distribution_inverse_link(distribution);
+        let family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+        let states = survival_ls_joint_oracle_states(&primaries);
+        let q = family
+            .collect_joint_quantities(&states)
+            .expect("collect joint quantities");
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("dynamic geometry");
+        let kernel = SurvivalLsRowKernel {
+            family: &family,
+            q: &q,
+            dynamic: &dynamic,
+            deriv_log_scale: 0.0,
+            offsets: family.joint_block_offsets(),
+        };
+
+        for row in 0..n {
+            // Dense ground truth: build the full Tower4<9> once and contract its
+            // t3 / t4 channels. The production methods must reproduce these
+            // exactly through the packed OneSeed / TwoSeed scalars.
+            let tower = kernel.row_nll_tower(row).expect("dense row tower");
+            for u in &dirs {
+                let dense_third = tower.third_contracted(u);
+                let packed_third =
+                    RowKernel::row_third_contracted(&kernel, row, u).expect("packed third");
+                for a in 0..SLS_ROW_K {
+                    for b in 0..SLS_ROW_K {
+                        let want = dense_third[a][b];
+                        let got = packed_third[a][b];
+                        assert!(
+                            (got - want).abs() <= 1e-9 * (1.0 + want.abs()),
+                            "{distribution:?} row {row} third[{a}][{b}]: packed OneSeed {got} \
+                             vs dense Tower4 {want}"
+                        );
+                    }
+                }
+                for v in &dirs {
+                    let dense_fourth = tower.fourth_contracted(u, v);
+                    let packed_fourth =
+                        RowKernel::row_fourth_contracted(&kernel, row, u, v).expect("packed fourth");
+                    for a in 0..SLS_ROW_K {
+                        for b in 0..SLS_ROW_K {
+                            let want = dense_fourth[a][b];
+                            let got = packed_fourth[a][b];
+                            assert!(
+                                (got - want).abs() <= 1e-9 * (1.0 + want.abs()),
+                                "{distribution:?} row {row} fourth[{a}][{b}]: packed TwoSeed \
+                                 {got} vs dense Tower4 {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The hand-derived analytic joint-Hessian directional derivative
-/// (`exact_newton_joint_hessian_directional_derivative_from_parts`, the path
-/// that is always taken because `row_kernel_directional_supported()` is
-/// hard-disabled) must agree with the jet-tower-certified generic row-kernel
-/// directional derivative on a FULLY TIME-VARYING family — i.e. with the
-/// derivative threshold/log-sigma channels (the velocity / `qdot` coordinate)
-/// live. The pre-existing FD coverage only exercises non-time-varying
-/// fixtures, where the velocity coordinate is inert, so it cannot witness a
-/// dropped `qdot` third-order contribution.
+/// (`exact_newton_joint_hessian_directional_derivative_from_parts`) must agree
+/// with the jet-tower-certified generic row-kernel directional derivative on a
+/// FULLY TIME-VARYING family — i.e. with the derivative threshold/log-sigma
+/// channels (the velocity / `qdot` coordinate) live. The pre-existing FD
+/// coverage only exercises non-time-varying fixtures, where the velocity
+/// coordinate is inert, so it cannot witness a dropped `qdot` third-order
+/// contribution.
+///
+/// #932: `row_kernel_directional_supported()` is now enabled for non-wiggle
+/// rows, so the row-kernel reference below is exactly the path a production fit
+/// takes — and the generic row-kernel directional derivative now consumes the
+/// PACKED `OneSeed<9>` scalar (no dense `Tower4<9>`). This test pins that packed
+/// path against the hand path to 1e-7, so enabling the gate is behaviour-
+/// preserving; both call sites are invoked explicitly here, independent of the
+/// gate.
 #[test]
 fn survival_ls_joint_directional_derivative_matches_tower_time_varying() {
     let join_result = std::thread::Builder::new()

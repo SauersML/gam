@@ -2433,6 +2433,18 @@ struct SpatialJointContext<'d> {
     frozen_glm_psi_bounds: Option<(f64, f64)>,
     frozen_glm_tensor: Option<crate::solver::glm_sufficient_lane::FrozenWeightGramTensor>,
     frozen_glm_tensor_attempted: bool,
+    /// #1033: memo of the frozen-W trial Fisher weights keyed on the warm β that
+    /// produced them. `stage_frozen_glm_trial_statistics` runs on EVERY κ trial
+    /// (every cost / gradient probe), and the only β-dependent quantity it needs
+    /// is the current Fisher weight vector `W(η)` (η = Xβ + offset) for the
+    /// drift check and the n-free gradient soundness gate. Computing `W` is an
+    /// O(n·p) GEMV + O(n) family evaluation; β only changes when the inner solve
+    /// re-converges (after an accepted outer step), so recomputing it on every
+    /// same-β probe was a redundant per-trial n-touch. Cache `(β, W)` and reuse
+    /// `W` whenever β is unchanged — the GEMV runs once per distinct β, i.e.
+    /// O(outer steps), not O(trials). `None` until the first compute / when no
+    /// frozen-W inputs are installed.
+    frozen_glm_weight_memo: Option<(Array1<f64>, Array1<f64>)>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2520,6 +2532,36 @@ impl<'d> SpatialJointContext<'d> {
         Ok(Some((obs.fisherweight, working_response)))
     }
 
+    /// #1033: the trial Fisher weight vector `W(η)` for `beta`, memoized on
+    /// `beta`. `stage_frozen_glm_trial_statistics` consults `W` on EVERY κ trial
+    /// (drift check + n-free gradient soundness gate) but `W` is a deterministic
+    /// function of β (η = Xβ + offset), and β only changes when the inner solve
+    /// re-converges — many cost / gradient probes share one β. Recompute the
+    /// O(n·p) working state only when β differs from the memoized key; otherwise
+    /// return the cached weights. Returns `None` exactly when
+    /// `frozen_glm_working_state` does (no frozen-W inputs / β shape mismatch).
+    fn frozen_glm_trial_weights(
+        &mut self,
+        beta: &Array1<f64>,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        if let Some((memo_beta, memo_w)) = self.frozen_glm_weight_memo.as_ref()
+            && memo_beta.len() == beta.len()
+            && memo_beta
+                .iter()
+                .zip(beta.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        {
+            return Ok(Some(memo_w.clone()));
+        }
+        match self.frozen_glm_working_state(beta)? {
+            Some((current_w, _)) => {
+                self.frozen_glm_weight_memo = Some((beta.clone(), current_w.clone()));
+                Ok(Some(current_w))
+            }
+            None => Ok(None),
+        }
+    }
+
     fn ensure_frozen_glm_tensor(
         &mut self,
         theta: &Array1<f64>,
@@ -2595,9 +2637,26 @@ impl<'d> SpatialJointContext<'d> {
         let mut staged_deriv: Option<(Array2<f64>, Array1<f64>)> = None;
         if theta.len() == self.rho_dim + 1 {
             let psi = theta[self.rho_dim];
-            if let (Some(tensor), Some(beta)) = (self.frozen_glm_tensor.as_ref(), warm_beta)
-                && tensor.contains(psi)
-                && let Some((current_w, _)) = self.frozen_glm_working_state(beta)?
+            // Compute the β-memoized trial Fisher weights up front (mutable
+            // self borrow) so the immutable `self.frozen_glm_tensor` borrow
+            // below does not alias it. `frozen_glm_trial_weights` recomputes the
+            // O(n·p) working state only on a β change, so a same-β probe pays
+            // nothing here (#1033). Only proceed when a tensor is installed and
+            // covers this ψ — otherwise skip the weight compute entirely.
+            let tensor_covers = self
+                .frozen_glm_tensor
+                .as_ref()
+                .is_some_and(|t| t.contains(psi));
+            let current_w = if tensor_covers {
+                match warm_beta {
+                    Some(beta) => self.frozen_glm_trial_weights(beta)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if let (Some(tensor), Some(current_w)) =
+                (self.frozen_glm_tensor.as_ref(), current_w.as_ref())
             {
                 const FROZEN_GLM_WEIGHT_DRIFT_RTOL: f64 = 1e-3;
                 if tensor.weight_drift_within(current_w.view(), FROZEN_GLM_WEIGHT_DRIFT_RTOL) {
@@ -3200,6 +3259,7 @@ fn run_exact_joint_spatial_optimization(
         },
         frozen_glm_tensor: None,
         frozen_glm_tensor_attempted: false,
+        frozen_glm_weight_memo: None,
     };
 
     // #1033b: single isotropic design-moving coordinate on a Gaussian-identity

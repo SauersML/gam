@@ -1,28 +1,35 @@
-//! #1376 regression guard: the analytic anisotropic Matérn DESIGN first
-//! derivative w.r.t. the RAW per-axis log-scale `η_a` must match a central
-//! finite difference of the realized design — for a single-axis perturbation,
-//! NOT just a contrast.
+//! #1376 regression guard: the analytic anisotropic Matérn DESIGN per-axis
+//! derivative the κ-optimizer consumes must match a central finite difference of
+//! the realized design taken in the OPTIMIZER's coordinate frame — i.e. moving
+//! the raw per-axis coordinate `psi_a`, which the coordinate map
+//! `spatial_term_psi_to_length_scale_and_aniso` decodes into BOTH the global
+//! length scale `ℓ = exp(−mean(psi))` AND the centered contrast
+//! `eta_a = psi_a − mean(psi)` simultaneously.
 //!
-//! The original #1376 defect (analytic outer-gradient ≠ FD, rel ≈ 0.85) was the
-//! anisotropic design first-derivative being left UN-centered: the forward
-//! anisotropic metric is the CENTERED contrast `w_a = exp(2·(η_a − mean(η)))`, so
-//! a uniform shift of every η_a is a no-op and the raw-η Jacobian must be the
-//! centering projection of the per-axis centered-ψ derivative,
+//! The original #1376 defect was a coordinate-frame error. An earlier fix
+//! installed the cross-axis centering projection `P = I − 11ᵀ/d` on the per-axis
+//! ψ derivatives, on the reasoning that a uniform η-shift is a no-op of the
+//! centered metric. That is true ONLY at fixed ℓ — but the optimizer never holds
+//! ℓ fixed: its coordinate `psi_a` drives ℓ and the contrast together. In the
+//! kernel argument these recombine,
 //!
-//!   ∂(design)/∂η_a = ∂(design)/∂ψ_a − (1/d) Σ_b ∂(design)/∂ψ_b.
+//!   x² = r²/ℓ² = Σ_a exp(2·(psi_a − mean(psi)))·exp(2·mean(psi))·h_a²
+//!              = Σ_a exp(2·psi_a)·h_a²,
 //!
-//! Centering was applied to the penalty derivatives but the DESIGN first
-//! derivatives (which feed the deviance and the H-side of the outer REML
-//! gradient) were un-centered, so the full outer gradient disagreed with a
-//! central FD of the criterion by the un-centered common mode (fixed on main in
-//! e0a7384e0 / 1f22db7c1).
+//! so the `mean(psi)` cancels exactly and the effective per-axis exponent is the
+//! RAW `psi_a`. The criterion derivative w.r.t. `psi_a` is therefore the NATIVE,
+//! un-centered per-axis derivative `∂φ/∂psi_a = q·s_a` (the centering and the
+//! omitted `−(1/d)·∂/∂ln ℓ` length-scale term cancel to the identity). The
+//! centering left the analytic outer gradient sum-zero / antisymmetric while the
+//! FD of the full criterion is not — the rel≈0.85 gap. Removing it restores
+//! agreement.
 //!
-//! A penalty-contrast FD test already guards the contrast direction
-//! (`anisotropic_penalty_contrast_derivative_matches_finite_difference`). This
-//! test guards the DESIGN side AND, crucially, a SINGLE-axis raw-η perturbation,
-//! which is exactly the common-mode the un-centered analytic got wrong: a one-axis
-//! bump moves `mean(η)` too, so a correct analytic must subtract the cross-axis
-//! mean.
+//! This test pins the DESIGN side directly: it FDs the realized design under a
+//! single-axis `psi_a` bump (decoded through the coordinate map so ℓ moves with
+//! it) and asserts the analytic `design_first[a]` matches — the exact frame the
+//! consumer (`spatial_log_kappa_hyper_dirs_frominfo_list`) and the outer FD
+//! audit use. A regression that re-installed the fixed-ℓ centering would fail
+//! this `psi`-frame FD.
 //!
 //! Reference-as-truth: every assertion is against a central finite difference of
 //! gam's own realized anisotropic design — never another tool's output.
@@ -33,11 +40,24 @@ use gam::terms::basis::{
 };
 use ndarray::Array2;
 
-/// Build the realized dense anisotropic Matérn design at a given raw-η vector,
-/// holding everything else (centers, ℓ, ν, identifiability) fixed.
-fn realized_design_at(data: &Array2<f64>, spec: &MaternBasisSpec, eta: &[f64]) -> Array2<f64> {
+/// Decode the κ-optimizer coordinate `psi` into the (length_scale, aniso_log_scales)
+/// pair exactly as `spatial_term_psi_to_length_scale_and_aniso` does:
+///   ℓ = exp(−mean(psi)),  eta_a = psi_a − mean(psi).
+fn psi_to_length_scale_and_eta(psi: &[f64]) -> (f64, Vec<f64>) {
+    let psi_bar = psi.iter().sum::<f64>() / psi.len() as f64;
+    let ls = (-psi_bar).exp();
+    let eta = psi.iter().map(|&v| v - psi_bar).collect();
+    (ls, eta)
+}
+
+/// Build the realized dense anisotropic Matérn design at a given OPTIMIZER
+/// coordinate `psi`, decoding it into (ℓ, η) the same way the κ-optimizer does,
+/// holding everything else (centers, ν, identifiability) fixed.
+fn realized_design_at_psi(data: &Array2<f64>, spec: &MaternBasisSpec, psi: &[f64]) -> Array2<f64> {
+    let (ls, eta) = psi_to_length_scale_and_eta(psi);
     let mut trial = spec.clone();
-    trial.aniso_log_scales = Some(eta.to_vec());
+    trial.length_scale = ls;
+    trial.aniso_log_scales = Some(eta);
     build_matern_basiswithworkspace(data.view(), &trial, &mut BasisWorkspace::default())
         .expect("realized aniso design build")
         .design
@@ -45,11 +65,10 @@ fn realized_design_at(data: &Array2<f64>, spec: &MaternBasisSpec, eta: &[f64]) -
 }
 
 #[test]
-fn aniso_design_raw_eta_first_derivative_matches_single_axis_fd() {
-    // A small 3-D anisotropic configuration: distinct per-axis scales so the
-    // centering (mean over axes) is non-trivial, and centers == data
-    // (UserProvided) so the basis geometry is byte-identical across the FD
-    // perturbations.
+fn aniso_design_raw_psi_first_derivative_matches_single_axis_fd() {
+    // A small 3-D anisotropic configuration: distinct per-axis scales, and
+    // centers == data (UserProvided) so the basis geometry is byte-identical
+    // across the FD perturbations.
     let data = Array2::from_shape_vec(
         (8, 3),
         vec![
@@ -58,11 +77,13 @@ fn aniso_design_raw_eta_first_derivative_matches_single_axis_fd() {
         ],
     )
     .unwrap();
-    let eta0 = vec![0.35, -0.20, 0.10];
+    // Optimizer coordinate psi0; decode it to the (ℓ, η) the spec is built at.
+    let psi0 = vec![0.30, -0.15, 0.20];
+    let (ls0, eta0) = psi_to_length_scale_and_eta(&psi0);
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
-        length_scale: 0.9,
+        length_scale: ls0,
         nu: MaternNu::ThreeHalves,
         include_intercept: false,
         double_penalty: false,
@@ -72,41 +93,26 @@ fn aniso_design_raw_eta_first_derivative_matches_single_axis_fd() {
     };
 
     let deriv = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();
-    let dim = eta0.len();
+    let dim = psi0.len();
     assert_eq!(
         deriv.design_first.len(),
         dim,
         "aniso design derivative builder must return one matrix per axis"
     );
 
-    // Sum of the centered per-axis design derivatives must be ZERO: centering
-    // projects out the all-ones common mode, so Σ_a ∂design/∂η_a = 0 (a uniform
-    // η shift leaves the centered metric — hence the design — unchanged).
-    let mut common_mode = deriv.design_first[0].clone();
-    for a in 1..dim {
-        common_mode = &common_mode + &deriv.design_first[a];
-    }
-    let common_mode_max = common_mode.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-    assert!(
-        common_mode_max < 1e-9,
-        "centered aniso design derivatives must sum to zero (all-ones common mode \
-         projected out); got max |Σ_a ∂design/∂η_a| = {common_mode_max:.3e}"
-    );
-
-    // Single-axis raw-η FD: bump ONLY η_a, rebuild the realized design, central
-    // difference. This is the exact common-mode case the un-centered analytic
-    // got wrong (one-axis bump also moves mean(η)). The columns of the realized
-    // design are identifiability-fixed (UserProvided centers + default
-    // residualization on the same data), so the per-entry difference is a clean
-    // FD of the same parameterization.
+    // Single-axis raw-psi FD: bump ONLY psi_a, decode to (ℓ, η) — which moves the
+    // global length scale AND every centered contrast — rebuild the realized
+    // design, central difference. This is the exact coordinate frame the outer
+    // optimizer / FD audit perturb. The NATIVE (un-centered) analytic derivative
+    // must match; the old fixed-ℓ centering would not.
     let h = 1e-6;
     for a in 0..dim {
-        let mut eta_p = eta0.clone();
-        eta_p[a] += h;
-        let mut eta_m = eta0.clone();
-        eta_m[a] -= h;
-        let dplus = realized_design_at(&data, &spec, &eta_p);
-        let dminus = realized_design_at(&data, &spec, &eta_m);
+        let mut psi_p = psi0.clone();
+        psi_p[a] += h;
+        let mut psi_m = psi0.clone();
+        psi_m[a] -= h;
+        let dplus = realized_design_at_psi(&data, &spec, &psi_p);
+        let dminus = realized_design_at_psi(&data, &spec, &psi_m);
         assert_eq!(
             dplus.raw_dim(),
             deriv.design_first[a].raw_dim(),
@@ -120,21 +126,18 @@ fn aniso_design_raw_eta_first_derivative_matches_single_axis_fd() {
             .fold(0.0_f64, |m, &v| m.max(v.abs()));
         assert!(
             max_err < 1e-5 * scale,
-            "aniso design raw-η derivative mismatch on axis {a}: max_err={max_err:.3e} \
-             (scale={scale:.3e}) — the un-centered #1376 bug would fail this single-axis FD"
+            "aniso design raw-psi derivative mismatch on axis {a}: max_err={max_err:.3e} \
+             (scale={scale:.3e}) — the centered #1376 bug would fail this single-axis psi FD"
         );
     }
 }
 
-/// Companion guard: the analytic aniso DESIGN second-diagonal `∂²X/∂η_a²` (raw-η
-/// gauge) must match a central second difference of the realized design under a
-/// single-axis η bump. The dense design path materializes `design_second_diag`
-/// from a centered implicit operator (`with_raw_eta_centering`), so this pins
-/// that the SECOND-order design channel is in the raw-η gauge — the design
-/// counterpart to the penalty-second centering (#1376). A regression that left
-/// the design seconds in the ψ frame would fail this single-axis FD.
+/// Companion guard: the analytic aniso DESIGN second-diagonal `∂²X/∂psi_a²` must
+/// match a central second difference of the realized design under a single-axis
+/// `psi_a` bump (decoded to (ℓ, η)). This pins that the SECOND-order design
+/// channel is in the same native optimizer-coordinate gauge as the first.
 #[test]
-fn aniso_design_raw_eta_second_diagonal_matches_single_axis_fd() {
+fn aniso_design_raw_psi_second_diagonal_matches_single_axis_fd() {
     let data = Array2::from_shape_vec(
         (8, 3),
         vec![
@@ -143,11 +146,12 @@ fn aniso_design_raw_eta_second_diagonal_matches_single_axis_fd() {
         ],
     )
     .unwrap();
-    let eta0 = vec![0.35, -0.20, 0.10];
+    let psi0 = vec![0.30, -0.15, 0.20];
+    let (ls0, eta0) = psi_to_length_scale_and_eta(&psi0);
     let spec = MaternBasisSpec {
         center_strategy: CenterStrategy::UserProvided(data.clone()),
         periodic: None,
-        length_scale: 0.9,
+        length_scale: ls0,
         nu: MaternNu::ThreeHalves,
         include_intercept: false,
         double_penalty: false,
@@ -157,23 +161,23 @@ fn aniso_design_raw_eta_second_diagonal_matches_single_axis_fd() {
     };
 
     let deriv = build_matern_basis_log_kappa_aniso_derivatives(data.view(), &spec).unwrap();
-    let dim = eta0.len();
+    let dim = psi0.len();
     // Small-n materialized path exposes the dense diagonal seconds; if the build
     // chose the operator-only path (no dense blocks), there is nothing to FD here
-    // (the operator path is already the centered reference oracle), so skip.
+    // (the operator path is already the native reference oracle), so skip.
     if deriv.design_second_diag.len() != dim {
         return;
     }
 
-    let s0 = realized_design_at(&data, &spec, &eta0);
+    let s0 = realized_design_at_psi(&data, &spec, &psi0);
     let h = 1e-4;
     for a in 0..dim {
-        let mut eta_p = eta0.clone();
-        eta_p[a] += h;
-        let mut eta_m = eta0.clone();
-        eta_m[a] -= h;
-        let sp = realized_design_at(&data, &spec, &eta_p);
-        let sm = realized_design_at(&data, &spec, &eta_m);
+        let mut psi_p = psi0.clone();
+        psi_p[a] += h;
+        let mut psi_m = psi0.clone();
+        psi_m[a] -= h;
+        let sp = realized_design_at_psi(&data, &spec, &psi_p);
+        let sm = realized_design_at_psi(&data, &spec, &psi_m);
         let fd = (&sp - &(&s0 * 2.0) + &sm).mapv(|v| v / (h * h));
         let analytic = &deriv.design_second_diag[a];
         assert_eq!(fd.raw_dim(), analytic.raw_dim(), "shape mismatch axis {a}");
@@ -181,7 +185,7 @@ fn aniso_design_raw_eta_second_diagonal_matches_single_axis_fd() {
         let max_err = (&fd - analytic).iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
         assert!(
             max_err < 2e-3 * scale.max(1.0),
-            "aniso design raw-η second-diagonal mismatch on axis {a}: max_err={max_err:.3e} \
+            "aniso design raw-psi second-diagonal mismatch on axis {a}: max_err={max_err:.3e} \
              (scale={scale:.3e})"
         );
     }

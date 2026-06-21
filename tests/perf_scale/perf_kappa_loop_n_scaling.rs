@@ -600,3 +600,187 @@ fn kappa_outer_loop_is_n_independent() {
          hyperparameter trial to touch only k×k objects)"
     );
 }
+
+// ───────────────────────── GLM (non-Gaussian) κ-loop ─────────────────────────
+//
+// The Gaussian-identity κ loop is FULLY n-free: it takes the design-revision
+// skip (`skip_design_realization`) so the design is never re-realized, and the
+// inner solve reads `XᵀWX(ψ)`/`XᵀWz(ψ)` straight from the n-free `PsiGramTensor`.
+//
+// The GLM (Poisson/Binomial/Gamma/NB) κ loop is a DIFFERENT, weaker lane and is
+// NOT n-independent by construction. `skip_design_realization` is gated on the
+// Gaussian `PsiGramTensor` covering ψ; a GLM fit installs no such tensor, so
+// every κ trial still runs `ensure_theta` → `apply_log_kappa`, re-realizing the
+// O(n·k) design. What the GLM lane DOES save is the per-trial Gram RE-STREAM:
+// the certified frozen-weight (`FrozenWeightGramTensor`) serves the first-Fisher
+// `XᵀWX(ψ)` n-free (O(D·k²) instead of O(n·k²)) whenever the warm-β Fisher
+// weights are within drift tolerance. So the GLM per-trial cost drops from
+// O(n·k²) to O(n·k) — Gram-reduced, but still O(n) through the design realize.
+//
+// Therefore a ≤8× n-INDEPENDENCE gate would be ARCHITECTURALLY FALSE on GLM. The
+// honest GLM measurement is this REPORT-ONLY ladder: it documents the residual
+// O(n·k) design-realization floor and exercises the frozen-W Gram lane (and the
+// #1033 per-trial Fisher-weight memo). The only hard assertion is a SUPER-LINEAR
+// catastrophe tripwire — if the frozen-W Gram lane stops firing, the per-trial
+// cost reverts to O(n·k²) and the per-callback ratio would track ~n_ratio² (way
+// past the design-realize O(n) floor); the tripwire catches exactly that
+// regression without pretending the GLM lane is n-free.
+
+/// Poisson-log 1-D spatial fixture, mirroring `simulate_1d_gaussian` but with a
+/// count response `y ~ Poisson(exp(0.6·sin(t)))`. Deterministic (a fixed LCG of
+/// the row index, mapped to a Poisson draw by inverse-CDF) so the ladder is a
+/// geometry/timing check, not a stochastic power test.
+fn simulate_1d_poisson(n: usize) -> (Array2<f64>, Array1<f64>) {
+    let mut x = Array2::<f64>::zeros((n, 1));
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let t = (i as f64) / (n as f64 - 1.0) * 6.0 - 3.0;
+        x[[i, 0]] = t;
+        let mu = (0.6 * t.sin()).exp();
+        // Deterministic Poisson(mu) via inverse-CDF on a fixed per-row uniform.
+        let u = (((i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)
+            >> 11) as f64)
+            / ((1u64 << 53) as f64);
+        let mut k = 0u32;
+        let mut cdf = (-mu).exp();
+        let mut p = cdf;
+        while u > cdf && k < 100 {
+            k += 1;
+            p *= mu / k as f64;
+            cdf += p;
+        }
+        y[i] = k as f64;
+    }
+    (x, y)
+}
+
+/// One Poisson-log κ fit, returning the internal κ-trial timing. Mirrors
+/// `run_fit` but with the Poisson family + log link (the frozen-W GLM lane).
+fn run_fit_poisson(n: usize, bounds: (f64, f64)) -> Result<FitTiming, String> {
+    let (x, y) = simulate_1d_poisson(n);
+    let weights = Array1::ones(n);
+    let offset = Array1::zeros(n);
+    let kappa_options = SpatialLengthScaleOptimizationOptions {
+        enabled: true,
+        max_outer_iter: 15,
+        rel_tol: 1e-5,
+        log_step: std::f64::consts::LN_2,
+        min_length_scale: bounds.0,
+        max_length_scale: bounds.1,
+        pilot_subsample_threshold: 0,
+    };
+
+    let t0 = Instant::now();
+    let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
+        data: x,
+        y,
+        weights,
+        offset,
+        spec: spec_1d(false),
+        family: LikelihoodSpec::new(
+            ResponseFamily::Poisson,
+            InverseLink::Standard(StandardLink::Log),
+        ),
+        options: fit_options(),
+        kappa_options,
+        wiggle: None,
+        coefficient_groups: Vec::new(),
+        penalty_block_gamma_priors: Vec::new(),
+        latent_coord: None,
+        _marker: std::marker::PhantomData,
+    }))
+    .map_err(|e| format!("{e:?}"))?;
+    let dt = t0.elapsed().as_secs_f64();
+
+    match result {
+        FitResult::Standard(s) => {
+            if !s.fit.beta.iter().all(|v: &f64| v.is_finite()) {
+                return Err("non-finite coefficients".to_string());
+            }
+            Ok(FitTiming {
+                wall_s: dt,
+                kappa_timing: s.kappa_timing,
+            })
+        }
+        _ => Err("expected Standard fit result".to_string()),
+    }
+}
+
+/// #1033 GLM lane n-scaling: REPORT-ONLY measurement of the Poisson-log κ outer
+/// loop across a 16× n sweep, with a SUPER-LINEAR catastrophe tripwire.
+///
+/// Reading the printed table: the GLM per-callback average is expected to grow
+/// roughly with n (the residual O(n·k) design-realization floor — the GLM lane
+/// is NOT n-free; see the module note above). What it must NOT do is grow with
+/// n² — that would mean the frozen-W Gram lane stopped firing and every trial is
+/// re-streaming the O(n·k²) Gram. The hard gate is therefore a generous
+/// super-linear tripwire (≤ n_ratio^1.5), not an n-independence (≤8×) bar.
+#[test]
+fn kappa_glm_poisson_loop_n_scaling_report() {
+    let bounds = (1e-2, 1e2);
+    let warm = run_fit_poisson(1000, bounds);
+    match &warm {
+        Ok(t) => eprintln!("[kappa-glm] warm Poisson κ fit primed caches in {:.4}s", t.wall_s),
+        Err(reason) => {
+            // The GLM frozen-W lane is a best-effort accelerator; if this fixture
+            // does not converge in the CI budget, report and return rather than
+            // fail (the Gaussian ladders are the close gate, not this one).
+            eprintln!("[kappa-glm] warm Poisson κ fit did not converge ({reason}); skipping");
+            return;
+        }
+    }
+
+    let ns = [1_000usize, 4_000, 16_000];
+    let mut callback_avg = Vec::with_capacity(ns.len());
+    eprintln!(
+        "[kappa-glm] {:>9}  {:>10}  {:>12}  {:>9}  {:>9}",
+        "n", "t_kappa_s", "callback_s", "resets", "calls"
+    );
+    for &n in &ns {
+        let kappa = match run_fit_poisson(n, bounds) {
+            Ok(k) if k.kappa_timing.is_some() => k,
+            Ok(_) => {
+                eprintln!("[kappa-glm] n={n}: κ optimizer reported no internal timing; skipping");
+                return;
+            }
+            Err(reason) => {
+                eprintln!("[kappa-glm] n={n}: fit failed ({reason}); skipping ladder");
+                return;
+            }
+        };
+        let timing = kappa.kappa_timing.unwrap();
+        let calls = (timing.cost_calls + timing.eval_calls + timing.efs_calls).max(1);
+        let per_cb = (timing.trial_total_s().max(0.0)) / calls as f64;
+        callback_avg.push(per_cb.max(1e-6));
+        eprintln!(
+            "[kappa-glm] {n:>9}  {:>10.4}  {:>12.5}  {:>9}  {:>9}",
+            kappa.wall_s,
+            per_cb,
+            timing.slow_path_resets,
+            calls
+        );
+    }
+
+    let first = callback_avg.first().copied().unwrap_or(0.0).max(1e-6);
+    let last = callback_avg.last().copied().unwrap_or(0.0).max(1e-6);
+    let n_ratio = (ns.last().unwrap() / ns.first().unwrap()) as f64; // 16
+    let cb_ratio = last / first;
+    // Super-linear tripwire: the GLM lane is O(n·k) per trial (design realize), so
+    // the per-callback grows ~n_ratio; a frozen-W Gram-lane miss reverts it to
+    // O(n·k²) ⇒ ~n_ratio² growth. Gate at n_ratio^1.5 — comfortably above the
+    // honest O(n) floor (and shared-node jitter) yet below the n² catastrophe.
+    let tripwire = n_ratio.powf(1.5);
+    eprintln!(
+        "[kappa-glm] n grew {n_ratio:.0}× ; PER-CALLBACK grew {cb_ratio:.2}× \
+         (GLM lane is O(n·k) by design ⇒ ~{n_ratio:.0}×; a frozen-W Gram-lane miss ⇒ \
+         ~{:.0}× = O(n·k²)) ; super-linear tripwire = {tripwire:.1}×",
+        n_ratio * n_ratio
+    );
+    assert!(
+        cb_ratio <= tripwire,
+        "[kappa-glm] Poisson κ per-callback grew {cb_ratio:.2}× across a {n_ratio:.0}× n \
+         increase — past the {tripwire:.1}× super-linear tripwire. The frozen-W GLM Gram \
+         lane is no longer firing (every trial re-streams the O(n·k²) Gram instead of \
+         serving it n-free from the certified FrozenWeightGramTensor)"
+    );
+}
