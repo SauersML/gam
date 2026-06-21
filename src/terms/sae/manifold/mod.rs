@@ -138,6 +138,9 @@ mod term;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod sae_contract_probe_tests;
+
 pub use arrow_solver::*;
 pub use atom::*;
 pub use certificate::*;
