@@ -1304,7 +1304,10 @@ pub(crate) fn duchon_hybrid_kernel_stable_integral(
     s_order: usize,
     k_dim: usize,
 ) -> Result<f64, BasisError> {
-    debug_assert!(duchon_hybrid_stable_integral_applies(p_order, s_order, k_dim));
+    assert!(
+        duchon_hybrid_stable_integral_applies(p_order, s_order, k_dim),
+        "duchon_hybrid_kernel_stable_integral precondition violated: 2(p+s) > d and 2p < d required (p={p_order}, s={s_order}, d={k_dim})"
+    );
     let p = p_order as f64;
     let s = s_order as f64;
     let half_d = 0.5 * k_dim as f64;
