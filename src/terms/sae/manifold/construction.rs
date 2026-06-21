@@ -41,6 +41,27 @@ impl OuterGradientError {
             reason: err.to_string(),
         }
     }
+
+    /// The exact gate the gradient lane (`SaeManifoldOuterObjective::eval`) uses
+    /// to decide whether to descend with the #1273 central-difference fallback
+    /// instead of propagating the error as a hard failure.
+    ///
+    /// The fallback is admissible ONLY when BOTH hold:
+    /// * the REML cost at this rho is finite (a genuinely feasible point -- the
+    ///   FD supplies a descent direction for a value the analytic path already
+    ///   produced), and
+    /// * the error is a legitimate conditioning/identifiability failure
+    ///   ([`Self::is_fd_eligible`]) -- the genuine #1273 flat-valley case.
+    ///
+    /// A non-finite cost or an [`OuterGradientError::InternalInvariant`] must
+    /// propagate: masking a shape/indexing bug, a non-finite intermediate, or a
+    /// violated invariant behind a plausible-but-wrong FD step is exactly the
+    /// regression #1436 closes. Centralising the decision here (rather than
+    /// inlining the boolean at the call site) makes the `cost x error-class`
+    /// contract a single, directly unit-testable predicate.
+    pub(crate) fn admits_fd_fallback(&self, cost: f64) -> bool {
+        cost.is_finite() && self.is_fd_eligible()
+    }
 }
 
 impl std::fmt::Display for OuterGradientError {

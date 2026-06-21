@@ -8005,6 +8005,59 @@ pub(crate) fn outer_gradient_internal_invariant_is_not_fd_eligible_1436() {
     );
 }
 
+/// #1436 — exercise the EXACT gate `SaeManifoldOuterObjective::eval` consults,
+/// `OuterGradientError::admits_fd_fallback`, over the full `cost x error-class`
+/// matrix. `is_fd_eligible` alone does not capture the cost interaction the call
+/// site depends on; this pins the composed contract so the FD fallback can never
+/// silently absorb an internal-invariant failure NOR fire at an infeasible
+/// (non-finite-cost) ρ — both must propagate as hard errors.
+#[test]
+pub(crate) fn admits_fd_fallback_only_for_conditioning_at_finite_cost_1436() {
+    let ill = OuterGradientError::IllConditioned {
+        reason: "near-singular joint Hessian".to_string(),
+    };
+    let non_id = OuterGradientError::NonIdentifiable {
+        reason: "gauge-degenerate direction".to_string(),
+    };
+    let internal = OuterGradientError::InternalInvariant {
+        reason: "shape mismatch".to_string(),
+    };
+
+    // Finite cost: only the genuine #1273 conditioning/identifiability classes
+    // admit the FD descent direction.
+    assert!(
+        ill.admits_fd_fallback(1.0),
+        "IllConditioned at a finite-cost ρ must admit the #1273 FD fallback"
+    );
+    assert!(
+        non_id.admits_fd_fallback(1.0),
+        "NonIdentifiable at a finite-cost ρ must admit the #1273 FD fallback"
+    );
+    assert!(
+        !internal.admits_fd_fallback(1.0),
+        "InternalInvariant must NEVER admit the FD fallback, even at a finite \
+         cost (#1436) — it must propagate as a hard error"
+    );
+
+    // Non-finite cost (infeasible point): NOTHING admits FD, not even an
+    // otherwise-eligible conditioning failure — there is no feasible value path
+    // to descend.
+    for bad_cost in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+        assert!(
+            !ill.admits_fd_fallback(bad_cost),
+            "IllConditioned must NOT admit FD at non-finite cost {bad_cost}"
+        );
+        assert!(
+            !non_id.admits_fd_fallback(bad_cost),
+            "NonIdentifiable must NOT admit FD at non-finite cost {bad_cost}"
+        );
+        assert!(
+            !internal.admits_fd_fallback(bad_cost),
+            "InternalInvariant must NOT admit FD at non-finite cost {bad_cost}"
+        );
+    }
+}
+
 #[test]
 pub(crate) fn deflated_solver_matches_plain_solve_when_no_gauge_is_installed() {
     let cache = diagonal_latent_cache(&[2.0_f64, 5.0, 7.0]);

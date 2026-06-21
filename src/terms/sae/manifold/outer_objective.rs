@@ -1538,12 +1538,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
         let gradient = match analytic {
             Ok(components) => components.gradient(),
             Err(analytic_err) => {
-                if !cost.is_finite() || !analytic_err.is_fd_eligible() {
+                if !analytic_err.admits_fd_fallback(cost) {
                     // #1436: propagate non-FD-eligible errors (InternalInvariant)
-                    // as hard failures instead of silently masking them with an
-                    // FD descent direction. Only IllConditioned /
-                    // NonIdentifiable at a finite-cost ρ route to the FD
-                    // fallback.
+                    // and non-finite-cost points as hard failures instead of
+                    // silently masking them with an FD descent direction. Only
+                    // IllConditioned / NonIdentifiable at a finite-cost ρ route to
+                    // the FD fallback (see `OuterGradientError::admits_fd_fallback`).
                     return Err(EstimationError::RemlOptimizationFailed(
                         analytic_err.to_string(),
                     ));
