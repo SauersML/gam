@@ -32,6 +32,19 @@ use gam::terms::term_builder::build_termspec;
 use gam::types::LikelihoodSpec;
 use ndarray::{Array1, Array2};
 
+/// Number of chart points per fitted dataset. The default is CI-affordable; the
+/// signal is identified by the chart GEOMETRY (radius, noise_sd), not the row
+/// count, so the strong sign-recovery / flatness asserts below hold at the
+/// smaller default. Setting `GAM_HEAVY` restores the full n=2000 used on the
+/// cluster.
+fn n_obs() -> usize {
+    if std::env::var("GAM_HEAVY").is_ok() {
+        2000
+    } else {
+        600
+    }
+}
+
 // --- deterministic RNG (splitmix64 → unit / gaussian), no external deps ------
 
 fn splitmix64(state: &mut u64) -> u64 {
@@ -208,7 +221,6 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
 /// gate for that fix. Prints the full V_p / deviance / penalty grid for
 /// diagnosis on failure.
 #[test]
-#[ignore = "cluster-only #944 profiled κ grid; runs many fixed-curvature fits"]
 fn vp_grid_identifies_planted_kappa_sign() {
     use gam::smooth::SmoothBasisSpec;
     let options = FitOptions::default();
@@ -218,7 +230,7 @@ fn vp_grid_identifies_planted_kappa_sign() {
     };
     let grid = [-1.9_f64, -1.0, -0.5, 0.0, 0.5, 1.0, 1.9];
     for (label, kappa_star) in [("hyperbolic", -2.0), ("flat", 0.0), ("spherical", 2.0)] {
-        let (feats, y) = dataset_on_m_kappa(2000, kappa_star, 0.68, 0.02, 0xD1A6_0001);
+        let (feats, y) = dataset_on_m_kappa(n_obs(), kappa_star, 0.68, 0.02, 0xD1A6_0001);
         let n = y.len();
         let mut frame = Array2::<f64>::zeros((n, 3));
         for i in 0..n {
@@ -301,9 +313,8 @@ fn vp_grid_identifies_planted_kappa_sign() {
 }
 
 #[test]
-#[ignore = "cluster-only #944 e2e curvature inference fit"]
 fn spherical_truth_recovers_positive_kappa_and_rejects_flat() {
-    let (feats, y) = dataset_on_m_kappa(2000, 2.0, 0.68, 0.02, 0x5151_0001);
+    let (feats, y) = dataset_on_m_kappa(n_obs(), 2.0, 0.68, 0.02, 0x5151_0001);
     let inf = fit_and_infer(&feats, &y);
     log::debug!(
         "[spherical] κ̂={:.4} CI=[{:.4}, {:.4}] verdict={:?} flat_p={:.4} lr={:.4}",
@@ -332,9 +343,8 @@ fn spherical_truth_recovers_positive_kappa_and_rejects_flat() {
 }
 
 #[test]
-#[ignore = "cluster-only #944 e2e curvature inference fit"]
 fn flat_truth_does_not_reject_flatness() {
-    let (feats, y) = dataset_on_m_kappa(2000, 0.0, 0.68, 0.02, 0x5151_0002);
+    let (feats, y) = dataset_on_m_kappa(n_obs(), 0.0, 0.68, 0.02, 0x5151_0002);
     let inf = fit_and_infer(&feats, &y);
     log::debug!(
         "[flat] κ̂={:.4} CI=[{:.4}, {:.4}] verdict={:?} flat_p={:.4} lr={:.4}",
@@ -361,9 +371,8 @@ fn flat_truth_does_not_reject_flatness() {
 }
 
 #[test]
-#[ignore = "cluster-only #944 e2e curvature inference fit"]
 fn hyperbolic_truth_recovers_negative_kappa_and_rejects_flat() {
-    let (feats, y) = dataset_on_m_kappa(2000, -2.0, 0.68, 0.02, 0x5151_0003);
+    let (feats, y) = dataset_on_m_kappa(n_obs(), -2.0, 0.68, 0.02, 0x5151_0003);
     let inf = fit_and_infer(&feats, &y);
     log::debug!(
         "[hyperbolic] κ̂={:.4} CI=[{:.4}, {:.4}] verdict={:?} flat_p={:.4} lr={:.4}",
