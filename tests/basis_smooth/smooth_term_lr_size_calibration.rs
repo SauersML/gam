@@ -228,13 +228,10 @@ fn size_se(alpha: f64, reps: usize) -> f64 {
 fn exhaustive_null_simulation_size_grid() {
     init_parallelism();
 
-    let heavy = false;
-    let reps: usize = if heavy { 600 } else { 120 };
-    let ns: &[usize] = if heavy {
-        &[30usize, 50, 100, 200, 500]
-    } else {
-        &[30usize, 100]
-    };
+    // Fixed CI-affordable grid (the exhaustive larger-n grid is a separate MSI
+    // artifact, not an env/cfg branch). The calibration claim holds on this grid.
+    let reps: usize = 120;
+    let ns: &[usize] = &[30usize, 100];
     let ks = [6usize, 12];
     let families = [NullFamily::PoissonLog, NullFamily::BernoulliLogit];
 
@@ -266,7 +263,7 @@ fn exhaustive_null_simulation_size_grid() {
         }
     }
 
-    assert_grid_calibration(&cells, reps, if heavy { "exhaustive" } else { "light" });
+    assert_grid_calibration(&cells, reps, "light");
 }
 
 /// BOUNDED CI SIZE CHECK (#939 deliverable 4): the small-`n` cells — where the
