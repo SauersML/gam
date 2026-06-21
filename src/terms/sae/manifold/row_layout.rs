@@ -26,11 +26,23 @@ use super::*;
 ///
 /// For JumpReLU the active set is exactly the gated support
 /// (`a_{n,k} ≠ 0`), so the compact solve is identity to the dense solve.
-/// For softmax / IBP-MAP the active set is the union of a top-`k_active_cap`
+/// For IBP-MAP the active set is the union of a top-`k_active_cap`
 /// truncation and a magnitude cutoff on `a_{n,k}`; this is only enabled when
 /// `K` is large enough that the dense `(m_total · p)²` data Gram would not
 /// fit the host / device working-set budget, and the dropped atoms carry
 /// `O(a_{n,k}²)` curvature that is negligible by construction of the cutoff.
+///
+/// #1408: SOFTMAX does NOT currently engage this compact layout — the
+/// assemble dispatch returns `None` for `AssignmentMode::Softmax` (see
+/// `assemble_arrow_schur` in `construction.rs`), so a softmax fit retains the
+/// full `K`-atom row dimension regardless of `K` or `top_k`. Folding softmax
+/// `top_k` sparsity into the compact solve requires writing the active×active
+/// Gershgorin majorizer sub-block (the softmax entropy curvature is indefinite,
+/// so its raw diagonal cannot be used) AND extending the logdet trace and the
+/// θ-adjoint to contract that SAME majorizer over the compact logit slots, so
+/// value, `log|H|`, and Γ stay coherent — a coordinated change that needs the
+/// FD contract gates to certify. This `struct` already supports the layout; the
+/// softmax engagement is the unfinished half.
 #[derive(Debug, Clone)]
 pub struct SaeRowLayout {
     /// `active_atoms[row]` — sorted indices of active atoms for that row.

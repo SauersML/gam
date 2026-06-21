@@ -1451,6 +1451,26 @@ impl SurvivalLocationScaleFamily {
         {
             use crate::families::row_kernel::RowKernel;
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
+            // Fast exit before any `p_total²` allocation: the velocity pass adds
+            // exactly zero unless some row carries live qdot-derivative mass
+            // (φ′=d1_qdot1, φ″=d2_qdot1, φ‴=d_h_d). The per-row fold below
+            // short-circuits those rows individually, but the rayon
+            // `fold`/`reduce` still allocates a fresh `(p_total, p_total)`
+            // accumulator per task and per reduction even when EVERY row is
+            // inert — which is the non-time-varying-scale case the outer REML
+            // optimizer probes repeatedly. Skip the whole pass (and its
+            // transient `p²` matrices) when the contribution is provably zero.
+            // This is exact, not an approximation: the omitted term is 0. It
+            // directly removes the per-eval `p²·threads` transient implicated in
+            // the silent steady-RSS-growth survival location-scale hang (#1389).
+            let any_live_qdot = (0..self.n).any(|row| {
+                let w = row_mask.map_or(1.0, |m| m[row]);
+                w != 0.0
+                    && (q.d1_qdot1[row] != 0.0 || q.d2_qdot1[row] != 0.0 || q.d_h_d[row] != 0.0)
+            });
+            if !any_live_qdot {
+                return Ok(Some(joint));
+            }
             let kernel = self.survival_ls_row_kernel_rescaled(q, dynamic, deriv_log_scale);
             let d_beta_slice = d_beta_flat
                 .as_slice()
