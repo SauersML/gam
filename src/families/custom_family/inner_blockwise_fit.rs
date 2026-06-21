@@ -1943,6 +1943,28 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // explicitly below) so a non-finite trial cannot masquerade as a
             // fixed point.
             let mut first_attempt_trial_objective: Option<f64> = None;
+            // Frozen-step line-search short-circuit (n≈3e5 marginal-slope floor
+            // stall). Once the joint trust radius is pinned (the shrink rule
+            // clamps every block radius at the `1e-12` floor, so a reject can no
+            // longer reduce it), the Moré–Sorensen / dogleg step the next attempt
+            // builds is a deterministic function of the unchanged radii and the
+            // reverted β — byte-identical to this attempt, hence the same trial
+            // objective. The floor-stalled cycle therefore logged
+            // `JOINT_TRUST_MAX_ATTEMPTS` identical `reject_floor` lines, each a
+            // redundant full-data (320k-row) line-search sweep (~0.5 s apiece),
+            // every cycle until the cross-cycle stall guard fired — pure waste on
+            // the dominant cost of the inner solve. Track the previous rejected
+            // attempt's trial objective; when the radius is held AND the current
+            // rejected trial reproduces it bit-for-bit the step is provably frozen
+            // and the remaining attempts are no-ops, so stop. `frozen_floor_full_reject`
+            // records that the cycle was nonetheless fully rejected, preserving the
+            // `all_attempts_rejected` partition the cross-cycle stall guard relies
+            // on; `first_attempt_trial_objective` is still captured on attempt 0,
+            // so the byte-identical cross-cycle detector is unaffected and the
+            // converged/non-converged decision is byte-identical to exhausting the
+            // loop.
+            let mut prev_rejected_attempt_objective: Option<f64> = None;
+            let mut frozen_floor_full_reject = false;
             // Coalesce consecutive trust-region attempts whose accept/reject
             // outcome and numeric signature round to the same values, so a long
             // run of identical retries collapses into a single "attempts a..b
@@ -2762,6 +2784,25 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 }
                 refresh_all_block_etas(family, specs, &mut states)?;
                 objective_rejects += 1;
+                // Frozen-step short-circuit (see declaration). `radius_held` here
+                // means the post-reject shrink did not change the joint trust
+                // radius — i.e. the radii are pinned at the `1e-12` floor. If the
+                // trial objective also reproduces the previous rejected attempt's
+                // bit-for-bit, the dogleg/Moré–Sorensen step is frozen and every
+                // remaining attempt would re-reject the identical step: skip the
+                // redundant full-data sweeps and let the cross-cycle stall guard
+                // certify the fixed point.
+                if radius_held && trialobjective.is_finite() {
+                    if let Some(prev) = prev_rejected_attempt_objective {
+                        if prev.to_bits() == trialobjective.to_bits() {
+                            frozen_floor_full_reject = true;
+                            break;
+                        }
+                    }
+                    prev_rejected_attempt_objective = Some(trialobjective);
+                } else {
+                    prev_rejected_attempt_objective = None;
+                }
             }
             if let Some(sig) = tr_log_sig.take() {
                 if tr_log_first == tr_log_last {
@@ -2884,8 +2925,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // full rejection by the likelihood path at a collapsed trust
                 // radius is the same numerically-flat-no-descent stall as a
                 // full objective rejection; counting either lets the guard fire.
-                let all_attempts_rejected =
-                    model_rejects + likelihood_rejects + objective_rejects + feasibility_rejects
+                let all_attempts_rejected = frozen_floor_full_reject
+                    || model_rejects + likelihood_rejects + objective_rejects + feasibility_rejects
                         == JOINT_TRUST_MAX_ATTEMPTS;
                 let radius_held_since_last_reject = match prev_rejected_trust_radius {
                     Some(prev) => {
