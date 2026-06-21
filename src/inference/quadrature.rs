@@ -5371,16 +5371,14 @@ mod tests {
                 "w({re}+{im}i): got {w:?}, want ({wre},{wim})"
             );
         }
-        // Large |z|: w(z) ~ i/(√π z). Check the tail carries the right asymptotic.
-        let z = Complex { re: 3.0, im: 40.0 };
-        let w = faddeeva_upper_halfplane(z);
-        let inv_sqrt_pi = 0.5 * std::f64::consts::FRAC_2_SQRT_PI;
-        let den = z.re * z.re + z.im * z.im;
-        let asy_re = inv_sqrt_pi * z.im / den;
-        let asy_im = inv_sqrt_pi * z.re / den;
+        // Large |z| (deep in the series tail, |z|≈40): must stay machine-precise,
+        // not merely match the leading i/(√π z) asymptotic (which is only ~4e-6
+        // accurate there). Reference: wofz(3+40i).
+        let w = faddeeva_upper_halfplane(Complex { re: 3.0, im: 40.0 });
         assert!(
-            (w.re - asy_re).abs() < 1e-6 && (w.im - asy_im).abs() < 1e-6,
-            "tail asymptotic mismatch: w={w:?} asy=({asy_re},{asy_im})"
+            (w.re - 0.01402158696172506).abs() < 1e-13
+                && (w.im - 0.0010509664408184546).abs() < 1e-13,
+            "tail value mismatch: w={w:?}"
         );
     }
 
