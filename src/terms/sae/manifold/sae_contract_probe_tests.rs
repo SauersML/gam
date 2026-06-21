@@ -6,8 +6,13 @@
 //! objective contract.
 
 use super::*;
-use super::tests::{TestPeriodicEvaluator, diagonal_latent_cache, periodic_basis};
+use super::tests::{
+    TestPeriodicEvaluator, diagonal_latent_cache, periodic_basis,
+    warmstart_test_objective_with_evaluator,
+};
 use crate::terms::{AssignmentMode, LatentManifold, SaeAssignment};
+use approx::assert_abs_diff_eq;
+use ndarray::array;
 use std::sync::Arc;
 
 pub(crate) fn euclidean_line_contract_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho)
@@ -946,4 +951,73 @@ pub(crate) fn deflated_solver_matches_dense_quotient_pseudoinverse_on_near_null_
         .t;
     assert!(plain[1] > 1.0e13, "plain near-null solve must be huge");
     assert_abs_diff_eq!(stiffened[1], 0.5, epsilon = 1.0e-12);
+}
+
+#[test]
+pub(crate) fn pca_seed_handles_huge_equal_finite_columns_without_mean_overflow() {
+    let z = array![[1.0e308_f64, 1.0e308], [1.0e308, 1.0e308]];
+    let coords =
+        sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Periodic], &[1]).unwrap();
+    assert_eq!(coords.dim(), (1, 2, 1));
+    assert!(
+        coords.iter().all(|value| value.is_finite()),
+        "huge finite equal columns must not overflow the PCA seed mean: {coords:?}"
+    );
+}
+
+#[test]
+pub(crate) fn pca_seed_rejects_huge_finite_span_that_overflows_centering() {
+    let z = array![[1.0e308_f64, 0.0], [-1.0e308, 0.0]];
+    let err = sae_pca_seed_initial_coords(z.view(), &[SaeAtomBasisKind::Periodic], &[1])
+        .expect_err("opposite huge finite values exceed f64 centering range");
+    assert!(
+        err.contains("centered Z is non-finite") || err.contains("SVD failed"),
+        "unexpected PCA seed error: {err}"
+    );
+}
+
+// ---- Issue #972: low-rank Grassmann decoder frame verification ----
+
+/// `polar(M) = W Vᵀ` is exactly column-orthonormal and equals `M` when `M`
+/// is already orthonormal (idempotence of the polar projection on the
+/// Stiefel manifold), and recovers the planted span of a low-rank decoder.
+#[test]
+pub(crate) fn planted_low_rank_frame_recovered_by_polar() {
+    let p = 12usize;
+    let r = 3usize;
+    let n = 200usize;
+    // Planted orthonormal frame: first `r` canonical axes (any rotation
+    // would do; canonical axes make the angle assertion transparent).
+    let mut planted = Array2::<f64>::zeros((p, r));
+    for j in 0..r {
+        planted[[j, j]] = 1.0;
+    }
+    // Latent coords drive targets onto the planted span: targets = coords·plantedᵀ.
+    let mut coords = Array2::<f64>::zeros((n, r));
+    for i in 0..n {
+        for j in 0..r {
+            // Deterministic, index-keyed pseudo-data (no clock RNG).
+            let x = ((i * 7 + j * 13 + 1) % 97) as f64 / 97.0 - 0.5;
+            coords[[i, j]] = x;
+        }
+    }
+    let targets = fast_abt(&coords, &planted);
+    let angle = grassmann_recover_planted_span_angle(targets.view(), coords.view(), planted.view())
+        .expect("span recovery");
+    assert_abs_diff_eq!(angle, 0.0, epsilon = 1.0e-9);
+
+    // Polar of an already-orthonormal frame is itself (up to canonical sign).
+    let frame = GrassmannFrame::polar_update(planted.view()).expect("polar");
+    let recovered_angle = frame
+        .max_principal_angle(planted.view())
+        .expect("principal angle");
+    assert_abs_diff_eq!(recovered_angle, 0.0, epsilon = 1.0e-9);
+    // Orthonormality: UᵀU = I_r.
+    let gram = fast_atb(&frame.frame().to_owned(), &frame.frame().to_owned());
+    for i in 0..r {
+        for j in 0..r {
+            let expect = if i == j { 1.0 } else { 0.0 };
+            assert_abs_diff_eq!(gram[[i, j]], expect, epsilon = 1.0e-9);
+        }
+    }
 }
