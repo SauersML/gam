@@ -1337,13 +1337,14 @@ fn survival_ls_joint_jet_tower_oracle_body() {
 /// #932 single-source / packed-scalar contract: the production
 /// `row_third_contracted` / `row_fourth_contracted` (now evaluated through the
 /// PACKED directional scalars `OneSeed<9>` / `TwoSeed<9>` — 1.46 / 2.8 KiB,
-/// never the ~50 KiB dense `Tower4<9>`) must equal the dense-tower contraction
-/// `row_nll_tower(row).{third,fourth}_contracted(...)` to ≤ 1e-9. Both sides
-/// differentiate the SAME single expression (`sls_row_nll`); the only difference
-/// is the carried channel set (nilpotent ε/δ fold the contraction into the
-/// differentiation vs materialising `t3`/`t4` then contracting). A regression
-/// that desyncs the packed path from the dense tower — or reintroduces a
-/// separate hand directional tower — fails here. This is the oracle that lets
+/// never the ~50 KiB dense `Tower4<9>`) must equal the contraction of the
+/// INDEPENDENT dense `SurvivalLsJointNllProgram` `Tower4<9>` (a separate row-NLL
+/// implementation, not the production `sls_row_nll`) to ≤ 1e-9. The packed
+/// scalars fold the contraction direction INTO the differentiation via the
+/// nilpotent ε/δ, never materialising `t3`/`t4`; the independent tower
+/// materialises the full tensor then contracts. A regression that desyncs the
+/// packed path from the dense answer — or reintroduces a separate hand
+/// directional tower — fails here. This is the oracle that lets
 /// `row_kernel_directional_supported()` return true: the memory-bounded packed
 /// path is provably the dense-tower answer.
 #[test]
@@ -1360,6 +1361,7 @@ fn survival_ls_packed_directional_matches_dense_tower_932() {
 }
 
 fn survival_ls_packed_directional_matches_dense_tower_body() {
+    use crate::families::jet_tower::evaluate_program;
     use crate::families::row_kernel::RowKernel;
 
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
@@ -1401,12 +1403,24 @@ fn survival_ls_packed_directional_matches_dense_tower_body() {
             deriv_log_scale: 0.0,
             offsets: family.joint_block_offsets(),
         };
+        // INDEPENDENT dense ground truth: the `SurvivalLsJointNllProgram`
+        // `RowNllProgram<9>` (the same one the all-channels oracle uses) — a
+        // separate Tower4<9> implementation of the row NLL, NOT the production
+        // `sls_row_nll`. Comparing the packed production contractions against
+        // THIS independent tower (rather than `sls_row_nll` at `Tower4`) keeps
+        // the oracle's truth genuinely independent of the code under test.
+        let program = SurvivalLsJointNllProgram {
+            inverse_link: &inverse_link,
+            primaries: primaries.clone(),
+            event: event.to_vec(),
+            weight: weight.to_vec(),
+        };
 
         for row in 0..n {
             // Dense ground truth: build the full Tower4<9> once and contract its
             // t3 / t4 channels. The production methods must reproduce these
             // exactly through the packed OneSeed / TwoSeed scalars.
-            let tower = kernel.row_nll_tower(row).expect("dense row tower");
+            let tower = evaluate_program(&program, row).expect("dense row tower");
             for u in &dirs {
                 let dense_third = tower.third_contracted(u);
                 let packed_third =

@@ -147,9 +147,11 @@ pub enum CurvatureVerdict {
 
 /// Profile-likelihood confidence interval for the fitted curvature `κ̂`.
 ///
-/// The set is the Wilks region `{κ : 2[V_p(κ̂) − V_p(κ)] ≤ χ²_{1,1−α}}` where
+/// The set is the Wilks region `{κ : 2[V_p(κ) − V_p(κ̂)] ≤ χ²_{1,1−α}}` where
 /// `V_p` is the caller's profiled criterion (LAML/REML negative log-evidence,
-/// already maximised over ρ and any nuisance ψ at each κ). Because κ=0 is an
+/// already maximised over ρ and any nuisance ψ at each κ; `κ̂` is its minimiser,
+/// so the profile *drop* `V_p(κ) − V_p(κ̂) ≥ 0` is what the CI walk thresholds at
+/// `½χ²`). Because κ=0 is an
 /// **interior** point of the smooth `S^d ← ℝ^d → H^d` family, no half-χ²
 /// boundary correction is applied.
 #[derive(Clone, Copy, Debug)]

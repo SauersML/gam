@@ -459,17 +459,6 @@ impl SurvivalLsRowKernel<'_> {
         Ok((p, kernel))
     }
 
-    pub(crate) fn row_nll_tower(
-        &self,
-        row: usize,
-    ) -> Result<crate::families::jet_tower::Tower4<SLS_ROW_K>, String> {
-        use crate::families::jet_tower::Tower4;
-
-        let (p, kernel) = self.row_nll_inputs(row)?;
-        let vars: [Tower4<SLS_ROW_K>; SLS_ROW_K] =
-            std::array::from_fn(|a| Tower4::variable(p[a], a));
-        sls_row_nll(&vars, &kernel)
-    }
 }
 
 /// The survival location-scale row negative log-likelihood, written ONCE over a
