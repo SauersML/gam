@@ -8,6 +8,8 @@
 mod arrow_schur_bug_hunt;
 #[path = "regressions/bernoulli_marginal_slope_bug_hunt_1.rs"]
 mod bernoulli_marginal_slope_bug_hunt_1;
+#[path = "regressions/build_rs_ban_gates_present.rs"]
+mod build_rs_ban_gates_present;
 #[path = "regressions/bug_hunt_1089_small_n_gaussian_double_penalty_terminates.rs"]
 mod bug_hunt_1089_small_n_gaussian_double_penalty_terminates;
 #[path = "regressions/bug_hunt_874_cyclic_bs_cc_outer_loop_terminates.rs"]
