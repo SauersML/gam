@@ -2263,6 +2263,24 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
                 base.chi_uv[[gi, wi0]],
                 base.d_uv[[gi, wi0]],
             );
+            // gam#932 universal-oracle (per timepoint): the directional second
+            // derivatives must equal the finite difference of the base second
+            // derivatives along g — value and derivative are ONE source of
+            // truth. This is the desync class #932 targets, isolated per
+            // timepoint (entry vs exit, where the moving-boundary a-axis flux
+            // contributions previously diverged with opposite sign).
+            for (name, got, want) in [
+                ("eta_uv_dir", ext.eta_uv_dir[[gi, wi0]], fd(&|b| b.eta_uv[[gi, wi0]], 2e-3)),
+                ("chi_uv_dir", ext.chi_uv_dir[[gi, wi0]], fd(&|b| b.chi_uv[[gi, wi0]], 2e-3)),
+                ("d_uv_dir", ext.d_uv_dir[[gi, wi0]], fd(&|b| b.d_uv[[gi, wi0]], 2e-3)),
+            ] {
+                let scale = want.abs().max(1.0);
+                assert!(
+                    (got - want).abs() <= 1e-2 * scale + 1e-6,
+                    "gam#932 {label} {name}[g,w0] production {got:+.6e} != FD-of-base witness \
+                     {want:+.6e} (directional vs base moving-boundary desync)"
+                );
+            }
         };
         tp_diag("entry", q0v, primary.q0);
         tp_diag("exit", q1v, primary.q1);
