@@ -45,7 +45,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          fetch-depth: 1
+          fetch-depth: 0 # build.rs human-author gate needs the real last build.rs editor; a depth-1 clone makes git log return HEAD, false-failing every Claude-authored HEAD (#1458)
 
       - name: Install Rust 1.93.0
         uses: dtolnay/rust-toolchain@stable
@@ -90,7 +90,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          fetch-depth: 1
+          fetch-depth: 0 # build.rs human-author gate needs the real last build.rs editor; a depth-1 clone makes git log return HEAD, false-failing every Claude-authored HEAD (#1458)
 
       - name: Free runner disk space
         # ubuntu-latest ships with ~14 GB free on /. `cargo test --all-features`
@@ -457,7 +457,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          fetch-depth: 1
+          fetch-depth: 0 # build.rs human-author gate needs the real last build.rs editor; a depth-1 clone makes git log return HEAD, false-failing every Claude-authored HEAD (#1458)
 
       - name: Install Rust 1.93.0
         uses: dtolnay/rust-toolchain@stable
