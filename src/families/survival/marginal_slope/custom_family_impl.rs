@@ -431,6 +431,29 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             return Ok(None);
         }
 
+        // Rigid (non-flex, non-timewiggle, non-per-z) path: route the all-axes
+        // sweep through the shared batched row-kernel API. The bespoke per-axis
+        // loop below calls `exact_newton_joint_hessian_directional_derivative`
+        // once per coefficient axis, and that rigid branch rebuilds a
+        // `SurvivalMarginalSlopeRowKernel` (cloning the whole family + designs)
+        // and its per-row cache on EVERY axis — the `p`-fold cache rebuild the
+        // #979 Jeffreys hot path pays per arms-the-gate cycle. The batched API
+        // builds the kernel once and dispatches to the kernel's BLAS-3 all-axes
+        // override when present, falling back to the bit-identical per-axis sweep
+        // otherwise. Flex / time-wiggle / per-z directional derivatives route
+        // through their own dynamic-q evaluators, so they keep the per-axis path.
+        if !self.per_z_logslope_active()
+            && !self.effective_flex_active(block_states)?
+            && !self.flex_timewiggle_active()
+        {
+            let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+            let axes = crate::families::row_kernel::row_kernel_directional_derivative_all_axes(
+                &kern,
+                &crate::families::row_kernel::RowSet::All,
+            )?;
+            return Ok(Some(axes));
+        }
+
         let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
