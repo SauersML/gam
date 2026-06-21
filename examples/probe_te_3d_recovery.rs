@@ -111,7 +111,7 @@ fn main() {
     // 3-D grid to keep n moderate.
     let n = 600usize;
     let nte = 400usize;
-    let mut samp = |seed: u64, m: usize| {
+    let samp = |seed: u64, m: usize| {
         let mut rng = Lcg::new(seed);
         let mut x = vec![];
         let mut y = vec![];
