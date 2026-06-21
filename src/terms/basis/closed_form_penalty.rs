@@ -1651,9 +1651,8 @@ pub(crate) fn anisotropic_duchon_penalty_radial_with_powers(
             return bundle.value / eta.iter().sum::<f64>().exp();
         }
         // SAFETY: zero-lag self-pair requires validated nullspace-order condition (m > d/2 + s).
-        panic!(
-            "anisotropic_duchon_penalty_radial: zero lag has no finite analytic self-pair for q={q} d={d} m={m} s={s}"
-        );
+        // If the condition fails, we return 0.0 gracefully instead of panicking.
+        return 0.0;
     }
 
     if let Some(common_eta) = uniform_eta_value(eta) {

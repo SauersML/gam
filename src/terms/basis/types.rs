@@ -139,6 +139,9 @@ pub enum BasisError {
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    #[error("{0}")]
+    DenseDerivativeMaterializationRefused(String),
+
     #[error(
         "Radial basis derivative is undefined at center collision (r = 0) for {kernel} \
          with dim = {dim}, m = {m}: {message}. The first/second derivative of the \
@@ -1872,7 +1875,7 @@ pub(crate) fn should_cache_implicit_radial_components(
     implicit_radial_cache_bytes(n, k, n_axes) <= policy.max_operator_cache_bytes
 }
 
-pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usize) {
+pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usize) -> Result<(), BasisError> {
     let first = dense_design_bytes(n, p).saturating_mul(d_pc);
     let second = dense_design_bytes(n, p).saturating_mul(d_pc.saturating_mul(d_pc));
     // Consult the library default ResourcePolicy. Production large-scale runs
@@ -1894,21 +1897,24 @@ pub fn assert_no_dense_derivative_materialization(n: usize, p: usize, d_pc: usiz
             // reached this point has materialized something the strict
             // operator contract forbids.
             // SAFETY: AnalyticOperatorRequired forbids dense derivative materialization.
-            panic!(
+            Err(BasisError::DenseDerivativeMaterializationRefused(format!(
                 "spatial PC Duchon derivative designs must remain operator-backed; refused persistent dense derivative materialization (n={n}, p={p}, d_pc={d_pc}, first_order={:.1} MiB, second_order={:.1} MiB)",
                 first as f64 / (1024.0 * 1024.0),
                 second as f64 / (1024.0 * 1024.0),
-            );
+            )))
         }
         crate::resource::DerivativeStorageMode::MaterializeIfSmall
         | crate::resource::DerivativeStorageMode::DiagnosticsOnly => {
-            assert!(
-                needed <= budget,
-                "spatial PC Duchon derivative designs would exceed the single-materialization budget; refused persistent dense derivative materialization (n={n}, p={p}, d_pc={d_pc}, first_order={:.1} MiB, second_order={:.1} MiB, budget={:.1} MiB)",
-                first as f64 / (1024.0 * 1024.0),
-                second as f64 / (1024.0 * 1024.0),
-                budget as f64 / (1024.0 * 1024.0),
-            );
+            if needed > budget {
+                Err(BasisError::DenseDerivativeMaterializationRefused(format!(
+                    "spatial PC Duchon derivative designs would exceed the single-materialization budget; refused persistent dense derivative materialization (n={n}, p={p}, d_pc={d_pc}, first_order={:.1} MiB, second_order={:.1} MiB, budget={:.1} MiB)",
+                    first as f64 / (1024.0 * 1024.0),
+                    second as f64 / (1024.0 * 1024.0),
+                    budget as f64 / (1024.0 * 1024.0),
+                )))
+            } else {
+                Ok(())
+            }
         }
     }
 }

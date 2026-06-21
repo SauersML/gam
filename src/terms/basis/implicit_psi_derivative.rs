@@ -1971,7 +1971,7 @@ impl ImplicitDesignPsiDerivative {
             self.n_axes()
         );
         if self.enforces_dense_materialization_budget() {
-            assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
+            assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes())?;
         }
         if self.axis_combinations.is_some() {
             let combo = self.transformed_axis_combination(axis);
@@ -2032,7 +2032,7 @@ impl ImplicitDesignPsiDerivative {
             self.n_axes()
         );
         if self.enforces_dense_materialization_budget() {
-            assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
+            assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes())?;
         }
         if self.axis_combinations.is_some() {
             let combo = self.transformed_axis_combination(axis);
@@ -2122,7 +2122,7 @@ impl ImplicitDesignPsiDerivative {
             "implicit psi second cross materialization requires distinct axes: axis_d={axis_d}, axis_e={axis_e}"
         );
         if self.enforces_dense_materialization_budget() {
-            assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes());
+            assert_no_dense_derivative_materialization(self.n, self.p_out(), self.n_axes())?;
         }
         if self.axis_combinations.is_some() {
             let combo_d = self.transformed_axis_combination(axis_d);
