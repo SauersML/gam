@@ -2401,7 +2401,13 @@ pub fn build_smooth_basis(
                     // 0.0 sentinel = κ-independent auto initialization in the
                     // basis builder (median chart center spacing, doubled).
                     length_scale,
-                    double_penalty: smooth_double_penalty,
+                    // Curvature smooth defaults to NO double-penalty ridge
+                    // (#1464): the curvature-blind ridge `I` absorbs the data fit
+                    // independently of κ and rails the fitted curvature to the
+                    // +chart bound (hyperbolic truth recovered as spherical). The
+                    // RKHS Gram penalty is already full-rank PD, so the ridge adds
+                    // no stability. Honour an EXPLICIT `double_penalty=` only.
+                    double_penalty: option_bool(options, "double_penalty").unwrap_or(false),
                     identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
                 },
             })

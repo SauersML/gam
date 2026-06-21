@@ -125,7 +125,18 @@ impl Default for ConstantCurvatureBasisSpec {
             center_strategy: CenterStrategy::FarthestPoint { num_centers: 50 },
             kappa: 0.0,
             length_scale: 0.0,
-            double_penalty: true,
+            // No double-penalty ridge by default (#1464). The RKHS Gram penalty
+            // zᵀKz is strictly PD/full-rank on distinct centers, so it already
+            // regularizes every coefficient direction — the ridge `I` adds no
+            // stability. Worse, `I` is curvature-BLIND: with its own λ it absorbs
+            // the data fit independently of κ, so the κ outer coordinate sees only
+            // the monotone Occam term (positive κ compresses geodesic distances →
+            // kernel log-det shrinks) and rails to the +chart bound for any curved
+            // data, recovering hyperbolic truth as spherical. Dropping the ridge
+            // matches the single-penalty profiled-REML oracle
+            // (`profiled_reml_identifies_curvature_sign_with_effective_length`),
+            // which identifies the curvature SIGN.
+            double_penalty: false,
             identifiability: ConstantCurvatureIdentifiability::CenterSumToZero,
         }
     }
