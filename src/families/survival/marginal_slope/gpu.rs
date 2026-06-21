@@ -1317,6 +1317,7 @@ pub fn pullback_step6_joint_beta(
 
 /// Flattened SoA view of the Step-6 rows, plus the per-row dims/offsets the
 /// device kernel indexes.  Built once from `&[SurvivalFlexStep6RowPullback]`.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 struct Step6DeviceBatch {
     n_rows: usize,
@@ -1331,6 +1332,7 @@ struct Step6DeviceBatch {
     j_off: Vec<u32>,
 }
 
+#[cfg(target_os = "linux")]
 impl Step6DeviceBatch {
     fn build(rows: &[SurvivalFlexStep6RowPullback<'_>], p: usize) -> Result<Self, GpuError> {
         let n_rows = rows.len();
