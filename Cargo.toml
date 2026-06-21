@@ -32,16 +32,8 @@ path = "src/lib.rs"
 members = ["crates/gam-pyffi"]
 resolver = "3"
 
-# TEMPORARY (issue-team velocity): "warn" not "deny" so pre-existing unused lib
-# methods (dead-code on in-flight paths) don't make the whole test tree fail to
-# compile and block ALL verification. #1288's flip back to "deny" (8f754a117) was
-# premature — the dead-code cleanup it assumed isn't done yet (~15 dead-code
-# items remain). The build script emits a `cargo:warning` nag to restore "deny"
-# but no longer hard-fails on "warn", so the build stays green for everyone
-# while that cleanup finishes; flip both back to "deny" once it builds clean.
 [lints.rust]
 warnings = "deny"
-dead_code = "allow"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
