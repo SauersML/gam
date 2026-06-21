@@ -4286,21 +4286,25 @@ pub fn logit_posterior_mean_exact(mu: f64, sigma: f64) -> f64 {
 
     // #1459: the previous implementation evaluated the tanh partial-fraction
     // series Σ Im w(z_n) via a composite-Simpson Faddeeva evaluator that
-    // carried a systematic, σ-independent, μ-linear bias of ~3.7e-5 at μ=3
-    // — 4-5 orders worse than the cheap production GHQ path it was meant to
-    // certify. The bias structure (constant in σ, odd in μ, directed toward
+    // carried a systematic, sigma-independent, mu-linear bias of ~3.7e-5 at
+    // mu=3 — 4-5 orders worse than the cheap production GHQ path it was meant
+    // to certify. The bias structure (constant in σ, odd in μ, directed toward
     // 0.5) proved robust to the Faddeeva evaluator's quadrature parameters,
     // indicating a fundamental accuracy ceiling of the polynomial-based
     // series + low-order Faddeeva approach.
     //
     // The integral E[sigmoid(μ + σZ)] = (1/√π) ∫ e^{-t²} sigmoid(μ + √2σt) dt
-    // is a weighted-Gaussian integral whose integrand is entire (sigmoid is
-    // analytic everywhere), so Gauss-Hermite quadrature converges
-    // EXPONENTIALLY. A 128-point rule gives ~1e-15 accuracy — genuinely
-    // machine-precision, making this the true "exact" oracle. It is
-    // independent of the production `logit_posterior_mean` path (which uses a
-    // different adaptive GHQ implementation at lower order), so it remains a
-    // valid certification reference.
+    // is a weighted-Gaussian integral. The integrand sigmoid(μ + √2σt) is
+    // analytic on the real line and entire as a function of t only when σ is
+    // small (the logistic function is meromorphic with complex poles at odd
+    // multiples of iπ; the √2σ scaling moves them closer to the real axis as
+    // σ grows). Gauss-Hermite quadrature converges geometrically while the
+    // nearest complex pole stays far from the real axis relative to the GHQ
+    // node span, so a 128-point rule gives sub-1e-7 accuracy across the
+    // practical (μ, σ) range. This is independent of the production
+    // `logit_posterior_mean` path (which uses a different adaptive GHQ
+    // implementation at lower order), so it remains a valid certification
+    // reference.
     let rule = compute_gauss_hermite_n(128);
     let sqrt2_sigma = SQRT_2 * sigma;
     let inv_sqrt_pi = 1.0 / std::f64::consts::PI.sqrt();
@@ -5000,26 +5004,20 @@ mod tests {
     /// #1459 — the `_exact` oracle must match the independent reference to
     /// ~1e-7. The old Faddeeva-based path carried a σ-independent, μ-linear
     /// bias of ~1.24e-5·μ (~3.7e-5 at μ=3). After the GHQ rewrite, the oracle
-    /// is spectrally accurate across the full (μ, σ) range.
+    /// is spectrally accurate across the full (μ, σ) range. Exercises the
+    /// complete Cartesian grid {1, 3, -2} × {0.02, 0.05, 0.5, 2.0}.
     #[test]
     fn test_logit_posterior_mean_exact_no_mu_linear_bias_1459() {
-        for &(mu, sigma) in &[
-            (1.0, 0.02),
-            (1.0, 0.5),
-            (1.0, 2.0),
-            (3.0, 0.05),
-            (3.0, 0.5),
-            (3.0, 2.0),
-            (-2.0, 0.05),
-            (-2.0, 2.0),
-        ] {
-            let exact = logit_posterior_mean_exact(mu, sigma);
-            let reference = high_res_sigmoid_integral(mu, sigma);
-            let err = (exact - reference).abs();
-            assert!(
-                err < 1e-7,
-                "exact oracle bias at mu={mu}, sigma={sigma}: {err:.3e} (must be < 1e-7 after #1459)"
-            );
+        for &mu in &[1.0, 3.0, -2.0] {
+            for &sigma in &[0.02, 0.05, 0.5, 2.0] {
+                let exact = logit_posterior_mean_exact(mu, sigma);
+                let reference = high_res_sigmoid_integral(mu, sigma);
+                let err = (exact - reference).abs();
+                assert!(
+                    err < 1e-7,
+                    "exact oracle bias at mu={mu}, sigma={sigma}: {err:.3e} (must be < 1e-7 after #1459)"
+                );
+            }
         }
     }
 
