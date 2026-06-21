@@ -1809,15 +1809,29 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                 timeout_sec=brms_fold_timeout if brms_fold_timeout > 0 else None,
             )
             if code != 0:
+                # #1390: run_cmd reports rc=124 when a fold exceeded its
+                # per-invocation BENCH_BRMS_FOLD_TIMEOUT_SEC budget (as opposed to
+                # a genuine brms/Stan modeling error). Tag the recorded failure so
+                # the suite can distinguish a budget overrun from a model failure
+                # — the overrun is the expected, capped outcome that keeps a slow
+                # brms fold from consuming the whole shard, not a regression.
+                timed_out = code == 124
+                base_error = err.strip() or out.strip()
+                error_msg = (
+                    f"r_brms fold exceeded the per-fold timeout "
+                    f"({brms_fold_timeout:g}s); capped to protect the shard budget"
+                    if timed_out
+                    else base_error
+                )
                 return {
                     "contender": "r_brms",
                     "scenario_name": scenario["name"],
-                    "status": "failed",
+                    "status": "timeout" if timed_out else "failed",
                     "fold_id": int(fold_id),
                     "n_train": int(len(fold.train_idx)),
                     "n_test": int(len(fold.test_idx)),
                     "n_folds": int(len(folds)),
-                    "error": err.strip() or out.strip(),
+                    "error": error_msg,
                 }
             fold_row = json.loads(out_path.read_text())
             if fold_row.get("status") != "ok":
