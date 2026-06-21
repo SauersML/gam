@@ -331,7 +331,7 @@ impl ResidentArrowFrameHandle {
             // SAFETY: off-CUDA, `ResidentArrowFrameHandle::new` always returns
             // `Err(Unavailable)`, so no handle of this type is ever constructed and
             // this method is statically unreachable on non-Linux targets.
-            panic!("ResidentArrowFrameHandle cannot be constructed off CUDA")
+            f64::NAN
         }
         #[cfg(target_os = "linux")]
         {
