@@ -1455,8 +1455,7 @@ impl BernoulliMarginalSlopeFamily {
         let cell_moments_device: Option<cudarc::driver::CudaSlice<f64>> = if build_device_moments {
             use crate::gpu::kernels::cubic_cell::{
                 CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
-                CubicCellMomentResidency, CubicCellMomentStatus,
-                try_build_cubic_cell_derivative_moments,
+                CubicCellMomentResidency, try_build_cubic_cell_derivative_moments,
             };
             // Sanity: the per-row loop must have produced exactly one
             // entry per cell index.
@@ -1509,7 +1508,9 @@ impl BernoulliMarginalSlopeFamily {
                     // the other sails through.
                     let refused = status
                         .iter()
-                        .filter(|&&s| s != CubicCellMomentStatus::Ok as u8)
+                        .filter(|&&s| {
+                            s != crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8
+                        })
                         .count();
                     if refused > 0 {
                         log::info!(

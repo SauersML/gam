@@ -365,6 +365,61 @@ mod per_term_edf_tests {
         );
     }
 
+    /// Sibling of `by_factor_unpenalised_main_effect_does_not_zero_last_level_edf`
+    /// for the OTHER design skip condition. `design_construction.rs` skips an RE
+    /// penalty block when `range.is_empty() || !penalized` — so a PENALIZED random
+    /// effect with zero kept groups (every level filtered → empty coefficient
+    /// range) owns NO entry in the flat `penalty_block_trace` layout, exactly like
+    /// an unpenalised block. The summary cursor must mirror BOTH conditions: a
+    /// `k_pen = usize::from(penalized && !range.is_empty())` advance. A cursor that
+    /// keys only on `penalized` (the partial fix) still advances by 1 for the
+    /// empty penalized block and slides every following smooth's trace window one
+    /// block down — the same #1368 desync that zeroes the last level's EDF.
+    #[test]
+    fn empty_range_penalised_re_does_not_zero_last_level_edf() {
+        let n_levels = 5usize;
+        let dim = 20usize;
+        let fit = fit_by_factor_penalty_layout(n_levels);
+        let smooth_start = 1; // global layout: [empty penalised RE block(0 cols) | smooths]
+        let expected_per_smooth = 15.0_f64;
+        let tol = 1e-9;
+        // The leading RE block is PENALIZED but has an empty coefficient range,
+        // so the design pushed no penalty block for it (penalty_block_trace has
+        // only the n_levels smooth entries).
+        let re_penalized = true;
+        let re_range_empty = true;
+
+        // ── BUGGY walk: cursor keys only on `penalized`, advances by 1. ──
+        let mut buggy_cursor = usize::from(re_penalized);
+        let mut buggy_edfs = Vec::new();
+        for level in 0..n_levels {
+            let start = smooth_start + level * dim;
+            let edf = fit.per_term_edf(start..(start + dim), buggy_cursor, 1);
+            buggy_cursor += 1;
+            buggy_edfs.push(edf);
+        }
+        assert!(
+            buggy_edfs.last().copied().unwrap() <= tol,
+            "the penalized-only cursor must zero the last level's EDF, got {buggy_edfs:?}"
+        );
+
+        // ── FIXED walk: cursor mirrors BOTH design conditions. ──
+        let mut cursor = usize::from(re_penalized && !re_range_empty); // = 0
+        let mut edfs = Vec::new();
+        for level in 0..n_levels {
+            let start = smooth_start + level * dim;
+            let edf = fit.per_term_edf(start..(start + dim), cursor, 1);
+            cursor += 1;
+            edfs.push(edf);
+        }
+        for (level, &edf) in edfs.iter().enumerate() {
+            assert!(
+                (edf - expected_per_smooth).abs() < tol,
+                "level {level} EDF {edf} != expected {expected_per_smooth} (set {edfs:?})"
+            );
+        }
+    }
+
     /// Build a fit whose GLOBAL penalty layout opens with a shared
     /// `LinearTermRidge` block (trace `lead_trace`) followed by `block_traces`
     /// further penalty blocks, with NO influence matrix recorded — so

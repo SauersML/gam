@@ -1827,12 +1827,17 @@ impl JacobiPreconditioner {
 /// - `BetaBlockJacobi`: block-Jacobi per `block_offsets` term (#287).
 /// - `ClusterJacobi`: one dense block per beta-graph connected component.
 /// - `AdditiveSchwarz { overlap }`: component + `overlap`-hop expansion,
-///   overlapping columns averaged by partition-of-unity weights.
+///   overlapping columns averaged by partition-of-unity weights (full dense
+///   local-inverse apply per subdomain).
+/// - `DiagAssembledSchwarz { overlap }`: the cheap Schwarz variant (#299) —
+///   same overlapping decomposition, but each subdomain contributes only the
+///   diagonal of its local inverse `(A_k⁻¹)_ii`, assembled additively with
+///   partition-of-unity weights into a single `O(K)`-apply diagonal.
 ///
 /// ```text
-/// Future variants (see #299):
-///   DiagAssembledSchwarz { overlap: usize },
-///   SparseIncompleteCholesky,
+/// Remaining variant (still see #299):
+///   SparseIncompleteCholesky — only meaningful once a sparse `S` is
+///   materialised (it is not today), so left unimplemented by design.
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchurPreconditionerKind {
@@ -1840,6 +1845,7 @@ pub enum SchurPreconditionerKind {
     BetaBlockJacobi,
     ClusterJacobi,
     AdditiveSchwarz { overlap: usize },
+    DiagAssembledSchwarz { overlap: usize },
 }
 
 /// Escalate beyond BetaBlockJacobi only when K exceeds this value and PCG
@@ -1904,6 +1910,86 @@ impl std::fmt::Debug for ClusterFactor {
 /// Maximum columns per cluster before scalar fallback.
 pub(crate) const CLUSTER_JACOBI_MAX_CLUSTER: usize = 512;
 
+/// Assemble the dense `b×b` reduced-Schur block for the column set `cols`:
+/// `S[cols, cols] = H_ββ[cols, cols] + ridge·I − Σ_i H_tβ[cols]ᵀ (H_tt^i)⁻¹ H_tβ[cols]`.
+///
+/// Shared by `ClusterJacobiPreconditioner::build_from_column_groups` (which
+/// Cholesky-factors the returned block) and `DiagAssembledSchwarzPreconditioner`
+/// (which inverts each subdomain block and keeps only its diagonal). The result
+/// is the LOWER triangle filled by the row reduction; callers that need the full
+/// symmetric block must `symmetrize_upper_from_lower`.
+///
+/// The per-row Schur contribution is fanned over fixed 64-row chunks above
+/// `SCHUR_MATVEC_PARALLEL_ROW_MIN` and folded left-to-right so the assembly is
+/// bit-identical to the serial path (and run-to-run deterministic), exactly as
+/// in `build_block_jacobi` (#1017).
+pub(crate) fn assemble_local_schur_block<B: BatchedBlockSolver + Sync>(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    ridge_beta: f64,
+    backend: &B,
+    cols: &[usize],
+) -> Array2<f64> {
+    let d = sys.d;
+    let b = cols.len();
+    let mut s_block = Array2::<f64>::zeros((b, b));
+    // Initialise from H_ββ via penalty_subblock_add (#296): routes through
+    // penalty_op or falls back to hbb / hbb_diag inline.
+    sys.penalty_subblock_add(cols, &mut s_block);
+    for bi in 0..b {
+        s_block[[bi, bi]] += ridge_beta;
+    }
+    let cluster_row_into = |row_idx: usize, row: &ArrowRowBlock, acc: &mut Array2<f64>| {
+        let mut col_vec = Array1::<f64>::zeros(d);
+        let mut solved_cols = Array2::<f64>::zeros((d, b));
+        for bj in 0..b {
+            let gj = cols[bj];
+            for c in 0..d {
+                col_vec[c] = row.htbeta[[c, gj]];
+            }
+            let solved = backend.solve_block_vector(htt_factors.factor(row_idx), col_vec.view());
+            for c in 0..d {
+                solved_cols[[c, bj]] = solved[c];
+            }
+        }
+        for bi in 0..b {
+            let gi = cols[bi];
+            for bj in 0..b {
+                let mut dot = 0.0;
+                for c in 0..d {
+                    dot += row.htbeta[[c, gi]] * solved_cols[[c, bj]];
+                }
+                acc[[bi, bj]] -= dot;
+            }
+        }
+    };
+    let n = sys.rows.len();
+    let parallel = n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
+    if parallel {
+        use rayon::prelude::*;
+        const CHUNK: usize = 64;
+        let partials: Vec<Array2<f64>> = (0..n)
+            .into_par_iter()
+            .chunks(CHUNK)
+            .map(|idxs| {
+                let mut local = Array2::<f64>::zeros((b, b));
+                for i in idxs {
+                    cluster_row_into(i, &sys.rows[i], &mut local);
+                }
+                local
+            })
+            .collect();
+        for local in &partials {
+            s_block += local;
+        }
+    } else {
+        for (row_idx, row) in sys.rows.iter().enumerate() {
+            cluster_row_into(row_idx, row, &mut s_block);
+        }
+    }
+    s_block
+}
+
 /// Dense Schur block per connected component of the beta-coupling graph.
 ///
 /// Nodes = beta blocks (`block_offsets`); edges = rows where two blocks
@@ -1954,7 +2040,6 @@ impl ClusterJacobiPreconditioner {
         backend: &B,
         col_groups: &[Vec<usize>],
     ) -> Result<Self, ArrowSchurError> {
-        let d = sys.d;
         let mut clusters = Vec::with_capacity(col_groups.len());
         for cols in col_groups {
             let b = cols.len();
@@ -1969,73 +2054,8 @@ impl ClusterJacobiPreconditioner {
                 });
                 continue;
             }
-            let mut s_block = Array2::<f64>::zeros((b, b));
-            // Initialise from H_ββ via penalty_subblock_add (#296): routes
-            // through penalty_op or falls back to hbb / hbb_diag inline.
-            sys.penalty_subblock_add(cols, &mut s_block);
-            for bi in 0..b {
-                s_block[[bi, bi]] += ridge_beta;
-            }
-            // Per-row Schur contribution `-= H_tβ[cols]ᵀ (H_tt)⁻¹ H_tβ[cols]`,
-            // subtracted into a (possibly thread-local) `b×b` accumulator. The
-            // rows are independent, so this is the per-cluster analogue of the
-            // already row-parallel `build_block_jacobi` body (#1017): at the SAE
-            // LLM shape the `Σ_i di·b` triangular solves plus the `b²·di` cross
-            // product are the cluster build's whole per-row cost.
-            let cluster_row_into = |row_idx: usize, row: &ArrowRowBlock, acc: &mut Array2<f64>| {
-                let mut col_vec = Array1::<f64>::zeros(d);
-                let mut solved_cols = Array2::<f64>::zeros((d, b));
-                for bj in 0..b {
-                    let gj = cols[bj];
-                    for c in 0..d {
-                        col_vec[c] = row.htbeta[[c, gj]];
-                    }
-                    let solved =
-                        backend.solve_block_vector(htt_factors.factor(row_idx), col_vec.view());
-                    for c in 0..d {
-                        solved_cols[[c, bj]] = solved[c];
-                    }
-                }
-                for bi in 0..b {
-                    let gi = cols[bi];
-                    for bj in 0..b {
-                        let mut dot = 0.0;
-                        for c in 0..d {
-                            dot += row.htbeta[[c, gi]] * solved_cols[[c, bj]];
-                        }
-                        acc[[bi, bj]] -= dot;
-                    }
-                }
-            };
-            // Fan over fixed 64-row chunks above the threshold, staying serial for
-            // the handful-of-rows non-SAE callers and inside a rayon worker
-            // (topology-race nesting guard). Chunk partials are folded
-            // left-to-right so the result is bit-identical to the serial path.
-            let n = sys.rows.len();
-            let parallel =
-                n >= SCHUR_MATVEC_PARALLEL_ROW_MIN && rayon::current_thread_index().is_none();
-            if parallel {
-                use rayon::prelude::*;
-                const CHUNK: usize = 64;
-                let partials: Vec<Array2<f64>> = (0..n)
-                    .into_par_iter()
-                    .chunks(CHUNK)
-                    .map(|idxs| {
-                        let mut local = Array2::<f64>::zeros((b, b));
-                        for i in idxs {
-                            cluster_row_into(i, &sys.rows[i], &mut local);
-                        }
-                        local
-                    })
-                    .collect();
-                for local in &partials {
-                    s_block += local;
-                }
-            } else {
-                for (row_idx, row) in sys.rows.iter().enumerate() {
-                    cluster_row_into(row_idx, row, &mut s_block);
-                }
-            }
+            let mut s_block =
+                assemble_local_schur_block(sys, htt_factors, ridge_beta, backend, cols);
             symmetrize_upper_from_lower(&mut s_block);
             let factor_opt = {
                 use faer::Side;
@@ -2158,6 +2178,190 @@ impl AdditiveSchwarzPreconditioner {
         }
         out
     }
+}
+
+/// Diagonal-assembled additive Schwarz (#299).
+///
+/// The cheap Schwarz variant the domain-decomposition literature recommends as
+/// the default for sparse-coupling β-graphs: instead of storing and applying a
+/// dense Cholesky factor per overlapping subdomain (as
+/// [`AdditiveSchwarzPreconditioner`] does), it inverts each overlapping
+/// subdomain Schur block ONCE at build time and keeps only the **diagonal of the
+/// local inverse** `(A_k⁻¹)_ii`. Those per-subdomain diagonal contributions are
+/// then assembled additively across overlapping subdomains with partition-of-
+/// unity weights into a single global diagonal `m`, applied as `out[i] = m[i]·r[i]`.
+///
+/// This is strictly richer than scalar Jacobi (`1/S_ii`): the local inverse
+/// diagonal `(A_k⁻¹)_ii` folds in the off-diagonal coupling WITHIN the subdomain,
+/// so a strongly-coupled column gets a smaller (better-damped) effective scale
+/// than its bare reciprocal diagonal would give — while the apply stays `O(K)`
+/// (one multiply per column), unlike the `O(Σ b_k²)` triangular solves of dense
+/// Schwarz. For `overlap = 0` and one column per subdomain it reduces exactly to
+/// scalar Jacobi.
+#[derive(Debug, Clone)]
+pub struct DiagAssembledSchwarzPreconditioner {
+    /// Global per-column multiplier `m[i]`; `out[i] = m[i] · r[i]`.
+    pub(crate) inv_diag: Vec<f64>,
+}
+
+impl DiagAssembledSchwarzPreconditioner {
+    pub fn from_arrow_schur<B: BatchedBlockSolver + Sync>(
+        sys: &ArrowSchurSystem,
+        htt_factors: &ArrowFactorSlab,
+        ridge_beta: f64,
+        backend: &B,
+        overlap: usize,
+    ) -> Result<Self, ArrowSchurError> {
+        // Build the overlapping subdomain column groups exactly like
+        // AdditiveSchwarz (component partition + `overlap` graph-hop expansion),
+        // so the two Schwarz variants decompose the β space identically and
+        // differ only in how each subdomain's local inverse is applied.
+        let col_groups: Vec<Vec<usize>> = if sys.block_offsets.is_empty() {
+            vec![(0..sys.k).collect()]
+        } else {
+            let graph = BetaCouplingGraph::build(
+                &sys.block_offsets,
+                &sys.rows
+                    .iter()
+                    .map(|r| r.htbeta.clone())
+                    .collect::<Vec<_>>(),
+            );
+            graph
+                .component_partition()
+                .iter()
+                .map(|seed| {
+                    let mut current = seed.clone();
+                    for _ in 0..overlap {
+                        current = graph.expand_one_hop(&current);
+                    }
+                    let mut cols: Vec<usize> = current
+                        .iter()
+                        .flat_map(|&b| sys.block_offsets[b].clone())
+                        .collect();
+                    cols.sort_unstable();
+                    cols.dedup();
+                    cols
+                })
+                .collect()
+        };
+        Self::build_from_column_groups(sys, htt_factors, ridge_beta, backend, &col_groups)
+    }
+
+    pub(crate) fn build_from_column_groups<B: BatchedBlockSolver + Sync>(
+        sys: &ArrowSchurSystem,
+        htt_factors: &ArrowFactorSlab,
+        ridge_beta: f64,
+        backend: &B,
+        col_groups: &[Vec<usize>],
+    ) -> Result<Self, ArrowSchurError> {
+        // Partition-of-unity weights: a column shared by `c` subdomains gets each
+        // of its `c` diagonal contributions scaled by `1/c`, so the assembled
+        // diagonal is a convex combination (and reduces to a single contribution
+        // for non-overlapping columns).
+        let mut counts = vec![0u32; sys.k];
+        for cols in col_groups {
+            for &gi in cols {
+                counts[gi] += 1;
+            }
+        }
+        let mut accum = vec![0.0f64; sys.k];
+        for cols in col_groups {
+            let b = cols.len();
+            if b == 0 {
+                continue;
+            }
+            // For large subdomains, the dense inverse is too costly; fall back to
+            // the global scalar Schur diagonal inverse `1/S_ii` for those columns
+            // (the diag-assembled variant then coincides with scalar Jacobi over
+            // that subdomain, which is exactly the intended cheap degradation).
+            if b > CLUSTER_JACOBI_MAX_CLUSTER {
+                let inv = build_schur_scalar_inv(sys, htt_factors, ridge_beta, backend, cols)?;
+                for (local, &gi) in cols.iter().enumerate() {
+                    let w = if counts[gi] == 0 {
+                        1.0
+                    } else {
+                        1.0 / counts[gi] as f64
+                    };
+                    accum[gi] += w * inv[local];
+                }
+                continue;
+            }
+            let mut s_block =
+                assemble_local_schur_block(sys, htt_factors, ridge_beta, backend, cols);
+            symmetrize_upper_from_lower(&mut s_block);
+            // Diagonal of the local inverse `(A_k⁻¹)_ii`, obtained by solving
+            // `A_k X = I` through the same faer Cholesky used elsewhere; on a
+            // non-PD local block, degrade to the scalar reciprocal diagonal.
+            let local_inv_diag = match local_inverse_diagonal(&s_block) {
+                Some(diag) => diag,
+                None => {
+                    let inv = build_schur_scalar_inv(sys, htt_factors, ridge_beta, backend, cols)?;
+                    inv
+                }
+            };
+            for (local, &gi) in cols.iter().enumerate() {
+                let w = if counts[gi] == 0 {
+                    1.0
+                } else {
+                    1.0 / counts[gi] as f64
+                };
+                accum[gi] += w * local_inv_diag[local];
+            }
+        }
+        // A column never covered by any subdomain (only possible for `k` columns
+        // with no block_offsets coverage) keeps a neutral unit scale.
+        for (gi, &c) in counts.iter().enumerate() {
+            if c == 0 {
+                accum[gi] = 1.0;
+            }
+        }
+        for (gi, m) in accum.iter().enumerate() {
+            if !m.is_finite() || *m <= 0.0 {
+                return Err(ArrowSchurError::PcgFailed {
+                    reason: format!(
+                        "diag-assembled Schwarz: non-positive assembled diagonal at index {gi}: {m}"
+                    ),
+                });
+            }
+        }
+        Ok(Self { inv_diag: accum })
+    }
+
+    pub(crate) fn apply(&self, r: &Array1<f64>) -> Array1<f64> {
+        let mut out = Array1::<f64>::zeros(r.len());
+        for (gi, &m) in self.inv_diag.iter().enumerate() {
+            out[gi] = m * r[gi];
+        }
+        out
+    }
+}
+
+/// Diagonal of `A⁻¹` for a small dense SPD block `A`, via the same faer
+/// Cholesky used by the cluster/Schwarz factors. Returns `None` if `A` is not
+/// positive-definite (caller degrades to the scalar reciprocal diagonal).
+pub(crate) fn local_inverse_diagonal(a: &Array2<f64>) -> Option<Vec<f64>> {
+    let b = a.nrows();
+    let llt = {
+        use faer::Side;
+        let view = FaerArrayView::new(a);
+        FaerLlt::new(view.as_ref(), Side::Lower).ok()?
+    };
+    use faer::linalg::solvers::Solve;
+    let mut diag = Vec::with_capacity(b);
+    for col in 0..b {
+        // Solve `A x = e_col`; the `col`-th entry of `x` is `(A⁻¹)_{col,col}`.
+        let mut rhs = Array1::<f64>::zeros(b);
+        rhs[col] = 1.0;
+        let stride = rhs.strides()[0];
+        let len = rhs.len();
+        // SAFETY: `rhs` is a uniquely-borrowed contiguous `Array1<f64>` of `len`
+        // elements with positive row stride; a single column never dereferences
+        // the column stride, so `0` is sound.
+        let rhs_mat = unsafe { faer::MatRef::from_raw_parts(rhs.as_ptr(), len, 1, stride, 0) };
+        let solved = llt.solve(rhs_mat);
+        diag.push(solved[(col, 0)]);
+    }
+    Some(diag)
 }
 
 /// How a cluster factor's contribution is written into the output vector.
@@ -2463,24 +2667,55 @@ pub(crate) fn steihaug_pcg_auto<B: BatchedBlockSolver + Sync>(
         metric_weights,
         resident.as_ref(),
     )?;
-    // All three preconditioner tiers (Jacobi -> ClusterJacobi ->
-    // AdditiveSchwarz) exhausted their iteration budget without driving the
-    // residual below tolerance. Returning the truncated AdditiveSchwarz iterate
-    // as `Ok` would feed an arbitrarily-large-residual step into the Newton
-    // driver, where the PCG diagnostics are discarded. Surface a recoverable
-    // failure instead so `solve_with_lm_escalation_inner` escalates the
-    // proximal ridge: better conditioning is precisely what a stalled PCG on
-    // an ill-conditioned reduced system needs.
-    if diag2.stopping_reason == PcgStopReason::MaxIter {
+    if diag2.stopping_reason != PcgStopReason::MaxIter {
+        return Ok((x2, diag2));
+    }
+    // Final tier — diagonal-assembled additive Schwarz (#299), the cheap-apply
+    // Schwarz variant. When the dense-block AdditiveSchwarz still ran out of
+    // iterations its O(Σ b_k²) apply may have throttled the iteration budget on
+    // a wide subdomain; the diag-assembled variant keeps Schwarz's overlapping
+    // local-inverse conditioning but applies in O(K), so it can take more CG
+    // iterations within the same wall budget. Same overlap (1) and same
+    // curvature-floored ridge as the dense-block tier.
+    let diag_schwarz = DiagAssembledSchwarzPreconditioner::from_arrow_schur(
+        sys,
+        htt_factors,
+        effective_ridge,
+        backend,
+        1,
+    )?;
+    let (x3, diag3) = run_pcg_with_preconditioner(
+        sys,
+        htt_factors,
+        effective_ridge,
+        rhs,
+        |r| diag_schwarz.apply(r),
+        pcg,
+        trust,
+        backend,
+        gpu_matvec,
+        metric_weights,
+        resident.as_ref(),
+    )?;
+    // All four preconditioner tiers (Jacobi -> ClusterJacobi -> AdditiveSchwarz
+    // -> DiagAssembledSchwarz) exhausted their iteration budget without driving
+    // the residual below tolerance. Returning a truncated iterate as `Ok` would
+    // feed an arbitrarily-large-residual step into the Newton driver, where the
+    // PCG diagnostics are discarded. Surface a recoverable failure instead so
+    // `solve_with_lm_escalation_inner` escalates the proximal ridge: better
+    // conditioning is precisely what a stalled PCG on an ill-conditioned reduced
+    // system needs.
+    if diag3.stopping_reason == PcgStopReason::MaxIter {
         return Err(ArrowSchurError::PcgFailed {
             reason: format!(
                 "Schur PCG exhausted all preconditioner tiers (Jacobi, ClusterJacobi, \
-                 AdditiveSchwarz) at MaxIter; final relative residual = {:e}",
-                diag2.final_relative_residual
+                 AdditiveSchwarz, DiagAssembledSchwarz) at MaxIter; final relative \
+                 residual = {:e}",
+                diag3.final_relative_residual
             ),
         });
     }
-    Ok((x2, diag2))
+    Ok((x3, diag3))
 }
 
 /// Run Steihaug-CG with a generic preconditioner closure.

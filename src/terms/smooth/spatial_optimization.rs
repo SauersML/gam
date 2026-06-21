@@ -1993,6 +1993,26 @@ fn try_exact_joint_spatial_length_scale_optimization(
     const JOINT_RHO_BOUND: f64 = 12.0;
     let rho_dim = best.fit.lambdas.len();
 
+    // #1464: a constant-curvature `curv()` term's geodesic-exponential kernel
+    // COLLAPSES toward the constant function as κ grows positive (sphere
+    // distances compress), so its global REML optimum at the +κ side is a LARGE
+    // smoothing λ — often ρ > +JOINT_RHO_BOUND. With the symmetric ±12 box the
+    // joint [ρ,ψ] optimizer is structurally clamped into the shallow
+    // under-smoothing basin whose spuriously-low deviance rails κ̂ to the +chart
+    // bound for any curved data (hyperbolic truth mis-recovered as spherical).
+    // When a constant-curvature term is present, widen ONLY the over-smoothing
+    // (upper) ρ bound to the standard `RHO_BOUND`, leaving the lower bound at
+    // −JOINT_RHO_BOUND so an overfit origin is never reachable — the same
+    // asymmetric-bound rationale the standard scalar-ρ path uses for the
+    // gam#1266 high-λ basin. Every other spatial/Matérn/Duchon/sphere joint fit
+    // keeps the historical ±12 box byte-for-byte.
+    let has_constant_curvature_term = !constant_curvature_term_indices(resolvedspec).is_empty();
+    let rho_upper_bound = if has_constant_curvature_term {
+        crate::estimate::RHO_BOUND
+    } else {
+        JOINT_RHO_BOUND
+    };
+
     // Compute per-term dimensionality for anisotropic terms.
     let dims_per_term = spatial_dims_per_term(resolvedspec, spatial_terms);
     let use_aniso = has_aniso_terms(resolvedspec, spatial_terms);
@@ -2047,7 +2067,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     let setup = ExactJointHyperSetup::new(
         best.fit.lambdas.mapv(f64::ln),
         Array1::<f64>::from_elem(rho_dim, -JOINT_RHO_BOUND),
-        Array1::<f64>::from_elem(rho_dim, JOINT_RHO_BOUND),
+        Array1::<f64>::from_elem(rho_dim, rho_upper_bound),
         log_kappa0,
         log_kappa_lower,
         log_kappa_upper,
@@ -3538,6 +3558,10 @@ fn run_exact_joint_spatial_optimization(
         // #1066 2-D binomial geo, #1069 GP/kriging). p = baseline design column
         // count.
         Some((data.nrows(), baseline_design.design.ncols())),
+        // #1464: widen the over-smoothing ρ ceiling + seed a high-λ probe when a
+        // constant-curvature term is present (collapsing +κ kernel needs a large
+        // smoothing λ beyond the historical ±12 box).
+        !constant_curvature_term_indices(resolvedspec).is_empty(),
     );
 
     let eval_outer = |ctx: &mut &mut SpatialJointContext<'_>,
@@ -6436,11 +6460,29 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     // scale-free *absolute* floor and the solver's curvature reference are
     // corrected. `None` preserves the prior scale-free calibration.
     profiled_objective_size: Option<(usize, usize)>,
+    // #1464: `true` when the fit carries a constant-curvature `curv()` term. Its
+    // geodesic-exponential kernel collapses toward the constant function on the
+    // +κ side, so the joint REML optimum there is a LARGE smoothing λ beyond the
+    // historical ±12 ρ box. For that case the over-smoothing ρ ceiling is widened
+    // to `RHO_BOUND` and an explicit high-ρ over-smoothing multistart probe is
+    // seeded so the joint ARC can reach that basin. `false` keeps the historical
+    // ±12 box and seed grid byte-for-byte for every other spatial/Matérn/Duchon/
+    // sphere/survival joint fit.
+    has_constant_curvature: bool,
 ) -> crate::solver::rho_optimizer::OuterProblem {
     let mut seed_heuristic = theta0.to_vec();
     for value in &mut seed_heuristic[..rho_dim] {
         *value = value.exp();
     }
+    // Over-smoothing ρ ceiling: widened only for a constant-curvature fit (see
+    // the `has_constant_curvature` param doc). Drives both the scalar saturation
+    // reference and the seed-grid clamp; the actual box is the per-dim
+    // `lower`/`upper` arrays passed in.
+    let rho_ceiling = if has_constant_curvature {
+        crate::estimate::RHO_BOUND
+    } else {
+        12.0
+    };
     let mut problem = crate::solver::rho_optimizer::OuterProblem::new(n_params)
         .with_gradient(gradient)
         .with_hessian(hessian)
@@ -6463,8 +6505,19 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_initial_rho(theta0.clone())
         .with_bfgs_step_cap(bfgs_step_cap)
         .with_bfgs_step_cap_psi(bfgs_step_cap_psi)
-        .with_seed_config(exact_joint_seed_config(risk_profile, auxiliary_dim))
-        .with_rho_bound(12.0)
+        .with_seed_config({
+            let mut sc = exact_joint_seed_config(risk_profile, auxiliary_dim);
+            if has_constant_curvature {
+                // Let the seed grid reach the widened over-smoothing ceiling and
+                // place one explicit probe in the high-λ basin (#1464). The
+                // probe is ρ ≈ +15, comfortably inside [12, RHO_BOUND], where the
+                // collapsing +κ kernel's heavily-smoothed optimum lives.
+                sc.bounds = (sc.bounds.0, rho_ceiling);
+                sc.over_smoothing_probe_rho = Some(15.0);
+            }
+            sc
+        })
+        .with_rho_bound(rho_ceiling)
         .with_heuristic_lambdas(seed_heuristic);
     if let Some((n_obs, p_cols)) = profiled_objective_size {
         // Calibrate to the n-scaled profiled criterion (see the param doc):
@@ -6842,6 +6895,11 @@ where
         // n-scaled profiled-criterion calibration for every family (#1053 /
         // #1066 / #1069 iso-κ non-convergence cure).
         Some((n_total, joint_p_cols)),
+        // #1464: widen the over-smoothing ρ ceiling + seed a high-λ probe when
+        // any block carries a constant-curvature term.
+        block_specs
+            .iter()
+            .any(|s| !constant_curvature_term_indices(s).is_empty()),
     );
 
     // Helper: collect specs and designs from cache into owned Vecs for closure calls.
@@ -7565,6 +7623,9 @@ fn try_exact_joint_latent_coord_optimization(
         // n-scaled profiled-criterion calibration (same absolute-gradient-floor
         // correction as the spatial paths; #1053 / #1066 / #1069).
         Some((data.nrows(), best.design.design.ncols().max(1))),
+        // #1464: widen the over-smoothing ρ ceiling and seed the high-ρ probe
+        // only when a constant-curvature curv() term is present in this fit.
+        !constant_curvature_term_indices(resolvedspec).is_empty(),
     );
 
     let eval_outer = |ctx: &mut &mut LatentJointContext<'_>,

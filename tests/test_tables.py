@@ -149,7 +149,7 @@ def test_categorical_dtype_columns_dict_numeric_string_is_categorical() -> None:
 
     data = {"g": ["0", "1", "2", "0", "1"], "y": [1.0, 2.0, 3.0, 4.0, 5.0]}
     columns, kind = table_columns(data)
-    categorical = categorical_dtype_columns(data, columns, kind)
+    categorical = categorical_dtype_columns(data, kind, columns=columns)
     assert "g" in categorical, f"numeric-string column must be categorical: {categorical}"
     assert "y" not in categorical, f"float column must stay numeric: {categorical}"
 
@@ -161,7 +161,7 @@ def test_categorical_dtype_columns_dict_numeric_covariate_stays_numeric() -> Non
     # as categorical — only string-valued columns are.
     data = {"age": [25.0, 30.0, 35.5], "y": [1.0, 2.0, 3.0]}
     columns, kind = table_columns(data)
-    categorical = categorical_dtype_columns(data, columns, kind)
+    categorical = categorical_dtype_columns(data, kind, columns=columns)
     assert categorical == frozenset(), f"numeric columns must stay numeric: {categorical}"
 
 
@@ -170,7 +170,7 @@ def test_categorical_dtype_columns_records_numeric_string_is_categorical() -> No
 
     recs = [{"g": "0", "y": 1.0}, {"g": "1", "y": 2.0}, {"g": "2", "y": 3.0}]
     columns, kind = table_columns(recs)
-    categorical = categorical_dtype_columns(recs, columns, kind)
+    categorical = categorical_dtype_columns(recs, kind, columns=columns)
     assert "g" in categorical, f"records numeric-string must be categorical: {categorical}"
 
 
@@ -180,7 +180,7 @@ def test_categorical_dtype_columns_pandas_numeric_string_still_categorical() -> 
 
     df = pd.DataFrame({"g": ["0", "1", "2"], "y": [1.0, 2.0, 3.0]})
     columns, kind = table_columns(df)
-    categorical = categorical_dtype_columns(df, columns, kind)
+    categorical = categorical_dtype_columns(df, kind, columns=columns)
     assert "g" in categorical, f"pandas regression guard: {categorical}"
 
 

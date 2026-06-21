@@ -32,6 +32,17 @@ pub struct SeedConfig {
     /// dimensions are pinned to their heuristic initial values in every seed
     /// instead of being swept through the smoothing-parameter seeding grid.
     pub num_auxiliary_trailing: usize,
+    /// #1464: when set, append ONE extra over-smoothing multistart seed at this
+    /// absolute log-λ on every smoothing dimension (clamped to `bounds`),
+    /// auxiliary dims left at their heuristic values. The default global shift
+    /// sweeps reach only ≈ +4 from the anchor, so a smooth whose global REML
+    /// optimum is a LARGE λ — the collapsing geodesic-exponential `curv()` kernel
+    /// on the +κ side — is never seeded into its high-λ basin and the joint
+    /// optimizer relaxes into a shallow under-smoothing trap (κ̂ rails to the
+    /// +chart bound). This probe puts a start IN that basin so the
+    /// criterion-ranked screening can adopt it when it is genuinely cheaper.
+    /// `None` (default) preserves every existing seed grid byte-for-byte.
+    pub over_smoothing_probe_rho: Option<f64>,
 }
 
 impl Default for SeedConfig {
@@ -43,6 +54,7 @@ impl Default for SeedConfig {
             screen_max_inner_iterations: 3,
             risk_profile: SeedRiskProfile::GeneralizedLinear,
             num_auxiliary_trailing: 0,
+            over_smoothing_probe_rho: None,
         }
     }
 }
@@ -500,6 +512,21 @@ pub fn generate_rho_candidates(
     for &shift in global_shifts {
         let swept = primary.mapv(|v| clamp_to_bounds(v + shift, bounds));
         add_seed_dedup(&mut seeds, &mut seen, swept);
+    }
+
+    // #1464 over-smoothing probe: an ABSOLUTE high-λ start on every smoothing
+    // dimension (auxiliary dims left at the anchor's values; they are re-pinned
+    // below). The global shift sweeps above reach only ≈ +4 from the anchor, so
+    // a collapsing-kernel smooth whose true REML optimum is a large λ would never
+    // be seeded into its over-smoothing basin. This puts a candidate IN it; the
+    // keep-best multistart adopts it only when it scores strictly better, so it
+    // can never worsen a fit. `None` (the default) skips this entirely.
+    if let Some(probe_rho) = config.over_smoothing_probe_rho {
+        let mut probe = primary.clone();
+        for j in 0..num_smoothing {
+            probe[j] = clamp_to_bounds(probe_rho, bounds);
+        }
+        add_seed_dedup(&mut seeds, &mut seen, probe);
     }
 
     // Low-discrepancy exploratory seeds around the anchor for basin discovery.

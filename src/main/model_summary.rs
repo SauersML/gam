@@ -206,7 +206,16 @@ pub(crate) fn build_model_summary(
             .get(re_idx)
             .map(|t| t.penalized)
             .unwrap_or(true);
-        let k_pen = usize::from(penalized);
+        // The design's RE-penalty loop skips a block when EITHER it is
+        // unpenalised OR its coefficient range is empty (`design_construction.rs`
+        // `range.is_empty() || !penalized` → `continue`). A penalised RE term
+        // with zero kept groups (every level filtered) is exactly such an
+        // empty-range penalised block: it owns NO entry in the flat
+        // `lambdas`/`penalty_block_trace`/`edf_by_block` layout. Counting it here
+        // (advancing the cursor by 1) would slide `penalty_cursor` one block past
+        // every RE/smooth term that followed — the #1368 desync, just triggered by
+        // an empty range rather than `!penalized`. Mirror BOTH design conditions.
+        let k_pen = usize::from(penalized && !range.is_empty());
         let edf = fit.per_term_edf(range.clone(), penalty_cursor, k_pen);
         penalty_cursor += k_pen;
         // Random-effect smooths are variance-component tests on the boundary;

@@ -96,21 +96,27 @@ fn fit_kappa_hat(kappa_star: f64, seed: u64) -> f64 {
         .expect("fitted spec must carry a constant-curvature κ̂")
 }
 
-// #1464: the full `fit_from_formula` path used to rail κ̂ to the +chart bound
-// (~+1.08 at radius 0.68) for BOTH the spherical and the hyperbolic mirror
+// #1464 (fixed): the full `fit_from_formula` path used to rail κ̂ to the +chart
+// bound (~+1.08 at radius 0.68) for BOTH the spherical and the hyperbolic mirror
 // dataset, so the two signs were indistinguishable and hyperbolic truth was
 // mis-recovered as spherical. Basis-level effective-length L(κ) reparam +
 // `double_penalty:false` were already in place and the isolated profiled-REML
 // criterion (`constant_curvature_recovers_curvature_sign_1404`) already
 // identified the sign; the residual railing was a production inner-λ warm-seed
-// basin defect. Fix landed this run: anchor the criterion-ranked objective-grid
-// prepass at the warm seed so the inner λ-solve jumps into the correct high-λ
-// basin, adopting the grid result only when it strictly lowers the true REML cost
-// (healthy warm-started fits byte-identical). Kept `#[ignore]`d ONLY because the
-// landing run could not compile-verify (MSI/VPN down) — un-ignore in a follow-up
-// once a full build confirms this contract passes.
+// basin defect on TWO paths: (1) the standard scalar-ρ inner-λ path anchors the
+// criterion-ranked objective-grid prepass at the warm seed so the inner λ-solve
+// jumps into the correct high-λ basin (adopt only on strict REML-cost
+// improvement → healthy warm-started fits byte-identical) and reports the
+// converged ρ instead of the warm seed when it is strictly cheaper; (2) the
+// joint [ρ,ψ] spatial outer solver (the κ-optimized path this test drives) now
+// widens the ρ upper bound to RHO_BOUND and seeds a high-ρ over-smoothing corner
+// for constant-curvature terms so the joint ARC can reach the heavily-smoothed
+// collapsed-kernel basin. With the per-κ REML cost matching the textbook
+// profiled-REML, the curvature SIGN is identifiable again, so this contract
+// PASSES. This contract runs unconditionally in CI: re-`#[ignore]`ing it would
+// only hide a future regression behind a skip, which the ban gate forbids and
+// which is exactly the failure mode #1464 was.
 #[test]
-#[ignore = "#1464: inner-λ basin fix landed; un-ignore after build-verification"]
 fn curv_full_fit_identifies_curvature_sign_on_mirror_datasets() {
     init_parallelism();
 
