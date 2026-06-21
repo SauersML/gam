@@ -163,10 +163,15 @@ fn build_margslope(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalS
 /// wall budget. While the bug is unfixed this test is slow/fails — the
 /// coordinator's fix makes it pass.
 #[test]
-#[ignore = "cluster-only #979 wall-clock regression for full Bernoulli marginal-slope fit"]
 fn margslope_duchon_above_cliff() {
     gam::init_parallelism();
-    let n = 2000;
+    // The #979 blowup is in the marginal-slope machinery, not n: a regressed fit
+    // pathologically slows even at a moderate n. Default to a CI-affordable n and
+    // assert the fit actually COMPLETES with a finite result (the functional half
+    // of the guard); `GAM_HEAVY` restores the full n=2000 cliff repro and adds the
+    // wall-clock budget (shared-CI timing is only meaningful on the cluster).
+    let heavy = std::env::var("GAM_HEAVY").is_ok();
+    let n = if heavy { 2000 } else { 600 };
     let centers = 10;
     let (data, spec) = build_margslope(n, centers);
     let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
@@ -179,22 +184,39 @@ fn margslope_duchon_above_cliff() {
     let start = Instant::now();
     let result = fit_model(request);
     let elapsed = start.elapsed().as_secs_f64();
-    match result {
+    let out = match result {
         Ok(FitResult::BernoulliMarginalSlope(out)) => {
             eprintln!(
                 "[979-DUCHON] n={n} centers={centers} total_s={elapsed:.2} outer_iters={} inner_cycles={} converged={}",
                 out.fit.outer_iterations, out.fit.inner_cycles, out.fit.outer_converged
             );
+            out
         }
         Ok(_) => panic!("wrong FitResult variant"),
-        Err(e) => {
-            eprintln!("[979-DUCHON] n={n} centers={centers} total_s={elapsed:.2} FAILED: {e}")
-        }
-    }
+        Err(e) => panic!("[979-DUCHON] n={n} centers={centers} total_s={elapsed:.2} FAILED: {e}"),
+    };
+    // Functional guard (runs in default CI): the marginal-slope Duchon fit must
+    // complete and produce finite coefficients — a regressed/diverged fit fails
+    // here independently of any wall-clock budget.
     assert!(
-        elapsed < 120.0,
-        "margslope Duchon fit took {elapsed:.1}s at n={n} centers={centers} (budget 120s) — #979 binary slowdown"
+        !out.fit.blocks.is_empty(),
+        "margslope Duchon fit produced no coefficient blocks"
     );
+    assert!(
+        out.fit
+            .blocks
+            .iter()
+            .flat_map(|b| b.beta.iter())
+            .all(|v| v.is_finite()),
+        "margslope Duchon fit produced non-finite coefficients (#979 binary arm)"
+    );
+    // Wall-clock cliff repro: only meaningful at full n on the cluster.
+    if heavy {
+        assert!(
+            elapsed < 120.0,
+            "margslope Duchon fit took {elapsed:.1}s at n={n} centers={centers} (budget 120s) — #979 binary slowdown"
+        );
+    }
 }
 
 /// Control: the IDENTICAL pure-Duchon basis (centers=10, d=2) fitting a plain
@@ -202,10 +224,13 @@ fn margslope_duchon_above_cliff() {
 /// assert <30s. This proves the basis itself is cheap and isolates the blowup to
 /// the marginal-slope machinery, exactly matching the issue's measurement.
 #[test]
-#[ignore = "cluster-only #979 wall-clock control; shared CI timing is not stable"]
 fn duchon_gaussian_smooth_baseline_is_fast() {
     gam::init_parallelism();
-    let n = 2000;
+    // Control for `margslope_duchon_above_cliff`. Default to a CI-affordable n and
+    // assert the plain Gaussian Duchon fit COMPLETES with finite coefficients;
+    // `GAM_HEAVY` restores the full n=2000 and the ~30s basis-is-cheap budget.
+    let heavy = std::env::var("GAM_HEAVY").is_ok();
+    let n = if heavy { 2000 } else { 600 };
     let centers = 10;
     let (data, _z, y) = simulate(n);
 
@@ -250,14 +275,24 @@ fn duchon_gaussian_smooth_baseline_is_fast() {
         },
     );
     let elapsed = start.elapsed().as_secs_f64();
-    match result {
-        Ok(_) => {
+    let fit = match result {
+        Ok(fit) => {
             eprintln!("[979-DUCHON-GAUSS] n={n} centers={centers} total_s={elapsed:.2} (control)");
+            fit
         }
         Err(e) => panic!("plain Gaussian Duchon smooth fit failed: {e}"),
-    }
+    };
+    // Functional guard (runs in default CI): the basis fit must complete with
+    // finite coefficients.
     assert!(
-        elapsed < 30.0,
-        "plain Gaussian Duchon smooth took {elapsed:.1}s at n={n} centers={centers} (budget 30s) — the basis itself must be cheap (#979 control)"
+        !fit.fit.beta.is_empty() && fit.fit.beta.iter().all(|v| v.is_finite()),
+        "plain Gaussian Duchon smooth produced non-finite coefficients (#979 control)"
     );
+    // Wall-clock control: only meaningful at full n on the cluster.
+    if heavy {
+        assert!(
+            elapsed < 30.0,
+            "plain Gaussian Duchon smooth took {elapsed:.1}s at n={n} centers={centers} (budget 30s) — the basis itself must be cheap (#979 control)"
+        );
+    }
 }
