@@ -166,11 +166,6 @@ mod tests {
     pub struct Order2<const K: usize>(pub Tower2<K>);
 
     impl<const K: usize> Order2<K> {
-        /// Read the underlying value channel.
-        #[inline]
-        pub fn v(&self) -> f64 {
-            self.0.v
-        }
         /// Read the gradient channel.
         #[inline]
         pub fn g(&self) -> [f64; K] {
