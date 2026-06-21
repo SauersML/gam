@@ -1021,3 +1021,113 @@ pub(crate) fn planted_low_rank_frame_recovered_by_polar() {
         }
     }
 }
+
+/// Regression test for #1415: the JumpReLU third derivative consumed by the
+/// log-determinant θ-adjoint (`assignment_prior_hdiag_derivative_entry`) must be
+/// the EXACT derivative of the (separately certified) Hessian diagonal
+/// `P''(ℓ)=(λ/τ²)s(1−2a)`, namely `P'''(ℓ)=(λ/τ³)s(1−6a+6a²)`. The historical
+/// code used `(2λ/τ³)s²(1−2a)`, which is algebraically wrong and vanishes at the
+/// threshold (`a=1/2`) where the true value is `−λ/(8τ³)`.
+///
+/// Oracle: a 4th-order central finite difference of the exact `P''(ℓ)` formula
+/// (FD permitted only inside the test as an independent check of the closed
+/// form). Also pins the exact threshold value `−λ/(8τ³)` and asserts the
+/// production entry is strictly negative there (the old formula returned 0).
+#[test]
+fn jumprelu_hdiag_third_derivative_matches_central_difference_1415() {
+    use ndarray::{Array1, Array2, Array3};
+    let n = 6usize;
+    let k = 2usize;
+    let p = 3usize;
+    let temperature = 0.35_f64;
+    let threshold = 0.1_f64;
+    // Include the exact threshold (logit == θ ⇒ a = 1/2) plus in-band points.
+    let logits = Array2::<f64>::from_shape_vec(
+        (n, k),
+        vec![0.1, 0.0, 0.2, -0.05, 0.05, 0.15, 0.25, 0.3, -0.1, 0.12, 0.18, 0.08],
+    )
+    .expect("valid logit grid");
+    let atoms: Vec<SaeManifoldAtom> = (0..k)
+        .map(|i| {
+            SaeManifoldAtom::new(
+                &format!("atom{i}"),
+                SaeAtomBasisKind::EuclideanPatch,
+                1,
+                Array2::<f64>::ones((n, 2)),
+                Array3::<f64>::zeros((n, 2, 1)),
+                Array2::<f64>::zeros((2, p)),
+                Array2::<f64>::eye(2),
+            )
+            .unwrap()
+        })
+        .collect();
+    let coords: Vec<Array2<f64>> = (0..k).map(|_| Array2::<f64>::zeros((n, 1))).collect();
+    let manifolds = vec![LatentManifold::Euclidean; k];
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits.clone(),
+        coords,
+        manifolds,
+        AssignmentMode::jumprelu(temperature, threshold),
+    )
+    .expect("valid JumpReLU assignment");
+    let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+    let rho = SaeManifoldRho::new(0.7_f64.ln(), -6.0, vec![Array1::<f64>::zeros(1); k]);
+
+    let inv_tau = 1.0 / temperature;
+    let sparsity = rho.log_lambda_sparse.exp();
+    let in_band = |logit: f64| {
+        crate::terms::sae::assignment::jumprelu_in_optimization_band(logit, threshold, temperature)
+    };
+    // Exact, separately-certified Hessian diagonal P''(ℓ) as a function of ℓ.
+    let p2 = |logit: f64| -> f64 {
+        if !in_band(logit) {
+            return 0.0;
+        }
+        let a = crate::linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+        let s = a * (1.0 - a);
+        sparsity * s * (1.0 - 2.0 * a) * inv_tau * inv_tau
+    };
+
+    let mut saw_threshold = false;
+    for row in 0..n {
+        for atom in 0..k {
+            let logit = logits[[row, atom]];
+            if !in_band(logit) {
+                continue;
+            }
+            let entry = term.assignment_prior_hdiag_derivative_entry(
+                &rho,
+                row,
+                atom,
+                SaeLocalRowVar::Logit { atom },
+                None,
+            );
+            // Independent oracle: 4th-order central difference of exact P''(ℓ).
+            let h = 1.0e-3_f64;
+            let fd = (-p2(logit + 2.0 * h) + 8.0 * p2(logit + h) - 8.0 * p2(logit - h)
+                + p2(logit - 2.0 * h))
+                / (12.0 * h);
+            let scale = entry.abs().max(fd.abs()).max(1.0e-8);
+            assert!(
+                (entry - fd).abs() <= 1.0e-5 * scale,
+                "row {row} atom {atom}: P''' entry {entry:e} vs FD {fd:e}"
+            );
+
+            if (logit - threshold).abs() < 1e-12 {
+                saw_threshold = true;
+                // At ℓ=θ: a=1/2, s=1/4 ⇒ P'''=−λ/(8τ³); the old code gave 0.
+                let expected = -sparsity / 8.0 * inv_tau * inv_tau * inv_tau;
+                assert_abs_diff_eq!(entry, expected, epsilon = 1e-9);
+                assert!(
+                    entry < -1e-6,
+                    "threshold third derivative must be strictly negative (old buggy \
+                     formula returned 0): entry={entry:e}"
+                );
+            }
+        }
+    }
+    assert!(
+        saw_threshold,
+        "fixture must include a logit exactly at the threshold to pin −λ/(8τ³)"
+    );
+}
