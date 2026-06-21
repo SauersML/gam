@@ -945,25 +945,86 @@ pub fn select_thin_plate_knots(
         );
     }
 
-    // Deterministic seed point: lexicographically smallest row.
-    let mut seed_idx = 0usize;
-    for i in 1..n {
-        let mut choose_i = false;
+    // Rotation-equivariant maximin seed. The greedy farthest-point recursion
+    // below uses ONLY Euclidean distances, which are invariant under any rigid
+    // rotation of the covariates, so the only frame-dependent ingredients of
+    // the selected knot set are the seed point and the tie-break. A thin-plate
+    // spline is mathematically *exactly* rotation-invariant — its `r^{2m-d}`
+    // (log r) kernel depends only on the pairwise distance `r`, and its
+    // polynomial null space `span{1, x, …}` is mapped onto itself by any
+    // orthogonal map — so rotating the data must leave the fitted surface
+    // unchanged, which requires the knot SET to be rotation-invariant. The old
+    // lexicographically-smallest-coordinate seed broke exactly this: a rigid
+    // rotation changes which row is "lexicographically smallest", reseeding the
+    // recursion at a different physical point and selecting a genuinely
+    // different knot set — a 90° rotation about the centroid drifted the
+    // default `thinplate(x, z)` surface by ~2% of its range while a pure row
+    // permutation was bit-stable.
+    //
+    // Seed at the row nearest the data centroid instead. The centroid is
+    // rotation-EQUIVARIANT (it rotates rigidly with the data) and the
+    // nearest-row test is a Euclidean distance, so the SAME physical row is
+    // chosen in every rotated frame; both are pure functions of the unordered
+    // value set, so the seed also stays row-permutation invariant (gam#1378).
+    let centroid: Vec<f64> = (0..d)
+        .map(|c| {
+            let mut s = 0.0;
+            for i in 0..n {
+                s += data[[i, c]];
+            }
+            s / n as f64
+        })
+        .collect();
+    let dist2_to_centroid: Vec<f64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let mut d2 = 0.0;
+            for c in 0..d {
+                let delta = data[[i, c]] - centroid[c];
+                d2 += delta * delta;
+            }
+            d2
+        })
+        .collect();
+
+    // Value-lexicographic order on a candidate's COORDINATE VALUES (not its row
+    // index): a pure function of the unordered data value set. It is the final,
+    // measure-zero tie-break for points that coincide on every rotation-
+    // invariant key below. Breaking ties by row index instead made the selected
+    // knot SET depend on the row order of the data, so a pure permutation
+    // produced a different basis, different conditioning, and a different REML
+    // λ̂ (gam#1378, ~3% curve drift while value-anchored cr/ps were identical).
+    let value_less = |i: usize, j: usize| -> bool {
         for c in 0..d {
-            let ai = data[[i, c]];
-            let as_ = data[[seed_idx, c]];
-            if ai < as_ {
-                choose_i = true;
-                break;
+            let vi = data[[i, c]];
+            let vj = data[[j, c]];
+            if vi < vj {
+                return true;
             }
-            if ai > as_ {
-                break;
+            if vi > vj {
+                return false;
             }
         }
-        if choose_i {
-            seed_idx = i;
-        }
-    }
+        // Exactly equal coordinates: fall back to row index only to keep a
+        // total order (duplicate points are interchangeable in the basis).
+        i < j
+    };
+
+    // Seed = centroid-nearest row; equidistant ties resolved by the value order
+    // so the seed is a deterministic, rotation- and permutation-invariant
+    // function of the data.
+    let seed_idx = (0..n)
+        .into_par_iter()
+        .map(|i| (i, dist2_to_centroid[i]))
+        .reduce_with(|a, b| {
+            if b.1 < a.1 || (b.1 == a.1 && value_less(b.0, a.0)) {
+                b
+            } else {
+                a
+            }
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
 
     let mut selected = Vec::with_capacity(num_knots);
     let mut chosen = vec![false; n];
@@ -982,32 +1043,6 @@ pub fn select_thin_plate_knots(
     });
     min_dist2[seed_idx] = 0.0;
 
-    // Lexicographic order on a candidate's COORDINATE VALUES (not its row
-    // index). Farthest-point ties — two unselected points at exactly the same
-    // `min_dist2` to the chosen set — are common on a maximin grid and in
-    // float arithmetic, and breaking them by row index made the selected knot
-    // SET depend on the row order of the data: a pure permutation of the
-    // training rows then produced a different thin-plate basis, a different
-    // design conditioning, and a different REML λ̂ (gam#1378, ~3% curve drift,
-    // while value-anchored cr/ps were bit-identical). Break ties by the
-    // value-lexicographically smallest candidate instead — a pure function of
-    // the data value set — so the knots (and hence the whole fit) are
-    // row-permutation invariant, matching the value-based seed above.
-    let value_less = |i: usize, j: usize| -> bool {
-        for c in 0..d {
-            let vi = data[[i, c]];
-            let vj = data[[j, c]];
-            if vi < vj {
-                return true;
-            }
-            if vi > vj {
-                return false;
-            }
-        }
-        // Exactly equal coordinates: fall back to row index only to keep a
-        // total order (duplicate points are interchangeable in the basis).
-        i < j
-    };
     while selected.len() < num_knots {
         let best_idx = min_dist2
             .par_iter()
@@ -1015,11 +1050,20 @@ pub fn select_thin_plate_knots(
             .filter(|(i, _)| !chosen[*i])
             .map(|(i, &cand)| (i, cand))
             .reduce_with(|a, b| {
-                if b.1 > a.1 || (b.1 == a.1 && value_less(b.0, a.0)) {
-                    b
-                } else {
-                    a
-                }
+                // Maximin: take the larger min-distance to the chosen set.
+                // Exact `min_dist2` ties — common on regular grids and in float
+                // arithmetic — are resolved by a rotation-invariant key first
+                // (the larger distance to the centroid, which spreads knots
+                // outward and is a pure function of the unordered value set),
+                // and only by the value order for points that also tie there.
+                // This keeps the selected knot set invariant under both rigid
+                // rotation and row permutation of the data.
+                let pick_b = b.1 > a.1
+                    || (b.1 == a.1
+                        && (dist2_to_centroid[b.0] > dist2_to_centroid[a.0]
+                            || (dist2_to_centroid[b.0] == dist2_to_centroid[a.0]
+                                && value_less(b.0, a.0))));
+                if pick_b { b } else { a }
             })
             .map(|(i, _)| i);
         let next_idx = match best_idx {
