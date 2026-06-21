@@ -23,10 +23,19 @@
 # the slowest of these comfortable margin (observed worst-case single tests run
 # well under 5 min) while still terminating a genuine hang (an infinite solver
 # loop, a deadlock, a runaway line search) quickly enough to be useful and far
-# inside the 350-min job backstop. `terminate-after = 1` means: after the test
-# crosses 600s once, kill it immediately and fail it (rather than logging
-# repeated "slow" notices and letting it run unbounded).
-slow-timeout = { period = "600s", terminate-after = 1 }
+# inside the 350-min job backstop.
+#
+# #1393: the kill threshold is 600s, but we also want EARLY identification of
+# tests that are slow-but-still-passing — those are what sum up inside a sharded
+# binary and drive a partition toward its wall-clock cap, and the issue's core
+# ask is to surface which per-target tests are slow before the whole target is
+# at risk. `period = "300s"` emits a named "SLOW" notice the moment a test
+# crosses 300s; `terminate-after = 2` then SIGKILLs it after the SECOND period
+# (600s total) and fails it. So a genuine hang is still terminated at 600s and
+# attributed by name, AND any test that legitimately runs 300–600s is logged by
+# name as it crosses 300s — giving per-test slow attribution within each shard
+# without changing the kill budget.
+slow-timeout = { period = "300s", terminate-after = 2 }
 
 # Emit the live test list and final summary even on success so the CI
 # forbidden-pattern grep over the captured log has the per-test context, and so
