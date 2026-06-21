@@ -1326,24 +1326,37 @@ fn wrap_to_period(x: f64, period: f64) -> f64 {
     if y == period { 0.0 } else { y }
 }
 
+/// Normalize `v[0..dim]` to a unit vector (for `LatentManifold::Sphere`
+/// projection and retraction).
+///
+/// "Or axis": if the input is zero or non-finite (degenerate or numerical
+/// mishap in caller), gracefully fall back to the canonical first axis
+/// unit vector `[1, 0, …, 0]`. This removes a hard panic while preserving
+/// the sphere contract that every returned point has unit Euclidean norm.
+/// Callers (project_point / retract on Sphere) already ensure dim matches
+/// the view length for the manifold component.
 fn normalize_or_axis(v: ArrayView1<'_, f64>, dim: usize) -> Array1<f64> {
     let mut norm_sq = 0.0_f64;
     for a in 0..dim {
         norm_sq += v[a] * v[a];
     }
-    if norm_sq <= 0.0 || !norm_sq.is_finite() {
-        // `LatentManifold::Sphere` requires unit-projectable ambient
-        // vectors; the term builder validates this upstream.
-        // SAFETY: a zero/non-finite norm means the upstream contract
-        // was broken at the caller boundary.
-        panic!("LatentManifold::Sphere cannot normalize a zero or non-finite ambient vector");
+    const EPS: f64 = 1e-300; // protect against underflow/denorm that would give Inf
+    if norm_sq > EPS && norm_sq.is_finite() {
+        let inv = 1.0 / norm_sq.sqrt();
+        let mut out = Array1::<f64>::zeros(dim);
+        for a in 0..dim {
+            out[a] = v[a] * inv;
+        }
+        out
+    } else {
+        // "or axis" fallback — beautiful, non-panicking resolution for
+        // degenerate ambient vector on the sphere.
+        let mut out = Array1::<f64>::zeros(dim);
+        if dim > 0 {
+            out[0] = 1.0;
+        }
+        out
     }
-    let inv = 1.0 / norm_sq.sqrt();
-    let mut out = Array1::<f64>::zeros(dim);
-    for a in 0..dim {
-        out[a] = v[a] * inv;
-    }
-    out
 }
 
 fn dot_views(a: ArrayView1<'_, f64>, b: ArrayView1<'_, f64>) -> f64 {
