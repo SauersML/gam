@@ -456,3 +456,52 @@ fn row_block_dim_matches_k_times_one_plus_d() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Gate-mode row block dimension probe (#1442): confirms q = K + K*d for the
+// gate-style assignment families (JumpReLU / IBP-MAP), which keep ALL K
+// assignment coordinates because there is no probability-simplex constraint and
+// hence no fixed reference logit. This is exactly one coordinate larger than the
+// Softmax convention q = (K-1) + K*d pinned by
+// `row_block_dim_matches_k_times_one_plus_d` above. Together the two tests pin
+// BOTH branches of `assignment_coord_dim`
+// (src/terms/sae/assignment.rs:300-305), so a future change cannot silently
+// apply the reference-logit reduction to a gate mode (or drop it from Softmax)
+// without a test going red.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn gate_mode_row_block_dim_keeps_all_k_assignment_coords() {
+    let k_atoms = 16usize;
+    let d = 1usize;
+    // Gate modes parameterise every atom's gate independently -> all K
+    // assignment coords are present: q = K + K*d = 16 + 16 = 32. Softmax fixes
+    // one reference logit: q = (K-1) + K*d = 31. The gate dimension must be
+    // exactly one larger.
+    let gate_expected_q = k_atoms + k_atoms * d; // 32
+    let softmax_expected_q = (k_atoms - 1) + k_atoms * d; // 31
+    assert_eq!(
+        gate_expected_q,
+        softmax_expected_q + 1,
+        "the fixed Softmax reference logit must account for exactly one row coordinate"
+    );
+
+    let mut f = build_fixture(k_atoms, 4, d, 500, 2, AssignmentMode::jumprelu(1.0, 0.0));
+    let sys = f
+        .term
+        .assemble_arrow_schur(f.target.view(), &f.rho, None)
+        .unwrap_or_else(|e| panic!("assemble_arrow_schur failed: {e}"));
+
+    assert_eq!(
+        sys.d, gate_expected_q,
+        "gate-mode row block dim q mismatch: expected K + K*d = {gate_expected_q}, got {}",
+        sys.d
+    );
+    for (i, row) in sys.rows.iter().enumerate() {
+        assert_eq!(
+            row.htt.dim(),
+            (gate_expected_q, gate_expected_q),
+            "row[{i}].htt shape mismatch: expected ({gate_expected_q}, {gate_expected_q})"
+        );
+    }
+}
