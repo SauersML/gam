@@ -620,4 +620,69 @@ mod tests {
         let permuted_centers = select_equal_mass_centers(permuted.view(), num_centers).unwrap();
         assert_center_sets_match(base.view(), permuted_centers.view(), 1e-13);
     }
+
+    /// #1456: the low-rank equal-mass center selector must be rotation
+    /// EQUIVARIANT — rigidly rotating the inputs about their centroid rotates
+    /// the selected center SET by the same rotation (so the un-rotated centers
+    /// coincide with the base selection). The axis-aligned k-d split was
+    /// rotation-SENSITIVE (the "widest coordinate" flipped under rotation,
+    /// picking a different equal-mass set and drifting the fitted thin-plate
+    /// surface ~2% of the signal range); the principal-axis (closed-form
+    /// covariance-angle) split restores the invariant. Exercises an exact 90°
+    /// rotation (no floating rounding of its own) and a generic 0.7-rad angle.
+    #[test]
+    fn equal_mass_centers_are_rotation_equivariant() {
+        // ~300 deterministic points on an anisotropic cloud (a sheared lattice
+        // plus jitter), so leaves have a well-defined principal axis.
+        let n = 300usize;
+        let mut pts = Array2::<f64>::zeros((n, 2));
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = || {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            let v = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+            ((v >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        for r in 0..n {
+            let u = next();
+            let v = next();
+            // Shear to break isotropy (anisotropic principal axes per leaf).
+            pts[[r, 0]] = 2.0 * u - 1.0 + 0.6 * (2.0 * v - 1.0);
+            pts[[r, 1]] = 2.0 * v - 1.0;
+        }
+        let num_centers = 48usize;
+        let base = select_equal_mass_centers(pts.view(), num_centers).unwrap();
+
+        // Centroid (rotation pivot).
+        let mut cx = 0.0;
+        let mut cy = 0.0;
+        for r in 0..n {
+            cx += pts[[r, 0]];
+            cy += pts[[r, 1]];
+        }
+        cx /= n as f64;
+        cy /= n as f64;
+
+        for &(ca, sa) in &[(0.0_f64, 1.0_f64), (0.7f64.cos(), 0.7f64.sin())] {
+            let mut rot = Array2::<f64>::zeros((n, 2));
+            for r in 0..n {
+                let x = pts[[r, 0]] - cx;
+                let y = pts[[r, 1]] - cy;
+                rot[[r, 0]] = ca * x - sa * y + cx;
+                rot[[r, 1]] = sa * x + ca * y + cy;
+            }
+            let rotated_centers = select_equal_mass_centers(rot.view(), num_centers).unwrap();
+            // Un-rotate the centers selected in the rotated frame and require the
+            // SET to coincide with the base selection (equivariance).
+            let mut unrotated = Array2::<f64>::zeros((num_centers, 2));
+            for r in 0..num_centers {
+                let x = rotated_centers[[r, 0]] - cx;
+                let y = rotated_centers[[r, 1]] - cy;
+                unrotated[[r, 0]] = ca * x + sa * y + cx;
+                unrotated[[r, 1]] = -sa * x + ca * y + cy;
+            }
+            assert_center_sets_match(base.view(), unrotated.view(), 1e-9);
+        }
+    }
 }
