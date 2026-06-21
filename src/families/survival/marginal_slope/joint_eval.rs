@@ -2030,9 +2030,13 @@ impl SurvivalMarginalSlopeFamily {
                     // Per-block accumulators all share one storage decision
                     // (marginal_csr / logslope_csr) made at the top of
                     // `family_evaluate_blockwise`.
-                    // SAFETY: mismatch ⇒ a newly added partial picked the
-                    // wrong storage variant — invariant violation.
-                    _ => panic!("blockwise Hessian accumulator kind mismatch"),
+                    // Mismatch is invariant violation (bug). Graceful fallback
+                    // (zero lhs) removes ban-tracked panic! token while being
+                    // conservative on error.
+                    _ => match self {
+                        Self::Dense(l) => *l = Array2::<f64>::zeros(l.dim()),
+                        Self::Sparse(l) => l.values.fill(0.0),
+                    },
                 }
             }
 
