@@ -381,7 +381,7 @@ fn sample_standard(
     data: ArrayView2<'_, f64>,
     col_map: &HashMap<String, usize>,
     training_headers: Option<&Vec<String>>,
-    likelihood: LikelihoodSpec,
+    mut likelihood: LikelihoodSpec,
     cfg: &NutsConfig,
 ) -> Result<NutsResult, String> {
     if likelihood.is_gaussian_identity() {
@@ -457,6 +457,21 @@ fn sample_standard(
     let dense_design_hmc = design.design.to_dense();
     let p = dense_design_hmc.ncols();
     let fit = fit_result_from_saved_model_for_prediction(model)?;
+    // Refresh the NB overdispersion `theta` from the fit's jointly-estimated
+    // `theta_hat` before sampling. The construction seed stored on the family
+    // spec (`theta: 1.0`) only seeds the inner solve; the NUTS NB log-likelihood
+    // / score (`src/inference/hmc.rs`) reads `theta` straight off this spec, so
+    // leaving the seed in place over-states `Var(y) = μ + μ²/θ` and inflates
+    // every coefficient's posterior SD (#1463 — the HMC sibling of the
+    // replicate-path bug #1124). `theta_fixed` NB carries the user's exact value
+    // in both the spec and the scale metadata, so this refresh is a no-op there.
+    // Mirrors how the replicate path reads `theta_hat` via the canonical
+    // `family_noise_parameter` helper (`negbin_theta().or(seed)`).
+    if let ResponseFamily::NegativeBinomial { theta, .. } = &mut likelihood.response {
+        if let Some(theta_hat) = fit.likelihood_scale.negbin_theta() {
+            *theta = theta_hat;
+        }
+    }
     if fit.beta.len() != p {
         return Err(format!(
             "standard sample: saved model has {} coefficients but rebuilt design has {} columns",
