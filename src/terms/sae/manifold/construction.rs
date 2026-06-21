@@ -1822,14 +1822,19 @@ impl SaeManifoldTerm {
         Arc::from(ranges.into_boxed_slice())
     }
 
-    /// Decide whether the sparse per-row active-set layout is engaged for the
-    /// dense-weight assignment modes (softmax / IBP-MAP), and if so derive the
-    /// per-row active-atom cap and magnitude cutoff.
+    /// Decide whether the sparse per-row active-set layout is engaged for a
+    /// dense-weight assignment mode, and if so derive the per-row active-atom
+    /// cap and magnitude cutoff.
     ///
-    /// The decision is auto-derived from the problem size and the
-    /// device/host working-set budget — never a CLI flag or kwarg. JumpReLU is
-    /// not handled here (it always uses its structural gate via
-    /// [`SaeRowLayout::from_jumprelu`]). The dense Gauss-Newton data Gram `G`
+    /// #1408: although this plan is mode-agnostic, the `assemble_arrow_schur`
+    /// dispatch consults it ONLY for IBP-MAP. `AssignmentMode::Softmax` returns
+    /// `None` at the dispatch before reaching here, so softmax always keeps the
+    /// full `K`-atom layout (folding softmax `top_k` into the compact solve needs
+    /// the active-sub-block Gershgorin majorizer + coherent logdet/θ-adjoint
+    /// extension — see `SaeRowLayout`'s doc). The decision is auto-derived from
+    /// the problem size and the device/host working-set budget — never a CLI flag
+    /// or kwarg. JumpReLU is not handled here (it always uses its structural gate
+    /// via [`SaeRowLayout::from_jumprelu`]). The dense Gauss-Newton data Gram `G`
     /// is `(m_total × m_total)` f64; if its dense form fits the budget we keep
     /// the exact full-support solve (every atom active per row), so small-`K`
     /// problems are bit-for-bit unchanged. Above that, we cap each row to the
