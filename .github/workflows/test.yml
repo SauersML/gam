@@ -29,8 +29,13 @@ env:
   # sccache turns a cold dep graph warm without relying on a portable target/.
   # The same RUSTC_WRAPPER seam is honored by build.sh locally, so a shared
   # remote backend (SCCACHE_BUCKET) would let CI and dev share one cache.
+  # RUSTC_WRAPPER is deliberately NOT set here: sccache aborts at server
+  # startup if its cache backend is unreachable, so wiring every rustc through
+  # it unconditionally turns a GitHub Actions cache outage into a hard build
+  # failure. Each job instead enables the wrapper only after a backend probe
+  # (see "Enable sccache only if its cache backend is reachable"), keeping the
+  # cache a pure speedup that degrades to a cold-but-green build during outages.
   SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
 
 jobs:
   clippy:
@@ -50,6 +55,22 @@ jobs:
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Enable sccache only if its cache backend is reachable
+        # The compiler cache is a speedup, never a hard build dependency.
+        # sccache runs a storage check when its server starts and aborts the
+        # process if the backend (the GitHub Actions cache) is unreachable;
+        # with RUSTC_WRAPPER=sccache that would fail the build at the first
+        # `cargo` call. Probe the backend once by starting the server and wire
+        # the wrapper in only on success, so an outage degrades to a cold-but-
+        # green build instead of a hard failure.
+        shell: bash
+        run: |
+          if sccache --start-server; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          else
+            echo "::warning::sccache cache backend unreachable; compiling without the compiler cache"
+          fi
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -100,6 +121,22 @@ jobs:
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.6
+
+      - name: Enable sccache only if its cache backend is reachable
+        # The compiler cache is a speedup, never a hard build dependency.
+        # sccache runs a storage check when its server starts and aborts the
+        # process if the backend (the GitHub Actions cache) is unreachable;
+        # with RUSTC_WRAPPER=sccache that would fail the build at the first
+        # `cargo` call. Probe the backend once by starting the server and wire
+        # the wrapper in only on success, so an outage degrades to a cold-but-
+        # green build instead of a hard failure.
+        shell: bash
+        run: |
+          if sccache --start-server; then
+            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          else
+            echo "::warning::sccache cache backend unreachable; compiling without the compiler cache"
+          fi
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
