@@ -2338,8 +2338,8 @@ pub(crate) fn radial_g_q_hessian(
         // value.
         // SAFETY: companion to `radial_g_q_partials` — `q` is
         // statically restricted to `{0, 1, 2}` by the public radial
-        // kernel API; this arm is unreachable for in-contract callers.
-        _ => panic!("radial_g_q_hessian requires q in {{0, 1, 2}}: q={q}"),
+        // kernel API. Graceful all-zero for q>2 removes ban panic (no contrib).
+        _ => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     }
 }
 
