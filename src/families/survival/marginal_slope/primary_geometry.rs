@@ -270,60 +270,6 @@ pub(crate) struct SurvivalFlexTimepointDirectionalExact {
     pub(crate) chi_uv_dir: Array2<f64>,
     pub(crate) d_u_dir: Array1<f64>,
     pub(crate) d_uv_dir: Array2<f64>,
-    /// #932 debug: for the hardcoded probe block, the 5 base per-term d_uv
-    /// integrals (t1..t5) and the 5 analytic dir per-term integrals
-    /// (t1_dir..t5_dir). The harness FDs the base terms and compares to the
-    /// dir terms to pin which t_i_dir drops a w-cross. Populated only in test
-    /// builds; `None` otherwise.
-    #[cfg(test)]
-    pub(crate) debug_d_uv_terms: Option<([f64; 5], [f64; 5])>,
-    /// #932 debug: directional channels of the interior `eta_uv`/`chi_uv` jet
-    /// INPUTS, so the FD-localizer can pin which input's dir channel under-counts
-    /// the (g,w0)/(g,g) interior cross. Indexed by primary; matrices full p×p.
-    /// `(a_uv_dir, tau_dir, tau_a_dir, a_u_dir, chi_dir, eta_aa_dir, eta_aaa_dir,
-    /// r_uv_dir, chi_uv_fixed_dir)`. Populated only in test builds.
-    #[cfg(test)]
-    pub(crate) debug_eta_uv_inputs: Option<DebugEtaUvInputs>,
-}
-
-/// #932 FD-localizer bundle: directional channels of the interior second-order
-/// jet inputs, used only by `debug_flex_directional_quantities_fd_localize`.
-#[cfg(test)]
-pub(crate) struct DebugEtaUvInputs {
-    pub(crate) chi_dir: f64,
-    pub(crate) eta_aa_dir: f64,
-    pub(crate) eta_aaa_dir: f64,
-    pub(crate) tau_dir: Array1<f64>,
-    pub(crate) tau_a_dir: Array1<f64>,
-    pub(crate) a_u_dir: Array1<f64>,
-    pub(crate) a_uv_dir: Array2<f64>,
-    /// `r_uv_dir[[u,v]]` = directional channel of the eta_uv fixed cross.
-    pub(crate) r_uv_dir: Array2<f64>,
-    /// `chi_uv_fixed_dir[[u,v]]` = directional channel of the chi_uv fixed cross.
-    pub(crate) chi_uv_fixed_dir: Array2<f64>,
-    // Base (non-directional) values of the same inputs, so the harness can FD
-    // each base along dir and compare to the dir channel above.
-    pub(crate) chi_base: f64,
-    pub(crate) eta_aa_base: f64,
-    pub(crate) eta_aaa_base: f64,
-    pub(crate) tau_base: Array1<f64>,
-    pub(crate) tau_a_base: Array1<f64>,
-    pub(crate) a_u_base: Array1<f64>,
-    pub(crate) a_uv_base: Array2<f64>,
-    pub(crate) r_uv_base: Array2<f64>,
-    pub(crate) chi_uv_fixed_base: Array2<f64>,
-    // #932 intercept-solve calibration residual `F` jets: the base `f_u`/`f_uv`
-    // (θ-derivatives of the constraint `F(a,θ)=0`) and `f_a`, so the harness can
-    // FD `f_u` along dir and compare to `f_uv·dir`, isolating whether the base
-    // `f_uv` boundary (the implicit intercept Hessian source) is inexact.
-    pub(crate) f_a_base: f64,
-    pub(crate) f_u_base: Array1<f64>,
-    pub(crate) f_uv_base: Array2<f64>,
-    // #932 f_au/f_aa moving-boundary certification (a-cross calibration jets).
-    // The harness FDs `f_a` along dir vs analytic `f_au·dir` to certify the
-    // derived a-channel boundary corrections (z_a=-1/b, z_ag=1/b², z_aa=0).
-    pub(crate) f_au_base: Array1<f64>,
-    pub(crate) f_aa_base: f64,
 }
 
 pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {
