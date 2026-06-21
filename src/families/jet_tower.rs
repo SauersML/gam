@@ -1152,6 +1152,45 @@ pub fn derived_fourth_contracted<const K: usize, P: RowNllProgram<K> + ?Sized>(
     Ok(evaluate_program(prog, row)?.fourth_contracted(dir_u, dir_v))
 }
 
+// ── The generic program seam (#932 scalar cutover) ───────────────────
+
+/// A family's row negative log-likelihood written ONCE over the generic
+/// [`super::jet_scalar::JetScalar`] interface, so the SAME expression can be
+/// re-instantiated at whatever order / representation a consumer needs
+/// ([`super::jet_scalar::Order2`] for `(v, g, H)`,
+/// [`super::jet_scalar::OneSeed`] for the contracted third,
+/// [`super::jet_scalar::TwoSeed`] for the contracted fourth, or the full
+/// [`Tower4`] for every channel at once).
+///
+/// This is additive to [`RowNllProgram`] (which is `Tower4`-specialised): a
+/// program implementing this generic trait gets the small contracted scalars for
+/// free, dissolving the dense-`Tower4<9>` cost objection in the location-scale
+/// gates (doc §A.4). An existing `Tower4`-only [`RowNllProgram`] continues to
+/// work unchanged; new families should prefer this generic trait.
+///
+/// TODO(#932): migrate each existing [`RowNllProgram`] impl to this trait by
+/// rewriting its `row_nll` body generically over `S: JetScalar<K>` (the bodies
+/// already use only `add`/`sub`/`mul`/`scale`/`exp`/`ln`/… which the generic
+/// trait provides) and deleting the `Tower4`-specialised method, then routing
+/// the directional / joint-Hessian gates through the contracted scalars.
+pub trait RowNllProgramGeneric<const K: usize>: Send + Sync {
+    /// Number of observations the program covers.
+    fn n_rows(&self) -> usize;
+
+    /// Current primary-scalar values for `row` (where to seed the scalar).
+    fn primaries(&self, row: usize) -> Result<[f64; K], String>;
+
+    /// The row NLL evaluated on a generic jet scalar. `p[a]` arrives pre-seeded
+    /// (base value + per-scalar nilpotent directions) by the caller; the body
+    /// uses ONLY [`super::jet_scalar::JetScalar`] ops and per-row data
+    /// (response, censoring, offsets) entering as constants.
+    fn row_nll_generic<S: super::jet_scalar::JetScalar<K>>(
+        &self,
+        row: usize,
+        p: &[S; K],
+    ) -> Result<S, String>;
+}
+
 // ── The oracle ───────────────────────────────────────────────────────
 
 /// One row's worth of hand-written kernel outputs, as claimed by a

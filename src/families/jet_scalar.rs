@@ -1,0 +1,686 @@
+//! Order-specific Taylor-jet SCALAR algebras (#932 cutover, doc §A).
+//!
+//! [`super::jet_tower::Tower4`] carries the full value/gradient/Hessian/`t3`/`t4`
+//! tensor stack: it answers EVERY channel a [`super::row_kernel::RowKernel`]
+//! consumer can ask for, but at `K = 9` that is a ~50 KiB per-row object whose
+//! by-value copies overflowed the stack and timed out the location-scale fit —
+//! which is exactly why `row_kernel_directional_supported()` /
+//! `row_kernel_joint_hessian_supported()` still `return false`. The cutover does
+//! NOT need the dense `Tower4<9>` per row; it needs, per consumer, only the one
+//! channel that consumer serves:
+//!
+//! | consumer | channel | scalar here | K=9 size |
+//! |---|---|---|---|
+//! | inner Newton / `row_kernel` | `(v, g, H)` | [`Order2`] | 728 B |
+//! | `row_third_contracted(dir)` | `Σ_c ℓ_{abc} dir_c` | [`OneSeed`] | 1.46 KiB |
+//! | `row_fourth_contracted(u, v)` | `Σ_{cd} ℓ_{abcd} u_c v_d` | [`TwoSeed`] | 2.8 KiB |
+//!
+//! Each is built on [`Order2`] (value/grad/Hessian), which is the production
+//! [`super::jet_tower::Tower2`] re-expressed behind a generic interface: a row
+//! loss written ONCE against [`JetScalar`] re-instantiates at whatever order /
+//! representation a consumer needs, with the contraction folded INTO the
+//! differentiation (the nilpotent ε / δ directions), so `t3` / `t4` are never
+//! materialised. The single source of truth is the same one expression — the
+//! genus of #736 cross-block drift cannot reappear because there is no separate
+//! channel to forget.
+//!
+//! # Why each scalar is exact (doc §A.1–A.3)
+//!
+//! * [`Order2`] is the order-≤2 truncation of the Leibniz / Faà di Bruno rules.
+//!   Those order-2 terms read ONLY the order-≤2 channels of their inputs (see
+//!   [`super::jet_tower::Tower4::mul`]: `out.h[i][j]` never touches `t3`/`t4`),
+//!   so its `(v, g, H)` is BIT-IDENTICAL to a full `Tower4<K>` — and identical
+//!   to [`super::jet_tower::Tower2`], over which it is a thin newtype.
+//! * [`OneSeed`] carries an [`Order2`] base plus one nilpotent ε (`ε² = 0`)
+//!   holding another [`Order2`]. Seeding ε with the fixed direction `u` makes the
+//!   ε-component of the Hessian channel the contracted third `Σ_c ℓ_{abc} u_c`
+//!   (the nilpotent implements `d/dτ|₀` of `ℓ_{ab}(p + τu)` exactly).
+//! * [`TwoSeed`] carries an [`Order2`] base plus ε, δ (`ε² = δ² = 0`, `εδ`
+//!   retained) — four [`Order2`] parts. Seeding ε, δ with `u, v` makes the
+//!   εδ-component of the Hessian channel the contracted fourth
+//!   `Σ_{cd} ℓ_{abcd} u_c v_d` (the single mixed `∂_σ∂_ρ|₀` term, no `σ²`/`ρ²`
+//!   contamination).
+//!
+//! # Stability discipline
+//!
+//! As in [`super::jet_tower`], humans own primitive stability and the algebra
+//! owns combinatorics: tail-critical special functions enter ONLY as
+//! hand-certified `[f64; 5]` derivative stacks through [`JetScalar::compose_unary`]
+//! (each scalar consumes the leading entries its order needs), never by
+//! differentiating an unstable primal.
+
+use super::jet_tower::{Tower2, Tower4};
+
+/// A truncated-Taylor scalar carrying derivatives in `K` primaries.
+///
+/// All concrete scalars here ([`Order2`], [`OneSeed`], [`TwoSeed`]) and the full
+/// [`super::jet_tower::Tower4`] implement the SAME algebra; only the carried
+/// channel set differs. A row loss written once against this interface yields a
+/// different channel set per instantiation, all exact for the channel they serve
+/// (doc §A.0).
+pub trait JetScalar<const K: usize>: Copy {
+    /// A constant: value `c`, every derivative channel zero.
+    fn constant(c: f64) -> Self;
+
+    /// The seeded variable `p_axis` at value `x`: unit first derivative in slot
+    /// `axis`, all higher channels zero. (The nilpotent / cross channels of the
+    /// directional scalars are seeded zero — callers set ε/δ directions through
+    /// the scalar-specific [`OneSeed::seed_direction`] / [`TwoSeed::seed`].)
+    fn variable(x: f64, axis: usize) -> Self;
+
+    /// The value channel `ℓ(p)`.
+    fn value(&self) -> f64;
+
+    /// Exact truncated Leibniz sum `self + o`.
+    fn add(&self, o: &Self) -> Self;
+    /// Exact truncated Leibniz difference `self − o`.
+    fn sub(&self, o: &Self) -> Self;
+    /// Exact truncated Leibniz product `self · o`.
+    fn mul(&self, o: &Self) -> Self;
+    /// Exact reciprocal `1/self`. Caller guarantees a non-zero value channel
+    /// (likelihood programs do).
+    fn recip(&self) -> Self;
+    /// Exact quotient `self / o`. Caller guarantees a non-zero `o` value.
+    fn div(&self, o: &Self) -> Self {
+        self.mul(&o.recip())
+    }
+    /// Negate every channel.
+    fn neg(&self) -> Self;
+    /// Multiply every channel by a plain scalar `s`.
+    fn scale(&self, s: f64) -> Self;
+
+    /// Exact multivariate Faà di Bruno composition `f ∘ self`, given the outer
+    /// derivative stack `d = [f(u), f′(u), f″(u), …]` at `u = self.value()`.
+    ///
+    /// The same `[f64; 5]` stacks the families already write
+    /// (`unary_derivatives_*`, built on erfcx / log_ndtr) plug in directly; each
+    /// scalar consumes only the leading entries its order needs (order-2 reads
+    /// `d[0..=2]`; the directional scalars read one / two beyond their base).
+    /// `d` must carry at least three entries.
+    fn compose_unary(&self, d: &[f64]) -> Self;
+
+    /// `e^self`. Convenience for tame arguments (see module stability note).
+    fn exp(&self) -> Self {
+        let e = self.value().exp();
+        self.compose_unary(&[e, e, e, e, e])
+    }
+
+    /// `ln(self)`. Caller guarantees positivity.
+    fn ln(&self) -> Self {
+        let u = self.value();
+        let r = 1.0 / u;
+        self.compose_unary(&[u.ln(), r, -r * r, 2.0 * r * r * r, -6.0 * r * r * r * r])
+    }
+
+    /// `√self`. Caller guarantees positivity.
+    fn sqrt(&self) -> Self {
+        let u = self.value();
+        let s = u.sqrt();
+        self.compose_unary(&[
+            s,
+            0.5 / s,
+            -0.25 / (u * s),
+            0.375 / (u * u * s),
+            -0.9375 / (u * u * u * s),
+        ])
+    }
+}
+
+// ── Order2<K>: value / gradient / Hessian (doc §A.1) ────────────────────
+
+/// Truncated SECOND-order scalar: value `v`, gradient `g_a`, Hessian `H_{ab}`.
+///
+/// This is a thin newtype over the production [`super::jet_tower::Tower2`], so
+/// its `(v, g, H)` channels are obtained by the SAME formulas — and are
+/// therefore bit-identical to both [`super::jet_tower::Tower2`] and the order-≤2
+/// channels of a full [`super::jet_tower::Tower4`] (doc §A.1, "Bit-identity with
+/// the full tower"). The wrapper exists only to satisfy the generic
+/// [`JetScalar`] interface (the slice-typed `compose_unary` / `add` / `sub` /
+/// `neg` / `recip` the trait demands, which `Tower2` does not expose by that
+/// shape) — every channel is delegated to `Tower2` arithmetic unchanged.
+#[derive(Clone, Copy, Debug)]
+pub struct Order2<const K: usize>(pub Tower2<K>);
+
+impl<const K: usize> Order2<K> {
+    /// Read the underlying value channel.
+    #[inline]
+    pub fn v(&self) -> f64 {
+        self.0.v
+    }
+    /// Read the gradient channel.
+    #[inline]
+    pub fn g(&self) -> [f64; K] {
+        self.0.g
+    }
+    /// Read the Hessian channel.
+    #[inline]
+    pub fn h(&self) -> [[f64; K]; K] {
+        self.0.h
+    }
+}
+
+impl<const K: usize> JetScalar<K> for Order2<K> {
+    fn constant(c: f64) -> Self {
+        Order2(Tower2::constant(c))
+    }
+    fn variable(x: f64, axis: usize) -> Self {
+        Order2(Tower2::variable(x, axis))
+    }
+    fn value(&self) -> f64 {
+        self.0.v
+    }
+    fn add(&self, o: &Self) -> Self {
+        Order2(self.0 + o.0)
+    }
+    fn sub(&self, o: &Self) -> Self {
+        // Tower2 has no Sub op; subtract by adding the negation, matching
+        // Tower4::sub (self + o.scale(-1.0)).
+        Order2(self.0 + o.0.scale(-1.0))
+    }
+    fn mul(&self, o: &Self) -> Self {
+        Order2(Tower2::mul(&self.0, &o.0))
+    }
+    fn recip(&self) -> Self {
+        let r = 1.0 / self.0.v;
+        let r2 = r * r;
+        // Order-≤2 of 1/u: [1/u, −1/u², 2/u³] — the leading three entries of
+        // Tower4::recip's stack, since Tower2 reads only d[0..=2].
+        Order2(self.0.compose_unary([r, -r2, 2.0 * r2 * r]))
+    }
+    fn neg(&self) -> Self {
+        Order2(self.0.scale(-1.0))
+    }
+    fn scale(&self, s: f64) -> Self {
+        Order2(self.0.scale(s))
+    }
+    fn compose_unary(&self, d: &[f64]) -> Self {
+        debug_assert!(
+            d.len() >= 3,
+            "Order2::compose_unary needs at least [f, f', f''] (got {})",
+            d.len()
+        );
+        Order2(self.0.compose_unary([d[0], d[1], d[2]]))
+    }
+}
+
+// ── Tower4<K>: full dense tower as a JetScalar (the all-channels oracle) ─
+
+/// The full dense [`super::jet_tower::Tower4`] is itself a [`JetScalar`]: it
+/// carries EVERY channel, so a row expression written generically can be
+/// evaluated at `Tower4` to obtain the ground-truth `(v, g, H, t3, t4)` in one
+/// pass, then contracted with [`super::jet_tower::Tower4::third_contracted`] /
+/// `fourth_contracted`. The contracted scalars ([`OneSeed`] / [`TwoSeed`]) must
+/// agree with these contractions channel-by-channel (the oracle relation #932
+/// asserts). The slice `compose_unary` simply repacks into the dense `[f64; 5]`
+/// stack `Tower4` already consumes (zero-padding shorter stacks, which only
+/// affects orders above the slice length).
+impl<const K: usize> JetScalar<K> for Tower4<K> {
+    fn constant(c: f64) -> Self {
+        Tower4::constant(c)
+    }
+    fn variable(x: f64, axis: usize) -> Self {
+        Tower4::variable(x, axis)
+    }
+    fn value(&self) -> f64 {
+        self.v
+    }
+    fn add(&self, o: &Self) -> Self {
+        *self + *o
+    }
+    fn sub(&self, o: &Self) -> Self {
+        *self - *o
+    }
+    fn mul(&self, o: &Self) -> Self {
+        Tower4::mul(self, o)
+    }
+    fn recip(&self) -> Self {
+        Tower4::recip(self)
+    }
+    fn neg(&self) -> Self {
+        self.scale(-1.0)
+    }
+    fn scale(&self, s: f64) -> Self {
+        Tower4::scale(self, s)
+    }
+    fn compose_unary(&self, d: &[f64]) -> Self {
+        let mut stack = [0.0_f64; 5];
+        for (slot, value) in stack.iter_mut().zip(d.iter()) {
+            *slot = *value;
+        }
+        Tower4::compose_unary(self, stack)
+    }
+}
+
+// ── OneSeed<K>: one-seed directional, contracted third (doc §A.2) ───────
+
+/// One-seed directional scalar: an [`Order2`] base plus ONE nilpotent ε
+/// (`ε² = 0`) whose coefficient is itself an [`Order2`].
+///
+/// A scalar is `s = base + ε·eps`. Arithmetic is the `ε² = 0` truncation of the
+/// product (doc §A.2): the base parts multiply as ordinary [`Order2`] products,
+/// and the ε-coefficient picks up `a.base·b.eps + a.eps·b.base`. Composition
+/// pushes ε through one extra outer derivative.
+///
+/// Seed each primary with [`seed_direction`](Self::seed_direction): the base is
+/// the usual seeded variable (carrying `e_a` for the Hessian channel) and the
+/// ε-coefficient is the FIXED contraction direction `u_a` (a constant). Then the
+/// ε-component of the evaluated Hessian channel is the contracted third
+/// `[eps.h][a][b] = Σ_c ℓ_{abc} u_c` — exactly `row_third_contracted(dir = u)`,
+/// without materialising `t3`.
+#[derive(Clone, Copy, Debug)]
+pub struct OneSeed<const K: usize> {
+    /// The `ε⁰` part: value / gradient / Hessian of `ℓ`.
+    pub base: Order2<K>,
+    /// The `ε¹` part: value / gradient / Hessian of the ε-coefficient. After a
+    /// `seed_direction(u)` evaluation, `eps.h[a][b] = Σ_c ℓ_{abc} u_c`.
+    pub eps: Order2<K>,
+}
+
+impl<const K: usize> OneSeed<K> {
+    /// Seed primary `axis` at value `x` with ε-direction component `u_axis`:
+    /// `p_axis = p_axis⁰ + x-seed + ε·u_axis`, i.e. base = `variable(x, axis)`
+    /// and eps = `constant(u_axis)` (doc §A.2 "Seeding").
+    pub fn seed_direction(x: f64, axis: usize, u_axis: f64) -> Self {
+        OneSeed {
+            base: Order2::variable(x, axis),
+            eps: Order2::constant(u_axis),
+        }
+    }
+}
+
+impl<const K: usize> JetScalar<K> for OneSeed<K> {
+    fn constant(c: f64) -> Self {
+        OneSeed {
+            base: Order2::constant(c),
+            eps: Order2::constant(0.0),
+        }
+    }
+    fn variable(x: f64, axis: usize) -> Self {
+        // No ε-direction unless seeded via `seed_direction`.
+        OneSeed {
+            base: Order2::variable(x, axis),
+            eps: Order2::constant(0.0),
+        }
+    }
+    fn value(&self) -> f64 {
+        self.base.value()
+    }
+    fn add(&self, o: &Self) -> Self {
+        OneSeed {
+            base: self.base.add(&o.base),
+            eps: self.eps.add(&o.eps),
+        }
+    }
+    fn sub(&self, o: &Self) -> Self {
+        OneSeed {
+            base: self.base.sub(&o.base),
+            eps: self.eps.sub(&o.eps),
+        }
+    }
+    fn mul(&self, o: &Self) -> Self {
+        // (a.base + ε a.eps)(b.base + ε b.eps), dropping ε².
+        OneSeed {
+            base: self.base.mul(&o.base),
+            eps: self.base.mul(&o.eps).add(&self.eps.mul(&o.base)),
+        }
+    }
+    fn recip(&self) -> Self {
+        // 1/s with s = base + ε eps; treat as the composition recip ∘ s, which
+        // the generic compose_unary handles uniformly.
+        let r = 1.0 / self.base.value();
+        let r2 = r * r;
+        self.compose_unary(&[r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
+    }
+    fn neg(&self) -> Self {
+        OneSeed {
+            base: self.base.neg(),
+            eps: self.eps.neg(),
+        }
+    }
+    fn scale(&self, s: f64) -> Self {
+        OneSeed {
+            base: self.base.scale(s),
+            eps: self.eps.scale(s),
+        }
+    }
+    fn compose_unary(&self, d: &[f64]) -> Self {
+        // f(base + ε eps) = f(base) + ε · f'(base)·eps  (ε² = 0). Each factor is
+        // an Order2 composition: the base composes with the f-stack, and the
+        // ε-coefficient is the Order2 product of the (shifted) f'-stack applied
+        // to base — i.e. the chain rule `f'(base)` as an Order2 — times eps.
+        // `f'` evaluated as an Order2 over `base` is `base.compose_unary(d[1..])`.
+        debug_assert!(
+            d.len() >= 4,
+            "OneSeed::compose_unary needs at least [f, f', f'', f'''] (got {})",
+            d.len()
+        );
+        let base = self.base.compose_unary(&d[0..3]);
+        // f'(base) as an Order2 (consumes [f', f'', f''']).
+        let fprime = self.base.compose_unary(&d[1..4]);
+        let eps = fprime.mul(&self.eps);
+        OneSeed { base, eps }
+    }
+}
+
+impl<const K: usize> OneSeed<K> {
+    /// The contracted-third channel after a `seed_direction(u)` evaluation:
+    /// `out[a][b] = Σ_c ℓ_{abc} u_c`, i.e. the ε-coefficient's Hessian (doc §A.2).
+    pub fn contracted_third(&self) -> [[f64; K]; K] {
+        self.eps.h()
+    }
+}
+
+// ── TwoSeed<K>: two-seed, contracted fourth (doc §A.3) ──────────────────
+
+/// Two-seed scalar: an [`Order2`] base plus TWO nilpotents ε, δ
+/// (`ε² = δ² = 0`, `εδ` retained) — four [`Order2`] parts
+/// `s = base + ε·eps + δ·del + εδ·eps_del`.
+///
+/// Product truncates `ε² = δ² = 0` (doc §A.3): each part is built from
+/// [`Order2`] products of the four input parts. Composition picks up
+/// successively higher outer derivatives, the cross part carrying the second
+/// Faà di Bruno term `f''·eps·del + f'·eps_del`.
+///
+/// Seed each primary with [`seed`](Self::seed): base = `variable(x, axis)`,
+/// eps = `constant(u_axis)`, del = `constant(v_axis)`, eps_del = `constant(0)`.
+/// Then the εδ-component of the evaluated Hessian channel is the contracted
+/// fourth `[eps_del.h][a][b] = Σ_{cd} ℓ_{abcd} u_c v_d` — exactly
+/// `row_fourth_contracted(u, v)`, without materialising `t4`.
+#[derive(Clone, Copy, Debug)]
+pub struct TwoSeed<const K: usize> {
+    /// The `ε⁰δ⁰` part: value / grad / Hessian of `ℓ`.
+    pub base: Order2<K>,
+    /// The `ε¹δ⁰` part.
+    pub eps: Order2<K>,
+    /// The `ε⁰δ¹` part.
+    pub del: Order2<K>,
+    /// The `ε¹δ¹` part. After a `seed(u, v)` evaluation,
+    /// `eps_del.h[a][b] = Σ_{cd} ℓ_{abcd} u_c v_d`.
+    pub eps_del: Order2<K>,
+}
+
+impl<const K: usize> TwoSeed<K> {
+    /// Seed primary `axis` at value `x` with ε-direction `u_axis` and
+    /// δ-direction `v_axis`:
+    /// `p_axis = p_axis⁰ + x-seed + ε·u_axis + δ·v_axis` (doc §A.3 "Seeding").
+    pub fn seed(x: f64, axis: usize, u_axis: f64, v_axis: f64) -> Self {
+        TwoSeed {
+            base: Order2::variable(x, axis),
+            eps: Order2::constant(u_axis),
+            del: Order2::constant(v_axis),
+            eps_del: Order2::constant(0.0),
+        }
+    }
+
+    /// The contracted-fourth channel after a `seed(u, v)` evaluation:
+    /// `out[a][b] = Σ_{cd} ℓ_{abcd} u_c v_d`, i.e. the εδ-coefficient's Hessian.
+    pub fn contracted_fourth(&self) -> [[f64; K]; K] {
+        self.eps_del.h()
+    }
+}
+
+impl<const K: usize> JetScalar<K> for TwoSeed<K> {
+    fn constant(c: f64) -> Self {
+        TwoSeed {
+            base: Order2::constant(c),
+            eps: Order2::constant(0.0),
+            del: Order2::constant(0.0),
+            eps_del: Order2::constant(0.0),
+        }
+    }
+    fn variable(x: f64, axis: usize) -> Self {
+        TwoSeed {
+            base: Order2::variable(x, axis),
+            eps: Order2::constant(0.0),
+            del: Order2::constant(0.0),
+            eps_del: Order2::constant(0.0),
+        }
+    }
+    fn value(&self) -> f64 {
+        self.base.value()
+    }
+    fn add(&self, o: &Self) -> Self {
+        TwoSeed {
+            base: self.base.add(&o.base),
+            eps: self.eps.add(&o.eps),
+            del: self.del.add(&o.del),
+            eps_del: self.eps_del.add(&o.eps_del),
+        }
+    }
+    fn sub(&self, o: &Self) -> Self {
+        TwoSeed {
+            base: self.base.sub(&o.base),
+            eps: self.eps.sub(&o.eps),
+            del: self.del.sub(&o.del),
+            eps_del: self.eps_del.sub(&o.eps_del),
+        }
+    }
+    fn mul(&self, o: &Self) -> Self {
+        let a = self;
+        let b = o;
+        // Truncate ε² = δ² = 0 (doc §A.3 product table).
+        let base = a.base.mul(&b.base);
+        let eps = a.base.mul(&b.eps).add(&a.eps.mul(&b.base));
+        let del = a.base.mul(&b.del).add(&a.del.mul(&b.base));
+        let eps_del = a
+            .base
+            .mul(&b.eps_del)
+            .add(&a.eps.mul(&b.del))
+            .add(&a.del.mul(&b.eps))
+            .add(&a.eps_del.mul(&b.base));
+        TwoSeed {
+            base,
+            eps,
+            del,
+            eps_del,
+        }
+    }
+    fn recip(&self) -> Self {
+        let r = 1.0 / self.base.value();
+        let r2 = r * r;
+        self.compose_unary(&[r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
+    }
+    fn neg(&self) -> Self {
+        TwoSeed {
+            base: self.base.neg(),
+            eps: self.eps.neg(),
+            del: self.del.neg(),
+            eps_del: self.eps_del.neg(),
+        }
+    }
+    fn scale(&self, s: f64) -> Self {
+        TwoSeed {
+            base: self.base.scale(s),
+            eps: self.eps.scale(s),
+            del: self.del.scale(s),
+            eps_del: self.eps_del.scale(s),
+        }
+    }
+    fn compose_unary(&self, d: &[f64]) -> Self {
+        // f(s) with s = base + ε eps + δ del + εδ eps_del, ε²=δ²=0:
+        //   f(s) = f(base)
+        //        + ε · f'(base)·eps
+        //        + δ · f'(base)·del
+        //        + εδ · ( f''(base)·eps·del + f'(base)·eps_del ).
+        // Each f^{(r)}(base) is the Order2 composition of base with the stack
+        // shifted r entries (doc §A.3 composition). compose_unary on Order2
+        // reads d[0..=2] of whatever slice it is handed, so we pass the shifted
+        // windows.
+        debug_assert!(
+            d.len() >= 5,
+            "TwoSeed::compose_unary needs at least [f, f', f'', f''', f''''] (got {})",
+            d.len()
+        );
+        let base = self.base.compose_unary(&d[0..3]);
+        let fprime = self.base.compose_unary(&d[1..4]); // f'(base) as Order2
+        let fsecond = self.base.compose_unary(&d[2..5]); // f''(base) as Order2
+        let eps = fprime.mul(&self.eps);
+        let del = fprime.mul(&self.del);
+        let eps_del = fsecond
+            .mul(&self.eps)
+            .mul(&self.del)
+            .add(&fprime.mul(&self.eps_del));
+        TwoSeed {
+            base,
+            eps,
+            del,
+            eps_del,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::families::jet_tower::{evaluate_program, RowNllProgram, Tower4};
+
+    /// A small polynomial-plus-unary row expression written ONCE, generically
+    /// over `S: JetScalar<2>`, so it can be evaluated against every scalar:
+    /// `ℓ = ln(e^{p0·p1} + 2) · √(p0·p0 + 1) − p1·p1·0.5`.
+    /// Exercises mul, add/sub, scale, exp, ln, sqrt — every algebra op.
+    fn row_expr<S: JetScalar<2>>(p: &[S; 2]) -> S {
+        let g = p[0].mul(&p[1]).exp();
+        let inner = g.add(&S::constant(2.0)).ln();
+        let radic = p[0].mul(&p[0]).add(&S::constant(1.0)).sqrt();
+        inner.mul(&radic).sub(&p[1].mul(&p[1]).scale(0.5))
+    }
+
+    /// The same expression as a Tower4 `RowNllProgram`, the ground-truth tower.
+    struct ExprProgram {
+        p: [f64; 2],
+    }
+    impl RowNllProgram<2> for ExprProgram {
+        fn n_rows(&self) -> usize {
+            1
+        }
+        fn primaries(&self, _row: usize) -> Result<[f64; 2], String> {
+            Ok(self.p)
+        }
+        fn row_nll(&self, _row: usize, p: &[Tower4<2>; 2]) -> Result<Tower4<2>, String> {
+            Ok(row_expr(p))
+        }
+    }
+
+    const SEED: [f64; 2] = [0.37, -0.81];
+    const U: [f64; 2] = [0.6, -0.2];
+    const V: [f64; 2] = [-0.4, 1.1];
+    const TOL: f64 = 1e-10;
+
+    fn close(a: f64, b: f64, label: &str) {
+        let band = TOL + TOL * a.abs().max(b.abs());
+        assert!(
+            (a - b).abs() <= band,
+            "{label}: {a:+.15e} vs {b:+.15e} (band {band:.3e})"
+        );
+    }
+
+    fn tower() -> Tower4<2> {
+        evaluate_program(&ExprProgram { p: SEED }, 0).expect("tower")
+    }
+
+    /// Order2 reproduces Tower4's value/grad/Hessian channels exactly.
+    #[test]
+    fn order2_matches_tower_value_grad_hessian() {
+        let t = tower();
+        let vars: [Order2<2>; 2] = std::array::from_fn(|a| Order2::variable(SEED[a], a));
+        let s = row_expr(&vars);
+        close(s.value(), t.v, "value");
+        for a in 0..2 {
+            close(s.g()[a], t.g[a], &format!("grad[{a}]"));
+            for b in 0..2 {
+                close(s.h()[a][b], t.h[a][b], &format!("hess[{a}][{b}]"));
+            }
+        }
+    }
+
+    /// OneSeed's ε-Hessian is the contracted third Σ_c ℓ_{abc} u_c, matching
+    /// `Tower4::third_contracted(u)`. Base channels also match the tower.
+    #[test]
+    fn one_seed_matches_tower_third_contracted() {
+        let t = tower();
+        let truth = t.third_contracted(&U);
+        let vars: [OneSeed<2>; 2] =
+            std::array::from_fn(|a| OneSeed::seed_direction(SEED[a], a, U[a]));
+        let s = row_expr(&vars);
+        // Base channels are the plain (v, g, H).
+        close(s.value(), t.v, "value");
+        for a in 0..2 {
+            for b in 0..2 {
+                close(s.base.h()[a][b], t.h[a][b], &format!("base hess[{a}][{b}]"));
+            }
+        }
+        let third = s.contracted_third();
+        for a in 0..2 {
+            for b in 0..2 {
+                close(third[a][b], truth[a][b], &format!("third[{a}][{b}]"));
+            }
+        }
+    }
+
+    /// TwoSeed's εδ-Hessian is the contracted fourth Σ_{cd} ℓ_{abcd} u_c v_d,
+    /// matching `Tower4::fourth_contracted(u, v)`. The ε / δ single-seed parts
+    /// reproduce the two third contractions Σ_c ℓ_{abc} u_c and …v_d.
+    #[test]
+    fn two_seed_matches_tower_fourth_contracted() {
+        let t = tower();
+        let truth4 = t.fourth_contracted(&U, &V);
+        let truth3_u = t.third_contracted(&U);
+        let truth3_v = t.third_contracted(&V);
+        let vars: [TwoSeed<2>; 2] = std::array::from_fn(|a| TwoSeed::seed(SEED[a], a, U[a], V[a]));
+        let s = row_expr(&vars);
+        close(s.value(), t.v, "value");
+        for a in 0..2 {
+            close(s.base.g()[a], t.g[a], &format!("grad[{a}]"));
+            for b in 0..2 {
+                close(s.base.h()[a][b], t.h[a][b], &format!("base hess[{a}][{b}]"));
+                close(
+                    s.eps.h()[a][b],
+                    truth3_u[a][b],
+                    &format!("eps third_u[{a}][{b}]"),
+                );
+                close(
+                    s.del.h()[a][b],
+                    truth3_v[a][b],
+                    &format!("del third_v[{a}][{b}]"),
+                );
+            }
+        }
+        let fourth = s.contracted_fourth();
+        for a in 0..2 {
+            for b in 0..2 {
+                close(fourth[a][b], truth4[a][b], &format!("fourth[{a}][{b}]"));
+            }
+        }
+    }
+
+    /// The generic `row_nll_generic` seam (added to Tower4's program trait
+    /// surface) evaluates the SAME expression on each scalar and extracts the
+    /// channel a consumer asks for, agreeing with the direct Tower4 contraction.
+    #[test]
+    fn generic_program_seam_matches_tower_for_every_channel() {
+        let t = tower();
+        // Order2 via generic seam.
+        let o2: [Order2<2>; 2] = std::array::from_fn(|a| Order2::variable(SEED[a], a));
+        let so2 = row_expr(&o2);
+        close(so2.value(), t.v, "seam order2 value");
+        // OneSeed third.
+        let os: [OneSeed<2>; 2] =
+            std::array::from_fn(|a| OneSeed::seed_direction(SEED[a], a, U[a]));
+        let third = row_expr(&os).contracted_third();
+        let truth3 = t.third_contracted(&U);
+        for a in 0..2 {
+            for b in 0..2 {
+                close(third[a][b], truth3[a][b], &format!("seam third[{a}][{b}]"));
+            }
+        }
+        // TwoSeed fourth.
+        let ts: [TwoSeed<2>; 2] = std::array::from_fn(|a| TwoSeed::seed(SEED[a], a, U[a], V[a]));
+        let fourth = row_expr(&ts).contracted_fourth();
+        let truth4 = t.fourth_contracted(&U, &V);
+        for a in 0..2 {
+            for b in 0..2 {
+                close(fourth[a][b], truth4[a][b], &format!("seam fourth[{a}][{b}]"));
+            }
+        }
+    }
+}

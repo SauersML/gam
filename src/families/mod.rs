@@ -11,6 +11,7 @@ pub mod gamlss;
 pub mod inverse_link;
 pub(crate) mod jet_algebra;
 pub(crate) mod jet_partitions;
+pub(crate) mod jet_scalar;
 pub mod jet_tower;
 pub mod joint_penalty;
 pub(crate) mod location_scale_engine;
