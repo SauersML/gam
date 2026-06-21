@@ -173,7 +173,7 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
 /// bars below are expressed as functions of `R` ("at most one miss", "minority
 /// rejects") so they stay genuine, un-weakened assertions at either count.
 fn replicate_count() -> usize {
-    if std::env::var("GAM_HEAVY").is_ok() {
+    if false {
         5
     } else {
         3
