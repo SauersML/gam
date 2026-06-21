@@ -314,6 +314,8 @@ mod latent_cache_inner_bug_hunt;
 mod measure_jet_aniso_isotropic_fallback_regression;
 #[path = "regressions/new_smooths_misc_regressions.rs"]
 mod new_smooths_misc_regressions;
+#[path = "regressions/no_rigor_regression.rs"]
+mod no_rigor_regression;
 #[path = "regressions/owed_work_issues_resolved.rs"]
 mod owed_work_issues_resolved;
 #[path = "regressions/regression_affine_anchor_moment_both_tails.rs"]
