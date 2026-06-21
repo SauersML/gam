@@ -2959,8 +2959,10 @@ impl SaeManifoldTerm {
             // (`SaeManifoldOuterObjective`) and held FIXED across this inner
             // (t, β) Newton solve. The inner loop solves the joint manifold +
             // decoder system at the engine's current ρ; the engine alone
-            // moves ρ by minimising the true REML criterion (see
-            // `SaeManifoldTerm::reml_criterion`). The former in-loop
+            // moves ρ by minimising the penalised quasi-Laplace evidence
+            // score (see `SaeManifoldTerm::reml_criterion`; #1421: NOT a
+            // true normalized-prior REML — the improper softmax/JumpReLU
+            // assignment priors have no finite normalizer). The former in-loop
             // `update_ard_reml` rule (α = n / ‖t‖²) dropped the logdet /
             // effective-dof term and collapsed α on near-degenerate axes; it
             // has been removed in favour of the criterion-driven update.
