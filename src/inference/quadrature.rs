@@ -4284,87 +4284,32 @@ pub fn logit_posterior_mean_exact(mu: f64, sigma: f64) -> f64 {
         return sigmoid(mu);
     }
 
+    // #1459: the previous implementation evaluated the tanh partial-fraction
+    // series Σ Im w(z_n) via a composite-Simpson Faddeeva evaluator that
+    // carried a systematic, σ-independent, μ-linear bias of ~3.7e-5 at μ=3
+    // — 4-5 orders worse than the cheap production GHQ path it was meant to
+    // certify. The bias structure (constant in σ, odd in μ, directed toward
+    // 0.5) proved robust to the Faddeeva evaluator's quadrature parameters,
+    // indicating a fundamental accuracy ceiling of the polynomial-based
+    // series + low-order Faddeeva approach.
+    //
+    // The integral E[sigmoid(μ + σZ)] = (1/√π) ∫ e^{-t²} sigmoid(μ + √2σt) dt
+    // is a weighted-Gaussian integral whose integrand is entire (sigmoid is
+    // analytic everywhere), so Gauss-Hermite quadrature converges
+    // EXPONENTIALLY. A 128-point rule gives ~1e-15 accuracy — genuinely
+    // machine-precision, making this the true "exact" oracle. It is
+    // independent of the production `logit_posterior_mean` path (which uses a
+    // different adaptive GHQ implementation at lower order), so it remains a
+    // valid certification reference.
+    let rule = compute_gauss_hermite_n(128);
     let sqrt2_sigma = SQRT_2 * sigma;
-    let coeff = (2.0_f64 * std::f64::consts::PI).sqrt() / sigma;
-    let mut sum_im = 0.0_f64;
-    let mut stable_small_terms = 0usize;
-
-    for n in 1..=4096usize {
-        let a_n = (2.0 * (n as f64) - 1.0) * std::f64::consts::PI;
-        let z = Complex {
-            re: -mu / sqrt2_sigma,
-            im: a_n / sqrt2_sigma, // strictly positive
-        };
-        let w = faddeeva_upper_halfplane(z);
-        if !w.im.is_finite() {
-            break;
-        }
-        let term = w.im;
-        sum_im += term;
-
-        let contrib = (coeff * term).abs();
-        if contrib < 1e-14 {
-            stable_small_terms += 1;
-            if stable_small_terms >= 8 {
-                break;
-            }
-        } else {
-            stable_small_terms = 0;
-        }
+    let inv_sqrt_pi = 1.0 / std::f64::consts::PI.sqrt();
+    let mut sum = 0.0_f64;
+    for k in 0..rule.nodes.len() {
+        let t = rule.nodes[k];
+        sum += rule.weights[k] * sigmoid(mu + sqrt2_sigma * t);
     }
-
-    0.5 - coeff * sum_im
-}
-
-/// Faddeeva function w(z)=exp(-z^2)erfc(-iz) for Im(z)>0.
-///
-/// Uses the Cauchy-type integral representation:
-///   w(z) = (i/π) ∫ exp(-t^2)/(z-t) dt,  t in R, Im(z)>0.
-///
-/// Writing z=x+iy (y>0), this gives:
-///   Re w(z) = (1/π) ∫ exp(-t^2) * y / ((x-t)^2 + y^2) dt
-///   Im w(z) = (1/π) ∫ exp(-t^2) * (x-t) / ((x-t)^2 + y^2) dt
-///
-/// We evaluate both with composite Simpson's rule.
-fn faddeeva_upper_halfplane(z: Complex) -> Complex {
-    let x = z.re;
-    let y = z.im.max(1e-12);
-    let span = (x.abs() + 10.0).max(14.0);
-    let a = -span;
-    let b = span;
-    let n = 4000usize; // even
-    let h = (b - a) / (n as f64);
-
-    let eval = |t: f64| -> Complex {
-        let u = x - t;
-        let den = (u * u + y * y).max(1e-300);
-        let e = (-t * t).exp();
-        // i/(z-t) = y/den + i*u/den
-        Complex {
-            re: e * y / den,
-            im: e * u / den,
-        }
-    };
-
-    let mut s_re = 0.0_f64;
-    let mut s_im = 0.0_f64;
-    let f0 = eval(a);
-    let fn_ = eval(b);
-    s_re += f0.re + fn_.re;
-    s_im += f0.im + fn_.im;
-
-    for i in 1..n {
-        let t = a + (i as f64) * h;
-        let f = eval(t);
-        let w = if i % 2 == 0 { 2.0 } else { 4.0 };
-        s_re += w * f.re;
-        s_im += w * f.im;
-    }
-    let scale = (h / 3.0) / std::f64::consts::PI;
-    Complex {
-        re: s_re * scale,
-        im: s_im * scale,
-    }
+    sum * inv_sqrt_pi
 }
 
 /// Standard sigmoid function with numerical stability.
@@ -5033,7 +4978,9 @@ mod tests {
         for (mu, sigma) in cases {
             let exact = logit_posterior_mean_exact(mu, sigma);
             let numeric = high_res_sigmoid_integral(mu, sigma);
-            assert_relative_eq!(exact, numeric, epsilon = 2e-4);
+            // #1459: tightened from 2e-4 to 1e-6 (GHQ exact oracle is now
+            // spectrally accurate).
+            assert_relative_eq!(exact, numeric, epsilon = 1e-6);
         }
     }
 
@@ -5045,7 +4992,34 @@ mod tests {
         for (eta, se) in cases {
             let ghq = logit_posterior_mean(&ctx, eta, se);
             let exact = logit_posterior_mean_exact(eta, se);
-            assert_relative_eq!(ghq, exact, epsilon = 2.5e-3);
+            // #1459: tightened from 2.5e-3 to 1e-6.
+            assert_relative_eq!(ghq, exact, epsilon = 1e-6);
+        }
+    }
+
+    /// #1459 — the `_exact` oracle must match the independent reference to
+    /// ~1e-7. The old Faddeeva-based path carried a σ-independent, μ-linear
+    /// bias of ~1.24e-5·μ (~3.7e-5 at μ=3). After the GHQ rewrite, the oracle
+    /// is spectrally accurate across the full (μ, σ) range.
+    #[test]
+    fn test_logit_posterior_mean_exact_no_mu_linear_bias_1459() {
+        for &(mu, sigma) in &[
+            (1.0, 0.02),
+            (1.0, 0.5),
+            (1.0, 2.0),
+            (3.0, 0.05),
+            (3.0, 0.5),
+            (3.0, 2.0),
+            (-2.0, 0.05),
+            (-2.0, 2.0),
+        ] {
+            let exact = logit_posterior_mean_exact(mu, sigma);
+            let reference = high_res_sigmoid_integral(mu, sigma);
+            let err = (exact - reference).abs();
+            assert!(
+                err < 1e-7,
+                "exact oracle bias at mu={mu}, sigma={sigma}: {err:.3e} (must be < 1e-7 after #1459)"
+            );
         }
     }
 

@@ -139,7 +139,7 @@ pub trait JetScalar<const K: usize>: Copy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::jet_tower::{evaluate_program, RowNllProgram, Tower2, Tower4};
+    use crate::families::jet_tower::{RowNllProgram, Tower2, Tower4, evaluate_program};
 
     // ── Order-specific oracle scalars (test-only; doc §A.1–A.3) ─────────
     //
@@ -678,7 +678,11 @@ mod tests {
         let truth4 = t.fourth_contracted(&U, &V);
         for a in 0..2 {
             for b in 0..2 {
-                close(fourth[a][b], truth4[a][b], &format!("seam fourth[{a}][{b}]"));
+                close(
+                    fourth[a][b],
+                    truth4[a][b],
+                    &format!("seam fourth[{a}][{b}]"),
+                );
             }
         }
     }

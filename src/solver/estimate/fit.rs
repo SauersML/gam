@@ -277,13 +277,10 @@ where
     // range-block and inner-PIRLS λ ceilings so a fully-smoothed direction carries
     // the SAME finite λ everywhere it is consumed.
     const LAMBDA_CEILING: f64 = 1.0e300;
-    let result_lambdas = result.lambdas.mapv(|v| {
-        if v.is_nan() {
-            v
-        } else {
-            v.min(LAMBDA_CEILING)
-        }
-    });
+    let result_lambdas =
+        result
+            .lambdas
+            .mapv(|v| if v.is_nan() { v } else { v.min(LAMBDA_CEILING) });
     let log_lambdas = result_lambdas.mapv(|v| v.max(1e-300).ln());
     let edf = result
         .inference

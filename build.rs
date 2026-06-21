@@ -898,8 +898,8 @@ fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
 
     let info = String::from_utf8_lossy(&output.stdout);
     let info = info.trim();
-    let is_claude = info.to_lowercase().contains("claude")
-        || info.to_lowercase().contains("anthropic");
+    let is_claude =
+        info.to_lowercase().contains("claude") || info.to_lowercase().contains("anthropic");
 
     if is_claude {
         panic!(
@@ -5344,12 +5344,12 @@ struct CommentBlock {
 /// nouns/verbs of the deferred work, not glue words.
 fn reword_is_stopword(t: &str) -> bool {
     const STOP: &[&str] = &[
-        "the", "and", "for", "this", "that", "with", "from", "into", "over", "each", "can",
-        "will", "its", "are", "was", "were", "has", "have", "had", "not", "but", "use", "uses",
-        "used", "via", "per", "out", "off", "all", "any", "one", "two", "new", "old", "should",
-        "would", "could", "may", "might", "must", "then", "than", "they", "them", "when", "where",
-        "which", "while", "here", "there", "only", "also", "still", "yet", "now", "later", "our",
-        "your", "their", "been", "being", "such", "some", "more", "most", "less", "few",
+        "the", "and", "for", "this", "that", "with", "from", "into", "over", "each", "can", "will",
+        "its", "are", "was", "were", "has", "have", "had", "not", "but", "use", "uses", "used",
+        "via", "per", "out", "off", "all", "any", "one", "two", "new", "old", "should", "would",
+        "could", "may", "might", "must", "then", "than", "they", "them", "when", "where", "which",
+        "while", "here", "there", "only", "also", "still", "yet", "now", "later", "our", "your",
+        "their", "been", "being", "such", "some", "more", "most", "less", "few",
     ];
     STOP.contains(&t)
 }
@@ -5394,31 +5394,31 @@ fn comment_block_has_deferral_cue(lower_text: &str) -> bool {
     static CUES: OnceLock<Vec<String>> = OnceLock::new();
     let cues = CUES.get_or_init(|| {
         vec![
-        format!("{}{}", "to", "do"),
-        format!("{}{}", "fix", "me"),
-        format!("{}-{}", "follow", "up"),
-        format!("{}{}", "follow", "up"),
-        format!("{}{}", "de", "fer"),
-        format!("{}{}", "stop", "gap"),
-        format!("{}{}", "place", "holder"),
-        format!("{}{}", "w", "ip"),
-        format!("{}{}", "t", "bd"),
-        "revisit".to_string(),
-        "punt".to_string(),
-        "eventually".to_string(),
-        "someday".to_string(),
-        "pending".to_string(),
-        "unimplemented".to_string(),
-        "incomplete".to_string(),
-        "stub".to_string(),
-        "not yet".to_string(),
-        "for now".to_string(),
-        "to be done".to_string(),
-        "to be implemented".to_string(),
-        "come back".to_string(),
-        "needs to".to_string(),
-        "remains to".to_string(),
-        "yet to".to_string(),
+            format!("{}{}", "to", "do"),
+            format!("{}{}", "fix", "me"),
+            format!("{}-{}", "follow", "up"),
+            format!("{}{}", "follow", "up"),
+            format!("{}{}", "de", "fer"),
+            format!("{}{}", "stop", "gap"),
+            format!("{}{}", "place", "holder"),
+            format!("{}{}", "w", "ip"),
+            format!("{}{}", "t", "bd"),
+            "revisit".to_string(),
+            "punt".to_string(),
+            "eventually".to_string(),
+            "someday".to_string(),
+            "pending".to_string(),
+            "unimplemented".to_string(),
+            "incomplete".to_string(),
+            "stub".to_string(),
+            "not yet".to_string(),
+            "for now".to_string(),
+            "to be done".to_string(),
+            "to be implemented".to_string(),
+            "come back".to_string(),
+            "needs to".to_string(),
+            "remains to".to_string(),
+            "yet to".to_string(),
         ]
     });
     cues.iter().any(|c| lower_text.contains(c.as_str()))

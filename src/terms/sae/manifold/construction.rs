@@ -59,10 +59,7 @@ impl OuterGradientError {
     /// shape/non-finite guards (`vector shapes`, `gauge length`, `must be finite`,
     /// `non-finite`). Everything else — including the `cholesky`/back-solve
     /// near-singular failures — is treated as a genuine conditioning trip.
-    pub(crate) fn classify_arrow_solver_error(
-        message: &str,
-        conditioning_err: Self,
-    ) -> Self {
+    pub(crate) fn classify_arrow_solver_error(message: &str, conditioning_err: Self) -> Self {
         let lower = message.to_ascii_lowercase();
         let is_internal = lower.contains("vector shapes")
             || lower.contains("gauge length")
@@ -9766,8 +9763,7 @@ mod outer_gradient_error_classification_1451_tests {
             "DeflatedArrowSolver: solution length 5 != cache full length 6",
         ];
         for msg in shape_messages {
-            let classified =
-                OuterGradientError::classify_arrow_solver_error(msg, conditioning());
+            let classified = OuterGradientError::classify_arrow_solver_error(msg, conditioning());
             assert!(
                 matches!(classified, OuterGradientError::InternalInvariant { .. }),
                 "shape mismatch must classify to InternalInvariant (#1451); got {classified}"
@@ -9788,8 +9784,7 @@ mod outer_gradient_error_classification_1451_tests {
             "outer_gradient_arrow_solver: non-finite entry in projected gauge Hessian",
         ];
         for msg in nonfinite_messages {
-            let classified =
-                OuterGradientError::classify_arrow_solver_error(msg, conditioning());
+            let classified = OuterGradientError::classify_arrow_solver_error(msg, conditioning());
             assert!(
                 matches!(classified, OuterGradientError::InternalInvariant { .. }),
                 "non-finite intermediate must classify to InternalInvariant (#1451); \
@@ -9810,8 +9805,7 @@ mod outer_gradient_error_classification_1451_tests {
             "DeflatedArrowSolver: gauge back-solve: singular factor",
         ];
         for msg in conditioning_messages {
-            let classified =
-                OuterGradientError::classify_arrow_solver_error(msg, conditioning());
+            let classified = OuterGradientError::classify_arrow_solver_error(msg, conditioning());
             assert!(
                 matches!(classified, OuterGradientError::IllConditioned { .. }),
                 "a finite, correctly-shaped near-singular failure must KEEP \

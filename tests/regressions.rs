@@ -10,6 +10,8 @@ mod arrow_schur_bug_hunt;
 mod bernoulli_marginal_slope_bug_hunt_1;
 #[path = "regressions/bug_hunt_1089_small_n_gaussian_double_penalty_terminates.rs"]
 mod bug_hunt_1089_small_n_gaussian_double_penalty_terminates;
+#[path = "regressions/bug_hunt_1379_univariate_matern_gp_degenerate_range_penalty.rs"]
+mod bug_hunt_1379_univariate_matern_gp_degenerate_range_penalty;
 #[path = "regressions/bug_hunt_874_cyclic_bs_cc_outer_loop_terminates.rs"]
 mod bug_hunt_874_cyclic_bs_cc_outer_loop_terminates;
 #[path = "regressions/bug_hunt_979_gaussian_duchon_inference_nuts_not_quadratic.rs"]
@@ -350,5 +352,3 @@ mod warm_start_store_regressions;
 mod wiggle_option_validation_issue_377_373;
 #[path = "regressions/workflow_bug_hunt.rs"]
 mod workflow_bug_hunt;
-#[path = "regressions/bug_hunt_1379_univariate_matern_gp_degenerate_range_penalty.rs"]
-mod bug_hunt_1379_univariate_matern_gp_degenerate_range_penalty;
