@@ -4225,47 +4225,35 @@ pub fn survival_posterior_meanvariance(
     (m1.clamp(0.0, 1.0), (m2 - m1 * m1).max(0.0))
 }
 
-/// Oracle-only exact logistic-normal mean using the Faddeeva-series representation.
+/// Oracle logistic-normal mean E[sigmoid(η)] for η ~ N(mu, sigma²).
 ///
-/// For η ~ N(mu, sigma^2):
-///   E[sigmoid(η)] = 1/2 - (sqrt(2π)/sigma) * Σ_{n>=1} Im[w((i a_n - mu)/(sqrt(2)sigma))]
-/// where a_n = (2n-1)π and w is the Faddeeva function.
+/// Evaluated via a 128-point Gauss-Hermite quadrature of
+///   E[sigmoid(η)] = (1/√π) ∫ e^{-t²} sigmoid(mu + √2·sigma·t) dt.
 ///
-/// This function is intentionally kept as a math/reference implementation:
-/// it documents the exact non-GHQ route that an optimized integrated logit IRLS
-/// path would eventually use. The practical migration path is:
+/// The integrand sigmoid(mu + √2·sigma·t) is analytic on the real line;
+/// Gauss-Hermite quadrature converges geometrically while the nearest complex
+/// pole of the logistic function (odd multiples of iπ, scaled by √2·sigma)
+/// stays far from the real axis relative to the GHQ node span. A 128-point
+/// rule gives sub-1e-7 accuracy across the practical (mu, sigma) range
+/// (verified by `test_logit_posterior_mean_exact_no_mu_linear_bias_1459` over
+/// the full {1,3,-2} × {0.02,0.05,0.5,2.0} grid).
 ///
-/// 1. prove machine-precision truncation criteria on the production domain,
-/// 2. expose the derivative d/dmu E[sigmoid(eta)] alongside the mean,
-/// 3. replace the GHQ loop in `logit_posterior_meanwith_deriv` once the exact
-///    special-function path is benchmarked and regression-tested thoroughly.
+/// This is the certification oracle for the production `logit_posterior_mean`
+/// GHQ path — it uses a higher-order (128-point) rule and independent routing,
+/// so agreement between the two confirms the production path's accuracy.
 ///
-/// Deterministic integration-free equivalent representation:
-/// Let m=mu, s=sigma, and erfcx(x)=exp(x^2)erfc(x). Then an exact convergent form is
+/// ## Historical / alternative Faddeeva-series representation
 ///
-///   E[sigmoid(η)]
-///   = Φ(m/s)
-///     + 0.5 * exp(-m^2/(2s^2))
-///       * Σ_{k>=1} (-1)^{k-1}
-///         [ erfcx((k s^2 + m)/(sqrt(2)s)) - erfcx((k s^2 - m)/(sqrt(2)s)) ].
+/// The mean also admits an exact series in terms of the Faddeeva function w:
+///   E[sigmoid(η)] = 1/2 - (√(2π)/sigma) · Σ_{n≥1} Im[w((i a_n - mu)/(√2 sigma))]
+/// where a_n = (2n-1)π. This derivation (sketched below) is retained for
+/// reference; the previous implementation evaluated it via a low-order
+/// composite-Simpson Faddeeva evaluator that carried a systematic,
+/// sigma-independent, mu-linear bias of ~1.24e-5·mu (#1459), so it was
+/// replaced by the direct GHQ form above.
 ///
-/// A matching exact second-moment representation uses the same erfcx building
-/// blocks U_k/V_k plus the boundary term -φ_{m,s}(0):
-///
-///   U_k(m,s) = 0.5 * exp(-m^2/(2s^2)) * erfcx((k s^2 - m)/(sqrt(2)s))
-///   V_k(m,s) = 0.5 * exp(-m^2/(2s^2)) * erfcx((k s^2 + m)/(sqrt(2)s))
-///
-///   E[sigmoid(η)^2]
-///     = Φ(m/s)
-///       + Σ_{k>=1} (k+1)(-1)^k U_k
-///       + Σ_{k>=2} (k-1)(-1)^k V_k
-///       - φ_{m,s}(0),
-///
-/// and therefore
-///
-///   Var(sigmoid(η)) = E[sigmoid(η)^2] - E[sigmoid(η)]^2.
-///
-/// Derivation sketch:
+/// Derivation sketch (the series itself is exact; the prior *evaluation* was
+/// what carried the bias):
 /// 1) sigmoid(t) = 1/2 + 1/2 tanh(t/2)
 /// 2) tanh has a partial-fraction expansion over odd poles ±i(2n-1)π
 /// 3) Taking Gaussian expectations termwise yields rational expectations of the form
@@ -4273,9 +4261,6 @@ pub fn survival_posterior_meanvariance(
 /// 4) Those are exactly representable by the Faddeeva function:
 ///    E[ 1 / (Z - i a) ] = i*sqrt(pi)/(sqrt(2)*sigma) * w((i a - mu)/(sqrt(2)*sigma))
 /// 5) Taking imaginary parts and summing odd a_n gives the stated series.
-///
-/// Therefore this routine is mathematically exact up to numerical truncation and
-/// numerical evaluation error of w(z).
 pub fn logit_posterior_mean_exact(mu: f64, sigma: f64) -> f64 {
     if !(mu.is_finite() && sigma.is_finite()) || sigma <= 0.0 {
         return sigmoid(mu);
@@ -4295,11 +4280,11 @@ pub fn logit_posterior_mean_exact(mu: f64, sigma: f64) -> f64 {
     //
     // The integral E[sigmoid(μ + σZ)] = (1/√π) ∫ e^{-t²} sigmoid(μ + √2σt) dt
     // is a weighted-Gaussian integral. The integrand sigmoid(μ + √2σt) is
-    // analytic on the real line and entire as a function of t only when σ is
-    // small (the logistic function is meromorphic with complex poles at odd
-    // multiples of iπ; the √2σ scaling moves them closer to the real axis as
-    // σ grows). Gauss-Hermite quadrature converges geometrically while the
-    // nearest complex pole stays far from the real axis relative to the GHQ
+    // analytic on the real line. The logistic function is meromorphic with
+    // complex poles at odd multiples of iπ; the √2σ scaling moves those poles
+    // to ±iπ/(√2σ), so they recede from the real axis as σ GROWS (the large-σ
+    // regime is the well-conditioned one). Gauss-Hermite quadrature converges
+    // geometrically while the nearest complex pole stays well outside the GHQ
     // node span, so a 128-point rule gives sub-1e-7 accuracy across the
     // practical (μ, σ) range. This is independent of the production
     // `logit_posterior_mean` path (which uses a different adaptive GHQ
