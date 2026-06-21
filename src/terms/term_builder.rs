@@ -69,6 +69,25 @@ const CYCLIC_DEFAULT_BASIS_DIM: usize = 12;
 /// explicit `k`/`basis_dim`.
 const FACTOR_SMOOTH_DEFAULT_BASIS_DIM: usize = 10;
 
+/// Default total basis dimension for a *univariate* (`d == 1`) thin-plate
+/// smooth `s(x, bs="tp")`, matching mgcv's 1-D `s()` default of `k = 10`.
+///
+/// The generic spatial center heuristic ([`default_num_centers`]) scales the
+/// center count with `n` (≈75 centers at `n = 300`), which is appropriate for a
+/// genuinely multi-dimensional spatial smooth but pathological for a 1-D
+/// thin-plate term: the oversized basis carries two penalty blocks whose REML
+/// ρ-surface has a weakly-identified flat valley. The outer optimizer then
+/// stalls on that valley at a point that depends on the row order of the
+/// training data, so a pure row permutation moves the fitted curve (#1378).
+/// Capping the *default* 1-D center count to an mgcv-sized basis keeps the
+/// ρ-surface well-identified and the fit row-permutation invariant, while still
+/// recovering smooth 1-D signal. Overridden by an explicit `k`/`centers`.
+///
+/// The center count is the total basis dimension minus the linear Duchon
+/// polynomial null space (dimension 2 in 1-D: constant + linear), so a `k = 10`
+/// basis corresponds to 8 kernel centers.
+const THIN_PLATE_1D_DEFAULT_BASIS_DIM: usize = 10;
+
 /// Default row-chunk size for the out-of-core PCA-basis smooth when the
 /// `chunk_size=` option is absent. Streams the design in row blocks to bound
 /// peak memory independent of the dataset row count.
@@ -2125,10 +2144,27 @@ pub fn build_smooth_basis(
                 policy,
             )
             .map_err(|e| e.to_string())?;
+            // A *univariate* (`d == 1`) thin-plate smooth `s(x, bs="tp")` is the
+            // routine 1-D smooth, not a spatial field: the generic spatial
+            // center heuristic (which scales with `n`) over-sizes it, producing
+            // a weakly-identified two-penalty ρ-surface whose REML optimum is
+            // row-order dependent (#1378). When no explicit center count / `k`
+            // is given, default the 1-D basis to mgcv's `k = 10` total
+            // dimension (kernel centers = total − linear-nullspace dim), capped
+            // by the heuristic so tiny-`n` plans are never inflated. An explicit
+            // `k`/`centers` still takes full effect via `parse_countwith_basis_alias`.
+            let default_centers = if cols.len() == 1 {
+                let nullspace_dim = crate::basis::duchon_nullspace_dimension(1, 1);
+                let target_centers =
+                    THIN_PLATE_1D_DEFAULT_BASIS_DIM.saturating_sub(nullspace_dim);
+                plan.centers.min(target_centers.max(1))
+            } else {
+                plan.centers
+            };
             let centers = parse_countwith_basis_alias(
                 options,
                 "centers",
-                cap_default_spatial_centers(options, plan.centers),
+                cap_default_spatial_centers(options, default_centers),
             )?;
             let center_strategy = if has_explicit_countwith_basis_alias(options, "centers") {
                 spatial_center_strategy_for_dimension(centers, cols.len())
@@ -4008,6 +4044,75 @@ mod tests {
                 ColumnKindTag::Categorical,
             ],
         }
+    }
+
+    /// #1378: the DEFAULT univariate `s(x, bs="tp")` must build a *modest*
+    /// mgcv-sized basis, not the n-scaled spatial heuristic. The oversized
+    /// default basis left the two-penalty REML ρ-surface with a flat valley
+    /// whose optimizer landing point depended on row order, breaking
+    /// row-permutation invariance. Pin the default 1-D center count so a
+    /// regression that reinstates the n-scaled default trips here, fast, with
+    /// no fit/optimizer in the loop.
+    #[test]
+    fn default_univariate_thinplate_basis_dim_is_modest() {
+        // n = 300 (the #1378 scenario): the n-scaled spatial heuristic would
+        // request ~75 centers here. The modest default must stay near k = 10.
+        let n = 300usize;
+        let rows: Vec<Vec<f64>> = (0..n)
+            .map(|i| {
+                let x = -3.0 + 6.0 * (i as f64) / ((n - 1) as f64);
+                vec![x.sin(), x]
+            })
+            .collect();
+        let ds = continuous_dataset(&["y", "x"], rows);
+
+        let mut options = BTreeMap::new();
+        options.insert("bs".to_string(), "tp".to_string());
+
+        let mut notes = Vec::new();
+        let basis = build_smooth_basis(
+            SmoothKind::S,
+            &["x".to_string()],
+            &[1],
+            &options,
+            &ds,
+            &mut notes,
+            &ResourcePolicy::default_library(),
+            1,
+        )
+        .expect("build default univariate tp smooth");
+
+        let centers = match &basis {
+            SmoothBasisSpec::ThinPlate { spec, .. } => match &spec.center_strategy {
+                CenterStrategy::Auto(inner) => match inner.as_ref() {
+                    CenterStrategy::FarthestPoint { num_centers }
+                    | CenterStrategy::EqualMass { num_centers }
+                    | CenterStrategy::EqualMassCovarRepresentative { num_centers }
+                    | CenterStrategy::KMeans { num_centers, .. } => *num_centers,
+                    other => panic!("unexpected auto inner center strategy: {other:?}"),
+                },
+                CenterStrategy::FarthestPoint { num_centers }
+                | CenterStrategy::EqualMass { num_centers }
+                | CenterStrategy::EqualMassCovarRepresentative { num_centers }
+                | CenterStrategy::KMeans { num_centers, .. } => *num_centers,
+                other => panic!("unexpected center strategy: {other:?}"),
+            },
+            other => panic!("expected ThinPlate basis, got {other:?}"),
+        };
+
+        // Total 1-D basis dim is centers + the linear Duchon null space (dim 2).
+        let nullspace = crate::basis::duchon_nullspace_dimension(1, 1);
+        let basis_dim = centers + nullspace;
+        assert!(
+            basis_dim <= THIN_PLATE_1D_DEFAULT_BASIS_DIM,
+            "default univariate tp basis dim {basis_dim} (centers={centers}) exceeds the \
+             modest mgcv-sized ceiling {THIN_PLATE_1D_DEFAULT_BASIS_DIM}; the n-scaled \
+             spatial default reintroduces the #1378 flat-valley non-invariance",
+        );
+        assert!(
+            centers >= 1,
+            "default univariate tp must still build a usable basis (centers={centers})",
+        );
     }
 
     fn inferred_tensor_basis_product(ds: &Dataset) -> usize {
