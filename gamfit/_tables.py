@@ -84,7 +84,7 @@ def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:
     row_count = len(columns[headers[0]])
     if row_count == 0:
         raise ValueError("table data cannot be empty")
-    categorical = categorical_dtype_columns(data, kind)
+    categorical = categorical_dtype_columns(data, columns, kind)
     rows = [
         [
             _stringify_marked(
@@ -107,12 +107,21 @@ def _stringify_marked(value: Any, is_categorical: bool, *, column: str | None = 
     return text
 
 
-def categorical_dtype_columns(data: Any, kind: str) -> frozenset[str]:
+def categorical_dtype_columns(
+    data: Any, columns: dict[str, list[Any]], kind: str
+) -> frozenset[str]:
     """Names of columns whose *source dtype* is non-numeric (string / object /
     categorical), independent of whether the rendered cell text parses as a
-    number. Only typed table libraries carry this signal; untyped inputs
-    (mappings, record/row sequences, numpy) return an empty set and keep the
-    value-based numeric inference.
+    number.
+
+    Typed table libraries (pandas/polars/pyarrow) carry this signal on their
+    dtypes. Untyped inputs (mappings, record/row sequences, numpy) do not — so
+    a column whose values are all Python ``str`` is treated as categorical
+    (matching pandas string/object-dtype behavior), while columns of
+    int/float/bool stay numeric. This keeps a numeric-string-label column
+    ("0", "1", "2") categorical in a dict just as it is in a DataFrame (#1467,
+    #1468, #1469); a genuinely-numeric by= covariate supplied as floats stays
+    numeric.
     """
     try:
         if kind == "pandas":
@@ -149,12 +158,23 @@ def categorical_dtype_columns(data: Any, kind: str) -> frozenset[str]:
                 ):
                     out.add(str(field.name))
             return frozenset(out)
+        # Untyped inputs (mapping / records / rows / numpy): the column-major
+        # `columns` dict holds the original Python values. A column is
+        # categorical when every non-None value is a `str` (and at least one
+        # value exists); numeric/bool columns stay numeric. This is the
+        # equivalent of pandas object/string dtype for dict/numpy inputs and
+        # prevents numeric-string labels ("0","1") being inferred numeric.
+        out = set()
+        for name, values in columns.items():
+            non_none = [v for v in values if v is not None]
+            if non_none and all(isinstance(v, str) for v in non_none):
+                out.add(name)
+        return frozenset(out)
     except Exception:
         # Dtype introspection is a best-effort enhancement; if a library's
         # introspection API shifts, fall back to value-based inference rather
         # than fail the fit.
         return frozenset()
-    return frozenset()
 
 
 def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
