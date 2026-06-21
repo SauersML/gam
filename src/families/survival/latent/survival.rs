@@ -3309,7 +3309,7 @@ impl LatentBinaryFamily {
         slices: &LatentSurvivalJointSlices,
         primary_gradient: &Array1<f64>,
         weight: f64,
-    ) {
+    ) -> Result<(), String> {
         for (primary_idx, time_vec) in [
             (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
             (LATENT_SURVIVAL_PRIMARY_Q_EXIT, self.x_time_exit.row(row)),
@@ -3336,15 +3336,16 @@ impl LatentBinaryFamily {
                 )
                 // SAFETY: `slices.mean` sized at construction to match
                 // `x_mean.ncols()`; an error means caller-side shape drift.
-                .unwrap_or_else(|error| {
-                    panic!(
+                .map_err(|error| {
+                    format!(
                         "latent binary mean gradient pullback dimension mismatch: row={row}, mean_slice={:?}, target_len={}, x_mean_cols={}, error={error}",
                         slices.mean,
                         target.len(),
                         self.x_mean.ncols()
                     )
-                });
+                })?;
         }
+        Ok(())
     }
 
     fn add_pullback_primary_hessian(
@@ -3353,7 +3354,7 @@ impl LatentBinaryFamily {
         row: usize,
         slices: &LatentSurvivalJointSlices,
         primary_hessian: &Array2<f64>,
-    ) {
+    ) -> Result<(), String> {
         {
             let time_target = &mut target.slice_mut(s![slices.time.clone(), slices.time.clone()]);
             dense_outer_accumulate(
@@ -3390,31 +3391,31 @@ impl LatentBinaryFamily {
                 mean_weight,
                 target.slice_mut(s![slices.mean.clone(), slices.mean.clone()]),
             )
-            .unwrap_or_else(|error| {
+            .map_err(|error| {
                 // SAFETY: `slices.mean` × `slices.mean` slab sized at
                 // construction to `x_mean.ncols()` × `x_mean.ncols()`;
                 // an error here is caller-side shape drift.
-                panic!(
+                format!(
                     "latent binary mean Hessian pullback dimension mismatch: row={row}, mean_slice={:?}, target_dim={:?}, x_mean_cols={}, error={error}",
                     slices.mean,
                     target.dim(),
                     self.x_mean.ncols()
                 )
-            });
+            })?;
 
         let mean_row = self
             .x_mean
             .try_row_chunk(row..row + 1)
-            .unwrap_or_else(|error| {
+            .map_err(|error| {
                 // SAFETY: row index comes from the enclosing `0..n` loop
                 // bound by `self.x_mean.nrows()`, so `row..row+1` is
                 // always a valid single-row chunk.
-                panic!(
+                format!(
                     "latent binary mean pullback row chunk failed: row={row}, x_mean_rows={}, x_mean_cols={}, error={error}",
                     self.x_mean.nrows(),
                     self.x_mean.ncols()
                 )
-            });
+            })?;
         let mean_vec = mean_row.row(0);
         for (primary_idx, time_vec) in [
             (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
@@ -3439,6 +3440,7 @@ impl LatentBinaryFamily {
                 }
             }
         }
+        Ok(())
     }
 
     fn evaluate_exact_newton_joint_dense(
@@ -3485,13 +3487,13 @@ impl LatentBinaryFamily {
                 &slices,
                 &primary_gradient,
                 wi,
-            );
+            )?;
             self.add_pullback_primary_hessian(
                 &mut hessian,
                 row_idx,
                 &slices,
                 &(wi * primary_hessian),
-            );
+            )?;
         }
         Ok((ll, gradient, hessian))
     }
