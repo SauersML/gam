@@ -344,6 +344,65 @@ impl FrozenWeightGramTensor {
         }
         true
     }
+
+    /// #1033 GLM endgame (value channel, n-free): the coefficient vector of ONE
+    /// frozen-`W` Fisher-scoring step at `psi`, solving the penalized normal
+    /// equations
+    ///
+    /// ```text
+    ///   (XᵀW X(ψ) + S) β = XᵀW z̃(ψ)
+    /// ```
+    ///
+    /// entirely in k-space — `XᵀW X(ψ)` from [`Self::gram_at`] and `XᵀW z̃(ψ)`
+    /// from [`Self::rhs_at`], both assembled n-free from the certified tensor —
+    /// so NO design row is touched. `penalty` is the (already ψ-keyed, k×k) total
+    /// penalty `S` the caller supplies in the SAME coefficient basis the tensor
+    /// was built in (the conditioned `x_fit` frame); it must be symmetric PSD so
+    /// `XᵀW X(ψ) + S` is SPD for the Cholesky solve.
+    ///
+    /// This is the LOAD-BEARING math for serving a GLM κ-trial's inner solve
+    /// without re-realizing the design: in the warm-β outer-loop regime the first
+    /// Fisher step is already at (or near) the trial's converged β, so — gated by
+    /// [`Self::weight_drift_within`] — this single k-space step IS the trial's
+    /// inner solve. It is a PURE function (no `&mut`, no I/O): the wiring that
+    /// routes the GLM lane through it (the design-revision skip) is a separate,
+    /// independently-verified increment. The frozen-`W` Gram is bit-tight against
+    /// the streamed weighted rebuild (see `frozen_w_gram_matches_exact_weighted_
+    /// rebuild`), so β here equals the streamed first-Fisher-step β to the solve's
+    /// conditioning.
+    ///
+    /// Returns `None` when `psi` is off-window, the penalty shape mismatches
+    /// `k×k`, or the Cholesky factorization fails (non-SPD assembled system) —
+    /// the caller then falls back to the exact per-trial PIRLS rebuild.
+    pub fn frozen_w_single_step_beta(
+        &self,
+        psi: f64,
+        penalty: ndarray::ArrayView2<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        if !self.contains(psi) {
+            return None;
+        }
+        let mut system = self.gram_at(psi);
+        let k = system.nrows();
+        if penalty.dim() != (k, k) {
+            return None;
+        }
+        system += &penalty;
+        if system.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        let rhs = self.rhs_at(psi);
+        if rhs.len() != k || rhs.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        use crate::faer_ndarray::FaerCholesky;
+        let factor = system.cholesky(faer::Side::Lower).ok()?;
+        let beta = factor.solvevec(&rhs);
+        if beta.iter().any(|v| !v.is_finite()) {
+            return None;
+        }
+        Some(beta)
+    }
 }
 
 /// The full mechanism-(c) endgame, documented for the next builder.
@@ -488,6 +547,85 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// #1033 GLM endgame value channel: the n-free frozen-`W` single Fisher step
+    /// `(XᵀWX(ψ)+S)β = XᵀWz̃(ψ)` solved entirely from the tensor's k-space
+    /// accessors must equal the SAME step solved from the streamed-exact
+    /// frozen-`W` Gram+RHS (rebuilt from rows) — to the solve's conditioning.
+    /// This pins the load-bearing math the GLM design-revision skip will route
+    /// through, independent of any live-fit wiring.
+    #[test]
+    fn frozen_w_single_step_beta_matches_streamed_first_fisher_step() {
+        let (n, k) = (200usize, 5usize);
+        let (psi_lo, psi_hi) = (-0.6, 0.6);
+        let w = frozen_weights(n);
+        let z = working_z(n);
+        let tensor = FrozenWeightGramTensor::build(
+            |psi| synth_design(psi, n, k),
+            w.view(),
+            z.view(),
+            psi_lo,
+            psi_hi,
+        )
+        .expect("frozen-W tensor must certify on the analytic Matérn-shaped design");
+
+        // A symmetric-PD penalty in the same k-space basis (diagonal ridge plus a
+        // mild off-diagonal bend), chosen so XᵀWX(ψ)+S is comfortably SPD.
+        let mut penalty = Array2::<f64>::zeros((k, k));
+        for a in 0..k {
+            penalty[[a, a]] = 0.5 + 0.1 * a as f64;
+            if a + 1 < k {
+                penalty[[a, a + 1]] = 0.05;
+                penalty[[a + 1, a]] = 0.05;
+            }
+        }
+
+        use crate::faer_ndarray::FaerCholesky;
+        for &frac in &[0.137_f64, 0.382, 0.618, 0.851] {
+            let psi = psi_lo + frac * (psi_hi - psi_lo);
+
+            // n-free single step from the tensor accessors.
+            let beta_nfree = tensor
+                .frozen_w_single_step_beta(psi, penalty.view())
+                .expect("frozen-W single step must solve (SPD system in-window)");
+
+            // Streamed reference: assemble (XᵀWX+S) and XᵀWz̃ from rows, solve.
+            let mut sys_ref = exact_weighted_gram(psi, n, k, &w);
+            sys_ref += &penalty;
+            let rhs_ref = exact_weighted_xty(psi, n, k, &w, &z);
+            let beta_ref = sys_ref
+                .cholesky(faer::Side::Lower)
+                .expect("reference system SPD")
+                .solvevec(&rhs_ref);
+
+            let scale = beta_ref
+                .iter()
+                .fold(0.0_f64, |a, &v| a.max(v.abs()))
+                .max(1e-300);
+            for (a, b) in beta_nfree.iter().zip(beta_ref.iter()) {
+                assert!(
+                    (a - b).abs() <= 1e-9 * scale,
+                    "frozen-W single-step β(ψ={psi}) n-free vs streamed off by {}",
+                    (a - b).abs()
+                );
+            }
+        }
+
+        // Shape-mismatched penalty and off-window ψ both refuse (sound fallback).
+        let bad_penalty = Array2::<f64>::zeros((k + 1, k + 1));
+        assert!(
+            tensor
+                .frozen_w_single_step_beta(0.0, bad_penalty.view())
+                .is_none(),
+            "a k+1×k+1 penalty must be refused"
+        );
+        assert!(
+            tensor
+                .frozen_w_single_step_beta(psi_hi + 1.0, penalty.view())
+                .is_none(),
+            "an off-window ψ must be refused"
+        );
     }
 
     #[test]
