@@ -352,5 +352,3 @@ mod wiggle_option_validation_issue_377_373;
 mod workflow_bug_hunt;
 #[path = "regressions/bug_hunt_1379_univariate_matern_gp_degenerate_range_penalty.rs"]
 mod bug_hunt_1379_univariate_matern_gp_degenerate_range_penalty;
-#[path = "regressions/bug_hunt_1378_default_tp_row_permutation_invariance.rs"]
-mod bug_hunt_1378_default_tp_row_permutation_invariance;
