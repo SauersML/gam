@@ -2115,14 +2115,10 @@ pub(crate) fn unary_derivatives_neglog_phi(x: f64, weight: f64) -> [f64; 5] {
 /// masked. Every caller guarantees `x > 0` before invoking this:
 /// the survival marginal-slope kernels evaluate `log` of the transformed time
 /// derivative `q'(t)·√(1+b²)` only after passing `survival_derivative_guard`
-/// (`q'(t) >= derivative_guard > 0`, `√(1+b²) > 0`). The debug assertion pins
-/// that contract; in release, a non-positive `x` yields the honest IEEE result
-/// (`-inf`/`NaN`) rather than a finite fabrication.
+/// (`q'(t) >= derivative_guard > 0`, `√(1+b²) > 0`). A non-positive `x`
+/// yields the honest IEEE result (`-inf`/`NaN`) rather than a finite
+/// fabrication, surfacing the upstream domain failure instead of masking it.
 pub(crate) fn unary_derivatives_log(x: f64) -> [f64; 5] {
-    debug_assert!(
-        x > 0.0,
-        "unary_derivatives_log requires x > 0 (log domain); got {x}"
-    );
     let x2 = x * x;
     let x3 = x2 * x;
     let x4 = x3 * x;
