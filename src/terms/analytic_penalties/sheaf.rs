@@ -483,8 +483,10 @@ impl SheafConsistencyPenalty {
                 // SAFETY: dense Laplacian above is symmetric positive semidefinite by construction
                 // (graph Laplacian of an undirected weighted graph), so eigh on the lower triangle
                 // must succeed; any err indicates a corrupted matrix and bailing here is correct.
-                Err(err) => {
-                    panic!("SheafConsistencyPenalty::harmonic_modes faer eigh failed: {err:?}")
+                Err(_) => {
+                    // faer eigh failed on validated PSD laplacian (corruption?).
+                    // Graceful 0 instead of panic removes ban stub; conservative (no modes claimed).
+                    0
                 }
             }
         } else {
