@@ -9397,6 +9397,63 @@ pub(crate) fn ibp_rho_sparse_logdet_trace_matches_dense_fd_1416() {
     );
 }
 
+/// #1417 — for LEARNABLE IBP alpha the joint Laplace `log|H|` depends on alpha
+/// not only through the prior Hessian but EXPLICITLY through the data
+/// Gauss-Newton blocks: `a_ik = σ(ℓ/τ)·π_k(α)`, so `H_ββ`, `H_tβ`, `H_tt` all
+/// carry `α`. The complete `½ ∂log|H|/∂logα` is therefore the prior-Hessian
+/// trace (`assignment_log_strength_hessian_trace`) PLUS the data trace
+/// (`learnable_ibp_data_logdet_alpha_trace`, #1417). The learnable-alpha control
+/// is `α(ρ₀) = α_base·e^{ρ₀}` (`resolve_learnable_weight`), so `∂logα/∂ρ₀ = 1`
+/// and a fixed-state central difference of `log|H|` w.r.t. ρ₀ must equal twice
+/// the SUM of both analytic traces. Omitting the data trace (the pre-#1417 bug)
+/// would fail this FD.
+#[test]
+pub(crate) fn learnable_ibp_alpha_logdet_trace_matches_dense_fd_1417() {
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    // Learnable-alpha IBP-MAP: ρ₀ (log_lambda_sparse) now drives alpha.
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, true);
+    rho.log_lambda_sparse = 0.1;
+    let (_value, _loss, cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .expect("converged cache");
+    let solver = DeflatedArrowSolver::plain(&cache);
+    // The full ½ ∂log|H|/∂logα = prior trace + data trace, exactly as
+    // `analytic_outer_rho_gradient_components` folds into `logdet_trace[0]`.
+    let prior_trace = term
+        .assignment_log_strength_hessian_trace(&rho, &cache, &solver)
+        .expect("prior-Hessian alpha trace");
+    let data_trace = term
+        .learnable_ibp_data_logdet_alpha_trace(&rho, &cache, &solver)
+        .expect("data-Hessian alpha trace");
+    let analytic = prior_trace + data_trace;
+
+    // Fixed-state central difference of log|H| w.r.t. ρ₀ (= log α offset).
+    let h = 1.0e-5;
+    let mut rho_plus = rho.clone();
+    let mut rho_minus = rho.clone();
+    rho_plus.log_lambda_sparse += h;
+    rho_minus.log_lambda_sparse -= h;
+    let fd_half = 0.5
+        * (fixed_state_logdet(term.clone(), &target, &rho_plus)
+            - fixed_state_logdet(term.clone(), &target, &rho_minus))
+        / (2.0 * h);
+    let tol = 3.0e-3 * (1.0 + fd_half.abs().max(analytic.abs()));
+    assert!(
+        (fd_half - analytic).abs() <= tol,
+        "learnable-α logdet trace: fd(½∂log|H|/∂logα)={fd_half:.8e}, \
+         analytic(prior+data)={analytic:.8e} (prior={prior_trace:.6e}, \
+         data={data_trace:.6e})"
+    );
+    // The data trace must be a genuine, nonzero contribution (the #1417 term the
+    // diagonal-only prior trace omitted) — otherwise the test would pass even if
+    // `learnable_ibp_data_logdet_alpha_trace` returned 0.
+    assert!(
+        data_trace.abs() > 1.0e-9,
+        "the #1417 data-Hessian alpha trace must be a live nonzero term; got \
+         {data_trace:.3e}"
+    );
+}
+
 /// #932 follow-up (the issue-comment cache-seam ask): the SAE row
 /// jet-program oracle driven directly from a CONVERGED production
 /// `ArrowFactorCache`, not a mirrored test layout.

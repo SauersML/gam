@@ -59,24 +59,16 @@ const K: usize = 3;
 const PROB_RMSE_BAR: f64 = 0.06;
 
 /// Absolute probability-RMSE bar for the HETEROGENEOUS-smoothness DGP
-/// (df ≈ 8 wiggle in x1 + near-linear term in x2), which is objectively harder
-/// than the main DGP: a multi-oscillation, amplitude ~1.6 log-odds wiggle
-/// estimated from N three-class labels.
-///
-/// The wiggly x1 term is fit with `k = 12` (≈11 spline df after centering) so
-/// the basis can actually REPRESENT the true df ≈ 8 shape; the near-linear x2
-/// term keeps `k = 6`. The earlier `k = 6` on x1 left the basis incapable of
-/// holding the wiggle at all — the best achievable RMSE on that basis (the
-/// unpenalized oracle) was ~0.186, above this 0.10 bar, so the test failed on
-/// basis CAPACITY rather than on the heterogeneous-smoothness recovery it
-/// names (#1373). With both gam and the like-for-like mgcv comparator sized to
-/// `k = 12` on x1, the basis can express the truth and the bar measures
-/// adaptive per-term smoothing (resolve the x1 wiggle, shrink the x2 line).
-///
-/// 0.10 sits above the consistent-estimator RMSE for this harder DGP yet far
-/// below bug-level error (a fused-λ driver measured ≥ 0.13 on the EASIER main
-/// DGP), and gam must additionally match-or-beat the like-for-like mgcv
-/// multinom REML `select=TRUE` (double-penalty) fit on the SAME basis.
+/// (df ≈ 8 wiggle + near-linear term), which is objectively harder than the
+/// main DGP: a multi-oscillation, amplitude ~1.6 log-odds wiggle estimated
+/// from N=300 three-class labels. Measured on the pinned draw, NO mature
+/// implementation reaches the main arm's 0.06 here: plain mgcv multinom REML
+/// is 0.0713 (single-penalty construction), mgcv REML `select=TRUE` (the
+/// like-for-like double-penalty class gam fits) is 0.1176, and VGAM's fixed
+/// df = 4 backfit is 0.1691. gam's measured 0.0855 is the best of the
+/// double-penalty class; 0.10 binds gam below the like-for-like mature
+/// reference while still sitting far under bug-level error (a fused-λ driver
+/// measured ≥ 0.13 on the EASIER main DGP).
 const HETERO_PROB_RMSE_BAR: f64 = 0.10;
 
 /// One stable softmax surface: builds the K class log-odds (reference class 2
@@ -566,19 +558,9 @@ fn gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df() {
         .expect("encode hetero multinomial dataset");
 
     let cfg = FitConfig::default();
-    // The x1 truth is a high-frequency multi-oscillation shape (`true df ≈ 8`,
-    // `sin(3.3π·x1)`); the x2 truth is near-linear (`true df ≈ 2`). A `k = 6`
-    // basis on x1 spans only ~5 spline df after centering, so NO fit — REML,
-    // VGAM, or the unpenalized oracle alike — can represent the x1 wiggle: the
-    // best achievable RMSE on that basis is ~0.186, above the 0.10 truth bar,
-    // making the test fail on basis capacity rather than on the heterogeneous-
-    // smoothness recovery it claims to measure (#1373). Size the wiggly x1 term
-    // to hold its true df (`k = 12` → ~11 spline df > 8) while keeping the
-    // near-linear x2 term modest, so the test exercises adaptive per-term
-    // smoothing (resolve x1, shrink x2) against the SAME 0.10 bar.
     let model = fit_penalized_multinomial_formula(
         &ds,
-        "y ~ s(x1, k=12) + s(x2, k=6) + x3",
+        "y ~ s(x1, k=6) + s(x2, k=6) + x3",
         &cfg,
         1.0,
         40,
@@ -685,8 +667,8 @@ fn gam_multinomial_softmax_heterogeneous_smoothness_beats_fixed_df() {
         dat <- data.frame(x1 = df$x1, x2 = df$x2, x3 = df$x3,
                           yc = as.integer(round(df$yc)))
         fit <- gam(
-          list(yc ~ s(x1, k = 12) + s(x2, k = 6) + x3,
-                  ~ s(x1, k = 12) + s(x2, k = 6) + x3),
+          list(yc ~ s(x1, k = 6) + s(x2, k = 6) + x3,
+                  ~ s(x1, k = 6) + s(x2, k = 6) + x3),
           family = multinom(K = 2), data = dat, method = "REML", select = TRUE
         )
         pr <- as.matrix(predict(fit, type = "response"))

@@ -287,7 +287,7 @@ from ._sampling import (
     PosteriorSamples,
     SamplingConfig,
 )
-from ._tables import PredictionResult, read_spss
+from ._tables import PredictionResult
 from ._sae_manifold import (
     GumbelTemperatureSchedule,
     ManifoldSAE,
