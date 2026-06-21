@@ -84,7 +84,7 @@ def normalize_table(data: Any) -> tuple[list[str], list[list[str]], str]:
     row_count = len(columns[headers[0]])
     if row_count == 0:
         raise ValueError("table data cannot be empty")
-    categorical = categorical_dtype_columns(data, kind)
+    categorical = categorical_dtype_columns(data, kind, columns=columns)
     rows = [
         [
             _stringify_marked(
@@ -107,12 +107,25 @@ def _stringify_marked(value: Any, is_categorical: bool, *, column: str | None = 
     return text
 
 
-def categorical_dtype_columns(data: Any, kind: str) -> frozenset[str]:
+def categorical_dtype_columns(
+    data: Any, kind: str, *, columns: dict[str, list[Any]] | None = None
+) -> frozenset[str]:
     """Names of columns whose *source dtype* is non-numeric (string / object /
     categorical), independent of whether the rendered cell text parses as a
-    number. Only typed table libraries carry this signal; untyped inputs
-    (mappings, record/row sequences, numpy) return an empty set and keep the
-    value-based numeric inference.
+    number.
+
+    Typed table libraries (pandas/polars/pyarrow) carry this signal in their
+    declared schema, so the dtype is read directly. Untyped inputs (mappings,
+    record/row sequences, numpy, plain row sequences) have no declared dtype, so
+    the signal is inferred from the *values*: a column is categorical iff it is
+    non-empty and every non-null value is a Python ``str`` (``numpy.str_`` is a
+    ``str`` subclass, so it is covered too). Any numeric (``int``/``float``/
+    ``bool``/numpy number) non-null value disqualifies the column, mirroring what
+    a pandas object-dtype all-string column would do. ``None`` and ``NaN`` are
+    treated as null and skipped, but a column must carry at least one real string
+    to be categorical. This closes the dict/records/numpy gap (#1467/#1468/#1469)
+    where a string column with numeric-looking labels ("0"/"1") was lowered to a
+    numeric covariate.
     """
     try:
         if kind == "pandas":
@@ -149,12 +162,39 @@ def categorical_dtype_columns(data: Any, kind: str) -> frozenset[str]:
                 ):
                     out.add(str(field.name))
             return frozenset(out)
+        # Untyped inputs (mappings, records, numpy, row sequences) have no
+        # declared dtype: infer categoricality from the column values.
+        if columns is None:
+            columns, _ = table_columns(data)
+        out = set()
+        for name, values in columns.items():
+            saw_string = False
+            disqualified = False
+            for value in values:
+                if value is None:
+                    continue
+                if isinstance(value, bool):
+                    # bool is numeric (and an int subclass) — not categorical.
+                    disqualified = True
+                    break
+                if isinstance(value, str):
+                    saw_string = True
+                    continue
+                if isinstance(value, float) and value != value:
+                    # NaN is treated as null/skip.
+                    continue
+                # Any other non-null value (int/float/numpy number/etc.) is
+                # numeric-or-other and disqualifies the column.
+                disqualified = True
+                break
+            if saw_string and not disqualified:
+                out.add(name)
+        return frozenset(out)
     except Exception:
         # Dtype introspection is a best-effort enhancement; if a library's
         # introspection API shifts, fall back to value-based inference rather
         # than fail the fit.
         return frozenset()
-    return frozenset()
 
 
 def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
