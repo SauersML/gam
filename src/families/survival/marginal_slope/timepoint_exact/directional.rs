@@ -862,14 +862,6 @@ impl SurvivalMarginalSlopeFamily {
         let mut chi_uv = Array2::<f64>::zeros((p, p));
         let mut eta_uv_dir = Array2::<f64>::zeros((p, p));
         let mut chi_uv_dir = Array2::<f64>::zeros((p, p));
-        #[cfg(test)]
-        let mut r_uv_dir_dbg = Array2::<f64>::zeros((p, p));
-        #[cfg(test)]
-        let mut chi_uv_fixed_dir_dbg = Array2::<f64>::zeros((p, p));
-        #[cfg(test)]
-        let mut r_uv_base_dbg = Array2::<f64>::zeros((p, p));
-        #[cfg(test)]
-        let mut chi_uv_fixed_base_dbg = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
                 let a_uv_jet = MultiDirJet::bilinear(a_uv[[u, v]], a_uv_dir[[u, v]], 0.0, 0.0);
@@ -939,17 +931,6 @@ impl SurvivalMarginalSlopeFamily {
                 eta_uv_dir[[v, u]] = eta_uv_dir[[u, v]];
                 chi_uv_dir[[u, v]] = chi_uv_jet.coeff(1);
                 chi_uv_dir[[v, u]] = chi_uv_dir[[u, v]];
-                #[cfg(test)]
-                {
-                    r_uv_dir_dbg[[u, v]] = r_uv_jet.coeff(1);
-                    r_uv_dir_dbg[[v, u]] = r_uv_jet.coeff(1);
-                    chi_uv_fixed_dir_dbg[[u, v]] = chi_uv_fixed_jet.coeff(1);
-                    chi_uv_fixed_dir_dbg[[v, u]] = chi_uv_fixed_jet.coeff(1);
-                    r_uv_base_dbg[[u, v]] = r_uv_jet.coeff(0);
-                    r_uv_base_dbg[[v, u]] = r_uv_jet.coeff(0);
-                    chi_uv_fixed_base_dbg[[u, v]] = chi_uv_fixed_jet.coeff(0);
-                    chi_uv_fixed_base_dbg[[v, u]] = chi_uv_fixed_jet.coeff(0);
-                }
             }
         }
         let eta_u_dir = eta_uv.dot(dir);
@@ -1129,21 +1110,12 @@ impl SurvivalMarginalSlopeFamily {
 
         // D_uv_dir
         let mut d_uv_dir = Array2::<f64>::zeros((p, p));
-        #[cfg(test)]
-        let mut debug_d_uv_terms: Option<([f64; 5], [f64; 5])> = None;
         if need_d_uv_dir {
-            // #932 debug probe block: (w0, w0) deviation diagonal.
-            #[cfg(test)]
-            let dbg_target: Option<(usize, usize)> = primary.w.as_ref().map(|w| (w.start, w.start));
             let d_uv_dir_cell_accums = cached
                 .cells
                 .iter()
-                .map(|cell_entry| -> Result<(Array2<f64>, [f64; 10]), String> {
+                .map(|cell_entry| -> Result<Array2<f64>, String> {
                     let mut d_uv_dir = Array2::<f64>::zeros((p, p));
-                    #[cfg(test)]
-                    let mut dbg_terms = [0.0_f64; 10];
-                    #[cfg(not(test))]
-                    let dbg_terms = [0.0_f64; 10];
                     let cell = cell_entry.partition_cell.cell;
                     let state_ref = &cell_entry.state;
                     let fixed = &cell_entry.fixed;
@@ -1680,34 +1652,6 @@ impl SurvivalMarginalSlopeFamily {
                                 &state_ref.moments,
                                 "survival D_t second derivative directional",
                             )?;
-                            #[cfg(test)]
-                            if dbg_target == Some((u, v)) {
-                                let ig = |poly: &[f64]| -> f64 {
-                                    exact_kernel::cell_polynomial_integral_from_moments(
-                                        poly,
-                                        &state_ref.moments,
-                                        "dbg",
-                                    )
-                                    .unwrap_or(f64::NAN)
-                                };
-                                // Base per-term ∫t_i·m (t1=i_base's chi_uv piece..t5).
-                                dbg_terms[0] += ig(&t1);
-                                dbg_terms[1] += ig(&t2);
-                                dbg_terms[2] += ig(&t3);
-                                dbg_terms[3] += ig(&t4);
-                                dbg_terms[4] += ig(&t5);
-                                // Analytic FULL dir per-term:
-                                //   D_dir(∫t_i·m) = ∫t_i_dir·m - ∫eta·eta_dir·t_i·m.
-                                // The trailing moment-measure correction must be
-                                // included per term so it equals the FD of ∫t_i·m.
-                                let mw = poly_mul(&eta_poly, &eta_dir_poly);
-                                let corr = |t: &[f64]| ig(&poly_mul(&mw, t));
-                                dbg_terms[5] += ig(&t1_dir) - corr(&t1);
-                                dbg_terms[6] += ig(&t2_dir) - corr(&t2);
-                                dbg_terms[7] += ig(&t3_dir) - corr(&t3);
-                                dbg_terms[8] += ig(&t4_dir) - corr(&t4);
-                                dbg_terms[9] += ig(&t5_dir) - corr(&t5);
-                            }
                             d_uv_dir[[u, v]] += value;
                             // Moving-domain (Leibniz) boundary flux for the
                             // density second-derivative integral: same
@@ -1796,28 +1740,15 @@ impl SurvivalMarginalSlopeFamily {
                             d_uv_dir[[v, u]] = d_uv_dir[[u, v]];
                         }
                     }
-                    Ok((d_uv_dir, dbg_terms))
+                    Ok(d_uv_dir)
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            #[cfg(test)]
-            let mut dbg_sum = [0.0_f64; 10];
-            for (cell_d_uv_dir, _cell_dbg) in &d_uv_dir_cell_accums {
+            for cell_d_uv_dir in &d_uv_dir_cell_accums {
                 for u in 0..p {
                     for v in 0..p {
                         d_uv_dir[[u, v]] += cell_d_uv_dir[[u, v]];
                     }
                 }
-                #[cfg(test)]
-                for k in 0..10 {
-                    dbg_sum[k] += _cell_dbg[k];
-                }
-            }
-            #[cfg(test)]
-            {
-                debug_d_uv_terms = Some((
-                    [dbg_sum[0], dbg_sum[1], dbg_sum[2], dbg_sum[3], dbg_sum[4]],
-                    [dbg_sum[5], dbg_sum[6], dbg_sum[7], dbg_sum[8], dbg_sum[9]],
-                ));
             }
         }
 
@@ -1828,36 +1759,6 @@ impl SurvivalMarginalSlopeFamily {
             chi_uv_dir,
             d_u_dir,
             d_uv_dir,
-            #[cfg(test)]
-            debug_d_uv_terms,
-            #[cfg(test)]
-            debug_eta_uv_inputs: Some(
-                crate::families::survival::marginal_slope::primary_geometry::DebugEtaUvInputs {
-                    chi_dir,
-                    eta_aa_dir,
-                    eta_aaa_dir,
-                    tau_dir: tau_dir.clone(),
-                    tau_a_dir: tau_a_dir.clone(),
-                    a_u_dir: a_u_dir.clone(),
-                    a_uv_dir: a_uv_dir.clone(),
-                    r_uv_dir: r_uv_dir_dbg,
-                    chi_uv_fixed_dir: chi_uv_fixed_dir_dbg,
-                    chi_base: chi_val,
-                    eta_aa_base: eta_aa,
-                    eta_aaa_base: eta_aaa,
-                    tau_base: tau.clone(),
-                    tau_a_base: tau_a.clone(),
-                    a_u_base: a_u.clone(),
-                    a_uv_base: a_uv.clone(),
-                    r_uv_base: r_uv_base_dbg,
-                    chi_uv_fixed_base: chi_uv_fixed_base_dbg,
-                    f_a_base: f_a,
-                    f_u_base: f_u.clone(),
-                    f_uv_base: f_uv.clone(),
-                    f_au_base: f_au.clone(),
-                    f_aa_base: f_aa,
-                },
-            ),
         })
     }
 }
