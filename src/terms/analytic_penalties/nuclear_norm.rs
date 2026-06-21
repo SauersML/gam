@@ -633,14 +633,11 @@ impl AnalyticPenalty for NuclearNormPenalty {
         // `AnalyticPenalty::hvp_target` has no Result channel; decomposition
         // or active-rank cutoff failures from the spectral helper are upstream
         // contract violations that must surface loudly.
-        let d = t.nrows();
         let (vr, tdr) = self
             .right_spectral_filters_applied(t.view(), v_mat.view())
-            // Beautiful robust: on spectral failure (contract violation per comment)
-            // return zero hvp contribution (correct shape) instead of hard panic.
-            // Keeps the overall fit alive; value/grad paths and other checks surface issues.
-            // Removes ban-tracked panic! .
-            .unwrap_or_else(|_| (Array2::<f64>::zeros((d, d)), Array2::<f64>::zeros((d, d))));
+            // SAFETY: error path is a caller contract violation; the upstream
+            // helper already formatted a diagnostic message.
+            .unwrap_or_else(|message| panic!("{}", message));
         let weight = self.resolved_weight(rho);
         let out = (vr + tdr) * weight;
         Self::flatten_matrix(&out)

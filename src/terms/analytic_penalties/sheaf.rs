@@ -483,10 +483,8 @@ impl SheafConsistencyPenalty {
                 // SAFETY: dense Laplacian above is symmetric positive semidefinite by construction
                 // (graph Laplacian of an undirected weighted graph), so eigh on the lower triangle
                 // must succeed; any err indicates a corrupted matrix and bailing here is correct.
-                Err(_) => {
-                    // faer eigh failed on validated PSD laplacian (corruption?).
-                    // Graceful 0 instead of panic removes ban stub; conservative (no modes claimed).
-                    0
+                Err(err) => {
+                    panic!("SheafConsistencyPenalty::harmonic_modes faer eigh failed: {err:?}")
                 }
             }
         } else {
@@ -536,10 +534,12 @@ impl SheafConsistencyPenalty {
             },
         ) {
             Ok(eigen) => eigen.eigenvalues.iter().filter(|&&e| e < tol).count(),
-            Err(_) => {
-                // Graceful 0 on Lanczos failure (removes ban panic).
-                // Conservative (under-count modes).
-                0
+            Err(err) => {
+                // SAFETY: A Lanczos breakdown here is a non-recoverable numerical
+                // failure of the harmonic-mode decomposition (e.g. a malformed or
+                // non-symmetric operator); there is no meaningful count to return,
+                // so the error must surface rather than be silently swallowed.
+                panic!("SheafConsistencyPenalty::harmonic_modes Lanczos failed: {err}")
             }
         }
     }

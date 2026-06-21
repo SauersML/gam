@@ -267,19 +267,27 @@ pub trait AnalyticPenalty: Send + Sync {
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        if let Some(diag) = self.hessian_diag(target, rho) {
-            assert_eq!(diag.len(), v.len(), "hvp dimension mismatch");
-            let mut out = Array1::<f64>::zeros(v.len());
-            for i in 0..v.len() {
-                out[i] = diag[i] * v[i];
-            }
-            out
-        } else {
-            // A non-diagonal penalty should override hvp. Graceful zero fallback
-            // removes the ban-tracked panic while keeping the fit running
-            // (conservative; the missing override is a programming error).
-            Array1::<f64>::zeros(v.len())
+        let diag = self.hessian_diag(target, rho).unwrap_or_else(|| {
+            // SAFETY: programming-error invariant, never a runtime/data condition.
+            // A penalty whose Hessian is non-diagonal MUST override `hvp` with its
+            // closed-form Hessian-vector product; reaching this default means the
+            // impl is missing that override. SPEC forbids a finite-difference
+            // fallback outside tests, so there is no recoverable path — failing
+            // loud here is the contract.
+            panic!(
+                "AnalyticPenalty::hvp default reached for `{}`, whose Hessian is \
+                 not diagonal (hessian_diag returned None). Such a penalty must \
+                 override `hvp` with its closed-form Hessian-vector product; the \
+                 default never finite-differences.",
+                self.name()
+            )
+        });
+        assert_eq!(diag.len(), v.len(), "hvp dimension mismatch");
+        let mut out = Array1::<f64>::zeros(v.len());
+        for i in 0..v.len() {
+            out[i] = diag[i] * v[i];
         }
+        out
     }
 
     /// Diagonal of a **PSD majorizer** of the Hessian — the positive

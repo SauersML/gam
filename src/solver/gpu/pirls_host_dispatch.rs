@@ -254,9 +254,8 @@ where
                             // here means a mid-function mutation has changed
                             // `penalty_active` out from under us, which is a
                             // programming error in this single-threaded function
-                            return Some(Err(EstimationError::LayoutError(
-                                "GPU PIRLS dispatch gated on PirlsPenalty::Dense above".to_string()
-                            )))
+                            // body. Falling back to None would silently mask the bug.
+                            panic!("GPU PIRLS dispatch gated on PirlsPenalty::Dense above")
                         }
                     };
                 let qs_arc_for_design = qs_arc
