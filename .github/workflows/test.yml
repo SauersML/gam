@@ -24,6 +24,13 @@ env:
   # entirely removes that corruption surface: gam's rlib is built ONCE (the
   # --lib phase), then reused unchanged by every per-file `--test` link.
   CARGO_INCREMENTAL: "0"
+  # Content-addressed compiler cache, shared across CI runs via the GitHub
+  # Actions cache. Pairs with Swatinem/rust-cache (which caches the registry):
+  # sccache turns a cold dep graph warm without relying on a portable target/.
+  # The same RUSTC_WRAPPER seam is honored by build.sh locally, so a shared
+  # remote backend (SCCACHE_BUCKET) would let CI and dev share one cache.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 jobs:
   clippy:
@@ -40,6 +47,9 @@ jobs:
         with:
           toolchain: 1.93.0
           components: clippy
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
@@ -87,6 +97,9 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.93.0
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2

@@ -14,6 +14,50 @@ S="$REPO/.buildd"; mkdir -p "$S"
 LOCK="$S/build.lock"; LOG="$S/last.log"; RESULT="$S/last.code"; HASHFILE="$S/last.hash"; HIST="$S/history.log"
 export CARGO_TARGET_DIR="$REPO/target" CARGO_INCREMENTAL=1   # item-granularity reuse
 export CARGO_BUILD_JOBS="${BUILD_JOBS:-2}"   # cap parallel rustc — default OOM-kills the 8GB box
+
+# ---------------------------------------------------------------------------
+# Compiler cache (sccache): a content-addressed warm dependency cache shared by
+# every agent tree on this box. sccache keys on preprocessed source + compiler
+# version + flags, so it is immune to the absolute-path / mtime churn that makes
+# a copied target/ dir worthless across machines. The heavy deps (faer, burn,
+# arrow, nalgebra, ndarray, …) are non-incremental and cache perfectly; the gam
+# crate itself keeps CARGO_INCREMENTAL for tight local item-reuse (sccache just
+# passes incremental compiles through uncached — the two compose, they don't
+# fight). First build after enabling is a one-time full rebuild (the rustc
+# wrapper changes cargo's fingerprint); every cold tree after that is warm.
+#
+# Wired via cargo's own `--config build.rustc-wrapper` (below) rather than the
+# RUSTC_WRAPPER env var: it is per-invocation and conditional, so a tree without
+# sccache still builds, and we set no environment. The on-disk cache lives in
+# sccache's default store; point it at a shared backend by exporting SCCACHE_DIR
+# or SCCACHE_BUCKET in your shell (sccache reads those natively — that is also
+# how you'd share one cache between this box and CI). Opt out: GAM_NO_SCCACHE=1.
+# ---------------------------------------------------------------------------
+CARGO=(cargo)
+if [[ -z "${GAM_NO_SCCACHE:-}" ]]; then
+  # Auto-install once if missing — a cold cache shouldn't be the steady state.
+  # Best-effort + idempotent: a single attempt is marked so we never re-hammer a
+  # package manager on every build. Delete .buildd/.sccache_tried to force a retry.
+  if ! command -v sccache >/dev/null 2>&1 && [[ ! -f "$S/.sccache_tried" ]]; then
+    : >"$S/.sccache_tried"
+    echo "[build.sh] sccache not found — installing it for a shared warm dep cache…" >&2
+    {
+      if command -v brew >/dev/null 2>&1; then brew install sccache
+      elif command -v cargo >/dev/null 2>&1; then cargo install sccache --locked
+      fi
+    } >&2 2>&1 || true
+  fi
+  command -v sccache >/dev/null 2>&1 && CARGO+=(--config 'build.rustc-wrapper="sccache"')
+fi
+# Compact one-line cache summary, in the same telemetry spirit as history.log.
+# No-ops silently when sccache is inactive or its stats format shifts.
+sccache_summary() {
+  [[ "${CARGO[*]}" == *rustc-wrapper* ]] || return 0
+  sccache --show-stats 2>/dev/null \
+    | grep -iE 'compile requests[[:space:]]|cache hits[[:space:]]+[0-9]|cache misses[[:space:]]+[0-9]' \
+    | sed 's/^[[:space:]]*/[sccache] /' >&2 || true
+}
+
 TIMEOUT=1800
 MIN_FREE_GB="${MIN_FREE_GB:-8}"
 now() { date +%H:%M:%S; }; ep() { date +%s; }
@@ -49,15 +93,16 @@ if [[ $# -gt 0 ]]; then
   REQ="$*"
   exec 9>"$LOCK"; flock -x 9
   cd "$REPO" || exit 1
-  t0=$(ep); timeout "$TIMEOUT" cargo "$@" >"$LOG" 2>&1; code=$?; dur=$(( $(ep)-t0 ))
+  t0=$(ep); timeout "$TIMEOUT" "${CARGO[@]}" "$@" >"$LOG" 2>&1; code=$?; dur=$(( $(ep)-t0 ))
   record "$REQ" "n/a" "$code" "$dur"
   flock -u 9
   echo "[build.sh] $REQ -> exit $code in ${dur}s (recompiled $(compiled_crates | grep -c . ) crates)"
+  sccache_summary
   tail -n 30 "$LOG"; exit $code
 fi
 
 # ---- warm-lib lane (no args): content-dedup ----
-BUILD=(cargo build --lib)
+BUILD=("${CARGO[@]}" build --lib)
 tree_hash() {
   # Include Cargo.lock so a dependency bump invalidates the dedup cache (else a
   # stale cached result could be served after deps changed but no *.rs did).
@@ -82,5 +127,6 @@ else
   fi
 fi
 flock -u 9
+sccache_summary
 if [[ "$code" == "0" ]]; then echo "BUILD OK (latest tree, hash ${HASH:0:12})"; exit 0
 else echo "BUILD FAILED ($code):"; tail -n 40 "$LOG"; exit "$code"; fi

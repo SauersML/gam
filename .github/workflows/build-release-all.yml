@@ -18,6 +18,13 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  # Content-addressed compiler cache shared across CI runs (GitHub Actions
+  # backend). These release builds are the heaviest dep-graph compiles in the
+  # repo, so warming sccache here is what makes every later run — and, via a
+  # shared SCCACHE_BUCKET, local build.sh — start warm instead of cold. sccache
+  # keys on flags too, so each matrix target keeps its own entries.
+  SCCACHE_GHA_ENABLED: "true"
+  RUSTC_WRAPPER: "sccache"
 
 permissions:
   contents: write
@@ -149,6 +156,9 @@ jobs:
         with:
           toolchain: nightly
           targets: ${{ matrix.target }}
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.6
 
       - name: Install NVIDIA CUDA Toolkit
         if: matrix.target == 'x86_64-unknown-linux-gnu'
