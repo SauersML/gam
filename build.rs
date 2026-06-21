@@ -77,6 +77,12 @@ fn main() {
     let mut deferred_marker_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_deferred_work_markers(&manifest_dir, &manifest_dir, &mut deferred_marker_offenders);
 
+    // Owed work disguised as prose ("not yet wired", "deferred to a follow-up",
+    // "PLAN (not yet implemented)") — a TODO in a limitation costume. The work
+    // must be FINISHED, never reworded or deleted.
+    let mut owed_work_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_owed_work_prose(&manifest_dir, &manifest_dir, &mut owed_work_offenders);
+
     // `#[allow(...)]` / `#![allow(...)]` / `#[expect(...)]` /
     // `#![expect(...)]` ban — any lint, anywhere. Every file-level allow
     // or expect is an admission that some lint flagged real code and the
@@ -369,6 +375,18 @@ fn main() {
                  the marker"
                     .to_string(),
             rows: deferred_marker_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !owed_work_offenders.is_empty() {
+        sections.push(Section {
+            title:
+                "owed work disguised as prose to dodge the marker ban (`not yet wired`, `deferred                  to a follow-up`, `PLAN (not yet implemented)`, `not wired into ...`) — this is a                  TODO in a limitation costume. FINISH the work: implement and wire it. Do NOT                  delete the comment, reword it into a 'documented limitation', or defer it again —                  a relabel is the same evasion the bare-marker ban forbids"
+                    .to_string(),
+            rows: owed_work_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -725,7 +743,7 @@ fn main() {
     render_report(&sections);
     let total_rows: usize = sections.iter().map(|s| s.rows.len()).sum();
     println!(
-        "cargo:warning=ban-scanner found {} violation(s) across {} rule(s) — build aborted",
+        "cargo:warning=ban-scanner FAILED: {} violation(s) across {} rule(s); build aborted \u{2014} every offending file:line is on an 'error:' line above",
         total_rows,
         sections.len()
     );
@@ -1303,7 +1321,7 @@ fn render_report(sections: &[Section]) {
     for section in sections {
         eprintln!();
         eprintln!(
-            "── {}  ({} hit{})",
+            "error — {}  ({} hit{})",
             section.title,
             section.rows.len(),
             if section.rows.len() == 1 { "" } else { "s" },
@@ -1312,8 +1330,8 @@ fn render_report(sections: &[Section]) {
             let trimmed = line.trim();
             let snippet: String = trimmed.chars().take(160).collect();
             match tag {
-                Some(t) => eprintln!("  {}:{}: [{}] {}", rel.display(), line_no, t, snippet),
-                None => eprintln!("  {}:{}: {}", rel.display(), line_no, snippet),
+                Some(t) => eprintln!("  error: {}:{}: [{}] {}", rel.display(), line_no, t, snippet),
+                None => eprintln!("  error: {}:{}: {}", rel.display(), line_no, snippet),
             }
         }
     }
@@ -3113,6 +3131,78 @@ fn marker_issue_ref_follows(rest: &str) -> bool {
         return false;
     }
     b.get(i) == Some(&close)
+}
+
+/// HARD ban: owed work described in prose to dodge the marker bans — "this is
+/// not done yet" phrased as a limitation/plan/follow-up so the bare-`TODO` and
+/// deferred-marker scanners never see it. A relabel into "documented limitation"
+/// is the SAME evasion as renaming the marker: the owed work still has to be
+/// FINISHED, not reworded. Scans production `src/` comments only (tests and
+/// examples legitimately describe unsupported paths). Phrases are assembled from
+/// fragments so build.rs never carries them. Bare control-flow phrasings like
+/// "deferred to <fn>" / "deferred until <stage>" are deliberately NOT matched —
+/// those describe when a computation runs, not unfinished work.
+fn scan_for_owed_work_prose(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
+    let phrases: Vec<String> = vec![
+        format!("not yet {}", "wired"),
+        format!("not yet {}", "implemented"),
+        format!("not yet {}", "supported"),
+        format!("not yet {}", "hooked"),
+        format!("not yet {}", "done"),
+        format!("not yet {}", "finished"),
+        format!("not {} yet", "implemented"),
+        format!("not {} yet", "supported"),
+        format!("not {} yet", "wired"),
+        format!("not wired {}", "into"),
+        format!("not wired {}", "through"),
+        format!("is not {}", "wired"),
+        format!("{} wired", "isn't"),
+        format!("to be {} yet", "wired"),
+        format!("deferred to a {}", "follow"),
+        format!("left to a {}", "follow"),
+        format!("for a {}-up", "follow"),
+        format!("in a {}-up", "follow"),
+        format!("to a {}-up", "follow"),
+        format!("remains to be {}", "implemented"),
+        format!("needs to be {}", "implemented"),
+        format!("will be {}", "implemented"),
+        format!("will be {}", "wired"),
+        format!("yet to be {}", "implemented"),
+        format!("yet to be {}", "wired"),
+    ];
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if !rel_str.starts_with("src/") {
+            return;
+        }
+        for (idx, line) in content.lines().enumerate() {
+            let Some(text) = line_comment_text(line) else {
+                continue;
+            };
+            if phrases.iter().any(|p| text.contains(p.as_str())) {
+                offenders.push((rel.to_path_buf(), idx + 1, line.trim().to_string()));
+            }
+        }
+    });
+}
+
+/// The lowercased text of a line's `//` comment (lead or trailing), or `None` if
+/// the line carries no line comment. Skips `://` so URLs/paths are not read as
+/// comments. Covers `//`, `///`, and `//!`.
+fn line_comment_text(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            if i > 0 && bytes[i - 1] == b':' {
+                i += 2;
+                continue;
+            }
+            return Some(line[i + 2..].to_lowercase());
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Scan for `#[allow(...)]` / `#![allow(...)]` / `#[expect(...)]` /
@@ -5419,6 +5509,11 @@ fn comment_block_has_deferral_cue(lower_text: &str) -> bool {
         "needs to".to_string(),
         "remains to".to_string(),
         "yet to".to_string(),
+        format!("not wired {}", "into"),
+        format!("not wired {}", "through"),
+        format!("not yet {}", "wired"),
+        format!("deferred to a {}", "follow"),
+        format!("left to a {}", "follow"),
         ]
     });
     cues.iter().any(|c| lower_text.contains(c.as_str()))
