@@ -782,7 +782,31 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         glm_first_step_gram,
     } = problem;
     let quadctx = crate::quadrature::QuadratureContext::new();
-    let lambdas = rho.exp();
+    // gam#1379 — finite-ceiling λ = exp(ρ). When the outer REML / spatial-κ
+    // optimizer drives a redundant penalty direction's log-λ past ~709 (it does
+    // so deterministically on 1-D `matern(x)` / `bs="gp"` data whose kernel
+    // already controls the smoothness an operator block also penalizes, so REML
+    // wants λ → ∞), `exp(ρ)` overflows to `+∞`. A literal `+∞` λ then poisons
+    // every downstream consumer that forms `λ · S`: the range-penalty block
+    // assembled as `Σ λ_k S_k` hits `∞ · 0 = NaN` and the eigensolve aborts, and
+    // the final fit-result validation rejects the non-finite stored λ outright.
+    // `exp(709.78) ≈ 1.8e308` is already the largest finite f64; capping log-λ at
+    // a value whose `exp` stays finite pins the over-penalized direction exactly
+    // as hard as `+∞` would for every finite-arithmetic consumer (the penalized
+    // block is numerically a hard constraint at λ this large) while keeping
+    // `λ · 0 = 0`. Ordinary finite λ are untouched, so non-degenerate fits and
+    // their recorded λ̂ are bit-identical. `ln(1e300) ≈ 690.78` keeps this in lock
+    // step with the post-exp λ ceiling (`1e300`) used by the reparam range-block
+    // assembly and the stored fit result, so a fully-smoothed direction carries
+    // the SAME finite λ everywhere it is consumed.
+    const LOG_LAMBDA_CEILING: f64 = 690.0;
+    let lambdas = rho.mapv(|r| {
+        if r.is_nan() {
+            r
+        } else {
+            r.min(LOG_LAMBDA_CEILING).exp()
+        }
+    });
     let lambdas_slice = lambdas.as_slice_memory_order().ok_or_else(|| {
         EstimationError::InvalidInput("non-contiguous lambda storage".to_string())
     })?;

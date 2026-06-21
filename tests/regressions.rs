@@ -350,3 +350,5 @@ mod warm_start_store_regressions;
 mod wiggle_option_validation_issue_377_373;
 #[path = "regressions/workflow_bug_hunt.rs"]
 mod workflow_bug_hunt;
+#[path = "regressions/bug_hunt_1379_univariate_matern_gp_degenerate_range_penalty.rs"]
+mod bug_hunt_1379_univariate_matern_gp_degenerate_range_penalty;

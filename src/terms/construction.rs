@@ -1981,6 +1981,44 @@ pub fn stable_reparameterizationwith_invariant(
     // No separate length check needed — penalties are matched against lambdas above,
     // and the invariant's qs_base is p x p (dimension-checked by the split).
 
+    // gam#1379 — finite-ceiling the per-penalty smoothing weights before they
+    // weight any penalty block. `λ_k = exp(ρ_k)` overflows to `+∞` once the
+    // outer REML/κ optimizer drives a redundant penalty direction's log-λ past
+    // ~709 (it happens deterministically on 1-D `matern(x)` / `bs="gp"` data
+    // whose kernel already controls the smoothness the stiffness operator also
+    // penalizes, so REML wants λ_stiffness → ∞). The range block is then
+    // assembled as `Σ_k λ_k S_k`; wherever a transformed `S_k` entry is exactly
+    // `0.0`, `∞ · 0 = NaN`, so the *entire* block comes back non-finite with
+    // zero finite content and the downstream eigensolve aborts the fit
+    // ("range penalty block contains non-finite entries, max finite magnitude
+    // 0.000e0"). A `λ` of `1e300` pins the penalized direction exactly as hard
+    // as `+∞` would for every finite-arithmetic consumer here (the eigensolve,
+    // the trace/logdet derivatives — which already tolerate a wide λ dynamic
+    // range via the eigenvalue floor below), but keeps `λ · 0 = 0`, so the
+    // block stays a well-formed PSD matrix. We only clamp non-finite or
+    // above-ceiling weights; ordinary finite λ pass through untouched, so the
+    // REML optimum (and its recorded λ̂) is unchanged on every non-degenerate fit.
+    const LAMBDA_CEILING: f64 = 1e300;
+    let lambdas_storage: Vec<f64>;
+    let lambdas: &[f64] = if lambdas
+        .iter()
+        .any(|&l| !l.is_finite() || l > LAMBDA_CEILING)
+    {
+        lambdas_storage = lambdas
+            .iter()
+            .map(|&l| {
+                if l.is_nan() {
+                    0.0
+                } else {
+                    l.min(LAMBDA_CEILING)
+                }
+            })
+            .collect();
+        &lambdas_storage
+    } else {
+        lambdas
+    };
+
     if m == 0 {
         return Ok(ReparamResult {
             s_transformed: Array2::zeros((p, p)),
@@ -2962,6 +3000,47 @@ mod tests {
         assert!(
             max_abs <= 1e-10,
             "u_truncated frame mismatch: max_abs={max_abs}"
+        );
+    }
+
+    #[test]
+    fn infinite_lambda_keeps_range_penalty_block_finite_1379() {
+        // gam#1379 regression: when the outer optimizer drives one penalty's
+        // λ = exp(ρ) to +∞ (a redundant operator direction REML wants pinned),
+        // the range block Σ_k λ_k S_k must NOT come back non-finite. The defect
+        // was `∞ · 0 = NaN` wherever a transformed S_k entry was exactly 0,
+        // poisoning the whole block ("range penalty block contains non-finite
+        // entries, max finite magnitude 0.000e0") and aborting the fit.
+        //
+        // Fixture: two penalties on a 3-wide block. The first penalizes only
+        // coordinate 0 (so its block S_k has structural zeros everywhere except
+        // [0,0]); give it λ = +∞. The second penalizes coordinate 1 at a normal
+        // λ. With the finite-ceiling clamp the reparam succeeds and every output
+        // matrix entry is finite; without it the eigensolve aborts.
+        let p = 3usize;
+        let rs_list = vec![array![[1.0, 0.0, 0.0]], array![[0.0, 1.0, 0.0]]];
+        let canonical = canonical_from_roots(&rs_list, p);
+        let lambdas = vec![f64::INFINITY, 3.0];
+        let inv = precompute_reparam_invariant_from_canonical(&canonical, p)
+            .expect("precompute invariant");
+        let rep = stable_reparameterizationwith_invariant(&canonical, &lambdas, p, &inv, None)
+            .expect("stable reparam must not abort on an infinite lambda (gam#1379)");
+
+        assert!(
+            rep.s_transformed.iter().all(|v| v.is_finite()),
+            "transformed penalty must be finite with an infinite lambda"
+        );
+        assert!(
+            rep.qs.iter().all(|v| v.is_finite()),
+            "reparam rotation must be finite with an infinite lambda"
+        );
+        assert!(
+            rep.log_det.is_finite(),
+            "penalty log-det must be finite with an infinite lambda"
+        );
+        assert!(
+            rep.det1.iter().all(|v| v.is_finite()),
+            "penalty log-det derivatives must be finite with an infinite lambda"
         );
     }
 
