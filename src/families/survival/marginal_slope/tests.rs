@@ -2136,6 +2136,24 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         prod_hess[[gi, wi0]],
         witness_h_gw
     );
+    // gam#1454 regression: the BASE intercept Hessian must match an independent
+    // gradient-FD witness at [g, w0] BEFORE the directional third is even asked
+    // — the owner's decisive localizer (a base mismatch means the directional
+    // third merely inherits it). The base f_aa/f_au moving-boundary a-axis flux
+    // (first_full.rs `moving_density_boundary_flux_a`) closes this; if it
+    // regresses, this fires pointing at the base Hessian rather than the
+    // directional chain.
+    {
+        let want = witness_h_gw;
+        let got = prod_hess[[gi, wi0]];
+        let scale = want.abs().max(1.0);
+        assert!(
+            (got - want).abs() <= 5e-3 * scale + 1e-6,
+            "gam#1454 base hess[g,w0] production {got:+.6e} != gradient-FD witness {want:+.6e} \
+             (base intercept moving-boundary flux missing/incorrect; the directional third \
+             cannot be correct while the base Hessian it differentiates is off)"
+        );
+    }
     {
         let beta_h_arr = Array1::from(beta_h0.clone());
         let beta_w_arr = Array1::from(beta_w0.clone());

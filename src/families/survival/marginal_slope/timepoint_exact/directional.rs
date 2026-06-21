@@ -449,6 +449,71 @@ impl SurvivalMarginalSlopeFamily {
                         }
                     }
                 }
+
+                // a-axis moving-boundary flux for the base intercept second
+                // derivatives, mirroring the f_uv pair + self-flux above with
+                // one axis = the intercept a (velocity z_a = −1/b at crossings,
+                // 0 at fixed edges). Keeps this module's base f_aa/f_au in sync
+                // with the f_uv boundary terms (and with first_full.rs), so the
+                // a_uv consumer below sees a consistent moving-boundary Hessian
+                // (gam#932/#1454).
+                let a_edge_vel =
+                    |edge: crate::families::cubic_cell_kernel::PartitionEdge| -> f64 {
+                        match edge {
+                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing {
+                                ..
+                            } => -1.0 / b,
+                            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                        }
+                    };
+                let flux_a = |poly: &[f64]| -> f64 {
+                    let v_r = a_edge_vel(part.right_edge);
+                    let v_l = a_edge_vel(part.left_edge);
+                    let right = if v_r != 0.0 {
+                        v_r * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                            cell, poly, cell.right,
+                        )
+                    } else {
+                        0.0
+                    };
+                    let left = if v_l != 0.0 {
+                        v_l * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                            cell, poly, cell.left,
+                        )
+                    } else {
+                        0.0
+                    };
+                    right - left
+                };
+                // self-flux `G_z·z_a·z_x` (G = bare density w). z_a = a_edge_vel,
+                // z_x = edge_vel(axis). x = a for f_aa, x = u for f_au.
+                let self_flux_ax = |zx_r: f64, zx_l: f64| -> f64 {
+                    let za_r = a_edge_vel(part.right_edge);
+                    let za_l = a_edge_vel(part.left_edge);
+                    let right = if za_r != 0.0 && zx_r != 0.0 {
+                        za_r * zx_r * density_w_z(cell.right)
+                    } else {
+                        0.0
+                    };
+                    let left = if za_l != 0.0 && zx_l != 0.0 {
+                        za_l * zx_l * density_w_z(cell.left)
+                    } else {
+                        0.0
+                    };
+                    right - left
+                };
+                let neg_dc_da = fixed.dc_da.map(|value| -value);
+                let za_r = a_edge_vel(part.right_edge);
+                let za_l = a_edge_vel(part.left_edge);
+                f_aa += 2.0 * flux_a(&neg_dc_da) + self_flux_ax(za_r, za_l);
+                for u in 0..p {
+                    let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                    let zu_r = edge_vel(u, part.right_edge, cell.right);
+                    let zu_l = edge_vel(u, part.left_edge, cell.left);
+                    f_au[u] += flux_a(&neg_coeff_u)
+                        + flux(u, &neg_dc_da)
+                        + self_flux_ax(zu_r, zu_l);
+                }
             }
         }
         let mut a_uv = Array2::<f64>::zeros((p, p));

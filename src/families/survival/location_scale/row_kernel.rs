@@ -2226,6 +2226,24 @@ impl SurvivalLocationScaleFamily {
         if g > 0.0 && g < guard {
             g = guard;
         }
+        // Boundary cancellation floor. The constrained Newton solve bounds only
+        // the structural `d_raw` channel; the additive `qdot = dq/dt` term from
+        // the threshold/log-σ time-transform is unconstrained and, when it is of
+        // comparable magnitude and opposite sign to `d_raw`, the difference
+        // `g = d_raw + qdot` is a near-cancellation. At a feasible boundary
+        // (`g → guard⁺`) the residual upstream error of that cancellation can
+        // tip the reconstructed `g` a hair below zero (observed ~ -2e-7 with a
+        // guard of 1e-6). Such a violation is strictly smaller than the modeling
+        // guard itself and lives inside the cancellation resolution
+        // `operand_scale`, so it cannot be distinguished from the feasible
+        // boundary state the optimizer converged to — floor it to the guard,
+        // exactly as the positive near-boundary branch above does. A genuinely
+        // non-monotone fit produces `g` negative by far more than the guard,
+        // which still hard-errors below.
+        let cancellation_floor = guard + roundoff_slack;
+        if g <= 0.0 && g >= -cancellation_floor {
+            g = guard;
+        }
         if g <= 0.0 {
             return Err(SurvivalLocationScaleError::ConstraintViolation {
                 reason: format!(

@@ -47,6 +47,50 @@ fn moving_density_boundary_flux(
     right - left
 }
 
+/// Moving-boundary Leibniz flux for differentiation w.r.t. the **intercept**
+/// `a` directly (as opposed to a θ-axis, whose `a`-sensitivity is `a_u`).
+///
+/// The link crossing `z = (τ − a)/b` moves with the intercept at velocity
+/// `∂z/∂a = −1/b` at every `Crossing` edge (fixed partition edges do not move).
+/// `f_aa`/`f_au` are second derivatives of the same moving-boundary cell
+/// integral as `f_uv`, but the base cell-moment kernels only carry the interior
+/// term — the `a`-axis boundary flux was omitted (gam#932/#1454), the dominant
+/// residual in the intercept-solve `a_uv` Hessian. This mirrors the θ-axis
+/// [`moving_density_boundary_flux`] for the `z_a = −1/b` velocity.
+fn moving_density_boundary_flux_a(
+    entry: &CachedCellEntry,
+    poly: &[f64],
+    b: f64,
+) -> f64 {
+    if b == 0.0 {
+        return 0.0;
+    }
+    let cell = entry.partition_cell.cell;
+    let edge_velocity = |edge: crate::families::cubic_cell_kernel::PartitionEdge| -> f64 {
+        match edge {
+            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => -1.0 / b,
+            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+        }
+    };
+    let v_r = edge_velocity(entry.partition_cell.right_edge);
+    let v_l = edge_velocity(entry.partition_cell.left_edge);
+    let right = if v_r != 0.0 {
+        v_r * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+            cell, poly, cell.right,
+        )
+    } else {
+        0.0
+    };
+    let left = if v_l != 0.0 {
+        v_l * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+            cell, poly, cell.left,
+        )
+    } else {
+        0.0
+    };
+    right - left
+}
+
 impl SurvivalMarginalSlopeFamily {
     pub(crate) fn compute_survival_timepoint_first_order_exact(
         &self,
@@ -447,6 +491,27 @@ impl SurvivalMarginalSlopeFamily {
                             f_uv[[v, u]] += boundary;
                         }
                     }
+                }
+            }
+
+            // a-axis moving-boundary flux for the intercept second derivatives.
+            // f_aa and f_au are second derivatives of the same moving-boundary
+            // cell integral as f_uv (the crossing z = (τ−a)/b moves with a at
+            // velocity z_a = −1/b), but the base cell-moment kernels carry only
+            // the interior term. This was the dominant residual in the
+            // intercept-solve a_uv Hessian (gam#932/#1454): f_uv received its
+            // θ-axis flux above while f_aa/f_au did not. Mirror the f_uv pair
+            // structure with one axis = a (using the negated-coeff convention
+            // the base cell kernels use): f_aa picks up the symmetric a/a flux
+            // (2·flux_a(∂c/∂a)); f_au[u] picks up flux_a(∂c/∂u) + flux_u(∂c/∂a).
+            for entry in &cached.cells {
+                let fixed = &entry.fixed;
+                let neg_dc_da = fixed.dc_da.map(|value| -value);
+                f_aa += 2.0 * moving_density_boundary_flux_a(entry, &neg_dc_da, b);
+                for u in 0..p {
+                    let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                    f_au[u] += moving_density_boundary_flux_a(entry, &neg_coeff_u, b)
+                        + moving_density_boundary_flux(u, primary, &a_u, entry, &neg_dc_da, b);
                 }
             }
         }
