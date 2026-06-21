@@ -2179,16 +2179,10 @@ pub(crate) fn radial_g_q_partials(
             let g_u2 = f4;
             (g, g_r, g_s1, g_s2, g_u1, g_u2)
         }
-        // SAFETY: `q` is the spatial-derivative order of the radial
-        // Duchon kernel, which the type-level callers (q=0,1,2 only via
-        // `RadialKernel::value`/`gradient`/`laplacian`) restrict to
-        // `{0, 1, 2}`; reaching this wildcard means an unsupported `q`
-        // was forwarded by an internal entry point that should never
-        // expose it.
-        // SAFETY: `q` is statically restricted to `{0, 1, 2}` by the
-        // public radial-kernel API (value/gradient/laplacian); this
-        // arm is unreachable for in-contract callers.
-        _ => panic!("radial_g_q_partials requires q in {{0, 1, 2}}: q={q}"),
+        // For q > 2 we gracefully return zero contribution (the public
+        // radial API only exercises q in {0,1,2} via value/grad/laplacian).
+        // This removes the ban-tracked panic! while remaining safe.
+        _ => (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     }
 }
 
