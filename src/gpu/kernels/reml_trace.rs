@@ -1027,11 +1027,11 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     // the slot at index j cannot have been rewritten between partition and
                     // this read; reaching this branch can only mean a future refactor split
                     // the partition from its consumer. The panic names the offending index.
-                    return Err(gpu_err!(
+                    panic!(
                         "reml_trace dense path: derivative index {j} is in dense_indices but \
                          input.derivatives[{j}] is not DerivativeHessian::Dense — \
                          dense_indices partition invariant violated"
-                    ));
+                    );
                 };
                 let hj_col = to_col_major(matrix);
                 let hj_dev = pinned_htod(&stream, &hj_col)
@@ -1137,11 +1137,11 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     // input.derivatives is immutably borrowed for the whole function so the
                     // slot at j cannot have been rewritten between partition and read; a
                     // failure here is a future-refactor bug, not a runtime input issue.
-                    return Err(gpu_err!(
+                    panic!(
                         "reml_trace structural path: derivative index {j} is in gram_indices \
                          but input.derivatives[{j}] is not DerivativeHessian::WeightedGram — \
                          gram_indices partition invariant violated"
-                    ));
+                    );
                 };
                 let slice = row_weights.as_slice().ok_or_else(|| {
                     gpu_err!("reml_trace structural H_j={j} row_weights not contiguous")
@@ -1182,12 +1182,12 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     // input.derivatives has been immutably borrowed since partitioning, so
                     // the variant at index j cannot have changed. A let-else failure here
                     // would mean a future refactor split partition from consumer loops.
-                    return Err(gpu_err!(
+                    panic!(
                         "reml_trace structural penalty_extra: derivative index {j} is in \
                          gram_indices but input.derivatives[{j}] is not \
                          DerivativeHessian::WeightedGram — gram_indices partition invariant \
                          violated"
-                    ));
+                    );
                 };
                 if let Some(pen) = penalty_extra {
                     let z_host = stream

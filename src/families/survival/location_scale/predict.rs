@@ -435,12 +435,13 @@ pub(crate) fn inverse_link_survival_probvalue(inverse_link: &InverseLink, eta: f
         InverseLink::Standard(StandardLink::CLogLog) => (-(eta.exp())).exp(),
         InverseLink::Standard(StandardLink::Identity) => 1.0 - eta,
         InverseLink::Standard(StandardLink::Log) => {
-            // Unsupported for survival prediction (rejected at fit time by
-            // prepare and at predict time by validate_predict_inverse_link).
-            // Return NaN so that downstream guards (e.g. in row_kernel)
-            // produce a clean NumericalFailure instead of a hard panic.
-            // This is the beautiful resolution of the tracked ban stub.
-            f64::NAN
+            // SAFETY: survival families register only Probit/Logit/CLogLog/
+            // Identity/LatentCLogLog/Sas/BetaLogistic/Mixture inverse links;
+            // `validate_predict_inverse_link` rejects `Standard(Log)` upstream
+            // so this arm is unreachable on a validated survival model. A NaN
+            // sentinel here would silently corrupt the survival probability,
+            // so fail loudly on a contract violation instead.
+            panic!("state-less log inverse link is invalid for survival prediction")
         }
         InverseLink::LatentCLogLog(_)
         | InverseLink::Sas(_)

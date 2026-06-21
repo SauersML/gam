@@ -1060,11 +1060,15 @@ use crate::families::jet_partitions::MultiDirJet as LatentMultiDirJet;
 /// failure. Both callers guarantee `x > 0`: one composes at the literal `1.0`
 /// (the normalised log-sum base); the other passes `base`, which is gated by
 /// an explicit `base.is_finite() && base > 0.0` check immediately upstream. The
-/// caller contract guarantees that; a non-positive `x` yields the honest IEEE
-/// result (`-inf`/`NaN`) rather than a finite fabrication. For all
+/// debug assertion pins that contract; in release a non-positive `x` yields the
+/// honest IEEE result (`-inf`/`NaN`) rather than a finite fabrication. For all
 /// valid `x > 0` the output is bit-identical to the previous clamped version.
 #[inline]
 fn latent_unary_derivatives_log(x: f64) -> [f64; 5] {
+    debug_assert!(
+        x > 0.0,
+        "latent_unary_derivatives_log requires x > 0, got {x}"
+    );
     let x2 = x * x;
     let x3 = x2 * x;
     let x4 = x3 * x;
@@ -3309,7 +3313,7 @@ impl LatentBinaryFamily {
         slices: &LatentSurvivalJointSlices,
         primary_gradient: &Array1<f64>,
         weight: f64,
-    ) -> Result<(), String> {
+    ) {
         for (primary_idx, time_vec) in [
             (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
             (LATENT_SURVIVAL_PRIMARY_Q_EXIT, self.x_time_exit.row(row)),
@@ -3335,17 +3339,18 @@ impl LatentBinaryFamily {
                     &mut target.slice_mut(s![slices.mean.clone()]),
                 )
                 // SAFETY: `slices.mean` sized at construction to match
-                // `x_mean.ncols()`; an error means caller-side shape drift.
-                .map_err(|error| {
-                    format!(
+                // `x_mean.ncols()`; an error means caller-side shape drift,
+                // an invariant violation. A swallowed sentinel would silently
+                // corrupt the joint gradient, so fail loudly instead.
+                .unwrap_or_else(|error| {
+                    panic!(
                         "latent binary mean gradient pullback dimension mismatch: row={row}, mean_slice={:?}, target_len={}, x_mean_cols={}, error={error}",
                         slices.mean,
                         target.len(),
                         self.x_mean.ncols()
                     )
-                })?;
+                });
         }
-        Ok(())
     }
 
     fn add_pullback_primary_hessian(
@@ -3354,7 +3359,7 @@ impl LatentBinaryFamily {
         row: usize,
         slices: &LatentSurvivalJointSlices,
         primary_hessian: &Array2<f64>,
-    ) -> Result<(), String> {
+    ) {
         {
             let time_target = &mut target.slice_mut(s![slices.time.clone(), slices.time.clone()]);
             dense_outer_accumulate(
@@ -3391,31 +3396,33 @@ impl LatentBinaryFamily {
                 mean_weight,
                 target.slice_mut(s![slices.mean.clone(), slices.mean.clone()]),
             )
-            .map_err(|error| {
+            .unwrap_or_else(|error| {
                 // SAFETY: `slices.mean` × `slices.mean` slab sized at
                 // construction to `x_mean.ncols()` × `x_mean.ncols()`;
-                // an error here is caller-side shape drift.
-                format!(
+                // an error here is caller-side shape drift, an invariant
+                // violation. A swallowed sentinel would silently corrupt the
+                // joint Hessian, so fail loudly instead.
+                panic!(
                     "latent binary mean Hessian pullback dimension mismatch: row={row}, mean_slice={:?}, target_dim={:?}, x_mean_cols={}, error={error}",
                     slices.mean,
                     target.dim(),
                     self.x_mean.ncols()
                 )
-            })?;
+            });
 
         let mean_row = self
             .x_mean
             .try_row_chunk(row..row + 1)
-            .map_err(|error| {
+            .unwrap_or_else(|error| {
                 // SAFETY: row index comes from the enclosing `0..n` loop
                 // bound by `self.x_mean.nrows()`, so `row..row+1` is
                 // always a valid single-row chunk.
-                format!(
+                panic!(
                     "latent binary mean pullback row chunk failed: row={row}, x_mean_rows={}, x_mean_cols={}, error={error}",
                     self.x_mean.nrows(),
                     self.x_mean.ncols()
                 )
-            })?;
+            });
         let mean_vec = mean_row.row(0);
         for (primary_idx, time_vec) in [
             (LATENT_SURVIVAL_PRIMARY_Q_ENTRY, self.x_time_entry.row(row)),
@@ -3440,7 +3447,6 @@ impl LatentBinaryFamily {
                 }
             }
         }
-        Ok(())
     }
 
     fn evaluate_exact_newton_joint_dense(
@@ -3487,13 +3493,13 @@ impl LatentBinaryFamily {
                 &slices,
                 &primary_gradient,
                 wi,
-            )?;
+            );
             self.add_pullback_primary_hessian(
                 &mut hessian,
                 row_idx,
                 &slices,
                 &(wi * primary_hessian),
-            )?;
+            );
         }
         Ok((ll, gradient, hessian))
     }
@@ -3627,7 +3633,7 @@ impl LatentBinaryFamily {
                             * (g_u[a] * survival_gradient[b] + survival_gradient[a] * g_u[b]);
                 }
             }
-            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary))?;
+            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary));
         }
         Ok(out)
     }
@@ -3736,7 +3742,7 @@ impl LatentBinaryFamily {
                                 + survival_gradient[a] * g_uv[b]);
                 }
             }
-            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary))?;
+            self.add_pullback_primary_hessian(&mut out, row_idx, &slices, &(wi * primary));
         }
         Ok(out)
     }
@@ -3939,7 +3945,7 @@ impl LatentJointHessianFamily for LatentBinaryFamily {
             for a in 0..LATENT_SURVIVAL_PRIMARY_DIM {
                 primary_hv[a] += binary.outer_scale * survival_gradient[a] * outer_dot;
             }
-            self.add_pullback_primary_gradient(out, row_idx, slices, &primary_hv, wi)?;
+            self.add_pullback_primary_gradient(out, row_idx, slices, &primary_hv, wi);
         }
         Ok(true)
     }
@@ -5142,14 +5148,11 @@ mod tests {
                 BlockWorkingSet::ExactNewton { gradient, hessian } => {
                     let neg_hess = match hessian {
                         SymmetricMatrix::Dense(mat) => mat[[0, 0]],
-                        _ => 0.0,  // mismatch should not happen; test assert below will catch
+                        _ => panic!("log_sigma block should use a dense exact-Newton Hessian"),
                     };
                     (gradient[0], neg_hess)
                 }
-                _ => {
-                    // should be ExactNewton for log_sigma in this test
-                    (0.0, 0.0)
-                }
+                _ => panic!("log_sigma block should use ExactNewton"),
             };
 
         assert!((block_grad - joint_gradient[sigma_idx]).abs() < 1e-12);

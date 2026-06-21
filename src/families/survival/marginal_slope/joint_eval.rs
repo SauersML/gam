@@ -2024,17 +2024,17 @@ impl SurvivalMarginalSlopeFamily {
 
         impl BlockwiseHessianAccumulator {
             fn add_assign(&mut self, other: &Self) {
-                match (&mut *self, other) {
+                match (self, other) {
                     (Self::Dense(lhs), Self::Dense(rhs)) => *lhs += rhs,
                     (Self::Sparse(lhs), Self::Sparse(rhs)) => lhs.add_values(&rhs.values),
                     // Per-block accumulators all share one storage decision
                     // (marginal_csr / logslope_csr) made at the top of
                     // `family_evaluate_blockwise`.
-                    // Mismatch is invariant violation (bug). Graceful fallback
-                    // (zero lhs) removes ban-tracked panic! token while being
-                    // conservative on error.
-                    (Self::Dense(l), _) => *l = Array2::<f64>::zeros(l.dim()),
-                    (Self::Sparse(l), _) => l.values.fill(0.0),
+                    // SAFETY: mismatch ⇒ a newly added partial picked the
+                    // wrong storage variant — invariant violation. Zeroing the
+                    // accumulator would silently corrupt the joint Hessian, so
+                    // fail loudly instead of fabricating a result.
+                    _ => panic!("blockwise Hessian accumulator kind mismatch"),
                 }
             }
 
