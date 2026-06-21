@@ -237,6 +237,67 @@ impl SoftmaxAssignmentSparsityPenalty {
         dh
     }
 
+    /// Per-row **Gershgorin diagonal majorizer** `D` of the exact softmax-entropy
+    /// Hessian [`Self::row_dense_hessian`], scaled by `scale = λ/τ²`. Returns the
+    /// `K×K` diagonal block `diag(D_0, …, D_{K−1})` with
+    /// `D_kk = Σ_j |H_kj|` (#1419).
+    ///
+    /// Unlike the Fisher metric [`Self::row_fisher_metric`] — which is PSD but
+    /// does NOT satisfy `G ⪰ H_entropy` (counterexample `a=(0.95,0.05)`,
+    /// `λ=τ=1`: `G₁₁=0.0475 < H₁₁=0.0784`) — this `D` is a genuine Loewner
+    /// majorizer: it is diagonally dominant over `H` (`D_kk − H_kk =
+    /// |H_kk|−H_kk + Σ_{j≠k}|H_kj| ≥ Σ_{j≠k}|(D−H)_kj|`), so `D − H ⪰ 0`, and
+    /// every `D_kk ≥ 0`, so `D ⪰ 0`. It therefore both keeps the assembled
+    /// evidence block PD (the property the entropy block needs so the
+    /// Faddeev–Popov deflation never fires) AND actually majorizes the entropy
+    /// curvature, which the Fisher surrogate did not. The criterion's `log|H|`,
+    /// its θ-adjoint [`Self::row_psd_majorizer_logit_derivative`], and the
+    /// assembled Hessian all differentiate this SAME operator `D`, keeping value
+    /// and adjoint on one exact branch.
+    #[must_use]
+    pub fn row_psd_majorizer(&self, row_logits: &[f64], scale: f64) -> Array2<f64> {
+        let k = self.k_atoms;
+        let d = self.psd_majorizer_abs_row_sums(row_logits, scale);
+        let mut out = Array2::<f64>::zeros((k, k));
+        for kk in 0..k {
+            out[[kk, kk]] = d[kk];
+        }
+        out
+    }
+
+    /// Derivative of the per-row Gershgorin majorizer [`Self::row_psd_majorizer`]
+    /// with respect to a single row logit `z_w`, scaled by `scale = λ/τ²`.
+    /// Returns the `K×K` diagonal block `diag(∂D_0/∂z_w, …)` with
+    /// `∂D_kk/∂z_w = Σ_j sign(H_kj)·(∂H_kj/∂z_w)` (#1419), where `H` is the exact
+    /// entropy Hessian [`Self::row_dense_hessian`] and `∂H_kj/∂z_w` is
+    /// [`Self::row_dense_hessian_logit_derivative`]. `sign(0)=0` (a zero entry
+    /// contributes no first-order change to its own magnitude). Built from the
+    /// SAME `(a, L, m)` derivative convention as the dense Hessian derivative, so
+    /// the θ-adjoint differentiates the SAME `D` the assembly added.
+    #[must_use]
+    pub fn row_psd_majorizer_logit_derivative(
+        &self,
+        row_logits: &[f64],
+        scale: f64,
+        w: usize,
+    ) -> Array2<f64> {
+        let k = self.k_atoms;
+        let h = self.row_dense_hessian(row_logits, scale);
+        let dh = self.row_dense_hessian_logit_derivative(row_logits, scale, w);
+        let mut out = Array2::<f64>::zeros((k, k));
+        for kk in 0..k {
+            let mut acc = 0.0_f64;
+            for jj in 0..k {
+                let s = h[[kk, jj]].signum();
+                if h[[kk, jj]] != 0.0 {
+                    acc += s * dh[[kk, jj]];
+                }
+            }
+            out[[kk, kk]] = acc;
+        }
+        out
+    }
+
     /// Per-row softmax **Fisher-information metric** `G = scale·(diag(a) − a aᵀ)`
     /// over the row's logits, with `a = softmax(row_logits)` and
     /// `scale = λ/τ²` (#1190). Returns the symmetric `K×K` block
@@ -245,20 +306,16 @@ impl SoftmaxAssignmentSparsityPenalty {
     ///   G_kj = scale·a_k·(δ_kj − a_j).
     /// ```
     ///
-    /// This is the PSD curvature operator the manifold-SAE evidence Hessian uses
-    /// in place of the (indefinite) exact entropy Hessian
-    /// [`Self::row_dense_hessian`]. `G` is a covariance/Gram matrix, hence
-    /// exactly PSD and smooth in the logits, so the per-row evidence block stays
-    /// PD by construction and the downstream Faddeev–Popov deflation never fires
-    /// on the entropy block. Because the entropy penalty is a FIXED prior whose
-    /// stationary point is set by its (unchanged) EXACT gradient, substituting
-    /// its curvature with the Fisher metric only conditions the Newton step and
-    /// the Laplace normalizer's curvature operator — it does NOT move the
-    /// optimum (a fixed-prior curvature majorization, exactly like the ARD
-    /// `prior.hess.max(0.0)` precedent). The criterion's `log|H|`, its θ-adjoint
-    /// [`Self::row_fisher_metric_logit_derivative`], and the assembled Hessian
-    /// all differentiate this SAME operator `G`, keeping value and adjoint on
-    /// one exact branch.
+    /// `G` is a covariance/Gram matrix, hence exactly PSD and smooth in the
+    /// logits. It is the Fisher-information metric of the row softmax, NOT a
+    /// curvature majorizer of the entropy Hessian: `G − H_entropy` can be
+    /// indefinite (#1419: `K=2`, `a=(0.95,0.05)`, `λ=τ=1` gives `G₁₁=0.0475 <
+    /// H₁₁=0.0784`, so `G ⋡ H`). The genuine Loewner majorizer the assembled
+    /// evidence block now uses is [`Self::row_psd_majorizer`]
+    /// (`D_kk = Σ_j|H_kj|`, which DOES satisfy `D ⪰ H` and `D ⪰ 0`); this
+    /// Fisher metric is retained only as a smooth PSD conditioning reference and
+    /// its derivative [`Self::row_fisher_metric_logit_derivative`], and must not
+    /// be presented or used as a curvature majorizer.
     #[must_use]
     pub fn row_fisher_metric(&self, row_logits: &[f64], scale: f64) -> Array2<f64> {
         let k = self.k_atoms;
@@ -1272,4 +1329,139 @@ impl AnalyticPenalty for JumpReLUPenalty {
     }
 
     impl_scalar_apply_schedule!(weight);
+}
+
+#[cfg(test)]
+mod fisher_majorizer_1419_tests {
+    use super::*;
+    use crate::linalg::faer_ndarray::FaerEigh;
+    use approx::assert_abs_diff_eq;
+    use ndarray::Array2;
+
+    /// #1419 — the Fisher information metric `G = scale·(diag(a) − a aᵀ)` is PSD
+    /// but is NOT a curvature majorizer of the exact softmax-entropy Hessian
+    /// `H_entropy`: `G − H_entropy` is indefinite. The genuine Gershgorin
+    /// diagonal operator `D_kk = Σ_j|H_kj|` (now `row_psd_majorizer`) IS a
+    /// Loewner majorizer: `D − H_entropy ⪰ 0` AND `D ⪰ 0`.
+    ///
+    /// Oracle: the exact entropy Hessian is built independently from
+    /// `row_dense_hessian` (the formula at sparsity.rs:160-193); the smallest
+    /// eigenvalue of `M − H` is computed by a direct symmetric eigensolve. The
+    /// stated K=2 counterexample (`a=(0.95,0.05)`, `λ=τ=1`) is pinned numerically
+    /// against the issue's `H_11 = 0.0783747664` and `G_11 = 0.0475`, and the
+    /// contrast (Fisher FAILS, Gershgorin PASSES) is asserted in both the full
+    /// K×K block and the single free direction of the reference-logit chart.
+    #[test]
+    fn gershgorin_majorizes_entropy_where_fisher_does_not_1419() {
+        // K=2, λ=τ=1 ⇒ scale = λ/τ² = 1. Logits that realize a = (0.95, 0.05):
+        // softmax([z0,z1]) = (0.95,0.05) ⟹ z0 − z1 = ln(0.95/0.05) = ln(19).
+        let temperature = 1.0_f64;
+        let scale = 1.0_f64; // λ/τ² with λ=1, τ=1.
+        let pen = SoftmaxAssignmentSparsityPenalty::new(2, temperature);
+        let z1 = 0.0_f64;
+        let z0 = z1 + (0.95_f64 / 0.05_f64).ln();
+        let row = [z0, z1];
+
+        // Confirm the realized softmax weights.
+        let a = pen.softmax_row(&row);
+        assert_abs_diff_eq!(a[0], 0.95, epsilon = 1e-12);
+        assert_abs_diff_eq!(a[1], 0.05, epsilon = 1e-12);
+
+        // Independent oracles: exact entropy Hessian, Fisher metric, majorizer.
+        let h = pen.row_dense_hessian(&row, scale);
+        let g = pen.row_fisher_metric(&row, scale);
+        let m = pen.row_psd_majorizer(&row, scale);
+
+        // Pin the issue's exact numbers in the sole free direction (index 0):
+        //   H_11 = 0.0783747664,  G_11 = a0·a1 = 0.0475.
+        assert_abs_diff_eq!(h[[0, 0]], 0.0783747664, epsilon = 1e-9);
+        assert_abs_diff_eq!(g[[0, 0]], 0.95 * 0.05, epsilon = 1e-12);
+
+        // The genuine majorizer's diagonal is the abs-row-sum D_kk = Σ_j|H_kj|.
+        for kk in 0..2 {
+            let row_sum: f64 = (0..2).map(|jj| h[[kk, jj]].abs()).sum();
+            assert_abs_diff_eq!(m[[kk, kk]], row_sum, epsilon = 1e-12);
+        }
+        // M is a nonnegative diagonal (PSD by inspection) — off-diagonals zero.
+        assert_abs_diff_eq!(m[[0, 1]], 0.0, epsilon = 1e-15);
+        assert_abs_diff_eq!(m[[1, 0]], 0.0, epsilon = 1e-15);
+        assert!(m[[0, 0]] >= 0.0 && m[[1, 1]] >= 0.0);
+
+        // Reference-logit chart: hold z1 fixed, the only free direction is z0, so
+        // the reduced 1×1 curvature is the (0,0) entry. Fisher FAILS the Loewner
+        // bound there (G_11 − H_11 < 0), the Gershgorin majorizer PASSES it.
+        let fisher_free = g[[0, 0]] - h[[0, 0]];
+        let major_free = m[[0, 0]] - h[[0, 0]];
+        assert!(
+            fisher_free < -1e-3,
+            "Fisher must FAIL the majorizer bound in the free direction (#1419); \
+             G_11 − H_11 = {fisher_free}"
+        );
+        assert!(
+            major_free >= -1e-12,
+            "Gershgorin majorizer must SATISFY the bound in the free direction (#1419); \
+             D_11 − H_11 = {major_free}"
+        );
+
+        // Full K×K Loewner check via a direct symmetric eigensolve oracle.
+        // smallest eigenvalue of (M − H) ≥ −tiny ⟹ M ⪰ H; the Fisher case has a
+        // strictly negative smallest eigenvalue ⟹ G ⋡ H.
+        let mut m_minus_h = Array2::<f64>::zeros((2, 2));
+        let mut g_minus_h = Array2::<f64>::zeros((2, 2));
+        for i in 0..2 {
+            for j in 0..2 {
+                m_minus_h[[i, j]] = m[[i, j]] - h[[i, j]];
+                g_minus_h[[i, j]] = g[[i, j]] - h[[i, j]];
+            }
+        }
+        let (m_evals, _) = m_minus_h.eigh(faer::Side::Lower).expect("eigh(M−H)");
+        let (g_evals, _) = g_minus_h.eigh(faer::Side::Lower).expect("eigh(G−H)");
+        let m_min = m_evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        let g_min = g_evals.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            m_min >= -1e-12,
+            "Gershgorin majorizer must be a Loewner majorizer (M − H ⪰ 0, #1419); \
+             smallest eigenvalue of M−H = {m_min}"
+        );
+        assert!(
+            g_min < -1e-9,
+            "the OLD Fisher metric must FAIL the Loewner majorizer test (#1419); \
+             smallest eigenvalue of G−H = {g_min} (expected strictly negative)"
+        );
+    }
+
+    /// #1419 — the majorizer's θ-derivative `∂D_kk/∂z_w = Σ_j sign(H_kj)∂H_kj/∂z_w`
+    /// is the exact derivative of the operator the assembly installs, so value and
+    /// log-det adjoint differentiate the SAME `D`. Oracle: a central finite
+    /// difference of `row_psd_majorizer` itself (away from any sign change, the
+    /// abs-row-sum is smooth). FD is permitted ONLY inside this test as an
+    /// independent check of the closed-form derivative.
+    #[test]
+    fn gershgorin_majorizer_logit_derivative_matches_fd_1419() {
+        let pen = SoftmaxAssignmentSparsityPenalty::new(4, 0.8);
+        let row = [0.3_f64, -0.6, 0.9, 0.2];
+        let scale = 1.1_f64 * (1.0 / 0.8_f64) * (1.0 / 0.8_f64);
+        let eps = 1e-6;
+        for w in 0..4 {
+            let dd = pen.row_psd_majorizer_logit_derivative(&row, scale, w);
+            let mut rp = row;
+            let mut rm = row;
+            rp[w] += eps;
+            rm[w] -= eps;
+            let mp = pen.row_psd_majorizer(&rp, scale);
+            let mm = pen.row_psd_majorizer(&rm, scale);
+            for k in 0..4 {
+                let fd = (mp[[k, k]] - mm[[k, k]]) / (2.0 * eps);
+                assert_abs_diff_eq!(dd[[k, k]], fd, epsilon = 1e-6);
+            }
+            // The derivative is a pure diagonal (D is diagonal).
+            for i in 0..4 {
+                for j in 0..4 {
+                    if i != j {
+                        assert_abs_diff_eq!(dd[[i, j]], 0.0, epsilon = 1e-15);
+                    }
+                }
+            }
+        }
+    }
 }

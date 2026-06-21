@@ -3662,16 +3662,16 @@ impl SaeManifoldTerm {
                 //      diagonal for softmax — that diagonal is the INDEFINITE exact
                 //      entropy Hessian (#1190), which drives the block non-PD. It
                 //      must instead write the ACTIVE×ACTIVE principal sub-block of
-                //      the Fisher metric `G = scale·(diag(a) − a aᵀ)` (PSD because
-                //      every principal submatrix of a PSD matrix is PSD), mirroring
-                //      the dense `softmax_dense` path. The full-K softmax
-                //      normalization is retained when forming `a` (the gate map),
-                //      so dropped tail logits contribute negligible (`O(a)`) mass.
+                //      the Gershgorin majorizer `D = diag(Σ_j|H_kj|)` (#1419; PSD
+                //      and `D ⪰ H_entropy`), mirroring the dense `softmax_dense`
+                //      path. The full-K softmax normalization is retained when
+                //      forming `a` (the gate map), so dropped tail logits contribute
+                //      negligible (`O(a)`) mass.
                 //   3. COHERENCE: the logdet (`assignment_log_strength_hessian_trace`
                 //      softmax branch) and the θ-adjoint (`softmax_dense_adjoint`,
                 //      currently gated on the dense `None` layout) must BOTH be
-                //      extended to contract the SAME active-sub-block Fisher metric
-                //      and its `row_fisher_metric_logit_derivative` over the compact
+                //      extended to contract the SAME active-sub-block majorizer
+                //      and its `row_psd_majorizer_logit_derivative` over the compact
                 //      logit slots — otherwise value, log|H|, and Γ desync (the
                 //      bug class `criterion_atoms.rs` exists to kill). This is the
                 //      part that needs the FD/contract gates to certify.
@@ -4227,47 +4227,40 @@ impl SaeManifoldTerm {
                             block.gt[free_idx] += assignment_grad[assignment_base + free_idx];
                         }
                         if let Some((penalty, scale)) = softmax_dense.as_ref() {
-                            // #1190: write the PSD softmax Fisher-information metric
-                            // `G = scale·(diag(a) − a aᵀ)` onto the row's logit block in
-                            // place of the EXACT entropy Hessian. The entropy Hessian is
-                            // INDEFINITE (concave directions on long-tailed rows), which
-                            // drove the per-row evidence block non-PD and forced the
-                            // downstream Faddeev–Popov deflation to flatten data-relevant
-                            // logit directions (under-identifying the atoms) while leaving
-                            // value/adjoint on two branches (log|H| read the deflated
-                            // factor; the θ-adjoint differentiated the raw dense Hessian).
-                            // `G` is a covariance/Gram, hence exactly PSD and smooth in the
-                            // logits, so the block is PD by construction and the deflation
-                            // no longer fires on the entropy block. Because the entropy
-                            // penalty is a FIXED prior whose stationary point is set by its
-                            // (unchanged) EXACT gradient, substituting its curvature with
-                            // the Fisher metric only conditions the Newton step and the
+                            // #1419: write the genuine Gershgorin Loewner majorizer
+                            // `D = diag(Σ_j|H_kj|)` of the exact entropy Hessian onto the
+                            // row's logit block in place of the EXACT entropy Hessian. The
+                            // entropy Hessian is INDEFINITE (concave directions on
+                            // long-tailed rows), which drove the per-row evidence block
+                            // non-PD and forced the downstream Faddeev–Popov deflation to
+                            // flatten data-relevant logit directions (under-identifying the
+                            // atoms). `D` is a nonnegative diagonal, hence exactly PSD and
+                            // PD-preserving like the previous Fisher surrogate, so the block
+                            // stays PD and the deflation no longer fires on the entropy
+                            // block. Unlike the Fisher metric `G = scale·(diag(a) − a aᵀ)`,
+                            // which is PSD but NOT a majorizer (`G − H_entropy` can be
+                            // indefinite — K=2, a=(0.95,0.05): G₁₁=0.0475 < H₁₁=0.0784,
+                            // #1419), `D` actually satisfies `D ⪰ H_entropy` and `D ⪰ 0`,
+                            // so it is a true MM/Loewner curvature majorizer. Because the
+                            // entropy penalty is a FIXED prior whose stationary point is set
+                            // by its (unchanged) EXACT gradient, replacing its curvature
+                            // with the majorizer only conditions the Newton step and the
                             // Laplace normalizer's curvature operator — it does NOT move the
-                            // optimum. #1419: this is a PSD curvature SURROGATE, NOT a
-                            // Loewner majorizer — `G − H_entropy` can be indefinite (e.g.
-                            // K=2, a=(0.95,0.05): G₁₁=0.0475 < H₁₁=0.0784). A true diagonal
-                            // majorizer (`psd_majorizer_abs_row_sums`, the Gershgorin
-                            // `D_kk = Σ_j|H_kj|`) exists, but it carries a non-smooth `abs(·)`
-                            // and is diagonal, which would split the smooth dense θ-adjoint
-                            // (`row_fisher_metric_logit_derivative`) off the assembled
-                            // operator. Because the optimum is unmoved (exact gradient) the
-                            // surrogate need only be PSD and smooth, not a majorizer; the
-                            // dense Gershgorin route is reserved for MM-descent paths that
-                            // genuinely require `G ⪰ H`.
+                            // optimum.
                             //
                             // Softmax uses the REDUCED K−1 free-logit chart (the last
                             // reference logit is fixed at 0, `assignment_coord_dim() = K−1`).
                             // Holding z_{K-1} fixed, the reduced curvature over the free
                             // logits 0..K−1 is exactly the top-left (K−1)×(K−1) submatrix of
-                            // the full K×K metric (the fixed logit contributes no row/column
-                            // to the free curvature). The criterion's `log|H|` and the
-                            // #1006 θ-adjoint differentiate this SAME `G` (see the
-                            // `row_fisher_metric_logit_derivative` site below), so value and
+                            // the full K×K majorizer (the fixed logit contributes no
+                            // row/column to the free curvature). The criterion's `log|H|`
+                            // and the #1006 θ-adjoint differentiate this SAME `D` (see the
+                            // `row_psd_majorizer_logit_derivative` site below), so value and
                             // adjoint stay on one exact branch.
                             let row_logits: Vec<f64> = (0..k_atoms)
                                 .map(|k| self.assignment.logits[[row, k]])
                                 .collect();
-                            let h_dense = penalty.row_fisher_metric(&row_logits, *scale);
+                            let h_dense = penalty.row_psd_majorizer(&row_logits, *scale);
                             for ki in 0..assignment_dim {
                                 for kj in 0..assignment_dim {
                                     block.htt[[ki, kj]] += h_dense[[ki, kj]];
@@ -7065,14 +7058,14 @@ impl SaeManifoldTerm {
                     .map(|k| self.assignment.logits[[row, k]])
                     .collect();
                 // ∂H/∂ρ over this row's free-logit block (position j ↔ atom j).
-                // #1190: the assembled curvature block is the softmax Fisher metric
-                // `G = scale·(diag(a) − a aᵀ)` (the PSD operator that replaced the
-                // indefinite entropy Hessian). `scale = λ_sparse·sparsity/τ²` is
-                // linear in `λ_sparse = exp(ρ)`, so `∂(scale·G)/∂ρ = scale·G = G`
+                // #1419: the assembled curvature block is the Gershgorin majorizer
+                // `D = diag(Σ_j|H_kj|)` (the genuine Loewner majorizer that replaced
+                // the indefinite entropy Hessian). `scale = λ_sparse·sparsity/τ²` is
+                // linear in `λ_sparse = exp(ρ)`, so `∂(scale·D)/∂ρ = scale·D = D`
                 // evaluated at the current scale — differentiate the SAME operator
                 // the assembly and θ-adjoint use so the ρ-gradient stays on one
                 // branch.
-                let dh_rho = penalty.row_fisher_metric(&row_logits, scale);
+                let dh_rho = penalty.row_psd_majorizer(&row_logits, scale);
                 for kj in 0..logit_dim {
                     let mut rhs_t = Array1::<f64>::zeros(total_t);
                     let rhs_beta = Array1::<f64>::zeros(cache.k);
@@ -8288,15 +8281,15 @@ impl SaeManifoldTerm {
                 }
             }
 
-            // #1190: when `w` is a logit and the assignment is softmax, the per-row
-            // softmax Fisher-metric `G = scale·(diag(a) − a aᵀ)` is what the assembly
-            // wrote into `htt` (the PSD curvature operator that replaces the
-            // indefinite exact entropy Hessian). Its full θ-derivative `∂G_{k,j}/∂z_w`
-            // (diagonal AND off-diagonal) is the SAME `a`-derived tensor the assembly
-            // and logdet now differentiate, so value and adjoint stay on ONE exact
-            // branch. Compute it once per logit `w` and add it at every logit pair
-            // `(a,b)` below. The diagonal softmax case is therefore handled here, NOT
-            // in `assignment_prior_hdiag_derivative_entry` (which returns 0 for
+            // #1419: when `w` is a logit and the assignment is softmax, the per-row
+            // Gershgorin majorizer `D = diag(Σ_j|H_kj|)` is what the assembly wrote
+            // into `htt` (the genuine Loewner majorizer that replaces the indefinite
+            // exact entropy Hessian). Its full θ-derivative `∂D_{k,k}/∂z_w` (diagonal;
+            // `∂D_kk/∂z_w = Σ_j sign(H_kj)·∂H_kj/∂z_w`) is the SAME operator the
+            // assembly and logdet now differentiate, so value and adjoint stay on ONE
+            // exact branch. Compute it once per logit `w` and add it at every logit
+            // pair `(a,b)` below. The diagonal softmax case is therefore handled here,
+            // NOT in `assignment_prior_hdiag_derivative_entry` (which returns 0 for
             // softmax to avoid double-counting).
             let row_logits_softmax: Option<Vec<f64>> = softmax_dense_adjoint.as_ref().map(|_| {
                 (0..k_atoms)
@@ -8311,7 +8304,7 @@ impl SaeManifoldTerm {
                     jets.vars[w],
                 ) {
                     (Some((penalty, scale)), Some(row_logits), SaeLocalRowVar::Logit { atom }) => {
-                        Some(penalty.row_fisher_metric_logit_derivative(row_logits, *scale, atom))
+                        Some(penalty.row_psd_majorizer_logit_derivative(row_logits, *scale, atom))
                     }
                     _ => None,
                 };
@@ -8470,7 +8463,8 @@ impl SaeManifoldTerm {
     ///   1. data: `B` uses Gauss-Newton `J̃J̃ᵀ`, dropping the residual curvature
     ///      `R[a,b] = Σ_out r_out·∂²f_out/∂θ_a∂θ_b` (t–t via `jets.second`, t–β via
     ///      `jets.beta_deriv`; the decoder is linear in β so the β–β block is 0);
-    ///   2. softmax: `B` uses the Fisher metric `G`, dropping `H_entropy − G`;
+    ///   2. softmax: `B` uses the Gershgorin majorizer `D = diag(Σ_j|H_kj|)`,
+    ///      dropping `H_entropy − D` (#1419);
     ///   3. periodic ARD: `B` uses `max(V'',0)`, dropping the negative part
     ///      `min(V'',0)` (the indefinite tail past a quarter period).
     /// `ΔC` is the sum of exactly these three deltas, each built from the SAME
@@ -8506,7 +8500,7 @@ impl SaeManifoldTerm {
             .map(|coord| coord.effective_axis_periods())
             .collect();
 
-        // Optional softmax exact-entropy-minus-Fisher delta operator.
+        // Optional softmax exact-entropy-minus-majorizer delta operator (#1419).
         let softmax_delta: Option<(
             crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty,
             f64,
@@ -8598,14 +8592,18 @@ impl SaeManifoldTerm {
                 }
             }
 
-            // (2) softmax: ΔC_logit = scale·(H_entropy − G) over the free logits.
+            // (2) softmax: ΔC_logit = (H_entropy − D) over the free logits, where
+            // `D = diag(Σ_j|H_kj|)` is the Gershgorin majorizer the assembled `B`
+            // wrote into the logit block (#1419). Adding `H_entropy − D` recovers the
+            // EXACT entropy curvature `A = B + ΔC`, so the solver's exact-Hessian
+            // correction differentiates the SAME operator the assembly installed.
             if let Some((penalty, scale)) = softmax_delta.as_ref() {
                 let assignment_dim = self.assignment.assignment_coord_dim();
                 let row_logits: Vec<f64> = (0..k_atoms)
                     .map(|k| self.assignment.logits[[row, k]])
                     .collect();
                 let h_entropy = penalty.row_dense_hessian(&row_logits, *scale);
-                let g_fisher = penalty.row_fisher_metric(&row_logits, *scale);
+                let majorizer = penalty.row_psd_majorizer(&row_logits, *scale);
                 for (a, va) in jets.vars.iter().enumerate() {
                     let SaeLocalRowVar::Logit { atom: ka } = *va else {
                         continue;
@@ -8621,7 +8619,7 @@ impl SaeManifoldTerm {
                         if kb >= assignment_dim {
                             continue;
                         }
-                        acc += (h_entropy[[ka, kb]] - g_fisher[[ka, kb]]) * v_t[b];
+                        acc += (h_entropy[[ka, kb]] - majorizer[[ka, kb]]) * v_t[b];
                     }
                     out.t[base + a] += acc;
                 }
