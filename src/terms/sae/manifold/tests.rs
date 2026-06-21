@@ -9352,6 +9352,51 @@ pub(crate) fn sae_logdet_theta_adjoint_matches_dense_fd_ibp_map() {
     }
 }
 
+/// #1416 — the IBP fixed-alpha `ρ_sparse`-trace `½ tr(H⁻¹ ∂H_p/∂ρ_sparse)` must
+/// include the FULL cross-row off-diagonal of the rank-one Woodbury source, not
+/// just the diagonal. Under IBP-MAP the per-column empirical-mass `M_k` couples
+/// every row of column `k` through `H_p = d·J Jᵀ + diag(s, c)`, and for fixed
+/// alpha the entire IBP prior scales with `λ_sparse = eᵖ`, so
+/// `∂H_p/∂ρ_sparse = H_p`. The analytic
+/// `assignment_log_strength_hessian_trace` returns `½ ∂log|H|/∂ρ_sparse`; this
+/// pins it against a fixed-state central difference of the joint `log|H|`. A
+/// diagonal-only contraction (the pre-#1416 bug) would miss the
+/// `½ d Σ_{i≠j}(H⁻¹)_{ij} J_i J_j` cross-row term and fail this FD.
+#[test]
+pub(crate) fn ibp_rho_sparse_logdet_trace_matches_dense_fd_1416() {
+    let (mut term, target, mut rho) = gamma_fd_tiny_fixture();
+    // Fixed-alpha IBP-MAP with an active sparse prior so the cross-row Woodbury
+    // source is genuinely live.
+    term.assignment.mode = AssignmentMode::ibp_map(0.7, 0.9, false);
+    rho.log_lambda_sparse = -1.0;
+    let (_value, _loss, cache) = term
+        .reml_criterion_with_cache(target.view(), &rho, None, 5, 0.4, 1.0e-6, 1.0e-6)
+        .expect("converged cache");
+    let solver = DeflatedArrowSolver::plain(&cache);
+    let analytic = term
+        .assignment_log_strength_hessian_trace(&rho, &cache, &solver)
+        .expect("rho_sparse logdet trace");
+
+    // Fixed-state central difference of log|H| w.r.t. ρ_sparse: vary λ_sparse,
+    // hold (t, β) at the converged state (`fixed_state_logdet` re-assembles H
+    // with inner_max_iter=0). The analytic trace is ½ ∂log|H|/∂ρ_sparse.
+    let h = 1.0e-5;
+    let mut rho_plus = rho.clone();
+    let mut rho_minus = rho.clone();
+    rho_plus.log_lambda_sparse += h;
+    rho_minus.log_lambda_sparse -= h;
+    let fd_half = 0.5
+        * (fixed_state_logdet(term.clone(), &target, &rho_plus)
+            - fixed_state_logdet(term.clone(), &target, &rho_minus))
+        / (2.0 * h);
+    let tol = 3.0e-3 * (1.0 + fd_half.abs().max(analytic.abs()));
+    assert!(
+        (fd_half - analytic).abs() <= tol,
+        "IBP ρ_sparse logdet trace: fd(½∂log|H|/∂ρ)={fd_half:.8e}, \
+         analytic={analytic:.8e}"
+    );
+}
+
 /// #932 follow-up (the issue-comment cache-seam ask): the SAE row
 /// jet-program oracle driven directly from a CONVERGED production
 /// `ArrowFactorCache`, not a mirrored test layout.
