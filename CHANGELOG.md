@@ -1,3 +1,79 @@
+## v0.3.120 — gam 0.3.120 / gamfit 0.1.222 (2026-06-21)
+
+crates.io + PyPI release of the open-issue bug-fix wave landed since gamfit
+0.1.221 (gam 0.3.119), plus the #1452/#1288 releasability cleanup that re-arms the
+`build.rs` hygiene gate to a hard failure and brings the tree into compliance so a
+release can actually build the `gamfit` wheel.
+
+**Releasability / hygiene (#1452 / #1288 / #780 / #871)**
+- The `build.rs` ban-scanner is back to a hard `exit(1)`: no `#[ignore]` tests,
+  no `debug_assert!`, no `unreachable!`, no manifest `dead_code = "allow"`, no
+  underscore-prefixed unused parameters, no `#[cfg(test)]` items outside a test
+  module, and no tracked file over 10k lines. The whole tree now complies and
+  builds clean under `[lints.rust] warnings = "deny"`.
+- Finished the #1288 dead-code cleanup: removed the never-consumed third-order
+  `d3qdot` location-scale qdot jet and the unwired batched
+  `jeffreys_*_flex_no_wiggle` / basis-contraction survival fast paths, scoped the
+  #932 jet-scalar oracle structs to their test module, and dropped leftover
+  #932 directional FD-localizer debug scaffolding.
+- Promoted cheap invariant `debug_assert!`/`debug_assert_eq!` to always-on
+  `assert!`/`assert_eq!` (penalty-root rank consistency, Duchon hybrid-integral
+  precondition); dropped release-noop debug assertions where the documented
+  contract wants honest IEEE `NaN`/`inf` propagation; replaced a banned
+  `unreachable!` with a `// SAFETY:`-justified `panic!`.
+
+**Inference & numerics**
+- **#1436**: a typed `OuterGradientError` (IllConditioned / NonIdentifiable /
+  InternalInvariant) narrows the SAE FD-fallback so only genuine
+  conditioning/identifiability failures admit the finite-difference descent
+  direction at a finite-cost ρ, while internal-invariant defects propagate as
+  hard errors. NonIdentifiable is now constructed at the gauge-degenerate,
+  non-deflatable outer-gradient site.
+- **#1424 / #1422 / #1423**: cancellation-free hybrid Duchon-Matern kernel
+  evaluation and a PSD mixed-periodicity Duchon penalty via an additive tensor
+  reproducing kernel, with the correct cylinder nullspace.
+- **#1271 / #1266 / #1380 / #1089**: the REML log-λ cap is lifted off
+  well-determined Gaussian-identity smooths so REML can reach the null-space
+  optimum, without changing the global default.
+- **#1391 / #1397 / #1017**: post-T rank invariant is anchored to the audit's
+  kept-rank certificate and made robust to the drop-deciding convention;
+  relaxed over-strict arrow-Schur parity asserts to a tight relative tolerance.
+- **#1376 / #1398 / #1404**: anisotropic Matern ψ-derivative centered to the
+  raw-η gauge; isotropic sphere-harmonic penalty and closed-form Sobolev jet
+  with a constant-curvature effective-length contract.
+- **#1426**: a stuck gamma/log REML stall is no longer shipped as a flat valley.
+- **#1385**: competing-risks CIF assembled on a refined internal grid.
+
+**Survival (#932 / #979 / #1394 / #1396)**
+- Moving-boundary flux / implicit-function / substitution jet-tower combinators
+  for the θ-dependent flex-calibration integrand, carried exactly to fourth
+  order, with the survival location-scale time-channel NLL sign living in a
+  single source of truth and rigid-kernel non-finite margin propagation.
+
+**Smooths, factors & summaries**
+- **#1403**: `s(x, by=factor)` routes to `BySmooth::Factor`, `s(x, by=numeric)`
+  to `BySmooth::Numeric`, and `bs="sz"` factor smooths to `FactorSmooth { Sz }`.
+- **#1378**: default univariate thin-plate basis sized to mgcv `k=10`, with
+  row-permutation-invariant knot selection.
+- **#1364**: P-spline scale equivariance.
+- **#1384**: `compare_models` refuses to rank fits of different response families.
+- **#1370 / #1368 / #1369**: `summary()` synthesizes valid factor levels for the
+  smooth-term replay so `fs`/`sz`/`by` smooths keep their EDF and per-level
+  labels.
+
+**Manifold-SAE**
+- **#1405 / #1406 / #1410 / #1411 / #1412**: matrix-free planner predicts the
+  true cross footprint; compact support is partial-selected and per-worker
+  scratch sized by compact dims; encode bench gates honest support recovery.
+- **#1026**: collinearity-gated decoder repulsion conditions the SAE
+  co-collapse direction with a keep-best multi-start.
+
+**Error messages**
+- **#1445**: NaN/None/empty table-cell errors now name the offending column and
+  row instead of an unactionable bare message.
+
+See the git history (`git log v0.3.118..v0.3.120`) for the complete set.
+
 ## v0.3.118 — gam 0.3.118 / gamfit 0.1.219 (2026-06-17)
 
 crates.io + PyPI release. The `gam` crate is bumped 0.3.117 → 0.3.118: this is a
