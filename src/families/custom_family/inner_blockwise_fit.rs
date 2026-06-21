@@ -3797,6 +3797,24 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     .map(|spectrum| spectrum.newton_decrement())
                 && decrement.is_finite()
                 && decrement <= objective_tol
+                // Conditioning-robust safety (gam#1449): the raw decrement above
+                // excludes every `|γ_k| ≤ null_cutoff = max(rank_tol·λ_max,
+                // numerical_floor)` mode. On a badly-scaled penalized Hessian
+                // `rank_tol·λ_max` can swallow a mode with small-but-REAL curvature
+                // AND real signal — a weakly-identified direction, not gauge —
+                // whose achievable improvement `c²/(2|γ|)` the raw decrement then
+                // silently ignores. Require that improvement, measured over the
+                // genuinely-curved band (above the machine-rank `numerical_floor`,
+                // a conditioning-robust cutoff that does NOT scale with λ_max), to
+                // ALSO be within tolerance before certifying. The genuine numerical
+                // null space (below `numerical_floor`) still contributes nothing,
+                // and the step is unchanged; this only HARDENS the stopping test so
+                // a weakly-identified real mode blocks premature certification.
+                && let Some(weak_decrement) = joint_spectrum
+                    .as_ref()
+                    .map(|spectrum| spectrum.weakly_identified_decrement())
+                && weak_decrement.is_finite()
+                && weak_decrement <= objective_tol
             {
                 // Audit witness (#1082): the residual mass this certificate
                 // EXCLUDES as gauge-null. The decrement bound is sound only when
