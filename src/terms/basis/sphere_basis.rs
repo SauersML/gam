@@ -3517,6 +3517,103 @@ pub fn build_matern_basis_log_kappa_aniso_derivatives(
                 }
             }
         }
+
+        // Center the PENALTY SECOND derivatives to the raw-η gauge (#1376).
+        //
+        // The per-axis builders produce the penalty ψ-Hessian: the diagonal
+        // `∂²S/∂ψ_a²` lives in `penalties_second_diag[a]` and the off-diagonal
+        // `∂²S/∂ψ_a∂ψ_b` is supplied lazily by `penalties_cross_provider`. The
+        // optimizer's coordinate is the RAW η, and the forward metric is the
+        // centered contrast ψ = C·η with `C = I − (1/d)·11ᵀ`, so the raw-η
+        // Hessian is the two-sided projection
+        //
+        //   H_η = Cᵀ H_ψ C,   i.e.  H_η[a,b] = Σ_{c,e} C[c,a] C[e,b] H_ψ[c,e],
+        //
+        // with `C[c,a] = δ_ca − 1/d`. Unlike the first derivative (a single
+        // mean-subtraction), the second derivative mixes ALL axis pairs, so each
+        // centered block needs the full d×d ψ-Hessian. We materialize it once
+        // (diag from `penalties_second_diag`, off-diagonals from the cross
+        // provider — `H_ψ` is symmetric, so `(c,e)` and `(e,c)` are equal),
+        // apply the projector, then overwrite the diagonal blocks and install a
+        // closure cross provider that serves the pre-centered `H_η[a,b]`.
+        //
+        // NOTE (design-Hessian gap): the analogous DESIGN second derivatives are
+        // NOT centered here because the dense path emits no design cross-second
+        // blocks (`design_second_cross` is always empty — see
+        // `build_aniso_design_psi_derivatives_shared`), so the full-Hessian
+        // projection is not computable for the design without first adding that
+        // cross computation. The large-n implicit-operator path already centers
+        // both orders (`with_raw_eta_centering`); closing the dense design-Hessian
+        // gap is tracked for a compile-verified follow-up (gam#1376).
+        if result.penalties_second_diag.len() == dim
+            && !result.penalties_second_diag[0].is_empty()
+            && let Some(provider) = result.penalties_cross_provider.take()
+        {
+            let num_blocks = result.penalties_second_diag[0].len();
+            // Full ψ-Hessian: psi_hessian[c][e] is a Vec<Array2> over penalty
+            // blocks. Diagonal from the stored second-diag; off-diagonal from the
+            // (symmetric) cross provider.
+            let mut psi_hessian: Vec<Vec<Vec<Array2<f64>>>> =
+                vec![vec![Vec::new(); dim]; dim];
+            for c in 0..dim {
+                psi_hessian[c][c] = result.penalties_second_diag[c].clone();
+            }
+            for c in 0..dim {
+                for e in (c + 1)..dim {
+                    let cross = provider.evaluate(c, e)?;
+                    // An empty return means "no cross coupling at this pair"
+                    // (e.g. no active shrinkage block); treat it as zeros.
+                    let cross = if cross.is_empty() {
+                        vec![
+                            Array2::<f64>::zeros(result.penalties_second_diag[c][0].raw_dim());
+                            num_blocks
+                        ]
+                    } else {
+                        cross
+                    };
+                    psi_hessian[c][e] = cross.clone();
+                    psi_hessian[e][c] = cross;
+                }
+            }
+            // C[c,a] = δ_ca − 1/d.
+            let c_proj = |c: usize, a: usize| -> f64 {
+                if c == a { 1.0 - inv_dim } else { -inv_dim }
+            };
+            // Centered H_η[a][b] per block.
+            let mut eta_hessian: Vec<Vec<Vec<Array2<f64>>>> =
+                vec![vec![Vec::new(); dim]; dim];
+            for a in 0..dim {
+                for b in 0..dim {
+                    let mut blocks = Vec::with_capacity(num_blocks);
+                    for blk in 0..num_blocks {
+                        let dimsz = result.penalties_second_diag[0][blk].raw_dim();
+                        let mut acc = Array2::<f64>::zeros(dimsz);
+                        for c in 0..dim {
+                            let cca = c_proj(c, a);
+                            for e in 0..dim {
+                                let w = cca * c_proj(e, b);
+                                acc.scaled_add(w, &psi_hessian[c][e][blk]);
+                            }
+                        }
+                        blocks.push(acc);
+                    }
+                    eta_hessian[a][b] = blocks;
+                }
+            }
+            // Overwrite the diagonal blocks with the centered raw-η diagonal.
+            for a in 0..dim {
+                result.penalties_second_diag[a] = eta_hessian[a][a].clone();
+            }
+            // Install a closure cross provider serving the pre-centered raw-η
+            // off-diagonal blocks (symmetric in its two axis arguments).
+            result.penalties_cross_provider =
+                Some(AnisoPenaltyCrossProvider::new(move |axis_a, axis_b| {
+                    if axis_a == axis_b || axis_a >= dim || axis_b >= dim {
+                        return Ok(Vec::new());
+                    }
+                    Ok(eta_hessian[axis_a][axis_b].clone())
+                }));
+        }
     }
 
     Ok(result)

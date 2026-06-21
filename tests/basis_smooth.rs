@@ -126,6 +126,8 @@ mod matern_2d_iso_kappa_outer_gradient_fd;
 mod matern_all_nu_sweep_diagnose;
 #[path = "basis_smooth/matern_aniso_eta_design_derivative_centering_fd.rs"]
 mod matern_aniso_eta_design_derivative_centering_fd;
+#[path = "basis_smooth/matern_aniso_penalty_second_derivative_centering_fd.rs"]
+mod matern_aniso_penalty_second_derivative_centering_fd;
 #[path = "basis_smooth/matern_extreme_length_scale.rs"]
 mod matern_extreme_length_scale;
 #[path = "basis_smooth/matern_formula_integration.rs"]
