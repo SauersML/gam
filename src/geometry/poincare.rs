@@ -620,15 +620,33 @@ pub fn tangent_decode_backward(
         }
         let s = sqrt_negc * nrm;
         let tanh_s = s.tanh();
-        let phi = tanh_s / s;
-        // phi'(s) = (s * (1 - tanh^2 s) - tanh s) / s^2.
-        let phi_prime = (s * (1.0 - tanh_s * tanh_s) - tanh_s) / (s * s);
-        // ds/dv = sqrt(k) * v / |v|. So
-        // dphi/dv = phi'(s) * sqrt(k) / |v| * v.
-        let dphi_dv_coeff = phi_prime * sqrt_negc / nrm;
+        // The forward `exp_coeff` CLAMPS the radial coefficient to
+        // `(1 - BOUNDARY_EPS)/s` once `tanh(s) >= 1 - BOUNDARY_EPS` (s beyond
+        // EXP_SATURATION_CAP), pinning the output norm to the open-ball boundary
+        // `(1 - BOUNDARY_EPS)/sqrt(k)`. The backward MUST differentiate that same
+        // clamped map, not the unclamped `tanh(s)/s`, or the analytic gradient
+        // desyncs from the forward in the saturated regime.
+        let (phi, dphi_dv_coeff) = if tanh_s >= 1.0 - BOUNDARY_EPS {
+            // Saturated: x_hat = C * v / |v| with C = (1 - BOUNDARY_EPS)/sqrt(k)
+            // constant ⇒ coeff = C/|v| = (1 - BOUNDARY_EPS)/s, and
+            // ∂x_hat_i/∂v_j = coeff (δ_ij - v̂_i v̂_j): the output is radially
+            // pinned, so the radial sensitivity is exactly cancelled.
+            let coeff = (1.0 - BOUNDARY_EPS) / s;
+            (coeff, -coeff / (nrm * nrm))
+        } else {
+            // Interior: x_hat = phi(s) * v, phi(s) = tanh(s)/s.
+            let phi = tanh_s / s;
+            // phi'(s) = (s * (1 - tanh^2 s) - tanh s) / s^2.
+            let phi_prime = (s * (1.0 - tanh_s * tanh_s) - tanh_s) / (s * s);
+            // ds/dv = sqrt(k) * v / |v|. So dphi/dv = phi'(s) * sqrt(k) / |v| * v.
+            (phi, phi_prime * sqrt_negc / nrm)
+        };
         // x_hat = phi * v ⇒ ∂x/∂v_j = phi δ_{ij} + dphi/dv_j * v_i.
         // grad_v_j = sum_i g_i (phi δ_{ij} + dphi/dv_j v_i)
         //          = phi * g_j + (g·v) * dphi/dv_j.
+        // (The saturated branch substitutes phi = clamped coeff and
+        // dphi_dv_coeff = -coeff/|v|², which is the exact Jacobian of the
+        // radially-pinned forward.)
         let g_dot_v: f64 = (0..d).map(|i| g_row[i] * v_row[i]).sum();
         for j in 0..d {
             grad_v[[b, j]] = phi * g_row[j] + g_dot_v * dphi_dv_coeff * v_row[j];

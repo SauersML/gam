@@ -477,10 +477,25 @@ pub fn generate_rho_candidates(
     }
 
     // Global shrink/expand sweeps from the anchor to probe over/under-smoothing regimes.
+    // The flexible (negative-shift) side MUST be probed as densely as the
+    // over-smoothing side: the seed-screening proxy is a capped-inner-iteration
+    // fit, and an over-smoothed seed converges trivially under that cap (its
+    // coefficients collapse into the penalty null space, the LAML is locally
+    // flat), so screening systematically ranks over-smoothed seeds first
+    // (documented in `rank_seeds_with_screening`). For a GeneralizedLinear /
+    // Survival model whose true optimum is flexible (e.g. a smooth Poisson
+    // tensor surface that genuinely needs ~10 effective df), a seed grid that
+    // only sweeps the over-smoothing side leaves the flexible basin unprobed,
+    // so none of the few full-budget solves ever lands in it and the fit
+    // over-smooths (#1082/#1373). Symmetric negative shifts give the flexible
+    // basin a candidate; the keep-best multi-start then retains it only if it
+    // actually scores better, so this can never worsen a fit — it only lets the
+    // optimizer SEE the lower-λ basin. Over-smoothed seeds remain present (and
+    // earlier in the list) so PIRLS-separation startup stability is unchanged.
     let global_shifts: &[f64] = match config.risk_profile {
         SeedRiskProfile::Gaussian => &[-2.0, 2.0, -4.0, 4.0],
-        SeedRiskProfile::GeneralizedLinear => &[0.0, 2.0, 4.0, -1.0],
-        SeedRiskProfile::Survival => &[0.0, 2.0, 4.0, 6.0],
+        SeedRiskProfile::GeneralizedLinear => &[0.0, 2.0, 4.0, -1.0, -2.0, -4.0],
+        SeedRiskProfile::Survival => &[0.0, 2.0, 4.0, 6.0, -2.0, -4.0],
     };
     for &shift in global_shifts {
         let swept = primary.mapv(|v| clamp_to_bounds(v + shift, bounds));

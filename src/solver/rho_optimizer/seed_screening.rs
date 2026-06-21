@@ -429,6 +429,51 @@ pub(crate) fn rank_seeds_with_screening(
         }
         ordered = interior;
         ordered.extend(boundary);
+
+        // Guarantee the flexible (low-λ) basin one full-budget solve for
+        // non-Gaussian models (#1082/#1373). The screening proxy is a
+        // capped-inner-iteration fit, and an over-smoothed seed converges
+        // trivially under that cap (coefficients collapse into the penalty
+        // null space, LAML locally flat), so the proxy systematically ranks
+        // over-smoothed seeds first — exactly the bias documented for the
+        // boundary case above, but it also crowds out a MODERATELY flexible
+        // seed that is not at the bound (and so survives the demotion). With
+        // only a few full-budget solves, the genuinely flexible basin (e.g. a
+        // smooth Poisson tensor surface that needs ~10 effective df) then
+        // never gets solved and the fit over-smooths. Promote the single
+        // most-flexible interior seed (smallest Σ of the leading rho_dim
+        // coordinates) to the front so it is always among the full solves.
+        // Gaussian REML's profiled-scale basin does not exhibit this bias, so
+        // this is gated to GeneralizedLinear / Survival. Keep-best across the
+        // full-solved seeds means promoting a flexible seed can never worsen
+        // the returned fit — it only lets the optimizer reach the lower-λ
+        // basin; the remaining proxy order is preserved.
+        let non_gaussian = !matches!(
+            config.seed_config.risk_profile,
+            crate::seeding::SeedRiskProfile::Gaussian
+        );
+        if non_gaussian && ordered.len() > 1 {
+            let rho_sum = |seed: &Array1<f64>| -> f64 {
+                (0..rho_dim.min(seed.len())).map(|i| seed[i]).sum()
+            };
+            if let Some((most_flexible_idx, _)) = ordered
+                .iter()
+                .enumerate()
+                .filter(|(_, seed)| !seed_is_oversmoothing_boundary(seed, rho_dim, &upper))
+                .min_by(|(_, a), (_, b)| rho_sum(a).total_cmp(&rho_sum(b)))
+            {
+                if most_flexible_idx != 0 {
+                    let flexible = ordered.remove(most_flexible_idx);
+                    log::info!(
+                        "[OUTER] {context}: promoted the most-flexible interior seed \
+                         (Σρ={:.3}) to the front so the low-λ basin gets a full-budget \
+                         solve (capped screening systematically under-ranks it)",
+                        rho_sum(&flexible),
+                    );
+                    ordered.insert(0, flexible);
+                }
+            }
+        }
     }
 
     log::debug!(
