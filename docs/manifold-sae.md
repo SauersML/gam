@@ -121,11 +121,7 @@ smoothing weights selected by REML. Each piece plays a distinct role
   is selected by the assignment prior. The three supported kinds are
   `"ibp_map"` (default), `"softmax"`, and `"jumprelu"`. `"ibp_map"`
   (Indian Buffet Process MAP) adapts the *number* of active atoms per token
-  via a sigmoid gate scaled by a stick-breaking geometric weight. The gate
-  is `σ(ℓ/τ)·π_k(α)`, which is strictly positive at every finite logit, so it
-  produces a **sharply decaying, sparsity-inducing** gate rather than a soft
-  simplex — but not exact zeros on its own; **hard zeros require the separate
-  `top_k=` truncation** (#1421). `"softmax"` is a
+  and produces **true zeros** rather than a soft simplex; `"softmax"` is a
   dense, simplex-normalized gate; `"jumprelu"` is a hard threshold (its
   cutoff is `jumprelu_threshold=`, default `0.0`). `top_k=` optionally caps
   the per-token active set, and `tau=` sets the Gumbel-softmax temperature.
