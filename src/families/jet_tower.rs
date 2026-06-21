@@ -1205,8 +1205,9 @@ pub fn generic_row_kernel<const K: usize, P: RowNllProgramGeneric<K> + ?Sized>(
     row: usize,
 ) -> Result<(f64, [f64; K], [[f64; K]; K]), String> {
     let base = prog.primaries(row)?;
-    let vars: [super::jet_scalar::Order2<K>; K] =
-        std::array::from_fn(|a| super::jet_scalar::Order2::variable(base[a], a));
+    let vars: [super::jet_scalar::Order2<K>; K] = std::array::from_fn(|a| {
+        <super::jet_scalar::Order2<K> as super::jet_scalar::JetScalar<K>>::variable(base[a], a)
+    });
     let s = prog.row_nll_generic(row, &vars)?;
     Ok((
         super::jet_scalar::JetScalar::value(&s),

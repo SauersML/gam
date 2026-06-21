@@ -1508,7 +1508,9 @@ impl BernoulliMarginalSlopeFamily {
                     // the other sails through.
                     let refused = status
                         .iter()
-                        .filter(|&&s| s != CubicCellMomentStatus::Ok as u8)
+                        .filter(|&&s| {
+                            s != crate::gpu::kernels::cubic_cell::CubicCellMomentStatus::Ok as u8
+                        })
                         .count();
                     if refused > 0 {
                         log::info!(

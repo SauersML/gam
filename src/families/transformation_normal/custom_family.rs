@@ -275,6 +275,7 @@ impl CustomFamily for TransformationNormalFamily {
             screen_max_inner_iterations: 2,
             risk_profile: crate::seeding::SeedRiskProfile::Gaussian,
             num_auxiliary_trailing: 0,
+            over_smoothing_probe_rho: None,
         }
     }
 

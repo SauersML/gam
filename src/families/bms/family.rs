@@ -284,6 +284,11 @@ pub(crate) fn build_score_warp_deviation_block_from_seed(
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BernoulliMarginalLinkMap {
+    /// The marginal linear predictor η this map was expanded about. The q-stack
+    /// `[q, q1, ..]` are the derivatives of `q(·) = Φ⁻¹(Φ(·))` at this η, so the
+    /// generic-jet path (#932 cutover) must seed its axis-0 primary here for the
+    /// composition's expansion point to be honest.
+    pub eta: f64,
     pub mu: f64,
     pub mu1: f64,
     pub mu2: f64,
@@ -327,6 +332,7 @@ pub(crate) fn bernoulli_marginal_link_map(
     })?;
     if raw_mu <= BERNOULLI_LINK_PROBABILITY_EPS || raw_mu >= 1.0 - BERNOULLI_LINK_PROBABILITY_EPS {
         return Ok(BernoulliMarginalLinkMap {
+            eta,
             mu,
             mu1: 0.0,
             mu2: 0.0,
@@ -359,6 +365,7 @@ pub(crate) fn bernoulli_marginal_link_map(
     let q4 = mu4 / phi_q + (q.powi(3) - 3.0 * q) * q1_q + 4.0 * q * q1 * q3 + 3.0 * q * q2 * q2
         - 6.0 * (q * q - 1.0) * q1_sq * q2;
     Ok(BernoulliMarginalLinkMap {
+        eta,
         mu,
         mu1,
         mu2,
@@ -370,6 +377,15 @@ pub(crate) fn bernoulli_marginal_link_map(
         q3,
         q4,
     })
+}
+
+impl BernoulliMarginalLinkMap {
+    /// The marginal linear predictor η this map was expanded about — the seed
+    /// value for the generic-jet path's axis-0 primary.
+    #[inline]
+    pub(crate) fn eta_value(&self) -> f64 {
+        self.eta
+    }
 }
 
 pub(super) fn require_probit_marginal_slope_link(

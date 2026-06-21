@@ -61,6 +61,7 @@ pub(crate) fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedCon
             },
             screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
             num_auxiliary_trailing: 0,
+            over_smoothing_probe_rho: None,
         };
     }
     SeedConfig {
@@ -86,6 +87,7 @@ pub(crate) fn external_reml_seed_config(k: usize, link: LinkFunction) -> SeedCon
         },
         screen_max_inner_iterations: SeedConfig::default().screen_max_inner_iterations,
         num_auxiliary_trailing: 0,
+        over_smoothing_probe_rho: None,
     }
 }
 

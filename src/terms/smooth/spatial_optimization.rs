@@ -7623,6 +7623,9 @@ fn try_exact_joint_latent_coord_optimization(
         // n-scaled profiled-criterion calibration (same absolute-gradient-floor
         // correction as the spatial paths; #1053 / #1066 / #1069).
         Some((data.nrows(), best.design.design.ncols().max(1))),
+        // #1464: widen the over-smoothing ρ ceiling and seed the high-ρ probe
+        // only when a constant-curvature curv() term is present in this fit.
+        !constant_curvature_term_indices(resolvedspec).is_empty(),
     );
 
     let eval_outer = |ctx: &mut &mut LatentJointContext<'_>,
