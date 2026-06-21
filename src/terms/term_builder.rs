@@ -535,20 +535,44 @@ pub fn build_termspec(
                     })? {
                         ColumnKindTag::Categorical => {
                             let levels = encoded_levels_for_column(ds, ColIdx::new(by_col));
-                            let penalized_group_owner_present = terms.iter().any(|other| {
-                                matches!(other, ParsedTerm::RandomEffect { name } if name == &by_name)
+                            // A penalized random block for this factor already
+                            // owns its full level offsets when EITHER an explicit
+                            // `group(factor)` appears, OR a *bare* categorical
+                            // `+ factor` does — the latter is auto-promoted to a
+                            // penalized random-effect block (see the
+                            // `ParsedTerm::Linear` / `ColumnKindTag::Categorical`
+                            // arm above, `penalized: true`). Both representations
+                            // carry the same per-level offsets, so #1457: the
+                            // `by=` branch must NOT additionally add its own
+                            // unpenalized treatment-coded main effect, which would
+                            // double-represent the factor (two `g` design blocks +
+                            // a spurious extra smoothing parameter).
+                            let penalized_group_owner_present = terms.iter().any(|other| match other {
+                                ParsedTerm::RandomEffect { name } => name == &by_name,
+                                ParsedTerm::Linear {
+                                    name,
+                                    explicit: false,
+                                    ..
+                                } if name == &by_name => col_map
+                                    .get(name)
+                                    .and_then(|c| ds.column_kinds.get(*c).copied())
+                                    .map(|kind| matches!(kind, ColumnKindTag::Categorical))
+                                    .unwrap_or(false),
+                                _ => false,
                             });
                             // Add an unpenalized treatment-coded fixed main
                             // effect for a standalone factor-by smooth, unless
                             // the same factor already has an explicit
-                            // `group(factor)` term.  In that mixed-model form
+                            // `group(factor)` term OR a bare categorical `+
+                            // factor` that was auto-promoted to a penalized
+                            // random block (#1457).  In those mixed-model forms
                             // the penalized random intercept is the coherent
                             // owner of level offsets; adding a no-pooling fixed
                             // factor effect would bypass random-effect
                             // shrinkage and degrade BLUP-style predictions.
                             if !random_terms
                                 .iter()
-                                .any(|rt| rt.name == by_name && !rt.penalized)
+                                .any(|rt| rt.name == by_name)
                                 && !penalized_group_owner_present
                             {
                                 random_terms.push(RandomEffectTermSpec {
@@ -4704,6 +4728,109 @@ mod tests {
             };
             assert_eq!(basis_size, k);
         }
+    }
+
+    /// #1457: `y ~ s(x, by=g) + g` with a BARE categorical `g` must NOT lower to
+    /// two `g` design blocks. The bare `+ g` is auto-promoted to a single
+    /// penalized random-effect block owning the factor's full level offsets; the
+    /// `by=` branch must then recognize that owner and skip adding its own
+    /// unpenalized treatment-coded main effect. Before the fix the dedup guard
+    /// recognized only explicit `group(g)` (a `ParsedTerm::RandomEffect`), so the
+    /// auto-promoted bare-`+ g` block slipped past and a spurious second `g`
+    /// block (plus an extra smoothing parameter) was added. Assert exactly ONE
+    /// `g` random/categorical block, and that adding the bare `+ g` introduces no
+    /// extra `g` blocks beyond `y ~ s(x, by=g)` alone.
+    fn factor_dataset_l3() -> Dataset {
+        // `g` is categorical with THREE levels (encoded 0.0/1.0/2.0).
+        let rows = (0..30)
+            .map(|i| {
+                let x = i as f64 / 29.0;
+                let g = (i % 3) as f64;
+                vec![x + g, x, g]
+            })
+            .collect::<Vec<_>>();
+        Dataset {
+            headers: vec!["y".into(), "x".into(), "g".into()],
+            values: Array2::from_shape_vec(
+                (rows.len(), 3),
+                rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+            )
+            .expect("rectangular L=3 factor test data"),
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "y".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "x".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "g".into(),
+                        kind: ColumnKindTag::Categorical,
+                        levels: vec!["a".into(), "b".into(), "c".into()],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Categorical,
+            ],
+        }
+    }
+
+    #[test]
+    fn factor_by_smooth_plus_bare_categorical_does_not_duplicate_factor_block() {
+        let ds = factor_dataset_l3();
+        let col_map = ds.column_map();
+
+        let g_blocks = |formula: &str| -> usize {
+            let parsed = parse_formula(formula).expect("parse by-smooth formula");
+            let mut notes = Vec::new();
+            let terms = build_termspec(
+                &parsed.terms,
+                &ds,
+                &col_map,
+                &mut notes,
+                &ResourcePolicy::default_library(),
+            )
+            .unwrap_or_else(|err| panic!("`{formula}` must build, got: {err:?}"));
+            terms
+                .random_effect_terms
+                .iter()
+                .filter(|rt| rt.name == "g")
+                .count()
+        };
+
+        // Baseline: the standalone factor-by smooth carries exactly ONE `g`
+        // block (the unpenalized treatment-coded factor main effect added by the
+        // `by=` branch).
+        let by_only = g_blocks("y ~ s(x, by=g, k=10)");
+        assert_eq!(
+            by_only, 1,
+            "`y ~ s(x, by=g)` must produce exactly one `g` design block"
+        );
+
+        // The bug: adding a bare `+ g` (auto-promoted to a penalized random
+        // block owning the same level offsets) must NOT introduce a second `g`
+        // block. Before the fix this was 2.
+        let by_plus_bare = g_blocks("y ~ s(x, by=g, k=10) + g");
+        assert_eq!(
+            by_plus_bare, 1,
+            "`y ~ s(x, by=g) + g` must collapse to ONE `g` block (#1457): the bare \
+             `+ g` already owns the factor's level offsets, so the `by=` branch \
+             must not add a second, treatment-coded main effect"
+        );
+
+        // The bare `+ g` adds no spurious extra `g` block versus the baseline.
+        assert_eq!(
+            by_plus_bare, by_only,
+            "the bare `+ g` collision must add zero extra `g` blocks (#1457)"
+        );
     }
 
     #[test]
