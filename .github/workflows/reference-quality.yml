@@ -47,7 +47,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          fetch-depth: 1
+          fetch-depth: 0 # #1458: full history so build.rs author gate resolves real last editor, not HEAD
 
       - name: Free runner disk space
         run: |
