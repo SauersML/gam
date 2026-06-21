@@ -139,6 +139,16 @@ fn main() {
     let mut panic_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
     scan_for_panic_without_safety(&manifest_dir, &manifest_dir, &mut panic_offenders);
 
+    // Silent-corruption laundering (Pattern 1): a banned panic!/contract-guard
+    // in non-test src deleted and replaced by a benign/NaN value at a site whose
+    // own comment says the condition cannot happen. 22 of the last 60 commits.
+    let mut silent_corruption_offenders: Vec<(PathBuf, usize, String)> = Vec::new();
+    scan_for_silent_corruption_laundering(
+        &manifest_dir,
+        &manifest_dir,
+        &mut silent_corruption_offenders,
+    );
+
     // `#[cfg(any())]` is permanently false, `#[cfg(all())]` permanently
     // true. Both are dead-by-construction guards in the same family as
     // `const X: bool = false;`.
@@ -458,6 +468,16 @@ fn main() {
         sections.push(Section {
             title: "mem::transmute without `// SAFETY:` justification".to_string(),
             rows: transmute_offenders
+                .iter()
+                .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
+                .collect(),
+        });
+    }
+
+    if !silent_corruption_offenders.is_empty() {
+        sections.push(Section {
+            title: "silent-corruption laundering: a contract-guard was replaced by a benign/NaN value at a site documented as impossible — restore the hard guard (panic with // SAFETY, or a real error), do NOT emit a corrupting sentinel".to_string(),
+            rows: silent_corruption_offenders
                 .iter()
                 .map(|(r, l, s)| (r.clone(), *l, None, s.clone()))
                 .collect(),
@@ -1920,6 +1940,205 @@ fn scan_for_transmute_without_safety(
 /// history audit still treats any panic-shape in a former-marker body as
 /// trivial, regardless of SAFETY comments — this softening applies only
 /// to the lexical scanner.
+/// Bans "silent-corruption laundering": a banned `panic!`/contract-guard in
+/// non-test src deleted and replaced by a benign or NaN value at a site whose
+/// own comment documents the condition as impossible. This is the
+/// most-recurring evasion (Pattern 1): the hard guard that would have caught a
+/// real invariant violation is swapped for `f64::NAN` / `0.0` / `Ok(())` /
+/// `None` / `Default::default()` / `Array*::zeros` / an all-zero tuple, so the
+/// corruption flows downstream silently instead of aborting.
+///
+/// Two precise, low-false-positive rules, both non-test src/ only:
+///   (A) `f64::NAN` (incl. `core::`/`std::` paths) EMITTED AS A VALUE — a
+///       match-arm body `=> f64::NAN`, a `return f64::NAN`, or a `f64::NAN`
+///       appearing inside a tuple/array literal `(f64::NAN, ...)` / trailing
+///       `f64::NAN,`. Comparisons (`.is_nan()`, `!= f64::NAN`) and a NaN used
+///       only as a provably-overwritten initial sentinel are NOT matched —
+///       only the value-emission forms above.
+///   (B) a benign-literal-only body (`0.0` / `Ok(())` / `None` /
+///       `Default::default()` / `Array*::zeros` / an all-zero tuple) appearing
+///       within ~6 lines AFTER a comment carrying a contract/impossibility
+///       token. "Comment says impossible" + "body returns a benign default" is
+///       the laundering signature.
+///
+/// All match tokens are assembled from string fragments so build.rs never
+/// self-trips on its own description.
+fn scan_for_silent_corruption_laundering(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
+    // Tokens assembled from fragments so this scanner never flags its own
+    // source (build.rs is skipped anyway, but keep the invariant explicit).
+    let nan_lit = format!("f64::{}", "NAN");
+    let nan_core = format!("core::f64::{}", "NAN");
+    let nan_std = format!("std::f64::{}", "NAN");
+    let is_nan = format!(".is_{}()", "nan");
+
+    // Contract / impossibility comment tokens, lowercased for matching.
+    // NOTE: the bare token "safety" is deliberately EXCLUDED. Every `unsafe`
+    // block carries a `// SAFETY:` justification, and a normal `Ok(())` /
+    // `f64::NAN` success/return a few lines below that justification is NOT
+    // laundering. We require an explicit *impossibility* claim — the strong
+    // tokens below — which is the actual laundering signature (e.g. bessel's
+    // "silently corrupt", arrow_schur's "unreachable"). Tokens are assembled
+    // from fragments so this scanner never self-trips.
+    // Only explicit IMPOSSIBILITY-ASSERTION phrases — a comment that documents
+    // the path as one that cannot legitimately execute. Broad doc words like
+    // "safety", "contract", and "invariant" are deliberately excluded: they
+    // appear in routine math/`unsafe` commentary next to perfectly normal
+    // returns and would flood the queue with false positives. The phrases below
+    // are the ones whose adjacency to a benign/NaN body IS the laundering tell
+    // (bessel's "silently corrupt", arrow_schur's "unreachable", evidence's
+    // "impossible"). All assembled from fragments so this scanner never
+    // self-trips on its own source.
+    let contract_tokens: Vec<String> = vec![
+        format!("{}", "unreachable"),
+        format!("{}", "impossible"),
+        format!("{} {}", "silently", "corrupt"),
+        format!("{} {}", "programming", "error"),
+        format!("{} {}", "must", "override"),
+        format!("{} {}", "cannot", "happen"),
+        format!("{} {}", "can not", "happen"),
+        format!("{} {}", "should", "never"),
+        format!("{} {}", "shall", "never"),
+        format!("{} {}", "never", "reached"),
+        format!("{} {}", "never", "happen"),
+        format!("{} {}", "never", "occur"),
+    ];
+
+    // Benign-default body fragments (rule B).
+    let benign_okunit = format!("{}(())", "Ok");
+    let benign_none = "None".to_string();
+    let benign_default = format!("{}::default()", "Default");
+
+    visit_files(root, dir, &mut |rel, content| {
+        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        if rel_str == "build.rs" {
+            return;
+        }
+        if rel.extension().and_then(OsStr::to_str) != Some("rs") {
+            return;
+        }
+        let has_nan = content.contains(&nan_lit);
+        let lower_all = content.to_lowercase();
+        let has_contract = contract_tokens.iter().any(|t| lower_all.contains(t));
+        if !has_nan && !has_contract {
+            return;
+        }
+
+        let mask = compute_test_mask(content, rel);
+        let lines: Vec<&str> = content.lines().collect();
+        let stripped_lines = strip_file_lines(content);
+
+        for (idx, line) in lines.iter().enumerate() {
+            if mask.get(idx).copied().unwrap_or(false) {
+                continue;
+            }
+            let stripped = stripped_lines.get(idx).map(String::as_str).unwrap_or(line);
+            let strimmed = stripped.trim();
+
+            // The laundering SIGNATURE is "comment says this cannot happen" +
+            // "body emits a corrupting sentinel". Both rules below require a
+            // contract/impossibility comment within ~6 preceding lines — a bare
+            // `f64::NAN`/`0.0` return on its own is a legitimate numeric
+            // convention (out-of-domain, diagnostic display); it only becomes
+            // laundering when the adjacent comment documents the path as
+            // impossible. Scan the RAW preceding lines (comments intact,
+            // lowercased), requiring an actual `//` comment line.
+            let mut found_contract_comment = false;
+            let lo = idx.saturating_sub(6);
+            for raw in lines.iter().take(idx).skip(lo) {
+                if !raw.contains("//") {
+                    continue;
+                }
+                let raw_lower = raw.to_lowercase();
+                if contract_tokens.iter().any(|t| raw_lower.contains(t)) {
+                    found_contract_comment = true;
+                    break;
+                }
+            }
+            if !found_contract_comment {
+                continue;
+            }
+
+            // Normalize the body: drop a single leading `return ` / `=> `
+            // (value-emission contexts) and a trailing `;` or `,`.
+            let mut emit_ctx = false;
+            let mut body = strimmed.to_string();
+            if let Some(rest) = body.strip_prefix("return ") {
+                emit_ctx = true;
+                body = rest.to_string();
+            }
+            if let Some(rest) = body.strip_prefix("=> ") {
+                emit_ctx = true;
+                body = rest.to_string();
+            }
+            let body = body.trim().trim_end_matches([';', ',']).trim();
+
+            // ---- Rule (A): NaN emitted as a value at an impossible site ----
+            // Only the value-emission forms — NOT a call/constructor argument
+            // (`unwrap_or(NAN)`, `from_elem(.., NAN)`, `set_item("k", NAN)`,
+            // `fill(NAN)`): a literal tuple/array/return body is the WHOLE
+            // expression of the (de-`return`-ed) line, never nested in `foo(`.
+            let is_comparison = strimmed.contains(&is_nan)
+                || strimmed.contains("!= ")
+                || strimmed.contains("== ")
+                || strimmed.contains(".partial_cmp")
+                || strimmed.contains("matches!");
+            let bare_nan = body == nan_lit || body == nan_core || body == nan_std;
+            let is_nan_aggregate = {
+                let open = body.starts_with('(') || body.starts_with('[');
+                let closed = body.ends_with(')') || body.ends_with(']');
+                if open && closed && body.len() >= 2 {
+                    let inner = &body[1..body.len() - 1];
+                    let inner_main = inner.split(';').next().unwrap_or(inner);
+                    !inner_main.trim().is_empty()
+                        && inner_main.split(',').all(|p| {
+                            let p = p.trim();
+                            p == nan_lit
+                                || p == nan_core
+                                || p == nan_std
+                                || p == "0.0"
+                                || p == "None"
+                        })
+                        && (inner_main.contains(&nan_lit)
+                            || inner_main.contains(&nan_core)
+                            || inner_main.contains(&nan_std))
+                } else {
+                    false
+                }
+            };
+            let _ = emit_ctx;
+            if (bare_nan || is_nan_aggregate) && !is_comparison {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+                continue;
+            }
+
+            // ---- Rule (B): benign default body at an impossible site ----
+            let is_zero_float = body == "0.0" || body == "0.0_f64" || body == "0f64";
+            let is_okunit = body == benign_okunit;
+            let is_none = body == benign_none;
+            let is_default = body == benign_default;
+            let is_zeros =
+                (body.starts_with("Array") && body.contains("::zeros")) || body.ends_with("::zeros()");
+            let is_zero_tuple = body.starts_with('(') && body.ends_with(')') && {
+                let inner = &body[1..body.len() - 1];
+                !inner.is_empty()
+                    && inner.split(',').all(|p| {
+                        let p = p.trim();
+                        p == "0.0" || p == "0.0_f64" || p == "0f64"
+                    })
+            };
+            let body_is_benign =
+                is_zero_float || is_okunit || is_none || is_default || is_zeros || is_zero_tuple;
+            if body_is_benign {
+                offenders.push((rel.to_path_buf(), idx + 1, line.to_string()));
+            }
+        }
+    });
+}
+
 fn scan_for_panic_without_safety(
     root: &Path,
     dir: &Path,
