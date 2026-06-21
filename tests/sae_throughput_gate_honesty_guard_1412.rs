@@ -83,3 +83,57 @@ fn throughput_gate_floor_is_k_scaled_not_a_trivial_constant() {
          K_SMALL/K_LARGE, not pinned to a separate constant"
     );
 }
+
+/// (4) The K=64 floor constant must not be silently lowered back toward the
+/// trivially-passing regime the issue called out (the old K=1024 floor was
+/// 2000·64/1024 = 125 rows/sec). Parse the literal and require it to stay at a
+/// real, non-trivial magnitude, so a future edit cannot quietly weaken the gate
+/// by dropping the constant.
+#[test]
+fn throughput_gate_floor_magnitude_is_not_trivially_weakened() {
+    let line = BENCH_SRC
+        .lines()
+        .find(|l| l.contains("CPU_THROUGHPUT_FLOOR_K64_ROWS_PER_SEC") && l.contains('='))
+        .expect("#1412: K=64 floor constant declaration must exist");
+    let rhs = line
+        .split('=')
+        .nth(1)
+        .expect("constant has an initializer")
+        .trim()
+        .trim_end_matches(';')
+        .replace('_', "");
+    let value: f64 = rhs
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("#1412: could not parse K=64 floor literal from `{line}`"));
+    // The K=64 floor must stay well above the trivial 125 rows/sec the issue
+    // flagged; 1000 is a generous lower bound that still rejects a silent
+    // collapse back to a no-op gate.
+    assert!(
+        value >= 1000.0,
+        "#1412: K=64 CPU throughput floor ({value}) was lowered toward the \
+         trivially-passing regime — the gate must demand a real per-row rate"
+    );
+}
+
+/// (5) The decision gate must actually EXERCISE both dictionary sizes (K=64 and
+/// K=1024). The issue noted the test demonstrated nothing about scaling; running
+/// both endpoints is what makes the K-scaled floor meaningful (the K=1024 run is
+/// the one a naive dense factorization fails). Pin that both are run.
+#[test]
+fn throughput_gate_exercises_both_dictionary_sizes() {
+    assert!(
+        BENCH_SRC.contains("const K_SMALL: usize = 64;"),
+        "#1412: K=64 endpoint removed from the gate"
+    );
+    assert!(
+        BENCH_SRC.contains("const K_LARGE: usize = 1024;"),
+        "#1412: K=1024 endpoint removed from the gate (the K-scaling evidence)"
+    );
+    // Both endpoints must feed assertions, not just be declared. floor_small and
+    // floor_large are the two gated quantities.
+    assert!(
+        BENCH_SRC.contains("floor_small") && BENCH_SRC.contains("floor_large"),
+        "#1412: both K endpoints must be gated (floor_small AND floor_large)"
+    );
+}
