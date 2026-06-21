@@ -561,7 +561,18 @@ impl DeviceResidentArrowWorkspace {
             let trial_objective =
                 self.objective_at(&base, half_target_energy, &trial_t, &trial_beta);
 
-            let objective_scale = current_objective.abs().max(1.0);
+            // Trust-region gain-ratio noise floor keyed to the objective's own
+            // magnitude, mirroring the production `LatentInnerSolver` (#1127): the
+            // floor must be equivariant under a response rescaling `y → a·y` (the
+            // penalized objective and both reductions scale as `O(a²)`). The
+            // previous `.max(1.0)` absolute floor broke this — near a converged
+            // iterate it pinned the floor at `1e-14` while a genuine refining
+            // step's `predicted_reduction` was `O(a²)`, misclassifying the real
+            // step as numerical noise and stalling the inner solve at a
+            // non-stationary point. A perfectly converged objective
+            // (`current_objective == 0`) yields a `0` floor, so the
+            // `predicted_reduction > 0` branch still governs and no step is lost.
+            let objective_scale = current_objective.abs();
             let noise_floor = objective_scale * 1e-14;
             let actual_reduction = current_objective - trial_objective;
             let rho = if predicted_reduction > noise_floor {
