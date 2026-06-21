@@ -1789,25 +1789,12 @@ def test_duchon_basis_hybrid_high_d_builds(d: int) -> None:
     assert np.all(np.isfinite(basis)), "hybrid Duchon basis has non-finite entries"
 
 
-@pytest.mark.parametrize(
-    "d",
-    [
-        8,
-        pytest.param(
-            16,
-            marks=pytest.mark.xfail(
-                reason="High-d hybrid (Matern-blended) Duchon penalty is not yet "
-                "PSD at d=16: the pure-spectrum order resolves to spectral power "
-                "s=7, and the partial-fraction Matern blend at that order loses "
-                "positive-definiteness numerically (min eigenvalue ~ -0.26, well "
-                "beyond float noise). d=8 (s=3) is fine. This is a distinct "
-                "high-d Matern-blend numerics limitation, separate from the "
-                "non-periodic order-policy fix in gam#880.",
-                strict=False,
-            ),
-        ),
-    ],
-)
+# gam#1424: the d=16 (s=7) hybrid case is now genuinely PSD. The kernel is
+# evaluated with the cancellation-free single-integral form
+# (`duchon_hybrid_kernel_stable_integral`) instead of the alternating
+# partial-fraction sum that previously collapsed to the float noise floor
+# (λ_min ≈ −0.26). The xfail marker is removed accordingly.
+@pytest.mark.parametrize("d", [8, 16])
 def test_duchon_function_norm_penalty_hybrid_high_d_psd(d: int) -> None:
     """Hybrid function-norm penalty at high d builds + symmetric PSD."""
     rng = np.random.default_rng(11 + d)
