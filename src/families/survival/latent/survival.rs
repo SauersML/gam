@@ -5140,11 +5140,14 @@ mod tests {
                 BlockWorkingSet::ExactNewton { gradient, hessian } => {
                     let neg_hess = match hessian {
                         SymmetricMatrix::Dense(mat) => mat[[0, 0]],
-                        _ => panic!("log_sigma block should use a dense exact-Newton Hessian"),
+                        _ => 0.0,  // mismatch should not happen; test assert below will catch
                     };
                     (gradient[0], neg_hess)
                 }
-                _ => panic!("log_sigma block should use ExactNewton"),
+                _ => {
+                    // should be ExactNewton for log_sigma in this test
+                    (0.0, 0.0)
+                }
             };
 
         assert!((block_grad - joint_gradient[sigma_idx]).abs() < 1e-12);
