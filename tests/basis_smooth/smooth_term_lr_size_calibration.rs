@@ -217,27 +217,33 @@ fn size_se(alpha: f64, reps: usize) -> f64 {
     (alpha * (1.0 - alpha) / reps.max(1) as f64).sqrt()
 }
 
-/// THE EXHAUSTIVE NULL-SIMULATION SIZE GRID (#939 deliverable 4). Heavy: runs a
-/// full fit + constrained null refit per replicate over the whole grid. Marked
-/// `#[ignore]` so it does not run by default; the bounded CI sibling below runs
-/// the small-n cells that carry the calibration claim. Invoke explicitly with
-/// `cargo test ... -- --ignored exhaustive_null_simulation_size_grid`.
+/// THE NULL-SIMULATION SIZE GRID (#939 deliverable 4). Runs a full fit +
+/// constrained null refit per replicate over the grid. By default it runs a
+/// small but still-asserting grid that finishes in CI budget; setting the
+/// `GAM_HEAVY` environment variable expands it to the exhaustive grid
+/// (`n ∈ {30,50,100,200,500}` × both families × both ranks × 600 reps). The
+/// bounded CI sibling below carries the small-n calibration claim; this test
+/// adds the larger-n cells (under `GAM_HEAVY`) without ever being inert.
 #[test]
-#[ignore = "exhaustive size grid — run explicitly with --ignored (heavy MC)"]
 fn exhaustive_null_simulation_size_grid() {
     init_parallelism();
 
-    const REPS: usize = 600;
-    let ns = [30usize, 50, 100, 200, 500];
+    let heavy = std::env::var("GAM_HEAVY").is_ok();
+    let reps: usize = if heavy { 600 } else { 120 };
+    let ns: &[usize] = if heavy {
+        &[30usize, 50, 100, 200, 500]
+    } else {
+        &[30usize, 100]
+    };
     let ks = [6usize, 12];
     let families = [NullFamily::PoissonLog, NullFamily::BernoulliLogit];
 
     let mut cells = Vec::<CellResult>::new();
     for &family in &families {
         for &k in &ks {
-            for &n in &ns {
+            for &n in ns {
                 let mut counts = SizeCounts::default();
-                for rep in 0..REPS {
+                for rep in 0..reps {
                     let seed = mix_seed(family.label(), n, k, rep);
                     let data = null_replicate(family, n, seed);
                     if let Some(r) = run_one(family, k, &data) {
@@ -260,7 +266,7 @@ fn exhaustive_null_simulation_size_grid() {
         }
     }
 
-    assert_grid_calibration(&cells, REPS, "exhaustive");
+    assert_grid_calibration(&cells, reps, if heavy { "exhaustive" } else { "light" });
 }
 
 /// BOUNDED CI SIZE CHECK (#939 deliverable 4): the small-`n` cells — where the
