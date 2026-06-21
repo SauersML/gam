@@ -146,7 +146,7 @@ fn duchon_smooth_is_rotation_invariant() {
     // original surface value at the un-rotated point.
     let mut worst_pred = 0.0_f64;
     let mut worst_edf = 0.0_f64;
-    for theta in [0.3_f64, 0.7854, 1.5] {
+    for theta in [0.3_f64, std::f64::consts::FRAC_PI_4, 1.5] {
         let (c, sn) = (theta.cos(), theta.sin());
         let rot = |x: f64, z: f64| {
             let (dx, dz) = (x - cx, z - cz);
