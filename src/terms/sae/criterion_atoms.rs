@@ -27,11 +27,21 @@
 //!
 //! ```text
 //!   dV/dρ = explicit               (∂/∂ρ of the data-fit+priors value)
-//!         + logdet_trace           (½·tr(H⁻¹ ∂H/∂ρ))
+//!         + logdet_trace           (½·tr(B⁻¹ ∂B/∂ρ))
 //!         + occam_deriv            (−∂occam/∂ρ)
-//!         + implicit_correction    (−½·Γᵀ H⁻¹ ∂g/∂ρ, the envelope/IFT term
+//!         + implicit_correction    (−½·Γᵀ A⁻¹ ∂g/∂ρ, the envelope/IFT term
 //!                                   that accounts for θ̂(ρ) moving — #1006's Γ).
 //! ```
+//!
+//! #1418: the criterion's Laplace curvature term is `½log|B|`, where `B` is the
+//! curvature the inner solve factors (Gauss-Newton data curvature, softmax
+//! Fisher metric, `max(V'',0)` ARD majorizers), so `Γ = ½tr(B⁻¹ ∂B/∂ρ)` and
+//! `logdet_trace` contract `B`. But the implicit step `θ̂_ρ = −A⁻¹ g_ρ` is
+//! governed by the EXACT stationarity Jacobian `A = ∇²_θθ L` (with residual
+//! curvature, exact softmax entropy Hessian, exact periodic ARD curvature), NOT
+//! the surrogate `B`. The implicit correction therefore solves against `A`
+//! (`SaeManifoldTerm::solve_exact_stationarity`, a B⁻¹-preconditioned Neumann
+//! fixed point on `A = B + ΔC`), so the correction is not biased by `B⁻¹ − A⁻¹`.
 //!
 //! # The atoms
 //!
