@@ -38,11 +38,11 @@ use ndarray::{Array1, Array2};
 /// smaller default. Setting `GAM_HEAVY` restores the full n=2000 used on the
 /// cluster.
 fn n_obs() -> usize {
-    if false {
-        2000
-    } else {
-        600
-    }
+    // Fixed CI-affordable size. The curvature signal is identified by the chart
+    // GEOMETRY (radius, noise_sd), not the row count, so the sign-recovery /
+    // flatness asserts hold at this n. A cluster-scale n=2000 sweep is a separate
+    // MSI artifact, not an env/cfg branch inside the test.
+    600
 }
 
 // --- deterministic RNG (splitmix64 → unit / gaussian), no external deps ------

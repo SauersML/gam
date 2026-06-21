@@ -139,13 +139,9 @@ fn fit_options(skip_rho_posterior_inference: bool) -> FitOptions {
 fn gaussian_duchon_rho_posterior_inference_is_not_quadratic_in_n() {
     gam::init_parallelism();
     // The point-estimate invariance asserts below hold at any n; the wall-clock
-    // budget is the per-leapfrog overhead gate. Default to a CI-affordable n;
-    // `GAM_HEAVY` restores the full n=2000 used on the cluster.
-    let n = if false {
-        2000
-    } else {
-        800
-    };
+    // budget is the per-leapfrog overhead gate. Fixed CI-affordable n; a
+    // cluster-scale n=2000 run is a separate MSI artifact, not an env/cfg branch.
+    let n = 800;
     let centers = 10;
     let (data, y) = simulate(n);
     let spec = TermCollectionSpec {

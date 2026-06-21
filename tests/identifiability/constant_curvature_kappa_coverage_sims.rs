@@ -168,16 +168,12 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
 
 /// Number of replicate datasets per arm. Small (CI cost) but enough to expose a
 /// badly-biased estimator or a grossly mis-covering CI; bars are binomial-aware.
-/// The default is CI-affordable (a handful of profiled κ fits); setting the
-/// `GAM_HEAVY` environment variable runs the larger replicate count. The pass
-/// bars below are expressed as functions of `R` ("at most one miss", "minority
-/// rejects") so they stay genuine, un-weakened assertions at either count.
+/// Fixed CI-affordable count: the pass bars below are expressed as functions of
+/// `R` ("at most one miss", "minority rejects"), so they stay genuine,
+/// un-weakened assertions at this count. A larger cluster-scale replicate sweep
+/// is a separate MSI artifact, not an env/cfg branch here.
 fn replicate_count() -> usize {
-    if false {
-        5
-    } else {
-        3
-    }
+    3
 }
 
 /// CI COVERAGE + κ̂ RECOVERY on CURVED truth. Across `R` independent M_κ
