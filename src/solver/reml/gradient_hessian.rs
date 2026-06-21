@@ -504,10 +504,69 @@ impl<'a> RemlState<'a> {
         penalty_subspace: Option<&PenaltySubspace>,
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
+        free_basis: Option<&Array2<f64>>,
     ) -> Result<(usize, super::reml_outer_engine::PenaltyLogdetDerivs), EstimationError> {
         let logdet_s_start = std::time::Instant::now();
         let lambdas = rho.mapv(f64::exp);
         let ridge = ridge_passport.penalty_logdet_ridge();
+
+        // Active-constraint projection consistency (#1380). When an active
+        // shape/box constraint reduces the smooth to a constraint-free subspace
+        // `Z` (columns = `null(A_active)`), the LAML cost's `½(log|H| − log|S|₊)`
+        // pair must be evaluated on ONE common subspace. The Hessian side is
+        // already projected (`h_for_operator = ZᵀHZ`, see `build_dense_assembly`),
+        // but the penalty side below is assembled from the FULL-width canonical
+        // penalties `Σ λ_k S_k` (rank/value/derivatives over the unprojected
+        // p-space). That mismatch makes `log|S|₊` grow like `(rank_full/2)·Σρ`
+        // while the projected `log|H|` grows only like `(dim(Z)/2)·Σρ`, so the
+        // pair `½(log|H| − log|S|₊) → −((rank_full − dim Z)/2)·Σρ` decreases
+        // without bound as λ → ∞ — the REML objective then rails λ to its
+        // ceiling and the convex/concave smooth collapses to the flat linear
+        // corner (EDF pinned, R² ≈ 0) even on a clean convex signal an
+        // unconstrained `s(x)` recovers at R² ≈ 0.99.
+        //
+        // Fix: when `Z` is active, project each per-component penalty root onto
+        // `Z` (`R_k ← R_k·Z`, so `S_k ↦ Zᵀ S_k Z`) and form the penalty logdet,
+        // rank, and exact ρ-derivatives from the SAME projected components. Both
+        // halves of the LAML pair then live in `range(Z)`; `log|S|₊` and
+        // `log|H|` grow at the matched rate and the objective regains the proper
+        // interior minimum in λ. The unconstrained / no-active-constraint path
+        // (`free_basis = None`) is byte-for-byte unchanged.
+        if let Some(z) = free_basis
+            && !self.canonical_penalties.is_empty()
+            && self.canonical_penalties.len() == rho.len()
+        {
+            let projected_roots: Vec<Array2<f64>> = self
+                .canonical_penalties
+                .iter()
+                .map(|penalty| penalty.full_width_root().dot(z))
+                .collect();
+            let (value, penalty_rank, det1, det2_full) = self
+                .structural_penalty_logdet_value_and_derivatives(
+                    &projected_roots,
+                    &lambdas,
+                    ridge,
+                )?;
+            log::info!(
+                "[STAGE] logdet S (Z-projected) rho_dim={} penalty_rank={} elapsed={:.3}s",
+                rho.len(),
+                penalty_rank,
+                logdet_s_start.elapsed().as_secs_f64(),
+            );
+            let det2 = if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
+                Some(det2_full)
+            } else {
+                None
+            };
+            return Ok((
+                penalty_rank,
+                super::reml_outer_engine::PenaltyLogdetDerivs {
+                    value,
+                    first: det1,
+                    second: det2,
+                },
+            ));
+        }
         // Value, rank, and ρ-derivatives of `log|Σ λ_k S_k|₊` ALL come from one
         // [`PenaltyPseudologdet`] (one eigendecomposition, one positive
         // eigenspace) so the analytic gradient differentiates exactly the value

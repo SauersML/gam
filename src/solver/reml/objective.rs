@@ -1084,6 +1084,7 @@ impl<'a> RemlState<'a> {
             penalty_subspace.as_ref(),
             bundle,
             mode,
+            free_basis_opt.as_ref(),
         )?;
 
         let beta = if let Some(z) = free_basis_opt.as_ref() {
@@ -1475,6 +1476,9 @@ impl<'a> RemlState<'a> {
             penalty_subspace.as_ref(),
             bundle,
             mode,
+            // Original-basis assembly is only used when there are no active
+            // constraints, so no constraint-free projection applies here.
+            None,
         )?;
 
         let nullspace_dim = beta.len().saturating_sub(penalty_rank) as f64;
