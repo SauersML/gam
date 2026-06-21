@@ -5427,15 +5427,20 @@ fn cosmetic_dodge_blob_at(manifest_dir: &Path, treeish: &str, rel: &str) -> Opti
 /// owed work is gone, but no code changed, so the work itself was never done —
 /// only the wording was laundered to satisfy the prose ban.
 ///
-/// FALSE-POSITIVE control. A commit is flagged ONLY when BOTH hold:
+/// FALSE-POSITIVE control + FORWARD PATH. A commit is flagged ONLY when ALL hold:
 ///   (a) a removed `//`-comment line carried an owed-work phrase AND that exact
-///       signal is gone from the after-blob (removed or reworded away); and
+///       signal is gone from the after-blob (removed or reworded away);
 ///   (b) `normalized_file_code_without_comments(before) ==
-///       normalized_file_code_without_comments(after)` — the stripped code is
-///       byte-identical.
+///       normalized_file_code_without_comments(after)` — the dodge commit itself
+///       changed no code; and
+///   (c) the file's comment-stripped code in the CURRENT tree is STILL identical
+///       to the pre-dodge state — the owed work has not since been done.
 /// Honest doc edits that don't touch an owed-work phrase never satisfy (a); any
-/// commit that changes real code never satisfies (b). Both arms must fire, so an
-/// ordinary documentation improvement and a genuine repair are both immune.
+/// commit that changes real code never satisfies (b). Crucially, (c) makes the
+/// gate forward-actionable instead of a catch-22: because it keys on the current
+/// tree rather than the frozen historical diff, doing the real work in the file
+/// (a genuine code change) clears it, while rewording never can. The owed work
+/// thus cannot be deferred away — but the one and only way out is to do it.
 fn run_cosmetic_wording_dodge_audit(
     manifest_dir: &Path,
     violations: &mut Vec<(PathBuf, usize, String, String)>,
@@ -5520,18 +5525,42 @@ fn run_cosmetic_wording_dodge_audit(
                 continue;
             }
 
-            // (b) comment-stripped code is byte-identical — no real work landed.
+            // (b) the dodge commit itself changed no code — its comment-stripped
+            // before/after are byte-identical, confirming it was a pure wording
+            // dodge and not a genuine repair that also tidied prose.
             if normalized_file_code_without_comments(&before)
                 != normalized_file_code_without_comments(&after)
             {
                 continue;
             }
 
+            // (c) FORWARD PATH (anchored on the CURRENT tree, not the frozen
+            // historical diff). Fire ONLY while the owed work is still undone —
+            // i.e. the file's comment-stripped code is STILL byte-identical to the
+            // pre-dodge state. The instant a genuine code change lands here (the
+            // deferred work actually done), this clears on its own. That is the
+            // ONLY exit and it is the one we want: rewording is still caught by
+            // (a)/(b), restoring the banned note is still caught by the prose ban,
+            // and only a real implementation releases the gate — so the work
+            // cannot be deferred, but doing it is never a catch-22. Reads the
+            // working-tree file so in-progress work unblocks the build; a deleted
+            // file means the deferred code path is gone, which also resolves it.
+            let current = match fs::read_to_string(manifest_dir.join(&rel)) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            if normalized_file_code_without_comments(&current)
+                != normalized_file_code_without_comments(&before)
+            {
+                continue;
+            }
+
             let reason = format!(
-                "cosmetic wording dodge: an owed-work/deferral note was reworded or deleted but \
-                 no code changed (file {rel}, commit {short}) — the work was NOT done, only the \
-                 wording. Do the real work or restore the honest note; rewording to satisfy \
-                 build.rs is banned.",
+                "cosmetic wording dodge: an owed-work/deferral note was reworded or deleted with \
+                 no code change (file {rel}, commit {short}) AND the file's code is STILL \
+                 unchanged from the pre-dodge state — the work was NOT done, only the wording. \
+                 Do the real work in this file: a genuine code change here releases this gate. \
+                 Rewording the note or restoring the banned phrasing does NOT.",
                 short = &sha[..sha.len().min(9)],
             );
             violations.push((
