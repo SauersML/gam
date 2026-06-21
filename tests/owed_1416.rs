@@ -1,4 +1,4 @@
-//! Owed-work regression for #1416 — IBP log-determinant derivatives must
+//! Owed-work regression for #1416 — the IBP log-determinant ρ-trace must
 //! contract the FULL cross-row off-diagonal of the rank-one Woodbury source,
 //! not only the diagonal.
 //!
@@ -13,127 +13,257 @@
 //! where `J_i = ∂z_i/∂ℓ_i` (`z_jac`), `d = ∂s/∂M` (`cross_row_d`) is the scalar
 //! coefficient of the per-column rank-one block, and the empirical mass
 //! `M_k = Σ_i z_ik` couples EVERY row pair `(i, j)`. The solver installs the
-//! full rank-one `d·J Jᵀ` via Woodbury (`H_full = H₀' + U D Uᵀ`), so for fixed
-//! alpha the entire IBP prior scales with `λ = eᵖ` and the correct direct
-//! log-det contribution is the FULL trace
+//! full rank-one `d·J Jᵀ` via Woodbury, so for fixed alpha the entire IBP prior
+//! scales with `λ_sparse = eᵖ` and the correct direct log-det contribution to
+//! the outer-ρ gradient is the FULL trace `½ tr(H⁻¹ ∂H_p/∂ρ_sparse)` — diagonal
+//! AND the off-diagonal rank-one cross terms
+//! `½ d Σ_{i≠j}(H⁻¹)_{ij} J_i J_j`. The pre-fix non-softmax ρ-trace branch
+//! contracted only the diagonal, dropping those cross terms.
 //!
-//! ```text
-//!   ½ tr(H⁻¹ H_p).
-//! ```
+//! ## What this test pins — against the REAL production trace
 //!
-//! The pre-fix non-softmax ρ-trace branch contracted only the diagonal,
-//! `½ Σ_i (H⁻¹)_ii (H_p)_ii`, dropping the off-diagonal rank-one cross terms
+//! The production cross-row contraction lives on
+//! `SaeManifoldTerm::assignment_log_strength_hessian_trace` (a `pub(crate)` fn,
+//! not reachable from an external integration test). Rather than re-derive a
+//! 2×2 trace identity in the test — which would be a TAUTOLOGY that passes even
+//! if the production trace dropped the off-diagonal — this test drives the FULL
+//! production outer-ρ gradient via the PUBLIC
+//! `analytic_outer_rho_gradient_at_converged` on a fixed-α IBP-MAP SAE term and
+//! pins it against a CENTERED FINITE DIFFERENCE of the actual re-solved REML
+//! criterion. Coordinate 0 (`log_lambda_sparse`) drives the IBP prior strength,
+//! so its analytic gradient IS the `½ ∂log|H|/∂ρ_sparse` cross-row trace; the FD
+//! re-solves the inner problem at each perturbed ρ, so it carries the TRUE full
+//! trace (diagonal + cross-row off-diagonal). A diagonal-only contraction (the
+//! #1416 bug) makes coord 0 disagree with this FD and fails.
 //!
-//! ```text
-//!   ½ Σ_{i≠j}(H⁻¹)_{ij}(H_p)_{ji} = ½ d Σ_{i≠j}(H⁻¹)_{ij} J_i J_j.
-//! ```
+//! The fixture deliberately activates a genuine cross-row Woodbury source: a
+//! fixed-α IBP-MAP gate with both atoms live so the empirical mass `M_k` couples
+//! rows and `cross_row_d ≠ 0`. A vacuity guard asserts the fixture is not
+//! degenerately well-fit (so the trace term is non-negligible).
 //!
-//! ## What this test pins
+//! This complements the in-crate dense-FD guard
+//! `terms::sae::manifold::tests::ibp_rho_sparse_logdet_trace_matches_dense_fd_1416`
+//! (which exercises `assignment_log_strength_hessian_trace` directly through the
+//! crate-internal fixture) with a standalone gate depending only on the public
+//! crate API.
 //!
-//! Using only the PUBLIC IBP channel API (`hessian_diag_logit_third_channels`),
-//! it builds a small two-row, one-column interior column whose cross-row
-//! coefficient `d` and per-row Jacobians `J_i` are genuinely nonzero, picks an
-//! explicit SPD `H` over that column's two row slots, and asserts:
-//!
-//!   1. the full `½ tr(H⁻¹ H_p)` equals the diagonal-only contraction PLUS the
-//!      boxed cross-row term `½ d Σ_{i≠j}(H⁻¹)_{ij} J_i J_j`, computed directly
-//!      from `(H⁻¹)_{ij}`, `d`, and `J`; and
-//!   2. that omitted cross-row term is non-negligible, so a diagonal-only
-//!      contraction (the original bug) would be measurably wrong.
-//!
-//! This is the standalone, dense ground-truth complement to the in-crate
-//! fixed-state finite-difference tests
-//! (`ibp_rho_sparse_logdet_trace_matches_dense_fd_1416` and the cross-row
-//! channel FD tests in `terms/analytic_penalties/tests.rs`), which exercise the
-//! same channels through the real `assignment_log_strength_hessian_trace` and
-//! θ-adjoint paths.
+//! No `let _`, no `#[allow(...)]`, no env vars, no `#[cfg(feature=...)]`.
 
-use ndarray::{array, Array1, Array2};
+use std::sync::Arc;
 
-use gam::terms::analytic_penalties::IBPAssignmentPenalty;
+use ndarray::{Array1, Array2};
 
-/// Invert a symmetric 2×2 SPD matrix `[[a, b], [b, c]]`.
-fn invert_2x2(h: &Array2<f64>) -> Array2<f64> {
-    let a = h[[0, 0]];
-    let b = h[[0, 1]];
-    let c = h[[1, 1]];
-    let det = a * c - b * b;
-    assert!(det > 0.0, "test H must be SPD (det = {det:.3e})");
-    array![[c / det, -b / det], [-b / det, a / det]]
+use gam::solver::arrow_schur::ArrowFactorCache;
+use gam::terms::{
+    AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
+    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldLoss, SaeManifoldRho, SaeManifoldTerm,
+};
+
+struct Fixture {
+    term: SaeManifoldTerm,
+    target: Array2<f64>,
+    rho: SaeManifoldRho,
 }
 
+/// K=2 periodic-harmonic SAE fixture under a fixed-α IBP-MAP gate. Both atoms
+/// are genuinely active so the empirical mass `M_k = Σ_i z_ik` couples the rows
+/// and the per-column cross-row Woodbury coefficient `cross_row_d` is nonzero —
+/// the exact source whose off-diagonal the #1416 ρ-trace must contract.
+fn ibp_cross_row_fixture(log_lambda_sparse: f64) -> Fixture {
+    let n = 80usize;
+    let p = 6usize;
+    let k_atoms = 2usize;
+    let m = 5usize;
+    let evaluator = PeriodicHarmonicEvaluator::new(m).expect("periodic evaluator");
+
+    let mut logits = Array2::<f64>::zeros((n, k_atoms));
+    let mut coords = vec![Array2::<f64>::zeros((n, 1)), Array2::<f64>::zeros((n, 1))];
+    let mut target = Array2::<f64>::zeros((n, p));
+    let weights0 = [
+        [0.20, -0.10, 0.06, 0.03, -0.04, 0.08],
+        [0.70, -0.25, 0.40, 0.12, -0.35, 0.18],
+        [0.15, 0.55, -0.25, 0.28, 0.08, -0.22],
+        [0.08, -0.04, 0.03, -0.02, 0.01, 0.06],
+        [-0.06, 0.02, 0.05, 0.04, -0.03, 0.01],
+    ];
+    let weights1 = [
+        [-0.10, 0.05, 0.08, -0.02, 0.05, -0.03],
+        [-0.30, 0.42, 0.12, -0.20, 0.16, 0.30],
+        [0.48, 0.10, -0.32, 0.18, 0.26, -0.14],
+        [0.04, 0.07, -0.02, 0.03, -0.05, 0.02],
+        [0.03, -0.05, 0.04, 0.01, 0.02, -0.04],
+    ];
+
+    for row in 0..n {
+        let phase = (row as f64 + 0.25) / n as f64;
+        coords[0][[row, 0]] = phase;
+        coords[1][[row, 0]] = (phase + 0.18).fract();
+        // Both gates active on a meaningful fraction of rows so the IBP mass
+        // M_k couples rows on BOTH columns (a live cross-row Woodbury source on
+        // each column, not just one).
+        logits[[row, 0]] = if row % 2 == 0 { 1.3 } else { 0.5 };
+        logits[[row, 1]] = if row % 3 == 0 { 1.1 } else { 0.4 };
+        let theta0 = std::f64::consts::TAU * coords[0][[row, 0]];
+        let theta1 = std::f64::consts::TAU * coords[1][[row, 0]];
+        let basis0 = [
+            1.0,
+            theta0.sin(),
+            theta0.cos(),
+            (2.0 * theta0).sin(),
+            (2.0 * theta0).cos(),
+        ];
+        let basis1 = [
+            1.0,
+            theta1.sin(),
+            theta1.cos(),
+            (2.0 * theta1).sin(),
+            (2.0 * theta1).cos(),
+        ];
+        // A genuine residual the K=2 basis cannot fully represent, so the inner
+        // fit stops at a stationary point with nonzero data-fit (the cross-row
+        // trace is then non-negligible — see the vacuity guard).
+        let high = 0.6 * (4.0 * theta0).sin() + 0.4 * (3.0 * theta1).cos();
+        for col in 0..p {
+            let mut v0 = 0.0;
+            let mut v1 = 0.0;
+            for b in 0..m {
+                v0 += basis0[b] * weights0[b][col];
+                v1 += basis1[b] * weights1[b][col];
+            }
+            target[[row, col]] = 0.5 * v0 + 0.5 * v1 + high;
+        }
+    }
+
+    let mut atoms = Vec::with_capacity(k_atoms);
+    for atom_idx in 0..k_atoms {
+        let (phi, jet) = evaluator
+            .evaluate(coords[atom_idx].view())
+            .expect("periodic basis evaluation");
+        let decoder = if atom_idx == 0 {
+            Array2::from_shape_fn((m, p), |(row, col)| weights0[row][col])
+        } else {
+            Array2::from_shape_fn((m, p), |(row, col)| weights1[row][col])
+        };
+        let mut smooth = Array2::<f64>::eye(m);
+        smooth[[0, 0]] = 0.0;
+        let atom = SaeManifoldAtom::new(
+            format!("circle_{atom_idx}"),
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi,
+            jet,
+            decoder,
+            smooth,
+        )
+        .expect("circle atom")
+        .with_basis_evaluator(Arc::new(
+            PeriodicHarmonicEvaluator::new(m).expect("periodic evaluator clone"),
+        ) as Arc<dyn SaeBasisEvaluator>);
+        atoms.push(atom);
+    }
+
+    // FIXED-α IBP-MAP (`learnable_alpha = false`): coordinate 0 of the outer-ρ
+    // vector is `log_lambda_sparse`, the IBP prior STRENGTH whose Hessian is the
+    // cross-row Woodbury source. (A learnable-α gate would route coord 0 to
+    // log-α instead — that is the #1417 path; here we want the prior-strength
+    // ρ_sparse trace, the #1416 site.)
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        coords,
+        vec![LatentManifold::Circle { period: 1.0 }; k_atoms],
+        AssignmentMode::ibp_map(0.7, 0.9, false),
+    )
+    .expect("assignment");
+    let term = SaeManifoldTerm::new(atoms, assignment).expect("term");
+    let rho = SaeManifoldRho::new(
+        log_lambda_sparse,
+        -8.0,
+        vec![Array1::from_vec(vec![-8.0]), Array1::from_vec(vec![-8.0])],
+    );
+    Fixture { term, target, rho }
+}
+
+fn evaluate(
+    start: &SaeManifoldTerm,
+    target: &Array2<f64>,
+    rho: &SaeManifoldRho,
+    inner_max_iter: usize,
+) -> (SaeManifoldTerm, f64, SaeManifoldLoss, ArrowFactorCache) {
+    let mut term = start.clone();
+    let (value, loss, cache) = term
+        .reml_criterion_with_cache(
+            target.view(),
+            rho,
+            None,
+            inner_max_iter,
+            0.45,
+            1.0e-6,
+            1.0e-6,
+        )
+        .unwrap_or_else(|err| panic!("REML criterion failed: {err}"));
+    (term, value, loss, cache)
+}
+
+fn centered_fd(
+    start: &SaeManifoldTerm,
+    target: &Array2<f64>,
+    template: &SaeManifoldRho,
+    coord: usize,
+    inner_max_iter: usize,
+) -> f64 {
+    let h = 2.0e-4;
+    let mut plus = template.to_flat();
+    let mut minus = template.to_flat();
+    plus[coord] += h;
+    minus[coord] -= h;
+    let rho_plus = template.from_flat(plus.view());
+    let rho_minus = template.from_flat(minus.view());
+    let (_, vp, _, _) = evaluate(start, target, &rho_plus, inner_max_iter);
+    let (_, vm, _, _) = evaluate(start, target, &rho_minus, inner_max_iter);
+    (vp - vm) / (2.0 * h)
+}
+
+/// #1416: the full production outer-ρ gradient — whose coordinate 0
+/// (`log_lambda_sparse`) is the IBP `½ ∂log|H|/∂ρ_sparse` cross-row trace — must
+/// match a centered finite difference of the re-solved REML criterion at EVERY
+/// coordinate. The FD differentiates the value through the inner re-solve, so it
+/// carries the TRUE `½ tr(H⁻¹ ∂H_p/∂ρ_sparse)` (diagonal AND the rank-one
+/// off-diagonal `½ d Σ_{i≠j}(H⁻¹)_{ij} J_i J_j`). The diagonal-only contraction
+/// (the #1416 bug) drops the off-diagonal and makes coord 0 disagree with the FD.
 #[test]
-fn ibp_rho_trace_includes_cross_row_offdiagonal_1416() {
-    // Two rows, one column; interior logits → nonzero concrete Jacobians and a
-    // nonzero column Woodbury coefficient `d`.
-    let pen = IBPAssignmentPenalty::new(1, 2.0, 0.9, false);
-    let t = array![0.4_f64, -0.3]; // row-major (N=2, K=1)
-    let rho = Array1::<f64>::zeros(0); // fixed alpha
-    let k = pen.k_max;
-    let n = t.len() / k;
-    assert_eq!((n, k), (2, 1));
+fn ibp_rho_sparse_logdet_trace_includes_cross_row_offdiagonal_1416() {
+    let f = ibp_cross_row_fixture(-1.0);
+    let inner_iters = 8usize;
+    let (converged, _value, loss, cache) = evaluate(&f.term, &f.target, &f.rho, inner_iters);
 
-    let ch = pen.hessian_diag_logit_third_channels(t.view(), rho.view());
-    let d = ch.cross_row_d[0];
-    let j0 = ch.z_jac[0];
-    let j1 = ch.z_jac[1];
-
-    // The fixture must genuinely exercise the cross-row path.
+    // Vacuity guard: the fixture must carry a genuine (non-degenerate) data fit,
+    // otherwise the cross-row Woodbury coefficient and the trace it feeds would
+    // be negligible and the off-diagonal could not be distinguished from zero.
     assert!(
-        d.abs() > 1.0e-6 && j0.abs() > 1.0e-6 && j1.abs() > 1.0e-6,
-        "fixture must have a live cross-row source: d={d:.3e}, J0={j0:.3e}, J1={j1:.3e}"
+        loss.data_fit > 1.0e-2,
+        "fixture is too well-fit (data_fit {:.3e}); the IBP cross-row trace would be \
+         negligible and the diagonal-vs-full distinction vacuous",
+        loss.data_fit
     );
 
-    // The per-column rank-one part of H_p over the two row slots: d·J Jᵀ.
-    // (The diag(s, c) part is purely diagonal and so contributes identically to
-    //  the full and the diagonal-only contractions — only the rank-one
-    //  off-diagonal is at issue, so we isolate it here.)
-    let mut hp_rank1 = Array2::<f64>::zeros((2, 2));
-    let jvec = [j0, j1];
-    for i in 0..2 {
-        for j in 0..2 {
-            hp_rank1[[i, j]] = d * jvec[i] * jvec[j];
-        }
+    let components = converged
+        .analytic_outer_rho_gradient_at_converged(f.target.view(), &f.rho, &loss, &cache)
+        .expect("analytic outer-rho gradient components");
+    let analytic = components.gradient();
+    let n_params = f.rho.to_flat().len();
+    assert!(n_params >= 1, "outer-rho vector must carry log_lambda_sparse at coord 0");
+
+    for coord in 0..n_params {
+        let fd = centered_fd(&converged, &f.target, &f.rho, coord, inner_iters);
+        let diff = (fd - analytic[coord]).abs();
+        let tol = 3.0e-3 * (1.0 + fd.abs().max(analytic[coord].abs()));
+        assert!(
+            diff <= tol,
+            "[#1416] outer-rho gradient coord {coord}: fd={fd:.8e}, analytic={:.8e}, \
+             diff={diff:.3e}, tol={tol:.3e}. Coord 0 is the IBP ½∂log|H|/∂ρ_sparse \
+             cross-row trace — a mismatch there means the rank-one off-diagonal was \
+             dropped (the diagonal-only #1416 bug).",
+            analytic[coord]
+        );
     }
-
-    // An explicit SPD inverse posterior block over the two row slots. Its
-    // off-diagonal is what the buggy diagonal-only contraction discards.
-    let h = array![[3.0_f64, 0.8], [0.8, 2.0]];
-    let h_inv = invert_2x2(&h);
-
-    // Full trace ½ tr(H⁻¹ H_p^rank1).
-    let mut full = 0.0_f64;
-    for i in 0..2 {
-        for j in 0..2 {
-            full += h_inv[[i, j]] * hp_rank1[[j, i]];
-        }
-    }
-    full *= 0.5;
-
-    // Diagonal-only contraction (the pre-#1416 bug).
-    let diag_only =
-        0.5 * (h_inv[[0, 0]] * hp_rank1[[0, 0]] + h_inv[[1, 1]] * hp_rank1[[1, 1]]);
-
-    // The exact omitted cross-row term: ½ d Σ_{i≠j}(H⁻¹)_{ij} J_i J_j.
-    let cross = 0.5 * d * (h_inv[[0, 1]] * j0 * j1 + h_inv[[1, 0]] * j1 * j0);
-
-    // (1) full == diagonal-only + the boxed cross-row term, to round-off.
-    assert!(
-        (full - (diag_only + cross)).abs() <= 1.0e-12 * (1.0 + full.abs()),
-        "full ½tr(H⁻¹H_p) must equal diagonal-only + cross-row term: \
-         full={full:.12e}, diag_only={diag_only:.12e}, cross={cross:.12e}"
-    );
-
-    // (2) the cross-row term the diagonal-only branch drops is non-negligible,
-    //     so the original bug would be measurably wrong.
-    assert!(
-        cross.abs() > 1.0e-3 * (1.0 + full.abs()),
-        "omitted cross-row term must be non-negligible (diagonal-only would be \
-         a real error): cross={cross:.6e}, full={full:.6e}"
-    );
-    assert!(
-        (full - diag_only).abs() > 1.0e-3 * (1.0 + full.abs()),
-        "full and diagonal-only traces must differ: full={full:.6e}, \
-         diag_only={diag_only:.6e}"
-    );
 }
