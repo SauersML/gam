@@ -1482,7 +1482,17 @@ where
             // unchanged, so non-degenerate fits and their recorded EDF accounting
             // are bit-identical (the `edf_by_block` channel already clamps the
             // complementary `rank − trace` to `[0, rank]`).
-            traces[kk] = (lambdas[kk] * frob).clamp(0.0, rank as f64);
+            // f64::clamp does NOT fix NaN (only ±inf): a NaN product (e.g.
+            // inf*0 from an overflowed solve) would slip through and trip the
+            // penalty_block_trace finiteness validator. Map any non-finite
+            // product to the saturated `rank` bound, exactly as the inf case
+            // already resolves (gam#1379).
+            let trace_val = lambdas[kk] * frob;
+            traces[kk] = if trace_val.is_finite() {
+                trace_val.clamp(0.0, rank as f64)
+            } else {
+                rank as f64
+            };
         }
         edf_total = (p_dim as f64 - kahan_sum(traces.iter().copied())).clamp(mp, p_dim as f64);
         penalty_block_trace.clone_from(&traces);
@@ -1565,7 +1575,14 @@ where
                         // penalized trace is bounded by the block rank, so clamp to
                         // keep `penalty_block_trace` finite and the EDF accounting
                         // consistent. Finite in-range traces are untouched.
-                        traces_f[kk] = (lambdas[kk] * frob).clamp(0.0, rank as f64);
+                        // NaN-safe (gam#1379): f64::clamp leaves NaN as NaN, so
+                        // map any non-finite product to the saturated `rank`.
+                        let trace_val = lambdas[kk] * frob;
+                        traces_f[kk] = if trace_val.is_finite() {
+                            trace_val.clamp(0.0, rank as f64)
+                        } else {
+                            rank as f64
+                        };
                     }
                     edf_total = (p_orig as f64 - kahan_sum(traces_f.iter().copied()))
                         .clamp(mp, p_orig as f64);
