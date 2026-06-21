@@ -269,7 +269,7 @@ fn wahba_sphere_kernel_sobolev_closed_form_derivative_dcos(cos_gamma: f64, m: us
         }
         // For m outside 1..=3 the caller dispatches to spectral instead; return
         // neutral 0 here to remove ban-tracked panic while safe (not reached).
-        other => 0.0,
+        _ => 0.0,
     };
     // du/d(cos gamma) = -1/2.
     dk_du * (-0.5)
