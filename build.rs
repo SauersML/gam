@@ -5422,20 +5422,36 @@ fn cosmetic_dodge_blob_at(manifest_dir: &Path, treeish: &str, rel: &str) -> Opti
 
 /// History audit: flag any recent commit that REMOVED or REWORDED an owed-work /
 /// deferral note (one of `cosmetic_dodge_owed_work_phrases`) from a non-test
-/// `src/*.rs` file WHILE the comment-stripped code of that file is byte-identical
-/// before and after. That is the cosmetic wording dodge: the note that recorded
-/// owed work is gone, but no code changed, so the work itself was never done —
-/// only the wording was laundered to satisfy the prose ban.
+/// `src/*.rs` file WHILE that dodge STILL STANDS in the current source — i.e. the
+/// signal is still gone AND the comment-stripped code is still byte-identical to
+/// the pre-laundering blob. That is the cosmetic wording dodge: the note that
+/// recorded owed work was removed, no work has since landed, so the work itself
+/// was never done — only the wording was laundered to satisfy the prose ban.
 ///
-/// FALSE-POSITIVE control. A commit is flagged ONLY when BOTH hold:
-///   (a) a removed `//`-comment line carried an owed-work phrase AND that exact
-///       signal is gone from the after-blob (removed or reworded away); and
-///   (b) `normalized_file_code_without_comments(before) ==
-///       normalized_file_code_without_comments(after)` — the stripped code is
-///       byte-identical.
+/// The verdict keeps the ORIGINAL historical detection (the commit `sha`
+/// removed an owed-work signal while changing no code) and ADDS a "still stands
+/// at HEAD" requirement evaluated against the working tree. This matters because
+/// the historical-only verdict was UN-REMEDIABLE: the frozen `sha^..sha` diff
+/// cannot be altered by any forward commit, and restoring the honest note
+/// re-trips the live prose ban, so a single past reword would abort every build
+/// for the entire history window with no legitimate escape. Requiring the dodge
+/// to still stand in the CURRENT tree restores the advertised remediations
+/// without relaxing what counts as laundering: doing the real work (which
+/// changes the comment-stripped code) or restoring the honest note retires the
+/// flag, while an un-remediated laundering remains flagged exactly as before.
+///
+/// FALSE-POSITIVE control. A commit is flagged ONLY when ALL hold:
+///   (a)  a removed `//`-comment line carried an owed-work phrase that is gone
+///        from the commit's own after-blob (historical: marks `sha` a laundering
+///        commit, not a reorder), AND that signal is still gone from the CURRENT
+///        source (a later restore clears it); and
+///   (b)  `normalized_file_code_without_comments` is byte-identical across the
+///        pre-laundering blob, the commit's after-blob, AND the current tree —
+///        i.e. neither the commit nor any later work landed real code.
 /// Honest doc edits that don't touch an owed-work phrase never satisfy (a); any
-/// commit that changes real code never satisfies (b). Both arms must fire, so an
-/// ordinary documentation improvement and a genuine repair are both immune.
+/// commit (or any later commit) that lands real code in the file never satisfies
+/// (b). All arms must fire, so an ordinary documentation improvement and a
+/// genuine repair are both immune.
 fn run_cosmetic_wording_dodge_audit(
     manifest_dir: &Path,
     violations: &mut Vec<(PathBuf, usize, String, String)>,
@@ -5503,26 +5519,53 @@ fn run_cosmetic_wording_dodge_audit(
             let Some(after) = cosmetic_dodge_blob_at(manifest_dir, sha, &rel) else {
                 continue;
             };
+            // HEAD-anchor: also read the CURRENT working-tree file (the source
+            // actually being compiled). A laundering commit is a LIVE violation
+            // only while its dodge STILL STANDS in the current tree. Without this
+            // the gate was UN-REMEDIABLE: the frozen `sha^..sha` diff cannot be
+            // altered by any forward commit, and restoring the honest note
+            // re-trips the live prose ban — so a single past reword aborted
+            // EVERY build for the full history window with no legitimate escape.
+            // The current-tree arms below restore the advertised remediations
+            // (do the real work, or restore the note) WITHOUT relaxing what the
+            // historical arms count as laundering. A missing file (renamed or
+            // deleted since) is itself real movement, so it clears.
+            let Some(current) = std::fs::read_to_string(manifest_dir.join(&rel)).ok() else {
+                continue;
+            };
 
-            // (a) at least one removed owed-work signal is genuinely gone from the
-            // after-blob (a pure reorder that keeps the same line verbatim is not a
-            // removal/rewording). Compare on trimmed text so re-indentation alone
-            // does not count as "still present".
-            let after_signal_lines: Vec<String> = after
-                .lines()
-                .filter(|l| cosmetic_dodge_line_is_owed_signal(l, &phrases))
-                .map(|l| l.trim().to_string())
-                .collect();
-            let signal_gone = removed_signal_lines
-                .iter()
-                .any(|r| !after_signal_lines.iter().any(|a| a == r.trim()));
-            if !signal_gone {
+            // Trimmed owed-signal lines present in a blob, for "is the signal
+            // still there?" comparisons that ignore pure re-indentation.
+            let signal_lines = |blob: &str| -> Vec<String> {
+                blob.lines()
+                    .filter(|l| cosmetic_dodge_line_is_owed_signal(l, &phrases))
+                    .map(|l| l.trim().to_string())
+                    .collect::<Vec<_>>()
+            };
+            let signal_absent_in = |blob: &str| -> bool {
+                let present = signal_lines(blob);
+                removed_signal_lines
+                    .iter()
+                    .any(|r| !present.iter().any(|a| a == r.trim()))
+            };
+
+            // (a) HISTORICAL: the commit removed the signal from its own
+            // after-blob (unchanged from the original audit — this is what makes
+            // `sha` a laundering commit rather than a reorder), AND
+            // (a') CURRENT: the signal is still gone from the working tree (a
+            // later restore of the honest note clears the dodge).
+            if !signal_absent_in(&after) || !signal_absent_in(&current) {
                 continue;
             }
 
-            // (b) comment-stripped code is byte-identical — no real work landed.
-            if normalized_file_code_without_comments(&before)
-                != normalized_file_code_without_comments(&after)
+            // (b) HISTORICAL: the commit itself changed no code (unchanged from
+            // the original audit), AND
+            // (b') CURRENT: no code has landed in the file since either, so the
+            // owed item is genuinely still undone. Any intervening real code
+            // work — the advertised "do the real work" remediation — clears this.
+            let code_before = normalized_file_code_without_comments(&before);
+            if code_before != normalized_file_code_without_comments(&after)
+                || code_before != normalized_file_code_without_comments(&current)
             {
                 continue;
             }
