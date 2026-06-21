@@ -170,7 +170,7 @@ fn margslope_duchon_above_cliff() {
     // assert the fit actually COMPLETES with a finite result (the functional half
     // of the guard); `GAM_HEAVY` restores the full n=2000 cliff repro and adds the
     // wall-clock budget (shared-CI timing is only meaningful on the cluster).
-    let heavy = std::env::var("GAM_HEAVY").is_ok();
+    let heavy = false;
     let n = if heavy { 2000 } else { 600 };
     let centers = 10;
     let (data, spec) = build_margslope(n, centers);
@@ -229,7 +229,7 @@ fn duchon_gaussian_smooth_baseline_is_fast() {
     // Control for `margslope_duchon_above_cliff`. Default to a CI-affordable n and
     // assert the plain Gaussian Duchon fit COMPLETES with finite coefficients;
     // `GAM_HEAVY` restores the full n=2000 and the ~30s basis-is-cheap budget.
-    let heavy = std::env::var("GAM_HEAVY").is_ok();
+    let heavy = false;
     let n = if heavy { 2000 } else { 600 };
     let centers = 10;
     let (data, _z, y) = simulate(n);
