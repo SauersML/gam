@@ -476,55 +476,54 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
     }
 }
 
-// ── Tower4<K>: full dense tower as a JetScalar (the all-channels path) ──────
-
-/// The full dense [`super::jet_tower::Tower4`] is itself a [`JetScalar`]: it
-/// carries EVERY channel, so a row expression written generically can be
-/// evaluated at `Tower4` to obtain the full `(v, g, H, t3, t4)` in one pass.
-/// The survival location-scale `row_nll_tower` consumes this impl (it evaluates
-/// [`super::survival::location_scale::row_kernel::sls_row_nll`] at `Tower4<9>`
-/// for the all-channels oracle / log-det path), and the #932 oracle uses it as
-/// the ground truth the packed [`Order2`] / [`OneSeed`] / [`TwoSeed`] scalars are
-/// pinned against via [`super::jet_tower::Tower4::third_contracted`] /
-/// `fourth_contracted`. `compose_unary` forwards the `[f64; 5]` stack straight to
-/// the dense [`super::jet_tower::Tower4::compose_unary`] it already consumes.
-impl<const K: usize> JetScalar<K> for super::jet_tower::Tower4<K> {
-    fn constant(c: f64) -> Self {
-        super::jet_tower::Tower4::constant(c)
-    }
-    fn variable(x: f64, axis: usize) -> Self {
-        super::jet_tower::Tower4::variable(x, axis)
-    }
-    fn value(&self) -> f64 {
-        self.v
-    }
-    fn add(&self, o: &Self) -> Self {
-        *self + *o
-    }
-    fn sub(&self, o: &Self) -> Self {
-        *self - *o
-    }
-    fn mul(&self, o: &Self) -> Self {
-        super::jet_tower::Tower4::mul(self, o)
-    }
-    fn recip(&self) -> Self {
-        super::jet_tower::Tower4::recip(self)
-    }
-    fn neg(&self) -> Self {
-        self.scale(-1.0)
-    }
-    fn scale(&self, s: f64) -> Self {
-        super::jet_tower::Tower4::scale(self, s)
-    }
-    fn compose_unary(&self, d: [f64; 5]) -> Self {
-        super::jet_tower::Tower4::compose_unary(self, d)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::families::jet_tower::{evaluate_program, RowNllProgram, Tower4};
+
+    // ── Tower4<K>: full dense tower as a JetScalar (the all-channels oracle) ─
+
+    /// The full dense [`Tower4`] is itself a [`JetScalar`]: it carries EVERY
+    /// channel, so a row expression written generically can be evaluated at
+    /// `Tower4` to obtain the full `(v, g, H, t3, t4)` in one pass. The #932
+    /// oracle uses it as the ground truth the packed [`Order2`] / [`OneSeed`] /
+    /// [`TwoSeed`] scalars are pinned against via [`Tower4::third_contracted`] /
+    /// `fourth_contracted`. Production families consume the *packed* scalars
+    /// (`Order2` for `(v, g, H)`, `OneSeed`/`TwoSeed` for the contractions); the
+    /// dense all-channels evaluation is only needed as the oracle truth, so this
+    /// impl is test-only.
+    impl<const K: usize> JetScalar<K> for Tower4<K> {
+        fn constant(c: f64) -> Self {
+            Tower4::constant(c)
+        }
+        fn variable(x: f64, axis: usize) -> Self {
+            Tower4::variable(x, axis)
+        }
+        fn value(&self) -> f64 {
+            self.v
+        }
+        fn add(&self, o: &Self) -> Self {
+            *self + *o
+        }
+        fn sub(&self, o: &Self) -> Self {
+            *self - *o
+        }
+        fn mul(&self, o: &Self) -> Self {
+            Tower4::mul(self, o)
+        }
+        fn recip(&self) -> Self {
+            Tower4::recip(self)
+        }
+        fn neg(&self) -> Self {
+            self.scale(-1.0)
+        }
+        fn scale(&self, s: f64) -> Self {
+            Tower4::scale(self, s)
+        }
+        fn compose_unary(&self, d: [f64; 5]) -> Self {
+            Tower4::compose_unary(self, d)
+        }
+    }
 
     /// A small polynomial-plus-unary row expression written ONCE, generically
     /// over `S: JetScalar<2>`, so it can be evaluated against every scalar:
@@ -678,6 +677,42 @@ mod tests {
         for a in 0..2 {
             for b in 0..2 {
                 close(fourth[a][b], truth4[a][b], &format!("seam fourth[{a}][{b}]"));
+            }
+        }
+    }
+
+    /// The (test-only) `Tower4: JetScalar` impl is the all-channels oracle scalar:
+    /// evaluating the SAME generic `row_expr` at `S = Tower4` (through the
+    /// `JetScalar` trait ops) must reproduce, channel-for-channel, the `Tower4`
+    /// obtained from the `RowNllProgram` / inherent-operator path
+    /// (`evaluate_program`). This pins that the trait impl delegates faithfully to
+    /// the inherent `Tower4` arithmetic (so the contracted-scalar oracles above,
+    /// which compare against `evaluate_program`'s tower, are comparing against the
+    /// same algebra the `JetScalar` interface exposes).
+    #[test]
+    fn tower4_as_jetscalar_matches_program_tower_all_channels() {
+        let t = tower();
+        let vars: [Tower4<2>; 2] = std::array::from_fn(|a| Tower4::variable(SEED[a], a));
+        let s = row_expr(&vars);
+        close(s.v, t.v, "tower-jetscalar value");
+        for a in 0..2 {
+            close(s.g[a], t.g[a], &format!("tower-jetscalar grad[{a}]"));
+            for b in 0..2 {
+                close(s.h[a][b], t.h[a][b], &format!("tower-jetscalar hess[{a}][{b}]"));
+                for c in 0..2 {
+                    close(
+                        s.t3[a][b][c],
+                        t.t3[a][b][c],
+                        &format!("tower-jetscalar t3[{a}][{b}][{c}]"),
+                    );
+                    for d in 0..2 {
+                        close(
+                            s.t4[a][b][c][d],
+                            t.t4[a][b][c][d],
+                            &format!("tower-jetscalar t4[{a}][{b}][{c}][{d}]"),
+                        );
+                    }
+                }
             }
         }
     }
