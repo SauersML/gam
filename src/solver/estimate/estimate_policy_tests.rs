@@ -284,7 +284,7 @@ fn prefit_binomial_detects_unpenalized_realized_design_separator() {
         &design,
         &[true, true],
     )
-    .expect("separation screen must complete without a layout error")
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "separation screen must complete without a layout error", e))
     .expect("second column exactly separates the binary response");
 
     assert_eq!(diagnostic.column_index, 1);
@@ -307,7 +307,7 @@ fn prefit_binomial_screen_respects_penalties_and_fractional_responses() {
             &design,
             &[true, false],
         )
-        .expect("separation screen must complete without a layout error"),
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "separation screen must complete without a layout error", e)),
         None,
         "a separating column with effective quadratic penalty should not be pre-fit rejected"
     );
@@ -318,7 +318,7 @@ fn prefit_binomial_screen_respects_penalties_and_fractional_responses() {
             &design,
             &[true, true],
         )
-        .expect("separation screen must complete without a layout error"),
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "separation screen must complete without a layout error", e)),
         None,
         "fractional binomial proportions are not exact binary separation"
     );
@@ -421,7 +421,7 @@ fn prefit_rank_check_detects_unpenalized_duplicate_column() {
     let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
     let diagnostic =
         detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
-            .expect("rank check should stream dense design")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "rank check should stream dense design", e))
             .expect("duplicate unpenalized columns are rank deficient");
 
     match diagnostic {
@@ -505,7 +505,7 @@ fn prefit_rank_check_detects_near_degenerate_unpenalized_design() {
     let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
     let diagnostic =
         detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
-            .expect("rank check should stream dense design")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "rank check should stream dense design", e))
             .expect("near-collinear unpenalized columns are near-degenerate");
 
     match diagnostic {
@@ -652,7 +652,7 @@ fn decode_invariant_test_fit() -> UnifiedFitResult {
         artifacts: FitArtifacts::default(),
         inner_cycles: 0,
     })
-    .expect("construct decode invariant test fit")
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "construct decode invariant test fit", e))
 }
 
 #[test]
@@ -660,7 +660,7 @@ fn dispersion_phi_prefers_inference_then_falls_back_to_standard_deviation() {
     // With a cached `inference` block present, `dispersion_phi()` returns
     // the stored dispersion verbatim so it can never diverge from the φ̂
     // that scaled the covariances at fit time.
-    let fit = decode_invariant_test_fit(, e));
+    let fit = decode_invariant_test_fit();
     assert_eq!(fit.dispersion(), Some(Dispersion::Known(1.0)));
     assert_eq!(fit.dispersion_phi(), 1.0);
 
@@ -897,7 +897,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
                     initial_epsilon: 0.0,
                     initial_log_delta: 0.0,
                 })
-                .expect("valid SAS initial state"),
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "valid SAS initial state", e)),
             ),
         ),
         latent_cloglog: None,
@@ -1136,7 +1136,7 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
                     initial_epsilon: 0.0,
                     initial_log_delta: 0.0,
                 })
-                .expect("valid SAS initial state"),
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "valid SAS initial state", e)),
             ),
         ),
         latent_cloglog: None,
@@ -1306,7 +1306,7 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
                     initial_epsilon: 0.0,
                     initial_log_delta: 0.0,
                 })
-                .expect("valid SAS initial state"),
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "valid SAS initial state", e)),
             ),
         ),
         latent_cloglog: None,

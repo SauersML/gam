@@ -835,6 +835,18 @@ pub struct PredictionWithSE {
     pub mean_se: Option<Array1<f64>>,
 }
 
+/// A per-observation DISPERSION channel (#1125): the generative-units dispersion
+/// surface a dispersion location-scale model learned. Implemented only by models
+/// that carry such a channel; [`PredictableModel::dispersion_channel`] hands one
+/// back so [`PredictableModel::predict_dispersion_scale`] can evaluate it.
+pub trait PerRowDispersionChannel {
+    /// Per-row dispersion in the generative `NoiseModel`'s own units.
+    fn per_row_dispersion(
+        &self,
+        input: &PredictInput,
+    ) -> Result<Array1<f64>, EstimationError>;
+}
+
 /// Trait for models that can produce predictions from new data.
 ///
 /// Implemented by each model class (standard, GAMLSS, survival) to provide
@@ -896,7 +908,19 @@ pub trait PredictableModel {
                 "predict_dispersion_scale requires at least one observation".to_string(),
             ));
         }
-        Ok(None)
+        match self.dispersion_channel() {
+            Some(channel) => channel.per_row_dispersion(input).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The per-row dispersion channel this model exposes, if any. Dispersion
+    /// location-scale models return `Some(self)` so the provided
+    /// [`predict_dispersion_scale`](Self::predict_dispersion_scale) evaluates
+    /// the channel; every other model inherits `None` and reports no per-row
+    /// dispersion.
+    fn dispersion_channel(&self) -> Option<&dyn PerRowDispersionChannel> {
+        None
     }
 
     /// Full prediction with confidence/observation intervals.

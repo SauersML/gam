@@ -90,13 +90,6 @@ pub trait JetScalar<const K: usize>: Copy {
     fn sub(&self, o: &Self) -> Self;
     /// Exact truncated Leibniz product `self · o`.
     fn mul(&self, o: &Self) -> Self;
-    /// Exact reciprocal `1/self`. Caller guarantees a non-zero value channel
-    /// (likelihood programs do).
-    fn recip(&self) -> Self;
-    /// Exact quotient `self / o`. Caller guarantees a non-zero `o` value.
-    fn div(&self, o: &Self) -> Self {
-        self.mul(&o.recip())
-    }
     /// Negate every channel.
     fn neg(&self) -> Self;
     /// Multiply every channel by a plain scalar `s`.
@@ -118,13 +111,6 @@ pub trait JetScalar<const K: usize>: Copy {
     fn exp(&self) -> Self {
         let e = self.value().exp();
         self.compose_unary([e, e, e, e, e])
-    }
-
-    /// `ln(self)`. Caller guarantees positivity.
-    fn ln(&self) -> Self {
-        let u = self.value();
-        let r = 1.0 / u;
-        self.compose_unary([u.ln(), r, -r * r, 2.0 * r * r * r, -6.0 * r * r * r * r])
     }
 
     /// `√self`. Caller guarantees positivity.
@@ -157,12 +143,6 @@ pub trait JetScalar<const K: usize>: Copy {
 pub struct Order2<const K: usize>(pub super::jet_tower::Tower2<K>);
 
 impl<const K: usize> Order2<K> {
-    /// Read the gradient channel.
-    #[inline]
-    pub fn g(&self) -> [f64; K] {
-        self.0.g
-    }
-
     /// Read the Hessian channel.
     #[inline]
     pub fn h(&self) -> [[f64; K]; K] {
@@ -190,13 +170,6 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
     }
     fn mul(&self, o: &Self) -> Self {
         Order2(super::jet_tower::Tower2::mul(&self.0, &o.0))
-    }
-    fn recip(&self) -> Self {
-        let r = 1.0 / self.0.v;
-        let r2 = r * r;
-        // Order-≤2 of 1/u: [1/u, −1/u², 2/u³] — the leading three entries of
-        // Tower4::recip's stack, since Tower2 reads only d[0..=2].
-        Order2(self.0.compose_unary([r, -r2, 2.0 * r2 * r]))
     }
     fn neg(&self) -> Self {
         Order2(self.0.scale(-1.0))
@@ -288,13 +261,6 @@ impl<const K: usize> JetScalar<K> for OneSeed<K> {
             base: self.base.mul(&o.base),
             eps: self.base.mul(&o.eps).add(&self.eps.mul(&o.base)),
         }
-    }
-    fn recip(&self) -> Self {
-        // 1/s with s = base + ε eps; treat as the composition recip ∘ s, which
-        // the generic compose_unary handles uniformly.
-        let r = 1.0 / self.base.value();
-        let r2 = r * r;
-        self.compose_unary([r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
     }
     fn neg(&self) -> Self {
         OneSeed {
@@ -428,11 +394,6 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
             eps_del,
         }
     }
-    fn recip(&self) -> Self {
-        let r = 1.0 / self.base.value();
-        let r2 = r * r;
-        self.compose_unary([r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
-    }
     fn neg(&self) -> Self {
         TwoSeed {
             base: self.base.neg(),
@@ -510,9 +471,6 @@ impl<const K: usize> JetScalar<K> for super::jet_tower::Tower4<K> {
     fn mul(&self, o: &Self) -> Self {
         super::jet_tower::Tower4::mul(self, o)
     }
-    fn recip(&self) -> Self {
-        super::jet_tower::Tower4::recip(self)
-    }
     fn neg(&self) -> Self {
         self.scale(-1.0)
     }
@@ -531,11 +489,11 @@ mod tests {
 
     /// A small polynomial-plus-unary row expression written ONCE, generically
     /// over `S: JetScalar<2>`, so it can be evaluated against every scalar:
-    /// `ℓ = ln(e^{p0·p1} + 2) · √(p0·p0 + 1) − p1·p1·0.5`.
-    /// Exercises mul, add/sub, scale, exp, ln, sqrt — every algebra op.
+    /// `ℓ = (e^{p0·p1} + 2) · √(p0·p0 + 1) − p1·p1·0.5`.
+    /// Exercises mul, add/sub, scale, exp, sqrt — every algebra op.
     fn row_expr<S: JetScalar<2>>(p: &[S; 2]) -> S {
         let g = p[0].mul(&p[1]).exp();
-        let inner = g.add(&S::constant(2.0)).ln();
+        let inner = g.add(&S::constant(2.0));
         let radic = p[0].mul(&p[0]).add(&S::constant(1.0)).sqrt();
         inner.mul(&radic).sub(&p[1].mul(&p[1]).scale(0.5))
     }
@@ -587,7 +545,7 @@ mod tests {
         let s = row_expr(&vars);
         close(s.value(), t.v, "value");
         for a in 0..2 {
-            close(s.g()[a], t.g[a], &format!("grad[{a}]"));
+            close(s.0.g[a], t.g[a], &format!("grad[{a}]"));
             for b in 0..2 {
                 close(s.h()[a][b], t.h[a][b], &format!("hess[{a}][{b}]"));
             }
@@ -631,7 +589,7 @@ mod tests {
         let s = row_expr(&vars);
         close(s.value(), t.v, "value");
         for a in 0..2 {
-            close(s.base.g()[a], t.g[a], &format!("grad[{a}]"));
+            close(s.base.0.g[a], t.g[a], &format!("grad[{a}]"));
             for b in 0..2 {
                 close(s.base.h()[a][b], t.h[a][b], &format!("base hess[{a}][{b}]"));
                 close(
