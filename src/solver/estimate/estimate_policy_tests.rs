@@ -789,8 +789,10 @@ fn unified_fit_validation_rejects_edf_smoothing_parameter_drift() {
 fn unified_fit_validation_accepts_persisted_log_lambda_roundoff() {
     let mut fit = decode_invariant_test_fit();
     fit.log_lambdas[0] += 5e-14;
-    fit.validate_numeric_finiteness()
-        .expect("sub-ulp persisted log-lambda roundoff should remain valid");
+    assert!(
+        fit.validate_numeric_finiteness().is_ok(),
+        "sub-ulp persisted log-lambda roundoff should remain valid"
+    );
 }
 
 #[test]
