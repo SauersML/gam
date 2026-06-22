@@ -2220,6 +2220,13 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // never enter this loop, so their seed is byte-identical to before. The κ-opt
     // OFF profiled fits are the SAME criterion `curvature_inference_forspec`
     // already trusts for the CI, so this reuses a verified sign-correct oracle.
+    // Records `(slot, selected_kappa_seed)` for each constant-curvature term so
+    // the joint ψ bounds can be HARD-PINNED to the selected sign's half-axis
+    // below: the joint ARC genuinely prefers the collapsed +κ corner (its
+    // production REML there is lower than the correct basin), so a seed alone is
+    // not enough — without a one-sided bound the optimiser walks back across
+    // κ = 0 to the spurious corner (the observed #1464 bit-identical railing).
+    let mut cc_sign_seeds: Vec<(usize, f64)> = Vec::new();
     if has_constant_curvature_term {
         for (slot, &term_idx) in spatial_terms.iter().enumerate() {
             if constant_curvature_term_spec(resolvedspec, term_idx).is_none() {
@@ -2236,6 +2243,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
                 options,
             ) {
                 log_kappa0.set_scalar_slot(slot, kappa_seed);
+                cc_sign_seeds.push((slot, kappa_seed));
             }
         }
     }
@@ -2271,6 +2279,26 @@ fn try_exact_joint_spatial_length_scale_optimization(
             kappa_options,
         )
     };
+    // #1464 hard sign-pin: for each constant-curvature term whose fixed-κ
+    // sign-basin scan chose a definite sign, collapse the joint ψ window to that
+    // sign's half-axis (closed at κ = 0) so the joint ARC physically CANNOT cross
+    // zero into the spurious +κ collapsed-kernel corner. The scan (the
+    // sign-correct profiled-REML oracle) is authoritative for the sign; the joint
+    // solve then only refines the magnitude inside the correct basin. A scan
+    // result of exactly κ = 0 (genuinely flat) leaves the window untouched.
+    // CC-gated — non-CC terms are never in `cc_sign_seeds`, so every other
+    // spatial/Matérn/Duchon/sphere joint window is byte-identical to before.
+    let mut log_kappa_lower = log_kappa_lower;
+    let mut log_kappa_upper = log_kappa_upper;
+    for &(slot, kappa_seed) in &cc_sign_seeds {
+        if kappa_seed < 0.0 {
+            // Hyperbolic basin: ψ ∈ [κ_min, 0].
+            log_kappa_upper.set_scalar_slot(slot, 0.0);
+        } else if kappa_seed > 0.0 {
+            // Spherical basin: ψ ∈ [0, κ_max].
+            log_kappa_lower.set_scalar_slot(slot, 0.0);
+        }
+    }
     // Project seed onto data-derived bounds; spec.length_scale is a hint,
     // not a hard constraint. BFGS requires theta0 ∈ [lower, upper].
     let log_kappa0 = log_kappa0.clamp_to_bounds(&log_kappa_lower, &log_kappa_upper);
