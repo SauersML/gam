@@ -30,11 +30,11 @@ pub enum GpuError {
     CalibrationFailed { reason: String },
     /// The requested GPU code path has no device kernel on this build. Callers
     /// treat this as a sentinel to fall back to the CPU path silently (no panic,
-    /// error log, just an info line). Distinct from `DriverCallFailed` so
-    /// the dispatcher can tell "kernel not landed yet" apart from "device
-    /// said no". Carries a short reason for diagnostics, e.g. the kernel
-    /// name and the awaited milestone.
-    NotYetImplemented { reason: String },
+    /// error log, just an info line). Distinct from `DriverCallFailed` so the
+    /// dispatcher can tell "this build ships no kernel for the path" apart from
+    /// "the device rejected the call". Carries a short reason for diagnostics,
+    /// e.g. the kernel name and the unsupported configuration.
+    NoDeviceKernel { reason: String },
 }
 
 crate::impl_reason_error_boilerplate! {
@@ -43,7 +43,7 @@ crate::impl_reason_error_boilerplate! {
         DriverSymbolMissing,
         DriverCallFailed,
         CalibrationFailed,
-        NotYetImplemented,
+        NoDeviceKernel,
     }
 }
 

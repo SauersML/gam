@@ -2654,6 +2654,17 @@ pub fn maybe_log_audit_drift(
     let beta_for_state: Vec<f64> = if beta_current.len() == p_total {
         beta_current.to_vec()
     } else {
+        // Length mismatch: the caller's β does not match the assembled design
+        // width, so the audit cannot be evaluated at the real β. Fall back to
+        // the origin (β = 0) but record it — the structural rank read at β = 0
+        // can differ from the rank at the true β, so a drift verdict resting on
+        // this fallback is only a coarse structural check.
+        log::debug!(
+            "[identifiability-drift] beta_current len {} != design width {}; \
+             auditing structural rank at the beta=0 fallback",
+            beta_current.len(),
+            p_total,
+        );
         vec![0.0; p_total]
     };
     let state = crate::families::custom_family::FamilyLinearizationState {

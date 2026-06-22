@@ -396,9 +396,9 @@ pub fn evidence_derivatives_hutchinson_gpu(
         if crate::gpu::device_runtime::GpuRuntime::global().is_some() {
             match linux_cuda::evidence_derivatives(&input) {
                 Ok(evidence) => return Ok(evidence),
-                Err(GpuError::NotYetImplemented { .. }) => {
-                    // Fall through to CPU reference until the device path
-                    // is fully landed by milestone 3.
+                Err(GpuError::NoDeviceKernel { .. }) => {
+                    // No device kernel for this path on this build: fall
+                    // through to the CPU reference.
                 }
                 Err(other) => return Err(String::from(other)),
             }

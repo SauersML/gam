@@ -2338,6 +2338,17 @@ impl TermCollectionDesign {
             return None; // fast path requires exactly one Kronecker term
         }
         let kron = kron_terms[0];
+        // A genuine tensor product needs at least two margins, and the marginal
+        // design / penalty / dim collections must agree in length. A degenerate
+        // (single-margin) or internally inconsistent factored basis cannot feed
+        // the Kronecker fast path, so fall back to the standard assembly rather
+        // than construct a malformed `KroneckerPenaltySystem` from it.
+        if kron.marginal_dims.len() < 2
+            || kron.marginal_penalties.len() != kron.marginal_dims.len()
+            || kron.marginal_designs.len() != kron.marginal_dims.len()
+        {
+            return None;
+        }
         // Only use the Kronecker path when the model is purely this tensor term
         // (no other smooth terms with separate penalties).
         let has_non_kron_smooth_terms = self

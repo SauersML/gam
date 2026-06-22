@@ -367,6 +367,16 @@ pub fn harvest_move_proposals(
     // Fit-side inputs for the #993 within-atom carve are absent here: record the
     // skip loudly. The fission proposal still rides; the e-gate decides acceptance.
     let fission_carve_skipped = !fission_atoms.is_empty();
+    if fission_carve_skipped {
+        // Make the recorded skip genuinely loud: the within-atom carve (#993)
+        // has no fit-side inputs on this path, so the fission audits ride
+        // un-refined and the e-gate alone owns their acceptance.
+        log::debug!(
+            "[structure-harvest] within-atom carve inputs absent (#993): {} fission \
+             audit(s) ride without sub-atom refinement; e-gate owns acceptance",
+            fission_atoms.len(),
+        );
+    }
     for &(atom, significance) in fission_atoms.iter().take(params.max_fissions) {
         proposals.push(proposal(
             term,

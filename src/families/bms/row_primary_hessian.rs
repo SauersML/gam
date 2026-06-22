@@ -1635,8 +1635,8 @@ impl BernoulliMarginalSlopeFamily {
         // Milestone 2 (#210): when the policy says GPU, eagerly probe the
         // backend so any NVRTC compile / context init failure surfaces in
         // the cache-decision log instead of at first dispatch. Probe
-        // returning `NotYetImplemented` is the expected pre-milestone-3
-        // outcome and means dispatch falls through to CPU rows below —
+        // returning `NoDeviceKernel` means this build ships no device
+        // kernel for the path, so dispatch falls through to CPU rows below —
         // the same path as today.
         if gpu_decision.use_gpu {
             match crate::families::bms::gpu::flex::BmsFlexGpuBackend::probe() {
@@ -1648,7 +1648,7 @@ impl BernoulliMarginalSlopeFamily {
                         );
                     }
                 }
-                Err(crate::gpu::gpu_error::GpuError::NotYetImplemented { reason }) => {
+                Err(crate::gpu::gpu_error::GpuError::NoDeviceKernel { reason }) => {
                     log::info!(
                         "[BMS row-primary-hessian-cache] gpu_backend_pending: {reason}; \
                          falling back to CPU rows"
@@ -1781,7 +1781,7 @@ impl BernoulliMarginalSlopeFamily {
         //    link-deviation runtimes present), pack the host inputs once and
         //    dispatch the row kernel. A successful launch returns the
         //    `n × r²` row-major Hessian; the CPU rayon loop below is then
-        //    skipped. Any failure (`NotYetImplemented`, driver errors, or
+        //    skipped. Any failure (`NoDeviceKernel`, driver errors, or
         //    pack-time precondition mismatch) logs a one-liner and falls
         //    through to the existing CPU path, preserving production
         //    behaviour under `gpu=auto`. Under `gpu=force`, the upstream

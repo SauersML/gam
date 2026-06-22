@@ -3085,7 +3085,7 @@ mod tests {
         {
             // Linux builds may or may not have a device; the dispatcher
             // contract is that without a runtime, probe() returns
-            // DriverLibraryUnavailable. Either outcome (NotYetImplemented,
+            // DriverLibraryUnavailable. Either outcome (NoDeviceKernel,
             // DriverLibraryUnavailable, or DriverCallFailed) is acceptable
             // here; success would mean the kernel actually ran which is a
             // V100-only outcome we don't gate the unit test on.
@@ -3096,7 +3096,7 @@ mod tests {
                 Err(GpuError::DriverLibraryUnavailable { .. })
                 | Err(GpuError::DriverCallFailed { .. })
                 | Err(GpuError::DriverSymbolMissing { .. })
-                | Err(GpuError::NotYetImplemented { .. }) => { /* expected on CPU-only */ }
+                | Err(GpuError::NoDeviceKernel { .. }) => { /* expected on CPU-only */ }
                 Err(other) => panic!("unexpected GpuError variant: {other:?}"),
             }
         }

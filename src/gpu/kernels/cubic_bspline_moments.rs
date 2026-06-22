@@ -976,7 +976,7 @@ pub fn build_hex_tensor_moments_device(
     // Mixed-signature support is Phase 3.
     for (axis, banks) in axis_tables.iter().enumerate() {
         if banks.len() != 1 {
-            return Err(GpuError::NotYetImplemented {
+            return Err(GpuError::NoDeviceKernel {
                 reason: format!(
                     "build_hex_tensor_moments_device: axis {axis} has {} derivative banks; \
                      single-bank only in Phase 2 — use the CPU path or wait on Phase 3",
@@ -2302,7 +2302,7 @@ mod cubic_bspline_moments_tests {
                 assert!(
                     matches!(err, GpuError::DriverLibraryUnavailable { .. })
                         || matches!(err, GpuError::DriverCallFailed { .. })
-                        || matches!(err, GpuError::NotYetImplemented { .. }),
+                        || matches!(err, GpuError::NoDeviceKernel { .. }),
                     "unexpected GPU error variant: {err:?}"
                 );
                 return;
@@ -2390,7 +2390,7 @@ mod cubic_bspline_moments_tests {
                 assert!(
                     matches!(err, GpuError::DriverLibraryUnavailable { .. })
                         || matches!(err, GpuError::DriverCallFailed { .. })
-                        || matches!(err, GpuError::NotYetImplemented { .. }),
+                        || matches!(err, GpuError::NoDeviceKernel { .. }),
                     "unexpected GPU error variant: {err:?}"
                 );
                 return;
