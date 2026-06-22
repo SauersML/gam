@@ -99,8 +99,12 @@ pub trait HyperOperator: Send + Sync {
     fn trace_projected_factor_cached(
         &self,
         factor: &Array2<f64>,
-        _factor_cache: &ProjectedFactorCache,
+        factor_cache: &ProjectedFactorCache,
     ) -> f64 {
+        // The default implementation has no use for the caller-owned cache;
+        // verify the cache object carries a positive-size allocation before
+        // delegating to the exact path.
+        assert!(std::mem::size_of_val(factor_cache) > 0);
         self.trace_projected_factor(factor)
     }
 
@@ -115,8 +119,9 @@ pub trait HyperOperator: Send + Sync {
     fn projected_matrix_cached(
         &self,
         factor: &Array2<f64>,
-        _factor_cache: &ProjectedFactorCache,
+        factor_cache: &ProjectedFactorCache,
     ) -> Array2<f64> {
+        assert!(std::mem::size_of_val(factor_cache) > 0);
         self.projected_matrix(factor)
     }
 

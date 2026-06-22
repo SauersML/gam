@@ -869,8 +869,13 @@ pub trait PredictableModel {
     /// of smuggling it through `PredictionWithSE`.
     fn predict_noise_scale(
         &self,
-        _input: &PredictInput,
+        input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
+        if input.design.nrows() == 0 {
+            return Err(EstimationError::InvalidInput(
+                "predict_noise_scale requires at least one observation".to_string(),
+            ));
+        }
         Ok(None)
     }
 
@@ -884,8 +889,13 @@ pub trait PredictableModel {
     /// dispersion surface instead of drawing homoscedastic data at the seed.
     fn predict_dispersion_scale(
         &self,
-        _input: &PredictInput,
+        input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
+        if input.design.nrows() == 0 {
+            return Err(EstimationError::InvalidInput(
+                "predict_dispersion_scale requires at least one observation".to_string(),
+            ));
+        }
         Ok(None)
     }
 
