@@ -253,6 +253,12 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     // pure heap-allocation removal with no effect on the computed objective.
     let mut eta_objective_scratch = Array2::<f64>::zeros((n_obs, m));
     let beta_flat_dim = p * m;
+    // Reused penalized-gradient buffer: each Newton iteration writes every entry
+    // `grad_flat[a·p + i] = Xᵀr` (direct assignment over all a∈0..m, i∈0..p)
+    // before adding the penalty term and before any read, so it carries no state
+    // across iterations and hoisting it out of the Newton loop is a pure
+    // heap-allocation removal with no effect on the computed gradient.
+    let mut grad_flat = Array1::<f64>::zeros(beta_flat_dim);
 
     let mut iterations = 0usize;
     let mut converged = false;
@@ -329,8 +335,10 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
             }
         }
 
-        // Penalized gradient: g_a = Xᵀ r_{·,a} + λ_a S β_a.
-        let mut grad_flat = Array1::<f64>::zeros(beta_flat_dim);
+        // Penalized gradient: g_a = Xᵀ r_{·,a} + λ_a S β_a. Written into the
+        // reused `grad_flat` buffer; the loop below assigns every entry (`=`,
+        // not `+=`) before the penalty `+=` and before any read, so no
+        // re-zeroing of the reused buffer is needed.
         for a in 0..m {
             for i in 0..p {
                 let mut acc = 0.0_f64;
