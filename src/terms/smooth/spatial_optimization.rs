@@ -2093,21 +2093,40 @@ pub fn fixed_kappa_profiled_reml_score(
 fn select_constant_curvature_kappa_sign_seed(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
-    weights: ArrayView1<'_, f64>,
-    offset: ArrayView1<'_, f64>,
     resolvedspec: &TermCollectionSpec,
     term_idx: usize,
-    family: LikelihoodSpec,
-    options: &FitOptions,
 ) -> Option<f64> {
     let (kappa_min, kappa_max) = constant_curvature_kappa_bounds(data, resolvedspec, term_idx);
     if !(kappa_min.is_finite() && kappa_max.is_finite() && kappa_max > kappa_min) {
         return None;
     }
+    // Resolve this term's chart-coordinate columns and its base spec so the
+    // sign-basin scan can score each probe κ with the κ-FAIR criterion directly
+    // on the production constant-curvature basis (#1464). The κ-fair score
+    // subtracts the design's generic radial-peak-fitting power (measured on a
+    // bank of κ-independent Euclidean-radial reference signals) from the data's
+    // profiled REML, so the +κ chart's distance-compression interpolation
+    // advantage — which lifts BOTH the data and the reference fits equally —
+    // cancels, leaving only the genuine curvature-shape signal. This is what
+    // makes the SIGN identifiable: the raw `fixed_kappa_profiled_reml_score`
+    // (still used for the magnitude/CI) is sign-blind on a generic radial signal
+    // and rails to the +chart bound for both spherical and hyperbolic truth.
+    let (feature_cols, base_spec) = match resolvedspec.smooth_terms.get(term_idx).map(|t| &t.basis) {
+        Some(SmoothBasisSpec::ConstantCurvature {
+            feature_cols, spec, ..
+        }) => (feature_cols, spec.clone()),
+        _ => return None,
+    };
+    let x_term = match select_columns(data, feature_cols) {
+        Ok(x) => x,
+        Err(e) => {
+            log::info!("[spatial-kappa] #1464 sign-basin scan column select failed ({e}); skipping");
+            return None;
+        }
+    };
     // Five probes spanning both signs: the two interior corners (half the chart
     // bound on each side, away from the saturating boundary), flat (κ = 0), and
-    // the chart bounds. κ-sign is PINNED during each ρ-profile, so the collapsing
-    // +κ kernel cannot pull a hyperbolic basin across zero.
+    // the chart bounds.
     let probes = [
         kappa_min,
         0.5 * kappa_min,
@@ -2115,18 +2134,14 @@ fn select_constant_curvature_kappa_sign_seed(
         0.5 * kappa_max,
         kappa_max,
     ];
-    let mut best: Option<(f64, f64)> = None; // (score, kappa)
+    let mut best: Option<(f64, f64)> = None; // (κ-fair score, kappa)
     for &kappa in &probes {
-        match fixed_kappa_profiled_reml_score(
-            data,
+        let mut probe_spec = base_spec.clone();
+        probe_spec.kappa = kappa;
+        match crate::basis::constant_curvature_kappa_fair_sign_score(
+            x_term.view(),
             y,
-            weights,
-            offset,
-            resolvedspec,
-            term_idx,
-            kappa,
-            family.clone(),
-            options,
+            &probe_spec,
         ) {
             Ok(score) => {
                 if best.as_ref().is_none_or(|(b, _)| score < *b) {
@@ -2142,8 +2157,8 @@ fn select_constant_curvature_kappa_sign_seed(
     }
     best.map(|(score, kappa)| {
         log::info!(
-            "[spatial-kappa] #1464 fixed-κ sign-basin scan selected κ_seed={kappa:.4} \
-             (profiled REML={score:.6e}) for term {term_idx}"
+            "[spatial-kappa] #1464 κ-fair sign-basin scan selected κ_seed={kappa:.4} \
+             (κ-fair score={score:.6e}) for term {term_idx}"
         );
         kappa
     })
@@ -2253,22 +2268,17 @@ fn try_exact_joint_spatial_length_scale_optimization(
             let scan = select_constant_curvature_kappa_sign_seed(
                 data,
                 y,
-                weights,
-                offset,
                 resolvedspec,
                 term_idx,
-                family.clone(),
-                options,
             );
-            // #1464 diagnostic (ban-clean: plain eprintln, no {:?}): what the
-            // sign-correct fixed-κ scan picked for this CC term, before any joint
-            // solve. If this prints a negative κ for the hyperbolic dataset but the
-            // final κ̂ is +1.08, the bug is downstream of the scan (solver railing
-            // or readback), not the scan.
+            // #1464 diagnostic: what the κ-fair sign-basin scan picked for this CC
+            // term, before any joint solve. If this prints a negative κ for the
+            // hyperbolic dataset but the final κ̂ is +1.08, the bug is downstream of
+            // the scan (solver railing or readback), not the scan.
             match scan {
                 Some(kappa_seed) => {
                     log::info!(
-                        "[#1464-trace] term {term_idx}: fixed-κ sign-basin scan picked κ_seed = {kappa_seed}"
+                        "[#1464-trace] term {term_idx}: κ-fair sign-basin scan picked κ_seed = {kappa_seed}"
                     );
                     log_kappa0.set_scalar_slot(slot, kappa_seed);
                     cc_sign_seeds.push((slot, kappa_seed));
@@ -8310,10 +8320,15 @@ pub fn curvature_inference_forspec(
 
     // Profiled criterion oracle V_p(κ): pin κ, fit with κ-optimisation OFF so
     // only ρ is profiled, return the REML/LAML negative-log-evidence. This is the
-    // SAME fixed-κ profiled criterion the production joint-fit path now scans to
-    // pick the κ-sign basin (`select_constant_curvature_kappa_sign_seed`),
-    // single-sourced through `fixed_kappa_profiled_reml_score` so the CI oracle
-    // and the basin-selection seed can never diverge.
+    // raw profiled criterion the CI walk crosses for the κ̂ MAGNITUDE and its
+    // confidence interval. The κ-SIGN basin selection
+    // (`select_constant_curvature_kappa_sign_seed`) deliberately uses a DIFFERENT,
+    // κ-FAIR criterion (`constant_curvature_kappa_fair_sign_score`, #1464): the raw
+    // V_p here is sign-blind on a generic radial signal (the +κ chart's
+    // distance-compression is a uniformly better interpolator regardless of the
+    // true sign, so raw V_p rails to the +chart bound for both signs), whereas the
+    // sign scan subtracts the design's generic radial-peak-fitting power to recover
+    // the genuine curvature sign. The two are intentionally not single-sourced.
     //
     // Memoize V_p across κ probes. The CI walk's bracketing/bisection, the
     // central-difference v_pp seed, and the flatness LR test all re-evaluate

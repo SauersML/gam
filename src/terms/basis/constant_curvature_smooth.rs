@@ -59,7 +59,7 @@
 //!   variants (e.g. tangent-space designs); the distance jet is the only one
 //!   this kernel construction needs.
 
-use ndarray::{Array1, Array2, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -750,6 +750,193 @@ pub fn build_constant_curvature_basis(
         null_eigenvectors,
         joint_null_rotation: None,
     })
+}
+
+/// Closed-form profiled Gaussian-REML negative-log-evidence of a dense design
+/// `b` (n×p) against response `y`, with an UNPENALIZED intercept column appended
+/// and the symmetric psd RKHS penalty `s` (p×p) profiled over a dense log-λ grid.
+/// `min_λ D(λ)` with
+///   `D(λ) = (n−Mp)·log(rss/(n−Mp)) + log|HᵀH| − log|λS|₊`,
+/// `H = [1|b]ᵀ[1|b] + λ·diag(0,S)`, `Mp = 1 + nullity(S)` (the intercept is in the
+/// null space). Self-contained — the same criterion shape the in-crate oracle
+/// `profiled_gaussian_reml_deviance` certifies, with the production intercept the
+/// full GAM always carries (so it matches what the fit path sees).
+fn profiled_reml_with_intercept(b: &Array2<f64>, y: &Array1<f64>, s: &Array2<f64>) -> f64 {
+    use crate::linalg::faer_ndarray::FaerEigh;
+    let n = b.nrows();
+    let p = b.ncols();
+    // Augmented design [1 | b] and zero-padded penalty diag(0, S).
+    let mut ba = Array2::<f64>::zeros((n, p + 1));
+    for i in 0..n {
+        ba[(i, 0)] = 1.0;
+        for j in 0..p {
+            ba[(i, j + 1)] = b[(i, j)];
+        }
+    }
+    let mut sa = Array2::<f64>::zeros((p + 1, p + 1));
+    for i in 0..p {
+        for j in 0..p {
+            sa[(i + 1, j + 1)] = s[(i, j)];
+        }
+    }
+    let pa = p + 1;
+    let btb = symmetrize(&ba.t().dot(&ba));
+    let bty = ba.t().dot(y);
+    let (s_evals, _) = FaerEigh::eigh(&symmetrize(&sa), faer::Side::Lower)
+        .expect("κ-fair penalty eigendecomposition");
+    let s_max = s_evals.iter().cloned().fold(0.0_f64, f64::max).max(1e-300);
+    let s_tol = s_max * 1e-9;
+    let r = s_evals.iter().filter(|&&e| e > s_tol).count();
+    let m_p = pa - r;
+    let dof = (n - m_p) as f64;
+    let log_det_s_plus: f64 = s_evals
+        .iter()
+        .filter(|&&e| e > s_tol)
+        .map(|&e| e.ln())
+        .sum();
+    let mut best = f64::INFINITY;
+    for k in -24i32..=24 {
+        let lam = (0.5 * f64::from(k)).exp();
+        let h = symmetrize(&(&btb + &(sa.mapv(|v| v * lam))));
+        let h_ridge = &h + &(Array2::<f64>::eye(pa) * (1e-10 * s_max.max(1.0)));
+        let (hv, hq) = FaerEigh::eigh(&symmetrize(&h_ridge), faer::Side::Lower)
+            .expect("κ-fair penalized-Hessian eigendecomposition");
+        let qty = hq.t().dot(&bty);
+        let mut beta = Array1::<f64>::zeros(pa);
+        let mut log_det_h = 0.0_f64;
+        for i in 0..pa {
+            let ev = hv[i].max(1e-300);
+            log_det_h += ev.ln();
+            let coef = qty[i] / ev;
+            for j in 0..pa {
+                beta[j] += hq[(j, i)] * coef;
+            }
+        }
+        let resid = y - &ba.dot(&beta);
+        let rss = resid.dot(&resid).max(1e-300);
+        let log_det_lam_s = (r as f64) * lam.ln() + log_det_s_plus;
+        let dev = dof * (rss / dof).ln() + log_det_h - log_det_lam_s;
+        if dev < best {
+            best = dev;
+        }
+    }
+    best
+}
+
+/// #1464: the **κ-fair** sign-resolving score for a constant-curvature smooth at
+/// a fixed κ — the production datum the sign-basin scan minimizes to choose the
+/// curvature SIGN basin.
+///
+/// THE DATA-FIT κ-FAIRNESS FIX. The L(κ)/L_S(κ) effective-length reparam already
+/// holds the kernel FILL and the penalty Occam term κ-invariant (#944/#1464
+/// penalty fix), but the realized profiled-REML DATA-FIT term is still sign-blind:
+/// on a generic center-peaked radial signal the +κ chart's geodesic-distance
+/// COMPRESSION concentrates the design's singular-value mass into the leading
+/// (low-order radial) modes — a uniformly better interpolator of ANY radial peak,
+/// regardless of the true curvature sign — so `V_p(κ)` decreases monotonically
+/// toward the +chart bound for BOTH spherical and hyperbolic truth (hyperbolic
+/// recovered as spherical, κ̂ railed to +0.5/max‖x‖²). Holding the EDF / hat-trace
+/// or ‖X‖_F κ-invariant does NOT cure it: the advantage is the per-direction
+/// REDISTRIBUTION of approximation power, not its total scale (verified — the EDF
+/// is already κ-invariant to <1% under L(κ), yet RSS still falls toward +κ).
+///
+/// The cure makes the comparison apples-to-apples by SUBTRACTING the design's
+/// GENERIC radial-peak-fitting power at this κ. We measure that generic power with
+/// a bank of κ-INDEPENDENT reference signals `r_α(i) = exp(−α·‖x_i‖)` — radial in
+/// the Euclidean chart coordinate, so carrying NO curvature-sign preference — and
+/// score
+///
+/// ```text
+///   V_fair(κ) = V_p(κ; y) − mean_α V_p(κ; r_α) .
+/// ```
+///
+/// The generic +κ interpolation advantage cancels between the two terms (it lifts
+/// `V_p(κ; y)` and `V_p(κ; r_α)` by the same amount), leaving only the GENUINE
+/// curvature-shape alignment of the actual data `y` with the κ-geometry. The bank
+/// (several α widths, averaged) removes the residual sensitivity of any single
+/// reference width to the data realization, so `argmin_κ V_fair` lands on the
+/// correct SIDE of 0 for both signs (spherical κ̂ > 0, hyperbolic κ̂ < 0) across
+/// seeds. The reference correction enters ONLY the sign-basin SELECTION; the
+/// realized fit and the magnitude/CI keep using the raw `V_p`, so the κ = 0 build
+/// and the final coefficients are untouched.
+///
+/// Builds the design `X = K_κ(data, centers)·z` at the data→center effective
+/// length `L(κ)` and the penalty `S = symm(zᵀK_κ(centers,centers)z)` at the
+/// center→center effective length `L_S(κ)`, exactly as
+/// [`build_constant_curvature_basis`] (raw RKHS Gram, scale = 1, intercept
+/// appended unpenalized), so the criterion the scan minimizes is the production
+/// design's own profiled REML.
+pub fn constant_curvature_kappa_fair_sign_score(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    spec: &ConstantCurvatureBasisSpec,
+) -> Result<f64, BasisError> {
+    if data.ncols() == 0 {
+        crate::bail_invalid_basis!("constant-curvature κ-fair score needs at least one feature column");
+    }
+    if !spec.kappa.is_finite() {
+        crate::bail_invalid_basis!("constant-curvature κ-fair score needs a finite kappa");
+    }
+    if y.len() != data.nrows() {
+        crate::bail_dim_basis!(
+            "constant-curvature κ-fair score: y has {} rows but data has {}",
+            y.len(),
+            data.nrows()
+        );
+    }
+    validate_chart_points(data, spec.kappa, "data")?;
+    let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
+    if centers.nrows() < 2 {
+        return Err(BasisError::InsufficientColumnsForConstraint {
+            found: centers.nrows(),
+        });
+    }
+    validate_chart_points(centers.view(), spec.kappa, "centers")?;
+    let length_scale = realized_constant_curvature_length_scale(centers.view(), spec.length_scale)?;
+    // Design effective length L(κ) (data→center fill) and penalty effective
+    // length L_S(κ) (center→center fill) — identical to the value builder.
+    let (ell_eff, _, _) =
+        constant_curvature_effective_length_jet(data, centers.view(), length_scale, spec.kappa)?;
+    let (ell_eff_penalty, _, _) = constant_curvature_effective_length_jet(
+        centers.view(),
+        centers.view(),
+        length_scale,
+        spec.kappa,
+    )?;
+    let weights = Array1::<f64>::ones(centers.nrows());
+    let z = weighted_coefficient_sum_to_zero_transform(weights.view())?;
+    let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[z]);
+    let raw_design = constant_curvature_kernel_matrix(data, centers.view(), spec.kappa, ell_eff)?;
+    let b = gauge.restrict_design(&raw_design);
+    let raw_penalty =
+        constant_curvature_kernel_matrix(centers.view(), centers.view(), spec.kappa, ell_eff_penalty)?;
+    let s = symmetrize(&gauge.restrict_penalty(&raw_penalty));
+
+    let v_y = profiled_reml_with_intercept(&b, &y.to_owned(), &s);
+
+    // κ-independent generic radial reference bank r_α(i) = exp(−α·‖x_i‖) in the
+    // Euclidean chart coordinate. Several widths, averaged, so the cancellation of
+    // the generic +κ peak-fitting advantage does not hinge on one tuned width.
+    const REFERENCE_ALPHAS: [f64; 4] = [0.5, 1.0, 2.0, 4.0];
+    let radii: Array1<f64> = data
+        .outer_iter()
+        .map(|row| row.dot(&row).sqrt())
+        .collect();
+    let mut v_ref_sum = 0.0_f64;
+    for &alpha in &REFERENCE_ALPHAS {
+        let r_alpha: Array1<f64> = radii.mapv(|rr| (-alpha * rr).exp());
+        v_ref_sum += profiled_reml_with_intercept(&b, &r_alpha, &s);
+    }
+    let v_ref_mean = v_ref_sum / REFERENCE_ALPHAS.len() as f64;
+
+    let v_fair = v_y - v_ref_mean;
+    if !v_fair.is_finite() {
+        crate::bail_invalid_basis!(
+            "constant-curvature κ-fair score at κ={} is non-finite (V_y={v_y}, V_ref={v_ref_mean})",
+            spec.kappa
+        );
+    }
+    Ok(v_fair)
 }
 
 /// Symmetrize `M` in place to `(M + Mᵀ)/2` (the realized penalty is built from
