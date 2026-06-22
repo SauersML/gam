@@ -62,6 +62,8 @@ mod quality_vs_flexsurv_rp_spline;
 mod quality_vs_flexsurv_weibull_aft;
 #[path = "quality/quality_vs_gam_competing_risks_integral_identity.rs"]
 mod quality_vs_gam_competing_risks_integral_identity;
+#[path = "quality/quality_vs_gamboostlss_gaussian_location_scale.rs"]
+mod quality_vs_gamboostlss_gaussian_location_scale;
 #[path = "quality/quality_vs_gamlss_beta_dispersion_location_scale_1060.rs"]
 mod quality_vs_gamlss_beta_dispersion_location_scale_1060;
 #[path = "quality/quality_vs_gamlss_binomial_location_scale.rs"]
@@ -274,8 +276,12 @@ mod quality_vs_rstpm2_pstpm2_monotone_baseline_constraint;
 mod quality_vs_rstpm2_pstpm2_penalized_baseline;
 #[path = "quality/quality_vs_rstpm2_pstpm2_smooth_covariate.rs"]
 mod quality_vs_rstpm2_pstpm2_smooth_covariate;
+#[path = "quality/quality_vs_scam_convex_smooth.rs"]
+mod quality_vs_scam_convex_smooth;
 #[path = "quality/quality_vs_scam_monotone_baseline.rs"]
 mod quality_vs_scam_monotone_baseline;
+#[path = "quality/quality_vs_scam_monotone_increasing_smooth.rs"]
+mod quality_vs_scam_monotone_increasing_smooth;
 #[path = "quality/quality_vs_scipy_boxcox_univariate_lambda.rs"]
 mod quality_vs_scipy_boxcox_univariate_lambda;
 #[path = "quality/quality_vs_scipy_conjugate_gaussian_posterior.rs"]
