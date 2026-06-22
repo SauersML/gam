@@ -2193,10 +2193,16 @@ mod linear_parity_anchor_1026_tests {
         captured / sst.max(1e-300)
     }
 
-    /// Build a K-atom LINEAR (degree-1, d=1) SAE term over distinct 1-D coords.
-    /// The decoder seed is irrelevant to the anchor (the anchor re-derives the
-    /// output subspace by SVD), so we seed zeros.
-    fn linear_term(k: usize, n: usize, p: usize) -> (SaeManifoldTerm, Array2<f64>) {
+    /// Build a K-atom LINEAR (degree-1, d=1) SAE term over distinct 1-D coords
+    /// with a known rank-`r_true` linear target `X = Z @ D`. The decoder seed is
+    /// irrelevant to the anchor (the anchor re-derives the output subspace by
+    /// SVD), so we seed zeros.
+    fn linear_term_rank(
+        k: usize,
+        n: usize,
+        p: usize,
+        r_true: usize,
+    ) -> (SaeManifoldTerm, Array2<f64>) {
         let mut atoms = Vec::with_capacity(k);
         let mut coords_blocks = Vec::with_capacity(k);
         for idx in 0..k {
@@ -2238,8 +2244,7 @@ mod linear_parity_anchor_1026_tests {
         )
         .unwrap();
         let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
-        // Known rank-R linear target: X = Z @ D.
-        let r_true = 6usize;
+        // Known rank-`r_true` linear target: X = Z @ D.
         let z = Array2::from_shape_fn((n, r_true), |(i, j)| {
             ((i as f64 + 1.0) * 0.137 * (j as f64 + 1.0)).sin() + 0.3 * ((i * j) as f64).cos()
         });
@@ -2248,6 +2253,11 @@ mod linear_parity_anchor_1026_tests {
         });
         let target = z.dot(&d_true);
         (term, target)
+    }
+
+    /// Rank-6 convenience wrapper (the original fixture).
+    fn linear_term(k: usize, n: usize, p: usize) -> (SaeManifoldTerm, Array2<f64>) {
+        linear_term_rank(k, n, p, 6)
     }
 
     #[test]
@@ -2297,6 +2307,146 @@ mod linear_parity_anchor_1026_tests {
                  entitled to (#1026 parity)"
             );
         }
+    }
+
+    /// #1026 — the anchor reaches the PCA ceiling at a LARGER synthetic
+    /// dictionary rank (not just the rank-2/6/12 of the small fixture). This is
+    /// the CPU-checkable half of the issue's K-scaling ladder (item 1): the
+    /// reconstruction-parity ceiling claim is pure sequential-deflation linear
+    /// algebra, so it must hold as the dictionary's total rank grows. Here
+    /// `K ∈ {8, 12, 16}` linear atoms (basis_size 2 each ⇒ total rank up to 32)
+    /// reconstruct a genuinely rank-24 target in `p = 40` output channels, so the
+    /// dictionary rank `2K` straddles the data rank 24 and the PCA ceiling is
+    /// non-trivial (neither 0 nor a saturated 1.0) at the low end. A regression
+    /// that loses reconstructible variance at scale — wrong per-atom rank, a
+    /// dropped deflation step, a non-orthogonal frame that only shows up once many
+    /// atoms accumulate — is caught here where the small fixture (capped at p=8)
+    /// could not exercise it. The large-K *real-corpus* EV-vs-K curve remains
+    /// GPU/corpus-gated; this pins only the synthetic Eckart-Young ceiling, which
+    /// needs no corpus.
+    #[test]
+    fn linear_span_anchor_reaches_pca_ceiling_at_large_dictionary_rank_1026() {
+        let n = 120usize;
+        let p = 40usize;
+        let r_true = 24usize;
+        for &k in &[8usize, 12, 16] {
+            let (term, target) = linear_term_rank(k, n, p, r_true);
+            let anchor = linear_span_anchor(&term, target.view())
+                .expect("large-K linear anchor must solve on finite linear data");
+            let ev_anchor =
+                reconstruction_explained_variance(target.view(), anchor.reconstruction.view())
+                    .expect("anchor EV must be finite");
+            // Each LINEAR atom has basis_size 2; the sequential Eckart-Young
+            // deflation captures the top-2 residual directions per atom, so K atoms
+            // capture rank min(2K, n, p, r_true). Compare to that PCA ceiling.
+            let total_rank = (2 * k).min(n).min(p).min(r_true);
+            let ceiling = pca_ev_ceiling(target.view(), total_rank);
+            println!(
+                "[#1026] LARGE K={k:>2} (dict rank {:>2}, data rank {r_true})  \
+                 anchor EV={ev_anchor:.8}  PCA ceiling={ceiling:.8}  gap={:.2e}",
+                2 * k,
+                ceiling - ev_anchor
+            );
+            assert!(ev_anchor.is_finite(), "K={k}: large-K anchor EV must be finite");
+            // The non-trivially-ranked ceiling (e.g. K=8 ⇒ rank-16 ceiling on
+            // rank-24 data is < 1.0) must be reached by the greedy deflation to the
+            // same small margin as the small fixture; a scale-only regression would
+            // open the gap by orders of magnitude.
+            assert!(
+                ev_anchor >= ceiling - 5e-3,
+                "K={k}: large-K linear anchor EV {ev_anchor} must reach the rank-{total_rank} \
+                 PCA ceiling {ceiling} (within 5e-3) at scale — a larger shortfall means the \
+                 deflation loses reconstructible variance as the dictionary grows (#1026 parity)"
+            );
+            // Sanity that the fixture actually exercises the sub-saturation regime
+            // at the low end (so the ceiling is a real constraint, not a free 1.0).
+            if 2 * k < r_true {
+                assert!(
+                    ceiling < 0.9999,
+                    "K={k}: dict rank {} < data rank {r_true} must give a sub-1.0 PCA ceiling \
+                     (got {ceiling}); fixture mis-specified",
+                    2 * k
+                );
+            }
+        }
+    }
+
+    /// #1026 — the ROUTING-BOUND ("price of sparsity") pinned as a STRICT EV gap,
+    /// in pure anchor algebra (no inner-solver / `into_fitted` confound). The
+    /// neutral-gate anchor keeps every atom ON for every row, so it can use all
+    /// `2K` decoder directions per row and reaches the rank-`2K` PCA ceiling. A
+    /// SPARSE router that activates only ONE atom per row caps that row's
+    /// reconstruction at the single active atom's basis rank (2), so on data whose
+    /// local rank exceeds 2 it CANNOT match the dense anchor. We realize the
+    /// sparse-routed reconstruction directly from the SAME anchor frames (each row
+    /// reconstructed by ONLY its assigned atom's rank-2 image), so the difference
+    /// is the routing restriction alone — the engine's seed/Newton dynamics never
+    /// enter. The strict gap is the CPU-provable face of the issue's finding that
+    /// fitted sparse routing under-reconstructs the neutral-gate PCA subspace;
+    /// the magnitude of that gap on the real Qwen corpus is the GPU/corpus-gated
+    /// frontier, but its SIGN (sparse < dense, strictly) is provable here.
+    #[test]
+    fn sparse_routing_strictly_underreconstructs_dense_anchor_1026() {
+        let n = 60usize;
+        let p = 16usize;
+        let r_true = 10usize;
+        let k = 5usize;
+        let (term, target) = linear_term_rank(k, n, p, r_true);
+
+        // Dense neutral-gate anchor: all 2K directions available per row.
+        let anchor = linear_span_anchor(&term, target.view())
+            .expect("dense anchor must solve on finite linear data");
+        let ev_dense =
+            reconstruction_explained_variance(target.view(), anchor.reconstruction.view())
+                .expect("dense EV finite");
+
+        // Sparse top-1 routing: each row reconstructed by ONLY its single assigned
+        // atom's rank-2 image. We assign rows round-robin across the K atoms and
+        // rebuild each atom's own rank-2 reconstruction of the FULL target (its
+        // Eckart-Young image), then keep only the rows routed to it. This is the
+        // best a single-active-atom router can do per row given these frames, so
+        // it is an UPPER bound on top-1 sparse EV — and it is still strictly below
+        // the dense anchor whenever the data's local rank exceeds 2.
+        let mut sparse_recon = Array2::<f64>::zeros((n, p));
+        for (atom_idx, atom_anchor) in anchor.atoms.iter().enumerate() {
+            // Atom image over all rows, exactly as the anchor builds each atom's
+            // contribution: `gate · coordinates @ frameᵀ` (frame is p×rank,
+            // `decoder_coordinates` is n×rank, so `fast_abt` gives the n×p image).
+            let coords = &atom_anchor.decoder_coordinates;
+            let frame_matrix = atom_anchor.frame.frame().to_owned();
+            let image =
+                fast_abt(coords, &frame_matrix).mapv(|v| v * atom_anchor.gate_weight);
+            for row in 0..n {
+                if row % k == atom_idx {
+                    for col in 0..p {
+                        sparse_recon[[row, col]] = image[[row, col]];
+                    }
+                }
+            }
+        }
+        let ev_sparse = reconstruction_explained_variance(target.view(), sparse_recon.view())
+            .expect("sparse EV finite");
+
+        println!(
+            "[#1026] routing-bound: dense neutral-gate anchor EV={ev_dense:.6}  \
+             top-1 sparse-routed EV={ev_sparse:.6}  price-of-sparsity gap={:.6}",
+            ev_dense - ev_sparse
+        );
+        assert!(
+            ev_dense.is_finite() && ev_sparse.is_finite(),
+            "both EVs must be finite: dense={ev_dense}, sparse={ev_sparse}"
+        );
+        // The dense anchor reaches (essentially) the full ceiling; the top-1 router
+        // is rank-limited to 2 per row on rank-10 data, so it MUST fall strictly
+        // short. The margin (well above rounding) is the provable price of sparsity.
+        assert!(
+            ev_dense > ev_sparse + 0.05,
+            "#1026 routing-bound: dense neutral-gate anchor EV {ev_dense:.6} must STRICTLY \
+             exceed top-1 sparse-routed EV {ev_sparse:.6} (the price of sparsity: a single \
+             active rank-2 atom per row cannot span the rank-{r_true} local data) — a \
+             vanishing gap would mean sparse routing is silently as expressive as the \
+             dense PCA subspace, contradicting the #1026 finding"
+        );
     }
 
     /// Build a single-atom LINEAR SAE whose one atom has latent dim `d` (basis
@@ -2634,5 +2784,116 @@ mod linear_parity_anchor_1026_tests {
                  at λ=exp({log_lam}) (ungating only enlarges the feasible set)"
             );
         }
+    }
+
+    /// Explained variance of the least-squares projection of `target` (n×p) onto
+    /// the column span of a design matrix `phi` (n×m). The design's first column is
+    /// an intercept in every caller below, so the projection is mean-aware and the
+    /// EV denominator (column-centered SST) is consistent. Solved via the normal
+    /// equations with a tiny ridge for numerical PD safety.
+    fn ls_projection_ev(phi: ArrayView2<'_, f64>, target: ArrayView2<'_, f64>) -> f64 {
+        let m = phi.ncols();
+        let gram = phi.t().dot(&phi) + Array2::<f64>::eye(m) * 1.0e-10;
+        let rhs = phi.t().dot(&target);
+        let coeffs = crate::faer_ndarray::FaerCholesky::cholesky(&gram, faer::Side::Lower)
+            .map(|c| c.solve_mat(&rhs))
+            .expect("design Gram must be SPD");
+        let fitted = phi.dot(&coeffs);
+        reconstruction_explained_variance(target, fitted.view()).expect("projection EV finite")
+    }
+
+    /// #1026 HYBRID curved+linear dictionary (ladder item 2) — the CPU-provable
+    /// per-active-expressivity invariant: on data that is a LINEAR component in one
+    /// latent coordinate PLUS a CURVED (periodic) component in another, a hybrid
+    /// dictionary that pairs a LINEAR atom with a CURVED (periodic-harmonic) atom
+    /// reconstructs STRICTLY MORE variance than EITHER a pure-linear dictionary OR
+    /// a pure-curved dictionary of the same composition alone. This is the issue's
+    /// "high-confidence hybrid-dominance" argument made concrete on synthetic data:
+    /// a degree-1 line cannot bend to the periodic wave (so curved-alone misses the
+    /// linear ramp's intercept/slope only partially via its own basis, and
+    /// linear-alone misses the wave entirely), while the union of the two bases
+    /// spans both. We fit each candidate by the EXACT least-squares projection onto
+    /// its basis design (built from the SAME production evaluators the SAE uses:
+    /// the linear `{1, z}` design and `PeriodicHarmonicEvaluator`'s `{1, sinθ,
+    /// cosθ}`), so the comparison is pure CPU linear algebra with no corpus, no
+    /// inner Newton, and no GPU. The real large-K hybrid EV-vs-K curve on the Qwen
+    /// corpus stays corpus/GPU-gated; this pins the SIGN of the hybrid advantage
+    /// (hybrid > max(linear, curved), strictly) which needs no corpus.
+    #[test]
+    fn hybrid_curved_plus_linear_beats_either_alone_1026() {
+        let n = 80usize;
+        let p = 5usize;
+        // Two independent latent coordinates: a linear factor z and a periodic
+        // angle θ ∈ [0, 1) (period 1). The signal is a linear ramp in z PLUS a
+        // genuine circular wave in θ that no degree-1 line in θ can represent.
+        let zf: Vec<f64> = (0..n).map(|i| ((i as f64 + 1.0) * 0.21).sin()).collect();
+        let theta: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.6180339887) % 1.0).collect();
+        // Per-channel coefficients for the linear ramp and the sin/cos wave.
+        let a0 = Array1::from_shape_fn(p, |c| 0.5 + 0.3 * (c as f64));
+        let a1 = Array1::from_shape_fn(p, |c| (((c + 1) % 4) as f64 - 1.5) * 0.8);
+        let bs = Array1::from_shape_fn(p, |c| (((c * 2 + 1) % 5) as f64 - 2.0) * 0.9);
+        let bc = Array1::from_shape_fn(p, |c| (((c * 3 + 2) % 5) as f64 - 2.0) * 0.7);
+        let two_pi = std::f64::consts::TAU;
+        let target = Array2::from_shape_fn((n, p), |(i, c)| {
+            a0[c] + a1[c] * zf[i]
+                + bs[c] * (two_pi * theta[i]).sin()
+                + bc[c] * (two_pi * theta[i]).cos()
+        });
+
+        // LINEAR-only design: {1, z} (the pure-linear dictionary's reach).
+        let mut phi_lin = Array2::<f64>::ones((n, 2));
+        for i in 0..n {
+            phi_lin[[i, 1]] = zf[i];
+        }
+        // CURVED-only design: the production periodic-harmonic basis {1, sinθ, cosθ}.
+        let eval = PeriodicHarmonicEvaluator::new(3).unwrap();
+        let theta_coords = Array2::from_shape_fn((n, 1), |(i, _)| theta[i]);
+        let (phi_curved, _jet) = eval.evaluate(theta_coords.view()).unwrap();
+        // HYBRID design: linear {z} tier concatenated with the curved {sinθ, cosθ}
+        // atom (single shared intercept) — the union basis the hybrid SAE realizes
+        // (a linear background atom + a curved atom in one fit).
+        let mut phi_hybrid = Array2::<f64>::ones((n, 4));
+        for i in 0..n {
+            phi_hybrid[[i, 1]] = zf[i];
+            phi_hybrid[[i, 2]] = phi_curved[[i, 1]]; // sinθ
+            phi_hybrid[[i, 3]] = phi_curved[[i, 2]]; // cosθ
+        }
+
+        let ev_lin = ls_projection_ev(phi_lin.view(), target.view());
+        let ev_curved = ls_projection_ev(phi_curved.view(), target.view());
+        let ev_hybrid = ls_projection_ev(phi_hybrid.view(), target.view());
+        println!(
+            "[#1026] hybrid dominance: linear-only EV={ev_lin:.6}  curved-only EV={ev_curved:.6}  \
+             hybrid EV={ev_hybrid:.6}  hybrid−max(either)={:.6}",
+            ev_hybrid - ev_lin.max(ev_curved)
+        );
+
+        assert!(
+            ev_lin.is_finite() && ev_curved.is_finite() && ev_hybrid.is_finite(),
+            "all three projection EVs must be finite: lin={ev_lin}, curved={ev_curved}, \
+             hybrid={ev_hybrid}"
+        );
+        // The hybrid spans BOTH components, so it captures (essentially) all the
+        // variance — strictly more than either single-geometry dictionary, each of
+        // which is blind to the other component. A regression that broke the
+        // periodic basis (curved collapses to the linear reach) or the linear tier
+        // would shrink this gap.
+        assert!(
+            ev_hybrid > ev_lin + 0.05,
+            "#1026 hybrid: union basis EV {ev_hybrid:.6} must STRICTLY beat linear-only \
+             {ev_lin:.6} (the curved atom captures the periodic wave a line cannot)"
+        );
+        assert!(
+            ev_hybrid > ev_curved + 0.05,
+            "#1026 hybrid: union basis EV {ev_hybrid:.6} must STRICTLY beat curved-only \
+             {ev_curved:.6} (the linear tier captures the z-ramp the periodic atom cannot)"
+        );
+        // And the hybrid essentially saturates: the union basis is the exact
+        // generating model, so its projection EV is ~1 (within LS/ridge rounding).
+        assert!(
+            ev_hybrid > 0.999,
+            "#1026 hybrid: the union basis is the exact generating model, so its \
+             projection EV must be ~1; got {ev_hybrid:.6}"
+        );
     }
 }
