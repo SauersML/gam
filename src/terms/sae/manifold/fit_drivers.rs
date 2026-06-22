@@ -3283,34 +3283,43 @@ impl SaeManifoldTerm {
         // the fixed chart), then a per-row coordinate re-projection onto that
         // refreshed decoder (a Lloyd/EM step that snaps each row's latent coordinate
         // to the nearest decoded grid point), then one more decoder refit at the
-        // re-projected coordinates. Each half-step is a closed-form global minimizer
-        // of its own sub-problem, so the alternation monotonically reduces the
-        // reconstruction residual on the data it sees.
+        // re-projected coordinates.
         //
         // It is applied here (every joint fit) rather than only on the homotopy
         // arrival because the standard inner solve — the path the real-data fit
         // actually takes when the curvature walk bifurcates rather than "arrives" —
-        // never reached this polish before. Each accepted alternation is committed
-        // ONLY when the dictionary reconstruction EV strictly improves beyond the
-        // degradation tolerance, snapshotting first and restoring on any non-
-        // improvement; so on a fit that already converged (the common case, every
-        // healthy synthetic fit) the first refit reproduces the same decoder and the
-        // EV does not move, the polish reverts, and the returned state is bit-for-bit
-        // the pre-polish converged state. The polish can therefore only ever RAISE
-        // reconstruction parity, never lower it, and never perturbs a good basin.
+        // never reached this polish before.
+        //
+        // CRITICAL: the gate is the PENALIZED objective total — the exact same
+        // scalar the inner Armijo line search and the outer REML evidence engine
+        // consume (`penalized_objective_total(target, rho, analytic_penalties, 1.0)`)
+        // — NOT raw reconstruction EV. The decoder refit is an UNPENALIZED data-fit
+        // least squares (and the coordinate re-projection is pure data-fit too), so a
+        // round can lower the reconstruction residual while RAISING the decoder
+        // smoothness penalty; gating on EV would then commit a state with a worse
+        // penalized objective and corrupt the evidence comparison the outer loop runs
+        // on the returned loss. Gating on the penalized total instead means a round
+        // is committed ONLY when it strictly lowers the SAME objective the joint
+        // Newton solve descends — so the returned penalized loss is guaranteed
+        // non-increasing (it preserves the inner loop's monotonicity contract) and a
+        // round that trades data-fit for penalty is correctly reverted. A truncated
+        // Newton leaves the penalized objective ABOVE its decoder-β argmin, so the
+        // penalized refit lowers it (the rescue); a converged decoder is already at
+        // that argmin, so the first refit reproduces it, the objective does not move,
+        // and the polish reverts to the bit-for-bit pre-polish state (the no-op).
         //
         // Skipped when decoder frames are active: `refit_decoder_least_squares_at_
         // current_state` writes the full-`B` decoder directly, which would desync the
         // factored frames the inner solve and `apply_newton_step` rely on; the
-        // homotopy-arrival polish makes the same conservative choice. K = 1 with a
-        // periodic atom on a wrong (chord) basin is also left to the homotopy
-        // recovery, not perturbed here.
+        // homotopy-arrival polish makes the same conservative choice.
         if !self.frames_active() {
-            let mut best_polish_ev = self
-                .dictionary_reconstruction_ev(target, rho)
-                .unwrap_or(f64::NEG_INFINITY);
-            if best_polish_ev.is_finite() {
-                for _ in 0..SAE_FINAL_DECODER_POLISH_MAX_ROUNDS {
+            let mut best_objective =
+                self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+            if best_objective.is_finite() {
+                // #1026: up to 4 alternating decoder-LSQ / coordinate-reprojection
+                // polish rounds; the strict-objective-decrease gate below stops
+                // early and is a bit-for-bit no-op on an already-converged decoder.
+                for _ in 0..4 {
                     let snapshot = self.snapshot_mutable_state();
                     let round = self
                         .refit_decoder_least_squares_at_current_state(target, Some(rho))
@@ -3323,18 +3332,23 @@ impl SaeManifoldTerm {
                         .and_then(|()| {
                             self.refit_decoder_least_squares_at_current_state(target, Some(rho))
                         })
-                        .and_then(|()| self.dictionary_reconstruction_ev(target, rho));
+                        .and_then(|()| {
+                            self.penalized_objective_total(target, rho, analytic_penalties, 1.0)
+                        });
+                    // Commit only on a STRICT decrease of the penalized objective,
+                    // scaled by the objective magnitude so the test is meaningful at
+                    // any loss scale. Anything else (already-converged decoder, a
+                    // round that traded data-fit for penalty, or a refit/projection
+                    // failure) restores the pre-round state and stops.
+                    let accept_floor =
+                        SAE_FINAL_EV_DEGRADATION_TOL * (1.0 + best_objective.abs());
                     match round {
-                        Ok(ev)
-                            if ev.is_finite()
-                                && ev > best_polish_ev + SAE_FINAL_EV_DEGRADATION_TOL =>
+                        Ok(value)
+                            if value.is_finite() && value < best_objective - accept_floor =>
                         {
-                            best_polish_ev = ev;
+                            best_objective = value;
                         }
                         _ => {
-                            // No strict improvement (already converged, or a refit /
-                            // projection failure): restore and stop — the polish is a
-                            // strict no-op on a settled decoder.
                             self.restore_mutable_state(&snapshot);
                             break;
                         }
