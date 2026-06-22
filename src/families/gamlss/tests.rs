@@ -433,6 +433,139 @@ pub(crate) fn binomial_location_scale_joint_hessian_matches_single_sourced_tower
     }
 }
 
+/// #932: at βw = 0 the WIGGLE joint-Hessian assembler must reduce EXACTLY to
+/// the (already tower-pinned) non-wiggle assembler on the (η_t, η_ls) block.
+///
+/// `wiggle_hessian_row_pieces` hand-derives the composed-index `q = q0 +
+/// Σ_j βw_j·B_j(q0)` chain through `m = B'·βw + 1` and `g2 = B''·βw`; its
+/// `coeff_tw_*` / `coeff_lw_*` / `coeffww` cross blocks are the #736 genus and
+/// have no exact (non-FD, non-operator-vs-dense) oracle. A full wiggle tower is
+/// a larger unit (#932 comment), but one structurally-certain invariant is
+/// cheap and independent: at `βw = 0` we have `m = 1`, `g2 = 0`, `etaw = 0`, so
+/// `q = q0` and the wiggle base coefficients collapse to the non-wiggle ones
+/// (`coeff_tt = hessian_coeff(m1, m2, q0_t, q0_t, 0)`, etc.). Therefore the
+/// wiggle joint Hessian's top-left `(pt+pls)` block must equal the non-wiggle
+/// `exact_newton_joint_hessian_from_designs` joint matrix built from the SAME
+/// data — two INDEPENDENT hand assemblers (the non-wiggle one is itself pinned
+/// to the single-source tower by
+/// `binomial_location_scale_joint_hessian_matches_single_sourced_tower_932`),
+/// so agreement transitively pins the wiggle base block to the tower and would
+/// catch a typo in the wiggle base chain. Across probit / logit / cloglog.
+#[test]
+pub(crate) fn binomial_wiggle_joint_hessian_reduces_to_nonwiggle_at_zero_betaw_932() {
+    let n = 10usize;
+    let pt = 3usize;
+    let pls = 2usize;
+    let xt = Array2::from_shape_fn((n, pt), |(i, j)| {
+        ((i as f64) * 0.17 + (j as f64) * 0.29).sin() * 0.4 + 0.2
+    });
+    let xls = Array2::from_shape_fn((n, pls), |(i, j)| {
+        ((i as f64) * 0.23 + (j as f64) * 0.41).cos() * 0.3
+    });
+    let beta_t = array![0.20, -0.10, 0.05];
+    let beta_ls = array![0.30, -0.15];
+    let eta_t = xt.dot(&beta_t);
+    let eta_ls = xls.dot(&beta_ls);
+    let y = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }));
+    let weights = Array1::from_iter((0..n).map(|i| 0.5 + 0.2 * i as f64));
+    let q_seed = Array1::linspace(-1.0, 1.0, n);
+    let (_wiggle_block, knots) =
+        BinomialLocationScaleWiggleFamily::buildwiggle_block_input(q_seed.view(), 2, 3, 2, false)
+            .expect("wiggle block");
+
+    for link in [
+        InverseLink::Standard(StandardLink::Probit),
+        InverseLink::Standard(StandardLink::Logit),
+        InverseLink::Standard(StandardLink::CLogLog),
+    ] {
+        let threshold_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xt.clone()));
+        let log_sigma_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xls.clone()));
+        let wiggle_family = BinomialLocationScaleWiggleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: link.clone(),
+            threshold_design: Some(threshold_design),
+            log_sigma_design: Some(log_sigma_design),
+            wiggle_knots: knots.clone(),
+            wiggle_degree: 2,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        // βw = 0 ⇒ etaw = 0, m = 1, g2 = 0, q = q0.
+        let q0 = Array1::from_iter(
+            eta_t
+                .iter()
+                .zip(eta_ls.iter())
+                .map(|(&t, &l)| binomial_location_scale_q0(t, exp_sigma_from_eta_scalar(l))),
+        );
+        let wiggle_design_current = wiggle_family
+            .wiggle_design(q0.view())
+            .expect("current wiggle basis");
+        let pw = wiggle_design_current.ncols();
+        let beta_w = Array1::<f64>::zeros(pw);
+        let eta_w = Array1::<f64>::zeros(n);
+        let wiggle_states = vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: eta_t.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: eta_ls.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_w,
+                eta: eta_w,
+            },
+        ];
+        let h_wiggle = wiggle_family
+            .exact_newton_joint_hessian(&wiggle_states)
+            .expect("wiggle joint Hessian")
+            .expect("wiggle joint Hessian present");
+        assert_eq!(h_wiggle.dim(), (pt + pls + pw, pt + pls + pw));
+
+        // Non-wiggle reference on identical data / states.
+        let nonwiggle_family = BinomialLocationScaleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: link.clone(),
+            threshold_design: None,
+            log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let nonwiggle_states = vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: eta_t.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: eta_ls.clone(),
+            },
+        ];
+        let h_nonwiggle = nonwiggle_family
+            .exact_newton_joint_hessian_from_designs(&nonwiggle_states, &xt, &xls)
+            .expect("non-wiggle joint Hessian")
+            .expect("non-wiggle joint Hessian present");
+        assert_eq!(h_nonwiggle.dim(), (pt + pls, pt + pls));
+
+        // The wiggle (η_t, η_ls) top-left block must equal the non-wiggle joint
+        // Hessian exactly (both are analytic; βw = 0 makes them the same model).
+        for a in 0..(pt + pls) {
+            for b in 0..(pt + pls) {
+                let w = h_wiggle[[a, b]];
+                let nw = h_nonwiggle[[a, b]];
+                assert!(
+                    (w - nw).abs() <= 1e-9 * (1.0 + nw.abs()),
+                    "{link:?}: wiggle (β_w=0) joint Hessian [{a}][{b}] {w:.9e} != \
+                     non-wiggle {nw:.9e}"
+                );
+            }
+        }
+    }
+}
+
 pub(crate) fn hand_trigamma(x: f64) -> f64 {
     crate::families::jet_tower::trigamma_derivative_stack(x)[0]
 }
