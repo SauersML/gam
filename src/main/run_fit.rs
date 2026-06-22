@@ -177,7 +177,15 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     progress.set_stage("fit", "parsing csv and inferring schema");
     progress.start_secondary_workflow("Data Loading", 3);
     let requested_columns = required_columns_for_fit(&args, &parsed)?;
-    let ds = load_dataset_projected(&args.data, &requested_columns)?;
+    // Force `group(g)` / `factor(g)` / `re(g)` grouping columns to a factor
+    // encoding even when their labels are numeric. An untyped CSV cannot carry
+    // the typed-frame categorical sentinel the Python path uses, so without this
+    // a numeric-coded grouping column would be demoted to a single continuous
+    // ramp — a strictly lower-capacity design than `gamfit.fit` builds for the
+    // same data. The CLI has no multinomial family, so the response is never a
+    // forced factor here; only the random-effect roles are. Bare `+ x` and
+    // `s(x)` stay value-inferred, so a continuous integer covariate is untouched.
+    let ds = load_fit_dataset_with_roles(&args.data, &requested_columns, &parsed, false)?;
     require_dataset_rows("fit", &args.data, ds.values.nrows())?;
     progress.advance_secondary_workflow(1);
     progress.advance_workflow(1);

@@ -124,7 +124,11 @@ pub(crate) fn run_survival(args: SurvivalArgs) -> Result<(), String> {
     let parsed = parse_formula(&formula)?;
     progress.set_stage("fit", "loading survival data");
     let requested_columns = required_columns_for_survival(&args, &parsed)?;
-    let ds = load_dataset_projected(&args.data, &requested_columns)?;
+    // Force explicit `group(g)` / `factor(g)` / `re(g)` grouping columns to a
+    // factor encoding even when numeric-coded (see the matching note in
+    // `run_fit`); the survival response is a `Surv(...)` expression, never a
+    // bare categorical column, so it is not a forced factor.
+    let ds = load_fit_dataset_with_roles(&args.data, &requested_columns, &parsed, false)?;
     progress.advance_workflow(1);
     let col_map = ds.column_map();
 

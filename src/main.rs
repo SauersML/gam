@@ -46,6 +46,7 @@ pub(crate) use gam::hmc::NutsConfig;
 pub(crate) use gam::inference::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy,
     load_dataset_projected as load_dataset_auto_projected,
+    load_dataset_projected_with_categorical_roles as load_dataset_auto_projected_with_categorical_roles,
     load_datasetwith_schema_projected as load_dataset_auto_with_schema_projected,
 };
 

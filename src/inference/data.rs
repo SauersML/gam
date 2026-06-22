@@ -278,10 +278,45 @@ pub fn load_dataset_projected(
     path: &Path,
     requested_columns: &[String],
 ) -> Result<EncodedDataset, DataError> {
+    load_dataset_projected_with_categorical_roles(path, requested_columns, &HashSet::new())
+}
+
+/// Schema-inferring projected loader that forces a set of columns to
+/// [`ColumnKindTag::Categorical`] regardless of whether their labels parse as
+/// numbers.
+///
+/// An untyped CSV/TSV/parquet-numeric frame cannot carry the dtype the typed
+/// Python frame stamps via [`CATEGORICAL_CELL_SENTINEL`], so the value-based
+/// inferer would otherwise demote an integer/numeric-coded factor (e.g. a
+/// `group(region)` grouping coded `0,1,2,3`) to `Continuous` and fit a single
+/// numeric ramp instead of one centred factor level per code. That makes the
+/// CLI's design strictly lower-capacity than the Python `gamfit.fit` design for
+/// the same data, which generalizes worse on every seed.
+///
+/// `categorical_roles` is keyed on the *formula role*, not on a value
+/// heuristic: a column is forced categorical only when the formula uses it in a
+/// role that is a factor by construction (`group(g)` / `factor(g)` / `re(g)`
+/// random-effect terms, or a categorical/multinomial response). A bare `+ x`
+/// linear term and a smooth argument `s(x)` are deliberately NOT included — they
+/// stay value-inferred, so a genuinely continuous integer covariate like
+/// `s(age)` or `+ age` remains `Continuous`. This mirrors the Python sentinel
+/// outcome (`force_categorical`, the column-major inferer) while keying it on
+/// the role the user actually declared.
+pub fn load_dataset_projected_with_categorical_roles(
+    path: &Path,
+    requested_columns: &[String],
+    categorical_roles: &HashSet<&str>,
+) -> Result<EncodedDataset, DataError> {
     match detect_format(path)? {
-        DataFormat::Csv => load_delimited_inferred(path, b',', requested_columns),
-        DataFormat::Tsv => load_delimited_inferred(path, b'\t', requested_columns),
-        DataFormat::Parquet => load_parquet_inferred(path, requested_columns),
+        DataFormat::Csv => {
+            load_delimited_inferred(path, b',', requested_columns, categorical_roles)
+        }
+        DataFormat::Tsv => {
+            load_delimited_inferred(path, b'\t', requested_columns, categorical_roles)
+        }
+        DataFormat::Parquet => {
+            load_parquet_inferred(path, requested_columns, categorical_roles)
+        }
     }
 }
 
@@ -309,7 +344,7 @@ pub fn load_datasetwith_schema_projected(
 // ---------------------------------------------------------------------------
 
 pub fn load_csvwith_inferred_schema(path: &Path) -> Result<EncodedDataset, DataError> {
-    load_delimited_inferred(path, b',', &[])
+    load_delimited_inferred(path, b',', &[], &HashSet::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -387,6 +422,7 @@ fn load_delimited_inferred(
     path: &Path,
     delimiter: u8,
     requested_columns: &[String],
+    categorical_roles: &HashSet<&str>,
 ) -> Result<EncodedDataset, DataError> {
     let t_open = std::time::Instant::now();
     let mut rdr = ReaderBuilder::new()
@@ -484,7 +520,17 @@ fn load_delimited_inferred(
     let sample_count = total_rows.min(SCHEMA_SAMPLE_ROWS);
     let inferred_columns = (0..p)
         .into_par_iter()
-        .map(|j| infer_delimited_column(&raw_fields, total_rows, p, j, &headers[j], sample_count))
+        .map(|j| {
+            infer_delimited_column(
+                &raw_fields,
+                total_rows,
+                p,
+                j,
+                &headers[j],
+                sample_count,
+                categorical_roles.contains(headers[j].as_str()),
+            )
+        })
         .collect::<Vec<_>>();
 
     let first_error = inferred_columns
@@ -585,6 +631,7 @@ fn infer_delimited_column(
     col: usize,
     header: &str,
     sample_count: usize,
+    force_categorical: bool,
 ) -> Result<InferredDelimitedColumn, DelimitedInferenceError> {
     // Per-column inference state (mirrors infer_schema_column logic).
     let mut values = Vec::<f64>::with_capacity(total_rows);
@@ -666,7 +713,17 @@ fn infer_delimited_column(
         }
     }
 
-    let kind = if all_numeric {
+    // A column the formula uses in a factor-by-construction role (an explicit
+    // `group(g)` / `factor(g)` / `re(g)` random effect, or a
+    // categorical/multinomial response) is encoded as a factor even when every
+    // label parsed as a number — the role-based analogue of the typed-frame
+    // `CATEGORICAL_CELL_SENTINEL` path, so CLI and Python produce the same
+    // factor design for a numeric-coded grouping column. The categorical fixup
+    // pass below recodes the already-parsed numeric `values` into sorted level
+    // indices, identical to the genuinely-non-numeric case.
+    let kind = if force_categorical {
+        ColumnKindTag::Categorical
+    } else if all_numeric {
         if all_binary {
             ColumnKindTag::Binary
         } else {
@@ -1282,6 +1339,7 @@ fn decode_parquet_batch_column(
 fn load_parquet_inferred(
     path: &Path,
     requested_columns: &[String],
+    categorical_roles: &HashSet<&str>,
 ) -> Result<EncodedDataset, DataError> {
     use parquet::arrow::{ProjectionMask, arrow_reader::ParquetRecordBatchReaderBuilder};
     use rayon::prelude::*;
@@ -1440,6 +1498,41 @@ fn load_parquet_inferred(
                         levels: levels_vec,
                     },
                 )
+            } else if categorical_roles.contains(header.as_str()) {
+                // Numeric column the formula uses in a factor-by-construction
+                // role (group()/factor()/re() or a categorical response):
+                // recode the numeric labels into sorted factor levels so a
+                // numeric-coded grouping column becomes one centred level per
+                // code, matching the typed-frame sentinel outcome and the
+                // delimited loader's `force_categorical` path. Labels are
+                // formatted with the same `{}` Display the level map keys on.
+                let labels: Vec<String> = col_values.iter().map(|v| v.to_string()).collect();
+                let mut levels_vec: Vec<String> = Vec::new();
+                let mut level_index: HashMap<String, usize> = HashMap::new();
+                for label in &labels {
+                    level_index.entry(label.clone()).or_insert_with(|| {
+                        let idx = levels_vec.len();
+                        levels_vec.push(label.clone());
+                        idx
+                    });
+                }
+                levels_vec.sort();
+                level_index.clear();
+                for (idx, level) in levels_vec.iter().enumerate() {
+                    level_index.insert(level.clone(), idx);
+                }
+                for (i, label) in labels.iter().enumerate() {
+                    col_values[i] = level_index[label] as f64;
+                }
+                (
+                    col_values,
+                    ColumnKindTag::Categorical,
+                    SchemaColumn {
+                        name: header.clone(),
+                        kind: ColumnKindTag::Categorical,
+                        levels: levels_vec,
+                    },
+                )
             } else {
                 // Numeric: check if binary.
                 let all_binary = col_values
@@ -1525,7 +1618,9 @@ fn load_parquet_with_schema(
     requested_columns: &[String],
 ) -> Result<EncodedDataset, DataError> {
     // Load with inference first, then validate/re-encode against provided schema.
-    let inferred = load_parquet_inferred(path, requested_columns)?;
+    // No formula roles are threaded here: the saved schema already records each
+    // column's categorical kind, and the re-encode pass below pins kinds to it.
+    let inferred = load_parquet_inferred(path, requested_columns, &HashSet::new())?;
     let p = inferred.headers.len();
     let n = inferred.values.nrows();
 
@@ -2295,7 +2390,8 @@ mod tests {
 
         // Inferred load: the column must be Continuous (5 and 7 are not 0/1),
         // never Categorical.
-        let inferred = load_parquet_inferred(&path, &[]).expect("inferred parquet load");
+        let inferred =
+            load_parquet_inferred(&path, &[], &HashSet::new()).expect("inferred parquet load");
         assert_eq!(inferred.column_kinds, vec![ColumnKindTag::Continuous]);
         assert_eq!(
             inferred.values.column(0).to_vec(),

@@ -128,6 +128,61 @@ pub(crate) fn load_dataset_projected(
     load_dataset_auto_projected(path, requested_columns)
 }
 
+/// Collect the columns a parsed formula uses in a *factor-by-construction*
+/// role, so the untyped CSV/TSV/parquet-numeric loader can force them to a
+/// categorical encoding (the role-based analogue of the typed-frame
+/// categorical sentinel).
+///
+/// Only roles that are factors *regardless of the data's values* are included:
+///
+/// * `group(g)` / `factor(g)` / `re(g)` random-effect terms
+///   ([`ParsedTerm::RandomEffect`]) — a grouping factor by construction.
+/// * a categorical / multinomial **response** column, when `response_is_categorical`.
+///
+/// Deliberately EXCLUDED so a genuinely-continuous integer covariate is never
+/// wrongly factorized:
+///
+/// * bare `+ x` linear terms ([`ParsedTerm::Linear`]) — role-ambiguous between a
+///   continuous slope and a factor main effect; the column kind alone
+///   disambiguates, exactly as today. A user who means a numeric-coded factor
+///   writes `factor(x)`.
+/// * smooth arguments `s(x)` / `te(x, z)` and a smooth's `by=` column — a smooth
+///   variable is numeric by construction, and `by=` may be a numeric
+///   varying-coefficient.
+fn collect_categorical_role_columns(terms: &[ParsedTerm], out: &mut BTreeSet<String>) {
+    for term in terms {
+        match term {
+            ParsedTerm::RandomEffect { name } => {
+                out.insert(name.clone());
+            }
+            ParsedTerm::LogSlopeSurface { terms, .. } => {
+                collect_categorical_role_columns(terms, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Build the categorical-role column set for a fit (random-effect grouping
+/// columns plus a categorical/multinomial response) and load the dataset with
+/// those columns forced to a factor encoding. See
+/// [`collect_categorical_role_columns`] and
+/// `gam::inference::data::load_dataset_projected_with_categorical_roles`.
+pub(crate) fn load_fit_dataset_with_roles(
+    path: &Path,
+    requested_columns: &[String],
+    parsed: &ParsedFormula,
+    response_is_categorical: bool,
+) -> Result<Dataset, gam::inference::data::DataError> {
+    let mut roles = BTreeSet::<String>::new();
+    collect_categorical_role_columns(&parsed.terms, &mut roles);
+    if response_is_categorical {
+        roles.insert(parsed.response.clone());
+    }
+    let role_refs: std::collections::HashSet<&str> = roles.iter().map(String::as_str).collect();
+    load_dataset_auto_projected_with_categorical_roles(path, requested_columns, &role_refs)
+}
+
 pub(crate) fn load_datasetwith_model_schema(
     path: &Path,
     model: &SavedModel,
