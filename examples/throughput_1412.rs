@@ -178,6 +178,38 @@ fn main() {
             None => (false, 0.0, f64::NAN),
         };
 
+        // ---- #1017 Phase 3 (Gram-resident POTRF): solve (XᵀWX+ridge)β=rhs with
+        //      the p×p Gram kept ON-DEVICE, downloading only the p-vector β. This
+        //      removes the Gram D2H that becomes the ceiling once X is resident —
+        //      the production IRLS step only needs β, not the Gram. ----
+        let solve_rps = match gam::gpu::linalg_dispatch::ResidentDesignGram::try_new(x.view()) {
+            Some(handle) => {
+                let rhs = Array1::from_shape_fn(p, |j| ((j as f64 + 1.0) * 0.03).cos());
+                let ridge = 1e-3_f64;
+                let _ = handle.solve_normal_equations(w.view(), rhs.view(), ridge);
+                let mut total = Duration::ZERO;
+                let mut ok = true;
+                for r in 0..reps {
+                    let wr = Array1::from_shape_fn(n, |i| (w[i] + 1e-3 * (r as f64)).abs());
+                    let start = Instant::now();
+                    match handle.solve_normal_equations(wr.view(), rhs.view(), ridge) {
+                        Some(beta) => {
+                            black_box(beta);
+                        }
+                        None => ok = false,
+                    }
+                    total += start.elapsed();
+                }
+                let s = total.as_secs_f64() / reps as f64;
+                if ok && s > 0.0 {
+                    n as f64 / s
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        };
+
         // ---- batched-Cholesky: stack of K small d×d Schur blocks ----
         let mut blocks: Vec<Array2<f64>> =
             (0..k_batch).map(|_| spd_block(d, &mut rng)).collect();
@@ -241,11 +273,14 @@ fn main() {
              frac_of_target={:.3} \
              resident_on_device={resident_on_device} resident_rows_per_sec={resident_rows_per_sec:.0} \
              resident_vs_percall_speedup={resident_speedup:.2} resident_parity_max_abs_diff={resident_parity:.3e} \
-             resident_frac_of_target={:.3}",
+             resident_frac_of_target={:.3} \
+             solve_resident_rows_per_sec={solve_rps:.0} solve_vs_percall_speedup={:.2} solve_frac_of_target={:.3}",
             gemm_s * 1e3,
             chol_s * 1e3,
             pipeline_rows_per_sec / TARGET_ROWS_PER_SEC,
             resident_rows_per_sec / TARGET_ROWS_PER_SEC,
+            if gemm_rows_per_sec > 0.0 { solve_rps / gemm_rows_per_sec } else { 0.0 },
+            solve_rps / TARGET_ROWS_PER_SEC,
         );
     }
 
