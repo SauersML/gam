@@ -405,6 +405,26 @@ impl SaeAssignment {
         self.with_frozen_routing(Some(snapshot))
     }
 
+    /// #1033 — in-place variant of [`Self::freeze_routing_from_current_logits`]
+    /// for callers holding `&mut SaeAssignment` (e.g. inside a `SaeManifoldTerm`),
+    /// where moving the assignment out is awkward. Same contract: snapshot the
+    /// current logits as the ρ-invariant frozen routing; reject Softmax.
+    pub fn freeze_routing_in_place(&mut self) -> Result<(), String> {
+        if matches!(self.mode, AssignmentMode::Softmax { .. }) {
+            return Err(
+                "SaeAssignment::freeze_routing_in_place: frozen routing under Softmax is rejected \
+                 (coupled-simplex entropy-majorizer); use IBP-MAP or JumpReLU"
+                    .to_string(),
+            );
+        }
+        let snapshot = self.logits.clone();
+        for row in 0..snapshot.nrows() {
+            validate_finite_logits(snapshot.row(row), row)?;
+        }
+        self.frozen_logits = Some(snapshot);
+        Ok(())
+    }
+
     /// #1033 — lift the frozen routing, restoring the free-logit search path.
     pub fn thaw_routing(&mut self) {
         self.frozen_logits = None;

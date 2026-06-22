@@ -144,6 +144,14 @@ pub struct SaeManifoldOuterObjective {
     /// #1207 — running tally of amortized warm-start outcomes, so a silent cold
     /// fallback is observable instead of hidden behind `.ok()`.
     pub(crate) warm_start_telemetry: AmortizedWarmStartTelemetry,
+    /// #1033 — when set, the term's assignment ROUTING is frozen (amortized): the
+    /// gates are pinned to a ρ-invariant predicted routing once before the ρ-search
+    /// and the inner solve never re-optimizes the logits, so every outer ρ
+    /// evaluation reuses ONE routing instead of re-solving the per-row gates. OFF
+    /// by default — the historical free-logit ρ-search is unchanged. This is the
+    /// opt-in lever for the n-independent outer loop; the n-scaling timing is
+    /// verified on the cluster.
+    pub(crate) routing_frozen: bool,
 }
 
 impl SaeManifoldOuterObjective {
@@ -178,7 +186,35 @@ impl SaeManifoldOuterObjective {
             last_loss: None,
             seeded_beta: None,
             warm_start_telemetry: AmortizedWarmStartTelemetry::default(),
+            routing_frozen: false,
         }
+    }
+
+    /// #1033 — opt into AMORTIZED (frozen) routing for the ρ-search: freeze the
+    /// term's assignment gates to the ρ-invariant routing distilled from the
+    /// CURRENT (construction-time / seed) dictionary, so the outer ρ-search reuses
+    /// one routing instead of re-solving the per-row gates at every eval (the
+    /// n-independent-outer-loop lever). Freezing once here — from the seed/anchor
+    /// dictionary — makes the routing genuinely ρ-invariant across the entire
+    /// search; the inner solve then optimizes only the coordinates and decoder.
+    /// The baseline (multi-start restore) term is frozen to match, so a reset
+    /// keeps the same routing. OFF unless opted in; rejected for Softmax
+    /// (separable-mode contract). Returns an error if the freeze is rejected.
+    #[must_use = "build error must be handled"]
+    pub fn with_amortized_routing(mut self, enabled: bool) -> Result<Self, String> {
+        if enabled {
+            self.term.assignment.freeze_routing_in_place()?;
+            // Freeze the multi-start restore baseline to match, so a `reset` keeps
+            // the same ρ-invariant routing.
+            self.baseline_term.assignment.freeze_routing_in_place()?;
+            self.routing_frozen = true;
+        }
+        Ok(self)
+    }
+
+    /// #1033 — whether the ρ-search runs on frozen (amortized) routing.
+    pub fn routing_is_frozen(&self) -> bool {
+        self.routing_frozen
     }
 
     /// #1207 — the accumulated amortized warm-start telemetry. "Uses amortized
