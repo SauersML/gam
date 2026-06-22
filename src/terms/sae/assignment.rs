@@ -250,6 +250,18 @@ pub struct SaeAssignment {
     /// the rank-(K·d) PCA ceiling, while the gated curved atoms still add sparse
     /// structure on the residual (#1026 routing-bound finding).
     pub ungated: Vec<bool>,
+    /// #1033 — AMORTIZED / FROZEN routing. When `Some`, this `(n, K)` matrix is a
+    /// ρ-INVARIANT predicted routing (the amortized `x → logits` map distilled
+    /// from the frozen dictionary): the gates are computed from THESE logits
+    /// instead of the free `self.logits`, and the logits are NOT optimized by the
+    /// inner Newton (their gradient/curvature/prior contributions are zeroed,
+    /// exactly as for [`Self::ungated`]). This is the generalization of an ungated
+    /// atom from "pin the gate at 1" to "pin the gate at the predicted value": it
+    /// makes the per-row routing a fixed function of `x` + the frozen dictionary,
+    /// so the outer ρ-search reuses ONE routing instead of re-solving per-row
+    /// gates every outer eval — the n-independent-outer-loop lever (#1033). `None`
+    /// is the historical free-logit path (bit-identical).
+    pub frozen_logits: Option<Array2<f64>>,
 }
 
 impl SaeAssignment {
@@ -296,7 +308,85 @@ impl SaeAssignment {
             coords,
             mode,
             ungated: vec![false; k],
+            frozen_logits: None,
         })
+    }
+
+    /// #1033 — install a ρ-INVARIANT FROZEN routing (the amortized predicted
+    /// logits; see [`SaeAssignment::frozen_logits`]). `predicted` must be
+    /// `(n, K)`. With routing frozen, the gates are computed from `predicted` and
+    /// the logits are excluded from the inner Newton (their gradient/curvature are
+    /// inert, like an ungated atom's). Passing `None` restores the free-logit
+    /// path.
+    #[must_use = "build error must be handled"]
+    pub fn with_frozen_routing(
+        mut self,
+        predicted: Option<Array2<f64>>,
+    ) -> Result<Self, String> {
+        if let Some(ref p) = predicted {
+            if p.dim() != (self.n_obs(), self.k_atoms()) {
+                return Err(format!(
+                    "SaeAssignment::with_frozen_routing: predicted shape {:?} must be ({}, {})",
+                    p.dim(),
+                    self.n_obs(),
+                    self.k_atoms()
+                ));
+            }
+            if matches!(self.mode, AssignmentMode::Softmax { .. }) {
+                return Err(
+                    "SaeAssignment::with_frozen_routing: frozen routing under Softmax is rejected \
+                     — the coupled simplex's entropy majorizer is assembled over the logits, which \
+                     a frozen (non-optimized) routing would leave inconsistent; this separable-mode \
+                     contract supports IBP-MAP and JumpReLU, whose per-atom gates have no \
+                     simplex-coupled curvature to skip"
+                        .to_string(),
+                );
+            }
+            for row in 0..p.nrows() {
+                validate_finite_logits(p.row(row), row)?;
+            }
+        }
+        self.frozen_logits = predicted;
+        Ok(self)
+    }
+
+    /// Whether the per-row routing is FROZEN (amortized) rather than free-logit.
+    pub fn routing_is_frozen(&self) -> bool {
+        self.frozen_logits.is_some()
+    }
+
+    /// The active routing logits for `row`: the frozen/predicted logits when
+    /// routing is frozen (#1033), else the free `self.logits`. This is the SINGLE
+    /// source the gate value reads, so freezing routing changes every gate
+    /// consistently.
+    pub(crate) fn routing_logits_row(&self, row: usize) -> ArrayView1<'_, f64> {
+        match self.frozen_logits {
+            Some(ref f) => f.row(row),
+            None => self.logits.row(row),
+        }
+    }
+
+    /// Whether atom `k`'s logit is held fixed (not a free Newton parameter): true
+    /// for an ungated atom (#1026, gate pinned at 1) OR when routing is frozen
+    /// (#1033, gate pinned at the predicted value). Both share the same inert
+    /// treatment — zero logit-JVP, zero sparsity-prior gradient/curvature, zero
+    /// softmax majorizer — so the logit slot never moves.
+    pub(crate) fn logit_is_fixed(&self, k: usize) -> bool {
+        self.routing_is_frozen() || self.ungated.get(k).copied().unwrap_or(false)
+    }
+
+    /// Per-atom mask (length `K`) of [`Self::logit_is_fixed`] — the logit slots
+    /// that are NOT free Newton parameters (ungated #1026 and/or frozen-routing
+    /// #1033). Precompute once per assembly and pass to the logit-JVP fillers so
+    /// the data-fit Jacobian zeroes those rows. Under frozen routing every entry
+    /// is `true`; with only ungated atoms it equals `ungated`; otherwise all
+    /// `false` (the historical free-logit path).
+    pub(crate) fn fixed_logit_mask(&self) -> Vec<bool> {
+        if self.routing_is_frozen() {
+            vec![true; self.k_atoms()]
+        } else {
+            self.ungated.clone()
+        }
     }
 
     /// #1026 — designate which atoms are UNGATED (the dense linear/background
@@ -408,7 +498,13 @@ impl SaeAssignment {
         row: usize,
         resolved_ibp_alpha: Option<f64>,
     ) -> Result<Array1<f64>, String> {
-        validate_finite_logits(self.logits.row(row), row)?;
+        // #1033 — read the ACTIVE routing logits: the ρ-invariant frozen/predicted
+        // logits when routing is frozen, else the free `self.logits`. This single
+        // source makes the gate value ρ-invariant under frozen routing (the
+        // amortized-routing lever) and bit-identical to the historical path when
+        // not frozen.
+        let routing = self.routing_logits_row(row);
+        validate_finite_logits(routing, row)?;
         // Only Softmax collapses to a fixed assignment at K==1: its
         // assignment_coord_dim is K-1 = 0, so there is no free logit. IBPMap and
         // JumpReLU keep a free per-atom gate logit even at K==1
@@ -418,20 +514,14 @@ impl SaeAssignment {
             return Ok(Array1::from_vec(vec![1.0]));
         }
         let mut row_gates = match self.mode {
-            AssignmentMode::Softmax { temperature, .. } => {
-                softmax_row(self.logits.row(row), temperature)
-            }
+            AssignmentMode::Softmax { temperature, .. } => softmax_row(routing, temperature),
             AssignmentMode::IBPMap {
                 temperature, alpha, ..
-            } => ibp_map_row(
-                self.logits.row(row),
-                temperature,
-                resolved_ibp_alpha.unwrap_or(alpha),
-            ),
+            } => ibp_map_row(routing, temperature, resolved_ibp_alpha.unwrap_or(alpha)),
             AssignmentMode::JumpReLU {
                 temperature,
                 threshold,
-            } => jumprelu_row(self.logits.row(row), temperature, threshold),
+            } => jumprelu_row(routing, temperature, threshold),
         };
         // #1026 — ungated (background-tier) atoms have a fixed unit gate. For the
         // column-separable IBP / JumpReLU modes the other atoms' gates are
@@ -1176,16 +1266,18 @@ pub(crate) fn assignment_prior_grad_hdiag(
     };
     grad += &sparsity_grad;
     diag += &sparsity_diag;
-    // #1026 — an ungated (background-tier) atom's logit is not a free parameter,
-    // so it carries NO sparsity-prior gradient or curvature. Zero its flat
-    // columns (`flat_logits` is row-major `row*K + atom`) so the assembled `gt`
-    // and `htt` logit slots for ungated atoms stay zero — matching the zero
-    // logit-JVP. The column-separable IBP / JumpReLU priors are per-atom, so
-    // zeroing one atom's columns leaves the others' prior exactly intact.
-    if assignment.has_ungated() {
+    // #1026/#1033 — a FIXED logit (an ungated atom's, or every atom's under
+    // frozen routing) is not a free parameter, so it carries NO sparsity-prior
+    // gradient or curvature. Zero its flat columns (`flat_logits` is row-major
+    // `row*K + atom`) so the assembled `gt` and `htt` logit slots stay zero —
+    // matching the zero logit-JVP. The column-separable IBP / JumpReLU priors are
+    // per-atom, so zeroing one atom's columns leaves the others' prior intact;
+    // under frozen routing ALL atoms' logit columns are zeroed (the whole routing
+    // is a fixed predicted function, not optimized).
+    if assignment.has_ungated() || assignment.routing_is_frozen() {
         let k = assignment.k_atoms();
         for idx in 0..grad.len() {
-            if assignment.ungated[idx % k] {
+            if assignment.logit_is_fixed(idx % k) {
                 grad[idx] = 0.0;
                 diag[idx] = 0.0;
             }
@@ -1228,14 +1320,15 @@ pub(crate) fn ibp_assignment_third_channels(
     };
     let mut channels =
         penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view());
-    // #1026 — zero the log-det third-derivative channels of ungated atoms so the
-    // #1006 θ-adjoint differentiates the SAME (ungated-zeroed) `htt` that
+    // #1026/#1033 — zero the log-det third-derivative channels of FIXED-logit
+    // atoms (ungated, or all atoms under frozen routing) so the #1006 θ-adjoint
+    // differentiates the SAME (fixed-logit-zeroed) `htt` that
     // `assignment_prior_grad_hdiag` assembled. `k_max` columns, row-major `N·K`
     // for the per-(row,atom) arrays and length-`K` for the per-column ones.
-    if assignment.has_ungated() {
+    if assignment.has_ungated() || assignment.routing_is_frozen() {
         let k = channels.k_max;
         for idx in 0..channels.z_jac.len() {
-            if assignment.ungated[idx % k] {
+            if assignment.logit_is_fixed(idx % k) {
                 channels.z_jac[idx] = 0.0;
                 channels.local_logit_third[idx] = 0.0;
                 channels.m_channel[idx] = 0.0;
@@ -1243,7 +1336,7 @@ pub(crate) fn ibp_assignment_third_channels(
             }
         }
         for atom in 0..k {
-            if assignment.ungated[atom] {
+            if assignment.logit_is_fixed(atom) {
                 channels.cross_row_d[atom] = 0.0;
                 channels.cross_row_dd[atom] = 0.0;
             }
