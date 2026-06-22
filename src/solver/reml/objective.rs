@@ -1636,14 +1636,22 @@ impl<'a> RemlState<'a> {
         mode: super::reml_outer_engine::EvalMode,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-            self.build_sparse_assembly(rho, bundle, mode)
-        } else if matches!(
+            return self.build_sparse_assembly(rho, bundle, mode);
+        }
+        // The original-basis dense path keeps β, the Hessian operator, the GLM
+        // derivative design, and the penalty coordinates in one (original)
+        // basis. It applies only to an UNCONSTRAINED QS frame: an active-set /
+        // monotonicity reduced subspace re-expresses the penalty coordinates
+        // through its projected `Z`, so that case is assembled in the
+        // transformed frame by `build_dense_assembly` — the correct routing for
+        // that subspace, not a fallback pending further work.
+        let unconstrained_qs_frame = matches!(
             bundle.pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::TransformedQs
         ) && self
             .active_constraint_free_basis(bundle.pirls_result.as_ref())
-            .is_none()
-        {
+            .is_none();
+        if unconstrained_qs_frame {
             self.build_dense_original_assembly(rho, bundle, mode)
         } else {
             self.build_dense_assembly(rho, bundle, mode)

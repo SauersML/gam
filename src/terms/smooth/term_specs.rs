@@ -2322,32 +2322,21 @@ impl TermCollectionDesign {
         realize_coefficient_groups(self, groups, base_prior)
     }
 
-    /// Extract a `KroneckerPenaltySystem` if exactly one smooth term has
-    /// Kronecker structure and it accounts for all penalties.
+    /// Extract a `KroneckerPenaltySystem` when the model's *only* smooth term is
+    /// a single Kronecker-factored tensor.
     ///
-    /// Returns `None` if no Kronecker structure is present or if the model
-    /// has multiple smooth terms with mixed structure.
+    /// This is a deliberate single-tensor fast path, not a partial feature: any
+    /// other shape — zero Kronecker terms, several of them, or a tensor mixed
+    /// with non-tensor smooth terms — is served correctly by the standard
+    /// block-separable assembly, so this returns `None` and the caller falls
+    /// back to it. The two former conditions (`len != 1` and "a non-Kronecker
+    /// smooth term exists") are jointly equivalent to "the sole smooth term is
+    /// Kronecker", which the slice pattern below expresses directly in one pass.
     pub fn kronecker_penalty_system(&self) -> Option<KroneckerPenaltySystem> {
-        let kron_terms: Vec<&KroneckerFactoredBasis> = self
-            .smooth
-            .terms
-            .iter()
-            .filter_map(|t| t.kronecker_factored.as_ref())
-            .collect();
-        if kron_terms.len() != 1 {
-            return None; // fast path requires exactly one Kronecker term
-        }
-        let kron = kron_terms[0];
-        // Only use the Kronecker path when the model is purely this tensor term
-        // (no other smooth terms with separate penalties).
-        let has_non_kron_smooth_terms = self
-            .smooth
-            .terms
-            .iter()
-            .any(|t| t.kronecker_factored.is_none());
-        if has_non_kron_smooth_terms {
-            return None; // mixed model — fall back to standard path
-        }
+        let [only_term] = self.smooth.terms.as_slice() else {
+            return None;
+        };
+        let kron = only_term.kronecker_factored.as_ref()?;
         KroneckerPenaltySystem::new(
             kron.marginal_penalties.clone(),
             kron.marginal_dims.clone(),
