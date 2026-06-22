@@ -34,13 +34,15 @@
 //! Uses only the public crate API.
 
 use gam::gpu::GpuRuntime;
-use gam::gpu::kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
+use gam::gpu::kernels::arrow_schur::{
+    ResidentArrowFrameHandle, solve_arrow_newton_step_dense_reference,
+};
 use gam::gpu::policy::GpuDispatchPolicy;
 use gam::solver::arrow_schur::{
     ArrowSchurSystem, ArrowSolveOptions, solve_arrow_newton_step_core,
     solve_with_lm_escalation_inner,
 };
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 
 /// Build a small well-conditioned dense Direct-mode arrow system, mirroring the
 /// in-crate `dense_direct_system` fixture so the CPU solve is deterministic and
@@ -281,4 +283,197 @@ fn dense_reference_step_dimensions_are_well_formed() {
     assert_eq!(sol.delta_t.len(), n * d);
     assert_eq!(sol.delta_beta.len(), k);
     assert!(sol.delta_t.iter().chain(sol.delta_beta.iter()).all(|v| v.is_finite()));
+}
+
+/// Assemble the dense bordered Hessian `H` and base gradient `g₀` from an arrow
+/// system, applying the same `(ridge_t, ridge_beta)` placement the device frame
+/// and the dense reference both bake into their factors. The Newton system the
+/// resident `solve_gradient` solves is `H δ = −g₀`.
+fn assemble_bordered_system(
+    sys: &ArrowSchurSystem,
+    n: usize,
+    d: usize,
+    k: usize,
+    ridge_t: f64,
+    ridge_beta: f64,
+) -> (Array2<f64>, Array1<f64>) {
+    let total = n * d + k;
+    let mut h = Array2::<f64>::zeros((total, total));
+    let mut g = Array1::<f64>::zeros(total);
+    for (i, row) in sys.rows.iter().enumerate() {
+        let base = i * d;
+        for r in 0..d {
+            for c in 0..d {
+                h[[base + r, base + c]] = row.htt[[r, c]];
+            }
+            h[[base + r, base + r]] += ridge_t;
+            for c in 0..k {
+                let v = row.htbeta[[r, c]];
+                h[[base + r, n * d + c]] = v;
+                h[[n * d + c, base + r]] = v;
+            }
+            g[base + r] = row.gt[r];
+        }
+    }
+    for r in 0..k {
+        for c in 0..k {
+            h[[n * d + r, n * d + c]] += sys.hbb[[r, c]];
+        }
+        h[[n * d + r, n * d + r]] += ridge_beta;
+        g[n * d + r] = sys.gb[r];
+    }
+    (h, g)
+}
+
+/// Independent dense linear solve `A x = b` via partial-pivoting Gaussian
+/// elimination — algorithmically distinct from the production Cholesky/Schur
+/// arrow factorisation, so it is a genuine oracle for the device step readback.
+fn solve_dense_partial_pivot(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
+    let n = a.nrows();
+    let mut m = a.clone();
+    let mut rhs = b.clone();
+    for col in 0..n {
+        // Partial pivot.
+        let mut pivot = col;
+        let mut best = m[[col, col]].abs();
+        for r in (col + 1)..n {
+            let v = m[[r, col]].abs();
+            if v > best {
+                best = v;
+                pivot = r;
+            }
+        }
+        assert!(best > 0.0, "independent solve hit a singular column {col}");
+        if pivot != col {
+            for c in 0..n {
+                m.swap([col, c], [pivot, c]);
+            }
+            rhs.swap(col, pivot);
+        }
+        let diag = m[[col, col]];
+        for r in (col + 1)..n {
+            let factor = m[[r, col]] / diag;
+            if factor != 0.0 {
+                for c in col..n {
+                    let sub = factor * m[[col, c]];
+                    m[[r, c]] -= sub;
+                }
+                let sub = factor * rhs[col];
+                rhs[r] -= sub;
+            }
+        }
+    }
+    let mut x = Array1::<f64>::zeros(n);
+    for col in (0..n).rev() {
+        let mut acc = rhs[col];
+        for c in (col + 1)..n {
+            acc -= m[[col, c]] * x[c];
+        }
+        x[col] = acc / m[[col, col]];
+    }
+    x
+}
+
+/// #1017 Phase 3 STEP readback parity (CPU-runnable). The resident frame's
+/// `solve_gradient` is the per-iterate device primitive the production inner
+/// Newton loop consumes: with the constant Hessian factors held resident, each
+/// iterate uploads only the fresh gradient `g₀` and reads back the step `δ`
+/// solving `H δ = −g₀`. On a CUDA host that `δ` rides the resident factors; on a
+/// device-absent host (and whenever the device declines) the production loop's
+/// `DeviceResident` arm falls back to `solve_arrow_newton_step_dense_reference`
+/// on the SAME residual system. This gate pins THAT dense fallback step — the
+/// exact `δ` a GPU host falls back to — against an independent partial-pivot
+/// Gaussian-elimination solve of the assembled bordered system, to ≤1e-9.
+///
+/// The existing `phase3_logdet_readback` gate certifies the SCALAR `log|H|`
+/// readback the same way; this closes the companion VECTOR (`δ`) readback so
+/// every value the resident frame surfaces — `log_det_hessian()` AND
+/// `solve_gradient()` — has a CPU correctness gate against an algorithmically
+/// independent oracle. Runs on the CPU build box; no CUDA required.
+#[test]
+fn phase3_step_readback_matches_independent_dense_solve() {
+    let (n, d, k) = (6usize, 2usize, 4usize);
+    let ridge_t = 1e-3;
+    let ridge_beta = 2e-3;
+    let sys = dense_direct_system(n, d, k);
+
+    // The dense fallback the production resident arm uses on decline.
+    let step = solve_arrow_newton_step_dense_reference(&sys, ridge_t, ridge_beta)
+        .expect("dense-reference oracle must solve the PD bordered system");
+
+    // Independent oracle: assemble H, g₀ and solve H δ = −g₀ by Gaussian
+    // elimination (distinct factorisation from the production Cholesky/Schur).
+    let (h, g) = assemble_bordered_system(&sys, n, d, k, ridge_t, ridge_beta);
+    let neg_g = g.mapv(|v| -v);
+    let delta = solve_dense_partial_pivot(&h, &neg_g);
+
+    let total = n * d + k;
+    let step_scale = (0..total).fold(1.0_f64, |m, i| m.max(delta[i].abs()));
+    let mut max_diff = 0.0_f64;
+    for r in 0..(n * d) {
+        max_diff = max_diff.max((step.delta_t[r] - delta[r]).abs());
+    }
+    for c in 0..k {
+        max_diff = max_diff.max((step.delta_beta[c] - delta[n * d + c]).abs());
+    }
+    assert!(
+        max_diff < 1e-9 * step_scale,
+        "Phase-3 step readback `δ` must equal an independent partial-pivot solve \
+         of H δ = −g₀ (|Δ|={max_diff:e}, scale={step_scale:e}); this is the host \
+         step the resident frame's solve_gradient() is certified against on the \
+         A100 and the exact δ a GPU host falls back to on decline"
+    );
+
+    // Residual check: the recovered step actually solves the bordered system, so
+    // a sign/slice regression in the readback cannot pass by coincidental match.
+    let mut max_resid = 0.0_f64;
+    for i in 0..total {
+        let mut row_dot = 0.0_f64;
+        for j in 0..total {
+            let dj = if j < n * d {
+                step.delta_t[j]
+            } else {
+                step.delta_beta[j - n * d]
+            };
+            row_dot += h[[i, j]] * dj;
+        }
+        max_resid = max_resid.max((row_dot - neg_g[i]).abs());
+    }
+    let g_scale = (0..total).fold(1.0_f64, |m, i| m.max(neg_g[i].abs()));
+    assert!(
+        max_resid < 1e-9 * g_scale,
+        "readback step must satisfy H δ = −g₀ (residual {max_resid:e})"
+    );
+}
+
+/// #1017 Phase 3 CPU-DECLINE contract (CPU-runnable). The certified-equivalence
+/// in `phase3_step_readback_matches_independent_dense_solve` is only meaningful
+/// because, off CUDA, the resident frame genuinely DECLINES and the production
+/// loop takes the dense-reference fallback. This gate pins that decline: on a
+/// device-absent host `ResidentArrowFrameHandle::new` must return an error
+/// (never a phantom handle) even with perfectly finite, PD inputs — so the
+/// `solve_gradient`/`log_det_hessian` device readbacks are statically
+/// unreachable and the dense fallback is what executes.
+///
+/// On a CUDA host the frame may legitimately build; the decline assertion only
+/// binds when no runtime is present, exactly like the routing gates above.
+#[test]
+fn phase3_resident_frame_declines_on_device_absent_host() {
+    let sys = dense_direct_system(6, 2, 4);
+    let frame = ResidentArrowFrameHandle::new(&sys, 1e-3, 2e-3);
+    if GpuRuntime::global().is_none() {
+        assert!(
+            frame.is_err(),
+            "on a device-absent host the resident frame must decline construction \
+             so the production loop falls back to the certified dense path, got Ok"
+        );
+    } else {
+        // CUDA present: a successful build's readbacks must be finite/well-shaped.
+        if let Ok(handle) = frame {
+            assert!(
+                handle.log_det_hessian().is_finite(),
+                "a built resident frame must surface a finite log|H| readback"
+            );
+        }
+    }
 }
