@@ -247,6 +247,11 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     // ordering `flat[a · P + i] = β[i, a]` to align with `dense_block_xtwx`.
     let mut beta = Array2::<f64>::zeros((p, m));
     let mut eta = Array2::<f64>::zeros((n_obs, m));
+    // Reused η scratch for the line-search objective probes (see
+    // `evaluate_objective`): overwritten in full on every call, so it carries
+    // no state between calls and hoisting it out of the backtracking loop is a
+    // pure heap-allocation removal with no effect on the computed objective.
+    let mut eta_objective_scratch = Array2::<f64>::zeros((n_obs, m));
     let beta_flat_dim = p * m;
 
     let mut iterations = 0usize;
@@ -268,19 +273,16 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
     };
 
     // Penalized objective F(β) = − log L(X β) + ½ Σ_a λ_a β_aᵀ S β_a.
-    let evaluate_objective = |beta_trial: &Array2<f64>| -> f64 {
-        let mut eta_trial = Array2::<f64>::zeros((n_obs, m));
-        for a in 0..m {
-            let beta_col = beta_trial.column(a);
-            for row in 0..n_obs {
-                let mut v = 0.0_f64;
-                for i in 0..p {
-                    v += design[[row, i]] * beta_col[i];
-                }
-                eta_trial[[row, a]] = v;
-            }
-        }
-        let ll = likelihood.log_lik(eta_trial.view(), y);
+    // The caller supplies a reused `(n_obs, m)` scratch for η = X·β so the
+    // backtracking line search (which calls this up to `MAX_BACKTRACKS + 1`
+    // times per Newton iteration) does not heap-allocate a fresh η buffer on
+    // every probe. The scratch is overwritten in full by `recompute_eta` before
+    // it is read, so reusing it is bit-for-bit identical to the prior
+    // allocate-fresh body: `recompute_eta` runs the SAME `Σ_i design·β` loop in
+    // the SAME order this closure used inline.
+    let evaluate_objective = |beta_trial: &Array2<f64>, eta_scratch: &mut Array2<f64>| -> f64 {
+        recompute_eta(beta_trial, eta_scratch);
+        let ll = likelihood.log_lik(eta_scratch.view(), y);
         let pen = weighted_penalty_sum(beta_trial, penalty, lambdas);
         -ll + pen
     };
@@ -461,14 +463,14 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
             out
         };
         if iter == 0 {
-            last_objective = evaluate_objective(&beta);
+            last_objective = evaluate_objective(&beta, &mut eta_objective_scratch);
             if !last_objective.is_finite() {
                 crate::bail_invalid_estim!("{context}: non-finite objective at β = 0");
             }
         }
         let mut alpha = 1.0_f64;
         let mut accepted_beta = proposed_beta(alpha);
-        let mut new_objective = evaluate_objective(&accepted_beta);
+        let mut new_objective = evaluate_objective(&accepted_beta, &mut eta_objective_scratch);
         let mut backtrack = 0usize;
         while (!new_objective.is_finite()
             || new_objective > last_objective + OBJECTIVE_DECREASE_SLACK)
@@ -476,7 +478,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
         {
             alpha *= LINE_SEARCH_SHRINK;
             accepted_beta = proposed_beta(alpha);
-            new_objective = evaluate_objective(&accepted_beta);
+            new_objective = evaluate_objective(&accepted_beta, &mut eta_objective_scratch);
             backtrack += 1;
         }
 
