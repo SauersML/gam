@@ -25,14 +25,20 @@
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_r};
+use gam::test_support::reference::{
+    Column, pearson, r_package_available, relative_l2, rmse, run_r,
+};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+    load_csvwith_inferred_schema,
 };
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
+use std::path::Path;
+
+const LIDAR_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/lidar.csv");
 
 #[test]
 fn gam_matern_family_recovers_truth_across_nu() {
@@ -201,4 +207,167 @@ fn gam_matern_family_recovers_truth_across_nu() {
         "gam Matérn fits for nu={nu_lo} and nu={nu_hi} are indistinguishable \
          (rel_l2={cross_order_rel:.4}); `nu` is not driving the kernel order"
     );
+}
+
+fn lidar_train_dataset(range: &[f64], logratio: &[f64]) -> gam::data::EncodedDataset {
+    let headers = vec!["range".to_string(), "logratio".to_string()];
+    let records: Vec<csv::StringRecord> = range
+        .iter()
+        .zip(logratio)
+        .map(|(&r, &y)| csv::StringRecord::from(vec![format!("{r:.17e}"), format!("{y:.17e}")]))
+        .collect();
+    encode_recordswith_inferred_schema(headers, records).expect("encode lidar train subset")
+}
+
+/// REAL-DATA held-out arm: the Matérn GP smoother across the smoothness ladder
+/// ν ∈ {1.5, 2.5, 3.5} must PREDICT held-out observations on the canonical
+/// `lidar` benchmark, for every order beating the constant-mean null and
+/// match-or-beating mgcv's matched `bs="gp", m=κ` GP smooth on the SAME held-out
+/// RMSE. The synthetic ν-ladder truth-recovery + kernel-distinctness arm above
+/// proves `nu` is wired; this proves the GP generalizes on real, noisy data.
+///
+/// Deterministic every-4th-row split (fit 3/4, score 1/4). No mature comparator
+/// is treated as ground truth — mgcv `bs="gp"` is a match-or-beat baseline on the
+/// held-out predictive metric, the honest quality question for an unknown truth.
+#[test]
+fn gam_matern_family_predicts_held_out_lidar_across_nu() {
+    init_parallelism();
+
+    let ds = load_csvwith_inferred_schema(Path::new(LIDAR_CSV)).expect("load lidar.csv");
+    let col = ds.column_map();
+    let range: Vec<f64> = ds.values.column(col["range"]).to_vec();
+    let logratio: Vec<f64> = ds.values.column(col["logratio"]).to_vec();
+    let n = range.len();
+    assert!(n > 100, "lidar should have ~221 rows, got {n}");
+
+    // Deterministic interleaved 3/4 train, 1/4 test split.
+    let mut tr_range = Vec::new();
+    let mut tr_logratio = Vec::new();
+    let mut te_range = Vec::new();
+    let mut te_logratio = Vec::new();
+    for i in 0..n {
+        if i % 4 == 0 {
+            te_range.push(range[i]);
+            te_logratio.push(logratio[i]);
+        } else {
+            tr_range.push(range[i]);
+            tr_logratio.push(logratio[i]);
+        }
+    }
+    let n_test = te_range.len();
+    assert!(n_test > 30, "need a meaningful held-out set, got {n_test}");
+
+    let train_ds = lidar_train_dataset(&tr_range, &tr_logratio);
+    let train_col = train_ds.column_map();
+    let train_range_idx = train_col["range"];
+    let train_ncols = train_ds.headers.len();
+
+    // Constant-mean null on held-out rows.
+    let mu_train = tr_logratio.iter().sum::<f64>() / tr_logratio.len() as f64;
+    let null_rmse = {
+        let s: f64 = te_logratio.iter().map(|&y| (y - mu_train).powi(2)).sum();
+        (s / n_test as f64).sqrt()
+    };
+
+    let orders: [(f64, i32); 3] = [(1.5, 3), (2.5, 4), (3.5, 5)];
+    for (nu, kappa) in orders {
+        // gam fit on TRAIN: logratio ~ matern(range, nu, k=18).
+        let formula = format!("logratio ~ matern(range, nu={nu}, k=18)");
+        let cfg = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
+        let result = fit_from_formula(&formula, &train_ds, &cfg)
+            .unwrap_or_else(|e| panic!("gam matern lidar fit (nu={nu}) failed: {e:?}"));
+        let FitResult::Standard(fit) = result else {
+            panic!("expected a standard Gaussian GAM fit for matern(nu={nu}) on lidar");
+        };
+        let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+
+        // gam prediction at the HELD-OUT range values (identity link).
+        let mut test_grid = Array2::<f64>::zeros((n_test, train_ncols));
+        for (i, &r) in te_range.iter().enumerate() {
+            test_grid[[i, train_range_idx]] = r;
+        }
+        let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
+            .unwrap_or_else(|e| panic!("held-out matern design rebuild (nu={nu}): {e:?}"));
+        let gam_test: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
+        assert!(
+            gam_test.iter().all(|v| v.is_finite()),
+            "non-finite held-out matern prediction (nu={nu})"
+        );
+        let gam_rmse = rmse(&gam_test, &te_logratio);
+
+        // mgcv matched GP smoother on the SAME train, predict the SAME held-out.
+        let mgcv_rmse = if r_package_available("mgcv") {
+            let tr_len = tr_range.len();
+            let mut padded_test = te_range.clone();
+            padded_test.resize(tr_len, 0.0);
+            let r = run_r(
+                &[
+                    Column::new("x", &tr_range),
+                    Column::new("y", &tr_logratio),
+                    Column::new("test_x", &padded_test),
+                    Column::new("test_n", &vec![n_test as f64; tr_len]),
+                    Column::new("kappa", &vec![f64::from(kappa); tr_len]),
+                ],
+                r#"
+                suppressPackageStartupMessages(library(mgcv))
+                kap <- as.integer(round(df$kappa[1]))
+                fit_df <- data.frame(x = df$x, y = df$y)
+                m <- gam(y ~ s(x, bs = "gp", k = 18, m = kap),
+                         data = fit_df, method = "REML")
+                k <- df$test_n[1]
+                newd <- data.frame(x = df$test_x[1:k])
+                emit("pred", as.numeric(predict(m, newdata = newd)))
+                emit("edf", sum(m$edf))
+                "#,
+            );
+            let mgcv_pred = r.vector("pred");
+            let mgcv_edf = r.scalar("edf");
+            assert_eq!(mgcv_pred.len(), n_test, "mgcv held-out prediction length mismatch");
+            let mrmse = rmse(mgcv_pred, &te_logratio);
+            let rel = relative_l2(&gam_test, mgcv_pred);
+            let corr = pearson(&gam_test, mgcv_pred);
+            eprintln!(
+                "lidar held-out matern(nu={nu}) m={kappa}: n_train={} n_test={n_test} \
+                 gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
+                 RMSE[gam={gam_rmse:.4} mgcv={mrmse:.4} null={null_rmse:.4}] \
+                 [context] rel_l2={rel:.4} pearson={corr:.5}",
+                tr_range.len()
+            );
+            Some(mrmse)
+        } else {
+            eprintln!(
+                "mgcv unavailable — asserting gam-side held-out quality only: \
+                 matern(nu={nu}) n_train={} n_test={n_test} gam_edf={gam_edf:.3} \
+                 RMSE[gam={gam_rmse:.4} null={null_rmse:.4}]",
+                tr_range.len()
+            );
+            None
+        };
+
+        // PRIMARY: the GP smooth explains held-out logratio far better than the
+        // constant mean. lidar carries a strong, smooth range→logratio signal, so
+        // a working Matérn GP must cut held-out RMSE well below the null.
+        assert!(
+            gam_rmse < null_rmse * 0.65,
+            "matern(nu={nu}) held-out RMSE {gam_rmse:.4} must beat the constant-mean \
+             null {null_rmse:.4} by a wide margin (bar: < 65% of null)"
+        );
+
+        // MATCH-OR-BEAT mgcv's matched GP order on the SAME held-out RMSE.
+        if let Some(mrmse) = mgcv_rmse {
+            assert!(
+                gam_rmse <= mrmse * 1.15,
+                "matern(nu={nu}) held-out RMSE {gam_rmse:.4} exceeds mgcv bs=gp m={kappa} \
+                 {mrmse:.4} * 1.15"
+            );
+        }
+
+        assert!(
+            gam_edf > 1.0 && gam_edf < 18.0,
+            "matern(nu={nu}) effective dof out of sane range: {gam_edf:.3}"
+        );
+    }
 }
