@@ -284,6 +284,61 @@ impl GpuDispatchPolicy {
     }
 }
 
+/// The aspirational single-GPU design-row throughput the #1412 decision gate is
+/// supposed to establish for the LLM-shape batched-Cholesky + tile-GEMM fit
+/// pipeline: 100 000 design rows processed per wall-clock second per device.
+///
+/// The original gate *claimed* this number without ever measuring it. The
+/// honest contract is the other way around: a benchmark
+/// (`examples/throughput_1412.rs`) measures the true rows/sec on a real device,
+/// and [`GpuThroughputVerdict::from_measurement`] reports whether the measured
+/// value meets the target — the verdict is a *function of the measurement*, not
+/// a hardcoded assertion. See `tests/owed_1412.rs`.
+pub const GPU_THROUGHPUT_TARGET_ROWS_PER_SEC: f64 = 100_000.0;
+
+/// Outcome of comparing a *measured* GPU throughput against the target. The
+/// only way to construct one is [`Self::from_measurement`], so a verdict can
+/// never assert a target that was not actually established by a measurement.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpuThroughputVerdict {
+    /// The measured design-rows-per-second on the device under test.
+    pub measured_rows_per_sec: f64,
+    /// The target the measurement is compared against.
+    pub target_rows_per_sec: f64,
+    /// `measured / target`. ≥ 1.0 means the target was established.
+    pub fraction_of_target: f64,
+    /// True iff `measured_rows_per_sec >= target_rows_per_sec`.
+    pub meets_target: bool,
+}
+
+impl GpuThroughputVerdict {
+    /// Build a verdict from a measured throughput against
+    /// [`GPU_THROUGHPUT_TARGET_ROWS_PER_SEC`]. A non-finite or non-positive
+    /// measurement can never meet the target (it is not a usable measurement).
+    #[inline]
+    pub fn from_measurement(measured_rows_per_sec: f64) -> Self {
+        Self::from_measurement_against(measured_rows_per_sec, GPU_THROUGHPUT_TARGET_ROWS_PER_SEC)
+    }
+
+    /// Build a verdict against an explicit target (used by tests that probe the
+    /// comparison logic without depending on the global target constant).
+    #[inline]
+    pub fn from_measurement_against(measured_rows_per_sec: f64, target_rows_per_sec: f64) -> Self {
+        let usable = measured_rows_per_sec.is_finite() && measured_rows_per_sec > 0.0;
+        let fraction_of_target = if usable && target_rows_per_sec > 0.0 {
+            measured_rows_per_sec / target_rows_per_sec
+        } else {
+            0.0
+        };
+        Self {
+            measured_rows_per_sec,
+            target_rows_per_sec,
+            fraction_of_target,
+            meets_target: usable && measured_rows_per_sec >= target_rows_per_sec,
+        }
+    }
+}
+
 /// Which `(response, link)` family the Stage 3.3 device-resident PIRLS loop
 /// can evaluate without going through the Level-B raw-body NVRTC path.
 ///
