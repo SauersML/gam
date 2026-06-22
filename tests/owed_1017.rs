@@ -34,11 +34,13 @@
 //! Uses only the public crate API.
 
 use gam::gpu::GpuRuntime;
+use gam::gpu::kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
 use gam::gpu::policy::GpuDispatchPolicy;
 use gam::solver::arrow_schur::{
     ArrowSchurSystem, ArrowSolveOptions, solve_arrow_newton_step_core,
     solve_with_lm_escalation_inner,
 };
+use ndarray::Array2;
 
 /// Build a small well-conditioned dense Direct-mode arrow system, mirroring the
 /// in-crate `dense_direct_system` fixture so the CPU solve is deterministic and
@@ -161,4 +163,122 @@ fn matvec_dispatch_predicate_admits_sae_llm_shape_rejects_tiny() {
         !policy.reduced_schur_matvec_should_offload(300, 8, 4, cg_iters),
         "the small CPU-canary shape must not engage the device"
     );
+}
+
+/// #1017 Phase 3 readback scalar parity (CPU-runnable). Phase 3 keeps the frame
+/// factors resident and reads back only scalars — among them `log|H|` (item (f)
+/// in the issue: "objective/line-search ... Host reads back scalars only"). The
+/// resident frame's `log_det_hessian()` (GPU host) and the device-resident inner
+/// fit's reported `log_det_hessian` must equal the value the outer EFS/BFGS loop
+/// would otherwise compute on the host. The A100 path asserts resident-vs-host
+/// log|H| parity in `examples/device_resident_inner_1017.rs`; that example never
+/// runs in CPU CI.
+///
+/// This gate pins the host side of that parity: the dense-reference oracle
+/// (`solve_arrow_newton_step_dense_reference`) — the EXACT path a GPU host falls
+/// back to on device decline, and the value the resident frame's
+/// `log_det_hessian()` is certified against — must compute `log|H| = 2·Σ ln L_ii`
+/// equal to an INDEPENDENT dense Cholesky log-determinant of the assembled
+/// bordered Hessian `H = [[D, B],[Bᵀ, H_ββ]] + ridge`. A regression in the
+/// readback scalar (dropped factor, wrong ridge placement, missing ×2, or a
+/// border block omitted from the determinant) diverges here on the build box,
+/// before any A100 run. Device-agnostic: no CUDA required.
+#[test]
+fn phase3_logdet_readback_matches_independent_cholesky_logdet() {
+    let (n, d, k) = (6usize, 2usize, 4usize);
+    let ridge_t = 1e-3;
+    let ridge_beta = 2e-3;
+    let sys = dense_direct_system(n, d, k);
+
+    let solution = solve_arrow_newton_step_dense_reference(&sys, ridge_t, ridge_beta)
+        .expect("dense-reference oracle must solve the PD bordered system");
+
+    // Independent reconstruction of the bordered Hessian H (with the SAME ridge
+    // placement as the oracle), then an independent Cholesky log-determinant.
+    let total = n * d + k;
+    let mut h = Array2::<f64>::zeros((total, total));
+    for (i, row) in sys.rows.iter().enumerate() {
+        let base = i * d;
+        for r in 0..d {
+            for c in 0..d {
+                h[[base + r, base + c]] = row.htt[[r, c]];
+            }
+            h[[base + r, base + r]] += ridge_t;
+            for c in 0..k {
+                let v = row.htbeta[[r, c]];
+                h[[base + r, n * d + c]] = v;
+                h[[n * d + c, base + r]] = v;
+            }
+        }
+    }
+    for r in 0..k {
+        for c in 0..k {
+            h[[n * d + r, n * d + c]] += sys.hbb[[r, c]];
+        }
+        h[[n * d + r, n * d + r]] += ridge_beta;
+    }
+
+    let logdet_independent = cholesky_logdet(&h);
+    let diff = (solution.log_det_hessian - logdet_independent).abs();
+    let scale = 1.0 + logdet_independent.abs();
+    assert!(
+        diff < 1e-9 * scale,
+        "Phase-3 log|H| readback scalar must equal an independent Cholesky \
+         log-determinant of the assembled bordered Hessian: oracle={} \
+         independent={} (|Δ|={diff:e}); this is the host-side value the resident \
+         frame's log_det_hessian() is certified against on the A100",
+        solution.log_det_hessian,
+        logdet_independent
+    );
+
+    // The log-determinant is strictly positive for this strongly PD system (all
+    // eigenvalues > 1), guarding against a degenerate 0.0 sentinel masquerading
+    // as a match.
+    assert!(
+        solution.log_det_hessian > 0.0,
+        "log|H| of a strongly PD bordered Hessian must be positive, got {}",
+        solution.log_det_hessian
+    );
+}
+
+/// Independent dense SPD log-determinant `2·Σ ln L_ii` via a self-contained
+/// lower Cholesky, fully independent of the production factor path.
+fn cholesky_logdet(a: &Array2<f64>) -> f64 {
+    let n = a.nrows();
+    let mut l = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..=i {
+            let mut s = a[[i, j]];
+            for kk in 0..j {
+                s -= l[[i, kk]] * l[[j, kk]];
+            }
+            if i == j {
+                assert!(s > 0.0, "independent Cholesky hit a non-positive pivot {s}");
+                l[[i, j]] = s.sqrt();
+            } else {
+                l[[i, j]] = s / l[[j, j]];
+            }
+        }
+    }
+    let mut logdet = 0.0_f64;
+    for i in 0..n {
+        logdet += l[[i, i]].ln();
+    }
+    2.0 * logdet
+}
+
+/// #1017 Phase 3 readback shape contract (CPU-runnable): the dense-reference
+/// oracle returns a step whose `delta_t`/`delta_beta` dimensions match the
+/// system — the same `O(n·d + k)` vectors the resident frame reads back. A
+/// regression that mis-slices the bordered solution surfaces here on the build
+/// box.
+#[test]
+fn dense_reference_step_dimensions_are_well_formed() {
+    let (n, d, k) = (5usize, 2usize, 3usize);
+    let sys = dense_direct_system(n, d, k);
+    let sol = solve_arrow_newton_step_dense_reference(&sys, 0.0, 0.0)
+        .expect("dense-reference oracle must solve");
+    assert_eq!(sol.delta_t.len(), n * d);
+    assert_eq!(sol.delta_beta.len(), k);
+    assert!(sol.delta_t.iter().chain(sol.delta_beta.iter()).all(|v| v.is_finite()));
 }
