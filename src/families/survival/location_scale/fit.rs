@@ -277,11 +277,22 @@ pub(crate) fn fit_survival_location_scale_terms(
     // shared with the inner block preparation so the two layouts always agree.
     let constant_scale = log_sigma_boot_design.penalties.is_empty();
     let protected_timewiggle_cols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
+    // Full warp exit design + log-t at exit (same `SURVIVAL_TIME_FLOOR` map the
+    // inner `prepare_survival_location_scale_model` uses), so the OUTER ρ count
+    // and the reduced-parametric dispatch consult the SAME log-t-baseline
+    // collapse predicate as the inner block preparation and stay in lock-step.
+    let time_design_exit = spec.time_block.design_exit.to_dense();
+    let log_time_exit = spec.age_exit.mapv(|t| {
+        t.max(crate::families::survival::construction::SURVIVAL_TIME_FLOOR)
+            .ln()
+    });
     let k_time = survival_time_rho_count(
         &spec.time_block.penalties,
         spec.time_block.design_exit.ncols(),
         constant_scale,
         protected_timewiggle_cols,
+        &time_design_exit,
+        log_time_exit.view(),
     );
     let time_rho0 = if k_time == 0 {
         // Reduced parametric AFT: the time block is unpenalized, so any caller-
@@ -315,6 +326,8 @@ pub(crate) fn fit_survival_location_scale_terms(
         &log_sigma_boot_design.nullspace_dims,
         log_sigma_boot_design.penalties.len(),
         spec.linkwiggle_block.is_some(),
+        &time_design_exit,
+        log_time_exit.view(),
     );
     let layout = SurvivalLambdaLayout::new(
         k_time,

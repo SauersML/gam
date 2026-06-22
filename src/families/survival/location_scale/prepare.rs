@@ -359,6 +359,8 @@ pub(crate) fn prepare_survival_location_scale_model(
         spec.time_block.design_exit.ncols(),
         survival_constant_scale(spec),
         protected_timewiggle_cols,
+        &spec.time_block.design_exit.to_dense(),
+        log_time_exit.view(),
     );
     let threshold_fixed_cols = if time_reduced_to_parametric {
         if time_prepared.pinned_free_row_constant {
@@ -590,6 +592,8 @@ pub(crate) fn prepare_survival_location_scale_model(
         &log_sigma_prep.nullspace_dims,
         log_sigma_prep.penalties.len(),
         spec.linkwiggle_block.is_some(),
+        &spec.time_block.design_exit.to_dense(),
+        log_time_exit.view(),
     );
     let (threshold_penalties, threshold_nullspace_dims, threshold_initial_log_lambdas) =
         if drop_parametric_ridges {
@@ -797,6 +801,8 @@ pub(crate) fn prepare_survival_location_scale_model(
             spec.time_block.design_exit.ncols(),
             survival_constant_scale(spec),
             protected_timewiggle_cols,
+            &spec.time_block.design_exit.to_dense(),
+            log_time_exit.view(),
         ),
         k_threshold: threshold_penalties.len(),
         k_log_sigma: log_sigma_penalties.len(),

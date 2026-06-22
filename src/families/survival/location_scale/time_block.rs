@@ -692,28 +692,81 @@ pub(crate) fn time_parametric_null_space_basis(
     Some(evecs.select(ndarray::Axis(1), &null_cols))
 }
 
+/// Does a certified constant-scale AFT (no timewiggle) carry the `log t`
+/// baseline in its FULL time-warp design span, so the whole warp can collapse to
+/// the σ-scaled log-t LOCATION offset regardless of how the penalty's affine
+/// null space spectrally resolves?
+///
+/// `time_parametric_null_space_basis` re-derives the I-spline penalty's affine
+/// null space spectrally. At the DEFAULT high knot count (8 internal knots) the
+/// value-space congruence `Lᵀ S_B L` is badly conditioned, so that re-derivation
+/// can miss the single structural null direction (`null_cols.is_empty()` →
+/// `None`) or absorb extra near-null directions — leaving the rank-1/rank-2/
+/// general null-space collapses below unfired and the warp full, penalized, and
+/// (with the strong-smoothing ρ seed) flattened to a fraction of its true scale.
+/// That flattening multiplicatively shrinks BOTH the location slopes and σ by a
+/// common factor and aliases the threshold intercept against the warp constant,
+/// collapsing the lowest-leverage interaction to 0 (the lognormal-AFT defect).
+///
+/// The `reduce_to_parametric` regime is ALREADY certified constant-scale with no
+/// timewiggle, and the survival time basis is built over `log t`
+/// (survival_construction.rs), so the parametric-AFT baseline IS exactly `log t`.
+/// This predicate confirms `log t` is recoverable from the full warp design
+/// image (`reduced_warp_logt_baseline_usable` on the identity basis — i.e. the
+/// full column span), which it is for any non-degenerate I-spline-over-log-t
+/// basis. When it holds the warp collapses to `location_logt_offset_time_block`
+/// — `h ≡ 0`, the `log t` baseline carried on the σ-scaled `q` channel, and the
+/// `−log σ` event-Jacobian term that IDENTIFIES σ — the same σ-pinning
+/// representation the rank-1 gauge produces, robust to the spectral fragility.
+pub(crate) fn time_block_collapses_to_logt_baseline(
+    constant_scale: bool,
+    protected_timewiggle_cols: usize,
+    design_exit: &Array2<f64>,
+    log_time_exit: ndarray::ArrayView1<f64>,
+) -> bool {
+    if !constant_scale || protected_timewiggle_cols != 0 {
+        return false;
+    }
+    let p = design_exit.ncols();
+    if p == 0 {
+        return false;
+    }
+    let identity = Array2::<f64>::eye(p);
+    reduced_warp_logt_baseline_usable(&identity, design_exit, log_time_exit)
+}
+
 /// Does the constant-scale-AFT regime actually reduce the time block to its
 /// unpenalized affine parametric null space?
 ///
 /// This is the single predicate that both the inner block preparation
 /// (`prepare_identified_time_block`) and the OUTER ρ layout
 /// (`SurvivalLambdaLayout`) consult so they agree on the reduced time block's
-/// smoothing-parameter count. The reduction fires only when the regime is
-/// constant-scale with no monotone timewiggle reintroducing flexibility AND the
-/// time penalty actually has an affine null space to collapse onto. When it
-/// fires the reduced block is genuinely unpenalized (`zᵀ S z ≈ 0` on the
-/// null space), so it carries ZERO smoothing parameters and must contribute no
-/// ρ coordinate to the outer REML search — exactly like the constant `log_sigma`
-/// and rigid `threshold` blocks (issue #736/#735/#721).
+/// smoothing-parameter count. The reduction fires when the regime is
+/// constant-scale with no monotone timewiggle reintroducing flexibility AND
+/// either the time penalty has a spectrally-resolved affine null space to
+/// collapse onto OR the full warp design carries the `log t` baseline
+/// (`time_block_collapses_to_logt_baseline`, robust to the spectral fragility of
+/// the high-knot-count null-space re-derivation). When it fires the reduced
+/// block is genuinely unpenalized, so it carries ZERO smoothing parameters and
+/// must contribute no ρ coordinate to the outer REML search — exactly like the
+/// constant `log_sigma` and rigid `threshold` blocks (issue #736/#735/#721).
 pub(crate) fn time_block_reduces_to_parametric(
     time_penalties: &[Array2<f64>],
     time_ncols: usize,
     constant_scale: bool,
     protected_timewiggle_cols: usize,
+    design_exit: &Array2<f64>,
+    log_time_exit: ndarray::ArrayView1<f64>,
 ) -> bool {
     constant_scale
         && protected_timewiggle_cols == 0
-        && time_parametric_null_space_basis(time_penalties, time_ncols).is_some()
+        && (time_parametric_null_space_basis(time_penalties, time_ncols).is_some()
+            || time_block_collapses_to_logt_baseline(
+                constant_scale,
+                protected_timewiggle_cols,
+                design_exit,
+                log_time_exit,
+            ))
 }
 
 /// Number of time-warp smoothing parameters (outer ρ coordinates) the survival
@@ -725,12 +778,16 @@ pub(crate) fn survival_time_rho_count(
     time_ncols: usize,
     constant_scale: bool,
     protected_timewiggle_cols: usize,
+    design_exit: &Array2<f64>,
+    log_time_exit: ndarray::ArrayView1<f64>,
 ) -> usize {
     if time_block_reduces_to_parametric(
         time_penalties,
         time_ncols,
         constant_scale,
         protected_timewiggle_cols,
+        design_exit,
+        log_time_exit,
     ) {
         0
     } else {
@@ -784,6 +841,8 @@ pub(crate) fn survival_reduced_parametric_aft_regime(
     log_sigma_nullspace_dims: &[usize],
     log_sigma_npenalties: usize,
     has_linkwiggle: bool,
+    design_exit: &Array2<f64>,
+    log_time_exit: ndarray::ArrayView1<f64>,
 ) -> bool {
     if has_linkwiggle || protected_timewiggle_cols > 0 {
         return false;
@@ -793,6 +852,8 @@ pub(crate) fn survival_reduced_parametric_aft_regime(
         time_ncols,
         constant_scale,
         protected_timewiggle_cols,
+        design_exit,
+        log_time_exit,
     ) != 0
     {
         return false;
@@ -1096,7 +1157,9 @@ pub(crate) fn prepare_identified_time_block(
     // are a property of individual I-spline columns, not of the affine
     // generators that span their null space — and the row-wise guard takes over
     // that role exactly.)
-    if reduce_to_parametric && let Some(z) = time_parametric_null_space_basis(&input.penalties, p) {
+    if reduce_to_parametric
+        && let Some(z) = time_parametric_null_space_basis(&input.penalties, p)
+    {
         let r = z.ncols();
         // Canonical log-t gauge (issue #892). In the reduced constant-scale
         // parametric-AFT regime the I-spline time-warp collapses onto its log-t
@@ -1295,6 +1358,37 @@ pub(crate) fn prepare_identified_time_block(
             // Fallback reduce keeps a free warp; no location-channel log-t offset.
             location_log_time_offset: false,
         });
+    }
+
+    // Robust σ-scaled log-t collapse (lognormal/Gaussian AFT warp-scale defect).
+    // The certified constant-scale parametric-AFT regime may reach here with the
+    // null-space branch above UNFIRED: at the DEFAULT high knot count (8 internal
+    // knots) the value-space congruence `Lᵀ S_B L` is ill-conditioned, so
+    // `time_parametric_null_space_basis`'s spectral re-derivation can return
+    // `None` (the single structural affine null direction pushed above the
+    // `100·p·eps·max_ev` threshold) even though the construction-certified
+    // `nullspace_dims` is 1. Without this collapse the warp stays full,
+    // penalized, and — under the strong-smoothing time-ρ seed — flattened, which
+    // multiplicatively shrinks every location slope and σ by a common factor and
+    // aliases the threshold intercept against the warp constant (the lowest-
+    // leverage interaction then sticks at its cold-start 0).
+    //
+    // This is the SAME σ-pinning representation the rank-1 gauge produces: the
+    // survival time basis is built over `log t`, so when the full warp design
+    // carries the `log t` baseline (`time_block_collapses_to_logt_baseline`) the
+    // whole warp collapses to `h ≡ 0` with the `log t` baseline on the σ-scaled
+    // `q` channel, supplying the `−log σ` event-Jacobian term that IDENTIFIES σ
+    // (`location_logt_offset_time_block`). The OUTER ρ layout agrees because
+    // `survival_time_rho_count` ORs the same predicate, so both see `k_time == 0`.
+    if reduce_to_parametric
+        && time_block_collapses_to_logt_baseline(true, 0, &design_exit, log_time_exit)
+    {
+        return Ok(location_logt_offset_time_block(
+            &design_entry,
+            &design_exit,
+            &design_derivative_exit,
+            p,
+        ));
     }
 
     let penalties = input.penalties.clone();
