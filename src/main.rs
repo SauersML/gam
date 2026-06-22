@@ -326,5 +326,5 @@ fn run() -> CliResult<()> {
 }
 
 #[cfg(test)]
-#[path = "../tests/src_modules/cli_tests.rs"]
+#[path = "../tests/src_modules/misc/cli_tests.rs"]
 mod cli_tests;

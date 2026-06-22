@@ -2017,8 +2017,8 @@ pub(crate) mod install_flex;
 pub(crate) mod row_kernel;
 #[cfg(test)]
 mod tests {
-    include!("../../../tests/src_modules/families_bms_identifiability_rigid_tests.rs");
-    include!("../../../tests/src_modules/families_bms_joint_hessian_hvp_correction_tests.rs");
+    include!("../../../tests/src_modules/misc/families_bms_identifiability_rigid_tests.rs");
+    include!("../../../tests/src_modules/optimization/families_bms_joint_hessian_hvp_correction_tests.rs");
 }
 pub(crate) mod axis_direction_search;
 pub(crate) mod cell_moment_assembly;
