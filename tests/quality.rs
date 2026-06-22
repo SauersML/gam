@@ -196,6 +196,8 @@ mod quality_vs_mgcv_high_leverage_gaussian_alo_stabilized;
 mod quality_vs_mgcv_matern_smooth;
 #[path = "quality/quality_vs_mgcv_matern_varying_nu.rs"]
 mod quality_vs_mgcv_matern_varying_nu;
+#[path = "quality/quality_vs_mgcv_negbin_estimated_theta_smooth.rs"]
+mod quality_vs_mgcv_negbin_estimated_theta_smooth;
 #[path = "quality/quality_vs_mgcv_nottem_cyclic.rs"]
 mod quality_vs_mgcv_nottem_cyclic;
 #[path = "quality/quality_vs_mgcv_pair_surface_live_backend.rs"]
