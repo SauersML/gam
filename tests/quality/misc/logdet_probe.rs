@@ -80,7 +80,6 @@ fn make_csv(seed: u64) -> std::path::PathBuf {
 // from the gated set: the suite harness lists it but the per-test run skips it
 // (rc=0 → PASS), so no real quality assertion is touched or weakened.
 #[test]
-#[ignore = "diagnostic dump (panics by design to surface the #1271-diag trace); not a quality gate — run with --ignored to see the dump"]
 fn diag_1271_dump_reml_logdet_internals() {
     init_parallelism();
 
@@ -164,8 +163,17 @@ fn diag_1271_dump_reml_logdet_internals() {
     }
     report.push_str("================================================================\n");
 
-    // Force nextest to surface the captured output even without --nocapture by
-    // failing with the full report as the panic message. This test is a probe,
-    // not a gate; the "failure" is the report.
-    panic!("{report}");
+    // Surface the diagnostic report via eprintln so it appears with --nocapture,
+    // then assert the fit produced a finite EDF with at least one captured
+    // REML evaluation — converting the probe from a deliberate panic into a
+    // legitimate running test (the ban-scanner forbids #[ignore] tests).
+    eprintln!("{report}");
+    assert!(
+        edf_total.is_finite() && edf_total > 0.0,
+        "edf_total must be finite: {edf_total}"
+    );
+    assert!(
+        !lines.is_empty(),
+        "the capture logger must have recorded at least one dense REML evaluation"
+    );
 }
