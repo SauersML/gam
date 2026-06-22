@@ -11,12 +11,30 @@
 //! fitted output". mgcv is a mature MATCH-OR-BEAT baseline on that same
 //! truth-recovery metric, not a fit to imitate.
 //!
-//! Documented numbers from the issue (gam 0.1.222 `b172e3ccd` vs mgcv 1.9-4):
-//!   * Tweedie `s(x)` log link        : RMSE ratio gam/mgcv ≈ 1.13
-//!   * `s(x) + x` (smooth + linear)    : ratio ≈ 1.05
-//!   * `s(x)+s(z)`, corr(x,z)=0.90     : ratio ≈ 1.03 (concurvity)
-//!   * cyclic tensor te(t,x,           : periodicity gap 0.0000; RMSE 0.018,
-//!     boundary=['periodic','clamped'])  beating default `te` (0.033)
+//! APPLES-TO-APPLES (the matched-model contract — every arm honours all three):
+//!
+//!   1. SAME BASIS. gam and mgcv use the SAME explicit `bs` on both sides, never
+//!      a bare `s()` that resolves to each tool's own default. The Gaussian arms
+//!      (s(x)+x, concurvity) pin `bs="cr"` on BOTH sides — the cubic-regression
+//!      spline is constructed identically in both engines (no thin-plate
+//!      knot-selection nondeterminism). The Tweedie arm pins `bs="tp"` on BOTH
+//!      sides (the clean thin-plate cell; see the #1477 note below). No arm uses
+//!      a bare default `s()` against an explicit basis.
+//!
+//!   2. SAME PENALTY MODEL. gam's smooth `double_penalty` flag is the exact analog
+//!      of mgcv's `select=`. The matched pairs are: gam `double_penalty=false`
+//!      ↔ mgcv ordinary penalized fit (`select=FALSE`, the default), and gam
+//!      `double_penalty=true` ↔ mgcv `select=TRUE`. Every arm fixes gam's
+//!      `double_penalty` EXPLICITLY and sets mgcv's `select=` to the matching
+//!      value, so neither side silently double-penalizes the nullspace while the
+//!      other does not. (gam's bare smooth default is `double_penalty=true` and
+//!      mgcv's bare default is `select=FALSE`; pinning both removes that mismatch.)
+//!
+//!   3. SAME FAMILY PARAMETERS. The Tweedie variance power `p` is FIXED at the
+//!      same value (1.5) on both sides — gam hard-codes `p=1.5` (it does not
+//!      estimate the power), so the mgcv call uses `tw(p=1.5)` (the fixed-power
+//!      Tweedie), NOT `tw()` (which estimates `p`). This arm therefore makes no
+//!      "power estimated" claim; both engines fit the SAME fixed-`p` model.
 //!
 //! Tolerances here are deliberately looser than the documented point estimates
 //! (the documented value is the seed-specific realization; the asserted bound is
@@ -25,28 +43,25 @@
 //! regression in any of these paths — a dropped penalty, a broken cyclic seam, a
 //! concurvity-driven over/under-smooth — fails the corresponding arm loudly.
 //!
-//! RECONCILIATION WITH #1476 / #1477 (important — these arms protect the
-//! genuinely-clean CONFIGS, not every config with the same term shape):
+//! RECONCILIATION WITH #1476 / #1477:
 //!
 //!   * #1477 proves the Tweedie `s(x)` mean is BIASED *specifically* on the
 //!     explicit P-spline basis (`bs='ps'`) — right-boundary blow-up — while
-//!     gamfit's own `bs='cr'` and the default thin-plate `s(x)` recover truth.
-//!     Arm 1 below pins the DEFAULT thin-plate `s(x)` (a `k=10` thin-plate
-//!     smooth, NOT `bs='ps'`); that is the clean cell. Arm 1 deliberately does
-//!     NOT certify the `bs='ps'` Tweedie path — that broken cell is tracked by
-//!     #1477 and must not be asserted "clean" here.
+//!     gamfit's own `bs='cr'` and the thin-plate `bs='tp'` recover truth. Arm 1
+//!     pins `bs="tp"` (matched on both sides) — the clean cell — and adds an
+//!     explicit right-boundary fitted-mean assertion so a #1477-style boundary
+//!     blow-up cannot leak into the thin-plate path undetected. Arm 1 does NOT
+//!     certify the `bs='ps'` Tweedie path; that broken cell is tracked by #1477.
 //!
-//!   * #1476 proves the DEFAULT double-penalty `s(x1)+s(x2)` MIS-ALLOCATES the
-//!     nullspace under moderate concurvity at the default basis with UNIFORM
-//!     support, collapsing one smooth's PER-PARTIAL effect to EDF≈0. The
-//!     additive SUM on a STANDARD-NORMAL-support design (Arm 3 below) is still
-//!     recovered and still match-or-beats mgcv — that is the clean, asserted
-//!     claim. Arm 3 therefore asserts ONLY the additive-sum recovery and
-//!     explicitly does NOT assert per-partial component recovery, because the
-//!     per-partial / Uniform-support / default-basis cell is the BROKEN one
-//!     tracked by #1476. Asserting per-partial "clean" here would contradict
-//!     #1476; this arm is scoped to the sum so it stays an honest regression of
-//!     a working path, not a false certification of a broken one.
+//!   * #1476 was the default double-penalty nullspace mis-allocation that
+//!     collapsed one smooth's PER-PARTIAL effect to EDF≈0 under concurvity. With
+//!     the projector fix (#26ab264e3) and a MATCHED penalty model (gam
+//!     `double_penalty=false` ↔ mgcv ordinary), the per-partial recovery should
+//!     now hold. Arm 3 therefore asserts the matched-model per-term contract
+//!     directly: each smooth keeps real EDF (neither collapses to ≈0), each
+//!     partial curve recovers its own truth component, and both smoothing
+//!     parameters are finite and sane. A regression that reintroduces the
+//!     nullspace collapse fails these per-term bars loudly.
 
 use csv::StringRecord;
 use gam::data::EncodedDataset;
@@ -105,19 +120,28 @@ fn gam_eta(
 }
 
 // ===========================================================================
-// Arm 1 — Tweedie s(x), log link, power estimated.
+// Arm 1 — Tweedie s(x), log link, FIXED variance power p = 1.5 (matched both
+//         sides). gam does NOT estimate p; this arm makes NO "power estimated"
+//         claim — it fits the same fixed-p model in both engines.
 // ===========================================================================
 
 /// The Tweedie compound-Poisson-gamma response with a log-link smooth must
-/// RECOVER a known log-mean curve and match-or-beat mgcv's `tw()` on
-/// truth-recovery RMSE. Documented: gam/mgcv RMSE ratio ≈ 1.13, no EDF stall.
+/// RECOVER a known log-mean curve and match-or-beat mgcv's FIXED-power
+/// `tw(p=1.5)` on truth-recovery RMSE. Documented: gam/mgcv RMSE ratio ≈ 1.13,
+/// no EDF stall.
 ///
-/// SCOPE (see the #1477 reconciliation in the module header): this arm uses the
-/// DEFAULT thin-plate `s(x, k=10)` basis, which is the clean Tweedie cell. It
-/// deliberately does NOT use the explicit `bs='ps'` P-spline basis, whose
-/// Tweedie mean is biased (right-boundary blow-up) and is tracked separately by
-/// #1477. A regression that leaks the #1477 ps bias into the default basis —
-/// or otherwise breaks the non-Gaussian thin-plate mean — fails this arm.
+/// MATCHED MODEL (see the module header contract):
+///   * SAME BASIS: `bs="tp"`, `k=10` on BOTH sides (the clean thin-plate cell,
+///     NOT the #1477-biased `bs='ps'`).
+///   * SAME PENALTY MODEL: gam `double_penalty=false` ↔ mgcv ordinary
+///     (`select=FALSE`).
+///   * SAME FAMILY PARAM: variance power fixed at `p=1.5` on both sides. gam
+///     hard-codes `p=1.5`; the mgcv call uses `tw(p=1.5)` (fixed), NOT `tw()`
+///     (which estimates `p`). No power-estimation claim is asserted.
+///
+/// Averaged over several seeds to suppress the compound-Poisson-gamma draw's
+/// Monte-Carlo noise, and with an explicit right-boundary fitted-mean check
+/// (the #1477 guard): the thin-plate mean must track truth at the right edge.
 #[test]
 fn tweedie_log_smooth_recovers_truth_and_matches_mgcv() {
     init_parallelism();
@@ -128,113 +152,140 @@ fn tweedie_log_smooth_recovers_truth_and_matches_mgcv() {
     let n = 400usize;
     let p_true = 1.5_f64;
     let phi = 0.6_f64;
+    let seeds: [u64; 5] = [147_001, 147_011, 147_021, 147_031, 147_041];
 
-    let mut rng = StdRng::seed_from_u64(147_001);
-    let unif = Uniform::new(0.0_f64, 3.0).expect("uniform x");
-    let mut x = Vec::with_capacity(n);
-    let mut y = Vec::with_capacity(n);
-    for _ in 0..n {
-        let xi = unif.sample(&mut rng);
-        let mu = true_eta(xi).exp();
-        // Compound Poisson–gamma draw for Tweedie 1<p<2 (Jørgensen): N ~ Pois(λ),
-        // y = sum of N gamma jumps. Standard reparameterization in (μ, φ, p).
-        let lambda = mu.powf(2.0 - p_true) / (phi * (2.0 - p_true));
-        let gamma_shape = (2.0 - p_true) / (p_true - 1.0);
-        let gamma_scale = phi * (p_true - 1.0) * mu.powf(p_true - 1.0);
-        let n_jumps = poisson_sample(lambda, &mut rng);
-        let mut yi = 0.0;
-        for _ in 0..n_jumps {
-            yi += gamma_sample(gamma_shape, gamma_scale, &mut rng);
-        }
-        x.push(xi);
-        y.push(yi);
-    }
-    let zeros = y.iter().filter(|&&v| v == 0.0).count();
-    assert!(zeros > 0, "Tweedie 1<p<2 must be zero-inflated; got {zeros} zeros");
-
-    let ds = encode(&[("x", &x), ("y", &y)]);
-    let x_idx = ds.column_map()["x"];
-    let width = ds.headers.len();
-
-    let cfg = FitConfig {
-        family: Some("tweedie".to_string()),
-        ..FitConfig::default()
-    };
-    let result = fit_from_formula("y ~ s(x, k=10)", &ds, &cfg).expect("gam tweedie fit");
-    let FitResult::Standard(fit) = result else {
-        panic!("Tweedie(log) is a scalar GLM family => expected FitResult::Standard");
-    };
-    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
-    assert!(
-        gam_edf > 1.0 && gam_edf < 15.0,
-        "tweedie smooth edf out of sane range (EDF stall?): {gam_edf:.3}"
-    );
-
-    // Dense evaluation grid: recover the MEAN curve mu = exp(eta) vs analytic
-    // truth on points spanning the support.
     let grid: Vec<f64> = (0..120).map(|i| 3.0 * i as f64 / 119.0).collect();
     let truth_mu: Vec<f64> = grid.iter().map(|&xg| true_eta(xg).exp()).collect();
-    let gam_mu: Vec<f64> = gam_eta(&fit, width, &[(x_idx, &grid)])
-        .iter()
-        .map(|e| e.exp())
-        .collect();
-
-    let r = run_r(
-        &[Column::new("x", &x), Column::new("y", &y)],
-        &format!(
-            r#"
-            suppressPackageStartupMessages(library(mgcv))
-            m <- gam(y ~ s(x, k = 10), data = df, family = tw(), method = "REML")
-            xg <- seq(0, 3, length.out = {ng})
-            emit("mu", as.numeric(predict(m, newdata = data.frame(x = xg), type = "response")))
-            emit("edf", sum(m$edf))
-            emit("p", as.numeric(m$family$getTheta(TRUE)))
-            "#,
-            ng = grid.len(),
-        ),
-    );
-    let mgcv_mu = r.vector("mu");
-    let mgcv_edf = r.scalar("edf");
-    assert_eq!(mgcv_mu.len(), grid.len(), "mgcv mu length mismatch");
-
-    let gam_err = rmse(&gam_mu, &truth_mu);
-    let mgcv_err = rmse(mgcv_mu, &truth_mu);
     let signal = truth_mu.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
         - truth_mu.iter().cloned().fold(f64::INFINITY, f64::min);
+    let last = grid.len() - 1;
+    let boundary_truth = truth_mu[last];
+
+    let mut gam_err_sum = 0.0;
+    let mut mgcv_err_sum = 0.0;
+    let mut boundary_ok = 0usize;
+
+    for &seed in &seeds {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let unif = Uniform::new(0.0_f64, 3.0).expect("uniform x");
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for _ in 0..n {
+            let xi = unif.sample(&mut rng);
+            let mu = true_eta(xi).exp();
+            // Compound Poisson–gamma draw for Tweedie 1<p<2 (Jørgensen): N ~ Pois(λ),
+            // y = sum of N gamma jumps. Standard reparameterization in (μ, φ, p).
+            let lambda = mu.powf(2.0 - p_true) / (phi * (2.0 - p_true));
+            let gamma_shape = (2.0 - p_true) / (p_true - 1.0);
+            let gamma_scale = phi * (p_true - 1.0) * mu.powf(p_true - 1.0);
+            let n_jumps = poisson_sample(lambda, &mut rng);
+            let mut yi = 0.0;
+            for _ in 0..n_jumps {
+                yi += gamma_sample(gamma_shape, gamma_scale, &mut rng);
+            }
+            x.push(xi);
+            y.push(yi);
+        }
+        let zeros = y.iter().filter(|&&v| v == 0.0).count();
+        assert!(zeros > 0, "Tweedie 1<p<2 must be zero-inflated; got {zeros} zeros");
+
+        let ds = encode(&[("x", &x), ("y", &y)]);
+        let x_idx = ds.column_map()["x"];
+        let width = ds.headers.len();
+
+        let cfg = FitConfig {
+            family: Some("tweedie".to_string()),
+            ..FitConfig::default()
+        };
+        // gam: matched basis (tp) + matched penalty model (double_penalty=false).
+        let result =
+            fit_from_formula("y ~ s(x, bs=\"tp\", k=10, double_penalty=false)", &ds, &cfg)
+                .expect("gam tweedie fit");
+        let FitResult::Standard(fit) = result else {
+            panic!("Tweedie(log) is a scalar GLM family => expected FitResult::Standard");
+        };
+        let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
+        assert!(
+            gam_edf > 1.0 && gam_edf < 15.0,
+            "tweedie smooth edf out of sane range (EDF stall?): {gam_edf:.3}"
+        );
+
+        let gam_mu: Vec<f64> = gam_eta(&fit, width, &[(x_idx, &grid)])
+            .iter()
+            .map(|e| e.exp())
+            .collect();
+
+        // mgcv: SAME basis (tp), SAME penalty model (ordinary, select=FALSE), and
+        // the SAME FIXED variance power p=1.5 — tw(p=1.5), NOT tw() (no estimate).
+        let r = run_r(
+            &[Column::new("x", &x), Column::new("y", &y)],
+            &format!(
+                r#"
+                suppressPackageStartupMessages(library(mgcv))
+                m <- gam(y ~ s(x, bs = "tp", k = 10), data = df,
+                         family = tw(p = 1.5), select = FALSE, method = "REML")
+                xg <- seq(0, 3, length.out = {ng})
+                emit("mu", as.numeric(predict(m, newdata = data.frame(x = xg), type = "response")))
+                emit("edf", sum(m$edf))
+                "#,
+                ng = grid.len(),
+            ),
+        );
+        let mgcv_mu = r.vector("mu");
+        let mgcv_edf = r.scalar("edf");
+        assert_eq!(mgcv_mu.len(), grid.len(), "mgcv mu length mismatch");
+
+        let gam_err = rmse(&gam_mu, &truth_mu);
+        let mgcv_err = rmse(mgcv_mu, &truth_mu);
+        gam_err_sum += gam_err;
+        mgcv_err_sum += mgcv_err;
+
+        // BOUNDARY (#1477 guard): the right-edge fitted mean must track truth.
+        // The clean tp cell stays within a tight factor of the analytic mean at
+        // x=3; the #1477 ps blow-up overshoots by >2×. Require 1.4× (tighter than
+        // before) at the rightmost evaluation point.
+        let boundary_gam = gam_mu[last];
+        if boundary_gam <= boundary_truth * 1.4 && boundary_gam >= boundary_truth / 1.4 {
+            boundary_ok += 1;
+        }
+
+        eprintln!(
+            "tweedie s(x) tp p=1.5 seed={seed}: n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
+             gam_rmse_vs_truth={gam_err:.5} mgcv_rmse_vs_truth={mgcv_err:.5} \
+             ratio={:.3} gam_mu(x=3)={boundary_gam:.4} truth(x=3)={boundary_truth:.4}",
+            gam_err / mgcv_err.max(1e-12)
+        );
+    }
+
+    let ns = seeds.len() as f64;
+    let gam_err = gam_err_sum / ns;
+    let mgcv_err = mgcv_err_sum / ns;
     eprintln!(
-        "tweedie s(x) log: n={n} gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
-         gam_rmse_vs_truth={gam_err:.5} mgcv_rmse_vs_truth={mgcv_err:.5} \
-         ratio={:.3} signal_range={signal:.4}",
-        gam_err / mgcv_err.max(1e-12)
+        "tweedie s(x) tp p=1.5 MEAN over {} seeds: gam_rmse={gam_err:.5} mgcv_rmse={mgcv_err:.5} \
+         ratio={:.3} signal={signal:.4} boundary_ok={boundary_ok}/{}",
+        seeds.len(),
+        gam_err / mgcv_err.max(1e-12),
+        seeds.len()
     );
 
-    // PRIMARY: gam recovers the mean curve well below the signal scale.
+    // PRIMARY: gam recovers the mean curve well below the signal scale (seed-mean).
     assert!(
         gam_err < 0.30 * signal,
-        "tweedie smooth failed to recover the log-mean curve: rmse={gam_err:.5} \
+        "tweedie smooth failed to recover the log-mean curve: mean rmse={gam_err:.5} \
          (signal {signal:.4})"
     );
-    // MATCH-OR-BEAT: gam's truth-recovery RMSE no worse than 1.25× mgcv's. The
-    // documented realization is ≈1.13; the 1.25 bound is the regression floor.
+    // MATCH-OR-BEAT: gam's seed-mean truth-recovery RMSE no worse than 1.25× mgcv's.
+    // The documented realization is ≈1.13; the 1.25 bound is the regression floor.
     assert!(
         gam_err <= mgcv_err * 1.25,
         "gam tweedie recovery {gam_err:.5} worse than mgcv {mgcv_err:.5} * 1.25"
     );
-
-    // BOUNDARY SANITY (the #1477 guard): the default thin-plate Tweedie mean must
-    // NOT exhibit the right-boundary blow-up that #1477 isolates on the `bs='ps'`
-    // basis (there the prediction overshoots truth by >2× at the right edge). The
-    // clean default-basis cell tracks truth at the boundary; we require the
-    // fitted mean at the rightmost evaluation point to stay within 1.6× of the
-    // analytic truth (well inside MC noise for a clean fit, far below a >2×
-    // blow-up). If the #1477 ps bias ever leaks into the default path this fires.
-    let last = grid.len() - 1;
-    let boundary_truth = truth_mu[last];
-    let boundary_gam = gam_mu[last];
+    // BOUNDARY: the right-edge mean must track truth on at least 4 of 5 seeds (a
+    // genuine #1477-style blow-up fails every seed, not an MC-tail one).
     assert!(
-        boundary_gam <= boundary_truth * 1.6 && boundary_gam >= boundary_truth / 1.6,
-        "tweedie default-basis mean shows a #1477-style right-boundary distortion: \
-         gam(x=3)={boundary_gam:.4} vs truth {boundary_truth:.4}"
+        boundary_ok >= 4,
+        "tweedie tp mean shows a #1477-style right-boundary distortion: \
+         only {boundary_ok}/5 seeds kept gam(x=3) within 1.4× of truth {boundary_truth:.4}"
     );
 }
 
@@ -274,8 +325,11 @@ fn smooth_plus_linear_same_var_recovers_truth_and_matches_mgcv() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
+    // gam: matched basis (cr) + matched penalty model (double_penalty=false). The
+    // parametric `linear(x)` term is unpenalized on both sides (mgcv `+ x` too).
     let result =
-        fit_from_formula("y ~ s(x, k=10) + linear(x)", &ds, &cfg).expect("gam s(x)+x fit");
+        fit_from_formula("y ~ s(x, bs=\"cr\", k=10, double_penalty=false) + linear(x)", &ds, &cfg)
+            .expect("gam s(x)+x fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for s(x)+linear(x)");
     };
@@ -285,12 +339,14 @@ fn smooth_plus_linear_same_var_recovers_truth_and_matches_mgcv() {
     let truth_grid: Vec<f64> = grid.iter().map(|&xg| truth(xg)).collect();
     let gam_grid = gam_eta(&fit, width, &[(x_idx, &grid)]);
 
+    // mgcv: SAME basis (cr), SAME penalty model (ordinary, select=FALSE).
     let r = run_r(
         &[Column::new("x", &x), Column::new("y", &y)],
         &format!(
             r#"
             suppressPackageStartupMessages(library(mgcv))
-            m <- gam(y ~ s(x, k = 10) + x, data = df, method = "REML")
+            m <- gam(y ~ s(x, bs = "cr", k = 10) + x, data = df,
+                     select = FALSE, method = "REML")
             xg <- seq(0, 4, length.out = {ng})
             emit("pred", as.numeric(predict(m, newdata = data.frame(x = xg))))
             emit("edf", sum(m$edf))
@@ -331,18 +387,18 @@ fn smooth_plus_linear_same_var_recovers_truth_and_matches_mgcv() {
 /// Two additive smooths on STRONGLY correlated covariates (concurvity, corr=0.9)
 /// must still recover the additive truth f(x)+g(z) and match-or-beat mgcv. High
 /// concurvity is the classic failure mode for additive smoothers (the component
-/// curves become weakly identified); recovering the SUM on a grid is the robust
-/// objective metric. Documented: gam/mgcv RMSE ratio ≈ 1.03.
+/// curves become weakly identified). Documented: gam/mgcv RMSE ratio ≈ 1.03.
 ///
-/// SCOPE (see the #1476 reconciliation in the module header): the asserted claim
-/// is recovery of the additive SUM f(x)+g(z) on a STANDARD-NORMAL-support
-/// design — a genuinely-clean, match-or-beat path. This arm explicitly does NOT
-/// assert per-PARTIAL component recovery: #1476 proves the default
-/// double-penalty nullspace mis-allocation collapses one PARTIAL effect to
-/// EDF≈0 under moderate concurvity with UNIFORM support at the default basis.
-/// That broken per-partial / Uniform cell is tracked by #1476 and must not be
-/// certified "clean" here. The sum stays identified even when the components are
-/// not, so the sum is the honest regression target for this working path.
+/// MATCHED MODEL + PER-TERM CONTRACT (the #1476 / #26ab264e3 guard): both engines
+/// fit `s(x, bs="cr") + s(z, bs="cr")` with a MATCHED ordinary penalty model
+/// (gam `double_penalty=false` ↔ mgcv `select=FALSE`). With the projector fix
+/// (#26ab264e3) the per-partial recovery should hold even under concurvity, so
+/// this arm now asserts the FULL per-term contract — not just the additive sum:
+///   (a) the additive SUM recovers truth and match-or-beats mgcv (unchanged);
+///   (b) EACH smooth keeps real EDF — neither collapses to ≈0 (the #1476 mode);
+///   (c) EACH partial curve recovers its own truth component (s_x↔f, s_z↔g);
+///   (d) BOTH smoothing parameters are finite and sane.
+/// A regression that reintroduces the nullspace collapse fails (b)/(c) loudly.
 #[test]
 fn concurvity_two_smooths_corr_090_recovers_truth_and_matches_mgcv() {
     init_parallelism();
@@ -384,8 +440,13 @@ fn concurvity_two_smooths_corr_090_recovers_truth_and_matches_mgcv() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result =
-        fit_from_formula("y ~ s(x, k=10) + s(z, k=10)", &ds, &cfg).expect("gam s(x)+s(z) fit");
+    // gam: matched basis (cr) + matched ordinary penalty model (double_penalty=false).
+    let result = fit_from_formula(
+        "y ~ s(x, bs=\"cr\", k=10, double_penalty=false) + s(z, bs=\"cr\", k=10, double_penalty=false)",
+        &ds,
+        &cfg,
+    )
+    .expect("gam s(x)+s(z) fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for s(x)+s(z)");
     };
@@ -396,22 +457,72 @@ fn concurvity_two_smooths_corr_090_recovers_truth_and_matches_mgcv() {
     let truth_sum: Vec<f64> = (0..n).map(|i| f(x[i]) + g(z[i])).collect();
     let gam_sum = gam_eta(&fit, width, &[(x_idx, &x), (z_idx, &z)]);
 
+    // --- per-term partials (the #1476 / #26ab264e3 contract) -------------------
+    // Isolate each smooth's partial curve by evaluating the frozen design with
+    // ONLY that covariate set (the other smooth contributes its constant value at
+    // 0, folded into the additive-identifiability constant — centered out below).
+    // s_x partial vs f(x); s_z partial vs g(z), both on a dense in-support grid.
+    let pgrid_x: Vec<f64> = (0..120).map(|i| -2.5 + 5.0 * i as f64 / 119.0).collect();
+    let pgrid_z = pgrid_x.clone();
+    let gam_px = gam_eta(&fit, width, &[(x_idx, &pgrid_x)]);
+    let gam_pz = gam_eta(&fit, width, &[(z_idx, &pgrid_z)]);
+    let truth_px: Vec<f64> = pgrid_x.iter().map(|&v| f(v)).collect();
+    let truth_pz: Vec<f64> = pgrid_z.iter().map(|&v| g(v)).collect();
+
+    // gam per-term EDF: edf_by_block is aligned 1:1 with the smoothing parameters
+    // (one penalty per cr smooth under double_penalty=false), so block 0 = s(x),
+    // block 1 = s(z). lambdas carries the per-term smoothing parameter.
+    let gam_edf_blocks = fit.fit.edf_by_block();
+    let gam_lambdas: Vec<f64> = fit.fit.lambdas.to_vec();
+    assert!(
+        gam_edf_blocks.len() >= 2,
+        "expected >=2 per-term EDF blocks for s(x)+s(z), got {}",
+        gam_edf_blocks.len()
+    );
+    assert!(
+        gam_lambdas.len() >= 2,
+        "expected >=2 per-term smoothing parameters, got {}",
+        gam_lambdas.len()
+    );
+    let edf_sx = gam_edf_blocks[0];
+    let edf_sz = gam_edf_blocks[1];
+
     let r = run_r(
         &[
             Column::new("x", &x),
             Column::new("z", &z),
             Column::new("y", &y),
         ],
-        r#"
+        &format!(
+            r#"
         suppressPackageStartupMessages(library(mgcv))
-        m <- gam(y ~ s(x, k = 10) + s(z, k = 10), data = df, method = "REML")
+        m <- gam(y ~ s(x, bs = "cr", k = 10) + s(z, bs = "cr", k = 10), data = df,
+                 select = FALSE, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
         emit("edf", sum(m$edf))
+        # per-smooth EDF (summary s.table rows are ordered s(x) then s(z))
+        st <- summary(m)$s.table
+        emit("edf_per", as.numeric(st[, "edf"]))
+        emit("sp", as.numeric(m$sp))
+        # per-term partial curves on the SAME dense grids gam scores
+        pgx <- seq(-2.5, 2.5, length.out = {ng})
+        tx <- predict(m, newdata = data.frame(x = pgx, z = 0), type = "terms")
+        emit("px", as.numeric(tx[, "s(x)"]))
+        tz <- predict(m, newdata = data.frame(x = 0, z = pgx), type = "terms")
+        emit("pz", as.numeric(tz[, "s(z)"]))
         "#,
+            ng = pgrid_x.len(),
+        ),
     );
     let mgcv_sum = r.vector("fitted");
     let mgcv_edf = r.scalar("edf");
+    let mgcv_edf_per = r.vector("edf_per");
+    let mgcv_sp = r.vector("sp");
+    let mgcv_px = r.vector("px");
+    let mgcv_pz = r.vector("pz");
     assert_eq!(mgcv_sum.len(), n, "mgcv fitted length mismatch");
+    assert_eq!(mgcv_edf_per.len(), 2, "mgcv must report 2 per-smooth EDFs");
+    assert_eq!(mgcv_sp.len(), 2, "mgcv must report 2 smoothing parameters");
 
     // Both engines fit an intercept; center sum and truth before comparing so the
     // additive identifiability constant does not contaminate the metric.
@@ -443,6 +554,94 @@ fn concurvity_two_smooths_corr_090_recovers_truth_and_matches_mgcv() {
         gam_err <= mgcv_err * 1.15,
         "gam concurvity recovery {gam_err:.5} worse than mgcv {mgcv_err:.5} * 1.15"
     );
+
+    // ====================================================================
+    // PER-TERM CONTRACT (the #1476 / #26ab264e3 regression guard). Now that
+    // the projector fix and the matched ordinary penalty model are in place,
+    // each smooth must keep real complexity and recover its OWN component.
+    // ====================================================================
+
+    // (b) EDF non-collapse: neither smooth may be smoothed to a straight line
+    // (EDF≈1) or annihilated (EDF≈0). The #1476 nullspace mis-allocation drives
+    // exactly one component's EDF to ≈0 while the other absorbs both signals;
+    // require BOTH gam smooths to carry genuine curvature (>1.5 EDF), and assert
+    // the same of mgcv so the bar is a real matched property, not gam-specific.
+    eprintln!(
+        "concurvity per-term: gam edf_sx={edf_sx:.3} edf_sz={edf_sz:.3} \
+         mgcv edf={:.3},{:.3} | gam sp={:.3e},{:.3e} mgcv sp={:.3e},{:.3e}",
+        mgcv_edf_per[0], mgcv_edf_per[1], gam_lambdas[0], gam_lambdas[1], mgcv_sp[0], mgcv_sp[1]
+    );
+    assert!(
+        edf_sx > 1.5 && edf_sz > 1.5,
+        "a concurvity smooth collapsed (the #1476 nullspace mis-allocation): \
+         gam EDF s(x)={edf_sx:.3}, s(z)={edf_sz:.3} (both must exceed 1.5)"
+    );
+    assert!(
+        mgcv_edf_per[0] > 1.5 && mgcv_edf_per[1] > 1.5,
+        "mgcv reference itself collapsed a smooth — the per-term bar is unfair: \
+         mgcv EDF s(x)={:.3}, s(z)={:.3}",
+        mgcv_edf_per[0], mgcv_edf_per[1]
+    );
+
+    // (c) per-PARTIAL truth recovery: each isolated smooth curve must track its
+    // OWN truth component (s_x↔f, s_z↔g), centered to drop the additive constant.
+    // R² of each partial against its truth component — and match-or-beat mgcv's
+    // own partials on the same metric (mgcv is the mature concurvity baseline).
+    let truth_px_c = center(&truth_px);
+    let truth_pz_c = center(&truth_pz);
+    let gam_px_c = center(&gam_px);
+    let gam_pz_c = center(&gam_pz);
+    let mgcv_px_c = center(mgcv_px);
+    let mgcv_pz_c = center(mgcv_pz);
+
+    let px_r2 = r2(&gam_px_c, &truth_px_c);
+    let pz_r2 = r2(&gam_pz_c, &truth_pz_c);
+    let px_err = rmse(&gam_px_c, &truth_px_c);
+    let pz_err = rmse(&gam_pz_c, &truth_pz_c);
+    let mgcv_px_err = rmse(&mgcv_px_c, &truth_px_c);
+    let mgcv_pz_err = rmse(&mgcv_pz_c, &truth_pz_c);
+    eprintln!(
+        "concurvity per-partial recovery: s(x) gam_r2={px_r2:.4} gam_rmse={px_err:.5} \
+         mgcv_rmse={mgcv_px_err:.5} | s(z) gam_r2={pz_r2:.4} gam_rmse={pz_err:.5} \
+         mgcv_rmse={mgcv_pz_err:.5}"
+    );
+    // Each partial recovers its own component well (not just the sum). A collapsed
+    // component would have near-zero or negative R² against its truth piece.
+    assert!(
+        px_r2 > 0.80,
+        "s(x) partial failed to recover f(x): R²={px_r2:.4} (component collapse?)"
+    );
+    assert!(
+        pz_r2 > 0.80,
+        "s(z) partial failed to recover g(z): R²={pz_r2:.4} (component collapse?)"
+    );
+    // MATCH-OR-BEAT mgcv per-partial: no worse than 1.30× mgcv's partial RMSE
+    // (per-partial is intrinsically noisier under concurvity than the sum, so the
+    // floor is looser than the 1.15 sum bar — but still a real matched bound).
+    assert!(
+        px_err <= mgcv_px_err * 1.30,
+        "gam s(x) partial {px_err:.5} worse than mgcv {mgcv_px_err:.5} * 1.30"
+    );
+    assert!(
+        pz_err <= mgcv_pz_err * 1.30,
+        "gam s(z) partial {pz_err:.5} worse than mgcv {mgcv_pz_err:.5} * 1.30"
+    );
+
+    // (d) both smoothing parameters finite, positive and not railed to the
+    // degenerate extremes (sp→∞ ⇒ a straight line; sp→0 ⇒ interpolation). gam's
+    // lambdas and mgcv's sp are the same penalty-weight coordinate.
+    for (i, &lam) in gam_lambdas.iter().take(2).enumerate() {
+        assert!(
+            lam.is_finite() && lam > 1e-8 && lam < 1e12,
+            "gam smoothing parameter {i} out of sane range (railed?): {lam:.3e}"
+        );
+    }
+    for (i, &sp) in mgcv_sp.iter().enumerate() {
+        assert!(
+            sp.is_finite() && sp > 0.0,
+            "mgcv smoothing parameter {i} not finite/positive: {sp:.3e}"
+        );
+    }
 }
 
 // ===========================================================================
@@ -614,8 +813,16 @@ fn covered(lower: &[f64], upper: &[f64], truth: &[f64]) -> usize {
 /// transform would silently mis-cover. We draw many Poisson replicates around a
 /// KNOWN log-mean, form gam's 95% response-scale mean intervals, and measure
 /// empirical coverage against the truth — then assert (a) gam is calibrated to
-/// nominal and (b) it covers at least as well as mgcv's `predict.gam(type=
-/// "response", se.fit=TRUE)` intervals on the identical data.
+/// nominal and (b) it covers at least as well as mgcv on the identical data.
+///
+/// MATCHED COVARIANCE (the finding-#6 fix): gam uses
+/// `ConditionalPlusSmoothingPreferred` (`H⁻¹ + J·Var(ρ̂)·Jᵀ` — the conditional
+/// posterior PLUS the first-order smoothing-parameter-uncertainty correction).
+/// mgcv's matching covariance is `Vc`, obtained with `unconditional = TRUE` in
+/// `predict.gam`. The mgcv call below therefore passes `unconditional = TRUE`,
+/// so BOTH intervals carry the smoothing-uncertainty term — not gam's `Vc`
+/// against mgcv's conditional `Vp`. Basis/penalty are matched too (`bs="cr"`,
+/// ordinary `select=FALSE` ↔ gam `double_penalty=false`).
 #[test]
 fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
     init_parallelism();
@@ -653,7 +860,9 @@ fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
             family: Some("poisson".to_string()),
             ..FitConfig::default()
         };
-        let result = fit_from_formula("y ~ s(x)", &ds, &cfg).expect("gam poisson fit");
+        let result =
+            fit_from_formula("y ~ s(x, bs=\"cr\", k=10, double_penalty=false)", &ds, &cfg)
+                .expect("gam poisson fit");
         let FitResult::Standard(fit) = result else {
             panic!("poisson => FitResult::Standard");
         };
@@ -687,8 +896,12 @@ fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
             &[Column::new("x", &x), Column::new("y", &y)],
             r#"
             suppressPackageStartupMessages(library(mgcv))
-            m <- gam(y ~ s(x), data = df, family = poisson(), method = "REML")
-            p <- predict(m, newdata = df, se.fit = TRUE, type = "response")
+            m <- gam(y ~ s(x, bs = "cr", k = 10), data = df, family = poisson(),
+                     select = FALSE, method = "REML")
+            # unconditional = TRUE -> Vc (adds the smoothing-parameter-uncertainty
+            # term), the match for gam's ConditionalPlusSmoothingPreferred mode.
+            p <- predict(m, newdata = df, se.fit = TRUE, type = "response",
+                         unconditional = TRUE)
             z <- qnorm(0.975)
             emit("lower", as.numeric(p$fit - z * p$se.fit))
             emit("upper", as.numeric(p$fit + z * p$se.fit))
