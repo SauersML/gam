@@ -312,10 +312,11 @@ mod cuda_impl {
         /// row-scale→GEMM→POTRF→TRSM on-device and returning only `β` removes the
         /// Gram transfer entirely.
         ///
-        /// `ridge` (e.g. the penalty diagonal `λ` or a Tikhonov floor) is added
-        /// to the Gram diagonal on the host-staged init before the on-device
-        /// POTRF. Returns `None` on shape mismatch, a non-PD factorisation, or
-        /// any device failure (the caller falls back to the CPU solve).
+        /// `ridge` (e.g. the penalty diagonal `λ` or a Tikhonov floor) is seeded
+        /// as `ridge·I` on the device and the Gram is GEMM-accumulated onto it
+        /// (`beta = 1`), so the diagonal bump never costs a Gram round-trip.
+        /// Returns `None` on shape mismatch, a non-PD factorisation, or any
+        /// device failure (the caller falls back to the CPU solve).
         pub(crate) fn solve_psd_normal_equations(
             &self,
             w: ArrayView1<'_, f64>,
@@ -343,8 +344,17 @@ mod cuda_impl {
                 p,
             )?;
 
-            // G = Xᵀ · weighted  (p×p, column-major), kept resident.
-            let mut g_dev = self.stream.alloc_zeros::<f64>(p.checked_mul(p)?).ok()?;
+            // Pre-seed G with `ridge·I` on the device, then GEMM-accumulate
+            // `XᵀW X` onto it with `beta = 1.0`. The Gram is formed and stays
+            // device-resident: `ridge·I` is a one-time H2D upload (the only way
+            // to set a diagonal without an NVRTC kernel), and crucially the p×p
+            // Gram is NEVER read back — only `β` returns. `ridge·I` upload is
+            // bandwidth-trivial vs the avoided per-solve Gram download.
+            let mut ridge_init = vec![0.0_f64; p.checked_mul(p)?];
+            for i in 0..p {
+                ridge_init[i * p + i] = ridge;
+            }
+            let mut g_dev = self.stream.clone_htod(&ridge_init).ok()?;
             let cfg = GemmConfig::<f64> {
                 transa: cublasOperation_t::CUBLAS_OP_T,
                 transb: cublasOperation_t::CUBLAS_OP_N,
@@ -354,31 +364,13 @@ mod cuda_impl {
                 alpha: 1.0,
                 lda: to_i32(self.rows)?,
                 ldb: to_i32(self.rows)?,
-                beta: 0.0,
+                // Accumulate onto the resident ridge·I seed.
+                beta: 1.0,
                 ldc: to_i32(p)?,
             };
-            // SAFETY: resident n×p X and the n×p weighted buffer form a p×p Gram.
+            // SAFETY: resident n×p X and the n×p weighted buffer form a p×p Gram;
+            // beta=1 accumulates Xᵀ(WX) onto the resident ridge·I in g_dev.
             unsafe { self.blas.gemm(cfg, &self.x_dev, &weighted_dev, &mut g_dev) }.ok()?;
-
-            // Add `ridge` to the diagonal. We read back only the p diagonal
-            // entries, bump them, and write them back (a p-element round trip,
-            // not the p² Gram) so the factorisation sees G + ridge·I.
-            if ridge != 0.0 {
-                let g_host = self.stream.clone_dtoh(&g_dev).ok()?;
-                let mut diag = Vec::with_capacity(p);
-                for i in 0..p {
-                    diag.push(g_host[i * p + i] + ridge);
-                }
-                // Re-upload the whole Gram with bumped diagonal. (A dedicated
-                // diagonal-axpy kernel would avoid even this p² round trip; the
-                // host bump keeps the increment dependency-free and the transfer
-                // is one-time per solve, not per CG iteration.)
-                let mut g_bumped = g_host;
-                for i in 0..p {
-                    g_bumped[i * p + i] = diag[i];
-                }
-                g_dev = self.stream.clone_htod(&g_bumped).ok()?;
-            }
 
             // POTRF(G) → lower factor L, resident in g_dev.
             let solver = DnHandle::new(self.stream.clone()).ok()?;
