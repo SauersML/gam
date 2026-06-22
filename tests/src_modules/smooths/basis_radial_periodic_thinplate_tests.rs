@@ -1620,11 +1620,274 @@ fn test_build_bspline_basis_1d_double_penalty() {
     // exactly rank(S_c)+rank(P) = 8+1 = 9.
     let summed = s_c + p_null;
     let joint_rank = analyze_penalty_block_with_op(&summed, None)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "assembled double penalty analyzes")
+        .unwrap_or_else(|e| panic!("assembled double penalty analyzes failed: {e:?}"))
         .rank;
-    assert_eq!(joint_rank, p_constrained, e));
+    assert_eq!(joint_rank, p_constrained);
 
     assert_eq!(result.design.nrows(), x.len());
+}
+
+/// Shared spectral-contract probe for the double-penalty null-space shrinkage
+/// ridge `P` produced by `build_bspline_basis_1d` (#1476/#1477).
+///
+/// Asserts the projector contract directly from the SHIPPED constrained-chart
+/// penalties rather than re-deriving anything:
+///   * `rank(P) == nullity(S_c)`            (P spans exactly the null space)
+///   * `‖S_c · P‖_F ≈ 0` and `‖P · S_c‖_F ≈ 0`  (spectral complementarity:
+///     the ridge penalizes ONLY the unpenalized polynomial direction and never
+///     touches a curvature mode)
+///   * `rank(S_c) + rank(P) == p_constrained` (no unpenalized direction left,
+///     so REML can shrink — never inflate — the null space, #1266)
+///
+/// `expected_nullity` pins the adapt-to-actual-null behavior: centered smooths
+/// have `nullity(S_c)=1` (constant removed); an uncentered / constraint-free
+/// smooth keeps its genuine polynomial null space, so the rebuilt projector
+/// must follow and produce `rank(P)=2` for an order-2 penalty.
+fn assert_double_penalty_projector_contract(
+    result: &BasisBuildResult,
+    expected_nullity: usize,
+    label: &str,
+) {
+    assert_eq!(
+        result.penalties.len(),
+        2,
+        "{label}: a free double-penalty basis must ship the bend penalty + the \
+         null-space shrinkage ridge as two separate REML coordinates"
+    );
+    assert!(
+        matches!(result.penaltyinfo[0].source, PenaltySource::Primary),
+        "{label}: first block must be the primary wiggliness penalty"
+    );
+    assert!(
+        matches!(
+            result.penaltyinfo[1].source,
+            PenaltySource::DoublePenaltyNullspace
+        ),
+        "{label}: second block must be the double-penalty null-space ridge"
+    );
+
+    let s_c = &result.penalties[0];
+    let p_null = &result.penalties[1];
+    let p_constrained = result.design.ncols();
+
+    let s_c_block = analyze_penalty_block_with_op(s_c, None)
+        .unwrap_or_else(|e| panic!("{label}: S_c analyzes failed: {e:?}"));
+    let p_block = analyze_penalty_block_with_op(p_null, None)
+        .unwrap_or_else(|e| panic!("{label}: P analyzes failed: {e:?}"));
+
+    assert_eq!(
+        s_c_block.nullity, expected_nullity,
+        "{label}: nullity(S_c) must be {expected_nullity}"
+    );
+    // The projector spans EXACTLY the constrained null space of S_c — this is
+    // the adapt-to-actual-null property: rank(P) tracks nullity(S_c), 1 when
+    // centered, 2 for an uncentered order-2 smooth.
+    assert_eq!(
+        p_block.rank, expected_nullity,
+        "{label}: rank(P) must equal nullity(S_c) = {expected_nullity}"
+    );
+    assert_eq!(
+        result.penaltyinfo[1].effective_rank, expected_nullity,
+        "{label}: reported ridge effective_rank must equal nullity(S_c)"
+    );
+
+    // Spectral complementarity: S_c·P = P·S_c = 0 exactly. The pre-fix raw-chart
+    // ridge (congruence of U Uᵀ) failed this — its spurious second eigendirection
+    // lived in range(S_c), giving ‖S_c P‖_F ≈ 0.15 and penalizing real curvature.
+    let sp_norm = s_c.dot(p_null).iter().map(|v| v * v).sum::<f64>().sqrt();
+    let ps_norm = p_null.dot(s_c).iter().map(|v| v * v).sum::<f64>().sqrt();
+    assert!(
+        sp_norm < 1e-9,
+        "{label}: ‖S_c·P‖_F must vanish (spectral complementarity); got {sp_norm:e}"
+    );
+    assert!(
+        ps_norm < 1e-9,
+        "{label}: ‖P·S_c‖_F must vanish (spectral complementarity); got {ps_norm:e}"
+    );
+
+    // The two blocks together leave NO unpenalized direction: rank(S_c)+rank(P)
+    // = p_constrained, the clean partition that lets REML shrink (#1266).
+    let summed = s_c + p_null;
+    let joint_rank = analyze_penalty_block_with_op(&summed, None)
+        .unwrap_or_else(|e| panic!("{label}: summed penalty analyzes failed: {e:?}"))
+        .rank;
+    assert_eq!(
+        joint_rank, p_constrained,
+        "{label}: assembled S_bend + P must have full structural rank"
+    );
+    assert_eq!(
+        s_c_block.rank + p_block.rank,
+        p_constrained,
+        "{label}: rank(S_c) + rank(P) must equal p_constrained"
+    );
+}
+
+fn double_penalty_spec(
+    num_internal_knots: usize,
+    penalty_order: usize,
+    identifiability: BSplineIdentifiability,
+    boundary_conditions: BSplineBoundaryConditions,
+) -> BSplineBasisSpec {
+    BSplineBasisSpec {
+        degree: 3,
+        penalty_order,
+        knotspec: BSplineKnotSpec::Generate {
+            data_range: (0.0, 1.0),
+            num_internal_knots,
+        },
+        double_penalty: true,
+        identifiability,
+        boundary: OneDimensionalBoundary::Open,
+        boundary_conditions,
+    }
+}
+
+/// #1476/#1477: the constrained-chart projector contract must hold across MANY
+/// basis sizes (k), not just the single k=10 case. For a sum-to-zero-centered
+/// order-2 P-spline the constant direction is removed by centering but the
+/// residual linear trend survives, so the constrained wiggliness penalty keeps a
+/// single null direction at every k — `nullity(S_c)=1` and a rank-1 projector
+/// spectrally complementary to the bend penalty. Order-1 is exercised uncentered
+/// below, where its constant null direction is unambiguously kept; under
+/// sum-to-zero centering an order-1 null space can vanish entirely (a different,
+/// correct, single-penalty outcome covered by the non-free / cyclic tests).
+#[test]
+fn double_penalty_projector_contract_across_k() {
+    // k = degree + 1 + num_internal_knots. degree=3 ⇒ k = 4 + n_knots.
+    // n_knots {4,6,16} ⇒ k {8,10,20}.
+    for &num_internal_knots in &[4usize, 6, 16] {
+        let k = 4 + num_internal_knots;
+        let x = Array::linspace(0.0, 1.0, 64);
+        let spec = double_penalty_spec(
+            num_internal_knots,
+            2,
+            BSplineIdentifiability::default(),
+            BSplineBoundaryConditions::default(),
+        );
+        let result = build_bspline_basis_1d(x.view(), &spec)
+            .unwrap_or_else(|e| panic!("k={k} build failed: {e:?}"));
+        let label = format!("centered k={k} order=2");
+        // After sum-to-zero centering the order-2 P-spline keeps nullity(S_c)=1
+        // (constant removed, residual linear trend survives) at every k.
+        assert_double_penalty_projector_contract(&result, 1, &label);
+    }
+}
+
+/// #1476/#1477 adapt-to-actual-null: an UNcentered / constraint-free smooth
+/// (`BSplineIdentifiability::None`) keeps its GENUINE polynomial null space, so
+/// the rebuilt projector must follow. An order-2 penalty leaves a 2-D null space
+/// (constant + linear), so `nullity(S_c)=2` and `rank(P)=2` — the projector is
+/// NOT hardcoded to rank 1. Order-1 leaves a 1-D (constant) null space.
+#[test]
+fn double_penalty_projector_adapts_to_uncentered_two_dim_nullspace() {
+    let x = Array::linspace(0.0, 1.0, 64);
+
+    // Order-2, uncentered: genuine 2-D null space ⇒ rank(P) == 2.
+    let spec2 = double_penalty_spec(
+        6,
+        2,
+        BSplineIdentifiability::None,
+        BSplineBoundaryConditions::default(),
+    );
+    let result2 = build_bspline_basis_1d(x.view(), &spec2)
+        .unwrap_or_else(|e| panic!("uncentered order-2 build failed: {e:?}"));
+    assert_double_penalty_projector_contract(&result2, 2, "uncentered order-2");
+
+    // Order-1, uncentered: 1-D (constant) null space ⇒ rank(P) == 1.
+    let spec1 = double_penalty_spec(
+        6,
+        1,
+        BSplineIdentifiability::None,
+        BSplineBoundaryConditions::default(),
+    );
+    let result1 = build_bspline_basis_1d(x.view(), &spec1)
+        .unwrap_or_else(|e| panic!("uncentered order-1 build failed: {e:?}"));
+    assert_double_penalty_projector_contract(&result1, 1, "uncentered order-1");
+}
+
+/// #1476/#1477: on a NON-free basis (clamped endpoint boundary condition) the
+/// `double_penalty` null-space block is suppressed entirely
+/// (`want_nullspace = double_penalty && boundary_conditions.is_free()`), so the
+/// constrained-chart rebuild helper is a no-op. Assert exactly one (primary)
+/// penalty ships — no spurious ridge is introduced even with `double_penalty:
+/// true`. This pins the helper's early-return / single-primary path.
+#[test]
+fn double_penalty_suppressed_on_non_free_boundary_is_single_penalty() {
+    let x = Array::linspace(0.0, 1.0, 64);
+    let clamped = BSplineBoundaryConditions {
+        left: BSplineEndpointBoundaryCondition::Clamped,
+        right: BSplineEndpointBoundaryCondition::Clamped,
+    };
+    let spec = double_penalty_spec(6, 2, BSplineIdentifiability::default(), clamped);
+    let result = build_bspline_basis_1d(x.view(), &spec)
+        .unwrap_or_else(|e| panic!("clamped double-penalty build failed: {e:?}"));
+    assert_eq!(
+        result.penalties.len(),
+        1,
+        "non-free boundary suppresses the null-space block: exactly one penalty"
+    );
+    assert!(
+        matches!(result.penaltyinfo[0].source, PenaltySource::Primary),
+        "the sole shipped penalty must be the primary wiggliness penalty"
+    );
+    assert!(
+        !result
+            .penaltyinfo
+            .iter()
+            .any(|info| matches!(info.source, PenaltySource::DoublePenaltyNullspace)),
+        "no spurious DoublePenaltyNullspace ridge on a non-free boundary"
+    );
+}
+
+/// #1476/#1477: a cyclic/periodic basis is also non-free for the null-space
+/// purpose — the constrained chart's wiggliness penalty has no isolated
+/// unpenalized polynomial trend to shrink — so even with `double_penalty: true`
+/// the rebuild helper introduces no ridge. Assert a single primary penalty and
+/// that the design still closes the seam (period boundary continuity).
+#[test]
+fn double_penalty_on_cyclic_basis_is_single_penalty_no_spurious_ridge() {
+    let x = Array1::from_vec(vec![0.0, 0.25, 0.5, 0.75, 1.0]);
+    let spec = BSplineBasisSpec {
+        degree: 3,
+        penalty_order: 2,
+        knotspec: BSplineKnotSpec::Generate {
+            data_range: (0.0, 1.0),
+            num_internal_knots: 8,
+        },
+        double_penalty: true,
+        identifiability: BSplineIdentifiability::None,
+        boundary: OneDimensionalBoundary::Cyclic {
+            start: 0.0,
+            end: 1.0,
+        },
+        boundary_conditions: BSplineBoundaryConditions::default(),
+    };
+    let result = build_bspline_basis_1d(x.view(), &spec)
+        .unwrap_or_else(|e| panic!("cyclic double-penalty build failed: {e:?}"));
+    assert_eq!(
+        result.penalties.len(),
+        1,
+        "cyclic basis must ship a single penalty — no double-penalty ridge"
+    );
+    assert!(
+        matches!(result.penaltyinfo[0].source, PenaltySource::Primary),
+        "cyclic basis's sole penalty must be the primary wiggliness penalty"
+    );
+    assert!(
+        !result
+            .penaltyinfo
+            .iter()
+            .any(|info| matches!(info.source, PenaltySource::DoublePenaltyNullspace)),
+        "no spurious DoublePenaltyNullspace ridge on a cyclic basis"
+    );
+    // Seam closes: first and last evaluation rows agree column-wise.
+    let dense = result.design.to_dense();
+    for j in 0..dense.ncols() {
+        assert!(
+            (dense[[0, j]] - dense[[dense.nrows() - 1, j]]).abs() < 1e-12,
+            "cyclic seam must close in column {j}"
+        );
+    }
 }
 
 // Boundary-condition emission moved from the basis builder to the

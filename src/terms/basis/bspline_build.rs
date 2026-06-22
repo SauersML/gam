@@ -1803,9 +1803,18 @@ fn rebuild_double_penalty_nullspace_in_constrained_chart(
     if !has_ridge {
         return Ok(candidates);
     }
+    // Select the wiggliness penalty by `PenaltySource::Primary` EXPLICITLY rather
+    // than "the first non-ridge block". `bspline_penalty_candidates` emits exactly
+    // one `Primary` (the bending penalty) plus the optional ridge, so the two are
+    // equivalent today. The explicit match is robust to a future per-axis
+    // boundary / anchor penalty being added to the 1-D candidate set: such a block
+    // would be a non-`Primary`, non-ridge candidate, and a `find(!ridge)` lookup
+    // could then mis-pick it and rebuild the projector from the wrong null space.
+    // Deriving the ridge from `null(S_c)` only makes sense for the genuine
+    // wiggliness penalty, so we pin that selection here.
     let primary_constrained = candidates
         .iter()
-        .find(|c| !matches!(c.source, PenaltySource::DoublePenaltyNullspace))
+        .find(|c| matches!(c.source, PenaltySource::Primary))
         .map(|c| c.matrix.clone());
     let Some(s_c) = primary_constrained else {
         crate::bail_invalid_basis!(
