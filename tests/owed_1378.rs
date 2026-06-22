@@ -88,18 +88,34 @@ fn fit_predict(bs: &str, x: &[f64], y: &[f64], grid: &[f64]) -> Vec<f64> {
         ..FitConfig::default()
     };
     let formula = format!("y ~ s(x, bs=\"{bs}\")");
-    let result = fit_from_formula(&formula, &data, &cfg).expect("tp fit");
-    let FitResult::Standard(fit) = result else {
-        panic!("expected standard fit for {formula}");
-    };
+    let result = fit_from_formula(&formula, &data, &cfg).expect("fit");
 
-    let mut grid_design = Array2::<f64>::zeros((grid.len(), data.headers.len()));
-    for (row, &g) in grid.iter().enumerate() {
-        grid_design[[row, x_idx]] = g;
+    match result {
+        FitResult::Standard(fit) => {
+            // Identity-link Gaussian: prediction = design(grid) · beta.
+            let mut grid_design = Array2::<f64>::zeros((grid.len(), data.headers.len()));
+            for (row, &g) in grid.iter().enumerate() {
+                grid_design[[row, x_idx]] = g;
+            }
+            let dm = build_term_collection_design(grid_design.view(), &fit.resolvedspec)
+                .expect("rebuild design at grid");
+            dm.design.apply(&fit.fit.beta).to_vec()
+        }
+        // A 1-D cubic Gaussian smooth (e.g. bs="cr") routes through the exact
+        // O(n) state-space smoothing-spline scan, which carries its own exact
+        // per-abscissa posterior rather than a dense design + beta. Predict the
+        // posterior mean directly so the control base is exercised on the
+        // representation the fit actually produced.
+        FitResult::SplineScan(scan) => grid
+            .iter()
+            .map(|&g| scan.predict(g).expect("spline scan predict").0)
+            .collect(),
+        FitResult::ResidualCascade(cascade) => grid
+            .iter()
+            .map(|&g| cascade.predict(&[g]).expect("residual cascade predict").0)
+            .collect(),
+        _ => panic!("unexpected fit variant for {formula}"),
     }
-    let dm = build_term_collection_design(grid_design.view(), &fit.resolvedspec)
-        .expect("rebuild design at grid");
-    dm.design.apply(&fit.fit.beta).to_vec()
 }
 
 /// The worst |prediction drift| of `bs` under a battery of pure row permutations,
