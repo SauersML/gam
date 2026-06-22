@@ -8592,7 +8592,6 @@ pub fn smooth_term_lr_inference_forspec(
     // Full design as a dense n×p array for the Lawley pair-matrix reduction.
     let full_design_dense = full.design.design.to_dense();
     let influence = full.fit.coefficient_influence();
-    let edf_blocks = full.fit.edf_by_block().to_vec();
     let family_disp = lawley_dispersion_for_family(&family, &full.fit);
 
     // The penalty-block cursor walks the same block order the summary table
@@ -8612,10 +8611,18 @@ pub fn smooth_term_lr_inference_forspec(
         if coeff_range.start >= coeff_range.end || coeff_range.end > p_total {
             continue;
         }
-        let edf = edf_blocks
-            .get(block_start..block_start + k)
-            .map(|block: &[f64]| block.iter().sum::<f64>())
-            .unwrap_or(0.0);
+        // Per-term EDF for the χ² reference df FALLBACK (used only when the
+        // influence matrix `F` is unavailable). Route through `per_term_edf`,
+        // which uses the ADDITIVE per-block trace channel
+        // (`|coeff_range| − Σ_{kk∈term} tr_kk`) and caps at the model total,
+        // rather than the raw `edf_by_block` block-sum `Σ_{kk}(rank_kk − tr_kk)`.
+        // For a multi-penalty term (te/ti/double-penalty) the penalties share one
+        // coefficient range, so the rank-based block-sum OVER-COUNTS the term EDF
+        // (Σ rank_kk > |coeff_range|) and would inflate the LR reference df,
+        // biasing the smooth-term test conservative on large/sparse fits where `F`
+        // is not materialised. (Same per-block over-count class as the multinomial
+        // `edf_per_class` fix.)
+        let edf = full.fit.per_term_edf(coeff_range.clone(), block_start, k);
         let ref_df = wood_reference_df(influence, &coeff_range).unwrap_or(edf.max(1e-12));
         if !(ref_df.is_finite() && ref_df > 0.0) {
             continue;
