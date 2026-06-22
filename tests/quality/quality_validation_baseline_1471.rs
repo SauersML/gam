@@ -24,6 +24,29 @@
 //! mgcv on truth recovery to within a small Monte-Carlo margin". A real
 //! regression in any of these paths — a dropped penalty, a broken cyclic seam, a
 //! concurvity-driven over/under-smooth — fails the corresponding arm loudly.
+//!
+//! RECONCILIATION WITH #1476 / #1477 (important — these arms protect the
+//! genuinely-clean CONFIGS, not every config with the same term shape):
+//!
+//!   * #1477 proves the Tweedie `s(x)` mean is BIASED *specifically* on the
+//!     explicit P-spline basis (`bs='ps'`) — right-boundary blow-up — while
+//!     gamfit's own `bs='cr'` and the default thin-plate `s(x)` recover truth.
+//!     Arm 1 below pins the DEFAULT thin-plate `s(x)` (a `k=10` thin-plate
+//!     smooth, NOT `bs='ps'`); that is the clean cell. Arm 1 deliberately does
+//!     NOT certify the `bs='ps'` Tweedie path — that broken cell is tracked by
+//!     #1477 and must not be asserted "clean" here.
+//!
+//!   * #1476 proves the DEFAULT double-penalty `s(x1)+s(x2)` MIS-ALLOCATES the
+//!     nullspace under moderate concurvity at the default basis with UNIFORM
+//!     support, collapsing one smooth's PER-PARTIAL effect to EDF≈0. The
+//!     additive SUM on a STANDARD-NORMAL-support design (Arm 3 below) is still
+//!     recovered and still match-or-beats mgcv — that is the clean, asserted
+//!     claim. Arm 3 therefore asserts ONLY the additive-sum recovery and
+//!     explicitly does NOT assert per-partial component recovery, because the
+//!     per-partial / Uniform-support / default-basis cell is the BROKEN one
+//!     tracked by #1476. Asserting per-partial "clean" here would contradict
+//!     #1476; this arm is scoped to the sum so it stays an honest regression of
+//!     a working path, not a false certification of a broken one.
 
 use csv::StringRecord;
 use gam::data::EncodedDataset;
@@ -88,6 +111,13 @@ fn gam_eta(
 /// The Tweedie compound-Poisson-gamma response with a log-link smooth must
 /// RECOVER a known log-mean curve and match-or-beat mgcv's `tw()` on
 /// truth-recovery RMSE. Documented: gam/mgcv RMSE ratio ≈ 1.13, no EDF stall.
+///
+/// SCOPE (see the #1477 reconciliation in the module header): this arm uses the
+/// DEFAULT thin-plate `s(x, k=10)` basis, which is the clean Tweedie cell. It
+/// deliberately does NOT use the explicit `bs='ps'` P-spline basis, whose
+/// Tweedie mean is biased (right-boundary blow-up) and is tracked separately by
+/// #1477. A regression that leaks the #1477 ps bias into the default basis —
+/// or otherwise breaks the non-Gaussian thin-plate mean — fails this arm.
 #[test]
 fn tweedie_log_smooth_recovers_truth_and_matches_mgcv() {
     init_parallelism();
@@ -190,6 +220,22 @@ fn tweedie_log_smooth_recovers_truth_and_matches_mgcv() {
         gam_err <= mgcv_err * 1.25,
         "gam tweedie recovery {gam_err:.5} worse than mgcv {mgcv_err:.5} * 1.25"
     );
+
+    // BOUNDARY SANITY (the #1477 guard): the default thin-plate Tweedie mean must
+    // NOT exhibit the right-boundary blow-up that #1477 isolates on the `bs='ps'`
+    // basis (there the prediction overshoots truth by >2× at the right edge). The
+    // clean default-basis cell tracks truth at the boundary; we require the
+    // fitted mean at the rightmost evaluation point to stay within 1.6× of the
+    // analytic truth (well inside MC noise for a clean fit, far below a >2×
+    // blow-up). If the #1477 ps bias ever leaks into the default path this fires.
+    let last = grid.len() - 1;
+    let boundary_truth = truth_mu[last];
+    let boundary_gam = gam_mu[last];
+    assert!(
+        boundary_gam <= boundary_truth * 1.6 && boundary_gam >= boundary_truth / 1.6,
+        "tweedie default-basis mean shows a #1477-style right-boundary distortion: \
+         gam(x=3)={boundary_gam:.4} vs truth {boundary_truth:.4}"
+    );
 }
 
 // ===========================================================================
@@ -287,6 +333,16 @@ fn smooth_plus_linear_same_var_recovers_truth_and_matches_mgcv() {
 /// concurvity is the classic failure mode for additive smoothers (the component
 /// curves become weakly identified); recovering the SUM on a grid is the robust
 /// objective metric. Documented: gam/mgcv RMSE ratio ≈ 1.03.
+///
+/// SCOPE (see the #1476 reconciliation in the module header): the asserted claim
+/// is recovery of the additive SUM f(x)+g(z) on a STANDARD-NORMAL-support
+/// design — a genuinely-clean, match-or-beat path. This arm explicitly does NOT
+/// assert per-PARTIAL component recovery: #1476 proves the default
+/// double-penalty nullspace mis-allocation collapses one PARTIAL effect to
+/// EDF≈0 under moderate concurvity with UNIFORM support at the default basis.
+/// That broken per-partial / Uniform cell is tracked by #1476 and must not be
+/// certified "clean" here. The sum stays identified even when the components are
+/// not, so the sum is the honest regression target for this working path.
 #[test]
 fn concurvity_two_smooths_corr_090_recovers_truth_and_matches_mgcv() {
     init_parallelism();
