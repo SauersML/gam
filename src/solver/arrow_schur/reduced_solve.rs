@@ -2639,7 +2639,7 @@ pub(crate) fn incomplete_cholesky_level0(
     a: &Array2<f64>,
 ) -> Option<(Vec<usize>, Vec<usize>, Vec<f64>)> {
     let b = a.nrows();
-    debug_assert_eq!(a.ncols(), b, "incomplete Cholesky needs a square block");
+    assert_eq!(a.ncols(), b, "incomplete Cholesky needs a square block");
 
     // ---- derive the level-0 lower-triangular pattern from `a` --------------
     // Per column j, the kept below-or-on-diagonal rows i>=j with a structurally
