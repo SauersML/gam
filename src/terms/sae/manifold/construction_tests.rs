@@ -309,3 +309,127 @@ mod softmax_majorizer_active_entry_1410_tests {
         }
     }
 }
+
+/// #1418: the implicit-function (IFT) back-substitution must invert the EXACT
+/// stationarity Jacobian `A = ∇²_θθ L`, not the assembled surrogate `B`.
+#[cfg(test)]
+mod exact_stationarity_solve_1418_tests {
+    use super::*;
+    use crate::terms::sae::manifold::tests::gamma_fd_tiny_fixture;
+    use ndarray::Array1;
+
+    /// Build a converged tiny SAE state whose inner residual is genuinely
+    /// nonzero (an unmodellable target perturbation on a curved periodic basis),
+    /// so the dropped curvature `ΔC = A − B = ⟨r, ∂²f⟩ + (H_entropy − D) + min(V'',0)`
+    /// is materially nonzero and `A ≠ B`. Returns the term, the perturbed target,
+    /// the rho, and the converged cache.
+    fn converged_state_with_residual() -> (
+        SaeManifoldTerm,
+        Array2<f64>,
+        SaeManifoldRho,
+        ArrowFactorCache,
+    ) {
+        let (mut term, mut target, mut rho) = gamma_fd_tiny_fixture();
+        // Perturb the target off the model manifold so the inner optimum has a
+        // real residual `r`, hence a real `⟨r, ∂²f⟩` curvature delta.
+        let (n, p) = (target.nrows(), target.ncols());
+        for row in 0..n {
+            for col in 0..p {
+                let phase = (row as f64 + 0.35) / n as f64;
+                let theta = std::f64::consts::TAU * phase;
+                target[[row, col]] += 0.6 * (3.0 * theta + 0.5 * col as f64).sin();
+            }
+        }
+        // Activate the sparsity / smoothness / ARD prior strengths so the softmax
+        // entropy delta and the periodic-ARD `min(V'',0)` delta are live too.
+        rho.log_lambda_sparse = -0.5;
+        rho.log_lambda_smooth = -1.0;
+        for axis in rho.log_ard.iter_mut() {
+            for v in axis.iter_mut() {
+                *v = -0.5;
+            }
+        }
+        let (_value, _loss, cache) = term
+            .reml_criterion_with_cache(target.view(), &rho, None, 40, 0.4, 1.0e-6, 1.0e-6)
+            .expect("converged cache with residual");
+        (term, target, rho, cache)
+    }
+
+    /// `‖A x − rhs‖` for the exact stationarity Jacobian `A` (the matrix-free
+    /// `B v + ΔC v` apply).
+    fn a_residual_norm(
+        term: &SaeManifoldTerm,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        x: &SaeArrowVector,
+        rhs: &SaeArrowVector,
+    ) -> f64 {
+        let ax = term
+            .apply_exact_hessian(rho, target, cache, x)
+            .expect("A matvec");
+        let resid = SaeArrowVector {
+            t: &ax.t - &rhs.t,
+            beta: &ax.beta - &rhs.beta,
+        };
+        sae_norm(&resid)
+    }
+
+    /// `solve_exact_stationarity` returns the EXACT solve of `A x = rhs` (small
+    /// `A`-residual), AND the surrogate solve `x_B = B⁻¹ rhs` leaves a LARGE
+    /// `A`-residual — so the certificate is non-vacuous (`A ≠ B`) and the IFT
+    /// step genuinely inverts `A`. Before #1418 the implicit step used `x_B`
+    /// (the truncated `B⁻¹`-Neumann iterate), whose `A`-residual is the large
+    /// value asserted below: that code leaves `‖A x_B − rhs‖` far from zero (and
+    /// the Neumann variant diverges outright once `ρ(B⁻¹ΔC) ≥ 1`), so this test
+    /// fails before the fix and passes only when the solve targets the exact `A`.
+    #[test]
+    fn solve_exact_stationarity_inverts_a_not_b_1418() {
+        let (term, target, rho, cache) = converged_state_with_residual();
+        let solver = DeflatedArrowSolver::plain(&cache);
+
+        // A deterministic, nonzero rhs spanning both the latent (t) and decoder
+        // (β) blocks.
+        let total_t = cache.delta_t_len();
+        let rhs = SaeArrowVector {
+            t: Array1::from_shape_fn(total_t, |i| 0.3 + 0.1 * ((i % 5) as f64) - 0.02 * i as f64),
+            beta: Array1::from_shape_fn(cache.k, |j| 0.2 - 0.05 * ((j % 3) as f64)),
+        };
+        let rhs_norm = sae_norm(&rhs).max(1.0);
+
+        // Exact A-solve via the #1418 path.
+        let x = term
+            .solve_exact_stationarity(&rho, target.view(), &cache, &solver, &rhs)
+            .expect("exact stationarity solve");
+        let exact_resid = a_residual_norm(&term, &rho, target.view(), &cache, &x, &rhs);
+
+        // Surrogate solve x_B = B⁻¹ rhs (the pre-#1418 implicit step).
+        let x_b = solver.solve(rhs.t.view(), rhs.beta.view()).expect("B inverse");
+        let surrogate_resid = a_residual_norm(&term, &rho, target.view(), &cache, &x_b, &rhs);
+
+        // 1) The exact solve drives the A-residual to ~0.
+        assert!(
+            exact_resid <= 1.0e-6 * rhs_norm,
+            "solve_exact_stationarity must invert the EXACT A: ‖A x − rhs‖/‖rhs‖ = {:.3e} \
+             (rhs_norm={rhs_norm:.3e}) — the IFT step is not solving A x = rhs (#1418)",
+            exact_resid / rhs_norm
+        );
+
+        // 2) Non-vacuity: the surrogate B-solve leaves a materially large
+        //    A-residual, so A ≠ B is genuinely exercised. The pre-#1418 code used
+        //    x_B for the implicit step, so this is exactly the error #1418 removed.
+        assert!(
+            surrogate_resid >= 1.0e-2 * rhs_norm,
+            "the surrogate B-solve must leave a large A-residual so the A≠B fix is \
+             non-vacuous: ‖A x_B − rhs‖/‖rhs‖ = {:.3e} — ΔC = A − B is too small to \
+             distinguish the exact stationarity Jacobian from the surrogate",
+            surrogate_resid / rhs_norm
+        );
+
+        // 3) The exact solve is a strict, large improvement over the surrogate.
+        assert!(
+            exact_resid < 1.0e-3 * surrogate_resid,
+            "exact A-solve residual {exact_resid:.3e} must be far below surrogate {surrogate_resid:.3e}"
+        );
+    }
+}
