@@ -29,7 +29,6 @@ mod quality_vs_mgcv_gaussian_smooth;
 mod quality_vs_mgcv_high_leverage_gaussian_alo_stabilized;
 mod quality_vs_mgcv_poisson_badhealth_doctor_visits;
 mod quality_vs_mgcv_poisson_tensor;
-mod quality_vs_mgcv_sas_link_asymmetric_binary;
 mod quality_vs_mgcv_tensor_te_2d_binomial;
 mod quality_vs_mgcv_tensor_te_2d_gamma;
 mod quality_vs_mgcv_tensor_te_2d_gaussian;

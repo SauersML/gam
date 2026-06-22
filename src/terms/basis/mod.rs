@@ -66,8 +66,8 @@ pub mod radial_profile;
 pub use constant_curvature_smooth::{
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, build_constant_curvature_basis,
     build_constant_curvature_basis_kappa_derivatives, constant_curvature_effective_length,
-    constant_curvature_kernel_kappa_jets, constant_curvature_kernel_matrix,
-    realized_constant_curvature_length_scale,
+    constant_curvature_kappa_fair_sign_score, constant_curvature_kernel_kappa_jets,
+    constant_curvature_kernel_matrix, realized_constant_curvature_length_scale,
 };
 
 pub use measure_jet_moments::{

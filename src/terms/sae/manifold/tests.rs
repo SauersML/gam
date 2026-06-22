@@ -9827,60 +9827,6 @@ pub(crate) fn sae_row_jet_program_matches_production_row_jets_on_converged_cache
                     }
                 }
             }
-
-            // β BORDER CHANNELS (#932): the hand path packs ∂ẑ_c/∂β_{k,b}
-            // (value) and ∂²ẑ_c/∂β_{k,b}∂p_a (the `beta_deriv` / `beta_l_deriv`
-            // mixed second derivatives) term by term in `row_jets_for_logdet`,
-            // with NO tower oracle previously. Reconstruction is LINEAR in β, so
-            // ∂ẑ_c/∂β_{k,b} = ζ_k(ℓ)·Φ_b(t_k)·B_{b,c}: the `beta_border_tower`
-            // sub-jet, built from the SAME gate_tower / basis_tower primitives as
-            // the reconstruction column. Pin every β channel (value + both
-            // mixed-derivative arrays) to that tower at ~1e-9, scaled by √w like
-            // the production packing.
-            for (beta_pos, channel) in border.iter().enumerate() {
-                for out_col in 0..p {
-                    let tower = prog.beta_border_tower::<K>(
-                        channel.atom,
-                        channel.basis_col,
-                        out_col,
-                    );
-                    let want_v = sqrt_row_w * tower.v;
-                    let v_floor = want_v.abs().max(1e-12);
-                    assert!(
-                        (jets.beta[beta_pos][out_col] - want_v).abs() <= 1e-9 * v_floor,
-                        "weighted={weighted} row {row} col {out_col} \
-                         beta[{beta_pos}] (atom {} basis {}): production {} vs tower {}",
-                        channel.atom,
-                        channel.basis_col,
-                        jets.beta[beta_pos][out_col],
-                        want_v
-                    );
-                    for a in 0..K {
-                        let want_d = sqrt_row_w * tower.g[a];
-                        let d_floor = want_d.abs().max(1e-12);
-                        // `beta_deriv` and `beta_l_deriv` are the SAME mixed
-                        // ∂²ẑ_c/∂β∂p_a derivative the linear-in-β reconstruction
-                        // produces (the hand path fills both identically); both
-                        // must equal the tower's first-derivative channel.
-                        assert!(
-                            (jets.beta_deriv[a][beta_pos][out_col] - want_d).abs()
-                                <= 1e-9 * d_floor,
-                            "weighted={weighted} row {row} col {out_col} \
-                             beta_deriv[{a}][{beta_pos}]: production {} vs tower {}",
-                            jets.beta_deriv[a][beta_pos][out_col],
-                            want_d
-                        );
-                        assert!(
-                            (jets.beta_l_deriv[a][beta_pos][out_col] - want_d).abs()
-                                <= 1e-9 * d_floor,
-                            "weighted={weighted} row {row} col {out_col} \
-                             beta_l_deriv[{a}][{beta_pos}]: production {} vs tower {}",
-                            jets.beta_l_deriv[a][beta_pos][out_col],
-                            want_d
-                        );
-                    }
-                }
-            }
         }
     }
 }

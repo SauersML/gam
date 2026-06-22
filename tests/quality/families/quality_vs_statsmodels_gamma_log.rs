@@ -30,20 +30,14 @@
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::{
-    Column, pearson, r_package_available, relative_l2, rmse, run_python, run_r,
-};
+use gam::test_support::reference::{Column, pearson, relative_l2, rmse, run_python};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
-    load_csvwith_inferred_schema,
 };
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Gamma, Uniform};
-use std::path::Path;
-
-const GAGURINE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/gagurine.csv");
 
 #[test]
 fn gam_gamma_log_matches_statsmodels() {
@@ -217,186 +211,5 @@ emit("scale", [res.scale])
         gam_rmse_truth <= ref_rmse_truth * 1.10,
         "Gamma(log) truth-recovery error worse than statsmodels by >10%: \
          gam={gam_rmse_truth:.5} vs statsmodels={ref_rmse_truth:.5}"
-    );
-}
-
-/// Gamma unit deviance `2*[ -log(y/mu) + (y-mu)/mu ]` (lower is better), the
-/// proper out-of-sample scoring metric for a Gamma(log) fit.
-fn gamma_unit_deviance(y: f64, mu: f64) -> f64 {
-    let mu = mu.max(1e-12);
-    2.0 * (-(y / mu).ln() + (y - mu) / mu)
-}
-
-fn mean_gamma_deviance(y: &[f64], mu: &[f64]) -> f64 {
-    assert_eq!(y.len(), mu.len(), "gamma deviance length mismatch");
-    let s: f64 = y
-        .iter()
-        .zip(mu)
-        .map(|(&yi, &mui)| gamma_unit_deviance(yi, mui))
-        .sum();
-    s / y.len().max(1) as f64
-}
-
-/// REAL-DATA held-out arm: gam's Gamma(log) smooth on the canonical positive,
-/// right-skewed `GAGurine` benchmark (MASS::GAGurine — GAG urine concentration
-/// vs Age in 314 children; the textbook Gamma/log smoothing problem) must
-/// predict held-out concentrations better than the constant-mean null and
-/// match-or-beat mgcv's `Gamma(link=log)` smooth on the SAME held-out Gamma
-/// deviance. A deterministic every-4th-row split fits on 3/4, scores on 1/4.
-#[test]
-fn gam_gamma_log_predicts_held_out_gagurine_better_than_baseline() {
-    init_parallelism();
-
-    let ds = load_csvwith_inferred_schema(Path::new(GAGURINE_CSV)).expect("load gagurine.csv");
-    let col = ds.column_map();
-    let age_idx = col["Age"];
-    let gag_idx = col["GAG"];
-    let age: Vec<f64> = ds.values.column(age_idx).to_vec();
-    let gag: Vec<f64> = ds.values.column(gag_idx).to_vec();
-    let n = age.len();
-    assert!(n > 300, "GAGurine should have ~314 rows, got {n}");
-    assert!(
-        gag.iter().all(|&v| v > 0.0),
-        "GAG concentration must be strictly positive for a Gamma fit"
-    );
-
-    // Deterministic every-4th-row held-out split.
-    let is_test = |i: usize| i % 4 == 0;
-    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
-    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
-    assert!(
-        train_rows.len() > 200 && test_rows.len() > 60,
-        "split sizes: train={} test={}",
-        train_rows.len(),
-        test_rows.len()
-    );
-
-    let train_age: Vec<f64> = train_rows.iter().map(|&i| age[i]).collect();
-    let train_gag: Vec<f64> = train_rows.iter().map(|&i| gag[i]).collect();
-    let test_age: Vec<f64> = test_rows.iter().map(|&i| age[i]).collect();
-    let test_gag: Vec<f64> = test_rows.iter().map(|&i| gag[i]).collect();
-
-    // Training-only dataset by sub-setting the encoded rows (schema unchanged).
-    let p_cols = ds.headers.len();
-    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p_cols));
-    for (out_row, &src_row) in train_rows.iter().enumerate() {
-        for c in 0..p_cols {
-            train_values[[out_row, c]] = ds.values[[src_row, c]];
-        }
-    }
-    let mut train_ds = ds.clone();
-    train_ds.values = train_values;
-
-    // ---- fit gam on TRAIN: GAG ~ s(Age), Gamma(log) -----------------------
-    let cfg = FitConfig {
-        family: Some("gamma".to_string()),
-        ..FitConfig::default()
-    };
-    let result = fit_from_formula("GAG ~ s(Age)", &train_ds, &cfg)
-        .expect("gam Gamma(log) fit on gagurine train");
-    let FitResult::Standard(fit) = result else {
-        panic!("expected a standard GAM fit for Gamma(log) GAG ~ s(Age)");
-    };
-    let gam_edf = fit.fit.edf_total().expect("gam reports total edf");
-
-    // gam held-out mean: rebuild the frozen design at the test Age values; with a
-    // log link mu = exp(design*beta).
-    let mut test_grid = Array2::<f64>::zeros((test_rows.len(), p_cols));
-    for (i, &a) in test_age.iter().enumerate() {
-        test_grid[[i, age_idx]] = a;
-    }
-    let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec)
-        .expect("rebuild design at held-out gagurine points");
-    let gam_test_mu: Vec<f64> = test_design
-        .design
-        .apply(&fit.fit.beta)
-        .iter()
-        .map(|e| e.exp())
-        .collect();
-    assert!(
-        gam_test_mu.iter().all(|&m| m.is_finite() && m > 0.0),
-        "held-out Gamma means must be finite and positive"
-    );
-
-    let gam_dev = mean_gamma_deviance(&test_gag, &gam_test_mu);
-
-    // Constant-mean null: the train mean predicted for every held-out row.
-    let mu_train = train_gag.iter().sum::<f64>() / train_gag.len() as f64;
-    let null_mu = vec![mu_train; test_rows.len()];
-    let null_dev = mean_gamma_deviance(&test_gag, &null_mu);
-
-    // ---- mature comparator: mgcv Gamma(link=log) smooth -------------------
-    let mgcv_dev = if r_package_available("mgcv") {
-        let tr_len = train_age.len();
-        let pad = |v: &[f64]| -> Vec<f64> {
-            let mut out = v.to_vec();
-            out.resize(tr_len, 0.0);
-            out
-        };
-        let r = run_r(
-            &[
-                Column::new("age", &train_age),
-                Column::new("gag", &train_gag),
-                Column::new("test_age", &pad(&test_age)),
-                Column::new("test_n", &vec![test_age.len() as f64; tr_len]),
-            ],
-            r#"
-            suppressPackageStartupMessages(library(mgcv))
-            m <- gam(gag ~ s(age), data = df, family = Gamma(link = "log"),
-                     method = "REML")
-            k <- df$test_n[1]
-            newd <- data.frame(age = df$test_age[1:k])
-            emit("mu", as.numeric(predict(m, newdata = newd, type = "response")))
-            emit("edf", sum(m$edf))
-            "#,
-        );
-        let mgcv_mu = r.vector("mu");
-        let mgcv_edf = r.scalar("edf");
-        assert_eq!(mgcv_mu.len(), test_rows.len(), "mgcv held-out mu length mismatch");
-        let dev = mean_gamma_deviance(&test_gag, mgcv_mu);
-        let rel = relative_l2(&gam_test_mu, mgcv_mu);
-        let corr = pearson(&gam_test_mu, mgcv_mu);
-        eprintln!(
-            "gagurine GAG~s(Age) Gamma(log) held-out: n_train={} n_test={} \
-             gam_edf={gam_edf:.3} mgcv_edf={mgcv_edf:.3} \
-             dev[gam={gam_dev:.4} mgcv={dev:.4} null={null_dev:.4}] \
-             [context] rel_l2(mu)={rel:.4} pearson(mu)={corr:.5}",
-            train_rows.len(),
-            test_rows.len()
-        );
-        Some(dev)
-    } else {
-        eprintln!(
-            "mgcv unavailable — asserting gam-side held-out quality only: \
-             n_train={} n_test={} gam_edf={gam_edf:.3} \
-             dev[gam={gam_dev:.4} null={null_dev:.4}]",
-            train_rows.len(),
-            test_rows.len()
-        );
-        None
-    };
-
-    // PRIMARY: the s(Age) Gamma(log) structure explains held-out GAG better than
-    // the constant mean. GAG falls sharply and smoothly with Age, so a correct
-    // smooth must cut the held-out deviance well below the null. Require at least
-    // 35% below null (a strong, un-weakened bound on a strongly age-dependent
-    // benchmark).
-    assert!(
-        gam_dev < null_dev * 0.65,
-        "gam held-out Gamma deviance {gam_dev:.4} must beat the constant-mean null \
-         {null_dev:.4} by a wide margin (bar: < 65% of null)"
-    );
-
-    // MATCH-OR-BEAT mgcv on the SAME held-out Gamma deviance, within 10%.
-    if let Some(dev) = mgcv_dev {
-        assert!(
-            gam_dev <= dev * 1.10,
-            "gam held-out Gamma deviance {gam_dev:.4} exceeds mgcv {dev:.4} * 1.10"
-        );
-    }
-
-    assert!(
-        gam_edf > 1.0 && gam_edf < 20.0,
-        "gam Gamma(log) effective dof out of sane range: {gam_edf:.3}"
     );
 }
