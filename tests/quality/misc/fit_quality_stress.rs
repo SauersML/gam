@@ -161,7 +161,7 @@ fn report(
     } else {
         span_fit / span_truth
     };
-    let cat = categorize(rmse_val, sigma, ratio); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
+    let cat = categorize(rmse_val, sigma, ratio);
     eprintln!(
         "[fit-quality] probe={probe} category={cat} rmse={rmse_val:.4} \
          sigma_noise={sigma:.4} span_fit={span_fit:.3} span_truth={span_truth:.3} \
@@ -307,7 +307,7 @@ fn hifreq_cyclic_probe(k: usize) -> Result<(), String> {
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
     let extra = format!("k={k} l1_at_truth={l1:.4}");
-    let cat = let cat = report(&probe, &formula, r, sigma, sf, st, &extra); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
+    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
     if let Category::Collapsed = cat {
         return Err(format!("probe collapsed"));
     }
@@ -363,7 +363,7 @@ fn hifreq_bc_probe(k: usize) -> Result<(), String> {
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
     let extra = format!("k={k} l1_at_truth={l1:.4}");
-    let cat = let cat = report(&probe, &formula, r, sigma, sf, st, &extra); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
+    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
     if let Category::Collapsed = cat {
         return Err(format!("probe collapsed"));
     }
@@ -458,7 +458,7 @@ fn hifreq_sphere_probe(l: usize) -> Result<(), String> {
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
     let extra = format!("l={l} l1_at_truth={l1:.4}");
-    let cat = let cat = report(&probe, &formula, r, sigma, sf, st, &extra); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
+    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
     if let Category::Collapsed = cat {
         return Err(format!("probe collapsed"));
     }
@@ -533,7 +533,7 @@ fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
     let extra = format!("k={k} l1_at_truth={l1:.4} n_train={}", theta.len());
-    let cat = let cat = report(&probe, &formula, r, sigma, sf, st, &extra); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
+    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
     if let Category::Collapsed = cat {
         return Err(format!("probe collapsed"));
     }
@@ -676,7 +676,7 @@ fn near_flat_signal() -> Result<(), String> {
             .map(|v| (v - truth_const).abs())
             .fold(0.0_f64, f64::max)
     });
-    let cat = let cat = report("near_flat_signal", formula, r, sigma, sf, st, &extra); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
+    let cat = report("near_flat_signal", formula, r, sigma, sf, st, &extra);
     if let Category::Collapsed = cat {
         return Err(format!("probe collapsed"));
     }

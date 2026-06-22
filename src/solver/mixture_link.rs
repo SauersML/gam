@@ -1124,7 +1124,7 @@ fn link_function_mu_d1(link: LinkFunction, eta: f64) -> Result<(f64, f64), Estim
             // exact `exp(η)` via `families::inverse_link::apply_inverse_link_vec`
             // (issue #963).
             let e = eta.clamp(-700.0, 700.0).exp();
-            Ok((e)
+            Ok((e, e))
         }
         LinkFunction::Logit => Ok(component_inverse_link_mu_d1(LinkComponent::Logit, eta)),
         LinkFunction::Probit => Ok(component_inverse_link_mu_d1(LinkComponent::Probit, eta)),
