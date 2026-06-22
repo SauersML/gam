@@ -4392,29 +4392,48 @@ fn relax_smoothing_rho_prior(
     // relaxable coordinates stay byte-flat (`Flat`) so a clean `n > p` fit is
     // unchanged (no regression on ordinary smooth recovery).
     //
-    // WELL-DETERMINED CONCURVITY (#1476). This select-out PC prior is applied to
-    // the `DoublePenaltyNullspace` coordinate in BOTH determinacy regimes — the
-    // well-determined regime too, NOT only `p > n`. Leaving the well-determined
-    // Gaussian null-space coordinate fully `Flat` is the concurvity collapse:
-    // under two correlated smooths `s(x1)+s(x2)` (corr ≈ 0.9) the two smooths'
-    // null-space (linear) directions are near-collinear, so the joint REML
-    // objective is essentially FLAT along the "transfer the shared linear signal
-    // between the two smooths" ridge. With no prior curvature on that coordinate
-    // REML cannot certify an interior stationary point and one smooth's
-    // `λ_nullspace` rails to the ρ bound (≈1e13), annihilating that smooth's
-    // genuine linear signal to `EDF ≈ 0` while the other absorbs it. The PC
-    // wall's strictly-positive curvature `(θ/4) e^{-ρ/2}` pins the coordinate at
-    // a FINITE stationary ρ, RETAINING a signal-bearing collinear null space.
-    // This does NOT re-introduce the #1266/#1271 inflation: the PC pull is in the
-    // SAME (+, shrink-out) direction REML already moves a genuinely-unsupported
-    // null space, so an irrelevant covariate still selects out (`EDF < 1`); the
-    // wall only stops the runaway collapse of a SUPPORTED one. The RANGE-space
-    // (`Primary`) bending coordinate is untouched (stays `Flat` when
-    // well-determined), so ordinary single-smooth recovery is unchanged.
+    // The strong select-out PC prior is applied to the `DoublePenaltyNullspace`
+    // coordinate ONLY in the UNDER-DETERMINED regime, where the outer score is
+    // genuinely flat on the select-out side and REML needs the active push. In the
+    // WELL-DETERMINED regime the null space gets the wide
+    // `nullspace_degeneracy_prior` instead (see below) — an active select-out mode
+    // there would over-shrink a genuinely-supported collinear null space (#1476).
+    // The RANGE-space (`Primary`) bending coordinate is untouched (stays `Flat`
+    // when well-determined), so ordinary single-smooth recovery is unchanged.
     //
     let nullspace_select_prior = crate::types::RhoPrior::PenalizedComplexity {
         upper: NULLSPACE_SELECT_PC_UPPER,
         tail_prob: NULLSPACE_SELECT_PC_TAIL_PROB,
+    };
+    // WELL-DETERMINED NULL-SPACE DEGENERACY BREAKER (#1476). When the fit is
+    // well-determined (`n ≥ 2·p`) the strong `nullspace_select_prior` above is the
+    // WRONG tool for the Gaussian null-space coordinate: its finite well-penalized
+    // mode at `λ* = θ² ≈ 8483` is an aggressive select-OUT pull that drags a
+    // GENUINELY-SUPPORTED null space (a real linear/constant component) toward
+    // collapse — the #1476 over-shrink. But leaving the coordinate fully `Flat`
+    // (the previous well-determined behaviour) is the OTHER failure: under
+    // concurvity (`s(x1)+s(x2)`, corr ≈ 0.9) the two smooths' null-space (linear)
+    // directions are near-collinear, so the joint REML objective is essentially
+    // FLAT along the "transfer the shared linear signal between the two smooths"
+    // ridge; with zero curvature on that coordinate REML cannot certify an
+    // interior stationary point and one smooth's `λ_nullspace` rails to the ρ
+    // bound (≈1e13), annihilating its genuine linear signal to `EDF ≈ 0` while the
+    // other absorbs it. The principled fix is NEITHER a select-out mode NOR a
+    // flat coordinate: it is a WIDE, weakly-informative symmetric Gaussian that
+    // contributes strictly-positive termination curvature `1/sd²` (breaking the
+    // concurvity flat-ridge degeneracy so REML lands an interior allocation) while
+    // its gradient `ρ/sd²` at any plausible optimum is negligible — so REML, not
+    // the prior, chooses how the shared linear signal is split. This adds no
+    // directional select-out bias, so it does NOT over-shrink a supported null
+    // space (#1476); a genuinely-UNSUPPORTED null space is still selected out
+    // because REML's own score drives its `λ` up and the weak symmetric pull
+    // barely opposes it (#1266 irrelevant-covariate shrinkage, #1371 single-smooth
+    // recovery preserved). The strong PC select-out remains in the
+    // UNDER-DETERMINED regime, where the score IS flat on the select-out side and
+    // REML needs the active push (#1392 wine `p > n`).
+    let nullspace_degeneracy_prior = crate::types::RhoPrior::Normal {
+        mean: 0.0,
+        sd: NULLSPACE_WELLDET_DEGENERACY_RHO_SD,
     };
     let per_coord = coords
         .iter()
@@ -4451,8 +4470,23 @@ fn relax_smoothing_rho_prior(
                 } else {
                     relaxed_prior.clone()
                 }
-            } else if underdetermined && is_nullspace {
-                nullspace_select_prior.clone()
+            } else if is_nullspace {
+                // Gaussian-identity double-penalty null-space selection ridge.
+                // UNDER-DETERMINED (`p > n`, #1392 wine): the outer score is flat
+                // on the select-out side, so REML stalls the null space "kept" at
+                // λ ≈ 0.11 and the EDF rails up — the active PC select-out push is
+                // required to move it out. WELL-DETERMINED (#1476 concurvity): the
+                // score is NOT flat, so an active select-out mode would over-shrink
+                // a genuinely-supported (collinear) null space; instead supply only
+                // the wide, weakly-informative termination curvature that breaks
+                // the concurvity flat-ridge degeneracy and lets REML allocate the
+                // shared linear signal. (#1266 select-out of a truly-unsupported
+                // null still holds — REML's own score drives its λ up.)
+                if underdetermined {
+                    nullspace_select_prior.clone()
+                } else {
+                    nullspace_degeneracy_prior.clone()
+                }
             } else {
                 relaxed_prior.clone()
             }
@@ -4474,6 +4508,25 @@ fn relax_smoothing_rho_prior(
 /// #1392 under-smoothing drag; widening it further weakens termination
 /// curvature without further benefit.
 const RELAX_UNDERDETERMINED_RHO_SD: f64 = 15.0;
+
+/// Standard deviation of the wide, weakly-informative symmetric `Normal` prior
+/// placed on a relaxable double-penalty smooth's `DoublePenaltyNullspace`
+/// selection coordinate when the fit is WELL-determined (`n ≥ 2·p`); see
+/// [`relax_smoothing_rho_prior`].
+///
+/// In the well-determined regime the null-space coordinate must be NEITHER the
+/// strong select-out PC prior (its finite mode `λ* ≈ 8483` over-shrinks a
+/// genuinely-supported collinear null space — the #1476 over-shrink) NOR fully
+/// `Flat` (under concurvity the shared-linear ridge is degenerate, and zero
+/// curvature lets one smooth's `λ_nullspace` rail to ≈1e13, collapsing it to
+/// `EDF ≈ 0`). A wide symmetric Gaussian threads both: like
+/// [`RELAX_UNDERDETERMINED_RHO_SD`] it contributes strictly-positive curvature
+/// `1/sd²` that breaks the concurvity flat-ridge degeneracy (so REML certifies an
+/// interior, signal-preserving allocation) while its gradient `ρ/sd²` at any
+/// plausible optimum is negligible — adding NO select-out bias, so a supported
+/// null space is left for REML to size. The same `sd = 15` calibration applies:
+/// ±2σ spans the feasible ρ range (`|ρ| ≤ 30`).
+const NULLSPACE_WELLDET_DEGENERACY_RHO_SD: f64 = 15.0;
 
 /// Distance-scale bound `upper` (`P(d > upper) = tail_prob` on the marginal-SD
 /// scale `d = exp(-ρ/2)`) of the penalized-complexity prior placed on a
