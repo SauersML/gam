@@ -21,11 +21,11 @@ fn dataset(n: usize) -> gam::data::EncodedDataset {
             StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
 }
 
 fn time<T>(label: &str, f: impl FnOnce() -> T) -> T {
-    let t = Instant::now(, e));
+    let t = Instant::now();
     let r = f();
     eprintln!("[stage] {label}: {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
     r
@@ -44,8 +44,8 @@ fn cylinder_fit_n_10k_stages() {
 
     // Stage 1: parse + materialize (formula → FitRequest)
     time("materialize", || {
-        materialize(formula, &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "materialize")
-    }, e));
+        materialize(formula, &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "materialize", e))
+    });
 
     // Stage 2: full fit
     let total = Instant::now();

@@ -267,6 +267,39 @@ impl SaeReconstructionRowProgram {
         acc
     }
 
+    /// The β **border-channel** local-variable sub-jet: the scalar
+    /// `s_{k,b}(p) = ζ_k(ℓ)·Φ_b(t_k)` as a `Tower4<K>` in the local
+    /// (logit/coord) primaries — the gate activation times ONE basis function.
+    ///
+    /// In the arrow system a β border channel is one free decoder coefficient
+    /// `β_{k,b,channel}` whose per-row reconstruction contribution to output
+    /// column `c` is `ζ_k(ℓ)·Φ_b(t_k)·output_c`, where `output` is the channel's
+    /// (frame / identity) output vector carried by the `SaeBorderChannel`, NOT
+    /// the current decoder matrix. The reconstruction is **linear** in `β`, so
+    /// `∂ẑ_c/∂β_{k,b,channel} = ζ_k(ℓ)·Φ_b(t_k)·output_c = s_{k,b}.v·output_c`
+    /// and `∂²ẑ_c/∂β∂p_a = s_{k,b}.g[a]·output_c` (the production `beta` /
+    /// `beta_deriv` / `beta_l_deriv` channels). The `output_c` factor is a
+    /// per-column constant the caller applies; this tower carries the entire
+    /// local-variable dependence.
+    ///
+    /// It is built from the SAME `gate_tower` / `basis_tower` primitives as
+    /// [`Self::reconstruction_column`], so the β border channel is single
+    /// sourced with the local-variable reconstruction tower (#932) — the hand
+    /// path in `row_jets_for_logdet` packs these same `ζ_k·Φ_b` products (then
+    /// multiplies by `channel.output`) term by term, and is pinned to this
+    /// tower by the converged-cache oracle.
+    #[must_use]
+    pub fn beta_border_tower<const K: usize>(&self, atom: usize, basis_col: usize) -> Tower4<K> {
+        assert_eq!(
+            self.n_primaries, K,
+            "SaeReconstructionRowProgram: tower arity K={K} must equal n_primaries={}",
+            self.n_primaries
+        );
+        let gate = self.gate_tower::<K>(atom);
+        let phi = self.atoms[atom].basis_tower::<K>(basis_col, &self.coord_slot[atom]);
+        gate.mul(&phi)
+    }
+
     /// The number of reconstruction output columns.
     #[must_use]
     pub fn out_dim(&self) -> usize {

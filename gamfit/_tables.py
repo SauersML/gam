@@ -113,28 +113,30 @@ def _stringify_marked(value: Any, is_categorical: bool, *, column: str | None = 
 
 
 def _infer_categorical_from_values(columns: dict[str, list[Any]]) -> frozenset[str]:
+    # Mirror what pandas infers for a Python list / object column: a column is
+    # categorical iff its values are NOT a uniform numeric (or bool) vector —
+    # i.e. it carries at least one Python ``str``. The presence of ANY string
+    # makes the whole column object-dtype-like, exactly as `pd.Series(...).dtype`
+    # reports `object` (→ categorical) for a list that mixes strings with
+    # anything else.
+    #
+    # Earlier this used an "ALL non-null values must be str" rule, which under-
+    # detected MIXED string+numeric columns: `["a", 1, "b"]` is `object` dtype in
+    # pandas (→ categorical) but the all-str rule saw the `1` and lowered the
+    # column to a NUMERIC covariate — the same typed-vs-untyped parity gap as
+    # #1467/#1468/#1469, one boundary case further out. A single string anywhere
+    # is enough (and is correct): a column that cannot be parsed as uniformly
+    # numeric is categorical, matching the pandas/polars/pyarrow branches.
+    #
+    # `bool` is NOT a `str`, so a pure-bool column (`[True, False]`, pandas `bool`
+    # dtype) stays numeric, while a `bool`+`str` mix (`[True, "a"]`, pandas
+    # `object`) becomes categorical via the string. `None`/`NaN` are nulls and
+    # never make a column categorical on their own (an all-null column carries no
+    # string and stays numeric, as pandas reports `float64` for an all-`NaN`
+    # list). `numpy.str_` is a `str` subclass, so it is covered too.
     out = set()
     for name, values in columns.items():
-        saw_string = False
-        disqualified = False
-        for value in values:
-            if value is None:
-                continue
-            if isinstance(value, bool):
-                # bool is numeric (and an int subclass) — not categorical.
-                disqualified = True
-                break
-            if isinstance(value, str):
-                saw_string = True
-                continue
-            if isinstance(value, float) and value != value:
-                # NaN is treated as null/skip.
-                continue
-            # Any other non-null value (int/float/numpy number/etc.) is
-            # numeric-or-other and disqualifies the column.
-            disqualified = True
-            break
-        if saw_string and not disqualified:
+        if any(isinstance(value, str) for value in values):
             out.add(name)
     return frozenset(out)
 
@@ -149,15 +151,17 @@ def categorical_dtype_columns(
     Typed table libraries (pandas/polars/pyarrow) carry this signal in their
     declared schema, so the dtype is read directly. Untyped inputs (mappings,
     record/row sequences, numpy, plain row sequences) have no declared dtype, so
-    the signal is inferred from the *values*: a column is categorical iff it is
-    non-empty and every non-null value is a Python ``str`` (``numpy.str_`` is a
-    ``str`` subclass, so it is covered too). Any numeric (``int``/``float``/
-    ``bool``/numpy number) non-null value disqualifies the column, mirroring what
-    a pandas object-dtype all-string column would do. ``None`` and ``NaN`` are
-    treated as null and skipped, but a column must carry at least one real string
-    to be categorical. This closes the dict/records/numpy gap (#1467/#1468/#1469)
-    where a string column with numeric-looking labels ("0"/"1") was lowered to a
-    numeric covariate.
+    the signal is inferred from the *values*: a column is categorical iff it
+    carries at least one Python ``str`` (``numpy.str_`` is a ``str`` subclass, so
+    it is covered too), mirroring how pandas assigns `object` dtype to any list
+    that is not a uniform numeric/bool vector. A pure ``int``/``float``/``bool``/
+    numpy-number column stays numeric (a genuinely-numeric ``by=`` covariate is
+    preserved); a column that mixes a string with numerics (``["a", 1]``) is
+    `object` in pandas and is therefore categorical here too. ``None`` and
+    ``NaN`` are nulls and never make a column categorical on their own. This
+    closes the dict/records/numpy gap (#1467/#1468/#1469) where a string column
+    with numeric-looking labels ("0"/"1") was lowered to a numeric covariate, and
+    its mixed-column corollary (a string+numeric column was likewise mis-lowered).
     """
     try:
         if kind == "pandas":

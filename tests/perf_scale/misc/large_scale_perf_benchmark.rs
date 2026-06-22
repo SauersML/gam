@@ -34,32 +34,32 @@ fn cylinder_data(n: usize) -> gam::data::EncodedDataset {
             StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "cyl")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "cyl", e))
 }
 
 fn periodic_1d_data(n: usize) -> gam::data::EncodedDataset {
     let headers = vec!["theta".into(), "y".into()];
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
-            let theta = TAU * (i as f64) / (n as f64, e));
+            let theta = TAU * (i as f64) / (n as f64);
             let y = 0.5 + 0.4 * theta.cos() - 0.2 * (2.0 * theta).sin();
             StringRecord::from(vec![theta.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "p1d")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "p1d", e))
 }
 
 fn bc_1d_data(n: usize) -> gam::data::EncodedDataset {
     let headers = vec!["x".into(), "y".into()];
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
-            let x = (i as f64) / (n as f64 - 1.0, e));
+            let x = (i as f64) / (n as f64 - 1.0);
             // function with zero at x=0 (the BC anchor)
             let y = x * (1.0 - x) * (1.0 + 0.5 * (PI * x).sin());
             StringRecord::from(vec![x.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "bc")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "bc", e))
 }
 
 fn sphere_data(n: usize) -> gam::data::EncodedDataset {
@@ -67,7 +67,7 @@ fn sphere_data(n: usize) -> gam::data::EncodedDataset {
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
             // Lambert equal-area sphere coverage
-            let frac = (i as f64) / (n as f64, e));
+            let frac = (i as f64) / (n as f64);
             let z = 1.0 - 2.0 * frac;
             let phi = TAU * ((i as f64) * 0.61803398875).fract();
             let lat = z.asin().to_degrees();
@@ -78,11 +78,11 @@ fn sphere_data(n: usize) -> gam::data::EncodedDataset {
             StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "sphere")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "sphere", e))
 }
 
 fn time_fit(formula: &str, data: &gam::data::EncodedDataset, cfg: &FitConfig) -> (f64, usize) {
-    let t = Instant::now(, e));
+    let t = Instant::now();
     let res = fit_from_formula(formula, data, cfg);
     let ms = t.elapsed().as_secs_f64() * 1e3;
     let p = res
@@ -196,13 +196,13 @@ fn noisy_cylinder_data(n: usize, noise_sd: f64, seed: u64) -> gam::data::Encoded
             StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "noisy")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "noisy", e))
 }
 
 #[test]
 fn large_scale_perf_cylinder_noisy_n100k_accuracy() { 
     // Fit on noisy data, check that |residuals| has expected scale.
-    init_parallelism(, e));
+    init_parallelism();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()

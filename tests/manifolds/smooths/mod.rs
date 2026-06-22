@@ -4,4 +4,5 @@ mod sphere_basis_jet;
 mod sphere_both_kernels_fit_smooth_truth;
 mod sphere_methods_agree_on_smooth_truth;
 mod sphere_penalty_order_sweep;
+mod sphere_wahba_double_penalty_null_subspace;
 mod spherical_spline;

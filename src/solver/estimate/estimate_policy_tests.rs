@@ -284,8 +284,8 @@ fn prefit_binomial_detects_unpenalized_realized_design_separator() {
         &design,
         &[true, true],
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "separation screen must complete without a layout error")
-    .expect("second column exactly separates the binary response", e));
+    .expect("separation screen must complete without a layout error")
+    .expect("second column exactly separates the binary response");
 
     assert_eq!(diagnostic.column_index, 1);
     assert!(diagnostic.positive_above_threshold);
@@ -307,10 +307,10 @@ fn prefit_binomial_screen_respects_penalties_and_fractional_responses() {
             &design,
             &[true, false],
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "separation screen must complete without a layout error"),
+        .expect("separation screen must complete without a layout error"),
         None,
         "a separating column with effective quadratic penalty should not be pre-fit rejected"
-    , e));
+    );
     assert_eq!(
         detect_prefit_binomial_single_column_separation_in_design(
             fractional_y.view(),
@@ -318,10 +318,10 @@ fn prefit_binomial_screen_respects_penalties_and_fractional_responses() {
             &design,
             &[true, true],
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "separation screen must complete without a layout error"),
+        .expect("separation screen must complete without a layout error"),
         None,
         "fractional binomial proportions are not exact binary separation"
-    , e));
+    );
 }
 
 #[test]
@@ -421,8 +421,8 @@ fn prefit_rank_check_detects_unpenalized_duplicate_column() {
     let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
     let diagnostic =
         detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "rank check should stream dense design")
-            .expect("duplicate unpenalized columns are rank deficient", e));
+            .expect("rank check should stream dense design")
+            .expect("duplicate unpenalized columns are rank deficient");
 
     match diagnostic {
         PrefitRegularityDiagnostic::RankDeficient {
@@ -459,7 +459,7 @@ fn prefit_rank_check_ignores_alias_carried_only_by_penalized_column() {
         &design,
         &[true, true, false],
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "rank check should stream dense design", e));
+    .expect("rank check should stream dense design");
 
     assert_eq!(
         diagnostic, None,
@@ -505,8 +505,8 @@ fn prefit_rank_check_detects_near_degenerate_unpenalized_design() {
     let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
     let diagnostic =
         detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "rank check should stream dense design")
-            .expect("near-collinear unpenalized columns are near-degenerate", e));
+            .expect("rank check should stream dense design")
+            .expect("near-collinear unpenalized columns are near-degenerate");
 
     match diagnostic {
         PrefitRegularityDiagnostic::NearDegenerate {
@@ -549,7 +549,7 @@ fn prefit_rank_check_accepts_well_conditioned_unpenalized_design() {
     let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
     let diagnostic =
         detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "rank check should stream dense design", e));
+            .expect("rank check should stream dense design");
     assert_eq!(
         diagnostic, None,
         "a well-conditioned full-rank unpenalized design must not be pre-fit rejected"
@@ -652,7 +652,7 @@ fn decode_invariant_test_fit() -> UnifiedFitResult {
         artifacts: FitArtifacts::default(),
         inner_cycles: 0,
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "construct decode invariant test fit", e))
+    .expect("construct decode invariant test fit")
 }
 
 #[test]
@@ -722,7 +722,7 @@ fn resolve_external_family_accepts_constant_precision_beta_regression() {
         ),
         None,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "external-design policy must accept constant-precision beta regression", e));
+    .expect("external-design policy must accept constant-precision beta regression");
     assert!(
         !firth,
         "beta regression does not request Firth bias reduction"
@@ -743,21 +743,21 @@ fn resolve_external_family_accepts_supported_nonlogit_firth_request() {
         ),
         Some(true),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "CLogLog has a Fisher-weight jet", e));
+    .expect("CLogLog has a Fisher-weight jet");
     assert!(firth);
 }
 
 #[test]
 fn unified_fit_decode_validation_rejects_beta_drift_from_blocks() {
     let fit = decode_invariant_test_fit();
-    let mut payload = serde_json::to_value(&fit).unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize fit", e));
+    let mut payload = serde_json::to_value(&fit).expect("serialize fit");
     // `Array1<f64>` uses ndarray's own (versioned-sequence) serde format,
     // not a bare JSON array, so round-trip the drifted value through
     // serde_json to honour that schema while still corrupting the data.
     payload["beta"] =
-        serde_json::to_value(Array1::from(vec![9.0_f64, 8.0_f64])).unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize drifted beta", e));
+        serde_json::to_value(Array1::from(vec![9.0_f64, 8.0_f64])).expect("serialize drifted beta");
     let decoded: UnifiedFitResult =
-        serde_json::from_value(payload).unwrap_or_else(|e| panic!("{} failed: {:?}", "deserialize corrupted fit", e));
+        serde_json::from_value(payload).expect("deserialize corrupted fit");
     let err = decoded
         .validate_numeric_finiteness()
         .expect_err("beta drift should fail validation");
@@ -773,11 +773,11 @@ fn unified_fit_validation_rejects_edf_smoothing_parameter_drift() {
     let mut fit = decode_invariant_test_fit();
     fit.inference
         .as_mut()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "test fit has inference")
+        .expect("test fit has inference")
         .edf_by_block = vec![1.5];
     let err = fit
         .validate_numeric_finiteness()
-        .expect_err("EDF entries should align with smoothing parameters", e));
+        .expect_err("EDF entries should align with smoothing parameters");
     assert!(
         err.to_string()
             .contains("EDF smoothing-parameter count mismatch"),
@@ -786,11 +786,13 @@ fn unified_fit_validation_rejects_edf_smoothing_parameter_drift() {
 }
 
 #[test]
-fn unified_fit_validation_accepts_persisted_log_lambda_roundoff() { 
+fn unified_fit_validation_accepts_persisted_log_lambda_roundoff() {
     let mut fit = decode_invariant_test_fit();
     fit.log_lambdas[0] += 5e-14;
-    fit.validate_numeric_finiteness()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "sub-ulp persisted log-lambda roundoff should remain valid", e));
+    assert!(
+        fit.validate_numeric_finiteness().is_ok(),
+        "sub-ulp persisted log-lambda roundoff should remain valid"
+    );
 }
 
 #[test]
@@ -809,12 +811,12 @@ fn unified_fit_validation_rejects_material_log_lambda_drift() {
 #[test]
 fn unified_fit_decode_validation_rejects_geometry_drift_from_inference() {
     let fit = decode_invariant_test_fit();
-    let mut payload = serde_json::to_value(&fit).unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize fit", e));
+    let mut payload = serde_json::to_value(&fit).expect("serialize fit");
     let drifted_hessian: Array2<f64> = array![[4.0, 0.0], [0.0, 5.0]];
     payload["geometry"]["penalized_hessian"] =
-        serde_json::to_value(&drifted_hessian).unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize drifted penalized Hessian", e));
+        serde_json::to_value(&drifted_hessian).expect("serialize drifted penalized Hessian");
     let decoded: UnifiedFitResult =
-        serde_json::from_value(payload).unwrap_or_else(|e| panic!("{} failed: {:?}", "deserialize corrupted fit", e));
+        serde_json::from_value(payload).expect("deserialize corrupted fit");
     let err = decoded
         .validate_numeric_finiteness()
         .expect_err("geometry drift should fail validation");
@@ -866,7 +868,7 @@ fn dense_penalty_test_inputs(
             p,
             context,
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "canonicalize dense penalties", e));
+        .expect("canonicalize dense penalties");
     (penalty_specs, canonical_penalties, active_nullspace_dims)
 }
 
@@ -895,7 +897,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
                     initial_epsilon: 0.0,
                     initial_log_delta: 0.0,
                 })
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "valid SAS initial state"),
+                .expect("valid SAS initial state"),
             ),
         ),
         latent_cloglog: None,
@@ -921,7 +923,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     };
 
     let theta = array![0.10, 0.12, -0.18];
-    let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg", e));
+    let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
     assert!(effective_sas_link.is_some());
     let (penalty_specs, canonical_penalties, active_nullspace_dims) = dense_penalty_test_inputs(
         &s_list,
@@ -947,20 +949,20 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
         None,
         None,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "reml_state", e));
+    .expect("reml_state");
     let rho = theta.slice(s![..1]).to_owned();
     let (epsilon_eff, d_eps_d_raw) = sas_effective_epsilon(theta[1]);
     let sas_state = state_from_sasspec(SasLinkSpec {
         initial_epsilon: epsilon_eff,
         initial_log_delta: theta[2],
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "sas state", e));
+    .expect("sas state");
     reml_state.set_link_states(None, Some(sas_state));
 
     let pirls_result = reml_state
         .obtain_eval_bundle(&rho)
         .map(|b| b.pirls_result.clone())
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "pirls_result", e));
+        .expect("pirls_result");
     let eta = &pirls_result.final_eta;
     let x_t = &pirls_result.x_transformed;
     use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -987,7 +989,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
             initial_epsilon: eps_eff,
             initial_log_delta: theta[2],
         })
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "score sas state", e));
+        .expect("score sas state");
         let out_vec: Vec<f64> = (0..eta.len())
             .into_par_iter()
             .map(|i| {
@@ -1052,7 +1054,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
             &rhs,
             max_abs_diag(&score_beta_jacobian) * 1e-12,
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "observed-jacobian solve for dbeta", e));
+        .expect("observed-jacobian solve for dbeta");
     dbeta_exact *= d_eps_d_raw;
 
     let fd_h = 1e-4 * (1.0 + theta[1].abs());
@@ -1071,18 +1073,18 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
             None,
             None,
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "fd state", e));
+        .expect("fd state");
         let (eps_eff, _) = sas_effective_epsilon(raw_eps);
         let sas_state = state_from_sasspec(SasLinkSpec {
             initial_epsilon: eps_eff,
             initial_log_delta: theta[2],
         })
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "fd sas state", e));
+        .expect("fd sas state");
         state.set_link_states(None, Some(sas_state));
         let pirls = state
             .obtain_eval_bundle(&rho)
             .map(|b| b.pirls_result.clone())
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "fd pirls", e));
+            .expect("fd pirls");
         pirls.beta_transformed.as_ref().clone()
     };
     let beta_p = beta_at(theta[1] + fd_h);
@@ -1134,7 +1136,7 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
                     initial_epsilon: 0.0,
                     initial_log_delta: 0.0,
                 })
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "valid SAS initial state"),
+                .expect("valid SAS initial state"),
             ),
         ),
         latent_cloglog: None,
@@ -1160,7 +1162,7 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
     };
 
     let theta = array![0.10, 0.12, -0.18];
-    let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg", e));
+    let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
     assert!(effective_sas_link.is_some());
     let (penalty_specs, canonical_penalties, active_nullspace_dims) = dense_penalty_test_inputs(
         &s_list,
@@ -1186,20 +1188,20 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
         None,
         None,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "reml_state", e));
+    .expect("reml_state");
     let rho = theta.slice(s![..1]).to_owned();
     let (epsilon_eff, _) = sas_effective_epsilon(theta[1]);
     let sas_state = state_from_sasspec(SasLinkSpec {
         initial_epsilon: epsilon_eff,
         initial_log_delta: theta[2],
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "sas state", e));
+    .expect("sas state");
     reml_state.set_link_states(None, Some(sas_state));
 
     let pirls_result = reml_state
         .obtain_eval_bundle(&rho)
         .map(|b| b.pirls_result.clone())
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "pirls_result", e));
+        .expect("pirls_result");
     let beta0 = pirls_result.beta_transformed.as_ref().clone();
     let s_transformed = pirls_result.reparam_result.s_transformed.clone();
     let ridge = pirls_result.ridge_used;
@@ -1304,7 +1306,7 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
                     initial_epsilon: 0.0,
                     initial_log_delta: 0.0,
                 })
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "valid SAS initial state"),
+                .expect("valid SAS initial state"),
             ),
         ),
         latent_cloglog: None,
@@ -1330,7 +1332,7 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
     };
 
     let theta = array![0.10, 0.12, -0.18];
-    let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg", e));
+    let (cfg, effective_sas_link) = resolved_external_config(&opts).expect("cfg");
     assert!(effective_sas_link.is_some());
     let (penalty_specs, canonical_penalties, active_nullspace_dims) = dense_penalty_test_inputs(
         &s_list,
@@ -1356,20 +1358,20 @@ fn sas_pirlshessian_matches_true_score_jacobian_at_seed19() {
         None,
         None,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "reml_state", e));
+    .expect("reml_state");
     let rho = theta.slice(s![..1]).to_owned();
     let (epsilon_eff, _) = sas_effective_epsilon(theta[1]);
     let sas_state = state_from_sasspec(SasLinkSpec {
         initial_epsilon: epsilon_eff,
         initial_log_delta: theta[2],
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "sas state", e));
+    .expect("sas state");
     reml_state.set_link_states(None, Some(sas_state));
 
     let pirls_result = reml_state
         .obtain_eval_bundle(&rho)
         .map(|b| b.pirls_result.clone())
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "pirls_result", e));
+        .expect("pirls_result");
     let beta0 = pirls_result.beta_transformed.as_ref().clone();
     let s_transformed = pirls_result.reparam_result.s_transformed.clone();
     let ridge = pirls_result.ridge_used;

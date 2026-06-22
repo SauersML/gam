@@ -548,6 +548,31 @@ fn hifreq_tensor_k4() -> Result<(), String> {
 fn hifreq_tensor_k6() -> Result<(), String> {
     hifreq_tensor_probe(6);
 }
+// gam#1082: hifreq_tensor_k8/k10 run LONGER than the default per-test
+// slow-timeout (300s notice / 600s SIGKILL) on an IRREDUCIBLE cost. They are
+// NOT `#[ignore]`d — the high-frequency recovery they verify is real coverage we
+// keep — they are given a dedicated, generous `slow-timeout` override in
+// `.config/nextest.toml` (filter `test(/hifreq_tensor_k(8|10)/)`) so the nightly
+// CI runs them to completion and asserts the recovery instead of bulk-killing
+// them at 600s. This is a genuine compute-cost split, not hiding a perf bug:
+//
+// The 2D tensor `te(theta, h, bc=['periodic','natural'], k=2k+4)` has coefficient
+// dimension p = kb² ≈ 400 (k8) / 576 (k10). The dominant inner cost is the dense
+// O(p³) Cholesky of the penalized PIRLS Hessian `XᵀWX + S_λ`, run every
+// PIRLS/REML iteration. This is genuinely irreducible here:
+//   * The PENALTY side already exploits the tensor's Kronecker structure fully —
+//     the marginal penalties are simultaneously diagonalized
+//     (`kronecker_reparameterization_engine`), so `S_λ` is diagonal and its
+//     log-det + λ-derivatives are O(p), not O(p³).
+//   * The DATA Gram `XᵀWX` does NOT inherit Kronecker structure: with a general
+//     PIRLS weight matrix W (data-dependent, non-identity), `Σ_i w_i (x_{a,i} ⊗
+//     x_{b,i})(·)ᵀ` does not factor as `A ⊗ B`, so its Cholesky is a true dense
+//     p×p factorization. No separable/banded reformulation removes the cube.
+// And `kb` CANNOT be capped to shrink p: the ground-truth signal is `sin(k·θ)`,
+// whose periodic marginal needs ≥ k Fourier modes to represent, so k8/k10
+// require kb ≳ 18; capping kb would make even the unpenalized oracle unable to
+// recover the truth, defeating the high-frequency recovery the probe exists to
+// check. k4/k6 (p ≈ 144/196) stay well within the default budget.
 #[test]
 fn hifreq_tensor_k8() -> Result<(), String> {
     hifreq_tensor_probe(8);

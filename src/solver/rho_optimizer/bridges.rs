@@ -343,13 +343,48 @@ impl CostStallGuard {
     /// (a weakly-identified flat valley that is NOT stationary). Either stalled
     /// verdict publishes the best iterate to the shared cell, tagged with its
     /// `converged` status.
-    fn observe(&mut self, rho: &Array1<f64>, value: f64, grad_norm: f64) -> CostStallVerdict {
+    ///
+    /// `inner_converged` is the inner-PIRLS convergence flag for THIS iterate's
+    /// solve (read from the inner-progress feedback AFTER the outer eval ran). It
+    /// is the load-bearing #1426 input: at the under-penalized (λ→0) ridge the
+    /// inner PIRLS hits its iteration cap, so the cost it reports is a half-fit
+    /// artifact that is SMALLER than the honest REML criterion at the
+    /// well-penalized optimum, and the analytic gradient it pairs with is
+    /// inconsistent. If such an iterate is allowed to become the guard's
+    /// best-so-far it permanently anchors the best to the overfit basin — an
+    /// uncapped, honest re-evaluation at a well-penalized ρ then carries a
+    /// *higher* (correct) cost and can never displace it, so the loop ships the
+    /// near-full-basis overfit. A non-converged inner solve is therefore NEVER
+    /// recorded as best and NEVER counted toward a stall: its cost/gradient are
+    /// untrustworthy, so the guard treats it as forced descent (streak reset) and
+    /// keeps the optimizer moving until an honest, converged iterate lands.
+    fn observe(
+        &mut self,
+        rho: &Array1<f64>,
+        value: f64,
+        grad_norm: f64,
+        inner_converged: bool,
+    ) -> CostStallVerdict {
         if !value.is_finite() {
             // A non-finite accepted objective is the inner-solver's problem,
             // not a stall; reset so a later real descent is not falsely
             // credited as a no-improvement step. The dedicated infeasible-trial
             // bookkeeping lives in `observe_infeasible`; this finite-path entry
             // is left untouched for non-finite values.
+            self.no_improve_streak = 0;
+            return CostStallVerdict::Continue;
+        }
+        if !inner_converged {
+            // #1426: the inner PIRLS hit its iteration cap at this ρ, so `value`
+            // is a half-converged artifact and `grad_norm` is inconsistent with
+            // it. Do NOT update best-so-far (a corrupted low cost at the λ→0
+            // ridge would anchor the best to the overfit forever) and do NOT
+            // count this toward a stall — reset the no-improvement streak so the
+            // optimizer keeps stepping until a fully-converged inner solve lands
+            // a trustworthy (cost, gradient) pair. The bridge separately uncaps
+            // the inner solve when it detects a stuck stall, so subsequent solves
+            // do converge and the best-so-far tracks an honest iterate.
+            self.infeasible_streak = 0;
             self.no_improve_streak = 0;
             return CostStallVerdict::Continue;
         }
@@ -443,9 +478,19 @@ impl CostStallGuard {
         rho: &Array1<f64>,
         value: f64,
         grad_norm: f64,
+        inner_converged: bool,
     ) -> CostStallVerdict {
         if !value.is_finite() {
             return CostStallVerdict::Continue;
+        }
+        if !inner_converged {
+            // #1426: a separation-stationary probe whose inner PIRLS did not
+            // converge carries an untrustworthy (cost, gradient) pair. Adopting
+            // it as the certificate-bearing optimum would ship a half-fit. Route
+            // it through the ordinary finite-path observer, which (with
+            // `inner_converged = false`) refuses to record it as best and keeps
+            // the optimizer descending toward an honest, converged iterate.
+            return self.observe(rho, value, grad_norm, inner_converged);
         }
         // A lower-bound separation probe is the certificate-bearing optimum ONLY
         // when it does not REGRESS the best feasible iterate already seen. In the
@@ -469,7 +514,7 @@ impl CostStallGuard {
             // ordinary (non-improving) observation so `best_rho`/`best_grad_norm`
             // are preserved and the stall logic halts back to that incumbent
             // rather than to this corner.
-            return self.observe(rho, value, grad_norm);
+            return self.observe(rho, value, grad_norm, inner_converged);
         }
         self.infeasible_streak = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
@@ -991,6 +1036,14 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // outer gradient tolerance is a flat-valley floor (`converged = false`),
         // a stationary one is a real optimum (`converged = true`). Both share the
         // sentinel; the verdict rides on the published `CostStallExit.converged`.
+        // #1426: read the inner-PIRLS convergence flag for the solve THIS eval
+        // just ran (the feedback atomics are updated by `execute_pirls_if_needed`
+        // after each non-screening solve, so the snapshot now reflects this ρ).
+        // A non-converged inner solve makes the reported cost/gradient
+        // untrustworthy; the guard must not record it as best-so-far nor count it
+        // toward a stall. `None` (no feedback wired) defaults to `true` so routes
+        // without inner-cap feedback are unchanged.
+        let inner_converged = inner_solve_converged(self.outer_inner_cap.as_ref());
         if let Some(guard) = self.cost_stall.as_mut() {
             // The stall guard's stationarity test must use the bound-PROJECTED
             // gradient norm (KKT residual), not the raw `g_norm` above — a
@@ -1000,7 +1053,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             // `g_norm` is kept for the inner-cap schedule / logging.
             let projected_g_norm =
                 projected_gradient_norm(x, &gradient, self.cost_stall_bounds.as_ref());
-            match guard.observe(x, eval.cost, projected_g_norm) {
+            match guard.observe(x, eval.cost, projected_g_norm, inner_converged) {
                 CostStallVerdict::Continue => {}
                 CostStallVerdict::StuckKeepDescending { residual_grad_norm } => {
                     // #1426: cost flatlined but the projected gradient is far
@@ -1110,6 +1163,26 @@ pub(crate) const INNER_CAP_CEILING: usize = 64;
 /// floored at 3 (anything less is below noise) and ceilinged at 64
 /// (the inner noise floor at large scale; further iters would be
 /// pure waste).
+/// Did the inner PIRLS for the most recent non-screening outer eval converge?
+///
+/// Reads the inner-progress feedback snapshot the cap schedule already consumes.
+/// Returns the snapshot's `last_converged` flag, defaulting to `true` when there
+/// is no feedback wired (`feedback == None`) or no inner solve has reported yet
+/// (`snapshot() == None`, e.g. the very first outer eval). Defaulting to `true`
+/// keeps routes without inner-cap feedback — and the cold-start iterate — on
+/// their existing behavior; the #1426 guard only *withholds trust* from an
+/// iterate KNOWN to have a non-converged inner solve, it never invents distrust.
+///
+/// IMPORTANT: this must be read AFTER the outer eval has run (so the feedback
+/// atomics, set by `execute_pirls_if_needed` post-solve, describe the solve at
+/// the current ρ), and BEFORE the next eval's cap is computed.
+pub(crate) fn inner_solve_converged(feedback: Option<&InnerProgressFeedback>) -> bool {
+    match feedback.and_then(InnerProgressFeedback::snapshot) {
+        Some(snap) => snap.last_converged,
+        None => true,
+    }
+}
+
 pub(crate) fn first_order_inner_cap_schedule(
     iter_count: usize,
     g_ratio: Option<f64>,
@@ -1432,6 +1505,11 @@ impl OuterSecondOrderBridge<'_> {
                 guard.grad_threshold,
             ) >= LOWER_BOUND_SEPARATION_ACTIVE_MIN
         };
+        // #1426: inner-PIRLS convergence flag for the solve behind this eval (see
+        // the matching read in the first-order bridge). A non-converged inner
+        // solve at the λ→0 ridge reports a half-fit cost the guard must not adopt
+        // as best-so-far. `None` (no feedback) defaults to `true`.
+        let inner_converged = inner_solve_converged(self.outer_inner_cap.as_ref());
         let guard = self.cost_stall.as_mut()?;
         let projected_g_norm = projected_gradient_norm(x, &eval.gradient, bounds.as_ref());
         let verdict = if separation_bound_stationary {
@@ -1446,9 +1524,9 @@ impl OuterSecondOrderBridge<'_> {
             // ridge of #1426 — keeps that interior mass in ‖g_proj‖, so
             // `publish_stall` honestly returns FlatValleyStall / converged=false
             // instead of shipping the overfit silently behind a fake zero.
-            guard.observe_constrained_stationary(x, eval.cost, projected_g_norm)
+            guard.observe_constrained_stationary(x, eval.cost, projected_g_norm, inner_converged)
         } else {
-            guard.observe(x, eval.cost, projected_g_norm)
+            guard.observe(x, eval.cost, projected_g_norm, inner_converged)
         };
         match verdict {
             CostStallVerdict::Continue => None,

@@ -804,6 +804,105 @@ fn apply_global_smooth_identifiability(
                 }
             })
             .collect::<Vec<_>>();
+        // #1476-class fix (central, basis-agnostic): when a non-trivial GLOBAL
+        // identifiability/orthogonalization transform `z_opt` was applied above,
+        // it congruence-restricts EVERY penalty — including a Marra & Wood double-
+        // penalty null-space shrinkage ridge (`DoublePenaltyNullspace`). A merely-
+        // restricted ridge `Zᵀ (Z_null Z_nullᵀ) Z` is NOT the projector onto the
+        // null space of the *constrained* bending penalty `Zᵀ S_bend Z`: the
+        // sum-to-zero / parametric-orthogonalization `Z` is not norm-preserving and
+        // typically DROPS the constant direction, so the restricted ridge is
+        // neither idempotent nor aligned with `null(Zᵀ S_bend Z)` and shrinks
+        // penalized directions (the #1266/#1476 flat-collapse / EDF mis-allocation
+        // class). This is the single chokepoint every basis flows through, so
+        // rebuild the ridge here from the null space of the constrained `Primary`
+        // penalty, exactly as the 1-D B-spline / tensor / thin-plate paths do in
+        // their own local builds. (Idempotent with those local rebuilds: when no
+        // further `Primary`-null directions survive, the rebuilt ridge equals the
+        // local one; when this global `Z` removes more, only this rebuild is
+        // correct.) Scoped to `coefficient_gauge.is_some()`: with no global
+        // transform the penalties are untouched and the basis-local ridge already
+        // lives in the fit chart.
+        let mut penalty_candidates = penalty_candidates;
+        if coefficient_gauge.is_some()
+            && penalty_candidates
+                .iter()
+                .any(|c| matches!(c.source, PenaltySource::DoublePenaltyNullspace))
+        {
+            // Nonzero-row support of a (symmetric) penalty matrix: the coefficient
+            // range it actually penalizes. A per-level `by=factor` smooth emits one
+            // `Primary`+`DoublePenaltyNullspace` pair PER LEVEL, each confined to
+            // that level's disjoint `[off..off+p]` diagonal block (#1427), so a
+            // ridge must be rebuilt from the Primary sharing ITS support — not the
+            // first global Primary, and not the summed bending (which would collapse
+            // the independent per-level λ). For a single smooth term there is one
+            // Primary spanning the whole block and this reduces to the simple case.
+            const SUPPORT_TOL: f64 = 0.0;
+            let support_rows = |m: &Array2<f64>| -> (usize, usize) {
+                let n = m.nrows();
+                let mut lo = n;
+                let mut hi = 0usize;
+                for i in 0..n {
+                    let any = (0..m.ncols()).any(|j| m[[i, j]].abs() > SUPPORT_TOL);
+                    if any {
+                        lo = lo.min(i);
+                        hi = hi.max(i + 1);
+                    }
+                }
+                (lo, hi)
+            };
+            // Snapshot each Primary's support + a clone of its matrix (immutable
+            // borrow released before we mutate the ridges below).
+            let primaries: Vec<((usize, usize), Array2<f64>)> = penalty_candidates
+                .iter()
+                .filter(|c| matches!(c.source, PenaltySource::Primary))
+                .map(|c| (support_rows(&c.matrix), c.matrix.clone()))
+                .collect();
+            for candidate in &mut penalty_candidates {
+                if !matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
+                    continue;
+                }
+                let q = candidate.matrix.nrows();
+                let (rlo, rhi) = support_rows(&candidate.matrix);
+                // The Primary whose support CONTAINS this ridge's support (the
+                // co-located bending block). Falls back to the unique Primary when
+                // the ridge is (numerically) empty.
+                let owner = primaries
+                    .iter()
+                    .find(|((plo, phi), _)| *plo <= rlo && rhi <= *phi)
+                    .or_else(|| (primaries.len() == 1).then(|| &primaries[0]));
+                let Some(((plo, phi), s_full)) = owner else {
+                    // No co-located Primary (shouldn't happen for a well-formed
+                    // double-penalty term): leave the restricted ridge as-is.
+                    continue;
+                };
+                // Rebuild from the Primary's OWN block submatrix so the resulting
+                // projector spans only that block's null space, then embed back
+                // into the term-local `q×q` frame at the same offset.
+                let block = s_full.slice(s![*plo..*phi, *plo..*phi]).to_owned();
+                let rebuilt_block = crate::terms::basis::build_nullspace_shrinkage_penalty(&block)?
+                    .map(|shrink| shrink.sym_penalty);
+                match rebuilt_block {
+                    Some(ridge_block) => {
+                        let mut full = Array2::<f64>::zeros((q, q));
+                        full.slice_mut(s![*plo..*phi, *plo..*phi]).assign(&ridge_block);
+                        let (matrix, scale) = normalize_penalty_in_constrained_space(&full);
+                        candidate.matrix = matrix;
+                        candidate.normalization_scale = scale;
+                        candidate.kronecker_factors = None;
+                        candidate.op = None;
+                    }
+                    // Constrained bending block is full rank: no null space to
+                    // shrink. Zero the ridge; the filter drops it.
+                    None => {
+                        candidate.matrix = Array2::<f64>::zeros((q, q));
+                        candidate.normalization_scale = 1.0;
+                        candidate.kronecker_factors = None;
+                        candidate.op = None;
+                    }
+                }
+            }
+        }
         let (penalties_constrained, nullspace_constrained, penaltyinfo_constrained) =
             filter_active_penalty_candidates(penalty_candidates)?;
         let linear_constraints_constrained =
@@ -4392,29 +4491,48 @@ fn relax_smoothing_rho_prior(
     // relaxable coordinates stay byte-flat (`Flat`) so a clean `n > p` fit is
     // unchanged (no regression on ordinary smooth recovery).
     //
-    // WELL-DETERMINED CONCURVITY (#1476). This select-out PC prior is applied to
-    // the `DoublePenaltyNullspace` coordinate in BOTH determinacy regimes — the
-    // well-determined regime too, NOT only `p > n`. Leaving the well-determined
-    // Gaussian null-space coordinate fully `Flat` is the concurvity collapse:
-    // under two correlated smooths `s(x1)+s(x2)` (corr ≈ 0.9) the two smooths'
-    // null-space (linear) directions are near-collinear, so the joint REML
-    // objective is essentially FLAT along the "transfer the shared linear signal
-    // between the two smooths" ridge. With no prior curvature on that coordinate
-    // REML cannot certify an interior stationary point and one smooth's
-    // `λ_nullspace` rails to the ρ bound (≈1e13), annihilating that smooth's
-    // genuine linear signal to `EDF ≈ 0` while the other absorbs it. The PC
-    // wall's strictly-positive curvature `(θ/4) e^{-ρ/2}` pins the coordinate at
-    // a FINITE stationary ρ, RETAINING a signal-bearing collinear null space.
-    // This does NOT re-introduce the #1266/#1271 inflation: the PC pull is in the
-    // SAME (+, shrink-out) direction REML already moves a genuinely-unsupported
-    // null space, so an irrelevant covariate still selects out (`EDF < 1`); the
-    // wall only stops the runaway collapse of a SUPPORTED one. The RANGE-space
-    // (`Primary`) bending coordinate is untouched (stays `Flat` when
-    // well-determined), so ordinary single-smooth recovery is unchanged.
+    // The strong select-out PC prior is applied to the `DoublePenaltyNullspace`
+    // coordinate ONLY in the UNDER-DETERMINED regime, where the outer score is
+    // genuinely flat on the select-out side and REML needs the active push. In the
+    // WELL-DETERMINED regime the null space gets the wide
+    // `nullspace_degeneracy_prior` instead (see below) — an active select-out mode
+    // there would over-shrink a genuinely-supported collinear null space (#1476).
+    // The RANGE-space (`Primary`) bending coordinate is untouched (stays `Flat`
+    // when well-determined), so ordinary single-smooth recovery is unchanged.
     //
     let nullspace_select_prior = crate::types::RhoPrior::PenalizedComplexity {
         upper: NULLSPACE_SELECT_PC_UPPER,
         tail_prob: NULLSPACE_SELECT_PC_TAIL_PROB,
+    };
+    // WELL-DETERMINED NULL-SPACE DEGENERACY BREAKER (#1476). When the fit is
+    // well-determined (`n ≥ 2·p`) the strong `nullspace_select_prior` above is the
+    // WRONG tool for the Gaussian null-space coordinate: its finite well-penalized
+    // mode at `λ* = θ² ≈ 8483` is an aggressive select-OUT pull that drags a
+    // GENUINELY-SUPPORTED null space (a real linear/constant component) toward
+    // collapse — the #1476 over-shrink. But leaving the coordinate fully `Flat`
+    // (the previous well-determined behaviour) is the OTHER failure: under
+    // concurvity (`s(x1)+s(x2)`, corr ≈ 0.9) the two smooths' null-space (linear)
+    // directions are near-collinear, so the joint REML objective is essentially
+    // FLAT along the "transfer the shared linear signal between the two smooths"
+    // ridge; with zero curvature on that coordinate REML cannot certify an
+    // interior stationary point and one smooth's `λ_nullspace` rails to the ρ
+    // bound (≈1e13), annihilating its genuine linear signal to `EDF ≈ 0` while the
+    // other absorbs it. The principled fix is NEITHER a select-out mode NOR a
+    // flat coordinate: it is a WIDE, weakly-informative symmetric Gaussian that
+    // contributes strictly-positive termination curvature `1/sd²` (breaking the
+    // concurvity flat-ridge degeneracy so REML lands an interior allocation) while
+    // its gradient `ρ/sd²` at any plausible optimum is negligible — so REML, not
+    // the prior, chooses how the shared linear signal is split. This adds no
+    // directional select-out bias, so it does NOT over-shrink a supported null
+    // space (#1476); a genuinely-UNSUPPORTED null space is still selected out
+    // because REML's own score drives its `λ` up and the weak symmetric pull
+    // barely opposes it (#1266 irrelevant-covariate shrinkage, #1371 single-smooth
+    // recovery preserved). The strong PC select-out remains in the
+    // UNDER-DETERMINED regime, where the score IS flat on the select-out side and
+    // REML needs the active push (#1392 wine `p > n`).
+    let nullspace_degeneracy_prior = crate::types::RhoPrior::Normal {
+        mean: 0.0,
+        sd: NULLSPACE_WELLDET_DEGENERACY_RHO_SD,
     };
     let per_coord = coords
         .iter()
@@ -4451,8 +4569,23 @@ fn relax_smoothing_rho_prior(
                 } else {
                     relaxed_prior.clone()
                 }
-            } else if underdetermined && is_nullspace {
-                nullspace_select_prior.clone()
+            } else if is_nullspace {
+                // Gaussian-identity double-penalty null-space selection ridge.
+                // UNDER-DETERMINED (`p > n`, #1392 wine): the outer score is flat
+                // on the select-out side, so REML stalls the null space "kept" at
+                // λ ≈ 0.11 and the EDF rails up — the active PC select-out push is
+                // required to move it out. WELL-DETERMINED (#1476 concurvity): the
+                // score is NOT flat, so an active select-out mode would over-shrink
+                // a genuinely-supported (collinear) null space; instead supply only
+                // the wide, weakly-informative termination curvature that breaks
+                // the concurvity flat-ridge degeneracy and lets REML allocate the
+                // shared linear signal. (#1266 select-out of a truly-unsupported
+                // null still holds — REML's own score drives its λ up.)
+                if underdetermined {
+                    nullspace_select_prior.clone()
+                } else {
+                    nullspace_degeneracy_prior.clone()
+                }
             } else {
                 relaxed_prior.clone()
             }
@@ -4474,6 +4607,25 @@ fn relax_smoothing_rho_prior(
 /// #1392 under-smoothing drag; widening it further weakens termination
 /// curvature without further benefit.
 const RELAX_UNDERDETERMINED_RHO_SD: f64 = 15.0;
+
+/// Standard deviation of the wide, weakly-informative symmetric `Normal` prior
+/// placed on a relaxable double-penalty smooth's `DoublePenaltyNullspace`
+/// selection coordinate when the fit is WELL-determined (`n ≥ 2·p`); see
+/// [`relax_smoothing_rho_prior`].
+///
+/// In the well-determined regime the null-space coordinate must be NEITHER the
+/// strong select-out PC prior (its finite mode `λ* ≈ 8483` over-shrinks a
+/// genuinely-supported collinear null space — the #1476 over-shrink) NOR fully
+/// `Flat` (under concurvity the shared-linear ridge is degenerate, and zero
+/// curvature lets one smooth's `λ_nullspace` rail to ≈1e13, collapsing it to
+/// `EDF ≈ 0`). A wide symmetric Gaussian threads both: like
+/// [`RELAX_UNDERDETERMINED_RHO_SD`] it contributes strictly-positive curvature
+/// `1/sd²` that breaks the concurvity flat-ridge degeneracy (so REML certifies an
+/// interior, signal-preserving allocation) while its gradient `ρ/sd²` at any
+/// plausible optimum is negligible — adding NO select-out bias, so a supported
+/// null space is left for REML to size. The same `sd = 15` calibration applies:
+/// ±2σ spans the feasible ρ range (`|ρ| ≤ 30`).
+const NULLSPACE_WELLDET_DEGENERACY_RHO_SD: f64 = 15.0;
 
 /// Distance-scale bound `upper` (`P(d > upper) = tail_prob` on the marginal-SD
 /// scale `d = exp(-ρ/2)`) of the penalized-complexity prior placed on a

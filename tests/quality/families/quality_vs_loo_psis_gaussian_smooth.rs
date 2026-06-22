@@ -200,9 +200,19 @@ fn gam_alo_is_honest_loo_predictive_error_on_lidar() {
     // The exact LOO predictor varies over a range `loo_spread`. ALO is a
     // single-fit analytic approximation to that n-refit object; on a smooth
     // Gaussian benchmark it must reproduce it to a small fraction of its spread.
+    // This floor only guarantees the spread is non-trivial so the relative
+    // 2%-of-spread recovery bar below is meaningful (not vacuous on a flat
+    // predictor). The earlier `> 1.0` floor was a mis-stated O(1) assumption
+    // about the data scale: the lidar logratio response lives on ~[-1, 0.2], so
+    // its leave-one-out predictor intrinsically spans ≈0.69, not >1.0 — gam's
+    // ALO reproduces that exact LOO object to ~0.26% of the spread (well inside
+    // the 2% bar), so the only thing the `> 1.0` floor rejected was lidar's true
+    // scale. Floor it to a value that still excludes a degenerate near-flat
+    // predictor while matching the benchmark's actual range.
     assert!(
-        loo_spread > 1.0,
-        "exact-LOO predictor should span O(1+): spread={loo_spread:.5}"
+        loo_spread > 0.3,
+        "exact-LOO predictor span too small for a meaningful recovery test: \
+         spread={loo_spread:.5}"
     );
     assert!(
         eta_tilde_vs_exact_rmse < 0.02 * loo_spread,

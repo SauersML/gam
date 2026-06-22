@@ -68,7 +68,19 @@ fn make_csv(seed: u64) -> std::path::PathBuf {
     path
 }
 
+// #[ignore]: this is a #1271 DIAGNOSTIC probe, not a quality gate. It panics
+// UNCONDITIONALLY (the panic message IS the captured `[#1271-diag]` trace —
+// see the module header) so that nextest surfaces the dump even without
+// `--nocapture`. Left un-ignored it therefore counts as a permanent
+// METRIC_OFF "failure" in the gating reference-quality suite while asserting
+// NOTHING about gam's accuracy — a false-failure that inflates the gating
+// bucket by one and measures no quality bound. `#[ignore]` keeps the probe
+// fully available on demand (`cargo test --ignored --nocapture
+// diag_1271_dump_reml_logdet_internals` still dumps the trace) but removes it
+// from the gated set: the suite harness lists it but the per-test run skips it
+// (rc=0 → PASS), so no real quality assertion is touched or weakened.
 #[test]
+#[ignore = "diagnostic dump (panics by design to surface the #1271-diag trace); not a quality gate — run with --ignored to see the dump"]
 fn diag_1271_dump_reml_logdet_internals() {
     init_parallelism();
 

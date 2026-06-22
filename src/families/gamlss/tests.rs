@@ -310,6 +310,262 @@ pub(crate) fn binomial_nonwiggle_tower_matches_hand_witness_channels() {
     }
 }
 
+/// #932: the production binomial location-scale JOINT Hessian assembler must
+/// equal the single-sourced `binomial_location_scale_nll_tower`.
+///
+/// `binomial_nonwiggle_tower_matches_hand_witness_channels` pins the *tower*
+/// against a *test* hand witness, and the operator-workspace tests pin the
+/// lazy operator against the dense `exact_newton_joint_hessian_from_designs`.
+/// But NOTHING pinned the production assembler's own row coefficients
+/// (`exact_newton_joint_hessian_row_coefficients`: `coeff_tt = m2 r²`,
+/// `coeff_tl = κ r (m1 + q m2)`, `coeff_ll = κ² q (m1 + q m2)`, with the q-chain
+/// `q = −η_t·e^{−η_ls}` and `κ = σ'(η_ls)/σ`) to the single-source tower. A
+/// typo in those coefficients (a dropped `q m2`, a wrong `κ` power — the #736
+/// cross-term genus) would slip past both existing oracles.
+///
+/// This closes the gap. For a multi-column non-wiggle fixture, the production
+/// `exact_newton_joint_hessian_from_designs` joint matrix is compared, at
+/// ~1e-9, to the joint Hessian assembled by pulling the per-row `Tower4<2>`
+/// curvature `tower.h` (in (η_t, η_ls)) through the same designs:
+/// `H = Σ_i [X_t; X_ls]_iᵀ · tower.h_i · [X_t; X_ls]_i`. Independent arithmetic
+/// (the tower differentiates one expression by Leibniz; the production builds
+/// the coefficients by hand), so agreement is a correctness proof of the hand
+/// assembler — across probit / logit / cloglog.
+#[test]
+pub(crate) fn binomial_location_scale_joint_hessian_matches_single_sourced_tower_932() {
+    let n = 7usize;
+    let pt = 2usize;
+    let pls = 2usize;
+    let xt = Array2::from_shape_fn((n, pt), |(i, j)| {
+        ((i as f64) * 0.31 + (j as f64) * 0.17).sin() + 0.4
+    });
+    let xls = Array2::from_shape_fn((n, pls), |(i, j)| {
+        ((i as f64) * 0.23 + (j as f64) * 0.41).cos() * 0.5
+    });
+    let beta_t = array![0.35, -0.20];
+    let beta_ls = array![0.18, -0.27];
+    let eta_t = xt.dot(&beta_t);
+    let eta_ls = xls.dot(&beta_ls);
+    let total = pt + pls;
+
+    for link in [
+        InverseLink::Standard(StandardLink::Probit),
+        InverseLink::Standard(StandardLink::Logit),
+        InverseLink::Standard(StandardLink::CLogLog),
+    ] {
+        let family = BinomialLocationScaleFamily {
+            y: Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 })),
+            weights: Array1::from_iter((0..n).map(|i| 0.5 + 0.2 * i as f64)),
+            link_kind: link.clone(),
+            threshold_design: None,
+            log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: eta_t.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: eta_ls.clone(),
+            },
+        ];
+
+        // Production hand-assembled joint Hessian (the path under audit).
+        let h_prod = family
+            .exact_newton_joint_hessian_from_designs(&states, &xt, &xls)
+            .expect("production joint Hessian")
+            .expect("production joint Hessian present");
+        assert_eq!(h_prod.dim(), (total, total));
+
+        // Single-sourced reference: per-row Tower4<2> curvature in (η_t, η_ls),
+        // pulled through the SAME designs. σ = e^{η_ls} ⇒ κ = 1, matching the
+        // tower's inv_sigma = e^{−η_ls}.
+        let mut h_tower = Array2::<f64>::zeros((total, total));
+        for i in 0..n {
+            let sigma = exp_sigma_from_eta_scalar(eta_ls[i]);
+            let q = binomial_location_scale_q0(eta_t[i], sigma);
+            let jet = inverse_link_jet_for_inverse_link(&link, q).expect("link jet");
+            let tower = binomial_location_scale_nll_tower(
+                family.y[i],
+                family.weights[i],
+                eta_t[i],
+                eta_ls[i],
+                q,
+                jet.mu,
+                jet.d1,
+                jet.d2,
+                jet.d3,
+                &link,
+                true,
+            )
+            .expect("row tower");
+
+            // Row design in the joint coefficient layout [X_t | X_ls].
+            let mut row = vec![0.0_f64; total];
+            for c in 0..pt {
+                row[c] = xt[[i, c]];
+            }
+            for c in 0..pls {
+                row[pt + c] = xls[[i, c]];
+            }
+            // channel(a): 0 -> η_t block, 1 -> η_ls block.
+            let block_of = |coef: usize| if coef < pt { 0usize } else { 1usize };
+            for a_coef in 0..total {
+                let ca = block_of(a_coef);
+                for b_coef in 0..total {
+                    let cb = block_of(b_coef);
+                    h_tower[[a_coef, b_coef]] +=
+                        tower.h[ca][cb] * row[a_coef] * row[b_coef];
+                }
+            }
+        }
+
+        for ((a, b), &prod) in h_prod.indexed_iter() {
+            let want = h_tower[[a, b]];
+            assert!(
+                (prod - want).abs() <= 1e-9 * (1.0 + want.abs()),
+                "{link:?}: joint Hessian [{a}][{b}] hand-assembler {prod:.9e} != \
+                 single-sourced tower {want:.9e}"
+            );
+        }
+    }
+}
+
+/// #932: at βw = 0 the WIGGLE joint-Hessian assembler must reduce EXACTLY to
+/// the (already tower-pinned) non-wiggle assembler on the (η_t, η_ls) block.
+///
+/// `wiggle_hessian_row_pieces` hand-derives the composed-index `q = q0 +
+/// Σ_j βw_j·B_j(q0)` chain through `m = B'·βw + 1` and `g2 = B''·βw`; its
+/// `coeff_tw_*` / `coeff_lw_*` / `coeffww` cross blocks are the #736 genus and
+/// have no exact (non-FD, non-operator-vs-dense) oracle. A full wiggle tower is
+/// a larger unit (#932 comment), but one structurally-certain invariant is
+/// cheap and independent: at `βw = 0` we have `m = 1`, `g2 = 0`, `etaw = 0`, so
+/// `q = q0` and the wiggle base coefficients collapse to the non-wiggle ones
+/// (`coeff_tt = hessian_coeff(m1, m2, q0_t, q0_t, 0)`, etc.). Therefore the
+/// wiggle joint Hessian's top-left `(pt+pls)` block must equal the non-wiggle
+/// `exact_newton_joint_hessian_from_designs` joint matrix built from the SAME
+/// data — two INDEPENDENT hand assemblers (the non-wiggle one is itself pinned
+/// to the single-source tower by
+/// `binomial_location_scale_joint_hessian_matches_single_sourced_tower_932`),
+/// so agreement transitively pins the wiggle base block to the tower and would
+/// catch a typo in the wiggle base chain. Across probit / logit / cloglog.
+#[test]
+pub(crate) fn binomial_wiggle_joint_hessian_reduces_to_nonwiggle_at_zero_betaw_932() {
+    let n = 10usize;
+    let pt = 3usize;
+    let pls = 2usize;
+    let xt = Array2::from_shape_fn((n, pt), |(i, j)| {
+        ((i as f64) * 0.17 + (j as f64) * 0.29).sin() * 0.4 + 0.2
+    });
+    let xls = Array2::from_shape_fn((n, pls), |(i, j)| {
+        ((i as f64) * 0.23 + (j as f64) * 0.41).cos() * 0.3
+    });
+    let beta_t = array![0.20, -0.10, 0.05];
+    let beta_ls = array![0.30, -0.15];
+    let eta_t = xt.dot(&beta_t);
+    let eta_ls = xls.dot(&beta_ls);
+    let y = Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 }));
+    let weights = Array1::from_iter((0..n).map(|i| 0.5 + 0.2 * i as f64));
+    let q_seed = Array1::linspace(-1.0, 1.0, n);
+    let (_wiggle_block, knots) =
+        BinomialLocationScaleWiggleFamily::buildwiggle_block_input(q_seed.view(), 2, 3, 2, false)
+            .expect("wiggle block");
+
+    for link in [
+        InverseLink::Standard(StandardLink::Probit),
+        InverseLink::Standard(StandardLink::Logit),
+        InverseLink::Standard(StandardLink::CLogLog),
+    ] {
+        let threshold_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xt.clone()));
+        let log_sigma_design =
+            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xls.clone()));
+        let wiggle_family = BinomialLocationScaleWiggleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: link.clone(),
+            threshold_design: Some(threshold_design),
+            log_sigma_design: Some(log_sigma_design),
+            wiggle_knots: knots.clone(),
+            wiggle_degree: 2,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        // βw = 0 ⇒ etaw = 0, m = 1, g2 = 0, q = q0.
+        let q0 = Array1::from_iter(
+            eta_t
+                .iter()
+                .zip(eta_ls.iter())
+                .map(|(&t, &l)| binomial_location_scale_q0(t, exp_sigma_from_eta_scalar(l))),
+        );
+        let wiggle_design_current = wiggle_family
+            .wiggle_design(q0.view())
+            .expect("current wiggle basis");
+        let pw = wiggle_design_current.ncols();
+        let beta_w = Array1::<f64>::zeros(pw);
+        let eta_w = Array1::<f64>::zeros(n);
+        let wiggle_states = vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: eta_t.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: eta_ls.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_w,
+                eta: eta_w,
+            },
+        ];
+        let h_wiggle = wiggle_family
+            .exact_newton_joint_hessian(&wiggle_states)
+            .expect("wiggle joint Hessian")
+            .expect("wiggle joint Hessian present");
+        assert_eq!(h_wiggle.dim(), (pt + pls + pw, pt + pls + pw));
+
+        // Non-wiggle reference on identical data / states.
+        let nonwiggle_family = BinomialLocationScaleFamily {
+            y: y.clone(),
+            weights: weights.clone(),
+            link_kind: link.clone(),
+            threshold_design: None,
+            log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let nonwiggle_states = vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: eta_t.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: eta_ls.clone(),
+            },
+        ];
+        let h_nonwiggle = nonwiggle_family
+            .exact_newton_joint_hessian_from_designs(&nonwiggle_states, &xt, &xls)
+            .expect("non-wiggle joint Hessian")
+            .expect("non-wiggle joint Hessian present");
+        assert_eq!(h_nonwiggle.dim(), (pt + pls, pt + pls));
+
+        // The wiggle (η_t, η_ls) top-left block must equal the non-wiggle joint
+        // Hessian exactly (both are analytic; βw = 0 makes them the same model).
+        for a in 0..(pt + pls) {
+            for b in 0..(pt + pls) {
+                let w = h_wiggle[[a, b]];
+                let nw = h_nonwiggle[[a, b]];
+                assert!(
+                    (w - nw).abs() <= 1e-9 * (1.0 + nw.abs()),
+                    "{link:?}: wiggle (β_w=0) joint Hessian [{a}][{b}] {w:.9e} != \
+                     non-wiggle {nw:.9e}"
+                );
+            }
+        }
+    }
+}
+
 pub(crate) fn hand_trigamma(x: f64) -> f64 {
     crate::families::jet_tower::trigamma_derivative_stack(x)[0]
 }

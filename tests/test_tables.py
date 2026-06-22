@@ -174,6 +174,52 @@ def test_categorical_dtype_columns_records_numeric_string_is_categorical() -> No
     assert "g" in categorical, f"records numeric-string must be categorical: {categorical}"
 
 
+# A MIXED string+numeric column is `object` dtype in pandas (→ categorical). The
+# untyped (dict/records/numpy) value-inference must agree, or it is the same
+# typed-vs-untyped parity gap as #1467/#1468/#1469 one boundary further out: the
+# old "every non-null value must be str" rule saw the numeric and lowered the
+# whole column to a NUMERIC covariate, dropping the string levels.
+def test_categorical_dtype_columns_dict_mixed_string_numeric_is_categorical() -> None:
+    from gamfit._tables import categorical_dtype_columns, table_columns
+
+    data = {"g": ["a", 1, "b", 2], "y": [1.0, 2.0, 3.0, 4.0]}
+    columns, kind = table_columns(data)
+    categorical = categorical_dtype_columns(data, kind, columns=columns)
+    assert "g" in categorical, (
+        f"a mixed string+numeric column is object-dtype in pandas and must be "
+        f"categorical (not lowered to a numeric covariate): {categorical}"
+    )
+    assert "y" not in categorical, f"pure float column must stay numeric: {categorical}"
+
+
+def test_categorical_dtype_columns_dict_numeric_with_one_string_is_categorical() -> None:
+    # The dual: a numeric column with a single stray string ("NA") is object in
+    # pandas (→ categorical); it must NOT be silently treated as numeric (which
+    # would make Rust fail to parse "NA" or mis-encode it).
+    from gamfit._tables import categorical_dtype_columns, table_columns
+
+    data = {"v": [1.0, 2.0, "NA", 4.0]}
+    columns, kind = table_columns(data)
+    categorical = categorical_dtype_columns(data, kind, columns=columns)
+    assert "v" in categorical, (
+        f"a numeric column carrying a non-numeric string is object-dtype in "
+        f"pandas and must be categorical: {categorical}"
+    )
+
+
+def test_categorical_dtype_columns_pure_bool_stays_numeric_but_bool_str_is_categorical() -> None:
+    # `bool` is not a `str`: a pure-bool column is `bool` dtype in pandas (numeric);
+    # a bool+str mix is `object` (categorical). Pins both halves so the string
+    # rule does not accidentally sweep in pure-bool columns.
+    from gamfit._tables import categorical_dtype_columns, table_columns
+
+    data = {"flag": [True, False, True], "mixed": [True, "yes", False]}
+    columns, kind = table_columns(data)
+    categorical = categorical_dtype_columns(data, kind, columns=columns)
+    assert "flag" not in categorical, f"pure-bool column must stay numeric: {categorical}"
+    assert "mixed" in categorical, f"bool+str column is object-dtype → categorical: {categorical}"
+
+
 def test_categorical_dtype_columns_pandas_numeric_string_still_categorical() -> None:
     pd = pytest.importorskip("pandas")
     from gamfit._tables import categorical_dtype_columns, table_columns

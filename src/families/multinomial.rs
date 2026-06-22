@@ -1665,7 +1665,46 @@ pub fn fit_penalized_multinomial_formula(
         .iter()
         .flat_map(|b| b.lambdas.iter().copied())
         .collect();
-    let edf_per_class = fit.inference.as_ref().map(|info| info.edf_by_block.clone());
+    // Per-active-class effective degrees of freedom, length `K-1`, summing to
+    // the model `edf_total`. The REML inference block reports `edf_by_block` as
+    // ONE entry per *penalty block* (per (class, term, penalty)), each computed
+    // as `rank(S_kk) − tr(H⁻¹ λ_kk S_kk)`. That per-block sum OVER-COUNTS the
+    // model EDF whenever several penalties share one coefficient range — a
+    // double-penalty / te / ti / adaptive smooth has ≥2 penalty blocks over the
+    // same columns, so `Σ_kk rank(S_kk) > p` and `Σ_kk edf_by_block > edf_total`
+    // (the observed ~79 for a ~24-coefficient model). Handing that raw per-block
+    // vector out as the documented length-(K-1) per-class EDF is therefore both
+    // the wrong LENGTH (it is `Σ_a n_blocks_a`, not `K-1`) and an over-count.
+    //
+    // The honest per-class EDF is the influence-matrix trace over each class's
+    // coefficient block. Classes occupy DISJOINT `p_per_class`-wide coefficient
+    // ranges, and the per-block traces `tr_kk = tr(H⁻¹ λ_kk S_kk)` are additive
+    // (no rank double-counting), so class `a`'s EDF is
+    // `p_per_class − Σ_{kk ∈ class a} tr_kk`, and `Σ_a edf_a = m·p_per_class −
+    // Σ_kk tr_kk = p − Σ tr_kk = edf_total` exactly. Segment the block-major
+    // `penalty_block_trace` by `lambdas_per_block` (the same per-class λ-count
+    // segmentation `lambdas_flat` uses). Fall back to `None` when the trace
+    // channel is unavailable or mis-shaped (legacy fixed-λ path), exactly as the
+    // raw `edf_by_block` map did before.
+    let edf_per_class = fit.inference.as_ref().and_then(|info| {
+        let traces = &info.penalty_block_trace;
+        if traces.len() != lambdas_per_block.iter().sum::<usize>() {
+            // Trace channel absent or not aligned with the per-class block
+            // segmentation — cannot assemble an honest per-class EDF.
+            return None;
+        }
+        let mut per_class = Vec::with_capacity(m);
+        let mut cursor = 0usize;
+        for &n_blocks in &lambdas_per_block {
+            let class_trace: f64 = traces[cursor..cursor + n_blocks].iter().sum();
+            // `tr(F)` over a class block ∈ [0, p_per_class]; clamp away
+            // round-off so a reported EDF can never be negative or exceed the
+            // class's own coefficient count.
+            per_class.push((p_per_class as f64 - class_trace).clamp(0.0, p_per_class as f64));
+            cursor += n_blocks;
+        }
+        Some(per_class)
+    });
     let coefficients_flat: Vec<f64> = coefficients_active.iter().copied().collect();
 
     // #1101: surface the joint Laplace posterior covariance `H⁻¹` (block-ordered

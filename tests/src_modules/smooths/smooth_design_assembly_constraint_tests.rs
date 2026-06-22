@@ -956,7 +956,7 @@ fn build_smooth_design_auto_promotes_thin_plate_below_canonical_polynomial_dimen
     assert!(
         matches!(metadata, BasisMetadata::Duchon { .. }),
         "expected Duchon metadata after auto-promotion, got {metadata:?}"
-    , e));
+    );
 }
 
 #[test]
@@ -1011,16 +1011,16 @@ fn freeze_term_collection_handles_thin_plate_auto_promotion_to_duchon() {
         .smooth
         .terms
         .first()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "at least one smooth term")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "at least one smooth term", e))
         .metadata;
     assert!(
         matches!(metadata, BasisMetadata::Duchon { .. }),
         "expected auto-promotion to Duchon, got {metadata:?}"
-    , e));
+    );
 
     let frozen = freeze_term_collection_from_design(&spec, &fit_design).unwrap_or_else(|e| panic!("{} failed: {:?}", 
         "freeze must succeed across the auto-promoted (ThinPlate spec, Duchon metadata) pair",
-    , e));
+    );
     assert!(
         matches!(frozen.smooth_terms[0].basis, SmoothBasisSpec::Duchon { .. }),
         "frozen spec should reflect the auto-promotion as a Duchon variant"
@@ -2024,7 +2024,7 @@ fn spatial_frozen_transform_rebuild_is_exact_on_trainingrows() {
             joint_null_rotation: None,
         }],
     };
-    let frozen_design = build_term_collection_design(data.view(), &frozenspec).unwrap(, e));
+    let frozen_design = build_term_collection_design(data.view(), &frozenspec).unwrap();
 
     assert_eq!(
         fit_design.smooth.term_designs.len(),
@@ -3190,7 +3190,7 @@ fn run_two_block_exact_joint_optimize(
 #[test]
 fn exact_joint_two_block_spatial_length_scale_freezes_matern_centers() {
     let n = 40usize;
-    let mut data = Array2::<f64>::zeros((n, 2), e));
+    let mut data = Array2::<f64>::zeros((n, 2));
     for i in 0..n {
         let x0 = i as f64 / (n as f64 - 1.0);
         let x1 = (i as f64 * 0.21).sin();
@@ -3394,8 +3394,8 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
             cache.design(),
             &cache.spatial_terms,
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper dirs build")
-        .expect("hyper dirs present", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper dirs build", e))
+        .expect("hyper dirs present");
         evaluate_joint_reml_outer_eval_at_theta(
             evaluator,
             cache.design(),
@@ -3406,7 +3406,7 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
             order,
             None,
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "outer eval")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "outer eval", e))
     };
 
     let (_, gradient, hessian_result) = eval_at(
@@ -3414,11 +3414,11 @@ fn spatial_aniso_joint_exact_hessian_materializes_small_case() {
         &mut cache,
         &mut evaluator,
         crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
-    , e));
+    );
     let hessian = hessian_result
         .materialize_dense()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "hessian materializes")
-        .expect("hessian present", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "hessian materializes", e))
+        .expect("hessian present");
     assert_eq!(hessian.nrows(), theta.len());
     assert_eq!(hessian.ncols(), theta.len());
     assert!(hessian.iter().all(|value| value.is_finite()));
@@ -3596,22 +3596,22 @@ fn iso_kappa_fd_variant_driver(
                 "iso-κ variant FD cost-only",
                 None,
             )
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "cost-only eval")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "cost-only eval", e))
     };
 
     let analytic_at = |theta: &Array1<f64>,
                        cache: &mut SingleBlockExactJointDesignCache<'_>,
                        evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>|
      -> (f64, Array1<f64>) {
-        cache.ensure_theta(theta).expect("ensure_theta", e));
+        cache.ensure_theta(theta).expect("ensure_theta");
         let hyper_dirs = try_build_spatial_log_kappa_hyper_dirs(
             data.view(),
             cache.spec(),
             cache.design(),
             &cache.spatial_terms,
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper dirs build")
-        .expect("hyper dirs present", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper dirs build", e))
+        .expect("hyper dirs present");
         let (cost, grad, _hess) = evaluate_joint_reml_outer_eval_at_theta(
             evaluator,
             cache.design(),
@@ -3882,10 +3882,10 @@ fn exact_spatial_joint_engine_aniso_iso_parity_1d() {
                 "exact joint spatial optimization did not converge (final_value={final_value})"
             ),
         })
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "exact joint spatial optimization")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "exact joint spatial optimization", e))
     };
 
-    let (theta_aniso, value_aniso) = run(SpatialHyperKind::Anisotropic, e));
+    let (theta_aniso, value_aniso) = run(SpatialHyperKind::Anisotropic);
     let (theta_iso, value_iso) = run(SpatialHyperKind::Isotropic);
 
     assert_eq!(
@@ -4052,9 +4052,9 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
             rho_dim,
             dims_per_term.clone(),
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "design cache")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "design cache", e))
     };
-    let external_opts = external_opts_for_design(&family, &frozen_design, &fit_opts, e));
+    let external_opts = external_opts_for_design(&family, &frozen_design, &fit_opts);
 
     let mut streamed_eval = crate::estimate::ExternalJointHyperEvaluator::new(
         y.view(),
@@ -4146,8 +4146,8 @@ fn psi_gram_tensor_lane_matches_streamed_reml_cost_and_gradient() {
             cache.design(),
             &spatial_terms,
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper_dirs build")
-        .expect("hyper_dirs present", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper_dirs build", e))
+        .expect("hyper_dirs present");
         let design_revision = Some(cache.design_revision());
         let order = if with_hessian {
             OuterEvalOrder::ValueGradientHessian
@@ -4404,7 +4404,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
             &external_opts,
             "e2e_kappa_optimum",
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluator")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluator", e))
     };
     let make_cache = || {
         SingleBlockExactJointDesignCache::new(
@@ -4419,7 +4419,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
     };
 
     // Streamed evaluator: no tensor installed, runs the exact O(n) path.
-    let mut streamed_eval = make_eval(, e));
+    let mut streamed_eval = make_eval();
     let mut stream_cache = make_cache();
 
     // Tensor evaluator: attach the certified tensor over the optimizer window.
@@ -4555,8 +4555,8 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
             cache.design(),
             &spatial_terms,
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper_dirs build")
-        .expect("hyper_dirs present", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper_dirs build", e))
+        .expect("hyper_dirs present");
         let (_c, _g, _h) = evaluate_joint_reml_outer_eval_at_theta(
             evaluator,
             cache.design(),
@@ -4570,11 +4570,11 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate_with_order", e));
         evaluator
             .current_beta()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "converged inner β̂ available after the PIRLS solve")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "converged inner β̂ available after the PIRLS solve", e))
     };
     for rho in &rho_sweep {
         for &psi in &psi_sweep {
-            assert!(psi > psi_lo && psi < psi_hi, "sweep ψ inside window", e));
+            assert!(psi > psi_lo && psi < psi_hi, "sweep ψ inside window");
             let mut theta = Array1::<f64>::zeros(rho_dim + 1);
             theta.slice_mut(s![..rho_dim]).assign(rho);
             theta[rho_dim] = psi;
@@ -4755,7 +4755,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             &external_opts,
             "fast_path_skip",
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluator")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluator", e))
     };
     let make_cache = || {
         SingleBlockExactJointDesignCache::new(
@@ -4770,7 +4770,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
     };
 
     // Tensor evaluator with the certified Gram tensor attached over the window.
-    let mut tensor_eval = make_eval(, e));
+    let mut tensor_eval = make_eval();
     let mut tensor_cache = make_cache();
     let attached = {
         let mut build_cache = make_cache();
@@ -4996,7 +4996,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             Some(cache.design_revision()),
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "streamed eval", e));
-        evaluator.current_beta().unwrap_or_else(|e| panic!("{} failed: {:?}", "streamed β̂")
+        evaluator.current_beta().unwrap_or_else(|e| panic!("{} failed: {:?}", "streamed β̂", e))
     };
 
     // Soundness bar: the n-free fast path must reproduce the streamed exact solve
@@ -5006,7 +5006,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         ("psi_b", theta_at(psi_b), &beta_b),
         ("psi_c", theta_at(psi_c), &beta_c),
     ] {
-        let beta_slow = beta_streamed(&mut streamed_eval, &mut stream_cache, &theta, e));
+        let beta_slow = beta_streamed(&mut streamed_eval, &mut stream_cache, &theta);
         let r = beta_tensor
             .iter()
             .zip(beta_slow.iter())
@@ -5183,7 +5183,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
             &external_opts,
             "forced_skip_diag",
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluator")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluator", e))
     };
     let make_cache = || {
         SingleBlockExactJointDesignCache::new(
@@ -5197,7 +5197,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
         .expect("design cache")
     };
 
-    let mut tensor_eval = make_eval(, e));
+    let mut tensor_eval = make_eval();
     let mut tensor_cache = make_cache();
     let attached = {
         let mut build_cache = make_cache();
@@ -5256,11 +5256,11 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
             Some(cache.design_revision()),
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "tensor eval", e));
-        evaluator.current_beta().unwrap_or_else(|e| panic!("{} failed: {:?}", "converged inner β̂")
+        evaluator.current_beta().unwrap_or_else(|e| panic!("{} failed: {:?}", "converged inner β̂", e))
     };
 
     // Pin the reference surface at ψ_A (slow path runs once, records psi_ref).
-    let beta_a = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_a), true, e));
+    let beta_a = eval_tensor(&mut tensor_eval, &mut tensor_cache, &theta_at(psi_a), true);
     assert!(beta_a.iter().all(|v| v.is_finite()), "pin β̂ finite");
     assert_eq!(tensor_eval.slow_path_reset_count(), 1, "one pinning reset");
 
@@ -5291,12 +5291,12 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
             Some(cache.design_revision()),
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "streamed eval", e));
-        evaluator.current_beta().unwrap_or_else(|e| panic!("{} failed: {:?}", "streamed β̂")
+        evaluator.current_beta().unwrap_or_else(|e| panic!("{} failed: {:?}", "streamed β̂", e))
     };
 
     eprintln!(
         "[DIAG1033-FORCE] 513-node tensor; pin ψ_a={psi_a:.5} window=[{psi_lo:.4},{psi_hi:.4}] span={span:.4}"
-    , e));
+    );
     eprintln!("[DIAG1033-FORCE] frac_of_span  psi  covers_skip(gate)  forced_skip_β̂rel_vs_streamed");
     // Sweep ψ moves off the pin, from tiny to a large rotation toward the
     // ill-conditioned low edge. For each: print the GATE verdict, then FORCE the
@@ -5373,8 +5373,8 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
     let tensor_arc = tensor_eval
         .psi_gram_tensor
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "tensor attached")
-        .clone(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "tensor attached", e))
+        .clone();
     let tensor_gram_at = |psi: f64| -> Array2<f64> { tensor_arc.gram_at(psi) };
     let tensor_rhs_at = |psi: f64| -> Array1<f64> { tensor_arc.rhs_at(psi) };
     let g_interp_a = tensor_gram_at(psi_a);
@@ -5679,8 +5679,8 @@ fn iso_kappa_duchon_outer_gradient_matches_centered_fd() {
                 cache.design(),
                 &cache.spatial_terms,
             )
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper dirs build")
-            .expect("hyper dirs present", e));
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper dirs build", e))
+            .expect("hyper dirs present");
             evaluate_joint_reml_outer_eval_at_theta(
                 evaluator,
                 cache.design(),
@@ -5691,7 +5691,7 @@ fn iso_kappa_duchon_outer_gradient_matches_centered_fd() {
                 order,
                 None,
             )
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "outer eval")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "outer eval", e))
         };
 
     let (cost_at_zero, grad_at_zero, _hess) = eval_at(
@@ -5699,7 +5699,7 @@ fn iso_kappa_duchon_outer_gradient_matches_centered_fd() {
         crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
         &mut cache,
         &mut evaluator,
-    , e));
+    );
 
     let h = 1e-5_f64;
     let psi_idx = rho_dim;
@@ -5989,8 +5989,8 @@ fn iso_kappa_duchon_dx_dpsi_matches_fd() {
     let psi_eval = 0.0_f64;
     let derivative_bundle =
         try_build_spatial_term_log_kappa_derivative(data.view(), &frozen, &design, 0)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula Duchon derivative should build")
-            .expect("Duchon derivative should be available", e));
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula Duchon derivative should build", e))
+            .expect("Duchon derivative should be available");
     let global_range = derivative_bundle.0;
     let p_total = derivative_bundle.1;
     let implicit_operator = derivative_bundle.8;
@@ -6571,7 +6571,7 @@ fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
         eval.2
             .materialize_dense()
             .expect("materialize eval hessian"),
-    , e));
+    );
 
     let mut theta1 = theta0.clone();
     theta1[joint_setup.rho_dim()] += 0.25;
@@ -6653,8 +6653,8 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
     let dims_per_term = vec![1];
     let mut theta0 = Array1::<f64>::zeros(rho_dim + 1);
     theta0[rho_dim] = -get_spatial_length_scale(&frozen, spatial_terms[0])
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "length scale")
-        .ln(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "length scale", e))
+        .ln();
 
     let mut cache = SingleBlockExactJointDesignCache::new(
         data.view(),
@@ -6687,7 +6687,7 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
         eval.2
             .materialize_dense()
             .expect("materialize eval hessian"),
-    , e));
+    );
 
     let mut theta1 = theta0.clone();
     theta1[rho_dim] += 0.35;
@@ -6872,8 +6872,8 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
         theta0[j] = 0.2 - 0.1 * j as f64;
     }
     theta0[rho_dim] = -get_spatial_length_scale(&frozen, spatial_terms[0])
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "length scale")
-        .ln(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "length scale", e))
+        .ln();
     let mut theta1 = theta0.clone();
     theta1[rho_dim] += 0.3;
 
@@ -6912,7 +6912,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
                     cache.design(),
                     &cache.spatial_terms,
                 )
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper dirs build")
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "hyper dirs build", e))
                 .expect("hyper dirs present")
             };
 
@@ -6926,7 +6926,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
                 crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
                 None,
             )
-            .expect("reused eval", e));
+            .expect("reused eval");
 
             let fresh_opts = external_opts_for_design(
                 &LikelihoodSpec::gaussian_identity(),
@@ -6969,13 +6969,13 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
             let reused_hess = reused_eval
                 .2
                 .materialize_dense()
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "reused hessian materializes")
-                .expect("reused hessian present", e));
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "reused hessian materializes", e))
+                .expect("reused hessian present");
             let fresh_hess = fresh_eval
                 .2
                 .materialize_dense()
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "fresh hessian materializes")
-                .expect("fresh hessian present", e));
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "fresh hessian materializes", e))
+                .expect("fresh hessian present");
             let hess_diff = max_abs_diff_matrix(&reused_hess, &fresh_hess);
             assert!(hess_diff <= 1e-9, "hessian mismatch: {hess_diff}");
 
@@ -7088,10 +7088,10 @@ fn exact_matern_log_kappa_derivative_uses_feature_columns_only() {
     );
     assert!(
         derivative
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "derivative call should succeed")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "derivative call should succeed", e))
             .is_some(),
         "Matérn term should expose an exact derivative"
-    , e));
+    );
 }
 
 #[test]
@@ -7159,7 +7159,7 @@ fn exact_thin_plate_log_kappa_derivative_uses_feature_columns_only() {
             let x =
                 select_columns(data.view(), feature_cols).unwrap_or_else(|e| panic!("{} failed: {:?}", "select ThinPlate feature cols", e));
             crate::basis::build_thin_plate_basis_log_kappa_derivative(x.view(), spec)
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "direct ThinPlate derivative should build")
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "direct ThinPlate derivative should build", e))
         }
         _ => panic!("expected ThinPlate term"),
     };
@@ -7172,13 +7172,13 @@ fn exact_thin_plate_log_kappa_derivative_uses_feature_columns_only() {
             feature_cols, spec, ..
         } => {
             let x =
-                select_columns(data.view(), feature_cols).expect("select ThinPlate feature cols", e));
+                select_columns(data.view(), feature_cols).expect("select ThinPlate feature cols");
             crate::basis::build_thin_plate_basis_log_kappasecond_derivative(x.view(), spec)
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "direct ThinPlate second derivative should build")
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "direct ThinPlate second derivative should build", e))
         }
         _ => panic!("expected ThinPlate term"),
     };
-    assert_eq!(local_x_psi.ncols(), smooth_term.coeff_range.len(), e));
+    assert_eq!(local_x_psi.ncols(), smooth_term.coeff_range.len());
     assert_eq!(local_x_psi_psi.ncols(), smooth_term.coeff_range.len());
     assert!(!local_s_psi.is_empty());
     assert_eq!(local_s_psi.len(), local_s_psi_psi.len());
@@ -7266,7 +7266,7 @@ fn exact_duchon_log_kappa_derivative_uses_feature_columns_only() {
         } => {
             let x = select_columns(data.view(), feature_cols).unwrap_or_else(|e| panic!("{} failed: {:?}", "select Duchon feature cols", e));
             crate::basis::build_duchon_basis_log_kappa_derivatives(x.view(), spec)
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "direct Duchon derivative bundle should build")
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "direct Duchon derivative bundle should build", e))
         }
         _ => panic!("expected Duchon term"),
     };
@@ -7281,7 +7281,7 @@ fn exact_duchon_log_kappa_derivative_uses_feature_columns_only() {
         penaltiessecond_derivative: local_s_psi_psi,
         implicit_operator: local_implicit_psi_psi_unused,
     } = derivative_bundle.second;
-    assert!(local_implicit_psi_unused.is_none(), e));
+    assert!(local_implicit_psi_unused.is_none());
     assert!(local_implicit_psi_psi_unused.is_none());
     assert_spatial_derivative_width(
         "Duchon first log-kappa",
@@ -7530,10 +7530,10 @@ fn duchon_terms_participate_in_kappa_optimization() {
         try_build_spatial_term_log_kappa_derivative(data.view(), &frozenspec, &design, 0);
     assert!(
         derivative
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon exact derivative call should succeed")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon exact derivative call should succeed", e))
             .is_some(),
         "Duchon term should expose an exact derivative"
-    , e));
+    );
 
     let optimized = fit_term_collectionwith_spatial_length_scale_optimization(
         data.view(),

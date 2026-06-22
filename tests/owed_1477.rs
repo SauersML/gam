@@ -207,6 +207,7 @@ fn tweedie_default_ps_smooth_recovers_unbiased_mean_no_boundary_blowup_1477() {
     let seeds: &[u64] = &[481001, 481002, 481003, 481004, 481005, 481006];
     let mut ps_worse = 0usize;
     let mut ps_rmse_all = Vec::new();
+    let mut cr_rmse_all = Vec::new();
     let mut ps_boundary_ratio_worst = 0.0_f64;
 
     for &seed in seeds {
@@ -244,6 +245,7 @@ fn tweedie_default_ps_smooth_recovers_unbiased_mean_no_boundary_blowup_1477() {
         );
 
         ps_rmse_all.push(ps_rmse);
+        cr_rmse_all.push(cr_rmse);
         if ps_rmse > cr_rmse {
             ps_worse += 1;
         }
@@ -263,17 +265,32 @@ fn tweedie_default_ps_smooth_recovers_unbiased_mean_no_boundary_blowup_1477() {
     // bug's median ps RMSE ≈ 0.47 with mu_range ≈ 3-4; a recovered fit lands well
     // under 0.30·range. This is the primary unbiasedness gate.
     ps_rmse_all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    cr_rmse_all.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let median_ps = ps_rmse_all[ps_rmse_all.len() / 2];
+    let median_cr = cr_rmse_all[cr_rmse_all.len() / 2];
     let abs_bar = 0.30 * mu_range;
     eprintln!(
-        "[#1477] mu_range={mu_range:.3} median ps_rmse={median_ps:.4} abs_bar={abs_bar:.4} \
-         ps_worse_than_cr={ps_worse}/{} worst_boundary_ratio={ps_boundary_ratio_worst:.3}",
+        "[#1477] mu_range={mu_range:.3} median ps_rmse={median_ps:.4} median cr_rmse={median_cr:.4} \
+         abs_bar={abs_bar:.4} ps_worse_than_cr={ps_worse}/{} worst_boundary_ratio={ps_boundary_ratio_worst:.3}",
         seeds.len()
     );
     assert!(
         median_ps <= abs_bar,
         "Tweedie default ps median RMSE-to-truth {median_ps:.4} > {abs_bar:.4} (0.30·range): \
          the non-Gaussian PS mean is systematically biased (#1477)."
+    );
+
+    // SHARP CONTRAST (#1477): on the SAME data the default `ps` basis must recover
+    // the Tweedie mean essentially as well as gam's own `cr` basis — the issue's
+    // decisive isolating measurement (mgcv's same `ps` recovers truth; the pre-fix
+    // gam `ps` lands ≈2.4× worse). The median `ps` RMSE must be within 1.40× the
+    // median `cr` RMSE; the bug blows far past this, the freed bending coordinate
+    // sits well under it.
+    assert!(
+        median_ps <= 1.40 * median_cr + 1e-9,
+        "Tweedie default ps median RMSE-to-truth {median_ps:.4} > 1.40 * cr median {median_cr:.4} \
+         (ratio {:.2}) on identical data — the non-Gaussian PS bending coordinate is biased (#1477).",
+        median_ps / median_cr.max(1e-12)
     );
 
     // The PS path must not be the systematically-worse basis: the bug had ps
