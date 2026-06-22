@@ -380,9 +380,34 @@ jobs:
           test_status=0
           : > /tmp/cargo-test.log
 
-          if ! run_cargo_test "$LIB_TEST_TIMEOUT" --lib --bins --examples; then
-            test_status=1
-          fi
+          # #1393: the in-crate unit suite (`--lib --bins --examples`) is the
+          # single LARGEST nextest invocation in this job — ~4000 `#[test]`s from
+          # the in-module `tests` blocks (the multi-thousand-line sae/custom_family/
+          # gamlss/survival `tests.rs` modules) all in ONE process group. Run
+          # serially (--test-threads 1, the peak-RSS guard) under the 1800s cap, the
+          # SUM of its legitimately-slow REML/PIRLS/joint-Newton unit tests overruns
+          # the GNU `timeout`, which SIGKILLs the whole phase (exit 124/137) BEFORE
+          # nextest prints any end-of-run summary — so the phase fails in bulk with
+          # NO per-test attribution (observed: 1241/4059 tests run, then killed at
+          # 1800s with no SLOW line). Every integration BINARY already escapes this
+          # via nextest `--partition`; the lib phase was the one un-sharded
+          # invocation still exposed to it. Shard it the same way: `--partition` is a
+          # pure run-time FILTER, so the lib/bins/examples binaries still LINK exactly
+          # once and each shard reuses them (no extra link, no extra disk, no change
+          # to which tests run or what they assert). Each shard carries the higher
+          # PARTITIONED_BINARY_TIMEOUT so a shard that draws several multi-minute unit
+          # tests still finishes and reports per-test results instead of being
+          # bulk-killed, while a genuine single-test hang is still caught by the 600s
+          # per-test slow-timeout and named.
+          LIB_PARTITIONS=8
+          for i in $(seq 1 "$LIB_PARTITIONS"); do
+            echo "::group::lib/bins/examples partition ${i}/${LIB_PARTITIONS}"
+            if ! run_cargo_test "$PARTITIONED_BINARY_TIMEOUT" --lib --bins --examples \
+                  --partition "count:${i}/${LIB_PARTITIONS}"; then
+              test_status=1
+            fi
+            echo "::endgroup::"
+          done
 
           # Free the executable test binaries that the lib/bins/examples
           # phase just linked. They were already executed, will not be rerun,
