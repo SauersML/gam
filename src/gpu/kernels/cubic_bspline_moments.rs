@@ -972,14 +972,16 @@ pub fn build_hex_tensor_moments_device(
             cells.d
         );
     }
-    // Single-bank requirement: exactly one derivative signature per axis.
-    // Mixed-signature support is Phase 3.
+    // This device kernel covers the single-bank layout (exactly one derivative
+    // signature per axis). Multi-bank (mixed-signature) axes are served by the
+    // CPU path, which is the correct reference computation.
     for (axis, banks) in axis_tables.iter().enumerate() {
         if banks.len() != 1 {
-            return Err(GpuError::NotYetImplemented {
+            return Err(GpuError::NoDeviceKernel {
                 reason: format!(
                     "build_hex_tensor_moments_device: axis {axis} has {} derivative banks; \
-                     single-bank only in Phase 2 — use the CPU path or wait on Phase 3",
+                     this device kernel covers the single-bank layout — multi-bank axes use \
+                     the CPU path",
                     banks.len()
                 ),
             });
@@ -2302,7 +2304,7 @@ mod cubic_bspline_moments_tests {
                 assert!(
                     matches!(err, GpuError::DriverLibraryUnavailable { .. })
                         || matches!(err, GpuError::DriverCallFailed { .. })
-                        || matches!(err, GpuError::NotYetImplemented { .. }),
+                        || matches!(err, GpuError::NoDeviceKernel { .. }),
                     "unexpected GPU error variant: {err:?}"
                 );
                 return;
@@ -2390,7 +2392,7 @@ mod cubic_bspline_moments_tests {
                 assert!(
                     matches!(err, GpuError::DriverLibraryUnavailable { .. })
                         || matches!(err, GpuError::DriverCallFailed { .. })
-                        || matches!(err, GpuError::NotYetImplemented { .. }),
+                        || matches!(err, GpuError::NoDeviceKernel { .. }),
                     "unexpected GPU error variant: {err:?}"
                 );
                 return;

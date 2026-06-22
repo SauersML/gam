@@ -28,13 +28,16 @@ pub enum GpuError {
     /// Runtime throughput calibration produced an unusable measurement
     /// (non-positive elapsed time, non-finite GB/s or GFLOPS).
     CalibrationFailed { reason: String },
-    /// The requested GPU code path has no device kernel on this build. Callers
-    /// treat this as a sentinel to fall back to the CPU path silently (no panic,
-    /// error log, just an info line). Distinct from `DriverCallFailed` so
-    /// the dispatcher can tell "kernel not landed yet" apart from "device
-    /// said no". Carries a short reason for diagnostics, e.g. the kernel
-    /// name and the awaited milestone.
-    NotYetImplemented { reason: String },
+    /// No device kernel exists for the requested GPU code path on this build.
+    /// Device kernels are added opportunistically as accelerations; the absence
+    /// of one is a permanently-possible, correctly-handled condition — not a
+    /// defect — because the CPU path it falls back to is the correct reference
+    /// computation. Callers treat this as a sentinel to fall back to the CPU
+    /// path silently (no panic, no error log). Distinct from `DriverCallFailed`
+    /// so the dispatcher can tell "no kernel for this path" apart from "the
+    /// device refused". Carries a short reason for diagnostics, e.g. the kernel
+    /// name. (Any GPU acceleration roadmap belongs in an issue, not here.)
+    NoDeviceKernel { reason: String },
 }
 
 crate::impl_reason_error_boilerplate! {
@@ -43,7 +46,7 @@ crate::impl_reason_error_boilerplate! {
         DriverSymbolMissing,
         DriverCallFailed,
         CalibrationFailed,
-        NotYetImplemented,
+        NoDeviceKernel,
     }
 }
 

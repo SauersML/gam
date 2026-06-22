@@ -483,7 +483,7 @@ pub fn draw_batch(input: PolyaGammaBatchInput<'_>) -> Result<Array1<f64>, String
         if crate::gpu::device_runtime::GpuRuntime::global().is_some() {
             match linux_cuda::draw_batch_gpu(&input) {
                 Ok(v) => return Ok(v),
-                Err(GpuError::NotYetImplemented { .. }) => {
+                Err(GpuError::NoDeviceKernel { .. }) => {
                     // Fall through to CPU reference until full landing.
                 }
                 Err(other) => return Err(String::from(other)),
