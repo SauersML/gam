@@ -152,6 +152,9 @@ pub(crate) fn run_outer_with_plan(
     // first rejection's rho + error is often the most diagnostic.
     let mut rejection_reasons: Vec<(usize, &'static str, String)> = Vec::new();
     let layout = cap.theta_layout();
+    // Number of smoothing (ρ) coordinates, used to break a near-LAML-tie toward
+    // the more-penalized basin in the non-Gaussian multi-start keep-best.
+    let rho_dim = layout.rho_dim();
     let mut started_seeds = 0usize;
     let expensive_seed_limit =
         expensive_unsuccessful_seed_limit(the_plan.solver, config.seed_config.risk_profile);

@@ -2123,7 +2123,7 @@ fn select_constant_curvature_kappa_sign_seed(
             options,
         ) {
             Ok(score) => {
-                if best.as_ref().map_or(true, |(b, _)| score < *b) {
+                if best.as_ref().is_none_or(|(b, _)| score < *b) {
                     best = Some((score, kappa));
                 }
             }
@@ -8183,13 +8183,12 @@ pub fn curvature_inference_forspec(
     let (kappa_min, kappa_max) = constant_curvature_kappa_bounds(data, resolvedspec, term_idx);
 
     // Profiled criterion oracle V_p(κ): pin κ, fit with κ-optimisation OFF so
-    // only ρ is profiled, return the REML/LAML negative-log-evidence. Disabling
-    // κ-opt routes `fit_term_collectionwith_spatial_length_scale_optimization`
-    // straight to `fit_term_collection_forspec` at the spec's κ.
-    let fixed_kappa_options = SpatialLengthScaleOptimizationOptions {
-        enabled: false,
-        ..SpatialLengthScaleOptimizationOptions::default()
-    };
+    // only ρ is profiled, return the REML/LAML negative-log-evidence. This is the
+    // SAME fixed-κ profiled criterion the production joint-fit path now scans to
+    // pick the κ-sign basin (`select_constant_curvature_kappa_sign_seed`),
+    // single-sourced through `fixed_kappa_profiled_reml_score` so the CI oracle
+    // and the basin-selection seed can never diverge.
+    //
     // Memoize V_p across κ probes. The CI walk's bracketing/bisection, the
     // central-difference v_pp seed, and the flatness LR test all re-evaluate
     // V_p at the SAME κ (κ̂ alone is fit ≥3×, and the bisection revisits its
@@ -8209,39 +8208,20 @@ pub fn curvature_inference_forspec(
         if let Some(&cached) = v_p_cache.borrow().get(&key) {
             return Ok(cached);
         }
-        let mut probe_spec = resolvedspec.clone();
-        match probe_spec
-            .smooth_terms
-            .get_mut(term_idx)
-            .map(|t| &mut t.basis)
-        {
-            Some(SmoothBasisSpec::ConstantCurvature { spec, .. }) => spec.kappa = kappa,
-            _ => {
-                return Err(format!(
-                    "V_p oracle: term {term_idx} is not a constant-curvature smooth"
-                ));
-            }
-        }
-        let fit = fit_term_collectionwith_spatial_length_scale_optimization(
+        let score = fixed_kappa_profiled_reml_score(
             data,
-            y.to_owned(),
-            weights.to_owned(),
-            offset.to_owned(),
-            &probe_spec,
+            y,
+            weights,
+            offset,
+            resolvedspec,
+            term_idx,
+            kappa,
             family.clone(),
             options,
-            &fixed_kappa_options,
         )
         .map_err(|e| format!("V_p fixed-κ fit at κ={kappa} failed: {e}"))?;
-        let score = fit_score(&fit.fit);
-        if score.is_finite() {
-            v_p_cache.borrow_mut().insert(key, score);
-            Ok(score)
-        } else {
-            Err(format!(
-                "V_p fixed-κ fit at κ={kappa} returned a non-finite score"
-            ))
-        }
+        v_p_cache.borrow_mut().insert(key, score);
+        Ok(score)
     };
 
     // Wald step seed: central FD of V_p at κ̂ (only sizes the first bracket; the

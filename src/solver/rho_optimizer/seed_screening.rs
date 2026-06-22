@@ -580,6 +580,69 @@ pub(crate) fn candidate_improves_best(candidate: &OuterResult, best: Option<&Out
     }
 }
 
+/// Relative LAML/REML tie band within which two *converged* outer optima count
+/// as statistically indistinguishable. The marginal likelihood is a smooth
+/// function of ρ with a flat valley near its optimum; a gap this small means the
+/// data cannot tell the two basins apart, so the choice between them must be
+/// made on a secondary principle (parsimony) rather than on LAML noise.
+pub(crate) const PARSIMONY_TIE_REL_BAND: f64 = 1e-3;
+
+/// Total penalty magnitude `Σρ` over the leading `rho_dim` smoothing
+/// coordinates. Larger `Σρ` = larger λ = MORE smoothing = the more parsimonious
+/// (lower effective-df) fit.
+#[inline]
+fn smoothing_rho_sum(result: &OuterResult, rho_dim: usize) -> f64 {
+    (0..rho_dim.min(result.rho.len()))
+        .map(|i| result.rho[i])
+        .sum()
+}
+
+/// Keep-best comparison that breaks a *near-tie* in the converged LAML toward
+/// the more parsimonious (more-smoothed) basin.
+///
+/// The plain [`candidate_improves_best`] adopts any converged candidate with a
+/// strictly lower LAML. For a GLM whose marginal likelihood is nearly flat
+/// across a range of λ (e.g. a smooth Poisson tensor surface), the under-
+/// penalized basin can score a LAML that is *epsilon* better while fitting noise
+/// — on the response scale `exp(η)` amplifies that wiggle into a fit far worse
+/// than the parsimonious optimum (#1373: the flexible-seed promotion drove the
+/// optimizer into exactly such an overshoot). When two converged optima are
+/// within [`PARSIMONY_TIE_REL_BAND`] of each other, the marginal likelihood
+/// cannot distinguish them, so we keep the more-smoothed one. Outside the tie
+/// band a genuinely-better flexible basin still wins, so a fit that truly needs
+/// the flexibility is unaffected. Used only at the non-Gaussian multi-start
+/// site, where the flexible (slot 0) and heavy (slot 1) seeds straddle the two
+/// basins by construction.
+#[inline]
+pub(crate) fn candidate_improves_best_parsimonious(
+    candidate: &OuterResult,
+    best: Option<&OuterResult>,
+    rho_dim: usize,
+) -> bool {
+    match best {
+        None => true,
+        Some(best) if candidate.converged != best.converged => candidate.converged,
+        Some(best) if candidate.converged && best.converged && rho_dim > 0 => {
+            let scale = candidate
+                .final_value
+                .abs()
+                .max(best.final_value.abs())
+                .max(1.0);
+            let gap = (candidate.final_value - best.final_value).abs();
+            if gap <= PARSIMONY_TIE_REL_BAND * scale {
+                // Statistical tie on LAML: prefer the more-smoothed basin, and
+                // only switch to the candidate if it is STRICTLY more penalized
+                // (so an exact-tie keeps the incumbent and the result is order-
+                // stable).
+                smoothing_rho_sum(candidate, rho_dim) > smoothing_rho_sum(best, rho_dim)
+            } else {
+                candidate.final_value < best.final_value
+            }
+        }
+        Some(best) => candidate.final_value < best.final_value,
+    }
+}
+
 #[inline]
 pub(crate) fn should_stop_expensive_multistart_after_best(
     best: Option<&OuterResult>,

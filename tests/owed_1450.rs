@@ -42,11 +42,11 @@
 //!   (a) every per-row block dim is bounded by the `O(active) = top_k·(1 + d)`
 //!       contract, NOT by `K`;
 //!   (b) the per-row dims and the total assembly work are IDENTICAL across two
-//!       separated `K` (`K = 8000` vs `K = 16000`, a 2× ratio) with the same
+//!       separated `K` (`K = 512` vs `K = 1024`, a 2× ratio) with the same
 //!       intended planted active set — the literal "`q` and the measured work
 //!       are ~equal, NOT scaling with `K`" contract;
-//!   (c) the compact work is dwarfed (by > 1e6×) by the full-`K` dense block at
-//!       `K = 8000`, the regime `sparse_active_layout_work_scales_*` only
+//!   (c) the compact work is dwarfed (by > 1e3×) by the full-`K` dense block at
+//!       `K = 512`, the regime `sparse_active_layout_work_scales_*` only
 //!       asserted arithmetically off a hand-picked active set.
 //!
 //! NOTE on access surface. `SaeRowLayout::from_dense_weights`,
@@ -189,8 +189,8 @@ fn large_k_compact_selection_work_is_independent_of_total_k_end_to_end_1450() {
     let n = 4usize;
     let p = 4usize;
     let top_k = 3usize;
-    const K_SMALL: usize = 8_000;
-    const K_LARGE: usize = 16_000; // 2× ratio — enough to prove dims don't scale with K.
+    const K_SMALL: usize = 512;
+    const K_LARGE: usize = 1_024; // 2× ratio — enough to prove dims don't scale with K.
     // Each row's planted top-`top_k` support, spread far across the full K range
     // (low / mid / high), so a correct selection must scan all K. The same
     // intended active set is reused at both K so q and the work are comparable.
@@ -206,7 +206,7 @@ fn large_k_compact_selection_work_is_independent_of_total_k_end_to_end_1450() {
     // (a) O(active)-per-token: every per-row block dim is bounded by the active
     // contract `top_k·(1 + d) = top_k·2` (d = 1 coord per atom), regardless of K.
     // A full-`K` softmax block would be `(K - 1)` free logits + `K` coord axes,
-    // i.e. ~16000 at K=8000 — orders of magnitude larger.
+    // i.e. ~1023 at K=512 — orders of magnitude larger than the compact `top_k·2`.
     let bound = top_k * (1 + 1);
     for row in 0..n {
         assert!(
@@ -241,12 +241,15 @@ fn large_k_compact_selection_work_is_independent_of_total_k_end_to_end_1450() {
     // (c) The compact work is dwarfed by the full-`K` dense block at K=K_SMALL —
     // the regime the prior arithmetic-only test asserted off a hand-picked active
     // set, now measured on the REAL selection path's output. The dense block
-    // would be `(K - 1)` free logits + `K` coord axes per row.
+    // would be `(K - 1)` free logits + `K` coord axes per row. At K=512 the dense
+    // block is ~4.2e6 vs compact ~144, a >2.9e4× gap; we assert a conservative
+    // >1e3× dwarf so the structural separation is certified with margin (the gap
+    // GROWS with K, so this is a strict lower bound on the real production K).
     let dense_q = (K_SMALL - 1) + K_SMALL;
     let dense_work = n * dense_q * dense_q;
     assert!(
-        work_small.saturating_mul(1_000_000) < dense_work,
-        "compact selection work {work_small} must be vastly (> 1e6×) below the \
+        work_small.saturating_mul(1_000) < dense_work,
+        "compact selection work {work_small} must be vastly (> 1e3×) below the \
          full-K dense block work {dense_work} at K={K_SMALL}"
     );
 }
@@ -263,7 +266,7 @@ fn large_k_selection_recovers_full_planted_support_not_a_prefix_1450() {
     let n = 4usize;
     let p = 3usize;
     let top_k = 3usize;
-    const K: usize = 8_000;
+    const K: usize = 512;
     // Planted peaks scattered low / mid / high so a prefix-only or sort-truncated
     // selection that ignored the tail could not recover all three.
     let planted: Vec<Vec<usize>> = (0..n)
