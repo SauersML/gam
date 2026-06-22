@@ -102,20 +102,28 @@ fn fit_kappa_hat(kappa_star: f64, seed: u64) -> f64 {
 // mis-recovered as spherical. Basis-level effective-length L(κ) reparam +
 // `double_penalty:false` were already in place and the isolated profiled-REML
 // criterion (`constant_curvature_recovers_curvature_sign_1404`) already
-// identified the sign; the residual railing was a production inner-λ warm-seed
-// basin defect on TWO paths: (1) the standard scalar-ρ inner-λ path anchors the
-// criterion-ranked objective-grid prepass at the warm seed so the inner λ-solve
-// jumps into the correct high-λ basin (adopt only on strict REML-cost
-// improvement → healthy warm-started fits byte-identical) and reports the
-// converged ρ instead of the warm seed when it is strictly cheaper; (2) the
-// joint [ρ,ψ] spatial outer solver (the κ-optimized path this test drives) now
-// widens the ρ upper bound to RHO_BOUND and seeds a high-ρ over-smoothing corner
-// for constant-curvature terms so the joint ARC can reach the heavily-smoothed
-// collapsed-kernel basin. With the per-κ REML cost matching the textbook
-// profiled-REML, the curvature SIGN is identifiable again, so this contract
-// PASSES. This contract runs unconditionally in CI: re-`#[ignore]`ing it would
-// only hide a future regression behind a skip, which the ban gate forbids and
-// which is exactly the failure mode #1464 was.
+// identified the sign; the residual railing was in the joint [ρ,ψ] spatial outer
+// solver (the κ-optimized path this test drives). Its constant-curvature seed
+// config used to inject an explicit over-smoothing probe at ρ ≈ +15 — a seed
+// pinned to the collapsed-kernel corner where the geodesic exponential
+// exp(−d_κ/L) degenerates to a near-constant. There the criterion is flat in κ
+// (the kernel no longer resolves curvature) and reduces to the monotone log-det
+// Occam term, so the keep-best multistart adopted the low-Occam collapsed null
+// regardless of the true sign — the bit-identical κ̂ → +bound rail for both
+// datasets. The fix removes that probe for constant-curvature terms and instead
+// seeds the κ-sign basin from the sign-correct fixed-κ profiled-REML scan
+// (`select_constant_curvature_kappa_sign_seed`): a small symmetric grid of
+// fixed-κ profiled fits spanning both chart signs, evaluated through the SAME
+// κ-opt-OFF profiled criterion the `curvature_inference_forspec` CI oracle
+// trusts, whose argmin seeds the joint solve INSIDE the correct sign basin with
+// a κ-resolving (non-degenerate) kernel. The ρ upper bound stays widened to
+// RHO_BOUND so a genuinely heavily-smoothed optimum is still reachable via the
+// gradient solve and the sweep grid — it just is not pre-pinned to the collapse
+// point. With the joint solve started in the right basin and the per-κ REML cost
+// matching the textbook profiled-REML, the curvature SIGN is identifiable again,
+// so this contract PASSES. This contract runs unconditionally in CI:
+// re-`#[ignore]`ing it would only hide a future regression behind a skip, which
+// the ban gate forbids and which is exactly the failure mode #1464 was.
 #[test]
 fn curv_full_fit_identifies_curvature_sign_on_mirror_datasets() {
     init_parallelism();
