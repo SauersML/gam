@@ -57,7 +57,8 @@ INTEG='binary(/^(owed_(1376|1392|1395|1399|1404|1426|1427|1033|1450|1454|1470|14
 INTEG="$INTEG | binary(/^(issue_1427_factor_by_single_centering|issue_1470_anova_ti_scattered_recovery|issue_1426_gammalog_recovery)$/)"
 INTEG="$INTEG | binary(/^(bug_hunt_1426_gamma_log_reml_flat_valley_overfit|bug_hunt_1464_curv_sign_diagnostic|bug_hunt_1464_curv_sign_identifiable)$/)"
 INTEG="$INTEG | binary(/^(diag_1376_matern_design_psi_fd|diag_1426_gammalog_basin|diag_1470_lambda_probe|sae_throughput_gate_honesty_guard_1412)$/)"
-QUAL='binary(=quality) & test(/quality_validation_baseline_1471::/)'
+# #1471 baseline module + the 1393 wave-2 scam/gamboostLSS quality arms (same bin).
+QUAL='binary(=quality) & ( test(/quality_validation_baseline_1471::/) | test(/quality_vs_scam_monotone_increasing_smooth::/) | test(/quality_vs_scam_convex_smooth::/) | test(/quality_vs_gamboostlss_gaussian_location_scale::/) )'
 FILTER="( $INTEG ) | ( $QUAL )"
 
 echo "=== (1+2) nextest run (release, --no-fail-fast) ==="
