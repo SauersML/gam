@@ -153,35 +153,64 @@ fn precond_ladder_converges_and_richer_tiers_help_on_dense_coupling() {
     let diag = row_of(&rows, SchurPreconditionerKind::Diagonal);
     let block = row_of(&rows, SchurPreconditionerKind::BetaBlockJacobi);
     let cluster = row_of(&rows, SchurPreconditionerKind::ClusterJacobi);
+    let schwarz = row_of(&rows, SchurPreconditionerKind::AdditiveSchwarz { overlap: 1 });
+    let diag_schwarz = row_of(&rows, SchurPreconditionerKind::DiagAssembledSchwarz { overlap: 1 });
     let ic0 = row_of(&rows, SchurPreconditionerKind::BlockIncompleteCholesky);
 
+    // The full per-tier iteration table — the #299 deliverable measurement.
     eprintln!(
-        "[#299 dense] diag={} block={} cluster={} ic0={}",
-        diag.iterations, block.iterations, cluster.iterations, ic0.iterations
+        "[#299 dense ladder] Diagonal={} BetaBlockJacobi={} ClusterJacobi={} \
+         AdditiveSchwarz={} DiagAssembledSchwarz={} BlockIncompleteCholesky={}",
+        diag.iterations,
+        block.iterations,
+        cluster.iterations,
+        schwarz.iterations,
+        diag_schwarz.iterations,
+        ic0.iterations
     );
 
-    // The fixture must be genuinely coupled, else the study is vacuous.
+    // The fixture must be genuinely coupled, else the study is vacuous: the
+    // block-diagonal preconditioners (which cannot see the dense off-block
+    // correction) must take several PCG iterations.
     assert!(
         diag.iterations >= 2,
         "coupled fixture must force scalar Diagonal Jacobi to iterate (got {})",
         diag.iterations
     );
-    // Cluster-Jacobi factors the whole connected component (the exact reduced
-    // Schur, since the system is one component): a single PCG iteration.
     assert!(
-        cluster.iterations <= diag.iterations,
-        "cluster-Jacobi ({}) must not exceed scalar Diagonal ({})",
-        cluster.iterations,
-        diag.iterations
-    );
-    // IC(0) sees the full coupling pattern (a single dense component → the
-    // pattern is the whole block), so it must beat the block-diagonal Jacobi
-    // that ignores all off-block mass.
-    assert!(
-        ic0.iterations <= block.iterations,
-        "IC(0) ({}) must not exceed block-Jacobi ({}) on the coupled system",
-        ic0.iterations,
+        block.iterations >= 2,
+        "coupled fixture must force block-Jacobi to iterate (got {}); the off-block \
+         coupling the richer tiers exploit must be real",
         block.iterations
+    );
+
+    // The #299 ladder claim: every tier that conditions MORE of the coupling than
+    // block-Jacobi must converge in no MORE PCG iterations than block-Jacobi on
+    // this ill-conditioned single-component system. ClusterJacobi factors the
+    // exact whole-component reduced Schur (single iteration); AdditiveSchwarz /
+    // DiagAssembledSchwarz / IC(0) each capture the off-block coupling the
+    // block-diagonal preconditioner ignores.
+    for (label, tier) in [
+        ("ClusterJacobi", cluster),
+        ("AdditiveSchwarz", schwarz),
+        ("DiagAssembledSchwarz", diag_schwarz),
+        ("BlockIncompleteCholesky", ic0),
+    ] {
+        assert!(
+            tier.iterations <= block.iterations,
+            "{label} ({}) must not exceed block-Jacobi ({}) on the coupled system — a \
+             richer tier that conditions more of the coupling cannot iterate more (#299)",
+            tier.iterations,
+            block.iterations
+        );
+    }
+    // ClusterJacobi is the exact factor of the single connected component, so it
+    // must be the strongest: a single PCG iteration.
+    assert!(
+        cluster.iterations <= 1,
+        "ClusterJacobi factors the exact single-component reduced Schur and must converge \
+         in <=1 PCG iteration (got {})",
+        cluster.iterations
     );
 }
 
