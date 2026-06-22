@@ -536,6 +536,27 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             return Ok(Some(axes));
         }
 
+        // Flex (no time-wiggle, no per-z): route the fixed-`d_u` all-axes sweep
+        // through the build-once path, which constructs the direction-independent
+        // per-row geometry and the fixed-`d_u` third contraction once and
+        // contracts the mixed fourth tensor against each axis, rather than the
+        // per-axis loop below that rebuilds both `p` times. Same per-row
+        // assembler as the per-axis sweep (equal up to the cross-row reduction
+        // order). This is the #979 flex second-directional Jeffreys hot path,
+        // mirroring the first-directional flex hook in
+        // `joint_jeffreys_information_directional_derivative_all_axes_with_specs`.
+        if !self.per_z_logslope_active()
+            && self.effective_flex_active(block_states)?
+            && !self.flex_timewiggle_active()
+        {
+            let axes = self
+                .exact_newton_joint_hessiansecond_directional_derivative_flex_no_wiggle_all_axes(
+                    block_states,
+                    d_beta_u_flat,
+                )?;
+            return Ok(Some(axes));
+        }
+
         let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)

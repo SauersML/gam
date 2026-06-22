@@ -1684,6 +1684,88 @@ impl SurvivalMarginalSlopeFamily {
         Ok(result)
     }
 
+    /// Build-once all-axes variant of
+    /// [`Self::exact_newton_joint_hessiansecond_directional_derivative_flex_no_wiggle`].
+    ///
+    /// The second-directional Jeffreys all-axes sweep needs the second
+    /// directional joint-Hessian `D²H[d_u, e_axis]` for a FIXED first direction
+    /// `d_u` and each of the `p` coordinate axes `e_axis`. Calling the
+    /// single-direction routine `p` times rebuilds, per row and per axis, the
+    /// direction-independent flex geometry (`q`-geometry, intercept solves,
+    /// cached partitions, exact base timepoints) AND the fixed-`d_u` pieces (the
+    /// `d_u` primary pullback `ud` and the third contraction `t_d = T·ud`) — a
+    /// `p`-fold redundant cost that is the #979 flex marginal-slope hot path.
+    /// This variant builds the per-row [`FlexThirdRowBase`] once and hoists the
+    /// fixed-`d_u` `ud`/`t_d` out of the per-axis loop, so only the per-axis
+    /// `e_axis` pullback, the mixed fourth contraction `Q[ud, ue]`, and the row
+    /// accumulation are repeated. Each output matrix routes through the same
+    /// per-row assemblers as the corresponding single-axis call
+    /// (`row_flex_fourth_contract_from_base` + `row_flex_third_contract_from_base`
+    /// + `accumulate_directional_joint_hessian_row`), so it equals that call up
+    /// to the cross-row rayon reduction order.
+    pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_flex_no_wiggle_all_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        d_u: &Array1<f64>,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let slices = block_slices(self, block_states);
+        let primary = flex_primary_slices(self);
+        let p_total = slices.total;
+        let identity_blocks = flex_identity_block_pairs(&primary, &slices);
+        let zeros = || vec![Array2::<f64>::zeros((p_total, p_total)); p_total];
+        let result = (0..self.n)
+            .into_par_iter()
+            .try_fold(zeros, |mut acc, row| -> Result<Vec<Array2<f64>>, String> {
+                // Direction-independent per-row geometry + fixed-`d_u` pieces,
+                // built once: the intercept solves / cached partitions / base
+                // timepoints (the base) and the `d_u` pullback `ud` plus its
+                // third contraction `t_d = T·ud`.
+                let q_geom = self.row_dynamic_q_geometry(row, block_states)?;
+                let base =
+                    self.build_row_flex_third_base_with_states(row, block_states, &primary)?;
+                let ud = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                    row,
+                    block_states,
+                    &slices,
+                    &q_geom,
+                    d_u,
+                )?;
+                let t_d = self.row_flex_third_contract_from_base(&base, &ud)?;
+                // Per-axis: only the `e_axis` pullback, the mixed fourth
+                // contraction, the `t_d·ue` gamma, and the accumulation repeat.
+                for axis_idx in 0..p_total {
+                    let mut axis = Array1::<f64>::zeros(p_total);
+                    axis[axis_idx] = 1.0;
+                    let ue = self.row_primary_direction_from_flat_dynamic_with_q_geometry(
+                        row,
+                        block_states,
+                        &slices,
+                        &q_geom,
+                        &axis,
+                    )?;
+                    let q_de = self.row_flex_fourth_contract_from_base(&base, &ud, &ue)?;
+                    let gamma = t_d.dot(&ue);
+                    self.accumulate_directional_joint_hessian_row(
+                        row,
+                        &slices,
+                        &q_geom,
+                        &identity_blocks,
+                        gamma.view(),
+                        q_de.view(),
+                        &mut acc[axis_idx],
+                    )?;
+                }
+                Ok(acc)
+            })
+            .try_reduce(zeros, |mut a, b| -> Result<_, String> {
+                for (ai, bi) in a.iter_mut().zip(b.into_iter()) {
+                    *ai += &bi;
+                }
+                Ok(a)
+            })?;
+        Ok(result)
+    }
+
     pub(crate) fn evaluate_blockwise_exact_newton(
         &self,
         block_states: &[ParameterBlockState],

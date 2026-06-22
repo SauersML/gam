@@ -217,6 +217,151 @@ impl SurvivalMarginalSlopeFamily {
         Ok(Array2::<f64>::from_shape_vec((p, p), flat).map_err(|e| e.to_string())?)
     }
 
+    /// Fourth-order directional contraction reusing a prebuilt
+    /// [`FlexThirdRowBase`], the mixed-direction analogue of
+    /// [`Self::row_flex_third_contract_from_base`].
+    ///
+    /// The base carries the direction-independent per-row geometry (intercept
+    /// solves, cached partitions, exact base timepoints) that
+    /// [`Self::row_flex_primary_fourth_contracted_exact`] otherwise rebuilds on
+    /// every call. Hoisting it lets a fixed-`dir_u` / sweeping-`dir_v` all-axes
+    /// pass pay that geometry once per row instead of `p` times — the #979 flex
+    /// second-directional Jeffreys hot path. Only the per-direction timepoint
+    /// extensions (`dir_u`, `dir_v`), the bidirectional second-order extension,
+    /// and the Block-10 fourth assembly are recomputed; the per-(u, v) assembly
+    /// routes through the same `cpu_oracle_fourth_contraction` as the
+    /// build-each-time path, on identical inputs.
+    pub(crate) fn row_flex_fourth_contract_from_base(
+        &self,
+        base: &FlexThirdRowBase,
+        dir_u: &Array1<f64>,
+        dir_v: &Array1<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let p = base.p;
+        if dir_u.iter().all(|v| v.abs() == 0.0) || dir_v.iter().all(|v| v.abs() == 0.0) {
+            return Ok(Array2::<f64>::zeros((p, p)));
+        }
+        let primary = flex_primary_slices(self);
+        let beta_h = base.beta_h.as_ref();
+        let beta_w = base.beta_w.as_ref();
+
+        let entry_ext_u = self.compute_survival_timepoint_directional_exact_from_cached(
+            base.row,
+            &primary,
+            base.q0,
+            base.q0_index,
+            base.a0,
+            base.g,
+            beta_h,
+            beta_w,
+            &base.entry_cached,
+            dir_u,
+            false,
+        )?;
+        let entry_ext_v = self.compute_survival_timepoint_directional_exact_from_cached(
+            base.row,
+            &primary,
+            base.q0,
+            base.q0_index,
+            base.a0,
+            base.g,
+            beta_h,
+            beta_w,
+            &base.entry_cached,
+            dir_v,
+            false,
+        )?;
+        let exit_ext_u = self.compute_survival_timepoint_directional_exact_from_cached(
+            base.row,
+            &primary,
+            base.q1,
+            base.q1_index,
+            base.a1,
+            base.g,
+            beta_h,
+            beta_w,
+            &base.exit_cached,
+            dir_u,
+            true,
+        )?;
+        let exit_ext_v = self.compute_survival_timepoint_directional_exact_from_cached(
+            base.row,
+            &primary,
+            base.q1,
+            base.q1_index,
+            base.a1,
+            base.g,
+            beta_h,
+            beta_w,
+            &base.exit_cached,
+            dir_v,
+            true,
+        )?;
+        let entry_bi = self.compute_survival_timepoint_bidirectional_exact_from_cached(
+            base.row,
+            &primary,
+            base.q0,
+            base.q0_index,
+            base.a0,
+            base.g,
+            beta_h,
+            beta_w,
+            &base.entry_cached,
+            dir_u,
+            dir_v,
+        )?;
+        let exit_bi = self.compute_survival_timepoint_bidirectional_exact_from_cached(
+            base.row,
+            &primary,
+            base.q1,
+            base.q1_index,
+            base.a1,
+            base.g,
+            beta_h,
+            beta_w,
+            &base.exit_cached,
+            dir_u,
+            dir_v,
+        )?;
+
+        let entry_d1 = block10_pack_dir(&entry_ext_u);
+        let entry_d2 = block10_pack_dir(&entry_ext_v);
+        let exit_d1 = block10_pack_dir(&exit_ext_u);
+        let exit_d2 = block10_pack_dir(&exit_ext_v);
+        let entry_bi_p = block10_pack_bi(&entry_bi);
+        let exit_bi_p = block10_pack_bi(&exit_bi);
+        let dir_u_vec: Vec<f64> = dir_u.to_vec();
+        let dir_v_vec: Vec<f64> = dir_v.to_vec();
+        let inputs =
+            crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10FourthInputs {
+                p,
+                qd1_index: base.qd1_index,
+                qd1: base.qd1,
+                w: self.weights[base.row],
+                d: self.event[base.row],
+                dir_u: &dir_u_vec,
+                dir_v: &dir_v_vec,
+                entry_base: &base.entry_base,
+                exit_base: &base.exit_base,
+                entry_ext_u: &entry_d1,
+                entry_ext_v: &entry_d2,
+                exit_ext_u: &exit_d1,
+                exit_ext_v: &exit_d2,
+                entry_bi: &entry_bi_p,
+                exit_bi: &exit_bi_p,
+            };
+        let flat =
+            crate::families::survival::marginal_slope::gpu::cpu_oracle_fourth_contraction(&inputs)
+                .map_err(|e| format!("block10 fourth contraction: {e}"))?;
+        let mut out = Array2::<f64>::zeros((p, p));
+        for u in 0..p {
+            for v in 0..p {
+                out[[u, v]] = flat[u * p + v];
+            }
+        }
+        Ok(out)
+    }
+
     /// Fourth-order directional contraction for the flexible survival path.
     ///
     /// The mixed second-directional timepoint transport is carried exactly

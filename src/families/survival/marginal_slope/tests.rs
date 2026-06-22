@@ -6818,6 +6818,61 @@ fn survival_jointhessian_flex_no_wiggle_all_axes_matches_per_axis() {
     }
 }
 
+/// gam#979: the build-once second-directional all-axes flex sweep
+/// (`..._flex_no_wiggle_all_axes`, fixed first direction `d_u`) must reproduce
+/// calling the single-direction second-directional routine once per coordinate
+/// axis. The all-axes path hoists the direction-independent per-row geometry
+/// (intercept solves, cached partitions, base timepoints) AND the fixed-`d_u`
+/// third contraction out of the per-axis loop; this asserts the optimization
+/// changes only the cost, never the result. The two paths feed the same per-row
+/// assemblers but run independent rayon reductions, so equality is to a tight
+/// relative tolerance, not bit-for-bit. The fixed `d_u` is deliberately a dense
+/// (non-axis-aligned) direction so the mixed fourth contraction `Q[ud, ue]` is
+/// exercised, not a single-coordinate special case.
+#[test]
+fn survival_jointhessian_flex_no_wiggle_second_directional_all_axes_matches_per_axis() {
+    let n = 40usize;
+    let family = make_flex_no_wiggle_test_family(n);
+    let states = flex_no_wiggle_test_block_states(&family);
+    assert!(family.effective_flex_active(&states).unwrap());
+    assert!(!family.flex_timewiggle_active());
+    let slices = block_slices(&family, &states);
+    let p = slices.total;
+    assert!(p >= 2, "test family must exercise multiple axes, got p={p}");
+
+    // Dense fixed first direction d_u (not an axis), so the swept axes hit the
+    // genuine mixed second-directional fourth contraction.
+    let mut d_u = Array1::<f64>::zeros(p);
+    for (k, value) in d_u.iter_mut().enumerate() {
+        *value = 0.03 * ((k as f64 + 0.4).sin()) - 0.02 * ((k as f64 + 1.1).cos());
+    }
+
+    let all_axes = family
+        .exact_newton_joint_hessiansecond_directional_derivative_flex_no_wiggle_all_axes(
+            &states, &d_u,
+        )
+        .expect("second-directional all-axes sweep");
+    assert_eq!(all_axes.len(), p);
+
+    for axis_idx in 0..p {
+        let mut axis = Array1::<f64>::zeros(p);
+        axis[axis_idx] = 1.0;
+        let per_axis = family
+            .exact_newton_joint_hessiansecond_directional_derivative_flex_no_wiggle(
+                &states, &d_u, &axis,
+            )
+            .expect("per-axis second-directional derivative");
+        let batched = &all_axes[axis_idx];
+        assert_eq!(batched.dim(), per_axis.dim());
+        let rel = rel_diff_array2_survival(batched, &per_axis);
+        assert!(
+            rel < 1e-10,
+            "axis {axis_idx}: build-once second-directional all-axes path diverged \
+             from per-axis sweep, rel {rel}"
+        );
+    }
+}
+
 #[test]
 fn survival_jointhessian_flex_no_wiggle_operator_subsample_half_scales_correctly() {
     use crate::outer_subsample::OuterScoreSubsample;
