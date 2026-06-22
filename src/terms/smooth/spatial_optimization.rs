@@ -2168,7 +2168,19 @@ fn try_exact_joint_spatial_length_scale_optimization(
     if try_build_spatial_log_kappa_hyper_dirs(data, resolvedspec, &best.design, spatial_terms)?
         .is_none()
     {
+        if !constant_curvature_term_indices(resolvedspec).is_empty() {
+            eprintln!(
+                "[#1464-trace] try_exact_joint RETURNED None (hyper_dirs unavailable); \
+                 κ̂ comes from a NON-joint path"
+            );
+        }
         return Ok(None);
+    }
+    if !constant_curvature_term_indices(resolvedspec).is_empty() {
+        eprintln!(
+            "[#1464-trace] try_exact_joint ENTERED for {} spatial term(s); CC present",
+            spatial_terms.len()
+        );
     }
 
     const JOINT_RHO_BOUND: f64 = 12.0;
@@ -2232,7 +2244,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
             if constant_curvature_term_spec(resolvedspec, term_idx).is_none() {
                 continue;
             }
-            if let Some(kappa_seed) = select_constant_curvature_kappa_sign_seed(
+            let scan = select_constant_curvature_kappa_sign_seed(
                 data,
                 y,
                 weights,
@@ -2241,9 +2253,25 @@ fn try_exact_joint_spatial_length_scale_optimization(
                 term_idx,
                 family.clone(),
                 options,
-            ) {
-                log_kappa0.set_scalar_slot(slot, kappa_seed);
-                cc_sign_seeds.push((slot, kappa_seed));
+            );
+            // #1464 diagnostic (ban-clean: plain eprintln, no {:?}): what the
+            // sign-correct fixed-κ scan picked for this CC term, before any joint
+            // solve. If this prints a negative κ for the hyperbolic dataset but the
+            // final κ̂ is +1.08, the bug is downstream of the scan (solver railing
+            // or readback), not the scan.
+            match scan {
+                Some(kappa_seed) => {
+                    eprintln!(
+                        "[#1464-trace] term {term_idx}: fixed-κ sign-basin scan picked κ_seed = {kappa_seed}"
+                    );
+                    log_kappa0.set_scalar_slot(slot, kappa_seed);
+                    cc_sign_seeds.push((slot, kappa_seed));
+                }
+                None => {
+                    eprintln!(
+                        "[#1464-trace] term {term_idx}: fixed-κ sign-basin scan returned NONE (no seed applied)"
+                    );
+                }
             }
         }
     }
@@ -2298,6 +2326,13 @@ fn try_exact_joint_spatial_length_scale_optimization(
             // Spherical basin: ψ ∈ [0, κ_max].
             log_kappa_lower.set_scalar_slot(slot, 0.0);
         }
+        eprintln!(
+            "[#1464-trace] slot {slot}: hard-pinned joint ψ window to \
+             [{}, {}] (seed sign {})",
+            log_kappa_lower.as_array()[log_kappa_lower.dims_per_term()[..slot].iter().sum::<usize>()],
+            log_kappa_upper.as_array()[log_kappa_upper.dims_per_term()[..slot].iter().sum::<usize>()],
+            if kappa_seed < 0.0 { "negative" } else if kappa_seed > 0.0 { "positive" } else { "zero" },
+        );
     }
     // Project seed onto data-derived bounds; spec.length_scale is a hint,
     // not a hard constraint. BFGS requires theta0 ∈ [lower, upper].
@@ -2371,6 +2406,13 @@ fn try_exact_joint_spatial_length_scale_optimization(
             final_value,
             final_grad_norm,
         } => {
+            if has_constant_curvature_term {
+                eprintln!(
+                    "[#1464-trace] joint solve NONCONVERGED (iters={iterations}, \
+                     final_value={final_value}); returning FROZEN BASELINE geometry \
+                     (κ̂ = spec default, NOT the joint candidate)"
+                );
+            }
             log::info!(
                 "[spatial-kappa] joint spatial optimization did not converge \
                  (iterations={}, final_objective={:.6e}, final_grad_norm={}); \
@@ -2400,6 +2442,13 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // gate would reject true improvements due to floating-point noise.
     let accept_tol = options.tol.max(1e-8 * baseline_score.abs()).max(1e-12);
     if joint_final_value > baseline_score + accept_tol {
+        if has_constant_curvature_term {
+            eprintln!(
+                "[#1464-trace] joint candidate WORSENED score (joint={joint_final_value}, \
+                 baseline={baseline_score}); returning FROZEN BASELINE geometry \
+                 (κ̂ = spec default, NOT the joint candidate)"
+            );
+        }
         log::info!(
             "[spatial-kappa] exact joint spatial candidate worsened the profiled score (joint={:.6e}, baseline={:.6e}, tol={:.2e}); keeping the frozen baseline geometry",
             joint_final_value,
@@ -2423,6 +2472,25 @@ fn try_exact_joint_spatial_length_scale_optimization(
     let rho_star = theta_star.slice(s![..rho_dim]).mapv(f64::exp);
     let log_kappa_star =
         SpatialLogKappaCoords::from_theta_tail_with_dims(&theta_star, rho_dim, dims_per_term);
+    // #1464 diagnostic (ban-clean): the joint solver's CONVERGED ψ-tail κ for each
+    // CC term — the value BEFORE any spec write-back / freeze / readback. If this
+    // is negative for the hyperbolic dataset but `get_constant_curvature_kappa`
+    // later returns +1.08, the railing is a POST-SOLVE clamp/readback, not the
+    // optimiser. If this is itself +1.08, the joint solver railed past the pin.
+    if has_constant_curvature_term {
+        let star = log_kappa_star.as_array();
+        let dims = log_kappa_star.dims_per_term();
+        for (slot, &term_idx) in spatial_terms.iter().enumerate() {
+            if constant_curvature_term_spec(resolvedspec, term_idx).is_some() {
+                let off: usize = dims[..slot].iter().sum();
+                eprintln!(
+                    "[#1464-trace] term {term_idx}: joint solver CONVERGED ψ-tail κ = {} \
+                     (this is the optimised candidate; joint_final_value={joint_final_value})",
+                    star[off]
+                );
+            }
+        }
+    }
     // Keep a handle on the baseline geometry spec before shadowing `resolvedspec`
     // with the κ-optimized spec, so the #1357 degenerate-corner guard below can
     // fall back to the frozen baseline.
