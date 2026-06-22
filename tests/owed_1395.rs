@@ -47,6 +47,7 @@ use gam::families::custom_family::{
 };
 use gam::matrix::SymmetricMatrix;
 use ndarray::{Array1, Array2, array};
+use num_dual::{DualNum, first_derivative};
 
 /// Scalar pseudo-Laplace family with a learnable `ρ` (penalty strength `λ = eᵖ`).
 /// Inner objective is `(β − target)²` with constant Hessian `H = [[2]]`.
@@ -360,6 +361,279 @@ fn owed_1395_pseudo_laplace_rho_objective_matches_closed_form() {
              — the 0.5·log|2+λ| Laplace term must NOT collapse",
             result.objective,
             expected
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// gam#1395 — matrix-free (dim > 64) coverage.
+//
+// The scalar fixtures above (and the in-suite autodiff guards) exercise dim=1.
+// The PRODUCTION structural guard in `assembly.rs::joint_outer_evaluate` only
+// rebuilds the ground-truth penalized Hessian and `assert!`s the assembled
+// `logdet()` for `dim <= JOINT_LOGDET_GUARD_MAX_DIM = 64` (the dimension where a
+// redundant dense eigendecomposition is affordable). At `total_p >= 512` the
+// evaluator instead picks the matrix-free `MatrixFreeSpdOperator` path
+// (`use_joint_matrix_free_path`). That operator's `logdet()` materializes the
+// FULL penalized dense matrix (`H_unpen + S_λ + scale·H_Φ`) and runs an EXACT
+// dense eigendecomposition — there is no stochastic logdet on this route — and
+// the outer ρ-gradient's `0.5·tr(H⁻¹ ∂H/∂ρ)` term goes through the same exact
+// dense `trace_hinv` kernel. So the matrix-free objective AND gradient must be
+// numerically exact, not approximate. This fixture pins both to the
+// closed-form / num-dual reference for a genuinely wide (p = 512) custom-family
+// joint system, closing the dim > 64 coverage gap the dense guard does not
+// reach. A `0.5·log|H|` collapse, a dropped penalty-derivative trace term, or a
+// stochastic logdet sneaking into this regime would fail these assertions.
+//
+// Closed form. The family is `p` independent diagonal coordinates: inner
+// objective `Σ_i (β_i − t_i)²` (per-coordinate data Hessian 2), ridge penalty
+// `0.5·λ·‖β‖²` with `λ = eᵖ`. Each coordinate is exactly the scalar ρ fixture,
+// so `β̂_i = 2 t_i / (2 + λ)` and the StrictPseudoLaplace objective is
+// `Σ_i [resid_i² + 0.5·λ·β̂_i²] + 0.5·p·ln(2 + λ)` (the log|H| term is
+// `0.5·log|（2+λ)·I_p| = 0.5·p·ln(2+λ)`). The ρ-gradient is the analytic
+// derivative of that scalar function, taken via `num_dual` so the reference is
+// independent of any hand chain-rule.
+
+const PSEUDO_LAPLACE_DIM: usize = 512;
+
+/// `p`-dimensional diagonal pseudo-Laplace family with a learnable `ρ`
+/// (`λ = eᵖ`). Joint Hessian is the constant `2·I_p`; `D_β H = 0`. This is the
+/// scalar ρ fixture replicated across `targets.len()` independent coordinates,
+/// which makes `total_p = p` route through the matrix-free operator at `p ≥ 512`
+/// while keeping a clean per-coordinate closed form.
+#[derive(Clone)]
+struct DiagonalPseudoLaplaceRhoFamily {
+    targets: Vec<f64>,
+}
+
+impl CustomFamily for DiagonalPseudoLaplaceRhoFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta = &block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta;
+        let p = self.targets.len();
+        assert_eq!(beta.len(), p, "diagonal pseudo-laplace beta width");
+        let mut log_likelihood = 0.0;
+        let mut gradient = Array1::<f64>::zeros(p);
+        for i in 0..p {
+            let resid = beta[i] - self.targets[i];
+            log_likelihood -= resid * resid;
+            gradient[i] = -2.0 * resid;
+        }
+        Ok(FamilyEvaluation {
+            log_likelihood,
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient,
+                hessian: SymmetricMatrix::Dense(2.0 * Array2::<f64>::eye(p)),
+            }],
+        })
+    }
+
+    fn exact_newton_outerobjective(&self) -> ExactNewtonOuterObjective {
+        ExactNewtonOuterObjective::StrictPseudoLaplace
+    }
+
+    // Same isolation rationale as the scalar fixtures: pin exactly the
+    // log-determinant term, opt out of the near-separation Jeffreys/Firth gate
+    // (the system is cleanly identified, H = 2·I_p).
+    fn joint_jeffreys_term_required(&self) -> bool {
+        false
+    }
+
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(!block_states.is_empty(), "rho joint hessian needs blocks");
+        Ok(Some(2.0 * Array2::<f64>::eye(self.targets.len())))
+    }
+
+    fn exact_newton_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        block_index: usize,
+        direction: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_index < block_states.len(), "rho block index in range");
+        assert_eq!(
+            direction.len(),
+            block_states[block_index].beta.len(),
+            "rho dir len matches beta"
+        );
+        let p = self.targets.len();
+        Ok(Some(Array2::<f64>::zeros((p, p))))
+    }
+
+    fn exact_newton_joint_hessian_directional_derivative(
+        &self,
+        block_states: &[ParameterBlockState],
+        direction: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        let total: usize = block_states.iter().map(|s| s.beta.len()).sum();
+        assert_eq!(direction.len(), total, "rho joint dir matches total beta");
+        Ok(Some(Array2::<f64>::zeros((total, total))))
+    }
+}
+
+/// Closed-form StrictPseudoLaplace objective for the diagonal ρ fixture, generic
+/// over a dual number so `num_dual` can supply the exact ρ-derivative. Mirrors
+/// the scalar `scalar_pseudo_laplace_rhoobjective_numdual` summed over the `p`
+/// independent coordinates: `Σ_i [resid_i² + 0.5·λ·β̂_i²] + 0.5·p·ln(2 + λ)`.
+fn diagonal_pseudo_laplace_rho_objective_numdual<D: DualNum<f64> + Copy>(
+    rho: D,
+    targets: &[f64],
+) -> D {
+    let lambda = rho.exp();
+    let denom = D::from(2.0) + lambda;
+    let mut acc = D::from(0.0);
+    for &t in targets {
+        let beta_hat = D::from(2.0 * t) / denom;
+        let resid = beta_hat - D::from(t);
+        acc = acc + resid * resid + D::from(0.5) * lambda * beta_hat * beta_hat;
+    }
+    acc + D::from(0.5 * targets.len() as f64) * denom.ln()
+}
+
+fn diagonal_pseudo_laplace_rho_spec(p: usize) -> ParameterBlockSpec {
+    // Design = I_p so each coordinate carries one observation (eta length = p),
+    // and the per-coordinate data Hessian is exactly 2. A single block of width
+    // p gives total_p = p — the size that drives the matrix-free route.
+    ParameterBlockSpec {
+        name: "diag_rho_block".to_string(),
+        design: gam::matrix::DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(
+            Array2::<f64>::eye(p),
+        )),
+        offset: Array1::zeros(p),
+        penalties: vec![PenaltyMatrix::Dense(Array2::eye(p))],
+        nullspace_dims: vec![0],
+        initial_log_lambdas: array![0.0],
+        initial_beta: Some(Array1::zeros(p)),
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }
+}
+
+#[test]
+fn owed_1395_matrix_free_pseudo_laplace_rho_objective_matches_closed_form() {
+    let p = PSEUDO_LAPLACE_DIM;
+    assert!(
+        p >= 512,
+        "fixture must clear the matrix-free total_p>=512 threshold (gam#1395 dim>64 coverage)"
+    );
+    // Distinct, non-trivial targets so the quadratic term is genuinely
+    // p-dependent (not a degenerate all-equal system).
+    let targets: Vec<f64> = (0..p).map(|i| 0.5 + 0.013 * (i as f64)).collect();
+    let family = DiagonalPseudoLaplaceRhoFamily {
+        targets: targets.clone(),
+    };
+    let spec = diagonal_pseudo_laplace_rho_spec(p);
+    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        compute_covariance: false,
+        ridge_floor: 1e-12,
+        ..BlockwiseFitOptions::default()
+    };
+
+    for rho in [-1.7_f64, -0.8, 0.0, 0.9, 1.8] {
+        let result = evaluate_custom_family_joint_hyper(
+            &family,
+            std::slice::from_ref(&spec),
+            &options,
+            &array![rho],
+            &derivative_blocks,
+            None,
+            gam::families::custom_family::EvalMode::ValueAndGradient,
+        )
+        .expect("matrix-free pseudo-laplace rho hyper eval");
+        assert!(
+            result.inner_converged,
+            "gam#1395 matrix-free rho={rho}: inner solve must converge for the \
+             outer objective/gradient to be valid"
+        );
+        let expected = diagonal_pseudo_laplace_rho_objective_numdual(rho, &targets);
+        // Relative floor: the objective is O(10³) at p=512, so a 1e-9 relative
+        // band is the honest f64 reassociation floor for a 512-dim
+        // eigendecomposition, not a loosened gate (a collapsed log|H| term would
+        // be O(0.5·p·ln2) ≈ 177 — utterly outside this band).
+        let tol = 1e-9 * (1.0 + expected.abs());
+        assert!(
+            (result.objective - expected).abs() < tol,
+            "gam#1395 matrix-free pseudo-Laplace rho={rho}, p={p}: objective={} \
+             expected (closed form)={} (gap={:.3e}, tol={:.3e}) — the 0.5·p·ln(2+λ) \
+             Laplace term must NOT collapse on the matrix-free (dim>64) route the \
+             dense guard does not cover",
+            result.objective,
+            expected,
+            (result.objective - expected).abs(),
+            tol
+        );
+    }
+}
+
+#[test]
+fn owed_1395_matrix_free_pseudo_laplace_rho_gradient_matches_num_dual() {
+    let p = PSEUDO_LAPLACE_DIM;
+    let targets: Vec<f64> = (0..p).map(|i| 0.5 + 0.013 * (i as f64)).collect();
+    let family = DiagonalPseudoLaplaceRhoFamily {
+        targets: targets.clone(),
+    };
+    let spec = diagonal_pseudo_laplace_rho_spec(p);
+    let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new()];
+    let options = BlockwiseFitOptions {
+        use_remlobjective: true,
+        compute_covariance: false,
+        ridge_floor: 1e-12,
+        ..BlockwiseFitOptions::default()
+    };
+
+    for rho in [-1.7_f64, -0.8, 0.0, 0.9, 1.8] {
+        let result = evaluate_custom_family_joint_hyper(
+            &family,
+            std::slice::from_ref(&spec),
+            &options,
+            &array![rho],
+            &derivative_blocks,
+            None,
+            gam::families::custom_family::EvalMode::ValueAndGradient,
+        )
+        .expect("matrix-free pseudo-laplace rho hyper eval");
+        assert!(
+            result.inner_converged,
+            "gam#1395 matrix-free rho={rho}: inner solve must converge"
+        );
+        // Exact ρ-derivative of the closed form, via num-dual (no hand
+        // chain-rule). The matrix-free 0.5·tr(H⁻¹ ∂H/∂ρ) term goes through the
+        // same exact dense trace_hinv kernel as the objective's logdet, so the
+        // analytic gradient must match this to tight tolerance.
+        let (value_nd, grad_nd) =
+            first_derivative(|x| diagonal_pseudo_laplace_rho_objective_numdual(x, &targets), rho);
+        assert_eq!(result.gradient.len(), 1, "scalar ρ gradient expected");
+        let obj_tol = 1e-9 * (1.0 + value_nd.abs());
+        assert!(
+            (result.objective - value_nd).abs() < obj_tol,
+            "gam#1395 matrix-free rho={rho}, p={p}: objective={} num_dual={} (gap={:.3e})",
+            result.objective,
+            value_nd,
+            (result.objective - value_nd).abs()
+        );
+        // The gradient is O(10²–10³) at p=512; the same 1e-9 relative floor
+        // applies. A dropped penalty-derivative trace term or a stochastic
+        // logdet-gradient on this route would shift it by O(p), far outside.
+        let grad_tol = 1e-9 * (1.0 + grad_nd.abs());
+        assert!(
+            (result.gradient[0] - grad_nd).abs() < grad_tol,
+            "gam#1395 matrix-free pseudo-Laplace rho={rho}, p={p}: analytic outer \
+             gradient={} num_dual closed-form={} (gap={:.3e}, tol={:.3e}) — the \
+             matrix-free 0.5·tr(H⁻¹ ∂H/∂ρ) logdet-gradient trace must match the \
+             exact dense-spectral reference on the dim>64 route",
+            result.gradient[0],
+            grad_nd,
+            (result.gradient[0] - grad_nd).abs(),
+            grad_tol
         );
     }
 }
