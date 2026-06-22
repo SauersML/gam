@@ -1,5 +1,13 @@
 use super::*;
 
+/// #1033 — temperature on the chart-geometry routing predictor's cosine-aligned
+/// logit `gate_logit_scale · ⟨x, γ̂⟩`. The alignment `⟨x, γ̂⟩` is on the natural
+/// `‖x‖` scale; this scale maps it into the gate's logit range so a
+/// well-reconstructing atom gets a clearly-on gate and a poorly-reconstructing one
+/// a clearly-off gate. A starting value pending the MSI accuracy-gate calibration
+/// (the single knob the fit-quality measurement tunes).
+const AMORTIZED_GATE_LOGIT_SCALE: f64 = 1.0;
+
 pub(crate) fn reconstruction_explained_variance(
     target: ArrayView2<'_, f64>,
     fitted: ArrayView2<'_, f64>,
@@ -191,24 +199,50 @@ impl SaeManifoldOuterObjective {
     }
 
     /// #1033 — opt into AMORTIZED (frozen) routing for the ρ-search: freeze the
-    /// term's assignment gates to the ρ-invariant routing distilled from the
-    /// CURRENT (construction-time / seed) dictionary, so the outer ρ-search reuses
-    /// one routing instead of re-solving the per-row gates at every eval (the
-    /// n-independent-outer-loop lever). Freezing once here — from the seed/anchor
-    /// dictionary — makes the routing genuinely ρ-invariant across the entire
-    /// search; the inner solve then optimizes only the coordinates and decoder.
-    /// The baseline (multi-start restore) term is frozen to match, so a reset
-    /// keeps the same routing. OFF unless opted in; rejected for Softmax
-    /// (separable-mode contract). Returns an error if the freeze is rejected.
+    /// term's assignment gates to a ρ-invariant routing distilled from the CURRENT
+    /// (construction-time / seed) dictionary, so the outer ρ-search reuses one
+    /// routing instead of re-solving the per-row gates at every eval (the
+    /// n-independent-outer-loop lever). `None` ⇒ off (free-logit search, the
+    /// default). `Some(predictor)` selects the fixed-form distill:
+    ///   * [`RoutingPredictor::Snapshot`] — freeze the current logits as-is
+    ///     (cheapest; the MVP/baseline; goes stale if the dictionary moves);
+    ///   * [`RoutingPredictor::ChartGeometry`] — distill the routing from the
+    ///     encode-chart reconstruction alignment of the current dictionary
+    ///     ([`SaeManifoldTerm::chart_geometry_routing_logits`]), which tracks the
+    ///     dictionary geometry.
+    /// Freezing here (from the seed/anchor dictionary) makes the routing
+    /// ρ-invariant across the search; the inner solve then optimizes only the
+    /// coordinates and decoder. The baseline (multi-start restore) term is frozen
+    /// to match. Rejected for Softmax (separable-mode contract). The accuracy gate
+    /// decides which predictor (and whether a per-outer-iterate refresh) is needed.
     #[must_use = "build error must be handled"]
-    pub fn with_amortized_routing(mut self, enabled: bool) -> Result<Self, String> {
-        if enabled {
-            self.term.assignment.freeze_routing_in_place()?;
-            // Freeze the multi-start restore baseline to match, so a `reset` keeps
-            // the same ρ-invariant routing.
-            self.baseline_term.assignment.freeze_routing_in_place()?;
-            self.routing_frozen = true;
+    pub fn with_amortized_routing(
+        mut self,
+        predictor: Option<RoutingPredictor>,
+    ) -> Result<Self, String> {
+        let Some(form) = predictor else {
+            return Ok(self);
+        };
+        match form {
+            RoutingPredictor::Snapshot => {
+                self.term.assignment.freeze_routing_in_place()?;
+                self.baseline_term.assignment.freeze_routing_in_place()?;
+            }
+            RoutingPredictor::ChartGeometry => {
+                let predicted = self.term.chart_geometry_routing_logits(
+                    self.target.view(),
+                    &self.current_rho,
+                    AMORTIZED_GATE_LOGIT_SCALE,
+                )?;
+                self.term
+                    .assignment
+                    .set_frozen_routing_in_place(predicted.clone())?;
+                self.baseline_term
+                    .assignment
+                    .set_frozen_routing_in_place(predicted)?;
+            }
         }
+        self.routing_frozen = true;
         Ok(self)
     }
 

@@ -118,6 +118,7 @@ pub use crate::terms::sae::assignment::*;
 pub use crate::terms::sae::basis::*;
 pub use crate::terms::sae::frames::*;
 
+mod amortized_routing;
 mod arrow_solver;
 mod atom;
 mod certificate;
