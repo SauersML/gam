@@ -519,13 +519,12 @@ impl ResidentDesignGram {
     pub fn gram(&self, w: ArrayView1<'_, f64>) -> Option<Array2<f64>> {
         #[cfg(not(target_os = "linux"))]
         {
-            // `try_new` never constructs `Self` off CUDA (it returns `None`), so
-            // this arm is statically unreachable; consume `w` and decline rather
-            // than diverge, mirroring the other non-Linux device shims.
-            if w.iter().any(|v| !v.is_finite()) {
-                return None;
-            }
-            None
+            // SAFETY: `try_new` returns `None` on every non-Linux target, so no
+            // `ResidentDesignGram` value is ever constructed and this method is
+            // statically unreachable. Fail loudly rather than launder the broken
+            // contract into a `None` sentinel that a caller might treat as a
+            // benign "GPU declined" and silently fall back on corrupt state.
+            panic!("ResidentDesignGram::gram is unreachable off CUDA/Linux")
         }
         #[cfg(target_os = "linux")]
         {
