@@ -446,6 +446,14 @@ fn hash_latent_id_mode(id_mode: &LatentIdMode, hasher: &mut Fingerprinter) {
             hasher.write_usize(2);
             hash_optional_vector(init_log_precision.as_ref(), hasher);
         }
+        LatentIdMode::IsometryToReference {
+            reference,
+            strength,
+        } => {
+            hasher.write_usize(5);
+            hasher.write_f64_array2(reference);
+            hash_aux_prior_strength(*strength, hasher);
+        }
         LatentIdMode::AuxOutcome {
             head,
             init_log_precision,

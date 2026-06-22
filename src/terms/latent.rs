@@ -58,8 +58,9 @@
 //!   opt-out; the caller is responsible for separately providing a unique
 //!   inner minimum (e.g. via a custom penalty).
 //!
-//! `LatentIdMode` does not expose `IsometryToReference` today (proposal §4(b));
-//! use `AuxPrior` or a future isometry prior for gauge fixing.
+//! [`LatentIdMode::IsometryToReference`] (proposal §4(b)) anchors the latent to
+//! a caller-supplied reference configuration via `½ μ ‖t − reference‖²` with a
+//! REML-selectable `μ`, fixing the gauge without an auxiliary signal `u`.
 
 use crate::solver::latent_cache::LatentRetractionRegistry;
 use crate::terms::basis::{BasisError, RadialScalarKind};
@@ -157,6 +158,19 @@ pub enum LatentIdMode {
         /// alongside the behavioral anchor, since the label alone under-pins
         /// the gauge. `None` defaults to a flat zero seed.
         init_log_precision: Option<Array1<f64>>,
+    },
+    /// Anchor the latent configuration to a caller-supplied reference up to
+    /// the global isometry the chosen manifold already quotients out: penalty
+    /// `R_id = ½ μ · ‖t − reference‖²` with REML-selectable `μ` (the log-`μ`
+    /// normalizer enters the marginal likelihood exactly as in `AuxPrior`).
+    /// Unlike `AuxPrior`, the target is a fixed reference configuration (e.g. a
+    /// pilot embedding that fixes the isometry representative) rather than an
+    /// auxiliary-conditional mean `ĥ(u)`, so it pins the gauge with no
+    /// auxiliary signal `u`. `reference` has shape `(n_obs, d)`. As a standalone
+    /// anchor it is a valid gauge fix; it also composes with `DimSelection` ARD.
+    IsometryToReference {
+        reference: Array2<f64>,
+        strength: AuxPriorStrength,
     },
     /// No gauge fix. Inner Hessian is rank-deficient; results are not
     /// uniquely defined. Intended only for the explicit "I supply my own
@@ -776,6 +790,8 @@ impl LatentIdMode {
     pub fn is_identifiable(&self) -> bool {
         match self {
             Self::AuxPrior { .. } | Self::AuxPriorDimSelection { .. } => true,
+            // A fixed-reference anchor pins the full gauge on its own.
+            Self::IsometryToReference { .. } => true,
             // The behavioral head anchors the gauge through the label channel
             // and always composes with ARD axis-selection; it is a standalone
             // identifiable mode provided the head actually carries labels (an

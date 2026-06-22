@@ -463,6 +463,12 @@ fn latent_coord_direct_hyper_count(
                 }
         }
         LatentIdMode::DimSelection { .. } => latent_dim,
+        // A fixed-reference anchor carries at most the REML-selectable log-`μ`
+        // (one direct hyper when `Auto`, none when `Fixed`), like `AuxPrior`.
+        LatentIdMode::IsometryToReference { strength, .. } => match strength {
+            AuxPriorStrength::Auto => 1,
+            AuxPriorStrength::Fixed(_) => 0,
+        },
         // The behavioral head appends one (1 + d) coefficient block per
         // η-channel, plus the composed per-axis ARD log-precisions.
         LatentIdMode::AuxOutcome { head, .. } => head.n_coeffs(latent_dim) + latent_dim,
@@ -494,6 +500,11 @@ fn latent_coord_initial_direct_hypers(
         }
         LatentIdMode::DimSelection { init_log_precision } => {
             append_latent_ard_seed(&mut values, init_log_precision.as_ref(), latent_dim)?;
+        }
+        LatentIdMode::IsometryToReference { strength, .. } => {
+            if matches!(strength, AuxPriorStrength::Auto) {
+                values.push(0.0);
+            }
         }
         LatentIdMode::AuxOutcome {
             head,
@@ -597,6 +608,42 @@ fn latent_id_objective_contribution(
                 gradient[direct_start] += 0.5 * mu * q - 0.5 * n_obs as f64;
             }
         }
+        LatentIdMode::IsometryToReference { reference, strength } => {
+            // Fixed-reference anchor `½ μ ‖t − reference‖²` with REML-selectable
+            // `μ`. Identical structure to `AuxPrior` except the target is a
+            // constant configuration (independent of `t`), so the latent
+            // gradient is the plain `μ · (t − reference)` with no projection
+            // term (`AuxPrior` subtracts the projected residual only because its
+            // target `ĥ(u)` depends on `t` through the internal ridge fit).
+            if reference.dim() != (n_obs, latent_dim) {
+                crate::bail_invalid_estim!(
+                    "IsometryToReference reference shape {:?} must equal (n_obs, latent_dim) = ({}, {})",
+                    reference.dim(),
+                    n_obs,
+                    latent_dim
+                );
+            }
+            let mu_slot = cursor;
+            let (log_mu, mu) = match strength {
+                AuxPriorStrength::Fixed(mu) => (mu.ln(), *mu),
+                AuxPriorStrength::Auto => {
+                    let log_mu = theta[cursor];
+                    cursor += 1;
+                    (log_mu, log_mu.exp())
+                }
+            };
+            let residual = &t - reference;
+            let q = residual.iter().map(|v| v * v).sum::<f64>();
+            cost += 0.5 * mu * q - 0.5 * n_obs as f64 * log_mu;
+            for n in 0..n_obs {
+                for axis in 0..latent_dim {
+                    gradient[t_start + n * latent_dim + axis] += mu * residual[[n, axis]];
+                }
+            }
+            if matches!(strength, AuxPriorStrength::Auto) {
+                gradient[mu_slot] += 0.5 * mu * q - 0.5 * n_obs as f64;
+            }
+        }
         LatentIdMode::AuxOutcome { head, .. } => {
             // Behavioral head likelihood channel: the head's design columns are
             // the live latent codes, so its NLL enters the SAME joint objective
@@ -645,7 +692,9 @@ fn latent_id_objective_contribution(
             }
             cursor += latent_dim;
         }
-        LatentIdMode::AuxPrior { .. } | LatentIdMode::None => {}
+        LatentIdMode::AuxPrior { .. }
+        | LatentIdMode::IsometryToReference { .. }
+        | LatentIdMode::None => {}
     }
 
     if cursor != theta.len() {
