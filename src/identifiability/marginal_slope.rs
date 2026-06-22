@@ -2562,9 +2562,10 @@ mod tests {
     ///   (4) reports `joint_rank` = (raw_total - 1).
     ///
     /// This validates the Phase-4b construction-time orthogonalisation
-    /// path on the survival K=4 row primary state without the SMGS construction
-    /// hook the active sibling integration provides. The shape of the result is
-    /// the contract the SMGS wiring will assert against.
+    /// path on the survival K=4 row primary state and then feeds the
+    /// compiled per-block reduced bases through the SMGS lift [`Gauge`]
+    /// (step 6), asserting the lift's reduced/raw block structure agrees
+    /// with the compiled rank-drop — the construction contract end to end.
     #[test]
     fn compile_survival_three_block_with_shared_constant_drops_one_direction() {
         use crate::identifiability::families::compiler::compile;
@@ -2698,6 +2699,42 @@ mod tests {
         assert_eq!(
             compiled.joint_rank, kept_total,
             "CompiledBlocks::joint_rank must match the sum of per-block t_lw widths",
+        );
+
+        // (6) SMGS construction contract. Feed the compiled per-block reduced
+        // bases (V_k = t_lw, shaped raw_k × kept_k) into the SMGS lift `Gauge`
+        // and verify the lift's coordinate bookkeeping matches the compiler's
+        // rank attribution: the reduced dimension equals `joint_rank`, the
+        // reduced block boundaries advance by each block's kept width, and —
+        // with R = None (no residualised cross-block reparam in this V-only
+        // construction) — the raw block boundaries advance by each block's raw
+        // width. This exercises the SMGS construction hook directly on the
+        // compiled output rather than asserting against a hypothetical shape.
+        let v_per_term: Vec<Array2<f64>> =
+            compiled.blocks.iter().map(|b| b.t_lw.clone()).collect();
+        let r_per_term: Vec<Option<Array2<f64>>> = vec![None; v_per_term.len()];
+        let gauge = Gauge::from_v_and_r(&v_per_term, &r_per_term);
+
+        let mut expected_reduced = vec![0usize];
+        let mut expected_raw = vec![0usize];
+        for b in &compiled.blocks {
+            let prev_reduced = *expected_reduced.last().unwrap();
+            expected_reduced.push(prev_reduced + b.t_lw.ncols());
+            let prev_raw = *expected_raw.last().unwrap();
+            expected_raw.push(prev_raw + b.t_lw.nrows());
+        }
+        assert_eq!(
+            *gauge.block_starts_reduced.last().unwrap(),
+            compiled.joint_rank,
+            "SMGS lift reduced dimension must equal the compiled joint_rank",
+        );
+        assert_eq!(
+            gauge.block_starts_reduced, expected_reduced,
+            "SMGS lift reduced block boundaries must match the compiled kept widths",
+        );
+        assert_eq!(
+            gauge.block_starts_raw, expected_raw,
+            "SMGS lift raw block boundaries must match the compiled per-block raw widths",
         );
     }
 
