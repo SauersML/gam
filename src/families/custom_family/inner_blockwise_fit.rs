@@ -587,6 +587,38 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         let mut prev_rejected_first_attempt_objective: Option<f64> = None;
         let mut consecutive_identical_rejected_cycles: usize = 0;
         const IDENTICAL_REJECTED_STALL_MAX_CYCLES: usize = 2;
+        // Collapsed-trust-region all-reject-at-floor guard (gam#979 survival
+        // hang / binary high-`centers` `IntegrationError`). DISTINCT from the
+        // two detectors above:
+        //   * `consecutive_held_rejected_cycles` requires the radius to be HELD
+        //     relative to the *previous reject* — which it is at any pinned
+        //     value, floor or not — and only fires after 8 cycles.
+        //   * `consecutive_identical_rejected_cycles` requires the trial
+        //     objective to repeat BIT-FOR-BIT, which a near-singular coupled
+        //     marginal↔logslope system need not do: tiny non-deterministic
+        //     round-off in the per-row tower contraction perturbs the trial
+        //     objective in its last ULPs even while the step is otherwise
+        //     stuck, so the byte-identical detector never latches.
+        // The unambiguous deterministic signal of "stuck and cannot recover" is
+        // the trust radius sitting at its absolute `1e-12` floor WHILE every
+        // line-search attempt is rejected: no smaller step is representable, so
+        // the radius cannot shrink further, and the all-reject means the step
+        // makes no progress. After `JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES`
+        // consecutive such cycles the loop is provably grinding to its budget on
+        // a near-singular system (`phantom_multiplier_with_well_conditioned_H`),
+        // so exit cleanly through the SAME identified-subspace / fixed-point
+        // certificate path the other two detectors use — converged if the
+        // range-space residual is stationary, give-best non-converged otherwise
+        // — instead of spinning out the full `inner_max_cycles`. The absolute-
+        // floor requirement is why this CANNOT fire on a genuinely progressing
+        // fit: a fit that is descending keeps the radius well above `1e-12`
+        // (it grows on `rho>0.75`/boundary and only collapses to the floor after
+        // a sustained reject streak), so the counter resets on every accepted
+        // cycle and never reaches the threshold.
+        // Threshold + floor ceiling live in `joint_newton.rs` so the loop and
+        // the `joint_newton_collapsed_trust_region_all_reject_exits_before_grinding_budget`
+        // unit test assert against one source of truth.
+        let mut consecutive_all_reject_at_floor_cycles: usize = 0;
         let mut last_joint_math: Option<JointNewtonMathDiagnostic> = None;
         // Cross-cycle cache of the joint Jeffreys/Firth triple `(β_key, ∇Φ, H_Φ)`
         // (gam#729/#826/#808). Computing `(∇Φ, H_Φ)` costs `p` family
@@ -2969,8 +3001,29 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 } else {
                     prev_rejected_first_attempt_objective = None;
                 }
+                // Collapsed-trust-region all-reject-at-floor detector (gam#979).
+                // Increment only when EVERY attempt this cycle was rejected AND
+                // the joint trust radius has reached its absolute `1e-12` floor:
+                // the radius cannot shrink further and the step makes no
+                // progress, so the next cycle is forced to repeat this one. Any
+                // accepted cycle (handled below via the post-grad-reload reset)
+                // or any cycle whose radius is still above the floor breaks the
+                // streak, so a progressing fit never accumulates it.
+                let all_attempts_rejected_at_floor_this_cycle = all_attempts_rejected
+                    && joint_trust_radius_at_absolute_floor(joint_trust_radius);
+                if all_attempts_rejected_at_floor_this_cycle {
+                    consecutive_all_reject_at_floor_cycles =
+                        consecutive_all_reject_at_floor_cycles.saturating_add(1);
+                } else {
+                    consecutive_all_reject_at_floor_cycles = 0;
+                }
+                let collapsed_floor_exit = joint_collapsed_floor_all_reject_exit(
+                    consecutive_all_reject_at_floor_cycles,
+                    all_attempts_rejected_at_floor_this_cycle,
+                );
                 if consecutive_held_rejected_cycles >= FULLY_REJECTED_STALL_MAX_CYCLES
                     || consecutive_identical_rejected_cycles >= IDENTICAL_REJECTED_STALL_MAX_CYCLES
+                    || collapsed_floor_exit
                 {
                     let last_math_summary = last_joint_math
                         .as_ref()
@@ -2995,6 +3048,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                             "byte-identical first-attempt trial objective for {} consecutive \
                              fully-rejected cycles (exact fixed point)",
                             consecutive_identical_rejected_cycles
+                        )
+                    } else if consecutive_all_reject_at_floor_cycles
+                        >= JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES
+                    {
+                        format!(
+                            "{} consecutive fully-rejected cycles with the joint trust radius \
+                             collapsed to its absolute 1e-12 floor (no smaller step \
+                             representable, step makes no progress)",
+                            consecutive_all_reject_at_floor_cycles
                         )
                     } else {
                         format!(
@@ -3139,7 +3201,9 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     let provable_fixed_point = joint_trust_radius <= FIXED_POINT_TRUST_RADIUS_CEIL
                         && (consecutive_held_rejected_cycles >= FULLY_REJECTED_STALL_MAX_CYCLES
                             || consecutive_identical_rejected_cycles
-                                >= IDENTICAL_REJECTED_STALL_MAX_CYCLES)
+                                >= IDENTICAL_REJECTED_STALL_MAX_CYCLES
+                            || consecutive_all_reject_at_floor_cycles
+                                >= JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES)
                         && model_exact;
                     if provable_fixed_point
                         && last_cycle_obj_change_below_tol
@@ -3224,6 +3288,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // fully-rejected cycles at the SAME iterate.
             prev_rejected_first_attempt_objective = None;
             consecutive_identical_rejected_cycles = 0;
+            // An accepted step moved β and (via the trust-region grow rules)
+            // lifts the radius off its floor, so the collapsed-floor all-reject
+            // streak no longer holds; reset it (gam#979).
+            consecutive_all_reject_at_floor_cycles = 0;
             // Accepted-cycle timing breakdown is debug-only. The per-cycle
             // info line below already includes total cycle time; emitting a
             // four-phase split on every verbose cycle adds a redundant info

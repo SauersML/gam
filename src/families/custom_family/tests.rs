@@ -7721,6 +7721,124 @@ pub(crate) fn joint_trust_region_radius_update_accept_reject_logic() {
     assert_eq!(poor.decision.label(), "shrink_marginal_accept");
 }
 
+/// gam#979: the coupled marginal↔logslope inner joint-Newton must NOT grind its
+/// full cycle budget on a near-singular system whose trust region has collapsed
+/// to the absolute `1e-12` floor with every line-search attempt rejected
+/// (`phantom_multiplier_with_well_conditioned_H`). The deterministic guard fires
+/// after `JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES` consecutive
+/// all-reject-at-floor cycles — well before any realistic `inner_max_cycles`.
+///
+/// This replays the exact counter bookkeeping the loop runs (the same
+/// `joint_trust_radius_at_absolute_floor` / `joint_collapsed_floor_all_reject_exit`
+/// predicates the production loop calls) over a deterministic per-cycle reject
+/// stream, and asserts (a) the guard fires before the budget, (b) it fires at the
+/// threshold cycle (not earlier — so a transient reject does not abort a fit), and
+/// (c) it never fires while the radius is above the floor (a progressing fit).
+#[test]
+pub(crate) fn joint_newton_collapsed_trust_region_all_reject_exits_before_grinding_budget() {
+    // A representative inner budget. The guard must exit FAR below it.
+    let inner_max_cycles = 200usize;
+    assert!(
+        JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES < inner_max_cycles / 4,
+        "the collapsed-floor guard must exit well before the inner cycle budget"
+    );
+
+    // The absolute floor `update_joint_trust_region_radius` clamps to — driven
+    // by repeated rejection (it ratchets the radius down by 0.25 each reject).
+    let mut radius = 1.0_f64;
+    for _ in 0..200 {
+        let rejected = update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 1.0);
+        assert!(!rejected.accepted, "a genuine objective increase must reject");
+        radius = rejected.radius;
+    }
+    assert!(
+        joint_trust_radius_at_absolute_floor(radius),
+        "sustained rejection must collapse the radius to its absolute 1e-12 floor"
+    );
+    assert_eq!(
+        update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 1.0)
+            .decision
+            .label(),
+        "reject_floor",
+        "at the floor a rejected step must be classified reject_floor"
+    );
+
+    // Replay the loop's per-cycle bookkeeping: every cycle is fully rejected at
+    // the collapsed floor. The guard must fire (and the loop break) at exactly
+    // the threshold cycle, never grinding to `inner_max_cycles`.
+    let mut consecutive = 0usize;
+    let mut exit_cycle: Option<usize> = None;
+    for cycle in 0..inner_max_cycles {
+        let all_attempts_rejected = true;
+        let at_floor = joint_trust_radius_at_absolute_floor(radius);
+        let all_attempts_rejected_at_floor = all_attempts_rejected && at_floor;
+        if all_attempts_rejected_at_floor {
+            consecutive += 1;
+        } else {
+            consecutive = 0;
+        }
+        if joint_collapsed_floor_all_reject_exit(consecutive, all_attempts_rejected_at_floor) {
+            exit_cycle = Some(cycle);
+            break;
+        }
+    }
+    let exit_cycle = exit_cycle.expect("collapsed-floor guard must exit, not grind to budget");
+    assert_eq!(
+        exit_cycle,
+        JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES - 1,
+        "guard must fire exactly at the threshold cycle (0-indexed)"
+    );
+    assert!(
+        exit_cycle + 1 < inner_max_cycles,
+        "guard must exit ({} cycles) well before the {} budget",
+        exit_cycle + 1,
+        inner_max_cycles
+    );
+
+    // Normal-path preservation: a progressing fit keeps the radius above the
+    // floor, so neither the per-cycle predicate nor the streak ever trips —
+    // even after far more than the threshold number of rejected (but not
+    // floored) cycles.
+    let progressing_radius = 1e-3_f64;
+    assert!(
+        !joint_trust_radius_at_absolute_floor(progressing_radius),
+        "an above-floor radius must not count as the absolute floor"
+    );
+    let mut progressing_consecutive = 0usize;
+    for _ in 0..(4 * JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES) {
+        let all_attempts_rejected = true;
+        let at_floor = joint_trust_radius_at_absolute_floor(progressing_radius);
+        let all_attempts_rejected_at_floor = all_attempts_rejected && at_floor;
+        if all_attempts_rejected_at_floor {
+            progressing_consecutive += 1;
+        } else {
+            progressing_consecutive = 0;
+        }
+        assert!(
+            !joint_collapsed_floor_all_reject_exit(
+                progressing_consecutive,
+                all_attempts_rejected_at_floor
+            ),
+            "the collapsed-floor guard must never fire while the radius is above the floor"
+        );
+    }
+
+    // And: even AT the floor, a single accepted (non-reject) cycle resets the
+    // streak, so the guard cannot fire on a fit that is still making progress.
+    let mut streak = JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES - 1;
+    // An accepted cycle => `all_attempts_rejected_at_floor` is false => reset.
+    let accepted_cycle_all_reject_at_floor = false;
+    streak = if accepted_cycle_all_reject_at_floor {
+        streak + 1
+    } else {
+        0
+    };
+    assert!(
+        !joint_collapsed_floor_all_reject_exit(streak, accepted_cycle_all_reject_at_floor),
+        "an accepted cycle must reset the streak and suppress the guard"
+    );
+}
+
 #[test]
 pub(crate) fn joint_trust_region_noise_floor_accepts_round_off_negative_actual() {
     // Near-converged iterate at large objective scale: both the

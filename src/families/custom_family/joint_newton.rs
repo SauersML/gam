@@ -2175,6 +2175,46 @@ pub(crate) fn joint_proposal_at_step_floor(proposal_step_inf: f64, step_tol: f64
         && proposal_step_inf <= STEP_FLOOR_CERT_FACTOR * step_tol
 }
 
+/// The absolute trust-radius floor `update_joint_trust_region_radius` clamps to
+/// (`radius.clamp(1.0e-12, 1.0e6)`), with a small multiplicative slack to absorb
+/// the promote-to-`RejectFloor` boundary test there.
+pub(crate) const JOINT_COLLAPSED_FLOOR_RADIUS_CEIL: f64 = 1.0e-12 * (1.0 + 1e-9);
+
+/// Number of consecutive all-reject-at-floor cycles after which the coupled
+/// joint-Newton loop is declared stuck-but-stationary and exited cleanly (gam#979).
+pub(crate) const JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES: usize = 4;
+
+/// Collapsed-trust-region all-reject-at-floor guard (gam#979).
+///
+/// Returns `true` iff the joint trust radius is finite and pinned at its
+/// absolute `1e-12` floor (no smaller step is representable, so it cannot shrink
+/// further) AND a fully-rejected cycle was just observed AND that pattern has now
+/// persisted for `JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES` consecutive cycles.
+/// When all three hold the inner loop is provably grinding to its budget on a
+/// near-singular coupled marginal↔logslope system (the survival-hang root cause):
+/// the step makes no progress and the radius cannot adapt, so every further cycle
+/// reproduces this one. The caller exits through the existing identified-subspace /
+/// fixed-point certificate path (converged if stationary, give-best otherwise).
+///
+/// This is a pure CONTROL-FLOW predicate — it changes no numerics. It cannot fire
+/// on a genuinely-progressing fit: a descending solve keeps the radius well above
+/// the floor (it grows on `rho>0.75`/boundary), so `at_absolute_floor` is false and
+/// the consecutive counter is reset to zero on every non-floor or accepted cycle.
+pub(crate) fn joint_collapsed_floor_all_reject_exit(
+    consecutive_all_reject_at_floor_cycles: usize,
+    all_attempts_rejected_at_floor_this_cycle: bool,
+) -> bool {
+    all_attempts_rejected_at_floor_this_cycle
+        && consecutive_all_reject_at_floor_cycles
+            >= JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES
+}
+
+/// True iff the joint trust radius has reached its absolute `1e-12` floor and can
+/// shrink no further (gam#979). Used to gate the collapsed-floor all-reject streak.
+pub(crate) fn joint_trust_radius_at_absolute_floor(joint_trust_radius: f64) -> bool {
+    joint_trust_radius.is_finite() && joint_trust_radius <= JOINT_COLLAPSED_FLOOR_RADIUS_CEIL
+}
+
 pub(crate) fn joint_trust_region_metric_step_norm(
     delta: &Array1<f64>,
     metric_diag: &Array1<f64>,
