@@ -190,7 +190,7 @@ def categorical_dtype_columns(
             if saw_string and not disqualified:
                 out.add(name)
         return frozenset(out)
-    except Exception:
+    except (ImportError, AttributeError, TypeError, KeyError, ValueError):
         # Dtype introspection is a best-effort enhancement; if a library's
         # introspection API shifts, fall back to value-based inference rather
         # than fail the fit.

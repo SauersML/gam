@@ -478,7 +478,6 @@ fn response_geometry_exp_map<'py>(
 /// is dimensionless to. Read these (not the scale-dependent κ̂ alone) when the data
 /// have been arbitrarily rescaled — e.g. unit-normalised OLMo activations.
 #[pyfunction(signature = (values, geometry, level=0.95))]
-#[allow(clippy::type_complexity)]
 fn response_geometry_fit_curvature<'py>(
     py: Python<'py>,
     values: PyReadonlyArray2<'py, f64>,

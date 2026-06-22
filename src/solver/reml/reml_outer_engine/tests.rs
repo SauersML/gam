@@ -491,7 +491,6 @@ pub(crate) fn full_h_inv_bilinear(h_full: &Array2<f64>, a: &Array1<f64>, b: &Arr
 /// component entirely and recovers the honest correction.
 #[test]
 pub(crate) fn ift_projected_pseudo_inverse_kills_null_subspace_noise() {
-    assert!(file!().ends_with(".rs"));
     let small_eig = 1e-12_f64;
     let (h_full, u_s) = synthetic_h_with_small_eig(small_eig, SmallEigPlacement::OutsideRangeSPlus);
     let kernel = build_subspace_kernel(&h_full, &u_s);
@@ -581,7 +580,6 @@ pub(crate) fn ift_full_h_solve_amplifies_null_subspace_noise_by_inverse_small_ei
 /// outside-`range(S_+)` case in tests 1 and 2 above.
 #[test]
 pub(crate) fn ift_projected_pseudo_inverse_cannot_help_when_small_eig_lives_inside_range_s_plus() {
-    assert!(file!().ends_with(".rs"));
     let small_eig = 1e-8_f64;
     let (h_full, u_s) = synthetic_h_with_small_eig(small_eig, SmallEigPlacement::InsideRangeSPlus);
     let kernel = build_subspace_kernel(&h_full, &u_s);
@@ -610,7 +608,6 @@ pub(crate) fn ift_projected_pseudo_inverse_cannot_help_when_small_eig_lives_insi
 /// and the existing code path is correct).
 #[test]
 pub(crate) fn ift_projected_pseudo_inverse_matches_full_h_on_well_conditioned_fixture() {
-    assert!(file!().ends_with(".rs"));
     // Well-conditioned H — every eigenvalue O(1).
     let p = 5usize;
     let r_subspace = 4usize;
@@ -1852,7 +1849,6 @@ pub(crate) fn test_dense_spectral_operator_solve_multi_matches_column_solves() {
 
 #[test]
 pub(crate) fn test_dense_spectral_operator_cross_trace_matches_column_solves() {
-    assert!(file!().ends_with(".rs"));
     let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
     let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
     let a = array![[1.0, 0.2, -0.1], [0.2, 2.0, 0.3], [-0.1, 0.3, 0.5],];
@@ -1866,7 +1862,6 @@ pub(crate) fn test_dense_spectral_operator_cross_trace_matches_column_solves() {
 
 #[test]
 pub(crate) fn test_dense_spectral_operator_operator_cross_matches_dense_formula() {
-    assert!(file!().ends_with(".rs"));
     let h = array![[5.0, 0.5, 0.25], [0.5, 3.5, 0.2], [0.25, 0.2, 2.5],];
     let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
     let dense = array![[1.0, 0.1, -0.2], [0.1, 0.75, 0.3], [-0.2, 0.3, 1.25],];
@@ -1891,7 +1886,6 @@ pub(crate) fn test_dense_spectral_operator_operator_cross_matches_dense_formula(
 
 #[test]
 pub(crate) fn test_hyper_coord_total_drift_result_keeps_operator_and_dense_correction() {
-    assert!(file!().ends_with(".rs"));
     let h = array![[4.0, 0.25], [0.25, 3.0],];
     let hop = DenseSpectralOperator::from_symmetric(&h).unwrap();
     let base = array![[1.0, 0.2], [0.2, 0.5],];
@@ -1914,7 +1908,6 @@ pub(crate) fn test_hyper_coord_total_drift_result_keeps_operator_and_dense_corre
 
 #[test]
 pub(crate) fn test_dense_spectral_operator_rotated_logdet_cross_matches_dense_path() {
-    assert!(file!().ends_with(".rs"));
     let h = array![[4.0, 0.5, 0.2], [0.5, 2.5, 0.3], [0.2, 0.3, 1.75],];
     let op = DenseSpectralOperator::from_symmetric(&h).unwrap();
     let a = array![[0.8, 0.2, -0.1], [0.2, 1.4, 0.35], [-0.1, 0.35, 0.9],];
@@ -1931,7 +1924,6 @@ pub(crate) fn test_dense_spectral_operator_rotated_logdet_cross_matches_dense_pa
 
 #[test]
 pub(crate) fn test_compute_adjoint_z_c_streaming_matches_dense_reference() {
-    assert!(file!().ends_with(".rs"));
     // streaming and dense paths differ only by reordering the sum that builds v;
     // with n=64, p=8 the gap is bounded by O(εn) ≈ 1e-14.
     let n = 64usize;
@@ -2002,7 +1994,6 @@ pub(crate) fn test_compute_adjoint_z_c_streaming_matches_dense_reference() {
 
 #[test]
 pub(crate) fn fourth_derivative_trace_matrix_matches_scalar_pair_formula() {
-    assert!(file!().ends_with(".rs"));
     let n = 37usize;
     let p = 5usize;
     let t = 4usize;
@@ -2680,7 +2671,6 @@ pub(crate) fn subspace_base_h2_traces_match_scalar_projected_kernel_path() {
 
 #[test]
 pub(crate) fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alpha() {
-    assert!(file!().ends_with(".rs"));
     // p=4, K=2, r=2 fixture — exercises the full projection K = U_S H_proj⁻¹ U_Sᵀ
     // (the existing r=1 case at projected_operator_hessian_matches_dense_subspace_trace
     // only verifies a trivial 1-D subspace).  Includes a small symmetric off-diagonal
@@ -2808,7 +2798,6 @@ pub(crate) fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alp
 
 #[test]
 pub(crate) fn projected_operator_hessian_matches_dense_subspace_trace() {
-    assert!(file!().ends_with(".rs"));
     let h = array![[3.0, 0.2], [0.2, 5.0]];
     let hop = Arc::new(DenseSpectralOperator::from_symmetric(&h).unwrap());
     let beta = array![0.4, -0.7];
@@ -2907,7 +2896,6 @@ pub(crate) fn projected_operator_hessian_matches_dense_subspace_trace() {
 
 #[test]
 pub(crate) fn penalty_subspace_batched_reduction_matches_serial_operator_reduction() {
-    assert!(file!().ends_with(".rs"));
     let kernel = PenaltySubspaceTrace {
         u_s: array![[1.0, 0.0], [0.2, 0.8], [-0.1, 0.6]],
         h_proj_inverse: array![[0.8, 0.1], [0.1, 0.6]],
@@ -3467,7 +3455,6 @@ pub(crate) fn test_reml_laml_evaluate_gaussian_basic() {
 
 #[test]
 pub(crate) fn fixed_dispersion_firth_cost_subtracts_jeffreys_term() {
-    assert!(file!().ends_with(".rs"));
     let x = array![[1.0, 0.0], [1.0, 1.0], [1.0, -1.0]];
     let eta = array![0.0, 0.4, -0.2];
     let firth_op = std::sync::Arc::new(
@@ -4426,7 +4413,6 @@ pub(crate) fn dense_spectral_logdet_traces_do_not_claim_hinv_kernel_equivalence(
 
 #[test]
 pub(crate) fn dense_spectral_hinv_cross_matches_solve_contraction() {
-    assert!(file!().ends_with(".rs"));
     let h = array![[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0],];
     let a = array![[1.0, 0.2, 0.1], [0.2, 0.5, 0.0], [0.1, 0.0, 0.3],];
     let b = array![[0.3, 0.1, 0.0], [0.1, 0.8, 0.2], [0.0, 0.2, 0.6],];
@@ -4442,7 +4428,6 @@ pub(crate) fn dense_spectral_hinv_cross_matches_solve_contraction() {
 
 #[test]
 pub(crate) fn sparse_block_local_operator_cross_without_takahashi_matches_dense_reference() {
-    assert!(file!().ends_with(".rs"));
     let h = array![
         [5.0, 0.2, 0.0, 0.1],
         [0.2, 4.0, 0.3, 0.0],
@@ -4478,7 +4463,6 @@ pub(crate) fn sparse_block_local_operator_cross_without_takahashi_matches_dense_
 
 #[test]
 pub(crate) fn sparse_matrix_block_operator_cross_without_takahashi_matches_dense_reference() {
-    assert!(file!().ends_with(".rs"));
     let h = array![
         [5.0, 0.2, 0.0, 0.1],
         [0.2, 4.0, 0.3, 0.0],
@@ -4520,7 +4504,6 @@ pub(crate) fn sparse_matrix_block_operator_cross_without_takahashi_matches_dense
 
 #[test]
 pub(crate) fn sparse_takahashi_trace_hinv_product_pairs_symmetric_lookups() {
-    assert!(file!().ends_with(".rs"));
     let h = array![[4.0, 0.2, 0.1], [0.2, 3.0, 0.4], [0.1, 0.4, 2.5],];
     let h_sparse = crate::linalg::sparse_exact::dense_to_sparse_symmetric_upper(&h, 0.0).unwrap();
     let factor =
@@ -4543,7 +4526,6 @@ pub(crate) fn sparse_takahashi_trace_hinv_product_pairs_symmetric_lookups() {
 
 #[test]
 pub(crate) fn hyper_operator_bilinear_view_matches_owned_bilinear() {
-    assert!(file!().ends_with(".rs"));
     let dense = DenseMatrixHyperOperator {
         matrix: array![[2.0, 0.3, -0.1], [0.3, 1.5, 0.4], [-0.1, 0.4, 3.0],],
     };
@@ -4587,7 +4569,6 @@ pub(crate) fn hyper_operator_bilinear_view_matches_owned_bilinear() {
 
 #[test]
 pub(crate) fn hyper_operator_scaled_add_mul_vec_matches_owned_matvec() {
-    assert!(file!().ends_with(".rs"));
     let dense = DenseMatrixHyperOperator {
         matrix: array![[2.0, 0.3, -0.1], [0.3, 1.5, 0.4], [-0.1, 0.4, 3.0],],
     };
@@ -4638,7 +4619,6 @@ pub(crate) fn hyper_operator_scaled_add_mul_vec_matches_owned_matvec() {
 
 #[test]
 pub(crate) fn stochastic_single_second_order_estimators_match_batched_paths() {
-    assert!(file!().ends_with(".rs"));
     let diag = array![4.0, 3.0, 2.0];
     let hop = MatrixFreeSpdOperator::new_with_mode(
         diag.len(),

@@ -2101,7 +2101,6 @@ pub fn cpu_oracle_third_contraction(
 
 /// One ordered fourth contracted matrix `D_{dir2}(D_{dir1} H)`; mirrors
 /// `compute_survival_fourth_contracted_ordered`.
-#[allow(clippy::too_many_arguments)]
 fn b10_fourth_ordered(
     p: usize,
     qd1_index: usize,

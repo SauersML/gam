@@ -2474,7 +2474,6 @@ impl CustomFamily for BinomialLocationScaleFamily {
         idx: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         assert!(arr.iter().all(|v| !v.is_nan()));
         Err(

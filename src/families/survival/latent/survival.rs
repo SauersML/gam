@@ -4141,7 +4141,6 @@ impl CustomFamily for LatentSurvivalFamily {
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(!block_spec.name.is_empty());
         if block_idx == Self::BLOCK_TIME {
             Ok(self.time_linear_constraints.clone())
@@ -4163,7 +4162,6 @@ impl CustomFamily for LatentSurvivalFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         Ok(Some(Arc::new(LatentSurvivalHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -4175,7 +4173,6 @@ impl CustomFamily for LatentSurvivalFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         self.evaluate_exact_newton_joint_gradient_dense(block_states)
             .map(|(log_likelihood, gradient)| {
                 Some(ExactNewtonJointGradientEvaluation {
@@ -4371,7 +4368,6 @@ impl CustomFamily for LatentBinaryFamily {
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(!block_spec.name.is_empty());
         if block_idx == Self::BLOCK_TIME {
             Ok(self.time_linear_constraints.clone())
@@ -4393,7 +4389,6 @@ impl CustomFamily for LatentBinaryFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         Ok(Some(Arc::new(LatentBinaryHessianWorkspace::new(
             self.clone(),
             block_states.to_vec(),
@@ -4405,7 +4400,6 @@ impl CustomFamily for LatentBinaryFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         self.evaluate_exact_newton_joint_dense(block_states)
             .map(|(log_likelihood, gradient, _)| {
                 Some(ExactNewtonJointGradientEvaluation {

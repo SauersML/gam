@@ -176,7 +176,6 @@ fn run_one(flex: bool, label: &str, budget_s: f64) {
 
 #[test]
 fn margslope_rigid_small_good_condition_completes_quickly() {
-    assert!(file!().ends_with(".rs"));
     // Rigid probit: closed-form vectorized inner solve. n=2000 should
     // complete in well under a second of compute on any reasonable
     // hardware; allow 30s to absorb CI-runner variance.
@@ -185,7 +184,6 @@ fn margslope_rigid_small_good_condition_completes_quickly() {
 
 #[test]
 fn margslope_flex_small_good_condition_completes_quickly() {
-    assert!(file!().ends_with(".rs"));
     // Flex probit: cubic score_warp + link_dev deviation blocks exercise
     // the per-row sextic-kernel cell evaluator at every inner-PIRLS
     // iteration. At n=2000 this is the large-scale production code path on

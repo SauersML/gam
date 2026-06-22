@@ -378,7 +378,6 @@ fn row_kappas_for_family(family: &str, eta: f64, dispersion: f64) -> PyResult<Ro
     design, family, eta, tested_start, tested_end, ref_df,
     penalty = None, dispersion = 1.0, prior_weights = None, lr_statistic = None
 ))]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn lawley_bartlett_factor<'py>(
     py: Python<'py>,
     design: numpy::PyReadonlyArray2<'py, f64>,
@@ -498,7 +497,6 @@ pub(crate) fn lawley_bartlett_factor<'py>(
     penalty, components, rho_cov,
     dispersion = 1.0, prior_weights = None, lr_statistic = None
 ))]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn lawley_bartlett_factor_estimated_lambda<'py>(
     py: Python<'py>,
     design: numpy::PyReadonlyArray2<'py, f64>,
@@ -659,7 +657,6 @@ pub(crate) fn lawley_bartlett_factor_estimated_lambda<'py>(
     contrast, beta, penalized_hessian, row_scores, lr_statistic,
     fisher_information = None, theta_null = 0.0
 ))]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn skovgaard_r_star<'py>(
     py: Python<'py>,
     contrast: numpy::PyReadonlyArray1<'py, f64>,
@@ -867,7 +864,6 @@ fn riesz_functional_gradient(
     design_row = None, design_row_b = None, design_matrix = None,
     weights = None, leverage = None
 ))]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn debiased_functional<'py>(
     py: Python<'py>,
     beta: numpy::PyReadonlyArray1<'py, f64>,
@@ -974,7 +970,6 @@ fn canonical_glm_family(name: &str) -> PyResult<CanonicalGlmFamily> {
 /// witness (`0` when every candidate was cold-fit).
 #[pyfunction]
 #[pyo3(signature = (design, response, s_lambda, x_star, family, alpha, candidates = None))]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn glm_full_conformal<'py>(
     py: Python<'py>,
     design: numpy::PyReadonlyArray2<'py, f64>,

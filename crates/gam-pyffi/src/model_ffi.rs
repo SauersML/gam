@@ -5119,7 +5119,6 @@ fn gaussian_reml_fit_with_constraints_backward<'py>(
 /// backward`) on the reduced system, and lift its gradients back to p-space:
 /// `grad_X = grad_X_Z Zᵀ`, `grad_S = Z grad_S_Z Zᵀ`; `grad_y`/`grad_weights`
 /// are invariant under the reparametrisation.
-#[allow(clippy::too_many_arguments)]
 fn constrained_active_backward<'py>(
     py: Python<'py>,
     x: ArrayView2<'_, f64>,

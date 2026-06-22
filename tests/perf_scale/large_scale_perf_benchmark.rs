@@ -97,7 +97,6 @@ fn time_fit(formula: &str, data: &gam::data::EncodedDataset, cfg: &FitConfig) ->
 
 #[test]
 fn large_scale_perf_cylinder_n1m() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -114,7 +113,6 @@ fn large_scale_perf_cylinder_n1m() {
 
 #[test]
 fn large_scale_perf_periodic_1d_n1m() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -131,7 +129,6 @@ fn large_scale_perf_periodic_1d_n1m() {
 
 #[test]
 fn large_scale_perf_bc_1d_n1m() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -144,7 +141,6 @@ fn large_scale_perf_bc_1d_n1m() {
 
 #[test]
 fn large_scale_perf_sphere_wahba_n100k() {
-    assert!(file!().ends_with(".rs"));
     // Sphere Wahba kernel is O(N·K), so at N=1M K=50 = 50M kernel evals,
     // which dominates. Cap at N=100K for now to keep the test under a
     // minute.
@@ -160,7 +156,6 @@ fn large_scale_perf_sphere_wahba_n100k() {
 
 #[test]
 fn large_scale_perf_sphere_harmonic_n1m() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -206,7 +201,6 @@ fn noisy_cylinder_data(n: usize, noise_sd: f64, seed: u64) -> gam::data::Encoded
 
 #[test]
 fn large_scale_perf_cylinder_noisy_n100k_accuracy() {
-    assert!(file!().ends_with(".rs"));
     // Fit on noisy data, check that |residuals| has expected scale.
     init_parallelism();
     let cfg = FitConfig {
@@ -226,7 +220,6 @@ fn large_scale_perf_cylinder_noisy_n100k_accuracy() {
 
 #[test]
 fn large_scale_perf_mixed_three_smooths_n100k() {
-    assert!(file!().ends_with(".rs"));
     // Compound model: periodic 1D + BC 1D + sphere harmonic. Tests that
     // mixed-feature models build and fit at large scale.
     init_parallelism();
@@ -272,7 +265,6 @@ fn large_scale_perf_mixed_three_smooths_n100k() {
 
 #[test]
 fn large_scale_perf_binomial_cylinder_n100k() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let n = 100_000;
     let headers = vec!["theta".into(), "h".into(), "y".into()];

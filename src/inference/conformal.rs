@@ -312,7 +312,6 @@ impl ConformalCalibrator {
     /// `design`, `offset`, `phi` mirror the arguments
     /// [`compute_alo_diagnostics_from_unified`] requires; `eta` is the fitted
     /// in-sample linear predictor `Xβ̂ + offset`.
-    #[allow(clippy::too_many_arguments)]
     pub fn from_fit(
         fit: &UnifiedFitResult,
         family: &LikelihoodSpec,

@@ -433,7 +433,6 @@ fn periodic_multioutput_fit_commutes_with_ambient_affine_stretching() {
 
 #[test]
 fn periodic_curve_evaluation_wraps_distorted_high_dimensional_loop() {
-    assert!(file!().ends_with(".rs"));
     let n = 160;
     let u = Array1::from_iter((0..n).map(|i| std::f64::consts::TAU * i as f64 / n as f64));
     let mut y = Array2::<f64>::zeros((n, 5));
@@ -1062,7 +1061,6 @@ fn test_thin_platewith_knot_count_constructor() {
 
 #[test]
 fn test_thin_plate_knot_selection_is_deterministic() {
-    assert!(file!().ends_with(".rs"));
     let data = array![
         [0.0, 0.0],
         [1.0, 0.0],
@@ -2428,7 +2426,6 @@ fn test_basis_boundaryvalues() {
 
 #[test]
 fn test_constant_extrapolation_matches_boundary_basisvalues() {
-    assert!(file!().ends_with(".rs"));
     let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
     let degree = 3usize;
     let left_boundary = evaluate_splines_at_point(0.0, degree, knots.view());
@@ -2445,7 +2442,6 @@ fn test_constant_extrapolation_matches_boundary_basisvalues() {
 
 #[test]
 fn test_create_basis_uses_linear_extension_outside_domain() {
-    assert!(file!().ends_with(".rs"));
     let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0];
     let degree = 3usize;
     let x = array![-0.5, 4.5];
@@ -2742,7 +2738,6 @@ fn test_ispline_scalar_is_monotone_in_x() {
 
 #[test]
 fn test_mspline_scalar_matches_scaled_bspline() {
-    assert!(file!().ends_with(".rs"));
     let knots = array![0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0];
     let degree = 2usize;
     let x = 1.25;
@@ -2830,7 +2825,6 @@ fn test_ispline_basis_drops_identicallyzero_leading_column() {
 
 #[test]
 fn test_ispline_derivative_matches_cumulative_bspline_derivative_finite_difference() {
-    assert!(file!().ends_with(".rs"));
     let knots = array![0.0, 0.0, 0.0, 0.0, 1.0, 2.0, 3.0, 3.0, 3.0, 3.0];
     let degree = 2usize;
     let bs_degree = degree + 1;
@@ -3058,7 +3052,6 @@ fn test_ispline_sparse_output_is_rejected() {
 
 #[test]
 fn test_degree_0_boundary_behavior() {
-    assert!(file!().ends_with(".rs"));
     let knots: Array1<f64> = array![0.0, 0.0, 1.0, 2.0, 2.0];
     let x = 2.0;
 
@@ -3409,7 +3402,6 @@ fn test_invalid_knot_vector_monotonicity_and_finiteness() {
 
 #[test]
 fn testsecond_derivative_matches_finite_difference() {
-    assert!(file!().ends_with(".rs"));
     let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
     let degree = 3;
     let num_basis = knots.len() - degree - 1;
@@ -3438,7 +3430,6 @@ fn testsecond_derivative_matches_finite_difference() {
 
 #[test]
 fn testthird_derivative_matches_finite_difference() {
-    assert!(file!().ends_with(".rs"));
     let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
     let degree = 3;
     let num_basis = knots.len() - degree - 1;
@@ -3465,7 +3456,6 @@ fn testthird_derivative_matches_finite_difference() {
 
 #[test]
 fn test_fourth_derivative_matches_finite_difference() {
-    assert!(file!().ends_with(".rs"));
     let knots = array![0.0, 0.0, 0.0, 0.0, 0.0, 0.3, 0.6, 1.0, 1.0, 1.0, 1.0, 1.0];
     let degree = 4;
     let num_basis = knots.len() - degree - 1;
@@ -3830,7 +3820,6 @@ fn test_build_duchon_basisfreezes_default_spatial_identifiability() {
 
 #[test]
 fn test_duchon_basis_spec_rejects_removed_double_penalty_field() {
-    assert!(file!().ends_with(".rs"));
     let payload = r#"{
             "center_strategy": { "FarthestPoint": { "num_centers": 4 } },
             "length_scale": 1.0,
@@ -4031,7 +4020,6 @@ fn assert_scale_free_joint_null_is_only_constant(
 /// the property the centered-mass design exists to deliver.
 #[test]
 fn test_scale_free_duchon_joint_null_space_is_only_the_constant() {
-    assert!(file!().ends_with(".rs"));
     // d=3 — the legacy 5-point cube-corner fixture. Linear null space
     // with power=1 satisfies both 2(p+s) > d and 2s < d.
     let data = array![
@@ -4062,7 +4050,6 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant() {
 /// gauge.
 #[test]
 fn test_scale_free_duchon_joint_null_space_is_only_the_constant_1d() {
-    assert!(file!().ends_with(".rs"));
     let data = array![[0.0], [0.5], [1.0], [1.5], [2.0], [2.5], [3.0], [3.5]];
     let spec = DuchonBasisSpec {
         radial_reparam: None,
@@ -4085,7 +4072,6 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant_1d() {
 /// penalized by the centered mass + tension/stiffness.
 #[test]
 fn test_scale_free_duchon_joint_null_space_is_only_the_constant_2d() {
-    assert!(file!().ends_with(".rs"));
     let data = array![
         [0.0, 0.0],
         [1.0, 0.0],
@@ -4121,7 +4107,6 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant_2d() {
 /// natural d=4 choice will be power=1.5 with Degree(2).
 #[test]
 fn test_scale_free_duchon_joint_null_space_is_only_the_constant_4d() {
-    assert!(file!().ends_with(".rs"));
     let data = array![
         [0.0, 0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0, 0.0],
@@ -4172,7 +4157,6 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant_4d() {
 /// remains exactly `span{1}`.
 #[test]
 fn test_scale_free_duchon_joint_null_space_is_only_the_constant_4d_fractional_s() {
-    assert!(file!().ends_with(".rs"));
     let data = array![
         [0.0, 0.0, 0.0, 0.0],
         [1.0, 0.0, 0.0, 0.0],
@@ -4213,7 +4197,6 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant_4d_fractional_s(
 /// (`r^(2(p+s)−d) = r¹`) that integer values skip over.
 #[test]
 fn test_scale_free_duchon_joint_null_space_is_only_the_constant_2d_fractional_s() {
-    assert!(file!().ends_with(".rs"));
     let data = array![
         [0.0, 0.0],
         [1.0, 0.0],
@@ -4256,7 +4239,6 @@ fn test_scale_free_duchon_joint_null_space_is_only_the_constant_2d_fractional_s(
 /// with the joint-null-space property intact.
 #[test]
 fn test_scale_free_duchon_joint_null_space_is_only_the_constant_8d_fractional_s() {
-    assert!(file!().ends_with(".rs"));
     let mut rows = Vec::new();
     let mut state: u64 = 0x9E3779B97F4A7C15;
     for _ in 0..80 {
@@ -5207,7 +5189,6 @@ fn test_pure_polyharmonic_origin_jets_preserve_derivative_singularities() {
 
 #[test]
 fn test_duchon_hybrid_collision_uses_combined_partial_fraction_limit() {
-    assert!(file!().ends_with(".rs"));
     let p_order = 1usize;
     let s_order = 1usize;
     let dim = 3usize;
@@ -5228,7 +5209,6 @@ fn test_duchon_hybrid_collision_uses_combined_partial_fraction_limit() {
 
 #[test]
 fn test_duchon_matern_block_origin_includes_kappa_power() {
-    assert!(file!().ends_with(".rs"));
     let kappa = 4.0;
     let value = duchon_matern_block(0.0, kappa, 1, 1).expect("block value");
     assert_abs_diff_eq!(value, 1.0 / 8.0, epsilon = 1e-14);
@@ -5236,7 +5216,6 @@ fn test_duchon_matern_block_origin_includes_kappa_power() {
 
 #[test]
 fn test_duchon_aniso_collocation_uses_metric_weights() {
-    assert!(file!().ends_with(".rs"));
     let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
     let eta = vec![2.0_f64.ln(), -2.0_f64.ln()];
     let ops = build_duchon_collocation_operator_matrices(
@@ -6067,7 +6046,6 @@ fn test_thin_plate_log_kappasecond_derivative_matchesfd() {
 /// (duchon_radial_core_psi_triplet + jets) vs the gram chain rule.
 #[test]
 fn test_duchon_operator_psi_derivatives_fd_dim1() {
-    assert!(file!().ends_with(".rs"));
     use ndarray::array;
     let centers = array![[0.0_f64], [0.2], [0.45], [0.7]];
     let nullspace_order = DuchonNullspaceOrder::Linear;
@@ -6176,7 +6154,6 @@ fn test_duchon_operator_psi_derivatives_fd_dim1() {
 /// `normalize_penaltywith_psi_derivatives`.
 #[test]
 fn test_duchon_raw_gram_psi_derivative_fd_dim1() {
-    assert!(file!().ends_with(".rs"));
     use ndarray::array;
     let centers = array![[0.0_f64], [0.2], [0.45], [0.7]];
     let nullspace_order = DuchonNullspaceOrder::Linear;
@@ -6257,7 +6234,6 @@ fn test_duchon_raw_gram_psi_derivative_fd_dim1() {
 /// degrade at kappa=1 (where chain-rule corner cases are likeliest).
 #[test]
 fn test_duchon_log_kappa_derivative_matchesfd_lengthscale_one() {
-    assert!(file!().ends_with(".rs"));
     let data = array![[0.0, 0.0], [1.0, 0.2], [0.3, 1.1], [0.9, 0.8]];
     let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
     let spec = DuchonBasisSpec {
@@ -6461,7 +6437,6 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
 /// SpatialIdentifiability::OrthogonalToParametric is the source of the bug.
 #[test]
 fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear_no_ident() {
-    assert!(file!().ends_with(".rs"));
     let n = 80usize;
     let mut data = ndarray::Array2::<f64>::zeros((n, 1));
     for i in 0..n {
@@ -6510,7 +6485,6 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear_no_ident() {
 /// of the rebuilt penalty for this 1D BinomialProbit-style spec.
 #[test]
 fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear() {
-    assert!(file!().ends_with(".rs"));
     let n = 80usize;
     let mut data = ndarray::Array2::<f64>::zeros((n, 1));
     for i in 0..n {

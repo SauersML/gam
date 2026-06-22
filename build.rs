@@ -2500,7 +2500,6 @@ fn scan_for_cargo_lint_allows(
             return;
         }
         let mut in_lints = false;
-        let mut in_clippy_section = false;
         for (idx, line) in content.lines().enumerate() {
             let trimmed = line.trim();
             let code_part = match trimmed.find('#') {
@@ -2516,20 +2515,9 @@ fn scan_for_cargo_lint_allows(
                     || header.starts_with("lints.")
                     || header == "workspace.lints"
                     || header.starts_with("workspace.lints.");
-                in_clippy_section = header == "lints.clippy" || header == "workspace.lints.clippy";
                 continue;
             }
             if !in_lints || code_part.is_empty() {
-                continue;
-            }
-            // `clippy::*` / `clippy.*` lints are exempt — we don't enforce
-            // clippy in this repo, so allow-entries for it are fine. Skip
-            // when we're inside a `[lints.clippy]` table, or when the bare
-            // key on this line targets the clippy tool.
-            if in_clippy_section
-                || code_part.starts_with("clippy.")
-                || code_part.starts_with("\"clippy::")
-            {
                 continue;
             }
             if code_part.contains("\"allow\"") {
@@ -3602,20 +3590,14 @@ fn scan_for_banned_allow(
                     // valid inside allow/expect anyway). Strip the known
                     // tool prefixes (`clippy::`, `rustc::`, `rustdoc::`) when
                     // labelling so the report shows the bare lint name.
-                    // `clippy::*` lints are exempt from the silencing ban —
-                    // we don't enforce clippy at all in this repo, so silencing
-                    // them is fine. Only non-clippy tokens count as offenders.
                     let mut first_label: Option<String> = None;
-                    let mut any_non_clippy = false;
+                    let mut any_lint = false;
                     for tok in inside.split(',') {
                         let trimmed = tok.trim();
                         if trimmed.is_empty() {
                             continue;
                         }
-                        if trimmed.starts_with("clippy::") {
-                            continue;
-                        }
-                        any_non_clippy = true;
+                        any_lint = true;
                         if first_label.is_none() {
                             let bare = trimmed
                                 .trim_start_matches("rustc::")
@@ -3623,7 +3605,7 @@ fn scan_for_banned_allow(
                             first_label = Some(bare.to_string());
                         }
                     }
-                    if any_non_clippy {
+                    if any_lint {
                         let attr = silencer.trim_end_matches('(');
                         let label = first_label.unwrap_or_else(|| "<empty>".to_string());
                         offenders.push((

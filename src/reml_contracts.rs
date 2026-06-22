@@ -101,7 +101,6 @@ pub trait HyperOperator: Send + Sync {
         factor: &Array2<f64>,
         factor_cache: &ProjectedFactorCache,
     ) -> f64 {
-        assert!(std::mem::size_of_val(factor_cache) > 0);
         self.trace_projected_factor(factor)
     }
 
@@ -118,7 +117,6 @@ pub trait HyperOperator: Send + Sync {
         factor: &Array2<f64>,
         factor_cache: &ProjectedFactorCache,
     ) -> Array2<f64> {
-        assert!(std::mem::size_of_val(factor_cache) > 0);
         self.projected_matrix(factor)
     }
 

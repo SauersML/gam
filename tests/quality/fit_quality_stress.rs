@@ -146,7 +146,7 @@ fn report_fit_error(probe: &str, formula: &str, err: &str) {
     eprintln!("[fit-quality] probe={probe} category={cat} formula=`{formula}` err=`{err}`",);
 }
 
-fn report(
+fn let cat = report(
     probe: &str,
     formula: &str,
     rmse_val: f64,
@@ -160,7 +160,7 @@ fn report(
     } else {
         span_fit / span_truth
     };
-    let cat = categorize(rmse_val, sigma, ratio);
+    let cat = categorize(rmse_val, sigma, ratio); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
     eprintln!(
         "[fit-quality] probe={probe} category={cat} rmse={rmse_val:.4} \
          sigma_noise={sigma:.4} span_fit={span_fit:.3} span_truth={span_truth:.3} \
@@ -272,7 +272,7 @@ fn fit_predict_2d(
 // Probe 1: high-frequency truths sin(2π k x), k in {4, 6, 8, 10}
 // =====================================================================
 
-fn hifreq_cyclic_probe(k: usize) -> Category {
+fn hifreq_cyclic_probe(k: usize) -> Result<(), String> {
     init_parallelism();
     let n: usize = 400;
     let sigma = 0.10;
@@ -296,7 +296,7 @@ fn hifreq_cyclic_probe(k: usize) -> Category {
         Ok(v) => v,
         Err(e) => {
             report_fit_error(&probe, &formula, &e);
-            return Category::Collapsed;
+            return Err("Fit collapsed".to_string());
         }
     };
     check_finite(&probe, &formula, &yhat, &beta);
@@ -305,31 +305,31 @@ fn hifreq_cyclic_probe(k: usize) -> Category {
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
     let extra = format!("k={k} l1_at_truth={l1:.4}");
-    report(&probe, &formula, r, sigma, sf, st, &extra)
+    let cat = let cat = report(&probe, &formula, r, sigma, sf, st, &extra); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
+    if let Category::Collapsed = cat {
+        return Err(format!("probe collapsed"));
+    }
+    Ok(())
 }
 
 #[test]
-fn hifreq_cyclic_k4() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_cyclic_k4() -> Result<(), String> {
     hifreq_cyclic_probe(4);
 }
 #[test]
-fn hifreq_cyclic_k6() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_cyclic_k6() -> Result<(), String> {
     hifreq_cyclic_probe(6);
 }
 #[test]
-fn hifreq_cyclic_k8() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_cyclic_k8() -> Result<(), String> {
     hifreq_cyclic_probe(8);
 }
 #[test]
-fn hifreq_cyclic_k10() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_cyclic_k10() -> Result<(), String> {
     hifreq_cyclic_probe(10);
 }
 
-fn hifreq_bc_probe(k: usize) -> Category {
+fn hifreq_bc_probe(k: usize) -> Result<(), String> {
     init_parallelism();
     let n: usize = 400;
     let sigma = 0.10;
@@ -352,7 +352,7 @@ fn hifreq_bc_probe(k: usize) -> Category {
         Ok(v) => v,
         Err(e) => {
             report_fit_error(&probe, &formula, &e);
-            return Category::Collapsed;
+            return Err("Fit collapsed".to_string());
         }
     };
     check_finite(&probe, &formula, &yhat, &beta);
@@ -361,27 +361,27 @@ fn hifreq_bc_probe(k: usize) -> Category {
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
     let extra = format!("k={k} l1_at_truth={l1:.4}");
-    report(&probe, &formula, r, sigma, sf, st, &extra)
+    let cat = let cat = report(&probe, &formula, r, sigma, sf, st, &extra); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
+    if let Category::Collapsed = cat {
+        return Err(format!("probe collapsed"));
+    }
+    Ok(())
 }
 
 #[test]
-fn hifreq_bc_k4() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_bc_k4() -> Result<(), String> {
     hifreq_bc_probe(4);
 }
 #[test]
-fn hifreq_bc_k6() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_bc_k6() -> Result<(), String> {
     hifreq_bc_probe(6);
 }
 #[test]
-fn hifreq_bc_k8() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_bc_k8() -> Result<(), String> {
     hifreq_bc_probe(8);
 }
 #[test]
-fn hifreq_bc_k10() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_bc_k10() -> Result<(), String> {
     hifreq_bc_probe(10);
 }
 
@@ -407,7 +407,7 @@ fn legendre_p(l: usize, x: f64) -> f64 {
     p_curr
 }
 
-fn hifreq_sphere_probe(l: usize) -> Category {
+fn hifreq_sphere_probe(l: usize) -> Result<(), String> {
     init_parallelism();
     // Quasi-uniform sphere sampling via Fibonacci spiral so we cover all
     // latitudes including near-pole bands.
@@ -447,7 +447,7 @@ fn hifreq_sphere_probe(l: usize) -> Category {
         Ok(v) => v,
         Err(e) => {
             report_fit_error(&probe, &formula, &e);
-            return Category::Collapsed;
+            return Err("Fit collapsed".to_string());
         }
     };
     check_finite(&probe, &formula, &yhat, &beta);
@@ -456,26 +456,27 @@ fn hifreq_sphere_probe(l: usize) -> Category {
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
     let extra = format!("l={l} l1_at_truth={l1:.4}");
-    report(&probe, &formula, r, sigma, sf, st, &extra)
+    let cat = let cat = report(&probe, &formula, r, sigma, sf, st, &extra); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
+    if let Category::Collapsed = cat {
+        return Err(format!("probe collapsed"));
+    }
+    Ok(())
 }
 
 #[test]
-fn hifreq_sphere_l4() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_sphere_l4() -> Result<(), String> {
     hifreq_sphere_probe(4);
 }
 #[test]
-fn hifreq_sphere_l6() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_sphere_l6() -> Result<(), String> {
     hifreq_sphere_probe(6);
 }
 #[test]
-fn hifreq_sphere_l8() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_sphere_l8() -> Result<(), String> {
     hifreq_sphere_probe(8);
 }
 
-fn hifreq_tensor_probe(k: usize) -> Category {
+fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
     init_parallelism();
     let n_theta = 24;
     let n_h = 24;
@@ -521,7 +522,7 @@ fn hifreq_tensor_probe(k: usize) -> Category {
         Ok(v) => v,
         Err(e) => {
             report_fit_error(&probe, &formula, &e);
-            return Category::Collapsed;
+            return Err("Fit collapsed".to_string());
         }
     };
     check_finite(&probe, &formula, &yhat, &beta);
@@ -530,27 +531,27 @@ fn hifreq_tensor_probe(k: usize) -> Category {
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
     let extra = format!("k={k} l1_at_truth={l1:.4} n_train={}", theta.len());
-    report(&probe, &formula, r, sigma, sf, st, &extra)
+    let cat = let cat = report(&probe, &formula, r, sigma, sf, st, &extra); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
+    if let Category::Collapsed = cat {
+        return Err(format!("probe collapsed"));
+    }
+    Ok(())
 }
 
 #[test]
-fn hifreq_tensor_k4() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_tensor_k4() -> Result<(), String> {
     hifreq_tensor_probe(4);
 }
 #[test]
-fn hifreq_tensor_k6() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_tensor_k6() -> Result<(), String> {
     hifreq_tensor_probe(6);
 }
 #[test]
-fn hifreq_tensor_k8() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_tensor_k8() -> Result<(), String> {
     hifreq_tensor_probe(8);
 }
 #[test]
-fn hifreq_tensor_k10() {
-    assert!(file!().ends_with(".rs"));
+fn hifreq_tensor_k10() -> Result<(), String> {
     hifreq_tensor_probe(10);
 }
 
@@ -565,8 +566,7 @@ fn bump_pair(x: f64) -> f64 {
 }
 
 #[test]
-fn bimodal_sharp_bumps_bc() {
-    assert!(file!().ends_with(".rs"));
+fn bimodal_sharp_bumps_bc() -> Result<(), String> {
     init_parallelism();
     let n = 500;
     let sigma = 0.05;
@@ -586,7 +586,7 @@ fn bimodal_sharp_bumps_bc() {
         Ok(v) => v,
         Err(e) => {
             report_fit_error("bimodal_sharp_bumps", formula, &e);
-            return;
+            return Err("Fit collapsed".to_string());
         }
     };
     check_finite("bimodal_sharp_bumps", formula, &yhat, &beta);
@@ -594,7 +594,7 @@ fn bimodal_sharp_bumps_bc() {
     let sf = span(&yhat);
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
-    report(
+    let cat = report(
         "bimodal_sharp_bumps",
         formula,
         r,
@@ -603,6 +603,10 @@ fn bimodal_sharp_bumps_bc() {
         st,
         &format!("l1_at_truth={l1:.4}"),
     );
+    if let Category::Collapsed = cat {
+        return Err(format!("probe collapsed"));
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -610,8 +614,7 @@ fn bimodal_sharp_bumps_bc() {
 // =====================================================================
 
 #[test]
-fn near_flat_signal() {
-    assert!(file!().ends_with(".rs"));
+fn near_flat_signal() -> Result<(), String> {
     init_parallelism();
     let n = 300;
     let sigma = 0.02;
@@ -632,7 +635,7 @@ fn near_flat_signal() {
         Ok(v) => v,
         Err(e) => {
             report_fit_error("near_flat_signal", formula, &e);
-            return;
+            return Err("Fit collapsed".to_string());
         }
     };
     check_finite("near_flat_signal", formula, &yhat, &beta);
@@ -646,7 +649,11 @@ fn near_flat_signal() {
             .map(|v| (v - truth_const).abs())
             .fold(0.0_f64, f64::max)
     });
-    report("near_flat_signal", formula, r, sigma, sf, st, &extra);
+    let cat = let cat = report("near_flat_signal", formula, r, sigma, sf, st, &extra); if let Category::Collapsed = cat {     return Err(format!("probe collapsed")); } Ok(())
+    if let Category::Collapsed = cat {
+        return Err(format!("probe collapsed"));
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -654,8 +661,7 @@ fn near_flat_signal() {
 // =====================================================================
 
 #[test]
-fn heteroscedastic_noise_mean_recovery() {
-    assert!(file!().ends_with(".rs"));
+fn heteroscedastic_noise_mean_recovery() -> Result<(), String> {
     init_parallelism();
     let n = 600;
     let mut rng = Lcg::new(303);
@@ -689,7 +695,7 @@ fn heteroscedastic_noise_mean_recovery() {
         Ok(v) => v,
         Err(e) => {
             report_fit_error("heteroscedastic", formula, &e);
-            return;
+            return Err("Fit collapsed".to_string());
         }
     };
     check_finite("heteroscedastic", formula, &yhat, &beta);
@@ -697,7 +703,7 @@ fn heteroscedastic_noise_mean_recovery() {
     let sf = span(&yhat);
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
-    report(
+    let cat = report(
         "heteroscedastic",
         formula,
         r,
@@ -706,6 +712,10 @@ fn heteroscedastic_noise_mean_recovery() {
         st,
         &format!("l1_at_truth={l1:.4} sigma_range=[0.05,0.30]"),
     );
+    if let Category::Collapsed = cat {
+        return Err(format!("probe collapsed"));
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -713,8 +723,7 @@ fn heteroscedastic_noise_mean_recovery() {
 // =====================================================================
 
 #[test]
-fn outlier_contamination() {
-    assert!(file!().ends_with(".rs"));
+fn outlier_contamination() -> Result<(), String> {
     init_parallelism();
     let n = 500;
     let sigma = 0.10;
@@ -747,7 +756,7 @@ fn outlier_contamination() {
         Ok(v) => v,
         Err(e) => {
             report_fit_error("outlier_contamination", formula, &e);
-            return;
+            return Err("Fit collapsed".to_string());
         }
     };
     check_finite("outlier_contamination", formula, &yhat, &beta);
@@ -755,7 +764,7 @@ fn outlier_contamination() {
     let sf = span(&yhat);
     let st = span(&truth);
     let l1 = truth_residual(&yhat, &truth);
-    report(
+    let cat = report(
         "outlier_contamination",
         formula,
         r,
@@ -764,6 +773,10 @@ fn outlier_contamination() {
         st,
         &format!("l1_at_truth={l1:.4} n_outliers={n_out}"),
     );
+    if let Category::Collapsed = cat {
+        return Err(format!("probe collapsed"));
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -771,8 +784,7 @@ fn outlier_contamination() {
 // =====================================================================
 
 #[test]
-fn sparse_dense_imbalance() {
-    assert!(file!().ends_with(".rs"));
+fn sparse_dense_imbalance() -> Result<(), String> {
     init_parallelism();
     let sigma = 0.05;
     let n_sparse = 20;
@@ -803,7 +815,7 @@ fn sparse_dense_imbalance() {
         Ok(v) => v,
         Err(e) => {
             report_fit_error("sparse_dense_imbalance", formula, &e);
-            return;
+            return Err("Fit collapsed".to_string());
         }
     };
     check_finite("sparse_dense_imbalance", formula, &yhat_all, &beta);
@@ -821,7 +833,7 @@ fn sparse_dense_imbalance() {
     let extra = format!(
         "rmse_sparse={r_sparse:.4} rmse_dense={r_dense:.4} rmse_worst={r_worst:.4} n_sparse={n_sparse} n_dense={n_dense}"
     );
-    report(
+    let cat = report(
         "sparse_dense_imbalance",
         formula,
         r_worst,
@@ -830,6 +842,10 @@ fn sparse_dense_imbalance() {
         st,
         &extra,
     );
+    if let Category::Collapsed = cat {
+        return Err(format!("probe collapsed"));
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -837,8 +853,7 @@ fn sparse_dense_imbalance() {
 // =====================================================================
 
 #[test]
-fn boundary_discontinuity_step() {
-    assert!(file!().ends_with(".rs"));
+fn boundary_discontinuity_step() -> Result<(), String> {
     init_parallelism();
     let n = 400;
     let sigma = 0.05;
@@ -859,7 +874,7 @@ fn boundary_discontinuity_step() {
         Ok(v) => v,
         Err(e) => {
             report_fit_error("step_discontinuity", formula, &e);
-            return;
+            return Err("Fit collapsed".to_string());
         }
     };
     check_finite("step_discontinuity", formula, &yhat, &beta);
@@ -871,7 +886,7 @@ fn boundary_discontinuity_step() {
         .iter()
         .map(|&v| (v - 1.0).max(0.0).max((-v).max(0.0)))
         .fold(0.0_f64, f64::max);
-    report(
+    let cat = report(
         "step_discontinuity",
         formula,
         r,
@@ -880,6 +895,10 @@ fn boundary_discontinuity_step() {
         st,
         &format!("gibbs_overshoot={over:.3}"),
     );
+    if let Category::Collapsed = cat {
+        return Err(format!("probe collapsed"));
+    }
+    Ok(())
 }
 
 // =====================================================================
@@ -887,8 +906,7 @@ fn boundary_discontinuity_step() {
 // =====================================================================
 
 #[test]
-fn tensor_multicollinear_inputs() {
-    assert!(file!().ends_with(".rs"));
+fn tensor_multicollinear_inputs() -> Result<(), String> {
     init_parallelism();
     let n = 500;
     let sigma = 0.10;
@@ -926,7 +944,7 @@ fn tensor_multicollinear_inputs() {
             let sf = span(&yhat);
             let st = span(&truth);
             let l1 = truth_residual(&yhat, &truth);
-            report(
+            let cat = report(
                 "multicollinear_tensor",
                 formula,
                 r,
@@ -935,6 +953,10 @@ fn tensor_multicollinear_inputs() {
                 st,
                 &format!("l1_at_truth={l1:.4} corr_ab~0.95"),
             );
+            if let Category::Collapsed = cat {
+                return Err(format!("probe collapsed"));
+            }
+            Ok(())
         }
         Err(e) => {
             // Some smooths refuse to build on near-singular tensor inputs.
@@ -952,7 +974,7 @@ fn tensor_multicollinear_inputs() {
 // =====================================================================
 
 #[test]
-fn cyclic_wrong_period() {
+fn cyclic_wrong_period() -> Result<(), String> {
     init_parallelism();
     let n = 300;
     let sigma = 0.05;
@@ -1005,7 +1027,7 @@ fn cyclic_wrong_period() {
             // Headline category here is what the fit did despite the
             // wrong period — usually a forced wraparound that ruins
             // the recovery.
-            report(
+            let cat = report(
                 "cyclic_wrong_period",
                 formula,
                 r,
@@ -1014,6 +1036,10 @@ fn cyclic_wrong_period() {
                 st,
                 "note=fit_accepted_wrong_period",
             );
+            if let Category::Collapsed = cat {
+                return Err(format!("probe collapsed"));
+            }
+            Ok(())
         }
     }
 }
@@ -1023,8 +1049,7 @@ fn cyclic_wrong_period() {
 // =====================================================================
 
 #[test]
-fn sphere_antipodal_only() {
-    assert!(file!().ends_with(".rs"));
+fn sphere_antipodal_only() -> Result<(), String> {
     init_parallelism();
     let n_per_pole = 80;
     let sigma = 0.05;
@@ -1085,7 +1110,7 @@ fn sphere_antipodal_only() {
         Ok(v) => v,
         Err(e) => {
             report_fit_error("antipodal_sphere", formula, &e);
-            return;
+            return Err("Fit collapsed".to_string());
         }
     };
     check_finite("antipodal_sphere", formula, &yhat, &beta);
@@ -1095,7 +1120,7 @@ fn sphere_antipodal_only() {
     let sf = span(yhat_polar);
     let st = span(truth_polar);
     let eq_max = yhat_equator.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-    report(
+    let cat = report(
         "antipodal_sphere",
         formula,
         r,
@@ -1104,4 +1129,8 @@ fn sphere_antipodal_only() {
         st,
         &format!("equator_max_abs={eq_max:.4} n_polar={n_polar}"),
     );
+    if let Category::Collapsed = cat {
+        return Err(format!("probe collapsed"));
+    }
+    Ok(())
 }

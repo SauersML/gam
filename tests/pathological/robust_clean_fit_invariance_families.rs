@@ -115,7 +115,6 @@ fn run_standard(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn summarize(
     beta: Vec<f64>,
     eta_train: Vec<f64>,

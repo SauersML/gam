@@ -92,7 +92,6 @@ fn commutator_residual_so2(w_frame: &Array3<f64>, theta: &Array2<f64>, z: &Array
 // ---------------------------------------------------------------------------
 #[test]
 fn so2_unitarity_and_determinant() {
-    assert!(file!().ends_with(".rs"));
     for &theta in &[0.0, 0.3, 1.1, std::f64::consts::PI, 4.7, -2.3] {
         let r_mat = rho_so2(theta);
         let rt_r = r_mat.t().dot(&r_mat);
@@ -109,7 +108,6 @@ fn so2_unitarity_and_determinant() {
 // ---------------------------------------------------------------------------
 #[test]
 fn so3_unitarity_rodrigues() {
-    assert!(file!().ends_with(".rs"));
     for omega in [
         [0.1, 0.0, 0.0],
         [0.0, 1.5, 0.0],

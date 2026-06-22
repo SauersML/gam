@@ -4832,7 +4832,6 @@ pub fn estimate_logit_pg_rao_blackwell_terms(
 /// * `nuts_family` - Family for log-likelihood computation
 /// * `firth_bias_reduction` - Whether Firth bias reduction was used in training
 /// * `config` - NUTS configuration
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_nuts_sampling(
     x: ArrayView2<f64>,
     y: ArrayView1<f64>,

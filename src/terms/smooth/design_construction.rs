@@ -4387,7 +4387,10 @@ fn relax_smoothing_rho_prior(
     // stalls it at λ ≈ 0.11 — the null space is kept, the EDF rails up, and
     // held-out prediction collapses (#1392). The RANGE-space (`Primary`) bending
     // coordinate's smoothing selection must NOT be touched, so this select-out
-    // bias is gated to `DoublePenaltyNullspace` coordinates only.
+    // bias is gated to `DoublePenaltyNullspace` coordinates only and is applied
+    // ONLY in the under-determined regime — in the well-determined regime the
+    // relaxable coordinates stay byte-flat (`Flat`) so a clean `n > p` fit is
+    // unchanged (no regression on ordinary smooth recovery).
     //
     // WELL-DETERMINED CONCURVITY (#1476). This select-out PC prior is applied to
     // the `DoublePenaltyNullspace` coordinate in BOTH determinacy regimes — the
@@ -4409,40 +4412,6 @@ fn relax_smoothing_rho_prior(
     // (`Primary`) bending coordinate is untouched (stays `Flat` when
     // well-determined), so ordinary single-smooth recovery is unchanged.
     //
-    // The select-out bias is the convex penalized-complexity bowl
-    // `C(ρ) = ρ/2 + θ e^{-ρ/2}` (negative-log PC prior). Its gradient
-    // `C'(ρ) = 1/2 − (θ/2) e^{-ρ/2}` is negative on the `λ → 0` (null-space
-    // kept, wiggly) under-smoothing side and positive once ρ exceeds the mode,
-    // so — because the objective is MINIMIZED — it pushes ρ UP off the wiggly
-    // side and DOWN from far over-smoothing toward a single FINITE interior mode
-    // at `ρ* = 2 ln θ` (`λ* = θ² ≈ 8483` for θ ≈ 92.1). It is NOT a monotone
-    // `λ → ∞` drive: the `+1/2` value the gradient approaches only as `ρ → +∞`
-    // is the OVER-smoothing tail of the bowl, where (objective minimized) it
-    // pulls ρ back DOWN toward the mode. So the null space is selected out toward
-    // the finite well-penalized λ* unless the data buys the wiggle, never to a
-    // hard λ = ∞ cap. Its curvature `(θ/4) e^{-ρ/2}` is strictly positive
-    // everywhere, so the outer loop still certifies a stationary point on the
-    // `p > n` design (the #1089 requirement); around the mode the bias is the
-    // same O(1/n) shift as any Occam prior, so it is negligible exactly where
-    // the null space is identified.
-    // NON-GAUSSIAN FAMILIES (#1426). The cap-lifting `relaxed_prior` (`Flat` /
-    // wide `Normal`) is a Gaussian-identity recovery device (#1266/#1271/#1392):
-    // it is justified by the byte-flat firth-barrier analysis on the
-    // Gaussian-identity REML criterion and lifting it for every family at once
-    // would silently re-tune the smoothing selection of binomial/Poisson/Gamma
-    // RANGE-space coordinates. So the primary bending coordinate of a non-
-    // Gaussian smooth KEEPS its base cap. But the `DoublePenaltyNullspace`
-    // selection ridge is family-agnostic — it exists ONLY to drive the linear/
-    // constant null-space component OUT (mgcv `select=TRUE`) — and under
-    // Gamma/log REML the symmetric base cap fails to push its λ up, so REML's
-    // interior minimum genuinely sits at the near-full-basis overfit (EDF≈24 vs
-    // mgcv EDF≈8 on the #1426 DGP, seed 900006). We therefore give the null-space
-    // selection coordinate the same select-out PC prior here, in BOTH determinacy
-    // regimes (the #1426 overfit is well-determined, n≫p), walling off the
-    // `λ → 0` (null-space-kept) side and pulling λ up toward the bowl's finite
-    // mode λ* = θ² (the `+1/2` gradient in the far over-smoothing tail pulls ρ
-    // back DOWN, so there is no λ → ∞ runaway); the data keeps the null space
-    // only when it earns it.
     let nullspace_select_prior = crate::types::RhoPrior::PenalizedComplexity {
         upper: NULLSPACE_SELECT_PC_UPPER,
         tail_prob: NULLSPACE_SELECT_PC_TAIL_PROB,
@@ -4460,21 +4429,29 @@ fn relax_smoothing_rho_prior(
             let is_nullspace =
                 matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace);
             if !gaussian_identity {
-                // Keep the base cap on the range-space coordinate; select the
-                // double-penalty null space out (#1426).
+                // NON-GAUSSIAN length-safe smooth. Select the double-penalty
+                // null space OUT (#1426), and free the BENDING (range-space)
+                // coordinate by the same regime rule the Gaussian path uses
+                // (#1477). The symmetric `Normal{0, sd}` base cap is a
+                // Gaussian-tuned #1089 termination stabiliser centred at λ=1 with
+                // NO smoothing-selection justification on a non-Gaussian smooth:
+                // keeping it dragged the bending log-λ off the REML optimum mgcv
+                // reaches, shipping a systematically biased mean with a hard
+                // right-boundary blow-up (Tweedie + default `ps`: pred ≈ 2.4×
+                // truth at x=1, while gam's own `cr` and mgcv's same `ps` both
+                // recover truth). Freeing it to `relaxed_prior` resolves to the
+                // firth one-sided barrier (`Flat`, well-determined) — byte-flat on
+                // the identified side (pure REML = mgcv) with only a convex wall
+                // against the `λ → 0` degeneracy — or the wide #1089 `Normal` when
+                // under-determined. This is NOT a re-tuning toward a particular λ:
+                // it REMOVES an unjustified cap and lets REML choose, exactly as on
+                // the (already-relaxed) Gaussian path.
                 if is_nullspace {
                     nullspace_select_prior.clone()
                 } else {
-                    base.clone()
+                    relaxed_prior.clone()
                 }
-            } else if is_nullspace {
-                // Gaussian-identity null-space selection ridge: wall it OUT with
-                // the penalized-complexity select-out prior in BOTH determinacy
-                // regimes (#1392 under-determined wine `p > n`, AND #1476
-                // well-determined concurvity). Leaving it `Flat` when
-                // well-determined lets one correlated smooth's `λ_nullspace` rail
-                // to ≈1e13 and collapse to `EDF ≈ 0` (#1476); the PC wall's
-                // strictly-positive curvature pins it at a finite stationary ρ.
+            } else if underdetermined && is_nullspace {
                 nullspace_select_prior.clone()
             } else {
                 relaxed_prior.clone()

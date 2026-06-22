@@ -350,7 +350,6 @@ pub(crate) struct LocScalePsiDirectionParts {
 /// the column counts, the two block betas, the block-list length (2 or 3) and
 /// the diagnostic label prefix — is passed in; the math is identical across
 /// Gaussian/Binomial × wiggle/non-wiggle.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn locscale_joint_psi_direction_parts(
     block_states: &[ParameterBlockState],
     derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],

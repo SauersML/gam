@@ -784,7 +784,7 @@ class Model:
             import pandas as pd
 
             return pd.DataFrame(rows_out)
-        except Exception:
+        except ImportError:
             return rows_out
 
     def save(self, path: str | Path) -> None:
@@ -962,7 +962,7 @@ class Model:
         # knows how to format the summary fields. (issue #308)
         try:
             return str(self.summary())
-        except Exception:
+        except (KeyError, ValueError, RuntimeError, TypeError):
             # Summary materialisation can fail on partially-loaded artifacts;
             # fall back to the developer repr rather than crashing print().
             return repr(self)
@@ -1197,7 +1197,7 @@ class MultinomialModel:
         # REML-fitted models carrying covariance + smooth terms.
         try:
             sig = self.smooth_significance()
-        except Exception:
+        except (RuntimeError, ValueError):
             sig = []
         if sig:
             lines.append("  smooth terms (Wood rank-truncated Wald):")

@@ -1189,7 +1189,6 @@ pub struct CompiledSurvivalDesignsPerTerm {
 /// Per-term apply: produce compiled designs + per-term-pulled-back
 /// penalties + the block-diagonal V matrices needed for the result-
 /// time lift.
-#[allow(clippy::too_many_arguments)]
 pub fn apply_per_term_survival_parametric_compile_to_designs(
     compiled: &SurvivalParametricCompiledPerTerm,
     time_partition: &[std::ops::Range<usize>],
@@ -1346,7 +1345,6 @@ pub fn compiled_map_from_per_term(
 /// the per-block penalty model stays exact for the highest-priority
 /// block (time, no anchor → `R = []`) and matches the sibling per-block
 /// compile path for the rest.
-#[allow(clippy::too_many_arguments)]
 pub fn apply_compiled_map_to_designs(
     map: &crate::identifiability::families::compiler::CompiledMap,
     time_design_entry: DesignMatrix,

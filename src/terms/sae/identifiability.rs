@@ -1639,7 +1639,6 @@ pub struct OrbitPenaltyOperator {
     /// Maps an orbit direction `(δB (M, p), δt (n, latent_dim))` to the
     /// penalty curvature root's image (any length); the penalty cost along the
     /// direction is the squared norm of the image.
-    #[allow(clippy::type_complexity)]
     pub apply: Box<dyn Fn(ArrayView2<f64>, ArrayView2<f64>) -> Array1<f64> + Send + Sync>,
     /// `σ_max²` of the penalty curvature root — the stiffness scale the
     /// orbit's penalty cost is reported relative to (the same

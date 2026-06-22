@@ -253,7 +253,6 @@ fn run_fit() -> FitSummary {
 /// assert MᵀW·G̃ ≈ 0 (< 1e-10) and the coefficient round-trip is exact (< 1e-12).
 #[test]
 fn orthogonalization_is_exact_and_round_trip_is_lossless() {
-    assert!(file!().ends_with(".rs"));
     let n = 120;
     let mut rng = StdRng::seed_from_u64(SEED ^ 0xA5A5_A5A5);
 
@@ -394,7 +393,6 @@ fn parse_block_diagnostics(err: &str) -> Option<(usize, f64, f64)> {
 /// asserted away.
 #[test]
 fn reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope() {
-    assert!(file!().ends_with(".rs"));
 
     let on = run_fit();
     eprintln!(
@@ -509,7 +507,6 @@ fn reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope() {
 /// claim is "the robust fit returns a finite bounded estimate and never errors".
 #[test]
 fn robust_cures_confounded_bms_never_fails_with_bounded_beta() {
-    assert!(file!().ends_with(".rs"));
 
     let on = run_fit();
 

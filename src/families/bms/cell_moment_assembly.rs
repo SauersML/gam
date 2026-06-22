@@ -3044,7 +3044,6 @@ mod empirical_rigid_jet_oracle_tests {
     /// Independent scalar row NLL `ℓ(m, g)` at this row's own latent score `z`.
     /// `m` is the marginal η; the marginal target `μ(m) = Φ(m)` drives the
     /// calibration root.
-    #[allow(clippy::too_many_arguments)]
     fn witness_nll(
         m: f64,
         g: f64,

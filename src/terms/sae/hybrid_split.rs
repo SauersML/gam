@@ -440,7 +440,6 @@ fn build_atom_candidates(
 ///
 /// Returns `None` (no report) when no atom is eligible — there is nothing to
 /// adjudicate.
-#[allow(clippy::too_many_arguments)]
 pub fn build_hybrid_split_report<'a, C, W, D, R, M, E>(
     atoms: &'a [SaeManifoldAtom],
     eligible_d1: impl Iterator<Item = usize>,

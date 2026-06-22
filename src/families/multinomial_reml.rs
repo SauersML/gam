@@ -1646,7 +1646,6 @@ impl CustomFamily for MultinomialFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         let eta = self.collect_eta_matrix(block_states)?;
         let log_lik = self.likelihood.log_lik(eta.view(), self.y_one_hot.view());
         let grad_eta_logl = self.likelihood.grad_eta(eta.view(), self.y_one_hot.view());
@@ -1662,7 +1661,6 @@ impl CustomFamily for MultinomialFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         // Freeze the per-row softmax probabilities once at construction: the
         // Fisher block H_{n,a,b} = w_n (δ_ab p_a − p_a p_b) is constant in the
         // matvec direction v, so every PCG H·v contraction reuses these probs

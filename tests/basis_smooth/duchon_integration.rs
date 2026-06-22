@@ -137,13 +137,11 @@ fn assert_invalid_pure_duchon_simulated_10d(power: usize, nullspace_order: Ducho
 #[test]
 fn duchon_fit_term_collection_gaussian_simulated_10d_default_like_config_rejects_infinite_diagonal()
 {
-    assert!(file!().ends_with(".rs"));
     assert_invalid_pure_duchon_simulated_10d(1, DuchonNullspaceOrder::Zero);
 }
 
 #[test]
 fn duchon_fit_term_collection_gaussian_simulated_10d_p2_s1_rejects_infinite_diagonal() {
-    assert!(file!().ends_with(".rs"));
     // An EXPLICIT pure-Duchon request whose kernel does not exist in 10D must be
     // rejected. The basis builder treats `power` LITERALLY (the magic cubic
     // default lives only in the formula/CLI/pyffi front-ends, not here), so

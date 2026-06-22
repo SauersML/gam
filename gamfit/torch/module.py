@@ -123,7 +123,8 @@ class GAM(nn.Module):
         """Eval-mode forward: design @ frozen_coef per smooth, summed."""
         from .fit import _build_design_penalty
 
-        assert self._frozen_coefs is not None
+        if self._frozen_coefs is None:
+            raise RuntimeError("frozen_coefs is None")
         points_list = (
             list(points) if isinstance(points, (list, tuple))
             else [points] * len(self.smooths)

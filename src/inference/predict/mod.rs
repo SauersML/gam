@@ -1967,7 +1967,6 @@ where
 /// for Tweedie by the caller). Returns `(None, None)` for the Gaussian/binomial
 /// location-scale families (their band is genuinely symmetric, handled by the
 /// symmetric driver) and for `RoystonParmar`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn family_observation_band_per_row(
     response: &ResponseFamily,
     mean: &Array1<f64>,

@@ -91,16 +91,19 @@ class ReductionTree:
 
     def leaves(self) -> list[int]:
         if self.is_leaf():
-            assert self.rank_id is not None
+            if self.rank_id is None:
+                raise RuntimeError("rank_id cannot be None in a leaf node")
             return [self.rank_id]
-        assert self.left is not None and self.right is not None
+        if self.left is None or self.right is None:
+            raise RuntimeError("internal node must have left and right children")
         return self.left.leaves() + self.right.leaves()
 
     def signature(self) -> str:
         """Stable parenthesized string of leaf ids in fixed fold order."""
         if self.is_leaf():
             return str(self.rank_id)
-        assert self.left is not None and self.right is not None
+        if self.left is None or self.right is None:
+            raise RuntimeError("internal node must have left and right children")
         return f"({self.left.signature()}+{self.right.signature()})"
 
 
@@ -235,10 +238,12 @@ class TreeReducer:
             # than recombined, so resume == from-scratch.
             return cached
         if tree.is_leaf():
-            assert tree.rank_id is not None
+            if tree.rank_id is None:
+                raise RuntimeError("rank_id cannot be None in a leaf node")
             value = np.array(leaves[tree.rank_id], dtype=np.float64, copy=True)
         else:
-            assert tree.left is not None and tree.right is not None
+            if tree.left is None or tree.right is None:
+                raise RuntimeError("internal node must have left and right children")
             # Left ALWAYS before right — the fixed accumulation order.
             left_val = self._reduce_subtree(tree.left, leaves)
             right_val = self._reduce_subtree(tree.right, leaves)

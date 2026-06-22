@@ -403,7 +403,6 @@ impl<T: AD> DifferentiableFunctionTrait<T> for EpsGaussianHessianPsiFn<T> {
 
 #[test]
 fn gaussian_location_scale_joint_psi_fixed_beta_terms_match_three_autodiff_engines() {
-    assert!(file!().ends_with(".rs"));
     let params = GaussianPsiParams {
         y: 1.4,
         betamu: -0.6,
@@ -453,7 +452,6 @@ fn gaussian_location_scale_joint_psi_fixed_beta_terms_match_three_autodiff_engin
 
 #[test]
 fn gaussian_location_scale_joint_psihessian_drift_matches_three_autodiff_engines() {
-    assert!(file!().ends_with(".rs"));
     let params = GaussianPsiParams {
         y: 1.4,
         betamu: -0.6,

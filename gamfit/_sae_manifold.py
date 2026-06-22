@@ -1008,7 +1008,7 @@ def _atom_functional_evidence(
             np.ascontiguousarray(coords),
             params,
         )
-    except Exception:
+    except (RuntimeError, ValueError, TypeError):
         return None
     phi = np.asarray(phi, dtype=float)
     jet = np.asarray(jet, dtype=float)

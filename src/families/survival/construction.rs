@@ -4093,7 +4093,6 @@ mod tests {
 
     #[test]
     fn marginal_slope_baseline_chain_rule_hessian_matches_fd_gradient() {
-        assert!(file!().ends_with(".rs"));
         let cfg = SurvivalBaselineConfig {
             target: SurvivalBaselineTarget::GompertzMakeham,
             scale: None,
@@ -4170,7 +4169,6 @@ mod tests {
 
     #[test]
     fn marginal_slope_baseline_chain_rule_gradient_contracts_probit_partials() {
-        assert!(file!().ends_with(".rs"));
         let cfg = SurvivalBaselineConfig {
             target: SurvivalBaselineTarget::GompertzMakeham,
             scale: None,
@@ -4230,7 +4228,6 @@ mod tests {
     /// combination, or entry gating) breaks this with an exact (0.0) tolerance.
     #[test]
     fn baseline_chain_rule_gradient_engine_matches_inline_reference() {
-        assert!(file!().ends_with(".rs"));
         let cfg = SurvivalBaselineConfig {
             target: SurvivalBaselineTarget::GompertzMakeham,
             scale: None,
@@ -4678,7 +4675,6 @@ mod tests {
 
     #[test]
     fn gompertz_offset_partials_small_shape_taylor_agrees_with_direct_branch() {
-        assert!(file!().ends_with(".rs"));
         // Both branches of gompertz_shape_derivatives should agree to high
         // precision at shape = 1e-10 + epsilon on the direct side vs
         // shape = 1e-10 - epsilon on the Taylor side. Here we spot-check
@@ -4728,7 +4724,6 @@ mod tests {
 
     #[test]
     fn gompertz_hazard_shape_derivatives_match_central_diff() {
-        assert!(file!().ends_with(".rs"));
         // shape stays well above the 1e-10 Taylor cutoff so the exact
         // closed-form branch is exercised and the expm1/exp arithmetic is
         // numerically clean. FD on the analytic value/first-derivative
@@ -4779,7 +4774,6 @@ mod tests {
 
     #[test]
     fn gompertz_hazard_shape_derivatives_small_shape_match_analytic_limit() {
-        assert!(file!().ends_with(".rs"));
         // At small x = shape·age the shape derivatives collapse to closed-form
         // limits. These MUST hold even for large ages with tiny shapes, which
         // is precisely the regime where the (cancelling) exact branch loses all
@@ -4841,7 +4835,6 @@ mod tests {
 
     #[test]
     fn gompertz_second_shape_derivative_is_accurate_in_old_pivot_gap() {
-        assert!(file!().ends_with(".rs"));
         // Regression: in the band shape ∈ [1e-10, ~1e-4] with a realistic age,
         // the OLD `shape < 1e-10` pivot sent ∂²H_G/∂shape² through the
         // catastrophically-cancelling exact branch. With age=100, shape=1e-9

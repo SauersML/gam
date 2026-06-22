@@ -214,7 +214,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         if self.per_z_logslope_active() {
             let (log_likelihood, gradient, _) =
                 self.evaluate_exact_newton_joint_dense_per_z(block_states)?;
@@ -249,7 +248,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         if self.per_z_logslope_active() {
             return Ok(None);
         }
@@ -272,7 +270,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         if self.per_z_logslope_active() {
             return Ok(None);
         }
@@ -563,7 +560,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         psi_i: usize,
         psi_j: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         if self.is_sigma_aux_index(derivative_blocks, psi_i)
             || self.is_sigma_aux_index(derivative_blocks, psi_j)
         {
@@ -583,7 +579,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         if self.is_sigma_aux_index(derivative_blocks, psi_index) {
             return self
                 .sigma_exact_joint_psihessian_directional_derivative(block_states, d_beta_flat);
@@ -653,7 +648,6 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(!block_spec.name.is_empty());
         if block_idx == 0 {
             return self.effective_time_linear_constraints();

@@ -1295,7 +1295,6 @@ fn nested_prefix_hessian_diag_is_psd() {
 
 #[test]
 fn nested_prefix_mask_is_correct() {
-    assert!(file!().ends_with(".rs"));
     let (t, n_rows, f) = nested_prefix_test_target();
     let target = PsiSlice::full(t.len(), Some(f));
     let prefixes = vec![1_usize, 3, 4];
@@ -1326,7 +1325,6 @@ fn nested_prefix_mask_is_correct() {
 
 #[test]
 fn nested_prefix_grad_rho_matches_finite_difference() {
-    assert!(file!().ends_with(".rs"));
     let (t, _n, f) = nested_prefix_test_target();
     let target = PsiSlice::full(t.len(), Some(f));
     let pen = NestedPrefixPenalty::new(

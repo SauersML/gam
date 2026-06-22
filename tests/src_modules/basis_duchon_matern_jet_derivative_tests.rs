@@ -944,7 +944,6 @@ fn matern_collocation_operator_matrices_should_match_closed_forms_in_1d() {
 
 #[test]
 fn aniso_distance_isotropic_when_eta_zero() {
-    assert!(file!().ends_with(".rs"));
     // When all η_a = 0, exp(2·0) = 1, so aniso distance == Euclidean distance.
     let x = [1.0, 2.0, 3.0];
     let c = [4.0, 5.0, 6.0];
@@ -967,7 +966,6 @@ fn aniso_distance_isotropic_when_eta_zero() {
 
 #[test]
 fn aniso_distance_weighted_correctly() {
-    assert!(file!().ends_with(".rs"));
     // Two axes, η = [ln2, -ln2] so exp(2η) = [4, 1/4].
     // h = [1, 2], so s = [4·1, 0.25·4] = [4, 1], r = √5.
     let x = [3.0, 5.0];
@@ -986,7 +984,6 @@ fn aniso_distance_weighted_correctly() {
 
 #[test]
 fn aniso_distance_components_sum_to_r_squared() {
-    assert!(file!().ends_with(".rs"));
     let x = [1.5, -0.3, 2.7, 0.1];
     let c = [0.2, 1.1, -0.5, 3.3];
     let eta = [0.5, -0.2, 0.1, -0.4];

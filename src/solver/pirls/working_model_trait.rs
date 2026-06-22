@@ -13,7 +13,6 @@ pub trait WorkingModel {
         beta: &Coefficients,
         curvature_kind: HessianCurvatureKind,
     ) -> Result<WorkingState, EstimationError> {
-        assert!(core::mem::size_of_val(&curvature_kind) > 0);
         self.update(beta)
     }
 
@@ -33,7 +32,6 @@ pub trait WorkingModel {
         curvature: HessianCurvatureKind,
     ) -> Result<CandidateEvaluation, EstimationError> {
         assert!(arr.iter().all(|v| !v.is_nan()));
-        assert!(std::mem::size_of_val(linear_predictor) > 0);
         self.update_candidate(beta, curvature)
             .map(CandidateEvaluation::Full)
     }

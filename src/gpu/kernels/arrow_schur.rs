@@ -16,7 +16,6 @@
 //!
 //! On non-Linux builds the entire module degrades to a CPU-fallback shim.
 
-#![allow(clippy::module_name_repetitions)]
 
 use ndarray::{Array1, Array2};
 

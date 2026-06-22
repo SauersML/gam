@@ -2618,7 +2618,6 @@ const SPATIAL_COLLAPSE_EDF_MARGIN: f64 = 1.0;
 /// scratch fit recovers the healthy baseline. This retry only fires on the
 /// collapse pathology, so warm-starting's speed/uniformity is preserved for every
 /// non-degenerate fallback.
-#[allow(clippy::too_many_arguments)]
 fn fit_frozen_baseline_geometry(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -8291,7 +8290,6 @@ pub struct CurvatureInference {
 /// `v_pp` (the initial Wald step size) is taken from a central finite difference
 /// of `V_p` at κ̂; the CI itself is the exact χ²₁ likelihood crossing, not the
 /// Wald ellipsoid, so this only sizes the first bracket step.
-#[allow(clippy::too_many_arguments)]
 pub fn curvature_inference_forspec(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -8537,7 +8535,6 @@ fn fitted_rho_penalty_components(
 ///
 /// Random-effect smooths and shape-constrained smooths are skipped (their tests
 /// are not a central-χ² LR), matching the summary table's policy.
-#[allow(clippy::too_many_arguments)]
 pub fn smooth_term_lr_inference_forspec(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,

@@ -71,7 +71,6 @@ fn assert_equiv(reference: &str, alternatives: &[&str]) {
 
 #[test]
 fn bc_left_aliases_equivalent() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     assert_equiv(
         "y ~ s(x, bc_left=clamped, k=10)",
@@ -84,7 +83,6 @@ fn bc_left_aliases_equivalent() {
 
 #[test]
 fn bc_right_aliases_equivalent() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     assert_equiv(
         "y ~ s(x, bc_right=clamped, k=10)",
@@ -97,7 +95,6 @@ fn bc_right_aliases_equivalent() {
 
 #[test]
 fn bc_global_vs_explicit_both_sides_equivalent() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     assert_equiv(
         "y ~ s(x, bc=anchored, k=10)",

@@ -264,7 +264,6 @@ pub trait CustomFamily {
         specs: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
-        assert!(std::mem::size_of_val(options) > 0);
         let coefficient_work = self
             .coefficient_hessian_cost(specs)
             .max(self.coefficient_gradient_cost(specs));
@@ -413,7 +412,6 @@ pub trait CustomFamily {
         block_states: &[ParameterBlockState],
         spec: &ParameterBlockSpec,
     ) -> Result<(DesignMatrix, Array1<f64>), String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         Ok((spec.design.clone(), spec.offset.clone()))
     }
 
@@ -460,7 +458,6 @@ pub trait CustomFamily {
         block_spec: &ParameterBlockSpec,
         arr: &Array1<f64>,
     ) -> Result<Option<BlockGeometryDirectionalDerivative>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         assert!(!block_spec.name.is_empty());
         assert!(arr.iter().all(|v| !v.is_nan()));
@@ -475,7 +472,6 @@ pub trait CustomFamily {
         block_spec: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         assert!(!block_spec.name.is_empty());
         Ok(beta)
@@ -501,7 +497,6 @@ pub trait CustomFamily {
         idx: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
@@ -515,7 +510,6 @@ pub trait CustomFamily {
         idx: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         assert!(!block_spec.name.is_empty());
         Ok(None)
@@ -537,7 +531,6 @@ pub trait CustomFamily {
         idx: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
@@ -560,7 +553,6 @@ pub trait CustomFamily {
         arr: &Array1<f64>,
         arr2: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         assert!(arr.iter().all(|v| !v.is_nan()));
         assert!(arr2.iter().all(|v| !v.is_nan()));
@@ -606,8 +598,6 @@ pub trait CustomFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
-        assert!(block_specs.len() <= isize::MAX as usize);
         Ok(None)
     }
 
@@ -621,7 +611,6 @@ pub trait CustomFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array1<f64>>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         Ok(None)
     }
 
@@ -673,8 +662,6 @@ pub trait CustomFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
-        assert!(block_specs.len() <= isize::MAX as usize);
         Ok(None)
     }
 
@@ -811,7 +798,6 @@ pub trait CustomFamily {
         states: &[ParameterBlockState],
     ) -> bool {
         assert_valid_blockspecs(specs, "matrix-free inner-joint preference");
-        assert!(states.len() <= isize::MAX as usize);
         false
     }
 
@@ -1349,7 +1335,6 @@ pub trait CustomFamily {
         &self,
         block_states: &[ParameterBlockState],
     ) -> Result<Option<ExactNewtonOuterCurvature>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         Ok(None)
     }
 
@@ -1370,7 +1355,6 @@ pub trait CustomFamily {
         block_specs: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         self.exact_newton_outer_curvature_directional_derivative(block_states, d_beta_flat)
     }
 
@@ -1397,7 +1381,6 @@ pub trait CustomFamily {
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(block_specs.len() <= isize::MAX as usize);
         self.exact_newton_outer_curvature_second_directional_derivative(
             block_states,
             d_beta_u_flat,
@@ -1591,7 +1574,6 @@ pub trait CustomFamily {
         idx: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
@@ -1615,7 +1597,6 @@ pub trait CustomFamily {
         arr: &Array1<f64>,
         arr2: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         assert!(arr.iter().all(|v| !v.is_nan()));
         assert!(arr2.iter().all(|v| !v.is_nan()));
@@ -1655,9 +1636,6 @@ pub trait CustomFamily {
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
         idx: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
-        assert!(block_specs.len() <= isize::MAX as usize);
-        assert!(derivative_blocks.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         Ok(None)
     }
@@ -1681,9 +1659,6 @@ pub trait CustomFamily {
         idx: usize,
         idx2: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
-        assert!(block_specs.len() <= isize::MAX as usize);
-        assert!(derivative_blocks.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         assert!(idx2 < usize::MAX);
         Ok(None)
@@ -1705,9 +1680,6 @@ pub trait CustomFamily {
         block_specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
-        assert!(block_specs.len() <= isize::MAX as usize);
-        assert!(derivative_blocks.len() <= isize::MAX as usize);
         Ok(None)
     }
 
@@ -1767,9 +1739,6 @@ pub trait CustomFamily {
         idx: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
-        assert!(block_specs.len() <= isize::MAX as usize);
-        assert!(derivative_blocks.len() <= isize::MAX as usize);
         assert!(idx < usize::MAX);
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)

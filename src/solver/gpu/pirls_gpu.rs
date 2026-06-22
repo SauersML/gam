@@ -466,7 +466,6 @@ extern "C" __global__ void chol_logdet_col_major(
     /// residual is already tight, or `‖g‖ = 0`.
     ///
     /// `H_step·x = penalized_hessian·x + step_lm_delta·x`.
-    #[allow(clippy::too_many_arguments)]
     fn newton_step_refine_once(
         solver: &cudarc::cusolver::DnHandle,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,

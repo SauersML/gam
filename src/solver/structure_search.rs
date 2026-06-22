@@ -297,7 +297,6 @@ pub fn canonical_order(proposals: &mut [MoveProposal]) {
 ///   and voids validity; it is the one closure that must genuinely optimize.
 /// * `refit(candidate, shard)` — fold the shard into the candidate (any
 ///   fitter, warm starts, GPU; no conditions).
-#[allow(clippy::too_many_arguments)]
 pub fn search<S, Sh>(
     mut state: S,
     mut proposals: Vec<MoveProposal>,

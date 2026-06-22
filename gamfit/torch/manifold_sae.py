@@ -790,7 +790,7 @@ class _SparsityLayer(nn.Module):
         # unit rows; each next line = the row least aligned with the chosen lines.
         try:
             _, _, vh = torch.linalg.svd(xn - xn.mean(dim=0, keepdim=True), full_matrices=False)
-        except Exception:
+        except torch.linalg.LinAlgError:
             return None, False
         centers = [vh[0]]
         for _ in range(1, n_atoms):
@@ -806,7 +806,7 @@ class _SparsityLayer(nn.Module):
                 if members.shape[0] > 0:
                     try:
                         _, _, vk = torch.linalg.svd(members, full_matrices=False)
-                    except Exception:
+                    except torch.linalg.LinAlgError:
                         return None, False
                     C[k] = vk[0]
         align = (xn @ C.T).abs()
@@ -855,7 +855,7 @@ class _SparsityLayer(nn.Module):
                 centered = rows - rows.mean(dim=0, keepdim=True)
                 try:
                     singular = torch.linalg.svdvals(centered)
-                except Exception:
+                except torch.linalg.LinAlgError:
                     return None
                 if singular.numel() > rank:
                     tail = singular[rank:].square().sum()
@@ -1244,7 +1244,7 @@ class _SparsityLayer(nn.Module):
                 rd = resid0 - resid0.mean(dim=0, keepdim=True)
                 try:
                     _, _, vh = torch.linalg.svd(rd, full_matrices=False)
-                except Exception:
+                except torch.linalg.LinAlgError:
                     return None
                 proj = rd @ vh[0]
                 assign = (proj > 0).to(torch.long)
@@ -1491,7 +1491,8 @@ class ManifoldSAE(nn.Module):
                     nn.init.normal_(m.weight, mean=0.0, std=s)
                     nn.init.zeros_(m.bias)
         else:
-            assert isinstance(self.encoder, nn.Linear)
+            if not isinstance(self.encoder, nn.Linear):
+                raise TypeError("encoder must be nn.Linear")
             nn.init.normal_(self.encoder.weight, mean=0.0, std=s)
             nn.init.zeros_(self.encoder.bias)
         nn.init.normal_(self.atom_raw_anchor, mean=0.0, std=s)
@@ -1625,7 +1626,8 @@ class ManifoldSAE(nn.Module):
         # participate in .fit() by providing the warm-start seeds; after the
         # certified solve, the fitted Rust state is authoritative.
         fit = self._last_fit
-        assert fit is not None
+        if fit is None:
+            raise RuntimeError("fit is missing")
         F = int(self.cfg.n_atoms)
         d = int(self.cfg.intrinsic_rank)
         x_np = x.detach().cpu().numpy()

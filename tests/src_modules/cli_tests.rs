@@ -846,7 +846,6 @@ fn load_dataset_projected_keeps_only_requested_columns() {
 
 #[test]
 fn resolve_family_auto_uses_logit_for_binary_response() {
-    assert!(file!().ends_with(".rs"));
     let y = array![0.0, 1.0, 1.0, 0.0];
 
     let family = resolve_family(
@@ -874,7 +873,6 @@ fn resolve_family_auto_uses_logit_for_binary_response() {
 /// one fit-routing contract, and the CLI is a thin adapter over it.
 #[test]
 fn cli_resolve_family_matches_canonical_workflow_resolver() {
-    assert!(file!().ends_with(".rs"));
     let y_binary = array![0.0, 1.0, 1.0, 0.0];
     let y_count = array![0.0, 1.0, 2.0, 3.0, 4.0];
     let y_positive = array![0.5, 1.5, 2.5, 3.5];
@@ -1096,7 +1094,6 @@ fn cli_resolve_family_rejects_theta_without_negative_binomial() {
 
 #[test]
 fn cli_firth_validation_allows_flexible_logit_base_link() {
-    assert!(file!().ends_with(".rs"));
     let choice = LinkChoice {
         mode: LinkMode::Flexible,
         link: LinkFunction::Logit,
@@ -5761,7 +5758,6 @@ fn assert_inverse_link_init_rejected(
 
 #[test]
 fn parse_survival_inverse_link_rejects_beta_logistic_init_for_sas() {
-    assert!(file!().ends_with(".rs"));
     assert_inverse_link_init_rejected(
         "sas",
         None,
@@ -5772,7 +5768,6 @@ fn parse_survival_inverse_link_rejects_beta_logistic_init_for_sas() {
 
 #[test]
 fn parse_survival_inverse_link_rejects_sas_init_for_logit() {
-    assert!(file!().ends_with(".rs"));
     assert_inverse_link_init_rejected(
         "logit",
         Some("0.1,0.2"),
@@ -5798,7 +5793,6 @@ fn parse_survival_inverse_link_accepts_beta_logistic_init() {
 
 #[test]
 fn parse_survival_inverse_link_rejects_sas_init_for_beta_logistic() {
-    assert!(file!().ends_with(".rs"));
     assert_inverse_link_init_rejected(
         "beta-logistic",
         Some("0.1,0.2"),
@@ -5809,7 +5803,6 @@ fn parse_survival_inverse_link_rejects_sas_init_for_beta_logistic() {
 
 #[test]
 fn parse_survival_inverse_link_rejects_beta_logistic_init_for_logit() {
-    assert!(file!().ends_with(".rs"));
     assert_inverse_link_init_rejected(
         "logit",
         None,

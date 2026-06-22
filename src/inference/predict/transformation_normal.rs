@@ -53,7 +53,6 @@ impl PredictionTransform for TransformationNormalPredictor {
     }
 
     fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
-        assert!(std::mem::size_of_val(&pass) > 0);
         ResponseInterval::IdentityEta
     }
 
@@ -94,7 +93,6 @@ impl PredictableModel for TransformationNormalPredictor {
         &self,
         predict_input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        assert!(std::mem::size_of_val(predict_input) > 0);
         Ok(None)
     }
 

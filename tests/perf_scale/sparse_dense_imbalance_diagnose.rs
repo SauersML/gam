@@ -137,7 +137,6 @@ fn run(formula: &str) -> (f64, f64, f64) {
 
 #[test]
 fn diagnose_sparse_dense_imbalance() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     // Each `run` call exercises a different basis/BC variant; the diagnose
     // harness eprintln!s its detailed metrics. The asserts here guarantee that

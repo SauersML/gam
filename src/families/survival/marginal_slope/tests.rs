@@ -3469,7 +3469,6 @@ fn link_flex_bidirectional_timepoint_returns_finite_transport() {
 
 #[test]
 fn link_flex_blockwise_exact_newton_matches_joint_principal_blocks() {
-    assert!(file!().ends_with(".rs"));
     let score_runtime = test_deviation_runtime();
     let link_runtime = test_deviation_runtime();
     let marginal_design = array![[0.7, -0.2], [0.1, 0.6]];
@@ -3873,7 +3872,6 @@ fn timewiggle_marginal_psi_terms_return_finite_joint_terms() {
 
 #[test]
 fn timewiggle_blockwise_exact_newton_matches_joint_principal_blocks() {
-    assert!(file!().ends_with(".rs"));
     let score_runtime = test_deviation_runtime();
     let marginal_design = array![[0.7, -0.2], [0.1, 0.6]];
     let marginal_beta = array![0.35, -0.1];
@@ -4937,7 +4935,6 @@ fn timewiggle_tail_constraints_are_part_of_time_block_feasibility() {
 
 #[test]
 fn timewiggle_tail_step_is_clipped_before_it_can_flip_derivative() {
-    assert!(file!().ends_with(".rs"));
     let constraints = append_timewiggle_tail_nonnegative_constraints(None, 2, 1)
         .expect("tail constraints")
         .expect("time constraints");
@@ -7106,8 +7103,6 @@ fn b10_pack_bi(
 /// `#[cfg(test)]` being used as a dead-code escape hatch — does not
 /// fire on a legitimate test helper. Visibility into the family's
 /// private methods is preserved by Rust's child-module visibility rule.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::type_complexity)]
 fn flex_primary_timepoint_jets_for_test(
     family: &SurvivalMarginalSlopeFamily,
     row: usize,

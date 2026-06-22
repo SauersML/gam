@@ -272,13 +272,13 @@ def _check_manifold_basis_compatibility(
     if hasattr(latent, "to_json"):
         try:
             latent_kind = str(latent.to_json().get("kind", ""))
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             latent_kind = None
     basis_kind = None
     if hasattr(basis, "to_dict"):
         try:
             basis_kind = str(basis.to_dict().get("kind", ""))
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
             basis_kind = None
     if latent_kind and basis_kind:
         from ._binding import rust_module
@@ -291,7 +291,7 @@ def _check_manifold_basis_compatibility(
         return
     try:
         latent_dim = int(latent.dimension)
-    except Exception:
+    except (AttributeError, TypeError, ValueError):
         # Rust dimension oracle not yet exposed by the local extension; the
         # Rust core will reject incompatible specs again at fit time.
         return

@@ -2244,7 +2244,6 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
     }
 
     fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
-        assert!(std::mem::size_of_val(&pass) > 0);
         ResponseInterval::TransformEta
     }
 
@@ -2276,7 +2275,6 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
         &self,
         predict_input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        assert!(std::mem::size_of_val(predict_input) > 0);
         Ok(None)
     }
 

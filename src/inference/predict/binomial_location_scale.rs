@@ -458,7 +458,6 @@ impl PredictionTransform for BinomialLocationScalePredictor {
                 })
             }
             PredictPass::PosteriorMean => {
-                assert!(std::mem::size_of_val(&covariance_mode) > 0);
                 self.posterior_mean_state(input, fit)
             }
         }
@@ -473,7 +472,6 @@ impl PredictionTransform for BinomialLocationScalePredictor {
     }
 
     fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
-        assert!(std::mem::size_of_val(&pass) > 0);
         // Probability already evaluated post-transformation: delta-method
         // response interval with the threshold-scale η interval collapsed onto
         // the point predictor.
@@ -510,7 +508,6 @@ impl PredictableModel for BinomialLocationScalePredictor {
         &self,
         predict_input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        assert!(std::mem::size_of_val(predict_input) > 0);
         Ok(None)
     }
 

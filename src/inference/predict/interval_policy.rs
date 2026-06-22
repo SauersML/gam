@@ -280,7 +280,6 @@ pub struct UncertaintyProvenance {
 /// (`eta`, `mean`, the two standard errors) plus the policy choices
 /// (`eta_interval`, `method`); the engine owns everything else so interval
 /// construction cannot drift between families.
-#[allow(clippy::too_many_arguments)]
 pub fn assemble_uncertainty_result(
     confidence_level: f64,
     eta: Array1<f64>,
@@ -501,8 +500,6 @@ pub trait PredictionTransform {
         pass: PredictPass,
         covariance_mode: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
-        assert!(std::mem::size_of_val(fit) > 0);
-        assert!(std::mem::size_of_val(&covariance_mode) > 0);
         match pass {
             PredictPass::FullUncertainty => self.point_state(input),
             PredictPass::PosteriorMean => Err(EstimationError::InvalidInput(
@@ -539,7 +536,6 @@ pub trait PredictionTransform {
         &self,
         input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        assert!(std::mem::size_of_val(input) > 0);
         Ok(None)
     }
 
@@ -570,7 +566,6 @@ pub trait PredictionTransform {
         // Default: no skew-aware band. The generic symmetric construction is
         // used instead. Validate the per-row inputs the driver hands every
         // transform so an overriding impl and this default agree on shape.
-        assert!(std::mem::size_of_val(input) > 0);
         assert_eq!(mean.len(), mean_se.len());
         assert_eq!(mean.len(), z_lower.len());
         assert_eq!(mean.len(), z_upper.len());

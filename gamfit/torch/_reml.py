@@ -900,7 +900,8 @@ def gaussian_reml_fit_additive(
             )
         if bys is not None and bys[i] is not None:
             by_i = bys[i]
-            assert by_i is not None  # narrow for type-checkers
+            if by_i is None:
+                raise RuntimeError("by_i is None")  # narrow for type-checkers
             if by_i.dim() != 1 or by_i.shape[0] != design.shape[0]:
                 raise ValueError(
                     f"bys[{i}] must be 1D of length N={design.shape[0]}; got {tuple(by_i.shape)}"

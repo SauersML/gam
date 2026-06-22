@@ -28,18 +28,6 @@ pub trait SaeBasisEvaluator: Send + Sync + std::fmt::Debug {
         Ok(PhiEtaSplit::all_linear(n_basis))
     }
 
-    /// Per-factor basis sizes `(M₁, M₂)` of a `d = 2` TENSOR-PRODUCT evaluator
-    /// whose fused basis is the Kronecker product of two factor bases in
-    /// row-major column order `flat = j·M₂ + k` (the within-atom carve / #993
-    /// convention). `M₁·M₂` equals the fused basis width. `None` for evaluators
-    /// that are not a two-factor product (single-axis, sphere chart, monomial
-    /// patch) — the within-atom functional-ANOVA carve is only defined on a
-    /// genuine product manifold, so a `None` here is the honest "no factor
-    /// split" signal, never a guess.
-    fn factor_basis_sizes(&self) -> Option<(usize, usize)> {
-        None
-    }
-
     /// Evaluate the basis at curvature scale `eta in [0, 1]` plus the analytic
     /// derivative with respect to eta.
     ///
@@ -824,18 +812,6 @@ impl SaeBasisEvaluator for TorusHarmonicEvaluator {
             }
         }
         Ok(PhiEtaSplit::from_curved_mask(curved))
-    }
-
-    /// A `d = 2` torus is the tensor product of two equal circle factors, each
-    /// of width `axis_basis_size()` (constant-leading: column 0 ≡ 1). Higher-
-    /// dimensional tori are not a TWO-factor product, so they report `None`.
-    fn factor_basis_sizes(&self) -> Option<(usize, usize)> {
-        if self.latent_dim == 2 {
-            let m = self.axis_basis_size();
-            Some((m, m))
-        } else {
-            None
-        }
     }
 
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {
@@ -1838,13 +1814,6 @@ impl SaeBasisEvaluator for CylinderHarmonicEvaluator {
             }
         }
         Ok(PhiEtaSplit::from_curved_mask(curved))
-    }
-
-    /// A cylinder `S¹ × ℝ` is the tensor product of the circle factor
-    /// (`circle_basis_size()`, the slow axis 0) and the line factor
-    /// (`line_basis_size()`, the fast axis 1), both constant-leading.
-    fn factor_basis_sizes(&self) -> Option<(usize, usize)> {
-        Some((self.circle_basis_size(), self.line_basis_size()))
     }
 
     fn second_jet_dyn(&self, coords: ArrayView2<'_, f64>) -> Option<Result<Array4<f64>, String>> {

@@ -2058,7 +2058,6 @@ fn metric_provenance_label(
     fisher_provenance = None,
     row_loss_weights = None,
 ))]
-#[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
@@ -5680,7 +5679,6 @@ fn sae_build_atom_plans(
     fisher_provenance = None,
     row_loss_weights = None,
 ))]
-#[allow(clippy::too_many_arguments)]
 fn sae_manifold_fit_minimal<'py>(
     py: Python<'py>,
     z: PyReadonlyArray2<'py, f64>,
@@ -6601,7 +6599,6 @@ fn sae_manifold_predict_oos<'py>(
     fisher_factors = None,
     fisher_provenance = None,
 ))]
-#[allow(clippy::too_many_arguments)]
 fn sae_steer_delta<'py>(
     py: Python<'py>,
     atom_k: usize,

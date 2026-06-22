@@ -550,7 +550,6 @@ fn build_duchon_basis_uncached(
 /// Returns the per-block penalty matrices (term-local frame, same order/count
 /// the cold build emits) and the active per-block nullspace dims — exactly the
 /// objects the cold build feeds into `filter_active_penalty_candidates_with_ops`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn duchon_penalties_at_length_scale(
     centers: ArrayView2<'_, f64>,
     identifiability_transform: Option<&Array2<f64>>,

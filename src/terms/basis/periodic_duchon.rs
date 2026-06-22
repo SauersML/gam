@@ -561,7 +561,6 @@ pub(crate) fn mixed_periodicity_additive_kernel(
 /// length-``d`` per-axis vectors, so the caller can assemble the input-location
 /// jet/Hessian directly. This is the exact analytic derivative of
 /// [`mixed_periodicity_additive_kernel`].
-#[allow(clippy::type_complexity)]
 pub(crate) fn mixed_periodicity_additive_kernel_jet(
     x: ArrayView1<'_, f64>,
     c: ArrayView1<'_, f64>,

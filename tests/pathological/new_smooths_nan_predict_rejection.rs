@@ -109,7 +109,6 @@ fn assert_clear_nonfinite_error(label: &str, err: &str) {
 
 #[test]
 fn sphere_wahba_predict_nan_rejected() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let data = make_sphere_dataset();
     let r = predict_with_nan(
@@ -123,7 +122,6 @@ fn sphere_wahba_predict_nan_rejected() {
 
 #[test]
 fn sphere_harmonic_predict_nan_rejected() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let data = make_sphere_dataset();
     let r = predict_with_nan(
@@ -163,7 +161,6 @@ fn periodic_1d_predict_nan_rejected() {
 
 #[test]
 fn cylinder_te_predict_nan_rejected() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let data = make_cylinder_dataset();
     let r = predict_with_nan(

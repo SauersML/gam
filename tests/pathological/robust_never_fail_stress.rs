@@ -254,7 +254,6 @@ fn run_battery() -> Vec<(&'static str, Path)> {
 /// escalation lands.
 #[test]
 fn characterize_robust_paths() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
 
     let battery = run_battery();

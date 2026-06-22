@@ -500,7 +500,6 @@ mod tests {
             latent_coords: &LatentCoordValues,
         ) -> Result<ArrowSchurSystem, String> {
             assert!(arr.iter().all(|v| !v.is_nan()));
-            assert!(std::mem::size_of_val(latent_coords) > 0);
             let mut sys = ArrowSchurSystem::new(self.n, self.d, self.k);
             for j in 0..self.k {
                 sys.hbb[[j, j]] = 1.0;
@@ -519,7 +518,6 @@ mod tests {
             latent_coords: &LatentCoordValues,
         ) -> Result<f64, String> {
             assert!(arr.iter().all(|v| !v.is_nan()));
-            assert!(std::mem::size_of_val(latent_coords) > 0);
             Ok(0.0)
         }
     }

@@ -259,7 +259,6 @@ impl PredictionTransform for SurvivalPredictor {
                 Ok(state)
             }
             PredictPass::PosteriorMean => {
-                assert!(std::mem::size_of_val(&covariance_mode) > 0);
                 let (eta_threshold, eta_log_sigma, design_noise) = self.linear_predictors(input)?;
                 // The eta_se here covers only the threshold block. Response-scale
                 // survival intervals also need sigma uncertainty, which is
@@ -383,7 +382,6 @@ impl PredictableModel for SurvivalPredictor {
         &self,
         predict_input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        assert!(std::mem::size_of_val(predict_input) > 0);
         Ok(None)
     }
 

@@ -52,7 +52,6 @@ fn predict_bounded(
 
 #[test]
 fn sphere_single_latitude_band_stable() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lon = Uniform::new(-179.0_f64, 179.0).expect("uniform");
@@ -87,7 +86,6 @@ fn sphere_single_latitude_band_stable() {
 
 #[test]
 fn sphere_polar_only_data_stable() {
-    assert!(file!().ends_with(".rs"));
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let u_lon = Uniform::new(-179.0_f64, 179.0).expect("uniform");

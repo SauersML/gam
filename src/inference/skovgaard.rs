@@ -295,7 +295,6 @@ pub fn scalar_skovgaard_r_star(input: &ScalarSkovgaardInput) -> Option<ScalarSko
 /// `observed_info = (cᵀ Ĥ⁻¹ c)⁻¹`, `expected_info = (cᵀ Iₑ⁻¹ c)⁻¹`, and
 /// `score_cov = (cᵀ Ĥ⁻¹ (Σ sᵢsᵢᵀ) Ĥ⁻¹ c)⁻¹` — the inverse of the sandwich
 /// (robust) variance of `ψ̂`. Returns `None` on any degenerate reduction.
-#[allow(clippy::too_many_arguments)]
 pub fn scalar_skovgaard_from_matrices(
     contrast: ndarray::ArrayView1<'_, f64>,
     beta: ndarray::ArrayView1<'_, f64>,

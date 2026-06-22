@@ -216,7 +216,6 @@ impl PredictionTransform for StandardPredictor {
                 })
             }
             PredictPass::PosteriorMean => {
-                assert!(std::mem::size_of_val(&covariance_mode) > 0);
                 self.wiggle_posterior_mean_state(input, fit)
             }
         }
@@ -327,7 +326,6 @@ impl PredictableModel for StandardPredictor {
         &self,
         predict_input: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
-        assert!(std::mem::size_of_val(predict_input) > 0);
         Ok(None)
     }
 

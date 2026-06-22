@@ -398,7 +398,6 @@ mod tests {
 
     #[test]
     fn test_operator_dense_agrees_unconstrained() {
-        assert!(file!().ends_with(".rs"));
         let centers = small_centers();
         let op = ClosedFormPenaltyOperator::new(
             centers.view(),
@@ -428,7 +427,6 @@ mod tests {
 
     #[test]
     fn test_operator_diag_agrees() {
-        assert!(file!().ends_with(".rs"));
         let centers = small_centers();
         let op = ClosedFormPenaltyOperator::new(
             centers.view(),
@@ -450,7 +448,6 @@ mod tests {
 
     #[test]
     fn test_operator_matvec_random_vector() {
-        assert!(file!().ends_with(".rs"));
         let centers = small_centers();
         let op = ClosedFormPenaltyOperator::new(
             centers.view(),
@@ -517,7 +514,6 @@ mod tests {
 
     #[test]
     fn test_operator_preserves_raw_anisotropy_coordinates() {
-        assert!(file!().ends_with(".rs"));
         let centers = small_centers();
         let eta = [0.35, 0.10];
         let op =

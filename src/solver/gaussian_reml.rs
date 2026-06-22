@@ -4154,7 +4154,6 @@ pub struct GaussianRemlBlocksBackwardAnalytic {
 /// terms are accumulated first, then the smoothing-parameter sensitivity is
 /// routed through the F×F profiled REML score Hessian from the implicit optimum.
 /// Pairs with the forward [`gaussian_reml_blocks_orthogonal_shared_scale`].
-#[allow(clippy::too_many_arguments)]
 pub fn gaussian_reml_fit_blocks_backward_analytic(
     designs: &[Array2<f64>],
     penalties_raw: &[Array2<f64>],
@@ -4709,7 +4708,6 @@ pub fn add_block_diagonal_penalty(
 /// per-output residual scale `sigma2`, and the penalized Fisher-weighted
 /// objective seeded by `latent_prior_score`. `row_weights` are the (already
 /// resolved) per-observation likelihood weights.
-#[allow(clippy::too_many_arguments)]
 pub fn dense_fisher_gaussian_fit(
     design: ArrayView2<'_, f64>,
     y: ArrayView2<'_, f64>,

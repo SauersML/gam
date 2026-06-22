@@ -1766,7 +1766,6 @@ pub(super) fn rigid_standard_normal_mixed_z_sensitivity(
 /// the rigid standard-normal kernel carries no deviation z-dependence, and the
 /// conditional gate's canonical (non-flex) kernel has no such blocks — the
 /// caller wires the correction only when `p_beta == p_marginal + p_logslope`.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn rigid_standard_normal_score_zeta_sensitivity(
     base_link: &InverseLink,
     marginal_eta: &Array1<f64>,

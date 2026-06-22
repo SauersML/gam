@@ -429,7 +429,6 @@ pub struct SmsTimewiggleTimeJacobian {
 
 impl SmsTimewiggleTimeJacobian {
     /// Construct.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         design_entry: Arc<Array2<f64>>,
         design_exit: Arc<Array2<f64>>,
@@ -640,7 +639,6 @@ pub struct SmsTimewiggleMarginalJacobian {
 
 impl SmsTimewiggleMarginalJacobian {
     /// Construct.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         design_entry: Arc<Array2<f64>>,
         design_exit: Arc<Array2<f64>>,

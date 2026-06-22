@@ -538,7 +538,6 @@ mod tests {
 
     #[test]
     pub(crate) fn weighted_cross_dense_matches_rowwise_reference_at_large_scale_block_size() {
-        assert!(file!().ends_with(".rs"));
         let left = deterministic_matrix(2048, 96, 0.1);
         let right = deterministic_matrix(2048, 64, 0.7);
         let weights = deterministic_weights(left.nrows());
@@ -549,7 +548,6 @@ mod tests {
 
     #[test]
     pub(crate) fn xt_diag_x_dense_into_matches_symmetric_reference_at_large_scale_block_size() {
-        assert!(file!().ends_with(".rs"));
         let x = deterministic_matrix(1024, 96, 1.1);
         let weights = deterministic_weights(x.nrows());
         let mut scratch = Array2::<f64>::zeros((0, 0));

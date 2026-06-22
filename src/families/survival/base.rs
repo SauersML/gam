@@ -456,7 +456,6 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
         block_idx: usize,
         spec: &crate::families::custom_family::ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        assert!(block_states.len() <= isize::MAX as usize);
         let block = self.blocks.get(block_idx).ok_or_else(|| {
             SurvivalError::CauseSpecificDimensionMismatch {
                 reason: format!(

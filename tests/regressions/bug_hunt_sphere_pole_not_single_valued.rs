@@ -186,18 +186,15 @@ fn assert_pole_single_valued(radians: bool, pole_lat_rad: f64, label: &str) {
 
 #[test]
 fn sphere_north_pole_predict_is_single_valued_radians() {
-    assert!(file!().ends_with(".rs"));
     assert_pole_single_valued(true, PI / 2.0, "north/radians");
 }
 
 #[test]
 fn sphere_south_pole_predict_is_single_valued_radians() {
-    assert!(file!().ends_with(".rs"));
     assert_pole_single_valued(true, -PI / 2.0, "south/radians");
 }
 
 #[test]
 fn sphere_north_pole_predict_is_single_valued_degrees() {
-    assert!(file!().ends_with(".rs"));
     assert_pole_single_valued(false, PI / 2.0, "north/degrees");
 }

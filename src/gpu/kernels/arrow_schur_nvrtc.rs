@@ -41,7 +41,6 @@
 //! `bump = scale · ε^½ · 1024` to `ridge_t` and re-launches, the same Ceres-
 //! style geometric escalation the CPU path already implements.
 
-#![allow(clippy::module_name_repetitions)]
 
 use crate::solver::arrow_schur::ArrowSchurSystem;
 
@@ -455,7 +454,6 @@ struct FusedRowState {
 /// `partial_s` / `partial_r` are written positive (`+Y_iᵀY_i`, `+Y_iᵀu_i`),
 /// matching the NVRTC kernel; the host reduction applies the documented signs.
 /// `log_det_local = 2 Σ_j ln L_i[j,j]` is the block's contribution to `log|H|`.
-#[allow(clippy::too_many_arguments)]
 fn emulate_forward_block(
     d_col_major: &[f64],
     b_col_major: &[f64],

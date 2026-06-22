@@ -332,7 +332,6 @@ pub(crate) const LOCATION_SCALE_N_OUTPUTS: usize = 2;
 /// fixed at [`LOCATION_SCALE_N_OUTPUTS`] for every two-block family here
 /// but is exposed so the helper composes cleanly with any future
 /// k-block extension.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_location_scale_block(
     name: impl Into<String>,
     design: DesignMatrix,
@@ -377,7 +376,6 @@ pub(crate) fn build_location_scale_block(
 /// contributes no linear effective Jacobian — the installed callback
 /// therefore exposes a zero `(n × p_w)` design under
 /// `n_family_outputs = LOCATION_SCALE_N_OUTPUTS`.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_location_scale_wiggle_block(
     name: impl Into<String>,
     design: DesignMatrix,
@@ -577,7 +575,6 @@ pub(crate) fn append_binomial_log_sigma_shrinkage_penalty_design(
 /// shrinkage penalty on the scale nullspace, and the joint Gaussian warm start —
 /// lives in exactly one place. Callers supply the per-block log-λ vectors sliced
 /// from their own layout (two-block vs with-wiggle) and append any extra blocks.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_gaussian_mean_and_scale_blocks(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -665,7 +662,6 @@ pub(crate) fn build_gaussian_mean_and_scale_blocks(
 /// mirrors [`build_gaussian_mean_and_scale_blocks`] but with the binomial-
 /// identified log-σ design, the link-aware joint warm start, and the same
 /// REML-selected full-span scale shrinkage penalty.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_binomial_threshold_and_scale_blocks(
     y: &Array1<f64>,
     weights: &Array1<f64>,

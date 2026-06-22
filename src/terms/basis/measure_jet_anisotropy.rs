@@ -492,7 +492,6 @@ pub(crate) struct BlockForms {
 /// `φ M̈`). This is the metric generalization of the inner loop in
 /// `measure_jet_smooth::assemble_weighted_forms`, with value and jets sharing
 /// one walk so a value↔derivative desync is structurally impossible.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn block_residual_jets(
     phi: &Array2<f64>,          // ml×d : δ/ε (metric-free local features)
     masses_local: &Array1<f64>, // ml

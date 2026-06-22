@@ -477,7 +477,6 @@ impl SurvivalMarginalSlopeFamily {
     /// path (with non-empty `identity_blocks`); the only behavioural
     /// difference between those callers is whether the identity-block cross
     /// terms are added, which is driven entirely by `identity_blocks`.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn accumulate_timewiggle_directional_row(
         &self,
         row: usize,

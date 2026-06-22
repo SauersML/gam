@@ -745,7 +745,6 @@ fn cross_block_identifiability_partial_alias_keeps_residual_rank() {
 
 #[test]
 fn flex_hessian_matvec_matches_dense_hessian() {
-    assert!(file!().ends_with(".rs"));
     let (family, states, cache, direction) =
         flex_hessian_matvec_fixture(96).expect("flex Hv fixture");
     let dense = family
@@ -3492,7 +3491,6 @@ fn validate_spec_rejects_nonfinite_z_values() {
 
 #[test]
 fn validate_spec_accepts_learnable_gaussian_shift_sigma() {
-    assert!(file!().ends_with(".rs"));
     let data = Array2::<f64>::zeros((3, 0));
     let mut spec = base_spec(
         array![0.0, 1.0, 0.0],
