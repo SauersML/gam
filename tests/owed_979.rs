@@ -43,7 +43,6 @@
 //! contract — the regression the #979 optimisation must never introduce — fails
 //! the first assertion; a both-wrong batched+per-axis pair fails the second.
 
-use std::sync::Arc;
 
 use gam::families::custom_family::{
     CustomFamily, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
@@ -51,14 +50,6 @@ use gam::families::custom_family::{
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
 
-/// Smooth per-row weight `g(η)` and its derivative `g'(η)`. A logistic-style
-/// `g(η) = σ(η)(1−σ(η))` mirrors the Bernoulli information weight whose per-row
-/// rebuild was the #979 cost; any smooth `g` exercises the same batched-vs-per-
-/// axis contract.
-fn g_weight(eta: f64) -> f64 {
-    let s = 1.0 / (1.0 + (-eta).exp());
-    s * (1.0 - s)
-}
 
 /// `g'(η) = σ(1−σ)(1−2σ)`.
 fn g_weight_deriv(eta: f64) -> f64 {
