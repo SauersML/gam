@@ -548,6 +548,22 @@ impl SmoothBasisSpec {
         }
     }
 
+    /// True for a tensor-product smooth that is only *marginally* centered
+    /// (`ti(...)`, [`TensorBSplineIdentifiability::MarginalSumToZero`]): its
+    /// per-margin sum-to-zero reparameterization `(B_xZ_x)⊗(B_zZ_z)` has ALREADY
+    /// removed each axis's main effect analytically (mgcv-identical), so its
+    /// main-effect removal is complete and it must take NO additional
+    /// owner-residualization block. Residualizing it a second time against the
+    /// realized main-effect designs is a grid-fragile no-op on an exact tensor
+    /// grid but eats genuine pure-interaction curvature off-grid (#1470).
+    pub fn is_marginally_centered_tensor(&self) -> bool {
+        matches!(
+            self,
+            Self::TensorBSpline { spec, .. }
+                if matches!(spec.identifiability, TensorBSplineIdentifiability::MarginalSumToZero)
+        )
+    }
+
     /// Feature columns this basis consumes, used alongside [`structural_kind`]
     /// to disambiguate two same-kind smooths on different axes. Wrapper
     /// variants delegate to their inner basis.
