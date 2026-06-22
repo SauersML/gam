@@ -310,6 +310,129 @@ pub(crate) fn binomial_nonwiggle_tower_matches_hand_witness_channels() {
     }
 }
 
+/// #932: the production binomial location-scale JOINT Hessian assembler must
+/// equal the single-sourced `binomial_location_scale_nll_tower`.
+///
+/// `binomial_nonwiggle_tower_matches_hand_witness_channels` pins the *tower*
+/// against a *test* hand witness, and the operator-workspace tests pin the
+/// lazy operator against the dense `exact_newton_joint_hessian_from_designs`.
+/// But NOTHING pinned the production assembler's own row coefficients
+/// (`exact_newton_joint_hessian_row_coefficients`: `coeff_tt = m2 r²`,
+/// `coeff_tl = κ r (m1 + q m2)`, `coeff_ll = κ² q (m1 + q m2)`, with the q-chain
+/// `q = −η_t·e^{−η_ls}` and `κ = σ'(η_ls)/σ`) to the single-source tower. A
+/// typo in those coefficients (a dropped `q m2`, a wrong `κ` power — the #736
+/// cross-term genus) would slip past both existing oracles.
+///
+/// This closes the gap. For a multi-column non-wiggle fixture, the production
+/// `exact_newton_joint_hessian_from_designs` joint matrix is compared, at
+/// ~1e-9, to the joint Hessian assembled by pulling the per-row `Tower4<2>`
+/// curvature `tower.h` (in (η_t, η_ls)) through the same designs:
+/// `H = Σ_i [X_t; X_ls]_iᵀ · tower.h_i · [X_t; X_ls]_i`. Independent arithmetic
+/// (the tower differentiates one expression by Leibniz; the production builds
+/// the coefficients by hand), so agreement is a correctness proof of the hand
+/// assembler — across probit / logit / cloglog.
+#[test]
+pub(crate) fn binomial_location_scale_joint_hessian_matches_single_sourced_tower_932() {
+    let n = 7usize;
+    let pt = 2usize;
+    let pls = 2usize;
+    let xt = Array2::from_shape_fn((n, pt), |(i, j)| {
+        ((i as f64) * 0.31 + (j as f64) * 0.17).sin() + 0.4
+    });
+    let xls = Array2::from_shape_fn((n, pls), |(i, j)| {
+        ((i as f64) * 0.23 + (j as f64) * 0.41).cos() * 0.5
+    });
+    let beta_t = array![0.35, -0.20];
+    let beta_ls = array![0.18, -0.27];
+    let eta_t = xt.dot(&beta_t);
+    let eta_ls = xls.dot(&beta_ls);
+    let total = pt + pls;
+
+    for link in [
+        InverseLink::Standard(StandardLink::Probit),
+        InverseLink::Standard(StandardLink::Logit),
+        InverseLink::Standard(StandardLink::CLogLog),
+    ] {
+        let family = BinomialLocationScaleFamily {
+            y: Array1::from_iter((0..n).map(|i| if i % 2 == 0 { 1.0 } else { 0.0 })),
+            weights: Array1::from_iter((0..n).map(|i| 0.5 + 0.2 * i as f64)),
+            link_kind: link.clone(),
+            threshold_design: None,
+            log_sigma_design: None,
+            policy: crate::resource::ResourcePolicy::default_library(),
+        };
+        let states = vec![
+            ParameterBlockState {
+                beta: beta_t.clone(),
+                eta: eta_t.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_ls.clone(),
+                eta: eta_ls.clone(),
+            },
+        ];
+
+        // Production hand-assembled joint Hessian (the path under audit).
+        let h_prod = family
+            .exact_newton_joint_hessian_from_designs(&states, &xt, &xls)
+            .expect("production joint Hessian")
+            .expect("production joint Hessian present");
+        assert_eq!(h_prod.dim(), (total, total));
+
+        // Single-sourced reference: per-row Tower4<2> curvature in (η_t, η_ls),
+        // pulled through the SAME designs. σ = e^{η_ls} ⇒ κ = 1, matching the
+        // tower's inv_sigma = e^{−η_ls}.
+        let mut h_tower = Array2::<f64>::zeros((total, total));
+        for i in 0..n {
+            let sigma = exp_sigma_from_eta_scalar(eta_ls[i]);
+            let q = binomial_location_scale_q0(eta_t[i], sigma);
+            let jet = inverse_link_jet_for_inverse_link(&link, q).expect("link jet");
+            let tower = binomial_location_scale_nll_tower(
+                family.y[i],
+                family.weights[i],
+                eta_t[i],
+                eta_ls[i],
+                q,
+                jet.mu,
+                jet.d1,
+                jet.d2,
+                jet.d3,
+                &link,
+                true,
+            )
+            .expect("row tower");
+
+            // Row design in the joint coefficient layout [X_t | X_ls].
+            let mut row = vec![0.0_f64; total];
+            for c in 0..pt {
+                row[c] = xt[[i, c]];
+            }
+            for c in 0..pls {
+                row[pt + c] = xls[[i, c]];
+            }
+            // channel(a): 0 -> η_t block, 1 -> η_ls block.
+            let block_of = |coef: usize| if coef < pt { 0usize } else { 1usize };
+            for a_coef in 0..total {
+                let ca = block_of(a_coef);
+                for b_coef in 0..total {
+                    let cb = block_of(b_coef);
+                    h_tower[[a_coef, b_coef]] +=
+                        tower.h[ca][cb] * row[a_coef] * row[b_coef];
+                }
+            }
+        }
+
+        for ((a, b), &prod) in h_prod.indexed_iter() {
+            let want = h_tower[[a, b]];
+            assert!(
+                (prod - want).abs() <= 1e-9 * (1.0 + want.abs()),
+                "{link:?}: joint Hessian [{a}][{b}] hand-assembler {prod:.9e} != \
+                 single-sourced tower {want:.9e}"
+            );
+        }
+    }
+}
+
 pub(crate) fn hand_trigamma(x: f64) -> f64 {
     crate::families::jet_tower::trigamma_derivative_stack(x)[0]
 }
