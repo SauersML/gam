@@ -818,6 +818,6 @@ pub struct ContractedPsiSecondOrder {
 pub type ContractedPsiSecondOrderFn =
     Arc<dyn Fn(&[f64]) -> Result<Option<ContractedPsiSecondOrder>, String> + Send + Sync>;
 
-use crate::solver::estimate::reml::reml_outer_engine::dense_linalg::{
+use crate::solver::reml::reml_outer_engine::{
     dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into,
 };

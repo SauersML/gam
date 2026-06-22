@@ -660,7 +660,7 @@ fn dispersion_phi_prefers_inference_then_falls_back_to_standard_deviation() {
     // With a cached `inference` block present, `dispersion_phi()` returns
     // the stored dispersion verbatim so it can never diverge from the φ̂
     // that scaled the covariances at fit time.
-    let fit = decode_invariant_test_fit(, e));
+    let fit = decode_invariant_test_fit();
     assert_eq!(fit.dispersion(), Some(Dispersion::Known(1.0)));
     assert_eq!(fit.dispersion_phi(), 1.0);
 
