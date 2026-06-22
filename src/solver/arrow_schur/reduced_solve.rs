@@ -2680,10 +2680,12 @@ pub(crate) fn incomplete_cholesky_level0(
     // multiplier L[j,k] — and a nonzero at the rows i of column j's pattern.
     // Any update whose target (i,j) is OUTSIDE the kept pattern is dropped.
     for j in 0..b {
-        // Diagonal: a[j,j] - Σ_{k<j} L[j,k]².
+        // Diagonal: a[j,j] - Σ_{k<j} L[j,k]². Each prior column k<j contributes
+        // its row-j entry L[j,k] (looked up by row, so the column index is not
+        // needed); columns without a row-j entry contribute nothing.
         let dpos = col_ptr[j];
         let mut diag = val[dpos];
-        for (k, mapk) in col_pos.iter().enumerate().take(j) {
+        for mapk in &col_pos[..j] {
             if let Some(&pjk) = mapk.get(&j) {
                 let ljk = val[pjk];
                 diag -= ljk * ljk;
@@ -2698,7 +2700,7 @@ pub(crate) fn incomplete_cholesky_level0(
         for p in (dpos + 1)..col_ptr[j + 1] {
             let i = row_idx[p];
             let mut s = val[p];
-            for (k, mapk) in col_pos.iter().enumerate().take(j) {
+            for mapk in &col_pos[..j] {
                 if let (Some(&pik), Some(&pjk)) = (mapk.get(&i), mapk.get(&j)) {
                     s -= val[pik] * val[pjk];
                 }
