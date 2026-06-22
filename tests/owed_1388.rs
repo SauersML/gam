@@ -215,3 +215,79 @@ fn owed_1388_rank53_class_underdetermined_joint_canonicalizes_on_bounded_stack()
     // descent, the WIDER block would overflow where the narrow one did not.
     assert_underdetermined_joint_canonicalizes(40, 60, 1 << 20);
 }
+
+/// FLAT-path arm (single channel, no `jacobian_callback`) that DETERMINISTICALLY
+/// trips the OLD strict `rank(J_can) == p_total_red` post-T invariant on an
+/// under-determined joint, and must now pass under the corrected
+/// `rank(J_can) == min(rank(J_pre), p_total_red)` invariant (#1388).
+///
+/// Geometry: a high-priority `anchor` block (just the intercept) plus a
+/// lower-priority `wide` block whose first column is the SAME intercept (a
+/// resolvable cross-block alias) and whose remaining `W` columns are a
+/// Vandermonde-style basis on only `n` points, so the joint column count
+/// `p_joint = 1 + (1 + W)` exceeds the row count `n`. The audit resolves and
+/// drops exactly the lower-priority intercept alias (`wide` is lower priority),
+/// leaving `p_total_red = 1 + W` kept columns — but the design carries only `n`
+/// independent rows, so the reduced `J_can` is row-capped at
+/// `rank(J_pre) = n < p_total_red`. The OLD invariant saw `rank(J_can) < p_red`
+/// and aborted with "post-T rank invariant violated"; the corrected invariant
+/// certifies against `min(rank(J_pre), p_total_red) = n` and passes.
+#[test]
+fn owed_1388_flat_underdetermined_joint_canonicalizes_min_target() {
+    let n = 8usize;
+    let w = 14usize; // wide block carries 1 (alias intercept) + W extra columns
+    let x: Vec<f64> = (0..n).map(|i| i as f64 / (n as f64 - 1.0)).collect();
+
+    // anchor: intercept only, highest priority.
+    let mut anchor_d = Array2::<f64>::zeros((n, 1));
+    for i in 0..n {
+        anchor_d[[i, 0]] = 1.0;
+    }
+    let mut anchor = ParameterBlockSpec::defaults();
+    anchor.name = "anchor".to_string();
+    anchor.design = DesignMatrix::Dense(DenseDesignMatrix::from(anchor_d));
+    anchor.offset = Array1::<f64>::zeros(n);
+    anchor.gauge_priority = 200;
+
+    // wide: col 0 = intercept (aliases anchor), cols 1..=W = monomial powers of x
+    // (only n of which can be independent), lowest priority so the audit demotes
+    // ITS aliased intercept.
+    let p_wide = 1 + w;
+    let mut wide_d = Array2::<f64>::zeros((n, p_wide));
+    for i in 0..n {
+        wide_d[[i, 0]] = 1.0; // aliased intercept
+        let mut pw = 1.0;
+        for j in 1..p_wide {
+            pw *= x[i];
+            wide_d[[i, j]] = pw;
+        }
+    }
+    let mut wide = ParameterBlockSpec::defaults();
+    wide.name = "wide".to_string();
+    wide.design = DesignMatrix::Dense(DenseDesignMatrix::from(wide_d));
+    wide.offset = Array1::<f64>::zeros(n);
+    wide.gauge_priority = 100;
+
+    let specs = vec![anchor, wide];
+    let p_joint: usize = specs.iter().map(|s| s.design.ncols()).sum();
+    assert!(
+        p_joint > n,
+        "flat fixture must be under-determined: p_joint={p_joint} <= n={n}",
+    );
+
+    // Before the fix: Err(DimensionMismatch{reason: "...post-T rank invariant
+    // violated..."}). After: Ok, because the reduced rank legitimately equals
+    // min(rank(J_pre), p_total_red) = n on this under-determined joint.
+    let canon = match canonicalize_for_identifiability(&specs) {
+        Ok(c) => c,
+        Err(e) => panic!(
+            "under-determined flat joint (p_joint={p_joint} > n={n}) must canonicalise; \
+             got error (regression of the #1388 post-T min-target invariant fix): {e:?}",
+        ),
+    };
+    let p_reduced: usize = canon.reduced_specs.iter().map(|s| s.design.ncols()).sum();
+    assert!(
+        p_reduced <= p_joint,
+        "reduced width {p_reduced} must not exceed raw width {p_joint}",
+    );
+}

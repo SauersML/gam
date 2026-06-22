@@ -1793,14 +1793,17 @@ impl<'a> RemlState<'a> {
         // nothing to refine. Mirror the gate here so large-model fits silently drop
         // the refinement rather than erroring out — matching the established skip
         // pattern for non-canonical-logit links above.
+        //
+        // The Firth gate is strictly tighter than the TK dense-work caps used by
+        // the non-Gaussianity audit (`TK_MAX_*`): `firth_problem_scale_allows`
+        // already bounds `n ≤ FIRTH_MAX_OBSERVATIONS (20_000)`,
+        // `p ≤ FIRTH_MAX_COEFFICIENTS (256)` and `n·p ≤ FIRTH_MAX_LINEAR_WORK (2e6)`,
+        // each of which is below the corresponding TK cap. Passing this gate
+        // therefore guarantees the dense calculus below is affordable, so no
+        // separate TK size check is needed here.
         let n_x = self.x().nrows();
         let p_x = self.x().ncols();
         if !super::firth_problem_scale_allows(n_x, p_x) {
-            return Ok(zero_correction());
-        }
-        let dense_work = n_x.saturating_mul(p_x);
-        if n_x > TK_MAX_OBSERVATIONS || p_x > TK_MAX_COEFFICIENTS || dense_work > TK_MAX_DENSE_WORK
-        {
             return Ok(zero_correction());
         }
 

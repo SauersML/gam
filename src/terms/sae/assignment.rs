@@ -1187,6 +1187,87 @@ pub fn select_hybrid_atom_parameterization(
 }
 
 #[cfg(test)]
+mod ibp_prior_614_tests {
+    // #614: `ibp_stick_breaking_prior` used to compute `π_k = (α/(α+1))^k` with
+    // `π_0 = 1`, i.e. an UNSHRUNK first atom — the prior mean of no stick at all,
+    // which broke α's role as an IBP concentration parameter. The consistent
+    // truncated-IBP stick-breaking prior mean is `π_k = (α/(α+1))^{k+1}`, the
+    // expectation of the product of (k+1) i.i.d. Beta(α,1) stick means, so EVERY
+    // atom (including the first) carries one stick of shrinkage. This test pins
+    // that contract so the regression cannot silently return.
+    use super::*;
+
+    fn ratio(alpha: f64) -> f64 {
+        alpha / (alpha + 1.0)
+    }
+
+    #[test]
+    fn first_atom_is_shrunk_not_unity() {
+        // The #614 defect: π_0 must equal the single-stick mean α/(α+1), NOT 1.0.
+        for &alpha in &[0.1_f64, 0.5, 1.0, 2.0, 5.0] {
+            let prior = ordered_geometric_shrinkage_prior(8, alpha);
+            let r = ratio(alpha);
+            assert!(
+                (prior[0] - r).abs() < 1e-12,
+                "π_0 must be the single-stick mean α/(α+1)={r} (was the unshrunk 1.0 in #614); got {}",
+                prior[0]
+            );
+            assert!(
+                prior[0] < 1.0,
+                "first atom must be shrunk (π_0<1) for alpha={alpha}; got {}",
+                prior[0]
+            );
+        }
+    }
+
+    #[test]
+    fn prior_is_consistent_geometric_product_mean() {
+        // π_k = (α/(α+1))^{k+1} exactly, and every successive ratio equals α/(α+1).
+        for &alpha in &[0.3_f64, 1.0, 4.0] {
+            let k = 12;
+            let prior = ordered_geometric_shrinkage_prior(k, alpha);
+            let r = ratio(alpha);
+            for j in 0..k {
+                let expected = r.powi((j + 1) as i32);
+                assert!(
+                    (prior[j] - expected).abs() < 1e-12 * expected.max(1.0),
+                    "alpha={alpha} π_{j}: expected {expected}, got {}",
+                    prior[j]
+                );
+            }
+            // Strictly decreasing (ordered shrinkage), no plateau at the head.
+            for j in 1..k {
+                assert!(
+                    prior[j] < prior[j - 1],
+                    "alpha={alpha}: prior must strictly decrease at index {j}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn alpha_behaves_as_concentration() {
+        // Larger α => heavier mass / slower decay: π_0 increases toward 1 and the
+        // tail (e.g. π_4) carries more mass. This is the IBP-concentration role
+        // the #614 fix restored.
+        let lo = ordered_geometric_shrinkage_prior(8, 0.5);
+        let hi = ordered_geometric_shrinkage_prior(8, 5.0);
+        assert!(
+            hi[0] > lo[0],
+            "larger alpha must raise π_0 (concentration): {} vs {}",
+            hi[0],
+            lo[0]
+        );
+        assert!(
+            hi[4] > lo[4],
+            "larger alpha must put more mass in the tail: {} vs {}",
+            hi[4],
+            lo[4]
+        );
+    }
+}
+
+#[cfg(test)]
 mod hybrid_split_tests {
     use super::*;
     use crate::solver::evidence::HybridAtomParam;

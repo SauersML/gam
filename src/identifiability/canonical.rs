@@ -1309,6 +1309,44 @@ fn canonicalize_for_identifiability_inner(
                 flat_audit_convention_rank(&j_can, &flat_blocks_can)
             };
 
+            // Same convention applied to the FULL pre-reduction design `J_pre`,
+            // built from the RAW specs so each raw block is augmented with its
+            // own (un-pulled-back) structural penalty. This is the rank ceiling a
+            // faithful column-selection `T` can possibly leave behind: `T` removes
+            // exactly the audit-demoted columns, so the surviving columns are as
+            // independent as the full design ever was — no more, no less.
+            //
+            // On an UNDER-DETERMINED joint (`p_total_raw > r_map`, the
+            // cirrhosis/heart_failure `p_joint > n` regime of gam#1388, where every
+            // categorical level expands into its own column) the unaugmented data
+            // Gram of `J_pre` is row-capped at `r_map` independent directions, so
+            // `rank_j_pre < p_total_raw`. The same cap then limits `J_can`: it
+            // CANNOT reach `p_total_red` independent columns when the rows (and the
+            // penalty anchors) simply do not span that many directions — that is
+            // legitimate penalty-rested under-determination, NOT a defective `T`.
+            // Certifying against `p_total_red` directly therefore tripped a FALSE
+            // "post-T rank invariant violated" on exactly these benchmarks.
+            let flat_blocks_pre: Vec<FlatRankBlock> = specs
+                .iter()
+                .map(|s| FlatRankBlock {
+                    width: s.design.ncols(),
+                    structural_penalty: block_structural_penalty_dense(s),
+                    priority: s.gauge_priority,
+                })
+                .collect();
+            let rank_j_pre = if use_channel_aware {
+                audit_convention_rank(&j_pre, nk_scale, &flat_blocks_pre)
+            } else {
+                flat_audit_convention_rank(&j_pre, &flat_blocks_pre)
+            };
+            // The achievable target: a faithful `T` leaves `J_can` at the FULL
+            // design's rank when the design is over-determined (`rank_j_pre ==
+            // p_total_raw ⇒ target == p_total_red`, the original strict invariant),
+            // and at the row-/penalty-limited rank when it is under-determined. A
+            // defective `T` that drops a direction the audit kept makes `J_can`
+            // rank-deficient BELOW this target and is still caught.
+            let rank_target = rank_j_pre.min(p_total_red);
+
             // Threaded certificate from the audit itself: the per-block
             // `effective_dim` sums to the rank the drop convention kept — the
             // audit's own joint_rank verdict, which equals `p_total_red` for a
@@ -1317,7 +1355,8 @@ fn canonicalize_for_identifiability_inner(
 
             log::info!(
                 "[CANON] post-T invariant ({} convention): \
-                 rank(J_can)={rank_j_can} p_red={p_total_red} \
+                 rank(J_can)={rank_j_can} rank(J_pre)={rank_j_pre} \
+                 rank_target={rank_target} p_red={p_total_red} \
                  audit_kept_rank={audit_kept_rank} \
                  (p_raw={p_total_raw} k={k})",
                 if use_channel_aware {
@@ -1327,11 +1366,17 @@ fn canonicalize_for_identifiability_inner(
                 },
             );
 
-            // The faithful-`T` certificate: `J_can` is full column rank under the
-            // drop-deciding convention. A rank-deficient `J_can` means `T` dropped
-            // an identifiable direction (or left a redundant one) — a bug in `T`
-            // construction, NOT a benign reduction.
-            if rank_j_can != p_total_red {
+            // The faithful-`T` certificate: `J_can` retains every independent
+            // direction the FULL design carried into the kept columns —
+            // `rank(J_can) == min(rank(J_pre), p_total_red)`. When the design is
+            // over-determined `rank(J_pre) == p_total_raw ≥ p_total_red`, so the
+            // target collapses to `p_total_red` and this is the original strict
+            // full-column-rank invariant. When it is under-determined the target is
+            // the row-/penalty-limited `rank(J_pre)`, so legitimate `p_joint > n`
+            // joints pass. A rank-deficient `J_can` BELOW the target still means `T`
+            // dropped an identifiable direction (or left a redundant one) — a bug
+            // in `T` construction, which remains caught.
+            if rank_j_can != rank_target {
                 let block_shapes: Vec<String> = per_block_transform
                     .iter()
                     .zip(specs.iter())
@@ -1341,10 +1386,11 @@ fn canonicalize_for_identifiability_inner(
                     reason: format!(
                         "canonicalize_for_identifiability: post-T rank invariant violated — \
                          under the drop-deciding {} convention the reduced design J_can is \
-                         rank-deficient: rank(J_can)={rank_j_can} but p_red={p_total_red} \
+                         rank-deficient: rank(J_can)={rank_j_can} but rank_target=\
+                         min(rank(J_pre)={rank_j_pre}, p_red={p_total_red})={rank_target} \
                          (audit_kept_rank={audit_kept_rank}, p_raw={p_total_raw}, k={k}); the \
-                         column-selection T dropped a direction the audit deemed identifiable \
-                         — a bug in T construction; per-block T shapes: [{}]",
+                         column-selection T dropped a direction the FULL design carried into \
+                         the kept columns — a bug in T construction; per-block T shapes: [{}]",
                         if use_channel_aware {
                             "σ²-Gram"
                         } else {
@@ -2273,6 +2319,109 @@ mod tests {
             rank_can, p_red,
             "reduced J_can must be full rank ({rank_can} != p_red {p_red}) under the \
              penalty-augmented, priority-tiered flat convention (#1391/#1388)"
+        );
+    }
+
+    /// #1388 root cause (post-T rank invariant): on the cirrhosis/heart_failure
+    /// survival benchmarks the joint marginal-slope design is UNDER-DETERMINED —
+    /// once every categorical level becomes its own column, `p_joint > n`, so the
+    /// joint design has FEWER independent rows than columns and its
+    /// convention-rank is capped strictly below `p_joint`. A faithful
+    /// column-selection `T` (which removes exactly the audit-demoted aliases)
+    /// then leaves a reduced `J_can` whose rank is STILL row-capped below
+    /// `p_total_red`: that is legitimate penalty-rested under-determination, NOT a
+    /// defective `T`. The OLD strict invariant `rank(J_can) == p_total_red` tripped
+    /// a FALSE "post-T rank invariant violated: rank(J_can) != p_red" abort here
+    /// (the issue's "rank(T)=53 != dim=31"); the corrected invariant certifies
+    /// `rank(J_can) == min(rank(J_pre), p_total_red)`, which a faithful `T`
+    /// satisfies while a defective `T` (rank below the target) is still caught.
+    ///
+    /// This fixture is the exact geometry at unit scale: an under-determined flat
+    /// joint (`p_raw = 6 > n = 4`) whose full-design convention-rank `rank(J_pre)`
+    /// is row-capped at 4 < `p_total_red = 5`. The test asserts (a) the OLD
+    /// `rank(J_can) == p_total_red` invariant WOULD have tripped
+    /// (`rank(J_can) < p_total_red`), and (b) the NEW target-anchored invariant
+    /// HOLDS (`rank(J_can) == min(rank(J_pre), p_total_red)`).
+    #[test]
+    fn post_t_invariant_underdetermined_jcan_meets_min_target_1388() {
+        // n = 4 rows, p_raw = 6 columns split across two blocks → UNDER-DETERMINED.
+        // Block A: a single shared constant (the aliased intercept, dropped by a
+        // faithful T). Block B: 5 columns spanning at most the 4-row column space.
+        let n = 4usize;
+        let p_total_raw = 6usize;
+        let mut j_pre = Array2::<f64>::zeros((n, p_total_raw));
+        // Block A col 0: constant (aliases block B col 0).
+        for i in 0..n {
+            j_pre[[i, 0]] = 1.0;
+        }
+        // Block B cols 1..6: constant (= alias of A), then a 4-row-rank basis whose
+        // 5 columns can carry at most 4 independent directions.
+        for i in 0..n {
+            let xi = i as f64;
+            j_pre[[i, 1]] = 1.0; // alias of block-A constant
+            j_pre[[i, 2]] = xi;
+            j_pre[[i, 3]] = xi * xi;
+            j_pre[[i, 4]] = xi * xi * xi;
+            // col 5 is an EXACT duplicate of col 4, so block B's 5 columns carry
+            // only 4 independent directions (an exactly rank-deficient Gram,
+            // tolerance-independent — the post-T re-rank cannot reach 5).
+            j_pre[[i, 5]] = xi * xi * xi;
+        }
+
+        // No penalties: pure data-rank regime. Under the flat convention the full
+        // design's rank is row-capped.
+        let blocks_pre = [
+            FlatRankBlock {
+                width: 1,
+                structural_penalty: None,
+                priority: 200,
+            },
+            FlatRankBlock {
+                width: 5,
+                structural_penalty: None,
+                priority: 100,
+            },
+        ];
+        let rank_j_pre = flat_audit_convention_rank(&j_pre, &blocks_pre);
+        assert!(
+            rank_j_pre < p_total_raw,
+            "fixture must be under-determined: rank(J_pre)={rank_j_pre} must be < \
+             p_raw={p_total_raw}",
+        );
+
+        // A faithful T drops block-A's aliased constant (column 0). The reduced
+        // design keeps block B's 5 columns.
+        let kept: [usize; 5] = [1, 2, 3, 4, 5];
+        let p_total_red = kept.len();
+        let mut j_can = Array2::<f64>::zeros((n, p_total_red));
+        for i in 0..n {
+            for (out, &src) in kept.iter().enumerate() {
+                j_can[[i, out]] = j_pre[[i, src]];
+            }
+        }
+        let blocks_can = [FlatRankBlock {
+            width: 5,
+            structural_penalty: None,
+            priority: 100,
+        }];
+        let rank_j_can = flat_audit_convention_rank(&j_can, &blocks_can);
+
+        // (a) The OLD strict invariant `rank(J_can) == p_total_red` WOULD have
+        // tripped: the reduced design is row-capped below its column count.
+        assert!(
+            rank_j_can < p_total_red,
+            "fixture must reproduce the under-determined deficit: rank(J_can)=\
+             {rank_j_can} must be < p_red={p_total_red} (the OLD invariant would abort)",
+        );
+
+        // (b) The NEW target-anchored invariant HOLDS: a faithful T leaves J_can at
+        // exactly the achievable rank `min(rank(J_pre), p_total_red)`.
+        let rank_target = rank_j_pre.min(p_total_red);
+        assert_eq!(
+            rank_j_can, rank_target,
+            "post-T rank invariant must hold under the corrected target: \
+             rank(J_can)={rank_j_can} != min(rank(J_pre)={rank_j_pre}, \
+             p_red={p_total_red})={rank_target} (#1388)",
         );
     }
 
