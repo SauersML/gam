@@ -2008,7 +2008,7 @@ pub fn cell_density_boundary_integrand(cell: DenestedCubicCell, g: &[f64], z: f6
 #[cfg(test)]
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn cell_third_derivative_boundary_integrand(
+fn cell_third_derivative_boundary_integrand(
     cell: DenestedCubicCell,
     first_coefficients_r: &[f64],
     first_coefficients_s: &[f64],
