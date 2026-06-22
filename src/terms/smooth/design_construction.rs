@@ -4400,22 +4400,29 @@ fn relax_smoothing_rho_prior(
     // on the `p > n` design (the #1089 requirement); at a well-earned (large-λ)
     // null space the pull is the same O(1/n) shift as any Occam prior, so the
     // bias is negligible exactly where the null space is identified.
-    // NON-GAUSSIAN FAMILIES (#1426). The cap-lifting `relaxed_prior` (`Flat` /
-    // wide `Normal`) is a Gaussian-identity recovery device (#1266/#1271/#1392):
-    // it is justified by the byte-flat firth-barrier analysis on the
-    // Gaussian-identity REML criterion and lifting it for every family at once
-    // would silently re-tune the smoothing selection of binomial/Poisson/Gamma
-    // RANGE-space coordinates. So the primary bending coordinate of a non-
-    // Gaussian smooth KEEPS its base cap. But the `DoublePenaltyNullspace`
-    // selection ridge is family-agnostic — it exists ONLY to drive the linear/
-    // constant null-space component OUT (mgcv `select=TRUE`) — and under
-    // Gamma/log REML the symmetric base cap fails to push its λ up, so REML's
-    // interior minimum genuinely sits at the near-full-basis overfit (EDF≈24 vs
-    // mgcv EDF≈8 on the #1426 DGP, seed 900006). We therefore give the null-space
-    // selection coordinate the same one-sided select-out PC prior here, in BOTH
-    // determinacy regimes (the #1426 overfit is well-determined, n≫p), walling
-    // off the `λ → 0` (null-space-kept) side while leaving the bounded Occam pull
-    // toward `λ → ∞`; the data keeps the null space only when it earns it.
+    // NON-GAUSSIAN FAMILIES (#1426 / #1477). The base prior is the same
+    // Gaussian-tuned symmetric `Normal{0, sd}` cap, but it is NOT a non-Gaussian
+    // smoothing-selection device: it is a #1089 termination-curvature stabiliser
+    // centred at λ=1. Keeping it on a length-safe non-Gaussian smooth has two
+    // failure modes, both fixed here:
+    //   * The `DoublePenaltyNullspace` selection ridge — family-agnostic, exists
+    //     ONLY to drive the linear/constant null-space component OUT (mgcv
+    //     `select=TRUE`) — was left un-pushed under Gamma/log REML, so REML's
+    //     interior minimum sat at a near-full-basis overfit (EDF≈24 vs mgcv≈8 on
+    //     the #1426 DGP). It now gets the one-sided select-out PC prior in BOTH
+    //     determinacy regimes (the #1426 overfit is well-determined, n≫p).
+    //   * The BENDING (range-space) coordinate had its symmetric cap dragging the
+    //     fitted log-λ off the REML optimum mgcv reaches, shipping a
+    //     systematically biased mean with a hard right-boundary blow-up (#1477:
+    //     Tweedie + default `ps` predicts ≈2.4× truth at x=1, while gam's own `cr`
+    //     and mgcv's same `ps` both recover truth). It now uses the SAME
+    //     `relaxed_prior` regime rule as the Gaussian path — `Flat` (firth
+    //     one-sided barrier, byte-flat on the identified side = pure REML = mgcv)
+    //     when well-determined, the wide #1089 `Normal` when under-determined.
+    // Freeing the bending coordinate is NOT a re-tuning toward a particular λ: it
+    // REMOVES an unjustified cap and lets pure REML choose, exactly as on the
+    // already-relaxed Gaussian path; the firth barrier still walls off the
+    // `λ → 0` under-smoothing degeneracy.
     let nullspace_select_prior = crate::types::RhoPrior::PenalizedComplexity {
         upper: NULLSPACE_SELECT_PC_UPPER,
         tail_prob: NULLSPACE_SELECT_PC_TAIL_PROB,
@@ -4433,12 +4440,27 @@ fn relax_smoothing_rho_prior(
             let is_nullspace =
                 matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace);
             if !gaussian_identity {
-                // Keep the base cap on the range-space coordinate; select the
-                // double-penalty null space out (#1426).
+                // NON-GAUSSIAN length-safe smooth. Select the double-penalty
+                // null space OUT (#1426), and free the BENDING (range-space)
+                // coordinate by the same regime rule the Gaussian path uses
+                // (#1477). The symmetric `Normal{0, sd}` base cap is a
+                // Gaussian-tuned #1089 termination stabiliser centred at λ=1 with
+                // NO smoothing-selection justification on a non-Gaussian smooth:
+                // keeping it dragged the bending log-λ off the REML optimum mgcv
+                // reaches, shipping a systematically biased mean with a hard
+                // right-boundary blow-up (Tweedie + default `ps`: pred ≈ 2.4×
+                // truth at x=1, while gam's own `cr` and mgcv's same `ps` both
+                // recover truth). Freeing it to `relaxed_prior` resolves to the
+                // firth one-sided barrier (`Flat`, well-determined) — byte-flat on
+                // the identified side (pure REML = mgcv) with only a convex wall
+                // against the `λ → 0` degeneracy — or the wide #1089 `Normal` when
+                // under-determined. This is NOT a re-tuning toward a particular λ:
+                // it REMOVES an unjustified cap and lets REML choose, exactly as on
+                // the (already-relaxed) Gaussian path.
                 if is_nullspace {
                     nullspace_select_prior.clone()
                 } else {
-                    base.clone()
+                    relaxed_prior.clone()
                 }
             } else if underdetermined && is_nullspace {
                 nullspace_select_prior.clone()
