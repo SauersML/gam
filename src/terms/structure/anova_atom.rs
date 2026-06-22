@@ -528,6 +528,174 @@ pub fn fit_tensor_surface(
     })
 }
 
+/// The real-fit producer of a representational [`CarveInput`] from a fitted
+/// `d = 2` product atom (#993).
+///
+/// Holds the two factor bases the carve consumes plus the
+/// [`TensorSurfaceFit`] re-fit of the atom's own ambient reconstruction. The
+/// fit is what supplies the scale-included decoder-coefficient covariance
+/// (`coeff_covariance` / `joint_covariance`) — the production inner Hessian is
+/// a DIFFERENT parameterization (tangent frames, not tensor coefficients) and
+/// cannot offer the carve a coefficient-space `Vb`, so the carve's covariance
+/// is re-derived here on the same empirical code measure the test centers
+/// against (the coherence the module docs require). Owns its arrays so the
+/// borrowed [`CarveInput`] built via [`Self::representational_carve_input`] can
+/// reference them for the lifetime of the carve call.
+#[derive(Clone, Debug)]
+pub struct FittedAtomCarveInput {
+    /// Factor-A basis on the code sample, `n × M₁`.
+    pub phi_a: Array2<f64>,
+    /// Factor-B basis on the code sample, `n × M₂`.
+    pub phi_b: Array2<f64>,
+    /// REML re-fit of the atom's ambient reconstruction onto the tensor basis,
+    /// carrying the per-channel coefficient matrices and their scale-included
+    /// covariance.
+    pub surface: TensorSurfaceFit,
+    /// Cross-dimension joint covariance of the stacked coefficient vector
+    /// (`TensorSurfaceFit::joint_covariance`), materialized once so the
+    /// borrowed [`CarveInput`] can reference it.
+    pub joint_covariance: Array2<f64>,
+}
+
+impl FittedAtomCarveInput {
+    /// Borrow this bundle as a representational [`CarveInput`] ready for
+    /// [`carve`]. The coefficient covariance and the joint covariance come
+    /// from the REML re-fit; the gauge kernels default to the
+    /// partition-of-unity convention (`u = 1`), which is the correct centered-
+    /// basis null direction for the constant-leading harmonic factor bases.
+    pub fn representational_carve_input(&self) -> CarveInput<'_> {
+        CarveInput {
+            phi_a: self.phi_a.view(),
+            phi_b: self.phi_b.view(),
+            coeffs: self.surface.coeffs.as_slice(),
+            coeff_covariance: Some(self.surface.coeff_covariance.as_slice()),
+            joint_coeff_covariance: Some(&self.joint_covariance),
+            kernel_a: None,
+            kernel_b: None,
+            edf: Some(self.surface.edf),
+            residual_df: self.surface.residual_df,
+            scale: SmoothTestScale::Estimated,
+            notion: BindingNotion::Representational,
+        }
+    }
+}
+
+/// Build the representational carve inputs for a fitted `d = 2` product atom
+/// directly from its FUSED tensor basis and decoder (#993).
+///
+/// `basis_values` is the atom's `Φ_k` on the code sample (`n × M₁M₂`), laid
+/// out as the Kronecker product of the two per-axis factor bases in row-major
+/// column order `flat = j·M₂ + k` (the convention every product evaluator —
+/// `TorusHarmonicEvaluator`, `CylinderHarmonicEvaluator` — emits, with the
+/// per-axis CONSTANT column at axis-index 0). `decoder_coefficients` is `B_k`
+/// (`M₁M₂ × p`). `m_a`/`m_b` are the two factor basis sizes (`m_a·m_b` must
+/// equal the fused width).
+///
+/// The factor bases are recovered exactly from the fused basis using the
+/// constant-leading-column property: with `φ²₀ ≡ 1`, column `j·M₂` is
+/// `φ¹_j·φ²₀ = φ¹_j`, and with `φ¹₀ ≡ 1`, column `k` is `φ¹₀·φ²_k = φ²_k`. The
+/// recovered factorization is then VERIFIED against every fused column
+/// (`Φ[:, j·M₂+k] = φ¹_j·φ²_k` to a tight tolerance) so a non-separable basis
+/// (a wrong split, or a kind whose leading column is not the unit constant) is
+/// rejected loudly rather than silently mis-carved.
+///
+/// The carve responses are the atom's own ambient reconstruction
+/// `m_k(t) = Φ_k(t)·B_k` (`n × p`); fitting the tensor surface to it on the
+/// same code measure yields the scale-included coefficient covariance the
+/// binding Wald test needs. The reconstruction is an exact linear image of the
+/// decoder, so the re-fit recovers the decoder's own ANOVA structure (the
+/// representational binding question) with a covariance that is honest about
+/// the finite code sample.
+pub fn carve_input_from_fitted_atom(
+    basis_values: ArrayView2<'_, f64>,
+    decoder_coefficients: ArrayView2<'_, f64>,
+    m_a: usize,
+    m_b: usize,
+) -> Result<FittedAtomCarveInput, String> {
+    let n = basis_values.nrows();
+    let fused = basis_values.ncols();
+    let p = decoder_coefficients.ncols();
+    if m_a == 0 || m_b == 0 {
+        return Err(format!(
+            "carve_input_from_fitted_atom: degenerate factor sizes (m_a={m_a}, m_b={m_b})"
+        ));
+    }
+    if m_a.checked_mul(m_b) != Some(fused) {
+        return Err(format!(
+            "carve_input_from_fitted_atom: factor sizes {m_a}×{m_b} do not multiply to the \
+             fused basis width {fused}"
+        ));
+    }
+    if decoder_coefficients.nrows() != fused {
+        return Err(format!(
+            "carve_input_from_fitted_atom: decoder has {} rows but the fused basis is width {fused}",
+            decoder_coefficients.nrows()
+        ));
+    }
+    if n < 2 || p == 0 {
+        return Err(format!(
+            "carve_input_from_fitted_atom: degenerate sample (n={n}, p={p})"
+        ));
+    }
+
+    // Recover the factor bases from the constant-leading Kronecker layout:
+    // φ¹_j = Φ[:, j·M₂ + 0]  (φ²₀ ≡ 1),   φ²_k = Φ[:, 0·M₂ + k]  (φ¹₀ ≡ 1).
+    let mut phi_a = Array2::<f64>::zeros((n, m_a));
+    for j in 0..m_a {
+        let col = j * m_b;
+        for row in 0..n {
+            phi_a[[row, j]] = basis_values[[row, col]];
+        }
+    }
+    let mut phi_b = Array2::<f64>::zeros((n, m_b));
+    for k in 0..m_b {
+        for row in 0..n {
+            phi_b[[row, k]] = basis_values[[row, k]];
+        }
+    }
+
+    // Verify the fused basis really is the Kronecker product of the recovered
+    // factors (separability + constant-leading-column assumption). The check is
+    // relative to the fused magnitude so it is scale-honest; a non-product atom
+    // or a wrong split fails here instead of being silently mis-carved.
+    let mut max_abs = 0.0_f64;
+    for &v in basis_values.iter() {
+        max_abs = max_abs.max(v.abs());
+    }
+    let tol = 1e-9 * (1.0 + max_abs);
+    for j in 0..m_a {
+        for k in 0..m_b {
+            let col = j * m_b + k;
+            for row in 0..n {
+                let recon = phi_a[[row, j]] * phi_b[[row, k]];
+                if (recon - basis_values[[row, col]]).abs() > tol {
+                    return Err(format!(
+                        "carve_input_from_fitted_atom: fused basis is not the Kronecker product \
+                         of the {m_a}×{m_b} factor split (entry [{row},{col}] = {} vs φ¹·φ² = {recon}); \
+                         the atom is not a constant-leading product basis",
+                        basis_values[[row, col]]
+                    ));
+                }
+            }
+        }
+    }
+
+    // Carve responses = the atom's ambient reconstruction m_k = Φ_k · B_k.
+    let reconstruction = basis_values.dot(&decoder_coefficients);
+
+    // REML re-fit of the reconstruction onto the SAME tensor basis: supplies the
+    // scale-included decoder-coefficient covariance the binding Wald test reads.
+    let surface = fit_tensor_surface(phi_a.view(), phi_b.view(), reconstruction.view())?;
+    let joint_covariance = surface.joint_covariance();
+
+    Ok(FittedAtomCarveInput {
+        phi_a,
+        phi_b,
+        surface,
+        joint_covariance,
+    })
+}
+
 /// Engine cap on knot cells per axis (the grid engine's dense-Cholesky
 /// sizing contract: `p = (K+3)² ≤ 1225`).
 const PAIR_COMPONENT_MAX_CELLS: usize = 32;
@@ -1591,5 +1759,106 @@ mod tests {
             ..splittable.clone()
         };
         assert_eq!(fission_decision(&kept, None), FissionDecision::Keep);
+    }
+
+    /// A constant-leading factor basis (column 0 ≡ 1, like the harmonic
+    /// factors' constant term) on a small sample.
+    fn constant_leading_factor(n: usize, m: usize, seed: u64) -> Array2<f64> {
+        let mut phi = Array2::<f64>::zeros((n, m));
+        let mut s = seed;
+        for row in 0..n {
+            phi[[row, 0]] = 1.0;
+            for col in 1..m {
+                // Deterministic LCG in [-1, 1).
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let u = ((s >> 11) as f64) / ((1u64 << 53) as f64);
+                phi[[row, col]] = 2.0 * u - 1.0;
+            }
+        }
+        phi
+    }
+
+    /// #993 producer: `carve_input_from_fitted_atom` recovers the two factor
+    /// bases EXACTLY from the fused Kronecker basis (constant-leading column
+    /// convention), and the re-fit surface reconstructs the decoder's own
+    /// tensor coefficients — so a real fitted product atom feeds the carve.
+    #[test]
+    fn producer_recovers_factor_bases_and_surface_from_fused_atom() {
+        let n = 40;
+        let (m_a, m_b) = (3, 4);
+        let p = 2;
+        let phi_a = constant_leading_factor(n, m_a, 0xA993);
+        let phi_b = constant_leading_factor(n, m_b, 0xB993);
+
+        // Fused Kronecker basis, row-major column flat = j*m_b + k.
+        let mut fused = Array2::<f64>::zeros((n, m_a * m_b));
+        for row in 0..n {
+            for j in 0..m_a {
+                for k in 0..m_b {
+                    fused[[row, j * m_b + k]] = phi_a[[row, j]] * phi_b[[row, k]];
+                }
+            }
+        }
+        // An arbitrary decoder B_k (M₁M₂ × p).
+        let mut decoder = Array2::<f64>::zeros((m_a * m_b, p));
+        let mut s = 0xD00D_u64;
+        for r in 0..(m_a * m_b) {
+            for c in 0..p {
+                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                let u = ((s >> 11) as f64) / ((1u64 << 53) as f64);
+                decoder[[r, c]] = 2.0 * u - 1.0;
+            }
+        }
+
+        let bundle =
+            carve_input_from_fitted_atom(fused.view(), decoder.view(), m_a, m_b).expect("producer");
+
+        // Factor bases recovered to machine precision.
+        let mut max_a = 0.0_f64;
+        for row in 0..n {
+            for j in 0..m_a {
+                max_a = max_a.max((bundle.phi_a[[row, j]] - phi_a[[row, j]]).abs());
+            }
+        }
+        let mut max_b = 0.0_f64;
+        for row in 0..n {
+            for k in 0..m_b {
+                max_b = max_b.max((bundle.phi_b[[row, k]] - phi_b[[row, k]]).abs());
+            }
+        }
+        assert!(max_a < 1e-12, "phi_a recovery error {max_a:e}");
+        assert!(max_b < 1e-12, "phi_b recovery error {max_b:e}");
+
+        // The carve input is well-formed: p coefficient matrices, each M₁×M₂,
+        // with matching covariance blocks and the joint Kronecker covariance.
+        let input = bundle.representational_carve_input();
+        assert_eq!(input.coeffs.len(), p);
+        for c in input.coeffs {
+            assert_eq!(c.dim(), (m_a, m_b));
+        }
+        assert_eq!(bundle.joint_covariance.dim(), (p * m_a * m_b, p * m_a * m_b));
+
+        // The carve runs end-to-end on the producer's output.
+        let report = carve(&input, 0.05).expect("carve on producer output");
+        assert_eq!(report.notion, BindingNotion::Representational);
+        assert!(report.edge_p_value.is_some(), "binding p-value must be produced");
+    }
+
+    /// A non-separable fused basis (not a Kronecker product of two factors) is
+    /// rejected loudly, not silently mis-carved.
+    #[test]
+    fn producer_rejects_non_separable_basis() {
+        let n = 12;
+        let (m_a, m_b) = (2, 2);
+        let mut fused = Array2::<f64>::from_elem((n, m_a * m_b), 1.0);
+        // Break separability in one entry only.
+        fused[[3, 3]] = 7.0;
+        let decoder = Array2::<f64>::ones((m_a * m_b, 1));
+        let err = carve_input_from_fitted_atom(fused.view(), decoder.view(), m_a, m_b)
+            .expect_err("non-separable basis must be rejected");
+        assert!(
+            err.contains("Kronecker product"),
+            "rejection must name the separability failure; got: {err}"
+        );
     }
 }
