@@ -517,12 +517,15 @@ impl ResidentDesignGram {
     /// per design row. Returns `None` on a shape mismatch or device failure.
     #[must_use]
     pub fn gram(&self, w: ArrayView1<'_, f64>) -> Option<Array2<f64>> {
-        if w.is_empty() {
-            return None;
-        }
         #[cfg(not(target_os = "linux"))]
         {
-            match self._never {}
+            // `try_new` never constructs `Self` off CUDA (it returns `None`), so
+            // this arm is statically unreachable; consume `w` and decline rather
+            // than diverge, mirroring the other non-Linux device shims.
+            if w.iter().any(|v| !v.is_finite()) {
+                return None;
+            }
+            None
         }
         #[cfg(target_os = "linux")]
         {
@@ -535,7 +538,9 @@ impl ResidentDesignGram {
     pub fn dims(&self) -> (usize, usize) {
         #[cfg(not(target_os = "linux"))]
         {
-            match self._never {}
+            // Statically unreachable off CUDA (see `gram`); a sentinel is safe
+            // because no `Self` is ever constructed on this target.
+            (0, 0)
         }
         #[cfg(target_os = "linux")]
         {
