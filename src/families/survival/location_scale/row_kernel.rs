@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::families::jet_scalar::{JetScalar, OneSeed, TwoSeed};
+use crate::families::jet_scalar::{JetScalar, Order2, OneSeed, TwoSeed};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurvivalExactRowKernel {
@@ -282,18 +282,6 @@ pub(crate) struct SurvivalLsRowKernel<'a> {
     pub(crate) offsets: Vec<usize>,
 }
 
-/// Per-index `(D, D2)` map-derivative tensors for one row, plus the
-/// index-space log-likelihood derivatives. `D[i][a] = ∂(index i)/∂(channel a)`,
-/// `D2[i][a][b] = ∂²(index i)/∂a∂b`.
-pub(crate) struct SlsRowMaps {
-    /// ell_i  = (ell_u0, ell_u1, ell_g)
-    pub(crate) l1: [f64; 3],
-    /// ell_ii = (ell_u0u0, ell_u1u1, ell_gg)
-    pub(crate) l2: [f64; 3],
-    pub(crate) d: [[f64; SLS_ROW_K]; 3],
-    pub(crate) d2: [[[f64; SLS_ROW_K]; SLS_ROW_K]; 3],
-}
-
 impl SurvivalLsRowKernel<'_> {
     /// Resolve the design for a threshold/log-sigma channel, falling back to the
     /// exit design when the entry/derivative variant is absent (time-invariant).
@@ -303,70 +291,6 @@ impl SurvivalLsRowKernel<'_> {
         fallback: &'b DesignMatrix,
     ) -> &'b DesignMatrix {
         opt.as_ref().unwrap_or(fallback)
-    }
-
-    /// Build the per-row index/map derivative tensors from the cached scalars.
-    /// Symmetric `D2` entries are written in both slots so the
-    /// uniform accumulation loops never have to special-case ordering.
-    pub(crate) fn row_maps(&self, row: usize) -> SlsRowMaps {
-        let q = self.q;
-        let mut m = SlsRowMaps {
-            l1: [q.d1_q0[row], q.d1_q1[row], q.d1_qdot1[row]],
-            l2: [q.d2_q0[row], q.d2_q1[row], q.d2_qdot1[row]],
-            d: [[0.0; SLS_ROW_K]; 3],
-            d2: [[[0.0; SLS_ROW_K]; SLS_ROW_K]; 3],
-        };
-        // helper closures to set symmetric entries
-        let set2 = |t: &mut [[f64; SLS_ROW_K]; SLS_ROW_K], a: usize, b: usize, v: f64| {
-            t[a][b] = v;
-            t[b][a] = v;
-        };
-
-        // Entry-side q-chain derivatives are always populated (equal to the
-        // exit values in the time-invariant case).
-        let dq_t_en = self.q.dq_t_entry.as_ref().map_or(q.dq_t[row], |a| a[row]);
-        let dq_ls_en = self.q.dq_ls_entry.as_ref().map_or(q.dq_ls[row], |a| a[row]);
-        let d2q_tls_en = self
-            .q
-            .d2q_tls_entry
-            .as_ref()
-            .map_or(q.d2q_tls[row], |a| a[row]);
-        let d2q_ls_en = self
-            .q
-            .d2q_ls_entry
-            .as_ref()
-            .map_or(q.d2q_ls[row], |a| a[row]);
-
-        // Index 0: u0 = h0 + q0(eta_t_entry=ch4, eta_ls_entry=ch7).
-        m.d[0][0] = 1.0;
-        m.d[0][4] = dq_t_en;
-        m.d[0][7] = dq_ls_en;
-        set2(&mut m.d2[0], 4, 7, d2q_tls_en);
-        m.d2[0][7][7] = d2q_ls_en;
-
-        // Index 1: u1 = h1 + q1(eta_t_exit=ch3, eta_ls_exit=ch6).
-        m.d[1][1] = 1.0;
-        m.d[1][3] = q.dq_t[row];
-        m.d[1][6] = q.dq_ls[row];
-        set2(&mut m.d2[1], 3, 6, q.d2q_tls[row]);
-        m.d2[1][6][6] = q.d2q_ls[row];
-
-        // Index 2: g = d_raw + qdot1(eta_t_exit=ch3, eta_t_deriv=ch5,
-        // eta_ls_exit=ch6, eta_ls_deriv=ch8).
-        m.d[2][2] = 1.0;
-        m.d[2][3] = q.dqdot_t[row];
-        m.d[2][5] = q.dqdot_td[row];
-        m.d[2][6] = q.dqdot_ls[row];
-        m.d[2][8] = q.dqdot_lsd[row];
-        m.d2[2][3][3] = q.d2qdot_tt[row];
-        set2(&mut m.d2[2], 3, 6, q.d2qdot_tls[row]);
-        set2(&mut m.d2[2], 3, 5, q.d2qdot_ttd[row]);
-        set2(&mut m.d2[2], 3, 8, q.d2qdot_tlsd[row]);
-        m.d2[2][6][6] = q.d2qdot_ls[row];
-        set2(&mut m.d2[2], 6, 5, q.d2qdot_lstd[row]);
-        set2(&mut m.d2[2], 6, 8, q.d2qdot_lslsd[row]);
-
-        m
     }
 
     /// Per-row dense design row for each channel within its coefficient block:
@@ -610,32 +534,23 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
         &self,
         row: usize,
     ) -> Result<(f64, [f64; SLS_ROW_K], [[f64; SLS_ROW_K]; SLS_ROW_K]), String> {
-        let m = self.row_maps(row);
-        // NLL = -ell. Gradient and Hessian carry the overall minus sign.
-        let mut grad = [0.0_f64; SLS_ROW_K];
-        let mut hess = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
-        for i in 0..3 {
-            let l1 = m.l1[i];
-            let l2 = m.l2[i];
-            let di = &m.d[i];
-            for a in 0..SLS_ROW_K {
-                grad[a] -= l1 * di[a];
-                if di[a] != 0.0 {
-                    for b in 0..SLS_ROW_K {
-                        hess[a][b] -= l2 * di[a] * di[b];
-                    }
-                }
-            }
-            let d2i = &m.d2[i];
-            for a in 0..SLS_ROW_K {
-                for b in 0..SLS_ROW_K {
-                    if d2i[a][b] != 0.0 {
-                        hess[a][b] -= l1 * d2i[a][b];
-                    }
-                }
-            }
-        }
-        Ok((-self.q.ll[row], grad, hess))
+        // #932: value, gradient and Hessian derive from the SAME single-sourced
+        // row NLL (`sls_row_nll`) instantiated at the packed `Order2<9>` scalar —
+        // the exact order-≤2 truncation of the Leibniz / Faà di Bruno rules (728
+        // B/row). There is no longer a hand-assembled coefficient-space chain rule
+        // here: the `(v, g, H)` channels are the order-≤2 part of the very
+        // expression whose order-3/4 directional contractions `row_third_contracted`
+        // / `row_fourth_contracted` already evaluate, so all four channels share one
+        // mathematical definition (the #736/#932 single-source contract). Identity
+        // seeding (`Order2::variable`) makes the ε/δ-free tower carry ∂/∂p_a and
+        // ∂²/∂p_a∂p_b directly. Bit-identical to `row_nll_tower(row)?` value/grad/
+        // Hessian by the `survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels`
+        // oracle (≤ 1e-9).
+        let (p, kernel) = self.row_nll_inputs(row)?;
+        let vars: [Order2<SLS_ROW_K>; SLS_ROW_K] =
+            std::array::from_fn(|a| Order2::variable(p[a], a));
+        let out = sls_row_nll(&vars, &kernel)?;
+        Ok((out.value(), out.g(), out.h()))
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; SLS_ROW_K] {
