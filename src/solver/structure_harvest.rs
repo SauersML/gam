@@ -364,9 +364,14 @@ pub fn harvest_move_proposals(
     // Keep the most-suspect (lowest significance) audit per parent atom.
     fission_atoms.sort_by(|x, y| x.1.total_cmp(&y.1).then(x.0.cmp(&y.0)));
     fission_atoms.dedup_by_key(|(atom, _)| *atom);
-    // Fit-side inputs for the #993 within-atom carve are absent here: record the
-    // skip loudly. The fission proposal still rides; the e-gate decides acceptance.
-    let fission_carve_skipped = !fission_atoms.is_empty();
+    // Loud, quantitative record of the #993-blocked degrade path: the within-
+    // atom carve refit's fit-side inputs land with #993, so count the fission
+    // proposals that actually ride (after the `max_fissions` cap) without it. A
+    // bare bool over-reported when the cap dropped every candidate; deriving it
+    // from the count is the precise, never-silent record, consistent with how
+    // `births_proposed` quantifies its channel.
+    let fission_carve_skipped_count = fission_atoms.len().min(params.max_fissions);
+    let fission_carve_skipped = fission_carve_skipped_count > 0;
     for &(atom, significance) in fission_atoms.iter().take(params.max_fissions) {
         proposals.push(proposal(
             term,
@@ -423,6 +428,7 @@ pub fn harvest_move_proposals(
     Ok(HarvestReport {
         proposals,
         fission_carve_skipped,
+        fission_carve_skipped_count,
         births_proposed,
         birth_skipped_reason,
     })
@@ -435,10 +441,14 @@ pub struct HarvestReport {
     /// Trigger-stamped, claim-stamped, structurally-hashed proposals, ready for
     /// [`search`] (which canonicalizes and gates them).
     pub proposals: Vec<MoveProposal>,
-    /// Whether any fission audit rode without its #993 within-atom carve refit
-    /// (the carve's fit-side inputs are not yet available). Recorded so the
-    /// degraded path is visible, never silent.
+    /// Whether any fission audit actually rode (after the `max_fissions` cap)
+    /// without its within-atom carve refit, whose fit-side inputs land with
+    /// #993. Recorded so the degraded path is visible, never silent.
     pub fission_carve_skipped: bool,
+    /// How many fission proposals rode without the #993 within-atom carve — the
+    /// precise, quantitative companion to `fission_carve_skipped`, so the size
+    /// of the degraded set is visible, never just a yes/no.
+    pub fission_carve_skipped_count: usize,
     /// Number of residual-factor birth candidates proposed.
     pub births_proposed: usize,
     /// If the birth channel could not run (empty residuals, evidence-ladder

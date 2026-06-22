@@ -2651,11 +2651,16 @@ pub fn maybe_log_audit_drift(
     // curvature-weighted.  That is the correct identifiability check: structural
     // rank is what tells you whether the model is locally identified at β.
     let p_total: usize = specs.iter().map(|s| s.design.ncols()).sum();
-    let beta_for_state: Vec<f64> = if beta_current.len() == p_total {
-        beta_current.to_vec()
-    } else {
-        vec![0.0; p_total]
-    };
+    // Drift must be evaluated at the CURRENT coefficient vector. If the supplied
+    // `beta_current` does not match the audited column total we cannot honestly
+    // evaluate at this point: auditing at a fabricated all-zero β reports rank
+    // drift against a configuration the model never occupied (a structurally
+    // different point), which is worse than reporting nothing. Skip this round
+    // rather than emit a spurious verdict.
+    if beta_current.len() != p_total {
+        return None;
+    }
+    let beta_for_state: Vec<f64> = beta_current.to_vec();
     let state = crate::families::custom_family::FamilyLinearizationState {
         beta: &beta_for_state,
         family_scalars: family_scalars.cloned(),
