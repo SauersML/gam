@@ -300,6 +300,83 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     ) -> Result<[[f64; 4]; 4], String> {
         crate::families::jet_tower::derived_fourth_contracted(self, row, dir_u, dir_v)
     }
+
+    /// Batched all-axes FIRST directional derivative of the joint Hessian for
+    /// the rigid survival marginal-slope kernel (gam#979).
+    ///
+    /// The generic per-axis fall-back (`row_kernel_directional_derivative_all_axes`)
+    /// asks for `Hdot[e_a]` `p` separate times, and EACH per-axis sweep rebuilds
+    /// the per-row fourth-order `Tower4<4>` for every row inside
+    /// `row_third_contracted` (`evaluate_program` → full t3/t4 build) — `n·p`
+    /// tower evaluations per all-axes call. For survival the tower is the
+    /// expensive object (closed-form probit/log-pdf composition over four
+    /// primaries), so this is the #979 inner-Newton Jeffreys/Firth hot path.
+    ///
+    /// This override builds each row's `t3` tensor ONCE (the swept axis enters
+    /// only through the cheap primary projection `dir_a = Jᵢ·e_a` and the linear
+    /// `t3.third_contracted(dir_a)`), then closes every axis off that single
+    /// build. Crucially it reuses the kernel's OWN `jacobian_action`,
+    /// `Tower4::third_contracted`, and `add_pullback_hessian` in the EXACT SAME
+    /// `ARROW_ROW_CHUNK`-chunked reduction order as the generic per-axis path
+    /// (`par_try_reduce_fold(RowSet::All)`): the cached `t3[row]` is bit-for-bit
+    /// the tensor a fresh `evaluate_program(row)` would produce (a deterministic
+    /// pure function of the row), and every float op downstream is identical, so
+    /// axis `a` matches `row_kernel_directional_derivative(self, All, e_a)`
+    /// bit-for-bit. Only the redundant `(p−1)·n` tower rebuilds are removed.
+    ///
+    /// Claims only the full-data unit-weight `RowSet::All` case; otherwise
+    /// returns `None` so the generic per-axis Horvitz-Thompson sweep runs.
+    fn directional_derivative_all_axes_dense_override(
+        &self,
+        rows: &crate::families::row_kernel::RowSet,
+        p: usize,
+    ) -> Option<Result<Vec<Array2<f64>>, String>> {
+        if p != self.n_coefficients() {
+            return Some(Err(format!(
+                "survival marginal-slope directional_derivative_all_axes_dense_override: \
+                 axis count {p} disagrees with n_coefficients() {}",
+                self.n_coefficients(),
+            )));
+        }
+        if !matches!(rows, crate::families::row_kernel::RowSet::All) {
+            return None;
+        }
+        Some(self.directional_derivative_all_axes_build_once(p))
+    }
+
+    /// Batched all-axes SECOND directional derivative of the joint Hessian for
+    /// the rigid survival marginal-slope kernel (gam#979): the outer-REML
+    /// Jeffreys `H_Φ` drift analogue of the first-order override above.
+    ///
+    /// With `d_beta_u` fixed and the second direction sweeping every canonical
+    /// axis, the generic per-axis path runs `p` full-data sweeps each rebuilding
+    /// the per-row `Tower4<4>` (`row_fourth_contracted` → `evaluate_program`).
+    /// This override builds each row's `t4` tensor and the fixed-direction
+    /// projection `dir_u = Jᵢ·u` ONCE, then closes every axis with the cheap
+    /// linear `t4.fourth_contracted(dir_u, dir_a)` and the kernel's own
+    /// `add_pullback_hessian`, in the SAME chunked reduction order as
+    /// `row_kernel_second_directional_derivative(self, All, u, e_a)` — bit-for-bit
+    /// identical, only the redundant tower rebuilds removed.
+    ///
+    /// Claims only the full-data unit-weight `RowSet::All` case; otherwise `None`.
+    fn second_directional_derivative_all_axes_dense_override(
+        &self,
+        rows: &crate::families::row_kernel::RowSet,
+        d_beta_u: &[f64],
+    ) -> Option<Result<Vec<Array2<f64>>, String>> {
+        if d_beta_u.len() != self.n_coefficients() {
+            return Some(Err(format!(
+                "survival marginal-slope second_directional_derivative_all_axes_dense_override: \
+                 fixed direction has {} entries, expected {}",
+                d_beta_u.len(),
+                self.n_coefficients(),
+            )));
+        }
+        if !matches!(rows, crate::families::row_kernel::RowSet::All) {
+            return None;
+        }
+        Some(self.second_directional_derivative_all_axes_build_once(d_beta_u))
+    }
 }
 
 impl SurvivalMarginalSlopeRowKernel {
@@ -343,5 +420,107 @@ impl SurvivalMarginalSlopeRowKernel {
             rank,
             [(0, axis0), (1, axis1), (2, axis2), (3, axis3)],
         )
+    }
+}
+
+impl SurvivalMarginalSlopeRowKernel {
+    /// Build every row's full fourth-order primary tower ONCE.
+    ///
+    /// `evaluate_program(self, row)` is a deterministic pure function of the
+    /// row's primaries, so the cached tower's `t3`/`t4` channels are bit-for-bit
+    /// what a fresh per-axis `row_third_contracted` / `row_fourth_contracted`
+    /// rebuild would produce — the build-once batched overrides below contract
+    /// against these cached towers without changing any downstream arithmetic.
+    fn build_row_towers(&self) -> Result<Vec<crate::families::jet_tower::Tower4<4>>, String> {
+        let n = <Self as RowKernel<4>>::n_rows(self);
+        (0..n)
+            .into_par_iter()
+            .map(|row| crate::families::jet_tower::evaluate_program::<4, Self>(self, row))
+            .collect()
+    }
+
+    /// Deterministic `ARROW_ROW_CHUNK`-chunked reduction matching
+    /// `par_try_reduce_fold(RowSet::All)`: rows fold in index order inside each
+    /// fixed 256-row chunk, chunks reduce in chunk-index order on the caller
+    /// thread. `per_row(row, &mut acc)` accumulates one row's pullback into the
+    /// `p×p` accumulator exactly as the generic per-axis fold does.
+    fn chunked_pullback_reduce<F>(&self, p: usize, per_row: F) -> Result<Array2<f64>, String>
+    where
+        F: Fn(usize, &mut Array2<f64>) -> Result<(), String> + Sync,
+    {
+        let n = <Self as RowKernel<4>>::n_rows(self);
+        let chunk = crate::outer_subsample::ARROW_ROW_CHUNK;
+        let n_chunks = crate::outer_subsample::arrow_row_chunk_count(n);
+        let chunk_accumulators: Vec<Result<Array2<f64>, String>> = (0..n_chunks)
+            .into_par_iter()
+            .map(|chunk_idx| {
+                let start = chunk_idx * chunk;
+                let end = (start + chunk).min(n);
+                let mut acc = Array2::<f64>::zeros((p, p));
+                for row in start..end {
+                    per_row(row, &mut acc)?;
+                }
+                Ok(acc)
+            })
+            .collect();
+        let mut total = Array2::<f64>::zeros((p, p));
+        for acc in chunk_accumulators {
+            total += &acc?;
+        }
+        Ok(total)
+    }
+
+    /// gam#979 build-once all-axes FIRST directional derivative — see the trait
+    /// override docstring. Builds the per-row `t3` towers once, then for each
+    /// canonical axis runs the identical chunked pullback reduction the generic
+    /// per-axis sweep runs, reusing the cached tower instead of rebuilding it.
+    fn directional_derivative_all_axes_build_once(
+        &self,
+        p: usize,
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let towers = self.build_row_towers()?;
+        (0..p)
+            .into_par_iter()
+            .map(|a| {
+                let mut axis = vec![0.0_f64; p];
+                axis[a] = 1.0;
+                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                    self.chunked_pullback_reduce(p, |row, acc| {
+                        let dir = self.jacobian_action(row, &axis);
+                        let third = towers[row].third_contracted(&dir);
+                        self.add_pullback_hessian(row, &third, acc);
+                        Ok(())
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// gam#979 build-once all-axes SECOND directional derivative — see the trait
+    /// override docstring. Builds the per-row `t4` towers and the fixed-direction
+    /// projection once, then closes every axis from that single build in the
+    /// generic per-axis sweep's reduction order.
+    fn second_directional_derivative_all_axes_build_once(
+        &self,
+        d_beta_u: &[f64],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        let p = self.n_coefficients();
+        let towers = self.build_row_towers()?;
+        (0..p)
+            .into_par_iter()
+            .map(|a| {
+                let mut axis = vec![0.0_f64; p];
+                axis[a] = 1.0;
+                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                    self.chunked_pullback_reduce(p, |row, acc| {
+                        let dir_u = self.jacobian_action(row, d_beta_u);
+                        let dir_v = self.jacobian_action(row, &axis);
+                        let fourth = towers[row].fourth_contracted(&dir_u, &dir_v);
+                        self.add_pullback_hessian(row, &fourth, acc);
+                        Ok(())
+                    })
+                })
+            })
+            .collect()
     }
 }

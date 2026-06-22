@@ -7808,3 +7808,150 @@ fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
         }
     }
 }
+
+/// gam#979 build-once equality contract for the rigid survival marginal-slope
+/// kernel.
+///
+/// The inner-Newton Jeffreys/Firth term needs, each cycle, the directional
+/// derivative of the joint Hessian for every canonical axis `e_a` (and the
+/// outer-REML `H_Φ` drift needs the second-directional analogue). Before this
+/// fix the rigid survival kernel implemented NEITHER
+/// `directional_derivative_all_axes_dense_override` NOR its second-order
+/// sibling, so `row_kernel_directional_derivative_all_axes` fell into the
+/// generic per-axis fall-back — `p` independent full-data sweeps, each
+/// rebuilding the per-row `Tower4<4>` for every row (`n·p` tower evaluations).
+/// That redundant tower rebuild is the survival #979 hot path.
+///
+/// The new overrides build each row's tower ONCE and contract every axis off
+/// that single build. A batched override is only a valid optimisation if it is
+/// bit-for-bit what the per-axis sweep returns. This gate builds a
+/// representative rigid fixture (non-trivial time / marginal / logslope designs,
+/// `n = 300` rows so the `ARROW_ROW_CHUNK = 256` chunked reduction spans more
+/// than one tile, mixed event / censored, with and without Gaussian frailty so
+/// the probit scale ≠ 1) and asserts, for EVERY coefficient axis, that the
+/// build-once override equals the per-axis sweep to machine precision — the
+/// exact contract a wrong override would silently violate while corrupting
+/// survival derivatives.
+#[test]
+fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
+    use crate::families::row_kernel::{
+        RowKernel, RowSet, row_kernel_directional_derivative,
+        row_kernel_directional_derivative_all_axes, row_kernel_second_directional_derivative,
+        row_kernel_second_directional_derivative_all_axes,
+    };
+
+    let n = 300usize;
+    // Mixed event / censored rows, deterministic and finite-margin.
+    let z: Vec<f64> = (0..n).map(|r| ((r as f64) * 0.37).sin() * 1.1).collect();
+    let weights: Vec<f64> = (0..n).map(|r| 0.7 + 0.5 * ((r % 5) as f64) / 5.0).collect();
+    let event: Vec<f64> = (0..n).map(|r| ((r % 3 == 0) as u8) as f64).collect();
+
+    // Non-trivial marginal (2-col) and logslope (2-col) designs so the
+    // all-axes sweep exercises the coupled marginal block (which feeds BOTH
+    // the entry and exit primaries through `jacobian_action`) and the logslope
+    // block, not just the single time axis.
+    let p_m = 2usize;
+    let p_g = 2usize;
+    let marginal_design = Array2::from_shape_fn((n, p_m), |(r, j)| {
+        0.2 + 0.05 * (r as f64).cos() + 0.11 * (j as f64) - 0.013 * (r as f64) / (n as f64)
+    });
+    let logslope_design = Array2::from_shape_fn((n, p_g), |(r, j)| {
+        0.1 + 0.07 * (r as f64).sin() - 0.09 * (j as f64) + 0.004 * (r as f64) / (n as f64)
+    });
+    let beta_marginal = Array1::from_vec(vec![0.18, -0.12]);
+    let beta_logslope = Array1::from_vec(vec![-0.2, 0.13]);
+    // Realized linear predictors carried on the block states (the marginal /
+    // logslope eta channels the rigid primaries read), exactly as a real fit
+    // installs them: eta = design · beta.
+    let marginal_eta = marginal_design.dot(&beta_marginal);
+    let logslope_eta = logslope_design.dot(&beta_logslope);
+
+    for frailty in [None, Some(0.55_f64)] {
+        let mut family = oracle_rigid_family(n, &z, &weights, &event, frailty);
+        family.marginal_design = DesignMatrix::from(marginal_design.clone());
+        family.logslope_design = DesignMatrix::from(logslope_design.clone());
+
+        let beta_time = array![0.65];
+        let block_states = vec![
+            ParameterBlockState {
+                beta: beta_time.clone(),
+                eta: Array1::zeros(n),
+            },
+            ParameterBlockState {
+                beta: beta_marginal.clone(),
+                eta: marginal_eta.clone(),
+            },
+            ParameterBlockState {
+                beta: beta_logslope.clone(),
+                eta: logslope_eta.clone(),
+            },
+        ];
+
+        let kernel = SurvivalMarginalSlopeRowKernel::new(family, block_states);
+        let p = RowKernel::n_coefficients(&kernel);
+        assert_eq!(
+            p,
+            1 + p_m + p_g,
+            "fixture coefficient width should be time(1)+marginal({p_m})+logslope({p_g})"
+        );
+
+        // ---- FIRST directional derivative: override vs per-axis sweep --------
+        let batched = row_kernel_directional_derivative_all_axes(&kernel, &RowSet::All)
+            .expect("build-once all-axes first directional derivative");
+        assert_eq!(
+            batched.len(),
+            p,
+            "the batched first-directional sweep returns one p×p matrix per axis"
+        );
+        for a in 0..p {
+            let mut e_a = vec![0.0_f64; p];
+            e_a[a] = 1.0;
+            let per_axis = row_kernel_directional_derivative(&kernel, &RowSet::All, &e_a)
+                .expect("per-axis first directional derivative");
+            assert_eq!(batched[a].dim(), (p, p));
+            assert_eq!(per_axis.dim(), (p, p));
+            let mut max_gap = 0.0_f64;
+            for r in 0..p {
+                for c in 0..p {
+                    max_gap = max_gap.max((batched[a][[r, c]] - per_axis[[r, c]]).abs());
+                }
+            }
+            assert!(
+                max_gap < 1e-9,
+                "frailty {frailty:?} axis {a}: #979 build-once FIRST directional override \
+                 diverged from the per-axis sweep by {max_gap:e}; the optimisation changed \
+                 the math, not just the schedule"
+            );
+        }
+
+        // ---- SECOND directional derivative: override vs per-axis sweep -------
+        // Fix a non-trivial direction `u` touching every block.
+        let d_u = vec![0.5, 0.3, -0.7, 0.9, -0.4];
+        let batched2 =
+            row_kernel_second_directional_derivative_all_axes(&kernel, &RowSet::All, &d_u)
+                .expect("build-once all-axes second directional derivative");
+        assert_eq!(
+            batched2.len(),
+            p,
+            "the batched second-directional sweep returns one p×p matrix per axis"
+        );
+        for a in 0..p {
+            let mut e_a = vec![0.0_f64; p];
+            e_a[a] = 1.0;
+            let per_axis =
+                row_kernel_second_directional_derivative(&kernel, &RowSet::All, &d_u, &e_a)
+                    .expect("per-axis second directional derivative");
+            let mut max_gap = 0.0_f64;
+            for r in 0..p {
+                for c in 0..p {
+                    max_gap = max_gap.max((batched2[a][[r, c]] - per_axis[[r, c]]).abs());
+                }
+            }
+            assert!(
+                max_gap < 1e-9,
+                "frailty {frailty:?} axis {a}: #979 build-once SECOND directional override \
+                 diverged from the per-axis sweep by {max_gap:e}"
+            );
+        }
+    }
+}

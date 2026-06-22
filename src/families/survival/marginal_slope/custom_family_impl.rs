@@ -512,6 +512,30 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
             return Ok(None);
         }
 
+        // Rigid (non-flex, non-timewiggle, non-per-z) path: route the all-axes
+        // second-directional sweep through the shared batched row-kernel API,
+        // mirroring the first-order hook above. The per-axis loop below rebuilds
+        // a `SurvivalMarginalSlopeRowKernel` (cloning the whole family) AND its
+        // per-row `Tower4<4>` for every axis — the `p`-fold tower rebuild the
+        // #979 outer-REML Jeffreys `H_Φ` drift pays. The batched API builds the
+        // kernel once and dispatches to the kernel's build-once all-axes override
+        // (which builds each row's tower once and contracts every axis off it),
+        // falling back to the bit-identical per-axis sweep otherwise.
+        if !self.per_z_logslope_active()
+            && !self.effective_flex_active(block_states)?
+            && !self.flex_timewiggle_active()
+        {
+            let kern = SurvivalMarginalSlopeRowKernel::new(self.clone(), block_states.to_vec());
+            let su = d_beta_u_flat.as_slice().ok_or("non-contiguous d_beta_u")?;
+            let axes =
+                crate::families::row_kernel::row_kernel_second_directional_derivative_all_axes(
+                    &kern,
+                    &crate::families::row_kernel::RowSet::All,
+                    su,
+                )?;
+            return Ok(Some(axes));
+        }
+
         let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
         let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
