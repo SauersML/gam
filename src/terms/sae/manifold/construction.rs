@@ -8593,7 +8593,7 @@ impl SaeManifoldTerm {
                 let mut gamma = 0.0_f64;
                 // The active logit `w` differentiates against; `None` unless this
                 // slot is a softmax logit on the softmax path.
-                let softmax_dD_w: Option<(&[f64], f64, f64, f64, usize)> = match (
+                let softmax_d_dw: Option<(&[f64], f64, f64, f64, usize)> = match (
                     softmax_adjoint_row,
                     jets.vars[w],
                 ) {
@@ -8612,7 +8612,7 @@ impl SaeManifoldTerm {
                             Some((a_soft, m, scale, inv_tau, _atom_w)),
                             SaeLocalRowVar::Logit { atom: atom_a },
                             SaeLocalRowVar::Logit { atom: atom_b },
-                        ) = (softmax_dD_w, jets.vars[a], jets.vars[b])
+                        ) = (softmax_d_dw, jets.vars[a], jets.vars[b])
                         {
                             if atom_a == atom_b {
                                 dh += active_softmax_majorizer_logit_derivative_entry(

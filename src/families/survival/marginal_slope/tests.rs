@@ -2394,8 +2394,6 @@ fn flex_directional_second_derivative_fd_localizer() {
     };
     let primary = flex_primary_slices(&family);
     let p = primary.total;
-    let h_range = primary.h.clone().expect("score-warp primary range");
-    let w_range = primary.w.clone().expect("link-dev primary range");
 
     let beta_h0: Vec<f64> = (0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())).collect();
     let beta_w0: Vec<f64> = (0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())).collect();
