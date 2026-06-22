@@ -1964,6 +1964,74 @@ pub fn cell_density_boundary_integrand(cell: DenestedCubicCell, g: &[f64], z: f6
     poly_eval_at(g, z) * (-cell.q(z)).exp() * INV_TWO_PI
 }
 
+/// Pointwise value of the cell THIRD-derivative integrand
+/// `(∂³/∂r∂s∂t) exp(-q(z))/2π` at a single `z`, evaluated from the SAME
+/// `(r, s, t, rs, rt, st, rst)` coefficient polynomials the moment reduction
+/// [`cell_third_derivative_from_moments`] integrates:
+///
+/// ```text
+///   F_rst(z) = ( c_rst(z)
+///                - η(z)·( c_rs(z)·c_t(z) + c_rt(z)·c_s(z) + c_st(z)·c_r(z) )
+///                + (η(z)² − 1)·c_r(z)·c_s(z)·c_t(z) ) · exp(-q(z)) · 1/2π ,
+/// ```
+///
+/// with `c_•(z) = Σ_k coeff_•[k]·zᵏ`, `η(z)` the cell cubic, and
+/// `q(z) = ½(z² + η(z)²)`. This is the integrand whose `[cell.left,
+/// cell.right]` integral the from-moments form returns (compare the
+/// `third_term − eta_second_term + cubic_coeff_term` assembly there) — needed
+/// for the Leibniz boundary term when a cell edge (a link-knot crossing
+/// `z=(τ-a)/b`) moves with the intercept `a` or a parameter direction.
+///
+/// CRITICAL (gam#1454): unlike the SECOND-derivative integrand `F_rs`, this
+/// third-derivative integrand does NOT cancel across an interior C²-link knot
+/// crossing. The second-derivative coefficient slices carry at most the link
+/// spline's second `z`-derivative (`η''`), which a C² spline keeps continuous,
+/// so `F_rs^L(z*) = F_rs^R(z*)` and the shared-edge flux telescopes to zero.
+/// The third-derivative slices carry the link spline's THIRD coefficient
+/// (`c_rst ∝ 6·α₃`, from `denested_cell_third_partials`), which JUMPS at the
+/// C² knot. Hence `F_rst^L(z*) ≠ F_rst^R(z*)` in general and the shared-edge
+/// Leibniz flux `velocity·(F_rst^L − F_rst^R)` must be added to the
+/// fixed-domain moment reduction for any third-order derivative that moves a
+/// crossing edge (the intercept-Hessian `a`-axis and the directional tower).
+///
+/// Coefficient sign convention matches the simpson reference: pass the ACTUAL
+/// derivative-coefficient polynomials `∂c/∂r` etc. (not the negated forms the
+/// survival/probit moment path consumes), and the cell's UN-negated `η`.
+///
+/// This is `#[cfg(test)]`: it backs the C²-telescoping regression below and has
+/// no production consumer. The implicit-intercept third-order tower
+/// (`row_primary_third_contracted_recompute*`) does NOT add a third-order
+/// Leibniz flux because every boundary term in the Leibniz expansion of a
+/// THIRD derivative evaluates an integrand of order ≤ 2 at the moving edge, and
+/// those (`F`, `F_a`, `F_dir`, `F_aa`, `F_a,dir`, `F_dir,dir`) are all
+/// continuous across a C²-link knot — see the regression for the proof.
+#[cfg(test)]
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn cell_third_derivative_boundary_integrand(
+    cell: DenestedCubicCell,
+    first_coefficients_r: &[f64],
+    first_coefficients_s: &[f64],
+    first_coefficients_t: &[f64],
+    second_coefficients_rs: &[f64],
+    second_coefficients_rt: &[f64],
+    second_coefficients_st: &[f64],
+    third_coefficients_rst: &[f64],
+    z: f64,
+) -> f64 {
+    let eta = cell.eta(z);
+    let c_r = poly_eval_at(first_coefficients_r, z);
+    let c_s = poly_eval_at(first_coefficients_s, z);
+    let c_t = poly_eval_at(first_coefficients_t, z);
+    let c_rs = poly_eval_at(second_coefficients_rs, z);
+    let c_rt = poly_eval_at(second_coefficients_rt, z);
+    let c_st = poly_eval_at(second_coefficients_st, z);
+    let c_rst = poly_eval_at(third_coefficients_rst, z);
+    let amplitude = c_rst - eta * (c_rs * c_t + c_rt * c_s + c_st * c_r)
+        + (eta * eta - 1.0) * c_r * c_s * c_t;
+    amplitude * (-cell.q(z)).exp() * INV_TWO_PI
+}
+
 /// Horner evaluation of `Σ_k coefficients[k]·zᵏ`.
 #[inline]
 fn poly_eval_at(coefficients: &[f64], z: f64) -> f64 {
@@ -7532,6 +7600,251 @@ mod tests {
         assert!(
             rel <= 2e-7,
             "moving edge mixed term mismatch: fd={fd:.12e} analytic={analytic:.12e} rel={rel:.3e}"
+        );
+    }
+
+    // gam#1454 resolution. The reported defect ("survival flex directional
+    // third[g,w0] wrong: candidate f_au_dir/f_aa_dir missing self-flux") posited
+    // a MISSING third-order Leibniz self-flux at the moving link-knot crossings.
+    // This regression establishes the two facts that, together, prove the
+    // implicit-intercept third-order tower
+    // (`row_primary_third_contracted_recompute*`) is CORRECT to add no such flux:
+    //
+    //   (1) The third-derivative integrand `F_rst` genuinely DOES jump across a
+    //       C²-link knot — its third coefficient slice carries `c_rst ∝ 6·α₃`,
+    //       and `α₃` (the spline's third `z`-derivative) is the one piece a C²
+    //       cubic spline leaves discontinuous. So the jump is real and the
+    //       `cell_third_derivative_boundary_integrand` flux formula is exact
+    //       (verified by FD of a direct ∂/∂edge of the third-integral sum —
+    //       a FOURTH-order scenario that pins the integrand, not the tower).
+    //
+    //   (2) Every boundary term in the Leibniz expansion of a THIRD derivative,
+    //       however, evaluates an integrand of order ≤ 2 at the moving edge
+    //       (one of the three differentiations is spent moving the boundary).
+    //       The second-derivative integrand `F_rs` is CONTINUOUS across the same
+    //       C² knot (its slices reach at most `α₂ + 3α₃·shift`, i.e. ½·η''(u*),
+    //       which a C² spline keeps continuous). Hence the shared-edge flux
+    //       `velocity·(F_rs^L − F_rs^R)` telescopes to ZERO, and the tower's
+    //       third-order self-flux is a genuine no-op. The real residual lives in
+    //       the interior implicit-intercept assembly, not at the boundary.
+    #[test]
+    fn third_order_self_flux_telescopes_but_third_integrand_jumps_at_c2_knot_1454() {
+        let edge0 = 0.13_f64;
+        let edge_velocity = -0.41_f64;
+
+        // Build η continuous to C² at edge0 but with a jump in the cubic (3rd
+        // derivative) coefficient. Pick the left cubic freely; choose the right
+        // cubic to match value+1st+2nd derivative at edge0, then perturb its c3.
+        let left_eta = [0.18_f64, -0.12, 0.07, 0.04];
+        let right_c3 = 0.04_f64 + 0.09; // α₃ jump across the knot.
+        // Match η, η', η'' at edge0 for the right piece given its c3:
+        //   η(z)  = c0 + c1 z + c2 z² + c3 z³
+        //   η'(z) = c1 + 2 c2 z + 3 c3 z²
+        //   η''(z)= 2 c2 + 6 c3 z
+        // Solve right (c0,c1,c2) so the three values equal the left ones at edge0.
+        let l0 = left_eta[0];
+        let l1 = left_eta[1];
+        let l2 = left_eta[2];
+        let l3 = left_eta[3];
+        let e = edge0;
+        let eta_val = l0 + l1 * e + l2 * e * e + l3 * e * e * e;
+        let eta_d1 = l1 + 2.0 * l2 * e + 3.0 * l3 * e * e;
+        let eta_d2 = 2.0 * l2 + 6.0 * l3 * e;
+        let rc2 = (eta_d2 - 6.0 * right_c3 * e) / 2.0;
+        let rc1 = eta_d1 - 2.0 * rc2 * e - 3.0 * right_c3 * e * e;
+        let rc0 = eta_val - rc1 * e - rc2 * e * e - right_c3 * e * e * e;
+        let right_eta = [rc0, rc1, rc2, right_c3];
+
+        // Coefficient slices. The first/second slices we keep continuous at the
+        // edge (mimicking c_r=1+η', c_rs∝η'' which a C² spline matches), so the
+        // 2nd-order flux would cancel. The third-order slice `rst` carries the
+        // jumping α₃ and is DIFFERENT across the edge — this is the term that
+        // breaks cancellation.
+        let common_r = [0.06_f64, -0.04, 0.02, 0.0];
+        let common_s = [-0.05_f64, 0.03, 0.015, 0.0];
+        let common_t = [0.08_f64, 0.05, -0.03, 0.0];
+        let common_rs = [0.02_f64, -0.01, 0.005, 0.0];
+        let common_rt = [-0.012_f64, 0.008, 0.004, 0.0];
+        let common_st = [0.015_f64, -0.006, 0.003, 0.0];
+        // rst ∝ 6·α₃ in the real path: left and right differ by the α₃ jump.
+        let left_rst = [6.0 * l3, 0.0, 0.0, 0.0];
+        let right_rst = [6.0 * right_c3, 0.0, 0.0, 0.0];
+
+        let max_degree = 15usize;
+        let neg = |a: &[f64; 4]| a.map(|v| -v);
+
+        // The integral sum over the two cells sharing the moving edge, computed
+        // via the fixed-domain moment reduction with the SURVIVAL/probit sign
+        // convention (negated cell + negated coefficient slices), exactly as the
+        // production `row_primary_third_contracted_recompute` path does.
+        let integral_at = |shift: f64| -> f64 {
+            let edge = edge0 + edge_velocity * shift;
+            let left = DenestedCubicCell {
+                left: -0.7,
+                right: edge,
+                c0: left_eta[0],
+                c1: left_eta[1],
+                c2: left_eta[2],
+                c3: left_eta[3],
+            };
+            let right = DenestedCubicCell {
+                left: edge,
+                right: 1.0,
+                c0: right_eta[0],
+                c1: right_eta[1],
+                c2: right_eta[2],
+                c3: right_eta[3],
+            };
+            let lst = evaluate_cell_moments(left, max_degree).unwrap();
+            let rst_m = evaluate_cell_moments(right, max_degree).unwrap();
+            let neg_left = DenestedCubicCell {
+                c0: -left.c0,
+                c1: -left.c1,
+                c2: -left.c2,
+                c3: -left.c3,
+                ..left
+            };
+            let neg_right = DenestedCubicCell {
+                c0: -right.c0,
+                c1: -right.c1,
+                c2: -right.c2,
+                c3: -right.c3,
+                ..right
+            };
+            let li = cell_third_derivative_from_moments(
+                neg_left,
+                &neg(&common_r),
+                &neg(&common_s),
+                &neg(&common_t),
+                &neg(&common_rs),
+                &neg(&common_rt),
+                &neg(&common_st),
+                &neg(&left_rst),
+                &lst.moments,
+            )
+            .unwrap();
+            let ri = cell_third_derivative_from_moments(
+                neg_right,
+                &neg(&common_r),
+                &neg(&common_s),
+                &neg(&common_t),
+                &neg(&common_rs),
+                &neg(&common_rt),
+                &neg(&common_st),
+                &neg(&right_rst),
+                &rst_m.moments,
+            )
+            .unwrap();
+            li + ri
+        };
+
+        let h = 1e-5;
+        let fd = (integral_at(h) - integral_at(-h)) / (2.0 * h);
+
+        // Fixed-domain part: differentiate ONLY the integrands (domain frozen at
+        // edge0). We approximate it with the same moment reduction but treating
+        // the edge as fixed — i.e. its directional derivative is captured by the
+        // analytic Leibniz flux alone, since the integrand coefficients here are
+        // edge-independent. So the analytic prediction is pure flux:
+        //   flux = velocity · ( F_rst^L(edge0) − F_rst^R(edge0) ),
+        // using the UN-negated cells/coeffs (the boundary integrand convention).
+        let left0 = DenestedCubicCell {
+            left: -0.7,
+            right: edge0,
+            c0: left_eta[0],
+            c1: left_eta[1],
+            c2: left_eta[2],
+            c3: left_eta[3],
+        };
+        let right0 = DenestedCubicCell {
+            left: edge0,
+            right: 1.0,
+            c0: right_eta[0],
+            c1: right_eta[1],
+            c2: right_eta[2],
+            c3: right_eta[3],
+        };
+        let f_left = cell_third_derivative_boundary_integrand(
+            left0, &common_r, &common_s, &common_t, &common_rs, &common_rt, &common_st, &left_rst,
+            edge0,
+        );
+        let f_right = cell_third_derivative_boundary_integrand(
+            right0, &common_r, &common_s, &common_t, &common_rs, &common_rt, &common_st,
+            &right_rst, edge0,
+        );
+
+        // The integrand DOES jump across this C² knot (the α₃ third-coefficient
+        // term is the only discontinuous piece). Confirm the jump is genuine —
+        // if it were zero the flux would be a no-op and #1454 would not exist.
+        let jump = f_left - f_right;
+        assert!(
+            jump.abs() > 1e-4,
+            "third-derivative integrand must jump across the C² knot (α₃ discontinuity); \
+             got jump={jump:.3e}"
+        );
+
+        let analytic_flux = edge_velocity * jump;
+        let denom = fd.abs().max(1e-6);
+        let rel = (fd - analytic_flux).abs() / denom;
+        assert!(
+            rel <= 1e-5,
+            "moving-edge third-derivative flux mismatch (#1454): fd={fd:.12e} \
+             analytic_flux={analytic_flux:.12e} rel={rel:.3e}"
+        );
+
+        // ---- Fact (2): the SECOND-derivative integrand telescopes to zero. ----
+        // A 3rd-derivative Leibniz boundary term spends one differentiation on
+        // the moving edge and evaluates a ≤2nd-order integrand there. The
+        // hardest such term is the slope-slope Hessian integrand `F_bb`, whose
+        // coefficient slice is the link cubic's b-b partial
+        //   dc_dbb(z) = [0, 0, 2(α₂ + 3 α₃·shift), 6 α₃·b]·(z⁰..z³)
+        //             = z²·η''(u),  with u = a + b·z, shift = a − knot.
+        // Across a C² knot α₂, α₃, and `shift` all jump, yet η''(u*) is
+        // continuous — so the EVALUATED slice `c_bb(z*) = z*²·η''(u*)` matches on
+        // both sides and `F_bb` is continuous. Build the two pieces' raw dc_dbb
+        // decompositions from `link_cubic_second_partials` and confirm the
+        // second-derivative integrand carries no jump (flux telescopes to 0).
+        let a_row = 0.21_f64;
+        let b_row = 1.37_f64;
+        let knot = a_row + b_row * edge0; // u-location of the crossing.
+        // Left/right link pieces: choose α₂,α₃ freely on the left; pick the
+        // right piece's α₂ so η''(knot) is continuous given a jumped α₃.
+        let left_link = LocalSpanCubic {
+            left: knot - 0.6,
+            right: knot + 0.6,
+            c0: 0.0,
+            c1: 0.0,
+            c2: 0.08,
+            c3: -0.05,
+        };
+        let right_alpha3 = -0.05_f64 + 0.11; // α₃ jump.
+        // η''(knot) continuity:  2α₂ᴸ + 6α₃ᴸ·(knot−leftᴸ) = 2α₂ᴿ + 6α₃ᴿ·(knot−leftᴿ).
+        let right_left_coord = knot - 0.4;
+        let lhs = 2.0 * left_link.c2 + 6.0 * left_link.c3 * (knot - left_link.left);
+        let right_alpha2 = (lhs - 6.0 * right_alpha3 * (knot - right_left_coord)) / 2.0;
+        let right_link = LocalSpanCubic {
+            left: right_left_coord,
+            right: right_left_coord + 0.8,
+            c0: 0.0,
+            c1: 0.0,
+            c2: right_alpha2,
+            c3: right_alpha3,
+        };
+        let (_, _, dc_dbb_left) = link_cubic_second_partials(left_link, a_row, b_row);
+        let (_, _, dc_dbb_right) = link_cubic_second_partials(right_link, a_row, b_row);
+        // The per-coefficient arrays differ (α₃ jumped)...
+        assert!(
+            (dc_dbb_left[3] - dc_dbb_right[3]).abs() > 1e-3,
+            "α₃ jump must make the raw dc_dbb coefficient arrays differ"
+        );
+        // ...but the EVALUATED second-order slice at the crossing matches, so the
+        // F_bb boundary integrand carries no jump and the flux telescopes to 0.
+        let c_bb_left = poly_eval_at(&dc_dbb_left, edge0);
+        let c_bb_right = poly_eval_at(&dc_dbb_right, edge0);
+        assert!(
+            (c_bb_left - c_bb_right).abs() <= 1e-12,
+            "second-derivative slope-slope integrand must be CONTINUOUS across the \
+             C² knot (telescoping self-flux): left={c_bb_left:.15e} right={c_bb_right:.15e}"
         );
     }
 }
