@@ -829,35 +829,76 @@ fn apply_global_smooth_identifiability(
                 .iter()
                 .any(|c| matches!(c.source, PenaltySource::DoublePenaltyNullspace))
         {
-            if let Some(s_c) = penalty_candidates
+            // Nonzero-row support of a (symmetric) penalty matrix: the coefficient
+            // range it actually penalizes. A per-level `by=factor` smooth emits one
+            // `Primary`+`DoublePenaltyNullspace` pair PER LEVEL, each confined to
+            // that level's disjoint `[off..off+p]` diagonal block (#1427), so a
+            // ridge must be rebuilt from the Primary sharing ITS support — not the
+            // first global Primary, and not the summed bending (which would collapse
+            // the independent per-level λ). For a single smooth term there is one
+            // Primary spanning the whole block and this reduces to the simple case.
+            const SUPPORT_TOL: f64 = 0.0;
+            let support_rows = |m: &Array2<f64>| -> (usize, usize) {
+                let n = m.nrows();
+                let mut lo = n;
+                let mut hi = 0usize;
+                for i in 0..n {
+                    let any = (0..m.ncols()).any(|j| m[[i, j]].abs() > SUPPORT_TOL);
+                    if any {
+                        lo = lo.min(i);
+                        hi = hi.max(i + 1);
+                    }
+                }
+                (lo, hi)
+            };
+            // Snapshot each Primary's support + a clone of its matrix (immutable
+            // borrow released before we mutate the ridges below).
+            let primaries: Vec<((usize, usize), Array2<f64>)> = penalty_candidates
                 .iter()
-                .find(|c| matches!(c.source, PenaltySource::Primary))
-                .map(|c| c.matrix.clone())
-            {
-                let rebuilt =
-                    crate::terms::basis::build_nullspace_shrinkage_penalty(&s_c)?
-                        .map(|shrink| shrink.sym_penalty);
-                let p = s_c.nrows();
-                for candidate in &mut penalty_candidates {
-                    if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
-                        match &rebuilt {
-                            Some(ridge) => {
-                                let (matrix, scale) =
-                                    normalize_penalty_in_constrained_space(ridge);
-                                candidate.matrix = matrix;
-                                candidate.normalization_scale = scale;
-                                candidate.kronecker_factors = None;
-                                candidate.op = None;
-                            }
-                            // Constrained bending penalty is full rank: no null
-                            // space to shrink. Zero the block; the filter drops it.
-                            None => {
-                                candidate.matrix = Array2::<f64>::zeros((p, p));
-                                candidate.normalization_scale = 1.0;
-                                candidate.kronecker_factors = None;
-                                candidate.op = None;
-                            }
-                        }
+                .filter(|c| matches!(c.source, PenaltySource::Primary))
+                .map(|c| (support_rows(&c.matrix), c.matrix.clone()))
+                .collect();
+            for candidate in &mut penalty_candidates {
+                if !matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
+                    continue;
+                }
+                let q = candidate.matrix.nrows();
+                let (rlo, rhi) = support_rows(&candidate.matrix);
+                // The Primary whose support CONTAINS this ridge's support (the
+                // co-located bending block). Falls back to the unique Primary when
+                // the ridge is (numerically) empty.
+                let owner = primaries
+                    .iter()
+                    .find(|((plo, phi), _)| *plo <= rlo && rhi <= *phi)
+                    .or_else(|| (primaries.len() == 1).then(|| &primaries[0]));
+                let Some(((plo, phi), s_full)) = owner else {
+                    // No co-located Primary (shouldn't happen for a well-formed
+                    // double-penalty term): leave the restricted ridge as-is.
+                    continue;
+                };
+                // Rebuild from the Primary's OWN block submatrix so the resulting
+                // projector spans only that block's null space, then embed back
+                // into the term-local `q×q` frame at the same offset.
+                let block = s_full.slice(s![*plo..*phi, *plo..*phi]).to_owned();
+                let rebuilt_block = crate::terms::basis::build_nullspace_shrinkage_penalty(&block)?
+                    .map(|shrink| shrink.sym_penalty);
+                match rebuilt_block {
+                    Some(ridge_block) => {
+                        let mut full = Array2::<f64>::zeros((q, q));
+                        full.slice_mut(s![*plo..*phi, *plo..*phi]).assign(&ridge_block);
+                        let (matrix, scale) = normalize_penalty_in_constrained_space(&full);
+                        candidate.matrix = matrix;
+                        candidate.normalization_scale = scale;
+                        candidate.kronecker_factors = None;
+                        candidate.op = None;
+                    }
+                    // Constrained bending block is full rank: no null space to
+                    // shrink. Zero the ridge; the filter drops it.
+                    None => {
+                        candidate.matrix = Array2::<f64>::zeros((q, q));
+                        candidate.normalization_scale = 1.0;
+                        candidate.kronecker_factors = None;
+                        candidate.op = None;
                     }
                 }
             }
