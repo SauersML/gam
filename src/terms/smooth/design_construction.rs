@@ -4360,6 +4360,35 @@ fn relax_smoothing_rho_prior(
     } else {
         crate::types::RhoPrior::Flat
     };
+    // DOUBLE-PENALTY NULL-SPACE SELECTION (#1392, mgcv `select=TRUE`). A
+    // double-penalty smooth carries a second `DoublePenaltyNullspace` ridge on
+    // the term's penalty null space ({1, x} for a 1-D bend) whose only job is
+    // selection: drive its λ → ∞ to shrink the null-space (linear) component
+    // OUT when the data does not support it, exactly as mgcv's `select=TRUE`
+    // adds a null-space penalty. On an over-parameterized `p > n` fit
+    // (`wine_gamair`: 5 `ps` smooths on ~26 rows) the symmetric relaxed prior
+    // above leaves this ridge's outer score flat on the select-out side, so REML
+    // stalls it at λ ≈ 0.11 — the null space is kept, the EDF rails up, and
+    // held-out prediction collapses (#1392). The RANGE-space (`Primary`) bending
+    // coordinate's smoothing selection must NOT be touched, so this select-out
+    // bias is gated to `DoublePenaltyNullspace` coordinates only and is applied
+    // ONLY in the under-determined regime — in the well-determined regime the
+    // relaxable coordinates stay byte-flat (`Flat`) so a clean `n > p` fit is
+    // unchanged (no regression on ordinary smooth recovery).
+    //
+    // The select-out bias is the one-sided penalized-complexity barrier: it
+    // walls off the `λ → 0` (null-space kept, wiggly) under-smoothing side and
+    // leaves only the gentle bounded Occam pull (gradient → +1/2) toward
+    // `λ → ∞` on the over-smoothing side, so REML keeps the null space ONLY when
+    // the data clearly earns it. Its curvature `(θ/4) e^{-ρ/2}` is strictly
+    // positive everywhere, so the outer loop still certifies a stationary point
+    // on the `p > n` design (the #1089 requirement); at a well-earned (large-λ)
+    // null space the pull is the same O(1/n) shift as any Occam prior, so the
+    // bias is negligible exactly where the null space is identified.
+    let nullspace_select_prior = crate::types::RhoPrior::PenalizedComplexity {
+        upper: NULLSPACE_SELECT_PC_UPPER,
+        tail_prob: NULLSPACE_SELECT_PC_TAIL_PROB,
+    };
     let per_coord = coords
         .iter()
         .map(|info| {
@@ -4367,10 +4396,15 @@ fn relax_smoothing_rho_prior(
                 .termname
                 .as_deref()
                 .is_some_and(|name| relaxable_terms.contains(name));
-            if relax {
-                relaxed_prior.clone()
+            if !relax {
+                return base.clone();
+            }
+            if underdetermined
+                && matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace)
+            {
+                nullspace_select_prior.clone()
             } else {
-                base.clone()
+                relaxed_prior.clone()
             }
         })
         .collect::<Vec<_>>();
@@ -4390,6 +4424,30 @@ fn relax_smoothing_rho_prior(
 /// #1392 under-smoothing drag; widening it further weakens termination
 /// curvature without further benefit.
 const RELAX_UNDERDETERMINED_RHO_SD: f64 = 15.0;
+
+/// Distance-scale bound `upper` (`P(d > upper) = tail_prob` on the marginal-SD
+/// scale `d = exp(-ρ/2)`) of the one-sided penalized-complexity prior placed on
+/// a relaxable smooth's `DoublePenaltyNullspace` selection coordinate when the
+/// fit is under-determined (`n < 2·p`); see [`relax_smoothing_rho_prior`].
+///
+/// The null-space ridge exists only to SELECT the linear/constant null-space
+/// component out (mgcv `select=TRUE`): we want its `λ` driven UP (`d → 0`)
+/// unless the data clearly buys the null-space wiggle. A small `upper` puts the
+/// exponential PC wall against the `λ → 0` (null space kept) side close in, so
+/// the gentle bounded Occam pull toward `λ → ∞` is what remains; the data can
+/// still keep the null space when it genuinely earns it. `0.05` places the wall
+/// at a marginal-SD scale two decades below unit, biasing toward select-out on
+/// the over-parameterized `p > n` wine fit while staying weakly informative.
+const NULLSPACE_SELECT_PC_UPPER: f64 = 0.05;
+
+/// Tail probability `α` (`P(d > upper) = α`) calibrating the rate
+/// `θ = −ln(α)/upper` of the [`NULLSPACE_SELECT_PC_UPPER`] penalized-complexity
+/// select-out prior. A small `α` makes the wall against the kept-null-space
+/// (`λ → 0`) side steep; combined with the small `upper` it yields a strong
+/// θ ≈ 92 so REML moves the under-determined null-space ridge off its stalled
+/// λ ≈ 0.11 toward select-out, without ever a hard cap (the over-smoothing pull
+/// stays bounded at gradient +1/2). See [`relax_smoothing_rho_prior`].
+const NULLSPACE_SELECT_PC_TAIL_PROB: f64 = 0.01;
 
 fn adaptive_fit_options_base(options: &FitOptions, design: &TermCollectionDesign) -> FitOptions {
     FitOptions {
