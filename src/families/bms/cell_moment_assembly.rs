@@ -3355,6 +3355,265 @@ mod empirical_rigid_jet_oracle_tests {
              (corrupted {corrupted:+.6e} vs witness {fd_mggg:+.6e})"
         );
     }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // EXACT tower oracle (#932): the empirical-grid rigid derivative tower,
+    // single-sourced.
+    //
+    // The FD witness above is the *only* guard the hand-written
+    // `empirical_rigid_{primary_grad_hess,third_full,fourth_full}_closed_form`
+    // IFT/Faà-di-Bruno recursion had — and FD is an APPROXIMATION (percent-band
+    // Richardson tolerance, conditioning-limited on the stiffest mggg channel:
+    // the #833 term sat right at the edge of its 1% band). #932 asks for the
+    // tower to be derived MECHANICALLY from a once-written row NLL and pinned to
+    // the production tensors at the exact f64-FMA floor (~1e-9), so a dropped
+    // IFT term cannot hide inside FD truncation.
+    //
+    // This builds a SECOND, fully exact `Tower4<2>` over the primaries (m, g)
+    // that shares NO code with the production closed-forms: the calibrated
+    // intercept `a(m, g)` is recovered by `jet_tower::implicit_solve` (per-order
+    // linear correction of the dense-symmetric-tensor constraint
+    // `F(a, m, g) = −μ(m) + Σ_k π_k Φ(a + s·g·node_k)`), and the row NLL is the
+    // single scalar `ℓ = unary_derivatives_neglog_phi(sign·(a + s·g·z), w)`
+    // composed onto that tower. Both compute the SAME analytic derivatives, so
+    // they must agree to ~1e-9 with no truncation tolerance — the same exact
+    // discipline the standard-normal `rigid` and `empirical_flex` oracles use.
+    // This is the rigid-empirical analogue of `flex_tower_witness`
+    // (`empirical_flex_jet_oracle_tests`) and the BMS rigid std-normal
+    // `tower.t4` cutover, extended to the last hand-derived BMS tower.
+
+    /// Exact `Tower4<2>` row NLL over the primaries θ = (m = marginal η, g =
+    /// slope), with the calibrated intercept `a(m, g)` solved as an exact
+    /// implicit tower via [`crate::families::jet_tower::implicit_solve`]. Reads
+    /// value / gradient / Hessian / third / fourth straight off the tower.
+    ///
+    /// `m` enters the constraint ONLY through the marginal target `μ(m)` (its
+    /// derivatives `mu1..mu4` come from the production link map), exactly as in
+    /// production: the observed index `a + s·g·z` carries no explicit `m`, so
+    /// every m-channel of the tower rides through `a(m, g)`.
+    fn rigid_empirical_tower_witness(
+        family: &BernoulliMarginalSlopeFamily,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        slope: f64,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> crate::families::jet_tower::Tower4<2> {
+        // `unary_derivatives_{normal_cdf,neglog_phi}` are in scope via the
+        // file-level `use super::gradient_paths::*` (the same glob the flex
+        // tower witness relies on).
+        use crate::families::jet_tower::{Tower4, implicit_solve};
+
+        let s = family.probit_frailty_scale();
+        // Scalar intercept anchor (order-0 root) from the independent bracketed
+        // solve already defined in this module — shares no code with the
+        // production IFT chain.
+        let a0 = witness_intercept(marginal.mu, slope, s, nodes, measure_weights);
+
+        // Calibration constraint F(a, m, g) over slots (0 = a, 1 = m, 2 = g):
+        //   F = −μ(m) + Σ_k π_k · Φ(a + s·g·node_k).
+        let a_var = Tower4::<3>::variable(a0, 0);
+        // m-axis anchor is the marginal linear predictor η this map expands
+        // about (`marginal.eta`); `mu1..mu4` are derivatives of μ w.r.t. that η.
+        let m_var = Tower4::<3>::variable(marginal.eta, 1);
+        let g_var = Tower4::<3>::variable(slope, 2);
+        // μ(m) as a unary composition of the marginal η slot — derivatives are
+        // exactly the production link map (correct for ANY marginal link).
+        let mu_tower =
+            m_var.compose_unary([marginal.mu, marginal.mu1, marginal.mu2, marginal.mu3, marginal.mu4]);
+        let mut f_constraint = Tower4::<3>::constant(0.0) - mu_tower;
+        for (&node, &weight) in nodes.iter().zip(measure_weights.iter()) {
+            // η_k = a + (s·g)·node_k.
+            let eta_k = a_var + g_var.scale(s * node);
+            let cdf = eta_k.compose_unary(unary_derivatives_normal_cdf(eta_k.v));
+            f_constraint = f_constraint + cdf.scale(weight);
+        }
+        // Eliminate a → exact intercept tower a(m, g) as a Tower4<2>.
+        let a_tower: Tower4<2> =
+            implicit_solve::<3, 2>(&f_constraint, a0).expect("rigid empirical implicit intercept tower");
+
+        // Row NLL over θ = (m, g): observed index η = a(m, g) + s·g·z, signed by
+        // (2y − 1), through the SAME signed-probit −logΦ scalar kernel
+        // production uses (`unary_derivatives_neglog_phi` = the production
+        // `signed_probit_neglog_unary_stack`). g (slot 1) enters the index both
+        // directly (s·g·z) and through a; m (slot 0) only through a.
+        let z = family.z[row];
+        let g_t = Tower4::<2>::variable(slope, 1);
+        let eta = a_tower + g_t.scale(s * z);
+        let sign = 2.0 * family.y[row] - 1.0;
+        let signed = eta.scale(sign);
+        signed.compose_unary(unary_derivatives_neglog_phi(signed.v, family.weights[row]))
+    }
+
+    /// The production hand-written closed-form tower
+    /// (`primary_grad_hess` + `third_full` + `fourth_full`) must equal the
+    /// mechanically-derived `implicit_solve` tower to the f64 floor (~1e-9) —
+    /// the exact-oracle replacement for the percent-band FD witness. Any dropped
+    /// IFT / Faà-di-Bruno term (the #833 genus) shifts a tensor component well
+    /// outside 1e-9 and fails loudly, with no truncation slack to hide in.
+    #[test]
+    fn empirical_rigid_kernel_matches_exact_implicit_solve_tower_932() {
+        let grid = test_grid();
+        let m = [0.25_f64, -0.6, 0.05, 0.85, -1.1];
+        let g = [0.30_f64, -0.45, 0.2, -0.15, 0.55];
+        let z = [0.4_f64, -1.0, 0.1, 0.6, -0.5];
+        let y = [1.0_f64, 0.0, 1.0, 0.0, 1.0];
+        let w = [1.0_f64, 0.8, 1.3, 0.9, 1.1];
+        let n = m.len();
+
+        for &frailty_sd in &[None, Some(0.6_f64)] {
+            let family =
+                empirical_family(y.to_vec(), z.to_vec(), w.to_vec(), frailty_sd, grid.clone());
+
+            for row in 0..n {
+                let marginal = bernoulli_marginal_link_map(
+                    &InverseLink::Standard(crate::types::StandardLink::Probit),
+                    m[row],
+                )
+                .expect("marginal link map");
+
+                // Production hand-written closed-form channels (under audit).
+                let (value, gradient, hessian) = family
+                    .empirical_rigid_primary_grad_hess_closed_form(
+                        row,
+                        marginal,
+                        g[row],
+                        &grid.nodes,
+                        &grid.weights,
+                    )
+                    .expect("production grad/hess");
+                let third = family
+                    .empirical_rigid_third_full_closed_form(
+                        row,
+                        marginal,
+                        g[row],
+                        &grid.nodes,
+                        &grid.weights,
+                    )
+                    .expect("production third");
+                let fourth = family
+                    .empirical_rigid_fourth_full_closed_form(
+                        row,
+                        marginal,
+                        g[row],
+                        &grid.nodes,
+                        &grid.weights,
+                    )
+                    .expect("production fourth");
+
+                // Independent exact tower (implicit_solve), shares no code.
+                let tower = rigid_empirical_tower_witness(
+                    &family,
+                    row,
+                    marginal,
+                    g[row],
+                    &grid.nodes,
+                    &grid.weights,
+                );
+
+                let tol = |scale: f64| 1e-9 * scale.abs().max(1.0);
+
+                // Value.
+                assert!(
+                    (tower.v - value).abs() <= tol(value),
+                    "frailty {frailty_sd:?} row {row}: tower value {:+.12e} != production {value:+.12e}",
+                    tower.v
+                );
+
+                // Gradient (m, g).
+                for (axis, prod) in [(0usize, gradient[0]), (1usize, gradient[1])] {
+                    assert!(
+                        (tower.g[axis] - prod).abs() <= tol(prod),
+                        "frailty {frailty_sd:?} row {row}: grad[{axis}] tower {:+.12e} != production {prod:+.12e}",
+                        tower.g[axis]
+                    );
+                }
+
+                // Hessian (symmetric).
+                for (i, j, prod) in [
+                    (0, 0, hessian[0][0]),
+                    (0, 1, hessian[0][1]),
+                    (1, 1, hessian[1][1]),
+                ] {
+                    assert!(
+                        (tower.h[i][j] - prod).abs() <= tol(prod),
+                        "frailty {frailty_sd:?} row {row}: H[{i}][{j}] tower {:+.12e} != production {prod:+.12e}",
+                        tower.h[i][j]
+                    );
+                }
+
+                // Third tensor (every symmetric component).
+                for (i, j, k, prod) in [
+                    (0, 0, 0, third[0][0][0]),
+                    (0, 0, 1, third[0][0][1]),
+                    (0, 1, 1, third[0][1][1]),
+                    (1, 1, 1, third[1][1][1]),
+                ] {
+                    assert!(
+                        (tower.t3[i][j][k] - prod).abs() <= tol(prod),
+                        "frailty {frailty_sd:?} row {row}: T3[{i}][{j}][{k}] tower {:+.12e} != production {prod:+.12e}",
+                        tower.t3[i][j][k]
+                    );
+                }
+
+                // Fourth tensor (every symmetric component) — the #833 block.
+                for (i, j, k, l, prod) in [
+                    (0, 0, 0, 0, fourth[0][0][0][0]),
+                    (0, 0, 0, 1, fourth[0][0][0][1]),
+                    (0, 0, 1, 1, fourth[0][0][1][1]),
+                    (0, 1, 1, 1, fourth[0][1][1][1]),
+                    (1, 1, 1, 1, fourth[1][1][1][1]),
+                ] {
+                    assert!(
+                        (tower.t4[i][j][k][l] - prod).abs() <= tol(prod),
+                        "frailty {frailty_sd:?} row {row}: T4[{i}][{j}][{k}][{l}] tower {:+.12e} != production {prod:+.12e}",
+                        tower.t4[i][j][k][l]
+                    );
+                }
+            }
+        }
+    }
+
+    /// Companion to the planted-#833 FD test, but at the EXACT tower's
+    /// resolution: a single dropped IFT term in the production `mggg` component
+    /// is `O(10⁻²)` of the tensor, while the exact-tower agreement band is
+    /// `~1e-9`, so the omission is `~10⁷×` outside tolerance — the exact oracle
+    /// catches it with enormous margin (vs the FD witness's bare ~2× margin).
+    #[test]
+    fn planted_833_style_omission_is_caught_by_exact_tower_932() {
+        let grid = test_grid();
+        let (m0, g0) = (0.4_f64, 0.35_f64);
+        let (z0, y0, w0) = (0.5_f64, 1.0_f64, 1.0_f64);
+        let family = empirical_family(vec![y0], vec![z0], vec![w0], None, grid.clone());
+        let marginal = bernoulli_marginal_link_map(
+            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            m0,
+        )
+        .expect("link map");
+
+        let fourth = family
+            .empirical_rigid_fourth_full_closed_form(0, marginal, g0, &grid.nodes, &grid.weights)
+            .expect("production fourth");
+        let prod_mggg = fourth[0][1][1][1];
+
+        let tower =
+            rigid_empirical_tower_witness(&family, 0, marginal, g0, &grid.nodes, &grid.weights);
+        let tower_mggg = tower.t4[0][1][1][1];
+
+        // Correct production agrees with the exact tower at the f64 floor…
+        assert!(
+            (tower_mggg - prod_mggg).abs() <= 1e-9 * prod_mggg.abs().max(1.0),
+            "sanity: correct production T4_mggg {prod_mggg:+.12e} should match exact tower {tower_mggg:+.12e}"
+        );
+
+        // …and a planted #833-style ~1.8% omission is ~10⁷× outside the band.
+        let corrupted = prod_mggg * 1.018 + 1e-3;
+        assert!(
+            (tower_mggg - corrupted).abs() > 1e-9 * corrupted.abs().max(1.0),
+            "exact tower failed to distinguish a planted #833-style omission \
+             (corrupted {corrupted:+.12e} vs tower {tower_mggg:+.12e})"
+        );
+    }
 }
 
 #[cfg(test)]
