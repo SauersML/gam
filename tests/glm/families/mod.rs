@@ -8,4 +8,5 @@ mod gaussian_fixed_dispersion_is_ignored_in_pirls_geometry_and_deviance;
 mod gaussian_sparse_xtwx_cache_correctness;
 mod gaussian_xtwx_cache_correctness;
 mod magic_family_auto_poisson_count;
+mod multinomial_edf_per_class_not_overcounted;
 mod multinomial_reml_deviance_reuse_issue_348;
