@@ -2169,7 +2169,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         .is_none()
     {
         if !constant_curvature_term_indices(resolvedspec).is_empty() {
-            eprintln!(
+            log::info!(
                 "[#1464-trace] try_exact_joint RETURNED None (hyper_dirs unavailable); \
                  κ̂ comes from a NON-joint path"
             );
@@ -2177,7 +2177,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         return Ok(None);
     }
     if !constant_curvature_term_indices(resolvedspec).is_empty() {
-        eprintln!(
+        log::info!(
             "[#1464-trace] try_exact_joint ENTERED for {} spatial term(s); CC present",
             spatial_terms.len()
         );
@@ -2261,14 +2261,14 @@ fn try_exact_joint_spatial_length_scale_optimization(
             // or readback), not the scan.
             match scan {
                 Some(kappa_seed) => {
-                    eprintln!(
+                    log::info!(
                         "[#1464-trace] term {term_idx}: fixed-κ sign-basin scan picked κ_seed = {kappa_seed}"
                     );
                     log_kappa0.set_scalar_slot(slot, kappa_seed);
                     cc_sign_seeds.push((slot, kappa_seed));
                 }
                 None => {
-                    eprintln!(
+                    log::info!(
                         "[#1464-trace] term {term_idx}: fixed-κ sign-basin scan returned NONE (no seed applied)"
                     );
                 }
@@ -2326,7 +2326,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
             // Spherical basin: ψ ∈ [0, κ_max].
             log_kappa_lower.set_scalar_slot(slot, 0.0);
         }
-        eprintln!(
+        log::info!(
             "[#1464-trace] slot {slot}: hard-pinned joint ψ window to \
              [{}, {}] (seed sign {})",
             log_kappa_lower.as_array()[log_kappa_lower.dims_per_term()[..slot].iter().sum::<usize>()],
@@ -2407,7 +2407,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
             final_grad_norm,
         } => {
             if has_constant_curvature_term {
-                eprintln!(
+                log::info!(
                     "[#1464-trace] joint solve NONCONVERGED (iters={iterations}, \
                      final_value={final_value}); returning FROZEN BASELINE geometry \
                      (κ̂ = spec default, NOT the joint candidate)"
@@ -2443,7 +2443,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     let accept_tol = options.tol.max(1e-8 * baseline_score.abs()).max(1e-12);
     if joint_final_value > baseline_score + accept_tol {
         if has_constant_curvature_term {
-            eprintln!(
+            log::info!(
                 "[#1464-trace] joint candidate WORSENED score (joint={joint_final_value}, \
                  baseline={baseline_score}); returning FROZEN BASELINE geometry \
                  (κ̂ = spec default, NOT the joint candidate)"
@@ -2483,7 +2483,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
         for (slot, &term_idx) in spatial_terms.iter().enumerate() {
             if constant_curvature_term_spec(resolvedspec, term_idx).is_some() {
                 let off: usize = dims[..slot].iter().sum();
-                eprintln!(
+                log::info!(
                     "[#1464-trace] term {term_idx}: joint solver CONVERGED ψ-tail κ = {} \
                      (this is the optimised candidate; joint_final_value={joint_final_value})",
                     star[off]
