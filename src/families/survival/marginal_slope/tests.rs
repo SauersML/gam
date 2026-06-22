@@ -2766,30 +2766,32 @@ fn flex_base_hessian_gw0_per_timepoint_matches_gradient_fd() {
         );
     }
 
-    // ENTRY timepoint (left-truncation): a KNOWN residual remains, localized to
-    // the calibration intercept Hessian a_uv[g,w0] (an internal diagnostic FD
-    // confirmed d_u[g]/d_u[w0] are exact to ~5e-7 and the residual is entirely
-    // in a_uv: analytic a_uv[g,w0]=-2.2515e-1 vs true -2.1847e-1, Δ≈-6.7e-3,
-    // propagating into eta_uv via chi·Δa_uv). The entry crossing's moving-
-    // boundary f_uv[g,w0]/f_aa assembly carries a further term the §D self-flux
-    // does not supply; it does NOT telescope away for the left-truncation
-    // partition the way the exit crossing does. This is a CHARACTERIZATION
-    // bound: it pins the residual so a future fix that closes it (Δ→0) or any
-    // regression that enlarges it both trip the gate, and it does not weaken
-    // the exit gate above.
+    // ENTRY timepoint (left-truncation): the #1454 partial-crossing velocity fix
+    // (FluxVelocity{Total,PartialIft}, commit 40122d07b) supplies the moving-
+    // boundary term for the IFT partials f_uv/f_au that the entry crossing needs.
+    // Pre-fix, a KNOWN residual (~6.7e-3) remained, localized to the calibration
+    // intercept Hessian a_uv[g,w0]; the fix CLOSES it so the entry base Hessian
+    // now matches the independent gradient-FD witness just like the exit crossing
+    // (both crossings use the corrected partial-velocity IFT). This is now a
+    // STRICT UPPER-BOUND GATE pinned to the same tolerance the already-correct
+    // exit arm proves (5e-3·scale + 1e-6): the entry residual must be ~0 like the
+    // exit's. A regression that re-enlarges the entry residual (GREW direction)
+    // re-trips this gate; the bound is not weakened, it asserts the fixed state.
     let entry = results
         .iter()
         .find(|r| r.0 == "entry")
         .expect("entry result present");
     {
         let (_, got, want, err) = *entry;
+        let scale = want.abs().max(1.0);
         assert!(
-            (6.0e-3..=7.5e-3).contains(&err),
-            "#1454 entry base eta_uv[g,w0] residual moved out of its characterized \
-             band: production {got:+.6e} vs gradient-FD witness {want:+.6e} \
-             (abserr {err:.3e}, expected in [6.0e-3, 7.5e-3]). If the residual \
-             SHRANK, the entry-crossing moving-boundary term was found — tighten \
-             this to a strict gate; if it GREW, a regression was introduced."
+            err <= 5e-3 * scale + 1e-6,
+            "#1454 entry base eta_uv[g,w0] production {got:+.6e} != gradient-FD \
+             witness {want:+.6e} (abserr {err:.3e}, gate 5e-3·scale+1e-6); the \
+             #1454 partial-crossing velocity term (FluxVelocity::PartialIft) for \
+             the entry crossing's IFT partials f_uv/f_au is missing, mis-signed, \
+             or regressed — the entry residual re-enlarged toward its pre-fix \
+             ~6.7e-3 instead of matching the exit crossing's ~0."
         );
     }
 }
