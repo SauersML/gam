@@ -1572,18 +1572,55 @@ fn test_build_bspline_basis_1d_double_penalty() {
     let p_constrained = result.design.ncols();
     let bend_rank = result.penaltyinfo[0].effective_rank;
     let null_rank = result.penaltyinfo[1].effective_rank;
-    // The bend penalty leaves its polynomial null space unpenalized (so it is
-    // rank-deficient on its own), and the shrinkage block carries real rank in
-    // exactly those directions.
-    assert!(bend_rank > 0 && bend_rank < p_constrained);
-    assert!(null_rank > 0);
-    // Together the two blocks leave NO unpenalized direction: the assembled
-    // double penalty `S_bend + Z Zᵀ` has full structural rank. This — not a
-    // clean rank partition (the blocks overlap on the same coefficient block) —
-    // is the property that lets REML *shrink* (never inflate) the null space
-    // (#1266); the overlapping-block geometry is what the penalty-logdet
-    // structural-rank handling on the REML side is built around.
-    let summed = &result.penalties[0] + &result.penalties[1];
+
+    // #1476/#1477: the double-penalty null-space shrinkage ridge `P` must be the
+    // orthogonal projector onto `null(S_c)` built in the CONSTRAINED coordinate
+    // chart — NOT the raw projector `U Uᵀ` congruence-transformed by the
+    // sum-to-zero `Z` (which is no longer a projector onto `null(ZᵀSZ)`). The
+    // raw-chart construction smeared a spurious second "null" direction
+    // (`δ=dist²(ĉ,null(S))≈0.148` for this k=10 order-2 P-spline) that lies in
+    // the RANGE of the bend penalty, so the "shrinkage" block penalized genuine
+    // curvature (concurvity collapse / Tweedie boundary bias). The real contract
+    // is a CLEAN rank partition with spectral complementarity, not merely a
+    // full-rank sum.
+    //
+    // Raw k=10 basis, sum-to-zero centering removes the constant direction:
+    //   p_constrained = 9, nullity(S_c) = 1  ⇒  rank(S_c)=8, rank(P)=1.
+    assert_eq!(p_constrained, 9);
+    assert_eq!(
+        bend_rank, 8,
+        "constrained order-2 bend penalty must have rank 8 (nullity 1 after centering)"
+    );
+    assert_eq!(
+        null_rank, 1,
+        "shrinkage ridge must be the rank-1 projector onto null(S_c), not the \
+         rank-2 congruence of the raw projector"
+    );
+
+    let s_c = &result.penalties[0];
+    let p_null = &result.penalties[1];
+    // Spectral complementarity: P projects onto null(S_c), so S_c·P = P·S_c = 0
+    // exactly (the ridge penalizes ONLY the unpenalized polynomial direction and
+    // never touches a curvature mode). The pre-fix raw-chart ridge failed this:
+    // its second eigendirection lived in range(S_c), giving ‖S_c P‖_F ≈ 0.15.
+    let sp = s_c.dot(p_null);
+    let ps = p_null.dot(s_c);
+    let sp_norm = sp.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let ps_norm = ps.iter().map(|v| v * v).sum::<f64>().sqrt();
+    assert!(
+        sp_norm < 1e-9,
+        "S_c·P must vanish (spectral complementarity); got ‖S_c P‖_F = {sp_norm:e}"
+    );
+    assert!(
+        ps_norm < 1e-9,
+        "P·S_c must vanish (spectral complementarity); got ‖P S_c‖_F = {ps_norm:e}"
+    );
+
+    // Together the two blocks still leave NO unpenalized direction: the assembled
+    // double penalty `S_bend + P` has full structural rank, so REML can shrink
+    // (never inflate) the null space (#1266). With the clean partition this is
+    // exactly rank(S_c)+rank(P) = 8+1 = 9.
+    let summed = s_c + p_null;
     let joint_rank = analyze_penalty_block_with_op(&summed, None)
         .expect("assembled double penalty analyzes")
         .rank;

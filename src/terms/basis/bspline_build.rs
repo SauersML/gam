@@ -207,6 +207,8 @@ pub fn build_bspline_basis_1d(
                     identifiability_transform,
                 )
             };
+        let transformed_candidates =
+            rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
         let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
             filter_active_penalty_candidates_with_ops(renormalize_constrained_penalty_candidates(
                 transformed_candidates,
@@ -313,6 +315,8 @@ pub fn build_bspline_basis_1d(
                 penalties_raw_mats,
                 Some(chunk),
             )?;
+        let transformed_candidates =
+            rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
         let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
             filter_active_penalty_candidates_with_ops(renormalize_constrained_penalty_candidates(
                 transformed_candidates,
@@ -612,6 +616,8 @@ pub fn build_bspline_basis_1d(
                 identifiability_transform,
             )
         };
+    let transformed_candidates =
+        rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(renormalize_constrained_penalty_candidates(
             transformed_candidates,
@@ -1759,6 +1765,66 @@ fn renormalize_constrained_penalty_candidates(
         }
     }
     candidates
+}
+
+/// Rebuild the double-penalty null-space shrinkage ridge in the FINAL
+/// (post-identifiability) coefficient chart.
+///
+/// The Marra & Wood (2011) null-space shrinkage block is the orthogonal
+/// projector `U Uᵀ` onto `null(S_wiggle)`. `bspline_penalty_candidates` builds
+/// it in the RAW B-spline coefficient chart, but the identifiability transform
+/// `Z` (sum-to-zero centering, boundary projection, ...) is applied to every
+/// penalty *afterwards* as the congruence `S → ZᵀSZ`. A congruence does NOT
+/// commute with the projector construction: `Zᵀ(UUᵀ)Z = (ZᵀU)(ZᵀU)ᵀ` is no
+/// longer a projector onto `null(ZᵀSZ)`. Its nonzero eigenvalues are those of
+/// `Uᵀ(ZZᵀ)U`; for an open/clamped B-spline the centering vector `c=Bᵀ1`
+/// is NOT in `null(S)`, so one of those eigenvalues is `δ=dist²(ĉ,null(S))>0`
+/// (≈0.148 for the k=10 order-2 P-spline). That spurious second null direction
+/// lies in the RANGE of the bend penalty, so the "shrinkage" ridge penalizes a
+/// genuine curvature mode — the source of the concurvity collapse (#1476) and
+/// the Tweedie `bs="ps"` boundary bias (#1477).
+///
+/// The fix mirrors the box-reparametrization path (term_specs.rs): rebuild the
+/// ridge from `null(S_c)` of the *transformed* primary wiggliness penalty, so
+/// `rank(P)=nullity(S_c)` and `S_c P = P S_c ≈ 0` exactly in the chart REML
+/// scores. After centering the constant direction is gone, so `nullity(S_c)=1`
+/// (a true rank-1 ridge); an UNcentered / constraint-free smooth keeps its
+/// genuine 2-D null space, because the projector adapts to the actual
+/// `null(S_c)`. The rebuilt ridge's `normalization_scale` is reset to `1.0`:
+/// it is a fresh unit-eigenvalue projector, and the subsequent
+/// `renormalize_constrained_penalty_candidates` pass folds in its unit-Frobenius
+/// scale just as for every other constrained block.
+fn rebuild_double_penalty_nullspace_in_constrained_chart(
+    mut candidates: Vec<PenaltyCandidate>,
+) -> Result<Vec<PenaltyCandidate>, BasisError> {
+    let has_ridge = candidates
+        .iter()
+        .any(|c| matches!(c.source, PenaltySource::DoublePenaltyNullspace));
+    if !has_ridge {
+        return Ok(candidates);
+    }
+    let primary_constrained = candidates
+        .iter()
+        .find(|c| !matches!(c.source, PenaltySource::DoublePenaltyNullspace))
+        .map(|c| c.matrix.clone());
+    let Some(s_c) = primary_constrained else {
+        crate::bail_invalid_basis!(
+            "double-penalty B-spline has a null-space shrinkage ridge but no primary \
+             wiggliness penalty to derive its constrained null space from"
+        );
+    };
+    let p = s_c.nrows();
+    let ridge = build_nullspace_shrinkage_penalty(&s_c)?
+        .map(|shrink| shrink.sym_penalty)
+        .unwrap_or_else(|| Array2::<f64>::zeros((p, p)));
+    for candidate in &mut candidates {
+        if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
+            candidate.matrix = ridge.clone();
+            candidate.normalization_scale = 1.0;
+            candidate.op = None;
+        }
+    }
+    Ok(candidates)
 }
 
 pub(crate) fn validated_kronecker_factors(
