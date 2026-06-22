@@ -255,6 +255,114 @@ fn large_k_compact_selection_work_is_independent_of_total_k_end_to_end_1450() {
     );
 }
 
+/// #1450 — the OTHER half of the "O(1)-per-token / n-free" contract: per-token
+/// assembly work must be independent of `n`. The `*_independent_of_total_k_*`
+/// gate above pins the `K` axis (doubling `K` at fixed active set leaves every
+/// per-row block unchanged); this gate pins the `n` axis (doubling the number of
+/// tokens at fixed `K` and fixed per-row active set must (1) produce exactly
+/// twice as many per-row blocks, (2) leave EVERY per-token block dimension
+/// IDENTICAL — the literal "O(1) per token" claim — and (3) scale the TOTAL
+/// assembly work exactly linearly in `n`, never super-linearly).
+///
+/// A per-token cost that secretly depended on `n` (e.g. an `O(n)` scan or an
+/// `O(n²)` cross-row coupling sneaking into the compact path) would break either
+/// the per-block-dim invariance or the strict linearity below. We drive the same
+/// real `assemble_arrow_schur` → `softmax_active_plan` → `from_dense_weights`
+/// path at `n` and `2n` with the SAME `K`, `top_k`, and per-row planted support,
+/// and observe the assembled per-row blocks (public `sys.rows` / `ArrowRowBlock`).
+#[test]
+fn compact_assembly_work_is_o1_per_token_and_n_free_end_to_end_1450() {
+    let p = 4usize;
+    let top_k = 3usize;
+    const K: usize = 512;
+    let n_small = 4usize;
+    let n_large = 8usize; // exactly 2× — total work must scale exactly 2×.
+
+    // Same per-row planted support construction at both `n`, with peaks scattered
+    // low / mid / high across the full `K` so the real selection scans all `K`.
+    // Row `i`'s support is a pure function of `i`, so the first `n_small` rows of
+    // the `n_large` fixture are bit-identical to the `n_small` fixture's rows —
+    // any per-row block-dim drift is therefore attributable ONLY to changing `n`.
+    let plant_for = |n: usize| -> Vec<Vec<usize>> {
+        (0..n)
+            .map(|row| vec![row % K, (K / 2 + row) % K, (K - 100 + row) % K])
+            .collect()
+    };
+    let planted_small = plant_for(n_small);
+    let planted_large = plant_for(n_large);
+
+    let dims_small = compact_assembly_dims(n_small, K, &planted_small, p, top_k);
+    let dims_large = compact_assembly_dims(n_large, K, &planted_large, p, top_k);
+
+    // (1) Exactly one assembled per-row block per token, and doubling `n` doubles
+    // the block count — the compact path emits a per-token block, not a global
+    // `n`-dependent structure.
+    assert_eq!(
+        dims_small.len(),
+        n_small,
+        "compact assembly must emit exactly one per-row block per token (n={n_small})"
+    );
+    assert_eq!(
+        dims_large.len(),
+        n_large,
+        "compact assembly must emit exactly one per-row block per token (n={n_large})"
+    );
+    assert_eq!(
+        dims_large.len(),
+        2 * dims_small.len(),
+        "doubling n must exactly double the per-row block count (n-free per-token contract)"
+    );
+
+    // (2) O(1) per token: every per-row block dim is the active contract
+    // `top_k·(1 + d)` and is IDENTICAL whether the fit has `n` or `2n` tokens.
+    // The shared rows (the first `n_small`) must match bit-for-bit, and every
+    // block in BOTH fits must equal the same `top_k·(1 + d)` footprint.
+    let per_token = top_k * (1 + 1); // |active| + Σ d_k (d = 1 coord per atom)
+    for row in 0..n_large {
+        assert_eq!(
+            dims_large[row], per_token,
+            "row {row}: per-token block dim {} must be the O(top_k) footprint {per_token}, \
+             INDEPENDENT of n — a compact block cannot grow with the token count",
+            dims_large[row]
+        );
+    }
+    for row in 0..n_small {
+        assert_eq!(
+            dims_small[row], dims_large[row],
+            "row {row}: per-token block dim must be IDENTICAL at n={n_small} and n={n_large} \
+             (the O(1)-per-token contract) — n={n_small} gave {}, n={n_large} gave {}",
+            dims_small[row], dims_large[row]
+        );
+    }
+
+    // (3) Strict LINEARITY of the total assembly work in `n`: with a per-token
+    // footprint independent of `n`, total work = Σ_row q_row² must scale EXACTLY
+    // with the token count, never super-linearly. `n_large = 2·n_small`, so the
+    // total work must be exactly 2× — a strict equality, not an inequality, so an
+    // `O(n²)` regression (which would make work_large > 2·work_small) is caught.
+    let work_small: usize = dims_small.iter().map(|&q| q * q).sum();
+    let work_large: usize = dims_large.iter().map(|&q| q * q).sum();
+    assert_eq!(
+        work_large,
+        2 * work_small,
+        "total compact assembly work must be EXACTLY linear in n (O(1) per token): \
+         n={n_small} work {work_small}, n={n_large} work {work_large} \
+         (a super-linear value would expose an n-dependent per-token cost)"
+    );
+    // And the per-token average is constant by construction of (2)+(3); pin it so
+    // the linearity is anchored to the real O(top_k) footprint, not to zero work.
+    assert_eq!(
+        work_small,
+        n_small * per_token * per_token,
+        "per-token work must be the constant O(top_k) footprint at n={n_small}"
+    );
+    assert_eq!(
+        work_large,
+        n_large * per_token * per_token,
+        "per-token work must be the constant O(top_k) footprint at n={n_large}"
+    );
+}
+
 /// #1450 companion: the support actually proposed by the real selection at large
 /// `K` must recover the planted top-`top_k` atoms — i.e. the `O(K)` partial
 /// select (`select_nth_unstable_by`, #1411) picks the genuine per-row peaks
