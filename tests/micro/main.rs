@@ -23,4 +23,4 @@
 //!   <target>/debug/deps/micro-<hash> --exact <test>   # run the binary directly
 //! or via the harness:  GAM_ISO_TAG=<you> bash iso.sh --fast=micro <test>
 
-mod example_bspline_open_knot_derivative;
+mod smooths;

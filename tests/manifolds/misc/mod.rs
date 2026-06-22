@@ -1,0 +1,9 @@
+mod equivariant_lie_atom;
+mod geodesic_small_step_matches_exp_to_second_order;
+mod layer_transport_functorial;
+mod product_retraction_matches_componentwise;
+mod spd_retraction_preserves_positive_definiteness;
+mod spherical_wahba_spectrum;
+mod stiefel_exp_map_vjp;
+mod torus_wraps_angles_to_principal_interval;
+mod wahba_kernel_spectral_truth;

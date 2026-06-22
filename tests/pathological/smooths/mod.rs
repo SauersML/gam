@@ -1,0 +1,6 @@
+mod constant_response_smooth_baseline;
+mod new_smooths_nan_predict_rejection;
+mod new_smooths_small_n_stability;
+mod pathological_empty_smooth_collection_behavior;
+mod polynomial_truth_smooth_recovery;
+mod small_n_smooth_safety;

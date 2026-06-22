@@ -1,0 +1,5 @@
+mod basis_duchon_matern_jet_derivative_tests;
+mod basis_radial_periodic_thinplate_tests;
+mod smooth_adaptive_bounded_duchon_tests;
+mod smooth_design_assembly_constraint_tests;
+mod smooth_matern_nfree_rekey_topology_tests;

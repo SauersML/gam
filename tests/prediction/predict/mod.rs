@@ -1,0 +1,7 @@
+mod predict_at_training_matches_fitted;
+mod predict_byfactor_recovers_truth_on_grid;
+mod predict_linear_interaction_recovers_truth_on_new_grid;
+mod predict_linear_term_extrapolation_se_grows;
+mod predict_new_row_eta_uses_training_column_order;
+mod predict_outside_train_range_bounded;
+mod predict_uncertainty_interval_coverage;

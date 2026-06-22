@@ -1,0 +1,7 @@
+mod cylinder_tensor_seam_continuity;
+mod poincare_conformal_dirichlet_penalty;
+mod sphere_basis_jet;
+mod sphere_both_kernels_fit_smooth_truth;
+mod sphere_methods_agree_on_smooth_truth;
+mod sphere_penalty_order_sweep;
+mod spherical_spline;

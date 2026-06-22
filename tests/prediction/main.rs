@@ -2,24 +2,8 @@
 //!
 //! Former top-level crates included as modules so they link as ONE binary.
 
-mod apply_family_inverse_link_variants_match_documented_mu;
-mod inverse_link_beta_logistic_jet_matches_finite_difference;
-mod inverse_link_latent_cloglog_jet_matches_finite_difference;
-mod inverse_link_mixture_jet_matches_finite_difference;
-mod inverse_link_sas_jet_matches_finite_difference;
-mod inverse_link_standard_jet_matches_finite_difference;
-mod latent_cloglog_inverse_link_cdf_monotone_bounds;
-mod mixture_link_cauchit_loglog_state_rejection;
-mod predict_at_training_matches_fitted;
-mod predict_at_training_matches_fitted_basis_sweep;
-mod predict_byfactor_recovers_truth_on_grid;
-mod predict_dispersion_location_scale_not_binomial_1064;
-mod predict_linear_interaction_recovers_truth_on_new_grid;
-mod predict_linear_term_extrapolation_se_grows;
-mod predict_new_row_eta_uses_training_column_order;
-mod predict_on_cpu_only_host_does_not_panic_with_cudarc;
-mod predict_outside_train_range_bounded;
-mod predict_parametric_survival_linear_covariate;
-mod predict_tensor_te_recovers_truth_on_grid;
-mod predict_uncertainty_interval_coverage;
-mod sas_inverse_link_cdf_monotone_bounds;
+mod families;
+mod gpu;
+mod predict;
+mod smooths;
+mod survival;

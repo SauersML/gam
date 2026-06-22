@@ -1,0 +1,5 @@
+mod arrow_schur_block_solve_matches_dense_identity;
+mod arrow_schur_complement_matches_dense_reference;
+mod arrow_schur_cross_row;
+mod arrow_schur_inertia_matches_sylvester_law;
+mod arrow_schur_mixed_precision;

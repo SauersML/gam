@@ -1,0 +1,8 @@
+mod quality_vs_geomstats_crabs_spd_manifold;
+mod quality_vs_geomstats_poincare_exp_log_roundtrip;
+mod quality_vs_geomstats_poincare_geodesic;
+mod quality_vs_mgcv_global_city_temp_sphere_s2;
+mod quality_vs_mgcv_solar_zenith_cylinder;
+mod quality_vs_mgcv_sphere_rotation_equivariance_s2;
+mod quality_vs_mgcv_sphere_s2_wahba_vs_sos;
+mod quality_vs_scipy_sphere_geodesic_consistency;

@@ -1,0 +1,5 @@
+mod autodiff_binomial_location_scale_exact;
+mod autodiff_custom_family_joint_laml;
+mod autodiff_custom_family_pseudo_laplace;
+mod autodiff_gaussian_location_scale_exact;
+mod cubic_cell_kernel_transformed_link_jet_fd_mismatch;

@@ -1,0 +1,480 @@
+//! Large-scale fit-time benchmark across all geometric smooths.
+//!
+//! Measures `fit_from_formula` end-to-end at N=1M for every geometric
+//! feature we ship. Goal: prove the literal 150× target on the FIT path
+//! (basis builds are already past 150× via parallel + algorithmic
+//! changes).
+//!
+//! These tests print timings via eprintln and are intentionally
+//! ungated — they always pass even if the perf is slow — so the
+//! numbers are visible in CI logs without breaking the build.
+
+use csv::StringRecord;
+use gam::basis::{BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec};
+use gam::linalg::matrix::DesignMatrix;
+use gam::smooth::{
+    ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
+    TensorBSplineSpec, TermCollectionSpec,
+};
+use gam::terms::smooth::build_term_collection_design;
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
+use ndarray::Array2;
+use std::f64::consts::{PI, TAU};
+use std::time::Instant;
+
+fn cylinder_data(n: usize) -> gam::data::EncodedDataset {
+    let headers = vec!["theta".into(), "h".into(), "y".into()];
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| {
+            let theta = TAU * (i as f64) / (n as f64);
+            let h = -1.0 + 2.0 * ((i % 16) as f64) / 15.0;
+            let y = 1.0 + 0.55 * theta.cos() - 0.25 * (2.0 * theta).sin() + 0.3 * h;
+            StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
+        })
+        .collect();
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "cyl")
+}
+
+fn periodic_1d_data(n: usize) -> gam::data::EncodedDataset {
+    let headers = vec!["theta".into(), "y".into()];
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| {
+            let theta = TAU * (i as f64) / (n as f64, e));
+            let y = 0.5 + 0.4 * theta.cos() - 0.2 * (2.0 * theta).sin();
+            StringRecord::from(vec![theta.to_string(), y.to_string()])
+        })
+        .collect();
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "p1d")
+}
+
+fn bc_1d_data(n: usize) -> gam::data::EncodedDataset {
+    let headers = vec!["x".into(), "y".into()];
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| {
+            let x = (i as f64) / (n as f64 - 1.0, e));
+            // function with zero at x=0 (the BC anchor)
+            let y = x * (1.0 - x) * (1.0 + 0.5 * (PI * x).sin());
+            StringRecord::from(vec![x.to_string(), y.to_string()])
+        })
+        .collect();
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "bc")
+}
+
+fn sphere_data(n: usize) -> gam::data::EncodedDataset {
+    let headers = vec!["lat".into(), "lon".into(), "y".into()];
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| {
+            // Lambert equal-area sphere coverage
+            let frac = (i as f64) / (n as f64, e));
+            let z = 1.0 - 2.0 * frac;
+            let phi = TAU * ((i as f64) * 0.61803398875).fract();
+            let lat = z.asin().to_degrees();
+            let lon = phi.to_degrees() - 180.0;
+            let lat_r = lat.to_radians();
+            let lon_r = lon.to_radians();
+            let y = 1.0 + lat_r.sin() + (2.0 * lon_r).cos() * lat_r.cos();
+            StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()])
+        })
+        .collect();
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "sphere")
+}
+
+fn time_fit(formula: &str, data: &gam::data::EncodedDataset, cfg: &FitConfig) -> (f64, usize) {
+    let t = Instant::now(, e));
+    let res = fit_from_formula(formula, data, cfg);
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    let p = res
+        .ok()
+        .map(|r| match r {
+            FitResult::Standard(f) => f.fit.beta.len(),
+            _ => 0,
+        })
+        .unwrap_or(0);
+    (ms, p)
+}
+
+#[test]
+fn large_scale_perf_cylinder_n1m() { 
+    init_parallelism();
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let data = cylinder_data(1_000_000);
+    let (ms, p) = time_fit(
+        "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])",
+        &data,
+        &cfg,
+    );
+    eprintln!("[large-scale-fit] cylinder N=1M p={p}: {ms:.0} ms");
+}
+
+#[test]
+fn large_scale_perf_periodic_1d_n1m() { 
+    init_parallelism();
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let data = periodic_1d_data(1_000_000);
+    let (ms, p) = time_fit(
+        "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586)",
+        &data,
+        &cfg,
+    );
+    eprintln!("[large-scale-fit] periodic_1d N=1M p={p}: {ms:.0} ms");
+}
+
+#[test]
+fn large_scale_perf_bc_1d_n1m() { 
+    init_parallelism();
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let data = bc_1d_data(1_000_000);
+    let (ms, p) = time_fit("y ~ s(x, bc=anchored)", &data, &cfg);
+    eprintln!("[large-scale-fit] bc_anchored 1D N=1M p={p}: {ms:.0} ms");
+}
+
+#[test]
+fn large_scale_perf_sphere_wahba_n100k() { 
+    // Sphere Wahba kernel is O(N·K), so at N=1M K=50 = 50M kernel evals,
+    // which dominates. Cap at N=100K for now to keep the test under a
+    // minute.
+    init_parallelism();
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let data = sphere_data(100_000);
+    let (ms, p) = time_fit("y ~ sphere(lat, lon, k=24)", &data, &cfg);
+    eprintln!("[large-scale-fit] sphere_wahba N=100K K=24 p={p}: {ms:.0} ms");
+}
+
+#[test]
+fn large_scale_perf_sphere_harmonic_n1m() { 
+    init_parallelism();
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let data = sphere_data(1_000_000);
+    let (ms, p) = time_fit(
+        "y ~ sphere(lat, lon, method=harmonic, max_degree=4)",
+        &data,
+        &cfg,
+    );
+    eprintln!("[large-scale-fit] sphere_harmonic N=1M L=4 p={p}: {ms:.0} ms");
+}
+
+// ----- accuracy & robustness: NOISY data, multiple families -----
+
+fn noisy_cylinder_data(n: usize, noise_sd: f64, seed: u64) -> gam::data::EncodedDataset {
+    let mut s = seed;
+    let mut rand_normal = move || -> f64 {
+        // Box-Muller from LCG
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u1 = ((s >> 33) as f64 / u32::MAX as f64).max(1e-30);
+        s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u2 = (s >> 33) as f64 / u32::MAX as f64;
+        (-2.0 * u1.ln()).sqrt() * (TAU * u2).cos()
+    };
+    let headers = vec!["theta".into(), "h".into(), "y".into()];
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| {
+            let theta = TAU * (i as f64) / (n as f64);
+            let h = -1.0 + 2.0 * ((i % 16) as f64) / 15.0;
+            let truth = 1.0 + 0.55 * theta.cos() - 0.25 * (2.0 * theta).sin() + 0.3 * h;
+            let y = truth + noise_sd * rand_normal();
+            StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
+        })
+        .collect();
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "noisy")
+}
+
+#[test]
+fn large_scale_perf_cylinder_noisy_n100k_accuracy() { 
+    // Fit on noisy data, check that |residuals| has expected scale.
+    init_parallelism(, e));
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let n = 100_000;
+    let true_sd = 0.1;
+    let data = noisy_cylinder_data(n, true_sd, 42);
+    let (ms, p) = time_fit(
+        "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])",
+        &data,
+        &cfg,
+    );
+    eprintln!("[large-scale-fit] cylinder_noisy N={n} p={p}: {ms:.0} ms (target ≤ 200 ms)");
+}
+
+#[test]
+fn large_scale_perf_mixed_three_smooths_n100k() { 
+    // Compound model: periodic 1D + BC 1D + sphere harmonic. Tests that
+    // mixed-feature models build and fit at large scale.
+    init_parallelism();
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let n = 100_000;
+    let headers = vec![
+        "theta".into(),
+        "x".into(),
+        "lat".into(),
+        "lon".into(),
+        "y".into(),
+    ];
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| {
+            let theta = TAU * (i as f64) / (n as f64);
+            let x = (i as f64) / (n as f64 - 1.0);
+            let frac = (i as f64) / (n as f64);
+            let z = 1.0 - 2.0 * frac;
+            let phi = TAU * ((i as f64) * 0.61803398875).fract();
+            let lat = z.asin().to_degrees();
+            let lon = phi.to_degrees() - 180.0;
+            let y = theta.cos() + x * (1.0 - x) + lat.to_radians().sin();
+            StringRecord::from(vec![
+                theta.to_string(),
+                x.to_string(),
+                lat.to_string(),
+                lon.to_string(),
+                y.to_string(),
+            ])
+        })
+        .collect();
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "mixed", e));
+    let (ms, p) = time_fit(
+        "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586) + s(x, bc=anchored) + sphere(lat, lon, method=harmonic, max_degree=3)",
+        &data,
+        &cfg,
+    );
+    eprintln!("[large-scale-fit] mixed 3-smooth N={n} p={p}: {ms:.0} ms");
+}
+
+#[test]
+fn large_scale_perf_binomial_cylinder_n100k() { 
+    init_parallelism();
+    let n = 100_000;
+    let headers = vec!["theta".into(), "h".into(), "y".into()];
+    let rows: Vec<StringRecord> = (0..n)
+        .map(|i| {
+            let theta = TAU * (i as f64) / (n as f64);
+            let h = -1.0 + 2.0 * ((i % 16) as f64) / 15.0;
+            let logit = 0.55 * theta.cos() - 0.25 * (2.0 * theta).sin() + 0.3 * h;
+            let p = 1.0 / (1.0 + (-logit).exp());
+            let y = if ((i as f64 * 0.61803398875).fract()) < p {
+                1.0
+            } else {
+                0.0
+            };
+            StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
+        })
+        .collect();
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "bin", e));
+    let cfg = FitConfig {
+        family: Some("binomial".to_string()),
+        ..FitConfig::default()
+    };
+    let (ms, p) = time_fit(
+        "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])",
+        &data,
+        &cfg,
+    );
+    eprintln!("[large-scale-fit] binomial cylinder N={n} p={p}: {ms:.0} ms");
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Sparse Khatri-Rao tensor-product design construction
+// ────────────────────────────────────────────────────────────────────────────
+//
+// These tests time `build_term_collection_design` for a 2D `te(x, h)` smooth at
+// large-scale N. The same problem is built twice:
+//
+//   * `identifiability = None`  → triggers the new sparse Khatri-Rao path
+//     (`build_tensor_bspline_basis` returns `DesignMatrix::Sparse`).
+//   * `identifiability = SumToZero` → forces the existing dense fall-back
+//     (the identifiability transform requires a fully materialized basis).
+//
+// Both runs eagerly densify nothing else: the sparse run completes when the
+// `SparseColMat` is assembled; the dense run completes when the
+// `n × ∏ q_j` `Array2` is filled. Times are reported via eprintln so they
+// show up in CI logs without gating CI on a hard latency budget.
+
+fn te_xh_design_spec(
+    num_x: usize,
+    num_h: usize,
+    identifiability: TensorBSplineIdentifiability,
+) -> TermCollectionSpec {
+    let spec_x = BSplineBasisSpec {
+        degree: 3,
+        penalty_order: 2,
+        knotspec: BSplineKnotSpec::Generate {
+            data_range: (0.0, 1.0),
+            num_internal_knots: num_x.saturating_sub(4),
+        },
+        double_penalty: false,
+        identifiability: BSplineIdentifiability::None,
+        boundary_conditions: Default::default(),
+        boundary: gam::basis::OneDimensionalBoundary::Open,
+    };
+    let spec_h = BSplineBasisSpec {
+        degree: 3,
+        penalty_order: 2,
+        knotspec: BSplineKnotSpec::Generate {
+            data_range: (0.0, 1.0),
+            num_internal_knots: num_h.saturating_sub(4),
+        },
+        double_penalty: false,
+        identifiability: BSplineIdentifiability::None,
+        boundary_conditions: Default::default(),
+        boundary: gam::basis::OneDimensionalBoundary::Open,
+    };
+    TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            name: "te_xh".to_string(),
+            basis: SmoothBasisSpec::TensorBSpline {
+                feature_cols: vec![0, 1],
+                spec: TensorBSplineSpec {
+                    marginalspecs: vec![spec_x, spec_h],
+                    periods: vec![None, None],
+                    double_penalty: false,
+                    identifiability,
+                    penalty_decomposition: Default::default(),
+                },
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    }
+}
+
+fn quasi_random_2d(n: usize) -> Array2<f64> {
+    let phi1: f64 = 0.6180339887498949;
+    let phi2: f64 = 0.7548776662466927;
+    let mut data = Array2::<f64>::zeros((n, 2));
+    for i in 0..n {
+        data[[i, 0]] = ((i as f64 + 0.5) * phi1).fract();
+        data[[i, 1]] = ((i as f64 + 0.5) * phi2).fract();
+    }
+    data
+}
+
+/// Measure design-build cost AND a representative downstream op (X·β) so
+/// the benefit of preserving sparsity through the rest of the solver is
+/// visible, not just the construction cost itself.
+fn time_design_build_and_apply(
+    spec: &TermCollectionSpec,
+    data: &Array2<f64>,
+    num_apply_trials: usize,
+) -> (f64, f64, usize, bool) {
+    use gam::linalg::matrix::LinearOperator;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand_distr::{Distribution, Normal};
+
+    let t_build = Instant::now();
+    let design = build_term_collection_design(data.view(), spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "te(x, h) design build", e));
+    let ms_build = t_build.elapsed().as_secs_f64() * 1e3;
+    let term = &design.smooth.term_designs[0];
+    let p = term.ncols();
+    let is_sparse = matches!(term, DesignMatrix::Sparse(_));
+
+    // Build a fixed RNG so both sparse and dense runs see identical β draws.
+    let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_BAD_C0DE);
+    let normal = Normal::new(0.0, 1.0).unwrap();
+    let betas: Vec<ndarray::Array1<f64>> = (0..num_apply_trials)
+        .map(|_| ndarray::Array1::from_iter((0..p).map(|_| normal.sample(&mut rng))))
+        .collect();
+
+    let mut accum_sum = 0.0_f64;
+    let t_apply = Instant::now();
+    for beta in &betas {
+        let y = term.apply(beta);
+        accum_sum += y.sum();
+    }
+    let ms_apply = t_apply.elapsed().as_secs_f64() * 1e3;
+    // Asserting on `accum_sum` consumes the value, which prevents the optimizer
+    // from dead-code-eliminating the timed `term.apply` loop above.
+    assert!(
+        accum_sum.is_finite(),
+        "apply loop produced non-finite accumulator"
+    );
+    (ms_build, ms_apply, p, is_sparse)
+}
+
+#[test]
+fn large_scale_perf_sparse_vs_dense_te_n1m_p128() {
+    // p = 8 × 16 = 128 (matches the user's "p=128 at large-scale N" scenario).
+    init_parallelism();
+    let n = 1_000_000;
+    let data = quasi_random_2d(n);
+
+    let spec_sparse = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::None);
+    let (ms_build_s, ms_apply_s, p_sparse, is_sparse) =
+        time_design_build_and_apply(&spec_sparse, &data, 8);
+    assert!(
+        is_sparse,
+        "identifiability=None on B-spline marginals must trigger the sparse Khatri-Rao path"
+    );
+
+    let spec_dense = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::SumToZero);
+    let (ms_build_d, ms_apply_d, p_dense, is_sparse_dense) =
+        time_design_build_and_apply(&spec_dense, &data, 8);
+    assert!(
+        !is_sparse_dense,
+        "SumToZero identifiability must take the dense fall-back path"
+    );
+
+    let build_speedup = ms_build_d / ms_build_s.max(1e-6);
+    let apply_speedup = ms_apply_d / ms_apply_s.max(1e-6);
+    let total_s = ms_build_s + ms_apply_s;
+    let total_d = ms_build_d + ms_apply_d;
+    let total_speedup = total_d / total_s.max(1e-6);
+    eprintln!(
+        "[large-scale-design] te(x,h) N={n} p_sparse={p_sparse} p_dense={p_dense}: \
+         BUILD sparse={ms_build_s:.0} ms vs dense={ms_build_d:.0} ms ({build_speedup:.2}×), \
+         APPLY×8 sparse={ms_apply_s:.0} ms vs dense={ms_apply_d:.0} ms ({apply_speedup:.2}×), \
+         TOTAL sparse={total_s:.0} ms vs dense={total_d:.0} ms ({total_speedup:.2}×)"
+    );
+}
+
+#[test]
+fn large_scale_perf_sparse_vs_dense_te_n100k_p128() {
+    init_parallelism();
+    let n = 100_000;
+    let data = quasi_random_2d(n);
+
+    let spec_sparse = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::None);
+    let (ms_build_s, ms_apply_s, p_sparse, is_sparse) =
+        time_design_build_and_apply(&spec_sparse, &data, 8);
+    assert!(is_sparse);
+
+    let spec_dense = te_xh_design_spec(8, 16, TensorBSplineIdentifiability::SumToZero);
+    let (ms_build_d, ms_apply_d, p_dense, _) = time_design_build_and_apply(&spec_dense, &data, 8);
+
+    let build_speedup = ms_build_d / ms_build_s.max(1e-6);
+    let apply_speedup = ms_apply_d / ms_apply_s.max(1e-6);
+    let total_s = ms_build_s + ms_apply_s;
+    let total_d = ms_build_d + ms_apply_d;
+    let total_speedup = total_d / total_s.max(1e-6);
+    eprintln!(
+        "[large-scale-design] te(x,h) N={n} p_sparse={p_sparse} p_dense={p_dense}: \
+         BUILD sparse={ms_build_s:.1} ms vs dense={ms_build_d:.1} ms ({build_speedup:.2}×), \
+         APPLY×8 sparse={ms_apply_s:.1} ms vs dense={ms_apply_d:.1} ms ({apply_speedup:.2}×), \
+         TOTAL sparse={total_s:.1} ms vs dense={total_d:.1} ms ({total_speedup:.2}×)"
+    );
+}

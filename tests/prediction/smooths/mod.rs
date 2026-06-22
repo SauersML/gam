@@ -1,0 +1,2 @@
+mod predict_at_training_matches_fitted_basis_sweep;
+mod predict_tensor_te_recovers_truth_on_grid;

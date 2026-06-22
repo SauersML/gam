@@ -1,0 +1,2 @@
+mod cli_tests;
+mod families_bms_identifiability_rigid_tests;

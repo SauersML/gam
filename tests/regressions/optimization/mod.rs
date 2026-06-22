@@ -1,0 +1,13 @@
+mod bc_clamped_startup_kkt_abort;
+mod beta_regression_reml_nonfinite;
+mod gamlss_linesearch_failure;
+mod large_scale_convergence_regression;
+mod nonnegative_constraint_kkt_abort_with_free_term;
+mod nonnegative_constraint_kkt_scale_invariant;
+mod outer_strategy_persistent_warm_start;
+mod reml_laml_rho_derivatives_fd_bug_hunt;
+mod reml_runtime_bug_hunt_ift_dispatch;
+mod reml_unified_2_3;
+mod sheaf_hessian_diag_wrong_on_self_loop_edge;
+mod warm_start_quality_regression;
+mod warm_start_store_regressions;

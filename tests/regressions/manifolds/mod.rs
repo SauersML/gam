@@ -1,0 +1,6 @@
+mod geometry_bug_hunt;
+mod poincare_distance_nearby_points_cancellation;
+mod poincare_self_distance;
+mod sphere_log_map_nearby_geodesic_cancellation;
+mod sphere_pole_not_single_valued;
+mod wahba_sphere_intercept_collision;

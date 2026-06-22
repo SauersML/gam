@@ -1,0 +1,5 @@
+mod glm_frozen_w_tensor_n_independence;
+mod grid_spline_2d_exact_oracle;
+mod grid_spline_2d_streaming_bench;
+mod sparse_data_smooth_fit;
+mod sparse_tensor_design_correctness;
