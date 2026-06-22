@@ -8097,6 +8097,16 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         );
     }
 
+    // #1376: the geometry-only anisotropy seed (`initial_aniso_contrasts`, from
+    // per-axis knot-coordinate spread) is blind to the response, so a signal
+    // axis and a nuisance axis with equal coordinate spread both seed to ~0 and
+    // the κ optimizer can stall at the symmetric point (it found a weak/flat
+    // antisymmetric gradient, amplified by double-penalty nullspace shrinkage).
+    // Add a bounded, response-aware per-axis nudge so the optimizer starts in
+    // the correct basin. This runs whether or not the pilot initializer fired
+    // (the pilot path is gated on a large-n threshold).
+    apply_response_aware_anisotropy_seed(data, y.view(), &mut resolvedspec, &spatial_terms);
+
     let baseline_options = superseded_fit_options(options);
     let best = fit_term_collection_forspec(
         data,

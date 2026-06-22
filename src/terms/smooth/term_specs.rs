@@ -3587,6 +3587,122 @@ pub fn get_spatial_aniso_log_scales(
         })
 }
 
+/// Per-axis response-structure score for anisotropy seeding.
+///
+/// For each spatial axis `a`, sort the response `y` by the axis coordinate
+/// `x_a` and measure the total squared successive variation of the sorted
+/// response, `tv_a = Σ_i (y_{σ(i+1)} − y_{σ(i)})²` where `σ` orders rows by
+/// `x_a`. An axis that carries real (possibly nonlinear) signal makes `y` vary
+/// SMOOTHLY when the rows are walked in that axis's order, so `tv_a` is SMALL;
+/// a pure-nuisance axis leaves `y` looking unordered, so `tv_a` is LARGE.
+///
+/// This deliberately does NOT use a linear correlation `corr(x_a, y)`: for an
+/// odd, symmetric signal such as `sin(2·x1)` over a symmetric domain the linear
+/// correlation is ~0 on the *signal* axis, which would misdirect the seed. The
+/// total-variation-of-sorted-response score captures nonlinear association.
+///
+/// Returns `score_a = −½·ln(tv_a + ε)` (larger ⇒ more signal on axis `a`),
+/// centered to sum to zero, or `None` when the data is degenerate (too few
+/// rows, non-finite, or all axes equally (un)structured). The caller adds a
+/// BOUNDED multiple of this to the geometry seed — it is a conservative nudge,
+/// never a hard override.
+fn response_aware_axis_contrasts(
+    x: ndarray::ArrayView2<'_, f64>,
+    y: ndarray::ArrayView1<'_, f64>,
+) -> Option<Vec<f64>> {
+    let n = x.nrows();
+    let d = x.ncols();
+    if d <= 1 || n < 4 || y.len() != n {
+        return None;
+    }
+    if x.iter().any(|v| !v.is_finite()) || y.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let mut scores = Vec::with_capacity(d);
+    for a in 0..d {
+        let mut order: Vec<usize> = (0..n).collect();
+        let col = x.column(a);
+        order.sort_by(|&i, &j| {
+            col[i]
+                .partial_cmp(&col[j])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut tv = 0.0_f64;
+        for w in order.windows(2) {
+            let diff = y[w[1]] - y[w[0]];
+            tv += diff * diff;
+        }
+        // ε guards against ln(0) on a perfectly flat / constant response.
+        scores.push(-0.5 * (tv + 1e-12).ln());
+    }
+    if scores.iter().any(|v| !v.is_finite()) {
+        return None;
+    }
+    let mean = scores.iter().sum::<f64>() / d as f64;
+    let centered: Vec<f64> = scores.iter().map(|&s| s - mean).collect();
+    // If every axis is equally structured the centered scores are ~0 and the
+    // nudge is a no-op — return None so the geometry seed is used unchanged.
+    if centered.iter().all(|&v| v.abs() < 1e-9) {
+        return None;
+    }
+    Some(centered)
+}
+
+/// Conservative, response-aware anisotropy seed nudge applied before the κ outer
+/// loop. For each anisotropic spatial term it adds a BOUNDED multiple of the
+/// per-axis response-structure contrast (`response_aware_axis_contrasts`) on top
+/// of the existing geometry seed, so the optimizer starts in the correct basin
+/// instead of at a response-blind near-symmetric point (the #1376 under-recovery
+/// where a signal axis and a nuisance axis with equal coordinate spread seed to
+/// ~[0,0]). The nudge is clamped to keep this a perturbation, never a hard
+/// override, so shared aniso Matérn/Duchon fits cannot be destabilized by it.
+pub(crate) fn apply_response_aware_anisotropy_seed(
+    data: ArrayView2<'_, f64>,
+    y: ndarray::ArrayView1<'_, f64>,
+    spec: &mut TermCollectionSpec,
+    spatial_terms: &[usize],
+) {
+    // Bound on the per-axis contrast nudge (in η units). One LN_2 ≈ 0.69 halves
+    // the effective per-axis length scale; capping at LN_2 keeps the seed within
+    // one optimizer log-step of the geometry seed while still breaking the
+    // symmetric-seed trap.
+    const MAX_NUDGE: f64 = std::f64::consts::LN_2;
+    for &term_idx in spatial_terms {
+        let Some(current_eta) = get_spatial_aniso_log_scales(spec, term_idx) else {
+            continue;
+        };
+        let d = current_eta.len();
+        if d <= 1 {
+            continue;
+        }
+        let Some(term) = spec.smooth_terms.get(term_idx) else {
+            continue;
+        };
+        let feature_cols = term.basis.structural_feature_cols();
+        if feature_cols.len() != d {
+            continue;
+        }
+        let Ok(x) = select_columns(data, &feature_cols) else {
+            continue;
+        };
+        let Some(contrast) = response_aware_axis_contrasts(x.view(), y) else {
+            continue;
+        };
+        let nudged: Vec<f64> = current_eta
+            .iter()
+            .zip(contrast.iter())
+            .map(|(&eta_a, &c_a)| eta_a + c_a.clamp(-MAX_NUDGE, MAX_NUDGE))
+            .collect();
+        // `set_spatial_aniso_log_scales` re-centers to Σ η = 0. A term that does
+        // not support aniso scales is silently skipped (the seed is optional).
+        if let Err(err) = set_spatial_aniso_log_scales(spec, term_idx, nudged) {
+            log::debug!(
+                "[spatial-kappa] response-aware anisotropy seed skipped for term {term_idx}: {err}"
+            );
+        }
+    }
+}
+
 /// Get the number of feature columns (spatial dimensionality) for a spatial term.
 fn get_spatial_feature_dim(spec: &TermCollectionSpec, term_idx: usize) -> Option<usize> {
     spec.smooth_terms
