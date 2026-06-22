@@ -88,7 +88,6 @@ fn is_test_path(path: &str) -> bool {
 
 /// One weakening finding.
 struct Finding {
-    sha: String,
     short: String,
     file: String,
     kind: &'static str,
@@ -319,7 +318,6 @@ fn collect_findings() -> Option<Vec<Finding>> {
                     .map(|l| l.trim().to_string())
                     .unwrap_or_default();
                 findings.push(Finding {
-                    sha: sha.clone(),
                     short: sha.chars().take(9).collect(),
                     file: h.file.clone(),
                     kind: "panic/assert removed, replaced by benign value",
@@ -347,8 +345,7 @@ fn collect_findings() -> Option<Vec<Finding>> {
             if let (Some(old_e), Some(new_e)) = (removed_exp, added_exp) {
                 if new_e < old_e {
                     findings.push(Finding {
-                        sha: sha.clone(),
-                        short: sha.chars().take(9).collect(),
+                            short: sha.chars().take(9).collect(),
                         file: h.file.clone(),
                         kind: "tolerance loosened",
                         detail: format!("bound exponent 1e-{old_e} -> 1e-{new_e}"),
