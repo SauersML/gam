@@ -290,7 +290,7 @@ fn joint_vs_independent_rmse(seed: u64, n_per_group: usize) -> [(f64, f64); 2] {
         .expect("joint by-factor fit ok")
     {
         FitResult::Standard(f) => f,
-        other => panic!("expected Standard joint fit"),
+        _ => panic!("expected Standard joint fit"),
     };
 
     // --- independent per-group fits ---
@@ -311,7 +311,7 @@ fn joint_vs_independent_rmse(seed: u64, n_per_group: usize) -> [(f64, f64); 2] {
             FitResult::Standard(f) => f,
             // single-penalty 1-D PS scan may route differently; force a Standard
             // fit by keeping the default basis (cr/tp → Standard).
-            other => panic!("expected Standard standalone fit"),
+            _ => panic!("expected Standard standalone fit"),
         };
         let indep_pred = predict_standard(&solo_fit, solo.headers.len(), solo_x, &grid);
         let indep_rmse = rmse_to_truth(&indep_pred, level, &grid);
