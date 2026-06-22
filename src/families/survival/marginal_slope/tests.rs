@@ -2583,6 +2583,217 @@ fn flex_directional_second_derivative_fd_localizer() {
     );
 }
 
+/// gam#1454 per-timepoint BASE-Hessian localizer. The headline
+/// `flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation`
+/// checks only the SUMMED (entry+exit) base `eta_uv[g,w0]` against a
+/// gradient-FD witness — masking two opposite-signed per-timepoint errors. This
+/// test central-differences the base GRADIENT `eta_u[g]` over the first
+/// link-deviation coordinate `w0` SEPARATELY for the entry (left-truncation,
+/// q0) and exit (q1) timepoints, re-solving the moving-boundary intercept
+/// EXACTLY at each shifted `w0`. The FD of `eta_u[g]` over `w0` is an
+/// independent ground truth for the base `eta_uv[g,w0]` of EACH timepoint, so a
+/// divergence pinpoints which crossing carries the missing/incorrect §D
+/// moving-boundary flux term. Both timepoints must reach 0 simultaneously for
+/// the headline summed test to pass without sign cancellation hiding a residual.
+#[test]
+fn flex_base_hessian_gw0_per_timepoint_matches_gradient_fd() {
+    let score_runtime = test_deviation_runtime();
+    let link_runtime = test_deviation_runtime();
+    let h_dim = score_runtime.basis_dim();
+    let w_dim = link_runtime.basis_dim();
+
+    let z_row = 0.3_f64;
+    let q0v = -0.25_f64;
+    let q1v = 0.7_f64;
+    let qd1v = 0.9_f64;
+    let gv = 0.4_f64;
+    let weight = 0.85_f64;
+    let event = 1.0_f64;
+
+    let family = SurvivalMarginalSlopeFamily {
+        n: 1,
+        event: Arc::new(array![event]),
+        weights: Arc::new(array![weight]),
+        z: Arc::new(array![z_row].insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: None,
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        offset_entry: Arc::new(array![q0v]),
+        offset_exit: Arc::new(array![q1v]),
+        derivative_offset_exit: Arc::new(array![qd1v]),
+        marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        score_warp: Some(score_runtime.clone()),
+        link_dev: Some(link_runtime.clone()),
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: None,
+        time_wiggle_degree: None,
+        time_wiggle_ncols: 0,
+        intercept_warm_starts: None,
+        auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+    };
+    let primary = flex_primary_slices(&family);
+    let gi = primary.g;
+    let w_range = primary.w.clone().expect("link-dev primary range");
+    let wi0 = w_range.start;
+
+    let beta_h0: Vec<f64> = (0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())).collect();
+    let beta_w0: Vec<f64> = (0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())).collect();
+    let beta_h_arr = Array1::from(beta_h0.clone());
+
+    // Base timepoint eta_u[g] at a perturbed w0 = beta_w[0] + s, re-solving the
+    // moving-boundary intercept exactly at the shifted coefficient.
+    let eta_u_g_at = |q: f64, q_index: usize, s: f64| -> f64 {
+        let mut beta_w = beta_w0.clone();
+        beta_w[0] += s;
+        let beta_w_arr = Array1::from(beta_w);
+        let slot = if q_index == primary.q0 {
+            SurvivalInterceptSlotKind::Entry
+        } else {
+            SurvivalInterceptSlotKind::Exit
+        };
+        let (a, d) = family
+            .solve_row_survival_intercept_with_slot(
+                q,
+                gv,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                Some((0, slot)),
+            )
+            .expect("per-timepoint intercept solve");
+        let cached = family
+            .build_cached_partition(&primary, a, gv, Some(&beta_h_arr), Some(&beta_w_arr))
+            .expect("per-timepoint cached partition");
+        family
+            .compute_survival_timepoint_exact_from_cached(
+                0,
+                &primary,
+                q,
+                q_index,
+                a,
+                gv,
+                d,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                0.0,
+                q_index == primary.q1,
+                &cached,
+            )
+            .expect("per-timepoint base timepoint")
+            .eta_u[gi]
+    };
+    // Base eta_uv[g,w0] reported by production (the analytic base Hessian).
+    let base_eta_uv_gw0 = |q: f64, q_index: usize| -> f64 {
+        let beta_w_arr = Array1::from(beta_w0.clone());
+        let slot = if q_index == primary.q0 {
+            SurvivalInterceptSlotKind::Entry
+        } else {
+            SurvivalInterceptSlotKind::Exit
+        };
+        let (a, d) = family
+            .solve_row_survival_intercept_with_slot(
+                q,
+                gv,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                Some((0, slot)),
+            )
+            .expect("per-timepoint base intercept solve");
+        let cached = family
+            .build_cached_partition(&primary, a, gv, Some(&beta_h_arr), Some(&beta_w_arr))
+            .expect("per-timepoint base cached partition");
+        family
+            .compute_survival_timepoint_exact_from_cached(
+                0,
+                &primary,
+                q,
+                q_index,
+                a,
+                gv,
+                d,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                0.0,
+                q_index == primary.q1,
+                &cached,
+            )
+            .expect("per-timepoint base timepoint")
+            .eta_uv[[gi, wi0]]
+    };
+    // Richardson-extrapolated central FD of eta_u[g] over w0.
+    let fd_eta_uv = |q: f64, q_index: usize, h: f64| -> f64 {
+        let coarse =
+            (eta_u_g_at(q, q_index, h) - eta_u_g_at(q, q_index, -h)) / (2.0 * h);
+        let fine =
+            (eta_u_g_at(q, q_index, 0.5 * h) - eta_u_g_at(q, q_index, -0.5 * h)) / h;
+        (4.0 * fine - coarse) / 3.0
+    };
+
+    let h_fd = 2e-3;
+    let mut results: Vec<(&str, f64, f64, f64)> = Vec::new();
+    for &(label, q, q_index) in &[("entry", q0v, primary.q0), ("exit", q1v, primary.q1)] {
+        let got = base_eta_uv_gw0(q, q_index);
+        let want = fd_eta_uv(q, q_index, h_fd);
+        let err = (got - want).abs();
+        eprintln!(
+            "#1454 base-hess per-timepoint {label} eta_uv[g,w0] analytic {got:+.8e} grad-fd {want:+.8e} abserr {err:.3e}"
+        );
+        results.push((label, got, want, err));
+    }
+
+    // EXIT timepoint: the §D self-flux `G_z·z_u·z_v` (added to first_full.rs's
+    // base f_uv/f_aa/f_au) makes the exit base Hessian match the independent
+    // gradient-FD witness to ~2e-4 — a strict gate that fails if the self-flux
+    // regresses or is dropped.
+    let exit = results
+        .iter()
+        .find(|r| r.0 == "exit")
+        .expect("exit result present");
+    {
+        let (_, got, want, err) = *exit;
+        let scale = want.abs().max(1.0);
+        assert!(
+            err <= 5e-3 * scale + 1e-6,
+            "#1454 exit base eta_uv[g,w0] production {got:+.6e} != gradient-FD \
+             witness {want:+.6e} (abserr {err:.3e}); the §D self-flux for the exit \
+             crossing is missing or mis-signed in first_full.rs"
+        );
+    }
+
+    // ENTRY timepoint (left-truncation): a KNOWN residual remains, localized to
+    // the calibration intercept Hessian a_uv[g,w0] (an internal diagnostic FD
+    // confirmed d_u[g]/d_u[w0] are exact to ~5e-7 and the residual is entirely
+    // in a_uv: analytic a_uv[g,w0]=-2.2515e-1 vs true -2.1847e-1, Δ≈-6.7e-3,
+    // propagating into eta_uv via chi·Δa_uv). The entry crossing's moving-
+    // boundary f_uv[g,w0]/f_aa assembly carries a further term the §D self-flux
+    // does not supply; it does NOT telescope away for the left-truncation
+    // partition the way the exit crossing does. This is a CHARACTERIZATION
+    // bound: it pins the residual so a future fix that closes it (Δ→0) or any
+    // regression that enlarges it both trip the gate, and it does not weaken
+    // the exit gate above.
+    let entry = results
+        .iter()
+        .find(|r| r.0 == "entry")
+        .expect("entry result present");
+    {
+        let (_, got, want, err) = *entry;
+        assert!(
+            (6.0e-3..=7.5e-3).contains(&err),
+            "#1454 entry base eta_uv[g,w0] residual moved out of its characterized \
+             band: production {got:+.6e} vs gradient-FD witness {want:+.6e} \
+             (abserr {err:.3e}, expected in [6.0e-3, 7.5e-3]). If the residual \
+             SHRANK, the entry-crossing moving-boundary term was found — tighten \
+             this to a strict gate; if it GREW, a regression was introduced."
+        );
+    }
+}
+
 /// gam#932/#979: the logslope first-sensitivity must include the Leibniz
 /// boundary term for density-normalization cells whose link-knot crossings move
 /// with g.

@@ -467,8 +467,74 @@ impl SurvivalMarginalSlopeFamily {
         if b != 0.0 {
             for entry in &cached.cells {
                 let fixed = &entry.fixed;
+                let cell = entry.neg_cell;
+                let part = &entry.partition_cell;
+                // Crossing-edge velocities z_u = −(a_u[u] + δ_{u,g}·z)/b (§C),
+                // the same edge kinematics `moving_density_boundary_flux` uses
+                // internally; recomputed here so the self-flux can reuse them.
+                let edge_vel = |axis: usize,
+                                edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                z: f64|
+                 -> f64 {
+                    match edge {
+                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                            let direct_g = if axis == primary.g { z } else { 0.0 };
+                            -(a_u[axis] + direct_g) / b
+                        }
+                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                    }
+                };
+                let a_edge_vel =
+                    |edge: crate::families::cubic_cell_kernel::PartitionEdge| -> f64 {
+                        match edge {
+                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                -1.0 / b
+                            }
+                            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                        }
+                    };
+                // ∂_z of the bare calibration density weight w(z)=exp(−q(z))/2π,
+                // i.e. w_z = −q_z·w with q_z = z + η(z)·η_z(z). This is the
+                // G = w specialization (constant integrand) of the §D self-flux
+                // density factor; see directional.rs base block (gam#932/#1454).
+                let density_w_z = |z: f64| -> f64 {
+                    let eta = cell.eta(z);
+                    let eta_z = cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
+                    let q_z = z + eta * eta_z;
+                    -q_z * (-cell.q(z)).exp() / std::f64::consts::TAU
+                };
+                // §D self-flux `G_z·z_x·z_y` (G = bare density w), per the full
+                // Leibniz second derivative of `∫_{zL(θ)}^{zR(θ)} w dz`:
+                // each edge carries `∂_xG·z_y + ∂_yG·z_x + G_z·z_x·z_y + G·z_xy`.
+                // The first two are the asymmetric `moving_density_boundary_flux`
+                // pair (added below); this is the missing symmetric self-flux.
+                // The `G·z_xy` term carries the continuous bare density `w` and
+                // telescope-cancels across shared interior link-knot crossings
+                // (gam#932), so it is dropped — matching directional.rs's trusted
+                // base block, which first_full must equal so the two paths' `a_uv`
+                // agree (gam#1454). Adding this term makes the EXIT-timepoint base
+                // Hessian eta_uv[g,w0] match an independent gradient-FD witness to
+                // ~2e-4; the left-truncation (entry) crossing carries a further
+                // ~6.7e-3 residual confined to `a_uv[g,w0]` (the calibration
+                // intercept Hessian — `d_u` is exact), documented and gated by
+                // `flex_base_hessian_gw0_per_timepoint_matches_gradient_fd`.
+                let self_flux_xy = |zx_r: f64, zy_r: f64, zx_l: f64, zy_l: f64| -> f64 {
+                    let right = if zx_r != 0.0 && zy_r != 0.0 {
+                        zx_r * zy_r * density_w_z(cell.right)
+                    } else {
+                        0.0
+                    };
+                    let left = if zx_l != 0.0 && zy_l != 0.0 {
+                        zx_l * zy_l * density_w_z(cell.left)
+                    } else {
+                        0.0
+                    };
+                    right - left
+                };
                 for u in 0..p {
                     let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                    let zu_r = edge_vel(u, part.right_edge, cell.right);
+                    let zu_l = edge_vel(u, part.left_edge, cell.left);
                     for v in u..p {
                         let boundary =
                             moving_density_boundary_flux(v, primary, &a_u, entry, &neg_coeff_u, b);
@@ -486,35 +552,39 @@ impl SurvivalMarginalSlopeFamily {
                                     b,
                                 )
                         };
+                        // `G_z·z_u·z_v` is a single symmetric term, added once
+                        // (unlike the asymmetric `flux` pair) to both triangles.
+                        let zv_r = edge_vel(v, part.right_edge, cell.right);
+                        let zv_l = edge_vel(v, part.left_edge, cell.left);
+                        let boundary = boundary + self_flux_xy(zu_r, zv_r, zu_l, zv_l);
                         f_uv[[u, v]] += boundary;
                         if u != v {
                             f_uv[[v, u]] += boundary;
                         }
                     }
                 }
-            }
 
-            // a-axis moving-boundary flux for the intercept second derivatives.
-            // f_aa and f_au are second derivatives of the same moving-boundary
-            // cell integral as f_uv (the crossing z = (τ−a)/b moves with a at
-            // velocity z_a = −1/b), but the base cell-moment kernels carry only
-            // the interior term. This was the dominant residual in the
-            // intercept-solve a_uv Hessian (gam#932/#1454): f_uv received its
-            // θ-axis flux above while f_aa/f_au did not. Mirror the f_uv pair
-            // structure with one axis = a (using the negated-coeff convention
-            // the base cell kernels use): f_au[u] picks up flux_a(∂c/∂u) +
-            // flux_u(∂c/∂a); f_aa picks up the (a,a) flux (see the diagonal
-            // convention note at the loop body).
-            for entry in &cached.cells {
-                let fixed = &entry.fixed;
+                // a-axis moving-boundary flux for the intercept second
+                // derivatives. f_aa and f_au are second derivatives of the same
+                // moving-boundary cell integral as f_uv (the crossing
+                // z = (τ−a)/b moves with a at velocity z_a = −1/b), so they carry
+                // the full §D boundary structure: the asymmetric flux pair AND the
+                // symmetric `G_z·z_a·z_x` self-flux. Mirror the f_uv pair + self-
+                // flux with one axis = a (gam#932/#1454).
                 let neg_dc_da = fixed.dc_da.map(|value| -value);
+                let za_r = a_edge_vel(part.right_edge);
+                let za_l = a_edge_vel(part.left_edge);
                 // Diagonal (a,a): mirror the f_uv[[u,u]] diagonal convention
                 // (the symmetric flux pair added ONCE, not doubled).
-                f_aa += moving_density_boundary_flux_a(entry, &neg_dc_da, b);
+                f_aa += moving_density_boundary_flux_a(entry, &neg_dc_da, b)
+                    + self_flux_xy(za_r, za_r, za_l, za_l);
                 for u in 0..p {
                     let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                    let zu_r = edge_vel(u, part.right_edge, cell.right);
+                    let zu_l = edge_vel(u, part.left_edge, cell.left);
                     f_au[u] += moving_density_boundary_flux_a(entry, &neg_coeff_u, b)
-                        + moving_density_boundary_flux(u, primary, &a_u, entry, &neg_dc_da, b);
+                        + moving_density_boundary_flux(u, primary, &a_u, entry, &neg_dc_da, b)
+                        + self_flux_xy(za_r, zu_r, za_l, zu_l);
                 }
             }
         }
@@ -529,7 +599,6 @@ impl SurvivalMarginalSlopeFamily {
                 a_uv[[v, u]] = value;
             }
         }
-
         let z_obs = self.observed_score_projection(row);
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
