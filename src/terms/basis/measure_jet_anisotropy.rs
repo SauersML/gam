@@ -135,7 +135,7 @@ pub fn lower_triangular_indices(d: usize) -> Vec<LIndex> {
 /// is `1/L_ii` when `i == j` and `0` otherwise. Writing `f = ln g = −(1/d)·ln
 /// det L`, `M = L·e^f`, every derivative below is the exact product rule on
 /// `L·e^f`.
-pub(crate) struct NormalizedFactor {
+pub struct NormalizedFactor {
     /// `M = L / det(L)^(1/d)` (d×d, lower-triangular, `det M = 1`).
     pub(crate) m: Array2<f64>,
     /// `∂M/∂L_a` for each active index `a` (d×d).
@@ -1102,6 +1102,20 @@ mod tests {
 
     pub(crate) fn band_for(centers: &Array2<f64>) -> MeasureJetBand {
         measure_jet_band(centers.view(), 0).expect("band")
+    }
+
+    pub(crate) fn two_cluster_centers() -> (ndarray::Array2<f64>, ndarray::Array1<f64>) {
+        (
+            ndarray::array![
+                [-0.8, -0.6],
+                [-0.7, -0.5],
+                [-0.6, -0.7],
+                [0.8, 0.6],
+                [0.7, 0.5],
+                [0.6, 0.7]
+            ],
+            ndarray::array![0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+        )
     }
 
     /// Oracle (1): with `L = I` (so `Ā = I`, `M = I`) the anisotropic energy

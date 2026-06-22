@@ -91,11 +91,6 @@ impl SurvivalExactRowKernel {
 }
 
 pub(crate) struct SurvivalJointQuantities {
-    /// Per-row log-likelihood `ell_i` (NOT negated). Rows excluded by the
-    /// degeneracy guard (`row_derivatives_rescaled` returns `None`) keep `0.0`,
-    /// matching their zero derivative slots. The RowKernel adapter uses this
-    /// to expose `nll_i = -ell_i` without recomputing row survival values.
-    pub(crate) ll: Array1<f64>,
     pub(crate) d1_q: Array1<f64>,
     pub(crate) d2_q: Array1<f64>,
     pub(crate) d3_q: Array1<f64>,
@@ -1202,7 +1197,6 @@ impl SurvivalLocationScaleFamily {
     ) -> Result<SurvivalJointQuantities, String> {
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
-        let mut ll = Array1::<f64>::zeros(n);
         let mut d1_q = Array1::<f64>::zeros(n);
         let mut d2_q = Array1::<f64>::zeros(n);
         let mut d3_q = Array1::<f64>::zeros(n);
@@ -1253,7 +1247,6 @@ impl SurvivalLocationScaleFamily {
             }
         }
 
-        let p_ll = SendPtr(ll.as_mut_ptr());
         let p_d1_q = SendPtr(d1_q.as_mut_ptr());
         let p_d2_q = SendPtr(d2_q.as_mut_ptr());
         let p_d3_q = SendPtr(d3_q.as_mut_ptr());
@@ -1291,7 +1284,6 @@ impl SurvivalLocationScaleFamily {
                 // exactly once; pointers target distinct length-`n` `Array1`
                 // buffers not read until the parallel loop completes.
                 unsafe {
-                    p_ll.write(i, row.ll);
                     p_d1_q.write(i, row.d1_q);
                     p_d2_q.write(i, row.d2_q);
                     p_d3_q.write(i, row.d3_q);
@@ -1314,7 +1306,6 @@ impl SurvivalLocationScaleFamily {
             })?;
 
         Ok(SurvivalJointQuantities {
-            ll,
             d1_q,
             d2_q,
             d3_q,

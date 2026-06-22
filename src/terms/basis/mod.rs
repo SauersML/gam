@@ -21,6 +21,7 @@ mod sphere_spectral;
 
 // ---- Measure-jet smooth (V0 / V∞) ----
 mod measure_jet_moments;
+mod measure_jet_anisotropy;
 mod measure_jet_predict;
 mod measure_jet_smooth;
 
@@ -87,6 +88,12 @@ pub use measure_jet_smooth::{
     measure_jet_multiscale_mode, measure_jet_quadrature_nodes, measure_jet_scale_spectrum,
     measure_jet_support_curve, realized_measure_jet_length_scale,
 };
+
+pub use measure_jet_anisotropy::{
+    MeasureJetAnisotropyJets, LIndex, lower_triangular_indices,
+    measure_jet_anisotropy_energy_form, measure_jet_anisotropy_energy_form_with_jets,
+};
+
 
 pub use sphere_spec::{
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,

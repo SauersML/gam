@@ -157,7 +157,7 @@ pub use crate::reml_contracts::{
 // ─────────────────────────────────────────────────────────────────────────
 // Leaf, state-free linear-algebra kernels (already real modules).
 // ─────────────────────────────────────────────────────────────────────────
-mod dense_linalg;
+pub(crate) mod dense_linalg;
 mod dense_projection;
 mod pseudo_logdet;
 

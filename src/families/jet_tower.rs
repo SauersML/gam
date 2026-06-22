@@ -493,6 +493,12 @@ impl<const K: usize> Tower2<K> {
         out
     }
 
+    /// e^self.
+    pub fn exp(&self) -> Self {
+        let e = self.v.exp();
+        self.compose_unary([e, e, e])
+    }
+
     /// √self. Caller guarantees positivity.
     pub fn sqrt(&self) -> Self {
         let u = self.v;

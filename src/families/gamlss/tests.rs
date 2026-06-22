@@ -8611,6 +8611,7 @@ pub(crate) fn binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_
             // axis 2 is reserved for the per-column wiggle amplitude.
             let eta_t_t = Tower2::<3>::variable(eta_t[i], 0);
             let eta_ls_t = Tower2::<3>::variable(eta_ls[i], 1);
+            
             let q0_tower = (eta_t_t * -1.0) * (eta_ls_t * -1.0).exp();
 
             for j in 0..pw {

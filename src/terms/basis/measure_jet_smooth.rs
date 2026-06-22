@@ -1827,7 +1827,25 @@ pub fn build_measure_jet_basis_psi_derivatives(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terms::basis::measure_jet_anisotropy::two_cluster_centers;
+    pub(crate) fn two_cluster_centers() -> (ndarray::Array2<f64>, ndarray::Array1<f64>) {
+        let centers = array![
+            [0.00, 0.00],
+            [0.31, 0.05],
+            [0.58, -0.07],
+            [0.93, 0.11],
+            [1.22, 0.02],
+            [1.49, -0.04],
+            [3.10, 2.00],
+            [3.42, 2.13],
+            [3.71, 1.91],
+            [4.05, 2.07],
+            [4.33, 1.96],
+            [4.61, 2.12],
+        ];
+        let m = centers.nrows();
+        let masses = ndarray::Array1::<f64>::from_elem(m, 1.0 / m as f64);
+        (centers, masses)
+    }
     use ndarray::array;
 
     pub(crate) fn band_for(centers: &Array2<f64>) -> MeasureJetBand {

@@ -313,7 +313,7 @@ fn bspline_boundary_conditions_emit_paired_equality_constraints() {
     let constraints = design
         .linear_constraints
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "boundary constraints", e));
+        .unwrap_or_else(|| panic!("{} failed", "boundary constraints"));
     assert_eq!(constraints.a.nrows(), 4);
     assert_eq!(constraints.a.ncols(), design.total_smooth_cols());
     assert_eq!(constraints.b.to_vec(), vec![2.0, -2.0, 0.0, -0.0]);
@@ -383,7 +383,7 @@ fn bspline_boundary_conditions_follow_frozen_identifiability_transform() {
     let constraints = design
         .linear_constraints
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "boundary constraints", e));
+        .unwrap_or_else(|| panic!("{} failed", "boundary constraints"));
     assert_eq!(constraints.a.nrows(), 2);
     assert_eq!(constraints.a.ncols(), raw_cols - 1);
     let BasisMetadata::BSpline1D { knots, .. } = &design.terms[0].metadata else {
@@ -437,7 +437,7 @@ fn residual_norm_to_column_space(x: &Array2<f64>, y: &Array1<f64>) -> f64 {
     let (u_opt, _, _) = x
         .svd(true, false)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "SVD should succeed in projection residual test", e));
-    let u = u_opt.unwrap_or_else(|e| panic!("{} failed: {:?}", "left singular vectors should be present", e));
+    let u = u_opt.unwrap_or_else(|| panic!("{} failed", "left singular vectors should be present"));
     let rank = numerical_rank(x);
     let mut proj = Array1::<f64>::zeros(y.len());
     for j in 0..rank.min(u.ncols()) {
@@ -913,7 +913,7 @@ fn build_smooth_design_accepts_monotone_thin_plate_1dwith_linear_constraints() {
     let lin = sd
         .linear_constraints
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "linear constraints should be generated", e));
+        .unwrap_or_else(|| panic!("{} failed", "linear constraints should be generated"));
     assert!(lin.a.nrows() > 0);
     assert_eq!(lin.a.ncols(), sd.total_smooth_cols());
     assert_eq!(lin.b.len(), lin.a.nrows());
@@ -952,7 +952,7 @@ fn build_smooth_design_auto_promotes_thin_plate_below_canonical_polynomial_dimen
 
     let sd = build_smooth_design(data.view(), &terms)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "auto-promotion to Duchon should succeed at infeasible canonical (d, k)", e));
-    let metadata = &sd.terms.first().unwrap_or_else(|e| panic!("{} failed: {:?}", "at least one smooth term").metadata;
+    let metadata = &sd.terms.first().expect("at least one smooth term").metadata;
     assert!(
         matches!(metadata, BasisMetadata::Duchon { .. }),
         "expected Duchon metadata after auto-promotion, got {metadata:?}"
@@ -1011,7 +1011,7 @@ fn freeze_term_collection_handles_thin_plate_auto_promotion_to_duchon() {
         .smooth
         .terms
         .first()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "at least one smooth term", e))
+        .unwrap_or_else(|| panic!("{} failed", "at least one smooth term"))
         .metadata;
     assert!(
         matches!(metadata, BasisMetadata::Duchon { .. }),
@@ -1019,8 +1019,8 @@ fn freeze_term_collection_handles_thin_plate_auto_promotion_to_duchon() {
     );
 
     let frozen = freeze_term_collection_from_design(&spec, &fit_design).unwrap_or_else(|e| panic!("{} failed: {:?}", 
-        "freeze must succeed across the auto-promoted (ThinPlate spec, Duchon metadata) pair",
-    );
+        "freeze must succeed across the auto-promoted (ThinPlate spec, Duchon metadata) pair", e
+    ));
     assert!(
         matches!(frozen.smooth_terms[0].basis, SmoothBasisSpec::Duchon { .. }),
         "frozen spec should reflect the auto-promotion as a Duchon variant"
@@ -1071,7 +1071,7 @@ fn build_smooth_design_accepts_monotone_matern_1dwith_linear_constraints() {
     let lin = sd
         .linear_constraints
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "linear constraints should be generated", e));
+        .unwrap_or_else(|| panic!("{} failed", "linear constraints should be generated"));
     assert!(lin.a.nrows() > 0);
     assert_eq!(lin.a.ncols(), sd.total_smooth_cols());
     assert_eq!(lin.b.len(), lin.a.nrows());
@@ -1106,7 +1106,7 @@ fn build_smooth_design_accepts_monotone_duchon_1dwith_linear_constraints() {
     let lin = sd
         .linear_constraints
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "linear constraints should be generated", e));
+        .unwrap_or_else(|| panic!("{} failed", "linear constraints should be generated"));
     assert!(lin.a.nrows() > 0);
     assert_eq!(lin.a.ncols(), sd.total_smooth_cols());
     assert_eq!(lin.b.len(), lin.a.nrows());
@@ -1139,7 +1139,7 @@ fn build_smooth_design_accepts_monotone_bsplinewith_bounds() {
     let lb = sd
         .coefficient_lower_bounds
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "lower bounds should be generated", e));
+        .unwrap_or_else(|| panic!("{} failed", "lower bounds should be generated"));
     assert_eq!(lb.len(), sd.total_smooth_cols());
     assert!(lb[0].is_infinite() && lb[0].is_sign_negative());
     for j in 1..lb.len() {
@@ -1751,13 +1751,13 @@ fn hierarchical_smooth_ownership_is_order_independent_for_bspline_and_duchon() {
             .terms
             .iter()
             .position(|term| term.name == "s_x")
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "owner term", e));
+            .unwrap_or_else(|| panic!("{} failed", "owner term"));
         let target_idx = design
             .smooth
             .terms
             .iter()
             .position(|term| term.name == "duchon_xy")
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "target term", e));
+            .unwrap_or_else(|| panic!("{} failed", "target term"));
         let owner_dense = design.smooth.term_designs[owner_idx].to_dense();
         let rel = orthogonality_relative_residual_for_design(
             &design.smooth.term_designs[target_idx],
@@ -1775,13 +1775,13 @@ fn hierarchical_smooth_ownership_is_order_independent_for_bspline_and_duchon() {
         .terms
         .iter()
         .position(|term| term.name == "duchon_xy")
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "duchon in design a", e));
+        .unwrap_or_else(|| panic!("{} failed", "duchon in design a"));
     let duchon_b_idx = design_b
         .smooth
         .terms
         .iter()
         .position(|term| term.name == "duchon_xy")
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "duchon in design b", e));
+        .unwrap_or_else(|| panic!("{} failed", "duchon in design b"));
     let duchon_a = design_a.smooth.term_designs[duchon_a_idx].to_dense();
     let duchon_b = design_b.smooth.term_designs[duchon_b_idx].to_dense();
     assert_eq!(duchon_a.dim(), duchon_b.dim());
@@ -1998,7 +1998,7 @@ fn spatial_frozen_transform_rebuild_is_exact_on_trainingrows() {
             *length_scale,
             identifiability_transform
                 .clone()
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit-time Option 5 should store transform"),
+                .expect("fit-time Option 5 should store transform"),
         ),
         other => panic!("unexpected metadata variant: {other:?}"),
     };
@@ -2368,7 +2368,7 @@ fn term_collection_joint_duchon_carries_frozen_transform_into_metadata() {
         } => {
             let z = identifiability_transform
                 .as_ref()
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "term collection should store frozen Duchon transform", e));
+                .unwrap_or_else(|| panic!("{} failed", "term collection should store frozen Duchon transform"));
             assert_eq!(z.nrows(), 4);
             assert_eq!(z.ncols(), 3);
         }
@@ -2543,7 +2543,7 @@ fn tensor_binary_margin_is_penalized_factor_smooth_not_unidentified_raw_tensor()
     let kron = design.terms[0]
         .kronecker_factored
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "tensor term should preserve Kronecker marginal metadata", e));
+        .unwrap_or_else(|| panic!("{} failed", "tensor term should preserve metadata"));
 
     assert_eq!(kron.marginal_dims, vec![5, 5]);
     assert_eq!(
@@ -3184,7 +3184,7 @@ fn run_two_block_exact_joint_optimize(
         },
         |_beta: &Array1<f64>| Ok(crate::solver::rho_optimizer::SeedOutcome::NoSlot),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", expect_msg)
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", expect_msg, e))
 }
 
 #[test]
@@ -4570,7 +4570,7 @@ fn psi_gram_tensor_e2e_kappa_optimum_matches_streamed() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate_with_order", e));
         evaluator
             .current_beta()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "converged inner β̂ available after the PIRLS solve", e))
+            .unwrap_or_else(|| panic!("{} failed", "converged inner β̂ available after the PIRLS solve"))
     };
     for rho in &rho_sweep {
         for &psi in &psi_sweep {
@@ -4874,7 +4874,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "tensor eval", e));
         let beta = evaluator
             .current_beta()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "converged inner β̂ available", e));
+            .unwrap_or_else(|| panic!("{} failed", "converged inner β̂ available"));
         (cost, grad, beta)
     };
 
@@ -4996,7 +4996,7 @@ fn psi_gram_tensor_fast_path_skips_n_row_lane_and_matches_streamed() {
             Some(cache.design_revision()),
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "streamed eval", e));
-        evaluator.current_beta().unwrap_or_else(|e| panic!("{} failed: {:?}", "streamed β̂", e))
+        evaluator.current_beta().unwrap_or_else(|| panic!("{} failed", "streamed β̂"))
     };
 
     // Soundness bar: the n-free fast path must reproduce the streamed exact solve
@@ -5256,7 +5256,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
             Some(cache.design_revision()),
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "tensor eval", e));
-        evaluator.current_beta().unwrap_or_else(|e| panic!("{} failed: {:?}", "converged inner β̂", e))
+        evaluator.current_beta().unwrap_or_else(|| panic!("{} failed", "converged inner β̂"))
     };
 
     // Pin the reference surface at ψ_A (slow path runs once, records psi_ref).
@@ -5291,7 +5291,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
             Some(cache.design_revision()),
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "streamed eval", e));
-        evaluator.current_beta().unwrap_or_else(|e| panic!("{} failed: {:?}", "streamed β̂", e))
+        evaluator.current_beta().unwrap_or_else(|| panic!("{} failed", "streamed β̂"))
     };
 
     eprintln!(
@@ -5373,7 +5373,7 @@ fn psi_gram_skip_forced_rotation_beta_error_ladder_diag() {
     let tensor_arc = tensor_eval
         .psi_gram_tensor
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "tensor attached", e))
+        .unwrap_or_else(|| panic!("{} failed", "tensor attached"))
         .clone();
     let tensor_gram_at = |psi: f64| -> Array2<f64> { tensor_arc.gram_at(psi) };
     let tensor_rhs_at = |psi: f64| -> Array1<f64> { tensor_arc.rhs_at(psi) };
@@ -5994,7 +5994,7 @@ fn iso_kappa_duchon_dx_dpsi_matches_fd() {
     let global_range = derivative_bundle.0;
     let p_total = derivative_bundle.1;
     let implicit_operator = derivative_bundle.8;
-    let op = implicit_operator.unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon derivative should expose implicit operator", e));
+    let op = implicit_operator.unwrap_or_else(|| panic!("{} failed", "Duchon derivative should expose implicit operator"));
     let p = op.p_out();
     assert_eq!(p_total, design.design.ncols());
     assert_eq!(global_range.end - global_range.start, p);
@@ -6560,14 +6560,14 @@ fn two_block_exact_joint_design_cache_clears_memo_on_theta_change() {
         crate::solver::rho_optimizer::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
     );
     cache.store_eval(eval.clone());
-    let cached_eval = cache.memoized_eval(&theta0).unwrap_or_else(|e| panic!("{} failed: {:?}", "cached eval", e));
+    let cached_eval = cache.memoized_eval(&theta0).unwrap_or_else(|| panic!("{} failed", "cached eval"));
     assert!((cached_eval.0 - eval.0).abs() <= 1e-12);
     assert_eq!(cached_eval.1, eval.1);
     assert_eq!(
         cached_eval
             .2
             .materialize_dense()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "materialize cached hessian"),
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "materialize cached hessian", e)),
         eval.2
             .materialize_dense()
             .expect("materialize eval hessian"),
@@ -6653,7 +6653,7 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
     let dims_per_term = vec![1];
     let mut theta0 = Array1::<f64>::zeros(rho_dim + 1);
     theta0[rho_dim] = -get_spatial_length_scale(&frozen, spatial_terms[0])
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "length scale", e))
+        .unwrap_or_else(|| panic!("{} failed", "length scale"))
         .ln();
 
     let mut cache = SingleBlockExactJointDesignCache::new(
@@ -6676,14 +6676,14 @@ fn single_block_exact_joint_design_cache_clears_memo_on_theta_change() {
         crate::solver::rho_optimizer::HessianResult::Analytic(Array2::<f64>::eye(theta0.len())),
     );
     cache.store_eval_at(&theta0, eval.clone());
-    let cached_eval = cache.memoized_eval(&theta0).unwrap_or_else(|e| panic!("{} failed: {:?}", "cached eval", e));
+    let cached_eval = cache.memoized_eval(&theta0).unwrap_or_else(|| panic!("{} failed", "cached eval"));
     assert!((cached_eval.0 - eval.0).abs() <= 1e-12);
     assert_eq!(cached_eval.1, eval.1);
     assert_eq!(
         cached_eval
             .2
             .materialize_dense()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "materialize cached hessian"),
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "materialize cached hessian", e)),
         eval.2
             .materialize_dense()
             .expect("materialize eval hessian"),
@@ -6789,7 +6789,7 @@ fn single_block_latent_coord_design_cache_invalidates_memo_on_outer_iter_advance
 
     let hit = cache
         .memoized_eval(&theta)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "memo should hit at the same outer iter", e));
+        .unwrap_or_else(|| panic!("{} failed", "memo should hit at the same outer iter"));
     assert!((hit.0 - eval.0).abs() <= 1e-12);
     assert_eq!(cache.memoized_cost(&theta), Some(eval.0));
 
@@ -6872,7 +6872,7 @@ fn external_joint_evaluator_reuse_matches_fresh_state_after_theta_update() {
         theta0[j] = 0.2 - 0.1 * j as f64;
     }
     theta0[rho_dim] = -get_spatial_length_scale(&frozen, spatial_terms[0])
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "length scale", e))
+        .unwrap_or_else(|| panic!("{} failed", "length scale"))
         .ln();
     let mut theta1 = theta0.clone();
     theta1[rho_dim] += 0.3;
@@ -7882,7 +7882,7 @@ fn aniso_bounds_clamp_preserves_in_range_global_length_scale_and_eta() {
             let eta = spec
                 .aniso_log_scales
                 .as_ref()
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "anisotropy should be preserved", e));
+                .unwrap_or_else(|| panic!("{} failed", "anisotropy should be preserved"));
             assert!((eta[0] - 3.0).abs() <= 1e-12);
             assert!((eta[1] + 3.0).abs() <= 1e-12);
         }
@@ -8009,7 +8009,7 @@ fn spatial_anisotropy_pilot_initializer_seeds_geometry_without_fit() {
             let eta = spec
                 .aniso_log_scales
                 .as_ref()
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "pilot initializer should preserve anisotropy", e));
+                .unwrap_or_else(|| panic!("{} failed", "pilot initializer should preserve anisotropy"));
             assert_eq!(eta.len(), 2);
             assert!((eta[0] + eta[1]).abs() <= 1e-12);
             assert!(

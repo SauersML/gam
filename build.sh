@@ -19,7 +19,6 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 S="$REPO/.buildd"; mkdir -p "$S"
 LOCK="$S/build.lock"; LOG="$S/last.log"; RESULT="$S/last.code"; HASHFILE="$S/last.hash"; HIST="$S/history.log"
 export CARGO_TARGET_DIR="$REPO/target" CARGO_INCREMENTAL=1   # item-granularity reuse
-export CARGO_BUILD_JOBS="${BUILD_JOBS:-2}"   # cap parallel rustc — default OOM-kills the 8GB box
 
 # ---------------------------------------------------------------------------
 # Compiler cache (sccache): a content-addressed warm dependency cache shared by

@@ -245,7 +245,7 @@ fn evaluate_splines_at_point(x: f64, degree: usize, knots: ArrayView1<f64>) -> A
         knots,
         basisvalues
             .as_slice_mut()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "basis row should be contiguous"),
+            .expect("basis row should be contiguous"),
         &mut scratch,
     );
     basisvalues
@@ -755,7 +755,7 @@ fn scaling_test_lap<D: DualNum<f64> + Copy>(psi: D, r: f64, eta: f64, d: f64) ->
 /// canonical definition from De Boor's "A Practical Guide to Splines" (2001).
 /// This can be used to cross-validate the iterative implementation in evaluate_splines_at_point.
 fn evaluate_bspline(x: f64, knots: &Array1<f64>, i: usize, degree: usize) -> f64 {
-    let last_knot = *knots.last().unwrap_or_else(|e| panic!("{} failed: {:?}", "knot vector should be non-empty", e));
+    let last_knot = *knots.last().unwrap_or_else(|| panic!("{} failed", "knot vector should be non-empty"));
     // Snap to partition-of-unity convention only at the exact right
     // endpoint. The fuzzy 1e-12 tolerance previously here swallowed
     // queries at `right.next_down()` (~2.22e-16 below the endpoint),
@@ -1968,7 +1968,7 @@ fn test_penalty_greville_selected_for_clamped_uniform_breakpoints() {
     let knots = internal::generate_full_knot_vector((0.0, 1.0), 5, degree).unwrap();
     let g = penalty_greville_abscissae_for_knots(&knots, degree)
         .unwrap()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clamped uniform breakpoints have non-uniform Greville abscissae", e));
+        .unwrap_or_else(|| panic!("{} failed", "clamped uniform breakpoints have non-uniform Greville abscissae"));
     // Sanity: the abscissae really are non-uniform (clustered at the ends).
     let gaps: Vec<f64> = g.windows(2).into_iter().map(|w| w[1] - w[0]).collect();
     let max_gap = gaps.iter().cloned().fold(f64::MIN, f64::max);
@@ -2091,7 +2091,7 @@ fn test_build_bspline_basis_1d_quantile_uses_divided_difference_penalty() {
     };
     let g = penalty_greville_abscissae_for_knots(knots, spec.degree)
         .unwrap()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "quantile knots should trigger Greville scaling", e));
+        .unwrap_or_else(|| panic!("{} failed", "quantile knots should trigger Greville scaling"));
     let expected =
         create_difference_penalty_matrix(built_design.ncols(), spec.penalty_order, Some(g.view()))
             .unwrap();
@@ -4917,7 +4917,7 @@ fn test_matern_closed_form_matches_collocation() {
     }
 
     let g_cf = closed_form_matern_pair_block(centers.view(), 0, length_scale, nu, None)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "q=0 Matérn closed-form should always return Some when 4ℓ > d", e));
+        .unwrap_or_else(|| panic!("{} failed", "q=0 Matérn closed-form should always return Some when 4ℓ > d"));
     assert_eq!(g_cf.shape(), &[k, k]);
     assert!(g_cf.iter().all(|v| v.is_finite()));
 
@@ -5280,7 +5280,7 @@ fn filter_active_penalty_candidates_drops_stale_kronecker_factors_after_projecti
 #[test]
 fn test_pairwise_distance_bounds_helper() {
     let pts = array![[0.0, 0.0], [3.0, 4.0], [6.0, 8.0]];
-    let (r_min, r_max) = pairwise_distance_bounds(pts.view()).unwrap_or_else(|e| panic!("{} failed: {:?}", "bounds should exist", e));
+    let (r_min, r_max) = pairwise_distance_bounds(pts.view()).unwrap_or_else(|| panic!("{} failed", "bounds should exist"));
     assert!((r_min - 5.0).abs() < 1e-12);
     assert!((r_max - 10.0).abs() < 1e-12);
 }
@@ -5289,7 +5289,7 @@ fn test_pairwise_distance_bounds_helper() {
 fn test_pairwise_distance_bounds_handles_large_finite_coordinates() {
     let pts = array![[0.0], [3.0e200], [6.0e200]];
     let (r_min, r_max) =
-        pairwise_distance_bounds(pts.view()).unwrap_or_else(|e| panic!("{} failed: {:?}", "large finite bounds should exist", e));
+        pairwise_distance_bounds(pts.view()).unwrap_or_else(|| panic!("{} failed", "large finite bounds should exist"));
     assert!((r_min - 3.0e200).abs() / 3.0e200 < 1e-12);
     assert!((r_max - 6.0e200).abs() / 6.0e200 < 1e-12);
 }
@@ -5588,7 +5588,7 @@ fn test_matern_center_sum_tozero_produces_kernel_transform() {
     else {
         panic!("expected Matérn metadata");
     };
-    let z = identifiability_transform.unwrap_or_else(|e| panic!("{} failed: {:?}", "sum-to-zero should store transform", e));
+    let z = identifiability_transform.unwrap_or_else(|| panic!("{} failed", "sum-to-zero should store transform"));
     assert_eq!(z.nrows(), centers.nrows());
     assert_eq!(z.ncols(), centers.nrows() - 1);
     let ones = Array1::<f64>::ones(centers.nrows());
@@ -6591,7 +6591,7 @@ fn test_duchon_design_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
     let analytic_design = match derivative.implicit_operator.as_ref() {
         Some(op) => op
             .materialize_first(0)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "materialize first design derivative"),
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "materialize first design derivative", e)),
         None => derivative.first.design_derivative.clone(),
     };
     eprintln!(
@@ -6768,7 +6768,7 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear() {
     let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Duchon derivative should build", e));
     let eps: f64 = 1e-5;
-    let kappa = 1.0 / spec.length_scale.unwrap_or_else(|e| panic!("{} failed: {:?}", "hybrid Duchon length_scale", e));
+    let kappa = 1.0 / spec.length_scale.unwrap_or_else(|| panic!("{} failed", "hybrid Duchon length_scale"));
     let ls_plus = 1.0 / (kappa * eps.exp());
     let ls_minus = 1.0 / (kappa * (-eps).exp());
     let mut spec_plus = spec.clone();
@@ -6851,7 +6851,7 @@ fn test_duchon_log_kappa_derivative_matchesfd() {
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Duchon derivative should build", e));
 
     let eps: f64 = 1e-6;
-    let kappa = 1.0 / spec.length_scale.unwrap_or_else(|e| panic!("{} failed: {:?}", "hybrid Duchon length_scale", e));
+    let kappa = 1.0 / spec.length_scale.unwrap_or_else(|| panic!("{} failed", "hybrid Duchon length_scale"));
     let ls_plus = 1.0 / (kappa * eps.exp());
     let ls_minus = 1.0 / (kappa * (-eps).exp());
     let mut spec_plus = spec.clone();
@@ -6870,7 +6870,7 @@ fn test_duchon_log_kappa_derivative_matchesfd() {
     let analytic_design = derivative
         .implicit_operator
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon design derivative must expose an implicit operator", e))
+        .unwrap_or_else(|| panic!("{} failed", "Duchon design derivative must expose an implicit operator"))
         .materialize_first(0)
         .expect("materialize first design derivative");
     let design_err = (&analytic_design - &fd_design)
@@ -6935,7 +6935,7 @@ fn test_periodic_duchon_log_kappa_derivative_matchesfd() {
     let base = build_duchon_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "base build", e));
 
     let eps: f64 = 2e-5;
-    let kappa = 1.0 / spec.length_scale.unwrap_or_else(|e| panic!("{} failed: {:?}", "hybrid Duchon length_scale", e));
+    let kappa = 1.0 / spec.length_scale.unwrap_or_else(|| panic!("{} failed", "hybrid Duchon length_scale"));
     let ls_plus = 1.0 / (kappa * eps.exp());
     let ls_minus = 1.0 / (kappa * (-eps).exp());
     let mut spec_plus = spec.clone();
@@ -6955,7 +6955,7 @@ fn test_periodic_duchon_log_kappa_derivative_matchesfd() {
     let analytic_second = second_derivative
         .implicit_operator
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon design second derivative must expose an implicit operator", e))
+        .unwrap_or_else(|| panic!("{} failed", "Duchon design second derivative must expose an implicit operator"))
         .materialize_second_diag(0)
         .expect("materialize second-diag design derivative");
     let design_err = (&analytic_second - &fd_design)

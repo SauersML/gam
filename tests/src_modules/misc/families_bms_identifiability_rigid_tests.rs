@@ -291,7 +291,7 @@ fn h_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockSt
         .block
         .initial_beta
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "score-warp initial beta", e))
+        .expect("score-warp initial beta")
         .len();
     let block_states = vec![
         dummy_block_state(array![0.0], seed.len()),
@@ -326,7 +326,7 @@ fn w_only_exact_fixture() -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockSt
         .block
         .initial_beta
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "link initial beta", e))
+        .expect("link initial beta")
         .len();
     let block_states = vec![
         dummy_block_state(array![0.0], seed.len()),
@@ -777,7 +777,7 @@ fn row_primary_third_trace_many_matches_single_direction_contracts() {
         let row_dirs = vec![
             family
                 .row_primary_direction_from_flat(row, &cache.slices, &cache.primary, &direction_a)
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "row direction a"),
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "row direction a", e)),
             family
                 .row_primary_direction_from_flat(row, &cache.slices, &cache.primary, &direction_b)
                 .expect("row direction b"),
@@ -1806,12 +1806,12 @@ fn bernoulli_sigma_psi_terms_subsample_full_equals_unsampled() {
     let h_full = with_full
         .hessian_psi_operator
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "op", e))
+        .expect("op")
         .to_dense();
     let h_baseline = baseline
         .hessian_psi_operator
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "op", e))
+        .expect("op")
         .to_dense();
     let h_rel = rel_diff_array2(&h_full, &h_baseline);
     assert!(h_rel < 1e-12, "hessian rel {}", h_rel);
@@ -1853,8 +1853,8 @@ fn bernoulli_sigma_psi_terms_subsample_half_scales_correctly() {
     let exp_score = &raw.score_psi * factor;
     let score_rel = rel_diff_array1(&scaled.score_psi, &exp_score);
     assert!(score_rel < 1e-12, "score_psi rel {}", score_rel);
-    let h_scaled = scaled.hessian_psi_operator.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "op").to_dense(, e));
-    let h_raw = raw.hessian_psi_operator.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "op").to_dense(, e));
+    let h_scaled = scaled.hessian_psi_operator.as_ref().expect("op failed").to_dense();
+    let h_raw = raw.hessian_psi_operator.as_ref().expect("op failed").to_dense();
     let h_exp = &h_raw * factor;
     let h_rel = rel_diff_array2(&h_scaled, &h_exp);
     assert!(h_rel < 1e-12, "hessian rel {}", h_rel);
@@ -2053,12 +2053,12 @@ fn bernoulli_psi_workspace_with_options_threads_subsample_to_first_order() {
     let h_ws = via_ws
         .hessian_psi_operator
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "ws hessian op", e))
+        .expect("ws hessian op")
         .to_dense();
     let h_direct = direct
         .hessian_psi_operator
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "direct hessian op", e))
+        .expect("direct hessian op")
         .to_dense();
     let h_rel = rel_diff_array2(&h_ws, &h_direct);
     assert!(h_rel == 0.0, "hessian diverged: rel {}", h_rel);
@@ -2135,7 +2135,7 @@ fn score_warp_basis_smoothness_penalty_is_full_rank() {
         .max()
         .or(Some(cfg.penalty_order))
         .filter(|o| *o > 0)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "test config has a positive penalty order", e));
+        .expect("test config has a positive penalty order");
     let (penalty, nullity) = prepared
         .runtime
         .integrated_derivative_penalty_with_nullity(max_order)
@@ -2154,7 +2154,7 @@ fn score_warp_basis_smoothness_penalty_is_full_rank() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "eigendecomposition of transformed-basis penalty", e));
     let evals_slice = evals
         .as_slice()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "contiguous transformed-basis penalty eigenvalues", e));
+        .expect("contiguous transformed-basis penalty eigenvalues");
     let threshold =
         crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
     let smallest = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
@@ -2185,7 +2185,7 @@ fn link_deviation_basis_smoothness_penalty_is_full_rank() {
         .max()
         .or(Some(cfg.penalty_order))
         .filter(|o| *o > 0)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "test config has a positive penalty order", e));
+        .expect("test config has a positive penalty order");
     let (penalty, nullity) = prepared
         .runtime
         .integrated_derivative_penalty_with_nullity(max_order)
@@ -2201,7 +2201,7 @@ fn link_deviation_basis_smoothness_penalty_is_full_rank() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "eigendecomposition of transformed-basis penalty", e));
     let evals_slice = evals
         .as_slice()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "contiguous transformed-basis penalty eigenvalues", e));
+        .expect("contiguous transformed-basis penalty eigenvalues");
     let threshold =
         crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
     let smallest = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
@@ -2282,7 +2282,7 @@ fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
         .block
         .initial_beta
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "link block initial beta", e))
+        .expect("link block initial beta")
         .len();
     let beta_link = Array1::from_iter((0..link_dim).map(|idx| 0.1 * (idx as f64 + 1.0)));
     let family = BernoulliMarginalSlopeFamily {
@@ -2301,7 +2301,7 @@ fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
 
     let slices = block_slices(&family);
     assert!(slices.h.is_none(), "score-warp slice should be absent");
-    let link_slice = slices.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "link slice", e));
+    let link_slice = slices.w.as_ref().expect("link slice");
     assert_eq!(
         slices.marginal.len(),
         0,
@@ -2320,7 +2320,7 @@ fn link_dev_without_score_warp_exposes_structural_derivative_lower_bounds() {
 
     let primary = primary_slices(&slices);
     assert!(primary.h.is_none(), "primary h slice should be absent");
-    let primary_w = primary.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "primary link slice", e));
+    let primary_w = primary.w.as_ref().expect("primary link slice");
     assert_eq!(primary_w.start, 2, "primary link slice should start at 2");
     assert_eq!(primary.total, 2 + link_dim);
 
@@ -2487,9 +2487,9 @@ fn exact_layout_ignores_dummy_beta_widths_for_empty_design_blocks() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "exact eval cache", e));
     assert_eq!(cache.slices.marginal.len(), 0);
     assert_eq!(cache.slices.logslope.len(), 0);
-    assert_eq!(cache.slices.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice").start, 0, e));
+    assert_eq!(cache.slices.h.as_ref().expect("h slice").start, 0);
     assert_eq!(
-        cache.slices.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice").start,
+        cache.slices.w.as_ref().expect("w slice").start,
         score_prepared.runtime.basis_dim()
     );
     assert_eq!(
@@ -2498,9 +2498,9 @@ fn exact_layout_ignores_dummy_beta_widths_for_empty_design_blocks() {
     );
     assert_eq!(cache.primary.q, 0);
     assert_eq!(cache.primary.logslope, 1);
-    assert_eq!(cache.primary.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "primary h").start, 2, e));
+    assert_eq!(cache.primary.h.as_ref().expect("primary h").start, 2);
     assert_eq!(
-        cache.primary.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "primary w").start,
+        cache.primary.w.as_ref().expect("primary w").start,
         2 + score_prepared.runtime.basis_dim()
     );
 }
@@ -2520,7 +2520,7 @@ fn score_warp_block_exposes_structural_derivative_lower_bounds() {
         .block
         .initial_beta
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "score-warp initial beta", e))
+        .expect("score-warp initial beta")
         .len();
     let family = BernoulliMarginalSlopeFamily {
         y: Arc::new(Array1::zeros(seed.len())),
@@ -2736,7 +2736,7 @@ fn structural_constraints_match_exact_monotonicity_guard() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "derivative design", e));
     let row_idx = (0..d1_design.nrows())
         .find(|&idx| d1_design.row(idx).dot(&d1_design.row(idx)) > 0.0)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "derivative design should include a nonzero row", e));
+        .expect("derivative design should include a nonzero row");
     let derivative_row = d1_design.row(row_idx).to_owned();
     let row_norm_sq = derivative_row.dot(&derivative_row);
     let infeasible = derivative_row.mapv(|value| -2.0 * value / row_norm_sq);
@@ -3109,7 +3109,7 @@ fn denested_microcells_follow_score_and_link_breaks() {
             .runtime
             .breakpoints()
             .as_slice()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "score breaks"),
+            .expect("score breaks"),
         link_prepared
             .runtime
             .breakpoints()
@@ -3126,7 +3126,7 @@ fn denested_microcells_follow_score_and_link_breaks() {
             .runtime
             .breakpoints()
             .as_slice()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "score breaks"),
+            .expect("score breaks"),
         link_prepared
             .runtime
             .breakpoints()
@@ -3194,7 +3194,7 @@ fn denested_microcell_eta_matches_direct_denested_formula() {
             .runtime
             .breakpoints()
             .as_slice()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "score breaks"),
+            .expect("score breaks"),
         link_prepared
             .runtime
             .breakpoints()
@@ -3277,15 +3277,15 @@ fn denested_branch_selection_uses_normalized_cell_coefficients() {
         ..affine
     };
     assert_eq!(
-        branch_exact_cell(affine).unwrap_or_else(|e| panic!("{} failed: {:?}", "affine branch"),
+        branch_exact_cell(affine).unwrap_or_else(|e| panic!("{} failed: {:?}", "affine branch", e)),
         ExactCellBranchShared::Affine
     );
     assert_eq!(
-        branch_exact_cell(quartic).unwrap_or_else(|e| panic!("{} failed: {:?}", "quartic branch"),
+        branch_exact_cell(quartic).unwrap_or_else(|e| panic!("{} failed: {:?}", "quartic branch", e)),
         ExactCellBranchShared::Quartic
     );
     assert_eq!(
-        branch_exact_cell(sextic).unwrap_or_else(|e| panic!("{} failed: {:?}", "sextic branch"),
+        branch_exact_cell(sextic).unwrap_or_else(|e| panic!("{} failed: {:?}", "sextic branch", e)),
         ExactCellBranchShared::Sextic
     );
 }
@@ -3521,7 +3521,7 @@ fn signed_probit_helpers_handle_nonfinite_boundaries_explicitly() {
 fn signed_probit_exact_derivative_helper_rejects_invalid_nonfinite_margins() {
     assert_eq!(
         signed_probit_neglog_derivatives_up_to_fourth(f64::INFINITY, 2.5)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "+inf should use the zero tail"),
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "+inf should use the zero tail", e)),
         (0.0, 0.0, 0.0, 0.0)
     );
 
@@ -4057,7 +4057,7 @@ fn w_only_gradient_hessian_finite_and_symmetric() {
         .block
         .initial_beta
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "link initial beta", e))
+        .expect("link initial beta")
         .len();
     // Non-trivial link coefficients to exercise all jet branches.
     let beta_link = Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0)));
@@ -4153,7 +4153,7 @@ fn h_only_gradient_hessian_finite_and_symmetric() {
         .block
         .initial_beta
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "score-warp initial beta", e))
+        .expect("score-warp initial beta")
         .len();
     let beta_score = Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0)));
 
@@ -4243,7 +4243,7 @@ fn w_only_exact_outer_directional_derivatives_are_present_and_finite() {
         .block
         .initial_beta
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "link initial beta", e))
+        .expect("link initial beta")
         .len();
     let beta_link = Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0)));
 
@@ -4270,7 +4270,7 @@ fn w_only_exact_outer_directional_derivatives_are_present_and_finite() {
     let total = slices.total;
     let mut dir_u = Array1::<f64>::zeros(total);
     let mut dir_v = Array1::<f64>::zeros(total);
-    let w_range = slices.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = slices.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.15;
     if w_range.len() > 1 {
         dir_u[w_range.start + 1] = -0.07;
@@ -4374,7 +4374,7 @@ fn h_only_exact_outer_directional_derivatives_are_present_and_finite() {
         .block
         .initial_beta
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "score-warp initial beta", e))
+        .expect("score-warp initial beta")
         .len();
     let beta_score = Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0)));
     let scalar_design = || {
@@ -4414,7 +4414,7 @@ fn h_only_exact_outer_directional_derivatives_are_present_and_finite() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[slices.marginal.start] = -0.35;
     dir_u[slices.logslope.start] = 0.28;
-    let h_range = slices.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = slices.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.12;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.06;
@@ -4478,7 +4478,7 @@ fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
         .block
         .initial_beta
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "score-warp initial beta", e))
+        .expect("score-warp initial beta")
         .len();
     let beta_score = Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0)));
 
@@ -4510,7 +4510,7 @@ fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[cache.primary.q] = -0.35;
     dir_u[cache.primary.logslope] = 0.28;
-    let h_range = cache.primary.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = cache.primary.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.12;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.06;
@@ -4594,7 +4594,7 @@ fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
         .block
         .initial_beta
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "link initial beta", e))
+        .expect("link initial beta")
         .len();
     let beta_link = Array1::from_iter((0..link_dim).map(|idx| 0.05 * (idx as f64 + 1.0)));
 
@@ -4626,7 +4626,7 @@ fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[cache.primary.q] = 0.4;
     dir_u[cache.primary.logslope] = -0.3;
-    let w_range = cache.primary.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = cache.primary.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.15;
     if w_range.len() > 1 {
         dir_u[w_range.start + 1] = -0.07;
@@ -4707,12 +4707,12 @@ fn dual_flex_row_primary_higher_order_contractions_are_finite_and_symmetric() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[cache.primary.q] = 0.7;
     dir_u[cache.primary.logslope] = -0.2;
-    let h_range = cache.primary.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = cache.primary.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.1;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.05;
     }
-    let w_range = cache.primary.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = cache.primary.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.08;
 
     dir_v[cache.primary.q] = -0.4;
@@ -4935,12 +4935,12 @@ fn dual_flex_exact_outer_fourth_direction_swap_is_symmetric() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[slices.marginal.start] = 0.7;
     dir_u[slices.logslope.start] = -0.2;
-    let h_range = slices.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = slices.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.1;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.05;
     }
-    let w_range = slices.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = slices.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.08;
 
     dir_v[slices.marginal.start] = -0.4;
@@ -4984,12 +4984,12 @@ fn dual_flex_row_primary_fourth_direction_swap_is_symmetric() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[cache.primary.q] = 0.7;
     dir_u[cache.primary.logslope] = -0.2;
-    let h_range = cache.primary.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = cache.primary.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.1;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.05;
     }
-    let w_range = cache.primary.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = cache.primary.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.08;
 
     dir_v[cache.primary.q] = -0.4;
@@ -5050,12 +5050,12 @@ fn dual_flex_row_primary_higher_order_direction_sign_rules_hold() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[cache.primary.q] = 0.7;
     dir_u[cache.primary.logslope] = -0.2;
-    let h_range = cache.primary.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = cache.primary.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.1;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.05;
     }
-    let w_range = cache.primary.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = cache.primary.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.08;
 
     dir_v[cache.primary.q] = -0.4;
@@ -5130,7 +5130,7 @@ fn h_only_row_primary_fourth_direction_swap_is_symmetric() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[cache.primary.q] = -0.35;
     dir_u[cache.primary.logslope] = 0.28;
-    let h_range = cache.primary.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = cache.primary.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.12;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.06;
@@ -5190,7 +5190,7 @@ fn w_only_row_primary_fourth_direction_swap_is_symmetric() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[cache.primary.q] = 0.4;
     dir_u[cache.primary.logslope] = -0.3;
-    let w_range = cache.primary.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = cache.primary.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.15;
     if w_range.len() > 1 {
         dir_u[w_range.start + 1] = -0.07;
@@ -5249,7 +5249,7 @@ fn h_only_row_primary_higher_order_direction_sign_rules_hold() {
     let mut dir = Array1::<f64>::zeros(total);
     dir[cache.primary.q] = -0.35;
     dir[cache.primary.logslope] = 0.28;
-    let h_range = cache.primary.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = cache.primary.h.as_ref().expect("h slice");
     dir[h_range.start] = 0.12;
     if h_range.len() > 1 {
         dir[h_range.start + 1] = -0.06;
@@ -5312,7 +5312,7 @@ fn w_only_row_primary_higher_order_direction_sign_rules_hold() {
     let mut dir = Array1::<f64>::zeros(total);
     dir[cache.primary.q] = 0.4;
     dir[cache.primary.logslope] = -0.3;
-    let w_range = cache.primary.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = cache.primary.w.as_ref().expect("w slice");
     dir[w_range.start] = 0.15;
     if w_range.len() > 1 {
         dir[w_range.start + 1] = -0.07;
@@ -5375,12 +5375,12 @@ fn dual_flex_exact_outer_direction_sign_rules_hold() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[slices.marginal.start] = 0.7;
     dir_u[slices.logslope.start] = -0.2;
-    let h_range = slices.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = slices.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.1;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.05;
     }
-    let w_range = slices.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = slices.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.08;
 
     dir_v[slices.marginal.start] = -0.4;
@@ -5437,12 +5437,12 @@ fn dual_flex_exact_outer_fourth_double_sign_flip_is_invariant() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[slices.marginal.start] = 0.7;
     dir_u[slices.logslope.start] = -0.2;
-    let h_range = slices.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = slices.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.1;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.05;
     }
-    let w_range = slices.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = slices.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.08;
 
     dir_v[slices.marginal.start] = -0.4;
@@ -5490,12 +5490,12 @@ fn dual_flex_exact_outer_third_direction_is_linear() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[slices.marginal.start] = 0.7;
     dir_u[slices.logslope.start] = -0.2;
-    let h_range = slices.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = slices.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.1;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.05;
     }
-    let w_range = slices.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = slices.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.08;
 
     dir_v[slices.marginal.start] = -0.4;
@@ -5543,12 +5543,12 @@ fn dual_flex_row_primary_third_direction_is_linear() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[cache.primary.q] = 0.7;
     dir_u[cache.primary.logslope] = -0.2;
-    let h_range = cache.primary.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = cache.primary.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.1;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.05;
     }
-    let w_range = cache.primary.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = cache.primary.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.08;
 
     dir_v[cache.primary.q] = -0.4;
@@ -5597,7 +5597,7 @@ fn h_only_row_primary_third_direction_is_linear() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[cache.primary.q] = -0.35;
     dir_u[cache.primary.logslope] = 0.28;
-    let h_range = cache.primary.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = cache.primary.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.12;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.06;
@@ -5648,7 +5648,7 @@ fn w_only_row_primary_third_direction_is_linear() {
     let mut dir_v = Array1::<f64>::zeros(total);
     dir_u[cache.primary.q] = 0.4;
     dir_u[cache.primary.logslope] = -0.3;
-    let w_range = cache.primary.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = cache.primary.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.15;
     if w_range.len() > 1 {
         dir_u[w_range.start + 1] = -0.07;
@@ -5699,12 +5699,12 @@ fn dual_flex_exact_outer_fourth_first_direction_is_linear() {
     let mut dir_w = Array1::<f64>::zeros(total);
     dir_u[slices.marginal.start] = 0.7;
     dir_u[slices.logslope.start] = -0.2;
-    let h_range = slices.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = slices.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.1;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.05;
     }
-    let w_range = slices.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = slices.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.08;
 
     dir_v[slices.marginal.start] = -0.4;
@@ -5752,7 +5752,7 @@ fn h_only_exact_outer_third_direction_is_linear() {
     let total = slices.total;
     let mut dir_u = Array1::<f64>::zeros(total);
     let mut dir_v = Array1::<f64>::zeros(total);
-    let h_range = slices.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = slices.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.12;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.06;
@@ -5795,7 +5795,7 @@ fn w_only_exact_outer_third_direction_is_linear() {
     let total = slices.total;
     let mut dir_u = Array1::<f64>::zeros(total);
     let mut dir_v = Array1::<f64>::zeros(total);
-    let w_range = slices.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = slices.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.15;
     if w_range.len() > 1 {
         dir_u[w_range.start + 1] = -0.07;
@@ -5837,7 +5837,7 @@ fn h_only_exact_outer_direction_sign_rules_hold() {
     let slices = block_slices(&family);
     let total = slices.total;
     let mut dir = Array1::<f64>::zeros(total);
-    let h_range = slices.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = slices.h.as_ref().expect("h slice");
     dir[h_range.start] = 0.12;
     if h_range.len() > 1 {
         dir[h_range.start + 1] = -0.06;
@@ -5881,7 +5881,7 @@ fn w_only_exact_outer_direction_sign_rules_hold() {
     let slices = block_slices(&family);
     let total = slices.total;
     let mut dir = Array1::<f64>::zeros(total);
-    let w_range = slices.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = slices.w.as_ref().expect("w slice");
     dir[w_range.start] = 0.15;
     if w_range.len() > 1 {
         dir[w_range.start + 1] = -0.07;
@@ -5926,7 +5926,7 @@ fn h_only_exact_outer_fourth_direction_swap_is_symmetric() {
     let total = slices.total;
     let mut dir_u = Array1::<f64>::zeros(total);
     let mut dir_v = Array1::<f64>::zeros(total);
-    let h_range = slices.h.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "h slice", e));
+    let h_range = slices.h.as_ref().expect("h slice");
     dir_u[h_range.start] = 0.12;
     if h_range.len() > 1 {
         dir_u[h_range.start + 1] = -0.06;
@@ -5963,7 +5963,7 @@ fn w_only_exact_outer_fourth_direction_swap_is_symmetric() {
     let total = slices.total;
     let mut dir_u = Array1::<f64>::zeros(total);
     let mut dir_v = Array1::<f64>::zeros(total);
-    let w_range = slices.w.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "w slice", e));
+    let w_range = slices.w.as_ref().expect("w slice");
     dir_u[w_range.start] = 0.15;
     if w_range.len() > 1 {
         dir_u[w_range.start + 1] = -0.07;
@@ -6607,7 +6607,7 @@ fn flexible_evaluate_block_diagonals_match_joint_exact_oracle() {
     let ranges = [
         slices.marginal.clone(),
         slices.logslope.clone(),
-        slices.h.clone().unwrap_or_else(|e| panic!("{} failed: {:?}", "score-warp block"),
+        slices.h.clone().expect("score-warp block"),
         slices.w.clone().expect("link-deviation block"),
     ];
 
@@ -6616,7 +6616,7 @@ fn flexible_evaluate_block_diagonals_match_joint_exact_oracle() {
         (eval.log_likelihood
             - family
                 .log_likelihood_only(&block_states)
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "log likelihood only"))
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "log likelihood only", e)))
         .abs()
             < 2e-12
     );
@@ -7649,7 +7649,7 @@ fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
         terms
             .hessian_psi_operator
             .as_ref()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "sigma Hessian operator", e))
+            .expect("sigma Hessian operator")
             .to_dense()
             .dim(),
         (2, 2)

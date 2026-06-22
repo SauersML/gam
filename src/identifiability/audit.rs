@@ -3111,7 +3111,7 @@ fn dominant_block_for_direction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    
     use ndarray::Array2;
     use linspace as linspace_minus_one_to_one;
 
