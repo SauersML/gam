@@ -137,7 +137,13 @@ impl SurvivalMarginalSlopeFamily {
                         let cu = fx.coeff_u[u].map(|value| -value);
                         f_au[u] += super::first_full::moving_density_boundary_flux_a(entry, &cu, b)
                             + super::first_full::moving_density_boundary_flux(
-                                u, primary, &au, entry, &da, b,
+                                u,
+                                primary,
+                                &au,
+                                entry,
+                                &da,
+                                b,
+                                super::first_full::FluxVelocity::PartialIft,
                             );
                     }
                     for u in 0..p {
@@ -145,11 +151,23 @@ impl SurvivalMarginalSlopeFamily {
                         for v in u..p {
                             let cv = fx.coeff_u[v].map(|value| -value);
                             let mut boundary = super::first_full::moving_density_boundary_flux(
-                                v, primary, &au, entry, &cu, b,
+                                v,
+                                primary,
+                                &au,
+                                entry,
+                                &cu,
+                                b,
+                                super::first_full::FluxVelocity::PartialIft,
                             );
                             if u != v {
                                 boundary += super::first_full::moving_density_boundary_flux(
-                                    u, primary, &au, entry, &cv, b,
+                                    u,
+                                    primary,
+                                    &au,
+                                    entry,
+                                    &cv,
+                                    b,
+                                    super::first_full::FluxVelocity::PartialIft,
                                 );
                             }
                             f_uv[[u, v]] += boundary;

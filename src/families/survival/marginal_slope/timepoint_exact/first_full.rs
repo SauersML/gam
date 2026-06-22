@@ -7,6 +7,28 @@
 
 use super::*;
 
+/// Which crossing velocity the moving-boundary flux uses.
+///
+/// The link crossing `z = (τ − a)/b` moves with `θ` both directly (through
+/// `b = g`) and through the intercept response `a(θ)` at velocity `a_u`. Two
+/// distinct quantities need this flux with two distinct velocities:
+///
+/// * [`FluxVelocity::Total`] — `∂z/∂θ_axis = −(a_u[axis] + direct_g)/b`, the
+///   genuine TOTAL z-motion, used by the first-derivative `d_u` (which also
+///   carries the `chi·a_u` intercept chain in its interior, so it is a
+///   consistent total derivative and is FD-verified correct).
+/// * [`FluxVelocity::PartialIft`] — `∂z/∂θ_axis|_a = −direct_g/b`, the PARTIAL
+///   z-motion at fixed intercept, used by the IFT partials `f_uv`/`f_au`
+///   (whose interiors use partial cell coefficients, a held fixed). The
+///   intercept-chain contribution to `a_uv` is supplied separately by the
+///   explicit `f_au·a_u + f_aa·a_u²` terms in the IFT recovery; feeding the
+///   total velocity here double-counts the intercept motion (gam#1454).
+#[derive(Clone, Copy)]
+pub(super) enum FluxVelocity {
+    Total,
+    PartialIft,
+}
+
 pub(super) fn moving_density_boundary_flux(
     axis: usize,
     primary: &FlexPrimarySlices,
@@ -14,6 +36,7 @@ pub(super) fn moving_density_boundary_flux(
     entry: &CachedCellEntry,
     poly: &[f64],
     b: f64,
+    velocity: FluxVelocity,
 ) -> f64 {
     if b == 0.0 {
         return 0.0;
@@ -23,7 +46,10 @@ pub(super) fn moving_density_boundary_flux(
         match edge {
             crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
                 let direct_g = if axis == primary.g { z } else { 0.0 };
-                -(a_u[axis] + direct_g) / b
+                match velocity {
+                    FluxVelocity::Total => -(a_u[axis] + direct_g) / b,
+                    FluxVelocity::PartialIft => -direct_g / b,
+                }
             }
             crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
         }
@@ -187,7 +213,15 @@ impl SurvivalMarginalSlopeFamily {
                             &integrand,
                             &state.moments,
                             "survival D_t first derivative",
-                        )? + moving_density_boundary_flux(u, primary, &a_u, entry, &chi_poly, b);
+                        )? + moving_density_boundary_flux(
+                            u,
+                            primary,
+                            &a_u,
+                            entry,
+                            &chi_poly,
+                            b,
+                            FluxVelocity::Total,
+                        );
                 }
                 Ok(d_u)
             })
@@ -452,7 +486,15 @@ impl SurvivalMarginalSlopeFamily {
                             &integrand,
                             &state.moments,
                             "survival D_t first derivative",
-                        )? + moving_density_boundary_flux(u, primary, &a_u, entry, &chi_poly, b);
+                        )? + moving_density_boundary_flux(
+                            u,
+                            primary,
+                            &a_u,
+                            entry,
+                            &chi_poly,
+                            b,
+                            FluxVelocity::Total,
+                        );
                 }
                 Ok(d_u)
             })
@@ -472,6 +514,14 @@ impl SurvivalMarginalSlopeFamily {
                 // Crossing-edge velocities z_u = −(a_u[u] + δ_{u,g}·z)/b (§C),
                 // the same edge kinematics `moving_density_boundary_flux` uses
                 // internally; recomputed here so the self-flux can reuse them.
+                // IFT-PARTIAL θ-axis crossing velocity `∂z/∂θ_axis|_a = −direct_g/b`
+                // (a held fixed) for the base intercept-Hessian partials f_uv/f_au
+                // and their self-flux. The intercept-chain z-motion is carried
+                // separately by the explicit f_au·a_u + f_aa·a_u² terms in the
+                // a_uv recovery, so it must NOT appear in the partial boundary
+                // flux/self-flux (feeding the total velocity double-counts it —
+                // gam#1454). `a_edge_vel` (z_a = −1/b) is the genuine a-motion
+                // and is unchanged. Mirrors directional.rs's base `edge_vel`.
                 let edge_vel = |axis: usize,
                                 edge: crate::families::cubic_cell_kernel::PartitionEdge,
                                 z: f64|
@@ -479,7 +529,7 @@ impl SurvivalMarginalSlopeFamily {
                     match edge {
                         crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
                             let direct_g = if axis == primary.g { z } else { 0.0 };
-                            -(a_u[axis] + direct_g) / b
+                            -direct_g / b
                         }
                         crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
                     }
@@ -536,8 +586,15 @@ impl SurvivalMarginalSlopeFamily {
                     let zu_r = edge_vel(u, part.right_edge, cell.right);
                     let zu_l = edge_vel(u, part.left_edge, cell.left);
                     for v in u..p {
-                        let boundary =
-                            moving_density_boundary_flux(v, primary, &a_u, entry, &neg_coeff_u, b);
+                        let boundary = moving_density_boundary_flux(
+                            v,
+                            primary,
+                            &a_u,
+                            entry,
+                            &neg_coeff_u,
+                            b,
+                            FluxVelocity::PartialIft,
+                        );
                         let boundary = if u == v {
                             boundary
                         } else {
@@ -550,6 +607,7 @@ impl SurvivalMarginalSlopeFamily {
                                     entry,
                                     &neg_coeff_v,
                                     b,
+                                    FluxVelocity::PartialIft,
                                 )
                         };
                         // `G_z·z_u·z_v` is a single symmetric term, added once
@@ -583,7 +641,15 @@ impl SurvivalMarginalSlopeFamily {
                     let zu_r = edge_vel(u, part.right_edge, cell.right);
                     let zu_l = edge_vel(u, part.left_edge, cell.left);
                     f_au[u] += moving_density_boundary_flux_a(entry, &neg_coeff_u, b)
-                        + moving_density_boundary_flux(u, primary, &a_u, entry, &neg_dc_da, b)
+                        + moving_density_boundary_flux(
+                            u,
+                            primary,
+                            &a_u,
+                            entry,
+                            &neg_dc_da,
+                            b,
+                            FluxVelocity::PartialIft,
+                        )
                         + self_flux_xy(za_r, zu_r, za_l, zu_l);
                 }
             }
@@ -798,6 +864,7 @@ impl SurvivalMarginalSlopeFamily {
                                     entry,
                                     &d_u_integrand_poly[u],
                                     b,
+                                    FluxVelocity::Total,
                                 );
                                 if u == v {
                                     uv
@@ -809,6 +876,7 @@ impl SurvivalMarginalSlopeFamily {
                                         entry,
                                         &d_u_integrand_poly[v],
                                         b,
+                                        FluxVelocity::Total,
                                     )
                                 }
                             } else {

@@ -362,6 +362,13 @@ impl SurvivalMarginalSlopeFamily {
                 let cell = cell_entry.neg_cell;
                 let fixed = &cell_entry.fixed;
                 let part = &cell_entry.partition_cell;
+                // IFT-PARTIAL θ-axis crossing velocity `∂z/∂θ_axis|_a = −direct_g/b`
+                // (a held fixed) for the base intercept-Hessian partials f_uv/f_au
+                // and their D_dir. The intercept-chain z-motion is carried
+                // separately by the explicit f_au·a_u + f_aa·a_u² terms in the
+                // a_uv recovery below, so it must NOT appear in the partial
+                // boundary flux (feeding the total velocity double-counts it —
+                // gam#1454). The d_uv_dir block keeps its own TOTAL `edge_vel`.
                 let edge_vel = |axis: usize,
                                 edge: crate::families::cubic_cell_kernel::PartitionEdge,
                                 z: f64|
@@ -369,7 +376,7 @@ impl SurvivalMarginalSlopeFamily {
                     match edge {
                         crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
                             let direct_g = if axis == primary.g { z } else { 0.0 };
-                            -(a_u[axis] + direct_g) / b
+                            -direct_g / b
                         }
                         crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
                     }
@@ -610,6 +617,13 @@ impl SurvivalMarginalSlopeFamily {
                     };
                     right - left
                 };
+                // IFT-PARTIAL θ-axis kinematics for the f_uv/f_au boundary D_dir:
+                // `z_axis = ∂z/∂θ_axis|_a = −z·axis_g/b` (drop the a_u[axis]
+                // intercept-chain term, matching the partial `edge_vel` above),
+                // and `z_axis_dir = D_dir(z_axis) = −(z_dir·axis_g + z_axis·dir_g)/b`
+                // (the dropped a_u[axis] also drops a_u_dir[axis] under D_dir).
+                // `z_dir` is the contraction direction's TOTAL z-motion (it carries
+                // the genuine a_dir intercept response) and is unchanged (gam#1454).
                 let edge_axis = |axis: usize,
                                  edge: crate::families::cubic_cell_kernel::PartitionEdge,
                                  z: f64|
@@ -618,8 +632,8 @@ impl SurvivalMarginalSlopeFamily {
                         crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
                             let z_dir = -(a_dir + z * dir_g) / b;
                             let axis_g = if axis == primary.g { 1.0 } else { 0.0 };
-                            let z_axis = -(a_u[axis] + z * axis_g) / b;
-                            let z_axis_dir = -(a_u_dir[axis] + z_dir * axis_g + z_axis * dir_g) / b;
+                            let z_axis = -(z * axis_g) / b;
+                            let z_axis_dir = -(z_dir * axis_g + z_axis * dir_g) / b;
                             (z_axis, z_axis_dir, z_dir)
                         }
                         crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
