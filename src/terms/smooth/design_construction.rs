@@ -630,7 +630,23 @@ fn apply_global_smooth_identifiability(
         let replay_z = frozen_global_orthogonality(termspec);
         let skip_global_transform = replay_z.is_none()
             && (smooth_has_frozen_identifiability(termspec) || term.lower_bounds_local.is_some());
-        let owner_indices = if replay_z.is_some() || skip_global_transform {
+        // A marginally-centered tensor interaction (`ti(...)`, MarginalSumToZero)
+        // has ALREADY removed each axis's main effect analytically, in
+        // coefficient space, via its per-margin sum-to-zero reparameterization
+        // (B_xZ_x)⊗(B_zZ_z) — exactly mgcv's `ti` construction. Residualizing it
+        // a SECOND time against the explicit s(x)/s(z) smooths' realized B-spline
+        // column spans is redundant on an exact tensor grid (a no-op there) and
+        // actively HARMFUL off-grid: the realized interaction columns share a
+        // grid-dependent, jitter-sized projection with the main-effect bases, so
+        // the second projection eats genuine pure-interaction curvature the main
+        // effects cannot represent. REML then rails the s(x)/s(z) smoothing
+        // parameters and the surface under-recovers (~40x, #1470). The analytic
+        // marginal centering is the correct and complete main-effect removal, so
+        // such a term takes NO owner block.
+        let owner_indices = if replay_z.is_some()
+            || skip_global_transform
+            || termspec.basis.is_marginally_centered_tensor()
+        {
             Vec::new()
         } else {
             // Relative cross-residual above which a dependent smooth's design is

@@ -2022,6 +2022,127 @@ impl SingleBlockLatentCoordDesignCache {
     }
 }
 
+/// #1464: the fixed-κ profiled-REML score `V_p(κ)` for a single constant-curvature
+/// term — pin κ on the term, fit with κ-optimisation DISABLED so only the
+/// smoothing parameters ρ are profiled, and return the resulting REML/LAML
+/// negative-log-evidence (the value the outer loop minimises). This is exactly
+/// the criterion the `curvature_inference_forspec` CI oracle evaluates; factoring
+/// it here lets the production joint-fit path reuse the SAME sign-correct profiled
+/// criterion to pick the κ-sign basin before the joint [ρ, ψ] solve, instead of
+/// letting the joint optimiser descend from a single κ seed into the spurious +κ
+/// collapsed-kernel corner (the headline #1464 sign-blindness).
+fn fixed_kappa_profiled_reml_score(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    term_idx: usize,
+    kappa: f64,
+    family: LikelihoodSpec,
+    options: &FitOptions,
+) -> Result<f64, EstimationError> {
+    if !kappa.is_finite() {
+        crate::bail_invalid_estim!("fixed-κ profiled score probed a non-finite κ = {kappa}");
+    }
+    let mut probe_spec = resolvedspec.clone();
+    match probe_spec.smooth_terms.get_mut(term_idx).map(|t| &mut t.basis) {
+        Some(SmoothBasisSpec::ConstantCurvature { spec, .. }) => spec.kappa = kappa,
+        _ => {
+            crate::bail_invalid_estim!(
+                "fixed-κ profiled score: term {term_idx} is not a constant-curvature smooth"
+            )
+        }
+    }
+    // κ-optimisation OFF routes straight to a fixed-κ profiled-ρ fit, identical to
+    // the `curvature_inference_forspec` V_p oracle.
+    let fixed_kappa_options = SpatialLengthScaleOptimizationOptions {
+        enabled: false,
+        ..SpatialLengthScaleOptimizationOptions::default()
+    };
+    let fit = fit_term_collectionwith_spatial_length_scale_optimization(
+        data,
+        y.to_owned(),
+        weights.to_owned(),
+        offset.to_owned(),
+        &probe_spec,
+        family,
+        options,
+        &fixed_kappa_options,
+    )?;
+    let score = fit_score(&fit.fit);
+    if !score.is_finite() {
+        crate::bail_invalid_estim!("fixed-κ profiled fit at κ={kappa} returned a non-finite score");
+    }
+    Ok(score)
+}
+
+/// #1464: choose the κ-sign basin for the joint spatial fit by scanning the
+/// sign-correct fixed-κ profiled-REML criterion `V_p(κ)` over a small symmetric
+/// grid spanning both chart signs, and return the argmin κ. The joint [ρ, ψ]
+/// optimiser is then seeded at this κ so it polishes inside the correct basin
+/// rather than descending from a single (near-zero) κ seed into the spurious +κ
+/// collapsed-kernel corner. Returns `None` when the term carries no usable κ
+/// window or every probe fit fails (caller falls back to the spec's κ seed).
+fn select_constant_curvature_kappa_sign_seed(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    term_idx: usize,
+    family: LikelihoodSpec,
+    options: &FitOptions,
+) -> Option<f64> {
+    let (kappa_min, kappa_max) = constant_curvature_kappa_bounds(data, resolvedspec, term_idx);
+    if !(kappa_min.is_finite() && kappa_max.is_finite() && kappa_max > kappa_min) {
+        return None;
+    }
+    // Five probes spanning both signs: the two interior corners (half the chart
+    // bound on each side, away from the saturating boundary), flat (κ = 0), and
+    // the chart bounds. κ-sign is PINNED during each ρ-profile, so the collapsing
+    // +κ kernel cannot pull a hyperbolic basin across zero.
+    let probes = [
+        kappa_min,
+        0.5 * kappa_min,
+        0.0,
+        0.5 * kappa_max,
+        kappa_max,
+    ];
+    let mut best: Option<(f64, f64)> = None; // (score, kappa)
+    for &kappa in &probes {
+        match fixed_kappa_profiled_reml_score(
+            data,
+            y,
+            weights,
+            offset,
+            resolvedspec,
+            term_idx,
+            kappa,
+            family.clone(),
+            options,
+        ) {
+            Ok(score) => {
+                if best.as_ref().map_or(true, |(b, _)| score < *b) {
+                    best = Some((score, kappa));
+                }
+            }
+            Err(e) => {
+                log::info!(
+                    "[spatial-kappa] #1464 sign-basin probe at κ={kappa:.4} failed ({e}); skipping"
+                );
+            }
+        }
+    }
+    best.map(|(score, kappa)| {
+        log::info!(
+            "[spatial-kappa] #1464 fixed-κ sign-basin scan selected κ_seed={kappa:.4} \
+             (profiled REML={score:.6e}) for term {term_idx}"
+        );
+        kappa
+    })
+}
+
 fn try_exact_joint_spatial_length_scale_optimization(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -2088,7 +2209,36 @@ fn try_exact_joint_spatial_length_scale_optimization(
     };
     // If the user/spec did not set a length_scale, re-seed ψ at the midpoint
     // of the data-derived window instead of the arbitrary options fallback.
-    let log_kappa0 = log_kappa0.reseed_from_data(data, resolvedspec, spatial_terms, kappa_options);
+    let mut log_kappa0 =
+        log_kappa0.reseed_from_data(data, resolvedspec, spatial_terms, kappa_options);
+    // #1464: for each constant-curvature term, pick the κ-sign basin from the
+    // sign-correct fixed-κ profiled-REML criterion (κ-sign PINNED during each
+    // ρ-profile) and seed the joint solver THERE, instead of letting the joint
+    // [ρ, ψ] optimiser descend from a single near-zero κ seed into the spurious
+    // +κ collapsed-kernel corner that rails κ̂ to the +chart bound regardless of
+    // the true sign. CC-gated: non-CC spatial/Matérn/Duchon/sphere joint fits
+    // never enter this loop, so their seed is byte-identical to before. The κ-opt
+    // OFF profiled fits are the SAME criterion `curvature_inference_forspec`
+    // already trusts for the CI, so this reuses a verified sign-correct oracle.
+    if has_constant_curvature_term {
+        for (slot, &term_idx) in spatial_terms.iter().enumerate() {
+            if constant_curvature_term_spec(resolvedspec, term_idx).is_none() {
+                continue;
+            }
+            if let Some(kappa_seed) = select_constant_curvature_kappa_sign_seed(
+                data,
+                y,
+                weights,
+                offset,
+                resolvedspec,
+                term_idx,
+                family.clone(),
+                options,
+            ) {
+                log_kappa0.set_scalar_slot(slot, kappa_seed);
+            }
+        }
+    }
     let log_kappa_lower = if use_aniso {
         SpatialLogKappaCoords::lower_bounds_aniso_from_data(
             data,

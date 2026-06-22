@@ -73,17 +73,27 @@ fn fit_predict_ps_dp(x: &[f64], y: &[f64], grid: &[f64], double_penalty: bool) -
     let dp = if double_penalty { "true" } else { "false" };
     let formula = format!("y ~ s(x, bs=\"ps\", k=10, double_penalty={dp})");
     let result = fit_from_formula(&formula, &data, &cfg).expect("ps fit");
-    let FitResult::Standard(fit) = result else {
-        panic!("expected standard fit for {formula}");
-    };
-
-    let mut grid_design = Array2::<f64>::zeros((grid.len(), data.headers.len()));
-    for (row, &g) in grid.iter().enumerate() {
-        grid_design[[row, x_idx]] = g;
+    match result {
+        // Single-penalty 1-D cubic Gaussian p-splines route through the exact
+        // O(n) spline-scan fast path (#1030), which returns its posterior
+        // directly (mean, variance) rather than a dense design + beta. Predict
+        // the posterior mean via the scan. (double_penalty=true is excluded from
+        // the scan and returns Standard — handled below.)
+        FitResult::SplineScan(scan) => grid
+            .iter()
+            .map(|&g| scan.predict(g).expect("scan predict at grid").0)
+            .collect(),
+        FitResult::Standard(fit) => {
+            let mut grid_design = Array2::<f64>::zeros((grid.len(), data.headers.len()));
+            for (row, &g) in grid.iter().enumerate() {
+                grid_design[[row, x_idx]] = g;
+            }
+            let dm = build_term_collection_design(grid_design.view(), &fit.resolvedspec)
+                .expect("rebuild design at grid");
+            dm.design.apply(&fit.fit.beta).to_vec()
+        }
+        _ => panic!("unexpected fit variant for {formula} (expected Standard or SplineScan)"),
     }
-    let dm = build_term_collection_design(grid_design.view(), &fit.resolvedspec)
-        .expect("rebuild design at grid");
-    dm.design.apply(&fit.fit.beta).to_vec()
 }
 
 /// Convenience: the single-penalty PS fit (mgcv `bs="ps"` convention).

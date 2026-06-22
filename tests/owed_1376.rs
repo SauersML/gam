@@ -308,3 +308,203 @@ fn aniso_matern_full_outer_loop_recovers_planted_signal_r2() {
         );
     }
 }
+
+/// One full anisotropic-Matérn outer-loop fit on the noise-free `sin(2·x1)`
+/// signal, parameterized by `double_penalty` and the center budget. Returns the
+/// realized recovery diagnostics: R², the residual / total sums of squares, the
+/// per-axis landed eta (centered contrasts), the landed global length scale ℓ,
+/// and the fitted-vs-true amplitude ratio (peak |fit| / peak |truth|) — the
+/// quantity a nullspace-ridge over-shrinkage would depress below 1.
+struct AnisoRecoveryReport {
+    double_penalty: bool,
+    num_centers: usize,
+    r2: f64,
+    ss_res: f64,
+    ss_tot: f64,
+    eta: Vec<f64>,
+    length_scale: f64,
+    amplitude_ratio: f64,
+}
+
+fn fit_aniso_recovery(double_penalty: bool, num_centers: usize) -> AnisoRecoveryReport {
+    let n = 180;
+    let (x, y) = simulate_aniso_signal(n);
+    let y_true = y.clone();
+
+    let spec = TermCollectionSpec {
+        linear_terms: vec![],
+        random_effect_terms: vec![],
+        smooth_terms: vec![SmoothTermSpec {
+            name: "matern_2d_aniso".to_string(),
+            basis: SmoothBasisSpec::Matern {
+                feature_cols: vec![0, 1],
+                spec: MaternBasisSpec {
+                    center_strategy: CenterStrategy::FarthestPoint { num_centers },
+                    periodic: None,
+                    length_scale: 1.0,
+                    nu: MaternNu::FiveHalves,
+                    include_intercept: false,
+                    double_penalty,
+                    identifiability: MaternIdentifiability::CenterSumToZero,
+                    aniso_log_scales: Some(vec![0.0, 0.0]),
+                    nullspace_shrinkage_survived: None,
+                },
+                input_scales: None,
+            },
+            shape: ShapeConstraint::None,
+            joint_null_rotation: None,
+        }],
+    };
+
+    let result = gam::fit_model(FitRequest::Standard(StandardFitRequest {
+        data: x,
+        y,
+        weights: Array1::ones(n),
+        offset: Array1::zeros(n),
+        spec,
+        family: LikelihoodSpec::new(
+            ResponseFamily::Gaussian,
+            InverseLink::Standard(StandardLink::Identity),
+        ),
+        options: FitOptions {
+            latent_cloglog: None,
+            mixture_link: None,
+            optimize_mixture: false,
+            sas_link: None,
+            optimize_sas: false,
+            compute_inference: false,
+            skip_rho_posterior_inference: false,
+            max_iter: 30,
+            tol: 1e-6,
+            nullspace_dims: vec![],
+            linear_constraints: None,
+            firth_bias_reduction: false,
+            adaptive_regularization: None,
+            penalty_shrinkage_floor: None,
+            rho_prior: Default::default(),
+            kronecker_penalty_system: None,
+            kronecker_factored: None,
+            persist_warm_start_disk: false,
+        },
+        kappa_options: SpatialLengthScaleOptimizationOptions {
+            enabled: true,
+            max_outer_iter: 30,
+            rel_tol: 1e-5,
+            log_step: std::f64::consts::LN_2,
+            min_length_scale: 1e-2,
+            max_length_scale: 1e2,
+            pilot_subsample_threshold: 0,
+        },
+        wiggle: None,
+        coefficient_groups: Vec::new(),
+        penalty_block_gamma_priors: Vec::new(),
+        latent_coord: None,
+        _marker: std::marker::PhantomData,
+    }))
+    .expect("anisotropic Matérn ablation fit should converge");
+
+    let fitted = match result {
+        FitResult::Standard(s) => s,
+        _ => panic!("expected Standard fit result"),
+    };
+
+    let pred = fitted.design.design.to_dense().dot(&fitted.fit.beta);
+    let y_mean = y_true.mean().unwrap_or(0.0);
+    let ss_res: f64 = (&pred - &y_true).mapv(|v| v * v).sum();
+    let ss_tot: f64 = y_true.iter().map(|&v| (v - y_mean) * (v - y_mean)).sum();
+    let r2 = 1.0 - ss_res / ss_tot;
+
+    let peak_fit = pred.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+    let peak_true = y_true.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+    let amplitude_ratio = if peak_true > 0.0 {
+        peak_fit / peak_true
+    } else {
+        f64::NAN
+    };
+
+    let resolved = &fitted.resolvedspec.smooth_terms[0];
+    let (eta, length_scale) = match &resolved.basis {
+        SmoothBasisSpec::Matern { spec, .. } => (
+            spec.aniso_log_scales.clone().unwrap_or_default(),
+            spec.length_scale,
+        ),
+        _ => (Vec::new(), f64::NAN),
+    };
+
+    AnisoRecoveryReport {
+        double_penalty,
+        num_centers,
+        r2,
+        ss_res,
+        ss_tot,
+        eta,
+        length_scale,
+        amplitude_ratio,
+    }
+}
+
+/// INSTRUMENTED ABLATION (#1376 truth-finding — NOT a merge gate): measure the
+/// TRUE achievable recovery of a correct anisotropic-Matérn fit on the noise-free
+/// `sin(2·x1)` signal across `double_penalty ∈ {true, false}` and center budgets
+/// {30, 60, 120}. The κ-direction sub-test already certifies the gradient is
+/// correct; this probe isolates whether the R²=0.807 seen under
+/// `double_penalty=true, 30 centers` is (a) a structural ceiling of that config
+/// (nullspace-ridge amplitude shrinkage and/or Nyquist-marginal x1 resolution) or
+/// (b) a genuinely-wrong κ̂ landing. It PRINTS κ̂/eta/ℓ/R²/amplitude for every
+/// config and asserts ONLY finiteness + the already-certified eta direction, so
+/// it never masks the real numbers behind a pass/fail bar.
+///
+/// Run with `--nocapture` to see the table:
+///   cargo test -p gam --test owed_1376 aniso_matern_recovery_ablation -- --nocapture
+#[test]
+fn aniso_matern_recovery_ablation_measures_true_ceiling() {
+    let configs = [
+        (true, 30usize),  // the failing merge-gate config
+        (false, 30usize), // same budget, single (bending) penalty only
+        (true, 60usize),  // more capacity, double penalty
+        (false, 60usize), // more capacity, single penalty
+        (false, 120usize), // ample capacity, single penalty
+    ];
+
+    println!(
+        "\n#1376 aniso-Matérn recovery ablation (noise-free y=sin(2·x1), n=180, ν=5/2):"
+    );
+    println!(
+        "  {:>6} {:>8} {:>8} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9}",
+        "dpen", "centers", "R2", "ss_res", "ss_tot", "eta0", "eta1", "ell", "amp_ratio"
+    );
+
+    for (double_penalty, num_centers) in configs {
+        let rep = fit_aniso_recovery(double_penalty, num_centers);
+        let eta0 = rep.eta.first().copied().unwrap_or(f64::NAN);
+        let eta1 = rep.eta.get(1).copied().unwrap_or(f64::NAN);
+        println!(
+            "  {:>6} {:>8} {:>8.4} {:>10.4e} {:>10.4e} {:>9.4} {:>9.4} {:>9.4} {:>9.4}",
+            rep.double_penalty,
+            rep.num_centers,
+            rep.r2,
+            rep.ss_res,
+            rep.ss_tot,
+            eta0,
+            eta1,
+            rep.length_scale,
+            rep.amplitude_ratio,
+        );
+
+        assert!(rep.r2.is_finite(), "R² must be finite");
+        assert!(rep.ss_res.is_finite() && rep.ss_tot > 0.0, "SS must be finite/positive");
+        assert!(
+            rep.eta.len() == 2 && rep.eta.iter().all(|v| v.is_finite()),
+            "two finite eta contrasts expected"
+        );
+        // The corrected κ-gradient must still point the signal axis tighter than
+        // the nuisance axis in EVERY config — config-robust anti-regression for
+        // the #1376 direction fix (independent of the amplitude/R² question).
+        assert!(
+            eta0 > eta1,
+            "signal-axis eta ({eta0:.4}) must exceed nuisance-axis eta ({eta1:.4}) \
+             for double_penalty={double_penalty}, centers={num_centers}"
+        );
+    }
+    println!();
+}

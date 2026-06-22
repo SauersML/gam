@@ -548,6 +548,22 @@ impl SmoothBasisSpec {
         }
     }
 
+    /// True for a tensor-product smooth that is only *marginally* centered
+    /// (`ti(...)`, [`TensorBSplineIdentifiability::MarginalSumToZero`]): its
+    /// per-margin sum-to-zero reparameterization `(B_xZ_x)⊗(B_zZ_z)` has ALREADY
+    /// removed each axis's main effect analytically (mgcv-identical), so its
+    /// main-effect removal is complete and it must take NO additional
+    /// owner-residualization block. Residualizing it a second time against the
+    /// realized main-effect designs is a grid-fragile no-op on an exact tensor
+    /// grid but eats genuine pure-interaction curvature off-grid (#1470).
+    pub fn is_marginally_centered_tensor(&self) -> bool {
+        matches!(
+            self,
+            Self::TensorBSpline { spec, .. }
+                if matches!(spec.identifiability, TensorBSplineIdentifiability::MarginalSumToZero)
+        )
+    }
+
     /// Feature columns this basis consumes, used alongside [`structural_kind`]
     /// to disambiguate two same-kind smooths on different axes. Wrapper
     /// variants delegate to their inner basis.
@@ -2911,6 +2927,20 @@ impl SpatialLogKappaCoords {
 
     pub(crate) fn as_array(&self) -> &Array1<f64> {
         &self.values
+    }
+
+    /// #1464: overwrite the single ψ value of a scalar (1-D) logical term by its
+    /// position `slot` in this coords vector (the same ordering as the
+    /// `term_indices` slice the constructors were built from). Used to inject the
+    /// fixed-κ sign-basin seed into a constant-curvature term's raw-κ slot before
+    /// the joint solve. No-op (returns `false`) when the slot is not scalar.
+    pub(crate) fn set_scalar_slot(&mut self, slot: usize, value: f64) -> bool {
+        if slot >= self.dims_per_term.len() || self.dims_per_term[slot] != 1 {
+            return false;
+        }
+        let offset = self.term_offset(slot);
+        self.values[offset] = value;
+        true
     }
 
     /// Split at a logical-term boundary. `mid` is the number of terms in the
