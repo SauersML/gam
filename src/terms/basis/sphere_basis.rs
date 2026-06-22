@@ -110,7 +110,27 @@ pub fn build_spherical_spline_basis(
         op: None,
     }];
     if spec.double_penalty {
-        let null_shrinkage = build_wahba_decomposed_null_shrinkage(&decomposition);
+        // The Marra & Wood double-penalty ridge must shrink the NULL SPACE of the
+        // primary RKHS penalty — the unpenalized low-degree spherical-harmonic
+        // block. `build_wahba_decomposed_null_shrinkage` instead put an identity
+        // on the KERNEL block (`[0..kernel_cols]`) whenever `low_degree_cols > 0`,
+        // i.e. it shrank the directions the primary ALREADY penalizes and left the
+        // genuinely-unpenalized low-degree harmonics free — the wrong subspace (a
+        // standalone numeric check gives ‖ridge·primary‖/(‖ridge‖‖primary‖) ≈ 0.41
+        // instead of 0). Build the ridge from the actual null space of the primary
+        // (`raw_penalty`, whose kernel block is full-rank after the diagonal
+        // stabilizer above and whose low-degree block is identically zero, so its
+        // null space is exactly the low-degree block), matching the corrected
+        // thin-plate / Matérn / 1-D B-spline pattern. The local `gauge` is the
+        // identity for the fresh-fit `CenterSumToZero` chart (and the frozen
+        // transform otherwise), so restricting `Z_null Z_nullᵀ` here keeps the
+        // ridge co-located with the constrained primary; the global
+        // orthogonalization in `design_construction` rebuilds it again from the
+        // globally-constrained primary, so this is correct whether or not an outer
+        // parametric block is residualized out.
+        let null_shrinkage = build_nullspace_shrinkage_penalty(&raw_penalty)?
+            .map(|block| block.sym_penalty)
+            .unwrap_or_else(|| Array2::<f64>::zeros((raw_width, raw_width)));
         let ridge = gauge.restrict_penalty(&null_shrinkage);
         let (ridge_norm, c_ridge) = normalize_penalty(&ridge);
         candidates.push(PenaltyCandidate {
@@ -432,23 +452,6 @@ fn build_wahba_decomposed_penalty(
     out.slice_mut(s![0..kernel_penalty.nrows(), 0..kernel_penalty.ncols()])
         .assign(&kernel_penalty);
     (&out + &out.t()) * 0.5
-}
-
-fn build_wahba_decomposed_null_shrinkage(
-    decomposition: &WahbaLowDegreeDecomposition,
-) -> Array2<f64> {
-    let p = decomposition.kernel_basis.ncols() + decomposition.low_degree_cols;
-    let mut out = Array2::<f64>::zeros((p, p));
-    if decomposition.low_degree_cols == 0 {
-        for i in 0..p {
-            out[[i, i]] = 1.0;
-        }
-    } else {
-        for i in 0..decomposition.kernel_basis.ncols() {
-            out[[i, i]] = 1.0;
-        }
-    }
-    out
 }
 
 fn solve_spd_columns_ridged(
