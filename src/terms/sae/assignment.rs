@@ -236,6 +236,20 @@ pub struct SaeAssignment {
     pub logits: Array2<f64>,
     pub coords: Vec<LatentCoordValues>,
     pub mode: AssignmentMode,
+    /// #1026 — per-atom UNGATED flag (length `K`, default all-`false`). An
+    /// ungated atom is the dense linear/background tier: its per-row gate is
+    /// fixed at `a_k ≡ 1` (it contributes `γ_k(t_k)` to EVERY row, unweighted),
+    /// it is excluded from the other atoms' gate (for the column-separable
+    /// IBP / JumpReLU modes the remaining atoms are computed independently, so
+    /// they are unaffected), and its logit is NOT a free parameter — its
+    /// logit-JVP, sparsity-prior gradient/curvature, and softmax majorizer
+    /// contributions are all zero, leaving its logit slot an inert
+    /// (ridge-regularized) null direction in the per-row Newton block. This lets
+    /// the linear tier carry FULL-RANK reconstructible variance
+    /// (`fitted = γ_ungated(x) + Σ_{gated} a_k·γ_k(x)`) so a linear SAE can reach
+    /// the rank-(K·d) PCA ceiling, while the gated curved atoms still add sparse
+    /// structure on the residual (#1026 routing-bound finding).
+    pub ungated: Vec<bool>,
 }
 
 impl SaeAssignment {
@@ -281,7 +295,49 @@ impl SaeAssignment {
             logits,
             coords,
             mode,
+            ungated: vec![false; k],
         })
+    }
+
+    /// #1026 — designate which atoms are UNGATED (the dense linear/background
+    /// tier; see [`SaeAssignment::ungated`]). `flags` must have length `K`.
+    ///
+    /// Ungating is defined for the COLUMN-SEPARABLE gate modes (IBP-MAP and
+    /// JumpReLU): each atom's gate is an independent per-atom function of its own
+    /// logit, so pinning one atom to `a_k ≡ 1` leaves every other atom's gate
+    /// exactly as computed. Softmax is a coupled simplex (`Σ_k a_k = 1` over all
+    /// `K`), so a unit gate for one atom is only well defined relative to a
+    /// gated-subset renormalization that must also be reflected in the logit-JVP
+    /// and the entropy majorizer; this constructor's contract is restricted to
+    /// the separable modes, and an ungated atom under Softmax is REJECTED here so
+    /// the inner solve never runs on a value/gradient-mismatched gate. Callers
+    /// wanting a dense background tier under Softmax route it as an IBP-MAP or
+    /// JumpReLU atom.
+    #[must_use = "build error must be handled"]
+    pub fn with_ungated(mut self, flags: Vec<bool>) -> Result<Self, String> {
+        if flags.len() != self.k_atoms() {
+            return Err(format!(
+                "SaeAssignment::with_ungated: flags length {} must equal K={}",
+                flags.len(),
+                self.k_atoms()
+            ));
+        }
+        if matches!(self.mode, AssignmentMode::Softmax { .. }) && flags.iter().any(|&u| u) {
+            return Err(
+                "SaeAssignment::with_ungated: an ungated atom under Softmax routing is \
+                 rejected — the coupled simplex requires a gated-subset renormalization \
+                 reflected in the logit-JVP and entropy majorizer, which this separable-mode \
+                 contract does not perform; route a dense background tier as IBP-MAP or JumpReLU"
+                    .to_string(),
+            );
+        }
+        self.ungated = flags;
+        Ok(self)
+    }
+
+    /// Whether any atom is ungated (the #1026 background tier is engaged).
+    pub fn has_ungated(&self) -> bool {
+        self.ungated.iter().any(|&u| u)
     }
 
     pub fn n_obs(&self) -> usize {
@@ -361,22 +417,37 @@ impl SaeAssignment {
         if self.k_atoms() == 1 && matches!(self.mode, AssignmentMode::Softmax { .. }) {
             return Ok(Array1::from_vec(vec![1.0]));
         }
-        match self.mode {
+        let mut row_gates = match self.mode {
             AssignmentMode::Softmax { temperature, .. } => {
-                Ok(softmax_row(self.logits.row(row), temperature))
+                softmax_row(self.logits.row(row), temperature)
             }
             AssignmentMode::IBPMap {
                 temperature, alpha, ..
-            } => Ok(ibp_map_row(
+            } => ibp_map_row(
                 self.logits.row(row),
                 temperature,
                 resolved_ibp_alpha.unwrap_or(alpha),
-            )),
+            ),
             AssignmentMode::JumpReLU {
                 temperature,
                 threshold,
-            } => Ok(jumprelu_row(self.logits.row(row), temperature, threshold)),
+            } => jumprelu_row(self.logits.row(row), temperature, threshold),
+        };
+        // #1026 — ungated (background-tier) atoms have a fixed unit gate. For the
+        // column-separable IBP / JumpReLU modes the other atoms' gates are
+        // computed independently above, so overwriting the ungated entries to 1.0
+        // leaves the gated atoms exactly as they were; the ungated atom then
+        // contributes `γ_k(t_k)` unweighted to every row. (Softmax + ungated is
+        // rejected at `with_ungated`, so no simplex renormalization is needed
+        // here.)
+        if self.has_ungated() {
+            for (k, gate) in row_gates.iter_mut().enumerate() {
+                if self.ungated[k] {
+                    *gate = 1.0;
+                }
+            }
         }
+        Ok(row_gates)
     }
 
     pub(crate) fn persist_resolved_ibp_alpha(&mut self, rho: &SaeManifoldRho) -> bool {
@@ -646,6 +717,10 @@ pub(crate) struct ActiveAtomLogitJvp<'a> {
     pub(crate) fitted: ArrayView1<'a, f64>,
     pub(crate) ibp_prior: Option<&'a [f64]>,
     pub(crate) compact_index: usize,
+    /// #1026 — when `true`, atom `k` is the ungated background tier: its gate is
+    /// the constant `1`, so its logit-JVP `da_k/dl_k` is identically zero (the
+    /// compact row is left untouched / zero).
+    pub(crate) ungated: bool,
 }
 
 /// Fill the single compact logit-JVP row for active atom `k`, using the
@@ -670,8 +745,14 @@ pub(crate) fn fill_active_atom_logit_jvp(
         fitted,
         ibp_prior,
         compact_index,
+        ungated,
     } = input;
     let p = fitted.len();
+    // #1026 — an ungated atom's gate is constant, so its logit-JVP is zero; leave
+    // its compact row untouched (the buffer row is pre-zeroed by the caller).
+    if ungated {
+        return;
+    }
     match mode {
         AssignmentMode::Softmax { temperature, .. } => {
             // da_k/dl_k contracted: a_k (decoded_k − fitted) / τ.
@@ -723,8 +804,13 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
     decoded: ArrayView2<'_, f64>,
     fitted: ArrayView1<'_, f64>,
     ibp_prior: Option<&[f64]>,
+    // #1026 — per-atom ungated flags (length `K`). An ungated atom's gate is
+    // constant, so its logit-JVP row is identically zero (skipped below). Empty
+    // ⇒ no atom is ungated (the historical path, bit-identical).
+    ungated: &[bool],
     local_jac: &mut Array2<f64>,
 ) {
+    let is_ungated = |k: usize| ungated.get(k).copied().unwrap_or(false);
     match mode {
         AssignmentMode::Softmax { temperature, .. } => {
             if assignments.len() == 1 {
@@ -736,6 +822,9 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
             // the final reference logit is fixed at zero and has no row.
             let inv_tau = 1.0 / temperature;
             for logit_col in 0..assignments.len() - 1 {
+                if is_ungated(logit_col) {
+                    continue;
+                }
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = assignments[logit_col]
                         * (decoded[[logit_col, out_col]] - fitted[out_col])
@@ -751,6 +840,9 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
             let prior = ibp_prior
                 .expect("fill_assignment_logit_jvp_rows: IBPMap requires precomputed prior");
             for logit_col in 0..assignments.len() {
+                if is_ungated(logit_col) {
+                    continue;
+                }
                 let pi_k = prior[logit_col];
                 let a_k = assignments[logit_col];
                 let sig = if pi_k > 0.0 { a_k / pi_k } else { 0.0 };
@@ -770,7 +862,7 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
             // support is a compact-layout/prior rule, not a data-fit STE.
             let inv_tau = 1.0 / temperature;
             for logit_col in 0..assignments.len() {
-                if logits[logit_col] <= threshold {
+                if is_ungated(logit_col) || logits[logit_col] <= threshold {
                     continue;
                 }
                 let activation = crate::linalg::utils::stable_logistic(
@@ -1084,6 +1176,21 @@ pub(crate) fn assignment_prior_grad_hdiag(
     };
     grad += &sparsity_grad;
     diag += &sparsity_diag;
+    // #1026 — an ungated (background-tier) atom's logit is not a free parameter,
+    // so it carries NO sparsity-prior gradient or curvature. Zero its flat
+    // columns (`flat_logits` is row-major `row*K + atom`) so the assembled `gt`
+    // and `htt` logit slots for ungated atoms stay zero — matching the zero
+    // logit-JVP. The column-separable IBP / JumpReLU priors are per-atom, so
+    // zeroing one atom's columns leaves the others' prior exactly intact.
+    if assignment.has_ungated() {
+        let k = assignment.k_atoms();
+        for idx in 0..grad.len() {
+            if assignment.ungated[idx % k] {
+                grad[idx] = 0.0;
+                diag[idx] = 0.0;
+            }
+        }
+    }
     Ok((grad, diag))
 }
 
@@ -1119,10 +1226,30 @@ pub(crate) fn ibp_assignment_third_channels(
         penalty.weight = rho.lambda_sparse();
         Array1::zeros(0)
     };
-    Ok(Some(penalty.hessian_diag_logit_third_channels(
-        target.view(),
-        rho_view.view(),
-    )))
+    let mut channels =
+        penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view());
+    // #1026 — zero the log-det third-derivative channels of ungated atoms so the
+    // #1006 θ-adjoint differentiates the SAME (ungated-zeroed) `htt` that
+    // `assignment_prior_grad_hdiag` assembled. `k_max` columns, row-major `N·K`
+    // for the per-(row,atom) arrays and length-`K` for the per-column ones.
+    if assignment.has_ungated() {
+        let k = channels.k_max;
+        for idx in 0..channels.z_jac.len() {
+            if assignment.ungated[idx % k] {
+                channels.z_jac[idx] = 0.0;
+                channels.local_logit_third[idx] = 0.0;
+                channels.m_channel[idx] = 0.0;
+                channels.logit_curvature[idx] = 0.0;
+            }
+        }
+        for atom in 0..k {
+            if assignment.ungated[atom] {
+                channels.cross_row_d[atom] = 0.0;
+                channels.cross_row_dd[atom] = 0.0;
+            }
+        }
+    }
+    Ok(Some(channels))
 }
 
 /// #1026 hybrid curved + linear-tail adjudication for one SAE atom slot.

@@ -4261,6 +4261,14 @@ impl SaeManifoldTerm {
                                     fitted: fitted.view(),
                                     ibp_prior: ibp_prior_slice,
                                     compact_index: j,
+                                    // #1026: ungated background-tier atoms have a
+                                    // constant gate ⇒ zero logit-JVP.
+                                    ungated: self
+                                        .assignment
+                                        .ungated
+                                        .get(k)
+                                        .copied()
+                                        .unwrap_or(false),
                                 },
                                 &mut jac_compact,
                             );
@@ -4297,6 +4305,8 @@ impl SaeManifoldTerm {
                             decoded.view(),
                             fitted.view(),
                             ibp_prior_slice,
+                            // #1026: zero logit-JVP rows for ungated background atoms.
+                            &self.assignment.ungated,
                             &mut jac_row,
                         );
                         // Coordinate columns for all atoms.
