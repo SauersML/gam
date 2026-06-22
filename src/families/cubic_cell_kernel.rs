@@ -4326,7 +4326,7 @@ mod tests {
                             assert_close_rel("tail value hit", repeat.value, expected.value, 1e-14);
                             assert_eq!(actual.moments.len(), expected.moments.len());
                             assert_eq!(repeat.moments.len(), expected.moments.len());
-                            for (idx, ((a, r)) in actual
+                            for (idx, ((a, r), e)) in actual
                                 .moments
                                 .iter()
                                 .zip(repeat.moments.iter())
