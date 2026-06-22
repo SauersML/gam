@@ -322,19 +322,8 @@ impl PredictableModel for DispersionLocationScalePredictor {
         self.noise_sd(input).map(Some)
     }
 
-    fn predict_dispersion_scale(
-        &self,
-        input: &PredictInput,
-    ) -> Result<Option<Array1<f64>>, EstimationError> {
-        // Per-row precision `exp(eta_d(x))` mapped into the generative
-        // NoiseModel's dispersion units (#1125): NB θ, Gamma shape and Beta φ
-        // ARE the precision; Tweedie φ is its reciprocal.
-        let precision = self.precision(input)?;
-        let dispersion = match self.likelihood.response {
-            ResponseFamily::Tweedie { .. } => precision.mapv(|pr| 1.0 / pr.max(f64::MIN_POSITIVE)),
-            _ => precision,
-        };
-        Ok(Some(dispersion))
+    fn dispersion_channel(&self) -> Option<&dyn PerRowDispersionChannel> {
+        Some(self)
     }
 
     fn predict_full_uncertainty(
@@ -361,5 +350,22 @@ impl PredictableModel for DispersionLocationScalePredictor {
 
     fn block_roles(&self) -> Vec<BlockRole> {
         vec![BlockRole::Location, BlockRole::Scale]
+    }
+}
+
+impl PerRowDispersionChannel for DispersionLocationScalePredictor {
+    fn per_row_dispersion(
+        &self,
+        input: &PredictInput,
+    ) -> Result<Array1<f64>, EstimationError> {
+        // Per-row precision `exp(eta_d(x))` mapped into the generative
+        // NoiseModel's dispersion units (#1125): NB θ, Gamma shape and Beta φ
+        // ARE the precision; Tweedie φ is its reciprocal.
+        let precision = self.precision(input)?;
+        let dispersion = match self.likelihood.response {
+            ResponseFamily::Tweedie { .. } => precision.mapv(|pr| 1.0 / pr.max(f64::MIN_POSITIVE)),
+            _ => precision,
+        };
+        Ok(dispersion)
     }
 }
