@@ -1,5 +1,134 @@
 use super::*;
 
+/// #1410 — single active-atom entry of the per-row softmax-entropy Gershgorin
+/// Loewner majorizer `D_kk = Σ_j |H_kj|` (#1419), computed WITHOUT materialising
+/// a full-`K` diagonal `d`.
+///
+/// The compact softmax assembly / θ-adjoint only ever read `D_kk` for the
+/// `≤ top_k` active atoms, yet
+/// [`SoftmaxAssignmentSparsityPenalty::psd_majorizer_abs_row_sums`] returns the
+/// FULL-`K` `d` vector (and the SAE callers were additionally copying the
+/// row's logits into a fresh length-`K` `Vec` just to feed it). At the SAE LLM
+/// shape (`K ≈ 100k`) that is two `O(K)` per-row scratch allocations on the
+/// compact (`O(top_k·d)`-per-token) path the whole #1408/#1409/#1450 contract
+/// exists to keep `K`-free. This helper consumes the per-row softmax
+/// assignments `a` (already in hand — it IS the softmax row) and an explicit
+/// active atom `kk`, and returns only that atom's majorizer diagonal, allocating
+/// nothing.
+///
+/// It reproduces `psd_majorizer_abs_row_sums` EXACTLY (same `(a, l, m)`
+/// algebra, same `ENTROPY_LOG_PROBABILITY_FLOOR`, same scaled formula), so the
+/// assembly, the criterion's `log|H|`, and the #1006 θ-adjoint still
+/// differentiate ONE operator. The shared `m = Σ_j a_j l_j` is the only `O(K)`
+/// pass; pass it in precomputed (`softmax_majorizer_log_mean`) so a row that
+/// fills several active slots pays it once. A debug oracle
+/// (`active_softmax_gershgorin_matches_dense_majorizer_1410`) pins this to the
+/// dense `psd_majorizer_abs_row_sums` so the two cannot drift.
+#[inline]
+fn softmax_majorizer_log_mean(a: &[f64]) -> f64 {
+    let floor = crate::terms::analytic_penalties::ENTROPY_LOG_PROBABILITY_FLOOR;
+    a.iter()
+        .map(|&a_i| {
+            let l_i = a_i.max(floor).ln() + 1.0;
+            a_i * l_i
+        })
+        .sum()
+}
+
+/// Single `(kk, jj)` entry of the exact per-row dense softmax-entropy Hessian
+/// `H_kj = scale·a_k·(δ_kj·(m−l_k−1) + a_j·(l_k+l_j+1−2m))` (mirrors
+/// [`SoftmaxAssignmentSparsityPenalty::row_dense_hessian`] entry-for-entry). Used
+/// by the #1418 exact-Hessian (`A = B + ΔC`) correction so the compact path can
+/// read only the active `≤ top_k × top_k` sub-block of `H_entropy` without
+/// materialising the full `K×K` dense block per row (#1410). `m` is the shared
+/// [`softmax_majorizer_log_mean`]; `O(1)` per entry, zero allocation.
+#[inline]
+fn softmax_dense_entropy_hessian_entry(a: &[f64], kk: usize, jj: usize, m: f64, scale: f64) -> f64 {
+    let floor = crate::terms::analytic_penalties::ENTROPY_LOG_PROBABILITY_FLOOR;
+    let l_kk = a[kk].max(floor).ln() + 1.0;
+    let l_jj = a[jj].max(floor).ln() + 1.0;
+    let indicator = if kk == jj { 1.0 } else { 0.0 };
+    scale * a[kk] * (indicator * (m - l_kk - 1.0) + a[jj] * (l_kk + l_jj + 1.0 - 2.0 * m))
+}
+
+/// Active-atom diagonal `D_kk` of the softmax-entropy Gershgorin majorizer; see
+/// [`softmax_majorizer_log_mean`]. `a` is the per-row softmax assignment vector,
+/// `kk` the (global) atom index, `m` the precomputed `Σ_j a_j l_j`, and `scale`
+/// the `λ/τ²` penalty scale. `O(K)` time, zero allocation.
+#[inline]
+fn active_softmax_gershgorin_majorizer_entry(a: &[f64], kk: usize, m: f64, scale: f64) -> f64 {
+    let floor = crate::terms::analytic_penalties::ENTROPY_LOG_PROBABILITY_FLOOR;
+    let l_kk = a[kk].max(floor).ln() + 1.0;
+    // Diagonal entry H_kk.
+    let h_kk = scale * a[kk] * ((m - l_kk - 1.0) + a[kk] * (2.0 * l_kk + 1.0 - 2.0 * m));
+    let mut acc = h_kk.abs();
+    // Off-diagonal entries H_kj, j ≠ k.
+    for (jj, &a_jj) in a.iter().enumerate() {
+        if jj == kk {
+            continue;
+        }
+        let l_jj = a_jj.max(floor).ln() + 1.0;
+        let h_kj = scale * a[kk] * a_jj * (l_kk + l_jj + 1.0 - 2.0 * m);
+        acc += h_kj.abs();
+    }
+    acc
+}
+
+/// Active-atom diagonal entry `∂D_kk/∂z_w = Σ_j sign(H_kj)·∂H_kj/∂z_w` of the
+/// softmax-entropy Gershgorin majorizer derivative (mirrors
+/// [`SoftmaxAssignmentSparsityPenalty::row_psd_majorizer_logit_derivative`]'s
+/// `out[[kk, kk]]` entry-for-entry — that operator's output is DIAGONAL, so only
+/// `kk == kk` entries are nonzero). The compact #1006 θ-adjoint needs this only
+/// for the row's `≤ top_k` active atoms paired with its active logits, so this
+/// computes one diagonal entry directly from the softmax row `a` instead of
+/// materialising the full `K×K` derivative matrix per (row, logit) (#1410).
+///
+/// `a` is the per-row softmax row, `kk` the (global) atom index, `w` the (global)
+/// logit being differentiated, `m` the shared [`softmax_majorizer_log_mean`],
+/// `scale = λ/τ²`, and `inv_tau = 1/τ`. Uses the SAME `∂a_r/∂z_w =
+/// a_r(δ_rw − a_w)/τ` convention as the dense library routine, so value and
+/// adjoint stay on one operator (pinned by
+/// `active_softmax_majorizer_logit_derivative_matches_dense_1410`). `O(K)` time,
+/// zero allocation.
+#[inline]
+fn active_softmax_majorizer_logit_derivative_entry(
+    a: &[f64],
+    kk: usize,
+    w: usize,
+    m: f64,
+    scale: f64,
+    inv_tau: f64,
+) -> f64 {
+    let floor = crate::terms::analytic_penalties::ENTROPY_LOG_PROBABILITY_FLOOR;
+    let a_w = a[w];
+    // ∂a_r/∂z_w = a_r(δ_rw − a_w)/τ ; ∂L_r/∂z_w = (∂a_r/∂z_w)/a_r ;
+    // dm = Σ_r (da_r·l_r + a_r·dl_r). One O(K) pass.
+    let da = |r: usize| a[r] * (if r == w { 1.0 } else { 0.0 } - a_w) * inv_tau;
+    let l = |r: usize| a[r].max(floor).ln() + 1.0;
+    let dl = |r: usize| da(r) / a[r].max(floor);
+    let dm: f64 = (0..a.len()).map(|r| da(r) * l(r) + a[r] * dl(r)).sum();
+    let l_kk = l(kk);
+    let da_kk = da(kk);
+    let dl_kk = dl(kk);
+    let mut acc = 0.0_f64;
+    for jj in 0..a.len() {
+        let indicator = if kk == jj { 1.0 } else { 0.0 };
+        let l_jj = l(jj);
+        // H_kj = scale·a_k·bracket ; only its SIGN is used.
+        let bracket = indicator * (m - l_kk - 1.0) + a[jj] * (l_kk + l_jj + 1.0 - 2.0 * m);
+        let h_kj = scale * a[kk] * bracket;
+        if h_kj == 0.0 {
+            continue;
+        }
+        let dbracket = indicator * (dm - dl_kk)
+            + da(jj) * (l_kk + l_jj + 1.0 - 2.0 * m)
+            + a[jj] * (dl_kk + dl(jj) - 2.0 * dm);
+        let dh_kj = scale * (da_kk * bracket + a[kk] * dbracket);
+        acc += h_kj.signum() * dh_kj;
+    }
+    acc
+}
+
 /// Typed error from the SAE outer-gradient analytic assembly path (#1436).
 ///
 /// The `eval()` analytic fallback (#1273/#1440: the plain undeflated analytic
@@ -3963,14 +4092,20 @@ impl SaeManifoldTerm {
         // are addressed by COMPACT SLOT in the compact branch below (the dense
         // branch keeps global-atom rows), so the row count is the max active set.
         //
-        // #1410/#1408: the `None` (full-K) branch below is taken for SOFTMAX,
-        // which still keeps the per-worker `(k_atoms·p)` `decoded` and
-        // `(q·max(w_dim,p))` `jac_white` scratch — the residual high-K per-worker
-        // footprint. It is bounded by the SOFTMAX layout gap (#1408): the dense
-        // softmax path genuinely touches every atom (it assembles the full dense
-        // entropy Hessian and normalises over all `K`), so the scratch cannot
-        // shrink until softmax engages the compact active-set layout. JumpReLU /
-        // IBP-MAP already take the `Some(layout)` branch and pay only `max_active`.
+        // #1410/#1408/#1409: SOFTMAX now ALSO takes the `Some(layout)` branch
+        // whenever a `top_k` cap (`set_softmax_active_cap`) or an in-core memory
+        // breach engages `softmax_active_plan` → `from_dense_weights`, so its
+        // per-worker `decoded`/`jac_white` scratch is the COMPACT
+        // `max_active`/`max_q_row` size too — no longer the full `(k_atoms·p)` /
+        // `(q·max(w_dim,p))` blow-up. JumpReLU / IBP-MAP likewise pay only
+        // `max_active`. The remaining `None` (full-`K`) branch is the UNCAPPED
+        // softmax / no-budget-breach case, which genuinely assembles the dense
+        // entropy block over all `K`; capping it (the compact contract) removes
+        // the per-worker `O(K)` footprint entirely. (#1410: the residual per-row
+        // `O(K)` softmax-majorizer scratch — a `row_logits` copy and the full-`K`
+        // `d`/`H_entropy` blocks — is removed separately; see the active-only
+        // `active_softmax_gershgorin_majorizer_entry` /
+        // `softmax_dense_entropy_hessian_entry` helpers below.)
         let (decoded_rows, scratch_q) = match row_layout.as_ref() {
             Some(layout) => {
                 let max_active = (0..n)
@@ -4297,18 +4432,35 @@ impl SaeManifoldTerm {
                         // gradient stays the EXACT entropy gradient (it sets the
                         // fixed point), so majorizing only conditions the Newton
                         // step. JumpReLU/IBP keep their (exact) diagonal.
-                        let softmax_majorizer_diag: Option<Vec<f64>> =
-                            softmax_dense.as_ref().map(|(penalty, scale)| {
-                                let row_logits: Vec<f64> = (0..k_atoms)
-                                    .map(|kk| self.assignment.logits[[row, kk]])
-                                    .collect();
-                                penalty.psd_majorizer_abs_row_sums(&row_logits, *scale)
-                            });
+                        //
+                        // #1410: compute only the active `D_kk` directly from this
+                        // row's softmax assignments `a` (= `assignments`, already
+                        // in hand), via `active_softmax_gershgorin_majorizer_entry`.
+                        // The previous `psd_majorizer_abs_row_sums(&row_logits, ..)`
+                        // call allocated TWO length-`K` per-row scratch vectors (a
+                        // fresh `row_logits` copy and the full-`K` returned `d`)
+                        // only to read `d[k]` for the `≤ top_k` active `k` — an
+                        // `O(K)` per-row allocation on the path the compact
+                        // contract keeps `K`-free. The shared `m = Σ_j a_j l_j` is
+                        // the one irreducible `O(K)` pass, computed once per row.
+                        let assignments_slice = assignments
+                            .as_slice()
+                            .expect("softmax assignments row must be contiguous");
+                        let majorizer_log_mean: Option<f64> = softmax_dense
+                            .as_ref()
+                            .map(|_| softmax_majorizer_log_mean(assignments_slice));
                         for (j, &k) in active.iter().enumerate() {
                             block.gt[j] += assignment_grad[assignment_base + k];
-                            match softmax_majorizer_diag.as_ref() {
-                                Some(d) => block.htt[[j, j]] += d[k],
-                                None => block.htt[[j, j]] += assignment_hdiag[assignment_base + k],
+                            match (softmax_dense.as_ref(), majorizer_log_mean) {
+                                (Some((_penalty, scale)), Some(m)) => {
+                                    block.htt[[j, j]] += active_softmax_gershgorin_majorizer_entry(
+                                        assignments_slice,
+                                        k,
+                                        m,
+                                        *scale,
+                                    );
+                                }
+                                _ => block.htt[[j, j]] += assignment_hdiag[assignment_base + k],
                             }
                         }
                     } else {
@@ -7157,19 +7309,37 @@ impl SaeManifoldTerm {
             let mut trace = 0.0_f64;
             for row in 0..self.n_obs() {
                 let row_base = cache.row_offsets[row];
-                let row_logits: Vec<f64> = (0..k_atoms)
-                    .map(|k| self.assignment.logits[[row, k]])
-                    .collect();
                 // ∂(scale·D)/∂ρ = scale·D (linear in λ_sparse = eᵖ) — the SAME
                 // operator the assembly and θ-adjoint differentiate.
-                let d = penalty.psd_majorizer_abs_row_sums(&row_logits, scale);
                 match self.last_row_layout {
                     Some(ref layout) => {
+                        // #1410: the compact adjoint reads `D_kk` only for this
+                        // row's `≤ top_k` active atoms, so compute those entries
+                        // directly from the softmax row `a` via the active-only
+                        // Gershgorin helper — no full-`K` `row_logits` copy and no
+                        // full-`K` `d` vector. `a` itself is the irreducible `O(K)`
+                        // softmax normalisation, computed once per row and shared
+                        // across the row's active slots.
+                        let a = crate::terms::sae::assignment::softmax_row(
+                            self.assignment.logits.row(row),
+                            temperature,
+                        );
+                        let a = a.as_slice().expect("softmax row must be contiguous");
+                        let m = softmax_majorizer_log_mean(a);
                         for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
-                            trace += inv_diag[row_base + pos] * d[atom];
+                            let d_atom =
+                                active_softmax_gershgorin_majorizer_entry(a, atom, m, scale);
+                            trace += inv_diag[row_base + pos] * d_atom;
                         }
                     }
                     None => {
+                        // Dense layout genuinely contracts every free logit slot's
+                        // `D_kk`, so the full-`K` `d` is intrinsic here; keep the
+                        // single-source dense majorizer call.
+                        let row_logits: Vec<f64> = (0..k_atoms)
+                            .map(|k| self.assignment.logits[[row, k]])
+                            .collect();
+                        let d = penalty.psd_majorizer_abs_row_sums(&row_logits, scale);
                         let q = cache.row_dims[row];
                         let logit_dim = assignment_dim.min(q);
                         for atom in 0..logit_dim {
@@ -8399,20 +8569,36 @@ impl SaeManifoldTerm {
             // pair `(a,b)` below. The diagonal softmax case is therefore handled here,
             // NOT in `assignment_prior_hdiag_derivative_entry` (which returns 0 for
             // softmax to avoid double-counting).
-            let row_logits_softmax: Option<Vec<f64>> = softmax_dense_adjoint.as_ref().map(|_| {
-                (0..k_atoms)
-                    .map(|k| self.assignment.logits[[row, k]])
-                    .collect()
-            });
+            // #1410: the softmax majorizer θ-derivative `∂D_kk/∂z_w` is DIAGONAL
+            // (`D` is diagonal), and the compact adjoint reads it only for this
+            // row's `≤ top_k` active atoms. Compute the needed diagonal entry
+            // directly from the softmax row `a` (= `assignments`, in hand) via
+            // `active_softmax_majorizer_logit_derivative_entry`, instead of the old
+            // per-(row, logit) full `K×K` `row_psd_majorizer_logit_derivative`
+            // allocation. `m = Σ_j a_j l_j` is shared across all `(w, k)` pairs of
+            // the row, so compute it once. `inv_tau` carries the softmax `∂a/∂z`
+            // convention.
+            let softmax_adjoint_row: Option<(&[f64], f64, f64, f64)> =
+                match (softmax_dense_adjoint.as_ref(), self.assignment.mode) {
+                    (Some((_penalty, scale)), AssignmentMode::Softmax { temperature, .. }) => {
+                        let a = assignments
+                            .as_slice()
+                            .expect("softmax assignments row must be contiguous");
+                        let m = softmax_majorizer_log_mean(a);
+                        Some((a, m, *scale, 1.0 / temperature))
+                    }
+                    _ => None,
+                };
             for w in 0..q {
                 let mut gamma = 0.0_f64;
-                let softmax_dh_w: Option<Array2<f64>> = match (
-                    softmax_dense_adjoint.as_ref(),
-                    row_logits_softmax.as_ref(),
+                // The active logit `w` differentiates against; `None` unless this
+                // slot is a softmax logit on the softmax path.
+                let softmax_dD_w: Option<(&[f64], f64, f64, f64, usize)> = match (
+                    softmax_adjoint_row,
                     jets.vars[w],
                 ) {
-                    (Some((penalty, scale)), Some(row_logits), SaeLocalRowVar::Logit { atom }) => {
-                        Some(penalty.row_psd_majorizer_logit_derivative(row_logits, *scale, atom))
+                    (Some((a, m, scale, inv_tau)), SaeLocalRowVar::Logit { atom: atom_w }) => {
+                        Some((a, m, scale, inv_tau, atom_w))
                     }
                     _ => None,
                 };
@@ -8420,13 +8606,19 @@ impl SaeManifoldTerm {
                     for b in 0..q {
                         let mut dh = sae_dot(&jets.second[a][w], &jets.first[b])
                             + sae_dot(&jets.first[a], &jets.second[b][w]);
+                        // `∂D/∂z_w` is diagonal, so it contributes only when the two
+                        // logit slots are the SAME atom (`atom_a == atom_b`).
                         if let (
-                            Some(dh_w),
+                            Some((a_soft, m, scale, inv_tau, _atom_w)),
                             SaeLocalRowVar::Logit { atom: atom_a },
                             SaeLocalRowVar::Logit { atom: atom_b },
-                        ) = (softmax_dh_w.as_ref(), jets.vars[a], jets.vars[b])
+                        ) = (softmax_dD_w, jets.vars[a], jets.vars[b])
                         {
-                            dh += dh_w[[atom_a, atom_b]];
+                            if atom_a == atom_b {
+                                dh += active_softmax_majorizer_logit_derivative_entry(
+                                    a_soft, atom_a, _atom_w, m, scale, inv_tau,
+                                );
+                            }
                         }
                         if a == b {
                             dh += match jets.vars[a] {
@@ -8705,13 +8897,23 @@ impl SaeManifoldTerm {
             // wrote into the logit block (#1419). Adding `H_entropy − D` recovers the
             // EXACT entropy curvature `A = B + ΔC`, so the solver's exact-Hessian
             // correction differentiates the SAME operator the assembly installed.
-            if let Some((penalty, scale)) = softmax_delta.as_ref() {
+            if let Some((_penalty, scale)) = softmax_delta.as_ref() {
                 let assignment_dim = self.assignment.assignment_coord_dim();
-                let row_logits: Vec<f64> = (0..k_atoms)
-                    .map(|k| self.assignment.logits[[row, k]])
-                    .collect();
-                let h_entropy = penalty.row_dense_hessian(&row_logits, *scale);
-                let majorizer = penalty.row_psd_majorizer(&row_logits, *scale);
+                // #1410: the correction only contracts the ACTIVE logit slots
+                // (`jets.vars` carries the row's `≤ top_k` active atoms on the
+                // compact layout), so build only the active sub-block of
+                // `ΔC = H_entropy − D` ENTRY-WISE rather than materialising the
+                // full `K×K` `row_dense_hessian` / `row_psd_majorizer` matrices per
+                // row (an `O(K²)`-per-row allocation that defeated the compact
+                // contract at the LLM shape). `D` is diagonal, so it subtracts only
+                // on `ka == kb`; the off-diagonal `H_entropy` entries come from the
+                // shared `(a, l, m)` algebra. The softmax row `a_soft` is the one
+                // irreducible `O(K)` term, computed once per row.
+                let a_soft = self.assignment.try_assignments_row_for_rho(row, rho)?;
+                let a_soft = a_soft
+                    .as_slice()
+                    .expect("softmax assignments row must be contiguous");
+                let m = softmax_majorizer_log_mean(a_soft);
                 for (a, va) in jets.vars.iter().enumerate() {
                     let SaeLocalRowVar::Logit { atom: ka } = *va else {
                         continue;
@@ -8727,7 +8929,17 @@ impl SaeManifoldTerm {
                         if kb >= assignment_dim {
                             continue;
                         }
-                        acc += (h_entropy[[ka, kb]] - majorizer[[ka, kb]]) * v_t[b];
+                        let h_entropy =
+                            softmax_dense_entropy_hessian_entry(a_soft, ka, kb, m, *scale);
+                        // `D` is the diagonal Gershgorin majorizer (#1419), so it
+                        // contributes only on the diagonal `ka == kb`.
+                        let delta = if ka == kb {
+                            h_entropy
+                                - active_softmax_gershgorin_majorizer_entry(a_soft, ka, m, *scale)
+                        } else {
+                            h_entropy
+                        };
+                        acc += delta * v_t[b];
                     }
                     out.t[base + a] += acc;
                 }
@@ -9931,6 +10143,141 @@ mod outer_gradient_error_classification_1451_tests {
                 classified.admits_plain_solver_fallback(1.0),
                 "a genuine conditioning failure at finite cost must admit the plain-solver fallback (#1273)"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod softmax_majorizer_active_entry_1410_tests {
+    //! #1410 — the active-only softmax-entropy curvature helpers
+    //! ([`super::active_softmax_gershgorin_majorizer_entry`],
+    //! [`super::softmax_dense_entropy_hessian_entry`],
+    //! [`super::softmax_majorizer_log_mean`]) let the compact assembly /
+    //! θ-adjoint / exact-Hessian-correction paths read one `(k)` diagonal or
+    //! `(k,j)` matrix entry WITHOUT materialising the full-`K` `d` vector or the
+    //! `K×K` dense entropy/majorizer blocks per row — the residual per-worker
+    //! `O(K)`/`O(K²)` scratch that defeated the compact `O(top_k·d)`-per-token
+    //! contract.
+    //!
+    //! Correctness is single-sourced: these helpers MUST reproduce the
+    //! `SoftmaxAssignmentSparsityPenalty` dense library routines
+    //! (`psd_majorizer_abs_row_sums`, `row_psd_majorizer`, `row_dense_hessian`)
+    //! BIT-FOR-BIT, because the assembled `B`, the criterion's `log|H|`, and the
+    //! #1006 θ-adjoint all differentiate ONE operator. If the dense library
+    //! formula ever changes, this oracle fails and forces the helpers back into
+    //! sync (preventing the value↔adjoint desync the compact rewrite must not
+    //! introduce).
+
+    use crate::terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty;
+
+    /// Deterministic, well-spread softmax logit rows (a long tail plus a few
+    /// peaks) so the abs-row-sum / dense-Hessian algebra is exercised across
+    /// near-zero and near-one assignment masses.
+    fn logit_rows(k: usize) -> Vec<Vec<f64>> {
+        let mut rows = Vec::new();
+        // Row a: a few sharp peaks spread across K, deep floor elsewhere.
+        let mut a = vec![-7.0_f64; k];
+        for &peak in &[0usize, k / 3, 2 * k / 3, k - 1] {
+            a[peak] = 5.0 + (peak as f64) * 0.001;
+        }
+        rows.push(a);
+        // Row b: smoothly varying logits (no degenerate ties).
+        let b: Vec<f64> = (0..k)
+            .map(|i| ((i as f64) * 0.37).sin() * 2.0 - (i as f64) / (k as f64))
+            .collect();
+        rows.push(b);
+        // Row c: near-uniform (entropy Hessian indefinite here — the regime the
+        // Gershgorin majorizer exists for).
+        rows.push(vec![0.01; k]);
+        rows
+    }
+
+    #[test]
+    fn active_softmax_gershgorin_matches_dense_majorizer_1410() {
+        let k = 64usize;
+        let temperature = 0.8_f64;
+        let scale = 1.7_f64;
+        let penalty = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
+        for row in logit_rows(k) {
+            // Dense reference: full-K abs-row-sum diagonal `d`.
+            let d_dense = penalty.psd_majorizer_abs_row_sums(&row, scale);
+            // The helper consumes the softmax row `a`, not raw logits, exactly as
+            // the assembly/adjoint feed it `assignments`. Build `a` the same way
+            // the penalty does internally.
+            let a = crate::terms::sae::assignment::softmax_row(
+                ndarray::ArrayView1::from(row.as_slice()),
+                temperature,
+            );
+            let a = a.as_slice().expect("softmax row contiguous");
+            let m = super::softmax_majorizer_log_mean(a);
+            for kk in 0..k {
+                let got = super::active_softmax_gershgorin_majorizer_entry(a, kk, m, scale);
+                assert_eq!(
+                    got, d_dense[kk],
+                    "active Gershgorin majorizer entry must equal the dense \
+                     psd_majorizer_abs_row_sums[{kk}] BIT-FOR-BIT (single-source #1410/#1419)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn active_softmax_dense_entropy_hessian_entry_matches_dense_block_1410() {
+        let k = 48usize;
+        let temperature = 1.3_f64;
+        let scale = 0.9_f64;
+        let penalty = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
+        for row in logit_rows(k) {
+            let h_dense = penalty.row_dense_hessian(&row, scale);
+            let a = crate::terms::sae::assignment::softmax_row(
+                ndarray::ArrayView1::from(row.as_slice()),
+                temperature,
+            );
+            let a = a.as_slice().expect("softmax row contiguous");
+            let m = super::softmax_majorizer_log_mean(a);
+            for kk in 0..k {
+                for jj in 0..k {
+                    let got = super::softmax_dense_entropy_hessian_entry(a, kk, jj, m, scale);
+                    assert_eq!(
+                        got, h_dense[[kk, jj]],
+                        "active dense entropy-Hessian entry ({kk},{jj}) must equal \
+                         row_dense_hessian BIT-FOR-BIT (single-source #1410/#1418)"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_softmax_majorizer_logit_derivative_matches_dense_1410() {
+        let k = 40usize;
+        let temperature = 0.7_f64;
+        let scale = 1.1_f64;
+        let inv_tau = 1.0 / temperature;
+        let penalty = SoftmaxAssignmentSparsityPenalty::new(k, temperature);
+        for row in logit_rows(k) {
+            let a = crate::terms::sae::assignment::softmax_row(
+                ndarray::ArrayView1::from(row.as_slice()),
+                temperature,
+            );
+            let a = a.as_slice().expect("softmax row contiguous");
+            let m = super::softmax_majorizer_log_mean(a);
+            // Pin the active diagonal entry against the dense library derivative
+            // matrix (which is diagonal: `out[[kk, kk]]`) for several `w`.
+            for w in [0usize, k / 2, k - 1] {
+                let dense = penalty.row_psd_majorizer_logit_derivative(&row, scale, w);
+                for kk in 0..k {
+                    let got = super::active_softmax_majorizer_logit_derivative_entry(
+                        a, kk, w, m, scale, inv_tau,
+                    );
+                    assert_eq!(
+                        got, dense[[kk, kk]],
+                        "active majorizer logit-derivative ∂D_({kk},{kk})/∂z_{w} must equal \
+                         row_psd_majorizer_logit_derivative diagonal BIT-FOR-BIT \
+                         (single-source #1410/#1419/#1006)"
+                    );
+                }
+            }
         }
     }
 }

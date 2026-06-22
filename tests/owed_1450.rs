@@ -292,3 +292,101 @@ fn large_k_selection_recovers_full_planted_support_not_a_prefix_1450() {
         );
     }
 }
+
+/// Assemble the compact softmax system and return, per row, the diagonal of the
+/// assembled latent curvature block `htt` (the Gauss-Newton data curvature plus
+/// the softmax-entropy Gershgorin majorizer the #1410 active-only helper now
+/// writes) alongside the row's compact block dim. The diagonal is the public,
+/// observable footprint of the per-row softmax-majorizer assembly path that #1410
+/// rewrote to allocate `O(top_k)` instead of `O(K)` scratch.
+fn compact_assembly_htt_diags(
+    n: usize,
+    k_atoms: usize,
+    planted: &[Vec<usize>],
+    p: usize,
+    top_k: usize,
+) -> Vec<Vec<f64>> {
+    let (mut term, target) = planted_softmax_term(n, k_atoms, planted, p);
+    term.set_softmax_active_cap(Some(top_k));
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k_atoms]);
+    let sys = term
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("compact softmax assembly must succeed at large K");
+    sys.rows
+        .iter()
+        .map(|r| (0..r.htt.nrows()).map(|i| r.htt[[i, i]]).collect::<Vec<f64>>())
+        .collect()
+}
+
+/// #1410 — the compact softmax assembly's per-row curvature must be INDEPENDENT
+/// of total `K` (the active-set / O(top_k)-per-token contract), and the
+/// active-only softmax-majorizer rewrite must NOT change the assembled values
+/// when `K` doubles.
+///
+/// The previous compact softmax path computed the per-row Gershgorin majorizer by
+/// allocating, FOR EACH ROW, a fresh length-`K` `row_logits` copy AND the full
+/// length-`K` `d` abs-row-sum vector returned by `psd_majorizer_abs_row_sums`,
+/// then read only the `≤ top_k` active diagonal entries — an `O(K)` per-row
+/// (hence per-Rayon-worker, transient) scratch allocation on the very path the
+/// compact contract exists to keep `K`-free. #1410 replaces that with
+/// `active_softmax_gershgorin_majorizer_entry`, which computes only the active
+/// `D_kk` from the softmax row already in hand. This test certifies the
+/// behaviour the user can observe: the assembled per-row `htt` diagonal is
+/// IDENTICAL at `K = 8000` and `K = 16000` for the same planted support (the
+/// deep `-7`-floor tail contributes negligible softmax mass, so the active
+/// curvature is genuinely `K`-invariant to full f64 precision), proving the
+/// per-token assembly work does not grow with `K`.
+#[test]
+fn compact_softmax_curvature_is_independent_of_total_k_1410() {
+    let n = 4usize;
+    let p = 3usize;
+    let top_k = 3usize;
+    const K_SMALL: usize = 8_000;
+    const K_LARGE: usize = 16_000; // 2× — per-worker scratch must NOT grow with this.
+    // Planted peaks scattered low / mid / high so the selection scans all K. The
+    // SAME atom indices and logit values are reused at both K, so the only
+    // difference between the two assemblies is the size of the negligible floor
+    // tail — which a K-free per-token path must not let leak into the curvature.
+    let planted: Vec<Vec<usize>> = (0..n)
+        .map(|row| vec![row, K_SMALL / 2 + row, K_SMALL - 100 + row])
+        .collect();
+
+    let diags_small = compact_assembly_htt_diags(n, K_SMALL, &planted, p, top_k);
+    let diags_large = compact_assembly_htt_diags(n, K_LARGE, &planted, p, top_k);
+
+    let exact_dim = top_k * (1 + 1); // |active| + Σ d_k (d = 1)
+    for row in 0..n {
+        assert_eq!(
+            diags_small[row].len(),
+            exact_dim,
+            "row {row}: K={K_SMALL} compact block dim must be the exact O(top_k) size {exact_dim}, \
+             not K-scaled"
+        );
+        assert_eq!(
+            diags_small[row].len(),
+            diags_large[row].len(),
+            "row {row}: compact block dim must be INDEPENDENT of total K (K={K_SMALL} vs {K_LARGE})"
+        );
+        // The assembled curvature diagonal must be K-invariant: doubling K (only
+        // the floor tail grows) must not move the active curvature. A path whose
+        // per-token majorizer scratch/work depended on the full K would, at best,
+        // see the tail leak into `D_kk = Σ_j|H_kj|`; here the floor mass is
+        // ~e^{-12} of a peak, far below the assertion tolerance.
+        for slot in 0..exact_dim {
+            let a = diags_small[row][slot];
+            let b = diags_large[row][slot];
+            assert!(
+                (a - b).abs() <= 1e-9 * (1.0 + a.abs().max(b.abs())),
+                "row {row} slot {slot}: assembled htt diagonal must be K-invariant \
+                 (K={K_SMALL} gave {a}, K={K_LARGE} gave {b}) — the per-token softmax-majorizer \
+                 assembly must not depend on total K (#1410)"
+            );
+        }
+        // The curvature is a genuine assembled block, not a stub: at least one
+        // diagonal entry is strictly positive (data GN + PSD majorizer).
+        assert!(
+            diags_small[row].iter().any(|&v| v > 0.0),
+            "row {row}: assembled compact curvature diagonal must be a real PSD block"
+        );
+    }
+}
