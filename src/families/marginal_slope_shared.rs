@@ -1556,10 +1556,10 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
     /// as [`Self::psi_second_order_terms`].
     fn psi_second_order_terms_contracted(
         &self,
-        alpha_psi: &[f64],
+        _: &[f64],
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String>
     {
-        assert!(alpha_psi.len() < usize::MAX);
+        // Default implementation ignores this parameter.
         Ok(None)
     }
 

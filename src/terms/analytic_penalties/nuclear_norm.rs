@@ -557,17 +557,6 @@ impl NuclearNormPenalty {
         Ok((right_filter, right_filter_derivative))
     }
 
-    fn flatten_matrix(m: &Array2<f64>) -> Array1<f64> {
-        let n_obs = m.nrows();
-        let d = m.ncols();
-        let mut out = Array1::<f64>::zeros(n_obs * d);
-        for n in 0..n_obs {
-            for a in 0..d {
-                out[n * d + a] = m[[n, a]];
-            }
-        }
-        out
-    }
 }
 
 impl AnalyticPenalty for NuclearNormPenalty {
@@ -611,7 +600,7 @@ impl AnalyticPenalty for NuclearNormPenalty {
                 }
             }
         }
-        Self::flatten_matrix(&grad)
+        super::flatten_matrix(&grad)
     }
 
     fn hvp(
@@ -640,7 +629,7 @@ impl AnalyticPenalty for NuclearNormPenalty {
             .unwrap_or_else(|message| panic!("{}", message));
         let weight = self.resolved_weight(rho);
         let out = (vr + tdr) * weight;
-        Self::flatten_matrix(&out)
+        super::flatten_matrix(&out)
     }
 
     impl_learnable_weight_grad_rho!();

@@ -41,9 +41,9 @@ pub struct PirlsWorkspace {
 }
 
 impl PirlsWorkspace {
-    pub fn new(n: usize, p: usize, idx: usize, idx2: usize) -> Self {
-        assert!(idx < usize::MAX);
-        assert!(idx2 < usize::MAX);
+    pub fn new(n: usize, p: usize, _: usize, _: usize) -> Self {
+        // Default implementation ignores this parameter.
+        // Default implementation ignores this parameter.
         // Stage buffers are allocated lazily: historically these were pre-sized to
         // worst-case dimensions, which inflates memory when many PIRLS workspaces
         // exist concurrently (e.g. parallel REML evals).

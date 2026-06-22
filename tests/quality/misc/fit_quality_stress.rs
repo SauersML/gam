@@ -144,9 +144,10 @@ fn report_fit_error(probe: &str, formula: &str, err: &str) {
         "FIT_FAILED"
     };
     eprintln!("[fit-quality] probe={probe} category={cat} formula=`{formula}` err=`{err}`",);
+    panic!("[fit-quality] probe={probe} category={cat} formula=`{formula}` err=`{err}`");
 }
 
-fn let cat = report(
+fn report(
     probe: &str,
     formula: &str,
     rmse_val: f64,
@@ -168,6 +169,7 @@ fn let cat = report(
         cat = cat.label(),
         ws = if extra.is_empty() { "" } else { " " },
     );
+    assert!(!matches!(cat, Category::Collapsed), "probe {probe} collapsed");
     cat
 }
 

@@ -454,11 +454,11 @@ pub trait CustomFamily {
     fn block_geometry_directional_derivative(
         &self,
         _: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         block_spec: &ParameterBlockSpec,
         arr: &Array1<f64>,
     ) -> Result<Option<BlockGeometryDirectionalDerivative>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(!block_spec.name.is_empty());
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
@@ -468,11 +468,11 @@ pub trait CustomFamily {
     fn post_update_block_beta(
         &self,
         _: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         block_spec: &ParameterBlockSpec,
         beta: Array1<f64>,
     ) -> Result<Array1<f64>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(!block_spec.name.is_empty());
         Ok(beta)
     }
@@ -494,10 +494,10 @@ pub trait CustomFamily {
     fn max_feasible_step_size(
         &self,
         _: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
@@ -507,10 +507,10 @@ pub trait CustomFamily {
     fn block_linear_constraints(
         &self,
         _: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(!block_spec.name.is_empty());
         Ok(None)
     }
@@ -528,10 +528,10 @@ pub trait CustomFamily {
     fn exact_newton_hessian_directional_derivative(
         &self,
         _: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
@@ -549,11 +549,11 @@ pub trait CustomFamily {
     fn exact_newton_hessian_second_directional_derivative(
         &self,
         _: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         arr: &Array1<f64>,
         arr2: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(arr.iter().all(|v| !v.is_nan()));
         assert!(arr2.iter().all(|v| !v.is_nan()));
         Ok(None)
@@ -1571,10 +1571,10 @@ pub trait CustomFamily {
     fn diagonalworking_weights_directional_derivative(
         &self,
         _: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }
@@ -1593,11 +1593,11 @@ pub trait CustomFamily {
     fn diagonalworking_weights_second_directional_derivative(
         &self,
         _: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         arr: &Array1<f64>,
         arr2: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(arr.iter().all(|v| !v.is_nan()));
         assert!(arr2.iter().all(|v| !v.is_nan()));
         Ok(None)
@@ -1634,9 +1634,9 @@ pub trait CustomFamily {
         _: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
         _: &[Vec<CustomFamilyBlockPsiDerivative>],
-        idx: usize,
+        _: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         Ok(None)
     }
 
@@ -1656,11 +1656,11 @@ pub trait CustomFamily {
         _: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
         _: &[Vec<CustomFamilyBlockPsiDerivative>],
-        idx: usize,
-        idx2: usize,
+        _: usize,
+        _: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-        assert!(idx < usize::MAX);
-        assert!(idx2 < usize::MAX);
+        // Default implementation ignores this parameter.
+        // Default implementation ignores this parameter.
         Ok(None)
     }
 
@@ -1736,10 +1736,10 @@ pub trait CustomFamily {
         _: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
         _: &[Vec<CustomFamilyBlockPsiDerivative>],
-        idx: usize,
+        _: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(None)
     }

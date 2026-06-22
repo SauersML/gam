@@ -87,8 +87,6 @@ class Smooth(BasisDescriptor):
 
         _check_manifold_basis_compatibility(latent, basis)
 
-        if penalty is None:
-            penalty = _default_penalty_for(latent)
         if penalty is not None and not isinstance(penalty, PenaltyDescriptor):
             raise TypeError(
                 f"Smooth.penalty must be a PenaltyDescriptor or None, "
@@ -252,13 +250,6 @@ def _default_basis_for(latent: ManifoldDescriptor) -> BasisDescriptor:
     )
 
 
-def _default_penalty_for(latent: ManifoldDescriptor) -> PenaltyDescriptor | None:
-    """Magic-by-default penalty selection. Returns ``None`` so the smooth
-    is unpenalized unless the user opts in."""
-    del latent
-    return None
-
-
 def _check_manifold_basis_compatibility(
     latent: ManifoldDescriptor, basis: BasisDescriptor
 ) -> None:
@@ -270,16 +261,10 @@ def _check_manifold_basis_compatibility(
     """
     latent_kind = None
     if hasattr(latent, "to_json"):
-        try:
-            latent_kind = str(latent.to_json().get("kind", ""))
-        except (AttributeError, TypeError, ValueError):
-            latent_kind = None
+        latent_kind = str(latent.to_json().get("kind", ""))
     basis_kind = None
     if hasattr(basis, "to_dict"):
-        try:
-            basis_kind = str(basis.to_dict().get("kind", ""))
-        except (AttributeError, TypeError, ValueError):
-            basis_kind = None
+        basis_kind = str(basis.to_dict().get("kind", ""))
     if latent_kind and basis_kind:
         from ._binding import rust_module
         validator = getattr(rust_module(), "validate_smooth_composition", None)
@@ -291,7 +276,7 @@ def _check_manifold_basis_compatibility(
         return
     try:
         latent_dim = int(latent.dimension)
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError:
         # Rust dimension oracle not yet exposed by the local extension; the
         # Rust core will reject incompatible specs again at fit time.
         return

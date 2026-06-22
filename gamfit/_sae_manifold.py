@@ -1008,8 +1008,8 @@ def _atom_functional_evidence(
             np.ascontiguousarray(coords),
             params,
         )
-    except (RuntimeError, ValueError, TypeError):
-        return None
+    except Exception as exc:
+        raise RuntimeError(f"Basis evaluation failed for kind {plan.get('kind')!r}: {exc}") from exc
     phi = np.asarray(phi, dtype=float)
     jet = np.asarray(jet, dtype=float)
     if (

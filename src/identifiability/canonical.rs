@@ -1842,27 +1842,7 @@ mod tests {
     use crate::families::custom_family::AdditiveBlockJacobian;
     use crate::linalg::matrix::DenseDesignMatrix;
     use ndarray::Array2;
-    fn spec_from_dense(
-        name: &str,
-        design: ndarray::Array2<f64>,
-    ) -> crate::families::custom_family::ParameterBlockSpec {
-        let n = design.nrows();
-        crate::families::custom_family::ParameterBlockSpec {
-            name: name.to_string(),
-            design: crate::linalg::matrix::DesignMatrix::Dense(
-                crate::linalg::matrix::DenseDesignMatrix::from(design),
-            ),
-            offset: ndarray::Array1::<f64>::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: ndarray::Array1::<f64>::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        }
-    }
+    use crate::test_support::spec_from_dense;
 
     fn linspace(n: usize) -> ndarray::Array1<f64> {
         if n <= 1 {
@@ -2472,15 +2452,7 @@ mod tests {
         }
     }
 
-    fn spec_from_dense_with_priority(
-        name: &str,
-        design: Array2<f64>,
-        gauge_priority: u8,
-    ) -> ParameterBlockSpec {
-        let mut s = spec_from_dense(name, design);
-        s.gauge_priority = gauge_priority;
-        s
-    }
+    use crate::test_support::spec_from_dense_with_priority;
 
     /// #933: a `jacobian_callback`-only block (no `stacked_design`) whose audit
     /// attributes a dropped column is now SAFELY REDUCED rather than kept at raw

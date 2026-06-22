@@ -161,18 +161,6 @@ impl BlockSparsityPenalty {
         (norm2 + self.smoothing_eps * self.smoothing_eps).sqrt()
     }
 
-    fn flatten_matrix(m: &Array2<f64>) -> Array1<f64> {
-        let n_obs = m.nrows();
-        let d = m.ncols();
-        let mut out = Array1::<f64>::zeros(n_obs * d);
-        for n in 0..n_obs {
-            for a in 0..d {
-                out[n * d + a] = m[[n, a]];
-            }
-        }
-        out
-    }
-
     pub fn diag_target(
         &self,
         target: ArrayView1<'_, f64>,
@@ -264,7 +252,7 @@ impl AnalyticPenalty for BlockSparsityPenalty {
                 }
             }
         }
-        Self::flatten_matrix(&grad)
+        super::flatten_matrix(&grad)
     }
 
     fn hvp(
@@ -303,7 +291,7 @@ impl AnalyticPenalty for BlockSparsityPenalty {
                 }
             }
         }
-        Self::flatten_matrix(&out)
+        super::flatten_matrix(&out)
     }
 
     impl_learnable_weight_grad_rho!();

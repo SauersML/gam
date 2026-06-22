@@ -167,5 +167,17 @@ pub use scad_mcp::*;
 pub use sparsity::*;
 pub use total_variation::*;
 
+pub(crate) fn flatten_matrix(m: &Array2<f64>) -> Array1<f64> {
+    let n_obs = m.nrows();
+    let d = m.ncols();
+    let mut out = Array1::<f64>::zeros(n_obs * d);
+    for n in 0..n_obs {
+        for a in 0..d {
+            out[n * d + a] = m[[n, a]];
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests;

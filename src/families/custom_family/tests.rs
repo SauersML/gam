@@ -2016,11 +2016,11 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
     impl ExactNewtonJointPsiWorkspace for BlockLocalPsiWorkspace {
         fn second_order_terms(
             &self,
-            idx: usize,
-            idx2: usize,
+            _: usize,
+            _: usize,
         ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-            assert!(idx < usize::MAX);
-            assert!(idx2 < usize::MAX);
+            // Default implementation ignores this parameter.
+            // Default implementation ignores this parameter.
             Ok(None)
         }
 
@@ -2076,11 +2076,11 @@ pub(crate) fn contracted_psi_hook_declines_partial_axis_coverage_before_pair_tab
     impl ExactNewtonJointPsiWorkspace for PartialContractedPsiWorkspace {
         fn second_order_terms(
             &self,
-            psi_i: usize,
-            psi_j: usize,
+            _: usize,
+            _: usize,
         ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-            assert!(psi_i < usize::MAX);
-            assert!(psi_j < usize::MAX);
+            // Default implementation ignores this parameter.
+            // Default implementation ignores this parameter.
             Ok(None)
         }
 
@@ -2103,10 +2103,10 @@ pub(crate) fn contracted_psi_hook_declines_partial_axis_coverage_before_pair_tab
 
         fn hessian_directional_derivative(
             &self,
-            psi_index: usize,
+            _: usize,
             d_beta_flat: &Array1<f64>,
         ) -> Result<Option<DriftDerivResult>, String> {
-            assert!(psi_index < usize::MAX);
+            // Default implementation ignores this parameter.
             assert_eq!(d_beta_flat.len(), 1);
             Ok(None)
         }
@@ -2169,11 +2169,11 @@ pub(crate) fn contracted_psi_hook_rejects_wrong_score_width_before_installing_op
     impl ExactNewtonJointPsiWorkspace for WrongScoreWidthPsiWorkspace {
         fn second_order_terms(
             &self,
-            psi_i: usize,
-            psi_j: usize,
+            _: usize,
+            _: usize,
         ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
-            assert!(psi_i < usize::MAX);
-            assert!(psi_j < usize::MAX);
+            // Default implementation ignores this parameter.
+            // Default implementation ignores this parameter.
             Ok(None)
         }
 
@@ -2193,10 +2193,10 @@ pub(crate) fn contracted_psi_hook_rejects_wrong_score_width_before_installing_op
 
         fn hessian_directional_derivative(
             &self,
-            psi_index: usize,
+            _: usize,
             d_beta_flat: &Array1<f64>,
         ) -> Result<Option<DriftDerivResult>, String> {
-            assert!(psi_index < usize::MAX);
+            // Default implementation ignores this parameter.
             assert_eq!(d_beta_flat.len(), 1);
             Ok(None)
         }
@@ -2321,10 +2321,10 @@ impl CustomFamily for DefaultDiagonalExactHookFamily {
     fn diagonalworking_weights_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         d_eta: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         Ok(Some((&block_states[0].eta * d_eta) * 2.0))
     }
 
@@ -3187,21 +3187,21 @@ impl CustomFamily for OneBlockGaussianFamily {
     fn diagonalworking_weights_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         d_eta: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         Ok(Some(Array1::zeros(d_eta.len())))
     }
 
     fn diagonalworking_weights_second_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         d_eta_u: &Array1<f64>,
         arr: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(Some(Array1::zeros(d_eta_u.len())))
     }
@@ -3353,10 +3353,10 @@ impl CustomFamily for PreferJointExactFamily {
     fn exact_newton_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(arr.iter().all(|v| !v.is_nan()));
         Err(
             "blockwise exact-newton path should not be used when joint path is available"
@@ -3642,10 +3642,10 @@ impl CustomFamily for OneBlockPseudoLaplaceExactFamily {
     fn exact_newton_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(Some(array![[0.0]]))
     }
@@ -3688,10 +3688,10 @@ impl CustomFamily for OneBlockExactPsiHookFamily {
     fn exact_newton_hessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(arr.iter().all(|v| !v.is_nan()));
         Ok(Some(array![[0.0]]))
     }
@@ -3710,9 +3710,9 @@ impl CustomFamily for OneBlockExactPsiHookFamily {
         block_states: &[ParameterBlockState],
         block_specs: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
-        idx: usize,
+        _: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         Ok(Some(ExactNewtonJointPsiTerms {
             objective_psi: 3.5,
             score_psi: array![0.0],

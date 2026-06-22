@@ -782,10 +782,9 @@ class Model:
             return rows_out
         try:
             import pandas as pd
-
-            return pd.DataFrame(rows_out)
-        except ImportError:
-            return rows_out
+        except ImportError as exc:
+            raise ImportError("pandas is required for DataFrame output; install pandas or set return_type='list'") from exc
+        return pd.DataFrame(rows_out)
 
     def save(self, path: str | Path) -> None:
         """Serialise the fitted model to ``path``."""
@@ -960,12 +959,7 @@ class Model:
         # developer one-liner stays on ``__repr__``. The rendering itself
         # lives in ``Summary.__str__`` so there is exactly one place that
         # knows how to format the summary fields. (issue #308)
-        try:
-            return str(self.summary())
-        except (KeyError, ValueError, RuntimeError, TypeError):
-            # Summary materialisation can fail on partially-loaded artifacts;
-            # fall back to the developer repr rather than crashing print().
-            return repr(self)
+        return str(self.summary())
 
     def _repr_html_(self) -> str:
         return self.report()
@@ -1102,12 +1096,9 @@ class MultinomialModel:
         if not (0.0 < level < 1.0):
             raise ValueError(f"level must be in (0, 1), got {level}")
         # Two-sided normal quantile for the requested level.
-        try:
-            from statistics import NormalDist
+        from statistics import NormalDist
 
-            z = NormalDist().inv_cdf(0.5 + level / 2.0)
-        except Exception:  # pragma: no cover - statistics is stdlib
-            z = 1.959963984540054
+        z = NormalDist().inv_cdf(0.5 + level / 2.0)
         try:
             out = rust_module().predict_multinomial_intervals_pyfunc(
                 self._model_bytes, headers, rows, z
@@ -1166,7 +1157,24 @@ class MultinomialModel:
         levels = list(meta["class_levels"])
         ref = int(meta["reference_class_index"])
         lambdas = list(meta.get("lambdas", []))
+        lambdas_per_block = list(meta.get("lambdas_per_block", []))
+        term_labels = list(meta.get("smooth_term_labels", []))
         edf_per_class = meta.get("edf_per_class")
+
+        if lambdas:
+            if len(lambdas_per_block) != m:
+                raise ValueError(
+                    f"Multinomial lambda metadata mismatch: {len(lambdas_per_block)} blocks for {m} active classes"
+                )
+            if sum(lambdas_per_block) != len(lambdas):
+                raise ValueError(
+                    f"Multinomial lambda metadata mismatch: {len(lambdas)} lambdas but blocks ask for {sum(lambdas_per_block)}"
+                )
+            if m > 0 and len(term_labels) != lambdas_per_block[0]:
+                raise ValueError(
+                    f"Multinomial lambda metadata mismatch: {len(term_labels)} term labels but block 0 has {lambdas_per_block[0]} lambdas"
+                )
+
         lines = [
             f"MultinomialModel formula: {meta['formula']}",
             f"  classes: {levels}  (reference = {levels[ref]!r})",
@@ -1181,12 +1189,17 @@ class MultinomialModel:
         # are stored in row-major `(P, K-1)` order; column `a` is class
         # `levels[a]`.
         coefs = list(meta["coefficients_flat"])
+        lambda_offset = 0
         for a in range(m):
             class_block = coefs[a::m]
             norm = math.sqrt(sum(c * c for c in class_block))
             row_bits = [f"‖β_a‖₂ = {norm:.4g}"]
-            if a < len(lambdas):
-                row_bits.append(f"λ = {float(lambdas[a]):.4g}")
+            if lambdas_per_block and lambdas_per_block[a] > 0:
+                n_lam = lambdas_per_block[a]
+                lam_chunk = lambdas[lambda_offset : lambda_offset + n_lam]
+                lambda_offset += n_lam
+                lam_strs = [f"{t}: {float(v):.4g}" for t, v in zip(term_labels, lam_chunk)]
+                row_bits.append(f"λ = [{', '.join(lam_strs)}]")
             if edf_per_class is not None and a < len(edf_per_class):
                 row_bits.append(f"edf = {float(edf_per_class[a]):.4g}")
             lines.append(
@@ -1195,10 +1208,7 @@ class MultinomialModel:
         # Wood rank-truncated Wald smooth-term significance table (#1101): the
         # same kernel the scalar `Model.summary` uses. Present only for
         # REML-fitted models carrying covariance + smooth terms.
-        try:
-            sig = self.smooth_significance()
-        except (RuntimeError, ValueError):
-            sig = []
+        sig = self.smooth_significance()
         if sig:
             lines.append("  smooth terms (Wood rank-truncated Wald):")
             lines.append(

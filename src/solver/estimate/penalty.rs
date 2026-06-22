@@ -464,7 +464,6 @@ pub(crate) fn map_hessian_to_original_basis(
     Ok(h)
 }
 
-use crate::model_types::result_types::dispersion_from_likelihood;
 
 /// Scale a posterior covariance `H^{-1}` by the coefficient-covariance scale.
 ///

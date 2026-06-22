@@ -2471,10 +2471,10 @@ impl CustomFamily for BinomialLocationScaleFamily {
     fn diagonalworking_weights_directional_derivative(
         &self,
         _: &[ParameterBlockState],
-        idx: usize,
+        _: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(arr.iter().all(|v| !v.is_nan()));
         Err(
             "BinomialLocationScaleFamily no longer supports diagonal working weights; exact curvature is required"

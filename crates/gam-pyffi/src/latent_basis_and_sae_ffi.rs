@@ -1102,6 +1102,13 @@ fn multinomial_model_metadata_pyfunc<'py>(
         "lambdas_per_block",
         envelope.saved.lambdas_per_block.clone(),
     )?;
+    let smooth_term_labels: Vec<String> = envelope
+        .saved
+        .smooth_term_spans
+        .iter()
+        .map(|span| span.label.clone())
+        .collect();
+    out.set_item("smooth_term_labels", smooth_term_labels)?;
     out.set_item("iterations", envelope.saved.iterations)?;
     out.set_item("converged", envelope.saved.converged)?;
     out.set_item(

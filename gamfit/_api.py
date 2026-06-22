@@ -1116,6 +1116,32 @@ def fit(
     if response_geometry is not None:
         if response_columns is None:
             raise ValueError("response_columns is required when response_geometry is set")
+        if family != "auto":
+            raise ValueError("family is forced to gaussian and cannot be specified with response_geometry")
+
+        for arg_name, arg_val in [
+            ("offset", offset),
+            ("transformation_normal", transformation_normal),
+            ("transformation_normal_stage1", transformation_normal_stage1),
+            ("survival_likelihood", survival_likelihood),
+            ("baseline_target", baseline_target),
+            ("baseline_scale", baseline_scale),
+            ("baseline_shape", baseline_shape),
+            ("baseline_rate", baseline_rate),
+            ("baseline_makeham", baseline_makeham),
+            ("z_column", z_column),
+            ("link", link),
+            ("logslope_formula", logslope_formula),
+            ("frailty_kind", frailty_kind),
+            ("frailty_sd", frailty_sd),
+            ("hazard_loading", hazard_loading),
+            ("noise_formula", noise_formula),
+            ("noise_offset", noise_offset),
+            ("flexible_link", flexible_link),
+        ]:
+            if arg_val is not None:
+                raise ValueError(f"{arg_name} is not supported with response_geometry")
+
         nested_config = dict(config or {})
         # Geometry is handled by the Python wrapper; scalar coordinate fits keep
         # using the ordinary Rust standard-GAM path.
@@ -1136,32 +1162,15 @@ def fit(
             reference=-1 if response_reference is None else int(response_reference),
             weights=weights,
             fisher_rao_w=fisher_rao_w,
-            fit_kwargs={
-                "offset": offset,
-                "weights": weights,
-                "transformation_normal": transformation_normal,
-                "survival_likelihood": survival_likelihood,
-                "baseline_target": baseline_target,
-                "baseline_scale": baseline_scale,
-                "baseline_shape": baseline_shape,
-                "baseline_rate": baseline_rate,
-                "baseline_makeham": baseline_makeham,
-                "z_column": z_column,
-                "link": link,
-                "logslope_formula": logslope_formula,
-                "frailty_kind": frailty_kind,
-                "frailty_sd": frailty_sd,
-                "hazard_loading": hazard_loading,
-                "scale_dimensions": scale_dimensions,
-                "adaptive_regularization": adaptive_regularization,
-                "firth": firth,
-                "precision_hyperpriors": precision_hyperpriors,
-                "fisher_rao_w": fisher_rao_w,
-                "latents": latents,
-                "penalties": penalties,
-                "smooths": smooths,
-                "config": nested_config or None,
-            },
+            scale_dimensions=scale_dimensions,
+            adaptive_regularization=adaptive_regularization,
+            firth=firth,
+            precision_hyperpriors=precision_hyperpriors,
+            latents=latents,
+            penalties=penalties,
+            smooths=smooths,
+            constraints=constraints,
+            config=nested_config or None,
         )
 
     headers, rows, table_kind = normalize_table(data)

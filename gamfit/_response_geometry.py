@@ -326,7 +326,6 @@ class ResponseGeometryModel:
         *,
         return_type: str | None = None,
         include_tangent: bool = False,
-        **kwargs: Any,
     ) -> Any:
         np = _np()
         _columns, input_kind = table_columns(data)
@@ -335,7 +334,7 @@ class ResponseGeometryModel:
         else:
             tangent_cols: list[Any] = []
             for model in self.models:
-                pred = model.predict(data, return_type="dict", **kwargs)
+                pred = model.predict(data, return_type="dict")
                 tangent_cols.append(np.asarray(pred["mean"], dtype=float))
             tangent = np.column_stack(tangent_cols)
         response = geometry_exp_map(
@@ -390,7 +389,15 @@ def fit_response_geometry(
     reference: int = -1,
     weights: str | None = None,
     fisher_rao_w: Any | None = None,
-    fit_kwargs: dict[str, Any] | None = None,
+    scale_dimensions: bool | None = None,
+    adaptive_regularization: bool | None = None,
+    firth: bool | None = None,
+    precision_hyperpriors: Any | None = None,
+    latents: Mapping[str, Any] | None = None,
+    penalties: Sequence[Any] | None = None,
+    smooths: Mapping[Any, Any] | None = None,
+    constraints: Mapping[str, Any] | None = None,
+    config: dict[str, Any] | None = None,
 ) -> ResponseGeometryModel:
     columns, table_kind = table_columns(data)
     y = response_matrix_from_table(data, response_columns)
@@ -416,16 +423,20 @@ def fit_response_geometry(
         reference=reference,
     )
     rhs = _formula_rhs(formula)
-    kwargs = dict(fit_kwargs or {})
-    kwargs["family"] = "gaussian"
-    kwargs["link"] = "identity"
-    kwargs["transformation_normal"] = None
-    kwargs["survival_likelihood"] = None
-    kwargs["z_column"] = None
-    kwargs["logslope_formula"] = None
-    kwargs["frailty_kind"] = None
-    kwargs["frailty_sd"] = None
-    kwargs["hazard_loading"] = None
+    kwargs = {
+        "family": "gaussian",
+        "link": "identity",
+        "weights": weights,
+        "scale_dimensions": scale_dimensions,
+        "adaptive_regularization": adaptive_regularization,
+        "firth": firth,
+        "precision_hyperpriors": precision_hyperpriors,
+        "latents": latents,
+        "penalties": penalties,
+        "smooths": smooths,
+        "constraints": constraints,
+        "config": config,
+    }
     np = _np()
     fisher_source = fisher_rao_w
     if fisher_source is None and resolved_coordinates.lower() == "alr":
@@ -447,7 +458,6 @@ def fit_response_geometry(
             int(tangent.shape[0]),
             int(tangent.shape[1]),
         )
-    kwargs.pop("fisher_rao_w", None)
     target = "__gamfit_response_geometry_shared"
     if target in columns:
         raise ValueError(f"response geometry reserved column already exists: {target}")

@@ -501,30 +501,30 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn transpose_mul(
         &self,
-        idx: usize,
+        _: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert_eq!(v.len(), self.n, "zero psi transpose_mul length mismatch");
         Ok(Array1::<f64>::zeros(self.p))
     }
 
     fn forward_mul(
         &self,
-        idx: usize,
+        _: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert_eq!(u.len(), self.p, "zero psi forward_mul length mismatch");
         Ok(Array1::<f64>::zeros(self.n))
     }
 
     fn transpose_mul_second_diag(
         &self,
-        idx: usize,
+        _: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert_eq!(
             v.len(),
             self.n,
@@ -535,12 +535,12 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn transpose_mul_second_cross(
         &self,
-        idx: usize,
-        idx2: usize,
+        _: usize,
+        _: usize,
         v: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        assert!(idx < usize::MAX);
-        assert!(idx2 < usize::MAX);
+        // Default implementation ignores this parameter.
+        // Default implementation ignores this parameter.
         assert_eq!(
             v.len(),
             self.n,
@@ -551,10 +551,10 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn forward_mul_second_diag(
         &self,
-        idx: usize,
+        _: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert_eq!(
             u.len(),
             self.p,
@@ -565,12 +565,12 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn forward_mul_second_cross(
         &self,
-        idx: usize,
-        idx2: usize,
+        _: usize,
+        _: usize,
         u: &ArrayView1<'_, f64>,
     ) -> Result<Array1<f64>, crate::terms::basis::BasisError> {
-        assert!(idx < usize::MAX);
-        assert!(idx2 < usize::MAX);
+        // Default implementation ignores this parameter.
+        // Default implementation ignores this parameter.
         assert_eq!(
             u.len(),
             self.p,
@@ -581,10 +581,10 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn row_chunk_first(
         &self,
-        idx: usize,
+        _: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(
             rows.start <= rows.end && rows.end <= self.n,
             "zero psi row_chunk_first row range out of bounds"
@@ -594,11 +594,11 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn row_vector_first_into(
         &self,
-        idx: usize,
+        _: usize,
         row: usize,
         mut out: ArrayViewMut1<'_, f64>,
     ) -> Result<(), crate::terms::basis::BasisError> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(
             row < self.n,
             "zero psi row_vector_first_into row out of bounds"
@@ -614,10 +614,10 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn row_chunk_second_diag(
         &self,
-        idx: usize,
+        _: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        assert!(idx < usize::MAX);
+        // Default implementation ignores this parameter.
         assert!(
             rows.start <= rows.end && rows.end <= self.n,
             "zero psi row_chunk_second_diag row range out of bounds"
@@ -627,12 +627,12 @@ impl CustomFamilyPsiDerivativeOperator for ZeroPsiDerivativeOperator {
 
     fn row_chunk_second_cross(
         &self,
-        idx: usize,
-        idx2: usize,
+        _: usize,
+        _: usize,
         rows: Range<usize>,
     ) -> Result<Array2<f64>, crate::terms::basis::BasisError> {
-        assert!(idx < usize::MAX);
-        assert!(idx2 < usize::MAX);
+        // Default implementation ignores this parameter.
+        // Default implementation ignores this parameter.
         assert!(
             rows.start <= rows.end && rows.end <= self.n,
             "zero psi row_chunk_second_cross row range out of bounds"
@@ -2612,8 +2612,8 @@ pub trait ExactNewtonJointHessianWorkspace: Send + Sync {
 }
 
 pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
-    fn first_order_terms(&self, idx: usize) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
-        assert!(idx < usize::MAX);
+    fn first_order_terms(&self, _: usize) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
+        // Default implementation ignores this parameter.
         Ok(None)
     }
 
@@ -2647,9 +2647,9 @@ pub trait ExactNewtonJointPsiWorkspace: Send + Sync {
     /// guards.
     fn second_order_terms_contracted(
         &self,
-        alpha_psi: &[f64],
+        _: &[f64],
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderContracted>, String> {
-        assert!(alpha_psi.len() < usize::MAX);
+        // Default implementation ignores this parameter.
         Ok(None)
     }
 

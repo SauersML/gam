@@ -99,9 +99,8 @@ pub trait HyperOperator: Send + Sync {
     fn trace_projected_factor_cached(
         &self,
         factor: &Array2<f64>,
-        factor_cache: &ProjectedFactorCache,
+        _factor_cache: &ProjectedFactorCache,
     ) -> f64 {
-        drop(factor_cache);
         self.trace_projected_factor(factor)
     }
 
@@ -116,9 +115,8 @@ pub trait HyperOperator: Send + Sync {
     fn projected_matrix_cached(
         &self,
         factor: &Array2<f64>,
-        factor_cache: &ProjectedFactorCache,
+        _factor_cache: &ProjectedFactorCache,
     ) -> Array2<f64> {
-        drop(factor_cache);
         self.projected_matrix(factor)
     }
 
@@ -815,6 +813,6 @@ pub struct ContractedPsiSecondOrder {
 pub type ContractedPsiSecondOrderFn =
     Arc<dyn Fn(&[f64]) -> Result<Option<ContractedPsiSecondOrder>, String> + Send + Sync>;
 
-use crate::solver::gaussian_reml::reml_outer_engine::dense_linalg::{
+use crate::solver::reml::reml_outer_engine::dense_linalg::{
     dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into,
 };
