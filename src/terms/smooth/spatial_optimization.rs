@@ -594,7 +594,14 @@ fn latent_id_objective_contribution(
                 .map_err(EstimationError::InvalidInput)?;
             let residual = &t - &targets;
             let q = residual.iter().map(|v| v * v).sum::<f64>();
-            cost += 0.5 * mu * q - 0.5 * n_obs as f64 * log_mu;
+            // The single shared precision `mu` governs every one of the
+            // `n_obs · latent_dim` scalar latent coordinates, so the prior
+            // log-determinant normalizer `−0.5·log det₊(mu · I_K)` counts
+            // `K = n_obs · latent_dim`. (The per-axis ARD path below emits
+            // `−0.5·n_obs·ln(α)` for each of `latent_dim` axes; one shared `mu`
+            // must equal that sum.)
+            let k = (n_obs * latent_dim) as f64;
+            cost += 0.5 * mu * q - 0.5 * k * log_mu;
 
             let projected_residual = aux_prior_targets(residual.view(), u.view(), *family)
                 .map_err(EstimationError::InvalidInput)?;
@@ -605,7 +612,7 @@ fn latent_id_objective_contribution(
                 }
             }
             if matches!(strength, AuxPriorStrength::Auto) {
-                gradient[direct_start] += 0.5 * mu * q - 0.5 * n_obs as f64;
+                gradient[direct_start] += 0.5 * mu * q - 0.5 * k;
             }
         }
         LatentIdMode::IsometryToReference { reference, strength } => {
@@ -634,14 +641,18 @@ fn latent_id_objective_contribution(
             };
             let residual = &t - reference;
             let q = residual.iter().map(|v| v * v).sum::<f64>();
-            cost += 0.5 * mu * q - 0.5 * n_obs as f64 * log_mu;
+            // Shared precision `mu` over all `K = n_obs · latent_dim` scalar
+            // coordinates: the normalizer `−0.5·log det₊(mu · I_K)` counts `K`,
+            // matching the AuxPrior arm and the ARD path's per-axis sum.
+            let k = (n_obs * latent_dim) as f64;
+            cost += 0.5 * mu * q - 0.5 * k * log_mu;
             for n in 0..n_obs {
                 for axis in 0..latent_dim {
                     gradient[t_start + n * latent_dim + axis] += mu * residual[[n, axis]];
                 }
             }
             if matches!(strength, AuxPriorStrength::Auto) {
-                gradient[mu_slot] += 0.5 * mu * q - 0.5 * n_obs as f64;
+                gradient[mu_slot] += 0.5 * mu * q - 0.5 * k;
             }
         }
         LatentIdMode::AuxOutcome { head, .. } => {

@@ -1435,10 +1435,18 @@ pub struct AuxPriorRemlStats {
 /// Auxiliary-prior REML statistics for a fixed outer coordinate `t`, given the
 /// precomputed `targets` (see [`aux_prior_targets`]). Returns the residual sum of
 /// squares, the precision `mu` (the supplied `aux_strength` when `Some`, else the
-/// closed-form REML optimum `mu = n / Σr²`), whether it was auto-selected, and
-/// the prior score `0.5·mu·Σr² − 0.5·n·ln(mu)`. The `log_mu` coordinate has this
+/// closed-form REML optimum `mu = K / Σr²`), whether it was auto-selected, and
+/// the prior score `0.5·mu·Σr² − 0.5·K·ln(mu)`. The `log_mu` coordinate has this
 /// closed-form optimum at fixed `t` because only the normalized auxiliary prior
 /// depends on it.
+///
+/// `K = n_obs · latent_dim` is the number of scalar latent coordinates the single
+/// shared precision `mu` governs. The normalizer term `−0.5·K·ln(mu)` is the prior
+/// log-determinant `−0.5·log det₊(mu · I_K)`, so it counts every governed
+/// coordinate. Counting only `n_obs` undercounts a `latent_dim`-dimensional latent
+/// by exactly `latent_dim`, which biases the REML precision toward under-shrinkage
+/// (the per-axis ARD path emits `−0.5·n_obs·ln(α)` for each of `latent_dim` axes;
+/// a single shared `mu` must match that sum).
 pub fn aux_prior_reml_stats(
     t_mat: ArrayView2<'_, f64>,
     targets: ArrayView2<'_, f64>,
@@ -1472,7 +1480,7 @@ pub fn aux_prior_reml_stats(
                         .to_string(),
                 );
             }
-            let mu = (n_obs as f64) / residual_sq;
+            let mu = ((n_obs * latent_dim) as f64) / residual_sq;
             if !(mu.is_finite() && mu > 0.0) {
                 return Err(format!(
                     "auto aux_strength selected a non-finite precision: {mu}"
@@ -1481,7 +1489,7 @@ pub fn aux_prior_reml_stats(
             (mu.ln(), mu, true)
         }
     };
-    let score = 0.5 * mu * residual_sq - 0.5 * (n_obs as f64) * log_mu;
+    let score = 0.5 * mu * residual_sq - 0.5 * ((n_obs * latent_dim) as f64) * log_mu;
     Ok(AuxPriorRemlStats {
         residual_sq,
         log_mu,

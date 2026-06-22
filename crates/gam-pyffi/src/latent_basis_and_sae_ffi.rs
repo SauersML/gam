@@ -7399,7 +7399,9 @@ fn gaussian_reml_fit_latent_backward<'py>(
             }
         }
         grad_aux_log_strength = Some(
-            grad_reml_score * (0.5 * stats.strength.mu * stats.residual_sq - 0.5 * n_obs as f64),
+            grad_reml_score
+                * (0.5 * stats.strength.mu * stats.residual_sq
+                    - 0.5 * (n_obs * latent_dim) as f64),
         );
     }
     if let Some(log_prec) = dim_selection_log_precision.as_ref() {
