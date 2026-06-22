@@ -1466,6 +1466,212 @@ fn survival_ls_packed_directional_matches_dense_tower_body() {
     }
 }
 
+/// #932 STRESS hardening of [`survival_ls_packed_directional_matches_dense_tower_932`].
+///
+/// The benign-fixture oracle above proves the packed `OneSeed`/`TwoSeed`
+/// contractions equal the independent dense `Tower4<9>` on moderate primaries.
+/// This arm hardens that gate in two ways a benign equality check cannot:
+///
+///   1. HIGH-CURVATURE / NEAR-DEGENERATE fixture. The primaries are pushed into
+///      the regime where the per-row NLL stacks saturate and their high-order
+///      jets blow up — exactly where a dropped/mis-scaled 3rd-or-4th-order term
+///      hides on a benign point:
+///        * deep-tail exit/entry indices `u0,u1` (large negative → `log S`
+///          curvature large; the `compose_unary` survival stack is evaluated far
+///          from 0 where its 3rd/4th derivatives dominate);
+///        * extreme `log-σ` channels (`exp(−η_lσ)` spans ~e^−2..e^2), so the
+///          threshold contributions to `u0,u1,g` are strongly amplified;
+///        * a deliberately SMALL-but-positive event Jacobian `g` (near the
+///          `log g` singularity, where `∂ⁿ log g = (−1)ⁿ⁻¹(n−1)!/gⁿ` is huge),
+///          stressing the `survival_ls_positive_log_stack` chain at 3rd/4th order.
+///      A vacuity guard asserts the fixture actually reaches this regime (small
+///      `g`, large `|u|`) so the stress is real, not nominal.
+///
+///   2. PLANTED SIGN-FLIP tripwire. Equality `packed == dense` alone does not
+///      prove the oracle could SEE a wrong packed value. After the exact match we
+///      negate a representative 4th-order cross entry and assert the packed value
+///      does NOT match the flip — i.e. the oracle has genuine resolving power
+///      against a sign/term error on the very block it guards.
+#[test]
+fn survival_ls_packed_directional_matches_dense_tower_high_curvature_932() {
+    let join_result = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(survival_ls_packed_directional_high_curvature_body)
+        .expect("spawn wide-stack high-curvature packed-directional oracle thread")
+        .join();
+    assert!(
+        join_result.is_ok(),
+        "survival LS high-curvature #932 oracle thread must complete"
+    );
+}
+
+fn survival_ls_packed_directional_high_curvature_body() {
+    use crate::families::jet_tower::evaluate_program;
+    use crate::families::row_kernel::RowKernel;
+
+    // Channel layout (matches `SurvivalLsJointNllProgram::row_nll`):
+    //   [0]=t_entry [1]=t_exit [2]=t_deriv [3]=thr_exit [4]=thr_entry
+    //   [5]=thr_deriv [6]=lσ_exit [7]=lσ_entry [8]=lσ_deriv.
+    // These rows drive `u0,u1` deep into the tail and `g` small-positive:
+    //   inv_σ_exit = e^{−p6}, u1 = p1 − p3·inv_σ_exit,
+    //   g = p2 + inv_σ_exit·(p3·p8 − p5)  (must stay > 0 for log g).
+    let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+        // Large log-σ swing (p6=1.8 ⇒ inv_σ_exit≈0.165; p7=−1.6 ⇒ inv_σ_entry≈4.95),
+        // big thresholds ⇒ |u0|,|u1| large; g≈0.9+0.165·(2.2·0.5−0.7)=0.966 → push
+        // smaller below.
+        [2.4, -3.1, 0.9, 2.2, 3.5, 0.7, 1.8, -1.6, 0.5],
+        // Deep-tail censored row with a SMALL event-Jacobian-style g build and a
+        // strongly negative exit index.
+        [-2.8, -4.2, 0.35, -2.6, -3.4, 1.3, -1.7, 1.5, -0.9],
+        // Near-degenerate g: p2=0.12, inv_σ_exit=e^{-0.4}≈0.670,
+        // g=0.12+0.670·(1.4·0.6−0.18)=0.12+0.670·0.66=0.562 → still positive but
+        // with large threshold curvature feeding u1.
+        [0.6, 3.8, 0.12, 1.4, 2.1, 0.18, 0.4, -0.5, 0.6],
+        // Tiny g with big tail: p2=0.05, inv_σ_exit=e^{-1.1}≈0.333,
+        // g=0.05+0.333·(0.9·0.4−0.05)=0.05+0.333·0.31=0.153 (small ⇒ huge log g jets).
+        [-1.2, 4.6, 0.05, 0.9, -2.3, 0.05, 1.1, -1.3, 0.4],
+    ];
+    let event = [1.0, 0.0, 1.0, 1.0];
+    let weight = [1.0, 0.9, 1.2, 0.8];
+    let n = primaries.len();
+
+    // Dense deterministic directions so every one of the nine channels
+    // participates in every contraction (no dropped/flipped cross block can hide).
+    let dirs: [[f64; SLS_ROW_K]; 3] = [
+        [0.7, -1.3, 0.5, 0.9, -0.6, 0.3, -1.1, 0.4, 0.8],
+        [-0.4, 0.6, -1.1, 0.3, 1.2, -0.7, 0.5, -0.9, 0.2],
+        [1.2, 0.2, -0.7, -0.5, 0.4, 1.0, -0.3, 0.6, -1.2],
+    ];
+
+    // Vacuity guard: confirm at least one event row actually reaches the
+    // high-curvature regime — a small-positive `g` and a large-magnitude exit
+    // index `u1` — so the stress is genuine, not a nominal relabelling of a
+    // benign point.
+    let mut min_event_g = f64::INFINITY;
+    let mut max_abs_u1 = 0.0_f64;
+    for (row, p) in primaries.iter().enumerate() {
+        let inv_sigma_exit = (-p[6]).exp();
+        let u1 = p[1] - p[3] * inv_sigma_exit;
+        let g = p[2] + inv_sigma_exit * (p[3] * p[8] - p[5]);
+        assert!(
+            g > 0.0,
+            "fixture row {row} has non-positive event Jacobian g={g:.4e}; log g undefined"
+        );
+        if event[row] != 0.0 {
+            min_event_g = min_event_g.min(g);
+        }
+        max_abs_u1 = max_abs_u1.max(u1.abs());
+    }
+    assert!(
+        min_event_g < 0.2,
+        "high-curvature fixture vacuous: smallest event-row g={min_event_g:.4e} is not near \
+         the log g singularity (want < 0.2); the small-g 3rd/4th-order stress is absent"
+    );
+    assert!(
+        max_abs_u1 > 3.0,
+        "high-curvature fixture vacuous: largest |u1|={max_abs_u1:.4e} is not deep in the \
+         survival tail (want > 3.0); the saturated log-survival curvature stress is absent"
+    );
+
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let inverse_link = residual_distribution_inverse_link(distribution);
+        let family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+        let states = survival_ls_joint_oracle_states(&primaries);
+        let q = family
+            .collect_joint_quantities(&states)
+            .expect("collect joint quantities");
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("dynamic geometry");
+        let kernel = SurvivalLsRowKernel {
+            family: &family,
+            q: &q,
+            dynamic: &dynamic,
+            deriv_log_scale: 0.0,
+            offsets: family.joint_block_offsets(),
+        };
+        let program = SurvivalLsJointNllProgram {
+            inverse_link: &inverse_link,
+            primaries: primaries.clone(),
+            event: event.to_vec(),
+            weight: weight.to_vec(),
+        };
+
+        // A slightly looser relative tolerance than the benign oracle's 1e-9:
+        // the deep-tail/small-g jets have magnitudes up to ~1e3, so the
+        // `(1+|want|)` relative band already scales with that; the absolute floor
+        // stays tight. A genuine dropped term is O(magnitude), far outside this.
+        let rel_tol = 1e-8_f64;
+
+        for row in 0..n {
+            let tower = evaluate_program(&program, row).expect("dense row tower (high curvature)");
+            for u in &dirs {
+                let dense_third = tower.third_contracted(u);
+                let packed_third =
+                    RowKernel::row_third_contracted(&kernel, row, u).expect("packed third");
+                for a in 0..SLS_ROW_K {
+                    for b in 0..SLS_ROW_K {
+                        let want = dense_third[a][b];
+                        let got = packed_third[a][b];
+                        assert!(
+                            (got - want).abs() <= rel_tol * (1.0 + want.abs()),
+                            "{distribution:?} HC row {row} third[{a}][{b}]: packed OneSeed {got} \
+                             vs dense Tower4 {want}"
+                        );
+                    }
+                }
+                for v in &dirs {
+                    let dense_fourth = tower.fourth_contracted(u, v);
+                    let packed_fourth =
+                        RowKernel::row_fourth_contracted(&kernel, row, u, v).expect("packed fourth");
+                    for a in 0..SLS_ROW_K {
+                        for b in 0..SLS_ROW_K {
+                            let want = dense_fourth[a][b];
+                            let got = packed_fourth[a][b];
+                            assert!(
+                                (got - want).abs() <= rel_tol * (1.0 + want.abs()),
+                                "{distribution:?} HC row {row} fourth[{a}][{b}]: packed TwoSeed \
+                                 {got} vs dense Tower4 {want}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Planted sign-flip tripwire ───────────────────────────────────────
+        // Pick the event row with the smallest g (max log-g curvature) and a
+        // 4th-order cross entry that is genuinely nonzero, then assert that
+        // negating the dense truth leaves the packed band: the oracle can SEE a
+        // sign/term error on the block it guards (not just confirm equality).
+        let trip_row = 3usize; // tiny-g, deep-tail event row
+        let du = &dirs[0];
+        let dv = &dirs[1];
+        let dense_fourth = evaluate_program(&program, trip_row)
+            .expect("trip tower")
+            .fourth_contracted(du, dv);
+        let packed_fourth = RowKernel::row_fourth_contracted(&kernel, trip_row, du, dv)
+            .expect("trip packed fourth");
+        // (t_deriv, lσ_exit) = [2][6]: a cross block that genuinely couples the
+        // event-Jacobian and scale channels through g and u1.
+        let (ca, cb) = (2usize, 6usize);
+        let want = dense_fourth[ca][cb];
+        if want.abs() > 1e-6 {
+            let flipped = -packed_fourth[ca][cb];
+            assert!(
+                (flipped - want).abs() > 1e-8 * (1.0 + want.abs()),
+                "{distribution:?} oracle failed to reject a planted fourth[{ca}][{cb}] sign flip: \
+                 flipped {flipped:+.9e} vs dense truth {want:+.9e} — the high-curvature gate has \
+                 no resolving power against a cross-block sign error"
+            );
+        }
+    }
+}
+
 /// The hand-derived analytic joint-Hessian directional derivative
 /// (`exact_newton_joint_hessian_directional_derivative_from_parts`) must agree
 /// with the jet-tower-certified generic row-kernel directional derivative on a
