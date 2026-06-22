@@ -801,7 +801,11 @@ fn main() {
 ///   1. the ban-scanner's terminal hard exit removed or made conditional (e.g.
 ///      quietly turned into a warning, as happened once and rode `main` for days);
 ///   2. any `process::exit` gate guarded by an environment variable;
-///   3. "temporary unblock"-style hack language anywhere in the file.
+///   3. "temporary unblock"-style hack language anywhere in the file;
+///   4. a hardcoded commit-SHA literal — build.rs operates on git history
+///      generically and never names a specific commit in code, so a quoted
+///      git-SHA-shaped literal is always an allowlist that exempts hand-picked
+///      commits from a history audit (the gate-level form of wording laundering).
 ///
 /// Every match needle is assembled from fragments at runtime, so this function
 /// never matches its own source. Like the other gates here, it may not be
@@ -925,6 +929,45 @@ fn forbid_build_rs_self_tampering(manifest_dir: &Path) {
                  (`{phrase}`). The gates here are not to be temporarily weakened; fix the \
                  underlying violations instead of weakening a gate."
             );
+        }
+    }
+
+    // ---- (4) no hardcoded commit-SHA literal (allowlist suppression) ----
+    // build.rs reads git history dynamically and has NO legitimate reason to name
+    // a specific commit in code. A quoted git-SHA-shaped literal is therefore an
+    // exemption/allowlist that skips a history audit for hand-picked commits — the
+    // gate-level analogue of the comment laundering those audits exist to catch
+    // (e.g. a `HUMAN_REVIEWED_DODGE_EXEMPT` list added to the cosmetic-dodge audit
+    // to make a laundering commit's violations vanish). This arm is content-based,
+    // so it fires on every build regardless of who authored the commit — closing
+    // the door a maintainer could otherwise be socially-engineered into opening.
+    //
+    // A SHA discussed in a COMMENT is unquoted prose, so it is never matched; only
+    // quoted string literals are inspected. "SHA-shaped" = a 7..=40 char run of
+    // lowercase hex carrying BOTH a digit and an a-f letter, which excludes plain
+    // decimal version strings and ordinary English words while catching every
+    // realistic abbreviated or full git object name.
+    for (line_no, raw) in lines.iter().enumerate() {
+        // Odd-position fragments of a `"`-split line are the quoted-string
+        // contents. Escapes inside a SHA literal do not occur, so this is exact
+        // for the construct being banned.
+        for literal in raw.split('"').skip(1).step_by(2) {
+            let len = literal.len();
+            let all_lower_hex = literal
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            let has_digit = literal.bytes().any(|b| b.is_ascii_digit());
+            let has_hex_letter = literal.bytes().any(|b| (b'a'..=b'f').contains(&b));
+            if (7..=40).contains(&len) && all_lower_hex && has_digit && has_hex_letter {
+                panic!(
+                    "self-integrity gate: build.rs contains a hardcoded commit-SHA literal \
+                     (`{literal}` at line {}). build.rs must operate on git history \
+                     generically; pinning a commit is an allowlist that exempts hand-picked \
+                     commits from a history audit and is banned. Remove the exemption and do \
+                     the real work the audit demands instead of suppressing it.",
+                    line_no + 1
+                );
+            }
         }
     }
 }
