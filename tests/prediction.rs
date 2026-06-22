@@ -20,6 +20,8 @@ mod latent_cloglog_inverse_link_cdf_monotone_bounds;
 mod mixture_link_cauchit_loglog_state_rejection;
 #[path = "prediction/predict_at_training_matches_fitted.rs"]
 mod predict_at_training_matches_fitted;
+#[path = "prediction/predict_at_training_matches_fitted_basis_sweep.rs"]
+mod predict_at_training_matches_fitted_basis_sweep;
 #[path = "prediction/predict_byfactor_recovers_truth_on_grid.rs"]
 mod predict_byfactor_recovers_truth_on_grid;
 #[path = "prediction/predict_dispersion_location_scale_not_binomial_1064.rs"]
