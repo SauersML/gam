@@ -639,10 +639,34 @@ pub fn build_constant_curvature_basis(
     // L(κ) = ℓ_ref·s(κ)/s₀ so changing κ moves the geometry, not the kernel
     // resolution (the #1059 curvature-identification fix). At κ = 0, L = ℓ_ref.
     let length_scale = realized_constant_curvature_length_scale(centers.view(), spec.length_scale)?;
+    // DESIGN effective length L(κ): solved against the DATA→center fill so the
+    // realized design's effective DOF stays κ-invariant (#944/#1059). The design
+    // X = K(data, centers)·z is built at this L.
     let (ell_eff, _, _) =
         constant_curvature_effective_length_jet(data, centers.view(), length_scale, spec.kappa)?;
-    let raw_penalty =
-        constant_curvature_kernel_matrix(centers.view(), centers.view(), spec.kappa, ell_eff)?;
+    // PENALTY effective length L_S(κ): solved against the CENTER→center fill so
+    // the penalty Gram S = zᵀK(centers,centers)z has a κ-INVARIANT resolution
+    // (#1464). The data→center fill that pins L(κ) does NOT pin the center→center
+    // penalty spectrum, so with the single shared L the penalty pseudo-determinant
+    // logdet|S|₊ drifts freely with κ: as κ grows positive the geodesic kernel
+    // collapses toward the constant, the center→center Gram eigenvalues bunch /
+    // drop below the rank tolerance, logdet|S|₊ falls, and the REML Occam term
+    // −½·logdet|S|₊ DECREASES — rewarding the +κ collapsed-kernel corner and
+    // railing κ̂ to the +chart bound for any curved data (the headline #1464
+    // sign-blindness: hyperbolic truth recovered as spherical, V_p(κ) monotone in
+    // κ with no interior optimum). Building the penalty at L_S(κ) holds the
+    // penalty eigenvalue SHAPE (hence logdet|S|₊ and its rank) κ-comparable, so
+    // the Occam term stops rewarding the collapse and V_p regains an interior
+    // minimum near the data-generating κ. At κ = 0, L_S = ℓ_ref = L, so the κ = 0
+    // build is byte-identical.
+    let (ell_eff_penalty, _, _) =
+        constant_curvature_effective_length_jet(centers.view(), centers.view(), length_scale, spec.kappa)?;
+    let raw_penalty = constant_curvature_kernel_matrix(
+        centers.view(),
+        centers.view(),
+        spec.kappa,
+        ell_eff_penalty,
+    )?;
     // Realized-design constraint transform: uniform coefficient sum-to-zero at
     // fit time; the frozen composed `z · z_parametric` at predict time (#532
     // pattern — see ConstantCurvatureIdentifiability).
@@ -850,11 +874,19 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
     // kernel κ-jets DIRECTLY — there is no normalization quotient rule to
     // propagate, which also removes the κ-dependent ‖S‖_F factor that the
     // normalized form had to differentiate.
+    //
+    // The penalty kernel is built at the CENTER→center effective-length jet
+    // L_S(κ) (#1464), NOT the design's data→center L(κ), so the analytic κ-gradient
+    // of logdet|S|₊ stays EXACT for the penalty-resolution-invariant value build
+    // above. q_S = d/L_S with both d and L_S moving in κ, so the quotient chain
+    // rule inside `constant_curvature_kernel_kappa_jets_scaled` carries the L_S jet.
+    let l_jet_penalty =
+        constant_curvature_effective_length_jet(centers.view(), centers.view(), length_scale, spec.kappa)?;
     let (_k_cc, dk_cc, dkk_cc) = constant_curvature_kernel_kappa_jets_scaled(
         centers.view(),
         centers.view(),
         spec.kappa,
-        l_jet,
+        l_jet_penalty,
     )?;
     let s_first = symmetrize(&gauge.restrict_penalty(&dk_cc));
     let s_second = symmetrize(&gauge.restrict_penalty(&dkk_cc));
