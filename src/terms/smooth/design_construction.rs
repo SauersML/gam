@@ -673,6 +673,22 @@ fn apply_global_smooth_identifiability(
             }
             out
         };
+        // [#1470-TRACE] remove before merge — empirical probe of ownership/gate
+        if std::env::var("GAM_1470_TRACE").is_ok() {
+            eprintln!(
+                "[1470] term='{}' idx={} owners_registered={:?} owners_after_gate={:?} \
+                 marginal_centered_tensor={} skip_global={} replay={} design cols={} rows={}",
+                term.name,
+                idx,
+                term_owners[idx],
+                owner_indices,
+                termspec.basis.is_marginally_centered_tensor(),
+                skip_global_transform,
+                replay_z.is_some(),
+                design_local.ncols(),
+                design_local.nrows(),
+            );
+        }
         let owner_blocks = owner_indices
             .iter()
             .map(|owner_idx| {

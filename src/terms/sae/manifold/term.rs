@@ -178,6 +178,26 @@ pub(crate) const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
 
 pub(crate) const SAE_FINAL_EV_DEGRADATION_TOL: f64 = 1.0e-3;
 
+/// #1026 — bound on the final alternating decoder-LSQ / coordinate-reprojection
+/// reconstruction polish that runs once after the joint Newton walk converges
+/// (see [`SaeManifoldTerm::run_joint_fit_arrow_schur`]). Each round is a
+/// closed-form decoder refit → per-row coordinate re-projection → decoder refit,
+/// committed only on a strict EV improvement. A handful of rounds captures the
+/// monotone gain on an under-converged real-data basin; the alternation is a
+/// Lloyd/EM contraction so later rounds yield diminishing returns and the
+/// strict-improvement gate stops it as soon as a round fails to advance EV. On an
+/// already-converged decoder the first round reproduces the same decoder and the
+/// gate reverts it immediately, so this is a no-op for healthy fits.
+pub(crate) const SAE_FINAL_DECODER_POLISH_MAX_ROUNDS: usize = 4;
+
+/// #1026 — per-row coordinate re-projection grid resolution for the final
+/// reconstruction polish (matches the resolution the curvature-homotopy arrival
+/// polish uses in `outer_objective.rs`). The projection snaps each row's latent
+/// coordinate to the nearest point of a `resolution`-point decode grid, so a
+/// finer grid is a tighter chart re-fit; `256` is the established cost/precision
+/// point for the chart re-projection (a circle/sphere/Euclidean grid sweep).
+pub(crate) const SAE_FINAL_DECODER_POLISH_PROJECTION_RESOLUTION: usize = 256;
+
 pub(crate) const SAE_SEED_DISPERSION_FLOOR: f64 = 1.0e-12;
 
 /// #1026 decoder-repulsion conditioner strength. Small fixed weight on the

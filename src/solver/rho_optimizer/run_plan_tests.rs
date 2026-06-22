@@ -2907,6 +2907,60 @@ fn candidate_selection_prefers_lower_cost_within_same_convergence_class() {
 }
 
 #[test]
+fn parsimonious_keep_best_breaks_laml_tie_toward_more_smoothing() {
+    let plan = OuterPlan {
+        solver: Solver::Bfgs,
+        hessian_source: HessianSource::BfgsApprox,
+    };
+    let rho_dim = 2usize;
+
+    // Two CONVERGED optima whose LAML values are a statistical tie (within the
+    // relative band): a flexible (low-Σρ) basin scoring epsilon BETTER, and a
+    // parsimonious (high-Σρ) basin. The parsimonious one must win the tie.
+    let flexible = OuterResult::new(array![-3.0, -3.0], 100.0, 1, true, plan);
+    let mut parsimonious = OuterResult::new(array![3.0, 3.0], 100.05, 1, true, plan);
+    parsimonious.final_grad_norm = Some(0.0);
+
+    // gap 0.05 <= 1e-3 * 100.05 (=0.10005) → tie band → prefer larger Σρ.
+    assert!(candidate_improves_best_parsimonious(
+        &parsimonious,
+        Some(&flexible),
+        rho_dim,
+    ));
+    // The flexible (lower-LAML) candidate must NOT displace the parsimonious
+    // incumbent on a tie — the tie-break is asymmetric toward more smoothing.
+    assert!(!candidate_improves_best_parsimonious(
+        &flexible,
+        Some(&parsimonious),
+        rho_dim,
+    ));
+
+    // A DECISIVE LAML advantage for the flexible basin (gap far outside the
+    // band) must still win: a fit that genuinely needs the flexibility is not
+    // sacrificed to parsimony.
+    let decisive_flexible = OuterResult::new(array![-3.0, -3.0], 90.0, 1, true, plan);
+    assert!(candidate_improves_best_parsimonious(
+        &decisive_flexible,
+        Some(&parsimonious),
+        rho_dim,
+    ));
+
+    // The convergence-class rule is unchanged: a converged candidate always
+    // beats a non-converged incumbent regardless of LAML/parsimony.
+    let nonconverged = OuterResult::new(array![5.0, 5.0], 50.0, 1, false, plan);
+    assert!(candidate_improves_best_parsimonious(
+        &parsimonious,
+        Some(&nonconverged),
+        rho_dim,
+    ));
+    assert!(!candidate_improves_best_parsimonious(
+        &nonconverged,
+        Some(&parsimonious),
+        rho_dim,
+    ));
+}
+
+#[test]
 fn gaussian_multistart_compares_converged_seed_costs() {
     let mut seed_config = crate::seeding::SeedConfig::default();
     seed_config.seed_budget = 2;

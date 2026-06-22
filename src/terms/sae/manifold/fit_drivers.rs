@@ -3262,6 +3262,86 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        // #1026 — final EV-gated alternating decoder-LSQ / coordinate-reprojection
+        // polish on the converged (best) basin.
+        //
+        // The bounded joint Newton walk above can return an UNDER-converged decoder
+        // on real long-tailed activations: a modest `max_iter` (the OLMo real-recon
+        // budget is `n_iter = 32` at K = 8 on a 64-dim cross-layer cloud) truncates
+        // the joint (t, β) solve before the decoder β reaches the penalized argmin
+        // for the converged coordinates, and the line-search / proximal LM damping
+        // shortens β steps further near a flat decoder-null direction. The result is
+        // the "degenerate-basin under-recovery" #1026 documents on REAL data: the
+        // dictionary reconstructs planted synthetic circles cleanly but leaves EV on
+        // the table on the long-tailed real spectrum because the decoder never
+        // settled, not because the chart is wrong.
+        //
+        // The cure reuses the SAME proven primitives the curvature-homotopy arrival
+        // path already trusts (`SaeManifoldOuterObjective::run_curvature_homotopy_
+        // entry_at_rho`, outer_objective.rs): a closed-form least-squares decoder
+        // refit at the current coordinates/gates (the exact data-optimal decoder for
+        // the fixed chart), then a per-row coordinate re-projection onto that
+        // refreshed decoder (a Lloyd/EM step that snaps each row's latent coordinate
+        // to the nearest decoded grid point), then one more decoder refit at the
+        // re-projected coordinates. Each half-step is a closed-form global minimizer
+        // of its own sub-problem, so the alternation monotonically reduces the
+        // reconstruction residual on the data it sees.
+        //
+        // It is applied here (every joint fit) rather than only on the homotopy
+        // arrival because the standard inner solve — the path the real-data fit
+        // actually takes when the curvature walk bifurcates rather than "arrives" —
+        // never reached this polish before. Each accepted alternation is committed
+        // ONLY when the dictionary reconstruction EV strictly improves beyond the
+        // degradation tolerance, snapshotting first and restoring on any non-
+        // improvement; so on a fit that already converged (the common case, every
+        // healthy synthetic fit) the first refit reproduces the same decoder and the
+        // EV does not move, the polish reverts, and the returned state is bit-for-bit
+        // the pre-polish converged state. The polish can therefore only ever RAISE
+        // reconstruction parity, never lower it, and never perturbs a good basin.
+        //
+        // Skipped when decoder frames are active: `refit_decoder_least_squares_at_
+        // current_state` writes the full-`B` decoder directly, which would desync the
+        // factored frames the inner solve and `apply_newton_step` rely on; the
+        // homotopy-arrival polish makes the same conservative choice. K = 1 with a
+        // periodic atom on a wrong (chord) basin is also left to the homotopy
+        // recovery, not perturbed here.
+        if !self.frames_active() {
+            let mut best_polish_ev = self
+                .dictionary_reconstruction_ev(target, rho)
+                .unwrap_or(f64::NEG_INFINITY);
+            if best_polish_ev.is_finite() {
+                for _ in 0..SAE_FINAL_DECODER_POLISH_MAX_ROUNDS {
+                    let snapshot = self.snapshot_mutable_state();
+                    let round = self
+                        .refit_decoder_least_squares_at_current_state(target, Some(rho))
+                        .and_then(|()| {
+                            self.seed_coords_by_decoder_projection(
+                                target,
+                                SAE_FINAL_DECODER_POLISH_PROJECTION_RESOLUTION,
+                            )
+                        })
+                        .and_then(|()| {
+                            self.refit_decoder_least_squares_at_current_state(target, Some(rho))
+                        })
+                        .and_then(|()| self.dictionary_reconstruction_ev(target, rho));
+                    match round {
+                        Ok(ev)
+                            if ev.is_finite()
+                                && ev > best_polish_ev + SAE_FINAL_EV_DEGRADATION_TOL =>
+                        {
+                            best_polish_ev = ev;
+                        }
+                        _ => {
+                            // No strict improvement (already converged, or a refit /
+                            // projection failure): restore and stop — the polish is a
+                            // strict no-op on a settled decoder.
+                            self.restore_mutable_state(&snapshot);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         // ρ is owned by the outer engine and unchanged here; just return the
         // converged inner loss at the fixed ρ.
         self.loss(target, rho)
