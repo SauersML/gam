@@ -4324,14 +4324,31 @@ impl<'a> RemlState<'a> {
             .map_err(EstimationError::EigendecompositionFailed)?;
         let h_thr =
             super::reml_outer_engine::positive_eigenvalue_threshold(h_evals.as_slice().unwrap());
-        let log_det =
-            super::reml_outer_engine::exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_thr);
         let kept: Vec<usize> = (0..p).filter(|&j| h_evals[j] > h_thr).collect();
         if kept.is_empty() {
             // No positive curvature anywhere: nothing identified, nothing to
             // correct — mirrors the structurally-null-penalty contract.
             return Ok((0.0, None));
         }
+        // Rank-guarded full log|H| (#1426 part A). When EVERY eigenvalue clears
+        // the (relative, eigensolver-noise-calibrated) threshold, H is full
+        // rank: there is no genuinely-null direction, so the pseudo-logdet is
+        // *identically* the full logdet `Σ_j ln μ_j`. Computing it as the full
+        // sum over all p eigenvalues here makes that equivalence explicit and
+        // guarantees the LAML determinant pair `½(log|H| − log|S|₊)` never
+        // orphans a small-but-real H direction that the penalty side keeps —
+        // the #1426 Occam-pair-inversion hazard. This is behaviourally identical
+        // to `exact_pseudo_logdet(.., h_thr)` whenever `kept.len() == p` (the
+        // filtered sum already spans every eigenvalue), so it cannot perturb any
+        // existing FD cert; it differs from the pseudo path ONLY in the
+        // genuinely rank-deficient case, where `kept.len() < p` and we fall back
+        // to the exact pseudo-logdet that #901 installed to tame the
+        // (p − rank)·ln ε divergence over true-null directions.
+        let log_det = if kept.len() == p {
+            h_evals.iter().map(|&s| s.ln()).sum()
+        } else {
+            super::reml_outer_engine::exact_pseudo_logdet(h_evals.as_slice().unwrap(), h_thr)
+        };
 
         // Spectral form of H_pen⁺: U_H (p × r) and diag(1/σ). In this basis
         // `h_proj_inverse = (U_Hᵀ H U_H)⁻¹ = diag(1/σ)` EXACTLY, so the two
