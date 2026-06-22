@@ -517,9 +517,11 @@ impl ResidentDesignGram {
     /// per design row. Returns `None` on a shape mismatch or device failure.
     #[must_use]
     pub fn gram(&self, w: ArrayView1<'_, f64>) -> Option<Array2<f64>> {
+        if w.is_empty() {
+            return None;
+        }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = w;
             match self._never {}
         }
         #[cfg(target_os = "linux")]
