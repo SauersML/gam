@@ -548,9 +548,13 @@ fn hifreq_tensor_k4() -> Result<(), String> {
 fn hifreq_tensor_k6() -> Result<(), String> {
     hifreq_tensor_probe(6);
 }
-// gam#1082: hifreq_tensor_k8/k10 exceed the CI per-test wall-clock budget on an
-// IRREDUCIBLE cost, not a fixable perf bug, so they are `#[ignore]`d in the
-// default run (still runnable explicitly / in a slow tier via `--ignored`).
+// gam#1082: hifreq_tensor_k8/k10 run LONGER than the default per-test
+// slow-timeout (300s notice / 600s SIGKILL) on an IRREDUCIBLE cost. They are
+// NOT `#[ignore]`d — the high-frequency recovery they verify is real coverage we
+// keep — they are given a dedicated, generous `slow-timeout` override in
+// `.config/nextest.toml` (filter `test(/hifreq_tensor_k(8|10)/)`) so the nightly
+// CI runs them to completion and asserts the recovery instead of bulk-killing
+// them at 600s. This is a genuine compute-cost split, not hiding a perf bug:
 //
 // The 2D tensor `te(theta, h, bc=['periodic','natural'], k=2k+4)` has coefficient
 // dimension p = kb² ≈ 400 (k8) / 576 (k10). The dominant inner cost is the dense
@@ -568,14 +572,12 @@ fn hifreq_tensor_k6() -> Result<(), String> {
 // whose periodic marginal needs ≥ k Fourier modes to represent, so k8/k10
 // require kb ≳ 18; capping kb would make even the unpenalized oracle unable to
 // recover the truth, defeating the high-frequency recovery the probe exists to
-// check. k4/k6 (p ≈ 144/196) stay in-budget and keep the recovery coverage.
+// check. k4/k6 (p ≈ 144/196) stay well within the default budget.
 #[test]
-#[ignore = "gam#1082: irreducible O(p³) dense data-Gram Cholesky at p≈400; kb can't be capped (needs ≥k Fourier modes for sin(kθ)). Run via --ignored / slow tier."]
 fn hifreq_tensor_k8() -> Result<(), String> {
     hifreq_tensor_probe(8);
 }
 #[test]
-#[ignore = "gam#1082: irreducible O(p³) dense data-Gram Cholesky at p≈576; kb can't be capped (needs ≥k Fourier modes for sin(kθ)). Run via --ignored / slow tier."]
 fn hifreq_tensor_k10() -> Result<(), String> {
     hifreq_tensor_probe(10);
 }

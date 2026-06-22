@@ -66,3 +66,26 @@ fail-fast = false
 # forbidden runtime-error-signature grep in CI can classify the failure mode.
 failure-output = "immediate-final"
 success-output = "never"
+
+# #1082: the two high-frequency 2D tensor recovery probes
+# (`hifreq_tensor_k8`/`hifreq_tensor_k10` in the `quality` binary) carry a
+# genuinely IRREDUCIBLE compute cost: a `te(theta, h, bc=['periodic','natural'],
+# k=2k+4)` fits a tensor of coefficient dimension p = kb² ≈ 400 (k8) / 576 (k10),
+# whose dominant per-PIRLS-iteration cost is the dense O(p³) Cholesky of
+# `XᵀWX + S_λ`. The penalty side is already fully Kronecker-diagonalized
+# (so its log-det is O(p)), but the DATA Gram `XᵀWX` under a general data-
+# dependent PIRLS weight W does NOT factor as `A ⊗ B`, so the data-Gram
+# factorization is irreducibly dense p³. `kb` cannot be capped to shrink p
+# without breaking the recovery the probes verify: `sin(k·θ)` needs ≥ k Fourier
+# modes in the periodic marginal (kb ≳ 18 for k8/k10).
+#
+# This is a real cost split, not a perf bug, and the high-frequency recovery is
+# coverage worth keeping — so rather than `#[ignore]` them (which would drop the
+# coverage), give ONLY these two tests a generous per-test budget so the nightly
+# run completes and asserts them instead of SIGKILLing at the default 600s. The
+# `quality` binary is sharded into 8 nextest partitions in CI (#1393), so the two
+# heavy tests spread across shards and each shard's summed wall-clock stays under
+# the per-partition cap. Every other test keeps the default 300s/600s budget.
+[[profile.ci.overrides]]
+filter = 'test(/hifreq_tensor_k(8|10)/)'
+slow-timeout = { period = "600s", terminate-after = 4 }
