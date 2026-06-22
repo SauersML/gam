@@ -804,6 +804,64 @@ fn apply_global_smooth_identifiability(
                 }
             })
             .collect::<Vec<_>>();
+        // #1476-class fix (central, basis-agnostic): when a non-trivial GLOBAL
+        // identifiability/orthogonalization transform `z_opt` was applied above,
+        // it congruence-restricts EVERY penalty — including a Marra & Wood double-
+        // penalty null-space shrinkage ridge (`DoublePenaltyNullspace`). A merely-
+        // restricted ridge `Zᵀ (Z_null Z_nullᵀ) Z` is NOT the projector onto the
+        // null space of the *constrained* bending penalty `Zᵀ S_bend Z`: the
+        // sum-to-zero / parametric-orthogonalization `Z` is not norm-preserving and
+        // typically DROPS the constant direction, so the restricted ridge is
+        // neither idempotent nor aligned with `null(Zᵀ S_bend Z)` and shrinks
+        // penalized directions (the #1266/#1476 flat-collapse / EDF mis-allocation
+        // class). This is the single chokepoint every basis flows through, so
+        // rebuild the ridge here from the null space of the constrained `Primary`
+        // penalty, exactly as the 1-D B-spline / tensor / thin-plate paths do in
+        // their own local builds. (Idempotent with those local rebuilds: when no
+        // further `Primary`-null directions survive, the rebuilt ridge equals the
+        // local one; when this global `Z` removes more, only this rebuild is
+        // correct.) Scoped to `coefficient_gauge.is_some()`: with no global
+        // transform the penalties are untouched and the basis-local ridge already
+        // lives in the fit chart.
+        let mut penalty_candidates = penalty_candidates;
+        if coefficient_gauge.is_some()
+            && penalty_candidates
+                .iter()
+                .any(|c| matches!(c.source, PenaltySource::DoublePenaltyNullspace))
+        {
+            if let Some(s_c) = penalty_candidates
+                .iter()
+                .find(|c| matches!(c.source, PenaltySource::Primary))
+                .map(|c| c.matrix.clone())
+            {
+                let rebuilt =
+                    crate::terms::basis::build_nullspace_shrinkage_penalty(&s_c)?
+                        .map(|shrink| shrink.sym_penalty);
+                let p = s_c.nrows();
+                for candidate in &mut penalty_candidates {
+                    if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
+                        match &rebuilt {
+                            Some(ridge) => {
+                                let (matrix, scale) =
+                                    normalize_penalty_in_constrained_space(ridge);
+                                candidate.matrix = matrix;
+                                candidate.normalization_scale = scale;
+                                candidate.kronecker_factors = None;
+                                candidate.op = None;
+                            }
+                            // Constrained bending penalty is full rank: no null
+                            // space to shrink. Zero the block; the filter drops it.
+                            None => {
+                                candidate.matrix = Array2::<f64>::zeros((p, p));
+                                candidate.normalization_scale = 1.0;
+                                candidate.kronecker_factors = None;
+                                candidate.op = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let (penalties_constrained, nullspace_constrained, penaltyinfo_constrained) =
             filter_active_penalty_candidates(penalty_candidates)?;
         let linear_constraints_constrained =
