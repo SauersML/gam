@@ -1455,6 +1455,58 @@ pub(crate) fn rigid_standard_normal_row_nll_generic<S: crate::families::jet_scal
     Ok(signed.compose_unary(signed_probit_neglog_unary_stack(m, w)))
 }
 
+/// One row of rigid standard-normal Bernoulli data as a generic
+/// [`RowNllProgramGeneric<2>`] (#932 production wiring).
+///
+/// This is the genuine production consumer of the generic program seam: the row
+/// NLL is written ONCE in [`rigid_standard_normal_row_nll_generic`] over
+/// `S: JetScalar<2>`, and this single-row program routes it through the
+/// [`crate::families::jet_tower`] `generic_*` evaluators
+/// ([`generic_full_tower`](crate::families::jet_tower::generic_full_tower) for
+/// the uncontracted tensors, and the cheap order-2 / contracted scalars for the
+/// value/grad/Hessian and directional channels). Primaries are
+/// `[marginal η, slope g]`; the marginal link map and per-row data
+/// `(z, y, w, probit_scale)` enter as constants on the body.
+pub(crate) struct RigidStandardNormalRow {
+    pub(crate) marginal: BernoulliMarginalLinkMap,
+    pub(crate) g: f64,
+    pub(crate) z: f64,
+    pub(crate) y: f64,
+    pub(crate) w: f64,
+    pub(crate) probit_scale: f64,
+}
+
+impl crate::families::jet_tower::RowNllProgramGeneric<2> for RigidStandardNormalRow {
+    fn n_rows(&self) -> usize {
+        1
+    }
+
+    fn primaries(&self, row: usize) -> Result<[f64; 2], String> {
+        if row != 0 {
+            return Err(format!("RigidStandardNormalRow: row {row} out of range"));
+        }
+        Ok([self.marginal.eta_value(), self.g])
+    }
+
+    fn row_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+        &self,
+        row: usize,
+        p: &[S; 2],
+    ) -> Result<S, String> {
+        if row != 0 {
+            return Err(format!("RigidStandardNormalRow: row {row} out of range"));
+        }
+        rigid_standard_normal_row_nll_generic(
+            p,
+            self.marginal,
+            self.z,
+            self.y,
+            self.w,
+            self.probit_scale,
+        )
+    }
+}
+
 #[inline]
 pub(crate) fn rigid_standard_normal_tower(
     marginal: BernoulliMarginalLinkMap,
@@ -1466,11 +1518,19 @@ pub(crate) fn rigid_standard_normal_tower(
 ) -> Result<Tower4<2>, String> {
     // #932 cutover: the full uncontracted tower comes from the SAME single
     // generic row-NLL expression every other channel consumer derives from,
-    // evaluated at the all-channels `Tower4` scalar. The previous hand-fused
-    // `signed`-jet + transcendental compose is now the `Order2` / `OneSeed` /
-    // `TwoSeed` / `Tower4` instantiation of one source of truth.
-    let vars: [Tower4<2>; 2] = [Tower4::variable(marginal.eta_value(), 0), Tower4::variable(g, 1)];
-    rigid_standard_normal_row_nll_generic(&vars, marginal, z, y, w, probit_scale)
+    // routed through the generic program seam evaluated at the all-channels
+    // `Tower4` scalar. `generic_full_tower` seeds `[marginal η, g]` exactly as
+    // the previous inline `Tower4::variable` form did, so this is bit-identical
+    // while giving `RowNllProgramGeneric` a genuine production consumer.
+    let program = RigidStandardNormalRow {
+        marginal,
+        g,
+        z,
+        y,
+        w,
+        probit_scale,
+    };
+    crate::families::jet_tower::generic_full_tower(&program, 0)
 }
 
 /// Branch-free `signed`-margin jet for the rigid standard-normal row kernel.
@@ -2274,6 +2334,124 @@ mod jet_tower_oracle_tests {
                         (fd - ad).abs() <= 1e-5 * ad.abs().max(1.0),
                         "row {row} {label}: FD witness {fd:+.6e} != tower grad {ad:+.6e}"
                     );
+                }
+            }
+        }
+    }
+
+    /// #932 production wiring: the rigid Bernoulli row, routed through the
+    /// generic [`RowNllProgramGeneric<2>`] program seam and its cheap
+    /// order-2 / contracted scalar evaluators (`generic_row_kernel`,
+    /// `generic_third_contracted`, `generic_fourth_contracted`,
+    /// `generic_full_tower`), must agree BIT-FOR-BIT with the dense
+    /// `Tower4`-only [`RowNllProgram`] path (`evaluate_program`). Both write the
+    /// same single-expression NLL — the contracted scalars fold the direction
+    /// into the differentiation, so this pins that the packed channels equal the
+    /// corresponding contractions of the dense tower truth, exercising every
+    /// `generic_*` evaluator end-to-end through a real production consumer.
+    #[test]
+    fn rigid_bernoulli_generic_program_matches_tower4_program_all_channels() {
+        use crate::families::jet_tower::{
+            generic_full_tower, generic_row_kernel, generic_third_contracted,
+            generic_fourth_contracted,
+        };
+
+        let eta = [0.3_f64, -0.7, 0.05, 0.9, -1.2, 2.1, -2.4];
+        let g = [0.2_f64, -0.5, 0.35, -0.15, 0.6, 0.45, -0.55];
+        let z = [0.4_f64, -1.1, 0.0, 0.7, -0.3, 1.6, -1.4];
+        let y = [1.0_f64, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+        let w = [1.0_f64, 0.8, 1.3, 0.9, 1.1, 0.7, 1.4];
+        let n = eta.len();
+        let dirs: [[f64; 2]; 3] = [[0.7, -1.3], [-0.4, 0.6], [1.2, 0.2]];
+
+        let close = |a: f64, b: f64, label: &str| {
+            let band = 1e-12 + 1e-12 * a.abs().max(b.abs());
+            assert!(
+                (a - b).abs() <= band,
+                "{label}: generic {a:+.15e} vs Tower4-program {b:+.15e} (band {band:.3e})"
+            );
+        };
+
+        for &probit_scale in &[1.0_f64, 0.8] {
+            // The dense Tower4-only program over all rows (independent path).
+            let tower_program = BernoulliRigidStandardNormalNllProgram {
+                primaries: (0..n).map(|r| [eta[r], g[r]]).collect(),
+                z: z.to_vec(),
+                y: y.to_vec(),
+                w: w.to_vec(),
+                probit_scale,
+            };
+
+            for row in 0..n {
+                let truth = evaluate_program(&tower_program, row).expect("Tower4 program tower");
+
+                let marginal = bernoulli_marginal_link_map(
+                    &InverseLink::Standard(crate::types::StandardLink::Probit),
+                    eta[row],
+                )
+                .expect("link map");
+                let program = RigidStandardNormalRow {
+                    marginal,
+                    g: g[row],
+                    z: z[row],
+                    y: y[row],
+                    w: w[row],
+                    probit_scale,
+                };
+
+                // generic_full_tower must reproduce the dense tower in EVERY
+                // channel (v, g, H, t3, t4).
+                let full = generic_full_tower(&program, 0).expect("generic full tower");
+                close(full.v, truth.v, "full value");
+                for a in 0..2 {
+                    close(full.g[a], truth.g[a], "full grad");
+                    for b in 0..2 {
+                        close(full.h[a][b], truth.h[a][b], "full hess");
+                        for c in 0..2 {
+                            close(full.t3[a][b][c], truth.t3[a][b][c], "full t3");
+                            for d in 0..2 {
+                                close(full.t4[a][b][c][d], truth.t4[a][b][c][d], "full t4");
+                            }
+                        }
+                    }
+                }
+
+                // generic_row_kernel (Order2) must equal the tower's (v, g, H).
+                let (val, grad, hess) =
+                    generic_row_kernel(&program, 0).expect("generic row kernel");
+                close(val, truth.v, "order2 value");
+                for a in 0..2 {
+                    close(grad[a], truth.g[a], "order2 grad");
+                    for b in 0..2 {
+                        close(hess[a][b], truth.h[a][b], "order2 hess");
+                    }
+                }
+
+                // generic_third_contracted (OneSeed) must equal the dense
+                // tower's third contraction for each direction.
+                for dir in &dirs {
+                    let third = generic_third_contracted(&program, 0, dir)
+                        .expect("generic third contracted");
+                    let truth3 = truth.third_contracted(dir);
+                    for a in 0..2 {
+                        for b in 0..2 {
+                            close(third[a][b], truth3[a][b], "third contracted");
+                        }
+                    }
+                }
+
+                // generic_fourth_contracted (TwoSeed) must equal the dense
+                // tower's fourth contraction for each direction pair.
+                for (i, u) in dirs.iter().enumerate() {
+                    let v = dirs[(i + 1) % dirs.len()];
+                    let fourth = generic_fourth_contracted(&program, 0, u, &v)
+                        .expect("generic fourth contracted");
+                    let truth4 = truth.fourth_contracted(u, &v);
+                    for a in 0..2 {
+                        for b in 0..2 {
+                            close(fourth[a][b], truth4[a][b], "fourth contracted");
+                        }
+                    }
                 }
             }
         }
