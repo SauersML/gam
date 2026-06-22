@@ -2408,6 +2408,258 @@ mod tests {
         );
     }
 
+    /// Number of per-axis harmonics for the planted torus carve fixtures.
+    const TORUS_CARVE_HARMONICS: usize = 2;
+
+    /// Build a 2-atom term whose atom 0 is a genuine `d = 2` Torus product atom
+    /// (so the #993 within-atom carve is DEFINED on it) carrying a caller-chosen
+    /// fused decoder, and whose atom 1 is a 1-D periodic child whose support
+    /// nests strictly inside atom 0's — the absorption-asymmetry trigger that
+    /// makes atom 0 a fission candidate, so `harvest_move_proposals` actually
+    /// invokes `run_within_atom_carve` on the torus's own fitted decoder.
+    ///
+    /// `torus_decoder` is `(2H+1)² × p`; column order is the constant-leading
+    /// Kronecker layout `flat = i·(2H+1) + j` that `factor_basis_sizes` and the
+    /// carve expect.
+    fn planted_torus_carve_term(
+        torus_decoder: Array2<f64>,
+    ) -> (SaeManifoldTerm, SaeManifoldRho) {
+        let n = 240usize;
+        let p = torus_decoder.ncols();
+        let h = TORUS_CARVE_HARMONICS;
+
+        // Atom 0: the d = 2 torus. Deterministic coprime-stride lattice so the
+        // 2-D code sample covers the torus (no degenerate diagonal).
+        let torus_eval = Arc::new(TorusHarmonicEvaluator::new(2, h).unwrap());
+        let axis_m = 2 * h + 1;
+        let mm = axis_m * axis_m;
+        assert_eq!(torus_decoder.nrows(), mm, "torus decoder must be (2H+1)²×p");
+        let torus_coords = Array2::<f64>::from_shape_fn((n, 2), |(row, axis)| {
+            if axis == 0 {
+                (row as f64 + 0.5) / n as f64
+            } else {
+                (((row * 137) % n) as f64 + 0.5) / n as f64
+            }
+        });
+        let (torus_phi, torus_jet) = torus_eval.evaluate(torus_coords.view()).unwrap();
+        let torus_atom = SaeManifoldAtom::new(
+            "torus".to_string(),
+            SaeAtomBasisKind::Torus,
+            2,
+            torus_phi,
+            torus_jet,
+            torus_decoder,
+            Array2::<f64>::eye(mm),
+        )
+        .unwrap()
+        .with_basis_second_jet(torus_eval.clone());
+
+        // Atom 1: a 1-D periodic child.
+        let child_eval = Arc::new(PeriodicHarmonicEvaluator::new(3).unwrap());
+        let child_coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| row as f64 / n as f64);
+        let (child_phi, child_jet) = child_eval.evaluate(child_coords.view()).unwrap();
+        let mut child_decoder = Array2::<f64>::zeros((3, p));
+        child_decoder[[1, 0]] = 1.0;
+        let child_atom = SaeManifoldAtom::new(
+            "child".to_string(),
+            SaeAtomBasisKind::Periodic,
+            1,
+            child_phi,
+            child_jet,
+            child_decoder,
+            Array2::<f64>::eye(3),
+        )
+        .unwrap()
+        .with_basis_second_jet(child_eval.clone());
+
+        // Routing: child (atom 1) active only on rows ≡ 0 mod 4; parent torus
+        // (atom 0) active on rows ≡ 0 mod 2 PLUS rows ≡ 1 mod 4 — the child's
+        // support nests strictly inside the parent's, so P(parent|child) = 1,
+        // P(child|parent) < 1 ⇒ absorption asymmetry on atom 0.
+        let mut logits = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let child_on = row % 4 == 0;
+            let parent_on = row % 2 == 0 || row % 4 == 1;
+            logits[[row, 0]] = if parent_on { ON } else { OFF };
+            logits[[row, 1]] = if child_on { ON } else { OFF };
+        }
+
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            vec![torus_coords, child_coords],
+            vec![
+                LatentManifold::Product(vec![
+                    LatentManifold::Circle { period: 1.0 },
+                    LatentManifold::Circle { period: 1.0 },
+                ]),
+                LatentManifold::Circle { period: 1.0 },
+            ],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(vec![torus_atom, child_atom], assignment).unwrap();
+        let rho = SaeManifoldRho::new(
+            0.0,
+            0.0,
+            vec![Array1::<f64>::zeros(2), Array1::<f64>::zeros(1)],
+        );
+        (term, rho)
+    }
+
+    /// A SEPARABLE fused torus decoder `g(θ₁,θ₂) = a(θ₁) + b(θ₂)` (no
+    /// interaction block — only the constant-leading main-effect columns carry
+    /// mass), in the `flat = i·(2H+1) + j` Kronecker layout. The within-atom
+    /// carve must permit a fission on this atom.
+    fn separable_torus_decoder(axis_m: usize, p: usize) -> Array2<f64> {
+        let mut b = Array2::<f64>::zeros((axis_m * axis_m, p));
+        for d in 0..p {
+            let alpha = 1.0 + d as f64;
+            let beta = 0.5 - 0.3 * d as f64;
+            for i in 0..axis_m {
+                let a_i = ((i + 1) as f64).recip() * alpha;
+                for j in 0..axis_m {
+                    let b_j = ((j + 1) as f64).recip() * beta;
+                    let coeff =
+                        if j == 0 { a_i } else { 0.0 } + if i == 0 { b_j } else { 0.0 };
+                    b[[i * axis_m + j, d]] = coeff;
+                }
+            }
+        }
+        b
+    }
+
+    /// A BOUND fused torus decoder: the separable part PLUS a genuine bilinear
+    /// interaction block on the curved×curved columns (`i ≥ 1, j ≥ 1`). The
+    /// within-atom carve must prove binding and KEEP the atom.
+    fn bound_torus_decoder(axis_m: usize, p: usize) -> Array2<f64> {
+        let mut b = separable_torus_decoder(axis_m, p);
+        for d in 0..p {
+            for i in 1..axis_m {
+                for j in 1..axis_m {
+                    b[[i * axis_m + j, d]] += 0.8 / ((i * j) as f64);
+                }
+            }
+        }
+        b
+    }
+
+    /// #975 / #993 INTEGRATION oracle (separable arm): a fission-candidate atom
+    /// that is a genuine `d = 2` product atom with a SEPARABLE decoder must have
+    /// the within-atom functional-ANOVA carve RUN inside `harvest_move_proposals`
+    /// (not skipped), carve to a SPLIT verdict (additivity = superposition), and
+    /// ride as a `Fission` proposal whose carve result is recorded. This is the
+    /// end-to-end wiring the reopen note demanded: the carve fires on the atom's
+    /// OWN fitted decoder through the harvest path, not just in isolation.
+    #[test]
+    fn separable_torus_fission_candidate_runs_within_atom_carve_and_splits() {
+        let axis_m = 2 * TORUS_CARVE_HARMONICS + 1;
+        let p = 3usize;
+        let decoder = separable_torus_decoder(axis_m, p);
+        let (term, rho) = planted_torus_carve_term(decoder);
+        let residuals = residuals_of(&term);
+        let params = HarvestParams {
+            max_fusions: 4,
+            max_fissions: 4,
+            max_births: 0,
+        };
+        let report = harvest_move_proposals(&term, &rho, residuals.view(), &params).unwrap();
+
+        // The carve actually RAN on the torus fission candidate (the #993 wiring
+        // fired) — this is the non-skip the reopen note required.
+        assert!(
+            report.fission_carve_ran_count >= 1,
+            "the within-atom carve must RUN on a d=2 product fission candidate; \
+             ran_count={}, unavailable={}",
+            report.fission_carve_ran_count,
+            report.fission_carve_unavailable_count
+        );
+        let torus_result = report
+            .fission_carve_results
+            .iter()
+            .find(|r| r.atom == 0)
+            .expect("a carve result must be recorded for the torus atom (0)");
+        assert!(
+            matches!(
+                torus_result.decision,
+                FissionDecision::SplitReconstructionOnly | FissionDecision::SplitCertifiedJoint
+            ),
+            "a separable torus must carve to a SPLIT verdict; got {:?} (interaction_fraction={:e})",
+            torus_result.decision,
+            torus_result.interaction_fraction
+        );
+        assert!(
+            torus_result.interaction_fraction < 1e-3,
+            "a separable decoder carries negligible interaction energy; got {:e}",
+            torus_result.interaction_fraction
+        );
+        // A split verdict rides as a fission proposal on the torus.
+        let torus_fission = report
+            .proposals
+            .iter()
+            .any(|pr| matches!(pr.mv, StructureMove::Fission { atom: 0 }));
+        assert!(
+            torus_fission,
+            "a separable (additive) torus must ride as a fission proposal; got {:?}",
+            report.proposals.iter().map(|pr| &pr.mv).collect::<Vec<_>>()
+        );
+    }
+
+    /// #975 / #993 INTEGRATION oracle (bound arm): the SAME fission-candidate
+    /// torus with a BOUND decoder (a genuine `θ₁·θ₂` interaction) must have the
+    /// within-atom carve RUN and PROVE binding — blocking the fission. The atom
+    /// stays whole and contested; no `Fission` proposal reaches the e-gate for
+    /// it. This is the binding=interaction half of the carve criterion, gating
+    /// the structure move end to end.
+    #[test]
+    fn bound_torus_fission_candidate_runs_within_atom_carve_and_keeps() {
+        let axis_m = 2 * TORUS_CARVE_HARMONICS + 1;
+        let p = 3usize;
+        let decoder = bound_torus_decoder(axis_m, p);
+        let (term, rho) = planted_torus_carve_term(decoder);
+        let residuals = residuals_of(&term);
+        let params = HarvestParams {
+            max_fusions: 4,
+            max_fissions: 4,
+            max_births: 0,
+        };
+        let report = harvest_move_proposals(&term, &rho, residuals.view(), &params).unwrap();
+
+        assert!(
+            report.fission_carve_ran_count >= 1,
+            "the within-atom carve must RUN on the bound torus fission candidate; \
+             ran_count={}, unavailable={}",
+            report.fission_carve_ran_count,
+            report.fission_carve_unavailable_count
+        );
+        let torus_result = report
+            .fission_carve_results
+            .iter()
+            .find(|r| r.atom == 0)
+            .expect("a carve result must be recorded for the bound torus atom (0)");
+        assert_eq!(
+            torus_result.decision,
+            FissionDecision::Keep,
+            "a bound torus must carve to KEEP (binding proven); interaction_fraction={:e}, edge_p={:?}",
+            torus_result.interaction_fraction,
+            torus_result.edge_p_value
+        );
+        assert!(
+            report.fission_carve_blocked_count >= 1,
+            "the bound carve must BLOCK at least one fission; blocked_count={}",
+            report.fission_carve_blocked_count
+        );
+        // The blocked atom must NOT ride as a fission proposal.
+        let torus_fission = report
+            .proposals
+            .iter()
+            .any(|pr| matches!(pr.mv, StructureMove::Fission { atom: 0 }));
+        assert!(
+            !torus_fission,
+            "a bound (irreducible) torus must NOT be proposed for fission; got {:?}",
+            report.proposals.iter().map(|pr| &pr.mv).collect::<Vec<_>>()
+        );
+    }
+
     /// Oracle (#997 type-I): three INDEPENDENT planted atoms (marginal supports
     /// at coprime strides) yield NO fusion proposal — the trigger does not
     /// manufacture binding edges where the codes are independent, so the e-gate
