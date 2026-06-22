@@ -2031,7 +2031,13 @@ impl SingleBlockLatentCoordDesignCache {
 /// criterion to pick the κ-sign basin before the joint [ρ, ψ] solve, instead of
 /// letting the joint optimiser descend from a single κ seed into the spurious +κ
 /// collapsed-kernel corner (the headline #1464 sign-blindness).
-fn fixed_kappa_profiled_reml_score(
+///
+/// `pub` so a regression test can evaluate the EXACT production criterion at two
+/// pinned κ (e.g. +κ vs −κ on a hyperbolic dataset) and settle solver-vs-criterion:
+/// if `V_p(+κ) < V_p(−κ)` for hyperbolic data, the criterion itself prefers the
+/// collapsed +κ corner and the bug is in the constant-curvature REML/Occam term,
+/// not the optimiser.
+pub fn fixed_kappa_profiled_reml_score(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
     weights: ArrayView1<'_, f64>,

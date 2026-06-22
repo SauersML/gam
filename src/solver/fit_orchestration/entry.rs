@@ -772,6 +772,63 @@ pub fn fit_spline_scan_from_formula(
         .map_err(|reason| WorkflowError::IntegrationFailed { reason })
 }
 
+/// #1464 diagnostic entry point: evaluate the EXACT production fixed-κ
+/// profiled-REML criterion (`fixed_kappa_profiled_reml_score`, the same one the
+/// joint-fit κ-sign scan uses) at a list of pinned κ values for the first
+/// constant-curvature term of `formula`, materialised from `data`/`config`
+/// exactly like [`fit_from_formula`]. Returns `(κ, V_p(κ))` pairs.
+///
+/// This settles solver-vs-criterion for the railing bug: if `V_p(+κ) < V_p(−κ)`
+/// for a genuinely HYPERBOLIC dataset, the criterion itself prefers the collapsed
+/// +κ corner — the bug is in the constant-curvature REML/Occam term, not the
+/// optimiser. If `V_p(−κ) < V_p(+κ)` yet the full fit still returns +κ, the bug
+/// is in the solver/readback. The profiled fit pins κ and profiles only ρ
+/// (κ-optimisation disabled), so each returned score is the negative-log-evidence
+/// the outer loop minimises.
+pub fn constant_curvature_profiled_reml_scores(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+    kappas: &[f64],
+) -> Result<Vec<(f64, f64)>, WorkflowError> {
+    let mat = materialize(formula, data, config)?;
+    let FitRequest::Standard(request) = mat.request else {
+        return Err(WorkflowError::IntegrationFailed {
+            reason: "constant_curvature_profiled_reml_scores: formula did not materialise to a \
+                     standard fit request"
+                .to_string(),
+        });
+    };
+    let term_idx = *crate::smooth::constant_curvature_term_indices(&request.spec)
+        .first()
+        .ok_or_else(|| WorkflowError::IntegrationFailed {
+            reason: "constant_curvature_profiled_reml_scores: formula has no constant-curvature \
+                     curv() term"
+                .to_string(),
+        })?;
+    let mut out = Vec::with_capacity(kappas.len());
+    for &kappa in kappas {
+        let score = crate::smooth::fixed_kappa_profiled_reml_score(
+            request.data.view(),
+            request.y.view(),
+            request.weights.view(),
+            request.offset.view(),
+            &request.spec,
+            term_idx,
+            kappa,
+            request.family.clone(),
+            &request.options,
+        )
+        .map_err(|e| WorkflowError::IntegrationFailed {
+            reason: format!(
+                "constant_curvature_profiled_reml_scores: fixed-κ fit at κ={kappa} failed: {e}"
+            ),
+        })?;
+        out.push((kappa, score));
+    }
+    Ok(out)
+}
+
 /// Derived dense-kernel cliff: the cascade auto-route fires only once the dense
 /// radial basis the smooth would otherwise use has SATURATED at its center cap
 /// (`default_num_centers == K_MAX`), so the dense `O(n·K² + K³)` kernel solve
