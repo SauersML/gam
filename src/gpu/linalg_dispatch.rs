@@ -519,12 +519,15 @@ impl ResidentDesignGram {
     pub fn gram(&self, w: ArrayView1<'_, f64>) -> Option<Array2<f64>> {
         #[cfg(not(target_os = "linux"))]
         {
-            // SAFETY: `try_new` returns `None` on every non-Linux target, so no
-            // `ResidentDesignGram` value is ever constructed and this method is
-            // statically unreachable. Fail loudly rather than launder the broken
-            // contract into a `None` sentinel that a caller might treat as a
-            // benign "GPU declined" and silently fall back on corrupt state.
-            panic!("ResidentDesignGram::gram is unreachable off CUDA/Linux")
+            // SAFETY: off CUDA, `try_new` always returns `None`, so no `Self` of
+            // this type is ever constructed and this method is statically
+            // unreachable. Returning a benign `None` would silently launder that
+            // impossibility into a "GPU declined" sentinel, so fail loudly. The
+            // `w.len()` use also consumes the parameter on this target.
+            panic!(
+                "ResidentDesignGram cannot be constructed off CUDA (w.len()={})",
+                w.len()
+            )
         }
         #[cfg(target_os = "linux")]
         {
@@ -537,9 +540,10 @@ impl ResidentDesignGram {
     pub fn dims(&self) -> (usize, usize) {
         #[cfg(not(target_os = "linux"))]
         {
-            // Statically unreachable off CUDA (see `gram`); a sentinel is safe
-            // because no `Self` is ever constructed on this target.
-            (0, 0)
+            // SAFETY: statically unreachable off CUDA (see `gram`) — no `Self`
+            // is ever constructed on this target; fail loudly rather than
+            // return a benign sentinel.
+            panic!("ResidentDesignGram cannot be constructed off CUDA")
         }
         #[cfg(target_os = "linux")]
         {
