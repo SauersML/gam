@@ -9,9 +9,11 @@
 //! file pins the invariant that the verdict is a function of whatever that
 //! measurement turns out to be.
 
+use gam::gpu::linalg_dispatch::ResidentDesignGram;
 use gam::gpu::policy::{
     GpuDispatchPolicy, GpuThroughputVerdict, GPU_THROUGHPUT_TARGET_ROWS_PER_SEC,
 };
+use ndarray::{Array1, Array2};
 
 /// The verdict must be derived from the measurement: a measurement below the
 /// target fails, a measurement at/above the target passes, and the reported
@@ -113,4 +115,52 @@ fn batched_small_potrf_admitted_on_batch_not_p() {
     // batch over the multi-item floor. This is the gate the LLM stack trips.
     assert!(d <= pol.small_dense_batched_potrf_max_p);
     assert!(batch >= pol.small_dense_batched_potrf_min_batch);
+}
+
+/// #1017 Phase 3: the resident-X Gram handle must (a) never change the numerics
+/// vs the per-call path when a device is present, and (b) decline cleanly (no
+/// panic, return `None`) on a CPU-only host or below-threshold shape — so a
+/// caller can always fall back. This test is device-agnostic: on a CUDA host it
+/// asserts bit-parity against the per-call Gram; on a CPU host it asserts the
+/// handle declines. Either way the contract holds.
+#[test]
+fn resident_design_gram_matches_per_call_or_declines() {
+    // A GPU-profitable LLM shape (clears the XtDiagX work gate when a device is
+    // present); small enough to run the CPU reference cross-check quickly.
+    let n = 4096usize;
+    let p = 256usize;
+    let x = Array2::from_shape_fn((n, p), |(i, j)| {
+        0.05 * ((i as f64 + 1.0) * 0.011 + (j as f64 + 1.0) * 0.017).sin()
+    });
+    let w = Array1::from_shape_fn(n, |i| 0.5 + ((i as f64 + 1.0) * 0.019).sin().abs());
+
+    match ResidentDesignGram::try_new(x.view()) {
+        Some(handle) => {
+            // Device present: dims echo the resident design, and the resident
+            // Gram is bit-identical (reduction-order tol) to the per-call path.
+            assert_eq!(handle.dims(), (n, p));
+            let resident = handle.gram(w.view()).expect("resident gram on device");
+            let per_call = gam::gpu::linalg_dispatch::try_fast_xt_diag_x(x.view(), w.view())
+                .expect("per-call gram on device");
+            let mut max_diff = 0.0_f64;
+            for (a, b) in resident.iter().zip(per_call.iter()) {
+                max_diff = max_diff.max((a - b).abs());
+            }
+            assert!(
+                max_diff < 1e-9,
+                "resident vs per-call Gram differ by {max_diff:e} (must be reduction-order only)"
+            );
+            // A wrong-length weight is rejected, not silently mis-scaled.
+            assert!(handle.gram(Array1::zeros(n + 1).view()).is_none());
+        }
+        None => {
+            // CPU-only host (or no device): the per-call path must also decline,
+            // and the handle declining is the documented fallback contract.
+            assert!(
+                gam::gpu::linalg_dispatch::try_fast_xt_diag_x(x.view(), w.view()).is_none(),
+                "on a host where the resident handle declines, the per-call GPU \
+                 path must decline too (both fall back to CPU)"
+            );
+        }
+    }
 }

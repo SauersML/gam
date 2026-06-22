@@ -200,6 +200,105 @@ mod cuda_impl {
         from_col_major(&out_col, left_cols, right_cols)
     }
 
+    /// #1017 Phase 3: a device-resident design matrix `X` whose `n×p` values are
+    /// uploaded to the device ONCE and reused across many `Xᵀ·diag(w)·X` Gram
+    /// evaluations.
+    ///
+    /// The per-call [`xt_diag_x_cuda`] path re-uploads the full `n×p` `X` (and a
+    /// second copy as the `right` operand) on EVERY call. For the SAE / IRLS
+    /// inner loop — where `X` is frozen across weight updates and the Gram is
+    /// rebuilt once per Newton/PIRLS step — that H2D staging dominates the wall
+    /// clock (measured #1412: the `XtWX` GEMM is ~98% of the pipeline at <20% GPU
+    /// utilisation, i.e. the device is starved by the per-call upload, not the
+    /// arithmetic). Uploading `X` once and crossing only the `n`-vector `w` (and
+    /// the `p×p` result) per call removes that ping-pong: the resident `X` is
+    /// `n·p` doubles vs the per-call `w` of `n` doubles, so the amortised
+    /// transfer per Gram drops by a factor of `p`.
+    pub(crate) struct ResidentWeightedGram {
+        stream: Arc<CudaStream>,
+        blas: CudaBlas,
+        x_dev: CudaSlice<f64>,
+        rows: usize,
+        cols: usize,
+    }
+
+    impl ResidentWeightedGram {
+        /// Upload `x` (`n×p`) to `ordinal` once, column-major, and keep it
+        /// resident. Returns `None` on a degenerate shape or any device failure
+        /// (the caller falls back to the per-call CPU/GPU path).
+        pub(crate) fn new(ordinal: usize, x: ArrayView2<'_, f64>) -> Option<Self> {
+            let (rows, cols) = x.dim();
+            if rows == 0 || cols == 0 {
+                return None;
+            }
+            let (stream, blas) = stream_and_blas_for(ordinal)?;
+            let x_col = to_col_major(&x);
+            let x_dev = stream.clone_htod(&*x_col).ok()?;
+            Some(Self {
+                stream,
+                blas,
+                x_dev,
+                rows,
+                cols,
+            })
+        }
+
+        #[inline]
+        pub(crate) fn dims(&self) -> (usize, usize) {
+            (self.rows, self.cols)
+        }
+
+        /// Compute `Xᵀ·diag(w)·X` reusing the resident `X`. Only `w` (`n`
+        /// doubles) crosses H2D and only the `p×p` Gram crosses D2H. The
+        /// arithmetic is bit-identical to [`xt_diag_x_cuda`] on the same device
+        /// (same `cublasDdgmm` row-scale + same `gemm` reduction order).
+        pub(crate) fn gram(&self, w: ArrayView1<'_, f64>) -> Option<Array2<f64>> {
+            if w.len() != self.rows {
+                return None;
+            }
+            let weights_host = vector_values(w);
+            let weights_dev = self.stream.clone_htod(&weights_host).ok()?;
+            let mut weighted_dev = self
+                .stream
+                .alloc_zeros::<f64>(self.rows.checked_mul(self.cols)?)
+                .ok()?;
+            row_scale_device(
+                &self.blas,
+                &self.stream,
+                &self.x_dev,
+                &weights_dev,
+                &mut weighted_dev,
+                self.rows,
+                self.cols,
+            )?;
+            let mut out_dev = self
+                .stream
+                .alloc_zeros::<f64>(self.cols.checked_mul(self.cols)?)
+                .ok()?;
+            let cfg = GemmConfig::<f64> {
+                transa: cublasOperation_t::CUBLAS_OP_T,
+                transb: cublasOperation_t::CUBLAS_OP_N,
+                m: to_i32(self.cols)?,
+                n: to_i32(self.cols)?,
+                k: to_i32(self.rows)?,
+                alpha: 1.0,
+                lda: to_i32(self.rows)?,
+                ldb: to_i32(self.rows)?,
+                beta: 0.0,
+                ldc: to_i32(self.cols)?,
+            };
+            // SAFETY: `x_dev` is the resident n×p column-major design; cfg forms
+            // Xᵀ (p×n) · weighted (n×p) → a p×p column-major Gram.
+            unsafe {
+                self.blas
+                    .gemm(cfg, &self.x_dev, &weighted_dev, &mut out_dev)
+            }
+            .ok()?;
+            let out_col = self.stream.clone_dtoh(&out_dev).ok()?;
+            from_col_major(&out_col, self.cols, self.cols)
+        }
+    }
+
     #[inline]
     fn assign_block(
         out: &mut Array2<f64>,
@@ -562,5 +661,5 @@ mod cuda_impl {
 pub(crate) use cuda_impl::{
     gemm_abt_strided_batched_cuda, gemm_broadcast_b_batched_cuda, gemm_cuda, gemm_on_ordinal_cuda,
     gemv_cuda, joint_hessian_2x2_cuda, trsm_cuda, xt_diag_x_cuda, xt_diag_x_on_ordinal_cuda,
-    xt_diag_y_cuda,
+    xt_diag_y_cuda, ResidentWeightedGram,
 };

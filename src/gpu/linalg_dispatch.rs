@@ -464,6 +464,84 @@ pub fn try_fast_xt_diag_x(x: ArrayView2<'_, f64>, w: ArrayView1<'_, f64>) -> Opt
     }
 }
 
+/// #1017 Phase 3: a device-resident design matrix for repeated `Xᵀ·diag(w)·X`
+/// Gram evaluations that uploads `X` to the device ONCE.
+///
+/// The per-call [`try_fast_xt_diag_x`] re-uploads the full `n×p` `X` on every
+/// call. The SAE / IRLS inner loop holds `X` fixed and rebuilds the Gram once
+/// per Newton/PIRLS weight update, so the repeated H2D of `X` is pure waste —
+/// measured on an A100 (#1412) it makes the `XtWX` GEMM ~98% of the pipeline at
+/// <20% device utilisation (the device is starved by staging, not arithmetic).
+/// This handle uploads `X` once at construction; each [`Self::gram`] crosses
+/// only the `n`-vector `w` H2D and the `p×p` Gram D2H, so the per-Gram transfer
+/// shrinks by a factor of `p`.
+///
+/// Admission keys on the same work-based [`DispatchOp::XtDiagX`] gate as the
+/// per-call path (so it engages exactly when the Gram is GPU-profitable) and the
+/// numerics are bit-identical to [`try_fast_xt_diag_x`] on the same device
+/// (same `cublasDdgmm` row-scale + `gemm` reduction order). On a non-CUDA host,
+/// a below-threshold shape, or any device failure, [`Self::try_new`] returns
+/// `None` and the caller keeps its CPU/per-call path — residency never changes
+/// the result, only where (and how often) `X` is staged.
+pub struct ResidentDesignGram {
+    #[cfg(target_os = "linux")]
+    inner: super::blas::ResidentWeightedGram,
+    #[cfg(not(target_os = "linux"))]
+    _never: std::convert::Infallible,
+}
+
+impl ResidentDesignGram {
+    /// Upload `x` (`n×p`) to the device once. Returns `None` when CUDA is
+    /// unavailable, the shape is below the GPU Gram threshold, or the upload
+    /// fails.
+    #[must_use]
+    pub fn try_new(x: ArrayView2<'_, f64>) -> Option<Self> {
+        let (n, p) = x.dim();
+        if n == 0 || p == 0 {
+            return None;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let runtime = route_through_gpu(DispatchOp::XtDiagX { n, p })?;
+            let inner =
+                super::blas::ResidentWeightedGram::new(runtime.device.ordinal, x)?;
+            Some(Self { inner })
+        }
+    }
+
+    /// Compute `Xᵀ·diag(w)·X` reusing the resident `X`. `w` must have one entry
+    /// per design row. Returns `None` on a shape mismatch or device failure.
+    #[must_use]
+    pub fn gram(&self, w: ArrayView1<'_, f64>) -> Option<Array2<f64>> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = w;
+            match self._never {}
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.gram(w)
+        }
+    }
+
+    /// `(n, p)` of the resident design.
+    #[must_use]
+    pub fn dims(&self) -> (usize, usize) {
+        #[cfg(not(target_os = "linux"))]
+        {
+            match self._never {}
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.dims()
+        }
+    }
+}
+
 /// Number of row-chunks to carve per device for the spectral leverage stream
 /// so [`super::pool::balanced_partition`] can keep every GPU busy. With fewer
 /// chunks than devices the pool would idle the surplus devices; oversubscribing

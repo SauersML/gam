@@ -134,6 +134,50 @@ fn main() {
         // Rows processed by the GEMM reduction per second.
         let gemm_rows_per_sec = if gemm_s > 0.0 { n as f64 / gemm_s } else { 0.0 };
 
+        // ---- #1017 Phase 3: resident-X Gram (upload X ONCE, reuse across the
+        //      same `reps` weight updates) — the before/after on the identical
+        //      shape that proves residency removes the per-call ping-pong. The
+        //      IRLS inner loop holds X fixed and only w changes, so this is the
+        //      production access pattern, not a synthetic favour. ----
+        let resident = gam::gpu::linalg_dispatch::ResidentDesignGram::try_new(x.view());
+        let (resident_on_device, resident_rows_per_sec, resident_parity) = match resident {
+            Some(handle) => {
+                // Parity vs the per-call path on the SAME (x, w): residency must
+                // not change the numerics, only where X is staged.
+                let parity = match (
+                    handle.gram(w.view()),
+                    gam::gpu::linalg_dispatch::try_fast_xt_diag_x(x.view(), w.view()),
+                ) {
+                    (Some(a), Some(b)) => {
+                        let mut m = 0.0_f64;
+                        for (va, vb) in a.iter().zip(b.iter()) {
+                            m = m.max((va - vb).abs());
+                        }
+                        m
+                    }
+                    _ => f64::NAN,
+                };
+                // Warm (handle already built = X resident); time `reps` Grams,
+                // each crossing only w (H2D) + the p×p Gram (D2H).
+                let _ = handle.gram(w.view());
+                let mut total = Duration::ZERO;
+                for r in 0..reps {
+                    // Perturb w per rep so each Gram is genuine work (mirrors an
+                    // IRLS weight update); regeneration is outside the timer.
+                    let wr = Array1::from_shape_fn(n, |i| (w[i] + 1e-3 * (r as f64)).abs());
+                    let start = Instant::now();
+                    if let Some(g) = handle.gram(wr.view()) {
+                        black_box(g);
+                    }
+                    total += start.elapsed();
+                }
+                let s = total.as_secs_f64() / reps as f64;
+                let rps = if s > 0.0 { n as f64 / s } else { 0.0 };
+                (true, rps, parity)
+            }
+            None => (false, 0.0, f64::NAN),
+        };
+
         // ---- batched-Cholesky: stack of K small d×d Schur blocks ----
         let mut blocks: Vec<Array2<f64>> =
             (0..k_batch).map(|_| spd_block(d, &mut rng)).collect();
@@ -181,15 +225,27 @@ fn main() {
             0.0
         };
 
+        // #1017 Phase 3 before/after: resident-X Gram vs per-call GEMM on the
+        // IDENTICAL shape. Speedup = how much the residency removes the ping-pong.
+        let resident_speedup = if gemm_rows_per_sec > 0.0 {
+            resident_rows_per_sec / gemm_rows_per_sec
+        } else {
+            0.0
+        };
+
         println!(
             "THROUGHPUT_1412 shape={label} n={n} p={p} k_batch={k_batch} d={d} \
              gemm_on_device={gemm_on_device} gemm_decl={gemm_decl} gemm_ms={:.3} gemm_rows_per_sec={gemm_rows_per_sec:.0} \
              chol_on_device={chol_on_device} chol_decl={chol_decl} chol_ms={:.3} chol_blocks_per_sec={chol_rows_per_sec:.0} \
              pipeline_rows_per_sec={pipeline_rows_per_sec:.0} \
-             frac_of_target={:.3}",
+             frac_of_target={:.3} \
+             resident_on_device={resident_on_device} resident_rows_per_sec={resident_rows_per_sec:.0} \
+             resident_vs_percall_speedup={resident_speedup:.2} resident_parity_max_abs_diff={resident_parity:.3e} \
+             resident_frac_of_target={:.3}",
             gemm_s * 1e3,
             chol_s * 1e3,
             pipeline_rows_per_sec / TARGET_ROWS_PER_SEC,
+            resident_rows_per_sec / TARGET_ROWS_PER_SEC,
         );
     }
 
