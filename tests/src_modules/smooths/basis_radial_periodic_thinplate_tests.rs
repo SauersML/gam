@@ -247,7 +247,7 @@ fn evaluate_splines_at_point(x: f64, degree: usize, knots: ArrayView1<f64>) -> A
             .as_slice_mut()
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "basis row should be contiguous"),
         &mut scratch,
-    , e));
+    );
     basisvalues
 }
 
@@ -305,9 +305,9 @@ fn periodic_bspline_derivative_matches_normalized_basis_finite_difference() {
         spec.degree,
         spec.num_basis,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "periodic derivative")
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "periodic derivative", e))
     .index_axis(Axis(2), 0)
-    .to_owned(, e));
+    .to_owned();
 
     let step = 1.0e-6;
     let plus = u.mapv(|v| v + step);
@@ -5613,7 +5613,7 @@ fn test_matern_operator_penalties_follow_rkhs_smoothness() {
             nullspace_shrinkage_survived: None,
         };
         build_matern_basis(data.view(), &spec)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e))
             .penaltyinfo
             .into_iter()
             .map(|info| info.source)
@@ -5623,7 +5623,7 @@ fn test_matern_operator_penalties_follow_rkhs_smoothness() {
     assert_eq!(
         sources_for(MaternNu::Half),
         vec![PenaltySource::OperatorMass]
-    , e));
+    );
     assert_eq!(
         sources_for(MaternNu::ThreeHalves),
         vec![PenaltySource::OperatorMass, PenaltySource::OperatorTension]
@@ -5903,8 +5903,8 @@ fn matern_frozen_nullspace_decision_overrides_spectral_test() {
     // transform so we exercise the FrozenTransform path with a pinned decision.
     let z =
         matern_identifiability_transform(centers.view(), &MaternIdentifiability::CenterSumToZero)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "transform builds")
-            .expect("center sum-to-zero yields a transform", e));
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "transform builds", e))
+            .expect("center sum-to-zero yields a transform");
     let base = |survived: Option<bool>| MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
@@ -5960,8 +5960,8 @@ fn matern_frozen_transform_skips_rank_reduction_on_degenerate_cloud() {
     let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
     let z =
         matern_identifiability_transform(centers.view(), &MaternIdentifiability::CenterSumToZero)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "transform builds")
-            .expect("center sum-to-zero yields a transform", e));
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "transform builds", e))
+            .expect("center sum-to-zero yields a transform");
     let transform_rows = z.nrows();
     assert_eq!(
         transform_rows,
@@ -6598,7 +6598,7 @@ fn test_duchon_design_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
         "[duchon_d1_p1_frozen_design] analytic shape={:?} fd shape={:?}",
         analytic_design.shape(),
         fd_design.shape()
-    , e));
+    );
     let a_norm = analytic_design.iter().map(|v| v * v).sum::<f64>().sqrt();
     let fd_norm = fd_design.iter().map(|v| v * v).sum::<f64>().sqrt();
     assert_eq!(
@@ -6870,9 +6870,9 @@ fn test_duchon_log_kappa_derivative_matchesfd() {
     let analytic_design = derivative
         .implicit_operator
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon design derivative must expose an implicit operator")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon design derivative must expose an implicit operator", e))
         .materialize_first(0)
-        .expect("materialize first design derivative", e));
+        .expect("materialize first design derivative");
     let design_err = (&analytic_design - &fd_design)
         .iter()
         .map(|v| v * v)
@@ -6955,9 +6955,9 @@ fn test_periodic_duchon_log_kappa_derivative_matchesfd() {
     let analytic_second = second_derivative
         .implicit_operator
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon design second derivative must expose an implicit operator")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon design second derivative must expose an implicit operator", e))
         .materialize_second_diag(0)
-        .expect("materialize second-diag design derivative", e));
+        .expect("materialize second-diag design derivative");
     let design_err = (&analytic_second - &fd_design)
         .iter()
         .map(|v| v * v)
@@ -7465,10 +7465,10 @@ fn test_duchon_collision_phi_rr_log_kappa_derivatives_even_log_branch_matchfd() 
         let ls = 1.0 / (kappa * psi_step.exp());
         let coeffs_step = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls);
         duchonphi_rr_collision_psi_triplet(ls, p_order, s_order, k_dim, &coeffs_step)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "collision phi_rr at perturbed kappa")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "collision phi_rr at perturbed kappa", e))
             .0
     };
-    let plus = at(eps, e));
+    let plus = at(eps);
     let minus = at(-eps);
     let fd_first = (plus - minus) / (2.0 * eps);
     let fd_second = (plus - 2.0 * phi_rr + minus) / (eps * eps);
@@ -7498,10 +7498,10 @@ fn test_duchon_radial_jets_use_collision_limits_at_origin() {
         duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "collision phi_rr", e));
     let t_collision = duchon_phi_rrrr_collision(length_scale, p_order, s_order, k_dim, &coeffs)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "collision phi''''")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "collision phi''''", e))
         / 3.0;
 
-    assert!(jets.phi_r.abs() < 1e-12, e));
+    assert!(jets.phi_r.abs() < 1e-12);
     assert!((jets.q - phi_rr).abs() < 1e-12);
     assert!((jets.lap - k_dim as f64 * phi_rr).abs() < 1e-12);
     assert!(jets.q_r.abs() < 1e-12);

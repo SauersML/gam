@@ -29,12 +29,12 @@ fn make_data_with_lats(lats: &[f64]) -> gam::data::EncodedDataset {
             ]));
         }
     }
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
 }
 
 #[test]
 fn sphere_training_rejects_lat_above_90() {
-    init_parallelism(, e));
+    init_parallelism();
     let bad_lats: Vec<f64> = (0..40)
         .map(|i| -75.0 + 4.0 * i as f64)
         .chain([95.0])

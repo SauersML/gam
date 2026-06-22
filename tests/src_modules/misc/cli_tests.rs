@@ -166,7 +166,7 @@ fn bounded_cli_termspec() -> TermCollectionSpec {
         &mut inference_notes,
         &gam::ResourcePolicy::default_library(),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "bounded term spec")
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "bounded term spec", e))
 }
 
 fn saved_fit_summary_fixture() -> SavedFitSummary {
@@ -196,7 +196,7 @@ fn chi_square_survival_approx(chi_sq: f64, df: f64) -> Option<f64> {
         return None;
     }
     let dist = ChiSquared::new(df).ok()?;
-    let p = 1.0 - dist.cdf(chi_sq, e));
+    let p = 1.0 - dist.cdf(chi_sq);
     p.is_finite().then_some(p)
 }
 
@@ -564,18 +564,18 @@ fn csv_mean_at(path: &std::path::Path, row_idx: usize) -> f64 {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse prediction csv", e));
     rows[row_idx]["mean"]
         .parse::<f64>()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "mean should parse")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "mean should parse", e))
 }
 
 fn csv_sigma_at(path: &std::path::Path, row_idx: usize) -> f64 {
-    let mut rdr = csv::Reader::from_path(path).expect("open prediction csv", e));
+    let mut rdr = csv::Reader::from_path(path).expect("open prediction csv");
     let rows = rdr
         .deserialize::<BTreeMap<String, String>>()
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse prediction csv", e));
     rows[row_idx]["sigma"]
         .parse::<f64>()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "sigma should parse")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "sigma should parse", e))
 }
 
 fn write_binomial_location_scale_train_csv(path: &std::path::Path) {
@@ -583,7 +583,7 @@ fn write_binomial_location_scale_train_csv(path: &std::path::Path) {
             path,
             "x1,x2,y\n-2.0,-1.2,0\n-1.7,0.4,0\n-1.5,-0.7,0\n-1.2,1.1,1\n-1.0,-0.3,0\n-0.8,0.9,0\n-0.5,-1.1,1\n-0.2,0.2,0\n0.0,-0.8,1\n0.3,1.0,0\n0.5,-0.4,1\n0.7,0.6,1\n0.9,-1.3,0\n1.1,0.3,1\n1.4,-0.2,1\n1.8,1.2,1\n",
         )
-        .expect("write training csv", e));
+        .expect("write training csv");
 }
 
 fn write_bernoulli_marginal_slope_train_csv(path: &std::path::Path) {
@@ -1034,7 +1034,7 @@ fn cli_resolve_family_matches_canonical_workflow_resolver() {
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "auto binary"),
         LikelihoodSpec::binomial_logit()
-    , e));
+    );
     assert_eq!(
         resolve_family(
             FamilyArg::Auto,
@@ -1046,7 +1046,7 @@ fn cli_resolve_family_matches_canonical_workflow_resolver() {
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "log link on counts"),
         LikelihoodSpec::poisson_log()
-    , e));
+    );
     // The SAS link is state-bearing, but family resolution embeds only the
     // canonical zero seed (epsilon = 0, log_delta = 0). The actual initial
     // state is supplied at fit time via `FitOptions.sas_link` and overrides
@@ -1255,7 +1255,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
     let expected_p = saved
         .survival_beta_time
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved beta_time")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved beta_time", e))
         .len()
         + saved
             .survival_beta_threshold
@@ -1267,7 +1267,7 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
             .as_ref()
             .expect("saved beta_log_sigma")
             .len()
-        + saved.beta_link_wiggle.as_ref().map_or(0, Vec::len, e));
+        + saved.beta_link_wiggle.as_ref().map_or(0, Vec::len);
     assert_eq!(covariance.nrows(), expected_p);
     assert_eq!(covariance.ncols(), expected_p);
 
@@ -1677,7 +1677,7 @@ fn saved_bernoulli_marginal_slope_replays_main_and_logslope_deviation_runtimes()
             .resolved_inverse_link()
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "resolved inverse link"),
         Some(InverseLink::Standard(StandardLink::Probit))
-    , e));
+    );
 }
 
 #[test]
@@ -2137,12 +2137,12 @@ fn intercept_only_binomial_mean_wiggle_model(
             sas_state: None,
         },
         family_name,
-    , e));
+    );
     payload.fit_result = Some(fit_result);
     payload.link = Some(InverseLink::Standard(
         StandardLink::try_from(link)
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "binomial mean-wiggle test helper requires a standard link"),
-    ), e));
+    ));
     payload.linkwiggle_knots = Some(wiggle_knots);
     payload.linkwiggle_degree = Some(wiggle_degree);
     payload.set_training_feature_metadata(vec![], vec![]);
@@ -2318,8 +2318,8 @@ fn mcwiggle_posterior_mean(
         }
     }
     let wiggle_design = test_saved_linkwiggle_design(&q0_draws, model)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "wiggle design")
-        .expect("wiggle model should produce basis", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "wiggle design", e))
+        .expect("wiggle model should produce basis");
     let mut acc = 0.0;
     for i in 0..draws {
         let q = q0_draws[i] + wiggle_design.row(i).dot(&beta_draws.row(i));
@@ -3123,7 +3123,7 @@ fn marginal_slope_linkwiggle_routes_into_anchored_deviation_config() {
     let routed = super::deviation_block_config_from_formula_linkwiggle(
         parsed.linkwiggle.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "linkwiggle config"),
     )
-    .expect("cubic linkwiggle must route into the deviation config", e));
+    .expect("cubic linkwiggle must route into the deviation config");
     assert_eq!(routed.degree, 3);
     assert_eq!(routed.num_internal_knots, 9);
     assert_eq!(routed.penalty_order, 3);
@@ -3150,7 +3150,7 @@ fn marginal_slope_linkwiggle_rejects_non_cubic_degree_at_routing_boundary() {
         let err = super::deviation_block_config_from_formula_linkwiggle(
             parsed.linkwiggle.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "linkwiggle config"),
         )
-        .expect_err("non-cubic linkwiggle must be rejected when routed into the cubic block", e));
+        .expect_err("non-cubic linkwiggle must be rejected when routed into the cubic block");
         assert!(
             err.contains("degree must be 3"),
             "error should state degree must be 3, got: {err}"
@@ -3337,7 +3337,7 @@ fn bernoulli_marginal_slope_saved_model_persists_exact_kernel_metadata_only() {
             .resolved_inverse_link()
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "resolved inverse link"),
         Some(InverseLink::Standard(StandardLink::Probit))
-    , e));
+    );
 }
 
 /// Snapshot parity: the CLI and PyFFI save paths feed identical *semantic*
@@ -3600,9 +3600,9 @@ fn saved_marginal_slope_models_require_latent_z_normalization() {
         InverseLink::Standard(StandardLink::Probit),
         gam::families::survival::lognormal_kernel::FrailtySpec::None,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build bernoulli marginal-slope saved model")
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build bernoulli marginal-slope saved model", e))
     .payload()
-    .clone(, e));
+    .clone();
     bernoulli.latent_z_normalization = None;
     let err = SavedModel::from_payload(bernoulli)
         .validate_for_persistence()
@@ -3692,7 +3692,7 @@ fn parse_duchon_power_defaults_to_cubic_rule_placeholder() {
     assert_eq!(
         parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "default Duchon power"),
         1.5
-    , e));
+    );
 }
 
 #[test]
@@ -3702,7 +3702,7 @@ fn parse_duchon_power_prefers_explicit_power() {
     assert_eq!(
         parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "power should parse"),
         0.0
-    , e));
+    );
 }
 
 #[test]
@@ -3714,7 +3714,7 @@ fn parse_duchon_power_accepts_fractional_power() {
     assert_eq!(
         parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "fractional power should parse"),
         0.5
-    , e));
+    );
 }
 
 #[test]
@@ -3758,14 +3758,14 @@ fn parse_duchon_order_accepts_supportedvalues() {
     assert_eq!(
         parse_duchon_order(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "default Duchon order"),
         DuchonNullspaceOrder::Linear
-    , e));
+    );
 
     let mut linear = BTreeMap::new();
     linear.insert("order".to_string(), "1".to_string());
     assert_eq!(
         parse_duchon_order(&linear).unwrap_or_else(|e| panic!("{} failed: {:?}", "linear Duchon order"),
         DuchonNullspaceOrder::Linear
-    , e));
+    );
 }
 
 #[test]
@@ -3775,7 +3775,7 @@ fn parse_duchon_order_accepts_higher_polynomial_degrees_and_rejects_malformedval
     assert_eq!(
         parse_duchon_order(&quadratic).unwrap_or_else(|e| panic!("{} failed: {:?}", "quadratic Duchon order"),
         DuchonNullspaceOrder::Degree(2)
-    , e));
+    );
 
     let mut malformed = BTreeMap::new();
     malformed.insert("order".to_string(), "linear".to_string());
@@ -3943,8 +3943,8 @@ fn survival_prediction_csv_includes_explicit_semantics_columns() {
     let mut path = std::env::temp_dir();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock")
-        .as_nanos(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
     path.push(format!("gam_survival_pred_schema_{ts}.csv"));
 
     let eta: Array1<f64> = array![0.5, -0.25];
@@ -3967,8 +3967,8 @@ fn survival_binary_prediction_csv_includes_explicit_semantics_columns() {
     let mut path = std::env::temp_dir();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock")
-        .as_nanos(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
     path.push(format!("gam_survival_binary_pred_schema_{ts}.csv"));
 
     let eta: Array1<f64> = array![0.5, -0.25];
@@ -3996,8 +3996,8 @@ fn survival_prediction_csv_emits_bounds_without_std_error() {
     let mut path = std::env::temp_dir();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock")
-        .as_nanos(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
     path.push(format!("gam_survival_pred_bounds_only_{ts}.csv"));
 
     let eta: Array1<f64> = array![0.5, -0.25];
@@ -4031,8 +4031,8 @@ fn survival_prediction_csv_errors_on_half_supplied_bounds() {
     let mut path = std::env::temp_dir();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock")
-        .as_nanos(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
     path.push(format!("gam_survival_pred_half_bounds_{ts}.csv"));
 
     let eta: Array1<f64> = array![0.0];
@@ -4085,8 +4085,8 @@ fn survival_binary_prediction_csv_emits_bounds_without_std_error() {
     let mut path = std::env::temp_dir();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock")
-        .as_nanos(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
     path.push(format!("gam_survival_binary_pred_bounds_only_{ts}.csv"));
 
     let eta: Array1<f64> = array![0.5, -0.25];
@@ -4119,8 +4119,8 @@ fn survival_binary_prediction_csv_errors_on_half_supplied_bounds() {
     let mut path = std::env::temp_dir();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock")
-        .as_nanos(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
     path.push(format!("gam_survival_binary_pred_half_bounds_{ts}.csv"));
 
     let eta: Array1<f64> = array![0.0];
@@ -4164,8 +4164,8 @@ fn prediction_csv_can_prepend_id_column() {
     let mut path = std::env::temp_dir();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock")
-        .as_nanos(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
     path.push(format!("gam_prediction_id_passthrough_{ts}.csv"));
 
     let eta = array![0.5, -0.25];
@@ -4189,8 +4189,8 @@ fn gaussian_location_scale_prediction_csv_includes_sigma_column() {
     let mut path = std::env::temp_dir();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock")
-        .as_nanos(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
     path.push(format!("gam_gaussian_loc_scale_pred_schema_{ts}.csv"));
 
     let eta = array![0.5, -0.25];
@@ -4221,8 +4221,8 @@ fn gaussian_location_scale_prediction_csv_includes_boundswhen_present() {
     let mut path = std::env::temp_dir();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock")
-        .as_nanos(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
     path.push(format!("gam_gaussian_loc_scale_pred_bounds_{ts}.csv"));
 
     let eta = array![1.0];
@@ -4821,11 +4821,11 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
         pred_input
             .design_noise
             .as_ref()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "logslope design")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "logslope design", e))
             .as_dense_ref()
             .is_none(),
         "saved survival predictor should keep the logslope design operator-backed"
-    , e));
+    );
 
     let prediction = predictor
         .predict_plugin_response(&pred_input)
@@ -5194,8 +5194,8 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
         &derivative_exit,
         &model,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "rebuild saved baseline-timewiggle")
-    .expect("saved baseline-timewiggle metadata", e));
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "rebuild saved baseline-timewiggle", e))
+    .expect("saved baseline-timewiggle metadata");
     let expected = predict_gam(
         exit_w,
         beta.view(),
@@ -5459,14 +5459,14 @@ fn saved_baseline_timewiggle_reconstruction_keeps_requested_order_one_penalty() 
     let model = SavedModel::from_payload(payload);
 
     let saved_cfg = gam::sample::saved_baseline_timewiggle_spec(&model)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved baseline-timewiggle spec")
-        .expect("timewiggle metadata", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved baseline-timewiggle spec", e))
+        .expect("timewiggle metadata");
     let wiggle_knots = Array1::from_vec(
         model
             .baseline_timewiggle_knots
             .clone()
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved knots"),
-    , e));
+    );
     let mut seed = Array1::<f64>::zeros(2 * eta_entry.len());
     for i in 0..eta_entry.len() {
         seed[i] = eta_entry[i];
@@ -5555,7 +5555,7 @@ fn evaluate_survival_baseline_handles_nearzero_gompertz_makeham_shape() {
     let (eta, derivative) =
         evaluate_survival_baseline(age, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate near-zero gompertz-makeham", e));
     let cumulative_hazard = (cfg.rate.unwrap_or_else(|e| panic!("{} failed: {:?}", "rate") + cfg.makeham.expect("makeham")) * age;
-    let expected_eta = cumulative_hazard.ln(, e));
+    let expected_eta = cumulative_hazard.ln();
     let expected_derivative = 1.0 / age;
     assert!((eta - expected_eta).abs() <= 1e-12);
     assert!((derivative - expected_derivative).abs() <= 1e-12);
@@ -5594,20 +5594,20 @@ fn parse_link_choice_rejects_flexible_blended_link() {
 #[test]
 fn parse_link_choice_accepts_binomial_aliases() {
     let probit = parse_link_choice(Some("binomial-probit"), false)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse binomial-probit")
-        .expect("link choice", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse binomial-probit", e))
+        .expect("link choice");
     assert!(matches!(probit.link, LinkFunction::Probit));
     assert!(probit.mixture_components.is_none());
 
     let logit = parse_link_choice(Some("binomial-logit"), false)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse binomial-logit")
-        .expect("link choice", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse binomial-logit", e))
+        .expect("link choice");
     assert!(matches!(logit.link, LinkFunction::Logit));
     assert!(logit.mixture_components.is_none());
 
     let cloglog = parse_link_choice(Some("binomial-cloglog"), false)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse binomial-cloglog")
-        .expect("link choice", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse binomial-cloglog", e))
+        .expect("link choice");
     assert!(matches!(cloglog.link, LinkFunction::CLogLog));
     assert!(cloglog.mixture_components.is_none());
 }
@@ -5615,8 +5615,8 @@ fn parse_link_choice_accepts_binomial_aliases() {
 #[test]
 fn parse_link_choice_flexible_shorthand_defaults_to_probit() {
     let choice = parse_link_choice(None, true)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse flexible shorthand")
-        .expect("link choice", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse flexible shorthand", e))
+        .expect("link choice");
     assert!(matches!(choice.mode, LinkMode::Flexible));
     assert!(matches!(choice.link, LinkFunction::Probit));
     assert!(choice.mixture_components.is_none());
@@ -6775,7 +6775,7 @@ fn survival_feasible_initial_beta_handles_sparse_overlapping_constraints() {
     };
 
     let beta0 = project_onto_linear_constraints(3, &constraints, None)
-        .expect("projection from origin onto well-formed constraints must succeed", e));
+        .expect("projection from origin onto well-formed constraints must succeed");
 
     assert!(beta0.iter().all(|v| v.is_finite()));
     for i in 0..constraints.a.nrows() {
@@ -6792,7 +6792,7 @@ fn survival_feasible_initial_beta_respects_offset_shifted_constraints() {
     };
 
     let beta0 = project_onto_linear_constraints(2, &constraints, None)
-        .expect("projection from origin onto well-formed constraints must succeed", e));
+        .expect("projection from origin onto well-formed constraints must succeed");
 
     assert!(beta0.iter().all(|v| v.is_finite()));
     assert!(constraints.a.row(0).dot(&beta0) - constraints.b[0] >= -1e-9);
@@ -6933,7 +6933,7 @@ fn ispline_time_basis_reuses_saved_keep_cols_on_narrow_prediction_range() {
         },
         None,
     )
-    .expect("rebuild prediction ispline basis", e));
+    .expect("rebuild prediction ispline basis");
 
     assert_eq!(rebuilt.x_entry_time.ncols(), trained.x_entry_time.ncols());
     assert_eq!(rebuilt.x_exit_time.ncols(), trained.x_exit_time.ncols());
@@ -6950,8 +6950,8 @@ fn saved_linkwiggle_derivative_matches_exact_constrained_basis_chain_rule() {
     let knots = vec![-2.0, -2.0, -2.0, -2.0, -0.5, 0.5, 2.0, 2.0, 2.0, 2.0];
     let knot_arr = Array1::from_vec(knots.clone());
     let constrained_cols = monotone_wiggle_basis_with_derivative_order(q0.view(), &knot_arr, 3, 0)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "build monotone link-wiggle basis")
-        .ncols(, e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "build monotone link-wiggle basis", e))
+        .ncols();
     let beta_link_wiggle = (0..constrained_cols)
         .map(|j| match j % 5 {
             0 => 0.2,
@@ -6981,14 +6981,14 @@ fn saved_linkwiggle_derivative_matches_exact_constrained_basis_chain_rule() {
 
     let exact = test_saved_linkwiggle_derivative_q0(&q0, &model).unwrap_or_else(|e| panic!("{} failed: {:?}", "exact derivative", e));
     let constrained_deriv = test_saved_linkwiggle_design(&q0, &model)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "design path should succeed")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "design path should succeed", e))
         .expect("wiggle design")
-        .ncols(, e));
+        .ncols();
     assert_eq!(constrained_deriv, beta_link_wiggle.len());
 
     let d_basis = test_saved_linkwiggle_basis(&q0, &model, BasisOptions::first_derivative())
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "derivative basis")
-        .expect("wiggle derivative basis", e));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "derivative basis", e))
+        .expect("wiggle derivative basis");
     let expected = d_basis.dot(&Array1::from_vec(beta_link_wiggle)) + 1.0;
     for i in 0..q0.len() {
         assert!(

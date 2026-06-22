@@ -37,12 +37,12 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
             y.to_string(),
         ]));
     }
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
 }
 
 #[test]
 fn sphere_m_sweep_lambda_diagnostic() { 
-    init_parallelism(, e));
+    init_parallelism();
     let data = make_dataset(400);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),

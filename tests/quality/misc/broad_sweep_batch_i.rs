@@ -40,7 +40,7 @@ fn mk_2col(
             y.to_string(),
         ]));
     }
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
 }
 
 fn fit_predict_2col(
@@ -52,7 +52,7 @@ fn fit_predict_2col(
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(formula, &data, &cfg).expect("fit ok", e));
+    let result = fit_from_formula(formula, &data, &cfg).expect("fit ok");
     let FitResult::Standard(fit) = result else {
         panic!()
     };
