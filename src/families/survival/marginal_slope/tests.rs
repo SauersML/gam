@@ -2330,6 +2330,261 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
     }
 }
 
+/// gam#1454/#932 FD-localizer: print the analytic-vs-FD error of EVERY
+/// directional second-derivative timepoint quantity
+/// (`eta_u_dir`, `eta_uv_dir`, `chi_u_dir`, `chi_uv_dir`, `d_u_dir`,
+/// `d_uv_dir`) against an exact-resolve finite difference of the base
+/// timepoint along the contraction direction, over EVERY primary axis (pair),
+/// for both the entry and exit timepoints.
+///
+/// The base FD witness re-solves the moving-boundary intercept exactly
+/// (`solve_row_survival_intercept_with_slot` + the production base timepoint),
+/// so it is an INDEPENDENT ground truth for `D_dir(base)` with no symbolic
+/// re-derivation. Any analytic `_dir` term that diverges from its FD pinpoints
+/// the inexact sub-term of the directional third[g,w0] chain: a desync in
+/// `d_uv_dir`/`eta_uv_dir` is the interior moment-jet/intercept-Hessian chain;
+/// a desync in `chi_uv_dir` is the calibration-RHS curvature chain.
+///
+/// This test prints (plain `eprintln!` of named f64) the per-(term, u, v)
+/// absolute error so the divergent term and block can be read off directly.
+/// It asserts only a loose outer guard (`5e-2`) so it surfaces — not hides —
+/// any residual; the per-term print is the localization signal.
+#[test]
+fn flex_directional_second_derivative_fd_localizer() {
+    let score_runtime = test_deviation_runtime();
+    let link_runtime = test_deviation_runtime();
+    let h_dim = score_runtime.basis_dim();
+    let w_dim = link_runtime.basis_dim();
+
+    let z_row = 0.3_f64;
+    let q0v = -0.25_f64;
+    let q1v = 0.7_f64;
+    let qd1v = 0.9_f64;
+    let gv = 0.4_f64;
+    let weight = 0.85_f64;
+    let event = 1.0_f64;
+
+    let family = SurvivalMarginalSlopeFamily {
+        n: 1,
+        event: Arc::new(array![event]),
+        weights: Arc::new(array![weight]),
+        z: Arc::new(array![z_row].insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: None,
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        offset_entry: Arc::new(array![q0v]),
+        offset_exit: Arc::new(array![q1v]),
+        derivative_offset_exit: Arc::new(array![qd1v]),
+        marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        score_warp: Some(score_runtime.clone()),
+        link_dev: Some(link_runtime.clone()),
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: None,
+        time_wiggle_degree: None,
+        time_wiggle_ncols: 0,
+        intercept_warm_starts: None,
+        auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+    };
+    let primary = flex_primary_slices(&family);
+    let p = primary.total;
+    let h_range = primary.h.clone().expect("score-warp primary range");
+    let w_range = primary.w.clone().expect("link-dev primary range");
+
+    let beta_h0: Vec<f64> = (0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())).collect();
+    let beta_w0: Vec<f64> = (0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())).collect();
+    let beta_h_arr = Array1::from(beta_h0.clone());
+    let beta_w_arr = Array1::from(beta_w0.clone());
+
+    let block_states = vec![
+        ParameterBlockState { beta: Array1::zeros(1), eta: array![0.0] },
+        ParameterBlockState { beta: Array1::zeros(0), eta: array![0.0] },
+        ParameterBlockState { beta: Array1::zeros(0), eta: array![gv] },
+        ParameterBlockState { beta: Array1::from(beta_h0.clone()), eta: array![0.0] },
+        ParameterBlockState { beta: Array1::from(beta_w0.clone()), eta: array![0.0] },
+    ];
+    // Sanity: the production scalar value must be finite for this fixture, so
+    // the directional timepoints are evaluated at a valid intercept solve.
+    let value = family
+        .row_neglog_flex_value(0, &block_states)
+        .expect("production flex row value");
+    assert!(value.is_finite(), "fixture scalar NLL must be finite");
+
+    let gi = primary.g;
+    let unit = |idx: usize| -> Array1<f64> {
+        let mut d = Array1::zeros(p);
+        d[idx] = 1.0;
+        d
+    };
+    let dir = unit(gi);
+
+    // Build the base + directional timepoint, plus a perturbed-`g` base for the
+    // exact-resolve FD witness, at a given timepoint `q`.
+    let timepoint_base_at = |q: f64, q_index: usize, g: f64| -> SurvivalFlexTimepointExact {
+        let slot = if q_index == primary.q0 {
+            SurvivalInterceptSlotKind::Entry
+        } else {
+            SurvivalInterceptSlotKind::Exit
+        };
+        let (a, d) = family
+            .solve_row_survival_intercept_with_slot(
+                q,
+                g,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                Some((0, slot)),
+            )
+            .expect("localizer intercept solve");
+        let cached = family
+            .build_cached_partition(&primary, a, g, Some(&beta_h_arr), Some(&beta_w_arr))
+            .expect("localizer cached partition");
+        family
+            .compute_survival_timepoint_exact_from_cached(
+                0,
+                &primary,
+                q,
+                q_index,
+                a,
+                g,
+                d,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                0.0,
+                q_index == primary.q1,
+                &cached,
+            )
+            .expect("localizer base timepoint")
+    };
+    let directional_at = |q: f64, q_index: usize| -> SurvivalFlexTimepointDirectionalExact {
+        let slot = if q_index == primary.q0 {
+            SurvivalInterceptSlotKind::Entry
+        } else {
+            SurvivalInterceptSlotKind::Exit
+        };
+        let (a, _d) = family
+            .solve_row_survival_intercept_with_slot(
+                q,
+                gv,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                Some((0, slot)),
+            )
+            .expect("localizer intercept solve (directional)");
+        let cached = family
+            .build_cached_partition(&primary, a, gv, Some(&beta_h_arr), Some(&beta_w_arr))
+            .expect("localizer cached partition (directional)");
+        family
+            .compute_survival_timepoint_directional_exact_from_cached(
+                0,
+                &primary,
+                q,
+                q_index,
+                a,
+                gv,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                &cached,
+                &dir,
+                q_index == primary.q1,
+            )
+            .expect("localizer directional timepoint")
+    };
+
+    // Richardson-extrapolated central FD of a base-timepoint scalar selector
+    // along the contraction direction g, re-solving the intercept exactly at
+    // each shifted g.
+    let fd_dir = |q: f64,
+                  q_index: usize,
+                  sel: &dyn Fn(&SurvivalFlexTimepointExact) -> f64,
+                  h: f64|
+     -> f64 {
+        let coarse = (sel(&timepoint_base_at(q, q_index, gv + h))
+            - sel(&timepoint_base_at(q, q_index, gv - h)))
+            / (2.0 * h);
+        let fine = (sel(&timepoint_base_at(q, q_index, gv + 0.5 * h))
+            - sel(&timepoint_base_at(q, q_index, gv - 0.5 * h)))
+            / h;
+        (4.0 * fine - coarse) / 3.0
+    };
+
+    let h_fd = 2e-3;
+    let mut worst_err = 0.0_f64;
+    let mut worst_label = String::from("none");
+
+    for &(label, q, q_index) in &[("entry", q0v, primary.q0), ("exit", q1v, primary.q1)] {
+        let ext = directional_at(q, q_index);
+
+        // ── Order-1 directional vectors: eta_u_dir, chi_u_dir, d_u_dir ──────
+        for u in 0..p {
+            for (name, got, want) in [
+                ("eta_u_dir", ext.eta_u_dir[u], fd_dir(q, q_index, &|b| b.eta_u[u], h_fd)),
+                ("chi_u_dir", ext.chi_u_dir[u], fd_dir(q, q_index, &|b| b.chi_u[u], h_fd)),
+                ("d_u_dir", ext.d_u_dir[u], fd_dir(q, q_index, &|b| b.d_u[u], h_fd)),
+            ] {
+                let err = (got - want).abs();
+                eprintln!(
+                    "#1454 localizer {label} {name}[{u}] analytic {got:+.8e} fd {want:+.8e} abserr {err:.3e}"
+                );
+                if err > worst_err {
+                    worst_err = err;
+                    worst_label = format!("{label} {name}[{u}]");
+                }
+            }
+        }
+
+        // ── Order-2 directional matrices: eta_uv_dir, chi_uv_dir, d_uv_dir ──
+        for u in 0..p {
+            for v in u..p {
+                for (name, got, want) in [
+                    (
+                        "eta_uv_dir",
+                        ext.eta_uv_dir[[u, v]],
+                        fd_dir(q, q_index, &|b| b.eta_uv[[u, v]], h_fd),
+                    ),
+                    (
+                        "chi_uv_dir",
+                        ext.chi_uv_dir[[u, v]],
+                        fd_dir(q, q_index, &|b| b.chi_uv[[u, v]], h_fd),
+                    ),
+                    (
+                        "d_uv_dir",
+                        ext.d_uv_dir[[u, v]],
+                        fd_dir(q, q_index, &|b| b.d_uv[[u, v]], h_fd),
+                    ),
+                ] {
+                    let err = (got - want).abs();
+                    eprintln!(
+                        "#1454 localizer {label} {name}[{u},{v}] analytic {got:+.8e} fd {want:+.8e} abserr {err:.3e}"
+                    );
+                    if err > worst_err {
+                        worst_err = err;
+                        worst_label = format!("{label} {name}[{u},{v}]");
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "#1454 localizer WORST {worst_label} abserr {worst_err:.3e}"
+    );
+    // Loose outer guard: surface (not hide) a residual. The per-term print
+    // above is the localization signal the owner reads to pinpoint the inexact
+    // term; a gross divergence still fails so the test is not a silent no-op.
+    assert!(
+        worst_err <= 5e-2,
+        "#1454 localizer: a directional second-derivative timepoint term diverges \
+         from its exact-resolve FD witness by {worst_err:.3e} at {worst_label} \
+         (read the per-term prints above to localize the inexact sub-term)"
+    );
+}
+
 /// gam#932/#979: the logslope first-sensitivity must include the Leibniz
 /// boundary term for density-normalization cells whose link-knot crossings move
 /// with g.
