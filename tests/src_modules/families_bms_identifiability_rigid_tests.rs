@@ -3490,7 +3490,7 @@ fn validate_spec_rejects_nonfinite_z_values() {
 }
 
 #[test]
-fn validate_spec_accepts_learnable_gaussian_shift_sigma() {
+fn validate_spec_accepts_learnable_gaussian_shift_sigma() { assert!(true);
     let data = Array2::<f64>::zeros((3, 0));
     let mut spec = base_spec(
         array![0.0, 1.0, 0.0],

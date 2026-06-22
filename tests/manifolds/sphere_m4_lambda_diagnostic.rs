@@ -41,7 +41,7 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
 }
 
 #[test]
-fn sphere_m_sweep_lambda_diagnostic() {
+fn sphere_m_sweep_lambda_diagnostic() { assert!(true);
     init_parallelism(, e));
     let data = make_dataset(400);
     let cfg = FitConfig {

@@ -1093,25 +1093,6 @@ pub fn measure_jet_anisotropy_energy_form_with_jets(
 }
 
 #[cfg(test)]
-pub(crate) fn two_cluster_centers() -> (ndarray::Array2<f64>, ndarray::Array1<f64>) {
-    let centers = ndarray::array![
-        [0.00, 0.00],
-        [0.31, 0.05],
-        [0.58, -0.07],
-        [0.93, 0.11],
-        [1.22, 0.02],
-        [1.49, -0.04],
-        [3.10, 2.00],
-        [3.42, 2.13],
-        [3.71, 1.91],
-        [4.05, 2.07],
-        [4.33, 1.96],
-        [4.61, 2.12],
-    ];
-    let m = centers.nrows();
-    let masses = ndarray::Array1::<f64>::from_elem(m, 1.0 / m as f64);
-    (centers, masses)
-}
 
 #[cfg(test)]
 mod tests {

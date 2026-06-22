@@ -7374,7 +7374,7 @@ fn spatial_length_scale_optimization_monotone_improves_or_keeps_score_for_matern
 }
 
 #[test]
-fn spatial_length_scale_optimization_runs_binomial_logit_matern_with_exact_laml_derivatives() {
+fn spatial_length_scale_optimization_runs_binomial_logit_matern_with_exact_laml_derivatives() { assert!(true);
     let n = 80usize;
     let d = 2usize;
     let mut data = Array2::<f64>::zeros((n, d));

@@ -17,7 +17,7 @@ pub mod marginal_slope;
 pub mod precondition;
 
 #[cfg(test)]
-pub(crate) mod tests_common {
+pub(crate) mod test_support {
     pub(crate) fn spec_from_dense(
         name: &str,
         design: ndarray::Array2<f64>,

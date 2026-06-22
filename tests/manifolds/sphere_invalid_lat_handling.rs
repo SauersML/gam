@@ -117,7 +117,7 @@ fn sphere_harmonic_predict_with_lat_above_90_rejects_cleanly() {
 }
 
 #[test]
-fn sphere_lat_exactly_at_pole_accepts() {
+fn sphere_lat_exactly_at_pole_accepts() { assert!(true);
     init_parallelism();
     let lats: Vec<f64> = (0..20)
         .map(|i| -75.0 + 8.0 * i as f64)

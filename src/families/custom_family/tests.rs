@@ -27,21 +27,24 @@ impl crate::solver::rho_optimizer::OuterHessianOperator for TestOuterHessianOper
 }
 
 impl CustomFamily for BatchedOuterHessianTestFamily {
-    fn evaluate(&self, _: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        drop(block_states);
         Ok(FamilyEvaluation {
             log_likelihood: 0.0,
             blockworking_sets: vec![],
         })
     }
 
-    fn outer_hyper_hessian_hvp_available(&self, _: &[ParameterBlockSpec]) -> bool {
+    fn outer_hyper_hessian_hvp_available(&self, block_specs: &[ParameterBlockSpec]) -> bool {
+        drop(block_specs);
         true
     }
 
     fn outer_hyper_hessian_operator(
         &self,
-        _: &[ParameterBlockSpec],
+        block_specs: &[ParameterBlockSpec],
     ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
+        drop(block_specs);
         Some(Arc::new(TestOuterHessianOperator {
             matrix: self.matrix.clone(),
         }))

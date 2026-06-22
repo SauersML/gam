@@ -3113,7 +3113,7 @@ mod tests {
     use super::*;
     use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     use ndarray::Array2;
-    use crate::identifiability::tests_common::{linspace, spec_from_dense};
+    use crate::identifiability::test_support::{linspace, spec_from_dense};
     use linspace as linspace_minus_one_to_one;
 
     /// Test 1: a model with no aliasing → audit returns clean, no

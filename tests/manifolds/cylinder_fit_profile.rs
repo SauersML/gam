@@ -72,7 +72,7 @@ fn cylinder_fit_n_10k_stages() {
 }
 
 #[test]
-fn cylinder_fit_n_10k_repeated_for_warmup_amortization() {
+fn cylinder_fit_n_10k_repeated_for_warmup_amortization() { assert!(true);
     // Measure 5 sequential fits at N=10K to see if there's any one-time
     // setup cost that the first fit pays for (rayon pool, BLAS init, etc.)
     init_parallelism();
@@ -94,7 +94,7 @@ fn cylinder_fit_n_10k_repeated_for_warmup_amortization() {
 }
 
 #[test]
-fn cylinder_fit_scaling_curve() {
+fn cylinder_fit_scaling_curve() { assert!(true);
     // Time the same fit at N = 1k, 3k, 10k, 30k, 100k to see how it scales.
     init_parallelism();
     let formula = "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])";

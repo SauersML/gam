@@ -1842,7 +1842,7 @@ mod tests {
     use crate::families::custom_family::AdditiveBlockJacobian;
     use crate::linalg::matrix::DenseDesignMatrix;
     use ndarray::Array2;
-    use crate::identifiability::tests_common::{linspace, spec_from_dense};
+    use crate::identifiability::test_support::{linspace, spec_from_dense};
 
     #[test]
     fn canonical_clean_specs_identity_transform() {

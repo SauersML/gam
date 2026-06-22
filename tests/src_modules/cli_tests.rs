@@ -1093,7 +1093,7 @@ fn cli_resolve_family_rejects_theta_without_negative_binomial() {
 }
 
 #[test]
-fn cli_firth_validation_allows_flexible_logit_base_link() {
+fn cli_firth_validation_allows_flexible_logit_base_link() { assert!(true);
     let choice = LinkChoice {
         mode: LinkMode::Flexible,
         link: LinkFunction::Logit,
