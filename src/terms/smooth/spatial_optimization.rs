@@ -6718,12 +6718,28 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_seed_config({
             let mut sc = exact_joint_seed_config(risk_profile, auxiliary_dim);
             if has_constant_curvature {
-                // Let the seed grid reach the widened over-smoothing ceiling and
-                // place one explicit probe in the high-λ basin (#1464). The
-                // probe is ρ ≈ +15, comfortably inside [12, RHO_BOUND], where the
-                // collapsing +κ kernel's heavily-smoothed optimum lives.
+                // Let the seed grid reach the widened over-smoothing ceiling so a
+                // smooth whose true REML optimum genuinely lives at large λ can be
+                // discovered (#1464).
                 sc.bounds = (sc.bounds.0, rho_ceiling);
-                sc.over_smoothing_probe_rho = Some(15.0);
+                // gam#1464: do NOT inject an explicit over-smoothing probe at
+                // ρ ≈ +15 for constant-curvature terms. The probe seeds the joint
+                // [ρ, ψ] solve at the collapsed-kernel corner where the geodesic
+                // exponential exp(−d_κ/L) degenerates to a near-constant. There the
+                // criterion is flat in κ (the kernel no longer resolves curvature)
+                // and reduces to the monotone log-det Occam term, so keep-best
+                // adopts the low-Occam collapsed null regardless of the true κ sign
+                // — the bit-identical κ̂ → +chart-bound rail for both ±κ datasets
+                // (the headline #1464 sign-blindness). The κ-sign basin is instead
+                // seeded from the sign-correct fixed-κ profiled-REML scan
+                // (`select_constant_curvature_kappa_sign_seed`, applied to
+                // `log_kappa0` above), which routes through the same κ-opt-OFF
+                // profiled fit the `curvature_inference_forspec` CI oracle trusts,
+                // so the joint solve starts inside the correct sign basin with a
+                // non-degenerate (κ-resolving) kernel rather than at the collapsed
+                // corner. The widened ρ ceiling is retained: legitimate
+                // over-smoothing is still reachable via the gradient solve and the
+                // sweep grid, just not pre-pinned to the collapse point.
             }
             sc
         })
