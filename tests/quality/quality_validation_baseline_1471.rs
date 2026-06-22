@@ -28,12 +28,17 @@
 use csv::StringRecord;
 use gam::data::EncodedDataset;
 use gam::matrix::LinearOperator;
+use gam::predict::{
+    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
+    predict_gamwith_uncertainty,
+};
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, r2, rmse, run_r};
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -529,6 +534,135 @@ fn cyclic_tensor_periodic_clamped_wraps_and_matches_mgcv() {
     assert!(
         gam_err <= mgcv_err * 1.20,
         "gam cyclic tensor recovery {gam_err:.5} worse than mgcv {mgcv_err:.5} * 1.20"
+    );
+}
+
+// ===========================================================================
+// Arm 5 — CI coverage under a NON-IDENTITY link (Poisson / log).
+// ===========================================================================
+
+/// Count intervals that bracket the truth.
+fn covered(lower: &[f64], upper: &[f64], truth: &[f64]) -> usize {
+    lower
+        .iter()
+        .zip(upper)
+        .zip(truth)
+        .filter(|((lo, hi), t)| **lo <= **t && **t <= **hi)
+        .count()
+}
+
+/// A 95% confidence interval is only correct if it covers the truth ~95% of the
+/// time. The existing Gaussian-identity coverage test exercises the trivial
+/// Jacobian (dμ/dη ≡ 1); this arm exercises the NON-trivial log-link delta
+/// method under a discrete Poisson response, where a wrong response-scale SE
+/// transform would silently mis-cover. We draw many Poisson replicates around a
+/// KNOWN log-mean, form gam's 95% response-scale mean intervals, and measure
+/// empirical coverage against the truth — then assert (a) gam is calibrated to
+/// nominal and (b) it covers at least as well as mgcv's `predict.gam(type=
+/// "response", se.fit=TRUE)` intervals on the identical data.
+#[test]
+fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
+    init_parallelism();
+    let n = 250usize;
+    let replicates = 24usize;
+    let nominal = 0.95_f64;
+
+    // Shared design across replicates (sorted x); only the Poisson draw changes.
+    let mut drng = StdRng::seed_from_u64(147_005);
+    let unif = Uniform::new(0.0_f64, 1.0).expect("uniform x");
+    let mut x: Vec<f64> = (0..n).map(|_| unif.sample(&mut drng)).collect();
+    x.sort_by(|a, b| a.partial_cmp(b).expect("finite x"));
+    // eta = 1.0 + 0.9*sin(2π x); mu = exp(eta) in ~[1.1, 6.7] (well away from 0,
+    // so the Gaussian-approximate interval is a fair comparison for both tools).
+    let mu_true: Vec<f64> = x.iter().map(|&v| (1.0 + 0.9 * (TAU * v).sin()).exp()).collect();
+
+    let poisson_log = LikelihoodSpec::new(
+        ResponseFamily::Poisson,
+        InverseLink::Standard(StandardLink::Log),
+    );
+
+    let total = n * replicates;
+    let mut gam_cov = 0usize;
+    let mut mgcv_cov = 0usize;
+
+    for rep in 0..replicates {
+        let mut rng = StdRng::seed_from_u64(700 + rep as u64);
+        let y: Vec<f64> = mu_true
+            .iter()
+            .map(|&m| poisson_sample(m, &mut rng) as f64)
+            .collect();
+
+        let ds = encode(&[("x", &x), ("y", &y)]);
+        let cfg = FitConfig {
+            family: Some("poisson".to_string()),
+            ..FitConfig::default()
+        };
+        let result = fit_from_formula("y ~ s(x)", &ds, &cfg).expect("gam poisson fit");
+        let FitResult::Standard(fit) = result else {
+            panic!("poisson => FitResult::Standard");
+        };
+        let design = build_term_collection_design(ds.values.view(), &fit.resolvedspec)
+            .expect("rebuild poisson design at training points");
+        let dense = design.design.to_dense();
+        let offset = Array1::<f64>::zeros(n);
+        let pred = predict_gamwith_uncertainty(
+            dense,
+            fit.fit.beta.view(),
+            offset.view(),
+            poisson_log.clone(),
+            &fit.fit,
+            &PredictUncertaintyOptions {
+                confidence_level: nominal,
+                covariance_mode: InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+                mean_interval_method: MeanIntervalMethod::Delta,
+                includeobservation_interval: false,
+                apply_bias_correction: false,
+                edgeworth_one_sided: false,
+                boundary_correction: false,
+                ood_inflation: false,
+                multi_point_joint: false,
+                ..PredictUncertaintyOptions::default()
+            },
+        )
+        .expect("gam poisson response-scale uncertainty");
+        gam_cov += covered(&pred.mean_lower.to_vec(), &pred.mean_upper.to_vec(), &mu_true);
+
+        let r = run_r(
+            &[Column::new("x", &x), Column::new("y", &y)],
+            r#"
+            suppressPackageStartupMessages(library(mgcv))
+            m <- gam(y ~ s(x), data = df, family = poisson(), method = "REML")
+            p <- predict(m, newdata = df, se.fit = TRUE, type = "response")
+            z <- qnorm(0.975)
+            emit("lower", as.numeric(p$fit - z * p$se.fit))
+            emit("upper", as.numeric(p$fit + z * p$se.fit))
+            "#,
+        );
+        mgcv_cov += covered(r.vector("lower"), r.vector("upper"), &mu_true);
+    }
+
+    let gam_coverage = gam_cov as f64 / total as f64;
+    let mgcv_coverage = mgcv_cov as f64 / total as f64;
+    let gam_err = (gam_coverage - nominal).abs();
+    let mgcv_err = (mgcv_coverage - nominal).abs();
+    eprintln!(
+        "poisson response-scale 95% CI coverage: reps={replicates} n={n} \
+         gam_cov={gam_coverage:.4} mgcv_cov={mgcv_coverage:.4} nominal={nominal} \
+         gam_err={gam_err:.4} mgcv_err={mgcv_err:.4}"
+    );
+
+    // PRIMARY: gam's own response-scale Poisson intervals are calibrated. The
+    // band (±0.07) is slightly looser than the Gaussian-identity case because
+    // the log-link delta method plus the discrete Poisson draw add MC noise.
+    assert!(
+        gam_err <= 0.07,
+        "gam 95% response-scale Poisson CI miscalibrated: empirical coverage \
+         {gam_coverage:.4} outside {nominal} ± 0.07"
+    );
+    // MATCH-OR-BEAT: gam calibrates at least as well as mgcv (MC slack 0.04).
+    assert!(
+        gam_err <= mgcv_err + 0.04,
+        "gam CI calibration worse than mgcv: gam_err {gam_err:.4} > mgcv_err {mgcv_err:.4} + 0.04"
     );
 }
 

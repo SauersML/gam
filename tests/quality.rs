@@ -38,6 +38,8 @@ mod quality_spline_scan_vs_mgcv;
 mod quality_ti_anova_scattered_recovers_truth;
 #[path = "quality/quality_tweedie_dispersion_location_scale_1060.rs"]
 mod quality_tweedie_dispersion_location_scale_1060;
+#[path = "quality/quality_validation_baseline_1471.rs"]
+mod quality_validation_baseline_1471;
 #[path = "quality/quality_vs_betareg_beta_logit.rs"]
 mod quality_vs_betareg_beta_logit;
 #[path = "quality/quality_vs_brute_force_loo_binomial_logit.rs"]
