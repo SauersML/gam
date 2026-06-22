@@ -5,6 +5,46 @@ pub(crate) const EXPENSIVE_PREWARM_RHO_DIM: usize = 4;
 pub(crate) const MULTI_SEED_PREWARM_BUDGET: usize = 8;
 pub(crate) const SINGLE_EXPENSIVE_PREWARM_BUDGET: usize = 16;
 
+/// Coefficient dimension at which the per-step inner solve cost begins to grow
+/// steeply (the empirical #979 "centers≈8→10" cliff). For a custom-family
+/// marginal-slope fit `p_coefficients` ≈ Σ over both formulas of the basis
+/// dim, so two `matern(centers=K)` formulas land at `p ≈ 2K`; the per-step
+/// inner joint-Newton solve becomes multi-second by `K ≈ 8` (`p ≈ 16`), well
+/// BELOW the `EXPENSIVE_PREWARM_COEFF_DIM = 24` "expensive shape" gate. Below
+/// this floor the pre-warm keeps the full `PATH_BUDGET` (cheap fits anneal
+/// fully and the seed-continuation accuracy is untouched); at or above it the
+/// per-seed step budget is scaled DOWN inversely with `p_coefficients` so the
+/// TOTAL pre-warm inner-solve work stays bounded as the problem grows past the
+/// cliff, instead of paying `PATH_BUDGET` (= 64) full inner solves per seed.
+pub(crate) const PREWARM_COST_CLIFF_COEFF_DIM: usize = 12;
+
+/// Target ceiling on `budget × p_coefficients` once past the cost cliff: the
+/// per-step inner solve cost scales roughly with `p_coefficients`, so holding
+/// `budget · p` constant keeps the per-seed pre-warm wall-clock flat across
+/// center counts (the #979 acceptance workloads centers ∈ {4, 12, 20} all land
+/// at a comparable, bounded pre-warm cost instead of the centers=20 non-finish).
+pub(crate) const PREWARM_COST_BUDGET_COEFF_PRODUCT: usize =
+    PREWARM_COST_CLIFF_COEFF_DIM * SINGLE_EXPENSIVE_PREWARM_BUDGET;
+
+/// Floor on the scaled budget: even on the largest problems the pre-warm must
+/// still anneal a few continuation legs from the oversmoothing ρ₀ toward the
+/// seed so the warm β it forwards is genuinely near-optimal (capping must not
+/// regress the seed-continuation accuracy the pre-warm exists to provide).
+pub(crate) const PREWARM_MIN_SCALED_BUDGET: usize = 4;
+
+/// Scale the per-seed continuation pre-warm step budget by `p_coefficients`
+/// once the problem is past the cost cliff, so the TOTAL pre-warm inner-solve
+/// work stays bounded as center count grows. Returns a budget in
+/// `[PREWARM_MIN_SCALED_BUDGET, base_budget]` that is non-increasing in
+/// `p_coefficients`. Below the cliff this is the identity (`base_budget`).
+pub(crate) fn cost_scaled_prewarm_budget(base_budget: usize, p_coefficients: usize) -> usize {
+    if p_coefficients <= PREWARM_COST_CLIFF_COEFF_DIM {
+        return base_budget;
+    }
+    let scaled = (PREWARM_COST_BUDGET_COEFF_PRODUCT / p_coefficients).max(PREWARM_MIN_SCALED_BUDGET);
+    scaled.min(base_budget)
+}
+
 pub(crate) fn continuation_prewarm_step_budget(
     config: &OuterConfig,
     cap: &OuterCapability,
@@ -30,13 +70,27 @@ pub(crate) fn continuation_prewarm_step_budget(
     let expensive_shape =
         p_coefficients >= EXPENSIVE_PREWARM_COEFF_DIM || cap.n_params >= EXPENSIVE_PREWARM_RHO_DIM;
 
-    if multi_seed_cascade && expensive_shape {
+    // Shape-derived base budget: the legacy "expensive shape" tiers. This caps
+    // the pre-warm only once the problem is large enough to declare an
+    // expensive shape (p ≥ 24 or rho dim ≥ 4).
+    let base_budget = if multi_seed_cascade && expensive_shape {
         MULTI_SEED_PREWARM_BUDGET.min(default_budget)
     } else if expensive_shape {
         SINGLE_EXPENSIVE_PREWARM_BUDGET.min(default_budget)
     } else {
         default_budget
-    }
+    };
+
+    // #979 cost-cliff cap: the per-step inner solve cost grows steeply with
+    // `p_coefficients` (the centers≈8→10 cliff for two-formula marginal-slope
+    // fits, where p ≈ 2·centers). The legacy "expensive shape" gate only fires
+    // at p ≥ 24, so a centers ∈ {8..12} fit still paid the FULL PATH_BUDGET (64)
+    // multi-second inner solves per seed — the binary marginal-slope slowdown.
+    // Scale the base budget DOWN inversely with `p_coefficients` past the cliff
+    // so total pre-warm work stays bounded, while preserving the full budget on
+    // cheap (small-p) fits and never collapsing below
+    // `PREWARM_MIN_SCALED_BUDGET` legs (so the warm β stays near-optimal).
+    cost_scaled_prewarm_budget(base_budget, p_coefficients)
 }
 
 /// Execute a single plan attempt (seed generation → solver loop → best result).
