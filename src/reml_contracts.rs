@@ -96,12 +96,35 @@ pub trait HyperOperator: Send + Sync {
             .sum()
     }
 
+    /// Optional stable identity for this operator's action `B`. When `Some`,
+    /// the default cached trace / projected-matrix paths memoize the `B · F`
+    /// product in the shared [`ProjectedFactorCache`] under a
+    /// `(design_id, factor)` key, so repeated projections of the same factor
+    /// against the same operator within one outer iteration build `B · F`
+    /// once. `None` (the default) disables that reuse: an operator with no
+    /// design factor stable across calls cannot key the cache without risking
+    /// a stale `B · F`, so it recomputes every time.
+    fn projection_design_id(&self) -> Option<usize> {
+        None
+    }
+
     fn trace_projected_factor_cached(
         &self,
         factor: &Array2<f64>,
-        _factor_cache: &ProjectedFactorCache,
+        factor_cache: &ProjectedFactorCache,
     ) -> f64 {
-        self.trace_projected_factor(factor)
+        match self.projection_design_id() {
+            Some(design_id) => {
+                let key = ProjectedFactorKey::from_factor_view(design_id, factor.view());
+                let projected = factor_cache.get_or_insert_with(key, || self.mul_mat(factor));
+                factor
+                    .iter()
+                    .zip(projected.iter())
+                    .map(|(&f, &bf)| f * bf)
+                    .sum()
+            }
+            None => self.trace_projected_factor(factor),
+        }
     }
 
     /// Compute the exact projected matrix `F^T B F`.
@@ -115,9 +138,16 @@ pub trait HyperOperator: Send + Sync {
     fn projected_matrix_cached(
         &self,
         factor: &Array2<f64>,
-        _factor_cache: &ProjectedFactorCache,
+        factor_cache: &ProjectedFactorCache,
     ) -> Array2<f64> {
-        self.projected_matrix(factor)
+        match self.projection_design_id() {
+            Some(design_id) => {
+                let key = ProjectedFactorKey::from_factor_view(design_id, factor.view());
+                let projected = factor_cache.get_or_insert_with(key, || self.mul_mat(factor));
+                crate::faer_ndarray::fast_atb(factor, projected.as_ref())
+            }
+            None => self.projected_matrix(factor),
+        }
     }
 
     /// Fill columns `[start, start + out.ncols())` of `B` into `out`.
@@ -813,6 +843,6 @@ pub struct ContractedPsiSecondOrder {
 pub type ContractedPsiSecondOrderFn =
     Arc<dyn Fn(&[f64]) -> Result<Option<ContractedPsiSecondOrder>, String> + Send + Sync>;
 
-use crate::solver::reml::reml_outer_engine::dense_linalg::{
+use crate::solver::estimate::reml::reml_outer_engine::{
     dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into,
 };
