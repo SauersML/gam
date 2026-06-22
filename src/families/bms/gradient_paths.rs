@@ -1437,9 +1437,7 @@ pub(crate) fn rigid_standard_normal_row_nll_generic<S: crate::families::jet_scal
     // observed slope b = s·g, scale c = √(1 + b²).
     let observed_slope = slope.scale(probit_scale);
     let b2 = observed_slope.mul(&observed_slope);
-    let c = b2
-        .add(&S::constant(1.0))
-        .compose_unary(unary_derivatives_sqrt(observed_slope.value() * observed_slope.value() + 1.0));
+    let c = b2.add(&S::constant(1.0)).sqrt();
     // η = q·c + (s·g)·z, signed margin m = (2y−1)·η.
     let eta = q.mul(&c).add(&observed_slope.scale(z));
     let signed = eta.scale(2.0 * y - 1.0);
