@@ -2337,6 +2337,17 @@ impl TermCollectionDesign {
             return None;
         };
         let kron = only_term.kronecker_factored.as_ref()?;
+        // A genuine tensor product needs at least two margins, and the marginal
+        // design / penalty / dim collections must agree in length. A degenerate
+        // (single-margin) or internally inconsistent factored basis cannot feed
+        // the Kronecker fast path, so fall back to the standard assembly rather
+        // than construct a malformed `KroneckerPenaltySystem` from it.
+        if kron.marginal_dims.len() < 2
+            || kron.marginal_penalties.len() != kron.marginal_dims.len()
+            || kron.marginal_designs.len() != kron.marginal_dims.len()
+        {
+            return None;
+        }
         KroneckerPenaltySystem::new(
             kron.marginal_penalties.clone(),
             kron.marginal_dims.clone(),

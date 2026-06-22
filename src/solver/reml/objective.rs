@@ -1654,6 +1654,14 @@ impl<'a> RemlState<'a> {
         if unconstrained_qs_frame {
             self.build_dense_original_assembly(rho, bundle, mode)
         } else {
+            // Reached for the transformed-QS active-set branch (where
+            // `free_basis_opt` rotates into a reduced subspace) or a non-QS
+            // frame: the original-basis penalty-coord fast path does not apply,
+            // so assemble in the evaluation frame via `build_dense_assembly`.
+            log::trace!(
+                "[reml-assembly] build_dense_assembly path \
+                 (transformed-QS active-set, or non-QS frame)"
+            );
             self.build_dense_assembly(rho, bundle, mode)
         }
     }

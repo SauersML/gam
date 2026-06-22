@@ -372,6 +372,14 @@ pub fn harvest_move_proposals(
     // `births_proposed` quantifies its channel.
     let fission_carve_skipped_count = fission_atoms.len().min(params.max_fissions);
     let fission_carve_skipped = fission_carve_skipped_count > 0;
+    if fission_carve_skipped {
+        log::debug!(
+            "[structure-harvest] within-atom carve inputs absent (#993): {} fission \
+             audit(s) ride without sub-atom refinement; e-gate owns acceptance",
+            fission_carve_skipped_count,
+        );
+    }
+
     for &(atom, significance) in fission_atoms.iter().take(params.max_fissions) {
         proposals.push(proposal(
             term,

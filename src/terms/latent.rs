@@ -371,8 +371,12 @@ impl LatentManifold {
                 normalize_or_axis(t, *dim)
             }
             Self::Interval { lo, hi } => {
+                // Order the bounds defensively: `f64::clamp` panics if min > max,
+                // so a reversed `Interval { lo, hi }` would otherwise crash deep
+                // in projection rather than clamp into the intended range.
+                let (lo, hi) = if lo <= hi { (*lo, *hi) } else { (*hi, *lo) };
                 let mut out = Array1::<f64>::zeros(1);
-                out[0] = t[0].clamp(*lo, *hi);
+                out[0] = t[0].clamp(lo, hi);
                 out
             }
             Self::Product(parts)
@@ -420,8 +424,12 @@ impl LatentManifold {
                 normalize_or_axis(y.view(), *dim)
             }
             Self::Interval { lo, hi } => {
+                // Order the bounds defensively: `f64::clamp` panics if min > max,
+                // so a reversed `Interval { lo, hi }` would otherwise crash the
+                // retraction instead of clamping into the intended range.
+                let (lo, hi) = if lo <= hi { (*lo, *hi) } else { (*hi, *lo) };
                 let mut out = Array1::<f64>::zeros(1);
-                out[0] = (t[0] + xi[0]).clamp(*lo, *hi);
+                out[0] = (t[0] + xi[0]).clamp(lo, hi);
                 out
             }
             Self::Product(parts)

@@ -2736,6 +2736,25 @@ mod tests {
             gauge.block_starts_raw, expected_raw,
             "SMGS lift raw block boundaries must match the compiled per-block raw widths",
         );
+
+        // (7) Every kept direction is finite and non-degenerate. A retained
+        // column with a zero or non-finite norm would be a spurious rank
+        // contribution that the count-only checks above cannot catch, so verify
+        // each compiled block's surviving directions directly.
+        for (bi, block) in compiled.blocks.iter().enumerate() {
+            for j in 0..block.t_lw.ncols() {
+                let col = block.t_lw.column(j);
+                assert!(
+                    col.iter().all(|v| v.is_finite()),
+                    "block {bi} kept direction {j} has a non-finite entry",
+                );
+                let norm = col.dot(&col).sqrt();
+                assert!(
+                    norm > 1e-10,
+                    "block {bi} kept direction {j} is degenerate (norm {norm:.3e})",
+                );
+            }
+        }
     }
 
     /// `T = I` case: per-block V = identity, R = None. The triangular

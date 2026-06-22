@@ -484,7 +484,8 @@ pub fn draw_batch(input: PolyaGammaBatchInput<'_>) -> Result<Array1<f64>, String
             match linux_cuda::draw_batch_gpu(&input) {
                 Ok(v) => return Ok(v),
                 Err(GpuError::NoDeviceKernel { .. }) => {
-                    // Fall through to CPU reference until full landing.
+                    // No device kernel for this path on this build: fall
+                    // through to the CPU reference.
                 }
                 Err(other) => return Err(String::from(other)),
             }

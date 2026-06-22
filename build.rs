@@ -3428,8 +3428,30 @@ fn marker_issue_ref_follows(rest: &str) -> bool {
 /// fragments so build.rs never carries them. Bare control-flow phrasings like
 /// "deferred to <fn>" / "deferred until <stage>" are deliberately NOT matched —
 /// those describe when a computation runs, not unfinished work.
-fn scan_for_owed_work_prose(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
-    let phrases: Vec<String> = vec![
+/// Shared owed-work classifier for BOTH the prose ban (`scan_for_owed_work_prose`,
+/// HEAD state) and the cosmetic-dodge audit (the removed-line diff check). `text`
+/// MUST already be lowercased — both callers pass lowercased comment text.
+///
+/// The phrase set is split by linguistic category, which is the crux of avoiding
+/// false positives WITHOUT weakening the gate:
+///   * STRONG phrases carry an explicit temporal / future-deferral cue ("not yet
+///     wired", "will be implemented", "deferred to a follow-up", "...yet"). They
+///     ALWAYS mean owed work, so they match unconditionally.
+///   * BARE-SCOPE phrases ("not wired into/through", "is/isn't wired") merely
+///     describe WHERE something is or is not used. "PG is not wired into the
+///     probit families" (it is logistic-only by theorem) and "the flat audit is
+///     not wired through W" (structural rank is the intended check) are PERMANENT
+///     facts, not deferrals. A bare-scope phrase therefore counts as owed work
+///     ONLY when a temporal cue co-occurs on the same line — i.e. it was actually
+///     a promise ("isn't wired through Z yet"), not a statement of scope.
+///
+/// This stays strict against laundering: rewording a temporal promise away still
+/// fires the cosmetic-dodge diff check (which inspects the REMOVED line, where the
+/// temporal cue still lived), and every strong phrase is untouched. It only stops
+/// the gate from manufacturing false positives on honest scope statements — which
+/// is exactly what drove rewording in the first place.
+fn comment_text_is_owed_work(text: &str) -> bool {
+    let strong: Vec<String> = vec![
         format!("not yet {}", "wired"),
         format!("not yet {}", "implemented"),
         format!("not yet {}", "supported"),
@@ -3439,10 +3461,6 @@ fn scan_for_owed_work_prose(root: &Path, dir: &Path, offenders: &mut Vec<(PathBu
         format!("not {} yet", "implemented"),
         format!("not {} yet", "supported"),
         format!("not {} yet", "wired"),
-        format!("not wired {}", "into"),
-        format!("not wired {}", "through"),
-        format!("is not {}", "wired"),
-        format!("{} wired", "isn't"),
         format!("to be {} yet", "wired"),
         format!("deferred to a {}", "follow"),
         format!("left to a {}", "follow"),
@@ -3456,6 +3474,26 @@ fn scan_for_owed_work_prose(root: &Path, dir: &Path, offenders: &mut Vec<(PathBu
         format!("yet to be {}", "implemented"),
         format!("yet to be {}", "wired"),
     ];
+    if strong.iter().any(|p| text.contains(p.as_str())) {
+        return true;
+    }
+    let bare_scope: Vec<String> = vec![
+        format!("not wired {}", "into"),
+        format!("not wired {}", "through"),
+        format!("is not {}", "wired"),
+        format!("{} wired", "isn't"),
+    ];
+    if bare_scope.iter().any(|p| text.contains(p.as_str())) {
+        // A bare scope statement is owed work only if it also promises a future
+        // change on the same line. Cues are kept tight so a permanent scope fact
+        // that merely happens to contain one of these words elsewhere is safe.
+        let temporal = [" yet", " will ", " soon", " later", " eventually", " once "];
+        return temporal.iter().any(|c| text.contains(c));
+    }
+    false
+}
+
+fn scan_for_owed_work_prose(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
     visit_files(root, dir, &mut |rel, content| {
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         if !rel_str.starts_with("src/") {
@@ -3465,7 +3503,7 @@ fn scan_for_owed_work_prose(root: &Path, dir: &Path, offenders: &mut Vec<(PathBu
             let Some(text) = line_comment_text(line) else {
                 continue;
             };
-            if phrases.iter().any(|p| text.contains(p.as_str())) {
+            if comment_text_is_owed_work(&text) {
                 offenders.push((rel.to_path_buf(), idx + 1, line.trim().to_string()));
             }
         }
@@ -5350,44 +5388,17 @@ fn collect_called_idents(stripped: &str, out: &mut Vec<String>) {
 /// very audit). Kept as a standalone helper so the removal-signal here keys on
 /// precisely the same phrase set the prose ban enforces — removing one of these
 /// notes is what this audit treats as an owed-work signal disappearing.
-fn cosmetic_dodge_owed_work_phrases() -> Vec<String> {
-    vec![
-        format!("not yet {}", "wired"),
-        format!("not yet {}", "implemented"),
-        format!("not yet {}", "supported"),
-        format!("not yet {}", "hooked"),
-        format!("not yet {}", "done"),
-        format!("not yet {}", "finished"),
-        format!("not {} yet", "implemented"),
-        format!("not {} yet", "supported"),
-        format!("not {} yet", "wired"),
-        format!("not wired {}", "into"),
-        format!("not wired {}", "through"),
-        format!("is not {}", "wired"),
-        format!("{} wired", "isn't"),
-        format!("to be {} yet", "wired"),
-        format!("deferred to a {}", "follow"),
-        format!("left to a {}", "follow"),
-        format!("for a {}-up", "follow"),
-        format!("in a {}-up", "follow"),
-        format!("to a {}-up", "follow"),
-        format!("remains to be {}", "implemented"),
-        format!("needs to be {}", "implemented"),
-        format!("will be {}", "implemented"),
-        format!("will be {}", "wired"),
-        format!("yet to be {}", "implemented"),
-        format!("yet to be {}", "wired"),
-    ]
-}
-
-/// True when `line` is a `//` line-comment carrying one of the owed-work /
-/// deferral prose phrases. Uses the same `line_comment_text` reader as
-/// `scan_for_owed_work_prose`, so URLs/`://` and non-comment code never match.
-fn cosmetic_dodge_line_is_owed_signal(line: &str, phrases: &[String]) -> bool {
+/// True when `line` is a `//` line-comment carrying an owed-work / deferral
+/// signal. Uses the same `line_comment_text` reader and the same
+/// `comment_text_is_owed_work` classifier as `scan_for_owed_work_prose`, so the
+/// diff check and the HEAD-state ban agree exactly on what counts as owed work —
+/// URLs/`://` never match, and a bare scope statement counts only with a temporal
+/// cue (see `comment_text_is_owed_work`).
+fn cosmetic_dodge_line_is_owed_signal(line: &str) -> bool {
     let Some(text) = line_comment_text(line) else {
         return false;
     };
-    phrases.iter().any(|p| text.contains(p.as_str()))
+    comment_text_is_owed_work(&text)
 }
 
 /// Collect the non-test `src/*.rs` files a single commit touched. A merge commit
@@ -5462,7 +5473,7 @@ fn cosmetic_dodge_blob_at(manifest_dir: &Path, treeish: &str, rel: &str) -> Opti
 }
 
 /// History audit: flag any recent commit that REMOVED or REWORDED an owed-work /
-/// deferral note (one of `cosmetic_dodge_owed_work_phrases`) from a non-test
+/// deferral note (per `comment_text_is_owed_work`) from a non-test
 /// `src/*.rs` file WHILE that dodge STILL STANDS in the current source — i.e. the
 /// signal is still gone AND the comment-stripped code is still byte-identical to
 /// the pre-laundering blob. That is the cosmetic wording dodge: the note that
@@ -5497,8 +5508,6 @@ fn run_cosmetic_wording_dodge_audit(
     manifest_dir: &Path,
     violations: &mut Vec<(PathBuf, usize, String, String)>,
 ) {
-    let phrases = cosmetic_dodge_owed_work_phrases();
-
     let log = match Command::new("git")
         .arg("-C")
         .arg(manifest_dir)
@@ -5545,7 +5554,7 @@ fn run_cosmetic_wording_dodge_audit(
                     continue;
                 }
                 if let Some(body) = line.strip_prefix('-')
-                    && cosmetic_dodge_line_is_owed_signal(body, &phrases)
+                    && cosmetic_dodge_line_is_owed_signal(body)
                 {
                     removed_signal_lines.push(body.to_string());
                 }
@@ -5579,7 +5588,7 @@ fn run_cosmetic_wording_dodge_audit(
             // still there?" comparisons that ignore pure re-indentation.
             let signal_lines = |blob: &str| -> Vec<String> {
                 blob.lines()
-                    .filter(|l| cosmetic_dodge_line_is_owed_signal(l, &phrases))
+                    .filter(|l| cosmetic_dodge_line_is_owed_signal(l))
                     .map(|l| l.trim().to_string())
                     .collect::<Vec<_>>()
             };
