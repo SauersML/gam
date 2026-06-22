@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import importlib
+import math
+import numbers
 from collections.abc import Mapping, Sequence
+from decimal import Decimal
 from typing import Any, cast
 
 SUPPORTED_OUTPUT_KINDS = {"dict", "numpy", "pandas", "polars", "pyarrow"}
@@ -56,7 +59,9 @@ class PreNormalizedTable:
 def _try_import(name: str) -> Any | None:
     try:
         return importlib.import_module(name)
-    except ImportError:
+    except ImportError as e:
+        if getattr(e, "name", None) != name:
+            raise
         return None
 
 
@@ -105,6 +110,33 @@ def _stringify_marked(value: Any, is_categorical: bool, *, column: str | None = 
     if is_categorical:
         return CATEGORICAL_CELL_SENTINEL + text
     return text
+
+
+def _infer_categorical_from_values(columns: dict[str, list[Any]]) -> frozenset[str]:
+    out = set()
+    for name, values in columns.items():
+        saw_string = False
+        disqualified = False
+        for value in values:
+            if value is None:
+                continue
+            if isinstance(value, bool):
+                # bool is numeric (and an int subclass) — not categorical.
+                disqualified = True
+                break
+            if isinstance(value, str):
+                saw_string = True
+                continue
+            if isinstance(value, float) and value != value:
+                # NaN is treated as null/skip.
+                continue
+            # Any other non-null value (int/float/numpy number/etc.) is
+            # numeric-or-other and disqualifies the column.
+            disqualified = True
+            break
+        if saw_string and not disqualified:
+            out.add(name)
+    return frozenset(out)
 
 
 def categorical_dtype_columns(
@@ -162,39 +194,18 @@ def categorical_dtype_columns(
                 ):
                     out.add(str(field.name))
             return frozenset(out)
-        # Untyped inputs (mappings, records, numpy, row sequences) have no
-        # declared dtype: infer categoricality from the column values.
-        if columns is None:
-            columns, _ = table_columns(data)
-        out = set()
-        for name, values in columns.items():
-            saw_string = False
-            disqualified = False
-            for value in values:
-                if value is None:
-                    continue
-                if isinstance(value, bool):
-                    # bool is numeric (and an int subclass) — not categorical.
-                    disqualified = True
-                    break
-                if isinstance(value, str):
-                    saw_string = True
-                    continue
-                if isinstance(value, float) and value != value:
-                    # NaN is treated as null/skip.
-                    continue
-                # Any other non-null value (int/float/numpy number/etc.) is
-                # numeric-or-other and disqualifies the column.
-                disqualified = True
-                break
-            if saw_string and not disqualified:
-                out.add(name)
-        return frozenset(out)
     except (ImportError, AttributeError, TypeError, KeyError, ValueError):
         # Dtype introspection is a best-effort enhancement; if a library's
         # introspection API shifts, fall back to value-based inference rather
         # than fail the fit.
-        return frozenset()
+        pass
+
+    # Untyped inputs (mappings, records, numpy, row sequences) have no
+    # declared dtype, or we hit an introspection error above: infer
+    # categoricality from the column values.
+    if columns is None:
+        columns, _ = table_columns(data)
+    return _infer_categorical_from_values(columns)
 
 
 def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
@@ -321,19 +332,24 @@ def response_column_name(formula: str) -> str | None:
 
 
 def mapping_table_columns(data: Mapping[Any, Any]) -> dict[str, list[Any]]:
-    columns = {str(key): vector_values(value) for key, value in data.items()}
+    columns: dict[str, list[Any]] = {}
+    for key, value in data.items():
+        key_str = str(key)
+        if key_str in columns:
+            raise ValueError(f"key collision: original key {key!r} normalizes to {key_str!r}, which is already used")
+        columns[key_str] = vector_values(value)
     validate_column_lengths(columns)
     return columns
 
 
 def record_table_columns(rows: list[Mapping[str, Any]]) -> dict[str, list[Any]]:
-    headers = collect_record_headers(rows)
+    headers, key_map = collect_record_headers(rows)
     columns: dict[str, list[Any]] = {header: [] for header in headers}
-    for row in rows:
-        for header in headers:
-            if header not in row:
-                raise ValueError(f"row is missing key '{header}'")
-            columns[header].append(row[header])
+    for row_idx, row in enumerate(rows):
+        for original_key, header in key_map.items():
+            if original_key not in row:
+                raise ValueError(f"row {row_idx + 1} is missing key {original_key!r} (normalized to '{header}')")
+            columns[header].append(row[original_key])
     return columns
 
 
@@ -387,20 +403,24 @@ def validate_column_lengths(columns: Mapping[str, Sequence[Any]]) -> None:
         raise ValueError("all columns must have the same length")
 
 
-def collect_record_headers(rows: list[Mapping[str, Any]]) -> list[str]:
+def collect_record_headers(rows: list[Mapping[str, Any]]) -> tuple[list[str], dict[Any, str]]:
     headers: list[str] = []
-    seen = set()
+    key_map: dict[Any, str] = {}
+    seen_str = set()
     for row in rows:
         for key in row.keys():
-            key_str = str(key)
-            if key_str not in seen:
-                seen.add(key_str)
+            if key not in key_map:
+                key_str = str(key)
+                if key_str in seen_str:
+                    raise ValueError(f"key collision: original key {key!r} normalizes to {key_str!r}, which is already used")
+                seen_str.add(key_str)
                 headers.append(key_str)
-    return headers
+                key_map[key] = key_str
+    return headers, key_map
 
 
 def stringify_cell(value: Any, *, column: str | None = None, row: int | None = None) -> str:
-    if isinstance(value, bool):
+    if isinstance(value, bool) or type(value).__name__ == "bool_":
         return "1" if value else "0"
     if value is None:
         if column and row is not None:
@@ -409,23 +429,18 @@ def stringify_cell(value: Any, *, column: str | None = None, row: int | None = N
             raise ValueError(f"column '{column}' contains None")
         else:
             raise ValueError("table cells cannot be None")
-    if isinstance(value, int):
-        # bool is handled above; covers Python int and any int subclass
-        # (e.g. numpy integers) so the rendered text is always a bare integer.
-        return repr(int(value))
-    if isinstance(value, float):
-        if value != value:
+    if isinstance(value, (numbers.Real, Decimal)):
+        numeric_value = float(value)
+        if not math.isfinite(numeric_value):
             if column and row is not None:
-                raise ValueError(f"column '{column}' has NaN at row {row + 1}")
+                raise ValueError(f"column '{column}' has non-finite numeric value at row {row + 1}")
             elif column:
-                raise ValueError(f"column '{column}' contains NaN")
+                raise ValueError(f"column '{column}' contains non-finite numeric value")
             else:
-                raise ValueError("table cells cannot be NaN")
-        # float subclasses (e.g. numpy.float64) render via repr() with the
-        # type name in NumPy 2.x ("np.float64(-3.0)"), which the Rust core
-        # cannot parse and so misclassifies the column as categorical.
-        # Normalize through the canonical Python float first.
-        return repr(float(value))
+                raise ValueError("table cells cannot be non-finite numeric value")
+        if isinstance(value, numbers.Integral):
+            return repr(int(value))
+        return repr(numeric_value)
     text = str(value)
     if not text:
         if column and row is not None:
@@ -446,8 +461,8 @@ def coerce_numeric_vector(values: Sequence[Any], *, label: str) -> list[float]:
             raise ValueError(
                 f"{label} contains a non-numeric value at position {index + 1}: {value!r}"
             ) from exc
-        if numeric_value != numeric_value:
-            raise ValueError(f"{label} contains NaN at position {index + 1}")
+        if not math.isfinite(numeric_value):
+            raise ValueError(f"{label} contains non-finite value at position {index + 1}")
         numeric.append(numeric_value)
     return numeric
 

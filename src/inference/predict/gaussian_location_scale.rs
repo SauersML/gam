@@ -189,7 +189,7 @@ impl PredictionTransform for GaussianLocationScalePredictor {
         Ok(eta.clone())
     }
 
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
+    fn response_jacobian_rows(&self, _: PredictPass) -> ResponseInterval {
         ResponseInterval::IdentityEta
     }
 

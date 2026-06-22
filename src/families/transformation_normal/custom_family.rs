@@ -110,7 +110,7 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         crate::families::block_layout::block_count::validate_block_count::<
             TransformationNormalError,
@@ -310,7 +310,7 @@ impl CustomFamily for TransformationNormalFamily {
 
     fn block_linear_constraints(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         block_index: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
@@ -378,7 +378,7 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psi_terms(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
@@ -419,7 +419,7 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psisecond_order_terms(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
@@ -525,7 +525,7 @@ impl CustomFamily for TransformationNormalFamily {
     fn exact_newton_joint_psihessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         psi_derivs: &[Vec<CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
         d_beta_flat: &Array1<f64>,

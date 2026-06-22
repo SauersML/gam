@@ -11,7 +11,7 @@ pub trait WorkingModel {
     fn update_with_curvature(
         &mut self,
         beta: &Coefficients,
-        curvature_kind: HessianCurvatureKind,
+        _: HessianCurvatureKind,
     ) -> Result<WorkingState, EstimationError> {
         self.update(beta)
     }
@@ -28,7 +28,7 @@ pub trait WorkingModel {
         &mut self,
         beta: &Coefficients,
         arr: &Array1<f64>,
-        linear_predictor: &LinearPredictor,
+        _: &LinearPredictor,
         curvature: HessianCurvatureKind,
     ) -> Result<CandidateEvaluation, EstimationError> {
         assert!(arr.iter().all(|v| !v.is_nan()));

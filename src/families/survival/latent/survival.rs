@@ -4137,7 +4137,7 @@ impl CustomFamily for LatentSurvivalFamily {
 
     fn block_linear_constraints(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
@@ -4160,7 +4160,7 @@ impl CustomFamily for LatentSurvivalFamily {
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         Ok(Some(Arc::new(LatentSurvivalHessianWorkspace::new(
             self.clone(),
@@ -4171,7 +4171,7 @@ impl CustomFamily for LatentSurvivalFamily {
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         self.evaluate_exact_newton_joint_gradient_dense(block_states)
             .map(|(log_likelihood, gradient)| {
@@ -4364,7 +4364,7 @@ impl CustomFamily for LatentBinaryFamily {
 
     fn block_linear_constraints(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
@@ -4387,7 +4387,7 @@ impl CustomFamily for LatentBinaryFamily {
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         Ok(Some(Arc::new(LatentBinaryHessianWorkspace::new(
             self.clone(),
@@ -4398,7 +4398,7 @@ impl CustomFamily for LatentBinaryFamily {
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         self.evaluate_exact_newton_joint_dense(block_states)
             .map(|(log_likelihood, gradient, _)| {

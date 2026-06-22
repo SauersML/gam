@@ -262,7 +262,7 @@ pub trait CustomFamily {
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
+        _: &BlockwiseFitOptions,
     ) -> ExactOuterDerivativeOrder {
         let coefficient_work = self
             .coefficient_hessian_cost(specs)
@@ -409,7 +409,7 @@ pub trait CustomFamily {
     /// current values of other blocks.
     fn block_geometry(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         spec: &ParameterBlockSpec,
     ) -> Result<(DesignMatrix, Array1<f64>), String> {
         Ok((spec.design.clone(), spec.offset.clone()))
@@ -453,7 +453,7 @@ pub trait CustomFamily {
     /// when that declaration is false.
     fn block_geometry_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         idx: usize,
         block_spec: &ParameterBlockSpec,
         arr: &Array1<f64>,
@@ -467,7 +467,7 @@ pub trait CustomFamily {
     /// Optional per-block coefficient projection applied after each block update.
     fn post_update_block_beta(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         idx: usize,
         block_spec: &ParameterBlockSpec,
         beta: Array1<f64>,
@@ -493,7 +493,7 @@ pub trait CustomFamily {
     /// Returns `None` if no barrier constraint applies (the default).
     fn max_feasible_step_size(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         idx: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<f64>, String> {
@@ -506,7 +506,7 @@ pub trait CustomFamily {
     /// `A * beta_block >= b`.
     fn block_linear_constraints(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         idx: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
@@ -527,7 +527,7 @@ pub trait CustomFamily {
     /// `None` as unavailable rather than silently substituting zero.
     fn exact_newton_hessian_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         idx: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
@@ -548,7 +548,7 @@ pub trait CustomFamily {
     /// Hessian drift is unavailable.
     fn exact_newton_hessian_second_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         idx: usize,
         arr: &Array1<f64>,
         arr2: &Array1<f64>,
@@ -595,8 +595,8 @@ pub trait CustomFamily {
     /// coefficient space without building per-block Hessian working sets.
     fn exact_newton_joint_gradient_evaluation(
         &self,
-        block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         Ok(None)
     }
@@ -609,7 +609,7 @@ pub trait CustomFamily {
     /// on its legacy hand-assembled gradient.
     fn exact_newton_joint_loglik_gradient(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
     ) -> Result<Option<Array1<f64>>, String> {
         Ok(None)
     }
@@ -659,8 +659,8 @@ pub trait CustomFamily {
     /// calls made by the unified outer evaluator.
     fn exact_newton_joint_hessian_workspace(
         &self,
-        block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         Ok(None)
     }
@@ -795,7 +795,7 @@ pub trait CustomFamily {
     fn prefers_matrix_free_inner_joint(
         &self,
         specs: &[ParameterBlockSpec],
-        states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
     ) -> bool {
         assert_valid_blockspecs(specs, "matrix-free inner-joint preference");
         false
@@ -1333,7 +1333,7 @@ pub trait CustomFamily {
     /// return derivatives in that same scaled curvature space.
     fn exact_newton_outer_curvature(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
     ) -> Result<Option<ExactNewtonOuterCurvature>, String> {
         Ok(None)
     }
@@ -1352,7 +1352,7 @@ pub trait CustomFamily {
     fn exact_newton_outer_curvature_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
         self.exact_newton_outer_curvature_directional_derivative(block_states, d_beta_flat)
@@ -1377,7 +1377,7 @@ pub trait CustomFamily {
     fn exact_newton_outer_curvature_second_directional_derivative_with_specs(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
@@ -1570,7 +1570,7 @@ pub trait CustomFamily {
     /// this with zero unless the family truly has constant working weights.
     fn diagonalworking_weights_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         idx: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {
@@ -1592,7 +1592,7 @@ pub trait CustomFamily {
     /// first-order geometry while building `d²H`.
     fn diagonalworking_weights_second_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         idx: usize,
         arr: &Array1<f64>,
         arr2: &Array1<f64>,
@@ -1631,9 +1631,9 @@ pub trait CustomFamily {
     /// evaluation must use this flattened-coefficient hook instead.
     fn exact_newton_joint_psi_terms(
         &self,
-        block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        _: &[Vec<CustomFamilyBlockPsiDerivative>],
         idx: usize,
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         assert!(idx < usize::MAX);
@@ -1653,9 +1653,9 @@ pub trait CustomFamily {
     /// contributions and profile/Laplace corrections.
     fn exact_newton_joint_psisecond_order_terms(
         &self,
-        block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        _: &[Vec<CustomFamilyBlockPsiDerivative>],
         idx: usize,
         idx2: usize,
     ) -> Result<Option<ExactNewtonJointPsiSecondOrderTerms>, String> {
@@ -1676,9 +1676,9 @@ pub trait CustomFamily {
     /// above when no workspace is provided.
     fn exact_newton_joint_psi_workspace(
         &self,
-        block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        _: &[Vec<CustomFamilyBlockPsiDerivative>],
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         Ok(None)
     }
@@ -1733,9 +1733,9 @@ pub trait CustomFamily {
     /// `exact_newton_joint_psi_workspace()` instead.
     fn exact_newton_joint_psihessian_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
-        derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
+        _: &[ParameterBlockState],
+        _: &[ParameterBlockSpec],
+        _: &[Vec<CustomFamilyBlockPsiDerivative>],
         idx: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {

@@ -355,6 +355,9 @@ _LAZY_TORCH_ATTRS: dict[str, tuple[str, str]] = {
 }
 
 
+_EXCLUDE_FROM_ALL = {"Path"}
+
+
 def __getattr__(name: str):
     """Lazy attribute hook for optional-extra primitives exposed at the top level.
 
@@ -372,6 +375,8 @@ def __getattr__(name: str):
         try:
             module = import_module(module_path)
         except ModuleNotFoundError as exc:
+            if exc.name != "torch" and not module_path.startswith(exc.name):
+                raise
             raise AttributeError(
                 f"gamfit.{name} requires an optional dependency that is not "
                 f"installed ({exc.name!r}). Install the torch extra: "
@@ -420,16 +425,12 @@ def _build_public_api() -> list[str]:
       1. every non-underscore name currently bound in the module globals
          (the heavy ``from ._x import ...`` blocks above), minus submodules
          and private re-imports;
-      2. every lazy-torch name in ``_LAZY_TORCH_ATTRS`` *whose backing
-         module is actually importable on this install* — torch-less
-         installs skip them automatically, so star-import never crashes;
-      3. an explicit allowlist of submodule attributes (``diagnostics``,
+      2. an explicit allowlist of submodule attributes (``diagnostics``,
          ``examples``, ``topology``, ``identifiability``, ``manifolds``,
          ``kernels``) that are part of the public API even though they are
          module objects.
     """
     from types import ModuleType
-    from importlib import import_module
 
     public_submodules = {
         "diagnostics",
@@ -443,6 +444,8 @@ def _build_public_api() -> list[str]:
     for name, value in globals().items():
         if name.startswith("_"):
             continue
+        if name in _EXCLUDE_FROM_ALL:
+            continue
         # Skip module objects unless they are explicitly in the public
         # submodule allowlist: ``importlib``, ``Path``, etc. were imported
         # for internal use and should not leak into star imports.
@@ -450,16 +453,6 @@ def _build_public_api() -> list[str]:
             continue
         api.add(name)
     api.add("__version__")
-    # Lazy-torch names: include only when importable on this install. We
-    # probe with ``import_module`` (cheap on a cache hit) rather than calling
-    # ``__getattr__`` because the latter raises AttributeError on missing
-    # torch, which is precisely the failure mode we are designing around.
-    for lazy_name, (module_path, _attr) in _LAZY_TORCH_ATTRS.items():
-        try:
-            import_module(module_path)
-        except ImportError:
-            continue
-        api.add(lazy_name)
     return sorted(api)
 
 

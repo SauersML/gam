@@ -2243,7 +2243,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
         self.mean_from_eta(eta)
     }
 
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
+    fn response_jacobian_rows(&self, _: PredictPass) -> ResponseInterval {
         ResponseInterval::TransformEta
     }
 

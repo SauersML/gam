@@ -1644,7 +1644,7 @@ impl CustomFamily for MultinomialFamily {
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         let eta = self.collect_eta_matrix(block_states)?;
         let log_lik = self.likelihood.log_lik(eta.view(), self.y_one_hot.view());
@@ -1659,7 +1659,7 @@ impl CustomFamily for MultinomialFamily {
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         // Freeze the per-row softmax probabilities once at construction: the
         // Fisher block H_{n,a,b} = w_n (δ_ab p_a − p_a p_b) is constant in the

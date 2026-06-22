@@ -2470,7 +2470,7 @@ impl CustomFamily for BinomialLocationScaleFamily {
 
     fn diagonalworking_weights_directional_derivative(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         idx: usize,
         arr: &Array1<f64>,
     ) -> Result<Option<Array1<f64>>, String> {

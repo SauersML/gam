@@ -3113,8 +3113,36 @@ mod tests {
     use super::*;
     use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     use ndarray::Array2;
-    use crate::identifiability::test_support::{linspace, spec_from_dense};
     use linspace as linspace_minus_one_to_one;
+
+    fn spec_from_dense(
+        name: &str,
+        design: ndarray::Array2<f64>,
+    ) -> crate::families::custom_family::ParameterBlockSpec {
+        let n = design.nrows();
+        crate::families::custom_family::ParameterBlockSpec {
+            name: name.to_string(),
+            design: crate::linalg::matrix::DesignMatrix::Dense(
+                crate::linalg::matrix::DenseDesignMatrix::from(design),
+            ),
+            offset: ndarray::Array1::<f64>::zeros(n),
+            penalties: Vec::new(),
+            nullspace_dims: Vec::new(),
+            initial_log_lambdas: ndarray::Array1::<f64>::zeros(0),
+            initial_beta: None,
+            gauge_priority: 100,
+            jacobian_callback: None,
+            stacked_design: None,
+            stacked_offset: None,
+        }
+    }
+
+    fn linspace(n: usize) -> ndarray::Array1<f64> {
+        if n <= 1 {
+            return ndarray::Array1::<f64>::zeros(n.max(1));
+        }
+        ndarray::Array1::linspace(-1.0, 1.0, n)
+    }
 
     /// Test 1: a model with no aliasing → audit returns clean, no
     /// drops, fatal=false.

@@ -90,7 +90,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn exact_outer_derivative_order(
         &self,
         specs: &[ParameterBlockSpec],
-        options: &BlockwiseFitOptions,
+        _: &BlockwiseFitOptions,
     ) -> crate::custom_family::ExactOuterDerivativeOrder {
         use crate::custom_family::ExactOuterDerivativeOrder;
 
@@ -688,7 +688,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         self.validate_exact_monotonicity(block_states)?;
         if !self.effective_flex_active(block_states)? {
@@ -719,7 +719,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         if !self.effective_flex_active(block_states)? {
             // Rigid path: use generic RowKernel<2> operator
@@ -740,7 +740,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn exact_newton_joint_hessian_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         if !self.effective_flex_active(block_states)? {
@@ -821,7 +821,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     /// free path wins well below that — drop the `p` floor for this family.
     fn prefers_matrix_free_inner_joint(
         &self,
-        specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         states: &[ParameterBlockState],
     ) -> bool {
         if self.y.len() < 16_384 {
@@ -1004,7 +1004,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn exact_newton_joint_psisecond_order_terms(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
@@ -1033,7 +1033,7 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     fn exact_newton_joint_psihessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
         d_beta_flat: &Array1<f64>,

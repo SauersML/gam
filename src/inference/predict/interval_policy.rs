@@ -496,9 +496,9 @@ pub trait PredictionTransform {
     fn linear_state(
         &self,
         input: &PredictInput,
-        fit: &UnifiedFitResult,
+        _: &UnifiedFitResult,
         pass: PredictPass,
-        covariance_mode: InferenceCovarianceMode,
+        _: InferenceCovarianceMode,
     ) -> Result<LinearState, EstimationError> {
         match pass {
             PredictPass::FullUncertainty => self.point_state(input),
@@ -534,7 +534,7 @@ pub trait PredictionTransform {
     /// caller requested observation intervals.
     fn observation_noise(
         &self,
-        input: &PredictInput,
+        _: &PredictInput,
     ) -> Result<Option<Array1<f64>>, EstimationError> {
         Ok(None)
     }
@@ -557,7 +557,7 @@ pub trait PredictionTransform {
     /// multipliers (the same masses the symmetric band would target).
     fn observation_band(
         &self,
-        input: &PredictInput,
+        _: &PredictInput,
         mean: &Array1<f64>,
         mean_se: &Array1<f64>,
         z_lower: &Array1<f64>,

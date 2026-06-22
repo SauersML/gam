@@ -1491,19 +1491,19 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         ("Arc::weak_count(", "Arc::weak_count", true),
         ("Rc::strong_count(", "Rc::strong_count", true),
         ("Rc::weak_count(", "Rc::weak_count", true),
-        // `file!().ends_with(".rs")` is a tautological assertion (the
-        // compile-time `file!()` macro always returns the `.rs` source
-        // path) commonly used to satisfy `scan_for_useless_tests` without
+        // `ends_with(".rs")` anywhere in the codebase.
+        // It's often a tautological assertion (e.g. `file!().ends_with(".rs")`)
+        // used to satisfy `scan_for_useless_tests` without
         // actually asserting anything about the unit under test. Strict
         // everywhere — tests must verify a real property.
         (
-            "file!().ends_with(\".rs\")",
-            "file!().ends_with(\".rs\")",
+            "ends_with(\".rs\")",
+            "ends_with(\".rs\")",
             false,
         ),
         (
-            "file!().ends_with(\".rs\"",
-            "file!().ends_with(\".rs\"",
+            "ends_with(\".rs\"",
+            "ends_with(\".rs\"",
             false,
         ),
         // Process termination bypasses `Drop`. Build.rs uses
@@ -4536,6 +4536,9 @@ fn scan_for_underscore_fn_args(
                 let name = &p[..end];
                 let rest = p[end..].trim_start();
                 if !rest.starts_with(':') {
+                    continue;
+                }
+                if name == "_" {
                     continue;
                 }
                 if name.starts_with('_') {

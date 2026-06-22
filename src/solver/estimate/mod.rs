@@ -110,9 +110,10 @@ pub use fit::{fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas
 pub(crate) use joint_hyper::ExternalJointHyperEvaluator;
 pub(crate) use optimizer::optimize_external_designwith_heuristic_lambdas_andwarm_start;
 pub use optimizer::{optimize_external_design, optimize_external_designwith_heuristic_lambdas};
+pub(crate) use crate::model_types::result_types::dispersion_from_likelihood;
 pub(crate) use penalty::{
     ParametricColumnConditioning, REML_CONTINUATION_PREWARM_RHO_CAP, REML_SECOND_ORDER_RHO_CAP,
-    REML_SEED_SCREENING_RHO_CAP, dispersion_from_likelihood, faer_frob_inner, kahan_sum,
+    REML_SEED_SCREENING_RHO_CAP, faer_frob_inner, kahan_sum,
     map_hessian_to_original_basis, scaled_covariance,
 };
 pub(crate) use prefit::{

@@ -212,7 +212,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn exact_newton_joint_gradient_evaluation(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<ExactNewtonJointGradientEvaluation>, String> {
         if self.per_z_logslope_active() {
             let (log_likelihood, gradient, _) =
@@ -246,7 +246,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn exact_newton_joint_hessian_workspace(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         if self.per_z_logslope_active() {
             return Ok(None);
@@ -267,7 +267,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn exact_newton_joint_hessian_workspace_with_options(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Arc<dyn ExactNewtonJointHessianWorkspace>>, String> {
         if self.per_z_logslope_active() {
@@ -555,7 +555,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn exact_newton_joint_psisecond_order_terms(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_i: usize,
         psi_j: usize,
@@ -574,7 +574,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
     fn exact_newton_joint_psihessian_directional_derivative(
         &self,
         block_states: &[ParameterBlockState],
-        block_specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
         derivative_blocks: &[Vec<crate::custom_family::CustomFamilyBlockPsiDerivative>],
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
@@ -644,7 +644,7 @@ impl CustomFamily for SurvivalMarginalSlopeFamily {
 
     fn block_linear_constraints(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {

@@ -200,7 +200,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         psi_b: &LocationScaleJointPsiDirection,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
-        outer_rows: Option<&[crate::outer_subsample::WeightedOuterRow]>,
+        _: Option<&[crate::outer_subsample::WeightedOuterRow]>,
     ) -> Result<ExactNewtonJointPsiSecondOrderTerms, String> {
         // Wiggle ψ path: full-data exact (= trivially unbiased). The
         // wiggle-specific second-order from-parts function inlines 30+
@@ -238,7 +238,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         d_beta_flat: &Array1<f64>,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
-        outer_rows: Option<&[crate::outer_subsample::WeightedOuterRow]>,
+        _: Option<&[crate::outer_subsample::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String> {
         // Same rationale as `ws_psi_second_order_terms_from_parts` above:
         // the wiggle ψ-Hessian directional-derivative function also inlines

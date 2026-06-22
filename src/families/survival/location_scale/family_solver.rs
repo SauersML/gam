@@ -2558,7 +2558,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
     fn block_linear_constraints(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         block_idx: usize,
         spec: &ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
@@ -2589,7 +2589,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
     fn post_update_block_beta(
         &self,
-        block_states: &[ParameterBlockState],
+        _: &[ParameterBlockState],
         block_idx: usize,
         block_spec: &ParameterBlockSpec,
         beta: Array1<f64>,

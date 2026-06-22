@@ -471,7 +471,7 @@ impl PredictionTransform for BinomialLocationScalePredictor {
         Ok(prob)
     }
 
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
+    fn response_jacobian_rows(&self, _: PredictPass) -> ResponseInterval {
         // Probability already evaluated post-transformation: delta-method
         // response interval with the threshold-scale η interval collapsed onto
         // the point predictor.

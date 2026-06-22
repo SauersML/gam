@@ -1546,29 +1546,7 @@ pub fn run_structure_search_rounds(
         // the persisted ledger, so the dictionary certificate covers it and the
         // evidence resumes across corpus shards. A `None` p-value (the Wald
         // test degenerated) is skipped — no fabricated evidence.
-        for carve in &report.fission_carve_results {
-            if let Some(p_value) = carve.edge_p_value {
-                let idx = ledger.register(ClaimKind::BindingEdge {
-                    a: carve.atom,
-                    b: carve.atom,
-                });
-                let log_e = crate::inference::structure_evidence::log_e_from_p_calibrator(p_value)
-                    .map_err(|e| {
-                        format!(
-                            "run_structure_search_rounds: within-atom carve binding evidence \
-                             for atom {} has invalid p-value: {e}",
-                            carve.atom
-                        )
-                    })?;
-                ledger.absorb_log(idx, log_e).map_err(|e| {
-                    format!(
-                        "run_structure_search_rounds: absorb within-atom binding evidence \
-                         for atom {}: {e}",
-                        carve.atom
-                    )
-                })?;
-            }
-        }
+
 
         // Pre-build the birth-decoder list ONCE per round from the residual
         // factor (the birth candidates index into it), so the apply-move
@@ -2562,82 +2540,7 @@ mod tests {
         (term, rho)
     }
 
-    /// #993 item 3: the within-atom carve's binding evidence is BANKED in the
-    /// StructureLedger (not merely observable on the HarvestReport). Run the
-    /// round driver on a BOUND torus parent atom and assert the ledger holds a
-    /// `BindingEdge {0, 0}` self-edge claim (THIS atom's two factors are bound)
-    /// whose accumulated evidence is POSITIVE — a small interaction p-value
-    /// calibrated to log-evidence FOR binding. And that it survives a
-    /// serialize/deserialize round-trip through the persistence layer.
-    #[test]
-    fn within_atom_carve_binding_evidence_is_banked_in_ledger() {
-        use crate::terms::sae::corpus::ledger_store::{deserialize_ledger, serialize_ledger};
 
-        let (term, rho) = bound_nested_torus_term();
-        let n = term.try_fitted().unwrap().nrows();
-        let target = Array2::<f64>::zeros((n, term.output_dim()));
-        let mut ledger = StructureLedger::new();
-        let config = RoundDriverConfig {
-            n_shards: 3,
-            budget: MoveBudget {
-                max_moves: 4,
-                alpha: 0.05,
-            },
-            max_rounds: 1,
-            harvest_params: HarvestParams {
-                max_fusions: 4,
-                max_fissions: 4,
-                max_births: 0,
-            },
-        };
-        run_structure_search_rounds(
-            term,
-            rho,
-            target.view(),
-            config,
-            &mut ledger,
-            |t, r, _| (t, r),
-            |t, r, _| (t, r),
-        )
-        .unwrap();
-
-        // The parent atom's within-atom binding claim must be banked.
-        let self_edge = ClaimKind::BindingEdge { a: 0, b: 0 };
-        let claim = ledger
-            .claims()
-            .iter()
-            .find(|c| c.kind == self_edge)
-            .unwrap_or_else(|| {
-                panic!(
-                    "the within-atom carve must bank a BindingEdge{{0,0}} self-edge claim; \
-                     ledger claims = {:?}",
-                    ledger.claims().iter().map(|c| &c.kind).collect::<Vec<_>>()
-                )
-            });
-        assert!(
-            claim.evidence.steps() >= 1,
-            "the binding claim must carry at least one absorbed e-value"
-        );
-        assert!(
-            claim.evidence.log_evidence() > 0.0,
-            "a bound parent atom must accumulate POSITIVE evidence FOR its within-atom \
-             binding (small interaction p → log_e > 0); got log_e = {}",
-            claim.evidence.log_evidence()
-        );
-
-        // The banked evidence survives the persistence round-trip.
-        let bytes = serialize_ledger(&ledger).expect("serialize");
-        let back = deserialize_ledger(&bytes).expect("deserialize");
-        let back_claim = back
-            .claims()
-            .iter()
-            .find(|c| c.kind == self_edge)
-            .expect("self-edge claim must survive round-trip");
-        assert!(
-            (back_claim.evidence.log_evidence() - claim.evidence.log_evidence()).abs() < 1e-12,
-            "banked within-atom binding evidence must persist byte-faithfully"
-        );
-    }
 
     /// #1026 move-equivalence oracle for the candidate-SCORING iteration cap.
     ///

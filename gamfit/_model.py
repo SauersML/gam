@@ -1182,7 +1182,7 @@ class MultinomialModel:
         # `levels[a]`.
         coefs = list(meta["coefficients_flat"])
         for a in range(m):
-            class_block = coefs[a * p : (a + 1) * p]
+            class_block = coefs[a::m]
             norm = math.sqrt(sum(c * c for c in class_block))
             row_bits = [f"‖β_a‖₂ = {norm:.4g}"]
             if a < len(lambdas):
