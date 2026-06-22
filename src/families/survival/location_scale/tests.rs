@@ -1900,6 +1900,163 @@ fn survival_ls_row_kernel_matches_bespoke_assembly_body() {
     }
 }
 
+/// #932: assembler-level single-source guard for the TIME-VARYING joint
+/// Hessian path across EVERY residual distribution.
+///
+/// `survival_ls_row_kernel_matches_bespoke_assembly` (#921) already pins the
+/// generic row-kernel joint Hessian (`row_kernel_hessian_dense`, sourced from
+/// the once-written `sls_row_nll` through `Order2<9>`) to the bespoke
+/// hand-assembler (`assemble_joint_hessian_from_quantities`). But that fixture
+/// is Gaussian-only and uses the SIMPLE block shape
+/// (`x_{threshold,log_sigma}_{entry,deriv} = None`), so it only exercises the
+/// `else` branches of the assembler. The hand-derived `if let Some(x_*_deriv)`
+/// branches — the time-varying blocks with the extra `h_exit_deriv` /
+/// `h_entry` cross-block weight expressions (e.g.
+/// `mxtwx(x_threshold_exit, &h_exit_deriv, x_t_deriv)`,
+/// `-(d2_qdot1·dqdot_t·dqdot_lsd + d1_qdot1·d2qdot_tlsd)`) — are EXACTLY the
+/// #736 dropped/sign-flipped cross-term genus, and no assembler==tower oracle
+/// covered them: they were only checked at the per-row level
+/// (`survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels`),
+/// never assembled into the joint matrix and compared.
+///
+/// This fills that gap. `survival_ls_joint_oracle_family` populates every
+/// entry/deriv design, so the assembler takes its time-varying branches; the
+/// generic engine builds the same joint Hessian from the single-sourced row
+/// NLL. They must agree to ~1e-9 (no FD: both are analytic), for
+/// Gaussian / Gumbel (Weibull AFT) / Logistic (log-logistic AFT). A dropped
+/// cross-block term in the hand assembler shifts a joint entry well outside
+/// 1e-9 and fails loudly — the assembler-level analogue of the per-row
+/// #736 guard.
+#[test]
+fn survival_ls_time_varying_joint_hessian_matches_single_sourced_tower_932() {
+    let join_result = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(survival_ls_time_varying_joint_hessian_tower_body)
+        .expect("spawn wide-stack assembler-tower oracle thread")
+        .join();
+    assert!(
+        join_result.is_ok(),
+        "survival LS time-varying assembler-vs-tower oracle thread must complete"
+    );
+}
+
+fn survival_ls_time_varying_joint_hessian_tower_body() {
+    use crate::families::row_kernel::{
+        RowSet, build_row_kernel_cache, row_kernel_gradient, row_kernel_hessian_dense,
+        row_kernel_log_likelihood,
+    };
+
+    // Same nine-channel fixture the all-channels per-row oracle uses: exact
+    // deaths, right-censored rows, deep / effectively-absent left truncation,
+    // extreme exit tails, and a fractional event weight — every channel and
+    // cross block populated, all clear of the monotonicity guard.
+    let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+        [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+        [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+        [-6.5, 5.6, 1.1, -0.7, -0.3, -0.15, 0.2, 0.4, 0.1],
+        [-1.0, -5.2, 0.7, 0.5, 0.6, 0.3, -0.1, -0.3, -0.25],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+    ];
+    let event = [1.0, 0.0, 1.0, 0.0, 1.0, 0.35];
+    let weight = [1.0, 0.8, 1.2, 0.9, 1.1, 1.3];
+
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let inverse_link = residual_distribution_inverse_link(distribution);
+        let family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+        // Sanity: this fixture must drive the time-varying assembler branches.
+        assert!(
+            family.x_threshold_entry.is_some()
+                && family.x_threshold_deriv.is_some()
+                && family.x_log_sigma_entry.is_some()
+                && family.x_log_sigma_deriv.is_some()
+                && family.x_link_wiggle.is_none(),
+            "fixture must populate every entry/deriv design and no link-wiggle so the \
+             assembler takes its time-varying branches"
+        );
+        let states = survival_ls_joint_oracle_states(&primaries);
+
+        let q = family
+            .collect_joint_quantities(&states)
+            .expect("collect joint quantities");
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("dynamic geometry");
+        let kernel = SurvivalLsRowKernel {
+            family: &family,
+            q: &q,
+            dynamic: &dynamic,
+            deriv_log_scale: 0.0,
+            offsets: family.joint_block_offsets(),
+        };
+
+        // Single-sourced tower joint Hessian: row kernel (Order2<9> over
+        // sls_row_nll) → dense block assembly.
+        let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("row kernel cache");
+        let h_tower = row_kernel_hessian_dense(&kernel, &cache, &RowSet::All);
+
+        // Bespoke hand assembler (time-varying branches).
+        let h_bespoke = family
+            .assemble_joint_hessian_from_quantities(&q, &states)
+            .expect("bespoke joint Hessian")
+            .expect("bespoke joint Hessian present");
+
+        assert_eq!(
+            h_tower.dim(),
+            h_bespoke.dim(),
+            "{distribution:?}: joint Hessian shape mismatch"
+        );
+        for ((a, b), &bespoke) in h_bespoke.indexed_iter() {
+            let tower = h_tower[[a, b]];
+            assert!(
+                (tower - bespoke).abs() <= 1e-9 * (1.0 + bespoke.abs()),
+                "{distribution:?}: joint Hessian [{a}][{b}] hand-assembler {bespoke} != \
+                 single-sourced tower {tower}"
+            );
+        }
+
+        // Gradient: the single-sourced engine's ∇(nll) must assemble at the
+        // joint coefficient dimension and stay finite (the gradient and Hessian
+        // share the one cache, so a consistent triple).
+        let g_tower = row_kernel_gradient(&kernel, &cache, &RowSet::All);
+        assert_eq!(
+            g_tower.len(),
+            *kernel.offsets.last().unwrap(),
+            "{distribution:?}: gradient dimension"
+        );
+        assert!(
+            g_tower.iter().all(|v| v.is_finite()),
+            "{distribution:?}: single-sourced gradient must be finite"
+        );
+
+        // Log-likelihood consistency: the engine's ℓ = −Σ nll_i must match the
+        // bespoke per-row `exact_row_kernel(row).log_likelihood()` sum.
+        let ll_tower = row_kernel_log_likelihood(&cache, &RowSet::All);
+        let mut ll_bespoke = 0.0;
+        for i in 0..family.n {
+            let state = family.row_predictor_state(
+                dynamic.h_entry[i],
+                dynamic.h_exit[i],
+                dynamic.hdot_exit[i],
+                dynamic.q_entry[i],
+                dynamic.q_exit[i],
+                dynamic.qdot_exit[i],
+            );
+            if let Some(k) = family.exact_row_kernel(i, state).expect("row kernel") {
+                ll_bespoke += k.log_likelihood();
+            }
+        }
+        assert!(
+            (ll_tower - ll_bespoke).abs() <= 1e-9 * (1.0 + ll_bespoke.abs()),
+            "{distribution:?}: log-likelihood single-sourced {ll_tower} != bespoke {ll_bespoke}"
+        );
+    }
+}
+
 #[test]
 fn survival_location_scale_coefficient_cost_delegates_to_joint_coupled_helper() {
     // SurvivalLocationScale couples time, threshold, log-σ, and optional
