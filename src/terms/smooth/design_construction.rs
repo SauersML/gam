@@ -4200,6 +4200,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 /// double-penalty term to `Flat`. Single-penalty terms are byte-for-byte
 /// unchanged, and an already-`Flat`/already-`Independent` base prior, or a
 /// design with no double-penalty block, is returned untouched.
+///
+/// Cap-lifting to `Flat`/wide-`Normal` is a Gaussian-identity recovery device
+/// and stays gated to that case. The `DoublePenaltyNullspace` *selection* prior
+/// — the one-sided select-out barrier that drives an unsupported null space out
+/// (mgcv `select=TRUE`) — is family-agnostic, so it is applied for non-Gaussian
+/// families too (e.g. the #1426 Gamma/log overfit) whenever the inner ρ is
+/// length-safe (no SAS/mixture link-shape coordinate, no moving spatial κ); the
+/// range-space coordinate of such a non-Gaussian smooth keeps its base cap.
 fn relax_smoothing_rho_prior(
     options: &FitOptions,
     family: &LikelihoodSpec,
@@ -4251,7 +4259,14 @@ fn relax_smoothing_rho_prior(
                 | BasisMetadata::MeasureJet { .. }
         )
     });
-    if !gaussian_identity || has_link_aux || has_moving_kappa {
+    // LENGTH SAFETY decides only whether the inner ρ aligns 1:1 with the penalty
+    // blocks (so an `Independent` prior is valid): it is broken by SAS/mixture
+    // link-shape coordinates and by a moving spatial κ, NOT by the response
+    // family or link per se. A Gamma/log (or any other non-Gaussian) GAM with no
+    // link-aux and no moving κ has exactly `penaltyinfo.len()` ρ coordinates, so
+    // the `DoublePenaltyNullspace` selection prior below is length-safe there too.
+    let length_safe = !has_link_aux && !has_moving_kappa;
+    if !length_safe {
         return base.clone();
     }
     let coords = &design.penaltyinfo;
@@ -4385,6 +4400,22 @@ fn relax_smoothing_rho_prior(
     // on the `p > n` design (the #1089 requirement); at a well-earned (large-λ)
     // null space the pull is the same O(1/n) shift as any Occam prior, so the
     // bias is negligible exactly where the null space is identified.
+    // NON-GAUSSIAN FAMILIES (#1426). The cap-lifting `relaxed_prior` (`Flat` /
+    // wide `Normal`) is a Gaussian-identity recovery device (#1266/#1271/#1392):
+    // it is justified by the byte-flat firth-barrier analysis on the
+    // Gaussian-identity REML criterion and lifting it for every family at once
+    // would silently re-tune the smoothing selection of binomial/Poisson/Gamma
+    // RANGE-space coordinates. So the primary bending coordinate of a non-
+    // Gaussian smooth KEEPS its base cap. But the `DoublePenaltyNullspace`
+    // selection ridge is family-agnostic — it exists ONLY to drive the linear/
+    // constant null-space component OUT (mgcv `select=TRUE`) — and under
+    // Gamma/log REML the symmetric base cap fails to push its λ up, so REML's
+    // interior minimum genuinely sits at the near-full-basis overfit (EDF≈24 vs
+    // mgcv EDF≈8 on the #1426 DGP, seed 900006). We therefore give the null-space
+    // selection coordinate the same one-sided select-out PC prior here, in BOTH
+    // determinacy regimes (the #1426 overfit is well-determined, n≫p), walling
+    // off the `λ → 0` (null-space-kept) side while leaving the bounded Occam pull
+    // toward `λ → ∞`; the data keeps the null space only when it earns it.
     let nullspace_select_prior = crate::types::RhoPrior::PenalizedComplexity {
         upper: NULLSPACE_SELECT_PC_UPPER,
         tail_prob: NULLSPACE_SELECT_PC_TAIL_PROB,
@@ -4399,9 +4430,17 @@ fn relax_smoothing_rho_prior(
             if !relax {
                 return base.clone();
             }
-            if underdetermined
-                && matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace)
-            {
+            let is_nullspace =
+                matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace);
+            if !gaussian_identity {
+                // Keep the base cap on the range-space coordinate; select the
+                // double-penalty null space out (#1426).
+                if is_nullspace {
+                    nullspace_select_prior.clone()
+                } else {
+                    base.clone()
+                }
+            } else if underdetermined && is_nullspace {
                 nullspace_select_prior.clone()
             } else {
                 relaxed_prior.clone()
