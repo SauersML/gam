@@ -2006,10 +2006,13 @@ pub fn cell_density_boundary_integrand(cell: DenestedCubicCell, g: &[f64], z: f6
 /// those (`F`, `F_a`, `F_dir`, `F_aa`, `F_a,dir`, `F_dir,dir`) are all
 /// continuous across a C²-link knot — see the regression for the proof.
 #[cfg(test)]
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn cell_third_derivative_boundary_integrand(
-    cell: DenestedCubicCell,
+mod cell_boundary_flux_tests {
+    use super::*;
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn cell_third_derivative_boundary_integrand(
+        cell: DenestedCubicCell,
     first_coefficients_r: &[f64],
     first_coefficients_s: &[f64],
     first_coefficients_t: &[f64],
@@ -2030,6 +2033,7 @@ fn cell_third_derivative_boundary_integrand(
     let amplitude = c_rst - eta * (c_rs * c_t + c_rt * c_s + c_st * c_r)
         + (eta * eta - 1.0) * c_r * c_s * c_t;
     amplitude * (-cell.q(z)).exp() * INV_TWO_PI
+    }
 }
 
 /// Horner evaluation of `Σ_k coefficients[k]·zᵏ`.
@@ -7764,11 +7768,11 @@ mod tests {
             c2: right_eta[2],
             c3: right_eta[3],
         };
-        let f_left = cell_third_derivative_boundary_integrand(
+        let f_left = cell_boundary_flux_tests::cell_third_derivative_boundary_integrand(
             left0, &common_r, &common_s, &common_t, &common_rs, &common_rt, &common_st, &left_rst,
             edge0,
         );
-        let f_right = cell_third_derivative_boundary_integrand(
+        let f_right = cell_boundary_flux_tests::cell_third_derivative_boundary_integrand(
             right0, &common_r, &common_s, &common_t, &common_rs, &common_rt, &common_st,
             &right_rst, edge0,
         );
