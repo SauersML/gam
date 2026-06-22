@@ -24,7 +24,7 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
-#[path = "../perf_scale/power_law_common.rs"]
+#[path = "../../perf_scale/misc/power_law_common.rs"]
 mod power_law_common;
 use power_law_common::report_power_law_full;
 

@@ -1032,7 +1032,7 @@ fn cli_resolve_family_matches_canonical_workflow_resolver() {
             ResponseColumnKind::Numeric,
             "y",
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "auto binary"),
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "auto binary", e)),
         LikelihoodSpec::binomial_logit()
     );
     assert_eq!(
@@ -1044,7 +1044,7 @@ fn cli_resolve_family_matches_canonical_workflow_resolver() {
             ResponseColumnKind::Numeric,
             "y",
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "log link on counts"),
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "log link on counts", e)),
         LikelihoodSpec::poisson_log()
     );
     // The SAS link is state-bearing, but family resolution embeds only the
@@ -1247,15 +1247,15 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
     assert_eq!(saved.survival_likelihood.as_deref(), Some("location-scale"));
     assert!(saved.survival_beta_log_sigma.is_some());
     assert!(saved.resolved_termspec_noise.is_some());
-    let fit_result = saved.fit_result.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "saved fit_result", e));
+    let fit_result = saved.fit_result.as_ref().unwrap_or_else(|| panic!("{} failed", "saved fit_result"));
     let covariance = fit_result
         .beta_covariance()
         .or(fit_result.beta_covariance_corrected())
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved survival fit covariance", e));
+        .unwrap_or_else(|| panic!("{} failed", "saved survival fit covariance"));
     let expected_p = saved
         .survival_beta_time
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved beta_time", e))
+        .unwrap_or_else(|| panic!("{} failed", "saved beta_time"))
         .len()
         + saved
             .survival_beta_threshold
@@ -1444,7 +1444,7 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
     let fit_result = saved
         .fit_result
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit_result should be saved", e));
+        .unwrap_or_else(|| panic!("{} failed", "fit_result should be saved"));
     assert!(saved.payload().latent_z_normalization.is_some());
     assert!(
         fit_result.beta_covariance().is_some() || fit_result.beta_covariance_corrected().is_some(),
@@ -1675,7 +1675,7 @@ fn saved_bernoulli_marginal_slope_replays_main_and_logslope_deviation_runtimes()
     assert_eq!(
         saved
             .resolved_inverse_link()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "resolved inverse link"),
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "resolved inverse link", e)),
         Some(InverseLink::Standard(StandardLink::Probit))
     );
 }
@@ -1832,7 +1832,7 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
     let fit_result = saved
         .fit_result
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit_result should be saved", e));
+        .unwrap_or_else(|| panic!("{} failed", "fit_result should be saved"));
     assert!(
         fit_result.beta_covariance().is_some() || fit_result.beta_covariance_corrected().is_some(),
         "CLI fit should save covariance for default posterior-mean prediction",
@@ -1924,7 +1924,7 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
     let fit_result = saved
         .fit_result
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit_result should be saved", e));
+        .unwrap_or_else(|| panic!("{} failed", "fit_result should be saved"));
     assert!(
         fit_result.beta_covariance().is_some() || fit_result.beta_covariance_corrected().is_some(),
         "CLI Firth fit should save covariance for default posterior-mean prediction",
@@ -2130,7 +2130,7 @@ fn intercept_only_binomial_mean_wiggle_model(
             likelihood: family,
             link: Some(
                 StandardLink::try_from(link)
-                    .unwrap_or_else(|e| panic!("{} failed: {:?}", "binomial mean-wiggle test helper requires a standard link"),
+                    .unwrap_or_else(|e| panic!("{} failed: {:?}", "binomial mean-wiggle test helper requires a standard link", e)),
             ),
             latent_cloglog_state: None,
             mixture_state: None,
@@ -2141,7 +2141,7 @@ fn intercept_only_binomial_mean_wiggle_model(
     payload.fit_result = Some(fit_result);
     payload.link = Some(InverseLink::Standard(
         StandardLink::try_from(link)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "binomial mean-wiggle test helper requires a standard link"),
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "binomial mean-wiggle test helper requires a standard link", e)),
     ));
     payload.linkwiggle_knots = Some(wiggle_knots);
     payload.linkwiggle_degree = Some(wiggle_degree);
@@ -2192,7 +2192,7 @@ fn standard_fixed_link_wiggle_prediction_runs() {
         2,
     );
 
-    let predictor = model.predictor().unwrap_or_else(|e| panic!("{} failed: {:?}", "predictor", e));
+    let predictor = model.predictor().unwrap_or_else(|| panic!("{} failed", "predictor"));
     let fit = super::fit_result_from_saved_model_for_prediction(&model).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit result", e));
     let input = super::PredictInput {
         design: super::DesignMatrix::from(Array2::<f64>::ones((3, 1))),
@@ -2334,7 +2334,7 @@ fn classify_cli_errorspecializes_thin_plate_knot_count_error() {
             "failed to build term collection design: Invalid input: thin-plate spline requires at least d+1 knots (7), got 3"
                 .to_string(),
         );
-    let advice = err.advice().unwrap_or_else(|e| panic!("{} failed: {:?}", "thin-plate advice", e));
+    let advice = err.advice().unwrap_or_else(|| panic!("{} failed", "thin-plate advice"));
     assert!(advice.contains("Increase the number of centers/knots"));
     assert!(!advice.contains("Shape mismatch detected"));
 }
@@ -2353,7 +2353,7 @@ fn classify_cli_errorspecializes_duchon_power_too_low() {
              raise power to >= 9 (or reduce the joint smooth's dimension)."
             .to_string(),
     );
-    let advice = err.advice().unwrap_or_else(|e| panic!("{} failed: {:?}", "duchon advice", e));
+    let advice = err.advice().unwrap_or_else(|| panic!("{} failed", "duchon advice"));
     assert!(advice.contains("power"));
     assert!(!advice.contains("Shape mismatch detected"));
 }
@@ -2364,7 +2364,7 @@ fn classify_cli_errorspecializes_thin_plate_knot_error() {
             "failed to build term collection design: Invalid input: thin-plate spline requires at least d+1 knots (13), got 12"
                 .to_string(),
         );
-    let advice = err.advice().unwrap_or_else(|e| panic!("{} failed: {:?}", "thin-plate advice", e));
+    let advice = err.advice().unwrap_or_else(|| panic!("{} failed", "thin-plate advice"));
     assert!(advice.contains("Increase the number of centers/knots"));
     assert!(!advice.contains("Shape mismatch detected"));
 }
@@ -2436,8 +2436,8 @@ fn concordance_depends_on_score_semantics() {
 
 #[test]
 fn chi_square_tail_probability_is_monotone_in_statistic() {
-    let p_small = chi_square_survival_approx(0.5, 4.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "p_small", e));
-    let p_large = chi_square_survival_approx(12.0, 4.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "p_large", e));
+    let p_small = chi_square_survival_approx(0.5, 4.0).unwrap_or_else(|| panic!("{} failed", "p_small"));
+    let p_large = chi_square_survival_approx(12.0, 4.0).unwrap_or_else(|| panic!("{} failed", "p_large"));
     assert!(p_large < p_small);
     assert!((0.0..=1.0).contains(&p_small));
     assert!((0.0..=1.0).contains(&p_large));
@@ -2524,8 +2524,8 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
 
     compact_fit_result_for_batch(&mut fit);
 
-    let inf = fit.inference.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "inference kept", e));
-    let geom = fit.geometry.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "geometry kept", e));
+    let inf = fit.inference.as_ref().unwrap_or_else(|| panic!("{} failed", "inference kept"));
+    let geom = fit.geometry.as_ref().unwrap_or_else(|| panic!("{} failed", "geometry kept"));
     assert_eq!(inf.working_weights.len(), 0);
     assert_eq!(inf.working_response.len(), 0);
     assert!(inf.reparam_qs.is_none());
@@ -3097,7 +3097,7 @@ fn build_termspec_accepts_joint_thinplate_above_three_dimensions() {
 #[test]
 fn parse_linkwiggle_defaults_to_all_penalty_orders() {
     let parsed = parse_formula("y ~ x + linkwiggle(degree=4, internal_knots=9)").unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
-    let lw = parsed.linkwiggle.unwrap_or_else(|e| panic!("{} failed: {:?}", "expected linkwiggle config", e));
+    let lw = parsed.linkwiggle.unwrap_or_else(|| panic!("{} failed", "expected linkwiggle config"));
     assert_eq!(lw.degree, 4);
     assert_eq!(lw.num_internal_knots, 9);
     assert_eq!(lw.penalty_orders, vec![1, 2, 3]);
@@ -3121,7 +3121,7 @@ fn marginal_slope_linkwiggle_routes_into_anchored_deviation_config() {
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     let routed = super::deviation_block_config_from_formula_linkwiggle(
-        parsed.linkwiggle.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "linkwiggle config"),
+        parsed.linkwiggle.as_ref().unwrap_or_else(|| panic!("{} failed", "linkwiggle config")),
     )
     .expect("cubic linkwiggle must route into the deviation config");
     assert_eq!(routed.degree, 3);
@@ -3148,7 +3148,7 @@ fn marginal_slope_linkwiggle_rejects_non_cubic_degree_at_routing_boundary() {
         ))
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "non-cubic linkwiggle must still parse at the shared layer", e));
         let err = super::deviation_block_config_from_formula_linkwiggle(
-            parsed.linkwiggle.as_ref().unwrap_or_else(|e| panic!("{} failed: {:?}", "linkwiggle config"),
+            parsed.linkwiggle.as_ref().unwrap_or_else(|| panic!("{} failed", "linkwiggle config")),
         )
         .expect_err("non-cubic linkwiggle must be rejected when routed into the cubic block");
         assert!(
@@ -3183,8 +3183,8 @@ fn marginal_slope_deviation_routing_splits_main_and_logslope_linkwiggles() {
         parsed_logslope.linkwiggle.as_ref(),
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "routing", e));
-    let link_dev = routed.link_dev.unwrap_or_else(|e| panic!("{} failed: {:?}", "main link-deviation config", e));
-    let score_warp = routed.score_warp.unwrap_or_else(|e| panic!("{} failed: {:?}", "logslope score-warp config", e));
+    let link_dev = routed.link_dev.unwrap_or_else(|| panic!("{} failed", "main link-deviation config"));
+    let score_warp = routed.score_warp.unwrap_or_else(|| panic!("{} failed", "logslope score-warp config"));
     assert_eq!(link_dev.degree, 3);
     assert_eq!(link_dev.num_internal_knots, 9);
     assert_eq!(link_dev.penalty_order, 3);
@@ -3271,7 +3271,7 @@ fn bernoulli_marginal_slope_rejects_flexible_and_unbounded_base_links() {
 fn parse_timewiggle_defaults_to_all_penalty_orders() {
     let parsed = parse_formula("Surv(entry, exit, event) ~ timewiggle(degree=4, internal_knots=9)")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
-    let tw = parsed.timewiggle.unwrap_or_else(|e| panic!("{} failed: {:?}", "expected timewiggle config", e));
+    let tw = parsed.timewiggle.unwrap_or_else(|| panic!("{} failed", "expected timewiggle config"));
     assert_eq!(tw.degree, 4);
     assert_eq!(tw.num_internal_knots, 9);
     assert_eq!(tw.penalty_orders, vec![1, 2, 3]);
@@ -3335,7 +3335,7 @@ fn bernoulli_marginal_slope_saved_model_persists_exact_kernel_metadata_only() {
     assert_eq!(
         model
             .resolved_inverse_link()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "resolved inverse link"),
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "resolved inverse link", e)),
         Some(InverseLink::Standard(StandardLink::Probit))
     );
 }
@@ -3459,7 +3459,7 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
         // `#[serde(rename_all = "kebab-case")]`.
         let obj = json
             .as_object_mut()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "payload serializes to an object", e));
+            .unwrap_or_else(|| panic!("{} failed", "payload serializes to an object"));
         obj.remove("training-feature-ranges");
         obj.remove("offset-column");
         obj.remove("noise-offset-column");
@@ -3664,7 +3664,7 @@ fn parse_link_formula_config_extracts_link_and_inits() {
             "y ~ x + link(type=sas, sas_init=\"0.1,-0.2\", rho=\"0.3\", beta_logistic_init=\"0.0,0.0\")",
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
-    let cfg = parsed.linkspec.unwrap_or_else(|e| panic!("{} failed: {:?}", "expected link formula config", e));
+    let cfg = parsed.linkspec.unwrap_or_else(|| panic!("{} failed", "expected link formula config"));
     assert_eq!(cfg.link, "sas");
     assert_eq!(cfg.sas_init.as_deref(), Some("0.1,-0.2"));
     assert_eq!(cfg.mixture_rho.as_deref(), Some("0.3"));
@@ -3677,7 +3677,7 @@ fn parse_survmodel_formula_config_extractsspec_and_distribution() {
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     let cfg = parsed
         .survivalspec
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "expected survival formula config", e));
+        .unwrap_or_else(|| panic!("{} failed", "expected survival formula config"));
     assert_eq!(cfg.spec.as_deref(), Some("crude"));
     assert_eq!(cfg.survival_distribution.as_deref(), Some("gaussian"));
 }
@@ -3690,7 +3690,7 @@ fn parse_duchon_power_defaults_to_cubic_rule_placeholder() {
     // column context, hands back the canonical 1.5 placeholder.
     let options = BTreeMap::new();
     assert_eq!(
-        parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "default Duchon power"),
+        parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "default Duchon power", e)),
         1.5
     );
 }
@@ -3700,7 +3700,7 @@ fn parse_duchon_power_prefers_explicit_power() {
     let mut options = BTreeMap::new();
     options.insert("power".to_string(), "0".to_string());
     assert_eq!(
-        parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "power should parse"),
+        parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "power should parse", e)),
         0.0
     );
 }
@@ -3712,7 +3712,7 @@ fn parse_duchon_power_accepts_fractional_power() {
     let mut options = BTreeMap::new();
     options.insert("power".to_string(), "0.5".to_string());
     assert_eq!(
-        parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "fractional power should parse"),
+        parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "fractional power should parse", e)),
         0.5
     );
 }
@@ -3756,14 +3756,14 @@ fn parse_duchon_power_rejects_conflicting_power_and_nu() {
 fn parse_duchon_order_accepts_supportedvalues() {
     let options = BTreeMap::new();
     assert_eq!(
-        parse_duchon_order(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "default Duchon order"),
+        parse_duchon_order(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "default Duchon order", e)),
         DuchonNullspaceOrder::Linear
     );
 
     let mut linear = BTreeMap::new();
     linear.insert("order".to_string(), "1".to_string());
     assert_eq!(
-        parse_duchon_order(&linear).unwrap_or_else(|e| panic!("{} failed: {:?}", "linear Duchon order"),
+        parse_duchon_order(&linear).unwrap_or_else(|e| panic!("{} failed: {:?}", "linear Duchon order", e)),
         DuchonNullspaceOrder::Linear
     );
 }
@@ -3773,7 +3773,7 @@ fn parse_duchon_order_accepts_higher_polynomial_degrees_and_rejects_malformedval
     let mut quadratic = BTreeMap::new();
     quadratic.insert("order".to_string(), "2".to_string());
     assert_eq!(
-        parse_duchon_order(&quadratic).unwrap_or_else(|e| panic!("{} failed: {:?}", "quadratic Duchon order"),
+        parse_duchon_order(&quadratic).unwrap_or_else(|e| panic!("{} failed: {:?}", "quadratic Duchon order", e)),
         DuchonNullspaceOrder::Degree(2)
     );
 
@@ -4821,7 +4821,7 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
         pred_input
             .design_noise
             .as_ref()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "logslope design", e))
+            .unwrap_or_else(|| panic!("{} failed", "logslope design"))
             .as_dense_ref()
             .is_none(),
         "saved survival predictor should keep the logslope design operator-backed"
@@ -5465,7 +5465,7 @@ fn saved_baseline_timewiggle_reconstruction_keeps_requested_order_one_penalty() 
         model
             .baseline_timewiggle_knots
             .clone()
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved knots"),
+            .unwrap_or_else(|| panic!("{} failed", "saved knots")),
     );
     let mut seed = Array1::<f64>::zeros(2 * eta_entry.len());
     for i in 0..eta_entry.len() {
@@ -5532,9 +5532,9 @@ fn evaluate_survival_baseline_matches_gompertz_makeham_formula() {
     let age = 11.5;
     let (eta, derivative) =
         evaluate_survival_baseline(age, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate gompertz-makeham baseline", e));
-    let shape = cfg.shape.unwrap_or_else(|e| panic!("{} failed: {:?}", "shape", e));
-    let rate = cfg.rate.unwrap_or_else(|e| panic!("{} failed: {:?}", "rate", e));
-    let makeham = cfg.makeham.unwrap_or_else(|e| panic!("{} failed: {:?}", "makeham", e));
+    let shape = cfg.shape.unwrap_or_else(|| panic!("{} failed", "shape"));
+    let rate = cfg.rate.unwrap_or_else(|| panic!("{} failed", "rate"));
+    let makeham = cfg.makeham.unwrap_or_else(|| panic!("{} failed", "makeham"));
     let cumulative_hazard = makeham * age + (rate / shape) * ((shape * age).exp() - 1.0);
     let expected_eta = cumulative_hazard.ln();
     let expected_derivative = (makeham + rate * (shape * age).exp()) / cumulative_hazard;
@@ -5554,7 +5554,7 @@ fn evaluate_survival_baseline_handles_nearzero_gompertz_makeham_shape() {
     let age = 11.5;
     let (eta, derivative) =
         evaluate_survival_baseline(age, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate near-zero gompertz-makeham", e));
-    let cumulative_hazard = (cfg.rate.unwrap_or_else(|e| panic!("{} failed: {:?}", "rate") + cfg.makeham.expect("makeham")) * age;
+    let cumulative_hazard = (cfg.rate.unwrap_or_else(|| panic!("{} failed", "rate")) + cfg.makeham.expect("makeham")) * age;
     let expected_eta = cumulative_hazard.ln();
     let expected_derivative = 1.0 / age;
     assert!((eta - expected_eta).abs() <= 1e-12);
@@ -5878,7 +5878,7 @@ fn flexible_link_injects_default_linkwiggle_config() {
     let link_choice =
         parse_link_choice(Some("flexible(logit)"), false).unwrap_or_else(|e| panic!("{} failed: {:?}", "parse flexible link choice", e));
     let cfg = effectivelinkwiggle_formulaspec(None, link_choice.as_ref())
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "flexible link should inject wiggle config", e));
+        .unwrap_or_else(|| panic!("{} failed", "flexible link should inject wiggle config"));
     let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
     assert_eq!(cfg.degree, 3);
     assert_eq!(cfg.num_internal_knots, defaults.num_internal_knots);
@@ -6622,7 +6622,7 @@ fn survival_location_scale_saved_fit_preserves_linkwiggle_metadata() {
     let fit = saved
         .fit_result
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved survival fit_result should be present", e));
+        .unwrap_or_else(|| panic!("{} failed", "saved survival fit_result should be present"));
     assert!(saved.linkwiggle_knots.is_some());
     assert!(saved.linkwiggle_degree.is_some());
     assert!(saved.beta_link_wiggle.is_some());
@@ -6688,7 +6688,7 @@ fn bspline_time_basis_inference_uses_unique_support_for_origin_entries() {
     let knots = built
         .knots
         .as_ref()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "bspline time basis should retain inferred knots", e));
+        .unwrap_or_else(|| panic!("{} failed", "bspline time basis should retain inferred knots"));
     let lower_boundary = knots[0];
     let upper_boundary = knots[knots.len() - 1];
     for &k in &knots[4..(knots.len() - 4)] {
@@ -6770,7 +6770,7 @@ fn survival_initial_time_coefficient_targets_safe_interior_derivative() {
 fn survival_feasible_initial_beta_handles_sparse_overlapping_constraints() {
     let constraints = gam::pirls::LinearInequalityConstraints {
         a: Array2::from_shape_vec((3, 3), vec![1.0, 0.0, 0.0, 0.5, 1.0, 0.0, 0.0, 1.0, 1.0])
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "constraint rows"),
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "constraint rows", e)),
         b: Array1::from_vec(vec![0.25, 0.5, 0.75]),
     };
 
@@ -6787,7 +6787,7 @@ fn survival_feasible_initial_beta_handles_sparse_overlapping_constraints() {
 #[test]
 fn survival_feasible_initial_beta_respects_offset_shifted_constraints() {
     let constraints = gam::pirls::LinearInequalityConstraints {
-        a: Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.25, 1.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "constraint rows"),
+        a: Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.25, 1.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "constraint rows", e)),
         b: Array1::from_vec(vec![-0.5, 0.4]),
     };
 
@@ -6928,7 +6928,7 @@ fn ispline_time_basis_reuses_saved_keep_cols_on_narrow_prediction_range() {
         SurvivalTimeBasisConfig::ISpline {
             degree: 2,
             knots,
-            keep_cols: trained.keep_cols.clone().unwrap_or_else(|e| panic!("{} failed: {:?}", "saved keep cols"),
+            keep_cols: trained.keep_cols.clone().unwrap_or_else(|| panic!("{} failed", "saved keep cols")),
             smooth_lambda: 1e-2,
         },
         None,

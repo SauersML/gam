@@ -38,7 +38,7 @@
 //! per-line-marker hole or empty the allowlist while leaving production FD in the
 //! tree.
 
-const SCANNER_SRC: &str = include_str!("autodiff/no_production_finite_differences.rs");
+const SCANNER_SRC: &str = include_str!("autodiff/misc/no_production_finite_differences.rs");
 
 /// The confinement guard test — the core #1440 invariant — must exist and must
 /// flag non-allowlisted files that use `fd-ok` markers.

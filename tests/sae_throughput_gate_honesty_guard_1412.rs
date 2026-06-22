@@ -30,7 +30,7 @@
 //! this guard only pins the gate definition so a refactor cannot silently
 //! restore the misleading floor or the finite-only correctness check.
 
-const BENCH_SRC: &str = include_str!("sae/sae_encode_throughput_bench.rs");
+const BENCH_SRC: &str = include_str!("sae/sae/sae_encode_throughput_bench.rs");
 
 /// (1) The honest GPU target is documented AND the test explicitly states the
 /// CPU floor does not establish it (necessary, not sufficient).

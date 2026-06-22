@@ -2,6 +2,8 @@
 //!
 //! Former top-level crates included as modules so they link as ONE binary.
 
+#[path = "../common/misc/fixtures.rs"]
+mod fixtures;
 
 mod misc;
 mod survival;

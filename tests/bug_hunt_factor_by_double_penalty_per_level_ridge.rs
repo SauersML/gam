@@ -141,7 +141,7 @@ fn factor_by_double_penalty_ridge_is_per_level_in_constrained_chart() {
         let rn = frob(ridge);
         let pn = frob(owner);
         assert!(rn > 0.0 && pn > 0.0, "ridge {r}: degenerate ridge/primary");
-        let rel = frob(&ridge.dot(owner)) / (rn * pn);
+        let rel = frob(&(**ridge).dot(&**owner)) / (rn * pn);
         assert!(
             rel < 1e-8,
             "ridge {r}: per-level double-penalty ridge does not annihilate its co-located \

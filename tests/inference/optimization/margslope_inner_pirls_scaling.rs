@@ -52,7 +52,7 @@ use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
-#[path = "../perf_scale/power_law_common.rs"]
+#[path = "../../perf_scale/misc/power_law_common.rs"]
 mod power_law_common;
 
 const SEED: u64 = 0x5CA1_AB1E_5C0F_E5A1;

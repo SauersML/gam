@@ -29,7 +29,7 @@ fn make_data_with_lats(lats: &[f64]) -> gam::data::EncodedDataset {
             ]));
         }
     }
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"))
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn sphere_training_rejects_lat_above_90() {
     };
     let err = fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg)
         .err()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "must fail with lat=95", e));
+        .unwrap_or_else(|| panic!("{} failed", "must fail with lat=95"));
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("latitude") && msg.contains("90"),
@@ -68,7 +68,7 @@ fn sphere_training_rejects_lat_below_neg90() {
     };
     let err = fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg)
         .err()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "must fail with lat=-100", e));
+        .unwrap_or_else(|| panic!("{} failed", "must fail with lat=-100"));
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("latitude") && msg.contains("90"),
@@ -84,7 +84,7 @@ fn assert_predict_with_invalid_lat_rejects_cleanly(formula: &str) {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(formula, &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit ok", e));
+    let result = fit_from_formula(formula, &data, &cfg).unwrap_or_else(|| panic!("{} failed", "fit ok"));
     let FitResult::Standard(fit) = result else {
         panic!("expected standard fit")
     };
@@ -129,7 +129,7 @@ fn sphere_lat_exactly_at_pole_accepts() {
         ..FitConfig::default()
     };
     fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "lat=±90 exactly must be accepted as the pole", e));
+        .unwrap_or_else(|| panic!("{} failed", "lat=±90 exactly must be accepted as the pole"));
 }
 
 #[test]
@@ -150,7 +150,7 @@ fn sphere_lat_at_90_plus_tiny_eps_fails_with_useful_message() {
     };
     let err = fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg)
         .err()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "90.0 + 1e-12 should still fail strict validation", e));
+        .unwrap_or_else(|| panic!("{} failed", "90.0 + 1e-12 should still fail strict validation"));
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("latitude") && msg.contains("90"),

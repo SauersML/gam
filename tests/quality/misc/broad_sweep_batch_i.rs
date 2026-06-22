@@ -25,9 +25,9 @@ fn mk_2col(
     seed: u64,
 ) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
-    let u_a = Uniform::new(range_a.0, range_a.1).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let u_b = Uniform::new(range_b.0, range_b.1).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let noise = Normal::new(0.0, sigma).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal", e));
+    let u_a = Uniform::new(range_a.0, range_a.1).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let u_b = Uniform::new(range_b.0, range_b.1).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let noise = Normal::new(0.0, sigma).unwrap_or_else(|| panic!("{} failed", "normal"));
     let headers = [col_a, col_b, "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(n);
     for _ in 0..n {
@@ -40,7 +40,7 @@ fn mk_2col(
             y.to_string(),
         ]));
     }
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"))
 }
 
 fn fit_predict_2col(
@@ -61,7 +61,7 @@ fn fit_predict_2col(
         m[[i, 0]] = *a;
         m[[i, 1]] = *b;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|| panic!("{} failed", "design"));
     design.design.apply(&fit.fit.beta).to_vec()
 }
 
@@ -142,9 +142,9 @@ fn cylinder_clean_seam_with_negative_h() {
 fn sphere_handles_lat_at_minus_90() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
-    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal", e));
+    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|| panic!("{} failed", "normal"));
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(300);
     for _ in 0..300 {
@@ -157,7 +157,7 @@ fn sphere_handles_lat_at_minus_90() {
             y.to_string(),
         ]));
     }
-    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e));
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"));
     let pred = fit_predict_2col(
         "y ~ sphere(lat, lon, k=20)",
         data,
@@ -173,8 +173,8 @@ fn sphere_handles_lat_at_minus_90() {
 fn periodic_with_offset_data_range() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
-    let u = Uniform::new(10.0_f64, 10.0 + TAU).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal", e));
+    let u = Uniform::new(10.0_f64, 10.0 + TAU).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|| panic!("{} failed", "normal"));
     let mut t: Vec<f64> = (0..200).map(|_| u.sample(&mut rng)).collect();
     t.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let y: Vec<f64> = t
@@ -187,7 +187,7 @@ fn periodic_with_offset_data_range() {
         .zip(y.iter())
         .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
-    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e));
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"));
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -197,14 +197,14 @@ fn periodic_with_offset_data_range() {
         &data,
         &cfg,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit", e));
+    .unwrap_or_else(|| panic!("{} failed", "fit"));
     let FitResult::Standard(fit) = result else {
         panic!()
     };
     let mut m = Array2::<f64>::zeros((2, 2));
     m[[0, 0]] = 10.0;
     m[[1, 0]] = 10.0 + TAU;
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|| panic!("{} failed", "design"));
     let pred = design.design.apply(&fit.fit.beta);
     assert!((pred[0] - pred[1]).abs() < 1e-6, "offset seam: {pred:?}");
 }
@@ -213,8 +213,8 @@ fn periodic_with_offset_data_range() {
 fn bc_clamped_at_high_k_smooths_correctly() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
-    let u = Uniform::new(0.0_f64, 1.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal", e));
+    let u = Uniform::new(0.0_f64, 1.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|| panic!("{} failed", "normal"));
     let mut x: Vec<f64> = (0..200).map(|_| u.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let y: Vec<f64> = x
@@ -227,12 +227,12 @@ fn bc_clamped_at_high_k_smooths_correctly() {
         .zip(y.iter())
         .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
-    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e));
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"));
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, bc=clamped, k=40)", &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit", e));
+    let result = fit_from_formula("y ~ s(x, bc=clamped, k=40)", &data, &cfg).unwrap_or_else(|| panic!("{} failed", "fit"));
     let FitResult::Standard(fit) = result else {
         panic!()
     };
@@ -241,7 +241,7 @@ fn bc_clamped_at_high_k_smooths_correctly() {
     for (i, &x) in xs.iter().enumerate() {
         m[[i, 0]] = x;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|| panic!("{} failed", "design"));
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     assert!(pred.iter().all(|v| v.is_finite()));
     let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -256,9 +256,9 @@ fn bc_clamped_at_high_k_smooths_correctly() {
 fn sphere_pseudo_with_small_n() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
-    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let noise = Normal::new(0.0, 0.1).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal", e));
+    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let noise = Normal::new(0.0, 0.1).unwrap_or_else(|| panic!("{} failed", "normal"));
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(20);
     for _ in 0..20 {
@@ -271,18 +271,18 @@ fn sphere_pseudo_with_small_n() {
             y.to_string(),
         ]));
     }
-    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e));
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"));
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result =
-        fit_from_formula("y ~ sphere(lat, lon, k=10, kernel=pseudo)", &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit", e));
+        fit_from_formula("y ~ sphere(lat, lon, k=10, kernel=pseudo)", &data, &cfg).unwrap_or_else(|| panic!("{} failed", "fit"));
     let FitResult::Standard(fit) = result else {
         panic!()
     };
-    let m = Array2::<f64>::from_shape_vec((1, 3), vec![0.0, 0.0, 0.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "shape", e));
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
+    let m = Array2::<f64>::from_shape_vec((1, 3), vec![0.0, 0.0, 0.0]).unwrap_or_else(|| panic!("{} failed", "shape"));
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|| panic!("{} failed", "design"));
     let pred = design.design.apply(&fit.fit.beta);
     assert!(pred[0].is_finite());
 }
@@ -291,9 +291,9 @@ fn sphere_pseudo_with_small_n() {
 fn sphere_sobolev_with_small_n() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
-    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let noise = Normal::new(0.0, 0.1).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal", e));
+    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let noise = Normal::new(0.0, 0.1).unwrap_or_else(|| panic!("{} failed", "normal"));
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(20);
     for _ in 0..20 {
@@ -306,18 +306,18 @@ fn sphere_sobolev_with_small_n() {
             y.to_string(),
         ]));
     }
-    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e));
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"));
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let result =
-        fit_from_formula("y ~ sphere(lat, lon, k=10, kernel=sobolev)", &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit", e));
+        fit_from_formula("y ~ sphere(lat, lon, k=10, kernel=sobolev)", &data, &cfg).unwrap_or_else(|| panic!("{} failed", "fit"));
     let FitResult::Standard(fit) = result else {
         panic!()
     };
-    let m = Array2::<f64>::from_shape_vec((1, 3), vec![0.0, 0.0, 0.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "shape", e));
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
+    let m = Array2::<f64>::from_shape_vec((1, 3), vec![0.0, 0.0, 0.0]).unwrap_or_else(|| panic!("{} failed", "shape"));
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|| panic!("{} failed", "design"));
     let pred = design.design.apply(&fit.fit.beta);
     assert!(pred[0].is_finite());
 }
@@ -329,8 +329,8 @@ fn sphere_rejects_constant_lon_column() {
     // it with an actionable error.
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
-    let u_lat = Uniform::new(-70.0_f64, 70.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal", e));
+    let u_lat = Uniform::new(-70.0_f64, 70.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|| panic!("{} failed", "normal"));
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(200);
     for _ in 0..200 {
@@ -342,14 +342,14 @@ fn sphere_rejects_constant_lon_column() {
             y.to_string(),
         ]));
     }
-    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e));
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"));
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let err = fit_from_formula("y ~ sphere(lat, lon, k=15)", &data, &cfg)
         .err()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "constant lon should be rejected as degenerate", e));
+        .unwrap_or_else(|| panic!("{} failed", "constant lon should be rejected as degenerate"));
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("constant") || msg.contains("unique") || msg.contains("degenerate"),
@@ -361,8 +361,8 @@ fn sphere_rejects_constant_lon_column() {
 fn periodic_1d_zero_amplitude_truth() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
-    let u = Uniform::new(0.0_f64, TAU).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal", e));
+    let u = Uniform::new(0.0_f64, TAU).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|| panic!("{} failed", "normal"));
     let mut t: Vec<f64> = (0..200).map(|_| u.sample(&mut rng)).collect();
     t.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let y: Vec<f64> = t.iter().map(|_| noise.sample(&mut rng)).collect();
@@ -372,7 +372,7 @@ fn periodic_1d_zero_amplitude_truth() {
         .zip(y.iter())
         .map(|(a, b)| StringRecord::from(vec![a.to_string(), b.to_string()]))
         .collect();
-    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e));
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"));
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -382,7 +382,7 @@ fn periodic_1d_zero_amplitude_truth() {
         &data,
         &cfg,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit", e));
+    .unwrap_or_else(|| panic!("{} failed", "fit"));
     let FitResult::Standard(fit) = result else {
         panic!()
     };
@@ -391,7 +391,7 @@ fn periodic_1d_zero_amplitude_truth() {
     for (i, &t) in probes.iter().enumerate() {
         m[[i, 0]] = t;
     }
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|| panic!("{} failed", "design"));
     let pred = design.design.apply(&fit.fit.beta).to_vec();
     let mean: f64 = pred.iter().sum::<f64>() / pred.len() as f64;
     let var: f64 = pred.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / pred.len() as f64;
@@ -404,9 +404,9 @@ fn periodic_1d_zero_amplitude_truth() {
 fn sphere_logit_predict_finite_at_pole() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
-    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let u01 = Uniform::new(0.0_f64, 1.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
+    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let u01 = Uniform::new(0.0_f64, 1.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(400);
     for _ in 0..400 {
@@ -420,18 +420,18 @@ fn sphere_logit_predict_finite_at_pole() {
             y.to_string(),
         ]));
     }
-    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e));
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"));
     let cfg = FitConfig {
         family: Some("binomial(logit)".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ sphere(lat, lon, k=15)", &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit", e));
+    let result = fit_from_formula("y ~ sphere(lat, lon, k=15)", &data, &cfg).unwrap_or_else(|| panic!("{} failed", "fit"));
     let FitResult::Standard(fit) = result else {
         panic!()
     };
     let m = Array2::<f64>::from_shape_vec((2, 3), vec![90.0, 0.0, 0.0, -90.0, 0.0, 0.0])
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "shape", e));
-    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
+        .unwrap_or_else(|| panic!("{} failed", "shape"));
+    let design = build_term_collection_design(m.view(), &fit.resolvedspec).unwrap_or_else(|| panic!("{} failed", "design"));
     let pred = design.design.apply(&fit.fit.beta);
     assert!(pred.iter().all(|v| v.is_finite()));
 }
@@ -440,9 +440,9 @@ fn sphere_logit_predict_finite_at_pole() {
 fn sphere_with_method_alias_sos() { 
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
-    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal", e));
+    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|| panic!("{} failed", "uniform"));
+    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|| panic!("{} failed", "normal"));
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(200);
     for _ in 0..200 {
@@ -455,11 +455,11 @@ fn sphere_with_method_alias_sos() {
             y.to_string(),
         ]));
     }
-    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e));
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"));
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     // sos is an alias for sphere
-    fit_from_formula("y ~ sos(lat, lon, k=15)", &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit ok", e));
+    fit_from_formula("y ~ sos(lat, lon, k=15)", &data, &cfg).unwrap_or_else(|| panic!("{} failed", "fit ok"));
 }

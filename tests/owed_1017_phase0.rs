@@ -119,7 +119,7 @@ fn run_forced_sequential(
     model: &FittedSaeManifold,
     ladders: &[AtomTransportLadderInput],
 ) -> Result<Vec<AtomTransportLadderReport>, String> {
-    rayon::iter::repeatn((), 1)
+    rayon::iter::repeat_n((), 1)
         .map(|()| atom_transport_ladder_reports(model, ladders))
         .collect::<Vec<_>>()
         .into_iter()

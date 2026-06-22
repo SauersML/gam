@@ -3,6 +3,8 @@
 //! Former top-level crates included as modules so they link as ONE binary.
 
 #[macro_use]
+#[path = "../common/mod.rs"]
+mod common;
 
 mod families;
 mod misc;

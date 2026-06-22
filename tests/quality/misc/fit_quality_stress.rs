@@ -316,19 +316,19 @@ fn hifreq_cyclic_probe(k: usize) -> Result<(), String> {
 
 #[test]
 fn hifreq_cyclic_k4() -> Result<(), String> {
-    hifreq_cyclic_probe(4);
+    hifreq_cyclic_probe(4)
 }
 #[test]
 fn hifreq_cyclic_k6() -> Result<(), String> {
-    hifreq_cyclic_probe(6);
+    hifreq_cyclic_probe(6)
 }
 #[test]
 fn hifreq_cyclic_k8() -> Result<(), String> {
-    hifreq_cyclic_probe(8);
+    hifreq_cyclic_probe(8)
 }
 #[test]
 fn hifreq_cyclic_k10() -> Result<(), String> {
-    hifreq_cyclic_probe(10);
+    hifreq_cyclic_probe(10)
 }
 
 fn hifreq_bc_probe(k: usize) -> Result<(), String> {
@@ -372,19 +372,19 @@ fn hifreq_bc_probe(k: usize) -> Result<(), String> {
 
 #[test]
 fn hifreq_bc_k4() -> Result<(), String> {
-    hifreq_bc_probe(4);
+    hifreq_bc_probe(4)
 }
 #[test]
 fn hifreq_bc_k6() -> Result<(), String> {
-    hifreq_bc_probe(6);
+    hifreq_bc_probe(6)
 }
 #[test]
 fn hifreq_bc_k8() -> Result<(), String> {
-    hifreq_bc_probe(8);
+    hifreq_bc_probe(8)
 }
 #[test]
 fn hifreq_bc_k10() -> Result<(), String> {
-    hifreq_bc_probe(10);
+    hifreq_bc_probe(10)
 }
 
 /// Spherical-harmonic ground-truth signal of degree l (l in {4, 6, 8}).
@@ -467,15 +467,15 @@ fn hifreq_sphere_probe(l: usize) -> Result<(), String> {
 
 #[test]
 fn hifreq_sphere_l4() -> Result<(), String> {
-    hifreq_sphere_probe(4);
+    hifreq_sphere_probe(4)
 }
 #[test]
 fn hifreq_sphere_l6() -> Result<(), String> {
-    hifreq_sphere_probe(6);
+    hifreq_sphere_probe(6)
 }
 #[test]
 fn hifreq_sphere_l8() -> Result<(), String> {
-    hifreq_sphere_probe(8);
+    hifreq_sphere_probe(8)
 }
 
 fn hifreq_tensor_probe(k: usize) -> Result<(), String> {

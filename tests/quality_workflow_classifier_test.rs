@@ -1,5 +1,4 @@
 use std::process::Command;
-use std::io::Write;
 
 #[test]
 fn test_reference_quality_classifier() {
@@ -7,7 +6,7 @@ fn test_reference_quality_classifier() {
     
     // Extract the classifier logic
     let start_marker = "gamfit_re='IntegrationFailed|InvalidConfig";
-    let end_marker = "outcome=METRIC_OFF;";
+    let _end_marker = "outcome=METRIC_OFF;";
     
     let mut classifier_code = String::new();
     let mut in_block = false;
