@@ -2064,3 +2064,159 @@ pub(crate) fn solve_design_least_squares(
     }
     Ok(vt.t().dot(&scaled))
 }
+
+#[cfg(test)]
+mod linear_parity_anchor_1026_tests {
+    //! #1026 — reconstruction-parity instrument + gate for the LINEAR-SAE
+    //! Eckart-Young anchor.
+    //!
+    //! For a purely-LINEAR dictionary the reconstruction ceiling is the
+    //! rank-(Σ_k basis_size_k) PCA / Eckart-Young projection of the target (the
+    //! best linear subspace of that total rank). [`linear_span_anchor`] is the
+    //! η=0 primitive that seeds the curvature walk with exactly that projection
+    //! via sequential per-atom residual SVDs, so — independent of the downstream
+    //! routing / inner Newton — its OWN reconstruction must attain the PCA
+    //! ceiling at the dictionary's total rank. If it does, any end-to-end
+    //! linear-SAE parity shortfall is a DOWNSTREAM (routing / canonicalization)
+    //! effect, not an anchor defect; if it does not, the anchor itself loses
+    //! reconstructible variance the linear dictionary is entitled to. This test
+    //! pins the anchor at the ceiling so a regression that weakens the
+    //! sequential-deflation parity (wrong per-atom rank, gate mishandling, a
+    //! non-orthogonal deflation) is caught.
+    //!
+    //! ## #1026 routing-bound finding (why a GATED linear SAE under-reconstructs)
+    //!
+    //! The anchor reaches the rank-(K·d) PCA ceiling because its NEUTRAL gates
+    //! ([`neutral_gate_weights`]: softmax `1/K`, IBP prior) keep every atom ON for
+    //! every row, so all `K·d` decoder directions are available to reconstruct
+    //! each row — exactly the unrestricted linear subspace PCA uses. A FITTED
+    //! softmax/IBP SAE instead routes each row through learned gates, so its
+    //! per-row reconstruction is `Σ_k a_k(row)·γ_k(t_k(row))` — a gate-WEIGHTED
+    //! (softmax: simplex `Σ_k a_k ≈ 1`) combination whose per-row effective rank is
+    //! bounded by that row's active-atom count. End-to-end linear-SAE parity with
+    //! PCA is therefore REACHABLE iff each row's active rank ≥ the data's local
+    //! rank — i.e. with dense-enough routing (high `top_k` / low sparsity `λ`); the
+    //! residual gap under SPARSE routing is the price of sparsity, not a defect.
+    //! The engine already retains the anchor-quality basin where reachable: the
+    //! [`SaeManifoldOuterObjective::into_fitted`] seed-basin + pristine-seed
+    //! fallbacks restore the anchor-seeded state whenever the inner solve degrades
+    //! EV. The parity-vs-sparsity tradeoff is the genuine #1026 frontier; the
+    //! UNGATED linear/background tier (a linear atom routed with `a_k ≡ 1`, added
+    //! to the gated curved residual) is the architectural lever that lets the
+    //! linear component carry full-rank variance while curved atoms stay sparse.
+
+    use super::*;
+
+    /// Rank-`q` PCA explained-variance ceiling of a column-centered target.
+    fn pca_ev_ceiling(target: ArrayView2<'_, f64>, q: usize) -> f64 {
+        let (n, p) = target.dim();
+        let mut centered = target.to_owned();
+        for c in 0..p {
+            let mean = (0..n).map(|r| target[[r, c]]).sum::<f64>() / n as f64;
+            for r in 0..n {
+                centered[[r, c]] -= mean;
+            }
+        }
+        let sst: f64 = centered.iter().map(|v| v * v).sum();
+        let (_, sv, _) = centered.svd(false, false).expect("svd");
+        let captured: f64 = sv.iter().take(q).map(|s| s * s).sum();
+        captured / sst.max(1e-300)
+    }
+
+    /// Build a K-atom LINEAR (degree-1, d=1) SAE term over distinct 1-D coords.
+    /// The decoder seed is irrelevant to the anchor (the anchor re-derives the
+    /// output subspace by SVD), so we seed zeros.
+    fn linear_term(k: usize, n: usize, p: usize) -> (SaeManifoldTerm, Array2<f64>) {
+        let mut atoms = Vec::with_capacity(k);
+        let mut coords_blocks = Vec::with_capacity(k);
+        for idx in 0..k {
+            let coords = Array2::from_shape_fn((n, 1), |(i, _)| {
+                ((i as f64 + 1.0) * 0.19 * (idx as f64 + 1.1)).sin()
+            });
+            // Linear basis Φ(t) = [1, t]; jet d/dt = [0, 1].
+            let mut phi = Array2::<f64>::zeros((n, 2));
+            let mut jet = ndarray::Array3::<f64>::zeros((n, 2, 1));
+            for r in 0..n {
+                phi[[r, 0]] = 1.0;
+                phi[[r, 1]] = coords[[r, 0]];
+                jet[[r, 1, 0]] = 1.0;
+            }
+            let decoder = Array2::<f64>::zeros((2, p));
+            atoms.push(
+                SaeManifoldAtom::new(
+                    format!("lin_{idx}"),
+                    SaeAtomBasisKind::Linear,
+                    1,
+                    phi,
+                    jet,
+                    decoder,
+                    Array2::<f64>::eye(2),
+                )
+                .unwrap(),
+            );
+            coords_blocks.push(coords);
+        }
+        let logits = Array2::from_shape_fn((n, k), |(i, kk)| {
+            0.2 + 0.05 * (i as f64) - 0.03 * (kk as f64)
+        });
+        let manifolds = vec![LatentManifold::Euclidean; k];
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            logits,
+            coords_blocks,
+            manifolds,
+            AssignmentMode::ibp_map(0.5, 1.0, false),
+        )
+        .unwrap();
+        let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
+        // Known rank-R linear target: X = Z @ D.
+        let r_true = 6usize;
+        let z = Array2::from_shape_fn((n, r_true), |(i, j)| {
+            ((i as f64 + 1.0) * 0.137 * (j as f64 + 1.0)).sin() + 0.3 * ((i * j) as f64).cos()
+        });
+        let d_true = Array2::from_shape_fn((r_true, p), |(j, c)| {
+            (1.0 + j as f64) * (((j * 5 + c * 3) % 7) as f64 - 3.0) / 3.0
+        });
+        let target = z.dot(&d_true);
+        (term, target)
+    }
+
+    #[test]
+    fn linear_span_anchor_reaches_pca_ceiling_at_dictionary_rank_1026() {
+        let n = 40usize;
+        let p = 8usize;
+        for &k in &[1usize, 2, 3, 6] {
+            let (term, target) = linear_term(k, n, p);
+            let anchor = linear_span_anchor(&term, target.view())
+                .expect("linear anchor must solve on finite linear data");
+            let ev_anchor = reconstruction_explained_variance(
+                target.view(),
+                anchor.reconstruction.view(),
+            )
+            .expect("anchor EV must be finite");
+            // Each LINEAR atom has basis_size 2 ({1, t}); the sequential
+            // Eckart-Young deflation captures top-2 of the residual per atom, so
+            // K atoms capture rank min(2K, n, p). Compare to that PCA ceiling.
+            let total_rank = (2 * k).min(n).min(p);
+            let ceiling = pca_ev_ceiling(target.view(), total_rank);
+            println!(
+                "[#1026] K={k:>2} (rank {total_rank})  anchor EV={ev_anchor:.8}  \
+                 PCA ceiling={ceiling:.8}  gap={:.2e}",
+                ceiling - ev_anchor
+            );
+            assert!(
+                ev_anchor.is_finite(),
+                "K={k}: anchor EV must be finite"
+            );
+            // The anchor's sequential rank-2-per-atom residual deflation is the
+            // greedy Eckart-Young projection onto the top-(2K) right-singular
+            // subspace, which (by Eckart-Young) equals the rank-(2K) PCA optimum.
+            // Pin it to the ceiling to tight tolerance (SVD round-off only).
+            assert!(
+                ev_anchor >= ceiling - 1e-9,
+                "K={k}: linear anchor EV {ev_anchor} must reach the rank-{total_rank} \
+                 PCA ceiling {ceiling} — a shortfall means the anchor loses linear \
+                 reconstructible variance the dictionary is entitled to (#1026 parity)"
+            );
+        }
+    }
+}
