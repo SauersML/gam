@@ -18,11 +18,14 @@
 //!      fit on the identical split (C_gam ≥ C_pstpm2 − 0.03). The primary claim
 //!      is gam's held-out discrimination, computed from gam's own predictions;
 //!      pstpm2 is a baseline-to-match, not a target to reproduce.
-//!   3. TRUTH RECOVERY (synthetic): a fixed-seed Gompertz baseline whose log Λ₀
-//!      is known to be strictly increasing and convex in t. gam must stay
-//!      monotone on the fine grid AND recover that convex curvature (≥ 80% of
-//!      interior second differences ≥ 0). This is recovery of a known shape, not
-//!      agreement with any peer tool.
+//!   3. TRUTH RECOVERY (synthetic): a fixed-seed Gompertz baseline whose
+//!      cumulative hazard Λ₀(t) = (a/b)(e^{bt} − 1) is known to be strictly
+//!      increasing and convex in t (Λ₀'' = a·b·e^{bt} > 0). gam must stay
+//!      monotone on the fine grid AND recover that convex curvature of Λ₀ on the
+//!      raw scale (≥ 80% of interior second differences ≥ 0). Note the LOG
+//!      cumulative hazard is concave, not convex, so the convexity check is made
+//!      on Λ₀ itself. This is recovery of a known shape, not agreement with any
+//!      peer tool.
 //!
 //! Why rstpm2::pstpm2 as the baseline: pstpm2 is the textbook *penalized*
 //! generalized survival model writing log Λ(t | x) = s(log t ; γ) + β·x with an
@@ -620,14 +623,22 @@ fn synthetic_gompertz_monotone_recovery() {
         }
     }
 
-    // Known truth: baseline log Λ₀(t) = log(a/b) + log(e^{bt} − 1). This is a
-    // strictly increasing, convex-in-t function for a Gompertz hazard. gam's
-    // recovered log Λ̂(t | x=0) must be convex over the bulk of the grid: count
-    // the fraction of interior points where the discrete second difference is
-    // ≥ 0 (curving upward), which the true Gompertz log-cumhaz satisfies.
+    // Known truth: the Gompertz CUMULATIVE HAZARD Λ₀(t) = (a/b)(e^{bt} − 1) is
+    // strictly increasing AND convex in t (a positive affine image of the convex
+    // e^{bt}, so Λ₀'' = a·b·e^{bt} > 0 everywhere). Convexity is a property of
+    // Λ₀ on the RAW scale — NOT of log Λ₀: on the log scale
+    //   log Λ₀(t) = log(a/b) + log(e^{bt} − 1),
+    //   d²/dt² log(e^{bt}−1) = −b²·e^{−bt}/(1−e^{−bt})² < 0,
+    // so log Λ₀ is strictly CONCAVE. An earlier version of this check took second
+    // differences of gam's LOG cumulative hazard and asserted convexity, which is
+    // mathematically impossible for a Gompertz baseline (the log-cumhaz is
+    // concave) — gam's correct fit therefore scored 0% "convex" and was wrongly
+    // failed. We assert the convexity that genuinely holds for the truth, on the
+    // raw Λ̂₀(t | x=0): count the interior points whose discrete second difference
+    // curves upward.
     let mut convex_pts = 0usize;
     let mut interior = 0usize;
-    for w in gam_log_cumhaz.windows(3) {
+    for w in gam_cumhaz.windows(3) {
         let second = w[2] - 2.0 * w[1] + w[0];
         interior += 1;
         if second >= -1e-9 {
@@ -639,7 +650,7 @@ fn synthetic_gompertz_monotone_recovery() {
     eprintln!(
         "Gompertz synthetic monotone recovery: n={n} events={n_events} grid={grid_n} \
          on [{grid_lo:.3}, {grid_hi:.3}] | violations={violations} \
-         convex_frac(logLambda)={convex_frac:.3} \
+         convex_frac(rawLambda)={convex_frac:.3} \
          gam_Lambda[0,last]=[{:.4},{:.4}]",
         gam_cumhaz[0],
         gam_cumhaz[grid_n - 1],
@@ -650,13 +661,13 @@ fn synthetic_gompertz_monotone_recovery() {
         "gam's cumulative hazard must stay strictly monotone on the Gompertz \
          synthetic, but dropped at {violations} of {grid_n} grid points"
     );
-    // The Gompertz baseline log Λ₀ is convex in t; gam's monotone I-spline fit
-    // should reproduce that upward curvature over the large majority of the
-    // grid. We require ≥ 80% of interior points to be (numerically) convex —
-    // a real recovery of the known steep shape, not a flat/linear collapse.
+    // The Gompertz baseline cumulative hazard Λ₀ is convex in t; gam's monotone
+    // I-spline fit should reproduce that upward curvature over the large majority
+    // of the grid. We require ≥ 80% of interior points to be (numerically) convex
+    // — a real recovery of the known steep shape, not a flat/linear collapse.
     assert!(
         convex_frac >= 0.80,
-        "gam failed to recover the convex Gompertz log-cumulative-hazard shape: \
+        "gam failed to recover the convex Gompertz cumulative-hazard shape: \
          only {convex_frac:.3} of interior grid points were convex (need ≥ 0.80)"
     );
 }
