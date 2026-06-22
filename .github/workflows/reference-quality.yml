@@ -288,6 +288,12 @@ jobs:
           # the expected, tolerated outcome here; we classify and stream them.
           set +e -u -o pipefail
           pass=0; metricoff=0; gamerr=0; referr=0; testerr=0; tmo=0; bf=0
+          # REF_ERROR among comparators the job GUARANTEES are installed (the
+          # `Verify R stack loads` step hard-fails if mgcv/gamlss/survival do not
+          # load). For those tests a lost reference is a genuine breakage, not the
+          # tolerated "optional native tool missing" case (INLA/scoringrules/PyMC),
+          # so it must gate the run rather than be absorbed by the 25% global floor.
+          guaranteed_referr=0
           # EVERYTHING the run produced lands under one directory that is uploaded
           # wholesale: the full per-test stdout+stderr logs (no tail truncation),
           # a rich un-truncated TSV, and a JSONL stream. The job-summary table and
@@ -405,6 +411,12 @@ jobs:
               outcome=TIMEOUT; cause=timeout; reason="exceeded ${cap}s wall-clock"; tmo=$((tmo+1))
             elif [ -n "$refmarker" ]; then
               outcome=REF_ERROR; cause=reference_tool; reason="$refmarker"; referr=$((referr+1))
+              # If the lost reference is one the job guarantees present, this REF_ERROR
+              # is a real breakage masking a lost gam-vs-reference comparison. Tracked
+              # by comparator name (mgcv/gamlss/survival are the hard-verified R refs).
+              case "$t" in
+                *mgcv*|*gamlss*|*survival*) guaranteed_referr=$((guaranteed_referr+1)) ;;
+              esac
             elif printf '%s' "$panicmsg" | grep -qaE 'src/test_support/reference\.rs|No such file or directory'; then
               # Test/harness setup defect (bad data, missing fixture, length
               # mismatch). Gated on the panic ORIGINATING in the harness
@@ -489,6 +501,29 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
+          # PER-COMPARATOR COVERAGE FLOOR (#1082, GPT-5.5 Pro concern: "quality runs
+          # passing without reference coverage"). The 25% global floor below tolerates
+          # missing OPTIONAL native references (INLA/scoringrules/PyMC). But the job
+          # HARD-VERIFIES that mgcv/gamlss/survival load before running (the
+          # `Verify R stack loads` step fails otherwise), so a REF_ERROR on any test
+          # backed by one of those is NOT a missing-infra waiver — it is a genuine
+          # breakage that silently dropped a gam-vs-mature-tool comparison. Require
+          # 100% reference coverage for the guaranteed comparators: a single such
+          # REF_ERROR fails the run, no percentage tolerance.
+          if [ "$guaranteed_referr" -gt 0 ]; then
+            echo ""
+            echo "::error::Reference Quality Suite UNTRUSTWORTHY: ${guaranteed_referr} test(s) backed by a GUARANTEED reference (mgcv/gamlss/survival) hit REF_ERROR. Those tools are verified-present before the run, so this is a real reference breakage that dropped a gam-vs-reference comparison — not an optional-tool waiver. 100% coverage is required for guaranteed comparators."
+            echo "----- guaranteed-comparator REF_ERROR rows (test  reason) -----"
+            awk -F'\t' 'NR>1 && $2=="REF_ERROR" && ($4 ~ /mgcv/ || $4 ~ /gamlss/ || $4 ~ /survival/) {printf "  %s\n    %s\n", $4, $10}' "$RES"
+            echo "---------------------------------------------------------------"
+            {
+              echo ""
+              echo "### Gate: FAILED (guaranteed-comparator reference coverage)"
+              echo ""
+              echo "${guaranteed_referr} test(s) backed by a hard-verified reference (mgcv/gamlss/survival) were REF_ERROR. Those references are guaranteed installed, so the lost comparison is a real breakage; 100% coverage is required for them."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
           # REFERENCE-COVERAGE FLOOR. REF_ERROR is non-blaming per-test (it is the
           # reference env, not a gam result), but the suite's ENTIRE value is the
           # gam-vs-mature-tool comparison. If the reference environment is broadly
@@ -509,7 +544,7 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
             exit 1
           fi
-          echo "Gate: PASSED — every test met its quality bar; reference coverage OK (REF_ERROR=${referr}/${N})."
+          echo "Gate: PASSED — every test met its quality bar; guaranteed-comparator reference coverage 100% (mgcv/gamlss/survival REF_ERROR=0); optional-reference REF_ERROR=${referr}/${N} within the 25% floor."
           { echo ""; echo "### Gate: PASSED"; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload full quality report (always — survives timeout/cancel)
