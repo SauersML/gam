@@ -1093,32 +1093,31 @@ pub fn measure_jet_anisotropy_energy_form_with_jets(
 }
 
 #[cfg(test)]
+pub(crate) fn two_cluster_centers() -> (ndarray::Array2<f64>, ndarray::Array1<f64>) {
+    let centers = ndarray::array![
+        [0.00, 0.00],
+        [0.31, 0.05],
+        [0.58, -0.07],
+        [0.93, 0.11],
+        [1.22, 0.02],
+        [1.49, -0.04],
+        [3.10, 2.00],
+        [3.42, 2.13],
+        [3.71, 1.91],
+        [4.05, 2.07],
+        [4.33, 1.96],
+        [4.61, 2.12],
+    ];
+    let m = centers.nrows();
+    let masses = ndarray::Array1::<f64>::from_elem(m, 1.0 / m as f64);
+    (centers, masses)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::terms::basis::{measure_jet_band, measure_jet_energy_form};
     use ndarray::array;
-
-    /// Two clusters of 2-D centers with uniform masses — the same fixture the
-    /// isotropic jet gate uses, so the `Ā = I` oracle compares like with like.
-    pub(crate) fn two_cluster_centers() -> (Array2<f64>, Array1<f64>) {
-        let centers = array![
-            [0.00, 0.00],
-            [0.31, 0.05],
-            [0.58, -0.07],
-            [0.93, 0.11],
-            [1.22, 0.02],
-            [1.49, -0.04],
-            [3.10, 2.00],
-            [3.42, 2.13],
-            [3.71, 1.91],
-            [4.05, 2.07],
-            [4.33, 1.96],
-            [4.61, 2.12],
-        ];
-        let m = centers.nrows();
-        let masses = Array1::<f64>::from_elem(m, 1.0 / m as f64);
-        (centers, masses)
-    }
 
     pub(crate) fn band_for(centers: &Array2<f64>) -> MeasureJetBand {
         measure_jet_band(centers.view(), 0).expect("band")

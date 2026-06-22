@@ -18,6 +18,9 @@ Numpy-level throughout; no torch build, no cluster, no clock entropy required.
 from __future__ import annotations
 
 import numpy as np
+import pytest
+
+torch = pytest.importorskip("torch")
 
 from gamfit.torch.distributed_reduce import TreeReducer, build_reduction_tree
 from gamfit.torch.harvest_contract import (

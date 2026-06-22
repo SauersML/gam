@@ -504,12 +504,6 @@ impl PredictableModel for BinomialLocationScalePredictor {
         self.predict_with_uncertainty_inner(input)
     }
 
-    fn predict_noise_scale(
-        &self,
-        predict_input: &PredictInput,
-    ) -> Result<Option<Array1<f64>>, EstimationError> {
-        Ok(None)
-    }
 
     fn predict_full_uncertainty(
         &self,

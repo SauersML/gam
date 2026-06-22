@@ -47,33 +47,10 @@ jobs:
         with:
           fetch-depth: 0 # build.rs human-author gate needs the real last build.rs editor; a depth-1 clone makes git log return HEAD, false-failing every Claude-authored HEAD (#1458)
 
-      - name: Install Rust 1.93.0
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust CI
+        uses: ./.github/actions/setup-rust-ci
         with:
-          toolchain: 1.93.0
           components: clippy
-
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.6
-
-      - name: Enable sccache only if its cache backend is reachable
-        # The compiler cache is a speedup, never a hard build dependency.
-        # sccache runs a storage check when its server starts and aborts the
-        # process if the backend (the GitHub Actions cache) is unreachable;
-        # with RUSTC_WRAPPER=sccache that would fail the build at the first
-        # `cargo` call. Probe the backend once by starting the server and wire
-        # the wrapper in only on success, so an outage degrades to a cold-but-
-        # green build instead of a hard failure.
-        shell: bash
-        run: |
-          if sccache --start-server; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          else
-            echo "::warning::sccache cache backend unreachable; compiling without the compiler cache"
-          fi
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
 
       - name: Lint
         run: cargo clippy --all-targets --all-features -- -A warnings -D clippy::correctness -D clippy::suspicious
@@ -92,56 +69,11 @@ jobs:
         with:
           fetch-depth: 0 # build.rs human-author gate needs the real last build.rs editor; a depth-1 clone makes git log return HEAD, false-failing every Claude-authored HEAD (#1458)
 
-      - name: Free runner disk space
-        # ubuntu-latest ships with ~14 GB free on /. `cargo test --all-features`
-        # links a binary per integration-test target against this dep graph
-        # (faer, burn, bevy_reflect, ndarray, nalgebra, arrow, parquet,
-        # criterion, ad_trait, autodiff, num-dual, …) and that has been
-        # exhausting the disk at link time — surfaced as `linking with cc
-        # failed: exit status: 1` followed by "No space left on device".
-        # Wiping these preinstalled toolchains (.NET, Android SDK, GHC,
-        # CodeQL, Boost) frees ~30 GB and pushes the link well clear of the
-        # ceiling. Each `rm` is `|| true`-guarded so a future runner image
-        # that drops one of these paths doesn't break the step.
-        run: |
-          set -uo pipefail
-          df -h /
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}" || true
-          df -h /
-
-      - name: Install Rust 1.93.0
-        uses: dtolnay/rust-toolchain@stable
+      - name: Setup Rust CI
+        uses: ./.github/actions/setup-rust-ci
         with:
-          toolchain: 1.93.0
-
-      - name: Set up sccache
-        uses: mozilla-actions/sccache-action@v0.0.6
-
-      - name: Enable sccache only if its cache backend is reachable
-        # The compiler cache is a speedup, never a hard build dependency.
-        # sccache runs a storage check when its server starts and aborts the
-        # process if the backend (the GitHub Actions cache) is unreachable;
-        # with RUSTC_WRAPPER=sccache that would fail the build at the first
-        # `cargo` call. Probe the backend once by starting the server and wire
-        # the wrapper in only on success, so an outage degrades to a cold-but-
-        # green build instead of a hard failure.
-        shell: bash
-        run: |
-          if sccache --start-server; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-          else
-            echo "::warning::sccache cache backend unreachable; compiling without the compiler cache"
-          fi
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: false
+          free-disk-space: 'true'
+          cache-targets: 'false'
 
       # #871: `gam-pyffi` (the PyO3 wheel crate) imports many `pub` items from
       # `gam` via `use gam::…`. The `gam` crate's own dead-code lint and the

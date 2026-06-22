@@ -24,31 +24,8 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       cache_key: ${{ steps.cache_key.outputs.cache_key }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Set up R
-        uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: "4.4.3"
-
-      - name: Install Python packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m pip install --upgrade pip
-          python3 -m pip install numpy matplotlib lifelines pandas xgboost scikit-learn
-
-      - name: Install R packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          Rscript -e 'install.packages(c("mgcv","survival","jsonlite"), repos="https://cloud.r-project.org")'
+      - name: Setup environment
+        uses: ./.github/actions/bench-setup
 
       - name: Compute cache key
         id: cache_key
@@ -141,32 +118,7 @@ jobs:
           python3 -m pip install --upgrade 'maturin>=1.7,<2'
           rm -rf dist
           maturin build --release -i python3 -o dist
-          python3 - <<'PY'
-          import glob
-          import pathlib
-          import shutil
-          import sys
-          import zipfile
-
-          wheels = sorted(glob.glob("dist/*.whl"))
-          if not wheels:
-              sys.exit("maturin produced no wheel under dist/")
-          wheel = wheels[-1]
-          out_dir = pathlib.Path("target/release")
-          out_dir.mkdir(parents=True, exist_ok=True)
-          with zipfile.ZipFile(wheel) as zf:
-              matches = [
-                  m for m in zf.namelist()
-                  if m.startswith("gamfit/_rust") and (m.endswith(".so") or m.endswith(".pyd"))
-              ]
-              if not matches:
-                  sys.exit(f"no _rust*.so found inside {wheel}")
-              for member in matches:
-                  target = out_dir / pathlib.Path(member).name
-                  with zf.open(member) as src, target.open("wb") as dst:
-                      shutil.copyfileobj(src, dst)
-                  print(f"extracted {target}")
-          PY
+          python3 .github/scripts/workflow_tasks.py extract_maturin_wheel target/release
           ls -l target/release/_rust*.so
 
       - name: Upload gam binary and Python extension
@@ -191,31 +143,8 @@ jobs:
       # Daily run leaves this empty so runner.py disables the per-command timeout entirely.
       BENCH_CMD_TIMEOUT_SEC: ${{ github.event.schedule == '0 7 * * *' && '' || '2400' }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Set up R
-        uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: "4.4.3"
-
-      - name: Install Python packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m pip install --upgrade pip
-          python3 -m pip install numpy matplotlib lifelines pandas xgboost scikit-learn
-
-      - name: Install R packages
-        shell: bash
-        run: |
-          set -euo pipefail
-          Rscript -e 'install.packages(c("mgcv","survival","jsonlite"), repos="https://cloud.r-project.org")'
+      - name: Setup environment
+        uses: ./.github/actions/bench-setup
 
       - name: Download prepared cohort
         uses: actions/download-artifact@v4

@@ -869,8 +869,10 @@ pub trait PredictableModel {
     /// of smuggling it through `PredictionWithSE`.
     fn predict_noise_scale(
         &self,
-        input: &PredictInput,
-    ) -> Result<Option<Array1<f64>>, EstimationError>;
+        _: &PredictInput,
+    ) -> Result<Option<Array1<f64>>, EstimationError> {
+        Ok(None)
+    }
 
     /// Optional per-observation DISPERSION parameter for dispersion
     /// location-scale families (#1125), expressed in the generative

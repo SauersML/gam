@@ -300,7 +300,7 @@ pub fn profile_ci_from_grid(grid: &[(f64, f64)], level: f64) -> Result<ClosurePr
 
 /// Acklam's rational approximation to the inverse standard-normal CDF, refined
 /// by one Halley step — accurate to ~1e-15, deterministic, dependency-free.
-fn inv_std_normal(p: f64) -> f64 {
+pub(crate) fn inv_std_normal(p: f64) -> f64 {
     if p <= 0.0 {
         return f64::NEG_INFINITY;
     }

@@ -61,136 +61,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import importlib.util
-          from pathlib import Path
-
-          mod_path = Path("bench/run_suite.py").resolve()
-          spec = importlib.util.spec_from_file_location("run_suite_mod", mod_path)
-          mod = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mod)
-
-          cfg = json.loads(Path("bench/scenarios.json").read_text())
-          scenarios = cfg.get("scenarios", [])
-          if not scenarios:
-              raise SystemExit("No benchmark scenarios found in bench/scenarios.json")
-
-          # Pure-Python schema validation: confirm each scenario spec is
-          # well-formed and dispatches to a registered dataset loader, without
-          # actually generating data. The matrix-prepare job does not build the
-          # Rust extension, so any preflight that called the full data path
-          # would hit `gamfit Rust extension is not built` and short-circuit
-          # the whole benchmark pipeline before the matrix is emitted.
-          for s in scenarios:
-              mod.validate_scenario_schema(s)
-          print(f"validated {len(scenarios)} scenario dataset schemas")
-          PY
+          python3 .github/scripts/workflow_tasks.py validate_schemas
 
       - name: Preflight geo_subpop16 simulation
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import importlib.util
-          from pathlib import Path
-
-          mod_path = Path("bench/run_suite.py").resolve()
-          spec = importlib.util.spec_from_file_location("run_suite_mod", mod_path)
-          mod = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mod)
-
-          cfg = json.loads(Path("bench/scenarios.json").read_text())
-          scenarios = cfg.get("scenarios", [])
-          geo_subpop = [s for s in scenarios if str(s.get("name", "")).startswith("geo_subpop16_")]
-          if not geo_subpop:
-              raise SystemExit("No geo_subpop16 scenarios found in bench/scenarios.json")
-
-          for s in geo_subpop:
-              mod.validate_scenario_schema(s)
-          print(f"validated geo_subpop16 simulation for {len(geo_subpop)} scenarios")
-          PY
+          python3 .github/scripts/workflow_tasks.py validate_geo_subpop
 
       - name: Build scenario matrix
         id: matrix
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          from pathlib import Path
-
-          SERIAL_SCENARIOS = {
-              "icu_survival_death",
-              "cirrhosis_survival",
-          }
-
-          def choose_single_knot(variants):
-              # Prefer k12 when present for comparability across families.
-              by_k = {v["k"]: v for v in variants}
-              if 12 in by_k:
-                  return by_k[12]["scenario"]
-              ordered = sorted(variants, key=lambda v: v["k"])
-              return ordered[len(ordered) // 2]["scenario"]
-
-          cfg = json.loads(Path("bench/scenarios.json").read_text())
-          scenarios = cfg.get("scenarios", [])
-          names = [s["name"] for s in scenarios if "name" in s]
-          if not names:
-              raise SystemExit("No benchmark scenarios found in bench/scenarios.json")
-
-          event_name = os.environ.get("GITHUB_EVENT_NAME", "").strip().lower()
-          is_nightly = event_name == "schedule"
-
-          if is_nightly:
-              # Nightly: run full matrix (all knot variants).
-              selected = names
-          else:
-              # Manual: run one representative knot per *_kN family.
-              k_pat = re.compile(r"^(?P<base>.+)_k(?P<k>\d+)$")
-              families = {}
-              selected = []
-              for name in names:
-                  m = k_pat.match(name)
-                  if not m:
-                      selected.append(name)
-                      continue
-                  base = m.group("base")
-                  families.setdefault(base, []).append(
-                      {"scenario": name, "k": int(m.group("k"))}
-                  )
-              for base in sorted(families):
-                  selected.append(choose_single_knot(families[base]))
-
-          include = [{"scenario": name} for name in selected]
-          if not include:
-              raise SystemExit("No benchmark scenarios found in bench/scenarios.json")
-          serial_include = [row for row in include if row["scenario"] in SERIAL_SCENARIOS]
-          parallel_include = [row for row in include if row["scenario"] not in SERIAL_SCENARIOS]
-          parallel_matrix = {"include": parallel_include}
-          serial_matrix = {"include": serial_include}
-          out = Path(os.environ["GITHUB_OUTPUT"])
-          with out.open("a", encoding="utf-8") as fh:
-              fh.write(f"parallel_matrix={json.dumps(parallel_matrix)}\n")
-              fh.write(f"parallel_count={len(parallel_include)}\n")
-              fh.write(f"serial_matrix={json.dumps(serial_matrix)}\n")
-              fh.write(f"serial_count={len(serial_include)}\n")
-          print(
-              json.dumps(
-                  {
-                      "event": event_name,
-                      "nightly_full_matrix": is_nightly,
-                      "scenario_count": len(selected),
-                      "parallel_count": len(parallel_include),
-                      "serial_count": len(serial_include),
-                      "parallel_matrix": parallel_matrix,
-                      "serial_matrix": serial_matrix,
-                  }
-              )
-          )
-          PY
+          python3 .github/scripts/workflow_tasks.py build_matrix
 
   bootstrap-runtime:
     name: Bootstrap benchmark runtime
@@ -274,30 +157,7 @@ jobs:
           python3 -m pip install --upgrade 'maturin>=1.7,<2'
           rm -rf dist
           maturin build --release -i python3 -o dist
-          python3 - <<'PY'
-          import glob
-          import pathlib
-          import shutil
-          import sys
-          import zipfile
-
-          wheels = sorted(glob.glob("dist/*.whl"))
-          if not wheels:
-              sys.exit("maturin produced no wheel under dist/")
-          wheel = wheels[-1]
-          with zipfile.ZipFile(wheel) as zf:
-              matches = [
-                  m for m in zf.namelist()
-                  if m.startswith("gamfit/_rust") and (m.endswith(".so") or m.endswith(".pyd"))
-              ]
-              if not matches:
-                  sys.exit(f"no _rust*.so found inside {wheel}")
-              for member in matches:
-                  target = pathlib.Path("gamfit") / pathlib.Path(member).name
-                  with zf.open(member) as src, target.open("wb") as dst:
-                      shutil.copyfileobj(src, dst)
-                  print(f"extracted {target}")
-          PY
+          python3 .github/scripts/workflow_tasks.py extract_maturin_wheel
           # Ship the freshly-built extension through the shared runtime
           # artifact so each shard does not have to recompile it.
           cp gamfit/_rust*.so bench/runtime/
@@ -408,40 +268,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import subprocess
-          import zipfile
-          from pathlib import Path
-
-          repo = "${{ github.repository }}"
-          run_id = "${{ github.run_id }}"
-          target_name = "bench-runtime"
-          out_dir = Path("bench/runtime")
-          out_dir.mkdir(parents=True, exist_ok=True)
-
-          proc = subprocess.run(
-              ["gh", "api", f"/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"],
-              check=True,
-              capture_output=True,
-              text=True,
-          )
-          artifacts = json.loads(proc.stdout).get("artifacts", [])
-          match = next((a for a in artifacts if a.get("name") == target_name and not a.get("expired")), None)
-          if match is None:
-              raise SystemExit(f"artifact {target_name!r} not found for run {run_id}")
-
-          zip_path = Path("bench-runtime.zip")
-          with zip_path.open("wb") as fh:
-              subprocess.run(
-                  ["gh", "api", f"/repos/{repo}/actions/artifacts/{match['id']}/zip"],
-                  check=True,
-                  stdout=fh,
-              )
-          with zipfile.ZipFile(zip_path) as zf:
-              zf.extractall(out_dir)
-          zip_path.unlink()
-          PY
+          python3 .github/scripts/workflow_tasks.py download_artifacts bench-runtime bench/runtime
 
       - name: Install gamfit Rust extension into source tree
         shell: bash
@@ -494,19 +321,7 @@ jobs:
           file "${BENCH_GAM_BIN}" || true
           test -x "${BENCH_GAM_BIN}"
           echo "smoke-import python deps"
-          python3 - <<'PY'
-          import importlib.util
-          from pathlib import Path
-          import numpy, pandas, lifelines, sksurv, xgboost
-
-          scenario_name = "${{ matrix.scenario }}"
-          mod_path = Path("bench/run_suite.py").resolve()
-          spec = importlib.util.spec_from_file_location("run_suite_mod", mod_path)
-          mod = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mod)
-
-          print(f"python deps ok (scenario={scenario_name})")
-          PY
+          python3 .github/scripts/workflow_tasks.py check_python_deps
           echo "smoke-load R deps"
           Rscript -e 'library(mgcv); library(jsonlite); library(survival); library(glmnet); library(gamlss); library(gamlss.dist); library(gamboostLSS); library(mboost); library(bamlss); library(brms); cat("R deps ok\n")'
           mkdir -p bench/results-shards
@@ -607,40 +422,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import subprocess
-          import zipfile
-          from pathlib import Path
-
-          repo = "${{ github.repository }}"
-          run_id = "${{ github.run_id }}"
-          target_name = "bench-runtime"
-          out_dir = Path("bench/runtime")
-          out_dir.mkdir(parents=True, exist_ok=True)
-
-          proc = subprocess.run(
-              ["gh", "api", f"/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"],
-              check=True,
-              capture_output=True,
-              text=True,
-          )
-          artifacts = json.loads(proc.stdout).get("artifacts", [])
-          match = next((a for a in artifacts if a.get("name") == target_name and not a.get("expired")), None)
-          if match is None:
-              raise SystemExit(f"artifact {target_name!r} not found for run {run_id}")
-
-          zip_path = Path("bench-runtime.zip")
-          with zip_path.open("wb") as fh:
-              subprocess.run(
-                  ["gh", "api", f"/repos/{repo}/actions/artifacts/{match['id']}/zip"],
-                  check=True,
-                  stdout=fh,
-              )
-          with zipfile.ZipFile(zip_path) as zf:
-              zf.extractall(out_dir)
-          zip_path.unlink()
-          PY
+          python3 .github/scripts/workflow_tasks.py download_artifacts bench-runtime bench/runtime
 
       - name: Install gamfit Rust extension into source tree
         shell: bash
@@ -693,19 +475,7 @@ jobs:
           file "${BENCH_GAM_BIN}" || true
           test -x "${BENCH_GAM_BIN}"
           echo "smoke-import python deps"
-          python3 - <<'PY'
-          import importlib.util
-          from pathlib import Path
-          import numpy, pandas, lifelines, sksurv, xgboost
-
-          scenario_name = "${{ matrix.scenario }}"
-          mod_path = Path("bench/run_suite.py").resolve()
-          spec = importlib.util.spec_from_file_location("run_suite_mod", mod_path)
-          mod = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(mod)
-
-          print(f"python deps ok (scenario={scenario_name})")
-          PY
+          python3 .github/scripts/workflow_tasks.py check_python_deps
           echo "smoke-load R deps"
           Rscript -e 'library(mgcv); library(jsonlite); library(survival); library(glmnet); library(gamlss); library(gamlss.dist); library(gamboostLSS); library(mboost); library(bamlss); library(brms); cat("R deps ok\n")'
           mkdir -p bench/results-shards
@@ -787,206 +557,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import subprocess
-          import zipfile
-          from pathlib import Path
-
-          repo = "${{ github.repository }}"
-          run_id = "${{ github.run_id }}"
-          root = Path("bench/artifacts")
-          root.mkdir(parents=True, exist_ok=True)
-
-          proc = subprocess.run(
-              ["gh", "api", f"/repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100"],
-              check=True,
-              capture_output=True,
-              text=True,
-          )
-          artifacts = json.loads(proc.stdout).get("artifacts", [])
-          shard_artifacts = [
-              a for a in artifacts
-              if str(a.get("name", "")).startswith("bench-")
-              and str(a.get("name", "")) != "bench-runtime"
-              and not a.get("expired")
-          ]
-          if not shard_artifacts:
-              raise SystemExit("No shard artifacts found to merge.")
-
-          for artifact in shard_artifacts:
-              artifact_dir = root / str(artifact["name"])
-              artifact_dir.mkdir(parents=True, exist_ok=True)
-              zip_path = artifact_dir.with_suffix(".zip")
-              with zip_path.open("wb") as fh:
-                  subprocess.run(
-                      ["gh", "api", f"/repos/{repo}/actions/artifacts/{artifact['id']}/zip"],
-                      check=True,
-                      stdout=fh,
-                  )
-              with zipfile.ZipFile(zip_path) as zf:
-                  zf.extractall(artifact_dir)
-              zip_path.unlink()
-          PY
+          python3 .github/scripts/workflow_tasks.py download_artifacts bench_ bench/artifacts
 
       - name: Merge shard JSON outputs
         shell: bash
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-          from datetime import datetime, timezone
-          from pathlib import Path
-
-          def fmt_num(v, digits=4):
-              if v is None:
-                  return "—"
-              try:
-                  return f"{float(v):.{digits}f}"
-              except Exception:
-                  return "—"
-
-          def fmt_status(row):
-              status = str(row.get("status", "unknown"))
-              if status == "ok":
-                  return "ok"
-              return f"failed: {row.get('error', 'unknown error')}"
-
-          def md_escape(v):
-              if v is None:
-                  return "—"
-              s = str(v).replace("\n", " ").strip()
-              return s.replace("|", "\\|")
-
-          artifacts = Path("bench/artifacts")
-          files = sorted(artifacts.rglob("*.json"))
-          if not files:
-              raise SystemExit("No shard artifacts found to merge.")
-
-          merged = []
-          for fp in files:
-              payload = json.loads(fp.read_text())
-              merged.extend(payload.get("results", []))
-
-          merged_sorted = sorted(
-              merged,
-              key=lambda r: (
-                  str(r.get("scenario_name", "")),
-                  str(r.get("contender", "")),
-              ),
-          )
-
-          out = Path("bench/results.nightly.json")
-          out.write_text(
-              json.dumps(
-                  {
-                      "created_at_utc": datetime.now(timezone.utc).isoformat(),
-                      "results": merged,
-                  },
-                  indent=2,
-              )
-          )
-          print(f"Wrote {out} from {len(files)} shard files with {len(merged)} rows.")
-
-          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
-          if summary_path:
-              ok_count = sum(1 for r in merged_sorted if str(r.get("status", "")) == "ok")
-              fail_count = len(merged_sorted) - ok_count
-              family_labels = {"binomial": "Classification", "gaussian": "Regression", "survival": "Survival"}
-              family_rows = {}
-              for r in merged_sorted:
-                  fam = str(r.get("family") or "unknown")
-                  family_rows.setdefault(fam, []).append(r)
-
-              def primary_metric(row):
-                  fam = str(row.get("family") or "")
-                  if fam == "binomial":
-                      return "Brier", row.get("brier"), "min"
-                  if fam == "gaussian":
-                      return "RMSE", row.get("rmse"), "min"
-                  if fam == "survival":
-                      return "C-index", row.get("auc"), "max"
-                  return "n/a", None, "min"
-
-              def winner_for_family(fam):
-                  rows = [r for r in family_rows.get(fam, []) if str(r.get("status", "")) == "ok"]
-                  if not rows:
-                      return None
-                  vals = []
-                  for r in rows:
-                      _, v, mode = primary_metric(r)
-                      if v is None:
-                          continue
-                      vals.append((float(v), r, mode))
-                  if not vals:
-                      return None
-                  mode = vals[0][2]
-                  return (min(vals, key=lambda x: x[0]) if mode == "min" else max(vals, key=lambda x: x[0]))[1]
-
-              lines = []
-              lines.append("## Benchmark Results")
-              lines.append("")
-              lines.append(f"- Generated: `{datetime.now(timezone.utc).isoformat()}`")
-              lines.append(f"- Shards merged: `{len(files)}`")
-              lines.append(f"- Result rows: `{len(merged_sorted)}` (`{ok_count}` ok, `{fail_count}` failed)")
-              lines.append("- Primary metrics by task:")
-              lines.append("  - Classification: lower Brier (with AUC + LogLoss shown)")
-              lines.append("  - Regression: lower RMSE (with MAE + R2 shown)")
-              lines.append("  - Survival: higher C-index")
-              lines.append("")
-              lines.append("### Leaders")
-              lines.append("")
-              lines.append("| Task | Winner | Primary Metric | Value |")
-              lines.append("|---|---|---|---:|")
-              for fam in ("binomial", "gaussian", "survival"):
-                  winner = winner_for_family(fam)
-                  if winner is None:
-                      lines.append(f"| {family_labels.get(fam, fam)} | — | — | — |")
-                      continue
-                  m_name, m_val, _ = primary_metric(winner)
-                  lines.append(
-                      f"| {family_labels.get(fam, fam)} | "
-                      f"{md_escape(winner.get('contender'))} ({md_escape(winner.get('scenario_name'))}) | "
-                      f"{m_name} | {fmt_num(m_val)} |"
-                  )
-              lines.append("")
-              lines.append("### Full Table")
-              lines.append("")
-              lines.append("| Task | Scenario | Contender | Status | C-index/AUC | Brier | LogLoss | RMSE | MAE | R2 | Fit (s) | Predict (s) |")
-              lines.append("|---|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-              for r in merged_sorted:
-                  fam = str(r.get("family") or "unknown")
-                  lines.append(
-                      "| "
-                      + " | ".join(
-                          [
-                              md_escape(family_labels.get(fam, fam)),
-                              md_escape(r.get("scenario_name")),
-                              md_escape(r.get("contender")),
-                              md_escape(fmt_status(r)),
-                              fmt_num(r.get("auc")),
-                              fmt_num(r.get("brier")),
-                              fmt_num(r.get("logloss")),
-                              fmt_num(r.get("rmse")),
-                              fmt_num(r.get("mae")),
-                              fmt_num(r.get("r2")),
-                              fmt_num(r.get("fit_sec")),
-                              fmt_num(r.get("predict_sec")),
-                          ]
-                      )
-                      + " |"
-                  )
-              lines.append("")
-              lines.append("### Model Specs")
-              lines.append("")
-              lines.append("| Scenario | Contender | Model Spec |")
-              lines.append("|---|---|---|")
-              for r in merged_sorted:
-                  lines.append(
-                      f"| {md_escape(r.get('scenario_name'))} | {md_escape(r.get('contender'))} | {md_escape(r.get('model_spec'))} |"
-                  )
-              Path(summary_path).write_text("\n".join(lines) + "\n")
-          PY
+          python3 .github/scripts/workflow_tasks.py format_results
 
       - name: Upload merged nightly results
         uses: actions/upload-artifact@v4

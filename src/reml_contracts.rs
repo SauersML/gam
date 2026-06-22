@@ -101,6 +101,7 @@ pub trait HyperOperator: Send + Sync {
         factor: &Array2<f64>,
         factor_cache: &ProjectedFactorCache,
     ) -> f64 {
+        drop(factor_cache);
         self.trace_projected_factor(factor)
     }
 
@@ -117,6 +118,7 @@ pub trait HyperOperator: Send + Sync {
         factor: &Array2<f64>,
         factor_cache: &ProjectedFactorCache,
     ) -> Array2<f64> {
+        drop(factor_cache);
         self.projected_matrix(factor)
     }
 
@@ -813,43 +815,6 @@ pub struct ContractedPsiSecondOrder {
 pub type ContractedPsiSecondOrderFn =
     Arc<dyn Fn(&[f64]) -> Result<Option<ContractedPsiSecondOrder>, String> + Send + Sync>;
 
-#[inline]
-fn dense_matvec_into(
-    matrix: &Array2<f64>,
-    x: ArrayView1<'_, f64>,
-    mut out: ArrayViewMut1<'_, f64>,
-) {
-    assert_eq!(matrix.ncols(), x.len());
-    assert_eq!(matrix.nrows(), out.len());
-    for (row, out_value) in matrix.rows().into_iter().zip(out.iter_mut()) {
-        *out_value = row.dot(&x);
-    }
-}
-
-#[inline]
-fn dense_matvec_scaled_add_into(
-    matrix: &Array2<f64>,
-    x: ArrayView1<'_, f64>,
-    scale: f64,
-    mut out: ArrayViewMut1<'_, f64>,
-) {
-    assert_eq!(matrix.ncols(), x.len());
-    assert_eq!(matrix.nrows(), out.len());
-    if scale == 0.0 {
-        return;
-    }
-    for (row, out_value) in matrix.rows().into_iter().zip(out.iter_mut()) {
-        *out_value += scale * row.dot(&x);
-    }
-}
-
-#[inline]
-fn dense_bilinear(matrix: &Array2<f64>, v: ArrayView1<'_, f64>, u: ArrayView1<'_, f64>) -> f64 {
-    assert_eq!(matrix.ncols(), v.len());
-    assert_eq!(matrix.nrows(), u.len());
-    let mut total = 0.0;
-    for (row, u_value) in matrix.rows().into_iter().zip(u.iter().copied()) {
-        total += u_value * row.dot(&v);
-    }
-    total
-}
+use crate::solver::reml::reml_outer_engine::dense_linalg::{
+    dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into,
+};

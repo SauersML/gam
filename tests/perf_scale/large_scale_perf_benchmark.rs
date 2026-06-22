@@ -34,32 +34,32 @@ fn cylinder_data(n: usize) -> gam::data::EncodedDataset {
             StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).expect("cyl")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "cyl")
 }
 
 fn periodic_1d_data(n: usize) -> gam::data::EncodedDataset {
     let headers = vec!["theta".into(), "y".into()];
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
-            let theta = TAU * (i as f64) / (n as f64);
+            let theta = TAU * (i as f64) / (n as f64, e));
             let y = 0.5 + 0.4 * theta.cos() - 0.2 * (2.0 * theta).sin();
             StringRecord::from(vec![theta.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).expect("p1d")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "p1d")
 }
 
 fn bc_1d_data(n: usize) -> gam::data::EncodedDataset {
     let headers = vec!["x".into(), "y".into()];
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
-            let x = (i as f64) / (n as f64 - 1.0);
+            let x = (i as f64) / (n as f64 - 1.0, e));
             // function with zero at x=0 (the BC anchor)
             let y = x * (1.0 - x) * (1.0 + 0.5 * (PI * x).sin());
             StringRecord::from(vec![x.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).expect("bc")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "bc")
 }
 
 fn sphere_data(n: usize) -> gam::data::EncodedDataset {
@@ -67,7 +67,7 @@ fn sphere_data(n: usize) -> gam::data::EncodedDataset {
     let rows: Vec<StringRecord> = (0..n)
         .map(|i| {
             // Lambert equal-area sphere coverage
-            let frac = (i as f64) / (n as f64);
+            let frac = (i as f64) / (n as f64, e));
             let z = 1.0 - 2.0 * frac;
             let phi = TAU * ((i as f64) * 0.61803398875).fract();
             let lat = z.asin().to_degrees();
@@ -78,11 +78,11 @@ fn sphere_data(n: usize) -> gam::data::EncodedDataset {
             StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).expect("sphere")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "sphere")
 }
 
 fn time_fit(formula: &str, data: &gam::data::EncodedDataset, cfg: &FitConfig) -> (f64, usize) {
-    let t = Instant::now();
+    let t = Instant::now(, e));
     let res = fit_from_formula(formula, data, cfg);
     let ms = t.elapsed().as_secs_f64() * 1e3;
     let p = res
@@ -196,13 +196,13 @@ fn noisy_cylinder_data(n: usize, noise_sd: f64, seed: u64) -> gam::data::Encoded
             StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).expect("noisy")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "noisy")
 }
 
 #[test]
 fn large_scale_perf_cylinder_noisy_n100k_accuracy() {
     // Fit on noisy data, check that |residuals| has expected scale.
-    init_parallelism();
+    init_parallelism(, e));
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -254,7 +254,7 @@ fn large_scale_perf_mixed_three_smooths_n100k() {
             ])
         })
         .collect();
-    let data = encode_recordswith_inferred_schema(headers, rows).expect("mixed");
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "mixed", e));
     let (ms, p) = time_fit(
         "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586) + s(x, bc=anchored) + sphere(lat, lon, method=harmonic, max_degree=3)",
         &data,
@@ -282,7 +282,7 @@ fn large_scale_perf_binomial_cylinder_n100k() {
             StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
         .collect();
-    let data = encode_recordswith_inferred_schema(headers, rows).expect("bin");
+    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "bin", e));
     let cfg = FitConfig {
         family: Some("binomial".to_string()),
         ..FitConfig::default()
@@ -387,7 +387,7 @@ fn time_design_build_and_apply(
     use rand_distr::{Distribution, Normal};
 
     let t_build = Instant::now();
-    let design = build_term_collection_design(data.view(), spec).expect("te(x, h) design build");
+    let design = build_term_collection_design(data.view(), spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "te(x, h) design build", e));
     let ms_build = t_build.elapsed().as_secs_f64() * 1e3;
     let term = &design.smooth.term_designs[0];
     let p = term.ncols();

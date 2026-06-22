@@ -1842,31 +1842,7 @@ mod tests {
     use crate::families::custom_family::AdditiveBlockJacobian;
     use crate::linalg::matrix::DenseDesignMatrix;
     use ndarray::Array2;
-
-    fn spec_from_dense(name: &str, design: Array2<f64>) -> ParameterBlockSpec {
-        let n = design.nrows();
-        ParameterBlockSpec {
-            name: name.to_string(),
-            design: DesignMatrix::Dense(DenseDesignMatrix::from(design)),
-            offset: Array1::<f64>::zeros(n),
-            penalties: Vec::new(),
-            nullspace_dims: Vec::new(),
-            initial_log_lambdas: Array1::<f64>::zeros(0),
-            initial_beta: None,
-            gauge_priority: 100,
-            jacobian_callback: None,
-            stacked_design: None,
-            stacked_offset: None,
-        }
-    }
-
-    fn linspace(n: usize) -> Array1<f64> {
-        if n <= 1 {
-            return Array1::<f64>::zeros(n.max(1));
-        }
-        let step = 2.0 / (n as f64 - 1.0);
-        Array1::from_iter((0..n).map(|i| -1.0 + step * i as f64))
-    }
+    use crate::identifiability::tests_common::{linspace, spec_from_dense};
 
     #[test]
     fn canonical_clean_specs_identity_transform() {

@@ -86,5 +86,5 @@ fn default_library_admits_small_dense_materialization() {
         50,
         &policy,
     )
-    .expect("small-data densification should be permitted");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "small-data densification should be permitted", e));
 }

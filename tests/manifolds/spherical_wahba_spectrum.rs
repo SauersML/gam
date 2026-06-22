@@ -42,7 +42,7 @@ fn wahba_kernel_spectrum_orders_1_to_4() {
 
     for m in 1..=4usize {
         let kmat = spherical_wahba_kernel_matrix(centers.view(), centers.view(), m, true)
-            .expect("kernel matrix computation");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "kernel matrix computation", e));
 
         // symmetry diagnostic
         let mut max_asym = 0.0_f64;
@@ -55,7 +55,7 @@ fn wahba_kernel_spectrum_orders_1_to_4() {
             }
         }
 
-        let (evals, _) = kmat.eigh(Side::Lower).expect("eigendecomposition");
+        let (evals, _) = kmat.eigh(Side::Lower).unwrap_or_else(|e| panic!("{} failed: {:?}", "eigendecomposition", e));
         let mut evec: Vec<f64> = evals.iter().copied().collect();
         evec.sort_by(|a, b| a.partial_cmp(b).unwrap());
 

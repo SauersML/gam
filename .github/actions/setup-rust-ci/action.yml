@@ -1,0 +1,51 @@
+name: setup-rust-ci
+description: Setup rust CI environment
+inputs:
+  free-disk-space:
+    description: "Whether to free disk space"
+    default: "false"
+  components:
+    description: "Rust components to install"
+    default: ""
+  cache-targets:
+    description: "Whether to cache cargo targets"
+    default: "true"
+runs:
+  using: composite
+  steps:
+    - name: Free runner disk space
+      if: ${{ inputs.free-disk-space == 'true' }}
+      shell: bash
+      run: |
+        set -uo pipefail
+        df -h /
+        sudo rm -rf /usr/share/dotnet || true
+        sudo rm -rf /usr/local/lib/android || true
+        sudo rm -rf /opt/ghc || true
+        sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+        sudo rm -rf /usr/local/share/boost || true
+        sudo rm -rf "${AGENT_TOOLSDIRECTORY:-}" || true
+        df -h /
+
+    - name: Install Rust 1.93.0
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        toolchain: 1.93.0
+        components: ${{ inputs.components }}
+
+    - name: Set up sccache
+      uses: mozilla-actions/sccache-action@v0.0.6
+
+    - name: Enable sccache only if its cache backend is reachable
+      shell: bash
+      run: |
+        if sccache --start-server; then
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+        else
+          echo "::warning::sccache cache backend unreachable; compiling without the compiler cache"
+        fi
+
+    - name: Cache cargo artifacts
+      uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: ${{ inputs.cache-targets }}

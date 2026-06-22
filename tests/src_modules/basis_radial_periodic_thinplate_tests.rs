@@ -75,11 +75,11 @@ fn shared_ladder_matern_jets_match_per_order_reference() {
                     let ladder = BesselKLadder::build(kappa * r, half_integer, max_steps);
                     let mut out = [0.0_f64; 5];
                     duchon_matern_family_jets_with_ladder(r, kappa, 1.37, mu, 4, &ladder, &mut out)
-                        .expect("ladder jets");
+                        .unwrap_or_else(|e| panic!("{} failed: {:?}", "ladder jets", e));
                     for (j, &ladder_value) in out.iter().enumerate() {
                         let reference =
                             duchon_matern_family_radial_derivative_reference(r, kappa, 1.37, mu, j)
-                                .expect("reference jets");
+                                .unwrap_or_else(|e| panic!("{} failed: {:?}", "reference jets", e));
                         let scale = reference.abs().max(ladder_value.abs()).max(1e-280);
                         assert!(
                             (ladder_value - reference).abs() <= 1e-11 * scale,
@@ -117,7 +117,7 @@ fn spherical_harmonic_penalty_keeps_laplace_beltrami_scale() {
     };
 
     let built =
-        build_spherical_harmonic_basis(data.view(), &spec).expect("build harmonic spherical basis");
+        build_spherical_harmonic_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "build harmonic spherical basis", e));
     assert_eq!(built.penalties.len(), 1);
     assert_eq!(built.penaltyinfo.len(), 1);
     assert_eq!(built.penaltyinfo[0].source, PenaltySource::Primary);
@@ -192,10 +192,10 @@ fn duchon_sae_atom_basis_matches_build_duchon_design() {
                 [1.3, 0.1, 0.2],
             ],
         };
-        let built = build_duchon_basis(t.view(), &spec).expect("build_duchon_basis");
+        let built = build_duchon_basis(t.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "build_duchon_basis", e));
         let reference = built.design.to_dense();
         let (phi, jet) = duchon_sae_atom_basis_with_jet(t.view(), centers.view(), order)
-            .expect("duchon_sae_atom_basis_with_jet");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "duchon_sae_atom_basis_with_jet", e));
 
         assert_eq!(
             phi.ncols(),
@@ -245,9 +245,9 @@ fn evaluate_splines_at_point(x: f64, degree: usize, knots: ArrayView1<f64>) -> A
         knots,
         basisvalues
             .as_slice_mut()
-            .expect("basis row should be contiguous"),
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "basis row should be contiguous"),
         &mut scratch,
-    );
+    , e));
     basisvalues
 }
 
@@ -275,7 +275,7 @@ fn periodic_bspline_basis_partitions_unity_and_closes_seam() {
         -std::f64::consts::TAU,
     ];
 
-    let basis = build_periodic_bspline_basis_1d(u.view(), &spec).expect("periodic basis");
+    let basis = build_periodic_bspline_basis_1d(u.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "periodic basis", e));
     assert_eq!(basis.dim(), (u.len(), spec.num_basis));
     for i in 0..basis.nrows() {
         let rowsum = basis.row(i).sum();
@@ -283,7 +283,7 @@ fn periodic_bspline_basis_partitions_unity_and_closes_seam() {
     }
 
     let seam = build_periodic_bspline_basis_1d(array![0.0, std::f64::consts::TAU].view(), &spec)
-        .expect("seam basis");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "seam basis", e));
     for j in 0..spec.num_basis {
         assert_abs_diff_eq!(seam[[0, j]], seam[[1, j]], epsilon = 1e-14);
     }
@@ -305,17 +305,17 @@ fn periodic_bspline_derivative_matches_normalized_basis_finite_difference() {
         spec.degree,
         spec.num_basis,
     )
-    .expect("periodic derivative")
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "periodic derivative")
     .index_axis(Axis(2), 0)
-    .to_owned();
+    .to_owned(, e));
 
     let step = 1.0e-6;
     let plus = u.mapv(|v| v + step);
     let minus = u.mapv(|v| v - step);
     let basis_plus =
-        build_periodic_bspline_basis_1d(plus.view(), &spec).expect("plus periodic basis");
+        build_periodic_bspline_basis_1d(plus.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus periodic basis", e));
     let basis_minus =
-        build_periodic_bspline_basis_1d(minus.view(), &spec).expect("minus periodic basis");
+        build_periodic_bspline_basis_1d(minus.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus periodic basis", e));
     let finite_difference = (&basis_plus - &basis_minus).mapv(|v| v / (2.0 * step));
 
     for row in 0..u.len() {
@@ -346,10 +346,10 @@ fn periodic_multioutput_fit_recovers_anisotropic_ellipse_and_oval() {
     let spec = periodic_test_spec(48);
     let curve =
         fit_periodic_bspline_curve(u.view(), y.view(), &spec, PERIODIC_TEST_SMOOTHING_LAMBDA)
-            .expect("fit curve");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit curve", e));
     assert_eq!(curve.ambient_dim(), 3);
 
-    let pred = curve.evaluate(u.view()).expect("predict curve");
+    let pred = curve.evaluate(u.view()).unwrap_or_else(|e| panic!("{} failed: {:?}", "predict curve", e));
     let rmse = pred
         .iter()
         .zip(y.iter())
@@ -405,21 +405,21 @@ fn periodic_multioutput_fit_commutes_with_ambient_affine_stretching() {
         &spec,
         PERIODIC_TEST_SMOOTHING_LAMBDA,
     )
-    .expect("fit base circle");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit base circle", e));
     let stretched_curve = fit_periodic_bspline_curve(
         u.view(),
         stretched.view(),
         &spec,
         PERIODIC_TEST_SMOOTHING_LAMBDA,
     )
-    .expect("fit stretched ambient curve");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit stretched ambient curve", e));
 
     let query = Array1::from_iter((0..73).map(|i| -1.3 + 0.17 * i as f64));
-    let base_pred = base_curve.evaluate(query.view()).expect("base predict");
+    let base_pred = base_curve.evaluate(query.view()).unwrap_or_else(|e| panic!("{} failed: {:?}", "base predict", e));
     let expected_stretched = fast_ab(&base_pred, &transform);
     let actual_stretched = stretched_curve
         .evaluate(query.view())
-        .expect("stretched predict");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "stretched predict", e));
     let max_abs = expected_stretched
         .iter()
         .zip(actual_stretched.iter())
@@ -449,14 +449,14 @@ fn periodic_curve_evaluation_wraps_distorted_high_dimensional_loop() {
         &periodic_test_spec(40),
         PERIODIC_TEST_SMOOTHING_LAMBDA,
     )
-    .expect("fit high-dimensional loop");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit high-dimensional loop", e));
 
     let q = array![0.17, 1.91, 5.8];
     let q_wrapped = q.mapv(|v| v + 9.0 * std::f64::consts::TAU);
-    let a = curve.evaluate(q.view()).expect("evaluate q");
+    let a = curve.evaluate(q.view()).unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate q", e));
     let b = curve
         .evaluate(q_wrapped.view())
-        .expect("evaluate wrapped q");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate wrapped q", e));
     let max_abs = a
         .iter()
         .zip(b.iter())
@@ -755,7 +755,7 @@ fn scaling_test_lap<D: DualNum<f64> + Copy>(psi: D, r: f64, eta: f64, d: f64) ->
 /// canonical definition from De Boor's "A Practical Guide to Splines" (2001).
 /// This can be used to cross-validate the iterative implementation in evaluate_splines_at_point.
 fn evaluate_bspline(x: f64, knots: &Array1<f64>, i: usize, degree: usize) -> f64 {
-    let last_knot = *knots.last().expect("knot vector should be non-empty");
+    let last_knot = *knots.last().unwrap_or_else(|e| panic!("{} failed: {:?}", "knot vector should be non-empty", e));
     // Snap to partition-of-unity convention only at the exact right
     // endpoint. The fuzzy 1e-12 tolerance previously here swallowed
     // queries at `right.next_down()` (~2.22e-16 below the endpoint),
@@ -800,7 +800,7 @@ fn evaluate_bspline(x: f64, knots: &Array1<f64>, i: usize, degree: usize) -> f64
 
 #[test]
 fn shared_owned_data_matrix_reuses_cached_arc_for_same_view() {
-    let data = Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).expect("data");
+    let data = Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "data", e));
     let cache = BasisCacheContext::default();
 
     let first = shared_owned_data_matrix(data.view(), &cache);
@@ -819,9 +819,9 @@ fn owned_data_cache_respects_byte_budget() {
     };
     let cache = BasisCacheContext::with_policy(&policy);
 
-    let first = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).expect("first data");
-    let second = Array2::from_shape_vec((2, 2), vec![5.0, 6.0, 7.0, 8.0]).expect("second data");
-    let third = Array2::from_shape_vec((2, 2), vec![9.0, 10.0, 11.0, 12.0]).expect("third data");
+    let first = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "first data", e));
+    let second = Array2::from_shape_vec((2, 2), vec![5.0, 6.0, 7.0, 8.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "second data", e));
+    let third = Array2::from_shape_vec((2, 2), vec![9.0, 10.0, 11.0, 12.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "third data", e));
 
     {
         let first_cached = shared_owned_data_matrix(first.view(), &cache);
@@ -844,9 +844,9 @@ fn owned_data_cache_respects_byte_budget() {
 fn owned_data_cache_respects_entry_cap() {
     let cache = BasisCacheContext::default();
 
-    let first = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).expect("first data");
-    let second = Array2::from_shape_vec((2, 2), vec![5.0, 6.0, 7.0, 8.0]).expect("second data");
-    let third = Array2::from_shape_vec((2, 2), vec![9.0, 10.0, 11.0, 12.0]).expect("third data");
+    let first = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "first data", e));
+    let second = Array2::from_shape_vec((2, 2), vec![5.0, 6.0, 7.0, 8.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "second data", e));
+    let third = Array2::from_shape_vec((2, 2), vec![9.0, 10.0, 11.0, 12.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "third data", e));
 
     let first_cached = shared_owned_data_matrix(first.view(), &cache);
     let second_cached = shared_owned_data_matrix(second.view(), &cache);
@@ -1120,7 +1120,7 @@ fn test_thin_plate_dimension4_uses_quadratic_polynomial_nullspace() {
         }
     }
     let tps = create_thin_plate_spline_basis(data.view(), knots.view())
-        .expect("dimension-4 TPS should build with a quadratic null space");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "dimension-4 TPS should build with a quadratic null space", e));
     assert_eq!(tps.dimension, 4);
     assert_eq!(tps.num_polynomial_basis, 15);
     assert_eq!(tps.num_kernel_basis, 1);
@@ -1343,7 +1343,7 @@ fn test_build_thin_plate_basis_switches_to_lazy_design_for_large_blocks() {
         identifiability: SpatialIdentifiability::None,
         radial_reparam: Some(Array2::<f64>::eye(k - 2)),
     };
-    let result = build_thin_plate_basis(data.view(), &spec).expect("large thin-plate basis");
+    let result = build_thin_plate_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "large thin-plate basis", e));
     assert!(matches!(
         result.design,
         DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::Lazy(_))
@@ -1620,9 +1620,9 @@ fn test_build_bspline_basis_1d_double_penalty() {
     // exactly rank(S_c)+rank(P) = 8+1 = 9.
     let summed = s_c + p_null;
     let joint_rank = analyze_penalty_block_with_op(&summed, None)
-        .expect("assembled double penalty analyzes")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "assembled double penalty analyzes")
         .rank;
-    assert_eq!(joint_rank, p_constrained);
+    assert_eq!(joint_rank, p_constrained, e));
 
     assert_eq!(result.design.nrows(), x.len());
 }
@@ -1705,7 +1705,7 @@ fn test_penalty_greville_selected_for_clamped_uniform_breakpoints() {
     let knots = internal::generate_full_knot_vector((0.0, 1.0), 5, degree).unwrap();
     let g = penalty_greville_abscissae_for_knots(&knots, degree)
         .unwrap()
-        .expect("clamped uniform breakpoints have non-uniform Greville abscissae");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clamped uniform breakpoints have non-uniform Greville abscissae", e));
     // Sanity: the abscissae really are non-uniform (clustered at the ends).
     let gaps: Vec<f64> = g.windows(2).into_iter().map(|w| w[1] - w[0]).collect();
     let max_gap = gaps.iter().cloned().fold(f64::MIN, f64::max);
@@ -1828,7 +1828,7 @@ fn test_build_bspline_basis_1d_quantile_uses_divided_difference_penalty() {
     };
     let g = penalty_greville_abscissae_for_knots(knots, spec.degree)
         .unwrap()
-        .expect("quantile knots should trigger Greville scaling");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "quantile knots should trigger Greville scaling", e));
     let expected =
         create_difference_penalty_matrix(built_design.ncols(), spec.penalty_order, Some(g.view()))
             .unwrap();
@@ -1862,7 +1862,7 @@ fn test_build_bspline_basis_1d_none_identifiability_prefers_sparse_design() {
         boundary_conditions: BSplineBoundaryConditions::default(),
     };
 
-    let built = build_bspline_basis_1d(x.view(), &spec).expect("build sparse bspline");
+    let built = build_bspline_basis_1d(x.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "build sparse bspline", e));
     assert!(matches!(built.design, DesignMatrix::Sparse(_)));
 }
 
@@ -1890,7 +1890,7 @@ fn test_build_bspline_basis_1d_default_identifiability_densifies_via_orthonormal
         boundary_conditions: BSplineBoundaryConditions::default(),
     };
 
-    let built = build_bspline_basis_1d(x.view(), &spec).expect("build centered bspline");
+    let built = build_bspline_basis_1d(x.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "build centered bspline", e));
     assert!(matches!(built.design, DesignMatrix::Dense(_)));
 }
 
@@ -1924,7 +1924,7 @@ fn test_quantile_knot_generation_excludes_boundary_point_masses() {
     x.extend([4.0, 7.0, 10.0, 20.0, 40.0, 80.0, 160.0, 285.0]);
     let x = Array1::from_vec(x).mapv(f64::ln);
     let knots = internal::generate_full_knot_vector_quantile(x.view(), 6, 3)
-        .expect("quantile knots should be inferred from strict interior support");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "quantile knots should be inferred from strict interior support", e));
 
     let lower = knots[0];
     let upper = knots[knots.len() - 1];
@@ -1939,7 +1939,7 @@ fn test_quantile_knot_generation_excludes_boundary_point_masses() {
         );
     }
 
-    let g = compute_greville_abscissae(&knots, 3).expect("Greville abscissae should be valid");
+    let g = compute_greville_abscissae(&knots, 3).unwrap_or_else(|e| panic!("{} failed: {:?}", "Greville abscissae should be valid", e));
     for i in 1..g.len() {
         assert!(
             g[i] > g[i - 1],
@@ -2702,10 +2702,10 @@ fn test_ispline_scalar_boundary_behavior() {
     let n_ispline = knots.len() - (degree + 1) - 2;
     let mut out = vec![0.0; n_ispline];
 
-    evaluate_ispline_scalar(-10.0, knots.view(), degree, &mut out).expect("left boundary eval");
+    evaluate_ispline_scalar(-10.0, knots.view(), degree, &mut out).unwrap_or_else(|e| panic!("{} failed: {:?}", "left boundary eval", e));
     assert!(out.iter().all(|&v| v.abs() <= 1e-12));
 
-    evaluate_ispline_scalar(10.0, knots.view(), degree, &mut out).expect("right boundary eval");
+    evaluate_ispline_scalar(10.0, knots.view(), degree, &mut out).unwrap_or_else(|e| panic!("{} failed: {:?}", "right boundary eval", e));
     for &v in &out {
         assert!((v - 1.0).abs() <= 1e-12);
     }
@@ -2719,11 +2719,11 @@ fn test_ispline_scalar_is_monotone_in_x() {
     let xs = [0.0, 0.25, 0.75, 1.5, 2.2, 2.8, 3.0];
 
     let mut prev = vec![0.0; n_ispline];
-    evaluate_ispline_scalar(xs[0], knots.view(), degree, &mut prev).expect("initial eval");
+    evaluate_ispline_scalar(xs[0], knots.view(), degree, &mut prev).unwrap_or_else(|e| panic!("{} failed: {:?}", "initial eval", e));
 
     for &x in xs.iter().skip(1) {
         let mut curr = vec![0.0; n_ispline];
-        evaluate_ispline_scalar(x, knots.view(), degree, &mut curr).expect("eval along grid");
+        evaluate_ispline_scalar(x, knots.view(), degree, &mut curr).unwrap_or_else(|e| panic!("{} failed: {:?}", "eval along grid", e));
         for j in 0..n_ispline {
             assert!(
                 curr[j] + 1e-12 >= prev[j],
@@ -2746,8 +2746,8 @@ fn test_mspline_scalar_matches_scaled_bspline() {
     let mut m = vec![0.0; num_basis];
     let mut scratch = SplineScratch::new(degree);
     evaluate_bspline_basis_scalar(x, knots.view(), degree, &mut b, &mut scratch)
-        .expect("bspline eval");
-    evaluate_mspline_scalar(x, knots.view(), degree, &mut m, &mut scratch).expect("mspline eval");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "bspline eval", e));
+    evaluate_mspline_scalar(x, knots.view(), degree, &mut m, &mut scratch).unwrap_or_else(|e| panic!("{} failed: {:?}", "mspline eval", e));
 
     let order = (degree + 1) as f64;
     for i in 0..num_basis {
@@ -2772,7 +2772,7 @@ fn test_create_basis_msplinezero_outside_domain() {
         degree,
         BasisOptions::m_spline(),
     )
-    .expect("create mspline basis");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "create mspline basis", e));
     let m = m.as_ref();
     assert!(m.row(0).iter().all(|v| v.abs() <= 1e-12));
     assert!(m.row(2).iter().all(|v| v.abs() <= 1e-12));
@@ -2790,7 +2790,7 @@ fn test_create_basis_ispline_boundaryrows() {
         degree,
         BasisOptions::i_spline(),
     )
-    .expect("create ispline basis");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "create ispline basis", e));
     let i_basis = i_basis.as_ref();
     assert!(i_basis.row(0).iter().all(|v| v.abs() <= 1e-12));
     for j in 0..i_basis.ncols() {
@@ -2812,7 +2812,7 @@ fn test_ispline_basis_drops_identicallyzero_leading_column() {
         degree,
         BasisOptions::i_spline(),
     )
-    .expect("create ispline basis");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "create ispline basis", e));
     let i_basis = i_basis.as_ref();
     assert_eq!(i_basis.ncols(), knots.len() - (degree + 1) - 2);
     for j in 0..i_basis.ncols() {
@@ -2835,7 +2835,7 @@ fn test_ispline_derivative_matches_cumulative_bspline_derivative_finite_differen
     let h = 1e-6;
     for &x in &xs {
         let mut db = vec![0.0; n_i + 1];
-        evaluate_bspline_derivative_scalar(x, knots.view(), bs_degree, &mut db).expect("B'(x)");
+        evaluate_bspline_derivative_scalar(x, knots.view(), bs_degree, &mut db).unwrap_or_else(|e| panic!("{} failed: {:?}", "B'(x)", e));
         let mut d_i = vec![0.0; n_i];
         let mut running = 0.0_f64;
         for j in (1..(n_i + 1)).rev() {
@@ -2916,7 +2916,7 @@ fn test_densesecond_derivativezeroes_outside_domain_even_on_sparse_heuristic_pat
         degree,
         BasisOptions::second_derivative(),
     )
-    .expect("dense second derivative");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "dense second derivative", e));
     let basis = basis.as_ref();
     assert!(basis.row(0).iter().all(|v| v.abs() <= 1e-12));
     assert!(
@@ -2932,18 +2932,18 @@ fn test_scalar_higher_derivatives_arezero_outside_domain() {
     let knots = array![0.0, 0.0, 0.0, 0.0, 0.4, 0.8, 1.0, 1.0, 1.0, 1.0];
     let mut second = vec![1.0; knots.len() - 3 - 1];
     evaluate_bsplinesecond_derivative_scalar(-0.1, knots.view(), 3, &mut second)
-        .expect("second derivative");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "second derivative", e));
     assert!(second.iter().all(|v| v.abs() <= 1e-12));
 
     let mut third = vec![1.0; knots.len() - 3 - 1];
     evaluate_bsplinethird_derivative_scalar(1.1, knots.view(), 3, &mut third)
-        .expect("third derivative");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "third derivative", e));
     assert!(third.iter().all(|v| v.abs() <= 1e-12));
 
     let knots4 = array![0.0, 0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0];
     let mut fourth = vec![1.0; knots4.len() - 4 - 1];
     evaluate_bspline_fourth_derivative_scalar(-0.2, knots4.view(), 4, &mut fourth)
-        .expect("fourth derivative");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "fourth derivative", e));
     assert!(fourth.iter().all(|v| v.abs() <= 1e-12));
 }
 
@@ -2994,14 +2994,14 @@ fn test_mspline_sparse_matches_dense() {
         2,
         BasisOptions::m_spline(),
     )
-    .expect("dense mspline");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "dense mspline", e));
     let (sparse, _) = create_basis::<Sparse>(
         x.view(),
         KnotSource::Provided(knots.view()),
         2,
         BasisOptions::m_spline(),
     )
-    .expect("sparse mspline");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "sparse mspline", e));
 
     let dense = dense.as_ref();
     let mut sparse_dense = Array2::<f64>::zeros((sparse.nrows(), sparse.ncols()));
@@ -3411,9 +3411,9 @@ fn testsecond_derivative_matches_finite_difference() {
     let x = 0.37;
     let h = 1e-5;
 
-    evaluate_bspline_derivative_scalar(x, knots.view(), degree, &mut d1).expect("first derivative");
+    evaluate_bspline_derivative_scalar(x, knots.view(), degree, &mut d1).unwrap_or_else(|e| panic!("{} failed: {:?}", "first derivative", e));
     evaluate_bsplinesecond_derivative_scalar(x, knots.view(), degree, &mut d2)
-        .expect("second derivative");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "second derivative", e));
 
     crate::assert_central_difference_array!(
         x,
@@ -3439,7 +3439,7 @@ fn testthird_derivative_matches_finite_difference() {
     let h = 1e-4;
 
     evaluate_bsplinethird_derivative_scalar(x, knots.view(), degree, &mut d3)
-        .expect("third derivative");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "third derivative", e));
 
     crate::assert_central_difference_array!(
         x,
@@ -3465,7 +3465,7 @@ fn test_fourth_derivative_matches_finite_difference() {
     let h = 1e-4;
 
     evaluate_bspline_fourth_derivative_scalar(x, knots.view(), degree, &mut d4)
-        .expect("fourth derivative");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "fourth derivative", e));
 
     crate::assert_central_difference_array!(
         x,
@@ -3593,7 +3593,7 @@ fn test_higher_derivative_engine_matches_reference() {
 
             for &x in &xs {
                 let mut got = vec![0.0; num_basis];
-                dispatch(x, &mut got).expect("engine derivative should succeed");
+                dispatch(x, &mut got).unwrap_or_else(|e| panic!("{} failed: {:?}", "engine derivative should succeed", e));
                 let want = reference_bspline_derivative(m, x, knots, degree);
                 assert_eq!(want.len(), got.len());
                 for j in 0..num_basis {
@@ -3630,7 +3630,7 @@ fn test_sparsesecond_derivative_matches_scalar() {
         );
 
         evaluate_bsplinesecond_derivative_scalar(x, knots.view(), degree, &mut scalarvalues)
-            .expect("scalar second derivative");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "scalar second derivative", e));
 
         let mut reconstructed = vec![0.0; num_basis];
         for (offset, &value) in sparsevalues.iter().enumerate() {
@@ -3661,7 +3661,7 @@ fn test_greville_abscissae_cubic() {
     let knots = array![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
     let degree = 3;
 
-    let g = compute_greville_abscissae(&knots, degree).expect("should compute Greville abscissae");
+    let g = compute_greville_abscissae(&knots, degree).unwrap_or_else(|e| panic!("{} failed: {:?}", "should compute Greville abscissae", e));
 
     // For degree 3: G_j = (t_{j+1} + t_{j+2} + t_{j+3}) / 3
     // G_0 = (0 + 0 + 0) / 3 = 0
@@ -3685,14 +3685,14 @@ fn test_geometric_constraint_transform_orthogonality() {
     let degree = 3;
 
     let (z, s_constrained) = compute_geometric_constraint_transform(&knots, degree, 2)
-        .expect("should compute transform");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "should compute transform", e));
     // Verify s_constrained has expected dimensions
     assert!(
         s_constrained.nrows() > 0,
         "s_constrained should not be empty"
     );
 
-    let g = compute_greville_abscissae(&knots, degree).expect("should compute Greville");
+    let g = compute_greville_abscissae(&knots, degree).unwrap_or_else(|e| panic!("{} failed: {:?}", "should compute Greville", e));
     let k = g.len();
     let ones = Array1::<f64>::ones(k);
 
@@ -3743,7 +3743,7 @@ fn test_orthogonality_transform_handles_heavily_collinear_design() {
     }
     let c = Array2::<f64>::ones((n, 1));
     let (constrained, z) = applyweighted_orthogonality_constraint(basis.view(), c.view(), None)
-        .expect("constraint nullspace must exist when k > q, regardless of design conditioning");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "constraint nullspace must exist when k > q, regardless of design conditioning", e));
 
     let cross = constrained.t().dot(&c);
     let max_violation = cross.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
@@ -3773,7 +3773,7 @@ fn test_geometric_constraint_transform_dimensions() {
         }
 
         let (z, s_c) = compute_geometric_constraint_transform(&knots, degree, 2)
-            .expect("should compute transform");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "should compute transform", e));
 
         let n_basis = n_knots - degree - 1;
         let n_constrained = n_basis - 2;
@@ -3905,7 +3905,7 @@ fn test_build_scale_free_duchon_basis_centered_spring_triplet() {
         operator_penalties: DuchonOperatorPenaltySpec::default(),
         boundary: OneDimensionalBoundary::Open,
     };
-    let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
+    let out = build_duchon_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon basis should build", e));
     assert_eq!(out.penalties.len(), 4);
     assert_eq!(out.penaltyinfo.len(), 4);
     assert!(out.penaltyinfo.iter().all(|info| info.active));
@@ -3936,7 +3936,7 @@ fn assert_scale_free_joint_null_is_only_constant(
 ) {
     use crate::faer_ndarray::FaerEigh;
     let out =
-        build_duchon_basis(data, spec).expect("Duchon basis should build for joint-null test");
+        build_duchon_basis(data, spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon basis should build for joint-null test", e));
     let design = out.design.to_dense();
     let (n, p) = design.dim();
     let BasisMetadata::Duchon {
@@ -3996,7 +3996,7 @@ fn assert_scale_free_joint_null_is_only_constant(
     );
     let (evals, _) = joint
         .eigh(faer::Side::Lower)
-        .expect("symmetric joint penalty has real eigenvalues");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "symmetric joint penalty has real eigenvalues", e));
     let max_eval = evals.iter().cloned().fold(0.0_f64, f64::max);
     let zero_threshold = null_tol * max_eval.max(1.0);
     let zero_count = evals.iter().filter(|&&e| e <= zero_threshold).count();
@@ -4549,7 +4549,7 @@ fn test_closed_form_linear_nullspace_kernel_subblock_finite_psd() {
     for c in 0..d {
         poly.column_mut(c + 1).assign(&centers.column(c));
     }
-    let z = kernel_constraint_nullspace_from_matrix(poly.view()).expect("Q construction");
+    let z = kernel_constraint_nullspace_from_matrix(poly.view()).unwrap_or_else(|e| panic!("{} failed: {:?}", "Q construction", e));
     // Z is (k, kernel_cols) with kernel_cols = k − rank(P) = k − (d+1).
     let kernel_cols = z.ncols();
     assert_eq!(kernel_cols, k - (d + 1));
@@ -4654,7 +4654,7 @@ fn test_matern_closed_form_matches_collocation() {
     }
 
     let g_cf = closed_form_matern_pair_block(centers.view(), 0, length_scale, nu, None)
-        .expect("q=0 Matérn closed-form should always return Some when 4ℓ > d");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "q=0 Matérn closed-form should always return Some when 4ℓ > d", e));
     assert_eq!(g_cf.shape(), &[k, k]);
     assert!(g_cf.iter().all(|v| v.is_finite()));
 
@@ -4672,7 +4672,7 @@ fn test_matern_closed_form_matches_collocation() {
     }
 
     // PSD via eigh (Frobenius-positive eigenvalues).
-    let (eigs, _) = FaerEigh::eigh(&g_cf, Side::Lower).expect("eigh");
+    let (eigs, _) = FaerEigh::eigh(&g_cf, Side::Lower).unwrap_or_else(|e| panic!("{} failed: {:?}", "eigh", e));
     let min_eig = eigs.iter().cloned().fold(f64::INFINITY, f64::min);
     let max_eig = eigs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     // PSD with mild numerical tolerance scaled by the matrix size.
@@ -4766,7 +4766,7 @@ fn test_matern_closed_form_q1_q2_psd_and_finite() {
                 );
             }
         }
-        let (eigs, _) = FaerEigh::eigh(&g, Side::Lower).expect("eigh");
+        let (eigs, _) = FaerEigh::eigh(&g, Side::Lower).unwrap_or_else(|e| panic!("{} failed: {:?}", "eigh", e));
         let min_eig = eigs.iter().cloned().fold(f64::INFINITY, f64::min);
         let max_eig = eigs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         assert!(
@@ -4814,7 +4814,7 @@ fn test_build_duchon_basis_linear_nullspace_uses_full_hilbert_scale() {
         operator_penalties: DuchonOperatorPenaltySpec::default(),
         boundary: OneDimensionalBoundary::Open,
     };
-    let out = build_duchon_basis(data.view(), &spec).expect("Duchon basis should build");
+    let out = build_duchon_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon basis should build", e));
     assert_eq!(out.penaltyinfo.len(), 4);
     assert!(out.penaltyinfo.iter().all(|info| info.active));
     assert!(matches!(out.penaltyinfo[0].source, PenaltySource::Primary));
@@ -4860,7 +4860,7 @@ fn test_duchon_zero_nullspace_uses_closed_form() {
         boundary: OneDimensionalBoundary::Open,
     };
     let out =
-        build_duchon_basis(data.view(), &spec).expect("Zero-nullspace Duchon basis should build");
+        build_duchon_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Zero-nullspace Duchon basis should build", e));
     assert_eq!(out.penaltyinfo.len(), 3);
     assert!(out.penaltyinfo.iter().all(|info| info.active));
 }
@@ -4886,7 +4886,7 @@ fn test_duchon_linear_nullspace_uses_collocation() {
         boundary: OneDimensionalBoundary::Open,
     };
     let out = build_duchon_basis(data.view(), &spec)
-        .expect("Linear-nullspace Duchon basis should build via collocation fallback");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "Linear-nullspace Duchon basis should build via collocation fallback", e));
     assert_eq!(out.penaltyinfo.len(), 4);
     assert!(out.penaltyinfo.iter().all(|info| info.active));
 }
@@ -4981,7 +4981,7 @@ fn filter_active_penalty_candidates_preserves_matching_kronecker_factors() {
         kronecker_factors: Some(vec![s.clone(), identity.clone()]),
         op: None,
     }])
-    .expect("matching Kronecker factors should be retained");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "matching Kronecker factors should be retained", e));
 
     assert_eq!(penaltyinfo.len(), 1);
     assert!(penaltyinfo[0].kronecker_factors.is_some());
@@ -5007,7 +5007,7 @@ fn filter_active_penalty_candidates_drops_stale_kronecker_factors_after_projecti
         kronecker_factors: Some(vec![s, identity]),
         op: None,
     }])
-    .expect("projected penalty should still analyze");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "projected penalty should still analyze", e));
 
     assert_eq!(penaltyinfo.len(), 1);
     assert!(penaltyinfo[0].active);
@@ -5017,7 +5017,7 @@ fn filter_active_penalty_candidates_drops_stale_kronecker_factors_after_projecti
 #[test]
 fn test_pairwise_distance_bounds_helper() {
     let pts = array![[0.0, 0.0], [3.0, 4.0], [6.0, 8.0]];
-    let (r_min, r_max) = pairwise_distance_bounds(pts.view()).expect("bounds should exist");
+    let (r_min, r_max) = pairwise_distance_bounds(pts.view()).unwrap_or_else(|e| panic!("{} failed: {:?}", "bounds should exist", e));
     assert!((r_min - 5.0).abs() < 1e-12);
     assert!((r_max - 10.0).abs() < 1e-12);
 }
@@ -5026,7 +5026,7 @@ fn test_pairwise_distance_bounds_helper() {
 fn test_pairwise_distance_bounds_handles_large_finite_coordinates() {
     let pts = array![[0.0], [3.0e200], [6.0e200]];
     let (r_min, r_max) =
-        pairwise_distance_bounds(pts.view()).expect("large finite bounds should exist");
+        pairwise_distance_bounds(pts.view()).unwrap_or_else(|e| panic!("{} failed: {:?}", "large finite bounds should exist", e));
     assert!((r_min - 3.0e200).abs() / 3.0e200 < 1e-12);
     assert!((r_max - 6.0e200).abs() / 6.0e200 < 1e-12);
 }
@@ -5165,20 +5165,20 @@ fn test_pure_duchon_rejects_divergent_laplacian_collocation() {
 
 #[test]
 fn test_pure_polyharmonic_origin_jets_preserve_derivative_singularities() {
-    let (_, _, tps_phi_rr) = polyharmonic_kernel_triplet(0.0, 2.0, 2).expect("thin-plate jet");
+    let (_, _, tps_phi_rr) = polyharmonic_kernel_triplet(0.0, 2.0, 2).unwrap_or_else(|e| panic!("{} failed: {:?}", "thin-plate jet", e));
     assert!(
         tps_phi_rr.is_infinite() && tps_phi_rr.is_sign_negative(),
         "2D thin-plate phi_rr(0) should diverge to -inf, got {tps_phi_rr}"
     );
     let (q, _, _, _) =
-        duchon_polyharmonic_operator_block_jets(0.0, 2.0, 2).expect("thin-plate operator jet");
+        duchon_polyharmonic_operator_block_jets(0.0, 2.0, 2).unwrap_or_else(|e| panic!("{} failed: {:?}", "thin-plate operator jet", e));
     assert!(
         q.is_infinite() && q.is_sign_negative(),
         "2D thin-plate phi_r/r at collision should diverge to -inf, got {q}"
     );
 
     let (_, gradient_first, gradient_second) =
-        polyharmonic_kernel_triplet(0.0, 2.0, 3).expect("3D first-derivative jet");
+        polyharmonic_kernel_triplet(0.0, 2.0, 3).unwrap_or_else(|e| panic!("{} failed: {:?}", "3D first-derivative jet", e));
     assert_abs_diff_eq!(
         gradient_first,
         -1.0 / (8.0 * std::f64::consts::PI),
@@ -5202,7 +5202,7 @@ fn test_duchon_hybrid_collision_uses_combined_partial_fraction_limit() {
         dim,
         Some(&coeffs),
     )
-    .expect("finite hybrid diagonal");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "finite hybrid diagonal", e));
     let expected = 1.0 / (4.0 * std::f64::consts::PI);
     assert_abs_diff_eq!(got, expected, epsilon = 1e-12);
 }
@@ -5210,7 +5210,7 @@ fn test_duchon_hybrid_collision_uses_combined_partial_fraction_limit() {
 #[test]
 fn test_duchon_matern_block_origin_includes_kappa_power() {
     let kappa = 4.0;
-    let value = duchon_matern_block(0.0, kappa, 1, 1).expect("block value");
+    let value = duchon_matern_block(0.0, kappa, 1, 1).unwrap_or_else(|e| panic!("{} failed: {:?}", "block value", e));
     assert_abs_diff_eq!(value, 1.0 / 8.0, epsilon = 1e-14);
 }
 
@@ -5228,7 +5228,7 @@ fn test_duchon_aniso_collocation_uses_metric_weights() {
         None,
         2,
     )
-    .expect("anisotropic Duchon collocation");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "anisotropic Duchon collocation", e));
 
     let mut workspace = BasisWorkspace::default();
     let z = kernel_constraint_nullspace(
@@ -5236,7 +5236,7 @@ fn test_duchon_aniso_collocation_uses_metric_weights() {
         DuchonNullspaceOrder::Linear,
         &mut workspace.cache,
     )
-    .expect("kernel constraint nullspace");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "kernel constraint nullspace", e));
     let p_order = duchon_p_from_nullspace_order(DuchonNullspaceOrder::Linear);
     let s_order = 2usize;
     let dim = 2usize;
@@ -5263,7 +5263,7 @@ fn test_duchon_aniso_collocation_uses_metric_weights() {
                     dim,
                     Some(&coeffs),
                 )
-                .expect("radial triplet");
+                .unwrap_or_else(|e| panic!("{} failed: {:?}", "radial triplet", e));
                 let lap = if r > 1e-10 {
                     let q = phi_r / r;
                     let t = (phi_rr - q) / (r * r);
@@ -5313,7 +5313,7 @@ fn test_matern_center_sum_tozero_produces_kernel_transform() {
         aniso_log_scales: None,
         nullspace_shrinkage_survived: None,
     };
-    let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
+    let out = build_matern_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     assert_eq!(out.design.nrows(), data.nrows());
     assert_eq!(out.design.ncols(), centers.nrows() - 1);
     assert_eq!(out.penalties[0].nrows(), out.design.ncols());
@@ -5325,7 +5325,7 @@ fn test_matern_center_sum_tozero_produces_kernel_transform() {
     else {
         panic!("expected Matérn metadata");
     };
-    let z = identifiability_transform.expect("sum-to-zero should store transform");
+    let z = identifiability_transform.unwrap_or_else(|e| panic!("{} failed: {:?}", "sum-to-zero should store transform", e));
     assert_eq!(z.nrows(), centers.nrows());
     assert_eq!(z.ncols(), centers.nrows() - 1);
     let ones = Array1::<f64>::ones(centers.nrows());
@@ -5350,7 +5350,7 @@ fn test_matern_operator_penalties_follow_rkhs_smoothness() {
             nullspace_shrinkage_survived: None,
         };
         build_matern_basis(data.view(), &spec)
-            .expect("Matérn basis should build")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build")
             .penaltyinfo
             .into_iter()
             .map(|info| info.source)
@@ -5360,7 +5360,7 @@ fn test_matern_operator_penalties_follow_rkhs_smoothness() {
     assert_eq!(
         sources_for(MaternNu::Half),
         vec![PenaltySource::OperatorMass]
-    );
+    , e));
     assert_eq!(
         sources_for(MaternNu::ThreeHalves),
         vec![PenaltySource::OperatorMass, PenaltySource::OperatorTension]
@@ -5415,9 +5415,9 @@ fn test_matern_operator_psi_derivatives_index_align_with_forward_gate() {
         None,
         None,
     )
-    .expect("forward Matérn operator penalties should build");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "forward Matérn operator penalties should build", e));
     let (forward_penalties, _, forward_info) =
-        filter_active_penalty_candidates(forward).expect("forward filter");
+        filter_active_penalty_candidates(forward).unwrap_or_else(|e| panic!("{} failed: {:?}", "forward filter", e));
     let forward_sources: Vec<PenaltySource> = forward_info
         .iter()
         .filter(|info| info.active)
@@ -5438,7 +5438,7 @@ fn test_matern_operator_psi_derivatives_index_align_with_forward_gate() {
         None,
         None,
     )
-    .expect("Matérn operator ψ-derivatives should build");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn operator ψ-derivatives should build", e));
     assert_eq!(
         psi_derivatives.len(),
         forward_sources.len(),
@@ -5476,7 +5476,7 @@ fn test_matern_operator_psi_derivatives_index_align_with_forward_gate() {
             None,
             None,
         )
-        .expect("FD forward penalties");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "FD forward penalties", e));
         cands
             .into_iter()
             .find(|c| c.source == source)
@@ -5533,11 +5533,11 @@ fn test_matern_overspecified_centers_yield_full_rank_basis() {
         aniso_log_scales: None,
         nullspace_shrinkage_survived: None,
     };
-    let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
+    let out = build_matern_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     let dense = out.design.to_dense();
     let realized_cols = dense.ncols();
     let rrqr = rrqr_with_permutation(&dense, default_rrqr_rank_alpha())
-        .expect("RRQR on the realized design should succeed");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "RRQR on the realized design should succeed", e));
     // The realized basis must be full column rank: no leftover collinear
     // columns for the identifiability audit to FATAL on.
     assert_eq!(
@@ -5569,7 +5569,7 @@ fn test_matern_include_intercept_keeps_single_unpenalized_dimension() {
         aniso_log_scales: None,
         nullspace_shrinkage_survived: None,
     };
-    let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
+    let out = build_matern_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     // (k-1) constrained kernel cols + explicit intercept.
     assert_eq!(out.design.ncols(), centers.nrows());
     assert_eq!(out.penalties.len(), 3);
@@ -5591,7 +5591,7 @@ fn test_matern_double_penalty_drops_inactive_nullspace_blockwithout_intercept() 
         aniso_log_scales: None,
         nullspace_shrinkage_survived: None,
     };
-    let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
+    let out = build_matern_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     assert_eq!(out.penalties.len(), 1);
     assert_eq!(out.nullspace_dims.len(), 1);
     assert_eq!(out.penaltyinfo.len(), 1);
@@ -5614,7 +5614,7 @@ fn test_matern_double_penalty_keeps_intercept_shrinkage_block() {
         aniso_log_scales: None,
         nullspace_shrinkage_survived: None,
     };
-    let out = build_matern_basis(data.view(), &spec).expect("Matérn basis should build");
+    let out = build_matern_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build", e));
     assert_eq!(out.penalties.len(), 2);
     assert_eq!(out.nullspace_dims.len(), 2);
     assert_eq!(out.penaltyinfo.len(), 2);
@@ -5640,8 +5640,8 @@ fn matern_frozen_nullspace_decision_overrides_spectral_test() {
     // transform so we exercise the FrozenTransform path with a pinned decision.
     let z =
         matern_identifiability_transform(centers.view(), &MaternIdentifiability::CenterSumToZero)
-            .expect("transform builds")
-            .expect("center sum-to-zero yields a transform");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "transform builds")
+            .expect("center sum-to-zero yields a transform", e));
     let base = |survived: Option<bool>| MaternBasisSpec {
         periodic: None,
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
@@ -5658,7 +5658,7 @@ fn matern_frozen_nullspace_decision_overrides_spectral_test() {
     };
     // Frozen OFF → only the primary kernel penalty survives.
     let off = build_matern_basis(data.view(), &base(Some(false)))
-        .expect("Matérn basis should build with frozen-off shrinkage");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build with frozen-off shrinkage", e));
     assert_eq!(
         off.penalties.len(),
         1,
@@ -5670,7 +5670,7 @@ fn matern_frozen_nullspace_decision_overrides_spectral_test() {
         let mut spec_on = base(Some(true));
         spec_on.length_scale = length_scale;
         let on = build_matern_basis(data.view(), &spec_on)
-            .expect("Matérn basis should build with frozen-on shrinkage");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "Matérn basis should build with frozen-on shrinkage", e));
         assert_eq!(
             on.penalties.len(),
             2,
@@ -5697,8 +5697,8 @@ fn matern_frozen_transform_skips_rank_reduction_on_degenerate_cloud() {
     let centers = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
     let z =
         matern_identifiability_transform(centers.view(), &MaternIdentifiability::CenterSumToZero)
-            .expect("transform builds")
-            .expect("center sum-to-zero yields a transform");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "transform builds")
+            .expect("center sum-to-zero yields a transform", e));
     let transform_rows = z.nrows();
     assert_eq!(
         transform_rows,
@@ -5732,7 +5732,7 @@ fn matern_frozen_transform_skips_rank_reduction_on_degenerate_cloud() {
         data[[i, 1]] = 0.5 + 1e-6 * t;
     }
     let out = build_matern_basis(data.view(), &spec)
-        .expect("frozen Matérn must replay on a degenerate cloud without re-reducing centers");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "frozen Matérn must replay on a degenerate cloud without re-reducing centers", e));
     // The realized design width matches the frozen transform's column space,
     // not some re-reduced count.
     assert_eq!(
@@ -5805,7 +5805,7 @@ fn test_matern_log_kappa_derivative_matchesfd() {
         nullspace_shrinkage_survived: None,
     };
     let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
-        .expect("analytic Matérn derivative should build");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Matérn derivative should build", e));
 
     let eps: f64 = 1e-6;
     let kappa = 1.0 / spec.length_scale;
@@ -5815,8 +5815,8 @@ fn test_matern_log_kappa_derivative_matchesfd() {
     let mut spec_minus = spec.clone();
     spec_plus.length_scale = ls_plus;
     spec_minus.length_scale = ls_minus;
-    let plus = build_matern_basis(data.view(), &spec_plus).expect("plus build");
-    let minus = build_matern_basis(data.view(), &spec_minus).expect("minus build");
+    let plus = build_matern_basis(data.view(), &spec_plus).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus build", e));
+    let minus = build_matern_basis(data.view(), &spec_minus).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
 
     let plus_design = plus.design.to_dense();
     let minus_design = minus.design.to_dense();
@@ -5876,7 +5876,7 @@ fn test_matern_double_penalty_log_kappa_derivative_matchesfd() {
         nullspace_shrinkage_survived: None,
     };
     let deriv = build_matern_basis_log_kappa_derivative(data.view(), &spec)
-        .expect("analytic Matérn double-penalty derivative should build");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Matérn double-penalty derivative should build", e));
 
     let eps: f64 = 1e-6;
     let kappa = 1.0 / spec.length_scale;
@@ -5886,8 +5886,8 @@ fn test_matern_double_penalty_log_kappa_derivative_matchesfd() {
     let mut spec_minus = spec.clone();
     spec_plus.length_scale = ls_plus;
     spec_minus.length_scale = ls_minus;
-    let plus = build_matern_basis(data.view(), &spec_plus).expect("plus build");
-    let minus = build_matern_basis(data.view(), &spec_minus).expect("minus build");
+    let plus = build_matern_basis(data.view(), &spec_plus).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus build", e));
+    let minus = build_matern_basis(data.view(), &spec_minus).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
 
     let fd_primary = (&plus.penalties[0] - &minus.penalties[0]) / (2.0 * eps);
     let primary_err = (&deriv.penalties_derivative[0] - &fd_primary)
@@ -5922,12 +5922,12 @@ fn test_thin_plate_log_kappa_derivative_matchesfd() {
         radial_reparam: None,
     };
     let base_for_reparam =
-        build_thin_plate_basis(data.view(), &spec).expect("base TPS build for radial reparam");
+        build_thin_plate_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "base TPS build for radial reparam", e));
     if let BasisMetadata::ThinPlate { radial_reparam, .. } = &base_for_reparam.metadata {
         spec.radial_reparam = radial_reparam.clone();
     }
     let deriv = build_thin_plate_basis_log_kappa_derivative(data.view(), &spec)
-        .expect("analytic ThinPlate derivative should build");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic ThinPlate derivative should build", e));
 
     let eps: f64 = 1e-6;
     let kappa = 1.0 / spec.length_scale;
@@ -5937,8 +5937,8 @@ fn test_thin_plate_log_kappa_derivative_matchesfd() {
     let mut spec_minus = spec.clone();
     spec_plus.length_scale = ls_plus;
     spec_minus.length_scale = ls_minus;
-    let plus = build_thin_plate_basis(data.view(), &spec_plus).expect("plus build");
-    let minus = build_thin_plate_basis(data.view(), &spec_minus).expect("minus build");
+    let plus = build_thin_plate_basis(data.view(), &spec_plus).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus build", e));
+    let minus = build_thin_plate_basis(data.view(), &spec_minus).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
 
     let plus_design = plus.design.to_dense();
     let minus_design = minus.design.to_dense();
@@ -5985,13 +5985,13 @@ fn test_thin_plate_log_kappasecond_derivative_matchesfd() {
         radial_reparam: None,
     };
     let base_for_reparam =
-        build_thin_plate_basis(data.view(), &spec).expect("base TPS build for radial reparam");
+        build_thin_plate_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "base TPS build for radial reparam", e));
     if let BasisMetadata::ThinPlate { radial_reparam, .. } = &base_for_reparam.metadata {
         spec.radial_reparam = radial_reparam.clone();
     }
     let analytic = build_thin_plate_basis_log_kappasecond_derivative(data.view(), &spec)
-        .expect("analytic ThinPlate second derivative should build");
-    let base = build_thin_plate_basis(data.view(), &spec).expect("base build");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic ThinPlate second derivative should build", e));
+    let base = build_thin_plate_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "base build", e));
 
     let eps: f64 = 2e-5;
     let kappa = 1.0 / spec.length_scale;
@@ -6001,8 +6001,8 @@ fn test_thin_plate_log_kappasecond_derivative_matchesfd() {
     let mut spec_minus = spec.clone();
     spec_plus.length_scale = ls_plus;
     spec_minus.length_scale = ls_minus;
-    let plus = build_thin_plate_basis(data.view(), &spec_plus).expect("plus build");
-    let minus = build_thin_plate_basis(data.view(), &spec_minus).expect("minus build");
+    let plus = build_thin_plate_basis(data.view(), &spec_plus).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus build", e));
+    let minus = build_thin_plate_basis(data.view(), &spec_minus).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
 
     let plus_design = plus.design.to_dense();
     let base_design = base.design.to_dense();
@@ -6067,7 +6067,7 @@ fn test_duchon_operator_psi_derivatives_fd_dim1() {
         2,
         &mut workspace,
     )
-    .expect("plus ops");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "plus ops", e));
     let ops_minus = build_duchon_collocation_operator_matriceswithworkspace(
         centers.view(),
         centers.view(),
@@ -6080,7 +6080,7 @@ fn test_duchon_operator_psi_derivatives_fd_dim1() {
         2,
         &mut workspace,
     )
-    .expect("minus ops");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "minus ops", e));
     let fd_d0 = (&ops_plus.d0 - &ops_minus.d0) / (2.0 * eps);
     let fd_d1 = (&ops_plus.d1 - &ops_minus.d1) / (2.0 * eps);
     let fd_d2 = (&ops_plus.d2 - &ops_minus.d2) / (2.0 * eps);
@@ -6115,7 +6115,7 @@ fn test_duchon_operator_psi_derivatives_fd_dim1() {
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     let z_kernel =
         kernel_constraint_nullspace(centers.view(), nullspace_order, &mut workspace.cache)
-            .expect("z kernel");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "z kernel", e));
     let p = centers.nrows();
     let kernel_cols = z_kernel.ncols();
     let mut d0_psi_analytic = ndarray::Array2::<f64>::zeros((p, kernel_cols));
@@ -6172,7 +6172,7 @@ fn test_duchon_raw_gram_psi_derivative_fd_dim1() {
         2,
         &mut workspace,
     )
-    .expect("base ops");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "base ops", e));
     let eps: f64 = 1e-5;
     let ls_plus = 1.0 / (1.0 * eps.exp());
     let ls_minus = 1.0 / (1.0 * (-eps).exp());
@@ -6188,7 +6188,7 @@ fn test_duchon_raw_gram_psi_derivative_fd_dim1() {
         2,
         &mut workspace,
     )
-    .expect("plus ops");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "plus ops", e));
     let ops_minus = build_duchon_collocation_operator_matriceswithworkspace(
         centers.view(),
         centers.view(),
@@ -6201,7 +6201,7 @@ fn test_duchon_raw_gram_psi_derivative_fd_dim1() {
         2,
         &mut workspace,
     )
-    .expect("minus ops");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "minus ops", e));
 
     let s0_raw_base = symmetrize(&fast_ata(&ops_base.d0));
     let s1_raw_base = symmetrize(&fast_ata(&ops_base.d1));
@@ -6249,7 +6249,7 @@ fn test_duchon_log_kappa_derivative_matchesfd_lengthscale_one() {
         boundary: OneDimensionalBoundary::Open,
     };
     let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
-        .expect("analytic Duchon derivative should build");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Duchon derivative should build", e));
     let eps: f64 = 1e-5;
     let kappa = 1.0;
     let ls_plus = 1.0 / (kappa * eps.exp());
@@ -6258,8 +6258,8 @@ fn test_duchon_log_kappa_derivative_matchesfd_lengthscale_one() {
     let mut spec_minus = spec.clone();
     spec_plus.length_scale = Some(ls_plus);
     spec_minus.length_scale = Some(ls_minus);
-    let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
-    let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+    let plus = build_duchon_basis(data.view(), &spec_plus).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus build", e));
+    let minus = build_duchon_basis(data.view(), &spec_minus).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
     for idx in 0..derivative.first.penalties_derivative.len() {
         let fd = (&plus.penalties[idx] - &minus.penalties[idx]) / (2.0 * eps);
         let analytic = &derivative.first.penalties_derivative[idx];
@@ -6294,7 +6294,7 @@ fn test_duchon_design_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
         operator_penalties: DuchonOperatorPenaltySpec::default(),
         boundary: OneDimensionalBoundary::Open,
     };
-    let base = build_duchon_basis(data.view(), &spec).expect("base build");
+    let base = build_duchon_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "base build", e));
     let z_frozen = match &base.metadata {
         BasisMetadata::Duchon {
             identifiability_transform,
@@ -6312,7 +6312,7 @@ fn test_duchon_design_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
         None => SpatialIdentifiability::None,
     };
     let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
-        .expect("analytic Duchon derivative should build");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Duchon derivative should build", e));
     let eps: f64 = 1e-5;
     let ls_plus = 1.0 / eps.exp();
     let ls_minus = 1.0 / (-eps).exp();
@@ -6320,22 +6320,22 @@ fn test_duchon_design_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
     let mut spec_minus = spec.clone();
     spec_plus.length_scale = Some(ls_plus);
     spec_minus.length_scale = Some(ls_minus);
-    let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
-    let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+    let plus = build_duchon_basis(data.view(), &spec_plus).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus build", e));
+    let minus = build_duchon_basis(data.view(), &spec_minus).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
     let plus_design = plus.design.to_dense();
     let minus_design = minus.design.to_dense();
     let fd_design = (&plus_design - &minus_design) / (2.0 * eps);
     let analytic_design = match derivative.implicit_operator.as_ref() {
         Some(op) => op
             .materialize_first(0)
-            .expect("materialize first design derivative"),
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "materialize first design derivative"),
         None => derivative.first.design_derivative.clone(),
     };
     eprintln!(
         "[duchon_d1_p1_frozen_design] analytic shape={:?} fd shape={:?}",
         analytic_design.shape(),
         fd_design.shape()
-    );
+    , e));
     let a_norm = analytic_design.iter().map(|v| v * v).sum::<f64>().sqrt();
     let fd_norm = fd_design.iter().map(|v| v * v).sum::<f64>().sqrt();
     assert_eq!(
@@ -6381,7 +6381,7 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
         operator_penalties: DuchonOperatorPenaltySpec::default(),
         boundary: OneDimensionalBoundary::Open,
     };
-    let base = build_duchon_basis(data.view(), &spec).expect("base build");
+    let base = build_duchon_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "base build", e));
     let z_frozen = match &base.metadata {
         BasisMetadata::Duchon {
             identifiability_transform,
@@ -6401,7 +6401,7 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
         None => SpatialIdentifiability::None,
     };
     let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
-        .expect("analytic Duchon derivative should build");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Duchon derivative should build", e));
     let eps: f64 = 1e-5;
     let ls_plus = 1.0 / eps.exp();
     let ls_minus = 1.0 / (-eps).exp();
@@ -6409,8 +6409,8 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_frozen() {
     let mut spec_minus = spec.clone();
     spec_plus.length_scale = Some(ls_plus);
     spec_minus.length_scale = Some(ls_minus);
-    let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
-    let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+    let plus = build_duchon_basis(data.view(), &spec_plus).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus build", e));
+    let minus = build_duchon_basis(data.view(), &spec_minus).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
     assert!(
         !derivative.first.penalties_derivative.is_empty(),
         "derivative must expose at least one penalty matrix"
@@ -6455,7 +6455,7 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear_no_ident() {
         boundary: OneDimensionalBoundary::Open,
     };
     let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
-        .expect("analytic Duchon derivative should build");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Duchon derivative should build", e));
     let eps: f64 = 1e-5;
     let kappa = 1.0;
     let ls_plus = 1.0 / (kappa * eps.exp());
@@ -6464,8 +6464,8 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear_no_ident() {
     let mut spec_minus = spec.clone();
     spec_plus.length_scale = Some(ls_plus);
     spec_minus.length_scale = Some(ls_minus);
-    let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
-    let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+    let plus = build_duchon_basis(data.view(), &spec_plus).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus build", e));
+    let minus = build_duchon_basis(data.view(), &spec_minus).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
     for idx in 0..derivative.first.penalties_derivative.len() {
         let fd = (&plus.penalties[idx] - &minus.penalties[idx]) / (2.0 * eps);
         let analytic = &derivative.first.penalties_derivative[idx];
@@ -6503,23 +6503,23 @@ fn test_duchon_log_kappa_derivative_matchesfd_dim1_power1_linear() {
         boundary: OneDimensionalBoundary::Open,
     };
     let derivative = build_duchon_basis_log_kappa_derivatives(data.view(), &spec)
-        .expect("analytic Duchon derivative should build");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Duchon derivative should build", e));
     let eps: f64 = 1e-5;
-    let kappa = 1.0 / spec.length_scale.expect("hybrid Duchon length_scale");
+    let kappa = 1.0 / spec.length_scale.unwrap_or_else(|e| panic!("{} failed: {:?}", "hybrid Duchon length_scale", e));
     let ls_plus = 1.0 / (kappa * eps.exp());
     let ls_minus = 1.0 / (kappa * (-eps).exp());
     let mut spec_plus = spec.clone();
     let mut spec_minus = spec.clone();
     spec_plus.length_scale = Some(ls_plus);
     spec_minus.length_scale = Some(ls_minus);
-    let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
-    let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+    let plus = build_duchon_basis(data.view(), &spec_plus).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus build", e));
+    let minus = build_duchon_basis(data.view(), &spec_minus).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
     eprintln!(
         "[duchon_d1_p1_linear] n_penalties={} analytic_n={}",
         plus.penalties.len(),
         derivative.first.penalties_derivative.len()
     );
-    let base = build_duchon_basis(data.view(), &spec).expect("base build");
+    let base = build_duchon_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "base build", e));
     for idx in 0..derivative.first.penalties_derivative.len() {
         let fd = (&plus.penalties[idx] - &minus.penalties[idx]) / (2.0 * eps);
         let analytic = &derivative.first.penalties_derivative[idx];
@@ -6585,18 +6585,18 @@ fn test_duchon_log_kappa_derivative_matchesfd() {
     let mut workspace = BasisWorkspace::default();
     let derivative =
         build_duchon_basis_log_kappa_derivativewithworkspace(data.view(), &spec, &mut workspace)
-            .expect("analytic Duchon derivative should build");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Duchon derivative should build", e));
 
     let eps: f64 = 1e-6;
-    let kappa = 1.0 / spec.length_scale.expect("hybrid Duchon length_scale");
+    let kappa = 1.0 / spec.length_scale.unwrap_or_else(|e| panic!("{} failed: {:?}", "hybrid Duchon length_scale", e));
     let ls_plus = 1.0 / (kappa * eps.exp());
     let ls_minus = 1.0 / (kappa * (-eps).exp());
     let mut spec_plus = spec.clone();
     let mut spec_minus = spec.clone();
     spec_plus.length_scale = Some(ls_plus);
     spec_minus.length_scale = Some(ls_minus);
-    let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
-    let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+    let plus = build_duchon_basis(data.view(), &spec_plus).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus build", e));
+    let minus = build_duchon_basis(data.view(), &spec_minus).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
 
     let plus_design = plus.design.to_dense();
     let minus_design = minus.design.to_dense();
@@ -6607,9 +6607,9 @@ fn test_duchon_log_kappa_derivative_matchesfd() {
     let analytic_design = derivative
         .implicit_operator
         .as_ref()
-        .expect("Duchon design derivative must expose an implicit operator")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon design derivative must expose an implicit operator")
         .materialize_first(0)
-        .expect("materialize first design derivative");
+        .expect("materialize first design derivative", e));
     let design_err = (&analytic_design - &fd_design)
         .iter()
         .map(|v| v * v)
@@ -6668,19 +6668,19 @@ fn test_periodic_duchon_log_kappa_derivative_matchesfd() {
         &spec,
         &mut workspace,
     )
-    .expect("analytic Duchon second derivative should build");
-    let base = build_duchon_basis(data.view(), &spec).expect("base build");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "analytic Duchon second derivative should build", e));
+    let base = build_duchon_basis(data.view(), &spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "base build", e));
 
     let eps: f64 = 2e-5;
-    let kappa = 1.0 / spec.length_scale.expect("hybrid Duchon length_scale");
+    let kappa = 1.0 / spec.length_scale.unwrap_or_else(|e| panic!("{} failed: {:?}", "hybrid Duchon length_scale", e));
     let ls_plus = 1.0 / (kappa * eps.exp());
     let ls_minus = 1.0 / (kappa * (-eps).exp());
     let mut spec_plus = spec.clone();
     let mut spec_minus = spec.clone();
     spec_plus.length_scale = Some(ls_plus);
     spec_minus.length_scale = Some(ls_minus);
-    let plus = build_duchon_basis(data.view(), &spec_plus).expect("plus build");
-    let minus = build_duchon_basis(data.view(), &spec_minus).expect("minus build");
+    let plus = build_duchon_basis(data.view(), &spec_plus).unwrap_or_else(|e| panic!("{} failed: {:?}", "plus build", e));
+    let minus = build_duchon_basis(data.view(), &spec_minus).unwrap_or_else(|e| panic!("{} failed: {:?}", "minus build", e));
 
     let plus_design = plus.design.to_dense();
     let base_design = base.design.to_dense();
@@ -6692,9 +6692,9 @@ fn test_periodic_duchon_log_kappa_derivative_matchesfd() {
     let analytic_second = second_derivative
         .implicit_operator
         .as_ref()
-        .expect("Duchon design second derivative must expose an implicit operator")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "Duchon design second derivative must expose an implicit operator")
         .materialize_second_diag(0)
-        .expect("materialize second-diag design derivative");
+        .expect("materialize second-diag design derivative", e));
     let design_err = (&analytic_second - &fd_design)
         .iter()
         .map(|v| v * v)
@@ -6906,7 +6906,7 @@ fn test_duchonspectral_scaling_matches_implementation() {
         k_dim,
         Some(&coeffs_1),
     )
-    .expect("scaled phi_1");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "scaled phi_1", e));
     let phi_2 = duchon_matern_kernel_general_from_distance(
         r,
         Some(length_scale_2),
@@ -6915,11 +6915,11 @@ fn test_duchonspectral_scaling_matches_implementation() {
         k_dim,
         Some(&coeffs_2),
     )
-    .expect("phi_2");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "phi_2", e));
     let jets_1 = duchon_radial_jets(scaled_r, length_scale_1, p_order, s_order, k_dim, &coeffs_1)
-        .expect("jets_1");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "jets_1", e));
     let jets_2 =
-        duchon_radial_jets(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2).expect("jets_2");
+        duchon_radial_jets(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2).unwrap_or_else(|e| panic!("{} failed: {:?}", "jets_2", e));
 
     let phi_scale = scale.powf(delta);
     let op_scale = scale.powf(delta + 2.0);
@@ -6953,7 +6953,7 @@ fn test_duchonspectral_scaling_matches_implementation() {
 
     let core =
         duchon_radial_core_psi_triplet(r, length_scale_2, p_order, s_order, k_dim, &coeffs_2)
-            .expect("radial core");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "radial core", e));
     assert!(core.phi.value.is_finite());
     assert!(core.phi.psi.is_finite());
     assert!(core.phi.psi_psi.is_finite());
@@ -7002,7 +7002,7 @@ fn test_radial_basis_cartesian_derivative_matches_legacy_loops() {
         nullspace_order,
         power,
     )
-    .expect("phi_r");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "phi_r", e));
     let phi_rr = duchon_radial_second_derivative_nd(
         t.view(),
         centers.view(),
@@ -7010,7 +7010,7 @@ fn test_radial_basis_cartesian_derivative_matches_legacy_loops() {
         nullspace_order,
         power,
     )
-    .expect("phi_rr");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "phi_rr", e));
     let phi_rrr = duchon_radial_third_derivative_nd(
         t.view(),
         centers.view(),
@@ -7018,7 +7018,7 @@ fn test_radial_basis_cartesian_derivative_matches_legacy_loops() {
         nullspace_order,
         power,
     )
-    .expect("phi_rrr");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "phi_rrr", e));
 
     // --- order 2: legacy Hessian loop -----------------------------------
     let mut legacy2 = Array2::<f64>::zeros((n_rows, p_out * d * d));
@@ -7061,7 +7061,7 @@ fn test_radial_basis_cartesian_derivative_matches_legacy_loops() {
         nullspace_order,
         power,
     )
-    .expect("shared order-2");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "shared order-2", e));
     assert_eq!(shared2.dim(), legacy2.dim());
     let err2 = (&shared2 - &legacy2)
         .iter()
@@ -7121,10 +7121,10 @@ fn test_radial_basis_cartesian_derivative_matches_legacy_loops() {
         nullspace_order,
         power,
     )
-    .expect("shared order-3");
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "shared order-3", e));
     let shared3 = shared3_flat
         .into_shape_with_order((n_rows, p_out, d * d * d))
-        .expect("reshape order-3");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "reshape order-3", e));
     assert_eq!(shared3.dim(), legacy3.dim());
     let err3 = (&shared3 - &legacy3)
         .iter()
@@ -7161,7 +7161,7 @@ fn test_duchon_collision_operator_limits_matchphi_rr_identities() {
 
     let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
         duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
-            .expect("collision phi_rr");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "collision phi_rr", e));
 
     let eps = 2e-5_f64;
     let ls_plus = 1.0 / (kappa * eps.exp());
@@ -7170,10 +7170,10 @@ fn test_duchon_collision_operator_limits_matchphi_rr_identities() {
     let coeffs_minus = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls_minus);
     let (phi_rr_plus, _, _) =
         duchonphi_rr_collision_psi_triplet(ls_plus, p_order, s_order, k_dim, &coeffs_plus)
-            .expect("plus collision phi_rr");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "plus collision phi_rr", e));
     let (phi_rr_minus, _, _) =
         duchonphi_rr_collision_psi_triplet(ls_minus, p_order, s_order, k_dim, &coeffs_minus)
-            .expect("minus collision phi_rr");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "minus collision phi_rr", e));
     let phi_rr_psi_fd = (phi_rr_plus - phi_rr_minus) / (2.0 * eps);
     let phi_rr_psi_psi_fd = (phi_rr_plus - 2.0 * phi_rr + phi_rr_minus) / (eps * eps);
     assert!((phi_rr_psi - phi_rr_psi_fd).abs() < 1e-6);
@@ -7195,17 +7195,17 @@ fn test_duchon_collision_phi_rr_log_kappa_derivatives_even_log_branch_matchfd() 
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, kappa);
     let (phi_rr, phi_rr_psi, phi_rr_psi_psi) =
         duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
-            .expect("collision phi_rr triplet");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "collision phi_rr triplet", e));
 
     let eps = 2.0e-5_f64;
     let at = |psi_step: f64| -> f64 {
         let ls = 1.0 / (kappa * psi_step.exp());
         let coeffs_step = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / ls);
         duchonphi_rr_collision_psi_triplet(ls, p_order, s_order, k_dim, &coeffs_step)
-            .expect("collision phi_rr at perturbed kappa")
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "collision phi_rr at perturbed kappa")
             .0
     };
-    let plus = at(eps);
+    let plus = at(eps, e));
     let minus = at(-eps);
     let fd_first = (plus - minus) / (2.0 * eps);
     let fd_second = (plus - 2.0 * phi_rr + minus) / (eps * eps);
@@ -7230,15 +7230,15 @@ fn test_duchon_radial_jets_use_collision_limits_at_origin() {
     let length_scale = 0.85;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     let jets = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
-        .expect("jets at origin");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "jets at origin", e));
     let (phi_rr, _, _) =
         duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
-            .expect("collision phi_rr");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "collision phi_rr", e));
     let t_collision = duchon_phi_rrrr_collision(length_scale, p_order, s_order, k_dim, &coeffs)
-        .expect("collision phi''''")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "collision phi''''")
         / 3.0;
 
-    assert!(jets.phi_r.abs() < 1e-12);
+    assert!(jets.phi_r.abs() < 1e-12, e));
     assert!((jets.q - phi_rr).abs() < 1e-12);
     assert!((jets.lap - k_dim as f64 * phi_rr).abs() < 1e-12);
     assert!(jets.q_r.abs() < 1e-12);
@@ -7258,10 +7258,10 @@ fn test_duchon_radial_jets_use_lower_order_collision_limits_at_origin() {
     let length_scale = 0.85;
     let coeffs = duchon_partial_fraction_coeffs(p_order, s_order, 1.0 / length_scale);
     let jets = duchon_radial_jets(0.0, length_scale, p_order, s_order, k_dim, &coeffs)
-        .expect("jets at origin");
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "jets at origin", e));
     let (phi_rr, _, _) =
         duchonphi_rr_collision_psi_triplet(length_scale, p_order, s_order, k_dim, &coeffs)
-            .expect("collision phi_rr");
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "collision phi_rr", e));
 
     assert!(jets.phi_r.abs() < 1e-12);
     assert!((jets.q - phi_rr).abs() < 1e-12);
@@ -7281,7 +7281,7 @@ fn test_duchon_radial_jets_t_equals_phi_rr_minus_q_over_r2() {
 
     for &r in &[0.01, 0.1, 0.5, 1.0, 2.0] {
         let jets =
-            duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs).expect("jets");
+            duchon_radial_jets(r, length_scale, p_order, s_order, k_dim, &coeffs).unwrap_or_else(|e| panic!("{} failed: {:?}", "jets", e));
         let t_expected = (jets.phi_rr - jets.q) / (r * r);
         let rel = if t_expected.abs() > 1e-15 {
             ((jets.t - t_expected) / t_expected).abs()

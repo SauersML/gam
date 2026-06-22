@@ -19,9 +19,9 @@ use rand_distr::{Distribution, Normal, Uniform};
 
 fn make_dataset(n: usize) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(7);
-    let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
-    let u_lon = Uniform::new(-179.0_f64, 179.0).expect("uniform");
-    let noise = Normal::new(0.0, 0.05).expect("normal");
+    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
+    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
+    let noise = Normal::new(0.0, 0.05).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal", e));
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(n);
     for _ in 0..n {
@@ -37,12 +37,12 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
             y.to_string(),
         ]));
     }
-    encode_recordswith_inferred_schema(headers, rows).expect("encode")
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode")
 }
 
 #[test]
 fn sphere_m_sweep_lambda_diagnostic() {
-    init_parallelism();
+    init_parallelism(, e));
     let data = make_dataset(400);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -107,7 +107,7 @@ fn sphere_m_sweep_lambda_diagnostic() {
             design_input[[i, 1]] = *lon;
         }
         let design =
-            build_term_collection_design(design_input.view(), &fit.resolvedspec).expect("design");
+            build_term_collection_design(design_input.view(), &fit.resolvedspec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
         let pred = design.design.apply(&fit.fit.beta).to_vec();
         let mean_pred = pred.iter().sum::<f64>() / pred.len() as f64;
         let var_pred =
