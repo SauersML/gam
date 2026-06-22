@@ -1677,6 +1677,18 @@ data_path <- args[1]
 out_path <- args[2]
 train_idx_path <- args[3]
 test_idx_path <- args[4]
+# #1390: path to a compiled-Stan-model cache shared across the CV folds. The
+# model structure (formula, family, priors, sampler settings) is IDENTICAL for
+# every fold — only the training-data subset changes — so the Stan C++ model
+# only needs to be compiled once. On a GAMLSS-style location-scale fit with
+# several P-spline smooths that compilation dominates the per-fold wall-clock
+# on the small daily-demand panels, and re-paying it five times (once per fold
+# subprocess) is what pushed the serial CV past the shard budget. The first
+# fold compiles + samples and saves the fitted object here; later folds reload
+# it and `update(..., recompile = FALSE)` to RESAMPLE on their own fold's data
+# with the cached binary. This changes nothing statistical: same model, same
+# 4-chain/2000-iter/1000-warmup posterior, independent fresh sampling per fold.
+cache_path <- if (length(args) >= 5) args[5] else ""
 
 suppressPackageStartupMessages({
   library(brms)
@@ -1719,8 +1731,17 @@ brms_iter <- .env_int("BENCH_BRMS_ITER", 2000L)
 brms_warmup <- .env_int("BENCH_BRMS_WARMUP", 1000L)
 if (brms_warmup >= brms_iter) brms_warmup <- as.integer(brms_iter %/% 2L)
 
-t0 <- proc.time()[["elapsed"]]
-fit <- tryCatch(
+brms_cores <- min(4L, max(1L, parallel::detectCores(logical=FALSE)))
+brms_control <- list(adapt_delta = 0.95, max_treedepth = 12)
+
+# Reuse the compiled Stan model from an earlier fold when the cache is present,
+# so only the FIRST fold pays the Stan C++ compilation (#1390). `update(...,
+# recompile = FALSE)` keeps the cached executable and resamples on this fold's
+# `train_df`; every sampler setting is carried over from the cached fit, so the
+# posterior is identical to fitting from scratch. A failed/missing reload falls
+# back to a full `brm()` compile, so the cache is a pure speedup, never a
+# correctness dependency.
+fit_from_scratch <- function() {
   brm(
     formula = bf(as.formula(mu_formula), sigma = as.formula(sigma_formula)),
     data = train_df,
@@ -1728,15 +1749,53 @@ fit <- tryCatch(
     chains = brms_chains,
     iter = brms_iter,
     warmup = brms_warmup,
-    cores = min(4L, max(1L, parallel::detectCores(logical=FALSE))),
+    cores = brms_cores,
     seed = 123,
-    control = list(adapt_delta = 0.95, max_treedepth = 12),
+    control = brms_control,
     refresh = 0,
     silent = 2
-  ),
+  )
+}
+
+t0 <- proc.time()[["elapsed"]]
+cached_fit <- NULL
+if (nzchar(cache_path) && file.exists(cache_path)) {
+  cached_fit <- tryCatch(readRDS(cache_path), error = function(e) NULL)
+}
+fit <- tryCatch(
+  if (!is.null(cached_fit)) {
+    # Reuse the compiled model. If the cached executable cannot be reused for
+    # this fold (e.g. a P-spline basis dimension differs because the fold's
+    # training size shifted the data-dependent `k`), fall back to a fresh
+    # compile so the cache stays a pure speedup and never fails a fold.
+    tryCatch(
+      update(
+        cached_fit,
+        newdata = train_df,
+        recompile = FALSE,
+        chains = brms_chains,
+        iter = brms_iter,
+        warmup = brms_warmup,
+        cores = brms_cores,
+        seed = 123,
+        control = brms_control,
+        refresh = 0,
+        silent = 2
+      ),
+      error = function(e) fit_from_scratch()
+    )
+  } else {
+    fit_from_scratch()
+  },
   error = function(e) e
 )
 fit_sec <- proc.time()[["elapsed"]] - t0
+
+# Persist the compiled model for the remaining folds. Only write when we have a
+# real fit and the cache is not already populated (the first fold seeds it).
+if (!inherits(fit, "error") && nzchar(cache_path) && !file.exists(cache_path)) {
+  tryCatch(saveRDS(fit, cache_path), error = function(e) NULL)
+}
 
 if (inherits(fit, "error")) {
   out <- list(status="failed", error=paste0("r_brms fit failed: ", conditionMessage(fit)))
@@ -1804,6 +1863,13 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
 
         cv_rows = []
         plot_payload = _init_plot_payload(ds)
+        # #1390: a single compiled-Stan-model cache shared across all folds in
+        # this scenario. The first fold compiles + samples and writes its fitted
+        # brms object here; the rest reload it and `update(recompile=FALSE)`, so
+        # the expensive Stan C++ compilation is paid once instead of once per
+        # fold. It lives inside the shared `td`, so it is cleaned up with the
+        # workspace at the end of the scenario.
+        model_cache_path = td_path / "brms_model_cache.rds"
         for fold_id, fold in enumerate(folds):
             train_idx_path = td_path / f"train_idx_{fold_id}.txt"
             test_idx_path = td_path / f"test_idx_{fold_id}.txt"
@@ -1818,6 +1884,7 @@ write(toJSON(out, auto_unbox=TRUE, null="null"), file=out_path)
                     str(out_path),
                     str(train_idx_path),
                     str(test_idx_path),
+                    str(model_cache_path),
                 ],
                 cwd=ROOT,
                 timeout_sec=brms_fold_timeout if brms_fold_timeout > 0 else None,
