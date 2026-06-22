@@ -1243,9 +1243,22 @@ impl SurvivalLocationScaleFamily {
             }
             .into());
         }
+        // The time block's solver design stacks `[entry; exit; derivative_exit]`
+        // (see `prepare.rs`'s `MultiChannelOperator::new`), so the stacked time
+        // eta is laid out `[entry(0..n); exit(n..2n); deriv(2n..3n)]`. The first
+        // return slot is `h_entry`, the second is `h_exit` (gam#1396): a prior
+        // revision read the entry channel from `eta_time[n..2*n]` and the exit
+        // channel from `eta_time[0..n]`, transposing the two so the exit-time
+        // index was evaluated at the entry predictor and vice versa. That swap
+        // left the *value* path self-consistent (every consumer saw the same
+        // transposed pair) but mis-paired each index with its design Jacobian
+        // (`time_jac_entry`/`time_jac_exit`), so the time-block gradient/Hessian
+        // disagreed with a finite-difference of the likelihood whenever the
+        // entry and exit designs differ — and the structural-time monotonicity
+        // guard saw the wrong exit derivative.
         Ok((
-            eta_time.slice(s![n..2 * n]),
             eta_time.slice(s![0..n]),
+            eta_time.slice(s![n..2 * n]),
             eta_time.slice(s![2 * n..3 * n]),
             eta_t_exit,
             eta_ls_exit,

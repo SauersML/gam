@@ -464,10 +464,13 @@ fn survival_exact_newton_test_states(
     beta_ls: f64,
 ) -> Vec<ParameterBlockState> {
     let n = family.n;
+    // Stacked time eta layout is `[entry; exit; deriv]` (gam#1396): the entry
+    // channel occupies `0..n`, the exit channel `n..2n`, matching the solver
+    // design's `MultiChannelOperator` stacking and `validate_joint_states`.
     let mut eta_time = Array1::<f64>::zeros(3 * n);
     for i in 0..n {
-        eta_time[i] = family.x_time_exit[[i, 0]] * beta_t;
-        eta_time[n + i] = family.x_time_entry[[i, 0]] * beta_t;
+        eta_time[i] = family.x_time_entry[[i, 0]] * beta_t;
+        eta_time[n + i] = family.x_time_exit[[i, 0]] * beta_t;
         eta_time[2 * n + i] = family.x_time_deriv[[i, 0]] * beta_t;
     }
     let eta_thr =
@@ -1132,29 +1135,35 @@ fn survival_ls_joint_oracle_family(
 }
 
 /// Block states matching [`survival_ls_joint_oracle_family`]: every block
-/// coefficient is 1, and the eta vectors carry the stacked
-/// `[exit; entry; derivative]` layout `validate_joint_states` expects for
-/// time-varying blocks (the time block is always stacked).
+/// coefficient is 1, and the eta vectors carry the stacked layout
+/// `validate_joint_states` expects for time-varying blocks. The time block
+/// stacks `[entry; exit; derivative]` (matching the solver design's
+/// `MultiChannelOperator` order), while the threshold / log-sigma blocks stack
+/// `[exit; entry; derivative]` — exactly the conventions the production
+/// `prepare.rs` stacking and `validate_joint_states` slicing use (gam#1396).
 fn survival_ls_joint_oracle_states(primaries: &[[f64; SLS_ROW_K]]) -> Vec<ParameterBlockState> {
     let n = primaries.len();
-    let stacked = |exit: usize, entry: usize, deriv: usize| {
+    let stacked = |first: usize, second: usize, deriv: usize| {
         let mut eta = Array1::<f64>::zeros(3 * n);
         for i in 0..n {
-            eta[i] = primaries[i][exit];
-            eta[n + i] = primaries[i][entry];
+            eta[i] = primaries[i][first];
+            eta[n + i] = primaries[i][second];
             eta[2 * n + i] = primaries[i][deriv];
         }
         eta
     };
     vec![
+        // Time block: `[entry(ch0); exit(ch1); deriv(ch2)]`.
         ParameterBlockState {
             beta: array![1.0],
-            eta: stacked(1, 0, 2),
+            eta: stacked(0, 1, 2),
         },
+        // Threshold block: `[exit(ch3); entry(ch4); deriv(ch5)]`.
         ParameterBlockState {
             beta: array![1.0],
             eta: stacked(3, 4, 5),
         },
+        // Log-sigma block: `[exit(ch6); entry(ch7); deriv(ch8)]`.
         ParameterBlockState {
             beta: array![1.0],
             eta: stacked(6, 7, 8),
