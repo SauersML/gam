@@ -251,6 +251,57 @@ pub fn build_thin_plate_basiswithworkspace(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // #1476-class fix: rebuild the double-penalty null-space shrinkage ridge
+        // (`DoublePenaltyNullspace`) in the CONSTRAINED chart, exactly as the
+        // 1-D B-spline path does (`rebuild_double_penalty_nullspace_in_constrained_chart`)
+        // and as the tensor path now does after its identifiability restriction.
+        //
+        // The ridge above is `Z_null Z_nullᵀ` = the projector onto the null space
+        // of the RAW (pre-identifiability) bending penalty `penalty_bending` (its
+        // all-zero polynomial block), and it was then merely congruence-restricted
+        // to `Zᵀ Z_null Z_nullᵀ Z`. The thin-plate identifiability transform `Z`
+        // DROPS the constant polynomial column and is not norm-preserving, so the
+        // restricted matrix is neither idempotent nor aligned with the null space
+        // of the *constrained* bending penalty `Zᵀ S_bend Z` — it carries shrinkage
+        // mass onto penalized (kernel) directions. Rebuild the ridge from the null
+        // space of the restricted `Primary` bending penalty so the double penalty
+        // shrinks exactly the unpenalized polynomial subspace that survives the
+        // intercept-removal constraint.
+        if candidates
+            .iter()
+            .any(|c| matches!(c.source, PenaltySource::DoublePenaltyNullspace))
+        {
+            let constrained_bend = candidates
+                .iter()
+                .find(|c| matches!(c.source, PenaltySource::Primary))
+                .map(|c| c.matrix.clone());
+            if let Some(s_c) = constrained_bend {
+                let rebuilt = crate::terms::basis::build_nullspace_shrinkage_penalty(&s_c)?
+                    .map(|shrink| shrink.sym_penalty);
+                let p = s_c.nrows();
+                for candidate in &mut candidates {
+                    if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
+                        match &rebuilt {
+                            Some(ridge) => {
+                                let (matrix, scale) = normalize_penalty(ridge);
+                                candidate.matrix = matrix;
+                                candidate.normalization_scale = scale;
+                                candidate.kronecker_factors = None;
+                                candidate.op = None;
+                            }
+                            // Constrained bending penalty is full rank: no null
+                            // space to shrink. Zero the block; the filter drops it.
+                            None => {
+                                candidate.matrix = Array2::<f64>::zeros((p, p));
+                                candidate.normalization_scale = 1.0;
+                                candidate.kronecker_factors = None;
+                                candidate.op = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
@@ -356,6 +407,46 @@ pub(crate) fn thin_plate_penalties_at_length_scale(
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
+        // #1476-class fix (mirror of the cold build): rebuild the
+        // `DoublePenaltyNullspace` ridge from the null space of the restricted
+        // `Primary` bending penalty rather than carrying the raw-chart projector
+        // through the (non-norm-preserving, intercept-dropping) identifiability
+        // restriction. MUST match the cold `build_thin_plate_basiswithworkspace`
+        // path exactly so a frozen-geometry length-scale re-key (#1033) produces
+        // a byte-identical ridge to the original fit.
+        if candidates
+            .iter()
+            .any(|c| matches!(c.source, PenaltySource::DoublePenaltyNullspace))
+        {
+            let constrained_bend = candidates
+                .iter()
+                .find(|c| matches!(c.source, PenaltySource::Primary))
+                .map(|c| c.matrix.clone());
+            if let Some(s_c) = constrained_bend {
+                let rebuilt = crate::terms::basis::build_nullspace_shrinkage_penalty(&s_c)?
+                    .map(|shrink| shrink.sym_penalty);
+                let p = s_c.nrows();
+                for candidate in &mut candidates {
+                    if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
+                        match &rebuilt {
+                            Some(ridge) => {
+                                let (matrix, scale) = normalize_penalty(ridge);
+                                candidate.matrix = matrix;
+                                candidate.normalization_scale = scale;
+                                candidate.kronecker_factors = None;
+                                candidate.op = None;
+                            }
+                            None => {
+                                candidate.matrix = Array2::<f64>::zeros((p, p));
+                                candidate.normalization_scale = 1.0;
+                                candidate.kronecker_factors = None;
+                                candidate.op = None;
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     let (penalties, nullspace_dims, _info, _eig, _ops) =
         filter_active_penalty_candidates_with_ops(candidates)?;
