@@ -1,6 +1,6 @@
 use super::family::clamp_bernoulli_link_probability;
 use super::*;
-use crate::families::jet_tower::{Tower2, Tower4};
+use crate::families::jet_tower::Tower4;
 use crate::matrix::{LinearOperator, SignedWeightsView};
 
 pub(crate) fn standardize_latent_z_with_policy(
@@ -1651,51 +1651,6 @@ pub(super) fn rigid_standard_normal_towers_batch<T>(
     Ok(())
 }
 
-/// Second-order-only sibling of [`rigid_standard_normal_tower`].
-///
-/// The value/gradient/Hessian path (the inner joint-Newton solve and the
-/// value-only ρ-homotopy pre-warm) consumes ONLY `(v, g, h)`; it never reads
-/// the third/fourth tower tensors, which exist for the outer κ/ψ
-/// 3rd/4th-order calculus. Evaluating over [`Tower2`] instead of [`Tower4`]
-/// drops the `K⁴` fourth-tensor (and `K³` third-tensor) Leibniz/Faà-di-Bruno
-/// arithmetic that dominates the cold marginal-slope fit while returning the
-/// EXACT same `(v, g, h)`: the order-≤2 channels of both towers are computed
-/// by identical formulas that read only order-≤2 inputs (see [`Tower2`]).
-///
-/// The unary derivative stack is the same single source of truth
-/// ([`signed_probit_neglog_derivatives_up_to_fourth`]); only its first three
-/// entries (f, f′, f″) are needed for the Hessian, so the third/fourth
-/// entries are simply not consulted.
-#[inline]
-pub(crate) fn rigid_standard_normal_tower2(
-    marginal: BernoulliMarginalLinkMap,
-    g: f64,
-    z: f64,
-    y: f64,
-    w: f64,
-    probit_scale: f64,
-) -> Result<Tower2<2>, String> {
-    let mut q = Tower2::<2>::constant(marginal.q);
-    q.g[0] = marginal.q1;
-    q.h[0][0] = marginal.q2;
-    let slope = Tower2::<2>::variable(g, 1);
-    let observed_logslope = slope * probit_scale;
-    let c = (observed_logslope * observed_logslope + 1.0).sqrt();
-    let eta = q * c + slope * (probit_scale * z);
-    let signed = eta * (2.0 * y - 1.0);
-    // ONE transcendental per row (see `rigid_standard_normal_tower`): the fused
-    // stack shares a single Mills-ratio evaluation for logΦ and k1..k2. Tower2
-    // consumes only the first three entries, so the (exact) k3/k4 are dropped.
-    if !(signed.v.is_finite() || signed.v == f64::INFINITY) {
-        return Err(format!(
-            "non-finite signed margin in rigid probit tower2: {}",
-            signed.v
-        ));
-    }
-    let stack = signed_probit_neglog_unary_stack(signed.v, w);
-    Ok(signed.compose_unary([stack[0], stack[1], stack[2]]))
-}
-
 #[inline]
 pub(super) fn rigid_standard_normal_row_kernel(
     marginal: BernoulliMarginalLinkMap,
@@ -1705,8 +1660,23 @@ pub(super) fn rigid_standard_normal_row_kernel(
     w: f64,
     probit_scale: f64,
 ) -> Result<(f64, [f64; 2], [[f64; 2]; 2]), String> {
-    let tower = rigid_standard_normal_tower2(marginal, g, z, y, w, probit_scale)?;
-    Ok((tower.v, tower.g, tower.h))
+    // #932 cutover: value/gradient/Hessian derive from the SAME single generic
+    // row-NLL expression (`rigid_standard_normal_row_nll_generic`) every other
+    // channel consumer uses, routed through the `RowNllProgramGeneric` seam at the
+    // packed `Order2<2>` scalar — there is no longer a hand-assembled `Tower2<2>`
+    // here. Seeds `[marginal η, g]` exactly as the deleted inline form did, so it
+    // is bit-identical (the `rigid_bernoulli_*_agrees_with_jet_tower_program_all_channels`
+    // oracle pins v/g/H ≤ 1e-12), while sharing one definition with the third/
+    // fourth/full-tower channels.
+    let program = RigidStandardNormalRow {
+        marginal,
+        g,
+        z,
+        y,
+        w,
+        probit_scale,
+    };
+    crate::families::jet_tower::generic_row_kernel(&program, 0)
 }
 
 /// Mixed `(primary, z)` second derivative of the rigid standard-normal row
