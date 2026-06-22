@@ -2057,6 +2057,114 @@ fn survival_ls_time_varying_joint_hessian_tower_body() {
     }
 }
 
+/// #932: the production survival-LS log-likelihood block GRADIENT
+/// (`evaluate_log_likelihood_and_block_gradients` — the LIVE outer-Newton
+/// gradient path, since `row_kernel_joint_hessian_supported()` is `false`) must
+/// equal the single-sourced row-kernel gradient.
+///
+/// The joint Hessian is now pinned to the tower (the time-varying assembler
+/// oracle above + the #921 simple-shape oracle), and the gradient-vs-FD SAS
+/// test covers one link, but no exact oracle pinned the bespoke block gradient
+/// to `row_kernel_gradient` (built from the same `sls_row_nll` the Hessian uses)
+/// across distributions and the time-varying shape. `survival_joint_gradient
+/// _evaluation_matches_evaluate_block_gradients` only checks the bespoke path
+/// against itself.
+///
+/// `row_kernel_gradient` returns ∇(nll) = −∇ℓ (the cached per-row jets are of
+/// the negative log-likelihood, pulled back), while
+/// `evaluate_log_likelihood_and_block_gradients` returns the log-likelihood
+/// gradient ∇ℓ; both block orders are `[time, threshold, log_sigma]`
+/// (`block_gradients = vec![grad_time, grad_t, grad_ls]` and
+/// `joint_block_offsets`), so the flattened bespoke ∇ℓ must equal `−g_tower`
+/// to ~1e-9, for Gaussian / Gumbel / Logistic on the every-channel fixture. A
+/// dropped term in the hand block gradient now fails loudly.
+#[test]
+fn survival_ls_block_gradient_matches_single_sourced_tower_932() {
+    let join_result = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(survival_ls_block_gradient_tower_body)
+        .expect("spawn wide-stack gradient oracle thread")
+        .join();
+    assert!(
+        join_result.is_ok(),
+        "survival LS block-gradient-vs-tower oracle thread must complete"
+    );
+}
+
+fn survival_ls_block_gradient_tower_body() {
+    use crate::families::row_kernel::{RowSet, build_row_kernel_cache, row_kernel_gradient};
+
+    let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+        [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+        [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+        [-6.5, 5.6, 1.1, -0.7, -0.3, -0.15, 0.2, 0.4, 0.1],
+        [-1.0, -5.2, 0.7, 0.5, 0.6, 0.3, -0.1, -0.3, -0.25],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+    ];
+    let event = [1.0, 0.0, 1.0, 0.0, 1.0, 0.35];
+    let weight = [1.0, 0.8, 1.2, 0.9, 1.1, 1.3];
+
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let inverse_link = residual_distribution_inverse_link(distribution);
+        let family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+        let states = survival_ls_joint_oracle_states(&primaries);
+
+        // Single-sourced tower gradient (∇nll = −∇ℓ).
+        let q = family
+            .collect_joint_quantities(&states)
+            .expect("collect joint quantities");
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("dynamic geometry");
+        let kernel = SurvivalLsRowKernel {
+            family: &family,
+            q: &q,
+            dynamic: &dynamic,
+            deriv_log_scale: 0.0,
+            offsets: family.joint_block_offsets(),
+        };
+        let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("row kernel cache");
+        let g_tower_nll = row_kernel_gradient(&kernel, &cache, &RowSet::All);
+
+        // Bespoke production block gradients (∇ℓ), flattened in the joint
+        // [time, threshold, log_sigma] layout.
+        let (_ll, block_gradients) = family
+            .evaluate_log_likelihood_and_block_gradients(&states)
+            .expect("bespoke block gradients");
+        let offsets = family.joint_block_offsets();
+        let total = *offsets.last().unwrap();
+        let mut g_bespoke_ll = vec![0.0_f64; total];
+        let mut pos = 0usize;
+        for block in &block_gradients {
+            for &v in block.iter() {
+                g_bespoke_ll[pos] = v;
+                pos += 1;
+            }
+        }
+        assert_eq!(
+            pos, total,
+            "{distribution:?}: flattened bespoke gradient width {pos} != joint total {total}"
+        );
+        assert_eq!(g_tower_nll.len(), total, "{distribution:?}: tower gradient width");
+
+        // ∇ℓ_bespoke == −∇nll_tower.
+        for i in 0..total {
+            let bespoke = g_bespoke_ll[i];
+            let tower = -g_tower_nll[i];
+            assert!(
+                (bespoke - tower).abs() <= 1e-9 * (1.0 + tower.abs()),
+                "{distribution:?}: block gradient[{i}] bespoke ∇ℓ {bespoke:.9e} != \
+                 single-sourced −∇nll {tower:.9e}"
+            );
+        }
+    }
+}
+
 #[test]
 fn survival_location_scale_coefficient_cost_delegates_to_joint_coupled_helper() {
     // SurvivalLocationScale couples time, threshold, log-σ, and optional
