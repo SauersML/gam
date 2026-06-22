@@ -474,6 +474,7 @@ fn aniso_matern_recovery_ablation_measures_true_ceiling() {
         "dpen", "centers", "R2", "ss_res", "ss_tot", "eta0", "eta1", "ell", "amp_ratio"
     );
 
+    let mut direction: Vec<(bool, usize, f64, f64)> = Vec::new();
     for (double_penalty, num_centers) in configs {
         let rep = fit_aniso_recovery(double_penalty, num_centers);
         let eta0 = rep.eta.first().copied().unwrap_or(f64::NAN);
@@ -497,14 +498,19 @@ fn aniso_matern_recovery_ablation_measures_true_ceiling() {
             rep.eta.len() == 2 && rep.eta.iter().all(|v| v.is_finite()),
             "two finite eta contrasts expected"
         );
-        // The corrected κ-gradient must still point the signal axis tighter than
-        // the nuisance axis in EVERY config — config-robust anti-regression for
-        // the #1376 direction fix (independent of the amplitude/R² question).
+        direction.push((double_penalty, num_centers, eta0, eta1));
+    }
+    println!();
+    // The corrected κ-gradient must point the signal axis tighter than the
+    // nuisance axis in EVERY config — config-robust anti-regression for the
+    // #1376 direction fix. Checked AFTER the full table prints, so the
+    // discriminating (double_penalty=false) rows are always visible even when
+    // an earlier (double_penalty=true) config still fails.
+    for (double_penalty, num_centers, eta0, eta1) in direction {
         assert!(
             eta0 > eta1,
             "signal-axis eta ({eta0:.4}) must exceed nuisance-axis eta ({eta1:.4}) \
              for double_penalty={double_penalty}, centers={num_centers}"
         );
     }
-    println!();
 }
