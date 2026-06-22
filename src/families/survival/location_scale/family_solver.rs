@@ -1943,6 +1943,13 @@ pub fn survival_location_scale_block_effective_jacobian(
 // survival derivative algebra has produced the final row coefficient, preserving
 // the invariant E[Σ_i (mask_i / π_i) contribution_i] = full-data sum.
 impl CustomFamily for SurvivalLocationScaleFamily {
+    // Survival location-scale fits keep the self-limiting Jeffreys/Firth
+    // curvature active for their under-identification regime. The trait default
+    // flipped to OFF in gam#1395 (flat-prior exact-Newton objective); opt in.
+    fn joint_jeffreys_term_required(&self) -> bool {
+        true
+    }
+
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }

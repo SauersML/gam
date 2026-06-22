@@ -5849,6 +5849,13 @@ impl SpatialAdaptiveExactFamily {
 }
 
 impl CustomFamily for SpatialAdaptiveExactFamily {
+    // Preserve the pre-gam#1395 behavior: the trait default flipped to OFF (the
+    // flat-prior exact-Newton objective carries no Jeffreys term), so families
+    // that historically armed the term by default opt back in explicitly.
+    fn joint_jeffreys_term_required(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let beta = &expect_single_block_state(block_states, "spatial adaptive exact family")?.beta;
         let eval = self.exact_evaluation(beta)?;
@@ -6283,6 +6290,13 @@ impl BoundedLinearFamily {
 }
 
 impl CustomFamily for BoundedLinearFamily {
+    // Preserve the pre-gam#1395 behavior: the trait default flipped to OFF (the
+    // flat-prior exact-Newton objective carries no Jeffreys term), so families
+    // that historically armed the term by default opt back in explicitly.
+    fn joint_jeffreys_term_required(&self) -> bool {
+        true
+    }
+
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         let latent_beta = &expect_single_block_state(block_states, "bounded linear family")?.beta;
         let (obs, hessian, gradient, prior_loglik) = self.evaluation_from_latent(latent_beta)?;

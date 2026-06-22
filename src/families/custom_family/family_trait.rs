@@ -1028,25 +1028,28 @@ pub trait CustomFamily {
     /// Whether the family's inner/outer solves need the full-span Jeffreys
     /// curvature `H_Φ` and score `∇Φ`.
     ///
-    /// Default `true` to preserve the existing separation/near-singular
-    /// robustness on every family the term was historically armed for
-    /// (probit/binomial, GAMLSS location-scale, BMS, survival marginal-slope).
+    /// Default `false`: the documented exact-Newton outer objectives
+    /// (`RidgedQuadraticReml`: `−ℓ + penalty + ½(log|H| − log|S|)`,
+    /// `StrictPseudoLaplace`: `−ℓ + penalty + ½log|H|`) carry NO Jeffreys/Firth
+    /// prior term, so the analytic objective must NOT fold `−Φ(β̂)` (the Jeffreys
+    /// prior value) nor augment the inner mode with `−Φ`. Arming the term by
+    /// default made the analytic objective `−ℓ + penalty + ½log|H| − Φ` —
+    /// subtracting a spurious `Φ` and, when `H` depends on `β`, shifting the inner
+    /// mode `β̂` away from the un-augmented stationary point — so the exact-Newton
+    /// fixtures disagreed with their num-dual / closed-form references by exactly
+    /// that prior contribution (gam#1395). The reference objective is the
+    /// flat-prior LAML/REML the contracts above define, so the term is OFF unless
+    /// a family explicitly opts in.
     ///
-    /// A family overrides this to `false` when it has no
-    /// separation/under-identification regime by construction — the
-    /// canonical case is a continuous-response monotone-transformation
-    /// family like `TransformationNormalFamily`, where the Fisher information
-    /// is `O(n)` on every identified direction at every working point and
-    /// the Jeffreys gate would always smooth-step to zero anyway. There the
-    /// term is pure overhead: each evaluation runs `p` directional
-    /// derivatives of the joint Hessian (`O(n·p²)` per call for the SCOP
-    /// directional derivative), called multiple times per inner cycle and
-    /// once per outer evaluation. At large scale (`p=144`, `n=20000`) the
-    /// overhead is the dominant per-cycle cost and exhausts the CI budget
-    /// long before the inner Newton converges, while contributing
-    /// essentially zero to the converged gradient and curvature.
+    /// A family overrides this to `true` when it has a genuine
+    /// separation / under-identification regime and wants the self-limiting
+    /// Jeffreys/Firth curvature to bound the coefficient there (probit/binomial,
+    /// GAMLSS binomial/location-scale, BMS, survival marginal-slope). In the
+    /// well-identified regime the conditioning gate smooth-steps the term to zero
+    /// anyway (`λ_min = O(n) ≫ 1`), so opting in costs nothing on clean fits and
+    /// only activates near separation — exactly where the robustness is needed.
     fn joint_jeffreys_term_required(&self) -> bool {
-        true
+        false
     }
 
     /// Optional Tier-B Jeffreys information matrix.

@@ -6,6 +6,15 @@
 use super::*;
 
 impl CustomFamily for SurvivalMarginalSlopeFamily {
+    // Survival marginal-slope fits have a genuine under-identification regime
+    // (near-collinear clustered-PC trends), so opt into the self-limiting
+    // Jeffreys/Firth curvature. The trait default flipped to OFF in gam#1395
+    // (the flat-prior exact-Newton objective carries no Jeffreys term); families
+    // with a real separation/under-identification regime opt in.
+    fn joint_jeffreys_term_required(&self) -> bool {
+        true
+    }
+
     /// #808: engage the inner self-vanishing Levenberg–Marquardt μ on a
     /// full-rank-but-ill-conditioned penalized Hessian. Clustered-PC marginal +
     /// log-slope share a matern PC basis → `H_pen` is full rank (`nullity == 0`)
