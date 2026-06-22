@@ -164,3 +164,100 @@ fn resident_design_gram_matches_per_call_or_declines() {
         }
     }
 }
+
+/// #1017 Phase 3 (Gram-resident POTRF chaining): the resident normal-equations
+/// solve `(XᵀWX + ridge·I)β = rhs` must match a host Cholesky solve of the same
+/// system (up to reduction-order roundoff) when a device is present, keeping the
+/// p×p Gram on-device and crossing back only the p-vector β. On a CPU host the
+/// handle declines (returns None at `try_new`). Device-agnostic.
+#[test]
+fn resident_normal_equations_matches_host_solve_or_declines() {
+    let n = 4096usize;
+    let p = 64usize; // small p keeps the host reference solve quick
+    let x = Array2::from_shape_fn((n, p), |(i, j)| {
+        0.05 * ((i as f64 + 1.0) * 0.013 + (j as f64 + 1.0) * 0.021).sin()
+    });
+    let w = Array1::from_shape_fn(n, |i| 0.5 + ((i as f64 + 1.0) * 0.017).sin().abs());
+    let rhs = Array1::from_shape_fn(p, |j| ((j as f64 + 1.0) * 0.03).cos());
+    let ridge = 1e-3;
+
+    if let Some(handle) = ResidentDesignGram::try_new(x.view()) {
+        let beta = handle
+            .solve_normal_equations(w.view(), rhs.view(), ridge)
+            .expect("resident normal-equations solve on device");
+        assert_eq!(beta.len(), p);
+
+        // Host reference: G = XᵀWX + ridge·I, then solve G β = rhs by Gaussian
+        // elimination (independent of the device Cholesky path).
+        let mut g = Array2::<f64>::zeros((p, p));
+        for a in 0..p {
+            for b in 0..p {
+                let mut acc = 0.0;
+                for r in 0..n {
+                    acc += x[[r, a]] * w[r] * x[[r, b]];
+                }
+                g[[a, b]] = acc;
+            }
+            g[[a, a]] += ridge;
+        }
+        let beta_ref = solve_spd_host(&g, &rhs);
+        let mut max_diff = 0.0_f64;
+        for (a, b) in beta.iter().zip(beta_ref.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        let scale = 1.0 + beta_ref.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            max_diff < 1e-6 * scale,
+            "resident β differs from host solve by {max_diff:e} (scale {scale})"
+        );
+
+        // Shape guards: wrong-length w or rhs is rejected.
+        assert!(handle
+            .solve_normal_equations(Array1::zeros(n + 1).view(), rhs.view(), ridge)
+            .is_none());
+        assert!(handle
+            .solve_normal_equations(w.view(), Array1::zeros(p + 1).view(), ridge)
+            .is_none());
+    }
+    // CPU-only host: try_new returned None; nothing to assert beyond the clean
+    // decline already covered by the gram test.
+}
+
+/// Dense SPD solve `A x = b` by Cholesky (lower) + forward/back substitution —
+/// a self-contained host reference independent of the device path.
+fn solve_spd_host(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {
+    let n = a.nrows();
+    let mut l = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..=i {
+            let mut s = a[[i, j]];
+            for k in 0..j {
+                s -= l[[i, k]] * l[[j, k]];
+            }
+            if i == j {
+                l[[i, j]] = s.max(0.0).sqrt();
+            } else {
+                l[[i, j]] = s / l[[j, j]];
+            }
+        }
+    }
+    // Forward: L y = b.
+    let mut y = Array1::<f64>::zeros(n);
+    for i in 0..n {
+        let mut s = b[i];
+        for k in 0..i {
+            s -= l[[i, k]] * y[k];
+        }
+        y[i] = s / l[[i, i]];
+    }
+    // Back: Lᵀ x = y.
+    let mut x = Array1::<f64>::zeros(n);
+    for i in (0..n).rev() {
+        let mut s = y[i];
+        for k in (i + 1)..n {
+            s -= l[[k, i]] * x[k];
+        }
+        x[i] = s / l[[i, i]];
+    }
+    x
+}

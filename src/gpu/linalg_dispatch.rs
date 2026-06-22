@@ -535,6 +535,39 @@ impl ResidentDesignGram {
         }
     }
 
+    /// Solve the penalized normal equations `(Xᵀ·diag(w)·X + ridge·I)·β = rhs`
+    /// with the Gram, its Cholesky factor, and the RHS all kept DEVICE-RESIDENT —
+    /// only `w` (`n`), `rhs` (`p`), and the solution `β` (`p`) cross the bus.
+    ///
+    /// This is the #1017 Phase-3 fix for the next ceiling after [`Self::gram`]:
+    /// the bare Gram still pays a `p×p` D2H (134 MB at p=4096), but the SAE/IRLS
+    /// inner step only needs `β`, so chaining row-scale→GEMM→POTRF→TRSM on-device
+    /// and returning only the `p`-vector removes that transfer entirely. Returns
+    /// `None` on a shape mismatch, a non-PD Gram, or any device failure — the
+    /// caller then runs the CPU normal-equations solve. The numerics match a
+    /// host `Cholesky((XᵀWX+ridge·I))` solve up to IEEE-754 reduction order.
+    #[must_use]
+    pub fn solve_normal_equations(
+        &self,
+        w: ArrayView1<'_, f64>,
+        rhs: ArrayView1<'_, f64>,
+        ridge: f64,
+    ) -> Option<Array1<f64>> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            // SAFETY: statically unreachable off CUDA (see `gram`); fail loudly.
+            panic!(
+                "ResidentDesignGram cannot be constructed off CUDA (w.len()={}, rhs.len()={}, ridge={ridge})",
+                w.len(),
+                rhs.len()
+            )
+        }
+        #[cfg(target_os = "linux")]
+        {
+            self.inner.solve_psd_normal_equations(w, rhs, ridge)
+        }
+    }
+
     /// `(n, p)` of the resident design.
     #[must_use]
     pub fn dims(&self) -> (usize, usize) {
