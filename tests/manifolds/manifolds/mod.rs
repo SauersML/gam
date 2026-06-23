@@ -10,7 +10,7 @@ mod sphere_constant_truth_flat_fit;
 mod sphere_degenerate_data_robust;
 mod sphere_exp_map_vjp_matches_finite_difference;
 mod sphere_harmonic_default_degree;
-mod sphere_harmonic_large_L_stability;
+mod sphere_harmonic_large_l_stability;
 mod sphere_high_freq_truth_robust;
 mod sphere_integration;
 mod sphere_invalid_lat_handling;
