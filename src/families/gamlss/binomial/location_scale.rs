@@ -2260,13 +2260,6 @@ impl BinomialLocationScaleFamily {
 }
 
 impl CustomFamily for BinomialLocationScaleFamily {
-    // Binomial fits have a genuine separation regime; keep the self-limiting
-    // Jeffreys/Firth curvature active. The trait default flipped to OFF in
-    // gam#1395 (flat-prior exact-Newton objective); opt back in here.
-    fn joint_jeffreys_term_required(&self) -> bool {
-        true
-    }
-
     /// The Binomial location-scale joint Hessian depends on β because the
     /// Hessian blocks are functions of q = -t/σ and the link derivatives,
     /// all of which change when β_t or β_{log σ} move.

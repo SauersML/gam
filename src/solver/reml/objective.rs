@@ -969,7 +969,6 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
-        force_spectral_logdet: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         use super::reml_outer_engine::{
             DenseCholeskyValueOnlyOperator, DenseSpectralOperator, PseudoLogdetMode,
@@ -1030,31 +1029,13 @@ impl<'a> RemlState<'a> {
         // here would make cost-only line-search / FD probes evaluate a
         // different scalar from the value+gradient path (#901).
         //
-        // #1376: the Cholesky fast path returns the EXACT log-determinant
-        // `Σ ln σ_j`, while the gradient path's `DenseSpectralOperator` returns
-        // the smooth-floored `Σ ln r_ε(σ_j)` and differentiates exactly THAT
-        // floored object via `tr(G_ε Ḣ)`. The two agree only when every σ_j is
-        // safely above the stability floor ε. A design-moving ψ coordinate (the
-        // Matérn/Duchon log-κ axis) under the default double-penalty drives the
-        // projected-kernel shrinkage block's near-null eigenvalues of
-        // `H = XᵀWX + Sλ` down toward ε, so the exact and floored log-dets — and
-        // hence their κ-derivatives — diverge. The outer FD audit then central-
-        // differences the EXACT-logdet ValueOnly cost while the analytic gradient
-        // reports the FLOORED-logdet derivative: an objective↔gradient DESYNC
-        // (analytic ≠ FD on `psi_kappa[..]`, the headline #1376 symptom). Gate the
-        // Cholesky fast path off whenever the outer vector carries a design-moving
-        // ψ coordinate, so value and gradient share ONE smooth-floored `log|H|`.
-        // Pure-ρ (penalty-only) fits keep the LLT speedup: their drifts live in
-        // `range(Sλ)`, the floored/exact logdets and their ρ-derivatives match,
-        // and there is no design-moving axis to desync. The caller passes
-        // `force_spectral_logdet = true` exactly when the outer vector carries a
-        // design-moving ψ coordinate.
+        // If LLT fails (near-singular Hessian), fall through to the spectral
+        // operator so the soft-floor regularization can handle it.
         let hessian_op: std::sync::Arc<dyn super::reml_outer_engine::HessianOperator> = if mode
             == super::reml_outer_engine::EvalMode::ValueOnly
             && matches!(hessian_mode, PseudoLogdetMode::Smooth)
             && free_basis_opt.is_none()
             && !c_nontrivial
-            && !force_spectral_logdet
         {
             match DenseCholeskyValueOnlyOperator::from_spd(h_for_operator.as_ref()) {
                 Ok(chol_op) => std::sync::Arc::new(chol_op),
@@ -1326,7 +1307,6 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
-        force_spectral_logdet: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         use super::reml_outer_engine::{DenseSpectralOperator, PseudoLogdetMode};
 
@@ -1447,7 +1427,6 @@ impl<'a> RemlState<'a> {
             if mode == super::reml_outer_engine::EvalMode::ValueOnly
                 && matches!(hessian_mode, PseudoLogdetMode::Smooth)
                 && !c_nontrivial
-                && !force_spectral_logdet
             {
                 match DenseCholeskyValueOnlyOperator::from_spd(&h_total_original) {
                     Ok(chol_op) => std::sync::Arc::new(chol_op),
@@ -1655,13 +1634,8 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         mode: super::reml_outer_engine::EvalMode,
-        force_spectral_logdet: bool,
     ) -> Result<super::assembly::InnerAssembly<'static>, EstimationError> {
         if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
-            // Sparse-exact `log|H|` is Cholesky-derived and its gradient traces
-            // are paired against the SAME exact factorization, so there is no
-            // floored-vs-exact desync to suppress here (#1376 affects only the
-            // dense smooth-floored spectral gradient paths).
             return self.build_sparse_assembly(rho, bundle, mode);
         }
         // The original-basis dense path keeps β, the Hessian operator, the GLM
@@ -1678,7 +1652,7 @@ impl<'a> RemlState<'a> {
             .active_constraint_free_basis(bundle.pirls_result.as_ref())
             .is_none();
         if unconstrained_qs_frame {
-            self.build_dense_original_assembly(rho, bundle, mode, force_spectral_logdet)
+            self.build_dense_original_assembly(rho, bundle, mode)
         } else {
             // Reached for the transformed-QS active-set branch (where
             // `free_basis_opt` rotates into a reduced subspace) or a non-QS
@@ -1688,7 +1662,7 @@ impl<'a> RemlState<'a> {
                 "[reml-assembly] build_dense_assembly path \
                  (transformed-QS active-set, or non-QS frame)"
             );
-            self.build_dense_assembly(rho, bundle, mode, force_spectral_logdet)
+            self.build_dense_assembly(rho, bundle, mode)
         }
     }
 
@@ -2470,9 +2444,7 @@ impl<'a> RemlState<'a> {
         // `TransformedQs` fits through `build_dense_original_assembly`, which
         // maps β and H back to the original basis so every ingredient agrees
         // with the canonical-penalty coordinate frame.
-        // No design-moving ψ on this bridge (pure-ρ cost/gradient): the LLT
-        // value-only fast path stays eligible.
-        let assembly = self.build_auto_assembly(rho, bundle, mode, false)?;
+        let assembly = self.build_auto_assembly(rho, bundle, mode)?;
         self.assemble_and_evaluate(rho, bundle, mode, assembly)
     }
 
@@ -2496,17 +2468,10 @@ impl<'a> RemlState<'a> {
     ) -> Result<super::reml_outer_engine::RemlLamlResult, EstimationError> {
         assert!(synthetic_ext_count > 0);
         let mode = super::reml_outer_engine::EvalMode::ValueOnly;
-        // #1376: a synthetic ext count is installed only when the outer vector
-        // carries design-moving ψ coordinates (the Matérn/Duchon log-κ / aniso
-        // axes whose value-only probes must dimension-match the gradient path).
-        // Force the smooth-floored spectral `log|H|` here so this value-only
-        // probe evaluates the SAME floored determinant the gradient path
-        // differentiates — otherwise the LLT fast path's exact `Σ ln σ` desyncs
-        // from the analytic `tr(G_ε Ḣ)` on the ψ block (the headline #1376 gap).
         let mut assembly = if force_sparse {
             self.build_sparse_assembly(rho, bundle, mode)?
         } else {
-            self.build_auto_assembly(rho, bundle, mode, true)?
+            self.build_auto_assembly(rho, bundle, mode)?
         };
         let p_dim = assembly.beta.len();
         assembly.ext_coords = (0..synthetic_ext_count)
@@ -2598,12 +2563,7 @@ impl<'a> RemlState<'a> {
         };
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = std::time::Instant::now();
-        // #1376: when this evaluation carries a design-moving ψ coordinate
-        // (e.g. the Matérn/Duchon log-κ axis), force the smooth-floored spectral
-        // `log|H|` even on a value-only probe so the cost matches the floored
-        // determinant the gradient path differentiates via `tr(G_ε Ḣ)`.
-        let force_spectral_logdet = ext_coords.iter().any(|c| !c.is_penalty_like);
-        let mut assembly = self.build_auto_assembly(rho, &bundle, mode, force_spectral_logdet)?;
+        let mut assembly = self.build_auto_assembly(rho, &bundle, mode)?;
         assembly.ext_coords = ext_coords;
         assembly.ext_coord_pair_fn = ext_pair_fn;
         assembly.rho_ext_pair_fn = rho_ext_pair_fn;
@@ -3212,11 +3172,7 @@ impl<'a> RemlState<'a> {
         // no active constraints).  See `rotate_link_ext_coords_to_original`.
         self.rotate_link_ext_coords_to_original(&bundle, &mut ext_coords)?;
 
-        // #1376: a non-empty ext block here means a value-only probe must agree
-        // with the gradient path's smooth-floored `log|H|`; force the spectral
-        // logdet so the LLT exact-determinant fast path cannot desync the cost.
-        let force_spectral_logdet = ext_coords.iter().any(|c| !c.is_penalty_like);
-        let mut assembly = self.build_auto_assembly(rho, &bundle, mode, force_spectral_logdet)?;
+        let mut assembly = self.build_auto_assembly(rho, &bundle, mode)?;
         let ext_dim = ext_coords.len();
         let p_dim = ext_coords.first().map(|coord| coord.g.len()).unwrap_or(0);
         assembly.ext_coords = ext_coords;
@@ -3279,17 +3235,8 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         ext_coords: Vec<super::reml_outer_engine::HyperCoord>,
     ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
-        // #1376: force the smooth-floored spectral `log|H|` whenever a
-        // design-moving ψ ext coordinate is present so the value matches the
-        // gradient path's floored determinant (the LLT exact-`Σ ln σ` fast path
-        // desyncs from `tr(G_ε Ḣ)` on the ψ block otherwise).
-        let force_spectral_logdet = ext_coords.iter().any(|c| !c.is_penalty_like);
-        let mut assembly = self.build_auto_assembly(
-            rho,
-            bundle,
-            super::reml_outer_engine::EvalMode::ValueOnly,
-            force_spectral_logdet,
-        )?;
+        let mut assembly =
+            self.build_auto_assembly(rho, bundle, super::reml_outer_engine::EvalMode::ValueOnly)?;
         assembly.ext_coords = ext_coords;
         self.assemble_and_evaluate_efs(rho, bundle, assembly)
     }

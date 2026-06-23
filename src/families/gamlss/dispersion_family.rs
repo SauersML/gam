@@ -473,13 +473,6 @@ impl DispersionGlmLocationScaleFamily {
 }
 
 impl CustomFamily for DispersionGlmLocationScaleFamily {
-    // Preserve the pre-gam#1395 behavior: the trait default flipped to OFF (the
-    // flat-prior exact-Newton objective carries no Jeffreys term), so families
-    // that historically armed the term by default opt back in explicitly.
-    fn joint_jeffreys_term_required(&self) -> bool {
-        true
-    }
-
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         validate_block_count::<GamlssError>(self.kind.family_tag(), 2, block_states.len())?;
         let eta_mu = &block_states[Self::BLOCK_MEAN].eta;

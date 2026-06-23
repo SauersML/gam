@@ -306,14 +306,9 @@ pub fn reml_laml_evaluate(
         // directions excluded from the cost's pseudo-logdet before the
         // inverse is applied — the same threshold for value and correction —
         // recovering the honest correction.
-        // IFT mode response `w = H⁻¹ r` (full-rank) or `K r` (projected
-        // pseudo-inverse). Shared between the inner-objective residual energy
-        // `−½ rᵀ w` and the moving-Hessian log-det response below.
-        let mut polish_step_for_warm_start: Option<Array1<f64>> = None;
-        let (w, cost_correction, branch) =
+        let (cost_correction, branch) =
             if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
-                let w = kernel.apply_pseudo_inverse(r);
-                (w, -0.5_f64 * kernel.bilinear_pseudo_inverse(r, r), "projected")
+                (-0.5_f64 * kernel.bilinear_pseudo_inverse(r, r), "projected")
             } else {
                 // Full-H IFT mode response `w = H⁻¹ r`. The cached
                 // `DenseSpectralOperator` (materialized once for `log_det_h`
@@ -329,54 +324,9 @@ pub fn reml_laml_evaluate(
                 // gradient kernel's `solve_multi`).
                 let w = hop.solve(r);
                 let cost_correction = -0.5_f64 * r.view().dot(&w);
-                polish_step_for_warm_start = Some(w.clone());
-                (w, cost_correction, "full_h")
+                inner_polish_step = Some(w);
+                (cost_correction, "full_h")
             };
-        // MOVING-HESSIAN LOG-DET RESPONSE (gam#1395). The outer criterion
-        // `V(β) = −ℓ(β) + ½βᵀSβ + ½log|H(β)+S| − ½log|S|` has the β-gradient
-        // `∇_βV = r + g_ld`, where `r = ∇_β(−ℓ+½βᵀSβ)` is the inner KKT residual
-        // and `g_ld_j = ½ tr((H+S)⁻¹ ∂_{β_j}(H+S))` is the β-gradient of the
-        // Laplace log-det term. When the family's joint Hessian depends on β
-        // (`hessian_derivative_correction` non-`None`), the second-order
-        // Taylor expansion of `V` about the inner-returned β̂ at the exact mode
-        // `β* = β̂ − H⁻¹r` is
-        //   V(β*) − V(β̂) ≈ −½ rᵀH⁻¹r − g_ldᵀH⁻¹r,
-        // so the bare `−½ rᵀH⁻¹r` energy omits `−g_ldᵀ w` (w = H⁻¹r). Using
-        // `g_ldᵀ w = ½ tr((H+S)⁻¹ D_βH[w])` (linearity of the directional
-        // derivative), the missing term is `−½ tr((H+S)⁻¹ D_βH[w])`, evaluated
-        // through the SAME inverse/pseudo-inverse the residual energy used so the
-        // value stays consistent. For a β-independent Hessian (Gaussian,
-        // `hessian_derivative_correction → None`) the term is exactly zero and
-        // the released path is byte-unchanged; it only activates on a β-dependent
-        // curvature evaluated at a non-stationary β̂ (loose inner solve), exactly
-        // the regime gam#1395's `requires_joint_stationarity` fixture pins.
-        //
-        // SIGN: `hessian_derivative_correction(v)` returns the moving-Hessian
-        // part of `∂H/∂ρ_k` at the mode response `v_k = H⁻¹(A_kβ̂)`, i.e.
-        // `D_βH[∂β̂/∂ρ_k] = D_βH[−v_k] = −D_βH[v_k]`. Called with `w` it returns
-        // `−D_βH[w]`, so `D_βH[w] = −correction` and the missing term
-        // `−½ tr(H⁻¹ D_βH[w]) = +½ tr(H⁻¹ · correction)`.
-        let moving_hessian_logdet_response =
-            match solution.deriv_provider.hessian_derivative_correction(&w) {
-                Ok(Some(d_beta_h)) => {
-                    let trace = match solution.penalty_subspace_trace.as_ref() {
-                        Some(kernel) => kernel.trace_projected_logdet(&d_beta_h),
-                        None => hop.trace_hinv_product(&d_beta_h),
-                    };
-                    0.5_f64 * trace
-                }
-                Ok(None) => 0.0,
-                Err(reason) => {
-                    return Err(RemlError::ContractViolation {
-                        reason: format!(
-                            "moving-Hessian IFT log-det response (gam#1395) failed: {reason}"
-                        ),
-                    }
-                    .into());
-                }
-            };
-        let cost_correction = cost_correction + moving_hessian_logdet_response;
-        inner_polish_step = polish_step_for_warm_start;
         let residual_energy = -cost_correction;
         log::info!(
             "[IFT-ENERGY] residual_energy={:.3e} cost_correction={:.3e} branch={}",

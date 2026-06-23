@@ -1943,13 +1943,6 @@ pub fn survival_location_scale_block_effective_jacobian(
 // survival derivative algebra has produced the final row coefficient, preserving
 // the invariant E[Σ_i (mask_i / π_i) contribution_i] = full-data sum.
 impl CustomFamily for SurvivalLocationScaleFamily {
-    // Survival location-scale fits keep the self-limiting Jeffreys/Firth
-    // curvature active for their under-identification regime. The trait default
-    // flipped to OFF in gam#1395 (flat-prior exact-Newton objective); opt in.
-    fn joint_jeffreys_term_required(&self) -> bool {
-        true
-    }
-
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }
@@ -2334,6 +2327,156 @@ impl CustomFamily for SurvivalLocationScaleFamily {
 
     fn has_explicit_joint_hessian(&self) -> bool {
         true
+    }
+
+    /// BATCHED all-axes first beta-directional derivative of the joint Jeffreys
+    /// information — the #1389/#979 survival location-scale outer-gradient hot
+    /// path. The `CustomFamily` default (`family_trait.rs`) fans the `p`
+    /// canonical unit axes across Rayon and calls
+    /// `joint_jeffreys_information_directional_derivative_with_specs` once per
+    /// axis. For this family that delegates to
+    /// [`Self::exact_newton_joint_hessian_directional_derivative`], whose
+    /// `_rescaled` entry rebuilds the FULL `O(n)` per-row joint quantities
+    /// (`collect_joint_quantities_rescaled`) AND the dynamic time geometry
+    /// (`build_dynamic_geometry`) on EVERY axis — a `p`-fold redundant full-data
+    /// sweep that NONE of the `p` directions actually depend on. With the
+    /// biobank/ICU `n` and a non-trivial joint `p`, that `p·O(n)` rebuild per
+    /// arms-the-gate outer-gradient cycle is the dominant wall-clock cost behind
+    /// the reported "hang" (steady CPU, no inner-PIRLS stage line). Memory:
+    /// `#1389 LS RSS-hang … per-axis p-fold sweep`.
+    ///
+    /// The fix builds `q` and `dynamic` ONCE and reuses them across all axes:
+    ///
+    ///   * Rigid / time-varying-channel layout WITHOUT link-wiggle
+    ///     (`row_kernel_directional_supported()`): dispatch through the shared
+    ///     build-once batched row-kernel API
+    ///     (`row_kernel_directional_derivative_all_axes`), which constructs the
+    ///     `SurvivalLsRowKernel` once and closes every axis from it (the same
+    ///     single-source the bespoke `_from_parts_masked` row-kernel branch uses
+    ///     for one direction), bit-identical to the per-axis sweep up to the
+    ///     cross-row reduction order.
+    ///   * FLEX moving-boundary (link-wiggle present): the row design is
+    ///     β-dependent so it stays on the bespoke hand-assembler, but each axis
+    ///     now runs through `_from_parts_masked` against the SINGLE prebuilt
+    ///     `q`/`dynamic` instead of recomputing them — collapsing the `p` full
+    ///     joint-quantity rebuilds to one while keeping the exact per-axis math.
+    ///
+    /// Returns `None` (matching the per-axis hook's first-`None` collapse) only
+    /// when the family declines the exact derivative; here it always exposes it,
+    /// so any axis yielding `None` is propagated as `None` for the whole batch.
+    fn joint_jeffreys_information_directional_derivative_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        let p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        let log_rescale = self.hessian_deriv_log_rescale(block_states);
+        // Build the β̂-fixed per-row joint quantities + dynamic time geometry
+        // ONCE — these are shared by every canonical axis and are the `p`-fold
+        // redundant cost the default per-axis sweep pays.
+        let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+
+        if self.row_kernel_directional_supported() {
+            // No link-wiggle: the coefficient→primary Jacobian is fixed, so the
+            // batched row-kernel API builds the kernel once and closes all axes.
+            let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_rescale);
+            let rows = crate::families::row_kernel::RowSet::All;
+            let axes = crate::families::row_kernel::row_kernel_directional_derivative_all_axes(
+                &kernel, &rows,
+            )?;
+            return Ok(Some(axes));
+        }
+
+        // FLEX (link-wiggle) path: β-dependent row design keeps the bespoke
+        // assembler, but reuse the single `q`/`dynamic` across the axis sweep.
+        use rayon::iter::{IntoParallelIterator, ParallelIterator};
+        let results: Vec<Result<Option<Array2<f64>>, String>> = (0..p)
+            .into_par_iter()
+            .map(|axis_idx| {
+                let mut axis = Array1::<f64>::zeros(p);
+                axis[axis_idx] = 1.0;
+                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                    self.exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
+                        &axis,
+                        &q,
+                        &dynamic,
+                        log_rescale,
+                    )
+                })
+            })
+            .collect();
+
+        let mut axes = Vec::with_capacity(p);
+        for result in results {
+            match result? {
+                Some(matrix) => axes.push(matrix),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(axes))
+    }
+
+    /// BATCHED all-axes second beta-directional derivative — the companion of
+    /// the first-directional override above for the Jeffreys `H_Φ` drift's
+    /// second-order completion. The `CustomFamily` default calls
+    /// [`Self::exact_newton_joint_hessiansecond_directional_derivative`] once per
+    /// canonical axis; that delegate (1) returns `None` for the link-wiggle
+    /// (FLEX) layout, so its all-axes batch is gated out wholesale, and (2) for
+    /// the non-wiggle layout rebuilds the `O(n)` joint quantities, dynamic
+    /// geometry, AND row kernel on EVERY axis — the same `p`-fold redundant
+    /// full-data rebuild the first-directional hot path pays (#979/#1389). This
+    /// override builds `q`/`dynamic`/`kernel` ONCE and closes every second axis
+    /// from it via the shared batched row-kernel API, bit-identical to the
+    /// per-axis sweep up to the cross-row reduction order.
+    fn joint_jeffreys_information_second_directional_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        // Link-wiggle (FLEX) declines the exact second directional derivative on
+        // the per-axis hook (returns `None`); preserve that first-`None` collapse.
+        if !self.row_kernel_directional_supported() {
+            return Ok(None);
+        }
+        let p_total = *self
+            .joint_block_offsets()
+            .last()
+            .ok_or_else(|| "missing joint block offsets".to_string())?;
+        // The flattened coefficient layout must agree with the joint block
+        // offsets; a spec total that disagrees is a caller-contract violation
+        // (the same total the per-axis default sizes its axes from).
+        let p_specs = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        if p_specs != p_total {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "joint Hessian second directional all-axes spec width {p_specs} disagrees with joint block total {p_total}",
+                ),
+            }
+            .into());
+        }
+        if d_beta_u_flat.len() != p_total {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "joint Hessian second directional all-axes u length mismatch: got {}, expected {p_total}",
+                    d_beta_u_flat.len()
+                ),
+            }
+            .into());
+        }
+        let log_rescale = self.hessian_deriv_log_rescale(block_states);
+        let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_rescale);
+        let axes = crate::families::row_kernel::row_kernel_second_directional_derivative_all_axes(
+            &kernel,
+            &crate::families::row_kernel::RowSet::All,
+            d_beta_u_flat
+                .as_slice()
+                .ok_or_else(|| "joint second directional u must be contiguous".to_string())?,
+        )?;
+        Ok(Some(axes))
     }
 
     fn exact_newton_outer_curvature(

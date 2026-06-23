@@ -4035,13 +4035,6 @@ type LatentSurvivalHessianWorkspace = LatentHessianWorkspace<LatentSurvivalFamil
 type LatentBinaryHessianWorkspace = LatentHessianWorkspace<LatentBinaryFamily>;
 
 impl CustomFamily for LatentSurvivalFamily {
-    // Latent survival fits keep the self-limiting Jeffreys/Firth curvature
-    // active for their under-identification regime. The trait default flipped to
-    // OFF in gam#1395 (flat-prior exact-Newton objective); opt back in here.
-    fn joint_jeffreys_term_required(&self) -> bool {
-        true
-    }
-
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }
@@ -4211,13 +4204,6 @@ impl CustomFamily for LatentSurvivalFamily {
 }
 
 impl CustomFamily for LatentBinaryFamily {
-    // Latent binary fits have a separation regime; keep the self-limiting
-    // Jeffreys/Firth curvature active. The trait default flipped to OFF in
-    // gam#1395 (flat-prior exact-Newton objective); opt back in here.
-    fn joint_jeffreys_term_required(&self) -> bool {
-        true
-    }
-
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }

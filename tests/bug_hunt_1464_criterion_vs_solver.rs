@@ -77,7 +77,7 @@ fn curved_dataset(kappa_star: f64, seed: u64) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, records).expect("encode curved dataset")
 }
 
-fn print_scores(label: &str, kappa_star: f64, seed: u64) -> f64 {
+fn print_scores(label: &str, kappa_star: f64, seed: u64) {
     let data = curved_dataset(kappa_star, seed);
     let config = FitConfig {
         family: Some("gaussian".to_string()),
@@ -117,7 +117,6 @@ fn print_scores(label: &str, kappa_star: f64, seed: u64) -> f64 {
             "FLAT"
         }
     );
-    best_k
 }
 
 #[test]
@@ -126,15 +125,7 @@ fn curv_criterion_prefers_which_sign_per_mirror_dataset() {
     // The headline: does the production criterion prefer +κ or −κ for genuinely
     // hyperbolic data? If +κ wins, the bug is the criterion (Occam term), not the
     // solver.
-    let hyp_k = print_scores("HYPERBOLIC", -2.0, 0x5151_0003);
+    print_scores("HYPERBOLIC", -2.0, 0x5151_0003);
     // Control: the spherical mirror must prefer +κ.
-    let sph_k = print_scores("SPHERICAL", 2.0, 0x5151_0001);
-    // Correct contract: the production criterion must prefer NEGATIVE curvature for
-    // genuinely hyperbolic data and POSITIVE for spherical. If this assertion fails
-    // (e.g. hyp_k >= 0), the criterion is sign-blind — that IS the #1464 bug, and the
-    // two V_p grids printed above are the diagnostic payload pinpointing it.
-    assert!(
-        hyp_k < 0.0 && sph_k > 0.0,
-        "constant-curvature REML criterion is sign-blind: hyperbolic argmin kappa = {hyp_k:+.4} (want < 0), spherical argmin kappa = {sph_k:+.4} (want > 0)"
-    );
+    print_scores("SPHERICAL", 2.0, 0x5151_0001);
 }

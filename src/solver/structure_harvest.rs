@@ -52,13 +52,13 @@ use crate::solver::structure_search::{
 };
 use crate::solver::{
     AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, TopologyScoreScale,
-    select_topology_with_fit,
+    select_topology_with_fit_parallel,
 };
 use crate::terms::latent::{LatentIdMode, LatentManifold};
 use crate::terms::sae::atom_codes::SparseAtomCodes;
 use crate::terms::sae::basis::{
     CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
-    SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
+    SaeBasisEvaluator, SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
 };
 use crate::terms::sae::manifold::{
     SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
@@ -1300,7 +1300,7 @@ fn race_birth_topology(
             by_kind.insert(AutoTopologyKind::ConstantCurvature, euclid);
         }
     }
-    let ranked = select_topology_with_fit(&selector, |kind| {
+    let ranked = select_topology_with_fit_parallel(&selector, |kind| {
         let spec = by_kind.get(&kind).ok_or_else(|| {
             format!(
                 "race_birth_topology: no realized candidate for fused topology {:?}",

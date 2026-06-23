@@ -63,26 +63,18 @@ const SANCTIONED_FD_FILES: &[&str] = &[
     "main/run_sample_generate_report.rs",   // copies certificate fields into the report
     "terms/sae/certificates.rs",            // SAE analogue of the audit certificate
     // ── Tracked REDUCIBLE production FD (NOT theoretically irreducible) ──
-    // These two were re-challenged under #1440. Neither is theoretically
-    // irreducible; both are listed only so the lint stays green while the analytic
-    // substitution is staged by the owning agent. Do NOT cite them as evidence
-    // that production FD is unavoidable.
+    // Listed only so the lint stays green while the analytic substitution is
+    // staged by the owning agent. Do NOT cite it as evidence that production FD is
+    // unavoidable.
     //
-    // (1) Geodesic-acceleration curvature probe, `(g(β+hδp)+g(β−hδp)−2g(β))/h²`
-    //     (Transtrum-Sethna). This is the directional SECOND derivative of the
-    //     gradient `(D²g)[δp,δp]` — a single double-contraction, NOT the full
-    //     third-order tensor — which equals `Σᵢ e_obs_i·(Xδp)_i²·xᵢ` + a
-    //     Gauss-Newton cross term, all O(n·p). The exact per-observation third
-    //     derivative `e_obs_from_jets` already exists in `pirls/curvature.rs`
-    //     (closed-form, currently dormant). MOREOVER the block is dead in
-    //     production: `options.geodesic_acceleration` is constructed `false` at
-    //     every call site and is never set `true` anywhere (incl. tests), so the
-    //     `if options.geodesic_acceleration { … }` guard is never entered. The
-    //     correct #1440 disposition is to DELETE the dead block (and its unused
-    //     flag plumbing) — not to sanction it as irreducible. Tracked here pending
-    //     that removal (solver-owner decision on whether to keep the flag).
-    "solver/pirls/reweight.rs",
-    // (2) SAE sphere-boost Gauss-Newton chart Jacobian. The residual is
+    // (The geodesic-acceleration curvature probe in `pirls/reweight.rs` was the
+    // other tracked entry. It was dead in production — gated on
+    // `options.geodesic_acceleration`, which is constructed `false` at every call
+    // site and never set `true` anywhere — so the `if options.geodesic_acceleration
+    // { … }` block was deleted (#1440). `reweight.rs` now carries no FD and is no
+    // longer listed.)
+    //
+    // SAE sphere-boost Gauss-Newton chart Jacobian. The residual is
     //     `r(θ) = svec(ÃᵀÃ − s·Ĝ)`; its θ-Jacobian is the closed-form chain rule
     //     `∂(ÃᵀÃ)/∂θ_k = (∂Ã/∂θ_k)ᵀÃ + Ãᵀ(∂Ã/∂θ_k)`, and `∂Ã/∂θ` is the known
     //     sphere-boost transform derivative composed with the moved-latitude cos
@@ -583,12 +575,16 @@ fn sanctioned_fd_allowlist_membership_is_correct() {
     assert!(fd_ok_markers_allowed(Path::new(
         "/Users/anyone/gam/src/solver/rho_optimizer/run.rs"
     )));
-    // The two genuinely-irreducible production FDs (geodesic-acceleration curvature
-    // probe; SAE sphere-boost GN chart Jacobian) ARE allowlisted, so they are
-    // tracked here rather than hidden behind off-allowlist per-line markers.
-    assert!(fd_ok_markers_allowed(Path::new(
+    // (#1440) The geodesic-acceleration FD block in `pirls/reweight.rs` was dead
+    // (gated on `options.geodesic_acceleration`, constructed `false` everywhere and
+    // never set `true`); it was deleted, so `reweight.rs` carries no FD and is NOT
+    // allowlisted.
+    assert!(!fd_ok_markers_allowed(Path::new(
         "src/solver/pirls/reweight.rs"
     )));
+    // The one remaining tracked production FD (SAE sphere-boost GN chart Jacobian)
+    // IS allowlisted, so it is tracked here rather than hidden behind an
+    // off-allowlist per-line marker.
     assert!(fd_ok_markers_allowed(Path::new(
         "src/terms/sae/chart_canonicalization.rs"
     )));

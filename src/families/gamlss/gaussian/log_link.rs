@@ -161,13 +161,6 @@ impl LogLinkDiagonalIrlsFamily for PoissonLogFamily {
 }
 
 impl CustomFamily for PoissonLogFamily {
-    // Preserve the pre-gam#1395 behavior: the trait default flipped to OFF (the
-    // flat-prior exact-Newton objective carries no Jeffreys term), so families
-    // that historically armed the term by default opt back in explicitly.
-    fn joint_jeffreys_term_required(&self) -> bool {
-        true
-    }
-
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         evaluate_log_link_diagonal_irls(self, block_states)
     }
@@ -271,13 +264,6 @@ impl LogLinkDiagonalIrlsFamily for GammaLogFamily {
 }
 
 impl CustomFamily for GammaLogFamily {
-    // Preserve the pre-gam#1395 behavior: the trait default flipped to OFF (the
-    // flat-prior exact-Newton objective carries no Jeffreys term), so families
-    // that historically armed the term by default opt back in explicitly.
-    fn joint_jeffreys_term_required(&self) -> bool {
-        true
-    }
-
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         evaluate_log_link_diagonal_irls(self, block_states)
     }

@@ -906,54 +906,18 @@ pub(crate) fn try_tangent_projected_evaluate(
     let z = match compute_active_constraint_tangent_basis(&block.a) {
         Some(z) => z,
         None => {
-            // Constraint matrix spans the full p-space — the tangent manifold is
-            // the single point {β̂}: β̂ is fully pinned by the active set and has
-            // NO mode response to ρ. The exact-Newton outer objective is still
-            // well-defined — it is the fixed-β̂ Laplace/REML criterion
-            //   V(ρ) = −ℓ(β̂) + ½ β̂ᵀS(λ)β̂ + ½ log|H + S(λ)| − ½ log|S(λ)|₊
-            // evaluated at the frozen β̂, with the gradient carrying ONLY the
-            // explicit ρ-dependence (no `∂β̂/∂ρ` mode response, since β̂ cannot
-            // move). The references in the constrained fixtures compute exactly
-            // this (full unconstrained-curvature Laplace term at the clamped β̂),
-            // so rather than refuse the evaluation, re-dispatch to the standard
-            // evaluator with the active set cleared (no tangent projection — the
-            // Laplace term stays on the full curvature `H + S(λ)`) and the IFT
-            // mode response suppressed: dropping the KKT residual freezes β̂ (the
-            // envelope correction `−½rᵀH⁻¹r` and the per-coordinate mode-response
-            // gradient both vanish), leaving the explicit fixed-β̂ ρ-derivative
-            // the reference expects (gam#1395).
-            let frozen = InnerSolution {
-                log_likelihood: solution.log_likelihood,
-                penalty_quadratic: solution.penalty_quadratic,
-                hessian_op: Arc::clone(&solution.hessian_op),
-                beta: solution.beta.clone(),
-                penalty_coords: solution.penalty_coords.clone(),
-                penalty_logdet: solution.penalty_logdet.clone(),
-                deriv_provider: Box::new(BorrowedDerivProvider(solution.deriv_provider.as_ref())),
-                firth: solution.firth.clone(),
-                hessian_logdet_correction: solution.hessian_logdet_correction,
-                penalty_subspace_trace: solution.penalty_subspace_trace.clone(),
-                rho_curvature_scale: solution.rho_curvature_scale,
-                rho_prior: solution.rho_prior.clone(),
-                n_observations: solution.n_observations,
-                nullspace_dim: solution.nullspace_dim,
-                gaussian_weight_log_sum_half: solution.gaussian_weight_log_sum_half,
-                dp_floor_scale: solution.dp_floor_scale,
-                dispersion: solution.dispersion.clone(),
-                ext_coords: solution.ext_coords.clone(),
-                ext_coord_pair_fn: None,
-                rho_ext_pair_fn: None,
-                contracted_psi_second_order: None,
-                fixed_drift_deriv: None,
-                barrier_config: solution.barrier_config.clone(),
-                // β̂ frozen: no IFT mode response.
-                kkt_residual: None,
-                // Prevents recursion via `try_tangent_projected_evaluate`.
-                active_constraints: None,
-                stochastic_trace_state: solution.stochastic_trace_state.clone(),
-            };
-            let result = reml_laml_evaluate(&frozen, rho, mode, prior_cost_gradient)?;
-            return Ok(Some(result));
+            // Constraint matrix spans the full p-space — tangent manifold is
+            // {β̂}. There is no degree of freedom left to optimise over and
+            // the outer LAML cost is the constant `-ℓ(β̂) + ½ β̂ᵀSβ̂`. We
+            // can return a degenerate result, but it's simpler and clearer
+            // to surface the situation.
+            return Err(format!(
+                "active constraint matrix has rank {} on {}-dim space; \
+                 tangent manifold is a single point ({{β̂}}), no outer \
+                 derivative is defined",
+                block.a.nrows(),
+                p
+            ));
         }
     };
     let h_full = solution

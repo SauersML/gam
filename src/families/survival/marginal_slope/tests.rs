@@ -2583,6 +2583,7 @@ fn flex_directional_second_derivative_fd_localizer() {
     );
 }
 
+<<<<<<< Updated upstream
 /// gam#1454 FOURTH-order (bidirectional) localizer. Mirrors the directional
 /// localizer one tier up: the bidirectional second-directional timepoint
 /// quantities `eta_uv_uv`/`chi_uv_uv`/`d_uv_uv` = D_dir1 D_dir2 (eta_uv etc.)
@@ -3118,6 +3119,8 @@ fn flex_base_hessian_gw0_per_timepoint_matches_gradient_fd() {
     }
 }
 
+=======
+>>>>>>> Stashed changes
 /// gam#932/#979: the logslope first-sensitivity must include the Leibniz
 /// boundary term for density-normalization cells whose link-knot crossings move
 /// with g.

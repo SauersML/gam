@@ -27,8 +27,11 @@
 //! (`fd_ok_markers_are_confined_to_the_allowlist`): a non-test file that uses an
 //! `fd-ok` marker but is not allowlisted is itself a violation. The allowlist is
 //! populated with every sanctioned FD (audit oracle/certificate machinery, the
-//! genuinely-irreducible geodesic probe and SAE chart Jacobian, and the tracked
-//! reducible survival-pilot FD debt), each with a written justification.
+//! geodesic probe and SAE chart Jacobian, and the tracked reducible survival-pilot
+//! FD debt), each with a written justification. (The survival-pilot FD and the
+//! geodesic probe have since been removed — the former replaced by its closed-form
+//! `c_derivatives` chain, the latter deleted as dead code — leaving only the SAE
+//! chart Jacobian and the diagnostic FD-audit machinery on the allowlist.)
 //!
 //! ## What this test guards
 //!
@@ -88,7 +91,9 @@ fn scanner_keeps_a_tracked_allowlist_constant() {
 #[test]
 fn known_sanctioned_fd_sites_stay_enumerated() {
     for site in [
-        "solver/pirls/reweight.rs",            // geodesic-acceleration curvature probe
+        // (`solver/pirls/reweight.rs` held the geodesic-acceleration curvature
+        // probe; that block was dead in production and was deleted under #1440, so
+        // the file no longer carries FD and is no longer enumerated.)
         "terms/sae/chart_canonicalization.rs", // SAE sphere-boost GN chart Jacobian
         "solver/rho_optimizer/fd_audit.rs",    // FD-audit oracle (diagnostic only)
     ] {

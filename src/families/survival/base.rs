@@ -382,13 +382,6 @@ fn evaluate_cause_specific_block(
 }
 
 impl CustomFamily for CauseSpecificRoystonParmarFamily {
-    // Preserve the pre-gam#1395 behavior: the trait default flipped to OFF (the
-    // flat-prior exact-Newton objective carries no Jeffreys term), so families
-    // that historically armed the term by default opt back in explicitly.
-    fn joint_jeffreys_term_required(&self) -> bool {
-        true
-    }
-
     fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
         crate::families::block_layout::block_count::validate_block_count::<SurvivalError>(
             "cause-specific survival",

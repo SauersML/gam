@@ -9,15 +9,6 @@ use super::row_kernel::*;
 use super::*;
 
 impl CustomFamily for BernoulliMarginalSlopeFamily {
-    // Bernoulli marginal-slope fits have a genuine separation regime
-    // (near-perfectly-classified rows), so opt into the self-limiting
-    // Jeffreys/Firth curvature that bounds the coefficient there. The trait
-    // default flipped to OFF in gam#1395 (the flat-prior exact-Newton objective
-    // carries no Jeffreys term); families with a real separation regime opt in.
-    fn joint_jeffreys_term_required(&self) -> bool {
-        true
-    }
-
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }
