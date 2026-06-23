@@ -203,10 +203,13 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline() {
 /// Source CSV (no auth, direct download):
 ///   https://vincentarelbundock.github.io/Rdatasets/csv/datasets/quakes.csv
 ///
-///   PRIMARY (objective, tool-free): held-out `test_R2 >= 0.15` — the bare
-///     spatial surface still explains held-out magnitude variance well above
-///     the constant-mean predictor (R2 = 0). The bar is slightly below the
-///     full-model arm because dropping the depth term removes signal.
+///   PRIMARY (objective): the bare spatial surface must be informative
+///     (held-out `R2 > 0`, i.e. beats the constant-mean predictor) AND recover
+///     held-out magnitude variance at least as well as the mature reference
+///     (`gam_R2 >= mgcv_R2 - 0.02`). An absolute `R2 >= 0.15` is NOT used here:
+///     the earthquake-location → magnitude signal is genuinely weak and mgcv
+///     itself only reaches `R2 ~ 0.08`, so a fixed absolute bar would measure
+///     the data, not gam.
 ///
 ///   BASELINE (match-or-beat): mgcv fits the SAME `mag ~ s(long, lat, bs="tp")`
 ///     on the SAME training rows and predicts the SAME held-out rows; gam's
