@@ -1483,6 +1483,98 @@ mod moment_engine_tests {
                 + 0.5 * pack.dc_dabb[k] * db * db
         })
     }
+
+    /// #932 item-2 Phase C: `cell_coeff_jets` must reproduce the hand cell-coeff
+    /// total θ-derivatives `c_k(a(θ), θ)` value + gradient (the `eta_u_poly =
+    /// dc_da·a_u + coeff_u` / `coeff_bu·db` structure) vs a central FD of the
+    /// scalar multivariate Taylor along a smooth `(a, {θ_u})` family. p=3 with the
+    /// g-slope at axis 1.
+    #[test]
+    fn cell_coeff_jets_value_and_grad_932() {
+        let p = 3usize;
+        let g_axis = 1usize;
+        let base_c = [0.2_f64, -0.3, 0.15, 0.05];
+        // Minimal but fully-populated fixed pack (per-primary length p).
+        let mk_run = |seed: f64| -> Vec<[f64; 4]> {
+            (0..p)
+                .map(|u| std::array::from_fn(|k| seed * (1.0 + u as f64) * (1.0 + k as f64) * 0.01))
+                .collect()
+        };
+        let fixed = DenestedCellPrimaryFixedPartials {
+            dc_da: [1.1, 0.2, 0.03, 0.0],
+            dc_daa: [0.07, 0.02, 0.0, 0.0],
+            dc_daaa: [0.003, 0.0, 0.0, 0.0],
+            coeff_u: mk_run(0.9),
+            coeff_au: mk_run(0.4),
+            coeff_bu: mk_run(0.5),
+            coeff_aau: mk_run(0.12),
+            coeff_abu: mk_run(0.16),
+            coeff_bbu: mk_run(0.11),
+            coeff_aaau: mk_run(0.02),
+            coeff_aabu: mk_run(0.03),
+            coeff_abbu: mk_run(0.04),
+            coeff_bbbu: mk_run(0.05),
+        };
+        // Smooth family θ: a(θ)=a0+θ·a_u, θ_u(θ)=u0[u]+θ·v[u].
+        let a0 = 0.3_f64;
+        let a_u = 0.25_f64;
+        let v = [0.2_f64, -0.4, 0.33];
+
+        let seeded = |x: f64, vel: f64| {
+            let g = vec![vel];
+            Jet2::from_parts(x, &g, &[])
+        };
+        let a_jet = seeded(a0, a_u);
+        let da = tangent_jet(&a_jet);
+        // du[u] = value-0 tangent carrying velocity v[u] in slot 0.
+        let du: Vec<Jet2> = (0..p).map(|u| seeded(0.0, v[u])).collect();
+        let jets = cell_coeff_jets(&a_jet, base_c, &fixed, g_axis, &da, &du);
+
+        // Scalar reference: c_k(da, {du}) via the same Taylor.
+        let scalar_c = |theta: f64| -> [f64; 4] {
+            let da = a_u * theta;
+            let db = v[g_axis] * theta;
+            std::array::from_fn(|k| {
+                let mut acc = base_c[k]
+                    + fixed.dc_da[k] * da
+                    + 0.5 * fixed.dc_daa[k] * da * da
+                    + fixed.dc_daaa[k] * da * da * da / 6.0;
+                for u in 0..p {
+                    let duu = v[u] * theta;
+                    acc += fixed.coeff_u[u][k] * duu
+                        + fixed.coeff_au[u][k] * da * duu
+                        + 0.5 * fixed.coeff_aau[u][k] * da * da * duu
+                        + fixed.coeff_bu[u][k] * db * duu
+                        + fixed.coeff_abu[u][k] * da * db * duu
+                        + 0.5 * fixed.coeff_bbu[u][k] * db * db * duu
+                        + fixed.coeff_aaau[u][k] * da * da * da * duu / 6.0
+                        + 0.5 * fixed.coeff_aabu[u][k] * da * da * db * duu
+                        + 0.5 * fixed.coeff_abbu[u][k] * da * db * db * duu
+                        + fixed.coeff_bbbu[u][k] * db * db * db * duu / 6.0;
+                }
+                acc
+            })
+        };
+        let h = 1e-6_f64;
+        let c0 = scalar_c(0.0);
+        let cp = scalar_c(h);
+        let cm = scalar_c(-h);
+        for k in 0..4 {
+            assert!(
+                (jets[k].value() - c0[k]).abs() <= 1e-12 * (1.0 + c0[k].abs()),
+                "c_{k} value {} != {}",
+                jets[k].value(),
+                c0[k]
+            );
+            let fd = (cp[k] - cm[k]) / (2.0 * h);
+            assert!(
+                (jets[k].g[0] - fd).abs() <= 1e-5 * (1.0 + fd.abs()),
+                "c_{k} grad {} != FD {}",
+                jets[k].g[0],
+                fd
+            );
+        }
+    }
 }
 
 // ── §C: observed cell-coefficient jets + eta/chi point-eval (Phase C core) ──
@@ -1550,6 +1642,71 @@ fn observed_coeff_component_jet<J: FlexJet>(
         .add(&dadb.mul(db).scale(half * dc_dabb[k]))
         .add(&dbdb.mul(db).scale(inv6 * dc_dbbb[k]));
     c
+}
+
+/// The per-cell de-nested coefficient `c_k` (k = 0..4) as a jet, built from the
+/// cell's `DenestedCellPrimaryFixedPartials` pack composed with the intercept
+/// perturbation `da = tangent(a_jet)` and the per-primary perturbations
+/// `du[u] = tangent(primary_u)`. This is the cell analogue of
+/// `observed_coeff_component_jet`, carrying ALL primaries (not just a,b): it is
+/// the multivariate Taylor of `c_k(a, {θ_u})` whose cross-partials are the pack
+/// fields. Matches the hand `eta_u_poly`/`eta_uv_poly`/`chi_*` assembly in
+/// `first_full`/`directional`/`bidirectional` term for term — the FlexJet algebra
+/// raises it to the contracted third/fourth automatically.
+///
+/// Taylor structure (per k, `g_axis` = the slope `b` primary):
+///   c = c0
+///     + dc_da·da + ½dc_daa·da² + ⅙dc_daaa·da³                       (pure a)
+///     + Σ_u coeff_u[u]·du                                           (pure u, lin)
+///     + Σ_u coeff_au[u]·da·du + ½Σ_u coeff_aau[u]·da²·du            (a×u)
+///     + Σ_u coeff_bu[u]·db·du + Σ_u coeff_abu[u]·da·db·du           (b×u)
+///       + ½Σ_u coeff_bbu[u]·db²·du
+///     + ⅙Σ_u coeff_aaau[u]·da³·du + ½Σ_u coeff_aabu[u]·da²·db·du    (3rd in a/b ×u)
+///       + ½Σ_u coeff_abbu[u]·da·db²·du + ⅙Σ_u coeff_bbbu[u]·db³·du
+/// where `db = du[g_axis]` (the slope perturbation). The `coeff_u`-family terms
+/// are LINEAR in `du` (each cell coefficient is at most linear in any single
+/// non-a/non-b primary), so no `du²` term is needed beyond the b-channel ones.
+fn cell_coeff_jets<J: FlexJet>(
+    template: &J,
+    base_c: [f64; 4],
+    fixed: &DenestedCellPrimaryFixedPartials,
+    g_axis: usize,
+    da: &J,
+    du: &[J],
+) -> [J; 4] {
+    let p = du.len();
+    let dada = da.mul(da);
+    let dadada = dada.mul(da);
+    let db = &du[g_axis];
+    let dadb = da.mul(db);
+    let dbdb = db.mul(db);
+    std::array::from_fn(|k| {
+        let mut c = const_jet_like(template, base_c[k]);
+        // Pure-a chain.
+        c = c
+            .add(&da.scale(fixed.dc_da[k]))
+            .add(&dada.scale(0.5 * fixed.dc_daa[k]))
+            .add(&dadada.scale(fixed.dc_daaa[k] / 6.0));
+        // Per-primary chains (linear in du[u]).
+        for u in 0..p {
+            let duu = &du[u];
+            let mut chain = duu.scale(fixed.coeff_u[u][k]);
+            chain = chain
+                .add(&da.mul(duu).scale(fixed.coeff_au[u][k]))
+                .add(&dada.mul(duu).scale(0.5 * fixed.coeff_aau[u][k]));
+            chain = chain
+                .add(&db.mul(duu).scale(fixed.coeff_bu[u][k]))
+                .add(&dadb.mul(duu).scale(fixed.coeff_abu[u][k]))
+                .add(&dbdb.mul(duu).scale(0.5 * fixed.coeff_bbu[u][k]));
+            chain = chain
+                .add(&dadada.mul(duu).scale(fixed.coeff_aaau[u][k] / 6.0))
+                .add(&dada.mul(db).mul(duu).scale(0.5 * fixed.coeff_aabu[u][k]))
+                .add(&dadb.mul(db).mul(duu).scale(0.5 * fixed.coeff_abbu[u][k]))
+                .add(&dbdb.mul(db).mul(duu).scale(fixed.coeff_bbbu[u][k] / 6.0));
+            c = c.add(&chain);
+        }
+        c
+    })
 }
 
 /// Evaluate a 4-coefficient cell polynomial jet `Σ_k coeff_jet[k]·z^k` at the
