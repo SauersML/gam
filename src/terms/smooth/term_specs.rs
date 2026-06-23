@@ -3434,28 +3434,22 @@ const KERNEL_RANGE_MAX_SPACING_MULTIPLE: f64 = 1e2;
 /// Matérn-only ceiling on the kernel length scale, as a fraction of the maximum
 /// pairwise distance `r_max` (i.e. the data diameter in the standardized kernel
 /// space). This bounds the largest correlation range the isotropic-κ outer
-/// optimizer may reach, so that κ may sharpen the kernel but cannot wander into
-/// the fully-flat corner where every kernel column collapses onto the polynomial
-/// nullspace and REML shrinks the smooth onto its intercept (#1357).
+/// optimizer (dimension > 1) may reach.
 ///
-/// #1074: the previous value (0.15) was far too aggressive. ψ = log κ =
-/// −log(length_scale), so this fraction is a *hard* upper bound on the kernel
-/// correlation range — and for any smooth field whose true correlation length
-/// exceeds `frac · r_max` the REML κ-optimizer is pinned at the cap and cannot
-/// reach the smoother kernel that fits the field, so gam systematically
-/// over-smooths (matern_smooth, matern_varying_nu, r_fields_mkriging, gpyto_gp,
-/// r_gpgp all under-recovered by ~1.3×). At 0.15 the cap coincided with the
-/// default *init* (`DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION`), so init and
-/// ceiling were identical and the optimizer could never move the range upward.
-/// Relaxed to `0.5`, which matches the generic diameter floor
-/// `KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max` (= `r_max / 2`) that Duchon / TPS
-/// already use without degenerating. The #1357 collapse corner is still guarded —
-/// but by the dedicated EDF-collapse guard in `spatial_optimization.rs` (which
-/// detects EDF → null and reverts to the frozen baseline geometry at the
-/// informative default length scale), not by this hard range clamp. That guard
-/// catches a genuine collapse at any length scale; this clamp was redundant
-/// belt-and-suspenders that also blocked legitimate long ranges.
-const MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.5;
+/// #1074: mgcv's `bs="gp"` default correlation range is the FULL data diameter
+/// (`gp.defn` range = max inter-point distance ≈ `r_max`), and matching that
+/// range is what aligns gam's Matérn recovery with mgcv (edf ≈ 14, not the
+/// over-flexed ≈ 28 a shorter range produces). So the Matérn optimizer must be
+/// allowed to reach `r_max`. This ceiling therefore sits ABOVE `r_max` (1.5×) so
+/// mgcv's range is a comfortably interior optimum, and — unlike the generic
+/// `r_max/2` floor used for TPS/Duchon nullspace conditioning — it OVERRIDES that
+/// floor for Matérn (see `spatial_term_psi_bounds`): the generic floor would
+/// pin the Matérn kernel to a wigglier-than-mgcv range. The #1357 fully-flat
+/// collapse corner is guarded separately by the EDF-collapse guard in
+/// `spatial_optimization.rs` (detects EDF → null, reverts to the frozen baseline
+/// geometry), which fires at any length scale — so this clamp need not be the
+/// collapse backstop, only a generous upper bound.
+const MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 1.5;
 
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
 ///
@@ -3528,18 +3522,18 @@ fn spatial_term_psi_bounds(
     // optimizer enter a numerically degenerate basis geometry.
     let mut psi_lo_data = (KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max).ln();
     let psi_hi_data = (KERNEL_RANGE_MAX_SPACING_MULTIPLE / r_min).ln();
-    // #1074: cap the Matérn isotropic-κ length scale at `frac · r_max`. ψ =
-    // log κ = −log(length_scale), so the largest admissible length scale is the
-    // smallest admissible ψ; raise that floor to `1 / (frac · r_max)`. At
-    // frac = 0.5 this coincides with the generic floor `2 / r_max` (length scales
-    // up to `r_max / 2`) that Duchon / TPS already use, so the Matérn kernel may
-    // now reach the longer correlation ranges these spatial fields need instead
-    // of being pinned at the old 0.15 init/ceiling. The #1357 flat-corner collapse
-    // is guarded separately by the EDF-collapse guard in spatial_optimization.rs.
+    // #1074: for the Matérn kernel, OVERRIDE the generic `r_max/2` lower-ψ floor
+    // (set above for TPS/Duchon nullspace conditioning) with a Matérn-specific
+    // floor that admits length scales up to `frac · r_max` (frac = 1.5). ψ =
+    // log κ = −log(length_scale), so a SMALLER ψ_lo permits a LONGER range. mgcv's
+    // gp default range is the full diameter (≈ r_max); the generic `r_max/2` cap
+    // would pin the Matérn optimizer to a wigglier-than-mgcv kernel (edf ≈ 28 vs
+    // 14 on the quakes spatial fit). Letting it reach `r_max` (interior to the
+    // 1.5× ceiling) matches mgcv. The #1357 fully-flat collapse is guarded by the
+    // EDF-collapse guard in spatial_optimization.rs, not by this bound.
     if let SmoothBasisSpec::Matern { .. } = &term.basis {
-        let matern_psi_lo =
+        psi_lo_data =
             (1.0 / (MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION * r_max)).ln();
-        psi_lo_data = psi_lo_data.max(matern_psi_lo);
     }
     // Intersect with the options window so min/max_length_scale remain hard caps.
     let psi_lo = psi_lo_data.max(fallback.0);
