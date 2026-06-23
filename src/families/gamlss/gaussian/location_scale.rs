@@ -140,11 +140,24 @@ impl GaussianLocationScaleFamily {
         &'a self,
         specs: Option<&'a [ParameterBlockSpec]>,
     ) -> Result<Option<(DenseOrOperator<'a>, DenseOrOperator<'a>)>, String> {
-        if self.exact_joint_supported() {
-            return self.exact_block_designs().map(Some);
-        }
+        // #1504: prefer the identifiability-CONSTRAINED block designs carried by
+        // `specs` whenever they are provided. The inner joint-Newton solve sizes
+        // its coefficient vector — and the consumer's dense-Hessian `total` — from
+        // these post-audit specs, which can be NARROWER than the family's stored
+        // pre-audit designs: a by-group smooth in BOTH the mean and log-σ blocks
+        // has aliased columns the identifiability audit drops. Reaching for the
+        // stored (unconstrained) designs here regardless of `specs` sized the joint
+        // Hessian to the wider pre-audit width and tripped the dense-Hessian shape
+        // check ("got 36x36, expected 32x32") on every such fit. When no audit
+        // reduction occurred the specs designs equal the stored ones, so ordinary
+        // (non-by-group) gaulss fits are byte-identical; the analytic location-scale
+        // Hessian is design-agnostic, so using the constrained designs loses no
+        // exactness. Fall back to the stored designs only when no specs are given.
         if let Some(specs) = specs {
             return self.exact_block_designs_fromspecs(specs).map(Some);
+        }
+        if self.exact_joint_supported() {
+            return self.exact_block_designs().map(Some);
         }
         Ok(None)
     }
