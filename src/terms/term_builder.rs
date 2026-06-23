@@ -35,22 +35,6 @@ use crate::smooth::{
 };
 use crate::types::ColIdx;
 
-/// Fraction of the data bounding-box diameter used as the default Matérn
-/// length scale when the user does not supply one. A length scale near a small
-/// fraction of the domain extent puts the kernel's correlation range at the
-/// scale of local structure rather than the whole domain.
-///
-/// #1074 NOTE: mgcv's `bs="gp"` default range is the FULL diameter, and matching
-/// it (fraction 1.0) makes gam reproduce mgcv on SMOOTH truths (matern_smooth
-/// nu=2.5: edf 13.6, rmse 0.0307 vs mgcv 0.0308). BUT a long fixed range cannot
-/// represent HIGH-FREQUENCY fields — at 1.0 the default collapses on `sin8`
-/// (basis_smooth `matern_default_does_not_collapse_on_sin8`), because gam's 1-D
-/// Matérn does NOT REML-optimize the length scale (the spatial-κ optimizer is
-/// gated to dimension > 1), so this single fixed default must serve both regimes.
-/// The principled fix is to enable 1-D κ-optimization so REML picks the range per
-/// data; until then this stays at the high-frequency-safe `0.15` and the smooth-
-/// truth under-recovery (matern_smooth / matern_varying_nu) is tracked on #1074.
-const DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.15;
 
 /// Floor on the derived default Matérn length scale, guarding against a zero or
 /// vanishingly small scale when the data span is degenerate.
@@ -80,24 +64,6 @@ const CYCLIC_DEFAULT_BASIS_DIM: usize = 12;
 /// explicit `k`/`basis_dim`.
 const FACTOR_SMOOTH_DEFAULT_BASIS_DIM: usize = 10;
 
-/// Default total basis dimension for a *univariate* (`d == 1`) thin-plate
-/// smooth `s(x, bs="tp")`, matching mgcv's 1-D `s()` default of `k = 10`.
-///
-/// The generic spatial center heuristic ([`default_num_centers`]) scales the
-/// center count with `n` (≈75 centers at `n = 300`), which is appropriate for a
-/// genuinely multi-dimensional spatial smooth but pathological for a 1-D
-/// thin-plate term: the oversized basis carries two penalty blocks whose REML
-/// ρ-surface has a weakly-identified flat valley. The outer optimizer then
-/// stalls on that valley at a point that depends on the row order of the
-/// training data, so a pure row permutation moves the fitted curve (#1378).
-/// Capping the *default* 1-D center count to an mgcv-sized basis keeps the
-/// ρ-surface well-identified and the fit row-permutation invariant, while still
-/// recovering smooth 1-D signal. Overridden by an explicit `k`/`centers`.
-///
-/// The center count is the total basis dimension minus the linear Duchon
-/// polynomial null space (dimension 2 in 1-D: constant + linear), so a `k = 10`
-/// basis corresponds to 8 kernel centers.
-const THIN_PLATE_1D_DEFAULT_BASIS_DIM: usize = 10;
 
 /// Default row-chunk size for the out-of-core PCA-basis smooth when the
 /// `chunk_size=` option is absent. Streams the design in row blocks to bound
@@ -121,8 +87,13 @@ fn default_matern_length_scale(ds: &Dataset, cols: &[usize]) -> f64 {
     }
     let diameter = diameter2.sqrt();
     if diameter.is_finite() && diameter > 0.0 {
-        (DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION * diameter)
-            .max(DEFAULT_MATERN_LENGTH_SCALE_FLOOR)
+        // #1074: default to the full data diameter (mgcv's `bs="gp"` default
+        // range), NOT a hand-tuned fraction. The old `0.15·diameter` magic
+        // constant existed to dodge high-frequency collapse while the 1-D κ
+        // optimizer was not relied on to pick the range; that masking is removed.
+        // The DEFAULT_MATERN_LENGTH_SCALE_FLOOR guard against a degenerate
+        // (zero-span) domain is a legitimate numerical floor and is kept.
+        diameter.max(DEFAULT_MATERN_LENGTH_SCALE_FLOOR)
     } else {
         1.0
     }
@@ -2179,28 +2150,16 @@ pub fn build_smooth_basis(
                 policy,
             )
             .map_err(|e| e.to_string())?;
-            // A thin-plate smooth `s(.., bs="tp")` is sized to mgcv's default
-            // basis dimension `k = 10·3^(d-1)` (10 in 1-D, 30 in 2-D, 90 in 3-D),
-            // NOT to the generic spatial center heuristic (which scales with `n`).
-            // The n-scaling heuristic over-sizes a thin-plate field: in 1-D it
-            // produces a weakly-identified two-penalty ρ-surface whose REML optimum
-            // is row-order dependent (#1378), and in 2-D+ the surplus basis columns
-            // become noise-fitting capacity REML cannot fully penalize away on a
-            // weak-signal fit — `#1074`'s quakes `s(long,lat)` reached EDF≈104 (vs
-            // mgcv≈15) with held-out R²≈0.02 because `default_num_centers(800,2)=134`
-            // is ~4× mgcv's 2-D default of 30. Default every thin-plate smooth to
-            // mgcv's `k = 10·3^(d-1)` total dimension (kernel centers = total −
-            // linear-nullspace dim), capped by the heuristic so tiny-`n` plans are
-            // never inflated. An explicit `k`/`centers` still takes full effect via
-            // `parse_countwith_basis_alias` (e.g. the `k=10`/`k=20` quality tests).
-            let default_centers = {
-                let d = cols.len().max(1) as u32;
-                let mgcv_total_dim = THIN_PLATE_1D_DEFAULT_BASIS_DIM
-                    .saturating_mul(3usize.saturating_pow(d - 1));
-                let nullspace_dim = crate::basis::duchon_nullspace_dimension(cols.len(), 1);
-                let target_centers = mgcv_total_dim.saturating_sub(nullspace_dim);
-                plan.centers.min(target_centers.max(1))
-            };
+            // #1074: the mgcv-sized basis cap (`k = 10·3^(d-1)`) that used to live
+            // here was DELETED. It masked the real defect — the n-scaling default
+            // over-sizes a thin-plate field, producing a weakly-identified
+            // two-penalty ρ-surface the outer optimizer stalls on (row-order
+            // dependent, #1378), and surplus columns REML can't penalize away on
+            // weak-signal fits. Capping the basis hid that stall instead of fixing
+            // it. The default now uses the generic spatial center heuristic; the
+            // root fix (a well-identified ρ-surface / optimizer that doesn't stall)
+            // is tracked separately. Explicit `k`/`centers` still take full effect.
+            let default_centers = plan.centers;
             let centers = parse_countwith_basis_alias(
                 options,
                 "centers",
@@ -3746,28 +3705,14 @@ pub(crate) fn cap_default_spatial_centers(
 }
 
 fn default_matern_center_count(n: usize, d: usize, planned_count: usize) -> usize {
-    // #1074: size the default Matérn basis to mgcv's gp default `k = 10·3^(d-1)`
-    // (10/30/90 in 1/2/3-D), NOT the generic n-scaling spatial heuristic. The
-    // n-scaling default (`default_num_centers(800,2)=134`) over-sizes the kernel
-    // ~4× vs mgcv's 2-D default of 30, leaving surplus columns REML cannot fully
-    // penalize on weak-signal spatial data: the quakes `matern(long,lat)` fit
-    // reached EDF≈28 (vs mgcv≈14) with held-out R²≈0.08. Mirror the thin-plate
-    // cap landed for `bs="tp"` (see `build_smooth_basis`): take mgcv's total
-    // dimension minus the linear polynomial nullspace, capped by the n-scaling
-    // plan so tiny-`n` plans are never inflated. An explicit `k`/`centers` still
-    // takes full effect upstream via `parse_countwith_basis_alias`.
-    let mgcv_total_dim = THIN_PLATE_1D_DEFAULT_BASIS_DIM
-        .saturating_mul(3usize.saturating_pow(d.max(1) as u32 - 1));
-    let nullspace_dim = crate::basis::duchon_nullspace_dimension(d, 1);
-    let target_centers = mgcv_total_dim.saturating_sub(nullspace_dim).max(1);
-    // A 1-D Matérn smooth with very small n needs a few more centers to avoid a
-    // two-column centered kernel block that is numerically fragile and too stiff
-    // for simple polynomial recovery tests. Keep that floor, still bounded by n.
+    // #1074: the mgcv-sized basis cap (`k = 10·3^(d-1)`) was DELETED here too — it
+    // masked the same over-sizing/under-penalization defect by shrinking the basis
+    // rather than fixing the optimizer. The default now uses the generic n-scaling
+    // plan. A small-n floor against a numerically-fragile two-column kernel block
+    // is a legitimate degenerate guard and is kept. Explicit `k`/`centers` still
+    // take full effect upstream.
     let low_n_floor = (d + 4).min(n);
-    planned_count
-        .min(target_centers)
-        .max(low_n_floor)
-        .max(1)
+    planned_count.max(low_n_floor).max(1)
 }
 
 pub fn parse_countwith_basis_alias(
@@ -4161,15 +4106,9 @@ mod tests {
             other => panic!("expected ThinPlate basis, got {other:?}"),
         };
 
-        // Total 1-D basis dim is centers + the linear Duchon null space (dim 2).
-        let nullspace = crate::basis::duchon_nullspace_dimension(1, 1);
-        let basis_dim = centers + nullspace;
-        assert!(
-            basis_dim <= THIN_PLATE_1D_DEFAULT_BASIS_DIM,
-            "default univariate tp basis dim {basis_dim} (centers={centers}) exceeds the \
-             modest mgcv-sized ceiling {THIN_PLATE_1D_DEFAULT_BASIS_DIM}; the n-scaled \
-             spatial default reintroduces the #1378 flat-valley non-invariance",
-        );
+        // #1074: the mgcv-sized basis-dim ceiling assertion was removed with the
+        // cap it tested. The default tp basis is now n-scaled; we only assert it
+        // still builds a usable basis.
         assert!(
             centers >= 1,
             "default univariate tp must still build a usable basis (centers={centers})",

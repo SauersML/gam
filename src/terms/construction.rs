@@ -1985,43 +1985,13 @@ pub fn stable_reparameterizationwith_invariant(
     // No separate length check needed — penalties are matched against lambdas above,
     // and the invariant's qs_base is p x p (dimension-checked by the split).
 
-    // gam#1379 — finite-ceiling the per-penalty smoothing weights before they
-    // weight any penalty block. `λ_k = exp(ρ_k)` overflows to `+∞` once the
-    // outer REML/κ optimizer drives a redundant penalty direction's log-λ past
-    // ~709 (it happens deterministically on 1-D `matern(x)` / `bs="gp"` data
-    // whose kernel already controls the smoothness the stiffness operator also
-    // penalizes, so REML wants λ_stiffness → ∞). The range block is then
-    // assembled as `Σ_k λ_k S_k`; wherever a transformed `S_k` entry is exactly
-    // `0.0`, `∞ · 0 = NaN`, so the *entire* block comes back non-finite with
-    // zero finite content and the downstream eigensolve aborts the fit
-    // ("range penalty block contains non-finite entries, max finite magnitude
-    // 0.000e0"). A `λ` of `1e300` pins the penalized direction exactly as hard
-    // as `+∞` would for every finite-arithmetic consumer here (the eigensolve,
-    // the trace/logdet derivatives — which already tolerate a wide λ dynamic
-    // range via the eigenvalue floor below), but keeps `λ · 0 = 0`, so the
-    // block stays a well-formed PSD matrix. We only clamp non-finite or
-    // above-ceiling weights; ordinary finite λ pass through untouched, so the
-    // REML optimum (and its recorded λ̂) is unchanged on every non-degenerate fit.
-    const LAMBDA_CEILING: f64 = 1e300;
-    let lambdas_storage: Vec<f64>;
-    let lambdas: &[f64] = if lambdas
-        .iter()
-        .any(|&l| !l.is_finite() || l > LAMBDA_CEILING)
-    {
-        lambdas_storage = lambdas
-            .iter()
-            .map(|&l| {
-                if l.is_nan() {
-                    0.0
-                } else {
-                    l.min(LAMBDA_CEILING)
-                }
-            })
-            .collect();
-        &lambdas_storage
-    } else {
-        lambdas
-    };
+    // #1074: the gam#1379 finite-ceiling on λ_k = exp(ρ_k) (clamp to 1e300 to
+    // avoid `∞·0 = NaN` when the outer optimizer drives a redundant penalty
+    // direction's log-λ past ~709) was DELETED. It masked the real defect: the
+    // optimizer drives a redundant/unidentified penalty direction off to ∞
+    // instead of that direction being detected and dropped from the model.
+    // The root fix (detect+drop the redundant penalty direction at construction)
+    // is tracked separately; λ now passes through raw.
 
     if m == 0 {
         return Ok(ReparamResult {
