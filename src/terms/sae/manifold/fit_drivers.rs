@@ -1574,7 +1574,34 @@ impl SaeManifoldTerm {
             return Ok(false);
         }
         let ev = 1.0 - ssr / sst;
-        if !(ev.is_finite() && ev <= SAE_FIT_DATA_COLLAPSE_EV_FLOOR) {
+        // #1522 — DERIVE the co-collapse acceptance bar from the data rather than
+        // keying on a corpus-tuned absolute constant. The bar is half the BEST EV
+        // any rank-`K` linear dictionary could reach on THIS centered target (its
+        // rank-`K` PCA / Eckart-Young ceiling), so it tracks the data's achievable
+        // reconstruction instead of an OLMo-calibrated number: a fit that explains
+        // less than half the variance a rank-`K` optimum could is a structural
+        // collapse on this data, whatever its absolute EV. The dictionary rank is
+        // the sum of the per-atom basis sizes (each atom contributes its own
+        // `basis_size()` directions), capped at the data rank `min(n, p)`. When the
+        // ceiling is degenerate or un-computable (constant target, SVD failure) the
+        // `pca_ev_ceiling` returns non-finite and we fall back to the absolute
+        // [`SAE_FIT_DATA_COLLAPSE_EV_FLOOR`] so the guard never keys on a
+        // meaningless bar.
+        let dictionary_rank = self
+            .atoms
+            .iter()
+            .map(|atom| atom.basis_size())
+            .sum::<usize>()
+            .min(n)
+            .min(p);
+        let derived_floor =
+            0.5 * crate::terms::sae::manifold::outer_objective::pca_ev_ceiling(target, dictionary_rank);
+        let ev_floor = if derived_floor.is_finite() {
+            derived_floor
+        } else {
+            SAE_FIT_DATA_COLLAPSE_EV_FLOOR
+        };
+        if !(ev.is_finite() && ev <= ev_floor) {
             return Ok(false);
         }
 
@@ -1600,7 +1627,10 @@ impl SaeManifoldTerm {
                 iteration,
                 atom,
                 max_active_mass: ev,
-                floor: SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
+                // #1522 — record the DATA-DERIVED bar the verdict actually used,
+                // not the absolute fallback constant, so the #976 ledger reflects
+                // which threshold this fit was measured against.
+                floor: ev_floor,
                 action: CollapseAction::Terminal,
             });
         }
