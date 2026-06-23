@@ -1575,6 +1575,182 @@ mod moment_engine_tests {
             );
         }
     }
+
+    /// #932 item-2 Phase C STEP 1: `flex_timepoint_d_cell` (the per-cell density
+    /// normalization `D_cell = INV_TWO_PI·Σ_k χ_k·M_k`) must reproduce the value
+    /// `INV_TWO_PI·Σ_k dc_da[k]·M_k` and the θ-gradient `d_u` (the hand
+    /// `survival_flex_base_d_u` quantity) vs a central FD of the same scalar `D(θ)`
+    /// on a smooth intercept-only family `a(θ)=a0+θ` with FIXED edges (isolates
+    /// the interior coefficient motion + the M_k `e^{−Δq}` `−χηη_u` term — the edge
+    /// flux is exercised by the moving-edge `base_moment_jets` tests). The cell's
+    /// `c_k` and `dc_da_k` move with `a` per the chosen `dc_daa`/`dc_daaa` pack.
+    #[test]
+    fn flex_timepoint_d_cell_value_and_grad_932() {
+        use crate::families::cubic_cell_kernel::evaluate_cell_moments;
+
+        let zl = -1.1_f64;
+        let zr = 1.6_f64;
+        // a-only family: c_k and dc_da_k are cubic/quadratic in θ via the pack.
+        let c_base = [0.2_f64, -0.3, 0.18, 0.06];
+        let dc_da = [1.05_f64, 0.22, 0.04, 0.0];
+        let dc_daa = [0.08_f64, 0.03, 0.0, 0.0];
+        let dc_daaa = [0.004_f64, 0.0, 0.0, 0.0];
+        let cell_at = |theta: f64| {
+            let c: [f64; 4] = std::array::from_fn(|k| {
+                c_base[k]
+                    + dc_da[k] * theta
+                    + 0.5 * dc_daa[k] * theta * theta
+                    + dc_daaa[k] * theta * theta * theta / 6.0
+            });
+            DenestedCubicCell {
+                left: zl,
+                right: zr,
+                c0: c[0],
+                c1: c[1],
+                c2: c[2],
+                c3: c[3],
+            }
+        };
+        let dc_da_at = |theta: f64| -> [f64; 4] {
+            std::array::from_fn(|k| {
+                dc_da[k] + dc_daa[k] * theta + 0.5 * dc_daaa[k] * theta * theta
+            })
+        };
+        let max_degree = 10usize;
+        let moments_at = |theta: f64| -> Vec<f64> {
+            evaluate_cell_moments(cell_at(theta), max_degree)
+                .expect("numeric cell moments")
+                .moments
+                .into_vec()
+        };
+        let d_scalar = |theta: f64| -> f64 {
+            let m = moments_at(theta);
+            let chi = dc_da_at(theta);
+            let mut acc = 0.0;
+            for k in 0..4 {
+                acc += chi[k] * m[k];
+            }
+            acc * std::f64::consts::TAU.recip()
+        };
+
+        // Jet build: single primary (slot 0) = the intercept axis, velocity 1.
+        let seeded = |x: f64, vel: f64| {
+            let g = vec![vel];
+            Jet2::from_parts(x, &g, &[])
+        };
+        let cell0 = cell_at(0.0);
+        let c_jets = [
+            seeded(cell0.c0, dc_da[0]),
+            seeded(cell0.c1, dc_da[1]),
+            seeded(cell0.c2, dc_da[2]),
+            seeded(cell0.c3, dc_da[3]),
+        ];
+        // chi_jets carry dc_da value + dc_daa motion (a-only family).
+        let dc_da0 = dc_da_at(0.0);
+        let chi_jets = [
+            seeded(dc_da0[0], dc_daa[0]),
+            seeded(dc_da0[1], dc_daa[1]),
+            seeded(dc_da0[2], dc_daa[2]),
+            seeded(dc_da0[3], dc_daa[3]),
+        ];
+        let template = seeded(0.0, 0.0);
+        let edge_l = seeded(zl, 0.0); // fixed edge: no motion
+        let edge_r = seeded(zr, 0.0);
+        let numeric0 = moments_at(0.0);
+        let d_jet = flex_timepoint_d_cell(
+            &template, &c_jets, &chi_jets, &edge_l, true, &edge_r, true, &numeric0,
+        );
+
+        assert!(
+            (d_jet.value() - d_scalar(0.0)).abs() <= 1e-10 * (1.0 + d_scalar(0.0).abs()),
+            "D value {} != {}",
+            d_jet.value(),
+            d_scalar(0.0)
+        );
+        let h = 1e-6_f64;
+        let fd = (d_scalar(h) - d_scalar(-h)) / (2.0 * h);
+        assert!(
+            (d_jet.g[0] - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+            "D grad (d_u) {} != FD {}",
+            d_jet.g[0],
+            fd
+        );
+    }
+
+    /// #932 item-2 Phase C: `cell_chi_poly_jets` (the `∂η/∂a = dc_da` family as
+    /// jets) value channel == `dc_da[k]`, gradient channel == the hand
+    /// `chi_u_poly = dc_daa·a_u + coeff_au` chain, vs a central FD of the scalar
+    /// `dc_da_k(a(θ), {θ_u})` Taylor. p=2 with the g-slope at axis 1.
+    #[test]
+    fn cell_chi_poly_jets_value_and_grad_932() {
+        let p = 2usize;
+        let g_axis = 1usize;
+        let mk_run = |seed: f64| -> Vec<[f64; 4]> {
+            (0..p)
+                .map(|u| std::array::from_fn(|k| seed * (1.0 + u as f64) * (1.0 + k as f64) * 0.01))
+                .collect()
+        };
+        let fixed = DenestedCellPrimaryFixedPartials {
+            dc_da: [1.05, 0.22, 0.04, 0.0],
+            dc_daa: [0.08, 0.03, 0.0, 0.0],
+            dc_daaa: [0.004, 0.0, 0.0, 0.0],
+            coeff_u: mk_run(0.9),
+            coeff_au: mk_run(0.4),
+            coeff_bu: mk_run(0.5),
+            coeff_aau: mk_run(0.12),
+            coeff_abu: mk_run(0.16),
+            coeff_bbu: mk_run(0.11),
+            coeff_aaau: mk_run(0.02),
+            coeff_aabu: mk_run(0.03),
+            coeff_abbu: mk_run(0.04),
+            coeff_bbbu: mk_run(0.05),
+        };
+        let a_u = 0.25_f64;
+        let v = [0.2_f64, -0.4];
+        let seeded = |x: f64, vel: f64| {
+            let g = vec![vel];
+            Jet2::from_parts(x, &g, &[])
+        };
+        let a_jet = seeded(0.3, a_u);
+        let da = tangent_jet(&a_jet);
+        let du: Vec<Jet2> = (0..p).map(|u| seeded(0.0, v[u])).collect();
+        let chi = cell_chi_poly_jets(&a_jet, &fixed, g_axis, &da, &du);
+
+        let chi_scalar = |theta: f64| -> [f64; 4] {
+            let da = a_u * theta;
+            let db = v[g_axis] * theta;
+            std::array::from_fn(|k| {
+                let mut acc =
+                    fixed.dc_da[k] + fixed.dc_daa[k] * da + 0.5 * fixed.dc_daaa[k] * da * da;
+                for u in 0..p {
+                    let duu = v[u] * theta;
+                    acc += fixed.coeff_au[u][k] * duu
+                        + fixed.coeff_aau[u][k] * da * duu
+                        + fixed.coeff_abu[u][k] * db * duu;
+                }
+                acc
+            })
+        };
+        let h = 1e-6_f64;
+        let c0 = chi_scalar(0.0);
+        let cp = chi_scalar(h);
+        let cm = chi_scalar(-h);
+        for k in 0..4 {
+            assert!(
+                (chi[k].value() - c0[k]).abs() <= 1e-12 * (1.0 + c0[k].abs()),
+                "chi_{k} value {} != {}",
+                chi[k].value(),
+                c0[k]
+            );
+            let fd = (cp[k] - cm[k]) / (2.0 * h);
+            assert!(
+                (chi[k].g[0] - fd).abs() <= 1e-5 * (1.0 + fd.abs()),
+                "chi_{k} grad {} != FD {}",
+                chi[k].g[0],
+                fd
+            );
+        }
+    }
 }
 
 // ── §C: observed cell-coefficient jets + eta/chi point-eval (Phase C core) ──
@@ -1707,6 +1883,75 @@ fn cell_coeff_jets<J: FlexJet>(
         }
         c
     })
+}
+
+/// The per-cell `χ = ∂η/∂a` polynomial coefficients `dc_da[k]` (k = 0..4) as
+/// jets, the `∂_a`-shifted analogue of [`cell_coeff_jets`]: the cell coefficient
+/// family whose base is `dc_da`, whose `a`-derivatives are `dc_daa`/`dc_daaa`,
+/// whose per-primary derivatives are `coeff_au`/`coeff_aau` (= `∂(dc_da)/∂u` and
+/// `∂²(dc_da)/∂a∂u`), and whose `b`-cross is `coeff_abu` (= `∂²(dc_da)/∂b∂u`).
+/// These are the `χ_u`/`χ_uv` chains the hand `first_full` assembles by hand
+/// (`chi_u_poly = dc_daa·a_u + coeff_au`); the FlexJet algebra raises them.
+fn cell_chi_poly_jets<J: FlexJet>(
+    template: &J,
+    fixed: &DenestedCellPrimaryFixedPartials,
+    g_axis: usize,
+    da: &J,
+    du: &[J],
+) -> [J; 4] {
+    let p = du.len();
+    let dada = da.mul(da);
+    let db = &du[g_axis];
+    std::array::from_fn(|k| {
+        // Base = dc_da; a-chain = dc_daa·da + ½dc_daaa·da².
+        let mut c = const_jet_like(template, fixed.dc_da[k]);
+        c = c
+            .add(&da.scale(fixed.dc_daa[k]))
+            .add(&dada.scale(0.5 * fixed.dc_daaa[k]));
+        for u in 0..p {
+            let duu = &du[u];
+            // χ per-primary: coeff_au[u]·du + coeff_aau[u]·da·du + coeff_abu[u]·db·du.
+            let chain = duu
+                .scale(fixed.coeff_au[u][k])
+                .add(&da.mul(duu).scale(fixed.coeff_aau[u][k]))
+                .add(&db.mul(duu).scale(fixed.coeff_abu[u][k]));
+            c = c.add(&chain);
+        }
+        c
+    })
+}
+
+/// #932 item-2 Phase C: the per-row density normalization `D = Σ_cells ∫ G0 dz`
+/// (`G0 = χ·w`, `w = e^{−q}/2π`) as a jet at any `FlexJet` order, carrying its
+/// exact θ-derivatives (the hand D-path `d_u`/`d_uv` are this jet's grad/Hess).
+///
+/// Per cell `D_cell = INV_TWO_PI · Σ_k χ_k · M_k`, where `χ_k` are the cell's
+/// `dc_da` polynomial coefficients as jets ([`cell_chi_poly_jets`]) and `M_k` are
+/// the cell's normalization moments as jets ([`base_moment_jets`], carrying both
+/// the coefficient motion and the moving-edge sliver). The single-source magic:
+/// the hand path forms `d_u` by EXPLICITLY assembling `χ_u − χ·η·η_u` + boundary
+/// flux; the jet product `χ_k·M_k` reproduces all three terms automatically —
+/// `χ_u` from `χ_k`'s motion, `−χ·η·η_u` from `M_k`'s interior `e^{−Δq}` factor
+/// (`∂M_k = −Σ_m(η∂η)_m M_{k+m}`), and the boundary flux from `M_k`'s edge
+/// sliver. `c_jets` are the cell's `c0..c3` jets ([`cell_coeff_jets`]) feeding the
+/// moment exponent; `edge_l`/`edge_r` the moving edge jets; `moments` the cell's
+/// NUMERIC moment vector (≥ `4 + 6` entries for the `e^{−Δq}` expansion).
+fn flex_timepoint_d_cell<J: FlexJet>(
+    template: &J,
+    c_jets: &[J; 4],
+    chi_jets: &[J; 4],
+    edge_l: &J,
+    left_finite: bool,
+    edge_r: &J,
+    right_finite: bool,
+    numeric_moments: &[f64],
+) -> J {
+    let m = base_moment_jets(c_jets, edge_l, left_finite, edge_r, right_finite, numeric_moments);
+    let mut acc = const_jet_like(template, 0.0);
+    for (k, chi_k) in chi_jets.iter().enumerate() {
+        acc = acc.add(&chi_k.mul(&m[k]));
+    }
+    acc.scale(std::f64::consts::TAU.recip())
 }
 
 /// Evaluate a 4-coefficient cell polynomial jet `Σ_k coeff_jet[k]·z^k` at the
