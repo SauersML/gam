@@ -115,335 +115,8 @@ trait FlexJet: Sized + Clone {
     fn ln(&self) -> Self {
         self.compose_unary(ln_stack(self.value()))
     }
-    /// `1/self` via the reciprocal Faà di Bruno stack at the value channel.
-    #[inline]
-    fn recip(&self) -> Self {
-        let x = self.value();
-        let inv = 1.0 / x;
-        let inv2 = inv * inv;
-        self.compose_unary([
-            inv,
-            -inv2,
-            2.0 * inv2 * inv,
-            -6.0 * inv2 * inv2,
-            24.0 * inv2 * inv2 * inv,
-        ])
-    }
-    /// `exp(self)` via the exponential stack at the value channel.
-    #[inline]
-    fn exp(&self) -> Self {
-        let e = self.value().exp();
-        self.compose_unary([e, e, e, e, e])
-    }
-    /// `self + c` for a scalar constant `c` (value-channel shift, derivatives
-    /// unchanged) via the affine composition stack `[v+c, 1, 0, 0, 0]`.
-    #[inline]
-    fn add_const(&self, c: f64) -> Self {
-        self.compose_unary([self.value() + c, 1.0, 0.0, 0.0, 0.0])
-    }
 }
 
-// ── §B moment engine: the de-nested cell moments over a FlexJet ─────────────
-//
-// #932 Item 2 (doc §D). The per-cell moments `M_n = ∫_{z_L}^{z_R} z^n e^{−q(z)} dz`
-// (sextic `q`, no closed antiderivative) satisfy the SAME raising recurrence the
-// numeric `cubic_cell_kernel::reduce_sextic_moments` uses —
-//   `M_{n+5} = (n·M_{n−1} − Σ_{j=0}^{4} d[j]·M_{n+j} − b_n) / d[5]`,
-// with `d = q'(z)` coefficients (`sextic_qprime_coefficients`) and boundary term
-// `b_n = z_R^n e^{−q(z_R)} − z_L^n e^{−q(z_L)}` — so it ports to ANY `FlexJet`
-// scalar verbatim. Carrying the cell coefficients `c0..c3` and the (moving) edges
-// `z_L,z_R` as jets propagates the moments' θ-derivatives mechanically: the
-// `Σ d[j]·M_{n+j}` term is the interior coefficient sensitivity and the boundary
-// term `b_n` is exactly the §D moving-boundary flux (its edge-jet derivatives are
-// the Leibniz `[z^n e^{−q}·z_edge']` contributions the hand `directional` path
-// assembles by hand). The base moments `M_0..M_4` (the normalization integrals)
-// arrive as jets from the cell evaluator — those carry the only transcendental
-// (erf/series) content; the algebra owns the rest.
-
-/// `q'(z)` coefficient jets `[d0..d5]` for `q = ½(z² + η²)`, `η = c0+c1 z+c2 z²+
-/// c3 z³`, over `FlexJet` cell-coefficient jets — the jet image of
-/// [`crate::families::cubic_cell_kernel::sextic_qprime_coefficients`].
-fn qprime_coeffs_jet<J: FlexJet>(c: &[J; 4]) -> [J; 6] {
-    let (c0, c1, c2, c3) = (&c[0], &c[1], &c[2], &c[3]);
-    // d0 = c0·c1
-    let d0 = c0.mul(c1);
-    // d1 = 1 + c1² + 2·c0·c2   (the leading `+z` of q' supplies the constant 1)
-    let d1 = c1.mul(c1).add(&c0.mul(c2).scale(2.0)).add_const(1.0);
-    // d2 = 3·c0·c3 + 3·c1·c2
-    let d2 = c0.mul(c3).add(&c1.mul(c2)).scale(3.0);
-    // d3 = 4·c1·c3 + 2·c2²
-    let d3 = c1.mul(c3).scale(4.0).add(&c2.mul(c2).scale(2.0));
-    // d4 = 5·c2·c3
-    let d4 = c2.mul(c3).scale(5.0);
-    // d5 = 3·c3²
-    let d5 = c3.mul(c3).scale(3.0);
-    [d0, d1, d2, d3, d4, d5]
-}
-
-/// `q(z) = ½(z² + η(z)²)` evaluated at an edge jet `z`, with `η` from the cell
-/// coefficient jets — the exponent whose `e^{−q}` is the boundary weight.
-fn cell_q_at_jet<J: FlexJet>(c: &[J; 4], z: &J) -> J {
-    // η = c0 + c1 z + c2 z² + c3 z³  (Horner)
-    let eta = c[3]
-        .mul(z)
-        .add(&c[2])
-        .mul(z)
-        .add(&c[1])
-        .mul(z)
-        .add(&c[0]);
-    // ½(z² + η²)
-    z.mul(z).add(&eta.mul(&eta)).scale(0.5)
-}
-
-/// One boundary term `z^n·e^{−q(z)}` at a (possibly infinite) moving edge jet.
-/// An infinite edge contributes nothing (matching the numeric
-/// `moment_boundary_term_with_powers` short-circuit).
-fn boundary_edge_term_jet<J: FlexJet>(c: &[J; 4], z: &J, z_pow_n: &J, finite: bool) -> Option<J> {
-    if !finite {
-        return None;
-    }
-    let q = cell_q_at_jet(c, z);
-    let w = q.scale(-1.0).exp();
-    Some(z_pow_n.mul(&w))
-}
-
-/// The sextic moment recurrence over a `FlexJet`: given the cell coefficient
-/// jets `c`, the moving edge jets `(z_left, z_right)` with their finiteness, and
-/// the base moment jets `M_0..M_4`, return `M_0..M_max` as jets. Bit-faithful to
-/// `reduce_sextic_moments` term for term, but every operation in the `FlexJet`
-/// algebra so the moments carry their exact θ-derivatives.
-fn cell_moment_recurrence_jet<J: FlexJet>(
-    c: &[J; 4],
-    z_left: &J,
-    left_finite: bool,
-    z_right: &J,
-    right_finite: bool,
-    base_m0_m4: &[J; 5],
-    max_degree: usize,
-) -> Vec<J> {
-    let d = qprime_coeffs_jet(c);
-    let inv_lead = d[5].recip();
-    let mut moments: Vec<J> = base_m0_m4.iter().cloned().collect();
-    if max_degree < 5 {
-        moments.truncate(max_degree + 1);
-        return moments;
-    }
-    // Rolling z^n at each edge (jets), starting at n = 0 (z^0 = 1 = z/z).
-    let one_l = z_left.recip().mul(z_left);
-    let one_r = z_right.recip().mul(z_right);
-    let mut left_pow = one_l;
-    let mut right_pow = one_r;
-    for n in 0..=(max_degree - 5) {
-        let b_left = boundary_edge_term_jet(c, z_left, &left_pow, left_finite);
-        let b_right = boundary_edge_term_jet(c, z_right, &right_pow, right_finite);
-        // b_n = right − left, missing edges contribute zero.
-        let mut b_n = match (b_right, b_left) {
-            (Some(r), Some(l)) => r.sub(&l),
-            (Some(r), None) => r,
-            (None, Some(l)) => l.scale(-1.0),
-            (None, None) => moments[0].scale(0.0),
-        };
-        // numer = n·M_{n−1} − Σ_{j=0}^{4} d[j]·M_{n+j} − b_n
-        let mut numer = if n == 0 {
-            moments[0].scale(0.0)
-        } else {
-            moments[n - 1].scale(n as f64)
-        };
-        for j in 0..=4 {
-            numer = numer.sub(&d[j].mul(&moments[n + j]));
-        }
-        numer = numer.sub(&b_n);
-        moments.push(numer.mul(&inv_lead));
-        // Roll powers: z^{n+1} = z^n · z.
-        left_pow = if left_finite {
-            left_pow.mul(z_left)
-        } else {
-            b_n.scale(0.0)
-        };
-        right_pow = if right_finite {
-            right_pow.mul(z_right)
-        } else {
-            // reuse b_n as a zero-jet scratch source of the right `p`
-            b_n = b_n.scale(0.0);
-            b_n
-        };
-    }
-    moments
-}
-
-/// #932 item-2 Phase B-base: the normalization base moments `M_0..M_4` as jets,
-/// carrying their exact θ-derivatives (incl. the moving-edge flux), built from
-/// the cell's already-computed NUMERIC moment vector (`numeric_moments`) plus the
-/// cell-coefficient jets `c` and the moving edge jets `(z_left, z_right)`.
-///
-/// `M_n = ∫_{z_L(θ)}^{z_R(θ)} zⁿ e^{−q(z,θ)} dz`, `q = ½(z² + η(z)²)`, `η = c0+c1z
-/// +c2z²+c3z³` with `(c, z_L, z_R)` all θ-dependent.
-///
-/// This single-sources the hand `survival_flex_base_d_u`/`_d_uv`/`f_au`/`f_aa`
-/// base normalization derivatives over a generic `FlexJet` order — exact to ALL
-/// jet orders (Jet2/Jet3/Jet4), not just first. The value channel is
-/// bit-identical to `numeric_moments[n]`; the derivative channels are
-/// finite-difference-pinned against `evaluate_cell_moments` on perturbed cells
-/// (`base_moment_jets_first_derivative_matches_fd_932`,
-/// `base_moment_jets_second_derivative_matches_fd_932`).
-///
-/// EXACTNESS to all orders (the self-consistent closure): write
-/// `M_n(θ) = ∫ zⁿ e^{−q(z,θ)} dz = ∫ zⁿ e^{−q(z,θ₀)}·e^{−Δq(z)} dz`,
-/// `Δq(z) = q(z,θ) − q(z,θ₀) = ½(η(z,θ)² − η(z,θ₀)²)` (the `z²` term cancels).
-/// The factor `e^{−Δq}` has VALUE channel 1 (Δq=0 at θ₀) and its derivative
-/// channels carry the full `(−∂q)` / `(−∂²q + (∂q)²)` / … expansion. Expanding
-/// `e^{−Δq}` as a jet-coefficient polynomial in `z` (`S(z)=Σ_m S_m zᵐ`, `S_m`
-/// jets) and dotting against the NUMERIC moments gives the interior
-/// `Σ_m S_m·M_{n+m}^{numeric}` — exact to every order because the `e^{−Δq}`
-/// expansion already contains the `(∂q)²` cross-term and higher. The truncation
-/// `e^{−Δq} ≈ Σ_{k≤4} (−Δq)^k/k!` is exact for the Jet≤4 nilpotency (`Δq` has
-/// value 0, so `(−Δq)^5` only feeds 5th-and-higher derivatives the order-≤4 jets
-/// discard). The boundary is the Leibniz flux `+ f(z_R)·z_R' − f(z_L)·z_L'`,
-/// integrand VALUE at the moving endpoint times the edge θ-velocity jet (exact to
-/// all orders via the edge-jet algebra).
-fn base_moment_jets<J: FlexJet>(
-    c: &[J; 4],
-    z_left: &J,
-    left_finite: bool,
-    z_right: &J,
-    right_finite: bool,
-    numeric_moments: &[f64],
-) -> [J; 5] {
-    // η₀ = value-only coefficient jets; jet-polynomial convolution helper.
-    let c0_const: [J; 4] = std::array::from_fn(|k| const_jet_like(&c[k], c[k].value()));
-    let conv = |lhs: &[J], rhs: &[J]| -> Vec<J> {
-        let mut out: Vec<J> = (0..lhs.len() + rhs.len() - 1)
-            .map(|_| const_jet_like(&c[0], 0.0))
-            .collect();
-        for (i, li) in lhs.iter().enumerate() {
-            for (j, rj) in rhs.iter().enumerate() {
-                out[i + j] = out[i + j].add(&li.mul(rj));
-            }
-        }
-        out
-    };
-    // −Δq(z) = −½(η² − η₀²), a jet-coefficient polynomial in z (value channel 0).
-    let eta_sq = conv(c, c);
-    let eta0_sq = conv(&c0_const, &c0_const);
-    let neg_dq: Vec<J> = eta_sq
-        .iter()
-        .zip(eta0_sq.iter())
-        .map(|(a, b)| a.sub(b).scale(-0.5))
-        .collect();
-    // S(z) = e^{−Δq} = Σ_{k=0}^{4} (−Δq)^k / k!  (jet-coefficient polynomial).
-    // Truncating at k=4 is exact for the order-≤4 jets (value(−Δq)=0).
-    let mut s_poly: Vec<J> = vec![const_jet_like(&c[0], 1.0)];
-    let mut power: Vec<J> = s_poly.clone();
-    let factorials = [1.0_f64, 1.0, 2.0, 6.0, 24.0];
-    for fact in factorials.iter().skip(1) {
-        power = conv(&power, &neg_dq);
-        for (m, coeff) in power.iter().enumerate() {
-            let term = coeff.scale(1.0 / fact);
-            if m < s_poly.len() {
-                s_poly[m] = s_poly[m].add(&term);
-            } else {
-                s_poly.push(term);
-            }
-        }
-    }
-    // The interior `Σ_m S_m·M_{n+m}^{numeric}` integrates `g(z,θ)=zⁿe^{−q(z,θ)}`
-    // over the FIXED value-channel limits `[z_L0, z_R0]` (the numeric moments are
-    // those fixed-limit integrals). The MOVING-limit correction is the thin
-    // sliver `∫_{z_R0}^{z_R(θ)} g dz − ∫_{z_L0}^{z_L(θ)} g dz` (`edge_sliver_jet`),
-    // exact to all jet orders.
-    std::array::from_fn(|n| {
-        let mut acc = const_jet_like(&c[0], 0.0);
-        for (m, s_m) in s_poly.iter().enumerate() {
-            let m_npm = numeric_moments.get(n + m).copied().unwrap_or(0.0);
-            if m_npm != 0.0 {
-                acc = acc.add(&s_m.scale(m_npm));
-            }
-        }
-        if let Some(sr) = edge_sliver_jet(n, c, z_right, right_finite) {
-            acc = acc.add(&sr);
-        }
-        if let Some(sl) = edge_sliver_jet(n, c, z_left, left_finite) {
-            acc = acc.sub(&sl);
-        }
-        acc
-    })
-}
-
-/// The moving-edge sliver `∫_{z_E0}^{z_E(θ)} zⁿ e^{−q(z,θ)} dz` as a jet (value
-/// 0, derivative channels = the §D moving-boundary flux to all orders). With
-/// `δ = z_E − z_E0` (jet, value 0) and `g(z) = zⁿ e^{−q}`,
-/// `∫_{z_E0}^{z_E} g dz = g·δ + ½ g_z δ² + ⅙ g_zz δ³ + (1/24) g_zzz δ⁴` (Taylor
-/// in δ; δ⁵ vanishes for the order-≤4 jets). `g`, `g_z`, … are evaluated at the
-/// FIXED edge `z_E0` but with the θ-dependent coefficient jets `c`, so the sliver
-/// carries the full coefficient × edge cross-motion. `q = ½(z² + η²)`,
-/// `q_z = z + η η_z`, `η_z = c1 + 2c2 z + 3c3 z²`; the `g`-stack follows from
-/// `g_z = (n/z − q_z) g` by the product/chain rule.
-fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> Option<J> {
-    if !finite {
-        return None;
-    }
-    let z0 = z_e.value();
-    let zc = const_jet_like(z_e, z0); // fixed edge, value-only
-    // η, η_z, η_zz, η_zzz at the fixed edge as jets (in c).
-    let eta = c[3]
-        .mul(&zc)
-        .add(&c[2])
-        .mul(&zc)
-        .add(&c[1])
-        .mul(&zc)
-        .add(&c[0]);
-    let eta_z = c[2]
-        .scale(2.0)
-        .add(&c[3].scale(3.0).mul(&zc))
-        .mul(&zc)
-        .add(&c[1]); // c1 + 2c2 z + 3c3 z²
-    let eta_zz = c[2].scale(2.0).add(&c[3].scale(6.0).mul(&zc)); // 2c2 + 6c3 z
-    let eta_zzz = c[3].scale(6.0); // 6c3
-    // q_z = z + η η_z ; q_zz = 1 + η_z² + η η_zz ; q_zzz = 3 η_z η_zz + η η_zzz
-    let q_z = zc.add(&eta.mul(&eta_z));
-    let q_zz = eta_z.mul(&eta_z).add(&eta.mul(&eta_zz)).add_const(1.0);
-    let q_zzz = eta_z.scale(3.0).mul(&eta_zz).add(&eta.mul(&eta_zzz));
-    // g = zⁿ e^{−q}.
-    let z_pow = {
-        let mut zk = const_jet_like(z_e, 1.0);
-        for _ in 0..n {
-            zk = zk.mul(&zc);
-        }
-        zk
-    };
-    let q = zc.mul(&zc).add(&eta.mul(&eta)).scale(0.5);
-    let w = q.scale(-1.0).exp();
-    let g = z_pow.mul(&w);
-    // n/z^k constants (z held at the fixed edge); 0 when n=0 or z0=0.
-    let nz = |power: i32| -> J {
-        if n == 0 || z0 == 0.0 {
-            const_jet_like(z_e, 0.0)
-        } else {
-            const_jet_like(z_e, n as f64 / z0.powi(power))
-        }
-    };
-    // g_z/g = a1 = n/z − q_z ; a1' = −n/z² − q_zz ; a1'' = 2n/z³ − q_zzz.
-    let a1 = nz(1).sub(&q_z);
-    let a1p = nz(2).scale(-1.0).sub(&q_zz);
-    let a1pp = nz(3).scale(2.0).sub(&q_zzz);
-    let g_z = a1.mul(&g);
-    // g_zz/g = b2 = a1' + a1² ; g_zzz/g = b2' + a1 b2, b2' = a1'' + 2 a1 a1'.
-    let b2 = a1p.add(&a1.mul(&a1));
-    let g_zz = b2.mul(&g);
-    let b2p = a1pp.add(&a1.mul(&a1p).scale(2.0));
-    let g_zzz = b2p.add(&a1.mul(&b2)).mul(&g);
-    // δ-power jets (δ value 0).
-    let delta = tangent_jet(z_e);
-    let d2 = delta.mul(&delta);
-    let d3 = d2.mul(&delta);
-    let d4 = d3.mul(&delta);
-    Some(
-        g.mul(&delta)
-            .add(&g_z.mul(&d2).scale(0.5))
-            .add(&g_zz.mul(&d3).scale(1.0 / 6.0))
-            .add(&g_zzz.mul(&d4).scale(1.0 / 24.0)),
-    )
-}
 
 /// The single-source flex row NLL **minus** the additive `w·d·ln2π` constant
 /// (which the caller adds to the value channel — it has no derivative). Written
@@ -1159,123 +832,845 @@ impl SurvivalMarginalSlopeFamily {
 
 }
 
-/// #932 item-2 Phase C STEP 3: the single-source timepoint inputs `(eta, chi, d)`
-/// at `Jet2` (value/grad/Hess), assembled from the generic FlexJet building
-/// blocks — the intercept lift (`lift_intercept_flex`), the observed eta/chi
-/// (`flex_timepoint_eta_chi`), and the density normalization
-/// `D = Σ_cells flex_timepoint_d_cell` — instead of the hand
-/// `compute_survival_timepoint_exact` θ-derivative assembly. The returned jets
-/// carry their exact first/second θ-derivatives so the value/gradient/Hessian
-/// channels match the hand `eta_u`/`eta_uv`/`chi_*`/`d_*` term for term.
-///
-/// A private free `fn` (no `&self` is needed — it consumes only the passed
-/// `primary`/`pack`/`rho`/`tau`/`cells`) so the in-`src` `#[cfg(test)]` gate can
-/// exercise it without a production caller (a `pub(crate)` item consumed only by
-/// masked test code trips the orphaned-`pub(crate)` ban). Promoted to a
-/// `pub(crate)` method at the production rewire (Phase D).
-///
-/// `rho`/`tau` are the score-warp(`h`)/link-dev(`w`)/`infl` linear-channel scalar
-/// weights (the hand `rho`/`tau` vectors, first_full.rs:909-953); they enter
-/// `eta`/`chi` through their own primary axes. `o_infl` shifts `eta`'s value.
-/// The cells supply both the calibration residual (for the lift) and the `D`
-/// integral.
-fn flex_timepoint_inputs_jet2_impl(
-    primary: &FlexPrimarySlices,
-    q_index: usize,
-    phi_q: f64,
-    a0: f64,
-    b: f64,
-    d_check: f64,
-    z_obs: f64,
-    o_infl: f64,
-    pack: &ObservedCoeffPack,
-    rho: &[f64],
-    tau: &[f64],
-    cells: &[CalibrationCellJetInputs<'_>],
-) -> Result<FlexTimepointJet2Out, String> {
-    {
-        let p = primary.total;
-        let template = Jet2::from_parts(0.0, &vec![0.0; p], &[]);
-        let b_jet = Jet2::primary(b, primary.g, p);
-        let du: Vec<Jet2> = (0..p).map(|u| Jet2::primary(0.0, u, p)).collect();
-
-        // Intercept lift to Jet2 (value/grad/Hess) — 2 Newton iterations.
-        let residual =
-            |a: &Jet2| calibration_residual_jet(a, &b_jet, primary.g, &du, q_index, phi_q, cells);
-        let a_jet = lift_intercept_flex(&template, a0, 1.0 / d_check, 2, residual);
-
-        // rho/tau channel jets: Σ_idx rho[idx]·(unit primary jet at idx).
-        let mut rho_jet = const_jet_like(&template, 0.0);
-        let mut tau_jet = const_jet_like(&template, 0.0);
-        for idx in 0..p {
-            if rho[idx] != 0.0 {
-                rho_jet = rho_jet.add(&Jet2::primary(0.0, idx, p).scale(rho[idx]));
-            }
-            if tau[idx] != 0.0 {
-                tau_jet = tau_jet.add(&Jet2::primary(0.0, idx, p).scale(tau[idx]));
-            }
-        }
-
-        let (eta, chi) =
-            flex_timepoint_eta_chi(&a_jet, &b_jet, z_obs, o_infl, pack, &rho_jet, &tau_jet);
-
-        // D = Σ_cells INV_TWO_PI·Σ_k χ_k·M_k, χ from cell_chi_poly_jets, M from
-        // the cell coeff jets through the lifted a_jet.
-        let da = tangent_jet(&a_jet);
-        let mut d = const_jet_like(&template, 0.0);
-        for cell in cells {
-            let c_pos = cell_coeff_jets(&a_jet, cell.base_pos_coeffs, cell.fixed, primary.g, &da, &du);
-            let chi_jets = cell_chi_poly_jets(&a_jet, cell.fixed, primary.g, &da, &du);
-            let edge_l = cell_edge_jet(&a_jet, &b_jet, cell.left_edge, cell.cell_left);
-            let edge_r = cell_edge_jet(&a_jet, &b_jet, cell.right_edge, cell.cell_right);
-            d = d.add(&flex_timepoint_d_cell(
-                &template,
-                &c_pos,
-                &chi_jets,
-                &edge_l,
-                cell.cell_left.is_finite(),
-                &edge_r,
-                cell.cell_right.is_finite(),
-                cell.numeric_moments,
-            ));
-        }
-
-        let to_g = |j: &Jet2| Array1::from(j.g.clone());
-        let to_h = |j: &Jet2| -> Result<Array2<f64>, String> {
-            Array2::from_shape_vec((p, p), j.h.clone()).map_err(|e| e.to_string())
-        };
-        Ok(FlexTimepointJet2Out {
-            eta: to_g(&eta),
-            eta_v: eta.value(),
-            eta_h: to_h(&eta)?,
-            chi: to_g(&chi),
-            chi_v: chi.value(),
-            chi_h: to_h(&chi)?,
-            d: to_g(&d),
-            d_v: d.value(),
-            d_h: to_h(&d)?,
-        })
-    }
-}
-
-/// The `Jet2` timepoint inputs `(eta, chi, d)` value/gradient/Hessian channels
-/// returned by [`flex_timepoint_inputs_jet2_impl`].
-struct FlexTimepointJet2Out {
-    eta_v: f64,
-    eta: Array1<f64>,
-    eta_h: Array2<f64>,
-    chi_v: f64,
-    chi: Array1<f64>,
-    chi_h: Array2<f64>,
-    d_v: f64,
-    d: Array1<f64>,
-    d_h: Array2<f64>,
-}
 
 #[cfg(test)]
 mod moment_engine_tests {
     use super::*;
     use crate::families::cubic_cell_kernel::{reduce_sextic_moments, DenestedCubicCell};
+
+    // #932: the `recip`/`exp`/`add_const` jet helpers (formerly `FlexJet` default
+    // methods) live here as free generic fns — only the relocated moment-engine /
+    // Phase-C builders below consume them, so keeping them inside the test module
+    // avoids the orphaned-`dead_code` gate while preserving the exact derivations.
+    fn recip<J: FlexJet>(x: &J) -> J {
+        let v = x.value();
+        let inv = 1.0 / v;
+        let inv2 = inv * inv;
+        x.compose_unary([inv, -inv2, 2.0 * inv2 * inv, -6.0 * inv2 * inv2, 24.0 * inv2 * inv2 * inv])
+    }
+    fn exp_jet<J: FlexJet>(x: &J) -> J {
+        let e = x.value().exp();
+        x.compose_unary([e, e, e, e, e])
+    }
+    fn add_const<J: FlexJet>(x: &J, c: f64) -> J {
+        x.compose_unary([x.value() + c, 1.0, 0.0, 0.0, 0.0])
+    }
+
+    // ── §B moment engine: the de-nested cell moments over a FlexJet ─────────────
+    //
+    // #932 Item 2 (doc §D). The per-cell moments `M_n = ∫_{z_L}^{z_R} z^n e^{−q(z)} dz`
+    // (sextic `q`, no closed antiderivative) satisfy the SAME raising recurrence the
+    // numeric `cubic_cell_kernel::reduce_sextic_moments` uses —
+    //   `M_{n+5} = (n·M_{n−1} − Σ_{j=0}^{4} d[j]·M_{n+j} − b_n) / d[5]`,
+    // with `d = q'(z)` coefficients (`sextic_qprime_coefficients`) and boundary term
+    // `b_n = z_R^n e^{−q(z_R)} − z_L^n e^{−q(z_L)}` — so it ports to ANY `FlexJet`
+    // scalar verbatim. Carrying the cell coefficients `c0..c3` and the (moving) edges
+    // `z_L,z_R` as jets propagates the moments' θ-derivatives mechanically: the
+    // `Σ d[j]·M_{n+j}` term is the interior coefficient sensitivity and the boundary
+    // term `b_n` is exactly the §D moving-boundary flux (its edge-jet derivatives are
+    // the Leibniz `[z^n e^{−q}·z_edge']` contributions the hand `directional` path
+    // assembles by hand). The base moments `M_0..M_4` (the normalization integrals)
+    // arrive as jets from the cell evaluator — those carry the only transcendental
+    // (erf/series) content; the algebra owns the rest.
+
+    /// `q'(z)` coefficient jets `[d0..d5]` for `q = ½(z² + η²)`, `η = c0+c1 z+c2 z²+
+    /// c3 z³`, over `FlexJet` cell-coefficient jets — the jet image of
+    /// [`crate::families::cubic_cell_kernel::sextic_qprime_coefficients`].
+    fn qprime_coeffs_jet<J: FlexJet>(c: &[J; 4]) -> [J; 6] {
+        let (c0, c1, c2, c3) = (&c[0], &c[1], &c[2], &c[3]);
+        // d0 = c0·c1
+        let d0 = c0.mul(c1);
+        // d1 = 1 + c1² + 2·c0·c2   (the leading `+z` of q' supplies the constant 1)
+        let d1 = add_const(&c1.mul(c1).add(&c0.mul(c2).scale(2.0)), 1.0);
+        // d2 = 3·c0·c3 + 3·c1·c2
+        let d2 = c0.mul(c3).add(&c1.mul(c2)).scale(3.0);
+        // d3 = 4·c1·c3 + 2·c2²
+        let d3 = c1.mul(c3).scale(4.0).add(&c2.mul(c2).scale(2.0));
+        // d4 = 5·c2·c3
+        let d4 = c2.mul(c3).scale(5.0);
+        // d5 = 3·c3²
+        let d5 = c3.mul(c3).scale(3.0);
+        [d0, d1, d2, d3, d4, d5]
+    }
+
+    /// `q(z) = ½(z² + η(z)²)` evaluated at an edge jet `z`, with `η` from the cell
+    /// coefficient jets — the exponent whose `e^{−q}` is the boundary weight.
+    fn cell_q_at_jet<J: FlexJet>(c: &[J; 4], z: &J) -> J {
+        // η = c0 + c1 z + c2 z² + c3 z³  (Horner)
+        let eta = c[3]
+            .mul(z)
+            .add(&c[2])
+            .mul(z)
+            .add(&c[1])
+            .mul(z)
+            .add(&c[0]);
+        // ½(z² + η²)
+        z.mul(z).add(&eta.mul(&eta)).scale(0.5)
+    }
+
+    /// One boundary term `z^n·e^{−q(z)}` at a (possibly infinite) moving edge jet.
+    /// An infinite edge contributes nothing (matching the numeric
+    /// `moment_boundary_term_with_powers` short-circuit).
+    fn boundary_edge_term_jet<J: FlexJet>(c: &[J; 4], z: &J, z_pow_n: &J, finite: bool) -> Option<J> {
+        if !finite {
+            return None;
+        }
+        let q = cell_q_at_jet(c, z);
+        let w = exp_jet(&q.scale(-1.0));
+        Some(z_pow_n.mul(&w))
+    }
+
+    /// The sextic moment recurrence over a `FlexJet`: given the cell coefficient
+    /// jets `c`, the moving edge jets `(z_left, z_right)` with their finiteness, and
+    /// the base moment jets `M_0..M_4`, return `M_0..M_max` as jets. Bit-faithful to
+    /// `reduce_sextic_moments` term for term, but every operation in the `FlexJet`
+    /// algebra so the moments carry their exact θ-derivatives.
+    fn cell_moment_recurrence_jet<J: FlexJet>(
+        c: &[J; 4],
+        z_left: &J,
+        left_finite: bool,
+        z_right: &J,
+        right_finite: bool,
+        base_m0_m4: &[J; 5],
+        max_degree: usize,
+    ) -> Vec<J> {
+        let d = qprime_coeffs_jet(c);
+        let inv_lead = recip(&d[5]);
+        let mut moments: Vec<J> = base_m0_m4.iter().cloned().collect();
+        if max_degree < 5 {
+            moments.truncate(max_degree + 1);
+            return moments;
+        }
+        // Rolling z^n at each edge (jets), starting at n = 0 (z^0 = 1 = z/z).
+        let one_l = recip(z_left).mul(z_left);
+        let one_r = recip(z_right).mul(z_right);
+        let mut left_pow = one_l;
+        let mut right_pow = one_r;
+        for n in 0..=(max_degree - 5) {
+            let b_left = boundary_edge_term_jet(c, z_left, &left_pow, left_finite);
+            let b_right = boundary_edge_term_jet(c, z_right, &right_pow, right_finite);
+            // b_n = right − left, missing edges contribute zero.
+            let mut b_n = match (b_right, b_left) {
+                (Some(r), Some(l)) => r.sub(&l),
+                (Some(r), None) => r,
+                (None, Some(l)) => l.scale(-1.0),
+                (None, None) => moments[0].scale(0.0),
+            };
+            // numer = n·M_{n−1} − Σ_{j=0}^{4} d[j]·M_{n+j} − b_n
+            let mut numer = if n == 0 {
+                moments[0].scale(0.0)
+            } else {
+                moments[n - 1].scale(n as f64)
+            };
+            for j in 0..=4 {
+                numer = numer.sub(&d[j].mul(&moments[n + j]));
+            }
+            numer = numer.sub(&b_n);
+            moments.push(numer.mul(&inv_lead));
+            // Roll powers: z^{n+1} = z^n · z.
+            left_pow = if left_finite {
+                left_pow.mul(z_left)
+            } else {
+                b_n.scale(0.0)
+            };
+            right_pow = if right_finite {
+                right_pow.mul(z_right)
+            } else {
+                // reuse b_n as a zero-jet scratch source of the right `p`
+                b_n = b_n.scale(0.0);
+                b_n
+            };
+        }
+        moments
+    }
+
+    /// #932 item-2 Phase B-base: the normalization base moments `M_0..M_4` as jets,
+    /// carrying their exact θ-derivatives (incl. the moving-edge flux), built from
+    /// the cell's already-computed NUMERIC moment vector (`numeric_moments`) plus the
+    /// cell-coefficient jets `c` and the moving edge jets `(z_left, z_right)`.
+    ///
+    /// `M_n = ∫_{z_L(θ)}^{z_R(θ)} zⁿ e^{−q(z,θ)} dz`, `q = ½(z² + η(z)²)`, `η = c0+c1z
+    /// +c2z²+c3z³` with `(c, z_L, z_R)` all θ-dependent.
+    ///
+    /// This single-sources the hand `survival_flex_base_d_u`/`_d_uv`/`f_au`/`f_aa`
+    /// base normalization derivatives over a generic `FlexJet` order — exact to ALL
+    /// jet orders (Jet2/Jet3/Jet4), not just first. The value channel is
+    /// bit-identical to `numeric_moments[n]`; the derivative channels are
+    /// finite-difference-pinned against `evaluate_cell_moments` on perturbed cells
+    /// (`base_moment_jets_first_derivative_matches_fd_932`,
+    /// `base_moment_jets_second_derivative_matches_fd_932`).
+    ///
+    /// EXACTNESS to all orders (the self-consistent closure): write
+    /// `M_n(θ) = ∫ zⁿ e^{−q(z,θ)} dz = ∫ zⁿ e^{−q(z,θ₀)}·e^{−Δq(z)} dz`,
+    /// `Δq(z) = q(z,θ) − q(z,θ₀) = ½(η(z,θ)² − η(z,θ₀)²)` (the `z²` term cancels).
+    /// The factor `e^{−Δq}` has VALUE channel 1 (Δq=0 at θ₀) and its derivative
+    /// channels carry the full `(−∂q)` / `(−∂²q + (∂q)²)` / … expansion. Expanding
+    /// `e^{−Δq}` as a jet-coefficient polynomial in `z` (`S(z)=Σ_m S_m zᵐ`, `S_m`
+    /// jets) and dotting against the NUMERIC moments gives the interior
+    /// `Σ_m S_m·M_{n+m}^{numeric}` — exact to every order because the `e^{−Δq}`
+    /// expansion already contains the `(∂q)²` cross-term and higher. The truncation
+    /// `e^{−Δq} ≈ Σ_{k≤4} (−Δq)^k/k!` is exact for the Jet≤4 nilpotency (`Δq` has
+    /// value 0, so `(−Δq)^5` only feeds 5th-and-higher derivatives the order-≤4 jets
+    /// discard). The boundary is the Leibniz flux `+ f(z_R)·z_R' − f(z_L)·z_L'`,
+    /// integrand VALUE at the moving endpoint times the edge θ-velocity jet (exact to
+    /// all orders via the edge-jet algebra).
+    fn base_moment_jets<J: FlexJet>(
+        c: &[J; 4],
+        z_left: &J,
+        left_finite: bool,
+        z_right: &J,
+        right_finite: bool,
+        numeric_moments: &[f64],
+    ) -> [J; 5] {
+        // η₀ = value-only coefficient jets; jet-polynomial convolution helper.
+        let c0_const: [J; 4] = std::array::from_fn(|k| const_jet_like(&c[k], c[k].value()));
+        let conv = |lhs: &[J], rhs: &[J]| -> Vec<J> {
+            let mut out: Vec<J> = (0..lhs.len() + rhs.len() - 1)
+                .map(|_| const_jet_like(&c[0], 0.0))
+                .collect();
+            for (i, li) in lhs.iter().enumerate() {
+                for (j, rj) in rhs.iter().enumerate() {
+                    out[i + j] = out[i + j].add(&li.mul(rj));
+                }
+            }
+            out
+        };
+        // −Δq(z) = −½(η² − η₀²), a jet-coefficient polynomial in z (value channel 0).
+        let eta_sq = conv(c, c);
+        let eta0_sq = conv(&c0_const, &c0_const);
+        let neg_dq: Vec<J> = eta_sq
+            .iter()
+            .zip(eta0_sq.iter())
+            .map(|(a, b)| a.sub(b).scale(-0.5))
+            .collect();
+        // S(z) = e^{−Δq} = Σ_{k=0}^{4} (−Δq)^k / k!  (jet-coefficient polynomial).
+        // Truncating at k=4 is exact for the order-≤4 jets (value(−Δq)=0).
+        let mut s_poly: Vec<J> = vec![const_jet_like(&c[0], 1.0)];
+        let mut power: Vec<J> = s_poly.clone();
+        let factorials = [1.0_f64, 1.0, 2.0, 6.0, 24.0];
+        for fact in factorials.iter().skip(1) {
+            power = conv(&power, &neg_dq);
+            for (m, coeff) in power.iter().enumerate() {
+                let term = coeff.scale(1.0 / fact);
+                if m < s_poly.len() {
+                    s_poly[m] = s_poly[m].add(&term);
+                } else {
+                    s_poly.push(term);
+                }
+            }
+        }
+        // The interior `Σ_m S_m·M_{n+m}^{numeric}` integrates `g(z,θ)=zⁿe^{−q(z,θ)}`
+        // over the FIXED value-channel limits `[z_L0, z_R0]` (the numeric moments are
+        // those fixed-limit integrals). The MOVING-limit correction is the thin
+        // sliver `∫_{z_R0}^{z_R(θ)} g dz − ∫_{z_L0}^{z_L(θ)} g dz` (`edge_sliver_jet`),
+        // exact to all jet orders.
+        std::array::from_fn(|n| {
+            let mut acc = const_jet_like(&c[0], 0.0);
+            for (m, s_m) in s_poly.iter().enumerate() {
+                let m_npm = numeric_moments.get(n + m).copied().unwrap_or(0.0);
+                if m_npm != 0.0 {
+                    acc = acc.add(&s_m.scale(m_npm));
+                }
+            }
+            if let Some(sr) = edge_sliver_jet(n, c, z_right, right_finite) {
+                acc = acc.add(&sr);
+            }
+            if let Some(sl) = edge_sliver_jet(n, c, z_left, left_finite) {
+                acc = acc.sub(&sl);
+            }
+            acc
+        })
+    }
+
+    /// The moving-edge sliver `∫_{z_E0}^{z_E(θ)} zⁿ e^{−q(z,θ)} dz` as a jet (value
+    /// 0, derivative channels = the §D moving-boundary flux to all orders). With
+    /// `δ = z_E − z_E0` (jet, value 0) and `g(z) = zⁿ e^{−q}`,
+    /// `∫_{z_E0}^{z_E} g dz = g·δ + ½ g_z δ² + ⅙ g_zz δ³ + (1/24) g_zzz δ⁴` (Taylor
+    /// in δ; δ⁵ vanishes for the order-≤4 jets). `g`, `g_z`, … are evaluated at the
+    /// FIXED edge `z_E0` but with the θ-dependent coefficient jets `c`, so the sliver
+    /// carries the full coefficient × edge cross-motion. `q = ½(z² + η²)`,
+    /// `q_z = z + η η_z`, `η_z = c1 + 2c2 z + 3c3 z²`; the `g`-stack follows from
+    /// `g_z = (n/z − q_z) g` by the product/chain rule.
+    fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> Option<J> {
+        if !finite {
+            return None;
+        }
+        let z0 = z_e.value();
+        let zc = const_jet_like(z_e, z0); // fixed edge, value-only
+        // η, η_z, η_zz, η_zzz at the fixed edge as jets (in c).
+        let eta = c[3]
+            .mul(&zc)
+            .add(&c[2])
+            .mul(&zc)
+            .add(&c[1])
+            .mul(&zc)
+            .add(&c[0]);
+        let eta_z = c[2]
+            .scale(2.0)
+            .add(&c[3].scale(3.0).mul(&zc))
+            .mul(&zc)
+            .add(&c[1]); // c1 + 2c2 z + 3c3 z²
+        let eta_zz = c[2].scale(2.0).add(&c[3].scale(6.0).mul(&zc)); // 2c2 + 6c3 z
+        let eta_zzz = c[3].scale(6.0); // 6c3
+        // q_z = z + η η_z ; q_zz = 1 + η_z² + η η_zz ; q_zzz = 3 η_z η_zz + η η_zzz
+        let q_z = zc.add(&eta.mul(&eta_z));
+        let q_zz = add_const(&eta_z.mul(&eta_z).add(&eta.mul(&eta_zz)), 1.0);
+        let q_zzz = eta_z.scale(3.0).mul(&eta_zz).add(&eta.mul(&eta_zzz));
+        // g = zⁿ e^{−q}.
+        let z_pow = {
+            let mut zk = const_jet_like(z_e, 1.0);
+            for _ in 0..n {
+                zk = zk.mul(&zc);
+            }
+            zk
+        };
+        let q = zc.mul(&zc).add(&eta.mul(&eta)).scale(0.5);
+        let w = exp_jet(&q.scale(-1.0));
+        let g = z_pow.mul(&w);
+        // n/z^k constants (z held at the fixed edge); 0 when n=0 or z0=0.
+        let nz = |power: i32| -> J {
+            if n == 0 || z0 == 0.0 {
+                const_jet_like(z_e, 0.0)
+            } else {
+                const_jet_like(z_e, n as f64 / z0.powi(power))
+            }
+        };
+        // g_z/g = a1 = n/z − q_z ; a1' = −n/z² − q_zz ; a1'' = 2n/z³ − q_zzz.
+        let a1 = nz(1).sub(&q_z);
+        let a1p = nz(2).scale(-1.0).sub(&q_zz);
+        let a1pp = nz(3).scale(2.0).sub(&q_zzz);
+        let g_z = a1.mul(&g);
+        // g_zz/g = b2 = a1' + a1² ; g_zzz/g = b2' + a1 b2, b2' = a1'' + 2 a1 a1'.
+        let b2 = a1p.add(&a1.mul(&a1));
+        let g_zz = b2.mul(&g);
+        let b2p = a1pp.add(&a1.mul(&a1p).scale(2.0));
+        let g_zzz = b2p.add(&a1.mul(&b2)).mul(&g);
+        // δ-power jets (δ value 0).
+        let delta = tangent_jet(z_e);
+        let d2 = delta.mul(&delta);
+        let d3 = d2.mul(&delta);
+        let d4 = d3.mul(&delta);
+        Some(
+            g.mul(&delta)
+                .add(&g_z.mul(&d2).scale(0.5))
+                .add(&g_zz.mul(&d3).scale(1.0 / 6.0))
+                .add(&g_zzz.mul(&d4).scale(1.0 / 24.0)),
+        )
+    }
+
+    /// #932 item-2 Phase C STEP 3: the single-source timepoint inputs `(eta, chi, d)`
+    /// at `Jet2` (value/grad/Hess), assembled from the generic FlexJet building
+    /// blocks — the intercept lift (`lift_intercept_flex`), the observed eta/chi
+    /// (`flex_timepoint_eta_chi`), and the density normalization
+    /// `D = Σ_cells flex_timepoint_d_cell` — instead of the hand
+    /// `compute_survival_timepoint_exact` θ-derivative assembly. The returned jets
+    /// carry their exact first/second θ-derivatives so the value/gradient/Hessian
+    /// channels match the hand `eta_u`/`eta_uv`/`chi_*`/`d_*` term for term.
+    ///
+    /// A private free `fn` (no `&self` is needed — it consumes only the passed
+    /// `primary`/`pack`/`rho`/`tau`/`cells`) so the in-`src` `#[cfg(test)]` gate can
+    /// exercise it without a production caller (a `pub(crate)` item consumed only by
+    /// masked test code trips the orphaned-`pub(crate)` ban). Promoted to a
+    /// `pub(crate)` method at the production rewire (Phase D).
+    ///
+    /// `rho`/`tau` are the score-warp(`h`)/link-dev(`w`)/`infl` linear-channel scalar
+    /// weights (the hand `rho`/`tau` vectors, first_full.rs:909-953); they enter
+    /// `eta`/`chi` through their own primary axes. `o_infl` shifts `eta`'s value.
+    /// The cells supply both the calibration residual (for the lift) and the `D`
+    /// integral.
+    fn flex_timepoint_inputs_jet2_impl(
+        primary: &FlexPrimarySlices,
+        q_index: usize,
+        phi_q: f64,
+        a0: f64,
+        b: f64,
+        d_check: f64,
+        z_obs: f64,
+        o_infl: f64,
+        pack: &ObservedCoeffPack,
+        rho: &[f64],
+        tau: &[f64],
+        cells: &[CalibrationCellJetInputs<'_>],
+    ) -> Result<FlexTimepointJet2Out, String> {
+        {
+            let p = primary.total;
+            let template = Jet2::from_parts(0.0, &vec![0.0; p], &[]);
+            let b_jet = Jet2::primary(b, primary.g, p);
+            let du: Vec<Jet2> = (0..p).map(|u| Jet2::primary(0.0, u, p)).collect();
+
+            // Intercept lift to Jet2 (value/grad/Hess) — 2 Newton iterations.
+            let residual =
+                |a: &Jet2| calibration_residual_jet(a, &b_jet, primary.g, &du, q_index, phi_q, cells);
+            let a_jet = lift_intercept_flex(&template, a0, 1.0 / d_check, 2, residual);
+
+            // rho/tau channel jets: Σ_idx rho[idx]·(unit primary jet at idx).
+            let mut rho_jet = const_jet_like(&template, 0.0);
+            let mut tau_jet = const_jet_like(&template, 0.0);
+            for idx in 0..p {
+                if rho[idx] != 0.0 {
+                    rho_jet = rho_jet.add(&Jet2::primary(0.0, idx, p).scale(rho[idx]));
+                }
+                if tau[idx] != 0.0 {
+                    tau_jet = tau_jet.add(&Jet2::primary(0.0, idx, p).scale(tau[idx]));
+                }
+            }
+
+            let (eta, chi) =
+                flex_timepoint_eta_chi(&a_jet, &b_jet, z_obs, o_infl, pack, &rho_jet, &tau_jet);
+
+            // D = Σ_cells INV_TWO_PI·Σ_k χ_k·M_k, χ from cell_chi_poly_jets, M from
+            // the cell coeff jets through the lifted a_jet.
+            let da = tangent_jet(&a_jet);
+            let mut d = const_jet_like(&template, 0.0);
+            for cell in cells {
+                let c_pos = cell_coeff_jets(&a_jet, cell.base_pos_coeffs, cell.fixed, primary.g, &da, &du);
+                let chi_jets = cell_chi_poly_jets(&a_jet, cell.fixed, primary.g, &da, &du);
+                let edge_l = cell_edge_jet(&a_jet, &b_jet, cell.left_edge, cell.cell_left);
+                let edge_r = cell_edge_jet(&a_jet, &b_jet, cell.right_edge, cell.cell_right);
+                d = d.add(&flex_timepoint_d_cell(
+                    &template,
+                    &c_pos,
+                    &chi_jets,
+                    &edge_l,
+                    cell.cell_left.is_finite(),
+                    &edge_r,
+                    cell.cell_right.is_finite(),
+                    cell.numeric_moments,
+                ));
+            }
+
+            let to_g = |j: &Jet2| Array1::from(j.g.clone());
+            let to_h = |j: &Jet2| -> Result<Array2<f64>, String> {
+                Array2::from_shape_vec((p, p), j.h.clone()).map_err(|e| e.to_string())
+            };
+            Ok(FlexTimepointJet2Out {
+                eta: to_g(&eta),
+                eta_v: eta.value(),
+                eta_h: to_h(&eta)?,
+                chi: to_g(&chi),
+                chi_v: chi.value(),
+                chi_h: to_h(&chi)?,
+                d: to_g(&d),
+                d_v: d.value(),
+                d_h: to_h(&d)?,
+            })
+        }
+    }
+
+    /// The `Jet2` timepoint inputs `(eta, chi, d)` value/gradient/Hessian channels
+    /// returned by [`flex_timepoint_inputs_jet2_impl`].
+    struct FlexTimepointJet2Out {
+        eta_v: f64,
+        eta: Array1<f64>,
+        eta_h: Array2<f64>,
+        chi_v: f64,
+        chi: Array1<f64>,
+        chi_h: Array2<f64>,
+        d_v: f64,
+        d: Array1<f64>,
+        d_h: Array2<f64>,
+    }
+
+    // ── §C: observed cell-coefficient jets + eta/chi point-eval (Phase C core) ──
+    //
+    // The observed cell coefficients `coeff[k]` are a smooth function of the
+    // intercept `a(θ)` and the slope `b` (= the `g` primary), with the score-warp
+    // (`h`) and link-dev (`w`) channels entering linearly on top. Their full
+    // bivariate Taylor in `(a,b)` is exactly the `observed_denested_cell_partials`
+    // pack (`dc_da…dc_dbbb`). Composing that Taylor with the intercept jet `a_jet`
+    // and the slope jet `b_jet` (both carrying their θ-derivatives) yields each
+    // `coeff[k]` AS a jet — so `eta = Σ_k coeff[k]·z_obs^k` and `chi = Σ_k
+    // dc_da[k]·z_obs^k` (point-evals at the fixed observation `z_obs`) carry their
+    // exact θ-derivatives mechanically, replacing the hand `eta_u = chi·a_u + rho`
+    // / `eta_uv = …` chain in `first_full`/`directional`/`bidirectional`.
+
+    /// A value-zero "tangent" jet `x_jet − x.value()`: value 0, derivative channels
+    /// preserved. Used as the perturbation argument of the bivariate Taylor below.
+    #[inline]
+    fn tangent_jet<J: FlexJet>(x: &J) -> J {
+        add_const(x, -x.value())
+    }
+
+    /// A constant jet (value `v`, all derivative channels zero), shaped like
+    /// `template` (so it carries the right runtime primary count).
+    #[inline]
+    fn const_jet_like<J: FlexJet>(template: &J, v: f64) -> J {
+        add_const(&template.scale(0.0), v)
+    }
+
+    /// #932 item-2 Phase C STEP 2: the generic-order intercept Newton lift over a
+    /// runtime `FlexJet` — the linchpin that produces the 3rd/4th intercept
+    /// θ-derivatives the base Hessian lacks. Mirrors `lift_intercept_order2` /
+    /// `filtered_implicit_solve_scalar` but over a runtime `Jet2`/`Jet3`/`Jet4`.
+    ///
+    /// The calibration constraint `F(a(θ), θ) = 0` is solved by the filtered Newton
+    /// step `A ← A − R(A)·inv_fa` (`inv_fa = 1/D`, `D = |F_a|`), iterated `iters`
+    /// times (the jet nilpotency order). `R(A)` is the calibration RESIDUAL JET built
+    /// by the caller-supplied `residual` closure from the per-cell coefficient jets
+    /// and moment jets:
+    ///
+    ///   R(A) = Σ_cells INV_TWO_PI · Σ_k tangent(c_posₖ(A)) · Mₖ(A)   (+ q self-term)
+    ///
+    /// where `c_posₖ(A)` are the POSITIVE cell coefficients as jets in `A` (and the
+    /// primaries) and `Mₖ(A)` the cell's normalization moment jets. This is the EXACT
+    /// calibration θ-jet to all orders: `∂_θ R = INV_TWO_PI ∫ η_θ e^{−q} = −f_u`,
+    /// `∂²_θ R = INV_TWO_PI ∫ (η_θθ − η η_θ²) e^{−q}` (the `−η η_θ²` falling out of
+    /// `Mₖ`'s own `e^{−Δq}` motion `M_θ = −∫ η η_θ e^{−q}`), reproducing the hand
+    /// `f_u`/`f_uv`/`f_aa` moment dots and their 3rd/4th extensions automatically. The
+    /// value channel is the scalar calibration `f` (driven to ~0 by seeding
+    /// `A.value = a0` from the scalar solve), so only the derivative channels solve.
+    ///
+    /// `template` carries the runtime primary count; `a0` the solved intercept value.
+    fn lift_intercept_flex<J: FlexJet>(
+        template: &J,
+        a0: f64,
+        inv_fa: f64,
+        iters: usize,
+        residual: impl Fn(&J) -> J,
+    ) -> J {
+        let mut a = const_jet_like(template, a0);
+        for _ in 0..iters {
+            let r = residual(&a);
+            a = a.sub(&r.scale(inv_fa));
+        }
+        a
+    }
+
+    /// The per-row calibration residual jet `R(A)` for [`lift_intercept_flex`],
+    /// summed over a timepoint's cells: `Σ_cells INV_TWO_PI·Σ_k tangent(c_posₖ(A))·
+    /// Mₖ(A)` plus the q-marginal self-term `−φ(q)` on the `q_index` primary (the
+    /// `f_u[q_index] += φ(q)` boundary term of the calibration). The cells are
+    /// supplied as `(base_pos_coeffs, fixed, edges, finiteness, numeric_moments)` so
+    /// the coefficient jets and moment jets are rebuilt at the current iterate `A`.
+    fn calibration_residual_jet<J: FlexJet>(
+        a_jet: &J,
+        b_jet: &J,
+        g_axis: usize,
+        du: &[J],
+        q_index: usize,
+        phi_q: f64,
+        cells: &[CalibrationCellJetInputs<'_>],
+    ) -> J {
+        let da = tangent_jet(a_jet);
+        let inv_two_pi = std::f64::consts::TAU.recip();
+        let mut r = const_jet_like(a_jet, 0.0);
+        for cell in cells {
+            // Positive cell coefficients as jets in (A, primaries).
+            let c_pos = cell_coeff_jets(a_jet, cell.base_pos_coeffs, cell.fixed, g_axis, &da, du);
+            // Moving edge jets: Crossing edges move with A/b, Fixed edges are static.
+            let edge_l = cell_edge_jet(a_jet, b_jet, cell.left_edge, cell.cell_left);
+            let edge_r = cell_edge_jet(a_jet, b_jet, cell.right_edge, cell.cell_right);
+            let m = base_moment_jets(
+                &c_pos,
+                &edge_l,
+                cell.cell_left.is_finite(),
+                &edge_r,
+                cell.cell_right.is_finite(),
+                cell.numeric_moments,
+            );
+            // Σ_k tangent(c_posₖ)·Mₖ  (tangent strips the value: F's VALUE is carried
+            // by the scalar seed, only the θ-motion of η enters the residual deriv).
+            let mut cell_r = const_jet_like(a_jet, 0.0);
+            for k in 0..4 {
+                cell_r = cell_r.add(&tangent_jet(&c_pos[k]).mul(&m[k]));
+            }
+            r = r.add(&cell_r.scale(inv_two_pi));
+        }
+        // q-marginal self-term: f_u[q_index] += φ(q) ⟹ R gains −φ(q)·(q-axis tangent).
+        // (R = −F, and the hand adds +φ(q) to f_u[q_index].)
+        if q_index < du.len() {
+            r = r.sub(&du[q_index].scale(phi_q));
+        }
+        r
+    }
+
+    /// Per-cell inputs for [`calibration_residual_jet`]: the positive base
+    /// coefficients, the fixed-partial pack, the cell edges (location + provenance),
+    /// and the numeric moment vector. Borrowed from the cached partition.
+    struct CalibrationCellJetInputs<'a> {
+        base_pos_coeffs: [f64; 4],
+        fixed: &'a DenestedCellPrimaryFixedPartials,
+        cell_left: f64,
+        cell_right: f64,
+        left_edge: crate::families::cubic_cell_kernel::PartitionEdge,
+        right_edge: crate::families::cubic_cell_kernel::PartitionEdge,
+        numeric_moments: &'a [f64],
+    }
+
+    /// The moving cell-edge `z` as a jet: a `Crossing { tau }` edge sits at
+    /// `z = (τ − a)/b` and moves with the intercept jet `a_jet` and slope jet
+    /// `b_jet`; a `Fixed(z)` edge is static (a constant jet, no θ-motion).
+    fn cell_edge_jet<J: FlexJet>(
+        a_jet: &J,
+        b_jet: &J,
+        edge: crate::families::cubic_cell_kernel::PartitionEdge,
+        z_value: f64,
+    ) -> J {
+        match edge {
+            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { tau } => {
+                // z = (τ − a)·(1/b).
+                const_jet_like(a_jet, tau).sub(a_jet).mul(&recip(b_jet))
+            }
+            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
+                const_jet_like(a_jet, z_value)
+            }
+        }
+    }
+
+    /// One observed cell coefficient `coeff[k]` as a jet: the bivariate `(a,b)`
+    /// Taylor (up to 3rd order, matching the `dc_d{a,b}…` pack) composed with the
+    /// intercept tangent `da` and slope tangent `db` jets. Terms with a 0/6/2/… are
+    /// the multinomial Taylor weights `coeff + Σ (1/(i!j!)) ∂^{i+j}coeff/∂a^i∂b^j ·
+    /// da^i db^j`.
+    fn observed_coeff_component_jet<J: FlexJet>(
+        template: &J,
+        k: usize,
+        coeff: [f64; 4],
+        dc_da: [f64; 4],
+        dc_db: [f64; 4],
+        dc_daa: [f64; 4],
+        dc_dab: [f64; 4],
+        dc_dbb: [f64; 4],
+        dc_daaa: [f64; 4],
+        dc_daab: [f64; 4],
+        dc_dabb: [f64; 4],
+        dc_dbbb: [f64; 4],
+        da: &J,
+        db: &J,
+    ) -> J {
+        let dada = da.mul(da);
+        let dadb = da.mul(db);
+        let dbdb = db.mul(db);
+        let mut c = const_jet_like(template, coeff[k]);
+        c = c.add(&da.scale(dc_da[k])).add(&db.scale(dc_db[k]));
+        c = c
+            .add(&dada.scale(0.5 * dc_daa[k]))
+            .add(&dadb.scale(dc_dab[k]))
+            .add(&dbdb.scale(0.5 * dc_dbb[k]));
+        let inv6 = 1.0 / 6.0;
+        let half = 0.5;
+        c = c
+            .add(&dada.mul(da).scale(inv6 * dc_daaa[k]))
+            .add(&dada.mul(db).scale(half * dc_daab[k]))
+            .add(&dadb.mul(db).scale(half * dc_dabb[k]))
+            .add(&dbdb.mul(db).scale(inv6 * dc_dbbb[k]));
+        c
+    }
+
+    /// The per-cell de-nested coefficient `c_k` (k = 0..4) as a jet, built from the
+    /// cell's `DenestedCellPrimaryFixedPartials` pack composed with the intercept
+    /// perturbation `da = tangent(a_jet)` and the per-primary perturbations
+    /// `du[u] = tangent(primary_u)`. This is the cell analogue of
+    /// `observed_coeff_component_jet`, carrying ALL primaries (not just a,b): it is
+    /// the multivariate Taylor of `c_k(a, {θ_u})` whose cross-partials are the pack
+    /// fields. Matches the hand `eta_u_poly`/`eta_uv_poly`/`chi_*` assembly in
+    /// `first_full`/`directional`/`bidirectional` term for term — the FlexJet algebra
+    /// raises it to the contracted third/fourth automatically.
+    ///
+    /// Taylor structure (per k, `g_axis` = the slope `b` primary):
+    ///   c = c0
+    ///     + dc_da·da + ½dc_daa·da² + ⅙dc_daaa·da³                       (pure a)
+    ///     + Σ_u coeff_u[u]·du                                           (pure u, lin)
+    ///     + Σ_u coeff_au[u]·da·du + ½Σ_u coeff_aau[u]·da²·du            (a×u)
+    ///     + Σ_u coeff_bu[u]·db·du + Σ_u coeff_abu[u]·da·db·du           (b×u)
+    ///       + ½Σ_u coeff_bbu[u]·db²·du
+    ///     + ⅙Σ_u coeff_aaau[u]·da³·du + ½Σ_u coeff_aabu[u]·da²·db·du    (3rd in a/b ×u)
+    ///       + ½Σ_u coeff_abbu[u]·da·db²·du + ⅙Σ_u coeff_bbbu[u]·db³·du
+    /// where `db = du[g_axis]` (the slope perturbation). The `coeff_u`-family terms
+    /// are LINEAR in `du` (each cell coefficient is at most linear in any single
+    /// non-a/non-b primary), so no `du²` term is needed beyond the b-channel ones.
+    fn cell_coeff_jets<J: FlexJet>(
+        template: &J,
+        base_c: [f64; 4],
+        fixed: &DenestedCellPrimaryFixedPartials,
+        g_axis: usize,
+        da: &J,
+        du: &[J],
+    ) -> [J; 4] {
+        let p = du.len();
+        let dada = da.mul(da);
+        let dadada = dada.mul(da);
+        let db = &du[g_axis];
+        let dadb = da.mul(db);
+        let dbdb = db.mul(db);
+        std::array::from_fn(|k| {
+            let mut c = const_jet_like(template, base_c[k]);
+            // Pure-a chain.
+            c = c
+                .add(&da.scale(fixed.dc_da[k]))
+                .add(&dada.scale(0.5 * fixed.dc_daa[k]))
+                .add(&dadada.scale(fixed.dc_daaa[k] / 6.0));
+            // Per-primary chains (linear in du[u]).
+            for u in 0..p {
+                let duu = &du[u];
+                let mut chain = duu.scale(fixed.coeff_u[u][k]);
+                chain = chain
+                    .add(&da.mul(duu).scale(fixed.coeff_au[u][k]))
+                    .add(&dada.mul(duu).scale(0.5 * fixed.coeff_aau[u][k]));
+                chain = chain
+                    .add(&db.mul(duu).scale(fixed.coeff_bu[u][k]))
+                    .add(&dadb.mul(duu).scale(fixed.coeff_abu[u][k]))
+                    .add(&dbdb.mul(duu).scale(0.5 * fixed.coeff_bbu[u][k]));
+                chain = chain
+                    .add(&dadada.mul(duu).scale(fixed.coeff_aaau[u][k] / 6.0))
+                    .add(&dada.mul(db).mul(duu).scale(0.5 * fixed.coeff_aabu[u][k]))
+                    .add(&dadb.mul(db).mul(duu).scale(0.5 * fixed.coeff_abbu[u][k]))
+                    .add(&dbdb.mul(db).mul(duu).scale(fixed.coeff_bbbu[u][k] / 6.0));
+                c = c.add(&chain);
+            }
+            c
+        })
+    }
+
+    /// The per-cell `χ = ∂η/∂a` polynomial coefficients `dc_da[k]` (k = 0..4) as
+    /// jets, the `∂_a`-shifted analogue of [`cell_coeff_jets`]: the cell coefficient
+    /// family whose base is `dc_da`, whose `a`-derivatives are `dc_daa`/`dc_daaa`,
+    /// whose per-primary derivatives are `coeff_au`/`coeff_aau` (= `∂(dc_da)/∂u` and
+    /// `∂²(dc_da)/∂a∂u`), and whose `b`-cross is `coeff_abu` (= `∂²(dc_da)/∂b∂u`).
+    /// These are the `χ_u`/`χ_uv` chains the hand `first_full` assembles by hand
+    /// (`chi_u_poly = dc_daa·a_u + coeff_au`); the FlexJet algebra raises them.
+    fn cell_chi_poly_jets<J: FlexJet>(
+        template: &J,
+        fixed: &DenestedCellPrimaryFixedPartials,
+        g_axis: usize,
+        da: &J,
+        du: &[J],
+    ) -> [J; 4] {
+        let p = du.len();
+        let dada = da.mul(da);
+        let db = &du[g_axis];
+        std::array::from_fn(|k| {
+            // Base = dc_da; a-chain = dc_daa·da + ½dc_daaa·da².
+            let mut c = const_jet_like(template, fixed.dc_da[k]);
+            c = c
+                .add(&da.scale(fixed.dc_daa[k]))
+                .add(&dada.scale(0.5 * fixed.dc_daaa[k]));
+            for u in 0..p {
+                let duu = &du[u];
+                // χ per-primary: coeff_au[u]·du + coeff_aau[u]·da·du + coeff_abu[u]·db·du.
+                let chain = duu
+                    .scale(fixed.coeff_au[u][k])
+                    .add(&da.mul(duu).scale(fixed.coeff_aau[u][k]))
+                    .add(&db.mul(duu).scale(fixed.coeff_abu[u][k]));
+                c = c.add(&chain);
+            }
+            c
+        })
+    }
+
+    /// #932 item-2 Phase C: the per-row density normalization `D = Σ_cells ∫ G0 dz`
+    /// (`G0 = χ·w`, `w = e^{−q}/2π`) as a jet at any `FlexJet` order, carrying its
+    /// exact θ-derivatives (the hand D-path `d_u`/`d_uv` are this jet's grad/Hess).
+    ///
+    /// Per cell `D_cell = INV_TWO_PI · Σ_k χ_k · M_k`, where `χ_k` are the cell's
+    /// `dc_da` polynomial coefficients as jets ([`cell_chi_poly_jets`]) and `M_k` are
+    /// the cell's normalization moments as jets ([`base_moment_jets`], carrying both
+    /// the coefficient motion and the moving-edge sliver). The single-source magic:
+    /// the hand path forms `d_u` by EXPLICITLY assembling `χ_u − χ·η·η_u` + boundary
+    /// flux; the jet product `χ_k·M_k` reproduces all three terms automatically —
+    /// `χ_u` from `χ_k`'s motion, `−χ·η·η_u` from `M_k`'s interior `e^{−Δq}` factor
+    /// (`∂M_k = −Σ_m(η∂η)_m M_{k+m}`), and the boundary flux from `M_k`'s edge
+    /// sliver. `c_jets` are the cell's `c0..c3` jets ([`cell_coeff_jets`]) feeding the
+    /// moment exponent; `edge_l`/`edge_r` the moving edge jets; `moments` the cell's
+    /// NUMERIC moment vector (≥ `4 + 6` entries for the `e^{−Δq}` expansion).
+    fn flex_timepoint_d_cell<J: FlexJet>(
+        template: &J,
+        c_jets: &[J; 4],
+        chi_jets: &[J; 4],
+        edge_l: &J,
+        left_finite: bool,
+        edge_r: &J,
+        right_finite: bool,
+        numeric_moments: &[f64],
+    ) -> J {
+        let m = base_moment_jets(c_jets, edge_l, left_finite, edge_r, right_finite, numeric_moments);
+        let mut acc = const_jet_like(template, 0.0);
+        for (k, chi_k) in chi_jets.iter().enumerate() {
+            acc = acc.add(&chi_k.mul(&m[k]));
+        }
+        acc.scale(std::f64::consts::TAU.recip())
+    }
+
+    /// Evaluate a 4-coefficient cell polynomial jet `Σ_k coeff_jet[k]·z^k` at the
+    /// fixed observation point `z` (the jet image of `eval_coeff4_at`).
+    #[inline]
+    fn eval_coeff_jet_at<J: FlexJet>(coeff_jet: &[J; 4], z: f64) -> J {
+        let mut zk = 1.0;
+        let mut acc = const_jet_like(&coeff_jet[0], 0.0);
+        for c in coeff_jet.iter() {
+            acc = acc.add(&c.scale(zk));
+            zk *= z;
+        }
+        acc
+    }
+
+    /// The observed cell-coefficient partial pack (`coeff`/`dc_d{a,b}…/dbbb`) passed
+    /// through `observed_denested_cell_partials`, bundled so the generic eta/chi
+    /// builder stays under the argument-count gate.
+    struct ObservedCoeffPack {
+        coeff: [f64; 4],
+        dc_da: [f64; 4],
+        dc_db: [f64; 4],
+        dc_daa: [f64; 4],
+        dc_dab: [f64; 4],
+        dc_dbb: [f64; 4],
+        dc_daaa: [f64; 4],
+        dc_daab: [f64; 4],
+        dc_dabb: [f64; 4],
+        dc_dbbb: [f64; 4],
+    }
+
+    /// Phase C-complete (generic order): the observed timepoint `eta` and `chi` as
+    /// jets at ANY `FlexJet` order, from the intercept jet `a_jet` (carrying its
+    /// θ-derivatives to that order) and the slope jet `b_jet`, the observed
+    /// cell-coefficient pack, and pre-built score-warp(`h`)/link-dev(`w`) `rho`/`tau`
+    /// channel jets. `eta`/`chi` carry their exact θ-derivatives by composing the
+    /// coefficients' bivariate `(a,b)` Taylor with the intercept/slope jets, then
+    /// adding the linear `h`/`w`/`infl` channels — replacing the hand
+    /// `eta_u = chi·a_u + rho`, `eta_uv = …` chains in
+    /// `first_full`/`directional`/`bidirectional`.
+    ///
+    /// `rho_jet`/`tau_jet` are the already-seeded jets carrying the linear `h`/`w`/
+    /// `infl` channels' θ-dependence on their own primaries (the caller builds them
+    /// at the correct order with the right directional seeds — order-specific
+    /// seeding context lives at the call site, not here). `eta += rho_jet`,
+    /// `chi += tau_jet`.
+    fn flex_timepoint_eta_chi<J: FlexJet>(
+        a_jet: &J,
+        b_jet: &J,
+        z_obs: f64,
+        o_infl: f64,
+        pack: &ObservedCoeffPack,
+        rho_jet: &J,
+        tau_jet: &J,
+    ) -> (J, J) {
+        let da = tangent_jet(a_jet);
+        let db = tangent_jet(b_jet);
+        let zero4 = [0.0_f64; 4];
+
+        // eta coefficients: the coeff pack composed with (da, db).
+        let coeff_jets: [J; 4] = std::array::from_fn(|k| {
+            observed_coeff_component_jet(
+                a_jet, k, pack.coeff, pack.dc_da, pack.dc_db, pack.dc_daa, pack.dc_dab, pack.dc_dbb,
+                pack.dc_daaa, pack.dc_daab, pack.dc_dabb, pack.dc_dbbb, &da, &db,
+            )
+        });
+        let eta = add_const(&eval_coeff_jet_at(&coeff_jets, z_obs), o_infl).add(rho_jet);
+
+        // chi = ∂eta/∂a coefficients = the dc_da pack, whose own (a,b)-Taylor is the
+        // once-`a`-shifted pack (dc_daa as ∂/∂a, dc_dab as ∂/∂b, dc_daaa/daab/dabb as
+        // the seconds; the dc_da pack carries no third-order term, so those are 0).
+        let chi_jets: [J; 4] = std::array::from_fn(|k| {
+            observed_coeff_component_jet(
+                a_jet, k, pack.dc_da, pack.dc_daa, pack.dc_dab, pack.dc_daaa, pack.dc_daab,
+                pack.dc_dabb, zero4, zero4, zero4, zero4, &da, &db,
+            )
+        });
+        let chi = eval_coeff_jet_at(&chi_jets, z_obs).add(tau_jet);
+
+        (eta, chi)
+    }
+
 
     /// #932 item-2 increment 1: the FlexJet moment recurrence must reproduce the
     /// numeric `reduce_sextic_moments` on the VALUE channel term-for-term (a
@@ -2112,404 +2507,3 @@ mod moment_engine_tests {
     }
 }
 
-// ── §C: observed cell-coefficient jets + eta/chi point-eval (Phase C core) ──
-//
-// The observed cell coefficients `coeff[k]` are a smooth function of the
-// intercept `a(θ)` and the slope `b` (= the `g` primary), with the score-warp
-// (`h`) and link-dev (`w`) channels entering linearly on top. Their full
-// bivariate Taylor in `(a,b)` is exactly the `observed_denested_cell_partials`
-// pack (`dc_da…dc_dbbb`). Composing that Taylor with the intercept jet `a_jet`
-// and the slope jet `b_jet` (both carrying their θ-derivatives) yields each
-// `coeff[k]` AS a jet — so `eta = Σ_k coeff[k]·z_obs^k` and `chi = Σ_k
-// dc_da[k]·z_obs^k` (point-evals at the fixed observation `z_obs`) carry their
-// exact θ-derivatives mechanically, replacing the hand `eta_u = chi·a_u + rho`
-// / `eta_uv = …` chain in `first_full`/`directional`/`bidirectional`.
-
-/// A value-zero "tangent" jet `x_jet − x.value()`: value 0, derivative channels
-/// preserved. Used as the perturbation argument of the bivariate Taylor below.
-#[inline]
-fn tangent_jet<J: FlexJet>(x: &J) -> J {
-    x.add_const(-x.value())
-}
-
-/// A constant jet (value `v`, all derivative channels zero), shaped like
-/// `template` (so it carries the right runtime primary count).
-#[inline]
-fn const_jet_like<J: FlexJet>(template: &J, v: f64) -> J {
-    template.scale(0.0).add_const(v)
-}
-
-/// #932 item-2 Phase C STEP 2: the generic-order intercept Newton lift over a
-/// runtime `FlexJet` — the linchpin that produces the 3rd/4th intercept
-/// θ-derivatives the base Hessian lacks. Mirrors `lift_intercept_order2` /
-/// `filtered_implicit_solve_scalar` but over a runtime `Jet2`/`Jet3`/`Jet4`.
-///
-/// The calibration constraint `F(a(θ), θ) = 0` is solved by the filtered Newton
-/// step `A ← A − R(A)·inv_fa` (`inv_fa = 1/D`, `D = |F_a|`), iterated `iters`
-/// times (the jet nilpotency order). `R(A)` is the calibration RESIDUAL JET built
-/// by the caller-supplied `residual` closure from the per-cell coefficient jets
-/// and moment jets:
-///
-///   R(A) = Σ_cells INV_TWO_PI · Σ_k tangent(c_posₖ(A)) · Mₖ(A)   (+ q self-term)
-///
-/// where `c_posₖ(A)` are the POSITIVE cell coefficients as jets in `A` (and the
-/// primaries) and `Mₖ(A)` the cell's normalization moment jets. This is the EXACT
-/// calibration θ-jet to all orders: `∂_θ R = INV_TWO_PI ∫ η_θ e^{−q} = −f_u`,
-/// `∂²_θ R = INV_TWO_PI ∫ (η_θθ − η η_θ²) e^{−q}` (the `−η η_θ²` falling out of
-/// `Mₖ`'s own `e^{−Δq}` motion `M_θ = −∫ η η_θ e^{−q}`), reproducing the hand
-/// `f_u`/`f_uv`/`f_aa` moment dots and their 3rd/4th extensions automatically. The
-/// value channel is the scalar calibration `f` (driven to ~0 by seeding
-/// `A.value = a0` from the scalar solve), so only the derivative channels solve.
-///
-/// `template` carries the runtime primary count; `a0` the solved intercept value.
-fn lift_intercept_flex<J: FlexJet>(
-    template: &J,
-    a0: f64,
-    inv_fa: f64,
-    iters: usize,
-    residual: impl Fn(&J) -> J,
-) -> J {
-    let mut a = const_jet_like(template, a0);
-    for _ in 0..iters {
-        let r = residual(&a);
-        a = a.sub(&r.scale(inv_fa));
-    }
-    a
-}
-
-/// The per-row calibration residual jet `R(A)` for [`lift_intercept_flex`],
-/// summed over a timepoint's cells: `Σ_cells INV_TWO_PI·Σ_k tangent(c_posₖ(A))·
-/// Mₖ(A)` plus the q-marginal self-term `−φ(q)` on the `q_index` primary (the
-/// `f_u[q_index] += φ(q)` boundary term of the calibration). The cells are
-/// supplied as `(base_pos_coeffs, fixed, edges, finiteness, numeric_moments)` so
-/// the coefficient jets and moment jets are rebuilt at the current iterate `A`.
-fn calibration_residual_jet<J: FlexJet>(
-    a_jet: &J,
-    b_jet: &J,
-    g_axis: usize,
-    du: &[J],
-    q_index: usize,
-    phi_q: f64,
-    cells: &[CalibrationCellJetInputs<'_>],
-) -> J {
-    let da = tangent_jet(a_jet);
-    let inv_two_pi = std::f64::consts::TAU.recip();
-    let mut r = const_jet_like(a_jet, 0.0);
-    for cell in cells {
-        // Positive cell coefficients as jets in (A, primaries).
-        let c_pos = cell_coeff_jets(a_jet, cell.base_pos_coeffs, cell.fixed, g_axis, &da, du);
-        // Moving edge jets: Crossing edges move with A/b, Fixed edges are static.
-        let edge_l = cell_edge_jet(a_jet, b_jet, cell.left_edge, cell.cell_left);
-        let edge_r = cell_edge_jet(a_jet, b_jet, cell.right_edge, cell.cell_right);
-        let m = base_moment_jets(
-            &c_pos,
-            &edge_l,
-            cell.cell_left.is_finite(),
-            &edge_r,
-            cell.cell_right.is_finite(),
-            cell.numeric_moments,
-        );
-        // Σ_k tangent(c_posₖ)·Mₖ  (tangent strips the value: F's VALUE is carried
-        // by the scalar seed, only the θ-motion of η enters the residual deriv).
-        let mut cell_r = const_jet_like(a_jet, 0.0);
-        for k in 0..4 {
-            cell_r = cell_r.add(&tangent_jet(&c_pos[k]).mul(&m[k]));
-        }
-        r = r.add(&cell_r.scale(inv_two_pi));
-    }
-    // q-marginal self-term: f_u[q_index] += φ(q) ⟹ R gains −φ(q)·(q-axis tangent).
-    // (R = −F, and the hand adds +φ(q) to f_u[q_index].)
-    if q_index < du.len() {
-        r = r.sub(&du[q_index].scale(phi_q));
-    }
-    r
-}
-
-/// Per-cell inputs for [`calibration_residual_jet`]: the positive base
-/// coefficients, the fixed-partial pack, the cell edges (location + provenance),
-/// and the numeric moment vector. Borrowed from the cached partition.
-struct CalibrationCellJetInputs<'a> {
-    base_pos_coeffs: [f64; 4],
-    fixed: &'a DenestedCellPrimaryFixedPartials,
-    cell_left: f64,
-    cell_right: f64,
-    left_edge: crate::families::cubic_cell_kernel::PartitionEdge,
-    right_edge: crate::families::cubic_cell_kernel::PartitionEdge,
-    numeric_moments: &'a [f64],
-}
-
-/// The moving cell-edge `z` as a jet: a `Crossing { tau }` edge sits at
-/// `z = (τ − a)/b` and moves with the intercept jet `a_jet` and slope jet
-/// `b_jet`; a `Fixed(z)` edge is static (a constant jet, no θ-motion).
-fn cell_edge_jet<J: FlexJet>(
-    a_jet: &J,
-    b_jet: &J,
-    edge: crate::families::cubic_cell_kernel::PartitionEdge,
-    z_value: f64,
-) -> J {
-    match edge {
-        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { tau } => {
-            // z = (τ − a)·(1/b).
-            const_jet_like(a_jet, tau).sub(a_jet).mul(&b_jet.recip())
-        }
-        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
-            const_jet_like(a_jet, z_value)
-        }
-    }
-}
-
-/// One observed cell coefficient `coeff[k]` as a jet: the bivariate `(a,b)`
-/// Taylor (up to 3rd order, matching the `dc_d{a,b}…` pack) composed with the
-/// intercept tangent `da` and slope tangent `db` jets. Terms with a 0/6/2/… are
-/// the multinomial Taylor weights `coeff + Σ (1/(i!j!)) ∂^{i+j}coeff/∂a^i∂b^j ·
-/// da^i db^j`.
-fn observed_coeff_component_jet<J: FlexJet>(
-    template: &J,
-    k: usize,
-    coeff: [f64; 4],
-    dc_da: [f64; 4],
-    dc_db: [f64; 4],
-    dc_daa: [f64; 4],
-    dc_dab: [f64; 4],
-    dc_dbb: [f64; 4],
-    dc_daaa: [f64; 4],
-    dc_daab: [f64; 4],
-    dc_dabb: [f64; 4],
-    dc_dbbb: [f64; 4],
-    da: &J,
-    db: &J,
-) -> J {
-    let dada = da.mul(da);
-    let dadb = da.mul(db);
-    let dbdb = db.mul(db);
-    let mut c = const_jet_like(template, coeff[k]);
-    c = c.add(&da.scale(dc_da[k])).add(&db.scale(dc_db[k]));
-    c = c
-        .add(&dada.scale(0.5 * dc_daa[k]))
-        .add(&dadb.scale(dc_dab[k]))
-        .add(&dbdb.scale(0.5 * dc_dbb[k]));
-    let inv6 = 1.0 / 6.0;
-    let half = 0.5;
-    c = c
-        .add(&dada.mul(da).scale(inv6 * dc_daaa[k]))
-        .add(&dada.mul(db).scale(half * dc_daab[k]))
-        .add(&dadb.mul(db).scale(half * dc_dabb[k]))
-        .add(&dbdb.mul(db).scale(inv6 * dc_dbbb[k]));
-    c
-}
-
-/// The per-cell de-nested coefficient `c_k` (k = 0..4) as a jet, built from the
-/// cell's `DenestedCellPrimaryFixedPartials` pack composed with the intercept
-/// perturbation `da = tangent(a_jet)` and the per-primary perturbations
-/// `du[u] = tangent(primary_u)`. This is the cell analogue of
-/// `observed_coeff_component_jet`, carrying ALL primaries (not just a,b): it is
-/// the multivariate Taylor of `c_k(a, {θ_u})` whose cross-partials are the pack
-/// fields. Matches the hand `eta_u_poly`/`eta_uv_poly`/`chi_*` assembly in
-/// `first_full`/`directional`/`bidirectional` term for term — the FlexJet algebra
-/// raises it to the contracted third/fourth automatically.
-///
-/// Taylor structure (per k, `g_axis` = the slope `b` primary):
-///   c = c0
-///     + dc_da·da + ½dc_daa·da² + ⅙dc_daaa·da³                       (pure a)
-///     + Σ_u coeff_u[u]·du                                           (pure u, lin)
-///     + Σ_u coeff_au[u]·da·du + ½Σ_u coeff_aau[u]·da²·du            (a×u)
-///     + Σ_u coeff_bu[u]·db·du + Σ_u coeff_abu[u]·da·db·du           (b×u)
-///       + ½Σ_u coeff_bbu[u]·db²·du
-///     + ⅙Σ_u coeff_aaau[u]·da³·du + ½Σ_u coeff_aabu[u]·da²·db·du    (3rd in a/b ×u)
-///       + ½Σ_u coeff_abbu[u]·da·db²·du + ⅙Σ_u coeff_bbbu[u]·db³·du
-/// where `db = du[g_axis]` (the slope perturbation). The `coeff_u`-family terms
-/// are LINEAR in `du` (each cell coefficient is at most linear in any single
-/// non-a/non-b primary), so no `du²` term is needed beyond the b-channel ones.
-fn cell_coeff_jets<J: FlexJet>(
-    template: &J,
-    base_c: [f64; 4],
-    fixed: &DenestedCellPrimaryFixedPartials,
-    g_axis: usize,
-    da: &J,
-    du: &[J],
-) -> [J; 4] {
-    let p = du.len();
-    let dada = da.mul(da);
-    let dadada = dada.mul(da);
-    let db = &du[g_axis];
-    let dadb = da.mul(db);
-    let dbdb = db.mul(db);
-    std::array::from_fn(|k| {
-        let mut c = const_jet_like(template, base_c[k]);
-        // Pure-a chain.
-        c = c
-            .add(&da.scale(fixed.dc_da[k]))
-            .add(&dada.scale(0.5 * fixed.dc_daa[k]))
-            .add(&dadada.scale(fixed.dc_daaa[k] / 6.0));
-        // Per-primary chains (linear in du[u]).
-        for u in 0..p {
-            let duu = &du[u];
-            let mut chain = duu.scale(fixed.coeff_u[u][k]);
-            chain = chain
-                .add(&da.mul(duu).scale(fixed.coeff_au[u][k]))
-                .add(&dada.mul(duu).scale(0.5 * fixed.coeff_aau[u][k]));
-            chain = chain
-                .add(&db.mul(duu).scale(fixed.coeff_bu[u][k]))
-                .add(&dadb.mul(duu).scale(fixed.coeff_abu[u][k]))
-                .add(&dbdb.mul(duu).scale(0.5 * fixed.coeff_bbu[u][k]));
-            chain = chain
-                .add(&dadada.mul(duu).scale(fixed.coeff_aaau[u][k] / 6.0))
-                .add(&dada.mul(db).mul(duu).scale(0.5 * fixed.coeff_aabu[u][k]))
-                .add(&dadb.mul(db).mul(duu).scale(0.5 * fixed.coeff_abbu[u][k]))
-                .add(&dbdb.mul(db).mul(duu).scale(fixed.coeff_bbbu[u][k] / 6.0));
-            c = c.add(&chain);
-        }
-        c
-    })
-}
-
-/// The per-cell `χ = ∂η/∂a` polynomial coefficients `dc_da[k]` (k = 0..4) as
-/// jets, the `∂_a`-shifted analogue of [`cell_coeff_jets`]: the cell coefficient
-/// family whose base is `dc_da`, whose `a`-derivatives are `dc_daa`/`dc_daaa`,
-/// whose per-primary derivatives are `coeff_au`/`coeff_aau` (= `∂(dc_da)/∂u` and
-/// `∂²(dc_da)/∂a∂u`), and whose `b`-cross is `coeff_abu` (= `∂²(dc_da)/∂b∂u`).
-/// These are the `χ_u`/`χ_uv` chains the hand `first_full` assembles by hand
-/// (`chi_u_poly = dc_daa·a_u + coeff_au`); the FlexJet algebra raises them.
-fn cell_chi_poly_jets<J: FlexJet>(
-    template: &J,
-    fixed: &DenestedCellPrimaryFixedPartials,
-    g_axis: usize,
-    da: &J,
-    du: &[J],
-) -> [J; 4] {
-    let p = du.len();
-    let dada = da.mul(da);
-    let db = &du[g_axis];
-    std::array::from_fn(|k| {
-        // Base = dc_da; a-chain = dc_daa·da + ½dc_daaa·da².
-        let mut c = const_jet_like(template, fixed.dc_da[k]);
-        c = c
-            .add(&da.scale(fixed.dc_daa[k]))
-            .add(&dada.scale(0.5 * fixed.dc_daaa[k]));
-        for u in 0..p {
-            let duu = &du[u];
-            // χ per-primary: coeff_au[u]·du + coeff_aau[u]·da·du + coeff_abu[u]·db·du.
-            let chain = duu
-                .scale(fixed.coeff_au[u][k])
-                .add(&da.mul(duu).scale(fixed.coeff_aau[u][k]))
-                .add(&db.mul(duu).scale(fixed.coeff_abu[u][k]));
-            c = c.add(&chain);
-        }
-        c
-    })
-}
-
-/// #932 item-2 Phase C: the per-row density normalization `D = Σ_cells ∫ G0 dz`
-/// (`G0 = χ·w`, `w = e^{−q}/2π`) as a jet at any `FlexJet` order, carrying its
-/// exact θ-derivatives (the hand D-path `d_u`/`d_uv` are this jet's grad/Hess).
-///
-/// Per cell `D_cell = INV_TWO_PI · Σ_k χ_k · M_k`, where `χ_k` are the cell's
-/// `dc_da` polynomial coefficients as jets ([`cell_chi_poly_jets`]) and `M_k` are
-/// the cell's normalization moments as jets ([`base_moment_jets`], carrying both
-/// the coefficient motion and the moving-edge sliver). The single-source magic:
-/// the hand path forms `d_u` by EXPLICITLY assembling `χ_u − χ·η·η_u` + boundary
-/// flux; the jet product `χ_k·M_k` reproduces all three terms automatically —
-/// `χ_u` from `χ_k`'s motion, `−χ·η·η_u` from `M_k`'s interior `e^{−Δq}` factor
-/// (`∂M_k = −Σ_m(η∂η)_m M_{k+m}`), and the boundary flux from `M_k`'s edge
-/// sliver. `c_jets` are the cell's `c0..c3` jets ([`cell_coeff_jets`]) feeding the
-/// moment exponent; `edge_l`/`edge_r` the moving edge jets; `moments` the cell's
-/// NUMERIC moment vector (≥ `4 + 6` entries for the `e^{−Δq}` expansion).
-fn flex_timepoint_d_cell<J: FlexJet>(
-    template: &J,
-    c_jets: &[J; 4],
-    chi_jets: &[J; 4],
-    edge_l: &J,
-    left_finite: bool,
-    edge_r: &J,
-    right_finite: bool,
-    numeric_moments: &[f64],
-) -> J {
-    let m = base_moment_jets(c_jets, edge_l, left_finite, edge_r, right_finite, numeric_moments);
-    let mut acc = const_jet_like(template, 0.0);
-    for (k, chi_k) in chi_jets.iter().enumerate() {
-        acc = acc.add(&chi_k.mul(&m[k]));
-    }
-    acc.scale(std::f64::consts::TAU.recip())
-}
-
-/// Evaluate a 4-coefficient cell polynomial jet `Σ_k coeff_jet[k]·z^k` at the
-/// fixed observation point `z` (the jet image of `eval_coeff4_at`).
-#[inline]
-fn eval_coeff_jet_at<J: FlexJet>(coeff_jet: &[J; 4], z: f64) -> J {
-    let mut zk = 1.0;
-    let mut acc = const_jet_like(&coeff_jet[0], 0.0);
-    for c in coeff_jet.iter() {
-        acc = acc.add(&c.scale(zk));
-        zk *= z;
-    }
-    acc
-}
-
-/// The observed cell-coefficient partial pack (`coeff`/`dc_d{a,b}…/dbbb`) passed
-/// through `observed_denested_cell_partials`, bundled so the generic eta/chi
-/// builder stays under the argument-count gate.
-struct ObservedCoeffPack {
-    coeff: [f64; 4],
-    dc_da: [f64; 4],
-    dc_db: [f64; 4],
-    dc_daa: [f64; 4],
-    dc_dab: [f64; 4],
-    dc_dbb: [f64; 4],
-    dc_daaa: [f64; 4],
-    dc_daab: [f64; 4],
-    dc_dabb: [f64; 4],
-    dc_dbbb: [f64; 4],
-}
-
-/// Phase C-complete (generic order): the observed timepoint `eta` and `chi` as
-/// jets at ANY `FlexJet` order, from the intercept jet `a_jet` (carrying its
-/// θ-derivatives to that order) and the slope jet `b_jet`, the observed
-/// cell-coefficient pack, and pre-built score-warp(`h`)/link-dev(`w`) `rho`/`tau`
-/// channel jets. `eta`/`chi` carry their exact θ-derivatives by composing the
-/// coefficients' bivariate `(a,b)` Taylor with the intercept/slope jets, then
-/// adding the linear `h`/`w`/`infl` channels — replacing the hand
-/// `eta_u = chi·a_u + rho`, `eta_uv = …` chains in
-/// `first_full`/`directional`/`bidirectional`.
-///
-/// `rho_jet`/`tau_jet` are the already-seeded jets carrying the linear `h`/`w`/
-/// `infl` channels' θ-dependence on their own primaries (the caller builds them
-/// at the correct order with the right directional seeds — order-specific
-/// seeding context lives at the call site, not here). `eta += rho_jet`,
-/// `chi += tau_jet`.
-fn flex_timepoint_eta_chi<J: FlexJet>(
-    a_jet: &J,
-    b_jet: &J,
-    z_obs: f64,
-    o_infl: f64,
-    pack: &ObservedCoeffPack,
-    rho_jet: &J,
-    tau_jet: &J,
-) -> (J, J) {
-    let da = tangent_jet(a_jet);
-    let db = tangent_jet(b_jet);
-    let zero4 = [0.0_f64; 4];
-
-    // eta coefficients: the coeff pack composed with (da, db).
-    let coeff_jets: [J; 4] = std::array::from_fn(|k| {
-        observed_coeff_component_jet(
-            a_jet, k, pack.coeff, pack.dc_da, pack.dc_db, pack.dc_daa, pack.dc_dab, pack.dc_dbb,
-            pack.dc_daaa, pack.dc_daab, pack.dc_dabb, pack.dc_dbbb, &da, &db,
-        )
-    });
-    let eta = eval_coeff_jet_at(&coeff_jets, z_obs)
-        .add_const(o_infl)
-        .add(rho_jet);
-
-    // chi = ∂eta/∂a coefficients = the dc_da pack, whose own (a,b)-Taylor is the
-    // once-`a`-shifted pack (dc_daa as ∂/∂a, dc_dab as ∂/∂b, dc_daaa/daab/dabb as
-    // the seconds; the dc_da pack carries no third-order term, so those are 0).
-    let chi_jets: [J; 4] = std::array::from_fn(|k| {
-        observed_coeff_component_jet(
-            a_jet, k, pack.dc_da, pack.dc_daa, pack.dc_dab, pack.dc_daaa, pack.dc_daab,
-            pack.dc_dabb, zero4, zero4, zero4, zero4, &da, &db,
-        )
-    });
-    let chi = eval_coeff_jet_at(&chi_jets, z_obs).add(tau_jet);
-
-    (eta, chi)
-}
