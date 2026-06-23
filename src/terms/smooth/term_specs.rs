@@ -3432,24 +3432,16 @@ const KERNEL_RANGE_MIN_DIAMETER_FRACTION: f64 = 2.0;
 const KERNEL_RANGE_MAX_SPACING_MULTIPLE: f64 = 1e2;
 
 /// Matérn-only ceiling on the kernel length scale, as a fraction of the maximum
-/// pairwise distance `r_max` (i.e. the data diameter in the standardized kernel
-/// space). This bounds the largest correlation range the isotropic-κ outer
-/// optimizer (dimension > 1) may reach.
+/// pairwise distance `r_max`. Caps how flat the isotropic-κ optimizer (dim > 1)
+/// can make the kernel before it collapses onto the polynomial nullspace (#1357).
 ///
-/// #1074: mgcv's `bs="gp"` default correlation range is the FULL data diameter
-/// (`gp.defn` range = max inter-point distance ≈ `r_max`), and matching that
-/// range is what aligns gam's Matérn recovery with mgcv (edf ≈ 14, not the
-/// over-flexed ≈ 28 a shorter range produces). So the Matérn optimizer must be
-/// allowed to reach `r_max`. This ceiling therefore sits ABOVE `r_max` (1.5×) so
-/// mgcv's range is a comfortably interior optimum, and — unlike the generic
-/// `r_max/2` floor used for TPS/Duchon nullspace conditioning — it OVERRIDES that
-/// floor for Matérn (see `spatial_term_psi_bounds`): the generic floor would
-/// pin the Matérn kernel to a wigglier-than-mgcv range. The #1357 fully-flat
-/// collapse corner is guarded separately by the EDF-collapse guard in
-/// `spatial_optimization.rs` (detects EDF → null, reverts to the frozen baseline
-/// geometry), which fires at any length scale — so this clamp need not be the
-/// collapse backstop, only a generous upper bound.
-const MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 1.5;
+/// #1074 NOTE: raising this toward mgcv's full-diameter range and overriding the
+/// generic `r_max/2` floor (tried at 1.5×) lets the 2-D optimizer reach mgcv's
+/// range, but it broke the 2-D κ outer-gradient FD tests and the high-frequency
+/// collapse guards in `basis_smooth`. Reverted to the conservative `0.15` (the
+/// generic floor governs); the matern 2-D under-recovery (edf 28 vs mgcv 14) is
+/// tracked on #1074 as needing a deeper κ-optimization fix, not a bound bump.
+const MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.15;
 
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
 ///
@@ -3522,18 +3514,15 @@ fn spatial_term_psi_bounds(
     // optimizer enter a numerically degenerate basis geometry.
     let mut psi_lo_data = (KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max).ln();
     let psi_hi_data = (KERNEL_RANGE_MAX_SPACING_MULTIPLE / r_min).ln();
-    // #1074: for the Matérn kernel, OVERRIDE the generic `r_max/2` lower-ψ floor
-    // (set above for TPS/Duchon nullspace conditioning) with a Matérn-specific
-    // floor that admits length scales up to `frac · r_max` (frac = 1.5). ψ =
-    // log κ = −log(length_scale), so a SMALLER ψ_lo permits a LONGER range. mgcv's
-    // gp default range is the full diameter (≈ r_max); the generic `r_max/2` cap
-    // would pin the Matérn optimizer to a wigglier-than-mgcv kernel (edf ≈ 28 vs
-    // 14 on the quakes spatial fit). Letting it reach `r_max` (interior to the
-    // 1.5× ceiling) matches mgcv. The #1357 fully-flat collapse is guarded by the
-    // EDF-collapse guard in spatial_optimization.rs, not by this bound.
+    // #1074: for the Matérn kernel, keep the length scale at or below
+    // `frac · r_max` by raising the ψ floor (a larger ψ_lo forbids longer ranges).
+    // `.max()` so this only ever tightens, never loosens, the generic floor — the
+    // 2-D κ outer-gradient FD tests and the high-frequency collapse guards depend
+    // on this conservative bound (an override that loosened it regressed them).
     if let SmoothBasisSpec::Matern { .. } = &term.basis {
-        psi_lo_data =
+        let matern_psi_lo =
             (1.0 / (MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION * r_max)).ln();
+        psi_lo_data = psi_lo_data.max(matern_psi_lo);
     }
     // Intersect with the options window so min/max_length_scale remain hard caps.
     let psi_lo = psi_lo_data.max(fallback.0);

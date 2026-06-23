@@ -36,19 +36,21 @@ use crate::smooth::{
 use crate::types::ColIdx;
 
 /// Fraction of the data bounding-box diameter used as the default Matérn
-/// length scale when the user does not supply one.
+/// length scale when the user does not supply one. A length scale near a small
+/// fraction of the domain extent puts the kernel's correlation range at the
+/// scale of local structure rather than the whole domain.
 ///
-/// #1074: this MUST match mgcv's `bs="gp"` default correlation range, which is
-/// the full data diameter (`gp.defn` range = `max` inter-point distance — verified
-/// directly: a 1-D `s(x, bs="gp", m=4)` reports range = `diff(range(x))`). gam's
-/// 1-D Matérn smooths do NOT REML-optimize the length scale (the spatial-κ
-/// optimizer is gated to dimension > 1), so this default IS the kernel's range
-/// for every 1-D fit. The old `0.15` made gam's correlation range ~6.7× shorter
-/// than mgcv's — a far wigglier kernel that REML could not smooth away (matern
-/// truth-recovery edf ≈ 17 vs mgcv ≈ 14, rmse 0.0435 vs 0.0308). At `1.0` the
-/// gam kernel reproduces mgcv's range exactly (edf 13.6, rmse 0.0307 — matching
-/// mgcv to within noise). For dimension > 1 this is the optimizer's seed.
-const DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 1.0;
+/// #1074 NOTE: mgcv's `bs="gp"` default range is the FULL diameter, and matching
+/// it (fraction 1.0) makes gam reproduce mgcv on SMOOTH truths (matern_smooth
+/// nu=2.5: edf 13.6, rmse 0.0307 vs mgcv 0.0308). BUT a long fixed range cannot
+/// represent HIGH-FREQUENCY fields — at 1.0 the default collapses on `sin8`
+/// (basis_smooth `matern_default_does_not_collapse_on_sin8`), because gam's 1-D
+/// Matérn does NOT REML-optimize the length scale (the spatial-κ optimizer is
+/// gated to dimension > 1), so this single fixed default must serve both regimes.
+/// The principled fix is to enable 1-D κ-optimization so REML picks the range per
+/// data; until then this stays at the high-frequency-safe `0.15` and the smooth-
+/// truth under-recovery (matern_smooth / matern_varying_nu) is tracked on #1074.
+const DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.15;
 
 /// Floor on the derived default Matérn length scale, guarding against a zero or
 /// vanishingly small scale when the data span is degenerate.
