@@ -2147,6 +2147,54 @@ fn collect_smooth_extrapolation_axes(
     }
 }
 
+/// Collect training-column indices that feed a *numeric* `by=` multiplier of a
+/// varying-coefficient smooth (`s(x, by=z)`).
+///
+/// A numeric by-variable enters the model as a linear multiplier of the centred
+/// smooth basis, so the prediction is exactly affine in `z` for any fixed `x`:
+/// `pred(x, z) = intercept + z·f(x)`. The by-multiplier is therefore an
+/// *unbounded linear* extrapolant — exactly like a parametric `linear` axis
+/// (already exempt from the clip via `training_linear_axes`), not a
+/// bounded-basis axis. Clamping it to the training range `[min(z), max(z)]`
+/// before the design is built would make the varying-coefficient effect plateau
+/// outside the sampled range (slope 0 above the max) and silently replace the
+/// natural `z == 0` baseline with the `z == min` prediction — the prediction is
+/// no longer affine in `z`. Exempt it from the predict-time axis clip.
+///
+/// Factor `by=` columns are categorical group labels handled by the
+/// level-lookup / random-effect machinery and are deliberately *not* exempted
+/// here. Returned indices reference `self.training_headers`, matching the
+/// iteration in `axis_clip_to_training_ranges`.
+fn collect_by_variable_numeric_axes(
+    basis: &crate::smooth::SmoothBasisSpec,
+    n_training_headers: usize,
+    out: &mut std::collections::HashSet<usize>,
+) {
+    use crate::smooth::{BySmoothKind, ByVarKind, SmoothBasisSpec};
+    match basis {
+        SmoothBasisSpec::ByVariable {
+            inner, by_col, kind, ..
+        } => {
+            if matches!(kind, BySmoothKind::Numeric) && *by_col < n_training_headers {
+                out.insert(*by_col);
+            }
+            collect_by_variable_numeric_axes(inner, n_training_headers, out);
+        }
+        SmoothBasisSpec::BySmooth { smooth, by_kind } => {
+            if let ByVarKind::Numeric { feature_col } = by_kind
+                && *feature_col < n_training_headers
+            {
+                out.insert(*feature_col);
+            }
+            collect_by_variable_numeric_axes(smooth, n_training_headers, out);
+        }
+        SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            collect_by_variable_numeric_axes(inner, n_training_headers, out);
+        }
+        _ => {}
+    }
+}
+
 impl FittedModel {
     /// Axis-clip each continuous new-data column to the (min, max) range
     /// observed in training. Categorical and binary columns are left
@@ -2201,6 +2249,12 @@ impl FittedModel {
         // through the single basis-layer extrapolation. See the method doc.
         let smooth_extrapolation_axes =
             self.training_smooth_extrapolation_axes(training_headers.len());
+        // Numeric `by=` multipliers of a varying-coefficient smooth `s(x, by=z)`
+        // are linear multipliers of the centred basis (prediction affine in z),
+        // so — like parametric linear axes — clipping them to the training range
+        // turns the varying-coefficient effect into a boundary plateau and
+        // destroys the z==0 baseline. Exempt them from the clip.
+        let by_variable_axes = self.training_by_variable_numeric_axes(training_headers.len());
         // Sphere latitude is a closed-manifold coordinate: its clip bounds are
         // the manifold's intrinsic domain ([-π/2, π/2] or [-90, 90]), not the
         // sampled range, so a pole prediction reaches the true pole instead of
@@ -2234,6 +2288,9 @@ impl FittedModel {
                 continue;
             }
             if smooth_extrapolation_axes.contains(&col_in_training) {
+                continue;
+            }
+            if by_variable_axes.contains(&col_in_training) {
                 continue;
             }
             let Some(&col_idx) = col_map.get(header) else {
@@ -2413,6 +2470,24 @@ impl FittedModel {
         for spec in self.saved_term_specs() {
             for term in &spec.smooth_terms {
                 collect_smooth_extrapolation_axes(&term.basis, n_training_headers, &mut out);
+            }
+        }
+        out
+    }
+
+    /// Collect the set of training-column indices that feed a *numeric* `by=`
+    /// multiplier of a varying-coefficient smooth. These columns are linear
+    /// multipliers (`pred = intercept + z·f(x)`), so they must be exempt from
+    /// the predict-time axis clip for the same reason parametric linear axes
+    /// are — see `collect_by_variable_numeric_axes` for the full rationale.
+    fn training_by_variable_numeric_axes(
+        &self,
+        n_training_headers: usize,
+    ) -> std::collections::HashSet<usize> {
+        let mut out: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for spec in self.saved_term_specs() {
+            for term in &spec.smooth_terms {
+                collect_by_variable_numeric_axes(&term.basis, n_training_headers, &mut out);
             }
         }
         out
