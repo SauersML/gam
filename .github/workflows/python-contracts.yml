@@ -16,7 +16,9 @@ on:
   pull_request:
     paths:
       - "tests/test_bug_hunt_numeric_by_variable_clamped_to_training_range_at_predict.py"
+      - "tests/test_bug_hunt_curv_smooth_hyperbolic_recovered_as_spherical.py"
       - "src/inference/model.rs"
+      - "src/terms/smooth/spatial_optimization.rs"
       - ".github/workflows/python-contracts.yml"
 
 concurrency:
@@ -85,3 +87,17 @@ jobs:
         # ./gamfit makes the installed wheel win the import.
         working-directory: ${{ runner.temp }}
         run: python -m pytest "$GITHUB_WORKSPACE/tests/test_bug_hunt_numeric_by_variable_clamped_to_training_range_at_predict.py" -v --tb=short
+
+      - name: Run curv() constant-curvature sign-recovery contract (#1464)
+        # Hyperbolic (kappa*<0) data must not be recovered as spherical; the
+        # Python full-fit path must honor the sign-correct kappa-fair fast-path
+        # pin in spatial_optimization.rs. Matches the Rust e2e owed_1464.rs guard.
+        #
+        # Run from runner.temp, NOT the repo root: the maturin wheel installs
+        # gamfit (incl. the compiled gamfit._rust) into site-packages, but the
+        # source tree's ./gamfit has no compiled _rust, so `python -m pytest`
+        # from the repo root imports the source package and fails with
+        # `ModuleNotFoundError: gamfit._rust`. Running from a directory without
+        # ./gamfit makes the installed wheel win the import.
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest "$GITHUB_WORKSPACE/tests/test_bug_hunt_curv_smooth_hyperbolic_recovered_as_spherical.py" -v --tb=short

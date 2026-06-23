@@ -563,6 +563,14 @@ jobs:
         # collect_by_variable_numeric_axes exemption in src/inference/model.rs.
         run: python -m pytest tests/test_bug_hunt_numeric_by_variable_clamped_to_training_range_at_predict.py -v --tb=short
 
+      - name: Run curv() constant-curvature sign-recovery contract (#1464)
+        # Full-fit Python contract: hyperbolic (kappa*<0) data must NOT be
+        # recovered as spherical. This is the Python-path guard matching the
+        # Rust e2e owed_1464.rs / bug_hunt_1464_* tests. The file was a
+        # print-only diagnostic (collected nothing) until it was made an
+        # asserting gate; wiring it here is what actually exercises #1464.
+        run: python -m pytest tests/test_bug_hunt_curv_smooth_hyperbolic_recovered_as_spherical.py -v --tb=short
+
       - name: Run survival API regression + save/load roundtrip tests
         # `test_survival_api_regressions.py` covers fit-only smoke checks
         # across survival likelihood modes; `test_survival_save_load_roundtrip.py`
