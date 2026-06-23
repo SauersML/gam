@@ -76,4 +76,12 @@ jobs:
         # s(x, by=z): the numeric by-multiplier must not be axis-clipped to its
         # training range at predict time, so the prediction stays affine in z.
         # Guards the collect_by_variable_numeric_axes exemption in model.rs.
-        run: python -m pytest tests/test_bug_hunt_numeric_by_variable_clamped_to_training_range_at_predict.py -v --tb=short
+        #
+        # Run from runner.temp, NOT the repo root: the maturin wheel installs
+        # gamfit (incl. the compiled gamfit._rust) into site-packages, but the
+        # source tree's ./gamfit has no compiled _rust, so `python -m pytest`
+        # from the repo root imports the source package and fails with
+        # `ModuleNotFoundError: gamfit._rust`. Running from a directory without
+        # ./gamfit makes the installed wheel win the import.
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest "$GITHUB_WORKSPACE/tests/test_bug_hunt_numeric_by_variable_clamped_to_training_range_at_predict.py" -v --tb=short
