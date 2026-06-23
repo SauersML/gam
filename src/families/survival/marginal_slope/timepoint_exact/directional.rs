@@ -356,6 +356,14 @@ impl SurvivalMarginalSlopeFamily {
             a_u[u] = -f_u[u] * inv_f_a;
         }
         let a_dir = a_u.dot(dir);
+        // Base density-normalization first derivative `d_u` (D-path), shared with
+        // `first_full`. The intercept Hessian below is recovered from this
+        // FD-validated quantity (`d_u = −f_au − f_aa·a_u`, since `D = −f_a`)
+        // rather than the inconsistent F-path `f_au`, whose moving-boundary
+        // partials do not reconstruct the total `d_u` at the (g,·) indices and
+        // left the directional base `a_uv[g,g]` ~0.02 short of `first_full`'s
+        // (gam#1454).
+        let d_u = self.survival_flex_base_d_u(primary, &a_u, cached, b, p)?;
         let dir_g = if primary.g < p { dir[primary.g] } else { 0.0 };
         if b != 0.0 {
             for cell_entry in &cached.cells {
@@ -528,14 +536,26 @@ impl SurvivalMarginalSlopeFamily {
         let mut a_uv = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
+                // D-path intercept Hessian (matches first_full.rs:681): with
+                // `D = −f_a` and `1/D = −inv_f_a`, `a_uv = (f_uv − d_u[u]·a_u[v]
+                // − d_u[v]·a_u[u] − f_aa·a_u[u]·a_u[v]) / D` (gam#1454).
                 let val =
-                    -(f_uv[[u, v]] + f_au[u] * a_u[v] + f_au[v] * a_u[u] + f_aa * a_u[u] * a_u[v])
+                    -(f_uv[[u, v]] - d_u[u] * a_u[v] - d_u[v] * a_u[u] - f_aa * a_u[u] * a_u[v])
                         * inv_f_a;
                 a_uv[[u, v]] = val;
                 a_uv[[v, u]] = val;
             }
         }
         let a_u_dir = a_uv.dot(dir);
+        // Directional derivative of the base `d_u`, formed by contracting the
+        // FD-validated total second derivative `d_uv` (full §D moving boundary):
+        // `d_u_dir = D_dir(d_u) = Σ_v dir[v]·d_uv[u,v]`. Single-sourced from
+        // `first_full` so the directional `a_uv_dir` agrees with the base path
+        // (gam#1454); supersedes the partial-boundary inline `d_u_dir` removed
+        // below.
+        let d_u_dir = self
+            .survival_flex_base_d_uv(primary, &a_u, &a_uv, cached, b, p)?
+            .dot(dir);
         if b != 0.0 {
             for cell_entry in &cached.cells {
                 let neg_cell = cell_entry.neg_cell;
@@ -911,13 +931,17 @@ impl SurvivalMarginalSlopeFamily {
         let mut a_uv_dir = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
+                // D_dir of the D-path numerator `N = f_uv − d_u[u]·a_u[v] −
+                // d_u[v]·a_u[u] − f_aa·a_u[u]·a_u[v]`, mirroring the base `a_uv`
+                // switch above. `a_uv_dir = −(N_dir + a_uv·f_a_dir)·inv_f_a`
+                // (gam#1454).
                 let n_dir = f_uv_dir[[u, v]]
-                    + f_au_dir[u] * a_u[v]
-                    + f_au[u] * a_u_dir[v]
-                    + f_au_dir[v] * a_u[u]
-                    + f_au[v] * a_u_dir[u]
-                    + f_aa_dir * a_u[u] * a_u[v]
-                    + f_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v]);
+                    - d_u_dir[u] * a_u[v]
+                    - d_u[u] * a_u_dir[v]
+                    - d_u_dir[v] * a_u[u]
+                    - d_u[v] * a_u_dir[u]
+                    - f_aa_dir * a_u[u] * a_u[v]
+                    - f_aa * (a_u_dir[u] * a_u[v] + a_u[u] * a_u_dir[v]);
                 let val = -(n_dir + f_a_dir * a_uv[[u, v]]) * inv_f_a;
                 a_uv_dir[[u, v]] = val;
                 a_uv_dir[[v, u]] = val;
@@ -1134,178 +1158,6 @@ impl SurvivalMarginalSlopeFamily {
         }
         let eta_u_dir = eta_uv.dot(dir);
         let chi_u_dir = chi_uv.dot(dir);
-
-        // D_u_dir: directional derivative of the density normalization first derivative.
-        let d_u_dir_cell_accums = cached
-            .cells
-            .iter()
-            .map(|cell_entry| -> Result<Array1<f64>, String> {
-                let mut d_u_dir = Array1::<f64>::zeros(p);
-                let cell = cell_entry.partition_cell.cell;
-                let state_ref = &cell_entry.state;
-                let fixed = &cell_entry.fixed;
-                let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
-                let chi_poly = fixed.dc_da.to_vec();
-                let eta_aa_poly = fixed.dc_daa.to_vec();
-
-                let mut eta_u_poly = vec![PolyVec::new(); p];
-                let mut chi_u_poly = vec![PolyVec::new(); p];
-                for u in 0..p {
-                    eta_u_poly[u] =
-                        poly_add(&poly_scale(&chi_poly, a_u[u]), fixed.coeff_u[u].as_ref());
-                    chi_u_poly[u] = poly_add(
-                        &poly_scale(&eta_aa_poly, a_u[u]),
-                        fixed.coeff_au[u].as_ref(),
-                    );
-                }
-
-                let eta_aaa_poly = fixed.dc_daaa.to_vec();
-                let mut coeff_dir_poly = vec![0.0; 4];
-                let mut coeff_a_dir_poly = vec![0.0; 4];
-                let mut coeff_aa_dir_poly = vec![0.0; 4];
-                for c in 0..p {
-                    if dir[c] == 0.0 {
-                        continue;
-                    }
-                    for k in 0..4 {
-                        coeff_dir_poly[k] += fixed.coeff_u[c][k] * dir[c];
-                        coeff_a_dir_poly[k] += fixed.coeff_au[c][k] * dir[c];
-                        coeff_aa_dir_poly[k] += fixed.coeff_aau[c][k] * dir[c];
-                    }
-                }
-                // TOTAL directional derivatives of the cell index jets (chain
-                // through both the direct params AND the calibration intercept a):
-                //   D_dir(η)    = chi·a_dir + ∂c/∂(direct)
-                //   D_dir(∂c/∂a)= eta_aa·a_dir + ∂²c/∂a∂(direct)
-                let eta_dir_poly = poly_add(&poly_scale(&chi_poly, a_dir), &coeff_dir_poly);
-                let chi_dir_poly = poly_add(&poly_scale(&eta_aa_poly, a_dir), &coeff_a_dir_poly);
-
-                for u in 0..p {
-                    let mut eta_u_dir_fixed = vec![0.0; 4];
-                    let mut chi_u_dir_fixed = vec![0.0; 4];
-                    for c in 0..p {
-                        if dir[c] == 0.0 {
-                            continue;
-                        }
-                        let sc = self.cell_pair_second_coeff(primary, &fixed.coeff_bu, u, c);
-                        let sca = self.cell_pair_third_coeff_a(primary, &fixed.coeff_abu, u, c);
-                        for k in 0..4 {
-                            eta_u_dir_fixed[k] += sc[k] * dir[c];
-                            chi_u_dir_fixed[k] += sca[k] * dir[c];
-                        }
-                    }
-                    // TOTAL D_dir(eta_u) = D_dir(chi·a_u + ∂c/∂u)
-                    //   = chi_dir·a_u + chi·a_u_dir + [∂²c/∂u∂(direct) + a_dir·∂²c/∂a∂u].
-                    // The intercept chain `a_dir·coeff_au[u]` and the `coeff_a_dir·a_u`
-                    // direct cross were dropped here, leaving d_u_dir/d_uv_dir wrong
-                    // at the deviation (β_w) indices once the link is curved
-                    // (gam#932/#979 — invisible at β=0 and on the q/g axes where
-                    // coeff_au/coeff_aau vanish).
-                    let eta_u_dir_poly = poly_add(
-                        &poly_add(
-                            &poly_add(
-                                &poly_scale(&chi_poly, a_u_dir[u]),
-                                &poly_scale(&chi_dir_poly, a_u[u]),
-                            ),
-                            &eta_u_dir_fixed,
-                        ),
-                        &poly_scale(fixed.coeff_au[u].as_ref(), a_dir),
-                    );
-                    // TOTAL D_dir(chi_u) = D_dir(eta_aa·a_u + ∂²c/∂a∂u)
-                    //   = eta_aa_dir·a_u + eta_aa·a_u_dir
-                    //     + [∂³c/∂a∂u∂(direct) + a_dir·∂³c/∂a²∂u].
-                    let eta_aa_dir_poly =
-                        poly_add(&poly_scale(&eta_aaa_poly, a_dir), &coeff_aa_dir_poly);
-                    let chi_u_dir_poly = poly_add(
-                        &poly_add(
-                            &poly_add(
-                                &poly_scale(&eta_aa_poly, a_u_dir[u]),
-                                &poly_scale(&eta_aa_dir_poly, a_u[u]),
-                            ),
-                            &chi_u_dir_fixed,
-                        ),
-                        &poly_scale(fixed.coeff_aau[u].as_ref(), a_dir),
-                    );
-
-                    // D_u integrand: chi_u - chi * eta * eta_u
-                    let integrand_base = poly_sub(
-                        &chi_u_poly[u],
-                        &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly[u]),
-                    );
-                    // Polynomial derivative of integrand w.r.t. dir, with the FULL
-                    // total D_dir(chi) = chi_dir_poly (not just its direct part).
-                    let integrand_dir = poly_sub(
-                        &poly_sub(
-                            &poly_sub(
-                                &chi_u_dir_poly,
-                                &poly_mul(&poly_mul(&chi_dir_poly, &eta_poly), &eta_u_poly[u]),
-                            ),
-                            &poly_mul(&poly_mul(&chi_poly, &eta_dir_poly), &eta_u_poly[u]),
-                        ),
-                        &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_dir_poly),
-                    );
-                    // Moment-weighting correction: -eta*eta_dir * integrand_base
-                    let full_integrand = poly_sub(
-                        &integrand_dir,
-                        &poly_mul(&poly_mul(&eta_poly, &eta_dir_poly), &integrand_base),
-                    );
-
-                    d_u_dir[u] += exact_kernel::cell_polynomial_integral_from_moments(
-                        &full_integrand,
-                        &state_ref.moments,
-                        "survival D_t first derivative directional",
-                    )?;
-
-                    // Moving-domain (Leibniz) boundary flux. The density
-                    // integral ∫_{z_L}^{z_R} integrand_base·exp(-q)/2π dz is over
-                    // a cell whose link-knot-crossing edges z=(τ-a)/b move with
-                    // `dir` at velocity z' = -(a_dir + z·dir_g)/b. Its directional
-                    // derivative therefore picks up
-                    //   integrand_base(z_R)·w(z_R)·z_R' - integrand_base(z_L)·w(z_L)·z_L'.
-                    // Unlike the Hessian-integral boundary term (which is shared
-                    // by adjacent cells and cancels across each interior knot),
-                    // this ln-density integrand is NOT shared, so the flux is
-                    // live and must be added (gam#932/#979).
-                    if b != 0.0 {
-                        let part = &cell_entry.partition_cell;
-                        let edge_vel =
-                            |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
-                                match edge {
-                                    crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
-                                        -(a_dir + z * dir_g) / b
-                                    }
-                                    crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
-                                }
-                            };
-                        let v_r = edge_vel(part.right_edge, cell.right);
-                        let v_l = edge_vel(part.left_edge, cell.left);
-                        if v_r != 0.0 {
-                            d_u_dir[u] += v_r
-                                * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
-                                    cell,
-                                    &integrand_base,
-                                    cell.right,
-                                );
-                        }
-                        if v_l != 0.0 {
-                            d_u_dir[u] -= v_l
-                                * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
-                                    cell,
-                                    &integrand_base,
-                                    cell.left,
-                                );
-                        }
-                    }
-                }
-                Ok(d_u_dir)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let mut d_u_dir = Array1::<f64>::zeros(p);
-        for cell_d_u_dir in d_u_dir_cell_accums {
-            for u in 0..p {
-                d_u_dir[u] += cell_d_u_dir[u];
-            }
-        }
 
         // D_uv_dir
         let mut d_uv_dir = Array2::<f64>::zeros((p, p));
