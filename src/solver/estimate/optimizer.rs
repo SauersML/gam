@@ -971,6 +971,103 @@ where
             // was a no-op (β̂ → the certified ρ, undoing the seed probe).
             reml_state.compute_cost(&strategy_result.rho)?;
         }
+        // #1074 UPPER-BOUND INWARD-DESCENT ESCAPE. The outer cost-stall /
+        // convergence check projects out a coordinate sitting on the ρ upper
+        // bound, so a coordinate that was driven to the over-smoothing rail can
+        // be certified "converged" even when the REML criterion is strictly
+        // LOWER at an interior ρ (a feasible inward descent the projection
+        // masks). On `s(long,lat,bs="tp") + s(depth)` the spatial/depth
+        // NULL-SPACE (affine-trend) coordinates rail to ρ=30 while
+        // `compute_cost` is ~23/~5 units lower at ρ≈2, annihilating a SUPPORTED
+        // spatial trend (#1074). This guard runs a bounded, keep-best
+        // coordinate-descent polish on EXACTLY the coordinates pinned at the
+        // upper bound: for each, it line-searches `compute_cost` over a coarse
+        // inward grid and adopts the strictly-best ρ. It uses the same
+        // authoritative `compute_cost` the optimizer minimizes, so it can only
+        // LOWER the certified cost — it never raises it and is a no-op when the
+        // rail genuinely is the optimum (an unsupported term shrinking out,
+        // #1266/#1271: no interior point is cheaper, so nothing is adopted).
+        {
+            let rho_upper = crate::estimate::RHO_BOUND;
+            let railed: Vec<usize> = (0..strategy_result.rho.len())
+                .filter(|&i| strategy_result.rho[i] >= rho_upper - 1e-9)
+                .collect();
+            // Baseline to beat = the optimizer's OWN authoritative converged
+            // cost (`final_value`), which was scored at the converged ρ with its
+            // own inner solve and is immune to warm-start pollution from the
+            // probes below (the #1371 lesson). A probe only wins if it is
+            // strictly cheaper than this honest cost.
+            let base_cost = strategy_result.final_value;
+            if !railed.is_empty() && base_cost.is_finite() {
+                // Inward probe grid (descending from the rail). Bounded and
+                // cheap: at most 2 · |railed| · 8 inner solves, and only when a
+                // coord is actually pinned at the upper rail. Two coordinate-
+                // descent passes pick up cross-coordinate coupling between the
+                // railed axes.
+                const INWARD_GRID: [f64; 8] = [25.0, 20.0, 15.0, 10.0, 5.0, 2.0, 0.0, -2.0];
+                let mut best_rho = strategy_result.rho.clone();
+                let mut best_cost = base_cost;
+                let mut improved = false;
+                for _pass in 0..2 {
+                    let mut pass_improved = false;
+                    for &coord in &railed {
+                        let mut local_best = best_rho.clone();
+                        let mut local_cost = best_cost;
+                        for &cand in &INWARD_GRID {
+                            let mut probe = best_rho.clone();
+                            probe[coord] = cand;
+                            if let Ok(c) = reml_state.compute_cost(&probe)
+                                && c.is_finite()
+                                && c < local_cost - 1e-6 * (1.0 + local_cost.abs())
+                            {
+                                local_cost = c;
+                                local_best = probe;
+                            }
+                        }
+                        if local_cost < best_cost - 1e-6 * (1.0 + best_cost.abs()) {
+                            best_rho = local_best;
+                            best_cost = local_cost;
+                            improved = true;
+                            pass_improved = true;
+                        }
+                    }
+                    if !pass_improved {
+                        break;
+                    }
+                }
+                if improved {
+                    // COLD CONFIRMATION (guards against adopting a warm-start /
+                    // inner-cap artifact, the #1426/#1371 trap). The grid probes
+                    // ran warm-started off each other; a λ→0-ish interior point
+                    // can report a spuriously low cost from a capped inner solve.
+                    // Clear the inner cache and re-score the candidate cold; only
+                    // adopt if it STILL strictly beats the authoritative
+                    // `final_value`.
+                    reml_state.reset_outer_seed_state();
+                    let cold = reml_state.compute_cost(&best_rho);
+                    let cold_ok = matches!(cold, Ok(c)
+                        if c.is_finite() && c < base_cost - 1e-6 * (1.0 + base_cost.abs()));
+                    if cold_ok {
+                        let cold_cost = cold.unwrap_or(best_cost);
+                        log::info!(
+                            "[OUTER] #1074 upper-bound escape: certified ρ cost {base_cost:.6e} \
+                             lowered to {cold_cost:.6e} (cold-confirmed) by descending {} rail \
+                             coord(s) inward; adopting the cheaper interior ρ",
+                            railed.len()
+                        );
+                        strategy_result.rho = best_rho;
+                        strategy_result.final_value = cold_cost;
+                        // β̂ already installed at `best_rho` by the cold eval above.
+                    } else {
+                        // The improvement did not survive a cold re-score — it was
+                        // a warm-start artifact. Keep the certified ρ and restore
+                        // its inner state for downstream assembly.
+                        reml_state.reset_outer_seed_state();
+                        reml_state.compute_cost(&strategy_result.rho)?;
+                    }
+                }
+            }
+        }
         // Convergence guard for the outer-aware inner-PIRLS schedule
         // (path #3): the BFGS bridge stores a coarsen-then-tighten cap
         // into `reml_state.outer_inner_cap` on every accepted gradient
