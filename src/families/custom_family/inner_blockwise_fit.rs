@@ -1650,10 +1650,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 spectral_step.most_negative_eigenvalue,
                             );
                         }
-                        if spectral_step.nullity > 0 {
-                            log::debug!(
-                                "[PIRLS/joint-Newton] spectral reduced solve: nullity@{:.0e}={}/{} \
-                             |P0 rhs|∞={:.3e} |P+ rhs|∞={:.3e} λ_min+={:.3e} λ_max={:.3e}",
+                        {
+                            log::info!(
+                                "[979-DIAG] cycle {cycle:>3} spectral solve: nullity@{:.0e}={}/{} \
+                             |P0 rhs|∞={:.3e} |P+ rhs|∞={:.3e} λ_min+={:.3e} λ_max={:.3e} reflected={}",
                                 spectral_step.rank_tol,
                                 spectral_step.nullity,
                                 total_p,
@@ -1661,6 +1661,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 spectral_step.range_rhs_inf,
                                 spectral_step.lambda_min_positive,
                                 spectral_step.lambda_max_abs,
+                                spectral_step.reflected_negative_modes,
                             );
                         }
                         delta = Some(spectral_step.delta);
