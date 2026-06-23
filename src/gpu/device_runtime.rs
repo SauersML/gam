@@ -283,6 +283,14 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     static CONTEXTS: OnceLock<Mutex<HashMap<usize, Arc<CudaContext>>>> = OnceLock::new();
     let contexts = CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(ctx) = contexts.lock().ok()?.get(&ordinal).cloned() {
+        // Bind cudarc's PRIMARY context current on THIS thread BEFORE the runtime
+        // materialisation below, so the runtime initialises the same context that
+        // new_stream()/CudaBlas::new run cublasCreate against. Without this, on a
+        // fresh solve thread the cached path lets the runtime init its own device
+        // context, and the later cublasCreate on the primary-context stream fails
+        // CUBLAS/CUSOLVER_STATUS_NOT_INITIALIZED (the probe-first GPU-dead bug).
+        let bound = catch_unwind(AssertUnwindSafe(|| ctx.bind_to_thread()));
+        log::trace!("[GPU] cuda_context_for cached bind ok={}", matches!(bound, Ok(Ok(()))));
         ensure_cuda_runtime_device(ordinal);
         return Some(ctx);
     }
@@ -296,6 +304,11 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
         let mut guard = contexts.lock().ok()?;
         guard.entry(ordinal).or_insert_with(|| ctx.clone()).clone()
     };
+    // CudaContext::new already bound the primary context, but the HashMap may return
+    // an entry created on another thread; rebind so the primary context is current on
+    // THIS thread before the runtime touch (same probe-first NOT_INITIALIZED guard).
+    let bound = catch_unwind(AssertUnwindSafe(|| out.bind_to_thread()));
+    log::trace!("[GPU] cuda_context_for fresh bind ok={}", matches!(bound, Ok(Ok(()))));
     ensure_cuda_runtime_device(ordinal);
     Some(out)
 }
