@@ -591,17 +591,37 @@ fn bounded_fit_geometry_precision_is_on_user_scale() {
         (0..covariance.nrows()).all(|i| covariance[[i, i]] > 0.0),
         "bounded user covariance must have a strictly positive variance on every coefficient"
     );
+    // Dispersion-ownership contract (`inference::dispersion_cov`): the stored
+    // `geometry.penalized_hessian` is the UNSCALED penalized Hessian `H`, while
+    // the reported `beta_covariance` is `Vb = φ̂·H⁻¹`. For this profiled-Gaussian
+    // fit `φ̂ = σ̂²` (the coefficient-covariance scale), so the inverse precision
+    // and the covariance are an exact pair only after multiplying by that scale
+    // — verifying it confirms the bounded fit both exports a covariance
+    // (gam#854) AND scales it by the estimated dispersion (gam#1514), rather
+    // than the pre-#1514 invariant `Vb == H⁻¹` that silently dropped σ̂².
+    let cov_scale = fitted.fit.coefficient_covariance_scale();
+    assert!(
+        cov_scale.is_finite() && cov_scale > 0.0,
+        "profiled-Gaussian bounded fit must report a finite positive σ̂² scale, got {cov_scale}"
+    );
+    assert!(
+        cov_scale < 1.0,
+        "near-noiseless fit should have a small residual variance, got σ̂²={cov_scale}"
+    );
     let chol = precision
         .cholesky(faer::Side::Lower)
         .expect("bounded user precision cholesky");
     let solved = chol.solve_mat(&Array2::eye(covariance.nrows()));
+    // Compare on the unscaled scale (`Vb/σ̂² == H⁻¹`) so the tolerance keeps its
+    // original magnitude rather than shrinking with σ̂².
     for i in 0..solved.nrows() {
         for j in 0..solved.ncols() {
+            let unscaled_cov = covariance[[i, j]] / cov_scale;
             assert!(
-                (solved[[i, j]] - covariance[[i, j]]).abs() < 1e-5,
-                "user-scale precision/covariance mismatch at ({i},{j}): inverse {}, covariance {}",
-                solved[[i, j]],
-                covariance[[i, j]]
+                (solved[[i, j]] - unscaled_cov).abs() < 1e-5,
+                "user-scale precision/covariance mismatch at ({i},{j}): inverse {}, \
+                 covariance/σ̂² {unscaled_cov} (σ̂²={cov_scale})",
+                solved[[i, j]]
             );
         }
     }
