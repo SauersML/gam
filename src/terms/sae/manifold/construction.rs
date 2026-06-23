@@ -7896,70 +7896,6 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
-    pub(crate) fn gate_first_derivatives_for_row(
-        &self,
-        rho: &SaeManifoldRho,
-        row: usize,
-        assignments: ArrayView1<'_, f64>,
-        vars: &[SaeLocalRowVar],
-    ) -> Result<Vec<Vec<f64>>, String> {
-        let k_atoms = self.k_atoms();
-        let q = vars.len();
-        let mut dz = vec![vec![0.0_f64; k_atoms]; q];
-        match self.assignment.mode {
-            AssignmentMode::Softmax { temperature, .. } => {
-                let inv_tau = 1.0 / temperature;
-                for (a_idx, var_a) in vars.iter().enumerate() {
-                    let SaeLocalRowVar::Logit { atom: j } = *var_a else {
-                        continue;
-                    };
-                    for k in 0..k_atoms {
-                        let indicator = if k == j { 1.0 } else { 0.0 };
-                        dz[a_idx][k] = assignments[k] * (indicator - assignments[j]) * inv_tau;
-                    }
-                }
-            }
-            AssignmentMode::IBPMap {
-                temperature, alpha, ..
-            } => {
-                let effective_alpha = self
-                    .assignment
-                    .mode
-                    .resolved_ibp_alpha(rho)
-                    .unwrap_or(alpha);
-                let prior = ordered_geometric_shrinkage_prior(k_atoms, effective_alpha);
-                let inv_tau = 1.0 / temperature;
-                for (idx, var) in vars.iter().enumerate() {
-                    let SaeLocalRowVar::Logit { atom } = *var else {
-                        continue;
-                    };
-                    let (_z, d1, _d2) =
-                        sae_sigmoid_derivatives_from_value(assignments[atom], inv_tau, prior[atom]);
-                    dz[idx][atom] = d1;
-                }
-            }
-            AssignmentMode::JumpReLU {
-                temperature,
-                threshold,
-            } => {
-                let inv_tau = 1.0 / temperature;
-                let logits = self.assignment.logits.row(row);
-                for (idx, var) in vars.iter().enumerate() {
-                    let SaeLocalRowVar::Logit { atom } = *var else {
-                        continue;
-                    };
-                    if logits[atom] <= threshold {
-                        continue;
-                    }
-                    let (_z, d1, _d2) =
-                        sae_sigmoid_derivatives_from_value(assignments[atom], inv_tau, 1.0);
-                    dz[idx][atom] = d1;
-                }
-            }
-        }
-        Ok(dz)
-    }
-
     fn reconstruction_row_program_for_logdet(
         &self,
         rho: &SaeManifoldRho,
@@ -8155,6 +8091,68 @@ impl SaeManifoldTerm {
         dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
     }
 
+    fn fill_beta_border_channels_from_program<const K: usize>(
+        program: &crate::terms::sae::row_jet_program::SaeReconstructionRowProgram,
+        sqrt_row_w: f64,
+        border: &[SaeBorderChannel],
+        beta: &mut [Vec<f64>],
+        beta_deriv: &mut [Vec<Vec<f64>>],
+        beta_l_deriv: &mut [Vec<Vec<f64>>],
+    ) {
+        let p = program.out_dim();
+        for (beta_pos, channel) in border.iter().enumerate() {
+            // s = ζ_k(ℓ)·Φ_b(t_k) over the local (logit/coord) primaries, built
+            // from the SAME gate_tower / basis_tower primitives as the
+            // reconstruction column. Tower slot `a` is `vars[a]` exactly as the
+            // reconstruction `first`/`second` channels index it.
+            let s = program.beta_border_tower::<K>(channel.atom, channel.basis_col);
+            for out_col in 0..p {
+                let out_c = channel.output[out_col];
+                beta[beta_pos][out_col] = sqrt_row_w * s.v * out_c;
+                for a in 0..K {
+                    // Reconstruction is linear in β, so beta_deriv and
+                    // beta_l_deriv are the identical mixed ∂²ẑ_c/∂β∂p_a channel.
+                    let mixed = sqrt_row_w * s.g[a] * out_c;
+                    beta_deriv[a][beta_pos][out_col] = mixed;
+                    beta_l_deriv[a][beta_pos][out_col] = mixed;
+                }
+            }
+        }
+    }
+
+    fn fill_beta_border_channels_from_program_dynamic(
+        program: &crate::terms::sae::row_jet_program::SaeReconstructionRowProgram,
+        sqrt_row_w: f64,
+        border: &[SaeBorderChannel],
+        beta: &mut [Vec<f64>],
+        beta_deriv: &mut [Vec<Vec<f64>>],
+        beta_l_deriv: &mut [Vec<Vec<f64>>],
+    ) -> Result<(), String> {
+        macro_rules! dispatch {
+            ($($k:literal),* $(,)?) => {
+                match program.n_primaries {
+                    $(
+                        $k => {
+                            Self::fill_beta_border_channels_from_program::<$k>(
+                                program,
+                                sqrt_row_w,
+                                border,
+                                beta,
+                                beta_deriv,
+                                beta_l_deriv,
+                            );
+                            Ok(())
+                        }
+                    )*
+                    q => Err(format!(
+                        "SAE β border Tower4 production path supports at most 16 row primaries, got {q}"
+                    )),
+                }
+            };
+        }
+        dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    }
+
     pub(crate) fn row_jets_for_logdet(
         &self,
         rho: &SaeManifoldRho,
@@ -8170,8 +8168,6 @@ impl SaeManifoldTerm {
             .row_loss_weights
             .as_deref()
             .map_or(1.0, |w| w[row].sqrt());
-        let dz = self.gate_first_derivatives_for_row(rho, row, assignments, &vars)?;
-
         let mut first = vec![vec![0.0_f64; p]; q];
         let mut second = vec![vec![vec![0.0_f64; p]; q]; q];
         let program =
@@ -8183,58 +8179,29 @@ impl SaeManifoldTerm {
             &mut second,
         )?;
 
+        // β BORDER CHANNELS (#932): single-sourced through the SAME
+        // reconstruction row program used above. A β border channel is one free
+        // decoder coefficient whose per-row contribution to output column `c` is
+        // ζ_k(ℓ)·Φ_b(t_k)·output_c — linear in β — so the value channel is
+        // `beta_border_tower.v · output_c` and the mixed ∂²ẑ_c/∂β∂p_a channel
+        // (both `beta_deriv` and `beta_l_deriv`, identical because the map is
+        // linear in β) is `beta_border_tower.g[a] · output_c`. The former hand
+        // packing — with its own gate first-derivative recursion
+        // (`gate_first_derivatives_for_row`) and term-by-term basis/jacobian
+        // reads — is replaced by the tower, which carries every gate/basis
+        // derivative automatically and is pinned to the prior hand path by
+        // `sae_row_jet_program_matches_production_row_jets_on_converged_cache`.
         let mut beta = vec![vec![0.0_f64; p]; border.len()];
         let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
         let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; q];
-        for (beta_pos, channel) in border.iter().enumerate() {
-            let atom = channel.atom;
-            let phi = self.atoms[atom].basis_values[[row, channel.basis_col]];
-            let base = assignments[atom] * phi * sqrt_row_w;
-            for out_col in 0..p {
-                beta[beta_pos][out_col] = base * channel.output[out_col];
-            }
-            for (var_idx, var) in vars.iter().enumerate() {
-                let scalar = match *var {
-                    SaeLocalRowVar::Logit { .. } => dz[var_idx][atom] * phi * sqrt_row_w,
-                    SaeLocalRowVar::Coord {
-                        atom: coord_atom,
-                        axis,
-                    } if coord_atom == atom => {
-                        assignments[atom]
-                            * self.atoms[atom].basis_jacobian[[row, channel.basis_col, axis]]
-                            * sqrt_row_w
-                    }
-                    _ => 0.0,
-                };
-                if scalar != 0.0 {
-                    for out_col in 0..p {
-                        beta_deriv[var_idx][beta_pos][out_col] = scalar * channel.output[out_col];
-                    }
-                }
-                let scalar_l = match *var {
-                    SaeLocalRowVar::Logit { .. } => {
-                        dz[var_idx][atom]
-                            * self.atoms[atom].basis_values[[row, channel.basis_col]]
-                            * sqrt_row_w
-                    }
-                    SaeLocalRowVar::Coord {
-                        atom: coord_atom,
-                        axis,
-                    } if coord_atom == atom => {
-                        assignments[atom]
-                            * self.atoms[atom].basis_jacobian[[row, channel.basis_col, axis]]
-                            * sqrt_row_w
-                    }
-                    _ => 0.0,
-                };
-                if scalar_l != 0.0 {
-                    for out_col in 0..p {
-                        beta_l_deriv[var_idx][beta_pos][out_col] =
-                            scalar_l * channel.output[out_col];
-                    }
-                }
-            }
-        }
+        Self::fill_beta_border_channels_from_program_dynamic(
+            &program,
+            sqrt_row_w,
+            border,
+            &mut beta,
+            &mut beta_deriv,
+            &mut beta_l_deriv,
+        )?;
 
         Ok(SaeRowJets {
             vars,

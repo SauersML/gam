@@ -728,17 +728,6 @@ impl SaeAssignment {
     }
 }
 
-pub(crate) fn sae_sigmoid_derivatives_from_value(
-    value: f64,
-    inv_tau: f64,
-    scale: f64,
-) -> (f64, f64, f64) {
-    let sig = if scale > 0.0 { value / scale } else { 0.0 };
-    let dz = scale * sig * (1.0 - sig) * inv_tau;
-    let d2z = scale * sig * (1.0 - sig) * (1.0 - 2.0 * sig) * inv_tau * inv_tau;
-    (value, dz, d2z)
-}
-
 pub(crate) fn neutral_gate_weights(mode: AssignmentMode, k_atoms: usize) -> Array1<f64> {
     match mode {
         AssignmentMode::Softmax { .. } => Array1::from_elem(k_atoms, 1.0 / (k_atoms.max(1) as f64)),
