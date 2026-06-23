@@ -3432,16 +3432,26 @@ const KERNEL_RANGE_MIN_DIAMETER_FRACTION: f64 = 2.0;
 const KERNEL_RANGE_MAX_SPACING_MULTIPLE: f64 = 1e2;
 
 /// Matérn-only ceiling on the kernel length scale, as a fraction of the maximum
-/// pairwise distance `r_max`. Caps how flat the isotropic-κ optimizer (dim > 1)
-/// can make the kernel before it collapses onto the polynomial nullspace (#1357).
+/// pairwise distance `r_max`. Caps how flat the isotropic-κ optimizer can make
+/// the kernel before it collapses onto the polynomial nullspace (#1357).
 ///
-/// #1074 NOTE: raising this toward mgcv's full-diameter range and overriding the
-/// generic `r_max/2` floor (tried at 1.5×) lets the 2-D optimizer reach mgcv's
-/// range, but it broke the 2-D κ outer-gradient FD tests and the high-frequency
-/// collapse guards in `basis_smooth`. Reverted to the conservative `0.15` (the
-/// generic floor governs); the matern 2-D under-recovery (edf 28 vs mgcv 14) is
-/// tracked on #1074 as needing a deeper κ-optimization fix, not a bound bump.
-const MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.15;
+/// #1074 ROOT CAUSE: at `0.15` this ceiling PINNED the κ-optimizer at the cap's
+/// upper bound for the *default-length-scale* path — `spatial_term_psi_bounds`
+/// raises ψ_lo to `1/(0.15·r_max)`, so the optimizer could never lengthen the
+/// range past `0.15·r_max ≈ 0.147`, even though the REML optimum sits near
+/// `0.3–0.5·r_max` (measured: an explicit length_scale lets the optimizer reach
+/// ~0.5 and recover the truth at rmse 0.031, matching mgcv's 0.031; pinned at
+/// 0.147 it under-recovers at 0.044). Relaxed to `0.5`, which coincides with the
+/// generic diameter floor `KERNEL_RANGE_MIN_DIAMETER_FRACTION/r_max` (= `r_max/2`)
+/// that Duchon/TPS already use, so the `.max()` clamp in `spatial_term_psi_bounds`
+/// is now a no-op vs the generic floor and the REML κ-optimizer is free to climb
+/// to its optimum in `[generic_floor, r_max/2]`. The #1357 fully-flat collapse
+/// corner stays guarded by the EDF-collapse guard in `spatial_optimization.rs`.
+/// NOTE: this is the cap ALONE — the default-init change (frac→1.0) that was
+/// bundled with an earlier attempt is what regressed the high-frequency sin8
+/// collapse guard, so the init stays at the conservative
+/// `DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION` and only the ceiling moves.
+const MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.5;
 
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
 ///
