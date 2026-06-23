@@ -431,6 +431,13 @@ pub struct FitConfig {
     /// Optional cap on the REML/LAML outer smoothing-parameter iterations for
     /// standard formula fits. `None` uses the production default.
     pub outer_max_iter: Option<usize>,
+    /// Optional wall-clock budget (seconds) for the outer smoothing search
+    /// (gam#979). Threaded to the survival marginal-slope fit, whose constrained
+    /// joint-Newton can fail to certify convergence and otherwise grind without
+    /// bound; with this set the fit returns its best-so-far iterate (or a
+    /// catchable error) within the budget instead of hanging. `None` keeps the
+    /// generous built-in default for that path and is unbounded elsewhere.
+    pub outer_wall_clock_budget_secs: Option<f64>,
 
     /// GPU backend selection policy. `Auto` uses supported device kernels for
     /// large workloads, `Off` pins execution to CPU kernels, and `Force` fails
@@ -531,6 +538,7 @@ impl Default for FitConfig {
             transformation_normal: false,
             firth: false,
             outer_max_iter: None,
+            outer_wall_clock_budget_secs: None,
             gpu_policy: crate::gpu::GpuPolicy::Auto,
             resource_policy: None,
             group_metadata: None,
