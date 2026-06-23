@@ -383,7 +383,13 @@ fn diag_quakes_spatial_1074() {
     train_ds.values = train_values;
     let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
 
-    for formula in ["mag ~ s(long, lat, bs=\"tp\") + s(depth)", "mag ~ s(long, lat, bs=\"tp\", k=30) + s(depth)"] {
+    for formula in [
+        "mag ~ s(long, lat, bs=\"tp\") + s(depth)",
+        "mag ~ s(long, lat, bs=\"tp\", double_penalty=FALSE) + s(depth)",
+        "mag ~ s(long, lat, bs=\"tp\")",
+        "mag ~ s(depth)",
+        "mag ~ s(long, lat, bs=\"tp\", k=60) + s(depth)",
+    ] {
         let result = fit_from_formula(formula, &train_ds, &cfg).unwrap();
         let FitResult::Standard(fit) = result else { panic!() };
         // held-out
