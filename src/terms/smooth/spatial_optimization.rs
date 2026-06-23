@@ -2323,31 +2323,41 @@ fn try_exact_joint_spatial_length_scale_optimization(
             kappa_options,
         )
     };
-    // #1464 hard sign-pin: for each constant-curvature term whose fixed-κ
-    // sign-basin scan chose a definite sign, collapse the joint ψ window to that
-    // sign's half-axis (closed at κ = 0) so the joint ARC physically CANNOT cross
-    // zero into the spurious +κ collapsed-kernel corner. The scan (the
-    // sign-correct profiled-REML oracle) is authoritative for the sign; the joint
-    // solve then only refines the magnitude inside the correct basin. A scan
-    // result of exactly κ = 0 (genuinely flat) leaves the window untouched.
-    // CC-gated — non-CC terms are never in `cc_sign_seeds`, so every other
+    // #1464 hard κ-PIN: for each constant-curvature term whose κ-FAIR sign-basin
+    // scan chose a definite sign, FREEZE the joint ψ coordinate at the scanned
+    // κ value (both bounds = κ_seed) rather than only closing the far half-axis at
+    // κ = 0. Why the full freeze and not the half-axis pin: the joint solver
+    // refines κ against the production profiled-REML `fit_score`, and that raw
+    // criterion is SIGN-BLIND — on a generic radial signal its data-fit term
+    // decreases MONOTONICALLY toward +κ for BOTH spherical and hyperbolic truth
+    // (the +κ chart compresses geodesic distances → a uniformly better radial
+    // interpolator; verified by `bug_hunt_1464_criterion_vs_solver`, V_p(+2) <
+    // V_p(0) < V_p(−2) for hyperbolic data). So a half-axis window [κ_min, 0] does
+    // NOT stop the rail: the solver walks κ to the 0-edge (κ̂ → 0, the observed
+    // hyperbolic-recovered-as-spherical failure). Only the κ-FAIR scan
+    // (`constant_curvature_kappa_fair_sign_score`, which subtracts the design's
+    // generic radial-peak-fitting power) is sign-identifying, and since the κ
+    // MAGNITUDE is unidentified here (V_p is monotone — it rails to whichever
+    // bound the window exposes), the scan's argmin is the authoritative κ̂. Freeze
+    // there and let the joint solve optimize only ρ (and any non-CC ψ) at that κ.
+    // This is byte-identical to the prior behaviour for SPHERICAL data — the
+    // half-axis pin already railed κ̂ to κ_max = the scan value — and only changes
+    // the negative-sign cases, which previously railed to 0. A scan result of
+    // exactly κ = 0 (genuinely flat) leaves the window untouched. CC-gated —
+    // non-CC terms are never in `cc_sign_seeds`, so every other
     // spatial/Matérn/Duchon/sphere joint window is byte-identical to before.
     let mut log_kappa_lower = log_kappa_lower;
     let mut log_kappa_upper = log_kappa_upper;
     for &(slot, kappa_seed) in &cc_sign_seeds {
-        if kappa_seed < 0.0 {
-            // Hyperbolic basin: ψ ∈ [κ_min, 0].
-            log_kappa_upper.set_scalar_slot(slot, 0.0);
-        } else if kappa_seed > 0.0 {
-            // Spherical basin: ψ ∈ [0, κ_max].
-            log_kappa_lower.set_scalar_slot(slot, 0.0);
+        if kappa_seed != 0.0 {
+            log_kappa_lower.set_scalar_slot(slot, kappa_seed);
+            log_kappa_upper.set_scalar_slot(slot, kappa_seed);
         }
         log::info!(
-            "[#1464-trace] slot {slot}: hard-pinned joint ψ window to \
-             [{}, {}] (seed sign {})",
+            "[#1464-trace] slot {slot}: FROZE joint ψ coordinate at κ_seed={kappa_seed} \
+             (window [{}, {}]); raw fit_score is sign-blind so the κ-fair scan is authoritative",
             log_kappa_lower.as_array()[log_kappa_lower.dims_per_term()[..slot].iter().sum::<usize>()],
             log_kappa_upper.as_array()[log_kappa_upper.dims_per_term()[..slot].iter().sum::<usize>()],
-            if kappa_seed < 0.0 { "negative" } else if kappa_seed > 0.0 { "positive" } else { "zero" },
         );
     }
     // Project seed onto data-derived bounds; spec.length_scale is a hint,
