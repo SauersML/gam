@@ -374,6 +374,14 @@ fn diag_matern_internals_1074() {
         "y ~ matern(x, nu=2.5, k=20, length_scale=0.50)",
         "y ~ matern(x, nu=2.5, k=20, length_scale=0.98)",
         "y ~ matern(x, nu=2.5, k=20, length_scale=1.50)",
+        // #1074: nu=1.5 sweep — find whether ANY range reaches mgcv's nu=1.5
+        // recovery (varying_nu match-or-beat bar). If gam's best > mgcv, the gap
+        // is the half-integer kernel itself, not the range.
+        "y ~ matern(x, nu=1.5, k=20, length_scale=0.10)",
+        "y ~ matern(x, nu=1.5, k=20, length_scale=0.15)",
+        "y ~ matern(x, nu=1.5, k=20, length_scale=0.30)",
+        "y ~ matern(x, nu=1.5, k=20, length_scale=0.50)",
+        "y ~ matern(x, nu=1.5, k=20, length_scale=0.98)",
     ] {
         let headers = ["x", "y"].into_iter().map(String::from).collect();
         let rows: Vec<csv::StringRecord> = x
