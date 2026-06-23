@@ -215,6 +215,27 @@ pub(crate) const COST_STALL_PROJECTED_GRAD_FLOOR: f64 = 1.0e-3;
 /// below the #1426 stuck residual (|g| ≈ 11) so the gamma/log overfit is caught.
 pub(crate) const FLAT_VALLEY_STALL_GRAD_CEILING: f64 = 5.0;
 
+/// Score-relative stationarity tolerance for certifying a cost-stalled flat
+/// valley (#1426/#1477). A cost stall whose best-iterate projected gradient
+/// clears `FLAT_VALLEY_CONVERGED_REL_GRAD · (1 + |score|)` is reported
+/// `converged = true` even when it exceeds the tight absolute
+/// `COST_STALL_PROJECTED_GRAD_FLOOR = 1e-3`. The REML/LAML score for a
+/// non-trivial fit is `O(1e2)–O(1e3)`, so this is a `O(0.1)` absolute gradient —
+/// the residual a weakly-identified (near-zero-curvature) ρ coordinate floors at,
+/// which mgcv's score-relative convergence certifies. Set so the wide
+/// degeneracy-prior null-space valleys (correct fits, EDF well below the basis)
+/// certify, while the #1426 stuck overfit (`|g| ≈ 11`, also above
+/// `FLAT_VALLEY_STALL_GRAD_CEILING`) does not.
+pub(crate) const FLAT_VALLEY_CONVERGED_REL_GRAD: f64 = 1.0e-3;
+
+/// Absolute cap on [`FLAT_VALLEY_CONVERGED_REL_GRAD`]'s score-relative bound.
+/// Without it a fit with a very large `|score|` would license certifying a large
+/// projected gradient; capping at `1.0` keeps the certified band a genuinely
+/// small absolute gradient regardless of score, and stays well below the
+/// `FLAT_VALLEY_STALL_GRAD_CEILING = 5.0` stuck-stall band so a stuck overfit on a
+/// large-score fit is never certified.
+pub(crate) const FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP: f64 = 1.0;
+
 /// Maximum number of consecutive [`CostStallVerdict::StuckKeepDescending`]
 /// escapes the guard grants before it falls back to a [`CostStallVerdict::
 /// FlatValleyStall`] halt (#1426). Each escape resets the no-improvement window
@@ -541,12 +562,35 @@ impl CostStallGuard {
         } else {
             grad_norm
         };
-        // Convergence is STATIONARITY, not cost-flatness: a cost stall counts
-        // as a converged optimum only when the projected gradient norm at the
-        // best iterate clears the same outer gradient tolerance the genuine
-        // BFGS convergence path checks. Otherwise it is a flat-valley floor
-        // with residual non-stationarity, reported `converged = false`.
-        let converged = best_grad_norm.is_finite() && best_grad_norm <= self.grad_threshold;
+        // Convergence is STATIONARITY, measured RELATIVE TO THE SCORE SCALE.
+        // A cost stall counts as a converged optimum when the projected gradient
+        // at the best iterate clears EITHER (a) the absolute outer gradient
+        // tolerance the genuine BFGS path checks, OR (b) a score-relative
+        // stationarity bound `FLAT_VALLEY_CONVERGED_REL_GRAD · (1 + |score|)`.
+        //
+        // Bound (b) is the mgcv-aligned half (#1426/#1477). On a WEAKLY-IDENTIFIED
+        // ρ coordinate — e.g. the double-penalty null-space log-λ of a smooth whose
+        // null space is only weakly supported, under the wide degeneracy prior — the
+        // REML surface is near-flat: the Hessian in that direction is ≈ 0, so the
+        // projected gradient cannot be driven down to the tight ABSOLUTE
+        // `COST_STALL_PROJECTED_GRAD_FLOOR = 1e-3` no matter how many outer steps
+        // run; it floors at the valley's own residual (`O(0.1)` on a score of
+        // `O(1e3)`). That is a genuine stationary optimum — mgcv certifies it (its
+        // convergence is the gradient relative to the score, not an absolute 1e-3) —
+        // and the cost-stall window has already proven the surface flattened. The
+        // OLD absolute-only test reported these correct fits `converged = false`,
+        // flooding the verdict with false alarms on exactly the fits the principled
+        // wide-prior (no null-space over-shrink) produces. The score-relative bound
+        // certifies them while a GENUINELY non-stationary residual — the #1426 stuck
+        // overfit (|g| ≈ 11 on a score `O(1e3)`, i.e. above BOTH this bound and the
+        // separate `FLAT_VALLEY_STALL_GRAD_CEILING`) — is still rejected and routed
+        // to `StuckKeepDescending`, so no near-full-basis overfit is ever certified.
+        let score_relative_grad_bound = (FLAT_VALLEY_CONVERGED_REL_GRAD
+            * (1.0 + best_value.abs()))
+        .min(FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP);
+        let converged = best_grad_norm.is_finite()
+            && (best_grad_norm <= self.grad_threshold
+                || best_grad_norm <= score_relative_grad_bound);
         if converged {
             if let Ok(mut slot) = self.exit.lock() {
                 *slot = Some(CostStallExit {
