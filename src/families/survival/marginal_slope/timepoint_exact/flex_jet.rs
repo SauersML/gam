@@ -1374,6 +1374,115 @@ mod moment_engine_tests {
             );
         }
     }
+
+    /// #932 item-2 Phase C: the generic `flex_timepoint_eta_chi<J>` builder must
+    /// reproduce `eta = eval_coeff4_at(coeff, z) + o_infl + rho` and `chi =
+    /// eval_coeff4_at(dc_da, z) + tau` on the VALUE channel, and the a/b θ-motion
+    /// on the gradient channel vs a central finite difference of the same scalar
+    /// expression along a smooth `(a,b)` family. Pins the bivariate-Taylor compose
+    /// + the linear rho/tau add at `Jet2`.
+    #[test]
+    fn flex_timepoint_eta_chi_value_and_grad_932() {
+        let z_obs = 0.7_f64;
+        let o_infl = 0.05_f64;
+        let pack = ObservedCoeffPack {
+            coeff: [0.2, -0.3, 0.15, 0.05],
+            dc_da: [1.1, 0.2, 0.03, 0.0],
+            dc_db: [0.4, 1.05, 0.1, 0.02],
+            dc_daa: [0.07, 0.02, 0.0, 0.0],
+            dc_dab: [0.2, 0.09, 0.01, 0.0],
+            dc_dbb: [0.11, 0.04, 0.005, 0.0],
+            dc_daaa: [0.003, 0.0, 0.0, 0.0],
+            dc_daab: [0.006, 0.001, 0.0, 0.0],
+            dc_dabb: [0.004, 0.002, 0.0, 0.0],
+            dc_dbbb: [0.008, 0.001, 0.0, 0.0],
+        };
+        // Single-primary family θ: a(θ)=a0+θ·a_u, b(θ)=b0+θ·b_u.
+        let a0 = 0.3_f64;
+        let b0 = 1.2_f64;
+        let a_u = 0.25_f64;
+        let b_u = -0.4_f64;
+        let p = 1usize;
+        let a_jet = Jet2::from_parts(a0, &[a_u], &[]);
+        let b_jet = Jet2::from_parts(b0, &[b_u], &[]);
+        // No rho/tau channels for this probe.
+        let zero = Jet2::from_parts(0.0, &vec![0.0; p], &[]);
+        let (eta, chi) = flex_timepoint_eta_chi(&a_jet, &b_jet, z_obs, o_infl, &pack, &zero, &zero);
+
+        // Scalar reference: eta(a,b) = Σ_k c_k(a,b) z^k, c_k composed from the
+        // bivariate Taylor of the pack about (a0,b0).
+        let coeff_scalar = |da: f64, db: f64| -> [f64; 4] {
+            std::array::from_fn(|k| {
+                pack.coeff[k]
+                    + pack.dc_da[k] * da
+                    + pack.dc_db[k] * db
+                    + 0.5 * pack.dc_daa[k] * da * da
+                    + pack.dc_dab[k] * da * db
+                    + 0.5 * pack.dc_dbb[k] * db * db
+                    + pack.dc_daaa[k] * da * da * da / 6.0
+                    + 0.5 * pack.dc_daab[k] * da * da * db
+                    + 0.5 * pack.dc_dabb[k] * da * db * db
+                    + pack.dc_dbbb[k] * db * db * db / 6.0
+            })
+        };
+        let eta_scalar = |theta: f64| -> f64 {
+            let c = coeff_scalar(a_u * theta, b_u * theta);
+            eval_coeff4_scalar(&c, z_obs) + o_infl
+        };
+        let chi_scalar = |theta: f64| -> f64 {
+            let dc = coeff_scalar_da(&pack, a_u * theta, b_u * theta);
+            eval_coeff4_scalar(&dc, z_obs)
+        };
+        assert!(
+            (eta.value() - eta_scalar(0.0)).abs() <= 1e-12 * (1.0 + eta_scalar(0.0).abs()),
+            "eta value {} != {}",
+            eta.value(),
+            eta_scalar(0.0)
+        );
+        assert!(
+            (chi.value() - chi_scalar(0.0)).abs() <= 1e-12 * (1.0 + chi_scalar(0.0).abs()),
+            "chi value {} != {}",
+            chi.value(),
+            chi_scalar(0.0)
+        );
+        let h = 1e-6_f64;
+        let eta_fd = (eta_scalar(h) - eta_scalar(-h)) / (2.0 * h);
+        let chi_fd = (chi_scalar(h) - chi_scalar(-h)) / (2.0 * h);
+        assert!(
+            (eta.g[0] - eta_fd).abs() <= 1e-5 * (1.0 + eta_fd.abs()),
+            "eta grad {} != FD {}",
+            eta.g[0],
+            eta_fd
+        );
+        assert!(
+            (chi.g[0] - chi_fd).abs() <= 1e-5 * (1.0 + chi_fd.abs()),
+            "chi grad {} != FD {}",
+            chi.g[0],
+            chi_fd
+        );
+    }
+
+    /// Scalar Horner `Σ_k c[k] z^k` (the `f64` image of `eval_coeff4_at`).
+    fn eval_coeff4_scalar(c: &[f64; 4], z: f64) -> f64 {
+        let mut acc = 0.0;
+        for &ck in c.iter().rev() {
+            acc = acc * z + ck;
+        }
+        acc
+    }
+
+    /// Scalar `∂_a coeff` Taylor (the dc_da pack composed about (a0,b0)) — the
+    /// reference for `chi`'s value/grad in the test above.
+    fn coeff_scalar_da(pack: &ObservedCoeffPack, da: f64, db: f64) -> [f64; 4] {
+        std::array::from_fn(|k| {
+            pack.dc_da[k]
+                + pack.dc_daa[k] * da
+                + pack.dc_dab[k] * db
+                + 0.5 * pack.dc_daaa[k] * da * da
+                + pack.dc_daab[k] * da * db
+                + 0.5 * pack.dc_dabb[k] * db * db
+        })
+    }
 }
 
 // ── §C: observed cell-coefficient jets + eta/chi point-eval (Phase C core) ──
@@ -1456,64 +1565,71 @@ fn eval_coeff_jet_at<J: FlexJet>(coeff_jet: &[J; 4], z: f64) -> J {
     acc
 }
 
-/// Phase C assembly (foundational `Jet2` order): the observed timepoint `eta`
-/// and `chi` as value/grad/Hessian jets, from the solved intercept derivatives
-/// (`a`, `a_u`, `a_uv` — `a_u = f_u/D`, `a_uv = lift_intercept_order2`) and the
-/// observed cell-coefficient partial pack. `b` is the slope (`g` primary at
-/// `g_axis`). `eta`/`chi` carry their exact first/second θ-derivatives by
-/// composing the coefficients' bivariate `(a,b)` Taylor with the intercept jet
-/// — replacing the hand `eta_u = chi·a_u + rho`, `eta_uv = …` chains in
-/// `first_full`/`directional`/`bidirectional` for the `a`/`b` channels.
-///
-/// The score-warp (`h`) / link-dev (`w`) channels (which enter `eta` linearly
-/// via `rho`/`tau`) and the `D`-normalization channel (via the moment engine)
-/// are layered on by the full `flex_timepoint_inputs` once those pieces land.
+/// The observed cell-coefficient partial pack (`coeff`/`dc_d{a,b}…/dbbb`) passed
+/// through `observed_denested_cell_partials`, bundled so the generic eta/chi
+/// builder stays under the argument-count gate.
+pub(crate) struct ObservedCoeffPack {
+    pub coeff: [f64; 4],
+    pub dc_da: [f64; 4],
+    pub dc_db: [f64; 4],
+    pub dc_daa: [f64; 4],
+    pub dc_dab: [f64; 4],
+    pub dc_dbb: [f64; 4],
+    pub dc_daaa: [f64; 4],
+    pub dc_daab: [f64; 4],
+    pub dc_dabb: [f64; 4],
+    pub dc_dbbb: [f64; 4],
+}
 
-fn flex_timepoint_eta_chi_jet2(
-    p: usize,
-    g_axis: usize,
-    a: f64,
-    a_u: &[f64],
-    a_uv: &[f64],
-    b: f64,
+/// Phase C-complete (generic order): the observed timepoint `eta` and `chi` as
+/// jets at ANY `FlexJet` order, from the intercept jet `a_jet` (carrying its
+/// θ-derivatives to that order) and the slope jet `b_jet`, the observed
+/// cell-coefficient pack, and pre-built score-warp(`h`)/link-dev(`w`) `rho`/`tau`
+/// channel jets. `eta`/`chi` carry their exact θ-derivatives by composing the
+/// coefficients' bivariate `(a,b)` Taylor with the intercept/slope jets, then
+/// adding the linear `h`/`w`/`infl` channels — replacing the hand
+/// `eta_u = chi·a_u + rho`, `eta_uv = …` chains in
+/// `first_full`/`directional`/`bidirectional`.
+///
+/// `rho_jet`/`tau_jet` are the already-seeded jets carrying the linear `h`/`w`/
+/// `infl` channels' θ-dependence on their own primaries (the caller builds them
+/// at the correct order with the right directional seeds — order-specific
+/// seeding context lives at the call site, not here). `eta += rho_jet`,
+/// `chi += tau_jet`.
+fn flex_timepoint_eta_chi<J: FlexJet>(
+    a_jet: &J,
+    b_jet: &J,
     z_obs: f64,
     o_infl: f64,
-    coeff: [f64; 4],
-    dc_da: [f64; 4],
-    dc_db: [f64; 4],
-    dc_daa: [f64; 4],
-    dc_dab: [f64; 4],
-    dc_dbb: [f64; 4],
-    dc_daaa: [f64; 4],
-    dc_daab: [f64; 4],
-    dc_dabb: [f64; 4],
-    dc_dbbb: [f64; 4],
-) -> (Jet2, Jet2) {
-    let a_jet = Jet2::from_parts(a, a_u, a_uv);
-    let b_jet = Jet2::primary(b, g_axis, p);
-    let da = tangent_jet(&a_jet);
-    let db = tangent_jet(&b_jet);
+    pack: &ObservedCoeffPack,
+    rho_jet: &J,
+    tau_jet: &J,
+) -> (J, J) {
+    let da = tangent_jet(a_jet);
+    let db = tangent_jet(b_jet);
     let zero4 = [0.0_f64; 4];
 
     // eta coefficients: the coeff pack composed with (da, db).
-    let coeff_jets: [Jet2; 4] = std::array::from_fn(|k| {
+    let coeff_jets: [J; 4] = std::array::from_fn(|k| {
         observed_coeff_component_jet(
-            &a_jet, k, coeff, dc_da, dc_db, dc_daa, dc_dab, dc_dbb, dc_daaa, dc_daab, dc_dabb,
-            dc_dbbb, &da, &db,
+            a_jet, k, pack.coeff, pack.dc_da, pack.dc_db, pack.dc_daa, pack.dc_dab, pack.dc_dbb,
+            pack.dc_daaa, pack.dc_daab, pack.dc_dabb, pack.dc_dbbb, &da, &db,
         )
     });
-    let eta = eval_coeff_jet_at(&coeff_jets, z_obs).add_const(o_infl);
+    let eta = eval_coeff_jet_at(&coeff_jets, z_obs)
+        .add_const(o_infl)
+        .add(rho_jet);
 
     // chi = ∂eta/∂a coefficients = the dc_da pack, whose own (a,b)-Taylor is the
     // once-`a`-shifted pack (dc_daa as ∂/∂a, dc_dab as ∂/∂b, dc_daaa/daab/dabb as
     // the seconds; the dc_da pack carries no third-order term, so those are 0).
-    let chi_jets: [Jet2; 4] = std::array::from_fn(|k| {
+    let chi_jets: [J; 4] = std::array::from_fn(|k| {
         observed_coeff_component_jet(
-            &a_jet, k, dc_da, dc_daa, dc_dab, dc_daaa, dc_daab, dc_dabb, zero4, zero4, zero4, zero4,
-            &da, &db,
+            a_jet, k, pack.dc_da, pack.dc_daa, pack.dc_dab, pack.dc_daaa, pack.dc_daab,
+            pack.dc_dabb, zero4, zero4, zero4, zero4, &da, &db,
         )
     });
-    let chi = eval_coeff_jet_at(&chi_jets, z_obs);
+    let chi = eval_coeff_jet_at(&chi_jets, z_obs).add(tau_jet);
 
     (eta, chi)
 }
