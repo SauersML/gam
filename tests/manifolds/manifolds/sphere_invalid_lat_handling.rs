@@ -29,7 +29,7 @@ fn make_data_with_lats(lats: &[f64]) -> gam::data::EncodedDataset {
             ]));
         }
     }
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|| panic!("{} failed", "encode"))
+    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn assert_predict_with_invalid_lat_rejects_cleanly(formula: &str) {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(formula, &data, &cfg).unwrap_or_else(|| panic!("{} failed", "fit ok"));
+    let result = fit_from_formula(formula, &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit ok", e));
     let FitResult::Standard(fit) = result else {
         panic!("expected standard fit")
     };
@@ -129,7 +129,7 @@ fn sphere_lat_exactly_at_pole_accepts() {
         ..FitConfig::default()
     };
     fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg)
-        .unwrap_or_else(|| panic!("{} failed", "lat=±90 exactly must be accepted as the pole"));
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "lat=±90 exactly must be accepted as the pole", e));
 }
 
 #[test]

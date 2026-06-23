@@ -542,11 +542,11 @@ fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
 
 #[test]
 fn hifreq_tensor_k4() -> Result<(), String> {
-    hifreq_tensor_probe(4);
+    hifreq_tensor_probe(4)
 }
 #[test]
 fn hifreq_tensor_k6() -> Result<(), String> {
-    hifreq_tensor_probe(6);
+    hifreq_tensor_probe(6)
 }
 // gam#1082: hifreq_tensor_k8/k10 run LONGER than the default per-test
 // slow-timeout (300s notice / 600s SIGKILL) on an IRREDUCIBLE cost. They are
@@ -575,11 +575,11 @@ fn hifreq_tensor_k6() -> Result<(), String> {
 // check. k4/k6 (p ≈ 144/196) stay well within the default budget.
 #[test]
 fn hifreq_tensor_k8() -> Result<(), String> {
-    hifreq_tensor_probe(8);
+    hifreq_tensor_probe(8)
 }
 #[test]
 fn hifreq_tensor_k10() -> Result<(), String> {
-    hifreq_tensor_probe(10);
+    hifreq_tensor_probe(10)
 }
 
 // =====================================================================
@@ -992,6 +992,7 @@ fn tensor_multicollinear_inputs() -> Result<(), String> {
                 "[fit-quality] probe=multicollinear_tensor category=BUILD_REFUSED \
                  formula=`{formula}` err=`{e}`",
             );
+            Ok(())
         }
     }
 }
@@ -1033,6 +1034,7 @@ fn cyclic_wrong_period() -> Result<(), String> {
                 "[fit-quality] probe=cyclic_wrong_period category=ERROR_RAISED \
                  formula=`{formula}` err=`{e}`",
             );
+            Ok(())
         }
         Ok(result) => {
             let FitResult::Standard(fit) = result else {

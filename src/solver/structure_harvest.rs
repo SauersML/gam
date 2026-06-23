@@ -63,6 +63,9 @@ use crate::terms::sae::basis::{
 use crate::terms::sae::manifold::{
     SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
 };
+use crate::terms::structure::anova_atom::{
+    CarveReport, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
+};
 use crate::warm_start::Fingerprinter;
 
 /// Per-row soft-assignment mass below which an atom is treated as INACTIVE on
@@ -96,6 +99,14 @@ const FUSION_DEPENDENCE_FLOOR: f64 = 0.6;
 /// Minimum conditional asymmetry for a pair to be proposed for a FISSION audit
 /// (the A⇒B absorption signature: one conditional near 1 without the converse).
 const ABSORPTION_ASYMMETRY_FLOOR: f64 = 0.5;
+
+/// Level at which the within-atom representational carve (#993) calls binding
+/// PROVEN (blocking a fission). The harvest carve is a PROPOSAL filter, not the
+/// final certificate — the downstream held-out e-gate owns acceptance — so this
+/// is the conventional 0.05 screening level, deliberately not the stricter
+/// certificate level; a carve that fails to reject here still rides as a
+/// fission proposal for the e-gate to adjudicate on held-out shards.
+const WITHIN_ATOM_CARVE_ALPHA: f64 = 0.05;
 
 /// Knobs for one harvest pass. All magic-by-default — derived from the fit, not
 /// surfaced as user flags.
@@ -277,11 +288,15 @@ fn proposal(term: &SaeManifoldTerm, mv: StructureMove, trigger: f64) -> MoveProp
 ///   coordinate prior).
 /// * **Fusions** from the top co-activation pairs by symmetric code dependence.
 /// * **Fission audits** from absorption-suspect pairs (high conditional
-///   asymmetry). Fit-side inputs for the within-atom substructure carve (#907
-///   mixture race / #975 `carve`) land with #993; until those inputs exist the
-///   audit proposes a fission whose acceptance the e-gate owns, and the absent
-///   carve is recorded loudly via [`HarvestReport::fission_carve_skipped`]
-///   rather than silently dropped.
+///   asymmetry). For each candidate that is a `d = 2` product atom the
+///   within-atom functional-ANOVA carve (#975 / #993) RUNS on the atom's own
+///   fitted decoder via [`run_within_atom_carve`]: a carve that proves binding
+///   blocks the fission (the atom is irreducible), an additive carve rides as a
+///   fission proposal ranked by its interaction fraction, and every outcome is
+///   recorded on [`HarvestReport::fission_carve_results`]. A non-product
+///   candidate (no factor split) rides on the co-activation audit and is
+///   counted in [`HarvestReport::fission_carve_unavailable_count`] — never a
+///   silent drop. The held-out e-gate still owns final acceptance.
 /// * **Births** from the whitened residual-factor subspace: the residuals are
 ///   fed to [`StructuredResidualModel::fit`], whose factor directions
 ///   ([`StructuredResidualModel::factor`]) are the birth candidates, ranked by
@@ -364,28 +379,81 @@ pub fn harvest_move_proposals(
     // Keep the most-suspect (lowest significance) audit per parent atom.
     fission_atoms.sort_by(|x, y| x.1.total_cmp(&y.1).then(x.0.cmp(&y.0)));
     fission_atoms.dedup_by_key(|(atom, _)| *atom);
-    // Loud, quantitative record of the #993-blocked degrade path: the within-
-    // atom carve refit's fit-side inputs land with #993, so count the fission
-    // proposals that actually ride (after the `max_fissions` cap) without it. A
-    // bare bool over-reported when the cap dropped every candidate; deriving it
-    // from the count is the precise, never-silent record, consistent with how
-    // `births_proposed` quantifies its channel.
-    let fission_carve_skipped_count = fission_atoms.len().min(params.max_fissions);
-    let fission_carve_skipped = fission_carve_skipped_count > 0;
-    if fission_carve_skipped {
-        log::debug!(
-            "[structure-harvest] within-atom carve inputs absent (#993): {} fission \
-             audit(s) ride without sub-atom refinement; e-gate owns acceptance",
-            fission_carve_skipped_count,
-        );
+
+    // #993: run the within-atom functional-ANOVA carve on each fission
+    // candidate that is a genuine `d = 2` product atom. The carve adjudicates
+    // the representational binding question (is the surface ONE bound product
+    // atom or TWO superposed factors?) on the atom's OWN fitted decoder, on the
+    // same empirical code measure. A carve that PROVES binding (the interaction
+    // is significant, or energetically non-negligible) blocks the fission — the
+    // atom stays whole and contested; the e-gate never sees a fission proposal
+    // for a bound atom. A carve that does NOT prove binding rides as a fission
+    // proposal whose trigger is the carve's interaction fraction (ascending —
+    // the most-separable atom sorts first), and whose binding evidence is the
+    // carve's `edge_p_value`, recorded for the ledger.
+    //
+    // A candidate that is NOT a recoverable product atom (single-axis, sphere
+    // chart, monomial patch — `factor_basis_sizes() == None`), or whose carve
+    // could not run (degenerate sample, non-separable basis), is recorded
+    // loudly via `fission_carve_unavailable` rather than silently dropped: its
+    // fission audit still rides on the co-activation significance, exactly the
+    // pre-#993 behavior, but the absence of the carve is now an explicit,
+    // counted signal instead of a blanket skip.
+    let mut carve_results: Vec<FissionCarveResult> = Vec::new();
+    let mut fission_carve_ran_count = 0usize;
+    let mut fission_carve_unavailable_count = 0usize;
+    let mut fission_carve_blocked_count = 0usize;
+    let mut gated_fissions: Vec<(usize, f64)> = Vec::new();
+    for &(atom, significance) in fission_atoms.iter().take(params.max_fissions) {
+        match run_within_atom_carve(term, atom) {
+            Some(Ok(report)) => {
+                fission_carve_ran_count += 1;
+                let decision = fission_decision(&report, None);
+                let edge_p = report.edge_p_value;
+                let interaction = report.interaction_fraction;
+                carve_results.push(FissionCarveResult {
+                    atom,
+                    edge_p_value: edge_p,
+                    interaction_fraction: interaction,
+                    decision,
+                });
+                match decision {
+                    FissionDecision::Keep => {
+                        // Binding proven (or interaction non-negligible): the
+                        // atom is irreducible. Do NOT propose a fission.
+                        fission_carve_blocked_count += 1;
+                        log::debug!(
+                            "[structure-harvest] #993 carve KEEPS atom {atom}: binding proven \
+                             (edge_p={edge_p:?}, interaction_fraction={interaction:.3e}); no fission proposed",
+                        );
+                    }
+                    FissionDecision::SplitReconstructionOnly
+                    | FissionDecision::SplitCertifiedJoint => {
+                        // Separable: propose the fission, ranked by interaction
+                        // fraction (ascending — most-additive first).
+                        gated_fissions.push((atom, interaction));
+                    }
+                }
+            }
+            Some(Err(err)) => {
+                fission_carve_unavailable_count += 1;
+                log::debug!(
+                    "[structure-harvest] #993 carve could not run on atom {atom}: {err}; \
+                     fission audit rides on co-activation significance, e-gate owns acceptance",
+                );
+                gated_fissions.push((atom, significance));
+            }
+            None => {
+                // Not a recoverable product atom — the within-atom carve is not
+                // defined here. Ride the co-activation audit, count it loudly.
+                fission_carve_unavailable_count += 1;
+                gated_fissions.push((atom, significance));
+            }
+        }
     }
 
-    for &(atom, significance) in fission_atoms.iter().take(params.max_fissions) {
-        proposals.push(proposal(
-            term,
-            StructureMove::Fission { atom },
-            significance,
-        ));
+    for &(atom, trigger) in &gated_fissions {
+        proposals.push(proposal(term, StructureMove::Fission { atom }, trigger));
     }
 
     // --- Births: whitened residual-factor subspace -------------------------
@@ -435,11 +503,70 @@ pub fn harvest_move_proposals(
 
     Ok(HarvestReport {
         proposals,
-        fission_carve_skipped,
-        fission_carve_skipped_count,
+        fission_carve_results: carve_results,
+        fission_carve_ran_count,
+        fission_carve_unavailable_count,
+        fission_carve_blocked_count,
         births_proposed,
         birth_skipped_reason,
     })
+}
+
+/// One within-atom carve outcome on a fission candidate (#993). Recorded on
+/// the [`HarvestReport`] so the binding decision and its evidence are visible
+/// — including the `edge_p_value` the dictionary certificate's `BindingEdge`
+/// claim reads — never silent.
+#[derive(Clone, Debug)]
+pub struct FissionCarveResult {
+    /// The audited product atom.
+    pub atom: usize,
+    /// Edge-level representational binding p-value (the carve's joint Wald over
+    /// the gauge-projected interaction block). `None` when the test degenerated.
+    pub edge_p_value: Option<f64>,
+    /// Fraction of centered surface energy carried by the interaction
+    /// (0 = perfectly additive / separable, 1 = pure interaction).
+    pub interaction_fraction: f64,
+    /// The carve's representational fission verdict.
+    pub decision: FissionDecision,
+}
+
+/// Run the within-atom representational carve on one fitted atom (#993).
+///
+/// Returns:
+/// * `None` — the atom is not a recoverable `d = 2` product atom (no factor
+///   split); the within-atom carve is undefined here.
+/// * `Some(Err(_))` — the atom is a product atom but the carve could not run
+///   (degenerate sample, non-separable basis, REML fit failure).
+/// * `Some(Ok(report))` — the carve ran; the report carries the binding
+///   verdict and evidence.
+///
+/// The factor sizes come from the atom's basis evaluator
+/// ([`SaeBasisEvaluator::factor_basis_sizes`]); the carve inputs are built from
+/// the atom's FUSED basis and decoder by
+/// [`crate::terms::structure::anova_atom::carve_input_from_fitted_atom`], which
+/// verifies the Kronecker separability before fitting.
+fn run_within_atom_carve(
+    term: &SaeManifoldTerm,
+    atom: usize,
+) -> Option<Result<CarveReport, String>> {
+    let a = &term.atoms[atom];
+    if a.latent_dim != 2 {
+        return None;
+    }
+    let evaluator = a.basis_evaluator.as_ref()?;
+    let (m_a, m_b) = evaluator.factor_basis_sizes()?;
+    let build = carve_input_from_fitted_atom(
+        a.basis_values.view(),
+        a.decoder_coefficients.view(),
+        m_a,
+        m_b,
+    );
+    let bundle = match build {
+        Ok(b) => b,
+        Err(e) => return Some(Err(e)),
+    };
+    let input = bundle.representational_carve_input();
+    Some(carve(&input, WITHIN_ATOM_CARVE_ALPHA))
 }
 
 /// The output of one [`harvest_move_proposals`] pass: the proposal stream plus
@@ -449,14 +576,23 @@ pub struct HarvestReport {
     /// Trigger-stamped, claim-stamped, structurally-hashed proposals, ready for
     /// [`search`] (which canonicalizes and gates them).
     pub proposals: Vec<MoveProposal>,
-    /// Whether any fission audit actually rode (after the `max_fissions` cap)
-    /// without its within-atom carve refit, whose fit-side inputs land with
-    /// #993. Recorded so the degraded path is visible, never silent.
-    pub fission_carve_skipped: bool,
-    /// How many fission proposals rode without the #993 within-atom carve — the
-    /// precise, quantitative companion to `fission_carve_skipped`, so the size
-    /// of the degraded set is visible, never just a yes/no.
-    pub fission_carve_skipped_count: usize,
+    /// The within-atom carve outcomes (#993): one entry per fission candidate
+    /// (within the `max_fissions` cap) that is a recoverable `d = 2` product
+    /// atom whose carve RAN. Carries the representational binding verdict and
+    /// `edge_p_value` — the dictionary certificate's `BindingEdge` evidence —
+    /// so a fission's binding decision is visible, never silent. A carve that
+    /// KEEPS the atom (binding proven) blocked its fission proposal; the
+    /// remaining entries' atoms each have a corresponding `Fission` proposal.
+    pub fission_carve_results: Vec<FissionCarveResult>,
+    /// How many fission candidates had the #993 within-atom carve actually run.
+    pub fission_carve_ran_count: usize,
+    /// How many fission candidates could NOT be carved (not a product atom, or
+    /// the carve failed) and rode on the co-activation audit instead — the
+    /// precise, never-silent record of the residual degrade path.
+    pub fission_carve_unavailable_count: usize,
+    /// How many fission candidates the carve BLOCKED (binding proven → atom kept
+    /// whole, no fission proposed). These never reach the e-gate.
+    pub fission_carve_blocked_count: usize,
     /// Number of residual-factor birth candidates proposed.
     pub births_proposed: usize,
     /// If the birth channel could not run (empty residuals, evidence-ladder
@@ -2239,8 +2375,10 @@ mod tests {
 
     /// Oracle (#997 trigger): a planted ABSORPTION (A⊇B: B's support nests
     /// inside A's) produces a FISSION audit on the parent A (high conditional
-    /// asymmetry, parent conditional ≈ 1), and the `fission_carve_skipped` flag
-    /// is recorded loudly (`fission_carve_skipped`; #993 carve absent on this path).
+    /// asymmetry, parent conditional ≈ 1). The planted atoms are 1-D `Periodic`
+    /// (NOT a `d = 2` product), so the #993 within-atom carve is undefined on
+    /// them and the candidate rides on the co-activation audit — recorded
+    /// loudly via `fission_carve_unavailable_count`, never silent.
     #[test]
     fn planted_absorption_harvests_fission_audit_with_loud_carve_skip() {
         // Atom 0 (parent) active on rows ≡ 0 mod 2 PLUS rows ≡ 1 mod 4; atom 1
@@ -2271,9 +2409,17 @@ mod tests {
             "nested-support parent (atom 0) must be flagged for a fission audit; got {:?}",
             report.proposals.iter().map(|p| &p.mv).collect::<Vec<_>>()
         );
+        assert_eq!(
+            report.fission_carve_ran_count, 0,
+            "1-D periodic atoms are not a product manifold; the within-atom carve cannot run"
+        );
         assert!(
-            report.fission_carve_skipped,
-            "the #993 within-atom carve is unwired; the skip must be recorded, not silent"
+            report.fission_carve_unavailable_count >= 1,
+            "the non-product fission candidate must be recorded as carve-unavailable, not silent"
+        );
+        assert!(
+            report.fission_carve_results.is_empty(),
+            "no carve ran, so there are no carve results to report"
         );
     }
 

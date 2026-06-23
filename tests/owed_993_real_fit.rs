@@ -184,7 +184,6 @@ fn harvest_params() -> HarvestParams {
 #[test]
 fn real_fitted_separable_torus_atom_runs_carve_and_proposes_fission() {
     let separable = {
-        let coords = torus_coords();
         let evaluator = TorusHarmonicEvaluator::new(2, N_HARMONICS).unwrap();
         let (m, _) = evaluator.factor_basis_sizes().unwrap();
         separable_decoder(m, 3)
@@ -227,7 +226,6 @@ fn real_fitted_separable_torus_atom_runs_carve_and_proposes_fission() {
 #[test]
 fn real_fitted_bound_torus_atom_runs_carve_and_blocks_fission() {
     let bound = {
-        let coords = torus_coords();
         let evaluator = TorusHarmonicEvaluator::new(2, N_HARMONICS).unwrap();
         let (m, _) = evaluator.factor_basis_sizes().unwrap();
         bound_decoder(m, 3)
