@@ -5,7 +5,7 @@
 //! cargo bench --bench margslope_flex_large_scale_hv
 //! ```
 
-#[path = "../../tests/test_support/margslope_flex_equivalence.rs"]
+#[path = "../../tests/test_support/misc/margslope_flex_equivalence.rs"]
 mod margslope_flex_equivalence;
 
 use criterion::{Criterion, criterion_group, criterion_main};
