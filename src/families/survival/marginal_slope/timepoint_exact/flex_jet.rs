@@ -1046,3 +1046,83 @@ mod moment_engine_tests {
         }
     }
 }
+
+// ── §C: observed cell-coefficient jets + eta/chi point-eval (Phase C core) ──
+//
+// The observed cell coefficients `coeff[k]` are a smooth function of the
+// intercept `a(θ)` and the slope `b` (= the `g` primary), with the score-warp
+// (`h`) and link-dev (`w`) channels entering linearly on top. Their full
+// bivariate Taylor in `(a,b)` is exactly the `observed_denested_cell_partials`
+// pack (`dc_da…dc_dbbb`). Composing that Taylor with the intercept jet `a_jet`
+// and the slope jet `b_jet` (both carrying their θ-derivatives) yields each
+// `coeff[k]` AS a jet — so `eta = Σ_k coeff[k]·z_obs^k` and `chi = Σ_k
+// dc_da[k]·z_obs^k` (point-evals at the fixed observation `z_obs`) carry their
+// exact θ-derivatives mechanically, replacing the hand `eta_u = chi·a_u + rho`
+// / `eta_uv = …` chain in `first_full`/`directional`/`bidirectional`.
+
+/// A value-zero "tangent" jet `x_jet − x.value()`: value 0, derivative channels
+/// preserved. Used as the perturbation argument of the bivariate Taylor below.
+#[inline]
+fn tangent_jet<J: FlexJet>(x: &J) -> J {
+    x.add_const(-x.value())
+}
+
+/// A constant jet (value `v`, all derivative channels zero), shaped like
+/// `template` (so it carries the right runtime primary count).
+#[inline]
+fn const_jet_like<J: FlexJet>(template: &J, v: f64) -> J {
+    template.scale(0.0).add_const(v)
+}
+
+/// One observed cell coefficient `coeff[k]` as a jet: the bivariate `(a,b)`
+/// Taylor (up to 3rd order, matching the `dc_d{a,b}…` pack) composed with the
+/// intercept tangent `da` and slope tangent `db` jets. Terms with a 0/6/2/… are
+/// the multinomial Taylor weights `coeff + Σ (1/(i!j!)) ∂^{i+j}coeff/∂a^i∂b^j ·
+/// da^i db^j`.
+fn observed_coeff_component_jet<J: FlexJet>(
+    template: &J,
+    k: usize,
+    coeff: [f64; 4],
+    dc_da: [f64; 4],
+    dc_db: [f64; 4],
+    dc_daa: [f64; 4],
+    dc_dab: [f64; 4],
+    dc_dbb: [f64; 4],
+    dc_daaa: [f64; 4],
+    dc_daab: [f64; 4],
+    dc_dabb: [f64; 4],
+    dc_dbbb: [f64; 4],
+    da: &J,
+    db: &J,
+) -> J {
+    let dada = da.mul(da);
+    let dadb = da.mul(db);
+    let dbdb = db.mul(db);
+    let mut c = const_jet_like(template, coeff[k]);
+    c = c.add(&da.scale(dc_da[k])).add(&db.scale(dc_db[k]));
+    c = c
+        .add(&dada.scale(0.5 * dc_daa[k]))
+        .add(&dadb.scale(dc_dab[k]))
+        .add(&dbdb.scale(0.5 * dc_dbb[k]));
+    let inv6 = 1.0 / 6.0;
+    let half = 0.5;
+    c = c
+        .add(&dada.mul(da).scale(inv6 * dc_daaa[k]))
+        .add(&dada.mul(db).scale(half * dc_daab[k]))
+        .add(&dadb.mul(db).scale(half * dc_dabb[k]))
+        .add(&dbdb.mul(db).scale(inv6 * dc_dbbb[k]));
+    c
+}
+
+/// Evaluate a 4-coefficient cell polynomial jet `Σ_k coeff_jet[k]·z^k` at the
+/// fixed observation point `z` (the jet image of `eval_coeff4_at`).
+#[inline]
+fn eval_coeff_jet_at<J: FlexJet>(coeff_jet: &[J; 4], z: f64) -> J {
+    let mut zk = 1.0;
+    let mut acc = const_jet_like(&coeff_jet[0], 0.0);
+    for c in coeff_jet.iter() {
+        acc = acc.add(&c.scale(zk));
+        zk *= z;
+    }
+    acc
+}
