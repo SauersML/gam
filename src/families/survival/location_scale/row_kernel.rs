@@ -752,7 +752,6 @@ impl<const KW: usize> crate::families::row_kernel::RowKernel<KW>
     }
 
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; KW] {
-        use crate::families::row_kernel::RowKernel as _;
         let base = self.base.jacobian_action(row, &d_beta[..self.wiggle_off]);
         std::array::from_fn(|a| {
             if a < SLS_ROW_K {
@@ -764,7 +763,6 @@ impl<const KW: usize> crate::families::row_kernel::RowKernel<KW>
     }
 
     fn jacobian_transpose_action(&self, row: usize, v: &[f64; KW], out: &mut [f64]) {
-        use crate::families::row_kernel::RowKernel as _;
         let vbase: [f64; SLS_ROW_K] = std::array::from_fn(|a| v[a]);
         self.base
             .jacobian_transpose_action(row, &vbase, &mut out[..self.wiggle_off]);

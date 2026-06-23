@@ -110,7 +110,7 @@ impl CubicRegressionBasis {
     /// `row` is overwritten.
     pub fn eval_row_into(&self, x: f64, row: &mut [f64]) {
         let k = self.knots.len();
-        debug_assert_eq!(row.len(), k);
+        assert_eq!(row.len(), k);
         for r in row.iter_mut() {
             *r = 0.0;
         }
