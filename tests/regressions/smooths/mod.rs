@@ -9,6 +9,7 @@ mod double_penalty_shrinks_irrelevant_covariate_1266;
 mod duchon_collocation_symmetry_psd_regression;
 mod duchon_hybrid_length_scale_default;
 mod factor_smooth_degree_shrink_predict_replay;
+mod gaulss_by_group_both_blocks_joint_hessian_shape_1504;
 mod group_random_effect_sparse_exact_smoothing_correction;
 mod input_loc_matern;
 mod margslope_duchon_slowdown;
