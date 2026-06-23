@@ -916,7 +916,15 @@ pub(crate) fn compute_smoothing_correction(
     // V_corr_orig = Qs * V_corr_trans * Qs^T
     let qs = &final_fit.reparam_result.qs;
     let qsv = qs.dot(&v_corr_trans);
-    let v_corr_orig = qsv.dot(&qs.t());
+    let mut v_corr_orig = qsv.dot(&qs.t());
+    // The congruence Qs·M·Qsᵀ is symmetric in exact arithmetic, but the two
+    // matrix products fill v[i,j] and v[j,i] via independent dot-products,
+    // leaving O(ε) asymmetry. This is a genuine covariance (added to the base
+    // Vb to form Vp, and consumed by model_comparison's corrected-EDF trace,
+    // which documents a "both symmetric" invariant it then relies on), so we
+    // symmetrize it like every other covariance-assembly site — unlike the
+    // influence matrix F = H⁻¹X'WX, which is deliberately left asymmetric.
+    crate::matrix::symmetrize_in_place(&mut v_corr_orig);
 
     // Validate the result
     if !v_corr_orig.iter().all(|v| v.is_finite()) {
