@@ -822,21 +822,34 @@ where
         // range railing is an interior-optimum the optimizer misses (optimizer
         // bug) or a genuine criterion preference for λ→∞ (criterion).
         if std::env::var("GAM_1074_RHO_SWEEP").is_ok() {
-            let baseline = Array1::<f64>::zeros(k);
-            eprintln!("[#1074-sweep] k={k} baseline=all-zeros");
-            for coord in 0..k {
-                let mut line = format!("[#1074-sweep] coord={coord}:");
-                for &rho in &[-5.0_f64, -2.0, 0.0, 2.0, 5.0, 8.0, 12.0, 16.0, 20.0, 25.0, 30.0]
-                {
-                    let mut p = baseline.clone();
-                    p[coord] = rho;
-                    let c = reml_state
-                        .compute_cost(&p)
-                        .map(|v| format!("{v:.5}"))
-                        .unwrap_or_else(|_| "ERR".to_string());
-                    line.push_str(&format!(" rho={rho:.0}->{c}"));
+            let grid = [
+                -5.0_f64, -2.0, 0.0, 2.0, 5.0, 8.0, 10.0, 12.0, 16.0, 20.0, 25.0, 30.0,
+            ];
+            let sweep_from = |label: &str, baseline: &Array1<f64>| {
+                eprintln!("[#1074-sweep] k={k} baseline={label}={baseline:?}");
+                for coord in 0..k {
+                    let mut line = format!("[#1074-sweep:{label}] coord={coord}:");
+                    for &rho in &grid {
+                        let mut p = baseline.clone();
+                        p[coord] = rho;
+                        let c = reml_state
+                            .compute_cost(&p)
+                            .map(|v| format!("{v:.4}"))
+                            .unwrap_or_else(|_| "ERR".to_string());
+                        line.push_str(&format!(" {rho:.0}->{c}"));
+                    }
+                    eprintln!("{line}");
                 }
-                eprintln!("{line}");
+            };
+            // (1) from the all-λ=1 origin.
+            sweep_from("zeros", &Array1::<f64>::zeros(k));
+            // (2) from the observed quakes converged proxy [30,9,12,9] so the
+            // per-coordinate slice is taken THROUGH the joint railing point —
+            // the only way to see whether the spatial coord has an interior min
+            // once the OTHER terms hold their absorbed allocation.
+            if k == 4 {
+                let conv = Array1::from(vec![30.0_f64, 9.0, 12.0, 9.0]);
+                sweep_from("conv", &conv);
             }
         }
 
