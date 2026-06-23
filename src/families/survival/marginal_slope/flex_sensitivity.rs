@@ -93,42 +93,29 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
 
-        let wi = self.weights[row];
-        let di = self.event[row];
-        let (log_surv0, _) = signed_probit_logcdf_and_mills_ratio(-entry.eta);
-        let (log_surv1, _) = signed_probit_logcdf_and_mills_ratio(-exit.eta);
-        let (entry_k1, _, _, _) = signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi)?;
-        let (exit_k1, _, _, _) =
-            signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di))?;
-        let log_phi_eta1 = -0.5 * (exit.eta * exit.eta + std::f64::consts::TAU.ln());
-        let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
-        let row_nll = wi
-            * (log_surv0
-                - (1.0 - di) * log_surv1
-                - di * log_phi_eta1
-                - di * exit.chi.ln()
-                - di * log_phi_q1
-                + di * exit.d.ln()
-                - di * qd1.ln());
-
-        let p = primary.total;
-        let mut grad = Array1::<f64>::zeros(p);
-        let entry_u1 = -entry_k1;
-        let exit_surv_u1 = -exit_k1;
-
-        for u in 0..p {
-            grad[u] += entry_u1 * entry.eta_u[u];
-            grad[u] += exit_surv_u1 * exit.eta_u[u];
-            grad[u] += wi * di * exit.eta * exit.eta_u[u];
-            grad[u] -= wi * di * exit.chi_u[u] / exit.chi;
-            if u == primary.q1 {
-                grad[u] += wi * di * q1;
-            }
-            grad[u] += wi * di * exit.d_u[u] / exit.d;
-            if u == primary.qd1 {
-                grad[u] -= wi * di / qd1;
-            }
-        }
+        // #932 single-source: the flex row NLL value + gradient fall out of the
+        // ONE generic row-NLL expression (`flex_row_nll`) instantiated at the
+        // value/grad jet — no separate hand-assembled probit chain / quotient
+        // rules. Grad-only: the first-order packs carry no `*_uv`, so the Hessian
+        // views are `None` (the value/gradient channels never read the Hessian).
+        let (row_nll, grad, _) = self.flex_row_nll_value_grad_hess(
+            row,
+            primary,
+            q1,
+            qd1,
+            entry.eta,
+            entry.eta_u.view(),
+            None,
+            exit.eta,
+            exit.eta_u.view(),
+            None,
+            exit.chi,
+            exit.chi_u.view(),
+            None,
+            exit.d,
+            exit.d_u.view(),
+            None,
+        )?;
 
         Ok((row_nll, grad))
     }
@@ -186,186 +173,32 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
 
-        let wi = self.weights[row];
-        let di = self.event[row];
-        let (log_surv0, _) = signed_probit_logcdf_and_mills_ratio(-entry.eta);
-        let (log_surv1, _) = signed_probit_logcdf_and_mills_ratio(-exit.eta);
-        let (entry_k1, entry_k2, _, _) =
-            signed_probit_neglog_derivatives_up_to_fourth(-entry.eta, -wi)?;
-        let (exit_k1, exit_k2, _, _) =
-            signed_probit_neglog_derivatives_up_to_fourth(-exit.eta, wi * (1.0 - di))?;
-
-        // ── Step-6 dispatcher: try GPU Step-5 assembly first ──────────────
-        //
-        // The per-row primary G/H assembly is pure scalar/vector algebra over
-        // the jets; the prep dispatchers (`try_device_partition_cells` +
-        // `try_device_cell_primary_fixed_partials`) already produced these
-        // jets via `compute_survival_timepoint_exact` →
-        // `build_cached_partition_with_moment_order`, so the only remaining
-        // family-side hop is the Step-5 G/H pullback in
-        // [`crate::families::survival::marginal_slope::gpu::try_device_step5_primary_assembly`].
-        //
-        // The GPU entry takes flat `&[f64]` views; both `Array1` and `Array2`
-        // returned by the timepoint-exact pass live in standard contiguous
-        // layout (built via `Array1::zeros` / `Array2::zeros` above), so the
-        // `as_slice()` extractions below are infallible in practice; we
-        // route through the CPU fallback when any of them happens not to be
-        // contiguous, preserving the legacy code path as the source of
-        // truth.
-        let p = primary.total;
-        let entry_eta_u = entry.eta_u.as_slice();
-        let entry_eta_uv = entry.eta_uv.as_slice();
-        let entry_chi_u = entry.chi_u.as_slice();
-        let entry_chi_uv = entry.chi_uv.as_slice();
-        let entry_d_u = entry.d_u.as_slice();
-        let entry_d_uv = entry.d_uv.as_slice();
-        let exit_eta_u = exit.eta_u.as_slice();
-        let exit_eta_uv = exit.eta_uv.as_slice();
-        let exit_chi_u = exit.chi_u.as_slice();
-        let exit_chi_uv = exit.chi_uv.as_slice();
-        let exit_d_u = exit.d_u.as_slice();
-        let exit_d_uv = exit.d_uv.as_slice();
-        let all_contiguous = entry_eta_u.is_some()
-            && entry_eta_uv.is_some()
-            && entry_chi_u.is_some()
-            && entry_chi_uv.is_some()
-            && entry_d_u.is_some()
-            && entry_d_uv.is_some()
-            && exit_eta_u.is_some()
-            && exit_eta_uv.is_some()
-            && exit_chi_u.is_some()
-            && exit_chi_uv.is_some()
-            && exit_d_u.is_some()
-            && exit_d_uv.is_some();
-        if all_contiguous
-            && exit.chi.is_finite()
-            && exit.chi > 0.0
-            && exit.d.is_finite()
-            && exit.d > 0.0
-        {
-            let row_inputs = [
-                crate::families::survival::marginal_slope::gpu::SurvivalFlexStep5RowInputs {
-                    entry:
-                        crate::families::survival::marginal_slope::gpu::SurvivalFlexTimepointJet {
-                            eta: entry.eta,
-                            chi: entry.chi,
-                            d: entry.d,
-                            eta_u: entry_eta_u.unwrap(),
-                            eta_uv: entry_eta_uv.unwrap(),
-                            chi_u: entry_chi_u.unwrap(),
-                            chi_uv: entry_chi_uv.unwrap(),
-                            d_u: entry_d_u.unwrap(),
-                            d_uv: entry_d_uv.unwrap(),
-                        },
-                    exit:
-                        crate::families::survival::marginal_slope::gpu::SurvivalFlexTimepointJet {
-                            eta: exit.eta,
-                            chi: exit.chi,
-                            d: exit.d,
-                            eta_u: exit_eta_u.unwrap(),
-                            eta_uv: exit_eta_uv.unwrap(),
-                            chi_u: exit_chi_u.unwrap(),
-                            chi_uv: exit_chi_uv.unwrap(),
-                            d_u: exit_d_u.unwrap(),
-                            d_uv: exit_d_uv.unwrap(),
-                        },
-                    wi,
-                    di,
-                    q1,
-                    qd1,
-                    q1_index: primary.q1,
-                    qd1_index: primary.qd1,
-                    entry_k1,
-                    entry_k2,
-                    exit_k1,
-                    exit_k2,
-                    log_surv0,
-                    log_surv1,
-                },
-            ];
-            // `try_device_step5_primary_assembly` is the device-shape Step-5
-            // pullback (`survival::marginal_slope::gpu`). Its current body
-            // is CPU-resident scalar algebra producing the same `(row_nll,
-            // grad, hess)` the inline CPU loop below builds; when the NVRTC
-            // kernel lands, this call site becomes the device-dispatch seam
-            // without further family-side rework.  We fall back to the
-            // inline CPU loop on `Err` so any device-side validation failure
-            // surfaces as a row-level CPU re-evaluation rather than a hard
-            // panic.
-            if let Ok(mut out) =
-                crate::families::survival::marginal_slope::gpu::try_device_step5_primary_assembly(
-                    &row_inputs,
-                )
-                && out.len() == 1
-            {
-                let row = out.remove(0);
-                if row.grad.len() == p && row.hess.len() == p * p {
-                    let grad = Array1::from_vec(row.grad);
-                    let hess =
-                        Array2::from_shape_vec((p, p), row.hess).map_err(|e| e.to_string())?;
-                    return Ok((row.row_nll, grad, hess));
-                }
-            }
-        }
-
-        let log_phi_eta1 = -0.5 * (exit.eta * exit.eta + std::f64::consts::TAU.ln());
-        let log_phi_q1 = -0.5 * (q1 * q1 + std::f64::consts::TAU.ln());
-        let row_nll = wi
-            * (log_surv0
-                - (1.0 - di) * log_surv1
-                - di * log_phi_eta1
-                - di * exit.chi.ln()
-                - di * log_phi_q1
-                + di * exit.d.ln()
-                - di * qd1.ln());
-
-        let mut grad = Array1::<f64>::zeros(p);
-        let mut hess = Array2::<f64>::zeros((p, p));
-        let entry_u1 = -entry_k1;
-        let entry_u2 = entry_k2;
-        let exit_surv_u1 = -exit_k1;
-        let exit_surv_u2 = exit_k2;
-
-        for u in 0..p {
-            grad[u] += entry_u1 * entry.eta_u[u];
-            grad[u] += exit_surv_u1 * exit.eta_u[u];
-            grad[u] += wi * di * exit.eta * exit.eta_u[u];
-            grad[u] -= wi * di * exit.chi_u[u] / exit.chi;
-            if u == primary.q1 {
-                grad[u] += wi * di * q1;
-            }
-            grad[u] += wi * di * exit.d_u[u] / exit.d;
-            if u == primary.qd1 {
-                grad[u] -= wi * di / qd1;
-            }
-        }
-
-        for u in 0..p {
-            for v in u..p {
-                let mut value = 0.0;
-                value +=
-                    entry_u2 * entry.eta_u[u] * entry.eta_u[v] + entry_u1 * entry.eta_uv[[u, v]];
-                value += exit_surv_u2 * exit.eta_u[u] * exit.eta_u[v]
-                    + exit_surv_u1 * exit.eta_uv[[u, v]];
-                value += wi * di * (exit.eta_u[u] * exit.eta_u[v] + exit.eta * exit.eta_uv[[u, v]]);
-                value -= wi
-                    * di
-                    * (exit.chi_uv[[u, v]] / exit.chi
-                        - (exit.chi_u[u] * exit.chi_u[v]) / (exit.chi * exit.chi));
-                if u == primary.q1 && v == primary.q1 {
-                    value += wi * di;
-                }
-                value += wi
-                    * di
-                    * (exit.d_uv[[u, v]] / exit.d
-                        - (exit.d_u[u] * exit.d_u[v]) / (exit.d * exit.d));
-                if u == primary.qd1 && v == primary.qd1 {
-                    value += wi * di / (qd1 * qd1);
-                }
-                hess[[u, v]] = value;
-                hess[[v, u]] = value;
-            }
-        }
+        // #932 single-source: value, gradient AND Hessian fall out of the ONE
+        // generic flex row-NLL expression (`flex_row_nll`) instantiated at the
+        // value/grad/Hessian jet (`Jet2`). This replaces both the hand-assembled
+        // probit-chain + quotient-rule loops AND the bespoke Step-5 device-shape
+        // pullback: there is exactly one definition of the flex row likelihood,
+        // and the (v, g, H) channels are the order-≤2 part of the same expression
+        // whose order-3/4 directional contractions
+        // `flex_row_nll_{third,fourth}_contracted` evaluate.
+        let (row_nll, grad, hess) = self.flex_row_nll_value_grad_hess(
+            row,
+            primary,
+            q1,
+            qd1,
+            entry.eta,
+            entry.eta_u.view(),
+            Some(entry.eta_uv.view()),
+            exit.eta,
+            exit.eta_u.view(),
+            Some(exit.eta_uv.view()),
+            exit.chi,
+            exit.chi_u.view(),
+            Some(exit.chi_uv.view()),
+            exit.d,
+            exit.d_u.view(),
+            Some(exit.d_uv.view()),
+        )?;
 
         Ok((row_nll, grad, hess))
     }

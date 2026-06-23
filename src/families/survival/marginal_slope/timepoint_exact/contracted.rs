@@ -192,29 +192,24 @@ impl SurvivalMarginalSlopeFamily {
             true,
         )?;
 
-        // Delegate the per-(u, v) assembly to the Block 10 GPU-substrate
-        // pure assembler in `crate::families::survival::marginal_slope::gpu`.  This is the
-        // single source of truth for the third-contraction inner loop —
-        // shared with the GPU dispatch path so CPU/GPU cannot drift.
-        let entry_d = block10_pack_dir(&entry_ext);
-        let exit_d = block10_pack_dir(&exit_ext);
-        let dir_vec: Vec<f64> = dir.to_vec();
-        let inputs =
-            crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10ThirdInputs {
-                p,
-                qd1_index: base.qd1_index,
-                qd1: base.qd1,
-                w: self.weights[base.row],
-                d: self.event[base.row],
-                dir: &dir_vec,
-                entry_base: &base.entry_base,
-                exit_base: &base.exit_base,
-                entry_ext: &entry_d,
-                exit_ext: &exit_d,
-            };
-        let flat =
-            crate::families::survival::marginal_slope::gpu::cpu_oracle_third_contraction(&inputs)?;
-        Ok(Array2::<f64>::from_shape_vec((p, p), flat).map_err(|e| e.to_string())?)
+        // #932 single-source: the contracted third `Σ_c ℓ_{abc} dir_c =
+        // (D_dir H)[a][b]` is the ε-Hessian channel of the ONE generic flex
+        // row-NLL expression (`flex_row_nll`) instantiated at the one-seed jet
+        // `Jet3`, seeded from the base + directional timepoint packs. Replaces
+        // the bespoke probit-chain / quotient-rule assembly that the Block-10
+        // `cpu_oracle_third_contraction` hand-coded.
+        self.flex_row_nll_third_contracted(
+            base.row,
+            &primary,
+            base.q1,
+            base.qd1,
+            dir.as_slice()
+                .ok_or_else(|| "third contraction: dir must be contiguous".to_string())?,
+            &base.entry_base,
+            &base.exit_base,
+            &block10_pack_dir(&entry_ext),
+            &block10_pack_dir(&exit_ext),
+        )
     }
 
     /// Fourth-order directional contraction for the flexible survival path.
@@ -403,47 +398,32 @@ impl SurvivalMarginalSlopeFamily {
             dir_v,
         )?;
 
-        // Delegate the per-(u, v) assembly + averaged-ordered
-        // symmetrization to the Block 10 GPU-substrate pure assembler.
-        // Single source of truth shared with the GPU dispatch path.
-        let entry_b = block10_pack_base(&entry_base);
-        let exit_b = block10_pack_base(&exit_base);
-        let entry_d1 = block10_pack_dir(&entry_ext_u);
-        let entry_d2 = block10_pack_dir(&entry_ext_v);
-        let exit_d1 = block10_pack_dir(&exit_ext_u);
-        let exit_d2 = block10_pack_dir(&exit_ext_v);
-        let entry_bi_p = block10_pack_bi(&entry_bi);
-        let exit_bi_p = block10_pack_bi(&exit_bi);
-        let dir_u_vec: Vec<f64> = dir_u.to_vec();
-        let dir_v_vec: Vec<f64> = dir_v.to_vec();
-        let inputs =
-            crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10FourthInputs {
-                p,
-                qd1_index: primary.qd1,
-                qd1,
-                w: self.weights[row],
-                d: self.event[row],
-                dir_u: &dir_u_vec,
-                dir_v: &dir_v_vec,
-                entry_base: &entry_b,
-                exit_base: &exit_b,
-                entry_ext_u: &entry_d1,
-                entry_ext_v: &entry_d2,
-                exit_ext_u: &exit_d1,
-                exit_ext_v: &exit_d2,
-                entry_bi: &entry_bi_p,
-                exit_bi: &exit_bi_p,
-            };
-        let flat =
-            crate::families::survival::marginal_slope::gpu::cpu_oracle_fourth_contraction(&inputs)
-                .map_err(|e| format!("block10 fourth contraction: {e}"))?;
-        let mut out = Array2::<f64>::zeros((p, p));
-        for u in 0..p {
-            for v in 0..p {
-                out[[u, v]] = flat[u * p + v];
-            }
-        }
-        Ok(out)
+        // #932 single-source: the contracted fourth `Σ_cd ℓ_{abcd} u_c v_d` is
+        // the εδ-Hessian channel of the ONE generic flex row-NLL expression
+        // (`flex_row_nll`) instantiated at the two-seed jet `Jet4`, seeded from
+        // the base + both directional + bidirectional timepoint packs. Replaces
+        // the bespoke per-(u,v) probit-chain / quotient-rule assembly that the
+        // Block-10 `cpu_oracle_fourth_contraction` hand-coded.
+        self.flex_row_nll_fourth_contracted(
+            row,
+            &primary,
+            q1,
+            qd1,
+            dir_u
+                .as_slice()
+                .ok_or_else(|| "fourth contraction: dir_u must be contiguous".to_string())?,
+            dir_v
+                .as_slice()
+                .ok_or_else(|| "fourth contraction: dir_v must be contiguous".to_string())?,
+            &block10_pack_base(&entry_base),
+            &block10_pack_base(&exit_base),
+            &block10_pack_dir(&entry_ext_u),
+            &block10_pack_dir(&exit_ext_u),
+            &block10_pack_dir(&entry_ext_v),
+            &block10_pack_dir(&exit_ext_v),
+            &block10_pack_bi(&entry_bi),
+            &block10_pack_bi(&exit_bi),
+        )
     }
 
     pub(crate) fn row_primary_third_contracted_general(
