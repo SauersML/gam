@@ -362,9 +362,13 @@ fn diag_matern_internals_1074() {
 
     for formula in [
         "y ~ matern(x, nu=2.5, k=20)",
-        "y ~ matern(x, nu=2.5, k=15)",
-        "y ~ matern(x, nu=2.5, k=10)",
-        "y ~ matern(x, nu=2.5, k=8)",
+        // #1074: sweep explicit length_scale at k=20 to find the range that
+        // reproduces mgcv's gp default (range = data diameter ≈ 0.98, edf≈13.85,
+        // rmse≈0.031). gam's frozen 1-D default is 0.15·diam ≈ 0.147 (edf 17).
+        "y ~ matern(x, nu=2.5, k=20, length_scale=0.30)",
+        "y ~ matern(x, nu=2.5, k=20, length_scale=0.50)",
+        "y ~ matern(x, nu=2.5, k=20, length_scale=0.98)",
+        "y ~ matern(x, nu=2.5, k=20, length_scale=1.50)",
     ] {
         let headers = ["x", "y"].into_iter().map(String::from).collect();
         let rows: Vec<csv::StringRecord> = x
