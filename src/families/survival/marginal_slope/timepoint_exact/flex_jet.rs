@@ -1751,6 +1751,105 @@ mod moment_engine_tests {
             );
         }
     }
+
+    /// #932 item-2 Phase C STEP 2: the calibration residual jet's gradient
+    /// channel must equal `−f_u` (the hand `cell_first_derivative_from_moments`
+    /// of `−coeff_u`), and `lift_intercept_flex` must recover the hand IFT
+    /// `a_u = f_u/D` on a synthetic single-cell single-primary calibration. This
+    /// pins the core derivation `∂_θ R = INV_TWO_PI ∫ η_θ e^{−q} = −f_u` and the
+    /// Newton lift's first-order channel against the validated kernel.
+    #[test]
+    fn lift_intercept_flex_first_order_matches_hand_ift_932() {
+        use crate::families::cubic_cell_kernel::{
+            cell_first_derivative_from_moments, evaluate_cell_moments, DenestedCubicCell,
+            PartitionEdge,
+        };
+
+        // Synthetic finite cell with real moments (degree 9, as the cached
+        // partition requests). Coefficients are the POSITIVE-cell c0..c3.
+        let cell = DenestedCubicCell {
+            left: -1.0,
+            right: 1.4,
+            c0: 0.2,
+            c1: -0.25,
+            c2: 0.15,
+            c3: 0.05,
+        };
+        let numeric = evaluate_cell_moments(cell, 9)
+            .expect("numeric moments")
+            .moments
+            .into_vec();
+        let base_pos = [cell.c0, cell.c1, cell.c2, cell.c3];
+        // fixed pack: ∂c/∂a = dc_da; one primary u=0 with ∂c/∂θ0 = coeff_u[0].
+        let p = 1usize;
+        let dc_da = [0.9_f64, 0.2, 0.05, 0.0];
+        let coeff_u0 = [0.3_f64, -0.15, 0.08, 0.0];
+        let zero_run: Vec<[f64; 4]> = vec![[0.0; 4]; p];
+        let mut coeff_u = zero_run.clone();
+        coeff_u[0] = coeff_u0;
+        let fixed = DenestedCellPrimaryFixedPartials {
+            dc_da,
+            dc_daa: [0.0; 4],
+            dc_daaa: [0.0; 4],
+            coeff_u,
+            coeff_au: zero_run.clone(),
+            coeff_bu: zero_run.clone(),
+            coeff_aau: zero_run.clone(),
+            coeff_abu: zero_run.clone(),
+            coeff_bbu: zero_run.clone(),
+            coeff_aaau: zero_run.clone(),
+            coeff_aabu: zero_run.clone(),
+            coeff_abbu: zero_run.clone(),
+            coeff_bbbu: zero_run,
+        };
+
+        // Hand calibration partials (no q self-term: phi_q = 0).
+        // f_u[0] = ∫(−coeff_u0)·e^{−q}/2π ; f_a = ∫(−dc_da)·e^{−q}/2π = −D.
+        let neg_coeff_u0 = coeff_u0.map(|v| -v);
+        let neg_dc_da = dc_da.map(|v| -v);
+        let f_u0 = cell_first_derivative_from_moments(&neg_coeff_u0, &numeric).expect("f_u");
+        let f_a = cell_first_derivative_from_moments(&neg_dc_da, &numeric).expect("f_a");
+        let d_check = f_a.abs();
+        let a_u_hand = f_u0 / d_check;
+
+        // Build the residual jet at A = const(a0) with the primary u=0 seeded.
+        let a0 = 0.31_f64;
+        let template = Jet2::from_parts(0.0, &vec![0.0; p], &[]);
+        let a_jet0 = Jet2::from_parts(a0, &vec![0.0; p], &[]);
+        let b_jet = Jet2::from_parts(1.1, &vec![0.0; p], &[]);
+        let du: Vec<Jet2> = (0..p).map(|u| Jet2::primary(0.0, u, p)).collect();
+        let cells = vec![CalibrationCellJetInputs {
+            base_pos_coeffs: base_pos,
+            fixed: &fixed,
+            cell_left: cell.left,
+            cell_right: cell.right,
+            left_edge: PartitionEdge::Fixed(cell.left),
+            right_edge: PartitionEdge::Fixed(cell.right),
+            numeric_moments: &numeric,
+        }];
+        // Residual at the un-lifted A0 (a_jet has zero derivative channels): its
+        // gradient is the DIRECT primary motion = −f_u (the η_θ0 term only).
+        let r0 = calibration_residual_jet(&a_jet0, &b_jet, 0, &du, p, 0.0, &cells);
+        assert!(
+            (r0.g[0] - (-f_u0)).abs() <= 1e-9 * (1.0 + f_u0.abs()),
+            "residual grad {} != -f_u {}",
+            r0.g[0],
+            -f_u0
+        );
+
+        // Lift: inv_fa = 1/D, but the residual's a-derivative sign — R_a = ∂R/∂a.
+        // R = −F and F_a = −D ⟹ R_a = D, so inv_fa = 1/D drives A toward the IFT
+        // root. Two Newton iterations at Jet2.
+        let residual =
+            |a: &Jet2| calibration_residual_jet(a, &b_jet, 0, &du, p, 0.0, &cells);
+        let a_lift = lift_intercept_flex(&template, a0, 1.0 / d_check, 2, residual);
+        assert!(
+            (a_lift.g[0] - a_u_hand).abs() <= 1e-6 * (1.0 + a_u_hand.abs()),
+            "lifted a_u {} != hand f_u/D {}",
+            a_lift.g[0],
+            a_u_hand
+        );
+    }
 }
 
 // ── §C: observed cell-coefficient jets + eta/chi point-eval (Phase C core) ──
@@ -1778,6 +1877,125 @@ fn tangent_jet<J: FlexJet>(x: &J) -> J {
 #[inline]
 fn const_jet_like<J: FlexJet>(template: &J, v: f64) -> J {
     template.scale(0.0).add_const(v)
+}
+
+/// #932 item-2 Phase C STEP 2: the generic-order intercept Newton lift over a
+/// runtime `FlexJet` — the linchpin that produces the 3rd/4th intercept
+/// θ-derivatives the base Hessian lacks. Mirrors `lift_intercept_order2` /
+/// `filtered_implicit_solve_scalar` but over a runtime `Jet2`/`Jet3`/`Jet4`.
+///
+/// The calibration constraint `F(a(θ), θ) = 0` is solved by the filtered Newton
+/// step `A ← A − R(A)·inv_fa` (`inv_fa = 1/D`, `D = |F_a|`), iterated `iters`
+/// times (the jet nilpotency order). `R(A)` is the calibration RESIDUAL JET built
+/// by the caller-supplied `residual` closure from the per-cell coefficient jets
+/// and moment jets:
+///
+///   R(A) = Σ_cells INV_TWO_PI · Σ_k tangent(c_posₖ(A)) · Mₖ(A)   (+ q self-term)
+///
+/// where `c_posₖ(A)` are the POSITIVE cell coefficients as jets in `A` (and the
+/// primaries) and `Mₖ(A)` the cell's normalization moment jets. This is the EXACT
+/// calibration θ-jet to all orders: `∂_θ R = INV_TWO_PI ∫ η_θ e^{−q} = −f_u`,
+/// `∂²_θ R = INV_TWO_PI ∫ (η_θθ − η η_θ²) e^{−q}` (the `−η η_θ²` falling out of
+/// `Mₖ`'s own `e^{−Δq}` motion `M_θ = −∫ η η_θ e^{−q}`), reproducing the hand
+/// `f_u`/`f_uv`/`f_aa` moment dots and their 3rd/4th extensions automatically. The
+/// value channel is the scalar calibration `f` (driven to ~0 by seeding
+/// `A.value = a0` from the scalar solve), so only the derivative channels solve.
+///
+/// `template` carries the runtime primary count; `a0` the solved intercept value.
+fn lift_intercept_flex<J: FlexJet>(
+    template: &J,
+    a0: f64,
+    inv_fa: f64,
+    iters: usize,
+    residual: impl Fn(&J) -> J,
+) -> J {
+    let mut a = const_jet_like(template, a0);
+    for _ in 0..iters {
+        let r = residual(&a);
+        a = a.sub(&r.scale(inv_fa));
+    }
+    a
+}
+
+/// The per-row calibration residual jet `R(A)` for [`lift_intercept_flex`],
+/// summed over a timepoint's cells: `Σ_cells INV_TWO_PI·Σ_k tangent(c_posₖ(A))·
+/// Mₖ(A)` plus the q-marginal self-term `−φ(q)` on the `q_index` primary (the
+/// `f_u[q_index] += φ(q)` boundary term of the calibration). The cells are
+/// supplied as `(base_pos_coeffs, fixed, edges, finiteness, numeric_moments)` so
+/// the coefficient jets and moment jets are rebuilt at the current iterate `A`.
+fn calibration_residual_jet<J: FlexJet>(
+    a_jet: &J,
+    b_jet: &J,
+    g_axis: usize,
+    du: &[J],
+    q_index: usize,
+    phi_q: f64,
+    cells: &[CalibrationCellJetInputs<'_>],
+) -> J {
+    let da = tangent_jet(a_jet);
+    let inv_two_pi = std::f64::consts::TAU.recip();
+    let mut r = const_jet_like(a_jet, 0.0);
+    for cell in cells {
+        // Positive cell coefficients as jets in (A, primaries).
+        let c_pos = cell_coeff_jets(a_jet, cell.base_pos_coeffs, cell.fixed, g_axis, &da, du);
+        // Moving edge jets: Crossing edges move with A/b, Fixed edges are static.
+        let edge_l = cell_edge_jet(a_jet, b_jet, cell.left_edge, cell.cell_left);
+        let edge_r = cell_edge_jet(a_jet, b_jet, cell.right_edge, cell.cell_right);
+        let m = base_moment_jets(
+            &c_pos,
+            &edge_l,
+            cell.cell_left.is_finite(),
+            &edge_r,
+            cell.cell_right.is_finite(),
+            cell.numeric_moments,
+        );
+        // Σ_k tangent(c_posₖ)·Mₖ  (tangent strips the value: F's VALUE is carried
+        // by the scalar seed, only the θ-motion of η enters the residual deriv).
+        let mut cell_r = const_jet_like(a_jet, 0.0);
+        for k in 0..4 {
+            cell_r = cell_r.add(&tangent_jet(&c_pos[k]).mul(&m[k]));
+        }
+        r = r.add(&cell_r.scale(inv_two_pi));
+    }
+    // q-marginal self-term: f_u[q_index] += φ(q) ⟹ R gains −φ(q)·(q-axis tangent).
+    // (R = −F, and the hand adds +φ(q) to f_u[q_index].)
+    if q_index < du.len() {
+        r = r.sub(&du[q_index].scale(phi_q));
+    }
+    r
+}
+
+/// Per-cell inputs for [`calibration_residual_jet`]: the positive base
+/// coefficients, the fixed-partial pack, the cell edges (location + provenance),
+/// and the numeric moment vector. Borrowed from the cached partition.
+pub(crate) struct CalibrationCellJetInputs<'a> {
+    pub base_pos_coeffs: [f64; 4],
+    pub fixed: &'a DenestedCellPrimaryFixedPartials,
+    pub cell_left: f64,
+    pub cell_right: f64,
+    pub left_edge: crate::families::cubic_cell_kernel::PartitionEdge,
+    pub right_edge: crate::families::cubic_cell_kernel::PartitionEdge,
+    pub numeric_moments: &'a [f64],
+}
+
+/// The moving cell-edge `z` as a jet: a `Crossing { tau }` edge sits at
+/// `z = (τ − a)/b` and moves with the intercept jet `a_jet` and slope jet
+/// `b_jet`; a `Fixed(z)` edge is static (a constant jet, no θ-motion).
+fn cell_edge_jet<J: FlexJet>(
+    a_jet: &J,
+    b_jet: &J,
+    edge: crate::families::cubic_cell_kernel::PartitionEdge,
+    z_value: f64,
+) -> J {
+    match edge {
+        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { tau } => {
+            // z = (τ − a)·(1/b).
+            const_jet_like(a_jet, tau).sub(a_jet).mul(&b_jet.recip())
+        }
+        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
+            const_jet_like(a_jet, z_value)
+        }
+    }
 }
 
 /// One observed cell coefficient `coeff[k]` as a jet: the bivariate `(a,b)`
