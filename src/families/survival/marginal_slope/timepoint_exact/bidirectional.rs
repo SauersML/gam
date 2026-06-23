@@ -120,7 +120,6 @@ impl SurvivalMarginalSlopeFamily {
             let mut f_a = 0.0f64;
             let mut f_aa = 0.0f64;
             let mut f_u = Array1::<f64>::zeros(p);
-            let mut f_au = Array1::<f64>::zeros(p);
             let mut f_uv = Array2::<f64>::zeros((p, p));
             for ce in &cached.cells {
                 let nc = ce.neg_cell;
@@ -138,15 +137,7 @@ impl SurvivalMarginalSlopeFamily {
                 )?;
                 for u in 0..p {
                     let cu = fx.coeff_u[u].map(|value| -value);
-                    let cau = fx.coeff_au[u].map(|value| -value);
                     f_u[u] += exact_kernel::cell_first_derivative_from_moments(&cu, &st.moments)?;
-                    f_au[u] += exact_kernel::cell_second_derivative_from_moments(
-                        nc,
-                        &da,
-                        &cu,
-                        &cau,
-                        &st.moments,
-                    )?;
                 }
                 for u in 0..p {
                     for v in u..p {
@@ -180,8 +171,8 @@ impl SurvivalMarginalSlopeFamily {
             // Moving-boundary flux on the base intercept-Hessian inputs, so this
             // calibration block's auv (feeding the 4th-order intercept inputs
             // ad1/ad2/ad12) matches the production first_full.rs / directional.rs
-            // auv. The crossing z=(τ−a)/b moves with a and every θ, so f_aa,
-            // f_au, f_uv each pick up their §D flux; the moment-only base omitted
+            // auv. The crossing z=(τ−a)/b moves with a and every θ, so f_aa and
+            // f_uv each pick up their §D flux; the moment-only base omitted
             // them (gam#932/#1454). These feed only scalar outputs here, so no
             // base/dir desync arises.
             if b != 0.0 {
@@ -244,22 +235,6 @@ impl SurvivalMarginalSlopeFamily {
                         let cu = fx.coeff_u[u].map(|value| -value);
                         let zu_r = crossing_vel(u, part.right_edge, cell.right);
                         let zu_l = crossing_vel(u, part.left_edge, cell.left);
-                        f_au[u] += super::first_full::moving_density_boundary_flux_a(entry, &cu, b)
-                            + super::first_full::moving_density_boundary_flux(
-                                u,
-                                primary,
-                                &au,
-                                entry,
-                                &da,
-                                b,
-                                super::first_full::FluxVelocity::PartialIft,
-                            )
-                            + self_flux(za_r, zu_r, za_l, zu_l);
-                    }
-                    for u in 0..p {
-                        let cu = fx.coeff_u[u].map(|value| -value);
-                        let zu_r = crossing_vel(u, part.right_edge, cell.right);
-                        let zu_l = crossing_vel(u, part.left_edge, cell.left);
                         for v in u..p {
                             let cv = fx.coeff_u[v].map(|value| -value);
                             // Asymmetric flux pair DOUBLED on the diagonal (matching
@@ -302,8 +277,8 @@ impl SurvivalMarginalSlopeFamily {
             // `cal_ad12 = dir1ᵀ·auv·dir2`, which threads a `cal_ad12·X` term into
             // every second-directional cell total (cd12/cu12/cuv12/…), so the
             // F-path error here was pervasive across all (u,v) blocks. The
-            // moment-`f_au` (and its boundary flux) above is now consumed only as a
-            // diagnostic; the Hessian no longer depends on it.
+            // moment-only `f_au` this reconstruction replaced is no longer
+            // accumulated, since the Hessian does not depend on it.
             let d_u = self.survival_flex_base_d_u(primary, &au, cached, b, p)?;
             let mut auv = Array2::<f64>::zeros((p, p));
             for u in 0..p {
@@ -315,7 +290,6 @@ impl SurvivalMarginalSlopeFamily {
                     auv[[v, u]] = value;
                 }
             }
-            let _ = &f_au;
             let ad1 = au.dot(dir1);
             let ad2 = au.dot(dir2);
             let aud2 = auv.dot(dir2);
