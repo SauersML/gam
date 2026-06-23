@@ -1669,8 +1669,19 @@ mod moment_engine_tests {
                 .add(&da.scale(fixed.dc_da[k]))
                 .add(&dada.scale(0.5 * fixed.dc_daa[k]))
                 .add(&dadada.scale(fixed.dc_daaa[k] / 6.0));
-            // Per-primary chains (linear in du[u]).
+            // Per-primary chains for the LINEAR axes (u != g): each cell coefficient
+            // is at most linear in any single non-a/non-b primary, so every
+            // `coeff_*u[u]·…·du[u]` term is genuinely BILINEAR in `du[u]` (factor 1,
+            // off-diagonal — no Taylor factorial on `du[u]`). The slope axis `g`
+            // (= `b`) is handled separately below because there `du[g] == db` appears
+            // as a REPEATED factor: `coeff_bu[g]·db·du[g] = dc_dbb·db²` would
+            // DOUBLE-count the pure-`b²` Taylor term (Jet2::mul gives `db·db` a
+            // Hessian of 2 — gam#932 g-diagonal fix), and likewise `coeff_abu[g]`
+            // (`a·b²`, needs ½) and `coeff_bbu[g]` (`b³`, needs ⅙ not ½).
             for u in 0..p {
+                if u == g_axis {
+                    continue;
+                }
                 let duu = &du[u];
                 let mut chain = duu.scale(fixed.coeff_u[u][k]);
                 chain = chain
@@ -1687,6 +1698,19 @@ mod moment_engine_tests {
                     .add(&dbdb.mul(db).mul(duu).scale(fixed.coeff_bbbu[u][k] / 6.0));
                 c = c.add(&chain);
             }
+            // Slope-axis (`b`) chain with the correct Taylor factorials (the
+            // `coeff_*u[g]` pack values are `dc_db`/`dc_dab`/`dc_dbb`/`dc_daab`/
+            // `dc_dabb`/`dc_dbbb`; the third-order `aaau/aabu/abbu/bbbu[g]` are 0):
+            //   dc_db·db + dc_dab·(da·db) + ½dc_daab·(da²·db)
+            //            + ½dc_dbb·db² + ½dc_dabb·(da·db²) + ⅙dc_dbbb·db³.
+            // This matches `observed_coeff_component_jet`'s b-terms exactly.
+            c = c
+                .add(&db.scale(fixed.coeff_u[g_axis][k]))
+                .add(&dadb.scale(fixed.coeff_au[g_axis][k]))
+                .add(&dada.mul(db).scale(0.5 * fixed.coeff_aau[g_axis][k]))
+                .add(&dbdb.scale(0.5 * fixed.coeff_bu[g_axis][k]))
+                .add(&dadb.mul(db).scale(0.5 * fixed.coeff_abu[g_axis][k]))
+                .add(&dbdb.mul(db).scale(fixed.coeff_bbu[g_axis][k] / 6.0));
             c
         })
     }
@@ -1714,7 +1738,15 @@ mod moment_engine_tests {
             c = c
                 .add(&da.scale(fixed.dc_daa[k]))
                 .add(&dada.scale(0.5 * fixed.dc_daaa[k]));
+            // Linear axes (u != g): χ per-primary is bilinear in du[u] (factor 1).
+            // The slope axis g (= b) is handled separately: there `coeff_abu[g]·db·
+            // du[g] = dc_dabb·db²` repeats the b factor and would DOUBLE-count χ's
+            // pure-`b²` Taylor term (gam#932 g-diagonal fix, mirroring cell_coeff_jets).
+            let dbdb = db.mul(db);
             for u in 0..p {
+                if u == g_axis {
+                    continue;
+                }
                 let duu = &du[u];
                 // χ per-primary: coeff_au[u]·du + coeff_aau[u]·da·du + coeff_abu[u]·db·du.
                 let chain = duu
@@ -1723,6 +1755,13 @@ mod moment_engine_tests {
                     .add(&db.mul(duu).scale(fixed.coeff_abu[u][k]));
                 c = c.add(&chain);
             }
+            // Slope-axis (b) χ-chain with correct factorials: coeff_au[g]·db +
+            // coeff_aau[g]·(da·db) + ½coeff_abu[g]·db²  (= dc_dab·db + dc_daab·da·db
+            // + ½dc_dabb·db²); the higher χ b-terms (coeff for b³/a²b on g) are 0.
+            c = c
+                .add(&db.scale(fixed.coeff_au[g_axis][k]))
+                .add(&da.mul(db).scale(fixed.coeff_aau[g_axis][k]))
+                .add(&dbdb.scale(0.5 * fixed.coeff_abu[g_axis][k]));
             c
         })
     }
@@ -1844,8 +1883,11 @@ mod moment_engine_tests {
     /// #932 item-2 increment 1: the FlexJet moment recurrence must reproduce the
     /// numeric `reduce_sextic_moments` on the VALUE channel term-for-term (a
     /// generic non-degenerate sextic cell), proving the port of the raising
-    /// recurrence + boundary term to the jet algebra is exact. (Derivative
-    /// channels are exercised by the directional/bidirectional timepoint gates below.)
+    /// recurrence + boundary term to the jet algebra is exact. The derivative
+    /// channels are exercised end-to-end by `flex_timepoint_inputs_jet3_directional_
+    /// matches_hand_932` / `_jet4_bidirectional_matches_hand_932` / `_ghw_jet3_jet4_
+    /// match_hand_932`, which pin the full directional/bidirectional moment jets
+    /// against the hand timepoint packs.
     #[test]
     fn cell_moment_recurrence_jet_value_matches_numeric_932() {
         let cell = DenestedCubicCell {
@@ -2208,7 +2250,12 @@ mod moment_engine_tests {
         let du: Vec<Jet2> = (0..p).map(|u| seeded(0.0, v[u])).collect();
         let jets = cell_coeff_jets(&a_jet, base_c, &fixed, g_axis, &da, &du);
 
-        // Scalar reference: c_k(da, {du}) via the same Taylor.
+        // Scalar reference: the TRUE multivariate Taylor `c_k(a(θ), {θ_u(θ)})` with
+        // CORRECT factorials on every repeated axis. The non-g axes are linear in
+        // `du[u]` (factor 1). The slope axis `g` (= `b`) carries its own pure-`b`
+        // powers `½dc_dbb·db²`, `½dc_dabb·da·db²`, `⅙dc_dbbb·db³` (Taylor 1/n!) — NOT
+        // the `coeff_bu[g]·db·du[g]` bilinear form, which would double/triple-count
+        // the g-diagonal (the gam#932 fix the jet now implements).
         let scalar_c = |theta: f64| -> [f64; 4] {
             let da = a_u * theta;
             let db = v[g_axis] * theta;
@@ -2217,7 +2264,11 @@ mod moment_engine_tests {
                     + fixed.dc_da[k] * da
                     + 0.5 * fixed.dc_daa[k] * da * da
                     + fixed.dc_daaa[k] * da * da * da / 6.0;
+                // Linear (u != g) axes: bilinear in du[u].
                 for u in 0..p {
+                    if u == g_axis {
+                        continue;
+                    }
                     let duu = v[u] * theta;
                     acc += fixed.coeff_u[u][k] * duu
                         + fixed.coeff_au[u][k] * da * duu
@@ -2230,6 +2281,13 @@ mod moment_engine_tests {
                         + 0.5 * fixed.coeff_abbu[u][k] * da * db * db * duu
                         + fixed.coeff_bbbu[u][k] * db * db * db * duu / 6.0;
                 }
+                // Slope axis g (= b): pure-b Taylor with 1/n! factorials.
+                acc += fixed.coeff_u[g_axis][k] * db
+                    + fixed.coeff_au[g_axis][k] * da * db
+                    + 0.5 * fixed.coeff_aau[g_axis][k] * da * da * db
+                    + 0.5 * fixed.coeff_bu[g_axis][k] * db * db
+                    + 0.5 * fixed.coeff_abu[g_axis][k] * da * db * db
+                    + fixed.coeff_bbu[g_axis][k] * db * db * db / 6.0;
                 acc
             })
         };
@@ -2250,6 +2308,26 @@ mod moment_engine_tests {
                 "c_{k} grad {} != FD {}",
                 jets[k].g[0],
                 fd
+            );
+        }
+
+        // gam#932 g-DIAGONAL Hessian: with each primary in its OWN slot, the cell
+        // coefficient jet's `Hess[g,g] = ∂²c/∂b²` MUST equal `coeff_bu[g] = dc_dbb`
+        // EXACTLY — NOT `2·dc_dbb`. The pre-fix `coeff_bu[g]·db·du[g]` term gave
+        // `dc_dbb·db²` whose Jet2 Hessian is `2·dc_dbb` (mul's symmetric 2×); the
+        // ½-factorial fix restores the true second partial. (`da` here is a pure
+        // intercept perturbation with NO primary grad, so it does not leak into the
+        // g-slot Hessian — isolating `∂²c/∂b²` cleanly.)
+        let da_iso = Jet2::from_parts(0.0, &vec![0.0; p], &[]);
+        let du_iso: Vec<Jet2> = (0..p).map(|u| Jet2::primary(0.0, u, p)).collect();
+        let jets_iso = cell_coeff_jets(&da_iso, base_c, &fixed, g_axis, &da_iso, &du_iso);
+        for k in 0..4 {
+            let hgg = jets_iso[k].h[g_axis * p + g_axis];
+            assert!(
+                (hgg - fixed.coeff_bu[g_axis][k]).abs() <= 1e-12 * (1.0 + fixed.coeff_bu[g_axis][k].abs()),
+                "c_{k} Hess[g,g] {} != dc_dbb {} (2× = the pre-fix g-diagonal bug)",
+                hgg,
+                fixed.coeff_bu[g_axis][k]
             );
         }
     }
@@ -2924,9 +3002,10 @@ mod moment_engine_tests {
     // mixed second-directional `D_du D_dv` = `block10_pack_bi`. These gates build a
     // REAL g-only survival family (no score-warp/link-dev, so every g order lives in
     // the observed `(a,b)` pack — no channel jets), drive both paths off the SAME
-    // cached partition, and pin term-for-term. The h/w channel orders (which need the
-    // channel-weight `(a,b)`-Taylor jets) are covered by the separate
-    // `flex_timepoint_inputs_ghw_jet3_jet4_match_hand_932` gate.
+    // cached partition, and pin term-for-term. The h/w channel orders ARE covered:
+    // `flex_timepoint_inputs_ghw_jet3_jet4_match_hand_932` runs the SAME generic
+    // builder on a family with active score-warp AND link-dev primaries (their
+    // `(a,b)`-Taylor enters via the observed multivariate pack `observed_fixed_for`).
 
     /// A minimal g-only survival marginal-slope family for the §3c directional gates:
     /// scalar score covariance, raw `z`, a 1-col marginal + 1-col logslope design, no
