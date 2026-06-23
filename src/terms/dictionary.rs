@@ -639,6 +639,60 @@ mod tests {
     }
 
     #[test]
+    fn orthonormal_rank_one_atoms_all_revived_no_dead_collapse_1500() {
+        // #1500: rows lie on K mutually ORTHONORMAL rank-1 directions, so a
+        // K-atom top_k=1 dictionary that recovers them reconstructs every row
+        // exactly (EV → 1). The dead-atom bug emptied a cluster, zeroed that atom
+        // permanently, and returned < K live atoms with badly under-explained
+        // variance. With empty-cluster re-seeding every atom stays live.
+        let (k, p, n) = (4usize, 8usize, 400usize);
+        // Deterministic orthonormal directions: eigenvectors of a fixed symmetric
+        // matrix are orthonormal, so no RNG is needed for a stable regression.
+        let mut a = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                a[[i, j]] = ((i * 7 + j * 3 + 1) % 11) as f64 - 5.0;
+            }
+        }
+        let sym = &a + &a.t();
+        let (_evals, evecs) = sym.eigh(Side::Lower).expect("orthonormal directions");
+        let dirs = evecs.slice(s![.., ..k]).t().to_owned(); // k×p, orthonormal rows
+        let mut x = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            let atom = row % k;
+            let scale = if row % 2 == 0 { 2.0 } else { -1.5 } + 0.01 * (row / k) as f64;
+            for col in 0..p {
+                let noise = 1.0e-3 * (((row * p + col) % 13) as f64 - 6.0);
+                x[[row, col]] = scale * dirs[[atom, col]] + noise;
+            }
+        }
+        let config = LinearDictionaryConfig {
+            n_atoms: k,
+            max_iter: 40,
+            top_k: 1,
+            assignment: LinearDictionaryAssignment::TopK,
+            temperature: DEFAULT_TEMPERATURE,
+            code_ridge: DEFAULT_CODE_RIDGE,
+            tolerance: 1.0e-9,
+        };
+        let fit = fit_linear_dictionary(x.view(), &config).expect("orthonormal dictionary fit");
+        let live = fit
+            .atoms
+            .axis_iter(Axis(0))
+            .filter(|atom| atom.iter().any(|value| value.abs() > 1.0e-12))
+            .count();
+        assert_eq!(
+            live, k,
+            "all {k} atoms must stay live (no dead-atom collapse); got {live} live"
+        );
+        assert!(
+            fit.explained_variance > 0.99,
+            "K orthonormal rank-1 atoms must be reconstructed at EV > 0.99; got {}",
+            fit.explained_variance
+        );
+    }
+
+    #[test]
     fn sparse_assignment_scales_to_thousand_atom_dictionary() {
         let active_atoms = array![
             [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
