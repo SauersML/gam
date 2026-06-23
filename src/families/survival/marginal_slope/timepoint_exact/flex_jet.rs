@@ -1321,6 +1321,80 @@ mod moment_engine_tests {
         Jet2::from_parts(0.0, grad, &h)
     }
 
+    /// #932 item-2 STEP 3c: the GENERIC-order timepoint `(eta, chi, d)` builder over
+    /// ANY `FlexJet` order (`Jet2`/`Jet3`/`Jet4`). Unlike `flex_timepoint_inputs_jet2_
+    /// impl` (which freezes the channel weights as scalars and pokes `Jet2` internals
+    /// to seed the second-order channel Hessian), this consumes ONLY jet algebra, so
+    /// instantiating it at `Jet3` (one directional seed) yields the directional
+    /// extension `D_dir(eta,chi,d)` in the `eps` channel, and at `Jet4` (two seeds)
+    /// the mixed second-directional `D_d1 D_d2` in the `eps_del` channel — the exact
+    /// `block10_pack_dir`/`block10_pack_bi` content the hand `directional`/
+    /// `bidirectional` modules assemble by explicit chain rule.
+    ///
+    /// The caller pre-seeds `b_jet` (the slope `g` primary), `du[u]` (the unit
+    /// per-primary jets), `template` (a zero jet shaped at the right order/`p`), and
+    /// supplies the OBSERVED-channel jets `rho_jet`/`tau_jet` (the `h`/`w`/`infl`
+    /// linear channels added to `eta`/`chi`; pass zero jets for a pure `g` model,
+    /// where the full `(a,b)` observed-coeff pack already carries every `g` order).
+    /// The full `(a,b)` Taylor runs against the REAL `b_jet` here (no `db=0`), so the
+    /// `g`-axis is single-sourced through the pack at every order.
+    ///
+    /// Returns the three output jets `(eta, chi, d)`; the caller extracts the value /
+    /// gradient / Hessian / directional channels it needs.
+    fn flex_timepoint_inputs_generic<J: FlexJet>(
+        template: &J,
+        b_jet: &J,
+        du: &[J],
+        a0: f64,
+        d_check: f64,
+        primary_g: usize,
+        q_index: usize,
+        phi_q: f64,
+        z_obs: f64,
+        o_infl: f64,
+        pack: &ObservedCoeffPack,
+        rho_jet: &J,
+        tau_jet: &J,
+        cells: &[CalibrationCellJetInputs<'_>],
+    ) -> Result<(J, J, J), String> {
+        // Intercept lift to order `J` (value/grad/Hess/… per the seed). The lift's
+        // residual closure rebuilds the per-cell coefficient + moment jets at the
+        // current iterate, so the lifted `a_jet` carries the intercept's full
+        // θ-jet (incl. directional channels) to order `J` automatically.
+        let residual =
+            |a: &J| calibration_residual_jet(a, b_jet, primary_g, du, q_index, phi_q, cells);
+        let a_jet = lift_intercept_flex(template, a0, 1.0 / d_check, 2, residual);
+
+        // Observed eta/chi: the full bivariate `(a,b)` Taylor composed with the
+        // lifted `a_jet` + real `b_jet`, plus the linear `h`/`w`/`infl` channels.
+        let (eta, chi) =
+            flex_timepoint_eta_chi(&a_jet, b_jet, z_obs, o_infl, pack, rho_jet, tau_jet);
+
+        // D normalization = Σ_cells INV_TWO_PI·Σ_k χ_k·M_k, with the cell coeff /
+        // chi-poly jets through the lifted `a_jet` and the moving-edge jets through
+        // `(a_jet, b_jet)`.
+        let da = tangent_jet(&a_jet);
+        let mut d = const_jet_like(template, 0.0);
+        for cell in cells {
+            let c_pos = cell_coeff_jets(&a_jet, cell.base_pos_coeffs, cell.fixed, primary_g, &da, du);
+            let chi_jets = cell_chi_poly_jets(&a_jet, cell.fixed, primary_g, &da, du);
+            let edge_l = cell_edge_jet(&a_jet, b_jet, cell.left_edge, cell.cell_left);
+            let edge_r = cell_edge_jet(&a_jet, b_jet, cell.right_edge, cell.cell_right);
+            d = d.add(&flex_timepoint_d_cell(
+                template,
+                &c_pos,
+                &chi_jets,
+                &edge_l,
+                cell.cell_left.is_finite(),
+                &edge_r,
+                cell.cell_right.is_finite(),
+                cell.numeric_moments,
+            ));
+        }
+
+        Ok((eta, chi, d))
+    }
+
     /// The `Jet2` timepoint inputs `(eta, chi, d)` value/gradient/Hessian channels
     /// returned by [`flex_timepoint_inputs_jet2_impl`].
     struct FlexTimepointJet2Out {
@@ -2804,6 +2878,317 @@ mod moment_engine_tests {
                 );
             }
         }
+    }
+
+    // ── §3c: real-family Jet3/Jet4 directional gates vs the hand directional/
+    // bidirectional packs ───────────────────────────────────────────────────────
+    //
+    // The generic `flex_timepoint_inputs_generic<J>` instantiated at `Jet3` (one
+    // directional seed `dir`) must produce, in its `eps` channel, the exact
+    // `block10_pack_dir` content the hand `compute_survival_timepoint_directional_
+    // exact_from_cached` assembles by explicit chain rule:
+    //   (Jet3 eta).eps.g[u]   == eta_u_dir[u]    = D_dir(eta_u[u])
+    //   (Jet3 eta).eps.h[u,v] == eta_uv_dir[u,v] = D_dir(eta_uv[u,v])
+    // and likewise chi/d. At `Jet4` (two seeds u,v) the `eps_del` channel is the
+    // mixed second-directional `D_du D_dv` = `block10_pack_bi`. These gates build a
+    // REAL g-only survival family (no score-warp/link-dev, so every g order lives in
+    // the observed `(a,b)` pack — no channel jets), drive both paths off the SAME
+    // cached partition, and pin term-for-term. The h/w channel orders (which need the
+    // channel-weight `(a,b)`-Taylor jets) land in a follow-up increment.
+
+    /// A minimal g-only survival marginal-slope family for the §3c directional gates:
+    /// scalar score covariance, raw `z`, a 1-col marginal + 1-col logslope design, no
+    /// score-warp/link-dev/wiggle/absorber. Deterministic synthetic data.
+    fn make_g_only_flex_family(n: usize) -> SurvivalMarginalSlopeFamily {
+        let event: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| if (i * 31 + 7) % 5 >= 3 { 1.0 } else { 0.0 }));
+        let weights: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.5 + ((i * 13 + 4) % 5) as f64 * 0.1));
+        let z: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| -1.0 + 2.0 * (((i * 17 + 5) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let offset_entry: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| -0.4 + 0.7 * (((i * 11 + 3) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let offset_exit: Array1<f64> = Array1::from_iter(
+            (0..n).map(|i| 0.1 + 0.6 * (((i * 19 + 7) % n) as f64 + 0.5) / (n as f64)),
+        );
+        let derivative_offset_exit: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.5 + 0.05 * ((i * 23 + 1) % 3) as f64));
+        let marginal_design = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.3 + 0.4 * (((i * 29 + 11) % n) as f64) / (n as f64)
+        });
+        let logslope_design = Array2::from_shape_fn((n, 1), |(i, _)| {
+            0.2 + 0.5 * (((i * 37 + 9) % n) as f64) / (n as f64)
+        });
+        SurvivalMarginalSlopeFamily {
+            n,
+            event: Arc::new(event),
+            weights: Arc::new(weights),
+            z: Arc::new(z.insert_axis(Axis(1))),
+            score_covariance: MarginalSlopeCovariance::Diagonal(Array1::from(vec![1.0])),
+            gaussian_frailty_sd: None,
+            derivative_guard: 1e-6,
+            design_entry: DesignMatrix::from(Array2::zeros((n, 0))),
+            design_exit: DesignMatrix::from(Array2::zeros((n, 0))),
+            design_derivative_exit: DesignMatrix::from(Array2::zeros((n, 0))),
+            offset_entry: Arc::new(offset_entry),
+            offset_exit: Arc::new(offset_exit),
+            derivative_offset_exit: Arc::new(derivative_offset_exit),
+            marginal_design: DesignMatrix::from(marginal_design),
+            logslope_design: DesignMatrix::from(logslope_design),
+            logslope_surface_ranges: vec![0..0],
+            score_warp: None,
+            link_dev: None,
+            influence_absorber: None,
+            time_linear_constraints: None,
+            time_wiggle_knots: None,
+            time_wiggle_degree: None,
+            time_wiggle_ncols: 0,
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Build the `flex_timepoint_inputs_generic` cell inputs (`CalibrationCellJet
+    /// Inputs`) for a timepoint from a cached partition — the `cached → jet-inputs`
+    /// bridge the production cutover will promote. Borrows the cached cells.
+    fn cells_from_cached(cached: &CachedPartitionCells) -> Vec<CalibrationCellJetInputs<'_>> {
+        cached
+            .cells
+            .iter()
+            .map(|entry| {
+                let cell = entry.partition_cell.cell;
+                CalibrationCellJetInputs {
+                    base_pos_coeffs: [cell.c0, cell.c1, cell.c2, cell.c3],
+                    fixed: &entry.fixed,
+                    cell_left: cell.left,
+                    cell_right: cell.right,
+                    left_edge: entry.partition_cell.left_edge,
+                    right_edge: entry.partition_cell.right_edge,
+                    numeric_moments: entry.state.moments.as_slice(),
+                }
+            })
+            .collect()
+    }
+
+    /// The observed `(a,b)` coefficient pack for the generic builder, from the
+    /// family's `observed_denested_cell_partials` (g-only: `beta_h`/`beta_w` = None).
+    fn observed_pack_for(
+        family: &SurvivalMarginalSlopeFamily,
+        row: usize,
+        a: f64,
+        b: f64,
+    ) -> ObservedCoeffPack {
+        let obs = family
+            .observed_denested_cell_partials(row, a, b, None, None)
+            .expect("observed denested cell partials");
+        ObservedCoeffPack {
+            coeff: obs.coeff,
+            dc_da: obs.dc_da,
+            dc_db: obs.dc_db,
+            dc_daa: obs.dc_daa,
+            dc_dab: obs.dc_dab,
+            dc_dbb: obs.dc_dbb,
+            dc_daaa: obs.dc_daaa,
+            dc_daab: obs.dc_daab,
+            dc_dabb: obs.dc_dabb,
+            dc_dbbb: obs.dc_dbbb,
+        }
+    }
+
+    /// #932 item-2 STEP 3c: `flex_timepoint_inputs_generic::<Jet3>` directional
+    /// channel == hand `compute_survival_timepoint_directional_exact_from_cached`
+    /// (`block10_pack_dir`) term-for-term (≤1e-6) on a real g-only family.
+    #[test]
+    fn flex_timepoint_inputs_jet3_directional_matches_hand_932() {
+        let n = 16usize;
+        let family = make_g_only_flex_family(n);
+        let primary = flex_primary_slices(&family);
+        let p = primary.total;
+        let row = 5usize;
+        let g = 0.21_f64;
+
+        // Exit timepoint q1. The g-only family has no time design and no wiggle, so
+        // `q1 = offset_exit[row] + marginal_design[row]·m_beta` (the marginal block
+        // eta), per `row_dynamic_q_values`.
+        let m_beta = 0.15_f64;
+        let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * m_beta;
+        let o_infl = 0.0_f64;
+        let (a1, d1) = family
+            .solve_row_survival_intercept_with_slot(
+                q1,
+                g,
+                None,
+                None,
+                Some((row, SurvivalInterceptSlotKind::Exit)),
+            )
+            .expect("intercept solve");
+        let cached = family
+            .build_cached_partition(&primary, a1, g, None, None)
+            .expect("cached partition");
+
+        // Direction: a generic non-axis-aligned direction over all primaries.
+        let dir = Array1::from_iter((0..p).map(|c| 0.1 + 0.05 * (c as f64) - 0.02 * ((c % 3) as f64)));
+
+        // Hand directional pack.
+        let hand = family
+            .compute_survival_timepoint_directional_exact_from_cached(
+                row, &primary, q1, primary.q1, a1, g, None, None, &cached, &dir, true,
+            )
+            .expect("hand directional");
+
+        // Generic Jet3 builder, seeded with the direction.
+        let phi_q = crate::probability::normal_pdf(q1);
+        let pack = observed_pack_for(&family, row, a1, g);
+        let cells = cells_from_cached(&cached);
+        let z_obs = family.observed_score_projection(row);
+        let d_check = family
+            .evaluate_survival_denom_d(a1, g, None, None)
+            .expect("denom");
+
+        let template = Jet3::primary(0.0, usize::MAX, p, 0.0);
+        let b_jet = Jet3::primary(g, primary.g, p, dir[primary.g]);
+        let du: Vec<Jet3> = (0..p)
+            .map(|u| Jet3::primary(0.0, u, p, dir[u]))
+            .collect();
+        let zero = Jet3::primary(0.0, usize::MAX, p, 0.0);
+        let (eta, chi, dnorm) = flex_timepoint_inputs_generic(
+            &template, &b_jet, &du, a1, d_check, primary.g, primary.q1, phi_q, z_obs, o_infl,
+            &pack, &zero, &zero, &cells,
+        )
+        .expect("generic jet3");
+
+        // eps.g = D_dir(grad), eps.h = D_dir(Hess). Compare to the hand *_dir.
+        let cmp_vec = |label: &str, jet: &Vec<f64>, hand: &[f64]| {
+            for u in 0..p {
+                assert!(
+                    (jet[u] - hand[u]).abs() <= 1e-6 * (1.0 + hand[u].abs()),
+                    "{label}[{u}] jet {} != hand {}",
+                    jet[u],
+                    hand[u]
+                );
+            }
+        };
+        let cmp_mat = |label: &str, jet: &Vec<f64>, hand: &Array2<f64>| {
+            for u in 0..p {
+                for v in 0..p {
+                    assert!(
+                        (jet[u * p + v] - hand[[u, v]]).abs() <= 1e-6 * (1.0 + hand[[u, v]].abs()),
+                        "{label}[{u},{v}] jet {} != hand {}",
+                        jet[u * p + v],
+                        hand[[u, v]]
+                    );
+                }
+            }
+        };
+        // First localize: the Jet3 BASE channel (`.base`) must equal the hand base
+        // timepoint (value/grad/Hess) — if the directional fails this isolates
+        // whether the base or the ε-lifting is at fault.
+        let base = family
+            .compute_survival_timepoint_exact_from_cached(
+                row, &primary, q1, primary.q1, a1, g, d1, None, None, o_infl, true, &cached,
+            )
+            .expect("hand base");
+        assert!(
+            (eta.base.v - base.eta).abs() <= 1e-6 * (1.0 + base.eta.abs()),
+            "eta base value {} != hand {}",
+            eta.base.v,
+            base.eta
+        );
+        cmp_vec("eta_u", &eta.base.g, base.eta_u.as_slice().unwrap());
+        cmp_mat("eta_uv", &eta.base.h, &base.eta_uv);
+        cmp_vec("chi_u", &chi.base.g, base.chi_u.as_slice().unwrap());
+        cmp_mat("chi_uv", &chi.base.h, &base.chi_uv);
+        cmp_vec("d_u", &dnorm.base.g, base.d_u.as_slice().unwrap());
+        cmp_mat("d_uv", &dnorm.base.h, &base.d_uv);
+
+        // The directional (ε) channel == hand `block10_pack_dir` term-for-term.
+        cmp_vec("eta_u_dir", &eta.eps.g, hand.eta_u_dir.as_slice().unwrap());
+        cmp_mat("eta_uv_dir", &eta.eps.h, &hand.eta_uv_dir);
+        cmp_vec("chi_u_dir", &chi.eps.g, hand.chi_u_dir.as_slice().unwrap());
+        cmp_mat("chi_uv_dir", &chi.eps.h, &hand.chi_uv_dir);
+        cmp_vec("d_u_dir", &dnorm.eps.g, hand.d_u_dir.as_slice().unwrap());
+        cmp_mat("d_uv_dir", &dnorm.eps.h, &hand.d_uv_dir);
+    }
+
+    /// #932 item-2 STEP 3c: `flex_timepoint_inputs_generic::<Jet4>` mixed second-
+    /// directional channel (`eps_del`) == hand `compute_survival_timepoint_
+    /// bidirectional_exact_from_cached` (`block10_pack_bi`) term-for-term (≤1e-6) on a
+    /// real g-only family. Two independent directions exercise the full
+    /// `D_d1 D_d2(eta_uv/chi_uv/d_uv)` mixed fourth-order transport.
+    #[test]
+    fn flex_timepoint_inputs_jet4_bidirectional_matches_hand_932() {
+        let n = 16usize;
+        let family = make_g_only_flex_family(n);
+        let primary = flex_primary_slices(&family);
+        let p = primary.total;
+        let row = 7usize;
+        let g = 0.18_f64;
+
+        let m_beta = 0.15_f64;
+        let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * m_beta;
+        let o_infl = 0.0_f64;
+        let (a1, _d1) = family
+            .solve_row_survival_intercept_with_slot(
+                q1,
+                g,
+                None,
+                None,
+                Some((row, SurvivalInterceptSlotKind::Exit)),
+            )
+            .expect("intercept solve");
+        let cached = family
+            .build_cached_partition(&primary, a1, g, None, None)
+            .expect("cached partition");
+
+        // Two independent directions.
+        let dir1 = Array1::from_iter((0..p).map(|c| 0.12 + 0.04 * (c as f64) - 0.01 * ((c % 2) as f64)));
+        let dir2 = Array1::from_iter((0..p).map(|c| -0.07 + 0.05 * ((c % 3) as f64) + 0.02 * (c as f64)));
+
+        let hand = family
+            .compute_survival_timepoint_bidirectional_exact_from_cached(
+                row, &primary, q1, primary.q1, a1, g, None, None, &cached, &dir1, &dir2,
+            )
+            .expect("hand bidirectional");
+
+        let phi_q = crate::probability::normal_pdf(q1);
+        let pack = observed_pack_for(&family, row, a1, g);
+        let cells = cells_from_cached(&cached);
+        let z_obs = family.observed_score_projection(row);
+        let d_check = family
+            .evaluate_survival_denom_d(a1, g, None, None)
+            .expect("denom");
+
+        // Jet4: base primary + ε (dir1) + δ (dir2) seeds.
+        let template = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
+        let b_jet = Jet4::primary(g, primary.g, p, dir1[primary.g], dir2[primary.g]);
+        let du: Vec<Jet4> = (0..p)
+            .map(|u| Jet4::primary(0.0, u, p, dir1[u], dir2[u]))
+            .collect();
+        let zero = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
+        let (eta, chi, dnorm) = flex_timepoint_inputs_generic(
+            &template, &b_jet, &du, a1, d_check, primary.g, primary.q1, phi_q, z_obs, o_infl,
+            &pack, &zero, &zero, &cells,
+        )
+        .expect("generic jet4");
+
+        let cmp_mat = |label: &str, jet: &Vec<f64>, hand: &Array2<f64>| {
+            for u in 0..p {
+                for v in 0..p {
+                    assert!(
+                        (jet[u * p + v] - hand[[u, v]]).abs() <= 1e-6 * (1.0 + hand[[u, v]].abs()),
+                        "{label}[{u},{v}] jet {} != hand {}",
+                        jet[u * p + v],
+                        hand[[u, v]]
+                    );
+                }
+            }
+        };
+        cmp_mat("eta_uv_uv", &eta.eps_del.h, &hand.eta_uv_uv);
+        cmp_mat("chi_uv_uv", &chi.eps_del.h, &hand.chi_uv_uv);
+        cmp_mat("d_uv_uv", &dnorm.eps_del.h, &hand.d_uv_uv);
     }
 }
 

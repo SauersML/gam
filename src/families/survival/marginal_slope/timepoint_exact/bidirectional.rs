@@ -1458,23 +1458,29 @@ impl SurvivalMarginalSlopeFamily {
             ad2,
             ad12,
         );
-        let eta_aaa_jet = MultiDirJet::bilinear(
-            eta_aaa,
-            eval_coeff4_at(
-                &g_jet.directional_family(g_jet.aaa_first, dir1, COEFF_SUPPORT_GW),
-                z_obs,
-            ),
-            eval_coeff4_at(
-                &g_jet.directional_family(g_jet.aaa_first, dir2, COEFF_SUPPORT_GW),
-                z_obs,
-            ),
-            // The second mixed (dir1,dir2) derivative of `eta_aaa = ∂³_a η` adds one
-            // more `b`-derivative to the third a-partial, i.e. ∂³_a∂_b∂_w of the cell
-            // coefficient. That is a 4th-order total (a,b)-partial of a degree-3
-            // cell polynomial, so it is identically zero (the old `aab_first`
-            // = ∂²_a∂_b∂_w slot was the `eta_aa` d12 term reused one a-order too low).
-            0.0,
+        let eta_aaa_d1 = eval_coeff4_at(
+            &g_jet.directional_family(g_jet.aaa_first, dir1, COEFF_SUPPORT_GW),
+            z_obs,
         );
+        let eta_aaa_d2 = eval_coeff4_at(
+            &g_jet.directional_family(g_jet.aaa_first, dir2, COEFF_SUPPORT_GW),
+            z_obs,
+        );
+        let dir1_g = if primary.g < p { dir1[primary.g] } else { 0.0 };
+        let dir2_g = if primary.g < p { dir2[primary.g] } else { 0.0 };
+        // `eta_aaa = ∂³_a η = −6·c3·b⁻³` is z-independent (c3 = the cell's cubic
+        // coefficient, independent of the log-slope g; b = eˢ). The earlier `0.0`
+        // came from a "∂³_a∂_b∂_w of a degree-3 cell poly ⇒ 0" argument that only
+        // holds for pure-z derivatives. The g-axis instead scales the b⁻³ factor,
+        // so the second mixed directional keeps nonzero g-cross terms:
+        //   ∂_d1∂_d2 η_aaa = −3·dir1_g·(∂_d2 η_aaa) − 3·dir2_g·(∂_d1 η_aaa)
+        //                    − 9·dir1_g·dir2_g·η_aaa
+        // (+ a pure-warp ∂_d1∂_d2 c3 term that vanishes whenever a direction is the
+        // g-axis, as in the #1454 g/β_w gate). (gam#1454)
+        let eta_aaa_d12 = -3.0 * dir1_g * eta_aaa_d2
+            - 3.0 * dir2_g * eta_aaa_d1
+            - 9.0 * dir1_g * dir2_g * eta_aaa;
+        let eta_aaa_jet = MultiDirJet::bilinear(eta_aaa, eta_aaa_d1, eta_aaa_d2, eta_aaa_d12);
 
         let mut a_u_jets = Vec::with_capacity(p);
         let mut tau_jets = Vec::with_capacity(p);
