@@ -1492,6 +1492,16 @@ fn with_identifiability_transform(
             degree: *degree,
             auto_shrink_note: auto_shrink_note.clone(),
         }),
+        BasisMetadata::CubicRegression1D {
+            knots,
+            identifiability_transform,
+        } => Ok(BasisMetadata::CubicRegression1D {
+            knots: knots.clone(),
+            identifiability_transform: compose_identifiability_transforms(
+                identifiability_transform.as_ref(),
+                transform,
+            )?,
+        }),
         BasisMetadata::ThinPlate {
             centers,
             length_scale,
