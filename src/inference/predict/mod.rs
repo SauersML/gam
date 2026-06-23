@@ -2420,20 +2420,35 @@ where
         MeanIntervalMethod::TransformEta => {
             let transformed_lower = apply_family_inverse_link(&eta_lower, &likelihood)?;
             let transformed_upper = apply_family_inverse_link(&eta_upper, &likelihood)?;
-            (
-                Array1::from_iter(
-                    transformed_lower
-                        .iter()
-                        .zip(transformed_upper.iter())
-                        .map(|(&lo, &hi)| lo.min(hi)),
-                ),
-                Array1::from_iter(
-                    transformed_lower
-                        .iter()
-                        .zip(transformed_upper.iter())
-                        .map(|(&lo, &hi)| lo.max(hi)),
-                ),
-            )
+            // #1515: on a degenerate fit (all-zero Poisson flat likelihood) the
+            // η-scale CI half-width z·se_eta is astronomically large, so the
+            // transformed endpoint g⁻¹(η ± z·se_eta) overflows to +inf — and the
+            // min/max against it produces a NaN that serializes to None and
+            // crashes the Python table shaper. When a transformed endpoint is not
+            // finite, fall back per-row to the delta-method bound
+            // mean ± z·mean_se, which is finite (mean is the plug-in inverse link
+            // and mean_se was delta-guarded above), so a fitted model always
+            // returns finite interval bounds.
+            // Check BOTH endpoints' finiteness (not the min/max result): Rust's
+            // f64::max/min return the non-NaN argument, so a single non-finite
+            // endpoint would otherwise slip through as a finite-but-wrong bound.
+            let lower = Array1::from_iter((0..mean.len()).map(|i| {
+                let (lo, hi) = (transformed_lower[i], transformed_upper[i]);
+                if lo.is_finite() && hi.is_finite() {
+                    lo.min(hi)
+                } else {
+                    mean[i] - z_lower_per_row[i] * mean_standard_error[i]
+                }
+            }));
+            let upper = Array1::from_iter((0..mean.len()).map(|i| {
+                let (lo, hi) = (transformed_lower[i], transformed_upper[i]);
+                if lo.is_finite() && hi.is_finite() {
+                    lo.max(hi)
+                } else {
+                    mean[i] + z_upper_per_row[i] * mean_standard_error[i]
+                }
+            }));
+            (lower, upper)
         }
     };
 
