@@ -1243,8 +1243,8 @@ impl SurvivalMarginalSlopeFamily {
         let d_u_d1 = d_uv_base.dot(dir1);
         let d_u_d2 = d_uv_base.dot(dir2);
         // D directional derivatives (D = −f_a).
-        let d_d1 = d_u_base.dot(dir1);
-        let d_d2 = d_u_base.dot(dir2);
+        let d_d1 = -f_a_d1;
+        let d_d2 = -f_a_d2;
         // D-path single-directional Hessian derivatives `auvd1`/`auvd2`
         // (`a_uv_dir = (N_dir − a_uv·D_dir)/D`, N = the D-path numerator).
         let mut auvd1 = Array2::<f64>::zeros((p, p));
@@ -1295,8 +1295,7 @@ impl SurvivalMarginalSlopeFamily {
         // D-path bilinear recovery of the second-directional Hessian `auvd12`:
         // `a_uv = (f_uv − d_u_u·a_u_v − d_u_v·a_u_u − f_aa·a_u_u·a_u_v)/D`, every
         // factor a bilinear jet; coeff(3) is `D_dir1 D_dir2(a_uv)`.
-        let _ = (&f_a_d1, &f_a_d2, &f_a_d12); // superseded by exact D-derivs
-        let d_jet = MultiDirJet::bilinear(d_check, d_d1, d_d2, d_u_d2.dot(dir1));
+        let d_jet = MultiDirJet::bilinear(d_check, d_d1, d_d2, -f_a_d12);
         let d_recip_jet = reciprocal_bilinear_jet(d_jet);
         let f_aa_jet = MultiDirJet::bilinear(f_aa, f_aa_d1, f_aa_d2, f_aa_d12);
         let mut auvd12 = Array2::<f64>::zeros((p, p));
