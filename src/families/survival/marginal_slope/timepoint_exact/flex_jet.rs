@@ -128,7 +128,7 @@ impl Jet2 {
         let hv = if h.is_empty() {
             vec![0.0; p * p]
         } else {
-            debug_assert_eq!(h.len(), p * p, "Jet2::from_parts Hessian length");
+            assert_eq!(h.len(), p * p, "Jet2::from_parts Hessian length");
             h.to_vec()
         };
         Jet2 {
@@ -455,7 +455,6 @@ impl SurvivalMarginalSlopeFamily {
     /// `g_*` are the length-`p` gradient packs, `h_*` the `p*p` row-major Hessian
     /// packs (empty for grad-only). Replaces the hand value/grad/Hessian
     /// assembly in `flex_sensitivity.rs`.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn flex_row_nll_value_grad_hess(
         &self,
         row: usize,
@@ -500,7 +499,6 @@ impl SurvivalMarginalSlopeFamily {
 
     /// Single-source flex contracted third `D_dir H[u,v]` from the entry/exit
     /// base + directional packs. Replaces `gpu::cpu_oracle_third_contraction`.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn flex_row_nll_third_contracted(
         &self,
         row: usize,
@@ -567,7 +565,6 @@ impl SurvivalMarginalSlopeFamily {
     /// Single-source flex contracted fourth `Σ_{cd} ℓ_{abcd} u_c v_d` from the
     /// entry/exit base + both directional packs + bidirectional packs. Replaces
     /// `gpu::cpu_oracle_fourth_contraction`.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn flex_row_nll_fourth_contracted(
         &self,
         row: usize,
