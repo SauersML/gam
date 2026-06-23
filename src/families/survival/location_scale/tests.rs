@@ -6212,3 +6212,176 @@ fn positive_log_cumulative_hazard_maps_to_baseline_cloglog_survival() {
         expected
     );
 }
+
+/// #932 (survival link-wiggle — the issue's named next step): the survival
+/// location-scale JOINT row NLL written ONCE over [`JetScalar`] is extended with
+/// the link-wiggle warp `q = q0 + Σ_j βw_j·B_j(q0)` (and the qdot coupling
+/// `g = m1·g0`, `m1 = 1 + Σ_j βw_j·B'_j(q0_exit)`), with the βw amplitudes as
+/// extra jet primaries. The mechanically-derived joint Hessian — including the
+/// `(η, βw)` and `(βw, βw)` cross blocks a fixed `JᵀHJ` pullback would drop —
+/// is pinned against central finite differences of the SAME program's value,
+/// across the three residual distributions. This validates the nonlinear
+/// link-wiggle pullback (the issue's §5/§13 map-inside-the-program) in the
+/// survival row program — the foundation for enabling
+/// `row_kernel_joint_hessian_supported` on link-wiggle rows.
+#[test]
+fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
+    use crate::families::jet_scalar::JetScalar;
+    use crate::families::jet_tower::{RowNllProgramGeneric, generic_row_kernel};
+
+    const PW: usize = 2;
+    const KW: usize = SLS_ROW_K + PW; // 9 base channels + 2 wiggle amplitudes
+
+    // Smooth wiggle basis B_j and its first three derivatives at q (any C^3
+    // basis exercises the warp; the production spline supplies the same stack).
+    fn basis(j: usize, q: f64) -> [f64; 4] {
+        match j {
+            0 => [0.5 * q * q, q, 1.0, 0.0],
+            _ => [q * q * q / 6.0, 0.5 * q * q, q, 1.0],
+        }
+    }
+
+    struct WiggleProg {
+        link: InverseLink,
+        w: f64,
+        d: f64,
+        p: [f64; KW],
+    }
+    impl RowNllProgramGeneric<KW> for WiggleProg {
+        fn n_rows(&self) -> usize {
+            1
+        }
+        fn primaries(&self, row: usize) -> Result<[f64; KW], String> {
+            if row != 0 {
+                return Err(format!("wiggle program: row {row} out of range"));
+            }
+            Ok(self.p)
+        }
+        fn row_nll_generic<S: JetScalar<KW>>(&self, row: usize, p: &[S; KW]) -> Result<S, String> {
+            if row != 0 {
+                return Err(format!("wiggle program: row {row} out of range"));
+            }
+            // Base nine-channel survival indices (exactly `sls_row_nll`).
+            let inv_sigma_entry = p[7].neg().exp();
+            let u0 = p[0].sub(&p[4].mul(&inv_sigma_entry));
+            let inv_sigma_exit = p[6].neg().exp();
+            let u1 = p[1].sub(&p[3].mul(&inv_sigma_exit));
+            let g0 = p[2].add(&inv_sigma_exit.mul(&p[3].mul(&p[8]).sub(&p[5])));
+
+            // Link-wiggle warp: amplitudes are primaries 9..9+PW; each basis is
+            // composed onto the BASE index jet (so it carries the η-dependence).
+            let u0v = JetScalar::value(&u0);
+            let u1v = JetScalar::value(&u1);
+            let mut u0w = u0;
+            let mut u1w = u1;
+            let mut m1 = S::constant(1.0);
+            for j in 0..PW {
+                let bw = p[SLS_ROW_K + j];
+                let b0 = basis(j, u0v);
+                u0w = u0w.add(&bw.mul(&u0.compose_unary([b0[0], b0[1], b0[2], 0.0, 0.0])));
+                let b1 = basis(j, u1v);
+                u1w = u1w.add(&bw.mul(&u1.compose_unary([b1[0], b1[1], b1[2], b1[3], 0.0])));
+                // B'_j(u1) jet for m1 = 1 + Σ βw·B'(u1) → g_warp = m1·g0.
+                m1 = m1.add(&bw.mul(&u1.compose_unary([b1[1], b1[2], b1[3], 0.0, 0.0])));
+            }
+            let g = m1.mul(&g0);
+
+            let mut nll = u0w
+                .compose_unary(survival_ls_log_survival_stack(&self.link, JetScalar::value(&u0w))?)
+                .scale(self.w);
+            let censored_weight = self.w * (1.0 - self.d);
+            if censored_weight != 0.0 {
+                nll = nll.add(
+                    &u1w.compose_unary(survival_ls_log_survival_stack(
+                        &self.link,
+                        JetScalar::value(&u1w),
+                    )?)
+                    .scale(-censored_weight),
+                );
+            }
+            let event_weight = self.w * self.d;
+            if event_weight != 0.0 {
+                nll = nll
+                    .add(
+                        &u1w.compose_unary(survival_ls_log_pdf_stack(
+                            &self.link,
+                            JetScalar::value(&u1w),
+                            0.0,
+                        )?)
+                        .scale(-event_weight),
+                    )
+                    .add(
+                        &g.compose_unary(survival_ls_positive_log_stack(JetScalar::value(&g)))
+                            .scale(-event_weight),
+                    );
+            }
+            Ok(nll)
+        }
+    }
+
+    // η-rich, moderate-tail base primaries; βw amplitudes nonzero so the warp
+    // and every wiggle cross block are exercised (event row d=1 → entry logS +
+    // exit logφ + qdot log_g all live).
+    let p0: [f64; KW] = [
+        0.25, 0.9, 1.3, 0.6, -0.1, 0.1, -0.2, -0.05, 0.3, // 9 base channels
+        0.3, -0.2, // βw_0, βw_1
+    ];
+
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let link = residual_distribution_inverse_link(distribution);
+        let value = |p: [f64; KW]| -> f64 {
+            generic_row_kernel(
+                &WiggleProg {
+                    link: link.clone(),
+                    w: 1.0,
+                    d: 1.0,
+                    p,
+                },
+                0,
+            )
+            .expect("wiggle program value")
+            .0
+        };
+        let h_jet = generic_row_kernel(
+            &WiggleProg {
+                link: link.clone(),
+                w: 1.0,
+                d: 1.0,
+                p: p0,
+            },
+            0,
+        )
+        .expect("wiggle program jet")
+        .2;
+
+        let hs = 1e-4;
+        for a in 0..KW {
+            for b in 0..KW {
+                let mut pp = p0;
+                pp[a] += hs;
+                pp[b] += hs;
+                let mut pm = p0;
+                pm[a] += hs;
+                pm[b] -= hs;
+                let mut mp = p0;
+                mp[a] -= hs;
+                mp[b] += hs;
+                let mut mm = p0;
+                mm[a] -= hs;
+                mm[b] -= hs;
+                let fd = (value(pp) - value(pm) - value(mp) + value(mm)) / (4.0 * hs * hs);
+                let scale = h_jet[a][b].abs().max(fd.abs()).max(1.0);
+                assert!(
+                    (h_jet[a][b] - fd).abs() <= 2e-3 * scale,
+                    "{distribution:?}: wiggle joint Hessian [{a}][{b}] jet {} vs FD {}",
+                    h_jet[a][b],
+                    fd
+                );
+            }
+        }
+    }
+}
