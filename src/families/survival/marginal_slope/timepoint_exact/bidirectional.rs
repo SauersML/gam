@@ -42,6 +42,62 @@ fn reciprocal_bilinear_jet(value: MultiDirJet) -> MultiDirJet {
     )
 }
 
+/// Bilinear-jet `exp` of `(x0, x1, x2, x12)`. With `e = exp(x0)`:
+/// `∂₁ = e·x1`, `∂₂ = e·x2`, `∂₁∂₂ = e·(x12 + x1·x2)` (the second Faà di Bruno
+/// term `f''·x1·x2 + f'·x12` with `f = f' = f'' = e`).
+#[inline]
+fn exp_bilinear_jet(x: &MultiDirJet) -> MultiDirJet {
+    let x0 = x.coeff(0);
+    let x1 = x.coeff(1);
+    let x2 = x.coeff(2);
+    let x12 = x.coeff(3);
+    let e = x0.exp();
+    MultiDirJet::bilinear(e, e * x1, e * x2, e * (x12 + x1 * x2))
+}
+
+/// Horner evaluation of a polynomial whose coefficients are bilinear jets, at a
+/// bilinear-jet point `z` (so the crossing-edge motion of `z` is carried too).
+#[inline]
+fn eval_poly_jets_at_jet(poly: &[MultiDirJet], z: &MultiDirJet) -> MultiDirJet {
+    let mut acc = MultiDirJet::constant(2, 0.0);
+    for coeff in poly.iter().rev() {
+        acc = acc.mul(z).add(coeff);
+    }
+    acc
+}
+
+/// Horner evaluation of the z-derivative `Σ_k k·c_k·z^{k-1}` for jet
+/// coefficients at a jet point `z`.
+#[inline]
+fn eval_poly_jets_deriv_at_jet(poly: &[MultiDirJet], z: &MultiDirJet) -> MultiDirJet {
+    let mut acc = MultiDirJet::constant(2, 0.0);
+    for (power, coeff) in poly.iter().enumerate().skip(1).rev() {
+        acc = acc.mul(z).add(&coeff.scale(power as f64));
+    }
+    acc
+}
+
+/// Bilinear-jet `Φ(−η)` for a bilinear jet `η`. With `Ψ = Φ(−η0)`,
+/// `Ψ_η = −φ(η0)`, `Ψ_ηη = η0·φ(η0)` (the outer stack for the unary compose):
+/// `∂₁ = Ψ_η·η1`, `∂₂ = Ψ_η·η2`, `∂₁∂₂ = Ψ_ηη·η1·η2 + Ψ_η·η12`.
+#[inline]
+fn neg_cdf_bilinear_jet(eta: &MultiDirJet) -> MultiDirJet {
+    let e0 = eta.coeff(0);
+    let e1 = eta.coeff(1);
+    let e2 = eta.coeff(2);
+    let e12 = eta.coeff(3);
+    let base = crate::probability::normal_cdf(-e0);
+    let phi = crate::probability::normal_pdf(e0);
+    let psi_eta = -phi;
+    let psi_etaeta = e0 * phi;
+    MultiDirJet::bilinear(
+        base,
+        psi_eta * e1,
+        psi_eta * e2,
+        psi_etaeta * e1 * e2 + psi_eta * e12,
+    )
+}
+
 impl SurvivalMarginalSlopeFamily {
     pub(crate) fn compute_survival_timepoint_bidirectional_exact_from_cached(
         &self,
@@ -858,17 +914,321 @@ impl SurvivalMarginalSlopeFamily {
         f_uv_d2[[q_index, q_index]] += dir2[q_index] * (q * q - 1.0) * phi_q;
         f_uv_d12[[q_index, q_index]] += dir1[q_index] * dir2[q_index] * q * (3.0 - q * q) * phi_q;
 
+        // §D moving-boundary flux on the base intercept-Hessian inputs and their
+        // two directional derivatives, carried as bilinear jets. first_full.rs's
+        // base `f_uv`/`f_aa`/`f_au` carry the calibration-F moving-boundary flux
+        // (asymmetric Leibniz pair + doubled-diagonal + `G_z·z_x·z_y` self-flux),
+        // and directional.rs carries its single `D_dir`. The bidirectional pass
+        // recovers `auv`/`auvd1`/`auvd2`/`auvd12` from the SAME F-path Hessian
+        // inputs, so each `f_uv`/`f_aa`/`f_au` (and its d1/d2/d12) must carry the
+        // flux through the bilinear `(dir1, dir2)` jet — exactly D_dir1 D_dir2 of
+        // the base block. Omitting it left the F-path inputs short of the §D total
+        // derivative the D-path `d_u` carries, so the recovered `auvd12` (hence
+        // the contracted fourth `fourth[g,β_w]`) was wrong (gam#1454). The
+        // intercept directional jets are the flux-corrected calibration scalars
+        // `cal_ad1`/`cal_ad2`/`cal_ad12` (= a-Hessian contracted with dir1, dir2),
+        // available before this recovery, so no base/dir desync arises.
+        if b != 0.0 {
+            let primary_view = SparsePrimaryCoeffJetView::new(
+                primary.g,
+                primary.h.as_ref(),
+                primary.w.as_ref(),
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+                &[],
+            );
+            let dir_g1 = if primary.g < p { dir1[primary.g] } else { 0.0 };
+            let dir_g2 = if primary.g < p { dir2[primary.g] } else { 0.0 };
+            let inv_b = 1.0 / b;
+            for entry in &cached.cells {
+                let fx = &entry.fixed;
+                let part = &entry.partition_cell;
+                let cell = part.cell;
+                let eta_base = [cell.c0, cell.c1, cell.c2, cell.c3];
+                // η composite jet (deviation + intercept chain); the calibration
+                // F integrand is `G = Φ(−η)·φ(z)`.
+                let eta_poly_jet = coeff4_composite_bilinear(
+                    &eta_base,
+                    &fx.dc_da,
+                    &fx.dc_daa,
+                    &primary_view.directional_family(&fx.coeff_u, dir1, COEFF_SUPPORT_GHW),
+                    &primary_view.directional_family(&fx.coeff_u, dir2, COEFF_SUPPORT_GHW),
+                    &primary_view.mixed_directional_from_b_family(
+                        &fx.coeff_bu,
+                        dir1,
+                        dir2,
+                        COEFF_SUPPORT_GHW,
+                    ),
+                    &primary_view.directional_family(&fx.coeff_au, dir1, COEFF_SUPPORT_GHW),
+                    &primary_view.directional_family(&fx.coeff_au, dir2, COEFF_SUPPORT_GHW),
+                    cal_ad1,
+                    cal_ad2,
+                    cal_ad12,
+                );
+                // χ = ∂η/∂a composite jet (for `neg_dc_da` = −χ flux poly).
+                let neg_dc_da_jet: Vec<MultiDirJet> = coeff4_composite_bilinear(
+                    &fx.dc_da,
+                    &fx.dc_daa,
+                    &fx.dc_daaa,
+                    &primary_view.directional_family(&fx.coeff_au, dir1, COEFF_SUPPORT_GHW),
+                    &primary_view.directional_family(&fx.coeff_au, dir2, COEFF_SUPPORT_GHW),
+                    &primary_view.mixed_directional_from_b_family(
+                        &fx.coeff_abu,
+                        dir1,
+                        dir2,
+                        COEFF_SUPPORT_GHW,
+                    ),
+                    &primary_view.directional_family(&fx.coeff_aau, dir1, COEFF_SUPPORT_GHW),
+                    &primary_view.directional_family(&fx.coeff_aau, dir2, COEFF_SUPPORT_GHW),
+                    cal_ad1,
+                    cal_ad2,
+                    cal_ad12,
+                )
+                .into_iter()
+                .map(|c| c.scale(-1.0))
+                .collect();
+                // Per-axis −∂η/∂θ_u total directional bilinear jets (deviation +
+                // intercept chain), via the composite-bilinear builder with the
+                // a-derivative stack `coeff_au`/`coeff_aau` and the partial-
+                // directional `coeff_bu`/`coeff_bbu`/`coeff_abu` families.
+                let neg_coeff_u_jets: Vec<Vec<MultiDirJet>> = (0..p)
+                    .map(|u| {
+                        coeff4_composite_bilinear(
+                            &fx.coeff_u[u],
+                            &fx.coeff_au[u],
+                            &fx.coeff_aau[u],
+                            &primary_view.param_directional_from_b_family(
+                                &fx.coeff_bu,
+                                u,
+                                dir1,
+                                COEFF_SUPPORT_GHW,
+                            ),
+                            &primary_view.param_directional_from_b_family(
+                                &fx.coeff_bu,
+                                u,
+                                dir2,
+                                COEFF_SUPPORT_GHW,
+                            ),
+                            &primary_view.param_mixed_from_bb_family(
+                                &fx.coeff_bbu,
+                                u,
+                                dir1,
+                                dir2,
+                                COEFF_SUPPORT_GHW,
+                            ),
+                            &primary_view.param_directional_from_b_family(
+                                &fx.coeff_abu,
+                                u,
+                                dir1,
+                                COEFF_SUPPORT_GHW,
+                            ),
+                            &primary_view.param_directional_from_b_family(
+                                &fx.coeff_abu,
+                                u,
+                                dir2,
+                                COEFF_SUPPORT_GHW,
+                            ),
+                            cal_ad1,
+                            cal_ad2,
+                            cal_ad12,
+                        )
+                        .into_iter()
+                        .map(|c| c.scale(-1.0))
+                        .collect()
+                    })
+                    .collect();
+                // Crossing-edge position jet `Z = (z, z1, z2, z12)`; the §C edge
+                // velocities `z_k = −(a_dk + z·dir_gk)/b` and mixed
+                // `z12 = −(a_d12 + z2·dir_g1 + z1·dir_g2)/b`, evaluated PER edge.
+                let edge_pos_jet = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                    z: f64|
+                 -> Option<MultiDirJet> {
+                    match edge {
+                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                            let z1 = -(cal_ad1 + z * dir_g1) * inv_b;
+                            let z2 = -(cal_ad2 + z * dir_g2) * inv_b;
+                            let z12 = -(cal_ad12 + z2 * dir_g1 + z1 * dir_g2) * inv_b;
+                            Some(MultiDirJet::bilinear(z, z1, z2, z12))
+                        }
+                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => None,
+                    }
+                };
+                // `1/b` as a bilinear jet: `b = g + const` moves with dir1/dir2
+                // (gam#1454), so `D_dk(1/b) = −dir_gk/b²` and the mixed
+                // `D_d1 D_d2(1/b) = 2·dir_g1·dir_g2/b³`. The velocities below carry
+                // this b-motion exactly (the directional `z_axis_dir` term
+                // `−z_axis·dir_g/b` is precisely this `1/b`-derivative).
+                let inv_b_jet =
+                    reciprocal_bilinear_jet(MultiDirJet::bilinear(b, dir_g1, dir_g2, 0.0));
+                // Partial-IFT θ-axis crossing-velocity jet `z_x = −direct_g_x/b`,
+                // with `direct_g_x = δ_{x,g}·Z` (the moving crossing). a held fixed
+                // (the intercept chain is supplied by the explicit f_au·au + f_aa·au²
+                // recovery terms), so it carries NO a_dk term — matching the base
+                // first_full/directional `edge_vel` (gam#1454).
+                let theta_vel_jet = |axis: usize, z_jet: &MultiDirJet| -> MultiDirJet {
+                    if axis == primary.g {
+                        z_jet.mul(&inv_b_jet).scale(-1.0)
+                    } else {
+                        MultiDirJet::constant(2, 0.0)
+                    }
+                };
+                // a-axis velocity `z_a = −1/b` (the b-motion makes this a nonzero
+                // jet under dir1/dir2 even though it is θ-independent at fixed b).
+                let a_vel_jet = inv_b_jet.scale(-1.0);
+                // Density weight jet `exp(−q)/2π = φ(η)φ(z)` at the moving edge,
+                // q = ½(z² + η²).
+                let weight_jet = |z_jet: &MultiDirJet, eta_jet: &MultiDirJet| -> MultiDirJet {
+                    let z2 = z_jet.mul(z_jet);
+                    let eta2 = eta_jet.mul(eta_jet);
+                    let neg_q = z2.add(&eta2).scale(-0.5);
+                    exp_bilinear_jet(&neg_q).scale(std::f64::consts::FRAC_1_PI * 0.5)
+                };
+                // `cell_density_boundary_integrand(cell, poly, z) = poly(z)·w(z)`
+                // as a bilinear jet, with both `poly` and the edge `z`/η moving.
+                let boundary_integrand_jet =
+                    |poly: &[MultiDirJet], z_jet: &MultiDirJet, weight: &MultiDirJet| -> MultiDirJet {
+                        eval_poly_jets_at_jet(poly, z_jet).mul(weight)
+                    };
+                // `G_z` of the calibration F integrand `G = Φ(−η)·φ(z)`:
+                //   G_z = −η_z·φ(η)φ(z) − z·Φ(−η)·φ(z),
+                // every factor a bilinear jet at the moving edge (η_z = ∂η/∂z).
+                let f_int_z_jet = |z_jet: &MultiDirJet,
+                                   eta_jet: &MultiDirJet,
+                                   eta_z_jet: &MultiDirJet,
+                                   weight: &MultiDirJet|
+                 -> MultiDirJet {
+                    let phi_z = {
+                        let z2 = z_jet.mul(z_jet);
+                        exp_bilinear_jet(&z2.scale(-0.5))
+                            .scale(1.0 / (2.0 * std::f64::consts::PI).sqrt())
+                    };
+                    let cdf = neg_cdf_bilinear_jet(eta_jet);
+                    eta_z_jet
+                        .mul(weight)
+                        .scale(-1.0)
+                        .sub(&z_jet.mul(&cdf).mul(&phi_z))
+                };
+                // Sum `right − left` of an edge functional over the cell's two
+                // crossing edges (skips Fixed edges, where every velocity is 0).
+                let edge_diff = |f: &dyn Fn(&MultiDirJet, f64) -> MultiDirJet| -> MultiDirJet {
+                    let mut acc = MultiDirJet::constant(2, 0.0);
+                    if let Some(zr) = edge_pos_jet(part.right_edge, cell.right) {
+                        acc = acc.add(&f(&zr, cell.right));
+                    }
+                    if let Some(zl) = edge_pos_jet(part.left_edge, cell.left) {
+                        acc = acc.sub(&f(&zl, cell.left));
+                    }
+                    acc
+                };
+                // Asymmetric Leibniz flux `z_axis · integrand(poly)`.
+                let theta_flux = |axis: usize, poly: &[MultiDirJet]| -> MultiDirJet {
+                    edge_diff(&|z_jet, _z| {
+                        let eta_jet = eval_poly_jets_at_jet(&eta_poly_jet, z_jet);
+                        let weight = weight_jet(z_jet, &eta_jet);
+                        theta_vel_jet(axis, z_jet)
+                            .mul(&boundary_integrand_jet(poly, z_jet, &weight))
+                    })
+                };
+                let a_flux = |poly: &[MultiDirJet]| -> MultiDirJet {
+                    edge_diff(&|z_jet, _z| {
+                        let eta_jet = eval_poly_jets_at_jet(&eta_poly_jet, z_jet);
+                        let weight = weight_jet(z_jet, &eta_jet);
+                        a_vel_jet.mul(&boundary_integrand_jet(poly, z_jet, &weight))
+                    })
+                };
+                // Symmetric self-flux `G_z·z_x·z_y` (velocities given as a closure
+                // of the edge position jet).
+                let self_flux = |vel_x: &dyn Fn(&MultiDirJet) -> MultiDirJet,
+                                 vel_y: &dyn Fn(&MultiDirJet) -> MultiDirJet|
+                 -> MultiDirJet {
+                    edge_diff(&|z_jet, _z| {
+                        let eta_jet = eval_poly_jets_at_jet(&eta_poly_jet, z_jet);
+                        let eta_z_jet = eval_poly_jets_deriv_at_jet(&eta_poly_jet, z_jet);
+                        let weight = weight_jet(z_jet, &eta_jet);
+                        let gz = f_int_z_jet(z_jet, &eta_jet, &eta_z_jet, &weight);
+                        gz.mul(&vel_x(z_jet)).mul(&vel_y(z_jet))
+                    })
+                };
+                let theta_v = |axis: usize| {
+                    move |z_jet: &MultiDirJet| theta_vel_jet(axis, z_jet)
+                };
+                let a_v = |z_jet: &MultiDirJet| z_jet.scale(0.0).add(&a_vel_jet);
+
+                // f_aa: doubled a-axis flux + (a,a) self-flux.
+                {
+                    let block = a_flux(&neg_dc_da_jet)
+                        .scale(2.0)
+                        .add(&self_flux(&a_v, &a_v));
+                    f_aa += block.coeff(0);
+                    f_aa_d1 += block.coeff(1);
+                    f_aa_d2 += block.coeff(2);
+                    f_aa_d12 += block.coeff(3);
+                }
+                // f_au[u]: a-axis flux on coeff_u + u-axis flux on dc_da +
+                // (a,u) self-flux.
+                for u in 0..p {
+                    let block = a_flux(&neg_coeff_u_jets[u])
+                        .add(&theta_flux(u, &neg_dc_da_jet))
+                        .add(&self_flux(&a_v, &theta_v(u)));
+                    f_au[u] += block.coeff(0);
+                    f_au_d1[u] += block.coeff(1);
+                    f_au_d2[u] += block.coeff(2);
+                    f_au_d12[u] += block.coeff(3);
+                }
+                // f_uv[u,v]: asymmetric flux pair (DOUBLED on the diagonal) +
+                // (u,v) self-flux.
+                for u in 0..p {
+                    for v in u..p {
+                        let block = theta_flux(v, &neg_coeff_u_jets[u])
+                            .add(&theta_flux(u, &neg_coeff_u_jets[v]))
+                            .add(&self_flux(&theta_v(u), &theta_v(v)));
+                        f_uv[[u, v]] += block.coeff(0);
+                        f_uv_d1[[u, v]] += block.coeff(1);
+                        f_uv_d2[[u, v]] += block.coeff(2);
+                        f_uv_d12[[u, v]] += block.coeff(3);
+                        if u != v {
+                            f_uv[[v, u]] += block.coeff(0);
+                            f_uv_d1[[v, u]] += block.coeff(1);
+                            f_uv_d2[[v, u]] += block.coeff(2);
+                            f_uv_d12[[v, u]] += block.coeff(3);
+                        }
+                    }
+                }
+            }
+        }
+
         let inv = 1.0 / f_a;
         let mut au = Array1::<f64>::zeros(p);
         for u in 0..p {
             au[u] = -f_u[u] * inv;
         }
+        // D-PATH intercept-Hessian recovery (matching first_full.rs/directional.rs,
+        // gam#1454): `a_uv = (f_uv − d_u[u]·a_u[v] − d_u[v]·a_u[u] − f_aa·a_u·a_u)/D`
+        // with `D = −f_a`. The F-path `f_au` does NOT reconstruct the §D total
+        // `d_u` (its moving-boundary partials differ), so the bidirectional —
+        // exactly like the base and directional passes — recovers from the
+        // FD-validated `d_u`/`d_uv` (and their directional extension `d_uv_dir`)
+        // instead. The second-directional Hessian `auvd12` then matches the
+        // directional path one tier up, closing the contracted fourth
+        // `fourth[g,β_w]` (gam#1454). `f_uv`/`f_aa` carry the §D flux added above.
+        let d_check = -f_a;
+        let inv_d = 1.0 / d_check;
+        let d_u_base = self.survival_flex_base_d_u(primary, &au, cached, b, p)?;
         let mut auv = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
-                let val =
-                    -(f_uv[[u, v]] + f_au[u] * au[v] + f_au[v] * au[u] + f_aa * au[u] * au[v])
-                        * inv;
+                let val = (f_uv[[u, v]]
+                    - d_u_base[u] * au[v]
+                    - d_u_base[v] * au[u]
+                    - f_aa * au[u] * au[v])
+                    * inv_d;
                 auv[[u, v]] = val;
                 auv[[v, u]] = val;
             }
@@ -878,29 +1238,38 @@ impl SurvivalMarginalSlopeFamily {
         let aud1 = auv.dot(dir1);
         let aud2 = auv.dot(dir2);
 
+        // Directional `d_u` derivatives via the FD-validated `d_uv` contraction.
+        let d_uv_base = self.survival_flex_base_d_uv(primary, &au, &auv, cached, b, p)?;
+        let d_u_d1 = d_uv_base.dot(dir1);
+        let d_u_d2 = d_uv_base.dot(dir2);
+        // D directional derivatives (D = −f_a).
+        let d_d1 = -f_a_d1;
+        let d_d2 = -f_a_d2;
+        // D-path single-directional Hessian derivatives `auvd1`/`auvd2`
+        // (`a_uv_dir = (N_dir − a_uv·D_dir)/D`, N = the D-path numerator).
         let mut auvd1 = Array2::<f64>::zeros((p, p));
         let mut auvd2 = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
                 let n1 = f_uv_d1[[u, v]]
-                    + f_au_d1[u] * au[v]
-                    + f_au[u] * aud1[v]
-                    + f_au_d1[v] * au[u]
-                    + f_au[v] * aud1[u]
-                    + f_aa_d1 * au[u] * au[v]
-                    + f_aa * (aud1[u] * au[v] + au[u] * aud1[v]);
-                let v1 = -(n1 + f_a_d1 * auv[[u, v]]) * inv;
+                    - d_u_d1[u] * au[v]
+                    - d_u_base[u] * aud1[v]
+                    - d_u_d1[v] * au[u]
+                    - d_u_base[v] * aud1[u]
+                    - f_aa_d1 * au[u] * au[v]
+                    - f_aa * (aud1[u] * au[v] + au[u] * aud1[v]);
+                let v1 = (n1 - d_d1 * auv[[u, v]]) * inv_d;
                 auvd1[[u, v]] = v1;
                 auvd1[[v, u]] = v1;
 
                 let n2 = f_uv_d2[[u, v]]
-                    + f_au_d2[u] * au[v]
-                    + f_au[u] * aud2[v]
-                    + f_au_d2[v] * au[u]
-                    + f_au[v] * aud2[u]
-                    + f_aa_d2 * au[u] * au[v]
-                    + f_aa * (aud2[u] * au[v] + au[u] * aud2[v]);
-                let v2 = -(n2 + f_a_d2 * auv[[u, v]]) * inv;
+                    - d_u_d2[u] * au[v]
+                    - d_u_base[u] * aud2[v]
+                    - d_u_d2[v] * au[u]
+                    - d_u_base[v] * aud2[u]
+                    - f_aa_d2 * au[u] * au[v]
+                    - f_aa * (aud2[u] * au[v] + au[u] * aud2[v]);
+                let v2 = (n2 - d_d2 * auv[[u, v]]) * inv_d;
                 auvd2[[u, v]] = v2;
                 auvd2[[v, u]] = v2;
             }
@@ -908,10 +1277,28 @@ impl SurvivalMarginalSlopeFamily {
 
         let ad12 = aud2.dot(dir1);
         let aud12 = auvd2.dot(dir1);
-        let mut auvd12 = Array2::<f64>::zeros((p, p));
-        let f_a_jet = MultiDirJet::bilinear(f_a, f_a_d1, f_a_d2, f_a_d12);
-        let f_a_recip_jet = reciprocal_bilinear_jet(f_a_jet);
+        // Mixed second-directional `d_u` derivative `D_dir1 D_dir2(d_u)` via the
+        // FD-validated directional `d_uv_dir` (= `D_dir1(d_uv)`), contracted with
+        // dir2: `d_u_d12[u] = Σ_v d_uv_dir1[u,v]·dir2[v] = D_dir1 D_dir2(d_u[u])`.
+        let dir1_ext = self.compute_survival_timepoint_directional_exact_from_cached(
+            row, primary, q, q_index, a, b, beta_h, beta_w, cached, dir1, true,
+        )?;
+        let d_u_d12 = dir1_ext.d_uv_dir.dot(dir2);
+
+        // a_u and d_u bilinear jets carry (·, D_dir1, D_dir2, D_dir1 D_dir2).
+        let a_u_jets: Vec<MultiDirJet> = (0..p)
+            .map(|u| MultiDirJet::bilinear(au[u], aud1[u], aud2[u], aud12[u]))
+            .collect();
+        let d_u_jets: Vec<MultiDirJet> = (0..p)
+            .map(|u| MultiDirJet::bilinear(d_u_base[u], d_u_d1[u], d_u_d2[u], d_u_d12[u]))
+            .collect();
+        // D-path bilinear recovery of the second-directional Hessian `auvd12`:
+        // `a_uv = (f_uv − d_u_u·a_u_v − d_u_v·a_u_u − f_aa·a_u_u·a_u_v)/D`, every
+        // factor a bilinear jet; coeff(3) is `D_dir1 D_dir2(a_uv)`.
+        let d_jet = MultiDirJet::bilinear(d_check, d_d1, d_d2, -f_a_d12);
+        let d_recip_jet = reciprocal_bilinear_jet(d_jet);
         let f_aa_jet = MultiDirJet::bilinear(f_aa, f_aa_d1, f_aa_d2, f_aa_d12);
+        let mut auvd12 = Array2::<f64>::zeros((p, p));
         for u in 0..p {
             for v in u..p {
                 let f_uv_jet = MultiDirJet::bilinear(
@@ -920,17 +1307,13 @@ impl SurvivalMarginalSlopeFamily {
                     f_uv_d2[[u, v]],
                     f_uv_d12[[u, v]],
                 );
-                let f_au_u_jet =
-                    MultiDirJet::bilinear(f_au[u], f_au_d1[u], f_au_d2[u], f_au_d12[u]);
-                let f_au_v_jet =
-                    MultiDirJet::bilinear(f_au[v], f_au_d1[v], f_au_d2[v], f_au_d12[v]);
-                let a_u_jet = MultiDirJet::bilinear(au[u], aud1[u], aud2[u], aud12[u]);
-                let a_v_jet = MultiDirJet::bilinear(au[v], aud1[v], aud2[v], aud12[v]);
+                let a_u_jet = &a_u_jets[u];
+                let a_v_jet = &a_u_jets[v];
                 let numerator = f_uv_jet
-                    .add(&f_au_u_jet.mul(&a_v_jet))
-                    .add(&f_au_v_jet.mul(&a_u_jet))
-                    .add(&f_aa_jet.mul(&a_u_jet.mul(&a_v_jet)));
-                let val = numerator.mul(&f_a_recip_jet).scale(-1.0).coeff(3);
+                    .sub(&d_u_jets[u].mul(a_v_jet))
+                    .sub(&d_u_jets[v].mul(a_u_jet))
+                    .sub(&f_aa_jet.mul(&a_u_jet.mul(a_v_jet)));
+                let val = numerator.mul(&d_recip_jet).coeff(3);
                 auvd12[[u, v]] = val;
                 auvd12[[v, u]] = val;
             }

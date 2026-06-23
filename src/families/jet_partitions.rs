@@ -65,6 +65,17 @@ impl MultiDirJet {
         }
     }
 
+    pub(crate) fn sub(&self, other: &Self) -> Self {
+        Self {
+            coeffs: self
+                .coeffs
+                .iter()
+                .zip(other.coeffs.iter())
+                .map(|(lhs, rhs)| lhs - rhs)
+                .collect(),
+        }
+    }
+
     pub(crate) fn scale(&self, scalar: f64) -> Self {
         Self {
             coeffs: self.coeffs.iter().map(|value| scalar * value).collect(),
