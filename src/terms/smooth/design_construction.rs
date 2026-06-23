@@ -1678,6 +1678,7 @@ fn with_identifiability_transform(
             periodic,
             group_levels,
             flavour,
+            marginal_is_cr,
         } => {
             // Factor-smooth metadata has no transform slot; the global pass
             // exports its transform via `SmoothTerm::unabsorbed_global_orthogonality`
@@ -1699,6 +1700,7 @@ fn with_identifiability_transform(
                 periodic: *periodic,
                 group_levels: group_levels.clone(),
                 flavour: flavour.clone(),
+                marginal_is_cr: *marginal_is_cr,
             })
         }
         BasisMetadata::Pca {

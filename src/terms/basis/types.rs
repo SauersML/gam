@@ -1488,6 +1488,12 @@ pub enum BasisMetadata {
         periodic: Option<(f64, f64, usize)>,
         group_levels: Vec<u64>,
         flavour: String,
+        /// `true` when the per-level marginal is a cubic regression spline
+        /// (`NaturalCubicRegression` knotspec, mgcv's `bs="sz"` default marginal,
+        /// #1074). Predict-time freeze must then restore a cr knotspec from the
+        /// stored value-knots rather than treating them as a B-spline knot
+        /// vector. Defaults to `false` (B-spline marginal) for backward compat.
+        marginal_is_cr: bool,
     },
 }
 

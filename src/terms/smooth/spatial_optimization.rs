@@ -5020,17 +5020,29 @@ fn freeze_smooth_basis_from_metadata(
                 degree,
                 periodic,
                 group_levels,
+                marginal_is_cr,
                 ..
             },
         ) => {
-            s.marginal.knotspec = periodic
-                .map(
-                    |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
-                        data_range: (domain_start, domain_start + period),
-                        num_basis,
-                    },
-                )
-                .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()));
+            s.marginal.knotspec = if *marginal_is_cr {
+                // A cubic regression spline marginal (mgcv's `bs="sz"` default,
+                // #1074) stores its `k` value-knots, not a B-spline knot vector.
+                // Restore the cr knotspec so the predict-time rebuild replays the
+                // SAME marginal instead of misreading the value-knots as a
+                // B-spline knot vector.
+                BSplineKnotSpec::NaturalCubicRegression {
+                    knots: knots.clone(),
+                }
+            } else {
+                periodic
+                    .map(
+                        |(domain_start, period, num_basis)| BSplineKnotSpec::PeriodicUniform {
+                            data_range: (domain_start, domain_start + period),
+                            num_basis,
+                        },
+                    )
+                    .unwrap_or_else(|| BSplineKnotSpec::Provided(knots.clone()))
+            };
             // Restore the FROZEN marginal degree (#555 predict-replay). With
             // a `Provided(knots)` knotspec the per-margin basis count is
             // `knots.len() - (degree + 1)`, so if fit-time auto-shrink

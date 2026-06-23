@@ -6456,7 +6456,11 @@ fn build_factor_smooth(
         // Re-wrap the marginal geometry as `FactorSmooth` metadata exactly as
         // the Fs/Re path below does, giving all three factor-smooth flavours a
         // single, freeze-consistent metadata shape that also pins the levels.
-        let (knots, degree, periodic) = match &built.metadata {
+        // The delegated marginal may be a B-spline (`bs="ps"`-style) OR a cubic
+        // regression spline (`NaturalCubicRegression`, mgcv's `bs="sz"` default,
+        // #1074); capture either so the predict-time freeze restores the SAME
+        // marginal class.
+        let (knots, degree, periodic, marginal_is_cr) = match &built.metadata {
             BasisMetadata::BSpline1D {
                 knots,
                 periodic,
@@ -6466,7 +6470,11 @@ fn build_factor_smooth(
                 knots.clone(),
                 degree.unwrap_or(spec.marginal.degree),
                 *periodic,
+                false,
             ),
+            BasisMetadata::CubicRegression1D { knots, .. } => {
+                (knots.clone(), spec.marginal.degree, None, true)
+            }
             other => {
                 crate::bail_invalid_basis!(
                     "sz factor smooth term '{}' produced an unexpected marginal metadata variant {:?}",
@@ -6483,6 +6491,7 @@ fn build_factor_smooth(
             periodic,
             group_levels: levels,
             flavour: "sz".to_string(),
+            marginal_is_cr,
         };
         return Ok(built);
     }
@@ -6727,6 +6736,9 @@ fn build_factor_smooth(
         periodic,
         group_levels: levels,
         flavour: flavour_tag,
+        // fs/re marginals are always B-spline; the cr marginal is sz-only and
+        // handled on the dedicated Sz path above.
+        marginal_is_cr: false,
     };
 
     let ops = vec![None; penalties.len()];
