@@ -331,6 +331,7 @@ fn matern_3d_aniso_fits_successfully() {
         min_length_scale: 1e-2,
         max_length_scale: 1e2,
         pilot_subsample_threshold: 0,
+        outer_wall_clock_budget_secs: None,
     };
 
     let fitted: FittedTermCollectionWithSpec =

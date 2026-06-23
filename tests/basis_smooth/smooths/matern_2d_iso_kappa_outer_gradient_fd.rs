@@ -335,6 +335,7 @@ fn aniso_matern_theta0_eta_contrast_gradient_is_fd_visible() {
             min_length_scale: 1e-2,
             max_length_scale: 1e2,
             pilot_subsample_threshold: 0,
+            outer_wall_clock_budget_secs: None,
         },
         wiggle: None,
         coefficient_groups: Vec::new(),

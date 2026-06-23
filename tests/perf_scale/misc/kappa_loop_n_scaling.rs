@@ -162,6 +162,7 @@ fn run_fit(
         min_length_scale: bounds.0,
         max_length_scale: bounds.1,
         pilot_subsample_threshold: 0,
+        outer_wall_clock_budget_secs: None,
     };
 
     let t0 = Instant::now();
@@ -668,6 +669,7 @@ fn run_fit_poisson(n: usize, bounds: (f64, f64)) -> Result<FitTiming, String> {
         min_length_scale: bounds.0,
         max_length_scale: bounds.1,
         pilot_subsample_threshold: 0,
+        outer_wall_clock_budget_secs: None,
     };
 
     let t0 = Instant::now();
