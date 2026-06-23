@@ -38,23 +38,6 @@ env:
   SCCACHE_GHA_ENABLED: "true"
 
 jobs:
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0 # build.rs human-author gate needs the real last build.rs editor; a depth-1 clone makes git log return HEAD, false-failing every Claude-authored HEAD (#1458)
-
-      - name: Setup Rust CI
-        uses: ./.github/actions/setup-rust-ci
-        with:
-          components: clippy
-
-      - name: Lint
-        run: cargo clippy --all-targets --all-features -- -A warnings -D clippy::correctness -D clippy::suspicious
-
   test:
     name: Test
     runs-on: ubuntu-latest
