@@ -312,12 +312,15 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                     }
                 }
                 // Overflow: fall back to the exact plug-in exp(η). If even that
-                // overflows, clamp to the f64-representable boundary.
+                // is not f64-representable the true mean genuinely exceeds the
+                // f64 range, so saturate to the largest finite f64 (a monotone,
+                // non-arbitrary boundary — no magic exponent cutoff) rather than
+                // returning +inf and serializing to null.
                 let plugin = eta.exp();
                 if plugin.is_finite() {
                     Ok(plugin)
                 } else {
-                    Ok(eta.clamp(-700.0, 700.0).exp())
+                    Ok(f64::MAX)
                 }
             }
             (ResponseFamily::Beta { .. }, _) => {
