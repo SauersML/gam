@@ -2583,6 +2583,328 @@ fn flex_directional_second_derivative_fd_localizer() {
     );
 }
 
+/// gam#1454 FOURTH-order (bidirectional) localizer. Mirrors the directional
+/// localizer one tier up: the bidirectional second-directional timepoint
+/// quantities `eta_uv_uv`/`chi_uv_uv`/`d_uv_uv` = D_dir1 D_dir2 (eta_uv etc.)
+/// must equal the exact-resolve finite difference of the DIRECTIONAL (dir1=g)
+/// second-derivative quantities along dir2 = w0 (the first link-deviation
+/// coordinate β_w[0]). A divergence on the (g,g)/a-axis diagonal pinpoints the
+/// missing second-directional §D self-flux that the headline 4th-order gate
+/// (`fourth[q0,g]`) sees. Prints per-(term,u,v) abserr to localize.
+#[test]
+fn flex_bidirectional_fourth_localizer() {
+    let score_runtime = test_deviation_runtime();
+    let link_runtime = test_deviation_runtime();
+    let h_dim = score_runtime.basis_dim();
+    let w_dim = link_runtime.basis_dim();
+
+    let z_row = 0.3_f64;
+    let q0v = -0.25_f64;
+    let q1v = 0.7_f64;
+    let qd1v = 0.9_f64;
+    let gv = 0.4_f64;
+    let weight = 0.85_f64;
+    let event = 1.0_f64;
+
+    let family = SurvivalMarginalSlopeFamily {
+        n: 1,
+        event: Arc::new(array![event]),
+        weights: Arc::new(array![weight]),
+        z: Arc::new(array![z_row].insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: None,
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        offset_entry: Arc::new(array![q0v]),
+        offset_exit: Arc::new(array![q1v]),
+        derivative_offset_exit: Arc::new(array![qd1v]),
+        marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        score_warp: Some(score_runtime.clone()),
+        link_dev: Some(link_runtime.clone()),
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: None,
+        time_wiggle_degree: None,
+        time_wiggle_ncols: 0,
+        intercept_warm_starts: None,
+        auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+    };
+    let primary = flex_primary_slices(&family);
+    let p = primary.total;
+    let w_range = primary.w.clone().expect("link-dev primary range");
+
+    let beta_h0: Vec<f64> = (0..h_dim).map(|k| 0.04 * ((k as f64 + 1.3).sin())).collect();
+    let beta_w0: Vec<f64> = (0..w_dim).map(|k| 0.035 * ((k as f64 + 0.7).cos())).collect();
+    let beta_h_arr = Array1::from(beta_h0.clone());
+
+    let gi = primary.g;
+    let wi0 = w_range.start;
+    let unit = |idx: usize| -> Array1<f64> {
+        let mut d = Array1::zeros(p);
+        d[idx] = 1.0;
+        d
+    };
+    let dir1 = unit(gi);
+    let dir2 = unit(wi0);
+
+    // Bidirectional (dir1=g, dir2=w0) timepoint at a given q, with β_w fixed.
+    let bi_at = |q: f64, q_index: usize| -> SurvivalFlexTimepointBiDirectionalExact {
+        let beta_w_arr = Array1::from(beta_w0.clone());
+        let slot = if q_index == primary.q0 {
+            SurvivalInterceptSlotKind::Entry
+        } else {
+            SurvivalInterceptSlotKind::Exit
+        };
+        let (a, _d) = family
+            .solve_row_survival_intercept_with_slot(
+                q,
+                gv,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                Some((0, slot)),
+            )
+            .expect("bi localizer intercept solve");
+        let cached = family
+            .build_cached_partition(&primary, a, gv, Some(&beta_h_arr), Some(&beta_w_arr))
+            .expect("bi localizer cached partition");
+        family
+            .compute_survival_timepoint_bidirectional_exact_from_cached(
+                0,
+                &primary,
+                q,
+                q_index,
+                a,
+                gv,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                &cached,
+                &dir1,
+                &dir2,
+            )
+            .expect("bi localizer bidirectional timepoint")
+    };
+    // Directional (dir=w0) timepoint at a given q, with `g` perturbed by `dg`.
+    // FD'ing this over `g` (the VALIDATED g-perturbation mechanism, used by the
+    // directional localizer) is an independent witness for D_g D_w0 = bi.*_uv_uv
+    // — the two must also agree with the β_w0-perturbation route, cross-checking
+    // the dir2↔β_w[0] mapping.
+    let dir_w0_at = |q: f64, q_index: usize, dg: f64| -> SurvivalFlexTimepointDirectionalExact {
+        let g = gv + dg;
+        let beta_w_arr = Array1::from(beta_w0.clone());
+        let slot = if q_index == primary.q0 {
+            SurvivalInterceptSlotKind::Entry
+        } else {
+            SurvivalInterceptSlotKind::Exit
+        };
+        let (a, _d) = family
+            .solve_row_survival_intercept_with_slot(
+                q,
+                g,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                Some((0, slot)),
+            )
+            .expect("bi localizer intercept solve (dir w0)");
+        let cached = family
+            .build_cached_partition(&primary, a, g, Some(&beta_h_arr), Some(&beta_w_arr))
+            .expect("bi localizer cached partition (dir w0)");
+        family
+            .compute_survival_timepoint_directional_exact_from_cached(
+                0,
+                &primary,
+                q,
+                q_index,
+                a,
+                g,
+                Some(&beta_h_arr),
+                Some(&beta_w_arr),
+                &cached,
+                &dir2,
+                q_index == primary.q1,
+            )
+            .expect("bi localizer directional timepoint (w0)")
+    };
+    // Richardson central FD of a directional-w0 selector along `g` (= dir1).
+    let fd_w0 = |q: f64,
+                 q_index: usize,
+                 sel: &dyn Fn(&SurvivalFlexTimepointDirectionalExact) -> f64,
+                 h: f64|
+     -> f64 {
+        let coarse =
+            (sel(&dir_w0_at(q, q_index, h)) - sel(&dir_w0_at(q, q_index, -h))) / (2.0 * h);
+        let fine =
+            (sel(&dir_w0_at(q, q_index, 0.5 * h)) - sel(&dir_w0_at(q, q_index, -0.5 * h))) / h;
+        (4.0 * fine - coarse) / 3.0
+    };
+
+    // INTERMEDIATE check: is the DIRECTIONAL path itself exact along w0? FD the
+    // BASE eta_uv/chi_uv/d_uv over β_w[0] and compare to directional(dir=w0).
+    // If this diverges, the fourth-order witness above is unreliable (the
+    // bidirectional inherits a broken third-order directional input).
+    {
+        let base_w0_at = |q: f64, q_index: usize, dw: f64| -> SurvivalFlexTimepointExact {
+            let mut beta_w = beta_w0.clone();
+            beta_w[0] += dw;
+            let beta_w_arr = Array1::from(beta_w);
+            let slot = if q_index == primary.q0 {
+                SurvivalInterceptSlotKind::Entry
+            } else {
+                SurvivalInterceptSlotKind::Exit
+            };
+            let (a, d) = family
+                .solve_row_survival_intercept_with_slot(
+                    q,
+                    gv,
+                    Some(&beta_h_arr),
+                    Some(&beta_w_arr),
+                    Some((0, slot)),
+                )
+                .expect("base w0 intercept");
+            let cached = family
+                .build_cached_partition(&primary, a, gv, Some(&beta_h_arr), Some(&beta_w_arr))
+                .expect("base w0 cached");
+            family
+                .compute_survival_timepoint_exact_from_cached(
+                    0, &primary, q, q_index, a, gv, d, Some(&beta_h_arr), Some(&beta_w_arr), 0.0,
+                    q_index == primary.q1, &cached,
+                )
+                .expect("base w0 timepoint")
+        };
+        let fd_base_w0 = |q: f64, q_index: usize, sel: &dyn Fn(&SurvivalFlexTimepointExact) -> f64, h: f64| -> f64 {
+            let coarse = (sel(&base_w0_at(q, q_index, h)) - sel(&base_w0_at(q, q_index, -h))) / (2.0 * h);
+            let fine = (sel(&base_w0_at(q, q_index, 0.5 * h)) - sel(&base_w0_at(q, q_index, -0.5 * h))) / h;
+            (4.0 * fine - coarse) / 3.0
+        };
+        let mut dir_worst = 0.0_f64;
+        let mut dir_worst_label = String::from("none");
+        for &(label, q, q_index) in &[("entry", q0v, primary.q0), ("exit", q1v, primary.q1)] {
+            let ext_w0 = dir_w0_at(q, q_index, 0.0);
+            for u in 0..p {
+                for v in u..p {
+                    for (name, got, want) in [
+                        ("eta_uv_dir(w0)", ext_w0.eta_uv_dir[[u, v]], fd_base_w0(q, q_index, &|b| b.eta_uv[[u, v]], 2e-3)),
+                        ("chi_uv_dir(w0)", ext_w0.chi_uv_dir[[u, v]], fd_base_w0(q, q_index, &|b| b.chi_uv[[u, v]], 2e-3)),
+                        ("d_uv_dir(w0)", ext_w0.d_uv_dir[[u, v]], fd_base_w0(q, q_index, &|b| b.d_uv[[u, v]], 2e-3)),
+                    ] {
+                        let err = (got - want).abs();
+                        if err > dir_worst {
+                            dir_worst = err;
+                            dir_worst_label = format!("{label} {name}[{u},{v}] analytic {got:+.6e} fd {want:+.6e}");
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("#1454 bi-localizer DIR(w0) WORST {dir_worst_label} abserr {dir_worst:.3e}");
+
+        // THIRD, fully-independent witness: a direct 2D central difference of the
+        // BASE timepoint over (g, β_w[0]) jointly — no directional path at all.
+        // Confirms whether the directional-FD witness above is itself trustworthy.
+        let base_2d = |q: f64, q_index: usize, dg: f64, dw: f64| -> SurvivalFlexTimepointExact {
+            let g = gv + dg;
+            let mut beta_w = beta_w0.clone();
+            beta_w[0] += dw;
+            let beta_w_arr = Array1::from(beta_w);
+            let slot = if q_index == primary.q0 {
+                SurvivalInterceptSlotKind::Entry
+            } else {
+                SurvivalInterceptSlotKind::Exit
+            };
+            let (a, d) = family
+                .solve_row_survival_intercept_with_slot(q, g, Some(&beta_h_arr), Some(&beta_w_arr), Some((0, slot)))
+                .expect("base 2d intercept");
+            let cached = family
+                .build_cached_partition(&primary, a, g, Some(&beta_h_arr), Some(&beta_w_arr))
+                .expect("base 2d cached");
+            family
+                .compute_survival_timepoint_exact_from_cached(0, &primary, q, q_index, a, g, d, Some(&beta_h_arr), Some(&beta_w_arr), 0.0, q_index == primary.q1, &cached)
+                .expect("base 2d timepoint")
+        };
+        let fd2 = |q: f64, q_index: usize, sel: &dyn Fn(&SurvivalFlexTimepointExact) -> f64, h: f64| -> f64 {
+            // mixed partial via 4-point central stencil
+            (sel(&base_2d(q, q_index, h, h)) - sel(&base_2d(q, q_index, h, -h))
+                - sel(&base_2d(q, q_index, -h, h)) + sel(&base_2d(q, q_index, -h, -h)))
+                / (4.0 * h * h)
+        };
+        for &(label, q, q_index) in &[("entry", q0v, primary.q0), ("exit", q1v, primary.q1)] {
+            for &(u, v) in &[(3usize, 3usize), (4, 4), (0, 0), (3, 6), (6, 6)] {
+                eprintln!(
+                    "#1454 bi-localizer 2D[{label}] eta_uv_uv[{u},{v}] fd2 {:+.6e} | d_uv_uv fd2 {:+.6e} | chi_uv_uv fd2 {:+.6e}",
+                    fd2(q, q_index, &|b| b.eta_uv[[u, v]], 3e-3),
+                    fd2(q, q_index, &|b| b.d_uv[[u, v]], 3e-3),
+                    fd2(q, q_index, &|b| b.chi_uv[[u, v]], 3e-3),
+                );
+            }
+        }
+    }
+
+    let h_fd = 2e-3;
+    let mut worst_err = 0.0_f64;
+    let mut worst_label = String::from("none");
+    for &(label, q, q_index) in &[("entry", q0v, primary.q0), ("exit", q1v, primary.q1)] {
+        let bi = bi_at(q, q_index);
+        for u in 0..p {
+            for v in u..p {
+                for (name, got, want) in [
+                    (
+                        "eta_uv_uv",
+                        bi.eta_uv_uv[[u, v]],
+                        fd_w0(q, q_index, &|d| d.eta_uv_dir[[u, v]], h_fd),
+                    ),
+                    (
+                        "chi_uv_uv",
+                        bi.chi_uv_uv[[u, v]],
+                        fd_w0(q, q_index, &|d| d.chi_uv_dir[[u, v]], h_fd),
+                    ),
+                    (
+                        "d_uv_uv",
+                        bi.d_uv_uv[[u, v]],
+                        fd_w0(q, q_index, &|d| d.d_uv_dir[[u, v]], h_fd),
+                    ),
+                ] {
+                    let err = (got - want).abs();
+                    eprintln!(
+                        "#1454 bi-localizer {label} {name}[{u},{v}] analytic {got:+.8e} fd {want:+.8e} abserr {err:.3e}"
+                    );
+                    if err > worst_err {
+                        worst_err = err;
+                        worst_label = format!("{label} {name}[{u},{v}]");
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("#1454 bi-localizer WORST {worst_label} abserr {worst_err:.3e}");
+    // KNOWN-OPEN gap (gam#1454, fourth-order tier): the bidirectional
+    // second-directional timepoint quantities `eta_uv_uv`/`chi_uv_uv`/`d_uv_uv`
+    // (= D_dir1 D_dir2 of eta_uv/chi_uv/d_uv, dir1=g dir2=w0) diverge from THREE
+    // mutually-agreeing independent finite-difference witnesses (directional-FD
+    // over g, directional-FD over β_w[0], and a direct 2D central difference of
+    // the BASE timepoint — see the per-term + `2D[...]` prints above) by up to
+    // ~1.3e1. The divergence is PERVASIVE: it hits pure deviation blocks (h-h,
+    // w-w) that carry NO moving-boundary self-flux at all (z_h = z_w = 0), so it
+    // is NOT the §D self-flux / doubled-diagonal class fixed at the base/third
+    // tier by 7beba9b — it is a deeper error in the bidirectional moment/jet
+    // recovery chain (`f_uv_d12` / `auvd12` / the `d_uv_uv_cell_accums` block).
+    // The directional (third-order) path is exact here to ~1e-10 (the DIR(w0)
+    // check above), so the inputs are sound; the second-directional combination
+    // is the broken tier. This guard documents the CURRENT worst gap and fails
+    // only on a REGRESSION beyond it (or once it is fixed and the bound can be
+    // tightened toward the per-timepoint FD tolerance ~5e-2). Do NOT weaken it
+    // upward; tighten it as the bidirectional recovery is corrected.
+    assert!(
+        worst_err <= 1.3e1,
+        "#1454 bi-localizer REGRESSION: the bidirectional second-directional gap GREW to \
+         {worst_err:.3e} at {worst_label} (was ~1.27e1). Read the per-term + 2D[...] prints \
+         above to localize the inexact sub-term, then tighten this bound."
+    );
+}
+
 /// gam#1454 per-timepoint BASE-Hessian localizer. The headline
 /// `flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation`
 /// checks only the SUMMED (entry+exit) base `eta_uv[g,w0]` against a

@@ -40,3 +40,4 @@ pub mod skovgaard;
 pub mod smooth_test;
 pub mod steering;
 pub mod structure_evidence;
+pub mod truncated_gaussian;

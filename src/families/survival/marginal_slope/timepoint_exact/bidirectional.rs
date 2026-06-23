@@ -131,10 +131,63 @@ impl SurvivalMarginalSlopeFamily {
             if b != 0.0 {
                 for entry in &cached.cells {
                     let fx = &entry.fixed;
+                    let part = &entry.partition_cell;
+                    let cell = part.cell;
                     let da = fx.dc_da.map(|value| -value);
-                    f_aa += super::first_full::moving_density_boundary_flux_a(entry, &da, b);
+                    // §D self-flux density factor for the calibration F integrand
+                    // `G = Φ(−η)·φ(z)` (NOT the bare weight), G_z = −η_z·exp(−q)/2π
+                    // − z·Φ(−η)·φ(z). Nonzero only when both crossing velocities
+                    // are nonzero (the (g,g)/a-axis diagonals). Mirrors the base
+                    // first_full/directional fix (gam#1454).
+                    let f_int_z = |z: f64| -> f64 {
+                        let eta = cell.eta(z);
+                        let eta_z = cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
+                        let exp_q = (-cell.q(z)).exp() / std::f64::consts::TAU;
+                        let phi_z = crate::probability::normal_pdf(z);
+                        -eta_z * exp_q - z * crate::probability::normal_cdf(-eta) * phi_z
+                    };
+                    let crossing_vel = |axis: usize,
+                                        edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                        z: f64|
+                     -> f64 {
+                        match edge {
+                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                let direct_g = if axis == primary.g { z } else { 0.0 };
+                                -direct_g / b
+                            }
+                            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                        }
+                    };
+                    let a_vel = |edge: crate::families::cubic_cell_kernel::PartitionEdge| -> f64 {
+                        match edge {
+                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                -1.0 / b
+                            }
+                            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                        }
+                    };
+                    let self_flux = |zx_r: f64, zy_r: f64, zx_l: f64, zy_l: f64| -> f64 {
+                        let right = if zx_r != 0.0 && zy_r != 0.0 {
+                            zx_r * zy_r * f_int_z(cell.right)
+                        } else {
+                            0.0
+                        };
+                        let left = if zx_l != 0.0 && zy_l != 0.0 {
+                            zx_l * zy_l * f_int_z(cell.left)
+                        } else {
+                            0.0
+                        };
+                        right - left
+                    };
+                    let za_r = a_vel(part.right_edge);
+                    let za_l = a_vel(part.left_edge);
+                    // f_aa diagonal: DOUBLED a-axis flux + (a,a) self-flux.
+                    f_aa += 2.0 * super::first_full::moving_density_boundary_flux_a(entry, &da, b)
+                        + self_flux(za_r, za_r, za_l, za_l);
                     for u in 0..p {
                         let cu = fx.coeff_u[u].map(|value| -value);
+                        let zu_r = crossing_vel(u, part.right_edge, cell.right);
+                        let zu_l = crossing_vel(u, part.left_edge, cell.left);
                         f_au[u] += super::first_full::moving_density_boundary_flux_a(entry, &cu, b)
                             + super::first_full::moving_density_boundary_flux(
                                 u,
@@ -144,12 +197,17 @@ impl SurvivalMarginalSlopeFamily {
                                 &da,
                                 b,
                                 super::first_full::FluxVelocity::PartialIft,
-                            );
+                            )
+                            + self_flux(za_r, zu_r, za_l, zu_l);
                     }
                     for u in 0..p {
                         let cu = fx.coeff_u[u].map(|value| -value);
+                        let zu_r = crossing_vel(u, part.right_edge, cell.right);
+                        let zu_l = crossing_vel(u, part.left_edge, cell.left);
                         for v in u..p {
                             let cv = fx.coeff_u[v].map(|value| -value);
+                            // Asymmetric flux pair DOUBLED on the diagonal (matching
+                            // the base fix); off-diagonal second term is 0 unless v==g.
                             let mut boundary = super::first_full::moving_density_boundary_flux(
                                 v,
                                 primary,
@@ -158,18 +216,18 @@ impl SurvivalMarginalSlopeFamily {
                                 &cu,
                                 b,
                                 super::first_full::FluxVelocity::PartialIft,
+                            ) + super::first_full::moving_density_boundary_flux(
+                                u,
+                                primary,
+                                &au,
+                                entry,
+                                &cv,
+                                b,
+                                super::first_full::FluxVelocity::PartialIft,
                             );
-                            if u != v {
-                                boundary += super::first_full::moving_density_boundary_flux(
-                                    u,
-                                    primary,
-                                    &au,
-                                    entry,
-                                    &cv,
-                                    b,
-                                    super::first_full::FluxVelocity::PartialIft,
-                                );
-                            }
+                            let zv_r = crossing_vel(v, part.right_edge, cell.right);
+                            let zv_l = crossing_vel(v, part.left_edge, cell.left);
+                            boundary += self_flux(zu_r, zv_r, zu_l, zv_l);
                             f_uv[[u, v]] += boundary;
                             if u != v {
                                 f_uv[[v, u]] += boundary;

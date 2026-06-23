@@ -866,23 +866,21 @@ fn profiled_reml_with_intercept(b: &Array2<f64>, y: &Array1<f64>, s: &Array2<f64
 /// [`build_constant_curvature_basis`] (raw RKHS Gram, scale = 1, intercept
 /// appended unpenalized), so the criterion the scan minimizes is the production
 /// design's own profiled REML.
-pub fn constant_curvature_kappa_fair_sign_score(
+/// Build the realized constant-curvature profile design `B = K_κ(data,
+/// centers)·z` and penalty `S = symm(zᵀK_κ(centers,centers)z)` at the fixed κ in
+/// `spec`, EXACTLY as [`build_constant_curvature_basis`] does (same centers, same
+/// κ-invariant effective lengths `L(κ)`/`L_S(κ)`, same center-sum-to-zero `z`,
+/// raw RKHS Gram penalty). Shared by the honest profiled-REML κ-profile score and
+/// the κ-fair sign score so both probe the production design's own criterion.
+fn constant_curvature_profile_design_penalty(
     data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
     spec: &ConstantCurvatureBasisSpec,
-) -> Result<f64, BasisError> {
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     if data.ncols() == 0 {
-        crate::bail_invalid_basis!("constant-curvature κ-fair score needs at least one feature column");
+        crate::bail_invalid_basis!("constant-curvature profile score needs at least one feature column");
     }
     if !spec.kappa.is_finite() {
-        crate::bail_invalid_basis!("constant-curvature κ-fair score needs a finite kappa");
-    }
-    if y.len() != data.nrows() {
-        crate::bail_dim_basis!(
-            "constant-curvature κ-fair score: y has {} rows but data has {}",
-            y.len(),
-            data.nrows()
-        );
+        crate::bail_invalid_basis!("constant-curvature profile score needs a finite kappa");
     }
     validate_chart_points(data, spec.kappa, "data")?;
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
@@ -911,28 +909,119 @@ pub fn constant_curvature_kappa_fair_sign_score(
     let raw_penalty =
         constant_curvature_kernel_matrix(centers.view(), centers.view(), spec.kappa, ell_eff_penalty)?;
     let s = symmetrize(&gauge.restrict_penalty(&raw_penalty));
+    Ok((b, s))
+}
+
+/// #1464: the **honest** fixed-κ profiled-REML score `V_p(κ)` for a
+/// constant-curvature smooth — the textbook Gaussian profiled-REML
+/// negative-log-evidence of the realized design `B = K_κ(data,centers)·z` against
+/// `y`, with the unpenalized intercept appended and the raw RKHS Gram penalty `S`
+/// profiled over λ (`profiled_reml_with_intercept`). This is the criterion whose
+/// argmin over the chart-bounded κ window IDENTIFIES the curvature, and the one
+/// `curvature_inference_forspec` walks for the magnitude CI and the κ = 0 flatness
+/// LR test.
+///
+/// Why this, not the production full-fit `reml_score`: the production REML's
+/// λ-selection heavily SMOOTHS this RKHS kernel (deviance ≫ near-interpolation
+/// RSS), and under heavy smoothing the +κ chart's geodesic-distance COMPRESSION
+/// makes the collapsed kernel fit the over-smoothed target better for ANY data —
+/// so the production `reml_score` is monotone toward the +chart bound regardless
+/// of the true sign (the headline #1464 sign-blindness, and an over-smoothing of
+/// the curvature criterion specifically). The honest profiled REML keeps the
+/// curvature-shape signal in the data fit (the κ that matches the geodesic
+/// geometry minimizes RSS), so its argmin lands on the correct sign, and because
+/// it is a proper profiled-REML deviance the LR/CI thresholds stay χ²-calibrated.
+/// On genuinely flat (constant-mean) data the criterion is ~flat in κ (the
+/// intercept absorbs the mean at every κ), giving the flatness test correct size.
+pub fn constant_curvature_honest_profiled_reml_score(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    spec: &ConstantCurvatureBasisSpec,
+) -> Result<f64, BasisError> {
+    if y.len() != data.nrows() {
+        crate::bail_dim_basis!(
+            "constant-curvature profiled-REML score: y has {} rows but data has {}",
+            y.len(),
+            data.nrows()
+        );
+    }
+    let (b, s) = constant_curvature_profile_design_penalty(data, spec)?;
+    let v = profiled_reml_with_intercept(&b, &y.to_owned(), &s);
+    if !v.is_finite() {
+        crate::bail_invalid_basis!(
+            "constant-curvature honest profiled-REML score at κ={} is non-finite",
+            spec.kappa
+        );
+    }
+    Ok(v)
+}
+
+pub fn constant_curvature_kappa_fair_sign_score(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    spec: &ConstantCurvatureBasisSpec,
+) -> Result<f64, BasisError> {
+    if y.len() != data.nrows() {
+        crate::bail_dim_basis!(
+            "constant-curvature κ-fair score: y has {} rows but data has {}",
+            y.len(),
+            data.nrows()
+        );
+    }
+    let (b, s) = constant_curvature_profile_design_penalty(data, spec)?;
 
     let v_y = profiled_reml_with_intercept(&b, &y.to_owned(), &s);
 
-    // κ-independent generic radial reference bank r_α(i) = exp(−α·‖x_i‖) in the
-    // Euclidean chart coordinate. Several widths, averaged, so the cancellation of
-    // the generic +κ peak-fitting advantage does not hinge on one tuned width.
-    const REFERENCE_ALPHAS: [f64; 4] = [0.5, 1.0, 2.0, 4.0];
-    let radii: Array1<f64> = data
-        .outer_iter()
-        .map(|row| row.dot(&row).sqrt())
-        .collect();
-    let mut v_ref_sum = 0.0_f64;
-    for &alpha in &REFERENCE_ALPHAS {
-        let r_alpha: Array1<f64> = radii.mapv(|rr| (-alpha * rr).exp());
-        v_ref_sum += profiled_reml_with_intercept(&b, &r_alpha, &s);
+    // CURVATURE-NEUTRAL, ENERGY-MATCHED reference: a COARSE radial profile of the
+    // data. The +κ chart compresses geodesic distances so the geodesic-
+    // exponential kernel is a uniformly better interpolator of any radial signal
+    // regardless of the true curvature sign; this generic interpolation advantage
+    // lifts `V_p(κ)` monotonically toward +κ and must be cancelled so only the
+    // genuine curvature-shape signal drives the sign. The reference that cancels
+    // it is one carrying the same gross radial energy as the data but no fine
+    // κ-geometry: `y_ref(i)` = mean of `y` over a SMALL number of Euclidean-radius
+    // bins. The bin count is deliberately coarse: enough bins to track the data's
+    // radial trend (so the +κ tilt cancels and a genuinely FLAT truth scores
+    // ~symmetrically in κ — its response is already a function of `‖x‖` alone, so
+    // `y_ref ≈ y` and the criterion refuses to prefer a sign), but few enough that
+    // the profile CANNOT reproduce the data-generating `d_κ⋆` curvature shape — so
+    // for a curved truth the residual `V_p(κ;y) − V_p(κ;y_ref)` still wells toward
+    // the data-generating sign. A fine profile would absorb the curvature signal
+    // (the radial truth is nearly a function of `‖x‖`); a fixed exp(−α‖x‖) bank
+    // does not match the data's radial energy and leaves a strong residual −κ tilt.
+    // The coarse matched profile shrinks that tilt to a small noise-overfit
+    // residual (the geodesic kernel overfits noise slightly more in the hyperbolic
+    // chart), so on a CURVED truth the genuine signal dominates and the argmin sign
+    // is correct. A residual flat-data tilt remains, so this term alone does NOT
+    // fully separate flat (κ ≈ 0) from hyperbolic (κ < 0); the caller adopts the
+    // argmin only for the negative (hyperbolic) sign and leaves the spherical and
+    // (residual-tilt) flat cases to the joint solver / κ ≈ 0 path.
+    let radii: Array1<f64> = data.outer_iter().map(|row| row.dot(&row).sqrt()).collect();
+    const N_RADIAL_BINS: usize = 10;
+    let r_max = radii.iter().cloned().fold(0.0_f64, f64::max).max(1e-12);
+    let bin_of = |r: f64| -> usize {
+        (((r / r_max) * N_RADIAL_BINS as f64) as usize).min(N_RADIAL_BINS - 1)
+    };
+    let mut bin_sum = [0.0_f64; N_RADIAL_BINS];
+    let mut bin_cnt = [0.0_f64; N_RADIAL_BINS];
+    for (i, &r) in radii.iter().enumerate() {
+        let b_idx = bin_of(r);
+        bin_sum[b_idx] += y[i];
+        bin_cnt[b_idx] += 1.0;
     }
-    let v_ref_mean = v_ref_sum / REFERENCE_ALPHAS.len() as f64;
+    let bin_mean: Vec<f64> = bin_sum
+        .iter()
+        .zip(bin_cnt.iter())
+        .map(|(&s, &c)| if c > 0.0 { s / c } else { 0.0 })
+        .collect();
+    let y_ref: Array1<f64> = radii.mapv(|r| bin_mean[bin_of(r)]);
 
-    let v_fair = v_y - v_ref_mean;
+    let v_ref = profiled_reml_with_intercept(&b, &y_ref, &s);
+
+    let v_fair = v_y - v_ref;
     if !v_fair.is_finite() {
         crate::bail_invalid_basis!(
-            "constant-curvature κ-fair score at κ={} is non-finite (V_y={v_y}, V_ref={v_ref_mean})",
+            "constant-curvature κ-fair score at κ={} is non-finite (V_y={v_y}, V_ref={v_ref})",
             spec.kappa
         );
     }

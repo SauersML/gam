@@ -241,11 +241,49 @@ impl GpuRuntime {
     }
 }
 
+/// Make the CUDA **runtime** API usable on `ordinal`.
+///
+/// gam drives the GPU through the CUDA *driver* API (cudarc [`CudaContext`]),
+/// which materialises the driver primary context but never selects a device for
+/// the CUDA *runtime* API. cuBLAS / cuSOLVER are runtime-based, so `cublasCreate`
+/// / `cusolverDnCreate` return `CUBLAS_STATUS_NOT_INITIALIZED` /
+/// `CUSOLVER_STATUS_NOT_INITIALIZED` until the runtime has a current device —
+/// which silently disables *every* GPU linear-algebra path (the dispatch sites
+/// map the handle error to `Unavailable` and fall back to CPU). We select the
+/// device on the calling host thread (cheap, idempotent) and force one-time
+/// runtime primary-context materialisation per device via the canonical
+/// `cudaMalloc`/`cudaFree` idiom, so every downstream handle creation succeeds.
+#[cfg(target_os = "linux")]
+fn ensure_cuda_runtime_device(ordinal: usize) {
+    let Ok(o) = i32::try_from(ordinal) else {
+        return;
+    };
+    // SAFETY: the `runtime` cudarc feature is enabled; cudaSetDevice on a valid
+    // ordinal is idempotent and per-host-thread.
+    let set_rc = unsafe { cudarc::runtime::sys::cudaSetDevice(o) };
+    log::trace!("[GPU] runtime cudaSetDevice({o}) -> {set_rc:?}");
+    // Materialise the runtime primary context on EVERY call (not once): the driver
+    // probe binds cudarc's own context, and cuBLAS/cuSOLVER `*Create` use whatever
+    // context is current at creation time, so the runtime device must be reselected
+    // and its primary context re-materialised immediately before each handle is made.
+    // A 256-byte allocate-then-free is the canonical, ~microsecond way to force it.
+    let mut p: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: forces runtime primary-context creation on the current device.
+    let malloc_rc = unsafe { cudarc::runtime::sys::cudaMalloc(&mut p as *mut _ as *mut _, 256) };
+    log::trace!("[GPU] runtime cudaMalloc -> {malloc_rc:?}");
+    if !p.is_null() {
+        // SAFETY: `p` is the live device allocation returned just above.
+        let free_rc = unsafe { cudarc::runtime::sys::cudaFree(p) };
+        log::trace!("[GPU] runtime cudaFree -> {free_rc:?}");
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     static CONTEXTS: OnceLock<Mutex<HashMap<usize, Arc<CudaContext>>>> = OnceLock::new();
     let contexts = CONTEXTS.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(ctx) = contexts.lock().ok()?.get(&ordinal).cloned() {
+        ensure_cuda_runtime_device(ordinal);
         return Some(ctx);
     }
     // cudarc 0.19 panics from `panic_no_lib_found` if its loader fails to
@@ -254,8 +292,12 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     let ctx = catch_unwind(AssertUnwindSafe(|| CudaContext::new(ordinal)))
         .ok()?
         .ok()?;
-    let mut guard = contexts.lock().ok()?;
-    Some(guard.entry(ordinal).or_insert_with(|| ctx.clone()).clone())
+    let out = {
+        let mut guard = contexts.lock().ok()?;
+        guard.entry(ordinal).or_insert_with(|| ctx.clone()).clone()
+    };
+    ensure_cuda_runtime_device(ordinal);
+    Some(out)
 }
 
 #[cfg(target_os = "linux")]

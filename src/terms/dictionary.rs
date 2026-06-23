@@ -117,8 +117,9 @@ pub fn fit_linear_dictionary(
         };
 
         fitted = assignments.dot(&atoms);
+        let mut any_reseeded = false;
         for atom_idx in 0..config.n_atoms {
-            fit_one_atom_penalized_ls(
+            any_reseeded |= fit_one_atom_penalized_ls(
                 x,
                 &mut atoms,
                 &mut assignments,
@@ -132,7 +133,10 @@ pub fn fit_linear_dictionary(
 
         completed_iterations = iter + 1;
         let ev = explained_variance(x, fitted.view());
-        if (ev - previous_ev).abs() <= config.tolerance.max(0.0) {
+        // #1500: never declare convergence on an iteration that re-seeded a dead
+        // atom — its revived direction carries no code yet, so EV is momentarily
+        // flat; one more sweep lets the assignment step route rows to it.
+        if !any_reseeded && (ev - previous_ev).abs() <= config.tolerance.max(0.0) {
             converged = true;
             break;
         }
@@ -259,14 +263,52 @@ fn fit_one_atom_penalized_ls(
     reml_scores: &mut Array1<f64>,
     atom_idx: usize,
     atom_ridge: f64,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let code = assignments.column(atom_idx).to_owned();
     let code_norm2 = code.dot(&code);
     if code_norm2 <= MIN_NORM2 {
-        atoms.row_mut(atom_idx).fill(0.0);
-        lambdas[atom_idx] = INACTIVE_LAMBDA;
-        reml_scores[atom_idx] = 0.0;
-        return Ok(());
+        // #1500: this atom's cluster is EMPTY (no rows routed to it by the
+        // assignment step). Zeroing it here made the atom permanently DEAD — a
+        // zero atom has zero similarity to every row, so `top_k_assignments`
+        // never routes anything back to it, the dictionary collapses to < K live
+        // atoms, and it under-explains variance even when the data is exactly K
+        // rank-1 atoms a K-atom dictionary could reconstruct perfectly. Instead
+        // RE-SEED the atom into the worst-currently-reconstructed direction (the
+        // standard k-means empty-cluster cure): point it at the largest-residual
+        // row's UNEXPLAINED component so the next assignment sweep can route that
+        // row's cluster to it and revive it. Returns `true` so the outer loop
+        // suppresses convergence this iteration (the revived atom has no code
+        // yet, so EV is momentarily flat — converging now would strand it).
+        let mut worst_row = 0usize;
+        let mut worst_res2 = -1.0_f64;
+        for row in 0..x.nrows() {
+            let mut res2 = 0.0_f64;
+            for col in 0..x.ncols() {
+                let d = x[[row, col]] - fitted[[row, col]];
+                res2 += d * d;
+            }
+            if res2 > worst_res2 {
+                worst_res2 = res2;
+                worst_row = row;
+            }
+        }
+        if worst_res2 <= MIN_NORM2 {
+            // Every row is already fully reconstructed by the other atoms: there
+            // is no unexplained direction to seed, so this atom is genuinely
+            // redundant capacity. Leave it inactive (this is not the bug).
+            atoms.row_mut(atom_idx).fill(0.0);
+            lambdas[atom_idx] = INACTIVE_LAMBDA;
+            reml_scores[atom_idx] = 0.0;
+            return Ok(false);
+        }
+        for col in 0..x.ncols() {
+            atoms[[atom_idx, col]] = x[[worst_row, col]] - fitted[[worst_row, col]];
+        }
+        normalize_row(atoms.slice_mut(s![atom_idx, ..]));
+        lambdas[atom_idx] = atom_ridge;
+        reml_scores[atom_idx] =
+            penalized_reconstruction_loss(x, fitted.view(), atom_ridge, atoms.view());
+        return Ok(true);
     }
 
     let old_atom = atoms.row(atom_idx).to_owned();
@@ -291,7 +333,7 @@ fn fit_one_atom_penalized_ls(
         .dot(&atoms.row(atom_idx).insert_axis(Axis(0)));
     reml_scores[atom_idx] =
         penalized_reconstruction_loss(x, fitted.view(), atom_ridge, atoms.view());
-    Ok(())
+    Ok(false)
 }
 
 fn top_k_assignments(
@@ -594,6 +636,60 @@ mod tests {
 
         assert!(fit.explained_variance > 0.99);
         assert_abs_diff_eq!(fit.explained_variance, oracle_ev, epsilon = 2.0e-4);
+    }
+
+    #[test]
+    fn orthonormal_rank_one_atoms_all_revived_no_dead_collapse_1500() {
+        // #1500: rows lie on K mutually ORTHONORMAL rank-1 directions, so a
+        // K-atom top_k=1 dictionary that recovers them reconstructs every row
+        // exactly (EV → 1). The dead-atom bug emptied a cluster, zeroed that atom
+        // permanently, and returned < K live atoms with badly under-explained
+        // variance. With empty-cluster re-seeding every atom stays live.
+        let (k, p, n) = (4usize, 8usize, 400usize);
+        // Deterministic orthonormal directions: eigenvectors of a fixed symmetric
+        // matrix are orthonormal, so no RNG is needed for a stable regression.
+        let mut a = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                a[[i, j]] = ((i * 7 + j * 3 + 1) % 11) as f64 - 5.0;
+            }
+        }
+        let sym = &a + &a.t();
+        let (_evals, evecs) = sym.eigh(Side::Lower).expect("orthonormal directions");
+        let dirs = evecs.slice(s![.., ..k]).t().to_owned(); // k×p, orthonormal rows
+        let mut x = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            let atom = row % k;
+            let scale = if row % 2 == 0 { 2.0 } else { -1.5 } + 0.01 * (row / k) as f64;
+            for col in 0..p {
+                let noise = 1.0e-3 * (((row * p + col) % 13) as f64 - 6.0);
+                x[[row, col]] = scale * dirs[[atom, col]] + noise;
+            }
+        }
+        let config = LinearDictionaryConfig {
+            n_atoms: k,
+            max_iter: 40,
+            top_k: 1,
+            assignment: LinearDictionaryAssignment::TopK,
+            temperature: DEFAULT_TEMPERATURE,
+            code_ridge: DEFAULT_CODE_RIDGE,
+            tolerance: 1.0e-9,
+        };
+        let fit = fit_linear_dictionary(x.view(), &config).expect("orthonormal dictionary fit");
+        let live = fit
+            .atoms
+            .axis_iter(Axis(0))
+            .filter(|atom| atom.iter().any(|value| value.abs() > 1.0e-12))
+            .count();
+        assert_eq!(
+            live, k,
+            "all {k} atoms must stay live (no dead-atom collapse); got {live} live"
+        );
+        assert!(
+            fit.explained_variance > 0.99,
+            "K orthonormal rank-1 atoms must be reconstructed at EV > 0.99; got {}",
+            fit.explained_variance
+        );
     }
 
     #[test]

@@ -109,6 +109,13 @@ fn gam_te_3d_recovers_nonadditive_surface() {
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian te() smooth");
     };
+    eprintln!(
+        "[#1074-te3d] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged={} iters={}",
+        fit.fit.edf_total().unwrap_or(f64::NAN),
+        fit.fit.edf_by_block().iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
+        fit.fit.log_lambdas.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
+        fit.fit.reml_score, fit.fit.outer_converged, fit.fit.outer_iterations,
+    );
 
     // gam fitted values at the training grid: rebuild the design from the frozen
     // spec at the observed (x1,x2,x3) (identity link => design*beta = mean).
@@ -122,6 +129,28 @@ fn gam_te_3d_recovers_nonadditive_surface() {
         .expect("rebuild 3-D tensor design at training points");
     let gam_fitted: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
 
+    // [#1074 DIAGNOSTIC] additive-vs-tensor: does gam recover the additive truth
+    // better with an additive model than with te()? Isolates te()-construction
+    // (tensor interaction handling) from the marginal basis quality.
+    for diag_formula in [
+        "y ~ s(x1, k=5) + s(x2, k=5) + s(x3, k=5)",
+        "y ~ te(x1, x2, x3, k=8)",
+    ] {
+        if let Ok(FitResult::Standard(df)) = fit_from_formula(diag_formula, &ds, &cfg) {
+            let dd = build_term_collection_design(grid.view(), &df.resolvedspec).unwrap();
+            let dfit: Vec<f64> = dd.design.apply(&df.fit.beta).to_vec();
+            let drmse = {
+                let m = dfit.iter().zip(y.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f64>()
+                    / dfit.len() as f64;
+                m.sqrt()
+            };
+            eprintln!(
+                "[#1074-te3d-diag] {diag_formula} :: edf={:.3} converged={} rmse_vs_truth={:.5}",
+                df.fit.edf_total().unwrap_or(f64::NAN), df.fit.outer_converged, drmse,
+            );
+        }
+    }
+
     // ---- fit the SAME model with mgcv (the mature reference) --------------
     let r = run_r(
         &[
@@ -134,7 +163,14 @@ fn gam_te_3d_recovers_nonadditive_surface() {
         suppressPackageStartupMessages(library(mgcv))
         m <- gam(y ~ te(x1, x2, x3, k = 5), data = df, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
+        emit("sp", as.numeric(m$sp))
+        emit("edf", as.numeric(sum(m$edf)))
         "#,
+    );
+    eprintln!(
+        "[#1074-te3d-mgcv] mgcv sp(per-margin)={:?} mgcv_edf_total={:?}",
+        r.vector("sp"),
+        r.vector("edf"),
     );
     let mgcv_fitted = r.vector("fitted");
     assert_eq!(mgcv_fitted.len(), n, "mgcv fitted length mismatch");

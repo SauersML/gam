@@ -1502,7 +1502,24 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
     let quadctx = crate::quadrature::QuadratureContext::new();
     let means: Result<Vec<f64>, EstimationError> = (0..eta.len())
         .into_par_iter()
-        .map(|i| strategy.posterior_mean(&quadctx, eta[i], eta_standard_error[i]))
+        .map(|i| {
+            let pm = strategy.posterior_mean(&quadctx, eta[i], eta_standard_error[i])?;
+            if pm.is_finite() {
+                return Ok(pm);
+            }
+            // #1515: a pathological coefficient posterior — e.g. an all-zero
+            // Poisson fit, whose flat likelihood leaves the penalized Hessian
+            // near-singular with `se_eta` in the thousands — makes the
+            // response-scale posterior integral E[g⁻¹(η)] = exp(η + se_eta²/2)
+            // overflow to +inf. That serializes to a JSON null across the
+            // gam-pyffi boundary and crashes the Python shaper with a `None`
+            // mean, even though the point linear predictor is finite. Degrade
+            // gracefully to the plug-in mean g⁻¹(η̂): it is finite (exp(η̂) for
+            // the log link) and consistent with the reported `linear_predictor`,
+            // so a model the API reports as fitted always yields a finite
+            // response mean.
+            strategy.inverse_link(eta[i])
+        })
         .collect();
 
     Ok(PredictPosteriorMeanResult {

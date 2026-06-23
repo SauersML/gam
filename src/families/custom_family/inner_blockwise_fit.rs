@@ -531,6 +531,36 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         let mut residual_descent_history: std::collections::VecDeque<f64> =
             std::collections::VecDeque::with_capacity(RESIDUAL_DESCENT_WINDOW);
         let mut tr_clamped_during_stall: bool = false;
+        // Deterministic slow-geometric-rate stall guard (gam#979 survival
+        // marginal-slope). The flat-residual guard below resets its no-improve
+        // counter whenever the residual drops ≥10% versus the running best, and
+        // the Newton-decrement certificate refuses while the decrement sits a
+        // hair above `objective_tol`. A residual crawling down by a small fixed
+        // fraction each cycle — the survival marginal-slope oversmoothed-ρ
+        // endgame: a stiff penalized Hessian (penalty dominates, eigenvalues
+        // ~1e6) yields Newton steps ~1e-5 far INSIDE a large trust radius, so
+        // the KKT residual descends geometrically but very slowly (~0.99×/cycle,
+        // halving only every ~80 cycles) — clears that 10% bar every ~12 cycles,
+        // so NEITHER guard ever fires and the solve grinds ~10³ cycles at ~p³
+        // each: minutes-to-hours per outer ρ-evaluation, the measured #979
+        // survival "hang" (n≈2500, centers=12 runs past a 900 s wall with no
+        // result). This is NOT divergence and NOT a flat stall — the residual is
+        // genuinely (geometrically) descending, just far too slowly to reach tol
+        // in a practical cycle count. Track a trailing window of residuals so
+        // the post-step site can PROJECT, from the window's geometric rate
+        // (cycle indices and residual ratios only — fully deterministic, NO
+        // wall-clock; cf. the explicit no-wall-clock note at the bottom of the
+        // cycle loop), how many more cycles reaching `residual_tol` would take.
+        const LINEAR_RATE_WINDOW: usize = 16;
+        // If, at the current geometric rate, reaching tol would take more than
+        // this many additional cycles, the ρ-evaluation cannot finish in a
+        // practical budget: exit `converged=false` with the finite β so the
+        // outer optimizer rejects this ρ and moves on (a well-conditioned ρ
+        // converges quadratically in a handful of cycles and never reaches the
+        // window, so this never touches a healthy solve).
+        const LINEAR_RATE_PROJECTION_CAP: usize = 100;
+        let mut residual_rate_history: std::collections::VecDeque<f64> =
+            std::collections::VecDeque::with_capacity(LINEAR_RATE_WINDOW + 1);
         // Fully-rejected stall guard. The residual-stall guard below
         // (post-grad-reload) only fires on cycles that produced an accepted
         // step, because every termination check it gates lives after the
@@ -675,6 +705,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // objective until then.
         for cycle in 0..inner_loop_hard_ceiling {
             if cycle >= inner_max_cycles {
+                break;
+            }
+            if cycle > 0 && crate::solver::rho_optimizer::outer_wall_clock_deadline_exceeded() {
+                // gam#979: the fit-level wall-clock budget is spent. Stop at the
+                // current best-effort iterate so the outer search (which would
+                // otherwise grind every remaining screening stage / seed / plan
+                // to its cycle budget on a constrained solve that never
+                // certifies) terminates in bounded time. >=1 cycle has run, so a
+                // finite iterate is always returned.
                 break;
             }
             let verbose_cycle = cycle == 0
@@ -1650,10 +1689,10 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 spectral_step.most_negative_eigenvalue,
                             );
                         }
-                        if spectral_step.nullity > 0 {
-                            log::debug!(
-                                "[PIRLS/joint-Newton] spectral reduced solve: nullity@{:.0e}={}/{} \
-                             |P0 rhs|∞={:.3e} |P+ rhs|∞={:.3e} λ_min+={:.3e} λ_max={:.3e}",
+                        {
+                            log::info!(
+                                "[979-DIAG] cycle {cycle:>3} spectral solve: nullity@{:.0e}={}/{} \
+                             |P0 rhs|∞={:.3e} |P+ rhs|∞={:.3e} λ_min+={:.3e} λ_max={:.3e} reflected={}",
                                 spectral_step.rank_tol,
                                 spectral_step.nullity,
                                 total_p,
@@ -1661,6 +1700,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                                 spectral_step.range_rhs_inf,
                                 spectral_step.lambda_min_positive,
                                 spectral_step.lambda_max_abs,
+                                spectral_step.reflected_negative_modes,
                             );
                         }
                         delta = Some(spectral_step.delta);
@@ -4681,6 +4721,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         tr_clamped_during_stall = true;
                     }
                 }
+                // Trailing window of post-step residuals for the deterministic
+                // slow-geometric-rate stall projection (gam#979 survival). Kept
+                // at length ≤ LINEAR_RATE_WINDOW+1 so the front is the residual
+                // exactly LINEAR_RATE_WINDOW cycles back.
+                if residual_rate_history.len() > LINEAR_RATE_WINDOW {
+                    residual_rate_history.pop_front();
+                }
+                residual_rate_history.push_back(residual);
             }
             if cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
                 && cycles_since_residual_improved >= RESIDUAL_STALL_NO_IMPROVE_CYCLES
@@ -4955,6 +5003,63 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 cycles_done = cycle + 1;
                 converged = false;
                 break;
+            }
+
+            // Slow-geometric-rate stall early-exit (gam#979 survival marginal-slope).
+            //
+            // Distinct from the flat-residual exit above (residual NOT improving
+            // for the no-improve window) and the Newton-decrement certificate
+            // (decrement ≤ objective_tol). Here the residual IS descending, just
+            // geometrically and far too slowly to reach tol in a practical cycle
+            // count — the survival marginal-slope oversmoothed-ρ endgame (stiff
+            // penalized Hessian → ~1e-5 Newton steps far inside a large trust
+            // radius → residual ~0.99×/cycle). Project, from the trailing
+            // window's geometric rate, the additional cycles to reach
+            // `residual_tol`; if that exceeds LINEAR_RATE_PROJECTION_CAP the
+            // ρ-evaluation cannot finish in a practical budget, so return the
+            // finite β as NON-converged and let the outer optimizer reject this
+            // ρ cleanly instead of grinding ~10³ cycles to inner_max_cycles (the
+            // #979 "hang"). DETERMINISTIC: cycle indices and residual ratios
+            // only, no wall-clock (cf. the no-wall-clock note below). Certifies
+            // nothing (`converged=false`) so it cannot bias the envelope
+            // gradient; it only rejects an impractical-to-finish iterate sooner.
+            // A still-progressing (quadratic / fast-geometric) solve reaches tol
+            // in a handful of cycles and never fills the window, so this never
+            // fires on a healthy fit.
+            if residual.is_finite()
+                && residual > residual_tol
+                && cycle + 1 >= RESIDUAL_STALL_MIN_CYCLES
+                && residual_rate_history.len() > LINEAR_RATE_WINDOW
+            {
+                let oldest = *residual_rate_history.front().unwrap();
+                let too_slow = if !oldest.is_finite() || oldest <= 0.0 || residual >= oldest {
+                    // No net geometric progress across the whole window.
+                    true
+                } else {
+                    let rate = (residual / oldest).powf(1.0 / (LINEAR_RATE_WINDOW as f64));
+                    if !(rate.is_finite()) || rate >= 1.0 {
+                        true
+                    } else {
+                        let projected_cycles = (residual_tol / residual).ln() / rate.ln();
+                        projected_cycles.is_finite()
+                            && projected_cycles > LINEAR_RATE_PROJECTION_CAP as f64
+                    }
+                };
+                if too_slow {
+                    log::warn!(
+                        "[PIRLS/joint-Newton convergence] cycle {:>3} | slow-geometric-rate stall early-exit (gam#979): residual={:.3e} (tol={:.3e}) descending at ~{:.4}×/cycle over the last {} cycles — projected >{} more cycles to reach tol; the residual is converging but far too slowly to finish in a practical budget (the survival marginal-slope oversmoothed-ρ endgame), so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
+                        cycle,
+                        residual,
+                        residual_tol,
+                        (residual / oldest).powf(1.0 / (LINEAR_RATE_WINDOW as f64)),
+                        LINEAR_RATE_WINDOW,
+                        LINEAR_RATE_PROJECTION_CAP,
+                        inner_max_cycles,
+                    );
+                    cycles_done = cycle + 1;
+                    converged = false;
+                    break;
+                }
             }
 
             // NOTE: there is deliberately NO wall-clock-driven "adaptive

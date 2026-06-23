@@ -450,8 +450,16 @@ fn posterior_predict_table_impl(
     }
     let samples = Array2::<f64>::from_shape_vec((n_draws, n_coeffs), samples_flat)
         .map_err(|err| format!("failed to reshape samples: {err}"))?;
-    // eta[k, i] = sum_j samples[k, j] * X[i, j] = (samples · X^T)[k, i].
-    let eta = samples.dot(&dense.t());
+    // A GLM fitted with `offset=...` targets the linear predictor η = X·β + offset.
+    // The point-predict path (`design.dot(beta) + input.offset`) and the
+    // coefficient sampler (#882) both re-apply that offset; the posterior-
+    // *predictive* η must too. Omitting it made every draw an offset-less X·β, so
+    // a rate model's predictive mean came out exp(-offset)× too small and silently
+    // reproduced the offset-less prediction.
+    let offset = resolve_offset_column(&dataset, &col_map, model.offset_column.as_deref())?;
+    // eta[k, i] = sum_j samples[k, j] * X[i, j] + offset[i]
+    //           = (samples · Xᵀ)[k, i] + offset[i]  (offset broadcasts over draws).
+    let eta = samples.dot(&dense.t()) + &offset;
     let eta_flat: Vec<f64> = eta.iter().copied().collect();
     let payload = PosteriorPredictPayload {
         eta_flat,

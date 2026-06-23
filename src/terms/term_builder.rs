@@ -39,6 +39,17 @@ use crate::types::ColIdx;
 /// length scale when the user does not supply one. A length scale near a small
 /// fraction of the domain extent puts the kernel's correlation range at the
 /// scale of local structure rather than the whole domain.
+///
+/// #1074 NOTE: mgcv's `bs="gp"` default range is the FULL diameter, and matching
+/// it (fraction 1.0) makes gam reproduce mgcv on SMOOTH truths (matern_smooth
+/// nu=2.5: edf 13.6, rmse 0.0307 vs mgcv 0.0308). BUT a long fixed range cannot
+/// represent HIGH-FREQUENCY fields — at 1.0 the default collapses on `sin8`
+/// (basis_smooth `matern_default_does_not_collapse_on_sin8`), because gam's 1-D
+/// Matérn does NOT REML-optimize the length scale (the spatial-κ optimizer is
+/// gated to dimension > 1), so this single fixed default must serve both regimes.
+/// The principled fix is to enable 1-D κ-optimization so REML picks the range per
+/// data; until then this stays at the high-frequency-safe `0.15` and the smooth-
+/// truth under-recovery (matern_smooth / matern_varying_nu) is tracked on #1074.
 const DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.15;
 
 /// Floor on the derived default Matérn length scale, guarding against a zero or
@@ -2168,22 +2179,27 @@ pub fn build_smooth_basis(
                 policy,
             )
             .map_err(|e| e.to_string())?;
-            // A *univariate* (`d == 1`) thin-plate smooth `s(x, bs="tp")` is the
-            // routine 1-D smooth, not a spatial field: the generic spatial
-            // center heuristic (which scales with `n`) over-sizes it, producing
-            // a weakly-identified two-penalty ρ-surface whose REML optimum is
-            // row-order dependent (#1378). When no explicit center count / `k`
-            // is given, default the 1-D basis to mgcv's `k = 10` total
-            // dimension (kernel centers = total − linear-nullspace dim), capped
-            // by the heuristic so tiny-`n` plans are never inflated. An explicit
-            // `k`/`centers` still takes full effect via `parse_countwith_basis_alias`.
-            let default_centers = if cols.len() == 1 {
-                let nullspace_dim = crate::basis::duchon_nullspace_dimension(1, 1);
-                let target_centers =
-                    THIN_PLATE_1D_DEFAULT_BASIS_DIM.saturating_sub(nullspace_dim);
+            // A thin-plate smooth `s(.., bs="tp")` is sized to mgcv's default
+            // basis dimension `k = 10·3^(d-1)` (10 in 1-D, 30 in 2-D, 90 in 3-D),
+            // NOT to the generic spatial center heuristic (which scales with `n`).
+            // The n-scaling heuristic over-sizes a thin-plate field: in 1-D it
+            // produces a weakly-identified two-penalty ρ-surface whose REML optimum
+            // is row-order dependent (#1378), and in 2-D+ the surplus basis columns
+            // become noise-fitting capacity REML cannot fully penalize away on a
+            // weak-signal fit — `#1074`'s quakes `s(long,lat)` reached EDF≈104 (vs
+            // mgcv≈15) with held-out R²≈0.02 because `default_num_centers(800,2)=134`
+            // is ~4× mgcv's 2-D default of 30. Default every thin-plate smooth to
+            // mgcv's `k = 10·3^(d-1)` total dimension (kernel centers = total −
+            // linear-nullspace dim), capped by the heuristic so tiny-`n` plans are
+            // never inflated. An explicit `k`/`centers` still takes full effect via
+            // `parse_countwith_basis_alias` (e.g. the `k=10`/`k=20` quality tests).
+            let default_centers = {
+                let d = cols.len().max(1) as u32;
+                let mgcv_total_dim = THIN_PLATE_1D_DEFAULT_BASIS_DIM
+                    .saturating_mul(3usize.saturating_pow(d - 1));
+                let nullspace_dim = crate::basis::duchon_nullspace_dimension(cols.len(), 1);
+                let target_centers = mgcv_total_dim.saturating_sub(nullspace_dim);
                 plan.centers.min(target_centers.max(1))
-            } else {
-                plan.centers
             };
             let centers = parse_countwith_basis_alias(
                 options,
@@ -3730,13 +3746,28 @@ pub(crate) fn cap_default_spatial_centers(
 }
 
 fn default_matern_center_count(n: usize, d: usize, planned_count: usize) -> usize {
-    // The generic spatial heuristic intentionally caps defaults at n/4 for
-    // high-dimensional operator conditioning.  A 1-D Matérn smooth with very
-    // small n needs a few more centers to avoid a two-column centered kernel
-    // block that is numerically fragile and too stiff for simple polynomial
-    // recovery tests.  Keep this Matérn-specific and still bounded by n.
+    // #1074: size the default Matérn basis to mgcv's gp default `k = 10·3^(d-1)`
+    // (10/30/90 in 1/2/3-D), NOT the generic n-scaling spatial heuristic. The
+    // n-scaling default (`default_num_centers(800,2)=134`) over-sizes the kernel
+    // ~4× vs mgcv's 2-D default of 30, leaving surplus columns REML cannot fully
+    // penalize on weak-signal spatial data: the quakes `matern(long,lat)` fit
+    // reached EDF≈28 (vs mgcv≈14) with held-out R²≈0.08. Mirror the thin-plate
+    // cap landed for `bs="tp"` (see `build_smooth_basis`): take mgcv's total
+    // dimension minus the linear polynomial nullspace, capped by the n-scaling
+    // plan so tiny-`n` plans are never inflated. An explicit `k`/`centers` still
+    // takes full effect upstream via `parse_countwith_basis_alias`.
+    let mgcv_total_dim = THIN_PLATE_1D_DEFAULT_BASIS_DIM
+        .saturating_mul(3usize.saturating_pow(d.max(1) as u32 - 1));
+    let nullspace_dim = crate::basis::duchon_nullspace_dimension(d, 1);
+    let target_centers = mgcv_total_dim.saturating_sub(nullspace_dim).max(1);
+    // A 1-D Matérn smooth with very small n needs a few more centers to avoid a
+    // two-column centered kernel block that is numerically fragile and too stiff
+    // for simple polynomial recovery tests. Keep that floor, still bounded by n.
     let low_n_floor = (d + 4).min(n);
-    planned_count.max(low_n_floor).max(1)
+    planned_count
+        .min(target_centers)
+        .max(low_n_floor)
+        .max(1)
 }
 
 pub fn parse_countwith_basis_alias(

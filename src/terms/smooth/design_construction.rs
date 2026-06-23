@@ -4875,6 +4875,16 @@ pub struct BoundedSampleColumn {
 /// Non-bounded columns have `J_ii = 1`, so they are sampled as the ordinary
 /// Gaussian Laplace draw and returned unchanged.
 ///
+/// Dispersion. `user_hessian` is the UNSCALED penalized Hessian `H_user`
+/// (unit implicit dispersion). For a free-dispersion family the latent
+/// posterior covariance is `φ̂·H_latent⁻¹`, so the caller passes
+/// `sqrt_cov_scale = √φ̂` (the coefficient-covariance scale `√σ̂²` for a
+/// profiled Gaussian, `1` for fixed-scale families like Binomial) and every
+/// latent perturbation is multiplied by it. This makes the draw covariance
+/// `sqrt_cov_scale² · H_latent⁻¹`, matching the fit's reported
+/// `Vb = cov_scale·H_user⁻¹` exactly (gam#1514) — without it a Gaussian
+/// bounded slope's draws were ~`1/σ̂` too wide.
+///
 /// Returns the draws as a `(n_draws, p)` matrix on the *internal* user scale
 /// (still conditioned); the caller back-transforms to the original data scale
 /// with the same conditioning it used for the point estimate.
@@ -4883,6 +4893,7 @@ pub fn sample_bounded_latent_posterior_internal(
     user_hessian: &Array2<f64>,
     bounded_columns: &[BoundedSampleColumn],
     n_draws: usize,
+    sqrt_cov_scale: f64,
     base_seed: u64,
 ) -> Result<Array2<f64>, EstimationError> {
     let p = beta_user.len();
@@ -4946,7 +4957,9 @@ pub fn sample_bounded_latent_posterior_internal(
         }
         solve_lower_transpose_into(&l, &eps, &mut delta);
         for i in 0..p {
-            draws[(k, i)] = theta_mode[i] + delta[i];
+            // δ has covariance `H_latent⁻¹`; scaling by √cov_scale lifts it to
+            // the dispersion-correct posterior covariance `cov_scale·H_latent⁻¹`.
+            draws[(k, i)] = theta_mode[i] + sqrt_cov_scale * delta[i];
         }
         // Push bounded columns through the exact interval map so every draw is
         // strictly inside (min, max); leave unconstrained columns untouched.
@@ -7105,29 +7118,36 @@ fn fit_bounded_term_collection_with_design(
     // geometry precision `penalized_hessian` is the user-scale penalized
     // Hessian `H_user = C⁻ᵀ J⁻¹ (H_latent + S_λ) J⁻¹ C⁻¹` (latent precision
     // pushed through the bounded transform's Jacobian `J = diag(dβ_user/dθ)`
-    // and the conditioning map `C`). The user-scale covariance is its exact
-    // inverse `H_user⁻¹`, which IS the delta-method pushforward of the latent
-    // posterior covariance `(H_latent + S_λ)⁻¹`. Inverting the same matrix the
-    // geometry reports guarantees `inv(penalized_hessian) == covariance`
-    // exactly and removes the dependency on the inner solver's optional,
-    // canonical-space `covariance_conditional` (which is `None` whenever the
-    // bounded blockspec carries no smoothing parameters — the no-rho fit path
-    // — leaving a bounded fit with a populated precision but no user-scale
-    // covariance, the gam#854 symptom). The latent precision is SPD at a
-    // strict posterior maximum; on a marginally-indefinite boundary Hessian we
-    // invert the positive-eigenvalue subspace (the structural null space of a
-    // penalised model is a flat posterior direction, not something to ridge
-    // away), matching the strict-pseudo-Laplace covariance contract (gam#748).
-    let beta_covariance = if options.compute_inference {
+    // and the conditioning map `C`). Its exact inverse `H_user⁻¹` is the
+    // delta-method pushforward of the latent posterior precision-inverse
+    // `(H_latent + S_λ)⁻¹` — but on the UNSCALED (unit-dispersion) scale. For a
+    // free-dispersion family (profiled Gaussian) the reported coefficient
+    // covariance is `Vb = φ̂ · H_user⁻¹` with `φ̂ = σ̂²`, so the unscaled inverse
+    // below is multiplied by the dispersion scale `cov_scale` once `σ̂²` is
+    // known (after the EDF, which sets the residual d.f.). For fixed-scale
+    // families (Binomial, `φ ≡ 1`) `cov_scale == 1` and `Vb = H_user⁻¹`
+    // unchanged. Skipping this scale was gam#1514: an interior, well-identified
+    // Gaussian bounded slope reported an SE ≈ 1/√Σ(xᵢ−x̄)² instead of
+    // σ̂/√Σ(xᵢ−x̄)², i.e. ~`1/σ̂` (≈20×) too wide.
+    //
+    // Inverting the same matrix the geometry reports keeps
+    // `inv(penalized_hessian) == cov_scale⁻¹ · covariance` and removes the
+    // dependency on the inner solver's optional, canonical-space
+    // `covariance_conditional` (which is `None` whenever the bounded blockspec
+    // carries no smoothing parameters — the no-rho fit path — leaving a bounded
+    // fit with a populated precision but no user-scale covariance, the gam#854
+    // symptom). The latent precision is SPD at a strict posterior maximum; on a
+    // marginally-indefinite boundary Hessian we invert the positive-eigenvalue
+    // subspace (the structural null space of a penalised model is a flat
+    // posterior direction, not something to ridge away), matching the
+    // strict-pseudo-Laplace covariance contract (gam#748).
+    let beta_covariance_unscaled = if options.compute_inference {
         Some(symmetric_positive_definite_inverse_or_pseudo(
             &penalized_hessian,
         )?)
     } else {
         None
     };
-    let beta_standard_errors = beta_covariance
-        .as_ref()
-        .map(|cov| Array1::from_iter((0..cov.nrows()).map(|i| cov[[i, i]].max(0.0).sqrt())));
     // EDF `p − Σ_k λ_k tr(H_latent⁻¹ S_k)` is computed in the *latent*
     // (untransformed) coordinate system the penalties `fit_penalties` live in,
     // so it needs the latent posterior covariance `(H_latent + S_λ)⁻¹`, not the
@@ -7164,6 +7184,48 @@ fn fit_bounded_term_collection_with_design(
             0.0,
         )
     };
+
+    // Dispersion. The bounded fit's working weight is scale-free for a profiled
+    // Gaussian (`W = priorweights`), so the unscaled penalized Hessian carries
+    // unit implicit dispersion and the reported coefficient covariance must be
+    // restored to `Vb = σ̂²·H_user⁻¹` with the REML residual variance
+    // `σ̂² = RSS/(n − edf_total)` — identical to the ordinary GAM path
+    // (`solver/estimate/optimizer.rs`). Fixed-scale families (Binomial here,
+    // `φ ≡ 1`) keep their full Fisher information in `W`, so `cov_scale == 1`
+    // and the covariance is `H_user⁻¹` unscaled. The single source of truth for
+    // the per-family scale is `GlmLikelihoodSpec::coefficient_covariance_scale`
+    // / `dispersion_from_likelihood`, reused verbatim so the bounded path can
+    // never drift from the standard contract (gam#1514).
+    let glm_likelihood = crate::types::GlmLikelihoodSpec::canonical(family.clone());
+    let standard_deviation = if family.is_gaussian_identity() {
+        let denom = if options.compute_inference {
+            (y.len() as f64 - edf_total).max(1.0)
+        } else {
+            (y.len() as f64).max(1.0)
+        };
+        (deviance / denom).sqrt()
+    } else {
+        1.0
+    };
+    let cov_scale = glm_likelihood
+        .coefficient_covariance_scale(standard_deviation * standard_deviation)
+        .max(f64::MIN_POSITIVE);
+    let dispersion = crate::estimate::dispersion_from_likelihood(&glm_likelihood, standard_deviation);
+    // Apply the dispersion scale to the unscaled inverse, producing the reported
+    // `Vb = cov_scale · H_user⁻¹` and its diagonal standard errors. The stored
+    // `penalized_hessian` stays UNSCALED (`H_user`) per the dispersion-ownership
+    // contract in `inference::dispersion_cov`; the sampler re-applies `√cov_scale`
+    // when it reconstructs the latent posterior (see `sample_standard_bounded`).
+    let beta_covariance = beta_covariance_unscaled.map(|mut cov| {
+        if cov_scale != 1.0 {
+            cov.mapv_inplace(|v| v * cov_scale);
+        }
+        cov
+    });
+    let beta_standard_errors = beta_covariance
+        .as_ref()
+        .map(|cov| Array1::from_iter((0..cov.nrows()).map(|i| cov[[i, i]].max(0.0).sqrt())));
+
     let geometry = Some(crate::estimate::FitGeometry {
         penalized_hessian: penalized_hessian.clone().into(),
         working_weights: eta_state.fisherweight.clone(),
@@ -7201,7 +7263,7 @@ fn fit_bounded_term_collection_with_design(
                     working_response
                 },
                 reparam_qs: None,
-                dispersion: crate::estimate::Dispersion::Known(1.0),
+                dispersion,
                 beta_covariance: beta_covariance
                     .clone()
                     .map(crate::inference::dispersion_cov::PhiScaledCovariance::from),
@@ -7241,7 +7303,7 @@ fn fit_bounded_term_collection_with_design(
                 outer_iterations: fit.outer_iterations,
                 outer_converged: fit.outer_converged,
                 outer_gradient_norm: fit.outer_gradient_norm,
-                standard_deviation: 1.0,
+                standard_deviation,
                 covariance_conditional,
                 covariance_corrected: None,
                 inference: Some(inf),

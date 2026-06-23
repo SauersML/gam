@@ -2249,7 +2249,24 @@ mod linear_parity_anchor_1026_tests {
             ((i as f64 + 1.0) * 0.137 * (j as f64 + 1.0)).sin() + 0.3 * ((i * j) as f64).cos()
         });
         let d_true = Array2::from_shape_fn((r_true, p), |(j, c)| {
-            (1.0 + j as f64) * (((j * 5 + c * 3) % 7) as f64 - 3.0) / 3.0
+            if r_true <= 7 {
+                // Original form. `((j*5 + c*3) % 7)` is genuinely rank-r_true while
+                // r_true <= 7 (its period-7 structure has not yet repeated a row),
+                // so the small fixtures keep their EXACT tuned gate-weighting
+                // margins. (Switching them to the DCT basis below shifts the
+                // gate-weighted top-rank subspace and breaks the 5e-3 parity gate.)
+                (1.0 + j as f64) * (((j * 5 + c * 3) % 7) as f64 - 3.0) / 3.0
+            } else {
+                // #1026: for r_true > 7 the period-7 form COLLAPSES — its rows
+                // repeat every 7 indices, so a nominally "rank-24" target was
+                // actually rank ~7, the rank-16 PCA ceiling saturated at 1.0, and
+                // the large-rank fixture self-check (`ceiling < 0.9999` when the
+                // dictionary rank is below the data rank) tripped. Use an
+                // orthogonal DCT-II basis (scaled per row) so all r_true rows are
+                // linearly independent and the target is genuinely rank min(r_true, p).
+                (1.0 + 0.5 * j as f64)
+                    * (std::f64::consts::PI * (c as f64 + 0.5) * (j as f64) / p as f64).cos()
+            }
         });
         let target = z.dot(&d_true);
         (term, target)

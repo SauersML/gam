@@ -408,38 +408,42 @@ impl SurvivalMarginalSlopeFamily {
                     };
                     right - left
                 };
-                // ∂_z of the bare calibration density weight `w(z)=exp(-q(z))/2π`,
-                // i.e. `w_z = -q_z·w` with `q_z = z + η(z)·η_z(z)`. This is the
-                // `density_z_derivative` of the directional reference block below
-                // specialised to the constant integrand `g≡1` (G = w itself).
-                let density_w_z = |z: f64| -> f64 {
-                    let eta = cell.eta(z);
-                    let eta_z = cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
-                    let q_z = z + eta * eta_z;
-                    -q_z * (-cell.q(z)).exp() / std::f64::consts::TAU
+                // ∂_z of the CALIBRATION F integrand `G = Φ(−η)·φ(z)` (positive
+                // cell η), NOT the bare weight `w = exp(−q)/2π`. The §D self-flux
+                // `G_z·z_u·z_v` uses the BASE integrand whose endpoints the Leibniz
+                // boundary evaluates; for the calibration F that integrand is
+                // `Φ(−η)φ`, so `G_z = −η_z·exp(−q)/2π − z·Φ(−η)·φ(z)`
+                // (`exp(−q)/2π = φ(η)φ(z)`). The previous `w_z = −q_z·w` equals
+                // `G_z` only for the D-normalization path; on the F-path it dropped
+                // the `−z·Φ(−η)φ` term, and since the self-flux is nonzero ONLY
+                // when both crossing velocities are nonzero (the (g,g)/a-axis
+                // diagonals), it corrupted exactly `f_uv[g,g]`/`f_aa`/`f_au[g]`
+                // (gam#1454). `part.cell` is the POSITIVE cell (Φ(−η_pos)).
+                let f_int_z = |z: f64| -> f64 {
+                    let eta = part.cell.eta(z);
+                    let eta_z = part.cell.c1 + 2.0 * part.cell.c2 * z + 3.0 * part.cell.c3 * z * z;
+                    let exp_q = (-part.cell.q(z)).exp() / std::f64::consts::TAU;
+                    let phi_z = crate::probability::normal_pdf(z);
+                    -eta_z * exp_q - z * crate::probability::normal_cdf(-eta) * phi_z
                 };
-                // Self-flux `G_z·z_u·z_v` of the moving-boundary second derivative
-                // (G = w). The Leibniz expansion of `∂_v∂_u ∫_{zL(θ)}^{zR(θ)} w dz`
-                // carries, per edge, `∂_uG·z_v + ∂_vG·z_u + G_z·z_u·z_v + G·z_uv`.
-                // The first two terms are the `flux(·)` pair above; this closure
-                // supplies the missing `G_z·z_u·z_v` self-flux (symmetric in u,v).
-                // The remaining `G·z_uv` term carries the bare continuous density
-                // `w` (not the cell-discontinuous integrand coefficients), so it
-                // telescope-cancels across each shared interior link-knot crossing
-                // and is dropped (gam#932). z_u/z_v reuse the crossing edge
-                // velocities `edge_vel`.
+                // Self-flux `G_z·z_u·z_v` of the moving-boundary second derivative.
+                // The Leibniz expansion of `∂_v∂_u ∫_{zL(θ)}^{zR(θ)} G dz` carries,
+                // per edge, `∂_uG·z_v + ∂_vG·z_u + G_z·z_u·z_v + G·z_uv`. The first
+                // two are the `flux(·)` pair; this supplies `G_z·z_u·z_v`. The
+                // `G·z_uv` term carries the continuous base integrand and
+                // telescope-cancels across shared interior crossings (gam#932).
                 let self_flux = |u: usize, v: usize| -> f64 {
                     let zu_r = edge_vel(u, part.right_edge, cell.right);
                     let zv_r = edge_vel(v, part.right_edge, cell.right);
                     let zu_l = edge_vel(u, part.left_edge, cell.left);
                     let zv_l = edge_vel(v, part.left_edge, cell.left);
                     let right = if zu_r != 0.0 && zv_r != 0.0 {
-                        zu_r * zv_r * density_w_z(cell.right)
+                        zu_r * zv_r * f_int_z(cell.right)
                     } else {
                         0.0
                     };
                     let left = if zu_l != 0.0 && zv_l != 0.0 {
-                        zu_l * zv_l * density_w_z(cell.left)
+                        zu_l * zv_l * f_int_z(cell.left)
                     } else {
                         0.0
                     };
@@ -448,13 +452,12 @@ impl SurvivalMarginalSlopeFamily {
                 for u in 0..p {
                     let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
                     for v in u..p {
-                        let boundary = flux(v, &neg_coeff_u);
-                        let boundary = if u == v {
-                            boundary
-                        } else {
-                            let neg_coeff_v = fixed.coeff_u[v].map(|value| -value);
-                            boundary + flux(u, &neg_coeff_v)
-                        };
+                        // Asymmetric Leibniz flux pair `∂_uG·z_v + ∂_vG·z_u`;
+                        // DOUBLED on the diagonal (both orderings coincide), the
+                        // previous single-add halved the g-axis `f_uv[g,g]`
+                        // (gam#1454). Off-diagonal [g,w0] unchanged (z_w0=0).
+                        let neg_coeff_v = fixed.coeff_u[v].map(|value| -value);
+                        let boundary = flux(v, &neg_coeff_u) + flux(u, &neg_coeff_v);
                         // `G_z·z_u·z_v` is a single symmetric term, added once
                         // (unlike the asymmetric `flux` pair) to both triangles.
                         let boundary = boundary + self_flux(u, v);
@@ -500,18 +503,19 @@ impl SurvivalMarginalSlopeFamily {
                     };
                     right - left
                 };
-                // self-flux `G_z·z_a·z_x` (G = bare density w). z_a = a_edge_vel,
+                // self-flux `G_z·z_a·z_x` with `G_z` the calibration F integrand
+                // derivative `f_int_z` (NOT bare `w_z`), gam#1454. z_a=a_edge_vel,
                 // z_x = edge_vel(axis). x = a for f_aa, x = u for f_au.
                 let self_flux_ax = |zx_r: f64, zx_l: f64| -> f64 {
                     let za_r = a_edge_vel(part.right_edge);
                     let za_l = a_edge_vel(part.left_edge);
                     let right = if za_r != 0.0 && zx_r != 0.0 {
-                        za_r * zx_r * density_w_z(cell.right)
+                        za_r * zx_r * f_int_z(cell.right)
                     } else {
                         0.0
                     };
                     let left = if za_l != 0.0 && zx_l != 0.0 {
-                        za_l * zx_l * density_w_z(cell.left)
+                        za_l * zx_l * f_int_z(cell.left)
                     } else {
                         0.0
                     };
@@ -520,9 +524,9 @@ impl SurvivalMarginalSlopeFamily {
                 let neg_dc_da = fixed.dc_da.map(|value| -value);
                 let za_r = a_edge_vel(part.right_edge);
                 let za_l = a_edge_vel(part.left_edge);
-                // Diagonal (a,a): mirror the f_uv[[u,u]] diagonal convention —
-                // the symmetric flux pair added ONCE (not doubled).
-                f_aa += flux_a(&neg_dc_da) + self_flux_ax(za_r, za_l);
+                // Diagonal (a,a): asymmetric flux pair DOUBLED (both orderings
+                // coincide), the f_uv[g,g] diagonal fix on the a-axis (gam#1454).
+                f_aa += 2.0 * flux_a(&neg_dc_da) + self_flux_ax(za_r, za_l);
                 for u in 0..p {
                     let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
                     let zu_r = edge_vel(u, part.right_edge, cell.right);
@@ -715,38 +719,40 @@ impl SurvivalMarginalSlopeFamily {
                     eval_edge(part.right_edge, neg_cell.right)
                         - eval_edge(part.left_edge, neg_cell.left)
                 };
-                // `G_z = w_z = -q_z·w` (G = w, constant integrand g≡1), reusing
-                // the directional block's `density_z_derivative` at poly=[1].
-                let density_w_z = |z: f64| -> f64 { density_z_derivative(&[1.0], z) };
-                // `D_dir(G_z) = D_dir(-q_z·w)`. With `q_z = z + η·η_z`,
-                // `D_dir(q_z) = η_dir·η_z + η·η_z_dir` (z is the integration
-                // variable, `D_dir(z)=0`), and `D_dir(w) = -η·η_dir·w` (since
-                // `D_dir(q) = η·η_dir`). Hence
-                // `D_dir(G_z) = [-(η_dir·η_z + η·η_z_dir) + q_z·η·η_dir]·w`.
-                // `η_dir`/`η_z_dir` come from the directional cell-coefficient
-                // shift `neg_cell_dir` already assembled above.
-                let density_w_z_dir = |z: f64| -> f64 {
-                    let eta = neg_cell.eta(z);
-                    let eta_z = neg_cell.c1 + 2.0 * neg_cell.c2 * z + 3.0 * neg_cell.c3 * z * z;
-                    let eta_dir = eval_poly_slice(&neg_cell_dir, z);
-                    let eta_z_dir = eval_poly_derivative_slice(&neg_cell_dir, z);
-                    let q_z = z + eta * eta_z;
-                    let w = (-neg_cell.q(z)).exp() / std::f64::consts::TAU;
-                    (-(eta_dir * eta_z + eta * eta_z_dir) + q_z * eta * eta_dir) * w
+                // Self-flux density factor for the CALIBRATION F integrand
+                // `G = Φ(−η)·φ(z)` (positive cell η), NOT the bare weight `w`
+                // (gam#1454; mirrors the base block's `f_int_z`). With
+                // `exp_q := exp(−q)/2π = φ(η)φ(z)` and `q_z = z + η·η_z`:
+                //   G_z      = −η_z·exp_q − z·Φ(−η)·φ(z)
+                //   D_dir Gz = exp_q·(−η_z_dir + η·η_z·η_dir + z·η_dir)   (∂_θ, fixed z)
+                //   ∂_z Gz   = −η_zz·exp_q + η_z·q_z·exp_q − G − z·G_z
+                // `η_dir`/`η_z_dir` are the POSITIVE-cell directional shifts, i.e.
+                // the NEGATION of the `neg_cell_dir` slice already assembled.
+                let density_w_z = |z: f64| -> f64 {
+                    let eta = part.cell.eta(z);
+                    let eta_z = part.cell.c1 + 2.0 * part.cell.c2 * z + 3.0 * part.cell.c3 * z * z;
+                    let exp_q = (-part.cell.q(z)).exp() / std::f64::consts::TAU;
+                    let phi_z = crate::probability::normal_pdf(z);
+                    -eta_z * exp_q - z * crate::probability::normal_cdf(-eta) * phi_z
                 };
-                // `∂_z G_z = ∂_z(-q_z·w) = (q_z² − q_zz)·w`, the second z-derivative
-                // of the bare calibration weight (G = w). `q_zz = 1 + η_z² + η·η_zz`
-                // with `η_zz = 2c₂ + 6c₃·z`. This is the boundary-MOTION sensitivity
-                // of `G_z`: the self-flux is evaluated at the moving crossing
-                // `z = z_edge(θ)`, so `D_dir(G_z) = ∂_θG_z + z_dir·∂_zG_z`.
+                let density_w_z_dir = |z: f64| -> f64 {
+                    let eta = part.cell.eta(z);
+                    let eta_z = part.cell.c1 + 2.0 * part.cell.c2 * z + 3.0 * part.cell.c3 * z * z;
+                    let eta_dir = -eval_poly_slice(&neg_cell_dir, z);
+                    let eta_z_dir = -eval_poly_derivative_slice(&neg_cell_dir, z);
+                    let exp_q = (-part.cell.q(z)).exp() / std::f64::consts::TAU;
+                    exp_q * (-eta_z_dir + eta * eta_z * eta_dir + z * eta_dir)
+                };
                 let density_w_zz = |z: f64| -> f64 {
-                    let eta = neg_cell.eta(z);
-                    let eta_z = neg_cell.c1 + 2.0 * neg_cell.c2 * z + 3.0 * neg_cell.c3 * z * z;
-                    let eta_zz = 2.0 * neg_cell.c2 + 6.0 * neg_cell.c3 * z;
+                    let eta = part.cell.eta(z);
+                    let eta_z = part.cell.c1 + 2.0 * part.cell.c2 * z + 3.0 * part.cell.c3 * z * z;
+                    let eta_zz = 2.0 * part.cell.c2 + 6.0 * part.cell.c3 * z;
+                    let exp_q = (-part.cell.q(z)).exp() / std::f64::consts::TAU;
+                    let phi_z = crate::probability::normal_pdf(z);
+                    let g = crate::probability::normal_cdf(-eta) * phi_z;
+                    let g_z = -eta_z * exp_q - z * g;
                     let q_z = z + eta * eta_z;
-                    let q_zz = 1.0 + eta_z * eta_z + eta * eta_zz;
-                    let w = (-neg_cell.q(z)).exp() / std::f64::consts::TAU;
-                    (q_z * q_z - q_zz) * w
+                    -eta_zz * exp_q + eta_z * q_z * exp_q - g - z * g_z
                 };
                 // `D_dir(G_z·z_u·z_v)` self-flux, the directional derivative of the
                 // base block's `self_flux` (gam#932). By Leibniz,
@@ -833,7 +839,9 @@ impl SurvivalMarginalSlopeFamily {
                     for k in 0..4 {
                         neg_dc_da_dir[k] += a_dir * neg_dc_daa[k];
                     }
-                    f_aa_dir += axis_flux_dir_a(&neg_dc_da, &neg_dc_da_dir);
+                    // DOUBLED on the (a,a) diagonal (matching the base f_aa
+                    // diagonal flux fix, gam#1454).
+                    f_aa_dir += 2.0 * axis_flux_dir_a(&neg_dc_da, &neg_dc_da_dir);
                     let aa_self = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
                                    z: f64|
                      -> f64 {
@@ -912,10 +920,10 @@ impl SurvivalMarginalSlopeFamily {
                             .cell_pair_second_coeff(primary, &fixed.coeff_bu, u, v)
                             .map(|val| -val);
                         let mut bval = boundary(&neg_coeff_u, &neg_coeff_v, &neg_sc_uv);
+                        // D_dir of the asymmetric flux pair; DOUBLED on the diagonal
+                        // (matching the base f_uv diagonal flux fix, gam#1454).
                         bval += axis_flux_dir(v, &neg_coeff_u, &neg_coeff_u_dir);
-                        if u != v {
-                            bval += axis_flux_dir(u, &neg_coeff_v, &neg_coeff_v_dir);
-                        }
+                        bval += axis_flux_dir(u, &neg_coeff_v, &neg_coeff_v_dir);
                         // `D_dir(G_z·z_u·z_v)` self-flux: directional derivative of
                         // the base block's symmetric `self_flux`, added once to both
                         // triangles (gam#932).
