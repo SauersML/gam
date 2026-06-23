@@ -22,6 +22,8 @@ mod monotone_shape_smooth_aborts_fit;
 mod new_smooths_misc_regressions;
 mod numeric_by_smooth_column_not_loaded_from_cli;
 mod overlapping_smooth_predict_design_mismatch;
+mod posterior_sampling_box_coefficient_constraint_1507;
+mod posterior_sampling_monotone_shape_constraint_1509;
 mod pure_duchon_probit_repro;
 mod quadrature_alo_smooth_test;
 mod regression_scale_basis_parsimony_501;
