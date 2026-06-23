@@ -384,8 +384,17 @@ fn diag_matern_internals_1074() {
         let gd = build_term_collection_design(g.view(), &fit.resolvedspec).unwrap();
         let gam_grid: Vec<f64> = gd.design.apply(&fit.fit.beta).to_vec();
         let rmse_t = rmse(&gam_grid, &truth_grid);
+        // #1074: the converged Matérn length_scale (= 1/kappa) the REML κ-optimizer
+        // landed on, to compare against mgcv's effective range. A too-SHORT range
+        // (wiggly kernel) is the suspected source of the EDF inflation vs mgcv.
+        let fitted_ls = fit.resolvedspec.smooth_terms.iter().find_map(|t| {
+            match &t.basis {
+                gam::smooth::SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
+                _ => None,
+            }
+        });
         eprintln!(
-            "[#1074-diag] {formula}\n    edf_total={:.3} edf_by_block={:?}\n    log_lambdas={:?}\n    lambdas={:?}\n    reml={:.4} converged={} outer_iters={} rmse_vs_truth={:.4}",
+            "[#1074-diag] {formula} fitted_length_scale={fitted_ls:?}\n    edf_total={:.3} edf_by_block={:?}\n    log_lambdas={:?}\n    lambdas={:?}\n    reml={:.4} converged={} outer_iters={} rmse_vs_truth={:.4}",
             fit.fit.edf_total().unwrap(),
             fit.fit.edf_by_block().iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
             fit.fit.log_lambdas.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
