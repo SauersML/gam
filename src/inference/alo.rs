@@ -475,7 +475,14 @@ fn compute_alo_diagnostics_from_pirls_inner(
                     base.finalweights[i] * r * r
                 })
                 .sum();
-            let dof = (n as f64) - base.edf;
+            // Effective sample size for dispersion (#584): a zero prior weight
+            // makes w_i·r_i² = 0, so the row is already excluded from the RSS
+            // numerator and must be excluded from the denominator too. Count only
+            // positive-weight rows, exactly as the main optimizer path does
+            // (optimizer.rs ~1567); using the raw row count over a zero-excluding
+            // numerator biases φ̂ low and shrinks every ALO SE.
+            let n_pos = (0..n).filter(|&i| base.finalweights[i] > 0.0).count();
+            let dof = (n_pos as f64) - base.edf;
             let denom = dof.max(1.0);
             rss / denom
         }
