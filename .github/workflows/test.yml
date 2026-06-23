@@ -555,6 +555,14 @@ jobs:
         # benchmark binaries or external services are required.
         run: python -m pytest tests/test_tables.py -v --tb=short
 
+      - name: Run numeric by-variable predict-clip contract
+        # Full-fit Python contract: a numeric `by=` multiplier of s(x, by=z)
+        # must not be axis-clipped to its training range at predict time, so the
+        # varying-coefficient prediction stays affine in z (z=0 leaves the
+        # baseline; z beyond the training max keeps its slope). Guards the
+        # collect_by_variable_numeric_axes exemption in src/inference/model.rs.
+        run: python -m pytest tests/test_bug_hunt_numeric_by_variable_clamped_to_training_range_at_predict.py -v --tb=short
+
       - name: Run survival API regression + save/load roundtrip tests
         # `test_survival_api_regressions.py` covers fit-only smoke checks
         # across survival likelihood modes; `test_survival_save_load_roundtrip.py`
