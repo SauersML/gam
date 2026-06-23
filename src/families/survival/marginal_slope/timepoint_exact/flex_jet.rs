@@ -212,7 +212,7 @@ fn boundary_edge_term_jet<J: FlexJet>(c: &[J; 4], z: &J, z_pow_n: &J, finite: bo
 /// the base moment jets `M_0..M_4`, return `M_0..M_max` as jets. Bit-faithful to
 /// `reduce_sextic_moments` term for term, but every operation in the `FlexJet`
 /// algebra so the moments carry their exact θ-derivatives.
-fn cell_moment_recurrence_jet<J: FlexJet + Clone>(
+fn cell_moment_recurrence_jet<J: FlexJet>(
     c: &[J; 4],
     z_left: &J,
     left_finite: bool,
