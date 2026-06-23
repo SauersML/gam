@@ -51,3 +51,25 @@ def test_all_zero_count_fit_predicts_finite_mean(formula: str, family: str) -> N
     # overflow value.
     assert np.all(mean >= 0.0)
     assert np.all(mean < 1.0), f"expected near-zero rate, got {mean[:3]}"
+
+
+def test_all_zero_count_interval_predict_finite() -> None:
+    # The interval path computes the response SE from the posterior-variance
+    # integral, which overflows on the same near-singular Hessian. A fitted model
+    # must still produce finite interval bounds (delta-method SE fallback), not a
+    # None/inf that crashes the table shaper.
+    n = 200
+    data = {"x": np.linspace(0.0, 1.0, n), "y": np.zeros(n)}
+    model = gamfit.fit(data, "y ~ s(x)", family="poisson")
+
+    out = model.predict(data, interval=0.95)
+    mean = np.asarray(out["mean"], dtype=float)
+    lower = np.asarray(out["mean_lower"], dtype=float)
+    upper = np.asarray(out["mean_upper"], dtype=float)
+
+    for name, col in (("mean", mean), ("mean_lower", lower), ("mean_upper", upper)):
+        assert np.all(np.isfinite(col)), (
+            f"all-zero Poisson interval predict: {name} not finite: {col[:3]}"
+        )
+    assert np.all(lower <= mean + 1e-9)
+    assert np.all(mean <= upper + 1e-9)

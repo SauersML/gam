@@ -2385,6 +2385,18 @@ where
                     );
                     meanvar += quadratic_form_from_jetmu(cov_theta, &mix_partials)?;
                 }
+                if !meanvar.is_finite() {
+                    // #1515: the same pathological coefficient posterior that
+                    // overflows the response-mean integral (an all-zero Poisson
+                    // flat likelihood leaves se_eta in the thousands) also
+                    // overflows the exact response-variance integral. Fall back
+                    // to the delta-method SE |dμ/dη| · se_eta around the plug-in
+                    // mean — finite — so an interval predict on a fitted-but-
+                    // degenerate model returns finite bounds instead of a
+                    // `+inf`/`None` that crashes the Python table shaper.
+                    let dmu_deta = strategy.inverse_link_jet(eta[i])?.d1;
+                    return Ok((dmu_deta.abs() * se_i).max(0.0));
+                }
                 Ok(meanvar.max(0.0).sqrt())
             })
             .collect::<Result<Vec<_>, _>>()?,
