@@ -276,7 +276,20 @@ jobs:
           # integration target. Build that target once, then the run step executes
           # its libtest cases directly. Running one unfiltered grouped binary
           # would put the whole suite behind a single 360s cap.
-          cargo build --keep-going --test quality 2>&1 | tail -120 \
+          #
+          # gam#1082: build the benchmark OPTIMIZED (`release-dev` = opt-level 3,
+          # codegen-units=16, no LTO — the fast-compile optimized profile). The
+          # default `test` profile compiles the gam crate at opt-level 0 (only its
+          # *dependencies* get opt-2 via `[profile.test.package."*"]`), so the
+          # benchmark was timing every fit on UNOPTIMIZED gam code — a perf profile
+          # the shipped wheel (`release-pypi`, lto=fat opt-3) and CLI (`release`)
+          # never run. perf shows the opt-0 hot path is dominated by ndarray
+          # per-element bounds/stride checks (`index_checked`, `stride_offset_checked`,
+          # `precondition_check`) that the optimizer elides, not by real FLOPs. This
+          # makes the 360s budget measure production-representative cost; it is NOT a
+          # budget bump (the per-test cap below is unchanged) — it stops measuring a
+          # debug build no user experiences.
+          cargo build --keep-going --profile release-dev --test quality 2>&1 | tail -120 \
             || echo "build reported errors; missing quality binary is flagged BUILDFAIL in the run step"
 
       - name: Run quality suite (resilient + streaming; full per-test capture)
@@ -304,7 +317,9 @@ jobs:
           RES="$OUT/quality_results.tsv"
           JSONL="$OUT/quality_results.jsonl"
           discovery_error=0
-          bin=$(find target/debug/deps -maxdepth 1 -type f -perm -u+x -name "quality-*" ! -name '*.*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
+          # gam#1082: the quality target is built under the `release-dev` profile
+          # (see the build step), so its binary lands in target/release-dev/deps.
+          bin=$(find target/release-dev/deps -maxdepth 1 -type f -perm -u+x -name "quality-*" ! -name '*.*' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)
           if [ -n "$bin" ] && [ -x "$bin" ]; then
             mapfile -t tests < <("$bin" --list 2>/dev/null | sed -n 's/: test$//p')
             if [ "${#tests[@]}" -eq 0 ]; then
