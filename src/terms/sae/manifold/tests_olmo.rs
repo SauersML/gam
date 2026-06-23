@@ -471,3 +471,130 @@ pub(crate) fn read_npy_f32_2d(path: &std::path::Path) -> Array2<f64> {
     }
     out
 }
+
+/// #1522 — the fitted-data collapse acceptance bar is DERIVED FROM THE DATA
+/// (`0.5 × rank-K PCA EV ceiling`), not the absolute
+/// [`SAE_FIT_DATA_COLLAPSE_EV_FLOOR`] magic constant. This pins the data
+/// derivation: build a fit whose reconstruction EV lands STRICTLY BETWEEN the old
+/// absolute floor and the data-derived bar, and assert the guard fires.
+///
+/// The target is the unit circle in `R^2` (`[[1,0],[0,1],[-1,0],[0,-1]]`), whose
+/// rank-2 PCA captures ALL of its centered variance, so `pca_ev_ceiling(target,
+/// K>=2) == 1.0` and the derived bar is `0.5`. The fit explains EV ~= 0.30 — ABOVE
+/// the old `SAE_FIT_DATA_COLLAPSE_EV_FLOOR` (0.10) but BELOW the data-derived 0.5.
+///
+/// Fail-before / pass-after: against the pre-#1522 hardcoded floor the test
+/// `0.30 <= 0.10` is FALSE, so the guard returns `false` (no collapse) and the
+/// `assert!(recorded)` FAILS. With the data-derived bar `0.30 <= 0.5` is TRUE, so
+/// the guard records the structural collapse and the test PASSES. A fit explaining
+/// less than half what a rank-K dictionary could is a collapse ON THIS DATA,
+/// whatever its absolute EV.
+///
+/// The collapse guard reads only `target`, `fitted`, `assignments`, the per-atom
+/// `basis_size()` and `k_atoms()` — it never EVALUATES the basis — so the atom is
+/// built with a raw periodic basis (`basis_size = 3`) and no evaluator.
+#[test]
+pub(crate) fn fit_data_collapse_bar_is_data_derived_not_absolute_floor_1522() {
+    // Raw periodic basis Φ = [1, sin(2πt), cos(2πt)] on 4 sample coords;
+    // `basis_size = 3`, so the single-atom dictionary rank is min(3, n, p).
+    let coords = array![[0.0_f64], [0.25], [0.5], [0.75]];
+    let n = coords.nrows();
+    let mut phi = Array2::<f64>::zeros((n, 3));
+    let mut jet = Array3::<f64>::zeros((n, 3, 1));
+    for row in 0..n {
+        let angle = 2.0 * std::f64::consts::PI * coords[[row, 0]];
+        phi[[row, 0]] = 1.0;
+        phi[[row, 1]] = angle.sin();
+        phi[[row, 2]] = angle.cos();
+        jet[[row, 1, 0]] = 2.0 * std::f64::consts::PI * angle.cos();
+        jet[[row, 2, 0]] = -2.0 * std::f64::consts::PI * angle.sin();
+    }
+    let atom = SaeManifoldAtom::new(
+        "circle",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        Array2::<f64>::zeros((3, 2)),
+        Array2::<f64>::eye(3),
+    )
+    .unwrap();
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![LatentManifold::Circle { period: 1.0 }],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+
+    let target = array![[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]];
+
+    // The rank-K PCA ceiling of this rank-2 target is 1.0 (the PROMOTED production
+    // function must be reachable and reach the full ceiling), so the data-derived
+    // bar is 0.5 — well above the absolute 0.10 floor.
+    let dictionary_rank = term
+        .atoms
+        .iter()
+        .map(|atom| atom.basis_size())
+        .sum::<usize>()
+        .min(target.nrows())
+        .min(target.ncols());
+    let ceiling = crate::terms::sae::manifold::outer_objective::pca_ev_ceiling(
+        target.view(),
+        dictionary_rank,
+    );
+    assert!(
+        (ceiling - 1.0).abs() < 1e-9,
+        "rank-{dictionary_rank} PCA ceiling of the unit-circle target must be 1.0; got {ceiling}"
+    );
+    let derived_bar = 0.5 * ceiling;
+    assert!(
+        derived_bar > SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
+        "data-derived bar {derived_bar} must exceed the old absolute floor \
+         {SAE_FIT_DATA_COLLAPSE_EV_FLOOR}, or the test cannot distinguish them"
+    );
+
+    // fitted = alpha * target ⇒ EV = 1 - (1 - alpha)^2 (column means are 0). Pick
+    // alpha so EV ~= 0.30, strictly inside (0.10, 0.5).
+    let alpha = 1.0 - (0.70_f64).sqrt();
+    let fitted = &target * alpha;
+    let ssr: f64 = target
+        .iter()
+        .zip(fitted.iter())
+        .map(|(t, f)| (t - f) * (t - f))
+        .sum();
+    let sst: f64 = target.iter().map(|t| t * t).sum();
+    let ev = 1.0 - ssr / sst;
+    assert!(
+        ev > SAE_FIT_DATA_COLLAPSE_EV_FLOOR && ev < derived_bar,
+        "fit EV {ev} must sit STRICTLY between the old floor \
+         {SAE_FIT_DATA_COLLAPSE_EV_FLOOR} and the derived bar {derived_bar}"
+    );
+
+    let assignments = Array2::<f64>::ones((n, 1));
+    let recorded = term
+        .record_fit_data_collapse_if_needed(target.view(), fitted.view(), assignments.view(), 3)
+        .unwrap();
+
+    // Pre-#1522 (absolute 0.10 floor): EV 0.30 > 0.10 ⇒ NOT recorded ⇒ this fails.
+    // Post-#1522 (derived 0.5 bar): EV 0.30 < 0.5 ⇒ recorded as a structural collapse.
+    assert!(
+        recorded,
+        "fit EV {ev} is below the data-derived bar {derived_bar} (half the rank-K \
+         PCA ceiling) and must be recorded as a collapse; the guard is still keying \
+         on the absolute floor {SAE_FIT_DATA_COLLAPSE_EV_FLOOR} instead of the data"
+    );
+    // The recorded ledger event must report the DATA-DERIVED bar, not the constant.
+    let terminal = term
+        .collapse_events()
+        .iter()
+        .find(|e| e.action == CollapseAction::Terminal)
+        .expect("a terminal collapse event must be recorded");
+    assert!(
+        (terminal.floor - derived_bar).abs() < 1e-9,
+        "ledger floor {} must be the data-derived bar {derived_bar}, not the absolute \
+         {SAE_FIT_DATA_COLLAPSE_EV_FLOOR}",
+        terminal.floor
+    );
+}

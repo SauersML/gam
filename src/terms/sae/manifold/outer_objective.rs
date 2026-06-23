@@ -44,6 +44,42 @@ pub(crate) fn reconstruction_explained_variance(
     }
 }
 
+/// Rank-`q` PCA explained-variance ceiling of a column-centered `target`: the
+/// fraction of centered total variance captured by its top-`q` principal
+/// directions (the Eckart-Young optimum at rank `q`). This is the BEST
+/// reconstruction EV any rank-`q` linear dictionary can achieve on this data, so
+/// it is the natural data-derived scale for a collapse acceptance bar (#1522):
+/// `0.5 × pca_ev_ceiling(target, K)` tracks the data's achievable EV instead of a
+/// corpus-tuned magic constant.
+///
+/// Returns a value in `[0, 1]` on a finite target; `f64::NAN` when the SVD fails
+/// or the centered target has no variance (an all-constant target), so callers
+/// can detect the degenerate case and fall back to their absolute floor rather
+/// than silently key on a meaningless ceiling.
+pub(crate) fn pca_ev_ceiling(target: ArrayView2<'_, f64>, q: usize) -> f64 {
+    let (n, p) = target.dim();
+    if n == 0 || p == 0 {
+        return f64::NAN;
+    }
+    let mut centered = target.to_owned();
+    for c in 0..p {
+        let mean = (0..n).map(|r| target[[r, c]]).sum::<f64>() / n as f64;
+        for r in 0..n {
+            centered[[r, c]] -= mean;
+        }
+    }
+    let sst: f64 = centered.iter().map(|v| v * v).sum();
+    if !(sst > 0.0) || !sst.is_finite() {
+        return f64::NAN;
+    }
+    let sv = match centered.svd(false, false) {
+        Ok((_, sv, _)) => sv,
+        Err(_) => return f64::NAN,
+    };
+    let captured: f64 = sv.iter().take(q).map(|s| s * s).sum();
+    captured / sst
+}
+
 /// #1207 — observable telemetry for the amortized warm-start (Design A). The
 /// warm-start is advisory (a transient atlas-build / encode refusal must not
 /// abort the criterion), so its failures were previously discarded with `.ok()`
@@ -2176,22 +2212,6 @@ mod linear_parity_anchor_1026_tests {
     //! linear component carry full-rank variance while curved atoms stay sparse.
 
     use super::*;
-
-    /// Rank-`q` PCA explained-variance ceiling of a column-centered target.
-    fn pca_ev_ceiling(target: ArrayView2<'_, f64>, q: usize) -> f64 {
-        let (n, p) = target.dim();
-        let mut centered = target.to_owned();
-        for c in 0..p {
-            let mean = (0..n).map(|r| target[[r, c]]).sum::<f64>() / n as f64;
-            for r in 0..n {
-                centered[[r, c]] -= mean;
-            }
-        }
-        let sst: f64 = centered.iter().map(|v| v * v).sum();
-        let (_, sv, _) = centered.svd(false, false).expect("svd");
-        let captured: f64 = sv.iter().take(q).map(|s| s * s).sum();
-        captured / sst.max(1e-300)
-    }
 
     /// Build a K-atom LINEAR (degree-1, d=1) SAE term over distinct 1-D coords
     /// with a known rank-`r_true` linear target `X = Z @ D`. The decoder seed is
