@@ -33,6 +33,12 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # Warm the dependency compile across runs via the GitHub Actions sccache
+  # backend, so the maturin wheel build does not recompile the full dep closure
+  # (faer/ndarray/nalgebra/arrow/…) on every run. setup-rust-ci enables the
+  # RUSTC_WRAPPER only after a backend-reachability probe, so a cache outage
+  # degrades to a cold-but-green build rather than a hard failure.
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   python-contracts:
@@ -51,7 +57,12 @@ jobs:
         uses: ./.github/actions/setup-rust-ci
         with:
           free-disk-space: 'true'
-          cache-targets: 'false'
+          # Cache the compiled `target/` (deps + prior gam/gam-pyffi objects)
+          # across runs so the maturin wheel build is incremental: a cold run
+          # populates the cache, subsequent runs restore it and recompile only
+          # the crates whose sources changed (~3-5 min instead of ~13). This is
+          # the dominant cost of the fast Python-contract verification.
+          cache-targets: 'true'
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
