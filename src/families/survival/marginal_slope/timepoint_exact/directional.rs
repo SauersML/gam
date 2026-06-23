@@ -1911,13 +1911,100 @@ impl SurvivalMarginalSlopeFamily {
                                             )
                                         + z_axis * z_dir * density_z_derivative(poly, z)
                                 };
-                                let base_boundary_dir = |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
-                                    let uv = base_flux_dir(v, &d_u_integrand_u, &d_u_integrand_dir_u, edge, z);
-                                    if u == v {
-                                        uv
-                                    } else {
-                                        uv + base_flux_dir(u, &d_u_integrand_v, &d_u_integrand_dir_v, edge, z)
+                                // §D self-flux `G0_z·z_u·z_v` and second-order edge
+                                // motion `G0·z_uv` of the density-integral second
+                                // derivative (G0 = chi·w, the base d_u boundary
+                                // integrand), and their D_dir. These mirror the new
+                                // base d_uv boundary in first_full.rs; their D_dir
+                                // must appear here so d_uv_dir stays the exact
+                                // directional derivative of the (now complete) base
+                                // d_uv (gam#1454).
+                                let g0_dir = |poly: &[f64], poly_dir: &[f64], z: f64| -> f64 {
+                                    // D_dir(poly·w) at fixed z = poly_dir·w − poly·η·η_dir·w.
+                                    let eta = cell.eta(z);
+                                    let eta_dir = eval_poly_slice(&eta_dir_poly, z);
+                                    let amp = eval_poly_slice(poly, z);
+                                    let amp_dir = eval_poly_slice(poly_dir, z);
+                                    (amp_dir - amp * eta * eta_dir) * (-cell.q(z)).exp()
+                                        / std::f64::consts::TAU
+                                };
+                                // ∂²_z(G0): the z-derivative of `density_z_derivative`
+                                // for the moving-edge `D_dir(G0_z)=∂_θG0_z+z_dir·∂_zG0_z`.
+                                let g0_zz = |poly: &[f64], z: f64| -> f64 {
+                                    let eta = cell.eta(z);
+                                    let eta_z = cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
+                                    let eta_zz = 2.0 * cell.c2 + 6.0 * cell.c3 * z;
+                                    let amp = eval_poly_slice(poly, z);
+                                    let amp_z = eval_poly_derivative_slice(poly, z);
+                                    let amp_zz = {
+                                        // second z-derivative of the cubic `poly`
+                                        2.0 * *poly.get(2).unwrap_or(&0.0)
+                                            + 6.0 * *poly.get(3).unwrap_or(&0.0) * z
+                                    };
+                                    let q_z = z + eta * eta_z;
+                                    let q_zz = 1.0 + eta_z * eta_z + eta * eta_zz;
+                                    let w = (-cell.q(z)).exp() / std::f64::consts::TAU;
+                                    // ∂_z[(amp_z − amp·q_z)·w]
+                                    //  = (amp_zz − amp_z·q_z − amp·q_zz)·w
+                                    //    + (amp_z − amp·q_z)·(−q_z)·w
+                                    (amp_zz - amp_z * q_z - amp * q_zz) * w
+                                        + (amp_z - amp * q_z) * (-q_z) * w
+                                };
+                                // D_dir(∂_z(G0)) at fixed z = ∂_z(D_dir(G0)).
+                                let g0_z_dir = |poly: &[f64], poly_dir: &[f64], z: f64| -> f64 {
+                                    let eta = cell.eta(z);
+                                    let eta_z = cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
+                                    let eta_dir = eval_poly_slice(&eta_dir_poly, z);
+                                    let eta_z_dir = eval_poly_derivative_slice(&eta_dir_poly, z);
+                                    let amp = eval_poly_slice(poly, z);
+                                    let amp_z = eval_poly_derivative_slice(poly, z);
+                                    let amp_dir = eval_poly_slice(poly_dir, z);
+                                    let amp_z_dir = eval_poly_derivative_slice(poly_dir, z);
+                                    let q_z = z + eta * eta_z;
+                                    let q_z_dir = eta_dir * eta_z + eta * eta_z_dir;
+                                    let w = (-cell.q(z)).exp() / std::f64::consts::TAU;
+                                    let w_dir = -eta * eta_dir * w;
+                                    // G0_z = (amp_z − amp·q_z)·w
+                                    (amp_z_dir - amp_dir * q_z - amp * q_z_dir) * w
+                                        + (amp_z - amp * q_z) * w_dir
+                                };
+                                let self_cross_dir = |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+                                    let (zu, zu_dir, z_dir) = edge_axis(u, edge, z);
+                                    let (zv, zv_dir, _) = edge_axis(v, edge, z);
+                                    let ug = if u == primary.g { 1.0 } else { 0.0 };
+                                    let vg = if v == primary.g { 1.0 } else { 0.0 };
+                                    if zu == 0.0 && zu_dir == 0.0 && zv == 0.0 && zv_dir == 0.0 {
+                                        return 0.0;
                                     }
+                                    // z_uv = −(a_uv + zu·vg + zv·ug)/b and its D_dir.
+                                    let zuv = -(a_uv[[u, v]] + zu * vg + zv * ug) / b;
+                                    let zuv_dir = -(a_uv_dir[[u, v]]
+                                        + zu_dir * vg
+                                        + zv_dir * ug
+                                        + zuv * dir_g)
+                                        / b;
+                                    // self-flux S = G0_z·zu·zv  ⇒ D_dir(S):
+                                    let g0z = density_z_derivative(&chi_poly, z);
+                                    let g0z_total_dir =
+                                        g0_z_dir(&chi_poly, &chi_dir_poly, z) + z_dir * g0_zz(&chi_poly, z);
+                                    let self_dir = g0z_total_dir * zu * zv
+                                        + g0z * (zu_dir * zv + zu * zv_dir);
+                                    // cross C = G0·z_uv  ⇒ D_dir(C):
+                                    let g0 = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                        cell, &chi_poly, z,
+                                    );
+                                    let g0_total_dir =
+                                        g0_dir(&chi_poly, &chi_dir_poly, z) + z_dir * g0z;
+                                    let cross_dir = g0_total_dir * zuv + g0 * zuv_dir;
+                                    self_dir + cross_dir
+                                };
+                                let base_boundary_dir = |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+                                    // part_a (axis v on d_u_integrand[u]) + part_b1
+                                    // (axis u on d_u_integrand[v]) for ALL u,v (the
+                                    // diagonal carries both, matching new base d_uv).
+                                    base_flux_dir(v, &d_u_integrand_u, &d_u_integrand_dir_u, edge, z)
+                                        + base_flux_dir(u, &d_u_integrand_v, &d_u_integrand_dir_v, edge, z)
+                                        + self_cross_dir(edge, z)
                                 };
                                 let v_r = edge_vel(part.right_edge, cell.right);
                                 let v_l = edge_vel(part.left_edge, cell.left);

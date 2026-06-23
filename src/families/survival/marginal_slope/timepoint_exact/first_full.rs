@@ -7,6 +7,26 @@
 
 use super::*;
 
+/// Horner evaluation of `Σ_k coefficients[k]·zᵏ`.
+#[inline]
+fn poly_eval_slice(coefficients: &[f64], z: f64) -> f64 {
+    let mut acc = 0.0;
+    for &coefficient in coefficients.iter().rev() {
+        acc = acc * z + coefficient;
+    }
+    acc
+}
+
+/// Horner evaluation of the z-derivative `Σ_k k·coefficients[k]·z^{k-1}`.
+#[inline]
+fn poly_eval_deriv_slice(coefficients: &[f64], z: f64) -> f64 {
+    let mut acc = 0.0;
+    for (power, &coefficient) in coefficients.iter().enumerate().skip(1).rev() {
+        acc = acc * z + (power as f64) * coefficient;
+    }
+    acc
+}
+
 /// Which crossing velocity the moving-boundary flux uses.
 ///
 /// The link crossing `z = (τ − a)/b` moves with `θ` both directly (through
@@ -856,29 +876,92 @@ impl SurvivalMarginalSlopeFamily {
                                 &state.moments,
                                 "survival D_t second derivative",
                             )?;
+                            // Full §D moving-domain second-derivative boundary of
+                            // the density integral `D = ∫ G0 dz`, `G0 = chi·w`
+                            // (chi = ∂η/∂a the D-integrand, w the bare density).
+                            // `d_u = ∫ ∂_u G0 dz + [G0·z_u]_edge` (the latter the
+                            // `moving_density_boundary_flux` on `chi_poly` in the
+                            // base d_u). Differentiating again by v gives, per
+                            // edge:
+                            //   PART A  (boundary of the d_u interior integral):
+                            //     ∂_u G0 · z_v  =  d_u_integrand[u]·w · z_v
+                            //   PART B  (D_v of the d_u boundary [G0·z_u]):
+                            //     ∂_v G0 · z_u  =  d_u_integrand[v]·w · z_u
+                            //     + G0_z · z_u · z_v          (the §D self-flux)
+                            //     + G0   · z_uv               (second-order edge motion)
+                            // The old code carried only PART A and (for u≠v) the
+                            // first PART-B piece, dropping the self-flux, the
+                            // `G0·z_uv` term, and — on the u==v diagonal — the
+                            // second `d_u_integrand·w·z_u` piece. That left the
+                            // EXIT base d_uv[g,w0] ~6.8e-3 short, the dominant
+                            // residual in the assembled intercept Hessian (it
+                            // enters with coefficient `w·d/D`), so the summed
+                            // base eta_uv[g,w0] missed its gradient-FD witness
+                            // (gam#1454).
                             let boundary = if b != 0.0 {
-                                let uv = moving_density_boundary_flux(
-                                    v,
-                                    primary,
-                                    &a_u,
-                                    entry,
-                                    &d_u_integrand_poly[u],
-                                    b,
-                                    FluxVelocity::Total,
-                                );
-                                if u == v {
-                                    uv
-                                } else {
-                                    uv + moving_density_boundary_flux(
-                                        u,
-                                        primary,
-                                        &a_u,
-                                        entry,
-                                        &d_u_integrand_poly[v],
-                                        b,
-                                        FluxVelocity::Total,
-                                    )
-                                }
+                                let part = &entry.partition_cell;
+                                // Total crossing velocity z_axis = −(a_u[axis] +
+                                // δ_{axis,g}·z)/b and its v-cross
+                                // z_uv = −(a_uv[u,v] + z_u·δ_{v,g} + z_v·δ_{u,g})/b
+                                // (§C with b_g = 1).
+                                let z_vel = |axis: usize,
+                                             edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                             z: f64|
+                                 -> f64 {
+                                    match edge {
+                                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                            let direct_g = if axis == primary.g { z } else { 0.0 };
+                                            -(a_u[axis] + direct_g) / b
+                                        }
+                                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                                    }
+                                };
+                                let z_cross = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                               z: f64|
+                                 -> f64 {
+                                    let zu = z_vel(u, edge, z);
+                                    let zv = z_vel(v, edge, z);
+                                    let ug = if u == primary.g { 1.0 } else { 0.0 };
+                                    let vg = if v == primary.g { 1.0 } else { 0.0 };
+                                    match edge {
+                                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                            -(a_uv[[u, v]] + zu * vg + zv * ug) / b
+                                        }
+                                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                                    }
+                                };
+                                // ∂_z(G0) = ∂_z(chi·w) = (chi' − chi·q_z)·w.
+                                let g0_z = |z: f64| -> f64 {
+                                    let eta = cell.eta(z);
+                                    let eta_z = cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
+                                    let amp = poly_eval_slice(&chi_poly, z);
+                                    let amp_z = poly_eval_deriv_slice(&chi_poly, z);
+                                    let q_z = z + eta * eta_z;
+                                    (amp_z - amp * q_z) * (-cell.q(z)).exp()
+                                        / std::f64::consts::TAU
+                                };
+                                let edge_term = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                                 z: f64|
+                                 -> f64 {
+                                    let zu = z_vel(u, edge, z);
+                                    let zv = z_vel(v, edge, z);
+                                    if zu == 0.0 && zv == 0.0 {
+                                        return 0.0;
+                                    }
+                                    let zuv = z_cross(edge, z);
+                                    let g0 = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                        cell, &chi_poly, z,
+                                    );
+                                    let part_a = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                        cell, &d_u_integrand_poly[u], z,
+                                    ) * zv;
+                                    let part_b1 = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                        cell, &d_u_integrand_poly[v], z,
+                                    ) * zu;
+                                    part_a + part_b1 + g0_z(z) * zu * zv + g0 * zuv
+                                };
+                                edge_term(part.right_edge, cell.right)
+                                    - edge_term(part.left_edge, cell.left)
                             } else {
                                 0.0
                             };
