@@ -822,7 +822,8 @@ where
         // to decide whether the spatial range railing is an interior-optimum the
         // optimizer misses (optimizer bug) or a genuine criterion preference for
         // λ→∞ (criterion). Enable with `RUST_LOG=debug` (the ban-scanner forbids
-        // `eprintln!`/`std::env::var`, so this routes through `log` instead).
+        // direct stderr printing and process-env reads, so this routes through
+        // the `log` facade instead).
         if log::log_enabled!(log::Level::Debug) {
             let grid = [
                 -5.0_f64, -2.0, 0.0, 2.0, 5.0, 8.0, 10.0, 12.0, 16.0, 20.0, 25.0, 30.0,
