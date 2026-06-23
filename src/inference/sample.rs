@@ -644,18 +644,26 @@ fn sample_standard_bounded(
                 .to_string(),
         );
     }
-    // The bounded fit exports the user-scale penalized Hessian; the latent
-    // sampler reconstructs the latent precision from it via the exact inverse
-    // delta-method. (`explicit_fit_hessian_for_whitening` returns this same
-    // user-scale penalized Hessian for a saved standard fit.)
+    // The bounded fit exports the UNSCALED user-scale penalized Hessian; the
+    // latent sampler reconstructs the latent precision from it via the exact
+    // inverse delta-method. (`explicit_fit_hessian_for_whitening` returns this
+    // same user-scale penalized Hessian for a saved standard fit.)
     let user_hessian =
         explicit_fit_hessian_for_whitening(&fit, p, "saved standard bounded-coefficient model")?;
+    // The exported Hessian carries unit implicit dispersion, so the latent
+    // posterior covariance is `cov_scale·H_latent⁻¹` with `cov_scale` the
+    // coefficient-covariance scale the fit used for `Vb` (`σ̂²` for a profiled
+    // Gaussian, `1` for fixed-scale Binomial). Re-applying `√cov_scale` here
+    // keeps the draw spread identical to the reported `summary().std_error`
+    // (gam#1514); the truncated-constraint path does the analogous √φ lift.
+    let sqrt_cov_scale = fit.coefficient_covariance_scale().max(0.0).sqrt();
     let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
     let samples = crate::smooth::sample_bounded_latent_posterior_internal(
         &mode,
         user_hessian,
         bounded_columns,
         n_total,
+        sqrt_cov_scale,
         chain_stream_seed(cfg.seed, 0, 0xB0DD_ED5E_ED90_1A7Cu64),
     )
     .map_err(|e| format!("standard bounded-coefficient posterior sampling failed: {e}"))?;

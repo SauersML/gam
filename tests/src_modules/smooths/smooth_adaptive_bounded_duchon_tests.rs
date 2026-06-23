@@ -3078,6 +3078,7 @@ fn bounded_latent_sampler_draws_in_bounds_and_preserves_joint() {
         &user_hessian,
         &bounded_columns,
         n_draws,
+        1.0,
         7607760,
     )
     .expect("bounded latent sampler");
