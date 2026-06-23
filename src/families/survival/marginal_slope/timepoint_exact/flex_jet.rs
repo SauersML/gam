@@ -1182,7 +1182,7 @@ mod moment_engine_tests {
     fn flex_timepoint_inputs_jet2_impl(
         primary: &FlexPrimarySlices,
         q_index: usize,
-        phi_q: f64,
+        q: f64,
         a0: f64,
         b: f64,
         d_check: f64,
@@ -1202,7 +1202,7 @@ mod moment_engine_tests {
             // lift's slope jet carries the `g` primary, so the lifted `a_jet`'s grad
             // `a_u`/Hess `a_uv` include the full intercept dependence on `g`.
             let residual =
-                |a: &Jet2| calibration_residual_jet(a, &b_jet, primary.g, &du, q_index, phi_q, cells);
+                |a: &Jet2| calibration_residual_jet(a, &b_jet, primary.g, &du, q_index, q, cells);
             let a_jet = lift_intercept_flex(&template, a0, 1.0 / d_check, 2, residual);
 
             // (a,b)-coupled channel jets. The hand `compute_survival_timepoint_exact`
@@ -1349,7 +1349,7 @@ mod moment_engine_tests {
         d_check: f64,
         primary_g: usize,
         q_index: usize,
-        phi_q: f64,
+        q: f64,
         z_obs: f64,
         o_infl: f64,
         pack: &ObservedCoeffPack,
@@ -1362,7 +1362,7 @@ mod moment_engine_tests {
         // current iterate, so the lifted `a_jet` carries the intercept's full
         // θ-jet (incl. directional channels) to order `J` automatically.
         let residual =
-            |a: &J| calibration_residual_jet(a, b_jet, primary_g, du, q_index, phi_q, cells);
+            |a: &J| calibration_residual_jet(a, b_jet, primary_g, du, q_index, q, cells);
         let a_jet = lift_intercept_flex(template, a0, 1.0 / d_check, 2, residual);
 
         // Observed eta/chi: the full bivariate `(a,b)` Taylor composed with the
@@ -1486,7 +1486,7 @@ mod moment_engine_tests {
         g_axis: usize,
         du: &[J],
         q_index: usize,
-        phi_q: f64,
+        q: f64,
         cells: &[CalibrationCellJetInputs<'_>],
     ) -> J {
         let da = tangent_jet(a_jet);
@@ -1514,10 +1514,26 @@ mod moment_engine_tests {
             }
             r = r.add(&cell_r.scale(inv_two_pi));
         }
-        // q-marginal self-term: f_u[q_index] += φ(q) ⟹ R gains −φ(q)·(q-axis tangent).
-        // (R = −F, and the hand adds +φ(q) to f_u[q_index].)
+        // q-marginal self-term, carried to ALL orders as the derivative channels of
+        // `g(q) = Φ(−q)` composed with the q-primary jet `q_jet = q + δq`. The hand
+        // adds, to the calibration F, `f_u[q] += φ(q)`, `f_uv[[q,q]] += −q·φ(q)`, and
+        // the directional `f_uv_dir[[q,q]] += dir[q]·(q²−1)·φ(q)` (first_full.rs:711,
+        // directional.rs:351). With `R = −F` and `g'(q)=−φ(q)`, `g''(q)=q·φ(q)`,
+        // `g'''(q)=(1−q²)·φ(q)`, `g''''(q)=(q³−3q)·φ(q)`, ADDING `g(q_jet)` (minus its
+        // value, to keep this term's value contribution 0 as the scalar seed already
+        // drives R≈0) reproduces every order: grad[q]=−φ(q), Hess[q,q]=q·φ(q), and the
+        // ε/εδ channels carry the directional `(q²−1)φ` / `(q³−3q)φ` q-self terms the
+        // FLAT `−φ(q)·δq` form dropped (the bug the Jet3/Jet4 gates pin).
         if q_index < du.len() {
-            r = r.sub(&du[q_index].scale(phi_q));
+            let phi_q = crate::probability::normal_pdf(q);
+            let g0 = crate::probability::normal_cdf(-q);
+            let g1 = -phi_q;
+            let g2 = q * phi_q;
+            let g3 = (1.0 - q * q) * phi_q;
+            let g4 = (q * q * q - 3.0 * q) * phi_q;
+            let q_jet = add_const(&du[q_index], q);
+            let q_self = add_const(&q_jet.compose_unary([g0, g1, g2, g3, g4]), -g0);
+            r = r.add(&q_self);
         }
         r
     }
@@ -2450,7 +2466,7 @@ mod moment_engine_tests {
             coeff_bbbu: zero_run,
         };
 
-        // Hand calibration partials (no q self-term: phi_q = 0).
+        // Hand calibration partials (no q self-term: q_index = p is out of range).
         // f_u[0] = ∫(−coeff_u0)·e^{−q}/2π ; f_a = ∫(−dc_da)·e^{−q}/2π = −D.
         let neg_coeff_u0 = coeff_u0.map(|v| -v);
         let neg_dc_da = dc_da.map(|v| -v);
@@ -3040,7 +3056,6 @@ mod moment_engine_tests {
             .expect("hand directional");
 
         // Generic Jet3 builder, seeded with the direction.
-        let phi_q = crate::probability::normal_pdf(q1);
         let pack = observed_pack_for(&family, row, a1, g);
         let cells = cells_from_cached(&cached);
         let z_obs = family.observed_score_projection(row);
@@ -3055,7 +3070,7 @@ mod moment_engine_tests {
             .collect();
         let zero = Jet3::primary(0.0, usize::MAX, p, 0.0);
         let (eta, chi, dnorm) = flex_timepoint_inputs_generic(
-            &template, &b_jet, &du, a1, d_check, primary.g, primary.q1, phi_q, z_obs, o_infl,
+            &template, &b_jet, &du, a1, d_check, primary.g, primary.q1, q1, z_obs, o_infl,
             &pack, &zero, &zero, &cells,
         )
         .expect("generic jet3");
@@ -3130,7 +3145,7 @@ mod moment_engine_tests {
         let m_beta = 0.15_f64;
         let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * m_beta;
         let o_infl = 0.0_f64;
-        let (a1, _d1) = family
+        let solved = family
             .solve_row_survival_intercept_with_slot(
                 q1,
                 g,
@@ -3139,6 +3154,7 @@ mod moment_engine_tests {
                 Some((row, SurvivalInterceptSlotKind::Exit)),
             )
             .expect("intercept solve");
+        let a1 = solved.0;
         let cached = family
             .build_cached_partition(&primary, a1, g, None, None)
             .expect("cached partition");
@@ -3153,7 +3169,6 @@ mod moment_engine_tests {
             )
             .expect("hand bidirectional");
 
-        let phi_q = crate::probability::normal_pdf(q1);
         let pack = observed_pack_for(&family, row, a1, g);
         let cells = cells_from_cached(&cached);
         let z_obs = family.observed_score_projection(row);
@@ -3169,7 +3184,7 @@ mod moment_engine_tests {
             .collect();
         let zero = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
         let (eta, chi, dnorm) = flex_timepoint_inputs_generic(
-            &template, &b_jet, &du, a1, d_check, primary.g, primary.q1, phi_q, z_obs, o_infl,
+            &template, &b_jet, &du, a1, d_check, primary.g, primary.q1, q1, z_obs, o_infl,
             &pack, &zero, &zero, &cells,
         )
         .expect("generic jet4");
