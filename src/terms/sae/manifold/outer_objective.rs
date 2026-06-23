@@ -2249,7 +2249,15 @@ mod linear_parity_anchor_1026_tests {
             ((i as f64 + 1.0) * 0.137 * (j as f64 + 1.0)).sin() + 0.3 * ((i * j) as f64).cos()
         });
         let d_true = Array2::from_shape_fn((r_true, p), |(j, c)| {
-            (1.0 + j as f64) * (((j * 5 + c * 3) % 7) as f64 - 3.0) / 3.0
+            // #1026: an ORTHOGONAL (DCT-II) basis, scaled per row, so all r_true
+            // rows are linearly INDEPENDENT and the target is genuinely rank
+            // min(r_true, p). The old `((j*5 + c*3) % 7)` form was PERIOD-7 in j —
+            // for r_true > 7 its rows collapsed into ~7 distinct directions, so a
+            // nominally "rank-24" target was actually rank ~7, the rank-16 PCA
+            // ceiling saturated at 1.0, and the large-rank fixture self-check
+            // (`ceiling < 0.9999` when dict rank < data rank) tripped.
+            (1.0 + 0.5 * j as f64)
+                * (std::f64::consts::PI * (c as f64 + 0.5) * (j as f64) / p as f64).cos()
         });
         let target = z.dot(&d_true);
         (term, target)
