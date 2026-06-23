@@ -292,16 +292,30 @@ impl SurvivalMarginalSlopeFamily {
                     }
                 }
             }
+            // D-path intercept Hessian (gam#1454). The moment-only `f_au` omits
+            // part of its §D moving-boundary flux (the same defect that forced the
+            // base/directional `a_uv` onto the D-path), so the F-path
+            // `auv = −(f_uv + f_au·au + f_au·au + f_aa·au²)·inv` diverges from the
+            // validated Hessian. Reconstruct via the single-source `d_u = ∇(−f_a)`:
+            // since `−d_u = f_au_exact + f_aa·au`, substituting yields the identical
+            // algebra with the CORRECT `f_au`. This `auv` feeds
+            // `cal_ad12 = dir1ᵀ·auv·dir2`, which threads a `cal_ad12·X` term into
+            // every second-directional cell total (cd12/cu12/cuv12/…), so the
+            // F-path error here was pervasive across all (u,v) blocks. The
+            // moment-`f_au` (and its boundary flux) above is now consumed only as a
+            // diagnostic; the Hessian no longer depends on it.
+            let d_u = self.survival_flex_base_d_u(primary, &au, cached, b, p)?;
             let mut auv = Array2::<f64>::zeros((p, p));
             for u in 0..p {
                 for v in u..p {
                     let value =
-                        -(f_uv[[u, v]] + f_au[u] * au[v] + f_au[v] * au[u] + f_aa * au[u] * au[v])
+                        -(f_uv[[u, v]] - d_u[u] * au[v] - d_u[v] * au[u] - f_aa * au[u] * au[v])
                             * inv;
                     auv[[u, v]] = value;
                     auv[[v, u]] = value;
                 }
             }
+            let _ = &f_au;
             let ad1 = au.dot(dir1);
             let ad2 = au.dot(dir2);
             let aud2 = auv.dot(dir2);
