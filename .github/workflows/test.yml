@@ -598,6 +598,20 @@ jobs:
             tests/bench_large_scale_runner_test.py \
             -v --tb=short
 
+      - name: Run full Python test suite (all test_*.py in tests/)
+        # #1512: testpaths=["tests"] means a bare `pytest` collects everything,
+        # but CI only named ~5 files explicitly. This step runs the FULL suite
+        # so orphaned test_bug_hunt_*.py contract repros execute in CI. It is
+        # `continue-on-error` initially — some test_bug_hunt_* files may fail
+        # (documenting still-open bugs); those should be triaged to
+        # @pytest.mark.xfail rather than allowed to stay orphaned. Once the
+        # known failures are triaged, flip this to a hard gate.
+        continue-on-error: true
+        run: |
+          python -m pytest tests/ \
+            --continue-on-collection-errors \
+            -v --tb=short -q
+
       - name: Build gam release binary
         # The integration scripts below shell out to target/release/gam.
         # The maturin wheel build above produces the Python extension, not
