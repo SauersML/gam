@@ -89,7 +89,20 @@ pub(crate) fn build_model_summary(
                 gam::types::InverseLink::Standard(gam::types::StandardLink::Identity),
             ))
         } else {
-            gam::types::GlmLikelihoodSpec::canonical(family.clone())
+            // Use the fit's *estimated* scale metadata, not the family default.
+            // For Gamma the unit deviance is multiplied by the estimated shape
+            // (calculate_deviance, deviance.rs), and `fit.deviance` already
+            // carries that estimated shape (PIRLS bakes it in via
+            // `with_gamma_shape`). `canonical(family)` would reset the shape to
+            // the default 1.0, so the null deviance would be scaled differently
+            // from the full deviance and the ratio `1 − D_full/D_null` would be
+            // contaminated by the shape factor. Threading the fitted scale here
+            // keeps both deviances on the same scale so it cancels exactly (the
+            // same applies to any other scale-carrying family, e.g. Beta φ).
+            gam::types::GlmLikelihoodSpec {
+                spec: family.clone(),
+                scale: fit.likelihood_scale,
+            }
         };
         gam::pirls::calculate_deviance(y, &nullmu, &null_likelihood, weights)
     };
