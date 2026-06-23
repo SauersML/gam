@@ -1120,6 +1120,19 @@ pub fn enrich_posterior_mean_bounds(
     link_kind: Option<&InverseLink>,
 ) -> Result<(), EstimationError> {
     let spec = spec_from_family_link(family, link_kind);
+    // Delta-method response SE `SE(μ̂) = |dμ/dη|·SE(η)`, supplied to the bound
+    // builder as a finite fallback: on a degenerate fit (an all-zero Poisson
+    // flat likelihood leaves SE(η) in the thousands) the TransformEta endpoint
+    // `g⁻¹(η ± z·SE(η))` overflows to `+inf`, which serializes to JSON null and
+    // surfaces as a non-finite interval column in the Python shaper. The
+    // fallback degrades such rows to `μ ± z·SE(μ̂)`, so a fitted model always
+    // yields finite bounds (#1515).
+    let strategy = strategy_for_spec(&spec);
+    let mut mean_se = Array1::<f64>::zeros(result.eta.len());
+    for i in 0..result.eta.len() {
+        let dmu_deta = strategy.inverse_link_jet(result.eta[i])?.d1;
+        mean_se[i] = dmu_deta.abs() * result.eta_standard_error[i];
+    }
     // TransformEta bounds: transform the η endpoints through the inverse link,
     // handle non-monotone transforms, and clamp to the family support. The
     // shared engine owns this construction so it cannot drift from the
@@ -1131,6 +1144,7 @@ pub fn enrich_posterior_mean_bounds(
         MeanBoundMethod::TransformEta {
             bounds: ResponseBounds::for_family(&spec.response),
             response_map: &|eta: &Array1<f64>| apply_family_inverse_link(eta, &spec),
+            mean_se: Some(&mean_se),
         },
     )
 }
