@@ -295,8 +295,33 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             | (ResponseFamily::Tweedie { .. }, _)
             | (ResponseFamily::NegativeBinomial { .. }, _)
             | (ResponseFamily::Gamma, _) => {
-                // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)  (log-normal MGF)
-                Ok((eta + 0.5 * se_eta * se_eta).exp())
+                // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)
+                // (log-normal MGF). When the likelihood is near-flat (e.g.
+                // all-zero Poisson counts) the posterior SE is astronomically
+                // wide and `0.5·se²` overflows the exponent, producing +inf —
+                // which the FFI serializes as JSON null (issue #1515). In that
+                // regime the posterior-integrated mean is numerically
+                // meaningless; fall back to the plug-in `exp(eta)` (the exact
+                // public inverse-link at the floored point estimate) so
+                // predict() stays finite and non-negative.
+                let exponent = eta + 0.5 * se_eta * se_eta;
+                if exponent.is_finite() {
+                    let mgf = exponent.exp();
+                    if mgf.is_finite() {
+                        return Ok(mgf);
+                    }
+                }
+                // Overflow: fall back to the exact plug-in exp(η). If even that
+                // is not f64-representable the true mean genuinely exceeds the
+                // f64 range, so saturate to the largest finite f64 (a monotone,
+                // non-arbitrary boundary — no magic exponent cutoff) rather than
+                // returning +inf and serializing to null.
+                let plugin = eta.exp();
+                if plugin.is_finite() {
+                    Ok(plugin)
+                } else {
+                    Ok(f64::MAX)
+                }
             }
             (ResponseFamily::Beta { .. }, _) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta).0)
