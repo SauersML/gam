@@ -129,7 +129,6 @@ impl SurvivalMarginalSlopeFamily {
         Ok(FlexThirdRowBase {
             row,
             p: primary.total,
-            qd1_index: primary.qd1,
             qd1,
             q0,
             q1,

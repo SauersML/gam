@@ -241,7 +241,6 @@ pub(crate) struct CachedPartitionCells {
 pub(crate) struct FlexThirdRowBase {
     pub(crate) row: usize,
     pub(crate) p: usize,
-    pub(crate) qd1_index: usize,
     pub(crate) qd1: f64,
     pub(crate) q0: f64,
     pub(crate) q1: f64,
