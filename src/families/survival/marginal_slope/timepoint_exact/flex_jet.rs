@@ -837,6 +837,7 @@ impl SurvivalMarginalSlopeFamily {
 mod moment_engine_tests {
     use super::*;
     use crate::families::cubic_cell_kernel::{reduce_sextic_moments, DenestedCubicCell};
+    use crate::families::marginal_slope_shared::eval_coeff4_at;
 
     // #932: the `recip`/`exp`/`add_const` jet helpers (formerly `FlexJet` default
     // methods) live here as free generic fns — only the relocated moment-engine /
@@ -1188,8 +1189,7 @@ mod moment_engine_tests {
         z_obs: f64,
         o_infl: f64,
         pack: &ObservedCoeffPack,
-        rho: &[f64],
-        tau: &[f64],
+        channels: &FlexChannelInputs<'_>,
         cells: &[CalibrationCellJetInputs<'_>],
     ) -> Result<FlexTimepointJet2Out, String> {
         {
@@ -1198,25 +1198,50 @@ mod moment_engine_tests {
             let b_jet = Jet2::primary(b, primary.g, p);
             let du: Vec<Jet2> = (0..p).map(|u| Jet2::primary(0.0, u, p)).collect();
 
-            // Intercept lift to Jet2 (value/grad/Hess) — 2 Newton iterations.
+            // Intercept lift to Jet2 (value/grad/Hess) — 2 Newton iterations. The
+            // lift's slope jet carries the `g` primary, so the lifted `a_jet`'s grad
+            // `a_u`/Hess `a_uv` include the full intercept dependence on `g`.
             let residual =
                 |a: &Jet2| calibration_residual_jet(a, &b_jet, primary.g, &du, q_index, phi_q, cells);
             let a_jet = lift_intercept_flex(&template, a0, 1.0 / d_check, 2, residual);
 
-            // rho/tau channel jets: Σ_idx rho[idx]·(unit primary jet at idx).
-            let mut rho_jet = const_jet_like(&template, 0.0);
-            let mut tau_jet = const_jet_like(&template, 0.0);
-            for idx in 0..p {
-                if rho[idx] != 0.0 {
-                    rho_jet = rho_jet.add(&Jet2::primary(0.0, idx, p).scale(rho[idx]));
-                }
-                if tau[idx] != 0.0 {
-                    tau_jet = tau_jet.add(&Jet2::primary(0.0, idx, p).scale(tau[idx]));
-                }
-            }
+            // (a,b)-coupled channel jets. The hand `compute_survival_timepoint_exact`
+            // adds, on top of the pure-`a` chain (`chi·a_uv + eta_aa·a_u·a_v` /
+            // `eta_aa·a_uv + eta_aaa·a_u·a_v`), the second-order CHANNEL coupling
+            //   eta_uv += tau[u]·a_u[v] + tau[v]·a_u[u] + r_uv               (first_full.rs:972)
+            //   chi_uv += tau_a[u]·a_u[v] + tau_a[v]·a_u[u] + chi_uv_fixed   (first_full.rs:980)
+            // (`tau`/`tau_a` = `dc_dab`/`dc_daab` on `g`, `dc_aw`/`dc_aaw` on `w`;
+            // `r_uv`/`chi_uv_fixed` the fixed `g×g`, `g×h`, `g×w` partials). A flat
+            // linear `rho[idx]·primary` jet carries NONE of this, leaving the Jet2
+            // Hessian wrong for every flex model with `h`/`w`/`g` primaries. So the
+            // channel jets must carry their first-order `rho`/`tau` AND this exact
+            // second-order content, built from the lifted `a_jet`'s gradient `a_u`.
+            //
+            // To avoid double-counting the `g`-axis, the observed-coeff bivariate
+            // `(a,b)` composition runs against a CONSTANT slope jet (`db = 0`), so the
+            // observed `eta`/`chi` carry only the pure-`a` chain; ALL of the `g`/`h`/
+            // `w`/`infl` first- and second-order content is single-sourced through the
+            // channel jets (the hand `rho`/`tau`/`tau_a` vectors carry `g` in slot
+            // `primary.g`, mirrored here).
+            let a_u = a_jet.g.clone();
+            let rho_jet = channel_jet2(
+                p,
+                channels.rho,
+                channels.tau,
+                &a_u,
+                channels.eta_fixed_uv,
+            );
+            let tau_jet = channel_jet2(
+                p,
+                channels.tau,
+                channels.tau_a,
+                &a_u,
+                channels.chi_fixed_uv,
+            );
+            let b_jet_obs = const_jet_like(&template, b);
 
             let (eta, chi) =
-                flex_timepoint_eta_chi(&a_jet, &b_jet, z_obs, o_infl, pack, &rho_jet, &tau_jet);
+                flex_timepoint_eta_chi(&a_jet, &b_jet_obs, z_obs, o_infl, pack, &rho_jet, &tau_jet);
 
             // D = Σ_cells INV_TWO_PI·Σ_k χ_k·M_k, χ from cell_chi_poly_jets, M from
             // the cell coeff jets through the lifted a_jet.
@@ -1255,6 +1280,45 @@ mod moment_engine_tests {
                 d_h: to_h(&d)?,
             })
         }
+    }
+
+    /// The score-warp(`h`)/link-dev(`w`)/`g`/`infl` linear-channel inputs for
+    /// [`flex_timepoint_inputs_jet2_impl`]: the hand `rho`/`tau`/`tau_a` first-order
+    /// channel-weight vectors (`eval_coeff4_at(dc_db/dc_dab/dc_daab …)`,
+    /// first_full.rs:909-953) and the fixed second-partial matrices `r_uv`
+    /// (`observed_fixed_eta_second_partial`) / `chi_uv_fixed`
+    /// (`observed_fixed_chi_second_partial`). The channel jets carry the EXACT
+    /// second-order coupling `tau[u]·a_u[v]+tau[v]·a_u[u]+fixed_uv` so the Jet2
+    /// Hessian matches the hand `eta_uv`/`chi_uv` term for term.
+    struct FlexChannelInputs<'a> {
+        rho: &'a [f64],
+        tau: &'a [f64],
+        tau_a: &'a [f64],
+        eta_fixed_uv: &'a Array2<f64>,
+        chi_fixed_uv: &'a Array2<f64>,
+    }
+
+    /// A `Jet2` linear-channel jet: value 0, gradient `grad`, and the `(a,b)`-coupled
+    /// Hessian `h[u,v] = cross[u]·a_u[v] + cross[v]·a_u[u] + fixed_uv[u,v]` — the
+    /// exact second-order channel content the hand `compute_survival_timepoint_exact`
+    /// adds to `eta_uv`/`chi_uv` (with `grad`/`cross` = `rho`/`tau` for the `eta`
+    /// channel, `tau`/`tau_a` for the `chi` channel, and `a_u` the lifted intercept
+    /// gradient). A flat first-order jet (the prior seeding) carries zero Hessian and
+    /// is therefore wrong for any flex model with active `h`/`w`/`g` primaries.
+    fn channel_jet2(
+        p: usize,
+        grad: &[f64],
+        cross: &[f64],
+        a_u: &[f64],
+        fixed_uv: &Array2<f64>,
+    ) -> Jet2 {
+        let mut h = vec![0.0_f64; p * p];
+        for u in 0..p {
+            for v in 0..p {
+                h[u * p + v] = cross[u] * a_u[v] + cross[v] * a_u[u] + fixed_uv[[u, v]];
+            }
+        }
+        Jet2::from_parts(0.0, grad, &h)
     }
 
     /// The `Jet2` timepoint inputs `(eta, chi, d)` value/gradient/Hessian channels
@@ -2436,6 +2500,16 @@ mod moment_engine_tests {
         };
         let rho = vec![0.0_f64; p];
         let tau = vec![0.0_f64; p];
+        let tau_a = vec![0.0_f64; p];
+        let eta_fixed_uv = Array2::<f64>::zeros((p, p));
+        let chi_fixed_uv = Array2::<f64>::zeros((p, p));
+        let channels = FlexChannelInputs {
+            rho: &rho,
+            tau: &tau,
+            tau_a: &tau_a,
+            eta_fixed_uv: &eta_fixed_uv,
+            chi_fixed_uv: &chi_fixed_uv,
+        };
         let cells = vec![CalibrationCellJetInputs {
             base_pos_coeffs: [cell.c0, cell.c1, cell.c2, cell.c3],
             fixed: &fixed,
@@ -2447,7 +2521,7 @@ mod moment_engine_tests {
         }];
 
         let out = flex_timepoint_inputs_jet2_impl(
-            &primary, primary.q1, 0.0, 0.31, 1.1, d_check, z_obs, o_infl, &pack, &rho, &tau, &cells,
+            &primary, primary.q1, 0.0, 0.31, 1.1, d_check, z_obs, o_infl, &pack, &channels, &cells,
         )
         .expect("jet timepoint inputs");
 
@@ -2502,6 +2576,232 @@ mod moment_engine_tests {
             assert_eq!(mat.shape(), [p, p]);
             for v in mat.iter() {
                 assert!(v.is_finite(), "Hessian channel finite");
+            }
+        }
+    }
+
+    /// #932 item-2 STEP 3b (the bug fix): the `Jet2` `eta_uv`/`chi_uv` Hessian must
+    /// reproduce the hand `compute_survival_timepoint_exact` channel coupling EXACTLY
+    /// (≤1e-9) — NOT just finite — for a flex model with active `h`/`w`/`g`
+    /// primaries. The hand (first_full.rs:972-988) assembles
+    ///
+    ///   eta_uv[u,v] = chi·a_uv + eta_aa·a_u[u]·a_u[v]
+    ///               + tau[u]·a_u[v] + tau[v]·a_u[u] + r_uv
+    ///   chi_uv[u,v] = eta_aa·a_uv + eta_aaa·a_u[u]·a_u[v]
+    ///               + tau_a[u]·a_u[v] + tau_a[v]·a_u[u] + chi_uv_fixed
+    ///
+    /// The PRIOR seeding made `rho`/`tau` flat first-order jets (zero Hessian),
+    /// dropping the `tau·a_u` cross-terms and the fixed `r_uv`/`chi_uv_fixed` second
+    /// partials — so the Jet2 Hessian was wrong for the normal flex config. This gate
+    /// pins the full second-order channel content against the hand formula, evaluated
+    /// from the jet's OWN lifted `a_jet` (grad `a_u`, Hess `a_uv`), `chi`/`eta_aa`/
+    /// `eta_aaa` from the observed pack, and non-trivial `rho`/`tau`/`tau_a`/
+    /// `r_uv`/`chi_uv_fixed` — exercising every term the bug omitted.
+    #[test]
+    fn flex_timepoint_inputs_jet2_hessian_matches_hand_channel_coupling_932() {
+        use crate::families::cubic_cell_kernel::{
+            cell_first_derivative_from_moments, evaluate_cell_moments, DenestedCubicCell,
+            PartitionEdge,
+        };
+
+        // p=4: q at 0, g (slope) at 1, one h (score-warp) axis at 2, one w
+        // (link-dev) axis at 3. The channel coupling is exercised on every
+        // (u,v) pair including the cross axes g×h, g×w, h×w.
+        let p = 4usize;
+        let g_axis = 1usize;
+        let h_axis = 2usize;
+        let w_axis = 3usize;
+        let primary = FlexPrimarySlices {
+            q0: 0,
+            q1: 0,
+            qd1: 0,
+            g: g_axis,
+            h: Some(h_axis..h_axis + 1),
+            w: Some(w_axis..w_axis + 1),
+            infl: None,
+            total: p,
+        };
+
+        // Calibration cell with non-trivial per-primary partials so the lifted
+        // a_jet carries a NON-ZERO gradient a_u AND Hessian a_uv on every axis —
+        // the multipliers of the channel cross-terms under test.
+        let cell = DenestedCubicCell {
+            left: -1.1,
+            right: 1.3,
+            c0: 0.22,
+            c1: -0.18,
+            c2: 0.13,
+            c3: 0.04,
+        };
+        let numeric = evaluate_cell_moments(cell, 27)
+            .expect("numeric moments")
+            .moments
+            .into_vec();
+        let dc_da = [0.85_f64, 0.21, 0.06, 0.0];
+        // Per-primary first/second sensitivities of the calibration coefficient:
+        // drive a_u/a_uv on q(0), g(1), h(2), w(3).
+        let mk_run = |base: [f64; 4], step: f64| -> Vec<[f64; 4]> {
+            (0..p)
+                .map(|u| base.map(|c| c * (0.1 + step * (u as f64 + 1.0))))
+                .collect()
+        };
+        let fixed = DenestedCellPrimaryFixedPartials {
+            dc_da,
+            dc_daa: [0.05, 0.02, 0.0, 0.0],
+            dc_daaa: [0.004, 0.0, 0.0, 0.0],
+            coeff_u: mk_run([0.3, 0.1, 0.02, 0.0], 0.07),
+            coeff_au: mk_run([0.12, 0.04, 0.0, 0.0], 0.05),
+            coeff_bu: mk_run([0.09, 0.03, 0.0, 0.0], 0.04),
+            coeff_aau: mk_run([0.02, 0.0, 0.0, 0.0], 0.01),
+            coeff_abu: mk_run([0.015, 0.0, 0.0, 0.0], 0.01),
+            coeff_bbu: mk_run([0.01, 0.0, 0.0, 0.0], 0.008),
+            coeff_aaau: vec![[0.0; 4]; p],
+            coeff_aabu: vec![[0.0; 4]; p],
+            coeff_abbu: vec![[0.0; 4]; p],
+            coeff_bbbu: vec![[0.0; 4]; p],
+        };
+        let neg_dc_da = dc_da.map(|v| -v);
+        let f_a = cell_first_derivative_from_moments(&neg_dc_da, &numeric).expect("f_a");
+        let d_check = f_a.abs();
+
+        let z_obs = 0.55_f64;
+        let o_infl = 0.0_f64;
+        let b = 1.07_f64;
+        let a0 = 0.29_f64;
+        let pack = ObservedCoeffPack {
+            coeff: [0.21, -0.27, 0.14, 0.05],
+            dc_da: [1.05, 0.19, 0.04, 0.0],
+            dc_db: [0.41, 1.02, 0.09, 0.02],
+            dc_daa: [0.08, 0.03, 0.0, 0.0],
+            dc_dab: [0.22, 0.1, 0.012, 0.0],
+            dc_dbb: [0.13, 0.05, 0.006, 0.0],
+            dc_daaa: [0.0035, 0.0, 0.0, 0.0],
+            dc_daab: [0.007, 0.0012, 0.0, 0.0],
+            dc_dabb: [0.0045, 0.0023, 0.0, 0.0],
+            dc_dbbb: [0.0085, 0.0011, 0.0, 0.0],
+        };
+        // Non-trivial channel weights on g/h/w (the hand `rho`/`tau`/`tau_a`).
+        // `rho[g]=dc_db`, `tau[g]=dc_dab`, `tau_a[g]=dc_daab` (evaluated at z_obs),
+        // plus independent h/w channel entries.
+        let mut rho = vec![0.0_f64; p];
+        let mut tau = vec![0.0_f64; p];
+        let mut tau_a = vec![0.0_f64; p];
+        rho[g_axis] = eval_coeff4_at(&pack.dc_db, z_obs);
+        rho[h_axis] = 0.37;
+        rho[w_axis] = 0.29;
+        tau[g_axis] = eval_coeff4_at(&pack.dc_dab, z_obs);
+        tau[w_axis] = 0.18;
+        tau_a[g_axis] = eval_coeff4_at(&pack.dc_daab, z_obs);
+        tau_a[w_axis] = 0.11;
+        // Fixed second partials r_uv (eta) / chi_uv_fixed: symmetric, with the
+        // g×g, g×h, g×w structure the hand `observed_fixed_*_second_partial`
+        // produces. Values are arbitrary-but-nonzero to pin the +fixed_uv add.
+        let mut eta_fixed_uv = Array2::<f64>::zeros((p, p));
+        let mut chi_fixed_uv = Array2::<f64>::zeros((p, p));
+        let set_sym = |m: &mut Array2<f64>, i: usize, j: usize, v: f64| {
+            m[[i, j]] = v;
+            m[[j, i]] = v;
+        };
+        set_sym(&mut eta_fixed_uv, g_axis, g_axis, 0.14);
+        set_sym(&mut eta_fixed_uv, g_axis, h_axis, 0.21);
+        set_sym(&mut eta_fixed_uv, g_axis, w_axis, 0.17);
+        set_sym(&mut chi_fixed_uv, g_axis, g_axis, 0.09);
+        set_sym(&mut chi_fixed_uv, g_axis, w_axis, 0.12);
+
+        let channels = FlexChannelInputs {
+            rho: &rho,
+            tau: &tau,
+            tau_a: &tau_a,
+            eta_fixed_uv: &eta_fixed_uv,
+            chi_fixed_uv: &chi_fixed_uv,
+        };
+        let cells = vec![CalibrationCellJetInputs {
+            base_pos_coeffs: [cell.c0, cell.c1, cell.c2, cell.c3],
+            fixed: &fixed,
+            cell_left: cell.left,
+            cell_right: cell.right,
+            // Crossing edges so the moving-boundary flux is active in a_uv / d.
+            left_edge: PartitionEdge::Crossing { tau: cell.left * b + a0 },
+            right_edge: PartitionEdge::Crossing { tau: cell.right * b + a0 },
+            numeric_moments: &numeric,
+        }];
+
+        let out = flex_timepoint_inputs_jet2_impl(
+            &primary, primary.q1, 0.0, a0, b, d_check, z_obs, o_infl, &pack, &channels, &cells,
+        )
+        .expect("jet timepoint inputs");
+
+        // Reconstruct the lifted a_jet's gradient/Hessian by re-running the same
+        // lift (the impl uses these internally) so the hand formula is evaluated
+        // against the IDENTICAL intercept derivatives the jet used.
+        let template = Jet2::from_parts(0.0, &vec![0.0; p], &[]);
+        let b_jet = Jet2::primary(b, g_axis, p);
+        let du: Vec<Jet2> = (0..p).map(|u| Jet2::primary(0.0, u, p)).collect();
+        let residual =
+            |a: &Jet2| calibration_residual_jet(a, &b_jet, g_axis, &du, primary.q1, 0.0, &cells);
+        let a_jet = lift_intercept_flex(&template, a0, 1.0 / d_check, 2, residual);
+        let a_u = a_jet.g.clone();
+        let a_uv = |u: usize, v: usize| a_jet.h[u * p + v];
+
+        // Observed scalars at z_obs (the hand's chi / eta_aa / eta_aaa).
+        let chi = eval_coeff4_at(&pack.dc_da, z_obs);
+        let eta_aa = eval_coeff4_at(&pack.dc_daa, z_obs);
+        let eta_aaa = eval_coeff4_at(&pack.dc_daaa, z_obs);
+
+        // EXACT match of the full hand channel-coupled Hessian (first_full.rs).
+        for u in 0..p {
+            for v in 0..p {
+                let eta_hand = chi * a_uv(u, v)
+                    + eta_aa * a_u[u] * a_u[v]
+                    + tau[u] * a_u[v]
+                    + tau[v] * a_u[u]
+                    + eta_fixed_uv[[u, v]];
+                let chi_hand = eta_aa * a_uv(u, v)
+                    + eta_aaa * a_u[u] * a_u[v]
+                    + tau_a[u] * a_u[v]
+                    + tau_a[v] * a_u[u]
+                    + chi_fixed_uv[[u, v]];
+                assert!(
+                    (out.eta_h[[u, v]] - eta_hand).abs() <= 1e-9 * (1.0 + eta_hand.abs()),
+                    "eta_uv[{u},{v}] jet {} != hand {}",
+                    out.eta_h[[u, v]],
+                    eta_hand
+                );
+                assert!(
+                    (out.chi_h[[u, v]] - chi_hand).abs() <= 1e-9 * (1.0 + chi_hand.abs()),
+                    "chi_uv[{u},{v}] jet {} != hand {}",
+                    out.chi_h[[u, v]],
+                    chi_hand
+                );
+            }
+        }
+
+        // Gradient too: eta_u = chi·a_u + rho, chi_u = eta_aa·a_u + tau.
+        for u in 0..p {
+            let eta_u_hand = chi * a_u[u] + rho[u];
+            let chi_u_hand = eta_aa * a_u[u] + tau[u];
+            assert!(
+                (out.eta[u] - eta_u_hand).abs() <= 1e-9 * (1.0 + eta_u_hand.abs()),
+                "eta_u[{u}] jet {} != hand {}",
+                out.eta[u],
+                eta_u_hand
+            );
+            assert!(
+                (out.chi[u] - chi_u_hand).abs() <= 1e-9 * (1.0 + chi_u_hand.abs()),
+                "chi_u[{u}] jet {} != hand {}",
+                out.chi[u],
+                chi_u_hand
+            );
+        }
+
+        // d_uv must be symmetric and finite (the moment-recurrence D Hessian).
+        for u in 0..p {
+            for v in 0..p {
+                assert!(out.d_h[[u, v]].is_finite(), "d_uv finite");
+                assert!(
+                    (out.d_h[[u, v]] - out.d_h[[v, u]]).abs() <= 1e-9,
+                    "d_uv symmetric at [{u},{v}]"
+                );
             }
         }
     }
