@@ -3735,13 +3735,28 @@ pub(crate) fn cap_default_spatial_centers(
 }
 
 fn default_matern_center_count(n: usize, d: usize, planned_count: usize) -> usize {
-    // The generic spatial heuristic intentionally caps defaults at n/4 for
-    // high-dimensional operator conditioning.  A 1-D Matérn smooth with very
-    // small n needs a few more centers to avoid a two-column centered kernel
-    // block that is numerically fragile and too stiff for simple polynomial
-    // recovery tests.  Keep this Matérn-specific and still bounded by n.
+    // #1074: size the default Matérn basis to mgcv's gp default `k = 10·3^(d-1)`
+    // (10/30/90 in 1/2/3-D), NOT the generic n-scaling spatial heuristic. The
+    // n-scaling default (`default_num_centers(800,2)=134`) over-sizes the kernel
+    // ~4× vs mgcv's 2-D default of 30, leaving surplus columns REML cannot fully
+    // penalize on weak-signal spatial data: the quakes `matern(long,lat)` fit
+    // reached EDF≈28 (vs mgcv≈14) with held-out R²≈0.08. Mirror the thin-plate
+    // cap landed for `bs="tp"` (see `build_smooth_basis`): take mgcv's total
+    // dimension minus the linear polynomial nullspace, capped by the n-scaling
+    // plan so tiny-`n` plans are never inflated. An explicit `k`/`centers` still
+    // takes full effect upstream via `parse_countwith_basis_alias`.
+    let mgcv_total_dim = THIN_PLATE_1D_DEFAULT_BASIS_DIM
+        .saturating_mul(3usize.saturating_pow(d.max(1) as u32 - 1));
+    let nullspace_dim = crate::basis::duchon_nullspace_dimension(d, 1);
+    let target_centers = mgcv_total_dim.saturating_sub(nullspace_dim).max(1);
+    // A 1-D Matérn smooth with very small n needs a few more centers to avoid a
+    // two-column centered kernel block that is numerically fragile and too stiff
+    // for simple polynomial recovery tests. Keep that floor, still bounded by n.
     let low_n_floor = (d + 4).min(n);
-    planned_count.max(low_n_floor).max(1)
+    planned_count
+        .min(target_centers)
+        .max(low_n_floor)
+        .max(1)
 }
 
 pub fn parse_countwith_basis_alias(
