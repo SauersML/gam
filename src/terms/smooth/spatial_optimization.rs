@@ -8200,6 +8200,38 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // (the pilot path is gated on a large-n threshold).
     apply_response_aware_anisotropy_seed(data, y.view(), &mut resolvedspec, &spatial_terms);
 
+    // #1464: pin each constant-curvature term's κ to the κ-FAIR sign-scan value
+    // BEFORE the baseline fit. The production profiled-REML criterion
+    // (`fixed_kappa_profiled_reml_score`) that drives BOTH the baseline geometry
+    // and the joint solve's accept-vs-baseline gate (`joint_final_value >
+    // baseline_score`) is SIGN-BLIND — its data-fit term decreases monotonically
+    // toward +κ for either truth sign, so a baseline left at κ = 0 always beats a
+    // correctly-signed-but-negative κ candidate on raw REML, and the gate discards
+    // the right answer (hyperbolic κ̂ → 0, recovered as spherical). Only the κ-fair
+    // scan (`constant_curvature_kappa_fair_sign_score`, which subtracts the
+    // design's generic radial-peak-fitting power) identifies the sign; since the κ
+    // MAGNITUDE is unidentified (raw V_p rails to a chart bound regardless), the
+    // scan's argmin is the authoritative κ̂. Pinning the baseline there makes the
+    // baseline, the frozen joint candidate (see the κ-PIN in
+    // `try_exact_joint_spatial_length_scale_optimization`), and the gate all agree
+    // on the sign-correct κ. Byte-identical for genuinely spherical data (the scan
+    // and the raw criterion both pick the +bound there) and for non-CC spatial
+    // terms (never entered). A scan result of κ = 0 (genuinely flat) leaves κ as-is.
+    for term_idx in constant_curvature_term_indices(&resolvedspec) {
+        if let Some(kappa_seed) =
+            select_constant_curvature_kappa_sign_seed(data, y.view(), &resolvedspec, term_idx)
+            && kappa_seed != 0.0
+            && let Some(SmoothBasisSpec::ConstantCurvature { spec: cc, .. }) =
+                resolvedspec.smooth_terms.get_mut(term_idx).map(|t| &mut t.basis)
+        {
+            log::info!(
+                "[#1464] pinned CC term {term_idx} baseline κ to κ-fair scan value {kappa_seed} \
+                 (raw profiled REML is sign-blind; scan is authoritative for the sign)"
+            );
+            cc.kappa = kappa_seed;
+        }
+    }
+
     let baseline_options = superseded_fit_options(options);
     let best = fit_term_collection_forspec(
         data,
