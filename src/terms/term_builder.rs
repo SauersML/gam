@@ -4248,6 +4248,8 @@ mod tests {
                 BSplineKnotSpec::Provided(ref knots) => {
                     knots.len().saturating_sub(marginal.degree + 1)
                 }
+                // cr basis dimension equals the knot count (no degree offset).
+                BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
             })
             .product()
     }
@@ -4285,6 +4287,8 @@ mod tests {
                 BSplineKnotSpec::Provided(ref knots) => {
                     knots.len().saturating_sub(marginal.degree + 1)
                 }
+                // cr basis dimension equals the knot count (no degree offset).
+                BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
             })
             .collect()
     }
