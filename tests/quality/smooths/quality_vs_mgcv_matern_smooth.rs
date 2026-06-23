@@ -348,6 +348,10 @@ fn gam_matern_smooth_recovers_truth_on_real_data() {
 #[test]
 fn diag_matern_internals_1074() {
     init_parallelism();
+    // #1074: surface the κ outer-optimizer's own OUTER-FD-AUDIT (analytic-vs-FD
+    // ψ-gradient) and KAPPA-PHASE ψ-iterate trace, to understand WHY the 1-D
+    // κ-optimizer does not descend from its seed. Writes to stderr (--nocapture).
+    gam::solver::visualizer::init_logging();
     let n = 180usize;
     let mut rng = StdRng::seed_from_u64(456);
     let ux = Uniform::new(0.0, 1.0).unwrap();
