@@ -1897,28 +1897,6 @@ pub(super) fn rigid_standard_normal_third_full(
     Ok(rigid_standard_normal_tower(marginal, g, z, y, w, probit_scale)?.t3)
 }
 
-/// Pack the four independent components of a fully-symmetric 3-tensor on
-/// a 2-dim primary space into the dense `[[[f64; 2]; 2]; 2]` representation
-/// callers slice. Index ordering follows `T[a][b][c]` = ∂³f/∂p_a ∂p_b ∂p_c.
-#[inline]
-pub(super) fn third_full_from_symmetric_components(
-    t_qqq: f64,
-    t_qqg: f64,
-    t_qgg: f64,
-    t_ggg: f64,
-) -> [[[f64; 2]; 2]; 2] {
-    let mut t = [[[0.0; 2]; 2]; 2];
-    t[0][0][0] = t_qqq;
-    t[0][0][1] = t_qqg;
-    t[0][1][0] = t_qqg;
-    t[1][0][0] = t_qqg;
-    t[0][1][1] = t_qgg;
-    t[1][0][1] = t_qgg;
-    t[1][1][0] = t_qgg;
-    t[1][1][1] = t_ggg;
-    t
-}
-
 /// Contract a symmetric 3-tensor on its third index with a primary-space
 /// direction `d = (d_eta, d_g)`, producing the symmetric 2×2 contracted
 /// matrix the outer-derivative pipeline consumes:
@@ -1960,41 +1938,6 @@ pub(super) fn rigid_standard_normal_fourth_full(
     // `HandRigidProbitKernel` witness in
     // `rigid_standard_normal_tower_path_matches_hand_chain_witness`.
     Ok(rigid_standard_normal_tower(marginal, g, z, y, w, probit_scale)?.t4)
-}
-
-/// Pack the five independent components of a fully-symmetric 4-tensor on a
-/// 2-dim primary space into the dense `[[[[f64; 2]; 2]; 2]; 2]` form.
-/// Index ordering: `T[a][b][c][d]` = ∂⁴f/∂p_a ∂p_b ∂p_c ∂p_d, symmetric in
-/// all four indices, so each of the 16 entries is fixed by the multi-set
-/// `{#η, #g}` of its index pattern.
-#[inline]
-pub(super) fn fourth_full_from_symmetric_components(
-    t_qqqq: f64,
-    t_qqqg: f64,
-    t_qqgg: f64,
-    t_qggg: f64,
-    t_gggg: f64,
-) -> [[[[f64; 2]; 2]; 2]; 2] {
-    let mut t = [[[[0.0; 2]; 2]; 2]; 2];
-    for a in 0..2 {
-        for b in 0..2 {
-            for c in 0..2 {
-                for d in 0..2 {
-                    let g_count = a + b + c + d; // count of `g` indices, 0..=4
-                    // a,b,c,d ∈ {0,1} so g_count ∈ 0..=4; the final arm catches
-                    // any unexpected value defensively without panicking.
-                    t[a][b][c][d] = match g_count {
-                        0 => t_qqqq,
-                        1 => t_qqqg,
-                        2 => t_qqgg,
-                        3 => t_qggg,
-                        _ => t_gggg,
-                    };
-                }
-            }
-        }
-    }
-    t
 }
 
 /// Contract a symmetric 4-tensor on its last two indices with two

@@ -127,6 +127,44 @@ pub trait JetScalar<const K: usize>: Copy {
     }
 }
 
+/// Filtered Hensel lift of a SCALAR implicit state `a(θ)` defined by the
+/// constraint `F(a, θ) = 0`, evaluated in ANY [`JetScalar`] algebra `S` (doc
+/// §11, "A generic implicit-lift operator for every production scalar").
+///
+/// This is the perf-respecting alternative to lifting through a dense
+/// `Tower4<K+1>` (which carries the implicit variable as an extra dense axis):
+/// the state `a` lives directly in the consumer's own `K`-primary algebra
+/// `S` — `Order2<K>` for value/gradient/Hessian, `Tower4<K>` for the full
+/// `t3`/`t4` — never paying for an extra variable.
+///
+/// **Method.** Fixed-Jacobian Newton in the nilpotent algebra. By the
+/// filtered-lift theorem (doc §11.1), if `F_a := ∂F/∂a(a₀, θ₀)` is the primal
+/// Jacobian at the base point and `inv_fa = 1/F_a`, then the iteration
+/// `A ← A − inv_fa · F(A, θ)` raises the filtration degree of the residual by
+/// at least one per step: each step kills exactly one graded layer. Starting
+/// from `A = const(a₀)` (whose residual lies in `F¹` because `θ − θ₀ ∈ 𝔫`),
+/// `iters` equal to the algebra's nilpotency order returns the *exact* lifted
+/// jet (`Order2`: 2, `OneSeed`: 3, `Tower4`/`TwoSeed`: 4). The value channel of
+/// `A` never moves — `F(A, θ).value() = F(a₀, θ₀) = 0` at the certified root —
+/// so a caller may precompute every primitive's derivative stack at the fixed
+/// base index once and let the cheap polynomial composition repeat per step.
+///
+/// `f` evaluates the constraint `F(a, θ)` in `S` (capturing the seeded
+/// parameter jets `θ`); `a0` is the certified scalar root `F(a₀, θ₀) ≈ 0`.
+pub fn filtered_implicit_solve_scalar<const K: usize, S: JetScalar<K>>(
+    a0: f64,
+    inv_fa: f64,
+    iters: usize,
+    f: impl Fn(&S) -> S,
+) -> S {
+    let mut a = S::constant(a0);
+    for _ in 0..iters {
+        let residual = f(&a);
+        a = a.sub(&residual.scale(inv_fa));
+    }
+    a
+}
+
 // ── Order2<K>: value / gradient / Hessian (doc §A.1) ────────────────────
 
 /// Truncated SECOND-order scalar: value `v`, gradient `g_a`, Hessian `H_{ab}`.

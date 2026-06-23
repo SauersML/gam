@@ -858,23 +858,75 @@ where
             let cost_converged = strategy_result.final_value;
             // The seed probe is a non-fatal measurement; a seed that fails to
             // evaluate simply skips the comparison. It leaves β̂ at the seed, so
-            // the no-op branch below must re-install β̂ at `strategy_result.rho`.
-            let cost_seed = reml_state.compute_cost(seed).ok();
+            // the no-op branch below relies on the unified β̂ re-install after the
+            // guard to restore it at `strategy_result.rho`.
+            //
+            // Probe the seed WITH its outer gradient (not cost alone): the grid
+            // prepass scored the seed by `compute_cost`, which runs the inner
+            // P-IRLS — at an under-penalized (λ→0) ρ the inner solve hits its
+            // iteration cap and reports a spuriously LOW cost (an invalid REML
+            // value the line search could not improve) while the analytic outer
+            // gradient still points strongly toward more penalization. The #1371
+            // false high-λ shelf this guard exists to escape is, by contrast, a
+            // GENUINE cheaper optimum: its seed is stationary. Even with the
+            // pollution-free `final_value` comparison above, a stuck stall can
+            // still under-cut it on raw cost, so only a seed whose cost is
+            // trustworthy (small residual gradient) may override the certified ρ.
+            let seed_eval = reml_state.compute_cost_and_gradient(seed).ok();
             // Strict relative improvement so a numerically-equal seed (the common
             // case where the optimizer reached the seed's basin) is left untouched
             // and the fit stays byte-identical.
             let floor = 1e-6 * (1.0 + cost_converged.abs());
-            if let Some(cost_seed) = cost_seed.filter(|c| c.is_finite())
+            if let Some((cost_seed, grad_seed)) = seed_eval.filter(|(c, _)| c.is_finite())
                 && cost_converged.is_finite()
                 && cost_seed < cost_converged - floor
             {
-                log::info!(
-                    "[OUTER] #1371 release-and-rerank: certified ρ cost {cost_converged:.6e} \
-                     exceeds the prepass seed cost {cost_seed:.6e}; adopting the seed \
-                     (false high-λ stationary shelf escaped)"
-                );
-                strategy_result.rho = seed.clone();
-                strategy_result.converged = true;
+                // Bound-projected residual gradient at the seed (same criterion
+                // `nonconverged_cost_is_trustworthy` / the flat-valley stall guard
+                // use): a component pinned at a bound by a gradient pushing past
+                // it is feasible-stationary and drops out of the norm.
+                let (blo, bhi) = {
+                    let (a, b) = reml_seed_config.bounds;
+                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                    (lo, hi.max(crate::estimate::RHO_BOUND))
+                };
+                let seed_grad_norm = {
+                    let mut sumsq = 0.0;
+                    for (i, &g) in grad_seed.iter().enumerate() {
+                        let s = seed.get(i).copied().unwrap_or(0.0);
+                        let pinned_lo = s <= blo + 1e-9 && g > 0.0;
+                        let pinned_hi = s >= bhi - 1e-9 && g < 0.0;
+                        if !(pinned_lo || pinned_hi) {
+                            sumsq += g * g;
+                        }
+                    }
+                    sumsq.sqrt()
+                };
+                let seed_cost_trustworthy = seed_grad_norm.is_finite()
+                    && seed_grad_norm
+                        <= crate::solver::rho_optimizer::FLAT_VALLEY_STALL_GRAD_CEILING;
+                if seed_cost_trustworthy {
+                    log::info!(
+                        "[OUTER] #1371 release-and-rerank: certified ρ cost {cost_converged:.6e} \
+                         exceeds the prepass seed cost {cost_seed:.6e} (seed |g|={seed_grad_norm:.3e} \
+                         ≤ ceiling); adopting the seed (false high-λ stationary shelf escaped)"
+                    );
+                    strategy_result.rho = seed.clone();
+                    strategy_result.converged = true;
+                } else {
+                    // #1426 leak: the cheaper seed is a stuck under-penalized
+                    // (λ→0) stall, not a genuine optimum — its low cost is an
+                    // inner-cap artifact. Adopting it would ship the near-full-
+                    // basis overfit (EDF ≈ k) and, worse, certify it converged.
+                    // Keep the honest certified ρ. β̂ is restored by the unified
+                    // re-install after the guard.
+                    log::info!(
+                        "[OUTER] #1371 release-and-rerank: prepass seed cost {cost_seed:.6e} is \
+                         cheaper than certified ρ {cost_converged:.6e} but UNTRUSTWORTHY \
+                         (seed |g|={seed_grad_norm:.3e} > ceiling — stuck under-penalized stall, \
+                         #1426); keeping the certified ρ"
+                    );
+                }
             }
             // Re-install β̂ at the (possibly newly-adopted) reported ρ so the
             // cached inner state matches `strategy_result.rho` for the downstream

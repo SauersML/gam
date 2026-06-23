@@ -3433,21 +3433,29 @@ const KERNEL_RANGE_MAX_SPACING_MULTIPLE: f64 = 1e2;
 
 /// Matérn-only ceiling on the kernel length scale, as a fraction of the maximum
 /// pairwise distance `r_max` (i.e. the data diameter in the standardized kernel
-/// space). The generic kernel-range floor `KERNEL_RANGE_MIN_DIAMETER_FRACTION`
-/// permits length scales up to `r_max / 2` ≈ half the data diameter, where a
-/// compactly-decaying Matérn kernel (ν ≥ 3/2) is already nearly flat across the
-/// whole point cloud. At that flat corner every kernel column collapses onto the
-/// polynomial nullspace and REML then shrinks the entire smooth onto its
-/// intercept (#1357: EDF → 1, predict returns a constant surface). Unlike the
-/// pure-Duchon path — whose `r²log r` / `r^{2m-d}` head has no intrinsic decay
-/// length and stays informative at large scale — the Matérn radial kernel's
-/// finite range makes a too-large length scale genuinely uninformative. So the
-/// Matérn isotropic-κ outer optimizer caps the length scale at the data-derived
-/// default fraction (mirroring `DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION`
-/// in the term builder): κ may sharpen the kernel but can never flatten it past
-/// the informative default, keeping the kernel block from going degenerate while
-/// REML still learns the smoothing penalty on top.
-const MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.15;
+/// space). This bounds the largest correlation range the isotropic-κ outer
+/// optimizer may reach, so that κ may sharpen the kernel but cannot wander into
+/// the fully-flat corner where every kernel column collapses onto the polynomial
+/// nullspace and REML shrinks the smooth onto its intercept (#1357).
+///
+/// #1074: the previous value (0.15) was far too aggressive. ψ = log κ =
+/// −log(length_scale), so this fraction is a *hard* upper bound on the kernel
+/// correlation range — and for any smooth field whose true correlation length
+/// exceeds `frac · r_max` the REML κ-optimizer is pinned at the cap and cannot
+/// reach the smoother kernel that fits the field, so gam systematically
+/// over-smooths (matern_smooth, matern_varying_nu, r_fields_mkriging, gpyto_gp,
+/// r_gpgp all under-recovered by ~1.3×). At 0.15 the cap coincided with the
+/// default *init* (`DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION`), so init and
+/// ceiling were identical and the optimizer could never move the range upward.
+/// Relaxed to `0.5`, which matches the generic diameter floor
+/// `KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max` (= `r_max / 2`) that Duchon / TPS
+/// already use without degenerating. The #1357 collapse corner is still guarded —
+/// but by the dedicated EDF-collapse guard in `spatial_optimization.rs` (which
+/// detects EDF → null and reverts to the frozen baseline geometry at the
+/// informative default length scale), not by this hard range clamp. That guard
+/// catches a genuine collapse at any length scale; this clamp was redundant
+/// belt-and-suspenders that also blocked legitimate long ranges.
+const MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.5;
 
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
 ///
@@ -3520,15 +3528,14 @@ fn spatial_term_psi_bounds(
     // optimizer enter a numerically degenerate basis geometry.
     let mut psi_lo_data = (KERNEL_RANGE_MIN_DIAMETER_FRACTION / r_max).ln();
     let psi_hi_data = (KERNEL_RANGE_MAX_SPACING_MULTIPLE / r_min).ln();
-    // #1357: for the Matérn kernel specifically, do not let the isotropic-κ
-    // optimizer flatten the kernel past the data-derived default length scale.
-    // ψ = log κ = −log(length_scale), so the largest admissible length scale is
-    // the smallest admissible ψ; raise that floor to `1 / (frac · r_max)` so the
-    // kernel range never exceeds `frac · r_max` (the informative default). The
-    // generic floor `2 / r_max` admits length scales up to `r_max / 2`, where the
-    // compactly-decaying Matérn kernel is flat across the whole cloud and REML
-    // collapses the smooth to its intercept. Duchon / TPS keep the generic floor
-    // (their kernels stay informative at large scale).
+    // #1074: cap the Matérn isotropic-κ length scale at `frac · r_max`. ψ =
+    // log κ = −log(length_scale), so the largest admissible length scale is the
+    // smallest admissible ψ; raise that floor to `1 / (frac · r_max)`. At
+    // frac = 0.5 this coincides with the generic floor `2 / r_max` (length scales
+    // up to `r_max / 2`) that Duchon / TPS already use, so the Matérn kernel may
+    // now reach the longer correlation ranges these spatial fields need instead
+    // of being pinned at the old 0.15 init/ceiling. The #1357 flat-corner collapse
+    // is guarded separately by the EDF-collapse guard in spatial_optimization.rs.
     if let SmoothBasisSpec::Matern { .. } = &term.basis {
         let matern_psi_lo =
             (1.0 / (MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION * r_max)).ln();

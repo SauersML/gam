@@ -138,6 +138,258 @@ pub(super) fn moving_density_boundary_flux_a(
 }
 
 impl SurvivalMarginalSlopeFamily {
+    /// Base first derivative `d_u = ∂_θ D` of the density normalization
+    /// `D = ∫ G0 dz` (`G0 = chi·w`): the interior moment integral of
+    /// `∂_u G0 = chi_u − chi·η·η_u` plus the §D `[G0·z_u]_edge` total-velocity
+    /// moving-boundary flux on `chi_poly`. Single-sourced so the `directional`
+    /// pass recovers its intercept Hessian `a_uv` from this FD-validated
+    /// quantity (D-path) instead of the inconsistent F-path `f_au` (gam#1454).
+    pub(crate) fn survival_flex_base_d_u(
+        &self,
+        primary: &FlexPrimarySlices,
+        a_u: &Array1<f64>,
+        cached: &CachedPartitionCells,
+        b: f64,
+        p: usize,
+    ) -> Result<Array1<f64>, String> {
+        let d_u_cell_accums = cached
+            .cells
+            .iter()
+            .map(|entry| -> Result<Vec<f64>, String> {
+                let cell = entry.partition_cell.cell;
+                let state = &entry.state;
+                let fixed = &entry.fixed;
+                let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
+                let chi_poly = fixed.dc_da.to_vec();
+                let mut d_u = vec![0.0; p];
+                for u in 0..p {
+                    let eta_u_poly = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
+                    let chi_u_poly =
+                        poly_add(&poly_scale(&fixed.dc_daa, a_u[u]), &fixed.coeff_au[u]);
+                    let integrand = poly_sub(
+                        &chi_u_poly,
+                        &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly),
+                    );
+                    d_u[u] = exact_kernel::cell_polynomial_integral_from_moments(
+                        &integrand,
+                        &state.moments,
+                        "survival D_t first derivative",
+                    )? + moving_density_boundary_flux(
+                        u,
+                        primary,
+                        a_u,
+                        entry,
+                        &chi_poly,
+                        b,
+                        FluxVelocity::Total,
+                    );
+                }
+                Ok(d_u)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut d_u = Array1::<f64>::zeros(p);
+        for cell_d_u in d_u_cell_accums {
+            for u in 0..p {
+                d_u[u] += cell_d_u[u];
+            }
+        }
+        Ok(d_u)
+    }
+
+    /// Base second derivative `d_uv = ∂_θ∂_θ D` (D-path), carrying the full §D
+    /// moving-domain second-derivative boundary (PART A + PART B self-flux +
+    /// `G0·z_uv`). Single-sourced from the FD-validated full evaluation so the
+    /// `directional` pass can form `d_u_dir = d_uv·dir` and recover a base/
+    /// directional intercept Hessian that agrees with `first_full` (gam#1454).
+    pub(crate) fn survival_flex_base_d_uv(
+        &self,
+        primary: &FlexPrimarySlices,
+        a_u: &Array1<f64>,
+        a_uv: &Array2<f64>,
+        cached: &CachedPartitionCells,
+        b: f64,
+        p: usize,
+    ) -> Result<Array2<f64>, String> {
+        let d_uv_cell_accums = cached
+            .cells
+            .iter()
+            .map(|entry| -> Result<Vec<f64>, String> {
+                let cell = entry.partition_cell.cell;
+                let state = &entry.state;
+                let fixed = &entry.fixed;
+                let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
+                let chi_poly = fixed.dc_da.to_vec();
+                let eta_aa_poly = fixed.dc_daa.to_vec();
+                let eta_aaa_poly = fixed.dc_daaa.to_vec();
+                let mut eta_u_poly = vec![PolyVec::new(); p];
+                let mut chi_u_poly = vec![PolyVec::new(); p];
+                let mut d_u_integrand_poly = vec![PolyVec::new(); p];
+                let mut d_uv = vec![0.0; p * p];
+                for u in 0..p {
+                    eta_u_poly[u] = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
+                    chi_u_poly[u] =
+                        poly_add(&poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u]);
+                    d_u_integrand_poly[u] = poly_sub(
+                        &chi_u_poly[u],
+                        &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly[u]),
+                    );
+                }
+                for u in 0..p {
+                    for v in u..p {
+                        let r_uv_fixed = if u == primary.g {
+                            fixed.coeff_bu[v].to_vec()
+                        } else if v == primary.g {
+                            fixed.coeff_bu[u].to_vec()
+                        } else {
+                            vec![0.0; 4]
+                        };
+                        let chi_uv_fixed = if u == primary.g {
+                            fixed.coeff_abu[v].to_vec()
+                        } else if v == primary.g {
+                            fixed.coeff_abu[u].to_vec()
+                        } else {
+                            vec![0.0; 4]
+                        };
+                        let eta_uv_poly = poly_add(
+                            &poly_add(
+                                &poly_add(
+                                    &poly_scale(&chi_poly, a_uv[[u, v]]),
+                                    &poly_scale(&eta_aa_poly, a_u[u] * a_u[v]),
+                                ),
+                                &poly_scale(&fixed.coeff_au[u], a_u[v]),
+                            ),
+                            &poly_add(&poly_scale(&fixed.coeff_au[v], a_u[u]), &r_uv_fixed),
+                        );
+                        let chi_uv_poly = poly_add(
+                            &poly_add(
+                                &poly_add(
+                                    &poly_scale(&eta_aa_poly, a_uv[[u, v]]),
+                                    &poly_scale(&eta_aaa_poly, a_u[u] * a_u[v]),
+                                ),
+                                &poly_scale(&fixed.coeff_aau[u], a_u[v]),
+                            ),
+                            &poly_add(&poly_scale(&fixed.coeff_aau[v], a_u[u]), &chi_uv_fixed),
+                        );
+                        let term2 = poly_scale(
+                            &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_poly[u]),
+                            -1.0,
+                        );
+                        let term3 = poly_scale(
+                            &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_poly[v]),
+                            -1.0,
+                        );
+                        let term4 = poly_scale(
+                            &poly_mul(
+                                &chi_poly,
+                                &poly_add(
+                                    &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                                    &poly_mul(&eta_poly, &eta_uv_poly),
+                                ),
+                            ),
+                            -1.0,
+                        );
+                        let term5 = poly_mul(
+                            &chi_poly,
+                            &poly_mul(
+                                &poly_mul(&eta_poly, &eta_poly),
+                                &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
+                            ),
+                        );
+                        let integrand = poly_add(
+                            &poly_add(&poly_add(&chi_uv_poly, &term2), &term3),
+                            &poly_add(&term4, &term5),
+                        );
+                        let value = exact_kernel::cell_polynomial_integral_from_moments(
+                            &integrand,
+                            &state.moments,
+                            "survival D_t second derivative",
+                        )?;
+                        // Full §D moving-domain second-derivative boundary of the
+                        // density integral `D = ∫ G0 dz`, `G0 = chi·w`. PART A
+                        // (boundary of the d_u interior integral) `∂_u G0·z_v`;
+                        // PART B (D_v of the d_u boundary [G0·z_u]) `∂_v G0·z_u +
+                        // G0_z·z_u·z_v + G0·z_uv`. The ln-density integrand is
+                        // per-cell (not shared), so no term telescopes (gam#1454).
+                        let boundary = if b != 0.0 {
+                            let part = &entry.partition_cell;
+                            let z_vel = |axis: usize,
+                                         edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                         z: f64|
+                             -> f64 {
+                                match edge {
+                                    crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                        let direct_g = if axis == primary.g { z } else { 0.0 };
+                                        -(a_u[axis] + direct_g) / b
+                                    }
+                                    crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                                }
+                            };
+                            let z_cross = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                           z: f64|
+                             -> f64 {
+                                let zu = z_vel(u, edge, z);
+                                let zv = z_vel(v, edge, z);
+                                let ug = if u == primary.g { 1.0 } else { 0.0 };
+                                let vg = if v == primary.g { 1.0 } else { 0.0 };
+                                match edge {
+                                    crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                                        -(a_uv[[u, v]] + zu * vg + zv * ug) / b
+                                    }
+                                    crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                                }
+                            };
+                            let g0_z = |z: f64| -> f64 {
+                                let eta = cell.eta(z);
+                                let eta_z = cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
+                                let amp = poly_eval_slice(&chi_poly, z);
+                                let amp_z = poly_eval_deriv_slice(&chi_poly, z);
+                                let q_z = z + eta * eta_z;
+                                (amp_z - amp * q_z) * (-cell.q(z)).exp()
+                                    / std::f64::consts::TAU
+                            };
+                            let edge_term = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                             z: f64|
+                             -> f64 {
+                                let zu = z_vel(u, edge, z);
+                                let zv = z_vel(v, edge, z);
+                                if zu == 0.0 && zv == 0.0 {
+                                    return 0.0;
+                                }
+                                let zuv = z_cross(edge, z);
+                                let g0 = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                    cell, &chi_poly, z,
+                                );
+                                let part_a = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                    cell, &d_u_integrand_poly[u], z,
+                                ) * zv;
+                                let part_b1 = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                    cell, &d_u_integrand_poly[v], z,
+                                ) * zu;
+                                part_a + part_b1 + g0_z(z) * zu * zv + g0 * zuv
+                            };
+                            edge_term(part.right_edge, cell.right)
+                                - edge_term(part.left_edge, cell.left)
+                        } else {
+                            0.0
+                        };
+                        d_uv[u * p + v] = value + boundary;
+                        d_uv[v * p + u] = value + boundary;
+                    }
+                }
+                Ok(d_uv)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        let mut d_uv = Array2::<f64>::zeros((p, p));
+        for cell_d_uv in d_uv_cell_accums {
+            for u in 0..p {
+                for v in 0..p {
+                    d_uv[[u, v]] += cell_d_uv[u * p + v];
+                }
+            }
+        }
+        Ok(d_uv)
+    }
+
     pub(crate) fn compute_survival_timepoint_first_order_exact(
         &self,
         row: usize,
@@ -483,48 +735,7 @@ impl SurvivalMarginalSlopeFamily {
             a_u[u] = f_u[u] / d_check;
         }
 
-        let d_u_cell_accums = cached
-            .cells
-            .iter()
-            .map(|entry| -> Result<Vec<f64>, String> {
-                let cell = entry.partition_cell.cell;
-                let state = &entry.state;
-                let fixed = &entry.fixed;
-                let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
-                let chi_poly = fixed.dc_da.to_vec();
-                let mut d_u = vec![0.0; p];
-                for u in 0..p {
-                    let eta_u_poly = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
-                    let chi_u_poly =
-                        poly_add(&poly_scale(&fixed.dc_daa, a_u[u]), &fixed.coeff_au[u]);
-                    let integrand = poly_sub(
-                        &chi_u_poly,
-                        &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly),
-                    );
-                    d_u[u] =
-                        exact_kernel::cell_polynomial_integral_from_moments(
-                            &integrand,
-                            &state.moments,
-                            "survival D_t first derivative",
-                        )? + moving_density_boundary_flux(
-                            u,
-                            primary,
-                            &a_u,
-                            entry,
-                            &chi_poly,
-                            b,
-                            FluxVelocity::Total,
-                        );
-                }
-                Ok(d_u)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let mut d_u = Array1::<f64>::zeros(p);
-        for cell_d_u in d_u_cell_accums {
-            for u in 0..p {
-                d_u[u] += cell_d_u[u];
-            }
-        }
+        let d_u = self.survival_flex_base_d_u(primary, &a_u, cached, b, p)?;
 
         if b != 0.0 {
             for entry in &cached.cells {
@@ -780,206 +991,11 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        let mut d_uv = Array2::<f64>::zeros((p, p));
-        if need_d_uv {
-            let d_uv_cell_accums = cached
-                .cells
-                .iter()
-                .map(|entry| -> Result<Vec<f64>, String> {
-                    let cell = entry.partition_cell.cell;
-                    let state = &entry.state;
-                    let fixed = &entry.fixed;
-                    let eta_poly = vec![cell.c0, cell.c1, cell.c2, cell.c3];
-                    let chi_poly = fixed.dc_da.to_vec();
-                    let eta_aa_poly = fixed.dc_daa.to_vec();
-                    let eta_aaa_poly = fixed.dc_daaa.to_vec();
-                    let mut eta_u_poly = vec![PolyVec::new(); p];
-                    let mut chi_u_poly = vec![PolyVec::new(); p];
-                    let mut d_u_integrand_poly = vec![PolyVec::new(); p];
-                    let mut d_uv = vec![0.0; p * p];
-                    for u in 0..p {
-                        eta_u_poly[u] = poly_add(&poly_scale(&chi_poly, a_u[u]), &fixed.coeff_u[u]);
-                        chi_u_poly[u] =
-                            poly_add(&poly_scale(&eta_aa_poly, a_u[u]), &fixed.coeff_au[u]);
-                        d_u_integrand_poly[u] = poly_sub(
-                            &chi_u_poly[u],
-                            &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly[u]),
-                        );
-                    }
-                    for u in 0..p {
-                        for v in u..p {
-                            let r_uv_fixed = if u == primary.g {
-                                fixed.coeff_bu[v].to_vec()
-                            } else if v == primary.g {
-                                fixed.coeff_bu[u].to_vec()
-                            } else {
-                                vec![0.0; 4]
-                            };
-                            let chi_uv_fixed = if u == primary.g {
-                                fixed.coeff_abu[v].to_vec()
-                            } else if v == primary.g {
-                                fixed.coeff_abu[u].to_vec()
-                            } else {
-                                vec![0.0; 4]
-                            };
-                            let eta_uv_poly = poly_add(
-                                &poly_add(
-                                    &poly_add(
-                                        &poly_scale(&chi_poly, a_uv[[u, v]]),
-                                        &poly_scale(&eta_aa_poly, a_u[u] * a_u[v]),
-                                    ),
-                                    &poly_scale(&fixed.coeff_au[u], a_u[v]),
-                                ),
-                                &poly_add(&poly_scale(&fixed.coeff_au[v], a_u[u]), &r_uv_fixed),
-                            );
-                            let chi_uv_poly = poly_add(
-                                &poly_add(
-                                    &poly_add(
-                                        &poly_scale(&eta_aa_poly, a_uv[[u, v]]),
-                                        &poly_scale(&eta_aaa_poly, a_u[u] * a_u[v]),
-                                    ),
-                                    &poly_scale(&fixed.coeff_aau[u], a_u[v]),
-                                ),
-                                &poly_add(&poly_scale(&fixed.coeff_aau[v], a_u[u]), &chi_uv_fixed),
-                            );
-                            let term2 = poly_scale(
-                                &poly_mul(&poly_mul(&chi_u_poly[v], &eta_poly), &eta_u_poly[u]),
-                                -1.0,
-                            );
-                            let term3 = poly_scale(
-                                &poly_mul(&poly_mul(&chi_u_poly[u], &eta_poly), &eta_u_poly[v]),
-                                -1.0,
-                            );
-                            let term4 = poly_scale(
-                                &poly_mul(
-                                    &chi_poly,
-                                    &poly_add(
-                                        &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
-                                        &poly_mul(&eta_poly, &eta_uv_poly),
-                                    ),
-                                ),
-                                -1.0,
-                            );
-                            let term5 = poly_mul(
-                                &chi_poly,
-                                &poly_mul(
-                                    &poly_mul(&eta_poly, &eta_poly),
-                                    &poly_mul(&eta_u_poly[u], &eta_u_poly[v]),
-                                ),
-                            );
-                            let integrand = poly_add(
-                                &poly_add(&poly_add(&chi_uv_poly, &term2), &term3),
-                                &poly_add(&term4, &term5),
-                            );
-                            let value = exact_kernel::cell_polynomial_integral_from_moments(
-                                &integrand,
-                                &state.moments,
-                                "survival D_t second derivative",
-                            )?;
-                            // Full §D moving-domain second-derivative boundary of
-                            // the density integral `D = ∫ G0 dz`, `G0 = chi·w`
-                            // (chi = ∂η/∂a the D-integrand, w the bare density).
-                            // `d_u = ∫ ∂_u G0 dz + [G0·z_u]_edge` (the latter the
-                            // `moving_density_boundary_flux` on `chi_poly` in the
-                            // base d_u). Differentiating again by v gives, per
-                            // edge:
-                            //   PART A  (boundary of the d_u interior integral):
-                            //     ∂_u G0 · z_v  =  d_u_integrand[u]·w · z_v
-                            //   PART B  (D_v of the d_u boundary [G0·z_u]):
-                            //     ∂_v G0 · z_u  =  d_u_integrand[v]·w · z_u
-                            //     + G0_z · z_u · z_v          (the §D self-flux)
-                            //     + G0   · z_uv               (second-order edge motion)
-                            // The old code carried only PART A and (for u≠v) the
-                            // first PART-B piece, dropping the self-flux, the
-                            // `G0·z_uv` term, and — on the u==v diagonal — the
-                            // second `d_u_integrand·w·z_u` piece. That left the
-                            // EXIT base d_uv[g,w0] ~6.8e-3 short, the dominant
-                            // residual in the assembled intercept Hessian (it
-                            // enters with coefficient `w·d/D`), so the summed
-                            // base eta_uv[g,w0] missed its gradient-FD witness
-                            // (gam#1454).
-                            let boundary = if b != 0.0 {
-                                let part = &entry.partition_cell;
-                                // Total crossing velocity z_axis = −(a_u[axis] +
-                                // δ_{axis,g}·z)/b and its v-cross
-                                // z_uv = −(a_uv[u,v] + z_u·δ_{v,g} + z_v·δ_{u,g})/b
-                                // (§C with b_g = 1).
-                                let z_vel = |axis: usize,
-                                             edge: crate::families::cubic_cell_kernel::PartitionEdge,
-                                             z: f64|
-                                 -> f64 {
-                                    match edge {
-                                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
-                                            let direct_g = if axis == primary.g { z } else { 0.0 };
-                                            -(a_u[axis] + direct_g) / b
-                                        }
-                                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
-                                    }
-                                };
-                                let z_cross = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
-                                               z: f64|
-                                 -> f64 {
-                                    let zu = z_vel(u, edge, z);
-                                    let zv = z_vel(v, edge, z);
-                                    let ug = if u == primary.g { 1.0 } else { 0.0 };
-                                    let vg = if v == primary.g { 1.0 } else { 0.0 };
-                                    match edge {
-                                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
-                                            -(a_uv[[u, v]] + zu * vg + zv * ug) / b
-                                        }
-                                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
-                                    }
-                                };
-                                // ∂_z(G0) = ∂_z(chi·w) = (chi' − chi·q_z)·w.
-                                let g0_z = |z: f64| -> f64 {
-                                    let eta = cell.eta(z);
-                                    let eta_z = cell.c1 + 2.0 * cell.c2 * z + 3.0 * cell.c3 * z * z;
-                                    let amp = poly_eval_slice(&chi_poly, z);
-                                    let amp_z = poly_eval_deriv_slice(&chi_poly, z);
-                                    let q_z = z + eta * eta_z;
-                                    (amp_z - amp * q_z) * (-cell.q(z)).exp()
-                                        / std::f64::consts::TAU
-                                };
-                                let edge_term = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
-                                                 z: f64|
-                                 -> f64 {
-                                    let zu = z_vel(u, edge, z);
-                                    let zv = z_vel(v, edge, z);
-                                    if zu == 0.0 && zv == 0.0 {
-                                        return 0.0;
-                                    }
-                                    let zuv = z_cross(edge, z);
-                                    let g0 = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
-                                        cell, &chi_poly, z,
-                                    );
-                                    let part_a = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
-                                        cell, &d_u_integrand_poly[u], z,
-                                    ) * zv;
-                                    let part_b1 = crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
-                                        cell, &d_u_integrand_poly[v], z,
-                                    ) * zu;
-                                    part_a + part_b1 + g0_z(z) * zu * zv + g0 * zuv
-                                };
-                                edge_term(part.right_edge, cell.right)
-                                    - edge_term(part.left_edge, cell.left)
-                            } else {
-                                0.0
-                            };
-                            d_uv[u * p + v] = value + boundary;
-                            d_uv[v * p + u] = value + boundary;
-                        }
-                    }
-                    Ok(d_uv)
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            for cell_d_uv in d_uv_cell_accums {
-                for u in 0..p {
-                    for v in 0..p {
-                        d_uv[[u, v]] += cell_d_uv[u * p + v];
-                    }
-                }
-            }
-        }
+        let d_uv = if need_d_uv {
+            self.survival_flex_base_d_uv(primary, &a_u, &a_uv, cached, b, p)?
+        } else {
+            Array2::<f64>::zeros((p, p))
+        };
 
         Ok(SurvivalFlexTimepointExact {
             eta,

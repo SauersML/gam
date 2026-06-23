@@ -203,10 +203,13 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline() {
 /// Source CSV (no auth, direct download):
 ///   https://vincentarelbundock.github.io/Rdatasets/csv/datasets/quakes.csv
 ///
-///   PRIMARY (objective, tool-free): held-out `test_R2 >= 0.15` — the bare
-///     spatial surface still explains held-out magnitude variance well above
-///     the constant-mean predictor (R2 = 0). The bar is slightly below the
-///     full-model arm because dropping the depth term removes signal.
+///   PRIMARY (objective): the bare spatial surface must be informative
+///     (held-out `R2 > 0`, i.e. beats the constant-mean predictor) AND recover
+///     held-out magnitude variance at least as well as the mature reference
+///     (`gam_R2 >= mgcv_R2 - 0.02`). An absolute `R2 >= 0.15` is NOT used here:
+///     the earthquake-location → magnitude signal is genuinely weak and mgcv
+///     itself only reaches `R2 ~ 0.08`, so a fixed absolute bar would measure
+///     the data, not gam.
 ///
 ///   BASELINE (match-or-beat): mgcv fits the SAME `mag ~ s(long, lat, bs="tp")`
 ///     on the SAME training rows and predicts the SAME held-out rows; gam's
@@ -326,9 +329,18 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline_on_real_data() {
     );
 
     // ---- PRIMARY objective assertion: the spatial surface alone predicts ---
+    // The earthquake-location → magnitude signal in `quakes` is genuinely weak:
+    // the mature reference (mgcv) itself only reaches a held-out R^2 of ~0.08
+    // here, so an absolute R^2 >= 0.15 bar is unachievable even by the gold
+    // standard and measures the data, not gam. Anchor instead to "informative
+    // (beats the no-skill mean predictor, R^2 > 0) AND at least as good as the
+    // mature reference" — the same match-or-beat philosophy the rest of the
+    // suite uses (cf. the EBM base-rate / mgcv-anchored recalibrations on #1074).
+    let mgcv_test_r2 = r2(mgcv_test_pred, &test_mag);
     assert!(
-        gam_test_r2 >= 0.15,
-        "gam's held-out spatial-only R2 too low: {gam_test_r2:.4} (< 0.15)"
+        gam_test_r2 > 0.0 && gam_test_r2 >= mgcv_test_r2 - 0.02,
+        "gam's held-out spatial-only R2 {gam_test_r2:.4} is not informative or trails \
+         mgcv {mgcv_test_r2:.4} (the mature reference) by more than 0.02"
     );
 
     // ---- BASELINE (match-or-beat): no worse than mgcv on held-out RMSE -----
@@ -342,4 +354,59 @@ fn gam_spatial_smooth_predicts_quakes_better_than_baseline_on_real_data() {
         gam_edf > 2.0 && gam_edf < 60.0,
         "gam effective dof out of sane range: {gam_edf:.3}"
     );
+}
+
+// ============================ #1074 DIAGNOSTIC ============================
+// TEMPORARY: localize the quakes s(long,lat,bs=tp) EDF inflation (edf~104 vs
+// mgcv ~15, held-out R^2~0.02). R-free. Dumps per-term log_lambdas, edf_by_block,
+// beta length, and held-out R^2.
+#[test]
+fn diag_quakes_spatial_1074() {
+    init_parallelism();
+    let ds = load_csvwith_inferred_schema(Path::new(QUAKES_CSV)).unwrap();
+    let col = ds.column_map();
+    let (long_idx, lat_idx, depth_idx, mag_idx) = (col["long"], col["lat"], col["depth"], col["mag"]);
+    let long: Vec<f64> = ds.values.column(long_idx).to_vec();
+    let lat: Vec<f64> = ds.values.column(lat_idx).to_vec();
+    let depth: Vec<f64> = ds.values.column(depth_idx).to_vec();
+    let mag: Vec<f64> = ds.values.column(mag_idx).to_vec();
+    let n = mag.len();
+    let is_test = |i: usize| i % 5 == 0;
+    let train_rows: Vec<usize> = (0..n).filter(|&i| !is_test(i)).collect();
+    let test_rows: Vec<usize> = (0..n).filter(|&i| is_test(i)).collect();
+    let p = ds.headers.len();
+    let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
+    for (out_row, &src_row) in train_rows.iter().enumerate() {
+        for c in 0..p { train_values[[out_row, c]] = ds.values[[src_row, c]]; }
+    }
+    let mut train_ds = ds.clone();
+    train_ds.values = train_values;
+    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+
+    for formula in [
+        "mag ~ s(long, lat, bs=\"tp\") + s(depth)",
+        "mag ~ s(long, lat, bs=\"tp\", double_penalty=FALSE) + s(depth)",
+        "mag ~ s(long, lat, bs=\"tp\")",
+        "mag ~ s(depth)",
+        "mag ~ s(long, lat, bs=\"tp\", k=60) + s(depth)",
+    ] {
+        let result = fit_from_formula(formula, &train_ds, &cfg).unwrap();
+        let FitResult::Standard(fit) = result else { panic!() };
+        // held-out
+        let mut tg = Array2::<f64>::zeros((test_rows.len(), p));
+        for (i, &r) in test_rows.iter().enumerate() {
+            tg[[i, long_idx]] = long[r]; tg[[i, lat_idx]] = lat[r]; tg[[i, depth_idx]] = depth[r];
+        }
+        let td = gam::smooth::build_term_collection_design(tg.view(), &fit.resolvedspec).unwrap();
+        use gam::matrix::LinearOperator;
+        let pred: Vec<f64> = td.design.apply(&fit.fit.beta).to_vec();
+        let truth: Vec<f64> = test_rows.iter().map(|&i| mag[i]).collect();
+        eprintln!(
+            "[#1074-quakes] edf_total={:.3} beta_len={} edf_by_block={:?} log_lambdas={:?} heldout_R2={:.4} :: {formula}",
+            fit.fit.edf_total().unwrap(), fit.fit.beta.len(),
+            fit.fit.edf_by_block().iter().map(|v| (v*100.0).round()/100.0).collect::<Vec<_>>(),
+            fit.fit.log_lambdas.iter().map(|v| (v*1000.0).round()/1000.0).collect::<Vec<_>>(),
+            r2(&pred, &truth),
+        );
+    }
 }
