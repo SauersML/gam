@@ -20,6 +20,7 @@ on:
       - "tests/test_bug_hunt_poisson_zero_count_fit_unpredictable_mean.py"
       - "src/inference/model.rs"
       - "src/inference/predict/mod.rs"
+      - "src/inference/predict/standard.rs"
       - "src/terms/smooth/spatial_optimization.rs"
       - ".github/workflows/python-contracts.yml"
 
