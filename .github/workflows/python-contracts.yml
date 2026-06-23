@@ -1,0 +1,79 @@
+name: Python Contracts
+
+# Fast Python full-fit contract checks, decoupled from the heavy Rust suite.
+#
+# The "Rust CI" workflow (test.yml) runs its Python pytest steps only AFTER the
+# full Rust nextest suite in the same job, so a Python-only contract (e.g. the
+# curv #1464 sign-recovery or the by-variable #1513 predict-clip guard) is not
+# observable until hours into that run. This workflow builds just the maturin
+# wheel and runs the targeted Python contract tests, so a fix to a Python-facing
+# contract verifies in ~20-30 min instead of being hostage to the Rust suite.
+# It is also the intended fast home for wiring in the orphaned Python contract
+# tests tracked by #1512.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "tests/test_bug_hunt_numeric_by_variable_clamped_to_training_range_at_predict.py"
+      - "src/inference/model.rs"
+      - ".github/workflows/python-contracts.yml"
+
+concurrency:
+  group: python-contracts-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  python-contracts:
+    name: Python contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          # build.rs human-author gate needs the real last build.rs editor; a
+          # shallow clone makes git log return HEAD and false-fails the gate.
+          fetch-depth: 0
+
+      - name: Setup Rust CI
+        uses: ./.github/actions/setup-rust-ci
+        with:
+          free-disk-space: 'true'
+          cache-targets: 'false'
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install maturin
+        run: python -m pip install --upgrade pip "maturin>=1.7,<2"
+
+      - name: Build and install gam extension (maturin build + wheel install)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          maturin build --release -i python3 -o dist
+          python -m pip install --force-reinstall dist/*.whl
+
+      - name: Install Python test extras
+        run: |
+          python -m pip install \
+            'pytest>=8' 'numpy>=1.26' 'pandas>=2.0' 'pyarrow>=14' \
+            'matplotlib>=3.8' 'scikit-learn>=1.4'
+
+      - name: Run numeric by-variable predict-clip contract (#1513)
+        # s(x, by=z): the numeric by-multiplier must not be axis-clipped to its
+        # training range at predict time, so the prediction stays affine in z.
+        # Guards the collect_by_variable_numeric_axes exemption in model.rs.
+        run: python -m pytest tests/test_bug_hunt_numeric_by_variable_clamped_to_training_range_at_predict.py -v --tb=short
