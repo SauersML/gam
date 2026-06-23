@@ -1845,7 +1845,7 @@ mod moment_engine_tests {
     /// numeric `reduce_sextic_moments` on the VALUE channel term-for-term (a
     /// generic non-degenerate sextic cell), proving the port of the raising
     /// recurrence + boundary term to the jet algebra is exact. (Derivative
-    /// channels are exercised by the full timepoint oracle once Phase C lands.)
+    /// channels are exercised by the directional/bidirectional timepoint gates below.)
     #[test]
     fn cell_moment_recurrence_jet_value_matches_numeric_932() {
         let cell = DenestedCubicCell {
@@ -2925,7 +2925,8 @@ mod moment_engine_tests {
     // REAL g-only survival family (no score-warp/link-dev, so every g order lives in
     // the observed `(a,b)` pack — no channel jets), drive both paths off the SAME
     // cached partition, and pin term-for-term. The h/w channel orders (which need the
-    // channel-weight `(a,b)`-Taylor jets) land in a follow-up increment.
+    // channel-weight `(a,b)`-Taylor jets) are covered by the separate
+    // `flex_timepoint_inputs_ghw_jet3_jet4_match_hand_932` gate.
 
     /// A minimal g-only survival marginal-slope family for the §3c directional gates:
     /// scalar score covariance, raw `z`, a 1-col marginal + 1-col logslope design, no
