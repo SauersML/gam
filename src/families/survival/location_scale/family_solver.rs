@@ -971,6 +971,22 @@ impl SurvivalLocationScaleFamily {
                 .map(|h| (h, 0.0)));
         }
         let q = self.collect_joint_quantities_rescaled(block_states, log_scale)?;
+        if self.x_link_wiggle.is_some() {
+            // #932: the link-wiggle joint Hessian is single-sourced through the
+            // §13 warp kernel (`sls_row_nll_wiggle`) instead of the bespoke
+            // `assemble_h_wiggle`; non-wiggle rows are untouched below.
+            let dynamic = self.build_dynamic_geometry(block_states)?;
+            return Ok(Some((
+                super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
+                    self,
+                    &q,
+                    &dynamic,
+                    block_states,
+                    log_scale,
+                )?,
+                log_scale,
+            )));
+        }
         if self.row_kernel_joint_hessian_supported() {
             let dynamic = self.build_dynamic_geometry(block_states)?;
             let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_scale);
@@ -2241,6 +2257,18 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
     ) -> Result<Option<Array2<f64>>, String> {
         let q = self.collect_joint_quantities(block_states)?;
+        if self.x_link_wiggle.is_some() {
+            // #932: link-wiggle joint Hessian via the single-source §13 warp
+            // kernel; non-wiggle rows keep the bespoke path below.
+            let dynamic = self.build_dynamic_geometry(block_states)?;
+            return Ok(Some(super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
+                self,
+                &q,
+                &dynamic,
+                block_states,
+                0.0,
+            )?));
+        }
         if self.row_kernel_joint_hessian_supported() {
             let dynamic = self.build_dynamic_geometry(block_states)?;
             let kernel = self.survival_ls_row_kernel(&q, &dynamic);

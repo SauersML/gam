@@ -516,6 +516,385 @@ pub(crate) fn row_set_from_survival_mask(
     }
 }
 
+/// #932 link-wiggle: the survival-LS row NLL extended with the link warp
+/// `q = q0 + Σ_j βw_j·B_j(q0)` and the qdot coupling `g = m1·g0`,
+/// `m1 = 1 + Σ_j βw_j·B'_j(q0_exit)`, written ONCE over a generic jet scalar
+/// (`KW = SLS_ROW_K + pw`). `vars[0..9]` are the base channels (exactly
+/// [`sls_row_nll`]); `vars[9..9+pw]` are the wiggle amplitudes βw. The per-row
+/// basis stacks are evaluated at the BASE indices (the warp composes the basis
+/// onto the index jet): `b{0,1,2}e` = `B/B'/B''` at `q0_entry`, `b{0,1,2,3}x` =
+/// `B/B'/B''/B'''` at `q0_exit`. Bit-identical (modulo association) to the nested
+/// witness in `survival_ls_wiggle_joint_hessian_matches_assembler_932`.
+/// Per-row warp basis stacks evaluated at the BASE indices. `b_u0` holds
+/// `[B, B', B'']` at `q0_entry` (entry warp `u0w`); `b_u1` holds
+/// `[B, B', B'', B''']` at `q0_exit` (exit warp `u1w` and the qdot slope `m1`).
+/// Each inner slice has one entry per wiggle column (`pw` long). Bundling the
+/// seven slices keeps [`sls_row_nll_wiggle`] within the argument budget.
+pub(crate) struct SlsWiggleRowBasis<'b> {
+    pub(crate) b_u0: [&'b [f64]; 3],
+    pub(crate) b_u1: [&'b [f64]; 4],
+}
+
+pub(crate) fn sls_row_nll_wiggle<const KW: usize, S: JetScalar<KW>>(
+    vars: &[S; KW],
+    kernel: &SurvivalExactRowKernel,
+    pw: usize,
+    basis: &SlsWiggleRowBasis<'_>,
+) -> S {
+    let [b0e, b1e, b2e] = basis.b_u0;
+    let [b0x, b1x, b2x, b3x] = basis.b_u1;
+    let inv_sigma_entry = vars[7].neg().exp();
+    let u0 = vars[0].sub(&vars[4].mul(&inv_sigma_entry));
+    let inv_sigma_exit = vars[6].neg().exp();
+    let u1 = vars[1].sub(&vars[3].mul(&inv_sigma_exit));
+    let g0 = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
+    let mut u0w = u0;
+    let mut u1w = u1;
+    let mut m1 = S::constant(1.0);
+    for j in 0..pw {
+        let bw = vars[SLS_ROW_K + j];
+        u0w = u0w.add(&bw.mul(&u0.compose_unary([b0e[j], b1e[j], b2e[j], 0.0, 0.0])));
+        u1w = u1w.add(&bw.mul(&u1.compose_unary([b0x[j], b1x[j], b2x[j], b3x[j], 0.0])));
+        m1 = m1.add(&bw.mul(&u1.compose_unary([b1x[j], b2x[j], b3x[j], 0.0, 0.0])));
+    }
+    let g = m1.mul(&g0);
+    let mut nll = u0w
+        .compose_unary([
+            kernel.log_s0,
+            -kernel.r0,
+            -kernel.dr0,
+            -kernel.ddr0,
+            -kernel.dddr0,
+        ])
+        .scale(kernel.w);
+    let censored_weight = kernel.w * (1.0 - kernel.d);
+    if censored_weight != 0.0 {
+        nll = nll.add(
+            &u1w.compose_unary([
+                kernel.log_s1,
+                -kernel.r1,
+                -kernel.dr1,
+                -kernel.ddr1,
+                -kernel.dddr1,
+            ])
+            .scale(-censored_weight),
+        );
+    }
+    let event_weight = kernel.w * kernel.d;
+    if event_weight != 0.0 {
+        nll = nll
+            .add(
+                &u1w.compose_unary([
+                    kernel.logphi1,
+                    kernel.dlogphi1,
+                    kernel.d2logphi1,
+                    kernel.d3logphi1,
+                    kernel.d4logphi1,
+                ])
+                .scale(-event_weight),
+            )
+            .add(
+                &g.compose_unary([
+                    kernel.log_g,
+                    kernel.d_log_g,
+                    kernel.d2_log_g,
+                    kernel.d3_log_g,
+                    kernel.d4_log_g,
+                ])
+                .scale(-event_weight),
+            );
+    }
+    nll
+}
+
+/// #932 link-wiggle joint-Hessian production kernel: routes the survival-LS
+/// joint Hessian for link-wiggle rows through the single-source §13 warp
+/// ([`sls_row_nll_wiggle`]) instead of the bespoke `assemble_h_wiggle`. The base
+/// 9 channels reuse the existing [`SurvivalLsRowKernel`] designs; the βw
+/// amplitudes are an IDENTITY map into a wiggle coefficient block appended last.
+/// `KW = SLS_ROW_K + pw`.
+pub(crate) struct SurvivalLsWiggleRowKernel<'a, const KW: usize> {
+    base: SurvivalLsRowKernel<'a>,
+    pw: usize,
+    wiggle_off: usize,
+    betaw: Vec<f64>,
+    b_u0_0: Array2<f64>,
+    b_u0_1: Array2<f64>,
+    b_u0_2: Array2<f64>,
+    b_u1_0: Array2<f64>,
+    b_u1_1: Array2<f64>,
+    b_u1_2: Array2<f64>,
+    b_u1_3: Array2<f64>,
+}
+
+impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
+    pub(crate) fn new(
+        family: &'a SurvivalLocationScaleFamily,
+        q: &'a SurvivalJointQuantities,
+        dynamic: &'a SurvivalDynamicGeometry,
+        block_states: &[ParameterBlockState],
+        deriv_log_scale: f64,
+    ) -> Result<Self, String> {
+        let base = SurvivalLsRowKernel {
+            family,
+            q,
+            dynamic,
+            deriv_log_scale,
+            offsets: family.joint_block_offsets(),
+        };
+        let knots = family
+            .wiggle_knots
+            .as_ref()
+            .ok_or("link-wiggle kernel: missing wiggle knots")?;
+        let degree = family
+            .wiggle_degree
+            .ok_or("link-wiggle kernel: missing wiggle degree")?;
+        // Base exit/entry indices where the warp basis is evaluated.
+        let q_exit = dynamic.q_exit.clone();
+        let q_entry = dynamic.q_entry.clone();
+        let b_u0_0 = survival_wiggle_basis_with_options(q_entry.view(), knots, degree, BasisOptions::value())?;
+        let b_u0_1 = survival_wiggle_basis_with_options(q_entry.view(), knots, degree, BasisOptions::first_derivative())?;
+        let b_u0_2 = survival_wiggle_basis_with_options(q_entry.view(), knots, degree, BasisOptions::second_derivative())?;
+        let b_u1_0 = survival_wiggle_basis_with_options(q_exit.view(), knots, degree, BasisOptions::value())?;
+        let b_u1_1 = survival_wiggle_basis_with_options(q_exit.view(), knots, degree, BasisOptions::first_derivative())?;
+        let b_u1_2 = survival_wiggle_basis_with_options(q_exit.view(), knots, degree, BasisOptions::second_derivative())?;
+        let b_u1_3 = survival_wiggle_third_basis(q_exit.view(), knots, degree)?;
+        let pw = b_u1_0.ncols();
+        if SLS_ROW_K + pw != KW {
+            return Err(format!(
+                "link-wiggle kernel: KW={KW} but SLS_ROW_K+pw={}",
+                SLS_ROW_K + pw
+            ));
+        }
+        // joint_block_offsets() appends the wiggle block last, so its start is
+        // the second-to-last offset (offsets = [0, time, +thr, +ls, +wiggle]).
+        let wiggle_off = base.offsets[base.offsets.len() - 2];
+        let betaw = block_states
+            .last()
+            .map(|s| s.beta.to_vec())
+            .ok_or("link-wiggle kernel: missing wiggle block state")?;
+        Ok(Self {
+            base,
+            pw,
+            wiggle_off,
+            betaw,
+            b_u0_0,
+            b_u0_1,
+            b_u0_2,
+            b_u1_0,
+            b_u1_1,
+            b_u1_2,
+            b_u1_3,
+        })
+    }
+
+    #[inline]
+    fn row_vars<S: JetScalar<KW>>(&self, row: usize, seed: impl Fn(f64, usize) -> S) -> [S; KW] {
+        let p = self.base.row_primary_values(row);
+        std::array::from_fn(|a| {
+            if a < SLS_ROW_K {
+                seed(p[a], a)
+            } else {
+                seed(self.betaw[a - SLS_ROW_K], a)
+            }
+        })
+    }
+
+    #[inline]
+    fn eval<S: JetScalar<KW>>(&self, row: usize, vars: &[S; KW]) -> Result<S, String> {
+        let kernel = self.base.row_nll_inputs(row)?.1;
+        let r_u0_0 = self.b_u0_0.row(row).to_vec();
+        let r_u0_1 = self.b_u0_1.row(row).to_vec();
+        let r_u0_2 = self.b_u0_2.row(row).to_vec();
+        let r_u1_0 = self.b_u1_0.row(row).to_vec();
+        let r_u1_1 = self.b_u1_1.row(row).to_vec();
+        let r_u1_2 = self.b_u1_2.row(row).to_vec();
+        let r_u1_3 = self.b_u1_3.row(row).to_vec();
+        let basis = SlsWiggleRowBasis {
+            b_u0: [&r_u0_0, &r_u0_1, &r_u0_2],
+            b_u1: [&r_u1_0, &r_u1_1, &r_u1_2, &r_u1_3],
+        };
+        Ok(sls_row_nll_wiggle(vars, &kernel, self.pw, &basis))
+    }
+
+    /// Per-(channel, row) coefficient-block + dense design row, length KW.
+    /// Base channels delegate to [`SurvivalLsRowKernel`]; βw channels map to the
+    /// wiggle block with a unit (identity) row `e_b`.
+    fn jrow(&self, ch: usize, row: usize) -> Option<(usize, Array1<f64>)> {
+        if ch < SLS_ROW_K {
+            let blk = self.base.channel_block(ch)?;
+            let r = self.base.channel_row(ch, row)?;
+            Some((self.base.offsets[blk], r))
+        } else {
+            let b = ch - SLS_ROW_K;
+            let mut e = Array1::<f64>::zeros(self.pw);
+            e[b] = 1.0;
+            Some((self.wiggle_off, e))
+        }
+    }
+}
+
+impl<const KW: usize> crate::families::row_kernel::RowKernel<KW>
+    for SurvivalLsWiggleRowKernel<'_, KW>
+{
+    fn n_rows(&self) -> usize {
+        self.base.family.n
+    }
+
+    fn n_coefficients(&self) -> usize {
+        self.wiggle_off + self.pw
+    }
+
+    fn row_kernel(&self, row: usize) -> Result<(f64, [f64; KW], [[f64; KW]; KW]), String> {
+        let vars: [Order2<KW>; KW] = self.row_vars(row, |x, a| Order2::variable(x, a));
+        let out = self.eval(row, &vars)?;
+        Ok((JetScalar::value(&out), out.g(), out.h()))
+    }
+
+    fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; KW] {
+        use crate::families::row_kernel::RowKernel as _;
+        let base = self.base.jacobian_action(row, &d_beta[..self.wiggle_off]);
+        std::array::from_fn(|a| {
+            if a < SLS_ROW_K {
+                base[a]
+            } else {
+                d_beta[self.wiggle_off + (a - SLS_ROW_K)]
+            }
+        })
+    }
+
+    fn jacobian_transpose_action(&self, row: usize, v: &[f64; KW], out: &mut [f64]) {
+        use crate::families::row_kernel::RowKernel as _;
+        let vbase: [f64; SLS_ROW_K] = std::array::from_fn(|a| v[a]);
+        self.base
+            .jacobian_transpose_action(row, &vbase, &mut out[..self.wiggle_off]);
+        for b in 0..self.pw {
+            out[self.wiggle_off + b] += v[SLS_ROW_K + b];
+        }
+    }
+
+    fn add_pullback_hessian(
+        &self,
+        row: usize,
+        h: &[[f64; KW]; KW],
+        target: &mut Array2<f64>,
+    ) {
+        let rows: Vec<Option<(usize, Array1<f64>)>> =
+            (0..KW).map(|ch| self.jrow(ch, row)).collect();
+        for a in 0..KW {
+            let Some((off_a, ra)) = rows[a].as_ref() else {
+                continue;
+            };
+            for b in 0..KW {
+                let hab = h[a][b];
+                if hab == 0.0 {
+                    continue;
+                }
+                let Some((off_b, rb)) = rows[b].as_ref() else {
+                    continue;
+                };
+                for (ia, &va) in ra.iter().enumerate() {
+                    if va == 0.0 {
+                        continue;
+                    }
+                    let w = hab * va;
+                    let mut trow = target.row_mut(off_a + ia);
+                    for (ib, &vb) in rb.iter().enumerate() {
+                        trow[off_b + ib] += w * vb;
+                    }
+                }
+            }
+        }
+    }
+
+    fn add_diagonal_quadratic(&self, row: usize, h: &[[f64; KW]; KW], diag: &mut [f64]) {
+        let rows: Vec<Option<(usize, Array1<f64>)>> =
+            (0..KW).map(|ch| self.jrow(ch, row)).collect();
+        for a in 0..KW {
+            let Some((off_a, ra)) = rows[a].as_ref() else {
+                continue;
+            };
+            for b in 0..KW {
+                let hab = h[a][b];
+                if hab == 0.0 {
+                    continue;
+                }
+                let Some((off_b, rb)) = rows[b].as_ref() else {
+                    continue;
+                };
+                if off_a != off_b {
+                    continue;
+                }
+                for (k, (&va, &vb)) in ra.iter().zip(rb.iter()).enumerate() {
+                    diag[off_a + k] += hab * va * vb;
+                }
+            }
+        }
+    }
+
+    fn row_third_contracted(&self, row: usize, dir: &[f64; KW]) -> Result<[[f64; KW]; KW], String> {
+        let vars: [OneSeed<KW>; KW] =
+            self.row_vars(row, |x, a| OneSeed::seed_direction(x, a, dir[a]));
+        Ok(self.eval(row, &vars)?.contracted_third())
+    }
+
+    fn row_fourth_contracted(
+        &self,
+        row: usize,
+        dir_u: &[f64; KW],
+        dir_v: &[f64; KW],
+    ) -> Result<[[f64; KW]; KW], String> {
+        let vars: [TwoSeed<KW>; KW] =
+            self.row_vars(row, |x, a| TwoSeed::seed(x, a, dir_u[a], dir_v[a]));
+        Ok(self.eval(row, &vars)?.contracted_fourth())
+    }
+}
+
+/// Dispatch the runtime wiggle width `pw` to a concrete `KW = SLS_ROW_K + pw`
+/// and assemble the link-wiggle joint Hessian through the single-source kernel.
+pub(crate) fn survival_ls_wiggle_joint_hessian_dense(
+    family: &SurvivalLocationScaleFamily,
+    q: &SurvivalJointQuantities,
+    dynamic: &SurvivalDynamicGeometry,
+    block_states: &[ParameterBlockState],
+    deriv_log_scale: f64,
+) -> Result<Array2<f64>, String> {
+    use crate::families::row_kernel::{RowSet, build_row_kernel_cache, row_kernel_hessian_dense};
+    let pw = family
+        .x_link_wiggle
+        .as_ref()
+        .map(|d| d.ncols())
+        .ok_or("wiggle joint Hessian: no link-wiggle design")?;
+    macro_rules! run {
+        ($kw:literal) => {{
+            let kernel = SurvivalLsWiggleRowKernel::<$kw>::new(
+                family,
+                q,
+                dynamic,
+                block_states,
+                deriv_log_scale,
+            )?;
+            let rows = RowSet::All;
+            let cache = build_row_kernel_cache(&kernel, &rows)?;
+            Ok(row_kernel_hessian_dense(&kernel, &cache, &rows))
+        }};
+    }
+    match SLS_ROW_K + pw {
+        10 => run!(10),
+        11 => run!(11),
+        12 => run!(12),
+        13 => run!(13),
+        14 => run!(14),
+        15 => run!(15),
+        16 => run!(16),
+        17 => run!(17),
+        18 => run!(18),
+        19 => run!(19),
+        20 => run!(20),
+        other => Err(format!("link-wiggle joint Hessian: unsupported KW={other}")),
+    }
+}
+
 impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     fn n_rows(&self) -> usize {
         self.family.n
