@@ -2420,20 +2420,32 @@ where
         MeanIntervalMethod::TransformEta => {
             let transformed_lower = apply_family_inverse_link(&eta_lower, &likelihood)?;
             let transformed_upper = apply_family_inverse_link(&eta_upper, &likelihood)?;
-            (
-                Array1::from_iter(
-                    transformed_lower
-                        .iter()
-                        .zip(transformed_upper.iter())
-                        .map(|(&lo, &hi)| lo.min(hi)),
-                ),
-                Array1::from_iter(
-                    transformed_lower
-                        .iter()
-                        .zip(transformed_upper.iter())
-                        .map(|(&lo, &hi)| lo.max(hi)),
-                ),
-            )
+            // #1515: on a degenerate fit (all-zero Poisson flat likelihood) the
+            // η-scale CI half-width z·se_eta is astronomically large, so the
+            // transformed endpoint g⁻¹(η ± z·se_eta) overflows to +inf — and the
+            // min/max against it produces a NaN that serializes to None and
+            // crashes the Python table shaper. When a transformed endpoint is not
+            // finite, fall back per-row to the delta-method bound
+            // mean ± z·mean_se, which is finite (mean is the plug-in inverse link
+            // and mean_se was delta-guarded above), so a fitted model always
+            // returns finite interval bounds.
+            let lower = Array1::from_iter((0..mean.len()).map(|i| {
+                let v = transformed_lower[i].min(transformed_upper[i]);
+                if v.is_finite() {
+                    v
+                } else {
+                    mean[i] - z_lower_per_row[i] * mean_standard_error[i]
+                }
+            }));
+            let upper = Array1::from_iter((0..mean.len()).map(|i| {
+                let v = transformed_lower[i].max(transformed_upper[i]);
+                if v.is_finite() {
+                    v
+                } else {
+                    mean[i] + z_upper_per_row[i] * mean_standard_error[i]
+                }
+            }));
+            (lower, upper)
         }
     };
 
