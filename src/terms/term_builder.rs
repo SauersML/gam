@@ -3020,14 +3020,17 @@ pub fn build_smooth_basis(
                         },
                         Some(period_value),
                     )
-                } else if margin_wants_cr(&per_axis_bs[axis]) {
+                } else if margin_wants_cr(&per_axis_bs[axis]) && k_axis >= 3 {
                     // mgcv `te()`/`ti()` default cr margin: place exactly
                     // `k_axis` Lancaster–Salkauskas value-knots at data
                     // quantiles. The cr basis dimension equals the knot count,
-                    // so this reproduces the requested per-margin `k` directly
-                    // (floored at the cr minimum of 3 knots).
-                    let k_cr = k_axis.max(3);
-                    let cr_knots = crate::terms::basis::select_cr_knots(ds.values.column(c), k_cr)
+                    // so this reproduces the requested per-margin `k` directly.
+                    // A natural cubic regression spline needs at least 3 knots
+                    // (one interior); a `k_axis < 3` margin (e.g. a binary
+                    // tensor axis requesting a linear margin) falls through to
+                    // the B-spline branch below, exactly as before #1074 — mgcv
+                    // likewise does not build a `cr` margin below k=3.
+                    let cr_knots = crate::terms::basis::select_cr_knots(ds.values.column(c), k_axis)
                         .map_err(|e| e.to_string())?;
                     (
                         BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots },
