@@ -1,3 +1,110 @@
+## v0.3.121 — gam 0.3.121 / gamfit 0.1.223 (2026-06-23)
+
+crates.io + PyPI release of the open-issue fix-and-feature wave landed since gam
+0.3.120 / gamfit 0.1.222. New data-ingestion surface (Dask, SPSS, numeric-string
+categoricals), a large correctness sweep across double-penalty smooths, REML
+convergence, survival/location-scale Hessians, model comparison and the
+manifold-SAE / latent stack, plus opt-in routing-predictor machinery and the
+device-resident GPU Gram path. The build.rs hygiene gate is hardened further
+(anti-laundering bans) and the tree continues to build the `gamfit` wheel clean.
+
+**Data input (Python wrapper)**
+- **#1460**: Dask DataFrames are accepted as input/output — materialized with a
+  single `compute()` into pandas for fitting — and a new `read_spss()` loads
+  `.sav`/`.zsav` files via `pyreadstat`, decoding value-labelled variables to
+  pandas `Categorical`.
+- **#1467 / #1468 / #1469 / #1473**: numeric-string columns in dict / records /
+  numpy inputs are treated as categorical (pandas-object parity); a mixed
+  string+numeric column is categorical, and dict-input multinomial hard-rejects
+  numeric-string class labels.
+
+**Smooths, factors & identifiability**
+- **#1476 / #1477**: the double-penalty null-space ridge is rebuilt in the
+  identifiability-constrained chart (after the global transform), pairing each
+  ridge with its co-located Primary block — fixing concurvity collapse of
+  `s(x1)+s(x2)`, by-factor per-level correctness, and Tweedie default-P-spline
+  mean bias, without over-shrinking a supported smooth.
+- **#1427**: `s(x, by=factor)` emits an independent per-level λ. **#1457**: a
+  bare categorical main effect is de-duplicated under `s(x, by=g) + g`.
+- **#1470**: `ti(x, z)` interactions stay grid-independent — no off-grid
+  residualization against the realized `s(x)`/`s(z)` spans in functional-ANOVA
+  models.
+- **#1378 / #1456**: default univariate thin-plate basis sized to mgcv `k=10`
+  with rotation- and permutation-invariant knot selection. **#1074**: default
+  thin-plate / Matérn basis sized to mgcv `k=10·3^(d-1)` and the Matérn
+  correlation range matched to mgcv's default (diameter), fixing EDF inflation.
+- **#1379**: per-block penalty trace clamped to `[0, rank]` (NaN-safe) so a
+  univariate `matern(x)` fits. **bs="sz"**: emits `FactorSmooth` metadata so
+  basis freezing matches the spec.
+
+**Inference & numerics**
+- **#1426**: a stuck gamma/log REML flat valley is no longer shipped as a
+  converged overfit — score-relative stationarity certification, rejection of
+  non-converged inner PIRLS iterates and untrustworthy release-rerank seeds, and
+  a rank-guarded `H` pseudo-logdet with a determinant-pair-sign guard.
+- **#1464 / #1404**: constant-curvature κ sign is identifiable in `curv()` — a
+  κ-fair scan recovers the hyperbolic/spherical sign and the joint solve is
+  pinned to the sign-correct half-axis; the curvature-blind double-penalty ridge
+  is dropped.
+- **#1395**: custom-family pseudo-Laplace / exact-Newton objectives gain a
+  structural guard against `0.5·log|H|` collapse and no longer fold the
+  Jeffreys/Firth prior into the pinned-mode objective. **#1418**: the IFT
+  back-substitution inverts the exact stationarity Jacobian.
+- **#1376**: anisotropic Matérn ψ- and penalty-second-derivatives centered to the
+  raw-η gauge. **#1392**: P-spline double-penalty underfit fixed for `p>n`.
+- **#1410 / #1419**: compact softmax curvature uses a genuine Gershgorin Loewner
+  majorizer and reads active-only entries. **multinomial**: genuine per-class
+  EDF (no per-penalty-block over-count), a Fisher-information sparse-class
+  λ-floor (#1082), and the hetero `x1` basis sized to its true df (#1373).
+
+**Families & model comparison**
+- **#1465**: `compare_models` computes Δ / Bayes-factor on the ranking scale.
+- **#1448**: negative-binomial runs the full outer θ↔λ alternation (re-selecting
+  ρ after each θ refresh); **#1463**: NB-NUTS `sample()` refreshes the fitted
+  `theta_hat` rather than the seed.
+- **#1504**: a Gaussian location-scale (gaulss) fit with a by-group smooth in
+  both the mean and log-σ blocks no longer crashes on a joint-Hessian shape
+  mismatch — the joint exact-Newton path uses the identifiability-constrained
+  designs (with an R-free regression guard).
+
+**Survival**
+- **#1454**: the survival flex intercept-Hessian moving-boundary / self-flux
+  terms are completed and carried exactly to fourth order, single-sourced from
+  the D-path. **#1396**: entry/exit transposition in time-block η slicing fixed
+  and a near-cancellation event-Jacobian floored to the monotonicity guard.
+- **#1388**: under-determined (`p_joint > n`) survival marginal-slope joints are
+  surfaced honestly. **#979**: the marginal-slope outer search is bounded by a
+  wall-clock deadline with collapsed-trust-region stuck-exit guards.
+
+**Manifold-SAE, latent & routing (#932 / #1017 / #1026 / #1033)**
+- **#932**: the survival-LS / BMS-rigid / SAE-β-border row kernels are
+  single-sourced through one `row_kernel` v/g/H tower with an exact wiggle
+  joint-Hessian oracle. **#1500**: dead dictionary atoms are re-seeded.
+- **#1017**: a device-resident GPU path uploads `X` once and chains a
+  Gram-resident POTRF, downloading only β (with CPU parity gates). **#1026**: an
+  ungated linear/background tier reconstructs full-rank alongside the gated
+  sparse atoms.
+- **#1033**: an opt-in chart-geometry / amortized routing predictor (off by
+  default) with an n-free frozen-W Fisher-step solver. **latent**: a new
+  `LatentIdMode::IsometryToReference` gauge-fix mode.
+
+**CLI & summaries**
+- The CLI honors formula-declared categorical roles (numeric-coded factors).
+- **#1368 / #1370**: `summary()`'s RE penalty-cursor skips empty-range penalized
+  RE blocks on both the in-process and Python persisted paths.
+
+**Releasability / hygiene**
+- The build.rs gate gains anti-laundering bans: silent NaN/`0.0`/`Ok(())`
+  corruption where a contract guard belongs, owed-work disguised as prose, and
+  hardcoded commit-SHA literals. Contract guards previously laundered into
+  silent corruption are restored to panics-with-`// SAFETY:` or proper `Result`
+  errors across penalties, solver, basis, evidence, families and GPU paths.
+- PR-level anti-evasion / owed-work-ledger workflows are removed (enforcement
+  lives in the build), clippy is dropped from CI, and **#1458** gives the
+  build.rs author gate full history so it resolves the real last editor.
+
+See the git history (`git log v0.3.120..v0.3.121`) for the complete set.
+
 ## v0.3.120 — gam 0.3.120 / gamfit 0.1.222 (2026-06-21)
 
 crates.io + PyPI release of the open-issue bug-fix wave landed since gamfit
