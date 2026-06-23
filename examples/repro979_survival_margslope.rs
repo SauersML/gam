@@ -95,8 +95,25 @@ fn main() {
     init_parallelism();
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
 
-    let n: usize = 600;
-    let centers: usize = 10;
+    let n: usize = std::env::var("REPRO_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(600);
+    let centers: usize = std::env::var("REPRO_CENTERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
+    // Watchdog: the #979 survival hang must report itself rather than running to
+    // a queue kill, so "no output to timeout" is distinguishable from a slow fit.
+    let budget_s: u64 = std::env::var("REPRO_TIMEOUT_S")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1200);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(budget_s));
+        eprintln!("[979-SURV] n={n} centers={centers} HANG: exceeded {budget_s}s watchdog budget");
+        std::process::exit(124);
+    });
 
     let data = build_dataset(n);
     let pcs: Vec<String> = (0..N_PCS).map(|i| format!("PC{}", i + 1)).collect();
