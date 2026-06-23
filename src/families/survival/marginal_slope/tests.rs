@@ -8389,6 +8389,14 @@ fn flex_bidir_auvd12_fd_1454() {
             for v in u..p {
                 let fd = (pp[[u, v]] - pm[[u, v]] - mp[[u, v]] + mm[[u, v]]) / (4.0 * h * h);
                 let got = analytic[[u, v]];
+                // The auvd12 kernel and its finite-difference reference must both
+                // stay finite even while the #1454 FD-MATCH is still under
+                // investigation; a non-finite value is an unconditional defect.
+                assert!(
+                    got.is_finite() && fd.is_finite(),
+                    "#1454 AUVD12 {label}[{u},{v}] produced a non-finite value: \
+                     analytic {got:+.6e} fd2 {fd:+.6e}"
+                );
                 let err = (got - fd).abs();
                 if err > 1e-3 {
                     eprintln!("#1454 AUVD12 {label}[{u},{v}] analytic {got:+.6e} fd2 {fd:+.6e} abserr {err:.3e}");
