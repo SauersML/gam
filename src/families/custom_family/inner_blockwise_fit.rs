@@ -677,6 +677,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             if cycle >= inner_max_cycles {
                 break;
             }
+            if cycle > 0 && crate::solver::rho_optimizer::outer_wall_clock_deadline_exceeded() {
+                // gam#979: the fit-level wall-clock budget is spent. Stop at the
+                // current best-effort iterate so the outer search (which would
+                // otherwise grind every remaining screening stage / seed / plan
+                // to its cycle budget on a constrained solve that never
+                // certifies) terminates in bounded time. >=1 cycle has run, so a
+                // finite iterate is always returned.
+                break;
+            }
             let verbose_cycle = cycle == 0
                 || cycle + 1 == inner_max_cycles
                 || (cycle + 1) % JOINT_LOG_VERBOSE_PERIOD == 0;
