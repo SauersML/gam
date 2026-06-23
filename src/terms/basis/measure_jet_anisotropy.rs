@@ -52,7 +52,7 @@ use faer::Side;
 
 use crate::linalg::faer_ndarray::FaerEigh;
 
-use super::{BasisError, MeasureJetBand};
+use super::{measure_jet_energy_form, BasisError, MeasureJetBand};
 
 /// Truncation radius of the Gaussian profile in units of the scale ε,
 /// mirroring `measure_jet_smooth`: weights beyond `3ε` (metric distance) are
@@ -910,7 +910,26 @@ pub fn measure_jet_anisotropy_energy_form(
     alpha: f64,
     l: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, BasisError> {
-    Ok(measure_jet_anisotropy_energy_form_with_jets(centers, masses, band, order_s, alpha, l)?.q)
+    // The anisotropic energy is EXACTLY the isotropic energy on the
+    // metric-transformed centers `Y = X·M` (module header: `E_A(X) ≡ E_I(Y)`):
+    // every metric-dependent quantity — the kernel distances `‖δM‖²`, the local
+    // affine features `(δ/ε)M`, the ε/2-net, the neighbor cutoff and the
+    // residual algebra — is the isotropic one evaluated on `Y`. Computing the
+    // value by that single substitution (rather than re-deriving it through the
+    // metric block walk) keeps it bit-for-bit identical to the isotropic form at
+    // `M = I` and routes it through the SAME PSD projection, instead of an
+    // operation-reordered re-assembly that drifts by round-off.
+    let d = centers.ncols();
+    if l.nrows() != d || l.ncols() != d {
+        crate::bail_dim_basis!(
+            "measure-jet anisotropy metric L must be {d}×{d} to match the ambient dimension, got {:?}",
+            l.dim()
+        );
+    }
+    let indices = lower_triangular_indices(d);
+    let nf = build_normalized_factor(l, &indices)?;
+    let y = centers.dot(&nf.m);
+    measure_jet_energy_form(y.view(), masses, band, order_s, alpha, 0.0)
 }
 
 /// The det-normalized anisotropic energy together with its EXACT first and
@@ -962,7 +981,6 @@ pub fn measure_jet_anisotropy_energy_form_with_jets(
     // Metric distances for the ε/2-net, neighbor cutoff and kernel exponent.
     let md = metric_sq_dists(centers, nf.m.view());
 
-    let mut q_form = Array2::<f64>::zeros((m_centers, m_centers));
     let mut d_first: Vec<Array2<f64>> = (0..n)
         .map(|_| Array2::<f64>::zeros((m_centers, m_centers)))
         .collect();
@@ -1053,7 +1071,6 @@ pub fn measure_jet_anisotropy_energy_form_with_jets(
             // density weight.
             for (a, &ja) in idx.iter().enumerate() {
                 for (c, &jc) in idx.iter().enumerate() {
-                    q_form[(ja, jc)] += base * blk.r[(a, c)];
                     for x in 0..n {
                         let qx_over_q = blk.dq[x] / blk.q;
                         d_first[x][(ja, jc)] +=
@@ -1078,9 +1095,17 @@ pub fn measure_jet_anisotropy_energy_form_with_jets(
         }
     }
 
-    // Numerical symmetrization (every analytic form here is symmetric).
+    // VALUE: the exact reduction `E_A(X; L) = E_I(X·M)`. Taking the value from
+    // the isotropic energy on the metric-transformed centers (rather than the
+    // operation-reordered metric block walk above) makes it bit-for-bit
+    // identical to the isotropic form at `M = I` and routes it through the SAME
+    // PSD projection. The block walk above is retained solely for the EXACT
+    // `L`-jets, which are FD-gated against this value.
+    let y = centers.dot(&nf.m);
+    let q = measure_jet_energy_form(y.view(), masses, band, order_s, alpha, 0.0)?;
+
+    // Numerical symmetrization (every analytic derivative form here is symmetric).
     let sym = |a: Array2<f64>| (&a + &a.t()) * 0.5;
-    let q = sym(q_form);
     let d_first: Vec<Array2<f64>> = d_first.into_iter().map(sym).collect();
     let d_second: Vec<Array2<f64>> = d_second.into_iter().map(sym).collect();
 
@@ -1091,8 +1116,6 @@ pub fn measure_jet_anisotropy_energy_form_with_jets(
         d_second,
     })
 }
-
-#[cfg(test)]
 
 #[cfg(test)]
 mod tests {
