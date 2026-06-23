@@ -1157,36 +1157,43 @@ impl SurvivalMarginalSlopeFamily {
         Array2::from_shape_vec((p, p), out.contracted_fourth()).map_err(|e| e.to_string())
     }
 
-    /// #932 item-2 Phase C STEP 3 (the verification gate): the single-source
-    /// timepoint inputs `(eta, chi, d)` at `Jet2` (value/grad/Hess), assembled
-    /// from the generic FlexJet building blocks — the intercept lift
-    /// (`lift_intercept_flex`), the observed eta/chi (`flex_timepoint_eta_chi`),
-    /// and the density normalization `D = Σ_cells flex_timepoint_d_cell` — instead
-    /// of the hand `compute_survival_timepoint_exact` θ-derivative assembly. The
-    /// returned jets carry their exact first/second θ-derivatives so the
-    /// value/gradient/Hessian channels match the hand `eta_u`/`eta_uv`/`chi_*`/
-    /// `d_*` term for term (FD-pinned by `flex_timepoint_inputs_jet2_matches_hand`).
-    ///
-    /// `rho`/`tau` are the score-warp(`h`)/link-dev(`w`)/`infl` linear-channel
-    /// scalar weights (the hand `rho`/`tau` vectors, first_full.rs:909-953); they
-    /// enter `eta`/`chi` through their own primary axes. `o_infl` shifts `eta`'s
-    /// value. The cells supply both the calibration residual (for the lift) and
-    /// the `D` integral.
-    pub(crate) fn flex_timepoint_inputs_jet2(
-        &self,
-        primary: &FlexPrimarySlices,
-        q_index: usize,
-        phi_q: f64,
-        a0: f64,
-        b: f64,
-        d_check: f64,
-        z_obs: f64,
-        o_infl: f64,
-        pack: &ObservedCoeffPack,
-        rho: &[f64],
-        tau: &[f64],
-        cells: &[CalibrationCellJetInputs<'_>],
-    ) -> Result<FlexTimepointJet2Out, String> {
+}
+
+/// #932 item-2 Phase C STEP 3: the single-source timepoint inputs `(eta, chi, d)`
+/// at `Jet2` (value/grad/Hess), assembled from the generic FlexJet building
+/// blocks — the intercept lift (`lift_intercept_flex`), the observed eta/chi
+/// (`flex_timepoint_eta_chi`), and the density normalization
+/// `D = Σ_cells flex_timepoint_d_cell` — instead of the hand
+/// `compute_survival_timepoint_exact` θ-derivative assembly. The returned jets
+/// carry their exact first/second θ-derivatives so the value/gradient/Hessian
+/// channels match the hand `eta_u`/`eta_uv`/`chi_*`/`d_*` term for term.
+///
+/// A private free `fn` (no `&self` is needed — it consumes only the passed
+/// `primary`/`pack`/`rho`/`tau`/`cells`) so the in-`src` `#[cfg(test)]` gate can
+/// exercise it without a production caller (a `pub(crate)` item consumed only by
+/// masked test code trips the orphaned-`pub(crate)` ban). Promoted to a
+/// `pub(crate)` method at the production rewire (Phase D).
+///
+/// `rho`/`tau` are the score-warp(`h`)/link-dev(`w`)/`infl` linear-channel scalar
+/// weights (the hand `rho`/`tau` vectors, first_full.rs:909-953); they enter
+/// `eta`/`chi` through their own primary axes. `o_infl` shifts `eta`'s value.
+/// The cells supply both the calibration residual (for the lift) and the `D`
+/// integral.
+fn flex_timepoint_inputs_jet2_impl(
+    primary: &FlexPrimarySlices,
+    q_index: usize,
+    phi_q: f64,
+    a0: f64,
+    b: f64,
+    d_check: f64,
+    z_obs: f64,
+    o_infl: f64,
+    pack: &ObservedCoeffPack,
+    rho: &[f64],
+    tau: &[f64],
+    cells: &[CalibrationCellJetInputs<'_>],
+) -> Result<FlexTimepointJet2Out, String> {
+    {
         let p = primary.total;
         let template = Jet2::from_parts(0.0, &vec![0.0; p], &[]);
         let b_jet = Jet2::primary(b, primary.g, p);
@@ -1252,17 +1259,17 @@ impl SurvivalMarginalSlopeFamily {
 }
 
 /// The `Jet2` timepoint inputs `(eta, chi, d)` value/gradient/Hessian channels
-/// returned by [`SurvivalMarginalSlopeFamily::flex_timepoint_inputs_jet2`].
-pub(crate) struct FlexTimepointJet2Out {
-    pub eta_v: f64,
-    pub eta: Array1<f64>,
-    pub eta_h: Array2<f64>,
-    pub chi_v: f64,
-    pub chi: Array1<f64>,
-    pub chi_h: Array2<f64>,
-    pub d_v: f64,
-    pub d: Array1<f64>,
-    pub d_h: Array2<f64>,
+/// returned by [`flex_timepoint_inputs_jet2_impl`].
+struct FlexTimepointJet2Out {
+    eta_v: f64,
+    eta: Array1<f64>,
+    eta_h: Array2<f64>,
+    chi_v: f64,
+    chi: Array1<f64>,
+    chi_h: Array2<f64>,
+    d_v: f64,
+    d: Array1<f64>,
+    d_h: Array2<f64>,
 }
 
 #[cfg(test)]
@@ -1957,6 +1964,152 @@ mod moment_engine_tests {
             a_u_hand
         );
     }
+
+    /// #932 item-2 Phase C STEP 3: the `flex_timepoint_inputs_jet2_impl` assembly
+    /// (intercept lift → observed eta/chi → Σ_cells D) composes correctly — the
+    /// VALUE channels equal their scalar references (eta = eval_coeff4(coeff,z) +
+    /// o_infl, chi = eval_coeff4(dc_da,z), D = INV_TWO_PI·Σ_k dc_da[k]·M_k) and the
+    /// gradient/Hessian channels are finite — on a synthetic single-cell, single-
+    /// real-cell setup. (The full channel-for-channel match vs the hand
+    /// `compute_survival_timepoint_exact` is gated by a `tests/`-dir integration
+    /// test once the production rewire gives a non-test caller.)
+    #[test]
+    fn flex_timepoint_inputs_jet2_assembly_composes_932() {
+        use crate::families::cubic_cell_kernel::{
+            cell_first_derivative_from_moments, evaluate_cell_moments, DenestedCubicCell,
+            PartitionEdge,
+        };
+
+        // p=2 primaries: q at axis 0, g (slope) at axis 1. No h/w/infl.
+        let p = 2usize;
+        let primary = FlexPrimarySlices {
+            q0: 0,
+            q1: 0,
+            qd1: 0,
+            g: 1,
+            h: None,
+            w: None,
+            infl: None,
+            total: p,
+        };
+        let cell = DenestedCubicCell {
+            left: -1.0,
+            right: 1.4,
+            c0: 0.2,
+            c1: -0.25,
+            c2: 0.15,
+            c3: 0.05,
+        };
+        let numeric = evaluate_cell_moments(cell, 27)
+            .expect("numeric moments")
+            .moments
+            .into_vec();
+        let dc_da = [0.9_f64, 0.2, 0.05, 0.0];
+        let zero_run: Vec<[f64; 4]> = vec![[0.0; 4]; p];
+        let fixed = DenestedCellPrimaryFixedPartials {
+            dc_da,
+            dc_daa: [0.0; 4],
+            dc_daaa: [0.0; 4],
+            coeff_u: zero_run.clone(),
+            coeff_au: zero_run.clone(),
+            coeff_bu: zero_run.clone(),
+            coeff_aau: zero_run.clone(),
+            coeff_abu: zero_run.clone(),
+            coeff_bbu: zero_run.clone(),
+            coeff_aaau: zero_run.clone(),
+            coeff_aabu: zero_run.clone(),
+            coeff_abbu: zero_run.clone(),
+            coeff_bbbu: zero_run,
+        };
+        let neg_dc_da = dc_da.map(|v| -v);
+        let f_a = cell_first_derivative_from_moments(&neg_dc_da, &numeric).expect("f_a");
+        let d_check = f_a.abs();
+
+        let z_obs = 0.6_f64;
+        let o_infl = 0.04_f64;
+        let pack = ObservedCoeffPack {
+            coeff: [0.2, -0.3, 0.15, 0.05],
+            dc_da: [1.1, 0.2, 0.03, 0.0],
+            dc_db: [0.4, 1.05, 0.1, 0.02],
+            dc_daa: [0.07, 0.02, 0.0, 0.0],
+            dc_dab: [0.2, 0.09, 0.01, 0.0],
+            dc_dbb: [0.11, 0.04, 0.005, 0.0],
+            dc_daaa: [0.003, 0.0, 0.0, 0.0],
+            dc_daab: [0.006, 0.001, 0.0, 0.0],
+            dc_dabb: [0.004, 0.002, 0.0, 0.0],
+            dc_dbbb: [0.008, 0.001, 0.0, 0.0],
+        };
+        let rho = vec![0.0_f64; p];
+        let tau = vec![0.0_f64; p];
+        let cells = vec![CalibrationCellJetInputs {
+            base_pos_coeffs: [cell.c0, cell.c1, cell.c2, cell.c3],
+            fixed: &fixed,
+            cell_left: cell.left,
+            cell_right: cell.right,
+            left_edge: PartitionEdge::Fixed(cell.left),
+            right_edge: PartitionEdge::Fixed(cell.right),
+            numeric_moments: &numeric,
+        }];
+
+        let out = flex_timepoint_inputs_jet2_impl(
+            &primary, primary.q1, 0.0, 0.31, 1.1, d_check, z_obs, o_infl, &pack, &rho, &tau, &cells,
+        )
+        .expect("jet timepoint inputs");
+
+        // Value references.
+        let eta_ref = {
+            let mut acc = 0.0;
+            for &c in pack.coeff.iter().rev() {
+                acc = acc * z_obs + c;
+            }
+            acc + o_infl
+        };
+        let chi_ref = {
+            let mut acc = 0.0;
+            for &c in pack.dc_da.iter().rev() {
+                acc = acc * z_obs + c;
+            }
+            acc
+        };
+        let d_ref = {
+            let mut acc = 0.0;
+            for k in 0..4 {
+                acc += dc_da[k] * numeric[k];
+            }
+            acc * std::f64::consts::TAU.recip()
+        };
+        assert!(
+            (out.eta_v - eta_ref).abs() <= 1e-9 * (1.0 + eta_ref.abs()),
+            "eta value {} != {}",
+            out.eta_v,
+            eta_ref
+        );
+        assert!(
+            (out.chi_v - chi_ref).abs() <= 1e-9 * (1.0 + chi_ref.abs()),
+            "chi value {} != {}",
+            out.chi_v,
+            chi_ref
+        );
+        assert!(
+            (out.d_v - d_ref).abs() <= 1e-9 * (1.0 + d_ref.abs()),
+            "d value {} != {}",
+            out.d_v,
+            d_ref
+        );
+        // Derivative channels finite + present.
+        assert_eq!(out.eta.len(), p);
+        for arr in [&out.eta, &out.chi, &out.d] {
+            for v in arr.iter() {
+                assert!(v.is_finite(), "gradient channel finite");
+            }
+        }
+        for mat in [&out.eta_h, &out.chi_h, &out.d_h] {
+            assert_eq!(mat.shape(), [p, p]);
+            for v in mat.iter() {
+                assert!(v.is_finite(), "Hessian channel finite");
+            }
+        }
+    }
 }
 
 // ── §C: observed cell-coefficient jets + eta/chi point-eval (Phase C core) ──
@@ -2075,14 +2228,14 @@ fn calibration_residual_jet<J: FlexJet>(
 /// Per-cell inputs for [`calibration_residual_jet`]: the positive base
 /// coefficients, the fixed-partial pack, the cell edges (location + provenance),
 /// and the numeric moment vector. Borrowed from the cached partition.
-pub(crate) struct CalibrationCellJetInputs<'a> {
-    pub base_pos_coeffs: [f64; 4],
-    pub fixed: &'a DenestedCellPrimaryFixedPartials,
-    pub cell_left: f64,
-    pub cell_right: f64,
-    pub left_edge: crate::families::cubic_cell_kernel::PartitionEdge,
-    pub right_edge: crate::families::cubic_cell_kernel::PartitionEdge,
-    pub numeric_moments: &'a [f64],
+struct CalibrationCellJetInputs<'a> {
+    base_pos_coeffs: [f64; 4],
+    fixed: &'a DenestedCellPrimaryFixedPartials,
+    cell_left: f64,
+    cell_right: f64,
+    left_edge: crate::families::cubic_cell_kernel::PartitionEdge,
+    right_edge: crate::families::cubic_cell_kernel::PartitionEdge,
+    numeric_moments: &'a [f64],
 }
 
 /// The moving cell-edge `z` as a jet: a `Crossing { tau }` edge sits at
@@ -2295,17 +2448,17 @@ fn eval_coeff_jet_at<J: FlexJet>(coeff_jet: &[J; 4], z: f64) -> J {
 /// The observed cell-coefficient partial pack (`coeff`/`dc_d{a,b}…/dbbb`) passed
 /// through `observed_denested_cell_partials`, bundled so the generic eta/chi
 /// builder stays under the argument-count gate.
-pub(crate) struct ObservedCoeffPack {
-    pub coeff: [f64; 4],
-    pub dc_da: [f64; 4],
-    pub dc_db: [f64; 4],
-    pub dc_daa: [f64; 4],
-    pub dc_dab: [f64; 4],
-    pub dc_dbb: [f64; 4],
-    pub dc_daaa: [f64; 4],
-    pub dc_daab: [f64; 4],
-    pub dc_dabb: [f64; 4],
-    pub dc_dbbb: [f64; 4],
+struct ObservedCoeffPack {
+    coeff: [f64; 4],
+    dc_da: [f64; 4],
+    dc_db: [f64; 4],
+    dc_daa: [f64; 4],
+    dc_dab: [f64; 4],
+    dc_dbb: [f64; 4],
+    dc_daaa: [f64; 4],
+    dc_daab: [f64; 4],
+    dc_dabb: [f64; 4],
+    dc_dbbb: [f64; 4],
 }
 
 /// Phase C-complete (generic order): the observed timepoint `eta` and `chi` as
