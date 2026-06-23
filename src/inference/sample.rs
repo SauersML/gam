@@ -412,27 +412,47 @@ fn sample_standard(
     mut likelihood: LikelihoodSpec,
     cfg: &NutsConfig,
 ) -> Result<NutsResult, String> {
-    // `bounded(x, min, max)` linear terms carry their posterior on the latent
-    // interval-transform scale (`beta = min + (max - min)*sigmoid(theta)`), so the
-    // draws must come from the dedicated `sample_standard_bounded` path below —
-    // even for a gaussian-identity model, whose closed-form Laplace shortcut would
-    // otherwise fire first and place posterior mass outside `[min, max]`. That
-    // shortcut ran before the bounded dispatch, leaving the in-bounds latent
-    // sampler dead code for the gaussian default (only binomial ever reached it).
-    // Detect bounded terms from the saved termspec up front so the common,
-    // bound-free gaussian path keeps its fast exact fallback without parsing.
-    let has_bounded_linear = model.resolved_termspec.as_ref().is_some_and(|ts| {
+    // A coefficient that needs a *constraint-aware* posterior sampler must not
+    // take the gaussian-identity closed-form Laplace shortcut: that shortcut
+    // draws an unconstrained `N(mode, φ·H⁻¹)`, which for an active bound puts
+    // ~half its mass on the forbidden side of the boundary. Three geometries
+    // qualify, and all reproduce on a default gaussian model:
+    //   * a `bounded(x, min, max)` interval transform (#1508) — sampled on its
+    //     latent logit scale by `sample_standard_bounded`;
+    //   * a `nonnegative()`/`nonpositive()`/`linear(min,max)`/`constrain()` box
+    //     bound on a parametric coefficient (#1507); and
+    //   * a monotone/convex/concave shape cone on a spline (#1509).
+    // The latter two are sampled from the truncated Gaussian below. Detect all
+    // three cheaply from the saved termspec so the common, fully-unconstrained
+    // gaussian path keeps its fast exact fallback without building the design;
+    // the precise dispatch (and the authoritative `design.linear_constraints`
+    // check) happens after the design is assembled.
+    let needs_constraint_aware_sampler = model.resolved_termspec.as_ref().is_some_and(|ts| {
         ts.linear_terms.iter().any(|term| {
-            matches!(
+            !matches!(
                 term.coefficient_geometry,
-                LinearCoefficientGeometry::Bounded { .. }
-            )
-        })
+                LinearCoefficientGeometry::Unconstrained
+            ) || term.coefficient_min.is_some()
+                || term.coefficient_max.is_some()
+        }) || ts
+            .smooth_terms
+            .iter()
+            .any(|term| !matches!(term.shape, crate::smooth::ShapeConstraint::None))
     });
-    if likelihood.is_gaussian_identity() && !has_bounded_linear {
+    if likelihood.is_gaussian_identity() && !needs_constraint_aware_sampler {
         return laplace_gaussian_fallback(model, cfg, "standard gaussian posterior");
     }
     if model.has_link_wiggle() {
+        // A Gaussian-identity link-wiggle model is sampled from its saved
+        // closed-form joint Laplace posterior (the mean and wiggle coefficients
+        // are jointly Gaussian); only the non-Gaussian wiggle posterior needs
+        // the dedicated link-wiggle NUTS path. Preserved from the original
+        // dispatch, where the Gaussian-identity shortcut ran ahead of the
+        // wiggle branch and so claimed Gaussian wiggle models for the
+        // closed-form path.
+        if likelihood.is_gaussian_identity() {
+            return laplace_gaussian_fallback(model, cfg, "standard gaussian posterior");
+        }
         return sample_standard_link_wiggle(
             model,
             data,
@@ -451,9 +471,22 @@ fn sample_standard(
         col_map,
         "resolved_termspec",
     )?;
-    // Bounded() coefficients are not sampled by the exact GLM-NUTS path. That
-    // path runs the Hamiltonian over the *raw* linear design with the saved
-    // user-scale mode, treating every coefficient as an unconstrained,
+    let design = build_term_collection_design(data, &spec)
+        .map_err(|e| format!("failed to build term collection design: {e}"))?;
+
+    // ---- Constraint-aware posterior dispatch -------------------------------
+    //
+    // A coefficient subject to an *active* constraint sits on the boundary of
+    // its feasible region, so a plain unconstrained draw `N(mode, φ·H⁻¹)`
+    // places ~half its mass on the forbidden side. The constrained geometry
+    // must therefore be reconstructed *here*, ahead of both the
+    // Gaussian-identity closed-form shortcut and the GLM-NUTS fallback —
+    // neither of which is aware of the feasible region (#1507/#1508/#1509).
+    // The fit pins the point estimate correctly; only the posterior was blind.
+
+    // (1) bounded() interval coefficients are not sampled by the GLM-NUTS path.
+    // That path runs the Hamiltonian over the *raw* linear design with the
+    // saved user-scale mode, treating every coefficient as an unconstrained,
     // Gaussian-penalized parameter. Bounded terms are fit through a custom
     // family that drives eta via an interval transform `beta = min + (max-min)·
     // sigmoid(theta)` of an unconstrained latent `theta`. The posterior is
@@ -466,6 +499,9 @@ fn sample_standard(
     // `sample_bounded_latent_posterior_internal` reconstructs the latent
     // geometry via the exact inverse delta-method (`H_latent = J H_user J`) and
     // returns user-scale draws that always lie strictly inside the interval.
+    // This must precede the Gaussian-identity shortcut: a Gaussian `bounded()`
+    // model would otherwise take the closed-form path and emit a user-scale
+    // Gaussian that spills outside the interval (#1508).
     let has_bounded = spec.linear_terms.iter().any(|term| {
         matches!(
             term.coefficient_geometry,
@@ -477,8 +513,6 @@ fn sample_standard(
         // `intercept_range.end + j` of the model's coefficient vector. Bounds
         // are on the original (user/data) scale, which is also the scale the
         // saved beta and penalized Hessian live on.
-        let design = build_term_collection_design(data, &spec)
-            .map_err(|e| format!("failed to build term collection design: {e}"))?;
         let bounded_columns: Vec<crate::smooth::BoundedSampleColumn> = spec
             .linear_terms
             .iter()
@@ -496,8 +530,30 @@ fn sample_standard(
             .collect();
         return sample_standard_bounded(model, cfg, &bounded_columns);
     }
-    let design = build_term_collection_design(data, &spec)
-        .map_err(|e| format!("failed to build term collection design: {e}"))?;
+
+    // (2) box / shape *inequality* constraints — `nonnegative()` /
+    // `linear(min,max)` / `constrain()` box bounds on a parametric coefficient
+    // (#1507) and the monotone/convex/concave shape cone `γ_j ≥ 0` on a spline
+    // (#1509). Both are reconstructed by `build_term_collection_design` into a
+    // single `A β ≥ b` polytope in the saved coefficient coordinate system, so
+    // one truncated-Gaussian sampler covers them uniformly. Like `bounded()`,
+    // this must precede the Gaussian-identity shortcut so a constrained
+    // Gaussian model is sampled inside its feasible region rather than from the
+    // boundary-centred unconstrained Gaussian.
+    if let Some(constraints) = design
+        .linear_constraints
+        .as_ref()
+        .filter(|c| c.a.nrows() > 0)
+    {
+        return sample_standard_truncated(model, cfg, constraints);
+    }
+
+    // (3) unconstrained Gaussian identity — saved closed-form Laplace posterior.
+    if likelihood.is_gaussian_identity() {
+        return laplace_gaussian_fallback(model, cfg, "standard gaussian posterior");
+    }
+
+    // (4) unconstrained non-Gaussian GLM — exact NUTS over the raw design.
     let weights = Array1::ones(data.nrows());
     let dense_design_hmc = design.design.to_dense();
     let p = dense_design_hmc.ncols();
@@ -594,6 +650,16 @@ fn sample_standard_bounded(
     // user-scale penalized Hessian for a saved standard fit.)
     let user_hessian =
         explicit_fit_hessian_for_whitening(&fit, p, "saved standard bounded-coefficient model")?;
+    // φ-scale the latent posterior covariance, mirroring `laplace_gaussian_fallback`.
+    // The unscaled penalised Hessian gives `H_latent^{-1}`; the posterior is
+    // `φ · H_latent^{-1}`. Fixed-scale families (Binomial / Poisson) have φ = 1,
+    // so this is a no-op there; a Gaussian-identity `bounded()` model — which
+    // now reaches this path before the closed-form Gaussian shortcut (#1508) —
+    // gets the correct residual-variance-scaled width instead of a unit-φ one.
+    let sqrt_phi = {
+        use crate::inference::dispersion_cov::DispersionExt as _;
+        fit.dispersion().unwrap_or_default().sqrt_phi()
+    };
     let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
     let samples = crate::smooth::sample_bounded_latent_posterior_internal(
         &mode,
@@ -601,8 +667,75 @@ fn sample_standard_bounded(
         bounded_columns,
         n_total,
         chain_stream_seed(cfg.seed, 0, 0xB0DD_ED5E_ED90_1A7Cu64),
+        sqrt_phi,
     )
     .map_err(|e| format!("standard bounded-coefficient posterior sampling failed: {e}"))?;
+
+    let posterior_mean = samples
+        .mean_axis(ndarray::Axis(0))
+        .unwrap_or_else(|| Array1::<f64>::zeros(p));
+    let posterior_std = samples.std_axis(ndarray::Axis(0), 1.0);
+
+    Ok(NutsResult {
+        samples,
+        posterior_mean,
+        posterior_std,
+        rhat: 1.0,
+        ess: n_total as f64,
+        converged: true,
+    })
+}
+
+/// Exact posterior draws for a standard GLM whose coefficients carry linear
+/// *inequality* constraints `A β ≥ b` — `nonnegative()` / `linear(min,max)` /
+/// `constrain()` box bounds on a parametric term (#1507) and the
+/// monotone/convex/concave shape cone `γ_j ≥ 0` on a spline (#1509).
+///
+/// The posterior is the Laplace Gaussian `N(mode, φ·H⁻¹)` *truncated* to the
+/// feasible polytope. For a Gaussian-identity model this is the exact
+/// posterior; for a non-Gaussian GLM it is the constraint-respecting Laplace
+/// approximation — the same modelling choice the `bounded()` term makes. The
+/// draws are produced by exact reflective Hamiltonian Monte Carlo
+/// ([`crate::inference::truncated_gaussian`]), so every draw is feasible and
+/// successive draws are essentially independent (`rhat ≈ 1`, matching the other
+/// Laplace posterior paths).
+fn sample_standard_truncated(
+    model: &SavedModel,
+    cfg: &NutsConfig,
+    constraints: &crate::pirls::LinearInequalityConstraints,
+) -> Result<NutsResult, String> {
+    validate_nuts_config(cfg).map_err(String::from)?;
+    let fit = fit_result_from_saved_model_for_prediction(model)?;
+    let mode = fit.beta.clone();
+    let p = mode.len();
+    if p == 0 {
+        return Err(
+            "standard constrained-coefficient posterior: cannot sample from an empty coefficient \
+             vector"
+                .to_string(),
+        );
+    }
+    // The saved standard fit exports the unscaled user-scale penalised Hessian
+    // `H`; the truncated sampler whitens with its Cholesky and re-applies √φ so
+    // the posterior covariance is `φ·H⁻¹`, identical to the unconstrained
+    // Gaussian/bounded paths. Fixed-scale families (Binomial / Poisson) have
+    // φ = 1.
+    let penalized_hessian =
+        explicit_fit_hessian_for_whitening(&fit, p, "saved standard constrained model")?;
+    let sqrt_phi = {
+        use crate::inference::dispersion_cov::DispersionExt as _;
+        fit.dispersion().unwrap_or_default().sqrt_phi()
+    };
+    let samples = crate::inference::truncated_gaussian::sample_truncated_gaussian_posterior(
+        &mode,
+        &penalized_hessian,
+        sqrt_phi,
+        constraints,
+        cfg.n_samples,
+        cfg.n_chains,
+        chain_stream_seed(cfg.seed, 0, 0x7290_C047_5D6E_B14Du64),
+    )?;
+    let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
 
     let posterior_mean = samples
         .mean_axis(ndarray::Axis(0))

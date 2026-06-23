@@ -3079,6 +3079,7 @@ fn bounded_latent_sampler_draws_in_bounds_and_preserves_joint() {
         &bounded_columns,
         n_draws,
         7607760,
+        1.0,
     )
     .expect("bounded latent sampler");
     assert_eq!(draws.dim(), (n_draws, 2));

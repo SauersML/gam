@@ -4875,6 +4875,13 @@ pub struct BoundedSampleColumn {
 /// Non-bounded columns have `J_ii = 1`, so they are sampled as the ordinary
 /// Gaussian Laplace draw and returned unchanged.
 ///
+/// Dispersion. The user-scale penalized Hessian is stored *unscaled* (no φ),
+/// so the latent posterior covariance is `φ · H_latent^{-1}`. `sqrt_phi = √φ`
+/// scales each latent draw accordingly: it is `1.0` for fixed-scale families
+/// (Binomial / Poisson, where `bounded()` is most common) and the residual-SD
+/// square root for a Gaussian / Gamma fit. Passing `1.0` recovers the original
+/// φ = 1 behaviour exactly.
+///
 /// Returns the draws as a `(n_draws, p)` matrix on the *internal* user scale
 /// (still conditioned); the caller back-transforms to the original data scale
 /// with the same conditioning it used for the point estimate.
@@ -4884,6 +4891,7 @@ pub fn sample_bounded_latent_posterior_internal(
     bounded_columns: &[BoundedSampleColumn],
     n_draws: usize,
     base_seed: u64,
+    sqrt_phi: f64,
 ) -> Result<Array2<f64>, EstimationError> {
     let p = beta_user.len();
     if user_hessian.nrows() != p || user_hessian.ncols() != p {
@@ -4946,7 +4954,9 @@ pub fn sample_bounded_latent_posterior_internal(
         }
         solve_lower_transpose_into(&l, &eps, &mut delta);
         for i in 0..p {
-            draws[(k, i)] = theta_mode[i] + delta[i];
+            // `delta` has covariance `H_latent^{-1}`; the √φ factor lifts it to
+            // the φ-scaled posterior covariance `φ · H_latent^{-1}`.
+            draws[(k, i)] = theta_mode[i] + sqrt_phi * delta[i];
         }
         // Push bounded columns through the exact interval map so every draw is
         // strictly inside (min, max); leave unconstrained columns untouched.
