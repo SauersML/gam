@@ -24,6 +24,9 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       cache_key: ${{ steps.cache_key.outputs.cache_key }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Setup environment
         uses: ./.github/actions/bench-setup
 
@@ -143,6 +146,9 @@ jobs:
       # Daily run leaves this empty so runner.py disables the per-command timeout entirely.
       BENCH_CMD_TIMEOUT_SEC: ${{ github.event.schedule == '0 7 * * *' && '' || '2400' }}
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Setup environment
         uses: ./.github/actions/bench-setup
 

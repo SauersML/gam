@@ -12,9 +12,13 @@ inputs:
 runs:
   using: composite
   steps:
-    - name: Checkout
-      uses: actions/checkout@v5
-
+    # This is a *local* composite action (`uses: ./.github/actions/bench-setup`).
+    # The runner can only resolve it after the repository has already been
+    # checked out, so a checkout step here could never bootstrap the very
+    # checkout it depends on — and it would clobber a caller's deliberate
+    # checkout config (e.g. benchmark.yml's `fetch-depth: 0` for the build.rs
+    # author gate, #1458). Every caller therefore runs `actions/checkout`
+    # itself before invoking this action.
     - name: Install Rust stable
       uses: dtolnay/rust-toolchain@stable
 
