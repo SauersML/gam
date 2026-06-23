@@ -2429,18 +2429,21 @@ where
             // mean ± z·mean_se, which is finite (mean is the plug-in inverse link
             // and mean_se was delta-guarded above), so a fitted model always
             // returns finite interval bounds.
+            // Check BOTH endpoints' finiteness (not the min/max result): Rust's
+            // f64::max/min return the non-NaN argument, so a single non-finite
+            // endpoint would otherwise slip through as a finite-but-wrong bound.
             let lower = Array1::from_iter((0..mean.len()).map(|i| {
-                let v = transformed_lower[i].min(transformed_upper[i]);
-                if v.is_finite() {
-                    v
+                let (lo, hi) = (transformed_lower[i], transformed_upper[i]);
+                if lo.is_finite() && hi.is_finite() {
+                    lo.min(hi)
                 } else {
                     mean[i] - z_lower_per_row[i] * mean_standard_error[i]
                 }
             }));
             let upper = Array1::from_iter((0..mean.len()).map(|i| {
-                let v = transformed_lower[i].max(transformed_upper[i]);
-                if v.is_finite() {
-                    v
+                let (lo, hi) = (transformed_lower[i], transformed_upper[i]);
+                if lo.is_finite() && hi.is_finite() {
+                    lo.max(hi)
                 } else {
                     mean[i] + z_upper_per_row[i] * mean_standard_error[i]
                 }
