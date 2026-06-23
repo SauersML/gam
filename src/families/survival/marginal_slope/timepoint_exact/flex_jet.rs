@@ -1348,13 +1348,13 @@ mod moment_engine_tests {
         a0: f64,
         d_check: f64,
         primary_g: usize,
+        infl: Option<usize>,
         q_index: usize,
         q: f64,
         z_obs: f64,
         o_infl: f64,
-        pack: &ObservedCoeffPack,
-        rho_jet: &J,
-        tau_jet: &J,
+        obs_coeff: [f64; 4],
+        obs_fixed: &DenestedCellPrimaryFixedPartials,
         cells: &[CalibrationCellJetInputs<'_>],
     ) -> Result<(J, J, J), String> {
         // Intercept lift to order `J` (value/grad/Hess/… per the seed). The lift's
@@ -1365,15 +1365,30 @@ mod moment_engine_tests {
             |a: &J| calibration_residual_jet(a, b_jet, primary_g, du, q_index, q, cells);
         let a_jet = lift_intercept_flex(template, a0, 1.0 / d_check, 2, residual);
 
-        // Observed eta/chi: the full bivariate `(a,b)` Taylor composed with the
-        // lifted `a_jet` + real `b_jet`, plus the linear `h`/`w`/`infl` channels.
-        let (eta, chi) =
-            flex_timepoint_eta_chi(&a_jet, b_jet, z_obs, o_infl, pack, rho_jet, tau_jet);
+        // Observed eta/chi: the OBSERVED cell coefficient `c_k(a, {θ_u})` and its
+        // `∂_a` (= χ) built as MULTIVARIATE jets over ALL primaries (g/h/w) via
+        // `cell_coeff_jets`/`cell_chi_poly_jets` on the OBSERVED-point fixed pack
+        // `obs_fixed` (the analogue of the calibration cells' pack: `coeff_u[g]=dc_db`,
+        // `coeff_u[h]=b·H(z_obs)`, `coeff_u[w]=link_basis(a,b)`, with their a/b
+        // partials). Composing with the lifted `a_jet` + the directional `du` seeds
+        // carries the h/w cross-derivatives to ALL orders automatically — replacing
+        // the (a,b)-only `observed_coeff_component_jet` + frozen-scalar channels.
+        // `eta = Σ_k c_k·z_obs^k + o_infl (+ the infl primary's unit partial)`.
+        let da = tangent_jet(&a_jet);
+        let eta_coeff = cell_coeff_jets(&a_jet, obs_coeff, obs_fixed, primary_g, &da, du);
+        let chi_coeff = cell_chi_poly_jets(&a_jet, obs_fixed, primary_g, &da, du);
+        let mut eta = add_const(&eval_coeff_jet_at(&eta_coeff, z_obs), o_infl);
+        if let Some(infl_axis) = infl {
+            // ∂η₁/∂o_infl = 1: the absorbed-influence offset shifts η₁ additively
+            // (#461), independent of the calibration cells, so its only partial is
+            // the unit slope on its own primary.
+            eta = eta.add(&du[infl_axis]);
+        }
+        let chi = eval_coeff_jet_at(&chi_coeff, z_obs);
 
         // D normalization = Σ_cells INV_TWO_PI·Σ_k χ_k·M_k, with the cell coeff /
-        // chi-poly jets through the lifted `a_jet` and the moving-edge jets through
-        // `(a_jet, b_jet)`.
-        let da = tangent_jet(&a_jet);
+        // chi-poly jets through the lifted `a_jet` (the `da` tangent above) and the
+        // moving-edge jets through `(a_jet, b_jet)`.
         let mut d = const_jet_like(template, 0.0);
         for cell in cells {
             let c_pos = cell_coeff_jets(&a_jet, cell.base_pos_coeffs, cell.fixed, primary_g, &da, du);
@@ -2989,29 +3004,107 @@ mod moment_engine_tests {
             .collect()
     }
 
-    /// The observed `(a,b)` coefficient pack for the generic builder, from the
-    /// family's `observed_denested_cell_partials` (g-only: `beta_h`/`beta_w` = None).
-    fn observed_pack_for(
+    /// The OBSERVED-point coefficient + per-primary fixed-partial pack for the generic
+    /// builder — the observed-point analogue of `denested_cell_primary_fixed_partials`
+    /// (the calibration cells' pack). Returns `(obs_coeff, obs_fixed)` where:
+    ///   - the `(a,b)` columns (the `g` slope axis) come from `observed_denested_cell
+    ///     _partials` (`coeff_u[g]=dc_db`, `coeff_au[g]=dc_dab`, `coeff_bu[g]=dc_dbb`,
+    ///     `coeff_aau[g]=dc_daab`, `coeff_abu[g]=dc_dabb`, `coeff_bbu[g]=dc_dbbb`),
+    ///   - the score-warp `h` columns from `observed_score_basis_coefficients` at
+    ///     `z_obs` (`coeff_u[h]=b·H(z_obs)`, `coeff_bu[h]=H(z_obs)`; a-independent, so
+    ///     every `a`-cross column is zero),
+    ///   - the link-dev `w` columns from `link_basis_cell_coefficients` at `u_obs`
+    ///     (`coeff_u[w]`) and its first/second/third `(a,b)` partials.
+    /// Feeding this to `cell_coeff_jets`/`cell_chi_poly_jets` builds the observed
+    /// `eta`/`chi` as multivariate jets over g/h/w to ALL orders — the same machinery
+    /// the calibration cells / D path use. `scale` = the probit-frailty scale.
+    fn observed_fixed_for(
         family: &SurvivalMarginalSlopeFamily,
+        primary: &FlexPrimarySlices,
         row: usize,
         a: f64,
         b: f64,
-    ) -> ObservedCoeffPack {
-        let obs = family
-            .observed_denested_cell_partials(row, a, b, None, None)
-            .expect("observed denested cell partials");
-        ObservedCoeffPack {
-            coeff: obs.coeff,
-            dc_da: obs.dc_da,
-            dc_db: obs.dc_db,
-            dc_daa: obs.dc_daa,
-            dc_dab: obs.dc_dab,
-            dc_dbb: obs.dc_dbb,
-            dc_daaa: obs.dc_daaa,
-            dc_daab: obs.dc_daab,
-            dc_dabb: obs.dc_dabb,
-            dc_dbbb: obs.dc_dbbb,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+    ) -> Result<([f64; 4], DenestedCellPrimaryFixedPartials), String> {
+        let r = primary.total;
+        let scale = family.probit_frailty_scale();
+        let z_obs = family.observed_score_projection(row);
+        let u_obs = a + b * z_obs;
+        let obs = family.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
+
+        let mut coeff_u = vec![[0.0; 4]; r];
+        let mut coeff_au = vec![[0.0; 4]; r];
+        let mut coeff_bu = vec![[0.0; 4]; r];
+        let mut coeff_aau = vec![[0.0; 4]; r];
+        let mut coeff_abu = vec![[0.0; 4]; r];
+        let mut coeff_bbu = vec![[0.0; 4]; r];
+        let mut coeff_aaau = vec![[0.0; 4]; r];
+        let mut coeff_aabu = vec![[0.0; 4]; r];
+        let mut coeff_abbu = vec![[0.0; 4]; r];
+        let mut coeff_bbbu = vec![[0.0; 4]; r];
+
+        // g (slope) axis = the observed (a,b) pack columns.
+        coeff_u[primary.g] = obs.dc_db;
+        coeff_au[primary.g] = obs.dc_dab;
+        coeff_bu[primary.g] = obs.dc_dbb;
+        coeff_aau[primary.g] = obs.dc_daab;
+        coeff_abu[primary.g] = obs.dc_dabb;
+        coeff_bbu[primary.g] = obs.dc_dbbb;
+
+        // h (score-warp) axis: `coeff_h(z_obs) = b·H(z_obs)` — linear in b, a-free.
+        if let Some(h_range) = primary.h.as_ref().filter(|_| family.score_warp.is_some()) {
+            for local_idx in 0..h_range.len() {
+                let idx = h_range.start + local_idx;
+                coeff_u[idx] = scale_coeff4(
+                    family.observed_score_basis_coefficients(row, local_idx, z_obs, b)?,
+                    scale,
+                );
+                coeff_bu[idx] = scale_coeff4(
+                    family.observed_score_basis_coefficients(row, local_idx, z_obs, 1.0)?,
+                    scale,
+                );
+            }
         }
+
+        // w (link-dev) axis: `coeff_w = link_basis(u_obs, a, b)` + its (a,b) partials.
+        if let (Some(w_range), Some(runtime)) = (primary.w.as_ref(), family.link_dev.as_ref()) {
+            for local_idx in 0..w_range.len() {
+                let span = runtime.basis_cubic_at(local_idx, u_obs)?;
+                let idx = w_range.start + local_idx;
+                coeff_u[idx] = scale_coeff4(exact_kernel::link_basis_cell_coefficients(span, a, b), scale);
+                let (dc_aw, dc_bw) = exact_kernel::link_basis_cell_coefficient_partials(span, a, b);
+                let (dc_aaw, dc_abw, dc_bbw) = exact_kernel::link_basis_cell_second_partials(span, a, b);
+                let (dc_aaaw, dc_aabw, dc_abbw, dc_bbbw) =
+                    exact_kernel::link_basis_cell_third_partials(span);
+                coeff_au[idx] = scale_coeff4(dc_aw, scale);
+                coeff_bu[idx] = scale_coeff4(dc_bw, scale);
+                coeff_aau[idx] = scale_coeff4(dc_aaw, scale);
+                coeff_abu[idx] = scale_coeff4(dc_abw, scale);
+                coeff_bbu[idx] = scale_coeff4(dc_bbw, scale);
+                coeff_aaau[idx] = scale_coeff4(dc_aaaw, scale);
+                coeff_aabu[idx] = scale_coeff4(dc_aabw, scale);
+                coeff_abbu[idx] = scale_coeff4(dc_abbw, scale);
+                coeff_bbbu[idx] = scale_coeff4(dc_bbbw, scale);
+            }
+        }
+
+        let fixed = DenestedCellPrimaryFixedPartials {
+            dc_da: obs.dc_da,
+            dc_daa: obs.dc_daa,
+            dc_daaa: obs.dc_daaa,
+            coeff_u,
+            coeff_au,
+            coeff_bu,
+            coeff_aau,
+            coeff_abu,
+            coeff_bbu,
+            coeff_aaau,
+            coeff_aabu,
+            coeff_abbu,
+            coeff_bbbu,
+        };
+        Ok((obs.coeff, fixed))
     }
 
     /// #932 item-2 STEP 3c: `flex_timepoint_inputs_generic::<Jet3>` directional
@@ -3056,7 +3149,8 @@ mod moment_engine_tests {
             .expect("hand directional");
 
         // Generic Jet3 builder, seeded with the direction.
-        let pack = observed_pack_for(&family, row, a1, g);
+        let (obs_coeff, obs_fixed) =
+            observed_fixed_for(&family, &primary, row, a1, g, None, None).expect("obs fixed");
         let cells = cells_from_cached(&cached);
         let z_obs = family.observed_score_projection(row);
         let d_check = family
@@ -3068,10 +3162,9 @@ mod moment_engine_tests {
         let du: Vec<Jet3> = (0..p)
             .map(|u| Jet3::primary(0.0, u, p, dir[u]))
             .collect();
-        let zero = Jet3::primary(0.0, usize::MAX, p, 0.0);
         let (eta, chi, dnorm) = flex_timepoint_inputs_generic(
-            &template, &b_jet, &du, a1, d_check, primary.g, primary.q1, q1, z_obs, o_infl,
-            &pack, &zero, &zero, &cells,
+            &template, &b_jet, &du, a1, d_check, primary.g, primary.infl, primary.q1, q1, z_obs,
+            o_infl, obs_coeff, &obs_fixed, &cells,
         )
         .expect("generic jet3");
 
@@ -3169,7 +3262,8 @@ mod moment_engine_tests {
             )
             .expect("hand bidirectional");
 
-        let pack = observed_pack_for(&family, row, a1, g);
+        let (obs_coeff, obs_fixed) =
+            observed_fixed_for(&family, &primary, row, a1, g, None, None).expect("obs fixed");
         let cells = cells_from_cached(&cached);
         let z_obs = family.observed_score_projection(row);
         let d_check = family
@@ -3182,10 +3276,9 @@ mod moment_engine_tests {
         let du: Vec<Jet4> = (0..p)
             .map(|u| Jet4::primary(0.0, u, p, dir1[u], dir2[u]))
             .collect();
-        let zero = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
         let (eta, chi, dnorm) = flex_timepoint_inputs_generic(
-            &template, &b_jet, &du, a1, d_check, primary.g, primary.q1, q1, z_obs, o_infl,
-            &pack, &zero, &zero, &cells,
+            &template, &b_jet, &du, a1, d_check, primary.g, primary.infl, primary.q1, q1, z_obs,
+            o_infl, obs_coeff, &obs_fixed, &cells,
         )
         .expect("generic jet4");
 
@@ -3204,6 +3297,176 @@ mod moment_engine_tests {
         cmp_mat("eta_uv_uv", &eta.eps_del.h, &hand.eta_uv_uv);
         cmp_mat("chi_uv_uv", &chi.eps_del.h, &hand.chi_uv_uv);
         cmp_mat("d_uv_uv", &dnorm.eps_del.h, &hand.d_uv_uv);
+    }
+
+    // ── §3c h/w channels: g+h+w directional/bidirectional gate ──────────────────
+    //
+    // With score-warp(`h`) AND link-dev(`w`) active, the OBSERVED eta/chi carry the
+    // `h`/`w` primaries, and their directional/bidirectional derivatives involve the
+    // h/w channel weights' OWN (a,b)-Taylor (w: `link_basis_cell_*partials`; h:
+    // a-independent, `coeff_u[h]=b·H(z_obs)`/`coeff_bu[h]=H(z_obs)`). `observed_fixed_
+    // for` packs these into a `DenestedCellPrimaryFixedPartials` at the observed point;
+    // `cell_coeff_jets`/`cell_chi_poly_jets` raise them to all orders. This gate pins
+    // the g+h+w Jet3/Jet4 contractions term-for-term vs the hand directional/
+    // bidirectional packs — the cross h/w derivatives the frozen-scalar channels
+    // dropped.
+
+    /// A score-warp / link-dev deviation runtime for the g+h+w gate (mirrors the
+    /// `tests.rs` fixture: degree-3 cubic, 1 internal knot, penalty orders 1/2/3).
+    fn flex_test_deviation_runtime() -> DeviationRuntime {
+        build_score_warp_deviation_block_from_seed(
+            &Array1::from(vec![-1.0, 0.0, 1.0]),
+            &DeviationBlockConfig {
+                degree: 3,
+                num_internal_knots: 1,
+                penalty_order: 2,
+                penalty_orders: vec![1, 2, 3],
+                double_penalty: false,
+                monotonicity_eps: 1e-4,
+            },
+        )
+        .expect("build test deviation runtime")
+        .runtime
+    }
+
+    /// A g+h+w survival family: like `make_g_only_flex_family` but with BOTH a
+    /// score-warp and a link-dev runtime installed (scalar score dim).
+    fn make_ghw_flex_family(n: usize) -> SurvivalMarginalSlopeFamily {
+        let mut family = make_g_only_flex_family(n);
+        family.score_warp = Some(flex_test_deviation_runtime());
+        family.link_dev = Some(flex_test_deviation_runtime());
+        family
+    }
+
+    /// #932 item-2 STEP 3c (h/w channels): `flex_timepoint_inputs_generic` at Jet3
+    /// (directional) AND Jet4 (bidirectional) == the hand directional/bidirectional
+    /// packs term-for-term (≤1e-6) on a model with ACTIVE `h` AND `w` primaries —
+    /// exercising the h/w channel-weight cross-derivatives to 3rd/4th order.
+    #[test]
+    fn flex_timepoint_inputs_ghw_jet3_jet4_match_hand_932() {
+        let n = 16usize;
+        let family = make_ghw_flex_family(n);
+        let primary = flex_primary_slices(&family);
+        let p = primary.total;
+        let row = 6usize;
+        let g = 0.2_f64;
+
+        // Non-trivial h/w coefficients (lengths from the primary layout).
+        let h_len = primary.h.as_ref().map(|r| r.len()).unwrap_or(0);
+        let w_len = primary.w.as_ref().map(|r| r.len()).unwrap_or(0);
+        let beta_h = Array1::from_iter((0..h_len).map(|i| 0.1 + 0.05 * (i as f64) - 0.02 * ((i % 2) as f64)));
+        let beta_w = Array1::from_iter((0..w_len).map(|i| -0.08 + 0.04 * (i as f64) + 0.01 * ((i % 3) as f64)));
+        let bh = Some(&beta_h);
+        let bw = Some(&beta_w);
+
+        let m_beta = 0.15_f64;
+        let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * m_beta;
+        let o_infl = 0.0_f64;
+        let solved = family
+            .solve_row_survival_intercept_with_slot(
+                q1,
+                g,
+                bh,
+                bw,
+                Some((row, SurvivalInterceptSlotKind::Exit)),
+            )
+            .expect("intercept solve");
+        let a1 = solved.0;
+        let d1 = solved.1;
+        let cached = family
+            .build_cached_partition(&primary, a1, g, bh, bw)
+            .expect("cached partition");
+
+        let (obs_coeff, obs_fixed) =
+            observed_fixed_for(&family, &primary, row, a1, g, bh, bw).expect("obs fixed");
+        let cells = cells_from_cached(&cached);
+        let z_obs = family.observed_score_projection(row);
+        let d_check = family
+            .evaluate_survival_denom_d(a1, g, bh, bw)
+            .expect("denom");
+
+        let cmp_vec = |label: &str, jet: &Vec<f64>, hand: &[f64]| {
+            for u in 0..p {
+                assert!(
+                    (jet[u] - hand[u]).abs() <= 1e-6 * (1.0 + hand[u].abs()),
+                    "{label}[{u}] jet {} != hand {}",
+                    jet[u],
+                    hand[u]
+                );
+            }
+        };
+        let cmp_mat = |label: &str, jet: &Vec<f64>, hand: &Array2<f64>| {
+            for u in 0..p {
+                for v in 0..p {
+                    assert!(
+                        (jet[u * p + v] - hand[[u, v]]).abs() <= 1e-6 * (1.0 + hand[[u, v]].abs()),
+                        "{label}[{u},{v}] jet {} != hand {}",
+                        jet[u * p + v],
+                        hand[[u, v]]
+                    );
+                }
+            }
+        };
+
+        // ── Jet3 directional ──
+        let dir = Array1::from_iter((0..p).map(|c| 0.1 + 0.05 * (c as f64) - 0.02 * ((c % 3) as f64)));
+        let hand_dir = family
+            .compute_survival_timepoint_directional_exact_from_cached(
+                row, &primary, q1, primary.q1, a1, g, bh, bw, &cached, &dir, true,
+            )
+            .expect("hand directional");
+        let base = family
+            .compute_survival_timepoint_exact_from_cached(
+                row, &primary, q1, primary.q1, a1, g, d1, bh, bw, o_infl, true, &cached,
+            )
+            .expect("hand base");
+
+        let template3 = Jet3::primary(0.0, usize::MAX, p, 0.0);
+        let b_jet3 = Jet3::primary(g, primary.g, p, dir[primary.g]);
+        let du3: Vec<Jet3> = (0..p).map(|u| Jet3::primary(0.0, u, p, dir[u])).collect();
+        let (eta3, chi3, d3) = flex_timepoint_inputs_generic(
+            &template3, &b_jet3, &du3, a1, d_check, primary.g, primary.infl, primary.q1, q1, z_obs,
+            o_infl, obs_coeff, &obs_fixed, &cells,
+        )
+        .expect("generic jet3");
+
+        // Base channel vs hand base (validates the h/w eta/chi Hessian too).
+        cmp_vec("eta_u", &eta3.base.g, base.eta_u.as_slice().unwrap());
+        cmp_mat("eta_uv", &eta3.base.h, &base.eta_uv);
+        cmp_vec("chi_u", &chi3.base.g, base.chi_u.as_slice().unwrap());
+        cmp_mat("chi_uv", &chi3.base.h, &base.chi_uv);
+        cmp_vec("d_u", &d3.base.g, base.d_u.as_slice().unwrap());
+        cmp_mat("d_uv", &d3.base.h, &base.d_uv);
+        // Directional channel vs hand directional.
+        cmp_vec("eta_u_dir", &eta3.eps.g, hand_dir.eta_u_dir.as_slice().unwrap());
+        cmp_mat("eta_uv_dir", &eta3.eps.h, &hand_dir.eta_uv_dir);
+        cmp_vec("chi_u_dir", &chi3.eps.g, hand_dir.chi_u_dir.as_slice().unwrap());
+        cmp_mat("chi_uv_dir", &chi3.eps.h, &hand_dir.chi_uv_dir);
+        cmp_vec("d_u_dir", &d3.eps.g, hand_dir.d_u_dir.as_slice().unwrap());
+        cmp_mat("d_uv_dir", &d3.eps.h, &hand_dir.d_uv_dir);
+
+        // ── Jet4 bidirectional ──
+        let dir1 = Array1::from_iter((0..p).map(|c| 0.12 + 0.04 * (c as f64) - 0.01 * ((c % 2) as f64)));
+        let dir2 = Array1::from_iter((0..p).map(|c| -0.07 + 0.05 * ((c % 3) as f64) + 0.02 * (c as f64)));
+        let hand_bi = family
+            .compute_survival_timepoint_bidirectional_exact_from_cached(
+                row, &primary, q1, primary.q1, a1, g, bh, bw, &cached, &dir1, &dir2,
+            )
+            .expect("hand bidirectional");
+
+        let template4 = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
+        let b_jet4 = Jet4::primary(g, primary.g, p, dir1[primary.g], dir2[primary.g]);
+        let du4: Vec<Jet4> = (0..p)
+            .map(|u| Jet4::primary(0.0, u, p, dir1[u], dir2[u]))
+            .collect();
+        let (eta4, chi4, d4) = flex_timepoint_inputs_generic(
+            &template4, &b_jet4, &du4, a1, d_check, primary.g, primary.infl, primary.q1, q1, z_obs,
+            o_infl, obs_coeff, &obs_fixed, &cells,
+        )
+        .expect("generic jet4");
+        cmp_mat("eta_uv_uv", &eta4.eps_del.h, &hand_bi.eta_uv_uv);
+        cmp_mat("chi_uv_uv", &chi4.eps_del.h, &hand_bi.chi_uv_uv);
+        cmp_mat("d_uv_uv", &d4.eps_del.h, &hand_bi.d_uv_uv);
     }
 }
 
