@@ -772,7 +772,12 @@ where
             let grid = [
                 -5.0_f64, -2.0, 0.0, 2.0, 5.0, 8.0, 10.0, 12.0, 16.0, 20.0, 25.0, 30.0,
             ];
-            let mut sweep_from = |label: &str, baseline: &Array1<f64>| {
+            let mut baselines: Vec<(&str, Array1<f64>)> =
+                vec![("zeros", Array1::<f64>::zeros(k))];
+            if k == 4 {
+                baselines.push(("conv", Array1::from(vec![9.0_f64, 30.0, 12.0, 30.0])));
+            }
+            for (label, baseline) in &baselines {
                 log::warn!("[#1074-sweep] k={k} baseline={label}={baseline:?}");
                 for coord in 0..k {
                     let mut line = format!("[#1074-sweep:{label}] coord={coord}:");
@@ -787,11 +792,6 @@ where
                     }
                     log::warn!("{line}");
                 }
-            };
-            sweep_from("zeros", &Array1::<f64>::zeros(k));
-            if k == 4 {
-                let conv = Array1::from(vec![9.0_f64, 30.0, 12.0, 30.0]);
-                sweep_from("conv", &conv);
             }
         }
 
