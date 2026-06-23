@@ -6385,3 +6385,220 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
         }
     }
 }
+
+/// #932 (survival link-wiggle GATE verification): the production hand assembler
+/// `assemble_joint_hessian_from_quantities` (which adds the wiggle block via
+/// `assemble_h_wiggle`) must equal the mechanically-derived joint Hessian built
+/// from the SINGLE-SOURCE §13 wiggle row program (`sls_row_nll` extended with the
+/// warp `q = q0 + Σ βw·B(q0)` and the qdot coupling `g = m1·g0`), assembled into
+/// coefficient space by the same `JᵀHJ` pullback the production row kernel uses.
+/// This is the sign-agnostic 1943-style oracle for the wiggle case: any dropped
+/// cross-block in the hand assembler (the #736 genus) shifts an entry past 1e-9.
+#[test]
+fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
+    use crate::families::jet_scalar::{JetScalar, Order2};
+
+    // event rows (d=1) so entry-logS + exit-logphi + qdot-log_g are all live;
+    // moderate-tail primaries clear of the monotonicity guard.
+    let primaries: Vec<[f64; SLS_ROW_K]> = vec![
+        [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
+        [-0.4, 0.5, 0.9, -0.8, -0.5, 0.4, -0.25, 0.35, 0.3],
+        [1.4, 2.1, 0.8, -1.1, -0.9, 0.2, 0.45, 0.55, 0.35],
+        [0.1, 0.6, 1.0, 0.3, 0.2, -0.3, -0.2, 0.15, 0.25],
+    ];
+    let event = [1.0, 1.0, 1.0, 1.0];
+    let weight = [1.0, 0.8, 1.2, 1.1];
+    let n = primaries.len();
+
+    // Base indices (used to evaluate the wiggle basis where the warp applies).
+    let q0_exit = Array1::from_shape_fn(n, |i| {
+        primaries[i][1] - primaries[i][3] * (-primaries[i][6]).exp()
+    });
+    let q0_entry = Array1::from_shape_fn(n, |i| {
+        primaries[i][0] - primaries[i][4] * (-primaries[i][7]).exp()
+    });
+
+    // A small monotone wiggle basis; degree/knots chosen for a few columns.
+    let knots = array![-2.0, -1.0, 0.0, 1.0, 2.0];
+    let degree = 3usize;
+    let xwiggle = survival_wiggle_basis_with_options(
+        q0_exit.view(),
+        &knots,
+        degree,
+        BasisOptions::value(),
+    )
+    .expect("wiggle design B(q0_exit)");
+    let pw = xwiggle.ncols();
+    let betaw = Array1::from_shape_fn(pw, |b| 0.25 - 0.08 * b as f64);
+
+    // Per-row basis derivative stacks at the BASE indices (the warp composes the
+    // basis onto the index jet). Exit needs B,B',B'',B'''; entry needs B,B',B''.
+    let bx0 = survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value()).unwrap();
+    let bx1 = survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::first_derivative()).unwrap();
+    let bx2 = survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::second_derivative()).unwrap();
+    let bx3 = survival_wiggle_third_basis(q0_exit.view(), &knots, degree).unwrap();
+    let be0 = survival_wiggle_basis_with_options(q0_entry.view(), &knots, degree, BasisOptions::value()).unwrap();
+    let be1 = survival_wiggle_basis_with_options(q0_entry.view(), &knots, degree, BasisOptions::first_derivative()).unwrap();
+    let be2 = survival_wiggle_basis_with_options(q0_entry.view(), &knots, degree, BasisOptions::second_derivative()).unwrap();
+
+    // The single-source §13 warp evaluated on a generic jet scalar, KW = 9 + pw.
+    fn wiggle_nll<const KW: usize, S: JetScalar<KW>>(
+        vars: &[S; KW],
+        kernel: &SurvivalExactRowKernel,
+        pw: usize,
+        b0e: &[f64], b1e: &[f64], b2e: &[f64],
+        b0x: &[f64], b1x: &[f64], b2x: &[f64], b3x: &[f64],
+    ) -> S {
+        let inv_sigma_entry = vars[7].neg().exp();
+        let u0 = vars[0].sub(&vars[4].mul(&inv_sigma_entry));
+        let inv_sigma_exit = vars[6].neg().exp();
+        let u1 = vars[1].sub(&vars[3].mul(&inv_sigma_exit));
+        let g0 = vars[2].add(&inv_sigma_exit.mul(&vars[3].mul(&vars[8]).sub(&vars[5])));
+        let mut u0w = u0;
+        let mut u1w = u1;
+        let mut m1 = S::constant(1.0);
+        for j in 0..pw {
+            let bw = vars[9 + j];
+            u0w = u0w.add(&bw.mul(&u0.compose_unary([b0e[j], b1e[j], b2e[j], 0.0, 0.0])));
+            u1w = u1w.add(&bw.mul(&u1.compose_unary([b0x[j], b1x[j], b2x[j], b3x[j], 0.0])));
+            m1 = m1.add(&bw.mul(&u1.compose_unary([b1x[j], b2x[j], b3x[j], 0.0, 0.0])));
+        }
+        let g = m1.mul(&g0);
+        let mut nll = u0w
+            .compose_unary([kernel.log_s0, -kernel.r0, -kernel.dr0, -kernel.ddr0, -kernel.dddr0])
+            .scale(kernel.w);
+        let cw = kernel.w * (1.0 - kernel.d);
+        if cw != 0.0 {
+            nll = nll.add(&u1w.compose_unary([kernel.log_s1, -kernel.r1, -kernel.dr1, -kernel.ddr1, -kernel.dddr1]).scale(-cw));
+        }
+        let ew = kernel.w * kernel.d;
+        if ew != 0.0 {
+            nll = nll
+                .add(&u1w.compose_unary([kernel.logphi1, kernel.dlogphi1, kernel.d2logphi1, kernel.d3logphi1, kernel.d4logphi1]).scale(-ew))
+                .add(&g.compose_unary([kernel.log_g, kernel.d_log_g, kernel.d2_log_g, kernel.d3_log_g, kernel.d4_log_g]).scale(-ew));
+        }
+        nll
+    }
+
+    for distribution in [
+        ResidualDistribution::Gaussian,
+        ResidualDistribution::Gumbel,
+        ResidualDistribution::Logistic,
+    ] {
+        let inverse_link = residual_distribution_inverse_link(distribution);
+        let mut family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+        family.x_link_wiggle = Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xwiggle.clone())));
+        family.wiggle_knots = Some(knots.clone());
+        family.wiggle_degree = Some(degree);
+
+        let mut states = survival_ls_joint_oracle_states(&primaries);
+        let etaw = xwiggle.dot(&betaw);
+        states.push(ParameterBlockState { beta: betaw.clone(), eta: etaw });
+
+        let q = family.collect_joint_quantities(&states).expect("joint quantities");
+        let dynamic = family.build_dynamic_geometry(&states).expect("dynamic geometry");
+        let bespoke = family
+            .assemble_joint_hessian_from_quantities(&q, &states)
+            .expect("bespoke joint Hessian")
+            .expect("bespoke joint Hessian present");
+
+        // Coefficient offsets = cumulative block beta widths (time,thr,ls,wiggle).
+        let widths: Vec<usize> = states.iter().map(|s| s.beta.len()).collect();
+        let mut offsets = vec![0usize];
+        for w in &widths {
+            offsets.push(offsets.last().unwrap() + w);
+        }
+        let ncoef = *offsets.last().unwrap();
+        let wiggle_off = offsets[3];
+
+        // Base-channel design rows via the production SurvivalLsRowKernel.
+        let base_kernel = SurvivalLsRowKernel {
+            family: &family,
+            q: &q,
+            dynamic: &dynamic,
+            deriv_log_scale: 0.0,
+            offsets: offsets[0..4].to_vec(),
+        };
+
+        let mut h_tower = Array2::<f64>::zeros((ncoef, ncoef));
+        for row in 0..n {
+            // Per-row primary Hessian from the §13 warp at Order2<9+pw>.
+            let pvals = base_kernel.row_primary_values(row);
+            let state = family.row_predictor_state(
+                dynamic.h_entry[row],
+                dynamic.h_exit[row],
+                dynamic.hdot_exit[row],
+                dynamic.q_entry[row],
+                dynamic.q_exit[row],
+                dynamic.qdot_exit[row],
+            );
+            let kernel = family
+                .exact_row_kernel_rescaled(row, state, 0.0)
+                .expect("exact row kernel")
+                .expect("exact row kernel present");
+            macro_rules! run_kw {
+                ($kw:literal) => {{
+                    let mut vars = [<Order2<$kw> as JetScalar<$kw>>::constant(0.0); $kw];
+                    for a in 0..9 {
+                        vars[a] = <Order2<$kw> as JetScalar<$kw>>::variable(pvals[a], a);
+                    }
+                    for b in 0..pw {
+                        vars[9 + b] = <Order2<$kw> as JetScalar<$kw>>::variable(betaw[b], 9 + b);
+                    }
+                    let out = wiggle_nll::<$kw, Order2<$kw>>(
+                        &vars, &kernel, pw,
+                        &be0.row(row).to_vec(), &be1.row(row).to_vec(), &be2.row(row).to_vec(),
+                        &bx0.row(row).to_vec(), &bx1.row(row).to_vec(), &bx2.row(row).to_vec(), &bx3.row(row).to_vec(),
+                    );
+                    let h = out.h();
+                    // Channel design rows: base 0..8 via channel_row, βw -> e_b.
+                    let mut jrows: Vec<(usize, Vec<f64>)> = Vec::with_capacity(9 + pw);
+                    for ch in 0..9usize {
+                        match (base_kernel.channel_block(ch), base_kernel.channel_row(ch, row)) {
+                            (Some(bk), Some(r)) => jrows.push((offsets[bk], r.to_vec())),
+                            _ => jrows.push((usize::MAX, vec![])),
+                        }
+                    }
+                    for b in 0..pw {
+                        let mut e = vec![0.0; pw];
+                        e[b] = 1.0;
+                        jrows.push((wiggle_off, e));
+                    }
+                    for a in 0..(9 + pw) {
+                        let (oa, ra) = &jrows[a];
+                        if *oa == usize::MAX { continue; }
+                        for bcol in 0..(9 + pw) {
+                            let hab = h[a][bcol];
+                            if hab == 0.0 { continue; }
+                            let (ob, rb) = &jrows[bcol];
+                            if *ob == usize::MAX { continue; }
+                            for (ia, &va) in ra.iter().enumerate() {
+                                if va == 0.0 { continue; }
+                                let wv = hab * va;
+                                for (ib, &vb) in rb.iter().enumerate() {
+                                    h_tower[[oa + ia, ob + ib]] += wv * vb;
+                                }
+                            }
+                        }
+                    }
+                }};
+            }
+            match 9 + pw {
+                10 => run_kw!(10),
+                11 => run_kw!(11),
+                12 => run_kw!(12),
+                13 => run_kw!(13),
+                14 => run_kw!(14),
+                other => panic!("wiggle oracle: unsupported KW={other}"),
+            }
+        }
+
+        for ((a, b), &bj) in bespoke.indexed_iter() {
+            let tj = h_tower[[a, b]];
+            assert!(
+                (tj - bj).abs() <= 1e-9 * (1.0 + bj.abs()),
+                "{distribution:?}: wiggle joint Hessian [{a}][{b}] assembler {bj} != tower {tj}"
+            );
+        }
+    }
+}
