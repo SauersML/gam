@@ -2608,9 +2608,37 @@ fn sae_manifold_fit_inner<'py>(
     );
     let problem =
         gam::solver::rho_optimizer::OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
-    problem
-        .run(&mut objective, "SAE manifold")
-        .map_err(estimation_error_to_pyerr)?;
+    // #1388: the outer ρ cascade drives a SERIAL per-row jet loop
+    // (`logdet_theta_adjoint` → `row_jets_for_logdet` → `gate_tower`) that builds
+    // `Tower4<16>` derivative towers — each carries a `t4` channel of 16⁴ doubles
+    // (~0.5 MiB) and a dozen-plus temporaries are live at once, so a single
+    // `gate_tower` frame is multi-megabyte. Under PyO3 this whole chain runs on
+    // Python's calling thread, whose fixed, modest stack overflows its guard page
+    // → SIGSEGV (a hard crash, not a Rust panic). `RUST_MIN_STACK` does NOT help:
+    // it only sizes threads spawned by the Rust std runtime, never the foreign
+    // (Python) thread we are called on. The native CLI never hits this because it
+    // runs the whole command on a 512 MiB worker thread (`CLI_WORKER_STACK_SIZE`
+    // in `src/main.rs`); mirror that headroom here. `objective` and `problem` are
+    // fully owned (the objective is built from `z_view.to_owned()` and owned
+    // config — no borrowed Python views), so a *scoped* thread can borrow them
+    // without a `'static` bound and is guaranteed to join before they drop.
+    const SAE_FIT_WORKER_STACK_SIZE: usize = 512 << 20;
+    std::thread::scope(|scope| -> PyResult<()> {
+        let worker = std::thread::Builder::new()
+            .name("gam-sae-fit".to_string())
+            .stack_size(SAE_FIT_WORKER_STACK_SIZE)
+            .spawn_scoped(scope, || problem.run(&mut objective, "SAE manifold"))
+            .map_err(|err| {
+                py_value_error(format!("sae_manifold_fit: spawn fit worker thread: {err}"))
+            })?;
+        match worker.join() {
+            Ok(run_result) => run_result.map(|_| ()).map_err(estimation_error_to_pyerr),
+            Err(_) => Err(py_value_error(
+                "sae_manifold_fit: joint-fit worker thread panicked (see prior error output)"
+                    .to_string(),
+            )),
+        }
+    })?;
     // Posterior shape uncertainty: per-atom φ-scaled decoder covariance and
     // ambient bands, read off the converged joint-Hessian Schur factor at the
     // settled ρ. Computed before `into_fitted` consumes the objective; reflects
