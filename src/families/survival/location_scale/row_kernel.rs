@@ -91,9 +91,6 @@ impl SurvivalExactRowKernel {
 }
 
 pub(crate) struct SurvivalJointQuantities {
-    /// Per-row log-likelihood `ell_i` (NOT negated). Rows excluded by the
-    /// degeneracy guard (`row_derivatives_rescaled` returns `None`) keep `0.0`,
-    /// matching their zero derivative slots. The RowKernel adapter uses this
     pub(crate) d1_q: Array1<f64>,
     pub(crate) d2_q: Array1<f64>,
     pub(crate) d3_q: Array1<f64>,

@@ -143,7 +143,7 @@ pub trait JetScalar<const K: usize>: Copy {
 pub struct Order2<const K: usize>(pub super::jet_tower::Tower2<K>);
 
 impl<const K: usize> Order2<K> {
-    /// Read the gradient channel.
+    /// Read the gradient channel `g_a = ∂ℓ/∂p_a`.
     #[inline]
     pub fn g(&self) -> [f64; K] {
         self.0.g
