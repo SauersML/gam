@@ -836,20 +836,33 @@ where
         // unsupported term shrinking out) — there the corner is the
         // lowest-cost point, no cheaper seed exists, and the guard is a no-op.
         if let Some(seed) = release_rerank_seed.as_ref() {
-            // Order matters: evaluate the SEED first, then the converged ρ, so
-            // that the no-op path leaves `reml_state`'s cached β̂ at
-            // `strategy_result.rho` (the value the downstream cap-guard / final
-            // assembly expect). The seed eval is a non-fatal probe — a guard
-            // must never break an otherwise-successful fit, so a seed that fails
-            // to evaluate simply skips the comparison. The converged-ρ eval uses
-            // `?` because that IS the fit's operating point; if it cannot be
-            // evaluated the fit is genuinely broken. It also restores β̂ to
-            // `strategy_result.rho` after the seed probe.
+            // The certified cost is the optimizer's OWN authoritative
+            // `final_value`, NOT a fresh `compute_cost(strategy_result.rho)`
+            // re-evaluation (load-bearing, #1426/#1477). The REML/LAML objective
+            // for a non-Gaussian family is NOT a pure function of ρ: it carries a
+            // profiled dispersion / nuisance that is established by the inner
+            // solve at the operating ρ, and `compute_cost` warm-starts the inner
+            // PIRLS from whatever β̂/φ the previous eval left behind. Probing the
+            // under-penalized prepass seed FIRST (necessary so the no-op path can
+            // leave β̂ at the seed for a clean re-install) pollutes that nuisance
+            // state, so a subsequent re-eval of the cleanly-converged ρ comes back
+            // a few REML units ABOVE its true certified cost — e.g. a Gamma/log
+            // optimum certified at 829.857 re-evaluates at 834.90 right after the
+            // seed probe, which is then (wrongly) above the seed's own 833.47 and
+            // the guard "escapes" to the under-penalized seed, shipping a
+            // near-full-basis overfit (EDF ≈ k, falsely tagged converged) that the
+            // seed loop's keep-best had already rejected (#1426 silent overfit;
+            // #1477 Tweedie boundary/EDF blow-up). `final_value` was scored at the
+            // converged ρ with ITS own inner solve, so it is immune to that probe
+            // pollution and is the honest cost to compare the seed against.
+            let cost_converged = strategy_result.final_value;
+            // The seed probe is a non-fatal measurement; a seed that fails to
+            // evaluate simply skips the comparison. It leaves β̂ at the seed, so
+            // the no-op branch below must re-install β̂ at `strategy_result.rho`.
             let cost_seed = reml_state.compute_cost(seed).ok();
-            let cost_converged = reml_state.compute_cost(&strategy_result.rho)?;
-            // Strict relative improvement so a numerically-equal seed (the
-            // common case where the optimizer reached the seed's basin) is left
-            // untouched and the fit stays byte-identical.
+            // Strict relative improvement so a numerically-equal seed (the common
+            // case where the optimizer reached the seed's basin) is left untouched
+            // and the fit stays byte-identical.
             let floor = 1e-6 * (1.0 + cost_converged.abs());
             if let Some(cost_seed) = cost_seed.filter(|c| c.is_finite())
                 && cost_converged.is_finite()
@@ -862,11 +875,12 @@ where
                 );
                 strategy_result.rho = seed.clone();
                 strategy_result.converged = true;
-                // Re-run the inner solve at the adopted seed so the cached β̂
-                // matches the reported ρ (the no-op path already leaves β̂ at
-                // `strategy_result.rho`).
-                reml_state.compute_cost(&strategy_result.rho)?;
             }
+            // Re-install β̂ at the (possibly newly-adopted) reported ρ so the
+            // cached inner state matches `strategy_result.rho` for the downstream
+            // cap-guard / final assembly — whether the guard fired (β̂ → seed) or
+            // was a no-op (β̂ → the certified ρ, undoing the seed probe).
+            reml_state.compute_cost(&strategy_result.rho)?;
         }
         // Convergence guard for the outer-aware inner-PIRLS schedule
         // (path #3): the BFGS bridge stores a coarsen-then-tighten cap
