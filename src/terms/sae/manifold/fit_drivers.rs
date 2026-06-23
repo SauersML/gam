@@ -1841,8 +1841,19 @@ impl SaeManifoldTerm {
                 }
             }
         }
+        // The per-atom collapse statistic is each atom's MAXIMUM assignment mass
+        // over rows; an atom whose strongest gate has fallen below the active-mass
+        // floor has lost all material support and must be re-seeded. The floor is
+        // the production trust threshold ([`SAE_TRUST_ACTIVE_MASS_FLOOR`]) — the
+        // same bar the atom-lens uses to decide an atom carries usable signal.
+        // (A blind `max_mass.is_finite()` test does NOT detect this: a gate-
+        // collapsed atom still has a finite, merely tiny, max mass, so a finiteness
+        // check waves the exact #976 mass-collapse mode straight through.)
+        let active_mass_floor = crate::inference::atom_lens::SAE_TRUST_ACTIVE_MASS_FLOOR;
         for atom in 0..k {
-            if max_mass[atom].is_finite() {
+            // Healthy atom: its strongest gate clears the floor. A non-finite max
+            // mass fails `>= floor` and so is treated as a breach (correctly).
+            if max_mass[atom] >= active_mass_floor {
                 continue;
             }
             let reseeds_used = self
@@ -1856,7 +1867,7 @@ impl SaeManifoldTerm {
                     iteration,
                     atom,
                     max_active_mass: max_mass[atom],
-                    floor: f64::NAN,
+                    floor: active_mass_floor,
                     action: CollapseAction::Reseeded,
                 });
             } else {
@@ -1869,7 +1880,7 @@ impl SaeManifoldTerm {
                         iteration,
                         atom,
                         max_active_mass: max_mass[atom],
-                        floor: f64::NAN,
+                        floor: active_mass_floor,
                         action: CollapseAction::Terminal,
                     });
                 }
@@ -2013,7 +2024,41 @@ impl SaeManifoldTerm {
             // centered target variance has collapsed regardless of relative
             // norms.
             let ev = self.dictionary_reconstruction_ev(target, rho)?;
-            if ev.is_finite() {
+            // CO-collapse is an EV-MAGNITUDE failure, not an EV-finiteness one: a
+            // co-collapsed dictionary explains essentially none of the centered
+            // target variance, but that EV is a perfectly finite number near zero
+            // (often slightly negative). Gating on `ev.is_finite()` therefore short-
+            // circuits this arm for every real fit — the #1522 regression that
+            // re-opened the #853/#976 blind spot (gates spread, decoders co-collapse,
+            // EV≈0, rank-deficient Hessian → REML abort). Trip the arm exactly when
+            // EV sits at or below the SAME data-derived collapse bar the fitted-data
+            // acceptance check keys on (half the rank-`K` PCA / Eckart-Young ceiling
+            // achievable on THIS centered target, falling back to the absolute
+            // [`SAE_FIT_DATA_COLLAPSE_EV_FLOOR`] when that ceiling is un-computable),
+            // so the co-collapse reseed and the data-collapse verdict measure
+            // degeneracy against one and the same threshold. A non-finite EV is
+            // un-certifiable here and is deferred (the median/mass guards and inner
+            // solve own that case), as is any EV above the bar (a healthy fit).
+            let n = self.n_obs();
+            let p = target.ncols();
+            let dictionary_rank = self
+                .atoms
+                .iter()
+                .map(|atom| atom.basis_size())
+                .sum::<usize>()
+                .min(n)
+                .min(p);
+            let derived_floor = 0.5
+                * crate::terms::sae::manifold::outer_objective::pca_ev_ceiling(
+                    target,
+                    dictionary_rank,
+                );
+            let ev_floor = if derived_floor.is_finite() {
+                derived_floor
+            } else {
+                SAE_FIT_DATA_COLLAPSE_EV_FLOOR
+            };
+            if !(ev.is_finite() && ev <= ev_floor) {
                 return Ok(());
             }
             // #1026 keep-best multi-start: the current (pre-reseed) state is a
