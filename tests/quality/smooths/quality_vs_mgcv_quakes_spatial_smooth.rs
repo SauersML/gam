@@ -393,11 +393,10 @@ fn diag_quakes_spatial_1074() {
         let pred: Vec<f64> = td.design.apply(&fit.fit.beta).to_vec();
         let truth: Vec<f64> = test_rows.iter().map(|&i| mag[i]).collect();
         eprintln!(
-            "[#1074-quakes] {formula}\n    edf_total={:.3} beta_len={} log_lambdas={:?}\n    edf_by_block={:?} lambdas={:?} heldout_R2={:.4}",
+            "[#1074-quakes] edf_total={:.3} beta_len={} edf_by_block={:?} log_lambdas={:?} heldout_R2={:.4} :: {formula}",
             fit.fit.edf_total().unwrap(), fit.fit.beta.len(),
-            fit.fit.log_lambdas.iter().map(|v| (v*1000.0).round()/1000.0).collect::<Vec<_>>(),
             fit.fit.edf_by_block().iter().map(|v| (v*100.0).round()/100.0).collect::<Vec<_>>(),
-            fit.fit.lambdas.iter().map(|v| (v*1e6).round()/1e6).collect::<Vec<_>>(),
+            fit.fit.log_lambdas.iter().map(|v| (v*1000.0).round()/1000.0).collect::<Vec<_>>(),
             r2(&pred, &truth),
         );
     }
