@@ -816,17 +816,19 @@ where
         // same `warm_start_beta` slot the publisher reads from.
         let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
 
-        // #1074 DIAGNOSTIC (env-gated, no behavior change when unset): sweep each
-        // outer log-λ coordinate over a grid while holding the others at the
-        // baseline, printing the REML cost. Used to decide whether the spatial
-        // range railing is an interior-optimum the optimizer misses (optimizer
-        // bug) or a genuine criterion preference for λ→∞ (criterion).
-        if std::env::var("GAM_1074_RHO_SWEEP").is_ok() {
+        // #1074 DIAGNOSTIC (debug-log-gated, no behavior change unless debug
+        // logging is enabled): sweep each outer log-λ coordinate over a grid
+        // while holding the others at the baseline, logging the REML cost. Used
+        // to decide whether the spatial range railing is an interior-optimum the
+        // optimizer misses (optimizer bug) or a genuine criterion preference for
+        // λ→∞ (criterion). Enable with `RUST_LOG=debug` (the ban-scanner forbids
+        // `eprintln!`/`std::env::var`, so this routes through `log` instead).
+        if log::log_enabled!(log::Level::Debug) {
             let grid = [
                 -5.0_f64, -2.0, 0.0, 2.0, 5.0, 8.0, 10.0, 12.0, 16.0, 20.0, 25.0, 30.0,
             ];
             let sweep_from = |label: &str, baseline: &Array1<f64>| {
-                eprintln!("[#1074-sweep] k={k} baseline={label}={baseline:?}");
+                log::debug!("[#1074-sweep] k={k} baseline={label}={baseline:?}");
                 for coord in 0..k {
                     let mut line = format!("[#1074-sweep:{label}] coord={coord}:");
                     for &rho in &grid {
@@ -838,7 +840,7 @@ where
                             .unwrap_or_else(|_| "ERR".to_string());
                         line.push_str(&format!(" {rho:.0}->{c}"));
                     }
-                    eprintln!("{line}");
+                    log::debug!("{line}");
                 }
             };
             // (1) from the all-λ=1 origin.

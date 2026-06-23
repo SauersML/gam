@@ -1456,6 +1456,15 @@ pub enum BasisMetadata {
         knots: Vec<Array1<f64>>,
         degrees: Vec<usize>,
         periods: Vec<Option<f64>>,
+        /// Per-margin flag: `true` when that margin is a natural cubic
+        /// regression spline (`NaturalCubicRegression` knotspec) rather than an
+        /// open/periodic B-spline (#1074). Persisted so the tensor freeze
+        /// rebuilds the cr marginal knotspec (value-at-knot) instead of an open
+        /// `Provided(knots)` B-spline, keeping predict-time marginals identical
+        /// to the fit-time cr margins. Defaults to all-`false` (legacy B-spline
+        /// tensors) when deserialized from an older persisted model.
+        #[serde(default)]
+        is_cr: Vec<bool>,
         identifiability_transform: Option<Array2<f64>>,
     },
     SphereHarmonics {

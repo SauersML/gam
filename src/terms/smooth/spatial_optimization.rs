@@ -4955,6 +4955,7 @@ fn freeze_smooth_basis_from_metadata(
                 knots,
                 degrees,
                 periods,
+                is_cr,
                 identifiability_transform,
             },
         ) => {
@@ -4970,6 +4971,13 @@ fn freeze_smooth_basis_from_metadata(
             *feature_cols = fitted_cols.clone();
             for i in 0..s.marginalspecs.len() {
                 s.marginalspecs[i].degree = degrees[i];
+                // A cr margin (#1074) freezes back to a `NaturalCubicRegression`
+                // knotspec carrying the same k value-knots, so the predict-time
+                // marginal cr design is rebuilt identically (not downgraded to
+                // an open `Provided(knots)` B-spline). `is_cr` may be empty when
+                // an older model is deserialized without the field — treat a
+                // missing/short entry as `false` (legacy B-spline tensor).
+                let margin_is_cr = is_cr.get(i).copied().unwrap_or(false);
                 s.marginalspecs[i].knotspec = match (periods[i], knots[i].len()) {
                     (Some(period), num_basis) if num_basis >= 1 => {
                         // Periodic uniform reconstructs the open
@@ -4982,6 +4990,9 @@ fn freeze_smooth_basis_from_metadata(
                             num_basis,
                         }
                     }
+                    _ if margin_is_cr => BSplineKnotSpec::NaturalCubicRegression {
+                        knots: knots[i].clone(),
+                    },
                     _ => BSplineKnotSpec::Provided(knots[i].clone()),
                 };
             }

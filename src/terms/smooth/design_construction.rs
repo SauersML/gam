@@ -1646,12 +1646,14 @@ fn with_identifiability_transform(
             knots,
             degrees,
             periods,
+            is_cr,
             identifiability_transform,
         } => Ok(BasisMetadata::TensorBSpline {
             feature_cols: feature_cols.clone(),
             knots: knots.clone(),
             degrees: degrees.clone(),
             periods: periods.clone(),
+            is_cr: is_cr.clone(),
             identifiability_transform: compose_identifiability_transforms(
                 identifiability_transform.as_ref(),
                 transform,
