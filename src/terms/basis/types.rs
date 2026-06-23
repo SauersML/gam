@@ -368,6 +368,17 @@ pub enum BSplineKnotSpec {
         placement: BSplineKnotPlacement,
     },
     Provided(Array1<f64>),
+    /// Natural cubic regression spline (`bs="cr"`/`"cs"`) knot set (#1074).
+    ///
+    /// Unlike the open-spline variants above, these `knots` are the `k`
+    /// Lancaster–Salkauskas knots `x*_1 < … < x*_k` that *directly* index the
+    /// basis values `β_i = f(x*_i)` — the basis dimension equals `knots.len()`
+    /// (not `knots.len() - degree - 1`). The 1-D builder routes this variant to
+    /// the cubic-regression builder; the cr identity therefore round-trips
+    /// through freeze/reload by virtue of the variant itself (no separate
+    /// metadata marker is required), and tensor margins inherit cr by carrying
+    /// this knotspec into `build_bspline_basis_1d`.
+    NaturalCubicRegression { knots: Array1<f64> },
 }
 
 /// Internal-knot placement strategy when knots are automatically inferred.
@@ -1320,6 +1331,16 @@ pub enum BasisMetadata {
         /// available evaluation count `n`. `Some(note)` records the before→after
         /// configuration; `None` means no auto-shrink occurred for this basis.
         auto_shrink_note: Option<String>,
+    },
+    /// Natural cubic regression spline (`bs="cr"`/`"cs"`) metadata (#1074).
+    ///
+    /// `knots` are the `k` Lancaster–Salkauskas knots that index the basis
+    /// values directly (basis dim = `knots.len()`). Predict-time rebuilds
+    /// reconstruct the cr geometry from `knots` and replay the captured
+    /// `identifiability_transform` exactly, mirroring `BSpline1D`.
+    CubicRegression1D {
+        knots: Array1<f64>,
+        identifiability_transform: Option<Array2<f64>>,
     },
     ThinPlate {
         centers: Array2<f64>,

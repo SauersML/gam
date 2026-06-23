@@ -32,6 +32,7 @@ mod polylog;
 mod bspline_build;
 mod bspline_eval;
 mod center_selection;
+mod cubic_regression;
 pub mod closed_form_operator;
 mod duchon_kernel_math;
 mod duchon_psi_derivatives;
@@ -114,6 +115,7 @@ pub(crate) use cyclic::{
 pub use bspline_build::*;
 pub use bspline_eval::*;
 pub use center_selection::*;
+pub use cubic_regression::*;
 pub use closed_form_operator::ClosedFormPenaltyOperator;
 pub use duchon_kernel_math::*;
 pub use duchon_psi_derivatives::*;
