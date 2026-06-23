@@ -144,7 +144,20 @@ impl StandardPredictor {
             .eta
             .iter()
             .zip(eta_se.iter())
-            .map(|(&e, &se)| strategy.posterior_mean(&quadctx, e, se))
+            .map(|(&e, &se)| {
+                // #1515: guard the wiggle posterior-mean path like the non-wiggle
+                // one (predict_gam_posterior_mean_from_backendwith_bc). A degenerate
+                // fit — near-singular Hessian, se in the thousands — overflows the
+                // response integral E[g⁻¹(η)] to +inf, which serializes as a None
+                // mean and crashes the Python shaper. Fall back to the finite plug-in
+                // mean g⁻¹(η̂), consistent with the reported linear predictor.
+                let pm = strategy.posterior_mean(&quadctx, e, se)?;
+                if pm.is_finite() {
+                    Ok(pm)
+                } else {
+                    strategy.inverse_link(e)
+                }
+            })
             .collect::<Result<Array1<f64>, _>>()?;
         Ok(LinearState {
             eta: plugin.eta,
