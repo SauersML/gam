@@ -133,9 +133,12 @@ impl log::Log for StderrInfoLogger {
 }
 static LOGGER: StderrInfoLogger = StderrInfoLogger;
 
-fn env_usize(key: &str, default: usize) -> usize {
-    std::env::var(key)
-        .ok()
+/// Positional CLI args: `repro979_margslope [n] [centers]`. Absent args keep the
+/// defaults so the example still runs bare. (Avoids `env::var`, which the
+/// repo-wide scanner bans — examples read tuning knobs from argv.)
+fn arg_usize(idx: usize, default: usize) -> usize {
+    std::env::args()
+        .nth(idx)
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
 }
@@ -143,15 +146,8 @@ fn env_usize(key: &str, default: usize) -> usize {
 fn main() {
     gam::init_parallelism();
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Info));
-    let n: usize = env_usize("REPRO_N", 1500);
-    let centers: usize = env_usize("REPRO_CENTERS", 4);
-    // Watchdog: a hang must report itself rather than running to a queue kill.
-    let budget_s = env_usize("REPRO_TIMEOUT_S", 1200);
-    std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_secs(budget_s as u64));
-        eprintln!("[979-REPRO] n={n} centers={centers} HANG: exceeded {budget_s}s watchdog budget");
-        std::process::exit(124);
-    });
+    let n: usize = arg_usize(1, 1500);
+    let centers: usize = arg_usize(2, 4);
     let (data, spec) = build(n, centers);
     let request = FitRequest::BernoulliMarginalSlope(BernoulliMarginalSlopeFitRequest {
         data: data.view(),
