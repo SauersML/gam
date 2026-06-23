@@ -137,6 +137,7 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
         max_outer_iter: 8,
         rel_tol: 1e-4,
         pilot_subsample_threshold: 0,
+        outer_wall_clock_budget_secs: None,
         ..SpatialLengthScaleOptimizationOptions::default()
     };
 

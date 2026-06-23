@@ -364,6 +364,7 @@ fn joint_build_and_cache_rebuild_frozen_pure_duchon_blocks() {
         max_outer_iter: 1,
         rel_tol: 1e-6,
         pilot_subsample_threshold: 0,
+        outer_wall_clock_budget_secs: None,
         ..SpatialLengthScaleOptimizationOptions::default()
     };
     let joint_setup =
