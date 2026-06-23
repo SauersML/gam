@@ -1262,10 +1262,12 @@ fn validate_smooth_basis_frozen(
         SmoothBasisSpec::BSpline1D { spec, .. } => {
             if !matches!(
                 spec.knotspec,
-                BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
+                BSplineKnotSpec::Provided(_)
+                    | BSplineKnotSpec::PeriodicUniform { .. }
+                    | BSplineKnotSpec::NaturalCubicRegression { .. }
             ) {
                 return Err(format!(
-                    "{label} term '{term_name}' is not frozen: BSpline knotspec must be Provided or PeriodicUniform"
+                    "{label} term '{term_name}' is not frozen: BSpline knotspec must be Provided, PeriodicUniform, or NaturalCubicRegression"
                 ));
             }
             Ok(())
@@ -1406,10 +1408,12 @@ impl TermCollectionSpec {
                 SmoothBasisSpec::BSpline1D { spec, .. } => {
                     if !matches!(
                         spec.knotspec,
-                        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
+                        BSplineKnotSpec::Provided(_)
+                            | BSplineKnotSpec::PeriodicUniform { .. }
+                            | BSplineKnotSpec::NaturalCubicRegression { .. }
                     ) {
                         return Err(SmoothError::invalid_config(format!(
-                            "{label} term '{}' is not frozen: BSpline knotspec must be Provided or PeriodicUniform",
+                            "{label} term '{}' is not frozen: BSpline knotspec must be Provided, PeriodicUniform, or NaturalCubicRegression",
                             st.name
                         ))
                         .into());
@@ -1701,10 +1705,12 @@ impl TermCollectionSpec {
                     for (dim, marginal) in spec.marginalspecs.iter().enumerate() {
                         if !matches!(
                             marginal.knotspec,
-                            BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
+                            BSplineKnotSpec::Provided(_)
+                                | BSplineKnotSpec::PeriodicUniform { .. }
+                                | BSplineKnotSpec::NaturalCubicRegression { .. }
                         ) {
                             return Err(SmoothError::invalid_config(format!(
-                                "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided or PeriodicUniform",
+                                "{label} term '{}' dim {} is not frozen: tensor marginal knotspec must be Provided, PeriodicUniform, or NaturalCubicRegression",
                                 st.name, dim
                             ))
                             .into());
@@ -5026,6 +5032,9 @@ fn build_tensor_bspline_basis(
     }
 
     let mut marginal_knots = Vec::<Array1<f64>>::with_capacity(feature_cols.len());
+    // Per-margin cr flag (#1074): `true` when the margin is a natural cubic
+    // regression spline, so the tensor freeze rebuilds the cr knotspec.
+    let mut marginal_is_cr_flags = Vec::<bool>::with_capacity(feature_cols.len());
     let mut marginal_degrees = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginalnum_basis = Vec::<usize>::with_capacity(feature_cols.len());
     let mut marginal_penalties = Vec::<Array2<f64>>::with_capacity(feature_cols.len());
@@ -5062,11 +5071,16 @@ fn build_tensor_bspline_basis(
         let mut marginal_unconstrained = marginalspec.clone();
         marginal_unconstrained.identifiability = BSplineIdentifiability::None;
         let built = build_bspline_basis_1d(data.column(col), &marginal_unconstrained)?;
-        let knots = match built.metadata {
-            BasisMetadata::BSpline1D { knots, .. } => knots,
+        // A cr (`NaturalCubicRegression`) margin emits `CubicRegression1D`
+        // metadata whose `knots` are the k value-knots; a B-spline margin emits
+        // `BSpline1D` with the clamped knot vector. Capture either so the
+        // tensor freeze can rebuild the exact same marginal knotspec (#1074).
+        let (knots, marginal_is_cr) = match built.metadata {
+            BasisMetadata::BSpline1D { knots, .. } => (knots, false),
+            BasisMetadata::CubicRegression1D { knots, .. } => (knots, true),
             _ => {
                 crate::bail_invalid_basis!(
-                    "internal TensorBSpline error at dim {dim}: expected BSpline1D metadata"
+                    "internal TensorBSpline error at dim {dim}: expected BSpline1D or CubicRegression1D metadata"
                 );
             }
         };
@@ -5078,6 +5092,7 @@ fn build_tensor_bspline_basis(
             _ => knots,
         };
         marginal_knots.push(metadata_knots);
+        marginal_is_cr_flags.push(marginal_is_cr);
         marginal_degrees.push(marginalspec.degree);
         marginalnum_basis.push(built.design.ncols());
         // Capture the sparse representation of this marginal (when the
@@ -5417,6 +5432,7 @@ fn build_tensor_bspline_basis(
             // user-supplied explicit period authoritative even if the
             // marginal knotspec carried no periodicity hint.
             periods: marginal_effective_periods,
+            is_cr: marginal_is_cr_flags,
             identifiability_transform: z_opt,
         },
         kronecker_factored: if matches!(spec.identifiability, TensorBSplineIdentifiability::None)

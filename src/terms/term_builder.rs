@@ -1771,16 +1771,38 @@ pub fn build_smooth_basis(
         let penalty_order = option_usize(options, "penalty_order")
             .unwrap_or(if effective_degree > 1 { 2 } else { 1 })
             .min(effective_degree);
-        let marginal = BSplineBasisSpec {
-            degree: effective_degree,
-            penalty_order,
-            knotspec: resolve_nonperiodic_bspline_knotspec(
+        // mgcv's `bs="sz"` builds the per-level deviation curves on a CUBIC
+        // REGRESSION SPLINE marginal (`cr`): quantile-placed knots with the
+        // integrated-squared-second-derivative penalty, NOT a uniform-knot
+        // B-spline with a difference penalty (#1074). On a smooth signal like
+        // sin(2*pi*x) the cr marginal recovers the per-group curves more
+        // efficiently than the B-spline margin gam used to hand it — the same
+        // marginal-basis gap seen in the te_3d cr comparison. Match mgcv: place
+        // the sz marginal on cr knots (k = internal + degree + 1, floored at the
+        // cr minimum of 3) when the caller has not overridden the degree. `fs`
+        // and `re` keep the B-spline marginal: `fs` is a random-effect-style
+        // smooth that penalizes the whole per-level coefficient (the difference
+        // penalty + null-space ridge is what makes its partial pooling work) and
+        // `re` is the raw linear effect handled above.
+        let sz_uses_cr = type_opt.as_str() == "sz" && effective_degree == DEFAULT_BSPLINE_DEGREE;
+        let marginal_knotspec = if sz_uses_cr {
+            let k_cr = (n_knots + effective_degree + 1).max(3);
+            let cr_knots = crate::terms::basis::select_cr_knots(ds.values.column(c), k_cr)
+                .map_err(|e| e.to_string())?;
+            BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots }
+        } else {
+            resolve_nonperiodic_bspline_knotspec(
                 options,
                 ds.values.column(c),
                 (minv, maxv),
                 effective_degree,
                 n_knots,
-            )?,
+            )?
+        };
+        let marginal = BSplineBasisSpec {
+            degree: effective_degree,
+            penalty_order,
+            knotspec: marginal_knotspec,
             // mgcv's `bs="fs"` is a random-effect-style smooth: EVERY per-level
             // coefficient, including the marginal null space, is penalized so
             // unobserved groups can be predicted — so `fs` keeps the null-space
@@ -2901,6 +2923,45 @@ pub fn build_smooth_basis(
                     vars.join(",")
                 ));
             }
+            // Per-axis requested marginal basis family. mgcv's `te()`/`ti()`
+            // default marginal basis is the cubic regression spline (`cr`), and
+            // the te_3d quality gap (#1074) is precisely the marginal-basis
+            // resolution at small `k`: a `cr` margin places k value-knots at
+            // data quantiles (finer interior resolution under natural boundary
+            // constraints) where the cubic B-spline margin has only
+            // `k-degree-1` interior knots. Resolve each axis to either an
+            // explicit per-margin `bs` (vector `bs=c('cr','ps')`), a single
+            // scalar `bs`, or the unset default — and route
+            // `cr`/`cs`/unset/`tp`/`tps` margins through the natural cubic
+            // regression builder (`NaturalCubicRegression` knotspec), keeping
+            // explicit `ps`/`bs`/`bspline` on the B-spline margin.
+            let per_axis_bs: Vec<Option<String>> =
+                match options.get("bs").or_else(|| options.get("type")) {
+                    Some(raw) if bs_selector_is_vector(raw) => {
+                        let list = parse_option_list(raw);
+                        (0..dim).map(|a| list.get(a).cloned()).collect()
+                    }
+                    Some(raw) => {
+                        let scalar = raw
+                            .trim()
+                            .trim_matches('"')
+                            .trim_matches('\'')
+                            .to_ascii_lowercase();
+                        vec![Some(scalar); dim]
+                    }
+                    None => vec![None; dim],
+                };
+            // A margin is realized as a natural cubic regression spline when it
+            // is the (unset) mgcv default, an explicit `cr`/`cs`, or a
+            // `tp`/`tps` (same per-axis penalized-spline space). Explicit
+            // B-spline-family margins (`ps`/`bs`/`bspline`/`p-spline`) keep the
+            // open B-spline margin.
+            let margin_wants_cr = |bs: &Option<String>| -> bool {
+                matches!(
+                    bs.as_deref(),
+                    None | Some("cr") | Some("cs") | Some("tp") | Some("tps")
+                )
+            };
             let mut margins: Vec<BSplineBasisSpec> = Vec::with_capacity(dim);
             let mut emitted_periods: Vec<Option<f64>> = Vec::with_capacity(dim);
             for axis in 0..dim {
@@ -2959,6 +3020,20 @@ pub fn build_smooth_basis(
                         },
                         Some(period_value),
                     )
+                } else if margin_wants_cr(&per_axis_bs[axis]) {
+                    // mgcv `te()`/`ti()` default cr margin: place exactly
+                    // `k_axis` Lancaster–Salkauskas value-knots at data
+                    // quantiles. The cr basis dimension equals the knot count,
+                    // so this reproduces the requested per-margin `k` directly
+                    // (floored at the cr minimum of 3 knots).
+                    let k_cr = k_axis.max(3);
+                    let cr_knots = crate::terms::basis::select_cr_knots(ds.values.column(c), k_cr)
+                        .map_err(|e| e.to_string())?;
+                    (
+                        BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots },
+                        OneDimensionalBoundary::Open,
+                        None,
+                    )
                 } else {
                     // `num_internal_knots = k - degree - 1` reproduces the
                     // requested basis size exactly when degree was reduced for
@@ -2991,11 +3066,20 @@ pub fn build_smooth_basis(
                     };
                     (knotspec, OneDimensionalBoundary::Open, None)
                 };
+                // A `cr` margin fixes cubic regression geometry; the cr builder
+                // reads only the knot set + `double_penalty`. Enable null-space
+                // shrinkage for an explicit `cs` margin. B-spline margins keep
+                // the resolved effective degree / penalty order with no extra
+                // null-space penalty (mgcv `select = FALSE` tensor default).
+                let is_cr_margin =
+                    matches!(knotspec, BSplineKnotSpec::NaturalCubicRegression { .. });
+                let margin_double_penalty =
+                    is_cr_margin && matches!(per_axis_bs[axis].as_deref(), Some("cs"));
                 margins.push(BSplineBasisSpec {
                     degree: effective_degree,
                     penalty_order: effective_penalty_order,
                     knotspec,
-                    double_penalty: false,
+                    double_penalty: margin_double_penalty,
                     identifiability: BSplineIdentifiability::None,
                     boundary,
                     boundary_conditions: BSplineBoundaryConditions::default(),
