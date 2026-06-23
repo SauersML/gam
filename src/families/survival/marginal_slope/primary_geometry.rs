@@ -277,6 +277,7 @@ pub(crate) struct SurvivalFlexTimepointExact {
     pub(crate) d_u: Array1<f64>,
     pub(crate) d_uv: Array2<f64>,
     /// DEBUG (#1454 localizer): base intercept Hessian ∂_u∂_v a.
+    #[cfg(test)]
     pub(crate) a_uv: Array2<f64>,
 }
 
@@ -306,6 +307,7 @@ pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {
     pub(crate) chi_uv_uv: Array2<f64>,
     pub(crate) d_uv_uv: Array2<f64>,
     /// DEBUG (#1454 localizer): intercept Hessian D_dir1 D_dir2 ∂_u∂_v a.
+    #[cfg(test)]
     pub(crate) auvd12: Array2<f64>,
 }
 
