@@ -5996,13 +5996,15 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     )
                     .map_err(|e| e.to_string())?;
                     crate::basis::matern_kernel_double_penalties_at_length_scale(
-                        penalty_centers.view(),
-                        identifiability_transform.as_ref(),
-                        *include_intercept,
-                        *nu,
-                        aniso_for_penalty,
-                        effective_ls,
-                        *nullspace_shrinkage_survived,
+                        &crate::basis::MaternKernelPenaltyKey {
+                            centers: penalty_centers.view(),
+                            identifiability_transform: identifiability_transform.as_ref(),
+                            include_intercept: *include_intercept,
+                            nu: *nu,
+                            aniso_log_scales: aniso_for_penalty,
+                            effective_length_scale: effective_ls,
+                            nullspace_shrinkage_survived: *nullspace_shrinkage_survived,
+                        },
                     )
                     .map_err(|e| e.to_string())?
                 } else {
@@ -6210,13 +6212,15 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 .map_err(|e| e.to_string())?;
                 if double_penalty {
                     crate::basis::matern_kernel_double_penalty_psi_derivatives_at_length_scale(
-                        penalty_centers.view(),
-                        identifiability_transform.as_ref(),
-                        *include_intercept,
-                        *nu,
-                        aniso_for_penalty,
-                        effective_ls,
-                        *nullspace_shrinkage_survived,
+                        &crate::basis::MaternKernelPenaltyKey {
+                            centers: penalty_centers.view(),
+                            identifiability_transform: identifiability_transform.as_ref(),
+                            include_intercept: *include_intercept,
+                            nu: *nu,
+                            aniso_log_scales: aniso_for_penalty,
+                            effective_length_scale: effective_ls,
+                            nullspace_shrinkage_survived: *nullspace_shrinkage_survived,
+                        },
                     )
                     .map_err(|e| e.to_string())?
                 } else {

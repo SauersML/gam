@@ -3184,8 +3184,31 @@ pub(crate) fn build_matern_kernel_penalty(
     Ok(penalty_kernel)
 }
 
-/// Build the Matérn double-penalty (RKHS-kernel) penalty list at an explicit
-/// **effective** length scale, mirroring the cold double-penalty assembly in
+/// Frozen-geometry key for the Matérn RKHS double-penalty κ-optimizer re-key
+/// (#1033). Bundles the ψ-invariant geometry/configuration pulled from the
+/// frozen `BasisMetadata::Matern` so the n-free value and ψ-derivative re-keys
+/// take a single descriptor rather than a long positional argument list. Only
+/// `effective_length_scale` (and, via the caller, the trial anisotropy in
+/// `aniso_log_scales`) moves across re-keys.
+pub(crate) struct MaternKernelPenaltyKey<'a> {
+    /// Periodic-expanded center cloud (matching the cold build's kernel pairs).
+    pub(crate) centers: ArrayView2<'a, f64>,
+    /// Identifiability transform `Z` (intercept column appended internally when
+    /// `include_intercept`).
+    pub(crate) identifiability_transform: Option<&'a Array2<f64>>,
+    pub(crate) include_intercept: bool,
+    pub(crate) nu: MaternNu,
+    pub(crate) aniso_log_scales: Option<&'a [f64]>,
+    /// σ_geom-compensated effective length scale at the trial ψ.
+    pub(crate) effective_length_scale: f64,
+    /// Frozen `nullspace_shrinkage_survived` metadata decision: `Some(true)`
+    /// emits the shrinkage ridge block, otherwise only the Primary block — so
+    /// the re-key block count is ψ-invariant (#1270).
+    pub(crate) nullspace_shrinkage_survived: Option<bool>,
+}
+
+/// Build the Matérn double-penalty (RKHS-kernel) penalty list at the key's
+/// effective length scale, mirroring the cold double-penalty assembly in
 /// `build_matern_basis_seeded` (`build_matern_kernel_penalty` →
 /// `project_penalty_matrix(full_transform)` →
 /// `matern_double_penalty_candidates_with_decision`). This is the κ-optimizer's
@@ -3193,35 +3216,24 @@ pub(crate) fn build_matern_kernel_penalty(
 /// `bs="gp"` / fields kriging), the analogue of
 /// `matern_operator_penalty_triplet_at_length_scale` for the operator path.
 ///
-/// `frozen_nullspace_shrinkage_survived` is the metadata decision pinned at the
-/// cold build, so the emitted BLOCK COUNT is ψ-invariant by construction (the
-/// #1270 topology-desync invariant): `Some(true)` always emits the Primary
-/// kernel Gram plus the null-space shrinkage ridge, `Some(false)`/`None` emits
-/// only the Primary block. Returns the per-block penalty matrices (term-local
-/// frame, same order/count the cold build emits) and their nullspace dims.
-#[allow(clippy::too_many_arguments)]
+/// Returns the per-block penalty matrices (term-local frame, same order/count
+/// the cold build emits) and their nullspace dims.
 pub(crate) fn matern_kernel_double_penalties_at_length_scale(
-    centers: ArrayView2<'_, f64>,
-    identifiability_transform: Option<&Array2<f64>>,
-    include_intercept: bool,
-    nu: MaternNu,
-    aniso_log_scales: Option<&[f64]>,
-    effective_length_scale: f64,
-    frozen_nullspace_shrinkage_survived: Option<bool>,
+    key: &MaternKernelPenaltyKey<'_>,
 ) -> Result<(Vec<Array2<f64>>, Vec<usize>), BasisError> {
     let penalty_kernel = build_matern_kernel_penalty(
-        centers,
-        effective_length_scale,
-        nu,
-        include_intercept,
-        aniso_log_scales,
+        key.centers,
+        key.effective_length_scale,
+        key.nu,
+        key.include_intercept,
+        key.aniso_log_scales,
     )?;
     // Reproduce the cold path's `full_transform`: the identifiability transform
     // with the unpenalized intercept column appended (when present), so the
     // projected Primary kernel Gram lives in the SAME constrained chart as the
     // realized design's penalties.
-    let full_transform = identifiability_transform.map(|z| {
-        if include_intercept {
+    let full_transform = key.identifiability_transform.map(|z| {
+        if key.include_intercept {
             append_intercept_to_transform(z)
         } else {
             z.clone()
@@ -3230,7 +3242,7 @@ pub(crate) fn matern_kernel_double_penalties_at_length_scale(
     let primary = project_penalty_matrix(&penalty_kernel, full_transform.as_ref());
     let (candidates, _survived) = crate::basis::matern_double_penalty_candidates_with_decision(
         &primary,
-        frozen_nullspace_shrinkage_survived,
+        key.nullspace_shrinkage_survived,
     )?;
     let (penalties, nullspace_dims, _info, _eig, _ops) =
         crate::basis::filter_active_penalty_candidates_with_ops(candidates)?;
@@ -3247,27 +3259,20 @@ pub(crate) fn matern_kernel_double_penalties_at_length_scale(
 ///   * shrinkage  → the exact spectral-projector `∂R~/∂ψ` (#1122),
 /// emitted only when `nullspace_shrinkage_survived == Some(true)` (the frozen
 /// decision), so the derivative list length matches the value block count.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn matern_kernel_double_penalty_psi_derivatives_at_length_scale(
-    centers: ArrayView2<'_, f64>,
-    identifiability_transform: Option<&Array2<f64>>,
-    include_intercept: bool,
-    nu: MaternNu,
-    aniso_log_scales: Option<&[f64]>,
-    effective_length_scale: f64,
-    nullspace_shrinkage_survived: Option<bool>,
+    key: &MaternKernelPenaltyKey<'_>,
 ) -> Result<Vec<Array2<f64>>, BasisError> {
     let (_s_norm, s_norm_psi, _s_norm_psi_psi, _c, a_raw, a_raw_psi, a_raw_psi_psi) =
         crate::basis::build_matern_double_penalty_primarywith_psi_derivatives(
-            centers,
-            effective_length_scale,
-            nu,
-            include_intercept,
-            identifiability_transform,
-            aniso_log_scales,
+            key.centers,
+            key.effective_length_scale,
+            key.nu,
+            key.include_intercept,
+            key.identifiability_transform,
+            key.aniso_log_scales,
         )?;
     let mut blocks = vec![s_norm_psi];
-    if matches!(nullspace_shrinkage_survived, Some(true)) {
+    if matches!(key.nullspace_shrinkage_survived, Some(true)) {
         let (shrink_first, _shrink_second) =
             crate::basis::matern_nullspace_shrinkage_psi_derivatives(
                 &a_raw,
