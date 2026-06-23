@@ -301,12 +301,21 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
                 // wide and `0.5·se²` overflows the exponent, producing +inf —
                 // which the FFI serializes as JSON null (issue #1515). In that
                 // regime the posterior-integrated mean is numerically
-                // meaningless; fall back to the plug-in `exp(eta)` (which is
-                // the floored finite point estimate) so predict() stays
-                // finite and non-negative.
+                // meaningless; fall back to the plug-in `exp(eta)` (the exact
+                // public inverse-link at the floored point estimate) so
+                // predict() stays finite and non-negative.
                 let exponent = eta + 0.5 * se_eta * se_eta;
-                if exponent.is_finite() && exponent < 700.0 {
-                    Ok(exponent.exp())
+                if exponent.is_finite() {
+                    let mgf = exponent.exp();
+                    if mgf.is_finite() {
+                        return Ok(mgf);
+                    }
+                }
+                // Overflow: fall back to the exact plug-in exp(η). If even that
+                // overflows, clamp to the f64-representable boundary.
+                let plugin = eta.exp();
+                if plugin.is_finite() {
+                    Ok(plugin)
                 } else {
                     Ok(eta.clamp(-700.0, 700.0).exp())
                 }
