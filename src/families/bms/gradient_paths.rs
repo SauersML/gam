@@ -1425,6 +1425,41 @@ pub(crate) fn rigid_standard_normal_row_nll_generic<S: crate::families::jet_scal
     w: f64,
     probit_scale: f64,
 ) -> Result<S, String> {
+    // The order-≤4 signed observed margin `m = (2y−1)·η`, written ONCE in
+    // `rigid_standard_normal_signed_margin` over `S: JetScalar<2>` and shared
+    // verbatim with the batched builder's Pass-A jet (#932 single source).
+    let signed = rigid_standard_normal_signed_margin(p, marginal, z, y, probit_scale);
+    // Preserve the production fail-fast: a NaN (non-`+∞`) signed margin is an
+    // upstream domain failure, not a tail saturation.
+    let m = signed.value();
+    if !(m.is_finite() || m == f64::INFINITY) {
+        return Err(format!(
+            "non-finite signed margin in rigid probit row NLL: {m}"
+        ));
+    }
+    // NLL = −w·logΦ(m) via the fused single-Mills-ratio probit neglog stack.
+    Ok(signed.compose_unary(signed_probit_neglog_unary_stack(m, w)))
+}
+
+/// The order-≤4 signed observed margin `m = (2y−1)·η` of one rigid
+/// standard-normal Bernoulli row, written ONCE over `S: JetScalar<2>`:
+/// `q(η_marg)` composed onto the η primary, observed slope `b = s·g`, scale
+/// `c = √(1 + b²)`, `η = q·c + b·z`. This is the polynomial part shared by
+/// every channel consumer — the per-row / contracted / full-tower generic NLL
+/// ([`rigid_standard_normal_row_nll_generic`]) composes the probit-neglog
+/// transcendental onto it, and the batched builder's Pass-A jet
+/// ([`rigid_standard_normal_signed_jet`]) evaluates it at `Tower4<2>` — so the
+/// signed margin has a single source (#932), with no second hand-packed jet.
+#[inline]
+pub(crate) fn rigid_standard_normal_signed_margin<
+    S: crate::families::jet_scalar::JetScalar<2>,
+>(
+    p: &[S; 2],
+    marginal: BernoulliMarginalLinkMap,
+    z: f64,
+    y: f64,
+    probit_scale: f64,
+) -> S {
     // q(η_marg): compose the link's q-as-function-of-η stack onto the η primary.
     let q = p[0].compose_unary([
         marginal.q,
@@ -1440,17 +1475,7 @@ pub(crate) fn rigid_standard_normal_row_nll_generic<S: crate::families::jet_scal
     let c = b2.add(&S::constant(1.0)).sqrt();
     // η = q·c + (s·g)·z, signed margin m = (2y−1)·η.
     let eta = q.mul(&c).add(&observed_slope.scale(z));
-    let signed = eta.scale(2.0 * y - 1.0);
-    // Preserve the production fail-fast: a NaN (non-`+∞`) signed margin is an
-    // upstream domain failure, not a tail saturation.
-    let m = signed.value();
-    if !(m.is_finite() || m == f64::INFINITY) {
-        return Err(format!(
-            "non-finite signed margin in rigid probit row NLL: {m}"
-        ));
-    }
-    // NLL = −w·logΦ(m) via the fused single-Mills-ratio probit neglog stack.
-    Ok(signed.compose_unary(signed_probit_neglog_unary_stack(m, w)))
+    eta.scale(2.0 * y - 1.0)
 }
 
 /// One row of rigid standard-normal Bernoulli data as a generic
@@ -1539,8 +1564,10 @@ pub(crate) fn rigid_standard_normal_tower(
 /// `c(g) = √(1 + (s·g)²)`, with no `erfc`/`exp`/`ln` call. Splitting this off
 /// lets the batched builder run all the cheap, branch-free jet products in one
 /// SIMD-friendly pass and isolate the (branchy, transcendental) Mills-ratio
-/// composition into its own tight pass. The returned jet is bit-identical to
-/// the `signed` jet inside `rigid_standard_normal_tower` (same op order).
+/// composition into its own tight pass. The returned jet is the SAME expression
+/// (`rigid_standard_normal_signed_margin`) the per-row `rigid_standard_normal_tower`
+/// signed margin evaluates, here at `Tower4<2>` — bit-identical by construction,
+/// not a parallel hand-packed jet (#932 single source).
 #[inline]
 fn rigid_standard_normal_signed_jet(
     marginal: BernoulliMarginalLinkMap,
@@ -1549,16 +1576,13 @@ fn rigid_standard_normal_signed_jet(
     y: f64,
     probit_scale: f64,
 ) -> Tower4<2> {
-    let mut q = Tower4::<2>::constant(marginal.q);
-    q.g[0] = marginal.q1;
-    q.h[0][0] = marginal.q2;
-    q.t3[0][0][0] = marginal.q3;
-    q.t4[0][0][0][0] = marginal.q4;
-    let slope = Tower4::<2>::variable(g, 1);
-    let observed_logslope = slope * probit_scale;
-    let c = (observed_logslope * observed_logslope + 1.0).sqrt();
-    let eta = q * c + slope * (probit_scale * z);
-    eta * (2.0 * y - 1.0)
+    // Seed `[marginal η, g]` exactly as the generic program's `primaries()`, then
+    // evaluate the one shared signed-margin expression at the all-channels scalar.
+    let p = [
+        Tower4::<2>::variable(marginal.eta_value(), 0),
+        Tower4::<2>::variable(g, 1),
+    ];
+    rigid_standard_normal_signed_margin(&p, marginal, z, y, probit_scale)
 }
 
 /// Batched, two-pass builder of the rigid standard-normal row `Tower4<2>` jets
