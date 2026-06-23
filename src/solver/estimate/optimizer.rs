@@ -816,6 +816,30 @@ where
         // same `warm_start_beta` slot the publisher reads from.
         let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
 
+        // #1074 DIAGNOSTIC (env-gated, no behavior change when unset): sweep each
+        // outer log-λ coordinate over a grid while holding the others at the
+        // baseline, printing the REML cost. Used to decide whether the spatial
+        // range railing is an interior-optimum the optimizer misses (optimizer
+        // bug) or a genuine criterion preference for λ→∞ (criterion).
+        if std::env::var("GAM_1074_RHO_SWEEP").is_ok() {
+            let baseline = Array1::<f64>::zeros(k);
+            eprintln!("[#1074-sweep] k={k} baseline=all-zeros");
+            for coord in 0..k {
+                let mut line = format!("[#1074-sweep] coord={coord}:");
+                for &rho in &[-5.0_f64, -2.0, 0.0, 2.0, 5.0, 8.0, 12.0, 16.0, 20.0, 25.0, 30.0]
+                {
+                    let mut p = baseline.clone();
+                    p[coord] = rho;
+                    let c = reml_state
+                        .compute_cost(&p)
+                        .map(|v| format!("{v:.5}"))
+                        .unwrap_or_else(|_| "ERR".to_string());
+                    line.push_str(&format!(" rho={rho:.0}->{c}"));
+                }
+                eprintln!("{line}");
+            }
+        }
+
         let mut strategy_result = problem.run(&mut obj, "standard REML")?;
         drop(obj);
         // #1371 release-and-rerank guard. The continuation oversmoothing
