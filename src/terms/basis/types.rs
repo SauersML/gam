@@ -1462,8 +1462,10 @@ pub enum BasisMetadata {
         /// rebuilds the cr marginal knotspec (value-at-knot) instead of an open
         /// `Provided(knots)` B-spline, keeping predict-time marginals identical
         /// to the fit-time cr margins. Defaults to all-`false` (legacy B-spline
-        /// tensors) when deserialized from an older persisted model.
-        #[serde(default)]
+        /// tensors) when deserialized from an older persisted model (the
+        /// older-model default is applied on the persisted `SmoothBasisSpec`
+        /// side; `BasisMetadata` itself is transient builder output and is not
+        /// serde-serialized, so it carries no `#[serde]` attributes).
         is_cr: Vec<bool>,
         identifiability_transform: Option<Array2<f64>>,
     },
