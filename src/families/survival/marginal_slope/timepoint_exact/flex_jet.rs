@@ -1156,6 +1156,113 @@ impl SurvivalMarginalSlopeFamily {
         let out = flex_row_nll(&eta0, &eta1, &chi1, &d1, &q1j, &qd1j, surv0, surv1, wi, di);
         Array2::from_shape_vec((p, p), out.contracted_fourth()).map_err(|e| e.to_string())
     }
+
+    /// #932 item-2 Phase C STEP 3 (the verification gate): the single-source
+    /// timepoint inputs `(eta, chi, d)` at `Jet2` (value/grad/Hess), assembled
+    /// from the generic FlexJet building blocks — the intercept lift
+    /// (`lift_intercept_flex`), the observed eta/chi (`flex_timepoint_eta_chi`),
+    /// and the density normalization `D = Σ_cells flex_timepoint_d_cell` — instead
+    /// of the hand `compute_survival_timepoint_exact` θ-derivative assembly. The
+    /// returned jets carry their exact first/second θ-derivatives so the
+    /// value/gradient/Hessian channels match the hand `eta_u`/`eta_uv`/`chi_*`/
+    /// `d_*` term for term (FD-pinned by `flex_timepoint_inputs_jet2_matches_hand`).
+    ///
+    /// `rho`/`tau` are the score-warp(`h`)/link-dev(`w`)/`infl` linear-channel
+    /// scalar weights (the hand `rho`/`tau` vectors, first_full.rs:909-953); they
+    /// enter `eta`/`chi` through their own primary axes. `o_infl` shifts `eta`'s
+    /// value. The cells supply both the calibration residual (for the lift) and
+    /// the `D` integral.
+    pub(crate) fn flex_timepoint_inputs_jet2(
+        &self,
+        primary: &FlexPrimarySlices,
+        q_index: usize,
+        phi_q: f64,
+        a0: f64,
+        b: f64,
+        d_check: f64,
+        z_obs: f64,
+        o_infl: f64,
+        pack: &ObservedCoeffPack,
+        rho: &[f64],
+        tau: &[f64],
+        cells: &[CalibrationCellJetInputs<'_>],
+    ) -> Result<FlexTimepointJet2Out, String> {
+        let p = primary.total;
+        let template = Jet2::from_parts(0.0, &vec![0.0; p], &[]);
+        let b_jet = Jet2::primary(b, primary.g, p);
+        let du: Vec<Jet2> = (0..p).map(|u| Jet2::primary(0.0, u, p)).collect();
+
+        // Intercept lift to Jet2 (value/grad/Hess) — 2 Newton iterations.
+        let residual =
+            |a: &Jet2| calibration_residual_jet(a, &b_jet, primary.g, &du, q_index, phi_q, cells);
+        let a_jet = lift_intercept_flex(&template, a0, 1.0 / d_check, 2, residual);
+
+        // rho/tau channel jets: Σ_idx rho[idx]·(unit primary jet at idx).
+        let mut rho_jet = const_jet_like(&template, 0.0);
+        let mut tau_jet = const_jet_like(&template, 0.0);
+        for idx in 0..p {
+            if rho[idx] != 0.0 {
+                rho_jet = rho_jet.add(&Jet2::primary(0.0, idx, p).scale(rho[idx]));
+            }
+            if tau[idx] != 0.0 {
+                tau_jet = tau_jet.add(&Jet2::primary(0.0, idx, p).scale(tau[idx]));
+            }
+        }
+
+        let (eta, chi) =
+            flex_timepoint_eta_chi(&a_jet, &b_jet, z_obs, o_infl, pack, &rho_jet, &tau_jet);
+
+        // D = Σ_cells INV_TWO_PI·Σ_k χ_k·M_k, χ from cell_chi_poly_jets, M from
+        // the cell coeff jets through the lifted a_jet.
+        let da = tangent_jet(&a_jet);
+        let mut d = const_jet_like(&template, 0.0);
+        for cell in cells {
+            let c_pos = cell_coeff_jets(&a_jet, cell.base_pos_coeffs, cell.fixed, primary.g, &da, &du);
+            let chi_jets = cell_chi_poly_jets(&a_jet, cell.fixed, primary.g, &da, &du);
+            let edge_l = cell_edge_jet(&a_jet, &b_jet, cell.left_edge, cell.cell_left);
+            let edge_r = cell_edge_jet(&a_jet, &b_jet, cell.right_edge, cell.cell_right);
+            d = d.add(&flex_timepoint_d_cell(
+                &template,
+                &c_pos,
+                &chi_jets,
+                &edge_l,
+                cell.cell_left.is_finite(),
+                &edge_r,
+                cell.cell_right.is_finite(),
+                cell.numeric_moments,
+            ));
+        }
+
+        let to_g = |j: &Jet2| Array1::from(j.g.clone());
+        let to_h = |j: &Jet2| -> Result<Array2<f64>, String> {
+            Array2::from_shape_vec((p, p), j.h.clone()).map_err(|e| e.to_string())
+        };
+        Ok(FlexTimepointJet2Out {
+            eta: to_g(&eta),
+            eta_v: eta.value(),
+            eta_h: to_h(&eta)?,
+            chi: to_g(&chi),
+            chi_v: chi.value(),
+            chi_h: to_h(&chi)?,
+            d: to_g(&d),
+            d_v: d.value(),
+            d_h: to_h(&d)?,
+        })
+    }
+}
+
+/// The `Jet2` timepoint inputs `(eta, chi, d)` value/gradient/Hessian channels
+/// returned by [`SurvivalMarginalSlopeFamily::flex_timepoint_inputs_jet2`].
+pub(crate) struct FlexTimepointJet2Out {
+    pub eta_v: f64,
+    pub eta: Array1<f64>,
+    pub eta_h: Array2<f64>,
+    pub chi_v: f64,
+    pub chi: Array1<f64>,
+    pub chi_h: Array2<f64>,
+    pub d_v: f64,
+    pub d: Array1<f64>,
+    pub d_h: Array2<f64>,
 }
 
 #[cfg(test)]
