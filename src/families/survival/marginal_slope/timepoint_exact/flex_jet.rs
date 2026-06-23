@@ -1126,3 +1126,65 @@ fn eval_coeff_jet_at<J: FlexJet>(coeff_jet: &[J; 4], z: f64) -> J {
     }
     acc
 }
+
+/// Phase C assembly (foundational `Jet2` order): the observed timepoint `eta`
+/// and `chi` as value/grad/Hessian jets, from the solved intercept derivatives
+/// (`a`, `a_u`, `a_uv` — `a_u = f_u/D`, `a_uv = lift_intercept_order2`) and the
+/// observed cell-coefficient partial pack. `b` is the slope (`g` primary at
+/// `g_axis`). `eta`/`chi` carry their exact first/second θ-derivatives by
+/// composing the coefficients' bivariate `(a,b)` Taylor with the intercept jet
+/// — replacing the hand `eta_u = chi·a_u + rho`, `eta_uv = …` chains in
+/// `first_full`/`directional`/`bidirectional` for the `a`/`b` channels.
+///
+/// The score-warp (`h`) / link-dev (`w`) channels (which enter `eta` linearly
+/// via `rho`/`tau`) and the `D`-normalization channel (via the moment engine)
+/// are layered on by the full `flex_timepoint_inputs` once those pieces land.
+
+fn flex_timepoint_eta_chi_jet2(
+    p: usize,
+    g_axis: usize,
+    a: f64,
+    a_u: &[f64],
+    a_uv: &[f64],
+    b: f64,
+    z_obs: f64,
+    o_infl: f64,
+    coeff: [f64; 4],
+    dc_da: [f64; 4],
+    dc_db: [f64; 4],
+    dc_daa: [f64; 4],
+    dc_dab: [f64; 4],
+    dc_dbb: [f64; 4],
+    dc_daaa: [f64; 4],
+    dc_daab: [f64; 4],
+    dc_dabb: [f64; 4],
+    dc_dbbb: [f64; 4],
+) -> (Jet2, Jet2) {
+    let a_jet = Jet2::from_parts(a, a_u, a_uv);
+    let b_jet = Jet2::primary(b, g_axis, p);
+    let da = tangent_jet(&a_jet);
+    let db = tangent_jet(&b_jet);
+    let zero4 = [0.0_f64; 4];
+
+    // eta coefficients: the coeff pack composed with (da, db).
+    let coeff_jets: [Jet2; 4] = std::array::from_fn(|k| {
+        observed_coeff_component_jet(
+            &a_jet, k, coeff, dc_da, dc_db, dc_daa, dc_dab, dc_dbb, dc_daaa, dc_daab, dc_dabb,
+            dc_dbbb, &da, &db,
+        )
+    });
+    let eta = eval_coeff_jet_at(&coeff_jets, z_obs).add_const(o_infl);
+
+    // chi = ∂eta/∂a coefficients = the dc_da pack, whose own (a,b)-Taylor is the
+    // once-`a`-shifted pack (dc_daa as ∂/∂a, dc_dab as ∂/∂b, dc_daaa/daab/dabb as
+    // the seconds; the dc_da pack carries no third-order term, so those are 0).
+    let chi_jets: [Jet2; 4] = std::array::from_fn(|k| {
+        observed_coeff_component_jet(
+            &a_jet, k, dc_da, dc_daa, dc_dab, dc_daaa, dc_daab, dc_dabb, zero4, zero4, zero4, zero4,
+            &da, &db,
+        )
+    });
+    let chi = eval_coeff_jet_at(&chi_jets, z_obs);
+
+    (eta, chi)
+}
