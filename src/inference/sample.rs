@@ -412,7 +412,24 @@ fn sample_standard(
     mut likelihood: LikelihoodSpec,
     cfg: &NutsConfig,
 ) -> Result<NutsResult, String> {
-    if likelihood.is_gaussian_identity() {
+    // `bounded(x, min, max)` linear terms carry their posterior on the latent
+    // interval-transform scale (`beta = min + (max - min)*sigmoid(theta)`), so the
+    // draws must come from the dedicated `sample_standard_bounded` path below —
+    // even for a gaussian-identity model, whose closed-form Laplace shortcut would
+    // otherwise fire first and place posterior mass outside `[min, max]`. That
+    // shortcut ran before the bounded dispatch, leaving the in-bounds latent
+    // sampler dead code for the gaussian default (only binomial ever reached it).
+    // Detect bounded terms from the saved termspec up front so the common,
+    // bound-free gaussian path keeps its fast exact fallback without parsing.
+    let has_bounded_linear = model.resolved_termspec.as_ref().is_some_and(|ts| {
+        ts.linear_terms.iter().any(|term| {
+            matches!(
+                term.coefficient_geometry,
+                LinearCoefficientGeometry::Bounded { .. }
+            )
+        })
+    });
+    if likelihood.is_gaussian_identity() && !has_bounded_linear {
         return laplace_gaussian_fallback(model, cfg, "standard gaussian posterior");
     }
     if model.has_link_wiggle() {
