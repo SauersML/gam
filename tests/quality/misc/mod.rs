@@ -5,6 +5,7 @@ mod broad_sweep_batch_i;
 mod feature_correctness_sweep;
 mod fit_quality_stress;
 mod logdet_probe;
+mod logdet_probe_1266_ps;
 mod mega_batch_j;
 mod mega_batch_k;
 mod quality_corrected_aic_psis_loo_selection;
