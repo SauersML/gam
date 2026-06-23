@@ -70,6 +70,29 @@ def test_monotone_decreasing_posterior_curves_are_monotone() -> None:
     assert frac_bad < 0.02, f"{frac_bad:.3f} of drawn curves are non-decreasing"
 
 
+def test_convex_posterior_curves_are_convex() -> None:
+    # The same coefficient-cone machinery handles the order-2 curvature
+    # constraints (convex/concave: γ_j ≥ 0 for j ≥ 2), so the posterior of a
+    # convex smooth must yield convex curves (non-negative second differences).
+    rng = np.random.default_rng(4)
+    n = 300
+    x = np.sort(rng.uniform(0, 1, n))
+    y = (x - 0.5) ** 2 * 4.0 + rng.standard_normal(n) * 0.1  # convex signal
+    df = pd.DataFrame({"x": x, "y": y})
+    m = gamfit.fit(df, "y ~ s(x, shape='convex')")
+
+    grid = _grid()
+    fitted = np.asarray(m.predict(grid)).ravel()
+    assert np.diff(fitted, 2).min() >= -1e-5  # point estimate convex
+
+    s = m.sample(df, samples=600, chains=2, seed=3)
+    curves = np.asarray(s.predict_draws(grid).mean)
+    span = np.ptp(curves)
+    worst = np.array([np.diff(c, 2).min() for c in curves])  # most-concave 2nd diff
+    frac_bad = float((worst < -0.005 * span).mean())
+    assert frac_bad < 0.02, f"{frac_bad:.3f} of drawn curves are non-convex"
+
+
 def test_monotone_posterior_is_non_degenerate() -> None:
     # The truncated posterior must still be dispersed: the drawn curves should
     # not all collapse onto the point estimate.
