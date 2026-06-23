@@ -94,6 +94,18 @@ impl GpuRuntime {
             // below in `catch_unwind` to convert the panic into a typed
             // `GpuError::DriverCallFailed` instead.
             install_cudarc_panic_filter();
+            // #1017 probe-first fix: establish cudarc's primary context P and
+            // initialize the CUDA runtime ON IT as the VERY FIRST CUDA action -- before
+            // gam's libloading libcuda preload, the compute-lib dlopens, and device_count.
+            // The clean cuda_context_for-first path works; the probe-first path failed
+            // because a pre-context CUDA touch left the runtime bound to a non-P context,
+            // so later cuBLAS/cuSOLVER handle creation on the P-stream returned
+            // NOT_INITIALIZED. Making cuda_context_for the first action replicates the
+            // working clean path (CudaContext::new loads libcuda + retains the primary +
+            // ensure runs the runtime init); on a CPU-only host it returns None cleanly
+            // via the panic filter + catch_unwind, and the preload check below still runs.
+            let primary_ready = cuda_context_for(0).is_some();
+            log::trace!("[GPU] probe pre-init primary context + runtime: {primary_ready}");
             if crate::gpu::driver::preload_cuda_driver().is_err() {
                 let reason = "libcuda unavailable";
                 Self::record_cpu_reason(reason);
@@ -103,17 +115,6 @@ impl GpuRuntime {
                     reason: reason.to_string(),
                 });
             }
-
-            // #1017 probe-first fix: establish cudarc's primary context P and
-            // initialize the CUDA runtime ON IT now -- BEFORE the compute-lib dlopens
-            // and device_count below. On the probe-first path, if the runtime's first
-            // touch happens after those steps it can bind a non-P context, and every
-            // later cuBLAS/cuSOLVER handle creation on the P-stream then fails
-            // CUBLAS/CUSOLVER_STATUS_NOT_INITIALIZED. Doing it first (exactly like the
-            // clean cuda_context_for-first path that works) makes the runtime adopt P;
-            // caching makes the device loop below reuse the same context for free.
-            let primary_ready = cuda_context_for(0).is_some();
-            log::trace!("[GPU] probe pre-init primary context + runtime: {primary_ready}");
 
             // Driver-only environments (e.g. large-scale workbench images that expose
             // `libcuda.so.1` but ship no cuBLAS/cuSOLVER/cuSPARSE) used to slip
