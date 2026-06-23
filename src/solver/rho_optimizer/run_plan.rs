@@ -244,6 +244,9 @@ pub(crate) fn run_outer_with_plan(
     // first rejection's rho + error is often the most diagnostic.
     let mut rejection_reasons: Vec<(usize, &'static str, String)> = Vec::new();
     let layout = cap.theta_layout();
+    // Number of smoothing (ρ) coordinates, used to break a near-LAML-tie toward
+    // the more-penalized basin in the non-Gaussian multi-start keep-best.
+    let rho_dim = layout.rho_dim();
     let mut started_seeds = 0usize;
     let expensive_seed_limit =
         expensive_unsuccessful_seed_limit(the_plan.solver, config.seed_config.risk_profile);
@@ -1779,7 +1782,25 @@ pub(crate) fn run_outer_with_plan(
                     candidate.final_value,
                     candidate.converged,
                 );
-                let candidate_improved = candidate_improves_best(&candidate, best.as_ref());
+                // #1373: for non-Gaussian models the seed screening deliberately
+                // places the most-flexible (low-λ) seed at slot 0 and the
+                // heaviest interior (high-λ) seed at slot 1 so the budget-2
+                // multi-start straddles both basins. The flexible basin can
+                // converge to a LAML that is *epsilon* better while overshooting
+                // on the response scale (exp(η) amplifies the noise-fitting
+                // wiggle into a fit far worse than the parsimonious optimum).
+                // Break that near-tie toward the more-smoothed basin so the
+                // overshoot is not adopted purely on LAML noise; a genuinely
+                // better flexible basin (decisive LAML gap) still wins.
+                let non_gaussian = !matches!(
+                    config.seed_config.risk_profile,
+                    crate::seeding::SeedRiskProfile::Gaussian
+                );
+                let candidate_improved = if non_gaussian {
+                    candidate_improves_best_parsimonious(&candidate, best.as_ref(), rho_dim)
+                } else {
+                    candidate_improves_best(&candidate, best.as_ref())
+                };
                 if candidate_improved {
                     best = Some(candidate);
                 }
@@ -1788,8 +1809,19 @@ pub(crate) fn run_outer_with_plan(
                     crate::seeding::SeedRiskProfile::Gaussian
                 ) && seed_budget > 1
                     && started_seeds < seed_budget;
+                // #1373: do not let the first-converged flexible seed (slot 0)
+                // short-circuit the multi-start before the deliberately-promoted
+                // parsimonious seed (slot 1) has been solved. Without this, the
+                // converged break below fires on slot 0 and the heavy basin that
+                // the screening order placed at slot 1 — precisely to let
+                // keep-best reject an overshoot — is never evaluated. Bounded to
+                // the existing seed_budget (typically 2 for non-Gaussian ARC), so
+                // this solves at most one additional seed before the break.
+                let non_gaussian_await_parsimony_seed =
+                    non_gaussian && seed_budget > 1 && started_seeds < seed_budget;
                 if best.as_ref().is_some_and(|b| b.converged)
                     && !quality_compare_remaining_gaussian_seeds
+                    && !non_gaussian_await_parsimony_seed
                 {
                     break;
                 }

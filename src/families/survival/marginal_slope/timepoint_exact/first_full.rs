@@ -49,57 +49,6 @@ pub(super) enum FluxVelocity {
     PartialIft,
 }
 
-/// The ONE mechanical moving-boundary Leibniz-flux core (gam#932).
-///
-/// Every moving-boundary flux in the flex marginal-slope tower — the θ-axis
-/// [`moving_density_boundary_flux`], the intercept-axis
-/// [`moving_density_boundary_flux_a`], and the higher-order directional/
-/// bidirectional analogs that used to inline this structure by hand — is the
-/// SAME contraction over the cell's two partition edges:
-///
-/// ```text
-///   flux = v_right · F(z_right) − v_left · F(z_left),
-/// ```
-///
-/// where `F(z)` is a boundary integrand evaluated at the edge `z`-location and
-/// `v_edge = ∂z_edge/∂(differentiation)` is the edge VELOCITY — nonzero only at
-/// a moving link-knot `Crossing` edge (`z = (τ−a)/b`), zero at a `Fixed`
-/// score-break or ±∞ tail edge (which do not move with the row scalars). The
-/// per-order flux differs ONLY in (a) which velocity jet feeds `v_edge` (the
-/// irreducible a-chain seam: `∂z/∂a = −1/b`, `∂z/∂θ = −(a_u+direct_g)/b`, and
-/// their directional derivatives) and (b) which integrand `F` is evaluated
-/// (the order-appropriate `cell_*_derivative_boundary_integrand`). This core
-/// factors out the shared edge-contraction so each call site supplies only
-/// those two, and the velocity-is-zero short-circuit lives in one place.
-#[inline]
-pub(super) fn moving_boundary_flux_core(
-    left_edge: crate::families::cubic_cell_kernel::PartitionEdge,
-    right_edge: crate::families::cubic_cell_kernel::PartitionEdge,
-    v_left: f64,
-    v_right: f64,
-    z_left: f64,
-    z_right: f64,
-    mut integrand_at: impl FnMut(f64) -> f64,
-) -> f64 {
-    let is_moving = |edge: crate::families::cubic_cell_kernel::PartitionEdge| {
-        matches!(
-            edge,
-            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. }
-        )
-    };
-    let right = if is_moving(right_edge) && v_right != 0.0 {
-        v_right * integrand_at(z_right)
-    } else {
-        0.0
-    };
-    let left = if is_moving(left_edge) && v_left != 0.0 {
-        v_left * integrand_at(z_left)
-    } else {
-        0.0
-    };
-    right - left
-}
-
 pub(super) fn moving_density_boundary_flux(
     axis: usize,
     primary: &FlexPrimarySlices,
@@ -113,22 +62,35 @@ pub(super) fn moving_density_boundary_flux(
         return 0.0;
     }
     let cell = entry.partition_cell.cell;
-    let crossing_velocity = |z: f64| -> f64 {
-        let direct_g = if axis == primary.g { z } else { 0.0 };
-        match velocity {
-            FluxVelocity::Total => -(a_u[axis] + direct_g) / b,
-            FluxVelocity::PartialIft => -direct_g / b,
+    let edge_velocity = |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+        match edge {
+            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                let direct_g = if axis == primary.g { z } else { 0.0 };
+                match velocity {
+                    FluxVelocity::Total => -(a_u[axis] + direct_g) / b,
+                    FluxVelocity::PartialIft => -direct_g / b,
+                }
+            }
+            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
         }
     };
-    moving_boundary_flux_core(
-        entry.partition_cell.left_edge,
-        entry.partition_cell.right_edge,
-        crossing_velocity(cell.left),
-        crossing_velocity(cell.right),
-        cell.left,
-        cell.right,
-        |z| crate::families::cubic_cell_kernel::cell_density_boundary_integrand(cell, poly, z),
-    )
+    let v_r = edge_velocity(entry.partition_cell.right_edge, cell.right);
+    let v_l = edge_velocity(entry.partition_cell.left_edge, cell.left);
+    let right = if v_r != 0.0 {
+        v_r * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+            cell, poly, cell.right,
+        )
+    } else {
+        0.0
+    };
+    let left = if v_l != 0.0 {
+        v_l * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+            cell, poly, cell.left,
+        )
+    } else {
+        0.0
+    };
+    right - left
 }
 
 /// Moving-boundary Leibniz flux for differentiation w.r.t. the **intercept**
@@ -150,18 +112,29 @@ pub(super) fn moving_density_boundary_flux_a(
         return 0.0;
     }
     let cell = entry.partition_cell.cell;
-    // Intercept-axis crossing velocity `∂z/∂a = −1/b`, constant across the edge
-    // (no `z`-dependence, unlike the θ-axis `direct_g·z` term).
-    let v_a = -1.0 / b;
-    moving_boundary_flux_core(
-        entry.partition_cell.left_edge,
-        entry.partition_cell.right_edge,
-        v_a,
-        v_a,
-        cell.left,
-        cell.right,
-        |z| crate::families::cubic_cell_kernel::cell_density_boundary_integrand(cell, poly, z),
-    )
+    let edge_velocity = |edge: crate::families::cubic_cell_kernel::PartitionEdge| -> f64 {
+        match edge {
+            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => -1.0 / b,
+            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+        }
+    };
+    let v_r = edge_velocity(entry.partition_cell.right_edge);
+    let v_l = edge_velocity(entry.partition_cell.left_edge);
+    let right = if v_r != 0.0 {
+        v_r * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+            cell, poly, cell.right,
+        )
+    } else {
+        0.0
+    };
+    let left = if v_l != 0.0 {
+        v_l * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+            cell, poly, cell.left,
+        )
+    } else {
+        0.0
+    };
+    right - left
 }
 
 impl SurvivalMarginalSlopeFamily {
@@ -767,7 +740,6 @@ impl SurvivalMarginalSlopeFamily {
         if b != 0.0 {
             for entry in &cached.cells {
                 let fixed = &entry.fixed;
-<<<<<<< Updated upstream
                 let cell = entry.neg_cell;
                 let part = &entry.partition_cell;
                 // Crossing-edge velocities z_u = −(a_u[u] + δ_{u,g}·z)/b (§C),
@@ -841,25 +813,17 @@ impl SurvivalMarginalSlopeFamily {
                     };
                     right - left
                 };
-=======
->>>>>>> Stashed changes
                 for u in 0..p {
                     let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                    let zu_r = edge_vel(u, part.right_edge, cell.right);
+                    let zu_l = edge_vel(u, part.left_edge, cell.left);
                     for v in u..p {
-<<<<<<< Updated upstream
                         // Asymmetric Leibniz flux pair `∂_uG·z_v + ∂_vG·z_u`; on the
                         // DIAGONAL (u==v) both orderings coincide → `2·flux` (the
                         // previous single-add halved the g-axis `f_uv[g,g]`,
                         // gam#1454). Off-diagonal [g,w0] is unchanged: its second
                         // term `flux(w0,·)` is 0 since z_w0=0.
                         let neg_coeff_v = fixed.coeff_u[v].map(|value| -value);
-=======
-                        // IFT partial ∂²f/∂θ_u∂θ_v|_a: the crossing moves with
-                        // θ only directly (b = g), NOT through the intercept
-                        // response — a is held fixed. Use the partial velocity;
-                        // the intercept chain enters a_uv via f_au·a_u + f_aa·a_u²
-                        // (gam#1454).
->>>>>>> Stashed changes
                         let boundary = moving_density_boundary_flux(
                             v,
                             primary,
@@ -877,52 +841,26 @@ impl SurvivalMarginalSlopeFamily {
                             b,
                             FluxVelocity::PartialIft,
                         );
-<<<<<<< Updated upstream
                         // `G_z·z_u·z_v` is a single symmetric term, added once
                         // (unlike the asymmetric `flux` pair) to both triangles.
                         let zv_r = edge_vel(v, part.right_edge, cell.right);
                         let zv_l = edge_vel(v, part.left_edge, cell.left);
                         let boundary = boundary + self_flux_xy(zu_r, zv_r, zu_l, zv_l);
-=======
-                        let boundary = if u == v {
-                            boundary
-                        } else {
-                            let neg_coeff_v = fixed.coeff_u[v].map(|value| -value);
-                            boundary
-                                + moving_density_boundary_flux(
-                                    u,
-                                    primary,
-                                    &a_u,
-                                    entry,
-                                    &neg_coeff_v,
-                                    b,
-                                    FluxVelocity::PartialIft,
-                                )
-                        };
->>>>>>> Stashed changes
                         f_uv[[u, v]] += boundary;
                         if u != v {
                             f_uv[[v, u]] += boundary;
                         }
                     }
                 }
-            }
 
-            // a-axis moving-boundary flux for the intercept second derivatives.
-            // f_aa and f_au are second derivatives of the same moving-boundary
-            // cell integral as f_uv (the crossing z = (τ−a)/b moves with a at
-            // velocity z_a = −1/b), but the base cell-moment kernels carry only
-            // the interior term. This was the dominant residual in the
-            // intercept-solve a_uv Hessian (gam#932/#1454): f_uv received its
-            // θ-axis flux above while f_aa/f_au did not. Mirror the f_uv pair
-            // structure with one axis = a (using the negated-coeff convention
-            // the base cell kernels use): f_au[u] picks up flux_a(∂c/∂u) +
-            // flux_u(∂c/∂a); f_aa picks up the (a,a) flux (see the diagonal
-            // convention note at the loop body).
-            for entry in &cached.cells {
-                let fixed = &entry.fixed;
+                // a-axis moving-boundary flux for the intercept second
+                // derivatives. f_aa and f_au are second derivatives of the same
+                // moving-boundary cell integral as f_uv (the crossing
+                // z = (τ−a)/b moves with a at velocity z_a = −1/b), so they carry
+                // the full §D boundary structure: the asymmetric flux pair AND the
+                // symmetric `G_z·z_a·z_x` self-flux. Mirror the f_uv pair + self-
+                // flux with one axis = a (gam#932/#1454).
                 let neg_dc_da = fixed.dc_da.map(|value| -value);
-<<<<<<< Updated upstream
                 let za_r = a_edge_vel(part.right_edge);
                 let za_l = a_edge_vel(part.left_edge);
                 // Diagonal (a,a): the asymmetric flux pair `∂_aG·z_a + ∂_aG·z_a`
@@ -930,13 +868,10 @@ impl SurvivalMarginalSlopeFamily {
                 // gam#1454.
                 f_aa += 2.0 * moving_density_boundary_flux_a(entry, &neg_dc_da, b)
                     + self_flux_xy(za_r, za_r, za_l, za_l);
-=======
-                // Diagonal (a,a): mirror the f_uv[[u,u]] diagonal convention
-                // (the symmetric flux pair added ONCE, not doubled).
-                f_aa += moving_density_boundary_flux_a(entry, &neg_dc_da, b);
->>>>>>> Stashed changes
                 for u in 0..p {
                     let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
+                    let zu_r = edge_vel(u, part.right_edge, cell.right);
+                    let zu_l = edge_vel(u, part.left_edge, cell.left);
                     f_au[u] += moving_density_boundary_flux_a(entry, &neg_coeff_u, b)
                         + moving_density_boundary_flux(
                             u,
@@ -946,7 +881,8 @@ impl SurvivalMarginalSlopeFamily {
                             &neg_dc_da,
                             b,
                             FluxVelocity::PartialIft,
-                        );
+                        )
+                        + self_flux_xy(za_r, zu_r, za_l, zu_l);
                 }
             }
         }
@@ -961,7 +897,6 @@ impl SurvivalMarginalSlopeFamily {
                 a_uv[[v, u]] = value;
             }
         }
-
         let z_obs = self.observed_score_projection(row);
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;

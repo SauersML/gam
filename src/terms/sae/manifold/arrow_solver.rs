@@ -304,3 +304,89 @@ pub(crate) struct SaeRowJets {
 pub(crate) fn sae_dot(a: &[f64], b: &[f64]) -> f64 {
     a.iter().zip(b.iter()).map(|(&x, &y)| x * y).sum()
 }
+
+/// Euclidean inner product `⟨a, b⟩` over the concatenated `(t, β)` blocks of two
+/// arrow vectors. Used by the #1418 `B`-preconditioned CG inner solve.
+pub(crate) fn sae_inner(a: &SaeArrowVector, b: &SaeArrowVector) -> f64 {
+    sae_dot(a.t.as_slice().unwrap_or(&[]), b.t.as_slice().unwrap_or(&[]))
+        + sae_dot(a.beta.as_slice().unwrap_or(&[]), b.beta.as_slice().unwrap_or(&[]))
+}
+
+/// Euclidean norm `‖a‖` over the concatenated `(t, β)` blocks of an arrow vector.
+pub(crate) fn sae_norm(a: &SaeArrowVector) -> f64 {
+    sae_inner(a, a).max(0.0).sqrt()
+}
+
+/// #1418: solve `A x = rhs` by **`B`-preconditioned conjugate gradients**, where
+/// `apply_a(v) = A v` is the exact stationarity-Jacobian matvec and the
+/// `solver` (the assembled `B` factorization) supplies the SPD preconditioner
+/// `B⁻¹`. The IFT step `θ̂_ρ = −A⁻¹ g_ρ` must invert the EXACT `A`, not the
+/// surrogate `B`; the earlier truncated Neumann series `Σ_m (−B⁻¹ΔC)^m B⁻¹ rhs`
+/// equals `A⁻¹ rhs` only when `ρ(B⁻¹ΔC) < 1`, and DIVERGED for large
+/// `ΔC = ⟨r, ∂²f⟩`. PCG converges for any spectral radius in ≤ `dim` steps — one
+/// `A` matvec and one `B⁻¹` solve per step, no second factorization. On
+/// non-positive curvature `pᵀ A p ≤ 0` (the high-residual `A` can be indefinite
+/// away from a strict minimum) it stops at the last finite iterate.
+pub(crate) fn solve_b_preconditioned_cg<F>(
+    solver: &DeflatedArrowSolver<'_>,
+    rhs: &SaeArrowVector,
+    apply_a: F,
+) -> Result<SaeArrowVector, String>
+where
+    F: Fn(&SaeArrowVector) -> Result<SaeArrowVector, String>,
+{
+    // x_0 = B⁻¹ rhs (the surrogate step; CG corrects it onto A⁻¹ rhs).
+    let mut x = solver
+        .solve(rhs.t.view(), rhs.beta.view())
+        .map_err(|err| format!("solve_b_preconditioned_cg: B inverse: {err}"))?;
+    // r_0 = rhs − A x_0; z_0 = B⁻¹ r_0; p_0 = z_0.
+    let ax = apply_a(&x)?;
+    let mut r = SaeArrowVector {
+        t: &rhs.t - &ax.t,
+        beta: &rhs.beta - &ax.beta,
+    };
+    let mut z = solver
+        .solve(r.t.view(), r.beta.view())
+        .map_err(|err| format!("solve_b_preconditioned_cg: B preconditioner: {err}"))?;
+    let mut p = z.clone();
+    let mut rz = sae_inner(&r, &z);
+
+    let rhs_norm = sae_norm(rhs).max(1.0);
+    let max_iters = (x.t.len() + x.beta.len()).clamp(8, 256);
+    let rel_tol = 1.0e-10;
+    for _ in 0..max_iters {
+        if !rz.is_finite() || rz <= 0.0 {
+            break; // preconditioned residual exhausted / degenerate.
+        }
+        let ap = apply_a(&p)?;
+        let p_ap = sae_inner(&p, &ap);
+        if !p_ap.is_finite() || p_ap <= 0.0 {
+            break; // non-positive curvature: keep the finite iterate.
+        }
+        let alpha = rz / p_ap;
+        for idx in 0..x.t.len() {
+            x.t[idx] += alpha * p.t[idx];
+            r.t[idx] -= alpha * ap.t[idx];
+        }
+        for idx in 0..x.beta.len() {
+            x.beta[idx] += alpha * p.beta[idx];
+            r.beta[idx] -= alpha * ap.beta[idx];
+        }
+        if sae_norm(&r) <= rel_tol * rhs_norm {
+            break;
+        }
+        z = solver
+            .solve(r.t.view(), r.beta.view())
+            .map_err(|err| format!("solve_b_preconditioned_cg: B preconditioner: {err}"))?;
+        let rz_next = sae_inner(&r, &z);
+        let beta = rz_next / rz;
+        for idx in 0..p.t.len() {
+            p.t[idx] = z.t[idx] + beta * p.t[idx];
+        }
+        for idx in 0..p.beta.len() {
+            p.beta[idx] = z.beta[idx] + beta * p.beta[idx];
+        }
+        rz = rz_next;
+    }
+    Ok(x)
+}

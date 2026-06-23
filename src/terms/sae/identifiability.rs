@@ -3035,110 +3035,66 @@ pub fn dictionary_report_with_transport_ladders(
     Ok(report)
 }
 
-/// Row count at or above which [`atom_transport_ladder_reports`] fans its
-/// independent per-atom ladder fits out over rayon (#1017 Phase 0). Below this
-/// the sequential walk wins (the per-atom transport solve dwarfs thread
-/// dispatch only once a few heavy candidates are in flight).
-pub(crate) const TRANSPORT_LADDER_PARALLEL_MIN: usize = 2;
-
-/// Fit one atom's #1096 transport ladder. Pure in `(model, input)` (reads the
-/// shared atom by index, builds local canonical coordinates, runs the pure
-/// [`transport_ladder`] solve), so distinct inputs are independent and the call
-/// is safe to run concurrently — no shared mutable state, no cross-input order
-/// dependency. Factored out of [`atom_transport_ladder_reports`] so the
-/// sequential and parallel dispatch share ONE body and are bit-identical.
-fn atom_transport_ladder_one(
-    model: &FittedSaeManifold,
-    input: &AtomTransportLadderInput,
-) -> Result<AtomTransportLadderReport, String> {
-    let atom = model.atoms.get(input.atom_index).ok_or_else(|| {
-        format!(
-            "atom transport ladder index {} out of range for {} fitted atoms",
-            input.atom_index,
-            model.atoms.len()
-        )
-    })?;
-    let depth = input.layers.len();
-    if depth < 2 {
-        return Err(format!(
-            "atom transport ladder for atom {} ('{}') needs at least two layers, got {depth}",
-            input.atom_index, atom.name
-        ));
-    }
-    if input.coords.len() != depth || input.topologies.len() != depth {
-        return Err(format!(
-            "atom transport ladder for atom {} ('{}') has {} layers, {} coordinate blocks, {} topologies",
-            input.atom_index,
-            atom.name,
-            depth,
-            input.coords.len(),
-            input.topologies.len()
-        ));
-    }
-
-    let mut coords = Vec::with_capacity(depth);
-    let mut topologies = Vec::with_capacity(depth);
-    for (layer_pos, (coord, topology)) in input.coords.iter().zip(input.topologies.iter()).enumerate()
-    {
-        coords.push(canonical_coords_for_transport(
-            coord,
-            topology,
-            input.atom_index,
-            &atom.name,
-            input.layers[layer_pos],
-        )?);
-        topologies.push(ChartTopology::from(topology));
-    }
-
-    let report = transport_ladder(&input.layers, &coords, &topologies).map_err(|e| {
-        format!(
-            "atom transport ladder for atom {} ('{}') failed: {e}",
-            input.atom_index, atom.name
-        )
-    })?;
-    Ok(AtomTransportLadderReport {
-        atom_index: input.atom_index,
-        atom_name: atom.name.clone(),
-        report,
-    })
-}
-
 /// Fit #1096 transport ladders for the supplied atom/layer coordinate blocks.
-///
-/// The per-atom ladder fits are INDEPENDENT (each reads the shared model by
-/// index and runs a pure transport solve on its own layer coordinates), so this
-/// fans them across rayon for a multi-candidate speedup (#1017 Phase 0) while
-/// staying bit-identical to the sequential walk: results are collected in INPUT
-/// ORDER, and on any failure the LOWEST-index error is returned — exactly the
-/// error the sequential `?`-walk would have surfaced first. A nested-rayon guard
-/// keeps a caller that is already inside a worker on the sequential body, so the
-/// inner per-atom solves' own parallelism is not oversubscribed.
 pub fn atom_transport_ladder_reports(
     model: &FittedSaeManifold,
     ladders: &[AtomTransportLadderInput],
 ) -> Result<Vec<AtomTransportLadderReport>, String> {
-    if ladders.len() >= TRANSPORT_LADDER_PARALLEL_MIN && rayon::current_thread_index().is_none() {
-        use rayon::prelude::*;
-        // Map every input to its Result IN ORDER (no short-circuit), so the
-        // success Vec matches the sequential order exactly and the first-by-index
-        // error is recoverable deterministically — rayon's own Result-collect
-        // would return a nondeterministic error on failure.
-        let results: Vec<Result<AtomTransportLadderReport, String>> = ladders
-            .par_iter()
-            .map(|input| atom_transport_ladder_one(model, input))
-            .collect();
-        let mut out = Vec::with_capacity(results.len());
-        for result in results {
-            out.push(result?);
+    let mut out = Vec::with_capacity(ladders.len());
+    for input in ladders {
+        let atom = model.atoms.get(input.atom_index).ok_or_else(|| {
+            format!(
+                "atom transport ladder index {} out of range for {} fitted atoms",
+                input.atom_index,
+                model.atoms.len()
+            )
+        })?;
+        let depth = input.layers.len();
+        if depth < 2 {
+            return Err(format!(
+                "atom transport ladder for atom {} ('{}') needs at least two layers, got {depth}",
+                input.atom_index, atom.name
+            ));
         }
-        Ok(out)
-    } else {
-        let mut out = Vec::with_capacity(ladders.len());
-        for input in ladders {
-            out.push(atom_transport_ladder_one(model, input)?);
+        if input.coords.len() != depth || input.topologies.len() != depth {
+            return Err(format!(
+                "atom transport ladder for atom {} ('{}') has {} layers, {} coordinate blocks, {} topologies",
+                input.atom_index,
+                atom.name,
+                depth,
+                input.coords.len(),
+                input.topologies.len()
+            ));
         }
-        Ok(out)
+
+        let mut coords = Vec::with_capacity(depth);
+        let mut topologies = Vec::with_capacity(depth);
+        for (layer_pos, (coord, topology)) in
+            input.coords.iter().zip(input.topologies.iter()).enumerate()
+        {
+            coords.push(canonical_coords_for_transport(
+                coord,
+                topology,
+                input.atom_index,
+                &atom.name,
+                input.layers[layer_pos],
+            )?);
+            topologies.push(ChartTopology::from(topology));
+        }
+
+        let report = transport_ladder(&input.layers, &coords, &topologies).map_err(|e| {
+            format!(
+                "atom transport ladder for atom {} ('{}') failed: {e}",
+                input.atom_index, atom.name
+            )
+        })?;
+        out.push(AtomTransportLadderReport {
+            atom_index: input.atom_index,
+            atom_name: atom.name.clone(),
+            report,
+        });
     }
+    Ok(out)
 }
 
 fn canonical_coords_for_transport(

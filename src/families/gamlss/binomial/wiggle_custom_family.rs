@@ -5,6 +5,13 @@
 use super::*;
 
 impl CustomFamily for BinomialLocationScaleWiggleFamily {
+    // Binomial fits have a genuine separation regime; keep the self-limiting
+    // Jeffreys/Firth curvature active. The trait default flipped to OFF in
+    // gam#1395 (flat-prior exact-Newton objective); opt back in here.
+    fn joint_jeffreys_term_required(&self) -> bool {
+        true
+    }
+
     /// The Binomial location-scale-wiggle joint Hessian depends on β because
     /// it involves the nonlinear link function evaluated at the combined
     /// predictor, which changes with all three coefficient blocks.

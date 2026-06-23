@@ -194,19 +194,11 @@ fn gam_factor_smooth_sz_matches_mgcv() {
           sum_dev <- sum_dev + as.numeric(tt[, 1])
         }
         emit("constraint_max", max(abs(sum_dev)))
-        emit("mgcv_edf", sum(m$edf))
-        emit("mgcv_sp", as.numeric(m$sp))
         "#,
     );
     let mgcv_fitted = r.vector("fitted");
     let mgcv_term = r.vector("term");
     let mgcv_constraint_max = r.scalar("constraint_max");
-    eprintln!(
-        "[#1074-sz-mgcv] mgcv_edf={:?} mgcv_sp={:?} gam_edf={gam_edf:.3} gam_log_lambdas={:?}",
-        r.vector("mgcv_edf"),
-        r.vector("mgcv_sp"),
-        fit.fit.log_lambdas.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-    );
     assert_eq!(mgcv_fitted.len(), n, "mgcv fitted length mismatch");
     assert_eq!(mgcv_term.len(), n, "mgcv term length mismatch");
 

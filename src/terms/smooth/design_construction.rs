@@ -4484,27 +4484,10 @@ fn relax_smoothing_rho_prior(
     // stalls it at λ ≈ 0.11 — the null space is kept, the EDF rails up, and
     // held-out prediction collapses (#1392). The RANGE-space (`Primary`) bending
     // coordinate's smoothing selection must NOT be touched, so this select-out
-    // bias is gated to `DoublePenaltyNullspace` coordinates only.
-    //
-    // WELL-DETERMINED CONCURVITY (#1476). This select-out PC prior is applied to
-    // the `DoublePenaltyNullspace` coordinate in BOTH determinacy regimes — the
-    // well-determined regime too, NOT only `p > n`. Leaving the well-determined
-    // Gaussian null-space coordinate fully `Flat` is the concurvity collapse:
-    // under two correlated smooths `s(x1)+s(x2)` (corr ≈ 0.9) the two smooths'
-    // null-space (linear) directions are near-collinear, so the joint REML
-    // objective is essentially FLAT along the "transfer the shared linear signal
-    // between the two smooths" ridge. With no prior curvature on that coordinate
-    // REML cannot certify an interior stationary point and one smooth's
-    // `λ_nullspace` rails to the ρ bound (≈1e13), annihilating that smooth's
-    // genuine linear signal to `EDF ≈ 0` while the other absorbs it. The PC
-    // wall's strictly-positive curvature `(θ/4) e^{-ρ/2}` pins the coordinate at
-    // a FINITE stationary ρ, RETAINING a signal-bearing collinear null space.
-    // This does NOT re-introduce the #1266/#1271 inflation: the PC pull is in the
-    // SAME (+, shrink-out) direction REML already moves a genuinely-unsupported
-    // null space, so an irrelevant covariate still selects out (`EDF < 1`); the
-    // wall only stops the runaway collapse of a SUPPORTED one. The RANGE-space
-    // (`Primary`) bending coordinate is untouched (stays `Flat` when
-    // well-determined), so ordinary single-smooth recovery is unchanged.
+    // bias is gated to `DoublePenaltyNullspace` coordinates only and is applied
+    // ONLY in the under-determined regime — in the well-determined regime the
+    // relaxable coordinates stay byte-flat (`Flat`) so a clean `n > p` fit is
+    // unchanged (no regression on ordinary smooth recovery).
     //
     // The strong select-out PC prior is applied to the `DoublePenaltyNullspace`
     // coordinate ONLY in the UNDER-DETERMINED regime, where the outer score is
@@ -4605,18 +4588,6 @@ fn relax_smoothing_rho_prior(
                 } else {
                     nullspace_degeneracy_prior.clone()
                 }
-<<<<<<< Updated upstream
-=======
-            } else if is_nullspace {
-                // Gaussian-identity null-space selection ridge: wall it OUT with
-                // the penalized-complexity select-out prior in BOTH determinacy
-                // regimes (#1392 under-determined wine `p > n`, AND #1476
-                // well-determined concurvity). Leaving it `Flat` when
-                // well-determined lets one correlated smooth's `λ_nullspace` rail
-                // to ≈1e13 and collapse to `EDF ≈ 0` (#1476); the PC wall's
-                // strictly-positive curvature pins it at a finite stationary ρ.
-                nullspace_select_prior.clone()
->>>>>>> Stashed changes
             } else {
                 relaxed_prior.clone()
             }

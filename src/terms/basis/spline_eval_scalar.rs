@@ -1162,12 +1162,25 @@ pub(crate) fn evaluate_bspline_derivative_recurrence_into(
     // matching the value basis so every higher-order derivative agrees with a
     // finite difference of the value (gam#1348). On an *open* knot vector the value
     // is constant outside the modeling interval, so every derivative order is zero
-    // there; on a *clamped* vector the value extends linearly, so the order-k
-    // derivative takes its (possibly nonzero) boundary value, obtained by clamping
-    // the eval point to the interval. No periodic wrap for an open/clamped basis:
-    // wrapping is only correct for a cyclic basis (whose evaluator pre-wraps its
-    // input) and corrupted the boundary spans here.
-    if depth == 0 && open_knot_derivative_exterior_is_zero(x, knot_vector, degree) {
+    // there; on a *clamped* vector the value extends LINEARLY, so the exterior
+    // first derivative is the constant boundary slope (obtained by clamping the
+    // eval point to the interval) while every order ≥ 2 is identically zero — an
+    // affine extension has no curvature. The earlier code clamped for all orders
+    // and so returned the boundary's nonzero `B^{(k)}` for k ≥ 2 outside the
+    // domain, disagreeing with both the dense builder
+    // (`apply_dense_bspline_extrapolation`) and a finite difference of the value.
+    // No periodic wrap for an open/clamped basis: wrapping is only correct for a
+    // cyclic basis (whose evaluator pre-wraps its input) and corrupted the
+    // boundary spans here.
+    if depth == 0
+        && (open_knot_derivative_exterior_is_zero(x, knot_vector, degree)
+            || linear_extension_higher_derivative_is_zero(
+                x,
+                knot_vector,
+                degree,
+                derivative_order,
+            ))
+    {
         out.fill(0.0);
         return Ok(());
     }

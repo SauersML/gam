@@ -2724,6 +2724,47 @@ impl SaeManifoldTerm {
         Ok(last_loss)
     }
 
+    /// #1407 equivalence hook: compute the fixed-decoder latent step BOTH ways
+    /// — through the LEAN fixed-decoder assembler (only per-row `htt`/`gt`, the
+    /// β decoder tier elided) and through the FULL joint assembler (which also
+    /// materialises the entire `K`-dependent decoder β tier that the
+    /// fixed-decoder step never reads) — at the term's current state, and return
+    /// `(lean_step, full_step)`.
+    ///
+    /// The fixed-decoder step reads ONLY `rows[*].htt`/`gt` + `row_offsets`
+    /// (see [`Self::fixed_decoder_step_from_rows`]), and the lean assembler
+    /// builds those per-row blocks identically to the full path — it merely
+    /// skips the wasted β-tier work. So the two returned vectors MUST be
+    /// bit-identical. A regression that lets the lean and full per-row blocks
+    /// diverge (e.g. a β-tier coupling silently leaking into `htt`/`gt`) would
+    /// break that equality. This is a test-only seam over the exact production
+    /// step logic — it adds no new math.
+    pub fn fixed_decoder_step_lean_vs_full_1407(
+        &mut self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        analytic_penalties: Option<&AnalyticPenaltyRegistry>,
+        ridge_ext_coord: f64,
+    ) -> Result<(Array1<f64>, Array1<f64>), String> {
+        // Lean path: the #1407 fixed-decoder assembler (β tier elided).
+        self.fixed_decoder_assembly = true;
+        let lean_sys = self.assemble_arrow_schur(target, rho, analytic_penalties);
+        self.fixed_decoder_assembly = false;
+        let lean_sys = lean_sys.map_err(|err| {
+            format!("SaeManifoldTerm::fixed_decoder_step_lean_vs_full_1407: lean assemble: {err}")
+        })?;
+        let lean_step = Self::fixed_decoder_step_from_rows(&lean_sys, ridge_ext_coord)?;
+
+        // Full path: the historical joint assembler (β tier materialised, then
+        // discarded by the fixed-decoder step which reads only htt/gt).
+        let full_sys = self.assemble_arrow_schur(target, rho, analytic_penalties).map_err(|err| {
+            format!("SaeManifoldTerm::fixed_decoder_step_lean_vs_full_1407: full assemble: {err}")
+        })?;
+        let full_step = Self::fixed_decoder_step_from_rows(&full_sys, ridge_ext_coord)?;
+
+        Ok((lean_step, full_step))
+    }
+
     /// Rank-revealing adaptive basis depth for rank-deficient decoder designs
     /// (#1117 root-cause fix; supersedes the prior data-null projector deflation
     /// + post-fit range projection and the #1051 LM ridge for this case).

@@ -8939,19 +8939,31 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
-    /// #1418: solve `A x = rhs` for the EXACT stationarity Jacobian
-    /// `A = ∇²_θθ L`, using the assembled `B` factorization (`solver`) as
-    /// preconditioner and the matrix-free correction `ΔC = A − B`
-    /// ([`Self::apply_exact_hessian_minus_b`]).
-    ///
-    /// Since `A = B + ΔC`, `A x = rhs ⟺ x = B⁻¹ rhs − B⁻¹(ΔC x)`. The
-    /// fixed-point `x_{m+1} = x_0 − B⁻¹(ΔC x_m)`, `x_0 = B⁻¹ rhs`, is the Neumann
-    /// series `Σ_m (−B⁻¹ΔC)^m x_0`; it converges because `B` is the
-    /// stability-conditioned approximation of `A` (`‖B⁻¹ΔC‖ < 1` near the
-    /// optimum). Each step costs one matrix-free `ΔC` matvec and one `B⁻¹` solve
-    /// — no second factorization. Exact on both the isotropic and the
-    /// whitened-metric paths (`apply_exact_hessian_minus_b` contracts the
-    /// metric-applied residual against the raw second jets in either case).
+    /// #1418: matrix-free apply of the EXACT stationarity Jacobian `A = ∇²_θθ L`:
+    /// `A v = B v + ΔC v`, the assembled arrow Hessian apply
+    /// ([`apply_cached_arrow_hessian`]) plus the matrix-free dropped-curvature
+    /// correction `ΔC = A − B` ([`Self::apply_exact_hessian_minus_b`]).
+    fn apply_exact_hessian(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        v: &SaeArrowVector,
+    ) -> Result<SaeArrowVector, String> {
+        let b_v = apply_cached_arrow_hessian(cache, v.t.view(), v.beta.view())?;
+        let dc_v = self.apply_exact_hessian_minus_b(rho, target, cache, v)?;
+        Ok(SaeArrowVector {
+            t: &b_v.t + &dc_v.t,
+            beta: &b_v.beta + &dc_v.beta,
+        })
+    }
+
+    /// #1418: solve `A x = rhs` for the EXACT stationarity Jacobian `A = ∇²_θθ L`
+    /// via `B`-preconditioned CG ([`solve_b_preconditioned_cg`]) with the
+    /// matrix-free `A v = B v + ΔC v` apply ([`Self::apply_exact_hessian`]). The
+    /// IFT step `θ̂_ρ = −A⁻¹ g_ρ` must invert the EXACT `A`, not the surrogate `B`;
+    /// CG converges for any `ρ(B⁻¹ΔC)`, where the earlier Neumann series diverged
+    /// once the dropped curvature `ΔC = ⟨r, ∂²f⟩` grew (large unmodellable residual).
     fn solve_exact_stationarity(
         &self,
         rho: &SaeManifoldRho,
@@ -8960,43 +8972,9 @@ impl SaeManifoldTerm {
         solver: &DeflatedArrowSolver<'_>,
         rhs: &SaeArrowVector,
     ) -> Result<SaeArrowVector, String> {
-        let x0 = solver
-            .solve(rhs.t.view(), rhs.beta.view())
-            .map_err(|err| format!("solve_exact_stationarity: B inverse: {err}"))?;
-        let mut x = SaeArrowVector {
-            t: x0.t.clone(),
-            beta: x0.beta.clone(),
-        };
-        // Fixed-point Neumann iteration with B⁻¹ preconditioner.
-        const MAX_ITERS: usize = 24;
-        const REL_TOL: f64 = 1.0e-10;
-        let x0_norm =
-            x0.t.iter()
-                .chain(x0.beta.iter())
-                .fold(0.0_f64, |m, &v| m.max(v.abs()))
-                .max(1.0);
-        let max_iters = MAX_ITERS;
-        for _ in 0..max_iters {
-            let dc = self.apply_exact_hessian_minus_b(rho, target, cache, &x)?;
-            let corr = solver
-                .solve(dc.t.view(), dc.beta.view())
-                .map_err(|err| format!("solve_exact_stationarity: B preconditioner: {err}"))?;
-            let mut max_delta = 0.0_f64;
-            for idx in 0..x.t.len() {
-                let next = x0.t[idx] - corr.t[idx];
-                max_delta = max_delta.max((next - x.t[idx]).abs());
-                x.t[idx] = next;
-            }
-            for idx in 0..x.beta.len() {
-                let next = x0.beta[idx] - corr.beta[idx];
-                max_delta = max_delta.max((next - x.beta[idx]).abs());
-                x.beta[idx] = next;
-            }
-            if max_delta <= REL_TOL * x0_norm {
-                break;
-            }
-        }
-        Ok(x)
+        solve_b_preconditioned_cg(solver, rhs, |v| {
+            self.apply_exact_hessian(rho, target, cache, v)
+        })
     }
 
     /// Analytic SAE REML outer-ρ gradient components at the already converged

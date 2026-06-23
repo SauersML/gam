@@ -580,7 +580,6 @@ pub(crate) fn candidate_improves_best(candidate: &OuterResult, best: Option<&Out
     }
 }
 
-<<<<<<< Updated upstream
 /// Relative LAML/REML tie band within which two *converged* outer optima count
 /// as statistically indistinguishable. The marginal likelihood is a smooth
 /// function of ρ with a flat valley near its optimum; a gap this small means the
@@ -702,8 +701,6 @@ pub(crate) fn candidate_improves_best_parsimonious(
     }
 }
 
-=======
->>>>>>> Stashed changes
 #[inline]
 pub(crate) fn should_stop_expensive_multistart_after_best(
     best: Option<&OuterResult>,

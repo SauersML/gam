@@ -451,6 +451,47 @@ pub(crate) fn open_knot_derivative_exterior_is_zero(
     (x < left || x > right) && !has_clamped_bspline_boundaries(knotview, degree)
 }
 
+/// True when the *linear* (clamped-knot) exterior extension forces the order-`k`
+/// derivative to vanish outside the modeling interval.
+///
+/// On a clamped knot vector the value basis is extended past the boundary as the
+/// affine function `B(x_b) + (x − x_b)·B'(x_b)` (see
+/// [`apply_dense_bspline_extrapolation`] and the value clamp in
+/// `clamp_eval_point_to_modeling_interval`). An affine function has a constant
+/// first derivative (the boundary slope) and **identically zero** second and
+/// higher derivatives, so for `derivative_order ≥ 2` the exterior derivative is
+/// zero — *not* the boundary's own `B^{(k)}(x_b)`, which is what naively
+/// clamping the eval point and evaluating the order-`k` recurrence returns.
+///
+/// This is the clamped-knot counterpart of
+/// [`open_knot_derivative_exterior_is_zero`] (which zeroes *every* order for the
+/// *constant* open-knot extension). The dense builder already enforces the
+/// affine-exterior contract in [`apply_dense_bspline_extrapolation`]; this
+/// predicate lets the per-point scalar/recurrence evaluators agree with it so a
+/// higher-derivative design equals a finite difference of the value in the
+/// boundary spans.
+#[inline]
+pub(crate) fn linear_extension_higher_derivative_is_zero(
+    x: f64,
+    knotview: ArrayView1<f64>,
+    degree: usize,
+    derivative_order: usize,
+) -> bool {
+    if derivative_order < 2 {
+        return false;
+    }
+    let num_basis = knotview.len().saturating_sub(degree + 1);
+    if num_basis == 0 {
+        return false;
+    }
+    let left = knotview[degree];
+    let right = knotview[num_basis];
+    if !(left.is_finite() && right.is_finite() && left < right) {
+        return false;
+    }
+    x < left || x > right
+}
+
 #[inline]
 pub(crate) fn one_sided_derivative_eval_point(
     x: f64,
@@ -663,7 +704,15 @@ pub(crate) fn evaluate_splines_derivative_sparse_intowith_lower(
         values.fill(0.0);
         return 0;
     }
-    let x_eval = one_sided_derivative_eval_point(x, knotview, degree);
+    // Clamped knots extend the value linearly past the boundary, so the exterior
+    // first derivative is the constant boundary slope obtained by evaluating at
+    // the clamped endpoint — mirror the value clamp (and the scalar derivative
+    // path) here so the sparse derivative agrees with a finite difference of the
+    // value in the boundary spans. Without the clamp a far-exterior point lands
+    // outside the degree-(d−1) support and the recurrence reads zero, breaking
+    // the boundary-slope contract.
+    let x_clamped = clamp_eval_point_to_modeling_interval(x, knotview, degree);
+    let x_eval = one_sided_derivative_eval_point(x_clamped, knotview, degree);
     internal::evaluate_splines_at_point_full_support_into(
         x_eval,
         degree - 1,

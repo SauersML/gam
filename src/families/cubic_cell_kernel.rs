@@ -1964,78 +1964,6 @@ pub fn cell_density_boundary_integrand(cell: DenestedCubicCell, g: &[f64], z: f6
     poly_eval_at(g, z) * (-cell.q(z)).exp() * INV_TWO_PI
 }
 
-/// Pointwise value of the cell THIRD-derivative integrand
-/// `(∂³/∂r∂s∂t) exp(-q(z))/2π` at a single `z`, evaluated from the SAME
-/// `(r, s, t, rs, rt, st, rst)` coefficient polynomials the moment reduction
-/// [`cell_third_derivative_from_moments`] integrates:
-///
-/// ```text
-///   F_rst(z) = ( c_rst(z)
-///                - η(z)·( c_rs(z)·c_t(z) + c_rt(z)·c_s(z) + c_st(z)·c_r(z) )
-///                + (η(z)² − 1)·c_r(z)·c_s(z)·c_t(z) ) · exp(-q(z)) · 1/2π ,
-/// ```
-///
-/// with `c_•(z) = Σ_k coeff_•[k]·zᵏ`, `η(z)` the cell cubic, and
-/// `q(z) = ½(z² + η(z)²)`. This is the integrand whose `[cell.left,
-/// cell.right]` integral the from-moments form returns (compare the
-/// `third_term − eta_second_term + cubic_coeff_term` assembly there) — needed
-/// for the Leibniz boundary term when a cell edge (a link-knot crossing
-/// `z=(τ-a)/b`) moves with the intercept `a` or a parameter direction.
-///
-/// CRITICAL (gam#1454): unlike the SECOND-derivative integrand `F_rs`, this
-/// third-derivative integrand does NOT cancel across an interior C²-link knot
-/// crossing. The second-derivative coefficient slices carry at most the link
-/// spline's second `z`-derivative (`η''`), which a C² spline keeps continuous,
-/// so `F_rs^L(z*) = F_rs^R(z*)` and the shared-edge flux telescopes to zero.
-/// The third-derivative slices carry the link spline's THIRD coefficient
-/// (`c_rst ∝ 6·α₃`, from `denested_cell_third_partials`), which JUMPS at the
-/// C² knot. Hence `F_rst^L(z*) ≠ F_rst^R(z*)` in general and the shared-edge
-/// Leibniz flux `velocity·(F_rst^L − F_rst^R)` must be added to the
-/// fixed-domain moment reduction for any third-order derivative that moves a
-/// crossing edge (the intercept-Hessian `a`-axis and the directional tower).
-///
-/// Coefficient sign convention matches the simpson reference: pass the ACTUAL
-/// derivative-coefficient polynomials `∂c/∂r` etc. (not the negated forms the
-/// survival/probit moment path consumes), and the cell's UN-negated `η`.
-///
-/// This is `#[cfg(test)]`: it backs the C²-telescoping regression below and has
-/// no production consumer. The implicit-intercept third-order tower
-/// (`row_primary_third_contracted_recompute*`) does NOT add a third-order
-/// Leibniz flux because every boundary term in the Leibniz expansion of a
-/// THIRD derivative evaluates an integrand of order ≤ 2 at the moving edge, and
-/// those (`F`, `F_a`, `F_dir`, `F_aa`, `F_a,dir`, `F_dir,dir`) are all
-/// continuous across a C²-link knot — see the regression for the proof.
-#[cfg(test)]
-mod cell_boundary_flux_tests {
-    use super::*;
-
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn cell_third_derivative_boundary_integrand(
-        cell: DenestedCubicCell,
-    first_coefficients_r: &[f64],
-    first_coefficients_s: &[f64],
-    first_coefficients_t: &[f64],
-    second_coefficients_rs: &[f64],
-    second_coefficients_rt: &[f64],
-    second_coefficients_st: &[f64],
-    third_coefficients_rst: &[f64],
-    z: f64,
-) -> f64 {
-    let eta = cell.eta(z);
-    let c_r = poly_eval_at(first_coefficients_r, z);
-    let c_s = poly_eval_at(first_coefficients_s, z);
-    let c_t = poly_eval_at(first_coefficients_t, z);
-    let c_rs = poly_eval_at(second_coefficients_rs, z);
-    let c_rt = poly_eval_at(second_coefficients_rt, z);
-    let c_st = poly_eval_at(second_coefficients_st, z);
-    let c_rst = poly_eval_at(third_coefficients_rst, z);
-    let amplitude = c_rst - eta * (c_rs * c_t + c_rt * c_s + c_st * c_r)
-        + (eta * eta - 1.0) * c_r * c_s * c_t;
-    amplitude * (-cell.q(z)).exp() * INV_TWO_PI
-    }
-}
-
 /// Horner evaluation of `Σ_k coefficients[k]·zᵏ`.
 #[inline]
 fn poly_eval_at(coefficients: &[f64], z: f64) -> f64 {
@@ -4144,6 +4072,38 @@ pub fn evaluate_cell_moments_with_scratch<'a>(
 mod tests {
     use super::*;
     use crate::probability::normal_pdf;
+
+    /// Pointwise value of the cell THIRD-derivative integrand
+    /// `(d3/dr ds dt) exp(-q(z))/2pi` at a single `z`, evaluated from the SAME
+    /// `(r, s, t, rs, rt, st, rst)` coefficient polynomials the moment reduction
+    /// `cell_third_derivative_from_moments` integrates. Unlike the
+    /// second-derivative integrand this one does NOT cancel across an interior
+    /// C2-link knot crossing (the `c_rst` third coefficient jumps), so it backs
+    /// the C2-telescoping regression below. Test-only; no production consumer.
+    #[inline]
+    fn cell_third_derivative_boundary_integrand(
+        cell: DenestedCubicCell,
+        first_coefficients_r: &[f64],
+        first_coefficients_s: &[f64],
+        first_coefficients_t: &[f64],
+        second_coefficients_rs: &[f64],
+        second_coefficients_rt: &[f64],
+        second_coefficients_st: &[f64],
+        third_coefficients_rst: &[f64],
+        z: f64,
+    ) -> f64 {
+        let eta = cell.eta(z);
+        let c_r = poly_eval_at(first_coefficients_r, z);
+        let c_s = poly_eval_at(first_coefficients_s, z);
+        let c_t = poly_eval_at(first_coefficients_t, z);
+        let c_rs = poly_eval_at(second_coefficients_rs, z);
+        let c_rt = poly_eval_at(second_coefficients_rt, z);
+        let c_st = poly_eval_at(second_coefficients_st, z);
+        let c_rst = poly_eval_at(third_coefficients_rst, z);
+        let amplitude = c_rst - eta * (c_rs * c_t + c_rt * c_s + c_st * c_r)
+            + (eta * eta - 1.0) * c_r * c_s * c_t;
+        amplitude * (-cell.q(z)).exp() * INV_TWO_PI
+    }
 
     #[inline]
     pub(super) fn polynomial_value(coefficients: &[f64], z: f64) -> f64 {
@@ -7768,11 +7728,11 @@ mod tests {
             c2: right_eta[2],
             c3: right_eta[3],
         };
-        let f_left = cell_boundary_flux_tests::cell_third_derivative_boundary_integrand(
+        let f_left = cell_third_derivative_boundary_integrand(
             left0, &common_r, &common_s, &common_t, &common_rs, &common_rt, &common_st, &left_rst,
             edge0,
         );
-        let f_right = cell_boundary_flux_tests::cell_third_derivative_boundary_integrand(
+        let f_right = cell_third_derivative_boundary_integrand(
             right0, &common_r, &common_s, &common_t, &common_rs, &common_rt, &common_st,
             &right_rst, edge0,
         );
