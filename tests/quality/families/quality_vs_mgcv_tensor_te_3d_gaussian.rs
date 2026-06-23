@@ -129,6 +129,28 @@ fn gam_te_3d_recovers_nonadditive_surface() {
         .expect("rebuild 3-D tensor design at training points");
     let gam_fitted: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
 
+    // [#1074 DIAGNOSTIC] additive-vs-tensor: does gam recover the additive truth
+    // better with an additive model than with te()? Isolates te()-construction
+    // (tensor interaction handling) from the marginal basis quality.
+    for diag_formula in [
+        "y ~ s(x1, k=5) + s(x2, k=5) + s(x3, k=5)",
+        "y ~ te(x1, x2, x3, k=8)",
+    ] {
+        if let Ok(FitResult::Standard(df)) = fit_from_formula(diag_formula, &ds, &cfg) {
+            let dd = build_term_collection_design(grid.view(), &df.resolvedspec).unwrap();
+            let dfit: Vec<f64> = dd.design.apply(&df.fit.beta).to_vec();
+            let drmse = {
+                let m = dfit.iter().zip(y.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f64>()
+                    / dfit.len() as f64;
+                m.sqrt()
+            };
+            eprintln!(
+                "[#1074-te3d-diag] {diag_formula} :: edf={:.3} converged={} rmse_vs_truth={:.5}",
+                df.fit.edf_total().unwrap_or(f64::NAN), df.fit.outer_converged, drmse,
+            );
+        }
+    }
+
     // ---- fit the SAME model with mgcv (the mature reference) --------------
     let r = run_r(
         &[
