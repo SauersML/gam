@@ -786,19 +786,26 @@ fn solve_block_orthogonal_rho(
                 condition_number: f64::INFINITY,
             });
         }
-        let hess_safe = if hess.abs() > 1.0e-10 {
-            hess
-        } else if hess >= 0.0 {
-            1.0e-10
+        // Newton step where the curvature is reliably positive; a unit
+        // gradient-descent direction where it is not (non-convex / near-flat
+        // region) so we never step ALONG negative curvature (which ascends).
+        // There is deliberately NO magic step clamp: the line search below
+        // globalizes and SKIPS any candidate ρ that is infeasible (e.g. λ =
+        // exp(ρ) overflows `validate_initial_lambda`), so an over-long Newton
+        // step is simply rejected rather than bounded by an arbitrary constant
+        // or crashing the solve. This is the root fix the old `.clamp(-2,2)`
+        // was masking: the clamp existed only to keep an over-long step from
+        // reaching `block_orthogonal_eval`, which errors on a non-finite λ.
+        let descent = grad.signum();
+        let step = if hess > 1.0e-10 {
+            grad / hess
         } else {
-            -1.0e-10
+            descent
         };
-        let step = (grad / hess_safe).clamp(-2.0, 2.0);
         let mut best_rho = rho;
         let mut best_eval = current;
         let mut best_phi =
             block_orthogonal_scale_objective(&best_eval, best_rho, scale_precision, rank).value;
-        let descent = grad.signum();
         for candidate_rho in [
             rho - step,
             rho - 0.5 * step,
@@ -806,7 +813,14 @@ fn solve_block_orthogonal_rho(
             rho - descent,
             rho - 0.25 * descent,
         ] {
-            let candidate_eval = block_orthogonal_eval(gram, rhs, penalty, candidate_rho)?;
+            // Skip infeasible candidates (λ overflow / ill-conditioned Gram)
+            // instead of failing the whole solve — the bounded gradient
+            // candidates (`rho - descent`, `rho - 0.25·descent`) remain valid,
+            // so a too-long Newton step degrades to gradient descent.
+            let Ok(candidate_eval) = block_orthogonal_eval(gram, rhs, penalty, candidate_rho)
+            else {
+                continue;
+            };
             let candidate_phi = block_orthogonal_scale_objective(
                 &candidate_eval,
                 candidate_rho,
