@@ -192,14 +192,22 @@ fn gam_te_3d_recovers_nonadditive_surface() {
         gam_rmse / signal_range
     );
 
-    // PRIMARY claim: gam reconstructs the non-additive truth. With a noise-free,
-    // smooth signal comfortably representable by k=5 cubic margins, a correct
-    // 3-D tensor interpolates the surface to well under 0.5% of its amplitude.
-    // The x1:x2:x3 cross term is unrepresentable additively, so clearing this
-    // bar means the Kronecker interaction blocks are constructed, penalized and
-    // centered correctly; any dropped margin / wrong Kronecker order would leave
-    // the cross term unrecovered and push this RMSE far past the bar.
-    let recovery_bar = 0.005 * signal_range;
+    // PRIMARY claim: gam reconstructs the non-additive truth to the k=5
+    // cubic-regression-margin representational limit. The surface is noise-free,
+    // but a k=5 `cr` margin (mgcv's te() default, which gam now matches — #1074)
+    // is NOT rich enough to interpolate a `sin(2πx)`-class surface exactly: its
+    // irreducible approximation error on this grid is ≈0.79% of the amplitude,
+    // and mgcv — the gold-standard reference with the identical k=5 cr margins —
+    // lands at the SAME 0.79% (gam_rmse == mgcv_rmse to 4 d.p., rel_l2≈6e-4).
+    // The original "well under 0.5%" bar was therefore below the basis floor and
+    // unreachable by ANY correct cr implementation at k=5 (mgcv included); the
+    // diagnostic above confirms k=8 margins drive RMSE to ~0 (the surface IS
+    // representable at higher k). We assert recovery to within 1.0% of the
+    // amplitude: comfortably above the verified k=5 cr floor yet still tight
+    // enough that a dropped margin / wrong Kronecker order (which leaves the
+    // x1:x2:x3 cross term unrecovered) blows past it. The match-or-beat-mgcv
+    // assertion below pins the accuracy claim to the mature reference itself.
+    let recovery_bar = 0.010 * signal_range;
     assert!(
         gam_rmse <= recovery_bar,
         "gam fails to recover the 3-D tensor surface: rmse={gam_rmse:.5} > bar={recovery_bar:.5} \
