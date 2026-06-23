@@ -887,16 +887,11 @@ impl SurvivalMarginalSlopeFamily {
             }
         }
 
-        let mut a_uv = Array2::<f64>::zeros((p, p));
-        for u in 0..p {
-            for v in u..p {
-                let value =
-                    (f_uv[[u, v]] - d_u[u] * a_u[v] - d_u[v] * a_u[u] - f_aa * a_u[u] * a_u[v])
-                        / d_check;
-                a_uv[[u, v]] = value;
-                a_uv[[v, u]] = value;
-            }
-        }
+        // #932 Item 1 (doc §B): lift the calibration intercept Hessian `a_uv`
+        // through `filtered_implicit_solve_scalar` over the calibration
+        // constraint `F(a, θ) = 0` (channels = the partials d_check/f_u/f_uv/
+        // f_aa/d_u assembled above), single-sourcing the hand IFT closed form.
+        let a_uv = self.lift_flex_intercept_hessian(p, d_check, &f_u, &f_uv, f_aa, &d_u, a)?;
         let z_obs = self.observed_score_projection(row);
         let u_obs = a + b * z_obs;
         let obs = self.observed_denested_cell_partials(row, a, b, beta_h, beta_w)?;
