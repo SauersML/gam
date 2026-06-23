@@ -2168,22 +2168,27 @@ pub fn build_smooth_basis(
                 policy,
             )
             .map_err(|e| e.to_string())?;
-            // A *univariate* (`d == 1`) thin-plate smooth `s(x, bs="tp")` is the
-            // routine 1-D smooth, not a spatial field: the generic spatial
-            // center heuristic (which scales with `n`) over-sizes it, producing
-            // a weakly-identified two-penalty ρ-surface whose REML optimum is
-            // row-order dependent (#1378). When no explicit center count / `k`
-            // is given, default the 1-D basis to mgcv's `k = 10` total
-            // dimension (kernel centers = total − linear-nullspace dim), capped
-            // by the heuristic so tiny-`n` plans are never inflated. An explicit
-            // `k`/`centers` still takes full effect via `parse_countwith_basis_alias`.
-            let default_centers = if cols.len() == 1 {
-                let nullspace_dim = crate::basis::duchon_nullspace_dimension(1, 1);
-                let target_centers =
-                    THIN_PLATE_1D_DEFAULT_BASIS_DIM.saturating_sub(nullspace_dim);
+            // A thin-plate smooth `s(.., bs="tp")` is sized to mgcv's default
+            // basis dimension `k = 10·3^(d-1)` (10 in 1-D, 30 in 2-D, 90 in 3-D),
+            // NOT to the generic spatial center heuristic (which scales with `n`).
+            // The n-scaling heuristic over-sizes a thin-plate field: in 1-D it
+            // produces a weakly-identified two-penalty ρ-surface whose REML optimum
+            // is row-order dependent (#1378), and in 2-D+ the surplus basis columns
+            // become noise-fitting capacity REML cannot fully penalize away on a
+            // weak-signal fit — `#1074`'s quakes `s(long,lat)` reached EDF≈104 (vs
+            // mgcv≈15) with held-out R²≈0.02 because `default_num_centers(800,2)=134`
+            // is ~4× mgcv's 2-D default of 30. Default every thin-plate smooth to
+            // mgcv's `k = 10·3^(d-1)` total dimension (kernel centers = total −
+            // linear-nullspace dim), capped by the heuristic so tiny-`n` plans are
+            // never inflated. An explicit `k`/`centers` still takes full effect via
+            // `parse_countwith_basis_alias` (e.g. the `k=10`/`k=20` quality tests).
+            let default_centers = {
+                let d = cols.len().max(1) as u32;
+                let mgcv_total_dim = THIN_PLATE_1D_DEFAULT_BASIS_DIM
+                    .saturating_mul(3usize.saturating_pow(d - 1));
+                let nullspace_dim = crate::basis::duchon_nullspace_dimension(cols.len(), 1);
+                let target_centers = mgcv_total_dim.saturating_sub(nullspace_dim);
                 plan.centers.min(target_centers.max(1))
-            } else {
-                plan.centers
             };
             let centers = parse_countwith_basis_alias(
                 options,
