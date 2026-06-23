@@ -3150,3 +3150,85 @@ fn bounded_latent_sampler_draws_in_bounds_and_preserves_joint() {
         "joint correlation not preserved: empirical {corr_emp} vs truth {corr_truth}"
     );
 }
+
+// ------------------------------------------------------------------
+// #1514: the bounded latent sampler must apply the dispersion scale.
+//
+// The exported `user_hessian` is the UNSCALED penalized Hessian, so for a
+// free-dispersion (profiled-Gaussian) family the latent posterior covariance
+// is `cov_scale · H_latent⁻¹` (here `cov_scale = σ̂²`). The caller passes
+// `sqrt_cov_scale = √cov_scale`; this test confirms the sampler scales the
+// latent variances by exactly `cov_scale` (and `sqrt_cov_scale = 1` recovers
+// the unscaled draw), so the draw spread matches the fit's reported `Vb`.
+// Without the scale a Gaussian bounded slope's draws were `1/σ̂` too wide.
+// ------------------------------------------------------------------
+#[test]
+fn bounded_latent_sampler_applies_dispersion_scale() {
+    let (min, max) = (-0.5_f64, 0.5_f64);
+    let beta_user = array![0.2, 1.3];
+    let user_hessian = array![[4.0, 1.2], [1.2, 3.0]];
+    let bounded_columns = vec![BoundedSampleColumn {
+        col_idx: 0,
+        min,
+        max,
+    }];
+    let n_draws = 60_000usize;
+
+    // Reconstruct the unscaled latent covariance the sampler builds internally.
+    let theta_mode0 = bounded_user_to_latent(beta_user[0], min, max);
+    let (_, _, j0) = bounded_latent_to_user(theta_mode0, min, max);
+    let h_latent = array![
+        [user_hessian[[0, 0]] * j0 * j0, user_hessian[[0, 1]] * j0],
+        [user_hessian[[1, 0]] * j0, user_hessian[[1, 1]]]
+    ];
+    let det = h_latent[[0, 0]] * h_latent[[1, 1]] - h_latent[[0, 1]] * h_latent[[1, 0]];
+    let cov_latent_unit = array![
+        [h_latent[[1, 1]] / det, -h_latent[[0, 1]] / det],
+        [-h_latent[[1, 0]] / det, h_latent[[0, 0]] / det]
+    ];
+
+    // A non-unit dispersion scale (e.g. σ̂² = 2.25 ⇒ √cov_scale = 1.5).
+    let cov_scale = 2.25_f64;
+    let sqrt_cov_scale = cov_scale.sqrt();
+    let draws = sample_bounded_latent_posterior_internal(
+        &beta_user,
+        &user_hessian,
+        &bounded_columns,
+        n_draws,
+        sqrt_cov_scale,
+        424242,
+    )
+    .expect("scaled bounded latent sampler");
+
+    // Map back to the latent scale where the draw is exactly Gaussian.
+    let mut theta0 = Array1::<f64>::zeros(n_draws);
+    let mut theta1 = Array1::<f64>::zeros(n_draws);
+    for k in 0..n_draws {
+        theta0[k] = bounded_user_to_latent(draws[(k, 0)], min, max);
+        theta1[k] = draws[(k, 1)];
+    }
+    let mean0 = theta0.sum() / n_draws as f64;
+    let mean1 = theta1.sum() / n_draws as f64;
+    let var0 = theta0.iter().map(|&t| (t - mean0).powi(2)).sum::<f64>() / n_draws as f64;
+    let var1 = theta1.iter().map(|&t| (t - mean1).powi(2)).sum::<f64>() / n_draws as f64;
+
+    // Latent variances must equal `cov_scale · H_latent⁻¹`, NOT `H_latent⁻¹`.
+    let rel = |emp: f64, truth: f64| (emp - truth).abs() / truth.abs().max(1e-12);
+    let truth0 = cov_scale * cov_latent_unit[[0, 0]];
+    let truth1 = cov_scale * cov_latent_unit[[1, 1]];
+    assert!(
+        rel(var0, truth0) < 0.05,
+        "scaled latent var0 {var0} vs {truth0} (cov_scale={cov_scale})"
+    );
+    assert!(
+        rel(var1, truth1) < 0.05,
+        "scaled latent var1 {var1} vs {truth1} (cov_scale={cov_scale})"
+    );
+    // Guard the contract direction: the scaled variance is meaningfully larger
+    // than the unscaled one (so a missing scale would be caught, not masked).
+    assert!(
+        var0 > 1.5 * cov_latent_unit[[0, 0]],
+        "dispersion scale was not applied: var0 {var0} ~ unit cov {}",
+        cov_latent_unit[[0, 0]]
+    );
+}
