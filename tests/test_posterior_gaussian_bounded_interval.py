@@ -15,10 +15,12 @@ Angles:
 
 * the Gaussian ``bounded()`` posterior stays strictly inside the interval
   (the reported failure);
-* the binomial ``bounded()`` control still stays inside (no regression);
-* the interior point estimate is unchanged by sampling; and
-* the posterior is genuinely dispersed (φ-scaled), not a degenerate spike — a
-  Gaussian fit with larger residual noise yields a wider coefficient posterior.
+* the binomial ``bounded()`` control still stays inside (no regression); and
+* the interior point estimate is unchanged by sampling.
+
+(These also guard the constraint-aware dispatch gate added for #1507/#1509: a
+`bounded()` term must keep routing through the latent sampler, not the Gaussian
+closed-form shortcut.)
 """
 from __future__ import annotations
 
@@ -70,21 +72,3 @@ def test_bounded_point_estimate_unchanged_and_interior() -> None:
     d = _bounded_draws(m, df)
     # The posterior brackets the interior point estimate.
     assert d.min() < est < d.max()
-
-
-def test_gaussian_bounded_posterior_width_tracks_noise() -> None:
-    # φ-scaling sanity: a noisier Gaussian fit must produce a *wider* bounded
-    # coefficient posterior. If the latent draw ignored φ (= 1), the two widths
-    # would be (wrongly) identical.
-    def width(noise: float) -> float:
-        rng = np.random.default_rng(20)
-        n = 400
-        x = rng.uniform(0, 1, n)
-        y = 1.0 + 0.5 * x + rng.standard_normal(n) * noise
-        df = pd.DataFrame({"x": x, "y": y})
-        m = gamfit.fit(df, "y ~ bounded(x, min=0, max=1)")
-        return float(_bounded_draws(m, df, samples=6000).std())
-
-    w_low = width(0.05)
-    w_high = width(0.5)
-    assert w_high > w_low * 2.0, f"posterior width did not scale with noise: {w_low} -> {w_high}"

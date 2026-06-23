@@ -60,7 +60,9 @@ def test_nonnegative_active_bound_binomial() -> None:
     y = rng.binomial(1, p, n)
     df = pd.DataFrame({"x": x, "y": y})
     m = gamfit.fit(df, "y ~ nonnegative(x)", family="binomial")
-    assert m.summary().coefficients[1]["estimate"] == 0.0
+    # Active bound: the constrained binomial fit pins to the boundary up to the
+    # solver's KKT tolerance (not necessarily bit-exact 0.0).
+    assert abs(m.summary().coefficients[1]["estimate"]) < 1e-6
 
     d = _coef_draws(m, df)
     # Was 100% negative before the fix.

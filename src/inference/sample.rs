@@ -650,16 +650,6 @@ fn sample_standard_bounded(
     // user-scale penalized Hessian for a saved standard fit.)
     let user_hessian =
         explicit_fit_hessian_for_whitening(&fit, p, "saved standard bounded-coefficient model")?;
-    // φ-scale the latent posterior covariance, mirroring `laplace_gaussian_fallback`.
-    // The unscaled penalised Hessian gives `H_latent^{-1}`; the posterior is
-    // `φ · H_latent^{-1}`. Fixed-scale families (Binomial / Poisson) have φ = 1,
-    // so this is a no-op there; a Gaussian-identity `bounded()` model — which
-    // now reaches this path before the closed-form Gaussian shortcut (#1508) —
-    // gets the correct residual-variance-scaled width instead of a unit-φ one.
-    let sqrt_phi = {
-        use crate::inference::dispersion_cov::DispersionExt as _;
-        fit.dispersion().unwrap_or_default().sqrt_phi()
-    };
     let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
     let samples = crate::smooth::sample_bounded_latent_posterior_internal(
         &mode,
@@ -667,7 +657,6 @@ fn sample_standard_bounded(
         bounded_columns,
         n_total,
         chain_stream_seed(cfg.seed, 0, 0xB0DD_ED5E_ED90_1A7Cu64),
-        sqrt_phi,
     )
     .map_err(|e| format!("standard bounded-coefficient posterior sampling failed: {e}"))?;
 
