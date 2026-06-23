@@ -631,6 +631,8 @@ fn bspline_basis_min_rows(spec: &crate::terms::basis::BSplineBasisSpec) -> usize
             spec.degree + 2
         }
         BSplineKnotSpec::Provided(knots) => knots.len().saturating_sub(spec.degree + 1).max(1),
+        // cr basis dimension equals the knot count (no degree offset).
+        BSplineKnotSpec::NaturalCubicRegression { knots } => knots.len(),
         BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis,
     };
     let columns = columns.max(spec.degree + 2);

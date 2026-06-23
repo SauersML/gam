@@ -2075,6 +2075,22 @@ pub fn build_smooth_basis(
                         },
                     )
                 }
+            } else if type_opt == "cr" || type_opt == "cs" {
+                // mgcv `bs="cr"`/`"cs"`: a natural cubic regression spline whose
+                // basis is indexed by `k` values at quantile-placed knots (#1074),
+                // NOT a B-spline knot vector. Match gam's `k=` convention by
+                // requesting the same total basis size the B-spline arm would
+                // produce (`n_knots` internal + degree + 1), floored at the cr
+                // minimum of 3 knots. `cr` vs `cs` (shrinkage) is carried by the
+                // `double_penalty` flag resolved below, which the cr builder reads.
+                let k_cr = (n_knots + effective_degree + 1).max(3);
+                let cr_knots =
+                    crate::terms::basis::select_cr_knots(ds.values.column(c), k_cr)
+                        .map_err(|e| e.to_string())?;
+                (
+                    BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots },
+                    parse_cyclic_boundary(options, minv, maxv)?,
+                )
             } else {
                 (
                     resolve_nonperiodic_bspline_knotspec(

@@ -712,6 +712,14 @@ fn apply_bspline_1d(
                 }
             }
             BSplineKnotSpec::Provided(existing) => BSplineKnotSpec::Provided(existing.clone()),
+            // cr/cs knots index the basis directly; an `n_knots` override does
+            // not map onto a B-spline internal-knot count, so the frozen cr knot
+            // set is respected verbatim.
+            BSplineKnotSpec::NaturalCubicRegression { knots } => {
+                BSplineKnotSpec::NaturalCubicRegression {
+                    knots: knots.clone(),
+                }
+            }
         };
     }
     if let Some(d) = descriptor.get("degree").and_then(JsonValue::as_u64) {
@@ -759,6 +767,13 @@ fn apply_bspline_1d(
             BSplineKnotSpec::PeriodicUniform { .. } => {
                 // Already periodic — nothing to do.
                 return Ok(());
+            }
+            BSplineKnotSpec::NaturalCubicRegression { .. } => {
+                return Err(format!(
+                    "smooths[{symbol:?}]: periodic=True is incompatible with a natural cubic \
+                     regression spline (bs=\"cr\"/\"cs\"), which is non-periodic. Build the \
+                     periodic smooth via the formula DSL `cc()`/`cyclic()` instead."
+                ));
             }
         };
         spec.knotspec = BSplineKnotSpec::PeriodicUniform {

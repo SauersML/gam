@@ -4653,6 +4653,28 @@ fn freeze_smooth_basis_from_metadata(
             // exactly as fit.
         }
         (
+            SmoothBasisSpec::BSpline1D { spec: s, .. },
+            BasisMetadata::CubicRegression1D {
+                knots,
+                identifiability_transform,
+            },
+        ) => {
+            // #1074: a natural cubic regression spline freezes to its
+            // value-at-knot knot set plus the captured raw→constrained transform,
+            // mirroring the `BSpline1D` arm above. The predict-time builder
+            // reconstructs the cr geometry from `knots` and replays the
+            // `FrozenTransform` exactly, so the design matches fit time.
+            s.knotspec = BSplineKnotSpec::NaturalCubicRegression {
+                knots: knots.clone(),
+            };
+            s.identifiability = match identifiability_transform {
+                Some(z) => BSplineIdentifiability::FrozenTransform {
+                    transform: z.clone(),
+                },
+                None => BSplineIdentifiability::None,
+            };
+        }
+        (
             SmoothBasisSpec::ThinPlate {
                 spec: s,
                 input_scales,
