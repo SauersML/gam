@@ -1962,7 +1962,7 @@ fn fit_term_collection_on_realized_design(
     // term's signal lives in its penalty null space (#1271 single-penalty tp/ps,
     // #1266 double-penalty selection). Length-safe: only fires when the inner ρ
     // aligns 1:1 with the penalty blocks (see `relax_smoothing_rho_prior`).
-    base_fit_opts.rho_prior = relax_smoothing_rho_prior(options, &family, design);
+    base_fit_opts.rho_prior = relax_smoothing_rho_prior(options, design);
     let fitted = FittedTermCollection {
         fit: fit_gamwith_heuristic_lambdas(
             design.design.clone(),
@@ -4300,16 +4300,16 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 /// unchanged, and an already-`Flat`/already-`Independent` base prior, or a
 /// design with no double-penalty block, is returned untouched.
 ///
-/// Cap-lifting to `Flat`/wide-`Normal` is a Gaussian-identity recovery device
-/// and stays gated to that case. The `DoublePenaltyNullspace` *selection* prior
-/// — the one-sided select-out barrier that drives an unsupported null space out
-/// (mgcv `select=TRUE`) — is family-agnostic, so it is applied for non-Gaussian
-/// families too (e.g. the #1426 Gamma/log overfit) whenever the inner ρ is
-/// length-safe (no SAS/mixture link-shape coordinate, no moving spatial κ); the
-/// range-space coordinate of such a non-Gaussian smooth keeps its base cap.
+/// The relaxed per-coordinate prior is FAMILY-AGNOSTIC: the cap-lifting of the
+/// bending coordinate and the determinacy-gated null-space treatment apply
+/// identically for Gaussian and non-Gaussian families. The response family / link
+/// only matters for length-safety (it can append auxiliary trailing ρ
+/// coordinates via dispersion / SAS / mixture / moving-κ machinery), which is
+/// gated separately by `length_safe`; once that gate passes the inner ρ aligns
+/// 1:1 with `penaltyinfo` regardless of family, so the same relaxation is valid
+/// for a Tweedie / Gamma-log `ps` smooth as for a Gaussian one (#1426/#1477).
 fn relax_smoothing_rho_prior(
     options: &FitOptions,
-    family: &LikelihoodSpec,
     design: &TermCollectionDesign,
 ) -> crate::types::RhoPrior {
     use crate::terms::basis::BasisMetadata;
@@ -4331,18 +4331,16 @@ fn relax_smoothing_rho_prior(
     //   * non-Gaussian dispersion / non-identity link machinery,
     //   * SAS ε/δ and mixture-link parameters,
     //   * spatial κ length-scale optimisation that actually moves κ.
-    // Gate to the Gaussian-identity, link-aux-free case. Spatial κ optimisation
-    // (Matérn / Duchon / sphere / curvature / measure-jet) genuinely appends a
-    // moving log-κ coordinate AND needs the cap to stabilise it, so bail if any
-    // such term is present. Thin-plate is the exception: its length-scale is a
-    // pure radial SCALE that REML cannot identify (the κ optimiser converges to
-    // a no-op, leaving `n_params = penalty-block count`), so it adds no trailing
-    // coordinate and is safe to relax alongside the B-spline family.
-    let gaussian_identity = matches!(family.response, crate::types::ResponseFamily::Gaussian)
-        && matches!(
-            family.link,
-            crate::types::InverseLink::Standard(crate::types::StandardLink::Identity)
-        );
+    // Gate to the link-aux-free case. Spatial κ optimisation (Matérn / Duchon /
+    // sphere / curvature / measure-jet) genuinely appends a moving log-κ
+    // coordinate AND needs the cap to stabilise it, so bail if any such term is
+    // present. Thin-plate is the exception: its length-scale is a pure radial
+    // SCALE that REML cannot identify (the κ optimiser converges to a no-op,
+    // leaving `n_params = penalty-block count`), so it adds no trailing
+    // coordinate and is safe to relax alongside the B-spline family. The response
+    // family / link itself does NOT break length-safety (a non-Gaussian GAM with
+    // no link-aux and no moving κ still has exactly `penaltyinfo.len()` inner ρ
+    // coordinates), so the relaxed prior below is family-agnostic.
     let has_link_aux = options.sas_link.is_some()
         || options.optimize_sas
         || options.mixture_link.is_some()
@@ -4546,41 +4544,45 @@ fn relax_smoothing_rho_prior(
             }
             let is_nullspace =
                 matches!(info.penalty.source, PenaltySource::DoublePenaltyNullspace);
-            if !gaussian_identity {
-                // NON-GAUSSIAN length-safe smooth. Select the double-penalty
-                // null space OUT (#1426), and free the BENDING (range-space)
-                // coordinate by the same regime rule the Gaussian path uses
-                // (#1477). The symmetric `Normal{0, sd}` base cap is a
-                // Gaussian-tuned #1089 termination stabiliser centred at λ=1 with
-                // NO smoothing-selection justification on a non-Gaussian smooth:
-                // keeping it dragged the bending log-λ off the REML optimum mgcv
-                // reaches, shipping a systematically biased mean with a hard
-                // right-boundary blow-up (Tweedie + default `ps`: pred ≈ 2.4×
-                // truth at x=1, while gam's own `cr` and mgcv's same `ps` both
-                // recover truth). Freeing it to `relaxed_prior` resolves to the
-                // firth one-sided barrier (`Flat`, well-determined) — byte-flat on
-                // the identified side (pure REML = mgcv) with only a convex wall
-                // against the `λ → 0` degeneracy — or the wide #1089 `Normal` when
-                // under-determined. This is NOT a re-tuning toward a particular λ:
-                // it REMOVES an unjustified cap and lets REML choose, exactly as on
-                // the (already-relaxed) Gaussian path.
-                if is_nullspace {
-                    nullspace_select_prior.clone()
-                } else {
-                    relaxed_prior.clone()
-                }
-            } else if is_nullspace {
-                // Gaussian-identity double-penalty null-space selection ridge.
-                // UNDER-DETERMINED (`p > n`, #1392 wine): the outer score is flat
-                // on the select-out side, so REML stalls the null space "kept" at
-                // λ ≈ 0.11 and the EDF rails up — the active PC select-out push is
-                // required to move it out. WELL-DETERMINED (#1476 concurvity): the
-                // score is NOT flat, so an active select-out mode would over-shrink
-                // a genuinely-supported (collinear) null space; instead supply only
-                // the wide, weakly-informative termination curvature that breaks
-                // the concurvity flat-ridge degeneracy and lets REML allocate the
-                // shared linear signal. (#1266 select-out of a truly-unsupported
-                // null still holds — REML's own score drives its λ up.)
+            // The relaxed per-coordinate prior is FAMILY-AGNOSTIC: the choice
+            // depends only on the coordinate's role (bending vs null-space
+            // selection) and on whether the data over-determines the model, NOT
+            // on the response family or link. (Length-safety — the only thing the
+            // family/link can break via auxiliary ρ coordinates — is already
+            // gated above by `length_safe`; reaching this point means the inner ρ
+            // aligns 1:1 with `penaltyinfo` for Gaussian and non-Gaussian alike.)
+            //
+            // The previous code split here on `gaussian_identity` and pinned the
+            // non-Gaussian null-space coordinate to the AGGRESSIVE PC select-out
+            // prior in BOTH determinacy regimes. That select-out prior has a
+            // finite well-penalized mode at λ* ≈ θ² ≈ 8483, which carves a SECOND,
+            // deep basin into the 2-D (bending, null-space) outer REML surface at
+            // large λ_null. On a well-determined non-Gaussian double-penalty `ps`
+            // smooth the outer ARC then has two competing basins — the genuine
+            // bending optimum and the prior-induced high-λ_null shelf — and the
+            // expensive non-Gaussian multi-start lands the wrong one: the fit
+            // ships a right-boundary blow-up (Tweedie `s(x)` pred ≈ 1.4–2.0× truth
+            // at x=1 on data whose null space is unsupported) and, on the hard
+            // seeds, a falsely-"converged" EDF-inflated under-smooth (#1477; the
+            // same genus as the #1426 Gamma/log overfit). The Gaussian path does
+            // NOT do this — #1476 deliberately switched its well-determined
+            // null-space coordinate to the wide, weakly-informative degeneracy
+            // prior precisely because the active select-out over-shrinks /
+            // destabilises a well-determined fit. Non-Gaussian needs the identical
+            // treatment, so the determinacy gate now applies to BOTH families:
+            //
+            //   * BENDING (range-space) coordinate → `relaxed_prior` (firth
+            //     one-sided barrier when well-determined = pure REML = mgcv; wide
+            //     #1089 `Normal` when under-determined).
+            //   * NULL-SPACE selection coordinate → the AGGRESSIVE PC select-out
+            //     ONLY when under-determined (`p > n`, #1392 wine: the outer score
+            //     is flat on the select-out side and REML needs the active push);
+            //     otherwise the gentle, wide degeneracy prior (#1476), which adds
+            //     termination curvature without biasing which λ_null REML lands on
+            //     — so a genuinely-unsupported null space is still selected out by
+            //     REML's own score (the sin-data linear trend → λ_null large) and a
+            //     genuinely-supported one is not over-shrunk.
+            if is_nullspace {
                 if underdetermined {
                     nullspace_select_prior.clone()
                 } else {
