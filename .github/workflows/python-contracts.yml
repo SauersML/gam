@@ -17,7 +17,9 @@ on:
     paths:
       - "tests/test_bug_hunt_numeric_by_variable_clamped_to_training_range_at_predict.py"
       - "tests/test_bug_hunt_curv_smooth_hyperbolic_recovered_as_spherical.py"
+      - "tests/test_bug_hunt_poisson_zero_count_fit_unpredictable_mean.py"
       - "src/inference/model.rs"
+      - "src/inference/predict/mod.rs"
       - "src/terms/smooth/spatial_optimization.rs"
       - ".github/workflows/python-contracts.yml"
 
@@ -101,3 +103,11 @@ jobs:
         # ./gamfit makes the installed wheel win the import.
         working-directory: ${{ runner.temp }}
         run: python -m pytest "$GITHUB_WORKSPACE/tests/test_bug_hunt_curv_smooth_hyperbolic_recovered_as_spherical.py" -v --tb=short
+
+      - name: Run all-zero-count predictable-mean contract (#1515)
+        # A Poisson/NB GAM fitted on identically-zero counts must stay
+        # predictable: the response-scale posterior mean overflows on the
+        # near-singular flat-likelihood Hessian, so predict must fall back to
+        # the finite plug-in mean g^-1(eta_hat) instead of returning None.
+        working-directory: ${{ runner.temp }}
+        run: python -m pytest "$GITHUB_WORKSPACE/tests/test_bug_hunt_poisson_zero_count_fit_unpredictable_mean.py" -v --tb=short
