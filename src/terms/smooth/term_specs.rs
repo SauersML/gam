@@ -7312,27 +7312,22 @@ fn build_single_local_smooth_term(
         }
     };
 
-    // #1074: matern() penalty selection.
+    // The Matérn design ALWAYS uses the operator-collocation {mass, tension,
+    // stiffness} penalty triplet, overriding whatever penalty
+    // `build_matern_basis_seeded` produced for the `double_penalty` flag.
     //
-    //   * `double_penalty = true` (the DEFAULT): keep the genuine
-    //     reproducing-kernel-Hilbert-space penalty `β' K_CC β` that
-    //     `build_matern_basis_seeded` already built (Primary kernel Gram + the
-    //     null-space shrinkage ridge). This is mgcv's `bs="gp"` / fields kriging
-    //     construction — design = cross-covariance `K_nc`, penalty = knot
-    //     covariance `K_cc` — and recovers the truth at the mature reference's
-    //     efficiency. The operator-collocation triplet (mass/tension/stiffness)
-    //     is only an *approximation* to that RKHS norm and systematically
-    //     under-smooths the rougher half-integer kernels (ν = 3/2), inflating
-    //     EDF and the truth-recovery RMSE (#1074).
-    //
-    //   * `double_penalty = false` (explicit opt-out): use the operator
-    //     collocation triplet, whose Sobolev-order dials give a finer-grained
-    //     roughness control than the single RKHS norm. The κ-optimizer's n-free
-    //     re-key and ψ-derivative paths branch on the same `double_penalty` flag
-    //     so the penalty BLOCK COUNT stays ψ-stable (the #1270 invariant).
-    if let SmoothBasisSpec::Matern { spec, .. } = &term.basis
-        && !spec.double_penalty
-    {
+    // #1074 investigated swapping this for the genuine RKHS kernel penalty
+    // `β' K_CC β` (mgcv `bs="gp"` / fields kriging) on the theory that the
+    // operator triplet under-smooths the rougher half-integer kernels. MSI
+    // truth-recovery measurement REFUTED that: the kernel penalty did NOT
+    // improve ν=3/2 recovery (`matern(x,nu=1.5)` RMSE-vs-truth stayed 0.0554)
+    // and it REGRESSED the high-frequency-init guard — `matern(x,nu≥5/2)` on
+    // sin(2π·8·x) collapsed (span 0.53, RMSE 0.70) because the single RKHS
+    // norm over-smooths a high-frequency truth where the Sobolev-order operator
+    // dials do not. The operator triplet is therefore retained as the Matérn
+    // penalty, and the κ-optimizer re-key / ψ-derivative paths route through the
+    // same triplet builder so the block count stays ψ-stable (#1270).
+    if let SmoothBasisSpec::Matern { .. } = &term.basis {
         let (penalties, nullspace_dims, penaltyinfo) =
             matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
         built.penalties = penalties;
