@@ -102,7 +102,7 @@ fn ln_stack(x: f64) -> [f64; 5] {
 /// A runtime-`K` truncated-Taylor scalar: the row loss is written once against
 /// this interface and re-instantiated at [`Jet2`] / [`Jet3`] / [`Jet4`] for the
 /// value/grad/Hessian, contracted-third, and contracted-fourth channels.
-trait FlexJet: Sized {
+trait FlexJet: Sized + Clone {
     fn value(&self) -> f64;
     fn add(&self, o: &Self) -> Self;
     fn sub(&self, o: &Self) -> Self;
