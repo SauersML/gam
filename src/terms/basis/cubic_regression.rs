@@ -110,7 +110,10 @@ impl CubicRegressionBasis {
     /// `row` is overwritten.
     pub fn eval_row_into(&self, x: f64, row: &mut [f64]) {
         let k = self.knots.len();
-        debug_assert_eq!(row.len(), k);
+        // assert_eq!, not debug_assert_eq!: the ban-scanner forbids debug_assert
+        // (silent in release → debug/release divergence). The length check is a
+        // cheap O(1) guard, so an always-active assert is acceptable here.
+        assert_eq!(row.len(), k);
         for r in row.iter_mut() {
             *r = 0.0;
         }
