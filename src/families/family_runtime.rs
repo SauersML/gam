@@ -295,8 +295,21 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             | (ResponseFamily::Tweedie { .. }, _)
             | (ResponseFamily::NegativeBinomial { .. }, _)
             | (ResponseFamily::Gamma, _) => {
-                // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)  (log-normal MGF)
-                Ok((eta + 0.5 * se_eta * se_eta).exp())
+                // E[exp(η)] where η ~ N(eta, se²) = exp(eta + se²/2)
+                // (log-normal MGF). When the likelihood is near-flat (e.g.
+                // all-zero Poisson counts) the posterior SE is astronomically
+                // wide and `0.5·se²` overflows the exponent, producing +inf —
+                // which the FFI serializes as JSON null (issue #1515). In that
+                // regime the posterior-integrated mean is numerically
+                // meaningless; fall back to the plug-in `exp(eta)` (which is
+                // the floored finite point estimate) so predict() stays
+                // finite and non-negative.
+                let exponent = eta + 0.5 * se_eta * se_eta;
+                if exponent.is_finite() && exponent < 700.0 {
+                    Ok(exponent.exp())
+                } else {
+                    Ok(eta.clamp(-700.0, 700.0).exp())
+                }
             }
             (ResponseFamily::Beta { .. }, _) => {
                 Ok(logit_posterior_meanvariance(quadctx, eta, se_eta).0)
