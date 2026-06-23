@@ -115,6 +115,160 @@ trait FlexJet: Sized {
     fn ln(&self) -> Self {
         self.compose_unary(ln_stack(self.value()))
     }
+    /// `1/self` via the reciprocal Faà di Bruno stack at the value channel.
+    #[inline]
+    fn recip(&self) -> Self {
+        let x = self.value();
+        let inv = 1.0 / x;
+        let inv2 = inv * inv;
+        self.compose_unary([
+            inv,
+            -inv2,
+            2.0 * inv2 * inv,
+            -6.0 * inv2 * inv2,
+            24.0 * inv2 * inv2 * inv,
+        ])
+    }
+    /// `exp(self)` via the exponential stack at the value channel.
+    #[inline]
+    fn exp(&self) -> Self {
+        let e = self.value().exp();
+        self.compose_unary([e, e, e, e, e])
+    }
+    /// `self + c` for a scalar constant `c` (value-channel shift, derivatives
+    /// unchanged) via the affine composition stack `[v+c, 1, 0, 0, 0]`.
+    #[inline]
+    fn add_const(&self, c: f64) -> Self {
+        self.compose_unary([self.value() + c, 1.0, 0.0, 0.0, 0.0])
+    }
+}
+
+// ── §B moment engine: the de-nested cell moments over a FlexJet ─────────────
+//
+// #932 Item 2 (doc §D). The per-cell moments `M_n = ∫_{z_L}^{z_R} z^n e^{−q(z)} dz`
+// (sextic `q`, no closed antiderivative) satisfy the SAME raising recurrence the
+// numeric `cubic_cell_kernel::reduce_sextic_moments` uses —
+//   `M_{n+5} = (n·M_{n−1} − Σ_{j=0}^{4} d[j]·M_{n+j} − b_n) / d[5]`,
+// with `d = q'(z)` coefficients (`sextic_qprime_coefficients`) and boundary term
+// `b_n = z_R^n e^{−q(z_R)} − z_L^n e^{−q(z_L)}` — so it ports to ANY `FlexJet`
+// scalar verbatim. Carrying the cell coefficients `c0..c3` and the (moving) edges
+// `z_L,z_R` as jets propagates the moments' θ-derivatives mechanically: the
+// `Σ d[j]·M_{n+j}` term is the interior coefficient sensitivity and the boundary
+// term `b_n` is exactly the §D moving-boundary flux (its edge-jet derivatives are
+// the Leibniz `[z^n e^{−q}·z_edge']` contributions the hand `directional` path
+// assembles by hand). The base moments `M_0..M_4` (the normalization integrals)
+// arrive as jets from the cell evaluator — those carry the only transcendental
+// (erf/series) content; the algebra owns the rest.
+
+/// `q'(z)` coefficient jets `[d0..d5]` for `q = ½(z² + η²)`, `η = c0+c1 z+c2 z²+
+/// c3 z³`, over `FlexJet` cell-coefficient jets — the jet image of
+/// [`crate::families::cubic_cell_kernel::sextic_qprime_coefficients`].
+fn qprime_coeffs_jet<J: FlexJet>(c: &[J; 4]) -> [J; 6] {
+    let (c0, c1, c2, c3) = (&c[0], &c[1], &c[2], &c[3]);
+    // d0 = c0·c1
+    let d0 = c0.mul(c1);
+    // d1 = 1 + c1² + 2·c0·c2   (the leading `+z` of q' supplies the constant 1)
+    let d1 = c1.mul(c1).add(&c0.mul(c2).scale(2.0)).add_const(1.0);
+    // d2 = 3·c0·c3 + 3·c1·c2
+    let d2 = c0.mul(c3).add(&c1.mul(c2)).scale(3.0);
+    // d3 = 4·c1·c3 + 2·c2²
+    let d3 = c1.mul(c3).scale(4.0).add(&c2.mul(c2).scale(2.0));
+    // d4 = 5·c2·c3
+    let d4 = c2.mul(c3).scale(5.0);
+    // d5 = 3·c3²
+    let d5 = c3.mul(c3).scale(3.0);
+    [d0, d1, d2, d3, d4, d5]
+}
+
+/// `q(z) = ½(z² + η(z)²)` evaluated at an edge jet `z`, with `η` from the cell
+/// coefficient jets — the exponent whose `e^{−q}` is the boundary weight.
+fn cell_q_at_jet<J: FlexJet>(c: &[J; 4], z: &J) -> J {
+    // η = c0 + c1 z + c2 z² + c3 z³  (Horner)
+    let eta = c[3]
+        .mul(z)
+        .add(&c[2])
+        .mul(z)
+        .add(&c[1])
+        .mul(z)
+        .add(&c[0]);
+    // ½(z² + η²)
+    z.mul(z).add(&eta.mul(&eta)).scale(0.5)
+}
+
+/// One boundary term `z^n·e^{−q(z)}` at a (possibly infinite) moving edge jet.
+/// An infinite edge contributes nothing (matching the numeric
+/// `moment_boundary_term_with_powers` short-circuit).
+fn boundary_edge_term_jet<J: FlexJet>(c: &[J; 4], z: &J, z_pow_n: &J, finite: bool) -> Option<J> {
+    if !finite {
+        return None;
+    }
+    let q = cell_q_at_jet(c, z);
+    let w = q.scale(-1.0).exp();
+    Some(z_pow_n.mul(&w))
+}
+
+/// The sextic moment recurrence over a `FlexJet`: given the cell coefficient
+/// jets `c`, the moving edge jets `(z_left, z_right)` with their finiteness, and
+/// the base moment jets `M_0..M_4`, return `M_0..M_max` as jets. Bit-faithful to
+/// `reduce_sextic_moments` term for term, but every operation in the `FlexJet`
+/// algebra so the moments carry their exact θ-derivatives.
+fn cell_moment_recurrence_jet<J: FlexJet>(
+    c: &[J; 4],
+    z_left: &J,
+    left_finite: bool,
+    z_right: &J,
+    right_finite: bool,
+    base_m0_m4: &[J; 5],
+    max_degree: usize,
+) -> Vec<J> {
+    let d = qprime_coeffs_jet(c);
+    let inv_lead = d[5].recip();
+    let mut moments: Vec<J> = base_m0_m4.iter().cloned().collect();
+    if max_degree < 5 {
+        moments.truncate(max_degree + 1);
+        return moments;
+    }
+    // Rolling z^n at each edge (jets), starting at n = 0 (z^0 = 1 = z/z).
+    let one_l = z_left.recip().mul(z_left);
+    let one_r = z_right.recip().mul(z_right);
+    let mut left_pow = one_l;
+    let mut right_pow = one_r;
+    for n in 0..=(max_degree - 5) {
+        let b_left = boundary_edge_term_jet(c, z_left, &left_pow, left_finite);
+        let b_right = boundary_edge_term_jet(c, z_right, &right_pow, right_finite);
+        // b_n = right − left, missing edges contribute zero.
+        let mut b_n = match (b_right, b_left) {
+            (Some(r), Some(l)) => r.sub(&l),
+            (Some(r), None) => r,
+            (None, Some(l)) => l.scale(-1.0),
+            (None, None) => moments[0].scale(0.0),
+        };
+        // numer = n·M_{n−1} − Σ_{j=0}^{4} d[j]·M_{n+j} − b_n
+        let mut numer = if n == 0 {
+            moments[0].scale(0.0)
+        } else {
+            moments[n - 1].scale(n as f64)
+        };
+        for j in 0..=4 {
+            numer = numer.sub(&d[j].mul(&moments[n + j]));
+        }
+        numer = numer.sub(&b_n);
+        moments.push(numer.mul(&inv_lead));
+        // Roll powers: z^{n+1} = z^n · z.
+        left_pow = if left_finite {
+            left_pow.mul(z_left)
+        } else {
+            b_n.scale(0.0)
+        };
+        right_pow = if right_finite {
+            right_pow.mul(z_right)
+        } else {
+            // reuse b_n as a zero-jet scratch source of the right `p`
+            b_n = b_n.scale(0.0);
+            b_n
+        };
+    }
+    moments
 }
 
 /// The single-source flex row NLL **minus** the additive `w·d·ln2π` constant
