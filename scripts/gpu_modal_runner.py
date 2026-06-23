@@ -53,10 +53,18 @@ DEFAULT_EXAMPLES = "throughput_1412"
 def _prep_repo(branch: str) -> None:
     import os
     import subprocess
+    import time
 
     import shutil
 
     os.makedirs("/cache/cargo", exist_ok=True)
+    # Ping the dead-hand heartbeat (the deployed gam-gpu-deadhand cron stops GPUs if
+    # this goes stale or any gam-gpu app runs >30min).
+    try:
+        with open("/cache/deadhand_heartbeat", "w") as _hb:
+            _hb.write(str(time.time()))
+    except OSError:
+        pass
     # A previously-cached SHALLOW clone trips the build.rs guard — nuke it so we re-clone full.
     if os.path.isfile(WORKDIR + "/.git/shallow"):
         print("[gam-gpu] removing stale shallow clone", flush=True)
