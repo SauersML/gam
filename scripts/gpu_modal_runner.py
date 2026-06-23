@@ -165,8 +165,9 @@ def run_tests(test_target: str = "sae", filters: str = "", branch: str = "main")
     for f in targets:
         cmd = ["cargo", "test", "--release", "--test", test_target]
         if f:
-            cmd += [f, "--exact"]
-        cmd += ["--", "--nocapture", "--test-threads=1"]
+            cmd += [f]
+        # `--exact` is a libtest arg -> after the `--` (cargo rejects it before).
+        cmd += ["--", "--nocapture", "--test-threads=1"] + (["--exact"] if f else [])
         r = _sh(cmd, capture_output=True, text=True)
         out = (r.stdout or "") + "\n----STDERR----\n" + (r.stderr or "")
         print(f"\n========== TEST {f or '(all)'} (exit {r.returncode}) ==========\n{out}", flush=True)

@@ -43,12 +43,11 @@ def deadhand():
 
     now = time.time()
 
-    # Heartbeat: refreshed by every GPU launch (launcher writes this at job start).
-    try:
-        last_ping = float(open(HEARTBEAT).read().strip())
-    except Exception:
-        last_ping = now  # first run: treat as fresh so we don't nuke a legit job
-    heartbeat_stale = (now - last_ping) > STALE_S
+    # AGE-only dead-hand (no cross-container heartbeat — Volume writes from a job
+    # container are not visible here without a commit, which produced false
+    # "stale" kills of legit running jobs). We track first-seen per app in our OWN
+    # committed state and stop anything that has run longer than MAX_RUN_S.
+    heartbeat_stale = False
 
     # List apps via the modal CLI (authenticated by the secret env).
     r = subprocess.run(["modal", "app", "list", "--json"], capture_output=True, text=True)
@@ -87,7 +86,7 @@ def deadhand():
     json.dump(new_seen, open(STATE, "w"))
     cache.commit()
     msg = (
-        f"DEADHAND now={int(now)} heartbeat_age={int(now-last_ping)}s stale={heartbeat_stale} "
+        f"DEADHAND now={int(now)} mode=age-only(max={MAX_RUN_S}s) "
         f"tracked={len(running)} stopped={stopped}"
     )
     print(msg, flush=True)
