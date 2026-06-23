@@ -983,3 +983,66 @@ impl SurvivalMarginalSlopeFamily {
         Array2::from_shape_vec((p, p), out.contracted_fourth()).map_err(|e| e.to_string())
     }
 }
+
+#[cfg(test)]
+mod moment_engine_tests {
+    use super::*;
+    use crate::families::cubic_cell_kernel::{reduce_sextic_moments, DenestedCubicCell};
+
+    /// #932 item-2 increment 1: the FlexJet moment recurrence must reproduce the
+    /// numeric `reduce_sextic_moments` on the VALUE channel term-for-term (a
+    /// generic non-degenerate sextic cell), proving the port of the raising
+    /// recurrence + boundary term to the jet algebra is exact. (Derivative
+    /// channels are exercised by the full timepoint oracle once Phase C lands.)
+    #[test]
+    fn cell_moment_recurrence_jet_value_matches_numeric_932() {
+        let cell = DenestedCubicCell {
+            left: -1.5,
+            right: 2.0,
+            c0: 0.3,
+            c1: -0.4,
+            c2: 0.5,
+            c3: 0.2,
+        };
+        let base = [1.0_f64, 0.1, 0.6, -0.05, 0.4];
+        let max_degree = 12usize;
+        let reference =
+            reduce_sextic_moments(cell, base, max_degree).expect("numeric sextic moments");
+
+        let p = 3usize;
+        let konst = |x: f64| Jet2::from_parts(x, &vec![0.0; p], &[]);
+        let c = [
+            konst(cell.c0),
+            konst(cell.c1),
+            konst(cell.c2),
+            konst(cell.c3),
+        ];
+        let zl = konst(cell.left);
+        let zr = konst(cell.right);
+        let base_jets = [
+            konst(base[0]),
+            konst(base[1]),
+            konst(base[2]),
+            konst(base[3]),
+            konst(base[4]),
+        ];
+        let moments = cell_moment_recurrence_jet(
+            &c,
+            &zl,
+            cell.left.is_finite(),
+            &zr,
+            cell.right.is_finite(),
+            &base_jets,
+            max_degree,
+        );
+        assert_eq!(moments.len(), reference.len(), "moment count");
+        for (n, (m, r)) in moments.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (m.value() - r).abs() <= 1e-9 * (1.0 + r.abs()),
+                "moment {n}: jet value {} != numeric {}",
+                m.value(),
+                r
+            );
+        }
+    }
+}
