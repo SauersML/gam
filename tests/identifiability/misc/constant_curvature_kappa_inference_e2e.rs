@@ -215,18 +215,22 @@ fn fit_and_infer(feats: &Array2<f64>, y: &Array1<f64>) -> CurvatureInference {
 
 /// The profiled criterion V_p(κ) must IDENTIFY the planted curvature: on a κ
 /// grid spanning the chart, argmin_κ V_p(κ) tracks the sign of the planted κ⋆.
-/// Before the #1059 curvature-identification fix the criterion was monotone in
-/// κ (railed to the +bound for every truth); this is the term-level regression
-/// gate for that fix. Prints the full V_p / deviance / penalty grid for
-/// diagnosis on failure.
+///
+/// V_p(κ) here is `fixed_kappa_profiled_reml_score` — the EXACT production
+/// curvature criterion `curvature_inference_forspec` walks for the κ̂ magnitude,
+/// CI, and flatness LR (#1464: the HONEST fixed-κ profiled REML of the realized
+/// constant-curvature design, `dof·log(rss/dof)+log|H|−log|λS|₊`). It is NOT the
+/// production full-fit `reml_score`: that criterion heavily SMOOTHS this RKHS
+/// kernel, and under heavy smoothing the +κ chart's geodesic-distance compression
+/// makes the collapsed kernel a uniformly better fit of the over-smoothed target,
+/// so it is monotone toward the +chart bound for EVERY truth (sign-blind — the
+/// #1464 root cause). The honest criterion keeps the curvature-shape signal in the
+/// data fit, so its argmin tracks the planted sign; this is the term-level
+/// regression gate for that fix.
 #[test]
 fn vp_grid_identifies_planted_kappa_sign() {
-    use gam::smooth::SmoothBasisSpec;
+    use gam::smooth::fixed_kappa_profiled_reml_score;
     let options = FitOptions::default();
-    let fixed_kappa = SpatialLengthScaleOptimizationOptions {
-        enabled: false,
-        ..SpatialLengthScaleOptimizationOptions::default()
-    };
     let grid = [-1.9_f64, -1.0, -0.5, 0.0, 0.5, 1.0, 1.9];
     for (label, kappa_star) in [("hyperbolic", -2.0), ("flat", 0.0), ("spherical", 2.0)] {
         let (feats, y) = dataset_on_m_kappa(n_obs(), kappa_star, 0.68, 0.02, 0xD1A6_0001);
@@ -245,30 +249,19 @@ fn vp_grid_identifies_planted_kappa_sign() {
         let mut v_min = f64::INFINITY;
         let mut v_max = f64::NEG_INFINITY;
         for &kk in &grid {
-            let mut spec = base_spec.clone();
-            if let Some(SmoothBasisSpec::ConstantCurvature { spec: cc, .. }) =
-                spec.smooth_terms.get_mut(0).map(|t| &mut t.basis)
-            {
-                cc.kappa = kk;
-            }
-            let fit = fit_term_collectionwith_spatial_length_scale_optimization(
+            let v = fixed_kappa_profiled_reml_score(
                 frame.view(),
-                y.clone(),
-                weights.clone(),
-                offset.clone(),
-                &spec,
+                y.view(),
+                weights.view(),
+                offset.view(),
+                &base_spec,
+                0,
+                kk,
                 LikelihoodSpec::gaussian_identity(),
                 &options,
-                &fixed_kappa,
             )
-            .expect("fixed-κ fit");
-            log::debug!(
-                "  κ={kk:+.2}  V_p={:.5}  dev={:.5}  pen={:.5}",
-                fit.fit.reml_score,
-                fit.fit.deviance,
-                fit.fit.stable_penalty_term
-            );
-            let v = fit.fit.reml_score;
+            .expect("fixed-κ profiled criterion");
+            log::debug!("  κ={kk:+.2}  V_p={v:.5}");
             if v < best.0 {
                 best = (v, kk);
             }

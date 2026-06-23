@@ -866,23 +866,21 @@ fn profiled_reml_with_intercept(b: &Array2<f64>, y: &Array1<f64>, s: &Array2<f64
 /// [`build_constant_curvature_basis`] (raw RKHS Gram, scale = 1, intercept
 /// appended unpenalized), so the criterion the scan minimizes is the production
 /// design's own profiled REML.
-pub fn constant_curvature_kappa_fair_sign_score(
+/// Build the realized constant-curvature profile design `B = K_κ(data,
+/// centers)·z` and penalty `S = symm(zᵀK_κ(centers,centers)z)` at the fixed κ in
+/// `spec`, EXACTLY as [`build_constant_curvature_basis`] does (same centers, same
+/// κ-invariant effective lengths `L(κ)`/`L_S(κ)`, same center-sum-to-zero `z`,
+/// raw RKHS Gram penalty). Shared by the honest profiled-REML κ-profile score and
+/// the κ-fair sign score so both probe the production design's own criterion.
+fn constant_curvature_profile_design_penalty(
     data: ArrayView2<'_, f64>,
-    y: ArrayView1<'_, f64>,
     spec: &ConstantCurvatureBasisSpec,
-) -> Result<f64, BasisError> {
+) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     if data.ncols() == 0 {
-        crate::bail_invalid_basis!("constant-curvature κ-fair score needs at least one feature column");
+        crate::bail_invalid_basis!("constant-curvature profile score needs at least one feature column");
     }
     if !spec.kappa.is_finite() {
-        crate::bail_invalid_basis!("constant-curvature κ-fair score needs a finite kappa");
-    }
-    if y.len() != data.nrows() {
-        crate::bail_dim_basis!(
-            "constant-curvature κ-fair score: y has {} rows but data has {}",
-            y.len(),
-            data.nrows()
-        );
+        crate::bail_invalid_basis!("constant-curvature profile score needs a finite kappa");
     }
     validate_chart_points(data, spec.kappa, "data")?;
     let centers = select_centers_by_strategy(data, &spec.center_strategy)?;
@@ -911,6 +909,66 @@ pub fn constant_curvature_kappa_fair_sign_score(
     let raw_penalty =
         constant_curvature_kernel_matrix(centers.view(), centers.view(), spec.kappa, ell_eff_penalty)?;
     let s = symmetrize(&gauge.restrict_penalty(&raw_penalty));
+    Ok((b, s))
+}
+
+/// #1464: the **honest** fixed-κ profiled-REML score `V_p(κ)` for a
+/// constant-curvature smooth — the textbook Gaussian profiled-REML
+/// negative-log-evidence of the realized design `B = K_κ(data,centers)·z` against
+/// `y`, with the unpenalized intercept appended and the raw RKHS Gram penalty `S`
+/// profiled over λ (`profiled_reml_with_intercept`). This is the criterion whose
+/// argmin over the chart-bounded κ window IDENTIFIES the curvature, and the one
+/// `curvature_inference_forspec` walks for the magnitude CI and the κ = 0 flatness
+/// LR test.
+///
+/// Why this, not the production full-fit `reml_score`: the production REML's
+/// λ-selection heavily SMOOTHS this RKHS kernel (deviance ≫ near-interpolation
+/// RSS), and under heavy smoothing the +κ chart's geodesic-distance COMPRESSION
+/// makes the collapsed kernel fit the over-smoothed target better for ANY data —
+/// so the production `reml_score` is monotone toward the +chart bound regardless
+/// of the true sign (the headline #1464 sign-blindness, and an over-smoothing of
+/// the curvature criterion specifically). The honest profiled REML keeps the
+/// curvature-shape signal in the data fit (the κ that matches the geodesic
+/// geometry minimizes RSS), so its argmin lands on the correct sign, and because
+/// it is a proper profiled-REML deviance the LR/CI thresholds stay χ²-calibrated.
+/// On genuinely flat (constant-mean) data the criterion is ~flat in κ (the
+/// intercept absorbs the mean at every κ), giving the flatness test correct size.
+pub fn constant_curvature_honest_profiled_reml_score(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    spec: &ConstantCurvatureBasisSpec,
+) -> Result<f64, BasisError> {
+    if y.len() != data.nrows() {
+        crate::bail_dim_basis!(
+            "constant-curvature profiled-REML score: y has {} rows but data has {}",
+            y.len(),
+            data.nrows()
+        );
+    }
+    let (b, s) = constant_curvature_profile_design_penalty(data, spec)?;
+    let v = profiled_reml_with_intercept(&b, &y.to_owned(), &s);
+    if !v.is_finite() {
+        crate::bail_invalid_basis!(
+            "constant-curvature honest profiled-REML score at κ={} is non-finite",
+            spec.kappa
+        );
+    }
+    Ok(v)
+}
+
+pub fn constant_curvature_kappa_fair_sign_score(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    spec: &ConstantCurvatureBasisSpec,
+) -> Result<f64, BasisError> {
+    if y.len() != data.nrows() {
+        crate::bail_dim_basis!(
+            "constant-curvature κ-fair score: y has {} rows but data has {}",
+            y.len(),
+            data.nrows()
+        );
+    }
+    let (b, s) = constant_curvature_profile_design_penalty(data, spec)?;
 
     let v_y = profiled_reml_with_intercept(&b, &y.to_owned(), &s);
 

@@ -2051,6 +2051,63 @@ pub fn fixed_kappa_profiled_reml_score(
     if !kappa.is_finite() {
         crate::bail_invalid_estim!("fixed-κ profiled score probed a non-finite κ = {kappa}");
     }
+    // Resolve the constant-curvature term's feature columns and base spec so the
+    // criterion is probed on the production constant-curvature design.
+    let (feature_cols, mut probe_basis) = match resolvedspec
+        .smooth_terms
+        .get(term_idx)
+        .map(|t| &t.basis)
+    {
+        Some(SmoothBasisSpec::ConstantCurvature {
+            feature_cols, spec, ..
+        }) => (feature_cols.clone(), spec.clone()),
+        _ => {
+            crate::bail_invalid_estim!(
+                "fixed-κ profiled score: term {term_idx} is not a constant-curvature smooth"
+            )
+        }
+    };
+    probe_basis.kappa = kappa;
+
+    // #1464: the curvature κ criterion the CI/flatness oracle walks (and the
+    // `constant_curvature_profiled_reml_scores` export reports) is the HONEST
+    // fixed-κ profiled REML of the realized constant-curvature design —
+    // `dof·log(rss/dof) + log|H| − log|λS|₊` profiled over λ on `[1|K_κ·z]`
+    // (`constant_curvature_honest_profiled_reml_score`). NOT the production
+    // full-fit `reml_score`: that score heavily SMOOTHS this RKHS kernel, and under
+    // heavy smoothing the +κ chart's geodesic-distance compression makes the
+    // collapsed kernel a uniformly better fit of the over-smoothed target for ANY
+    // data, so it is MONOTONE toward the +chart bound regardless of the true
+    // curvature sign (the #1464 sign-blindness — `bug_hunt_1464_criterion_vs_solver`
+    // shows V_p(+2) < V_p(0) < V_p(−2) on hyperbolic data with the raw score). The
+    // honest profiled REML keeps the curvature-shape signal in the data fit, so its
+    // argmin tracks the planted sign, and as a proper profiled-REML deviance the
+    // CI/flatness LR thresholds stay χ²-calibrated; on constant-mean data it is
+    // ~flat in κ, giving the flatness test correct size. Gaussian-identity is the
+    // only family the curvature-as-estimand path serves; a weighted response, a
+    // non-zero offset, or a non-Gaussian link routes to the production fixed-κ fit
+    // (those configurations are not exercised by curvature inference, and the
+    // fallback keeps their behaviour byte-identical).
+    let is_unweighted = weights.iter().all(|&w| (w - 1.0).abs() <= 1e-12);
+    let is_zero_offset = offset.iter().all(|&o| o.abs() <= 1e-12);
+    if family == LikelihoodSpec::gaussian_identity() && is_unweighted && is_zero_offset {
+        let x_term = select_columns(data, &feature_cols).map_err(EstimationError::from)?;
+        let score =
+            crate::basis::constant_curvature_honest_profiled_reml_score(x_term.view(), y, &probe_basis)
+                .map_err(|e| {
+                    EstimationError::InvalidInput(format!(
+                        "fixed-κ honest profiled-REML score at κ={kappa} failed: {e}"
+                    ))
+                })?;
+        if !score.is_finite() {
+            crate::bail_invalid_estim!(
+                "fixed-κ honest profiled-REML score at κ={kappa} is non-finite"
+            );
+        }
+        return Ok(score);
+    }
+
+    // Fallback (weighted / offset / non-Gaussian): the production fixed-κ fit.
     let mut probe_spec = resolvedspec.clone();
     match probe_spec.smooth_terms.get_mut(term_idx).map(|t| &mut t.basis) {
         Some(SmoothBasisSpec::ConstantCurvature { spec, .. }) => spec.kappa = kappa,
@@ -2060,8 +2117,6 @@ pub fn fixed_kappa_profiled_reml_score(
             )
         }
     }
-    // κ-optimisation OFF routes straight to a fixed-κ profiled-ρ fit, identical to
-    // the `curvature_inference_forspec` V_p oracle.
     let fixed_kappa_options = SpatialLengthScaleOptimizationOptions {
         enabled: false,
         ..SpatialLengthScaleOptimizationOptions::default()

@@ -379,7 +379,11 @@ fn curv_formula_builds_constant_curvature_term() {
         CenterStrategy::FarthestPoint { num_centers: 4 }
     ));
     assert_eq!(cc.length_scale, 0.0, "auto length-scale sentinel");
-    assert!(cc.double_penalty);
+    // curv() defaults to NO double-penalty ridge (#1464: the curvature-blind ridge
+    // `I` absorbs the data fit independently of κ and railed the fitted curvature
+    // to a chart bound; the RKHS Gram penalty is already full-rank PD). An explicit
+    // `double_penalty=` is still honoured.
+    assert!(!cc.double_penalty);
 }
 
 #[test]
