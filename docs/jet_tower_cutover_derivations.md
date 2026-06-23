@@ -688,3 +688,25 @@ hand kernel kept for speed gains a CI oracle asserting channel-by-channel
 agreement (mixed abs/rel tol, strict non-finite handling) against the
 single-expression tower truth — the test that would have caught #736 at
 introduction.
+
+---
+
+## Cutover status (2026-06-23)
+
+Landed on `main`:
+
+- **A.1 `Order2<K>`** — live; `RowKernel::row_kernel` `(v,g,H)` routes through it.
+- **A.2 one-seed / A.3 two-seed** — packed scalars exist; survival location-scale `RowKernel<9>` builds its directional / joint-Hessian channels through them (`survival::location_scale::row_kernel`).
+- **B implicit lift (BMS empirical-rigid)** — the hand IFT closed-forms are gone; the grid intercept `a(m,g)` is lifted in the consumer's packed algebra by the generic `filtered_implicit_solve_scalar` (`jet_scalar.rs`, fixed-Jacobian Newton in the nilpotent algebra), `Order2<2>` for `(v,g,H)` and `Tower4<2>` for `.t3/.t4`. Pinned to the independent `Tower4<3>` `implicit_solve` witness at 1e-9.
+- **BMS standard-normal** — ordinary row and the batched builder both derive their signed margin from one `rigid_standard_normal_signed_margin<S>` expression (no second hand-packed jet).
+- **SAE border channels** — `row_jets_for_logdet` β channels derive from `SaeReconstructionRowProgram::beta_border_tower<K>`; the hand gate-derivative recursion is deleted. Pinned by the converged-cache oracle at 1e-9.
+- **Binomial location-scale link-wiggle** — `wiggle_hessian_row_pieces` cross-blocks pinned to a mechanical `Tower2<3>` (composing `q = q0 + Σ βw·B(q0)`) at 1e-9, all three links (`binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_932`).
+
+Jet program landed, gate not yet flipped:
+
+- **E link-wiggle pullback (survival location-scale)** — the survival row NLL `sls_row_nll` extended with the warp `q = q0 + Σ βw·B(q0)` and the qdot coupling `g = m1·g0` (βw as jet primaries) is verified vs finite differences across Gaussian/Gumbel/Logistic. Enabling `row_kernel_joint_hessian_supported()` for the wiggle case (routing the production joint Hessian through this program) is the remaining production cutover: the wiggle is a nonlinear index-warp, so it needs a wiggle-aware row kernel that carries the warp and the three basis designs, not a plain `RowKernel<9+pw>`.
+
+Pending:
+
+- **C / D / Unifying: flex one program** — collapse `first_full.rs` + `directional.rs` + `bidirectional.rs` to one `RowNllProgram` (crossing edges via C, moving-domain integrals via D). The `moving_limit_boundary_tower*` helpers exist but have no production caller yet.
+- **Gate flips** — `row_kernel_directional_supported()` / `row_kernel_joint_hessian_supported()` for the link-wiggle case (depends on E above).
