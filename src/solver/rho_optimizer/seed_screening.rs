@@ -597,6 +597,30 @@ fn smoothing_rho_sum(result: &OuterResult, rho_dim: usize) -> f64 {
         .sum()
 }
 
+/// Whether a NON-converged outer result's cached `final_value` can be trusted
+/// for a keep-best cost comparison (#1426/#1477).
+///
+/// A non-converged seed reports a `final_value` that may or may not be a
+/// faithful REML/LAML evaluation at its ρ. When the bound-projected residual
+/// gradient is at most modestly above the outer tolerance
+/// (`<= FLAT_VALLEY_STALL_GRAD_CEILING`), the result is sitting on a genuine
+/// flat-valley / near-separable plateau: the cost is an honest evaluation and a
+/// legitimate basis for comparison. When the projected residual is FAR above the
+/// ceiling, the inner PIRLS hit its iteration cap at an under-penalized (λ→0) ρ
+/// — the cached cost is spuriously low (an invalid REML value the line search
+/// could not improve) while the analytic gradient still points strongly toward
+/// more penalization. That stuck-stall cost must NOT win a `final_value`
+/// comparison: trusting it ships the #1426 near-full-basis overfit (EDF ≈ k).
+///
+/// Mirrors exactly the stuck-stall vs. genuine-plateau distinction already used
+/// by [`should_stop_expensive_multistart_after_best`].
+#[inline]
+fn nonconverged_cost_is_trustworthy(result: &OuterResult) -> bool {
+    result
+        .final_grad_norm
+        .is_none_or(|g| g.is_finite() && g <= FLAT_VALLEY_STALL_GRAD_CEILING)
+}
+
 /// Keep-best comparison that breaks a *near-tie* in the converged LAML toward
 /// the more parsimonious (more-smoothed) basin.
 ///
@@ -639,7 +663,41 @@ pub(crate) fn candidate_improves_best_parsimonious(
                 candidate.final_value < best.final_value
             }
         }
-        Some(best) => candidate.final_value < best.final_value,
+        // BOTH non-converged (#1426/#1477). Do NOT blindly adopt the lower
+        // `final_value`: a non-converged seed's cached cost is only an honest
+        // REML/LAML evaluation when it sits on a genuine flat-valley plateau
+        // (projected residual `<= FLAT_VALLEY_STALL_GRAD_CEILING`). A seed whose
+        // residual is FAR above the ceiling is a stuck PIRLS-capped λ→0 stall
+        // with a spuriously-low cost (the #1426 near-full-basis overfit; the
+        // #1477 ps double-penalty overshoot adopted on the same untrustworthy
+        // basis). Seed screening deliberately puts the flexible (λ→0) seed at
+        // slot 0 and the heavy/penalized seed at slot 1, so this stuck seed's
+        // bogus cost otherwise beats the honest heavier candidate. A candidate
+        // with a TRUSTWORTHY cost beats an incumbent with an UNTRUSTWORTHY one
+        // regardless of `final_value`, and never loses to it.
+        Some(best) => {
+            let candidate_trustworthy = nonconverged_cost_is_trustworthy(candidate);
+            let best_trustworthy = nonconverged_cost_is_trustworthy(best);
+            match (candidate_trustworthy, best_trustworthy) {
+                (true, false) => true,
+                (false, true) => false,
+                // Both honest flat-valley plateaus: their costs ARE comparable.
+                (true, true) => candidate.final_value < best.final_value,
+                // Both stuck PIRLS-capped stalls (#1426): the cached cost is
+                // spuriously low for BOTH, so it cannot break the tie — the
+                // under-penalized λ→0 overfit (EDF ≈ k) carries the LOWER bogus
+                // cost yet a much LARGER residual gradient than the heavily
+                // penalized basin that is the real answer. Prefer the candidate
+                // whose bound-projected residual gradient is SMALLER, i.e. the
+                // one closer to a stationary point (the heavy flat-valley floor),
+                // not the λ→0 stall whose huge gradient marks its cost invalid.
+                // Falls back to `final_value` only when a gradient is unavailable.
+                (false, false) => match (candidate.final_grad_norm, best.final_grad_norm) {
+                    (Some(cg), Some(bg)) if cg.is_finite() && bg.is_finite() => cg < bg,
+                    _ => candidate.final_value < best.final_value,
+                },
+            }
+        }
     }
 }
 
