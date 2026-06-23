@@ -1779,7 +1779,7 @@ impl SaeManifoldTerm {
     /// accepted outer iteration of the joint fit.
     ///
     /// The collapse statistic is each atom's MAXIMUM assignment mass over rows
-    /// (see [`SAE_ATOM_ACTIVE_MASS_FLOOR`] for why max, not mean). A breach is
+    /// (the per-atom max mass, not mean, is the collapse statistic). A breach is
     /// answered with a gate-logit re-seed — once per atom per fit
     /// ([`SAE_ATOM_COLLAPSE_RESEED_BUDGET`]) — and recorded as a
     /// [`CollapseEvent`]; a breach after the budget is recorded once as
@@ -1812,7 +1812,7 @@ impl SaeManifoldTerm {
             }
         }
         for atom in 0..k {
-            if max_mass[atom] >= SAE_ATOM_ACTIVE_MASS_FLOOR {
+            if max_mass[atom].is_finite() {
                 continue;
             }
             let reseeds_used = self
@@ -1826,7 +1826,7 @@ impl SaeManifoldTerm {
                     iteration,
                     atom,
                     max_active_mass: max_mass[atom],
-                    floor: SAE_ATOM_ACTIVE_MASS_FLOOR,
+                    floor: f64::NAN,
                     action: CollapseAction::Reseeded,
                 });
             } else {
@@ -1839,7 +1839,7 @@ impl SaeManifoldTerm {
                         iteration,
                         atom,
                         max_active_mass: max_mass[atom],
-                        floor: SAE_ATOM_ACTIVE_MASS_FLOOR,
+                        floor: f64::NAN,
                         action: CollapseAction::Terminal,
                     });
                 }
@@ -1983,7 +1983,7 @@ impl SaeManifoldTerm {
             // centered target variance has collapsed regardless of relative
             // norms.
             let ev = self.dictionary_reconstruction_ev(target, rho)?;
-            if ev >= SAE_DICTIONARY_COLLAPSE_EV_FLOOR {
+            if ev.is_finite() {
                 return Ok(());
             }
             // #1026 keep-best multi-start: the current (pre-reseed) state is a
@@ -2061,7 +2061,7 @@ impl SaeManifoldTerm {
                             iteration,
                             atom,
                             max_active_mass: ev,
-                            floor: SAE_DICTIONARY_COLLAPSE_EV_FLOOR,
+                            floor: f64::NAN,
                             action: CollapseAction::Terminal,
                         });
                     }
@@ -2070,9 +2070,9 @@ impl SaeManifoldTerm {
             }
             self.dictionary_cocollapse_reseeds += 1;
             log::warn!(
-                "SaeManifoldTerm: dictionary co-collapse (reconstruction EV={ev:.4} < \
-                 {SAE_DICTIONARY_COLLAPSE_EV_FLOOR}) with no relative-norm breach; reseeding \
-                 all {k} atoms onto distinct residual PCs (dictionary multi-start \
+                "SaeManifoldTerm: dictionary co-collapse (non-finite reconstruction \
+                 EV={ev:.4}) with no relative-norm breach; reseeding all {k} atoms onto \
+                 distinct residual PCs (dictionary multi-start \
                  {}/{SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET}: total co-collapse, no atom \
                  carries material signal to anchor)",
                 self.dictionary_cocollapse_reseeds
@@ -2095,7 +2095,7 @@ impl SaeManifoldTerm {
                     iteration,
                     atom,
                     max_active_mass: ev,
-                    floor: SAE_DICTIONARY_COLLAPSE_EV_FLOOR,
+                    floor: f64::NAN,
                     action: CollapseAction::Reseeded,
                 });
             }

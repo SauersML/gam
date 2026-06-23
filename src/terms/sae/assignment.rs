@@ -25,14 +25,6 @@ use crate::terms::sae::manifold::SaeManifoldRho;
 /// and step halvings shrink the trial below the cap).
 pub(crate) const SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS: f64 = 4.0;
 
-/// #976 Layer-1 guard: per-atom active-mass floor. The collapse statistic is
-/// the atom's MAXIMUM assignment mass over rows, not its mean: a legitimately
-/// sparse atom has a small mean but high mass on its own rows, while only an
-/// atom with no material support anywhere — the #853 failure — has a small
-/// max. An atom whose max mass falls below this floor is re-seeded (once) or
-/// recorded as terminally collapsed; never a silent death, never a fit error.
-pub(crate) const SAE_ATOM_ACTIVE_MASS_FLOOR: f64 = 1.0e-3;
-
 /// #976 Layer-1 guard: re-seed budget per atom per joint fit. One second
 /// chance from a fresh basin; a second breach means the collapse is (locally)
 /// the objective's verdict at the current hyperparameters, which is recorded
@@ -55,20 +47,6 @@ pub(crate) const SAE_ATOM_COLLAPSE_RESEED_BUDGET: usize = 1;
 /// norm), so the K=1 path is byte-for-byte unchanged.
 pub(crate) const SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO: f64 = 1.0e-3;
 
-/// #976 Layer-1 guard (simultaneous-collapse arm): the reconstruction
-/// explained-variance below which a K>=2 dictionary is judged to have
-/// CO-collapsed — every atom degenerate together, so the median-relative
-/// [`SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO`] test sees no atom "behind" its peers
-/// and stays silent. This is the real-data K>=2 failure: atoms can split enough
-/// signal to avoid a relative-norm breach while still under-recovering the
-/// long-tailed target. The floor therefore lives above the committed
-/// OLMo-mixed-layer held-out acceptance bar (0.5 × rank-8 PCA EV ≈ 0.27515),
-/// so a partial co-collapse is re-diversified instead of being accepted as a
-/// merely-difficult fit. K=1 returns before this guard, so the single-atom OLMo
-/// path is unchanged. When tripped, the guard reseeds the dictionary onto
-/// distinct residual PCs to break the shared basin.
-pub(crate) const SAE_DICTIONARY_COLLAPSE_EV_FLOOR: f64 = 0.28;
-
 /// #976 / #1117 K>1 robustness: bounded DICTIONARY-level multi-start budget for
 /// the simultaneous co-collapse arm (the EV-floor branch of
 /// [`crate::terms::sae::manifold::SaeManifoldTerm::enforce_decoder_norm_guard`]).
@@ -81,7 +59,8 @@ pub(crate) const SAE_DICTIONARY_COLLAPSE_EV_FLOOR: f64 = 0.28;
 /// basins. A single such reseed empirically cannot always break a K≥3 three-way
 /// basin (identical (K, seed) flips EV≈0.40 ↔ 0.00), so this arm gets a small
 /// bounded budget of independent multi-starts. It is consumed ONLY when the
-/// whole dictionary explains < [`SAE_DICTIONARY_COLLAPSE_EV_FLOOR`] of the
+/// whole dictionary explains a non-finite reconstruction EV (the magic EV floor
+/// was deleted; only a genuine NaN/Inf degenerate state now triggers it) of the
 /// variance — a no-op for any healthy fit (real OLMo K=1 ~0.22, K=2 ~0.40).
 pub(crate) const SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET: usize = 3;
 

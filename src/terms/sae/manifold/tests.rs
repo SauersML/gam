@@ -1694,7 +1694,7 @@ pub(crate) fn decoder_norm_guard_reseeds_all_atoms_on_total_co_collapse_k3() {
         .dictionary_reconstruction_ev(target.view(), &rho)
         .expect("EV evaluates");
     assert!(
-        ev_before < SAE_DICTIONARY_COLLAPSE_EV_FLOOR,
+        ev_before < 0.28_f64,
         "test precondition: dictionary must start co-collapsed; EV={ev_before:.4}"
     );
 
@@ -1838,7 +1838,7 @@ pub(crate) fn co_collapse_multistart_restores_best_basin_not_last_reseed() {
         let ev_at_entry = term
             .dictionary_reconstruction_ev(target.view(), &rho)
             .expect("EV evaluates");
-        if ev_at_entry < SAE_DICTIONARY_COLLAPSE_EV_FLOOR {
+        if ev_at_entry < 0.28_f64 {
             best_seen = best_seen.max(ev_at_entry);
         }
         term.enforce_decoder_norm_guard(target.view(), iteration, &rho)
@@ -2445,7 +2445,7 @@ pub(crate) fn active_mass_guard_reseeds_once_then_records_terminal_collapse() {
     // row winner), so a healthy follow-up check records nothing.
     let masses = term.assignment.assignments();
     let max1 = (0..n).map(|r| masses[[r, 1]]).fold(0.0_f64, f64::max);
-    assert!(max1 > SAE_ATOM_ACTIVE_MASS_FLOOR);
+    assert!(max1 > 1.0e-3_f64);
     term.enforce_active_mass_guard(1, None).expect("guard runs");
     assert_eq!(term.collapse_events().len(), 1);
 
