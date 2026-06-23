@@ -8425,5 +8425,12 @@ fn flex_bidir_auvd12_fd_1454() {
             }
         }
         eprintln!("#1454 AUVD12 WORST {wl} abserr {worst:.3e}");
+        // The worst-case FD/analytic discrepancy must be finite — a NaN means the
+        // intercept re-solve or the analytic auvd12 blew up. This is the test's
+        // verifying assertion; the `eprintln!`s above carry the per-entry split.
+        assert!(
+            worst.is_finite(),
+            "#1454 auvd12 FD worst-case abserr must be finite, got {worst:.3e} at {wl}"
+        );
     }
 }
