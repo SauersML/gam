@@ -4952,10 +4952,10 @@ fn row_derivative_identities_hold_for_non_probit_links() {
 
             let ell_h0 = row.grad_time_eta_h0;
             let ell_h1 = row.grad_time_eta_h1;
-            let ell_q = row.d1_q;
+            let ell_q = row.d1_q0 + row.d1_q1;
             let ell_h0q = row.h_time_h0;
             let ell_h1q = row.h_time_h1;
-            let ell_qq = row.d2_q;
+            let ell_qq = row.d2_q0 + row.d2_q1;
             assert!(
                 (ell_q - ell_h0 - ell_h1).abs() <= 1e-10,
                 "survival {label} row {i} violated ell_q = ell_h0 + ell_h1: q={} h0={} h1={}",

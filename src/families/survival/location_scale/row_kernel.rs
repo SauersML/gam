@@ -91,9 +91,6 @@ impl SurvivalExactRowKernel {
 }
 
 pub(crate) struct SurvivalJointQuantities {
-    pub(crate) d1_q: Array1<f64>,
-    pub(crate) d2_q: Array1<f64>,
-    pub(crate) d3_q: Array1<f64>,
     /// Entry-only derivatives of ell w.r.t. q0.
     pub(crate) d1_q0: Array1<f64>,
     pub(crate) d2_q0: Array1<f64>,
@@ -108,9 +105,6 @@ pub(crate) struct SurvivalJointQuantities {
     pub(crate) h_time_h0: Array1<f64>,
     pub(crate) h_time_h1: Array1<f64>,
     pub(crate) h_time_d: Array1<f64>,
-    pub(crate) d_h_h0: Array1<f64>,
-    pub(crate) d_h_h1: Array1<f64>,
-    pub(crate) d_h_d: Array1<f64>,
     /// Exit-side dq/d(eta_t) = -exp(-eta_ls_exit).
     pub(crate) dq_t: Array1<f64>,
     /// Exit-side dq/d(eta_ls).
@@ -632,7 +626,6 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
         family: &'a SurvivalLocationScaleFamily,
         q: &'a SurvivalJointQuantities,
         dynamic: &'a SurvivalDynamicGeometry,
-        block_states: &[ParameterBlockState],
         deriv_log_scale: f64,
     ) -> Result<Self, String> {
         let base = SurvivalLsRowKernel {
@@ -669,10 +662,14 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
         // joint_block_offsets() appends the wiggle block last, so its start is
         // the second-to-last offset (offsets = [0, time, +thr, +ls, +wiggle]).
         let wiggle_off = base.offsets[base.offsets.len() - 2];
-        let betaw = block_states
-            .last()
-            .map(|s| s.beta.to_vec())
-            .ok_or("link-wiggle kernel: missing wiggle block state")?;
+        // βw is carried on the dynamic geometry (populated from the wiggle block
+        // in `build_dynamic_geometry`), so this kernel needs no `block_states` —
+        // letting the workspace `_from_parts` directional entry points build it.
+        let betaw = dynamic
+            .wiggle_beta
+            .as_ref()
+            .map(|b| b.to_vec())
+            .ok_or("link-wiggle kernel: missing wiggle_beta on dynamic geometry")?;
         Ok(Self {
             base,
             pw,
@@ -854,7 +851,6 @@ pub(crate) fn survival_ls_wiggle_joint_hessian_dense(
     family: &SurvivalLocationScaleFamily,
     q: &SurvivalJointQuantities,
     dynamic: &SurvivalDynamicGeometry,
-    block_states: &[ParameterBlockState],
     deriv_log_scale: f64,
 ) -> Result<Array2<f64>, String> {
     use crate::families::row_kernel::{RowSet, build_row_kernel_cache, row_kernel_hessian_dense};
@@ -865,13 +861,8 @@ pub(crate) fn survival_ls_wiggle_joint_hessian_dense(
         .ok_or("wiggle joint Hessian: no link-wiggle design")?;
     macro_rules! run {
         ($kw:literal) => {{
-            let kernel = SurvivalLsWiggleRowKernel::<$kw>::new(
-                family,
-                q,
-                dynamic,
-                block_states,
-                deriv_log_scale,
-            )?;
+            let kernel =
+                SurvivalLsWiggleRowKernel::<$kw>::new(family, q, dynamic, deriv_log_scale)?;
             let rows = RowSet::All;
             let cache = build_row_kernel_cache(&kernel, &rows)?;
             Ok(row_kernel_hessian_dense(&kernel, &cache, &rows))
@@ -890,6 +881,99 @@ pub(crate) fn survival_ls_wiggle_joint_hessian_dense(
         19 => run!(19),
         20 => run!(20),
         other => Err(format!("link-wiggle joint Hessian: unsupported KW={other}")),
+    }
+}
+
+/// Dispatch the runtime wiggle width `pw` to a concrete `KW` and assemble the
+/// single-source link-wiggle FIRST directional derivative `Σ_c ℓ_{abc} dir_c =
+/// (D_dir H)[a][b]` — the ε-Hessian channel of the §13 warp row NLL at the
+/// packed `OneSeed<KW>` directional scalar, pulled back into coefficient space
+/// by the SAME `JᵀHJ` the joint-Hessian path uses. Replaces the bespoke hand
+/// assembly the `_from_parts_masked` wiggle fall-through previously ran (the
+/// #736/#932 hand-derivative genus the single-source contract removes). The
+/// convention matches the non-wiggle base path, which routes its directional
+/// through the identical `row_kernel_directional_derivative` free function.
+pub(crate) fn survival_ls_wiggle_directional_derivative_dense(
+    family: &SurvivalLocationScaleFamily,
+    q: &SurvivalJointQuantities,
+    dynamic: &SurvivalDynamicGeometry,
+    deriv_log_scale: f64,
+    rows: &crate::families::row_kernel::RowSet,
+    d_beta: &[f64],
+) -> Result<Array2<f64>, String> {
+    use crate::families::row_kernel::row_kernel_directional_derivative;
+    let pw = family
+        .x_link_wiggle
+        .as_ref()
+        .map(|d| d.ncols())
+        .ok_or("wiggle directional derivative: no link-wiggle design")?;
+    macro_rules! run {
+        ($kw:literal) => {{
+            let kernel =
+                SurvivalLsWiggleRowKernel::<$kw>::new(family, q, dynamic, deriv_log_scale)?;
+            row_kernel_directional_derivative(&kernel, rows, d_beta)
+        }};
+    }
+    match SLS_ROW_K + pw {
+        10 => run!(10),
+        11 => run!(11),
+        12 => run!(12),
+        13 => run!(13),
+        14 => run!(14),
+        15 => run!(15),
+        16 => run!(16),
+        17 => run!(17),
+        18 => run!(18),
+        19 => run!(19),
+        20 => run!(20),
+        other => Err(format!(
+            "link-wiggle directional derivative: unsupported KW={other}"
+        )),
+    }
+}
+
+/// Dispatch the runtime wiggle width `pw` to a concrete `KW` and assemble the
+/// single-source link-wiggle SECOND directional derivative `Σ_cd ℓ_{abcd} u_c
+/// v_d` — the ε,δ-Hessian channel of the §13 warp row NLL at the packed
+/// `TwoSeed<KW>` bidirectional scalar. Replaces the previous wiggle carve-out
+/// that returned `None` (no second-directional curvature for wiggle rows).
+pub(crate) fn survival_ls_wiggle_second_directional_derivative_dense(
+    family: &SurvivalLocationScaleFamily,
+    q: &SurvivalJointQuantities,
+    dynamic: &SurvivalDynamicGeometry,
+    deriv_log_scale: f64,
+    rows: &crate::families::row_kernel::RowSet,
+    d_beta_u: &[f64],
+    d_beta_v: &[f64],
+) -> Result<Array2<f64>, String> {
+    use crate::families::row_kernel::row_kernel_second_directional_derivative;
+    let pw = family
+        .x_link_wiggle
+        .as_ref()
+        .map(|d| d.ncols())
+        .ok_or("wiggle second directional derivative: no link-wiggle design")?;
+    macro_rules! run {
+        ($kw:literal) => {{
+            let kernel =
+                SurvivalLsWiggleRowKernel::<$kw>::new(family, q, dynamic, deriv_log_scale)?;
+            row_kernel_second_directional_derivative(&kernel, rows, d_beta_u, d_beta_v)
+        }};
+    }
+    match SLS_ROW_K + pw {
+        10 => run!(10),
+        11 => run!(11),
+        12 => run!(12),
+        13 => run!(13),
+        14 => run!(14),
+        15 => run!(15),
+        16 => run!(16),
+        17 => run!(17),
+        18 => run!(18),
+        19 => run!(19),
+        20 => run!(20),
+        other => Err(format!(
+            "link-wiggle second directional derivative: unsupported KW={other}"
+        )),
     }
 }
 
@@ -1574,9 +1658,6 @@ impl SurvivalLocationScaleFamily {
     ) -> Result<SurvivalJointQuantities, String> {
         let n = self.n;
         let dynamic = self.build_dynamic_geometry(block_states)?;
-        let mut d1_q = Array1::<f64>::zeros(n);
-        let mut d2_q = Array1::<f64>::zeros(n);
-        let mut d3_q = Array1::<f64>::zeros(n);
         let mut d1_q0 = Array1::<f64>::zeros(n);
         let mut d2_q0 = Array1::<f64>::zeros(n);
         let mut d3_q0 = Array1::<f64>::zeros(n);
@@ -1588,9 +1669,6 @@ impl SurvivalLocationScaleFamily {
         let mut h_time_h0 = Array1::<f64>::zeros(n);
         let mut h_time_h1 = Array1::<f64>::zeros(n);
         let mut h_time_d = Array1::<f64>::zeros(n);
-        let mut d_h_h0 = Array1::<f64>::zeros(n);
-        let mut d_h_h1 = Array1::<f64>::zeros(n);
-        let mut d_h_d = Array1::<f64>::zeros(n);
 
         // Write each row's 21 derivative scalars directly into the
         // preallocated output arrays in parallel. The previous path collected
@@ -1624,9 +1702,6 @@ impl SurvivalLocationScaleFamily {
             }
         }
 
-        let p_d1_q = SendPtr(d1_q.as_mut_ptr());
-        let p_d2_q = SendPtr(d2_q.as_mut_ptr());
-        let p_d3_q = SendPtr(d3_q.as_mut_ptr());
         let p_d1_q0 = SendPtr(d1_q0.as_mut_ptr());
         let p_d2_q0 = SendPtr(d2_q0.as_mut_ptr());
         let p_d3_q0 = SendPtr(d3_q0.as_mut_ptr());
@@ -1638,9 +1713,6 @@ impl SurvivalLocationScaleFamily {
         let p_h_time_h0 = SendPtr(h_time_h0.as_mut_ptr());
         let p_h_time_h1 = SendPtr(h_time_h1.as_mut_ptr());
         let p_h_time_d = SendPtr(h_time_d.as_mut_ptr());
-        let p_d_h_h0 = SendPtr(d_h_h0.as_mut_ptr());
-        let p_d_h_h1 = SendPtr(d_h_h1.as_mut_ptr());
-        let p_d_h_d = SendPtr(d_h_d.as_mut_ptr());
 
         let dyn_ref = &dynamic;
         (0..n)
@@ -1661,9 +1733,6 @@ impl SurvivalLocationScaleFamily {
                 // exactly once; pointers target distinct length-`n` `Array1`
                 // buffers not read until the parallel loop completes.
                 unsafe {
-                    p_d1_q.write(i, row.d1_q);
-                    p_d2_q.write(i, row.d2_q);
-                    p_d3_q.write(i, row.d3_q);
                     p_d1_q0.write(i, row.d1_q0);
                     p_d2_q0.write(i, row.d2_q0);
                     p_d3_q0.write(i, row.d3_q0);
@@ -1675,17 +1744,11 @@ impl SurvivalLocationScaleFamily {
                     p_h_time_h0.write(i, row.h_time_h0);
                     p_h_time_h1.write(i, row.h_time_h1);
                     p_h_time_d.write(i, row.h_time_d);
-                    p_d_h_h0.write(i, row.d_h_h0);
-                    p_d_h_h1.write(i, row.d_h_h1);
-                    p_d_h_d.write(i, row.d_h_d);
                 }
                 Ok(())
             })?;
 
         Ok(SurvivalJointQuantities {
-            d1_q,
-            d2_q,
-            d3_q,
             d1_q0,
             d2_q0,
             d3_q0,
@@ -1697,9 +1760,6 @@ impl SurvivalLocationScaleFamily {
             h_time_h0,
             h_time_h1,
             h_time_d,
-            d_h_h0,
-            d_h_h1,
-            d_h_d,
             dq_t: dynamic.dq_t_exit,
             dq_ls: dynamic.dq_ls_exit,
             d2q_tls: dynamic.d2q_tls_exit,
@@ -2666,14 +2726,8 @@ impl SurvivalLocationScaleFamily {
         let d3_q1 = -tower.t3[1][1][1];
         let d1_qdot1 = -tower.g[2];
         let d2_qdot1 = -tower.h[2][2];
-        let d1_q = d1_q0 + d1_q1;
-        let d2_q = d2_q0 + d2_q1;
-        let d3_q = d3_q0 + d3_q1;
         Ok(Some(SurvivalRowDerivatives {
             ll: kernel.log_likelihood(),
-            d1_q,
-            d2_q,
-            d3_q,
             d1_q0,
             d2_q0,
             d3_q0,
@@ -2688,9 +2742,6 @@ impl SurvivalLocationScaleFamily {
             h_time_h0: d2_q0,
             h_time_h1: d2_q1,
             h_time_d: d2_qdot1,
-            d_h_h0: d3_q0,
-            d_h_h1: d3_q1,
-            d_h_d: -tower.t3[2][2][2],
         }))
     }
 }

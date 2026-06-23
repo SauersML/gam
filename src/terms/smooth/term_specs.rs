@@ -7312,7 +7312,27 @@ fn build_single_local_smooth_term(
         }
     };
 
-    if let SmoothBasisSpec::Matern { .. } = &term.basis {
+    // #1074: matern() penalty selection.
+    //
+    //   * `double_penalty = true` (the DEFAULT): keep the genuine
+    //     reproducing-kernel-Hilbert-space penalty `β' K_CC β` that
+    //     `build_matern_basis_seeded` already built (Primary kernel Gram + the
+    //     null-space shrinkage ridge). This is mgcv's `bs="gp"` / fields kriging
+    //     construction — design = cross-covariance `K_nc`, penalty = knot
+    //     covariance `K_cc` — and recovers the truth at the mature reference's
+    //     efficiency. The operator-collocation triplet (mass/tension/stiffness)
+    //     is only an *approximation* to that RKHS norm and systematically
+    //     under-smooths the rougher half-integer kernels (ν = 3/2), inflating
+    //     EDF and the truth-recovery RMSE (#1074).
+    //
+    //   * `double_penalty = false` (explicit opt-out): use the operator
+    //     collocation triplet, whose Sobolev-order dials give a finer-grained
+    //     roughness control than the single RKHS norm. The κ-optimizer's n-free
+    //     re-key and ψ-derivative paths branch on the same `double_penalty` flag
+    //     so the penalty BLOCK COUNT stays ψ-stable (the #1270 invariant).
+    if let SmoothBasisSpec::Matern { spec, .. } = &term.basis
+        && !spec.double_penalty
+    {
         let (penalties, nullspace_dims, penaltyinfo) =
             matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
         built.penalties = penalties;

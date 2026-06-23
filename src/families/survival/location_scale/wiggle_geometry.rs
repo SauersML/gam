@@ -325,6 +325,13 @@ pub(crate) struct SurvivalDynamicGeometry {
     pub(crate) wiggle_basis_d1_entry: Option<Array2<f64>>,
     pub(crate) wiggle_basis_d2_exit: Option<Array2<f64>>,
     pub(crate) wiggle_qdot_basis_exit: Option<Array2<f64>>,
+    /// #932: the current link-wiggle coefficient vector βw (the last joint
+    /// block's β), captured here so the single-source wiggle RowKernel
+    /// (`SurvivalLsWiggleRowKernel`) can be built from `(q, dynamic)` alone —
+    /// without re-threading `block_states` through the workspace-friendly
+    /// `_from_parts` directional entry points that deliberately drop it.
+    /// `Some(βw)` exactly when a link-wiggle design is present.
+    pub(crate) wiggle_beta: Option<Array1<f64>>,
 }
 
 impl SurvivalDynamicGeometry {
@@ -887,6 +894,11 @@ impl SurvivalLocationScaleFamily {
             wiggle_basis_d1_entry: wiggle_entry.as_ref().map(|w| w.basis_d1.clone()),
             wiggle_basis_d2_exit: wiggle_exit.as_ref().map(|w| w.basis_d2.clone()),
             wiggle_qdot_basis_exit,
+            wiggle_beta: if self.x_link_wiggle.is_some() {
+                Some(block_states[Self::BLOCK_LINK_WIGGLE].beta.to_owned())
+            } else {
+                None
+            },
         };
         dynamic.validate_precomputed_channels()?;
         Ok(dynamic)

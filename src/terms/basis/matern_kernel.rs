@@ -3184,6 +3184,101 @@ pub(crate) fn build_matern_kernel_penalty(
     Ok(penalty_kernel)
 }
 
+/// Build the Matérn double-penalty (RKHS-kernel) penalty list at an explicit
+/// **effective** length scale, mirroring the cold double-penalty assembly in
+/// `build_matern_basis_seeded` (`build_matern_kernel_penalty` →
+/// `project_penalty_matrix(full_transform)` →
+/// `matern_double_penalty_candidates_with_decision`). This is the κ-optimizer's
+/// n-free (#1033) re-key for the genuine RKHS penalty `β' K_CC β` (mgcv
+/// `bs="gp"` / fields kriging), the analogue of
+/// `matern_operator_penalty_triplet_at_length_scale` for the operator path.
+///
+/// `frozen_nullspace_shrinkage_survived` is the metadata decision pinned at the
+/// cold build, so the emitted BLOCK COUNT is ψ-invariant by construction (the
+/// #1270 topology-desync invariant): `Some(true)` always emits the Primary
+/// kernel Gram plus the null-space shrinkage ridge, `Some(false)`/`None` emits
+/// only the Primary block. Returns the per-block penalty matrices (term-local
+/// frame, same order/count the cold build emits) and their nullspace dims.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matern_kernel_double_penalties_at_length_scale(
+    centers: ArrayView2<'_, f64>,
+    identifiability_transform: Option<&Array2<f64>>,
+    include_intercept: bool,
+    nu: MaternNu,
+    aniso_log_scales: Option<&[f64]>,
+    effective_length_scale: f64,
+    frozen_nullspace_shrinkage_survived: Option<bool>,
+) -> Result<(Vec<Array2<f64>>, Vec<usize>), BasisError> {
+    let penalty_kernel = build_matern_kernel_penalty(
+        centers,
+        effective_length_scale,
+        nu,
+        include_intercept,
+        aniso_log_scales,
+    )?;
+    // Reproduce the cold path's `full_transform`: the identifiability transform
+    // with the unpenalized intercept column appended (when present), so the
+    // projected Primary kernel Gram lives in the SAME constrained chart as the
+    // realized design's penalties.
+    let full_transform = identifiability_transform.map(|z| {
+        if include_intercept {
+            append_intercept_to_transform(z)
+        } else {
+            z.clone()
+        }
+    });
+    let primary = project_penalty_matrix(&penalty_kernel, full_transform.as_ref());
+    let (candidates, _survived) = crate::basis::matern_double_penalty_candidates_with_decision(
+        &primary,
+        frozen_nullspace_shrinkage_survived,
+    )?;
+    let (penalties, nullspace_dims, _info, _eig, _ops) =
+        crate::basis::filter_active_penalty_candidates_with_ops(candidates)?;
+    Ok((penalties, nullspace_dims))
+}
+
+/// n-free (#1033) FIRST log-κ ψ-derivative of the Matérn RKHS double-penalty
+/// block list, from FROZEN geometry — the κ-optimizer re-key analogue of
+/// `build_matern_operator_penalty_psi_derivatives` for `double_penalty = true`.
+///
+/// Returns one block per ACTIVE penalty, index-aligned with the value re-key
+/// `matern_kernel_double_penalties_at_length_scale`:
+///   * `Primary`  → the projected-kernel-Gram `∂(Zᵀ K Z)/∂ψ` (normalized),
+///   * shrinkage  → the exact spectral-projector `∂R~/∂ψ` (#1122),
+/// emitted only when `nullspace_shrinkage_survived == Some(true)` (the frozen
+/// decision), so the derivative list length matches the value block count.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn matern_kernel_double_penalty_psi_derivatives_at_length_scale(
+    centers: ArrayView2<'_, f64>,
+    identifiability_transform: Option<&Array2<f64>>,
+    include_intercept: bool,
+    nu: MaternNu,
+    aniso_log_scales: Option<&[f64]>,
+    effective_length_scale: f64,
+    nullspace_shrinkage_survived: Option<bool>,
+) -> Result<Vec<Array2<f64>>, BasisError> {
+    let (_s_norm, s_norm_psi, _s_norm_psi_psi, _c, a_raw, a_raw_psi, a_raw_psi_psi) =
+        crate::basis::build_matern_double_penalty_primarywith_psi_derivatives(
+            centers,
+            effective_length_scale,
+            nu,
+            include_intercept,
+            identifiability_transform,
+            aniso_log_scales,
+        )?;
+    let mut blocks = vec![s_norm_psi];
+    if matches!(nullspace_shrinkage_survived, Some(true)) {
+        let (shrink_first, _shrink_second) =
+            crate::basis::matern_nullspace_shrinkage_psi_derivatives(
+                &a_raw,
+                &a_raw_psi,
+                &a_raw_psi_psi,
+            )?;
+        blocks.push(shrink_first);
+    }
+    Ok(blocks)
+}
+
 /// Compute the spatial identifiability transform for a dense design matrix.
 ///
 /// For the `OrthogonalToParametric` policy the transform orthogonalises `design`

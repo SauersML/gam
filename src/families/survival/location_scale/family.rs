@@ -76,12 +76,6 @@ pub(crate) struct SurvivalPredictorState {
 #[derive(Clone, Copy)]
 pub(crate) struct SurvivalRowDerivatives {
     pub(crate) ll: f64,
-    /// d ell / dq summed over entry+exit (= d1_q0 + d1_q1).
-    pub(crate) d1_q: f64,
-    /// d² ell / dq² summed (= d2_q0 + d2_q1 when q0=q1; used for time-invariant blocks).
-    pub(crate) d2_q: f64,
-    /// d³ ell / dq³ summed.
-    pub(crate) d3_q: f64,
     /// Entry-only derivative: d ell / dq0 = w * r(u0).
     pub(crate) d1_q0: f64,
     /// Entry-only second derivative: d² ell / dq0² = w * r'(u0).
@@ -103,9 +97,6 @@ pub(crate) struct SurvivalRowDerivatives {
     pub(crate) h_time_h0: f64,
     pub(crate) h_time_h1: f64,
     pub(crate) h_time_d: f64,
-    pub(crate) d_h_h0: f64,
-    pub(crate) d_h_h1: f64,
-    pub(crate) d_h_d: f64,
 }
 
 impl SurvivalRowDerivatives {

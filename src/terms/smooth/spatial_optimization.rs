@@ -5956,14 +5956,15 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 identifiability_transform,
                 aniso_log_scales,
                 input_scales,
+                nullspace_shrinkage_survived,
                 ..
             } => {
                 // `spatial_term_psi_to_length_scale_and_aniso` decodes ψ to a
                 // length scale in ORIGINAL data coordinates — exactly what the
-                // slow-path rebuild writes into `spec.length_scale` before
-                // `matern_operator_penalty_triplet_from_metadata` compensates it
-                // by σ_geom. Compensate identically here so the n-free re-key
-                // reproduces the slow-path penalty surface byte-for-byte (#706).
+                // slow-path rebuild writes into `spec.length_scale` before the
+                // realized penalty assembly compensates it by σ_geom. Compensate
+                // identically here so the n-free re-key reproduces the slow-path
+                // penalty surface byte-for-byte (#706).
                 let ls = ls_opt.ok_or_else(|| {
                     "Matérn n-free penalty re-key requires a finite length-scale".to_string()
                 })?;
@@ -5972,26 +5973,52 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     None => ls,
                 };
                 let aniso_for_penalty = aniso_from_psi.as_deref().or(aniso_log_scales.as_deref());
-                // Route through the SAME canonical operator-triplet builder the
-                // realized design uses (`matern_operator_penalty_triplet_from_
-                // metadata`). The Matérn design ALWAYS overrides the kernel
-                // double-penalty with this {mass, tension, stiffness} triplet
-                // (see `build_inner_smooth_basis`), so re-keying via the kernel
-                // path produced a 1-block surface against a 3-block frozen
-                // design — the topology desync #1270 hard-errored on. Sharing
-                // the builder makes the block count ψ-stable by construction.
-                let (penalties, nullspace_dims, _info) =
-                    matern_operator_penalty_triplet_at_length_scale(
-                        centers.view(),
+                // #1074: branch on the SAME `double_penalty` flag the realized
+                // design uses (see the Matérn penalty selection in
+                // `build_inner_smooth_basis` / term_specs.rs). `double_penalty =
+                // true` (the default) ships the genuine RKHS kernel penalty
+                // `β' K_CC β` (Primary kernel Gram + frozen null-space ridge);
+                // `false` ships the operator-collocation {mass, tension,
+                // stiffness} triplet. The block COUNT of each path is
+                // ψ-invariant (frozen nullspace decision / ν-gated operator
+                // dials), so the re-key never desyncs the frozen design (#1270).
+                let double_penalty = matches!(
+                    &termspec.basis,
+                    SmoothBasisSpec::Matern { spec, .. } if spec.double_penalty
+                );
+                if double_penalty {
+                    // Periodic-expand the frozen base centers exactly as the
+                    // cold double-penalty build does, so the kernel pairs and
+                    // the (expanded-center) identifiability transform align.
+                    let penalty_centers = crate::basis::expand_periodic_centers(
+                        &centers.to_owned(),
                         periodic.as_deref(),
-                        identifiability_transform.as_ref(),
-                        *nu,
-                        *include_intercept,
-                        aniso_for_penalty,
-                        effective_ls,
                     )
                     .map_err(|e| e.to_string())?;
-                (penalties, nullspace_dims)
+                    crate::basis::matern_kernel_double_penalties_at_length_scale(
+                        penalty_centers.view(),
+                        identifiability_transform.as_ref(),
+                        *include_intercept,
+                        *nu,
+                        aniso_for_penalty,
+                        effective_ls,
+                        *nullspace_shrinkage_survived,
+                    )
+                    .map_err(|e| e.to_string())?
+                } else {
+                    let (penalties, nullspace_dims, _info) =
+                        matern_operator_penalty_triplet_at_length_scale(
+                            centers.view(),
+                            periodic.as_deref(),
+                            identifiability_transform.as_ref(),
+                            *nu,
+                            *include_intercept,
+                            aniso_for_penalty,
+                            effective_ls,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    (penalties, nullspace_dims)
+                }
             }
             BasisMetadata::ThinPlate {
                 centers,
@@ -6155,6 +6182,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 identifiability_transform,
                 aniso_log_scales,
                 input_scales,
+                nullspace_shrinkage_survived,
                 ..
             } => {
                 let ls = ls_opt.ok_or_else(|| {
@@ -6164,20 +6192,46 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     Some(scales) => compensate_length_scale_for_standardization(ls, scales),
                     None => ls,
                 };
-                let penalty_centers =
-                    crate::basis::expand_periodic_centers(&centers.to_owned(), periodic.as_deref())
-                        .map_err(|e| e.to_string())?;
                 let aniso_for_penalty = aniso_from_psi.as_deref().or(aniso_log_scales.as_deref());
-                let (first, _second) = crate::basis::build_matern_operator_penalty_psi_derivatives(
-                    penalty_centers.view(),
-                    effective_ls,
-                    *nu,
-                    *include_intercept,
-                    identifiability_transform.as_ref(),
-                    aniso_for_penalty,
+                // #1074: match the penalty FORM the value re-key uses (above):
+                // RKHS kernel double-penalty when `double_penalty = true`, the
+                // operator triplet otherwise. The ψ-derivative blocks must be
+                // index-aligned with that value block list or the analytic outer
+                // REML gradient desyncs from its own penalty surface (the #1122
+                // failure mode).
+                let double_penalty = matches!(
+                    &termspec.basis,
+                    SmoothBasisSpec::Matern { spec, .. } if spec.double_penalty
+                );
+                let penalty_centers = crate::basis::expand_periodic_centers(
+                    &centers.to_owned(),
+                    periodic.as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
-                first
+                if double_penalty {
+                    crate::basis::matern_kernel_double_penalty_psi_derivatives_at_length_scale(
+                        penalty_centers.view(),
+                        identifiability_transform.as_ref(),
+                        *include_intercept,
+                        *nu,
+                        aniso_for_penalty,
+                        effective_ls,
+                        *nullspace_shrinkage_survived,
+                    )
+                    .map_err(|e| e.to_string())?
+                } else {
+                    let (first, _second) =
+                        crate::basis::build_matern_operator_penalty_psi_derivatives(
+                            penalty_centers.view(),
+                            effective_ls,
+                            *nu,
+                            *include_intercept,
+                            identifiability_transform.as_ref(),
+                            aniso_for_penalty,
+                        )
+                        .map_err(|e| e.to_string())?;
+                    first
+                }
             }
             BasisMetadata::ThinPlate {
                 centers,

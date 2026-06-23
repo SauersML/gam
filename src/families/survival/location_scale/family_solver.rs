@@ -978,11 +978,7 @@ impl SurvivalLocationScaleFamily {
             let dynamic = self.build_dynamic_geometry(block_states)?;
             return Ok(Some((
                 super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
-                    self,
-                    &q,
-                    &dynamic,
-                    block_states,
-                    log_scale,
+                    self, &q, &dynamic, log_scale,
                 )?,
                 log_scale,
             )));
@@ -1082,515 +1078,25 @@ impl SurvivalLocationScaleFamily {
             .map(Some);
         }
 
-        let time_dir = d_beta_flat.slice(s![offsets[0]..offsets[1]]).to_owned();
-        let threshold_dir = d_beta_flat.slice(s![offsets[1]..offsets[2]]).to_owned();
-        let log_sigma_dir = d_beta_flat.slice(s![offsets[2]..offsets[3]]).to_owned();
-        let wiggle_dir = if self.x_link_wiggle.is_some() {
-            Some(d_beta_flat.slice(s![offsets[3]..offsets[4]]).to_owned())
-        } else {
-            None
-        };
-
-        let delta_h0 = dynamic.time_jac_entry.dot(&time_dir);
-        let delta_h1 = dynamic.time_jac_exit.dot(&time_dir);
-        let delta_t_exit = self.x_threshold.matrixvectormultiply(&threshold_dir);
-        let delta_ls_exit = self.x_log_sigma.matrixvectormultiply(&log_sigma_dir);
-        let deltaw = match (self.x_link_wiggle.as_ref(), wiggle_dir.as_ref()) {
-            (Some(xw), Some(dir)) => Some(xw.matrixvectormultiply(dir)),
-            _ => None,
-        };
-
-        let mut delta_q_exit = &q.dq_t * &delta_t_exit + &q.dq_ls * &delta_ls_exit;
-        if let Some(dw) = &deltaw {
-            delta_q_exit += dw;
-        }
-        let delta_q_t_exit = &q.d2q_tls * &delta_ls_exit;
-        let delta_q_ls_exit = &q.d2q_tls * &delta_t_exit + &q.d2q_ls * &delta_ls_exit;
-        let delta_q_tls_exit = &q.d3q_tls_ls * &delta_ls_exit;
-        let delta_q_ls_ls_exit = &q.d3q_tls_ls * &delta_t_exit + &q.d3q_ls * &delta_ls_exit;
-
-        let d_d1_q_exit = &q.d2_q1 * &delta_q_exit + &q.h_time_h1 * &delta_h1;
-        let d_d2_q_exit = &q.d3_q1 * &delta_q_exit + &q.d_h_h1 * &delta_h1;
-
-        let x_threshold_exit_cow = self.x_threshold.to_dense_cow();
-        let x_threshold_exit = &*x_threshold_exit_cow;
-        let x_threshold_entry_cow = self
-            .x_threshold_entry
-            .as_ref()
-            .map(DesignMatrix::to_dense_cow);
-        let x_threshold_entry = x_threshold_entry_cow.as_deref();
-        let x_log_sigma_exit_cow = self.x_log_sigma.to_dense_cow();
-        let x_log_sigma_exit = &*x_log_sigma_exit_cow;
-        let x_log_sigma_entry_cow = self
-            .x_log_sigma_entry
-            .as_ref()
-            .map(DesignMatrix::to_dense_cow);
-        let x_log_sigma_entry = x_log_sigma_entry_cow.as_deref();
-        let xw_cow = self.x_link_wiggle.as_ref().map(DesignMatrix::to_dense_cow);
-        let xw = xw_cow.as_deref();
-        let mut joint = Array2::<f64>::zeros((p_total, p_total));
-
-        struct EntryDeltas {
-            delta_q: Array1<f64>,
-            delta_q_t: Array1<f64>,
-            delta_q_ls: Array1<f64>,
-            delta_q_tls: Array1<f64>,
-            delta_q_ls_ls: Array1<f64>,
-            d_d1_q: Array1<f64>,
-            d_d2_q: Array1<f64>,
-        }
-        let entry_deltas = if x_threshold_entry.is_some() || x_log_sigma_entry.is_some() {
-            let dt_en = self
-                .x_threshold_entry
-                .as_ref()
-                .map(|x| x.matrixvectormultiply(&threshold_dir))
-                .unwrap_or_else(|| delta_t_exit.clone());
-            let dls_en = self
-                .x_log_sigma_entry
-                .as_ref()
-                .map(|x| x.matrixvectormultiply(&log_sigma_dir))
-                .unwrap_or_else(|| delta_ls_exit.clone());
-            let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
-            let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
-            let d2q_tls_en = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
-            let d3q_tls_ls_en = q.d3q_tls_ls_entry.as_ref().unwrap_or(&q.d3q_tls_ls);
-            let d3q_ls_en = q.d3q_ls_entry.as_ref().unwrap_or(&q.d3q_ls);
-            let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap_or(&q.d2q_ls);
-            let mut dq_en = dq_t_en * &dt_en + dq_ls_en * &dls_en;
-            if let Some(dw) = &deltaw {
-                dq_en += dw;
-            }
-            EntryDeltas {
-                delta_q_t: d2q_tls_en * &dls_en,
-                delta_q_ls: d2q_tls_en * &dt_en + d2q_ls_en * &dls_en,
-                delta_q_tls: d3q_tls_ls_en * &dls_en,
-                delta_q_ls_ls: d3q_tls_ls_en * &dt_en + d3q_ls_en * &dls_en,
-                d_d1_q: &q.d2_q0 * &dq_en + &q.h_time_h0 * &delta_h0,
-                d_d2_q: &q.d3_q0 * &dq_en + &q.d_h_h0 * &delta_h0,
-                delta_q: dq_en,
-            }
-        } else {
-            EntryDeltas {
-                delta_q: delta_q_exit.clone(),
-                delta_q_t: delta_q_t_exit.clone(),
-                delta_q_ls: delta_q_ls_exit.clone(),
-                delta_q_tls: delta_q_tls_exit.clone(),
-                delta_q_ls_ls: delta_q_ls_ls_exit.clone(),
-                d_d1_q: &q.d2_q0 * &delta_q_exit + &q.h_time_h0 * &delta_h0,
-                d_d2_q: &q.d3_q0 * &delta_q_exit + &q.d_h_h0 * &delta_h0,
-            }
-        };
-
-        // Time-time directional derivative of the joint Hessian block.
-        //
-        // The stored joint "Hessian" H equals -∂²ℓ/∂β². The time-time
-        // diagonal base assembly (assemble_joint_hessian_from_quantities)
-        // is
-        //
-        //   H_tt = X_entry'·diag(nll.h0)·X_entry
-        //        + X_exit' ·diag(nll.h1)·X_exit
-        //        + X_deriv'·diag(nll.d )·X_deriv
-        //
-        // where (nll.h0, nll.h1, nll.d) = SurvivalJointQuantities::
-        // time_channel_nll_curvatures() = (-∂²ℓ/∂h0², -∂²ℓ/∂h1², -∂²ℓ/∂d_raw²).
-        // All three stored h_time_* hold +∂²ℓ (h_time_* = -tower.h[i][i],
-        // tower = NLL), so the curvature helper negates them uniformly. A prior
-        // stale convention used +h_time_d here, flipping the time-deriv
-        // self-term — gam#1396; the helper now owns the sign in one place.
-        //
-        // Differentiating H_tt along Δβ_t (with Δh0 = X_entry·Δβ_t,
-        // Δh1 = X_exit·Δβ_t, Δd = X_deriv·Δβ_t, and q0/q1 invariant in
-        // a pure time direction) gives
-        //
-        //   dH_tt = X_entry'·diag(-w·r''(u0)·Δh0)·X_entry
-        //         + X_exit' ·diag(-w·r'''-mixed·Δh1)·X_exit
-        //         + X_deriv'·diag(+d_h_d·Δd)·X_deriv
-        //         = X_entry'·diag(-d_h_h0·Δh0)·X_entry
-        //         + X_exit' ·diag(-d_h_h1·Δh1)·X_exit
-        //         + X_deriv'·diag(+d_h_d ·Δd )·X_deriv
-        //
-        // For non-time directions (Δβ_t = 0) the inner variables Δh0/Δh1/Δd
-        // vanish but u0/u1 still shift through q0/q1. Chain rule:
-        //   Δu0 = Δh0 + Δq_entry   (for pure time direction: Δq_entry = 0)
-        //   Δu1 = Δh1 + Δq_exit
-        // so the general form tracks Δu0 = Δh0 + entry_deltas.delta_q and
-        // Δu1 = Δh1 + delta_q_exit. (No q-dependence on d_raw ⇒ Δd alone
-        // drives the deriv-side weight derivative.)
-        let du0 = &delta_h0 + &entry_deltas.delta_q;
-        let du1 = &delta_h1 + &delta_q_exit;
-        let dh_h0 = &q.d_h_h0 * &du0;
-        let dh_h1 = &q.d_h_h1 * &du1;
-        // The d_raw (event-Jacobian g) self-term and every other velocity
-        // coordinate contribution are added below as a single complete
-        // g-coordinate pullback pass; the old `time_jac_deriv·(d_h_d·Δd)`
-        // term covered only the Δd (pure-time) slice of that coupling and is
-        // therefore folded into the general pass instead.
-        let d_h_time = mxtwxd(&dynamic.time_jac_entry, &(-&dh_h0), row_mask)
-            + mxtwxd(&dynamic.time_jac_exit, &(-&dh_h1), row_mask);
-        assign_symmetric_block(&mut joint, offsets[0], offsets[0], &d_h_time);
-
-        if let Some(x_t_en) = x_threshold_entry.as_ref() {
-            let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
-            let d_h_exit = -(&d_d2_q_exit * &q.dq_t.mapv(|v| safe_product(v, v))
-                + &(&q.d2_q1 * &(2.0 * &delta_q_t_exit * &q.dq_t)));
-            let d_h_entry = -(&entry_deltas.d_d2_q * &dq_t_en.mapv(|v| safe_product(v, v))
-                + &(&q.d2_q0 * &(2.0 * &entry_deltas.delta_q_t * dq_t_en)));
-            let d_h_tt = mxtwx(x_threshold_exit, &d_h_exit, x_threshold_exit, row_mask)?
-                + mxtwx(x_t_en, &d_h_entry, x_t_en, row_mask)?;
-            assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d_h_tt);
-        } else {
-            let d_d2_q_ti = &q.d3_q * &delta_q_exit + &q.d_h_h0 * &delta_h0 + &q.d_h_h1 * &delta_h1;
-            let d_h_t = -(&d_d2_q_ti * &q.dq_t.mapv(|v| safe_product(v, v))
-                + &(&q.d2_q * &(2.0 * &delta_q_t_exit * &q.dq_t)));
-            let d_h_tt = mxtwx(x_threshold_exit, &d_h_t, x_threshold_exit, row_mask)?;
-            assign_symmetric_block(&mut joint, offsets[1], offsets[1], &d_h_tt);
-        }
-
-        {
-            let has_t_entry = x_threshold_entry.is_some();
-            let has_ls_entry = x_log_sigma_entry.is_some();
-            if has_t_entry || has_ls_entry {
-                let x_t_en = x_threshold_entry.unwrap_or(x_threshold_exit);
-                let x_ls_en = x_log_sigma_entry.unwrap_or(x_log_sigma_exit);
-                let dq_t_en = q.dq_t_entry.as_ref().unwrap_or(&q.dq_t);
-                let dq_ls_en = q.dq_ls_entry.as_ref().unwrap_or(&q.dq_ls);
-                let d2q_tls_en = q.d2q_tls_entry.as_ref().unwrap_or(&q.d2q_tls);
-                let w_exit = -(&d_d2_q_exit * &(&q.dq_t * &q.dq_ls)
-                    + &(&q.d2_q1 * &(&delta_q_t_exit * &q.dq_ls + &q.dq_t * &delta_q_ls_exit))
-                    + &(&d_d1_q_exit * &q.d2q_tls)
-                    + &(&q.d1_q1 * &delta_q_tls_exit));
-                let w_entry = -(&entry_deltas.d_d2_q * &(dq_t_en * dq_ls_en)
-                    + &(&q.d2_q0
-                        * &(&entry_deltas.delta_q_t * dq_ls_en
-                            + dq_t_en * &entry_deltas.delta_q_ls))
-                    + &(&entry_deltas.d_d1_q * d2q_tls_en)
-                    + &(&q.d1_q0 * &entry_deltas.delta_q_tls));
-                let d_h_tl = mxtwx(x_threshold_exit, &w_exit, x_log_sigma_exit, row_mask)?
-                    + mxtwx(x_t_en, &w_entry, x_ls_en, row_mask)?;
-                assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d_h_tl);
-            } else {
-                let d_d1_q =
-                    &q.d2_q * &delta_q_exit + &q.h_time_h0 * &delta_h0 + &q.h_time_h1 * &delta_h1;
-                let d_d2_q =
-                    &q.d3_q * &delta_q_exit + &q.d_h_h0 * &delta_h0 + &q.d_h_h1 * &delta_h1;
-                let d_h_tlweights = -(&d_d2_q * &(&q.dq_t * &q.dq_ls)
-                    + &(&q.d2_q * &(&delta_q_t_exit * &q.dq_ls + &q.dq_t * &delta_q_ls_exit))
-                    + &(&d_d1_q * &q.d2q_tls)
-                    + &(&q.d1_q * &delta_q_tls_exit));
-                let d_h_tl = mxtwx(x_threshold_exit, &d_h_tlweights, x_log_sigma_exit, row_mask)?;
-                assign_symmetric_block(&mut joint, offsets[1], offsets[2], &d_h_tl);
-            }
-        }
-
-        if let Some(x_ls_en) = x_log_sigma_entry.as_ref() {
-            let dq_ls_en = q.dq_ls_entry.as_ref().unwrap();
-            let d2q_ls_en = q.d2q_ls_entry.as_ref().unwrap();
-            let d_h_exit = -(&d_d2_q_exit * &q.dq_ls.mapv(|v| safe_product(v, v))
-                + &(&q.d2_q1 * &(2.0 * &delta_q_ls_exit * &q.dq_ls))
-                + &(&d_d1_q_exit * &q.d2q_ls)
-                + &(&q.d1_q1 * &delta_q_ls_ls_exit));
-            let d_h_entry = -(&entry_deltas.d_d2_q * &dq_ls_en.mapv(|v| safe_product(v, v))
-                + &(&q.d2_q0 * &(2.0 * &entry_deltas.delta_q_ls * dq_ls_en))
-                + &(&entry_deltas.d_d1_q * d2q_ls_en)
-                + &(&q.d1_q0 * &entry_deltas.delta_q_ls_ls));
-            let d_h_ll = mxtwx(x_log_sigma_exit, &d_h_exit, x_log_sigma_exit, row_mask)?
-                + mxtwx(x_ls_en, &d_h_entry, x_ls_en, row_mask)?;
-            assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d_h_ll);
-        } else {
-            let d_d1_q =
-                &q.d2_q * &delta_q_exit + &q.h_time_h0 * &delta_h0 + &q.h_time_h1 * &delta_h1;
-            let d_d2_q = &q.d3_q * &delta_q_exit + &q.d_h_h0 * &delta_h0 + &q.d_h_h1 * &delta_h1;
-            let d_h_l = -(&d_d2_q * &q.dq_ls.mapv(|v| safe_product(v, v))
-                + &(&q.d2_q * &(2.0 * &delta_q_ls_exit * &q.dq_ls))
-                + &(&d_d1_q * &q.d2q_ls)
-                + &(&q.d1_q * &delta_q_ls_ls_exit));
-            let d_h_ll = mxtwx(x_log_sigma_exit, &d_h_l, x_log_sigma_exit, row_mask)?;
-            assign_symmetric_block(&mut joint, offsets[2], offsets[2], &d_h_ll);
-        }
-
-        if let (Some(x_t_en), Some(dq_t_en)) = (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref()) {
-            let d_h_h0_t = mxtwx(
-                &self.x_time_entry,
-                &(-(&dh_h0 * dq_t_en + &q.h_time_h0 * &entry_deltas.delta_q_t)),
-                x_t_en,
-                row_mask,
-            )?;
-            let d_h_h1_t = mxtwx(
-                &self.x_time_exit,
-                &(-(&dh_h1 * &q.dq_t + &q.h_time_h1 * &delta_q_t_exit)),
-                x_threshold_exit,
-                row_mask,
-            )?;
-            assign_symmetric_block(&mut joint, offsets[0], offsets[1], &(d_h_h0_t + d_h_h1_t));
-        } else {
-            let delta_q_t = &delta_q_t_exit;
-            let d_h_h0_t = mxtwx(
-                &self.x_time_entry,
-                &(-(&dh_h0 * &q.dq_t + &q.h_time_h0 * delta_q_t)),
-                x_threshold_exit,
-                row_mask,
-            )?;
-            let d_h_h1_t = mxtwx(
-                &self.x_time_exit,
-                &(-(&dh_h1 * &q.dq_t + &q.h_time_h1 * delta_q_t)),
-                x_threshold_exit,
-                row_mask,
-            )?;
-            assign_symmetric_block(&mut joint, offsets[0], offsets[1], &(d_h_h0_t + d_h_h1_t));
-        }
-
-        if let (Some(x_ls_en), Some(dq_ls_en)) =
-            (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
-        {
-            let d_h_h0_l = mxtwx(
-                &self.x_time_entry,
-                &(-(&dh_h0 * dq_ls_en + &q.h_time_h0 * &entry_deltas.delta_q_ls)),
-                x_ls_en,
-                row_mask,
-            )?;
-            let d_h_h1_l = mxtwx(
-                &self.x_time_exit,
-                &(-(&dh_h1 * &q.dq_ls + &q.h_time_h1 * &delta_q_ls_exit)),
-                x_log_sigma_exit,
-                row_mask,
-            )?;
-            assign_symmetric_block(&mut joint, offsets[0], offsets[2], &(d_h_h0_l + d_h_h1_l));
-        } else {
-            let delta_q_ls = &delta_q_ls_exit;
-            let d_h_h0_l = mxtwx(
-                &self.x_time_entry,
-                &(-(&dh_h0 * &q.dq_ls + &q.h_time_h0 * delta_q_ls)),
-                x_log_sigma_exit,
-                row_mask,
-            )?;
-            let d_h_h1_l = mxtwx(
-                &self.x_time_exit,
-                &(-(&dh_h1 * &q.dq_ls + &q.h_time_h1 * delta_q_ls)),
-                x_log_sigma_exit,
-                row_mask,
-            )?;
-            assign_symmetric_block(&mut joint, offsets[0], offsets[2], &(d_h_h0_l + d_h_h1_l));
-        }
-
-        if let (Some(xw_dense), Some(w_offset)) = (xw, offsets.get(3).copied()) {
-            let d_d2_q_combined = if x_threshold_entry.is_some() || x_log_sigma_entry.is_some() {
-                &d_d2_q_exit + &entry_deltas.d_d2_q
-            } else {
-                &q.d3_q * &delta_q_exit + &q.d_h_h0 * &delta_h0 + &q.d_h_h1 * &delta_h1
-            };
-            if let (Some(x_t_en), Some(dq_t_en)) =
-                (x_threshold_entry.as_ref(), q.dq_t_entry.as_ref())
-            {
-                let d_h_tw_exit = mxtwx(
-                    x_threshold_exit,
-                    &(-(&d_d2_q_exit * &q.dq_t + &q.d2_q1 * &delta_q_t_exit)),
-                    xw_dense,
-                    row_mask,
-                )?;
-                let d_h_tw_entry = mxtwx(
-                    x_t_en,
-                    &(-(&entry_deltas.d_d2_q * dq_t_en + &q.d2_q0 * &entry_deltas.delta_q_t)),
-                    xw_dense,
-                    row_mask,
-                )?;
-                assign_symmetric_block(
-                    &mut joint,
-                    offsets[1],
-                    w_offset,
-                    &(d_h_tw_exit + d_h_tw_entry),
-                );
-            } else {
-                let d_h_tw = mxtwx(
-                    x_threshold_exit,
-                    &(-(&d_d2_q_combined * &q.dq_t + &q.d2_q * &delta_q_t_exit)),
-                    xw_dense,
-                    row_mask,
-                )?;
-                assign_symmetric_block(&mut joint, offsets[1], w_offset, &d_h_tw);
-            }
-
-            if let (Some(x_ls_en), Some(dq_ls_en)) =
-                (x_log_sigma_entry.as_ref(), q.dq_ls_entry.as_ref())
-            {
-                let d_h_lw_exit = mxtwx(
-                    x_log_sigma_exit,
-                    &(-(&d_d2_q_exit * &q.dq_ls + &q.d2_q1 * &delta_q_ls_exit)),
-                    xw_dense,
-                    row_mask,
-                )?;
-                let d_h_lw_entry = mxtwx(
-                    x_ls_en,
-                    &(-(&entry_deltas.d_d2_q * dq_ls_en + &q.d2_q0 * &entry_deltas.delta_q_ls)),
-                    xw_dense,
-                    row_mask,
-                )?;
-                assign_symmetric_block(
-                    &mut joint,
-                    offsets[2],
-                    w_offset,
-                    &(d_h_lw_exit + d_h_lw_entry),
-                );
-            } else {
-                let d_h_lw = mxtwx(
-                    x_log_sigma_exit,
-                    &(-(&d_d2_q_combined * &q.dq_ls + &q.d2_q * &delta_q_ls_exit)),
-                    xw_dense,
-                    row_mask,
-                )?;
-                assign_symmetric_block(&mut joint, offsets[2], w_offset, &d_h_lw);
-            }
-
-            let d_hww = mxtwx(xw_dense, &(-&d_d2_q_combined), xw_dense, row_mask)?;
-            assign_symmetric_block(&mut joint, w_offset, w_offset, &d_hww);
-
-            let d_h_h0w = mxtwx(&self.x_time_entry, &(-&dh_h0), xw_dense, row_mask)?;
-            let d_h_h1w = mxtwx(&self.x_time_exit, &(-&dh_h1), xw_dense, row_mask)?;
-            assign_symmetric_block(&mut joint, offsets[0], w_offset, &(d_h_h0w + d_h_h1w));
-        }
-
-        // Velocity coordinate (event Jacobian g = d_raw + qdot) directional
-        // Hessian derivative. The block assembly above differentiates only the
-        // two q-index coordinates u0, u1; g couples the d_raw, threshold, and
-        // log-σ channels through qdot and contributes its own third-order term
-        // to every coefficient block it touches. In channel space g is the
-        // closed form
-        //     g = ch2 + e·(ch3·ch8 − ch5),   e = exp(−ch6),
-        // with ch2 = d_raw, ch3 = η_t exit, ch5 = η_t deriv, ch6 = η_logσ
-        // exit, ch8 = η_logσ deriv. Writing φ′ = ∂ℓ/∂g (d1_qdot1),
-        // φ″ = ∂²ℓ/∂g² (d2_qdot1), φ‴ = ∂³ℓ/∂g³ (d_h_d), the contribution of g
-        // to the NLL-Hessian directional derivative ∂(−∂²ℓ)/∂β·Δβ is
-        //   −[ φ‴(g′·Δ) g′⊗g′ + φ″(g″[Δ]⊗g′ + g′⊗g″[Δ])
-        //      + φ″(g′·Δ) g″ + φ′ g‴[Δ] ],
-        // pulled back to coefficient space through the row's channel designs.
-        // Censored rows carry event_weight 0 ⇒ φ′=φ″=φ‴=0 and contribute
-        // nothing (which also keeps g′ off any row where qdot is irrelevant).
-        {
-            use crate::families::row_kernel::RowKernel;
-            use rayon::iter::{IntoParallelIterator, ParallelIterator};
-            // Fast exit before any `p_total²` allocation: the velocity pass adds
-            // exactly zero unless some row carries live qdot-derivative mass
-            // (φ′=d1_qdot1, φ″=d2_qdot1, φ‴=d_h_d). The per-row fold below
-            // short-circuits those rows individually, but the rayon
-            // `fold`/`reduce` still allocates a fresh `(p_total, p_total)`
-            // accumulator per task and per reduction even when EVERY row is
-            // inert — which is the non-time-varying-scale case the outer REML
-            // optimizer probes repeatedly. Skip the whole pass (and its
-            // transient `p²` matrices) when the contribution is provably zero.
-            // This is exact, not an approximation: the omitted term is 0. It
-            // directly removes the per-eval `p²·threads` transient implicated in
-            // the silent steady-RSS-growth survival location-scale hang (#1389).
-            let any_live_qdot = (0..self.n).any(|row| {
-                let w = row_mask.map_or(1.0, |m| m[row]);
-                w != 0.0
-                    && (q.d1_qdot1[row] != 0.0 || q.d2_qdot1[row] != 0.0 || q.d_h_d[row] != 0.0)
-            });
-            if !any_live_qdot {
-                return Ok(Some(joint));
-            }
-            let kernel = self.survival_ls_row_kernel_rescaled(q, dynamic, deriv_log_scale);
-            let d_beta_slice = d_beta_flat
-                .as_slice()
-                .ok_or_else(|| "joint d_beta must be contiguous".to_string())?;
-            // Distinct ordered permutations of a (possibly repeated) index
-            // triple — the support of the fully symmetric g‴ tensor.
-            let contract3 = |g3d: &mut [[f64; SLS_ROW_K]; SLS_ROW_K],
-                             idx: [usize; 3],
-                             v: f64,
-                             dch: &[f64; SLS_ROW_K]| {
-                const PERMS: [[usize; 3]; 6] = [
-                    [0, 1, 2],
-                    [0, 2, 1],
-                    [1, 0, 2],
-                    [1, 2, 0],
-                    [2, 0, 1],
-                    [2, 1, 0],
-                ];
-                let mut seen: [(usize, usize, usize); 6] = [(usize::MAX, 0, 0); 6];
-                let mut n_seen = 0usize;
-                for pm in PERMS {
-                    let key = (idx[pm[0]], idx[pm[1]], idx[pm[2]]);
-                    if seen[..n_seen].contains(&key) {
-                        continue;
-                    }
-                    seen[n_seen] = key;
-                    n_seen += 1;
-                    g3d[key.0][key.1] += v * dch[key.2];
-                }
-            };
-            let g_contrib = (0..self.n)
-                .into_par_iter()
-                .fold(
-                    || Array2::<f64>::zeros((p_total, p_total)),
-                    |mut acc, row| {
-                        let w = row_mask.map_or(1.0, |m| m[row]);
-                        if w == 0.0 {
-                            return acc;
-                        }
-                        let l1 = w * q.d1_qdot1[row];
-                        let l2 = w * q.d2_qdot1[row];
-                        let l3 = w * q.d_h_d[row];
-                        if l1 == 0.0 && l2 == 0.0 && l3 == 0.0 {
-                            return acc;
-                        }
-                        let p = kernel.row_primary_values(row);
-                        let e = (-p[6]).exp();
-                        let dd = p[3] * p[8] - p[5];
-                        // g′ (channel gradient), supported on {2,3,5,6,8}.
-                        let mut gp = [0.0_f64; SLS_ROW_K];
-                        gp[2] = 1.0;
-                        gp[3] = e * p[8];
-                        gp[5] = -e;
-                        gp[6] = -e * dd;
-                        gp[8] = e * p[3];
-                        // g″ (symmetric channel Hessian).
-                        let mut g2 = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
-                        let set2 =
-                            |t: &mut [[f64; SLS_ROW_K]; SLS_ROW_K], a: usize, b: usize, v: f64| {
-                                t[a][b] = v;
-                                t[b][a] = v;
-                            };
-                        set2(&mut g2, 3, 8, e);
-                        set2(&mut g2, 3, 6, -e * p[8]);
-                        set2(&mut g2, 5, 6, e);
-                        g2[6][6] = e * dd;
-                        set2(&mut g2, 6, 8, -e * p[3]);
-                        let dch = kernel.jacobian_action(row, d_beta_slice);
-                        let gpd: f64 = (0..SLS_ROW_K).map(|c| gp[c] * dch[c]).sum();
-                        let mut g2d = [0.0_f64; SLS_ROW_K];
-                        for (a, slot) in g2d.iter_mut().enumerate() {
-                            *slot = (0..SLS_ROW_K).map(|c| g2[a][c] * dch[c]).sum();
-                        }
-                        // g‴[Δ] from the five symmetric third-derivative groups.
-                        let mut g3d = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
-                        contract3(&mut g3d, [3, 6, 8], -e, &dch);
-                        contract3(&mut g3d, [3, 6, 6], e * p[8], &dch);
-                        contract3(&mut g3d, [5, 6, 6], -e, &dch);
-                        contract3(&mut g3d, [6, 6, 6], -e * dd, &dch);
-                        contract3(&mut g3d, [6, 6, 8], e * p[3], &dch);
-                        let mut t_g = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
-                        for a in 0..SLS_ROW_K {
-                            for b in 0..SLS_ROW_K {
-                                t_g[a][b] = -(l3 * gpd * gp[a] * gp[b]
-                                    + l2 * (g2d[a] * gp[b] + gp[a] * g2d[b])
-                                    + l2 * gpd * g2[a][b]
-                                    + l1 * g3d[a][b]);
-                            }
-                        }
-                        kernel.add_pullback_hessian(row, &t_g, &mut acc);
-                        acc
-                    },
-                )
-                .reduce(
-                    || Array2::<f64>::zeros((p_total, p_total)),
-                    |mut a, b| {
-                        a += &b;
-                        a
-                    },
-                );
-            joint += &g_contrib;
-        }
-
-        Ok(Some(joint))
+        // #932: single-source the link-wiggle FIRST directional derivative
+        // `D_dir H` through the §13 warp kernel. The βw-dependent Jacobian is
+        // carried by the kernel's `JᵀHJ` pullback, so the contracted third
+        // (`OneSeed<KW>`) reproduces the bespoke hand assembly that used to live
+        // here, by single-source construction: it is one more jet order of the
+        // SAME §13 warp NLL whose Order2 joint Hessian is oracle-pinned to the
+        // bespoke `assemble_h_wiggle`. This branch is reached ONLY for wiggle
+        // rows — `row_kernel_directional_supported()` is `x_link_wiggle.is_none()`,
+        // so the non-wiggle case already returned above — and the convention
+        // matches that base path (same `row_kernel_directional_derivative`).
+        let rows = row_set_from_survival_mask(row_mask, self.n);
+        let d = d_beta_flat
+            .as_slice()
+            .ok_or_else(|| "joint d_beta must be contiguous".to_string())?;
+        Ok(Some(
+            super::row_kernel::survival_ls_wiggle_directional_derivative_dense(
+                self, q, dynamic, deriv_log_scale, &rows, d,
+            )?,
+        ))
     }
 
     pub(crate) fn evaluate_log_likelihood_and_block_gradients(
@@ -2262,11 +1768,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             // kernel; non-wiggle rows keep the bespoke path below.
             let dynamic = self.build_dynamic_geometry(block_states)?;
             return Ok(Some(super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
-                self,
-                &q,
-                &dynamic,
-                block_states,
-                0.0,
+                self, &q, &dynamic, 0.0,
             )?));
         }
         if self.row_kernel_joint_hessian_supported() {
@@ -2564,12 +2066,31 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             }
             .into());
         }
-        if !self.row_kernel_directional_supported() {
-            return Ok(None);
-        }
         let log_rescale = self.hessian_deriv_log_rescale(block_states);
         let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
         let dynamic = self.build_dynamic_geometry(block_states)?;
+        if self.x_link_wiggle.is_some() {
+            // #932: single-source the wiggle SECOND directional derivative via
+            // the §13 warp kernel (`TwoSeed<KW>`). Previously this returned
+            // `None` (the wiggle carve-out provided no second-directional
+            // curvature); now wiggle rows get the exact ε,δ-Hessian channel of
+            // the same single-sourced row NLL, matching the non-wiggle base path.
+            return Ok(Some(
+                super::row_kernel::survival_ls_wiggle_second_directional_derivative_dense(
+                    self,
+                    &q,
+                    &dynamic,
+                    log_rescale,
+                    &crate::families::row_kernel::RowSet::All,
+                    d_beta_u_flat.as_slice().ok_or_else(|| {
+                        "joint Hessian second directional u must be contiguous".to_string()
+                    })?,
+                    d_beta_v_flat.as_slice().ok_or_else(|| {
+                        "joint Hessian second directional v must be contiguous".to_string()
+                    })?,
+                )?,
+            ));
+        }
         let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_rescale);
         crate::families::row_kernel::row_kernel_second_directional_derivative(
             &kernel,
@@ -3545,15 +3066,35 @@ impl ExactNewtonJointHessianWorkspace for SurvivalLocationScaleExactNewtonJointH
             }
             .into());
         }
-        if !self.family.row_kernel_directional_supported() {
-            return Ok(None);
+        let rows = row_set_from_survival_mask(self.row_mask.as_deref(), self.family.n);
+        if self.family.x_link_wiggle.is_some() {
+            // #932: single-source the wiggle workspace SECOND directional
+            // derivative through the §13 warp kernel (`TwoSeed<KW>`) — `self.q`
+            // / `self.dynamic` already carry the wiggle geometry + βw, so no
+            // `block_states` re-thread is needed. Previously returned `None`.
+            return Ok(Some(
+                super::row_kernel::survival_ls_wiggle_second_directional_derivative_dense(
+                    &self.family,
+                    &self.q,
+                    &self.dynamic,
+                    self.deriv_log_scale,
+                    &rows,
+                    d_beta_u_flat.as_slice().ok_or_else(|| {
+                        "joint Hessian workspace second directional u must be contiguous"
+                            .to_string()
+                    })?,
+                    d_beta_v_flat.as_slice().ok_or_else(|| {
+                        "joint Hessian workspace second directional v must be contiguous"
+                            .to_string()
+                    })?,
+                )?,
+            ));
         }
         let kernel = self.family.survival_ls_row_kernel_rescaled(
             &self.q,
             &self.dynamic,
             self.deriv_log_scale,
         );
-        let rows = row_set_from_survival_mask(self.row_mask.as_deref(), self.family.n);
         crate::families::row_kernel::row_kernel_second_directional_derivative(
             &kernel,
             &rows,
