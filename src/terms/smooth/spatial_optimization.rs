@@ -6003,7 +6003,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                             nu: *nu,
                             aniso_log_scales: aniso_for_penalty,
                             effective_length_scale: effective_ls,
-                            nullspace_shrinkage_survived: *nullspace_shrinkage_survived,
+                            nullspace_shrinkage_survived: Some(*nullspace_shrinkage_survived),
                         },
                     )
                     .map_err(|e| e.to_string())?
@@ -6219,7 +6219,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                             nu: *nu,
                             aniso_log_scales: aniso_for_penalty,
                             effective_length_scale: effective_ls,
-                            nullspace_shrinkage_survived: *nullspace_shrinkage_survived,
+                            nullspace_shrinkage_survived: Some(*nullspace_shrinkage_survived),
                         },
                     )
                     .map_err(|e| e.to_string())?
