@@ -457,11 +457,13 @@ mod tests {
     #[test]
     fn monotone_cone_draws_stay_feasible() {
         let p = 6;
-        // SPD Hessian: tridiagonal-ish, well conditioned.
+        // SPD Hessian: coord 0 (the free coord) is decoupled so its marginal is
+        // a clean unconstrained check; coords 1..p are tridiagonally correlated
+        // *and* truncated, stressing the reflective dynamics under correlation.
         let mut h = Array2::<f64>::eye(p);
         for i in 0..p {
             h[(i, i)] = 3.0;
-            if i + 1 < p {
+            if i >= 1 && i + 1 < p {
                 h[(i, i + 1)] = 0.7;
                 h[(i + 1, i)] = 0.7;
             }
@@ -475,20 +477,23 @@ mod tests {
         }
         let c = constraints(a, Array1::zeros(p - 1));
         let n = 40_000;
-        let s = sample_truncated_gaussian_posterior(&mode, &h, 1.0, &c, n, 2, 31337)
+        let chains = 2;
+        let s = sample_truncated_gaussian_posterior(&mode, &h, 1.0, &c, n, chains, 31337)
             .expect("sampler");
-        assert_eq!(s.dim(), (n, p));
+        assert_eq!(s.dim(), (n * chains, p));
         assert_all_feasible(&s, &c);
         // The free coordinate is unconstrained → its sample mean tracks the mode.
         assert!((s.column(0).mean().unwrap() - 1.0).abs() < 0.05);
     }
 
-    /// An interior two-sided box `min ≤ β ≤ max` with an interior mode: draws
-    /// stay inside and the mean tracks the (interior) mode.
+    /// An interior two-sided box `min ≤ β ≤ max` with a *centred* mode: draws
+    /// stay strictly inside, and by symmetry the truncated mean equals the mode.
+    /// (A mode placed near a wall would pull the truncated mean off the mode —
+    /// the truncation is then asymmetric — so the mode is centred here.)
     #[test]
     fn interior_box_keeps_draws_in_interval() {
-        let h = array![[25.0]]; // σ = 0.2
-        let mode = array![0.8];
+        let h = array![[44.0]]; // σ ≈ 0.151 → both walls ~3.3σ away
+        let mode = array![0.5];
         // β ≥ 0 and −β ≥ −1  ⟺  0 ≤ β ≤ 1.
         let c = constraints(array![[1.0], [-1.0]], array![0.0, -1.0]);
         let n = 80_000;
@@ -496,6 +501,7 @@ mod tests {
             .expect("sampler");
         assert_all_feasible(&s, &c);
         assert!(s.column(0).iter().all(|&v| v > 0.0 && v < 1.0));
-        assert!((s.column(0).mean().unwrap() - 0.8).abs() < 0.01);
+        // Symmetric truncation around the centred mode ⇒ mean ≈ 0.5.
+        assert!((s.column(0).mean().unwrap() - 0.5).abs() < 0.01);
     }
 }
