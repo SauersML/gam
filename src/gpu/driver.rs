@@ -305,7 +305,38 @@ pub fn cuda_compute_library_present(stem: &str) -> bool {
             return false;
         }
     }
-    load_library_names(&cuda_compute_library_candidate_names(stem)).is_ok()
+    // Cache the probe per stem and KEEP the loaded handle alive for the process
+    // lifetime. Dropping the `Library` here dlclose's it; that dlopen+dlclose
+    // cycle tears down the compute library's global init state, after which
+    // cudarc's own cublasCreate / cusolverDnCreate fail
+    // CUBLAS/CUSOLVER_STATUS_NOT_INITIALIZED on the next handle creation (the GPU
+    // then silently declines and falls back to CPU). Holding the handle keeps the
+    // library mapped and initialized so cudarc reuses it intact.
+    static PROBED: OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        OnceLock::new();
+    static KEEP_ALIVE: OnceLock<std::sync::Mutex<Vec<Library>>> = OnceLock::new();
+    let probed = PROBED.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    if let Ok(cache) = probed.lock() {
+        if let Some(&present) = cache.get(stem) {
+            return present;
+        }
+    }
+    let present = match load_library_names(&cuda_compute_library_candidate_names(stem)) {
+        Ok(library) => {
+            if let Ok(mut keep) = KEEP_ALIVE
+                .get_or_init(|| std::sync::Mutex::new(Vec::new()))
+                .lock()
+            {
+                keep.push(library);
+            }
+            true
+        }
+        Err(_) => false,
+    };
+    if let Ok(mut cache) = probed.lock() {
+        cache.insert(stem.to_string(), present);
+    }
+    present
 }
 
 #[cfg(target_os = "linux")]
