@@ -446,6 +446,47 @@ fn quad_form(m: &[f64], v1: &[f64], v2: &[f64], p: usize) -> f64 {
     acc
 }
 
+/// Order-≤2 jet channels (value, gradient view, optional Hessian view) for the
+/// four flex row-NLL inputs (entry η, exit η, observed χ, observed d), bundled
+/// so `flex_row_nll_value_grad_hess` stays under the argument-count gate.
+pub(crate) struct FlexRowJet2Channels<'a> {
+    pub eta0_v: f64,
+    pub eta0_g: ndarray::ArrayView1<'a, f64>,
+    pub eta0_h: Option<ndarray::ArrayView2<'a, f64>>,
+    pub eta1_v: f64,
+    pub eta1_g: ndarray::ArrayView1<'a, f64>,
+    pub eta1_h: Option<ndarray::ArrayView2<'a, f64>>,
+    pub chi1_v: f64,
+    pub chi1_g: ndarray::ArrayView1<'a, f64>,
+    pub chi1_h: Option<ndarray::ArrayView2<'a, f64>>,
+    pub d1_v: f64,
+    pub d1_g: ndarray::ArrayView1<'a, f64>,
+    pub d1_h: Option<ndarray::ArrayView2<'a, f64>>,
+}
+
+/// Entry/exit base + directional timepoint packs for the contracted-third path,
+/// bundled to keep `flex_row_nll_third_contracted` under the argument-count gate.
+pub(crate) struct FlexThirdPacks<'a> {
+    pub entry_base: &'a gpu::SurvivalFlexBlock10TimepointBase,
+    pub exit_base: &'a gpu::SurvivalFlexBlock10TimepointBase,
+    pub entry_ext: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
+    pub exit_ext: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
+}
+
+/// Entry/exit base + both directional + bidirectional timepoint packs for the
+/// contracted-fourth path, bundled to keep `flex_row_nll_fourth_contracted`
+/// under the argument-count gate.
+pub(crate) struct FlexFourthPacks<'a> {
+    pub entry_base: &'a gpu::SurvivalFlexBlock10TimepointBase,
+    pub exit_base: &'a gpu::SurvivalFlexBlock10TimepointBase,
+    pub entry_ext_u: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
+    pub exit_ext_u: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
+    pub entry_ext_v: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
+    pub exit_ext_v: &'a gpu::SurvivalFlexBlock10TimepointDirectional,
+    pub entry_bi: &'a gpu::SurvivalFlexBlock10TimepointBiDirectional,
+    pub exit_bi: &'a gpu::SurvivalFlexBlock10TimepointBiDirectional,
+}
+
 impl SurvivalMarginalSlopeFamily {
     /// Single-source flex row value + gradient (+ Hessian if `hess_h*` non-empty)
     /// from the entry/exit timepoint packs. The Hessian channel is returned only
@@ -461,19 +502,22 @@ impl SurvivalMarginalSlopeFamily {
         primary: &FlexPrimarySlices,
         q1: f64,
         qd1: f64,
-        eta0_v: f64,
-        eta0_g: ndarray::ArrayView1<'_, f64>,
-        eta0_h: Option<ndarray::ArrayView2<'_, f64>>,
-        eta1_v: f64,
-        eta1_g: ndarray::ArrayView1<'_, f64>,
-        eta1_h: Option<ndarray::ArrayView2<'_, f64>>,
-        chi1_v: f64,
-        chi1_g: ndarray::ArrayView1<'_, f64>,
-        chi1_h: Option<ndarray::ArrayView2<'_, f64>>,
-        d1_v: f64,
-        d1_g: ndarray::ArrayView1<'_, f64>,
-        d1_h: Option<ndarray::ArrayView2<'_, f64>>,
+        ch: FlexRowJet2Channels<'_>,
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let FlexRowJet2Channels {
+            eta0_v,
+            eta0_g,
+            eta0_h,
+            eta1_v,
+            eta1_g,
+            eta1_h,
+            chi1_v,
+            chi1_g,
+            chi1_h,
+            d1_v,
+            d1_g,
+            d1_h,
+        } = ch;
         let p = primary.total;
         let wi = self.weights[row];
         let di = self.event[row];
@@ -506,11 +550,14 @@ impl SurvivalMarginalSlopeFamily {
         q1: f64,
         qd1: f64,
         dir: &[f64],
-        entry_base: &gpu::SurvivalFlexBlock10TimepointBase,
-        exit_base: &gpu::SurvivalFlexBlock10TimepointBase,
-        entry_ext: &gpu::SurvivalFlexBlock10TimepointDirectional,
-        exit_ext: &gpu::SurvivalFlexBlock10TimepointDirectional,
+        packs: FlexThirdPacks<'_>,
     ) -> Result<Array2<f64>, String> {
+        let FlexThirdPacks {
+            entry_base,
+            exit_base,
+            entry_ext,
+            exit_ext,
+        } = packs;
         let p = primary.total;
         let wi = self.weights[row];
         let di = self.event[row];
@@ -573,15 +620,18 @@ impl SurvivalMarginalSlopeFamily {
         qd1: f64,
         dir_u: &[f64],
         dir_v: &[f64],
-        entry_base: &gpu::SurvivalFlexBlock10TimepointBase,
-        exit_base: &gpu::SurvivalFlexBlock10TimepointBase,
-        entry_ext_u: &gpu::SurvivalFlexBlock10TimepointDirectional,
-        exit_ext_u: &gpu::SurvivalFlexBlock10TimepointDirectional,
-        entry_ext_v: &gpu::SurvivalFlexBlock10TimepointDirectional,
-        exit_ext_v: &gpu::SurvivalFlexBlock10TimepointDirectional,
-        entry_bi: &gpu::SurvivalFlexBlock10TimepointBiDirectional,
-        exit_bi: &gpu::SurvivalFlexBlock10TimepointBiDirectional,
+        packs: FlexFourthPacks<'_>,
     ) -> Result<Array2<f64>, String> {
+        let FlexFourthPacks {
+            entry_base,
+            exit_base,
+            entry_ext_u,
+            exit_ext_u,
+            entry_ext_v,
+            exit_ext_v,
+            entry_bi,
+            exit_bi,
+        } = packs;
         let p = primary.total;
         let wi = self.weights[row];
         let di = self.event[row];

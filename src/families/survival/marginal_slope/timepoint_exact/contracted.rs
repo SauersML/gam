@@ -205,10 +205,12 @@ impl SurvivalMarginalSlopeFamily {
             base.qd1,
             dir.as_slice()
                 .ok_or_else(|| "third contraction: dir must be contiguous".to_string())?,
-            &base.entry_base,
-            &base.exit_base,
-            &block10_pack_dir(&entry_ext),
-            &block10_pack_dir(&exit_ext),
+            super::flex_jet::FlexThirdPacks {
+                entry_base: &base.entry_base,
+                exit_base: &base.exit_base,
+                entry_ext: &block10_pack_dir(&entry_ext),
+                exit_ext: &block10_pack_dir(&exit_ext),
+            },
         )
     }
 
@@ -415,14 +417,16 @@ impl SurvivalMarginalSlopeFamily {
             dir_v
                 .as_slice()
                 .ok_or_else(|| "fourth contraction: dir_v must be contiguous".to_string())?,
-            &block10_pack_base(&entry_base),
-            &block10_pack_base(&exit_base),
-            &block10_pack_dir(&entry_ext_u),
-            &block10_pack_dir(&exit_ext_u),
-            &block10_pack_dir(&entry_ext_v),
-            &block10_pack_dir(&exit_ext_v),
-            &block10_pack_bi(&entry_bi),
-            &block10_pack_bi(&exit_bi),
+            super::flex_jet::FlexFourthPacks {
+                entry_base: &block10_pack_base(&entry_base),
+                exit_base: &block10_pack_base(&exit_base),
+                entry_ext_u: &block10_pack_dir(&entry_ext_u),
+                exit_ext_u: &block10_pack_dir(&exit_ext_u),
+                entry_ext_v: &block10_pack_dir(&entry_ext_v),
+                exit_ext_v: &block10_pack_dir(&exit_ext_v),
+                entry_bi: &block10_pack_bi(&entry_bi),
+                exit_bi: &block10_pack_bi(&exit_bi),
+            },
         )
     }
 
