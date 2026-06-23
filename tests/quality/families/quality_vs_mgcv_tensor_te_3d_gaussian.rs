@@ -141,7 +141,14 @@ fn gam_te_3d_recovers_nonadditive_surface() {
         suppressPackageStartupMessages(library(mgcv))
         m <- gam(y ~ te(x1, x2, x3, k = 5), data = df, method = "REML")
         emit("fitted", as.numeric(fitted(m)))
+        emit("sp", as.numeric(m$sp))
+        emit("edf", as.numeric(sum(m$edf)))
         "#,
+    );
+    eprintln!(
+        "[#1074-te3d-mgcv] mgcv sp(per-margin)={:?} mgcv_edf_total={:?}",
+        r.vector("sp"),
+        r.vector("edf"),
     );
     let mgcv_fitted = r.vector("fitted");
     assert_eq!(mgcv_fitted.len(), n, "mgcv fitted length mismatch");
