@@ -3451,7 +3451,7 @@ const KERNEL_RANGE_MAX_SPACING_MULTIPLE: f64 = 1e2;
 /// bundled with an earlier attempt is what regressed the high-frequency sin8
 /// collapse guard, so the init stays at the conservative
 /// `DEFAULT_MATERN_LENGTH_SCALE_DIAMETER_FRACTION` and only the ceiling moves.
-const MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.5;
+const MATERN_KERNEL_RANGE_MAX_LENGTH_SCALE_DIAMETER_FRACTION: f64 = 0.15;
 
 /// Returns ψ-space bounds (ψ_lo = ln(κ_lo), ψ_hi = ln(κ_hi)).
 ///
