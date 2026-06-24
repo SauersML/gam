@@ -1,4 +1,5 @@
 use super::*;
+use crate::families::jet_scalar::JetScalar;
 
 /// #1410 — single active-atom entry of the per-row softmax-entropy Gershgorin
 /// Loewner majorizer `D_kk = Σ_j |H_kj|` (#1419), computed WITHOUT materialising
@@ -8116,11 +8117,13 @@ impl SaeManifoldTerm {
         second: &mut [Vec<Vec<f64>>],
     ) {
         for out_col in 0..program.out_dim() {
-            let tower = program.reconstruction_column::<K>(out_col);
+            let tower = program.reconstruction_column_packed::<K>(out_col);
+            let g = tower.g();
+            let h = tower.h();
             for a in 0..K {
-                first[a][out_col] = sqrt_row_w * tower.g[a];
+                first[a][out_col] = sqrt_row_w * g[a];
                 for b in 0..K {
-                    second[a][b][out_col] = sqrt_row_w * tower.h[a][b];
+                    second[a][b][out_col] = sqrt_row_w * h[a][b];
                 }
             }
         }
@@ -8169,14 +8172,16 @@ impl SaeManifoldTerm {
             // from the SAME gate_tower / basis_tower primitives as the
             // reconstruction column. Tower slot `a` is `vars[a]` exactly as the
             // reconstruction `first`/`second` channels index it.
-            let s = program.beta_border_tower::<K>(channel.atom, channel.basis_col);
+            let s = program.beta_border_tower_packed::<K>(channel.atom, channel.basis_col);
+            let s_v = s.value();
+            let s_g = s.g();
             for out_col in 0..p {
                 let out_c = channel.output[out_col];
-                beta[beta_pos][out_col] = sqrt_row_w * s.v * out_c;
+                beta[beta_pos][out_col] = sqrt_row_w * s_v * out_c;
                 for a in 0..K {
                     // Reconstruction is linear in β, so beta_deriv and
                     // beta_l_deriv are the identical mixed ∂²ẑ_c/∂β∂p_a channel.
-                    let mixed = sqrt_row_w * s.g[a] * out_c;
+                    let mixed = sqrt_row_w * s_g[a] * out_c;
                     beta_deriv[a][beta_pos][out_col] = mixed;
                     beta_l_deriv[a][beta_pos][out_col] = mixed;
                 }
