@@ -341,6 +341,116 @@ pub(crate) fn try_device_arrow_direct(
     }
 }
 
+/// Admission + dispatch for the device-resident SAE matrix-free PCG **under the
+/// production Direct mode** (issue #1551).
+///
+/// The real SAE inner solve (`converge_inner_for_undamped_logdet` and the
+/// Laplace-evidence drivers) runs `ArrowSolveOptions::direct()` with a finite
+/// trust-region radius and installs the matrix-free `H_tβ` / `H_ββ` operators
+/// (`htbeta_matvec.is_some()`). Both existing device entries decline that shape:
+/// `try_device_arrow_direct` rejects matrix-free systems, and the InexactPCG
+/// device branch only fires when `radius == INFINITY` (never set in production).
+/// So every real SAE fit ran the inner arrow-Schur on the CPU (GPU 0%).
+///
+/// Direct mode is the **exact full Newton step** — there is no trust-region
+/// truncation to honor — so the unbounded device PCG, run to tight tolerance and
+/// high iteration count, converges to the SAME step the dense Direct CPU path
+/// produces (to ~1e-8). The `radius == INFINITY` concern that gates the
+/// InexactPCG device branch therefore does not apply here: the bounded radius in
+/// the options is irrelevant because Direct never truncates.
+///
+/// Returns `Some(Ok(..))` when the device produced a converged step (caller
+/// returns it), `Some(Err(..))` only for a numerical failure the LM escalation
+/// must respond to, and `None` when the device declines (no `device_sae_pcg`
+/// data, GPU not admitted, mode not Direct, or a transient device decline) — the
+/// caller then falls through to the bit-identical CPU dense Direct path
+/// unchanged.
+///
+/// The framed-vs-legacy split (`G ⊗ W_{ij}` factored frames vs full-`B`
+/// `⊗ I_p`) is handled inside `solve_sae_matrix_free_pcg` by its existing
+/// dispatch guard (`data.frame.is_some()`), so this site is agnostic to it.
+pub(crate) fn try_device_arrow_direct_sae_pcg(
+    sys: &ArrowSchurSystem,
+    htt_factors: &ArrowFactorSlab,
+    rhs_beta: &Array1<f64>,
+    ridge_t: f64,
+    ridge_beta: f64,
+    options: &ArrowSolveOptions,
+    backend: &CpuBatchedBlockSolver,
+    gauge_deflated_directions: usize,
+) -> Option<Result<ArrowNewtonStepArtifacts, ArrowSchurError>> {
+    if options.mode != ArrowSolverMode::Direct {
+        return None;
+    }
+    // Only the matrix-free SAE system carries device PCG frames; a dense Direct
+    // system routes through `try_device_arrow_direct` instead.
+    let device_data = sys.device_sae_pcg.as_ref()?;
+    // Cross-row penalties / streaming are not on this matrix-free PCG path.
+    if !sys.cross_row_penalties.is_empty() || options.streaming_chunk_size.is_some() {
+        return None;
+    }
+    let runtime = crate::gpu::device_runtime::GpuRuntime::global()?;
+    // CG-amortised work gate (same predicate the InexactPCG matvec-offload site
+    // uses): the SAE reduced-Schur apply is `O(n · k · d)` reused over the CG
+    // iteration budget, so it registers the real batched arithmetic the cold
+    // single-launch dense floor misses.
+    let cg_iters = options
+        .pcg
+        .max_iterations
+        .min(options.trust_region.max_iterations);
+    if !runtime
+        .policy()
+        .reduced_schur_matvec_should_offload(sys.rows.len(), sys.k, sys.d, cg_iters)
+    {
+        return None;
+    }
+    // Direct mode = exact full step: run the unbounded device PCG to a tight
+    // tolerance and a high iteration ceiling so it converges to the same step the
+    // dense Direct factorization yields. The control floor here is independent of
+    // the (irrelevant, never-truncated) trust-region radius.
+    let max_iterations = options.pcg.max_iterations.max(sys.k.saturating_add(1));
+    let relative_tolerance = options.pcg.relative_tolerance.min(1e-12);
+    match crate::gpu::kernels::arrow_schur::solve_sae_matrix_free_pcg(
+        sys,
+        device_data.as_ref(),
+        ridge_t,
+        ridge_beta,
+        rhs_beta,
+        max_iterations,
+        relative_tolerance,
+    ) {
+        Ok((delta_beta, mut diag)) => {
+            diag.used_device_arrow = true;
+            let delta_t = back_substitute_delta_t(sys, htt_factors, delta_beta.view(), backend);
+            Some(Ok(ArrowNewtonStepArtifacts {
+                delta_t,
+                delta_beta,
+                htt_factors: htt_factors.clone(),
+                schur_factor: None,
+                pcg_diagnostics: diag,
+                gauge_deflated_directions,
+            }))
+        }
+        // A non-PD per-row / Schur condition is a real numerical signal the LM
+        // escalation must respond to; surface the matching CPU error variant so
+        // the ridge is bumped and the solve retried (rather than silently
+        // continuing on a wrong step).
+        Err(crate::gpu::kernels::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired {
+            row,
+            bump,
+        }) => Some(Err(ArrowSchurError::PerRowFactorFailed {
+            row,
+            reason: format!("device SAE PCG per-row block non-PD; suggested ridge bump {bump:e}"),
+        })),
+        Err(crate::gpu::kernels::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed {
+            reason,
+        }) => Some(Err(ArrowSchurError::SchurFactorFailed { reason })),
+        // Unavailable / transient / framed-mismatch all mean "device declined" —
+        // fall through to the CPU dense Direct path transparently.
+        Err(_) => None,
+    }
+}
+
 /// LM-style ridge escalation around `solve_arrow_newton_step_core`.
 ///
 /// On `PerRowFactorFailed` / `PerRowFactorIllConditioned` /
@@ -1406,6 +1516,24 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
     let mut mixed_precision_status = MixedPrecisionStatus::Off;
     let (delta_beta, schur_factor, mut pcg_diagnostics) = match options.mode {
         ArrowSolverMode::Direct => {
+            // #1551 production device seam: when the matrix-free SAE PCG frames are
+            // present and the GPU admits the CG-amortised work, run the exact full
+            // Direct step on the device (no trust-region truncation in Direct mode,
+            // so the unbounded device PCG converges to the dense Direct step). On any
+            // device decline this returns `None` and the CPU dense path below runs
+            // bit-identically.
+            if let Some(device_step) = try_device_arrow_direct_sae_pcg(
+                sys,
+                &htt_factors,
+                &rhs_beta,
+                ridge_t,
+                ridge_beta,
+                options,
+                &backend,
+                gauge_deflated_directions,
+            ) {
+                return device_step;
+            }
             let schur = build_dense_schur_direct(sys, &htt_factors, ridge_beta, &backend)?;
             if let Some(attempt) = try_mixed_precision_arrow_solve(
                 sys,
