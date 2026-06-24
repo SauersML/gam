@@ -1,16 +1,14 @@
 //! Dense polynomial arithmetic for the survival marginal-slope closed-form
-//! chain: scalar-coefficient ops over `PolyVec` and their multi-directional-jet
-//! counterparts over `MultiDirJet`.
+//! chain: scalar-coefficient ops over `PolyVec`.
 //!
-//! Pure relocation from `survival_marginal_slope.rs` (issue #780
-//! decomposition): `poly_mul`/`poly_sub`/`poly_add`/`poly_scale` over scalar
-//! coefficient vectors, and `poly_add_jets`/`poly_scale_jets`/`poly_mul_jets`/
-//! `poly_coeff_mask` over `MultiDirJet` coefficient vectors. These are
-//! self-contained algebraic helpers; the entry points are re-imported by the
-//! parent so every call site is unchanged. Bodies are byte-identical.
+//! `poly_mul`/`poly_sub`/`poly_add`/`poly_scale` over scalar coefficient vectors
+//! (production, the grad-only first-order timepoint path). Their
+//! `MultiDirJet`-coefficient counterparts (`poly_*_jets`/`poly_coeff_mask`) are now
+//! test-only (the hand oracle) and live in `flex_oracle_structs_tests`, since the
+//! #932-2 cutover routes the production flex jet path through the `flex_jet` runtime
+//! jet algebra. Bodies are byte-identical to their pre-relocation form (#780).
 
 use super::PolyVec;
-use crate::families::jet_partitions::MultiDirJet;
 use smallvec::{SmallVec, smallvec};
 
 #[inline]
@@ -74,41 +72,9 @@ pub(crate) fn poly_scale(poly: &[f64], scale: f64) -> PolyVec {
     out
 }
 
-pub(crate) fn poly_add_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<MultiDirJet> {
-    let count = lhs.len().max(rhs.len());
-    let mut out = Vec::with_capacity(count);
-    for idx in 0..count {
-        let left = lhs
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| MultiDirJet::zero(2));
-        let right = rhs
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| MultiDirJet::zero(2));
-        out.push(left.add(&right));
-    }
-    out
-}
-
-pub(crate) fn poly_scale_jets(poly: &[MultiDirJet], scale: &MultiDirJet) -> Vec<MultiDirJet> {
-    poly.iter().map(|coeff| coeff.mul(scale)).collect()
-}
-
-pub(crate) fn poly_mul_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<MultiDirJet> {
-    if lhs.is_empty() || rhs.is_empty() {
-        return Vec::new();
-    }
-    let mut out = vec![MultiDirJet::zero(2); lhs.len() + rhs.len() - 1];
-    for (i, left) in lhs.iter().enumerate() {
-        for (j, right) in rhs.iter().enumerate() {
-            let prod = left.mul(right);
-            out[i + j] = out[i + j].add(&prod);
-        }
-    }
-    out
-}
-
-pub(crate) fn poly_coeff_mask(poly: &[MultiDirJet], mask: usize) -> Vec<f64> {
-    poly.iter().map(|coeff| coeff.coeff(mask)).collect()
-}
+// #932-2 cutover: the `MultiDirJet`-coefficient poly ops (`poly_add_jets` /
+// `poly_scale_jets` / `poly_mul_jets` / `poly_coeff_mask`) feed ONLY the now
+// test-only hand directional/bidirectional oracle — the production flex jet path
+// uses the runtime `flex_jet` jet algebra, not `MultiDirJet`. Moved to the
+// test-masked `flex_oracle_structs_tests` module so the non-test lib build does not
+// carry them as dead code.

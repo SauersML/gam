@@ -81,52 +81,9 @@
 
 use super::*;
 use crate::families::bms::signed_probit_neglog_derivatives_up_to_fourth;
-use crate::families::jet_scalar::{filtered_implicit_solve_scalar, Order2};
-use crate::families::jet_tower::Tower2;
 use crate::families::survival::marginal_slope::gpu;
 use crate::inference::probability::signed_probit_logcdf_and_mills_ratio;
 
-/// #932 Item 1 (doc §B): lift the calibration intercept jet `a(θ)` — value /
-/// gradient / Hessian — by `filtered_implicit_solve_scalar` over the calibration
-/// constraint `F(a, θ) = 0`, instead of the hand IFT closed forms. `F`'s
-/// `(a, θ)` jet channels ARE the already-computed calibration partials:
-/// `F_a = D` (`d_check`), `F_{θi} = −f_u[i]`, `F_aa = f_aa`,
-/// `F_{aθi} = d_u[i]` (= `∂D/∂θ_i`), `F_{θiθj} = −f_uv[i][j]`. The filtered
-/// Newton step `A ← A − F(A)/F_a` (2 iterations at `Order2`, the nilpotency
-/// order) returns `A.g = a_u`, `A.h = a_uv` — reproducing the hand IFT
-/// `a_u = f_u/D`, `a_uv = (f_uv − d_u·a_u − d_u·a_u − f_aa·a_u·a_u)/D` term for
-/// term, but from the recurrence rather than a memorised string (`jet_tower`
-/// `implicit_solve` pins that equivalence at 1e-12). `O(K²)` per timepoint.
-fn lift_intercept_order2<const K: usize>(
-    d_check: f64,
-    f_u: &[f64],
-    f_uv: &[f64],
-    f_aa: f64,
-    d_u: &[f64],
-    a0: f64,
-) -> [[f64; K]; K] {
-    let residual = |a: &Order2<K>| -> Order2<K> {
-        let ag = a.g();
-        let ah = a.h();
-        let mut g = [0.0_f64; K];
-        let mut h = [[0.0_f64; K]; K];
-        for i in 0..K {
-            g[i] = d_check * ag[i] - f_u[i];
-        }
-        for i in 0..K {
-            for j in 0..K {
-                h[i][j] = d_check * ah[i][j]
-                    + f_aa * ag[i] * ag[j]
-                    + d_u[i] * ag[j]
-                    + d_u[j] * ag[i]
-                    - f_uv[i * K + j];
-            }
-        }
-        Order2(Tower2 { v: 0.0, g, h })
-    };
-    let a = filtered_implicit_solve_scalar::<K, Order2<K>>(a0, 1.0 / d_check, 2, residual);
-    a.h()
-}
 
 /// The `[f64; 5]` Faà di Bruno stack of `g(η) = logΦ(−η)` at `η`.
 ///
@@ -585,87 +542,6 @@ pub(crate) struct FlexFourthPacks<'a> {
 }
 
 impl SurvivalMarginalSlopeFamily {
-    /// #932 Item 1: dispatch the runtime primary count `p` to a concrete `K` and
-    /// lift the calibration intercept Hessian `a_uv` via [`lift_intercept_order2`]
-    /// (`filtered_implicit_solve_scalar` over the calibration constraint) — the
-    /// single-source replacement for the hand IFT closed form. `Order2` keeps it
-    /// `O(K²)` per timepoint (no dense `Tower4<K+1>`); for primary counts beyond
-    /// the dispatch table the byte-identical hand IFT is the fallback.
-    pub(crate) fn lift_flex_intercept_hessian(
-        &self,
-        p: usize,
-        d_check: f64,
-        f_u: &Array1<f64>,
-        f_uv: &Array2<f64>,
-        f_aa: f64,
-        d_u: &Array1<f64>,
-        a0: f64,
-    ) -> Result<Array2<f64>, String> {
-        let fu = f_u
-            .as_slice()
-            .ok_or_else(|| "intercept lift: f_u must be contiguous".to_string())?;
-        let fuv = f_uv
-            .as_slice()
-            .ok_or_else(|| "intercept lift: f_uv must be contiguous".to_string())?;
-        let du = d_u
-            .as_slice()
-            .ok_or_else(|| "intercept lift: d_u must be contiguous".to_string())?;
-        macro_rules! go {
-            ($k:literal) => {{
-                let a_uv = lift_intercept_order2::<$k>(d_check, fu, fuv, f_aa, du, a0);
-                Array2::from_shape_fn((p, p), |(i, j)| a_uv[i][j])
-            }};
-        }
-        let a_uv = match p {
-            1 => go!(1),
-            2 => go!(2),
-            3 => go!(3),
-            4 => go!(4),
-            5 => go!(5),
-            6 => go!(6),
-            7 => go!(7),
-            8 => go!(8),
-            9 => go!(9),
-            10 => go!(10),
-            11 => go!(11),
-            12 => go!(12),
-            13 => go!(13),
-            14 => go!(14),
-            15 => go!(15),
-            16 => go!(16),
-            17 => go!(17),
-            18 => go!(18),
-            19 => go!(19),
-            20 => go!(20),
-            21 => go!(21),
-            22 => go!(22),
-            23 => go!(23),
-            24 => go!(24),
-            _ => {
-                // Byte-identical hand IFT fallback for primary counts beyond the
-                // dispatch table.
-                let inv = 1.0 / d_check;
-                let mut a_u = Array1::<f64>::zeros(p);
-                for u in 0..p {
-                    a_u[u] = fu[u] * inv;
-                }
-                let mut a_uv = Array2::<f64>::zeros((p, p));
-                for u in 0..p {
-                    for v in u..p {
-                        let value = (f_uv[[u, v]]
-                            - d_u[u] * a_u[v]
-                            - d_u[v] * a_u[u]
-                            - f_aa * a_u[u] * a_u[v])
-                            * inv;
-                        a_uv[[u, v]] = value;
-                        a_uv[[v, u]] = value;
-                    }
-                }
-                a_uv
-            }
-        };
-        Ok(a_uv)
-    }
 
     /// Single-source flex row value + gradient (+ Hessian if `hess_h*` non-empty)
     /// from the entry/exit timepoint packs. The Hessian channel is returned only
@@ -2104,6 +1980,140 @@ mod moment_engine_tests {
     use super::*;
     use crate::families::cubic_cell_kernel::{reduce_sextic_moments, DenestedCubicCell};
     use crate::families::marginal_slope_shared::eval_coeff4_at;
+    use crate::families::jet_scalar::{filtered_implicit_solve_scalar, Order2};
+    use crate::families::jet_tower::Tower2;
+
+    // #932-2 cutover: the hand IFT intercept-Hessian lift (`lift_flex_intercept_hessian`
+    // + its `lift_intercept_order2` Order2 dispatch) is consumed only by the hand
+    // `_from_cached` oracle now — the production flex jet path lifts the intercept
+    // through the generic `flex_timepoint_inputs_generic` builder's own
+    // `lift_intercept_flex`. Gated to the test build so the lib carries no dead code.
+    /// #932 Item 1 (doc §B): lift the calibration intercept jet `a(θ)` — value /
+    /// gradient / Hessian — by `filtered_implicit_solve_scalar` over the calibration
+    /// constraint `F(a, θ) = 0`, instead of the hand IFT closed forms. `F`'s
+    /// `(a, θ)` jet channels ARE the already-computed calibration partials:
+    /// `F_a = D` (`d_check`), `F_{θi} = −f_u[i]`, `F_aa = f_aa`,
+    /// `F_{aθi} = d_u[i]` (= `∂D/∂θ_i`), `F_{θiθj} = −f_uv[i][j]`. The filtered
+    /// Newton step `A ← A − F(A)/F_a` (2 iterations at `Order2`, the nilpotency
+    /// order) returns `A.g = a_u`, `A.h = a_uv` — reproducing the hand IFT
+    /// `a_u = f_u/D`, `a_uv = (f_uv − d_u·a_u − d_u·a_u − f_aa·a_u·a_u)/D` term for
+    /// term, but from the recurrence rather than a memorised string (`jet_tower`
+    /// `implicit_solve` pins that equivalence at 1e-12). `O(K²)` per timepoint.
+    fn lift_intercept_order2<const K: usize>(
+        d_check: f64,
+        f_u: &[f64],
+        f_uv: &[f64],
+        f_aa: f64,
+        d_u: &[f64],
+        a0: f64,
+    ) -> [[f64; K]; K] {
+        let residual = |a: &Order2<K>| -> Order2<K> {
+            let ag = a.g();
+            let ah = a.h();
+            let mut g = [0.0_f64; K];
+            let mut h = [[0.0_f64; K]; K];
+            for i in 0..K {
+                g[i] = d_check * ag[i] - f_u[i];
+            }
+            for i in 0..K {
+                for j in 0..K {
+                    h[i][j] = d_check * ah[i][j]
+                        + f_aa * ag[i] * ag[j]
+                        + d_u[i] * ag[j]
+                        + d_u[j] * ag[i]
+                        - f_uv[i * K + j];
+                }
+            }
+            Order2(Tower2 { v: 0.0, g, h })
+        };
+        let a = filtered_implicit_solve_scalar::<K, Order2<K>>(a0, 1.0 / d_check, 2, residual);
+        a.h()
+    }
+
+    impl SurvivalMarginalSlopeFamily {
+        /// #932 Item 1: dispatch the runtime primary count `p` to a concrete `K` and
+        /// lift the calibration intercept Hessian `a_uv` via [`lift_intercept_order2`]
+        /// (`filtered_implicit_solve_scalar` over the calibration constraint) — the
+        /// single-source replacement for the hand IFT closed form. `Order2` keeps it
+        /// `O(K²)` per timepoint (no dense `Tower4<K+1>`); for primary counts beyond
+        /// the dispatch table the byte-identical hand IFT is the fallback.
+        pub(crate) fn lift_flex_intercept_hessian(
+            &self,
+            p: usize,
+            d_check: f64,
+            f_u: &Array1<f64>,
+            f_uv: &Array2<f64>,
+            f_aa: f64,
+            d_u: &Array1<f64>,
+            a0: f64,
+        ) -> Result<Array2<f64>, String> {
+            let fu = f_u
+                .as_slice()
+                .ok_or_else(|| "intercept lift: f_u must be contiguous".to_string())?;
+            let fuv = f_uv
+                .as_slice()
+                .ok_or_else(|| "intercept lift: f_uv must be contiguous".to_string())?;
+            let du = d_u
+                .as_slice()
+                .ok_or_else(|| "intercept lift: d_u must be contiguous".to_string())?;
+            macro_rules! go {
+                ($k:literal) => {{
+                    let a_uv = lift_intercept_order2::<$k>(d_check, fu, fuv, f_aa, du, a0);
+                    Array2::from_shape_fn((p, p), |(i, j)| a_uv[i][j])
+                }};
+            }
+            let a_uv = match p {
+                1 => go!(1),
+                2 => go!(2),
+                3 => go!(3),
+                4 => go!(4),
+                5 => go!(5),
+                6 => go!(6),
+                7 => go!(7),
+                8 => go!(8),
+                9 => go!(9),
+                10 => go!(10),
+                11 => go!(11),
+                12 => go!(12),
+                13 => go!(13),
+                14 => go!(14),
+                15 => go!(15),
+                16 => go!(16),
+                17 => go!(17),
+                18 => go!(18),
+                19 => go!(19),
+                20 => go!(20),
+                21 => go!(21),
+                22 => go!(22),
+                23 => go!(23),
+                24 => go!(24),
+                _ => {
+                    // Byte-identical hand IFT fallback for primary counts beyond the
+                    // dispatch table.
+                    let inv = 1.0 / d_check;
+                    let mut a_u = Array1::<f64>::zeros(p);
+                    for u in 0..p {
+                        a_u[u] = fu[u] * inv;
+                    }
+                    let mut a_uv = Array2::<f64>::zeros((p, p));
+                    for u in 0..p {
+                        for v in u..p {
+                            let value = (f_uv[[u, v]]
+                                - d_u[u] * a_u[v]
+                                - d_u[v] * a_u[u]
+                                - f_aa * a_u[u] * a_u[v])
+                                * inv;
+                            a_uv[[u, v]] = value;
+                            a_uv[[v, u]] = value;
+                        }
+                    }
+                    a_uv
+                }
+            };
+            Ok(a_uv)
+        }
+    }
+
 
 
 
@@ -4287,4 +4297,5 @@ mod moment_engine_tests {
         cmp_mat_oracle("d_uv_uv", &d4.eps_del.h, &oracle_d_uvuv);
     }
 }
+
 

@@ -163,10 +163,7 @@ pub(crate) use fit_setup::*;
 pub(crate) use hessian::*;
 pub(crate) use joint_eval::*;
 pub(crate) use joint_workspace::*;
-pub(crate) use poly_arith::{
-    poly_add, poly_add_jets, poly_coeff_mask, poly_mul, poly_mul_jets, poly_scale, poly_scale_jets,
-    poly_sub,
-};
+pub(crate) use poly_arith::{poly_add, poly_mul, poly_scale, poly_sub};
 pub(crate) use primary_geometry::*;
 pub(crate) use row_kernel::*;
 pub use row_math::*;

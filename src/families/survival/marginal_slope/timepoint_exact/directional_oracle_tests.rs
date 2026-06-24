@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::families::survival::marginal_slope::flex_oracle_structs_tests::{
+    poly_add_jets, poly_coeff_mask, poly_mul_jets, poly_scale_jets,
     SurvivalFlexTimepointDirectionalExact, COEFF_SUPPORT_GHW, COEFF_SUPPORT_GW,
 };
 
@@ -58,9 +59,18 @@ impl SurvivalMarginalSlopeFamily {
         // q-marginal RHS self term `+φ(q)` on `f_u[q_index]` is part of it).
         let a_dir = {
             let mut f_dir_pre = 0.0;
+            // The calibration derivative `f_a = Σ_cells F'_a` recomputed from the cached
+            // cells (the production cache no longer carries it as a field — only this
+            // oracle read it; bit-identical to the former `cached.calibration_f_a`).
+            let mut calibration_f_a = 0.0;
             for cell_entry in &cached.cells {
                 let state = &cell_entry.state;
                 let fixed = &cell_entry.fixed;
+                let neg_dc_da = fixed.dc_da.map(|v| -v);
+                calibration_f_a += exact_kernel::cell_first_derivative_from_moments(
+                    &neg_dc_da,
+                    &state.moments,
+                )?;
                 let mut neg_coeff_dir = [0.0; 4];
                 for c in 0..p {
                     if dir[c] == 0.0 {
@@ -82,7 +92,7 @@ impl SurvivalMarginalSlopeFamily {
                 f_dir_pre += dir[q_index] * phi_q;
             }
             // a_u = -f_u/f_a ⇒ a_dir = a_u·dir = -(f_dir)/f_a.
-            -f_dir_pre / cached.calibration_f_a
+            -f_dir_pre / calibration_f_a
         };
 
         struct DirectionalTimepointCellAccum {

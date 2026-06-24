@@ -44,12 +44,6 @@ impl MultiDirJet {
         out
     }
 
-    pub(crate) fn bilinear(base: f64, d1: f64, d2: f64, d12: f64) -> Self {
-        Self {
-            coeffs: vec![base, d1, d2, d12],
-        }
-    }
-
     pub(crate) fn coeff(&self, mask: usize) -> f64 {
         self.coeffs[mask]
     }
@@ -61,17 +55,6 @@ impl MultiDirJet {
                 .iter()
                 .zip(other.coeffs.iter())
                 .map(|(lhs, rhs)| lhs + rhs)
-                .collect(),
-        }
-    }
-
-    pub(crate) fn sub(&self, other: &Self) -> Self {
-        Self {
-            coeffs: self
-                .coeffs
-                .iter()
-                .zip(other.coeffs.iter())
-                .map(|(lhs, rhs)| lhs - rhs)
                 .collect(),
         }
     }
@@ -143,4 +126,35 @@ fn bit_positions(mask: usize) -> super::jet_algebra::SlotBuf {
 /// Combine a slot-group (list of bit positions) back into a sub-mask.
 fn mask_of(slots: &[usize]) -> usize {
     slots.iter().fold(0usize, |acc, &b| acc | (1usize << b))
+}
+
+// #932-2 cutover: `MultiDirJet::bilinear` (the 4-coeff `[base, d1, d2, d12]`
+// constructor) and `MultiDirJet::sub` are consumed ONLY by the now test-only hand
+// survival directional/bidirectional oracle (the production flex jet path uses the
+// `flex_jet` runtime jet algebra, not `MultiDirJet`). They stay defined on the type
+// but gated to the test build so the non-test lib does not carry them as dead code.
+// (A child `#[cfg(test)] mod` can reach the private `coeffs` field, so the bodies are
+// byte-identical to their former inherent-impl form.)
+#[cfg(test)]
+mod oracle_only_methods_tests {
+    use super::*;
+
+    impl MultiDirJet {
+        pub(crate) fn bilinear(base: f64, d1: f64, d2: f64, d12: f64) -> Self {
+            Self {
+                coeffs: vec![base, d1, d2, d12],
+            }
+        }
+
+        pub(crate) fn sub(&self, other: &Self) -> Self {
+            Self {
+                coeffs: self
+                    .coeffs
+                    .iter()
+                    .zip(other.coeffs.iter())
+                    .map(|(lhs, rhs)| lhs - rhs)
+                    .collect(),
+            }
+        }
+    }
 }

@@ -222,7 +222,6 @@ impl DenestedCellPrimaryFixedPartials {
 /// (F, D, D_uv) that previously each rebuilt partition cells independently.
 pub(crate) struct CachedPartitionCells {
     pub(crate) cells: Vec<CachedCellEntry>,
-    pub(crate) calibration_f_a: f64,
 }
 
 /// Direction-independent per-row state for the flex third-order contraction.

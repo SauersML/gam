@@ -7,7 +7,8 @@
 
 use super::*;
 use crate::families::survival::marginal_slope::flex_oracle_structs_tests::{
-    coeff4_composite_bilinear, coeff4_fixed_bilinear, scalar_composite_bilinear,
+    coeff4_composite_bilinear, coeff4_fixed_bilinear, poly_add_jets, poly_coeff_mask,
+    poly_mul_jets, poly_scale_jets, scalar_composite_bilinear,
     SurvivalFlexTimepointBiDirectionalExact, COEFF_SUPPORT_GHW, COEFF_SUPPORT_GW,
 };
 

@@ -22,6 +22,48 @@ use ndarray::{Array1, Array2};
 // unused-import lint).
 use super::{FlexPrimarySlices, SurvivalMarginalSlopeFamily};
 
+// #932-2 cutover: the `MultiDirJet`-coefficient polynomial ops for the hand oracle
+// (moved from `poly_arith.rs`, where they were dead in the non-test lib build after
+// the production flex path stopped using `MultiDirJet`). Bodies byte-identical.
+pub(crate) fn poly_add_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<MultiDirJet> {
+    let count = lhs.len().max(rhs.len());
+    let mut out = Vec::with_capacity(count);
+    for idx in 0..count {
+        let left = lhs
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| MultiDirJet::zero(2));
+        let right = rhs
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| MultiDirJet::zero(2));
+        out.push(left.add(&right));
+    }
+    out
+}
+
+pub(crate) fn poly_scale_jets(poly: &[MultiDirJet], scale: &MultiDirJet) -> Vec<MultiDirJet> {
+    poly.iter().map(|coeff| coeff.mul(scale)).collect()
+}
+
+pub(crate) fn poly_mul_jets(lhs: &[MultiDirJet], rhs: &[MultiDirJet]) -> Vec<MultiDirJet> {
+    if lhs.is_empty() || rhs.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![MultiDirJet::zero(2); lhs.len() + rhs.len() - 1];
+    for (i, left) in lhs.iter().enumerate() {
+        for (j, right) in rhs.iter().enumerate() {
+            let prod = left.mul(right);
+            out[i + j] = out[i + j].add(&prod);
+        }
+    }
+    out
+}
+
+pub(crate) fn poly_coeff_mask(poly: &[MultiDirJet], mask: usize) -> Vec<f64> {
+    poly.iter().map(|coeff| coeff.coeff(mask)).collect()
+}
+
 /// `g+h+w` coefficient-support mask for the hand oracle (slope + score-warp +
 /// link-dev primaries active).
 pub(crate) const COEFF_SUPPORT_GHW: CoeffSupport = CoeffSupport {

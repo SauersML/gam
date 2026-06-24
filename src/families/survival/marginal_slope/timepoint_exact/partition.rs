@@ -116,17 +116,11 @@ impl SurvivalMarginalSlopeFamily {
             && out.partials[0].len() == n
         {
             let mut cells = Vec::with_capacity(n);
-            let mut calibration_f_a = 0.0;
             for (idx, partition_cell) in raw_cells.into_iter().enumerate() {
                 let flat = &out.partials[0][idx];
                 let fixed = DenestedCellPrimaryFixedPartials::from_flat_slice(
                     flat.as_slice(),
                     primary.total,
-                )?;
-                let neg_dc_da = fixed.dc_da.map(|v| -v);
-                calibration_f_a += exact_kernel::cell_first_derivative_from_moments(
-                    &neg_dc_da,
-                    &states[idx].moments,
                 )?;
                 cells.push(CachedCellEntry {
                     partition_cell,
@@ -135,13 +129,9 @@ impl SurvivalMarginalSlopeFamily {
                     fixed,
                 });
             }
-            return Ok(CachedPartitionCells {
-                cells,
-                calibration_f_a,
-            });
+            return Ok(CachedPartitionCells { cells });
         }
         let mut cells = Vec::with_capacity(n);
-        let mut calibration_f_a = 0.0;
         for (idx, partition_cell) in raw_cells.into_iter().enumerate() {
             let fixed = self.denested_cell_primary_fixed_partials(
                 primary,
@@ -152,9 +142,6 @@ impl SurvivalMarginalSlopeFamily {
                 z_mids[idx],
                 u_mids[idx],
             )?;
-            let neg_dc_da = fixed.dc_da.map(|v| -v);
-            calibration_f_a +=
-                exact_kernel::cell_first_derivative_from_moments(&neg_dc_da, &states[idx].moments)?;
             cells.push(CachedCellEntry {
                 partition_cell,
                 neg_cell: neg_cells[idx],
@@ -162,10 +149,7 @@ impl SurvivalMarginalSlopeFamily {
                 fixed,
             });
         }
-        Ok(CachedPartitionCells {
-            cells,
-            calibration_f_a,
-        })
+        Ok(CachedPartitionCells { cells })
     }
 
     pub(crate) fn build_cached_partition(
