@@ -169,59 +169,125 @@ pub(super) struct DispersionRowKernel {
     pub(super) disp_response: f64,
 }
 
+/// NB2 row NLL written ONCE over a generic [`JetScalar<2>`] (#932), seeded on
+/// the natural parameters `(μ, θ)`. Instantiated at `Order2<2>` for the
+/// production `(v, g, H)` hot path and at `Tower4<2>` for the test oracle.
 #[inline]
-pub(crate) fn dispersion_nb_nll_tower(
+fn dispersion_nb_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
     yi: f64,
     mu_value: f64,
     theta_value: f64,
     wi: f64,
-) -> crate::families::jet_tower::Tower4<2> {
-    use crate::families::jet_tower::Tower4;
-    let mu = Tower4::<2>::variable(mu_value, 0);
-    let theta = Tower4::<2>::variable(theta_value, 1);
-    let tpm = theta + mu;
-    let loglik = (theta + yi).ln_gamma() - theta.ln_gamma() - ln_gamma(yi + 1.0)
-        + theta * theta.ln()
-        - theta * tpm.ln()
-        + mu.ln() * yi
-        - tpm.ln() * yi;
-    -loglik * wi
+) -> S {
+    let mu = S::variable(mu_value, 0);
+    let theta = S::variable(theta_value, 1);
+    let tpm = theta.add(&mu);
+    // (theta + yi).ln_gamma() - theta.ln_gamma() - ln_gamma(yi+1)
+    //   + theta*theta.ln() - theta*tpm.ln() + mu.ln()*yi - tpm.ln()*yi
+    let loglik = theta
+        .add(&S::constant(yi))
+        .ln_gamma()
+        .sub(&theta.ln_gamma())
+        .sub(&S::constant(ln_gamma(yi + 1.0)))
+        .add(&theta.mul(&theta.ln()))
+        .sub(&theta.mul(&tpm.ln()))
+        .add(&mu.ln().scale(yi))
+        .sub(&tpm.ln().scale(yi));
+    loglik.scale(-wi)
 }
 
+/// Production `Order2<2>` (value/grad/Hessian) NB2 row NLL — the packed hot
+/// path the dispersion kernel consumes (no dense `t3`/`t4`).
 #[inline]
-pub(crate) fn dispersion_gamma_nll_tower(
+pub(crate) fn dispersion_nb_nll_order2(
+    yi: f64,
+    mu_value: f64,
+    theta_value: f64,
+    wi: f64,
+) -> crate::families::jet_scalar::Order2<2> {
+    dispersion_nb_nll_generic::<crate::families::jet_scalar::Order2<2>>(
+        yi,
+        mu_value,
+        theta_value,
+        wi,
+    )
+}
+
+/// Gamma row NLL written ONCE over a generic [`JetScalar<2>`] (#932), seeded on
+/// `(μ, ν)`.
+#[inline]
+fn dispersion_gamma_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
     yi: f64,
     y_pos: f64,
     mu_value: f64,
     nu_value: f64,
     wi: f64,
-) -> crate::families::jet_tower::Tower4<2> {
-    use crate::families::jet_tower::Tower4;
-    let mu = Tower4::<2>::variable(mu_value, 0);
-    let nu = Tower4::<2>::variable(nu_value, 1);
-    let loglik = nu * nu.ln() - nu * mu.ln() - nu.ln_gamma() + (nu - 1.0) * y_pos.ln()
-        - nu * (mu.recip() * yi);
-    -loglik * wi
+) -> S {
+    let _ = yi;
+    let mu = S::variable(mu_value, 0);
+    let nu = S::variable(nu_value, 1);
+    // nu*nu.ln() - nu*mu.ln() - nu.ln_gamma() + (nu-1)*y_pos.ln() - nu*(mu.recip()*yi)
+    let loglik = nu
+        .mul(&nu.ln())
+        .sub(&nu.mul(&mu.ln()))
+        .sub(&nu.ln_gamma())
+        .add(&nu.sub(&S::constant(1.0)).scale(y_pos.ln()))
+        .sub(&nu.mul(&mu.recip().scale(yi)));
+    loglik.scale(-wi)
 }
 
+/// Production `Order2<2>` Gamma row NLL (value/grad/Hessian hot path).
 #[inline]
-pub(crate) fn dispersion_beta_nll_tower(
+pub(crate) fn dispersion_gamma_nll_order2(
+    yi: f64,
+    y_pos: f64,
+    mu_value: f64,
+    nu_value: f64,
+    wi: f64,
+) -> crate::families::jet_scalar::Order2<2> {
+    dispersion_gamma_nll_generic::<crate::families::jet_scalar::Order2<2>>(
+        yi, y_pos, mu_value, nu_value, wi,
+    )
+}
+
+/// Beta row NLL written ONCE over a generic [`JetScalar<2>`] (#932), seeded on
+/// `(μ, φ)`.
+#[inline]
+fn dispersion_beta_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
     yi: f64,
     mu_value: f64,
     phi_value: f64,
     wi: f64,
-) -> crate::families::jet_tower::Tower4<2> {
-    use crate::families::jet_tower::Tower4;
-    let mu = Tower4::<2>::variable(mu_value, 0);
-    let phi = Tower4::<2>::variable(phi_value, 1);
-    let one_minus_mu = Tower4::<2>::constant(1.0) - mu;
+) -> S {
+    let mu = S::variable(mu_value, 0);
+    let phi = S::variable(phi_value, 1);
+    let one_minus_mu = S::constant(1.0).sub(&mu);
     let yc = yi.clamp(1e-12, 1.0 - 1e-12);
-    let a = mu * phi;
-    let b = one_minus_mu * phi;
-    let loglik = phi.ln_gamma() - a.ln_gamma() - b.ln_gamma()
-        + (a - 1.0) * yc.ln()
-        + (b - 1.0) * (1.0 - yc).ln();
-    -loglik * wi
+    let a = mu.mul(&phi);
+    let b = one_minus_mu.mul(&phi);
+    // phi.ln_gamma() - a.ln_gamma() - b.ln_gamma()
+    //   + (a-1)*yc.ln() + (b-1)*(1-yc).ln()
+    let loglik = phi
+        .ln_gamma()
+        .sub(&a.ln_gamma())
+        .sub(&b.ln_gamma())
+        .add(&a.sub(&S::constant(1.0)).scale(yc.ln()))
+        .add(&b.sub(&S::constant(1.0)).scale((1.0 - yc).ln()));
+    loglik.scale(-wi)
+}
+
+/// Production `Order2<2>` Beta row NLL (value/grad/Hessian hot path; the cross
+/// channel `h()[0][1]` feeds the Beta observed cross weight).
+#[inline]
+pub(crate) fn dispersion_beta_nll_order2(
+    yi: f64,
+    mu_value: f64,
+    phi_value: f64,
+    wi: f64,
+) -> crate::families::jet_scalar::Order2<2> {
+    dispersion_beta_nll_generic::<crate::families::jet_scalar::Order2<2>>(
+        yi, mu_value, phi_value, wi,
+    )
 }
 
 /// Tweedie compound Poisson–Gamma row NLL written ONCE over `Tower4<2>`, seeded
@@ -246,6 +312,60 @@ pub(crate) fn dispersion_beta_nll_tower(
 /// `[f64; 5]` derivative stacks the tower owns, so no primitive is re-derived:
 /// only the Leibniz/Faà-di-Bruno composition is mechanized.
 #[inline]
+fn dispersion_tweedie_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+    yi: f64,
+    eta_mu: f64,
+    eta_d: f64,
+    p: f64,
+    wi: f64,
+) -> S {
+    let one_minus_p = 1.0 - p;
+    let two_minus_p = 2.0 - p;
+    // μ = exp(η_μ), φ = exp(−η_d): the natural parameters as jets in the
+    // predictor primaries, so the whole derivative tower is in η-space.
+    let mu = S::variable(eta_mu, 0).exp();
+    let phi = S::variable(eta_d, 1).scale(-1.0).exp();
+    if yi > 0.0 {
+        // dev = 2·[ μ^{2−p}/(2−p) − y·μ^{1−p}/(1−p) + y^{2−p}/((1−p)(2−p)) ]
+        let dev = mu
+            .powf(two_minus_p)
+            .scale(1.0 / two_minus_p)
+            .sub(&mu.powf(one_minus_p).scale(yi / one_minus_p))
+            .add(&S::constant(
+                yi.powf(two_minus_p) / (one_minus_p * two_minus_p),
+            ))
+            .scale(2.0);
+        // ℓ = dev·(−0.5/φ) − 0.5·ln(2πφ) − 0.5·p·ln y
+        let loglik = dev
+            .mul(&phi.recip().scale(-0.5))
+            .sub(&phi.scale(2.0 * std::f64::consts::PI).ln().scale(0.5))
+            .sub(&S::constant(0.5 * p * yi.ln()));
+        loglik.scale(-wi)
+    } else {
+        // Exact point mass P(Y=0) = exp(−μ^{2−p}/(φ(2−p))).
+        let c = mu.powf(two_minus_p).scale(1.0 / two_minus_p);
+        let loglik = c.mul(&phi.recip()).scale(-1.0);
+        loglik.scale(-wi)
+    }
+}
+
+/// Production `Order2<2>` Tweedie row NLL (value/grad/Hessian hot path).
+#[inline]
+pub(crate) fn dispersion_tweedie_nll_order2(
+    yi: f64,
+    eta_mu: f64,
+    eta_d: f64,
+    p: f64,
+    wi: f64,
+) -> crate::families::jet_scalar::Order2<2> {
+    dispersion_tweedie_nll_generic::<crate::families::jet_scalar::Order2<2>>(
+        yi, eta_mu, eta_d, p, wi,
+    )
+}
+
+/// Dense `Tower4<2>` Tweedie row NLL: the #932 oracle for
+/// [`dispersion_tweedie_nll_order2`].
+#[inline]
 pub(crate) fn dispersion_tweedie_nll_tower(
     yi: f64,
     eta_mu: f64,
@@ -253,35 +373,16 @@ pub(crate) fn dispersion_tweedie_nll_tower(
     p: f64,
     wi: f64,
 ) -> crate::families::jet_tower::Tower4<2> {
-    use crate::families::jet_tower::Tower4;
-    let one_minus_p = 1.0 - p;
-    let two_minus_p = 2.0 - p;
-    // μ = exp(η_μ), φ = exp(−η_d): the natural parameters as jets in the
-    // predictor primaries, so the whole derivative tower is in η-space.
-    let mu = Tower4::<2>::variable(eta_mu, 0).exp();
-    let phi = (Tower4::<2>::variable(eta_d, 1) * (-1.0)).exp();
-    if yi > 0.0 {
-        let dev = (mu.powf(two_minus_p) * (1.0 / two_minus_p)
-            - mu.powf(one_minus_p) * (yi / one_minus_p)
-            + Tower4::<2>::constant(yi.powf(two_minus_p) / (one_minus_p * two_minus_p)))
-            * 2.0;
-        let loglik = dev * (phi.recip() * (-0.5))
-            - (phi * (2.0 * std::f64::consts::PI)).ln() * 0.5
-            - Tower4::<2>::constant(0.5 * p * yi.ln());
-        loglik * (-wi)
-    } else {
-        // Exact point mass P(Y=0) = exp(−μ^{2−p}/(φ(2−p))).
-        let c = mu.powf(two_minus_p) * (1.0 / two_minus_p);
-        let loglik = c * phi.recip() * (-1.0);
-        loglik * (-wi)
-    }
+    dispersion_tweedie_nll_generic::<crate::families::jet_tower::Tower4<2>>(
+        yi, eta_mu, eta_d, p, wi,
+    )
 }
 
 #[inline]
 pub(crate) fn beta_observed_cross_weight_eta(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
     let q = (mu * (1.0 - mu)).max(1e-12);
-    let tower = dispersion_beta_nll_tower(yi, mu, phi, wi);
-    q * phi * tower.h[0][1]
+    let tower = dispersion_beta_nll_order2(yi, mu, phi, wi);
+    q * phi * tower.h()[0][1]
 }
 
 #[inline]
@@ -312,14 +413,14 @@ pub(crate) fn dispersion_row_cross_weight(
 
 #[inline]
 pub(crate) fn tower_score_info(
-    tower: &crate::families::jet_tower::Tower4<2>,
+    tower: &crate::families::jet_scalar::Order2<2>,
     idx: usize,
     wi: f64,
 ) -> (f64, f64) {
     if wi == 0.0 {
         (0.0, 0.0)
     } else {
-        (-tower.g[idx] / wi, tower.h[idx][idx] / wi)
+        (-tower.g()[idx] / wi, tower.h()[idx][idx] / wi)
     }
 }
 
@@ -342,9 +443,9 @@ pub(super) fn dispersion_row_kernel(
             let mu = em.exp().max(1e-300);
             let theta = ed.exp().max(1e-12); // precision (size)
             let tpm = theta + mu;
-            let tower = dispersion_nb_nll_tower(yi, mu, theta, wi);
+            let tower = dispersion_nb_nll_order2(yi, mu, theta, wi);
             let (s_theta, info_theta_raw) = tower_score_info(&tower, 1, wi);
-            let loglik = -tower.v;
+            let loglik = -tower.value();
             let info_mu = if wi == 0.0 {
                 DISPERSION_MIN_CURVATURE
             } else {
@@ -369,9 +470,9 @@ pub(super) fn dispersion_row_kernel(
             let mu = em.exp().max(1e-300);
             let nu = ed.exp().max(1e-12); // precision = shape ν
             let y_pos = yi.max(1e-300);
-            let tower = dispersion_gamma_nll_tower(yi, y_pos, mu, nu, wi);
+            let tower = dispersion_gamma_nll_order2(yi, y_pos, mu, nu, wi);
             let (s_nu, info_nu_raw) = tower_score_info(&tower, 1, wi);
-            let loglik = -tower.v;
+            let loglik = -tower.value();
             let info_mu = if wi == 0.0 {
                 DISPERSION_MIN_CURVATURE
             } else {
@@ -396,10 +497,10 @@ pub(super) fn dispersion_row_kernel(
             let mu = (1.0 / (1.0 + (-em).exp())).clamp(1e-12, 1.0 - 1e-12);
             let phi = ed.exp().max(1e-12); // precision
             let q = (mu * (1.0 - mu)).max(1e-12); // dμ/dη
-            let tower = dispersion_beta_nll_tower(yi, mu, phi, wi);
+            let tower = dispersion_beta_nll_order2(yi, mu, phi, wi);
             let (score_mu, info_mu_raw) = tower_score_info(&tower, 0, wi);
             let (s_phi, info_phi_raw) = tower_score_info(&tower, 1, wi);
-            let loglik = -tower.v;
+            let loglik = -tower.value();
             let info_mu = info_mu_raw.max(DISPERSION_MIN_CURVATURE);
             let mean_weight = wi * q * q * info_mu;
             let mean_response = em + score_mu / (q * info_mu);
@@ -432,8 +533,8 @@ pub(super) fn dispersion_row_kernel(
             // the `φ = exp(−η_d)` chain and its nonlinear `∂²φ/∂η_d²` curvature
             // correction are all mechanically carried — no per-branch
             // `s_phi`/`s_eta`/`curvature_eta` hand calculus.
-            let tower = dispersion_tweedie_nll_tower(yi, em, ed, p, wi);
-            let loglik = -tower.v;
+            let tower = dispersion_tweedie_nll_order2(yi, em, ed, p, wi);
+            let loglik = -tower.value();
             // η_d-space score and observed information off the tower, via the
             // same helper the NB/Gamma/Beta arms use (returns `(0, 0)` when the
             // prior weight is zero, so the row stays excluded below).
@@ -1068,7 +1169,7 @@ mod tests {
         let digamma_b = crate::families::jet_tower::digamma_derivative_stack(b)[0];
         let score_neutral_y = 1.0 / (1.0 + (-(digamma_a - digamma_b)).exp());
 
-        let tower = dispersion_beta_nll_tower(score_neutral_y, mu, phi, 1.0);
+        let tower = dispersion_beta_nll_order2(score_neutral_y, mu, phi, 1.0);
         let trigamma_a = std::f64::consts::PI * std::f64::consts::PI / 6.0;
         let trigamma_b = crate::families::jet_tower::trigamma_derivative_stack(b)[0];
         let analytic = phi * (mu * trigamma_a - (1.0 - mu) * trigamma_b);
@@ -1079,7 +1180,7 @@ mod tests {
             "audit example should have visibly nonzero cross information, got {analytic}"
         );
         assert_close("helper cross information", helper, analytic, 1e-12);
-        assert_close("tower mixed channel", tower.h[0][1], analytic, 1e-8);
+        assert_close("tower mixed channel", tower.h()[0][1], analytic, 1e-8);
 
         let q = mu * (1.0 - mu);
         let eta_cross = beta_observed_cross_weight_eta(score_neutral_y, mu, phi, 1.0);
@@ -1089,6 +1190,82 @@ mod tests {
             q * phi * analytic,
             1e-8,
         );
+    }
+
+    /// #932 oracle: the production `Order2<2>` evaluation of each dispersion
+    /// row NLL must reproduce, channel-for-channel (value/grad/Hessian), the
+    /// dense `Tower4<2>` evaluation of the SAME single-source generic body the
+    /// packed-scalar cutover replaced.
+    #[test]
+    pub(crate) fn order2_matches_dense_tower_all_channels() {
+        use crate::families::jet_scalar::{JetScalar, Order2};
+        use crate::families::jet_tower::Tower4;
+
+        fn check_o2_vs_tower4(label: &str, o2: Order2<2>, t4: Tower4<2>) {
+            let band = |a: f64, b: f64| 1e-9 + 1e-9 * a.abs().max(b.abs());
+            assert!(
+                (o2.value() - t4.v).abs() <= band(o2.value(), t4.v),
+                "{label} value: {} vs {}",
+                o2.value(),
+                t4.v
+            );
+            for a in 0..2 {
+                assert!(
+                    (o2.g()[a] - t4.g[a]).abs() <= band(o2.g()[a], t4.g[a]),
+                    "{label} grad[{a}]: {} vs {}",
+                    o2.g()[a],
+                    t4.g[a]
+                );
+                for b in 0..2 {
+                    assert!(
+                        (o2.h()[a][b] - t4.h[a][b]).abs() <= band(o2.h()[a][b], t4.h[a][b]),
+                        "{label} hess[{a}][{b}]: {} vs {}",
+                        o2.h()[a][b],
+                        t4.h[a][b]
+                    );
+                }
+            }
+        }
+
+        let wi = 1.7_f64;
+        // NB2: (μ, θ).
+        for &(yi, mu, theta) in &[(0.0, 1.2, 3.0), (4.0, 2.5, 0.7), (10.0, 0.6, 5.0)] {
+            check_o2_vs_tower4(
+                "nb",
+                dispersion_nb_nll_generic::<Order2<2>>(yi, mu, theta, wi),
+                dispersion_nb_nll_generic::<Tower4<2>>(yi, mu, theta, wi),
+            );
+        }
+        // Gamma: (μ, ν).
+        for &(yi, mu, nu) in &[(0.5, 1.1, 2.0), (3.0, 4.0, 0.9), (1.0, 0.3, 6.0)] {
+            let y_pos = yi.max(1e-300);
+            check_o2_vs_tower4(
+                "gamma",
+                dispersion_gamma_nll_generic::<Order2<2>>(yi, y_pos, mu, nu, wi),
+                dispersion_gamma_nll_generic::<Tower4<2>>(yi, y_pos, mu, nu, wi),
+            );
+        }
+        // Beta: (μ, φ).
+        for &(yi, mu, phi) in &[(0.3, 0.4, 5.0), (0.9, 0.6, 12.0), (0.01, 0.2, 3.0)] {
+            check_o2_vs_tower4(
+                "beta",
+                dispersion_beta_nll_generic::<Order2<2>>(yi, mu, phi, wi),
+                dispersion_beta_nll_generic::<Tower4<2>>(yi, mu, phi, wi),
+            );
+        }
+        // Tweedie: (η_μ, η_d), both density branches.
+        for &(yi, eta_mu, eta_d, p) in &[
+            (0.0, 0.4, -0.3, 1.5),
+            (2.5, -0.2, 0.5, 1.3),
+            (0.0, 1.0, 0.1, 1.7),
+            (5.0, 0.7, -0.6, 1.6),
+        ] {
+            check_o2_vs_tower4(
+                "tweedie",
+                dispersion_tweedie_nll_generic::<Order2<2>>(yi, eta_mu, eta_d, p, wi),
+                dispersion_tweedie_nll_generic::<Tower4<2>>(yi, eta_mu, eta_d, p, wi),
+            );
+        }
     }
 
     #[test]

@@ -154,6 +154,90 @@ pub trait JetScalar<const K: usize>: Copy {
             a * (a - 1.0) * (a - 2.0) * (a - 3.0) * u.powf(a - 4.0),
         ])
     }
+
+    /// `ln Γ(self)`. Caller guarantees a positive argument. Uses the SAME
+    /// hand-certified derivative stack [`super::jet_tower::Tower4::ln_gamma`]
+    /// consumes ([`super::jet_tower::ln_gamma_derivative_stack`]), so any
+    /// program written over both matches term-for-term.
+    fn ln_gamma(&self) -> Self {
+        self.compose_unary(crate::families::jet_tower::ln_gamma_derivative_stack(
+            self.value(),
+        ))
+    }
+
+    /// `ψ(self) = d/dx ln Γ(x)` (digamma). Caller guarantees a positive
+    /// argument. Same hand-certified stack
+    /// [`super::jet_tower::digamma_derivative_stack`].
+    fn digamma(&self) -> Self {
+        self.compose_unary(crate::families::jet_tower::digamma_derivative_stack(
+            self.value(),
+        ))
+    }
+}
+
+// ── Order2<K> ergonomic operator overloads (doc §A.1) ───────────────────
+//
+// The dispersion-family row NLLs are written with `+`/`-`/`*` operators over
+// the primaries (mirroring how they read as `Tower4` expressions). These
+// delegate channel-for-channel to the inner `Tower2` arithmetic (which has
+// `Add`/`Mul`; `Sub`/`Neg` are expressed as `+ (-1)·rhs` exactly as the
+// `JetScalar::sub` / `JetScalar::neg` impls do), so an `Order2` expression is
+// bit-identical to the same `Tower4` expression's order-≤2 channels.
+
+impl<const K: usize> std::ops::Add for Order2<K> {
+    type Output = Self;
+    #[inline]
+    fn add(self, o: Self) -> Self {
+        Order2(self.0 + o.0)
+    }
+}
+
+impl<const K: usize> std::ops::Add<f64> for Order2<K> {
+    type Output = Self;
+    #[inline]
+    fn add(self, c: f64) -> Self {
+        Order2(self.0 + c)
+    }
+}
+
+impl<const K: usize> std::ops::Sub for Order2<K> {
+    type Output = Self;
+    #[inline]
+    fn sub(self, o: Self) -> Self {
+        Order2(self.0 + o.0.scale(-1.0))
+    }
+}
+
+impl<const K: usize> std::ops::Sub<f64> for Order2<K> {
+    type Output = Self;
+    #[inline]
+    fn sub(self, c: f64) -> Self {
+        Order2(self.0 + (-c))
+    }
+}
+
+impl<const K: usize> std::ops::Mul for Order2<K> {
+    type Output = Self;
+    #[inline]
+    fn mul(self, o: Self) -> Self {
+        Order2(super::jet_tower::Tower2::mul(&self.0, &o.0))
+    }
+}
+
+impl<const K: usize> std::ops::Mul<f64> for Order2<K> {
+    type Output = Self;
+    #[inline]
+    fn mul(self, c: f64) -> Self {
+        Order2(self.0.scale(c))
+    }
+}
+
+impl<const K: usize> std::ops::Neg for Order2<K> {
+    type Output = Self;
+    #[inline]
+    fn neg(self) -> Self {
+        Order2(self.0.scale(-1.0))
+    }
 }
 
 /// Filtered Hensel lift of a SCALAR implicit state `a(θ)` defined by the

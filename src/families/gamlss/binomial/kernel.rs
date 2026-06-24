@@ -466,6 +466,61 @@ pub(crate) fn binomial_location_scale_core(
     })
 }
 
+/// The binomial location-scale row NLL written ONCE over a generic
+/// [`JetScalar<2>`] (#932). The map `q = −η_t·exp(−η_ls)` is built in the
+/// scalar algebra `S` (the primaries seeded by the caller via `seed`), then the
+/// per-row negative log-likelihood follows from the hand-certified `q`-space
+/// derivative stack `[−ll, m1, m2, m3, m4]` through one
+/// [`JetScalar::compose_unary`].
+///
+/// Instantiating `S` selects the channel a consumer needs without ever
+/// materialising the dense `Tower4<2>` `t3`/`t4`:
+/// * `S = Order2<2>` → value/grad/Hessian (the joint-Hessian path),
+/// * `S = OneSeed<2>` → the contracted third `Σ_c ℓ_{abc} dir_c`,
+/// * `S = TwoSeed<2>` → the contracted fourth `Σ_{cd} ℓ_{abcd} u_c v_d`.
+///
+/// `seed(value, axis)` produces the primary jet for axis `axis` (0 = η_t,
+/// 1 = η_ls); the directional scalars fold their contraction direction in
+/// through this closure (mirrors `survival::location_scale::sls_row_nll`).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn binomial_location_scale_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+    y: f64,
+    weight: f64,
+    eta_t: f64,
+    eta_ls: f64,
+    q_value: f64,
+    mu: f64,
+    dmu_dq: f64,
+    d2mu_dq2: f64,
+    d3mu_dq3: f64,
+    link_kind: &InverseLink,
+    include_fourth: bool,
+    seed: impl Fn(f64, usize) -> S,
+) -> Result<S, String> {
+    let eta_t_jet = seed(eta_t, 0);
+    let eta_ls_jet = seed(eta_ls, 1);
+    let inv_sigma = eta_ls_jet.scale(-1.0).exp();
+    let q = eta_t_jet.neg().mul(&inv_sigma);
+    let ll = binomial_location_scale_log_likelihood(y, weight, q_value, link_kind, mu)?;
+    let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
+        y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
+    );
+    let m4 = if include_fourth {
+        binomial_neglog_q_fourth_derivative_dispatch(
+            y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
+        )?
+    } else {
+        0.0
+    };
+    Ok(q.compose_unary([-ll, m1, m2, m3, m4]))
+}
+
+/// Dense `Tower4<2>` builder for the binomial location-scale row NLL: the
+/// all-channels evaluation of [`binomial_location_scale_nll_generic`]. Retained
+/// as the #932 oracle (the contracted/Hessian packed-scalar paths are pinned
+/// bit-identical to its channels) and for the gradient-only consumers in
+/// `location_scale.rs`.
 #[inline]
 pub(crate) fn binomial_location_scale_nll_tower(
     y: f64,
@@ -481,37 +536,45 @@ pub(crate) fn binomial_location_scale_nll_tower(
     include_fourth: bool,
 ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
     use crate::families::jet_tower::Tower4;
-    let eta_t_tower = Tower4::<2>::variable(eta_t, 0);
-    let eta_ls_tower = Tower4::<2>::variable(eta_ls, 1);
-    let inv_sigma = (eta_ls_tower * -1.0).exp();
-    let q = -eta_t_tower * inv_sigma;
-    let ll = binomial_location_scale_log_likelihood(y, weight, q_value, link_kind, mu)?;
-    let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
-        y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
-    );
-    let m4 = if include_fourth {
-        binomial_neglog_q_fourth_derivative_dispatch(
-            y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
-        )?
-    } else {
-        0.0
-    };
-    Ok(q.compose_unary([-ll, m1, m2, m3, m4]))
+    binomial_location_scale_nll_generic::<Tower4<2>>(
+        y,
+        weight,
+        eta_t,
+        eta_ls,
+        q_value,
+        mu,
+        dmu_dq,
+        d2mu_dq2,
+        d3mu_dq3,
+        link_kind,
+        include_fourth,
+        |x, axis| Tower4::<2>::variable(x, axis),
+    )
 }
 
+/// Generic per-row NLL from the precomputed core, parameterised on the
+/// [`JetScalar<2>`] the consumer needs (the packed `Order2`/`OneSeed`/`TwoSeed`
+/// scalars for the Hessian / contracted-third / contracted-fourth hot paths,
+/// without the dense `Tower4<2>` `t3`/`t4`). Reconstructs `(η_t, η_ls)` from the
+/// core's `(σ, q0)` and forwards the per-row stack to
+/// [`binomial_location_scale_nll_generic`].
 #[inline]
-pub(crate) fn binomial_location_scale_nll_tower_from_core_row(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn binomial_location_scale_nll_generic_from_core_row<
+    S: crate::families::jet_scalar::JetScalar<2>,
+>(
     y: f64,
     weight: f64,
     core: &BinomialLocationScaleCore,
     row: usize,
     link_kind: &InverseLink,
     include_fourth: bool,
-) -> Result<crate::families::jet_tower::Tower4<2>, String> {
+    seed: impl Fn(f64, usize) -> S,
+) -> Result<S, String> {
     let sigma = core.sigma[row];
     let eta_t = -core.q0[row] * sigma;
     let eta_ls = sigma.ln();
-    binomial_location_scale_nll_tower(
+    binomial_location_scale_nll_generic::<S>(
         y,
         weight,
         eta_t,
@@ -523,6 +586,7 @@ pub(crate) fn binomial_location_scale_nll_tower_from_core_row(
         core.d3mu_dq3[row],
         link_kind,
         include_fourth,
+        seed,
     )
 }
 
@@ -547,11 +611,21 @@ pub(crate) fn binomial_location_scale_first_directional_coefficients(
     let triples: Result<Vec<(f64, f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| {
-            let tower = binomial_location_scale_nll_tower_from_core_row(
-                y[i], weights[i], core, i, link_kind, false,
-            )?;
+            use crate::families::jet_scalar::OneSeed;
             let dir = [d_eta_t[i], d_eta_ls[i]];
-            let contracted = tower.third_contracted(&dir);
+            // PACKED contracted-third scalar: seed each primary's ε-direction
+            // with `dir`, so the ε-Hessian channel is `Σ_c ℓ_{abc} dir_c`
+            // (`row_third_contracted`) without materialising the dense `t3`.
+            let scalar = binomial_location_scale_nll_generic_from_core_row::<OneSeed<2>>(
+                y[i],
+                weights[i],
+                core,
+                i,
+                link_kind,
+                false,
+                |x, axis| OneSeed::seed_direction(x, axis, dir[axis]),
+            )?;
+            let contracted = scalar.contracted_third();
             Ok((contracted[0][0], contracted[0][1], contracted[1][1]))
         })
         .collect();
@@ -588,12 +662,22 @@ pub(crate) fn binomial_location_scalesecond_directional_coefficients(
     let triples: Result<Vec<(f64, f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| -> Result<(f64, f64, f64), String> {
-            let tower = binomial_location_scale_nll_tower_from_core_row(
-                y[i], weights[i], core, i, link_kind, true,
-            )?;
+            use crate::families::jet_scalar::TwoSeed;
             let dir_u = [d_eta_t_u[i], d_eta_ls_u[i]];
             let dir_v = [d_eta_t_v[i], d_eta_ls_v[i]];
-            let contracted = tower.fourth_contracted(&dir_u, &dir_v);
+            // PACKED contracted-fourth scalar: seed ε with `dir_u` and δ with
+            // `dir_v`, so the εδ-Hessian channel is `Σ_{cd} ℓ_{abcd} u_c v_d`
+            // (`row_fourth_contracted`) without materialising the dense `t4`.
+            let scalar = binomial_location_scale_nll_generic_from_core_row::<TwoSeed<2>>(
+                y[i],
+                weights[i],
+                core,
+                i,
+                link_kind,
+                true,
+                |x, axis| TwoSeed::seed(x, axis, dir_u[axis], dir_v[axis]),
+            )?;
+            let contracted = scalar.contracted_fourth();
             Ok((contracted[0][0], contracted[0][1], contracted[1][1]))
         })
         .collect();
@@ -607,4 +691,119 @@ pub(crate) fn binomial_location_scalesecond_directional_coefficients(
         coeff_ll[i] = ll;
     }
     Ok((coeff_tt, coeff_tl, coeff_ll))
+}
+
+#[cfg(test)]
+mod packed_scalar_oracle_tests {
+    //! #932 oracle: the packed `Order2`/`OneSeed`/`TwoSeed` evaluations of the
+    //! single-source [`binomial_location_scale_nll_generic`] must reproduce,
+    //! channel-for-channel, the dense `Tower4<2>` builder
+    //! ([`binomial_location_scale_nll_tower`]) the contracted/Hessian hot paths
+    //! replaced — value/grad/Hessian for `Order2`, the contracted third for
+    //! `OneSeed`, the contracted fourth for `TwoSeed`.
+    use super::*;
+    use crate::families::jet_scalar::{OneSeed, Order2, TwoSeed};
+    use crate::types::{InverseLink, StandardLink};
+
+    fn rel_close(a: f64, b: f64, label: &str) {
+        let band = 1e-9 + 1e-9 * a.abs().max(b.abs());
+        assert!(
+            (a - b).abs() <= band,
+            "{label}: {a:+.15e} vs {b:+.15e} (band {band:.3e})"
+        );
+    }
+
+    /// Evaluate the dense tower and the three packed scalars over a grid of
+    /// (y, eta_t, eta_ls) for each link, pinning every channel a consumer reads.
+    #[test]
+    fn packed_scalars_match_dense_tower_all_channels() {
+        let links = [
+            InverseLink::Standard(StandardLink::Logit),
+            InverseLink::Standard(StandardLink::Probit),
+            InverseLink::Standard(StandardLink::CLogLog),
+        ];
+        let grid = [
+            (0.0_f64, 0.4_f64, -0.3_f64),
+            (1.0, -0.7, 0.5),
+            (0.0, 1.2, 0.2),
+            (1.0, 0.1, -0.8),
+        ];
+        let dir_u = [0.6_f64, -0.2_f64];
+        let dir_v = [-0.4_f64, 1.1_f64];
+        for link in &links {
+            for &(y, eta_t, eta_ls) in &grid {
+                let weight = 1.3_f64;
+                let SigmaJet1 { sigma, .. } = exp_sigma_jet1_scalar(eta_ls);
+                let q0 = binomial_location_scale_q0(eta_t, sigma);
+                let jet = match inverse_link_jet_for_inverse_link(link, q0) {
+                    Ok(j) => j,
+                    Err(_) => continue,
+                };
+                let args = |include_fourth: bool| {
+                    (
+                        y,
+                        weight,
+                        eta_t,
+                        eta_ls,
+                        q0,
+                        jet.mu,
+                        jet.d1,
+                        jet.d2,
+                        jet.d3,
+                        link,
+                        include_fourth,
+                    )
+                };
+
+                // Dense Tower4 oracle.
+                let (y_, w_, et_, el_, q_, mu_, d1_, d2_, d3_, lk_, _f) = args(true);
+                let tower =
+                    binomial_location_scale_nll_tower(y_, w_, et_, el_, q_, mu_, d1_, d2_, d3_, lk_, true)
+                        .expect("tower");
+
+                // Order2 (v, g, H).
+                let (y2, w2, et2, el2, q2, mu2, d12, d22, d32, lk2, f2) = args(false);
+                let o2 = binomial_location_scale_nll_generic::<Order2<2>>(
+                    y2, w2, et2, el2, q2, mu2, d12, d22, d32, lk2, f2,
+                    |x, axis| Order2::variable(x, axis),
+                )
+                .expect("order2");
+                rel_close(o2.value(), tower.v, "order2 value");
+                for a in 0..2 {
+                    rel_close(o2.g()[a], tower.g[a], "order2 grad");
+                    for b in 0..2 {
+                        rel_close(o2.h()[a][b], tower.h[a][b], "order2 hess");
+                    }
+                }
+
+                // OneSeed contracted third Σ_c ℓ_{abc} dir_u_c.
+                let truth3 = tower.third_contracted(&dir_u);
+                let os = binomial_location_scale_nll_generic::<OneSeed<2>>(
+                    y2, w2, et2, el2, q2, mu2, d12, d22, d32, lk2, false,
+                    |x, axis| OneSeed::seed_direction(x, axis, dir_u[axis]),
+                )
+                .expect("oneseed");
+                let third = os.contracted_third();
+                for a in 0..2 {
+                    for b in 0..2 {
+                        rel_close(third[a][b], truth3[a][b], "oneseed third");
+                    }
+                }
+
+                // TwoSeed contracted fourth Σ_{cd} ℓ_{abcd} u_c v_d.
+                let truth4 = tower.fourth_contracted(&dir_u, &dir_v);
+                let ts = binomial_location_scale_nll_generic::<TwoSeed<2>>(
+                    y2, w2, et2, el2, q2, mu2, d12, d22, d32, lk2, true,
+                    |x, axis| TwoSeed::seed(x, axis, dir_u[axis], dir_v[axis]),
+                )
+                .expect("twoseed");
+                let fourth = ts.contracted_fourth();
+                for a in 0..2 {
+                    for b in 0..2 {
+                        rel_close(fourth[a][b], truth4[a][b], "twoseed fourth");
+                    }
+                }
+            }
+        }
+    }
 }
