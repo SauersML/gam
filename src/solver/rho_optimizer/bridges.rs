@@ -585,9 +585,8 @@ impl CostStallGuard {
         // overfit (|g| ≈ 11 on a score `O(1e3)`, i.e. above BOTH this bound and the
         // separate `FLAT_VALLEY_STALL_GRAD_CEILING`) — is still rejected and routed
         // to `StuckKeepDescending`, so no near-full-basis overfit is ever certified.
-        let score_relative_grad_bound = (FLAT_VALLEY_CONVERGED_REL_GRAD
-            * (1.0 + best_value.abs()))
-        .min(FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP);
+        let score_relative_grad_bound = (FLAT_VALLEY_CONVERGED_REL_GRAD * (1.0 + best_value.abs()))
+            .min(FLAT_VALLEY_CONVERGED_ABS_GRAD_CAP);
         let converged = best_grad_norm.is_finite()
             && (best_grad_norm <= self.grad_threshold
                 || best_grad_norm <= score_relative_grad_bound);

@@ -148,7 +148,7 @@ mod poly_arith;
 mod primary_geometry;
 mod psi_terms;
 mod pullback;
-mod row_kernel;
+pub(crate) mod row_kernel;
 mod row_math;
 mod spec;
 mod timepoint_exact;

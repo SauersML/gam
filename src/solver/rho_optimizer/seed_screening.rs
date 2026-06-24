@@ -467,9 +467,8 @@ pub(crate) fn rank_seeds_with_screening(
             crate::seeding::SeedRiskProfile::Gaussian
         );
         if non_gaussian && ordered.len() > 1 {
-            let rho_sum = |seed: &Array1<f64>| -> f64 {
-                (0..rho_dim.min(seed.len())).map(|i| seed[i]).sum()
-            };
+            let rho_sum =
+                |seed: &Array1<f64>| -> f64 { (0..rho_dim.min(seed.len())).map(|i| seed[i]).sum() };
             if let Some((most_flexible_idx, _)) = ordered
                 .iter()
                 .enumerate()
