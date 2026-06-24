@@ -104,6 +104,60 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     let use_joint_newton =
         has_joint_exacthessian && (specs.len() >= 2 || has_workspace_source) && !blocks_separable;
     let joint_workspace_requested = use_joint_newton && has_workspace_source;
+    // Row-measure consistency for the outer-score subsample (gam#1135 HT path).
+    //
+    // `BlockwiseFitOptions::outer_score_subsample` carries a per-row
+    // Horvitz–Thompson reweighting. The inner β-solve has several likelihood
+    // evaluators that must all agree on ONE row measure for the trust-region
+    // ratio `ρ = [F(β) − F(β+δ)] / [−g·δ − ½δᵀHδ]` to be valid:
+    //
+    //   * the coefficient line search, which ALWAYS evaluates
+    //     `log_likelihood_only_with_options` and so applies the subsample
+    //     whenever it is present in `options`;
+    //   * the joint Hessian, built via
+    //     `exact_newton_joint_hessian_workspace_with_options` (HT) when the
+    //     workspace path is engaged;
+    //   * the entry/reload base objective + gradient from
+    //     `load_joint_gradient_evaluation`, which only honours the subsample
+    //     through its workspace branch — guarded by
+    //     `inner_joint_workspace_gradient_available`. A family that does NOT
+    //     advertise that capability (e.g. GaussianLocationScale) falls through
+    //     to `family.evaluate` / `exact_newton_joint_gradient_evaluation`, which
+    //     ignore `options` and score the FULL data.
+    //
+    // When the base objective is full-data but the line search is HT, the
+    // trust-region numerator compares `F_full(β)` against `F_HT(β+δ)`. The two
+    // differ by a β-independent constant (the HT-vs-full log-likelihood gap), so
+    // `actual_reduction` stays pinned at that constant even as the step shrinks
+    // to machine ε — every attempt rejects, the radius collapses, and the inner
+    // solve exits non-converged. That cascades to "no candidate seeds passed
+    // outer startup validation" and the whole fit fails — the manifestation is a
+    // GaussianLocationScale fit with an outer-score subsample installed (manual
+    // or auto-installed at scale) that cannot complete its final inner refit.
+    //
+    // The subsample is an OUTER-score variance-reduction device, consumed by the
+    // outer ψ/ρ derivative path (`psi_hyper`); β̂(ρ) itself must stay the
+    // unbiased full-data optimum unless the family can run a FULLY HT-consistent
+    // inner solve. It can do so exactly when its entry ll+gradient also honour
+    // the subsample, i.e. `inner_joint_workspace_gradient_available` (BMS,
+    // survival marginal-slope) — there the line search, Hessian, and base
+    // objective are all HT and the contract is preserved. Otherwise (the
+    // GaussianLocationScale contract: "inner PIRLS never installs the option, so
+    // the inner solve continues to consume the exact full-data log-likelihood")
+    // the inner solve must run on full data; strip the subsample so the entry
+    // objective, gradient/Hessian, line search, and the trust-region
+    // row-measure bookkeeping all agree on the full-data measure.
+    let inner_consumes_subsample =
+        joint_workspace_requested && family.inner_joint_workspace_gradient_available(specs);
+    let stripped_subsample_options;
+    let options = if !inner_consumes_subsample && options.outer_score_subsample.is_some() {
+        let mut cleaned = options.clone();
+        cleaned.outer_score_subsample = None;
+        stripped_subsample_options = cleaned;
+        &stripped_subsample_options
+    } else {
+        options
+    };
     let inner_tol = options.inner_tol;
     let inner_max_cycles_base = options.inner_max_cycles;
     // Per-outer-call inner-cycle cap. The earlier "adaptive inner cycle
