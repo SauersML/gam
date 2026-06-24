@@ -421,8 +421,15 @@ pub const TORUS_FLOW_MAX_HARMONIC: i32 = 2;
 /// treats it as a failed step; the final chart is never produced) when
 /// `det Dφ_θ ≤ δ` anywhere on the check grid. `θ = 0` has `det Dφ = 1`
 /// everywhere and only guarded steps are ever accepted, so the optimizer can
-/// never walk through a fold.
-pub const TORUS_FLOW_DIFFEO_MIN_DET: f64 = 0.1;
+/// never walk through a fold. The floor is one-directional: raising it only
+/// ever rejects MORE near-fold candidates, never accepts a fold, so it is a
+/// conservative guard rather than a tuned operating point. The torus, free
+/// patch, and sphere flows all enforce the IDENTICAL contract, so the value
+/// lives here once and the per-topology floors below alias it.
+pub const SAE_FLOW_DIFFEO_MIN_DET: f64 = 0.1;
+
+/// Torus-flow diffeomorphism floor — see [`SAE_FLOW_DIFFEO_MIN_DET`].
+pub const TORUS_FLOW_DIFFEO_MIN_DET: f64 = SAE_FLOW_DIFFEO_MIN_DET;
 
 /// Per-axis node count of the diffeomorphism-guard check grid. The flow basis
 /// is band-limited to `TORUS_FLOW_MAX_HARMONIC` (≤ 2 oscillations per axis),
@@ -1178,7 +1185,7 @@ pub const PATCH_FLOW_MAX_DEGREE: usize = 1;
 /// Diffeomorphism floor `δ` for the free-patch flow — identical contract to
 /// [`TORUS_FLOW_DIFFEO_MIN_DET`]: a candidate with `det Dφ_θ ≤ δ` anywhere on
 /// the check grid is rejected, so the optimizer can never walk through a fold.
-pub const PATCH_FLOW_DIFFEO_MIN_DET: f64 = 0.1;
+pub const PATCH_FLOW_DIFFEO_MIN_DET: f64 = SAE_FLOW_DIFFEO_MIN_DET;
 
 /// Per-axis node count of the free-patch diffeomorphism-guard check grid. With
 /// the affine flow basis (`PATCH_FLOW_MAX_DEGREE = 1`) the Jacobian `Dφ_θ` is
@@ -1566,7 +1573,7 @@ pub fn patch_isometry_flow_reparameterization(
 /// flow with `det Dφ_θ ≤ δ` anywhere on the data band is rejected, so the
 /// optimizer never walks through a fold (identical contract to the torus /
 /// patch floors).
-pub const SPHERE_FLOW_DIFFEO_MIN_DET: f64 = 0.1;
+pub const SPHERE_FLOW_DIFFEO_MIN_DET: f64 = SAE_FLOW_DIFFEO_MIN_DET;
 
 /// Latitude band margin (radians) from each pole inside which the sphere
 /// conformal-boost flow is well-conditioned. The off-meridian boost generators
