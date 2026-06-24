@@ -80,6 +80,26 @@ pub(crate) fn pca_ev_ceiling(target: ArrayView2<'_, f64>, q: usize) -> f64 {
     captured / sst
 }
 
+/// #1522 — the data-derived co-collapse acceptance bar: a fit whose
+/// reconstruction EV sits at or below this value on `target` is a structural
+/// collapse. It is [`SAE_COLLAPSE_PCA_EV_FRACTION`] times the rank-`q` PCA /
+/// Eckart-Young EV ceiling (`pca_ev_ceiling`), i.e. a fixed fraction of the BEST
+/// EV any rank-`q` linear dictionary could reach on THIS centered target, so the
+/// bar tracks what the data actually admits rather than a corpus-tuned constant.
+/// When the ceiling is un-computable (constant target / SVD failure →
+/// non-finite) it falls back to the absolute [`SAE_FIT_DATA_COLLAPSE_EV_FLOOR`]
+/// so the guard always keys on a finite number. This is the SINGLE source every
+/// collapse-guard site shares, so the fitted-data acceptance check and the
+/// co-collapse reseed measure degeneracy against one and the same threshold.
+pub(crate) fn collapse_ev_bar(target: ArrayView2<'_, f64>, dictionary_rank: usize) -> f64 {
+    let derived = SAE_COLLAPSE_PCA_EV_FRACTION * pca_ev_ceiling(target, dictionary_rank);
+    if derived.is_finite() {
+        derived
+    } else {
+        SAE_FIT_DATA_COLLAPSE_EV_FLOOR
+    }
+}
+
 /// #1207 — observable telemetry for the amortized warm-start (Design A). The
 /// warm-start is advisory (a transient atlas-build / encode refusal must not
 /// abort the criterion), so its failures were previously discarded with `.ok()`

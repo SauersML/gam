@@ -548,7 +548,13 @@ pub(crate) fn fit_data_collapse_bar_is_data_derived_not_absolute_floor_1522() {
         (ceiling - 1.0).abs() < 1e-9,
         "rank-{dictionary_rank} PCA ceiling of the unit-circle target must be 1.0; got {ceiling}"
     );
-    let derived_bar = 0.5 * ceiling;
+    // Key on production's own bar (collapse_ev_bar = SAE_COLLAPSE_PCA_EV_FRACTION
+    // · ceiling here, since the ceiling is finite) so this test can never drift
+    // from the live collapse decision.
+    let derived_bar = crate::terms::sae::manifold::outer_objective::collapse_ev_bar(
+        target.view(),
+        dictionary_rank,
+    );
     assert!(
         derived_bar > SAE_FIT_DATA_COLLAPSE_EV_FLOOR,
         "data-derived bar {derived_bar} must exceed the old absolute floor \

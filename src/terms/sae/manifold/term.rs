@@ -167,12 +167,33 @@ impl SaeBetaPenaltyAssembly {
     }
 }
 
-/// Final fitted-data explained-variance floor for the reconstruction-collapse
-/// guard (#1023). This is deliberately an effectively-zero threshold: ordinary
-/// under-fitting is a model-quality issue, but returning a K>=1 active SAE whose
-/// fitted matrix is indistinguishable from the column mean is a structural
-/// collapse and must enter the #976 CollapseEvent ledger.
+/// ABSOLUTE FALLBACK explained-variance floor for the reconstruction-collapse
+/// guard (#1023), used ONLY when the data-derived bar is un-computable.
+///
+/// #1522 retired this as the primary collapse threshold: the live bar is
+/// [`SAE_COLLAPSE_PCA_EV_FRACTION`]`·pca_ev_ceiling(target, K)` (see
+/// `collapse_ev_bar`), which tracks the data's own achievable EV instead of a
+/// corpus-tuned constant. This number is reached only on a degenerate target
+/// (constant columns / SVD failure → non-finite ceiling), where any positive
+/// floor is arbitrary; `0.10` is a deliberately conservative "the fitted matrix
+/// must explain at least a tenth of the variance or it is a structural collapse"
+/// fallback so the guard still keys on *something* finite in that corner. It is
+/// NOT a tuned operating point — a fit on real data is judged against the PCA
+/// ceiling, never this constant.
 pub(crate) const SAE_FIT_DATA_COLLAPSE_EV_FLOOR: f64 = 0.10;
+
+/// #1522 — fraction of the rank-`K` PCA / Eckart-Young EV ceiling below which a
+/// fit counts as a structural co-collapse. The collapse bar is
+/// `SAE_COLLAPSE_PCA_EV_FRACTION · pca_ev_ceiling(target, dictionary_rank)`: the
+/// ceiling is the BEST EV any rank-`K` linear dictionary could reach on THIS
+/// centered target, so the bar is data-derived (scales with what the data
+/// actually admits) rather than an absolute corpus-tuned number. `0.5` encodes
+/// the decision "a fit that explains less than HALF of the linearly-achievable
+/// variance has structurally collapsed, whatever its absolute EV" — a
+/// dimensionless ratio with that single, explicit meaning, not a magnitude tuned
+/// to any one corpus. It is the sole source for the ratio used at every
+/// collapse-guard site.
+pub(crate) const SAE_COLLAPSE_PCA_EV_FRACTION: f64 = 0.5;
 
 pub(crate) const SAE_FIT_DATA_COLLAPSE_COST: f64 = 1.0e12;
 

@@ -1594,13 +1594,10 @@ impl SaeManifoldTerm {
             .sum::<usize>()
             .min(n)
             .min(p);
-        let derived_floor =
-            0.5 * crate::terms::sae::manifold::outer_objective::pca_ev_ceiling(target, dictionary_rank);
-        let ev_floor = if derived_floor.is_finite() {
-            derived_floor
-        } else {
-            SAE_FIT_DATA_COLLAPSE_EV_FLOOR
-        };
+        let ev_floor = crate::terms::sae::manifold::outer_objective::collapse_ev_bar(
+            target,
+            dictionary_rank,
+        );
         if !(ev.is_finite() && ev <= ev_floor) {
             return Ok(false);
         }
@@ -2141,16 +2138,10 @@ impl SaeManifoldTerm {
                 .sum::<usize>()
                 .min(n)
                 .min(p);
-            let derived_floor = 0.5
-                * crate::terms::sae::manifold::outer_objective::pca_ev_ceiling(
-                    target,
-                    dictionary_rank,
-                );
-            let ev_floor = if derived_floor.is_finite() {
-                derived_floor
-            } else {
-                SAE_FIT_DATA_COLLAPSE_EV_FLOOR
-            };
+            let ev_floor = crate::terms::sae::manifold::outer_objective::collapse_ev_bar(
+                target,
+                dictionary_rank,
+            );
             if !(ev.is_finite() && ev <= ev_floor) {
                 return Ok(());
             }
