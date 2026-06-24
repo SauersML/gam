@@ -4,6 +4,8 @@
 //! dispersion-channel joint-curvature corrections.
 
 use super::weighted_design_products::{mirror_upper_to_lower, xt_diag_x_design, xt_diag_y_design};
+// `Order2<2>::value()` is the JetScalar trait method; bring the trait into scope
+// so the dispersion row-NLL value reads (`-tower.value()`) resolve (E0599 fix).
 use super::{
     BlockwiseTermFitResult, GamlssLambdaLayout, LOCATION_SCALE_N_OUTPUTS,
     LocationScaleFamilyBuilder, build_location_scale_block, fit_location_scale_terms,
@@ -14,6 +16,7 @@ use crate::custom_family::{
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
 };
 use crate::families::block_layout::block_count::validate_block_count;
+use crate::families::jet_scalar::JetScalar;
 use crate::gamlss::GamlssError;
 use crate::matrix::LinearOperator;
 use crate::model_types::UnifiedFitResult;
@@ -364,7 +367,6 @@ pub(crate) fn dispersion_tweedie_nll_order2(
         yi, eta_mu, eta_d, p, wi,
     )
 }
-
 
 #[inline]
 pub(crate) fn beta_observed_cross_weight_eta(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
