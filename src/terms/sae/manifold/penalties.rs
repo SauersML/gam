@@ -328,22 +328,24 @@ impl SaeManifoldTerm {
         cross
     }
 
-    /// Atoms the barriers hold up: any atom whose assignment column carries
-    /// nonzero mass. (A structurally dead atom is not artificially inflated.)
+    /// Atoms the AMPLITUDE barrier holds up: every live dictionary slot whose
+    /// decoder carries any norm at all. #1026/#1522 — the amplitude barrier
+    /// `-μ log‖B_k‖²` exists precisely to keep a decoder off the zero/degenerate
+    /// boundary, so it must NOT be gated on assignment mass: during a co-collapse
+    /// the assignment columns themselves drain, which (under the old
+    /// assignment-energy gate) silently switched the barrier OFF at the exact
+    /// moment it is needed. We gate instead on decoder presence above the active
+    /// floor, so the hold-up force is live for every real atom independent of how
+    /// the (separately collapsing) assignment routes mass.
     fn barrier_active_atoms(&self) -> Vec<bool> {
-        let k_atoms = self.k_atoms();
-        let gates = self.assignment.assignments();
-        let n = gates.nrows();
-        let mut active = vec![false; k_atoms];
-        for k in 0..k_atoms {
-            let mut e = 0.0_f64;
-            for row in 0..n {
-                let a = gates[[row, k]];
-                e += a * a;
-            }
-            active[k] = e > 0.0;
-        }
-        active
+        let floor2 = SAE_BARRIER_ACTIVE_NORM_FLOOR * SAE_BARRIER_ACTIVE_NORM_FLOOR;
+        self.atoms
+            .iter()
+            .map(|atom| {
+                let s2: f64 = atom.decoder_coefficients.iter().map(|v| v * v).sum();
+                s2 > floor2
+            })
+            .collect()
     }
 
     /// #1026/#1522 — accumulate the AMPLITUDE barrier's analytic gradient into
