@@ -422,11 +422,44 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
         Ok((delta_beta, mut diag)) => {
             diag.used_device_arrow = true;
             let delta_t = back_substitute_delta_t(sys, htt_factors, delta_beta.view(), backend);
+            // The matrix-free device PCG returns the step ONLY (it never forms the
+            // dense reduced Schur). But every production SAE inner solve consumes
+            // the cache's joint-Hessian log-det (½log|H| Laplace normaliser, read
+            // through `arrow_log_det_from_cache`), which with `k > 0` REQUIRES a
+            // dense `schur_factor` — without it the cache yields `None` and the
+            // evidence solve errors out. So we must still emit a reduced-Schur
+            // Cholesky factor for the determinant. Build it from the (already
+            // computed) per-row factors and factor the dense K×K block; this keeps
+            // the determinant bit-identical to the CPU Direct path while the Newton
+            // STEP itself was solved on the device (`used_device_arrow == true`).
+            //
+            // On any failure forming/factoring the Schur (non-PD pivot the LM
+            // escalation must respond to), surface the error rather than returning a
+            // cache that would silently starve the evidence of its log-det. We route
+            // through `solve_dense_reduced_system` (the exact CPU Direct reduce) so
+            // the emitted factor — and therefore the log-det — is bit-identical to
+            // the non-device path, including the #1026 `schur_pd_floor` handling.
+            let schur = match build_dense_schur_direct(sys, htt_factors, ridge_beta, backend) {
+                Ok(schur) => schur,
+                Err(err) => return Some(Err(err)),
+            };
+            let schur_factor = match solve_dense_reduced_system(&schur, rhs_beta, options, None) {
+                Ok((_cpu_delta_beta, Some(factor), _diag)) => factor,
+                Ok((_, None, _)) => {
+                    // Direct mode always returns a dense factor; a `None` here would
+                    // be an InexactPCG artifact that cannot happen on this branch.
+                    return Some(Err(ArrowSchurError::SchurFactorFailed {
+                        reason: "device SAE Direct: reduced solve returned no dense factor"
+                            .to_string(),
+                    }));
+                }
+                Err(err) => return Some(Err(err)),
+            };
             Some(Ok(ArrowNewtonStepArtifacts {
                 delta_t,
                 delta_beta,
                 htt_factors: htt_factors.clone(),
-                schur_factor: None,
+                schur_factor: Some(schur_factor),
                 pcg_diagnostics: diag,
                 gauge_deflated_directions,
             }))
