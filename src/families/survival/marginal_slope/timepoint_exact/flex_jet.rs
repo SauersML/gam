@@ -3620,6 +3620,71 @@ mod moment_engine_tests {
             .evaluate_survival_denom_d(a1, g, bh, bw)
             .expect("denom");
 
+        // ── #932 PROBE (runs FIRST, before any cmp_mat): jet a_uv_uv[q1,q1] vs an
+        // independent scalar-solve FD oracle (no hand path involved). eta_uv_uv[1,1]
+        // (1 = primary.q1, which enters eta only through the lifted intercept a)
+        // reduces to chi·a_uv_uv[1,1], so the eta_uv_uv mismatch is an intercept
+        // a_uv_uv mismatch. Re-run the SAME intercept lift the generic path uses (with
+        // the Jet4 bidirectional seeds) and pull a_jet.eps_del.h[1,1]; compare to a
+        // central finite difference of the scalar intercept solve a(q1, β+t·dir) along
+        // the two directions and the q1-Hessian axis (exact root — the arbiter).
+        {
+            let dir1 = Array1::from_iter(
+                (0..p).map(|c| 0.12 + 0.04 * (c as f64) - 0.01 * ((c % 2) as f64)),
+            );
+            let dir2 = Array1::from_iter(
+                (0..p).map(|c| -0.07 + 0.05 * ((c % 3) as f64) + 0.02 * (c as f64)),
+            );
+            let template4 = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
+            let b_jet4 = Jet4::primary(g, primary.g, p, dir1[primary.g], dir2[primary.g]);
+            let du4: Vec<Jet4> = (0..p)
+                .map(|u| Jet4::primary(0.0, u, p, dir1[u], dir2[u]))
+                .collect();
+            let residual_probe = |a: &Jet4| {
+                calibration_residual_jet(a, &b_jet4, primary.g, &du4, primary.q1, q1, &cells)
+            };
+            let a_jet_probe = lift_intercept_flex(&template4, a1, 1.0 / d_check, 4, residual_probe);
+            let jet_a_uvuv = a_jet_probe.eps_del.h[primary.q1 * p + primary.q1];
+
+            let a_of = |dq1: f64, t1: f64, t2: f64| -> f64 {
+                let q1_pert = q1 + dq1 + t1 * dir1[primary.q1] + t2 * dir2[primary.q1];
+                let g_pert = g + t1 * dir1[primary.g] + t2 * dir2[primary.g];
+                let bh_pert: Array1<f64> = Array1::from_iter((0..h_len).map(|i| {
+                    let idx = primary.h.as_ref().unwrap().start + i;
+                    beta_h[i] + t1 * dir1[idx] + t2 * dir2[idx]
+                }));
+                let bw_pert: Array1<f64> = Array1::from_iter((0..w_len).map(|i| {
+                    let idx = primary.w.as_ref().unwrap().start + i;
+                    beta_w[i] + t1 * dir1[idx] + t2 * dir2[idx]
+                }));
+                family
+                    .solve_row_survival_intercept_with_slot(
+                        q1_pert,
+                        g_pert,
+                        Some(&bh_pert),
+                        Some(&bw_pert),
+                        None,
+                    )
+                    .expect("probe intercept solve")
+                    .0
+            };
+            let hq = 2.0e-3_f64;
+            let ht = 3.0e-3_f64;
+            let hess_q = |t1: f64, t2: f64| -> f64 {
+                (a_of(hq, t1, t2) - 2.0 * a_of(0.0, t1, t2) + a_of(-hq, t1, t2)) / (hq * hq)
+            };
+            let ref_a_uvuv = (hess_q(ht, ht) - hess_q(ht, -ht) - hess_q(-ht, ht)
+                + hess_q(-ht, -ht))
+                / (4.0 * ht * ht);
+            let chi_probe = eval_coeff4_at(&obs_fixed.dc_da, z_obs);
+            assert!(
+                (jet_a_uvuv - ref_a_uvuv).abs() <= 1e-3 * (1.0 + ref_a_uvuv.abs()),
+                "#932 PROBE a_uv_uv[q1,q1]: jet {jet_a_uvuv} != scalar-FD {ref_a_uvuv} \
+                 (diff {}; chi {chi_probe} — eta_uv_uv ≈ chi·a_uv_uv)",
+                jet_a_uvuv - ref_a_uvuv,
+            );
+        }
+
         let cmp_vec = |label: &str, jet: &Vec<f64>, hand: &[f64]| {
             for u in 0..p {
                 assert!(
@@ -3699,69 +3764,6 @@ mod moment_engine_tests {
             o_infl, obs_coeff, &obs_fixed, &cells,
         )
         .expect("generic jet4");
-
-        // ── #932 PROBE: jet a_uv_uv[q1,q1] vs an independent scalar-solve FD ──
-        // eta_uv_uv[1,1] (1 = primary.q1, which enters eta only through the lifted
-        // intercept a) reduces to chi·a_uv_uv[1,1] (eta is linear in a at the q1 axis:
-        // eta_aa/tau/r_uv vanish there). So the eta_uv_uv mismatch is an intercept
-        // a_uv_uv mismatch. Re-run the SAME intercept lift the generic path uses and
-        // pull its bidirectional channel a_jet.eps_del.h[1,1]; compare to a finite
-        // difference of the scalar intercept solve a(q1, β+t·dir) along the two
-        // directions and the q1-Hessian axis (exact root, no jet — the oracle).
-        {
-            let residual_probe = |a: &Jet4| {
-                calibration_residual_jet(a, &b_jet4, primary.g, &du4, primary.q1, q1, &cells)
-            };
-            let a_jet_probe = lift_intercept_flex(&template4, a1, 1.0 / d_check, 4, residual_probe);
-            let jet_a_uvuv = a_jet_probe.eps_del.h[primary.q1 * p + primary.q1];
-
-            // Scalar-solve reference: a as a function of the q1 marginal and the
-            // primaries, perturbed by t1·dir1 + t2·dir2 (directions are over the FULL
-            // primary vector, so q1 itself is also moved by their q1-component, plus
-            // the dedicated Hessian shift dq1). Only q1/g/β_h/β_w move the intercept.
-            let a_of = |dq1: f64, t1: f64, t2: f64| -> f64 {
-                let q1_pert =
-                    q1 + dq1 + t1 * dir1[primary.q1] + t2 * dir2[primary.q1];
-                let g_pert = g + t1 * dir1[primary.g] + t2 * dir2[primary.g];
-                let bh_pert: Array1<f64> = Array1::from_iter((0..h_len).map(|i| {
-                    let idx = primary.h.as_ref().unwrap().start + i;
-                    beta_h[i] + t1 * dir1[idx] + t2 * dir2[idx]
-                }));
-                let bw_pert: Array1<f64> = Array1::from_iter((0..w_len).map(|i| {
-                    let idx = primary.w.as_ref().unwrap().start + i;
-                    beta_w[i] + t1 * dir1[idx] + t2 * dir2[idx]
-                }));
-                family
-                    .solve_row_survival_intercept_with_slot(
-                        q1_pert,
-                        g_pert,
-                        Some(&bh_pert),
-                        Some(&bw_pert),
-                        None,
-                    )
-                    .expect("probe intercept solve")
-                    .0
-            };
-            // a_uv_uv[q1,q1] = ∂²_q1 D_dir1 D_dir2 a. q1-Hessian via the dq1 stencil,
-            // directional second-cross via the (t1,t2) 2×2 stencil.
-            let hq = 2.0e-3_f64;
-            let ht = 3.0e-3_f64;
-            let hess_q = |t1: f64, t2: f64| -> f64 {
-                (a_of(hq, t1, t2) - 2.0 * a_of(0.0, t1, t2) + a_of(-hq, t1, t2)) / (hq * hq)
-            };
-            let ref_a_uvuv = (hess_q(ht, ht) - hess_q(ht, -ht) - hess_q(-ht, ht)
-                + hess_q(-ht, -ht))
-                / (4.0 * ht * ht);
-
-            let chi_probe = eval_coeff4_at(&obs_fixed.dc_da, z_obs);
-            assert!(
-                (jet_a_uvuv - ref_a_uvuv).abs() <= 1e-3 * (1.0 + ref_a_uvuv.abs()),
-                "#932 PROBE a_uv_uv[q1,q1]: jet {jet_a_uvuv} != scalar-FD {ref_a_uvuv} \
-                 (eta_uv_uv jet {} hand {}; chi {chi_probe})",
-                eta4.eps_del.h[primary.q1 * p + primary.q1],
-                hand_bi.eta_uv_uv[[primary.q1, primary.q1]],
-            );
-        }
 
         cmp_mat("eta_uv_uv", &eta4.eps_del.h, &hand_bi.eta_uv_uv);
         cmp_mat("chi_uv_uv", &chi4.eps_del.h, &hand_bi.chi_uv_uv);
