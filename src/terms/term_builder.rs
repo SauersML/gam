@@ -4936,6 +4936,149 @@ mod tests {
         }
     }
 
+    /// Build a dataset with a ternary continuous covariate `x ∈ {0,1,2}` and a
+    /// 2-level categorical group `g`, for the low-cardinality cr-cap tests.
+    fn ternary_factor_dataset() -> Dataset {
+        let rows = (0..120)
+            .map(|i| {
+                let x = (i % 3) as f64;
+                let g = (i % 2) as f64;
+                vec![x + g, x, g]
+            })
+            .collect::<Vec<_>>();
+        Dataset {
+            headers: vec!["y".into(), "x".into(), "g".into()],
+            values: Array2::from_shape_vec(
+                (rows.len(), 3),
+                rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+            )
+            .expect("rectangular ternary factor test data"),
+            schema: DataSchema {
+                columns: vec![
+                    SchemaColumn {
+                        name: "y".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "x".into(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    },
+                    SchemaColumn {
+                        name: "g".into(),
+                        kind: ColumnKindTag::Categorical,
+                        levels: vec!["a".into(), "b".into()],
+                    },
+                ],
+            },
+            column_kinds: vec![
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Continuous,
+                ColumnKindTag::Categorical,
+            ],
+        }
+    }
+
+    #[test]
+    fn univariate_cr_smooth_caps_knots_to_data_support() {
+        // #1541: `s(x, bs=cr, k=10)` on a ternary covariate (3 distinct values)
+        // must NOT hard-fail in cr-knot selection ("cubic regression spline with
+        // k=10 requires at least 10 distinct values, got 3"). The cr basis is
+        // capped to the data support — exactly 3 value-knots at {0,1,2} — which
+        // is full-rank for the data, so it can still represent any 3 group means.
+        let ds = continuous_dataset(
+            &["y", "x"],
+            (0..90).map(|i| vec![(i % 3) as f64, (i % 3) as f64]).collect(),
+        );
+        let col_map = ds.column_map();
+        let parsed = parse_formula("y ~ s(x, bs=cr, k=10)").expect("parse cr smooth");
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("cr k=10 must cap to data support instead of erroring");
+        let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected BSpline1D for s(x, bs=cr)");
+        };
+        let BSplineKnotSpec::NaturalCubicRegression { knots } = &spec.knotspec else {
+            panic!("expected cr knotspec, got {:?}", spec.knotspec);
+        };
+        // Capped to exactly the 3 distinct covariate values.
+        assert_eq!(knots.len(), 3, "cr basis not capped to 3 distinct values");
+        assert_eq!(knots.as_slice().unwrap(), &[0.0, 1.0, 2.0]);
+        // The reduction is surfaced to the user (mgcv warns in the same case).
+        assert!(
+            notes.iter().any(|n| n.contains("data-support cap")),
+            "cap not reported in inference notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn univariate_cr_smooth_binary_covariate_degrades_to_bspline() {
+        // #1541: a BINARY covariate has too few distinct values (2) for ANY cr
+        // spline (needs >= 3 distinct). `s(x, bs=cr)` must degrade to a B-spline
+        // marginal — the default basis the same data already fits — NOT hard-fail.
+        let ds = continuous_dataset(
+            &["y", "x"],
+            (0..80).map(|i| vec![(i % 2) as f64, (i % 2) as f64]).collect(),
+        );
+        let col_map = ds.column_map();
+        let parsed = parse_formula("y ~ s(x, bs=cr, k=10)").expect("parse cr smooth");
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("binary cr must degrade to B-spline instead of erroring");
+        let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected BSpline1D for s(x, bs=cr)");
+        };
+        assert!(
+            !matches!(spec.knotspec, BSplineKnotSpec::NaturalCubicRegression { .. }),
+            "binary covariate must NOT build a cr basis, got {:?}",
+            spec.knotspec
+        );
+        assert!(
+            notes.iter().any(|n| n.contains("Degraded to the linear B-spline")),
+            "degradation not reported in inference notes: {notes:?}"
+        );
+    }
+
+    #[test]
+    fn sz_factor_smooth_caps_cr_marginal_to_data_support() {
+        // #1542: the `sz` factor-smooth cr MARGINAL must cap to the data support
+        // too, not hard-fail. On a ternary covariate the marginal is a cr basis
+        // of exactly 3 value-knots (full-rank for the data).
+        let ds = ternary_factor_dataset();
+        let col_map = ds.column_map();
+        let parsed = parse_formula("y ~ s(x, g, bs=sz, k=10)").expect("parse sz factor smooth");
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("sz k=10 must cap the cr marginal instead of erroring");
+        let SmoothBasisSpec::FactorSmooth { spec } = &terms.smooth_terms[0].basis else {
+            panic!("expected FactorSmooth for s(x, g, bs=sz)");
+        };
+        let BSplineKnotSpec::NaturalCubicRegression { knots } = &spec.marginal.knotspec else {
+            panic!("expected cr marginal knotspec, got {:?}", spec.marginal.knotspec);
+        };
+        assert_eq!(knots.len(), 3, "sz cr marginal not capped to 3 distinct values");
+        assert_eq!(knots.as_slice().unwrap(), &[0.0, 1.0, 2.0]);
+    }
+
     /// #1457: `y ~ s(x, by=g) + g` with a BARE categorical `g` must NOT lower to
     /// two `g` design blocks. The bare `+ g` is auto-promoted to a single
     /// penalized random-effect block owning the factor's full level offsets; the
