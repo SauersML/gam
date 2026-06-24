@@ -193,18 +193,38 @@ fn selected_uncertainty_backend<'a>(
                         covariance.ncols()
                     )));
                 }
-                Ok((
-                    PredictionCovarianceBackend::from_dense(covariance.view()),
-                    true,
-                ))
-            } else {
-                selected_uncertainty_backend(
-                    fit,
-                    expected_dim,
-                    InferenceCovarianceMode::Conditional,
-                    label,
-                )
+                // The smoothing-corrected covariance `H⁻¹ + J Var(ρ̂) Jᵀ` is only
+                // usable when it is finite. On a degenerate fit — e.g. an
+                // all-zero-count Poisson, whose flat likelihood leaves the outer
+                // REML problem near-singular — `Var(ρ̂)` blows up and the
+                // correction term carries non-finite entries, even though the
+                // conditional `H⁻¹` is well defined. A NaN/∞ covariance produces
+                // NaN standard errors that propagate through the interval path
+                // (the delta-method fallback in `transform_eta_interval` cannot
+                // rescue them because it multiplies the same blown-up SE), so a
+                // model the API reports as fitted yields non-finite interval
+                // bounds (#1515). Treat a non-finite correction exactly like a
+                // missing one — the `Preferred` mode already contracts to fall
+                // back to the conditional covariance when the correction is
+                // unavailable, and an unusable correction is that same case — so
+                // a fitted model always yields finite standard errors and bounds.
+                if covariance.iter().all(|v| v.is_finite()) {
+                    return Ok((
+                        PredictionCovarianceBackend::from_dense(covariance.view()),
+                        true,
+                    ));
+                }
+                log::warn!(
+                    "{label}: smoothing-corrected covariance has non-finite entries; \
+                     degrading to the conditional covariance (#1515)"
+                );
             }
+            selected_uncertainty_backend(
+                fit,
+                expected_dim,
+                InferenceCovarianceMode::Conditional,
+                label,
+            )
         }
         InferenceCovarianceMode::ConditionalPlusSmoothingRequired => {
             let covariance = fit.beta_covariance_corrected().ok_or_else(|| {
