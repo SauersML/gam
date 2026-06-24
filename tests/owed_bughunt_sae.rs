@@ -18,8 +18,8 @@ use gam::geometry::poincare::{tangent_decode_backward, tangent_decode_forward, B
 /// radially-pinned map — not the unclamped `tanh(s)/s` — or the gradient
 /// desyncs from the forward in the saturated regime.
 ///
-/// This drives the decode deep into saturation (a unit gate onto a
-/// near-boundary atom gives `s ≈ 8 > 6.103`) and finite-differences the forward
+/// This drives the decode deep into saturation (gates of ≈3 onto the two
+/// near-boundary atoms give `s ≈ 8 > 6.103`) and finite-differences the forward
 /// loss. The OLD unclamped backward disagreed with the FD here (the disagreement
 /// is bounded by `~BOUNDARY_EPS` but is a genuine forward/backward inconsistency
 /// the small-input FD test never exercised); the fixed backward matches.
@@ -33,7 +33,7 @@ fn poincare_tangent_backward_matches_fd_in_saturated_regime() {
     // radially-pinned Jacobian's tangential part is exercised — not just the
     // radial cancellation.
     let atoms = array![[0.95, 0.1], [0.1, 0.95]];
-    let gates = array![[2.2, 1.8]];
+    let gates = array![[3.0, 2.5]];
     let curvature = -1.0;
 
     let (x_hat, cache) =
