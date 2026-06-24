@@ -1,15 +1,12 @@
-//! Shared CUDA driver bindings used by every cuBLAS / cuSPARSE / cuSOLVER
-//! routing module.
+//! Shared CUDA driver presence/loading helpers used by every cuBLAS / cuSPARSE
+//! / cuSOLVER routing module.
 //!
-//! All library bindings share:
-//!
-//! * one [`DriverApi`] (resolved once from the dlopen'd `libcuda` handle),
-//! * one CUDA context created against the selected device at first use,
-//! * the helpers below for byte-size math, column-major layout, and the
-//!   RAII [`DeviceAllocation`] wrapper.
-//!
-//! Future runtimes (cuRAND, cuFFT, NVRTC) borrow the same triple instead
-//! of re-initializing the driver and creating another context.
+//! The GPU path uses ONE context model: cudarc's device PRIMARY context
+//! (`cuDevicePrimaryCtxRetain`, bound in `device_runtime::cuda_context_for`).
+//! cuBLAS/cuSOLVER/cuSPARSE handles attach to that current context; there is no
+//! separate user `cuCtxCreate` context (its removal fixed the #1017
+//! NOT_INITIALIZED handle failures). This module keeps only the libcuda
+//! presence probes, byte-size/layout helpers, and the `check_cuda` status wrap.
 
 use libloading::Library;
 #[cfg(target_os = "linux")]
@@ -25,175 +22,15 @@ use super::gpu_error::GpuError;
 use crate::gpu_err;
 
 pub type CuResult = i32;
-// SAFETY: libcuda FFI fn-pointer alias matching the C ABI we dlsym
-// below; the `unsafe` qualifier propagates the call-site obligations
-// (live context, valid pointers/sizes) up to each invoker.
-type CuInit = unsafe extern "C" fn(u32) -> CuResult;
-// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
-type CuDeviceGet = unsafe extern "C" fn(*mut i32, i32) -> CuResult;
-// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
-type CuCtxCreate = unsafe extern "C" fn(*mut usize, u32, i32) -> CuResult;
-// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
-type CuCtxSetCurrent = unsafe extern "C" fn(usize) -> CuResult;
-// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
-type CuCtxDestroy = unsafe extern "C" fn(usize) -> CuResult;
-// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
-type CuMemAlloc = unsafe extern "C" fn(*mut u64, usize) -> CuResult;
-// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
-type CuMemFree = unsafe extern "C" fn(u64) -> CuResult;
-// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
-type CuMemcpyHtoD = unsafe extern "C" fn(u64, *const std::ffi::c_void, usize) -> CuResult;
-// SAFETY: libcuda FFI fn-pointer alias; obligations propagated to invoker.
-type CuMemcpyDtoH = unsafe extern "C" fn(*mut std::ffi::c_void, u64, usize) -> CuResult;
-
-/// Resolved CUDA driver entry points.
-pub struct DriverApi {
-    pub cu_init: CuInit,
-    pub cu_device_get: CuDeviceGet,
-    pub cu_ctx_create: CuCtxCreate,
-    pub cu_ctx_set_current: CuCtxSetCurrent,
-    pub cu_ctx_destroy: CuCtxDestroy,
-    pub cu_mem_alloc: CuMemAlloc,
-    pub cu_mem_free: CuMemFree,
-    pub cu_memcpy_htod: CuMemcpyHtoD,
-    pub cu_memcpy_dtoh: CuMemcpyDtoH,
-}
-
-impl DriverApi {
-    pub fn load(library: &'static Library) -> Result<Self, GpuError> {
-        let sym = |e: libloading::Error| GpuError::DriverSymbolMissing {
-            reason: e.to_string(),
-        };
-        // SAFETY: each library.get asserts a signature matching the
-        // libcuda export of the same name; deref yields raw fn pointers
-        // backed by a process-static handle that cannot be unloaded.
-        unsafe {
-            Ok(Self {
-                cu_init: *library.get(b"cuInit\0").map_err(sym)?,
-                cu_device_get: *library.get(b"cuDeviceGet\0").map_err(sym)?,
-                cu_ctx_create: *library.get(b"cuCtxCreate_v2\0").map_err(sym)?,
-                cu_ctx_set_current: *library.get(b"cuCtxSetCurrent\0").map_err(sym)?,
-                cu_ctx_destroy: *library.get(b"cuCtxDestroy_v2\0").map_err(sym)?,
-                cu_mem_alloc: *library.get(b"cuMemAlloc_v2\0").map_err(sym)?,
-                cu_mem_free: *library.get(b"cuMemFree_v2\0").map_err(sym)?,
-                cu_memcpy_htod: *library.get(b"cuMemcpyHtoD_v2\0").map_err(sym)?,
-                cu_memcpy_dtoh: *library.get(b"cuMemcpyDtoH_v2\0").map_err(sym)?,
-            })
-        }
-    }
-}
-
-/// Shared CUDA driver + selected-device context used by every library
-/// runtime. Created once per process; subsequent library handles
-/// (`cublasCreate_v2`, `cusolverDnCreate`, `cusparseCreate`) attach to
-/// the same context instead of building their own.
-pub struct CudaWorkingState {
-    /// Resolved CUDA driver entry points. The underlying dlopen'd `libcuda`
-    /// is retained by the static loader, so the fn pointers in `api` stay
-    /// valid for the process lifetime without any owning field here.
-    pub api: DriverApi,
-    /// Primary CUDA context for the selected device. Library runtimes
-    /// must `cuCtxSetCurrent` on it before issuing work.
-    pub context: usize,
-}
-
-impl CudaWorkingState {
-    /// Initialize the driver and create one context against `device_ordinal`.
-    /// Returns `None` if libcuda can't be loaded, a required symbol is
-    /// missing, or any of `cuInit / cuDeviceGet / cuCtxCreate` fails.
-    pub fn init(device_ordinal: usize) -> Option<Self> {
-        let ordinal = to_i32(device_ordinal)?;
-        let library = load_static_cuda_driver_library().ok()?;
-        let api = DriverApi::load(library).ok()?;
-        // SAFETY: api was just resolved from the live libcuda handle;
-        // we pass in-range device ordinals and pointers to local stack
-        // slots that outlive each call, satisfying the driver-API contract.
-        unsafe {
-            check_cuda((api.cu_init)(0), "cuInit").ok()?;
-            let mut device = 0_i32;
-            check_cuda((api.cu_device_get)(&mut device, ordinal), "cuDeviceGet").ok()?;
-            let mut context = 0_usize;
-            check_cuda((api.cu_ctx_create)(&mut context, 0, device), "cuCtxCreate").ok()?;
-            Some(Self { api, context })
-        }
-    }
-
-    /// Bind this context to the calling thread. Library runtimes call
-    /// this before issuing work because cuCtxSetCurrent is per-thread.
-    #[inline]
-    pub fn set_current(&self) -> Result<(), GpuError> {
-        check_cuda(
-            // SAFETY: self.context was produced by cuCtxCreate in init()
-            // and lives until Self::drop; the driver fn pointer was
-            // resolved against the same libcuda handle.
-            unsafe { (self.api.cu_ctx_set_current)(self.context) },
-            "cuCtxSetCurrent",
-        )
-    }
-}
-
-impl Drop for CudaWorkingState {
-    fn drop(&mut self) {
-        // Only fires at process shutdown via the runtime's `OnceLock`;
-        // best-effort cleanup so cuda-gdb / nvidia-smi see no dangling
-        // context. Errors are swallowed because the process is on its
-        // way out anyway.
-        // SAFETY: self.context was produced by cuCtxCreate in init() and
-        // is destroyed exactly once here as part of Self::drop.
-        unsafe {
-            (self.api.cu_ctx_destroy)(self.context);
-        }
-    }
-}
-
-/// RAII device allocation: frees on drop via `cuMemFree_v2`.
-pub struct DeviceAllocation<'a> {
-    state: &'a CudaWorkingState,
-    pub ptr: u64,
-}
-
-impl<'a> DeviceAllocation<'a> {
-    /// Allocate `bytes` of device memory. Caller is responsible for context
-    /// `cuCtxSetCurrent` having been issued for `state.context` before this call.
-    // SAFETY: marked `unsafe fn` because the caller must guarantee that a
-    // CUDA context is current on this thread; borrowing state also keeps
-    // the owning context alive until this allocation has been dropped.
-    pub unsafe fn new(state: &'a CudaWorkingState, bytes: usize) -> Option<Self> {
-        let mut ptr = 0_u64;
-        check_cuda(
-            // SAFETY: &mut ptr is a valid u64 slot living to the end of
-            // this fn; `state.context` is current by the caller contract;
-            // `bytes` is the caller-requested allocation size.
-            unsafe { (state.api.cu_mem_alloc)(&mut ptr, bytes) },
-            "cuMemAlloc",
-        )
-        .ok()?;
-        Some(Self { state, ptr })
-    }
-}
-
-impl Drop for DeviceAllocation<'_> {
-    fn drop(&mut self) {
-        // Re-bind the owning context before freeing: cuMemFree requires a
-        // current context on the calling thread, and Drop may fire from a
-        // different thread than `new`. We then ALWAYS attempt the free,
-        // even if set_current failed (e.g. driver was deinitialized at
-        // shutdown). Skipping the free on a transient set_current failure
-        // would silently leak device memory — never acceptable on GPU.
-        // SAFETY: state.context was produced by cuCtxCreate and is kept
-        // alive for at least the duration of this borrow; the driver fn
-        // pointers were resolved against the same live libcuda handle.
-        unsafe {
-            (self.state.api.cu_ctx_set_current)(self.state.context);
-        }
-        // SAFETY: self.ptr was produced by cuMemAlloc inside Self::new
-        // while state.context was current; we have just re-bound that same
-        // context (best-effort) and this RAII owner frees exactly once.
-        unsafe {
-            (self.state.api.cu_mem_free)(self.ptr);
-        }
-    }
-}
+// NOTE (#1017): the `DriverApi` / `CudaWorkingState` / `DeviceAllocation` cluster
+// that lived here was REMOVED. It created a SEPARATE user CUDA context via
+// `cuCtxCreate` — distinct from cudarc's device PRIMARY context (cuDevicePrimaryCtxRetain)
+// that the live GPU path actually uses — which is the documented cause of the
+// cuBLAS/cuSOLVER NOT_INITIALIZED handle failures (handles bind to whichever
+// context is current). The cluster had ZERO consumers once the runtime routed
+// through `cuda_context_for` (the primary context) in `device_runtime.rs`, so it
+// was dead dual-context code. Keep ONE context model: the cudarc primary context.
+// Do not reintroduce `cuCtxCreate` for issuing work.
 
 #[inline]
 pub fn check_cuda(result: CuResult, name: &str) -> Result<(), GpuError> {
