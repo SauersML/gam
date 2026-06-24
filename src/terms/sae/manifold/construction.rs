@@ -4984,6 +4984,25 @@ impl SaeManifoldTerm {
         // Symmetric for the transpose: `H_βt = J_βᵀ · Lᵀ`, so apply `Lᵀ`
         // first to map the q_i-vector back to p-space, then scatter through
         // the support.
+        // #1017/#1026 — the device SAE matrix-free PCG (`device_sae_pcg`) is
+        // installed ONLY on the full-`B` path. Its kernel
+        // (`solve_sae_matrix_free_pcg`) hard-codes the channel-identical data
+        // Hessian `G ⊗ I_p` (smooth blocks `λ S_k ⊗ I_p`, sparse-G blocks
+        // identical across the `p` output channels). The frames-engaged path's
+        // data Hessian is instead `G_{ij} ⊗ W_{ij}` with `W_{ij} = U_iᵀU_j`
+        // (per-pair frame overlaps, NOT identity) and per-atom blocks of rank
+        // `r_k < p`. Frames are "engaged" precisely when at least one atom is
+        // genuinely frame-reduced, so `W_{ij}` is never the identity here.
+        // Feeding the `⊗ I_p` kernel a factored `⊗ W_{ij}` system would return a
+        // numerically WRONG Newton step (it returns `Ok`, with no CPU fallback),
+        // so wiring `device_sae_pcg` for framed systems is a kernel change
+        // (carry `ranks` + the `W_{ij}` cross-factors and consume them in the
+        // matvec), NOT an offset remap. Until that kernel exists the framed path
+        // keeps `device_rows = None` and the inner solve falls back to the CPU
+        // `steihaug_pcg_auto`, which already solves the factored system exactly
+        // via `CompositePenaltyOp`. (Bit-parity for the eventual framed kernel is
+        // size-independent — any CUDA device validates it; only the throughput
+        // numbers want an A100.)
         let device_rows = if frames_engaged {
             None
         } else {
