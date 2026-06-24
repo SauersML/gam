@@ -212,17 +212,10 @@ impl DenestedCellPrimaryFixedPartials {
     }
 }
 
-pub(crate) const COEFF_SUPPORT_GHW: CoeffSupport = CoeffSupport {
-    include_primary: true,
-    include_h: true,
-    include_w: true,
-};
-
-pub(crate) const COEFF_SUPPORT_GW: CoeffSupport = CoeffSupport {
-    include_primary: true,
-    include_h: false,
-    include_w: true,
-};
+// #932-2 cutover: `COEFF_SUPPORT_GHW`/`COEFF_SUPPORT_GW` moved to the test-masked
+// `flex_oracle_structs_tests` module — they parametrize only the now test-only hand
+// directional/bidirectional oracle (the production jet path's `observed_fixed_for`
+// gates the h/w channels by `family.score_warp`/`link_dev` directly).
 
 /// Pre-computed partition cell data for a single timepoint evaluation.
 /// Built once per (a, b, β_h, β_w) and reused across the three passes
@@ -481,69 +474,12 @@ pub(crate) fn spatial_block_primary_loading(block_idx: usize) -> Result<Array1<f
     }
 }
 
-pub(crate) fn scalar_composite_bilinear(
-    base: f64,
-    da: f64,
-    daa: f64,
-    fixed_d1: f64,
-    fixed_d2: f64,
-    fixed_d12: f64,
-    da_d1: f64,
-    da_d2: f64,
-    ad1: f64,
-    ad2: f64,
-    ad12: f64,
-) -> MultiDirJet {
-    MultiDirJet::bilinear(
-        base,
-        da * ad1 + fixed_d1,
-        da * ad2 + fixed_d2,
-        da * ad12 + daa * ad1 * ad2 + da_d1 * ad2 + da_d2 * ad1 + fixed_d12,
-    )
-}
-
-pub(crate) fn coeff4_fixed_bilinear(
-    base: &[f64; 4],
-    d1: &[f64; 4],
-    d2: &[f64; 4],
-    d12: &[f64; 4],
-) -> Vec<MultiDirJet> {
-    (0..4)
-        .map(|k| MultiDirJet::bilinear(base[k], d1[k], d2[k], d12[k]))
-        .collect()
-}
-
-pub(crate) fn coeff4_composite_bilinear(
-    base: &[f64; 4],
-    da: &[f64; 4],
-    daa: &[f64; 4],
-    fixed_d1: &[f64; 4],
-    fixed_d2: &[f64; 4],
-    fixed_d12: &[f64; 4],
-    da_d1: &[f64; 4],
-    da_d2: &[f64; 4],
-    ad1: f64,
-    ad2: f64,
-    ad12: f64,
-) -> Vec<MultiDirJet> {
-    (0..4)
-        .map(|k| {
-            scalar_composite_bilinear(
-                base[k],
-                da[k],
-                daa[k],
-                fixed_d1[k],
-                fixed_d2[k],
-                fixed_d12[k],
-                da_d1[k],
-                da_d2[k],
-                ad1,
-                ad2,
-                ad12,
-            )
-        })
-        .collect()
-}
+// #932-2 cutover: `scalar_composite_bilinear` / `coeff4_fixed_bilinear` /
+// `coeff4_composite_bilinear` moved to the test-masked `flex_oracle_structs_tests`
+// module — these `MultiDirJet`-bilinear coefficient assemblers feed only the now
+// test-only hand bidirectional oracle (the production jet path builds the
+// second-directional coefficient channels through `flex_jet::cell_coeff_jets` over
+// the `Jet4` algebra).
 
 /// Derive a primary-space direction from a precomputed psi design row and beta,
 /// avoiding a redundant psi design row build inside `row_primary_psi_direction`.
