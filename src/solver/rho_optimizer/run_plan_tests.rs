@@ -4650,3 +4650,71 @@ fn cost_scaled_prewarm_budget_is_bounded_and_never_zero() {
         prev = b;
     }
 }
+
+// ─── #979 outer wall-clock deadline (survival marginal-slope hang) ────
+
+/// gam#979 — second, last-resort termination guarantee for the survival
+/// marginal-slope hang. The slow-geometric-rate stall guard
+/// (`loop_guard::slow_geometric_rate_exceeds_projection_cap`) ends the inner
+/// joint-Newton when the residual is descending too slowly to finish, but the
+/// outer search can still cascade across MANY ρ seeds/plans (every one
+/// rejecting on the monotonicity-pinned baseline). The process-global
+/// `OUTER_WALL_CLOCK_DEADLINE`, armed once around the whole survival fit, is the
+/// catch-all that the inner joint-Newton cycle loop checks
+/// (`inner_blockwise_fit.rs`: `if cycle > 0 && outer_wall_clock_deadline_exceeded()`)
+/// so the public API returns its best-effort iterate in bounded time instead of
+/// hanging to timeout.
+///
+/// This pins the three load-bearing properties of that mechanism with NO
+/// wall-clock assertion (deterministic on the armed `Instant` only):
+///   1. nothing armed  => `exceeded()` is `false` (every non-survival fit is
+///      byte-for-byte unchanged — the guard is opt-in);
+///   2. a deadline already in the PAST => `exceeded()` is `true` (the inner loop
+///      breaks and the fit terminates);
+///   3. a deadline in the FUTURE => `exceeded()` is `false` (a fast survival fit
+///      is never cut short before it converges);
+///   4. `clear()` restores the unbounded default so a stale past deadline can
+///      never leak forward and bound a later, unrelated fit.
+///
+/// Serialised inside one `#[test]` (the deadline is a process-global) and always
+/// cleared on exit so it cannot perturb any sibling test.
+#[test]
+fn outer_wall_clock_deadline_bounds_then_clears_979() {
+    use std::time::{Duration, Instant};
+
+    // Start from a known-clear state regardless of any prior test ordering.
+    clear_outer_wall_clock_deadline();
+    assert!(
+        !outer_wall_clock_deadline_exceeded(),
+        "with nothing armed the deadline guard must be inert (non-survival fits unchanged)"
+    );
+
+    // (2) A deadline in the past => exceeded immediately. The inner loop's
+    //     `cycle > 0 && outer_wall_clock_deadline_exceeded()` check then breaks,
+    //     returning the best-effort iterate instead of grinding to timeout.
+    arm_outer_wall_clock_deadline(Instant::now() - Duration::from_secs(1));
+    assert!(
+        outer_wall_clock_deadline_exceeded(),
+        "a past deadline must report exceeded so the inner joint-Newton terminates"
+    );
+
+    // (4) Clearing restores the unbounded default — a stale deadline must never
+    //     leak to a later, unrelated fit.
+    clear_outer_wall_clock_deadline();
+    assert!(
+        !outer_wall_clock_deadline_exceeded(),
+        "clearing must restore the unbounded default (no stale-deadline leak)"
+    );
+
+    // (3) A generous future deadline must NOT fire, so a fast survival fit is
+    //     never cut short before its KKT/REML certificate.
+    arm_outer_wall_clock_deadline(Instant::now() + Duration::from_secs(3600));
+    assert!(
+        !outer_wall_clock_deadline_exceeded(),
+        "a future deadline must not fire — a fast fit converges normally"
+    );
+
+    // Always leave the global clear so no sibling test sees an armed deadline.
+    clear_outer_wall_clock_deadline();
+    assert!(!outer_wall_clock_deadline_exceeded());
+}
