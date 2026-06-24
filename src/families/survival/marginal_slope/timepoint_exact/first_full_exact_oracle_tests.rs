@@ -8,7 +8,8 @@
 //! `FluxVelocity` / `moving_density_boundary_flux` stay production in `first_full`.
 
 use super::*;
-use super::first_full::{moving_density_boundary_flux, FluxVelocity};
+use super::first_full::moving_density_boundary_flux;
+use crate::families::survival::marginal_slope::flex_oracle_structs_tests::neg_cell_of;
 
 /// Horner evaluation of `Σ_k coefficients[k]·zᵏ`.
 #[inline]
@@ -118,7 +119,7 @@ impl SurvivalMarginalSlopeFamily {
                         entry,
                         &chi_poly,
                         b,
-                        FluxVelocity::Total,
+                        true,
                     );
                 }
                 Ok(d_u)
@@ -355,7 +356,7 @@ impl SurvivalMarginalSlopeFamily {
             .cells
             .iter()
             .map(|entry| -> Result<ExactTimepointCellAccum, String> {
-                let neg_cell = entry.neg_cell;
+                let neg_cell = neg_cell_of(entry);
                 let state = &entry.state;
                 let fixed = &entry.fixed;
                 let neg_dc_da = fixed.dc_da.map(|value| -value);
@@ -465,7 +466,7 @@ impl SurvivalMarginalSlopeFamily {
         if b != 0.0 {
             for entry in &cached.cells {
                 let fixed = &entry.fixed;
-                let cell = entry.neg_cell;
+                let cell = neg_cell_of(entry);
                 let part = &entry.partition_cell;
                 // Crossing-edge velocities z_u = −(a_u[u] + δ_{u,g}·z)/b (§C),
                 // the same edge kinematics `moving_density_boundary_flux` uses
@@ -556,7 +557,7 @@ impl SurvivalMarginalSlopeFamily {
                             entry,
                             &neg_coeff_u,
                             b,
-                            FluxVelocity::PartialIft,
+                            false,
                         ) + moving_density_boundary_flux(
                             u,
                             primary,
@@ -564,7 +565,7 @@ impl SurvivalMarginalSlopeFamily {
                             entry,
                             &neg_coeff_v,
                             b,
-                            FluxVelocity::PartialIft,
+                            false,
                         );
                         // `G_z·z_u·z_v` is a single symmetric term, added once
                         // (unlike the asymmetric `flux` pair) to both triangles.
@@ -605,7 +606,7 @@ impl SurvivalMarginalSlopeFamily {
                             entry,
                             &neg_dc_da,
                             b,
-                            FluxVelocity::PartialIft,
+                            false,
                         )
                         + self_flux_xy(za_r, zu_r, za_l, zu_l);
                 }

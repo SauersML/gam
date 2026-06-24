@@ -20,7 +20,24 @@ use ndarray::{Array1, Array2};
 // impl below (moved from `contraction.rs`). Imported explicitly (not `super::*`,
 // which would shadow the `CoeffSupport`/`MultiDirJet` imports above and trip the
 // unused-import lint).
-use super::{FlexPrimarySlices, SurvivalMarginalSlopeFamily};
+use super::{CachedCellEntry, FlexPrimarySlices, SurvivalMarginalSlopeFamily};
+
+/// Reconstruct the sign-flipped cubic cell the hand oracle integrates against,
+/// from the cached partition cell. Production no longer stores it on
+/// `CachedCellEntry` (the jet timepoint path never reads it), so the oracle
+/// rebuilds it here by negating the cubic coefficients — byte-identical to the
+/// `neg_cell` the cache builder formerly carried.
+pub(crate) fn neg_cell_of(entry: &CachedCellEntry) -> exact_kernel::DenestedCubicCell {
+    let cell = entry.partition_cell.cell;
+    exact_kernel::DenestedCubicCell {
+        left: cell.left,
+        right: cell.right,
+        c0: -cell.c0,
+        c1: -cell.c1,
+        c2: -cell.c2,
+        c3: -cell.c3,
+    }
+}
 
 // #932-2 cutover: the `MultiDirJet`-coefficient polynomial ops for the hand oracle
 // (moved from `poly_arith.rs`, where they were dead in the non-test lib build after

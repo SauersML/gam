@@ -5,8 +5,9 @@
 //! derivatives (η_uv_dir, χ_uv_dir, D_u_dir, D_uv_dir).
 
 use super::*;
+use crate::families::marginal_slope_shared::SparsePrimaryCoeffJetView;
 use crate::families::survival::marginal_slope::flex_oracle_structs_tests::{
-    poly_add_jets, poly_coeff_mask, poly_mul_jets, poly_scale_jets,
+    neg_cell_of, poly_add_jets, poly_coeff_mask, poly_mul_jets, poly_scale_jets,
     SurvivalFlexTimepointDirectionalExact, COEFF_SUPPORT_GHW, COEFF_SUPPORT_GW,
 };
 
@@ -112,7 +113,7 @@ impl SurvivalMarginalSlopeFamily {
             .iter()
             .map(
                 |cell_entry| -> Result<DirectionalTimepointCellAccum, String> {
-                    let neg_cell = cell_entry.neg_cell;
+                    let neg_cell = neg_cell_of(cell_entry);
                     let state = &cell_entry.state;
                     let fixed = &cell_entry.fixed;
                     let neg_dc_da: [f64; 4] = fixed.dc_da.map(|v| -v);
@@ -380,7 +381,7 @@ impl SurvivalMarginalSlopeFamily {
         let dir_g = if primary.g < p { dir[primary.g] } else { 0.0 };
         if b != 0.0 {
             for cell_entry in &cached.cells {
-                let cell = cell_entry.neg_cell;
+                let cell = neg_cell_of(cell_entry);
                 let fixed = &cell_entry.fixed;
                 let part = &cell_entry.partition_cell;
                 // IFT-PARTIAL θ-axis crossing velocity `∂z/∂θ_axis|_a = −direct_g/b`
@@ -575,7 +576,7 @@ impl SurvivalMarginalSlopeFamily {
             .dot(dir);
         if b != 0.0 {
             for cell_entry in &cached.cells {
-                let neg_cell = cell_entry.neg_cell;
+                let neg_cell = neg_cell_of(cell_entry);
                 let fixed = &cell_entry.fixed;
                 let part = &cell_entry.partition_cell;
                 let neg_dc_da = fixed.dc_da.map(|val| -val);

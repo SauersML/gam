@@ -6,8 +6,9 @@
 //! intercept solve for a pair of directions.
 
 use super::*;
+use crate::families::marginal_slope_shared::SparsePrimaryCoeffJetView;
 use crate::families::survival::marginal_slope::flex_oracle_structs_tests::{
-    coeff4_composite_bilinear, coeff4_fixed_bilinear, poly_add_jets, poly_coeff_mask,
+    coeff4_composite_bilinear, coeff4_fixed_bilinear, neg_cell_of, poly_add_jets, poly_coeff_mask,
     poly_mul_jets, poly_scale_jets, scalar_composite_bilinear,
     SurvivalFlexTimepointBiDirectionalExact, COEFF_SUPPORT_GHW, COEFF_SUPPORT_GW,
 };
@@ -127,7 +128,7 @@ impl SurvivalMarginalSlopeFamily {
             let mut f_u = Array1::<f64>::zeros(p);
             let mut f_uv = Array2::<f64>::zeros((p, p));
             for ce in &cached.cells {
-                let nc = ce.neg_cell;
+                let nc = neg_cell_of(ce);
                 let st = &ce.state;
                 let fx = &ce.fixed;
                 let da = fx.dc_da.map(|value| -value);
@@ -254,7 +255,7 @@ impl SurvivalMarginalSlopeFamily {
                                 entry,
                                 &cu,
                                 b,
-                                super::first_full::FluxVelocity::PartialIft,
+                                false,
                             ) + super::first_full::moving_density_boundary_flux(
                                 u,
                                 primary,
@@ -262,7 +263,7 @@ impl SurvivalMarginalSlopeFamily {
                                 entry,
                                 &cv,
                                 b,
-                                super::first_full::FluxVelocity::PartialIft,
+                                false,
                             );
                             let zv_r = crossing_vel(v, part.right_edge, cell.right);
                             let zv_l = crossing_vel(v, part.left_edge, cell.left);
@@ -345,7 +346,7 @@ impl SurvivalMarginalSlopeFamily {
                 let mut f_aa_d12 = 0.0f64;
                 let mut f_au_d12 = Array1::<f64>::zeros(p);
                 let mut f_uv_d12 = Array2::<f64>::zeros((p, p));
-                let nc = ce.neg_cell;
+                let nc = neg_cell_of(ce);
                 let st = &ce.state;
                 let fx = &ce.fixed;
                 let da = fx.dc_da.map(|v| -v);

@@ -13,28 +13,6 @@ use super::*;
 
 
 
-/// Which crossing velocity the moving-boundary flux uses.
-///
-/// The link crossing `z = (τ − a)/b` moves with `θ` both directly (through
-/// `b = g`) and through the intercept response `a(θ)` at velocity `a_u`. Two
-/// distinct quantities need this flux with two distinct velocities:
-///
-/// * [`FluxVelocity::Total`] — `∂z/∂θ_axis = −(a_u[axis] + direct_g)/b`, the
-///   genuine TOTAL z-motion, used by the first-derivative `d_u` (which also
-///   carries the `chi·a_u` intercept chain in its interior, so it is a
-///   consistent total derivative and is FD-verified correct).
-/// * [`FluxVelocity::PartialIft`] — `∂z/∂θ_axis|_a = −direct_g/b`, the PARTIAL
-///   z-motion at fixed intercept, used by the IFT partials `f_uv`/`f_au`
-///   (whose interiors use partial cell coefficients, a held fixed). The
-///   intercept-chain contribution to `a_uv` is supplied separately by the
-///   explicit `f_au·a_u + f_aa·a_u²` terms in the IFT recovery; feeding the
-///   total velocity here double-counts the intercept motion (gam#1454).
-#[derive(Clone, Copy)]
-pub(super) enum FluxVelocity {
-    Total,
-    PartialIft,
-}
-
 pub(super) fn moving_density_boundary_flux(
     axis: usize,
     primary: &FlexPrimarySlices,
@@ -42,8 +20,22 @@ pub(super) fn moving_density_boundary_flux(
     entry: &CachedCellEntry,
     poly: &[f64],
     b: f64,
-    velocity: FluxVelocity,
+    include_intercept: bool,
 ) -> f64 {
+    // The link crossing `z = (τ − a)/b` moves with `θ` both directly (through
+    // `b = g`) and through the intercept response `a(θ)` at velocity `a_u`. Two
+    // distinct quantities need this flux with two distinct velocities:
+    //
+    // * `include_intercept = true` — `∂z/∂θ_axis = −(a_u[axis] + direct_g)/b`,
+    //   the genuine TOTAL z-motion, used by the first-derivative `d_u` (which
+    //   also carries the `chi·a_u` intercept chain in its interior, so it is a
+    //   consistent total derivative and is FD-verified correct).
+    // * `include_intercept = false` — `∂z/∂θ_axis|_a = −direct_g/b`, the PARTIAL
+    //   z-motion at fixed intercept, used by the IFT partials `f_uv`/`f_au`
+    //   (whose interiors use partial cell coefficients, a held fixed). The
+    //   intercept-chain contribution to `a_uv` is supplied separately by the
+    //   explicit `f_au·a_u + f_aa·a_u²` terms in the IFT recovery; feeding the
+    //   total velocity here double-counts the intercept motion (gam#1454).
     if b == 0.0 {
         return 0.0;
     }
@@ -52,10 +44,8 @@ pub(super) fn moving_density_boundary_flux(
         match edge {
             crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
                 let direct_g = if axis == primary.g { z } else { 0.0 };
-                match velocity {
-                    FluxVelocity::Total => -(a_u[axis] + direct_g) / b,
-                    FluxVelocity::PartialIft => -direct_g / b,
-                }
+                let intercept = if include_intercept { a_u[axis] } else { 0.0 };
+                -(intercept + direct_g) / b
             }
             crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
         }
@@ -185,7 +175,7 @@ impl SurvivalMarginalSlopeFamily {
                             entry,
                             &chi_poly,
                             b,
-                            FluxVelocity::Total,
+                            true,
                         );
                 }
                 Ok(d_u)

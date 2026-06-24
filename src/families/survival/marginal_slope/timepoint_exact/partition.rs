@@ -47,9 +47,8 @@ impl SurvivalMarginalSlopeFamily {
             }
         };
 
-        // ── 2. per-cell prelude (neg_cell, z_mid, u_mid, moment state) ──
+        // ── 2. per-cell prelude (z_mid, u_mid, moment state) ──
         let n = raw_cells.len();
-        let mut neg_cells = Vec::with_capacity(n);
         let mut z_mids = Vec::with_capacity(n);
         let mut u_mids = Vec::with_capacity(n);
         let mut states = Vec::with_capacity(n);
@@ -58,18 +57,9 @@ impl SurvivalMarginalSlopeFamily {
         >::with_capacity(n);
         for partition_cell in &raw_cells {
             let cell = partition_cell.cell;
-            let neg_cell = exact_kernel::DenestedCubicCell {
-                left: cell.left,
-                right: cell.right,
-                c0: -cell.c0,
-                c1: -cell.c1,
-                c2: -cell.c2,
-                c3: -cell.c3,
-            };
             let z_mid = exact_kernel::interval_probe_point(cell.left, cell.right)?;
             let u_mid = a + b * z_mid;
             let state = exact_kernel::evaluate_cell_moments(cell, moment_order)?;
-            neg_cells.push(neg_cell);
             z_mids.push(z_mid);
             u_mids.push(u_mid);
             states.push(state);
@@ -124,7 +114,6 @@ impl SurvivalMarginalSlopeFamily {
                 )?;
                 cells.push(CachedCellEntry {
                     partition_cell,
-                    neg_cell: neg_cells[idx],
                     state: states[idx].clone(),
                     fixed,
                 });
@@ -144,7 +133,6 @@ impl SurvivalMarginalSlopeFamily {
             )?;
             cells.push(CachedCellEntry {
                 partition_cell,
-                neg_cell: neg_cells[idx],
                 state: states[idx].clone(),
                 fixed,
             });

@@ -253,7 +253,6 @@ pub(crate) struct FlexThirdRowBase {
 
 pub(crate) struct CachedCellEntry {
     pub(crate) partition_cell: exact_kernel::DenestedPartitionCell,
-    pub(crate) neg_cell: exact_kernel::DenestedCubicCell,
     pub(crate) state: exact_kernel::CellMomentState,
     pub(crate) fixed: DenestedCellPrimaryFixedPartials,
 }
