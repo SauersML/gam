@@ -472,7 +472,8 @@ fn build_collapse_rescue_linear_image(
     atom_idx: usize,
     assign: ArrayView1<'_, f64>,
     target_resid: ArrayView2<'_, f64>,
-) -> Option<(HybridAtomCandidate, AtomLinearImage)> {
+    prior_dirs: &[Array1<f64>],
+) -> Option<(HybridAtomCandidate, AtomLinearImage, Array1<f64>)> {
     let n = assign.len();
     let p = target_resid.ncols();
     if n < MIN_ROWS_FOR_LINEAR_FIT || target_resid.nrows() != n || p == 0 {
@@ -533,6 +534,27 @@ fn build_collapse_rescue_linear_image(
             break;
         }
     }
+    // #1026 — ORTHOGONALIZE this atom's recovered axis against the axes already taken
+    // by earlier rescued atoms (Gram-Schmidt). Independent per-atom leave-one-atom-out
+    // top directions overlap (every collapsed atom's residual ≈ the same dominant PC),
+    // so the dictionary spans only ~1 axis (real OLMo: EV 0.58). Forcing DISTINCT axes
+    // makes the rescued images span rank-K — the same span the matched linear-topology
+    // dictionary reaches at EV 0.74. An atom whose top axis is fully explained by the
+    // earlier ones (near-zero residual after projection) genuinely adds nothing and is
+    // skipped (its slot stays the curved decode / dead).
+    for d in prior_dirs {
+        if d.len() == p {
+            let proj = v.dot(d);
+            for j in 0..p {
+                v[j] -= proj * d[j];
+            }
+        }
+    }
+    let v_ortho_norm = v.dot(&v).sqrt();
+    if !(v_ortho_norm > 1e-6) {
+        return None;
+    }
+    v.mapv_inplace(|x| x / v_ortho_norm);
     // Fresh per-row codes `uᵢ = yᵢ·v` and the weighted line fit against them.
     let mut u = Array1::<f64>::zeros(n);
     let mut t_bar = 0.0_f64;
@@ -590,7 +612,7 @@ fn build_collapse_rescue_linear_image(
         b1,
         row_codes: Some(u),
     };
-    Some((linear, image))
+    Some((linear, image, v))
 }
 
 /// Assemble the per-atom candidate slots for [`select_hybrid_split`] from the
@@ -637,6 +659,10 @@ where
     // so the geometry/EV pairing is structured report data, not a log line.
     let mut turnings: Vec<Option<f64>> = Vec::new();
     let mut delta_evs: Vec<Option<f64>> = Vec::new();
+    // #1026 — output directions already claimed by rescued (collapsed) atoms, so each
+    // new rescue picks a DISTINCT orthogonal axis (cumulative rank-K span ≈ the linear
+    // ceiling) rather than overlapping on the dominant residual PC.
+    let mut rescue_dirs: Vec<Array1<f64>> = Vec::new();
 
     for atom_idx in eligible_d1 {
         let atom = &atoms[atom_idx];
@@ -715,8 +741,10 @@ where
                 atom_idx,
                 assign.view(),
                 target_resid.view(),
+                &rescue_dirs,
             ) {
-                Some((linear, image)) => {
+                Some((linear, image, dir)) => {
+                    rescue_dirs.push(dir);
                     slots.push(vec![linear]);
                     names.push(atom.name.clone());
                     manifolds.push(manifold);
