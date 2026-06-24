@@ -2841,6 +2841,14 @@ fn flex_bidirectional_fourth_localizer() {
                 );
             }
         }
+        for &(label, q, q_index) in &[("entry", q0v, primary.q0), ("exit", q1v, primary.q1)] {
+            let bi = bi_at(q, q_index);
+            for &(u, v) in &[(0usize, 0usize), (0, 3), (0, 6), (3, 3)] {
+                let fd = fd2(q, q_index, &|b| b.a_uv[[u, v]], 3e-3);
+                let got = bi.auvd12[[u, v]];
+                eprintln!("#1454 AUVD12CHK {label}[{u},{v}] analytic {got:+.6e} fd2 {fd:+.6e} abserr {:.3e}", (got - fd).abs());
+            }
+        }
     }
 
     let h_fd = 2e-3;
