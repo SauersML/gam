@@ -174,6 +174,20 @@ pub struct AtomLinearImage {
     pub b0: Array1<f64>,
     /// Per-output-channel slope `b₁` (length `p`).
     pub b1: Array1<f64>,
+    /// #1026 collapse-rescue per-row coordinates. `None` for the ordinary path:
+    /// the line is evaluated at the atom's OWN realized coordinate `t`. `Some(u)`
+    /// only when the atom's circle codes had collapsed to a single point
+    /// (`s_tt ≈ 0`) so its own coordinate carries no spread — then the line is fit
+    /// against, and reconstruct evaluates it at, these FRESH per-row codes `uᵢ`
+    /// (the projection of the leave-this-atom-out residual onto its top
+    /// mass-weighted output direction). This is what lets a circle atom that the
+    /// joint fit drove into the degenerate "chord-through-the-arc" fixed point
+    /// still reconstruct its residual's best linear direction — recovering the
+    /// linear-tail reach the hybrid-split was designed to deliver — instead of a
+    /// constant (its collapsed curve), which is the real-OLMo rank-1 co-collapse
+    /// (held-out EV ≈ 0.13 vs the linear ceiling ≈ 0.74). Length `n` (one per
+    /// reconstructed row); unassigned rows are gated to zero by `a_k` anyway.
+    pub row_codes: Option<Array1<f64>>,
 }
 
 impl AtomLinearImage {
@@ -182,6 +196,16 @@ impl AtomLinearImage {
         let dt = t - self.t_bar;
         for (j, slot) in out.iter_mut().enumerate() {
             *slot = self.b0[j] + dt * self.b1[j];
+        }
+    }
+
+    /// The coordinate at which row `row` should evaluate this image: the
+    /// collapse-rescue fresh code `uᵢ` when present (#1026), else the atom's own
+    /// realized coordinate `own_t` passed by the caller.
+    pub fn coordinate_for_row(&self, row: usize, own_t: f64) -> f64 {
+        match &self.row_codes {
+            Some(u) if row < u.len() => u[row],
+            _ => own_t,
         }
     }
 }
@@ -427,6 +451,148 @@ fn build_atom_candidates(
     Some((linear, curved, (t_bar, b0, b1)))
 }
 
+/// #1026 collapse rescue. When a `d = 1` atom's own coordinate has collapsed to a
+/// single point (`build_atom_candidates` refuses because `s_tt ≈ 0`), the atom is
+/// stuck in the degenerate "chord-through-the-arc" fixed point and its curved
+/// decode is a constant — the rank-1 dictionary co-collapse (real-OLMo held-out EV
+/// ≈ 0.13 vs the rank-K linear ceiling ≈ 0.74). The hybrid-split was DESIGNED to
+/// let such a linear-tail atom decode as a straight line; the only reason it can't
+/// here is that its own codes carry no spread to fit a slope against.
+///
+/// Recover FRESH per-row codes from the data instead: `uᵢ = yᵢ·v`, the projection
+/// of the leave-this-atom-out residual onto its top mass-weighted output direction
+/// `v` (the rank-1 of `Σᵢ wᵢ yᵢyᵢᵀ`, `wᵢ = a_k²` — the SAME design weight the line
+/// fit uses). These codes span the residual's strongest linear axis by
+/// construction, so the straight image `b₀ + (uᵢ − ū)·b₁` fit against them
+/// reconstructs that axis at LINEAR quality — exactly the linear-tail reach the
+/// split owes. Returns the forced-LINEAR candidate plus the image carrying `uᵢ`,
+/// or `None` when the residual itself carries no usable direction (a genuine zero
+/// atom the mass/decoder guards own).
+fn build_collapse_rescue_linear_image(
+    atom_idx: usize,
+    assign: ArrayView1<'_, f64>,
+    target_resid: ArrayView2<'_, f64>,
+) -> Option<(HybridAtomCandidate, AtomLinearImage)> {
+    let n = assign.len();
+    let p = target_resid.ncols();
+    if n < MIN_ROWS_FOR_LINEAR_FIT || target_resid.nrows() != n || p == 0 {
+        return None;
+    }
+    let mut w_sum = 0.0_f64;
+    for i in 0..n {
+        let a = assign[i];
+        if !(a.is_finite() && a >= 0.0) {
+            return None;
+        }
+        w_sum += a * a;
+    }
+    if !(w_sum > 0.0) {
+        return None;
+    }
+    // Top mass-weighted output direction `v` of the residual via power iteration on
+    // `M = Σᵢ wᵢ yᵢyᵢᵀ` (p×p, never materialized): `v ← normalize(Σᵢ wᵢ yᵢ (yᵢ·v))`.
+    // Seed from the per-channel weighted energy so a rank-1 residual converges in
+    // one step and the seed is deterministic (no RNG).
+    let mut v = Array1::<f64>::zeros(p);
+    for j in 0..p {
+        let mut e = 0.0_f64;
+        for i in 0..n {
+            let a = assign[i];
+            let y = target_resid[[i, j]];
+            e += a * a * y * y;
+        }
+        v[j] = e;
+    }
+    let mut vnorm = v.dot(&v).sqrt();
+    if !(vnorm > 0.0) {
+        return None;
+    }
+    v.mapv_inplace(|x| x / vnorm);
+    for _ in 0..32 {
+        let mut mv = Array1::<f64>::zeros(p);
+        for i in 0..n {
+            let a = assign[i];
+            let w = a * a;
+            let mut proj = 0.0_f64;
+            for j in 0..p {
+                proj += target_resid[[i, j]] * v[j];
+            }
+            let wp = w * proj;
+            for j in 0..p {
+                mv[j] += wp * target_resid[[i, j]];
+            }
+        }
+        vnorm = mv.dot(&mv).sqrt();
+        if !(vnorm > 0.0) {
+            return None;
+        }
+        mv.mapv_inplace(|x| x / vnorm);
+        let cos = mv.dot(&v).abs();
+        v = mv;
+        if cos > 1.0 - 1e-12 {
+            break;
+        }
+    }
+    // Fresh per-row codes `uᵢ = yᵢ·v` and the weighted line fit against them.
+    let mut u = Array1::<f64>::zeros(n);
+    let mut t_bar = 0.0_f64;
+    for i in 0..n {
+        let mut proj = 0.0_f64;
+        for j in 0..p {
+            proj += target_resid[[i, j]] * v[j];
+        }
+        u[i] = proj;
+        t_bar += assign[i] * assign[i] * proj;
+    }
+    t_bar /= w_sum;
+    let mut s_tt = 0.0_f64;
+    for i in 0..n {
+        let dt = u[i] - t_bar;
+        s_tt += assign[i] * assign[i] * dt * dt;
+    }
+    if !(s_tt > 1e-12 * (1.0 + t_bar * t_bar)) {
+        return None;
+    }
+    let mut b0 = Array1::<f64>::zeros(p);
+    let mut b1 = Array1::<f64>::zeros(p);
+    let mut linear_rss = 0.0_f64;
+    for j in 0..p {
+        let mut s_1y = 0.0_f64;
+        let mut s_ty = 0.0_f64;
+        for i in 0..n {
+            let a = assign[i];
+            let dt = u[i] - t_bar;
+            let y = target_resid[[i, j]];
+            s_1y += a * y;
+            s_ty += a * dt * y;
+        }
+        b0[j] = s_1y / w_sum;
+        b1[j] = s_ty / s_tt;
+    }
+    for i in 0..n {
+        let a = assign[i];
+        let dt = u[i] - t_bar;
+        for j in 0..p {
+            let r = target_resid[[i, j]] - a * (b0[j] + dt * b1[j]);
+            linear_rss += r * r;
+        }
+    }
+    let linear_log_det_h = (p as f64) * (w_sum.ln() + s_tt.ln());
+    let linear_nle = reduced_laplace_nle(0.5 * linear_rss, linear_log_det_h);
+    if !linear_nle.is_finite() {
+        return None;
+    }
+    let linear = HybridAtomCandidate::linear(linear_nle, 2 * p);
+    let image = AtomLinearImage {
+        atom_idx,
+        t_bar,
+        b0,
+        b1,
+        row_codes: Some(u),
+    };
+    Some((linear, image))
+}
+
 /// Assemble the per-atom candidate slots for [`select_hybrid_split`] from the
 /// fitted `d = 1` atoms, run the adjudication, and return the report.
 ///
@@ -506,7 +672,10 @@ where
             }
             _ => None,
         };
-        let Some((linear, curved, (t_bar, b0, b1))) = build_atom_candidates(
+        // A flat (Euclidean) chart cannot honestly present a curved candidate;
+        // the selector drops it. Present both for curveable charts.
+        let manifold = manifold_for(atom_idx);
+        match build_atom_candidates(
             coords.view(),
             assign.view(),
             decoded.view(),
@@ -514,28 +683,50 @@ where
             curved_num_params,
             curved_phi.as_ref().map(|phi| phi.view()),
             fitted_turning,
-        ) else {
-            continue;
-        };
-        // A flat (Euclidean) chart cannot honestly present a curved candidate;
-        // the selector drops it. Present both for curveable charts.
-        let manifold = manifold_for(atom_idx);
-        let slot = if manifold.is_euclidean() {
-            vec![linear]
-        } else {
-            vec![linear, curved]
-        };
-        slots.push(slot);
-        names.push(atom.name.clone());
-        manifolds.push(manifold);
-        turnings.push(fitted_turning);
-        delta_evs.push(delta_ev_for(atom_idx));
-        linear_images.push(AtomLinearImage {
-            atom_idx,
-            t_bar,
-            b0,
-            b1,
-        });
+        ) {
+            Some((linear, curved, (t_bar, b0, b1))) => {
+                let slot = if manifold.is_euclidean() {
+                    vec![linear]
+                } else {
+                    vec![linear, curved]
+                };
+                slots.push(slot);
+                names.push(atom.name.clone());
+                manifolds.push(manifold);
+                turnings.push(fitted_turning);
+                delta_evs.push(delta_ev_for(atom_idx));
+                linear_images.push(AtomLinearImage {
+                    atom_idx,
+                    t_bar,
+                    b0,
+                    b1,
+                    row_codes: None,
+                });
+            }
+            // #1026 collapse rescue: `build_atom_candidates` refused because the
+            // atom's own coordinate collapsed (`s_tt ≈ 0`) — the rank-1 co-collapse
+            // fixed point. Recover a FRESH linear image from the residual's top
+            // direction (fresh per-row codes) and force the LINEAR verdict (a
+            // single-option slot the selector must take) so the slot reconstructs
+            // its residual's best linear axis at linear quality instead of the
+            // collapsed-curve constant. `None` only when the residual itself is
+            // degenerate — then there is genuinely nothing to recover and we skip.
+            None => match build_collapse_rescue_linear_image(
+                atom_idx,
+                assign.view(),
+                target_resid.view(),
+            ) {
+                Some((linear, image)) => {
+                    slots.push(vec![linear]);
+                    names.push(atom.name.clone());
+                    manifolds.push(manifold);
+                    turnings.push(fitted_turning);
+                    delta_evs.push(delta_ev_for(atom_idx));
+                    linear_images.push(image);
+                }
+                None => continue,
+            },
+        }
     }
 
     if slots.is_empty() {

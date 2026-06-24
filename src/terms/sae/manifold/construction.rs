@@ -2308,8 +2308,8 @@ impl SaeManifoldTerm {
                     continue;
                 }
                 if let Some(image) = linear_images.get(&atom_idx) {
-                    let t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
-                    image.fill_row(t, &mut g_buf);
+                    let own_t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
+                    image.fill_row(image.coordinate_for_row(row, own_t), &mut g_buf);
                 } else {
                     self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
                 }
@@ -2379,9 +2379,10 @@ impl SaeManifoldTerm {
                 let a_k = a[atom_idx];
                 if let Some(image) = linear_images.get(&atom_idx) {
                     // Verdict-linear slot: substitute the straight sub-model image
-                    // at this row's fitted on-atom coordinate.
-                    let t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
-                    image.fill_row(t, &mut g_buf);
+                    // at this row's fitted on-atom coordinate — or, for a #1026
+                    // collapse-rescued slot, at its fresh per-row code.
+                    let own_t = self.assignment.coords[atom_idx].as_matrix()[[row, 0]];
+                    image.fill_row(image.coordinate_for_row(row, own_t), &mut g_buf);
                 } else {
                     self.atoms[atom_idx].fill_decoded_row(row, &mut g_buf);
                 }
