@@ -687,6 +687,20 @@ impl SaeManifoldOuterObjective {
             }
         };
 
+        // #1026 LINEAR-DOMINANCE FLOOR. The η=0 corrector above leaves the term at
+        // the certified Eckart-Young (PCA-ceiling) anchor — a genuine linear model
+        // (first-harmonic decoder + polar coords) whose reconstruction EV is exactly
+        // the data-achievable linear ceiling. Snapshot it NOW, before the predictor-
+        // corrector walk mutates the decoder/coords. If curvature provably cannot beat
+        // this convex linear optimum (the walk collapses below the arrival floor and
+        // the recovery Newton fit cannot clear it), we restore this anchor at the end
+        // rather than leaving a co-collapsed full-curved basin for the cascade to
+        // re-collapse — making `F_returned ≤ F_linear` an invariant of the optimizer,
+        // not just a property of the model class. This is the K≥2 co-collapse cure the
+        // relative per-atom-share floor alone cannot deliver (it only TRIGGERS recovery;
+        // it never restores the linear optimum when recovery also fails).
+        let anchor_floor_state = self.term.snapshot_mutable_state();
+
         let mut eta = 0.0_f64;
         let mut eta_step = CURVATURE_WALK_INITIAL_ETA_STEP;
         let mut eta_steps = 0usize;
@@ -1059,6 +1073,38 @@ impl SaeManifoldOuterObjective {
                     }
                 }
             }
+        }
+        // #1026 LINEAR-DOMINANCE FLOOR (final, path-independent). Whatever the walk
+        // did — early bifurcation, or arrived-but-recovery-failed — the term must not
+        // be left reconstructing BELOW the certified linear (PCA) ceiling it relaxed
+        // from. When the current state is under the (already per-atom-share-relaxed)
+        // arrival floor AND the η=0 anchor reconstructs strictly better, restore the
+        // anchor: curvature that cannot beat the convex linear optimum returns that
+        // optimum. The anchor is a real linear model (not a reconstruction-time
+        // substitution), so this generalizes to held-out data. Conservative by
+        // construction: a genuine curved arrival (EV ≥ arrival_floor, the synthetic-
+        // harmonic regime) never enters this block, so curved branches that beat
+        // linear are untouched.
+        if let Ok(cur_fit) = self.term.try_fitted_for_rho(&rho)
+            && let Some(cur_ev) =
+                reconstruction_explained_variance(self.target.view(), cur_fit.view())
+            && anchor_ev.is_finite()
+            && cur_ev < arrival_floor
+            && anchor_ev > cur_ev
+        {
+            self.term.restore_mutable_state(&anchor_floor_state);
+            self.term.set_homotopy_eta(0.0).ok();
+            self.last_loss = self.term.loss(self.target.view(), &rho).ok();
+            // The certified anchor IS the delivered fit: mark arrival and clear any
+            // mid-walk bifurcation so the outer seed loop adopts the anchor rather
+            // than resetting to the (collapse-prone) cold cascade.
+            arrived = true;
+            bifurcation = None;
+            log::info!(
+                "[#1026] linear-dominance floor: curved EV {cur_ev:.4} < arrival floor \
+                 {arrival_floor:.4}; restored certified η=0 PCA anchor (EV {anchor_ev:.4}) — \
+                 F_returned ≤ F_linear"
+            );
         }
         let collapse_events = self.term.collapse_events().len();
         self.term.set_curvature_walk_report(CurvatureWalkReport {
