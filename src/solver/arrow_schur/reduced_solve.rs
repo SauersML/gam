@@ -1234,20 +1234,39 @@ impl JacobiPreconditioner {
         // order — bit-identical run-to-run (the #1017 preconditioner gate).
         let row_into = |i: usize, row: &ArrowRowBlock, diag_part: &mut Array1<f64>| {
             let di = sys.row_dims[i];
+            // Dense-slab fast path (#1017): when the per-row cross-block is a
+            // materialized `di × k` slab (no matrix-free operator), the entire
+            // reduced-Schur diagonal contribution for this row is
+            // `Σ_c H_tβ[c,a] · ((H_tt)⁻¹ H_tβ)[c,a]`. The generic loop below
+            // re-solved `(H_tt)⁻¹` once PER COLUMN — `O(k)` block solves + `O(k)`
+            // allocations per row, i.e. `O(n·k)` tiny solves per Newton step
+            // (the dominant fixed per-solve cost at the SAE wide-border shape,
+            // k in the tens of thousands). Solve all `k` columns in ONE batched
+            // block solve instead, then take the column dots. Reassociates the
+            // diagonal within the documented #1211 preconditioner margin (same as
+            // the resident no-probe path), and the preconditioner only steers the
+            // PCG iterate, which still terminates at the PCG tolerance.
+            if sys.htbeta_matvec.is_none() && row.htbeta.dim() == (di, k) {
+                let solved = backend.solve_block_matrix(htt_factors.factor(i), row.htbeta.view());
+                for a in 0..k {
+                    let mut acc = 0.0;
+                    for c in 0..di {
+                        acc += row.htbeta[[c, a]] * solved[[c, a]];
+                    }
+                    diag_part[a] -= acc;
+                }
+                return;
+            }
+            // Matrix-free path: probe column a. `e_a` stays all-zero between
+            // columns — set the single active entry and reset it after the probe,
+            // so we never pay the `O(k)` `e_a.fill(0.0)` per column (that fill was
+            // `O(n·k²)`). `sys_htbeta_apply_row` zeroes `col_i` internally.
             let mut col_i = Array1::<f64>::zeros(di);
             let mut e_a = Array1::<f64>::zeros(k);
             for a in 0..k {
-                if sys.htbeta_matvec.is_some() || row.htbeta.dim() != (di, k) {
-                    // Kronecker / matrix-free path: probe column a.
-                    e_a.fill(0.0);
-                    e_a[a] = 1.0;
-                    col_i.fill(0.0);
-                    sys_htbeta_apply_row(sys, i, row, e_a.view(), &mut col_i);
-                } else {
-                    for c in 0..di {
-                        col_i[c] = row.htbeta[[c, a]];
-                    }
-                }
+                e_a[a] = 1.0;
+                sys_htbeta_apply_row(sys, i, row, e_a.view(), &mut col_i);
+                e_a[a] = 0.0;
                 let solved = backend.solve_block_vector(htt_factors.factor(i), col_i.view());
                 let mut acc = 0.0;
                 for c in 0..di {
