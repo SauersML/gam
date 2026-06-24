@@ -441,56 +441,15 @@ impl SaeManifoldOuterObjective {
         // state. Curvature that cannot beat the convex linear optimum returns that
         // optimum; because the anchor is a genuine linear model (not a
         // reconstruction-time substitution) the dominance holds on held-out data too.
-        // #1026 GLOBAL LINEAR-DOMINANCE FLOOR (F_returned ≤ F_linear), self-contained.
-        // The outer ρ-cascade can re-curve below the certified Eckart-Young anchor and
-        // settle the RESULT there (real OLMo K=8: EV 0.58 vs the 0.74 PCA ceiling), and
-        // the user-facing `m.reconstruct` rebuilds an OOS term that re-encodes at η=1
-        // and propagates the DECODER (not any η state). So: re-derive the anchor on a
-        // clone of the settled term via the SAME convex η=0 relaxation `solve_at_eta`
-        // uses (`set_homotopy_eta(0) + reml_criterion_with_cache`), then set η=1 — the
-        // anchor's first-harmonic decoder IS the rank-2K PCA, so at η=1 (the OOS default)
-        // the re-encode + first-harmonic decode reconstructs the PCA ceiling and
-        // GENERALIZES (a genuine linear-carrying decoder, not a reconstruction-time
-        // substitution). Adopt only when it strictly beats the returned curved EV, so
-        // genuine curved arrivals are untouched.
-        let returned_ev = fitted
-            .try_fitted_for_rho(&fitted_rho)
-            .ok()
-            .and_then(|fit| reconstruction_explained_variance(target.view(), fit.view()));
-        let mut anchor_term = fitted.clone();
-        anchor_term.set_homotopy_eta(0.0).ok();
-        let anchor_rho = fitted_rho.clone();
-        let anchor_solved = anchor_term
-            .reml_criterion_with_cache(
-                target.view(),
-                &anchor_rho,
-                registry.as_ref(),
-                inner_max_iter.max(CURVATURE_WALK_RECOVERY_INNER_ITERS),
-                learning_rate,
-                ridge_ext_coord,
-                ridge_beta,
-            )
-            .is_ok();
-        // η=1 so the OOS reconstruct (which rebuilds at η=1) honors the anchor decoder.
-        anchor_term.set_homotopy_eta(1.0).ok();
-        if anchor_solved
-            && let Some(returned_ev) = returned_ev
-            && let Ok(anchor_fit) = anchor_term.try_fitted_for_rho(&anchor_rho)
-            && let Some(anchor_ev) =
-                reconstruction_explained_variance(target.view(), anchor_fit.view())
-            && anchor_ev.is_finite()
-            && anchor_ev > returned_ev + SAE_FINAL_EV_DEGRADATION_TOL
-            && let Ok(anchor_loss) = anchor_term.loss(target.view(), &anchor_rho)
-        {
-            log::info!(
-                "[#1026] into_fitted linear-dominance floor: returned curved EV \
-                 {returned_ev:.4} < re-derived η=0 PCA anchor EV {anchor_ev:.4} (@η=1); adopting \
-                 the certified linear anchor as the final fit (F_returned ≤ F_linear)"
-            );
-            fitted = anchor_term;
-            fitted_rho = anchor_rho;
-            fitted_loss = anchor_loss;
-        }
+        // NOTE (#1026): a GLOBAL linear-dominance floor was attempted here (re-derive the
+        // η=0 PCA anchor and adopt it when the result reconstructs worse). It was
+        // REMOVED because it cannot move the user-facing metric: `m.reconstruct` rebuilds
+        // a fresh OOS term that RE-ENCODES the assignment + coordinates, so no term-state
+        // or decoder fix survives — only `hybrid_linear_images` (#1228) propagate to OOS.
+        // The robust generalizing recovery is therefore the hybrid-split rescue
+        // (collapsed atoms decode their linear image), not an η-anchor restore. Keeping
+        // the cheap SEED-level floor in the curvature walk (internal F≤F_linear) and
+        // avoiding the expensive per-fit re-derive that delivered no measured gain.
         // #1019 — the post-fit assembly seam: canonicalize every eligible
         // atom's chart to its canonical Diff(M) representative (arc length
         // for d = 1, minimum-isometry-defect flow for d = 2 torus atoms)
