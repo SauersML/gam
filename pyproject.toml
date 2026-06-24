@@ -107,6 +107,15 @@ module-name = "gamfit._rust"
 # that does ``pytest.importorskip("torch")``.
 addopts = "--import-mode=importlib"
 testpaths = ["tests"]
+# #1512: register the custom markers used to keep the full tests/ collection
+# green in CI. `slow` flags tests whose wall-clock is too long for the standard
+# Python-API CI runner (CI runs `-m "not slow"`); they are still collected and
+# run by a bare `pytest tests/` locally. xfailing a test still keeps it
+# collected (an XPASS/XFAIL never reddens the suite), so no marker-based
+# deselection is needed for the documented-open-bug repros.
+markers = [
+  "slow: test is too slow for the default CI Python-API job (run explicitly or locally)",
+]
 
 [tool.mypy]
 python_version = "3.10"

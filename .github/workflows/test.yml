@@ -598,17 +598,39 @@ jobs:
             tests/bench_large_scale_runner_test.py \
             -v --tb=short
 
+      - name: Guard against orphaned Python tests (#1512)
+        # #1512 anti-regression (HARD gate, pure-Python — no Rust extension
+        # needed). The directory-level full-suite step below is what keeps every
+        # tests/test_*.py collected by CI; this meta-test fails if that catch-all
+        # step is ever removed and CI reverts to naming individual files (which
+        # is exactly how 161/166 test files became silent orphans). Running it as
+        # its own hard-gated step means a future workflow regression is caught
+        # with a named-file error instead of silently re-orphaning the suite.
+        run: |
+          python -m pytest tests/test_ci_no_orphan_python_tests_1512.py -v --tb=short
+
       - name: Run full Python test suite (all test_*.py in tests/)
         # #1512: testpaths=["tests"] means a bare `pytest` collects everything,
-        # but CI only named ~5 files explicitly. This step runs the FULL suite
-        # so orphaned test_bug_hunt_*.py contract repros execute in CI. It is
-        # `continue-on-error` initially — some test_bug_hunt_* files may fail
-        # (documenting still-open bugs); those should be triaged to
-        # @pytest.mark.xfail rather than allowed to stay orphaned. Once the
-        # known failures are triaged, flip this to a hard gate.
+        # but CI only named ~5 files explicitly, so 161/166 tests/test_*.py ran
+        # in NO job. This DIRECTORY-LEVEL step runs the whole suite so every
+        # current AND future test_*.py is collected automatically — no per-file
+        # workflow line to hand-add. `-m "not slow"` drops the files tagged
+        # @pytest.mark.slow (registered in pyproject.toml) so the long-running
+        # repros do not blow the standard runner's budget; everything else,
+        # including the @pytest.mark.xfail open-bug repros, still runs (an
+        # XFAIL/XPASS never reddens the suite).
+        #
+        # Still `continue-on-error: true`: the wheel build (build.rs human-author
+        # gate, #1458) could not be exercised in the triage environment, so the
+        # full green/red status of the gamfit-dependent suite was not verified
+        # end-to-end here. Keeping the step soft preserves the #1512 win (the
+        # orphaned repros now RUN and are visible in the job log) without risking
+        # a red gate on tests that were never confirmed green. Flip to a hard gate
+        # once a wheel-backed run confirms the `-m "not slow"` subset is green.
         continue-on-error: true
         run: |
           python -m pytest tests/ \
+            -m "not slow" \
             --continue-on-collection-errors \
             -v --tb=short -q
 
