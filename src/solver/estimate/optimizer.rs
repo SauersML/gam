@@ -295,6 +295,10 @@ where
     }
 
     let p = x.ncols();
+    // Raw design row count, captured before `x` is moved (line ~339); used by the
+    // #1266 null-space shrink-out escape's `n ≥ 2·p` determinacy gate, which must
+    // match `relax_smoothing_rho_prior`'s well-determined gate exactly.
+    let n_design_rows = x.nrows();
     validate_penalty_specs(&s_list, p, "optimize_external_design")?;
     let (canonical, active_nullspace_dims) = crate::construction::canonicalize_penalty_specs(
         &s_list,
@@ -1062,6 +1066,178 @@ where
                         // The improvement did not survive a cold re-score — it was
                         // a warm-start artifact. Keep the certified ρ and restore
                         // its inner state for downstream assembly.
+                        reml_state.reset_outer_seed_state();
+                        reml_state.compute_cost(&strategy_result.rho)?;
+                    }
+                }
+            }
+        }
+        // #1266 NULL-SPACE SHRINK-OUT ESCAPE (pure-REML; the OUTWARD-direction
+        // dual of the #1074 inward escape above).
+        //
+        // A default double-penalty smooth (mgcv `select = TRUE`) carries a
+        // `DoublePenaltyNullspace` shrinkage ridge on the term's penalty null
+        // space ({1, x} for a 1-D bend) whose only job is SELECTION: drive its
+        // λ_null UP to shrink an UNSUPPORTED term's constant+linear component out
+        // (EDF → 0). On a well-determined Gaussian fit the relaxed ρ-prior places
+        // a WIDE, symmetric `Normal(0, sd=15)` on that coordinate — NOT as a
+        // selection criterion but purely as a degeneracy-breaker: the #1476
+        // concurvity flat-ridge needs strictly-positive outer curvature to
+        // certify an interior allocation. That symmetric prior's `ρ/sd²` gradient
+        // also OPPOSES the (genuinely shallow) REML shrink-out tail, so the outer
+        // optimizer certifies a stationary point at a MODERATE λ_null
+        // (ρ_null ≈ 3.5, EDF ≈ 1.6) instead of following pure REML to the
+        // shrink-out corner — the residual #1266 "Half B" contract violation. The
+        // prior cannot be made one-sided: its high-ρ curvature is exactly what
+        // stops a SUPPORTED concurvity null space from railing out (#1476), so a
+        // data-INDEPENDENT prior cannot separate "shrink the unsupported term"
+        // (#1266) from "keep the supported one" (#1476/#1371) — they overlap in ρ.
+        //
+        // The data-DEPENDENT discriminator is pure data-REML. For each
+        // well-determined null-space selection coordinate, line-search the
+        // OVER-SMOOTHING (high-ρ) direction on the PURE REML cost
+        // (`compute_cost − configured_ρ_prior`; the prior is a conditioning
+        // device, not a selection criterion) and adopt the strictly-best
+        // COLD-confirmed point:
+        //   * UNSUPPORTED null space (#1266 `s(z)`): pure REML descends toward
+        //     shrink-out → the escape fires, EDF → 0.
+        //   * SUPPORTED null space (#1371 genuine slope; #1476 concurvity): pure
+        //     REML strictly RISES under over-smoothing — killing a real linear
+        //     trend dumps its variance into σ̂², and moving one concurvity
+        //     coordinate alone off the joint transfer-ridge raises the residual —
+        //     so there is no strict improvement and the escape is an exact no-op,
+        //     leaving the supported signal untouched.
+        //
+        // Unlike #1074 (where the OPTIMIZER's bound projection masks the descent),
+        // here it is the PRIOR that masks it, so the search runs on the pure
+        // (prior-stripped) criterion. SCOPE: eligible coordinates are exactly the
+        // well-determined relaxed null-space degeneracy coordinates
+        // (`is_nullspace_degeneracy_prior`, gated by `n ≥ 2·p`). This deliberately
+        // EXCLUDES the under-determined regime (`n < 2·p`, #1392 wine `p > n`),
+        // where the null-space prior is the AGGRESSIVE PC select-out — a
+        // deliberate, load-bearing selection push onto a genuinely-flat REML
+        // score that stripping would undo.
+        {
+            let well_determined = n_design_rows >= 2 * p;
+            let select_coords: Vec<usize> = if well_determined {
+                match reml_state.effective_rho_prior().as_ref() {
+                    crate::types::RhoPrior::Independent(per_coord) => (0..strategy_result
+                        .rho
+                        .len())
+                        .filter(|&i| {
+                            per_coord.get(i).is_some_and(
+                                crate::terms::smooth::is_nullspace_degeneracy_prior,
+                            )
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            // Authoritative pure-REML baseline at the converged ρ: the optimizer's
+            // own `final_value` (immune to warm-start pollution, the #1371 lesson)
+            // minus the configured ρ-prior + soft λ→0 guard it carried. A probe
+            // wins only if it strictly beats THIS pure cost.
+            let conv_prior = reml_state
+                .configured_rho_prior_atom(&strategy_result.rho)
+                .cost()
+                + reml_state
+                    .soft_rho_guard_prior_atom(&strategy_result.rho)
+                    .cost();
+            let base_pure = strategy_result.final_value - conv_prior;
+            if !select_coords.is_empty() && base_pure.is_finite() && conv_prior.is_finite() {
+                // Pure data-REML at ρ: penalized `compute_cost` minus the configured
+                // ρ-prior and the soft λ→0 guard (both `O(K)` functions of ρ alone).
+                // Subtracting them recovers the mgcv-parity criterion selection
+                // must follow; the prior bias on λ_null is removed exactly.
+                let pure_reml = |rho: &Array1<f64>| -> Option<f64> {
+                    let c = reml_state.compute_cost(rho).ok()?;
+                    if !c.is_finite() {
+                        return None;
+                    }
+                    let prior = reml_state.configured_rho_prior_atom(rho).cost()
+                        + reml_state.soft_rho_guard_prior_atom(rho).cost();
+                    if !prior.is_finite() {
+                        return None;
+                    }
+                    Some(c - prior)
+                };
+                // Ascending over-smoothing grid in ABSOLUTE ρ (toward the
+                // shrink-out rail at `RHO_BOUND`); only values strictly above a
+                // coordinate's current ρ are over-smoothing candidates. Bounded:
+                // at most 2 · |select| · 6 inner solves, and only fires when a
+                // null-space coordinate is actually held below the rail.
+                let rho_upper = crate::estimate::RHO_BOUND;
+                const OUTWARD_GRID: [f64; 6] = [6.0, 9.0, 12.0, 18.0, 24.0, 30.0];
+                let mut best_rho = strategy_result.rho.clone();
+                let mut best_pure = base_pure;
+                let mut improved = false;
+                for _pass in 0..2 {
+                    let mut pass_improved = false;
+                    for &coord in &select_coords {
+                        let mut local_best = best_rho.clone();
+                        let mut local_pure = best_pure;
+                        for &cand in &OUTWARD_GRID {
+                            let target = cand.min(rho_upper);
+                            if target <= best_rho[coord] + 1e-9 {
+                                continue;
+                            }
+                            let mut probe = best_rho.clone();
+                            probe[coord] = target;
+                            if let Some(c) = pure_reml(&probe)
+                                && c < local_pure - 1e-6 * (1.0 + local_pure.abs())
+                            {
+                                local_pure = c;
+                                local_best = probe;
+                            }
+                        }
+                        if local_pure < best_pure - 1e-6 * (1.0 + best_pure.abs()) {
+                            best_rho = local_best;
+                            best_pure = local_pure;
+                            improved = true;
+                            pass_improved = true;
+                        }
+                    }
+                    if !pass_improved {
+                        break;
+                    }
+                }
+                if improved {
+                    // COLD confirmation (mirror of #1074): the warm grid probes
+                    // ran off each other's inner warm starts and can report a
+                    // spuriously-low cost. Clear the inner cache and re-score the
+                    // candidate cold; adopt only if its PURE REML STILL strictly
+                    // beats the authoritative converged baseline.
+                    reml_state.reset_outer_seed_state();
+                    let cold_penalized = reml_state.compute_cost(&best_rho);
+                    let cold_pure = cold_penalized.as_ref().ok().and_then(|&c| {
+                        c.is_finite().then(|| {
+                            c - reml_state.configured_rho_prior_atom(&best_rho).cost()
+                                - reml_state.soft_rho_guard_prior_atom(&best_rho).cost()
+                        })
+                    });
+                    if let (Ok(penalized), Some(cold_pure)) = (cold_penalized, cold_pure)
+                        && cold_pure.is_finite()
+                        && cold_pure < base_pure - 1e-6 * (1.0 + base_pure.abs())
+                    {
+                        // β̂ already installed at `best_rho` by the cold eval above.
+                        // Report the PENALIZED cost there as the objective so the
+                        // cached inner state and `final_value` agree with the
+                        // adopted ρ for the downstream cap-guard / assembly.
+                        log::info!(
+                            "[OUTER] #1266 null-space shrink-out escape: pure REML \
+                             {base_pure:.6e} → {cold_pure:.6e} (cold-confirmed) by \
+                             over-smoothing {} selection coord(s); adopting the \
+                             shrink-out ρ (penalized cost {penalized:.6e})",
+                            select_coords.len()
+                        );
+                        strategy_result.rho = best_rho;
+                        strategy_result.final_value = penalized;
+                    } else {
+                        // The improvement did not survive a cold re-score (or the
+                        // re-score failed) — a warm-start artifact. Keep the
+                        // certified ρ and restore its inner state.
                         reml_state.reset_outer_seed_state();
                         reml_state.compute_cost(&strategy_result.rho)?;
                     }

@@ -4643,6 +4643,37 @@ const RELAX_UNDERDETERMINED_RHO_SD: f64 = 15.0;
 /// ±2σ spans the feasible ρ range (`|ρ| ≤ 30`).
 const NULLSPACE_WELLDET_DEGENERACY_RHO_SD: f64 = 15.0;
 
+/// True iff `prior` is the well-determined double-penalty null-space *degeneracy*
+/// prior that [`relax_smoothing_rho_prior`] places on a `DoublePenaltyNullspace`
+/// selection coordinate in the well-determined regime — the wide, symmetric
+/// `Normal(0, NULLSPACE_WELLDET_DEGENERACY_RHO_SD)` whose ONLY job is to break
+/// the #1476 concurvity flat-ridge degeneracy with strictly-positive curvature,
+/// NOT to bias selection.
+///
+/// The post-convergence #1266 null-space shrink-out escape in the outer
+/// optimizer ([`crate::solver::estimate::optimizer`]) keys on this predicate to
+/// recognise EXACTLY those coordinates: their symmetric conditioning prior also
+/// (wrongly) opposes the genuine REML shrink-out tail of an *unsupported* term,
+/// so the optimizer's converged λ_null must be re-selected by pure data-REML.
+/// The recognizer lives next to the prior's construction so the two cannot drift
+/// apart; the Half B regression gate
+/// (`default_double_penalty_shrinks_irrelevant_covariate_edf_below_one`) is the
+/// backstop that catches any drift.
+///
+/// In the well-determined relaxed `Independent` prior this `Normal(0, sd=15)`
+/// signature is UNIQUE to the null-space coordinate: the relaxed bending
+/// coordinate is `Flat`, non-relaxable coordinates keep the tighter base
+/// `Normal(0, 3)`, and the under-determined bending `Normal(0, 15)` is excluded
+/// by the optimizer's own `n ≥ 2·p` determinacy gate before this predicate is
+/// consulted.
+pub(crate) fn is_nullspace_degeneracy_prior(prior: &crate::types::RhoPrior) -> bool {
+    matches!(
+        prior,
+        crate::types::RhoPrior::Normal { mean, sd }
+            if *mean == 0.0 && *sd == NULLSPACE_WELLDET_DEGENERACY_RHO_SD
+    )
+}
+
 /// Distance-scale bound `upper` (`P(d > upper) = tail_prob` on the marginal-SD
 /// scale `d = exp(-ρ/2)`) of the penalized-complexity prior placed on a
 /// relaxable smooth's `DoublePenaltyNullspace` selection coordinate when the fit
