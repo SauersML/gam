@@ -276,7 +276,6 @@ pub(crate) struct SurvivalFlexTimepointExact {
     pub(crate) chi_uv: Array2<f64>,
     pub(crate) d_u: Array1<f64>,
     pub(crate) d_uv: Array2<f64>,
-    pub(crate) a_uv: Array2<f64>,
 }
 
 pub(crate) struct SurvivalFlexTimepointFirstOrderExact {
@@ -305,7 +304,6 @@ pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {
     pub(crate) eta_uv_uv: Array2<f64>,
     pub(crate) chi_uv_uv: Array2<f64>,
     pub(crate) d_uv_uv: Array2<f64>,
-    pub(crate) auvd12: Array2<f64>,
 }
 
 #[derive(Clone)]
