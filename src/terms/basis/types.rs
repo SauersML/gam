@@ -1661,7 +1661,7 @@ impl Clone for KroneckerFactoredBasis {
             invariant: match self.invariant.get() {
                 Some(s) => {
                     let cell = std::sync::OnceLock::new();
-                    let _ = cell.set(std::sync::Arc::clone(s));
+                    cell.get_or_init(|| std::sync::Arc::clone(s));
                     cell
                 }
                 None => std::sync::OnceLock::new(),
@@ -1705,9 +1705,10 @@ impl KroneckerFactoredBasis {
         if let Some(s) = self.invariant.get() {
             return Ok(std::sync::Arc::clone(s));
         }
-        // Compute outside the cell (fallible) and try to install. A concurrent
-        // racer may win `set`; either way the stored value is the unique
-        // function of the fixed marginal data, so we return whichever landed.
+        // Compute outside the cell (fallible) and install via `get_or_init`. If a
+        // concurrent racer already won, `get_or_init` drops our `computed` and
+        // returns the stored one; either way the value is the unique function of
+        // the fixed marginal data, so the returned Arc is correct.
         let computed = std::sync::Arc::new(
             crate::construction::KroneckerInvariantStructure::compute(
                 &self.marginal_designs,
@@ -1715,12 +1716,8 @@ impl KroneckerFactoredBasis {
                 &self.marginal_dims,
             )?,
         );
-        let _ = self.invariant.set(std::sync::Arc::clone(&computed));
-        Ok(self
-            .invariant
-            .get()
-            .map(std::sync::Arc::clone)
-            .unwrap_or(computed))
+        let installed = self.invariant.get_or_init(|| computed);
+        Ok(std::sync::Arc::clone(installed))
     }
 }
 
