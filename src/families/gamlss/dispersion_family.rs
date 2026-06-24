@@ -223,7 +223,6 @@ fn dispersion_gamma_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
     nu_value: f64,
     wi: f64,
 ) -> S {
-    let _ = yi;
     let mu = S::variable(mu_value, 0);
     let nu = S::variable(nu_value, 1);
     // nu*nu.ln() - nu*mu.ln() - nu.ln_gamma() + (nu-1)*y_pos.ln() - nu*(mu.recip()*yi)
@@ -364,18 +363,25 @@ pub(crate) fn dispersion_tweedie_nll_order2(
 }
 
 /// Dense `Tower4<2>` Tweedie row NLL: the #932 oracle for
-/// [`dispersion_tweedie_nll_order2`].
-#[inline]
-pub(crate) fn dispersion_tweedie_nll_tower(
-    yi: f64,
-    eta_mu: f64,
-    eta_d: f64,
-    p: f64,
-    wi: f64,
-) -> crate::families::jet_tower::Tower4<2> {
-    dispersion_tweedie_nll_generic::<crate::families::jet_tower::Tower4<2>>(
-        yi, eta_mu, eta_d, p, wi,
-    )
+/// [`dispersion_tweedie_nll_order2`]. Test-only — production runs the packed
+/// `dispersion_tweedie_nll_order2`, which is its sole consumer-of-record; this
+/// dense Tower4 instantiation exists purely to pin that path bit-identical in
+/// the tests, so it lives in a `#[cfg(test)]` module (it has no production
+/// caller, and the dense Tower4 is exactly what #932 removed from the hot path).
+#[cfg(test)]
+pub(crate) mod tweedie_oracle_tests {
+    #[inline]
+    pub(crate) fn dispersion_tweedie_nll_tower(
+        yi: f64,
+        eta_mu: f64,
+        eta_d: f64,
+        p: f64,
+        wi: f64,
+    ) -> crate::families::jet_tower::Tower4<2> {
+        super::dispersion_tweedie_nll_generic::<crate::families::jet_tower::Tower4<2>>(
+            yi, eta_mu, eta_d, p, wi,
+        )
+    }
 }
 
 #[inline]

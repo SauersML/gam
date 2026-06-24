@@ -13,9 +13,9 @@ use super::binomial_q_derivs::{
     binomial_neglog_q_fourth_derivative_logit_closed_form,
     binomial_neglog_q_fourth_derivative_probit_closed_form,
 };
+use super::dispersion_family::tweedie_oracle_tests::dispersion_tweedie_nll_tower;
 use super::dispersion_family::{
     DISPERSION_ETA_CLAMP, DISPERSION_MIN_CURVATURE, DispersionRowKernel, dispersion_row_kernel,
-    dispersion_tweedie_nll_tower,
 };
 use crate::basis::{
     CenterStrategy, Dense, KnotSource, MaternBasisSpec, MaternIdentifiability, MaternNu,
@@ -416,8 +416,7 @@ pub(crate) fn binomial_location_scale_joint_hessian_matches_single_sourced_tower
                 let ca = block_of(a_coef);
                 for b_coef in 0..total {
                     let cb = block_of(b_coef);
-                    h_tower[[a_coef, b_coef]] +=
-                        tower.h[ca][cb] * row[a_coef] * row[b_coef];
+                    h_tower[[a_coef, b_coef]] += tower.h[ca][cb] * row[a_coef] * row[b_coef];
                 }
             }
         }
@@ -8612,7 +8611,7 @@ pub(crate) fn binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_
             // axis 2 is reserved for the per-column wiggle amplitude.
             let eta_t_t = Tower2::<3>::variable(eta_t[i], 0);
             let eta_ls_t = Tower2::<3>::variable(eta_ls[i], 1);
-            
+
             let q0_tower = (eta_t_t * -1.0) * (eta_ls_t * -1.0).exp();
 
             for j in 0..pw {
@@ -8623,8 +8622,7 @@ pub(crate) fn binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_
                     } else {
                         Tower2::<3>::constant(betaw[k])
                     };
-                    let basis_k =
-                        q0_tower.compose_unary([b0[[i, k]], d0[[i, k]], dd0[[i, k]]]);
+                    let basis_k = q0_tower.compose_unary([b0[[i, k]], d0[[i, k]], dd0[[i, k]]]);
                     q = q + coef * basis_k;
                 }
                 let nll = q.compose_unary([0.0, m1, m2]);
