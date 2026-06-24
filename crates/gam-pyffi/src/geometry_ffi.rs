@@ -12,6 +12,16 @@ fn poincare_distance<'py>(
     })
 }
 
+/// #1026/#1522 — set the process-global SAE anti-collapse barrier overrides so a
+/// SINGLE compiled wheel can sweep the (μ_amp × μ_sep × gate) response surface
+/// without recompiling gam per config. `amp_strength`/`sep_strength` are NaN to
+/// restore the compiled default; `gate_mode`: 0 = decoder-norm (default), 1 =
+/// legacy assignment-energy gate, 2 = unconditional.
+#[pyfunction(signature = (amp_strength = f64::NAN, sep_strength = f64::NAN, gate_mode = 0))]
+fn sae_set_barrier_overrides(amp_strength: f64, sep_strength: f64, gate_mode: u8) {
+    gam::terms::sae::manifold::set_sae_barrier_overrides(amp_strength, sep_strength, gate_mode);
+}
+
 #[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
 fn sae_select_k(
     py: Python<'_>,
@@ -4156,6 +4166,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_rho_so3, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_rho_so3_jvp, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_set_barrier_overrides, module)?)?;
     module.add_function(wrap_pyfunction!(sae_select_k, module)?)?;
     module.add_function(wrap_pyfunction!(sae_auto_k_recommendation, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;

@@ -272,7 +272,19 @@ def main() -> None:
         help="held-out EV of the official Qwen W32K linear-SAE reference from figH",
     )
     ap.add_argument("--out", help="optional JSON file for the measured table")
+    # #1026/#1522 anti-collapse barrier overrides (one wheel sweeps many configs;
+    # NaN strength = compiled default). gate_mode: 0=decoder-norm, 1=legacy
+    # assignment-energy, 2=unconditional.
+    ap.add_argument("--amp-mu", type=float, default=float("nan"))
+    ap.add_argument("--sep-mu", type=float, default=float("nan"))
+    ap.add_argument("--gate-mode", type=int, default=0)
     args = ap.parse_args()
+
+    import math
+    if (not math.isnan(args.amp_mu)) or (not math.isnan(args.sep_mu)) or args.gate_mode != 0:
+        from gamfit import sae_set_barrier_overrides
+        sae_set_barrier_overrides(args.amp_mu, args.sep_mu, args.gate_mode)
+        print(f"[barrier] amp_mu={args.amp_mu} sep_mu={args.sep_mu} gate_mode={args.gate_mode}", flush=True)
 
     x = _load_activations(args)
     rng = np.random.default_rng(args.seed)

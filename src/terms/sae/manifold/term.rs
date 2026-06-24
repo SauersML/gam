@@ -227,6 +227,61 @@ pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 /// force vanishes with the norm). Small fixed weight to start; annealed later.
 pub(crate) const SAE_AMPLITUDE_BARRIER_STRENGTH: f64 = 100.0;
 
+// #1026/#1522 — RUNTIME barrier-tuning overrides. The strengths and the
+// active-atom GATE MODE are read through the accessors below instead of the
+// raw consts so a SINGLE compiled wheel can sweep the entire
+// (μ_amp × μ_sep × gate) response surface from Python (`set_sae_barrier_overrides`),
+// rather than recompiling the (one-rustc-invocation) gam crate per constant.
+// A quiet-NaN sentinel means "unset → use the compiled default const", so 0.0
+// remains a legitimate swept value (barrier fully disabled). With no override
+// set, the accessor returns exactly the const, so behaviour is unchanged.
+static SAE_AMP_STRENGTH_OVERRIDE_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x7ff8_0000_0000_0000);
+static SAE_SEP_STRENGTH_OVERRIDE_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x7ff8_0000_0000_0000);
+/// Active-atom gate mode for the amplitude barrier: 0 = decoder-norm (the
+/// correct default — hold up every live decoder), 1 = legacy assignment-energy
+/// gate (drains during co-collapse; kept only to A/B the regression), 2 =
+/// unconditional (every dictionary slot). Sweepable to attribute the OLMo
+/// co-collapse to amplitude vs collinear (separation) failure in one build.
+static SAE_BARRIER_GATE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub(crate) fn sae_amplitude_barrier_strength() -> f64 {
+    let v =
+        f64::from_bits(SAE_AMP_STRENGTH_OVERRIDE_BITS.load(std::sync::atomic::Ordering::Relaxed));
+    if v.is_nan() {
+        SAE_AMPLITUDE_BARRIER_STRENGTH
+    } else {
+        v
+    }
+}
+
+pub(crate) fn sae_separation_barrier_strength() -> f64 {
+    let v =
+        f64::from_bits(SAE_SEP_STRENGTH_OVERRIDE_BITS.load(std::sync::atomic::Ordering::Relaxed));
+    if v.is_nan() {
+        SAE_SEPARATION_BARRIER_STRENGTH
+    } else {
+        v
+    }
+}
+
+pub(crate) fn sae_barrier_gate_mode() -> u8 {
+    SAE_BARRIER_GATE_MODE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set the process-global SAE-barrier tuning overrides (one wheel, many configs).
+/// `amp_strength`/`sep_strength` are NaN to clear an override back to the compiled
+/// default; `gate_mode` selects the amplitude active-atom gate (see
+/// [`SAE_BARRIER_GATE_MODE`]). Called from the gamfit Python FFI sweep driver.
+pub fn set_sae_barrier_overrides(amp_strength: f64, sep_strength: f64, gate_mode: u8) {
+    SAE_AMP_STRENGTH_OVERRIDE_BITS
+        .store(amp_strength.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    SAE_SEP_STRENGTH_OVERRIDE_BITS
+        .store(sep_strength.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    SAE_BARRIER_GATE_MODE.store(gate_mode, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// #1026/#1522 AMPLITUDE barrier softening `ε` (added inside `log(s_k²+ε)` and in
 /// every denominator). Keeps the barrier finite and the PSD majorizer bounded at
 /// an exactly-zero decoder, while remaining negligible against a healthy

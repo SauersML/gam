@@ -249,7 +249,7 @@ impl SaeManifoldTerm {
     /// collapse boundary. "Active" = atoms whose assignment column carries any
     /// mass (a structurally-dead atom is not held up by the barrier). 0 for `K<1`.
     pub(crate) fn amplitude_barrier_value(&self, penalty_scale: f64) -> f64 {
-        let mu = penalty_scale * SAE_AMPLITUDE_BARRIER_STRENGTH;
+        let mu = penalty_scale * sae_amplitude_barrier_strength();
         if mu == 0.0 {
             return 0.0;
         }
@@ -271,7 +271,7 @@ impl SaeManifoldTerm {
     /// shapes. Diverges as two coactive atoms align (`c_jk² → 1`); exactly 0 when
     /// their shapes are orthogonal. 0 for `K<2`.
     pub(crate) fn separation_barrier_value(&self, penalty_scale: f64) -> f64 {
-        let mu = penalty_scale * SAE_SEPARATION_BARRIER_STRENGTH;
+        let mu = penalty_scale * sae_separation_barrier_strength();
         if mu == 0.0 {
             return 0.0;
         }
@@ -338,14 +338,39 @@ impl SaeManifoldTerm {
     /// floor, so the hold-up force is live for every real atom independent of how
     /// the (separately collapsing) assignment routes mass.
     fn barrier_active_atoms(&self) -> Vec<bool> {
-        let floor2 = SAE_BARRIER_ACTIVE_NORM_FLOOR * SAE_BARRIER_ACTIVE_NORM_FLOOR;
-        self.atoms
-            .iter()
-            .map(|atom| {
-                let s2: f64 = atom.decoder_coefficients.iter().map(|v| v * v).sum();
-                s2 > floor2
-            })
-            .collect()
+        let k_atoms = self.k_atoms();
+        match sae_barrier_gate_mode() {
+            // Legacy assignment-energy gate (drains during co-collapse). Kept
+            // ONLY so a sweep can A/B it against the decoder-norm default.
+            1 => {
+                let gates = self.assignment.assignments();
+                let n = gates.nrows();
+                (0..k_atoms)
+                    .map(|k| {
+                        let mut e = 0.0_f64;
+                        for row in 0..n {
+                            let a = gates[[row, k]];
+                            e += a * a;
+                        }
+                        e > 0.0
+                    })
+                    .collect()
+            }
+            // Unconditional: every live dictionary slot.
+            2 => vec![true; k_atoms],
+            // Default (0): decoder-norm gate — hold up every atom whose decoder
+            // carries norm above the active floor, independent of assignment.
+            _ => {
+                let floor2 = SAE_BARRIER_ACTIVE_NORM_FLOOR * SAE_BARRIER_ACTIVE_NORM_FLOOR;
+                self.atoms
+                    .iter()
+                    .map(|atom| {
+                        let s2: f64 = atom.decoder_coefficients.iter().map(|v| v * v).sum();
+                        s2 > floor2
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// #1026/#1522 — accumulate the AMPLITUDE barrier's analytic gradient into
@@ -367,7 +392,7 @@ impl SaeManifoldTerm {
         penalty_scale: f64,
         dense_beta_curvature: bool,
     ) -> bool {
-        let mu = penalty_scale * SAE_AMPLITUDE_BARRIER_STRENGTH;
+        let mu = penalty_scale * sae_amplitude_barrier_strength();
         if mu == 0.0 {
             return false;
         }
@@ -439,7 +464,7 @@ impl SaeManifoldTerm {
         penalty_scale: f64,
         dense_beta_curvature: bool,
     ) -> bool {
-        let mu = penalty_scale * SAE_SEPARATION_BARRIER_STRENGTH;
+        let mu = penalty_scale * sae_separation_barrier_strength();
         if mu == 0.0 {
             return false;
         }
