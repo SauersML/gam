@@ -1693,7 +1693,20 @@ impl TermCollectionSpec {
                     }
                     if !matches!(
                         spec.marginal.knotspec,
-                        BSplineKnotSpec::Provided(_) | BSplineKnotSpec::PeriodicUniform { .. }
+                        BSplineKnotSpec::Provided(_)
+                            | BSplineKnotSpec::PeriodicUniform { .. }
+                            // mgcv's `bs="sz"` default marginal is a cubic
+                            // regression spline (#1074), and the freeze step
+                            // restores it as a `NaturalCubicRegression` knotspec
+                            // carrying its `k` value-knots (spatial_optimization.rs
+                            // `marginal_is_cr` branch) — the SAME treatment the
+                            // tensor margin already gets in the arm below. Without
+                            // this variant a frozen `sz` factor smooth fails its own
+                            // predict-time freeze check ("factor-smooth marginal
+                            // knots missing") even though its knots are fully
+                            // materialized; the validation simply was not updated
+                            // when the cr marginal landed.
+                            | BSplineKnotSpec::NaturalCubicRegression { .. }
                     ) {
                         return Err(format!(
                             "{label} term '{}' is not frozen: factor-smooth marginal knots missing",
