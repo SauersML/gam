@@ -102,7 +102,20 @@ impl SaeManifoldTerm {
                     t * t * (3.0 - 2.0 * t)
                 };
                 if gate_value > 0.0 {
-                    let w = SAE_DECODER_REPULSION_STRENGTH * gate_value;
+                    // #1522 — scale the repulsion by `n_obs`. The reconstruction loss
+                    // it must counter is a SUM over all `n` rows (`Σ_i ‖z_i − ẑ_i‖²`),
+                    // whose gradient on a decoder block scales with `n`, while this
+                    // repulsion is ONE global penalty. A fixed strength is therefore
+                    // ~n× too weak — on real OLMo (`n≈508`) the absolute strength
+                    // `1e-3` is ~5 orders of magnitude below the reconstruction
+                    // gradient, so the joint Newton refit always wins and re-aligns
+                    // every decoder onto the dominant PC (the rank-1 co-collapse:
+                    // EV≈0.13 vs the rank-K linear ceiling ≈0.74). Multiplying by `n`
+                    // makes the per-pair penalty COMMENSURATE with the reconstruction
+                    // pull at any dataset size, so the inner fit can no longer
+                    // symmetrise a diversely-seeded dictionary back into one basin.
+                    let n_scale = self.n_obs().max(1) as f64;
+                    let w = SAE_DECODER_REPULSION_STRENGTH * n_scale * gate_value;
                     gate[[j, k]] = w;
                     gate[[k, j]] = w;
                     any_active = true;
