@@ -18,7 +18,7 @@
 //! * `hessian_coeff` (`H_ab`, order 2) is the **hot inner-Newton** path and is
 //!   kept as the hand-tuned closed form `m2·q_a q_b + m1·q_ab` — the cheapest
 //!   possible spelling, evaluated once per row per inner iterate. It is pinned
-//!   bit-for-bit against the `Tower2` composition in the oracle test below.
+//!   bit-for-bit against the `Tower2` composition in the oracle_tests test below.
 //! * `directionalhessian_coeff` (`D_u H_ab`, order 3) and
 //!   `second_directionalhessian_coeff` (`D²_{uv} H_ab`, order 4) are the
 //!   **outer-loop cross-block** chains — the exact #736/#947/#948 bug genus
@@ -31,7 +31,7 @@
 //!   walker, not by hand, so no cross term can be silently dropped.
 //!
 //! The pre-migration hand formulas are retained verbatim as the bit-identity
-//! oracle (`mod oracle`) the new tower path is pinned against (the
+//! oracle (`mod oracle_tests`) the new tower path is pinned against (the
 //! `verify_kernel_channels` discipline — the hand calculus is the witness, the
 //! tower is the single source of truth).
 
@@ -57,7 +57,7 @@ pub(crate) fn hessian_coeff_fromobjective_q_terms(
     //
     // Hot inner-Newton path: kept as the hand-tuned closed form. The
     // `Tower2<2>` composition `compose([·, m1, m2]).h[a][b]` produces the exact
-    // same value (pinned in `oracle::hessian_matches_tower`); the hand spelling
+    // same value (pinned in `oracle_tests::hessian_matches_tower`); the hand spelling
     // avoids building a 2-variable tower per row per inner iterate.
     m2 * q_a * q_b + m1 * q_ab
 }
@@ -123,7 +123,7 @@ pub(crate) fn second_directionalhessian_coeff_fromobjective_q_terms(
     // 15 mixed partials over every sub-block of {a, b, u, v}, compose with the
     // F-stack `[·, m1, m2, m3, m4]`, and read `t4[a][b][u][v]`.
     //
-    // This is exactly the hand expansion in `oracle::second_directional_hand`
+    // This is exactly the hand expansion in `oracle_tests::second_directional_hand`
     // (the single `dq_u·dqv·q_ab` term the old hand path once double-counted,
     // every `m2`/`m3` cross term, …) but produced by the partition walker —
     // there is no hand-maintained channel left to drop or mis-weight.
@@ -151,7 +151,7 @@ pub(crate) fn second_directionalhessian_coeff_fromobjective_q_terms(
 }
 
 #[cfg(test)]
-mod oracle {
+mod oracle_tests {
     //! Pre-migration hand-summed chain-rule formulas, kept verbatim as the
     //! bit-identity witnesses for the #932 `Tower` composition. If the tower
     //! path ever drifts from the hand calculus these channels disagree.
