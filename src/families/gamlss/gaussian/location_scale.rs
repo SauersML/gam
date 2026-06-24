@@ -39,14 +39,6 @@ impl Clone for GaussianLocationScaleFamily {
     }
 }
 
-/// Test-only counter of how many times `get_or_compute_row_scalars` actually
-/// recomputed the O(n) transcendental row-scalar stack (cache MISS). A wired
-/// cache turns the 2nd…Kth call within one (η_μ, η_logσ) into hits, so this
-/// counter pins "redundant recompute eliminated" as a regression.
-#[cfg(test)]
-pub(crate) static ROW_SCALAR_COMPUTE_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
 impl GaussianLocationScaleFamily {
     pub const BLOCK_MU: usize = 0;
     pub const BLOCK_LOG_SIGMA: usize = 1;
@@ -97,8 +89,6 @@ impl GaussianLocationScaleFamily {
         // race recomputing the same (η_μ, η_logσ) is harmless — identical
         // inputs yield bit-identical scalars — so last-writer-wins is safe and
         // every reader observes equal contents.
-        #[cfg(test)]
-        ROW_SCALAR_COMPUTE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let rows = Arc::new(gaussian_jointrow_scalars(
             &self.y,
             etamu,

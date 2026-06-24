@@ -6095,9 +6095,6 @@ pub(crate) fn gaussian_joint_first_directional_hessian_matches_autodiff() {
 
 #[test]
 pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
-    use crate::families::gamlss::gaussian::location_scale::ROW_SCALAR_COMPUTE_COUNT;
-    use std::sync::atomic::Ordering;
-
     let (y, weights, xmu, x_ls, beta_mu, beta_ls) = gaussian_logb_design_test_data();
     let etamu = xmu.dot(&beta_mu);
     let eta_ls = x_ls.dot(&beta_ls);
@@ -6135,16 +6132,21 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
     let reference =
         gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("reference row scalars");
 
-    // Drive all four exact-joint paths under the SAME (η_μ, η_logσ).
+    // Drive all four exact-joint paths under the SAME (η_μ, η_logσ). The first
+    // populates the cache; the rest must hit it.
     let u: Array1<f64> = Array1::from_shape_fn(total, |k| 0.11 + 0.03 * (k as f64));
     let v: Array1<f64> = Array1::from_shape_fn(total, |k| -0.07 + 0.05 * (k as f64));
-
-    ROW_SCALAR_COMPUTE_COUNT.store(0, Ordering::Relaxed);
 
     let h0 = family
         .exact_newton_joint_hessian_from_designs(&states, &xmu_d, &xls_d)
         .expect("H")
         .expect("H present");
+    // After the first consumer, the cache must be populated; grab the stored Arc.
+    let stored = {
+        let guard = family.cached_row_scalars.read().expect("lock");
+        let (_, _, _, _, _, _, rows) = guard.as_ref().expect("cache populated after first call");
+        std::sync::Arc::clone(rows)
+    };
     let d1 = family
         .exact_newton_joint_hessian_directional_derivative_from_designs(
             &states, &xmu_d, &xls_d, &u,
@@ -6157,27 +6159,28 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
         )
         .expect("d2H")
         .expect("d2H present");
-    // The cached Arc must be byte-identical to the independent reference.
-    let cached = family
+
+    // Race-free proof that the 2nd…Kth consumers REUSE the stored allocation
+    // (cache HIT shares the Arc via `Arc::clone`; a recompute would mint a new
+    // allocation, so `ptr_eq` would be false). Family-local state, immune to
+    // concurrent tests.
+    let hit = family
         .get_or_compute_row_scalars(&etamu, &eta_ls)
         .expect("cached row scalars");
-
-    // Exactly ONE recompute for all four shared-(η_μ,η_logσ) consumers.
-    let computes = ROW_SCALAR_COMPUTE_COUNT.load(Ordering::Relaxed);
-    assert_eq!(
-        computes, 1,
-        "gaulss row-scalar cache should recompute exactly once per (η_μ, η_logσ); got {computes}"
+    assert!(
+        std::sync::Arc::ptr_eq(&stored, &hit),
+        "gaulss row-scalar cache should reuse the stored allocation (no redundant recompute)"
     );
 
     // Bit-identical cached contents vs the independent reference.
     let fields: [(&Array1<f64>, &Array1<f64>); 7] = [
-        (&cached.obs_weight, &reference.obs_weight),
-        (&cached.w, &reference.w),
-        (&cached.m, &reference.m),
-        (&cached.n, &reference.n),
-        (&cached.kappa, &reference.kappa),
-        (&cached.kappa_prime, &reference.kappa_prime),
-        (&cached.kappa_dprime, &reference.kappa_dprime),
+        (&hit.obs_weight, &reference.obs_weight),
+        (&hit.w, &reference.w),
+        (&hit.m, &reference.m),
+        (&hit.n, &reference.n),
+        (&hit.kappa, &reference.kappa),
+        (&hit.kappa_prime, &reference.kappa_prime),
+        (&hit.kappa_dprime, &reference.kappa_dprime),
     ];
     for (got, want) in fields {
         for (a, b) in got.iter().zip(want.iter()) {
@@ -6185,20 +6188,29 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
         }
     }
 
-    // Hessians/derivatives are finite and shaped — exactness vs the analytic
-    // forms is pinned by the sibling autodiff tests; here we additionally
-    // confirm the cached path reproduces them bit-for-bit on a recompute.
-    family
-        .cached_row_scalars
-        .write()
-        .expect("lock")
-        .take(); // force a miss
+    // A different (η_μ, η_logσ) must MISS (distinct fingerprint → fresh Arc).
+    let eta_ls_shift = &eta_ls + 0.31;
+    let miss = family
+        .get_or_compute_row_scalars(&etamu, &eta_ls_shift)
+        .expect("recompute on miss");
+    assert!(
+        !std::sync::Arc::ptr_eq(&stored, &miss),
+        "distinct η must recompute, not serve the stale cached allocation"
+    );
+
+    // Invalidate and recompute the Hessian: must be bit-identical to the cached
+    // run (proves the cache changes nothing numerically).
+    family.cached_row_scalars.write().expect("lock").take();
     let h0b = family
         .exact_newton_joint_hessian_from_designs(&states, &xmu_d, &xls_d)
         .expect("H2")
         .expect("H2 present");
     for (a, b) in h0.iter().zip(h0b.iter()) {
-        assert_eq!(a.to_bits(), b.to_bits(), "Hessian not bit-identical after cache invalidation");
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "Hessian not bit-identical after cache invalidation"
+        );
     }
     assert_eq!(h0.dim(), (total, total));
     assert!(d1.iter().all(|x| x.is_finite()));
