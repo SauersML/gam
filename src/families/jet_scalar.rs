@@ -125,6 +125,35 @@ pub trait JetScalar<const K: usize>: Copy {
             -0.9375 / (u * u * u * s),
         ])
     }
+
+    /// `ln(self)`. Caller guarantees positivity. Same derivative stack
+    /// [`super::jet_tower::Tower4::ln`] uses, so any program written over both
+    /// matches term-for-term.
+    fn ln(&self) -> Self {
+        let u = self.value();
+        let r = 1.0 / u;
+        self.compose_unary([u.ln(), r, -r * r, 2.0 * r * r * r, -6.0 * r * r * r * r])
+    }
+
+    /// `1/self`.
+    fn recip(&self) -> Self {
+        let r = 1.0 / self.value();
+        let r2 = r * r;
+        self.compose_unary([r, -r2, 2.0 * r2 * r, -6.0 * r2 * r2, 24.0 * r2 * r2 * r])
+    }
+
+    /// `self^a` for real exponent `a`. Caller guarantees a positive base.
+    /// Mirrors [`super::jet_tower::Tower4::powf`] (falling-factorial stack).
+    fn powf(&self, a: f64) -> Self {
+        let u = self.value();
+        self.compose_unary([
+            u.powf(a),
+            a * u.powf(a - 1.0),
+            a * (a - 1.0) * u.powf(a - 2.0),
+            a * (a - 1.0) * (a - 2.0) * u.powf(a - 3.0),
+            a * (a - 1.0) * (a - 2.0) * (a - 3.0) * u.powf(a - 4.0),
+        ])
+    }
 }
 
 /// Filtered Hensel lift of a SCALAR implicit state `a(θ)` defined by the
