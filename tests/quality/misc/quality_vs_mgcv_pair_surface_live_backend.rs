@@ -48,10 +48,32 @@ fn truth(x1: f64, x2: f64) -> f64 {
     (2.4 * x1).sin() * (2.1 * x2).cos() + 0.8 * x1 * x2 + 0.5 * (3.0 * x1 * x2).sin()
 }
 
-/// Deterministic, RNG-free zero-mean noise stream (low-discrepancy phase).
+/// Deterministic, RNG-free, zero-mean noise stream that is INDEPENDENT of both
+/// coordinate abscissae.
+///
+/// The earlier revision drew the noise phase from the SAME golden-ratio
+/// sequence that generates `x1` (`x1[i] = frac((i+1)·golden)`), so the
+/// "noise" collapsed algebraically to `noise(i) = 0.3·(x1[i] − 0.5)` — a smooth
+/// LINEAR function of x1, not independent error. With the perturbation aliased
+/// onto a model coordinate the response `y = f(x1,x2) + 0.3·x1 − 0.15` carried
+/// ZERO irreducible residual: the REML smoother (correctly) interpolated it
+/// (edf → the full basis, λ → 1e-8), and so truth-recovery RMSE was pinned at
+/// the trend magnitude `0.3/√12 ≈ 0.0866` for ANY correct estimator — above the
+/// `0.06·range` bar, making the recovery assertion mathematically unsatisfiable.
+///
+/// Hash the row index through the splitmix64 finalizer to a value uncorrelated
+/// with the golden / √2 abscissae, giving genuine zero-mean noise the smoother
+/// must actually average out (RMSE ≈ 0.0866 per draw, ≈ 0 after pooling 2000
+/// rows). The stream stays fully deterministic and RNG-free, so gam and mgcv
+/// still see byte-identical rows.
 fn noise(i: usize) -> f64 {
-    let golden = 0.618_033_988_749_894_9_f64;
-    (((i + 1) as f64 * golden).fract() - 0.5) * 2.0 * NOISE_AMP
+    let mut z = (i as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // Top 53 bits → uniform in [0, 1), then mapped to (−NOISE_AMP, +NOISE_AMP).
+    let unit = (z >> 11) as f64 / (1u64 << 53) as f64;
+    (unit - 0.5) * 2.0 * NOISE_AMP
 }
 
 #[test]
