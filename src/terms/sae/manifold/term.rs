@@ -225,7 +225,7 @@ pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 /// decoder gradient `∂P/∂B_k = -2μ_s/(s_k²+ε)·B_k` has magnitude `∝ 1/‖B_k‖`
 /// near zero, a genuine OUTWARD restoring force (unlike the angle penalty, whose
 /// force vanishes with the norm). Small fixed weight to start; annealed later.
-pub(crate) const SAE_AMPLITUDE_BARRIER_STRENGTH: f64 = 1.0;
+pub(crate) const SAE_AMPLITUDE_BARRIER_STRENGTH: f64 = 100.0;
 
 /// #1026/#1522 AMPLITUDE barrier softening `ε` (added inside `log(s_k²+ε)` and in
 /// every denominator). Keeps the barrier finite and the PSD majorizer bounded at
@@ -241,7 +241,7 @@ pub(crate) const SAE_AMPLITUDE_BARRIER_EPS: f64 = 1.0e-8;
 /// `∂P/∂c_jk = 2μ_C q_jk c_jk/(1-c_jk²+ε)` DIVERGES as atoms align (`c_jk→1`) and
 /// is exactly 0 when `c_jk = 0` — and, unlike the threshold repulsion, it does
 /// NOT switch off at small amplitude (it sees only the SHAPE `U_k`).
-pub(crate) const SAE_SEPARATION_BARRIER_STRENGTH: f64 = 1.0;
+pub(crate) const SAE_SEPARATION_BARRIER_STRENGTH: f64 = 100.0;
 
 /// #1026/#1522 SEPARATION barrier softening `ε` in `log(1 - c_jk² + ε)`. Bounds
 /// the barrier (and its PSD majorizer) at the exact-alignment limit `c_jk² = 1`.
