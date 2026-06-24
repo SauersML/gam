@@ -1485,9 +1485,18 @@ mod moment_engine_tests {
         // residual closure rebuilds the per-cell coefficient + moment jets at the
         // current iterate, so the lifted `a_jet` carries the intercept's full
         // θ-jet (incl. directional channels) to order `J` automatically.
+        //
+        // The filtered (frozen-inverse) Newton chord gains exactly ONE derivative
+        // order per iteration, so the iterate count must reach the highest jet
+        // order in play: 2 for `Jet2`, 3 for the `Jet3` directional Hessian, 4 for
+        // the `Jet4` mixed-second-directional channel. Run 4 universally — once the
+        // calibration residual hits zero at a given order, every further iterate is
+        // an exact no-op (`a -= 0`), so `Jet2`/`Jet3` are unaffected by the extra
+        // passes. (A hardcoded 2 left the Jet3/Jet4 mixed intercept derivatives one
+        // iteration short — `eta_uv` converged but `eta_uv_dir` did not; gam#932.)
         let residual =
             |a: &J| calibration_residual_jet(a, b_jet, primary_g, du, q_index, q, cells);
-        let a_jet = lift_intercept_flex(template, a0, 1.0 / d_check, 2, residual);
+        let a_jet = lift_intercept_flex(template, a0, 1.0 / d_check, 4, residual);
 
         // Observed eta/chi: the OBSERVED cell coefficient `c_k(a, {θ_u})` and its
         // `∂_a` (= χ) built as MULTIVARIATE jets over ALL primaries (g/h/w) via
