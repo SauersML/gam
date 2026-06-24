@@ -1203,8 +1203,16 @@ mod moment_engine_tests {
             .zip(eta0_sq.iter())
             .map(|(a, b)| a.sub(b).scale(-0.5))
             .collect();
-        // S(z) = e^{−Δq} = Σ_{k=0}^{4} (−Δq)^k / k!  (jet-coefficient polynomial).
-        // Truncating at k=4 is exact for the order-≤4 jets (value(−Δq)=0).
+        // S(z) = e^{−Δq} = Σ_{k=0}^{4} (−Δq)^k / k!  (jet-coefficient polynomial),
+        // splitting e^{−q(θ)} = e^{−q0}·e^{−Δq}, Δq = q(θ)−q0. Truncating at k=p=4
+        // is EXACT for the order-≤4 jets: value(−Δq)=0 ⇒ −Δq ∈ m (nilpotent) ⇒
+        // (−Δq)^{p+1} = 0.
+        //
+        // MOMENT-DEGREE BUDGET. η is cubic ⇒ deg_z(Δq) ≤ 6, so deg_z(S) ≤ 6p, and
+        // the interior dot `Σ_m S_m·M_{n+m}` below reaches `M_{n+6p}`. An order-`p`
+        // jet for `M_n` therefore needs numeric base moments through `n + 6p`: for
+        // p=4 that is `n+24` (n≤4 base moments → M_28; n≤3 calibration → M_27). The
+        // cached partition builds to 32 (margin), which is why 27/32 are not magic.
         let mut s_poly: Vec<J> = vec![const_jet_like(&c[0], 1.0)];
         let mut power: Vec<J> = s_poly.clone();
         let factorials = [1.0_f64, 1.0, 2.0, 6.0, 24.0];
@@ -1251,6 +1259,20 @@ mod moment_engine_tests {
     /// carries the full coefficient × edge cross-motion. `q = ½(z² + η²)`,
     /// `q_z = z + η η_z`, `η_z = c1 + 2c2 z + 3c3 z²`; the `g`-stack follows from
     /// `g_z = (n/z − q_z) g` by the product/chain rule.
+    ///
+    /// The four `gδ`/`½g_z δ²`/`⅙g_zz δ³`/`(1/24)g_zzz δ⁴` terms are JET products, so
+    /// the θ-jet of the sliver automatically contains every coefficient×edge cross
+    /// channel of the full Faà di Bruno expansion. Concretely, writing `d_k = δ^(k)`
+    /// and `G_r^[s] = ∂_t^s ∂_z^r g`, the 4th θ-derivative is
+    /// `S'''' = G_0 d_4 + 4G_0^[1] d_3 + 6G_0^[2] d_2 + 4G_0^[3] d_1 + 4G_1 d_1 d_3
+    ///        + 3G_1 d_2² + 12G_1^[1] d_1 d_2 + 6G_1^[2] d_1² + 6G_2 d_1² d_2
+    ///        + 4G_2^[1] d_1³ + G_3 d_1⁴`. So a 4th-ORDER-only crossing-edge mismatch
+    /// is NOT uniquely the `g_zzz δ⁴` term — it can equally be a wrong `z_4` (edge
+    /// 4th deriv) or a coefficient-edge CROSS channel (`G_1^[2] d_1²`, `G_2^[1] d_1³`,
+    /// `G_1 d_2²`). NOTE: the `n/z` `g`-stack form has a removable singularity at
+    /// `z_E0=0` (special-cased); the singularity-free polynomial form
+    /// `g_z = e^{−q}(n z^{n−1} − q_z z^n)`, `g_zz = e^{−q}(n(n−1)z^{n−2} − 2n q_z z^{n−1}
+    /// + (q_z²−q_zz)z^n)`, … is preferable when `z_E0` may be near 0.
     fn edge_sliver_jet<J: FlexJet>(n: usize, c: &[J; 4], z_e: &J, finite: bool) -> Option<J> {
         if !finite {
             return None;
