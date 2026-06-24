@@ -482,6 +482,20 @@ pub(crate) fn binomial_location_scale_core(
 /// `seed(value, axis)` produces the primary jet for axis `axis` (0 = η_t,
 /// 1 = η_ls); the directional scalars fold their contraction direction in
 /// through this closure (mirrors `survival::location_scale::sls_row_nll`).
+///
+/// `need_value` gates the `q`-space VALUE channel `−ll`. The composed value
+/// `d[0] = −ll` flows ONLY into the result's value channel: the gradient and
+/// Hessian read `d[1..=2]`, the contracted third reads the ε-Hessian, the
+/// contracted fourth reads the εδ-Hessian — NONE touch `d[0]`. So the
+/// directional consumers (`OneSeed`/`TwoSeed`), which discard the value
+/// channel, are byte-for-byte invariant under `d[0]`; they pass
+/// `need_value = false` and skip computing `ll` altogether. That elides one
+/// per-row log-likelihood — whose Probit/Logit/CLogLog branches each evaluate
+/// an `erfc`/`softplus`/`log1mexp`-class special function — that the `?` error
+/// propagation otherwise keeps alive (blocking the compiler from dead-code
+/// eliminating it). This is EXACT, not an approximation: the contracted output
+/// tensors are unchanged. Value-channel consumers (`Order2` joint-Hessian, the
+/// dense `Tower4` oracle / gradient path) pass `true` and get the exact `−ll`.
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn binomial_location_scale_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
@@ -496,13 +510,22 @@ pub(crate) fn binomial_location_scale_nll_generic<S: crate::families::jet_scalar
     d3mu_dq3: f64,
     link_kind: &InverseLink,
     include_fourth: bool,
+    need_value: bool,
     seed: impl Fn(f64, usize) -> S,
 ) -> Result<S, String> {
     let eta_t_jet = seed(eta_t, 0);
     let eta_ls_jet = seed(eta_ls, 1);
     let inv_sigma = eta_ls_jet.scale(-1.0).exp();
     let q = eta_t_jet.neg().mul(&inv_sigma);
-    let ll = binomial_location_scale_log_likelihood(y, weight, q_value, link_kind, mu)?;
+    // The value channel `−ll` is dead for every derivative/contraction channel;
+    // only pay the special-function-bearing log-likelihood when a value-channel
+    // consumer actually reads it (proven bit-identical for the contracted
+    // paths: their output is independent of `d[0]`).
+    let neg_ll = if need_value {
+        -binomial_location_scale_log_likelihood(y, weight, q_value, link_kind, mu)?
+    } else {
+        0.0
+    };
     let (m1, m2, m3) = binomial_neglog_q_derivatives_dispatch(
         y, weight, q_value, mu, dmu_dq, d2mu_dq2, d3mu_dq3, link_kind,
     );
@@ -513,7 +536,7 @@ pub(crate) fn binomial_location_scale_nll_generic<S: crate::families::jet_scalar
     } else {
         0.0
     };
-    Ok(q.compose_unary([-ll, m1, m2, m3, m4]))
+    Ok(q.compose_unary([neg_ll, m1, m2, m3, m4]))
 }
 
 /// Dense `Tower4<2>` builder for the binomial location-scale row NLL: the
@@ -548,6 +571,9 @@ pub(crate) fn binomial_location_scale_nll_tower(
         d3mu_dq3,
         link_kind,
         include_fourth,
+        // The Tower4 builder is the value/gradient/oracle consumer: it needs the
+        // exact `−ll` value channel.
+        true,
         |x, axis| Tower4::<2>::variable(x, axis),
     )
 }
@@ -559,7 +585,6 @@ pub(crate) fn binomial_location_scale_nll_tower(
 /// core's `(σ, q0)` and forwards the per-row stack to
 /// [`binomial_location_scale_nll_generic`].
 #[inline]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn binomial_location_scale_nll_generic_from_core_row<
     S: crate::families::jet_scalar::JetScalar<2>,
 >(
@@ -569,6 +594,7 @@ pub(crate) fn binomial_location_scale_nll_generic_from_core_row<
     row: usize,
     link_kind: &InverseLink,
     include_fourth: bool,
+    need_value: bool,
     seed: impl Fn(f64, usize) -> S,
 ) -> Result<S, String> {
     let sigma = core.sigma[row];
@@ -586,6 +612,7 @@ pub(crate) fn binomial_location_scale_nll_generic_from_core_row<
         core.d3mu_dq3[row],
         link_kind,
         include_fourth,
+        need_value,
         seed,
     )
 }
@@ -622,7 +649,8 @@ pub(crate) fn binomial_location_scale_first_directional_coefficients(
                 core,
                 i,
                 link_kind,
-                false,
+                false, // include_fourth
+                false, // need_value: contracted third discards the value channel
                 |x, axis| OneSeed::seed_direction(x, axis, dir[axis]),
             )?;
             let contracted = scalar.contracted_third();
@@ -674,7 +702,8 @@ pub(crate) fn binomial_location_scalesecond_directional_coefficients(
                 core,
                 i,
                 link_kind,
-                true,
+                true,  // include_fourth
+                false, // need_value: contracted fourth discards the value channel
                 |x, axis| TwoSeed::seed(x, axis, dir_u[axis], dir_v[axis]),
             )?;
             let contracted = scalar.contracted_fourth();
@@ -757,14 +786,26 @@ mod packed_scalar_oracle_tests {
 
                 // Dense Tower4 oracle.
                 let (y_, w_, et_, el_, q_, mu_, d1_, d2_, d3_, lk_, _f) = args(true);
-                let tower =
-                    binomial_location_scale_nll_tower(y_, w_, et_, el_, q_, mu_, d1_, d2_, d3_, lk_, true)
-                        .expect("tower");
+                let tower = binomial_location_scale_nll_tower(
+                    y_, w_, et_, el_, q_, mu_, d1_, d2_, d3_, lk_, true,
+                )
+                .expect("tower");
 
                 // Order2 (v, g, H).
                 let (y2, w2, et2, el2, q2, mu2, d12, d22, d32, lk2, f2) = args(false);
                 let o2 = binomial_location_scale_nll_generic::<Order2<2>>(
-                    y2, w2, et2, el2, q2, mu2, d12, d22, d32, lk2, f2,
+                    y2,
+                    w2,
+                    et2,
+                    el2,
+                    q2,
+                    mu2,
+                    d12,
+                    d22,
+                    d32,
+                    lk2,
+                    f2,
+                    true, // need_value: Order2 reads the value channel
                     |x, axis| Order2::variable(x, axis),
                 )
                 .expect("order2");
@@ -779,7 +820,18 @@ mod packed_scalar_oracle_tests {
                 // OneSeed contracted third Σ_c ℓ_{abc} dir_u_c.
                 let truth3 = tower.third_contracted(&dir_u);
                 let os = binomial_location_scale_nll_generic::<OneSeed<2>>(
-                    y2, w2, et2, el2, q2, mu2, d12, d22, d32, lk2, false,
+                    y2,
+                    w2,
+                    et2,
+                    el2,
+                    q2,
+                    mu2,
+                    d12,
+                    d22,
+                    d32,
+                    lk2,
+                    false, // include_fourth
+                    false, // need_value: contracted third is independent of d[0]
                     |x, axis| OneSeed::seed_direction(x, axis, dir_u[axis]),
                 )
                 .expect("oneseed");
@@ -793,7 +845,18 @@ mod packed_scalar_oracle_tests {
                 // TwoSeed contracted fourth Σ_{cd} ℓ_{abcd} u_c v_d.
                 let truth4 = tower.fourth_contracted(&dir_u, &dir_v);
                 let ts = binomial_location_scale_nll_generic::<TwoSeed<2>>(
-                    y2, w2, et2, el2, q2, mu2, d12, d22, d32, lk2, true,
+                    y2,
+                    w2,
+                    et2,
+                    el2,
+                    q2,
+                    mu2,
+                    d12,
+                    d22,
+                    d32,
+                    lk2,
+                    true,  // include_fourth
+                    false, // need_value: contracted fourth is independent of d[0]
                     |x, axis| TwoSeed::seed(x, axis, dir_u[axis], dir_v[axis]),
                 )
                 .expect("twoseed");
