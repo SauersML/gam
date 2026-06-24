@@ -1729,7 +1729,9 @@ pub(super) fn rigid_standard_normal_row_kernel(
 /// contraction `J_iᵀ` (marginal+logslope design rows) is applied by the caller.
 ///
 /// It is computed by seeding `z` as a THIRD jet variable (index 2) in the SAME
-/// `Tower4` the value/gradient/Hessian path uses (#932 row-jet machinery): the
+/// order-≤2 jet algebra the value/gradient/Hessian path uses, carried by the
+/// packed `Order2<3>`/`Tower2<3>` scalar rather than a dense `Tower4<3>`
+/// (#932 row-jet machinery, packed-scalar perf cutover): the
 /// rigid standard-normal observed index is `η = q·c(g) + g·(s·z)` with
 /// `c(g) = √(1 + (s·g)²)`, `s = probit_scale`, and `ℓ = −w·log Φ(sign·η)`. The
 /// converged-frame mixed partials of the NLL are the off-diagonal Hessian
@@ -1746,13 +1748,21 @@ pub(super) fn rigid_standard_normal_mixed_z_sensitivity(
     probit_scale: f64,
 ) -> Result<[f64; 2], String> {
     // Three jet axes: q = marginal η (0), g = slope (1), z = latent score (2).
-    let mut q = Tower4::<3>::constant(marginal.q);
+    //
+    // #932 perf: this consumer reads ONLY the two mixed Hessian channels
+    // `h[0][2]`/`h[1][2]`, so it needs only the value/gradient/Hessian stack —
+    // the packed `Order2<3>` scalar (operating on its inner `Tower2<3>`), NOT a
+    // dense `Tower4<3>` that would materialise the unused `K³`/`K⁴` `t3`/`t4`
+    // tensors. The order-≤2 channels are bit-identical to the dense tower
+    // (`Tower2::mul`/`compose_unary` match `Tower4` term-for-term), so the read
+    // entries are unchanged; the `q3`/`q4` marginal-link channels are dropped
+    // because no order-≤2 channel of the composed jet reads them.
+    use crate::families::jet_tower::Tower2;
+    let mut q = Tower2::<3>::constant(marginal.q);
     q.g[0] = marginal.q1;
     q.h[0][0] = marginal.q2;
-    q.t3[0][0][0] = marginal.q3;
-    q.t4[0][0][0][0] = marginal.q4;
-    let slope = Tower4::<3>::variable(g, 1);
-    let z_var = Tower4::<3>::variable(z, 2);
+    let slope = Tower2::<3>::variable(g, 1);
+    let z_var = Tower2::<3>::variable(z, 2);
     let observed_logslope = slope * probit_scale;
     let c = (observed_logslope * observed_logslope + 1.0).sqrt();
     // η = q·c + g·(s·z): z enters linearly through the slope×z product, so the
@@ -1774,7 +1784,9 @@ pub(super) fn rigid_standard_normal_mixed_z_sensitivity(
             marginal.q
         ));
     }
-    let tower = signed.compose_unary(stack);
+    // Order-≤2 composition consumes only the leading `[f, f', f'']` of the
+    // certified `[f64; 5]` derivative stack.
+    let tower = signed.compose_unary([stack[0], stack[1], stack[2]]);
     // #1131: `tower` is the NLL `ℓ = −w·log Φ`, so `tower.h[·][z]` is the mixed
     // partial of the NLL. Negate to the LOG-LIKELIHOOD-score convention
     // `s = ∂²(log L)/∂(primary)∂z = −∂²ℓ/∂(primary)∂z`, under which the
@@ -2390,5 +2402,220 @@ mod jet_tower_oracle_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod flex_primary_hessian_oracle_tests {
+    //! #932 correctness gate for the BMS-FLEX per-row primary Hessian assembled
+    //! by hand product-rule in
+    //! [`super::super::row_primary_hessian::BernoulliMarginalSlopeFamily::compute_row_analytic_flex_from_parts_into`]
+    //! (`f_aa += w·φ·(η_aa − η·η_a·η_a)`, the `f_au`/`f_uv`/`a_uv` chain, and the
+    //! final `d2_m·η_u·η_v + d1_m·s_y·η_uv` contraction).
+    //!
+    //! A prior audit found this hand Hessian had NO INDEPENDENT oracle: the only
+    //! covering test (`families_bms_joint_hessian_hvp_correction_tests.rs`)
+    //! asserts batched-vs-nonbatched self-consistency using the SAME hand code on
+    //! both sides, so a dropped product-rule term would pass undetected. This
+    //! module closes that gap with a finite-difference witness that NEVER runs the
+    //! Hessian-assembly branch: it central-differences the flex GRADIENT — which
+    //! is produced by an entirely separate code path (the `need_hessian = false`
+    //! value/`eta_u`-scaling lines, none of which read the `f_aa`/`f_au`/`f_uv`
+    //! product-rule accumulators) — and pins the analytic Hessian against it.
+    //!
+    //! The gradient itself is FD-validated transitively: it is the analytic
+    //! gradient of the same per-row NLL, evaluated at the converged intercept,
+    //! and the FD perturbation re-solves the intercept root per perturbed point
+    //! (rebuilding the row context), so the difference quotient is the true
+    //! mixed/second partial of the row negative log-likelihood — the independent
+    //! truth the hand Hessian must reproduce.
+
+    use super::*;
+    use crate::matrix::DenseDesignMatrix;
+    use ndarray::Array1;
+    use ndarray::Array2;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    /// Port of the integration-test flex fixture
+    /// (`make_flex_hvp_cache_test_family`), kept in-crate so the oracle can run
+    /// without the test crate (the family struct is `pub(super)`). Builds a small
+    /// flex BMS family with both a score-warp and a link-deviation block so the
+    /// flex Hessian assembly exercises every primary block (q, logslope, h, w).
+    fn make_flex_oracle_family(n: usize) -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
+        let score_seed = Array1::linspace(-2.0, 2.0, n.max(6));
+        let link_seed = Array1::linspace(-1.8, 1.8, n.max(6));
+        let cfg = DeviationBlockConfig {
+            num_internal_knots: 3,
+            ..DeviationBlockConfig::default()
+        };
+        let score_prepared = build_score_warp_deviation_block_from_seed(&score_seed, &cfg)
+            .expect("build score warp block");
+        let link_prepared = build_link_deviation_block_from_knots_design_seed_and_weights(
+            &link_seed, &link_seed, &cfg,
+        )
+        .expect("build link deviation block");
+
+        let y: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| if (i * 17 + 3) % 7 >= 4 { 1.0 } else { 0.0 }));
+        let weights: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| 0.75 + ((i * 11 + 5) % 5) as f64 * 0.05));
+        let z: Array1<f64> =
+            Array1::from_iter((0..n).map(|i| -1.7 + 3.4 * (i as f64 + 0.5) / n as f64));
+        let marginal_x = Array2::from_shape_fn((n, 2), |(i, j)| {
+            if j == 0 {
+                1.0
+            } else {
+                -0.4 + 0.8 * ((i * 19 + 7) % n) as f64 / n as f64
+            }
+        });
+        let logslope_x = Array2::from_shape_fn((n, 2), |(i, j)| {
+            if j == 0 {
+                1.0
+            } else {
+                0.3 - 0.6 * ((i * 23 + 11) % n) as f64 / n as f64
+            }
+        });
+
+        let family = BernoulliMarginalSlopeFamily {
+            y: Arc::new(y),
+            weights: Arc::new(weights),
+            z: Arc::new(z.clone()),
+            latent_measure: LatentMeasureKind::StandardNormal,
+            gaussian_frailty_sd: Some(0.15),
+            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+            marginal_design: DesignMatrix::Dense(DenseDesignMatrix::from(marginal_x.clone())),
+            logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(logslope_x.clone())),
+            score_warp: Some(score_prepared.runtime.clone()),
+            link_dev: Some(link_prepared.runtime.clone()),
+            policy: crate::resource::ResourcePolicy::default_library(),
+            cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(1024)),
+            cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
+            intercept_warm_starts: None,
+            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+        };
+
+        let beta_m = Array1::from_vec(vec![0.12, -0.04]);
+        let beta_g = Array1::from_vec(vec![0.35, 0.03]);
+        let beta_h = Array1::from_iter(
+            (0..score_prepared.runtime.basis_dim()).map(|idx| 0.0015 * (idx as f64 + 1.0)),
+        );
+        let beta_w = Array1::from_iter(
+            (0..link_prepared.runtime.basis_dim()).map(|idx| -0.001 * (idx as f64 + 1.0)),
+        );
+        let states = vec![
+            ParameterBlockState {
+                eta: marginal_x.dot(&beta_m),
+                beta: beta_m,
+            },
+            ParameterBlockState {
+                eta: logslope_x.dot(&beta_g),
+                beta: beta_g,
+            },
+            ParameterBlockState {
+                beta: beta_h,
+                eta: Array1::zeros(z.len()),
+            },
+            ParameterBlockState {
+                beta: beta_w,
+                eta: Array1::zeros(z.len()),
+            },
+        ];
+        (family, states)
+    }
+
+    /// The flex primary gradient at a perturbed primary point. Perturbs primary
+    /// coordinate `u` by `delta` (mutating the relevant block state — the
+    /// marginal/logslope row η or a deviation β plus its design contribution
+    /// where applicable), rebuilds the row context FRESH (re-solving the
+    /// calibration intercept root at the perturbed point), and returns the
+    /// analytic gradient. The Hessian-assembly branch is never run, so this is a
+    /// genuinely independent witness for that branch.
+    fn flex_gradient_at_perturbed(
+        family: &BernoulliMarginalSlopeFamily,
+        states: &[ParameterBlockState],
+        primary: &super::super::hessian_paths::PrimarySlices,
+        row: usize,
+        u: usize,
+        delta: f64,
+    ) -> Array1<f64> {
+        let mut states = states.to_vec();
+        // Map the primary coordinate `u` onto the parameter that controls it.
+        // q / logslope live in the per-row η of blocks 0 / 1; the deviation
+        // bases live in the β of blocks 2 (score-warp) / 3 (link-wiggle), which
+        // the row context reads via `score_beta` / `link_beta` (their η rows are
+        // unused on the flex per-row path, so only β need move).
+        if u == primary.q {
+            states[0].eta[row] += delta;
+        } else if u == primary.logslope {
+            states[1].eta[row] += delta;
+        } else if let Some(h_range) = primary.h.as_ref()
+            && h_range.contains(&u)
+        {
+            states[2].beta[u - h_range.start] += delta;
+        } else if let Some(w_range) = primary.w.as_ref()
+            && w_range.contains(&u)
+        {
+            states[3].beta[u - w_range.start] += delta;
+        } else {
+            panic!("primary coordinate {u} out of range for flex oracle");
+        }
+        let row_ctx = family
+            .build_row_exact_context_with_stats_and_cell_cache(row, &states, None, false)
+            .expect("perturbed row context");
+        let (_neglog, grad, _hess) = family
+            .compute_row_primary_gradient_hessian(row, &states, primary, &row_ctx)
+            .expect("perturbed gradient");
+        grad
+    }
+
+    /// The hand-assembled BMS-FLEX per-row primary Hessian must equal the
+    /// central finite difference of the flex gradient at every fixture row.
+    #[test]
+    fn flex_primary_hessian_matches_central_fd_of_gradient() {
+        let n = 12usize;
+        let (family, states) = make_flex_oracle_family(n);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("flex exact eval cache");
+        let primary = &cache.primary;
+        let r = primary.total;
+        assert!(r >= 4, "flex fixture must carry q + logslope + deviation blocks");
+
+        // Central-difference step. The flex gradient is smooth in every primary
+        // coordinate; 1e-4 balances truncation (O(h^2)) against the cancellation
+        // floor of the per-perturbation intercept re-solve (~1e-12).
+        let h = 1e-4;
+        let mut max_rel = 0.0_f64;
+
+        // A handful of interior rows (avoid the strongest-tail endpoints where
+        // the FD floor is loosest). Every primary coordinate is differenced.
+        for &row in &[2usize, 5, 8] {
+            let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, row);
+            let (_neglog, _grad, analytic_hess) = family
+                .compute_row_primary_gradient_hessian(row, &states, primary, row_ctx)
+                .expect("analytic flex gradient + hessian");
+
+            for u in 0..r {
+                let grad_plus = flex_gradient_at_perturbed(&family, &states, primary, row, u, h);
+                let grad_minus = flex_gradient_at_perturbed(&family, &states, primary, row, u, -h);
+                for v in 0..r {
+                    let fd = (grad_plus[v] - grad_minus[v]) / (2.0 * h);
+                    let analytic = analytic_hess[[v, u]];
+                    let denom = 1.0 + analytic.abs().max(fd.abs());
+                    let rel = (analytic - fd).abs() / denom;
+                    max_rel = max_rel.max(rel);
+                    assert!(
+                        rel <= 1e-6,
+                        "flex hand Hessian H[{v}][{u}] = {analytic:.6e} disagrees with central \
+                         FD of the gradient {fd:.6e} at row {row} (rel {rel:.3e}); a product-rule \
+                         term is dropped or mis-signed"
+                    );
+                }
+            }
+        }
+        // Surface the achieved tightness for the record.
+        assert!(max_rel <= 1e-6, "flex Hessian FD oracle max rel {max_rel:.3e}");
     }
 }
