@@ -3119,6 +3119,95 @@ mod tests {
         assert!((out.mean[1] - expected).abs() <= 1e-12);
     }
 
+    /// #1536 regression (engine level): once confidence bounds are assembled,
+    /// the posterior-mean result must carry the RESPONSE-scale SE
+    /// `SE(μ̂) = |dμ/dη|·SE(η)` in `mean_standard_error` — the quantity the
+    /// FFI/CLI surface as the documented response-scale `std_error` column,
+    /// beside the response-scale `mean`/band. For a curved (logit) link it is
+    /// strictly below the link-scale `eta_standard_error` (dμ/dη = p(1−p) < ¼),
+    /// the mirror of the log-link case where it is larger; this asymmetry is
+    /// exactly what the `std_error` column was getting wrong.
+    #[test]
+    fn enrich_posterior_mean_bounds_populates_response_scale_se_for_logit() {
+        let eta = array![0.0, 0.4];
+        let eta_se = array![0.5, 0.3];
+        let mean = array![0.5, 1.0 / (1.0 + (-0.4_f64).exp())];
+        let mut result = PredictPosteriorMeanResult {
+            eta: eta.clone(),
+            eta_standard_error: eta_se.clone(),
+            mean,
+            mean_standard_error: None,
+            mean_lower: None,
+            mean_upper: None,
+            observation_lower: None,
+            observation_upper: None,
+        };
+        enrich_posterior_mean_bounds(
+            &mut result,
+            0.95,
+            crate::types::LikelihoodSpec::binomial_logit(),
+            None,
+        )
+        .expect("enrich posterior-mean bounds");
+
+        let mse = result
+            .mean_standard_error
+            .as_ref()
+            .expect("response-scale SE must be populated once bounds are assembled");
+        for i in 0..eta.len() {
+            // Delta-method through the logit inverse link: dμ/dη = p(1−p).
+            let p = 1.0 / (1.0 + (-eta[i]).exp());
+            let expected = p * (1.0 - p) * eta_se[i];
+            assert!(
+                (mse[i] - expected).abs() <= 1e-9,
+                "mean_standard_error[{i}]={} expected delta-method {}",
+                mse[i],
+                expected
+            );
+            // The response-scale SE is strictly below the link-scale SE for a
+            // logit link — the bug reported the latter as the former.
+            assert!(
+                mse[i] < eta_se[i],
+                "response SE {} should be below link SE {} for logit",
+                mse[i],
+                eta_se[i]
+            );
+        }
+    }
+
+    /// #1536 control: for the identity-link Gaussian the response and link
+    /// scales coincide, so the assembled `mean_standard_error` equals
+    /// `eta_standard_error` exactly — the property that hid the bug on Gaussian.
+    #[test]
+    fn enrich_posterior_mean_bounds_response_se_equals_link_se_for_gaussian() {
+        let eta = array![1.3, -0.2];
+        let eta_se = array![0.3, 0.45];
+        let mut result = PredictPosteriorMeanResult {
+            eta: eta.clone(),
+            eta_standard_error: eta_se.clone(),
+            mean: eta.clone(),
+            mean_standard_error: None,
+            mean_lower: None,
+            mean_upper: None,
+            observation_lower: None,
+            observation_upper: None,
+        };
+        enrich_posterior_mean_bounds(
+            &mut result,
+            0.95,
+            crate::types::LikelihoodSpec::gaussian_identity(),
+            None,
+        )
+        .expect("enrich posterior-mean bounds");
+        let mse = result
+            .mean_standard_error
+            .as_ref()
+            .expect("response-scale SE must be populated");
+        for i in 0..eta.len() {
+            assert!((mse[i] - eta_se[i]).abs() <= 1e-12);
+        }
+    }
+
     #[test]
     fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_runtime_kernel() {
         let seed = array![-1.5, -0.2, 0.6, 1.4];
