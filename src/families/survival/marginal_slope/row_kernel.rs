@@ -430,6 +430,75 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
         Ok((out.value(), out.g(), out.h()))
     }
 
+    /// Batched all-rows `(nll, grad, hess)` via the A100 NVRTC survival row-jet
+    /// (#932-GPU). Gathers every row's primaries + scalar inputs, then calls the
+    /// device dispatcher ([`crate::gpu::kernels::survival_rowjet`]) which runs the
+    /// SAME unified `rigid_row_nll` jet on device for all `n` rows in parallel and
+    /// falls back to the CPU jet on no-GPU / small-`n` / any device error. The
+    /// result is bit-close (≤1e-9; measured 4.7e-12) to the per-row `row_kernel`
+    /// loop, so the cache is identical.
+    ///
+    /// Returns `None` (per-row CPU loop) when ANY row violates the monotonicity
+    /// guard — that domain failure must surface as the `MonotonicityViolation`
+    /// error the per-row path raises, not be masked by the device kernel (which
+    /// does not re-derive the guard).
+    fn batched_value_grad_hess_all(
+        &self,
+    ) -> Option<Result<(Vec<f64>, Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>), String>> {
+        use crate::gpu::kernels::survival_rowjet::{
+            survival_rigid_row_jets, SurvivalRowInputs,
+        };
+        let n = self.family.n;
+        let probit_scale = self.family.probit_frailty_scale();
+        let qd1_lower = self.family.time_derivative_lower_bound();
+        // Gather per-row inputs in parallel (the pure-f64 score summary + primary
+        // projections — the same quantities the per-row path computes). Surface
+        // any gather error; bail to the per-row path on a monotonicity violation.
+        let gather: Result<Vec<SurvivalRowInputs>, String> = (0..n)
+            .into_par_iter()
+            .map(|row| {
+                let p = rigid_row_kernel_primaries(&self.family, &self.block_states, row)?;
+                if survival_derivative_guard_violated(p[2], qd1_lower) {
+                    return Err("monotonicity-violation-fallback".to_string());
+                }
+                let inputs = rigid_row_inputs(
+                    &self.family,
+                    &self.block_states,
+                    row,
+                    "survival marginal-slope rigid row kernel (batched)",
+                )?;
+                Ok(SurvivalRowInputs {
+                    primaries: p,
+                    wi: inputs.wi,
+                    di: inputs.di,
+                    z_sum: inputs.z_sum,
+                    cov_ones: inputs.covariance_ones,
+                })
+            })
+            .collect();
+        let rows = match gather {
+            Ok(rows) => rows,
+            // Monotonicity violation or gather failure → defer to the per-row
+            // path, which raises the precise error.
+            Err(_) => return None,
+        };
+        // (v,g,H) only — the third/fourth direction args are unused for the
+        // value cache; pass zeros.
+        let zero = [0.0_f64; 4];
+        let ch = survival_rigid_row_jets(&rows, probit_scale, &zero, &zero, &zero);
+        let mut grads = vec![[0.0_f64; 4]; n];
+        let mut hesss = vec![[[0.0_f64; 4]; 4]; n];
+        for row in 0..n {
+            for a in 0..4 {
+                grads[row][a] = ch.grad[row * 4 + a];
+                for b in 0..4 {
+                    hesss[row][a][b] = ch.hess[row * 16 + a * 4 + b];
+                }
+            }
+        }
+        Some(Ok((ch.value, grads, hesss)))
+    }
+
     fn jacobian_action(&self, row: usize, d_beta: &[f64]) -> [f64; 4] {
         let d_beta = ndarray::ArrayView1::from(d_beta);
         let d_time = d_beta.slice(s![self.slices.time.clone()]);

@@ -272,6 +272,21 @@ pub trait RowKernel<const K: usize>: Send + Sync {
         Ok(())
     }
 
+    /// Optional batched all-rows `(nll, grad, hess)` fast path for the full-data
+    /// (`RowSet::All`) row-kernel cache build. When a kernel can compute every
+    /// row's primary-space `(v, g[K], H[K×K])` in one batched pass — e.g. an
+    /// A100 NVRTC kernel that evaluates the transcendental per-row jet for all
+    /// `n` rows in parallel — it returns the three parallel `n`-length vectors
+    /// here; otherwise the default `None` keeps the per-row `row_kernel(row)`
+    /// loop. The batched result MUST be bit-close (≤1e-9) to the per-row path
+    /// (it runs the SAME unified jet on device), so the cache is identical; the
+    /// fast path is a pure accelerator with a CPU fallback inside it.
+    fn batched_value_grad_hess_all(
+        &self,
+    ) -> Option<Result<(Vec<f64>, Vec<[f64; K]>, Vec<[[f64; K]; K]>), String>> {
+        None
+    }
+
     /// Optional BLAS-3 Jacobian-action fast path: returns `Jᵢ · F` as an
     /// `(n_rows × stride)` dense matrix when the kernel can produce one
     /// (typically when the underlying design exposes a contiguous dense
@@ -702,6 +717,22 @@ pub fn build_row_kernel_cache<const K: usize>(
         (work_count >= ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS).then(LoopProgress::default_interval);
     match rows {
         RowSet::All => {
+            // GPU fast path (#932-GPU): a kernel that can evaluate every row's
+            // primary (v,g,H) in one batched device pass returns the three
+            // parallel n-length vectors here. The result is the SAME unified
+            // jet (≤1e-9), so the cache is bit-close; on `None` or any error
+            // we fall through to the per-row CPU loop below.
+            if let Some(Ok((bv, bg, bh))) = kern.batched_value_grad_hess_all() {
+                if bv.len() == n && bg.len() == n && bh.len() == n {
+                    return Ok(RowKernelCache {
+                        n,
+                        p,
+                        nll: bv,
+                        gradients: bg,
+                        hessians: bh,
+                    });
+                }
+            }
             // Pool-aware block size (issue #1045): a few-per-worker partition of
             // the row range instead of one task per 256-row arrow tile, so the
             // light per-row jet build does not pay `n/256` task entries of
