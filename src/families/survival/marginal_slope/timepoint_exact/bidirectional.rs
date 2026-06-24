@@ -2170,8 +2170,6 @@ impl SurvivalMarginalSlopeFamily {
             eta_uv_uv,
             chi_uv_uv,
             d_uv_uv,
-            #[cfg(test)]
-            auvd12,
         })
     }
 }

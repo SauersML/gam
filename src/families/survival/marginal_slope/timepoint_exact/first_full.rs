@@ -1003,8 +1003,6 @@ impl SurvivalMarginalSlopeFamily {
             chi_uv,
             d_u,
             d_uv,
-            #[cfg(test)]
-            a_uv,
         })
     }
 }
