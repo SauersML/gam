@@ -147,6 +147,11 @@ jobs:
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
           manylinux: auto
+          # #1534: inside the manylinux container the mounted workspace is
+          # owned by a different uid than the build user, so git refuses
+          # build.rs's author-gate `git log` with "detected dubious ownership"
+          # and the build panics. Trust the mounted tree before the build runs.
+          before-script-linux: git config --global --add safe.directory '*'
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-linux-${{ matrix.platform.target }}
@@ -186,6 +191,10 @@ jobs:
             --out dist
             --manifest-path crates/gam-pyffi/Cargo.toml
           manylinux: musllinux_1_2
+          # #1534: same dubious-ownership fix as the manylinux job — the
+          # musllinux_1_2 container mounts the workspace under a foreign uid,
+          # blocking build.rs's `git log` author gate.
+          before-script-linux: git config --global --add safe.directory '*'
       - uses: actions/upload-artifact@v4
         with:
           name: wheels-musllinux-${{ matrix.target }}
