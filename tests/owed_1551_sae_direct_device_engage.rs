@@ -48,7 +48,7 @@ use ndarray::Array2;
 /// fixture so the dense per-row `htbeta` slabs + dense `hbb` make the CPU dense
 /// reference an exact baseline for the device-solved step. Returns the system
 /// with `device_sae_pcg` installed.
-fn build_framed_sae_system() -> ArrowSchurSystem {
+fn build_framed_sae_system(install_device_data: bool) -> ArrowSchurSystem {
     let p = 6usize;
     let n_atoms = 8usize;
     let ranks: Vec<usize> = (0..n_atoms)
@@ -215,22 +215,28 @@ fn build_framed_sae_system() -> ArrowSchurSystem {
     // row (the full-`B` residency operator's per-row support). The framed kernel
     // consumes `frame.row_htbeta` instead and ignores these, but the installer's
     // shape contract still requires `n` (here empty) entries.
-    sys.set_device_sae_pcg_data(DeviceSaePcgData {
-        p,
-        beta_dim: border_dim,
-        a_phi: vec![Vec::new(); n],
-        local_jac: vec![Vec::new(); n],
-        smooth_blocks,
-        sparse_g_blocks: Vec::new(),
-        frame: Some(DeviceSaeFrameData {
-            ranks,
-            basis_sizes,
-            border_offsets,
-            frame_blocks,
-            smooth_ranks,
-            row_htbeta,
-        }),
-    });
+    //
+    // `install_device_data == false` yields the IDENTICAL system without the
+    // device frames — the device-free CPU Direct path, the exact bit-identity
+    // baseline the device-solved step must reproduce.
+    if install_device_data {
+        sys.set_device_sae_pcg_data(DeviceSaePcgData {
+            p,
+            beta_dim: border_dim,
+            a_phi: vec![Vec::new(); n],
+            local_jac: vec![Vec::new(); n],
+            smooth_blocks,
+            sparse_g_blocks: Vec::new(),
+            frame: Some(DeviceSaeFrameData {
+                ranks,
+                basis_sizes,
+                border_offsets,
+                frame_blocks,
+                smooth_ranks,
+                row_htbeta,
+            }),
+        });
+    }
     sys
 }
 
@@ -242,7 +248,7 @@ fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
 
 #[test]
 fn sae_direct_mode_engages_device_on_production_entry_1551() {
-    let sys = build_framed_sae_system();
+    let sys = build_framed_sae_system(true);
 
     // The wide factored border must clear the device-loop floor; this is the
     // shape the Phase-1 offload predicate admits. If this regresses below the

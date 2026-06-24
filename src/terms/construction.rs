@@ -3184,6 +3184,85 @@ mod tests {
     }
 
     #[test]
+    fn kronecker_memoized_invariant_is_bit_identical_to_unmemoized_engine() {
+        // The hot-path memoization (compute the marginal eigensystems /
+        // reparameterized marginals once, reuse across outer iterates) must
+        // produce a KroneckerReparamResult that is *bit-identical* to the
+        // unmemoized engine for the same marginal data and λ — the cached work
+        // is literally the same eigendecomposition. Cover several λ on one fixed
+        // invariant structure (the realistic outer-loop pattern).
+        let marginal_designs = vec![
+            array![[1.0, 0.3, -0.2], [0.4, 1.0, 0.1], [-0.1, 0.2, 1.0]],
+            array![[1.0, -0.5], [0.2, 1.0], [0.7, 0.3]],
+        ];
+        let marginal_penalties = vec![
+            array![[2.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0]],
+            array![[3.0, -1.5], [-1.5, 3.0]],
+        ];
+        let marginal_dims = vec![3usize, 2usize];
+
+        let invariant = super::KroneckerInvariantStructure::compute(
+            &marginal_designs,
+            &marginal_penalties,
+            &marginal_dims,
+        )
+        .expect("invariant structure");
+
+        for lambdas in [
+            vec![5.0, 7.0],
+            vec![0.0, 7.0],
+            vec![5.0, 0.0],
+            vec![1e-3, 1e3],
+        ] {
+            for floor in [None, Some(1e-6)] {
+                let unmemoized = super::kronecker_reparameterization_engine(
+                    &marginal_designs,
+                    &marginal_penalties,
+                    &marginal_dims,
+                    &lambdas,
+                    true,
+                    floor,
+                )
+                .expect("unmemoized engine");
+                let memoized = super::kronecker_reparameterization_engine_with_invariant(
+                    &invariant,
+                    &marginal_dims,
+                    &lambdas,
+                    true,
+                    floor,
+                )
+                .expect("memoized engine");
+
+                assert_eq!(memoized.log_det.to_bits(), unmemoized.log_det.to_bits());
+                assert_eq!(
+                    memoized.penalty_shrinkage_ridge.to_bits(),
+                    unmemoized.penalty_shrinkage_ridge.to_bits()
+                );
+                for (a, b) in memoized.det1.iter().zip(unmemoized.det1.iter()) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (a, b) in memoized.det2.iter().zip(unmemoized.det2.iter()) {
+                    assert_eq!(a.to_bits(), b.to_bits());
+                }
+                for (ma, ua) in memoized
+                    .reparameterized_marginals
+                    .iter()
+                    .zip(unmemoized.reparameterized_marginals.iter())
+                {
+                    for (a, b) in ma.iter().zip(ua.iter()) {
+                        assert_eq!(a.to_bits(), b.to_bits());
+                    }
+                }
+                for (mq, uq) in memoized.marginal_qs.iter().zip(unmemoized.marginal_qs.iter()) {
+                    for (a, b) in mq.iter().zip(uq.iter()) {
+                        assert_eq!(a.to_bits(), b.to_bits());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn kronecker_double_penalty_shrinks_only_joint_null_space() {
         let marginal_designs = vec![Array2::<f64>::eye(2), Array2::<f64>::eye(2)];
         let marginal_penalties = vec![
