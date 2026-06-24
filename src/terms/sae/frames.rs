@@ -376,6 +376,87 @@ impl FrameProjection {
     }
 }
 
+/// Build the frames-engaged device SAE PCG data (issue #1017/#1026): the
+/// factored-border analogue of the full-`B` `DeviceSaePcgData`. The penalty side
+/// carries the smooth `λ S_k ⊗ I_{r_k}` blocks (right-width `r_k`, at `off_c[k]`)
+/// and the data-fit `G_{ij} ⊗ W_{ij}` blocks; the reduced-Schur side carries the
+/// per-row DENSE cross-block `H_tβ^(i)` as a row-major `q_i × border_dim` slab.
+///
+/// `args.frame_blocks` are the same `(g, w)` blocks fed to
+/// `FactoredFrameKroneckerOp`, snapshotted before that op consumed them.
+/// `args.smooth_scaled_s[k]` is `λ S_k` (`M_k × M_k`). A row whose `htbeta` is
+/// not at the factored width contributes an empty slab (reduced-Schur term zero).
+pub(crate) struct FramedDeviceArgs<'a> {
+    pub p: usize,
+    pub border_dim: usize,
+    pub border_offsets: &'a [usize],
+    pub ranks: &'a [usize],
+    pub basis_sizes: &'a [usize],
+    pub smooth_scaled_s: &'a [Array2<f64>],
+    pub frame_blocks: Vec<crate::solver::arrow_schur::FactoredFrameGBlock>,
+    pub rows: &'a [crate::solver::arrow_schur::ArrowRowBlock],
+}
+
+pub(crate) fn build_framed_device_sae_data(
+    args: FramedDeviceArgs<'_>,
+) -> crate::solver::arrow_schur::DeviceSaePcgData {
+    use crate::solver::arrow_schur::{
+        DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock,
+    };
+    let FramedDeviceArgs {
+        p,
+        border_dim,
+        border_offsets,
+        ranks,
+        basis_sizes,
+        smooth_scaled_s,
+        frame_blocks,
+        rows,
+    } = args;
+    let n_atoms = ranks.len();
+    let mut smooth_blocks = Vec::with_capacity(n_atoms);
+    let mut smooth_ranks = Vec::with_capacity(n_atoms);
+    for k in 0..n_atoms {
+        smooth_blocks.push(DeviceSaeSmoothBlock {
+            global_offset: border_offsets[k],
+            factor_a: smooth_scaled_s[k].clone(),
+        });
+        smooth_ranks.push(ranks[k]);
+    }
+    let row_htbeta: Vec<Vec<f64>> = rows
+        .iter()
+        .map(|row| {
+            let (qi, w) = row.htbeta.dim();
+            if w != border_dim {
+                return Vec::new();
+            }
+            let mut flat = vec![0.0_f64; qi * w];
+            for c in 0..qi {
+                for a in 0..w {
+                    flat[c * w + a] = row.htbeta[[c, a]];
+                }
+            }
+            flat
+        })
+        .collect();
+    DeviceSaePcgData {
+        p,
+        beta_dim: border_dim,
+        a_phi: Vec::new(),
+        local_jac: Vec::new(),
+        smooth_blocks,
+        sparse_g_blocks: Vec::new(),
+        frame: Some(DeviceSaeFrameData {
+            ranks: ranks.to_vec(),
+            basis_sizes: basis_sizes.to_vec(),
+            border_offsets: border_offsets.to_vec(),
+            frame_blocks,
+            smooth_ranks,
+            row_htbeta,
+        }),
+    }
+}
+
 /// Relative spectral cutoff used when the Grassmann-frame factorization decides
 /// the effective column rank `r` of an atom's decoder `B_k` (issue #972). A
 /// singular value of `B_k` below `cutoff · σ_max` carries `< (σ/σ_max)²` of the

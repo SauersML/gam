@@ -5128,6 +5128,10 @@ impl SaeManifoldTerm {
                     w,
                 });
             }
+            // #1017/#1026 — snapshot the factored data-fit blocks for the
+            // frames-engaged device PCG BEFORE `FactoredFrameKroneckerOp::new`
+            // consumes them. Cheap clone (co-occurring blocks only).
+            let device_frame_blocks = frame_blocks.clone();
             let data_op =
                 FactoredFrameKroneckerOp::new(ranks.clone(), basis_sizes.clone(), frame_blocks)?;
 
@@ -5180,6 +5184,27 @@ impl SaeManifoldTerm {
             }
             sys.set_block_offsets(Arc::from(block_ranges.into_boxed_slice()));
             sys.set_penalty_op(Arc::new(CompositePenaltyOp { k: border_dim, ops }));
+            // #1017/#1026 — install the frames-engaged device SAE PCG data. Skipped
+            // (CPU fallback) when a dense analytic Beta-tier penalty fired (the
+            // device kernel does not model that extra dense term). Builder:
+            // `crate::terms::sae::frames::build_framed_device_sae_data`.
+            let has_dense_beta_penalty =
+                beta_penalty_assembly.dense_written || beta_penalty_assembly.deferred_factored;
+            if !has_dense_beta_penalty {
+                let device = crate::terms::sae::frames::build_framed_device_sae_data(
+                    crate::terms::sae::frames::FramedDeviceArgs {
+                        p,
+                        border_dim,
+                        border_offsets: off_c.as_slice(),
+                        ranks: ranks.as_slice(),
+                        basis_sizes: basis_sizes.as_slice(),
+                        smooth_scaled_s: &smooth_scaled_s,
+                        frame_blocks: device_frame_blocks,
+                        rows: &sys.rows,
+                    },
+                );
+                sys.set_device_sae_pcg_data(device);
+            }
         } else {
             let (device_a_phi, device_local_jac) =
                 device_rows.expect("full-beta SAE PCG rows are cloned before row operator install");
@@ -5236,6 +5261,7 @@ impl SaeManifoldTerm {
                 local_jac: device_local_jac,
                 smooth_blocks: device_smooth_blocks,
                 sparse_g_blocks: g_sparse_blocks.clone(),
+                frame: None,
             });
             let mut ops: Vec<Arc<dyn BetaPenaltyOp>> = smooth_ops;
             ops.push(Arc::new(SparseBlockKroneckerPenaltyOp {

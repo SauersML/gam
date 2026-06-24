@@ -698,15 +698,33 @@ pub fn solve_sae_matrix_free_pcg(
     }
     #[cfg(target_os = "linux")]
     {
-        cuda::solve_sae_matrix_free_pcg(
-            sys,
-            data,
-            ridge_t,
-            ridge_beta,
-            rhs_beta,
-            max_iterations,
-            relative_tolerance,
-        )
+        // #1017/#1026 dispatch GUARD: framed data (frame metadata present) carries
+        // a factored β border `G ⊗ W_{ij}` data Hessian and dense per-row cross
+        // blocks the legacy `⊗ I_p` kernel CANNOT represent — feeding it framed
+        // data would silently return a WRONG Newton step (it returns Ok with no
+        // fallback). Route framed systems to the dedicated framed kernel and
+        // legacy full-`B` systems to the legacy kernel; the two never cross.
+        if data.frame.is_some() {
+            cuda::solve_sae_matrix_free_pcg_framed(
+                sys,
+                data,
+                ridge_t,
+                ridge_beta,
+                rhs_beta,
+                max_iterations,
+                relative_tolerance,
+            )
+        } else {
+            cuda::solve_sae_matrix_free_pcg(
+                sys,
+                data,
+                ridge_t,
+                ridge_beta,
+                rhs_beta,
+                max_iterations,
+                relative_tolerance,
+            )
+        }
     }
 }
 
@@ -768,13 +786,155 @@ pub fn solve_arrow_newton_step_dense_reference(
     })
 }
 
+/// Frames-engaged reduced-Schur penalty-side matvec `out = (P_ββ + ρ_β I)·x`,
+/// computed purely from the factored device data (issue #1017/#1026). This is
+/// the CPU bit-parity ORACLE for the GPU `arrow_sae_*` penalty kernels on the
+/// frames path: smooth `λ S_k ⊗ I_{r_k}` (each `smooth_blocks[i]` at its
+/// `global_offset` with right-width `frame.smooth_ranks[i]`) plus data-fit
+/// `G_{ij} ⊗ W_{ij}` (each `frame.frame_blocks` entry, with the `μ`-major /
+/// frame-minor index `border_offset[atom] + basis·r + frame_coord`). The
+/// accumulation order matches the device kernels exactly.
+///
+/// `out` is OVERWRITTEN: first set to `ρ_β·x`, then the penalty blocks add in.
+#[doc(hidden)]
+pub fn sae_framed_penalty_matvec_cpu(
+    data: &DeviceSaePcgData,
+    ridge_beta: f64,
+    x: &[f64],
+    out: &mut [f64],
+) {
+    let frame = data
+        .frame
+        .as_ref()
+        .expect("sae_framed_penalty_matvec_cpu requires frame metadata");
+    let k = data.beta_dim;
+    for a in 0..k {
+        out[a] = ridge_beta * x[a];
+    }
+    // Smooth penalty `λ S_k ⊗ I_{r_k}`: y[off + ia·r + ib] += Σ_ja S[ia,ja]·x[off + ja·r + ib].
+    for (blk, &r) in data.smooth_blocks.iter().zip(frame.smooth_ranks.iter()) {
+        let off = blk.global_offset;
+        let m = blk.factor_a.nrows();
+        for i_a in 0..m {
+            for i_b in 0..r {
+                let mut acc = 0.0_f64;
+                for j_a in 0..m {
+                    let s = blk.factor_a[[i_a, j_a]];
+                    if s == 0.0 {
+                        continue;
+                    }
+                    acc += s * x[off + j_a * r + i_b];
+                }
+                out[off + i_a * r + i_b] += acc;
+            }
+        }
+    }
+    // Data-fit penalty `G_{ij} ⊗ W_{ij}`.
+    for blk in &frame.frame_blocks {
+        let r_i = frame.ranks[blk.atom_i];
+        let r_j = frame.ranks[blk.atom_j];
+        let off_i = frame.border_offsets[blk.atom_i];
+        let off_j = frame.border_offsets[blk.atom_j];
+        let (m_i, m_j) = blk.g.dim();
+        for li in 0..m_i {
+            let yi_base = off_i + li * r_i;
+            for lj in 0..m_j {
+                let g = blk.g[[li, lj]];
+                if g == 0.0 {
+                    continue;
+                }
+                let xj_base = off_j + lj * r_j;
+                for a in 0..r_i {
+                    let mut acc = 0.0_f64;
+                    for b in 0..r_j {
+                        acc += blk.w[[a, b]] * x[xj_base + b];
+                    }
+                    out[yi_base + a] += g * acc;
+                }
+            }
+        }
+    }
+}
+
+/// Frames-engaged FULL reduced-Schur matvec `out = S·x` purely from the device
+/// data, where `S = (P_ββ + ρ_β I) − Σ_i H_βt^(i)(H_tt^(i)+ρ_t I)⁻¹ H_tβ^(i)`
+/// (issue #1017/#1026). The penalty side is [`sae_framed_penalty_matvec_cpu`];
+/// the per-row reduced term reads the dense `frame.row_htbeta[i]`
+/// (`q_i × border_dim`, row-major), solves against the row's
+/// `H_tt^(i)+ρ_t I` Cholesky factor, and scatters the transpose back. This is
+/// the size-independent bit-parity oracle the device kernel mirrors; it is also
+/// the matvec the GPU PCG iterates.
+#[doc(hidden)]
+pub fn sae_framed_schur_matvec_cpu(
+    sys: &ArrowSchurSystem,
+    data: &DeviceSaePcgData,
+    ridge_t: f64,
+    ridge_beta: f64,
+    x: &[f64],
+    out: &mut [f64],
+) -> Result<(), String> {
+    let frame = data
+        .frame
+        .as_ref()
+        .ok_or("sae_framed_schur_matvec_cpu requires frame metadata")?;
+    let k = data.beta_dim;
+    sae_framed_penalty_matvec_cpu(data, ridge_beta, x, out);
+    if frame.row_htbeta.len() != sys.rows.len() {
+        return Err(format!(
+            "sae_framed_schur_matvec_cpu: {} row_htbeta slabs but {} rows",
+            frame.row_htbeta.len(),
+            sys.rows.len()
+        ));
+    }
+    for (i, row) in sys.rows.iter().enumerate() {
+        let slab = &frame.row_htbeta[i];
+        if slab.is_empty() {
+            continue;
+        }
+        let qi = sys.row_dims[i];
+        if qi == 0 || slab.len() != qi * k {
+            continue;
+        }
+        // h = H_tβ^(i) · x  (length q_i).
+        let mut h = vec![0.0_f64; qi];
+        for c in 0..qi {
+            let base = c * k;
+            let mut acc = 0.0_f64;
+            for a in 0..k {
+                acc += slab[base + a] * x[a];
+            }
+            h[c] = acc;
+        }
+        // solve (H_tt^(i)+ρ_t I) s = h.
+        let mut block = row.htt.clone();
+        for d in 0..qi {
+            block[[d, d]] += ridge_t;
+        }
+        let factor = cholesky_factor_in_place(block.view(), CholeskyGuard::NonnegativePivot)
+            .ok_or_else(|| format!("sae_framed_schur_matvec_cpu: row {i} H_tt not PD"))?;
+        let s = cholesky_solve_vector(factor.view(), Array1::from_vec(h).view());
+        // out -= H_βt^(i) · s = (H_tβ^(i))ᵀ · s.
+        for c in 0..qi {
+            let sc = s[c];
+            if sc == 0.0 {
+                continue;
+            }
+            let base = c * k;
+            for a in 0..k {
+                out[a] -= slab[base + a] * sc;
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 mod cuda {
     use super::{ArrowSchurGpuFailure, ArrowSchurGpuSolution, pack_block, pack_host};
     use crate::gpu::driver::to_i32;
     use crate::gpu::linalg_dispatch::{DispatchOp, route_through_gpu};
     use crate::solver::arrow_schur::{
-        ArrowSchurSystem, DeviceSaePcgData, PcgDiagnostics, PcgStopReason,
+        ArrowSchurSystem, DeviceSaeFrameData, DeviceSaePcgData, PcgDiagnostics, PcgStopReason,
     };
     use cudarc::cublas::sys::{
         cublasDiagType_t, cublasFillMode_t, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
@@ -1975,6 +2135,191 @@ extern "C" __global__ void arrow_sae_diag_sub(
         double pe = phi[e];
         atomicAdd(&diag[beta_base[e] + oc], -(pe * pe) * quad);
     }
+}
+
+/* ── #1017/#1026 frames-engaged device kernels ─────────────────────────────
+ * The factored β border is C-space (width Σ M_k·r_k). The penalty side is the
+ * smooth `λ S_k ⊗ I_{r_k}` (per-block right-width r_k) plus the data-fit
+ * `G_{ij} ⊗ W_{ij}` (W = U_iᵀU_j, dense r_i×r_j). The reduced-Schur term uses
+ * the per-row DENSE cross-block H_tβ^(i) (q_i × border_dim, row-major). */
+
+extern "C" __global__ void arrow_sae_frame_smooth_matvec(
+    const double* __restrict__ x,
+    double* __restrict__ out,
+    const int* __restrict__ block_offsets,
+    const int* __restrict__ block_m,
+    const int* __restrict__ block_r,
+    const int* __restrict__ factor_ptr,
+    const double* __restrict__ factors,
+    int n_blocks
+) {
+    int block_id = blockIdx.y;
+    int linear = blockIdx.x * blockDim.x + threadIdx.x;
+    if (block_id >= n_blocks) {
+        return;
+    }
+    int m = block_m[block_id];
+    int r = block_r[block_id];
+    int total = m * r;
+    if (linear >= total) {
+        return;
+    }
+    int li = linear / r;
+    int ib = linear - li * r;
+    int off = block_offsets[block_id];
+    int fbase = factor_ptr[block_id];
+    double acc = 0.0;
+    for (int lj = 0; lj < m; ++lj) {
+        double a = factors[fbase + li * m + lj];
+        acc += a * x[off + lj * r + ib];
+    }
+    out[off + li * r + ib] += acc;
+}
+
+extern "C" __global__ void arrow_sae_frame_g_matvec(
+    const double* __restrict__ x,
+    double* __restrict__ out,
+    const int* __restrict__ off_i,
+    const int* __restrict__ off_j,
+    const int* __restrict__ r_i,
+    const int* __restrict__ r_j,
+    const int* __restrict__ m_i,
+    const int* __restrict__ m_j,
+    const int* __restrict__ g_ptr,
+    const double* __restrict__ g_data,
+    const int* __restrict__ w_ptr,
+    const double* __restrict__ w_data,
+    int n_blocks
+) {
+    int block_id = blockIdx.y;
+    int linear = blockIdx.x * blockDim.x + threadIdx.x;
+    if (block_id >= n_blocks) {
+        return;
+    }
+    int ri = r_i[block_id];
+    int rj = r_j[block_id];
+    int mi = m_i[block_id];
+    int mj = m_j[block_id];
+    int total = mi * ri;
+    if (linear >= total) {
+        return;
+    }
+    int li = linear / ri;       // basis row in atom i
+    int a = linear - li * ri;   // frame coord in atom i
+    int oi = off_i[block_id];
+    int oj = off_j[block_id];
+    int gbase = g_ptr[block_id];
+    int wbase = w_ptr[block_id];
+    double acc = 0.0;
+    for (int lj = 0; lj < mj; ++lj) {
+        double g = g_data[gbase + li * mj + lj];
+        if (g == 0.0) { continue; }
+        int xj_base = oj + lj * rj;
+        double inner = 0.0;
+        for (int b = 0; b < rj; ++b) {
+            inner += w_data[wbase + a * rj + b] * x[xj_base + b];
+        }
+        acc += g * inner;
+    }
+    out[oi + li * ri + a] += acc;
+}
+
+/* Per-row reduced-Schur subtraction with a DENSE cross-block H_tβ^(i).
+ *   h_i   = H_tβ^(i) · x                (length q_i)
+ *   s_i   = (H_tt^(i)+ρ_t I)⁻¹ h_i      (apply cached ainv, length q_i)
+ *   out  -= (H_tβ^(i))ᵀ · s_i           (scatter into border_dim)
+ * `htb` is row-major (q_i × k) flattened, `htb_ptr` gives each row's base and
+ * (htb_ptr[row+1]-htb_ptr[row])/k == q_i. `q_of` carries q_i directly. */
+extern "C" __global__ void arrow_sae_frame_apply_h(
+    const double* __restrict__ x,
+    const int* __restrict__ htb_ptr,
+    const double* __restrict__ htb,
+    const int* __restrict__ q_of,
+    double* __restrict__ hvec,
+    int k,
+    int max_q,
+    int n_rows
+) {
+    int row = blockIdx.y;
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows) { return; }
+    int q = q_of[row];
+    if (c >= q) { return; }
+    int base = htb_ptr[row] + c * k;
+    double acc = 0.0;
+    for (int a = 0; a < k; ++a) {
+        acc += htb[base + a] * x[a];
+    }
+    hvec[row * max_q + c] = acc;
+}
+
+extern "C" __global__ void arrow_sae_frame_apply_ainv(
+    const double* __restrict__ ainv,
+    const double* __restrict__ hvec,
+    const int* __restrict__ q_of,
+    double* __restrict__ svec,
+    int max_q,
+    int n_rows
+) {
+    int row = blockIdx.y;
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows || c >= max_q) { return; }
+    int q = q_of[row];
+    double acc = 0.0;
+    int abase = row * max_q * max_q;
+    for (int j = 0; j < q; ++j) {
+        acc += ainv[abase + c * max_q + j] * hvec[row * max_q + j];
+    }
+    svec[row * max_q + c] = acc;
+}
+
+extern "C" __global__ void arrow_sae_frame_scatter_h(
+    const double* __restrict__ svec,
+    const int* __restrict__ htb_ptr,
+    const double* __restrict__ htb,
+    const int* __restrict__ q_of,
+    double* __restrict__ out,
+    int k,
+    int max_q,
+    int n_rows
+) {
+    int row = blockIdx.y;
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows || a >= k) { return; }
+    int q = q_of[row];
+    int hbase = htb_ptr[row];
+    double acc = 0.0;
+    for (int c = 0; c < q; ++c) {
+        acc += htb[hbase + c * k + a] * svec[row * max_q + c];
+    }
+    atomicAdd(&out[a], -acc);
+}
+
+/* Frame Jacobi diagonal subtraction: diag[a] -= Σ_c Σ_d H_tβ[c,a]·ainv[c,d]·H_tβ[d,a]. */
+extern "C" __global__ void arrow_sae_frame_diag_sub(
+    double* __restrict__ diag,
+    const double* __restrict__ ainv,
+    const int* __restrict__ htb_ptr,
+    const double* __restrict__ htb,
+    const int* __restrict__ q_of,
+    int k,
+    int max_q,
+    int n_rows
+) {
+    int row = blockIdx.y;
+    int a = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n_rows || a >= k) { return; }
+    int q = q_of[row];
+    int hbase = htb_ptr[row];
+    int abase = row * max_q * max_q;
+    double quad = 0.0;
+    for (int c = 0; c < q; ++c) {
+        double hc = htb[hbase + c * k + a];
+        for (int d = 0; d < q; ++d) {
+            quad += hc * ainv[abase + c * max_q + d] * htb[hbase + d * k + a];
+        }
+    }
+    atomicAdd(&diag[a], -quad);
 }
 "#;
 
@@ -3336,6 +3681,575 @@ extern "C" __global__ void arrow_sae_diag_sub(
         Ok(closure)
     }
 
+    // ── #1017/#1026 frames-engaged device PCG ──────────────────────────────
+
+    struct DeviceSaeFrameBuffers {
+        // Smooth `λ S_k ⊗ I_{r_k}`.
+        s_off: CudaSlice<i32>,
+        s_m: CudaSlice<i32>,
+        s_r: CudaSlice<i32>,
+        s_ptr: CudaSlice<i32>,
+        s_data: CudaSlice<f64>,
+        s_blocks: usize,
+        // Data `G_{ij} ⊗ W_{ij}`.
+        g_off_i: CudaSlice<i32>,
+        g_off_j: CudaSlice<i32>,
+        g_ri: CudaSlice<i32>,
+        g_rj: CudaSlice<i32>,
+        g_mi: CudaSlice<i32>,
+        g_mj: CudaSlice<i32>,
+        g_ptr: CudaSlice<i32>,
+        g_data: CudaSlice<f64>,
+        w_ptr: CudaSlice<i32>,
+        w_data: CudaSlice<f64>,
+        g_blocks: usize,
+        g_max_work: usize,
+        // Per-row dense cross-block H_tβ^(i) + row q + factored ainv.
+        htb_ptr: CudaSlice<i32>,
+        htb: CudaSlice<f64>,
+        q_of: CudaSlice<i32>,
+        ainv: CudaSlice<f64>,
+        hvec: CudaSlice<f64>,
+        svec: CudaSlice<f64>,
+        n_rows: usize,
+        k: usize,
+        max_q: usize,
+    }
+
+    fn flatten_device_sae_frame_data(
+        sys: &ArrowSchurSystem,
+        data: &DeviceSaePcgData,
+        frame: &DeviceSaeFrameData,
+        ridge_t: f64,
+        stream: &Arc<CudaStream>,
+    ) -> Result<DeviceSaeFrameBuffers, ArrowSchurGpuFailure> {
+        let n_rows = sys.rows.len();
+        let k = data.beta_dim;
+        if frame.row_htbeta.len() != n_rows
+            || frame.ranks.len() != frame.basis_sizes.len()
+            || frame.border_offsets.len() != frame.ranks.len()
+            || data.smooth_blocks.len() != frame.smooth_ranks.len()
+        {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+
+        // Smooth blocks.
+        let mut s_off = Vec::new();
+        let mut s_m = Vec::new();
+        let mut s_r = Vec::new();
+        let mut s_ptr = vec![0_i32];
+        let mut s_data = Vec::<f64>::new();
+        for (blk, &r) in data.smooth_blocks.iter().zip(frame.smooth_ranks.iter()) {
+            let (m, mc) = blk.factor_a.dim();
+            if m != mc {
+                return Err(ArrowSchurGpuFailure::Unavailable);
+            }
+            s_off.push(checked_i32(blk.global_offset)?);
+            s_m.push(checked_i32(m)?);
+            s_r.push(checked_i32(r)?);
+            for ri in 0..m {
+                for ci in 0..m {
+                    s_data.push(blk.factor_a[[ri, ci]]);
+                }
+            }
+            s_ptr.push(checked_i32(s_data.len())?);
+        }
+
+        // Data blocks (g + w).
+        let mut g_off_i = Vec::new();
+        let mut g_off_j = Vec::new();
+        let mut g_ri = Vec::new();
+        let mut g_rj = Vec::new();
+        let mut g_mi = Vec::new();
+        let mut g_mj = Vec::new();
+        let mut g_ptr = vec![0_i32];
+        let mut g_data = Vec::<f64>::new();
+        let mut w_ptr = vec![0_i32];
+        let mut w_data = Vec::<f64>::new();
+        let mut g_max_work = 0usize;
+        for blk in &frame.frame_blocks {
+            let ri = frame.ranks[blk.atom_i];
+            let rj = frame.ranks[blk.atom_j];
+            let (mi, mj) = blk.g.dim();
+            if blk.w.dim() != (ri, rj) {
+                return Err(ArrowSchurGpuFailure::Unavailable);
+            }
+            g_off_i.push(checked_i32(frame.border_offsets[blk.atom_i])?);
+            g_off_j.push(checked_i32(frame.border_offsets[blk.atom_j])?);
+            g_ri.push(checked_i32(ri)?);
+            g_rj.push(checked_i32(rj)?);
+            g_mi.push(checked_i32(mi)?);
+            g_mj.push(checked_i32(mj)?);
+            for r in 0..mi {
+                for c in 0..mj {
+                    g_data.push(blk.g[[r, c]]);
+                }
+            }
+            g_ptr.push(checked_i32(g_data.len())?);
+            for a in 0..ri {
+                for b in 0..rj {
+                    w_data.push(blk.w[[a, b]]);
+                }
+            }
+            w_ptr.push(checked_i32(w_data.len())?);
+            g_max_work = g_max_work.max(mi * ri);
+        }
+
+        // Per-row dense cross-block + q + ainv (factored H_tt⁻¹).
+        let mut htb_ptr = vec![0_i32];
+        let mut htb = Vec::<f64>::new();
+        let mut q_of = Vec::<i32>::with_capacity(n_rows);
+        let mut max_q = 0usize;
+        for (i, slab) in frame.row_htbeta.iter().enumerate() {
+            let qi = sys.row_dims[i];
+            // A populated slab must be q_i × k row-major; an empty slab ⇒ q=0
+            // (the row contributes no reduced-Schur term).
+            let q_eff = if !slab.is_empty() && slab.len() == qi * k {
+                qi
+            } else {
+                0
+            };
+            q_of.push(checked_i32(q_eff)?);
+            max_q = max_q.max(q_eff);
+            if q_eff > 0 {
+                htb.extend_from_slice(slab);
+            }
+            htb_ptr.push(checked_i32(htb.len())?);
+        }
+        if max_q == 0 {
+            // No row contributes a reduced term — the system is pure-penalty.
+            // Still valid; give max_q=1 so the ainv buffer is non-empty.
+            max_q = 1;
+        }
+
+        let mut ainv = vec![0.0_f64; n_rows * max_q * max_q];
+        for (i, row) in sys.rows.iter().enumerate() {
+            let q = q_of[i] as usize;
+            if q == 0 {
+                continue;
+            }
+            if row.htt.dim() != (q, q) {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: format!(
+                        "framed SAE device PCG row {i}: H_tt shape {:?} != ({q}, {q})",
+                        row.htt.dim()
+                    ),
+                });
+            }
+            let mut block = row.htt.clone();
+            for d in 0..q {
+                block[[d, d]] += ridge_t;
+            }
+            let factor = crate::linalg::triangular::cholesky_factor_in_place(
+                block.view(),
+                crate::linalg::triangular::CholeskyGuard::NonnegativePivot,
+            )
+            .ok_or_else(|| {
+                let scale = row
+                    .htt
+                    .diag()
+                    .iter()
+                    .map(|v| v.abs())
+                    .fold(0.0_f64, f64::max)
+                    .max(1.0);
+                ArrowSchurGpuFailure::RidgeBumpRequired {
+                    row: i,
+                    bump: scale * f64::EPSILON.sqrt() * super::RIDGE_BUMP_EPS_MARGIN,
+                }
+            })?;
+            for col in 0..q {
+                let mut e = Array1::<f64>::zeros(q);
+                e[col] = 1.0;
+                let solved =
+                    crate::linalg::triangular::cholesky_solve_vector(factor.view(), e.view());
+                for r in 0..q {
+                    ainv[i * max_q * max_q + r * max_q + col] = solved[r];
+                }
+            }
+        }
+
+        let htod_i = |v: &[i32]| stream.clone_htod(v).map_err(|_| ArrowSchurGpuFailure::Unavailable);
+        let htod_f = |v: &[f64]| stream.clone_htod(v).map_err(|_| ArrowSchurGpuFailure::Unavailable);
+        Ok(DeviceSaeFrameBuffers {
+            s_off: htod_i(&s_off)?,
+            s_m: htod_i(&s_m)?,
+            s_r: htod_i(&s_r)?,
+            s_ptr: htod_i(&s_ptr)?,
+            s_data: htod_f(&s_data)?,
+            s_blocks: data.smooth_blocks.len(),
+            g_off_i: htod_i(&g_off_i)?,
+            g_off_j: htod_i(&g_off_j)?,
+            g_ri: htod_i(&g_ri)?,
+            g_rj: htod_i(&g_rj)?,
+            g_mi: htod_i(&g_mi)?,
+            g_mj: htod_i(&g_mj)?,
+            g_ptr: htod_i(&g_ptr)?,
+            g_data: htod_f(&g_data)?,
+            w_ptr: htod_i(&w_ptr)?,
+            w_data: htod_f(&w_data)?,
+            g_blocks: frame.frame_blocks.len(),
+            g_max_work,
+            htb_ptr: htod_i(&htb_ptr)?,
+            htb: htod_f(&htb)?,
+            q_of: htod_i(&q_of)?,
+            ainv: htod_f(&ainv)?,
+            hvec: stream
+                .alloc_zeros::<f64>(n_rows * max_q)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?,
+            svec: stream
+                .alloc_zeros::<f64>(n_rows * max_q)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?,
+            n_rows,
+            k,
+            max_q,
+        })
+    }
+
+    fn sae_frame_penalty_diag_host(
+        data: &DeviceSaePcgData,
+        frame: &DeviceSaeFrameData,
+        ridge_beta: f64,
+    ) -> Result<Vec<f64>, ArrowSchurGpuFailure> {
+        let mut diag = vec![ridge_beta; data.beta_dim];
+        // Smooth: diag[off + ia·r + ib] += S[ia,ia].
+        for (blk, &r) in data.smooth_blocks.iter().zip(frame.smooth_ranks.iter()) {
+            let m = blk.factor_a.nrows();
+            for ia in 0..m {
+                let coeff = blk.factor_a[[ia, ia]];
+                let base = blk.global_offset + ia * r;
+                for ib in 0..r {
+                    if base + ib >= diag.len() {
+                        return Err(ArrowSchurGpuFailure::Unavailable);
+                    }
+                    diag[base + ib] += coeff;
+                }
+            }
+        }
+        // Data: on-diagonal atom blocks contribute g[li,li]·w[a,a].
+        for blk in &frame.frame_blocks {
+            if blk.atom_i != blk.atom_j {
+                continue;
+            }
+            let r = frame.ranks[blk.atom_i];
+            let off = frame.border_offsets[blk.atom_i];
+            let (mi, mj) = blk.g.dim();
+            for li in 0..mi.min(mj) {
+                let gii = blk.g[[li, li]];
+                let base = off + li * r;
+                for a in 0..r {
+                    if base + a >= diag.len() {
+                        return Err(ArrowSchurGpuFailure::Unavailable);
+                    }
+                    diag[base + a] += gii * blk.w[[a, a]];
+                }
+            }
+        }
+        Ok(diag)
+    }
+
+    fn frame_grid(work: usize, n_rows: usize) -> Result<LaunchConfig, ArrowSchurGpuFailure> {
+        Ok(LaunchConfig {
+            grid_dim: (
+                ((work as u32).saturating_add(255) / 256).max(1),
+                checked_i32(n_rows)? as u32,
+                1,
+            ),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        })
+    }
+
+    fn launch_sae_frame_matvec(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        buffers: &mut DeviceSaeFrameBuffers,
+        x: &CudaSlice<f64>,
+        out: &mut CudaSlice<f64>,
+        ridge_beta: f64,
+    ) -> Result<(), ArrowSchurGpuFailure> {
+        launch_sae_init(stream, module, out, x, ridge_beta, buffers.k)?;
+        // Smooth penalty.
+        if buffers.s_blocks > 0 {
+            let kernel = module
+                .load_function("arrow_sae_frame_smooth_matvec")
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let blocks_i32 = checked_i32(buffers.s_blocks)?;
+            let cfg = frame_grid(buffers.k, buffers.s_blocks)?;
+            let mut b = stream.launch_builder(&kernel);
+            b.arg(x)
+                .arg(&mut *out)
+                .arg(&buffers.s_off)
+                .arg(&buffers.s_m)
+                .arg(&buffers.s_r)
+                .arg(&buffers.s_ptr)
+                .arg(&buffers.s_data)
+                .arg(&blocks_i32);
+            // SAFETY: smooth block metadata/data are live device buffers; the grid
+            // covers (k channels × n_blocks) and the kernel bounds-checks m·r.
+            unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        // Data penalty.
+        if buffers.g_blocks > 0 {
+            let kernel = module
+                .load_function("arrow_sae_frame_g_matvec")
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let blocks_i32 = checked_i32(buffers.g_blocks)?;
+            let cfg = frame_grid(buffers.g_max_work.max(1), buffers.g_blocks)?;
+            let mut b = stream.launch_builder(&kernel);
+            b.arg(x)
+                .arg(&mut *out)
+                .arg(&buffers.g_off_i)
+                .arg(&buffers.g_off_j)
+                .arg(&buffers.g_ri)
+                .arg(&buffers.g_rj)
+                .arg(&buffers.g_mi)
+                .arg(&buffers.g_mj)
+                .arg(&buffers.g_ptr)
+                .arg(&buffers.g_data)
+                .arg(&buffers.w_ptr)
+                .arg(&buffers.w_data)
+                .arg(&blocks_i32);
+            // SAFETY: g/w block metadata/data are live device buffers; the grid
+            // covers (max m_i·r_i × n_blocks) and the kernel bounds-checks.
+            unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        // Reduced-Schur subtraction via dense per-row cross-blocks.
+        let k_i32 = checked_i32(buffers.k)?;
+        let max_q_i32 = checked_i32(buffers.max_q)?;
+        let n_rows_i32 = checked_i32(buffers.n_rows)?;
+        {
+            let kernel = module
+                .load_function("arrow_sae_frame_apply_h")
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let cfg = frame_grid(buffers.max_q, buffers.n_rows)?;
+            let mut b = stream.launch_builder(&kernel);
+            b.arg(x)
+                .arg(&buffers.htb_ptr)
+                .arg(&buffers.htb)
+                .arg(&buffers.q_of)
+                .arg(&mut buffers.hvec)
+                .arg(&k_i32)
+                .arg(&max_q_i32)
+                .arg(&n_rows_i32);
+            // SAFETY: dense cross-block + pointers + hvec are live buffers sized
+            // for (n_rows × max_q) / (n_rows × k); kernel guards q_i and k.
+            unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        {
+            let kernel = module
+                .load_function("arrow_sae_frame_apply_ainv")
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let cfg = frame_grid(buffers.max_q, buffers.n_rows)?;
+            let mut b = stream.launch_builder(&kernel);
+            b.arg(&buffers.ainv)
+                .arg(&buffers.hvec)
+                .arg(&buffers.q_of)
+                .arg(&mut buffers.svec)
+                .arg(&max_q_i32)
+                .arg(&n_rows_i32);
+            // SAFETY: ainv/hvec/svec are live buffers sized for n_rows·max_q²
+            // and n_rows·max_q; the kernel guards row/coord bounds.
+            unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        {
+            let kernel = module
+                .load_function("arrow_sae_frame_scatter_h")
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let cfg = frame_grid(buffers.k, buffers.n_rows)?;
+            let mut b = stream.launch_builder(&kernel);
+            b.arg(&buffers.svec)
+                .arg(&buffers.htb_ptr)
+                .arg(&buffers.htb)
+                .arg(&buffers.q_of)
+                .arg(out)
+                .arg(&k_i32)
+                .arg(&max_q_i32)
+                .arg(&n_rows_i32);
+            // SAFETY: svec/cross-block/out are live buffers; the kernel atomically
+            // accumulates into out[a] for a<k and reads c<q_i.
+            unsafe { b.launch(cfg) }.map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        }
+        Ok(())
+    }
+
+    fn launch_sae_frame_diag_sub(
+        stream: &Arc<CudaStream>,
+        module: &Arc<CudaModule>,
+        buffers: &DeviceSaeFrameBuffers,
+        diag: &mut CudaSlice<f64>,
+    ) -> Result<(), ArrowSchurGpuFailure> {
+        let kernel = module
+            .load_function("arrow_sae_frame_diag_sub")
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let k_i32 = checked_i32(buffers.k)?;
+        let max_q_i32 = checked_i32(buffers.max_q)?;
+        let n_rows_i32 = checked_i32(buffers.n_rows)?;
+        let cfg = frame_grid(buffers.k, buffers.n_rows)?;
+        let mut b = stream.launch_builder(&kernel);
+        b.arg(diag)
+            .arg(&buffers.ainv)
+            .arg(&buffers.htb_ptr)
+            .arg(&buffers.htb)
+            .arg(&buffers.q_of)
+            .arg(&k_i32)
+            .arg(&max_q_i32)
+            .arg(&n_rows_i32);
+        // SAFETY: diag + cross-block + ainv live buffers; kernel guards a<k, c/d<q.
+        unsafe { b.launch(cfg) }
+            .map(drop)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)
+    }
+
+    pub(super) fn solve_sae_matrix_free_pcg_framed(
+        sys: &ArrowSchurSystem,
+        data: &DeviceSaePcgData,
+        ridge_t: f64,
+        ridge_beta: f64,
+        rhs_beta: &Array1<f64>,
+        max_iterations: usize,
+        relative_tolerance: f64,
+    ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
+        let k = rhs_beta.len();
+        if k == 0 || data.beta_dim != k || sys.k != k {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+        let frame = data
+            .frame
+            .as_ref()
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let runtime = crate::gpu::device_runtime::GpuRuntime::global()
+            .filter(|rt| {
+                rt.policy().reduced_schur_matvec_should_offload(
+                    sys.rows.len(),
+                    sys.k,
+                    sys.d,
+                    max_iterations,
+                )
+            })
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let stream = ctx
+            .new_stream()
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let vector_module = pcg_vector_module(&ctx)?;
+        let mut buffers = flatten_device_sae_frame_data(sys, data, frame, ridge_t, &stream)?;
+
+        let rhs_norm = rhs_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if rhs_norm == 0.0 {
+            return Ok((Array1::<f64>::zeros(k), PcgDiagnostics::default()));
+        }
+        let tol = (relative_tolerance.max(0.0) * rhs_norm).max(1e-12);
+        let rhs_dev = stream
+            .clone_htod(
+                rhs_beta
+                    .as_slice()
+                    .ok_or(ArrowSchurGpuFailure::Unavailable)?,
+            )
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let diag_host = sae_frame_penalty_diag_host(data, frame, ridge_beta)?;
+        let mut diag_dev = stream
+            .clone_htod(&diag_host)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        launch_sae_frame_diag_sub(&stream, vector_module, &buffers, &mut diag_dev)?;
+        let diag_host = stream
+            .clone_dtoh(&diag_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut inv_diag = Vec::with_capacity(k);
+        for (idx, &d) in diag_host.iter().enumerate() {
+            if !d.is_finite() || d <= 1.0e-18 {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: format!(
+                        "framed SAE GPU PCG: non-positive Jacobi diagonal at {idx}: {d:e}"
+                    ),
+                });
+            }
+            inv_diag.push(1.0 / d);
+        }
+        let inv_diag_dev = stream
+            .clone_htod(&inv_diag)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+        let mut x_dev = stream
+            .alloc_zeros::<f64>(k)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut r_dev = stream
+            .alloc_zeros::<f64>(k)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        device_copy(&blas, &stream, k, &rhs_dev, &mut r_dev)?;
+        let mut z_dev = stream
+            .alloc_zeros::<f64>(k)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        launch_jacobi_mul(&stream, vector_module, &inv_diag_dev, &r_dev, &mut z_dev, k)?;
+        let mut p_dev = stream
+            .alloc_zeros::<f64>(k)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        device_copy(&blas, &stream, k, &z_dev, &mut p_dev)?;
+        let mut ap_dev = stream
+            .alloc_zeros::<f64>(k)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+
+        let mut rz = device_dot(&blas, &stream, k, &r_dev, &z_dev)?;
+        if rz <= 0.0 || !rz.is_finite() {
+            return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                reason: format!("framed SAE GPU PCG: non-positive initial rᵀM⁻¹r={rz:e}"),
+            });
+        }
+        let mut diag = PcgDiagnostics {
+            precond_apply_calls: 1,
+            stopping_reason: PcgStopReason::MaxIter,
+            ..PcgDiagnostics::default()
+        };
+        for _ in 0..max_iterations.max(1) {
+            launch_sae_frame_matvec(
+                &stream,
+                vector_module,
+                &mut buffers,
+                &p_dev,
+                &mut ap_dev,
+                ridge_beta,
+            )?;
+            diag.matvec_calls += 1;
+            diag.iterations += 1;
+            let pap = device_dot(&blas, &stream, k, &p_dev, &ap_dev)?;
+            if pap <= 0.0 || !pap.is_finite() {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: format!("framed SAE GPU PCG: non-positive curvature pᵀAp={pap:e}"),
+                });
+            }
+            let alpha = rz / pap;
+            device_axpy(&blas, &stream, k, alpha, &p_dev, &mut x_dev)?;
+            device_axpy(&blas, &stream, k, -alpha, &ap_dev, &mut r_dev)?;
+            let r_norm = device_nrm2(&blas, &stream, k, &r_dev)?;
+            if r_norm <= tol {
+                diag.final_relative_residual = r_norm / rhs_norm;
+                diag.stopping_reason = PcgStopReason::Converged;
+                break;
+            }
+            launch_jacobi_mul(&stream, vector_module, &inv_diag_dev, &r_dev, &mut z_dev, k)?;
+            diag.precond_apply_calls += 1;
+            let rz_new = device_dot(&blas, &stream, k, &r_dev, &z_dev)?;
+            if rz_new <= 0.0 || !rz_new.is_finite() {
+                return Err(ArrowSchurGpuFailure::SchurFactorFailed {
+                    reason: format!("framed SAE GPU PCG: non-positive rᵀM⁻¹r={rz_new:e}"),
+                });
+            }
+            let beta = rz_new / rz;
+            launch_update_p(&stream, vector_module, &z_dev, beta, &mut p_dev, k)?;
+            rz = rz_new;
+        }
+        if diag.stopping_reason != PcgStopReason::Converged {
+            let r_norm = device_nrm2(&blas, &stream, k, &r_dev)?;
+            diag.final_relative_residual = r_norm / rhs_norm;
+            diag.stopping_reason = PcgStopReason::MaxIter;
+        }
+        let x = stream
+            .clone_dtoh(&x_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        Ok((Array1::from_vec(x), diag))
+    }
+
     pub(super) fn solve_sae_matrix_free_pcg(
         sys: &ArrowSchurSystem,
         data: &DeviceSaePcgData,
@@ -3347,6 +4261,12 @@ extern "C" __global__ void arrow_sae_diag_sub(
     ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
         let k = rhs_beta.len();
         if k == 0 || data.beta_dim != k || sys.k != k {
+            return Err(ArrowSchurGpuFailure::Unavailable);
+        }
+        // #1017/#1026 GUARD: the legacy `⊗ I_p` kernel must NEVER receive framed
+        // data (factored `G ⊗ W_{ij}` + dense per-row cross blocks); decline so a
+        // mis-route falls back to the CPU rather than returning a wrong step.
+        if data.frame.is_some() {
             return Err(ArrowSchurGpuFailure::Unavailable);
         }
         // #1017 Phase-1 dispatch re-key: this is the matrix-free SAE reduced-Schur
@@ -4055,5 +4975,480 @@ mod tests {
                 out_serial[a]
             );
         }
+    }
+
+    /// #1017/#1026 — the frames-engaged CPU reduced-Schur matvec
+    /// [`sae_framed_schur_matvec_cpu`] (the bit-parity oracle the GPU kernel
+    /// mirrors) must equal the dense reduced Schur `S = (P_ββ + ρ_β I) −
+    /// Σ_i H_βt^(i)(H_tt^(i)+ρ_t I)⁻¹ H_tβ^(i)` formed by the canonical dense
+    /// reference, on a small framed system with mixed per-atom ranks
+    /// (`r_k < p` framed + `r_k = p` un-framed). Size-independent gate.
+    #[test]
+    fn framed_sae_schur_matvec_matches_dense_reference() {
+        use crate::solver::arrow_schur::{
+            BetaPenaltyOp, DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock,
+            FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp,
+        };
+
+        let p = 4usize;
+        // Three atoms: ranks 2 (framed), 4 (un-framed), 3 (framed).
+        let ranks = vec![2usize, 4usize, 3usize];
+        let basis_sizes = vec![2usize, 1usize, 2usize];
+        let n_atoms = ranks.len();
+        let mut border_offsets = Vec::with_capacity(n_atoms);
+        let mut acc = 0usize;
+        for k in 0..n_atoms {
+            border_offsets.push(acc);
+            acc += basis_sizes[k] * ranks[k];
+        }
+        let border_dim = acc; // 2*2 + 1*4 + 2*3 = 14
+
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut sample = || -> f64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0
+        };
+
+        // Per-atom orthonormal-ish frames U_k (p × r_k) for the W = U_iᵀU_j
+        // factors; un-framed atom (r=p) uses U = I_p.
+        let mut frames: Vec<Array2<f64>> = Vec::with_capacity(n_atoms);
+        for k in 0..n_atoms {
+            let r = ranks[k];
+            let mut u = Array2::<f64>::zeros((p, r));
+            for i in 0..p {
+                for j in 0..r {
+                    u[[i, j]] = if r == p && i == j {
+                        1.0
+                    } else if r == p {
+                        0.0
+                    } else {
+                        sample()
+                    };
+                }
+            }
+            frames.push(u);
+        }
+        let w_of = |i: usize, j: usize| -> Array2<f64> {
+            let (ui, uj) = (&frames[i], &frames[j]);
+            let (ri, rj) = (ranks[i], ranks[j]);
+            let mut w = Array2::<f64>::zeros((ri, rj));
+            for a in 0..ri {
+                for b in 0..rj {
+                    let mut s = 0.0;
+                    for c in 0..p {
+                        s += ui[[c, a]] * uj[[c, b]];
+                    }
+                    w[[a, b]] = s;
+                }
+            }
+            w
+        };
+
+        // Co-occurring data-fit blocks: all diagonal pairs + one cross (0,2).
+        let mut frame_blocks: Vec<FactoredFrameGBlock> = Vec::new();
+        let mut pairs = vec![(0usize, 0usize), (1, 1), (2, 2), (0, 2), (2, 0)];
+        pairs.sort();
+        for &(i, j) in &pairs {
+            let (mi, mj) = (basis_sizes[i], basis_sizes[j]);
+            let mut g = Array2::<f64>::zeros((mi, mj));
+            for r in 0..mi {
+                for c in 0..mj {
+                    g[[r, c]] = 0.3 * sample();
+                }
+            }
+            // Make diagonal blocks SPD-leaning so S stays PD.
+            if i == j {
+                for r in 0..mi.min(mj) {
+                    g[[r, r]] += mi as f64 + 2.0;
+                }
+            }
+            frame_blocks.push(FactoredFrameGBlock {
+                atom_i: i,
+                atom_j: j,
+                g,
+                w: w_of(i, j),
+            });
+        }
+
+        // Smooth blocks λ S_k (M_k × M_k), SPD.
+        let mut smooth_blocks: Vec<DeviceSaeSmoothBlock> = Vec::with_capacity(n_atoms);
+        let mut smooth_ranks: Vec<usize> = Vec::with_capacity(n_atoms);
+        for k in 0..n_atoms {
+            let m = basis_sizes[k];
+            let mut a = Array2::<f64>::zeros((m, m));
+            for r in 0..m {
+                for c in 0..m {
+                    a[[r, c]] = 0.2 * sample();
+                }
+            }
+            let mut s = a.t().dot(&a);
+            for r in 0..m {
+                s[[r, r]] += 1.0;
+            }
+            smooth_blocks.push(DeviceSaeSmoothBlock {
+                global_offset: border_offsets[k],
+                factor_a: s,
+            });
+            smooth_ranks.push(ranks[k]);
+        }
+
+        // Build the system: n rows, dense htbeta slabs (q_i × border_dim).
+        let n = 6usize;
+        let q = 3usize;
+        let mut sys = ArrowSchurSystem::new(n, q, border_dim);
+        let mut row_htbeta: Vec<Vec<f64>> = Vec::with_capacity(n);
+        for i in 0..n {
+            // SPD htt.
+            let mut a = Array2::<f64>::zeros((q, q));
+            for r in 0..q {
+                for c in 0..q {
+                    a[[r, c]] = sample();
+                }
+            }
+            let mut htt = a.t().dot(&a);
+            for r in 0..q {
+                htt[[r, r]] += q as f64 + 1.0;
+            }
+            sys.rows[i].htt = htt;
+            let mut slab = vec![0.0_f64; q * border_dim];
+            for c in 0..q {
+                for col in 0..border_dim {
+                    let v = 0.15 * sample();
+                    slab[c * border_dim + col] = v;
+                    sys.rows[i].htbeta[[c, col]] = v;
+                }
+            }
+            row_htbeta.push(slab);
+        }
+
+        // Dense H_ββ from the SAME penalty ops (so the dense reference's S
+        // matches the device penalty side exactly).
+        let data_op = FactoredFrameKroneckerOp::new(
+            ranks.clone(),
+            basis_sizes.clone(),
+            frame_blocks.clone(),
+        )
+        .expect("frame op");
+        let mut hbb = data_op.to_dense();
+        for k in 0..n_atoms {
+            let op = IdentityRightKroneckerPenaltyOp {
+                factor_a: smooth_blocks[k].factor_a.clone(),
+                p: ranks[k],
+                global_offset: border_offsets[k],
+                k: border_dim,
+            };
+            let d = op.to_dense();
+            for r in 0..border_dim {
+                for c in 0..border_dim {
+                    hbb[[r, c]] += d[[r, c]];
+                }
+            }
+        }
+        sys.hbb = hbb;
+
+        let data = DeviceSaePcgData {
+            p,
+            beta_dim: border_dim,
+            a_phi: Vec::new(),
+            local_jac: Vec::new(),
+            smooth_blocks,
+            sparse_g_blocks: Vec::new(),
+            frame: Some(DeviceSaeFrameData {
+                ranks: ranks.clone(),
+                basis_sizes: basis_sizes.clone(),
+                border_offsets: border_offsets.clone(),
+                frame_blocks,
+                smooth_ranks,
+                row_htbeta,
+            }),
+        };
+
+        let ridge_t = 1e-7;
+        let ridge_beta = 1e-6;
+
+        // Dense reference reduced Schur S (border_dim × border_dim), formed
+        // exactly as solve_arrow_newton_step_dense_reference assembles the
+        // bordered Hessian and eliminates the t-block.
+        let mut s_dense = Array2::<f64>::zeros((border_dim, border_dim));
+        for r in 0..border_dim {
+            for c in 0..border_dim {
+                s_dense[[r, c]] = sys.hbb[[r, c]];
+            }
+            s_dense[[r, r]] += ridge_beta;
+        }
+        for row in &sys.rows {
+            let mut htt = row.htt.clone();
+            for d in 0..q {
+                htt[[d, d]] += ridge_t;
+            }
+            let factor = cholesky_factor_in_place(htt.view(), CholeskyGuard::NonnegativePivot)
+                .expect("htt PD");
+            // Y = (htt)⁻¹ htbeta  (q × border_dim); S -= htbetaᵀ Y.
+            let mut y = Array2::<f64>::zeros((q, border_dim));
+            for col in 0..border_dim {
+                let mut e = Array1::<f64>::zeros(q);
+                for r in 0..q {
+                    e[r] = row.htbeta[[r, col]];
+                }
+                let solved = cholesky_solve_vector(factor.view(), e.view());
+                for r in 0..q {
+                    y[[r, col]] = solved[r];
+                }
+            }
+            for r in 0..border_dim {
+                for c in 0..border_dim {
+                    let mut acc = 0.0;
+                    for d in 0..q {
+                        acc += row.htbeta[[d, r]] * y[[d, c]];
+                    }
+                    s_dense[[r, c]] -= acc;
+                }
+            }
+        }
+
+        // Probe vectors: compare S·x from the device-data CPU oracle vs dense S·x.
+        let mut max_rel = 0.0_f64;
+        for trial in 0..4 {
+            let x: Vec<f64> = (0..border_dim)
+                .map(|a| 0.3 * ((a as f64 + trial as f64) * 0.21).cos() - 0.1)
+                .collect();
+            let mut got = vec![0.0_f64; border_dim];
+            sae_framed_schur_matvec_cpu(&sys, &data, ridge_t, ridge_beta, &x, &mut got)
+                .expect("framed matvec");
+            let mut want = vec![0.0_f64; border_dim];
+            for r in 0..border_dim {
+                let mut acc = 0.0;
+                for c in 0..border_dim {
+                    acc += s_dense[[r, c]] * x[c];
+                }
+                want[r] = acc;
+            }
+            let scale = want.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
+            for a in 0..border_dim {
+                let rel = (got[a] - want[a]).abs() / scale;
+                max_rel = max_rel.max(rel);
+            }
+        }
+        assert!(
+            max_rel <= 1e-10,
+            "framed SAE Schur matvec vs dense reference diverged: max_rel={max_rel:e}"
+        );
+    }
+
+    /// #1017/#1026 GPU arm: when a CUDA device admits the framed SAE PCG, its
+    /// solved `δβ` must match the CPU dense reduced-system solve of the SAME
+    /// framed system (size-independent — a small device validates the kernel).
+    /// Skips cleanly (returns) when no device is available or the policy
+    /// declines (`solve_sae_matrix_free_pcg` → `Unavailable`).
+    #[test]
+    fn framed_sae_device_pcg_matches_cpu_when_cuda_admits() {
+        use crate::solver::arrow_schur::{
+            DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
+            FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp, BetaPenaltyOp,
+        };
+
+        let p = 3usize;
+        let ranks = vec![2usize, 3usize];
+        let basis_sizes = vec![2usize, 2usize];
+        let n_atoms = ranks.len();
+        let mut border_offsets = Vec::with_capacity(n_atoms);
+        let mut acc = 0usize;
+        for k in 0..n_atoms {
+            border_offsets.push(acc);
+            acc += basis_sizes[k] * ranks[k];
+        }
+        let border_dim = acc;
+
+        let mut state = 0xfeed_face_dead_beefu64;
+        let mut sample = || -> f64 {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((state >> 33) as f64) / ((1u64 << 31) as f64) - 1.0
+        };
+        let mut frames: Vec<Array2<f64>> = Vec::new();
+        for k in 0..n_atoms {
+            let r = ranks[k];
+            let mut u = Array2::<f64>::zeros((p, r));
+            for i in 0..p {
+                for j in 0..r {
+                    u[[i, j]] = if r == p && i == j {
+                        1.0
+                    } else if r == p {
+                        0.0
+                    } else {
+                        sample()
+                    };
+                }
+            }
+            frames.push(u);
+        }
+        let w_of = |i: usize, j: usize| {
+            let (ui, uj) = (&frames[i], &frames[j]);
+            let (ri, rj) = (ranks[i], ranks[j]);
+            let mut w = Array2::<f64>::zeros((ri, rj));
+            for a in 0..ri {
+                for b in 0..rj {
+                    let mut s = 0.0;
+                    for c in 0..p {
+                        s += ui[[c, a]] * uj[[c, b]];
+                    }
+                    w[[a, b]] = s;
+                }
+            }
+            w
+        };
+        let mut frame_blocks = Vec::new();
+        for &(i, j) in &[(0usize, 0usize), (1, 1), (0, 1), (1, 0)] {
+            let (mi, mj) = (basis_sizes[i], basis_sizes[j]);
+            let mut g = Array2::<f64>::zeros((mi, mj));
+            for r in 0..mi {
+                for c in 0..mj {
+                    g[[r, c]] = 0.25 * sample();
+                }
+            }
+            if i == j {
+                for r in 0..mi.min(mj) {
+                    g[[r, r]] += mi as f64 + 2.0;
+                }
+            }
+            frame_blocks.push(FactoredFrameGBlock {
+                atom_i: i,
+                atom_j: j,
+                g,
+                w: w_of(i, j),
+            });
+        }
+        let mut smooth_blocks = Vec::new();
+        let mut smooth_ranks = Vec::new();
+        for k in 0..n_atoms {
+            let m = basis_sizes[k];
+            let mut a = Array2::<f64>::zeros((m, m));
+            for r in 0..m {
+                for c in 0..m {
+                    a[[r, c]] = 0.2 * sample();
+                }
+            }
+            let mut s = a.t().dot(&a);
+            for r in 0..m {
+                s[[r, r]] += 1.0;
+            }
+            smooth_blocks.push(DeviceSaeSmoothBlock {
+                global_offset: border_offsets[k],
+                factor_a: s,
+            });
+            smooth_ranks.push(ranks[k]);
+        }
+        let n = 5usize;
+        let q = 3usize;
+        let mut sys = ArrowSchurSystem::new(n, q, border_dim);
+        let mut row_htbeta = Vec::new();
+        for i in 0..n {
+            let mut a = Array2::<f64>::zeros((q, q));
+            for r in 0..q {
+                for c in 0..q {
+                    a[[r, c]] = sample();
+                }
+            }
+            let mut htt = a.t().dot(&a);
+            for r in 0..q {
+                htt[[r, r]] += q as f64 + 1.0;
+            }
+            sys.rows[i].htt = htt;
+            let mut slab = vec![0.0_f64; q * border_dim];
+            for c in 0..q {
+                for col in 0..border_dim {
+                    let v = 0.12 * sample();
+                    slab[c * border_dim + col] = v;
+                    sys.rows[i].htbeta[[c, col]] = v;
+                }
+            }
+            row_htbeta.push(slab);
+        }
+        let data_op = FactoredFrameKroneckerOp::new(
+            ranks.clone(),
+            basis_sizes.clone(),
+            frame_blocks.clone(),
+        )
+        .expect("frame op");
+        let mut hbb = data_op.to_dense();
+        for k in 0..n_atoms {
+            let op = IdentityRightKroneckerPenaltyOp {
+                factor_a: smooth_blocks[k].factor_a.clone(),
+                p: ranks[k],
+                global_offset: border_offsets[k],
+                k: border_dim,
+            };
+            let d = op.to_dense();
+            for r in 0..border_dim {
+                for c in 0..border_dim {
+                    hbb[[r, c]] += d[[r, c]];
+                }
+            }
+        }
+        sys.hbb = hbb;
+        let data = DeviceSaePcgData {
+            p,
+            beta_dim: border_dim,
+            a_phi: Vec::new(),
+            local_jac: Vec::new(),
+            smooth_blocks,
+            sparse_g_blocks: Vec::new(),
+            frame: Some(DeviceSaeFrameData {
+                ranks: ranks.clone(),
+                basis_sizes: basis_sizes.clone(),
+                border_offsets: border_offsets.clone(),
+                frame_blocks,
+                smooth_ranks,
+                row_htbeta,
+            }),
+        };
+        let ridge_t = 1e-7;
+        let ridge_beta = 1e-6;
+        let rhs: Array1<f64> =
+            Array1::from_shape_fn(border_dim, |a| ((a as f64 + 1.0) * 0.17).sin());
+
+        let Ok((device, _diag)) = solve_sae_matrix_free_pcg(
+            &sys,
+            &data,
+            ridge_t,
+            ridge_beta,
+            &rhs,
+            400,
+            1e-12,
+        ) else {
+            // No CUDA device / policy declined — kernel host code is still
+            // compile-validated; the numeric arm needs a GPU node.
+            return;
+        };
+
+        // CPU dense reduced-system solve of the SAME framed system: form S via
+        // the CPU oracle matvec on the identity, then solve S·δβ = rhs.
+        let mut s_dense = Array2::<f64>::zeros((border_dim, border_dim));
+        for col in 0..border_dim {
+            let mut e = vec![0.0_f64; border_dim];
+            e[col] = 1.0;
+            let mut sc = vec![0.0_f64; border_dim];
+            sae_framed_schur_matvec_cpu(&sys, &data, ridge_t, ridge_beta, &e, &mut sc)
+                .expect("cpu matvec");
+            for r in 0..border_dim {
+                s_dense[[r, col]] = sc[r];
+            }
+        }
+        let factor = cholesky_factor_in_place(s_dense.view(), CholeskyGuard::NonnegativePivot)
+            .expect("S PD");
+        let cpu = cholesky_solve_vector(factor.view(), rhs.view());
+
+        let scale = cpu.iter().fold(0.0_f64, |m, v| m.max(v.abs())).max(1.0);
+        let mut max_rel = 0.0_f64;
+        for a in 0..border_dim {
+            max_rel = max_rel.max((device[a] - cpu[a]).abs() / scale);
+        }
+        assert!(
+            max_rel <= 1e-7,
+            "framed SAE device PCG vs CPU dense solve diverged: max_rel={max_rel:e}"
+        );
     }
 }

@@ -3372,6 +3372,7 @@ pub(crate) fn sae_structured_system(
         local_jac: local_jac.clone(),
         smooth_blocks: Vec::new(),
         sparse_g_blocks: Vec::new(),
+        frame: None,
     });
     (sys, a_phi, local_jac)
 }
