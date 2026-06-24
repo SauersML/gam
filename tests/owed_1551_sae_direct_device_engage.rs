@@ -275,9 +275,37 @@ fn sae_direct_mode_engages_device_on_production_entry_1551() {
         "production SAE inner solve must be Direct mode (the device branch under test)"
     );
 
-    // CPU dense reference (the exact full Direct step the device must reproduce).
+    // BIT-IDENTITY BASELINE: the IDENTICAL system WITHOUT device frames, solved
+    // through the SAME production entry — i.e. the CPU Direct path. The device
+    // branch must reproduce this exactly (Direct mode = exact full step, no
+    // truncation), so this is the tight reference. (`solve_arrow_newton_step_
+    // dense_reference` factors the FULL joint system rather than the reduced
+    // Schur, so it diverges at the conditioning floor of a wide-border fixture;
+    // it is used only as a loose cross-check below.)
+    let sys_cpu = build_framed_sae_system(false);
+    assert!(
+        sys_cpu.device_sae_pcg.is_none(),
+        "device-free baseline must carry no device frames"
+    );
+    let (cpu_dt, cpu_db, cpu_cache) =
+        solve_arrow_newton_step_with_options(&sys_cpu, 0.0, 0.0, &options)
+            .expect("device-free CPU Direct baseline solve must succeed");
+    assert!(
+        !cpu_cache.pcg_diagnostics.used_device_arrow,
+        "the device-free baseline must NOT claim device execution"
+    );
+
+    // Loose physical cross-check: the reduced-Schur Direct step and the full
+    // dense-joint solve agree to the fixture's conditioning floor.
     let reference = solve_arrow_newton_step_dense_reference(&sys, 0.0, 0.0)
-        .expect("CPU dense reference solve must succeed on the well-conditioned fixture");
+        .expect("CPU dense reference solve must succeed");
+    let ref_dt = max_abs_diff(cpu_dt.as_slice().unwrap(), reference.delta_t.as_slice().unwrap());
+    let ref_db = max_abs_diff(cpu_db.as_slice().unwrap(), reference.delta_beta.as_slice().unwrap());
+    assert!(
+        ref_dt <= 1e-2 && ref_db <= 1e-2,
+        "reduced-Schur Direct step must agree with the full dense-joint solve to the \
+         fixture conditioning floor (max|Δt|={ref_dt:.3e}, max|Δβ|={ref_db:.3e})"
+    );
 
     let (delta_t, delta_beta, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
         .expect("production Direct-mode SAE solve must succeed");
@@ -293,48 +321,56 @@ fn sae_direct_mode_engages_device_on_production_entry_1551() {
         log_det.is_finite(),
         "joint-Hessian log-det must be finite, got {log_det}"
     );
+    let cpu_log_det = cpu_cache
+        .joint_hessian_log_det
+        .expect("device-free CPU baseline must also produce the log-det");
+    assert!(
+        (log_det - cpu_log_det).abs() <= 1e-7 * (1.0 + cpu_log_det.abs()),
+        "device-path log-det must match the CPU Direct log-det (device={log_det}, \
+         cpu={cpu_log_det}) — the reduced-Schur factor the device branch emits must be \
+         bit-equivalent to the CPU path"
+    );
+
+    let dt = max_abs_diff(delta_t.as_slice().unwrap(), cpu_dt.as_slice().unwrap());
+    let db = max_abs_diff(delta_beta.as_slice().unwrap(), cpu_db.as_slice().unwrap());
 
     if GpuRuntime::global().is_some() {
-        // GPU host: the device path must have engaged on this production-shaped
-        // Direct fit, and reproduced the exact full Newton step.
+        // GPU host: the device path must have ENGAGED on this production-shaped
+        // Direct fit, and reproduced the exact full Newton step the CPU Direct
+        // path computes (to the tight PCG tolerance).
         assert!(
             cache.pcg_diagnostics.used_device_arrow,
             "#1551 REGRESSION: a production-shaped Direct-mode SAE fit ran on the CPU \
              (used_device_arrow == false) despite a CUDA runtime being present — the \
              device SAE solver did not engage"
         );
-        let dt = max_abs_diff(delta_t.as_slice().unwrap(), reference.delta_t.as_slice().unwrap());
-        let db = max_abs_diff(
-            delta_beta.as_slice().unwrap(),
-            reference.delta_beta.as_slice().unwrap(),
-        );
         assert!(
             dt <= 1e-7 && db <= 1e-7,
-            "device Direct SAE step must match the CPU dense reference to <= 1e-7 \
+            "device-solved Direct SAE step must match the CPU Direct step to <= 1e-7 \
              (max|Δt diff|={dt:.3e}, max|Δβ diff|={db:.3e})"
+        );
+        eprintln!(
+            "[owed_1551] GPU host: device ENGAGED on production Direct SAE fit \
+             (used_device_arrow=true); device-vs-CPU max|Δt|={dt:.3e} max|Δβ|={db:.3e}"
         );
     } else {
         // CPU-only host (CI): the device branch declines (no runtime), so the
-        // solve is the bit-identical CPU Direct path. Pin that the routing is
-        // reachable and does NOT falsely claim device execution, and that the
-        // CPU step matches the dense reference (no regression to the solve).
+        // production path IS the CPU Direct path — bit-identical to the baseline.
+        // Pins that the routing is reachable, declines cleanly, and does not
+        // regress the solve or the log-det.
         assert!(
             !cache.pcg_diagnostics.used_device_arrow,
             "no CUDA runtime present but used_device_arrow was set true"
         );
-        let dt = max_abs_diff(delta_t.as_slice().unwrap(), reference.delta_t.as_slice().unwrap());
-        let db = max_abs_diff(
-            delta_beta.as_slice().unwrap(),
-            reference.delta_beta.as_slice().unwrap(),
-        );
         assert!(
-            dt <= 1e-7 && db <= 1e-7,
-            "CPU Direct SAE step must match the dense reference (max|Δt|={dt:.3e}, \
-             max|Δβ|={db:.3e})"
+            dt == 0.0 && db == 0.0,
+            "on a CPU host the device-frame system and the device-free system must \
+             take the identical CPU Direct path (max|Δt diff|={dt:.3e}, max|Δβ diff|={db:.3e})"
         );
         eprintln!(
-            "[owed_1551] CPU-only host: Direct-mode SAE routing reachable + non-regressing; \
-             device-vs-CPU engagement assertion is the GPU-gated remainder"
+            "[owed_1551] CPU-only host: Direct-mode SAE routing reachable + non-regressing \
+             (device-frame system == device-free system); device-vs-CPU engagement \
+             assertion is the GPU-gated remainder"
         );
     }
 }
