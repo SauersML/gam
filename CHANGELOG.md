@@ -1,3 +1,129 @@
+## v0.3.123 — gam 0.3.123 / gamfit 0.1.225 (2026-06-24)
+
+crates.io + PyPI release of the open-issue fix wave landed since gam 0.3.122 /
+gamfit 0.1.224. The headline is the predict output layer: the reported
+`std_error` and the `predict_array` return shape now match what `predict()`
+documents and lays out, instead of silently handing back link-scale values on
+non-identity links. Alongside that: low-cardinality cubic-regression smooths now
+fit instead of hard-failing, the outer REML smoothing search is made invariant to
+the order terms/margins are typed in, the default thin-plate basis is made
+row-permutation invariant to the ulp, and the SAE held-out decode path is repaired
+to match training. The build/CI hygiene also tightens (the full `tests/` suite now
+runs in CI behind an orphan guard) and the workspace stays dead-code-clean as a
+primary build (`cargo check --workspace --all-targets` green, so the published
+`gam-pyffi` wheel's `use gam::…` surface is verified, not just the `gam` lib).
+
+**Prediction output layer (response scale)**
+- **#1536**: `predict(interval=...)` / `gam predict` now report `std_error` on the
+  *response* scale — the delta-method `SE(μ̂) = |dμ/dη|·SE(η)` the credible band
+  beside it is built from — instead of the link-scale `σ_η`. On a non-identity
+  link the two were off by the inverse-link Jacobian, so the SE column was
+  internally inconsistent with its own `mean`/`mean_lower`/`mean_upper`. The
+  posterior-mean path gained a `PredictPosteriorMeanResult::mean_standard_error`
+  field, populated from the SE the band already uses and surfaced by the FFI/CLI.
+- **#1537**: `predict_array(X)` with no `interval` now returns the documented 1-D
+  response-scale vector, matching `predict()`, instead of the 2-D
+  `[linear_predictor, mean]` column matrix — a naive `[:, 0]` / `.ravel()` caller
+  was silently getting the link-scale linear predictor on non-identity links. The
+  interval case still returns the full column matrix.
+- **#1515**: interval predict on a degenerate fit no longer returns non-finite
+  bounds. When the smoothing-corrected covariance `H⁻¹ + J Var(ρ̂) Jᵀ` carries
+  non-finite entries (e.g. an all-zero-count Poisson, whose flat likelihood leaves
+  the outer REML problem near-singular and blows up `Var(ρ̂)`) the predictor now
+  degrades to the finite conditional covariance `H⁻¹` — the `Preferred` mode
+  already falls back when the correction is *missing*, and an unusable (non-finite)
+  correction is the same case — so a model the API reports as fitted always yields
+  finite `std_error` and `mean_lower`/`mean_upper`.
+
+**Smooths & bases**
+- **#1541**: a univariate `s(x, bs="cr"/"cs")` cubic-regression smooth no longer
+  hard-fails the whole fit on a low-cardinality covariate (a binary indicator, a
+  3-level ordinal, a small count). The basis is capped to the data support —
+  `k = min(k_requested, n_distinct)` value-knots, mgcv-style — and below the cr
+  minimum of three distinct values it degrades to the linear B-spline marginal the
+  default `s(x, k=..)` basis already builds. The cap is surfaced in the inference
+  notes. This is the univariate sibling of the tensor-margin cap.
+- **#1542**: a factor smooth `s(x, g, bs="sz")` likewise caps its per-level cr
+  marginal to data support rather than aborting. A pre-existing latent bug was
+  uncovered and fixed in the same change: a frozen `sz` factor smooth failed its
+  own predict-time freeze check ("factor-smooth marginal knots missing") because
+  the validation whitelist had never been updated for the cr marginal — so `sz`
+  *predict* was broken regardless of cardinality. It now fits *and* predicts.
+- **#1543**: a basis the fit silently adjusted is no longer silent to gamfit
+  callers. The mgcv-style cap/degradation advisories the Rust core records (and
+  the CLI already prints) are now carried through the FFI to Python: `gamfit.fit`
+  / `fit_array` emit one `GamInferenceWarning` per note at fit time, and
+  `Model.notes` exposes them for after-the-fact / post-load inspection. Previously
+  the Python path dropped `inference_notes` at the FFI boundary, so a capped basis
+  warned in the CLI but was invisible to gamfit. (The payload field is
+  `#[serde(default)]`, so older saved models load cleanly as "no notes".)
+- **tensor margins**: explicit `te(...)` margin `k` is capped to data support
+  (mgcv-style), with the `cr` `basis_size` helpers repaired.
+- **#1378**: the default `s(x, bs="tp")` thin-plate smooth is made exactly
+  row-permutation invariant. The knot-selection centroid was summed in row order,
+  so floating-point round-off shifted it by an ulp under a pure row permutation —
+  enough to flip the seed (and hence the whole knot set and `λ̂`) on data symmetric
+  about the mean. The column sum is now taken in canonical value-sorted order.
+
+**REML smoothing-parameter selection**
+- **#1538 / #1539**: the outer REML smoothing-parameter search is made invariant
+  to the order terms and margins are written in — additive `s(x)+s(z)` vs
+  `s(z)+s(x)` and tensor `te(x,z)` vs `te(z,x)` now select the same `λ̂` and fit
+  the identical surface (worst row-drift 1.0e-1 → 1.8e-6, 6e-2 → 7.1e-5). Each
+  rho-coordinate is labelled by a placement-independent canonical key (the
+  penalty's orthogonal-invariant spectrum plus a data-dependent block signature),
+  so seeding, multistart and tie-breaking all run on one canonical layout and map
+  back to the native order for the caller. Single smooths run the native path
+  byte-for-byte as before.
+
+**SAE (sparse autoencoder)**
+- **#1540**: the held-out SAE reconstruction now attaches the trained dictionary's
+  hybrid-collapsed straight images, so verdict-linear `d=1` slots decode by the
+  same linear image training used. The parameter was accepted but never wired, so
+  every OOS reconstruction silently fell back to the all-curved decoder — a
+  train/test decode mismatch on hybrid-collapsed dictionaries.
+- **#1026**: SAE anti-collapse interior-point barriers (finite-difference
+  verified), runtime barrier-strength and IBP-alpha overrides so one wheel sweeps
+  all configs, and GPU residency Phase 0-1 telemetry / fail-closed wiring.
+
+**Survival**
+- **#979**: the marginal-slope seed-screening cascade is bounded by the outer
+  wall-clock deadline (single-sourced with the slow-geometric-rate stall guard),
+  so a hard survival fit cannot blow the outer time budget in the inner search.
+
+**Model summaries**
+- **#1544**: `MultinomialModel.summary()` (and `str()`/`print()`) no longer raises
+  `ValueError` on a smooth multinomial fit. The summary assumed one λ per smooth
+  term per class, but the default Marra–Wood double penalty emits two penalty
+  components — a wiggliness penalty plus a null-space shrinkage penalty — so the
+  per-block λ count never matched the term-label count. The summary now records
+  per-penalty-component λ labels and pairs every component (including each term's
+  null-space λ) instead of silently dropping it.
+
+**Custom families & outer-score subsampling**
+- A custom-family / `GaussianLocationScale` fit with a Horvitz–Thompson
+  `outer_score_subsample` no longer hard-fails with `IntegrationFailed`. The inner
+  coefficient solve was mixing two row measures — a full-data entry/reload base
+  objective against an HT-subsampled trial — for families that do not advertise an
+  HT-consistent inner gradient, so the trust-region `actual_reduction` was pinned
+  at the constant HT-vs-full log-likelihood gap, the radius collapsed, and every
+  seed was rejected at outer startup. The subsample is now stripped from the inner
+  options unless the family runs a fully HT-consistent inner solve, keeping β̂(ρ)
+  the unbiased full-data optimum (the subsample remains an outer ψ/ρ-derivative
+  variance-reduction device). Covered by the `ws4a` subsampled-vs-full parity test.
+
+**Build & CI hygiene**
+- **#1534**: the manylinux / musllinux wheel containers trust the mounted
+  workspace tree (`git config --global --add safe.directory '*'`) so `build.rs`'s
+  author gate runs instead of panicking on "dubious ownership" ~12 min into the
+  release build.
+- **#1512**: the full `tests/` suite now runs in CI via a directory-level pytest
+  step, behind a hard-gated orphan-guard meta-test, so new `test_*.py` repros are
+  collected automatically instead of silently running in no job.
+- **#932 / #1017**: continued survival flex single-source derivative cutover onto
+  the jet tower and removal of the dead dual-context CUDA path, keeping the `gam`
+  crate dead-code-clean as a primary build.
+
 ## v0.3.122 — gam 0.3.122 / gamfit 0.1.224 (2026-06-24)
 
 crates.io + PyPI release of the open-issue fix wave landed since gam 0.3.121 /
