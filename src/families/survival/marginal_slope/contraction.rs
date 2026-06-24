@@ -3,7 +3,7 @@
 
 use super::*;
 
-use crate::families::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
+use crate::families::jet_scalar::{JetScalar, OneSeed, TwoSeed};
 
 impl SurvivalMarginalSlopeFamily {
     /// Build the row's third-order contracted tensor
@@ -97,7 +97,10 @@ impl SurvivalMarginalSlopeFamily {
             "survival marginal-slope rigid row helper kernel",
         )?;
         let p = rigid_row_kernel_primaries(self, block_states, row)?;
-        let vars: [Order2<4>; 4] = std::array::from_fn(|a| Order2::variable(p[a], a));
+        // Static-sparsity (v,g,H): q0/q1/qd1 linear ⇒ linear×linear self-Hessian
+        // elided (see `SparseOrder2`). Bit-identical to the dense `Order2<4>`.
+        let vars: [SparseOrder2<RIGID_LINEAR_MASK>; 4] =
+            std::array::from_fn(|a| SparseOrder2::variable(p[a], a));
         let out = rigid_row_nll(&vars, &inputs)?;
         let nll = out.value();
         let grad_arr = out.g();

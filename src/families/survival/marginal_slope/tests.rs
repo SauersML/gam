@@ -1410,6 +1410,95 @@ fn rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
     }
 }
 
+/// #932 static-sparsity oracle: the `SparseOrder2<RIGID_LINEAR_MASK>` scalar the
+/// production `row_kernel` (v,g,H) path instantiates must be BIT-IDENTICAL to the
+/// dense `Order2<4>` on the SAME single-sourced `rigid_row_nll` expression, over
+/// a random grid of primaries and inputs (mixed event/censored, frailty probit
+/// scale != 1). The sparse scalar elides only the provably-zero linear×linear
+/// self-Hessian reads, so every read channel (value/gradient/full Hessian) must
+/// agree exactly — proving the perf optimization is loss-free.
+#[test]
+fn rigid_row_kernel_sparse_matches_dense_932() {
+    use crate::families::jet_scalar::{JetScalar, Order2};
+
+    // Deterministic xorshift grid (no RNG dependency).
+    let mut s: u64 = 0x9E3779B97F4A7C15;
+    let mut nx = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        ((s >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
+    };
+
+    let mut max_rel = 0.0_f64;
+    for _ in 0..4000 {
+        let p = [nx() * 1.5, nx() * 1.5, 0.5 + nx().abs() * 2.0, nx() * 1.2];
+        let inputs = RigidRowInputs {
+            row: 0,
+            wi: 0.5 + nx().abs(),
+            di: if nx() > 0.0 { 1.0 } else { 0.0 },
+            z_sum: nx() * 1.2,
+            covariance_ones: 0.7 + nx().abs(),
+            probit_scale: 0.6 + nx().abs(),
+            qd1_lower: -1.0,
+        };
+
+        let dense_vars: [Order2<4>; 4] = std::array::from_fn(|a| Order2::variable(p[a], a));
+        let dense = rigid_row_nll(&dense_vars, &inputs).expect("dense rigid row nll");
+
+        let sparse_vars: [SparseOrder2<RIGID_LINEAR_MASK>; 4] =
+            std::array::from_fn(|a| SparseOrder2::variable(p[a], a));
+        let sparse = rigid_row_nll(&sparse_vars, &inputs).expect("sparse rigid row nll");
+
+        let mut check = |a: f64, b: f64| {
+            let rel = (a - b).abs() / (1.0 + a.abs().max(b.abs()));
+            if rel > max_rel {
+                max_rel = rel;
+            }
+            assert!(
+                (a - b).abs() <= 1e-12 + 1e-12 * a.abs().max(b.abs()),
+                "sparse vs dense channel disagreement: {a:+.16e} vs {b:+.16e}"
+            );
+        };
+        check(sparse.value(), dense.value());
+        for a in 0..4 {
+            check(sparse.g()[a], dense.g()[a]);
+            for b in 0..4 {
+                check(sparse.h()[a][b], dense.h()[a][b]);
+            }
+        }
+    }
+    assert!(
+        max_rel <= 1e-12,
+        "sparse vs dense max relative error {max_rel:.3e} exceeds 1e-12"
+    );
+}
+
+/// #932 static-sparsity SAFETY: declaring a genuinely NONLINEAR axis (`g`, axis
+/// 3) as linear violates the index-affine contract and must panic at the
+/// debug-checked elision site rather than silently dropping the linear×linear
+/// curvature it would skip — so a future mis-declaration cannot ship a wrong
+/// Hessian.
+#[test]
+#[should_panic(expected = "static-sparsity contract violated")]
+fn rigid_row_kernel_sparse_wrong_mask_panics_932() {
+    use crate::families::jet_scalar::JetScalar;
+    // Mask claims ALL four axes linear, including the nonlinear g (axis 3).
+    const WRONG: u32 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
+    let p = [0.3_f64, 0.9, 1.4, 0.25];
+    let inputs = RigidRowInputs {
+        row: 0,
+        wi: 1.0,
+        di: 1.0,
+        z_sum: 0.2,
+        covariance_ones: 1.0,
+        probit_scale: 0.85,
+        qd1_lower: -1.0,
+    };
+    let vars: [SparseOrder2<WRONG>; 4] = std::array::from_fn(|a| SparseOrder2::variable(p[a], a));
+    let _ = rigid_row_nll(&vars, &inputs);
+}
+
 #[test]
 fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
     let score_runtime = test_deviation_runtime();
