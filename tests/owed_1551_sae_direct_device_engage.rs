@@ -211,11 +211,15 @@ fn build_framed_sae_system() -> ArrowSchurSystem {
         sys.gb[a] = 0.05 * ((a as f64 + 1.0) * 0.31).sin();
     }
 
+    // `set_device_sae_pcg_data` asserts `a_phi`/`local_jac` have one entry per
+    // row (the full-`B` residency operator's per-row support). The framed kernel
+    // consumes `frame.row_htbeta` instead and ignores these, but the installer's
+    // shape contract still requires `n` (here empty) entries.
     sys.set_device_sae_pcg_data(DeviceSaePcgData {
         p,
         beta_dim: border_dim,
-        a_phi: Vec::new(),
-        local_jac: Vec::new(),
+        a_phi: vec![Vec::new(); n],
+        local_jac: vec![Vec::new(); n],
         smooth_blocks,
         sparse_g_blocks: Vec::new(),
         frame: Some(DeviceSaeFrameData {
