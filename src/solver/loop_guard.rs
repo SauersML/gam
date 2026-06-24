@@ -297,6 +297,63 @@ pub fn inner_convergence_is_truthful(converged: bool, min_certified_residual: f6
     !converged || min_certified_residual.is_finite()
 }
 
+/// Deterministic slow-geometric-rate stall predicate (gam#979 survival
+/// marginal-slope hang).
+///
+/// The survival marginal-slope oversmoothed-ρ endgame produces a stiff
+/// penalized Hessian (penalty dominates, eigenvalues ~1e6) whose Newton steps
+/// are ~1e-5 far INSIDE a large trust radius, so the inner KKT residual
+/// descends geometrically but very slowly (~0.99×/cycle, halving only every
+/// ~80 cycles). That is neither divergence nor a flat stall: the residual is
+/// genuinely shrinking, just far too slowly to reach `residual_tol` in a
+/// practical cycle count — so the flat-residual no-improve guard never latches
+/// (the residual clears its 10% bar every ~12 cycles) and the loop grinds ~10³
+/// cycles at ~p³ each, the measured #979 "hang".
+///
+/// Given the residual `window_oldest` cycles `window_cycles` ago and the
+/// `current` residual, this projects — from the per-cycle geometric rate
+/// `(current/window_oldest)^(1/window_cycles)` — how many additional cycles
+/// reaching `residual_tol` would take, and returns `true` when that exceeds
+/// `projection_cap` (i.e. the ρ-evaluation cannot finish in a practical
+/// budget). It is FULLY DETERMINISTIC: cycle indices and residual ratios only,
+/// no wall-clock. It also returns `true` when the window shows no net
+/// geometric progress at all (rate ≥ 1, or the window did not shrink), which
+/// likewise cannot reach tol.
+///
+/// A healthy (quadratically / fast-geometrically converging) solve reaches tol
+/// in a handful of cycles and never fills the window, and even when it does the
+/// projected remaining cycles are tiny, so this never fires on it. The caller
+/// uses a `true` verdict to stop with the current finite β as `converged=false`
+/// so the outer optimizer rejects this ρ and moves on; it certifies nothing and
+/// so cannot bias the envelope gradient.
+#[inline]
+pub fn slow_geometric_rate_exceeds_projection_cap(
+    current: f64,
+    window_oldest: f64,
+    window_cycles: usize,
+    residual_tol: f64,
+    projection_cap: usize,
+) -> bool {
+    if window_cycles == 0 {
+        return false;
+    }
+    if !current.is_finite() || current <= residual_tol {
+        // Either non-finite (a different guard owns that) or already at/under
+        // tol (the convergence certificate owns that): not a slow-rate stall.
+        return false;
+    }
+    if !window_oldest.is_finite() || window_oldest <= 0.0 || current >= window_oldest {
+        // No net geometric progress across the whole window: cannot reach tol.
+        return true;
+    }
+    let rate = (current / window_oldest).powf(1.0 / (window_cycles as f64));
+    if !rate.is_finite() || rate >= 1.0 {
+        return true;
+    }
+    let projected_cycles = (residual_tol / current).ln() / rate.ln();
+    projected_cycles.is_finite() && projected_cycles > projection_cap as f64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,5 +481,137 @@ mod tests {
         assert!(madsen_retry_exhausted(f64::NAN, 0, 5));
         assert!(madsen_retry_exhausted(1e13, 0, 5));
         assert!(!madsen_retry_exhausted(1.0, 4, 5));
+    }
+
+    /// gam#979 survival marginal-slope: the slow-geometric-rate stall guard must
+    /// TERMINATE the inner joint-Newton in a bounded number of cycles on the
+    /// oversmoothed-ρ endgame (a residual crawling down by a fixed small factor
+    /// ~0.99×/cycle that would otherwise grind ~10³ cycles to the budget — the
+    /// measured hang) WITHOUT firing on a healthy fast-geometric solve. This
+    /// replays the production loop's window bookkeeping (the trailing window of
+    /// the last `LINEAR_RATE_WINDOW` post-step residuals, the guard armed only
+    /// after `MIN_CYCLES`) over a deterministic residual stream and asserts a
+    /// finite, bounded exit cycle — an iteration-count assertion, not a
+    /// wall-clock threshold.
+    #[test]
+    fn slow_geometric_stall_guard_terminates_in_bounded_cycles_979() {
+        // Mirror the production constants in inner_blockwise_fit.rs.
+        const LINEAR_RATE_WINDOW: usize = 16;
+        const LINEAR_RATE_PROJECTION_CAP: usize = 100;
+        const RESIDUAL_STALL_MIN_CYCLES: usize = 40;
+        // A representative inner cycle budget; the guard must exit FAR below it.
+        const INNER_BUDGET: usize = 1000;
+        let residual_tol = 1e-6_f64;
+
+        // Replay the production window: a VecDeque holding at most
+        // LINEAR_RATE_WINDOW+1 residuals (front = residual LINEAR_RATE_WINDOW
+        // cycles back), the guard armed only at/after MIN_CYCLES and once the
+        // window is full.
+        fn run_stream(
+            per_cycle_rate: f64,
+            residual_tol: f64,
+            window: usize,
+            min_cycles: usize,
+            cap: usize,
+            budget: usize,
+        ) -> (Option<usize>, bool) {
+            let mut history: std::collections::VecDeque<f64> =
+                std::collections::VecDeque::with_capacity(window + 1);
+            let mut residual = 1.0_f64; // start well above tol
+            let mut reached_tol = false;
+            for cycle in 0..budget {
+                // A genuine convergence certificate would have exited already.
+                if residual <= residual_tol {
+                    reached_tol = true;
+                    return (None, reached_tol);
+                }
+                if history.len() > window {
+                    history.pop_front();
+                }
+                history.push_back(residual);
+                if cycle + 1 >= min_cycles && history.len() > window {
+                    let oldest = *history.front().unwrap();
+                    if slow_geometric_rate_exceeds_projection_cap(
+                        residual,
+                        oldest,
+                        window,
+                        residual_tol,
+                        cap,
+                    ) {
+                        return (Some(cycle + 1), reached_tol);
+                    }
+                }
+                residual *= per_cycle_rate;
+            }
+            (None, reached_tol)
+        }
+
+        // 1) The #979 hang signature: ~0.99×/cycle. Reaching 1e-6 from 1.0 at
+        //    0.99×/cycle would take ~1375 cycles (> the 1000 budget) — a hang.
+        //    The guard must fire, and bounded: just past MIN_CYCLES once the
+        //    window first fills, NOT at the budget.
+        let (slow_exit, slow_reached) = run_stream(
+            0.99,
+            residual_tol,
+            LINEAR_RATE_WINDOW,
+            RESIDUAL_STALL_MIN_CYCLES,
+            LINEAR_RATE_PROJECTION_CAP,
+            INNER_BUDGET,
+        );
+        assert!(
+            !slow_reached,
+            "the slow-geometric stream must not reach tol within budget (it is the hang)"
+        );
+        let slow_exit =
+            slow_exit.expect("slow-geometric stall guard must fire, not grind to the budget");
+        assert!(
+            slow_exit < INNER_BUDGET / 4,
+            "guard must terminate well below the {INNER_BUDGET}-cycle budget, fired at {slow_exit}"
+        );
+        // It can only arm at MIN_CYCLES, so the exit is bounded from both sides.
+        assert!(
+            slow_exit >= RESIDUAL_STALL_MIN_CYCLES,
+            "guard must not fire before it is armed (MIN_CYCLES={RESIDUAL_STALL_MIN_CYCLES})"
+        );
+
+        // 2) A healthy fast-geometric solve (~0.3×/cycle) reaches tol in a
+        //    handful of cycles and NEVER reaches the armed window — the guard
+        //    must never fire on it.
+        let (fast_exit, fast_reached) = run_stream(
+            0.3,
+            residual_tol,
+            LINEAR_RATE_WINDOW,
+            RESIDUAL_STALL_MIN_CYCLES,
+            LINEAR_RATE_PROJECTION_CAP,
+            INNER_BUDGET,
+        );
+        assert!(
+            fast_reached,
+            "a fast-geometric solve must reach tol (healthy convergence)"
+        );
+        assert!(
+            fast_exit.is_none(),
+            "the slow-rate guard must NEVER fire on a healthy fast-geometric solve"
+        );
+
+        // 3) Direct predicate properties at the boundary.
+        // No net progress across the window => fire (cannot reach tol).
+        assert!(slow_geometric_rate_exceeds_projection_cap(
+            1.0, 1.0, LINEAR_RATE_WINDOW, residual_tol, LINEAR_RATE_PROJECTION_CAP
+        ));
+        // Residual already at/under tol => never fire (certificate owns it).
+        assert!(!slow_geometric_rate_exceeds_projection_cap(
+            1e-7, 1.0, LINEAR_RATE_WINDOW, residual_tol, LINEAR_RATE_PROJECTION_CAP
+        ));
+        // A brisk window (0.5×/cycle over 16 cycles, residual 1e-3) projects to
+        // only ~10 more cycles to tol => never fire.
+        let brisk_oldest = 1e-3 / 0.5_f64.powi(LINEAR_RATE_WINDOW as i32);
+        assert!(!slow_geometric_rate_exceeds_projection_cap(
+            1e-3,
+            brisk_oldest,
+            LINEAR_RATE_WINDOW,
+            residual_tol,
+            LINEAR_RATE_PROJECTION_CAP
+        ));
     }
 }

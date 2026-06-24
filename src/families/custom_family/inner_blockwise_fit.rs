@@ -5032,19 +5032,15 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 && residual_rate_history.len() > LINEAR_RATE_WINDOW
             {
                 let oldest = *residual_rate_history.front().unwrap();
-                let too_slow = if !oldest.is_finite() || oldest <= 0.0 || residual >= oldest {
-                    // No net geometric progress across the whole window.
-                    true
-                } else {
-                    let rate = (residual / oldest).powf(1.0 / (LINEAR_RATE_WINDOW as f64));
-                    if !(rate.is_finite()) || rate >= 1.0 {
-                        true
-                    } else {
-                        let projected_cycles = (residual_tol / residual).ln() / rate.ln();
-                        projected_cycles.is_finite()
-                            && projected_cycles > LINEAR_RATE_PROJECTION_CAP as f64
-                    }
-                };
+                // Single source of truth for the slow-geometric-rate projection
+                // (gam#979): deterministic cycle-count projection, no wall-clock.
+                let too_slow = crate::solver::loop_guard::slow_geometric_rate_exceeds_projection_cap(
+                    residual,
+                    oldest,
+                    LINEAR_RATE_WINDOW,
+                    residual_tol,
+                    LINEAR_RATE_PROJECTION_CAP,
+                );
                 if too_slow {
                     log::warn!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | slow-geometric-rate stall early-exit (gam#979): residual={:.3e} (tol={:.3e}) descending at ~{:.4}×/cycle over the last {} cycles — projected >{} more cycles to reach tol; the residual is converging but far too slowly to finish in a practical budget (the survival marginal-slope oversmoothed-ρ endgame), so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",
