@@ -421,9 +421,23 @@ jobs:
           # step summary) so the real wall-clock drivers are visible at a glance
           # regardless of whether the target finished cleanly or was bulk-killed.
           # This is pure log post-processing — it changes no test and no cap.
+          #
+          # CARGO_TERM_COLOR=always (job env) makes nextest emit these status
+          # lines WRAPPED in ANSI SGR escapes — the bytes are
+          # `\e[33;1m        SLOW\e[0m [>300.000s] (1/1) \e[35;1mgam::owed_X\e[0m
+          # \e[34;1m<test>\e[0m`, NOT a plain `SLOW [`. A regex anchored on
+          # `SLOW +\[` therefore matched NOTHING, slow_lines came back empty on
+          # every run, and the "NO test crossed the 300s SLOW period" branch
+          # below fired even when tests had visibly TIMED OUT at 600s — sending
+          # every tuning pass chasing partition counts instead of the actually
+          # hung tests. Strip the SGR escapes first so the match sees plain text,
+          # and capture through the `(n/m)` field to the test NAME (the previous
+          # pattern stopped at the binary). `\x1b\[[0-9;]*m` is the SGR form; GNU
+          # sed on the runner understands the `\x1b` escape.
           echo "::group::#1393 per-test slow/timeout attribution"
-          slow_lines="$(grep -hoE '(SLOW|TIMEOUT|TERMINATING) +\[[^]]*\] +[^ ]+ +[^ ]+' \
-                          /tmp/cargo-test.log 2>/dev/null | sort -u || true)"
+          slow_lines="$(sed -E 's/\x1b\[[0-9;]*m//g' /tmp/cargo-test.log 2>/dev/null \
+                          | grep -oE '(SLOW|TIMEOUT|TERMINATING) +\[[^]]*\] +\([^)]*\) +[^ ]+ +[^ ]+' \
+                          | sort -u || true)"
           if [ -n "$slow_lines" ]; then
             echo "Tests that crossed the 300s SLOW period (named even if their target was later bulk-killed):"
             printf '%s\n' "$slow_lines"
@@ -434,11 +448,13 @@ jobs:
               printf '%s\n' "$slow_lines"
               echo '```'
             } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
-            # A wall-clock target-kill with NO slow line means a test hung/summed
-            # under 300s-per-test but over the target cap — flag it so the next
-            # tuning pass knows the 300s notice was too coarse for that target.
+            # A target was also killed at its wall-clock cap. Its drivers are
+            # almost always among the SLOW/TIMEOUT lines just printed (a binary
+            # holding several 600s-terminate tests sums past the cap); point the
+            # next tuning pass at those, or finer-shard the target if its kill
+            # left no slow line of its own.
             if grep -q '::error::Test command exceeded' /tmp/cargo-test.log; then
-              echo "::warning::#1393: a target hit its wall-clock cap; cross-reference the SLOW lines above to find the drivers, or finer-shard that target if none are listed."
+              echo "::warning::#1393: a target hit its wall-clock cap; cross-reference the SLOW/TIMEOUT lines above to find the drivers, or finer-shard that target if none are listed."
             fi
           elif grep -q '::error::Test command exceeded' /tmp/cargo-test.log; then
             echo "::warning::#1393: a target was killed at its wall-clock cap but NO test crossed the 300s SLOW period — the cap was reached by the SUM of sub-300s tests. Increase that target's partition count in partitions_for_binary (or lower DYNAMIC_TESTS_PER_PARTITION)."
