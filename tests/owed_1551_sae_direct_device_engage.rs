@@ -40,7 +40,7 @@ use gam::solver::arrow_schur::{
     solve_arrow_newton_step_with_options, ArrowSchurSystem, ArrowSolveOptions, BetaPenaltyOp,
     DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
 };
-use ndarray::{Array1, Array2};
+use ndarray::Array2;
 
 /// Build a production-shaped framed SAE arrow system: few rows, wide factored
 /// border (`k >= DEVICE_LOOP_MIN_P`), modest per-row depth `d` — the LLM/SAE
