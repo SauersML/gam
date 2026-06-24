@@ -196,6 +196,15 @@ pub struct SaeManifoldOuterObjective {
     /// opt-in lever for the n-independent outer loop; the n-scaling timing is
     /// verified on the cluster.
     pub(crate) routing_frozen: bool,
+    /// #1026 — the certified Eckart-Young (η=0) linear anchor captured by the
+    /// curvature-homotopy walk: `(anchor_reconstruction_ev, anchor_state)`. The
+    /// anchor's EV is the data-achievable PCA ceiling and its state is a genuine
+    /// linear model (first-harmonic decoder + polar coords). The outer ρ-cascade can
+    /// re-curve away from it and settle below; [`Self::into_fitted`] restores this
+    /// snapshot when the returned curved state reconstructs worse, enforcing
+    /// `F_returned ≤ F_linear` at the RESULT (the seed-level floor in the walk alone
+    /// does not survive the cascade). `None` until the walk runs.
+    pub(crate) certified_linear_anchor: Option<(f64, SaeManifoldMutableState)>,
 }
 
 impl SaeManifoldOuterObjective {
@@ -231,6 +240,7 @@ impl SaeManifoldOuterObjective {
             seeded_beta: None,
             warm_start_telemetry: AmortizedWarmStartTelemetry::default(),
             routing_frozen: false,
+            certified_linear_anchor: None,
         }
     }
 
@@ -321,14 +331,10 @@ impl SaeManifoldOuterObjective {
             ridge_ext_coord,
             ridge_beta,
             last_loss,
+            certified_linear_anchor,
             ..
         } = self;
         let pristine_seed_term = baseline_term.clone();
-        // #1026 — a spare clone of the pristine seed for the GLOBAL linear-dominance
-        // floor below: the outer cascade can re-curve away from the certified η=0
-        // anchor and settle below it, so the seed-level floor in the curvature walk
-        // is necessary but not sufficient — the RESULT must also be floored.
-        let anchor_seed_term = pristine_seed_term.clone();
         let pristine_seed_rho = baseline_rho.clone();
         let mut fitted_rho = current_rho;
         let loss = last_loss.unwrap_or_else(|| SaeManifoldLoss {
@@ -446,42 +452,33 @@ impl SaeManifoldOuterObjective {
         // state. Curvature that cannot beat the convex linear optimum returns that
         // optimum; because the anchor is a genuine linear model (not a
         // reconstruction-time substitution) the dominance holds on held-out data too.
-        let returned_ev = fitted
-            .try_fitted_for_rho(&fitted_rho)
-            .ok()
-            .and_then(|fit| reconstruction_explained_variance(target.view(), fit.view()));
-        // Always consume `anchor_seed_term` and re-solve the convex η=0 relaxation so
-        // the certified PCA-ceiling anchor is a real candidate at the result.
-        let mut anchor_term = anchor_seed_term;
-        anchor_term.set_homotopy_eta(0.0).ok();
-        let mut anchor_rho = fitted_rho.clone();
-        let anchor_iters = inner_max_iter.max(CURVATURE_WALK_RECOVERY_INNER_ITERS);
-        let anchor_solve = anchor_term.run_joint_fit_arrow_schur(
-            target.view(),
-            &mut anchor_rho,
-            registry.as_ref(),
-            anchor_iters,
-            learning_rate,
-            ridge_ext_coord,
-            ridge_beta,
-        );
-        if let Some(returned_ev) = returned_ev
-            && anchor_solve.is_ok()
-            && let Ok(anchor_fit) = anchor_term.try_fitted_for_rho(&anchor_rho)
-            && let Some(anchor_ev) =
-                reconstruction_explained_variance(target.view(), anchor_fit.view())
+        // #1026 GLOBAL LINEAR-DOMINANCE FLOOR (F_returned ≤ F_linear). Restore the
+        // certified η=0 PCA anchor the curvature walk captured (a genuine linear
+        // model: first-harmonic decoder + polar coords, reconstructing at the
+        // data-achievable linear ceiling) when the returned curved state reconstructs
+        // worse. The cascade re-curves below the anchor on real linear-Gaussian
+        // activations (OLMo K=8: returned EV 0.58 vs anchor 0.7365); restoring the
+        // captured anchor STATE — not a re-solve of the pristine seed, which itself
+        // collapses — propagates the seed-level floor to the result. Adopted only when
+        // strictly better, so genuine curved arrivals (EV ≥ anchor) are untouched, and
+        // the anchor is a real linear model so dominance holds on held-out data.
+        if let Some((anchor_ev, anchor_state)) = certified_linear_anchor
+            && let Ok(returned_fit) = fitted.try_fitted_for_rho(&fitted_rho)
+            && let Some(returned_ev) =
+                reconstruction_explained_variance(target.view(), returned_fit.view())
             && anchor_ev.is_finite()
             && anchor_ev > returned_ev + SAE_FINAL_EV_DEGRADATION_TOL
-            && let Ok(anchor_loss) = anchor_term.loss(target.view(), &anchor_rho)
         {
+            fitted.restore_mutable_state(&anchor_state);
+            fitted.set_homotopy_eta(0.0).ok();
+            if let Ok(anchor_loss) = fitted.loss(target.view(), &fitted_rho) {
+                fitted_loss = anchor_loss;
+            }
             log::info!(
                 "[#1026] into_fitted linear-dominance floor: returned curved EV \
-                 {returned_ev:.4} < η=0 PCA anchor EV {anchor_ev:.4}; adopting the certified \
+                 {returned_ev:.4} < certified η=0 PCA anchor EV {anchor_ev:.4}; restored the \
                  linear anchor as the final fit (F_returned ≤ F_linear)"
             );
-            fitted = anchor_term;
-            fitted_rho = anchor_rho;
-            fitted_loss = anchor_loss;
         }
         // #1019 — the post-fit assembly seam: canonicalize every eligible
         // atom's chart to its canonical Diff(M) representative (arc length
@@ -1157,6 +1154,19 @@ impl SaeManifoldOuterObjective {
                  {arrival_floor:.4}; restored certified η=0 PCA anchor (EV {anchor_ev:.4}) — \
                  F_returned ≤ F_linear"
             );
+        }
+        // #1026 — persist the certified η=0 anchor (the PCA-ceiling linear model) so
+        // `into_fitted` can floor the FINAL result at it: the outer ρ-cascade runs
+        // after this walk and can re-curve below the anchor (real OLMo: the seed floor
+        // restores EV 0.7365 here, but the cascade settles the result at 0.58). Only
+        // keep the best anchor seen across the walks (the EV ceiling is ≈ρ-stable).
+        if anchor_ev.is_finite()
+            && self
+                .certified_linear_anchor
+                .as_ref()
+                .is_none_or(|(best, _)| anchor_ev > *best)
+        {
+            self.certified_linear_anchor = Some((anchor_ev, anchor_floor_state));
         }
         let collapse_events = self.term.collapse_events().len();
         self.term.set_curvature_walk_report(CurvatureWalkReport {
