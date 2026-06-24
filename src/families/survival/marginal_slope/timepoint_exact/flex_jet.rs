@@ -1232,6 +1232,15 @@ mod moment_engine_tests {
         // those fixed-limit integrals). The MOVING-limit correction is the thin
         // sliver `∫_{z_R0}^{z_R(θ)} g dz − ∫_{z_L0}^{z_L(θ)} g dz` (`edge_sliver_jet`),
         // exact to all jet orders.
+        //
+        // SHARED-EDGE JUMP COLLAPSE: when the caller sums these per-cell moments over
+        // a partition, an INTERIOR edge shared by cells `i`,`i+1` enters as `+sliver`
+        // (cell i's right) and `−sliver` (cell i+1's left) at the SAME moving `z` with
+        // the SAME `g` — so the two flux contributions telescope to zero automatically.
+        // Only GENUINE boundaries (the timepoint Crossing edge with no cancel partner,
+        // §D) survive. No hand jump/flux formula is needed; the cancellation is exact
+        // in the jet algebra because both slivers are the identical jet with opposite
+        // sign.
         std::array::from_fn(|n| {
             let mut acc = const_jet_like(&c[0], 0.0);
             for (m, s_m) in s_poly.iter().enumerate() {
@@ -1662,6 +1671,23 @@ mod moment_engine_tests {
     /// `f_u`/`f_uv`/`f_aa` moment dots and their 3rd/4th extensions automatically. The
     /// value channel is the scalar calibration `f` (driven to ~0 by seeding
     /// `A.value = a0` from the scalar solve), so only the derivative channels solve.
+    ///
+    /// ## What the iteration converges to: the implicit-function tower
+    ///
+    /// The fixed point is the exact `a(θ)` of `F(a(θ),θ) = 0`. Differentiating
+    /// `F` repeatedly (with `F_{pq} = ∂^{p+q}F/∂a^p∂t^q` along a path, `A=a_1`,
+    /// `B=a_2`, `C=a_3`, `D=a_4`) gives the standard IFT recursion the jet recovers
+    /// channel-for-channel — only `F_a·a_n` carries `a_n` linearly, all else is the
+    /// already-known lower orders:
+    /// ```text
+    ///   a_i   = −F_i / F_a
+    ///   a_ij  = −(F_ij + F_ai a_j + F_aj a_i + F_aa a_i a_j) / F_a
+    ///   A = −F_01/F_10;  B = −(F_02 + 2F_11 A + F_20 A²)/F_10
+    ///   C = −(F_03 + 3F_12 A + 3F_21 A² + F_30 A³ + 3(F_11+F_20 A)B)/F_10
+    ///   D = −(F_04 + 4F_13 A + 6F_22 A² + 4F_31 A³ + F_40 A⁴
+    ///         + 6F_12 B + 12F_21 A B + 6F_30 A² B + 3F_20 B²
+    ///         + 4(F_11+F_20 A)C) / F_10
+    /// ```
     ///
     /// ## Why an order-`p` jet needs exactly `p` iterations (NOT quadratic Newton)
     ///
