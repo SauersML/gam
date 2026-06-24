@@ -1003,7 +1003,6 @@ impl SurvivalMarginalSlopeFamily {
             chi_uv,
             d_u,
             d_uv,
-            a_solved: a,
         })
     }
 }

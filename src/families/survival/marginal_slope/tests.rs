@@ -2841,12 +2841,6 @@ fn flex_bidirectional_fourth_localizer() {
                 );
             }
         }
-        for &(label, q, q_index) in &[("entry", q0v, primary.q0), ("exit", q1v, primary.q1)] {
-            let bi = bi_at(q, q_index);
-            let fd = fd2(q, q_index, &|b| b.a_solved, 3e-3);
-            let got = bi.cal_ad12_out;
-            eprintln!("#1454 CALAD12CHK {label} analytic {got:+.6e} fd2 {fd:+.6e} abserr {:.3e}", (got - fd).abs());
-        }
     }
 
     let h_fd = 2e-3;
