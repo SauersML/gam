@@ -770,8 +770,10 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         // Lift the calibrated intercept's derivative tower by the exact
-        // implicit-function recursion (docs/jet_tower_cutover_derivations.md §B),
-        // NOT a value-pinned Newton iteration.
+        // implicit-function recursion (the frozen-inverse chord that recovers one
+        // homogeneous Taylor degree per iteration; see `lift_intercept_flex` in
+        // survival/.../flex_jet.rs for the nilpotent-ideal proof), NOT a
+        // value-pinned Newton iteration.
         //
         // The defect §B identifies in the prior pinned-Newton loop: it took a
         // full-jet Newton step `A -= F·(1/F_a)` each pass and then RESET the
