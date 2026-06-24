@@ -3802,7 +3802,7 @@ mod moment_engine_tests {
             };
             let a_jet_probe = lift_intercept_flex(&template4, a1, 1.0 / d_check, 4, residual_probe);
             let jet_a_uvuv = a_jet_probe.eps_del.h[primary.q1 * p + primary.q1];
-            let ref_a_uvuv = mixed_uvuv(&|t| t.0);
+            let ref_a_uvuv = mixed_uvuv(&|t: (f64, f64, f64, f64)| t.0);
             assert!(
                 (jet_a_uvuv - ref_a_uvuv).abs() <= 1e-3 * (1.0 + ref_a_uvuv.abs()),
                 "#932 PROBE a_uv_uv[q1,q1]: jet {jet_a_uvuv} != scalar-FD {ref_a_uvuv} \
@@ -3811,9 +3811,9 @@ mod moment_engine_tests {
             );
 
             (
-                mixed_uvuv(&|t| t.1),
-                mixed_uvuv(&|t| t.2),
-                mixed_uvuv(&|t| t.3),
+                mixed_uvuv(&|t: (f64, f64, f64, f64)| t.1),
+                mixed_uvuv(&|t: (f64, f64, f64, f64)| t.2),
+                mixed_uvuv(&|t: (f64, f64, f64, f64)| t.3),
             )
         };
 
