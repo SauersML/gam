@@ -596,7 +596,89 @@ fn sphere_mean_candidates(
         candidates.push(unit.clone());
         candidates.push(unit.mapv(|x| -x));
     }
+    // The dominant eigenvector of `M` always lies IN the subspace where the data
+    // is spread. When the points are balanced around a great circle (e.g. an
+    // equilateral triangle on the equator, `M = diag(1.5, 1.5, 0)`), the extrinsic
+    // mean is the zero vector (dropped above) and every dominant-eigenvector seed
+    // sits on the equator, so descent converges to an equatorial data point. The
+    // TRUE Fréchet mean is on the axis ORTHOGONAL to the spread — the SMALLEST
+    // eigenvalue eigenvector. Seed the descent from the full orthonormal eigenbasis
+    // of `M` (both signs); the caller keeps the lowest-objective converged result,
+    // so non-degenerate inputs are unaffected.
+    for axis in sphere_eigenbasis(moment.view()) {
+        let nrm = norm(axis.view());
+        if nrm > 0.0 {
+            let unit = axis.mapv(|x| x / nrm);
+            candidates.push(unit.clone());
+            candidates.push(unit.mapv(|x| -x));
+        }
+    }
     Ok(candidates)
+}
+
+/// Orthonormal eigenbasis of a symmetric PSD matrix via power iteration with
+/// Hotelling deflation.
+///
+/// Reuses the same power-iteration scheme as [`sphere_dominant_axis`] (so no new
+/// linear-algebra dependency is introduced): repeatedly extract the current
+/// dominant eigenvector, then deflate it out of the matrix (`M ← M − λ a aᵀ`) so
+/// the next pass yields the next eigenvector. The returned set spans the full
+/// `d`-dimensional eigenbasis, covering the least-dominant (orthogonal) axes that
+/// the dominant-only seed never reaches.
+fn sphere_eigenbasis(moment: ArrayView2<'_, f64>) -> Vec<Array1<f64>> {
+    let d = moment.nrows();
+    let mut basis: Vec<Array1<f64>> = Vec::new();
+    if d == 0 {
+        return basis;
+    }
+    let mut residual = moment.to_owned();
+    for _ in 0..d {
+        let axis = match sphere_dominant_axis(residual.view()) {
+            Some(a) => a,
+            None => break,
+        };
+        // Rayleigh quotient λ = aᵀ M a for the deflation magnitude.
+        let mut ma = Array1::<f64>::zeros(d);
+        for r in 0..d {
+            let mut acc = 0.0;
+            for c in 0..d {
+                acc += residual[[r, c]] * axis[c];
+            }
+            ma[r] = acc;
+        }
+        let lambda = dot(axis.view(), ma.view());
+        if lambda <= 1.0e-12 {
+            // Remaining spectrum is (numerically) zero: power iteration can no
+            // longer distinguish a direction, so it would just repeat the same
+            // axis. Complete the eigenbasis deterministically by Gram–Schmidt over
+            // the coordinate axes against the directions already found — this is
+            // exactly the null space of `M` (e.g. the pole for an equatorial
+            // great-circle spread), which is where the true Fréchet mean lives.
+            for k in 0..d {
+                let mut cand = Array1::<f64>::zeros(d);
+                cand[k] = 1.0;
+                for b in &basis {
+                    let proj = dot(cand.view(), b.view());
+                    for col in 0..d {
+                        cand[col] -= proj * b[col];
+                    }
+                }
+                let nrm = norm(cand.view());
+                if nrm > 1.0e-9 {
+                    let unit = cand.mapv(|x| x / nrm);
+                    basis.push(unit);
+                }
+            }
+            break;
+        }
+        basis.push(axis.clone());
+        for r in 0..d {
+            for c in 0..d {
+                residual[[r, c]] -= lambda * axis[r] * axis[c];
+            }
+        }
+    }
+    basis
 }
 
 /// Build the weighted second-moment matrix `M = Σ wᵢ pᵢ pᵢᵀ = Pᵀ diag(w) P`.
