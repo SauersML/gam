@@ -221,6 +221,20 @@ def inject(path: str, branch: str = "main"):
 
 
 @app.local_entrypoint()
+def inject_a100(path: str, branch: str = "main"):
+    # Inject a local example onto the A100 (representative FP64) without pushing.
+    import os
+
+    name = os.path.splitext(os.path.basename(path))[0]
+    with open(path) as f:
+        source = f.read()
+    res = run_injected.with_options(gpu="A100-80GB").remote(
+        example_name=name, source=source, branch=branch
+    )
+    print("\n[gam-gpu] INJECT-A100 RESULT:", res)
+
+
+@app.local_entrypoint()
 def bench_a100(examples: str = DEFAULT_EXAMPLES, branch: str = "main"):
     # A100 reserved ONLY for the final FP64 perf gates; everything else runs on T4.
     res = run_benches.with_options(gpu="A100-80GB").remote(examples=examples, branch=branch)
