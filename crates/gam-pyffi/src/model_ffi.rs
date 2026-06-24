@@ -1236,6 +1236,31 @@ fn saved_model_payload_string(model_bytes: Vec<u8>, key: &str) -> PyResult<Optio
     }))
 }
 
+/// Human-readable inference advisories recorded while the model was fit — the
+/// mgcv-style "k reduced to the data support" / basis-degradation notes from the
+/// cr/cs/sz cap (#1541, #1542), and any other materialization advisory. The CLI
+/// prints these; this accessor lets gamfit surface the SAME notes as
+/// `GamInferenceWarning`s and via `model.notes` rather than dropping them at the
+/// FFI boundary (#1543). Returns an empty list for older payloads that predate
+/// the field (it deserializes via `#[serde(default)]`).
+#[pyfunction]
+fn inference_notes_from_model(model_bytes: Vec<u8>) -> PyResult<Vec<String>> {
+    let saved: serde_json::Value = serde_json::from_slice(&model_bytes)
+        .map_err(|err| PyValueError::new_err(format!("saved model payload must be JSON: {err}")))?;
+    let notes = saved
+        .get("payload")
+        .and_then(|payload| payload.get("inference_notes"))
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str().map(str::to_owned))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    Ok(notes)
+}
+
 fn required_saved_model_payload_string_value(model_bytes: &[u8], key: &str) -> PyResult<String> {
     saved_model_payload_string(model_bytes.to_vec(), key)?
         .ok_or_else(|| py_value_error(format!("saved model payload is missing {key}")))

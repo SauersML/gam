@@ -845,6 +845,22 @@ class Model:
         return self.summary().family_name
 
     @property
+    def notes(self) -> list[str]:
+        """Inference advisories recorded while this model was fit.
+
+        Each note is an mgcv-style advisory that the fitted model differs from
+        what was literally requested — e.g. ``"... basis reduced from k=10 to
+        k=3 to match the covariate's 3 distinct value(s)"`` when a cubic-
+        regression marginal is capped to the data support, or a basis-
+        degradation note when a low-cardinality covariate cannot support the
+        requested smooth. :func:`gamfit.fit` also emits these as
+        :class:`gamfit.GamInferenceWarning` at fit time; this property lets a
+        caller inspect them after the fact (or after loading a saved model).
+        Empty when the fit used exactly the requested configuration.
+        """
+        return list(rust_module().inference_notes_from_model(self._model_bytes))
+
+    @property
     def used_device(self) -> bool:
         return rust_module().required_saved_model_payload_string(
             self._model_bytes, "used_device"

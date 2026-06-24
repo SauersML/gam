@@ -3974,6 +3974,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(load_model, module)?)?;
     module.add_function(wrap_pyfunction!(bayes_factor_log_diff, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_payload_string, module)?)?;
+    module.add_function(wrap_pyfunction!(inference_notes_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(
         required_saved_model_payload_string,
         module
@@ -4785,6 +4786,14 @@ fn fit_dataset_impl(
     // rides on fit_config straight into materialize.
     let materialized = materialize(&formula, &dataset, &fit_config)?;
     let request = materialized.request;
+    // Advisories produced while materializing (e.g. the mgcv-style "k reduced to
+    // the data support" / basis-degradation notes from the cr/cs/sz cap, #1541
+    // #1542). The CLI prints these via `print_inference_summary`; the Python
+    // path used to drop them on the floor, so a gamfit user whose basis was
+    // silently capped got no signal at all (#1543). Carry them into the
+    // serialized payload so gamfit can surface them as `GamInferenceWarning`s
+    // and via `model.notes`.
+    let inference_notes = materialized.inference_notes;
 
     let mut payload = match request {
         FitRequest::Standard(standard_request) => {
@@ -4837,6 +4846,7 @@ fn fit_dataset_impl(
                     );
                 scan_payload.group_metadata = fit_config.group_metadata.clone();
                 scan_payload.training_table_kind = training_table_kind;
+                scan_payload.inference_notes = inference_notes;
                 let model = FittedModel::from_payload(scan_payload);
                 return serde_json::to_vec(&model).map_err(|err| {
                     gam::solver::fit_orchestration::WorkflowError::IntegrationFailed {
@@ -5062,6 +5072,7 @@ fn fit_dataset_impl(
     };
     payload.group_metadata = fit_config.group_metadata.clone();
     payload.training_table_kind = training_table_kind;
+    payload.inference_notes = inference_notes;
     let model = FittedModel::from_payload(payload);
     serde_json::to_vec(&model).map_err(|err| {
         gam::solver::fit_orchestration::WorkflowError::IntegrationFailed {

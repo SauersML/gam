@@ -23,6 +23,7 @@ from ._reml_common import check_forward_state, coerce_grad_payload
 from ._response_geometry import ResponseGeometryModel, fit_response_geometry
 from ._tables import normalize_table
 from ._validation import FormulaValidation
+from ._warnings import emit_inference_warnings
 
 
 @dataclass(frozen=True, slots=True)
@@ -1270,7 +1271,12 @@ def fit(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return Model(_model_bytes=model_bytes, _training_table_kind=table_kind)
+    model = Model(_model_bytes=model_bytes, _training_table_kind=table_kind)
+    # Surface any materialization advisories (e.g. an mgcv-style "k reduced to
+    # the data support" note when a cr/cs/sz basis is capped) as warnings, so a
+    # basis the fit silently adjusted is never silent to the caller (#1543).
+    emit_inference_warnings(model.notes)
+    return model
 
 
 def fit_array(
@@ -1378,7 +1384,9 @@ def fit_array(
         )
     except Exception as exc:
         raise map_exception(exc) from exc
-    return Model(_model_bytes=model_bytes, _training_table_kind="numpy")
+    model = Model(_model_bytes=model_bytes, _training_table_kind="numpy")
+    emit_inference_warnings(model.notes)  # see fit(): never silently adjust a basis (#1543)
+    return model
 
 
 def load(path: str | Path) -> Any:
