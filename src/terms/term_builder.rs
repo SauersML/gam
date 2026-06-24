@@ -1785,11 +1785,31 @@ pub fn build_smooth_basis(
         // penalty + null-space ridge is what makes its partial pooling work) and
         // `re` is the raw linear effect handled above.
         let sz_uses_cr = type_opt.as_str() == "sz" && effective_degree == DEFAULT_BSPLINE_DEGREE;
+        // The `sz` cr marginal is capped to the covariate's data support exactly
+        // like the univariate `cr`/`cs` path (#1542): `select_cr_knots` cannot
+        // place more value-knots than there are distinct covariate values, so an
+        // unclamped marginal `k` on a low-cardinality covariate (a 3-level ordinal,
+        // a small count) used to hard-fail the whole factor smooth instead of
+        // reducing like mgcv — while the B-spline-marginal `fs` sibling fit the
+        // identical data. Below the cr minimum (a binary covariate) degrade to the
+        // B-spline marginal `fs` already uses, keeping the `sz` deviation flavour.
         let marginal_knotspec = if sz_uses_cr {
-            let k_cr = (n_knots + effective_degree + 1).max(3);
-            let cr_knots = crate::terms::basis::select_cr_knots(ds.values.column(c), k_cr)
-                .map_err(|e| e.to_string())?;
-            BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots }
+            let k_cr = (n_knots + effective_degree + 1).max(CR_MIN_KNOTS);
+            match capped_cr_marginal_knotspec(
+                ds.values.column(c),
+                k_cr,
+                &vars.join(","),
+                inference_notes,
+            )? {
+                Some(cr_knotspec) => cr_knotspec,
+                None => resolve_nonperiodic_bspline_knotspec(
+                    options,
+                    ds.values.column(c),
+                    (minv, maxv),
+                    effective_degree,
+                    n_knots,
+                )?,
+            }
         } else {
             resolve_nonperiodic_bspline_knotspec(
                 options,
@@ -2105,14 +2125,32 @@ pub fn build_smooth_basis(
                 // produce (`n_knots` internal + degree + 1), floored at the cr
                 // minimum of 3 knots. `cr` vs `cs` (shrinkage) is carried by the
                 // `double_penalty` flag resolved below, which the cr builder reads.
-                let k_cr = (n_knots + effective_degree + 1).max(3);
-                let cr_knots =
-                    crate::terms::basis::select_cr_knots(ds.values.column(c), k_cr)
-                        .map_err(|e| e.to_string())?;
-                (
-                    BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots },
-                    parse_cyclic_boundary(options, minv, maxv)?,
-                )
+                //
+                // Cap that request to the covariate's data support (#1541): a cr
+                // basis cannot place more value-knots than there are distinct
+                // covariate values, so an unclamped `k` on a low-cardinality
+                // predictor (binary indicator, 3-level ordinal, small count) used
+                // to hard-fail in `select_cr_knots` instead of reducing like mgcv
+                // and gam's tensor path. Below the cr minimum (a binary covariate)
+                // degrade to the B-spline marginal the default `s(x, k=..)` basis
+                // already fits on the same data — never a hard error.
+                let k_cr = (n_knots + effective_degree + 1).max(CR_MIN_KNOTS);
+                let knotspec = match capped_cr_marginal_knotspec(
+                    ds.values.column(c),
+                    k_cr,
+                    &vars.join(","),
+                    inference_notes,
+                )? {
+                    Some(cr_knotspec) => cr_knotspec,
+                    None => resolve_nonperiodic_bspline_knotspec(
+                        options,
+                        ds.values.column(c),
+                        (minv, maxv),
+                        effective_degree,
+                        n_knots,
+                    )?,
+                };
+                (knotspec, parse_cyclic_boundary(options, minv, maxv)?)
             } else {
                 (
                     resolve_nonperiodic_bspline_knotspec(
@@ -3286,6 +3324,67 @@ pub fn unique_count_column(col: ArrayView1<'_, f64>) -> usize {
         set.insert(norm.to_bits());
     }
     set.len().max(1)
+}
+
+/// Minimum knot count for a natural cubic regression spline: `select_cr_knots`
+/// places one value-knot per basis function and needs at least an interior knot,
+/// so the sparsest representable cr basis is `{const, linear, curvature}` at
+/// three knots. Below this a cr spline is not constructible and the caller must
+/// degrade to the linear B-spline marginal.
+pub(crate) const CR_MIN_KNOTS: usize = 3;
+
+/// Build a cubic-regression marginal knot spec capped to the covariate's data
+/// support, mgcv-style.
+///
+/// A `cr`/`cs`/`sz` marginal places exactly one basis function per value-knot,
+/// so `select_cr_knots` cannot place more knots than the covariate has DISTINCT
+/// values — it `bail`s with "cubic regression spline with k=N requires at least
+/// N distinct values" otherwise. An unclamped `k` on an ordinary low-cardinality
+/// covariate (a binary indicator, a 3-level ordinal/Likert score, a small count)
+/// therefore hard-failed the whole fit instead of reducing the basis the way
+/// mgcv — and gam's own tensor-margin path (996f829d7, `term_builder.rs:2986` /
+/// the `k_axis >= 3` cr gate at `:3047`) — do. This is the univariate / factor-
+/// smooth sibling of that tensor cap (#1541, #1542).
+///
+/// Returns:
+/// - `Some(NaturalCubicRegression { .. })` with `k = min(k_requested, n_distinct)`
+///   value-knots when the data supports a cr spline (`n_distinct >= CR_MIN_KNOTS`).
+///   A cr basis of exactly `n_distinct` knots is full-rank for the data — it can
+///   represent any per-distinct-value structure (e.g. 3 arbitrary group means on
+///   a ternary covariate) — so the cap never costs recoverable signal.
+/// - `None` when `n_distinct < CR_MIN_KNOTS` (a binary covariate): too few
+///   distinct values for ANY cr spline, so the caller degrades to the linear
+///   B-spline marginal — exactly what the default `s(x, k=..)` basis already
+///   builds on the same data, and what the tensor path's `< 3` branch builds.
+///
+/// `inference_notes` records any reduction so the user sees that `k` was capped
+/// (mgcv emits a warning in the same situation).
+fn capped_cr_marginal_knotspec(
+    col: ArrayView1<'_, f64>,
+    k_cr_requested: usize,
+    label: &str,
+    inference_notes: &mut Vec<String>,
+) -> Result<Option<BSplineKnotSpec>, String> {
+    let n_distinct = unique_count_column(col);
+    let k_cr = k_cr_requested.min(n_distinct);
+    if k_cr < CR_MIN_KNOTS {
+        inference_notes.push(format!(
+            "Smooth '{label}': cubic-regression ('cr'/'cs'/'sz') basis requested k={k_cr_requested}, \
+             but the covariate has only {n_distinct} distinct value(s) — too few to support a cubic \
+             regression spline (needs >= {CR_MIN_KNOTS} distinct values). Degraded to the linear \
+             B-spline marginal the default basis builds on the same data."
+        ));
+        return Ok(None);
+    }
+    if k_cr < k_cr_requested {
+        inference_notes.push(format!(
+            "Smooth '{label}': cubic-regression ('cr'/'cs'/'sz') basis reduced from k={k_cr_requested} \
+             to k={k_cr} to match the covariate's {n_distinct} distinct value(s) (mgcv-style \
+             data-support cap; a cr basis cannot place more value-knots than the data has)."
+        ));
+    }
+    let cr_knots = crate::terms::basis::select_cr_knots(col, k_cr).map_err(|e| e.to_string())?;
+    Ok(Some(BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots }))
 }
 
 /// Smallest number of distinct covariate values seen within any single group
