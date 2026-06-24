@@ -573,6 +573,20 @@ fn sphere_mean_candidates(
     // `M = Σ wᵢ pᵢ pᵢᵀ = Pᵀ diag(w) P` over all n points: the same GPU-dispatched
     // weighted cross-product used by `sphere_second_moment`.
     let moment = sphere_second_moment(values, weights);
+    // Seed the Karcher descent from EVERY principal axis of `M` (each ± sign),
+    // not only the dominant one. The Fréchet mean of points spread symmetrically
+    // around a great subsphere lives on the SMALLEST-eigenvalue axis — e.g. for an
+    // equilateral triangle on the equator (`M = diag(1.5, 1.5, 0)`) the mean is a
+    // pole, the `e₃` axis. A dominant-axis-only seed can never reach it: the
+    // descent started in the equatorial eigenplane stays equatorial and converges
+    // to a sub-optimal equatorial stationary point. A full self-adjoint
+    // eigendecomposition of the small `d×d` Gram offers all `d` axes, so the
+    // correct basin is always among the seeds.
+    if push_eigenvector_axes(&moment, &mut candidates) {
+        return Ok(candidates);
+    }
+    // Eigendecomposition was numerically unavailable: fall back to the dominant
+    // axis via power iteration so the seed set is never empty.
     let mut v = Array1::<f64>::from_elem(d, 1.0 / (d as f64).sqrt());
     for _ in 0..SPHERE_SEED_POWER_ITERS {
         let mut nv = Array1::<f64>::zeros(d);
@@ -597,6 +611,35 @@ fn sphere_mean_candidates(
         candidates.push(unit.mapv(|x| -x));
     }
     Ok(candidates)
+}
+
+/// Append `±` each eigenvector axis of the symmetric second-moment matrix `M`
+/// to the Karcher seed set, returning `true` when at least one axis was added.
+///
+/// Covering every principal axis — including the smallest-eigenvalue one — is
+/// what lets the descent reach the Fréchet mean of data spread symmetrically
+/// around a great subsphere, which a dominant-axis-only seed structurally
+/// misses. The decomposition is of a `d×d` matrix (`d` = ambient sphere
+/// dimension, typically 3), so it is negligible next to the per-point reductions.
+fn push_eigenvector_axes(moment: &Array2<f64>, candidates: &mut Vec<Array1<f64>>) -> bool {
+    use crate::linalg::faer_ndarray::FaerEigh;
+    use faer::Side;
+    let evecs = match moment.eigh(Side::Lower) {
+        Ok((_evals, evecs)) => evecs,
+        Err(_) => return false,
+    };
+    let mut pushed = false;
+    for col in 0..evecs.ncols() {
+        let axis = evecs.column(col).to_owned();
+        let nrm = norm(axis.view());
+        if nrm > 0.0 && nrm.is_finite() {
+            let unit = axis.mapv(|x| x / nrm);
+            candidates.push(unit.clone());
+            candidates.push(unit.mapv(|x| -x));
+            pushed = true;
+        }
+    }
+    pushed
 }
 
 /// Build the weighted second-moment matrix `M = Σ wᵢ pᵢ pᵢᵀ = Pᵀ diag(w) P`.
@@ -819,8 +862,9 @@ pub fn sphere_frechet_mean(
     if candidates.is_empty() {
         candidates.push(sphere_orthogonal_unit(y.row(0))?);
     }
-    let mut best_mu: Option<Array1<f64>> = None;
-    let mut best_obj = f64::INFINITY;
+    // Run the Riemannian descent from every seed and keep ALL converged minima so
+    // the global optimum can be selected by objective rather than by seed order.
+    let mut converged: Vec<(f64, Array1<f64>)> = Vec::new();
     for candidate in candidates {
         let mut mu = candidate;
         let mut failed = false;
@@ -842,19 +886,39 @@ pub fn sphere_frechet_mean(
             continue;
         }
         let obj = sphere_frechet_objective(y.view(), w.view(), mu.view());
-        if obj < best_obj {
-            best_obj = obj;
-            best_mu = Some(mu);
+        converged.push((obj, mu));
+    }
+    if let Some(best_obj) = converged.iter().map(|(obj, _)| *obj).reduce(f64::min) {
+        // Tolerance for "ties at the global objective": absolute floor plus a
+        // relative term so it scales with the objective magnitude.
+        let obj_tie = 1.0e-9 * (1.0 + best_obj.abs());
+        // Two unit vectors count as the SAME minimizer when their geodesic
+        // separation is below this angle (≈ 4.5e-4 rad); antipodes and any
+        // genuinely distinct equatorial points fall far outside it.
+        const SAME_POINT_DOT: f64 = 1.0 - 1.0e-7;
+        let optima: Vec<&Array1<f64>> = converged
+            .iter()
+            .filter(|(obj, _)| *obj <= best_obj + obj_tie)
+            .map(|(_, mu)| mu)
+            .collect();
+        let unique = optima.iter().all(|mu| {
+            let d = dot(optima[0].view(), mu.view()).clamp(-1.0, 1.0);
+            d >= SAME_POINT_DOT
+        });
+        if unique {
+            // A single isolated global minimizer (the ordinary Karcher mean).
+            return Ok(optima[0].to_vec());
         }
+        // The global minimizer is NOT unique — the descent reached two or more
+        // distinct points of equal objective (e.g. both poles of an equatorial
+        // triangle, or the whole equator of an antipodal pair). Resolve the tie
+        // with the deterministic structural pick below rather than letting seed
+        // order decide, so the result is stable run-to-run.
     }
-    if let Some(mu) = best_mu {
-        return Ok(mu.to_vec());
-    }
-    // No log-map iteration converged: the problem is non-identifiable because the
-    // data has a degenerate/antipodal structure (e.g. equal-weight {e1, −e1},
-    // whose minimizer set is the entire orthogonal equator). Honor the documented
-    // contract by returning ONE deterministic equatorial minimizer rather than an
-    // endpoint surrogate or a "not identifiable" error.
+    // Either no seed converged, or the minimizer is a non-identifiable continuum
+    // / antipodal-symmetric pair. Honor the documented contract by returning ONE
+    // deterministic minimizer (e.g. `+e2` for equal-weight {e1, −e1}) rather than
+    // a seed-order-dependent point, an endpoint surrogate, or a spurious error.
     if let Some(mu) = sphere_equatorial_minimizer(y.view(), w.view()) {
         return Ok(mu.to_vec());
     }
