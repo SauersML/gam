@@ -96,13 +96,21 @@ use crate::inference::smooth_test::{
 use crate::solver::grid_spline_2d::{GridSpline2dDesign, axis_basis_at};
 
 /// Interaction energy fraction at or below which the interaction block is
-/// energetically negligible and lossless fission is on the table. A
-/// REML/ARD-killed interaction lands at numerical zero; `1e-6` of the
-/// centered surface variance corresponds to a relative amplitude of
-/// `1e-3` (≈ √fraction), far below behavioral relevance for any consumer
-/// of the carve, while sitting far above f64 roundoff accumulated through
-/// the centering algebra. Auto-applied — no knob.
-pub const FISSION_MAX_INTERACTION_FRACTION: f64 = 1e-6;
+/// energetically negligible and lossless fission is on the table. The bar is
+/// the finite-sample NOISE FLOOR of the interaction estimate, not exact
+/// algebraic zero. A planted, exactly-additive coefficient matrix carves to
+/// numerical zero (≈ f64 roundoff), but a real REML fit of a genuinely
+/// separable surface over noisy scattered codes cannot drive its penalized
+/// interaction block below the variance its own estimator injects: a 5%-noise
+/// pair fit lands at ~`1e-4` of centered surface energy (a relative amplitude of
+/// `1e-2`, ≈ √fraction). `1e-4` sits just above that estimator floor so a
+/// separable atom actually fissions end to end (the production
+/// `fit_pair_surface → carve` path, which the planted in-module tests do not
+/// exercise), while staying far below any genuine interaction — the bound
+/// panels carry fractions orders of magnitude larger, and the companion binding
+/// Wald test resolves small-but-real interactions besides. Auto-applied — no
+/// knob.
+pub const FISSION_MAX_INTERACTION_FRACTION: f64 = 1e-4;
 
 /// Interaction energy fraction at or below which the gauge-projected
 /// interaction block is f64 roundoff rather than signal, so the binding Wald
