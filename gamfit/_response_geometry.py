@@ -438,18 +438,20 @@ def fit_response_geometry(
         "config": config,
     }
     np = _np()
+    # ALR is a valid chart but NOT isometric to Aitchison geometry: in ALR
+    # coordinates the Aitchison inner product is ⟨u, v⟩ = uᵀ G v with the Gram
+    # G = I_{D-1} − (1/D)·11ᵀ (for D = 3 it is [[2/3,-1/3],[-1/3,2/3]] ≠ I).
+    # Whitening the tangent coordinates by W = G^{1/2} (ỹ = y·W) makes BOTH the
+    # residual AND the smoothing penalty Aitchison-isometric, so the fit is
+    # invariant to the (arbitrary) ALR reference part and equal to the CLR fit
+    # (#1549). Whitening the residual ALONE — the previous fisher_rao_w = G
+    # route — left the penalty λ·tr(BᵀSB) in the non-orthogonal raw ALR frame
+    # and made the fit reference-dependent. A user-supplied fisher_rao_w is an
+    # explicit residual-metric override and is honoured verbatim (no whitening).
+    whitener = None
     fisher_source = fisher_rao_w
     if fisher_source is None and resolved_coordinates.lower() == "alr":
-        # ALR is a valid chart but NOT isometric to Aitchison geometry: in ALR
-        # coordinates the Aitchison inner product is ⟨u, v⟩ = uᵀ G v with the
-        # Gram G = I_{D-1} − (1/D)·11ᵀ (for D = 3 it is [[2/3,-1/3],[-1/3,2/3]]
-        # ≠ I). Fitting a plain Gaussian/Euclidean model in ALR therefore
-        # minimizes the wrong (non-Aitchison) residual norm. Attach G as the
-        # per-observation residual weight so the Gaussian objective rᵀ G r and
-        # its gradient XᵀG(y−Xβ) are Aitchison-correct. (ILR/CLR have G = I and
-        # need no weighting; that is why the default coordinate is isometric.)
-        n_parts = int(y.shape[1])
-        fisher_source = _aitchison_metric_blocks(np, int(tangent.shape[0]), n_parts)
+        whitener = _aitchison_whitener(np, int(y.shape[1]))
     fisher_w = None
     if fisher_source is not None:
         fisher_w = _ffi(
@@ -465,9 +467,21 @@ def fit_response_geometry(
     augmented[target] = tangent[:, 0].tolist()
     template_formula = f"{target} ~ {rhs}"
     template_model = fit_func(augmented, template_formula, **kwargs)
+    # Fit the joint tangent REML in the whitened frame when whitening applies; the
+    # design matrix X (and hence the template) is unaffected by the response-side
+    # rotation, so only the tangent passed to the shared solve is whitened.
+    fit_tangent = tangent if whitener is None else tangent @ whitener[0]
     shared_fit = _fit_shared_tangent_reml(
-        augmented, template_formula, tangent, kwargs, fisher_w
+        augmented, template_formula, fit_tangent, kwargs, fisher_w
     )
+    if whitener is not None:
+        # Fold the inverse whitener back into the coefficients so predict_tangent
+        # (X @ coefficients) returns ordinary ALR tangent coordinates again:
+        #   (X @ Cᵂ) @ W⁻¹ = (whitened tangent) @ W⁻¹ = ALR tangent.
+        # The downstream inverse-ALR exp map then round-trips on the native chart.
+        shared_fit["coefficients"] = np.ascontiguousarray(
+            np.asarray(shared_fit["coefficients"], dtype=float) @ whitener[1]
+        )
     return ResponseGeometryModel(
         models=(),
         # The geometry used for the log/exp maps carries the fitted κ̂ for a
@@ -488,23 +502,45 @@ def fit_response_geometry(
     )
 
 
-def _aitchison_metric_blocks(np: Any, n_obs: int, n_parts: int) -> Any:
-    """Aitchison Gram ``G = I_{D-1} − (1/D)·11ᵀ`` for ALR coordinates.
+def _aitchison_whitener(np: Any, n_parts: int) -> tuple[Any, Any]:
+    """Symmetric whitener ``W = G^{1/2}`` (and its inverse) for ALR coordinates.
 
     ALR maps a ``D``-part composition to ``D-1`` log-ratio coordinates, but the
-    Aitchison inner product in those coordinates is ``⟨u, v⟩ = uᵀ G v`` with this
-    ``(D-1)×(D-1)`` Gram (for ``D = 3`` it is ``[[2/3,-1/3],[-1/3,2/3]]`` ≠ I).
-    Returned as a single 2-D block; the FFI broadcasts it across all ``n_obs``
-    observations so the Gaussian residual weighting ``rᵀ G r`` is constant and
-    Aitchison-correct. ``n_obs`` is accepted to document the broadcast intent.
+    Aitchison inner product in those coordinates is ``⟨u, v⟩ = uᵀ G v`` with the
+    Gram ``G = I_{D-1} − (1/D)·11ᵀ`` (for ``D = 3`` it is
+    ``[[2/3,-1/3],[-1/3,2/3]]`` ≠ I). ``G`` has eigenvalue ``1/D`` along the
+    all-ones direction and ``1`` on its orthogonal complement, so it is positive
+    definite and ``G^{1/2}`` exists.
+
+    Whitening the tangent coordinates by ``W = G^{1/2}`` (``ỹ = y·W``) turns the
+    Aitchison inner product into the plain Euclidean one: ``ỹ ỹᵀ = yᵀ Wᵀ W y =
+    yᵀ G y``. Fitting the isotropic Gaussian REML in the whitened frame then
+    expresses BOTH the residual ``rᵀ G r`` and the penalty ``λ·tr(BᵀSB)`` in the
+    Aitchison metric — the previous ``fisher_rao_w = G`` approach whitened only
+    the residual and left the penalty in the raw ALR frame, which is exactly the
+    reference-dependence bug (#1549): the change-of-reference map between two ALR
+    frames is linear but not orthogonal, so it preserves ``yᵀ G y`` but NOT
+    ``tr(BᵀSB)``. In the whitened frame any two references differ by an
+    *orthogonal* rotation ``Q = W' M W⁻¹`` of the coordinates, under which the
+    whole shared-smoothing isotropic objective (Frobenius residual + ``Sᵇ⊗I``
+    penalty + REML log-dets) is invariant, so the fitted composition is
+    reference-free and equal to the CLR fit.
+
+    Returns ``(W, W⁻¹)`` with ``W`` symmetric. (ILR/CLR have ``G = I`` and need
+    no whitening; that is why the default coordinate is already isometric.)
     """
     if n_parts < 2:
         raise ValueError("Aitchison metric requires at least two compositional parts")
-    if n_obs <= 0:
-        raise ValueError("Aitchison metric requires at least one observation")
     dim = n_parts - 1
     gram = np.eye(dim, dtype=float) - (1.0 / float(n_parts))
-    return gram
+    # Symmetric eigendecomposition: G = V diag(w) Vᵀ, all w > 0, so the symmetric
+    # square root and its inverse are V diag(w^{±1/2}) Vᵀ. dim is tiny (D-1), so
+    # this is exact and cheap.
+    eigvals, eigvecs = np.linalg.eigh(gram)
+    root = np.sqrt(eigvals)
+    sqrt = (eigvecs * root) @ eigvecs.T
+    inv_sqrt = (eigvecs / root) @ eigvecs.T
+    return sqrt, inv_sqrt
 
 
 def _formula_rhs(formula: str) -> str:
