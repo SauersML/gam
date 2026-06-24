@@ -249,14 +249,6 @@ impl SaeReconstructionRowProgram {
                     Some(slot) => S::variable(self.logits[atom], slot),
                     None => S::constant(self.logits[atom]),
                 };
-                // σ(x) = 1 / (1 + exp(−x)). Evaluated in a branch-stable form to
-                // avoid overflow of the inner `exp`: the two algebraic identities
-                //   x ≥ 0:  σ(x) = 1 / (1 + exp(−x))      (exp(−x) ∈ (0,1])
-                //   x < 0:  σ(x) = exp(x) / (1 + exp(x))   (exp(x)  ∈ (0,1))
-                // are equal everywhere, so they produce the identical tower in
-                // every derivative channel. The branch is selected on the base
-                // .v of x (a constant for a given row), so it is not a function
-                // of the tower variables and the derivative stack is unchanged.
                 let x = l.sub(&S::constant(self.gate_shift[atom])).scale(inv_tau);
                 let one = S::constant(1.0);
                 let sigma = if x.value() >= 0.0 {
@@ -266,6 +258,52 @@ impl SaeReconstructionRowProgram {
                     ex.mul(&recip(&one.add(&ex)))
                 };
                 sigma.scale(self.gate_scale[atom])
+            }
+        }
+    }
+
+    /// All atoms' gate jets `ζ_k` at once, with the softmax denominator SHARED
+    /// across atoms (#932 perf). The per-atom [`Self::gate_tower`] rebuilds the
+    /// whole softmax denominator — `K` exp-jets, their sum, and the reciprocal —
+    /// on EVERY call, because only the numerator differs per atom; calling it `K`
+    /// times costs `K·(K exps) = O(K²)` exponential jets and `K` reciprocal jets
+    /// per row. Here the `K` exp-jets, the denominator sum, and the single
+    /// reciprocal jet are built ONCE, then `ζ_k = exp_k · inv_denom`. This emits
+    /// exactly `K` exps + `1` recip per row instead of `K²` + `K` (measured:
+    /// `K(K−1)` redundant exps and `K−1` redundant recips eliminated per row at
+    /// `K=8` ⇒ 56 exps + 7 recips removed), and is **bit-identical** to the
+    /// per-atom path (same `exp_k · recip(denom)` product, same Leibniz order).
+    /// Pure [`JetScalar`] ops — single-source, exact, no softmax chain rule.
+    fn all_gates<const K: usize, S: JetScalar<K>>(&self) -> Vec<S> {
+        let n = self.gate_value.len();
+        match self.gate {
+            RowGate::Softmax { inv_tau } => {
+                let shift = self
+                    .logits
+                    .iter()
+                    .copied()
+                    .fold(f64::NEG_INFINITY, f64::max)
+                    * inv_tau;
+                // The K exp-jets and the denominator, built ONCE and shared.
+                let mut exps: Vec<S> = Vec::with_capacity(n);
+                let mut denom = S::constant(0.0);
+                for j in 0..n {
+                    let lj = match self.logit_slot[j] {
+                        Some(slot) => S::variable(self.logits[j], slot),
+                        None => S::constant(self.logits[j]),
+                    };
+                    let ej = lj.scale(inv_tau).sub(&S::constant(shift)).exp();
+                    denom = denom.add(&ej);
+                    exps.push(ej);
+                }
+                let inv = recip(&denom);
+                exps.iter().map(|e| e.mul(&inv)).collect()
+            }
+            // Per-atom logistic gates are independent (each depends only on its
+            // own logit); there is no shared denominator to hoist, so this is the
+            // same as calling `gate_tower` per atom.
+            RowGate::PerAtomLogistic { .. } => {
+                (0..n).map(|atom| self.gate_tower::<K, S>(atom)).collect()
             }
         }
     }
@@ -337,10 +375,10 @@ impl SaeReconstructionRowProgram {
         );
         let p = self.out_dim();
         // Hoist the per-atom gate jet (c-independent) and basis jets
-        // (c-independent) out of the column loop.
-        let gates: Vec<Order2<K>> = (0..self.atoms.len())
-            .map(|atom| self.gate_tower::<K, Order2<K>>(atom))
-            .collect();
+        // (c-independent) out of the column loop. `all_gates` additionally shares
+        // the softmax denominator / reciprocal across atoms (K exps + 1 recip,
+        // not K² + K).
+        let gates: Vec<Order2<K>> = self.all_gates::<K, Order2<K>>();
         let bases: Vec<Vec<Order2<K>>> = self
             .atoms
             .iter()
@@ -445,11 +483,13 @@ impl SaeReconstructionRowProgram {
     }
 
     /// Packed β border-channel sub-jets for a batch of `(atom, basis_col)`
-    /// channels, with the per-atom gate jet HOISTED (#932 perf): many border
-    /// channels share the same atom, and the gate jet `ζ_k` (the dominant
-    /// `K`-exp / `K×K`-Hessian cost) is a function of the atom's logits only, not
-    /// of `basis_col`. Building it once per DISTINCT atom and reusing it removes
-    /// the per-channel gate recomputation. Each result is **bit-identical** to
+    /// channels, with the per-atom gate jets HOISTED and the softmax denominator
+    /// SHARED across atoms (#932 perf): the gate jet `ζ_k` (the dominant `K`-exp
+    /// / `K×K`-Hessian cost) is a function of the row's logits only, not of
+    /// `basis_col`, and every atom's gate shares one softmax denominator /
+    /// reciprocal. [`Self::all_gates`] builds all `K` gates once (K exps + 1
+    /// recip per row); each channel then just multiplies its atom's cached gate
+    /// by its basis jet. Each result is **bit-identical** to
     /// [`Self::beta_border_tower_packed`] for the same `(atom, basis_col)` (same
     /// `gate.mul(basis)` product), in the input order.
     #[must_use]
@@ -462,23 +502,13 @@ impl SaeReconstructionRowProgram {
             "SaeReconstructionRowProgram: tower arity K={K} must equal n_primaries={}",
             self.n_primaries
         );
-        // Lazily cache one gate jet per atom (atoms are few; a Vec<Option<_>>
-        // keyed by atom index avoids recomputing the shared gate per channel).
-        let mut gate_cache: Vec<Option<Order2<K>>> = vec![None; self.atoms.len()];
+        let gates: Vec<Order2<K>> = self.all_gates::<K, Order2<K>>();
         channels
             .iter()
             .map(|&(atom, basis_col)| {
-                let gate = match gate_cache[atom] {
-                    Some(g) => g,
-                    None => {
-                        let g = self.gate_tower::<K, Order2<K>>(atom);
-                        gate_cache[atom] = Some(g);
-                        g
-                    }
-                };
                 let phi =
                     self.atoms[atom].basis_tower::<K, Order2<K>>(basis_col, &self.coord_slot[atom]);
-                gate.mul(&phi)
+                gates[atom].mul(&phi)
             })
             .collect()
     }
@@ -1151,12 +1181,40 @@ mod tests {
         }
     }
 
-    /// #932 perf pin: the gate/basis-HOISTED all-columns reconstruction
-    /// (`reconstruction_all_columns_packed`) is BIT-IDENTICAL to calling
-    /// `reconstruction_column_packed(c)` per column — the hoist removes only the
-    /// `out_dim×` redundant gate/basis recomputation, not any arithmetic. Every
-    /// value/grad/Hessian channel must match exactly (==), since the Leibniz
-    /// products are the same in the same order.
+    /// #932 perf pin: the gate-shared `all_gates` produces gate jets
+    /// BIT-IDENTICAL to the per-atom `gate_tower` — sharing the softmax
+    /// denominator / reciprocal across atoms (K exps + 1 recip instead of
+    /// K² + K) changes only which redundant work is elided, not the result
+    /// (`ζ_k = exp_k · recip(denom)` is the same product, same Leibniz order).
+    #[test]
+    fn shared_all_gates_bit_identical_to_per_atom_gate_tower() {
+        for tau in [0.9_f64, 1.3, 2.1] {
+            let (prog, _inv_tau) = softmax_fixture(tau);
+            let all = prog.all_gates::<6, Order2<6>>();
+            assert_eq!(all.len(), prog.gate_value.len());
+            for atom in 0..prog.gate_value.len() {
+                let per = prog.gate_tower::<6, Order2<6>>(atom);
+                assert_eq!(all[atom].value(), per.value(), "atom {atom} value");
+                for a in 0..6 {
+                    assert_eq!(all[atom].g()[a], per.g()[a], "atom {atom} g[{a}]");
+                    for b in 0..6 {
+                        assert_eq!(
+                            all[atom].h()[a][b],
+                            per.h()[a][b],
+                            "atom {atom} h[{a}][{b}]"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// #932 perf pin: the gate/basis-HOISTED + denominator-SHARED all-columns
+    /// reconstruction (`reconstruction_all_columns_packed`) is BIT-IDENTICAL to
+    /// calling `reconstruction_column_packed(c)` per column — the hoist + share
+    /// removes only redundant gate/basis/denominator recomputation, not any
+    /// arithmetic. Every value/grad/Hessian channel must match exactly (==),
+    /// since the Leibniz products are the same in the same order.
     #[test]
     fn hoisted_all_columns_bit_identical_to_per_column() {
         for tau in [0.9_f64, 1.3, 2.1] {
