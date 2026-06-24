@@ -283,12 +283,15 @@ def main() -> None:
     args = ap.parse_args()
 
     import math
+    # The pyo3 setters live in the compiled `gamfit._rust` module (the #[pymodule]
+    # named "_rust"); gamfit/__init__.py only re-exports a curated top-level list,
+    # which does not include these sweep knobs — so import them from _rust directly.
     if (not math.isnan(args.amp_mu)) or (not math.isnan(args.sep_mu)) or args.gate_mode != 0:
-        from gamfit import sae_set_barrier_overrides
+        from gamfit._rust import sae_set_barrier_overrides
         sae_set_barrier_overrides(args.amp_mu, args.sep_mu, args.gate_mode)
         print(f"[barrier] amp_mu={args.amp_mu} sep_mu={args.sep_mu} gate_mode={args.gate_mode}", flush=True)
     if not math.isnan(args.ibp_alpha):
-        from gamfit import sae_set_ibp_alpha
+        from gamfit._rust import sae_set_ibp_alpha
         sae_set_ibp_alpha(args.ibp_alpha)
         print(f"[ibp] alpha={args.ibp_alpha}", flush=True)
 

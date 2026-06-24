@@ -1033,6 +1033,38 @@ impl SaeManifoldAtom {
         }
     }
 
+    /// #1026 — `∂²g_k/∂t_{ik,axis}∂η` for one row/axis, restricted to the curved
+    /// basis columns. Because the η-dial scales exactly the curved columns
+    /// (`∂Φ^η/∂η = Φ_curved`), the η-derivative of the coordinate Jacobian
+    /// `∂(∂Φ/∂t·B)/∂η` is the SAME coordinate-Jacobian contraction summed over
+    /// only the curved columns. This is the coordinate-channel analog of the
+    /// β-predictor's `curvature_basis_eta_derivatives`, and supplies the missing
+    /// `w_t = ∂g_t/∂η` forcing that lets the homotopy walk track onto the curved
+    /// branch instead of riding the linear shadow. `curved_cols` are the atom's
+    /// `phi_eta_split` curved column indices; a linear-only atom writes zeros.
+    pub fn fill_decoded_curved_derivative_row(
+        &self,
+        row: usize,
+        latent_axis: usize,
+        curved_cols: &[usize],
+        out: &mut [f64],
+    ) {
+        let p = self.output_dim();
+        assert_eq!(out.len(), p);
+        for slot in out.iter_mut() {
+            *slot = 0.0;
+        }
+        for &basis_col in curved_cols {
+            let dphi = self.basis_jacobian[[row, basis_col, latent_axis]];
+            if dphi == 0.0 {
+                continue;
+            }
+            for out_col in 0..p {
+                out[out_col] += dphi * self.decoder_coefficients[[basis_col, out_col]];
+            }
+        }
+    }
+
     /// Recompute the intrinsic (arc-length) roughness Gram
     /// [`Self::smooth_penalty`] from [`Self::smooth_penalty_raw`], the current
     /// basis Jacobian, and the current decoder coefficients (issue #673).

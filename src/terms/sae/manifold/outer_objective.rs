@@ -747,27 +747,37 @@ impl SaeManifoldOuterObjective {
             let eta_next = (eta + eta_step).min(1.0);
             let d_eta = eta_next - eta;
 
-            // Predictor: IFT step on the cached factor warm-starts the corrector
-            // (β-channel only; `w_t = 0`). Non-fatal — on any predictor failure
-            // the corrector simply opens from the previous η's converged β.
+            // Predictor: IFT step on the cached factor warm-starts the corrector.
+            // #1026 — the COORDINATE channel `w_t = ∂g_t/∂η` (was hardcoded `0`)
+            // is now supplied alongside `∂g_β/∂η`. Because the η-dial scales the
+            // curved basis columns, dropping `w_t` left the predictor unable to
+            // move coordinates as curvature turns on, so the walk tracked the
+            // linear-shadow branch to η=1; the full step lets it follow the curved
+            // branch. The IFT step is `Δparams = −H⁻¹ ∂g/∂η · Δη`, i.e. delta
+            // `−u` applied at step `Δη` through the manifold retraction the Newton
+            // step uses (coords + logits + β in one consistent application).
+            // Non-fatal — any predictor failure just opens the corrector from the
+            // previous η's converged state.
             if let Ok(dg_beta) = self
                 .term
                 .curvature_beta_gradient_eta_derivative(self.target.view(), &rho)
                 && dg_beta.len() == last_cache.k
             {
-                let w_t = Array1::<f64>::zeros(last_cache.delta_t_len());
-                if let Ok((_u_t, u_beta)) =
-                    last_cache.full_inverse_apply(w_t.view(), dg_beta.view())
+                let w_t = self
+                    .term
+                    .curvature_t_gradient_eta_derivative(self.target.view(), &rho)
+                    .unwrap_or_else(|_| Array1::<f64>::zeros(last_cache.delta_t_len()));
+                if w_t.len() == last_cache.delta_t_len()
+                    && let Ok((u_t, u_beta)) =
+                        last_cache.full_inverse_apply(w_t.view(), dg_beta.view())
+                    && u_t.iter().chain(u_beta.iter()).all(|v| v.is_finite())
                 {
-                    let mut beta = self.term.flatten_beta();
-                    if beta.len() == u_beta.len() {
-                        for (b, u) in beta.iter_mut().zip(u_beta.iter()) {
-                            *b -= u * d_eta;
-                        }
-                        if beta.iter().all(|v| v.is_finite()) {
-                            self.term.set_flat_beta(beta.view()).ok();
-                        }
-                    }
+                    let neg_u_t: Array1<f64> = u_t.iter().map(|v| -v).collect();
+                    let neg_u_beta: Array1<f64> = u_beta.iter().map(|v| -v).collect();
+                    // Refresh the basis so the corrector opens at the moved coords.
+                    self.term
+                        .apply_newton_step_impl(neg_u_t.view(), neg_u_beta.view(), d_eta, true)
+                        .ok();
                 }
             }
 

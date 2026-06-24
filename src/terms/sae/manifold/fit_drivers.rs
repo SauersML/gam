@@ -1805,6 +1805,99 @@ impl SaeManifoldTerm {
         Ok(out)
     }
 
+    /// #1026 — the COORDINATE-channel curvature-homotopy predictor RHS `∂g_t/∂η`
+    /// in the dense `n·q` coordinate layout (`row·q + coord_offsets[k] + axis`),
+    /// the missing companion to [`Self::curvature_beta_gradient_eta_derivative`].
+    ///
+    /// The η-dial scales the curved basis columns (`∂Φ^η/∂η = Φ_curved`), so with
+    /// the per-row coordinate Jacobian `J_k[i,axis,c] = a_ik (∂Φ_k[i,:,axis]·B_k)[c]`
+    /// the data-fit coordinate gradient is `g_t[i,k,axis] = Σ_c J_k[i,axis,c] r_i[c]`
+    /// and (assignment + decoder held during the predictor step, W = I for the
+    /// Gaussian reconstruction channel)
+    /// `∂g_t/∂η[i,k,axis] = Σ_c a_ik ( (∂Φ_curved_k[i,:,axis]·B_k)[c] r_i[c]`
+    /// `                            + (∂Φ_k[i,:,axis]·B_k)[c] (∂fitted_i/∂η)[c] )`,
+    /// with `∂Φ_curved/∂t` the curved-column coordinate Jacobian
+    /// ([`SaeManifoldAtom::fill_decoded_curved_derivative_row`]) and
+    /// `∂fitted_i/∂η = Σ_{k'} a_ik' (∂Φ^η_{k'}[i,:]/∂η)·B_{k'}` exactly as in the
+    /// β predictor. Supplying this as `w_t` (instead of the historical `w_t = 0`)
+    /// lets the predictor move coordinates as curvature turns on, so the homotopy
+    /// corrector tracks onto the curved branch rather than the linear shadow.
+    /// Returns a zero vector for a curvature-inert dictionary (no curved columns).
+    pub(crate) fn curvature_t_gradient_eta_derivative(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+    ) -> Result<Array1<f64>, String> {
+        let n = self.n_obs();
+        let p = self.output_dim();
+        let q = self.assignment.row_block_dim();
+        let coord_offsets = self.assignment.coord_offsets();
+        let residual = self.reconstruction_residual(target, rho)?;
+        let dphi_deta = self.curvature_basis_eta_derivatives()?;
+        // Curved-column indices per atom (the η-scaled columns).
+        let mut curved_cols: Vec<Vec<usize>> = Vec::with_capacity(self.k_atoms());
+        for atom in self.atoms.iter() {
+            let m = atom.basis_size();
+            let cols = match atom.basis_evaluator.as_ref() {
+                Some(evaluator) => evaluator.phi_eta_split(m)?.curved_cols,
+                None => Vec::new(),
+            };
+            curved_cols.push(cols);
+        }
+        // ∂fitted_i/∂η = Σ_{k'} a_ik' (dΦ_{k'}[i,:])·B_{k'} — identical to the β path.
+        let mut dfitted = Array2::<f64>::zeros((n, p));
+        for row in 0..n {
+            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            for (atom_idx, atom) in self.atoms.iter().enumerate() {
+                let a_k = a[atom_idx];
+                if a_k == 0.0 {
+                    continue;
+                }
+                let m = atom.basis_size();
+                for mu in 0..m {
+                    let dphi = dphi_deta[atom_idx][[row, mu]];
+                    if dphi == 0.0 {
+                        continue;
+                    }
+                    let w = a_k * dphi;
+                    for c in 0..p {
+                        dfitted[[row, c]] += w * atom.decoder_coefficients[[mu, c]];
+                    }
+                }
+            }
+        }
+        let mut out = Array1::<f64>::zeros(n * q);
+        let mut full_buf = vec![0.0_f64; p];
+        let mut curved_buf = vec![0.0_f64; p];
+        for row in 0..n {
+            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            for (atom_idx, atom) in self.atoms.iter().enumerate() {
+                let a_k = a[atom_idx];
+                if a_k == 0.0 {
+                    continue;
+                }
+                let d = atom.latent_dim;
+                let off = coord_offsets[atom_idx];
+                for axis in 0..d {
+                    atom.fill_decoded_derivative_row(row, axis, &mut full_buf);
+                    atom.fill_decoded_curved_derivative_row(
+                        row,
+                        axis,
+                        &curved_cols[atom_idx],
+                        &mut curved_buf,
+                    );
+                    let mut acc = 0.0_f64;
+                    for c in 0..p {
+                        acc += curved_buf[c] * residual[[row, c]]
+                            + full_buf[c] * dfitted[[row, c]];
+                    }
+                    out[row * q + off + axis] += a_k * acc;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// #976 Layer-1 guard 3: the per-atom active-mass floor, checked once per
     /// accepted outer iteration of the joint fit.
     ///
