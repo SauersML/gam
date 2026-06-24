@@ -233,6 +233,37 @@ impl GpuRuntime {
         Self::global().is_some()
     }
 
+    /// Fail-closed accessor for the process-wide runtime under a [`GpuMode`]
+    /// contract (issue #1017).
+    ///
+    /// * [`GpuMode::Required`] — the device MUST be present: when the probe
+    ///   found no usable runtime this returns `Err(GpuError::DriverLibraryUnavailable)`
+    ///   carrying the recorded CPU reason, so the resident path surfaces a
+    ///   structured error instead of silently falling back to the CPU.
+    /// * [`GpuMode::Auto`] / [`GpuMode::Off`] — preserve the existing
+    ///   probe-first behavior bit-for-bit: this is a thin wrapper over
+    ///   [`Self::global`] that maps the `None` case to the same typed error
+    ///   without ever forcing the runtime on or changing any numerics. `Auto`
+    ///   callers treat the `Err` exactly as they treated `global().is_none()`
+    ///   today (fall back to CPU); only the `Required` caller propagates it.
+    ///
+    /// This does NOT alter `global()`/`cuda_context_for`/`ensure_cuda_runtime_device`;
+    /// it only adds the residency gate on top of the working Auto path.
+    pub fn global_or_fail(mode: super::GpuMode) -> Result<&'static Self, GpuError> {
+        match mode {
+            super::GpuMode::Off => Err(GpuError::DriverLibraryUnavailable {
+                reason: "GPU residency mode is off".to_string(),
+            }),
+            super::GpuMode::Auto | super::GpuMode::Required => {
+                Self::global().ok_or_else(|| GpuError::DriverLibraryUnavailable {
+                    reason: Self::cpu_reason()
+                        .unwrap_or("CUDA runtime unavailable")
+                        .to_string(),
+                })
+            }
+        }
+    }
+
     #[must_use]
     pub fn policy(&self) -> &GpuDispatchPolicy {
         &self.policy

@@ -728,3 +728,182 @@ fn circle_plus_line_keeps_one_curved_one_linear_1026() {
          the one-curved/one-linear split."
     );
 }
+
+// ---------------------------------------------------------------------------
+// 6. Barrier analytic-gradient finite-difference certificates (#1026/#1522).
+//
+// These certify that the two anti-collapse interior-point barriers' analytic
+// decoder gradients (the vectors accumulated into `sys.gb` during assembly)
+// match a CENTRAL finite difference of the barrier value, to rel-tol 1e-5. They
+// use the hermetic public inspectors `*_barrier_value_and_grad_for_test`, which
+// return the barrier's value and its isolated analytic β-gradient with no
+// data-fit / smoothness / ARD mixed in, so the FD pins the barrier math alone.
+// ---------------------------------------------------------------------------
+
+/// Build a two-atom circle term with caller-supplied decoders and softmax
+/// assignment (well-conditioned coactivation), for the FD certificates.
+fn two_atom_barrier_term(dec0: Array2<f64>, dec1: Array2<f64>) -> SaeManifoldTerm {
+    let coords0 = array![[0.05], [0.22], [0.55], [0.81], [0.34], [0.66], [0.12], [0.90]];
+    let coords1 = array![[0.15], [0.31], [0.64], [0.92], [0.47], [0.09], [0.73], [0.40]];
+    let atom0 = circle_atom("bar0", &coords0, dec0);
+    let atom1 = circle_atom("bar1", &coords1, dec1);
+    let n = coords0.nrows();
+    // Distinct logits so the normalized coactivation q_jk is strictly in (0,1).
+    let logits = Array2::from_shape_fn((n, 2), |(i, k)| 0.2 + 0.13 * i as f64 - 0.4 * k as f64);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        logits,
+        vec![coords0, coords1],
+        vec![
+            LatentManifold::Circle { period: 1.0 },
+            LatentManifold::Circle { period: 1.0 },
+        ],
+        AssignmentMode::softmax(1.0),
+    )
+    .unwrap();
+    SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap()
+}
+
+/// Central finite-difference of a barrier value over every β coordinate, using
+/// the public `flatten_beta` / `set_flat_beta` to perturb the decoders.
+fn barrier_fd_grad(
+    term: &mut SaeManifoldTerm,
+    value_of: impl Fn(&SaeManifoldTerm) -> f64,
+    h: f64,
+) -> Array1<f64> {
+    let beta0 = term.flatten_beta();
+    let dim = beta0.len();
+    let mut g = Array1::<f64>::zeros(dim);
+    for j in 0..dim {
+        let mut bp = beta0.clone();
+        bp[j] += h;
+        term.set_flat_beta(bp.view()).unwrap();
+        let vp = value_of(term);
+        let mut bm = beta0.clone();
+        bm[j] -= h;
+        term.set_flat_beta(bm.view()).unwrap();
+        let vm = value_of(term);
+        g[j] = (vp - vm) / (2.0 * h);
+    }
+    term.set_flat_beta(beta0.view()).unwrap();
+    g
+}
+
+/// Relative L2 error between an analytic and a finite-difference gradient.
+fn rel_grad_err(analytic: &Array1<f64>, fd: &Array1<f64>) -> f64 {
+    let diff: f64 = analytic
+        .iter()
+        .zip(fd.iter())
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum::<f64>()
+        .sqrt();
+    let scale = fd.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-12);
+    diff / scale
+}
+
+/// CERTIFICATE: the AMPLITUDE barrier's analytic gradient equals the central FD
+/// of its value to rel-tol 1e-5, at decoders of moderate norm (the smooth
+/// interior of the barrier where the FD is trustworthy).
+#[test]
+fn amplitude_barrier_analytic_gradient_matches_central_fd_1026() {
+    const M: usize = 3;
+    const P: usize = 3;
+    // Two distinct, moderate-norm decoders.
+    let mut dec0 = Array2::<f64>::zeros((M, P));
+    dec0[[1, 0]] = 0.9;
+    dec0[[2, 1]] = 1.1;
+    dec0[[0, 2]] = 0.4;
+    let mut dec1 = Array2::<f64>::zeros((M, P));
+    dec1[[1, 1]] = 0.7;
+    dec1[[2, 2]] = 0.6;
+    dec1[[0, 0]] = 0.5;
+
+    let mut term = two_atom_barrier_term(dec0, dec1);
+    let (_v, analytic) = term.amplitude_barrier_value_and_grad_for_test();
+    let fd = barrier_fd_grad(
+        &mut term,
+        |t| t.amplitude_barrier_value_and_grad_for_test().0,
+        1e-6,
+    );
+    let err = rel_grad_err(&analytic, &fd);
+    assert!(
+        err <= 1e-5,
+        "amplitude-barrier analytic gradient must match central FD to rel-tol \
+         1e-5; got rel err {err:e}. analytic={analytic:?} fd={fd:?}"
+    );
+}
+
+/// CERTIFICATE: the SEPARATION barrier's analytic gradient equals the central FD
+/// of its value to rel-tol 1e-5, at two partially-overlapping shapes (so
+/// `c² ∈ (0,1)` and the barrier is in its smooth interior).
+#[test]
+fn separation_barrier_analytic_gradient_matches_central_fd_1026() {
+    const M: usize = 3;
+    const P: usize = 3;
+    // Partially-overlapping decoder shapes: both load channel 0 (overlap) but
+    // also distinct channels, so c_jk² is strictly inside (0,1).
+    let mut dec0 = Array2::<f64>::zeros((M, P));
+    dec0[[1, 0]] = 1.0;
+    dec0[[2, 1]] = 0.8;
+    let mut dec1 = Array2::<f64>::zeros((M, P));
+    dec1[[1, 0]] = 0.6; // shared channel-0 sin → partial alignment
+    dec1[[2, 2]] = 0.9;
+
+    let mut term = two_atom_barrier_term(dec0, dec1);
+    let (v, analytic) = term.separation_barrier_value_and_grad_for_test();
+    assert!(
+        v.abs() > 0.0 && analytic.iter().any(|g| g.abs() > 0.0),
+        "fixture must engage the separation barrier (value {v:e} and a nonzero \
+         gradient) so the FD certificate is non-vacuous"
+    );
+    let fd = barrier_fd_grad(
+        &mut term,
+        |t| t.separation_barrier_value_and_grad_for_test().0,
+        1e-6,
+    );
+    let err = rel_grad_err(&analytic, &fd);
+    assert!(
+        err <= 1e-5,
+        "separation-barrier analytic gradient must match central FD to rel-tol \
+         1e-5; got rel err {err:e}. analytic={analytic:?} fd={fd:?}"
+    );
+}
+
+/// CERTIFICATE: at a NEAR-ZERO decoder (the collapse point) the amplitude
+/// barrier's gradient points AWAY from zero — i.e. its component along the
+/// decoder's own (growing) direction is strictly negative, so the minimiser is
+/// driven to grow the norm. This is the property the threshold repulsion lacks.
+#[test]
+fn amplitude_barrier_gradient_points_away_from_collapse_1026() {
+    const M: usize = 3;
+    const P: usize = 3;
+    let eps = 1e-6_f64;
+    // Atom 0: a real decoder. Atom 1: near-zero decoder along channel 0.
+    let mut dec0 = Array2::<f64>::zeros((M, P));
+    dec0[[1, 0]] = 1.0;
+    dec0[[2, 1]] = 1.0;
+    let mut dec1 = Array2::<f64>::zeros((M, P));
+    dec1[[1, 0]] = eps;
+    dec1[[2, 0]] = eps;
+
+    let term = two_atom_barrier_term(dec0, dec1);
+    let (_v, grad) = term.amplitude_barrier_value_and_grad_for_test();
+
+    // β layout: atom 1 starts at M*P; its decoder direction is the unit vector
+    // along (sin→ch0, cos→ch0). The radial gradient component must be < 0 (so
+    // descent `-grad` grows the norm outward).
+    let atom1_start = M * P;
+    let mut dir = vec![0.0_f64; M * P];
+    dir[P] = 1.0; // sin → ch0  (basis row 1, channel 0)
+    dir[2 * P] = 1.0; // cos → ch0  (basis row 2, channel 0)
+    let dnorm = (dir.iter().map(|v| v * v).sum::<f64>()).sqrt();
+    for v in dir.iter_mut() {
+        *v /= dnorm;
+    }
+    let radial: f64 = (0..M * P).map(|j| grad[atom1_start + j] * dir[j]).sum();
+    assert!(
+        radial < -1e-3,
+        "amplitude barrier must push a near-zero decoder OUTWARD: radial \
+         gradient ∂P/∂(radius) must be strictly negative (got {radial:e}). A \
+         non-negative value means no restoring force at the collapse point."
+    );
+}

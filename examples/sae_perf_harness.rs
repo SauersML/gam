@@ -483,11 +483,11 @@ fn run_device_inner_iter(shape: &Shape) -> Result<(), String> {
         "device_inner_iter",
         device_ms,
         &format!(
-            "status=ok build_ms={build_ms:.3} cpu_ms={cpu_ms:.3} speedup={:.3} max_abs_step_err={max_err:.3e} objective={:.6e} grad_norm={:.6e} used_device={} host_bytes={} device_bytes={}",
+            "status=ok build_ms={build_ms:.3} cpu_ms={cpu_ms:.3} speedup={:.3} max_abs_step_err={max_err:.3e} objective={:.6e} grad_norm={:.6e} execution_path={} host_bytes={} device_bytes={}",
             cpu_ms / device_ms.max(f64::MIN_POSITIVE),
             device.objective,
             device.gradient_norm,
-            device.used_device,
+            device.execution_path.as_str(),
             workspace.host_shadow_bytes(),
             workspace.resident_device_bytes()
         ),
@@ -548,14 +548,14 @@ fn run_device_fit(shape: &Shape) -> Result<(), String> {
         "device_fit",
         device_ms,
         &format!(
-            "status=ok build_ms={build_ms:.3} cpu_ms={cpu_ms:.3} speedup={:.3} max_abs_err={max_err:.3e} iters={} accepted={} converged={} objective={:.6e} grad_norm={:.6e} used_device={}",
+            "status=ok build_ms={build_ms:.3} cpu_ms={cpu_ms:.3} speedup={:.3} max_abs_err={max_err:.3e} iters={} accepted={} converged={} objective={:.6e} grad_norm={:.6e} execution_path={}",
             cpu_ms / device_ms.max(f64::MIN_POSITIVE),
             device.iterations,
             device.accepted_iterations,
             device.converged,
             device.objective,
             device.gradient_norm,
-            device.used_device
+            device.execution_path.as_str()
         ),
     );
     if max_err > DEVICE_PARITY_TOL {

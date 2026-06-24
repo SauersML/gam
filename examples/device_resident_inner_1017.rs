@@ -130,12 +130,12 @@ fn main() {
         parity <= parity_tol
     );
     println!(
-        "DEVRES_1017 resident   iters={} accepted={} converged={} used_device={} objective={:.9e} \
+        "DEVRES_1017 resident   iters={} accepted={} converged={} execution_path={} objective={:.9e} \
          logdetH={:.6e} wall_ms={:.3}",
         res_out.iterations,
         res_out.accepted_iterations,
         res_out.converged,
-        res_out.used_device,
+        res_out.execution_path.as_str(),
         res_out.objective,
         res_out.log_det_hessian,
         res_t.as_secs_f64() * 1e3,

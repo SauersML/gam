@@ -1541,9 +1541,11 @@ pub(crate) fn sweep_color_arm_throughput<'py>(py: Python<'py>) -> PyResult<Bound
     let seq =
         assert_sweep_parity_vs_sequential(&variants, &opts, &results).map_err(py_value_error)?;
 
-    let used_device = results
-        .iter()
-        .any(|r| r.as_ref().map(|f| f.outcome.used_device).unwrap_or(false));
+    let used_device = results.iter().any(|r| {
+        r.as_ref()
+            .map(|f| f.outcome.execution_path.used_device())
+            .unwrap_or(false)
+    });
     let speedup = if seq.fits_per_second > 0.0 {
         mux.fits_per_second / seq.fits_per_second
     } else {

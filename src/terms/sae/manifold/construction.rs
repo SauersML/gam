@@ -3466,6 +3466,11 @@ impl SaeManifoldTerm {
         // used, so the line search sees the term the Newton step optimizes. 0
         // unless two atoms are near-collinear (the no-op case).
         total += self.decoder_repulsion_value(penalty_scale);
+        // #1026/#1522 — interior-point collapse-prevention barriers, on the SAME
+        // decoders the assembly's gradient/curvature used, so the line search sees
+        // exactly the term the inner Newton step optimises (no value/grad desync).
+        total += self.amplitude_barrier_value(penalty_scale);
+        total += self.separation_barrier_value(penalty_scale);
         Ok(total)
     }
 
@@ -5051,6 +5056,19 @@ impl SaeManifoldTerm {
         // so a framed system carries it identically to the analytic β penalties.
         // No-op unless two atoms are near-collinear (the frozen gate is `None`).
         if self.add_sae_decoder_repulsion(&mut sys, penalty_scale, dense_beta_curvature) {
+            beta_penalty_assembly.record_curvature(dense_beta_curvature);
+        }
+        // #1026/#1522 — interior-point collapse-prevention barriers. The amplitude
+        // barrier supplies the OUTWARD radial force at the zero-decoder collapse
+        // point (the principal failure state the threshold repulsion skips), and
+        // the separation barrier supplies the alignment-divergent separating
+        // curvature on normalized shapes weighted by coactivation. Both accumulate
+        // into the full-`B` β-tier here, BEFORE the frame transform, so a framed
+        // system carries them identically to the analytic β penalties.
+        if self.add_sae_amplitude_barrier(&mut sys, penalty_scale, dense_beta_curvature) {
+            beta_penalty_assembly.record_curvature(dense_beta_curvature);
+        }
+        if self.add_sae_separation_barrier(&mut sys, penalty_scale, dense_beta_curvature) {
             beta_penalty_assembly.record_curvature(dense_beta_curvature);
         }
         if frames_engaged {

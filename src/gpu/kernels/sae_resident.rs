@@ -12,6 +12,7 @@ use ndarray::Array1;
 use crate::gpu::kernels::arrow_schur::{
     ArrowSchurGpuFailure, solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
 };
+use crate::model_types::ExecutionPath;
 
 /// Per-iterate solve backend for the resident inner Newton loop.
 ///
@@ -38,9 +39,17 @@ pub enum InnerSolveMode {
 }
 
 impl InnerSolveMode {
+    /// Truthful [`ExecutionPath`] this solve mode realizes (issue #1017): the
+    /// resident loop keeps factors on-device (`GpuResidentFull`), the baseline
+    /// re-uploads/re-factors every iterate (`GpuReupload`), and the reference
+    /// path runs on the host (`Cpu`).
     #[inline]
-    const fn on_device(self) -> bool {
-        matches!(self, Self::DeviceResident | Self::DeviceReupload)
+    const fn execution_path(self) -> ExecutionPath {
+        match self {
+            Self::DeviceResident => ExecutionPath::GpuResidentFull,
+            Self::DeviceReupload => ExecutionPath::GpuReupload,
+            Self::CpuReference => ExecutionPath::Cpu,
+        }
     }
 }
 use crate::solver::arrow_schur::{ArrowSchurError, ArrowSchurSystem};
@@ -137,7 +146,7 @@ pub struct DeviceResidentArrowStep {
     pub objective: f64,
     pub gradient_norm: f64,
     pub log_det_hessian: f64,
-    pub used_device: bool,
+    pub execution_path: ExecutionPath,
 }
 
 #[derive(Debug, Clone)]
@@ -236,6 +245,31 @@ impl DeviceResidentArrowWorkspace {
         }
     }
 
+    /// Opaque device-context identifier for telemetry: `1` when the resident
+    /// device buffers are live on this workspace, `0` when no device was bound.
+    /// Distinguishes "a device executed this fit" from "silent CPU fallback"
+    /// without leaking the cudarc handle.
+    #[must_use]
+    fn context_id(&self) -> usize {
+        usize::from(self.device_resident())
+    }
+
+    /// Bytes the re-uploading / frame-build path moves host→device for a full
+    /// `D`/`B`/`g`/border refresh, used to attribute H2D traffic in telemetry.
+    #[must_use]
+    fn frame_upload_bytes(&self) -> usize {
+        [
+            self.slabs.row_hessian_slabs.len(),
+            self.slabs.row_cross_slabs.len(),
+            self.slabs.row_gradient_slabs.len(),
+            self.slabs.border_hessian.len(),
+            self.slabs.border_gradient.len(),
+        ]
+        .into_iter()
+        .sum::<usize>()
+            * std::mem::size_of::<f64>()
+    }
+
     #[must_use]
     pub fn host_shadow_bytes(&self) -> usize {
         [
@@ -267,7 +301,7 @@ impl DeviceResidentArrowWorkspace {
         }
         let sys = self.to_arrow_system();
         solve_arrow_newton_step(&sys, ridge_t, ridge_beta)
-            .map(|solution| self.finish_step(solution, true))
+            .map(|solution| self.finish_step(solution, ExecutionPath::GpuResidentLinearization))
             .map_err(map_gpu_error)
     }
 
@@ -280,7 +314,7 @@ impl DeviceResidentArrowWorkspace {
     ) -> Result<DeviceResidentArrowStep, DeviceResidentArrowError> {
         let sys = self.to_arrow_system();
         solve_arrow_newton_step_dense_reference(&sys, ridge_t, ridge_beta)
-            .map(|solution| self.finish_step(solution, false))
+            .map(|solution| self.finish_step(solution, ExecutionPath::Cpu))
             .map_err(|reason| DeviceResidentArrowError::Solve { reason })
     }
 
@@ -316,7 +350,7 @@ impl DeviceResidentArrowWorkspace {
     fn finish_step(
         &self,
         solution: crate::gpu::kernels::arrow_schur::ArrowSchurGpuSolution,
-        used_device: bool,
+        execution_path: ExecutionPath,
     ) -> DeviceResidentArrowStep {
         DeviceResidentArrowStep {
             delta_t: solution.delta_t,
@@ -324,7 +358,7 @@ impl DeviceResidentArrowWorkspace {
             objective: 0.5 * squared_norm(&self.target_x),
             gradient_norm: self.gradient_norm(),
             log_det_hessian: solution.log_det_hessian,
-            used_device,
+            execution_path,
         }
     }
 
@@ -408,7 +442,7 @@ impl DeviceResidentArrowWorkspace {
         opts: &DeviceResidentInnerOptions,
         mode: InnerSolveMode,
     ) -> Result<DeviceResidentInnerOutcome, DeviceResidentArrowError> {
-        let on_device = mode.on_device();
+        let execution_path = mode.execution_path();
         let n = self.shape.n;
         let d = self.shape.d;
         let p = self.shape.p;
@@ -448,7 +482,7 @@ impl DeviceResidentArrowWorkspace {
             objective: current_objective,
             gradient_norm: 0.0,
             log_det_hessian: 0.0,
-            used_device: on_device,
+            execution_path,
         };
 
         while total_iters < opts.max_iterations {
@@ -476,7 +510,19 @@ impl DeviceResidentArrowWorkspace {
                         match crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(
                             &residual, ridge_t, ridge_beta,
                         ) {
-                            Ok(frame) => resident_frame = Some((ridge_t, ridge_beta, frame)),
+                            Ok(frame) => {
+                                // Building a resident frame creates the device
+                                // stream/handles and runs the per-row POTRF +
+                                // border Schur factor once; record both so a
+                                // silent decline (no rebuild ⇒ no factor count)
+                                // is visible in the telemetry.
+                                crate::gpu::profile::telemetry_record_handle_creation(
+                                    self.context_id(),
+                                );
+                                crate::gpu::profile::telemetry_record_factorization();
+                                crate::gpu::profile::telemetry_record_h2d(self.frame_upload_bytes());
+                                resident_frame = Some((ridge_t, ridge_beta, frame));
+                            }
                             Err(err) => frame_build_error = Some(map_gpu_error(err)),
                         }
                     }
@@ -491,6 +537,16 @@ impl DeviceResidentArrowWorkspace {
                                 }
                             }
                             let g_beta: Vec<f64> = residual.gb.iter().copied().collect();
+                            // The resident solve uploads only the O(n·d + p)
+                            // gradient, launches the per-iterate solve kernel, and
+                            // reads back only δ.
+                            let grad_bytes =
+                                (g_t.len() + g_beta.len()) * std::mem::size_of::<f64>();
+                            crate::gpu::profile::telemetry_record_h2d(grad_bytes);
+                            crate::gpu::profile::telemetry_record_kernel_launch();
+                            crate::gpu::profile::telemetry_record_d2h(
+                                (n * d + p) * std::mem::size_of::<f64>(),
+                            );
                             frame.solve_gradient(&g_t, &g_beta).map_err(map_gpu_error)
                         }
                         None => Err(frame_build_error.unwrap_or_else(|| {
@@ -503,7 +559,16 @@ impl DeviceResidentArrowWorkspace {
                 InnerSolveMode::DeviceReupload => {
                     // #1017 residency baseline: re-upload D/B/g and re-factor on
                     // every iterate. Same GPU factor kernels as the resident path,
-                    // minus the across-iteration buffer/factor reuse.
+                    // minus the across-iteration buffer/factor reuse — so EVERY
+                    // iterate creates handles, factorizes, launches, and re-uploads
+                    // the full slabs.
+                    crate::gpu::profile::telemetry_record_handle_creation(self.context_id());
+                    crate::gpu::profile::telemetry_record_factorization();
+                    crate::gpu::profile::telemetry_record_h2d(self.frame_upload_bytes());
+                    crate::gpu::profile::telemetry_record_kernel_launch();
+                    crate::gpu::profile::telemetry_record_d2h(
+                        (n * d + p) * std::mem::size_of::<f64>(),
+                    );
                     solve_arrow_newton_step(&residual, ridge_t, ridge_beta).map_err(map_gpu_error)
                 }
                 InnerSolveMode::CpuReference => {
@@ -595,7 +660,7 @@ impl DeviceResidentArrowWorkspace {
                     objective: current_objective,
                     gradient_norm: g_norm,
                     log_det_hessian: solution.log_det_hessian,
-                    used_device: on_device,
+                    execution_path,
                 };
                 accepted_iters += 1;
                 total_iters += 1;
@@ -623,7 +688,7 @@ impl DeviceResidentArrowWorkspace {
             iterations: total_iters,
             accepted_iterations: accepted_iters,
             converged,
-            used_device: on_device,
+            execution_path,
         })
     }
 
@@ -770,7 +835,7 @@ pub struct DeviceResidentInnerOutcome {
     pub iterations: usize,
     pub accepted_iterations: usize,
     pub converged: bool,
-    pub used_device: bool,
+    pub execution_path: ExecutionPath,
 }
 
 fn grow_ridge(current: f64, grow: f64) -> f64 {
@@ -1521,7 +1586,11 @@ mod tests {
         if ws.device_resident() {
             // Resident device loop: factors stay on-device across iterations.
             let dev = ws.device_fit(&opts).expect("device resident fit");
-            assert!(dev.used_device, "device_fit must report device execution");
+            assert_eq!(
+                dev.execution_path,
+                ExecutionPath::GpuResidentFull,
+                "device_fit must report the full device-resident execution path"
+            );
             assert!(dev.converged, "device resident loop must converge");
 
             // Certified-refinement parity (#1014): the resident path and the
@@ -1588,7 +1657,11 @@ mod tests {
             let reup = ws
                 .device_reupload_fit(&opts)
                 .expect("device re-uploading fit");
-            assert!(reup.used_device, "device_reupload_fit must run on device");
+            assert_eq!(
+                reup.execution_path,
+                ExecutionPath::GpuReupload,
+                "device_reupload_fit must report the re-uploading device path"
+            );
             assert!(reup.converged, "re-uploading loop must converge");
             let mut max_reup_rel = 0.0_f64;
             for (a, b) in reup.t.iter().zip(cpu.t.iter()) {

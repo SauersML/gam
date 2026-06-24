@@ -198,6 +198,346 @@ impl SaeManifoldTerm {
         penalty_scale * per_fit.value(target_beta.view(), rho_local.view())
     }
 
+    // ── #1026/#1522 COLLAPSE-PREVENTION interior-point barriers ──────────────
+    //
+    // These two log-barriers are the anti-collapse core. Unlike the
+    // collinearity-gated repulsion they have a genuine restoring force at the
+    // zero-decoder collapse point and at the alignment limit. They operate
+    // directly on the per-atom decoders `B_k` (shape `M_k × p`, row-major in the
+    // flat-β layout: index `beta_offsets[k] + a*p + o`), so the gradient /
+    // curvature written into `sys.gb` / `sys.hbb` are in EXACTLY the same
+    // full-`B` β coordinates as `add_sae_decoder_repulsion` and the analytic β
+    // penalties, and the matching value (`*_barrier_value`) reads the same
+    // decoders — so value / gradient / Hessian never desync across the line
+    // search.
+
+    /// #1026/#1522 — normalized coactivation matrix
+    /// `q_jk = (Σ_i a_ij a_ik)/sqrt(Σa_ij²·Σa_ik²) ∈ [0,1]` from the current soft
+    /// assignment `a` (the gate matrix). `q_jj = 1`; a column with zero energy
+    /// gives `q = 0` for all its pairs (no coactivation ⇒ no separation force).
+    pub(crate) fn barrier_normalized_coactivation(&self) -> Array2<f64> {
+        let k_atoms = self.k_atoms();
+        let gates = self.assignment.assignments();
+        let n = gates.nrows();
+        // Per-column energy Σ_i a_ik².
+        let mut energy = vec![0.0_f64; k_atoms];
+        for k in 0..k_atoms {
+            let mut e = 0.0;
+            for row in 0..n {
+                let a = gates[[row, k]];
+                e += a * a;
+            }
+            energy[k] = e;
+        }
+        let mut q = Array2::<f64>::zeros((k_atoms, k_atoms));
+        for j in 0..k_atoms {
+            for k in 0..k_atoms {
+                let mut s = 0.0;
+                for row in 0..n {
+                    s += gates[[row, j]] * gates[[row, k]];
+                }
+                let denom = (energy[j] * energy[k]).sqrt();
+                q[[j, k]] = if denom > 0.0 { s / denom } else { 0.0 };
+            }
+        }
+        q
+    }
+
+    /// #1026/#1522 AMPLITUDE barrier value
+    /// `P_amp = -μ_s · Σ_{k: active} log(s_k² + ε)`, `s_k² = ‖B_k‖²_F`. Diverges
+    /// to `+∞` as any active decoder norm → 0, so the minimiser is pushed off the
+    /// collapse boundary. "Active" = atoms whose assignment column carries any
+    /// mass (a structurally-dead atom is not held up by the barrier). 0 for `K<1`.
+    pub(crate) fn amplitude_barrier_value(&self, penalty_scale: f64) -> f64 {
+        let mu = penalty_scale * SAE_AMPLITUDE_BARRIER_STRENGTH;
+        if mu == 0.0 {
+            return 0.0;
+        }
+        let eps = SAE_AMPLITUDE_BARRIER_EPS;
+        let active = self.barrier_active_atoms();
+        let mut acc = 0.0_f64;
+        for (k, atom) in self.atoms.iter().enumerate() {
+            if !active[k] {
+                continue;
+            }
+            let s2: f64 = atom.decoder_coefficients.iter().map(|v| v * v).sum();
+            acc += -(s2 + eps).ln();
+        }
+        mu * acc
+    }
+
+    /// #1026/#1522 SEPARATION barrier value
+    /// `P_sep = -μ_C · Σ_{j<k} q_jk · log(1 - c_jk² + ε)` on the normalized
+    /// shapes. Diverges as two coactive atoms align (`c_jk² → 1`); exactly 0 when
+    /// their shapes are orthogonal. 0 for `K<2`.
+    pub(crate) fn separation_barrier_value(&self, penalty_scale: f64) -> f64 {
+        let mu = penalty_scale * SAE_SEPARATION_BARRIER_STRENGTH;
+        if mu == 0.0 {
+            return 0.0;
+        }
+        let k_atoms = self.k_atoms();
+        if k_atoms < 2 {
+            return 0.0;
+        }
+        let eps = SAE_SEPARATION_BARRIER_EPS;
+        let floor2 = SAE_BARRIER_ACTIVE_NORM_FLOOR * SAE_BARRIER_ACTIVE_NORM_FLOOR;
+        let q = self.barrier_normalized_coactivation();
+        let norm_sq: Vec<f64> = self
+            .atoms
+            .iter()
+            .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
+            .collect();
+        let mut acc = 0.0_f64;
+        for j in 0..k_atoms {
+            for k in (j + 1)..k_atoms {
+                if norm_sq[j] <= floor2 || norm_sq[k] <= floor2 {
+                    continue;
+                }
+                let qjk = q[[j, k]];
+                if qjk <= 0.0 {
+                    continue;
+                }
+                let c2 = self.barrier_cross_shape_energy(j, k) / (norm_sq[j] * norm_sq[k]);
+                let arg = (1.0 - c2 + eps).max(eps);
+                acc += -qjk * arg.ln();
+            }
+        }
+        mu * acc
+    }
+
+    /// Squared cross-Gram shape energy `‖B_j B_kᵀ‖²_F = Σ_{a,b}(Σ_o B_j[a,o]B_k[b,o])²`
+    /// for atoms `j, k` (the un-normalized numerator of `c_jk²`).
+    fn barrier_cross_shape_energy(&self, j: usize, k: usize) -> f64 {
+        let bj = &self.atoms[j].decoder_coefficients;
+        let bk = &self.atoms[k].decoder_coefficients;
+        let (m_j, p) = (bj.nrows(), bj.ncols());
+        let m_k = bk.nrows();
+        if bk.ncols() != p {
+            return 0.0;
+        }
+        let mut cross = 0.0_f64;
+        for a in 0..m_j {
+            for b in 0..m_k {
+                let mut c = 0.0_f64;
+                for o in 0..p {
+                    c += bj[[a, o]] * bk[[b, o]];
+                }
+                cross += c * c;
+            }
+        }
+        cross
+    }
+
+    /// Atoms the barriers hold up: any atom whose assignment column carries
+    /// nonzero mass. (A structurally dead atom is not artificially inflated.)
+    fn barrier_active_atoms(&self) -> Vec<bool> {
+        let k_atoms = self.k_atoms();
+        let gates = self.assignment.assignments();
+        let n = gates.nrows();
+        let mut active = vec![false; k_atoms];
+        for k in 0..k_atoms {
+            let mut e = 0.0_f64;
+            for row in 0..n {
+                let a = gates[[row, k]];
+                e += a * a;
+            }
+            active[k] = e > 0.0;
+        }
+        active
+    }
+
+    /// #1026/#1522 — accumulate the AMPLITUDE barrier's analytic gradient into
+    /// `sys.gb` and a PSD majorizer of its curvature into `sys.hbb`, in the
+    /// full-`B` β layout. Returns `true` iff anything was written.
+    ///
+    /// With `s_k² = ‖B_k‖²_F` and `D_k = 1/(s_k²+ε)`:
+    ///   value     `P = -μ Σ_k log(s_k²+ε)`,
+    ///   gradient  `∂P/∂B_k = -2μ D_k · B_k`            (magnitude `∝ 1/‖B_k‖`),
+    ///   Hessian   `-2μ D_k I + 4μ D_k² · vec(B_k)vec(B_k)ᵀ`.
+    /// The first (`-2μ D_k I`) term is NEGATIVE-definite (the barrier is concave
+    /// in `‖B‖` away from 0) and is DROPPED from the majorizer; the rank-1
+    /// `+4μ D_k² vec(B_k)vec(B_k)ᵀ` term is PSD and is kept, so `sys.hbb` stays
+    /// PD. (Dropping the indefinite term only makes the inner Newton more
+    /// conservative; the consistent value/gradient drive the actual descent.)
+    pub(crate) fn add_sae_amplitude_barrier(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        penalty_scale: f64,
+        dense_beta_curvature: bool,
+    ) -> bool {
+        let mu = penalty_scale * SAE_AMPLITUDE_BARRIER_STRENGTH;
+        if mu == 0.0 {
+            return false;
+        }
+        let eps = SAE_AMPLITUDE_BARRIER_EPS;
+        let p = self.output_dim();
+        let offsets = self.beta_offsets();
+        let active = self.barrier_active_atoms();
+        let mut wrote = false;
+        for (k, atom) in self.atoms.iter().enumerate() {
+            if !active[k] {
+                continue;
+            }
+            let bk = &atom.decoder_coefficients;
+            let m = bk.nrows();
+            let s2: f64 = bk.iter().map(|v| v * v).sum();
+            let d = 1.0 / (s2 + eps);
+            let off = offsets[k];
+            // Gradient: -2μ D · B_k.
+            let g_scale = -2.0 * mu * d;
+            for a in 0..m {
+                for o in 0..p {
+                    sys.gb[off + a * p + o] += g_scale * bk[[a, o]];
+                }
+            }
+            wrote = true;
+            if !dense_beta_curvature {
+                continue;
+            }
+            // PSD majorizer: +4μ D² · vec(B_k)vec(B_k)ᵀ on this atom's block.
+            let h_scale = 4.0 * mu * d * d;
+            for ai in 0..m {
+                for oi in 0..p {
+                    let i = off + ai * p + oi;
+                    let bi = bk[[ai, oi]];
+                    if bi == 0.0 {
+                        continue;
+                    }
+                    for aj in 0..m {
+                        for oj in 0..p {
+                            let bj = bk[[aj, oj]];
+                            if bj == 0.0 {
+                                continue;
+                            }
+                            let jcol = off + aj * p + oj;
+                            sys.hbb[[i, jcol]] += h_scale * bi * bj;
+                        }
+                    }
+                }
+            }
+        }
+        wrote
+    }
+
+    /// #1026/#1522 — accumulate the SEPARATION barrier's analytic gradient into
+    /// `sys.gb` and a PSD majorizer into `sys.hbb`, in the full-`B` β layout.
+    /// Returns `true` iff anything was written.
+    ///
+    /// Per pair `j<k` with `n_j²=‖B_j‖²_F`, `M=B_jB_kᵀ`, `G=‖M‖²_F`,
+    /// `c²=G/(n_j²n_k²)`, `α = μ q_jk/(1-c²+ε) ≥ 0` (`= ∂[-μq·log(1-c²+ε)]/∂c²`):
+    ///   `∂P/∂B_j = 2α[ (M B_k)/(n_j²n_k²) - (c²/n_j²) B_j ]`,
+    ///   `∂P/∂B_k = 2α[ (Mᵀ B_j)/(n_j²n_k²) - (c²/n_k²) B_k ]`.
+    /// The exact Hessian is indefinite; a Levenberg PSD majorizer adds the
+    /// positive scalar `2α c²/n_·²` on the moving atom's diagonal block (matching
+    /// the magnitude of the self-shrink gradient term), which is PSD and grows
+    /// without bound as `c²→1`, exactly where separating curvature is needed.
+    pub(crate) fn add_sae_separation_barrier(
+        &self,
+        sys: &mut ArrowSchurSystem,
+        penalty_scale: f64,
+        dense_beta_curvature: bool,
+    ) -> bool {
+        let mu = penalty_scale * SAE_SEPARATION_BARRIER_STRENGTH;
+        if mu == 0.0 {
+            return false;
+        }
+        let k_atoms = self.k_atoms();
+        if k_atoms < 2 {
+            return false;
+        }
+        let eps = SAE_SEPARATION_BARRIER_EPS;
+        let floor2 = SAE_BARRIER_ACTIVE_NORM_FLOOR * SAE_BARRIER_ACTIVE_NORM_FLOOR;
+        let p = self.output_dim();
+        let offsets = self.beta_offsets();
+        let q = self.barrier_normalized_coactivation();
+        let norm_sq: Vec<f64> = self
+            .atoms
+            .iter()
+            .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
+            .collect();
+        let mut wrote = false;
+        for j in 0..k_atoms {
+            for k in (j + 1)..k_atoms {
+                if norm_sq[j] <= floor2 || norm_sq[k] <= floor2 {
+                    continue;
+                }
+                let qjk = q[[j, k]];
+                if qjk <= 0.0 {
+                    continue;
+                }
+                let bj = &self.atoms[j].decoder_coefficients;
+                let bk = &self.atoms[k].decoder_coefficients;
+                let (m_j, pj) = (bj.nrows(), bj.ncols());
+                let m_k = bk.nrows();
+                if pj != p || bk.ncols() != p {
+                    continue;
+                }
+                let nj2 = norm_sq[j];
+                let nk2 = norm_sq[k];
+                // Cross matrix M = B_j B_kᵀ (shape m_j × m_k).
+                let mut cross = Array2::<f64>::zeros((m_j, m_k));
+                for a in 0..m_j {
+                    for b in 0..m_k {
+                        let mut c = 0.0_f64;
+                        for o in 0..p {
+                            c += bj[[a, o]] * bk[[b, o]];
+                        }
+                        cross[[a, b]] = c;
+                    }
+                }
+                let g: f64 = cross.iter().map(|v| v * v).sum();
+                let c2 = g / (nj2 * nk2);
+                let alpha = mu * qjk / ((1.0 - c2 + eps).max(eps));
+                let inv = 1.0 / (nj2 * nk2);
+                let off_j = offsets[j];
+                let off_k = offsets[k];
+                // ∂P/∂B_j = 2α[ (M B_k)/(nj²nk²) - (c²/nj²) B_j ].
+                for a in 0..m_j {
+                    for o in 0..p {
+                        let mut mb = 0.0_f64;
+                        for b in 0..m_k {
+                            mb += cross[[a, b]] * bk[[b, o]];
+                        }
+                        let grad = 2.0 * alpha * (mb * inv - (c2 / nj2) * bj[[a, o]]);
+                        sys.gb[off_j + a * p + o] += grad;
+                    }
+                }
+                // ∂P/∂B_k = 2α[ (Mᵀ B_j)/(nj²nk²) - (c²/nk²) B_k ].
+                for b in 0..m_k {
+                    for o in 0..p {
+                        let mut mtb = 0.0_f64;
+                        for a in 0..m_j {
+                            mtb += cross[[a, b]] * bj[[a, o]];
+                        }
+                        let grad = 2.0 * alpha * (mtb * inv - (c2 / nk2) * bk[[b, o]]);
+                        sys.gb[off_k + b * p + o] += grad;
+                    }
+                }
+                wrote = true;
+                if !dense_beta_curvature {
+                    continue;
+                }
+                // Levenberg PSD majorizer: positive scalar on each atom's
+                // diagonal block, magnitude `2α c²/n_·²`, growing as c²→1.
+                let lev_j = 2.0 * alpha * c2 / nj2;
+                let lev_k = 2.0 * alpha * c2 / nk2;
+                if lev_j > 0.0 {
+                    for idx in 0..(m_j * p) {
+                        let g_i = off_j + idx;
+                        sys.hbb[[g_i, g_i]] += lev_j;
+                    }
+                }
+                if lev_k > 0.0 {
+                    for idx in 0..(m_k * p) {
+                        let g_i = off_k + idx;
+                        sys.hbb[[g_i, g_i]] += lev_k;
+                    }
+                }
+            }
+        }
+        wrote
+    }
+
     pub(crate) fn live_mechanism_sparsity_penalties(
         &self,
         base: &Arc<MechanismSparsityPenalty>,
@@ -445,6 +785,32 @@ impl SaeManifoldTerm {
             }
         }
         true
+    }
+
+    /// #1026/#1522 — PUBLIC test inspector: the AMPLITUDE barrier value and its
+    /// analytic decoder gradient (length `beta_dim`, full-`B` layout) at the
+    /// current decoders, with `penalty_scale = 1`. Hermetic seam so the
+    /// owed-1026 FD battery can certify `∂P_amp/∂B` against a central finite
+    /// difference of [`Self::amplitude_barrier_value`] in isolation (no data-fit,
+    /// smoothness, or ARD mixed in). Returns `(value, grad)`.
+    pub fn amplitude_barrier_value_and_grad_for_test(&self) -> (f64, Array1<f64>) {
+        let mut sys = ArrowSchurSystem::default();
+        sys.gb = Array1::<f64>::zeros(self.beta_dim());
+        sys.hbb = Array2::<f64>::zeros((0, 0));
+        self.add_sae_amplitude_barrier(&mut sys, 1.0, false);
+        (self.amplitude_barrier_value(1.0), sys.gb)
+    }
+
+    /// #1026/#1522 — PUBLIC test inspector: the SEPARATION barrier value and its
+    /// analytic decoder gradient (length `beta_dim`, full-`B` layout) at the
+    /// current decoders, with `penalty_scale = 1`. Same hermetic-seam purpose as
+    /// [`Self::amplitude_barrier_value_and_grad_for_test`]. Returns `(value, grad)`.
+    pub fn separation_barrier_value_and_grad_for_test(&self) -> (f64, Array1<f64>) {
+        let mut sys = ArrowSchurSystem::default();
+        sys.gb = Array1::<f64>::zeros(self.beta_dim());
+        sys.hbb = Array2::<f64>::zeros((0, 0));
+        self.add_sae_separation_barrier(&mut sys, 1.0, false);
+        (self.separation_barrier_value(1.0), sys.gb)
     }
 }
 

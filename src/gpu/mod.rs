@@ -37,7 +37,7 @@ pub use gpu_error::GpuError;
 pub use memory::{DeviceBuffer, DeviceCsrMatrix, DeviceMatrix, DeviceVector};
 pub use policy::{GpuDispatchPolicy, GpuMixedPrecisionPolicy};
 pub use pool::{balanced_partition, scatter_batched};
-pub use profile::{KernelStat, KernelStatsSnapshot};
+pub use profile::{GpuExecutionTelemetry, KernelStat, KernelStatsSnapshot};
 
 // ---------------------------------------------------------------------------
 // User-facing policy and instrumentation hooks (formerly src/gpu.rs).
@@ -112,6 +112,67 @@ impl GpuPolicy {
 impl fmt::Display for GpuPolicy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// Fail-closed GPU residency mode (issue #1017).
+///
+/// Distinct from [`GpuPolicy`], which governs opportunistic per-kernel dispatch.
+/// `GpuMode` is the process-wide *residency contract* the resident solver
+/// consults through [`crate::gpu::device_runtime::GpuRuntime::global_or_fail`]:
+///
+/// * [`GpuMode::Auto`] — use the device when the probe admits it, fall back to
+///   CPU otherwise (the current, working behavior; preserved bit-for-bit).
+/// * [`GpuMode::Required`] — the device MUST be available; if the runtime is
+///   absent the resident path returns a structured error instead of silently
+///   running on the CPU. This is the fail-closed guard the reviewers asked for.
+/// * [`GpuMode::Off`] — never use the device.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GpuMode {
+    /// Use the device when available; fall back to CPU otherwise.
+    #[default]
+    Auto,
+    /// Require the device; error (do not fall back) when it is unavailable.
+    Required,
+    /// Never use the device.
+    Off,
+}
+
+impl GpuMode {
+    /// Stable lowercase identifier.
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Required => "required",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl fmt::Display for GpuMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+static GPU_MODE: OnceLock<GpuMode> = OnceLock::new();
+
+/// Configure the process-wide GPU residency mode. First-writer-wins so
+/// concurrent fits cannot race the contract; a redundant late call is ignored.
+pub fn set_gpu_mode(mode: GpuMode) {
+    GPU_MODE.set(mode).ok();
+}
+
+/// Read the process-wide GPU residency mode. Defaults to [`GpuMode::Auto`]
+/// without claiming the slot, mirroring [`global_policy`] so an incidental
+/// read never locks the mode against a later explicit [`set_gpu_mode`].
+#[inline]
+pub fn gpu_mode() -> GpuMode {
+    match GPU_MODE.get() {
+        Some(m) => *m,
+        None => GpuMode::Auto,
     }
 }
 
@@ -391,6 +452,45 @@ mod policy_tests {
         assert_eq!(GpuPolicy::parse("cpu"), None);
         assert_eq!(GpuPolicy::parse(""), None);
         assert_eq!(GpuPolicy::parse("wat"), None);
+    }
+
+    #[test]
+    fn execution_path_defaults_to_cpu() {
+        use crate::model_types::ExecutionPath;
+        // The truthful execution-path classifier must default to the CPU path,
+        // so a result struct that is never told otherwise cannot claim the
+        // device (the original `used_device: bool` defaulted the same way, but
+        // now the "no device" state is a named, non-lying variant).
+        assert_eq!(ExecutionPath::default(), ExecutionPath::Cpu);
+        assert!(!ExecutionPath::Cpu.used_device());
+        assert!(ExecutionPath::GpuResidentFull.used_device());
+    }
+
+    #[test]
+    fn gpu_mode_required_fails_closed_when_device_absent() {
+        use crate::gpu::device_runtime::GpuRuntime;
+        // Off always refuses, regardless of hardware.
+        assert!(matches!(
+            GpuRuntime::global_or_fail(GpuMode::Off),
+            Err(GpuError::DriverLibraryUnavailable { .. })
+        ));
+
+        if GpuRuntime::is_available() {
+            // On a GPU host both Auto and Required must succeed.
+            assert!(GpuRuntime::global_or_fail(GpuMode::Required).is_ok());
+            assert!(GpuRuntime::global_or_fail(GpuMode::Auto).is_ok());
+        } else {
+            // Fail-closed: Required surfaces a STRUCTURED error rather than a
+            // silent CPU fallback. Auto also reports unavailable (callers there
+            // swallow it and fall back), but the variant is what lets Required
+            // propagate it as fatal.
+            let required = GpuRuntime::global_or_fail(GpuMode::Required);
+            assert!(
+                matches!(required, Err(GpuError::DriverLibraryUnavailable { .. })),
+                "GpuMode::Required must fail closed when the device is absent, got {required:?}"
+            );
+            assert!(GpuRuntime::global_or_fail(GpuMode::Auto).is_err());
+        }
     }
 
     #[test]
