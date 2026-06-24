@@ -293,4 +293,106 @@ mod oracle {
             close("D2_uv H_ab", tower, hand);
         }
     }
+
+    /// #932 βw cross-channel guard. The link-wiggle kernel
+    /// (`binomial/wiggle.rs`) does NOT call
+    /// `second_directionalhessian_coeff_fromobjective_q_terms` per (row, coeff)
+    /// — that would be `O(n · p_w)` order-4 tower evaluations. Instead it
+    /// hand-expands the coefficient as a polynomial in each wiggle basis slot
+    /// `(b, b′, b″, b‴)` and factors out the per-row scalar coefficients
+    /// `alpha_xw_{b,d,dd,d3}` (the `X_t/X_ls ↔ wiggle` cross blocks) and
+    /// `c_ww_{bb,bd,bdd,dd_pair}` (the wiggle↔wiggle block), so the operator
+    /// applies them as rank structure. Those hand expansions are the exact
+    /// #736/#947 bug genus (a dropped or mis-weighted mixed term).
+    ///
+    /// This test re-derives both expansions from the documented substitutions
+    /// and asserts they reproduce the SINGLE-SOURCE coefficient bit-for-bit, so
+    /// any future drift in the wiggle expansion that diverges from the jet
+    /// truth is caught here rather than in a silently wrong outer Hessian.
+    #[test]
+    fn betaw_cross_channel_expansions_match_single_source() {
+        let mut next = stream(0x5151);
+        let mut max_xw = 0.0_f64;
+        let mut max_ww = 0.0_f64;
+        for _ in 0..2000 {
+            let (m1, m2, m3, m4) = (next(), next(), next(), next());
+            let (dq_u, dqv, d2q_uv) = (next(), next(), next());
+            // full-q x-channel partials (x = t).
+            let (q_t, dq_t_u, dq_tv, d2q_t_uv) = (next(), next(), next(), next());
+            // base-q0 partials.
+            let (q0_t, dq0_u, dq0v, d2q0_uv) = (next(), next(), next(), next());
+            let (dq0_t_u, dq0_tv, d2q0_t_uv) = (next(), next(), next());
+            // one wiggle basis slot j and a second slot k.
+            let (br, dr, ddr, d3r) = (next(), next(), next(), next());
+
+            // X_t ↔ wiggle cross block: a = t, b = w. Substitutions mirror the
+            // `binomial/wiggle.rs` comment (qw = b, dqw_u = b′·dq0u, …).
+            let qw = br;
+            let dqw_u = dr * dq0_u;
+            let dqwv = dr * dq0v;
+            let d2qw_uv = ddr * dq0_u * dq0v + dr * d2q0_uv;
+            let q_tw = dr * q0_t;
+            let dq_tw_u = ddr * dq0_u * q0_t + dr * dq0_t_u;
+            let dq_twv = ddr * dq0v * q0_t + dr * dq0_tv;
+            let d2q_tw_uv = d3r * dq0_u * dq0v * q0_t
+                + ddr * (d2q0_uv * q0_t + dq0_u * dq0_tv + dq0v * dq0_t_u)
+                + dr * d2q0_t_uv;
+            let coeff_tw = second_directionalhessian_coeff_fromobjective_q_terms(
+                m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, qw, q_tw, dq_t_u, dq_tv, dqw_u, dqwv,
+                d2q_t_uv, d2qw_uv, dq_tw_u, dq_twv, d2q_tw_uv,
+            );
+            let alpha_b =
+                m4 * dq_u * dqv * q_t + m3 * (d2q_uv * q_t + dq_u * dq_tv + dqv * dq_t_u) + m2 * d2q_t_uv;
+            let alpha_d = m3 * (dq_u * q_t * dq0v + dqv * q_t * dq0_u + dq_u * dqv * q0_t)
+                + m2
+                    * (dq_t_u * dq0v
+                        + dq_tv * dq0_u
+                        + q_t * d2q0_uv
+                        + d2q_uv * q0_t
+                        + dq_u * dq0_tv
+                        + dqv * dq0_t_u)
+                + m1 * d2q0_t_uv;
+            let alpha_dd = m2 * (q_t * dq0_u * dq0v + dq_u * dq0v * q0_t + dqv * dq0_u * q0_t)
+                + m1 * (d2q0_uv * q0_t + dq0_u * dq0_tv + dq0v * dq0_t_u);
+            let alpha_d3 = m1 * dq0_u * dq0v * q0_t;
+            let recon_xw = alpha_b * br + alpha_d * dr + alpha_dd * ddr + alpha_d3 * d3r;
+            max_xw = max_xw.max((coeff_tw - recon_xw).abs() / coeff_tw.abs().max(1.0));
+
+            // wiggle ↔ wiggle block: a = w_j, b = w_k (q linear in each βw, so
+            // q_ab = 0 and there is no third/fourth own-channel term).
+            let (brk, drk, ddrk) = (next(), next(), next());
+            let coeff_ww = second_directionalhessian_coeff_fromobjective_q_terms(
+                m1,
+                m2,
+                m3,
+                m4,
+                dq_u,
+                dqv,
+                d2q_uv,
+                br,
+                brk,
+                0.0,
+                dr * dq0_u,
+                dr * dq0v,
+                drk * dq0_u,
+                drk * dq0v,
+                ddr * dq0_u * dq0v + dr * d2q0_uv,
+                ddrk * dq0_u * dq0v + drk * d2q0_uv,
+                0.0,
+                0.0,
+                0.0,
+            );
+            let c_ww_bb = m4 * dq_u * dqv + m3 * d2q_uv;
+            let c_ww_bd = m3 * (dq_u * dq0v + dqv * dq0_u) + m2 * d2q0_uv;
+            let c_ww_bdd = m2 * dq0_u * dq0v;
+            let c_ww_dd_pair = 2.0 * m2 * dq0_u * dq0v;
+            let recon_ww = c_ww_bb * br * brk
+                + c_ww_bd * (br * drk + dr * brk)
+                + c_ww_bdd * (br * ddrk + ddr * brk)
+                + c_ww_dd_pair * dr * drk;
+            max_ww = max_ww.max((coeff_ww - recon_ww).abs() / coeff_ww.abs().max(1.0));
+        }
+        assert!(max_xw < 1e-12, "alpha_xw drifted from single source: {max_xw:.3e}");
+        assert!(max_ww < 1e-12, "c_ww drifted from single source: {max_ww:.3e}");
+    }
 }
