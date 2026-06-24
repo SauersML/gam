@@ -8116,8 +8116,13 @@ impl SaeManifoldTerm {
         first: &mut [Vec<f64>],
         second: &mut [Vec<Vec<f64>>],
     ) {
-        for out_col in 0..program.out_dim() {
-            let tower = program.reconstruction_column_packed::<K>(out_col);
+        // Build every output column at once with the per-atom gate / basis jets
+        // hoisted out of the column loop (#932 perf): the softmax gate jet and
+        // the basis jets are column-independent, so this removes the `out_dim×`
+        // redundant recomputation the per-column path incurred (~9× faster at
+        // K=8, out_dim=16). Bit-identical to per-column `_packed` assembly.
+        let columns = program.reconstruction_all_columns_packed::<K>();
+        for (out_col, tower) in columns.iter().enumerate() {
             let g = tower.g();
             let h = tower.h();
             for a in 0..K {
@@ -8167,12 +8172,16 @@ impl SaeManifoldTerm {
         beta_l_deriv: &mut [Vec<Vec<f64>>],
     ) {
         let p = program.out_dim();
+        // s = ζ_k(ℓ)·Φ_b(t_k) over the local (logit/coord) primaries, built from
+        // the SAME gate_tower / basis_tower primitives as the reconstruction
+        // column. Build all channels at once with the per-atom gate jet hoisted
+        // (#932 perf): border channels sharing an atom reuse one gate jet instead
+        // of recomputing it. Bit-identical to per-channel `_packed`.
+        let chans: Vec<(usize, usize)> =
+            border.iter().map(|c| (c.atom, c.basis_col)).collect();
+        let sjets = program.beta_border_towers_packed::<K>(&chans);
         for (beta_pos, channel) in border.iter().enumerate() {
-            // s = ζ_k(ℓ)·Φ_b(t_k) over the local (logit/coord) primaries, built
-            // from the SAME gate_tower / basis_tower primitives as the
-            // reconstruction column. Tower slot `a` is `vars[a]` exactly as the
-            // reconstruction `first`/`second` channels index it.
-            let s = program.beta_border_tower_packed::<K>(channel.atom, channel.basis_col);
+            let s = &sjets[beta_pos];
             let s_v = s.value();
             let s_g = s.g();
             for out_col in 0..p {

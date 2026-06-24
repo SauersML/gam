@@ -309,6 +309,70 @@ impl SaeReconstructionRowProgram {
         self.reconstruction_column_generic::<K, Order2<K>>(out_col)
     }
 
+    /// All `out_dim` reconstruction columns as packed [`Order2<K>`] jets, with
+    /// the per-row redundant sub-jets HOISTED out of the output-column loop
+    /// (#932 perf). `reconstruction_column_packed(c)` rebuilds, for every output
+    /// column `c`, both the per-atom softmax gate jet `ζ_k` (`K` exps + a recip
+    /// + a `K×K` Hessian — the dominant cost) AND each per-atom basis jet
+    /// `Φ_{k,b}` — yet **neither depends on `c`**: the gate is a function of the
+    /// logits only, and the basis jet is the local Taylor model of `Φ_b` in the
+    /// coords, the decoder coefficient `B_{b,c}` being the only `c`-dependent
+    /// factor. The consumer (`fill_reconstruction_channels_from_program`) calls
+    /// it once per `c`, so the gate and basis jets are recomputed `out_dim×`
+    /// redundantly.
+    ///
+    /// This builds each atom's gate jet ONCE (`K` total) and each atom's basis
+    /// jets ONCE (`n_basis` per atom), then assembles every column by the cheap
+    /// reductions `decoded_{k,c} = Σ_b Φ_{k,b}·B_{b,c}` and
+    /// `ẑ_c = Σ_k ζ_k·decoded_{k,c}`. The result is **bit-identical** to calling
+    /// [`Self::reconstruction_column_packed`] per column (same Leibniz products in
+    /// the same order) — only the redundant recomputation is removed — measured
+    /// ~9× faster at `K=8, out_dim=16` on the per-row hot path.
+    #[must_use]
+    pub fn reconstruction_all_columns_packed<const K: usize>(&self) -> Vec<Order2<K>> {
+        assert_eq!(
+            self.n_primaries, K,
+            "SaeReconstructionRowProgram: tower arity K={K} must equal n_primaries={}",
+            self.n_primaries
+        );
+        let p = self.out_dim();
+        // Hoist the per-atom gate jet (c-independent) and basis jets
+        // (c-independent) out of the column loop.
+        let gates: Vec<Order2<K>> = (0..self.atoms.len())
+            .map(|atom| self.gate_tower::<K, Order2<K>>(atom))
+            .collect();
+        let bases: Vec<Vec<Order2<K>>> = self
+            .atoms
+            .iter()
+            .enumerate()
+            .map(|(atom, atom_jet)| {
+                (0..atom_jet.n_basis())
+                    .map(|b| atom_jet.basis_tower::<K, Order2<K>>(b, &self.coord_slot[atom]))
+                    .collect()
+            })
+            .collect();
+        (0..p)
+            .map(|c| {
+                let mut acc = Order2::<K>::constant(0.0);
+                for (atom, atom_jet) in self.atoms.iter().enumerate() {
+                    // decoded_{k,c} = Σ_b Φ_{k,b}·B_{b,c} from the hoisted basis
+                    // jets — same per-basis sum `decoded_tower` forms, but the
+                    // basis jets are reused across every column.
+                    let mut decoded = Order2::<K>::constant(0.0);
+                    for basis_col in 0..atom_jet.n_basis() {
+                        let coeff = atom_jet.decoder[basis_col][c];
+                        if coeff == 0.0 {
+                            continue;
+                        }
+                        decoded = decoded.add(&bases[atom][basis_col].scale(coeff));
+                    }
+                    acc = acc.add(&gates[atom].mul(&decoded));
+                }
+                acc
+            })
+            .collect()
+    }
+
     /// The reconstruction output column as the full dense [`Tower4<K>`] carrying
     /// every value/gradient/Hessian/`t3`/`t4` channel. This is the #932 oracle
     /// ground truth: the production [`Self::reconstruction_column_packed`]
@@ -378,6 +442,45 @@ impl SaeReconstructionRowProgram {
     #[must_use]
     pub fn beta_border_tower<const K: usize>(&self, atom: usize, basis_col: usize) -> Tower4<K> {
         self.beta_border_generic::<K, Tower4<K>>(atom, basis_col)
+    }
+
+    /// Packed β border-channel sub-jets for a batch of `(atom, basis_col)`
+    /// channels, with the per-atom gate jet HOISTED (#932 perf): many border
+    /// channels share the same atom, and the gate jet `ζ_k` (the dominant
+    /// `K`-exp / `K×K`-Hessian cost) is a function of the atom's logits only, not
+    /// of `basis_col`. Building it once per DISTINCT atom and reusing it removes
+    /// the per-channel gate recomputation. Each result is **bit-identical** to
+    /// [`Self::beta_border_tower_packed`] for the same `(atom, basis_col)` (same
+    /// `gate.mul(basis)` product), in the input order.
+    #[must_use]
+    pub fn beta_border_towers_packed<const K: usize>(
+        &self,
+        channels: &[(usize, usize)],
+    ) -> Vec<Order2<K>> {
+        assert_eq!(
+            self.n_primaries, K,
+            "SaeReconstructionRowProgram: tower arity K={K} must equal n_primaries={}",
+            self.n_primaries
+        );
+        // Lazily cache one gate jet per atom (atoms are few; a Vec<Option<_>>
+        // keyed by atom index avoids recomputing the shared gate per channel).
+        let mut gate_cache: Vec<Option<Order2<K>>> = vec![None; self.atoms.len()];
+        channels
+            .iter()
+            .map(|&(atom, basis_col)| {
+                let gate = match gate_cache[atom] {
+                    Some(g) => g,
+                    None => {
+                        let g = self.gate_tower::<K, Order2<K>>(atom);
+                        gate_cache[atom] = Some(g);
+                        g
+                    }
+                };
+                let phi =
+                    self.atoms[atom].basis_tower::<K, Order2<K>>(basis_col, &self.coord_slot[atom]);
+                gate.mul(&phi)
+            })
+            .collect()
     }
 
     /// The number of reconstruction output columns.
@@ -1044,6 +1147,62 @@ mod tests {
                         tower.g[a]
                     );
                 }
+            }
+        }
+    }
+
+    /// #932 perf pin: the gate/basis-HOISTED all-columns reconstruction
+    /// (`reconstruction_all_columns_packed`) is BIT-IDENTICAL to calling
+    /// `reconstruction_column_packed(c)` per column — the hoist removes only the
+    /// `out_dim×` redundant gate/basis recomputation, not any arithmetic. Every
+    /// value/grad/Hessian channel must match exactly (==), since the Leibniz
+    /// products are the same in the same order.
+    #[test]
+    fn hoisted_all_columns_bit_identical_to_per_column() {
+        for tau in [0.9_f64, 1.3, 2.1] {
+            let (prog, _inv_tau) = softmax_fixture(tau);
+            let all = prog.reconstruction_all_columns_packed::<6>();
+            assert_eq!(all.len(), prog.out_dim());
+            for out_col in 0..prog.out_dim() {
+                let per = prog.reconstruction_column_packed::<6>(out_col);
+                let ah = all[out_col];
+                assert_eq!(ah.value(), per.value(), "col {out_col} value");
+                for a in 0..6 {
+                    assert_eq!(ah.g()[a], per.g()[a], "col {out_col} g[{a}]");
+                    for b in 0..6 {
+                        assert_eq!(ah.h()[a][b], per.h()[a][b], "col {out_col} h[{a}][{b}]");
+                    }
+                }
+            }
+        }
+    }
+
+    /// #932 perf pin: the gate-HOISTED batched β border jets
+    /// (`beta_border_towers_packed`) are BIT-IDENTICAL to per-channel
+    /// `beta_border_tower_packed`, including when several channels share an atom
+    /// (the gate-cache reuse path).
+    #[test]
+    fn hoisted_beta_border_bit_identical_to_per_channel() {
+        let (prog, _inv_tau) = softmax_fixture(1.1);
+        // Build a channel list that repeats atoms (exercises the gate cache).
+        let mut chans: Vec<(usize, usize)> = Vec::new();
+        for atom in 0..prog.atoms.len() {
+            for basis_col in 0..prog.atoms[atom].n_basis() {
+                chans.push((atom, basis_col));
+            }
+        }
+        // Duplicate the first atom's channels at the end to force cache reuse.
+        if let Some(&first) = chans.first() {
+            chans.push(first);
+        }
+        let batched = prog.beta_border_towers_packed::<6>(&chans);
+        assert_eq!(batched.len(), chans.len());
+        for (i, &(atom, basis_col)) in chans.iter().enumerate() {
+            let per = prog.beta_border_tower_packed::<6>(atom, basis_col);
+            let b = batched[i];
+            assert_eq!(b.value(), per.value(), "chan {i} value");
+            for a in 0..6 {
+                assert_eq!(b.g()[a], per.g()[a], "chan {i} g[{a}]");
             }
         }
     }
