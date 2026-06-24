@@ -287,24 +287,12 @@ pub(crate) struct SurvivalFlexTimepointFirstOrderExact {
     pub(crate) d_u: Array1<f64>,
 }
 
-/// Directional extensions of a timepoint's exact quantities, contracted with
-/// a single direction.  These are the pieces needed to compose the third-order
-/// NLL contraction.
-pub(crate) struct SurvivalFlexTimepointDirectionalExact {
-    pub(crate) eta_uv_dir: Array2<f64>,
-    pub(crate) eta_u_dir: Array1<f64>,
-    pub(crate) chi_u_dir: Array1<f64>,
-    pub(crate) chi_uv_dir: Array2<f64>,
-    pub(crate) d_u_dir: Array1<f64>,
-    pub(crate) d_uv_dir: Array2<f64>,
-    pub(crate) a_uv_dir: Array2<f64>,
-}
-
-pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {
-    pub(crate) eta_uv_uv: Array2<f64>,
-    pub(crate) chi_uv_uv: Array2<f64>,
-    pub(crate) d_uv_uv: Array2<f64>,
-}
+// #932-2 cutover: `SurvivalFlexTimepoint{Directional,BiDirectional}Exact` are the
+// return shapes of the now test-only hand directional/bidirectional oracle
+// producers; they moved to the test-masked `flex_oracle_structs_tests` module
+// (consumed only by the `*_oracle_tests` hand oracle + the `tests.rs` FD witnesses),
+// since the production contracted path reads the Block-10 packs straight from the
+// `Jet3`/`Jet4` builders.
 
 #[derive(Clone)]
 pub(crate) struct SurvivalTimeWiggleGeometry {

@@ -173,4 +173,6 @@ pub use row_math::*;
 pub use spec::*;
 
 #[cfg(test)]
+mod flex_oracle_structs_tests;
+#[cfg(test)]
 mod tests;

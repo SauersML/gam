@@ -1838,6 +1838,215 @@ impl SurvivalMarginalSlopeFamily {
     }
 }
 
+// #932-2 increment 2: the higher-order `MomentTerm` channels (Jet3 directional /
+// Jet4 mixed-second-directional) + their `jet2_moment_eps`/`jet2_moment_eps_del`
+// order-3/4 `j/(j+m)` Leibniz projectors. Production once the contracted
+// directional/bidirectional path (`row_flex_{third,fourth}_contract_from_base`)
+// drives `flex_timepoint_inputs_generic` at `Jet3`/`Jet4`.
+
+impl MomentTerm for Jet3 {
+    fn moment_term(&self, m: &Self) -> Self {
+        // The calibration residual term lifted to the one-seed ε algebra. The base
+        // channel is the order-≤2 [`Jet2`] `moment_term`; the ε channel carries the
+        // order-3 `j/(j+m)` Leibniz weights (verified against the symbolic operator):
+        //   ε.v   = cE.v·M_v
+        //   ε.g   = cE.g·M_v + ½·(cE.v·M_g + cB.g·mE.v)
+        //   ε.h   = cE.h·M_v + ⅔·(cE.g⊗M_g + cB.h·mE.v) + ⅓·(cE.v·mE.h-cross + cB.g⊗mE.g)
+        // where cB/cE = self.base/eps, mB/mE = m.base/eps (and ⊗ the symmetric cross).
+        let base = self.base.moment_term(&m.base);
+        let eps = jet2_moment_eps(&self.base, &self.eps, &m.base, &m.eps);
+        Jet3 { base, eps }
+    }
+}
+
+impl MomentTerm for Jet4 {
+    fn moment_term(&self, m: &Self) -> Self {
+        // The calibration residual term lifted to the two-seed ε/δ algebra. The base
+        // is the order-≤2 [`Jet2`] `moment_term`; ε/δ are the order-3 ε-channel
+        // [`jet2_moment_eps`]; the εδ channel carries the order-4 `j/(j+m)` Leibniz
+        // weights (every channel verified term-for-term against the symbolic operator).
+        let base = self.base.moment_term(&m.base);
+        let eps = jet2_moment_eps(&self.base, &self.eps, &m.base, &m.eps);
+        let del = jet2_moment_eps(&self.base, &self.del, &m.base, &m.del);
+        let eps_del = jet2_moment_eps_del(self, m);
+        Jet4 {
+            base,
+            eps,
+            del,
+            eps_del,
+        }
+    }
+}
+
+/// The εδ channel of the contracted calibration residual term for [`Jet4`] — the
+/// order-4 `j/(j+m)`-weighted product (every term verified against the symbolic
+/// operator). `c`/`m` are the full coefficient / moment Jet4s.
+fn jet2_moment_eps_del(c: &Jet4, m: &Jet4) -> Jet2 {
+    let (cb, ca, cd, cad) = (&c.base, &c.eps, &c.del, &c.eps_del);
+    let (mb, ma, md, mad) = (&m.base, &m.eps, &m.del, &m.eps_del);
+    let p = cb.p();
+    // εδ.v {a,b}:  c(a)M(b)·½ + c(a,b)M()·1 + c(b)M(a)·½
+    let v = 0.5 * ca.v * md.v + cad.v * mb.v + 0.5 * cd.v * ma.v;
+    // εδ.g {s,a,b}: c(a)M(b,s)·⅓ + c(a,b)M(s)·⅔ + c(a,b,s)M()·1 + c(a,s)M(b)·⅔
+    //            + c(b)M(a,s)·⅓ + c(b,s)M(a)·⅔ + c(s)M(a,b)·⅓
+    let mut g = vec![0.0; p];
+    for i in 0..p {
+        g[i] = (1.0 / 3.0) * ca.v * md.g[i]
+            + (2.0 / 3.0) * cad.v * mb.g[i]
+            + cad.g[i] * mb.v
+            + (2.0 / 3.0) * ca.g[i] * md.v
+            + (1.0 / 3.0) * cd.v * ma.g[i]
+            + (2.0 / 3.0) * cd.g[i] * ma.v
+            + (1.0 / 3.0) * cb.g[i] * mad.v;
+    }
+    // εδ.h {s,s,a,b}:  c(a)M(b,s,s)·¼ + c(a,b)M(s,s)·½ + c(a,b,s)M(s)·(3/2 over the
+    //   symmetric s-pair) + c(a,b,s,s)M()·1 + c(a,s)M(b,s)·1 + c(a,s,s)M(b)·¾
+    //   + c(b)M(a,s,s)·¼ + c(b,s)M(a,s)·1 + c(b,s,s)M(a)·¾
+    //   + c(s)M(a,b,s)·½ + c(s,s)M(a,b)·½
+    // The single-index forms (c(a,s)M(b,s), etc.) symmetrize to (i,j)+(j,i) below.
+    let mut h = vec![0.0; p * p];
+    for i in 0..p {
+        for j in 0..p {
+            let k = i * p + j;
+            h[k] = 0.25 * ca.v * md.h[k]
+                + 0.5 * cad.v * mb.h[k]
+                + 0.75 * (cad.g[i] * mb.g[j] + cad.g[j] * mb.g[i])
+                + cad.h[k] * mb.v
+                + 0.5 * (ca.g[i] * md.g[j] + ca.g[j] * md.g[i])
+                + 0.75 * ca.h[k] * md.v
+                + 0.25 * cd.v * ma.h[k]
+                + 0.5 * (cd.g[i] * ma.g[j] + cd.g[j] * ma.g[i])
+                + 0.75 * cd.h[k] * ma.v
+                + 0.25 * (cb.g[i] * mad.g[j] + cb.g[j] * mad.g[i])
+                + 0.5 * cb.h[k] * mad.v;
+        }
+    }
+    Jet2 { v, g, h }
+}
+
+/// The ε channel of the contracted calibration residual term (the order-3
+/// `j/(j+m)`-weighted product), shared by [`Jet3`] and [`Jet4`]. `cb`/`ce` are the
+/// coefficient jet's base / ε Jet2 parts, `mb`/`me` the moment jet's. Returns the
+/// ε-channel Jet2 (`v`/`g`/`h`).
+fn jet2_moment_eps(cb: &Jet2, ce: &Jet2, mb: &Jet2, me: &Jet2) -> Jet2 {
+    let p = cb.p();
+    let v = ce.v * mb.v;
+    let mut g = vec![0.0; p];
+    for i in 0..p {
+        g[i] = ce.g[i] * mb.v + 0.5 * (ce.v * mb.g[i] + cb.g[i] * me.v);
+    }
+    let mut h = vec![0.0; p * p];
+    for i in 0..p {
+        for j in 0..p {
+            h[i * p + j] = ce.h[i * p + j] * mb.v
+                + (2.0 / 3.0) * (ce.g[i] * mb.g[j] + ce.g[j] * mb.g[i])
+                + (2.0 / 3.0) * cb.h[i * p + j] * me.v
+                + (1.0 / 3.0) * ce.v * mb.h[i * p + j]
+                + (1.0 / 3.0) * (cb.g[i] * me.g[j] + cb.g[j] * me.g[i]);
+        }
+    }
+    Jet2 { v, g, h }
+}
+
+impl SurvivalMarginalSlopeFamily {
+    /// #932-2 PRODUCTION cutover (increment 2): the directional timepoint
+    /// extension `D_dir(eta_u/eta_uv/chi_u/chi_uv/d_u/d_uv)` via the single-source
+    /// `flex_timepoint_inputs_generic` jet builder at [`Jet3`] (one nilpotent ε
+    /// seed = the contraction direction). Returns the Block-10 directional pack
+    /// directly (the ε channel `.eps.g`/`.eps.h` of the `(eta, chi, d)` jets),
+    /// replacing the hand `compute_survival_timepoint_directional_exact_from_cached`
+    /// chain-rule assembly. Pinned term-for-term against the hand `block10_pack_dir`
+    /// by `flex_timepoint_inputs_jet3_directional_matches_hand_932` /
+    /// `_ghw_jet3_jet4_match_hand_932`.
+    pub(crate) fn compute_survival_timepoint_directional_jet_from_cached(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        q: f64,
+        q_index: usize,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        cached: &CachedPartitionCells,
+        dir: &Array1<f64>,
+    ) -> Result<crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional, String>
+    {
+        let p = primary.total;
+        let d_check = self.evaluate_survival_denom_d(a, b, beta_h, beta_w)?;
+        let z_obs = self.observed_score_projection(row);
+        let (obs_coeff, obs_fixed) = observed_fixed_for(self, primary, row, a, b, beta_h, beta_w)?;
+        let cells = cells_from_cached(cached);
+
+        let template = Jet3::primary(0.0, usize::MAX, p, 0.0);
+        let b_jet = Jet3::primary(b, primary.g, p, dir[primary.g]);
+        let du: Vec<Jet3> = (0..p).map(|u| Jet3::primary(0.0, u, p, dir[u])).collect();
+        let (eta, chi, d) = flex_timepoint_inputs_generic(
+            &template, &b_jet, &du, a, d_check, primary.g, primary.infl, q_index, q, z_obs, 0.0,
+            obs_coeff, &obs_fixed, &cells,
+        )?;
+
+        Ok(
+            crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
+                eta_u_dir: eta.eps.g.clone(),
+                eta_uv_dir: eta.eps.h.clone(),
+                chi_u_dir: chi.eps.g.clone(),
+                chi_uv_dir: chi.eps.h.clone(),
+                d_u_dir: d.eps.g.clone(),
+                d_uv_dir: d.eps.h.clone(),
+            },
+        )
+    }
+
+    /// #932-2 PRODUCTION cutover (increment 2): the mixed second-directional
+    /// timepoint extension `D_{d1} D_{d2}(eta_uv/chi_uv/d_uv)` via the single-source
+    /// builder at [`Jet4`] (two nilpotent seeds ε = `dir1`, δ = `dir2`). Returns the
+    /// Block-10 bidirectional pack directly (the εδ-Hessian channel `.eps_del.h`),
+    /// replacing the hand `compute_survival_timepoint_bidirectional_exact_from_cached`.
+    /// Pinned against the hand `block10_pack_bi` by
+    /// `flex_timepoint_inputs_jet4_bidirectional_matches_hand_932` /
+    /// `_ghw_jet3_jet4_match_hand_932`.
+    pub(crate) fn compute_survival_timepoint_bidirectional_jet_from_cached(
+        &self,
+        row: usize,
+        primary: &FlexPrimarySlices,
+        q: f64,
+        q_index: usize,
+        a: f64,
+        b: f64,
+        beta_h: Option<&Array1<f64>>,
+        beta_w: Option<&Array1<f64>>,
+        cached: &CachedPartitionCells,
+        dir1: &Array1<f64>,
+        dir2: &Array1<f64>,
+    ) -> Result<crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBiDirectional, String>
+    {
+        let p = primary.total;
+        let d_check = self.evaluate_survival_denom_d(a, b, beta_h, beta_w)?;
+        let z_obs = self.observed_score_projection(row);
+        let (obs_coeff, obs_fixed) = observed_fixed_for(self, primary, row, a, b, beta_h, beta_w)?;
+        let cells = cells_from_cached(cached);
+
+        let template = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
+        let b_jet = Jet4::primary(b, primary.g, p, dir1[primary.g], dir2[primary.g]);
+        let du: Vec<Jet4> = (0..p)
+            .map(|u| Jet4::primary(0.0, u, p, dir1[u], dir2[u]))
+            .collect();
+        let (eta, chi, d) = flex_timepoint_inputs_generic(
+            &template, &b_jet, &du, a, d_check, primary.g, primary.infl, q_index, q, z_obs, 0.0,
+            obs_coeff, &obs_fixed, &cells,
+        )?;
+
+        Ok(
+            crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBiDirectional {
+                eta_uv_uv: eta.eps_del.h.clone(),
+                chi_uv_uv: chi.eps_del.h.clone(),
+                d_uv_uv: d.eps_del.h.clone(),
+            },
+        )
+    }
+}
+
 #[cfg(test)]
 mod moment_engine_tests {
     use super::*;
@@ -1845,109 +2054,6 @@ mod moment_engine_tests {
     use crate::families::marginal_slope_shared::eval_coeff4_at;
 
 
-    impl MomentTerm for Jet3 {
-        fn moment_term(&self, m: &Self) -> Self {
-            // The calibration residual term lifted to the one-seed ε algebra. The base
-            // channel is the order-≤2 [`Jet2`] `moment_term`; the ε channel carries the
-            // order-3 `j/(j+m)` Leibniz weights (verified against the symbolic operator):
-            //   ε.v   = cE.v·M_v
-            //   ε.g   = cE.g·M_v + ½·(cE.v·M_g + cB.g·mE.v)
-            //   ε.h   = cE.h·M_v + ⅔·(cE.g⊗M_g + cB.h·mE.v) + ⅓·(cE.v·mE.h-cross + cB.g⊗mE.g)
-            // where cB/cE = self.base/eps, mB/mE = m.base/eps (and ⊗ the symmetric cross).
-            let base = self.base.moment_term(&m.base);
-            let eps = jet2_moment_eps(&self.base, &self.eps, &m.base, &m.eps);
-            Jet3 { base, eps }
-        }
-    }
-
-    impl MomentTerm for Jet4 {
-        fn moment_term(&self, m: &Self) -> Self {
-            // The calibration residual term lifted to the two-seed ε/δ algebra. The base
-            // is the order-≤2 [`Jet2`] `moment_term`; ε/δ are the order-3 ε-channel
-            // [`jet2_moment_eps`]; the εδ channel carries the order-4 `j/(j+m)` Leibniz
-            // weights (every channel verified term-for-term against the symbolic operator).
-            let base = self.base.moment_term(&m.base);
-            let eps = jet2_moment_eps(&self.base, &self.eps, &m.base, &m.eps);
-            let del = jet2_moment_eps(&self.base, &self.del, &m.base, &m.del);
-            let eps_del = jet2_moment_eps_del(self, m);
-            Jet4 {
-                base,
-                eps,
-                del,
-                eps_del,
-            }
-        }
-    }
-
-    /// The εδ channel of the contracted calibration residual term for [`Jet4`] — the
-    /// order-4 `j/(j+m)`-weighted product (every term verified against the symbolic
-    /// operator). `c`/`m` are the full coefficient / moment Jet4s.
-    fn jet2_moment_eps_del(c: &Jet4, m: &Jet4) -> Jet2 {
-        let (cb, ca, cd, cad) = (&c.base, &c.eps, &c.del, &c.eps_del);
-        let (mb, ma, md, mad) = (&m.base, &m.eps, &m.del, &m.eps_del);
-        let p = cb.p();
-        // εδ.v {a,b}:  c(a)M(b)·½ + c(a,b)M()·1 + c(b)M(a)·½
-        let v = 0.5 * ca.v * md.v + cad.v * mb.v + 0.5 * cd.v * ma.v;
-        // εδ.g {s,a,b}: c(a)M(b,s)·⅓ + c(a,b)M(s)·⅔ + c(a,b,s)M()·1 + c(a,s)M(b)·⅔
-        //            + c(b)M(a,s)·⅓ + c(b,s)M(a)·⅔ + c(s)M(a,b)·⅓
-        let mut g = vec![0.0; p];
-        for i in 0..p {
-            g[i] = (1.0 / 3.0) * ca.v * md.g[i]
-                + (2.0 / 3.0) * cad.v * mb.g[i]
-                + cad.g[i] * mb.v
-                + (2.0 / 3.0) * ca.g[i] * md.v
-                + (1.0 / 3.0) * cd.v * ma.g[i]
-                + (2.0 / 3.0) * cd.g[i] * ma.v
-                + (1.0 / 3.0) * cb.g[i] * mad.v;
-        }
-        // εδ.h {s,s,a,b}:  c(a)M(b,s,s)·¼ + c(a,b)M(s,s)·½ + c(a,b,s)M(s)·(3/2 over the
-        //   symmetric s-pair) + c(a,b,s,s)M()·1 + c(a,s)M(b,s)·1 + c(a,s,s)M(b)·¾
-        //   + c(b)M(a,s,s)·¼ + c(b,s)M(a,s)·1 + c(b,s,s)M(a)·¾
-        //   + c(s)M(a,b,s)·½ + c(s,s)M(a,b)·½
-        // The single-index forms (c(a,s)M(b,s), etc.) symmetrize to (i,j)+(j,i) below.
-        let mut h = vec![0.0; p * p];
-        for i in 0..p {
-            for j in 0..p {
-                let k = i * p + j;
-                h[k] = 0.25 * ca.v * md.h[k]
-                    + 0.5 * cad.v * mb.h[k]
-                    + 0.75 * (cad.g[i] * mb.g[j] + cad.g[j] * mb.g[i])
-                    + cad.h[k] * mb.v
-                    + 0.5 * (ca.g[i] * md.g[j] + ca.g[j] * md.g[i])
-                    + 0.75 * ca.h[k] * md.v
-                    + 0.25 * cd.v * ma.h[k]
-                    + 0.5 * (cd.g[i] * ma.g[j] + cd.g[j] * ma.g[i])
-                    + 0.75 * cd.h[k] * ma.v
-                    + 0.25 * (cb.g[i] * mad.g[j] + cb.g[j] * mad.g[i])
-                    + 0.5 * cb.h[k] * mad.v;
-            }
-        }
-        Jet2 { v, g, h }
-    }
-
-    /// The ε channel of the contracted calibration residual term (the order-3
-    /// `j/(j+m)`-weighted product), shared by [`Jet3`] and [`Jet4`]. `cb`/`ce` are the
-    /// coefficient jet's base / ε Jet2 parts, `mb`/`me` the moment jet's. Returns the
-    /// ε-channel Jet2 (`v`/`g`/`h`).
-    fn jet2_moment_eps(cb: &Jet2, ce: &Jet2, mb: &Jet2, me: &Jet2) -> Jet2 {
-        let p = cb.p();
-        let v = ce.v * mb.v;
-        let mut g = vec![0.0; p];
-        for i in 0..p {
-            g[i] = ce.g[i] * mb.v + 0.5 * (ce.v * mb.g[i] + cb.g[i] * me.v);
-        }
-        let mut h = vec![0.0; p * p];
-        for i in 0..p {
-            for j in 0..p {
-                h[i * p + j] = ce.h[i * p + j] * mb.v
-                    + (2.0 / 3.0) * (ce.g[i] * mb.g[j] + ce.g[j] * mb.g[i])
-                    + (2.0 / 3.0) * cb.h[i * p + j] * me.v
-                    + (1.0 / 3.0) * ce.v * mb.h[i * p + j]
-                    + (1.0 / 3.0) * (cb.g[i] * me.g[j] + cb.g[j] * me.g[i]);
-            }
-        }
-        Jet2 { v, g, h }
-    }
 
     // ── §B moment engine: the de-nested cell moments over a FlexJet ─────────────
     //

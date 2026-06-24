@@ -1,6 +1,9 @@
 //! Tests for the survival marginal-slope family (relocated verbatim).
 
 use super::*;
+use crate::families::survival::marginal_slope::flex_oracle_structs_tests::{
+    SurvivalFlexTimepointBiDirectionalExact, SurvivalFlexTimepointDirectionalExact,
+};
 use crate::custom_family::{CustomFamily, ExactOuterDerivativeOrder};
 use crate::matrix::{DenseDesignMatrix, SymmetricMatrix};
 use approx::assert_relative_eq;

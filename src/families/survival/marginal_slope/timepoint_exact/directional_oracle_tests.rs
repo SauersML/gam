@@ -5,6 +5,7 @@
 //! derivatives (η_uv_dir, χ_uv_dir, D_u_dir, D_uv_dir).
 
 use super::*;
+use crate::families::survival::marginal_slope::flex_oracle_structs_tests::SurvivalFlexTimepointDirectionalExact;
 
 #[inline]
 fn eval_poly_slice(coefficients: &[f64], z: f64) -> f64 {

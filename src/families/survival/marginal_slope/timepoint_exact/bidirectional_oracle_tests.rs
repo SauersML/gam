@@ -6,6 +6,9 @@
 //! intercept solve for a pair of directions.
 
 use super::*;
+use crate::families::survival::marginal_slope::flex_oracle_structs_tests::{
+    SurvivalFlexTimepointBiDirectionalExact, SurvivalFlexTimepointDirectionalExact,
+};
 
 #[inline]
 fn eval_poly_slice(coefficients: &[f64], z: f64) -> f64 {

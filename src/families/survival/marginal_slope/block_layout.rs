@@ -437,28 +437,12 @@ pub(crate) fn block10_pack_base(
     }
 }
 
-pub(crate) fn block10_pack_dir(
-    ext: &SurvivalFlexTimepointDirectionalExact,
-) -> crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
-    crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointDirectional {
-        eta_uv_dir: ext.eta_uv_dir.iter().copied().collect(),
-        eta_u_dir: ext.eta_u_dir.to_vec(),
-        chi_u_dir: ext.chi_u_dir.to_vec(),
-        chi_uv_dir: ext.chi_uv_dir.iter().copied().collect(),
-        d_u_dir: ext.d_u_dir.to_vec(),
-        d_uv_dir: ext.d_uv_dir.iter().copied().collect(),
-    }
-}
-
-pub(crate) fn block10_pack_bi(
-    bi: &SurvivalFlexTimepointBiDirectionalExact,
-) -> crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBiDirectional {
-    crate::families::survival::marginal_slope::gpu::SurvivalFlexBlock10TimepointBiDirectional {
-        eta_uv_uv: bi.eta_uv_uv.iter().copied().collect(),
-        chi_uv_uv: bi.chi_uv_uv.iter().copied().collect(),
-        d_uv_uv: bi.d_uv_uv.iter().copied().collect(),
-    }
-}
+// #932-2 cutover: `block10_pack_dir`/`block10_pack_bi` are removed — the production
+// contracted path now reads the Block-10 directional/bidirectional packs directly
+// from the `Jet3`/`Jet4` builders (`compute_survival_timepoint_{directional,
+// bidirectional}_jet_from_cached` return the gpu pack), so the hand-pack adapters
+// (which converted the now-test-only `SurvivalFlexTimepoint{Directional,
+// BiDirectional}Exact` structs) have no remaining consumer.
 
 pub(crate) fn flex_primary_slices(family: &SurvivalMarginalSlopeFamily) -> FlexPrimarySlices {
     let q0 = 0usize;
