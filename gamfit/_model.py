@@ -990,6 +990,40 @@ class Model:
         return self.report()
 
 
+def _multinomial_lambda_component_labels(
+    lambda_labels: Sequence[str],
+    term_labels: Sequence[str],
+    n_lam: int,
+) -> list[str]:
+    """Return exactly ``n_lam`` labels for one class block's λ slice (#1544).
+
+    Each active class block selects one λ per *penalty component*, and the
+    Marra–Wood double penalty (plus tensor/operator smooths) emits more than one
+    component per smooth term. The authoritative per-component labels live in
+    ``lambda_labels`` (length ``n_lam``); when present they are used verbatim so
+    each λ names both its term and its role (e.g. ``s(x)`` and
+    ``s(x) [null space]``).
+
+    The fallbacks exist only for models serialized before per-component labels
+    were recorded. They must still yield *exactly* ``n_lam`` labels so the
+    caller's ``zip(names, lam_chunk)`` never drops a λ — the silent truncation
+    that the old ``zip(term_labels, lam_chunk)`` caused when there were fewer
+    term labels than λ. If the component count is an exact multiple of the term
+    count, components are grouped under their term with a 1-based suffix;
+    otherwise positional ``λ{i}`` labels are used.
+    """
+    labels = list(lambda_labels)
+    if len(labels) == n_lam:
+        return labels
+    terms = list(term_labels)
+    if terms and n_lam % len(terms) == 0:
+        comps = n_lam // len(terms)
+        if comps == 1:
+            return list(terms)
+        return [f"{t} [{c + 1}]" for t in terms for c in range(comps)]
+    return [f"λ{i}" for i in range(n_lam)]
+
+
 class MultinomialPrediction:
     """Multinomial class-probability prediction with delta-method uncertainty.
 
@@ -1184,8 +1218,22 @@ class MultinomialModel:
         lambdas = list(meta.get("lambdas", []))
         lambdas_per_block = list(meta.get("lambdas_per_block", []))
         term_labels = list(meta.get("smooth_term_labels", []))
+        # Per-penalty-component λ labels, parallel to a single class block's λ
+        # slice (#1544). The Marra–Wood double penalty (and tensor/operator
+        # smooths) emit more than one penalty component — hence more than one λ —
+        # per smooth term, so these are NOT 1:1 with `term_labels`: a single
+        # `s(x)` term yields a primary wiggliness λ and a null-space shrinkage λ,
+        # each carrying its own label here. Pairing λ with these component labels
+        # (rather than assuming one λ per term) is what keeps every λ in the
+        # summary instead of silently truncating the null-space penalties.
+        lambda_labels = list(meta.get("lambda_labels", []))
         edf_per_class = meta.get("edf_per_class")
 
+        # Structural invariants that keep the per-class λ slicing below in
+        # bounds: one λ-block per active class, and the blocks partition the flat
+        # λ vector exactly. These guard genuine metadata corruption; the
+        # label/λ cardinality is reconciled per-component in the renderer, never
+        # assumed 1:1 with the term count (the #1544 root cause).
         if lambdas:
             if len(lambdas_per_block) != m:
                 raise ValueError(
@@ -1194,10 +1242,6 @@ class MultinomialModel:
             if sum(lambdas_per_block) != len(lambdas):
                 raise ValueError(
                     f"Multinomial lambda metadata mismatch: {len(lambdas)} lambdas but blocks ask for {sum(lambdas_per_block)}"
-                )
-            if m > 0 and len(term_labels) != lambdas_per_block[0]:
-                raise ValueError(
-                    f"Multinomial lambda metadata mismatch: {len(term_labels)} term labels but block 0 has {lambdas_per_block[0]} lambdas"
                 )
 
         lines = [
@@ -1223,7 +1267,10 @@ class MultinomialModel:
                 n_lam = lambdas_per_block[a]
                 lam_chunk = lambdas[lambda_offset : lambda_offset + n_lam]
                 lambda_offset += n_lam
-                lam_strs = [f"{t}: {float(v):.4g}" for t, v in zip(term_labels, lam_chunk)]
+                names = _multinomial_lambda_component_labels(
+                    lambda_labels, term_labels, n_lam
+                )
+                lam_strs = [f"{t}: {float(v):.4g}" for t, v in zip(names, lam_chunk)]
                 row_bits.append(f"λ = [{', '.join(lam_strs)}]")
             if edf_per_class is not None and a < len(edf_per_class):
                 row_bits.append(f"edf = {float(edf_per_class[a]):.4g}")

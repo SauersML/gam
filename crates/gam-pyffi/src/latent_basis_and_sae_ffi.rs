@@ -1109,6 +1109,12 @@ fn multinomial_model_metadata_pyfunc<'py>(
         .map(|span| span.label.clone())
         .collect();
     out.set_item("smooth_term_labels", smooth_term_labels)?;
+    // Per-penalty-component λ labels, parallel to a single class block's λ slice
+    // (#1544). With the Marra–Wood double penalty a smooth term emits two
+    // components (primary wiggliness + null-space shrinkage), so this is NOT 1:1
+    // with `smooth_term_labels`; the summary renderer pairs each λ with the
+    // label here component-for-component instead of assuming one λ per term.
+    out.set_item("lambda_labels", envelope.saved.lambda_labels.clone())?;
     out.set_item("iterations", envelope.saved.iterations)?;
     out.set_item("converged", envelope.saved.converged)?;
     out.set_item(

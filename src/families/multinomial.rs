@@ -76,7 +76,7 @@ use crate::solver::fit_orchestration::{
     FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,
 };
 use crate::terms::smooth::{
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
+    PenaltyBlockInfo, TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design,
 };
 use crate::terms::term_builder::resolve_role_col;
@@ -726,6 +726,19 @@ pub struct MultinomialSavedModel {
     /// `summary()`. Empty for a wholly parametric (no-smooth) model.
     #[serde(default)]
     pub smooth_term_spans: Vec<MultinomialSmoothTermSpan>,
+    /// One descriptive label per *penalty component* within a single active-class
+    /// block, parallel to that block's λ slice (i.e. length
+    /// `lambdas_per_block[0]`). The Marra–Wood double penalty (and tensor /
+    /// operator smooths) emit **more than one** penalty component — hence more
+    /// than one λ — per smooth term, so this is NOT 1:1 with
+    /// [`Self::smooth_term_spans`]: a single `s(x)` term contributes a primary
+    /// wiggliness λ labelled `s(x)` and a null-space shrinkage λ labelled
+    /// `s(x) [null space]`. The summary renderer pairs `lambdas` with these
+    /// labels component-for-component so no λ is ever dropped (#1544). Built from
+    /// the per-component term name + penalty role at fit time; empty for a
+    /// wholly parametric model or a model serialized before this field existed.
+    #[serde(default)]
+    pub lambda_labels: Vec<String>,
 }
 
 /// One smooth term's coefficient span within a class block, plus its
@@ -742,6 +755,43 @@ pub struct MultinomialSmoothTermSpan {
     pub col_end: usize,
     /// Leading unpenalized (polynomial nullspace) dimension within the term.
     pub nullspace_dim: usize,
+}
+
+/// Descriptive label for one penalty *component* (one λ) within a class block,
+/// for the `summary()` per-class λ rollup (#1544). A smooth term can emit
+/// several penalty components — the Marra–Wood double penalty splits `s(x)`
+/// into a primary wiggliness penalty and a null-space shrinkage penalty, and
+/// tensor / operator smooths emit a component per margin / differential
+/// operator — each with its own independently-selected λ. The label is the
+/// term name (from `PenaltyBlockInfo::termname`) plus a role suffix derived
+/// from the penalty's [`PenaltySource`], so each λ in the summary names both
+/// the term it smooths and the role it plays. `pen_idx` is the global penalty
+/// index, used only as a last-resort fallback label.
+fn penalty_component_label(info: Option<&PenaltyBlockInfo>, pen_idx: usize) -> String {
+    use crate::basis::PenaltySource;
+    let term = info
+        .and_then(|i| i.termname.clone())
+        .unwrap_or_else(|| format!("s{pen_idx}"));
+    let role = match info.map(|i| &i.penalty.source) {
+        // The primary wiggliness penalty is the term's "main" λ; show the bare
+        // term name so the common single-penalty case reads cleanly.
+        Some(PenaltySource::Primary) | None => None,
+        Some(PenaltySource::DoublePenaltyNullspace) => Some("null space".to_string()),
+        Some(PenaltySource::OperatorMass) => Some("mass".to_string()),
+        Some(PenaltySource::OperatorTension) => Some("tension".to_string()),
+        Some(PenaltySource::OperatorStiffness) => Some("stiffness".to_string()),
+        Some(PenaltySource::OperatorRelevance { axis }) => Some(format!("axis {axis}")),
+        Some(PenaltySource::TensorMarginal { dim }) => Some(format!("margin {dim}")),
+        Some(PenaltySource::TensorSeparable { penalized_margins }) => {
+            Some(format!("separable {penalized_margins:?}"))
+        }
+        Some(PenaltySource::TensorGlobalRidge) => Some("ridge".to_string()),
+        Some(PenaltySource::Other(s)) => Some(s.clone()),
+    };
+    match role {
+        Some(role) => format!("{term} [{role}]"),
+        None => term,
+    }
 }
 
 impl MultinomialSavedModel {
@@ -1843,6 +1893,23 @@ pub fn fit_penalized_multinomial_formula(
         });
     }
 
+    // One descriptive label per penalty *component* within a single class block,
+    // parallel to that block's λ slice (#1544). `design.penalties` is index-
+    // parallel to every active class's `block.lambdas` (each block carries the
+    // full per-component penalty list, validated above by
+    // `block.lambdas.len() == penalties_arc.len()`), so iterating it in order
+    // yields exactly `lambdas_per_block[0]` labels aligned with the per-block λ.
+    // This is deliberately NOT deduped by col_range (unlike `smooth_term_spans`):
+    // the double penalty's primary and null-space components share one col_range
+    // but select independent λ, and each must keep its own label so the summary
+    // renderer never collapses or drops a λ.
+    let lambda_labels: Vec<String> = design
+        .penalties
+        .iter()
+        .enumerate()
+        .map(|(pen_idx, _)| penalty_component_label(design.penaltyinfo.get(pen_idx), pen_idx))
+        .collect();
+
     // Unpenalized deviance read directly from the converged unpenalized
     // log-likelihood the rho-prior driver already computed (issue #348):
     // MultinomialFamily::evaluate sets FamilyEvaluation.log_likelihood =
@@ -1871,6 +1938,7 @@ pub fn fit_penalized_multinomial_formula(
         coefficient_covariance_flat,
         coefficient_influence_flat,
         smooth_term_spans,
+        lambda_labels,
     })
 }
 
