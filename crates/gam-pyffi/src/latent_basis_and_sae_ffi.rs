@@ -2629,7 +2629,24 @@ fn sae_manifold_fit_inner<'py>(
     // config — no borrowed Python views), so a *scoped* thread can borrow them
     // without a `'static` bound and is guaranteed to join before they drop.
     const SAE_FIT_WORKER_STACK_SIZE: usize = 512 << 20;
-    std::thread::scope(|scope| -> PyResult<()> {
+    // gam#1026: bound the whole SAE manifold fit so the K>=2 outer search —
+    // whose continuation re-entry homotopy floor and seed cascade can thrash
+    // indefinitely when an over-complete dictionary collapses to a near-singular
+    // joint Hessian (no seed certifies convergence, every demotion re-enters a
+    // heavier regime) — returns its best-so-far iterate in bounded time instead
+    // of hanging. Mirrors the in-crate survival fix (gam#979). The budget is
+    // read from `GAM_SAE_FIT_MAX_SECONDS` (generous default) so a caller can tune
+    // it without recompiling; cleared on EVERY exit path so a stale deadline
+    // never leaks to a later fit on the same process.
+    let budget_secs = std::env::var("GAM_SAE_FIT_MAX_SECONDS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(1800.0);
+    gam::solver::rho_optimizer::arm_outer_wall_clock_deadline(
+        std::time::Instant::now() + std::time::Duration::from_secs_f64(budget_secs.max(1.0)),
+    );
+    let fit_scope_result = std::thread::scope(|scope| -> PyResult<()> {
         let worker = std::thread::Builder::new()
             .name("gam-sae-fit".to_string())
             .stack_size(SAE_FIT_WORKER_STACK_SIZE)
@@ -2644,7 +2661,9 @@ fn sae_manifold_fit_inner<'py>(
                     .to_string(),
             )),
         }
-    })?;
+    });
+    gam::solver::rho_optimizer::clear_outer_wall_clock_deadline();
+    fit_scope_result?;
     // Posterior shape uncertainty: per-atom φ-scaled decoder covariance and
     // ambient bands, read off the converged joint-Hessian Schur factor at the
     // settled ρ. Computed before `into_fitted` consumes the objective; reflects
@@ -4057,7 +4076,10 @@ impl PyFittedTransport {
         py: Python<'py>,
         t: PyReadonlyArray1<'py, f64>,
     ) -> PyResult<Py<PyArray1<f64>>> {
-        let out = self.inner.eval(t.as_array()).map_err(PyValueError::new_err)?;
+        let out = self
+            .inner
+            .eval(t.as_array())
+            .map_err(PyValueError::new_err)?;
         Ok(out.into_pyarray(py).unbind())
     }
 
@@ -7466,8 +7488,7 @@ fn gaussian_reml_fit_latent_backward<'py>(
         }
         grad_aux_log_strength = Some(
             grad_reml_score
-                * (0.5 * stats.strength.mu * stats.residual_sq
-                    - 0.5 * (n_obs * latent_dim) as f64),
+                * (0.5 * stats.strength.mu * stats.residual_sq - 0.5 * (n_obs * latent_dim) as f64),
         );
     }
     if let Some(log_prec) = dim_selection_log_precision.as_ref() {

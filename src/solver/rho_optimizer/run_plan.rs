@@ -40,15 +40,19 @@ pub(crate) const PREWARM_COST_BUDGET_COEFF_PRODUCT: usize =
 static OUTER_WALL_CLOCK_DEADLINE: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
-/// Arm the global outer wall-clock deadline for the current fit.
-pub(crate) fn arm_outer_wall_clock_deadline(deadline: std::time::Instant) {
+/// Arm the global outer wall-clock deadline for the current fit. `pub` so FFI
+/// fit entries (the SAE manifold fit is orchestrated from the `gam-pyffi` crate)
+/// can bound their outer search the same way the in-crate survival entry does
+/// (see `survival/marginal_slope/fit_entry.rs`).
+pub fn arm_outer_wall_clock_deadline(deadline: std::time::Instant) {
     if let Ok(mut slot) = OUTER_WALL_CLOCK_DEADLINE.lock() {
         *slot = Some(deadline);
     }
 }
 
-/// Clear the armed deadline. Call on EVERY exit path of the arming fit.
-pub(crate) fn clear_outer_wall_clock_deadline() {
+/// Clear the armed deadline. Call on EVERY exit path of the arming fit. `pub` for
+/// the same FFI-entry reason as [`arm_outer_wall_clock_deadline`].
+pub fn clear_outer_wall_clock_deadline() {
     if let Ok(mut slot) = OUTER_WALL_CLOCK_DEADLINE.lock() {
         *slot = None;
     }
@@ -79,7 +83,8 @@ pub(crate) fn cost_scaled_prewarm_budget(base_budget: usize, p_coefficients: usi
     if p_coefficients <= PREWARM_COST_CLIFF_COEFF_DIM {
         return base_budget;
     }
-    let scaled = (PREWARM_COST_BUDGET_COEFF_PRODUCT / p_coefficients).max(PREWARM_MIN_SCALED_BUDGET);
+    let scaled =
+        (PREWARM_COST_BUDGET_COEFF_PRODUCT / p_coefficients).max(PREWARM_MIN_SCALED_BUDGET);
     scaled.min(base_budget)
 }
 
