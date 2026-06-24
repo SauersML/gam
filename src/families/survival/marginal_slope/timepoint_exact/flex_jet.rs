@@ -360,6 +360,18 @@ impl FlexJet for Jet3 {
             eps: self.eps.scale(s),
         }
     }
+    fn moment_term(&self, m: &Self) -> Self {
+        // The calibration residual term lifted to the one-seed ε algebra. The base
+        // channel is the order-≤2 [`Jet2::moment_term`]; the ε channel carries the
+        // order-3 `j/(j+m)` Leibniz weights (verified against the symbolic operator):
+        //   ε.v   = cE.v·M_v
+        //   ε.g   = cE.g·M_v + ½·(cE.v·M_g + cB.g·mE.v)
+        //   ε.h   = cE.h·M_v + ⅔·(cE.g⊗M_g + cB.h·mE.v) + ⅓·(cE.v·mE.h-cross + cB.g⊗mE.g)
+        // where cB/cE = self.base/eps, mB/mE = m.base/eps (and ⊗ the symmetric cross).
+        let base = self.base.moment_term(&m.base);
+        let eps = jet2_moment_eps(&self.base, &self.eps, &m.base, &m.eps);
+        Jet3 { base, eps }
+    }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         let base = self.base.compose_unary([d[0], d[1], d[2], d[3], d[4]]);
         // f'(base) as a Jet2 (consumes [f', f'', f''']).
@@ -367,6 +379,76 @@ impl FlexJet for Jet3 {
         let eps = fprime.mul(&self.eps);
         Jet3 { base, eps }
     }
+}
+
+/// The εδ channel of the contracted calibration residual term for [`Jet4`] — the
+/// order-4 `j/(j+m)`-weighted product (every term verified against the symbolic
+/// operator). `c`/`m` are the full coefficient / moment Jet4s.
+fn jet2_moment_eps_del(c: &Jet4, m: &Jet4) -> Jet2 {
+    let (cb, ca, cd, cad) = (&c.base, &c.eps, &c.del, &c.eps_del);
+    let (mb, ma, md, mad) = (&m.base, &m.eps, &m.del, &m.eps_del);
+    let p = cb.p();
+    // εδ.v {a,b}:  c(a)M(b)·½ + c(a,b)M()·1 + c(b)M(a)·½
+    let v = 0.5 * ca.v * md.v + cad.v * mb.v + 0.5 * cd.v * ma.v;
+    // εδ.g {s,a,b}: c(a)M(b,s)·⅓ + c(a,b)M(s)·⅔ + c(a,b,s)M()·1 + c(a,s)M(b)·⅔
+    //            + c(b)M(a,s)·⅓ + c(b,s)M(a)·⅔ + c(s)M(a,b)·⅓
+    let mut g = vec![0.0; p];
+    for i in 0..p {
+        g[i] = (1.0 / 3.0) * ca.v * md.g[i]
+            + (2.0 / 3.0) * cad.v * mb.g[i]
+            + cad.g[i] * mb.v
+            + (2.0 / 3.0) * ca.g[i] * md.v
+            + (1.0 / 3.0) * cd.v * ma.g[i]
+            + (2.0 / 3.0) * cd.g[i] * ma.v
+            + (1.0 / 3.0) * cb.g[i] * mad.v;
+    }
+    // εδ.h {s,s,a,b}:  c(a)M(b,s,s)·¼ + c(a,b)M(s,s)·½ + c(a,b,s)M(s)·(3/2 over the
+    //   symmetric s-pair) + c(a,b,s,s)M()·1 + c(a,s)M(b,s)·1 + c(a,s,s)M(b)·¾
+    //   + c(b)M(a,s,s)·¼ + c(b,s)M(a,s)·1 + c(b,s,s)M(a)·¾
+    //   + c(s)M(a,b,s)·½ + c(s,s)M(a,b)·½
+    // The single-index forms (c(a,s)M(b,s), etc.) symmetrize to (i,j)+(j,i) below.
+    let mut h = vec![0.0; p * p];
+    for i in 0..p {
+        for j in 0..p {
+            let k = i * p + j;
+            h[k] = 0.25 * ca.v * md.h[k]
+                + 0.5 * cad.v * mb.h[k]
+                + 0.75 * (cad.g[i] * mb.g[j] + cad.g[j] * mb.g[i])
+                + cad.h[k] * mb.v
+                + 0.5 * (ca.g[i] * md.g[j] + ca.g[j] * md.g[i])
+                + 0.75 * ca.h[k] * md.v
+                + 0.25 * cd.v * ma.h[k]
+                + 0.5 * (cd.g[i] * ma.g[j] + cd.g[j] * ma.g[i])
+                + 0.75 * cd.h[k] * ma.v
+                + 0.25 * (cb.g[i] * mad.g[j] + cb.g[j] * mad.g[i])
+                + 0.5 * cb.h[k] * mad.v;
+        }
+    }
+    Jet2 { v, g, h }
+}
+
+/// The ε channel of the contracted calibration residual term (the order-3
+/// `j/(j+m)`-weighted product), shared by [`Jet3`] and [`Jet4`]. `cb`/`ce` are the
+/// coefficient jet's base / ε Jet2 parts, `mb`/`me` the moment jet's. Returns the
+/// ε-channel Jet2 (`v`/`g`/`h`).
+fn jet2_moment_eps(cb: &Jet2, ce: &Jet2, mb: &Jet2, me: &Jet2) -> Jet2 {
+    let p = cb.p();
+    let v = ce.v * mb.v;
+    let mut g = vec![0.0; p];
+    for i in 0..p {
+        g[i] = ce.g[i] * mb.v + 0.5 * (ce.v * mb.g[i] + cb.g[i] * me.v);
+    }
+    let mut h = vec![0.0; p * p];
+    for i in 0..p {
+        for j in 0..p {
+            h[i * p + j] = ce.h[i * p + j] * mb.v
+                + (2.0 / 3.0) * (ce.g[i] * mb.g[j] + ce.g[j] * mb.g[i])
+                + (2.0 / 3.0) * cb.h[i * p + j] * me.v
+                + (1.0 / 3.0) * ce.v * mb.h[i * p + j]
+                + (1.0 / 3.0) * (cb.g[i] * me.g[j] + cb.g[j] * me.g[i]);
+        }
+    }
+    Jet2 { v, g, h }
 }
 
 // ── Jet4: two-seed, contracted fourth (doc §A.3) ───────────────────────────
@@ -441,6 +523,22 @@ impl FlexJet for Jet4 {
             eps: self.eps.scale(s),
             del: self.del.scale(s),
             eps_del: self.eps_del.scale(s),
+        }
+    }
+    fn moment_term(&self, m: &Self) -> Self {
+        // The calibration residual term lifted to the two-seed ε/δ algebra. The base
+        // is the order-≤2 [`Jet2::moment_term`]; ε/δ are the order-3 ε-channel
+        // [`jet2_moment_eps`]; the εδ channel carries the order-4 `j/(j+m)` Leibniz
+        // weights (every channel verified term-for-term against the symbolic operator).
+        let base = self.base.moment_term(&m.base);
+        let eps = jet2_moment_eps(&self.base, &self.eps, &m.base, &m.eps);
+        let del = jet2_moment_eps(&self.base, &self.del, &m.base, &m.del);
+        let eps_del = jet2_moment_eps_del(self, m);
+        Jet4 {
+            base,
+            eps,
+            del,
+            eps_del,
         }
     }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
@@ -1521,11 +1619,15 @@ mod moment_engine_tests {
                 cell.cell_right.is_finite(),
                 cell.numeric_moments,
             );
-            // Σ_k tangent(c_posₖ)·Mₖ  (tangent strips the value: F's VALUE is carried
-            // by the scalar seed, only the θ-motion of η enters the residual deriv).
+            // Σ_k moment_term(c_posₖ, Mₖ): the EXACT de-nested calibration residual
+            // `∫ η_θ e^{−q}`. `moment_term` strips c's value (F's VALUE is carried by
+            // the scalar seed) AND applies the `j/(j+m)` Leibniz weights so the lead
+            // derivative always lands on the coefficient polynomial η — a plain
+            // `tangent(c)·M` over-counts every split-derivative term by its binomial
+            // weight, doubling the lifted intercept Hessian `a_uv` (gam#932 base gates).
             let mut cell_r = const_jet_like(a_jet, 0.0);
             for k in 0..4 {
-                cell_r = cell_r.add(&tangent_jet(&c_pos[k]).mul(&m[k]));
+                cell_r = cell_r.add(&c_pos[k].moment_term(&m[k]));
             }
             r = r.add(&cell_r.scale(inv_two_pi));
         }
