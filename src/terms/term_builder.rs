@@ -2967,7 +2967,31 @@ pub fn build_smooth_basis(
             for axis in 0..dim {
                 let c = cols[axis];
                 let (data_min, data_max) = col_minmax(ds.values.column(c))?;
-                let k_axis = k_list[axis];
+                // mgcv reduces a tensor margin's basis dimension to what its data
+                // can support: a cr or B-spline margin cannot place more value
+                // knots / basis functions than there are DISTINCT covariate
+                // values on that axis. Without this cap an explicit `k` on a
+                // low-cardinality margin — e.g. the binary `badh ∈ {0,1}` in
+                // `te(age, badh, k=5)` — hard-failed in `select_cr_knots` ("cubic
+                // regression spline with k=5 requires at least 5 distinct values,
+                // got 2") instead of degrading to the 2-function (linear) margin
+                // mgcv builds there. The auto-`k` path already caps per margin via
+                // `heuristic_tensor_margin_knots`; mirror that for explicit `k`.
+                // The cap propagates correctly: every per-axis quantity below
+                // (effective degree, knot set, penalty order) is derived from
+                // `k_axis`, and the marginal basis size is read from the resulting
+                // knot spec — never from `k_list`. Floor at 2 so a margin still
+                // carries at least a linear basis (tensor margins require k >= 2).
+                let k_requested = k_list[axis];
+                let n_distinct_axis = unique_count_column(ds.values.column(c));
+                let k_axis = k_requested.min(n_distinct_axis).max(2);
+                if k_axis < k_requested {
+                    log::info!(
+                        "tensor smooth: margin axis {axis} requested k={k_requested}, but the \
+                         covariate has only {n_distinct_axis} distinct value(s); reducing this \
+                         margin to k={k_axis} (mgcv-style data-support cap on the per-axis basis)."
+                    );
+                }
                 // Per-axis effective spline degree. The B-spline basis with `k`
                 // functions is well-defined for any `degree <= k - 1`; mgcv's
                 // `te(...)` exploits this so a binary tensor margin
@@ -4970,6 +4994,9 @@ mod tests {
                 BSplineKnotSpec::Generate {
                     num_internal_knots, ..
                 } => num_internal_knots + m.degree + 1,
+                // The mgcv-default `cr` margin (#1074) reports its basis size as
+                // the number of value-knots placed.
+                BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
                 _ => panic!("unexpected tensor marginal knotspec"),
             })
             .collect::<Vec<_>>();
@@ -5048,10 +5075,67 @@ mod tests {
                 num_internal_knots: Some(n),
                 ..
             } => n + m.degree + 1,
+            // The mgcv-default `cr` margin (#1074) reports its basis size as the
+            // number of value-knots placed.
+            BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
             _ => panic!("unexpected tensor marginal knotspec"),
         };
         assert_eq!(basis_size(continuous), 5);
         assert_eq!(basis_size(binary), 2);
+    }
+
+    #[test]
+    fn tensor_smooth_uniform_k_is_capped_to_a_low_cardinality_margins_distinct_values() {
+        // Regression: a SINGLE `k=5` applied to every axis of `te(x, b, k=5)`
+        // with a BINARY second margin (`b ∈ {0, 1}`) must build a valid tensor,
+        // NOT hard-fail in cr-knot selection ("cubic regression spline with k=5
+        // requires at least 5 distinct values, got 2"). mgcv caps a margin's
+        // basis to its data support; the binary axis becomes the 2-function
+        // (linear) margin, while the continuous axis keeps the requested k=5.
+        // This is the `te(age, badh, k=5)` real-data case that previously errored.
+        let ds = continuous_dataset(
+            &["y", "x", "b"],
+            (0..40)
+                .map(|i| {
+                    let x = i as f64 / 39.0;
+                    let b = (i % 2) as f64;
+                    vec![x.sin() + 0.5 * b, x, b]
+                })
+                .collect(),
+        );
+        let parsed = parse_formula("y ~ te(x, b, k=5)").expect("parse tensor with uniform k=5");
+        let col_map = ds.column_map();
+        let mut notes = Vec::new();
+        let terms = build_termspec(
+            &parsed.terms,
+            &ds,
+            &col_map,
+            &mut notes,
+            &crate::resource::ResourcePolicy::default_library(),
+        )
+        .expect("uniform k=5 must auto-cap the binary margin instead of erroring");
+        let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
+            panic!("expected tensor B-spline for te(x, b)");
+        };
+        let basis_size = |m: &BSplineBasisSpec| match &m.knotspec {
+            BSplineKnotSpec::PeriodicUniform { num_basis, .. } => *num_basis,
+            BSplineKnotSpec::Generate {
+                num_internal_knots, ..
+            } => num_internal_knots + m.degree + 1,
+            BSplineKnotSpec::Automatic {
+                num_internal_knots: Some(n),
+                ..
+            } => n + m.degree + 1,
+            BSplineKnotSpec::NaturalCubicRegression { knots } => knots.len(),
+            other => panic!("unexpected tensor marginal knotspec: {other:?}"),
+        };
+        let binary = &spec.marginalspecs[1];
+        // Binary margin is reduced to the 2-function linear basis its data
+        // supports (k capped from 5 to 2, degree dropped to 1).
+        assert_eq!(basis_size(binary), 2);
+        assert_eq!(binary.degree, 1);
+        // The continuous margin is unaffected by the cap (40 distinct values).
+        assert_eq!(basis_size(&spec.marginalspecs[0]), 5);
     }
 
     #[test]
@@ -5288,6 +5372,9 @@ mod tests {
                         num_internal_knots: Some(num_internal_knots),
                         ..
                     } => num_internal_knots + m.degree + 1,
+                    // The mgcv-default `cr` margin (#1074) reports its basis size
+                    // as the number of value-knots placed.
+                    BSplineKnotSpec::NaturalCubicRegression { ref knots } => knots.len(),
                     _ => panic!("unexpected tensor margin knotspec"),
                 })
                 .product()
