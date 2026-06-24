@@ -1466,21 +1466,16 @@ impl SurvivalMarginalSlopeFamily {
             &g_jet.directional_family(g_jet.aaa_first, dir2, COEFF_SUPPORT_GW),
             z_obs,
         );
-        let dir1_g = if primary.g < p { dir1[primary.g] } else { 0.0 };
-        let dir2_g = if primary.g < p { dir2[primary.g] } else { 0.0 };
-        // `eta_aaa = ∂³_a η = −6·c3·b⁻³` is z-independent (c3 = the cell's cubic
-        // coefficient, independent of the log-slope g; b = eˢ). The earlier `0.0`
-        // came from a "∂³_a∂_b∂_w of a degree-3 cell poly ⇒ 0" argument that only
-        // holds for pure-z derivatives. The g-axis instead scales the b⁻³ factor,
-        // so the second mixed directional keeps nonzero g-cross terms:
-        //   ∂_d1∂_d2 η_aaa = −3·dir1_g·(∂_d2 η_aaa) − 3·dir2_g·(∂_d1 η_aaa)
-        //                    − 9·dir1_g·dir2_g·η_aaa
-        // (+ a pure-warp ∂_d1∂_d2 c3 term that vanishes whenever a direction is the
-        // g-axis, as in the #1454 g/β_w gate). (gam#1454)
-        let eta_aaa_d12 = -3.0 * dir1_g * eta_aaa_d2
-            - 3.0 * dir2_g * eta_aaa_d1
-            - 9.0 * dir1_g * dir2_g * eta_aaa;
-        let eta_aaa_jet = MultiDirJet::bilinear(eta_aaa, eta_aaa_d1, eta_aaa_d2, eta_aaa_d12);
+        // eta_aaa second mixed (dir1,dir2) directional. A g-cross closed form
+        // (−3·dir1_g·η_aaa_d2 − …) was tried (gam#1454) but is WRONG at the q0/q1
+        // intercept slots: η_aaa is evaluated at z_obs (the observed score
+        // projection), which itself depends on g/w, so the b⁻³-scaling argument
+        // misses the ∂z_obs/∂dir chain and blew chi_uv_uv[0,0] to ~16 (validly
+        // measured on an isolated target). Restored to 0.0 (the known-open value);
+        // the correct term needs the genuine 2nd-directional of aaa_first (new
+        // g_jet family), not a closed form. This slot does NOT affect the gate
+        // (eta_uv_uv q0-row), which is the real #1454 driver.
+        let eta_aaa_jet = MultiDirJet::bilinear(eta_aaa, eta_aaa_d1, eta_aaa_d2, 0.0);
 
         let mut a_u_jets = Vec::with_capacity(p);
         let mut tau_jets = Vec::with_capacity(p);
