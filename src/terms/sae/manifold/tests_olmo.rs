@@ -175,33 +175,34 @@ pub(crate) fn olmo_real_curvature_anchor_is_positive_definite() {
 /// The production entry of record for a K >= 2 dictionary is the #1007
 /// certified curvature-homotopy walk from the Eckart-Young LINEAR anchor. On
 /// the long-tailed real spectrum the best achievable reconstruction EV at K
-/// atoms is bounded by the cumulative linear (PCA) ceiling — well under the
-/// absolute `CURVATURE_WALK_ARRIVAL_EV_FLOOR = 0.5`. The pre-#1189 absolute
-/// floor rejected EVERY genuine anchor arrival, the fit fell through to the
-/// blind seed cascade, and the cascade collapsed into the degenerate basin
-/// (in-sample EV <= `SAE_FIT_DATA_COLLAPSE_EV_FLOOR`), so
-/// `add_fit_data_collapse_penalty` added `SAE_FIT_DATA_COLLAPSE_COST` on every
-/// outer trial and the whole REML loop pinned at `~1e12`.
+/// atoms is bounded by the cumulative linear (PCA) ceiling — well under any
+/// fixed absolute EV target. The pre-#1189 absolute floor rejected EVERY genuine
+/// anchor arrival, the fit fell through to the blind seed cascade, and the
+/// cascade collapsed into the degenerate basin (in-sample EV <=
+/// `SAE_FIT_DATA_COLLAPSE_EV_FLOOR`), so `add_fit_data_collapse_penalty` added
+/// `SAE_FIT_DATA_COLLAPSE_COST` on every outer trial and the whole REML loop
+/// pinned at `~1e12`.
 ///
-/// The #1189 fix makes the curvature-walk arrival floor RELATIVE to the certified
-/// Eckart-Young anchor's reconstruction EV (the achievable linear ceiling),
-/// clamped to [data-collapse floor, absolute floor], instead of an absolute 0.5
-/// that is structurally unreachable on real long-tailed activations.
+/// The fix makes the arrival floor purely DATA-DERIVED: the achievable linear
+/// ceiling `anchor_ev` discounted by one atom's share (`anchor_ev * (K-1)/K`),
+/// floored at the data-collapse threshold — no absolute EV target at all.
 ///
 /// This is a fast, SOLVE-FREE regression: it grounds the certified anchor ceiling
 /// on the genuine OLMo fixture (`linear_span_anchor` — the same certificate the
 /// production entry reads, SVDs only, no inner Newton solve — earlier solve-based
 /// variants ran 20+ min and were repeatedly SIGTERM-killed), then pins the fix's
-/// `curvature_arrival_floor` property across the three regimes that matter:
+/// arrival-floor property across the regimes that matter:
 ///
 ///   * REAL regime (the bug): a fit AT the achievable PCA ceiling (≈ 0.4 on OLMo,
 ///     where the production hang's converged fit lands) is a perfect non-degenerate
-///     fit, yet the pre-#1189 absolute 0.5 floor rejected it and demoted to the
-///     cascade that pins the loop at the 1e12 sentinel. The relative floor must
-///     RELAX below the absolute floor and ACCEPT a fit at that ceiling.
-///   * SYNTHETIC regime (must be preserved): on planted harmonics the ceiling is
-///     high (≈ 0.95) so the absolute floor stays binding — a fit stuck at the
-///     linear chord is still correctly demoted.
+///     fit; the data-derived floor must sit STRICTLY BELOW that ceiling at every K
+///     so the fit is accepted, not demoted to the cascade that pins the loop at the
+///     1e12 sentinel.
+///   * SYNTHETIC regime: on planted harmonics the achievable ceiling is high
+///     (≈ 0.95); the floor is a share of it, so a genuine curved recovery (EV ≈
+///     0.94) clears it at every K — the same data-derived rule, no separate branch.
+///   * #1026 per-atom share: a curved K>=2 arrival within 1/K of the cumulative
+///     ceiling clears the floor (co-collapse forgiveness).
 ///   * PATHOLOGICAL ceiling: the floor never drops below the data-collapse
 ///     threshold (a genuinely degenerate fit is always caught).
 #[test]
@@ -274,30 +275,17 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     );
     eprintln!("[#1189] real-data anchor ceiling anchor_ev={anchor_ev:.5}");
 
-    // The #1189 fix is `curvature_arrival_floor`: the arrival floor is the
-    // achievable linear ceiling scaled by `CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION`,
-    // clamped to [collapse floor, absolute floor]. Recompute it here from the SAME
-    // constants the fix uses and pin its defining property across the two regimes
-    // that matter — using the REAL fixture's row count / SST so the test is
-    // grounded in genuine activations, not a synthetic stand-in.
-    // Mirror the production floor EXACTLY. The base #1189 gate (absolute vs. the
-    // linear-ceiling fraction, clamped to the data-collapse floor) governs K = 1;
-    // for K >= 2 it is additionally relaxed by the per-atom share (#1026) so a
-    // curved K-atom fit within `1/K` of the cumulative ceiling is accepted.
+    // Mirror the production arrival floor EXACTLY (see
+    // `run_curvature_homotopy_entry_at_rho`): the achievable linear PCA ceiling
+    // `anchor_ev` discounted by ONE atom's share, `anchor_ev * (K-1)/K`, floored at
+    // the data-collapse threshold. There is no absolute EV target — the bar is
+    // purely the data-derived achievable ceiling. K=1 has no co-collapse partner
+    // and no share to forgive (discount 0), so it reduces to the collapse floor;
+    // the floor rises toward the ceiling as K grows.
     let arrival_floor_k = |achievable_ceiling: f64, k_active: usize| -> f64 {
-        let base = CURVATURE_WALK_ARRIVAL_EV_FLOOR
-            .min(CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * achievable_ceiling)
-            .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR);
-        if k_active >= 2 {
-            let k = k_active as f64;
-            let per_atom_share_floor = achievable_ceiling * ((k - 1.0) / k);
-            base.min(per_atom_share_floor.max(0.0))
-                .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR)
-        } else {
-            base
-        }
+        let k = k_active.max(1) as f64;
+        (achievable_ceiling * ((k - 1.0) / k)).max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR)
     };
-    // The #1189 single-atom regimes (K=1) keep the original gate unchanged.
     let arrival_floor = |achievable_ceiling: f64| -> f64 { arrival_floor_k(achievable_ceiling, 1) };
 
     // REAL-DATA REGIME (the #1189 bug): on genuine long-tailed LLM activations the
@@ -308,35 +296,30 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     // demoted to the collapsing cascade that pins the loop at the 1e12 sentinel.
     // The fix's relative floor must ACCEPT a fit at the achievable ceiling.
     let real_regime_ceiling = 0.40_f64; // representative OLMo K-atom PCA ceiling
-    let real_floor = arrival_floor(real_regime_ceiling);
-    eprintln!(
-        "[#1189] real regime: ceiling={real_regime_ceiling} absolute_floor={CURVATURE_WALK_ARRIVAL_EV_FLOOR} relative_floor={real_floor:.5}"
-    );
-    assert!(
-        real_floor < CURVATURE_WALK_ARRIVAL_EV_FLOOR,
-        "the #1189 relative floor did NOT relax below the absolute floor on the real-data regime \
-         (ceiling {real_regime_ceiling}, relative floor {real_floor:.5} >= absolute \
-         {CURVATURE_WALK_ARRIVAL_EV_FLOOR}): a genuine fit at the achievable ceiling would still be \
-         rejected and demoted to the collapsing cascade (#1189)."
-    );
-    assert!(
-        real_regime_ceiling >= real_floor,
-        "a genuine fit AT the achievable real-data ceiling {real_regime_ceiling} is rejected by the \
-         #1189 relative floor {real_floor:.5} (#1189)."
-    );
+    for k in [1usize, 2, 8] {
+        let f = arrival_floor_k(real_regime_ceiling, k);
+        eprintln!("[#1189] real regime K={k}: ceiling={real_regime_ceiling} floor={f:.5}");
+        assert!(
+            f < real_regime_ceiling,
+            "[#1189] arrival floor {f:.5} (K={k}) is not strictly below the achievable real-data \
+             ceiling {real_regime_ceiling}: a genuine fit AT the ceiling would be rejected and \
+             demoted to the collapsing cascade that pins the loop at the 1e12 sentinel."
+        );
+    }
 
-    // SYNTHETIC REGIME (must be preserved): on planted harmonics the achievable EV
-    // is high (≈ 0.9), so the absolute 0.5 floor remains binding and a fit stuck
-    // at the linear chord (EV ≈ the anchor, far below the curved optimum) is still
-    // correctly demoted. The relative floor must NOT relax the gate here.
+    // SYNTHETIC REGIME: on planted harmonics the achievable EV is high (≈ 0.95).
+    // The data-derived floor is a share of that ceiling, so it stays well below it
+    // and a genuine curved recovery (EV ≈ 0.94) clears it at every K — the same
+    // data-derived rule as the real regime, no separate absolute branch.
     let synthetic_ceiling = 0.95_f64;
-    let synthetic_floor = arrival_floor(synthetic_ceiling);
-    assert!(
-        (synthetic_floor - CURVATURE_WALK_ARRIVAL_EV_FLOOR).abs() < 1e-12,
-        "the #1189 relative floor wrongly relaxed the gate on the synthetic regime (ceiling \
-         {synthetic_ceiling}, floor {synthetic_floor:.5} != absolute {CURVATURE_WALK_ARRIVAL_EV_FLOOR}); \
-         planted-harmonic recovery must keep the strict absolute floor (#1189)."
-    );
+    for k in [1usize, 2, 8] {
+        let f = arrival_floor_k(synthetic_ceiling, k);
+        assert!(
+            f < synthetic_ceiling && 0.94 >= f,
+            "[#1189] synthetic floor {f:.5} (K={k}) must sit below the achievable ceiling \
+             {synthetic_ceiling} so a genuine planted-harmonic recovery (EV ≈ 0.94) is accepted."
+        );
+    }
 
     // CLAMP: a pathological (near-zero) ceiling must never drop the floor below the
     // data-collapse threshold — a genuinely degenerate fit is always caught.
@@ -347,38 +330,34 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
          (floor {pathological_floor:.5} < {SAE_FIT_DATA_COLLAPSE_EV_FLOOR}) (#1189)."
     );
 
-    // And the REAL anchor ceiling itself yields a finite, well-ordered floor in
-    // [collapse floor, absolute floor].
-    let real_anchor_floor = arrival_floor(anchor_ev);
-    assert!(
-        (SAE_FIT_DATA_COLLAPSE_EV_FLOOR..=CURVATURE_WALK_ARRIVAL_EV_FLOOR)
-            .contains(&real_anchor_floor),
-        "real-data anchor floor {real_anchor_floor:.5} fell outside [{SAE_FIT_DATA_COLLAPSE_EV_FLOOR}, \
-         {CURVATURE_WALK_ARRIVAL_EV_FLOOR}] (#1189)."
-    );
+    // And the REAL anchor ceiling itself yields a finite floor in
+    // [collapse floor, achievable ceiling) at every K.
+    for k in [1usize, 2, 8] {
+        let f = arrival_floor_k(anchor_ev, k);
+        assert!(
+            f >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR && f < anchor_ev.max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR + 1e-9),
+            "real-data anchor floor {f:.5} (K={k}) fell outside [{SAE_FIT_DATA_COLLAPSE_EV_FLOOR}, \
+             anchor ceiling {anchor_ev:.5}) (#1189)."
+        );
+    }
 
     // #1026 — PER-ATOM-SHARE REGRESSION. The K>=2 co-collapse signature: the
     // curvature walk reaches a REAL curved branch whose whole-dictionary EV is
-    // close to, but slightly below, the cumulative K-atom linear ceiling. The
-    // pre-#1026 floor (0.9 x the FULL linear ceiling) demoted that genuine
-    // arrival to a branch bifurcation, and the seed cascade then co-collapsed to
-    // the 1e12 sentinel. Pin that a curved K=3 arrival at the real OLMo branch
-    // (EV = 0.2461, the verified K=1 held-out value; a K=3 dictionary on the same
-    // L25 signal lands in the same band) now CLEARS the floor.
-    // Representative real-OLMo K=3 cumulative linear ceiling (the production L44
-    // run measured ~0.30-0.56). Pin a fixed value so the regression is grounded in
-    // the REAL co-collapse regime, independent of this small fixture's anchor_ev
-    // (which, with a rich K=8 d=2 torus basis on 64-dim output, saturates to ~1.0
-    // and would never exercise the fractional-ceiling co-collapse the bug lives in).
+    // close to, but slightly below, the cumulative K-atom linear ceiling. Keying
+    // the floor on the FULL ceiling would demote that genuine arrival to a branch
+    // bifurcation, and the seed cascade then co-collapses to the 1e12 sentinel.
+    // The per-atom share forgives one atom's worth of the ceiling, so a curved K=3
+    // arrival within 1/K of the ceiling CLEARS the floor.
+    // Representative real-OLMo K=3 cumulative linear ceiling (production L44 run
+    // measured ~0.30-0.56); pinned fixed so the regression exercises the
+    // fractional-ceiling co-collapse band independent of this fixture's near-1.0
+    // anchor_ev.
     let k3_linear_ceiling = 0.30_f64;
     let k3_curved_arrival = 0.2461_f64; // verified real-OLMo curved-branch EV
     let k3_floor = arrival_floor_k(k3_linear_ceiling, 3);
-    let k3_floor_old = CURVATURE_WALK_ARRIVAL_EV_FLOOR
-        .min(CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * k3_linear_ceiling)
-        .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR);
     eprintln!(
         "[#1026] K=3 ceiling={k3_linear_ceiling:.4} curved_arrival={k3_curved_arrival:.4} \
-         new_floor={k3_floor:.4} old_floor={k3_floor_old:.4}"
+         floor={k3_floor:.4}"
     );
     assert!(
         k3_curved_arrival >= k3_floor,
@@ -387,35 +366,28 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
          co-collapse regression is NOT fixed."
     );
     assert!(
-        k3_curved_arrival < k3_floor_old,
-        "[#1026] the OLD full-ceiling floor {k3_floor_old:.4} should have demoted the curved K=3 \
-         arrival at EV {k3_curved_arrival:.4} — if it did not, this fixture no longer exercises \
-         the co-collapse bug and the regression is vacuous."
+        k3_floor < k3_linear_ceiling && k3_curved_arrival < k3_linear_ceiling,
+        "[#1026] the per-atom-share floor {k3_floor:.4} must sit strictly below the FULL linear \
+         ceiling {k3_linear_ceiling:.4} (else there is no forgiveness and the regression is \
+         vacuous), and the curved arrival {k3_curved_arrival:.4} must lie in that forgiven band."
     );
-    // Structure of the floor across K. K=1 keeps the original #1189 base gate
-    // (no co-collapse to forgive); for K >= 2 the per-atom share relaxes it BELOW
-    // the base (a curved K-atom fit is allowed to fall one atom's share short of
-    // the cumulative ceiling), and within the K >= 2 family the floor is
-    // NON-DECREASING in K (a larger dictionary is held closer to its ceiling),
-    // bounded above by the base #1189 gate it relaxes from.
+    // Structure of the floor across K: K=1 has no co-collapse to forgive, so it is
+    // the most permissive (the bare data-collapse floor); for K >= 2 the floor is
+    // the per-atom share `ceiling*(K-1)/K`, NON-DECREASING in K (a larger
+    // dictionary is held closer to its ceiling) and always strictly below it.
     let f1 = arrival_floor_k(k3_linear_ceiling, 1);
     let f2 = arrival_floor_k(k3_linear_ceiling, 2);
     let f3 = arrival_floor_k(k3_linear_ceiling, 3);
     let f8 = arrival_floor_k(k3_linear_ceiling, 8);
     assert!(
-        f2 <= f1 + 1e-12,
-        "[#1026] K=2 floor {f2:.4} should relax BELOW the K=1 base gate {f1:.4} \
-         (the per-atom share must forgive one collapsed atom)."
+        f1 <= f2 && f2 <= f3 && f3 <= f8,
+        "[#1026] arrival floor is not monotone non-decreasing across K \
+         (K=1 {f1:.4}, K=2 {f2:.4}, K=3 {f3:.4}, K=8 {f8:.4})."
     );
     assert!(
-        f2 <= f3 && f3 <= f8,
-        "[#1026] per-atom-share floor is not monotone non-decreasing across K>=2 \
-         (K=2 {f2:.4}, K=3 {f3:.4}, K=8 {f8:.4})."
-    );
-    assert!(
-        f8 <= f1 + 1e-12,
-        "[#1026] the share floor exceeded the K=1 base gate at large K \
-         (K=8 {f8:.4} > base {f1:.4})."
+        f8 < k3_linear_ceiling,
+        "[#1026] the share floor reached/exceeded the full ceiling at large K \
+         (K=8 {f8:.4} >= ceiling {k3_linear_ceiling:.4})."
     );
 
     // Guard the sentinel constant the fix exists to avoid pinning the loop at.

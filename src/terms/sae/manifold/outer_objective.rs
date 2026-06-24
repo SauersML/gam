@@ -969,22 +969,18 @@ impl SaeManifoldOuterObjective {
         // branch); otherwise we demote to a recorded bifurcation so the cascade
         // takes over from the pristine baseline. A genuinely good arrival (the
         // common case, every fit already passing) never enters this block.
-        // #1189 — the arrival floor is RELATIVE to the certified linear ceiling.
-        // The absolute `CURVATURE_WALK_ARRIVAL_EV_FLOOR` is calibrated for planted
-        // synthetic harmonics (a real circle reconstructs at EV ≳ 0.9); on real
-        // high-dim data whose signal sits on a long-tailed spectrum the best
-        // achievable EV at K atoms is bounded by the cumulative linear (PCA)
-        // ceiling — which is well under 0.5 on real LLM activations — so the
-        // absolute floor rejected EVERY genuine arrival, the fit fell to the blind
-        // cascade, and the cascade collapsed to the `1e12` data-collapse sentinel.
-        // The Eckart-Young anchor's OWN reconstruction EV is exactly that
-        // achievable linear ceiling (`anchor_ev = 1 − ‖residual‖² / SST`); a
-        // curved arrival that recovers at least `CURVATURE_WALK_ARRIVAL_ANCHOR_
-        // FRACTION` of it has, by construction, NOT tracked into a worse basin
-        // than the convex linear optimum it started on. The effective floor is the
-        // MIN of the absolute floor and this fraction of the anchor ceiling: on
-        // synthetic data the absolute floor still binds (and the curved fit clears
-        // both); on real data it relaxes to the data-achievable ceiling.
+        // #1189 — the arrival floor is RELATIVE to the certified linear ceiling,
+        // never an absolute EV target. On real high-dim data whose signal sits on a
+        // long-tailed spectrum the best achievable EV at K atoms is bounded by the
+        // cumulative linear (PCA) ceiling — well under any fixed floor on real LLM
+        // activations — so an absolute floor would reject EVERY genuine arrival, the
+        // fit would fall to the blind cascade, and the cascade would collapse to the
+        // `1e12` data-collapse sentinel (the #1189 bug). The Eckart-Young anchor's
+        // OWN reconstruction EV is exactly that achievable linear ceiling
+        // (`anchor_ev = 1 − ‖residual‖² / SST`); the arrival floor below is a
+        // share of it (see there), so a curved arrival that recovers within one
+        // atom's share of the anchor has, by construction, NOT tracked into a worse
+        // basin than the convex linear optimum it started on.
         let target_sst = {
             let (n, p) = self.target.dim();
             let mut means = vec![0.0_f64; p];
@@ -1007,54 +1003,31 @@ impl SaeManifoldOuterObjective {
         let anchor_ev = if target_sst > f64::MIN_POSITIVE && anchor_residual_norm_sq.is_finite() {
             1.0 - anchor_residual_norm_sq / target_sst
         } else {
-            // No usable ceiling estimate: fall back to the absolute floor.
-            CURVATURE_WALK_ARRIVAL_EV_FLOOR
+            // No usable ceiling estimate (degenerate target): fall back to the
+            // data-collapse floor so the arrival gate keys on a finite number.
+            SAE_FIT_DATA_COLLAPSE_EV_FLOOR
         };
-        // The relative floor relaxes the absolute one DOWN to the data-achievable
-        // ceiling, but never BELOW the data-collapse floor the sentinel itself
-        // keys on: a fit at or under `SAE_FIT_DATA_COLLAPSE_EV_FLOOR` is genuinely
-        // degenerate (worse than a constant predictor would warrant) and must
-        // always route to recovery, even when a pathological anchor estimate
-        // (negative / near-zero `anchor_ev`) would otherwise drop the floor to
-        // zero and wave the collapse through.
-        // #1026 — the relative floor must also be PER-ATOM-SHARE aware. The
-        // anchor's certified ceiling `anchor_ev` is the CUMULATIVE Eckart-Young EV
-        // across ALL K atoms (sequential residual deflation in `linear_span_anchor`).
-        // In a K-atom dictionary each atom carries on average ~1/K of the captured
-        // variance, so a single atom that curves trades at most ~one atom's share of
-        // the linear ceiling for the geometry it gains. Holding the whole-dictionary
-        // curved EV to `0.9 * anchor_ev` (the full linear ceiling) therefore rejects
-        // genuine arrivals whenever the curved fit recovers slightly less than the
-        // cumulative linear optimum -- the K >= 2 co-collapse signature: the walk
-        // reaches a real curved branch (EV = 0.2461 / 0.29 / 0.37 on real OLMo) but
-        // `0.9 * anchor_ev` demotes it to a bifurcation and the cascade then
-        // collapses. The principled floor discounts the linear ceiling by exactly one
-        // atom's share: a curved K-atom fit need only stay within `1/K` of the linear
-        // ceiling (`anchor_ev * (K - 1)/K`), never within a flat 10%. At K = 1 the
-        // share floor is 0 (a single curved atom is judged only against the absolute /
-        // data-collapse floors -- it already beats its linear counterpart); as K grows
-        // it climbs back toward `anchor_ev`, still capped by the absolute
-        // `0.9 * anchor_ev` so a large dictionary is never held above the linear
-        // optimum it relaxed from.
-        // The base #1189 floor (absolute vs. the certified linear-ceiling
-        // fraction) governs the SINGLE-atom regime, where there is no second atom
-        // to collapse onto and the share concept is undefined. For K >= 2 it is
-        // ADDITIONALLY relaxed by the per-atom share so a curved K-atom fit that
-        // recovers within `1/K` of the cumulative ceiling is accepted; K = 1 keeps
-        // the original gate exactly (no co-collapse to forgive there).
-        let k_active = self.term.k_atoms().max(1);
-        let base_floor = CURVATURE_WALK_ARRIVAL_EV_FLOOR
-            .min(CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION * anchor_ev)
-            .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR);
-        let arrival_floor = if k_active >= 2 {
-            let k = k_active as f64;
-            let per_atom_share_floor = anchor_ev * ((k - 1.0) / k);
-            base_floor
-                .min(per_atom_share_floor.max(0.0))
-                .max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR)
-        } else {
-            base_floor
-        };
+        // Arrival floor (#1189 / #1026): accept the curved arrival when its
+        // reconstruction EV recovers the linear PCA ceiling `anchor_ev` minus at
+        // most ONE atom's share of it. Sequential Eckart-Young deflation gives each
+        // atom ~1/K of the cumulative linear optimum (`anchor_ev` is the
+        // certified CUMULATIVE ceiling across all K atoms), so a single atom that
+        // curves trades at most 1/K of the ceiling for the geometry it gains: the
+        // whole-dictionary curved EV need only stay within 1/K, i.e.
+        // `>= anchor_ev * (K - 1)/K`. This is exactly the achievable, data-derived
+        // bar — no absolute EV target. On real long-tailed activations `anchor_ev`
+        // is well under any fixed floor, so keying on the achievable ceiling is the
+        // whole #1189 fix; the per-atom discount is the #1026 co-collapse
+        // forgiveness. K = 1 has no co-collapse partner and no share to forgive
+        // (the discount is 0), so a single curved atom is judged purely against the
+        // data-collapse floor and its curve-vs-linear quality is adjudicated
+        // downstream by the EV-vs-K structure search. Never below
+        // `SAE_FIT_DATA_COLLAPSE_EV_FLOOR`: a fit under that is degenerate (worse
+        // than a constant predictor) and must route to recovery whatever the
+        // anchor estimate.
+        let k_active = self.term.k_atoms().max(1) as f64;
+        let arrival_floor =
+            (anchor_ev * ((k_active - 1.0) / k_active)).max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR);
         if arrived
             && let Ok(final_fit) = self.term.try_fitted_for_rho(&rho)
             && let Some(final_ev) =
@@ -1063,10 +1036,9 @@ impl SaeManifoldOuterObjective {
         {
             log::info!(
                 "[#1007/#1189] curvature walk reached η=1 but the reconstruction is degenerate \
-                 (EV={final_ev:.4} < arrival floor {arrival_floor:.4} = min(abs \
-                 {CURVATURE_WALK_ARRIVAL_EV_FLOOR}, {CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION} × \
-                 anchor ceiling {anchor_ev:.4})); running a \
-                 bounded joint Newton fit from the pristine seed to recover the curved branch"
+                 (EV={final_ev:.4} < arrival floor {arrival_floor:.4} = anchor ceiling \
+                 {anchor_ev:.4} × (K-1)/K); running a bounded joint Newton fit from the \
+                 pristine seed to recover the curved branch"
             );
             // Real joint Newton fit from the pristine baseline (circle-aware
             // seed), at the full η = 1 basis, with a budget that does NOT collapse

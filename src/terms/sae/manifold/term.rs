@@ -42,44 +42,11 @@ pub(crate) const CURVATURE_WALK_MIN_ETA_STEP: f64 = 1.0 / 256.0;
 /// defers to the cascade, never a spin.
 pub(crate) const CURVATURE_WALK_MAX_CORRECTORS: usize = 32;
 
-/// Minimum η = 1 reconstruction explained-variance for the curvature-homotopy
-/// walk to certify "arrived" (#1117). The predictor-corrector walk from the
-/// Eckart-Young LINEAR anchor can converge (legitimately, on the gauge/decoder-
-/// null quotient) into a degenerate basin whose reconstruction is worse than the
-/// data mean (a NEGATIVE EV). When the post-polish EV is below this floor the
-/// walk runs a bounded joint Newton recovery from the pristine seed, and on
-/// failure demotes to a recorded bifurcation so the documented seed cascade
-/// recovers the good branch. The floor sits well below a genuine recovery (a
-/// real circle reconstructs at EV ≳ 0.9) but firmly above the worse-than-trivial
-/// basins, so a clean arrival is never touched while a garbage basin always is.
-pub(crate) const CURVATURE_WALK_ARRIVAL_EV_FLOOR: f64 = 0.5;
-
-/// Fraction of the certified Eckart-Young LINEAR anchor's own reconstruction EV
-/// that a curvature-walk arrival must recover to count as "arrived" (#1189). The
-/// absolute [`CURVATURE_WALK_ARRIVAL_EV_FLOOR`] is calibrated for planted
-/// synthetic harmonics (a real circle reconstructs at EV ≳ 0.9), but it is
-/// STRUCTURALLY UNREACHABLE on real high-dim data whose signal sits on a
-/// long-tailed spectrum: the best achievable EV at K atoms is bounded by the
-/// cumulative linear (PCA) ceiling, which on real LLM residual-stream activations
-/// is well under 0.5. On such data the absolute floor rejected EVERY certified
-/// anchor arrival, the fit fell through to the blind seed cascade, and the
-/// cascade collapsed into the degenerate basin (in-sample EV ≤ the data-collapse
-/// floor → the `1e12` sentinel pinned the whole outer loop). The genuine
-/// degenerate-basin signature is the curved walk tracking AWAY from the convex
-/// Eckart-Young optimum it started on — i.e. recovering MUCH LESS than the
-/// linear anchor's own EV — not merely landing below an absolute constant the
-/// data can never reach. So the effective floor is the MINIMUM of the absolute
-/// floor and this fraction of the anchor's certified linear-ceiling EV: a curved
-/// fit that reconstructs at least this fraction of the convex linear optimum has,
-/// by construction, NOT fallen into a worse basin. On synthetic planted circles
-/// the linear chord's EV is itself modest, so the absolute floor still binds (and
-/// the curved fit, reaching EV ≈ 0.9, clears both); on real data the relative
-/// floor relaxes to the achievable ceiling and a working fit is accepted.
-pub(crate) const CURVATURE_WALK_ARRIVAL_ANCHOR_FRACTION: f64 = 0.9;
-
 /// Joint Newton iteration budget for the curvature-walk degenerate-basin
-/// recovery (#1117). When the walk lands on a sub-`CURVATURE_WALK_ARRIVAL_EV_
-/// FLOOR` reconstruction, the recovery runs a REAL joint fit from the pristine
+/// recovery (#1117). When the walk lands on a sub-arrival-floor (see the
+/// `arrival_floor` in `run_curvature_homotopy_entry_at_rho`: the achievable
+/// linear ceiling `anchor_ev` minus one atom's share) reconstruction, the
+/// recovery runs a REAL joint fit from the pristine
 /// (circle-aware) seed with at least this many inner iterations, independent of
 /// the outer objective's possibly-frozen `inner_max_iter = 0` — otherwise the
 /// recovery (and the fallback cascade) would re-freeze at the cold seed and
