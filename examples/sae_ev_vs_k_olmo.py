@@ -336,16 +336,26 @@ def main() -> None:
             k_max_fit_seconds,
             args.max_reconstruct_seconds,
         )
-        ev_l, fit_l, recon_l, linear_split, linear_topologies = _fit_ev(
-            z_tr,
-            z_te,
-            k,
-            "linear",
-            args.seed,
-            args.n_iter,
-            k_max_fit_seconds,
-            args.max_reconstruct_seconds,
-        )
+        # The pure-linear comparison arm rides a separate basis lane whose OOS /
+        # basis_with_jet plumbing can error independently of the curved arm (e.g.
+        # the unsupported "linear" basis kind). A failure there must NOT discard
+        # the curved EV-vs-K climb — the #1026 headline measurement — so the
+        # linear arm is reported as NaN and the row still prints.
+        try:
+            ev_l, fit_l, recon_l, linear_split, linear_topologies = _fit_ev(
+                z_tr,
+                z_te,
+                k,
+                "linear",
+                args.seed,
+                args.n_iter,
+                k_max_fit_seconds,
+                args.max_reconstruct_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 — arm-isolated, reported honestly
+            print(f"[linear K={k}] arm failed, reporting NaN: {exc}", flush=True)
+            ev_l, fit_l, recon_l = float("nan"), float("nan"), float("nan")
+            linear_split, linear_topologies = None, None
         print(
             f"{k:>4}  {ev_h:>13.6f}  {ev_l:>13.6f}  {ev_h - ev_l:>17.6f}  "
             f"{fit_h:>9.1f}  {fit_l:>9.1f}  {max(recon_h, recon_l):>9.1f}"
