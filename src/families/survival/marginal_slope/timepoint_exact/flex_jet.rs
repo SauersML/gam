@@ -2039,7 +2039,14 @@ mod moment_engine_tests {
             c2: c0[2] + theta * dc[2],
             c3: c0[3] + theta * dc[3],
         };
-        let max_degree = 12usize;
+        // The `e^{−Δq}` interior closure expands `S(z)=Σ_{k≤4}(−Δq)^k/k!`; for the
+        // SECOND θ-derivative the `(−Δq)²` term (degree-12 in z, since η is cubic so
+        // `−Δq=½(η²−η₀²)` is degree-6) reaches `M_{n+12}` (up to `M_16` for `n≤4`). A
+        // `max_degree` of 12 silently `unwrap_or(0.0)`s those high-degree moments,
+        // truncating the analytic second derivative (~1.5% on `M_1`). Production
+        // builds the cached moments to order 27 (`build_cached_partition`); match it
+        // so the moment dot is complete to every order the Jet2 Hessian reads.
+        let max_degree = 27usize;
         let moments_at = |theta: f64| -> Vec<f64> {
             evaluate_cell_moments(cell_at(theta), max_degree)
                 .expect("numeric cell moments")
