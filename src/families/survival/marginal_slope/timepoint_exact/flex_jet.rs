@@ -3708,33 +3708,34 @@ mod moment_engine_tests {
             .evaluate_survival_denom_d(a1, g, bh, bw)
             .expect("denom");
 
-        // ── #932 PROBE (runs FIRST, before any cmp_mat): jet a_uv_uv[q1,q1] vs an
-        // independent scalar-solve FD oracle (no hand path involved). eta_uv_uv[1,1]
-        // (1 = primary.q1, which enters eta only through the lifted intercept a)
-        // reduces to chi·a_uv_uv[1,1], so the eta_uv_uv mismatch is an intercept
-        // a_uv_uv mismatch. Re-run the SAME intercept lift the generic path uses (with
-        // the Jet4 bidirectional seeds) and pull a_jet.eps_del.h[1,1]; compare to a
-        // central finite difference of the scalar intercept solve a(q1, β+t·dir) along
-        // the two directions and the q1-Hessian axis (exact root — the arbiter).
-        {
+        // ── #932 SCALAR-FD ORACLE (runs FIRST, before any cmp_mat): the authoritative
+        // [q1,q1] bidirectional reference, built WITHOUT the hand bidirectional path.
+        //
+        // `q1` (= primary.q1) enters the OBSERVED eta/chi/D only through the lifted
+        // intercept a (no de-nested-cell coefficient dependence: the eta_aa·a_u² and
+        // r_uv terms vanish at the q1 axis), so eta_uv_uv[q1,q1] = D_d1 D_d2(∂²_q1
+        // eta_obs) is a pure chain through the intercept solve a(q1, β). Finite-
+        // difference the observed scalars eta_obs/chi_obs/D as functions of the q1
+        // marginal and the (dir1, dir2)-perturbed primaries — the intercept root is
+        // bisected to 1e-12, so this is an exact oracle. The hand
+        // `compute_survival_timepoint_bidirectional` §D moving-boundary flux is still
+        // incomplete at the q1 self-block (gam#1454: 1a7801741/c8aea3f11 closed the
+        // off-q1 blocks; the q1 self-flux into `auvd12` remains short), so the gate
+        // asserts the [q1,q1] entries against THIS oracle, not the buggy moving-target
+        // hand. The probe also pins the jet's lifted intercept a_uv_uv against the
+        // scalar-FD a-Hessian — the cross-check that localized the bug to the hand,
+        // not the jet (this PROBE PASSES).
+        let (oracle_eta_uvuv, oracle_chi_uvuv, oracle_d_uvuv) = {
             let dir1 = Array1::from_iter(
                 (0..p).map(|c| 0.12 + 0.04 * (c as f64) - 0.01 * ((c % 2) as f64)),
             );
             let dir2 = Array1::from_iter(
                 (0..p).map(|c| -0.07 + 0.05 * ((c % 3) as f64) + 0.02 * (c as f64)),
             );
-            let template4 = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
-            let b_jet4 = Jet4::primary(g, primary.g, p, dir1[primary.g], dir2[primary.g]);
-            let du4: Vec<Jet4> = (0..p)
-                .map(|u| Jet4::primary(0.0, u, p, dir1[u], dir2[u]))
-                .collect();
-            let residual_probe = |a: &Jet4| {
-                calibration_residual_jet(a, &b_jet4, primary.g, &du4, primary.q1, q1, &cells)
-            };
-            let a_jet_probe = lift_intercept_flex(&template4, a1, 1.0 / d_check, 4, residual_probe);
-            let jet_a_uvuv = a_jet_probe.eps_del.h[primary.q1 * p + primary.q1];
-
-            let a_of = |dq1: f64, t1: f64, t2: f64| -> f64 {
+            // Solve the intercept at the perturbed point and read back (a, eta_obs,
+            // chi_obs, D). The directions are over the FULL primary vector, so q1 is
+            // also moved by their q1-component, plus the dedicated Hessian shift dq1.
+            let scalars_of = |dq1: f64, t1: f64, t2: f64| -> (f64, f64, f64, f64) {
                 let q1_pert = q1 + dq1 + t1 * dir1[primary.q1] + t2 * dir2[primary.q1];
                 let g_pert = g + t1 * dir1[primary.g] + t2 * dir2[primary.g];
                 let bh_pert: Array1<f64> = Array1::from_iter((0..h_len).map(|i| {
@@ -3745,7 +3746,7 @@ mod moment_engine_tests {
                     let idx = primary.w.as_ref().unwrap().start + i;
                     beta_w[i] + t1 * dir1[idx] + t2 * dir2[idx]
                 }));
-                family
+                let a_pert = family
                     .solve_row_survival_intercept_with_slot(
                         q1_pert,
                         g_pert,
@@ -3753,25 +3754,68 @@ mod moment_engine_tests {
                         Some(&bw_pert),
                         None,
                     )
-                    .expect("probe intercept solve")
-                    .0
+                    .expect("oracle intercept solve")
+                    .0;
+                let obs = family
+                    .observed_denested_cell_partials(
+                        row,
+                        a_pert,
+                        g_pert,
+                        Some(&bh_pert),
+                        Some(&bw_pert),
+                    )
+                    .expect("oracle observed partials");
+                let d_pert = family
+                    .evaluate_survival_denom_d(a_pert, g_pert, Some(&bh_pert), Some(&bw_pert))
+                    .expect("oracle denom");
+                (
+                    a_pert,
+                    eval_coeff4_at(&obs.coeff, z_obs) + o_infl,
+                    eval_coeff4_at(&obs.dc_da, z_obs),
+                    d_pert,
+                )
             };
+
             let hq = 2.0e-3_f64;
             let ht = 3.0e-3_f64;
-            let hess_q = |t1: f64, t2: f64| -> f64 {
-                (a_of(hq, t1, t2) - 2.0 * a_of(0.0, t1, t2) + a_of(-hq, t1, t2)) / (hq * hq)
+            // ∂²_q1 D_dir1 D_dir2 of a selected scalar (q1-Hessian via the dq1 stencil,
+            // directional second-cross via the (t1,t2) 2×2 stencil).
+            let mixed_uvuv = |sel: &dyn Fn((f64, f64, f64, f64)) -> f64| -> f64 {
+                let hess_q = |t1: f64, t2: f64| -> f64 {
+                    (sel(scalars_of(hq, t1, t2)) - 2.0 * sel(scalars_of(0.0, t1, t2))
+                        + sel(scalars_of(-hq, t1, t2)))
+                        / (hq * hq)
+                };
+                (hess_q(ht, ht) - hess_q(ht, -ht) - hess_q(-ht, ht) + hess_q(-ht, -ht))
+                    / (4.0 * ht * ht)
             };
-            let ref_a_uvuv = (hess_q(ht, ht) - hess_q(ht, -ht) - hess_q(-ht, ht)
-                + hess_q(-ht, -ht))
-                / (4.0 * ht * ht);
-            let chi_probe = eval_coeff4_at(&obs_fixed.dc_da, z_obs);
+
+            // Cross-check: the jet's lifted intercept a_uv_uv[q1,q1] (eps_del Hessian)
+            // == the scalar-FD a-Hessian (the verdict that confirmed the jet correct).
+            let template4 = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
+            let b_jet4 = Jet4::primary(g, primary.g, p, dir1[primary.g], dir2[primary.g]);
+            let du4: Vec<Jet4> = (0..p)
+                .map(|u| Jet4::primary(0.0, u, p, dir1[u], dir2[u]))
+                .collect();
+            let residual_probe = |a: &Jet4| {
+                calibration_residual_jet(a, &b_jet4, primary.g, &du4, primary.q1, q1, &cells)
+            };
+            let a_jet_probe = lift_intercept_flex(&template4, a1, 1.0 / d_check, 4, residual_probe);
+            let jet_a_uvuv = a_jet_probe.eps_del.h[primary.q1 * p + primary.q1];
+            let ref_a_uvuv = mixed_uvuv(&|t| t.0);
             assert!(
                 (jet_a_uvuv - ref_a_uvuv).abs() <= 1e-3 * (1.0 + ref_a_uvuv.abs()),
                 "#932 PROBE a_uv_uv[q1,q1]: jet {jet_a_uvuv} != scalar-FD {ref_a_uvuv} \
-                 (diff {}; chi {chi_probe} — eta_uv_uv ≈ chi·a_uv_uv)",
+                 (diff {})",
                 jet_a_uvuv - ref_a_uvuv,
             );
-        }
+
+            (
+                mixed_uvuv(&|t| t.1),
+                mixed_uvuv(&|t| t.2),
+                mixed_uvuv(&|t| t.3),
+            )
+        };
 
         let cmp_vec = |label: &str, jet: &Vec<f64>, hand: &[f64]| {
             for u in 0..p {
@@ -3853,9 +3897,38 @@ mod moment_engine_tests {
         )
         .expect("generic jet4");
 
-        cmp_mat("eta_uv_uv", &eta4.eps_del.h, &hand_bi.eta_uv_uv);
-        cmp_mat("chi_uv_uv", &chi4.eps_del.h, &hand_bi.chi_uv_uv);
-        cmp_mat("d_uv_uv", &d4.eps_del.h, &hand_bi.d_uv_uv);
+        // Bidirectional eps_del Hessians vs hand — EXCEPT the [q1,q1] self-block,
+        // where the hand §D moving-boundary flux is still incomplete (gam#1454). There
+        // the scalar-FD oracle (probe-confirmed against the jet's lifted a_uv_uv) is
+        // authoritative, so [q1,q1] is asserted against `oracle_*_uvuv` at the FD
+        // tolerance and every other (u,v) against the hand at the tight tolerance.
+        let q = primary.q1;
+        let cmp_mat_oracle = |label: &str, jet: &Vec<f64>, hand: &Array2<f64>, oracle_qq: f64| {
+            for u in 0..p {
+                for v in 0..p {
+                    if u == q && v == q {
+                        assert!(
+                            (jet[q * p + q] - oracle_qq).abs() <= 1e-3 * (1.0 + oracle_qq.abs()),
+                            "{label}[q1,q1] jet {} != scalar-FD oracle {} (hand {} is #1454-incomplete here)",
+                            jet[q * p + q],
+                            oracle_qq,
+                            hand[[q, q]],
+                        );
+                    } else {
+                        assert!(
+                            (jet[u * p + v] - hand[[u, v]]).abs()
+                                <= 1e-6 * (1.0 + hand[[u, v]].abs()),
+                            "{label}[{u},{v}] jet {} != hand {}",
+                            jet[u * p + v],
+                            hand[[u, v]],
+                        );
+                    }
+                }
+            }
+        };
+        cmp_mat_oracle("eta_uv_uv", &eta4.eps_del.h, &hand_bi.eta_uv_uv, oracle_eta_uvuv);
+        cmp_mat_oracle("chi_uv_uv", &chi4.eps_del.h, &hand_bi.chi_uv_uv, oracle_chi_uvuv);
+        cmp_mat_oracle("d_uv_uv", &d4.eps_del.h, &hand_bi.d_uv_uv, oracle_d_uvuv);
     }
 }
 

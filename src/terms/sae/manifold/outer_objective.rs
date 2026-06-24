@@ -324,6 +324,11 @@ impl SaeManifoldOuterObjective {
             ..
         } = self;
         let pristine_seed_term = baseline_term.clone();
+        // #1026 — a spare clone of the pristine seed for the GLOBAL linear-dominance
+        // floor below: the outer cascade can re-curve away from the certified η=0
+        // anchor and settle below it, so the seed-level floor in the curvature walk
+        // is necessary but not sufficient — the RESULT must also be floored.
+        let anchor_seed_term = pristine_seed_term.clone();
         let pristine_seed_rho = baseline_rho.clone();
         let mut fitted_rho = current_rho;
         let loss = last_loss.unwrap_or_else(|| SaeManifoldLoss {
@@ -430,6 +435,51 @@ impl SaeManifoldOuterObjective {
             fitted_rho = pristine_seed_rho;
             fitted_loss = seed_loss;
             pristine_seed_won = true;
+        }
+        // #1026 GLOBAL LINEAR-DOMINANCE FLOOR (F_returned ≤ F_linear). The seed and
+        // pristine-seed guards above re-solve the CURVED (η=1) fit, which on real
+        // linear-Gaussian activations can co-collapse to a fraction of the linear
+        // ceiling (real OLMo K=8: EV ≈ 0.58 vs the 0.74 certified Eckart-Young
+        // ceiling). As a final candidate, re-solve the CONVEX η=0 linear relaxation —
+        // the same certified PCA-ceiling anchor the curvature walk starts from — and
+        // adopt it when it reconstructs strictly better than the returned curved
+        // state. Curvature that cannot beat the convex linear optimum returns that
+        // optimum; because the anchor is a genuine linear model (not a
+        // reconstruction-time substitution) the dominance holds on held-out data too.
+        if let Ok(returned_fit) = fitted.try_fitted_for_rho(&fitted_rho)
+            && let Some(returned_ev) =
+                reconstruction_explained_variance(target.view(), returned_fit.view())
+        {
+            let mut anchor_term = anchor_seed_term;
+            anchor_term.set_homotopy_eta(0.0).ok();
+            let mut anchor_rho = fitted_rho.clone();
+            let anchor_iters = inner_max_iter.max(CURVATURE_WALK_RECOVERY_INNER_ITERS);
+            let anchor_solve = anchor_term.run_joint_fit_arrow_schur(
+                target.view(),
+                &mut anchor_rho,
+                registry.as_ref(),
+                anchor_iters,
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            );
+            if anchor_solve.is_ok()
+                && let Ok(anchor_fit) = anchor_term.try_fitted_for_rho(&anchor_rho)
+                && let Some(anchor_ev) =
+                    reconstruction_explained_variance(target.view(), anchor_fit.view())
+                && anchor_ev.is_finite()
+                && anchor_ev > returned_ev + SAE_FINAL_EV_DEGRADATION_TOL
+                && let Ok(anchor_loss) = anchor_term.loss(target.view(), &anchor_rho)
+            {
+                log::info!(
+                    "[#1026] into_fitted linear-dominance floor: returned curved EV \
+                     {returned_ev:.4} < η=0 PCA anchor EV {anchor_ev:.4}; adopting the certified \
+                     linear anchor as the final fit (F_returned ≤ F_linear)"
+                );
+                fitted = anchor_term;
+                fitted_rho = anchor_rho;
+                fitted_loss = anchor_loss;
+            }
         }
         // #1019 — the post-fit assembly seam: canonicalize every eligible
         // atom's chart to its canonical Diff(M) representative (arc length
