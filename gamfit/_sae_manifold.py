@@ -2456,18 +2456,32 @@ class ManifoldSAE:
 
     def summary(self) -> dict[str, Any]:
         # `self.assignment` is the canonical kind. Active-atom detection is
-        # mode-specific:
-        #   softmax   -> active if its share exceeds the uniform mass 1/K;
-        #   ibp_map   -> active if its posterior gate exceeds the 0.5 threshold;
-        #   jumprelu  -> active if the (hard) gate is nonzero (> 0).
+        # mode-specific, and so is the array it thresholds:
+        #   softmax   -> mixture shares; active if a share exceeds uniform mass 1/K.
+        #   jumprelu  -> hard gate activations; active if the gate is nonzero.
+        #   ibp_map   -> the per-atom posterior INCLUSION GATE σ(logit); active if
+        #                it exceeds 0.5 (⇔ the MAP includes the atom). The gates
+        #                are independent across atoms, NOT a simplex.
+        # `self.assignments` holds the normalized reconstruction responsibilities
+        # (Σ_k ≈ 1 per row), which are the correct quantity to threshold for
+        # softmax/jumprelu but NOT for ibp_map: with K ≥ 2 a responsibility
+        # essentially never reaches 0.5, so thresholding it collapsed the ibp_map
+        # L0 count to ~0 even at R² ≈ 0.99 with every atom carrying mass. The
+        # ibp_map gates are σ of the stored per-atom low-level logits.
         kind = _canonical_assignment(self.assignment, "assignment")
         if kind == "softmax":
+            summary_array = self.assignments
             threshold = 1.0 / max(1, len(self.atoms))
         elif kind == "jumprelu":
+            summary_array = self.assignments
             threshold = 0.0
         else:  # ibp_map
+            logits = np.asarray(self.low_level_logits, dtype=float)
+            summary_array = 1.0 / (1.0 + np.exp(-logits))
             threshold = 0.5
-        avg_active, mean_mass = rust_module().sae_manifold_assignment_summary(self.assignments, threshold)
+        avg_active, mean_mass = rust_module().sae_manifold_assignment_summary(
+            np.ascontiguousarray(summary_array, dtype=float), threshold
+        )
         return {
             "K": len(self.atoms),
             "d_atom": int(self.coords[0].shape[1]) if self.coords else 0,
