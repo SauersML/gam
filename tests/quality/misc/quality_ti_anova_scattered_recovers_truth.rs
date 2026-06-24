@@ -24,11 +24,23 @@
 //! tight enough that any partial fix that leaves the main effects collapsed
 //! still fails. This is the configuration the existing grid-only `ti` coverage
 //! is structurally blind to.
+//!
+//! BASELINE TO MATCH-OR-BEAT: mgcv. The only other `ti`-vs-mgcv head-to-head in
+//! the suite (`quality_vs_mgcv_tensor_ti_2d_gaussian`) runs on a regular tensor
+//! grid — exactly the configuration this bug is blind to (the collapse only
+//! happens once the coordinates leave the grid). So we additionally fit the
+//! identical `s(x)+s(z)+ti(x,z)` model with mgcv on the SAME scattered rows and
+//! require (a) mgcv itself recovers the truth here — verifying the long-standing
+//! "mgcv is fine on scattered data" claim that was never actually exercised —
+//! and (b) gam's recovery error is no worse than mgcv's by more than a generous
+//! margin. The margin is deliberately loose (basis-default differences move RMSE
+//! by tens of percent, not multiples) while the ~40× main-effect collapse this
+//! test guards against blows through any sane multiplier.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::rmse;
+use gam::test_support::reference::{Column, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -120,5 +132,58 @@ fn gam_ss_ti_anova_recovers_truth_on_scattered_data() {
          rmse={rmse_gam:.5} > bar={bar:.5} (broken value is ~0.52; correct ~0.01). \
          The ti interaction-only construction is not orthogonal to the s() main \
          effects on the realized (non-grid) design (#1470)."
+    );
+
+    // ---- BASELINE: fit the SAME model with mgcv on the SAME scattered rows --
+    // Mirror gam's three-term ANOVA decomposition with cubic P-spline margins
+    // (bs="ps", 2nd-order difference penalty). The ti margin spec matches the
+    // grid head-to-head test; the s() margins use the same P-spline family so
+    // the comparison is apples-to-apples.
+    let r = run_r(
+        &[
+            Column::new("x", &x),
+            Column::new("z", &z),
+            Column::new("y", &y),
+        ],
+        r#"
+        suppressPackageStartupMessages(library(mgcv))
+        m <- gam(
+            y ~ s(x, bs = "ps", m = c(2, 2), k = 10)
+              + s(z, bs = "ps", m = c(2, 2), k = 10)
+              + ti(x, z, bs = "ps", m = list(c(2, 2), c(2, 2)), k = 6),
+            data = df, method = "REML")
+        emit("fitted", as.numeric(fitted(m)))
+        "#,
+    );
+    let mgcv_fitted = r.vector("fitted");
+    assert_eq!(mgcv_fitted.len(), N, "mgcv fitted length mismatch");
+    let rmse_mgcv = rmse(&mgcv_fitted, &truth_vals);
+
+    // (a) mgcv itself must recover the truth on this scattered data — the claim
+    // the module docstring has always made but never tested.
+    assert!(
+        rmse_mgcv <= bar,
+        "mgcv unexpectedly fails to recover the truth on this scattered \
+         s(x)+s(z)+ti(x,z) data: rmse_mgcv={rmse_mgcv:.5} > {bar:.5}. The premise \
+         that mgcv is fine off-grid (and the bug is gam-specific) is violated; \
+         re-examine the test data/model before trusting the gam comparison."
+    );
+
+    // (b) gam must match or beat mgcv. Generous multiplier over an absolute
+    // floor: basis-default differences perturb RMSE by tens of percent, so a
+    // 1.5x band anchored at 0.03 (below the 0.05 recovery bar, above the ~0.01
+    // achievable floor) can never spuriously fail, while the ~40x main-effect
+    // collapse (rmse ~0.52 vs mgcv ~0.01) blows through it by an order of
+    // magnitude.
+    let match_or_beat = 1.5 * rmse_mgcv.max(0.03);
+    eprintln!(
+        "s(x)+s(z)+ti(x,z) scattered match-or-beat: rmse_gam={rmse_gam:.5} \
+         rmse_mgcv={rmse_mgcv:.5} match_or_beat_bar={match_or_beat:.5}"
+    );
+    assert!(
+        rmse_gam <= match_or_beat,
+        "gam's scattered ti recovery is materially worse than mgcv's: \
+         rmse_gam={rmse_gam:.5} > 1.5*max(rmse_mgcv,0.03)={match_or_beat:.5} \
+         (rmse_mgcv={rmse_mgcv:.5}). #1470 collapse signature."
     );
 }
