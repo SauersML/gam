@@ -324,6 +324,8 @@ impl SaeManifoldOuterObjective {
             ..
         } = self;
         let pristine_seed_term = baseline_term.clone();
+        // #1026 — spare clone of the PRISTINE seed for the global linear-dominance floor.
+        let anchor_seed_term = pristine_seed_term.clone();
         let pristine_seed_rho = baseline_rho.clone();
         let mut fitted_rho = current_rho;
         let loss = last_loss.unwrap_or_else(|| SaeManifoldLoss {
@@ -441,15 +443,51 @@ impl SaeManifoldOuterObjective {
         // state. Curvature that cannot beat the convex linear optimum returns that
         // optimum; because the anchor is a genuine linear model (not a
         // reconstruction-time substitution) the dominance holds on held-out data too.
-        // NOTE (#1026): a GLOBAL linear-dominance floor was attempted here (re-derive the
-        // η=0 PCA anchor and adopt it when the result reconstructs worse). It was
-        // REMOVED because it cannot move the user-facing metric: `m.reconstruct` rebuilds
-        // a fresh OOS term that RE-ENCODES the assignment + coordinates, so no term-state
-        // or decoder fix survives — only `hybrid_linear_images` (#1228) propagate to OOS.
-        // The robust generalizing recovery is therefore the hybrid-split rescue
-        // (collapsed atoms decode their linear image), not an η-anchor restore. Keeping
-        // the cheap SEED-level floor in the curvature walk (internal F≤F_linear) and
-        // avoiding the expensive per-fit re-derive that delivered no measured gain.
+        // #1026 GLOBAL LINEAR-DOMINANCE FLOOR (decoder route). `m.reconstruct` RE-ENCODES
+        // codes+assignment against the fit's DECODERS (the OOS re-encode lifts a collapsed
+        // internal EV 0.13 to 0.58), so to move the user-facing metric we must change the
+        // FINAL DECODERS — not an η/coord state. Derive the certified anchor the way the
+        // curvature walk does (`reml_criterion_with_cache` at η=0 = the convex Eckart-Young
+        // relaxation) from the PRISTINE SEED (a collapsed term's η=0 re-solve stays stuck
+        // ~0.58; the seed's reaches the ~0.74 ceiling), keep η=1 so the OOS reconstruct
+        // honors the anchor decoder, and adopt when it strictly beats the returned EV.
+        let returned_ev = fitted
+            .try_fitted_for_rho(&fitted_rho)
+            .ok()
+            .and_then(|fit| reconstruction_explained_variance(target.view(), fit.view()));
+        let mut anchor_term = anchor_seed_term;
+        anchor_term.set_homotopy_eta(0.0).ok();
+        let anchor_rho = fitted_rho.clone();
+        let anchor_solved = anchor_term
+            .reml_criterion_with_cache(
+                target.view(),
+                &anchor_rho,
+                registry.as_ref(),
+                inner_max_iter.max(CURVATURE_WALK_RECOVERY_INNER_ITERS),
+                learning_rate,
+                ridge_ext_coord,
+                ridge_beta,
+            )
+            .is_ok();
+        anchor_term.set_homotopy_eta(1.0).ok();
+        if anchor_solved
+            && let Some(returned_ev) = returned_ev
+            && let Ok(anchor_fit) = anchor_term.try_fitted_for_rho(&anchor_rho)
+            && let Some(anchor_ev) =
+                reconstruction_explained_variance(target.view(), anchor_fit.view())
+            && anchor_ev.is_finite()
+            && anchor_ev > returned_ev + SAE_FINAL_EV_DEGRADATION_TOL
+            && let Ok(anchor_loss) = anchor_term.loss(target.view(), &anchor_rho)
+        {
+            log::info!(
+                "[#1026] into_fitted linear-dominance floor: returned EV {returned_ev:.4} < \
+                 reml-η0 anchor EV {anchor_ev:.4} (from pristine seed, @η=1); adopting the \
+                 certified linear-anchor DECODERS as the final fit"
+            );
+            fitted = anchor_term;
+            fitted_rho = anchor_rho;
+            fitted_loss = anchor_loss;
+        }
         // #1019 — the post-fit assembly seam: canonicalize every eligible
         // atom's chart to its canonical Diff(M) representative (arc length
         // for d = 1, minimum-isometry-defect flow for d = 2 torus atoms)
