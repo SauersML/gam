@@ -10,7 +10,7 @@ docstring promises.
 point predictions on the response scale".  So ``predict_array(X)`` with no
 ``interval`` should likewise return a 1-D response-scale prediction vector.
 
-Observed (gamfit 0.1.224): ``predict_array(X)`` returns a 2-D array.  With no
+Observed before this fix: ``predict_array(X)`` returned a 2-D array.  With no
 interval its shape is ``(n, 2)`` whose **alphabetically-ordered** columns are
 ``[linear_predictor, mean]`` (with an interval it is ``(n, 5)`` —
 ``[linear_predictor, mean, mean_lower, mean_upper, std_error]``).  The root
