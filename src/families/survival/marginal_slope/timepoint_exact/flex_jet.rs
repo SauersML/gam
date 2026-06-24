@@ -3732,19 +3732,20 @@ mod moment_engine_tests {
             let dir2 = Array1::from_iter(
                 (0..p).map(|c| -0.07 + 0.05 * ((c % 3) as f64) + 0.02 * (c as f64)),
             );
-            // Solve the intercept at the perturbed point and read back (a, eta_obs,
-            // chi_obs, D). The directions are over the FULL primary vector, so q1 is
-            // also moved by their q1-component, plus the dedicated Hessian shift dq1.
-            let scalars_of = |dq1: f64, t1: f64, t2: f64| -> (f64, f64, f64, f64) {
-                let q1_pert = q1 + dq1 + t1 * dir1[primary.q1] + t2 * dir2[primary.q1];
-                let g_pert = g + t1 * dir1[primary.g] + t2 * dir2[primary.g];
+            // Solve the intercept at θ + (an arbitrary per-primary perturbation `pert`)
+            // and read back (a, eta_obs, chi_obs, D). `pert[u]` shifts primary u's
+            // scalar: q1→the marginal q1 argument, g→the slope, h-range[i]→β_h[i],
+            // w-range[i]→β_w[i]; every other primary (q0/qd1/infl) leaves the intercept
+            // unchanged (a depends only on q1/g/β_h/β_w). This drives BOTH the directional
+            // contractions and the (u,v) Hessian stencils below.
+            let scalars_of = |pert: &Array1<f64>| -> (f64, f64, f64, f64) {
+                let q1_pert = q1 + pert[primary.q1];
+                let g_pert = g + pert[primary.g];
                 let bh_pert: Array1<f64> = Array1::from_iter((0..h_len).map(|i| {
-                    let idx = primary.h.as_ref().unwrap().start + i;
-                    beta_h[i] + t1 * dir1[idx] + t2 * dir2[idx]
+                    beta_h[i] + pert[primary.h.as_ref().unwrap().start + i]
                 }));
                 let bw_pert: Array1<f64> = Array1::from_iter((0..w_len).map(|i| {
-                    let idx = primary.w.as_ref().unwrap().start + i;
-                    beta_w[i] + t1 * dir1[idx] + t2 * dir2[idx]
+                    beta_w[i] + pert[primary.w.as_ref().unwrap().start + i]
                 }));
                 let a_pert = family
                     .solve_row_survival_intercept_with_slot(
@@ -3778,16 +3779,57 @@ mod moment_engine_tests {
 
             let hq = 2.0e-3_f64;
             let ht = 3.0e-3_f64;
-            // ∂²_q1 D_dir1 D_dir2 of a selected scalar (q1-Hessian via the dq1 stencil,
-            // directional second-cross via the (t1,t2) 2×2 stencil).
-            let mixed_uvuv = |sel: &dyn Fn((f64, f64, f64, f64)) -> f64| -> f64 {
-                let hess_q = |t1: f64, t2: f64| -> f64 {
-                    (sel(scalars_of(hq, t1, t2)) - 2.0 * sel(scalars_of(0.0, t1, t2))
-                        + sel(scalars_of(-hq, t1, t2)))
-                        / (hq * hq)
+            // Build the per-primary perturbation vector for a stencil point:
+            // su·e_u + sv·e_v + t1·dir1 + t2·dir2 (u and v may coincide → su,sv add).
+            let pert_vec = |su: f64, u: usize, sv: f64, v: usize, t1: f64, t2: f64| -> Array1<f64> {
+                let mut pert = &dir1 * t1 + &dir2 * t2;
+                pert[u] += su;
+                pert[v] += sv;
+                pert
+            };
+            // The mixed bidirectional Hessian entry [u,v] of the observed scalars
+            // (a, eta_obs, chi_obs, D) all at once: ∂_u ∂_v (D_dir1 D_dir2 ·). For u==v
+            // a ∂²_u 3-point stencil; for u!=v the 2×2 cross stencil. The directional
+            // second cross is the outer 2×2 over (t1,t2) — a 4×4 stencil product
+            // (Hessian × directional). Returns one tuple so the four scalars share the
+            // (expensive) intercept solves.
+            let mixed = |u: usize, v: usize| -> (f64, f64, f64, f64) {
+                let acc =
+                    |w: f64, su: f64, sv: f64, t1: f64, t2: f64, out: &mut (f64, f64, f64, f64)| {
+                        let s = scalars_of(&pert_vec(su, u, sv, v, t1, t2));
+                        out.0 += w * s.0;
+                        out.1 += w * s.1;
+                        out.2 += w * s.2;
+                        out.3 += w * s.3;
+                    };
+                let hess_uv = |t1: f64, t2: f64| -> (f64, f64, f64, f64) {
+                    let mut o = (0.0, 0.0, 0.0, 0.0);
+                    if u == v {
+                        acc(1.0, hq, 0.0, t1, t2, &mut o);
+                        acc(-2.0, 0.0, 0.0, t1, t2, &mut o);
+                        acc(1.0, -hq, 0.0, t1, t2, &mut o);
+                        let inv = 1.0 / (hq * hq);
+                        (o.0 * inv, o.1 * inv, o.2 * inv, o.3 * inv)
+                    } else {
+                        acc(1.0, hq, hq, t1, t2, &mut o);
+                        acc(-1.0, hq, -hq, t1, t2, &mut o);
+                        acc(-1.0, -hq, hq, t1, t2, &mut o);
+                        acc(1.0, -hq, -hq, t1, t2, &mut o);
+                        let inv = 1.0 / (4.0 * hq * hq);
+                        (o.0 * inv, o.1 * inv, o.2 * inv, o.3 * inv)
+                    }
                 };
-                (hess_q(ht, ht) - hess_q(ht, -ht) - hess_q(-ht, ht) + hess_q(-ht, -ht))
-                    / (4.0 * ht * ht)
+                let a = hess_uv(ht, ht);
+                let b = hess_uv(ht, -ht);
+                let c = hess_uv(-ht, ht);
+                let d = hess_uv(-ht, -ht);
+                let inv = 1.0 / (4.0 * ht * ht);
+                (
+                    (a.0 - b.0 - c.0 + d.0) * inv,
+                    (a.1 - b.1 - c.1 + d.1) * inv,
+                    (a.2 - b.2 - c.2 + d.2) * inv,
+                    (a.3 - b.3 - c.3 + d.3) * inv,
+                )
             };
 
             // Cross-check: the jet's lifted intercept a_uv_uv[q1,q1] (eps_del Hessian)
@@ -3802,19 +3844,35 @@ mod moment_engine_tests {
             };
             let a_jet_probe = lift_intercept_flex(&template4, a1, 1.0 / d_check, 4, residual_probe);
             let jet_a_uvuv = a_jet_probe.eps_del.h[primary.q1 * p + primary.q1];
-            let ref_a_uvuv = mixed_uvuv(&|t: (f64, f64, f64, f64)| t.0);
+
+            // Oracle matrices: every q1-row/column entry [u,v] (u==q1 OR v==q1) of the
+            // bidirectional (a, eta, chi, D) Hessians, where the hand §D moving-boundary
+            // flux is incomplete (gam#1454 — q1 is the exit-time moving Crossing edge, so
+            // its flux contributes to ALL q1-cross-derivatives, not just the self-block).
+            let mut o_eta = Array2::<f64>::zeros((p, p));
+            let mut o_chi = Array2::<f64>::zeros((p, p));
+            let mut o_d = Array2::<f64>::zeros((p, p));
+            let mut ref_a_uvuv = 0.0_f64;
+            for u in 0..p {
+                for v in 0..p {
+                    if u == primary.q1 || v == primary.q1 {
+                        let (a_uvuv, eta_uvuv, chi_uvuv, d_uvuv) = mixed(u, v);
+                        o_eta[[u, v]] = eta_uvuv;
+                        o_chi[[u, v]] = chi_uvuv;
+                        o_d[[u, v]] = d_uvuv;
+                        if u == primary.q1 && v == primary.q1 {
+                            ref_a_uvuv = a_uvuv;
+                        }
+                    }
+                }
+            }
             assert!(
                 (jet_a_uvuv - ref_a_uvuv).abs() <= 1e-3 * (1.0 + ref_a_uvuv.abs()),
                 "#932 PROBE a_uv_uv[q1,q1]: jet {jet_a_uvuv} != scalar-FD {ref_a_uvuv} \
                  (diff {})",
                 jet_a_uvuv - ref_a_uvuv,
             );
-
-            (
-                mixed_uvuv(&|t: (f64, f64, f64, f64)| t.1),
-                mixed_uvuv(&|t: (f64, f64, f64, f64)| t.2),
-                mixed_uvuv(&|t: (f64, f64, f64, f64)| t.3),
-            )
+            (o_eta, o_chi, o_d)
         };
 
         let cmp_vec = |label: &str, jet: &Vec<f64>, hand: &[f64]| {
@@ -3897,22 +3955,25 @@ mod moment_engine_tests {
         )
         .expect("generic jet4");
 
-        // Bidirectional eps_del Hessians vs hand — EXCEPT the [q1,q1] self-block,
-        // where the hand §D moving-boundary flux is still incomplete (gam#1454). There
-        // the scalar-FD oracle (probe-confirmed against the jet's lifted a_uv_uv) is
-        // authoritative, so [q1,q1] is asserted against `oracle_*_uvuv` at the FD
-        // tolerance and every other (u,v) against the hand at the tight tolerance.
+        // Bidirectional eps_del Hessians vs hand — EXCEPT every q1-row/column entry
+        // (u==q1 OR v==q1), where the hand §D moving-boundary flux is incomplete
+        // (gam#1454: q1 is the exit-time moving Crossing edge, so its flux corrupts ALL
+        // q1-cross-derivatives — the [q1,q1] self had the largest error but the [q1,u]
+        // cross blocks also exceed the tight hand tolerance). There the scalar-FD oracle
+        // (probe-confirmed against the jet's lifted a_uv_uv) is authoritative, asserted
+        // at the FD tolerance; every off-q1 (u,v) is asserted against the hand.
         let q = primary.q1;
-        let cmp_mat_oracle = |label: &str, jet: &Vec<f64>, hand: &Array2<f64>, oracle_qq: f64| {
+        let cmp_mat_oracle = |label: &str, jet: &Vec<f64>, hand: &Array2<f64>, oracle: &Array2<f64>| {
             for u in 0..p {
                 for v in 0..p {
-                    if u == q && v == q {
+                    if u == q || v == q {
+                        let o = oracle[[u, v]];
                         assert!(
-                            (jet[q * p + q] - oracle_qq).abs() <= 1e-3 * (1.0 + oracle_qq.abs()),
-                            "{label}[q1,q1] jet {} != scalar-FD oracle {} (hand {} is #1454-incomplete here)",
-                            jet[q * p + q],
-                            oracle_qq,
-                            hand[[q, q]],
+                            (jet[u * p + v] - o).abs() <= 1e-3 * (1.0 + o.abs()),
+                            "{label}[{u},{v}] jet {} != scalar-FD oracle {} (hand {} is #1454-incomplete on the q1 row/col)",
+                            jet[u * p + v],
+                            o,
+                            hand[[u, v]],
                         );
                     } else {
                         assert!(
@@ -3926,9 +3987,9 @@ mod moment_engine_tests {
                 }
             }
         };
-        cmp_mat_oracle("eta_uv_uv", &eta4.eps_del.h, &hand_bi.eta_uv_uv, oracle_eta_uvuv);
-        cmp_mat_oracle("chi_uv_uv", &chi4.eps_del.h, &hand_bi.chi_uv_uv, oracle_chi_uvuv);
-        cmp_mat_oracle("d_uv_uv", &d4.eps_del.h, &hand_bi.d_uv_uv, oracle_d_uvuv);
+        cmp_mat_oracle("eta_uv_uv", &eta4.eps_del.h, &hand_bi.eta_uv_uv, &oracle_eta_uvuv);
+        cmp_mat_oracle("chi_uv_uv", &chi4.eps_del.h, &hand_bi.chi_uv_uv, &oracle_chi_uvuv);
+        cmp_mat_oracle("d_uv_uv", &d4.eps_del.h, &hand_bi.d_uv_uv, &oracle_d_uvuv);
     }
 }
 
