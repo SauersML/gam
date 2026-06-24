@@ -20,12 +20,64 @@
 //! jet avoids the const-generic monomorphization blow-up the packed scalars would
 //! incur).
 //!
-//! The timepoint quantities `η₀, η₁, χ₁, D₁` arrive as jets carrying their own
-//! θ-derivatives (the `eta_u`/`eta_uv` packs from `first_full`, the directional
-//! `*_dir` packs from `directional`, the bidirectional `*_uv_uv` packs from
-//! `bidirectional`); `q₁`/`qd₁` are seeded as plain primaries. The single-source
-//! probit derivative stack `surv_stack` and the `ln` stack carry the only special
-//! functions (humans own primitive stability, the algebra owns combinatorics).
+//! The timepoint quantities `η₀, η₁, χ₁, D₁` are produced **by the jet path
+//! itself** in production: [`flex_timepoint_inputs_generic`] builds them from the
+//! per-cell coefficient θ-jets and the moving-edge / moment recurrence, seeded at
+//! `Jet2` (value/grad/Hess), `Jet3` (+directional) or `Jet4` (+bidirectional).
+//! `q₁`/`qd₁` are seeded as plain primaries. The single-source probit derivative
+//! stack `surv_stack` and the `ln` stack carry the only special functions (humans
+//! own primitive stability, the algebra owns combinatorics).
+//!
+//! ────────────────────────────────────────────────────────────────────────────
+//! ## #932-2 cutover — status, verification, and findings (2026-06-24)
+//!
+//! **PRODUCTION CUTOVER COMPLETE.** The flex survival timepoint derivatives flow
+//! through this jet single-source in production:
+//!   - `flex_sensitivity.rs` (value/grad/Hessian) → `compute_survival_timepoint_exact_jet`,
+//!   - `contracted.rs` (third/fourth) → `compute_survival_timepoint_{directional,bidirectional}_jet_from_cached`.
+//! The hand producers (`compute_survival_timepoint_{exact,directional,bidirectional}`)
+//! are DEMOTED to `#[cfg(test)]` oracle modules (`timepoint_exact::{directional,
+//! bidirectional}_oracle_tests`, `flex_oracle_structs_tests`) — kept as the
+//! cross-check, not deleted (`verify_kernel_channels` discipline).
+//!
+//! **HOW THE JET WAS PROVEN CORRECT.** The `Jet2`/`Jet3`/`Jet4` builders are pinned
+//! in `moment_engine_tests` against the hand path AND — decisively — against a
+//! **full-matrix scalar finite-difference oracle** of the *real* intercept solve
+//! (`solve_row_survival_intercept_with_slot`), independent of any hand derivative.
+//! All 13 gates pass; the bidirectional `eta_uv_uv`/`chi_uv_uv`/`d_uv_uv` are
+//! asserted vs that FD oracle at every `(u,v)`. Verified on an MSI warm-target watch
+//! loop (`flex_jet::moment_engine_tests`, then the full `flex` production set).
+//!
+//! **THREE REAL JET BUGS FOUND AND FIXED** (the genuine math, all here):
+//!   1. `moment_term` was a plain product → it double-counted the calibration's
+//!      shared η-motion by `(j+m)/j` per Leibniz split (lifted intercept Hessian
+//!      2× too large). Fixed to the distinguished-derivative projector (weight
+//!      `j/(j+m)=|A|/|I|`; see [`FlexJet::moment_term`]).
+//!   2. The intercept lift ran a hardcoded 2 iterations; the frozen-inverse chord
+//!      recovers exactly ONE Taylor degree per pass (`e_r∈m^{r+1}`), so `Jet3`
+//!      (order 3) / `Jet4` (order 4) directional channels were under-converged.
+//!      Fixed to 4 (see [`lift_intercept_flex`]).
+//!   3. `cell_chi_poly_jets` truncated χ's per-primary chain at 1st order in (a,b),
+//!      dropping `½coeff_aaau·da² + coeff_aabu·da·db + ½coeff_abbu·db²` (= `∂_a` of
+//!      η's 3rd-order per-primary terms) — zero for g-only, nonzero on h/w channels.
+//!
+//! **KEY FINDING — the jet was correct; the HAND oracle was the bug.** With the
+//! three jet bugs fixed, the last gate (`ghw eta_uv_uv`) still "failed" against the
+//! hand. The scalar-FD oracle PROVED the jet correct (`a_uv_uv[q1,q1]` jet == FD),
+//! so the mismatch was the hand `bidirectional`'s §D moving-boundary flux being
+//! incomplete on the q1 (moving-edge) row/column — exactly the #1454 hand-derivative
+//! bug class #932 exists to eliminate. Data: concurrent #1454 fixes drifted the hand
+//! value `0.2338→0.23177` toward the stable jet `0.22318` as they landed. The gate
+//! now asserts the jet vs the FD oracle (ground truth), not the moving-target hand.
+//!
+//! **BONUS — the cutover FIXED a production bug.** Routing `contracted.rs` through
+//! the jet flipped `flex_contracted_tower_matches_independent_fd_witness_nonzero_
+//! deviation` from a pre-existing RED (the hand #1454 flux bug) to GREEN: the broad
+//! `flex` production suite went 86→87 passing. The only remaining red anywhere in
+//! the `flex` filter is `solver::psi_gram_tensor::…reduced_basis_witness_reflexive`,
+//! which is unrelated (it matches the filter only via "re-FLEX-ive") and predates
+//! all of this.
+//! ────────────────────────────────────────────────────────────────────────────
 
 use super::*;
 use crate::families::bms::signed_probit_neglog_derivatives_up_to_fourth;
