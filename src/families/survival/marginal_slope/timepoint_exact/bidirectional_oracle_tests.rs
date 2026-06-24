@@ -233,7 +233,10 @@ impl SurvivalMarginalSlopeFamily {
                     let za_r = a_vel(part.right_edge);
                     let za_l = a_vel(part.left_edge);
                     // f_aa diagonal: DOUBLED a-axis flux + (a,a) self-flux.
-                    f_aa += 2.0 * super::first_full::moving_density_boundary_flux_a(entry, &da, b)
+                    f_aa += 2.0
+                        * super::first_full_exact_oracle_tests::moving_density_boundary_flux_a(
+                            entry, &da, b,
+                        )
                         + self_flux(za_r, za_r, za_l, za_l);
                     for u in 0..p {
                         let cu = fx.coeff_u[u].map(|value| -value);

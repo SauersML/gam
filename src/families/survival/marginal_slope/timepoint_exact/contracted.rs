@@ -69,14 +69,16 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
 
-        let (a0, d0) = self.solve_row_survival_intercept_with_slot(
+        // The intercept solve's density check `d0`/`d1` is recomputed inside the jet
+        // base builder (`evaluate_survival_denom_d`); only the intercepts are needed.
+        let (a0, _) = self.solve_row_survival_intercept_with_slot(
             q0,
             g,
             beta_h,
             beta_w,
             Some((row, SurvivalInterceptSlotKind::Entry)),
         )?;
-        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+        let (a1, _) = self.solve_row_survival_intercept_with_slot(
             q1,
             g,
             beta_h,
@@ -87,33 +89,14 @@ impl SurvivalMarginalSlopeFamily {
         let entry_cached = self.build_cached_partition(primary, a0, g, beta_h, beta_w)?;
         let exit_cached = self.build_cached_partition(primary, a1, g, beta_h, beta_w)?;
 
-        let entry = self.compute_survival_timepoint_exact_from_cached(
-            row,
-            primary,
-            q0,
-            primary.q0,
-            a0,
-            g,
-            d0,
-            beta_h,
-            beta_w,
-            o_infl,
-            false,
-            &entry_cached,
+        // #932-2 increment 3: the contracted BASE timepoint (value/grad/Hessian seed of
+        // the Jet3/Jet4 contraction) now comes from the single-source jet builder, not
+        // the hand `compute_survival_timepoint_exact_from_cached`.
+        let entry = self.compute_survival_timepoint_exact_jet_from_cached(
+            row, primary, q0, primary.q0, a0, g, beta_h, beta_w, o_infl, &entry_cached,
         )?;
-        let exit = self.compute_survival_timepoint_exact_from_cached(
-            row,
-            primary,
-            q1,
-            primary.q1,
-            a1,
-            g,
-            d1,
-            beta_h,
-            beta_w,
-            o_infl,
-            true,
-            &exit_cached,
+        let exit = self.compute_survival_timepoint_exact_jet_from_cached(
+            row, primary, q1, primary.q1, a1, g, beta_h, beta_w, o_infl, &exit_cached,
         )?;
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {
@@ -262,14 +245,16 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
 
-        let (a0, d0) = self.solve_row_survival_intercept_with_slot(
+        // Only the solved intercepts are needed; the jet base builder recomputes the
+        // density check internally.
+        let (a0, _) = self.solve_row_survival_intercept_with_slot(
             q0,
             g,
             beta_h,
             beta_w,
             Some((row, SurvivalInterceptSlotKind::Entry)),
         )?;
-        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+        let (a1, _) = self.solve_row_survival_intercept_with_slot(
             q1,
             g,
             beta_h,
@@ -280,33 +265,13 @@ impl SurvivalMarginalSlopeFamily {
         let entry_cached = self.build_cached_partition(&primary, a0, g, beta_h, beta_w)?;
         let exit_cached = self.build_cached_partition(&primary, a1, g, beta_h, beta_w)?;
 
-        let entry_base = self.compute_survival_timepoint_exact_from_cached(
-            row,
-            &primary,
-            q0,
-            primary.q0,
-            a0,
-            g,
-            d0,
-            beta_h,
-            beta_w,
-            o_infl,
-            false,
-            &entry_cached,
+        // #932-2 increment 3: contracted-fourth BASE timepoint via the single-source
+        // jet builder (replaces the hand `compute_survival_timepoint_exact_from_cached`).
+        let entry_base = self.compute_survival_timepoint_exact_jet_from_cached(
+            row, &primary, q0, primary.q0, a0, g, beta_h, beta_w, o_infl, &entry_cached,
         )?;
-        let exit_base = self.compute_survival_timepoint_exact_from_cached(
-            row,
-            &primary,
-            q1,
-            primary.q1,
-            a1,
-            g,
-            d1,
-            beta_h,
-            beta_w,
-            o_infl,
-            true,
-            &exit_cached,
+        let exit_base = self.compute_survival_timepoint_exact_jet_from_cached(
+            row, &primary, q1, primary.q1, a1, g, beta_h, beta_w, o_infl, &exit_cached,
         )?;
 
         if !exit_base.chi.is_finite() || exit_base.chi <= 0.0 {

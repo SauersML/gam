@@ -200,92 +200,12 @@ impl SurvivalMarginalSlopeFamily {
         })
     }
 
-    pub(crate) fn observed_fixed_eta_second_partial(
-        &self,
-        primary: &FlexPrimarySlices,
-        obs: &ObservedDenestedCellPartials,
-        row: usize,
-        u: usize,
-        v: usize,
-        z_obs: f64,
-        u_obs: f64,
-        a: f64,
-        b: f64,
-    ) -> Result<f64, String> {
-        let scale = self.probit_frailty_scale();
-        if u == primary.g && v == primary.g {
-            return Ok(eval_coeff4_at(&obs.dc_dbb, z_obs));
-        }
-        if u == primary.g {
-            if let Some(h_range) = primary.h.as_ref()
-                && v >= h_range.start
-                && v < h_range.end
-            {
-                let local_idx = v - h_range.start;
-                return Ok(eval_coeff4_at(
-                    &scale_coeff4(
-                        self.observed_score_basis_coefficients(row, local_idx, z_obs, 1.0)?,
-                        scale,
-                    ),
-                    z_obs,
-                ));
-            }
-            if let Some(w_range) = primary.w.as_ref()
-                && v >= w_range.start
-                && v < w_range.end
-            {
-                let local_idx = v - w_range.start;
-                let runtime = self
-                    .link_dev
-                    .as_ref()
-                    .ok_or_else(|| "missing survival link runtime".to_string())?;
-                let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-                let (_, dc_bw) =
-                    exact_kernel::link_basis_cell_coefficient_partials(basis_span, a, b);
-                return Ok(eval_coeff4_at(&scale_coeff4(dc_bw, scale), z_obs));
-            }
-        }
-        if v == primary.g {
-            return self
-                .observed_fixed_eta_second_partial(primary, obs, row, v, u, z_obs, u_obs, a, b);
-        }
-        Ok(0.0)
-    }
-
-    pub(crate) fn observed_fixed_chi_second_partial(
-        &self,
-        primary: &FlexPrimarySlices,
-        obs: &ObservedDenestedCellPartials,
-        u: usize,
-        v: usize,
-        z_obs: f64,
-        u_obs: f64,
-        a: f64,
-        b: f64,
-    ) -> Result<f64, String> {
-        let scale = self.probit_frailty_scale();
-        if u == primary.g && v == primary.g {
-            return Ok(eval_coeff4_at(&obs.dc_dabb, z_obs));
-        }
-        if u == primary.g
-            && let Some(w_range) = primary.w.as_ref()
-            && v >= w_range.start
-            && v < w_range.end
-        {
-            let local_idx = v - w_range.start;
-            let runtime = self
-                .link_dev
-                .as_ref()
-                .ok_or_else(|| "missing survival link runtime".to_string())?;
-            let basis_span = runtime.basis_cubic_at(local_idx, u_obs)?;
-            let (_, dc_abw, _) = exact_kernel::link_basis_cell_second_partials(basis_span, a, b);
-            return Ok(eval_coeff4_at(&scale_coeff4(dc_abw, scale), z_obs));
-        }
-        if v == primary.g {
-            return self.observed_fixed_chi_second_partial(primary, obs, v, u, z_obs, u_obs, a, b);
-        }
-        Ok(0.0)
-    }
+    // #932-2 increment 3: `observed_fixed_eta_second_partial` /
+    // `observed_fixed_chi_second_partial` (the FIXED g×h / g×w second-partial channels
+    // of the hand timepoint Hessian) feed ONLY the now test-only hand oracle — the
+    // production jet path single-sources these cross channels through the multivariate
+    // `flex_jet::cell_coeff_jets` / `cell_chi_poly_jets`. Moved to the test-masked
+    // `flex_oracle_structs_tests` module.
 
     pub(crate) fn evaluate_survival_denom_d(
         &self,
