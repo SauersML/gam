@@ -721,3 +721,81 @@ Pending:
   3. **Items 1–5 are an inseparable package.** Because the pack architecture (`eta/chi/d` → `block10_pack_*` → `gpu::cpu_oracle_third/fourth_contraction`, the single source **shared with the GPU dispatch path**, `contracted.rs:195–217`) assembles the contraction from matrix packs, you cannot drop in Item 1 (IFT via `implicit_solve`) alone — it only fits once `row_nll` is generic and the Block-10 assembler + ≈7 consumers in `joint_eval.rs`/`newton_operators.rs`/`psi_terms.rs` are replaced.
 
   **Real path:** build a `JetScalar<K>`-generic *de-nested moment engine* (the sextic moment reduction + cell-coefficient θ-jets expressed over packed scalars), compose the NLL (`flex_sensitivity.rs:105–112` formula) once over it, then route third/fourth through `OneSeed/TwoSeed` — at which point `directional.rs`/`bidirectional.rs`/the Block-10 contraction and the 4,720 hand lines retire, pinned channel-by-channel against the current path by `verify_kernel_channels`. This is a scoped multi-pass build with the oracle green at each step — not a single blind landing (the #736/#1454 regression class).
+
+---
+
+## F. Algebraic contracts — rigorous derivations (2026-06-23)
+
+The flex single-source rests on four identities where ordinary product-rule
+intuition is insufficient. These are the contracts the `FlexJet` algebra
+(`timepoint_exact/flex_jet.rs`) must satisfy; each is verified channel-by-channel
+against an independent oracle.
+
+### F.1 The calibration `moment_term` is a distinguished-derivative projector
+
+The calibration residual `R = ∫ η e^{−q} = Σ_k C_k M_k` has derivatives whose
+LEAD index is forced onto the coefficient η (`∂_θ R = ∫ η_θ e^{−q}`). Because the
+moment carries the `e^{−q}` motion (`M_a = −∫ z^k η η_a e^{−q}`), an ordinary jet
+product `tangent(C)·M` double-counts the shared η-motion. The exact operation
+averages over which derivative slot is the distinguished (lead) one; a split
+`C_A M_B` survives iff the lead slot lies in `A` (probability `|A|/|I|`):
+
+```text
+  P_I(C,M) = Σ_{A⊔B=I, A≠∅}  (|A|/|I|)  C_A M_B          (weight j/(j+m), j=|A|).
+```
+
+Orders 1–4 (realised by `Jet2::moment_term` / `jet2_moment_eps` / `jet2_moment_eps_del`):
+
+```text
+  P_i    = C_i M
+  P_ij   = C_ij M + ½(C_i M_j + C_j M_i)
+  P_ijk  = C_ijk M + ⅔ Σ C_ij M_k + ⅓ Σ C_i M_jk
+  P_ijkl = C_ijkl M + ¾ Σ C_ijk M_l + ½ Σ C_ij M_kl + ¼ Σ C_i M_jkl
+```
+
+Along a scalar path this collapses to `P_n = Σ_j binom(n−1,j−1) C^(j)M^(n−j) =
+d^(n−1)/dt^(n−1)(C′M)`, since `binom(n,j)·(j/n) = binom(n−1,j−1)`. So `½ / ⅔,⅓ /
+¾,½,¼` are `binom(n−1,j−1)/binom(n,j)`, not empirical fudge factors. Ordinary
+`mul` over-counts each `(j,m)` split by `(j+m)/j` (e.g. doubles the `C_i M_j`
+Hessian term) — the bug behind the gam#932 base-channel factor-2.
+
+### F.2 Fourth-order moving-boundary sliver
+
+`M_n = ∫_{L(θ)}^{R(θ)} z^n e^{−q} dz` splits into a fixed-domain interior dot
+`Σ_m S_m M_{n+m}` plus an edge sliver per moving limit. With `δ = z_E − z_E0`
+(value 0) and `g = z^n e^{−q}`,
+
+```text
+  S = ∫_{z_E0}^{z_E} g dz = g δ + ½ g_z δ² + ⅙ g_zz δ³ + (1/24) g_zzz δ⁴      (δ⁵ = 0).
+```
+
+Crossing edge `b z = τ − a` gives the per-order `z^(n)` recursion automatically by
+evaluating `z = (τ−a)/b` in the jet algebra (`z_4 = (τ_4 − a_4 − 4b_1 z_3 − 6b_2 z_2
+− 4b_3 z_1 − b_4 z)/b`). The spatial stack is `g_z = (n/z − q_z)g`,
+`g_zz = (A²+A′)g`, `g_zzz = (A³+3AA′+A″)g` with `A = n/z − q_z`,
+`q_z = z + η η_z`, `q_zz = 1 + η_z² + η η_zz`, `q_zzz = 3η_z η_zz + η η_zzz`.
+The singularity-free polynomial form `g_z = e^{−q}(n z^{n−1} − q_z z^n)`, … is
+preferred near `z_E0 = 0`. Because the four terms are jet PRODUCTS, the full
+`S'''' = G_0 d_4 + 4G_0^[1] d_3 + 6G_0^[2] d_2 + 4G_0^[3] d_1 + 4G_1 d_1 d_3
++ 3G_1 d_2² + 12G_1^[1] d_1 d_2 + 6G_1^[2] d_1² + 6G_2 d_1² d_2 + 4G_2^[1] d_1³ +
+G_3 d_1⁴` (with `d_k = δ^(k)`, `G_r^[s] = ∂_t^s ∂_z^r g`) falls out — a 4th-order
+crossing-edge mismatch is therefore NOT uniquely `g_zzz δ⁴`; it may be a wrong
+`z_4` or a cross channel (`G_1^[2] d_1²`, `G_2^[1] d_1³`).
+
+### F.3 Moment-degree budget `n_max + 6p`
+
+`e^{−q(θ)} = e^{−q0}·e^{−Δq}` with `e^{−Δq} = Σ_{k≤p} (−Δq)^k/k!` exact (`−Δq`
+nilpotent). η cubic ⇒ `deg_z Δq ≤ 6` ⇒ `deg_z S ≤ 6p`, so the interior dot reaches
+`M_{n+6p}`. An order-`p` jet for `M_n` needs numeric base moments through
+`n + 6p`: for `p=4`, `n≤4 → M_28`, `n≤3 → M_27`. The cached partition builds to 32.
+
+### F.4 The implicit lift needs exactly `p` frozen-inverse iterations
+
+`A_{r+1} = A_r − R(A_r)/F_a(a0,0)` (FROZEN scalar inverse — a chord step, not true
+Newton). With `m` the nilpotent ideal (`m^{p+1}=0`) and `e_r = A_r − a*`:
+`e_{r+1} = (1 − inv_fa·F_a(a*,θ))e_r + O(e_r²)`. The constant part of `1 −
+inv_fa·F_a` vanishes (`inv_fa·F_a(a0,0)=1`), so `1 − inv_fa·F_a ∈ m` and `e_r² ∈
+m^{2k} ⊆ m^{k+1}`; hence `e_r ∈ m^k ⟹ e_{r+1} ∈ m^{k+1}`. Seed `e_0 ∈ m`, so
+`e_r ∈ m^{r+1}` and `e_p = 0`: **one Taylor degree recovered per iteration.** Thus
+`Jet2→2, Jet3→3, Jet4→4`, extra passes are exact no-ops, and a hardcoded `2`
+under-iterates the Jet3/Jet4 mixed intercept derivatives (gam#932).
