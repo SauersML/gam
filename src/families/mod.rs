@@ -6,6 +6,7 @@ pub(crate) mod coefficient_cost;
 pub mod cubic_cell_kernel;
 pub mod custom_family;
 pub mod family_runtime;
+pub(crate) mod fast_channel;
 pub(crate) mod fnv1a;
 pub mod gamlss;
 pub mod inverse_link;

@@ -35,6 +35,8 @@
 //! `verify_kernel_channels` discipline — the hand calculus is the witness, the
 //! tower is the single source of truth).
 
+use crate::families::fast_channel::{faa_top2, faa_top3, faa_top4};
+
 #[inline]
 pub(crate) fn hessian_coeff_fromobjective_q_terms(
     m1: f64,
@@ -43,14 +45,13 @@ pub(crate) fn hessian_coeff_fromobjective_q_terms(
     q_b: f64,
     q_ab: f64,
 ) -> f64 {
-    // F = -sum ell, scalar q:
-    //   H_ab = m2 * q_a q_b + m1 * q_ab.
-    //
-    // Hot inner-Newton path: kept as the hand-tuned closed form. The
-    // `Tower2<2>` composition `compose([·, m1, m2]).h[a][b]` produces the exact
-    // same value (pinned in `oracle_tests::hessian_matches_tower`); the hand spelling
-    // avoids building a 2-variable tower per row per inner iterate.
-    m2 * q_a * q_b + m1 * q_ab
+    // #932 unified source: `H_ab = ∂²(F∘q)/∂a∂b` is the fully-mixed order-2 top
+    // channel of the composition, so it IS `fast_channel::faa_top2` — the
+    // universal Faà di Bruno partition sum `m₂·q_a q_b + m₁·q_ab`. No
+    // per-family chain rule; the primitive is pinned to the runtime partition
+    // walker in `fast_channel`, and compiles to the same straight line as the
+    // closed form (a packed order-2 dual matched hand asm).
+    faa_top2([m1, m2], &[0.0, q_a, q_b, q_ab])
 }
 
 #[inline]
@@ -66,20 +67,19 @@ pub(crate) fn directionalhessian_coeff_fromobjective_q_terms(
     dq_b: f64,
     dq_ab: f64,
 ) -> f64 {
-    // #932: `D_u H_ab` is the order-3 mixed channel of `F(q(θ))` in the three
-    // distinct directions (a, b, u). The SINGLE SOURCE is the `Tower4<3>` jet
-    // compose `q.compose_unary([·,m1,m2,m3]).t3[a][b][u]` (see
-    // `oracle_tests::tower_order3`). But a dense `Tower4<3>` materializes all
-    // 3⁴ tensor channels to read ONE — measured at ~19× the hand factorization
-    // in optimized asm (983 vs 52 x86 instructions). This is a per-row
-    // production coefficient, so it carries the hand-factored straight-line
-    // form, pinned BIT-FOR-BIT against the jet single source in
-    // `oracle_tests::directional_matches_jet_single_source`. The jet is the
-    // truth; the hand spelling is the compiled form. (#932 "fast as hand": no
-    // general jet representation reads a single high-order channel within ~4.5×
-    // of the hand factorization — the dense tower is 19×, a seed-folded
-    // multilinear dual 4.5× — so the hot path keeps the hand form + oracle.)
-    m3 * dq * q_a * q_b + m2 * (dq_a * q_b + q_a * dq_b + dq * q_ab) + m1 * dq_ab
+    // #932 unified source: `D_u H_ab = ∂³(F∘q)/∂a∂b∂u` is the fully-mixed
+    // order-3 top channel, so it IS `fast_channel::faa_top3` — the universal
+    // partition sum over the three distinct directions {a, b, u}. Pack the
+    // q-map block partials into the bitmask array (a=1, b=2, u=4) and read the
+    // top channel. This is the SAME jet truth as `Tower4<3>::compose.t3[a][b][u]`
+    // (pinned in `oracle_tests`) but computes ONLY the read channel as a
+    // compile-time-unrolled sum — measured at ~hand instruction count, vs ~19×
+    // for the dense tower that materializes the whole 3⁴ tensor.
+    let q = [
+        0.0, q_a, q_b, q_ab, // _, a, b, ab
+        dq, dq_a, dq_b, dq_ab, // u, au, bu, abu
+    ];
+    faa_top3([m1, m2, m3], &q)
 }
 
 #[inline]
@@ -104,23 +104,23 @@ pub(crate) fn second_directionalhessian_coeff_fromobjective_q_terms(
     dq_abv: f64,
     d2q_ab_uv: f64,
 ) -> f64 {
-    // #932: `D²_{uv} H_ab` is the order-4 mixed channel of `F(q(θ))` in the four
-    // distinct directions (a, b, u, v). The SINGLE SOURCE is the `Tower4<4>`
-    // jet compose `q.compose_unary([·,m1,m2,m3,m4]).t4[a][b][u][v]` (see
-    // `oracle_tests::tower_order4`); a dense `Tower4<4>` materializes all 4⁴
-    // tensor channels to read ONE, ~19× the hand factorization in optimized asm.
-    // Per-row production coefficient → hand-factored straight-line form, pinned
-    // bit-for-bit against the jet single source in
-    // `oracle_tests::second_directional_matches_jet_single_source`. The single
-    // `dq_u·dqv·q_ab` term (which an even-older hand path once DOUBLE-counted)
-    // appears exactly once below; the jet oracle is what guarantees it.
-    let d_qaqb_u = dq_a_u * q_b + q_a * dq_b_u;
-    let d_qaqbv = dq_av * q_b + q_a * dq_bv;
-    let d2_qaqb_uv = d2q_a_uv * q_b + dq_a_u * dq_bv + dq_av * dq_b_u + q_a * d2q_b_uv;
-    m4 * dq_u * dqv * q_a * q_b
-        + m3 * (d2q_uv * q_a * q_b + dq_u * d_qaqbv + dqv * d_qaqb_u + dq_u * dqv * q_ab)
-        + m2 * (d2_qaqb_uv + d2q_uv * q_ab + dq_u * dq_abv + dqv * dq_ab_u)
-        + m1 * d2q_ab_uv
+    // #932 unified source: `D²_{uv} H_ab = ∂⁴(F∘q)/∂a∂b∂u∂v` is the fully-mixed
+    // order-4 top channel, so it IS `fast_channel::faa_top4` — the universal
+    // partition sum over the four distinct directions {a, b, u, v}. Pack the
+    // q-map block partials into the bitmask array (a=1, b=2, u=4, v=8) and read
+    // the top channel. Same jet truth as `Tower4<4>::compose.t4[a][b][u][v]`
+    // (pinned in `oracle_tests`) but computes ONLY that channel as a
+    // compile-time-unrolled 15-term sum — measured at ≤ hand instruction count,
+    // vs ~19× for the dense tower. The single `dq_u·dqv·q_ab` term an even-older
+    // hand path once DOUBLE-counted is one partition (`{u}{v}` over the `q_ab`
+    // block) the universal rule emits exactly once.
+    let q = [
+        0.0, q_a, q_b, q_ab, // _, a, b, ab
+        dq_u, dq_a_u, dq_b_u, dq_ab_u, // u, au, bu, abu
+        dqv, dq_av, dq_bv, dq_abv, // v, av, bv, abv
+        d2q_uv, d2q_a_uv, d2q_b_uv, d2q_ab_uv, // uv, auv, buv, abuv
+    ];
+    faa_top4([m1, m2, m3, m4], &q)
 }
 
 #[cfg(test)]
