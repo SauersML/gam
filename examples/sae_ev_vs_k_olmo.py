@@ -155,6 +155,17 @@ def _fit_ev(
             f"{topology} K={k} held-out reconstruct exceeded wall-clock guard: "
             f"{reconstruct_seconds:.1f}s > {max_reconstruct_seconds:.1f}s"
         )
+    # #1026 IN-SAMPLE probe: reconstruct the SAME train rows (same order ⇒ the
+    # hybrid-split collapse-rescue's train-indexed fresh codes align) to isolate
+    # whether the curved fit's collapse is repaired in-sample, separately from the
+    # held-out generalization (which still needs the OOS coordinate projection).
+    try:
+        fitted_train = m.reconstruct(z_tr)
+        train_ev = _ev(z_tr, fitted_train)
+    except Exception as exc:  # noqa: BLE001 - diagnostic only, never fail the fit
+        train_ev = float("nan")
+        print(f"[{topology} K={k}] train-EV probe failed: {exc}", flush=True)
+    print(f"[{topology} K={k}] IN_SAMPLE_EV={train_ev:.4f}  held_out_EV={_ev(z_te, fitted_test):.4f}", flush=True)
     hybrid_split = getattr(m, "hybrid_split", None)
     atom_topologies = [str(v) for v in getattr(m, "atom_topologies", [])]
     return (
