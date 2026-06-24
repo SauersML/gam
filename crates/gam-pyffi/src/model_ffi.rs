@@ -2252,6 +2252,42 @@ fn basis_with_jet<'py>(
                 penalty.into_pyarray(py).unbind(),
             ))
         }
+        "linear" | "affine" | "linear_rank1" => {
+            // A genuinely linear (rank-1 affine) atom carries the curve γ(t)=t·b,
+            // so each coordinate axis IS its own basis function: φ(t)=t with a
+            // constant identity input-derivative and no curvature to penalize.
+            // For the scalar SAE projection (d=1) this is the single-column design
+            // φ=t, jet ∂φ/∂t=1, penalty=[0] — exactly the M_k=1 linear comparison
+            // arm the #1026 EV-vs-K ladder fits against the curved atom.
+            let coords = t.as_array();
+            if coords.iter().any(|value| !value.is_finite()) {
+                return Err(py_value_error(
+                    "basis_with_jet linear basis requires finite t values".to_string(),
+                ));
+            }
+            let n_rows = coords.nrows();
+            let d = coords.ncols();
+            if d == 0 {
+                return Err(py_value_error(
+                    "basis_with_jet linear basis requires t with at least one column".to_string(),
+                ));
+            }
+            let phi = coords.to_owned();
+            let mut jet = Array3::<f64>::zeros((n_rows, d, d));
+            for row in 0..n_rows {
+                for axis in 0..d {
+                    jet[[row, axis, axis]] = 1.0;
+                }
+            }
+            // Linear functions lie entirely in the smoothing nullspace: no
+            // second-derivative energy, hence a zero curvature penalty.
+            let penalty = Array2::<f64>::zeros((d, d));
+            Ok((
+                phi.into_pyarray(py).unbind(),
+                jet.into_pyarray(py).unbind(),
+                penalty.into_pyarray(py).unbind(),
+            ))
+        }
         other => Err(py_value_error(format!(
             "basis_with_jet unsupported basis kind {other:?}"
         ))),
