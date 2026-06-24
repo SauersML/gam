@@ -2169,6 +2169,7 @@ impl SurvivalMarginalSlopeFamily {
             eta_uv_uv,
             chi_uv_uv,
             d_uv_uv,
+            cal_ad12_out: cal_ad12,
         })
     }
 }
