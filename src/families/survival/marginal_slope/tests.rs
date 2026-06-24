@@ -2841,26 +2841,6 @@ fn flex_bidirectional_fourth_localizer() {
                 );
             }
         }
-        // #1454: is auvd12 (intercept Hessian 2nd mixed directional) correct at the
-        // q0-row gate blocks? FD it vs a 2D central diff of base a_uv.
-        for &(label, q, q_index) in &[("entry", q0v, primary.q0), ("exit", q1v, primary.q1)] {
-            let bi = bi_at(q, q_index);
-            let hh = 3e-3_f64;
-            let pp = base_2d(q, q_index, hh, hh);
-            let pm = base_2d(q, q_index, hh, -hh);
-            let mp = base_2d(q, q_index, -hh, hh);
-            let mm = base_2d(q, q_index, -hh, -hh);
-            for &(u, v) in &[(0usize, 0usize), (0, 3), (0, 6), (3, 3), (3, 6)] {
-                let fd = (pp.a_uv[[u, v]] - pm.a_uv[[u, v]] - mp.a_uv[[u, v]]
-                    + mm.a_uv[[u, v]])
-                    / (4.0 * hh * hh);
-                let got = bi.auvd12[[u, v]];
-                eprintln!(
-                    "#1454 AUVD12CHK {label}[{u},{v}] analytic {got:+.6e} fd2 {fd:+.6e} abserr {:.3e}",
-                    (got - fd).abs()
-                );
-            }
-        }
     }
 
     let h_fd = 2e-3;
@@ -8297,4 +8277,3 @@ fn rigid_survival_all_axes_build_once_equals_per_axis_sweep_979() {
         }
     }
 }
-
