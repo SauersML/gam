@@ -288,6 +288,26 @@ impl FlexJet for Jet2 {
             h: self.h.iter().map(|&x| x * s).collect(),
         }
     }
+    fn moment_term(&self, m: &Self) -> Self {
+        // `self` = c_k (value stripped here, only θ-derivatives enter the residual),
+        // `m` = M_k. The exact residual term keeps the j/(j+m) Leibniz weights:
+        //   R.g[i]    = c_g[i]·M_v                                   (j=1: weight 1)
+        //   R.h[i][j] = c_h[i][j]·M_v                                (j=2: weight 1)
+        //             + ½·(c_g[i]·M_g[j] + c_g[j]·M_g[i])            (j=1,m=1: weight ½)
+        let p = self.p();
+        let mut g = vec![0.0; p];
+        let mut h = vec![0.0; p * p];
+        for i in 0..p {
+            g[i] = self.g[i] * m.v;
+        }
+        for i in 0..p {
+            for j in 0..p {
+                h[i * p + j] =
+                    self.h[i * p + j] * m.v + 0.5 * (self.g[i] * m.g[j] + self.g[j] * m.g[i]);
+            }
+        }
+        Jet2 { v: 0.0, g, h }
+    }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
         // Order-≤2 reads only [f, f', f''].
         let p = self.p();
