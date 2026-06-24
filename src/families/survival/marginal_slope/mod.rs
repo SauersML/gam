@@ -50,7 +50,7 @@ pub(crate) use crate::families::jet_partitions::MultiDirJet;
 pub(crate) use crate::families::survival::lognormal_kernel::FrailtySpec;
 
 pub(crate) use crate::families::marginal_slope_shared::{
-    CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
+    DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
     add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
     build_denested_partition_cells as shared_denested_partition_cells, chunked_row_reduction,
     directional_obj_grad_hess, eval_coeff4_at, is_sigma_aux_index as shared_is_sigma_aux_index,

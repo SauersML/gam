@@ -459,7 +459,7 @@ impl SaeManifoldOuterObjective {
             .and_then(|fit| reconstruction_explained_variance(target.view(), fit.view()));
         let mut anchor_term = fitted.clone();
         anchor_term.set_homotopy_eta(0.0).ok();
-        let mut anchor_rho = fitted_rho.clone();
+        let anchor_rho = fitted_rho.clone();
         let anchor_solved = anchor_term
             .reml_criterion_with_cache(
                 target.view(),
