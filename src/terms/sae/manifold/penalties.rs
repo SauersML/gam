@@ -211,15 +211,27 @@ impl SaeManifoldTerm {
     // decoders — so value / gradient / Hessian never desync across the line
     // search.
 
-    /// #1026/#1522 — normalized coactivation matrix
-    /// `q_jk = (Σ_i a_ij a_ik)/sqrt(Σa_ij²·Σa_ik²) ∈ [0,1]` from the current soft
-    /// assignment `a` (the gate matrix). `q_jj = 1`; a column with zero energy
-    /// gives `q = 0` for all its pairs (no coactivation ⇒ no separation force).
-    pub(crate) fn barrier_normalized_coactivation(&self) -> Array2<f64> {
+    /// #1026/#1522 — SPARSE normalized coactivation: the list of `(j, k, q_jk)`
+    /// for `j < k` whose normalized coactivation `q_jk > 0`, i.e. the atom pairs
+    /// that actually co-fire on at least one row. This is the separation barrier's
+    /// only input — every pair with `q_jk = 0` is a strict no-op, so enumerating
+    /// the co-active pairs directly is exactly equivalent to forming the full
+    /// `q_jk = (Σ_i a_ij a_ik)/sqrt(Σa_ij²·Σa_ik²)` matrix and skipping its zeros,
+    /// while avoiding the `O(K²·N)` dense build that is fatal at large K (K=32768).
+    ///
+    /// The numerator `Σ_i a_ij a_ik` for each pair is accumulated in increasing
+    /// row order, so each returned `q_jk` equals the full-matrix entry to the last
+    /// bit. Cost is `O(N·K)` to read the gates plus `O(Σ_row active_row²)` over the
+    /// per-row support; for a sparse (top-k / JumpReLU) assignment the support is
+    /// tiny so this is `O(N·active²)`, linear in the number of co-active pairs.
+    pub(crate) fn barrier_coactive_pairs(&self) -> Vec<(usize, usize, f64)> {
         let k_atoms = self.k_atoms();
+        if k_atoms < 2 {
+            return Vec::new();
+        }
         let gates = self.assignment.assignments();
         let n = gates.nrows();
-        // Per-column energy Σ_i a_ik².
+        // Per-column energy Σ_i a_ik² (same as the dense path).
         let mut energy = vec![0.0_f64; k_atoms];
         for k in 0..k_atoms {
             let mut e = 0.0;
@@ -229,18 +241,36 @@ impl SaeManifoldTerm {
             }
             energy[k] = e;
         }
-        let mut q = Array2::<f64>::zeros((k_atoms, k_atoms));
-        for j in 0..k_atoms {
+        // Sparse numerator: accumulate Σ_i a_ij a_ik only over the pairs that
+        // co-fire, visiting rows in increasing order so each pair's running sum
+        // matches the dense `Σ_row` loop bit-for-bit.
+        let mut num: std::collections::BTreeMap<(usize, usize), f64> =
+            std::collections::BTreeMap::new();
+        let mut active: Vec<usize> = Vec::new();
+        for row in 0..n {
+            active.clear();
             for k in 0..k_atoms {
-                let mut s = 0.0;
-                for row in 0..n {
-                    s += gates[[row, j]] * gates[[row, k]];
+                if gates[[row, k]] != 0.0 {
+                    active.push(k);
                 }
-                let denom = (energy[j] * energy[k]).sqrt();
-                q[[j, k]] = if denom > 0.0 { s / denom } else { 0.0 };
+            }
+            for ai in 0..active.len() {
+                let j = active[ai];
+                let gj = gates[[row, j]];
+                for &k in &active[ai + 1..] {
+                    *num.entry((j, k)).or_insert(0.0) += gj * gates[[row, k]];
+                }
             }
         }
-        q
+        let mut pairs = Vec::with_capacity(num.len());
+        for ((j, k), s) in num {
+            let denom = (energy[j] * energy[k]).sqrt();
+            let qjk = if denom > 0.0 { s / denom } else { 0.0 };
+            if qjk > 0.0 {
+                pairs.push((j, k, qjk));
+            }
+        }
+        pairs
     }
 
     /// #1026/#1522 AMPLITUDE barrier value
@@ -281,26 +311,19 @@ impl SaeManifoldTerm {
         }
         let eps = SAE_SEPARATION_BARRIER_EPS;
         let floor2 = SAE_BARRIER_ACTIVE_NORM_FLOOR * SAE_BARRIER_ACTIVE_NORM_FLOOR;
-        let q = self.barrier_normalized_coactivation();
         let norm_sq: Vec<f64> = self
             .atoms
             .iter()
             .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
             .collect();
         let mut acc = 0.0_f64;
-        for j in 0..k_atoms {
-            for k in (j + 1)..k_atoms {
-                if norm_sq[j] <= floor2 || norm_sq[k] <= floor2 {
-                    continue;
-                }
-                let qjk = q[[j, k]];
-                if qjk <= 0.0 {
-                    continue;
-                }
-                let c2 = self.barrier_cross_shape_energy(j, k) / (norm_sq[j] * norm_sq[k]);
-                let arg = (1.0 - c2 + eps).max(eps);
-                acc += -qjk * arg.ln();
+        for (j, k, qjk) in self.barrier_coactive_pairs() {
+            if norm_sq[j] <= floor2 || norm_sq[k] <= floor2 {
+                continue;
             }
+            let c2 = self.barrier_cross_shape_energy(j, k) / (norm_sq[j] * norm_sq[k]);
+            let arg = (1.0 - c2 + eps).max(eps);
+            acc += -qjk * arg.ln();
         }
         mu * acc
     }
@@ -476,89 +499,82 @@ impl SaeManifoldTerm {
         let floor2 = SAE_BARRIER_ACTIVE_NORM_FLOOR * SAE_BARRIER_ACTIVE_NORM_FLOOR;
         let p = self.output_dim();
         let offsets = self.beta_offsets();
-        let q = self.barrier_normalized_coactivation();
         let norm_sq: Vec<f64> = self
             .atoms
             .iter()
             .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
             .collect();
         let mut wrote = false;
-        for j in 0..k_atoms {
-            for k in (j + 1)..k_atoms {
-                if norm_sq[j] <= floor2 || norm_sq[k] <= floor2 {
-                    continue;
-                }
-                let qjk = q[[j, k]];
-                if qjk <= 0.0 {
-                    continue;
-                }
-                let bj = &self.atoms[j].decoder_coefficients;
-                let bk = &self.atoms[k].decoder_coefficients;
-                let (m_j, pj) = (bj.nrows(), bj.ncols());
-                let m_k = bk.nrows();
-                if pj != p || bk.ncols() != p {
-                    continue;
-                }
-                let nj2 = norm_sq[j];
-                let nk2 = norm_sq[k];
-                // Cross matrix M = B_j B_kᵀ (shape m_j × m_k).
-                let mut cross = Array2::<f64>::zeros((m_j, m_k));
-                for a in 0..m_j {
-                    for b in 0..m_k {
-                        let mut c = 0.0_f64;
-                        for o in 0..p {
-                            c += bj[[a, o]] * bk[[b, o]];
-                        }
-                        cross[[a, b]] = c;
-                    }
-                }
-                let g: f64 = cross.iter().map(|v| v * v).sum();
-                let c2 = g / (nj2 * nk2);
-                let alpha = mu * qjk / ((1.0 - c2 + eps).max(eps));
-                let inv = 1.0 / (nj2 * nk2);
-                let off_j = offsets[j];
-                let off_k = offsets[k];
-                // ∂P/∂B_j = 2α[ (M B_k)/(nj²nk²) - (c²/nj²) B_j ].
-                for a in 0..m_j {
-                    for o in 0..p {
-                        let mut mb = 0.0_f64;
-                        for b in 0..m_k {
-                            mb += cross[[a, b]] * bk[[b, o]];
-                        }
-                        let grad = 2.0 * alpha * (mb * inv - (c2 / nj2) * bj[[a, o]]);
-                        sys.gb[off_j + a * p + o] += grad;
-                    }
-                }
-                // ∂P/∂B_k = 2α[ (Mᵀ B_j)/(nj²nk²) - (c²/nk²) B_k ].
+        for (j, k, qjk) in self.barrier_coactive_pairs() {
+            if norm_sq[j] <= floor2 || norm_sq[k] <= floor2 {
+                continue;
+            }
+            let bj = &self.atoms[j].decoder_coefficients;
+            let bk = &self.atoms[k].decoder_coefficients;
+            let (m_j, pj) = (bj.nrows(), bj.ncols());
+            let m_k = bk.nrows();
+            if pj != p || bk.ncols() != p {
+                continue;
+            }
+            let nj2 = norm_sq[j];
+            let nk2 = norm_sq[k];
+            // Cross matrix M = B_j B_kᵀ (shape m_j × m_k).
+            let mut cross = Array2::<f64>::zeros((m_j, m_k));
+            for a in 0..m_j {
                 for b in 0..m_k {
+                    let mut c = 0.0_f64;
                     for o in 0..p {
-                        let mut mtb = 0.0_f64;
-                        for a in 0..m_j {
-                            mtb += cross[[a, b]] * bj[[a, o]];
-                        }
-                        let grad = 2.0 * alpha * (mtb * inv - (c2 / nk2) * bk[[b, o]]);
-                        sys.gb[off_k + b * p + o] += grad;
+                        c += bj[[a, o]] * bk[[b, o]];
                     }
+                    cross[[a, b]] = c;
                 }
-                wrote = true;
-                if !dense_beta_curvature {
-                    continue;
-                }
-                // Levenberg PSD majorizer: positive scalar on each atom's
-                // diagonal block, magnitude `2α c²/n_·²`, growing as c²→1.
-                let lev_j = 2.0 * alpha * c2 / nj2;
-                let lev_k = 2.0 * alpha * c2 / nk2;
-                if lev_j > 0.0 {
-                    for idx in 0..(m_j * p) {
-                        let g_i = off_j + idx;
-                        sys.hbb[[g_i, g_i]] += lev_j;
+            }
+            let g: f64 = cross.iter().map(|v| v * v).sum();
+            let c2 = g / (nj2 * nk2);
+            let alpha = mu * qjk / ((1.0 - c2 + eps).max(eps));
+            let inv = 1.0 / (nj2 * nk2);
+            let off_j = offsets[j];
+            let off_k = offsets[k];
+            // ∂P/∂B_j = 2α[ (M B_k)/(nj²nk²) - (c²/nj²) B_j ].
+            for a in 0..m_j {
+                for o in 0..p {
+                    let mut mb = 0.0_f64;
+                    for b in 0..m_k {
+                        mb += cross[[a, b]] * bk[[b, o]];
                     }
+                    let grad = 2.0 * alpha * (mb * inv - (c2 / nj2) * bj[[a, o]]);
+                    sys.gb[off_j + a * p + o] += grad;
                 }
-                if lev_k > 0.0 {
-                    for idx in 0..(m_k * p) {
-                        let g_i = off_k + idx;
-                        sys.hbb[[g_i, g_i]] += lev_k;
+            }
+            // ∂P/∂B_k = 2α[ (Mᵀ B_j)/(nj²nk²) - (c²/nk²) B_k ].
+            for b in 0..m_k {
+                for o in 0..p {
+                    let mut mtb = 0.0_f64;
+                    for a in 0..m_j {
+                        mtb += cross[[a, b]] * bj[[a, o]];
                     }
+                    let grad = 2.0 * alpha * (mtb * inv - (c2 / nk2) * bk[[b, o]]);
+                    sys.gb[off_k + b * p + o] += grad;
+                }
+            }
+            wrote = true;
+            if !dense_beta_curvature {
+                continue;
+            }
+            // Levenberg PSD majorizer: positive scalar on each atom's
+            // diagonal block, magnitude `2α c²/n_·²`, growing as c²→1.
+            let lev_j = 2.0 * alpha * c2 / nj2;
+            let lev_k = 2.0 * alpha * c2 / nk2;
+            if lev_j > 0.0 {
+                for idx in 0..(m_j * p) {
+                    let g_i = off_j + idx;
+                    sys.hbb[[g_i, g_i]] += lev_j;
+                }
+            }
+            if lev_k > 0.0 {
+                for idx in 0..(m_k * p) {
+                    let g_i = off_k + idx;
+                    sys.hbb[[g_i, g_i]] += lev_k;
                 }
             }
         }
