@@ -794,7 +794,7 @@ impl SaeManifoldTerm {
     /// difference of [`Self::amplitude_barrier_value`] in isolation (no data-fit,
     /// smoothness, or ARD mixed in). Returns `(value, grad)`.
     pub fn amplitude_barrier_value_and_grad_for_test(&self) -> (f64, Array1<f64>) {
-        let mut sys = ArrowSchurSystem::default();
+        let mut sys = ArrowSchurSystem::new(0, 0, self.beta_dim());
         sys.gb = Array1::<f64>::zeros(self.beta_dim());
         sys.hbb = Array2::<f64>::zeros((0, 0));
         self.add_sae_amplitude_barrier(&mut sys, 1.0, false);
@@ -806,7 +806,7 @@ impl SaeManifoldTerm {
     /// current decoders, with `penalty_scale = 1`. Same hermetic-seam purpose as
     /// [`Self::amplitude_barrier_value_and_grad_for_test`]. Returns `(value, grad)`.
     pub fn separation_barrier_value_and_grad_for_test(&self) -> (f64, Array1<f64>) {
-        let mut sys = ArrowSchurSystem::default();
+        let mut sys = ArrowSchurSystem::new(0, 0, self.beta_dim());
         sys.gb = Array1::<f64>::zeros(self.beta_dim());
         sys.hbb = Array2::<f64>::zeros((0, 0));
         self.add_sae_separation_barrier(&mut sys, 1.0, false);
