@@ -49,6 +49,76 @@ impl<'a> RemlState<'a> {
         self.compute_cost_with_ext_count(p, 0)
     }
 
+    /// Per-ρ-coordinate canonical keys in NATIVE (formula) order.
+    ///
+    /// `keys[i]` is a stable, formula-order-independent fingerprint of the
+    /// penalty coordinate that ρ-coordinate `i` controls. The outer REML driver
+    /// uses these to present an identical *canonical* coordinate layout to the
+    /// smoothing-parameter optimizer no matter which order the user wrote the
+    /// smooth terms / tensor margins — so the flat double-penalty REML valley is
+    /// resolved order-invariantly (#1538/#1539).
+    ///
+    /// Each key combines two formula-order-independent signatures:
+    ///
+    ///  1. The penalty's STRUCTURAL key (see
+    ///     [`super::reml_outer_engine::PenaltyCoordinate::canonical_structural_key`])
+    ///     — distinguishes a range block from its null-space ridge, and one
+    ///     tensor margin's penalty family from another.
+    ///  2. A DATA-dependent block signature: the outer REML gradient evaluated
+    ///     once at the symmetric reference ρ = 0 (all λ = 1). `g[i]` depends only
+    ///     on block `i`'s data + penalty, so it carries the SAME value for, e.g.,
+    ///     `s(x)`'s range coordinate whether `s(x)` was written first or second.
+    ///     This is what breaks the x↔z symmetry when two smooths share an
+    ///     identical spline basis (so their penalty matrices — and hence their
+    ///     structural keys — are equal): without it the canonical order would be
+    ///     ambiguous and the optimizer's order-dependence would survive.
+    ///
+    /// Returns `None` when the penalty-coordinate count does not match the
+    /// expected ρ dimension, or when the reference gradient cannot be evaluated
+    /// (so the caller falls back to the native layout untouched rather than risk
+    /// a misaligned permutation). For Gaussian additive `s()` smooths the
+    /// coordinates are the (range + null-space) double-penalty blocks; for `te()`
+    /// they are the per-margin Kronecker coordinates plus the appended
+    /// null-space ridge.
+    pub(crate) fn canonical_rho_keys(&self, expected_rho_dim: usize) -> Option<Vec<u64>> {
+        use std::hash::{Hash, Hasher};
+        let coords = self.build_penalty_coords();
+        if coords.len() != expected_rho_dim || expected_rho_dim == 0 {
+            return None;
+        }
+        // Symmetric reference point ρ = 0 (every λ = 1): identical for every
+        // term order, so the per-coordinate gradient there is a clean
+        // block-attached, order-invariant data signature. A failure to evaluate
+        // (degenerate inner solve) disables canonicalization rather than
+        // permuting on an unreliable signature.
+        let reference = ndarray::Array1::<f64>::zeros(expected_rho_dim);
+        let grad = self.compute_gradient(&reference).ok()?;
+        if grad.len() != expected_rho_dim || !grad.iter().all(|v| v.is_finite()) {
+            return None;
+        }
+        // Quantize the data signature to a coarse relative grid so floating
+        // round-off cannot split two coordinates that are genuinely identical.
+        let quant = |v: f64| -> i64 {
+            if !v.is_finite() || v.abs() <= 1e-300 {
+                0
+            } else {
+                (v * 1.0e6).round() as i64
+            }
+        };
+        Some(
+            coords
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                    c.canonical_structural_key().hash(&mut hasher);
+                    quant(grad[i]).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .collect(),
+        )
+    }
+
     pub(crate) fn compute_cost_with_ext_count(
         &self,
         p: &Array1<f64>,

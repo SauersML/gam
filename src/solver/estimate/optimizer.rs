@@ -437,6 +437,17 @@ where
     }
     reml_state.setwarm_start_original_beta(warm_start_beta);
 
+    // Term/margin-order invariance (#1538/#1539). The per-ρ-coordinate canonical
+    // keys label each coordinate by its placement-independent (penalty + data)
+    // content; the induced canonical permutation lets BOTH the objective-grid
+    // seed prepass AND the outer optimizer operate in an identical canonical
+    // coordinate layout for every term order. `None` when the coordinate count
+    // does not match the ρ-dimension (legacy native-order path, unchanged).
+    let canon_keys = reml_state.canonical_rho_keys(k);
+    let canon_perm: Option<Vec<usize>> = canon_keys
+        .as_ref()
+        .and_then(|keys| crate::solver::rho_optimizer::canonical_permutation(keys));
+
     let reml_seed_config = external_reml_seed_config(k, cfg.link_function());
     let reml_tol = cfg.reml_convergence_tolerance;
     let reml_max_iter = opts.max_iter;
@@ -602,7 +613,16 @@ where
             .with_problem_size(n_obs, x_o.ncols())
             .with_arc_initial_regularization(if gaussian_identity { Some(0.25) } else { None })
             .with_operator_initial_trust_radius(if gaussian_identity { Some(4.0) } else { None })
-            .with_rho_bound(crate::estimate::RHO_BOUND);
+            .with_rho_bound(crate::estimate::RHO_BOUND)
+            // Make the outer smoothing-parameter search invariant to the order
+            // the smooth terms / tensor margins were written (#1538/#1539). The
+            // structural keys label each ρ-coordinate by its placement-
+            // independent penalty content, so the optimizer canonicalizes the
+            // coordinate layout and resolves the flat double-penalty REML valley
+            // identically for `s(x)+s(z)` vs `s(z)+s(x)` and `te(x,z)` vs
+            // `te(z,x)`. `None` (coordinate count not matching ρ-dim) leaves the
+            // native-order path unchanged.
+            .with_rho_canonical_keys(canon_keys.clone());
         let problem = if let Some(h) = heuristic_lambdas {
             problem.with_heuristic_lambdas(h.to_vec())
         } else {
@@ -722,12 +742,42 @@ where
             } else {
                 Array1::from_elem(k, (risk_shift + weight_log_geom_mean).clamp(lo, hi))
             };
-            let refined = crate::seeding::select_objective_seed_on_log_lambda_grid(
-                &base,
-                (lo, hi),
-                k,
-                |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
-            );
+            // Run the objective-grid seed search in CANONICAL coordinate order
+            // (#1538/#1539) so its greedy per-axis / pairwise-saturation
+            // refinement — which is order-dependent in native layout — explores
+            // the SAME axes for every term order. The grid builds canonical
+            // candidates; the eval closure maps each back to native order before
+            // scoring with the true `compute_cost`, and the refined seed is
+            // mapped native again for `with_initial_rho`. Without a permutation
+            // this is the identity, so the native-order path is byte-for-byte
+            // unchanged.
+            let refined = if let Some(perm) = canon_perm.as_ref() {
+                let to_native = |canon: &Array1<f64>| -> Array1<f64> {
+                    let mut out = Array1::zeros(canon.len());
+                    for (c, &i) in perm.iter().enumerate() {
+                        out[i] = canon[c];
+                    }
+                    out
+                };
+                let base_canon = Array1::from_iter(perm.iter().map(|&i| base[i]));
+                let refined_canon = crate::seeding::select_objective_seed_on_log_lambda_grid(
+                    &base_canon,
+                    (lo, hi),
+                    k,
+                    |canon_rho| {
+                        let native = to_native(canon_rho);
+                        reml_state.compute_cost(&native).ok().filter(|c| c.is_finite())
+                    },
+                );
+                to_native(&refined_canon)
+            } else {
+                crate::seeding::select_objective_seed_on_log_lambda_grid(
+                    &base,
+                    (lo, hi),
+                    k,
+                    |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
+                )
+            };
             // Emit the seed when the grid moved it, or — on the Gaussian
             // weight-anchored path — whenever the anchored `base` is itself
             // offset from the unanchored origin (so the shifted optimum is

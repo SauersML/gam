@@ -936,3 +936,241 @@ pub(crate) fn validate_second_order_seed_hessian(
 
     Ok(())
 }
+
+// ─── Permutation-invariant outer coordinate canonicalization ──────────
+//
+// The additive-term-order (#1539) and tensor-margin-order (#1538) invariance
+// bugs share one root cause: the outer smoothing-parameter optimizer resolves
+// a flat double-penalty REML valley differently depending on the ORDER the
+// penalty blocks are presented (seed placement, multistart, and tie-breaking
+// all operate in native penalty-index order). The design and penalty are
+// symmetric up to a block permutation, so the cure is permutation-invariance
+// by construction: present the optimizer an identical CANONICAL coordinate
+// layout regardless of native order, then map the optimized ρ back.
+//
+// The canonical order is a stable sort of the native coordinates by their
+// structural key (see `PenaltyCoordinate::canonical_structural_key`), which is
+// derived purely from each penalty's rotation-/placement-invariant content —
+// never from its native position. Two formula orders therefore yield the SAME
+// canonical layout, so the optimizer's seeding/multistart/tie-break all run on
+// byte-identical coordinates and select identical λ̂.
+
+/// Canonical→native index map: `perm[c]` is the native coordinate placed at
+/// canonical position `c`.
+///
+/// Returns `None` when the keys are already in canonical order (the permutation
+/// is the identity), so the legacy native-order path runs untouched.
+pub(crate) fn canonical_permutation(keys: &[u64]) -> Option<Vec<usize>> {
+    let n = keys.len();
+    if n <= 1 {
+        return None;
+    }
+    let mut perm: Vec<usize> = (0..n).collect();
+    // Stable sort by structural key. Ties (structurally interchangeable
+    // coordinates) keep their native relative order — harmless precisely
+    // because tied coordinates produce identical fits under any assignment.
+    perm.sort_by_key(|&i| keys[i]);
+    if perm.iter().enumerate().all(|(c, &i)| c == i) {
+        None
+    } else {
+        Some(perm)
+    }
+}
+
+/// Reorder a native-layout ρ vector into canonical order: `out[c] = native[perm[c]]`.
+fn permute_to_canonical(native: &Array1<f64>, perm: &[usize]) -> Array1<f64> {
+    Array1::from_iter(perm.iter().map(|&i| native[i]))
+}
+
+/// Reorder a canonical-layout ρ vector back into native order:
+/// `out[perm[c]] = canonical[c]`.
+fn permute_to_native(canonical: &Array1<f64>, perm: &[usize]) -> Array1<f64> {
+    let mut out = Array1::zeros(canonical.len());
+    for (c, &i) in perm.iter().enumerate() {
+        out[i] = canonical[c];
+    }
+    out
+}
+
+/// Map an `OuterResult` produced in CANONICAL coordinate order back to the
+/// objective's native layout, in place. Permutes every per-coordinate array
+/// (ρ, gradient, Hessian) consistently; scalar and diagnostic fields are
+/// untouched.
+pub(crate) fn outer_result_to_native(mut result: OuterResult, perm: &[usize]) -> OuterResult {
+    if result.rho.len() == perm.len() {
+        result.rho = permute_to_native(&result.rho, perm);
+    }
+    if let Some(g) = result.final_gradient.as_ref()
+        && g.len() == perm.len()
+    {
+        result.final_gradient = Some(permute_to_native(g, perm));
+    }
+    if let Some(h) = result.final_hessian.as_ref()
+        && h.nrows() == perm.len()
+        && h.ncols() == perm.len()
+    {
+        // H_native[perm[a], perm[b]] = H_canon[a, b].
+        let mut hn = Array2::<f64>::zeros((perm.len(), perm.len()));
+        for (a, &ia) in perm.iter().enumerate() {
+            for (b, &ib) in perm.iter().enumerate() {
+                hn[[ia, ib]] = h[[a, b]];
+            }
+        }
+        result.final_hessian = Some(hn);
+    }
+    result
+}
+
+/// Wraps any [`OuterObjective`] so the optimizer can work in a CANONICAL
+/// coordinate order while the wrapped objective continues to receive ρ in its
+/// NATIVE order. The optimizer hands canonical ρ to this wrapper; the wrapper
+/// permutes canonical→native before forwarding to the inner objective, so the
+/// inner objective (and any checkpointing/cache layer beneath it) sees native
+/// ρ exactly as before. Capability shape (`n_params`, `psi_dim`, …) is
+/// unchanged — only coordinate order differs.
+pub(crate) struct CanonicalizedObjective<'a> {
+    inner: &'a mut dyn OuterObjective,
+    /// Canonical→native map: `perm[c]` is the native index at canonical slot `c`.
+    perm: Vec<usize>,
+}
+
+impl<'a> CanonicalizedObjective<'a> {
+    pub(crate) fn new(inner: &'a mut dyn OuterObjective, perm: Vec<usize>) -> Self {
+        Self { inner, perm }
+    }
+
+    #[inline]
+    fn to_native(&self, canonical: &Array1<f64>) -> Array1<f64> {
+        if canonical.len() == self.perm.len() {
+            permute_to_native(canonical, &self.perm)
+        } else {
+            // Defensive: a length the permutation does not cover is forwarded
+            // verbatim rather than corrupted (should not occur for ρ-coords).
+            canonical.clone()
+        }
+    }
+
+    /// Map a native-order eval (gradient/Hessian) back into canonical order so
+    /// the optimizer sees a self-consistent canonical objective.
+    fn eval_to_canonical(&self, mut eval: OuterEval) -> OuterEval {
+        if eval.gradient.len() == self.perm.len() {
+            eval.gradient = permute_to_canonical(&eval.gradient, &self.perm);
+        }
+        eval.hessian = match eval.hessian {
+            HessianResult::Analytic(h)
+                if h.nrows() == self.perm.len() && h.ncols() == self.perm.len() =>
+            {
+                let mut hc = Array2::<f64>::zeros((self.perm.len(), self.perm.len()));
+                for (a, &ia) in self.perm.iter().enumerate() {
+                    for (b, &ib) in self.perm.iter().enumerate() {
+                        hc[[a, b]] = h[[ia, ib]];
+                    }
+                }
+                HessianResult::Analytic(hc)
+            }
+            other => other,
+        };
+        // `inner_beta_hint` is in the coefficient basis (not ρ-coordinate
+        // order), so it is forwarded unchanged.
+        eval
+    }
+}
+
+impl<'a> OuterObjective for CanonicalizedObjective<'a> {
+    fn capability(&self) -> OuterCapability {
+        self.inner.capability()
+    }
+
+    fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        let native = self.to_native(rho);
+        self.inner.eval_cost(&native)
+    }
+
+    fn eval_screening_proxy(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
+        let native = self.to_native(rho);
+        self.inner.eval_screening_proxy(&native)
+    }
+
+    fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
+        let native = self.to_native(rho);
+        let eval = self.inner.eval(&native)?;
+        Ok(self.eval_to_canonical(eval))
+    }
+
+    fn eval_with_order(
+        &mut self,
+        rho: &Array1<f64>,
+        order: OuterEvalOrder,
+    ) -> Result<OuterEval, EstimationError> {
+        let native = self.to_native(rho);
+        let eval = self.inner.eval_with_order(&native, order)?;
+        Ok(self.eval_to_canonical(eval))
+    }
+
+    fn eval_efs(&mut self, rho: &Array1<f64>) -> Result<EfsEval, EstimationError> {
+        let native = self.to_native(rho);
+        let mut efs = self.inner.eval_efs(&native)?;
+        // `steps` has one entry per θ-coordinate (length = n_rho + n_ext). The
+        // canonical permutation covers only the leading ρ-coordinate block, so
+        // map exactly those native→canonical; any trailing ψ/ext steps keep
+        // their position (the canonicalized path is ρ-only, psi_dim == 0).
+        let m = self.perm.len();
+        if efs.steps.len() >= m {
+            let leading = Array1::from_iter(efs.steps.iter().take(m).copied());
+            let canon_leading = permute_to_canonical(&leading, &self.perm);
+            for (c, v) in canon_leading.iter().enumerate() {
+                efs.steps[c] = *v;
+            }
+        }
+        Ok(efs)
+    }
+
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+
+    fn seed_inner_state(&mut self, beta: &Array1<f64>) -> Result<SeedOutcome, EstimationError> {
+        // β is in the coefficient basis, not ρ-coordinate order — forward as-is.
+        self.inner.seed_inner_state(beta)
+    }
+
+    fn allow_continuation_prewarm(&self) -> bool {
+        self.inner.allow_continuation_prewarm()
+    }
+
+    fn requires_continuation_path_entry(&self) -> bool {
+        self.inner.requires_continuation_path_entry()
+    }
+
+    fn accept_seed_without_outer_iterations(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Result<Option<f64>, EstimationError> {
+        let native = self.to_native(rho);
+        self.inner.accept_seed_without_outer_iterations(&native)
+    }
+
+    fn curvature_homotopy_entry(
+        &mut self,
+        rho: &Array1<f64>,
+    ) -> Option<Result<bool, EstimationError>> {
+        let native = self.to_native(rho);
+        self.inner.curvature_homotopy_entry(&native)
+    }
+
+    fn finalize_outer_result(
+        &mut self,
+        rho: &Array1<f64>,
+        plan: &OuterPlan,
+    ) -> Result<(), EstimationError> {
+        let native = self.to_native(rho);
+        self.inner.finalize_outer_result(&native, plan)
+    }
+
+    fn outer_device_admission(&self) -> Option<crate::gpu::policy::RemlOuterAdmission> {
+        // The device path optimizes in its own coordinate layout; canonicalized
+        // problems route through the host BFGS/ARC path (where the permutation
+        // is honored) rather than the device driver.
+        None
+    }
+}

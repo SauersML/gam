@@ -99,6 +99,21 @@ pub(crate) struct OuterConfig {
     /// metric. `None` on every cold-start / no-cache / pre-Hessian-schema path,
     /// which falls back to the scalar warm metric byte-for-byte.
     pub(crate) warm_start_outer_hessian: Option<Array2<f64>>,
+    /// Per-ρ-coordinate structural keys, in the objective's NATIVE (formula)
+    /// coordinate order, used to make the outer smoothing-parameter search
+    /// invariant to the order the user wrote the smooth terms / tensor margins
+    /// (#1538/#1539).
+    ///
+    /// When `Some` and the keys induce a non-identity canonical permutation,
+    /// [`run_outer`] reorders the coordinate layout the optimizer sees into a
+    /// stable canonical order (derived purely from the keys, never from the
+    /// native position) before seeding/optimizing, and inverts the permutation
+    /// on the returned ρ / gradient / Hessian so the caller still receives the
+    /// native layout. Seeding, multistart and tie-breaking then all operate on
+    /// the identical canonical layout for every term order, so both orders
+    /// reach the same λ̂ and the same fitted surface. `None` (or an identity
+    /// permutation) leaves the legacy native-order path byte-for-byte unchanged.
+    pub(crate) rho_canonical_keys: Option<Vec<u64>>,
 }
 
 impl Default for OuterConfig {
@@ -127,6 +142,7 @@ impl Default for OuterConfig {
                 crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
             warm_start_cache_hit: false,
             warm_start_outer_hessian: None,
+            rho_canonical_keys: None,
         }
     }
 }
@@ -171,6 +187,7 @@ pub struct OuterProblem {
     cache_mirror_sessions: Vec<Arc<CacheSession>>,
     rho_uncertainty_problem_size: crate::rho_uncertainty::RhoUncertaintyProblemSize,
     continuation_prewarm: bool,
+    rho_canonical_keys: Option<Vec<u64>>,
 }
 
 impl OuterProblem {
@@ -205,7 +222,17 @@ impl OuterProblem {
             rho_uncertainty_problem_size:
                 crate::rho_uncertainty::RhoUncertaintyProblemSize::default(),
             continuation_prewarm: true,
+            rho_canonical_keys: None,
         }
+    }
+
+    /// Supply per-ρ-coordinate structural keys (native/formula order) so the
+    /// outer search is canonicalized to be invariant to the order the smooth
+    /// terms / tensor margins were written (#1538/#1539). See
+    /// [`OuterConfig::rho_canonical_keys`].
+    pub fn with_rho_canonical_keys(mut self, keys: Option<Vec<u64>>) -> Self {
+        self.rho_canonical_keys = keys;
+        self
     }
 
     pub fn with_gradient(mut self, d: Derivative) -> Self {
@@ -478,6 +505,7 @@ impl OuterProblem {
             // a warm-start hit decodes a converged outer Hessian; cold by
             // construction here, like `warm_start_cache_hit`.
             warm_start_outer_hessian: None,
+            rho_canonical_keys: self.rho_canonical_keys.clone(),
         }
     }
 
@@ -1357,6 +1385,21 @@ pub(crate) fn run_outer(
     config: &OuterConfig,
     context: &str,
 ) -> Result<OuterResult, EstimationError> {
+    // Permutation-invariant outer search (#1538/#1539). When the caller has
+    // supplied per-coordinate structural keys that induce a non-identity
+    // canonical order, run the ENTIRE outer pipeline (seeding, multistart,
+    // optimization, and the #934 certificate / uncertainty audits) in that
+    // canonical layout against a permuting wrapper, then map the result back to
+    // the native layout. Seeding/tie-breaking then see byte-identical
+    // coordinates for every term order, so both orders select the same λ̂.
+    if let Some(keys) = config.rho_canonical_keys.as_ref()
+        && let Some(perm) = canonical_permutation(keys)
+    {
+        let canonical_config = canonicalize_outer_config(config, &perm);
+        let mut canonical_obj = CanonicalizedObjective::new(obj, perm.clone());
+        let result = run_outer(&mut canonical_obj, &canonical_config, context)?;
+        return Ok(outer_result_to_native(result, &perm));
+    }
     let mut result = run_outer_uncertified(obj, config, context)?;
     if config.max_iter <= 1 {
         return Ok(result);
@@ -1375,6 +1418,62 @@ pub(crate) fn run_outer(
         &mut result,
     ));
     Ok(result)
+}
+
+/// Build a CANONICAL-order copy of an [`OuterConfig`] for the
+/// permutation-invariant outer search (#1538/#1539).
+///
+/// `perm[c]` is the native coordinate at canonical slot `c`. Every
+/// per-coordinate config field (initial ρ seed, heuristic-λ seed, per-axis
+/// bounds, transferred warm Hessian) is reordered native→canonical so the
+/// optimizer's seeding and multistart operate entirely in canonical space;
+/// scalar fields are copied verbatim. `rho_canonical_keys` is cleared so the
+/// recursive [`run_outer`] frame runs the normal (identity-order) pipeline on
+/// the already-canonical objective.
+fn canonicalize_outer_config(config: &OuterConfig, perm: &[usize]) -> OuterConfig {
+    // Permute a per-coordinate slice native→canonical; pass through any length
+    // that does not match the permutation (defensive — should not occur).
+    let permute_vec = |v: &[f64]| -> Vec<f64> {
+        if v.len() == perm.len() {
+            perm.iter().map(|&i| v[i]).collect()
+        } else {
+            v.to_vec()
+        }
+    };
+    let permute_arr = |a: &Array1<f64>| -> Array1<f64> {
+        if a.len() == perm.len() {
+            Array1::from_iter(perm.iter().map(|&i| a[i]))
+        } else {
+            a.clone()
+        }
+    };
+    let mut canonical = config.clone();
+    canonical.rho_canonical_keys = None;
+    if let Some(initial) = config.initial_rho.as_ref() {
+        canonical.initial_rho = Some(permute_arr(initial));
+    }
+    if let Some(h) = config.heuristic_lambdas.as_ref() {
+        canonical.heuristic_lambdas = Some(permute_vec(h));
+    }
+    if let Some((lower, upper)) = config.bounds.as_ref() {
+        canonical.bounds = Some((permute_arr(lower), permute_arr(upper)));
+    }
+    // A transferred dense outer Hessian is in native coordinate order; permute
+    // it into canonical order so the BFGS warm metric stays aligned. (None on
+    // the cold-start canonicalized path, so this is usually a no-op.)
+    if let Some(h) = config.warm_start_outer_hessian.as_ref()
+        && h.nrows() == perm.len()
+        && h.ncols() == perm.len()
+    {
+        let mut hc = Array2::<f64>::zeros((perm.len(), perm.len()));
+        for (a, &ia) in perm.iter().enumerate() {
+            for (b, &ib) in perm.iter().enumerate() {
+                hc[[a, b]] = h[[ia, ib]];
+            }
+        }
+        canonical.warm_start_outer_hessian = Some(hc);
+    }
+    canonical
 }
 
 /// The solver ladder behind [`run_outer`], without the #934 self-audit.

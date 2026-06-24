@@ -638,6 +638,102 @@ impl PenaltyCoordinate {
             }
         }
     }
+
+    /// A stable, formula-order-independent signature of this penalty
+    /// coordinate's STRUCTURAL CONTENT.
+    ///
+    /// Two penalty coordinates that represent the same smoothing structure —
+    /// the same wiggliness root, the same null-space ridge, the same tensor
+    /// margin — produce the same key regardless of which block of the joint
+    /// coefficient vector they happen to occupy or which order the user typed
+    /// the terms in. It is derived ENTIRELY from rotation/placement-invariant
+    /// content (rank, block width, the spectrum of the block-local penalty
+    /// `Sₖ = RₖᵀRₖ`, or the marginal eigenvalue spectrum for a Kronecker
+    /// margin), and NEVER from a coordinate's position (`start`/`dim_index`)
+    /// in the joint layout. Swapping `s(x)+s(z)` ↔ `s(z)+s(x)` or
+    /// `te(x,z)` ↔ `te(z,x)` permutes the coordinates but leaves each
+    /// coordinate's key fixed.
+    ///
+    /// This is the key the outer REML driver sorts on to present an identical
+    /// canonical coordinate layout to the smoothing-parameter optimizer
+    /// regardless of term/margin order, so the flat double-penalty REML valley
+    /// is resolved order-invariantly (#1538/#1539). Values are quantized to a
+    /// coarse relative grid so that floating-point round-off in the roots does
+    /// not split an otherwise-identical key.
+    pub(crate) fn canonical_structural_key(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+        // Quantize a magnitude to a coarse log-relative grid so tiny numeric
+        // differences in equivalent roots collapse to the same bucket, while
+        // genuinely different roughness scales stay distinct.
+        let quant = |v: f64| -> i64 {
+            if !v.is_finite() || v.abs() <= 1e-300 {
+                return 0;
+            }
+            // ~1e-6 relative resolution: round log|v| to 6 decimals and keep sign.
+            let q = (v.abs().ln() * 1.0e6).round() as i64;
+            if v < 0.0 { -q } else { q }
+        };
+
+        match self {
+            Self::DenseRoot(root)
+            | Self::DenseRootCentered { root, .. }
+            | Self::BlockRoot { root, .. }
+            | Self::BlockRootCentered { root, .. } => {
+                // Tag the rooted family uniformly: placement (start/end/total)
+                // is deliberately excluded so a block that moves between term
+                // orders keeps its key. The spectrum of Sₖ = RₖᵀRₖ is the
+                // rotation-invariant fingerprint of the penalty.
+                0u8.hash(&mut hasher);
+                root.nrows().hash(&mut hasher); // rank
+                root.ncols().hash(&mut hasher); // block width
+                let sk = root.t().dot(root);
+                // Orthogonal-invariants of the symmetric Sₖ = RₖᵀRₖ: the power
+                // sums Σλ (trace), Σλ² (= ‖Sₖ‖²_F), Σλ³ (tr(Sₖ³)). Each is a
+                // symmetric function of Sₖ's eigenvalues, so they are unchanged
+                // by any orthonormal change of basis of the block coordinates
+                // (hence by which joint block the penalty occupies) and by the
+                // order of the terms. Together with rank and width they form a
+                // strong placement-independent fingerprint without an
+                // eigendecomposition.
+                let n = sk.nrows().min(sk.ncols());
+                let trace1 = (0..n).map(|i| sk[[i, i]]).sum::<f64>();
+                let frob_sq = sk.iter().map(|&x| x * x).sum::<f64>(); // = Σλ²
+                let sk2 = sk.dot(&sk);
+                let trace3 = {
+                    let sk3diag = sk2.dot(&sk);
+                    (0..n).map(|i| sk3diag[[i, i]]).sum::<f64>()
+                };
+                let mut invariants = [quant(trace1), quant(frob_sq), quant(trace3)];
+                // Power sums are already order-agnostic; sorting is a harmless
+                // guard against any future addition of non-symmetric summaries.
+                invariants.sort_unstable();
+                invariants.hash(&mut hasher);
+            }
+            Self::KroneckerMarginal {
+                eigenvalues,
+                dim_index,
+                marginal_dims,
+                ..
+            } => {
+                // A tensor margin's identity is its OWN marginal penalty
+                // spectrum plus the (sorted) set of marginal dimensions — both
+                // independent of which slot `dim_index` the margin occupies, so
+                // `te(x,z)` and `te(z,x)` give each margin the same key.
+                1u8.hash(&mut hasher);
+                let mut margin_spectrum: Vec<i64> =
+                    eigenvalues[*dim_index].iter().map(|&e| quant(e)).collect();
+                margin_spectrum.sort_unstable();
+                margin_spectrum.hash(&mut hasher);
+                let mut dims_sorted = marginal_dims.clone();
+                dims_sorted.sort_unstable();
+                dims_sorted.hash(&mut hasher);
+            }
+        }
+
+        hasher.finish()
+    }
 }
 
 // PenaltyLogdetEigenspace, build_penalty_logdet_eigenspace,
