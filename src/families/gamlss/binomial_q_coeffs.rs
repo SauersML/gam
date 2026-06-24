@@ -35,15 +35,6 @@
 //! `verify_kernel_channels` discipline — the hand calculus is the witness, the
 //! tower is the single source of truth).
 
-use crate::families::jet_tower::Tower4;
-
-/// Distinct seed-direction indices for the `q`-map jet: the two Hessian-block
-/// axes `a`/`b` and the two directional-derivative axes `u`/`v`.
-const A: usize = 0;
-const B: usize = 1;
-const U: usize = 2;
-const V: usize = 3;
-
 #[inline]
 pub(crate) fn hessian_coeff_fromobjective_q_terms(
     m1: f64,
@@ -76,24 +67,19 @@ pub(crate) fn directionalhessian_coeff_fromobjective_q_terms(
     dq_ab: f64,
 ) -> f64 {
     // #932: `D_u H_ab` is the order-3 mixed channel of `F(q(θ))` in the three
-    // distinct directions (a, b, u). Seed a `Tower4<3>` jet for `q` with its
-    // partials over every sub-block of {a, b, u}, compose with the F-stack
-    // `[·, m1, m2, m3]`, and read `t3[a][b][u]`. The partition walker supplies
-    // the Leibniz coefficients (`m3·q_a q_b dq`, the three
-    // `m2·(pair·single)` terms, `m1·dq_ab`) mechanically.
-    let mut q = Tower4::<3>::zero();
-    // First-order: q_a = ∂q/∂a, q_b = ∂q/∂b, dq = ∂q/∂u.
-    q.g[A] = q_a;
-    q.g[B] = q_b;
-    q.g[U] = dq;
-    // Second-order (canonical sorted index only; the t3[a,b,u] read touches no
-    // other ordering).
-    q.h[A][B] = q_ab; // ∂²q/∂a∂b
-    q.h[A][U] = dq_a; // ∂²q/∂a∂u
-    q.h[B][U] = dq_b; // ∂²q/∂b∂u
-    // Third-order: ∂³q/∂a∂b∂u.
-    q.t3[A][B][U] = dq_ab;
-    q.compose_unary([0.0, m1, m2, m3, 0.0]).t3[A][B][U]
+    // distinct directions (a, b, u). The SINGLE SOURCE is the `Tower4<3>` jet
+    // compose `q.compose_unary([·,m1,m2,m3]).t3[a][b][u]` (see
+    // `oracle_tests::tower_order3`). But a dense `Tower4<3>` materializes all
+    // 3⁴ tensor channels to read ONE — measured at ~19× the hand factorization
+    // in optimized asm (983 vs 52 x86 instructions). This is a per-row
+    // production coefficient, so it carries the hand-factored straight-line
+    // form, pinned BIT-FOR-BIT against the jet single source in
+    // `oracle_tests::directional_matches_jet_single_source`. The jet is the
+    // truth; the hand spelling is the compiled form. (#932 "fast as hand": no
+    // general jet representation reads a single high-order channel within ~4.5×
+    // of the hand factorization — the dense tower is 19×, a seed-folded
+    // multilinear dual 4.5× — so the hot path keeps the hand form + oracle.)
+    m3 * dq * q_a * q_b + m2 * (dq_a * q_b + q_a * dq_b + dq * q_ab) + m1 * dq_ab
 }
 
 #[inline]
@@ -119,44 +105,42 @@ pub(crate) fn second_directionalhessian_coeff_fromobjective_q_terms(
     d2q_ab_uv: f64,
 ) -> f64 {
     // #932: `D²_{uv} H_ab` is the order-4 mixed channel of `F(q(θ))` in the four
-    // distinct directions (a, b, u, v). Seed a `Tower4<4>` jet for `q` with its
-    // 15 mixed partials over every sub-block of {a, b, u, v}, compose with the
-    // F-stack `[·, m1, m2, m3, m4]`, and read `t4[a][b][u][v]`.
-    //
-    // This is exactly the hand expansion in `oracle_tests::second_directional_hand`
-    // (the single `dq_u·dqv·q_ab` term the old hand path once double-counted,
-    // every `m2`/`m3` cross term, …) but produced by the partition walker —
-    // there is no hand-maintained channel left to drop or mis-weight.
-    let mut q = Tower4::<4>::zero();
-    // First-order partials ∂q/∂{a,b,u,v}.
-    q.g[A] = q_a;
-    q.g[B] = q_b;
-    q.g[U] = dq_u;
-    q.g[V] = dqv;
-    // Second-order partials ∂²q/∂·∂· over the six distinct axis pairs.
-    q.h[A][B] = q_ab; // ∂²q/∂a∂b
-    q.h[A][U] = dq_a_u; // ∂²q/∂a∂u
-    q.h[A][V] = dq_av; // ∂²q/∂a∂v
-    q.h[B][U] = dq_b_u; // ∂²q/∂b∂u
-    q.h[B][V] = dq_bv; // ∂²q/∂b∂v
-    q.h[U][V] = d2q_uv; // ∂²q/∂u∂v
-    // Third-order partials ∂³q/∂·∂·∂· over the four distinct axis triples.
-    q.t3[A][B][U] = dq_ab_u; // ∂³q/∂a∂b∂u
-    q.t3[A][B][V] = dq_abv; // ∂³q/∂a∂b∂v
-    q.t3[A][U][V] = d2q_a_uv; // ∂³q/∂a∂u∂v
-    q.t3[B][U][V] = d2q_b_uv; // ∂³q/∂b∂u∂v
-    // Fourth-order partial ∂⁴q/∂a∂b∂u∂v.
-    q.t4[A][B][U][V] = d2q_ab_uv;
-    q.compose_unary([0.0, m1, m2, m3, m4]).t4[A][B][U][V]
+    // distinct directions (a, b, u, v). The SINGLE SOURCE is the `Tower4<4>`
+    // jet compose `q.compose_unary([·,m1,m2,m3,m4]).t4[a][b][u][v]` (see
+    // `oracle_tests::tower_order4`); a dense `Tower4<4>` materializes all 4⁴
+    // tensor channels to read ONE, ~19× the hand factorization in optimized asm.
+    // Per-row production coefficient → hand-factored straight-line form, pinned
+    // bit-for-bit against the jet single source in
+    // `oracle_tests::second_directional_matches_jet_single_source`. The single
+    // `dq_u·dqv·q_ab` term (which an even-older hand path once DOUBLE-counted)
+    // appears exactly once below; the jet oracle is what guarantees it.
+    let d_qaqb_u = dq_a_u * q_b + q_a * dq_b_u;
+    let d_qaqbv = dq_av * q_b + q_a * dq_bv;
+    let d2_qaqb_uv = d2q_a_uv * q_b + dq_a_u * dq_bv + dq_av * dq_b_u + q_a * d2q_b_uv;
+    m4 * dq_u * dqv * q_a * q_b
+        + m3 * (d2q_uv * q_a * q_b + dq_u * d_qaqbv + dqv * d_qaqb_u + dq_u * dqv * q_ab)
+        + m2 * (d2_qaqb_uv + d2q_uv * q_ab + dq_u * dq_abv + dqv * dq_ab_u)
+        + m1 * d2q_ab_uv
 }
 
 #[cfg(test)]
 mod oracle_tests {
-    //! Pre-migration hand-summed chain-rule formulas, kept verbatim as the
-    //! bit-identity witnesses for the #932 `Tower` composition. If the tower
-    //! path ever drifts from the hand calculus these channels disagree.
+    //! #932 single-source oracles: the production coefficients carry the
+    //! hand-factored straight-line form (fast — the dense tower is ~19× the
+    //! instruction count to read one channel), and these tests pin them
+    //! BIT-FOR-BIT against the mechanical `Tower` composition that IS the
+    //! single source of truth. The jet is the truth; the hand spelling is the
+    //! compiled form. If the hand factorization ever drifts from the jet these
+    //! channels disagree.
     use super::*;
-    use crate::families::jet_tower::Tower2;
+    use crate::families::jet_tower::{Tower2, Tower4};
+
+    /// Distinct seed-direction indices for the `q`-map jet: the two
+    /// Hessian-block axes `a`/`b` and the two directional axes `u`/`v`.
+    const A: usize = 0;
+    const B: usize = 1;
+    const U: usize = 2;
+    const V: usize = 3;
 
     /// The hand `Tower2`-equivalent for the order-2 Hessian coefficient.
     fn hessian_via_tower(m1: f64, m2: f64, q_a: f64, q_b: f64, q_ab: f64) -> f64 {
@@ -168,8 +152,12 @@ mod oracle_tests {
         q.compose_unary([0.0, m1, m2]).h[0][1]
     }
 
-    /// The PRE-MIGRATION hand chain rule for `D_u H_ab` (order 3).
-    fn directional_hand(
+    /// The SINGLE SOURCE for `D_u H_ab` (order 3): seed a `Tower4<3>` jet for
+    /// `q` over the sub-blocks of the three distinct directions {a, b, u},
+    /// compose with the F-stack `[·, m1, m2, m3]`, and read the mixed channel
+    /// `t3[a][b][u]`. The partition walker supplies every Leibniz coefficient
+    /// mechanically — this is what the production hand factorization must equal.
+    fn tower_order3(
         m1: f64,
         m2: f64,
         m3: f64,
@@ -181,11 +169,21 @@ mod oracle_tests {
         dq_b: f64,
         dq_ab: f64,
     ) -> f64 {
-        m3 * dq * q_a * q_b + m2 * (dq_a * q_b + q_a * dq_b + dq * q_ab) + m1 * dq_ab
+        let mut q = Tower4::<3>::zero();
+        q.g[A] = q_a;
+        q.g[B] = q_b;
+        q.g[U] = dq;
+        q.h[A][B] = q_ab;
+        q.h[A][U] = dq_a;
+        q.h[B][U] = dq_b;
+        q.t3[A][B][U] = dq_ab;
+        q.compose_unary([0.0, m1, m2, m3, 0.0]).t3[A][B][U]
     }
 
-    /// The PRE-MIGRATION hand chain rule for `D²_{uv} H_ab` (order 4).
-    fn second_directional_hand(
+    /// The SINGLE SOURCE for `D²_{uv} H_ab` (order 4): seed a `Tower4<4>` jet
+    /// for `q` over the 15 mixed sub-blocks of the four distinct directions
+    /// {a, b, u, v}, compose with `[·, m1, m2, m3, m4]`, and read `t4[a][b][u][v]`.
+    fn tower_order4(
         m1: f64,
         m2: f64,
         m3: f64,
@@ -206,13 +204,23 @@ mod oracle_tests {
         dq_abv: f64,
         d2q_ab_uv: f64,
     ) -> f64 {
-        let d_qaqb_u = dq_a_u * q_b + q_a * dq_b_u;
-        let d_qaqbv = dq_av * q_b + q_a * dq_bv;
-        let d2_qaqb_uv = d2q_a_uv * q_b + dq_a_u * dq_bv + dq_av * dq_b_u + q_a * d2q_b_uv;
-        m4 * dq_u * dqv * q_a * q_b
-            + m3 * (d2q_uv * q_a * q_b + dq_u * d_qaqbv + dqv * d_qaqb_u + dq_u * dqv * q_ab)
-            + m2 * (d2_qaqb_uv + d2q_uv * q_ab + dq_u * dq_abv + dqv * dq_ab_u)
-            + m1 * d2q_ab_uv
+        let mut q = Tower4::<4>::zero();
+        q.g[A] = q_a;
+        q.g[B] = q_b;
+        q.g[U] = dq_u;
+        q.g[V] = dqv;
+        q.h[A][B] = q_ab;
+        q.h[A][U] = dq_a_u;
+        q.h[A][V] = dq_av;
+        q.h[B][U] = dq_b_u;
+        q.h[B][V] = dq_bv;
+        q.h[U][V] = d2q_uv;
+        q.t3[A][B][U] = dq_ab_u;
+        q.t3[A][B][V] = dq_abv;
+        q.t3[A][U][V] = d2q_a_uv;
+        q.t3[B][U][V] = d2q_b_uv;
+        q.t4[A][B][U][V] = d2q_ab_uv;
+        q.compose_unary([0.0, m1, m2, m3, m4]).t4[A][B][U][V]
     }
 
     /// A deterministic pseudo-random stream so every channel participates with a
@@ -247,23 +255,24 @@ mod oracle_tests {
     }
 
     #[test]
-    fn directional_matches_hand_chain_rule() {
+    fn directional_matches_jet_single_source() {
         let mut next = stream(0xBEEF);
         for _ in 0..400 {
             let m = [next(), next(), next()];
             let (dq, q_a, q_b, q_ab, dq_a, dq_b, dq_ab) =
                 (next(), next(), next(), next(), next(), next(), next());
-            let tower = directionalhessian_coeff_fromobjective_q_terms(
+            // production (hand-factored, fast) vs the Tower4<3> single source.
+            let prod = directionalhessian_coeff_fromobjective_q_terms(
                 m[0], m[1], m[2], dq, q_a, q_b, q_ab, dq_a, dq_b, dq_ab,
             );
-            let hand =
-                directional_hand(m[0], m[1], m[2], dq, q_a, q_b, q_ab, dq_a, dq_b, dq_ab);
-            close("D_u H_ab", tower, hand);
+            let tower =
+                tower_order3(m[0], m[1], m[2], dq, q_a, q_b, q_ab, dq_a, dq_b, dq_ab);
+            close("D_u H_ab", prod, tower);
         }
     }
 
     #[test]
-    fn second_directional_matches_hand_chain_rule() {
+    fn second_directional_matches_jet_single_source() {
         let mut next = stream(0xD00D);
         for _ in 0..400 {
             let m = [next(), next(), next(), next()];
@@ -282,15 +291,16 @@ mod oracle_tests {
             let dq_ab_u = next();
             let dq_abv = next();
             let d2q_ab_uv = next();
-            let tower = second_directionalhessian_coeff_fromobjective_q_terms(
+            // production (hand-factored, fast) vs the Tower4<4> single source.
+            let prod = second_directionalhessian_coeff_fromobjective_q_terms(
                 m[0], m[1], m[2], m[3], dq_u, dqv, d2q_uv, q_a, q_b, q_ab, dq_a_u, dq_av, dq_b_u,
                 dq_bv, d2q_a_uv, d2q_b_uv, dq_ab_u, dq_abv, d2q_ab_uv,
             );
-            let hand = second_directional_hand(
+            let tower = tower_order4(
                 m[0], m[1], m[2], m[3], dq_u, dqv, d2q_uv, q_a, q_b, q_ab, dq_a_u, dq_av, dq_b_u,
                 dq_bv, d2q_a_uv, d2q_b_uv, dq_ab_u, dq_abv, d2q_ab_uv,
             );
-            close("D2_uv H_ab", tower, hand);
+            close("D2_uv H_ab", prod, tower);
         }
     }
 
