@@ -110,11 +110,46 @@ trait FlexJet: Sized + Clone {
     fn scale(&self, s: f64) -> Self;
     /// Faà di Bruno composition `f ∘ self` with stack `[f, f′, f″, f‴, f⁗]`.
     fn compose_unary(&self, d: [f64; 5]) -> Self;
-    /// The de-nested calibration residual term `tangent(self)·m`, with each
-    /// Leibniz contribution weighted `j/(j+m)` (j = derivatives landing on the
-    /// coefficient `self`, m = on the moment `m`) so the calibration always
-    /// lands its lead derivative on the coefficient — the exact `∫ η_θ e^{−q}`
-    /// residual, avoiding the symmetric-product 2× over-count of `mul`.
+    /// The calibration residual term `C·M` as a **distinguished-derivative
+    /// projector**, NOT an ordinary product. (`C = self` the coefficient jet,
+    /// `M = m` the moment jet.)
+    ///
+    /// ## Why a projector and not `mul`
+    ///
+    /// The calibration residual is `R = ∫ η e^{−q} dz = Σ_k C_k M_k`, and its
+    /// derivatives must equal the calibration constraint tensors `∂_θ R = ∫ η_θ
+    /// e^{−q}` whose FIRST (lead) index is forced onto the coefficient η. The
+    /// moment carries the `e^{−q}` motion (`M_a = −∫ z^k η η_a e^{−q}`), so when
+    /// both `C` and `M` move with the same θ, an ordinary jet product
+    /// `tangent(C)·M` double-counts the shared η-motion: at order n it gives
+    /// every `(j,m)` split the binomial weight, which is too large by `(j+m)/j`.
+    ///
+    /// ## The exact law (distinguished-derivative averaging)
+    ///
+    /// Average over which of the `r = |I|` derivative slots is the distinguished
+    /// (lead) one; a term `C_A M_B` (A on the coefficient, B on the moment)
+    /// survives iff the lead slot lies in A, which happens with probability
+    /// `|A|/|I|`:
+    ///
+    /// ```text
+    ///   P_I(C,M) = Σ_{A⊔B=I, A≠∅}  (|A| / |I|)  C_A M_B ,   weight j/(j+m), j=|A|.
+    /// ```
+    ///
+    /// Orders 1–4 (the `Jet2`/`Jet3`/`Jet4` impls below realise exactly these):
+    ///
+    /// ```text
+    ///   P_i    = C_i M
+    ///   P_ij   = C_ij M + ½(C_i M_j + C_j M_i)
+    ///   P_ijk  = C_ijk M + ⅔ Σ C_ij M_k + ⅓ Σ C_i M_jk
+    ///   P_ijkl = C_ijkl M + ¾ Σ C_ijk M_l + ½ Σ C_ij M_kl + ¼ Σ C_i M_jkl
+    /// ```
+    ///
+    /// Along a scalar path the law collapses to the closed form
+    /// `P_n = Σ_j C(n,j)·(j/n)·C^(j)M^(n−j) = Σ_j C(n−1,j−1) C^(j)M^(n−j)
+    ///      = d^(n−1)/dt^(n−1) (C′M)` — i.e. `½/⅔,⅓/¾,½,¼` are not empirical
+    /// fudge factors but `binom(n−1,j−1)/binom(n,j)`. Verified channel-for-channel
+    /// against the true `R_ij…` integrals (gam#932; the design recommendation is to
+    /// generate the weights from `block-size/total-order`, retiring hand tables).
     fn moment_term(&self, m: &Self) -> Self;
     /// `ln(self)` via [`ln_stack`] at the value channel.
     #[inline]
@@ -1605,6 +1640,27 @@ mod moment_engine_tests {
     /// `f_u`/`f_uv`/`f_aa` moment dots and their 3rd/4th extensions automatically. The
     /// value channel is the scalar calibration `f` (driven to ~0 by seeding
     /// `A.value = a0` from the scalar solve), so only the derivative channels solve.
+    ///
+    /// ## Why an order-`p` jet needs exactly `p` iterations (NOT quadratic Newton)
+    ///
+    /// `inv_fa` is the FROZEN scalar inverse `1/F_a(a0,0)` — its derivative
+    /// channels are dropped — so this is a chord/modified-Newton step, not true
+    /// Newton. Let `m` be the nilpotent ideal of the order-`p` jet algebra
+    /// (`m^{p+1} = 0`), and `e_r = A_r − a*` the jet error against the exact root.
+    /// Taylor-expanding `F(a*+e_r) = F_a·e_r + O(e_r²)`,
+    ///
+    /// ```text
+    ///   e_{r+1} = (1 − inv_fa·F_a(a*,θ))·e_r + O(e_r²).
+    /// ```
+    ///
+    /// The constant part of `1 − inv_fa·F_a` vanishes (`inv_fa·F_a(a0,0) = 1`), so
+    /// `1 − inv_fa·F_a ∈ m`; and `e_r² ∈ m^{2k} ⊆ m^{k+1}`. Hence
+    /// `e_r ∈ m^k ⟹ e_{r+1} ∈ m^{k+1}`. The seed `A_0 = const(a0)` has no nilpotent
+    /// channels (`e_0 ∈ m`), so by induction `e_r ∈ m^{r+1}` and `e_p = 0`:
+    /// **each iteration recovers exactly one additional homogeneous Taylor degree.**
+    /// So `Jet2 → 2`, `Jet3 → 3`, `Jet4 → 4` (and any extra passes are exact no-ops,
+    /// since `R(a*) = 0` once converged). A hardcoded `2` left the Jet3/Jet4 mixed
+    /// intercept derivatives one+ iterations short (gam#932). Callers pass `iters = 4`.
     ///
     /// `template` carries the runtime primary count; `a0` the solved intercept value.
     fn lift_intercept_flex<J: FlexJet>(
