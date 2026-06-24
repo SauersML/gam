@@ -2690,6 +2690,15 @@ pub fn kronecker_logdet_and_derivatives(
                 } else {
                     0.0
                 };
+                // When ck == 0 (a zero λ, a zero marginal eigenvalue, or a cell
+                // outside the joint null for the ridge penalty) every term this
+                // index k contributes — `ck·inv_sigma − ck²·inv_sigma2` on the
+                // diagonal and `−ck·cl·inv_sigma2` on every off-diagonal — is
+                // exactly 0.0, so adding them to the finite running accumulators
+                // is a bit-identical no-op. Skip the inner sweep entirely.
+                if ck == 0.0 {
+                    continue;
+                }
                 hess[[k, k]] += ck * inv_sigma - ck * ck * inv_sigma2;
                 for l in (k + 1)..n_pen {
                     let cl = if l < d {
@@ -2712,6 +2721,86 @@ pub fn kronecker_logdet_and_derivatives(
     }
 
     (logdet, grad, hess)
+}
+
+/// λ-invariant Kronecker tensor structure: everything in a tensor-product fit
+/// that depends ONLY on the marginal designs/penalties (which are fixed for the
+/// whole fit) and NOT on the smoothing parameters λ = exp(ρ).
+///
+/// The marginal eigendecomposition (`O(Σ q_k³)`), the reparameterized marginals
+/// `B_k · U_k`, and the balanced-penalty shrinkage scale `max_bal` are all
+/// functions of the fixed marginal data alone. Caching them once per fit lets
+/// every outer REML iterate (50+ per fit on the #1082 tensor cases) skip the
+/// repeated `eigh()` calls and `B_k U_k` GEMMs; only the cheap
+/// `kronecker_logdet_and_derivatives` λ-grid sweep is redone per iterate.
+#[derive(Clone, Debug)]
+pub struct KroneckerInvariantStructure {
+    /// Marginal eigenvalues from each marginal penalty eigendecomposition.
+    pub marginal_eigenvalues: Vec<Array1<f64>>,
+    /// Marginal eigenvector matrices U_k.
+    pub marginal_qs: Vec<Array2<f64>>,
+    /// Reparameterized marginal designs: `B_k · U_k` for each marginal k.
+    pub reparameterized_marginals: Vec<Array2<f64>>,
+    /// Max balanced-penalty eigenvalue scale `max_k-grid Σ_k μ_{k,j_k}/||S_k||_F`,
+    /// used to form the shrinkage ridge `floor * max_bal`. λ-independent.
+    pub max_balanced_eigenvalue: f64,
+}
+
+impl KroneckerInvariantStructure {
+    /// Compute the λ-invariant tensor structure once from the fixed marginal data.
+    pub fn compute(
+        marginal_designs: &[Array2<f64>],
+        marginal_penalties: &[Array2<f64>],
+        marginal_dims: &[usize],
+    ) -> Result<Self, EstimationError> {
+        let d = marginal_dims.len();
+        // Eigendecompose each marginal penalty once through the same robust path
+        // used by KroneckerPenaltySystem so every Kronecker caller sees the same
+        // eigensystem and pseudo-logdet surface.
+        let mut marginal_eigenvalues = Vec::with_capacity(d);
+        let mut marginal_qs = Vec::with_capacity(d);
+        for (evals, evecs) in kronecker_marginal_eigensystems(
+            marginal_penalties,
+            "kronecker_reparameterization_engine",
+        )? {
+            marginal_eigenvalues.push(evals);
+            marginal_qs.push(evecs);
+        }
+
+        // Reparameterized marginals: B_k · U_k.
+        let reparameterized_marginals: Vec<Array2<f64>> = marginal_designs
+            .iter()
+            .zip(marginal_qs.iter())
+            .map(|(b_k, u_k)| crate::faer_ndarray::fast_ab(b_k, u_k))
+            .collect();
+
+        // Max balanced eigenvalue: for Kronecker, the balanced penalty's max
+        // eigenvalue is the max over multi-indices of Σ_k (1/||S_k||_F) μ_{k,j_k}.
+        let mut max_balanced_eigenvalue = 0.0_f64;
+        let mut multi_idx = vec![0usize; d];
+        let frob_norms: Vec<f64> = marginal_penalties
+            .iter()
+            .map(|s| s.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-12))
+            .collect();
+        loop {
+            let mut sigma = 0.0;
+            for k in 0..d {
+                sigma += marginal_eigenvalues[k][multi_idx[k]] / frob_norms[k];
+            }
+            max_balanced_eigenvalue = max_balanced_eigenvalue.max(sigma);
+
+            if kronecker_multi_index_advance(&mut multi_idx, marginal_dims) {
+                break;
+            }
+        }
+
+        Ok(Self {
+            marginal_eigenvalues,
+            marginal_qs,
+            reparameterized_marginals,
+            max_balanced_eigenvalue,
+        })
+    }
 }
 
 /// Kronecker-factored reparameterization for tensor-product penalties.
@@ -2737,47 +2826,38 @@ pub fn kronecker_reparameterization_engine(
         )));
     }
 
-    // Eigendecompose each marginal penalty once through the same robust path
-    // used by KroneckerPenaltySystem so every Kronecker caller sees the same
-    // eigensystem and pseudo-logdet surface.
-    let mut marginal_eigenvalues = Vec::with_capacity(d);
-    let mut marginal_qs = Vec::with_capacity(d);
-    for (evals, evecs) in
-        kronecker_marginal_eigensystems(marginal_penalties, "kronecker_reparameterization_engine")?
-    {
-        marginal_eigenvalues.push(evals);
-        marginal_qs.push(evecs);
-    }
+    let invariant =
+        KroneckerInvariantStructure::compute(marginal_designs, marginal_penalties, marginal_dims)?;
+    kronecker_reparameterization_engine_with_invariant(
+        &invariant,
+        marginal_dims,
+        lambdas,
+        has_double_penalty,
+        penalty_shrinkage_floor,
+    )
+}
 
-    // Reparameterized marginals: B_k · U_k.
-    let reparameterized_marginals: Vec<Array2<f64>> = marginal_designs
-        .iter()
-        .zip(marginal_qs.iter())
-        .map(|(b_k, u_k)| crate::faer_ndarray::fast_ab(b_k, u_k))
-        .collect();
+/// Kronecker-factored reparameterization reusing a precomputed λ-invariant
+/// structure (eigensystems, reparameterized marginals, shrinkage scale).
+///
+/// Bit-identical to `kronecker_reparameterization_engine` for the same marginal
+/// data — the only difference is that the `eigh()` / `B_k U_k` work was hoisted
+/// out of the per-iterate path into the cached `invariant`. Only the λ-dependent
+/// `kronecker_logdet_and_derivatives` sweep and `floor * max_bal` scaling run here.
+pub fn kronecker_reparameterization_engine_with_invariant(
+    invariant: &KroneckerInvariantStructure,
+    marginal_dims: &[usize],
+    lambdas: &[f64],
+    has_double_penalty: bool,
+    penalty_shrinkage_floor: Option<f64>,
+) -> Result<KroneckerReparamResult, EstimationError> {
+    let marginal_eigenvalues = invariant.marginal_eigenvalues.clone();
+    let marginal_qs = invariant.marginal_qs.clone();
+    let reparameterized_marginals = invariant.reparameterized_marginals.clone();
 
     // Compute shrinkage ridge from balanced penalty eigenvalue scale.
     let penalty_shrinkage_ridge = if let Some(floor) = penalty_shrinkage_floor {
-        // Max balanced eigenvalue: for Kronecker, the balanced penalty's max
-        // eigenvalue is the max over multi-indices of Σ_k (1/||S_k||_F) μ_{k,j_k}.
-        let mut max_bal = 0.0_f64;
-        let mut multi_idx = vec![0usize; d];
-        let frob_norms: Vec<f64> = marginal_penalties
-            .iter()
-            .map(|s| s.iter().map(|v| v * v).sum::<f64>().sqrt().max(1e-12))
-            .collect();
-        loop {
-            let mut sigma = 0.0;
-            for k in 0..d {
-                sigma += marginal_eigenvalues[k][multi_idx[k]] / frob_norms[k];
-            }
-            max_bal = max_bal.max(sigma);
-
-            if kronecker_multi_index_advance(&mut multi_idx, marginal_dims) {
-                break;
-            }
-        }
-        floor * max_bal
+        floor * invariant.max_balanced_eigenvalue
     } else {
         0.0
     };

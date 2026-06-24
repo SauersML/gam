@@ -497,7 +497,6 @@ pub(crate) fn binomial_location_scale_core(
 /// tensors are unchanged. Value-channel consumers (`Order2` joint-Hessian, the
 /// dense `Tower4` oracle / gradient path) pass `true` and get the exact `−ll`.
 #[inline]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn binomial_location_scale_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
     y: f64,
     weight: f64,

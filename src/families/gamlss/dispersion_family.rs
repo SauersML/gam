@@ -310,8 +310,11 @@ pub(crate) fn dispersion_beta_nll_order2(
 /// `μ` and `φ` enter the deviance only through `powf` and a `recip`, whose
 /// `[f64; 5]` derivative stacks the tower owns, so no primitive is re-derived:
 /// only the Leibniz/Faà-di-Bruno composition is mechanized.
+/// `pub(crate)` so the test oracle (the dense `Tower4<2>` instantiation, defined
+/// in the gamlss test module) can pin the production `Order2<2>` path against it;
+/// production consumes it through [`dispersion_tweedie_nll_order2`].
 #[inline]
-fn dispersion_tweedie_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+pub(crate) fn dispersion_tweedie_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
     yi: f64,
     eta_mu: f64,
     eta_d: f64,
@@ -362,27 +365,6 @@ pub(crate) fn dispersion_tweedie_nll_order2(
     )
 }
 
-/// Dense `Tower4<2>` Tweedie row NLL: the #932 oracle for
-/// [`dispersion_tweedie_nll_order2`]. Test-only — production runs the packed
-/// `dispersion_tweedie_nll_order2`, which is its sole consumer-of-record; this
-/// dense Tower4 instantiation exists purely to pin that path bit-identical in
-/// the tests, so it lives in a `#[cfg(test)]` module (it has no production
-/// caller, and the dense Tower4 is exactly what #932 removed from the hot path).
-#[cfg(test)]
-pub(crate) mod tweedie_oracle_tests {
-    #[inline]
-    pub(crate) fn dispersion_tweedie_nll_tower(
-        yi: f64,
-        eta_mu: f64,
-        eta_d: f64,
-        p: f64,
-        wi: f64,
-    ) -> crate::families::jet_tower::Tower4<2> {
-        super::dispersion_tweedie_nll_generic::<crate::families::jet_tower::Tower4<2>>(
-            yi, eta_mu, eta_d, p, wi,
-        )
-    }
-}
 
 #[inline]
 pub(crate) fn beta_observed_cross_weight_eta(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {

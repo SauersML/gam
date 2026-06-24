@@ -1627,7 +1627,7 @@ impl std::fmt::Debug for BasisBuildResult {
 }
 
 /// Factored tensor-product basis metadata for operator-backed downstream use.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KroneckerFactoredBasis {
     /// Marginal design matrices: `marginal_designs[j]` is `(n, q_j)`.
     pub marginal_designs: Vec<Array2<f64>>,
@@ -1637,6 +1637,91 @@ pub struct KroneckerFactoredBasis {
     pub marginal_dims: Vec<usize>,
     /// Whether the system includes a global ridge (double) penalty.
     pub has_double_penalty: bool,
+    /// λ-invariant tensor structure (marginal eigensystems, reparameterized
+    /// marginals, shrinkage scale), memoized once per fit. The marginal
+    /// designs/penalties are fixed for the whole fit, so the expensive marginal
+    /// `eigh()` and `B_k·U_k` GEMMs only need to run once — every outer REML
+    /// iterate (50+ on the #1082 tensor cases) then reuses this. Filled lazily
+    /// on first use via [`Self::invariant_structure`]. NOT serialized and reset
+    /// to empty on `Clone` (it is purely a within-fit performance cache; a fresh
+    /// owner recomputes on first demand, keeping every result bit-identical).
+    invariant: std::sync::OnceLock<std::sync::Arc<crate::construction::KroneckerInvariantStructure>>,
+}
+
+impl Clone for KroneckerFactoredBasis {
+    fn clone(&self) -> Self {
+        Self {
+            marginal_designs: self.marginal_designs.clone(),
+            marginal_penalties: self.marginal_penalties.clone(),
+            marginal_dims: self.marginal_dims.clone(),
+            has_double_penalty: self.has_double_penalty,
+            // Propagate the memoized structure when present so a clone made
+            // mid-fit keeps the hoist; otherwise start empty (recomputed on
+            // first demand, identical result).
+            invariant: match self.invariant.get() {
+                Some(s) => {
+                    let cell = std::sync::OnceLock::new();
+                    let _ = cell.set(std::sync::Arc::clone(s));
+                    cell
+                }
+                None => std::sync::OnceLock::new(),
+            },
+        }
+    }
+}
+
+impl KroneckerFactoredBasis {
+    /// Construct from the fixed marginal data with an empty invariant cache.
+    pub fn new(
+        marginal_designs: Vec<Array2<f64>>,
+        marginal_penalties: Vec<Array2<f64>>,
+        marginal_dims: Vec<usize>,
+        has_double_penalty: bool,
+    ) -> Self {
+        Self {
+            marginal_designs,
+            marginal_penalties,
+            marginal_dims,
+            has_double_penalty,
+            invariant: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Lazily compute (once) and return the λ-invariant tensor structure
+    /// (marginal eigensystems, reparameterized marginals, shrinkage scale).
+    ///
+    /// Computed from the fixed marginal designs/penalties, so the result is the
+    /// same on every call within a fit; the first call pays the `eigh()` cost
+    /// and every later call is a pointer load. Because the cache is keyed on the
+    /// fixed marginal data and `marginal_penalties`/`marginal_designs` are
+    /// immutable for the fit's lifetime, no invalidation is needed.
+    pub fn invariant_structure(
+        &self,
+    ) -> Result<
+        std::sync::Arc<crate::construction::KroneckerInvariantStructure>,
+        crate::estimate::EstimationError,
+    > {
+        // Fast path: already memoized.
+        if let Some(s) = self.invariant.get() {
+            return Ok(std::sync::Arc::clone(s));
+        }
+        // Compute outside the cell (fallible) and try to install. A concurrent
+        // racer may win `set`; either way the stored value is the unique
+        // function of the fixed marginal data, so we return whichever landed.
+        let computed = std::sync::Arc::new(
+            crate::construction::KroneckerInvariantStructure::compute(
+                &self.marginal_designs,
+                &self.marginal_penalties,
+                &self.marginal_dims,
+            )?,
+        );
+        let _ = self.invariant.set(std::sync::Arc::clone(&computed));
+        Ok(self
+            .invariant
+            .get()
+            .map(std::sync::Arc::clone)
+            .unwrap_or(computed))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

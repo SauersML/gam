@@ -13,10 +13,26 @@ use super::binomial_q_derivs::{
     binomial_neglog_q_fourth_derivative_logit_closed_form,
     binomial_neglog_q_fourth_derivative_probit_closed_form,
 };
-use super::dispersion_family::tweedie_oracle_tests::dispersion_tweedie_nll_tower;
 use super::dispersion_family::{
     DISPERSION_ETA_CLAMP, DISPERSION_MIN_CURVATURE, DispersionRowKernel, dispersion_row_kernel,
+    dispersion_tweedie_nll_generic,
 };
+
+/// Dense `Tower4<2>` Tweedie row NLL oracle: the #932 all-channels instantiation
+/// of the single-source [`dispersion_tweedie_nll_generic`] that production runs
+/// as `Order2<2>` (via `dispersion_tweedie_nll_order2`). Test-only — it lives
+/// here in the gamlss test module (its sole consumer) rather than as a
+/// production `src/` item with no production caller.
+#[inline]
+fn dispersion_tweedie_nll_tower(
+    yi: f64,
+    eta_mu: f64,
+    eta_d: f64,
+    p: f64,
+    wi: f64,
+) -> crate::families::jet_tower::Tower4<2> {
+    dispersion_tweedie_nll_generic::<crate::families::jet_tower::Tower4<2>>(yi, eta_mu, eta_d, p, wi)
+}
 use crate::basis::{
     CenterStrategy, Dense, KnotSource, MaternBasisSpec, MaternIdentifiability, MaternNu,
     create_basis,
@@ -6075,6 +6091,118 @@ pub(crate) fn gaussian_joint_first_directional_hessian_matches_autodiff() {
         skew <= 1e-12,
         "Gaussian first-directional dH skew exceeds noise floor: {skew}"
     );
+}
+
+#[test]
+pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
+    use crate::families::gamlss::gaussian::location_scale::ROW_SCALAR_COMPUTE_COUNT;
+    use std::sync::atomic::Ordering;
+
+    let (y, weights, xmu, x_ls, beta_mu, beta_ls) = gaussian_logb_design_test_data();
+    let etamu = xmu.dot(&beta_mu);
+    let eta_ls = x_ls.dot(&beta_ls);
+    let pmu = beta_mu.len();
+    let p_ls = beta_ls.len();
+    let total = pmu + p_ls;
+
+    let family = GaussianLocationScaleFamily {
+        y: y.clone(),
+        weights: weights.clone(),
+        mu_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            xmu.clone(),
+        ))),
+        log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            x_ls.clone(),
+        ))),
+        policy: crate::resource::ResourcePolicy::default_library(),
+        cached_row_scalars: std::sync::RwLock::new(None),
+    };
+    let states = vec![
+        ParameterBlockState {
+            beta: beta_mu.clone(),
+            eta: etamu.clone(),
+        },
+        ParameterBlockState {
+            beta: beta_ls.clone(),
+            eta: eta_ls.clone(),
+        },
+    ];
+    let xmu_d = DenseOrOperator::Borrowed(&xmu);
+    let xls_d = DenseOrOperator::Borrowed(&x_ls);
+
+    // Independent (un-cached) reference scalars computed straight from the free
+    // function: a cache HIT must return bit-identical contents.
+    let reference =
+        gaussian_jointrow_scalars(&y, &etamu, &eta_ls, &weights).expect("reference row scalars");
+
+    // Drive all four exact-joint paths under the SAME (η_μ, η_logσ).
+    let u: Array1<f64> = Array1::from_shape_fn(total, |k| 0.11 + 0.03 * (k as f64));
+    let v: Array1<f64> = Array1::from_shape_fn(total, |k| -0.07 + 0.05 * (k as f64));
+
+    ROW_SCALAR_COMPUTE_COUNT.store(0, Ordering::Relaxed);
+
+    let h0 = family
+        .exact_newton_joint_hessian_from_designs(&states, &xmu_d, &xls_d)
+        .expect("H")
+        .expect("H present");
+    let d1 = family
+        .exact_newton_joint_hessian_directional_derivative_from_designs(
+            &states, &xmu_d, &xls_d, &u,
+        )
+        .expect("dH")
+        .expect("dH present");
+    let d2 = family
+        .exact_newton_joint_hessiansecond_directional_derivative_from_designs(
+            &states, &xmu_d, &xls_d, &u, &v,
+        )
+        .expect("d2H")
+        .expect("d2H present");
+    // The cached Arc must be byte-identical to the independent reference.
+    let cached = family
+        .get_or_compute_row_scalars(&etamu, &eta_ls)
+        .expect("cached row scalars");
+
+    // Exactly ONE recompute for all four shared-(η_μ,η_logσ) consumers.
+    let computes = ROW_SCALAR_COMPUTE_COUNT.load(Ordering::Relaxed);
+    assert_eq!(
+        computes, 1,
+        "gaulss row-scalar cache should recompute exactly once per (η_μ, η_logσ); got {computes}"
+    );
+
+    // Bit-identical cached contents vs the independent reference.
+    let fields: [(&Array1<f64>, &Array1<f64>); 7] = [
+        (&cached.obs_weight, &reference.obs_weight),
+        (&cached.w, &reference.w),
+        (&cached.m, &reference.m),
+        (&cached.n, &reference.n),
+        (&cached.kappa, &reference.kappa),
+        (&cached.kappa_prime, &reference.kappa_prime),
+        (&cached.kappa_dprime, &reference.kappa_dprime),
+    ];
+    for (got, want) in fields {
+        for (a, b) in got.iter().zip(want.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "cached row scalar bit mismatch");
+        }
+    }
+
+    // Hessians/derivatives are finite and shaped — exactness vs the analytic
+    // forms is pinned by the sibling autodiff tests; here we additionally
+    // confirm the cached path reproduces them bit-for-bit on a recompute.
+    family
+        .cached_row_scalars
+        .write()
+        .expect("lock")
+        .take(); // force a miss
+    let h0b = family
+        .exact_newton_joint_hessian_from_designs(&states, &xmu_d, &xls_d)
+        .expect("H2")
+        .expect("H2 present");
+    for (a, b) in h0.iter().zip(h0b.iter()) {
+        assert_eq!(a.to_bits(), b.to_bits(), "Hessian not bit-identical after cache invalidation");
+    }
+    assert_eq!(h0.dim(), (total, total));
+    assert!(d1.iter().all(|x| x.is_finite()));
+    assert!(d2.iter().all(|x| x.is_finite()));
 }
 
 #[test]

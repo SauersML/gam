@@ -4644,9 +4644,15 @@ fn cost_scaled_prewarm_budget_is_bounded_and_never_zero() {
     let mut prev = path_budget + 1;
     for p in (PREWARM_COST_CLIFF_COEFF_DIM + 1)..=256 {
         let b = cost_scaled_prewarm_budget(path_budget, p);
-        assert!(b >= PREWARM_MIN_SCALED_BUDGET, "p={p} budget {b} below floor");
+        assert!(
+            b >= PREWARM_MIN_SCALED_BUDGET,
+            "p={p} budget {b} below floor"
+        );
         assert!(b <= path_budget, "p={p} budget {b} above base");
-        assert!(b <= prev, "p={p} budget {b} not non-increasing (prev {prev})");
+        assert!(
+            b <= prev,
+            "p={p} budget {b} not non-increasing (prev {prev})"
+        );
         prev = b;
     }
 }

@@ -39,21 +39,76 @@ impl Clone for GaussianLocationScaleFamily {
     }
 }
 
+/// Test-only counter of how many times `get_or_compute_row_scalars` actually
+/// recomputed the O(n) transcendental row-scalar stack (cache MISS). A wired
+/// cache turns the 2nd…Kth call within one (η_μ, η_logσ) into hits, so this
+/// counter pins "redundant recompute eliminated" as a regression.
+#[cfg(test)]
+pub(crate) static ROW_SCALAR_COMPUTE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl GaussianLocationScaleFamily {
     pub const BLOCK_MU: usize = 0;
     pub const BLOCK_LOG_SIGMA: usize = 1;
+
+    /// Cheap order-preserving fingerprint of an η vector: (first, middle, last)
+    /// element. Within one outer REML evaluation η_μ and η_logσ are the fixed
+    /// inner-converged predictors, so every exact-joint consumer
+    /// (Hessian / directional / second-directional / ψ paths) is handed the
+    /// identical pair; the fingerprint lets us recompute the O(n) transcendental
+    /// row-scalar stack (`gaussian_jointrow_scalars`: one `sigma_link` jet +
+    /// `exp`/reciprocal per row) ONCE and share an `Arc` across all of them.
+    /// An empty vector fingerprints to all-`f64::NAN`, which never compares
+    /// equal to a stored fingerprint (NaN != NaN), so the empty case always
+    /// recomputes; the underlying constructor handles n = 0.
+    #[inline]
+    fn eta_fingerprint(eta: &Array1<f64>) -> (f64, f64, f64) {
+        let n = eta.len();
+        if n == 0 {
+            return (f64::NAN, f64::NAN, f64::NAN);
+        }
+        (eta[0], eta[n / 2], eta[n - 1])
+    }
 
     pub(crate) fn get_or_compute_row_scalars(
         &self,
         etamu: &Array1<f64>,
         eta_ls: &Array1<f64>,
     ) -> Result<Arc<GaussianJointRowScalars>, String> {
-        Ok(Arc::new(gaussian_jointrow_scalars(
+        let (m0, m1, m2) = Self::eta_fingerprint(etamu);
+        let (l0, l1, l2) = Self::eta_fingerprint(eta_ls);
+        // Fast path: fingerprint hit under a shared read lock. NaN fingerprints
+        // (empty η) never match because NaN != NaN, so they fall through and
+        // recompute.
+        if let Ok(guard) = self.cached_row_scalars.read() {
+            if let Some((cm0, cm1, cm2, cl0, cl1, cl2, rows)) = guard.as_ref() {
+                if *cm0 == m0
+                    && *cm1 == m1
+                    && *cm2 == m2
+                    && *cl0 == l0
+                    && *cl1 == l1
+                    && *cl2 == l2
+                {
+                    return Ok(Arc::clone(rows));
+                }
+            }
+        }
+        // Miss: compute once and publish under the write lock. A concurrent
+        // race recomputing the same (η_μ, η_logσ) is harmless — identical
+        // inputs yield bit-identical scalars — so last-writer-wins is safe and
+        // every reader observes equal contents.
+        #[cfg(test)]
+        ROW_SCALAR_COMPUTE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rows = Arc::new(gaussian_jointrow_scalars(
             &self.y,
             etamu,
             eta_ls,
             &self.weights,
-        )?))
+        )?);
+        if let Ok(mut guard) = self.cached_row_scalars.write() {
+            *guard = Some((m0, m1, m2, l0, l1, l2, Arc::clone(&rows)));
+        }
+        Ok(rows)
     }
 
     pub fn parameternames() -> &'static [&'static str] {

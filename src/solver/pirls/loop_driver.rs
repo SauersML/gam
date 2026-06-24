@@ -845,9 +845,15 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         None
     };
     let kronecker_runtime = if let Some(kron) = penalty.kronecker_factored {
-        let kron_result = crate::construction::kronecker_reparameterization_engine(
-            &kron.marginal_designs,
-            &kron.marginal_penalties,
+        // The marginal eigensystems and reparameterized marginals depend only on
+        // the fixed marginal designs/penalties, not on λ = exp(ρ). Memoize them
+        // once per fit so each outer REML iterate reuses the eigendecomposition
+        // instead of recomputing `eigh()` + `B_k·U_k` every call; only the cheap
+        // λ-grid logdet/derivative sweep is redone here. Bit-identical to the
+        // unmemoized engine.
+        let invariant = kron.invariant_structure()?;
+        let kron_result = crate::construction::kronecker_reparameterization_engine_with_invariant(
+            &invariant,
             &kron.marginal_dims,
             lambdas_slice,
             kron.has_double_penalty,
