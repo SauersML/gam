@@ -110,6 +110,12 @@ trait FlexJet: Sized + Clone {
     fn scale(&self, s: f64) -> Self;
     /// Faà di Bruno composition `f ∘ self` with stack `[f, f′, f″, f‴, f⁗]`.
     fn compose_unary(&self, d: [f64; 5]) -> Self;
+    /// The de-nested calibration residual term `tangent(self)·m`, with each
+    /// Leibniz contribution weighted `j/(j+m)` (j = derivatives landing on the
+    /// coefficient `self`, m = on the moment `m`) so the calibration always
+    /// lands its lead derivative on the coefficient — the exact `∫ η_θ e^{−q}`
+    /// residual, avoiding the symmetric-product 2× over-count of `mul`.
+    fn moment_term(&self, m: &Self) -> Self;
     /// `ln(self)` via [`ln_stack`] at the value channel.
     #[inline]
     fn ln(&self) -> Self {
