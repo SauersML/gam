@@ -2185,11 +2185,12 @@ impl SaeManifoldTerm {
             // fighting the optimizer over one atom. It gets its OWN budget
             // (`SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET`), distinct from the
             // per-atom `SAE_ATOM_COLLAPSE_RESEED_BUDGET` (which stays 1 for the
-            // reasons in its doc). Because this branch only runs when
-            // EV < `SAE_DICTIONARY_COLLAPSE_EV_FLOOR` — a fit that already explains
-            // ~zero variance — it is a no-op for every healthy K=1/K=2 fit (real
-            // OLMo EV ~0.22 / ~0.40) and can only ADD basin-escape attempts to an
-            // already-failed dictionary.
+            // reasons in its doc). Because this branch only runs when EV is at or
+            // below the data-derived collapse bar (`collapse_ev_bar` =
+            // `SAE_COLLAPSE_PCA_EV_FRACTION` × the rank-K PCA ceiling) — a fit
+            // explaining less than half the linearly-achievable variance — it is a
+            // no-op for every healthy fit and can only ADD basin-escape attempts
+            // to an already-failed dictionary.
             if self.dictionary_cocollapse_reseeds >= SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET {
                 // Multi-start budget spent. #1026: restore the BEST basin seen
                 // across all reseeds (including the original seed) before giving up
@@ -2229,9 +2230,9 @@ impl SaeManifoldTerm {
             }
             self.dictionary_cocollapse_reseeds += 1;
             log::warn!(
-                "SaeManifoldTerm: dictionary co-collapse (non-finite reconstruction \
-                 EV={ev:.4}) with no relative-norm breach; reseeding all {k} atoms onto \
-                 distinct residual PCs (dictionary multi-start \
+                "SaeManifoldTerm: dictionary co-collapse (reconstruction EV={ev:.4} at or \
+                 below the data-derived collapse bar) with no relative-norm breach; \
+                 reseeding all {k} atoms onto distinct residual PCs (dictionary multi-start \
                  {}/{SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET}: total co-collapse, no atom \
                  carries material signal to anchor)",
                 self.dictionary_cocollapse_reseeds

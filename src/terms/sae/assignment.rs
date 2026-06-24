@@ -59,9 +59,13 @@ pub(crate) const SAE_ATOM_DECODER_NORM_COLLAPSE_RATIO: f64 = 1.0e-3;
 /// basins. A single such reseed empirically cannot always break a K≥3 three-way
 /// basin (identical (K, seed) flips EV≈0.40 ↔ 0.00), so this arm gets a small
 /// bounded budget of independent multi-starts. It is consumed ONLY when the
-/// whole dictionary explains a non-finite reconstruction EV (the magic EV floor
-/// was deleted; only a genuine NaN/Inf degenerate state now triggers it) of the
-/// variance — a no-op for any healthy fit (real OLMo K=1 ~0.22, K=2 ~0.40).
+/// whole dictionary's reconstruction EV is at or below the data-derived collapse
+/// bar (`collapse_ev_bar` = `SAE_COLLAPSE_PCA_EV_FRACTION` × the rank-K PCA
+/// ceiling, i.e. less than half the variance any rank-K linear dictionary could
+/// reach) — the old absolute magic EV floor was REPLACED by that data-derived
+/// bar, not deleted. A no-op for any healthy fit (real OLMo K=1 ~0.22, K=2
+/// ~0.40, both well above the bar); on the rough patches of a hard K≥3 fit a
+/// transient sub-bar EV can still consume the budget before the fit recovers.
 pub(crate) const SAE_DICTIONARY_COCOLLAPSE_RESEED_BUDGET: usize = 3;
 
 /// Machine-precision support cutoff for the smooth JumpReLU assignment prior,
