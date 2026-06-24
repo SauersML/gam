@@ -7570,6 +7570,25 @@ where
                     });
                 }
             }
+            // Wall-clock budget guard for the outer length-scale search. The
+            // inner joint-Newton (its `cycle > 0` break) and the seed-screening
+            // cascade already abandon work once the armed deadline passes, but
+            // the κ optimizer that DRIVES those inner solves had no such guard:
+            // every fresh trial θ still paid a full cycle-0 constrained-Newton
+            // setup (which never certifies on the monotonicity-pinned baseline),
+            // and the line search kept proposing new probes, so the total fit
+            // wall-clock was (#outer evals × cycle-0 cost) — unbounded by the
+            // budget even though both lower levels honored it. Once the deadline
+            // is spent, refuse to launch any NEW inner solve: serve only the
+            // already-cached evaluations (handled above, so the best accepted
+            // iterate is still returned) and mark every uncached trial θ as the
+            // bounded-infeasible sentinel the optimizer already knows how to
+            // reject. The line search then backtracks to its accepted iterate in
+            // O(1) per probe and the driver returns the best-so-far fit. The
+            // guard is a no-op when no deadline is armed.
+            if crate::solver::rho_optimizer::outer_wall_clock_deadline_exceeded() {
+                return Ok(OuterEval::infeasible(theta.len()));
+            }
             if let Err(err) = ctx.cache.ensure_theta(theta) {
                 log::warn!(
                     "[OUTER] n-block exact-joint spatial: ensure_theta failed during gradient evaluation: {err}"
@@ -7654,6 +7673,16 @@ where
             |ctx: &mut &mut NBlockExactJointState<'_>, theta: &Array1<f64>| {
                 if let Some(cost) = ctx.cache.memoized_cost(theta) {
                     return Ok(cost);
+                }
+                // Wall-clock budget guard (cost-only line-search probe). See the
+                // sibling guard in `eval_outer`: once the armed outer deadline is
+                // spent, refuse to start a new inner solve for an uncached trial
+                // θ and return the +∞ infeasible cost the line search already
+                // treats as a rejected step, so the search collapses to its best
+                // accepted iterate in bounded time instead of paying a full
+                // cycle-0 inner setup per probe. No-op when no deadline is armed.
+                if crate::solver::rho_optimizer::outer_wall_clock_deadline_exceeded() {
+                    return Ok(f64::INFINITY);
                 }
                 if let Err(err) = ctx.cache.ensure_theta(theta) {
                     log::warn!(

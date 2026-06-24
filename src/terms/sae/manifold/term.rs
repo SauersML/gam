@@ -229,7 +229,16 @@ pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 /// applied at the call site (`penalty_scale`). The value is empirically tuned to
 /// be commensurate with the unit-scale reconstruction objective and is overridable
 /// at runtime via [`set_sae_barrier_overrides`] to sweep the response surface.
-pub(crate) const SAE_AMPLITUDE_BARRIER_STRENGTH: f64 = 100.0;
+///
+/// #1026/#1522 RETUNE (2026-06-24, real OLMo-L25 EV-vs-K ladder): the original
+/// `100` is NOT commensurate — at a healthy decoder `s_k²~O(1)` the outward force
+/// `2μ_s/(s_k²+ε)·B_k ≈ 200·B_k` dwarfs the unit-scale reconstruction gradient,
+/// pinning the outer fit in a barrier-dominated flat valley (a healthy K=1 fit
+/// stalled 3494 s with no recorded EV at `μ_s=100`). At `μ_s=1` the force is
+/// `~2·B_k`, the K=1 fit is fast, and the curved held-out EV climbs cleanly with K
+/// (0.2132 → 0.3256 → 0.4891 for K=1,2,4 on OLMo L25). So `1` IS the
+/// data-commensurate strength; `100` was itself an over-strong magic constant.
+pub(crate) const SAE_AMPLITUDE_BARRIER_STRENGTH: f64 = 1.0;
 
 // #1026/#1522 — RUNTIME barrier-tuning overrides. The strengths and the
 // active-atom GATE MODE are read through the accessors below instead of the
@@ -300,7 +309,14 @@ pub(crate) const SAE_AMPLITUDE_BARRIER_EPS: f64 = 1.0e-8;
 /// `∂P/∂c_jk = 2μ_C q_jk c_jk/(1-c_jk²+ε)` DIVERGES as atoms align (`c_jk→1`) and
 /// is exactly 0 when `c_jk = 0` — and, unlike the threshold repulsion, it does
 /// NOT switch off at small amplitude (it sees only the SHAPE `U_k`).
-pub(crate) const SAE_SEPARATION_BARRIER_STRENGTH: f64 = 100.0;
+///
+/// #1026/#1522 RETUNE (2026-06-24): paired down to `10` alongside the amplitude
+/// retune (`SAE_AMPLITUDE_BARRIER_STRENGTH` 100→1) — this is the
+/// `{μ_amp=1, μ_sep=10}` config that produced the clean OLMo L25 EV-vs-K climb.
+/// The separation force already DIVERGES near alignment (`1/(1-c²+ε)`), so a
+/// large flat-region prefactor is unnecessary and only adds outer-objective
+/// stiffness away from collapse.
+pub(crate) const SAE_SEPARATION_BARRIER_STRENGTH: f64 = 10.0;
 
 /// #1026/#1522 SEPARATION barrier softening `ε` in `log(1 - c_jk² + ε)`. Bounds
 /// the barrier (and its PSD majorizer) at the exact-alignment limit `c_jk² = 1`.
