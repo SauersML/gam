@@ -5249,17 +5249,22 @@ mod tests {
             FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp, BetaPenaltyOp,
         };
 
-        let p = 3usize;
-        let ranks = vec![2usize, 3usize];
-        let basis_sizes = vec![2usize, 2usize];
-        let n_atoms = ranks.len();
+        // Large enough to clear the device-offload policy floor (k ≥ 32 and
+        // n·k·d·iters ≥ MATVEC_OFFLOAD_FLOPS_MIN) so the GPU kernel actually
+        // runs on a device rather than the policy declining.
+        let p = 6usize;
+        let n_atoms = 8usize;
+        let ranks: Vec<usize> = (0..n_atoms)
+            .map(|k| if k % 2 == 0 { 3usize } else { p })
+            .collect();
+        let basis_sizes: Vec<usize> = (0..n_atoms).map(|_| 3usize).collect();
         let mut border_offsets = Vec::with_capacity(n_atoms);
         let mut acc = 0usize;
         for k in 0..n_atoms {
             border_offsets.push(acc);
             acc += basis_sizes[k] * ranks[k];
         }
-        let border_dim = acc;
+        let border_dim = acc; // Σ M_k·r_k = 4·(3·3) + 4·(3·6) = 36 + 72 = 108
 
         let mut state = 0xfeed_face_dead_beefu64;
         let mut sample = || -> f64 {
@@ -5300,8 +5305,14 @@ mod tests {
             }
             w
         };
+        let mut pairs: Vec<(usize, usize)> = (0..n_atoms).map(|k| (k, k)).collect();
+        // A few off-diagonal cross blocks (symmetric pairs).
+        for &(i, j) in &[(0usize, 1usize), (2, 4), (3, 6)] {
+            pairs.push((i, j));
+            pairs.push((j, i));
+        }
         let mut frame_blocks = Vec::new();
-        for &(i, j) in &[(0usize, 0usize), (1, 1), (0, 1), (1, 0)] {
+        for &(i, j) in &pairs {
             let (mi, mj) = (basis_sizes[i], basis_sizes[j]);
             let mut g = Array2::<f64>::zeros((mi, mj));
             for r in 0..mi {
@@ -5341,8 +5352,8 @@ mod tests {
             });
             smooth_ranks.push(ranks[k]);
         }
-        let n = 5usize;
-        let q = 3usize;
+        let n = 400usize;
+        let q = 4usize;
         let mut sys = ArrowSchurSystem::new(n, q, border_dim);
         let mut row_htbeta = Vec::new();
         for i in 0..n {
@@ -5360,7 +5371,9 @@ mod tests {
             let mut slab = vec![0.0_f64; q * border_dim];
             for c in 0..q {
                 for col in 0..border_dim {
-                    let v = 0.12 * sample();
+                    // Small entries: with 400 rows the reduced-Schur subtraction
+                    // Σ_i H_βtᵀ H_tt⁻¹ H_tβ must not overwhelm the PD penalty.
+                    let v = 0.02 * sample();
                     slab[c * border_dim + col] = v;
                     sys.rows[i].htbeta[[c, col]] = v;
                 }
