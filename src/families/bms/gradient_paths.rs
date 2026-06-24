@@ -1952,6 +1952,41 @@ pub(super) fn rigid_standard_normal_fourth_full(
     Ok(rigid_standard_normal_tower(marginal, g, z, y, w, probit_scale)?.t4)
 }
 
+/// Combined uncontracted THIRD **and** FOURTH primary tensors for one rigid
+/// standard-normal row, read off a SINGLE shared `Tower4<2>` jet.
+///
+/// `rigid_standard_normal_third_full` (→ `.t3`) and
+/// `rigid_standard_normal_fourth_full` (→ `.t4`) each build a full
+/// `rigid_standard_normal_tower` and discard the OTHER tensor — so a consumer
+/// that needs both for the same `(row, β)` point (the outer Jeffreys/REML
+/// derivative path warms both the `rigid_third_full` and `rigid_fourth_full`
+/// caches in the same fit; see the paired `rigid_{third,fourth}_full_cached`
+/// warm-up) pays the per-row Mills-ratio transcendental
+/// (`signed_probit_neglog_unary_stack`, ~88% of the per-row scalar cost) TWICE
+/// where ONCE suffices. The two tensors are the `.t3` / `.t4` channels of the
+/// same tower, so this builder evaluates that tower ONCE and returns both.
+///
+/// EXACTNESS. The returned `(t3, t4)` are bit-identical to
+/// `rigid_standard_normal_third_full` / `rigid_standard_normal_fourth_full`
+/// respectively — it is literally the same `rigid_standard_normal_tower` call,
+/// so no accuracy and no generality (the unified single-source jet) is lost; the
+/// only thing removed is the redundant second transcendental. The codegen-level
+/// redundancy (two `#[inline(never)]` tower builds are NOT CSE'd into one) was
+/// verified by emitting asm for the two-call vs combined shapes: two calls to
+/// the transcendental collapse to one.
+#[inline]
+pub(super) fn rigid_standard_normal_third_and_fourth_full(
+    marginal: BernoulliMarginalLinkMap,
+    g: f64,
+    z: f64,
+    y: f64,
+    w: f64,
+    probit_scale: f64,
+) -> Result<([[[f64; 2]; 2]; 2], [[[[f64; 2]; 2]; 2]; 2]), String> {
+    let tower = rigid_standard_normal_tower(marginal, g, z, y, w, probit_scale)?;
+    Ok((tower.t3, tower.t4))
+}
+
 /// Contract a symmetric 4-tensor on its last two indices with two
 /// primary-space directions `u = (u_eta, u_g)` and `v = (v_eta, v_g)`,
 /// producing the symmetric 2×2 matrix the outer-Hessian pipeline expects:
@@ -2199,7 +2234,13 @@ mod jet_tower_oracle_tests {
                 )
                 .expect("production row kernel");
 
-                let third_full = rigid_standard_normal_third_full(
+                // One shared tower for BOTH the third and fourth tensors (the
+                // #932 transcendental-de-dup builder): this is the redundancy-
+                // free form of the former two separate
+                // `rigid_standard_normal_{third,fourth}_full` calls, and it is
+                // pinned bit-identically against them in
+                // `rigid_third_and_fourth_full_shares_one_tower_bit_identical`.
+                let (third_full, fourth_full) = rigid_standard_normal_third_and_fourth_full(
                     marginal,
                     g[row],
                     z[row],
@@ -2207,21 +2248,12 @@ mod jet_tower_oracle_tests {
                     w[row],
                     probit_scale,
                 )
-                .expect("production third");
+                .expect("production third+fourth");
                 let third: Vec<([f64; 2], [[f64; 2]; 2])> = dirs
                     .iter()
                     .map(|d| (*d, contract_third_full(&third_full, d[0], d[1])))
                     .collect();
 
-                let fourth_full = rigid_standard_normal_fourth_full(
-                    marginal,
-                    g[row],
-                    z[row],
-                    y[row],
-                    w[row],
-                    probit_scale,
-                )
-                .expect("production fourth");
                 let fourth: Vec<([f64; 2], [f64; 2], [[f64; 2]; 2])> = dirs
                     .iter()
                     .enumerate()
@@ -2281,6 +2313,61 @@ mod jet_tower_oracle_tests {
                         (fd - ad).abs() <= 1e-5 * ad.abs().max(1.0),
                         "row {row} {label}: FD witness {fd:+.6e} != tower grad {ad:+.6e}"
                     );
+                }
+            }
+        }
+    }
+
+    /// #932 transcendental de-duplication: the combined
+    /// [`rigid_standard_normal_third_and_fourth_full`] builder reads BOTH the
+    /// third and fourth uncontracted tensors off ONE shared
+    /// `rigid_standard_normal_tower` (one Mills-ratio transcendental per row),
+    /// and must be BIT-IDENTICAL to the two separate single-tensor builders
+    /// (`rigid_standard_normal_third_full` + `rigid_standard_normal_fourth_full`,
+    /// two transcendentals). This pins the exactness of the redundancy
+    /// elimination: `==`, max diff exactly 0.0 — same tower, no accuracy or
+    /// generality change, only the redundant second transcendental removed.
+    #[test]
+    fn rigid_third_and_fourth_full_shares_one_tower_bit_identical() {
+        let eta = [0.3_f64, -0.7, 0.05, 0.9, -1.2, 2.1, -2.4];
+        let g = [0.2_f64, -0.5, 0.35, -0.15, 0.6, 0.45, -0.55];
+        let z = [0.4_f64, -1.1, 0.0, 0.7, -0.3, 1.6, -1.4];
+        let y = [1.0_f64, 0.0, 0.0, 1.0, 1.0, 0.0, 1.0];
+        let w = [1.0_f64, 0.8, 1.3, 0.9, 1.1, 0.7, 1.4];
+        for &probit_scale in &[1.0_f64, 0.8] {
+            for r in 0..eta.len() {
+                let marginal = bernoulli_marginal_link_map(
+                    &InverseLink::Standard(crate::types::StandardLink::Probit),
+                    eta[r],
+                )
+                .expect("link map");
+                let t3_sep =
+                    rigid_standard_normal_third_full(marginal, g[r], z[r], y[r], w[r], probit_scale)
+                        .expect("separate third");
+                let t4_sep = rigid_standard_normal_fourth_full(
+                    marginal, g[r], z[r], y[r], w[r], probit_scale,
+                )
+                .expect("separate fourth");
+                let (t3_comb, t4_comb) = rigid_standard_normal_third_and_fourth_full(
+                    marginal, g[r], z[r], y[r], w[r], probit_scale,
+                )
+                .expect("combined third+fourth");
+                // Exact bitwise equality (same tower) — no tolerance.
+                for a in 0..2 {
+                    for b in 0..2 {
+                        for c in 0..2 {
+                            assert_eq!(
+                                t3_comb[a][b][c], t3_sep[a][b][c],
+                                "t3[{a}][{b}][{c}] row {r} scale {probit_scale} not bit-identical"
+                            );
+                            for d in 0..2 {
+                                assert_eq!(
+                                    t4_comb[a][b][c][d], t4_sep[a][b][c][d],
+                                    "t4[{a}][{b}][{c}][{d}] row {r} scale {probit_scale} not bit-identical"
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
