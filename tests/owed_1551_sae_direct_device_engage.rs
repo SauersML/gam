@@ -37,8 +37,8 @@ use gam::gpu::kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
 use gam::gpu::policy::GpuDispatchPolicy;
 use gam::gpu::GpuRuntime;
 use gam::solver::arrow_schur::{
-    solve_arrow_newton_step_with_options, ArrowSchurSystem, ArrowSolveOptions, BetaPenaltyOp,
-    DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
+    solve_arrow_newton_step_with_options, ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode,
+    BetaPenaltyOp, DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
 };
 use ndarray::Array2;
 
@@ -255,14 +255,18 @@ fn sae_direct_mode_engages_device_on_production_entry_1551() {
         GpuDispatchPolicy::DEVICE_LOOP_MIN_P
     );
 
-    // PRODUCTION shape: Direct mode + the default finite trust region. This is
-    // exactly what `converge_inner_for_undamped_logdet` builds; it is NOT the
-    // `inexact_pcg()` + `radius == INFINITY` shape the old device test used.
+    // PRODUCTION shape: the exact options `converge_inner_for_undamped_logdet`
+    // builds. The mode is Direct — and Direct mode is the EXACT full Newton step
+    // (no trust-region truncation), so the trust radius is irrelevant to the
+    // solve. The pre-existing InexactPCG device branch is gated on BOTH
+    // `mode == InexactPCG` AND `radius == INFINITY`; production SAE is Direct
+    // mode, so it never reaches that gate regardless of the radius. The Direct
+    // device branch this gate exercises engages on `mode == Direct` directly.
     let options = ArrowSolveOptions::direct().with_ill_conditioning_tolerated();
-    assert!(
-        options.trust_region.radius.is_finite(),
-        "production Direct options must carry a FINITE trust radius (the old gate \
-         required INFINITY, which no production site sets)"
+    assert_eq!(
+        options.mode,
+        ArrowSolverMode::Direct,
+        "production SAE inner solve must be Direct mode (the device branch under test)"
     );
 
     // CPU dense reference (the exact full Direct step the device must reproduce).
