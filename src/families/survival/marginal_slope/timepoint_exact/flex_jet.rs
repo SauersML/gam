@@ -1784,6 +1784,16 @@ mod moment_engine_tests {
     /// The moving cell-edge `z` as a jet: a `Crossing { tau }` edge sits at
     /// `z = (τ − a)/b` and moves with the intercept jet `a_jet` and slope jet
     /// `b_jet`; a `Fixed(z)` edge is static (a constant jet, no θ-motion).
+    ///
+    /// Evaluating `(τ−a)·(1/b)` in the jet algebra reproduces the entire §C
+    /// crossing-edge velocity recursion for free — no hand flux formula. From the
+    /// defining identity `b·z = τ − a`, differentiating `n` times along a path
+    /// gives `Σ_{k=0}^n binom(n,k) b^(k) z^(n−k) = τ^(n) − a^(n)`, i.e.
+    /// `z^(n) = (τ^(n) − a^(n) − Σ_{k=1}^n binom(n,k) b^(k) z^(n−k)) / b`
+    /// (`z_1 = (τ_1−a_1−b_1 z)/b`, …, `z_4 = (τ_4−a_4−4b_1 z_3−6b_2 z_2−4b_3 z_1−b_4 z)/b`).
+    /// That is exactly what `sub` + `mul(&recip(b))` compute channel-for-channel,
+    /// so the moving-boundary edge velocities the hand `directional`/`bidirectional`
+    /// assemble by explicit flux drop out of the seed.
     fn cell_edge_jet<J: FlexJet>(
         a_jet: &J,
         b_jet: &J,
