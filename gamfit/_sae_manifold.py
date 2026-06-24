@@ -2458,7 +2458,7 @@ class ManifoldSAE:
         # `self.assignment` is the canonical kind. Active-atom detection is
         # mode-specific:
         #   softmax   -> active if its share exceeds the uniform mass 1/K;
-        #   ibp_map   -> active if its posterior gate exceeds the 0.5 threshold;
+        #   ibp_map   -> active if it carries any responsibility mass (> 1e-8);
         #   jumprelu  -> active if the (hard) gate is nonzero (> 0).
         kind = _canonical_assignment(self.assignment, "assignment")
         if kind == "softmax":
@@ -2466,7 +2466,14 @@ class ManifoldSAE:
         elif kind == "jumprelu":
             threshold = 0.0
         else:  # ibp_map
-            threshold = 0.5
+            # #1547: ``self.assignments`` holds the normalized reconstruction
+            # responsibilities (``assignments_z``), which sum to ~1 across the K
+            # atoms per row -- NOT posterior gates. The per-row max therefore
+            # cannot reach a 0.5 gate bar once K>=2, so a 0.5 threshold collapses
+            # avg_active_atoms to ~0. "Active" for a responsibility array means
+            # mass above a small epsilon, matching ``_closed_form_trust_diagnostics``
+            # (``assignments[:, k] > 1e-8``).
+            threshold = 1.0e-8
         avg_active, mean_mass = rust_module().sae_manifold_assignment_summary(self.assignments, threshold)
         return {
             "K": len(self.atoms),
