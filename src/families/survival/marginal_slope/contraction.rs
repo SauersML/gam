@@ -3,39 +3,12 @@
 
 use super::*;
 
-struct SurvivalMarginalSlopeRigidRowProgram<'a> {
-    family: &'a SurvivalMarginalSlopeFamily,
-    block_states: &'a [ParameterBlockState],
-}
-
-impl crate::families::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRigidRowProgram<'_> {
-    fn n_rows(&self) -> usize {
-        self.family.n
-    }
-
-    fn primaries(&self, row: usize) -> Result<[f64; 4], String> {
-        rigid_row_kernel_primaries(self.family, self.block_states, row)
-    }
-
-    fn row_nll(
-        &self,
-        row: usize,
-        p: &[crate::families::jet_tower::Tower4<4>; 4],
-    ) -> Result<crate::families::jet_tower::Tower4<4>, String> {
-        rigid_row_kernel_nll_tower(
-            self.family,
-            self.block_states,
-            row,
-            p,
-            "survival marginal-slope rigid row helper tower",
-        )
-    }
-}
+use crate::families::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 
 impl SurvivalMarginalSlopeFamily {
     /// Build the row's third-order contracted tensor
-    /// `T[a][b] = d_ea d_eb d_dir NLL_i` from the single rigid
-    /// `RowNllProgram` tower.
+    /// `T[a][b] = d_ea d_eb d_dir NLL_i` from the single-source rigid row NLL
+    /// at the packed `OneSeed<4>` directional scalar (no dense `t3`).
     pub(crate) fn row_primary_third_contracted_tower(
         &self,
         row: usize,
@@ -51,20 +24,25 @@ impl SurvivalMarginalSlopeFamily {
             }
             .into());
         }
-        let program = SurvivalMarginalSlopeRigidRowProgram {
-            family: self,
-            block_states,
-        };
         let mut dir_arr = [0.0_f64; N_PRIMARY];
         dir_arr.copy_from_slice(dir.as_slice().ok_or_else(|| {
             "survival rigid third contracted: non-contiguous direction".to_string()
         })?);
-        crate::families::jet_tower::derived_third_contracted(&program, row, &dir_arr)
+        let inputs = rigid_row_inputs(
+            self,
+            block_states,
+            row,
+            "survival marginal-slope rigid row helper third",
+        )?;
+        let p = rigid_row_kernel_primaries(self, block_states, row)?;
+        let vars: [OneSeed<4>; 4] =
+            std::array::from_fn(|a| OneSeed::seed_direction(p[a], a, dir_arr[a]));
+        Ok(rigid_row_nll(&vars, &inputs)?.contracted_third())
     }
 
     /// Build the row's fourth-order contracted tensor
-    /// `T[a][b] = d_ea d_eb d_dir_u d_dir_v NLL_i` from the single rigid
-    /// `RowNllProgram` tower.
+    /// `T[a][b] = d_ea d_eb d_dir_u d_dir_v NLL_i` from the single-source rigid
+    /// row NLL at the packed `TwoSeed<4>` bidirectional scalar (no dense `t4`).
     pub(crate) fn row_primary_fourth_contracted_tower(
         &self,
         row: usize,
@@ -82,10 +60,6 @@ impl SurvivalMarginalSlopeFamily {
             }
             .into());
         }
-        let program = SurvivalMarginalSlopeRigidRowProgram {
-            family: self,
-            block_states,
-        };
         let mut u_arr = [0.0_f64; N_PRIMARY];
         u_arr.copy_from_slice(dir_u.as_slice().ok_or_else(|| {
             "survival rigid fourth contracted: non-contiguous u direction".to_string()
@@ -94,24 +68,40 @@ impl SurvivalMarginalSlopeFamily {
         v_arr.copy_from_slice(dir_v.as_slice().ok_or_else(|| {
             "survival rigid fourth contracted: non-contiguous v direction".to_string()
         })?);
-        crate::families::jet_tower::derived_fourth_contracted(&program, row, &u_arr, &v_arr)
+        let inputs = rigid_row_inputs(
+            self,
+            block_states,
+            row,
+            "survival marginal-slope rigid row helper fourth",
+        )?;
+        let p = rigid_row_kernel_primaries(self, block_states, row)?;
+        let vars: [TwoSeed<4>; 4] =
+            std::array::from_fn(|a| TwoSeed::seed(p[a], a, u_arr[a], v_arr[a]));
+        Ok(rigid_row_nll(&vars, &inputs)?.contracted_fourth())
     }
 
-    /// Compute per-row primary gradient and Hessian using the rigid
-    /// `RowNllProgram` tower.  The hot inner computation uses stack arrays only;
-    /// conversion to Array1/Array2 happens once at the boundary for API
-    /// compatibility with outer-derivative paths.
+    /// Compute per-row primary gradient and Hessian from the single-source rigid
+    /// row NLL at the packed `Order2<4>` scalar (no dense `Tower4<4>`). The hot
+    /// inner computation uses stack arrays only; conversion to Array1/Array2
+    /// happens once at the boundary for API compatibility with outer-derivative
+    /// paths.
     pub(crate) fn compute_row_primary_gradient_hessian_uncached(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
     ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
-        let program = SurvivalMarginalSlopeRigidRowProgram {
-            family: self,
+        let inputs = rigid_row_inputs(
+            self,
             block_states,
-        };
-        let (nll, grad_arr, hess_arr) =
-            crate::families::jet_tower::derived_row_kernel(&program, row)?;
+            row,
+            "survival marginal-slope rigid row helper kernel",
+        )?;
+        let p = rigid_row_kernel_primaries(self, block_states, row)?;
+        let vars: [Order2<4>; 4] = std::array::from_fn(|a| Order2::variable(p[a], a));
+        let out = rigid_row_nll(&vars, &inputs)?;
+        let nll = out.value();
+        let grad_arr = out.g();
+        let hess_arr = out.h();
         // Convert stack arrays to ndarray types at the boundary.
         let grad = Array1::from_vec(grad_arr.to_vec());
         let mut hess = Array2::zeros((N_PRIMARY, N_PRIMARY));
