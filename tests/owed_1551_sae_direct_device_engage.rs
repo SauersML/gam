@@ -246,9 +246,20 @@ fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
         .fold(0.0_f64, |m, (x, y)| m.max((x - y).abs()))
 }
 
+fn trace(msg: &str) {
+    use std::io::Write;
+    if let Ok(path) = std::env::var("OWED_1551_TRACE") {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            writeln!(f, "{msg}").ok();
+        }
+    }
+}
+
 #[test]
 fn sae_direct_mode_engages_device_on_production_entry_1551() {
+    trace("start");
     let sys = build_framed_sae_system(true);
+    trace("built sys with device data");
 
     // The wide factored border must clear the device-loop floor; this is the
     // shape the Phase-1 offload predicate admits. If this regresses below the
@@ -287,9 +298,11 @@ fn sae_direct_mode_engages_device_on_production_entry_1551() {
         sys_cpu.device_sae_pcg.is_none(),
         "device-free baseline must carry no device frames"
     );
+    trace("solving device-free CPU baseline");
     let (cpu_dt, cpu_db, cpu_cache) =
         solve_arrow_newton_step_with_options(&sys_cpu, 0.0, 0.0, &options)
             .expect("device-free CPU Direct baseline solve must succeed");
+    trace("device-free baseline solved");
     assert!(
         !cpu_cache.pcg_diagnostics.used_device_arrow,
         "the device-free baseline must NOT claim device execution"
@@ -297,18 +310,25 @@ fn sae_direct_mode_engages_device_on_production_entry_1551() {
 
     // Loose physical cross-check: the reduced-Schur Direct step and the full
     // dense-joint solve agree to the fixture's conditioning floor.
+    trace("solving dense reference");
     let reference = solve_arrow_newton_step_dense_reference(&sys, 0.0, 0.0)
         .expect("CPU dense reference solve must succeed");
     let ref_dt = max_abs_diff(cpu_dt.as_slice().unwrap(), reference.delta_t.as_slice().unwrap());
     let ref_db = max_abs_diff(cpu_db.as_slice().unwrap(), reference.delta_beta.as_slice().unwrap());
+    trace(&format!("dense ref done ref_dt={ref_dt:.3e} ref_db={ref_db:.3e}"));
     assert!(
         ref_dt <= 1e-2 && ref_db <= 1e-2,
         "reduced-Schur Direct step must agree with the full dense-joint solve to the \
          fixture conditioning floor (max|Δt|={ref_dt:.3e}, max|Δβ|={ref_db:.3e})"
     );
 
+    trace("solving production (device-data) system");
     let (delta_t, delta_beta, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
         .expect("production Direct-mode SAE solve must succeed");
+    trace(&format!(
+        "production solved used_device_arrow={}",
+        cache.pcg_diagnostics.used_device_arrow
+    ));
 
     // The joint-Hessian log-det MUST be present and finite on EITHER path — this
     // is the Laplace normaliser every production SAE inner solve consumes. The
