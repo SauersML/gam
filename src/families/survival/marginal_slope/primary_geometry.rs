@@ -298,6 +298,7 @@ pub(crate) struct SurvivalFlexTimepointDirectionalExact {
     pub(crate) chi_uv_dir: Array2<f64>,
     pub(crate) d_u_dir: Array1<f64>,
     pub(crate) d_uv_dir: Array2<f64>,
+    pub(crate) a_uv_dir: Array2<f64>,
 }
 
 pub(crate) struct SurvivalFlexTimepointBiDirectionalExact {

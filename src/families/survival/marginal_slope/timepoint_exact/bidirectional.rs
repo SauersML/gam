@@ -1264,13 +1264,17 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         let ad12 = aud2.dot(dir1);
-        let aud12 = auvd2.dot(dir1);
         // Mixed second-directional `d_u` derivative `D_dir1 D_dir2(d_u)` via the
         // FD-validated directional `d_uv_dir` (= `D_dir1(d_uv)`), contracted with
         // dir2: `d_u_d12[u] = Σ_v d_uv_dir1[u,v]·dir2[v] = D_dir1 D_dir2(d_u[u])`.
         let dir1_ext = self.compute_survival_timepoint_directional_exact_from_cached(
             row, primary, q, q_index, a, b, beta_h, beta_w, cached, dir1, true,
         )?;
+        // aud12 = D_dir1 D_dir2 a_u, single-sourced from the EXACT directional
+        // a_uv_dir (mirroring d_u_d12); the prior local `auvd2.dot(dir1)` used the
+        // bidirectional's own auvd2 re-derivation, which diverged at the q0/warp
+        // rows and corrupted auvd12 -> eta_uv_uv -> the #1454 gate (gam#1454).
+        let aud12 = dir1_ext.a_uv_dir.dot(dir2);
         let d_u_d12 = dir1_ext.d_uv_dir.dot(dir2);
 
         // a_u and d_u bilinear jets carry (·, D_dir1, D_dir2, D_dir1 D_dir2).

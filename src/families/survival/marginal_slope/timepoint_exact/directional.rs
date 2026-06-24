@@ -1899,6 +1899,7 @@ impl SurvivalMarginalSlopeFamily {
         }
 
         Ok(SurvivalFlexTimepointDirectionalExact {
+            a_uv_dir,
             eta_uv_dir,
             eta_u_dir,
             chi_u_dir,
