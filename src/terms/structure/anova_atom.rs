@@ -104,6 +104,22 @@ use crate::solver::grid_spline_2d::{GridSpline2dDesign, axis_basis_at};
 /// the centering algebra. Auto-applied — no knob.
 pub const FISSION_MAX_INTERACTION_FRACTION: f64 = 1e-6;
 
+/// Interaction energy fraction at or below which the gauge-projected
+/// interaction block is f64 roundoff rather than signal, so the binding Wald
+/// test cannot constitute proof of binding. An exactly-additive surface fits to
+/// machine precision; its scale-included posterior covariance collapses
+/// (`σ̂² → 0`) while the projected interaction coefficients are pure centering
+/// roundoff, so the Wald statistic degenerates into a `0/0` ratio — roundoff
+/// coefficients divided by a vanishing covariance — that can read as
+/// overwhelmingly significant (`p ≈ 0`). At or below this floor (a relative
+/// amplitude of `1e-6`, far above the ~`1e-30` roundoff an exactly-additive
+/// carve actually lands at, yet far below any interaction a finite-sample fit
+/// can statistically resolve) the surface is additive by construction and no
+/// such statistic counts as binding: absence of an interaction is not evidence
+/// of one. This keeps a numerically-additive atom from being held whole on a
+/// phantom edge. Auto-applied — no knob.
+const INTERACTION_NUMERICAL_FLOOR: f64 = 1e-12;
+
 /// Which binding notion a carve report speaks about (see module docs; the
 /// two are independent and a complete adjudication runs both).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1139,7 +1155,16 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
         }
     };
 
-    let binding_proven = edge_p_value.is_some_and(|p| p <= alpha);
+    // A Wald test cannot prove the PRESENCE of an interaction whose energy is
+    // numerically indistinguishable from zero. When the interaction block is at
+    // the f64 roundoff floor (an exactly-additive surface fit to machine
+    // precision), the scale-included posterior collapses with it and the Wald
+    // statistic becomes a 0/0 artifact that can read as overwhelmingly
+    // significant (p ≈ 0). Below the floor the surface is additive by
+    // construction, so no statistic counts as binding and the atom is free to
+    // fission — see `INTERACTION_NUMERICAL_FLOOR`.
+    let numerically_additive = interaction_fraction <= INTERACTION_NUMERICAL_FLOOR;
+    let binding_proven = !numerically_additive && edge_p_value.is_some_and(|p| p <= alpha);
     let negligible = interaction_fraction <= FISSION_MAX_INTERACTION_FRACTION;
     let fission = if negligible && !binding_proven {
         Some(FissionPlan {
