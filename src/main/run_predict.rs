@@ -176,7 +176,10 @@ pub(crate) fn run_predict_unified(
         (
             pred.eta,
             pred.mean,
-            Some(pred.eta_standard_error),
+            // `std_error` is the response-scale SE column, beside the
+            // response-scale mean/band — emit `mean_standard_error`, not the
+            // link-scale `eta_standard_error` (#1536).
+            Some(pred.mean_standard_error),
             Some(pred.mean_lower),
             Some(pred.mean_upper),
         )
@@ -195,7 +198,15 @@ pub(crate) fn run_predict_unified(
         (
             pm.eta,
             pm.mean,
-            Some(pm.eta_standard_error),
+            // Response-scale `std_error` (#1536): the posterior-mean path
+            // populates `mean_standard_error` whenever a confidence level is
+            // requested (it is here); fall back to the link-scale SE only for
+            // the unreachable point-only case.
+            Some(
+                pm.mean_standard_error
+                    .clone()
+                    .unwrap_or(pm.eta_standard_error),
+            ),
             pm.mean_lower,
             pm.mean_upper,
         )

@@ -292,13 +292,22 @@ class Model:
             options["observation_interval"] = observation_interval
         try:
             rust = rust_module()
-            return rust.predict_array(
+            result = rust.predict_array(
                 self._model_bytes,
                 rust.numeric_matrix_f64(X, "X"),
                 json.dumps(options),
             )
         except Exception as exc:
             raise map_exception(exc) from exc
+        if interval is None:
+            # Parity with :meth:`predict` (#1537): with no interval the result is
+            # the 1-D response-scale prediction vector, not the engine's
+            # `[linear_predictor, mean]` column matrix. The FFI returns the lone
+            # response-scale `mean` column as `(n, 1)`; drop the trailing axis.
+            import numpy as np
+
+            return np.asarray(result).reshape(-1)
+        return result
 
     def predict_conformal(
         self,

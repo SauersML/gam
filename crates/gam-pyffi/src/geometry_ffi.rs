@@ -5763,6 +5763,20 @@ fn predict_array_impl(
     }
     let options = parse_predict_options(options_json)?;
     let columns = predict_columns(&model, dataset, &options)?;
+    // Parity with `predict()` (#1537): with no interval requested, return the
+    // single response-scale `mean` column as an `(n, 1)` array — the Python
+    // wrapper ravels it to the documented 1-D response-scale prediction vector.
+    // Returning the full alphabetical `[linear_predictor, mean]` matrix here
+    // both breaks shape parity and silently hands a naive `[:, 0]` / `.ravel()`
+    // caller the LINK-scale linear predictor on non-identity links. With an
+    // interval the full column matrix is retained for the array caller.
+    if options.interval.is_none() {
+        let mean = columns
+            .get("mean")
+            .ok_or_else(|| "predict_array: response `mean` column missing".to_string())?;
+        return Array2::from_shape_vec((mean.len(), 1), mean.clone())
+            .map_err(|err| format!("predict_array: failed to shape mean column: {err}"));
+    }
     columns_to_array(columns)
 }
 
@@ -5927,10 +5941,18 @@ fn predict_columns(
                 })?;
             columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
             columns.insert("mean".to_string(), prediction.mean.to_vec());
-            columns.insert(
-                "std_error".to_string(),
-                prediction.eta_standard_error.to_vec(),
-            );
+            // `std_error` is documented and laid out as the response-scale SE
+            // (beside the response-scale `mean`/`mean_lower`/`mean_upper`), so
+            // emit the response-scale `mean_standard_error` — the SE the band is
+            // built from — not the link-scale `eta_standard_error` (#1536). The
+            // posterior-mean path always populates it once an interval is
+            // requested; fall back to the link-scale SE only for the (here
+            // unreachable) point-only case.
+            let response_se = prediction
+                .mean_standard_error
+                .clone()
+                .unwrap_or_else(|| prediction.eta_standard_error.clone());
+            columns.insert("std_error".to_string(), response_se.to_vec());
             columns.insert("mean_lower".to_string(), mean_lower.to_vec());
             columns.insert("mean_upper".to_string(), mean_upper.to_vec());
             // Observation (prediction) interval: present only when the request
@@ -5977,9 +5999,11 @@ fn predict_columns(
                 .map_err(|err| format!("prediction with uncertainty failed: {err}"))?;
             columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
             columns.insert("mean".to_string(), prediction.mean.to_vec());
+            // Response-scale SE beside the response-scale mean/band (#1536):
+            // emit `mean_standard_error`, not the link-scale `eta_standard_error`.
             columns.insert(
                 "std_error".to_string(),
-                prediction.eta_standard_error.to_vec(),
+                prediction.mean_standard_error.to_vec(),
             );
             columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());
             columns.insert("mean_upper".to_string(), prediction.mean_upper.to_vec());
@@ -6161,9 +6185,11 @@ fn predict_columns_conformal(
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
     columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
     columns.insert("mean".to_string(), prediction.mean.to_vec());
+    // Response-scale SE beside the response-scale mean/band (#1536): emit
+    // `mean_standard_error`, not the link-scale `eta_standard_error`.
     columns.insert(
         "std_error".to_string(),
-        prediction.eta_standard_error.to_vec(),
+        prediction.mean_standard_error.to_vec(),
     );
     // mean_lower / mean_upper now carry the distribution-free conformal bounds.
     columns.insert("mean_lower".to_string(), prediction.mean_lower.to_vec());

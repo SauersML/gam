@@ -734,6 +734,7 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
         eta: state.eta,
         eta_standard_error: cond_eta_se.clone(),
         mean: state.mean,
+        mean_standard_error: None,
         mean_lower: None,
         mean_upper: None,
         observation_lower: None,
@@ -783,6 +784,10 @@ pub fn predict_posterior_mean_generic<T: PredictionTransform>(
         _ => (cond_eta_se, cond_mean_se),
     };
     result.eta_standard_error = eta_se;
+    // Record the response-scale SE used to build the credible band so the FFI/CLI
+    // predict tables can report it as `std_error` instead of the link-scale σ_η
+    // (#1536).
+    result.mean_standard_error = Some(mean_se.clone());
 
     {
         let response_map = |eta: &Array1<f64>| transform.response(eta);
@@ -1134,6 +1139,7 @@ mod parity_tests {
             eta: eta.clone(),
             eta_standard_error: eta_se.clone(),
             mean: mean.clone(),
+            mean_standard_error: None,
             mean_lower: None,
             mean_upper: None,
             observation_lower: None,
@@ -1163,6 +1169,7 @@ mod parity_tests {
             eta: eta.clone(),
             eta_standard_error: eta_se.clone(),
             mean: mean.clone(),
+            mean_standard_error: None,
             mean_lower: None,
             mean_upper: None,
             observation_lower: None,

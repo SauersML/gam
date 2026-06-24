@@ -1035,6 +1035,14 @@ pub struct PredictPosteriorMeanResult {
     pub eta: Array1<f64>,
     pub eta_standard_error: Array1<f64>,
     pub mean: Array1<f64>,
+    /// Response-scale (delta-method) standard error `SE(μ̂) = |dμ/dη|·SE(η)`,
+    /// the response-scale twin of `eta_standard_error`. `Some` once confidence
+    /// bounds are assembled (it is the SE the response-scale credible band is
+    /// built from); `None` for point-only predictions. Surfaced as the
+    /// documented response-scale `std_error` column by the FFI/CLI predict
+    /// tables (#1536) so the reported SE matches the `mean`/`mean_lower`/
+    /// `mean_upper` columns beside it instead of the link-scale `σ_η`.
+    pub mean_standard_error: Option<Array1<f64>>,
     /// Response-scale lower confidence bound (set by
     /// [`enrich_posterior_mean_bounds`]).
     pub mean_lower: Option<Array1<f64>>,
@@ -1133,6 +1141,9 @@ pub fn enrich_posterior_mean_bounds(
         let dmu_deta = strategy.inverse_link_jet(result.eta[i])?.d1;
         mean_se[i] = dmu_deta.abs() * result.eta_standard_error[i];
     }
+    // Record the response-scale SE so downstream surfaces (FFI/CLI predict
+    // tables) report it as `std_error` rather than the link-scale `σ_η` (#1536).
+    result.mean_standard_error = Some(mean_se.clone());
     // TransformEta bounds: transform the η endpoints through the inverse link,
     // handle non-monotone transforms, and clamp to the family support. The
     // shared engine owns this construction so it cannot drift from the
@@ -1540,6 +1551,7 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
         eta,
         eta_standard_error,
         mean: Array1::from_vec(means?),
+        mean_standard_error: None,
         mean_lower: None,
         mean_upper: None,
         observation_lower: None,
