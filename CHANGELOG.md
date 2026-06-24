@@ -1,3 +1,88 @@
+## v0.3.122 — gam 0.3.122 / gamfit 0.1.224 (2026-06-24)
+
+crates.io + PyPI release of the open-issue fix wave landed since gam 0.3.121 /
+gamfit 0.1.223. A robustness sweep across degenerate-fit prediction and
+constrained-coefficient posterior sampling, family deviance/dispersion
+corrections, a pure-REML escape for double-penalty null-space shrinkage, further
+thin-plate/Matérn root-cause cleanup, the survival flex single-source derivative
+cutover (with the fourth-order moving-boundary residual further closed), and SAE
+collapse *prevention* — a data-derived bar plus a linear-dominance floor in place
+of magic constants. The build.rs hygiene gate continues to hold: spent #1454
+localizer probe fields are removed and the unwired survival moment-engine oracle
+is relocated into its test module, so the `gam` crate stays dead-code-clean as a
+primary (`cargo build` / `cargo publish`) build.
+
+**Prediction & posterior sampling**
+- **#1515**: degenerate / near-singular fits no longer emit non-finite
+  predictions. Interval predict gets a finite delta-method SE fallback, the
+  log-link posterior mean is floored when its SE overflows, and an all-zero
+  Poisson fit predicts a finite plug-in mean when the posterior-mean integral
+  overflows — with finite interval bounds throughout.
+- **#1507 / #1509**: box- and shape-constrained coefficients now draw from a
+  truncated-Gaussian posterior on the latent scale, so `predict_draws()` respect
+  the monotone-shape and `bounded()` box constraints instead of escaping them;
+  posterior-predictive draws also re-apply the model offset.
+- **#1514**: a `bounded()` Gaussian coefficient covariance is scaled by σ̂², so
+  its standard errors are neither too wide nor too narrow.
+- **#1513**: numeric `by=`-variable multipliers are exempt from the predict-time
+  axis clip (they are multipliers, not a smooth axis).
+
+**Families & model comparison**
+- **#1529**: Gamma deviance-explained is no longer contaminated by an
+  estimated-shape mismatch — the null deviance uses the fitted dispersion rather
+  than resetting to the family default.
+- **#584**: ALO dispersion divides by the positive-weight row count (the true
+  residual dof), not the raw row count, so zero-weight rows do not deflate it.
+- **model comparison**: the smoothing-correction covariance `V_corr` is
+  symmetrized before use (#1527).
+
+**Smooths, REML & double penalty**
+- **#1266**: the default double penalty (Marra–Wood null-space shrinkage) no
+  longer inflates smooth EDF — a pure-REML null-space shrink-out escape lets an
+  irrelevant covariate be shrunk out (and `s(x)` on linear data recover its true
+  ~2 EDF) instead of pinning every term near the basis dimension.
+- **#1074**: further thin-plate / Matérn root-cause cleanup — the masking hacks
+  (the Matérn-specific length-scale ceiling, a redundant λ ceiling, the
+  thin-plate cap and center-cap, the latent active-mass floor) are deleted in
+  favor of the real basis-sizing / correlation-range fixes; `te()`/`ti()` cr
+  margins honor the requested `k` (guarded to `k ≥ 3`) and `bs="sz"` factor
+  smooths route through the cr metadata freeze/replay.
+- **#1531**: the constant-curvature double penalty is documented and tested to
+  use an identity ridge (full-rank null space). **#1464**: the curv
+  hyperbolic-sign contract is now an asserting CI gate.
+
+**Survival (#932 / #1454)**
+- **#932**: the survival flex marginal-slope derivative tower is single-sourced
+  through one generic `FlexJet` jet algebra — the link-wiggle joint-Hessian
+  cutover is landed in production and the generic-order moment / eta-chi
+  machinery is exact to all carried orders, with the calibration residual derived
+  as a distinguished-derivative `j/(j+m)` projector.
+- **#1454**: the fourth-order `[g, β_w]` bidirectional cross residual is
+  corrected in sign and magnitude — the moving-boundary `D²(B)` term and the
+  missing `f_a` self-flux are added to the bidirectional `§D` path. The final
+  observed-point link-warp term remains and **#1454 stays open** for it.
+
+**Manifold-SAE & latent (#1026 / #1388 / #1522)**
+- **#1522**: the SAE collapse **floors** (a magic 0.28 reconstruction-EV bar, a
+  1e-3 atom-mass floor, a latent active-mass floor) are replaced by a
+  data-derived PCA-EV ceiling plus a genuine NaN guard — collapse *prevention*
+  in the assignment/decoder step rather than detect-and-reseed band-aids.
+- **#1026**: a hybrid-split collapse rescue rebuilds a fresh linear image for
+  rank-1 co-collapsed circle atoms, and a result-level linear-dominance floor in
+  `into_fitted` restores the certified PCA anchor (`F ≤ F_linear`) when curvature
+  collapses — backed by a collapse-safe SAE acceptance battery.
+- **#1388**: the SAE joint fit runs on a wide-stack worker thread in the wheel,
+  avoiding a stack overflow on large joints.
+
+**GPU & build (#1017)**
+- **#1017**: CUDA initialization is hardened — the primary context is bound and
+  the runtime initialized before the first cuBLAS/cuSOLVER handle creation
+  (probe-first `NOT_INITIALIZED`), and the probed compute libraries stay loaded
+  so `dlclose` cannot poison cuBLAS; a GPU regression guard and a Modal A100/T4
+  runner (with a dead-hand heartbeat kill-switch) back it.
+- **CI**: the full pytest suite runs in CI (#1512 / #1532) and the fast Python
+  Contracts workflow caches `target/` and enables sccache (#1518).
+
 ## v0.3.121 — gam 0.3.121 / gamfit 0.1.223 (2026-06-23)
 
 crates.io + PyPI release of the open-issue fix-and-feature wave landed since gam
