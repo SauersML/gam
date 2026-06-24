@@ -1093,20 +1093,29 @@ where
         // data-INDEPENDENT prior cannot separate "shrink the unsupported term"
         // (#1266) from "keep the supported one" (#1476/#1371) — they overlap in ρ.
         //
-        // The data-DEPENDENT discriminator is pure data-REML. For each
-        // well-determined null-space selection coordinate, line-search the
-        // OVER-SMOOTHING (high-ρ) direction on the PURE REML cost
+        // The data-DEPENDENT discriminator is pure data-REML PLUS a parsimony
+        // check. For each well-determined null-space selection coordinate,
+        // line-search the OVER-SMOOTHING (high-ρ) direction on the PURE REML cost
         // (`compute_cost − configured_ρ_prior`; the prior is a conditioning
-        // device, not a selection criterion) and adopt the strictly-best
-        // COLD-confirmed point:
-        //   * UNSUPPORTED null space (#1266 `s(z)`): pure REML descends toward
-        //     shrink-out → the escape fires, EDF → 0.
-        //   * SUPPORTED null space (#1371 genuine slope; #1476 concurvity): pure
-        //     REML strictly RISES under over-smoothing — killing a real linear
-        //     trend dumps its variance into σ̂², and moving one concurvity
-        //     coordinate alone off the joint transfer-ridge raises the residual —
-        //     so there is no strict improvement and the escape is an exact no-op,
-        //     leaving the supported signal untouched.
+        // device, not a selection criterion), then adopt the strictly-best
+        // COLD-confirmed point ONLY if it also does not increase the model's total
+        // EDF:
+        //   * UNSUPPORTED, uncorrelated null space (#1266 `s(z)`): pure REML
+        //     descends toward shrink-out AND total EDF drops (z carries no signal,
+        //     so nothing absorbs it) → the escape fires, EDF → 0.
+        //   * SUPPORTED null space (#1371 genuine slope): pure REML strictly RISES
+        //     under over-smoothing (killing a real linear trend dumps its variance
+        //     into σ̂²) → no strict improvement → exact no-op.
+        //   * CONCURVITY null space (#1476 `s(x1)+s(x2)`, corr ≈ 0.9): pure REML
+        //     *marginally* prefers over-smoothing one coordinate because the inner
+        //     β re-solve lets the CORRELATED partner absorb the shared signal — the
+        //     "signal transfer" the degeneracy prior exists to forbid. That
+        //     transfer keeps the deviance flat but INFLATES total EDF (the partner
+        //     spends extra basis), so the EDF-non-increase guard vetoes it →
+        //     no-op, the interior allocation is kept. (Pure REML alone cannot see
+        //     this: the concurvity ridge is flat, so the transfer reads as a tiny
+        //     improvement; the parsimony guard is what distinguishes a genuine
+        //     simplification from a lateral reallocation.)
         //
         // Unlike #1074 (where the OPTIMIZER's bound projection masks the descent),
         // here it is the PRIOR that masks it, so the search runs on the pure
@@ -1147,6 +1156,20 @@ where
                     .cost();
             let base_pure = strategy_result.final_value - conv_prior;
             if !select_coords.is_empty() && base_pure.is_finite() && conv_prior.is_finite() {
+                // Converged-point total inner EDF, for the PARSIMONY guard below.
+                // The inner P-IRLS solve at the converged ρ is cached, so this is
+                // free. A genuine #1266 shrink-out (an UNSUPPORTED, uncorrelated
+                // term selected out) strictly LOWERS the model's total EDF; a
+                // concurvity TRANSFER (#1476: one null-space shrinks but its
+                // correlated partner absorbs the signal via the inner β re-solve)
+                // INFLATES it. Pure REML alone marginally prefers the transfer on
+                // a flat concurvity ridge — exactly the allocation the degeneracy
+                // prior exists to forbid — so the escape must additionally refuse
+                // any adoption that does not reduce total EDF.
+                let edf_conv = reml_state
+                    .obtain_eval_bundle(&strategy_result.rho)
+                    .ok()
+                    .map(|b| b.pirls_result.edf);
                 // Pure data-REML at ρ: penalized `compute_cost` minus the configured
                 // ρ-prior and the soft λ→0 guard (both `O(K)` functions of ρ alone).
                 // Subtracting them recovers the mgcv-parity criterion selection
@@ -1217,9 +1240,23 @@ where
                                 - reml_state.soft_rho_guard_prior_atom(&best_rho).cost()
                         })
                     });
+                    // Total inner EDF at the candidate (cached from the cold eval).
+                    // The PARSIMONY guard: a genuine shrink-out must not INCREASE
+                    // the model's effective dimension (see `edf_conv`). When either
+                    // EDF is unavailable, refuse the adoption — a shrink that can't
+                    // be certified parsimonious is not worth the #1476 risk.
+                    let edf_best = reml_state
+                        .obtain_eval_bundle(&best_rho)
+                        .ok()
+                        .map(|b| b.pirls_result.edf);
+                    let edf_non_increasing = match (edf_best, edf_conv) {
+                        (Some(eb), Some(ec)) => eb <= ec + 1e-6,
+                        _ => false,
+                    };
                     if let (Ok(penalized), Some(cold_pure)) = (cold_penalized, cold_pure)
                         && cold_pure.is_finite()
                         && cold_pure < base_pure - 1e-6 * (1.0 + base_pure.abs())
+                        && edf_non_increasing
                     {
                         // β̂ already installed at `best_rho` by the cold eval above.
                         // Report the PENALIZED cost there as the objective so the
@@ -1227,7 +1264,8 @@ where
                         // adopted ρ for the downstream cap-guard / assembly.
                         log::info!(
                             "[OUTER] #1266 null-space shrink-out escape: pure REML \
-                             {base_pure:.6e} → {cold_pure:.6e} (cold-confirmed) by \
+                             {base_pure:.6e} → {cold_pure:.6e} (cold-confirmed), total \
+                             EDF {edf_conv:?} → {edf_best:?} (parsimonious) by \
                              over-smoothing {} selection coord(s); adopting the \
                              shrink-out ρ (penalized cost {penalized:.6e})",
                             select_coords.len()
