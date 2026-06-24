@@ -1880,16 +1880,27 @@ mod moment_engine_tests {
             // du[g] = dc_dabb·db²` repeats the b factor and would DOUBLE-count χ's
             // pure-`b²` Taylor term (gam#932 g-diagonal fix, mirroring cell_coeff_jets).
             let dbdb = db.mul(db);
+            let dadb = da.mul(db);
             for u in 0..p {
                 if u == g_axis {
                     continue;
                 }
                 let duu = &du[u];
-                // χ per-primary: coeff_au[u]·du + coeff_aau[u]·da·du + coeff_abu[u]·db·du.
+                // χ = ∂_a η, so χ's per-primary chain is ∂_a of η's per-primary chain
+                // (`cell_coeff_jets`), dropping one a-order:
+                //   coeff_au·du + coeff_aau·da·du + coeff_abu·db·du
+                //   + ½coeff_aaau·da²·du + coeff_aabu·(da·db)·du + ½coeff_abbu·db²·du.
+                // The three second-order terms are zero for a g-only family but
+                // NON-zero on h/w channels, where χ_uv's directional (Jet3) / mixed
+                // (Jet4) channel needs them — without them χ_uv_dir under-counts
+                // (gam#932 ghw gate).
                 let chain = duu
                     .scale(fixed.coeff_au[u][k])
                     .add(&da.mul(duu).scale(fixed.coeff_aau[u][k]))
-                    .add(&db.mul(duu).scale(fixed.coeff_abu[u][k]));
+                    .add(&db.mul(duu).scale(fixed.coeff_abu[u][k]))
+                    .add(&dada.mul(duu).scale(0.5 * fixed.coeff_aaau[u][k]))
+                    .add(&dadb.mul(duu).scale(fixed.coeff_aabu[u][k]))
+                    .add(&dbdb.mul(duu).scale(0.5 * fixed.coeff_abbu[u][k]));
                 c = c.add(&chain);
             }
             // Slope-axis (b) χ-chain with correct factorials: coeff_au[g]·db +
