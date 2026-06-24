@@ -20,7 +20,7 @@ SE ``mean_standard_error``), so
 to within the mild asymmetry of the transformed band.  A response-scale
 ``std_error`` must therefore agree with that band half-width.
 
-Observed (gamfit 0.1.224): the ``std_error`` column is populated from the
+Observed before this fix: the ``std_error`` column was populated from the
 LINK-scale SE ``eta_standard_error`` instead of the response-scale
 ``mean_standard_error``
 (``crates/gam-pyffi/src/geometry_ffi.rs:5910-5913`` and the siblings at

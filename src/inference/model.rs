@@ -255,6 +255,16 @@ pub struct FittedModelPayload {
     pub model_kind: ModelKind,
     pub family_state: FittedFamily,
     pub family: String,
+    /// Human-readable advisories produced while materializing this model —
+    /// e.g. an mgcv-style "k was reduced to the data support" note when a
+    /// cubic-regression marginal is capped, or a basis-degradation note. These
+    /// are surfaced to CLI users via `print_inference_summary`; persisting them
+    /// here lets the Python (gamfit) interface surface the SAME advisories as
+    /// warnings / `model.notes` instead of silently dropping them at the FFI
+    /// boundary (#1543). `#[serde(default)]` keeps older payloads (which had no
+    /// such field) deserializing cleanly as "no notes".
+    #[serde(default)]
+    pub inference_notes: Vec<String>,
     #[serde(default)]
     pub used_device: bool,
     #[serde(default)]
@@ -674,6 +684,7 @@ impl FittedModelPayload {
             model_kind,
             family_state,
             family,
+            inference_notes: Vec::new(),
             used_device: false,
             fit_result: None,
             unified: None,
