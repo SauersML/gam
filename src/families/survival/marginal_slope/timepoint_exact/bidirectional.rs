@@ -1149,6 +1149,32 @@ impl SurvivalMarginalSlopeFamily {
                 };
                 let a_v = |z_jet: &MultiDirJet| z_jet.scale(0.0).add(&a_vel_jet);
 
+                // f_a: the base intercept-density's §D moving-boundary flux,
+                // `D_dir(f_a) ⊇ z_dir·integrand(neg_dc_da)`, the bilinear analog
+                // of directional.rs's `f_a_dir += first_boundary(&neg_dc_da)`
+                // (~line 824). The base f_a has NO velocity (the boundary is at
+                // rest at zeroth order), so only the MOTION of the edge under the
+                // (dir1, dir2) jet contributes: take the edge-position jet's
+                // motion part `z_jet − z_jet.coeff(0)` (coeff(0)=0) as the
+                // Leibniz velocity and multiply by the density integrand of
+                // `neg_dc_da`. Its coeff(1)/(2)/(3) are the d1/d2/d12 fluxes
+                // f_a was missing; without them `f_a_d12` (→ `d_jet`'s
+                // `−f_a_d12`) was short of D_dir1 D_dir2(f_a), corrupting the
+                // `auvd12` recovery and the contracted fourth `fourth[q0,g]`
+                // (gam#1454).
+                {
+                    let block = edge_diff(&|z_jet, _z| {
+                        let motion = z_jet.sub(&MultiDirJet::constant(2, z_jet.coeff(0)));
+                        let eta_jet = eval_poly_jets_at_jet(&eta_poly_jet, z_jet);
+                        let weight = weight_jet(z_jet, &eta_jet);
+                        motion.mul(&boundary_integrand_jet(&neg_dc_da_jet, z_jet, &weight))
+                    });
+                    f_a += block.coeff(0);
+                    f_a_d1 += block.coeff(1);
+                    f_a_d2 += block.coeff(2);
+                    f_a_d12 += block.coeff(3);
+                }
+
                 // f_aa: doubled a-axis flux + (a,a) self-flux.
                 {
                     let block = a_flux(&neg_dc_da_jet)
