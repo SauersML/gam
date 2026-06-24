@@ -2176,6 +2176,110 @@ impl SurvivalMarginalSlopeFamily {
                             if l1 != 0.0 || l2 != 0.0 || l12 != 0.0 {
                                 d_uv_uv[[u, v]] -= boundary(cell.left, l1, l2, l12);
                             }
+
+                            // `D_dir1 D_dir2(B)`: the base `d_uv = I + B`, and the
+                            // block above only carries `D²(I)` (interior `value` +
+                            // its moving-boundary). `B` is `survival_flex_base_d_uv`'s
+                            // OWN §D moving boundary (first_full.rs `edge_term`):
+                            //   B = part_a + part_b1 + G0_z·z_u·z_v + G0·z_uv,
+                            // with `G0 = χ·w`, `part_a = (∂_u d_u-integrand)·z_v`,
+                            // `part_b1 = (∂_v d_u-integrand)·z_u`, the BARE-cell-weight
+                            // velocities `z_x = −(a_u[x] + δ_{x,g}·z)/b` and the cross
+                            // `z_uv = −(a_uv + z_u·δ_{v,g} + z_v·δ_{u,g})/b`. Promote
+                            // every factor to a bilinear (dir1, dir2) jet — the edge
+                            // POSITION jet `Z` carries the §C contraction motion, the
+                            // composite η jet `eta_poly_jet` carries the cell-coeff
+                            // motion (so the weight's `q_z = Z + η·η_z` shifts with the
+                            // direction), and `a_u_jets`/`a_uv_jet` carry the intercept
+                            // chain — then `B.coeff(3) = D_dir1 D_dir2(B)`. Dropping it
+                            // left `d_uv_uv` short of `D²(d_uv)` on the g-touching
+                            // blocks (the dominant `fourth[g,h0]` residual, gam#1454).
+                            let dir_g1j = dir1[primary.g];
+                            let dir_g2j = dir2[primary.g];
+                            let inv_b_jet = reciprocal_bilinear_jet(MultiDirJet::bilinear(
+                                b, dir_g1j, dir_g2j, 0.0,
+                            ));
+                            let neg_inv_b_jet = inv_b_jet.scale(-1.0);
+                            let ug = if u == primary.g { 1.0 } else { 0.0 };
+                            let vg = if v == primary.g { 1.0 } else { 0.0 };
+                            // d_u interior integrand polys (poly-of-jets):
+                            //   d_u-integrand[x] = χ_u[x] − χ·η·η_u[x].
+                            let d_u_int_u = poly_add_jets(
+                                &chi_u_poly_jets[u],
+                                &poly_scale_jets(
+                                    &poly_mul_jets(
+                                        &poly_mul_jets(&chi_poly_jet, &eta_poly_jet),
+                                        &eta_u_poly_jets[u],
+                                    ),
+                                    &MultiDirJet::constant(2, -1.0),
+                                ),
+                            );
+                            let d_u_int_v = poly_add_jets(
+                                &chi_u_poly_jets[v],
+                                &poly_scale_jets(
+                                    &poly_mul_jets(
+                                        &poly_mul_jets(&chi_poly_jet, &eta_poly_jet),
+                                        &eta_u_poly_jets[v],
+                                    ),
+                                    &MultiDirJet::constant(2, -1.0),
+                                ),
+                            );
+                            let weight_at = |zj: &MultiDirJet| -> MultiDirJet {
+                                let eta = eval_poly_jets_at_jet(&eta_poly_jet, zj);
+                                let z2 = zj.mul(zj);
+                                let eta2 = eta.mul(&eta);
+                                let neg_q = z2.add(&eta2).scale(-0.5);
+                                exp_bilinear_jet(&neg_q)
+                                    .scale(std::f64::consts::FRAC_1_PI * 0.5)
+                            };
+                            let edge_term_jet = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                                 zb: f64,
+                                                 z1: f64,
+                                                 z2: f64,
+                                                 z12: f64|
+                             -> MultiDirJet {
+                                match edge {
+                                    crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {}
+                                    crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
+                                        return MultiDirJet::constant(2, 0.0);
+                                    }
+                                }
+                                // Edge-position jet (base + §C contraction motion).
+                                let zj = MultiDirJet::bilinear(zb, z1, z2, z12);
+                                // Bare-cell-weight base velocities `z_x = −(a_u[x] +
+                                // δ_{x,g}·Z)/b`, the intercept-chain crossing motion.
+                                let direct_u =
+                                    if u == primary.g { zj.clone() } else { MultiDirJet::constant(2, 0.0) };
+                                let direct_v =
+                                    if v == primary.g { zj.clone() } else { MultiDirJet::constant(2, 0.0) };
+                                let zu = a_u_jets[u].add(&direct_u).mul(&neg_inv_b_jet);
+                                let zv = a_u_jets[v].add(&direct_v).mul(&neg_inv_b_jet);
+                                let zuv = a_uv_jet
+                                    .add(&zu.mul(&MultiDirJet::constant(2, vg)))
+                                    .add(&zv.mul(&MultiDirJet::constant(2, ug)))
+                                    .mul(&neg_inv_b_jet);
+                                let weight = weight_at(&zj);
+                                let g0 = eval_poly_jets_at_jet(&chi_poly_jet, &zj).mul(&weight);
+                                let part_a =
+                                    eval_poly_jets_at_jet(&d_u_int_u, &zj).mul(&weight).mul(&zv);
+                                let part_b1 =
+                                    eval_poly_jets_at_jet(&d_u_int_v, &zj).mul(&weight).mul(&zu);
+                                // G0_z = ∂_z(χ·w) = (χ_z − χ·q_z)·w, q_z = Z + η·η_z.
+                                let chi_val = eval_poly_jets_at_jet(&chi_poly_jet, &zj);
+                                let chi_z = eval_poly_jets_deriv_at_jet(&chi_poly_jet, &zj);
+                                let eta_val = eval_poly_jets_at_jet(&eta_poly_jet, &zj);
+                                let eta_z = eval_poly_jets_deriv_at_jet(&eta_poly_jet, &zj);
+                                let q_z = zj.add(&eta_val.mul(&eta_z));
+                                let g0_z = chi_z.sub(&chi_val.mul(&q_z)).mul(&weight);
+                                part_a
+                                    .add(&part_b1)
+                                    .add(&g0_z.mul(&zu).mul(&zv))
+                                    .add(&g0.mul(&zuv))
+                            };
+                            let b_jet = edge_term_jet(part.right_edge, cell.right, r1, r2, r12).sub(
+                                &edge_term_jet(part.left_edge, cell.left, l1, l2, l12),
+                            );
+                            d_uv_uv[[u, v]] += b_jet.coeff(3);
                         }
                         d_uv_uv[[v, u]] = d_uv_uv[[u, v]];
                     }
