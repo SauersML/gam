@@ -211,7 +211,7 @@ pub(crate) const SAE_DECODER_REPULSION_STRENGTH: f64 = 1.0e-3;
 /// choice of decoder scale.
 pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 
-// ── #1026 / #1522 annealed interior-point COLLAPSE-PREVENTION barriers ───────
+// ── #1026 / #1522 interior-point COLLAPSE-PREVENTION barriers ────────────────
 //
 // The collinearity-gated `SAE_DECODER_REPULSION_*` term above is a SEPARATOR for
 // already-large, already-collinear decoders; it is a strict no-op at the
@@ -224,7 +224,11 @@ pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 /// `P_amp = -μ_s · Σ_{k active} log(s_k² + ε)` with `s_k² = ‖B_k‖²_F`. Its
 /// decoder gradient `∂P/∂B_k = -2μ_s/(s_k²+ε)·B_k` has magnitude `∝ 1/‖B_k‖`
 /// near zero, a genuine OUTWARD restoring force (unlike the angle penalty, whose
-/// force vanishes with the norm). Small fixed weight to start; annealed later.
+/// force vanishes with the norm). Fixed strength — there is no μ-continuation
+/// schedule; the only per-fit scaling is the minibatch chunk fraction `n_chunk/N`
+/// applied at the call site (`penalty_scale`). The value is empirically tuned to
+/// be commensurate with the unit-scale reconstruction objective and is overridable
+/// at runtime via [`set_sae_barrier_overrides`] to sweep the response surface.
 pub(crate) const SAE_AMPLITUDE_BARRIER_STRENGTH: f64 = 100.0;
 
 // #1026/#1522 — RUNTIME barrier-tuning overrides. The strengths and the
