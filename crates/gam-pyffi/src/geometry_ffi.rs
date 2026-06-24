@@ -22,6 +22,14 @@ fn sae_set_barrier_overrides(amp_strength: f64, sep_strength: f64, gate_mode: u8
     gam::terms::sae::manifold::set_sae_barrier_overrides(amp_strength, sep_strength, gate_mode);
 }
 
+/// #1026 — set the process-global IBP-α override (flattens the ordered geometric
+/// assignment prior π_k=(α/(α+1))^{k+1} so all K atoms can contribute). A
+/// non-finite or non-positive value clears the override back to the compiled α.
+#[pyfunction(signature = (alpha = f64::NAN))]
+fn sae_set_ibp_alpha(alpha: f64) {
+    gam::terms::sae::assignment::set_ibp_alpha_override(alpha);
+}
+
 #[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
 fn sae_select_k(
     py: Python<'_>,
@@ -4167,6 +4175,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(equivariant_rho_so3_jvp, module)?)?;
     module.add_function(wrap_pyfunction!(equivariant_gauge_companion_loss, module)?)?;
     module.add_function(wrap_pyfunction!(sae_set_barrier_overrides, module)?)?;
+    module.add_function(wrap_pyfunction!(sae_set_ibp_alpha, module)?)?;
     module.add_function(wrap_pyfunction!(sae_select_k, module)?)?;
     module.add_function(wrap_pyfunction!(sae_auto_k_recommendation, module)?)?;
     module.add_function(wrap_pyfunction!(sae_manifold_fit, module)?)?;

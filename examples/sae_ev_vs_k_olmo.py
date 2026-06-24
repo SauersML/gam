@@ -278,6 +278,8 @@ def main() -> None:
     ap.add_argument("--amp-mu", type=float, default=float("nan"))
     ap.add_argument("--sep-mu", type=float, default=float("nan"))
     ap.add_argument("--gate-mode", type=int, default=0)
+    ap.add_argument("--ibp-alpha", type=float, default=float("nan"),
+                    help="#1026 override IBP-MAP alpha (flattens prior; NaN=compiled default)")
     args = ap.parse_args()
 
     import math
@@ -285,6 +287,10 @@ def main() -> None:
         from gamfit import sae_set_barrier_overrides
         sae_set_barrier_overrides(args.amp_mu, args.sep_mu, args.gate_mode)
         print(f"[barrier] amp_mu={args.amp_mu} sep_mu={args.sep_mu} gate_mode={args.gate_mode}", flush=True)
+    if not math.isnan(args.ibp_alpha):
+        from gamfit import sae_set_ibp_alpha
+        sae_set_ibp_alpha(args.ibp_alpha)
+        print(f"[ibp] alpha={args.ibp_alpha}", flush=True)
 
     x = _load_activations(args)
     rng = np.random.default_rng(args.seed)

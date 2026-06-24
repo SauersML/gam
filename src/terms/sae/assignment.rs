@@ -214,7 +214,15 @@ impl AssignmentMode {
                 alpha,
                 learnable_alpha,
                 ..
-            } => Some(if learnable_alpha {
+            } => Some(if let Some(over) = ibp_alpha_override() {
+                // #1026 — a process-global α override flattens the ordered
+                // geometric prior π_k = (α/(α+1))^{k+1} so all K atoms can
+                // contribute to the reconstruction (the production α=1 gives a
+                // (0.5)^{k+1} schedule that structurally caps atoms 4..K to a few
+                // percent → effective-K≈3). Forces the fixed value, bypassing the
+                // learnable schedule, so a sweep can attribute the EV ceiling.
+                over
+            } else if learnable_alpha {
                 resolve_learnable_weight(alpha, rho.log_lambda_sparse)
             } else {
                 alpha
@@ -222,6 +230,27 @@ impl AssignmentMode {
             _ => None,
         }
     }
+}
+
+// #1026 — process-global IBP-α override (NaN sentinel = "unset → use the
+// AssignmentMode's compiled α"). Lets ONE wheel sweep the prior-flattening axis
+// from Python (`sae_set_ibp_alpha`) without recompiling the gam crate.
+static IBP_ALPHA_OVERRIDE_BITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0x7ff8_0000_0000_0000);
+
+pub(crate) fn ibp_alpha_override() -> Option<f64> {
+    let v = f64::from_bits(IBP_ALPHA_OVERRIDE_BITS.load(std::sync::atomic::Ordering::Relaxed));
+    if v.is_finite() && v > 0.0 {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// Set (or, with a non-finite/non-positive value, clear) the process-global
+/// IBP-α override. Called from the gamfit Python FFI sweep driver.
+pub fn set_ibp_alpha_override(alpha: f64) {
+    IBP_ALPHA_OVERRIDE_BITS.store(alpha.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Per-row latent assignment state.
