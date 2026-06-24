@@ -3845,24 +3845,29 @@ mod moment_engine_tests {
             let a_jet_probe = lift_intercept_flex(&template4, a1, 1.0 / d_check, 4, residual_probe);
             let jet_a_uvuv = a_jet_probe.eps_del.h[primary.q1 * p + primary.q1];
 
-            // Oracle matrices: every q1-row/column entry [u,v] (u==q1 OR v==q1) of the
-            // bidirectional (a, eta, chi, D) Hessians, where the hand §D moving-boundary
-            // flux is incomplete (gam#1454 — q1 is the exit-time moving Crossing edge, so
-            // its flux contributes to ALL q1-cross-derivatives, not just the self-block).
+            // Oracle matrices: the FULL bidirectional (a, eta, chi, D) Hessian for EVERY
+            // (u,v) — the scalar-FD of the real intercept solve is ground truth at every
+            // entry, so the gate asserts the whole eta/chi/D_uv_uv matrix against it and
+            // drops the hand reference entirely (the hand §D moving-boundary has multiple
+            // #1454 incompletenesses across the matrix — q1 row/col AND the h/w blocks —
+            // so it is not a usable reference here). The Hessian is symmetric, so compute
+            // v>=u and mirror. `a`-channel diagonal [q1,q1] feeds the lifted-intercept
+            // cross-check below.
             let mut o_eta = Array2::<f64>::zeros((p, p));
             let mut o_chi = Array2::<f64>::zeros((p, p));
             let mut o_d = Array2::<f64>::zeros((p, p));
             let mut ref_a_uvuv = 0.0_f64;
             for u in 0..p {
-                for v in 0..p {
-                    if u == primary.q1 || v == primary.q1 {
-                        let (a_uvuv, eta_uvuv, chi_uvuv, d_uvuv) = mixed(u, v);
-                        o_eta[[u, v]] = eta_uvuv;
-                        o_chi[[u, v]] = chi_uvuv;
-                        o_d[[u, v]] = d_uvuv;
-                        if u == primary.q1 && v == primary.q1 {
-                            ref_a_uvuv = a_uvuv;
-                        }
+                for v in u..p {
+                    let (a_uvuv, eta_uvuv, chi_uvuv, d_uvuv) = mixed(u, v);
+                    o_eta[[u, v]] = eta_uvuv;
+                    o_eta[[v, u]] = eta_uvuv;
+                    o_chi[[u, v]] = chi_uvuv;
+                    o_chi[[v, u]] = chi_uvuv;
+                    o_d[[u, v]] = d_uvuv;
+                    o_d[[v, u]] = d_uvuv;
+                    if u == primary.q1 && v == primary.q1 {
+                        ref_a_uvuv = a_uvuv;
                     }
                 }
             }
@@ -3938,11 +3943,9 @@ mod moment_engine_tests {
         // ── Jet4 bidirectional ──
         let dir1 = Array1::from_iter((0..p).map(|c| 0.12 + 0.04 * (c as f64) - 0.01 * ((c % 2) as f64)));
         let dir2 = Array1::from_iter((0..p).map(|c| -0.07 + 0.05 * ((c % 3) as f64) + 0.02 * (c as f64)));
-        let hand_bi = family
-            .compute_survival_timepoint_bidirectional_exact_from_cached(
-                row, &primary, q1, primary.q1, a1, g, bh, bw, &cached, &dir1, &dir2,
-            )
-            .expect("hand bidirectional");
+        // The hand bidirectional pack is intentionally NOT used as a reference for the
+        // eps_del Hessians: it has multiple #1454 §D moving-boundary incompletenesses
+        // across the matrix. The scalar-FD oracle (`oracle_*_uvuv`) is asserted instead.
 
         let template4 = Jet4::primary(0.0, usize::MAX, p, 0.0, 0.0);
         let b_jet4 = Jet4::primary(g, primary.g, p, dir1[primary.g], dir2[primary.g]);
@@ -3955,41 +3958,35 @@ mod moment_engine_tests {
         )
         .expect("generic jet4");
 
-        // Bidirectional eps_del Hessians vs hand — EXCEPT every q1-row/column entry
-        // (u==q1 OR v==q1), where the hand §D moving-boundary flux is incomplete
-        // (gam#1454: q1 is the exit-time moving Crossing edge, so its flux corrupts ALL
-        // q1-cross-derivatives — the [q1,q1] self had the largest error but the [q1,u]
-        // cross blocks also exceed the tight hand tolerance). There the scalar-FD oracle
-        // (probe-confirmed against the jet's lifted a_uv_uv) is authoritative, asserted
-        // at the FD tolerance; every off-q1 (u,v) is asserted against the hand.
-        let q = primary.q1;
-        let cmp_mat_oracle = |label: &str, jet: &Vec<f64>, hand: &Array2<f64>, oracle: &Array2<f64>| {
+        // Bidirectional eps_del Hessians: assert the FULL matrix against the scalar-FD
+        // oracle (ground truth from the real intercept solve) at EVERY (u,v) — the hand
+        // bidirectional has multiple #1454 §D moving-boundary incompletenesses across the
+        // matrix (q1 row/col AND the h/w blocks), so it is dropped as a reference here.
+        // Any jet≠oracle entry beyond the (generous) FD tolerance is a REAL JET BUG and
+        // is reported in full (all failing [u,v] with jet/oracle/rel-err), not masked.
+        let cmp_mat_oracle = |label: &str, jet: &Vec<f64>, oracle: &Array2<f64>| {
+            let mut fails: Vec<String> = Vec::new();
             for u in 0..p {
                 for v in 0..p {
-                    if u == q || v == q {
-                        let o = oracle[[u, v]];
-                        assert!(
-                            (jet[u * p + v] - o).abs() <= 1e-3 * (1.0 + o.abs()),
-                            "{label}[{u},{v}] jet {} != scalar-FD oracle {} (hand {} is #1454-incomplete on the q1 row/col)",
-                            jet[u * p + v],
-                            o,
-                            hand[[u, v]],
-                        );
-                    } else {
-                        assert!(
-                            (jet[u * p + v] - hand[[u, v]]).abs()
-                                <= 1e-6 * (1.0 + hand[[u, v]].abs()),
-                            "{label}[{u},{v}] jet {} != hand {}",
-                            jet[u * p + v],
-                            hand[[u, v]],
-                        );
+                    let o = oracle[[u, v]];
+                    let j = jet[u * p + v];
+                    if (j - o).abs() > 1e-3 * (1.0 + o.abs()) {
+                        let rel = (j - o).abs() / (1.0 + o.abs());
+                        fails.push(format!("[{u},{v}] jet {j:.6} oracle {o:.6} rel {rel:.2e}"));
                     }
                 }
             }
+            assert!(
+                fails.is_empty(),
+                "{label} jet != scalar-FD oracle at {} entr{}: {}",
+                fails.len(),
+                if fails.len() == 1 { "y" } else { "ies" },
+                fails.join("; "),
+            );
         };
-        cmp_mat_oracle("eta_uv_uv", &eta4.eps_del.h, &hand_bi.eta_uv_uv, &oracle_eta_uvuv);
-        cmp_mat_oracle("chi_uv_uv", &chi4.eps_del.h, &hand_bi.chi_uv_uv, &oracle_chi_uvuv);
-        cmp_mat_oracle("d_uv_uv", &d4.eps_del.h, &hand_bi.d_uv_uv, &oracle_d_uvuv);
+        cmp_mat_oracle("eta_uv_uv", &eta4.eps_del.h, &oracle_eta_uvuv);
+        cmp_mat_oracle("chi_uv_uv", &chi4.eps_del.h, &oracle_chi_uvuv);
+        cmp_mat_oracle("d_uv_uv", &d4.eps_del.h, &oracle_d_uvuv);
     }
 }
 
