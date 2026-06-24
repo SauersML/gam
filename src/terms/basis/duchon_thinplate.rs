@@ -965,12 +965,26 @@ pub fn select_thin_plate_knots(
     // nearest-row test is a Euclidean distance, so the SAME physical row is
     // chosen in every rotated frame; both are pure functions of the unordered
     // value set, so the seed also stays row-permutation invariant (gam#1378).
+    //
+    // The column sum is taken in CANONICAL (value-sorted) order rather than row
+    // order. A plain `for i in 0..n { s += data[[i, c]] }` accumulates in the
+    // data's ROW order, so floating-point round-off makes the result depend on
+    // that order: a pure row permutation re-sequences the additions and shifts
+    // the mean by an ulp. That ulp is enough to break the EXACT equidistance of
+    // points that are symmetric about the mean (the common 1-D case), so the
+    // `dist2_to_centroid` comparisons below stop reducing to the
+    // value-lexicographic tie-break and the seed — and hence the whole knot set
+    // — flips with row order. That is the residual ~1e-7 `s(x, bs="tp")`
+    // row-permutation drift owed under gam#1378 (value-anchored `bs="cr"/"ps"`
+    // stayed bit-stable because they never seed off this centroid). Sorting the
+    // column values yields the identical addition sequence for every permutation
+    // of the same data — all values are finite (guarded above), so `total_cmp`
+    // is a total order — restoring a bit-identical, order-independent centroid.
     let centroid: Vec<f64> = (0..d)
         .map(|c| {
-            let mut s = 0.0;
-            for i in 0..n {
-                s += data[[i, c]];
-            }
+            let mut col: Vec<f64> = (0..n).map(|i| data[[i, c]]).collect();
+            col.sort_by(|a, b| a.total_cmp(b));
+            let s: f64 = col.iter().sum();
             s / n as f64
         })
         .collect();
