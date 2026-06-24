@@ -144,25 +144,31 @@ impl SurvivalMarginalSlopeFamily {
             .into());
         }
 
-        let (a0, d0) = self.solve_row_survival_intercept_with_slot(
+        // The intercept solve's density-normalization check `d0`/`d1` is recomputed
+        // inside the jet timepoint builder (`evaluate_survival_denom_d`), so only the
+        // solved intercepts `a0`/`a1` are needed here.
+        let (a0, _d0) = self.solve_row_survival_intercept_with_slot(
             q0,
             g,
             beta_h,
             beta_w,
             Some((row, SurvivalInterceptSlotKind::Entry)),
         )?;
-        let (a1, d1) = self.solve_row_survival_intercept_with_slot(
+        let (a1, _d1) = self.solve_row_survival_intercept_with_slot(
             q1,
             g,
             beta_h,
             beta_w,
             Some((row, SurvivalInterceptSlotKind::Exit)),
         )?;
-        let entry = self.compute_survival_timepoint_exact(
-            row, primary, q0, primary.q0, a0, g, d0, beta_h, beta_w, o_infl, false,
+        // #932-2 PRODUCTION cutover: the exact timepoint value/grad/Hessian come from
+        // the single-source `flex_timepoint_inputs_generic` jet builder (Jet2), not
+        // the hand `compute_survival_timepoint_exact` probit-chain assembly.
+        let entry = self.compute_survival_timepoint_exact_jet(
+            row, primary, q0, primary.q0, a0, g, beta_h, beta_w, o_infl,
         )?;
-        let exit = self.compute_survival_timepoint_exact(
-            row, primary, q1, primary.q1, a1, g, d1, beta_h, beta_w, o_infl, true,
+        let exit = self.compute_survival_timepoint_exact_jet(
+            row, primary, q1, primary.q1, a1, g, beta_h, beta_w, o_infl,
         )?;
 
         if !exit.chi.is_finite() || exit.chi <= 0.0 {

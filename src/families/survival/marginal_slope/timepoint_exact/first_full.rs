@@ -1,9 +1,11 @@
 //! Exact first-order and full timepoint evaluations.
 //!
 //! `compute_survival_timepoint_first_order_exact` carries the calibration
-//! solve and first partials; `compute_survival_timepoint_exact` extends it to
-//! the full second-order timepoint quantities (η, χ, D and their u/uv partials)
-//! over the cached partition.
+//! solve and first partials; `compute_survival_timepoint_exact_from_cached`
+//! extends it to the full second-order timepoint quantities (η, χ, D and their
+//! u/uv partials) over the cached partition. (The production value/grad/Hessian
+//! path is now the single-source `compute_survival_timepoint_exact_jet`; this
+//! hand pack remains the directional/bidirectional base + the FD oracle.)
 
 use super::*;
 
@@ -569,37 +571,6 @@ impl SurvivalMarginalSlopeFamily {
             chi_u,
             d_u,
         })
-    }
-
-    pub(crate) fn compute_survival_timepoint_exact(
-        &self,
-        row: usize,
-        primary: &FlexPrimarySlices,
-        q: f64,
-        q_index: usize,
-        a: f64,
-        b: f64,
-        d_calibration: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-        o_infl: f64,
-        need_d_uv: bool,
-    ) -> Result<SurvivalFlexTimepointExact, String> {
-        let cached = self.build_cached_partition(primary, a, b, beta_h, beta_w)?;
-        self.compute_survival_timepoint_exact_from_cached(
-            row,
-            primary,
-            q,
-            q_index,
-            a,
-            b,
-            d_calibration,
-            beta_h,
-            beta_w,
-            o_infl,
-            need_d_uv,
-            &cached,
-        )
     }
 
     pub(crate) fn compute_survival_timepoint_exact_from_cached(

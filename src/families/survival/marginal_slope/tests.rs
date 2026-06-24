@@ -3193,7 +3193,10 @@ fn flex_logslope_first_sensitivity_matches_fd() {
                 Some((0, SurvivalInterceptSlotKind::Exit)),
             )
             .expect("exit intercept");
-        fam.compute_survival_timepoint_exact(
+        let cached = fam
+            .build_cached_partition(&primary, a1, gg, Some(&bh), Some(&bw))
+            .expect("cached partition");
+        fam.compute_survival_timepoint_exact_from_cached(
             0,
             &primary,
             q1v,
@@ -3205,6 +3208,7 @@ fn flex_logslope_first_sensitivity_matches_fd() {
             Some(&bw),
             0.0,
             true,
+            &cached,
         )
         .expect("exit base")
     };
