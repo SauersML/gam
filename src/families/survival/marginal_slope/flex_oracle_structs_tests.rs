@@ -13,9 +13,11 @@
 use crate::families::jet_partitions::MultiDirJet;
 use crate::families::marginal_slope_shared::CoeffSupport;
 use ndarray::{Array1, Array2};
-// `SurvivalMarginalSlopeFamily` + `FlexPrimarySlices` — same resolution as the
-// `contraction.rs` impl the cell-pair helpers below were moved from.
-use super::*;
+// `SurvivalMarginalSlopeFamily` + `FlexPrimarySlices` — for the cell-pair helper
+// impl below (moved from `contraction.rs`). Imported explicitly (not `super::*`,
+// which would shadow the `CoeffSupport`/`MultiDirJet` imports above and trip the
+// unused-import lint).
+use super::{FlexPrimarySlices, SurvivalMarginalSlopeFamily};
 
 /// `g+h+w` coefficient-support mask for the hand oracle (slope + score-warp +
 /// link-dev primaries active).
