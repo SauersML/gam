@@ -324,8 +324,6 @@ impl SaeManifoldOuterObjective {
             ..
         } = self;
         let pristine_seed_term = baseline_term.clone();
-        // #1026 — spare pristine-seed clone for the global linear-dominance floor.
-        let anchor_seed_term = pristine_seed_term.clone();
         let pristine_seed_rho = baseline_rho.clone();
         let mut fitted_rho = current_rho;
         let loss = last_loss.unwrap_or_else(|| SaeManifoldLoss {
@@ -433,82 +431,25 @@ impl SaeManifoldOuterObjective {
             fitted_loss = seed_loss;
             pristine_seed_won = true;
         }
-        // #1026 GLOBAL LINEAR-DOMINANCE FLOOR via the DECODER (the channel m.reconstruct
-        // honors). m.reconstruct rebuilds a fresh OOS term and re-encodes codes+assignment
-        // against the DECODERS at η=1, so to move the user-facing metric we change the
-        // final decoders to the certified rank-2K PCA anchor:
-        //   1. re-derive the anchor from the PRISTINE seed via the convex η=0 relaxation
-        //      (`reml_criterion_with_cache` at η=0 — the call the curvature walk uses, which
-        //      reaches the ~0.74 ceiling; a collapsed term's η=0 re-solve stays ~0.58).
-        //   2. ZERO the curved (higher-harmonic) decoder columns so the decoder is PURE
-        //      first-harmonic — exactly the rank-2K PCA core. The earlier η-anchor attempts
-        //      failed because the η=0 solve left non-zero higher-harmonic coeffs that, at
-        //      the OOS-served η=1, distort the reconstruction back below the curved result.
-        //      With them zeroed, the η=1 reconstruction IS the PCA ceiling and propagates
-        //      through m.reconstruct (decoder-only), no payload/η-serving change needed.
-        // The adopt decision uses the RELIABLE η=0 EV (the anchor reconstructs the ceiling
-        // there); adopt only when it strictly beats the returned curved EV (genuine curved
-        // wins are untouched). This is the reviewers' retained-linear-incumbent dominance
-        // fallback: F_returned ≤ F_linear, holding on held-out data (a real linear decoder).
-        let returned_ev = fitted
-            .try_fitted_for_rho(&fitted_rho)
-            .ok()
-            .and_then(|fit| reconstruction_explained_variance(target.view(), fit.view()));
-        let mut anchor_term = anchor_seed_term;
-        anchor_term.set_homotopy_eta(0.0).ok();
-        let anchor_rho = fitted_rho.clone();
-        let anchor_solved = anchor_term
-            .reml_criterion_with_cache(
-                target.view(),
-                &anchor_rho,
-                registry.as_ref(),
-                inner_max_iter.max(CURVATURE_WALK_RECOVERY_INNER_ITERS),
-                learning_rate,
-                ridge_ext_coord,
-                ridge_beta,
-            )
-            .is_ok();
-        let anchor_ev = anchor_term
-            .try_fitted_for_rho(&anchor_rho)
-            .ok()
-            .and_then(|fit| reconstruction_explained_variance(target.view(), fit.view()));
-        if anchor_solved
-            && let Some(returned_ev) = returned_ev
-            && let Some(anchor_ev) = anchor_ev
-            && anchor_ev.is_finite()
-            && anchor_ev > returned_ev + SAE_FINAL_EV_DEGRADATION_TOL
-        {
-            // Zero the curved (η-scaled) decoder columns so the decoder is the pure
-            // first-harmonic PCA core, then serve at η=1 (the OOS default).
-            for atom in anchor_term.atoms.iter_mut() {
-                let m = atom.decoder_coefficients.nrows();
-                let pchan = atom.decoder_coefficients.ncols();
-                if let Some(split) = atom
-                    .basis_evaluator
-                    .as_ref()
-                    .and_then(|eval| eval.phi_eta_split(m).ok())
-                {
-                    for &col in &split.curved_cols {
-                        if col < m {
-                            for j in 0..pchan {
-                                atom.decoder_coefficients[[col, j]] = 0.0;
-                            }
-                        }
-                    }
-                }
-            }
-            anchor_term.set_homotopy_eta(1.0).ok();
-            if let Ok(anchor_loss) = anchor_term.loss(target.view(), &anchor_rho) {
-                log::info!(
-                    "[#1026] into_fitted linear-dominance floor: returned EV {returned_ev:.4} < \
-                     η=0 PCA anchor EV {anchor_ev:.4}; adopting pure-first-harmonic anchor \
-                     decoders (curved cols zeroed) — F_returned ≤ F_linear, OOS-propagating"
-                );
-                fitted = anchor_term;
-                fitted_rho = anchor_rho;
-                fitted_loss = anchor_loss;
-            }
-        }
+        // #1026 GLOBAL LINEAR-DOMINANCE FLOOR (F_returned ≤ F_linear). The seed and
+        // pristine-seed guards above re-solve the CURVED (η=1) fit, which on real
+        // linear-Gaussian activations can co-collapse to a fraction of the linear
+        // ceiling (real OLMo K=8: EV ≈ 0.58 vs the 0.74 certified Eckart-Young
+        // ceiling). As a final candidate, re-solve the CONVEX η=0 linear relaxation —
+        // the same certified PCA-ceiling anchor the curvature walk starts from — and
+        // adopt it when it reconstructs strictly better than the returned curved
+        // state. Curvature that cannot beat the convex linear optimum returns that
+        // optimum; because the anchor is a genuine linear model (not a
+        // reconstruction-time substitution) the dominance holds on held-out data too.
+        // NOTE (#1026): a GLOBAL linear-dominance floor was attempted here (re-derive the
+        // η=0 PCA anchor and adopt it when the result reconstructs worse). It was
+        // REMOVED because it cannot move the user-facing metric: `m.reconstruct` rebuilds
+        // a fresh OOS term that RE-ENCODES the assignment + coordinates, so no term-state
+        // or decoder fix survives — only `hybrid_linear_images` (#1228) propagate to OOS.
+        // The robust generalizing recovery is therefore the hybrid-split rescue
+        // (collapsed atoms decode their linear image), not an η-anchor restore. Keeping
+        // the cheap SEED-level floor in the curvature walk (internal F≤F_linear) and
+        // avoiding the expensive per-fit re-derive that delivered no measured gain.
         // #1019 — the post-fit assembly seam: canonicalize every eligible
         // atom's chart to its canonical Diff(M) representative (arc length
         // for d = 1, minimum-isometry-defect flow for d = 2 torus atoms)
