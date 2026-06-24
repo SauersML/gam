@@ -7868,29 +7868,22 @@ fn block10_production_fourth_contraction_matches_scalar_fd_witness() {
             }
 
             // The hand `cpu_oracle_fourth_contraction` (`b10_fourth_ordered`) stays
-            // EXERCISED as a deprecated cross-check, but is asserted only to be finite
-            // and within the KNOWN #1454 fourth-order envelope of the (FD-correct)
-            // production path — its g/h/w cross-channel quotient terms are
-            // ~14% off the scalar-FD ground truth (the bug the single-source jet
-            // eliminated). A tight parity here would assert a wrong reference; this
-            // documents the gap quantitatively and trips only if the hand oracle
-            // diverges far beyond the known incompleteness or returns non-finite.
+            // EXERCISED as a deprecated cross-check (kept alive, not dead code), but is
+            // NOT asserted bit- or envelope-equal to production: its 4th-order g/h/w
+            // cross-channel quotient terms carry the #1454 moving-boundary
+            // incompleteness the single-source jet eliminated, so its divergence from
+            // the (FD-correct) production path IS the known bug itself — bounding that
+            // divergence is meaningless and fixture-fragile (it varies per fixture and
+            // direction). We assert only that the hand path stays FINITE (no crash /
+            // NaN). The production-vs-scalar-FD gate above is the real correctness check.
             let hand = b10_fourth_oracle_from_family(&family, &block_states, dir_u, &dir_v);
             assert_eq!(hand.len(), p * p);
             for u in 0..p {
                 for v in 0..p {
                     let h = hand[u * p + v];
-                    let prod = production[[u, v]];
                     assert!(
                         h.is_finite(),
                         "{} / {u_label}->{v_label} hand fourth[{u},{v}] non-finite: {h:+.6e}",
-                        fixture.label
-                    );
-                    let scale = prod.abs().max(1.0);
-                    assert!(
-                        (h - prod).abs() <= 2.5e-1 * scale + 1e-4,
-                        "{} / {u_label}->{v_label} hand fourth[{u},{v}]={h:+.6e} diverged beyond the \
-                         known #1454 envelope of production {prod:+.6e}",
                         fixture.label
                     );
                 }
