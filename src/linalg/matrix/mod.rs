@@ -5774,8 +5774,9 @@ impl From<&DesignMatrix> for DesignBlock {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChunkedKernelDesignOperator, CoefficientTransformOperator, DenseDesignMatrix,
-        DenseDesignOperator, DesignMatrix, EmbeddedColumnBlock, MultiChannelOperator,
+        BlockDesignOperator, ChunkedKernelDesignOperator, CoefficientTransformOperator,
+        DenseDesignMatrix, DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
+        MultiChannelOperator,
         PsdWeightsView, ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator,
         SignedWeightsView, SparseDesignMatrix, dense_operator_to_dense_by_chunks,
         dense_transpose_weighted_response, fast_atv, fast_av, streaming_sparse_csc_xt_diag_x,
@@ -6060,6 +6061,59 @@ mod tests {
         for i in 0..expected_xtwy.len() {
             assert!((expected_xtwy[i] - got_xtwy[i]).abs() < 1e-12);
         }
+    }
+
+    /// Perf (#1017): the fused scale-once + `fast_atb` Dense×Dense cross-block
+    /// assembly in `BlockDesignOperator::diag_xtw_x` must equal the full stacked
+    /// reference Gram `Xᵀ diag(w) X` for a multi-block dense layout with SIGNED
+    /// weights (the observed-Hessian regime that exercises the sign-correct
+    /// asymmetric cross kernel). Several dense blocks of differing widths so the
+    /// off-diagonal slicing and the symmetric transpose fill are both covered.
+    #[test]
+    fn block_design_fused_dense_cross_matches_stacked_reference_xtwx() {
+        let b0 = array![
+            [1.0, 2.0],
+            [0.5, -1.0],
+            [3.0, 0.25],
+            [-2.0, 1.5],
+            [0.75, -0.5],
+        ];
+        let b1 = array![
+            [-1.0, 0.5, 2.0],
+            [1.5, -0.25, 0.0],
+            [0.0, 1.0, -1.5],
+            [2.0, 0.5, 1.0],
+            [-0.5, -1.0, 0.25],
+        ];
+        let b2 = array![[0.5], [-1.0], [2.0], [0.25], [-0.75]];
+
+        let mut stacked = Array2::<f64>::zeros((5, 6));
+        stacked.slice_mut(s![.., 0..2]).assign(&b0);
+        stacked.slice_mut(s![.., 2..5]).assign(&b1);
+        stacked.slice_mut(s![.., 5..6]).assign(&b2);
+
+        let blocks = vec![
+            DesignBlock::Dense(DenseDesignMatrix::from(b0)),
+            DesignBlock::Dense(DenseDesignMatrix::from(b1)),
+            DesignBlock::Dense(DenseDesignMatrix::from(b2)),
+        ];
+        let op = BlockDesignOperator::new(blocks).expect("block design");
+
+        // Signed weights: the cross kernel must NOT clamp to PSD here.
+        let weights = array![1.5, -0.5, 2.0, -1.0, 0.75];
+        let weighted = stacked.clone() * weights.view().insert_axis(Axis(1));
+        let expected = stacked.t().dot(&weighted);
+
+        let got = op.diag_xtw_x(&weights).expect("block fused xtwx");
+        assert_eq!(got.dim(), (6, 6));
+        let max_diff = (&got - &expected)
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_diff < 1e-10,
+            "fused block Dense×Dense Gram mismatch: max_diff={max_diff}"
+        );
     }
 
     #[test]
