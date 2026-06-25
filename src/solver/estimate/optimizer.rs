@@ -698,6 +698,29 @@ where
         // Unconditionally assigned inside the prepass block below (before its
         // first read by the #1371 guard), so it carries no dead initializer.
         let release_rerank_seed: Option<Array1<f64>>;
+        // #1548: the well-determined Marra-Wood double-penalty null-space
+        // selection coordinates, recognised exactly as the #1266 shrink-out
+        // escape recognises them (the relaxed `Normal(0, sd=15)` degeneracy
+        // prior, gated by `n ≥ 2·p`). A SUPPORTED such coordinate has a deep
+        // low-λ_null "keep" basin AND a flat high-λ_null annihilation shelf; the
+        // objective-grid prepass below probes the keep corner for exactly these
+        // coordinates so it can seed the well-conditioned keep basin directly
+        // rather than the shelf — see the keep-saturation probe in
+        // `select_objective_seed_on_log_lambda_grid`.
+        let nullspace_seed_coords: Vec<usize> = if n_design_rows >= 2 * p {
+            match reml_state.effective_rho_prior().as_ref() {
+                crate::types::RhoPrior::Independent(per_coord) => (0..k)
+                    .filter(|&i| {
+                        per_coord
+                            .get(i)
+                            .is_some_and(crate::terms::smooth::is_nullspace_degeneracy_prior)
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
         let prepass_seed: Option<Array1<f64>> = {
             let bnds = reml_seed_config.bounds;
             let (lo, hi_seed) = if bnds.0 <= bnds.1 {
@@ -760,10 +783,17 @@ where
                     out
                 };
                 let base_canon = Array1::from_iter(perm.iter().map(|&i| base[i]));
+                // Canonical slot `c` carries native coordinate `perm[c]`; a
+                // null-space coordinate must be probed in whichever slot it
+                // occupies in the canonical layout the grid refines.
+                let nullspace_canon: Vec<usize> = (0..k)
+                    .filter(|&c| nullspace_seed_coords.contains(&perm[c]))
+                    .collect();
                 let refined_canon = crate::seeding::select_objective_seed_on_log_lambda_grid(
                     &base_canon,
                     (lo, hi),
                     k,
+                    &nullspace_canon,
                     |canon_rho| {
                         let native = to_native(canon_rho);
                         reml_state.compute_cost(&native).ok().filter(|c| c.is_finite())
@@ -775,6 +805,7 @@ where
                     &base,
                     (lo, hi),
                     k,
+                    &nullspace_seed_coords,
                     |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
                 )
             };
@@ -831,6 +862,9 @@ where
             if k == 4 {
                 baselines.push(("conv", Array1::from(vec![9.0_f64, 30.0, 12.0, 30.0])));
             }
+            if k == 2 {
+                baselines.push(("conv6", Array1::from(vec![6.0_f64, 6.0])));
+            }
             for (label, baseline) in &baselines {
                 log::warn!("[#1074-sweep] k={k} baseline={label}={baseline:?}");
                 for coord in 0..k {
@@ -838,11 +872,14 @@ where
                     for &rho in &grid {
                         let mut p = baseline.clone();
                         p[coord] = rho;
-                        let c = reml_state
-                            .compute_cost(&p)
-                            .map(|v| format!("{v:.4}"))
-                            .unwrap_or_else(|_| "ERR".to_string());
-                        line.push_str(&format!(" {rho:.0}->{c}"));
+                        let cg = reml_state.compute_cost_and_gradient(&p).ok();
+                        let cell = match cg {
+                            Some((c, g)) => {
+                                format!("{c:.4}(g{}={:.3e})", coord, g.get(coord).copied().unwrap_or(f64::NAN))
+                            }
+                            None => "ERR".to_string(),
+                        };
+                        line.push_str(&format!(" {rho:.0}->{cell}"));
                     }
                     log::warn!("{line}");
                 }

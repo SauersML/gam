@@ -594,6 +594,7 @@ pub fn select_objective_seed_on_log_lambda_grid<F>(
     rho_seed: &Array1<f64>,
     bounds: (f64, f64),
     n_smooths: usize,
+    nullspace_coords: &[usize],
     mut eval_cost: F,
 ) -> Array1<f64>
 where
@@ -675,6 +676,25 @@ where
         // the true REML/LAML cost — so a genuinely better interior optimum or
         // supported smooth simply wins the comparison.
         let saturation = clamp_to_bounds(bnds.1, bnds);
+        // Lower-saturation ("keep") corner, the symmetric dual of `saturation`.
+        // The per-axis sweep above probes the over-smoothing/shrink-out corner
+        // (`bnds.1`) so an unsupported double-penalty null-space coordinate can
+        // rail its λ_null up and select the term out (#1266). The MISSING corner
+        // is the opposite one: a SUPPORTED null space (a genuine linear/constant
+        // trend the data buy) has its global REML optimum at a LOW λ_null "keep"
+        // basin, separated from the high-λ_null annihilation shelf by a flat
+        // valley. Without a keep-direction probe the grid can seed only the shelf
+        // corner, leaving the outer optimizer to cross that flat valley to reach
+        // the keep basin — a crossing whose success rode on sub-ULP gradient signs
+        // that a covariate reflection x→−x flips, so the mirror fit stalled on the
+        // shelf and annihilated the supported trend (#1548). Probing the keep
+        // corner for EXACTLY the null-space coordinates (where un-shrinking is
+        // safe — the wiggliness penalty stays active, so there is no λ→0
+        // inner-cap overfit artifact) lets the grid seed the well-conditioned keep
+        // basin directly. It is criterion-ranked like every other probe: an
+        // unsupported term's keep corner is never cheaper than its shrink-out
+        // corner, so #1266 is untouched.
+        let keep_saturation = clamp_to_bounds(bnds.0, bnds);
         for axis in 0..n_smooths {
             let anchor = best_seed.clone();
             let mut targets = vec![
@@ -683,6 +703,15 @@ where
             ];
             if (anchor[axis] - saturation).abs() > 1e-9 {
                 targets.push(saturation);
+            }
+            if nullspace_coords.contains(&axis) {
+                // Step toward the keep basin (a moderate un-shrink) and the full
+                // keep saturation, so the probe reaches the basin wherever it sits
+                // between the anchor and λ_null → 0.
+                targets.push(clamp_to_bounds(anchor[axis] - 6.0, bnds));
+                if (anchor[axis] - keep_saturation).abs() > 1e-9 {
+                    targets.push(keep_saturation);
+                }
             }
             for target in targets {
                 let mut candidate = anchor.clone();
@@ -793,7 +822,7 @@ mod tests {
     #[test]
     fn objective_grid_can_seed_adjacent_pair_oversmoothing_corner() {
         let base = Array1::zeros(4);
-        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 4, |rho| {
+        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 4, &[], |rho| {
             let supported_cost = 0.1 * (rho[0].powi(2) + rho[1].powi(2));
             let unsupported_gap = (rho[2] - 12.0).powi(2) + (rho[3] - 12.0).powi(2);
             Some(supported_cost + unsupported_gap)
@@ -894,7 +923,7 @@ mod tests {
     #[test]
     fn objective_grid_seed_selects_lowest_finite_cost_candidate() {
         let base = Array1::from_vec(vec![0.0, 0.0]);
-        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, |rho| {
+        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, &[], |rho| {
             Some((rho[0] - 6.0).powi(2) + (rho[1] - 6.0).powi(2))
         });
 
@@ -905,7 +934,7 @@ mod tests {
     #[test]
     fn objective_grid_seed_keeps_baseline_when_no_candidate_improves_cost() {
         let base = Array1::from_vec(vec![1.0, -2.0]);
-        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, |rho| {
+        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, &[], |rho| {
             if (rho[0] - 1.0).abs() < 1e-12 && (rho[1] + 2.0).abs() < 1e-12 {
                 Some(0.0)
             } else {
