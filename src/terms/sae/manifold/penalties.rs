@@ -321,29 +321,6 @@ impl SaeManifoldTerm {
         pairs
     }
 
-    /// #1026/#1522 AMPLITUDE barrier value
-    /// `P_amp = -μ_s · Σ_{k: active} log(s_k² + ε)`, `s_k² = ‖B_k‖²_F`. Diverges
-    /// to `+∞` as any active decoder norm → 0, so the minimiser is pushed off the
-    /// collapse boundary. "Active" = atoms whose assignment column carries any
-    /// mass (a structurally-dead atom is not held up by the barrier). 0 for `K<1`.
-    pub(crate) fn amplitude_barrier_value(&self, penalty_scale: f64) -> f64 {
-        let mu = penalty_scale * sae_amplitude_barrier_strength();
-        if mu == 0.0 {
-            return 0.0;
-        }
-        let eps = SAE_AMPLITUDE_BARRIER_EPS;
-        let active = self.barrier_active_atoms();
-        let mut acc = 0.0_f64;
-        for (k, atom) in self.atoms.iter().enumerate() {
-            if !active[k] {
-                continue;
-            }
-            let s2: f64 = atom.decoder_coefficients.iter().map(|v| v * v).sum();
-            acc += -(s2 + eps).ln();
-        }
-        mu * acc
-    }
-
     /// #1026/#1522 SEPARATION barrier value
     /// `P_sep = -μ_C · Σ_{j<k} q_jk · log(1 - c_jk² + ε)` on the normalized
     /// shapes. Diverges as two coactive atoms align (`c_jk² → 1`); exactly 0 when
@@ -397,124 +374,6 @@ impl SaeManifoldTerm {
             }
         }
         cross
-    }
-
-    /// Atoms the AMPLITUDE barrier holds up: every live dictionary slot whose
-    /// decoder carries any norm at all. #1026/#1522 — the amplitude barrier
-    /// `-μ log‖B_k‖²` exists precisely to keep a decoder off the zero/degenerate
-    /// boundary, so it must NOT be gated on assignment mass: during a co-collapse
-    /// the assignment columns themselves drain, which (under the old
-    /// assignment-energy gate) silently switched the barrier OFF at the exact
-    /// moment it is needed. We gate instead on decoder presence above the active
-    /// floor, so the hold-up force is live for every real atom independent of how
-    /// the (separately collapsing) assignment routes mass.
-    fn barrier_active_atoms(&self) -> Vec<bool> {
-        let k_atoms = self.k_atoms();
-        match sae_barrier_gate_mode() {
-            // Legacy assignment-energy gate (drains during co-collapse). Kept
-            // ONLY so a sweep can A/B it against the decoder-norm default.
-            1 => {
-                let gates = self.assignment.assignments();
-                let n = gates.nrows();
-                (0..k_atoms)
-                    .map(|k| {
-                        let mut e = 0.0_f64;
-                        for row in 0..n {
-                            let a = gates[[row, k]];
-                            e += a * a;
-                        }
-                        e > 0.0
-                    })
-                    .collect()
-            }
-            // Unconditional: every live dictionary slot.
-            2 => vec![true; k_atoms],
-            // Default (0): decoder-norm gate — hold up every atom whose decoder
-            // carries norm above the active floor, independent of assignment.
-            _ => {
-                let floor2 = SAE_BARRIER_ACTIVE_NORM_FLOOR * SAE_BARRIER_ACTIVE_NORM_FLOOR;
-                self.atoms
-                    .iter()
-                    .map(|atom| {
-                        let s2: f64 = atom.decoder_coefficients.iter().map(|v| v * v).sum();
-                        s2 > floor2
-                    })
-                    .collect()
-            }
-        }
-    }
-
-    /// #1026/#1522 — accumulate the AMPLITUDE barrier's analytic gradient into
-    /// `sys.gb` and a PSD majorizer of its curvature into `sys.hbb`, in the
-    /// full-`B` β layout. Returns `true` iff anything was written.
-    ///
-    /// With `s_k² = ‖B_k‖²_F` and `D_k = 1/(s_k²+ε)`:
-    ///   value     `P = -μ Σ_k log(s_k²+ε)`,
-    ///   gradient  `∂P/∂B_k = -2μ D_k · B_k`            (magnitude `∝ 1/‖B_k‖`),
-    ///   Hessian   `-2μ D_k I + 4μ D_k² · vec(B_k)vec(B_k)ᵀ`.
-    /// The first (`-2μ D_k I`) term is NEGATIVE-definite (the barrier is concave
-    /// in `‖B‖` away from 0) and is DROPPED from the majorizer; the rank-1
-    /// `+4μ D_k² vec(B_k)vec(B_k)ᵀ` term is PSD and is kept, so `sys.hbb` stays
-    /// PD. (Dropping the indefinite term only makes the inner Newton more
-    /// conservative; the consistent value/gradient drive the actual descent.)
-    pub(crate) fn add_sae_amplitude_barrier(
-        &self,
-        sys: &mut ArrowSchurSystem,
-        penalty_scale: f64,
-        dense_beta_curvature: bool,
-    ) -> bool {
-        let mu = penalty_scale * sae_amplitude_barrier_strength();
-        if mu == 0.0 {
-            return false;
-        }
-        let eps = SAE_AMPLITUDE_BARRIER_EPS;
-        let p = self.output_dim();
-        let offsets = self.beta_offsets();
-        let active = self.barrier_active_atoms();
-        let mut wrote = false;
-        for (k, atom) in self.atoms.iter().enumerate() {
-            if !active[k] {
-                continue;
-            }
-            let bk = &atom.decoder_coefficients;
-            let m = bk.nrows();
-            let s2: f64 = bk.iter().map(|v| v * v).sum();
-            let d = 1.0 / (s2 + eps);
-            let off = offsets[k];
-            // Gradient: -2μ D · B_k.
-            let g_scale = -2.0 * mu * d;
-            for a in 0..m {
-                for o in 0..p {
-                    sys.gb[off + a * p + o] += g_scale * bk[[a, o]];
-                }
-            }
-            wrote = true;
-            if !dense_beta_curvature {
-                continue;
-            }
-            // PSD majorizer: +4μ D² · vec(B_k)vec(B_k)ᵀ on this atom's block.
-            let h_scale = 4.0 * mu * d * d;
-            for ai in 0..m {
-                for oi in 0..p {
-                    let i = off + ai * p + oi;
-                    let bi = bk[[ai, oi]];
-                    if bi == 0.0 {
-                        continue;
-                    }
-                    for aj in 0..m {
-                        for oj in 0..p {
-                            let bj = bk[[aj, oj]];
-                            if bj == 0.0 {
-                                continue;
-                            }
-                            let jcol = off + aj * p + oj;
-                            sys.hbb[[i, jcol]] += h_scale * bi * bj;
-                        }
-                    }
-                }
-            }
-        }
-        wrote
     }
 
     /// #1026/#1522 — accumulate the SEPARATION barrier's analytic gradient into
@@ -878,24 +737,10 @@ impl SaeManifoldTerm {
         true
     }
 
-    /// #1026/#1522 — PUBLIC test inspector: the AMPLITUDE barrier value and its
-    /// analytic decoder gradient (length `beta_dim`, full-`B` layout) at the
-    /// current decoders, with `penalty_scale = 1`. Hermetic seam so the
-    /// owed-1026 FD battery can certify `∂P_amp/∂B` against a central finite
-    /// difference of [`Self::amplitude_barrier_value`] in isolation (no data-fit,
-    /// smoothness, or ARD mixed in). Returns `(value, grad)`.
-    pub fn amplitude_barrier_value_and_grad_for_test(&self) -> (f64, Array1<f64>) {
-        let mut sys = ArrowSchurSystem::new(0, 0, self.beta_dim());
-        sys.gb = Array1::<f64>::zeros(self.beta_dim());
-        sys.hbb = Array2::<f64>::zeros((0, 0));
-        self.add_sae_amplitude_barrier(&mut sys, 1.0, false);
-        (self.amplitude_barrier_value(1.0), sys.gb)
-    }
-
     /// #1026/#1522 — PUBLIC test inspector: the SEPARATION barrier value and its
     /// analytic decoder gradient (length `beta_dim`, full-`B` layout) at the
-    /// current decoders, with `penalty_scale = 1`. Same hermetic-seam purpose as
-    /// [`Self::amplitude_barrier_value_and_grad_for_test`]. Returns `(value, grad)`.
+    /// current decoders, with `penalty_scale = 1`. Hermetic seam so the owed-1026
+    /// FD battery can certify `∂P_sep/∂B` in isolation. Returns `(value, grad)`.
     pub fn separation_barrier_value_and_grad_for_test(&self) -> (f64, Array1<f64>) {
         let mut sys = ArrowSchurSystem::new(0, 0, self.beta_dim());
         sys.gb = Array1::<f64>::zeros(self.beta_dim());

@@ -3353,7 +3353,6 @@ impl SaeManifoldTerm {
         // #1026/#1522 — interior-point collapse-prevention barriers, on the SAME
         // decoders the assembly's gradient/curvature used, so the line search sees
         // exactly the term the inner Newton step optimises (no value/grad desync).
-        total += self.amplitude_barrier_value(penalty_scale);
         total += self.separation_barrier_value(penalty_scale);
         Ok(total)
     }
@@ -4872,13 +4871,30 @@ impl SaeManifoldTerm {
         // framed systems carry `G_ij ⊗ W_ij` with rank-r atom blocks. Feeding a
         // framed system to that kernel would silently return the wrong Newton
         // step. Framed device PCG therefore needs the dedicated factored kernel.
+        // #1033 large-n: the per-row support `kron_a_phi` and local Jacobians
+        // `kron_jac` are consumed by BOTH the host matrix-free row operator
+        // (`SaeKroneckerRows`) and the solver's `DeviceSaePcgData`. Previously
+        // each took its own full `O(n·q·p)` / `O(n·k_active)` clone, so the
+        // always-resident footprint of the CPU non-frames path carried TWO copies
+        // of the dominant Jacobian slab. Promote each to a single `Arc<[…]>` once
+        // and hand both consumers a refcount bump (`O(1)`) — the backing
+        // allocation is shared, halving the resident per-row Jacobian memory.
+        // Reads are identical (`&arc[row]`, `.len()`), so the assembled system and
+        // every matvec are bit-for-bit unchanged.
         let device_rows = if frames_engaged {
             None
         } else {
-            Some((kron_a_phi.clone(), kron_jac.clone()))
+            let a_phi_shared: Arc<[Vec<(usize, f64)>]> =
+                Arc::from(std::mem::take(&mut kron_a_phi).into_boxed_slice());
+            let jac_shared: Arc<[Vec<f64>]> =
+                Arc::from(std::mem::take(&mut kron_jac).into_boxed_slice());
+            Some((a_phi_shared, jac_shared))
         };
         if !frames_engaged {
-            let kron = Arc::new(SaeKroneckerRows::new(p, kron_a_phi, kron_jac));
+            let (a_phi_shared, jac_shared) = device_rows
+                .clone()
+                .expect("non-frames path always populates device_rows");
+            let kron = Arc::new(SaeKroneckerRows::new(p, a_phi_shared, jac_shared));
             let kron_t = Arc::clone(&kron);
             let p_dim = p;
             sys.set_row_htbeta_operator(
@@ -4953,9 +4969,6 @@ impl SaeManifoldTerm {
         // curvature on normalized shapes weighted by coactivation. Both accumulate
         // into the full-`B` β-tier here, BEFORE the frame transform, so a framed
         // system carries them identically to the analytic β penalties.
-        if self.add_sae_amplitude_barrier(&mut sys, penalty_scale, dense_beta_curvature) {
-            beta_penalty_assembly.record_curvature(dense_beta_curvature);
-        }
         if self.add_sae_separation_barrier(&mut sys, penalty_scale, dense_beta_curvature) {
             beta_penalty_assembly.record_curvature(dense_beta_curvature);
         }

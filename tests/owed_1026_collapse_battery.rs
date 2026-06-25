@@ -190,7 +190,11 @@ fn pca_polar_containment_reconstructs_rank2k_to_machine_precision_1026() {
             dec[[1, j]] = c * v2[j]; // sin row → v2
             dec[[2, j]] = c * v1[j]; // cos row → v1
         }
-        atoms.push(circle_atom(&format!("circle_{pair}"), &coords_blocks[pair], dec));
+        atoms.push(circle_atom(
+            &format!("circle_{pair}"),
+            &coords_blocks[pair],
+            dec,
+        ));
         for i in 0..n {
             amplitudes[[i, pair]] = radii[pair][i] / c;
         }
@@ -381,8 +385,26 @@ fn zero_amplitude_interior_force_points_away_from_collapse_1026() {
     dec1[[1, 0]] = eps;
     dec1[[2, 0]] = eps;
 
-    let coords0 = array![[0.05], [0.22], [0.55], [0.81], [0.34], [0.66], [0.12], [0.90]];
-    let coords1 = array![[0.15], [0.31], [0.64], [0.92], [0.47], [0.09], [0.73], [0.40]];
+    let coords0 = array![
+        [0.05],
+        [0.22],
+        [0.55],
+        [0.81],
+        [0.34],
+        [0.66],
+        [0.12],
+        [0.90]
+    ];
+    let coords1 = array![
+        [0.15],
+        [0.31],
+        [0.64],
+        [0.92],
+        [0.47],
+        [0.09],
+        [0.73],
+        [0.40]
+    ];
     let atom0 = circle_atom("real", &coords0, dec0);
     let atom1 = circle_atom("collapsing", &coords1, dec1);
     let n = coords0.nrows();
@@ -426,9 +448,7 @@ fn zero_amplitude_interior_force_points_away_from_collapse_1026() {
     for v in dir.iter_mut() {
         *v /= dnorm;
     }
-    let radial_grad: f64 = (0..M * P)
-        .map(|j| sys.gb[atom1_start + j] * dir[j])
-        .sum();
+    let radial_grad: f64 = (0..M * P).map(|j| sys.gb[atom1_start + j] * dir[j]).sum();
 
     assert!(
         radial_grad < -1e-9,
@@ -485,8 +505,26 @@ fn duplicate_decoder_has_finite_nonzero_separating_curvature_1026() {
     dec_orth1[[1, 1]] = 1.0;
     dec_orth1[[2, 1]] = 1.0;
 
-    let coords0 = array![[0.05], [0.22], [0.55], [0.81], [0.34], [0.66], [0.12], [0.90]];
-    let coords1 = array![[0.15], [0.31], [0.64], [0.92], [0.47], [0.09], [0.73], [0.40]];
+    let coords0 = array![
+        [0.05],
+        [0.22],
+        [0.55],
+        [0.81],
+        [0.34],
+        [0.66],
+        [0.12],
+        [0.90]
+    ];
+    let coords1 = array![
+        [0.15],
+        [0.31],
+        [0.64],
+        [0.92],
+        [0.47],
+        [0.09],
+        [0.73],
+        [0.40]
+    ];
     let build = |d0: Array2<f64>, d1: Array2<f64>| -> SaeManifoldTerm {
         let a0 = circle_atom("dup0", &coords0, d0);
         let a1 = circle_atom("dup1", &coords1, d1);
@@ -653,7 +691,8 @@ fn circle_plus_line_keeps_one_curved_one_linear_1026() {
         )
         .unwrap();
         let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
-        term.reconstruct_from_assignments(amps.view(), false).unwrap()
+        term.reconstruct_from_assignments(amps.view(), false)
+            .unwrap()
     };
 
     // --- Mixed dictionary: circle atom on (v1,v2) + "line" atom on (w, v1).
@@ -743,8 +782,26 @@ fn circle_plus_line_keeps_one_curved_one_linear_1026() {
 /// Build a two-atom circle term with caller-supplied decoders and softmax
 /// assignment (well-conditioned coactivation), for the FD certificates.
 fn two_atom_barrier_term(dec0: Array2<f64>, dec1: Array2<f64>) -> SaeManifoldTerm {
-    let coords0 = array![[0.05], [0.22], [0.55], [0.81], [0.34], [0.66], [0.12], [0.90]];
-    let coords1 = array![[0.15], [0.31], [0.64], [0.92], [0.47], [0.09], [0.73], [0.40]];
+    let coords0 = array![
+        [0.05],
+        [0.22],
+        [0.55],
+        [0.81],
+        [0.34],
+        [0.66],
+        [0.12],
+        [0.90]
+    ];
+    let coords1 = array![
+        [0.15],
+        [0.31],
+        [0.64],
+        [0.92],
+        [0.47],
+        [0.09],
+        [0.73],
+        [0.40]
+    ];
     let atom0 = circle_atom("bar0", &coords0, dec0);
     let atom1 = circle_atom("bar1", &coords1, dec1);
     let n = coords0.nrows();
@@ -800,38 +857,6 @@ fn rel_grad_err(analytic: &Array1<f64>, fd: &Array1<f64>) -> f64 {
     diff / scale
 }
 
-/// CERTIFICATE: the AMPLITUDE barrier's analytic gradient equals the central FD
-/// of its value to rel-tol 1e-5, at decoders of moderate norm (the smooth
-/// interior of the barrier where the FD is trustworthy).
-#[test]
-fn amplitude_barrier_analytic_gradient_matches_central_fd_1026() {
-    const M: usize = 3;
-    const P: usize = 3;
-    // Two distinct, moderate-norm decoders.
-    let mut dec0 = Array2::<f64>::zeros((M, P));
-    dec0[[1, 0]] = 0.9;
-    dec0[[2, 1]] = 1.1;
-    dec0[[0, 2]] = 0.4;
-    let mut dec1 = Array2::<f64>::zeros((M, P));
-    dec1[[1, 1]] = 0.7;
-    dec1[[2, 2]] = 0.6;
-    dec1[[0, 0]] = 0.5;
-
-    let mut term = two_atom_barrier_term(dec0, dec1);
-    let (_v, analytic) = term.amplitude_barrier_value_and_grad_for_test();
-    let fd = barrier_fd_grad(
-        &mut term,
-        |t| t.amplitude_barrier_value_and_grad_for_test().0,
-        1e-6,
-    );
-    let err = rel_grad_err(&analytic, &fd);
-    assert!(
-        err <= 1e-5,
-        "amplitude-barrier analytic gradient must match central FD to rel-tol \
-         1e-5; got rel err {err:e}. analytic={analytic:?} fd={fd:?}"
-    );
-}
-
 /// CERTIFICATE: the SEPARATION barrier's analytic gradient equals the central FD
 /// of its value to rel-tol 1e-5, at two partially-overlapping shapes (so
 /// `c² ∈ (0,1)` and the barrier is in its smooth interior).
@@ -865,45 +890,5 @@ fn separation_barrier_analytic_gradient_matches_central_fd_1026() {
         err <= 1e-5,
         "separation-barrier analytic gradient must match central FD to rel-tol \
          1e-5; got rel err {err:e}. analytic={analytic:?} fd={fd:?}"
-    );
-}
-
-/// CERTIFICATE: at a NEAR-ZERO decoder (the collapse point) the amplitude
-/// barrier's gradient points AWAY from zero — i.e. its component along the
-/// decoder's own (growing) direction is strictly negative, so the minimiser is
-/// driven to grow the norm. This is the property the threshold repulsion lacks.
-#[test]
-fn amplitude_barrier_gradient_points_away_from_collapse_1026() {
-    const M: usize = 3;
-    const P: usize = 3;
-    let eps = 1e-6_f64;
-    // Atom 0: a real decoder. Atom 1: near-zero decoder along channel 0.
-    let mut dec0 = Array2::<f64>::zeros((M, P));
-    dec0[[1, 0]] = 1.0;
-    dec0[[2, 1]] = 1.0;
-    let mut dec1 = Array2::<f64>::zeros((M, P));
-    dec1[[1, 0]] = eps;
-    dec1[[2, 0]] = eps;
-
-    let term = two_atom_barrier_term(dec0, dec1);
-    let (_v, grad) = term.amplitude_barrier_value_and_grad_for_test();
-
-    // β layout: atom 1 starts at M*P; its decoder direction is the unit vector
-    // along (sin→ch0, cos→ch0). The radial gradient component must be < 0 (so
-    // descent `-grad` grows the norm outward).
-    let atom1_start = M * P;
-    let mut dir = vec![0.0_f64; M * P];
-    dir[P] = 1.0; // sin → ch0  (basis row 1, channel 0)
-    dir[2 * P] = 1.0; // cos → ch0  (basis row 2, channel 0)
-    let dnorm = (dir.iter().map(|v| v * v).sum::<f64>()).sqrt();
-    for v in dir.iter_mut() {
-        *v /= dnorm;
-    }
-    let radial: f64 = (0..M * P).map(|j| grad[atom1_start + j] * dir[j]).sum();
-    assert!(
-        radial < -1e-3,
-        "amplitude barrier must push a near-zero decoder OUTWARD: radial \
-         gradient ∂P/∂(radius) must be strictly negative (got {radial:e}). A \
-         non-negative value means no restoring force at the collapse point."
     );
 }

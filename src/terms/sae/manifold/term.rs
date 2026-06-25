@@ -208,55 +208,18 @@ pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 // anti-collapse core: they are interior-point log-barriers that DIVERGE at the
 // collapse boundary, so the inner Newton can never reach it.
 
-/// #1026/#1522 AMPLITUDE barrier strength `μ_s`. Penalty
-/// `P_amp = -μ_s · Σ_{k active} log(s_k² + ε)` with `s_k² = ‖B_k‖²_F`. Its
-/// decoder gradient `∂P/∂B_k = -2μ_s/(s_k²+ε)·B_k` has magnitude `∝ 1/‖B_k‖`
-/// near zero, a genuine OUTWARD restoring force (unlike the angle penalty, whose
-/// force vanishes with the norm). Fixed strength — there is no μ-continuation
-/// schedule; the only per-fit scaling is the minibatch chunk fraction `n_chunk/N`
-/// applied at the call site (`penalty_scale`). The value is empirically tuned to
-/// be commensurate with the unit-scale reconstruction objective and is overridable
-/// at runtime via [`set_sae_barrier_overrides`] to sweep the response surface.
-///
-/// #1026/#1522 RETUNE (2026-06-24, real OLMo-L25 EV-vs-K ladder): the original
-/// `100` is NOT commensurate — at a healthy decoder `s_k²~O(1)` the outward force
-/// `2μ_s/(s_k²+ε)·B_k ≈ 200·B_k` dwarfs the unit-scale reconstruction gradient,
-/// pinning the outer fit in a barrier-dominated flat valley (a healthy K=1 fit
-/// stalled 3494 s with no recorded EV at `μ_s=100`). At `μ_s=1` the force is
-/// `~2·B_k`, the K=1 fit is fast, and the curved held-out EV climbs cleanly with K
-/// (0.2132 → 0.3256 → 0.4891 for K=1,2,4 on OLMo L25). So `1` IS the
-/// data-commensurate strength; `100` was itself an over-strong magic constant.
-pub(crate) const SAE_AMPLITUDE_BARRIER_STRENGTH: f64 = 1.0;
-
-// #1026/#1522 — RUNTIME barrier-tuning overrides. The strengths and the
-// active-atom GATE MODE are read through the accessors below instead of the
-// raw consts so a SINGLE compiled wheel can sweep the entire
-// (μ_amp × μ_sep × gate) response surface from Python (`set_sae_barrier_overrides`),
-// rather than recompiling the (one-rustc-invocation) gam crate per constant.
-// A quiet-NaN sentinel means "unset → use the compiled default const", so 0.0
-// remains a legitimate swept value (barrier fully disabled). With no override
-// set, the accessor returns exactly the const, so behaviour is unchanged.
-static SAE_AMP_STRENGTH_OVERRIDE_BITS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0x7ff8_0000_0000_0000);
+// #1026/#1522 — RUNTIME separation-barrier-strength override. Read through the
+// accessor below instead of the raw const so a SINGLE compiled wheel can sweep
+// μ_sep from Python (`set_sae_barrier_overrides`) without recompiling. A
+// quiet-NaN sentinel means "unset → use the compiled default const", so 0.0
+// remains a legitimate swept value (barrier disabled). The amplitude
+// (keep-alive) barrier was removed: an over-complete dictionary's surplus
+// features SHOULD die, and a dead atom's decoder block is parked into a
+// well-conditioned state by the inner per-row Tikhonov ridge — forcing the
+// norm away from zero only over-inflated healthy atoms and fought that natural
+// death. So there is no amplitude strength or active-atom gate to override.
 static SAE_SEP_STRENGTH_OVERRIDE_BITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0x7ff8_0000_0000_0000);
-/// Active-atom gate mode for the amplitude barrier: 0 = decoder-norm (the
-/// correct default — hold up every live decoder), 1 = legacy assignment-energy
-/// gate (drains during co-collapse; kept only to A/B the regression), 2 =
-/// unconditional (every dictionary slot). Sweepable to attribute the OLMo
-/// co-collapse to amplitude vs collinear (separation) failure in one build.
-static SAE_BARRIER_GATE_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-pub(crate) fn sae_amplitude_barrier_strength() -> f64 {
-    let v =
-        f64::from_bits(SAE_AMP_STRENGTH_OVERRIDE_BITS.load(std::sync::atomic::Ordering::Relaxed));
-    if v.is_nan() {
-        SAE_AMPLITUDE_BARRIER_STRENGTH
-    } else {
-        v
-    }
-}
-
 pub(crate) fn sae_separation_barrier_strength() -> f64 {
     let v =
         f64::from_bits(SAE_SEP_STRENGTH_OVERRIDE_BITS.load(std::sync::atomic::Ordering::Relaxed));
@@ -267,27 +230,18 @@ pub(crate) fn sae_separation_barrier_strength() -> f64 {
     }
 }
 
-pub(crate) fn sae_barrier_gate_mode() -> u8 {
-    SAE_BARRIER_GATE_MODE.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Set the process-global SAE-barrier tuning overrides (one wheel, many configs).
-/// `amp_strength`/`sep_strength` are NaN to clear an override back to the compiled
-/// default; `gate_mode` selects the amplitude active-atom gate (see
-/// [`SAE_BARRIER_GATE_MODE`]). Called from the gamfit Python FFI sweep driver.
+/// Set the process-global SAE separation-barrier strength override (one wheel,
+/// many configs). `sep_strength` is NaN to clear back to the compiled default.
+/// `amp_strength` and `gate_mode` are accepted for FFI-signature stability but
+/// ignored: the amplitude (keep-alive) barrier and its active-atom gate were
+/// removed (surplus features are allowed to die into a ridge-parked state).
+/// Called from the gamfit Python FFI sweep driver.
 pub fn set_sae_barrier_overrides(amp_strength: f64, sep_strength: f64, gate_mode: u8) {
-    SAE_AMP_STRENGTH_OVERRIDE_BITS
-        .store(amp_strength.to_bits(), std::sync::atomic::Ordering::Relaxed);
+    // `amp_strength` / `gate_mode` are intentionally unused (the amplitude
+    // barrier was removed); kept in the signature for FFI stability.
     SAE_SEP_STRENGTH_OVERRIDE_BITS
         .store(sep_strength.to_bits(), std::sync::atomic::Ordering::Relaxed);
-    SAE_BARRIER_GATE_MODE.store(gate_mode, std::sync::atomic::Ordering::Relaxed);
 }
-
-/// #1026/#1522 AMPLITUDE barrier softening `ε` (added inside `log(s_k²+ε)` and in
-/// every denominator). Keeps the barrier finite and the PSD majorizer bounded at
-/// an exactly-zero decoder, while remaining negligible against a healthy
-/// decoder's `‖B_k‖²_F` (which is O(1) on unit-scale data).
-pub(crate) const SAE_AMPLITUDE_BARRIER_EPS: f64 = 1.0e-8;
 
 /// #1026/#1522 SEPARATION barrier strength `μ_C`. Penalty
 /// `P_sep = -μ_C · Σ_{j<k} q_jk · log(1 - c_jk² + ε)` on the NORMALIZED decoder
@@ -298,12 +252,11 @@ pub(crate) const SAE_AMPLITUDE_BARRIER_EPS: f64 = 1.0e-8;
 /// is exactly 0 when `c_jk = 0` — and, unlike the threshold repulsion, it does
 /// NOT switch off at small amplitude (it sees only the SHAPE `U_k`).
 ///
-/// #1026/#1522 RETUNE (2026-06-24): paired down to `10` alongside the amplitude
-/// retune (`SAE_AMPLITUDE_BARRIER_STRENGTH` 100→1) — this is the
-/// `{μ_amp=1, μ_sep=10}` config that produced the clean OLMo L25 EV-vs-K climb.
-/// The separation force already DIVERGES near alignment (`1/(1-c²+ε)`), so a
-/// large flat-region prefactor is unnecessary and only adds outer-objective
-/// stiffness away from collapse.
+/// `10` — the separation force already DIVERGES near alignment (`1/(1-c²+ε)`),
+/// so a large flat-region prefactor is unnecessary and only adds outer-objective
+/// stiffness away from collapse. (This is the sole remaining barrier; the
+/// amplitude keep-alive barrier was removed — surplus features in an
+/// over-complete dictionary are allowed to die into a ridge-parked state.)
 pub(crate) const SAE_SEPARATION_BARRIER_STRENGTH: f64 = 10.0;
 
 /// #1026/#1522 SEPARATION barrier softening `ε` in `log(1 - c_jk² + ε)`. Bounds
