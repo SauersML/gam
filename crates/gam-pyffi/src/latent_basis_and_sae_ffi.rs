@@ -3187,7 +3187,17 @@ fn sae_manifold_fit_inner<'py>(
         _ => alpha.ln(),
     };
     out.set_item("log_alpha", reported_log_alpha)?;
-    out.set_item("log_lambda_smooth", rho.log_lambda_smooth)?;
+    // Clone, do NOT move the field out: `rho` is still owned and is borrowed
+    // again below for the co-trained amortized-encoder report
+    // (`term.amortized_encoder_consistency(.., &rho)`). Moving the non-`Copy`
+    // `log_lambda_smooth: Vec<f64>` out here would partially move `rho` and make
+    // that later `&rho` borrow a borrow-after-move (E0382), which broke the
+    // gam-pyffi build (#1559). The predict path (`sae_manifold_predict_oos`) can
+    // move the field by value because its `rho` dies immediately after; here it
+    // lives on, so we clone the K-length vector once at result emission — a
+    // negligible allocation that matches every other still-live-owner field
+    // emission in this file (`lambdas.clone()`, `class_levels.clone()`, …).
+    out.set_item("log_lambda_smooth", rho.log_lambda_smooth.clone())?;
     out.set_item("log_ard", log_ard_py)?;
     out.set_item("assignment_prior", assignment_kind)?;
     out.set_item(
