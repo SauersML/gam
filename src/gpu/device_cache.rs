@@ -129,6 +129,16 @@ mod linux {
     fn nvrtc_compile_options() -> CompileOptions {
         let mut opts = CompileOptions::default();
         opts.include_paths = nvrtc_include_paths();
+        // #1551: pin the NVRTC virtual arch to the selected device's compute
+        // capability. Without it NVRTC defaults below sm_60, where the
+        // `atomicAdd(double*, double)` overload is absent — so kernels using
+        // double atomics (the SAE arrow/Schur PCG kernels) fail to compile and
+        // the device path silently falls back to the CPU (SAE ran at 0% GPU).
+        // `arch` is `Option<&'static str>`; `nvrtc_arch()` returns a static
+        // `compute_NN` for the device's real capability.
+        if let Some(runtime) = crate::gpu::device_runtime::GpuRuntime::global() {
+            opts.arch = Some(runtime.selected_device().capability.nvrtc_arch());
+        }
         opts
     }
 

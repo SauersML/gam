@@ -23,6 +23,40 @@ impl GpuCapability {
             min_warp_size: 32,
         }
     }
+
+    /// NVRTC `--gpu-architecture` virtual-arch string for this device's compute
+    /// capability (e.g. `compute_80` for an A100 `8.0`).
+    ///
+    /// Critical for NVRTC correctness, not just performance: with no
+    /// `--gpu-architecture`, NVRTC defaults to a virtual arch below `sm_60`,
+    /// where the `atomicAdd(double*, double)` overload (added in compute
+    /// capability 6.0) does not exist. A kernel source using `double` atomics
+    /// (the SAE arrow/Schur PCG kernels do) then fails to compile, the module
+    /// load Errs, and the whole device path silently falls back to the CPU.
+    /// Keying the arch to the real device capability admits those kernels.
+    ///
+    /// Returns a `&'static str` because `cudarc`'s `CompileOptions::arch` is
+    /// `Option<&'static str>`. Unknown/future capabilities round DOWN to the
+    /// nearest known major to stay valid for the installed NVRTC, never up
+    /// (an arch newer than the toolkit knows would itself fail to compile).
+    #[must_use]
+    pub const fn nvrtc_arch(&self) -> &'static str {
+        match (self.compute_major, self.compute_minor) {
+            // Newer-than-known majors round DOWN to compute_90 to stay valid for
+            // the installed NVRTC (an arch the toolkit doesn't know would itself
+            // fail to compile); refine when the toolkit/cudarc gain the arch.
+            (major, _) if major >= 9 => "compute_90",
+            (8, 9) => "compute_89",
+            (8, 6) => "compute_86",
+            (8, _) => "compute_80",
+            (7, 5) => "compute_75",
+            (7, _) => "compute_70",
+            // 6.x and anything below: pin the lowest arch that still has the
+            // `double` atomicAdd so a 6.x-built toolkit accepts the source. gam
+            // requires CC >= 6.0 in practice for the double-atomic kernels.
+            _ => "compute_60",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
