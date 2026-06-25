@@ -272,12 +272,10 @@ def main() -> None:
         help="held-out EV of the official Qwen W32K linear-SAE reference from figH",
     )
     ap.add_argument("--out", help="optional JSON file for the measured table")
-    # #1026/#1522 anti-collapse barrier overrides (one wheel sweeps many configs;
-    # NaN strength = compiled default). gate_mode: 0=decoder-norm, 1=legacy
-    # assignment-energy, 2=unconditional.
-    ap.add_argument("--amp-mu", type=float, default=float("nan"))
+    # #1026/#1522 anti-collapse separation-barrier override (one wheel sweeps
+    # many configs; NaN strength = compiled default). The amplitude (keep-alive)
+    # barrier and its active-atom gate were removed, so μ_sep is the only knob.
     ap.add_argument("--sep-mu", type=float, default=float("nan"))
-    ap.add_argument("--gate-mode", type=int, default=0)
     ap.add_argument("--ibp-alpha", type=float, default=float("nan"),
                     help="#1026 override IBP-MAP alpha (flattens prior; NaN=compiled default)")
     args = ap.parse_args()
@@ -286,10 +284,10 @@ def main() -> None:
     # The pyo3 setters live in the compiled `gamfit._rust` module (the #[pymodule]
     # named "_rust"); gamfit/__init__.py only re-exports a curated top-level list,
     # which does not include these sweep knobs — so import them from _rust directly.
-    if (not math.isnan(args.amp_mu)) or (not math.isnan(args.sep_mu)) or args.gate_mode != 0:
+    if not math.isnan(args.sep_mu):
         from gamfit._rust import sae_set_barrier_overrides
-        sae_set_barrier_overrides(args.amp_mu, args.sep_mu, args.gate_mode)
-        print(f"[barrier] amp_mu={args.amp_mu} sep_mu={args.sep_mu} gate_mode={args.gate_mode}", flush=True)
+        sae_set_barrier_overrides(args.sep_mu)
+        print(f"[barrier] sep_mu={args.sep_mu}", flush=True)
     if not math.isnan(args.ibp_alpha):
         from gamfit._rust import sae_set_ibp_alpha
         sae_set_ibp_alpha(args.ibp_alpha)
