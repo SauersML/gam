@@ -1,42 +1,5 @@
 use super::*;
 
-pub struct BernoulliMarginalSlopePredictor {
-    pub beta_marginal: Array1<f64>,
-    pub beta_logslope: Array1<f64>,
-    pub beta_score_warp: Option<Array1<f64>>,
-    pub beta_link_dev: Option<Array1<f64>>,
-    pub base_link: InverseLink,
-    pub z_column: String,
-    pub latent_z_normalization: SavedLatentZNormalization,
-    pub latent_measure: LatentMeasureKind,
-    pub baseline_marginal: f64,
-    pub baseline_logslope: f64,
-    pub covariance: Option<Array2<f64>>,
-    pub score_warp_runtime: Option<SavedCompiledFlexBlock>,
-    pub link_deviation_runtime: Option<SavedCompiledFlexBlock>,
-    pub gaussian_frailty_sd: Option<f64>,
-    /// Optional rank-INT latent-z calibration. When `Some`, every
-    /// predict-time z (after `latent_z_normalization`) is routed through
-    /// [`LatentZRankIntCalibration::apply_at_predict`] before entering
-    /// the standard-normal closed-form rigid kernel — mirroring the
-    /// fit-time transform applied to training z. The map is the exact
-    /// monotone, invertible (up to empirical-CDF resolution) piecewise-
-    /// linear interpolation on (sorted_z, weighted_cdf) followed by Φ⁻¹,
-    /// so the calibrated sample is N(0,1) by construction. `None` means
-    /// training-time z already passed the strict normality check and no
-    /// transform was applied.
-    pub(crate) latent_z_calibration: Option<crate::families::bms::LatentZRankIntCalibration>,
-    /// Optional conditional location-scale latent-z calibration (#905). When
-    /// `Some`, predict-time z (after `latent_z_normalization`) is replaced by
-    /// `ζ = (z − m(C))/√v(C)`, with the conditioning span `a(C)` rebuilt from
-    /// the marginal prediction design — mirroring the fit-time correction the
-    /// Auto path applied when its conditional `E[z|C]`/`Var(z|C)` Rao gate
-    /// detected PC/grouping-dependence. Mutually exclusive with
-    /// `latent_z_calibration`.
-    pub(crate) latent_z_conditional_calibration:
-        Option<crate::families::bms::LatentZConditionalCalibration>,
-}
-
 /// Per-runtime predict-time anchor correction matrices.
 ///
 /// Built once per top-level predict call from the marginal + logslope
@@ -103,7 +66,7 @@ impl BernoulliMarginalSlopePredictor {
         design_logslope: &DesignMatrix,
         z: &Array1<f64>,
     ) -> Result<BmsAnchorCorrections, EstimationError> {
-        use crate::inference::model::SavedAnchorKind;
+        use gam::inference::model::SavedAnchorKind;
         let needs_score = self
             .score_warp_runtime
             .as_ref()
@@ -268,7 +231,7 @@ impl BernoulliMarginalSlopePredictor {
         runtime: &SavedCompiledFlexBlock,
         runtime_label: &str,
     ) -> Result<(), EstimationError> {
-        use crate::inference::model::SavedAnchorKind;
+        use gam::inference::model::SavedAnchorKind;
         for (idx, component) in runtime.anchor_components.iter().enumerate() {
             match &component.kind {
                 SavedAnchorKind::Parametric { .. } => {}
@@ -614,7 +577,7 @@ impl BernoulliMarginalSlopePredictor {
         beta_link_dev: Option<&Array1<f64>>,
         score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
         link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
-    ) -> Result<Vec<crate::families::cubic_cell_kernel::DenestedPartitionCell>, EstimationError>
+    ) -> Result<Vec<gam::families::cubic_cell_kernel::DenestedPartitionCell>, EstimationError>
     {
         let score_breaks = if let Some(runtime) = self.score_warp_runtime.as_ref() {
             runtime.breakpoints().map_err(EstimationError::from)?
@@ -627,7 +590,7 @@ impl BernoulliMarginalSlopePredictor {
             Vec::new()
         };
         let mut cells =
-            crate::families::cubic_cell_kernel::build_denested_partition_cells_with_tails(
+            gam::families::cubic_cell_kernel::build_denested_partition_cells_with_tails(
                 a,
                 b,
                 &score_breaks,
@@ -648,7 +611,7 @@ impl BernoulliMarginalSlopePredictor {
                         }
                         Ok(span)
                     } else {
-                        Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
+                        Ok(gam::families::cubic_cell_kernel::LocalSpanCubic {
                             left: 0.0,
                             right: 1.0,
                             c0: 0.0,
@@ -668,7 +631,7 @@ impl BernoulliMarginalSlopePredictor {
                         }
                         Ok(span)
                     } else {
-                        Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
+                        Ok(gam::families::cubic_cell_kernel::LocalSpanCubic {
                             left: 0.0,
                             right: 1.0,
                             c0: 0.0,
@@ -719,14 +682,14 @@ impl BernoulliMarginalSlopePredictor {
         for partition_cell in cells {
             let cell = partition_cell.cell;
             let (dc_da_raw, _) =
-                crate::families::cubic_cell_kernel::denested_cell_coefficient_partials(
+                gam::families::cubic_cell_kernel::denested_cell_coefficient_partials(
                     partition_cell.score_span,
                     partition_cell.link_span,
                     a,
                     slope,
                 );
             let (d2c_da2_raw, _, _) =
-                crate::families::cubic_cell_kernel::denested_cell_second_partials(
+                gam::families::cubic_cell_kernel::denested_cell_second_partials(
                     partition_cell.score_span,
                     partition_cell.link_span,
                     a,
@@ -740,18 +703,18 @@ impl BernoulliMarginalSlopePredictor {
             // its required degree is the binding bound. Hardcoding 7 here
             // produced 8 moments while the contraction needs 10 (#321).
             let max_degree =
-                crate::families::cubic_cell_kernel::cell_second_derivative_required_max_degree(
+                gam::families::cubic_cell_kernel::cell_second_derivative_required_max_degree(
                     &dc_da, &dc_da, &d2c_da2,
                 );
-            let state = crate::families::cubic_cell_kernel::evaluate_cell_moments(cell, max_degree)
+            let state = gam::families::cubic_cell_kernel::evaluate_cell_moments(cell, max_degree)
                 .map_err(EstimationError::InvalidInput)?;
             f += state.value;
-            f_a += crate::families::cubic_cell_kernel::cell_first_derivative_from_moments(
+            f_a += gam::families::cubic_cell_kernel::cell_first_derivative_from_moments(
                 &dc_da,
                 &state.moments,
             )
             .map_err(EstimationError::InvalidInput)?;
-            f_aa += crate::families::cubic_cell_kernel::cell_second_derivative_from_moments(
+            f_aa += gam::families::cubic_cell_kernel::cell_second_derivative_from_moments(
                 cell,
                 &dc_da,
                 &dc_da,
@@ -773,7 +736,7 @@ impl BernoulliMarginalSlopePredictor {
         score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
         link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
     ) -> Result<ObservedDenestedCellPartials, EstimationError> {
-        use crate::families::cubic_cell_kernel as exact;
+        use gam::families::cubic_cell_kernel as exact;
 
         let zero_span = exact::LocalSpanCubic {
             left: 0.0,
@@ -917,9 +880,9 @@ impl BernoulliMarginalSlopePredictor {
         frailty: FrailtySpec,
         score_warp_runtime: Option<SavedCompiledFlexBlock>,
         link_deviation_runtime: Option<SavedCompiledFlexBlock>,
-        latent_z_calibration: Option<crate::families::bms::LatentZRankIntCalibration>,
+        latent_z_calibration: Option<gam::families::bms::LatentZRankIntCalibration>,
         latent_z_conditional_calibration: Option<
-            crate::families::bms::LatentZConditionalCalibration,
+            gam::families::bms::LatentZConditionalCalibration,
         >,
     ) -> Result<Self, String> {
         let gaussian_frailty_sd = match frailty {
@@ -942,7 +905,7 @@ impl BernoulliMarginalSlopePredictor {
         };
         if !matches!(
             base_link,
-            InverseLink::Standard(crate::types::StandardLink::Probit)
+            InverseLink::Standard(gam::types::StandardLink::Probit)
         ) {
             return Err(
                 "bernoulli marginal-slope predictor requires link(type=probit); saved non-probit marginal-slope models must be refit"
@@ -1144,7 +1107,7 @@ impl BernoulliMarginalSlopePredictor {
         let target = marginal.mu;
         let abs_tol = 1e-8_f64.max(1e-4 * target.abs());
 
-        let (root, _, f_best) = crate::families::monotone_root::solve_monotone_root(
+        let (root, _, f_best) = gam::families::monotone_root::solve_monotone_root(
             eval,
             intercept,
             "saved bernoulli intercept",
@@ -1475,7 +1438,7 @@ impl BernoulliMarginalSlopePredictor {
             // OnceLock / lazy init lives inside the par closure (per the
             // OnceLock + nested rayon deadlock rule).
             let global_score_basis_table: Option<
-                Vec<Vec<crate::families::cubic_cell_kernel::LocalSpanCubic>>,
+                Vec<Vec<gam::families::cubic_cell_kernel::LocalSpanCubic>>,
             > = if let (LatentMeasureKind::GlobalEmpirical { grid }, Some(runtime)) =
                 (&self.latent_measure, self.score_warp_runtime.as_ref())
             {
@@ -1597,7 +1560,7 @@ impl BernoulliMarginalSlopePredictor {
                                     if let Some(corr) = score_corr_row {
                                         basis_span.c0 -= corr[j];
                                     }
-                                    let coeffs = crate::families::cubic_cell_kernel::score_basis_cell_coefficients(
+                                    let coeffs = gam::families::cubic_cell_kernel::score_basis_cell_coefficients(
                                         basis_span,
                                         slope,
                                     );
@@ -1614,7 +1577,7 @@ impl BernoulliMarginalSlopePredictor {
                                     if let Some(corr) = link_corr_row {
                                         basis_span.c0 -= corr[j];
                                     }
-                                    let coeffs = crate::families::cubic_cell_kernel::link_basis_cell_coefficients(
+                                    let coeffs = gam::families::cubic_cell_kernel::link_basis_cell_coefficients(
                                         basis_span,
                                         intercept,
                                         slope,
@@ -1636,11 +1599,11 @@ impl BernoulliMarginalSlopePredictor {
                         for partition_cell in cells {
                             let cell = partition_cell.cell;
                             let state =
-                                crate::families::cubic_cell_kernel::evaluate_cell_moments(
+                                gam::families::cubic_cell_kernel::evaluate_cell_moments(
                                     cell, 9,
                                 )
                                 .map_err(EstimationError::InvalidInput)?;
-                            let (_, dc_db_raw) = crate::families::cubic_cell_kernel::denested_cell_coefficient_partials(
+                            let (_, dc_db_raw) = gam::families::cubic_cell_kernel::denested_cell_coefficient_partials(
                                 partition_cell.score_span,
                                 partition_cell.link_span,
                                 intercept,
@@ -1650,7 +1613,7 @@ impl BernoulliMarginalSlopePredictor {
                             // Gaussian frailty, so every coefficient partial of
                             // F(a, theta) must carry the same probit scale as F_a.
                             let dc_db = scale_coeff4(dc_db_raw, scale);
-                            f_b += crate::families::cubic_cell_kernel::cell_first_derivative_from_moments(
+                            f_b += gam::families::cubic_cell_kernel::cell_first_derivative_from_moments(
                                 &dc_db,
                                 &state.moments,
                             )
@@ -1665,11 +1628,11 @@ impl BernoulliMarginalSlopePredictor {
                                     if let Some(corr) = score_corr_row {
                                         basis_span.c0 -= corr[j];
                                     }
-                                    let coeffs = crate::families::cubic_cell_kernel::score_basis_cell_coefficients(
+                                    let coeffs = gam::families::cubic_cell_kernel::score_basis_cell_coefficients(
                                         basis_span, slope,
                                     );
                                     let coeffs = scale_coeff4(coeffs, scale);
-                                    f_h_row[j] += crate::families::cubic_cell_kernel::cell_first_derivative_from_moments(
+                                    f_h_row[j] += gam::families::cubic_cell_kernel::cell_first_derivative_from_moments(
                                         &coeffs,
                                         &state.moments,
                                     )
@@ -1685,13 +1648,13 @@ impl BernoulliMarginalSlopePredictor {
                                     if let Some(corr) = link_corr_row {
                                         basis_span.c0 -= corr[j];
                                     }
-                                    let coeffs = crate::families::cubic_cell_kernel::link_basis_cell_coefficients(
+                                    let coeffs = gam::families::cubic_cell_kernel::link_basis_cell_coefficients(
                                         basis_span,
                                         intercept,
                                         slope,
                                     );
                                     let coeffs = scale_coeff4(coeffs, scale);
-                                    f_w_row[j] += crate::families::cubic_cell_kernel::cell_first_derivative_from_moments(
+                                    f_w_row[j] += gam::families::cubic_cell_kernel::cell_first_derivative_from_moments(
                                         &coeffs,
                                         &state.moments,
                                     )
@@ -2221,7 +2184,7 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
                 )?;
                 let eta_se = self.eta_standard_error_from_backend(input, &backend)?;
                 let strategy = strategy_for_family(self.likelihood_family(), Some(&self.base_link));
-                let quadctx = crate::quadrature::QuadratureContext::new();
+                let quadctx = gam::quadrature::QuadratureContext::new();
                 let mean = Array1::from_iter(
                     eta.iter()
                         .zip(eta_se.iter())

@@ -1,4 +1,5 @@
 use super::*;
+use crate::inference::dispersion_cov::se_from_covariance;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Optimize smoothing parameters for an external design using the same REML/LAML machinery.

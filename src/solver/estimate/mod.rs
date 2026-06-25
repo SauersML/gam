@@ -29,7 +29,7 @@ use std::time::Instant;
 // Crate-level imports
 use crate::construction::{CanonicalPenalty, ReparamInvariant};
 use crate::inference::diagnostics::should_emit_h_min_eig_diag;
-use crate::inference::predict::se_from_covariance;
+use crate::inference::dispersion_cov::se_from_covariance;
 use crate::linalg::utils::{
     KahanSum, add_relative_diag_ridge, matrix_inversewith_regularization, row_mismatch_message,
 };
@@ -75,15 +75,6 @@ mod prefit;
 pub(crate) mod smoothing_correction;
 mod summary;
 
-pub use crate::inference::predict::{
-    CoefficientUncertaintyResult, InferenceCovarianceMode, MeanIntervalMethod,
-    PosteriorMeanOptions, PredictInput, PredictPosteriorMeanResult, PredictResult,
-    PredictUncertaintyOptions, PredictUncertaintyResult, PredictableModel, coefficient_uncertainty,
-    coefficient_uncertaintywith_mode, enrich_posterior_mean_bounds, predict_gam,
-    predict_gam_posterior_mean, predict_gam_posterior_meanwith_backend,
-    predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
-};
-pub(crate) use crate::model_types::result_types::dispersion_from_likelihood;
 pub use crate::model_types::{
     AdaptiveRegularizationOptions, BlockRole, FitArtifacts, FitGeometry, FitInference, FitOptions,
     FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts, ensure_finite_scalar,

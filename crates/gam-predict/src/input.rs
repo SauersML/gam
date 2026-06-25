@@ -3,27 +3,28 @@ use std::collections::HashMap;
 use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use crate::basis::{
+use gam::basis::{
     BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
 };
-use crate::estimate::{BlockRole, PredictInput};
-use crate::families::bms::LatentMeasureKind;
-use crate::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};
-use crate::families::survival::predict::SurvivalPredictError;
-use crate::families::survival::predict::{
+use crate::PredictInput;
+use gam::estimate::BlockRole;
+use gam::families::bms::LatentMeasureKind;
+use gam::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};
+use gam::families::survival::predict::SurvivalPredictError;
+use gam::families::survival::predict::{
     fit_result_from_saved_model_for_prediction, resolve_termspec_for_prediction,
 };
-use crate::families::transformation_normal::{
+use gam::families::transformation_normal::{
     TRANSFORMATION_MONOTONICITY_EPS, TRANSFORMATION_NORMAL_H_ABS_MAX,
     transformation_normal_pit_score,
 };
-use crate::inference::model::{
+use gam::inference::model::{
     FittedModel, FittedModelError, PredictModelClass, append_deployment_extension_columns,
 };
-use crate::linalg::utils::inf_norm;
-use crate::matrix::DesignMatrix;
-use crate::smooth::build_term_collection_design;
-use crate::term_builder::resolve_role_col;
+use gam::linalg::utils::inf_norm;
+use gam::matrix::DesignMatrix;
+use gam::smooth::build_term_collection_design;
+use gam::term_builder::resolve_role_col;
 
 /// Typed errors emitted while assembling a [`PredictInput`] from a saved model.
 ///

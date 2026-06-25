@@ -30,7 +30,7 @@ use crate::inference::model::{
     FittedFamily, FittedModel as SavedModel, SavedBaselineTimeWiggleRuntime,
     load_survival_time_basis_config_from_model, survival_baseline_config_from_model,
 };
-use crate::inference::predict::{BernoulliMarginalSlopePredictor, PredictInput};
+use crate::inference::predict_io::{BernoulliMarginalSlopePredictor, PredictInput};
 use crate::linalg::matrix::DesignMatrix;
 use crate::model_types::{BlockRole, FittedBlock, FittedLinkState, UnifiedFitResult};
 use crate::probability::signed_probit_logcdf_and_mills_ratio;

@@ -47,7 +47,7 @@ impl GaussianLocationScalePredictor {
         }
         let floor = self.sigma_floor;
         Ok(eta_noise.mapv(|eta| {
-            crate::families::sigma_link::logb_sigma_from_eta_with_floor_scalar(floor, eta)
+            gam::families::sigma_link::logb_sigma_from_eta_with_floor_scalar(floor, eta)
         }))
     }
 

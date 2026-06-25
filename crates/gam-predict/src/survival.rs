@@ -42,7 +42,7 @@ fn survival_tail_value_from_failure_jet(
     failure_jet: &InverseLinkJet,
 ) -> f64 {
     match inverse_link {
-        InverseLink::Standard(crate::types::StandardLink::Probit) => {
+        InverseLink::Standard(gam::types::StandardLink::Probit) => {
             if eta.is_nan() {
                 f64::NAN
             } else if eta == f64::INFINITY {
@@ -53,8 +53,8 @@ fn survival_tail_value_from_failure_jet(
                 0.5 * statrs::function::erf::erfc(eta / std::f64::consts::SQRT_2)
             }
         }
-        InverseLink::Standard(crate::types::StandardLink::Logit) => 1.0 / (1.0 + eta.exp()),
-        InverseLink::Standard(crate::types::StandardLink::CLogLog) => (-(eta.exp())).exp(),
+        InverseLink::Standard(gam::types::StandardLink::Logit) => 1.0 / (1.0 + eta.exp()),
+        InverseLink::Standard(gam::types::StandardLink::CLogLog) => (-(eta.exp())).exp(),
         _ => (1.0 - failure_jet.mu).clamp(0.0, 1.0),
     }
 }
@@ -65,7 +65,7 @@ fn inverse_link_survival_tail_value_and_failure_density(
     eta: f64,
 ) -> Result<(f64, f64), EstimationError> {
     let failure_jet =
-        crate::solver::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta)?;
+        gam::solver::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta)?;
     Ok((
         survival_tail_value_from_failure_jet(inverse_link, eta, &failure_jet).clamp(0.0, 1.0),
         failure_jet.d1,
@@ -294,7 +294,7 @@ impl PredictionTransform for SurvivalPredictor {
                     p_s,
                     "survival posterior mean",
                 )?;
-                let quadctx = crate::quadrature::QuadratureContext::new();
+                let quadctx = gam::quadrature::QuadratureContext::new();
                 let mean = Array1::from_vec(
                     (0..eta_threshold.len())
                         .map(|i| {

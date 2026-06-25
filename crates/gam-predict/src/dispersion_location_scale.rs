@@ -184,7 +184,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
             // conditional η posterior `η ~ N(eta, eta_se²)`.
             PredictPass::PosteriorMean => {
                 let strategy = self.strategy();
-                let quadctx = crate::quadrature::QuadratureContext::new();
+                let quadctx = gam::quadrature::QuadratureContext::new();
                 eta.iter()
                     .zip(eta_se.iter())
                     .map(|(&e, &se)| strategy.posterior_mean(&quadctx, e, se))

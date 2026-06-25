@@ -34,11 +34,16 @@
 //! `solver::estimate::Dispersion` already implements `phi()` and
 //! `is_estimated()`.
 
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
 pub use crate::model_types::Dispersion;
+
+/// Compute standard errors from a covariance matrix (sqrt of diagonal).
+pub fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
+    Array1::from_iter(cov.diag().iter().map(|&v| v.max(0.0).sqrt()))
+}
 
 /// Posterior coefficient covariance `Vb = phi * H^{-1}` — the matrix users
 /// see as `Cov(beta_hat)`. This newtype documents that `phi` has already

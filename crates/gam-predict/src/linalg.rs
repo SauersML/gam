@@ -1,4 +1,4 @@
-use crate::matrix::{DesignMatrix, FactorizedSystem, SymmetricMatrix};
+use gam::matrix::{DesignMatrix, FactorizedSystem, SymmetricMatrix};
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::ops::Range;
@@ -340,7 +340,7 @@ mod tests {
         }
         let sparse = SparseColMat::try_new_from_triplets(dense.nrows(), dense.ncols(), &triplets)
             .expect("assemble sparse design");
-        DesignMatrix::Sparse(crate::matrix::SparseDesignMatrix::new(sparse))
+        DesignMatrix::Sparse(gam::matrix::SparseDesignMatrix::new(sparse))
     }
 
     #[test]

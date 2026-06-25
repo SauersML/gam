@@ -2,54 +2,52 @@ pub mod input;
 pub mod interval_policy;
 pub mod linalg;
 
-use crate::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
-use crate::families::bms::{EmpiricalZGrid, LatentMeasureKind};
-use crate::families::bms::{bernoulli_marginal_link_map, empirical_intercept_from_marginal};
-use crate::families::family_runtime::{
+pub use gam::inference::dispersion_cov::se_from_covariance;
+pub use gam::inference::predict_io::{BernoulliMarginalSlopePredictor, PredictInput};
+
+use gam::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
+use gam::families::bms::{EmpiricalZGrid, LatentMeasureKind};
+use gam::families::bms::{bernoulli_marginal_link_map, empirical_intercept_from_marginal};
+use gam::families::family_runtime::{
     FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_for_spec,
     strategy_from_fit,
 };
-use crate::families::marginal_slope_shared::{
+use gam::families::marginal_slope_shared::{
     ObservedDenestedCellPartials, eval_coeff4_at,
     probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
 };
-use crate::families::survival::lognormal_kernel::FrailtySpec;
-use crate::inference::model::{
+use gam::families::survival::lognormal_kernel::FrailtySpec;
+use gam::inference::model::{
     SavedCompiledFlexBlock, SavedLatentZNormalization, SavedLinkWiggleRuntime,
 };
-use crate::inference::predict::interval_policy::{
+use crate::interval_policy::{
     EtaInterval, LinearState, MeanBoundMethod, PredictPass, PredictionTransform, ResponseBounds,
     ResponseInterval, assemble_posterior_mean_bounds, predict_full_uncertainty_generic,
     predict_plugin_response_generic, predict_posterior_mean_generic,
     predict_with_uncertainty_generic,
 };
-use crate::inference::predict::linalg::{
+use crate::linalg::{
     PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows,
     rowwise_local_covariances_parallel,
 };
-use crate::linalg::utils::predict_gam_dimension_mismatch_message;
-use crate::matrix::{DesignMatrix, SymmetricMatrix};
-use crate::mixture_link::{
+use gam::linalg::utils::predict_gam_dimension_mismatch_message;
+use gam::matrix::{DesignMatrix, SymmetricMatrix};
+use gam::mixture_link::{
     InverseLinkJet, beta_logistic_inverse_link_jetwith_param_partials,
     mixture_inverse_link_jetwith_rho_partials_into, sas_inverse_link_jetwith_param_partials,
 };
-use crate::probability::{
+use gam::probability::{
     beta_moment_matched_interval, gamma_moment_matched_interval,
     negative_binomial_moment_matched_interval, normal_cdf, normal_pdf,
     poisson_moment_matched_interval, standard_normal_quantile, tweedie_moment_matched_interval,
 };
-use crate::quadrature::QuadratureContext;
-use crate::types::{InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
+use gam::quadrature::QuadratureContext;
+use gam::types::{InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 thread_local! {
     static PREDICT_QUADRATURE_CONTEXT: QuadratureContext = QuadratureContext::new();
-}
-
-/// Compute standard errors from a covariance matrix (sqrt of diagonal).
-pub fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {
-    Array1::from_iter(cov.diag().iter().map(|&v| v.max(0.0).sqrt()))
 }
 
 fn apply_family_inverse_link(
@@ -748,7 +746,7 @@ fn padded_design_standard_errors_from_backend(
 }
 
 fn projected_bivariate_posterior_mean_result<F>(
-    quadctx: &crate::quadrature::QuadratureContext,
+    quadctx: &gam::quadrature::QuadratureContext,
     mu: [f64; 2],
     cov: [[f64; 2]; 2],
     integrand: F,
@@ -764,7 +762,7 @@ where
         return integrand(mu[0], mu[1]);
     }
     if var0 <= POSTERIOR_MEAN_VARIANCE_TOL && cov01.abs() <= POSTERIOR_MEAN_CROSS_TOL {
-        return crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, EstimationError>(
+        return gam::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, EstimationError>(
             quadctx,
             [mu[1]],
             [[var1]],
@@ -773,7 +771,7 @@ where
         );
     }
     if var1 <= POSTERIOR_MEAN_VARIANCE_TOL && cov01.abs() <= POSTERIOR_MEAN_CROSS_TOL {
-        return crate::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, EstimationError>(
+        return gam::quadrature::normal_expectation_nd_adaptive_result::<1, _, _, EstimationError>(
             quadctx,
             [mu[0]],
             [[var0]],
@@ -781,7 +779,7 @@ where
             |x| integrand(x[0], mu[1]),
         );
     }
-    crate::quadrature::normal_expectation_2d_adaptive_result(quadctx, mu, cov, integrand)
+    gam::quadrature::normal_expectation_2d_adaptive_result(quadctx, mu, cov, integrand)
 }
 
 pub struct PredictResult {
@@ -793,29 +791,12 @@ pub struct PredictResult {
 //  PredictableModel trait — uniform prediction interface for all model types
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Input to the prediction trait. Contains the design matrix and metadata
-/// needed for point prediction + uncertainty quantification.
-pub struct PredictInput {
-    /// Design matrix for the primary (mean/location) block.
-    pub design: DesignMatrix,
-    /// Offset vector for the primary block.
-    pub offset: Array1<f64>,
-    /// Optional design matrix for the noise/scale block (GAMLSS/survival).
-    pub design_noise: Option<DesignMatrix>,
-    /// Optional offset vector for the noise/scale block.
-    pub offset_noise: Option<Array1<f64>>,
-    /// Optional auxiliary scalar covariate used by specialized predictors.
-    pub auxiliary_scalar: Option<Array1<f64>>,
-    /// Optional auxiliary matrix used by specialized predictors.
-    pub auxiliary_matrix: Option<Array2<f64>>,
-}
-
 fn slice_predict_input(
     input: &PredictInput,
     rows: std::ops::Range<usize>,
 ) -> Result<PredictInput, EstimationError> {
     Ok(PredictInput {
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        design: DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(
             design_row_chunk(&input.design, rows.clone()).map_err(EstimationError::InvalidInput)?,
         )),
         offset: input.offset.slice(ndarray::s![rows.clone()]).to_owned(),
@@ -824,7 +805,7 @@ fn slice_predict_input(
             .as_ref()
             .map(|design| {
                 design_row_chunk(design, rows.clone())
-                    .map(|d| DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(d)))
+                    .map(|d| DesignMatrix::Dense(gam::matrix::DenseDesignMatrix::from(d)))
                     .map_err(EstimationError::InvalidInput)
             })
             .transpose()?,
@@ -982,14 +963,14 @@ pub trait PredictableModel {
 
 // Per-family predictor implementations, split by concern (#1145).
 // Each submodule is glob re-exported so public paths stay
-// `crate::inference::predict::<Item>` unchanged.
-mod bernoulli_marginal_slope;
-mod binomial_location_scale;
-mod dispersion_location_scale;
-mod gaussian_location_scale;
-mod standard;
-mod survival;
-mod transformation_normal;
+// `crate::<Item>` unchanged.
+pub mod bernoulli_marginal_slope;
+pub mod binomial_location_scale;
+pub mod dispersion_location_scale;
+pub mod gaussian_location_scale;
+pub mod standard;
+pub mod survival;
+pub mod transformation_normal;
 
 pub use bernoulli_marginal_slope::*;
 pub use binomial_location_scale::*;
@@ -1141,7 +1122,7 @@ impl PosteriorMeanOptions {
 pub fn enrich_posterior_mean_bounds(
     result: &mut PredictPosteriorMeanResult,
     confidence_level: f64,
-    family: crate::types::LikelihoodSpec,
+    family: gam::types::LikelihoodSpec,
     link_kind: Option<&InverseLink>,
 ) -> Result<(), EstimationError> {
     let spec = spec_from_family_link(family, link_kind);
@@ -1294,7 +1275,7 @@ pub struct PredictUncertaintyOptions {
     /// `mean_lower` / `mean_upper` bounds are REPLACED by a split-conformal /
     /// conformalized-scale-regression interval `μ̂(x) ± q̂·s(x)` whose finite-
     /// sample marginal coverage is `≥ level` regardless of model
-    /// misspecification (see [`crate::inference::conformal`]). The multiplier
+    /// misspecification (see [`gam::inference::conformal`]). The multiplier
     /// `q̂` is calibrated at miscoverage `α = 1 − level` from the model's own
     /// approximate-leave-one-out held-out residuals. This is applied by
     /// [`predict_full_uncertainty_conformal`], which is the only path that
@@ -1541,7 +1522,7 @@ fn predict_gam_posterior_mean_from_backendwith_bc(
     }
     let etavar = linear_predictorvariance_from_backend(&x, backend)?;
     let eta_standard_error = etavar.mapv(|v| v.max(0.0).sqrt());
-    let quadctx = crate::quadrature::QuadratureContext::new();
+    let quadctx = gam::quadrature::QuadratureContext::new();
     let means: Result<Vec<f64>, EstimationError> = (0..eta.len())
         .into_par_iter()
         .map(|i| {
@@ -2344,7 +2325,7 @@ where
             .zip(z_upper_per_row.iter())
             .map(|((&e, &s), &zu)| e + zu * s),
     );
-    let quadctx = crate::quadrature::QuadratureContext::new();
+    let quadctx = gam::quadrature::QuadratureContext::new();
 
     // Derivative of inverse link g^{-1}(η) used for delta-method:
     //   Var(μ_i) ≈ [d g^{-1}(η_i)/dη]^2 Var(η_i).
@@ -2542,7 +2523,7 @@ where
 /// predictor is independent of every calibration point, split-conformal needs
 /// no leave-one-out correction — the nonconformity score is the plain held-out
 /// residual `r_i = y_cal_i − μ̂(x_cal_i)`, normalized by `s(x_cal_i)`. See
-/// [`crate::inference::conformal::ConformalCalibrator::from_held_out_fold`].
+/// [`gam::inference::conformal::ConformalCalibrator::from_held_out_fold`].
 pub struct ConformalCalibrationFold<'a> {
     /// Predict input over the held-out calibration design (design + offset, and
     /// any noise/auxiliary blocks the model needs).
@@ -2554,7 +2535,7 @@ pub struct ConformalCalibrationFold<'a> {
 /// Full-uncertainty prediction with opt-in distribution-free conformal
 /// calibration of the response-scale interval.
 ///
-/// This is the real predict-path caller of [`crate::inference::conformal`].
+/// This is the real predict-path caller of [`gam::inference::conformal`].
 /// It always runs the model's own [`PredictableModel::predict_full_uncertainty`]
 /// (so the point predictions, η/mean SEs, observation interval, and provenance
 /// are exactly the model-based ones). Then, when `options.conformal_level` is
@@ -2580,7 +2561,7 @@ pub struct ConformalCalibrationFold<'a> {
 ///
 /// The conformal interval carries finite-sample marginal coverage `≥ level`
 /// regardless of model misspecification; see the module docs of
-/// [`crate::inference::conformal`] for the response-scale decision and the
+/// [`gam::inference::conformal`] for the response-scale decision and the
 /// exact order-statistic multiplier.
 pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
     model: &M,
@@ -2638,7 +2619,7 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
     );
     let test_scale =
         predictive_standard_error(family, &result.mean, &result.mean_standard_error, fit);
-    let calibrator = crate::inference::conformal::ConformalCalibrator::from_held_out_fold(
+    let calibrator = gam::inference::conformal::ConformalCalibrator::from_held_out_fold(
         calibration.y,
         cal_result.mean.view(),
         cal_scale.view(),
@@ -2758,20 +2739,20 @@ pub fn coefficient_uncertaintywith_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::estimate::{
+    use gam::estimate::{
         BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult,
         UnifiedFitResultParts,
     };
-    use crate::inference::model::SavedCompiledFlexBlock;
-    use crate::pirls::PirlsStatus;
-    use crate::types::{LinkFunction, StandardLink};
+    use gam::inference::model::SavedCompiledFlexBlock;
+    use gam::pirls::PirlsStatus;
+    use gam::types::{LinkFunction, StandardLink};
     use ndarray::{Array1, Array2, array};
 
     fn saved_runtime_from_deviation_runtime(
-        runtime: &crate::families::bms::DeviationRuntime,
+        runtime: &gam::families::bms::DeviationRuntime,
     ) -> SavedCompiledFlexBlock {
         SavedCompiledFlexBlock {
-            kernel: crate::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
+            kernel: gam::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
             breakpoints: runtime.breakpoints().to_vec(),
             basis_dim: runtime.basis_dim(),
             span_c0: runtime
@@ -2818,7 +2799,7 @@ mod tests {
             ..PredictUncertaintyOptions::default()
         };
 
-        let beta_seed = crate::types::LikelihoodSpec::new(
+        let beta_seed = gam::types::LikelihoodSpec::new(
             ResponseFamily::Beta { phi: 1.0 },
             InverseLink::Standard(StandardLink::Logit),
         );
@@ -2836,7 +2817,7 @@ mod tests {
             "bare Vb must not build a Beta observation interval from the seed phi"
         );
 
-        let nb_seed = crate::types::LikelihoodSpec::new(
+        let nb_seed = gam::types::LikelihoodSpec::new(
             ResponseFamily::NegativeBinomial {
                 theta: 1.0,
                 theta_fixed: false,
@@ -2887,7 +2868,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::new(
+            gam::types::LikelihoodSpec::new(
                 ResponseFamily::Beta { phi: 1.0 },
                 InverseLink::Standard(StandardLink::Logit),
             ),
@@ -2913,7 +2894,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::new(
+            gam::types::LikelihoodSpec::new(
                 ResponseFamily::NegativeBinomial {
                     theta: 1.0,
                     theta_fixed: false,
@@ -2942,9 +2923,9 @@ mod tests {
             }],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(crate::types::LikelihoodSpec::gaussian_identity()),
-            likelihood_scale: crate::types::LikelihoodScaleMetadata::ProfiledGaussian,
-            log_likelihood_normalization: crate::types::LogLikelihoodNormalization::Full,
+            likelihood_family: Some(gam::types::LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: gam::types::LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: gam::types::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
             deviance: 0.0,
             reml_score: 0.0,
@@ -3006,9 +2987,9 @@ mod tests {
             ],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(crate::types::LikelihoodSpec::gaussian_identity()),
-            likelihood_scale: crate::types::LikelihoodScaleMetadata::ProfiledGaussian,
-            log_likelihood_normalization: crate::types::LogLikelihoodNormalization::Full,
+            likelihood_family: Some(gam::types::LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: gam::types::LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: gam::types::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
             deviance: 0.0,
             reml_score: 0.0,
@@ -3059,9 +3040,9 @@ mod tests {
             ],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(crate::types::LikelihoodSpec::royston_parmar()),
-            likelihood_scale: crate::types::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
-            log_likelihood_normalization: crate::types::LogLikelihoodNormalization::Full,
+            likelihood_family: Some(gam::types::LikelihoodSpec::royston_parmar()),
+            likelihood_scale: gam::types::LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            log_likelihood_normalization: gam::types::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
             deviance: 0.0,
             reml_score: 0.0,
@@ -3100,11 +3081,11 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::binomial_probit(),
+            gam::types::LikelihoodSpec::binomial_probit(),
             covariance.view(),
         )
         .expect("predict posterior mean");
-        let expected = crate::quadrature::probit_posterior_meanwith_deriv_exact(0.7, 0.5).mean;
+        let expected = gam::quadrature::probit_posterior_meanwith_deriv_exact(0.7, 0.5).mean;
         assert!((out.mean[0] - expected).abs() <= 1e-12);
         assert!((out.mean[1] - expected).abs() <= 1e-12);
     }
@@ -3119,12 +3100,12 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::binomial_logit(),
+            gam::types::LikelihoodSpec::binomial_logit(),
             covariance.view(),
         )
         .expect("predict posterior mean");
-        let quadctx = crate::quadrature::QuadratureContext::new();
-        let expected = crate::quadrature::integrated_inverse_link_mean_and_derivative(
+        let quadctx = gam::quadrature::QuadratureContext::new();
+        let expected = gam::quadrature::integrated_inverse_link_mean_and_derivative(
             &quadctx,
             LinkFunction::Logit,
             0.4,
@@ -3162,7 +3143,7 @@ mod tests {
         enrich_posterior_mean_bounds(
             &mut result,
             0.95,
-            crate::types::LikelihoodSpec::binomial_logit(),
+            gam::types::LikelihoodSpec::binomial_logit(),
             None,
         )
         .expect("enrich posterior-mean bounds");
@@ -3212,7 +3193,7 @@ mod tests {
         enrich_posterior_mean_bounds(
             &mut result,
             0.95,
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             None,
         )
         .expect("enrich posterior-mean bounds");
@@ -3228,9 +3209,9 @@ mod tests {
     #[test]
     fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_runtime_kernel() {
         let seed = array![-1.5, -0.2, 0.6, 1.4];
-        let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+        let prepared = gam::families::bms::build_score_warp_deviation_block_from_seed(
             &seed,
-            &crate::families::bms::DeviationBlockConfig {
+            &gam::families::bms::DeviationBlockConfig {
                 degree: 3,
                 num_internal_knots: 3,
                 ..Default::default()
@@ -3243,7 +3224,7 @@ mod tests {
             beta_logslope: array![1.6],
             beta_score_warp: Some(array![0.7, -0.4]),
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+            base_link: InverseLink::Standard(gam::types::StandardLink::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::StandardNormal,
@@ -3268,9 +3249,9 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("DenestedCubicTransport"));
 
-        let err = crate::families::bms::build_score_warp_deviation_block_from_seed(
+        let err = gam::families::bms::build_score_warp_deviation_block_from_seed(
             &seed,
-            &crate::families::bms::DeviationBlockConfig {
+            &gam::families::bms::DeviationBlockConfig {
                 degree: 2,
                 num_internal_knots: 3,
                 ..Default::default()
@@ -3291,9 +3272,9 @@ mod tests {
     #[test]
     fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-        let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+        let prepared = gam::families::bms::build_score_warp_deviation_block_from_seed(
             &seed,
-            &crate::families::bms::DeviationBlockConfig {
+            &gam::families::bms::DeviationBlockConfig {
                 num_internal_knots: 4,
                 ..Default::default()
             },
@@ -3337,13 +3318,13 @@ mod tests {
 
     #[test]
     fn saved_anchored_deviation_runtime_design_with_anchor_rows_applies_residual() {
-        use crate::families::bms::deviation_runtime::ParametricAnchorBlock;
-        use crate::inference::model::{SavedAnchorComponent, SavedAnchorKind};
+        use gam::families::bms::deviation_runtime::ParametricAnchorBlock;
+        use gam::inference::model::{SavedAnchorComponent, SavedAnchorKind};
 
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-        let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+        let prepared = gam::families::bms::build_score_warp_deviation_block_from_seed(
             &seed,
-            &crate::families::bms::DeviationBlockConfig {
+            &gam::families::bms::DeviationBlockConfig {
                 num_internal_knots: 4,
                 ..Default::default()
             },
@@ -3423,7 +3404,7 @@ mod tests {
             beta_logslope: array![-0.4],
             beta_score_warp: None,
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+            base_link: InverseLink::Standard(gam::types::StandardLink::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::StandardNormal,
@@ -3485,7 +3466,7 @@ mod tests {
             beta_logslope: array![0.9],
             beta_score_warp: None,
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+            base_link: InverseLink::Standard(gam::types::StandardLink::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::LocalEmpirical {
@@ -3546,7 +3527,7 @@ mod tests {
             beta_logslope: array![-0.4],
             beta_score_warp: None,
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::StandardLink::Logit),
+            base_link: InverseLink::Standard(gam::types::StandardLink::Logit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::StandardNormal,
@@ -3590,7 +3571,7 @@ mod tests {
             beta_logslope: array![-0.4],
             beta_score_warp: None,
             beta_link_dev: None,
-            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+            base_link: InverseLink::Standard(gam::types::StandardLink::Probit),
             z_column: "z".to_string(),
             latent_z_normalization: SavedLatentZNormalization { mean: 0.0, sd: 1.0 },
             latent_measure: LatentMeasureKind::StandardNormal,
@@ -3661,7 +3642,7 @@ mod tests {
             );
             // The FFI surfaces the TransformEta band Φ(η ± z·se); reconstruct it
             // and check ordering + the probability clip range. z = Φ⁻¹(0.975).
-            let z = crate::probability::standard_normal_quantile(0.975).unwrap();
+            let z = gam::probability::standard_normal_quantile(0.975).unwrap();
             let lo = normal_cdf(eta[i] - z * se_oracle).clamp(0.0, 1.0);
             let hi = normal_cdf(eta[i] + z * se_oracle).clamp(0.0, 1.0);
             let mean = normal_cdf(eta[i]);
@@ -3680,9 +3661,9 @@ mod tests {
     #[test]
     fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
         let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-        let prepared = crate::families::bms::build_score_warp_deviation_block_from_seed(
+        let prepared = gam::families::bms::build_score_warp_deviation_block_from_seed(
             &seed,
-            &crate::families::bms::DeviationBlockConfig {
+            &gam::families::bms::DeviationBlockConfig {
                 num_internal_knots: 4,
                 ..Default::default()
             },
@@ -3718,7 +3699,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::royston_parmar(),
+            gam::types::LikelihoodSpec::royston_parmar(),
         )
         .expect("royston-parmar point prediction");
         let expected_eta = array![0.4, 1.2];
@@ -3747,7 +3728,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::royston_parmar(),
+            gam::types::LikelihoodSpec::royston_parmar(),
             covariance.view(),
         )
         .expect("royston-parmar posterior mean");
@@ -3755,14 +3736,14 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::royston_parmar(),
+            gam::types::LikelihoodSpec::royston_parmar(),
             covariance.view(),
             &fit,
         )
         .expect("royston-parmar posterior mean with fit");
 
-        let quadctx = crate::quadrature::QuadratureContext::new();
-        let expected = crate::quadrature::survival_posterior_mean(&quadctx, 0.35, 0.3);
+        let quadctx = gam::quadrature::QuadratureContext::new();
+        let expected = gam::quadrature::survival_posterior_mean(&quadctx, 0.35, 0.3);
         for i in 0..out.mean.len() {
             assert!((out.mean[i] - expected).abs() <= 1e-12);
             assert!((out_with_fit.mean[i] - expected).abs() <= 1e-12);
@@ -3799,14 +3780,14 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::royston_parmar(),
+            gam::types::LikelihoodSpec::royston_parmar(),
             &fit,
             &options,
         )
         .expect("royston-parmar uncertainty");
 
-        let quadctx = crate::quadrature::QuadratureContext::new();
-        let (_, variance) = crate::quadrature::survival_posterior_meanvariance(&quadctx, 0.6, 0.5);
+        let quadctx = gam::quadrature::QuadratureContext::new();
+        let (_, variance) = gam::quadrature::survival_posterior_meanvariance(&quadctx, 0.6, 0.5);
         assert!((out.mean[0] - (-(0.6_f64.exp())).exp()).abs() <= 1e-12);
         assert!((out.eta_standard_error[0] - 0.5).abs() <= 1e-12);
         assert!((out.mean_standard_error[0] - variance.sqrt()).abs() <= 1e-12);
@@ -3850,7 +3831,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &base_options,
         )
@@ -3859,7 +3840,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &options_fused,
         )
@@ -3887,7 +3868,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &options_mismatched,
         )
@@ -3903,7 +3884,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
-            sigma_floor: crate::families::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
             covariance: None,
             link_wiggle: None,
         };
@@ -3935,7 +3916,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.5],
             beta_noise: array![0.1],
-            sigma_floor: crate::families::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
             covariance: Some(array![[4.0, 0.0], [0.0, 9.0]]),
             link_wiggle: None,
         };
@@ -3964,7 +3945,7 @@ mod tests {
         let predictor = GaussianLocationScalePredictor {
             beta_mu: array![0.0],
             beta_noise: array![0.0],
-            sigma_floor: crate::families::sigma_link::LOGB_SIGMA_FLOOR,
+            sigma_floor: gam::families::sigma_link::LOGB_SIGMA_FLOOR,
             covariance: Some(array![[1.0, 0.0], [0.0, 0.0]]),
             link_wiggle: None,
         };
@@ -4129,7 +4110,7 @@ mod tests {
         covariance: Array2<f64>,
         bias_correction_beta: Option<Array1<f64>>,
     ) -> UnifiedFitResult {
-        use crate::estimate::FitInference;
+        use gam::estimate::FitInference;
         let p = beta.len();
         let inf = FitInference {
             // No penalty in this fixture (lambdas empty), so leave edf_by_block
@@ -4142,7 +4123,7 @@ mod tests {
             working_weights: Array1::zeros(0),
             working_response: Array1::zeros(0),
             reparam_qs: None,
-            dispersion: crate::estimate::Dispersion::Known(1.0),
+            dispersion: gam::estimate::Dispersion::Known(1.0),
             beta_covariance: Some(covariance.clone().into()),
             beta_standard_errors: None,
             beta_covariance_corrected: None,
@@ -4161,9 +4142,9 @@ mod tests {
             }],
             log_lambdas: Array1::zeros(0),
             lambdas: Array1::zeros(0),
-            likelihood_family: Some(crate::types::LikelihoodSpec::gaussian_identity()),
-            likelihood_scale: crate::types::LikelihoodScaleMetadata::ProfiledGaussian,
-            log_likelihood_normalization: crate::types::LogLikelihoodNormalization::Full,
+            likelihood_family: Some(gam::types::LikelihoodSpec::gaussian_identity()),
+            likelihood_scale: gam::types::LikelihoodScaleMetadata::ProfiledGaussian,
+            log_likelihood_normalization: gam::types::LogLikelihoodNormalization::Full,
             log_likelihood: 0.0,
             deviance: 0.0,
             reml_score: 0.0,
@@ -4222,7 +4203,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -4231,7 +4212,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4260,7 +4241,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4283,7 +4264,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit_with,
             &bc_options(true),
         )
@@ -4292,7 +4273,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit_without,
             &bc_options(true),
         )
@@ -4416,7 +4397,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -4425,7 +4406,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4466,7 +4447,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -4475,7 +4456,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4519,7 +4500,7 @@ mod tests {
                 x.clone(),
                 beta.view(),
                 offset.view(),
-                crate::types::LikelihoodSpec::gaussian_identity(),
+                gam::types::LikelihoodSpec::gaussian_identity(),
                 &fit,
                 &bc_options(false),
             )
@@ -4528,7 +4509,7 @@ mod tests {
                 x.clone(),
                 beta.view(),
                 offset.view(),
-                crate::types::LikelihoodSpec::gaussian_identity(),
+                gam::types::LikelihoodSpec::gaussian_identity(),
                 &fit,
                 &bc_options(true),
             )
@@ -4639,7 +4620,7 @@ mod tests {
             xt.clone(),
             beta_hat.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -4648,7 +4629,7 @@ mod tests {
             xt.clone(),
             beta_hat.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4765,7 +4746,7 @@ mod tests {
                     xt.clone(),
                     beta_mean.view(),
                     offset.view(),
-                    crate::types::LikelihoodSpec::gaussian_identity(),
+                    gam::types::LikelihoodSpec::gaussian_identity(),
                     &fit,
                     &bc_options(false),
                 )
@@ -4774,7 +4755,7 @@ mod tests {
                     xt.clone(),
                     beta_mean.view(),
                     offset.view(),
-                    crate::types::LikelihoodSpec::gaussian_identity(),
+                    gam::types::LikelihoodSpec::gaussian_identity(),
                     &fit,
                     &bc_options(true),
                 )
@@ -4868,7 +4849,7 @@ mod tests {
             x_row,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit_orig,
             &bc_options(true),
         )
@@ -4877,7 +4858,7 @@ mod tests {
             x_tilde,
             theta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit_repar,
             &bc_options(true),
         )
@@ -4925,7 +4906,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -4934,7 +4915,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4970,7 +4951,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -4997,7 +4978,7 @@ mod tests {
             x.clone(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(false),
         )
@@ -5062,7 +5043,7 @@ mod tests {
             x,
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &bc_options(true),
         )
@@ -5232,7 +5213,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -5268,7 +5249,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -5291,7 +5272,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -5326,7 +5307,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -5378,7 +5359,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )
@@ -5415,7 +5396,7 @@ mod tests {
             x.view(),
             beta.view(),
             offset.view(),
-            crate::types::LikelihoodSpec::gaussian_identity(),
+            gam::types::LikelihoodSpec::gaussian_identity(),
             &fit,
             &opts,
         )

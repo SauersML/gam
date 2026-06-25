@@ -20,13 +20,13 @@
 //! delegates the policy to the helpers below, so interval/posterior-mean
 //! behaviour cannot drift between families.
 
-use crate::estimate::{EstimationError, UnifiedFitResult};
-use crate::inference::predict::{
+use gam::estimate::{EstimationError, UnifiedFitResult};
+use crate::{
     InferenceCovarianceMode, PosteriorMeanOptions, PredictInput, PredictPosteriorMeanResult,
     PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult, PredictionWithSE,
     family_observation_band,
 };
-use crate::types::ResponseFamily;
+use gam::types::ResponseFamily;
 use ndarray::Array1;
 
 /// Closed response-scale support `[lo, hi]` used to clamp transformed interval
@@ -95,7 +95,7 @@ impl ResponseBounds {
 /// throughout the predict path; every predictor's interval construction routes
 /// its quantile through here so the convention cannot diverge.
 pub fn central_z(level: f64) -> Result<f64, EstimationError> {
-    crate::probability::standard_normal_quantile(0.5 + 0.5 * level)
+    gam::probability::standard_normal_quantile(0.5 + 0.5 * level)
         .map_err(EstimationError::InvalidInput)
 }
 

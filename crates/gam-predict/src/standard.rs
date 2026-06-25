@@ -3,7 +3,7 @@ use super::*;
 /// Standard (single-block) GAM predictor.
 pub struct StandardPredictor {
     pub beta: Array1<f64>,
-    pub family: crate::types::LikelihoodSpec,
+    pub family: gam::types::LikelihoodSpec,
     pub link_kind: Option<InverseLink>,
     pub covariance: Option<Array2<f64>>,
     pub link_wiggle: Option<SavedLinkWiggleRuntime>,
@@ -14,7 +14,7 @@ impl StandardPredictor {
     /// from the first block and covariance from the unified result.
     pub(crate) fn from_unified(
         unified: &UnifiedFitResult,
-        family: crate::types::LikelihoodSpec,
+        family: gam::types::LikelihoodSpec,
         link_kind: Option<InverseLink>,
         link_wiggle: Option<SavedLinkWiggleRuntime>,
     ) -> Result<Self, String> {
@@ -139,7 +139,7 @@ impl StandardPredictor {
             "standard link-wiggle posterior mean covariance mismatch",
         )?;
         let strategy = strategy_for_family(self.family.clone(), self.link_kind.as_ref());
-        let quadctx = crate::quadrature::QuadratureContext::new();
+        let quadctx = gam::quadrature::QuadratureContext::new();
         let mean = plugin
             .eta
             .iter()
