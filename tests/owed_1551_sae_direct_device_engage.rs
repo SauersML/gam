@@ -258,8 +258,8 @@ fn build_framed_sae_system(install_device_data: bool) -> ArrowSchurSystem {
         sys.set_device_sae_pcg_data(DeviceSaePcgData {
             p,
             beta_dim: border_dim,
-            a_phi: vec![Vec::new(); n],
-            local_jac: vec![Vec::new(); n],
+            a_phi: std::sync::Arc::from(vec![Vec::new(); n]),
+            local_jac: std::sync::Arc::from(vec![Vec::new(); n]),
             smooth_blocks,
             sparse_g_blocks: Vec::new(),
             frame: Some(DeviceSaeFrameData {
