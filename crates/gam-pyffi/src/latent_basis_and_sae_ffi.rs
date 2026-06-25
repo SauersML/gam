@@ -2641,8 +2641,22 @@ fn sae_manifold_fit_inner<'py>(
         ridge_ext_coord,
         ridge_beta,
     );
-    let problem =
-        gam::solver::rho_optimizer::OuterProblem::new(n_params).with_initial_rho(init_rho_flat);
+    // #1026 — "normal SAE" entry: a single seed (the PCA decoder-projection
+    // seed already installed on the term) with NO ρ-multistart. The GAM default
+    // generates ~12 ρ-candidates and screens them (each a partial inner fit) plus
+    // a continuation pre-warm — empirically that entry machinery alone times out
+    // even a well-posed K=8 fit (the 13-seed cascade burned the whole budget
+    // before the outer loop made progress). A dictionary fit does not need
+    // multistart insurance: the PCA projection lands each row in the decisive
+    // basin and EFS refines the per-atom penalties from there. seed_budget=1 +
+    // max_seeds=1 collapses the cascade to the single initial ρ.
+    let problem = gam::solver::rho_optimizer::OuterProblem::new(n_params)
+        .with_initial_rho(init_rho_flat)
+        .with_seed_config(gam::solver::seeding::SeedConfig {
+            max_seeds: 1,
+            seed_budget: 1,
+            ..Default::default()
+        });
     // #1388: the outer ρ cascade drives a SERIAL per-row jet loop
     // (`logdet_theta_adjoint` → `row_jets_for_logdet` → `gate_tower`) that builds
     // `Tower4<16>` derivative towers — each carries a `t4` channel of 16⁴ doubles
