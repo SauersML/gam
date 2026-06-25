@@ -194,6 +194,10 @@ name = "sae_perf_harness"
 path = "examples/sae_perf_harness.rs"
 
 [[example]]
+name = "sae_hillclimb_envelope_1017"
+path = "examples/sae_hillclimb_envelope_1017.rs"
+
+[[example]]
 name = "cyl_family_repro"
 path = "examples/cyl_family_repro.rs"
 
