@@ -36,6 +36,7 @@ path = "src/lib.rs"
 # off a temporarily-monolithic engine. See the #1521 thread for the plan.
 members = [
     "crates/gam-data",
+    "crates/gam-spec",
     "crates/gam-inference",
     "crates/gam-cli",
     "crates/gam-math",
@@ -76,6 +77,7 @@ statrs = "0.18.0"
 libm = "0.2.16"
 gam-data = { path = "crates/gam-data" }
 gam-math = { path = "crates/gam-math" }
+gam-spec = { path = "crates/gam-spec" }
 gam-runtime = { path = "crates/gam-runtime" }
 pest = "2.8.6"
 pest_derive = "2.8.6"

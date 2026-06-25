@@ -1,0 +1,17 @@
+[package]
+name = "gam-spec"
+version = "0.3.123"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ndarray = { version = "0.17.2", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+
+[lints.rust]
+warnings = "deny"
