@@ -1,0 +1,23 @@
+[package]
+name = "gam-runtime"
+version = "0.3.123"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+log = "0.4.29"
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
+sha2 = "0.10.8"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[lints.rust]
+warnings = "deny"
