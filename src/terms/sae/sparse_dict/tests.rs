@@ -1,3 +1,4 @@
+use super::codes::solve_row_codes;
 use super::scoring::{TileScorer, top_s_online};
 use super::{SparseDictConfig, fit_sparse_dictionary};
 use ndarray::{Array2, ArrayView2};
@@ -64,6 +65,142 @@ fn pca_ev(x: ArrayView2<'_, f32>, rank: usize) -> f64 {
     sorted.sort_by(|a, b| b.partial_cmp(a).unwrap());
     let top: f64 = sorted.iter().take(rank).sum();
     if total <= 1.0e-24 { 1.0 } else { top / total }
+}
+
+/// Held-out reconstruction EV of a fitted dictionary `decoder` on a *fresh*
+/// block `x_test` it never trained on. The decoder is FROZEN: each test row is
+/// routed (top-`s`) against it and its codes are the active-set LS solve — the
+/// exact production held-out path (`ManifoldSAE.reconstruct`), one decoder, new
+/// coordinates. EV is `1 − RSS/TSS` with the TSS centred on `x_test`'s own mean,
+/// so a dictionary that merely memorised the train block earns nothing here.
+fn held_out_ev(
+    decoder: ArrayView2<'_, f32>,
+    x_test: ArrayView2<'_, f32>,
+    s: usize,
+    tile: usize,
+    code_ridge: f32,
+) -> f64 {
+    let n = x_test.nrows();
+    let p = x_test.ncols();
+    let scorer = TileScorer::new(s, tile);
+    let mut means = vec![0.0f64; p];
+    for i in 0..n {
+        for c in 0..p {
+            means[c] += x_test[[i, c]] as f64;
+        }
+    }
+    for c in 0..p {
+        means[c] /= n as f64;
+    }
+    let mut rss = 0.0f64;
+    let mut tss = 0.0f64;
+    for i in 0..n {
+        let row = x_test.row(i);
+        let active = scorer.route_row(row, decoder);
+        let code = solve_row_codes(row, decoder, &active, s, code_ridge);
+        let mut recon = vec![0.0f64; p];
+        for j in 0..code.indices.len() {
+            let cj = code.codes[j] as f64;
+            if cj == 0.0 {
+                continue;
+            }
+            let drow = decoder.row(code.indices[j] as usize);
+            for c in 0..p {
+                recon[c] += cj * drow[c] as f64;
+            }
+        }
+        for c in 0..p {
+            let r = x_test[[i, c]] as f64 - recon[c];
+            rss += r * r;
+            let t = x_test[[i, c]] as f64 - means[c];
+            tss += t * t;
+        }
+    }
+    if tss <= 1.0e-24 {
+        if rss <= 1.0e-24 { 1.0 } else { 0.0 }
+    } else {
+        1.0 - rss / tss
+    }
+}
+
+/// HELD-OUT rank-`r` PCA EV: principal subspace fitted on `x_train` ONLY, then
+/// scored on `x_test`. This is the honest linear baseline the sparse trainer
+/// must match-or-beat — the rank-`r` linear autoencoder's out-of-sample
+/// reconstruction, with NO leakage of the test block into the basis.
+fn pca_ev_held_out(
+    x_train: ArrayView2<'_, f32>,
+    x_test: ArrayView2<'_, f32>,
+    rank: usize,
+) -> f64 {
+    let p = x_train.ncols();
+    let ntr = x_train.nrows();
+    let mut means = vec![0.0f64; p];
+    for i in 0..ntr {
+        for c in 0..p {
+            means[c] += x_train[[i, c]] as f64;
+        }
+    }
+    for c in 0..p {
+        means[c] /= ntr as f64;
+    }
+    // Train covariance → top-`rank` eigenvectors (the PCA basis).
+    let mut cov = Array2::<f64>::zeros((p, p));
+    for i in 0..ntr {
+        for a in 0..p {
+            let xa = x_train[[i, a]] as f64 - means[a];
+            for b in 0..p {
+                cov[[a, b]] += xa * (x_train[[i, b]] as f64 - means[b]);
+            }
+        }
+    }
+    use crate::faer_ndarray::FaerEigh;
+    let (evals, evecs) = cov.eigh(faer::Side::Lower).expect("pca eig");
+    // eigh returns ascending eigenvalues; take the top-`rank` columns.
+    let mut order: Vec<usize> = (0..p).collect();
+    order.sort_by(|&a, &b| evals[b].partial_cmp(&evals[a]).unwrap());
+    let keep: Vec<usize> = order.into_iter().take(rank.min(p)).collect();
+    // Project test rows onto the train PCA subspace and reconstruct.
+    let nte = x_test.nrows();
+    let mut means_te = vec![0.0f64; p];
+    for i in 0..nte {
+        for c in 0..p {
+            means_te[c] += x_test[[i, c]] as f64;
+        }
+    }
+    for c in 0..p {
+        means_te[c] /= nte as f64;
+    }
+    let mut rss = 0.0f64;
+    let mut tss = 0.0f64;
+    for i in 0..nte {
+        // Centre on the TRAIN mean (the basis's origin) for reconstruction.
+        let mut centred = vec![0.0f64; p];
+        for c in 0..p {
+            centred[c] = x_test[[i, c]] as f64 - means[c];
+        }
+        let mut recon = vec![0.0f64; p];
+        for &k in &keep {
+            let mut coord = 0.0f64;
+            for c in 0..p {
+                coord += centred[c] * evecs[[c, k]];
+            }
+            for c in 0..p {
+                recon[c] += coord * evecs[[c, k]];
+            }
+        }
+        for c in 0..p {
+            let r = centred[c] - recon[c];
+            rss += r * r;
+            // TSS centred on the test mean: the variance an honest baseline must explain.
+            let t = x_test[[i, c]] as f64 - means_te[c];
+            tss += t * t;
+        }
+    }
+    if tss <= 1.0e-24 {
+        if rss <= 1.0e-24 { 1.0 } else { 0.0 }
+    } else {
+        1.0 - rss / tss
+    }
 }
 
 #[test]
@@ -153,6 +290,73 @@ fn sparse_trainer_recovers_planted_dictionary_beats_pca_baseline() {
         "sparse trainer EV {} must match-or-beat rank-{k} PCA baseline {}",
         fit.explained_variance,
         baseline
+    );
+}
+
+#[test]
+fn sparse_trainer_beats_rank_k_pca_on_held_out_reconstruction() {
+    // #1026 MVP ACCEPTANCE (the real one): on a planted dictionary at modest K,
+    // the trainer's route→sparse-codes→decoder-update must recover HELD-OUT
+    // reconstruction EV that match-or-beats a rank-K linear/PCA baseline fitted
+    // on the SAME train block — out of sample, no leakage. A planted sparse
+    // mixture (each row a handful of atoms drawn from a K-atom over-complete
+    // dictionary, K > p) is exactly the regime where a sparse top-s code beats a
+    // rank-K dense subspace: the linear PCA of a p-dim block saturates at rank p,
+    // but the sparse dictionary keeps resolving distinct atoms past p.
+    let (k, p, n) = (64usize, 16usize, 1600usize);
+    // Over-complete planted dictionary: K=64 atoms in p=16 dims, each row a
+    // 2-sparse combination. Linear PCA caps at rank 16; the sparse code does not.
+    let (x, _atoms) = planted(k, p, n, 0.35);
+    // Deterministic 80/20 split (stride the rows so both blocks see every atom).
+    let n_test = n / 5;
+    let mut train_rows: Vec<usize> = Vec::new();
+    let mut test_rows: Vec<usize> = Vec::new();
+    for i in 0..n {
+        if i % 5 == 0 {
+            test_rows.push(i);
+        } else {
+            train_rows.push(i);
+        }
+    }
+    let mut x_train = Array2::<f32>::zeros((train_rows.len(), p));
+    for (r, &i) in train_rows.iter().enumerate() {
+        x_train.row_mut(r).assign(&x.row(i));
+    }
+    let mut x_test = Array2::<f32>::zeros((test_rows.len(), p));
+    for (r, &i) in test_rows.iter().enumerate() {
+        x_test.row_mut(r).assign(&x.row(i));
+    }
+    assert_eq!(x_test.nrows(), n_test);
+
+    let s = 2usize;
+    let tile = 16usize;
+    let code_ridge = 1.0e-6f32;
+    let config = SparseDictConfig {
+        n_atoms: k,
+        active: s,
+        minibatch: 256,
+        max_epochs: 60,
+        score_tile: tile,
+        code_ridge,
+        decoder_ridge: 1.0e-6,
+        tolerance: 1.0e-9,
+    };
+    // Fit the dictionary on TRAIN ONLY.
+    let fit = fit_sparse_dictionary(x_train.view(), &config).expect("held-out trainer fit");
+
+    // Held-out EV: frozen decoder, fresh test-row codes (production path).
+    let sparse_out = held_out_ev(fit.decoder.view(), x_test.view(), s, tile, code_ridge);
+    // Linear baseline: rank-K PCA fitted on train, scored on test. With K > p the
+    // rank is clamped to p, so this is the best possible LINEAR autoencoder here.
+    let pca_out = pca_ev_held_out(x_train.view(), x_test.view(), k);
+
+    assert!(
+        sparse_out > 0.9,
+        "held-out sparse-dictionary EV {sparse_out} should explain the planted held-out block"
+    );
+    assert!(
+        sparse_out + 1.0e-4 >= pca_out,
+        "held-out sparse EV {sparse_out} must match-or-beat held-out rank-{k} PCA baseline {pca_out}"
     );
 }
 
