@@ -4848,14 +4848,8 @@ mod tests {
             // Err means the device PCG kernel does not run on GPU (a real fault that
             // must not masquerade as a pass via this skip). Legit skip ONLY when no
             // usable CUDA device exists (CPU CI). The exact `ArrowSchurGpuFailure`
-            // variant is the diagnostic that distinguishes a dispatch-policy decline
-            // (`Unavailable`, e.g. `route_through_gpu` Gemv floor / context-init /
-            // nextest env) from a numeric guard (`SchurFactorFailed`) from a true
-            // kernel fault — so print it before the assert.
+            // variant is folded into the assert message as the diagnostic.
             Err(failure) => {
-                eprintln!(
-                    "[#1551 decline-tag] device_resident_pcg: ArrowSchurGpuFailure::{failure:?}"
-                );
                 assert!(
                     crate::gpu::device_runtime::GpuRuntime::global().is_none(),
                     "#1017: CUDA device present but the device reduced-beta PCG \
@@ -5485,15 +5479,8 @@ mod tests {
             // offload floor, so a CUDA device that is PRESENT yet declines means the
             // framed device PCG kernel does not run on GPU (the fault must not pass
             // silently). Legit skip ONLY when no usable CUDA device exists (CPU CI).
-            // Print the exact `ArrowSchurGpuFailure` variant: the framed path can
-            // decline at the `GpuRuntime::global().filter(should_offload)` admission
-            // (`Unavailable`), a per-row/Schur numeric guard (`SchurFactorFailed` /
-            // `RidgeBumpRequired`), or a `frame.is_some()` mis-route — the tag tells
-            // us which, distinguishing a dispatch/env decline from a kernel fault.
+            // The exact `ArrowSchurGpuFailure` variant is folded into the assert.
             Err(failure) => {
-                eprintln!(
-                    "[#1551 decline-tag] framed_sae_device_pcg: ArrowSchurGpuFailure::{failure:?}"
-                );
                 assert!(
                     crate::gpu::device_runtime::GpuRuntime::global().is_none(),
                     "#1017: CUDA device present but the framed device SAE PCG \
