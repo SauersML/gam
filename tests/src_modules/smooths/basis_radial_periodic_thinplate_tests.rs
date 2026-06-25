@@ -1320,13 +1320,26 @@ fn test_thin_plate_num_centers_is_exact_center_count() {
 fn test_build_thin_plate_basis_switches_to_lazy_design_for_large_blocks() {
     // The lazy switch fires when the projected dense materialization would
     // exceed `ResourcePolicy::max_single_materialization_bytes` (1 GiB on
-    // `default_library`). For n × p × 8 to cross that bound we need
-    // n·p > 2^27, so the smaller (17_000 × 2_000) pin used previously
-    // landed at ~272 MiB and never triggered the lazy path. Size the
-    // test so the dense allocation alone would be ~1.01 GiB — comfortably
-    // over the cap, while still allocating only ~200 KiB of inputs.
-    let n = 17_000usize;
-    let k = 8_000usize;
+    // `default_library`). For thin-plate `base_cols == k` exactly (the kernel
+    // constraint nullspace contributes `k - M` columns and the polynomial
+    // block adds the `M` back), so the trip wire is just `n · k · 8 > 1 GiB`,
+    // i.e. `n · k > 2^27`.
+    //
+    // Drive that threshold with *many rows and few centers* rather than many
+    // centers. The build's only non-trivial compute is the O(k^3)
+    // `thin_plate_kernel_constraint_nullspace` RRQR plus the k×k penalty
+    // factorizations (and, here, the `radial_reparam` matrix); everything that
+    // scales with `n` is O(n) streaming setup that never materializes the n×k
+    // block on the lazy path. Previous pins grew `k` instead — 2_000 then
+    // 8_000 — which forced a 2_000×2_000 / 8_000×8_000 dense RRQR. Under the
+    // unoptimized `[profile.test]` build (opt-level 0) those cubic
+    // factorizations ran for many minutes and tripped the per-test CI timeout,
+    // and `radial_reparam: eye(k - 2)` additionally allocated a ~511 MiB
+    // identity at k = 8_000. With `k = 256` the cubic work is milliseconds and
+    // the reparam is a 254×254 identity, while `n = 600_000` gives
+    // `600_000 · 256 · 8 ≈ 1.14 GiB`, comfortably over the 1 GiB cap.
+    let n = 600_000usize;
+    let k = 256usize;
     let mut data = Array2::<f64>::zeros((n, 1));
     let mut centers = Array2::<f64>::zeros((k, 1));
     for i in 0..n {
