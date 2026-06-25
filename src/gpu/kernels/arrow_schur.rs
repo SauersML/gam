@@ -5465,7 +5465,7 @@ mod tests {
         let rhs: Array1<f64> =
             Array1::from_shape_fn(border_dim, |a| ((a as f64 + 1.0) * 0.17).sin());
 
-        let (device, _diag) = match solve_sae_matrix_free_pcg(
+        let (device, diag) = match solve_sae_matrix_free_pcg(
             &sys,
             &data,
             ridge_t,
@@ -5513,9 +5513,38 @@ mod tests {
         for a in 0..border_dim {
             max_rel = max_rel.max((device[a] - cpu[a]).abs() / scale);
         }
+        // #1551 divergence triage (max_rel=0.91 once the device actually engages):
+        // disambiguate matvec-bug vs PCG-non-convergence vs operator-mismatch.
+        // Residual of the DEVICE solution against the CPU operator S_cpu: if the
+        // device solved the SAME operator and converged, ‖S_cpu·device − rhs‖ ≈ 0;
+        // a large residual means the device matvec is a DIFFERENT operator (kernel
+        // bug), whereas a small residual with large max_rel would indicate a
+        // (near-)singular S where both solves are valid. Also surface what the
+        // device PCG thought it did (stopping reason / iters / final residual).
+        let mut s_dev_resid = 0.0_f64;
+        {
+            let sx = s_dense.dot(&device);
+            for a in 0..border_dim {
+                s_dev_resid = s_dev_resid.max((sx[a] - rhs[a]).abs());
+            }
+        }
+        let s_cpu_resid = {
+            let sc = s_dense.dot(&cpu);
+            let mut m = 0.0_f64;
+            for a in 0..border_dim {
+                m = m.max((sc[a] - rhs[a]).abs());
+            }
+            m
+        };
         assert!(
             max_rel <= 1e-7,
-            "framed SAE device PCG vs CPU dense solve diverged: max_rel={max_rel:e}"
+            "[#1551 framed-triage] max_rel={max_rel:e} | device-vs-CPU-operator residual \
+             ‖S_cpu·device−rhs‖={s_dev_resid:e} (CPU's own ={s_cpu_resid:e}) | device PCG \
+             stop={:?} iters={} final_rel_resid={:e} — large operator-residual ⇒ device matvec \
+             is a different operator (kernel bug); small ⇒ PCG/precond or singular-S issue",
+            diag.stopping_reason,
+            diag.iterations,
+            diag.final_relative_residual,
         );
     }
 }
