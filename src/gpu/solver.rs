@@ -931,7 +931,7 @@ pub fn iterative_refinement_cholesky_solve(
     {
         let (rows, cols) = hessian.dim();
         return Err(format!(
-            "CUDA support not compiled; hessian={rows}x{cols}, rhs={}x{}, need_logdet={need_logdet}",
+            "CUDA support not compiled; hessian={rows}x{cols}, rhs={}x{}",
             rhs.nrows(),
             rhs.ncols()
         ));
