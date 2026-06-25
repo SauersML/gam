@@ -4161,35 +4161,22 @@ mod tests {
 
             // Allocate a DeviceResidentRowHess by hand using the HVP backend's
             // stream + module so we don't need to drive the full BMS row kernel.
-            let backend = match HvpKernelBackend::probe() {
-                Ok(b) => b,
-                Err(err) => {
-                    eprintln!("[bms_flex_row hvp parity] backend probe failed: {err}");
-                    return;
-                }
-            };
+            // Past the GpuRuntime::global() Some-gate above: a probe/upload failure
+            // here is a real device fault on a CUDA host, not a no-CUDA skip. Fail
+            // loud (the device-PCG skip-pass class, eee12f6b2) — the old arms
+            // returned and the test passed while exercising nothing.
+            let backend =
+                HvpKernelBackend::probe().expect("[bms_flex_row hvp parity] backend probe must succeed on CUDA host");
             let stream = backend.stream.clone();
-            let d_h = match stream.clone_htod(&row_hessians) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!("[bms_flex_row hvp parity] upload h failed: {err}");
-                    return;
-                }
-            };
-            let d_m = match stream.clone_htod(&marginal) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!("[bms_flex_row hvp parity] upload marg failed: {err}");
-                    return;
-                }
-            };
-            let d_g = match stream.clone_htod(&logslope) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!("[bms_flex_row hvp parity] upload logslope failed: {err}");
-                    return;
-                }
-            };
+            let d_h = stream
+                .clone_htod(&row_hessians)
+                .expect("[bms_flex_row hvp parity] upload h must succeed on CUDA host");
+            let d_m = stream
+                .clone_htod(&marginal)
+                .expect("[bms_flex_row hvp parity] upload marg must succeed on CUDA host");
+            let d_g = stream
+                .clone_htod(&logslope)
+                .expect("[bms_flex_row hvp parity] upload logslope must succeed on CUDA host");
             let storage = DeviceResidentRowHess {
                 hess: d_h,
                 marginal_design: d_m,
@@ -4306,35 +4293,21 @@ mod tests {
             }
         }
 
-        let backend = match HvpKernelBackend::probe() {
-            Ok(b) => b,
-            Err(err) => {
-                eprintln!("[bms_flex_row hvp_multi parity] backend probe failed: {err}");
-                return;
-            }
-        };
+        // Past the GpuRuntime::global() Some-gate: a probe/upload failure here is a
+        // real device fault on a CUDA host, not a no-CUDA skip — fail loud
+        // (device-PCG skip-pass class, eee12f6b2).
+        let backend = HvpKernelBackend::probe()
+            .expect("[bms_flex_row hvp_multi parity] backend probe must succeed on CUDA host");
         let stream = backend.stream.clone();
-        let d_h = match stream.clone_htod(&row_hessians) {
-            Ok(s) => s,
-            Err(err) => {
-                eprintln!("[bms_flex_row hvp_multi parity] upload h failed: {err}");
-                return;
-            }
-        };
-        let d_m = match stream.clone_htod(&marginal) {
-            Ok(s) => s,
-            Err(err) => {
-                eprintln!("[bms_flex_row hvp_multi parity] upload marg failed: {err}");
-                return;
-            }
-        };
-        let d_g = match stream.clone_htod(&logslope) {
-            Ok(s) => s,
-            Err(err) => {
-                eprintln!("[bms_flex_row hvp_multi parity] upload logslope failed: {err}");
-                return;
-            }
-        };
+        let d_h = stream
+            .clone_htod(&row_hessians)
+            .expect("[bms_flex_row hvp_multi parity] upload h must succeed on CUDA host");
+        let d_m = stream
+            .clone_htod(&marginal)
+            .expect("[bms_flex_row hvp_multi parity] upload marg must succeed on CUDA host");
+        let d_g = stream
+            .clone_htod(&logslope)
+            .expect("[bms_flex_row hvp_multi parity] upload logslope must succeed on CUDA host");
         let storage = DeviceResidentRowHess {
             hess: d_h,
             marginal_design: d_m,
@@ -4465,40 +4438,21 @@ mod tests {
                 &v,
             );
 
-            let backend = match HvpKernelBackend::probe() {
-                Ok(b) => b,
-                Err(err) => {
-                    eprintln!(
-                        "[bms_flex_row hvp_into_device parity] backend probe \
-                         failed: {err}"
-                    );
-                    return;
-                }
-            };
+            // Past the GpuRuntime::global() Some-gate: probe/upload failures are
+            // real device faults on a CUDA host — fail loud (device-PCG class).
+            let backend = HvpKernelBackend::probe().expect(
+                "[bms_flex_row hvp_into_device parity] backend probe must succeed on CUDA host",
+            );
             let stream = backend.stream.clone();
-            let d_h = match stream.clone_htod(&row_hessians) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!("[bms_flex_row hvp_into_device parity] upload h failed: {err}");
-                    return;
-                }
-            };
-            let d_m = match stream.clone_htod(&marginal) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!("[bms_flex_row hvp_into_device parity] upload marg failed: {err}");
-                    return;
-                }
-            };
-            let d_g = match stream.clone_htod(&logslope) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!(
-                        "[bms_flex_row hvp_into_device parity] upload logslope failed: {err}"
-                    );
-                    return;
-                }
-            };
+            let d_h = stream
+                .clone_htod(&row_hessians)
+                .expect("[bms_flex_row hvp_into_device parity] upload h must succeed on CUDA host");
+            let d_m = stream.clone_htod(&marginal).expect(
+                "[bms_flex_row hvp_into_device parity] upload marg must succeed on CUDA host",
+            );
+            let d_g = stream.clone_htod(&logslope).expect(
+                "[bms_flex_row hvp_into_device parity] upload logslope must succeed on CUDA host",
+            );
             let storage = DeviceResidentRowHess {
                 hess: d_h,
                 marginal_design: d_m,
@@ -4873,35 +4827,20 @@ mod tests {
 
             // Build a transient device-resident storage and launch the
             // dense-block kernel.
-            let backend = match HvpKernelBackend::probe() {
-                Ok(b) => b,
-                Err(err) => {
-                    eprintln!("[bms_flex_row dense_block parity] backend probe failed: {err}");
-                    return;
-                }
-            };
+            // Past the GpuRuntime::global() Some-gate: probe/upload failures are
+            // real device faults on a CUDA host — fail loud (device-PCG class).
+            let backend = HvpKernelBackend::probe()
+                .expect("[bms_flex_row dense_block parity] backend probe must succeed on CUDA host");
             let stream = backend.stream.clone();
-            let d_h = match stream.clone_htod(&row_hessians) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!("[bms_flex_row dense_block parity] upload h failed: {err}");
-                    return;
-                }
-            };
-            let d_m = match stream.clone_htod(&marginal) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!("[bms_flex_row dense_block parity] upload marg failed: {err}");
-                    return;
-                }
-            };
-            let d_g = match stream.clone_htod(&logslope) {
-                Ok(s) => s,
-                Err(err) => {
-                    eprintln!("[bms_flex_row dense_block parity] upload logslope failed: {err}");
-                    return;
-                }
-            };
+            let d_h = stream
+                .clone_htod(&row_hessians)
+                .expect("[bms_flex_row dense_block parity] upload h must succeed on CUDA host");
+            let d_m = stream
+                .clone_htod(&marginal)
+                .expect("[bms_flex_row dense_block parity] upload marg must succeed on CUDA host");
+            let d_g = stream.clone_htod(&logslope).expect(
+                "[bms_flex_row dense_block parity] upload logslope must succeed on CUDA host",
+            );
             let storage = DeviceResidentRowHess {
                 hess: d_h,
                 marginal_design: d_m,

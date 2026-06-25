@@ -757,11 +757,16 @@ mod tests {
             }
             let Some(bundle) = try_primary_state_gram_cuda(&channel_blocks, &h_packed, &ranges)
             else {
-                eprintln!(
-                    "[identifiability_compile] GPU Gram build returned None — \
-                     treating as CI infra outage, not parity regression"
+                // We already returned above when no CUDA runtime is present, so a
+                // None here means the GPU Gram build DECLINED with a runtime
+                // present — a real device/dispatch fault, not an infra outage.
+                // Fail loud (the device-PCG skip-pass class, eee12f6b2) instead of
+                // masking the fault as a pass.
+                panic!(
+                    "[identifiability_compile] GPU primary-state Gram build returned None \
+                     with a CUDA runtime present — the device path declined a workload it \
+                     must run (kernel/dispatch fault), not a CI infra outage"
                 );
-                return;
             };
             let (cpu_h, cpu_s) = cpu_oracle(&channel_blocks, &h_packed, &ranges);
             let tol_abs = 1e-9_f64;

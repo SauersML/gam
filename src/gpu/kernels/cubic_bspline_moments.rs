@@ -2298,15 +2298,19 @@ mod cubic_bspline_moments_tests {
         let dev = match super::build_hex_tensor_moments_device(&spec, &axes_for_build, &cells) {
             Ok(d) => d,
             Err(err) => {
-                eprintln!("skipping GPU parity test (no CUDA runtime): {err}");
-                // The skip path must still execute at least one assertion so
-                // the assertionless-test scanner stays happy.
+                // A legitimate skip happens ONLY when no CUDA runtime exists. With
+                // a runtime present, any build error (including DriverCallFailed) is
+                // a real device fault, not a "no CUDA" skip — fail loud (the
+                // device-PCG skip-pass class, eee12f6b2). The earlier version
+                // skip-passed on DriverCallFailed/NoDeviceKernel even on a GPU host,
+                // masking real kernel faults.
                 assert!(
-                    matches!(err, GpuError::DriverLibraryUnavailable { .. })
-                        || matches!(err, GpuError::DriverCallFailed { .. })
-                        || matches!(err, GpuError::NoDeviceKernel { .. }),
-                    "unexpected GPU error variant: {err:?}"
+                    crate::gpu::device_runtime::GpuRuntime::global().is_none(),
+                    "GPU hex-tensor moment build failed with a CUDA runtime present: \
+                     {err:?}. A runtime-present build failure is a real device/kernel \
+                     fault, not a legitimate no-CUDA skip."
                 );
+                eprintln!("skipping GPU parity test (no CUDA runtime): {err}");
                 return;
             }
         };
@@ -2388,13 +2392,15 @@ mod cubic_bspline_moments_tests {
         let first = match super::build_hex_tensor_moments_device(&spec, &axes_for_build, &cells) {
             Ok(d) => d,
             Err(err) => {
-                eprintln!("skipping module-cache test (no CUDA runtime): {err}");
+                // Legit skip only with no CUDA runtime; a runtime-present build
+                // failure is a real device fault (device-PCG skip-pass class).
                 assert!(
-                    matches!(err, GpuError::DriverLibraryUnavailable { .. })
-                        || matches!(err, GpuError::DriverCallFailed { .. })
-                        || matches!(err, GpuError::NoDeviceKernel { .. }),
-                    "unexpected GPU error variant: {err:?}"
+                    crate::gpu::device_runtime::GpuRuntime::global().is_none(),
+                    "GPU hex-tensor module-cache build failed with a CUDA runtime \
+                     present: {err:?}. A runtime-present build failure is a real \
+                     device/kernel fault, not a legitimate no-CUDA skip."
                 );
+                eprintln!("skipping module-cache test (no CUDA runtime): {err}");
                 return;
             }
         };

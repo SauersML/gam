@@ -304,10 +304,20 @@ fn per_token_block_dim_is_independent_of_k_at_fixed_active() {
 
 #[test]
 fn gpu_reduced_beta_solve_matches_cpu_when_available() {
-    // Assemble a small system and form the reduced `(S, rhs)` on the host; the
-    // GPU and CPU reduced solves must agree on the same inputs.
+    // Assemble a system and form the reduced `(S, rhs)` on the host; the GPU and
+    // CPU reduced solves must agree on the same inputs.
+    //
+    // The reduced-β GPU PCG is dispatched by its CG-amortised work
+    // `2·k²·max_iterations` against the 1e8 GEMM FLOP floor (#1017 re-key). With
+    // `max_iterations = 200` (default), the device path is admitted only when
+    // `k ≳ 500`. `beta_dim = Σ_atoms basis_size·p_out = k_atoms·4·2`, so 64 atoms
+    // give k = 512 ⇒ `2·512²·200 ≈ 1.05e8 ≥ 1e8` and the device PCG actually runs
+    // on a GPU host. The earlier k=64 fixture (8 atoms) was far below the floor:
+    // `solve_reduced_beta_pcg` always returned Unavailable on a real GPU and the
+    // parity assertion NEVER ran on hardware — a vacuous skip-pass (device-PCG
+    // class, eee12f6b2).
     let (mut term, target, rho) = build_term(
-        8,
+        64,
         4,
         1,
         200,
@@ -342,6 +352,17 @@ fn gpu_reduced_beta_solve_matches_cpu_when_available() {
     ) {
         Ok(delta) => delta,
         Err(ArrowSchurGpuFailure::Unavailable) => {
+            // The fixture (k=512, iters=200) clears the 1e8 device dispatch floor,
+            // so with a CUDA runtime present the reduced-β GPU PCG must run. An
+            // Unavailable here means the device declined a workload it was sized to
+            // run — a real fault, not a no-CUDA skip. Fail loud unless this is a
+            // genuinely CPU-only host (device-PCG skip-pass class, eee12f6b2).
+            assert!(
+                gam::gpu::device_runtime::GpuRuntime::global().is_none(),
+                "[sae_streaming/gpu_parity] reduced-β GPU PCG returned Unavailable on a \
+                 floor-clearing fixture (k=512, iters=200) with a CUDA runtime present — \
+                 the device path declined a workload it must run"
+            );
             eprintln!(
                 "[sae_streaming/gpu_parity] no CUDA device — skipping GPU↔CPU \
                  reduced-β parity (CPU path is exercised by (a))"
