@@ -1043,16 +1043,53 @@ where
         // #1266/#1271: no interior point is cheaper, so nothing is adopted).
         {
             let rho_upper = crate::estimate::RHO_BOUND;
-            let railed: Vec<usize> = (0..strategy_result.rho.len())
+            // Coordinates eligible for the inward (less-smoothing) descent. Two
+            // kinds qualify:
+            //   (1) any coordinate pinned at the ρ upper rail — the original
+            //       #1074 case: the outer convergence check projects out a
+            //       rail-pinned coordinate, masking a feasible interior descent;
+            //   (2) the well-determined double-penalty NULL-SPACE selection
+            //       coordinates (`is_nullspace_degeneracy_prior`). These sit on a
+            //       near-FLAT REML ridge in λ_null, so the outer optimizer can
+            //       certify convergence at ANY high-but-not-railed ρ_null
+            //       depending on its (floating-point) iterate path. Reflecting the
+            //       covariate `x → −x` reverses the basis column order and flips
+            //       that landing shoulder: a SUPPORTED affine trend is kept at
+            //       ρ_null ≈ 0 in one orientation but over-penalized to e.g.
+            //       ρ_null ≈ 25 in the mirror (#1548), even though neither is at
+            //       the exact rail. Descending these to the cheaper interior
+            //       optimum lands BOTH orientations on the same shoulder.
+            // The descent below probes ONLY strictly-lower ρ, so it never
+            // over-smooths (raising λ_null is the #1266 escape's job, with its
+            // EDF parsimony guard against the #1476 concurvity transfer). It is
+            // keep-best + cold-confirmed against the authoritative penalized cost,
+            // so it is an exact no-op wherever the current ρ already is the
+            // optimum — e.g. an unsupported trend correctly shrunk out at the rail
+            // (#1266/#1271), where no interior point is cheaper.
+            let mut descent_coords: Vec<usize> = (0..strategy_result.rho.len())
                 .filter(|&i| strategy_result.rho[i] >= rho_upper - 1e-9)
                 .collect();
+            if n_design_rows >= 2 * p
+                && let crate::types::RhoPrior::Independent(per_coord) =
+                    reml_state.effective_rho_prior().as_ref()
+            {
+                for i in 0..strategy_result.rho.len() {
+                    if strategy_result.rho[i] < rho_upper - 1e-9
+                        && per_coord
+                            .get(i)
+                            .is_some_and(crate::terms::smooth::is_nullspace_degeneracy_prior)
+                    {
+                        descent_coords.push(i);
+                    }
+                }
+            }
             // Baseline to beat = the optimizer's OWN authoritative converged
             // cost (`final_value`), which was scored at the converged ρ with its
             // own inner solve and is immune to warm-start pollution from the
             // probes below (the #1371 lesson). A probe only wins if it is
             // strictly cheaper than this honest cost.
             let base_cost = strategy_result.final_value;
-            if !railed.is_empty() && base_cost.is_finite() {
+            if !descent_coords.is_empty() && base_cost.is_finite() {
                 // Inward probe grid (descending from the rail). Bounded and
                 // cheap: at most 2 · |railed| · 8 inner solves, and only when a
                 // coord is actually pinned at the upper rail. Two coordinate-
@@ -1064,10 +1101,19 @@ where
                 let mut improved = false;
                 for _pass in 0..2 {
                     let mut pass_improved = false;
-                    for &coord in &railed {
+                    for &coord in &descent_coords {
                         let mut local_best = best_rho.clone();
                         let mut local_cost = best_cost;
                         for &cand in &INWARD_GRID {
+                            // Inward escape only ever DESCENDS (less smoothing):
+                            // skip any grid point at or above this coordinate's
+                            // current ρ. Over-smoothing a null-space coordinate is
+                            // the #1266 escape's job (it carries the EDF parsimony
+                            // guard that prevents the #1476 concurvity transfer);
+                            // this guard must never raise λ without it.
+                            if cand >= best_rho[coord] - 1e-9 {
+                                continue;
+                            }
                             let mut probe = best_rho.clone();
                             probe[coord] = cand;
                             if let Ok(c) = reml_state.compute_cost(&probe)
@@ -1089,6 +1135,78 @@ where
                         break;
                     }
                 }
+                // CONTINUOUS REFINEMENT of each descended coordinate. The coarse
+                // INWARD_GRID snaps λ to a grid node (e.g. ρ_null = 0), but in the
+                // OTHER covariate orientation the outer optimizer reports the
+                // continuous interior minimizer (e.g. ρ_null = −0.37). Leaving one
+                // orientation on the grid node while the other keeps the continuous
+                // optimum leaves a small residual reflection asymmetry (#1548:
+                // ~1.7e-3 mirror drift survives the grid descent alone). Golden-
+                // section the SAME authoritative penalized cost on each moved
+                // coordinate so both orientations converge to the identical
+                // continuous minimum. It can only lower the cost from the grid node
+                // (the bracket straddles it), and the cold confirmation below still
+                // gates adoption, so this never raises the certified cost.
+                if improved {
+                    const GS_R: f64 = 0.618_033_988_749_894_8; // (√5 − 1) / 2
+                    for coord in descent_coords.clone() {
+                        if (best_rho[coord] - strategy_result.rho[coord]).abs() <= 1e-9 {
+                            continue; // coordinate did not descend
+                        }
+                        // Bracket straddling the adopted grid node, never re-entering
+                        // the over-smoothing region above the coordinate's start ρ.
+                        let node = best_rho[coord];
+                        let mut a = node - 3.0;
+                        let mut b = (node + 3.0).min(strategy_result.rho[coord]);
+                        if b <= a + 1e-6 {
+                            continue;
+                        }
+                        let cost_at = |st: &mut RemlState, base: &Array1<f64>, x: f64| -> Option<f64> {
+                            let mut p = base.clone();
+                            p[coord] = x;
+                            st.compute_cost(&p).ok().filter(|c| c.is_finite())
+                        };
+                        let mut c = b - GS_R * (b - a);
+                        let mut d = a + GS_R * (b - a);
+                        let mut fc = cost_at(&mut reml_state, &best_rho, c);
+                        let mut fd = cost_at(&mut reml_state, &best_rho, d);
+                        let mut refine_ok = fc.is_some() && fd.is_some();
+                        for _ in 0..40 {
+                            if (b - a).abs() < 1e-4 {
+                                break;
+                            }
+                            match (fc, fd) {
+                                (Some(vc), Some(vd)) if vc <= vd => {
+                                    b = d;
+                                    d = c;
+                                    fd = fc;
+                                    c = b - GS_R * (b - a);
+                                    fc = cost_at(&mut reml_state, &best_rho, c);
+                                }
+                                (Some(_), Some(_)) => {
+                                    a = c;
+                                    c = d;
+                                    fc = fd;
+                                    d = a + GS_R * (b - a);
+                                    fd = cost_at(&mut reml_state, &best_rho, d);
+                                }
+                                _ => {
+                                    refine_ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        if refine_ok {
+                            let xm = 0.5 * (a + b);
+                            if let Some(fm) = cost_at(&mut reml_state, &best_rho, xm)
+                                && fm < best_cost
+                            {
+                                best_rho[coord] = xm;
+                                best_cost = fm;
+                            }
+                        }
+                    }
+                }
                 if improved {
                     // COLD CONFIRMATION (guards against adopting a warm-start /
                     // inner-cap artifact, the #1426/#1371 trap). The grid probes
@@ -1104,10 +1222,11 @@ where
                     if cold_ok {
                         let cold_cost = cold.unwrap_or(best_cost);
                         log::info!(
-                            "[OUTER] #1074 upper-bound escape: certified ρ cost {base_cost:.6e} \
-                             lowered to {cold_cost:.6e} (cold-confirmed) by descending {} rail \
-                             coord(s) inward; adopting the cheaper interior ρ",
-                            railed.len()
+                            "[OUTER] #1074/#1548 upper-bound escape: certified ρ cost \
+                             {base_cost:.6e} lowered to {cold_cost:.6e} (cold-confirmed) by \
+                             descending {} over-smoothed coord(s) inward; adopting the cheaper \
+                             interior ρ",
+                            descent_coords.len()
                         );
                         strategy_result.rho = best_rho;
                         strategy_result.final_value = cold_cost;
