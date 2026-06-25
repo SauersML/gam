@@ -6198,6 +6198,39 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
         "distinct η must recompute, not serve the stale cached allocation"
     );
 
+    // Fingerprint-collision guard: an η that shares the (first, mid, last)
+    // sample points with the cached key but differs at an INTERIOR index must
+    // still MISS. A lossy 3-point fingerprint would falsely HIT here and serve
+    // the cached predictor's scalars to a different predictor; the full-vector
+    // key must reject it and recompute scalars that actually differ.
+    family.cached_row_scalars.write().expect("lock").take();
+    let primed = family
+        .get_or_compute_row_scalars(&etamu, &eta_ls)
+        .expect("prime cache for collision probe");
+    let mut eta_ls_interior = eta_ls.clone();
+    let interior = eta_ls_interior.len() / 4; // an index that is NOT 0, n/2, or n-1
+    assert!(
+        interior != 0 && interior != eta_ls_interior.len() / 2 && interior != eta_ls_interior.len() - 1,
+        "collision probe needs an interior index distinct from the 3 sampled points"
+    );
+    eta_ls_interior[interior] += 0.5;
+    let collide = family
+        .get_or_compute_row_scalars(&etamu, &eta_ls_interior)
+        .expect("recompute on interior-only change");
+    assert!(
+        !std::sync::Arc::ptr_eq(&primed, &collide),
+        "η differing only at an interior index must MISS, not collide on a 3-point fingerprint"
+    );
+    let recomputed_collide =
+        gaussian_jointrow_scalars(&y, &etamu, &eta_ls_interior, &weights).expect("collide reference");
+    for (a, b) in collide.w.iter().zip(recomputed_collide.w.iter()) {
+        assert_eq!(
+            a.to_bits(),
+            b.to_bits(),
+            "interior-changed η must be served its OWN scalars, not the stale cached ones"
+        );
+    }
+
     // Invalidate and recompute the Hessian: must be bit-identical to the cached
     // run (proves the cache changes nothing numerically).
     family.cached_row_scalars.write().expect("lock").take();
