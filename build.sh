@@ -98,6 +98,29 @@ record() { # args: req dedup exit dur
     "$(now)" "\"$req\"" "$dedup" "$n" "$names" "$dur" "$code" >> "$HIST"
 }
 
+# ---- maturin lane: `./build.sh maturin [extra maturin args]` ----
+# Builds the gamfit Python extension through the SAME single-flight lock + sccache
+# warm dep cache as the cargo lanes, so concurrent agents/jobs do not each recompile
+# the heavy dep tree (faer/arrow/burn/…) — the difference between a ~2-min gam-only
+# rebuild and a ~20-min cold one. The cargo lanes wire sccache via `--config
+# build.rustc-wrapper`; maturin runs its own internal cargo, which honours the
+# RUSTC_WRAPPER env form instead, so set that here under the same sccache condition.
+if [[ "${1:-}" == "maturin" ]]; then
+  shift
+  if command -v sccache >/dev/null 2>&1 && [[ -z "${GAM_NO_SCCACHE:-}" ]]; then
+    export RUSTC_WRAPPER="$(command -v sccache)"   # CARGO_INCREMENTAL already 0 above
+  fi
+  REQ="maturin develop --release $*"
+  exec 9>"$LOCK"; flock -x 9
+  cd "$REPO" || exit 1
+  t0=$(ep); timeout "$TIMEOUT" maturin develop --release "$@" >"$LOG" 2>&1; code=$?; dur=$(( $(ep)-t0 ))
+  record "$REQ" "n/a" "$code" "$dur"
+  flock -u 9
+  echo "[build.sh] $REQ -> exit $code in ${dur}s (recompiled $(compiled_crates | grep -c . ) crates)"
+  sccache_summary
+  tail -n 30 "$LOG"; exit "$code"
+fi
+
 # ---- test-run lane (args present): serialized, reuses warm lib ----
 if [[ $# -gt 0 ]]; then
   REQ="$*"
