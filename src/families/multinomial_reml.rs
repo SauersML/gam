@@ -2864,6 +2864,161 @@ mod tests {
         );
     }
 
+    // ----------------------------------------------------------------------
+    // #932 doctrine oracle for the softmax directional / second-directional
+    // joint-Hessian assembly.
+    //
+    // The production hand path builds the per-canonical-axis derivatives of the
+    // joint softmax Fisher Hessian `H(β) = block(Xᵀ W(β) X)`,
+    // `W = diag(p) − p pᵀ`, in one fused row sweep
+    // (`assemble_all_axis_directional_derivatives`,
+    // `assemble_all_axis_second_directional_derivatives`). Those hand
+    // `diag(p)−ppᵀ` directional assemblies are FAST and STAY in production, but
+    // — exactly like every other #932 family — they must be pinned to a
+    // MECHANICAL single source so a dropped or mis-weighted softmax-Jacobian
+    // term (the #736/#947 bug genus) is caught here, not in a silently wrong
+    // outer Jeffreys drift.
+    //
+    // MECHANICAL SOURCE (independent of the assembly under test):
+    //  * `H(β) = exact_newton_joint_hessian(β)` is the STATIC joint Fisher
+    //    Hessian — the assembly's own zeroth order. Its derivative along the
+    //    canonical axis `e_{(a0,i0)}` is `∂H/∂β_{a0,i0}`, which we take by a
+    //    central finite difference of `H` (a quantity that never calls the
+    //    directional assembly). This pins the FIRST-directional set.
+    //  * `Hdot[δ](β) = exact_newton_joint_hessian_directional_derivative(β, δ)`
+    //    via the per-direction `directional_fisher_jet` → `dense_block_xtwx`
+    //    route (the GENERAL-direction branch, NOT the canonical-axis memo). Its
+    //    derivative along canonical axis `e_a` is `∂Hdot[δ]/∂β_a`, taken by a
+    //    central FD of `Hdot[δ]`. This pins the SECOND-directional set against a
+    //    different assembly than the one under test.
+    // ----------------------------------------------------------------------
+
+    /// Perturb a stacked β set by `factor·X·e_{(a0,i0)}` in the η domain: add
+    /// `factor` to coefficient `i0` of class `a0` and rebuild the η states.
+    fn perturb_axis(
+        family: &MultinomialFamily,
+        betas: &[Array1<f64>],
+        a0: usize,
+        i0: usize,
+        factor: f64,
+    ) -> Vec<ParameterBlockState> {
+        let mut shifted = betas.to_vec();
+        shifted[a0][i0] += factor;
+        states_at_betas(family, &shifted)
+    }
+
+    #[test]
+    fn all_axis_directional_derivatives_match_static_hessian_finite_difference() {
+        // K = 4 ⇒ M = 3 active classes with genuine off-diagonal softmax
+        // coupling; p = 3 coefficients per class.
+        let n = 11;
+        let p = 3;
+        let k = 4;
+        let family = family_with_weights(
+            n,
+            p,
+            k,
+            Array1::from_shape_fn(n, |i| 0.5 + 0.4 * ((i as f64) * 0.41).sin().abs()),
+        );
+        let m = family.active_classes();
+        let total = m * p;
+        let betas = sample_betas(m, p, 0.6);
+        let states = states_at_betas(&family, &betas);
+        let eta = family.collect_eta_matrix(&states).expect("eta collect");
+
+        let hand = family.assemble_all_axis_directional_derivatives(eta.view());
+        assert_eq!(hand.len(), total, "one directional matrix per canonical axis");
+
+        let eps = 1.0e-6;
+        let mut max_rel = 0.0_f64;
+        for a0 in 0..m {
+            for i0 in 0..p {
+                let axis = a0 * p + i0;
+                let h_plus = family
+                    .exact_newton_joint_hessian(&perturb_axis(&family, &betas, a0, i0, eps))
+                    .expect("H+")
+                    .expect("H+ some");
+                let h_minus = family
+                    .exact_newton_joint_hessian(&perturb_axis(&family, &betas, a0, i0, -eps))
+                    .expect("H-")
+                    .expect("H- some");
+                let hand_axis = &hand[axis];
+                for r in 0..total {
+                    for c in 0..total {
+                        let fd = (h_plus[[r, c]] - h_minus[[r, c]]) / (2.0 * eps);
+                        let scale = fd.abs().max(hand_axis[[r, c]].abs()).max(1.0);
+                        max_rel = max_rel.max((hand_axis[[r, c]] - fd).abs() / scale);
+                    }
+                }
+            }
+        }
+        assert!(
+            max_rel <= 1.0e-6,
+            "softmax all-axis directional assembly drifted from the static-Hessian \
+             finite difference by relative {max_rel:.3e}"
+        );
+    }
+
+    #[test]
+    fn all_axis_second_directional_derivatives_match_directional_finite_difference() {
+        let n = 10;
+        let p = 3;
+        let k = 4;
+        let family = family_with_weights(
+            n,
+            p,
+            k,
+            Array1::from_shape_fn(n, |i| 0.6 + 0.3 * ((i as f64) * 0.53).cos().abs()),
+        );
+        let m = family.active_classes();
+        let total = m * p;
+        let betas = sample_betas(m, p, 0.5);
+        let states = states_at_betas(&family, &betas);
+        let eta = family.collect_eta_matrix(&states).expect("eta collect");
+
+        // Fixed first direction δ (the u-direction), a non-canonical mode so the
+        // mechanical witness exercises the general directional jet branch.
+        let delta = Array1::from_shape_fn(total, |idx| 0.4 * ((idx as f64 * 1.7 + 0.3).sin()));
+
+        let hand = family
+            .assemble_all_axis_second_directional_derivatives(eta.view(), &delta)
+            .expect("second-directional assembly");
+        assert_eq!(hand.len(), total, "one second-directional matrix per axis");
+
+        // Mechanical witness: Hdot[δ](β) by the per-direction jet route, FD'd
+        // along each canonical axis. Force the GENERAL-direction branch (not the
+        // canonical-axis memo) — δ is a dense mode, so the branch is taken.
+        let hdot_at = |st: &[ParameterBlockState]| -> Array2<f64> {
+            family
+                .exact_newton_joint_hessian_directional_derivative(st, &delta)
+                .expect("Hdot")
+                .expect("Hdot some")
+        };
+
+        let eps = 1.0e-6;
+        let mut max_rel = 0.0_f64;
+        for a0 in 0..m {
+            for i0 in 0..p {
+                let axis = a0 * p + i0;
+                let hd_plus = hdot_at(&perturb_axis(&family, &betas, a0, i0, eps));
+                let hd_minus = hdot_at(&perturb_axis(&family, &betas, a0, i0, -eps));
+                let hand_axis = &hand[axis];
+                for r in 0..total {
+                    for c in 0..total {
+                        let fd = (hd_plus[[r, c]] - hd_minus[[r, c]]) / (2.0 * eps);
+                        let scale = fd.abs().max(hand_axis[[r, c]].abs()).max(1.0);
+                        max_rel = max_rel.max((hand_axis[[r, c]] - fd).abs() / scale);
+                    }
+                }
+            }
+        }
+        assert!(
+            max_rel <= 1.0e-5,
+            "softmax all-axis second-directional assembly drifted from the directional \
+             finite difference by relative {max_rel:.3e}"
+        );
+    }
+
     /// #753 — a multinomial adapter instance can arm the universal full-span
     /// Jeffreys/Firth proper prior so a SEPARATING fit gets finite, bounded
     /// curvature instead of drifting to ±∞.
