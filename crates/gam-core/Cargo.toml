@@ -23,4 +23,8 @@ path = "src/lib.rs"
 [lints.rust]
 warnings = "deny"
 
+# Pinned to the root crate so the shared Cargo.lock resolves a single copy.
 [dependencies]
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
