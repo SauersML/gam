@@ -19,7 +19,7 @@ pub(crate) use gam::estimate::{
     AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus,
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
     ParametricTermSummary, PosteriorMeanOptions, PredictInput, SmoothTermSummary, UnifiedFitResult,
-    compute_continuous_smoothness_order, fit_gam, optimize_external_design, predict_gam,
+    compute_continuous_smoothness_order, fit_gam, optimize_external_design,
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
 
@@ -77,11 +77,9 @@ pub(crate) use gam::inference::model_payload_builders::{
     assemble_transformation_normal_payload,
 };
 
-pub(crate) use gam::inference::predict::input::build_predict_input_for_model;
+pub(crate) use gam_predict::input::build_predict_input_for_model;
 
-pub(crate) use gam::inference::predict::linalg::{
-    PredictionCovarianceBackend, rowwise_local_covariances,
-};
+pub(crate) use gam_predict::linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 
 pub(crate) use gam::inference::smooth_test::{SmoothTestInput, wood_smooth_test};
 
@@ -89,13 +87,12 @@ pub(crate) use gam::matrix::{DesignMatrix, SymmetricMatrix};
 
 pub(crate) use gam::mixture_link::state_fromspec;
 
-pub(crate) use gam::predict::{
-    PredictableModel, predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
+pub(crate) use gam_predict::{
+    PredictableModel, predict_gam, predict_gam_posterior_meanwith_backend,
+    predict_gamwith_uncertainty,
 };
 
 pub(crate) use gam::probability::{normal_cdf, standard_normal_quantile};
-
-pub(crate) use gam::report;
 
 pub(crate) use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
@@ -213,6 +210,7 @@ mod model_build;
 mod model_summary;
 #[path = "main/prediction_csv.rs"]
 mod prediction_csv;
+mod report;
 #[path = "main/run_diagnose.rs"]
 mod run_diagnose;
 #[path = "main/run_fit.rs"]
@@ -326,5 +324,5 @@ fn run() -> CliResult<()> {
 }
 
 #[cfg(test)]
-#[path = "../tests/src_modules/misc/cli_tests.rs"]
+#[path = "../../../tests/src_modules/misc/cli_tests.rs"]
 mod cli_tests;
