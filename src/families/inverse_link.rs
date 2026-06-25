@@ -1,8 +1,8 @@
 /// Apply a closed-form inverse link element-wise from a string tag.
 ///
 /// Kept as string-dispatched (rather than routed through the canonical
-/// `InverseLink` enum) because the two callers — `inference::eta_bands`
-/// and `inference::posterior_bands` — are reached only through the
+/// `InverseLink` enum) because the two callers for eta and posterior bands
+/// are reached only through the
 /// Python FFI (`crates/gam-pyffi`), which hands in `family_kind` as a
 /// `&str` carrying the family metadata produced on the Python side.
 /// No `InverseLink` value is in scope at those entry points; constructing

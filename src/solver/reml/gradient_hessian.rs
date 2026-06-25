@@ -2197,7 +2197,8 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         n_ext: usize,
     ) -> Result<TkCorrectionTerms, EstimationError> {
-        use crate::inference::hmc::{
+        use crate::inference as inference_root;
+        use inference_root::hmc_io::{
             block_sampled_marginal_correction, laplace_directional_cubic_diagnostic,
             laplace_trustworthiness_from_skewness,
         };

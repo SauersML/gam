@@ -1629,9 +1629,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 && precision.nrows() == precision.ncols()
                 && joint_mode.iter().all(|v| v.is_finite())
             {
-                let sampling_config =
-                    crate::inference::hmc::NutsConfig::for_dimension(joint_mode.len());
-                match crate::inference::hmc::sample_gaussian_mode_posterior(
+                use crate::inference as inference_root;
+                use inference_root::hmc_io as engine_hmc;
+
+                let sampling_config = engine_hmc::NutsConfig::for_dimension(joint_mode.len());
+                match engine_hmc::sample_gaussian_mode_posterior(
                     joint_mode.view(),
                     precision.view(),
                     &sampling_config,

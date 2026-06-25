@@ -25,7 +25,7 @@ pub(crate) use crate::construction::{
     create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
 };
 pub(crate) use crate::faer_ndarray::array2_to_matmut;
-pub(crate) use crate::inference::hmc::BlockExcessTarget;
+use crate::inference as inference_root;
 pub(crate) use crate::linalg::utils::{
     StableSolver, boundary_hit_indices, symmetric_spectrum_condition_number,
 };
@@ -41,6 +41,7 @@ pub(crate) use crate::types::{
     SasLinkState, StandardLink,
 };
 pub(crate) use gam_runtime::warm_start::Fingerprinter;
+pub(crate) use inference_root::hmc_io::BlockExcessTarget;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, s};
 pub(crate) use std::collections::{HashMap, VecDeque};
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

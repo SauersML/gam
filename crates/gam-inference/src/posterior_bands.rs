@@ -2,9 +2,9 @@ use ndarray::{Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
-use crate::families::inverse_link::{apply_inverse_link_spec_vec, apply_inverse_link_vec};
-use crate::types::InverseLink;
-use crate::util::quantile::quantile_from_sorted;
+use gam::families::inverse_link::{apply_inverse_link_spec_vec, apply_inverse_link_vec};
+use gam::types::InverseLink;
+use gam::util::quantile::quantile_from_sorted;
 
 /// Inverse-link selector for the posterior-band engine.
 ///
@@ -186,7 +186,7 @@ pub fn posterior_eta_bands_link(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::util::quantile::quantile_from_sorted;
+    use gam::util::quantile::quantile_from_sorted;
     use ndarray::Array2;
 
     /// Parity / regression test pinning the *single* posterior eta-band
@@ -352,10 +352,10 @@ mod tests {
     ///      draws, not SAS inverse-link transforms of eta quantiles.
     #[test]
     fn spec_path_produces_finite_response_bands_for_parameterized_sas_link() {
-        use crate::solver::mixture_link::inverse_link_mu_d1_for_inverse_link;
-        use crate::types::InverseLink;
+        use gam::solver::mixture_link::inverse_link_mu_d1_for_inverse_link;
+        use gam::types::InverseLink;
 
-        let state = crate::solver::mixture_link::sas_link_state_from_raw(0.7, -0.4)
+        let state = gam::solver::mixture_link::sas_link_state_from_raw(0.7, -0.4)
             .expect("valid SAS link state");
         let link = InverseLink::Sas(state);
 
@@ -376,7 +376,7 @@ mod tests {
         let alpha = (1.0 - level) / 2.0;
 
         // The bare string tag has no SAS state and refuses outright.
-        assert!(crate::families::inverse_link::apply_inverse_link_vec(&[0.0_f64], "sas").is_err());
+        assert!(gam::families::inverse_link::apply_inverse_link_vec(&[0.0_f64], "sas").is_err());
 
         let selector = LinkSelector::Spec(&link);
         let (eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper) =

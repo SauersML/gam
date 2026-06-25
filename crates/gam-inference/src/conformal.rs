@@ -37,8 +37,8 @@
 //! heteroscedastic `s_i` it is conformalized scale regression.
 //!
 //! CRITICAL: this uses the EXACT k-th order statistic from
-//! [`crate::util::quantile::order_statistic`]. It deliberately does NOT use
-//! the interpolating [`crate::util::quantile::quantile_from_sorted`] — linear
+//! [`gam::util::quantile::order_statistic`]. It deliberately does NOT use
+//! the interpolating [`gam::util::quantile::quantile_from_sorted`] — linear
 //! interpolation between order statistics would void the finite-sample coverage
 //! proof.
 //!
@@ -56,14 +56,14 @@
 //!   derived from the model's predict-time response-scale SE `s(x_cal_i)`.
 //!   This is
 //!   [`ConformalCalibrator::from_held_out_fold`], driven by
-//!   [`crate::inference::predict::predict_full_uncertainty_conformal`] over a
-//!   [`crate::inference::predict::ConformalCalibrationFold`]. The fold carries
+//!   [`gam_predict::predict_full_uncertainty_conformal`] over a
+//!   [`gam_predict::ConformalCalibrationFold`]. The fold carries
 //!   its own design and may be of ANY size, fully decoupled from the training
 //!   rows.
 //! * **In-sample (no held-out fold available).** When the only data are the
 //!   training set, [`ConformalCalibrator::from_fit`] uses the
 //!   first-order approximate-leave-one-out diagnostics in
-//!   [`crate::inference::alo`] to manufacture leave-one-out residuals from the
+//!   [`gam::inference::alo`] to manufacture leave-one-out residuals from the
 //!   training rows. This is a calibrated heuristic: it inherits the split
 //!   conformal finite-sample guarantee only to the extent that the approximate
 //!   ALO scores match true leave-one-out exchangeable scores; there is no
@@ -71,7 +71,7 @@
 //!
 //! Either way the predict path consumes `q̂` through the opt-in
 //! `conformal_level` field on
-//! [`crate::inference::predict::PredictUncertaintyOptions`], which calls
+//! [`gam_predict::PredictUncertaintyOptions`], which calls
 //! [`ConformalCalibrator::apply_to_uncertainty_result`] to overwrite the
 //! model-based response-scale bounds with the conformal ones.
 //!
@@ -98,14 +98,14 @@
 //! about `Y` directly rather than relying on a delta-method linearization that
 //! the coverage proof does not need.
 
-use crate::estimate::{EstimationError, UnifiedFitResult};
-use crate::families::family_runtime::FamilyStrategy;
-use crate::families::family_runtime::strategy_for_spec;
-use crate::inference::alo::compute_alo_diagnostics_from_unified;
-use crate::inference::predict::PredictUncertaintyResult;
-use crate::inference::predict::interval_policy::ResponseBounds;
-use crate::types::{LikelihoodSpec, LinkFunction};
-use crate::util::quantile::order_statistic;
+use gam::estimate::{EstimationError, UnifiedFitResult};
+use gam::families::family_runtime::FamilyStrategy;
+use gam::families::family_runtime::strategy_for_spec;
+use gam::inference::alo::compute_alo_diagnostics_from_unified;
+use gam::types::{LikelihoodSpec, LinkFunction};
+use gam::util::quantile::order_statistic;
+use gam_predict::PredictUncertaintyResult;
+use gam_predict::interval_policy::ResponseBounds;
 use ndarray::{Array1, Array2, ArrayView1};
 
 fn effective_scale(scale: f64, idx: usize, role: &str) -> Result<f64, EstimationError> {
