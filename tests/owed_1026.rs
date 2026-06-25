@@ -36,8 +36,8 @@ use gam::solver::arrow_schur::{
 };
 use gam::terms::latent::LatentManifold;
 use gam::terms::{
-    AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind, SaeBasisEvaluator,
-    SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
+    ArdSharing, AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
+    SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
 };
 
 const M: usize = 3; // periodic basis: [const, sin, cos]
@@ -515,5 +515,81 @@ fn matrix_free_pcg_curvature_floor_is_noop_on_healthy_system_1026() {
             (a - b).abs() <= 1e-12 * (1.0 + a.abs().max(b.abs())),
             "healthy-system Δβ must match with/without the floor: {a} vs {b}"
         );
+    }
+}
+
+/// #1026 — shared-hyperparameter ARD at large K. The OUTER REML optimizer
+/// searches over the flat `to_flat()` coordinate vector, so its dimension is
+/// what makes a large-K fit tractable or not.
+///
+/// Per-atom ARD (the small/moderate-K default) gives one independent outer
+/// coordinate per atom per axis: `2 + Σ_k d_k`. At K = 32_768 1-D atoms that is
+/// 32_770 outer hyperparameters, each outer eval refitting the whole dictionary
+/// — intractable for a generic outer optimizer. The shared mode collapses ARD
+/// to one strength per intrinsic axis (`max_d`), broadcast to every atom, so the
+/// flat vector is a CONSTANT `2 + max_d` regardless of K.
+///
+/// This gate pins both regimes: per-atom keeps the historical `2 + Σ d_k` count
+/// (so existing fits are unchanged), and shared is O(1) in K. It also checks the
+/// broadcast round-trip: `from_flat` rebuilds the full per-atom precision table
+/// the inner solve consumes, with every atom sharing the per-axis strength.
+#[test]
+fn shared_ard_collapses_outer_param_count_at_large_k() {
+    // d=1 atoms (the worst case: one ARD axis per atom).
+    let d_per_atom = 1usize;
+    for &k in &[2usize, 32usize, 1000usize, 32_768usize] {
+        let log_ard: Vec<ndarray::Array1<f64>> =
+            (0..k).map(|_| ndarray::Array1::<f64>::zeros(d_per_atom)).collect();
+
+        let per_atom = SaeManifoldRho::new(-0.5, -0.5, log_ard.clone());
+        assert_eq!(per_atom.ard_sharing, ArdSharing::PerAtom);
+        // Per-atom: 2 + Σ_k d_k = 2 + K (d=1). This is exactly the historical
+        // layout — existing small-K fits keep their parameterization.
+        assert_eq!(
+            per_atom.to_flat().len(),
+            2 + k * d_per_atom,
+            "per-atom ARD must keep 2 + Σ d_k outer coords (K={k})"
+        );
+
+        let shared = SaeManifoldRho::new_shared_ard(-0.5, -0.5, log_ard.clone());
+        assert_eq!(shared.ard_sharing, ArdSharing::Shared);
+        // Shared: a CONSTANT 2 + max_d outer coords, independent of K.
+        assert_eq!(
+            shared.to_flat().len(),
+            2 + d_per_atom,
+            "shared ARD must be O(1) in K (got K={k})"
+        );
+    }
+
+    // Round-trip: shared flat broadcasts back to a full per-atom table, every
+    // atom carrying the shared per-axis strength, preserving heterogeneous d_k.
+    let log_ard = vec![
+        ndarray::Array1::<f64>::zeros(2), // a 2-axis atom
+        ndarray::Array1::<f64>::zeros(1), // a 1-axis atom
+        ndarray::Array1::<f64>::zeros(2), // another 2-axis atom
+    ];
+    let shared = SaeManifoldRho::new_shared_ard(0.0, 0.0, log_ard);
+    let flat = shared.to_flat();
+    // max_d = 2 → 2 + 2 = 4 outer coords.
+    assert_eq!(flat.len(), 4);
+
+    // Drive the two shared per-axis strengths to distinct values and broadcast.
+    let mut moved = flat.clone();
+    moved[2] = 1.5; // axis-0 shared log-precision
+    moved[3] = -2.5; // axis-1 shared log-precision
+    let rebuilt = shared.from_flat(moved.view());
+    assert_eq!(rebuilt.ard_sharing, ArdSharing::Shared);
+    // Every atom that owns axis 0 sees 1.5; every atom owning axis 1 sees -2.5;
+    // the 1-axis atom keeps its single axis.
+    assert_eq!(rebuilt.log_ard.len(), 3);
+    assert_eq!(rebuilt.log_ard[0].as_slice().unwrap(), &[1.5, -2.5]);
+    assert_eq!(rebuilt.log_ard[1].as_slice().unwrap(), &[1.5]);
+    assert_eq!(rebuilt.log_ard[2].as_slice().unwrap(), &[1.5, -2.5]);
+
+    // to_flat is the exact inverse of the broadcast (read-back is exact when the
+    // table is uniform across owners, which the broadcast guarantees).
+    let reflat = rebuilt.to_flat();
+    for (a, b) in moved.iter().zip(reflat.iter()) {
+        assert!((a - b).abs() <= 1e-12, "shared ARD round-trip must be exact: {a} vs {b}");
     }
 }

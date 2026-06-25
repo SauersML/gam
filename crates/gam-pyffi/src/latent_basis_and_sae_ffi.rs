@@ -1643,6 +1643,21 @@ const SAE_SPHERE_BASIS_SIZE: usize = 7;
 /// [`gam::terms::sae::manifold::SaeManifoldTerm::seed_coords_by_decoder_projection`].
 const SAE_OOS_PROJECTION_GRID_RESOLUTION: usize = 256;
 
+/// #1026 — atom-count threshold at/above which per-atom ARD is collapsed to a
+/// CONSTANT number of SHARED outer hyperparameters (one ARD strength per
+/// intrinsic axis, broadcast to all atoms) instead of one-per-atom-per-axis.
+///
+/// Below this, the historical per-atom ARD is unchanged so existing small /
+/// moderate-K fits, tests, and quality runs do not regress. The threshold is
+/// set well above the K of every existing test fixture (which run at K ≤ a few
+/// dozen) and below the large-K regime (K in the hundreds–thousands) where the
+/// `2 + Σ_k d_k` outer-hyperparameter explosion makes the generic outer
+/// optimizer intractable. Shared ARD remains a principled REML
+/// reparameterization (a single shared smoothing parameter tying the replicate
+/// per-atom ARD terms), so the large-K fit is well-posed, just lower-dimensional
+/// in the outer search.
+const SAE_SHARED_ARD_K_THRESHOLD: usize = 256;
+
 fn seed_oos_softmax_logits_from_projection_residuals(
     term: &mut gam::terms::sae::manifold::SaeManifoldTerm,
     target: ArrayView2<'_, f64>,
@@ -2581,9 +2596,23 @@ fn sae_manifold_fit_inner<'py>(
     let seed_dispersion = base_term
         .seed_reconstruction_dispersion(z_view)
         .map_err(py_value_error)?;
-    let init_rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard)
-        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
-        .map_err(py_value_error)?;
+    // #1026 — at large K, per-atom ARD makes the OUTER optimizer search
+    // `2 + Σ_k d_k` hyperparameters (e.g. ~32 770 at K = 32 768 1-D atoms),
+    // each eval refitting the whole dictionary — intractable. Above the
+    // `SAE_SHARED_ARD_K_THRESHOLD` collapse the per-atom ARD to a CONSTANT
+    // `2 + max_d` SHARED hyperparameters (one ARD strength per intrinsic axis,
+    // broadcast to every atom). Below the threshold the historical per-atom ARD
+    // is unchanged, so existing small/moderate-K fits, tests, and quality runs
+    // are bit-for-bit identical. The inner per-atom precision table is unchanged
+    // in both modes; only the outer search dimension differs.
+    let use_shared_ard = native_ard_enabled && k_atoms >= SAE_SHARED_ARD_K_THRESHOLD;
+    let init_rho = if use_shared_ard {
+        SaeManifoldRho::new_shared_ard(sparsity_strength.ln(), smoothness.ln(), log_ard)
+    } else {
+        SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard)
+    }
+    .seed_scaled_by_dispersion_for_assignment(seed_dispersion, mode)
+    .map_err(py_value_error)?;
     let init_rho_flat = init_rho.to_flat();
     let n_params = init_rho_flat.len();
     // Whether an isometry gauge penalty is installed on this fit. Read here,
