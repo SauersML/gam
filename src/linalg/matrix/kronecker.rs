@@ -90,23 +90,6 @@ impl TensorProductDesignOperator {
         })
     }
 
-    /// Materialize the full Kronecker row for observation `row`.
-    /// Only used by fallback paths (quadratic_form_diag, row_chunk);
-    /// the hot-path apply/apply_transpose use sequential contraction instead.
-    fn row_values(&self, row: usize) -> Vec<f64> {
-        let mut values = vec![1.0_f64];
-        for marginal in &self.marginals {
-            let q = marginal.ncols();
-            let mut next = vec![0.0_f64; values.len() * q];
-            for (prefix_idx, &prefix) in values.iter().enumerate() {
-                for col in 0..q {
-                    next[prefix_idx * q + col] = prefix * marginal[[row, col]];
-                }
-            }
-            values = next;
-        }
-        values
-    }
 
     /// Compute Xβ via column-wise BLAS matvecs across all n observations.
     ///
@@ -471,9 +454,10 @@ impl DenseDesignOperator for TensorProductDesignOperator {
         }
         // Reuse two scratch buffers across all rows in the chunk instead of
         // allocating a fresh `Vec` per row (and a fresh `next` per marginal
-        // per row) inside `row_values`. The Khatri-Rao contraction is written
-        // straight into the contiguous `out` row, bit-identically: same
-        // `prefix * marginal[[row, col]]` products in the same order.
+        // per row). The Khatri-Rao contraction is written straight into the
+        // contiguous `out` row, bit-identically: the same
+        // `prefix * marginal[[row, col]]` products in the same order as the
+        // sequential per-row materialization it replaces.
         let mut cur = Vec::<f64>::with_capacity(self.total_cols);
         let mut next = Vec::<f64>::with_capacity(self.total_cols);
         for (local_row, global_row) in rows.enumerate() {
