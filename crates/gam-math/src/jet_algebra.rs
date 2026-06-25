@@ -80,7 +80,7 @@ where
 /// summed output coefficient. Blocks of order ≥ `derivs.len()` are skipped
 /// (their `f^{(r)}` is beyond the truncation), matching both legacy paths.
 #[inline]
-pub(crate) fn faa_di_bruno<F>(positions: &[usize], derivs: &[f64], mut inner: F) -> f64
+pub fn faa_di_bruno<F>(positions: &[usize], derivs: &[f64], mut inner: F) -> f64
 where
     F: FnMut(&[usize]) -> f64,
 {

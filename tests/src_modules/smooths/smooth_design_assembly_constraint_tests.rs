@@ -50,7 +50,7 @@ fn superseded_fit_options_skip_only_rho_posterior_inference() {
 }
 
 fn structural_shape_hex(spec: &TermCollectionSpec) -> String {
-    let mut h = crate::warm_start::Fingerprinter::new();
+    let mut h = gam_runtime::warm_start::Fingerprinter::new();
     spec.write_structural_shape_hash(&mut h);
     h.finish_hex()
 }

@@ -612,13 +612,13 @@ fn bernoulli_flex_hvp_cache_matches_uncached_path_small_case() {
         row_contexts: cached.row_contexts.clone(),
         row_cell_moments: None,
         cell_family_forest: None,
-        row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
-        row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
+        row_cell_moments_d15: gam_runtime::resource::RayonSafeOnce::new(),
+        row_cell_moments_d21: gam_runtime::resource::RayonSafeOnce::new(),
         row_primary_hessians: RowPrimaryEvalCache::Empty,
-        rigid_third_full: crate::resource::RayonSafeOnce::new(),
-        rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
-        flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
-        flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
+        rigid_third_full: gam_runtime::resource::RayonSafeOnce::new(),
+        rigid_fourth_full: gam_runtime::resource::RayonSafeOnce::new(),
+        flex_axis_third_tensors: gam_runtime::resource::RayonSafeOnce::new(),
+        flex_axis_fourth_tensors: gam_runtime::resource::RayonSafeOnce::new(),
         full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let direction =
@@ -686,18 +686,18 @@ fn bernoulli_flex_tiled_hvp_cache_matches_host_cache_small_case() {
         row_contexts: host_cache.row_contexts.clone(),
         row_cell_moments: host_cache.row_cell_moments.clone(),
         cell_family_forest: None,
-        row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
-        row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
+        row_cell_moments_d15: gam_runtime::resource::RayonSafeOnce::new(),
+        row_cell_moments_d21: gam_runtime::resource::RayonSafeOnce::new(),
         row_primary_hessians: RowPrimaryEvalCache::Tiled(RowPrimaryEvalTiles::new(
             family.y.len(),
             r,
             5,
             tiles,
         )),
-        rigid_third_full: crate::resource::RayonSafeOnce::new(),
-        rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
-        flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
-        flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
+        rigid_third_full: gam_runtime::resource::RayonSafeOnce::new(),
+        rigid_fourth_full: gam_runtime::resource::RayonSafeOnce::new(),
+        flex_axis_third_tensors: gam_runtime::resource::RayonSafeOnce::new(),
+        flex_axis_fourth_tensors: gam_runtime::resource::RayonSafeOnce::new(),
         full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let direction =
@@ -774,13 +774,13 @@ fn bernoulli_flex_hvp_cache_timing_large_scale_shape_pattern() {
         row_contexts: cached.row_contexts.clone(),
         row_cell_moments: None,
         cell_family_forest: None,
-        row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
-        row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
+        row_cell_moments_d15: gam_runtime::resource::RayonSafeOnce::new(),
+        row_cell_moments_d21: gam_runtime::resource::RayonSafeOnce::new(),
         row_primary_hessians: RowPrimaryEvalCache::Empty,
-        rigid_third_full: crate::resource::RayonSafeOnce::new(),
-        rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
-        flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
-        flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
+        rigid_third_full: gam_runtime::resource::RayonSafeOnce::new(),
+        rigid_fourth_full: gam_runtime::resource::RayonSafeOnce::new(),
+        flex_axis_third_tensors: gam_runtime::resource::RayonSafeOnce::new(),
+        flex_axis_fourth_tensors: gam_runtime::resource::RayonSafeOnce::new(),
         full_data_outer_rows: std::sync::OnceLock::new(),
     };
     let directions: Vec<_> = (0..4)
@@ -2131,7 +2131,7 @@ struct BernoulliRigidNllProgram {
     block_states: Vec<ParameterBlockState>,
 }
 
-impl crate::families::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
+impl gam_math::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
     fn n_rows(&self) -> usize {
         self.family.y.len()
     }
@@ -2143,8 +2143,8 @@ impl crate::families::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
     fn row_nll(
         &self,
         row: usize,
-        p: &[crate::families::jet_tower::Tower4<2>; 2],
-    ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
+        p: &[gam_math::jet_tower::Tower4<2>; 2],
+    ) -> Result<gam_math::jet_tower::Tower4<2>, String> {
         let y = self.family.y[row];
         let w = self.family.weights[row];
         let z = self.family.z[row];
@@ -2181,7 +2181,7 @@ impl crate::families::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
 /// is CI-verified channel-by-channel against the one-expression truth.
 #[test]
 fn bernoulli_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
-    use crate::families::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
+    use gam_math::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
     use crate::families::row_kernel::RowKernel;
 
     let n = 6usize;

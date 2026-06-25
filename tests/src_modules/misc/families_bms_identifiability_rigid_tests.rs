@@ -80,7 +80,7 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
         base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
         score_warp: None,
         link_dev: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(1024)),
         cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
         intercept_warm_starts: None,
@@ -7036,7 +7036,7 @@ struct EmpiricalRigidNllProgram {
     grid_w: Vec<f64>,
 }
 
-impl crate::families::jet_tower::RowNllProgram<2> for EmpiricalRigidNllProgram {
+impl gam_math::jet_tower::RowNllProgram<2> for EmpiricalRigidNllProgram {
     fn n_rows(&self) -> usize {
         self.a_root.len()
     }
@@ -7049,9 +7049,9 @@ impl crate::families::jet_tower::RowNllProgram<2> for EmpiricalRigidNllProgram {
     fn row_nll(
         &self,
         row: usize,
-        p: &[crate::families::jet_tower::Tower4<2>; 2],
-    ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
-        use crate::families::jet_tower::Tower4;
+        p: &[gam_math::jet_tower::Tower4<2>; 2],
+    ) -> Result<gam_math::jet_tower::Tower4<2>, String> {
+        use gam_math::jet_tower::Tower4;
         // p[0] is the seeded m-jet, p[1] the seeded g-jet. The marginal link
         // value μ(m) and its m-derivatives enter as a constant-in-g jet seeded
         // from the link map (μ depends only on m = primary 0).
@@ -7114,7 +7114,7 @@ impl crate::families::jet_tower::RowNllProgram<2> for EmpiricalRigidNllProgram {
 
 #[test]
 fn empirical_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
-    use crate::families::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
+    use gam_math::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
 
     let (family, grid, marginal_etas, slopes) = empirical_rigid_fd_fixture();
     let s = family.probit_frailty_scale();
