@@ -330,6 +330,38 @@ pub fn sae_row_jets_softmax(
     sae_row_jets_cpu_softmax(rows, k, p, inv_tau)
 }
 
+/// Contract the per-row reconstruction jet channels into the Gauss-Newton data
+/// curvature the arrow-Schur logdet consumer factorises:
+/// `H_tt[a][b] = Σ_c first[a][c]·first[b][c]` (the `⟨J_a, J_b⟩` block #932
+/// documents at `construction.rs:7588`). Returns one `K×K` row-major slab per
+/// row, flattened `[n_rows * K * K]` — exactly the `row_hessian_slabs` layout the
+/// resident workspace ([`crate::gpu::kernels::sae_resident::DeviceResidentArrowSlabs`])
+/// uploads, so a production resident bridge can feed these directly.
+///
+/// This is the bit-exact CPU contraction of the channels [`sae_row_jets_softmax`]
+/// produces (device or CPU); it is the single missing step between the proven
+/// row-jet primitive and the slab consumers, and is GPU-independent (pure
+/// reduction) so it is exact by construction.
+#[must_use]
+pub fn gauss_newton_row_hessian_slabs(channels: &SaeRowJetChannels) -> Vec<f64> {
+    let (n, k, p) = (channels.n_rows, channels.k, channels.p);
+    let mut slabs = vec![0.0_f64; n * k * k];
+    for row in 0..n {
+        let f = &channels.first[row * k * p..(row + 1) * k * p];
+        let s = &mut slabs[row * k * k..(row + 1) * k * k];
+        for a in 0..k {
+            for b in 0..k {
+                let mut acc = 0.0_f64;
+                for c in 0..p {
+                    acc += f[a * p + c] * f[b * p + c];
+                }
+                s[a * k + b] = acc;
+            }
+        }
+    }
+    slabs
+}
+
 #[cfg(target_os = "linux")]
 mod device {
     use super::{SaeRowJetChannels, SaeSoftmaxRowInputs, softmax_kernel_source};
@@ -531,6 +563,39 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn gauss_newton_slab_is_symmetric_psd_gram() {
+        // H_tt = Σ_c first[a][c]·first[b][c] is a Gram matrix: symmetric and PSD.
+        let k = 5;
+        let p = 7;
+        let inv_tau = 1.0 / 0.9;
+        let rows = fixture(4, k, p);
+        let ch = sae_row_jets_cpu_softmax(&rows, k, p, inv_tau);
+        let slabs = gauss_newton_row_hessian_slabs(&ch);
+        assert_eq!(slabs.len(), 4 * k * k);
+        for row in 0..4 {
+            let s = &slabs[row * k * k..(row + 1) * k * k];
+            // symmetry + matches the explicit Σ_c contraction
+            let f = &ch.first[row * k * p..(row + 1) * k * p];
+            for a in 0..k {
+                for b in 0..k {
+                    let expect: f64 = (0..p).map(|c| f[a * p + c] * f[b * p + c]).sum();
+                    assert!((s[a * k + b] - expect).abs() <= 1e-12);
+                    assert!((s[a * k + b] - s[b * k + a]).abs() <= 1e-12);
+                }
+            }
+            // PSD: vᵀHv = ‖Σ_a v_a J_a‖² ≥ 0 for a random v.
+            let v: Vec<f64> = (0..k).map(|a| ((a * 13 + 1) as f64 * 0.3).sin()).collect();
+            let mut quad = 0.0;
+            for a in 0..k {
+                for b in 0..k {
+                    quad += v[a] * s[a * k + b] * v[b];
+                }
+            }
+            assert!(quad >= -1e-12, "GN slab not PSD: vᵀHv={quad}");
         }
     }
 
