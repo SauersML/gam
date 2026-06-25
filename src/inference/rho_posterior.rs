@@ -724,14 +724,14 @@ where
     F: FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send,
 {
     let k = rho_hat.len();
-    let config = crate::inference::hmc::NutsConfig {
+    let config = crate::inference::hmc_io::NutsConfig {
         n_samples: n_samples.max(4),
         nwarmup: (n_samples / 2).max(RHO_POSTERIOR_NUTS_WARMUP_FLOOR),
         n_chains: 2,
         target_accept: 0.9,
         seed,
     };
-    let result = crate::inference::hmc::run_rho_criterion_nuts(
+    let result = crate::inference::hmc_io::run_rho_criterion_nuts(
         rho_hat.view(),
         outer_hessian.view(),
         criterion_and_grad,

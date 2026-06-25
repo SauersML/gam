@@ -1,25 +1,17 @@
+pub mod conformal;
 pub mod input;
 pub mod interval_policy;
 pub mod linalg;
 
+pub use conformal::*;
 pub use gam::inference::dispersion_cov::se_from_covariance;
-pub use gam::inference::predict_io::{BernoulliMarginalSlopePredictor, PredictInput};
+pub use gam::inference::predict_io::{
+    BernoulliMarginalSlopePredictor, PredictInput, PredictResult,
+};
 
-use gam::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
-use gam::families::bms::{EmpiricalZGrid, LatentMeasureKind};
-use gam::families::bms::{bernoulli_marginal_link_map, empirical_intercept_from_marginal};
-use gam::families::family_runtime::{
-    FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_for_spec,
-    strategy_from_fit,
-};
-use gam::families::marginal_slope_shared::{
-    ObservedDenestedCellPartials, eval_coeff4_at,
-    probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
-};
-use gam::families::survival::lognormal_kernel::FrailtySpec;
-use gam::inference::model::{
-    SavedCompiledFlexBlock, SavedLatentZNormalization, SavedLinkWiggleRuntime,
-};
+use crate::binomial_location_scale::BinomialLocationScalePredictor;
+use crate::dispersion_location_scale::DispersionLocationScalePredictor;
+use crate::gaussian_location_scale::GaussianLocationScalePredictor;
 use crate::interval_policy::{
     EtaInterval, LinearState, MeanBoundMethod, PredictPass, PredictionTransform, ResponseBounds,
     ResponseInterval, assemble_posterior_mean_bounds, predict_full_uncertainty_generic,
@@ -30,6 +22,19 @@ use crate::linalg::{
     PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows,
     rowwise_local_covariances_parallel,
 };
+use crate::standard::StandardPredictor;
+use crate::survival::SurvivalPredictor;
+use crate::transformation_normal::TransformationNormalPredictor;
+use gam::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};
+use gam::families::family_runtime::{
+    FamilyStrategy, ResolvedFamilyStrategy, strategy_for_family, strategy_for_spec,
+    strategy_from_fit,
+};
+use gam::inference::model::{
+    FittedFamily, FittedModel, PredictModelClass, SavedLinkWiggleRuntime,
+    binomial_location_scale_threshold_beta, gaussian_location_scale_mean_beta,
+    location_scale_noise_beta,
+};
 use gam::linalg::utils::predict_gam_dimension_mismatch_message;
 use gam::matrix::{DesignMatrix, SymmetricMatrix};
 use gam::mixture_link::{
@@ -38,8 +43,8 @@ use gam::mixture_link::{
 };
 use gam::probability::{
     beta_moment_matched_interval, gamma_moment_matched_interval,
-    negative_binomial_moment_matched_interval, normal_cdf, normal_pdf,
-    poisson_moment_matched_interval, standard_normal_quantile, tweedie_moment_matched_interval,
+    negative_binomial_moment_matched_interval, normal_cdf, poisson_moment_matched_interval,
+    standard_normal_quantile, tweedie_moment_matched_interval,
 };
 use gam::quadrature::QuadratureContext;
 use gam::types::{InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily};
@@ -782,14 +787,185 @@ where
     gam::quadrature::normal_expectation_2d_adaptive_result(quadctx, mu, cov, integrand)
 }
 
-pub struct PredictResult {
-    pub eta: Array1<f64>,
-    pub mean: Array1<f64>,
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  PredictableModel trait — uniform prediction interface for all model types
 // ═══════════════════════════════════════════════════════════════════════════
+
+pub trait FittedModelPredictExt {
+    fn predictor(&self) -> Option<Box<dyn PredictableModel>>;
+    fn bernoulli_marginal_slope_predictor(&self)
+    -> Result<BernoulliMarginalSlopePredictor, String>;
+    fn block_roles(&self) -> Option<Vec<BlockRole>>;
+}
+
+impl FittedModelPredictExt for FittedModel {
+    fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
+        let runtime = self.saved_prediction_runtime().ok()?;
+        match self.predict_model_class() {
+            PredictModelClass::GaussianLocationScale => {
+                let fit = self.fit_result.as_ref()?;
+                let beta_mu = gaussian_location_scale_mean_beta(fit)?;
+                let beta_noise = location_scale_noise_beta(fit)
+                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
+                let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
+                let sigma_floor = gam::families::sigma_link::LOGB_SIGMA_FLOOR * response_scale;
+                Some(Box::new(GaussianLocationScalePredictor {
+                    beta_mu,
+                    beta_noise,
+                    sigma_floor,
+                    covariance: fit.beta_covariance().cloned(),
+                    link_wiggle: runtime.link_wiggle,
+                }) as Box<dyn PredictableModel>)
+            }
+            PredictModelClass::Standard => {
+                let family = self.family_state.likelihood();
+                let link_kind = self.resolved_inverse_link().ok().flatten();
+                let fit = self.fit_result.as_ref()?;
+                let beta = if runtime.link_wiggle.is_some() {
+                    fit.block_by_role(BlockRole::Mean)?.beta.clone()
+                } else if let Some(unified) = self.unified() {
+                    StandardPredictor::from_unified(
+                        unified,
+                        family.clone(),
+                        link_kind.clone(),
+                        None,
+                    )
+                    .ok()
+                    .map(|p| p.beta)
+                    .unwrap_or_else(|| fit.beta.clone())
+                } else {
+                    fit.beta.clone()
+                };
+                let covariance = fit.beta_covariance().cloned();
+                Some(Box::new(StandardPredictor {
+                    beta,
+                    family,
+                    link_kind,
+                    covariance,
+                    link_wiggle: runtime.link_wiggle,
+                }))
+            }
+            PredictModelClass::Survival => {
+                if matches!(
+                    self.family_state,
+                    FittedFamily::Survival {
+                        survival_likelihood: Some(ref survival_likelihood),
+                        ..
+                    } if survival_likelihood == "marginal-slope"
+                ) {
+                    return None;
+                }
+                let unified = self.unified()?;
+                let inverse_link = self.resolved_inverse_link().ok().flatten().unwrap_or(
+                    gam::types::InverseLink::Standard(gam::types::StandardLink::Probit),
+                );
+                SurvivalPredictor::from_unified(unified, inverse_link)
+                    .ok()
+                    .map(|p| Box::new(p) as Box<dyn PredictableModel>)
+            }
+            PredictModelClass::BinomialLocationScale => {
+                let inverse_link = self.resolved_inverse_link().ok().flatten().unwrap_or(
+                    gam::types::InverseLink::Standard(gam::types::StandardLink::Probit),
+                );
+                let fit = self.fit_result.as_ref()?;
+                let beta_threshold = binomial_location_scale_threshold_beta(fit)?;
+                let beta_noise = location_scale_noise_beta(fit)
+                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
+                Some(Box::new(BinomialLocationScalePredictor {
+                    beta_threshold,
+                    beta_noise,
+                    covariance: fit.beta_covariance().cloned(),
+                    inverse_link,
+                    link_wiggle: runtime.link_wiggle,
+                }) as Box<dyn PredictableModel>)
+            }
+            PredictModelClass::DispersionLocationScale => {
+                let fit = self.fit_result.as_ref()?;
+                let beta_mu = gaussian_location_scale_mean_beta(fit)?;
+                let beta_noise = location_scale_noise_beta(fit)
+                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
+                let inverse_link = self.resolved_inverse_link().ok().flatten();
+                Some(Box::new(DispersionLocationScalePredictor {
+                    beta_mu,
+                    beta_noise,
+                    likelihood: self.family_state.likelihood(),
+                    inverse_link,
+                    covariance: fit.beta_covariance().cloned(),
+                }) as Box<dyn PredictableModel>)
+            }
+            PredictModelClass::BernoulliMarginalSlope => self
+                .bernoulli_marginal_slope_predictor()
+                .ok()
+                .map(|p| Box::new(p) as Box<dyn PredictableModel>),
+            PredictModelClass::TransformationNormal => {
+                let fit = self.fit_result.as_ref()?;
+                Some(Box::new(TransformationNormalPredictor {
+                    covariance: fit.beta_covariance().cloned(),
+                }) as Box<dyn PredictableModel>)
+            }
+        }
+    }
+
+    fn bernoulli_marginal_slope_predictor(
+        &self,
+    ) -> Result<BernoulliMarginalSlopePredictor, String> {
+        if !matches!(
+            self.predict_model_class(),
+            PredictModelClass::BernoulliMarginalSlope
+        ) {
+            return Err(format!(
+                "bernoulli_marginal_slope_predictor: model is not a bernoulli marginal-slope \
+                 model (class {:?})",
+                self.predict_model_class()
+            ));
+        }
+        let runtime = self
+            .saved_prediction_runtime()
+            .map_err(|err| format!("bernoulli marginal-slope predictor runtime: {err}"))?;
+        let unified = self.unified().ok_or_else(|| {
+            "bernoulli marginal-slope predictor requires a unified fit".to_string()
+        })?;
+        let payload = self.payload();
+        let z_column = payload.z_column.clone().ok_or_else(|| {
+            "bernoulli marginal-slope predictor requires a saved z column".to_string()
+        })?;
+        BernoulliMarginalSlopePredictor::from_unified(
+            unified,
+            z_column,
+            payload.latent_z_normalization.ok_or_else(|| {
+                "marginal-slope predictor requires saved latent-z normalization".to_string()
+            })?,
+            payload.latent_measure.clone().ok_or_else(|| {
+                "marginal-slope predictor requires a saved latent measure".to_string()
+            })?,
+            payload.marginal_baseline.ok_or_else(|| {
+                "marginal-slope predictor requires a saved marginal baseline".to_string()
+            })?,
+            payload.logslope_baseline.ok_or_else(|| {
+                "marginal-slope predictor requires a saved logslope baseline".to_string()
+            })?,
+            self.resolved_inverse_link()
+                .map_err(|err| format!("marginal-slope predictor inverse link: {err}"))?
+                .unwrap_or(gam::types::InverseLink::Standard(
+                    gam::types::StandardLink::Probit,
+                )),
+            self.family_state
+                .frailty()
+                .ok_or_else(|| {
+                    "marginal-slope predictor requires a saved frailty spec".to_string()
+                })?
+                .clone(),
+            runtime.score_warp,
+            runtime.link_deviation,
+            runtime.latent_z_rank_int_calibration,
+            runtime.latent_z_conditional_calibration,
+        )
+    }
+
+    fn block_roles(&self) -> Option<Vec<BlockRole>> {
+        self.predictor().map(|p| p.block_roles())
+    }
+}
 
 fn slice_predict_input(
     input: &PredictInput,
@@ -971,14 +1147,6 @@ pub mod gaussian_location_scale;
 pub mod standard;
 pub mod survival;
 pub mod transformation_normal;
-
-pub use bernoulli_marginal_slope::*;
-pub use binomial_location_scale::*;
-pub use dispersion_location_scale::*;
-pub use gaussian_location_scale::*;
-pub use standard::*;
-pub use survival::*;
-pub use transformation_normal::*;
 
 /// Compute eta standard errors from a design matrix and covariance/precision backend.
 fn eta_standard_errors_from_backend(
@@ -2619,7 +2787,7 @@ pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
     );
     let test_scale =
         predictive_standard_error(family, &result.mean, &result.mean_standard_error, fit);
-    let calibrator = gam::inference::conformal::ConformalCalibrator::from_held_out_fold(
+    let calibrator = ConformalCalibrator::from_held_out_fold(
         calibration.y,
         cal_result.mean.view(),
         cal_scale.view(),

@@ -14,6 +14,12 @@ use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use rand::{RngExt, SeedableRng};
 
+use super::hmc_io::{
+    FamilyNutsInputs, GlmFlatInputs, LinkWiggleSplineArtifacts, NutsFamily, SurvivalFlatInputs,
+    explicit_fit_hessian_for_whitening, run_link_wiggle_nuts_sampling,
+    run_nuts_sampling_flattened_family, run_survival_nuts_sampling_flattened, validate_nuts_config,
+};
+pub use super::hmc_io::{NutsConfig, NutsResult};
 use crate::basis::create_difference_penalty_matrix;
 use crate::estimate::{BlockRole, UnifiedFitResult, validate_all_finite};
 use crate::faer_ndarray::FaerCholesky;
@@ -35,11 +41,6 @@ use crate::families::survival::{
 use crate::families::wiggle::{
     append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_knots,
     split_wiggle_penalty_orders,
-};
-use crate::hmc::{
-    FamilyNutsInputs, GlmFlatInputs, LinkWiggleSplineArtifacts, NutsConfig, NutsFamily, NutsResult,
-    SurvivalFlatInputs, explicit_fit_hessian_for_whitening, run_link_wiggle_nuts_sampling,
-    run_nuts_sampling_flattened_family, run_survival_nuts_sampling_flattened, validate_nuts_config,
 };
 use crate::inference::formula_dsl::{LinkWiggleFormulaSpec, parse_formula};
 use crate::inference::model::{

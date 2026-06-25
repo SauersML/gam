@@ -103,7 +103,7 @@ pub(crate) use response_basis::{
     assert_rowwise_kronecker_dimensions, build_response_basis, response_endpoint_value_bases,
     response_floor_offsets,
 };
-pub(crate) use scop_density::*;
+pub use scop_density::*;
 pub(crate) use warm_start::*;
 
 #[cfg(test)]

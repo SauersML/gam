@@ -1,6 +1,6 @@
 use super::*;
 
-pub(crate) fn transformation_normal_pit_score(
+pub fn transformation_normal_pit_score(
     h: f64,
     lower: f64,
     upper: f64,

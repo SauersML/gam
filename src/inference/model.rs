@@ -15,11 +15,6 @@ use crate::inference::formula_dsl::{
     inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message, parse_formula,
     parse_surv_interval_response, parse_surv_response, parsed_term_column_names,
 };
-use crate::inference::predict::{
-    BernoulliMarginalSlopePredictor, BinomialLocationScalePredictor,
-    DispersionLocationScalePredictor, GaussianLocationScalePredictor, PredictableModel,
-    StandardPredictor, SurvivalPredictor,
-};
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
 use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
 use crate::types::{
@@ -1004,20 +999,20 @@ pub struct SavedPredictionRuntime {
     pub influence_absorber_width: Option<usize>,
 }
 
-fn gaussian_location_scale_mean_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
+pub fn gaussian_location_scale_mean_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
     fit.block_by_role(BlockRole::Location)
         .or_else(|| fit.block_by_role(BlockRole::Mean))
         .map(|block| block.beta.clone())
 }
 
-fn binomial_location_scale_threshold_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
+pub fn binomial_location_scale_threshold_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
     fit.block_by_role(BlockRole::Threshold)
         .or_else(|| fit.block_by_role(BlockRole::Location))
         .or_else(|| fit.block_by_role(BlockRole::Mean))
         .map(|block| block.beta.clone())
 }
 
-fn location_scale_noise_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
+pub fn location_scale_noise_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> {
     fit.block_by_role(BlockRole::Scale)
         .map(|block| block.beta.clone())
 }
@@ -3293,216 +3288,6 @@ impl FittedModel {
         }
     }
 
-    /// Build a validated predictor for the saved model shape and runtime.
-    ///
-    /// Survival callers build the time-basis design from saved metadata before
-    /// handing prediction to the same trait-level machinery.
-    pub fn predictor(&self) -> Option<Box<dyn PredictableModel>> {
-        let runtime = self.saved_prediction_runtime().ok()?;
-        match self.predict_model_class() {
-            PredictModelClass::GaussianLocationScale => {
-                let fit = self.fit_result.as_ref()?;
-                let beta_mu = gaussian_location_scale_mean_beta(fit)?;
-                let beta_noise = location_scale_noise_beta(fit)
-                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
-                // The log-σ coefficients were mapped to raw response units by
-                // shifting the intercept by `+ln(response_scale)`, which scales
-                // only the `exp(η)` term. The σ floor must be scaled separately
-                // so reconstructed σ is response-scale-equivariant (#884): use
-                // `LOGB_SIGMA_FLOOR · response_scale` (≈ 1 % of the response
-                // spread). A model fitted without standardization persists
-                // `gaussian_response_scale = 1`, recovering the raw floor.
-                let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
-                let sigma_floor = crate::families::sigma_link::LOGB_SIGMA_FLOOR * response_scale;
-                Some(Box::new(GaussianLocationScalePredictor {
-                    beta_mu,
-                    beta_noise,
-                    sigma_floor,
-                    covariance: fit.beta_covariance().cloned(),
-                    link_wiggle: runtime.link_wiggle,
-                }) as Box<dyn PredictableModel>)
-            }
-            PredictModelClass::Standard => {
-                let family = self.family_state.likelihood();
-                let link_kind = self.resolved_inverse_link().ok().flatten();
-                let fit = self.fit_result.as_ref()?;
-                let beta = if runtime.link_wiggle.is_some() {
-                    fit.block_by_role(BlockRole::Mean)?.beta.clone()
-                } else if let Some(unified) = self.unified() {
-                    StandardPredictor::from_unified(
-                        unified,
-                        family.clone(),
-                        link_kind.clone(),
-                        None,
-                    )
-                    .ok()
-                    .map(|p| p.beta)
-                    .unwrap_or_else(|| fit.beta.clone())
-                } else {
-                    fit.beta.clone()
-                };
-                let covariance = fit.beta_covariance().cloned();
-                Some(Box::new(StandardPredictor {
-                    beta,
-                    family,
-                    link_kind,
-                    covariance,
-                    link_wiggle: runtime.link_wiggle,
-                }))
-            }
-            PredictModelClass::Survival => {
-                if matches!(
-                    self.family_state,
-                    FittedFamily::Survival {
-                        survival_likelihood: Some(ref survival_likelihood),
-                        ..
-                    } if survival_likelihood == "marginal-slope"
-                ) {
-                    return None;
-                }
-                let unified = self.unified()?;
-                // Default to probit inverse link for survival models.
-                let inverse_link = self
-                    .resolved_inverse_link()
-                    .ok()
-                    .flatten()
-                    .unwrap_or(InverseLink::Standard(StandardLink::Probit));
-                SurvivalPredictor::from_unified(unified, inverse_link)
-                    .ok()
-                    .map(|p| Box::new(p) as Box<dyn PredictableModel>)
-            }
-            PredictModelClass::BinomialLocationScale => {
-                let inverse_link = self
-                    .resolved_inverse_link()
-                    .ok()
-                    .flatten()
-                    .unwrap_or(InverseLink::Standard(StandardLink::Probit));
-                let fit = self.fit_result.as_ref()?;
-                let beta_threshold = binomial_location_scale_threshold_beta(fit)?;
-                let beta_noise = location_scale_noise_beta(fit)
-                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
-                Some(Box::new(BinomialLocationScalePredictor {
-                    beta_threshold,
-                    beta_noise,
-                    covariance: fit.beta_covariance().cloned(),
-                    inverse_link,
-                    link_wiggle: runtime.link_wiggle,
-                }) as Box<dyn PredictableModel>)
-            }
-            PredictModelClass::DispersionLocationScale => {
-                let fit = self.fit_result.as_ref()?;
-                // The mean prediction routes through the family's GLM inverse
-                // link (log for NB/Gamma/Tweedie, logit for Beta); the
-                // log-precision block feeds the overdispersion / predictive-SD
-                // channel — never the binomial threshold-scale predictor.
-                let beta_mu = gaussian_location_scale_mean_beta(fit)?;
-                let beta_noise = location_scale_noise_beta(fit)
-                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
-                let inverse_link = self.resolved_inverse_link().ok().flatten();
-                Some(Box::new(DispersionLocationScalePredictor {
-                    beta_mu,
-                    beta_noise,
-                    likelihood: self.family_state.likelihood(),
-                    inverse_link,
-                    covariance: fit.beta_covariance().cloned(),
-                }) as Box<dyn PredictableModel>)
-            }
-            PredictModelClass::BernoulliMarginalSlope => {
-                let unified = self.unified()?;
-                let payload = self.payload();
-                let z_column = payload.z_column.clone()?;
-                let predictor = BernoulliMarginalSlopePredictor::from_unified(
-                    unified,
-                    z_column,
-                    payload.latent_z_normalization?,
-                    payload.latent_measure.clone()?,
-                    payload.marginal_baseline?,
-                    payload.logslope_baseline?,
-                    self.resolved_inverse_link()
-                        .ok()?
-                        .unwrap_or(InverseLink::Standard(StandardLink::Probit)),
-                    self.family_state.frailty()?.clone(),
-                    runtime.score_warp,
-                    runtime.link_deviation,
-                    runtime.latent_z_rank_int_calibration,
-                    runtime.latent_z_conditional_calibration,
-                )
-                .ok()?;
-                Some(Box::new(predictor) as Box<dyn PredictableModel>)
-            }
-            PredictModelClass::TransformationNormal => {
-                // The h values are computed in build_predict_input_for_model
-                // and stored in the offset field. The predictor is a simple
-                // identity: eta = offset, mean = offset (h is already the
-                // PIT-transformed value on the standard normal scale).
-                let fit = self.fit_result.as_ref()?;
-                Some(Box::new(super::predict::TransformationNormalPredictor {
-                    covariance: fit.beta_covariance().cloned(),
-                }) as Box<dyn PredictableModel>)
-            }
-        }
-    }
-
-    /// Concrete bernoulli marginal-slope predictor with explicit error
-    /// surfacing. `predictor()` boxes the same object behind the
-    /// `PredictableModel` trait and swallows construction failures into
-    /// `None`; the posterior predictive path (#1049) needs the concrete type
-    /// (for `final_eta_from_theta` / `theta_len`) and propagatable error
-    /// messages, so it builds the predictor here instead.
-    pub fn bernoulli_marginal_slope_predictor(
-        &self,
-    ) -> Result<BernoulliMarginalSlopePredictor, String> {
-        if !matches!(
-            self.predict_model_class(),
-            PredictModelClass::BernoulliMarginalSlope
-        ) {
-            return Err(format!(
-                "bernoulli_marginal_slope_predictor: model is not a bernoulli marginal-slope \
-                 model (class {:?})",
-                self.predict_model_class()
-            ));
-        }
-        let runtime = self
-            .saved_prediction_runtime()
-            .map_err(|err| format!("bernoulli marginal-slope predictor runtime: {err}"))?;
-        let unified = self.unified().ok_or_else(|| {
-            "bernoulli marginal-slope predictor requires a unified fit".to_string()
-        })?;
-        let payload = self.payload();
-        let z_column = payload.z_column.clone().ok_or_else(|| {
-            "bernoulli marginal-slope predictor requires a saved z column".to_string()
-        })?;
-        BernoulliMarginalSlopePredictor::from_unified(
-            unified,
-            z_column,
-            payload.latent_z_normalization.ok_or_else(|| {
-                "marginal-slope predictor requires saved latent-z normalization".to_string()
-            })?,
-            payload.latent_measure.clone().ok_or_else(|| {
-                "marginal-slope predictor requires a saved latent measure".to_string()
-            })?,
-            payload.marginal_baseline.ok_or_else(|| {
-                "marginal-slope predictor requires a saved marginal baseline".to_string()
-            })?,
-            payload.logslope_baseline.ok_or_else(|| {
-                "marginal-slope predictor requires a saved logslope baseline".to_string()
-            })?,
-            self.resolved_inverse_link()
-                .map_err(|err| format!("marginal-slope predictor inverse link: {err}"))?
-                .unwrap_or(InverseLink::Standard(StandardLink::Probit)),
-            self.family_state
-                .frailty()
-                .ok_or_else(|| {
-                    "marginal-slope predictor requires a saved frailty spec".to_string()
-                })?
-                .clone(),
-            runtime.score_warp,
-            runtime.link_deviation,
-            runtime.latent_z_rank_int_calibration,
-            runtime.latent_z_conditional_calibration,
-        )
-    }
-
     /// V∞ §5 coverage floor for the measure-jet extrapolation variance: a
     /// band level "covers" a query once its kernel mass reaches this fraction
     /// of that level's web-averaged support. Magic-by-default (no dial):
@@ -3779,13 +3564,6 @@ impl FittedModel {
             contributed = true;
         }
         Ok(contributed.then_some(total))
-    }
-
-    /// Returns the block roles for this model via the `PredictableModel` trait.
-    ///
-    /// For standard models this is `[BlockRole::Mean]`.
-    pub fn block_roles(&self) -> Option<Vec<BlockRole>> {
-        self.predictor().map(|p| p.block_roles())
     }
 
     /// Access the unified fit result, if stored.

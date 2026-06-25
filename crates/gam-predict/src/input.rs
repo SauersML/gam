@@ -3,10 +3,8 @@ use std::collections::HashMap;
 use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use gam::basis::{
-    BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense,
-};
 use crate::PredictInput;
+use gam::basis::{BasisOptions, Dense, KnotSource, create_basis, create_ispline_derivative_dense};
 use gam::estimate::BlockRole;
 use gam::families::bms::LatentMeasureKind;
 use gam::families::scale_design::{build_scale_deviation_operator, scale_transform_from_payload};

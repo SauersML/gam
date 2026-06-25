@@ -162,13 +162,13 @@ pub(crate) fn run_predict_unified(
 
     // --- Compute prediction ---
     let (eta, mean, se_opt, mean_lo, mean_hi) = if args.uncertainty {
-        let options = gam::estimate::PredictUncertaintyOptions {
+        let options = PredictUncertaintyOptions {
             confidence_level: args.level,
             covariance_mode: infer_covariance_mode(args.covariance_mode),
-            mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
+            mean_interval_method: MeanIntervalMethod::TransformEta,
             includeobservation_interval: false,
             apply_bias_correction: !args.no_bias_correction,
-            ..gam::estimate::PredictUncertaintyOptions::default()
+            ..PredictUncertaintyOptions::default()
         };
         let pred = predictor
             .predict_full_uncertainty(pred_input, &fit_for_predict, &options)
@@ -1387,13 +1387,13 @@ pub(crate) fn run_predict_survival(
                 .predict_full_uncertainty(
                     &pred_input,
                     &predictor_fit,
-                    &gam::estimate::PredictUncertaintyOptions {
+                    &PredictUncertaintyOptions {
                         confidence_level: args.level,
                         covariance_mode: infer_covariance_mode(args.covariance_mode),
-                        mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
+                        mean_interval_method: MeanIntervalMethod::TransformEta,
                         includeobservation_interval: false,
                         apply_bias_correction: !args.no_bias_correction,
-                        ..gam::estimate::PredictUncertaintyOptions::default()
+                        ..PredictUncertaintyOptions::default()
                     },
                 )
                 .map_err(|e| format!("predict_full_uncertainty failed: {e}"))?;
@@ -1530,13 +1530,13 @@ pub(crate) fn run_predict_survival(
             eta_offset_exit.view(),
             LikelihoodSpec::royston_parmar(),
             &fit_saved,
-            &gam::estimate::PredictUncertaintyOptions {
+            &PredictUncertaintyOptions {
                 confidence_level: args.level,
                 covariance_mode: infer_covariance_mode(args.covariance_mode),
-                mean_interval_method: gam::estimate::MeanIntervalMethod::TransformEta,
+                mean_interval_method: MeanIntervalMethod::TransformEta,
                 includeobservation_interval: false,
                 apply_bias_correction: !args.no_bias_correction,
-                ..gam::estimate::PredictUncertaintyOptions::default()
+                ..PredictUncertaintyOptions::default()
             },
         )
         .map_err(|e| format!("survival uncertainty prediction failed: {e}"))?;

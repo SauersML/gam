@@ -5990,9 +5990,9 @@ fn predict_columns(
             // mode (issue #398); only the reported uncertainty responds.
             let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
                 .unwrap_or(
-                gam::inference::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+                gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             );
-            let posterior_options = gam::inference::predict::PosteriorMeanOptions {
+            let posterior_options = gam_predict::PosteriorMeanOptions {
                 confidence_level: Some(confidence_level),
                 covariance_mode,
                 include_observation_interval: options.observation_interval.unwrap_or(false),
@@ -6052,16 +6052,16 @@ fn predict_columns(
             // engine's `includeobservation_interval` switch.
             let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?
                 .unwrap_or(
-                gam::inference::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+                gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
             );
             let includeobservation_interval = options.observation_interval.unwrap_or(false);
-            let uncertainty_options = gam::inference::predict::PredictUncertaintyOptions {
+            let uncertainty_options = gam_predict::PredictUncertaintyOptions {
                 confidence_level,
                 covariance_mode,
-                mean_interval_method: gam::inference::predict::MeanIntervalMethod::TransformEta,
+                mean_interval_method: gam_predict::MeanIntervalMethod::TransformEta,
                 includeobservation_interval,
                 apply_bias_correction: false,
-                ..gam::inference::predict::PredictUncertaintyOptions::default()
+                ..gam_predict::PredictUncertaintyOptions::default()
             };
             let prediction = predictor
                 .predict_full_uncertainty(&predict_input, &fit, &uncertainty_options)
@@ -6092,7 +6092,7 @@ fn predict_columns(
                 .predict_posterior_mean(
                     &predict_input,
                     &fit,
-                    &gam::inference::predict::PosteriorMeanOptions::point_only(),
+                    &gam_predict::PosteriorMeanOptions::point_only(),
                 )
                 .map_err(|err| format!("posterior-mean prediction failed: {err}"))?;
             columns.insert("linear_predictor".to_string(), prediction.eta.to_vec());
@@ -6139,7 +6139,7 @@ fn conformal_calibration_fold(
     model: &FittedModel,
     fit: &gam::solver::estimate::UnifiedFitResult,
     calibration: EncodedDataset,
-) -> Result<(gam::inference::predict::PredictInput, Array1<f64>), String> {
+) -> Result<(gam_predict::PredictInput, Array1<f64>), String> {
     if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
         return Err(format!(
             "conformal calibration currently supports only standard GAM models; got '{}'",
@@ -6224,24 +6224,24 @@ fn predict_columns_conformal(
     let family = model_likelihood_spec(model);
 
     let covariance_mode = parse_covariance_mode(options.covariance_mode.as_deref())?.unwrap_or(
-        gam::inference::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+        gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
     );
-    let uncertainty_options = gam::inference::predict::PredictUncertaintyOptions {
+    let uncertainty_options = gam_predict::PredictUncertaintyOptions {
         confidence_level: level,
         covariance_mode,
-        mean_interval_method: gam::inference::predict::MeanIntervalMethod::TransformEta,
+        mean_interval_method: gam_predict::MeanIntervalMethod::TransformEta,
         includeobservation_interval: options.observation_interval.unwrap_or(false),
         apply_bias_correction: false,
         conformal_level: Some(level),
-        ..gam::inference::predict::PredictUncertaintyOptions::default()
+        ..gam_predict::PredictUncertaintyOptions::default()
     };
 
     let (cal_input, cal_y) = conformal_calibration_fold(model, &fit, calibration)?;
-    let calibration_fold = gam::inference::predict::ConformalCalibrationFold {
+    let calibration_fold = gam_predict::ConformalCalibrationFold {
         input: cal_input,
         y: cal_y.view(),
     };
-    let prediction = gam::inference::predict::predict_full_uncertainty_conformal(
+    let prediction = gam_predict::predict_full_uncertainty_conformal(
         predictor.as_ref(),
         &predict_input,
         &fit,

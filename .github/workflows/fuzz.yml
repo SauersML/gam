@@ -34,7 +34,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build release binary
-        run: cargo build --release --bin gam
+        run: cargo build --release -p gam-cli
 
       - name: Set up Python
         uses: actions/setup-python@v5

@@ -141,7 +141,7 @@ jobs:
             python3 -m pip install --upgrade pip setuptools wheel
             python3 -m pip install --target bench/runtime/pydeps numpy pandas scikit-learn lifelines scikit-survival xgboost matplotlib
           fi
-          cargo build --release --bin gam
+          cargo build --release -p gam-cli
           cp target/release/gam bench/runtime/gam
           chmod +x bench/runtime/gam
           # Build the gamfit._rust PyO3 extension that bench/run_suite.py

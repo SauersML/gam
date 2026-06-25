@@ -148,7 +148,7 @@ pub(crate) fn back_substitution_lower_transpose<'l, 'y>(
 /// retained here because the sampler tolerates rank-deficient conditional
 /// precisions by zeroing the corresponding draw component instead of emitting a
 /// non-finite value.
-pub(crate) fn back_substitution_lower_transpose_guarded_into(
+pub fn back_substitution_lower_transpose_guarded_into(
     l: &Array2<f64>,
     rhs: &Array1<f64>,
     out: &mut Array1<f64>,

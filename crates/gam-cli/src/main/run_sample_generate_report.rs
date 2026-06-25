@@ -1013,7 +1013,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
         for sp in &input.smooth_plots {
             cli_out!(
                 "{}",
-                crate::report::sparkline::render_smooth_line(&sp.name, &sp.x, &sp.y)
+                gam::report::sparkline::render_smooth_line(&sp.name, &sp.x, &sp.y)
             );
         }
     }

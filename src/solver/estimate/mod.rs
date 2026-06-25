@@ -29,7 +29,6 @@ use std::time::Instant;
 // Crate-level imports
 use crate::construction::{CanonicalPenalty, ReparamInvariant};
 use crate::inference::diagnostics::should_emit_h_min_eig_diag;
-use crate::inference::dispersion_cov::se_from_covariance;
 use crate::linalg::utils::{
     KahanSum, add_relative_diag_ridge, matrix_inversewith_regularization, row_mismatch_message,
 };
@@ -61,7 +60,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 #[path = "../reml/mod.rs"]
-pub(crate) mod reml;
+pub mod reml;
 
 pub use reml::reml_outer_engine::PenaltyCoordinate;
 
@@ -75,6 +74,7 @@ mod prefit;
 pub(crate) mod smoothing_correction;
 mod summary;
 
+pub(crate) use crate::model_types::result_types::dispersion_from_likelihood;
 pub use crate::model_types::{
     AdaptiveRegularizationOptions, BlockRole, FitArtifacts, FitGeometry, FitInference, FitOptions,
     FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts, ensure_finite_scalar,

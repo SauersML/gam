@@ -99,7 +99,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo build --release --bin gam
+          cargo build --release -p gam-cli
           ls -l target/release/gam
 
       - name: Build gamfit._rust Python extension

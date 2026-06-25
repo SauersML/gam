@@ -71,7 +71,7 @@ pub(crate) use gam::geometry::poincare::{
 
 pub(crate) use gam::geometry::simplex::{closure as simplex_closure, simplex_frechet_mean};
 
-pub(crate) use gam::inference::hmc::{NutsConfig, NutsResult};
+pub(crate) use gam::sample::{NutsConfig, NutsResult};
 
 pub(crate) use gam::data::{
     ColumnKindTag, DataSchema, EncodedDataset, SchemaColumn, UnseenCategoryPolicy,
@@ -97,9 +97,10 @@ pub(crate) use gam::inference::model_payload_builders::{
     assemble_transformation_normal_payload,
 };
 
-pub(crate) use gam::inference::posterior_bands::{self, PosteriorPredictBandsPayload};
+pub(crate) use gam_inference::posterior_bands::{self, PosteriorPredictBandsPayload};
 
-pub(crate) use gam::inference::predict::input::build_predict_input_for_model;
+pub(crate) use gam_predict::FittedModelPredictExt;
+pub(crate) use gam_predict::input::build_predict_input_for_model;
 
 pub(crate) use gam::geometry::sinkhorn_barycenter::{
     circular_cost as sinkhorn_circular_cost_impl, euclidean_cost as sinkhorn_euclidean_cost_impl,

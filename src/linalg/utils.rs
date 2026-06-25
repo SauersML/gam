@@ -33,7 +33,7 @@ pub(crate) const fn splitmix64(state: &mut u64) -> u64 {
 /// returns a mixed value without persisting state. Equivalent to
 /// `{ let mut s = x; splitmix64(&mut s) }`.
 #[inline]
-pub(crate) const fn splitmix64_hash(x: u64) -> u64 {
+pub const fn splitmix64_hash(x: u64) -> u64 {
     let mut state = x;
     splitmix64(&mut state)
 }
@@ -98,7 +98,7 @@ pub(crate) fn trace_of_product(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -
 /// for large negative `x`. Previously duplicated as `stable_softplus` in
 /// `terms/smooth.rs` and `families/gamlss.rs`.
 #[inline]
-pub(crate) fn stable_softplus(x: f64) -> f64 {
+pub fn stable_softplus(x: f64) -> f64 {
     if x > 0.0 {
         x + (-x).exp().ln_1p()
     } else {
@@ -117,7 +117,7 @@ pub(crate) fn stable_softplus(x: f64) -> f64 {
 /// `terms/analytic_penalties.rs`, `sigmoid_stable` in `inference/hmc.rs`, and
 /// `sigmoid_scalar` in `terms/sae/manifold/mod.rs` — all three were bit-identical.
 #[inline]
-pub(crate) fn stable_logistic(x: f64) -> f64 {
+pub fn stable_logistic(x: f64) -> f64 {
     if x >= 0.0 {
         1.0 / (1.0 + (-x).exp())
     } else {
@@ -141,7 +141,7 @@ where
 /// multiple call sites across `solver/pirls.rs`, `inference/predict_input.rs`,
 /// and `terms/construction.rs`. Returns `0.0` for an empty iterator.
 #[inline]
-pub(crate) fn inf_norm<I: IntoIterator<Item = f64>>(values: I) -> f64 {
+pub fn inf_norm<I: IntoIterator<Item = f64>>(values: I) -> f64 {
     values.into_iter().fold(0.0_f64, |acc, x| acc.max(x.abs()))
 }
 
@@ -445,7 +445,7 @@ pub(crate) fn row_mismatch_message(
     }
 }
 
-pub(crate) fn predict_gam_dimension_mismatch_message(
+pub fn predict_gam_dimension_mismatch_message(
     x_rows: usize,
     x_cols: usize,
     beta_len: usize,

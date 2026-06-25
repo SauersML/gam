@@ -20,12 +20,12 @@
 //! delegates the policy to the helpers below, so interval/posterior-mean
 //! behaviour cannot drift between families.
 
-use gam::estimate::{EstimationError, UnifiedFitResult};
 use crate::{
     InferenceCovarianceMode, PosteriorMeanOptions, PredictInput, PredictPosteriorMeanResult,
     PredictResult, PredictUncertaintyOptions, PredictUncertaintyResult, PredictionWithSE,
     family_observation_band,
 };
+use gam::estimate::{EstimationError, UnifiedFitResult};
 use gam::types::ResponseFamily;
 use ndarray::Array1;
 

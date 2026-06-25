@@ -18,7 +18,7 @@ pub(crate) use gam::alo::compute_alo_diagnostics_from_fit;
 pub(crate) use gam::estimate::{
     AdaptiveRegularizationOptions, BlockRole, ContinuousSmoothnessOrderStatus,
     ExternalOptimOptions, ExternalOptimResult, FitOptions, FittedLinkState, ModelSummary,
-    ParametricTermSummary, PosteriorMeanOptions, PredictInput, SmoothTermSummary, UnifiedFitResult,
+    ParametricTermSummary, SmoothTermSummary, UnifiedFitResult,
     compute_continuous_smoothness_order, fit_gam, optimize_external_design,
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
 };
@@ -41,7 +41,7 @@ pub(crate) use gam::gamlss::{
 
 pub(crate) use gam::generative::{generativespec_from_predict, sampleobservation_replicates};
 
-pub(crate) use gam::hmc::NutsConfig;
+pub(crate) use gam::sample::NutsConfig;
 
 pub(crate) use gam::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy,
@@ -88,9 +88,12 @@ pub(crate) use gam::matrix::{DesignMatrix, SymmetricMatrix};
 pub(crate) use gam::mixture_link::state_fromspec;
 
 pub(crate) use gam_predict::{
-    PredictableModel, predict_gam, predict_gam_posterior_meanwith_backend,
-    predict_gamwith_uncertainty,
+    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod, PosteriorMeanOptions,
+    PredictInput, PredictUncertaintyOptions, PredictableModel, predict_gam,
+    predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
+
+pub(crate) use gam::report;
 
 pub(crate) use gam::probability::{normal_cdf, standard_normal_quantile};
 
@@ -210,7 +213,6 @@ mod model_build;
 mod model_summary;
 #[path = "main/prediction_csv.rs"]
 mod prediction_csv;
-mod report;
 #[path = "main/run_diagnose.rs"]
 mod run_diagnose;
 #[path = "main/run_fit.rs"]

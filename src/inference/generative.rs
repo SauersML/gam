@@ -1,5 +1,6 @@
 use crate::custom_family::{CustomFamily, ParameterBlockState};
-use crate::estimate::{EstimationError, PredictResult};
+use crate::estimate::EstimationError;
+use crate::inference::predict_io::PredictResult;
 use crate::types::{
     LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily, is_valid_tweedie_power,
 };

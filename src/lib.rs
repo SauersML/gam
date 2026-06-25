@@ -105,7 +105,6 @@ pub fn init_parallelism() {
     });
 }
 
-#[path = "main/config_resolve.rs"]
 pub mod config_resolve;
 pub mod families;
 pub mod geometry;
@@ -151,8 +150,8 @@ pub use geometry::{
 };
 pub use gpu::GpuPolicy;
 pub use inference::{
-    alo, conformal, generative, higher_order, hmc, model_comparison, polya_gamma, predict,
-    probability, quadrature, rho_posterior, sample, smooth_test,
+    alo, generative, higher_order, model_comparison, polya_gamma, probability, quadrature,
+    rho_posterior, sample, smooth_test,
 };
 pub use linalg::{faer_ndarray, matrix, utils};
 // #931-#935 criterion calculus: the profiled-criterion abstraction

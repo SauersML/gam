@@ -21,7 +21,7 @@ pub(super) mod hyper;
 mod inner_strategy;
 pub(crate) mod jeffreys_subspace;
 pub(crate) mod outer_eval;
-pub(crate) mod penalty_logdet;
+pub mod penalty_logdet;
 pub(crate) mod per_atom_efs;
 pub(crate) mod reml_outer_engine;
 mod rho_key;
@@ -4185,7 +4185,7 @@ pub(crate) struct SparseExactEvalData {
 }
 
 #[derive(Clone)]
-pub(crate) struct FirthDenseOperator {
+pub struct FirthDenseOperator {
     // Exact Firth/Jeffreys objects on the identifiable subspace.
     //
     // Let X in R^{n×p} potentially be rank-deficient with rank r.

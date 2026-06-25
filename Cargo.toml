@@ -4,7 +4,6 @@ version = "0.3.123"
 edition = "2024"
 rust-version = "1.93"
 autobins = false
-default-run = "gam"
 description = "Generalized penalized likelihood engine"
 license = "AGPL-3.0-or-later"
 # Limit the published `.crate` to source + bench harnesses + license + readme.
@@ -37,7 +36,10 @@ path = "src/lib.rs"
 # off a temporarily-monolithic engine. See the #1521 thread for the plan.
 members = [
     "crates/gam-data",
+    "crates/gam-inference",
+    "crates/gam-cli",
     "crates/gam-math",
+    "crates/gam-predict",
     "crates/gam-pyffi",
     "crates/gam-runtime",
 ]
@@ -99,10 +101,6 @@ ad_trait = "0.3.0"
 criterion = "0.8"
 tempfile = "3.27.0"
 approx = "0.5.1"
-
-[[bin]]
-name = "gam"
-path = "src/main.rs"
 
 [[bench]]
 name = "closed_form_pair_block"

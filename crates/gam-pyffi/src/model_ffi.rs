@@ -126,19 +126,19 @@ struct PyPredictOptions {
 /// error so a typo never silently degrades to the default covariance.
 fn parse_covariance_mode(
     raw: Option<&str>,
-) -> Result<Option<gam::inference::predict::InferenceCovarianceMode>, String> {
+) -> Result<Option<gam_predict::InferenceCovarianceMode>, String> {
     let Some(text) = raw else {
         return Ok(None);
     };
     match text.trim().to_ascii_lowercase().as_str() {
         "conditional" => Ok(Some(
-            gam::inference::predict::InferenceCovarianceMode::Conditional,
+            gam_predict::InferenceCovarianceMode::Conditional,
         )),
         "smoothing" => Ok(Some(
-            gam::inference::predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
+            gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingPreferred,
         )),
         "required" => Ok(Some(
-            gam::inference::predict::InferenceCovarianceMode::ConditionalPlusSmoothingRequired,
+            gam_predict::InferenceCovarianceMode::ConditionalPlusSmoothingRequired,
         )),
         other => Err(format!(
             "covariance_mode must be one of \"conditional\", \"smoothing\", or \"required\"; \

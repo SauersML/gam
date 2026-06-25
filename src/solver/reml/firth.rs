@@ -423,7 +423,7 @@ impl FirthDenseOperator {
         kahan_sum((0..diag.len()).map(|i| diag[i] * matrix[[i, i]]))
     }
 
-    pub(crate) fn build_for_link(
+    pub fn build_for_link(
         link: &InverseLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
@@ -431,7 +431,7 @@ impl FirthDenseOperator {
         Self::build_with_observation_weights_impl(link, x_dense, eta, None)
     }
 
-    pub(crate) fn build_with_observation_weights_for_link(
+    pub fn build_with_observation_weights_for_link(
         link: &InverseLink,
         x_dense: &Array2<f64>,
         eta: &Array1<f64>,
@@ -744,7 +744,7 @@ impl FirthDenseOperator {
     }
 
     #[inline]
-    pub(crate) fn jeffreys_logdet_and_beta_gradient(&self) -> (f64, Array1<f64>) {
+    pub fn jeffreys_logdet_and_beta_gradient(&self) -> (f64, Array1<f64>) {
         (self.jeffreys_logdet(), self.jeffreys_beta_gradient())
     }
 
