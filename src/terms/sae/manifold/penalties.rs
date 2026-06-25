@@ -25,7 +25,17 @@ impl SaeManifoldTerm {
         // from `O(K²·N)` (35e12 products at K=32768) to `O(N·active²)` with no
         // change to the result — the same coactive-pairs reduction proven exact
         // for the separation barrier (#1026, `barrier_coactive_pairs`).
-        let mut coactivation = Array2::<f64>::zeros((k_atoms, k_atoms));
+        // Build the SPARSE symmetrized pair list directly, never the dense
+        // `K×K` matrix (8 GiB at K=32768). For a co-active pair `(j,k)` with
+        // `j<k` the operator's symmetrized weight is
+        //   ½·(W[j,k] + W[k,j]) = W[j,k]   (W is symmetric by construction here)
+        // with `W[j,k] = (Σ_row gj·gk)·inv_n`. Accumulating the numerator only
+        // over the per-row active support and visiting rows in increasing order
+        // reproduces the dense `Gᵀ·G/n` entry bit-for-bit; pairs that never
+        // co-fire have weight 0 and are simply absent (the dense operator skipped
+        // them). Cost collapses from `O(K²·N)` to `O(N·active²)`.
+        let mut num: std::collections::BTreeMap<(usize, usize), f64> =
+            std::collections::BTreeMap::new();
         let mut active: Vec<(usize, f64)> = Vec::with_capacity(k_atoms.min(64));
         for row in 0..n {
             active.clear();
@@ -35,22 +45,38 @@ impl SaeManifoldTerm {
                     active.push((j, g));
                 }
             }
-            for &(j, gj) in &active {
-                for &(k, gk) in &active {
-                    coactivation[[j, k]] += gj * gk;
+            for ai in 0..active.len() {
+                let (j, gj) = active[ai];
+                for &(k, gk) in &active[ai + 1..] {
+                    let (lo, hi) = if j < k { (j, k) } else { (k, j) };
+                    *num.entry((lo, hi)).or_insert(0.0) += gj * gk;
                 }
             }
         }
-        coactivation.mapv_inplace(|v| v * inv_n);
-        let mut per_fit: DecoderIncoherencePenalty = (**base).clone();
-        per_fit.block_sizes = block_sizes;
-        per_fit.p_out = p;
-        per_fit.target = PsiSlice {
-            range: 0..m_total * p,
-            latent_dim: Some(m_total),
-        };
-        per_fit.coactivation = coactivation;
-        Some(per_fit)
+        let pairs: Vec<(usize, usize, f64)> = num
+            .into_iter()
+            .filter_map(|((j, k), s)| {
+                let w = s * inv_n;
+                (w != 0.0).then_some((j, k, w))
+            })
+            .collect();
+        DecoderIncoherencePenalty::new_sparse(
+            PsiSlice {
+                range: 0..m_total * p,
+                latent_dim: Some(m_total),
+            },
+            block_sizes,
+            p,
+            pairs,
+            base.weight,
+            base.learnable_weight,
+        )
+        .ok()
+        .map(|mut per_fit| {
+            per_fit.rho_index = base.rho_index;
+            per_fit.weight_schedule = base.weight_schedule.clone();
+            per_fit
+        })
     }
 
     /// #1026 — refresh the frozen per-assembly decoder-repulsion gate from the

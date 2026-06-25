@@ -223,6 +223,51 @@ fn resident_normal_equations_matches_host_solve_or_declines() {
     // decline already covered by the gram test.
 }
 
+/// #1412 (symmetric single-upload): `xt_diag_x` passes the SAME array as the
+/// left and right GEMM operand, so the device path stages `X` ONCE (aliased
+/// operand) instead of uploading two byte-identical n×p copies. That aliasing
+/// must not change the value: the symmetric per-call Gram has to equal a host
+/// `Xᵀ·diag(w)·X` reference (reduction-order tol) when a device is present. On a
+/// CPU host the GPU path declines and the host fast path already computes the
+/// same reference, so the contract holds either way.
+#[test]
+fn symmetric_gram_single_upload_matches_host_reference_or_declines() {
+    let n = 4096usize;
+    let p = 96usize;
+    let x = Array2::from_shape_fn((n, p), |(i, j)| {
+        0.05 * ((i as f64 + 1.0) * 0.0151 + (j as f64 + 1.0) * 0.0233).sin()
+    });
+    // Signed weights exercise the exact Xᵀ(WX) row-scale (no sqrt/clip), which
+    // the aliased single-upload branch must preserve bit-for-bit.
+    let w = Array1::from_shape_fn(n, |i| ((i as f64 + 1.0) * 0.0193).sin());
+
+    // Host reference Gram, independent of the device path.
+    let mut g_ref = Array2::<f64>::zeros((p, p));
+    for a in 0..p {
+        for b in 0..p {
+            let mut acc = 0.0;
+            for r in 0..n {
+                acc += x[[r, a]] * w[r] * x[[r, b]];
+            }
+            g_ref[[a, b]] = acc;
+        }
+    }
+
+    if let Some(g) = gam::gpu::linalg_dispatch::try_fast_xt_diag_x(x.view(), w.view()) {
+        let mut max_diff = 0.0_f64;
+        for (a, b) in g.iter().zip(g_ref.iter()) {
+            max_diff = max_diff.max((a - b).abs());
+        }
+        let scale = 1.0 + g_ref.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            max_diff < 1e-9 * scale,
+            "symmetric single-upload Gram differs from host reference by {max_diff:e} (scale {scale})"
+        );
+    }
+    // CPU-only host: try_fast_xt_diag_x returns None and the host fast path owns
+    // the same reference; the decline is the documented fallback.
+}
+
 /// Dense SPD solve `A x = b` by Cholesky (lower) + forward/back substitution —
 /// a self-contained host reference independent of the device path.
 fn solve_spd_host(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {

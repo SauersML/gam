@@ -55,7 +55,7 @@ pub use sae::encode::{
     EncodeResult, KANTOROVICH_THRESHOLD, RowCertificate, row_certificate,
 };
 pub use sae::manifold::{
-    AssignmentMode, CertificateInputs, CurvatureBifurcation, CurvatureWalkReport,
+    ArdSharing, AssignmentMode, CertificateInputs, CurvatureBifurcation, CurvatureWalkReport,
     GumbelTemperatureSchedule, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
     SaeBasisEvaluator, SaeManifoldAtom, SaeManifoldLoss, SaeManifoldOuterObjective, SaeManifoldRho,
     SaeManifoldTerm, SaeOuterRhoGradientComponents, ScheduleKind, SphereChartEvaluator,

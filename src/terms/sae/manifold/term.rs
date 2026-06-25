@@ -466,7 +466,11 @@ pub struct SaeManifoldTerm {
     /// threshold — the strict no-op case). Refreshed at the same chokepoint as
     /// the smoothness Gram; not part of the persisted term identity (Clone
     /// starts `None`).
-    pub(crate) decoder_repulsion_gate: Option<Array2<f64>>,
+    /// SPARSE near-collinear pair gate (#1026): the list of `(j, k, w)` with
+    /// `j < k` whose frozen repulsion weight `w > 0`. Only near-collinear pairs
+    /// (above the collinearity gate) ever carry a nonzero weight, so this list is
+    /// tiny even at large `K` — never the dense `K×K` matrix (8 GiB at K=32768).
+    pub(crate) decoder_repulsion_gate: Option<Vec<(usize, usize, f64)>>,
     /// #1026: the load-bearing curved-vs-linear hybrid-split verdict, computed
     /// once in [`Self::canonicalize_charts_post_fit`] after the joint fit
     /// converges. Each eligible `d = 1` atom's fitted curved image is adjudicated
