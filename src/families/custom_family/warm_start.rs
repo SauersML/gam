@@ -124,16 +124,9 @@ pub(crate) fn nonconverged_outer_efs_result(
     include_logdet_h: bool,
     include_logdet_s: bool,
     context: &str,
-) -> Result<
-    (
-        crate::solver::rho_optimizer::EfsEval,
-        ConstrainedWarmStart,
-        bool,
-    ),
-    String,
-> {
+) -> Result<(gam_problem::EfsEval, ConstrainedWarmStart, bool), String> {
     Ok((
-        crate::solver::rho_optimizer::EfsEval {
+        gam_problem::EfsEval {
             cost: inner_penalized_objective(inner, include_logdet_h, include_logdet_s, context)?,
             steps: vec![0.0; theta_dim],
             beta: None,
@@ -830,7 +823,7 @@ impl CustomOuterState {
 pub struct CustomFamilyJointHyperResult {
     pub objective: f64,
     pub gradient: Array1<f64>,
-    pub outer_hessian: crate::solver::rho_optimizer::HessianResult,
+    pub outer_hessian: gam_problem::HessianResult,
     pub warm_start: CustomFamilyWarmStart,
     /// `false` when the inner blockwise/Newton solve hit its divergence
     /// early-exit or its max-cycle cap. Envelope-theorem outer gradients
@@ -843,7 +836,7 @@ pub struct CustomFamilyJointHyperResult {
 }
 
 pub struct CustomFamilyJointHyperEfsResult {
-    pub efs_eval: crate::solver::rho_optimizer::EfsEval,
+    pub efs_eval: gam_problem::EfsEval,
     pub warm_start: CustomFamilyWarmStart,
     /// See [`CustomFamilyJointHyperResult::inner_converged`]. EFS gradients
     /// also assume a stationary inner solve.
@@ -853,7 +846,7 @@ pub struct CustomFamilyJointHyperEfsResult {
 pub(crate) struct OuterObjectiveEvalResult {
     pub(crate) objective: f64,
     pub(crate) gradient: Array1<f64>,
-    pub(crate) outer_hessian: crate::solver::rho_optimizer::HessianResult,
+    pub(crate) outer_hessian: gam_problem::HessianResult,
     pub(crate) warm_start: ConstrainedWarmStart,
     pub(crate) inner_converged: bool,
 }

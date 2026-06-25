@@ -12,7 +12,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
+#[macro_use]
+mod macros;
+
 mod linalg_helpers;
+pub mod solver_contract;
 
 mod gpu {
     pub(crate) mod linalg_dispatch {
@@ -38,6 +42,10 @@ mod gpu {
 }
 
 use linalg_helpers::{dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into};
+pub use solver_contract::{
+    DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterEval,
+    OuterHessianMaterialization, OuterHessianOperator, OuterStrategyError,
+};
 
 #[cold]
 fn reml_contract_panic(message: impl Into<String>) -> ! {

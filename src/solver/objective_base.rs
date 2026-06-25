@@ -1,26 +1,12 @@
 use ndarray::Array2;
 use std::sync::Arc;
 
-use crate::solver::rho_optimizer::{OuterStrategyError, RhoBlockAdditiveOuterHessian};
+use crate::solver::rho_optimizer::RhoBlockAdditiveOuterHessian;
+use gam_problem::OuterStrategyError;
 
-// `OuterEval` and `HessianResult` moved DOWN to the `crate::solver_contract`
-// lower layer (#1135) so the `families` layer can name them without importing
-// up into `solver`. Re-exported here so existing `crate::solver::objective_base`
-// paths keep resolving. The solver-internal `add_rho_block_dense` extension
-// (which needs the solver-private `RhoBlockAdditiveOuterHessian`) stays here.
-pub use crate::solver_contract::{HessianResult, OuterEval};
+pub use gam_problem::HessianResult;
 
-impl HessianResult {
-    /// Solver-internal extension: additive rho-block update. Lives here (not in
-    /// the lower contract layer) because it constructs the solver-private
-    /// `RhoBlockAdditiveOuterHessian` wrapper. Inherent impls may live in any
-    /// module of the defining crate.
-    pub fn add_rho_block_dense(&mut self, rho_block: &Array2<f64>) -> Result<(), String> {
-        add_rho_block_dense_to_hessian(self, rho_block)
-    }
-}
-
-fn add_rho_block_dense_to_hessian(
+pub(crate) fn add_rho_block_dense_to_hessian(
     hessian: &mut HessianResult,
     rho_block: &Array2<f64>,
 ) -> Result<(), String> {

@@ -1,9 +1,7 @@
 use super::*;
 
-// `EfsEval` moved DOWN to `crate::solver_contract` (#1135) so families can
-// build and return it without importing up into `crate::solver::rho_optimizer`.
-// Re-exported here so existing `rho_optimizer::EfsEval` paths keep resolving.
-pub use crate::solver_contract::EfsEval;
+// Re-exported here while the shared EFS contract lives in `gam-problem`.
+pub use gam_problem::EfsEval;
 
 /// Outcome of [`OuterObjective::seed_inner_state`].
 ///

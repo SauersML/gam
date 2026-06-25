@@ -513,9 +513,8 @@ where
                 "simultaneous mixture and SAS optimization is not supported"
             );
         } else if mixture_dim == 0 && sas_dim == 0 {
-            use crate::solver::rho_optimizer::{
-                DeclaredHessianForm, Derivative, OuterEvalOrder, OuterProblem,
-            };
+            use crate::solver::rho_optimizer::{OuterEvalOrder, OuterProblem};
+            use gam_problem::{DeclaredHessianForm, Derivative};
 
             let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
             // Standard-GAM dense problem dimensions configure both cost models
@@ -1615,9 +1614,8 @@ where
                 reml_seed_config_mix.max_seeds = 1;
                 reml_seed_config_mix.seed_budget = 1;
             }
-            use crate::solver::rho_optimizer::{
-                DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
-            };
+            use crate::solver::rho_optimizer::OuterProblem;
+            use gam_problem::{DeclaredHessianForm, Derivative, HessianResult, OuterEval};
             let initial_link_kind = cfg.link_kind.clone();
             let prefer_gradient_only = theta_dim >= REML_SECOND_ORDER_RHO_CAP;
             let continuation_prewarm = theta_dim < REML_CONTINUATION_PREWARM_RHO_CAP;

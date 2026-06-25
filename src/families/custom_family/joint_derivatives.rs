@@ -140,9 +140,7 @@ impl HessianDerivativeProvider for BorrowedJointDerivProvider<'_> {
         true
     }
 
-    fn family_outer_hessian_operator(
-        &self,
-    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
+    fn family_outer_hessian_operator(&self) -> Option<Arc<dyn gam_problem::OuterHessianOperator>> {
         self.family_outer_hessian_operator.clone()
     }
 }
@@ -167,8 +165,7 @@ pub(crate) struct OwnedJointDerivProvider {
                 + Sync,
         >,
     >,
-    pub(crate) family_outer_hessian_operator:
-        Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>>,
+    pub(crate) family_outer_hessian_operator: Option<Arc<dyn gam_problem::OuterHessianOperator>>,
 }
 
 impl HessianDerivativeProvider for OwnedJointDerivProvider {
@@ -286,9 +283,7 @@ impl HessianDerivativeProvider for OwnedJointDerivProvider {
         })
     }
 
-    fn family_outer_hessian_operator(
-        &self,
-    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
+    fn family_outer_hessian_operator(&self) -> Option<Arc<dyn gam_problem::OuterHessianOperator>> {
         self.family_outer_hessian_operator.clone()
     }
 }
@@ -518,9 +513,7 @@ impl HessianDerivativeProvider for JeffreysHphiAwareJointDerivatives<'_> {
         self.inner.outer_hessian_derivative_kernel()
     }
 
-    fn family_outer_hessian_operator(
-        &self,
-    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
+    fn family_outer_hessian_operator(&self) -> Option<Arc<dyn gam_problem::OuterHessianOperator>> {
         self.inner.family_outer_hessian_operator()
     }
 }

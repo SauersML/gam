@@ -63,10 +63,9 @@
 use crate::linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
 use crate::matrix::FactorizedSystem;
 use crate::solver::estimate::EstimationError;
-use crate::solver::rho_optimizer::{
-    HessianResult, OuterCapability, OuterHessianOperator, OuterObjective, OuterPlan, OuterResult,
-};
+use crate::solver::rho_optimizer::{OuterCapability, OuterObjective, OuterPlan, OuterResult};
 use faer::Side;
+use gam_problem::{HessianResult, OuterHessianOperator};
 use ndarray::{Array1, Array2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
@@ -668,9 +667,8 @@ pub fn run_per_atom_efs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::rho_optimizer::{
-        DeclaredHessianForm, Derivative, EfsEval, OuterEval, SeedOutcome,
-    };
+    use crate::solver::rho_optimizer::SeedOutcome;
+    use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, OuterEval};
     use ndarray::array;
 
     /// Exact outer-Hessian operator for the quadratic mock: `v ↦ A·v`.

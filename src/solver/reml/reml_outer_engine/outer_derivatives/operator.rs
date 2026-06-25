@@ -720,7 +720,7 @@ impl UnifiedOuterHessianOperator {
     }
 }
 
-impl crate::solver::rho_optimizer::OuterHessianOperator for UnifiedOuterHessianOperator {
+impl gam_problem::OuterHessianOperator for UnifiedOuterHessianOperator {
     fn dim(&self) -> usize {
         self.coords.len()
     }

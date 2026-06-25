@@ -1484,10 +1484,10 @@ pub(crate) fn large_n_gaussian_location_scale_keeps_exact_outer_hessian_plan() {
     let options = BlockwiseFitOptions::default();
     let (gradient, hessian) =
         crate::custom_family::custom_family_outer_derivatives(&family, &specs, &options);
-    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
+    assert_eq!(gradient, gam_problem::Derivative::Analytic);
     assert_eq!(
         hessian,
-        crate::solver::rho_optimizer::DeclaredHessianForm::Either,
+        gam_problem::DeclaredHessianForm::Either,
         "large-n GAMLSS location-scale fits must advertise exact second-order curvature instead of triggering the historical BFGS downgrade"
     );
 
@@ -4153,10 +4153,7 @@ pub(crate) fn binomial_location_scale_many_smoothing_params_keeps_second_order_o
         &specs,
         &BlockwiseFitOptions::default(),
     );
-    assert_eq!(
-        hessian,
-        crate::solver::rho_optimizer::DeclaredHessianForm::Either
-    );
+    assert_eq!(hessian, gam_problem::DeclaredHessianForm::Either);
 }
 
 #[test]

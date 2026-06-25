@@ -2787,7 +2787,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             Array1<f64>,
             f64,
             Array1<f64>,
-            crate::solver::rho_optimizer::HessianResult,
+            gam_problem::HessianResult,
             crate::custom_family::CustomFamilyWarmStart,
         )>,
     }
@@ -2908,9 +2908,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
     };
 
     use crate::model_types::EstimationError;
-    use crate::solver::rho_optimizer::{
-        DeclaredHessianForm, Derivative, OuterEval, OuterEvalOrder,
-    };
+    use crate::solver::rho_optimizer::OuterEvalOrder;
+    use gam_problem::{DeclaredHessianForm, Derivative, OuterEval};
 
     // Exact first-order AND second-order [rho, psi] calculus is available
     // for all inverse links via the shared jet formulas plus the generic
@@ -2960,8 +2959,8 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             && (!matches!(order, OuterEvalOrder::ValueGradientHessian)
                 || matches!(
                     cached_hess,
-                    crate::solver::rho_optimizer::HessianResult::Analytic(_)
-                        | crate::solver::rho_optimizer::HessianResult::Operator(_)
+                    gam_problem::HessianResult::Analytic(_)
+                        | gam_problem::HessianResult::Operator(_)
                 ))
         {
             state.warm_cache = Some(cached_warm.clone());

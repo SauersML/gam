@@ -1930,10 +1930,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let (joint_gradient, joint_hessian) =
         custom_family_outer_derivatives(&initial_family, &initial_blocks, options);
     let analytic_joint_gradient_available = analytic_joint_derivatives_available
-        && matches!(
-            joint_gradient,
-            crate::solver::rho_optimizer::Derivative::Analytic
-        );
+        && matches!(joint_gradient, gam_problem::Derivative::Analytic);
     // Survival marginal-slope now exposes exact coefficient-space and ψ-space
     // Hessian directional derivatives as HyperOperators (see the workspace
     // overrides below). Keep analytic curvature advertised at large scale;

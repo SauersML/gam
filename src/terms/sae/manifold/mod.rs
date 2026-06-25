@@ -103,9 +103,9 @@ pub(crate) use crate::solver::estimate::EstimationError;
 pub(crate) use crate::solver::evidence::arrow_log_det_from_cache;
 
 pub(crate) use crate::solver::rho_optimizer::{
-    DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterCapability, OuterEval,
-    OuterEvalOrder, OuterObjective, SeedOutcome,
+    OuterCapability, OuterEvalOrder, OuterObjective, SeedOutcome,
 };
+pub(crate) use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterEval};
 
 pub(crate) use crate::solver::structure_search::{CollapseAction, CollapseEvent};
 

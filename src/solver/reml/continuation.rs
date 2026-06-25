@@ -37,7 +37,8 @@ use ndarray::Array1;
 use crate::families::custom_family::KktRefusalDiagnosis;
 use crate::solver::estimate::EstimationError;
 use crate::solver::inner_status::{InnerFailure, classify_inner_error};
-use crate::solver::rho_optimizer::{OuterEval, OuterEvalOrder, OuterObjective};
+use crate::solver::rho_optimizer::{OuterEvalOrder, OuterObjective};
+use gam_problem::OuterEval;
 
 /// Hard ceiling on the number of ρ steps along a single continuation
 /// path. Past this we surface the last `InnerFailure` rather than the
@@ -779,9 +780,8 @@ mod tests {
     // queue of `Result<&'static str_or_ok, &'static str_failure>`. The
     // mock records the ρ at each call so step counting can be asserted.
 
-    use crate::solver::rho_optimizer::{
-        DeclaredHessianForm, Derivative, HessianResult, OuterCapability,
-    };
+    use crate::solver::rho_optimizer::OuterCapability;
+    use gam_problem::{DeclaredHessianForm, Derivative, HessianResult};
 
     /// A response scripted for the next `eval_with_order` call.
     #[derive(Clone)]
@@ -1161,8 +1161,8 @@ mod tests {
         let obj = ClosureObjective {
             state: (),
             cap: crate::solver::rho_optimizer::OuterCapability {
-                gradient: crate::solver::rho_optimizer::Derivative::Analytic,
-                hessian: crate::solver::rho_optimizer::DeclaredHessianForm::Unavailable,
+                gradient: gam_problem::Derivative::Analytic,
+                hessian: gam_problem::DeclaredHessianForm::Unavailable,
                 n_params: 1,
                 psi_dim: 0,
                 fixed_point_available: false,
@@ -1188,11 +1188,7 @@ mod tests {
             >,
             reset_fn: None::<fn(&mut ())>,
             efs_fn: None::<
-                fn(
-                    &mut (),
-                    &Array1<f64>,
-                )
-                    -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError>,
+                fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>,
             >,
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<
@@ -1234,8 +1230,8 @@ mod tests {
         let obj = ClosureObjective {
             state: (),
             cap: crate::solver::rho_optimizer::OuterCapability {
-                gradient: crate::solver::rho_optimizer::Derivative::Analytic,
-                hessian: crate::solver::rho_optimizer::DeclaredHessianForm::Unavailable,
+                gradient: gam_problem::Derivative::Analytic,
+                hessian: gam_problem::DeclaredHessianForm::Unavailable,
                 n_params: 1,
                 psi_dim: 0,
                 fixed_point_available: false,
@@ -1261,11 +1257,7 @@ mod tests {
             >,
             reset_fn: None::<fn(&mut ())>,
             efs_fn: None::<
-                fn(
-                    &mut (),
-                    &Array1<f64>,
-                )
-                    -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError>,
+                fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>,
             >,
             screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
             seed_fn: None::<

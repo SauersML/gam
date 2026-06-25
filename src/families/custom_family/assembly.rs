@@ -376,14 +376,7 @@ pub(crate) fn unified_joint_cost_gradient(
     // (`cost −= Φ`) so the outer criterion matches the Φ-augmented inner
     // objective (gam#979). `None` when the term is unavailable/gated to zero.
     firth_value: Option<f64>,
-) -> Result<
-    (
-        f64,
-        Array1<f64>,
-        crate::solver::rho_optimizer::HessianResult,
-    ),
-    String,
-> {
+) -> Result<(f64, Array1<f64>, gam_problem::HessianResult), String> {
     let hessian_op: Arc<dyn HessianOperator> = match first_order_trace_skip.as_ref() {
         Some(trace_values) if !trace_values.is_empty() => Arc::new(
             FirstOrderTraceSkipOperator::new(hessian_op, trace_values.len()),
@@ -448,7 +441,7 @@ pub(crate) fn unified_joint_efs_eval(
     rho_prior: crate::types::RhoPrior,
     deriv_provider: Box<dyn HessianDerivativeProvider + '_>,
     ext_bundle: Option<ExtCoordBundle>,
-) -> Result<crate::solver::rho_optimizer::EfsEval, String> {
+) -> Result<gam_problem::EfsEval, String> {
     let (assembly, _) = build_custom_family_inner_assembly(
         inner,
         specs,
@@ -506,7 +499,7 @@ pub(crate) fn unified_joint_efs_eval(
         let inner_hessian_scale =
             hessian_operator_geometric_scale(inner_solution.hessian_op.as_ref());
         let hybrid = compute_hybrid_efs_update(&inner_solution, rho_slice, gradient_slice);
-        Ok(crate::solver::rho_optimizer::EfsEval {
+        Ok(gam_problem::EfsEval {
             cost: result.cost,
             steps: hybrid.steps,
             beta: Some(inner_solution.beta.clone()),
@@ -526,7 +519,7 @@ pub(crate) fn unified_joint_efs_eval(
     } else {
         let inner_hessian_scale =
             hessian_operator_geometric_scale(inner_solution.hessian_op.as_ref());
-        Ok(crate::solver::rho_optimizer::EfsEval {
+        Ok(gam_problem::EfsEval {
             cost: result.cost,
             steps: compute_efs_update(&inner_solution, rho_slice, gradient_slice),
             beta: Some(inner_solution.beta.clone()),
@@ -748,9 +741,7 @@ pub(crate) fn joint_outer_evaluate(
     >,
     ext_bundle: Option<ExtCoordBundle>,
     first_order_trace_skip: Option<Array1<f64>>,
-    batched_outer_hessian_operator: Option<
-        Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>,
-    >,
+    batched_outer_hessian_operator: Option<Arc<dyn gam_problem::OuterHessianOperator>>,
     // Universal under-identification robustness (always armed when the family can
     // expose an exact joint Hessian). The
     // outer REML logdet AND its trace derivatives must run on the same
@@ -1244,7 +1235,7 @@ pub(crate) fn joint_outer_evaluate(
         .into());
     }
     match &outer_hessian {
-        crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => {
+        gam_problem::HessianResult::Analytic(hessian) => {
             if hessian.iter().any(|value| !value.is_finite()) {
                 return Err(CustomFamilyError::NumericalFailure {
                     reason: "joint outer evaluation produced a non-finite Hessian".to_string(),
@@ -1264,7 +1255,7 @@ pub(crate) fn joint_outer_evaluate(
                 .into());
             }
         }
-        crate::solver::rho_optimizer::HessianResult::Operator(op) => {
+        gam_problem::HessianResult::Operator(op) => {
             if op.dim() != expected_theta_dim {
                 return Err(format!(
                     "joint outer evaluation returned operator Hessian dim {}, expected {}",
@@ -1273,7 +1264,7 @@ pub(crate) fn joint_outer_evaluate(
                 ));
             }
         }
-        crate::solver::rho_optimizer::HessianResult::Unavailable => {}
+        gam_problem::HessianResult::Unavailable => {}
     }
 
     let warm = ConstrainedWarmStart {
@@ -1342,7 +1333,7 @@ pub(crate) fn joint_outer_evaluate_efs(
         >,
     >,
     ext_bundle: Option<ExtCoordBundle>,
-) -> Result<crate::solver::rho_optimizer::EfsEval, String> {
+) -> Result<gam_problem::EfsEval, String> {
     let joint_trace_diagonal_ridge = moderidge + if !strict_spd { extra_logdet_ridge } else { 0.0 };
     let scaled_joint_trace_diagonal_ridge = rho_curvature_scale * joint_trace_diagonal_ridge;
 
@@ -1581,14 +1572,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
     rho_prior: crate::types::RhoPrior,
-) -> Result<
-    (
-        crate::solver::rho_optimizer::EfsEval,
-        ConstrainedWarmStart,
-        bool,
-    ),
-    String,
-> {
+) -> Result<(gam_problem::EfsEval, ConstrainedWarmStart, bool), String> {
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);
     let strict_spd = use_exact_newton_strict_spd(family);

@@ -1084,22 +1084,13 @@ impl<'a> RemlState<'a> {
         rho_dim: usize,
         hyper_dirs: &[DirectionalHyperParam],
         order: crate::solver::rho_optimizer::OuterEvalOrder,
-    ) -> Result<
-        (
-            f64,
-            Array1<f64>,
-            crate::solver::rho_optimizer::HessianResult,
-        ),
-        EstimationError,
-    > {
+    ) -> Result<(f64, Array1<f64>, gam_problem::HessianResult), EstimationError> {
         let t_outer_start = std::time::Instant::now();
         let rho = theta.slice(s![..rho_dim]).to_owned();
 
         if !hyper_dirs.is_empty() {
-            let requested_hessian = matches!(
-                order,
-                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
-            );
+            let requested_hessian =
+                matches!(order, crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian);
             // Firth pair Hessian terms are now available via Primitive A
             // (hphi_tau_tau_partial_apply) and Primitive B
             // (d_beta_hphi_tau_partial_apply); the policy no longer needs to
@@ -1134,9 +1125,7 @@ impl<'a> RemlState<'a> {
             } else {
                 order
             } {
-                crate::solver::rho_optimizer::OuterEvalOrder::Value => {
-                    super::reml_outer_engine::EvalMode::ValueOnly
-                }
+                crate::solver::rho_optimizer::OuterEvalOrder::Value => super::reml_outer_engine::EvalMode::ValueOnly,
                 crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient => {
                     super::reml_outer_engine::EvalMode::ValueAndGradient
                 }
@@ -1163,7 +1152,7 @@ impl<'a> RemlState<'a> {
                 if requested_hessian && !downgrade_exact_tau_tau {
                     result.hessian
                 } else {
-                    crate::solver::rho_optimizer::HessianResult::Unavailable
+                    gam_problem::HessianResult::Unavailable
                 },
             ))
         } else {

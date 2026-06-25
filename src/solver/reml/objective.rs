@@ -2371,7 +2371,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         assembly: super::assembly::InnerAssembly<'static>,
-    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
+    ) -> Result<gam_problem::EfsEval, EstimationError> {
         use super::reml_outer_engine::{compute_efs_update, compute_hybrid_efs_update};
 
         let beta_for_barrier = assembly.beta.clone();
@@ -2474,7 +2474,7 @@ impl<'a> RemlState<'a> {
             } else {
                 Some(hybrid.psi_indices)
             };
-            crate::solver::rho_optimizer::EfsEval {
+            gam_problem::EfsEval {
                 cost: efs_cost,
                 steps: hybrid.steps,
                 beta: Some(beta_for_barrier),
@@ -2497,7 +2497,7 @@ impl<'a> RemlState<'a> {
                 bundle.pirls_result.relative_gradient_norm(),
             );
             self.record_efs_single_loop_bias(rho, diagnostics)?;
-            crate::solver::rho_optimizer::EfsEval {
+            gam_problem::EfsEval {
                 cost: efs_cost,
                 steps,
                 beta: Some(beta_for_barrier),
@@ -2700,7 +2700,7 @@ impl<'a> RemlState<'a> {
     pub fn compute_efs_steps(
         &self,
         p: &Array1<f64>,
-    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
+    ) -> Result<gam_problem::EfsEval, EstimationError> {
         if self.large_n_efs_single_loop_lane() {
             self.cache_manager.invalidate_eval_bundle();
             let previous_cap = self
@@ -2718,7 +2718,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn compute_efs_steps_inner(
         &self,
         p: &Array1<f64>,
-    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
+    ) -> Result<gam_problem::EfsEval, EstimationError> {
         let bundle = match self.obtain_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
@@ -2741,7 +2741,7 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
-    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
+    ) -> Result<gam_problem::EfsEval, EstimationError> {
         if self.large_n_efs_single_loop_lane() {
             self.cache_manager.invalidate_eval_bundle();
             let previous_cap = self
@@ -2759,7 +2759,7 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
         hyper_dirs: &[crate::estimate::reml::DirectionalHyperParam],
-    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
+    ) -> Result<gam_problem::EfsEval, EstimationError> {
         let bundle = match self.obtain_eval_bundle(rho) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
@@ -2904,10 +2904,8 @@ impl<'a> RemlState<'a> {
         &self,
         p: &Array1<f64>,
     ) -> Result<(f64, Array1<f64>), EstimationError> {
-        let eval = self.compute_outer_eval_with_order(
-            p,
-            crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
-        )?;
+        let eval =
+            self.compute_outer_eval_with_order(p, crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient)?;
         Ok((eval.cost, eval.gradient))
     }
 
@@ -2919,10 +2917,8 @@ impl<'a> RemlState<'a> {
         self.arena
             .lastgradient_used_stochastic_fallback
             .store(false, Ordering::Relaxed);
-        let allow_second_order = matches!(
-            order,
-            crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
-        ) && self.analytic_outer_hessian_enabled();
+        let allow_second_order = matches!(order, crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian)
+            && self.analytic_outer_hessian_enabled();
         let t_eval_start = std::time::Instant::now();
         {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
@@ -3022,8 +3018,9 @@ impl<'a> RemlState<'a> {
             // Value+gradient: this evaluator's assembly contract requires a
             // gradient (see the `result.gradient` demand below), so fulfil it as
             // value+gradient with the Hessian skipped.
-            crate::solver::rho_optimizer::OuterEvalOrder::Value
-            | crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient => None,
+            crate::solver::rho_optimizer::OuterEvalOrder::Value | crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient => {
+                None
+            }
             crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian => {
                 if allow_second_order {
                     Some(self.selecthessian_strategy_policy(&bundle))
@@ -3323,7 +3320,7 @@ impl<'a> RemlState<'a> {
     pub fn compute_efs_steps_with_link_ext(
         &self,
         rho: &Array1<f64>,
-    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
+    ) -> Result<gam_problem::EfsEval, EstimationError> {
         self.reject_firth_link_ext()?;
         let bundle = self.obtain_eval_bundle(rho)?;
         let mut ext_coords = self.build_link_ext_coords(&bundle)?;
@@ -3348,7 +3345,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
         bundle: &EvalShared,
         ext_coords: Vec<super::reml_outer_engine::HyperCoord>,
-    ) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
+    ) -> Result<gam_problem::EfsEval, EstimationError> {
         // #1376: force the smooth-floored spectral `log|H|` whenever a
         // design-moving ψ ext coordinate is present so the value matches the
         // gradient path's floored determinant (the LLT exact-`Σ ln σ` fast path

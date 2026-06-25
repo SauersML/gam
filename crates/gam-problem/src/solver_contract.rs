@@ -41,7 +41,7 @@ pub enum OuterHessianMaterialization {
 }
 
 impl OuterHessianMaterialization {
-    pub(crate) fn is_available(self) -> bool {
+    pub fn is_available(self) -> bool {
         !matches!(self, Self::Unavailable)
     }
 }
@@ -65,7 +65,7 @@ pub enum OuterStrategyError {
     RhoBlockShape { reason: String },
 }
 
-crate::impl_reason_error_boilerplate! {
+impl_reason_error_boilerplate! {
     OuterStrategyError {
         OperatorShape,
         NonFiniteHessian,
@@ -326,7 +326,7 @@ impl OuterEval {
         }
     }
 
-    pub(crate) fn value_only(
+    pub fn value_only(
         cost: f64,
         n_params: usize,
         inner_beta_hint: Option<Array1<f64>>,

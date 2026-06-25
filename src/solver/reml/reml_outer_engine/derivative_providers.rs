@@ -162,9 +162,7 @@ pub trait HessianDerivativeProvider: Send + Sync {
     /// the existing `outer_hessian_derivative_kernel` / `compute_outer_hessian`
     /// path.  This is the contract surface for CTN, survival, GAMLSS and
     /// other families that ship a directional outer-HVP operator.
-    fn family_outer_hessian_operator(
-        &self,
-    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
+    fn family_outer_hessian_operator(&self) -> Option<Arc<dyn gam_problem::OuterHessianOperator>> {
         None
     }
 }

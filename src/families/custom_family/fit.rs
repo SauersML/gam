@@ -808,7 +808,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     }
 
     use crate::model_types::EstimationError;
-    use crate::solver::rho_optimizer::{FallbackPolicy, OuterEval, OuterEvalOrder, OuterProblem};
+    use crate::solver::rho_optimizer::{FallbackPolicy, OuterEvalOrder, OuterProblem};
+    use gam_problem::OuterEval;
 
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let outer_inner_cap = options
@@ -1048,7 +1049,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     Ok(OuterEval {
                         cost: eval.objective,
                         gradient: Array1::zeros(rho.len()),
-                        hessian: crate::solver::rho_optimizer::HessianResult::Unavailable,
+                        hessian: gam_problem::HessianResult::Unavailable,
                         inner_beta_hint,
                     })
                 }
@@ -1096,15 +1097,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 if eval.objective.is_finite()
                     && eval.gradient.iter().all(|v| v.is_finite())
                     && match &eval.outer_hessian {
-                        crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => {
+                        gam_problem::HessianResult::Analytic(hessian) => {
                             hessian.iter().all(|v| v.is_finite())
                         }
-                        crate::solver::rho_optimizer::HessianResult::Operator(op) => {
+                        gam_problem::HessianResult::Operator(op) => {
                             !request_hessian || op.dim() == rho.len()
                         }
-                        crate::solver::rho_optimizer::HessianResult::Unavailable => {
-                            !request_hessian
-                        }
+                        gam_problem::HessianResult::Unavailable => !request_hessian,
                     } =>
             {
                 let warm_start = eval.warm_start.clone();
@@ -1373,31 +1372,25 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             log::warn!(
                 "[OUTER-FD-AUDIT/custom-family] outer did not certify convergence; running desync/identifiability audit n={audit_n} n_rho={n_rho} need_outer_hessian={need_outer_hessian}"
             );
-            let mut eval_at = |rho: &Array1<f64>,
-                               mode: EvalMode|
-             -> Result<
-                (
-                    f64,
-                    Array1<f64>,
-                    crate::solver::rho_optimizer::HessianResult,
-                ),
-                String,
-            > {
-                let e = outerobjectivegradienthessian_labeled(
-                    family,
-                    specs,
-                    &outer_options,
-                    &label_layout,
-                    rho,
-                    None,
-                    &rho_prior,
-                    mode,
-                )?;
-                if !e.inner_converged {
-                    return Err("inner solve did not converge at audit rho".to_string());
-                }
-                Ok((e.objective, e.gradient, e.outer_hessian))
-            };
+            let mut eval_at =
+                |rho: &Array1<f64>,
+                 mode: EvalMode|
+                 -> Result<(f64, Array1<f64>, gam_problem::HessianResult), String> {
+                    let e = outerobjectivegradienthessian_labeled(
+                        family,
+                        specs,
+                        &outer_options,
+                        &label_layout,
+                        rho,
+                        None,
+                        &rho_prior,
+                        mode,
+                    )?;
+                    if !e.inner_converged {
+                        return Err("inner solve did not converge at audit rho".to_string());
+                    }
+                    Ok((e.objective, e.gradient, e.outer_hessian))
+                };
             match crate::solver::rho_optimizer::outer_gradient_fd_audit(
                 // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
                 &rho0,

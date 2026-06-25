@@ -3585,9 +3585,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         ..BlockwiseFitOptions::default()
     };
 
-    use crate::solver::rho_optimizer::{
-        DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
-    };
+    use crate::solver::rho_optimizer::OuterProblem;
+    use gam_problem::{DeclaredHessianForm, Derivative, HessianResult, OuterEval};
 
     struct SpatialAdaptiveOuterState {
         warm_cache: Option<CustomFamilyWarmStart>,
@@ -7945,7 +7944,7 @@ fn evaluate_joint_reml_outer_eval_at_theta(
     (
         f64,
         Array1<f64>,
-        crate::solver::rho_optimizer::HessianResult,
+        gam_problem::HessianResult,
     ),
     EstimationError,
 > {
@@ -7972,7 +7971,7 @@ fn evaluate_joint_reml_efs_at_theta(
     hyper_dirs: Vec<crate::estimate::reml::DirectionalHyperParam>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     design_revision: Option<u64>,
-) -> Result<crate::solver::rho_optimizer::EfsEval, EstimationError> {
+) -> Result<gam_problem::EfsEval, EstimationError> {
     evaluator.evaluate_efs(
         &design.design,
         &design.penalties,

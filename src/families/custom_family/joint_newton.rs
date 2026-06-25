@@ -1541,11 +1541,8 @@ pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-) -> (
-    crate::solver::rho_optimizer::Derivative,
-    crate::solver::rho_optimizer::DeclaredHessianForm,
-) {
-    use crate::solver::rho_optimizer::{DeclaredHessianForm, Derivative};
+) -> (gam_problem::Derivative, gam_problem::DeclaredHessianForm) {
+    use gam_problem::{DeclaredHessianForm, Derivative};
 
     // The capability-vs-policy split: capability tells us *what the family
     // can compute*; policy tells us *what we should ask for at this size*.

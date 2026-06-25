@@ -56,10 +56,10 @@ mod seed_screening;
 
 pub(crate) use crate::model_types::CERTIFICATE_RAIL_MARGIN;
 pub use crate::model_types::CriterionCertificate;
-pub use crate::solver::objective_base::{HessianResult, OuterEval};
 pub(crate) use bridges::*;
 pub use capability::*;
 pub(crate) use fd_audit::*; // fd-ok: re-exports FD-audit oracle; audit-only, not in the math path
+pub use gam_problem::{HessianResult, OuterEval};
 pub use hessian_operator::*;
 pub use objective::*;
 pub(crate) use run::*;

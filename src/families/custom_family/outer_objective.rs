@@ -8,7 +8,7 @@
 
 use super::*;
 
-impl crate::solver::rho_optimizer::OuterHessianOperator for OwnedDenseOuterHessianOperator {
+impl gam_problem::OuterHessianOperator for OwnedDenseOuterHessianOperator {
     fn dim(&self) -> usize {
         self.matrix.nrows()
     }
@@ -62,7 +62,7 @@ impl crate::solver::rho_optimizer::OuterHessianOperator for OwnedDenseOuterHessi
 }
 
 pub(crate) struct LabeledOuterHessianOperator {
-    pub(crate) base: Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>,
+    pub(crate) base: Arc<dyn gam_problem::OuterHessianOperator>,
     pub(crate) physical_to_outer: Vec<Option<usize>>,
     pub(crate) outer_dim: usize,
     /// Scratch buffers reused across `apply_into` calls to avoid
@@ -73,7 +73,7 @@ pub(crate) struct LabeledOuterHessianOperator {
 
 impl LabeledOuterHessianOperator {
     pub(crate) fn new(
-        base: Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>,
+        base: Arc<dyn gam_problem::OuterHessianOperator>,
         layout: &PenaltyLabelLayout,
     ) -> Self {
         let n_physical = layout.physical_to_outer.len();
@@ -89,7 +89,7 @@ impl LabeledOuterHessianOperator {
     }
 }
 
-impl crate::solver::rho_optimizer::OuterHessianOperator for LabeledOuterHessianOperator {
+impl gam_problem::OuterHessianOperator for LabeledOuterHessianOperator {
     fn dim(&self) -> usize {
         self.outer_dim
     }
@@ -208,9 +208,7 @@ impl crate::solver::rho_optimizer::OuterHessianOperator for LabeledOuterHessianO
         self.base.is_cheap_to_materialize()
     }
 
-    fn materialization_capability(
-        &self,
-    ) -> crate::solver::rho_optimizer::OuterHessianMaterialization {
+    fn materialization_capability(&self) -> gam_problem::OuterHessianMaterialization {
         self.base.materialization_capability()
     }
 }
@@ -223,7 +221,7 @@ pub(crate) fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
     rho: &Array1<f64>,
     workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>>,
     eval_mode: EvalMode,
-) -> Result<Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>>, String> {
+) -> Result<Option<Arc<dyn gam_problem::OuterHessianOperator>>, String> {
     if eval_mode != EvalMode::ValueGradientHessian {
         return Ok(None);
     }
@@ -233,16 +231,16 @@ pub(crate) fn custom_family_batched_outer_hessian_operator<F: CustomFamily>(
         return Ok(None);
     };
     match terms.outer_hessian {
-        crate::solver::rho_optimizer::HessianResult::Operator(operator) => Ok(Some(operator)),
-        crate::solver::rho_optimizer::HessianResult::Analytic(matrix) => {
+        gam_problem::HessianResult::Operator(operator) => Ok(Some(operator)),
+        gam_problem::HessianResult::Analytic(matrix) => {
             Ok(Some(Arc::new(OwnedDenseOuterHessianOperator { matrix })))
         }
-        crate::solver::rho_optimizer::HessianResult::Unavailable => Ok(None),
+        gam_problem::HessianResult::Unavailable => Ok(None),
     }
 }
 
 pub(crate) fn outer_efs_result_to_joint_hyper_efs_result(
-    efs_eval: crate::solver::rho_optimizer::EfsEval,
+    efs_eval: gam_problem::EfsEval,
     warm_start: ConstrainedWarmStart,
     inner_converged: bool,
 ) -> CustomFamilyJointHyperEfsResult {

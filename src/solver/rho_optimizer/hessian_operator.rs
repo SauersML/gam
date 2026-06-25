@@ -1,14 +1,8 @@
 use super::*;
 
-// The outer Hessian operator contract — the `OuterHessianOperator` trait,
-// `OuterHessianMaterialization`, `OuterStrategyError`, `Derivative`, and
-// `DeclaredHessianForm` — moved DOWN to `crate::solver_contract` (#1135) so the
-// `families` layer can implement and name them without importing up into
-// `crate::solver::rho_optimizer`. Re-exported here so existing
-// `crate::solver::rho_optimizer::*` paths keep resolving. The solver-private
-// `RhoBlockAdditiveOuterHessian` wrapper and the materialization dimension cap
-// stay in `solver`.
-pub use crate::solver_contract::{
+// The outer Hessian operator contract lives in `gam-problem`. Re-exported here
+// while solver-private wrappers stay in `solver`.
+pub use gam_problem::{
     DeclaredHessianForm, Derivative, OuterHessianMaterialization, OuterHessianOperator,
     OuterStrategyError,
 };

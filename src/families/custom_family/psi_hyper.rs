@@ -1221,7 +1221,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     return Ok(OuterObjectiveEvalResult {
                         objective: value_only.objective,
                         gradient,
-                        outer_hessian: crate::solver::rho_optimizer::HessianResult::Unavailable,
+                        outer_hessian: gam_problem::HessianResult::Unavailable,
                         warm_start: value_only.warm_start,
                         inner_converged: inner.converged,
                     });
@@ -1620,7 +1620,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                     return Ok(OuterObjectiveEvalResult {
                         objective: value_only.objective,
                         gradient,
-                        outer_hessian: crate::solver::rho_optimizer::HessianResult::Unavailable,
+                        outer_hessian: gam_problem::HessianResult::Unavailable,
                         warm_start: value_only.warm_start,
                         inner_converged: inner.converged,
                     });
@@ -2172,14 +2172,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
     rho_current: &Array1<f64>,
     derivative_blocks: SharedDerivativeBlocks,
     warm_start: Option<&ConstrainedWarmStart>,
-) -> Result<
-    (
-        crate::solver::rho_optimizer::EfsEval,
-        ConstrainedWarmStart,
-        bool,
-    ),
-    CustomFamilyError,
-> {
+) -> Result<(gam_problem::EfsEval, ConstrainedWarmStart, bool), CustomFamilyError> {
     if derivative_blocks.len() != specs.len() {
         crate::bail_dim_custom!(
             "joint hyper derivative block count mismatch: got {}, expected {}",

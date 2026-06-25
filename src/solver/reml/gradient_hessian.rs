@@ -2061,10 +2061,11 @@ impl<'a> RemlState<'a> {
     {
         result.cost += correction.cost();
         if let Some(correction_hess) = correction.hessian() {
-            result
-                .hessian
-                .add_rho_block_dense(correction_hess)
-                .map_err(EstimationError::InvalidInput)?;
+            crate::solver::objective_base::add_rho_block_dense_to_hessian(
+                &mut result.hessian,
+                correction_hess,
+            )
+            .map_err(EstimationError::InvalidInput)?;
         }
         if let (Some(ref mut grad), Some(correction_grad)) =
             (result.gradient.as_mut(), correction.gradient())

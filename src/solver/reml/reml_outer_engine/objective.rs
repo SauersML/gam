@@ -420,7 +420,7 @@ pub fn reml_laml_evaluate(
             ift_residual_energy,
             inner_polish_step,
             gradient: None,
-            hessian: crate::solver::rho_optimizer::HessianResult::Unavailable,
+            hessian: gam_problem::HessianResult::Unavailable,
             rho_mode_response_cols: None,
             ext_mode_response_cols: None,
         });
@@ -1391,17 +1391,20 @@ pub fn reml_laml_evaluate(
                 .into());
             }
             let assembly_start = std::time::Instant::now();
-            let mut hessian = crate::solver::rho_optimizer::HessianResult::Operator(family_op);
+            let mut hessian = gam_problem::HessianResult::Operator(family_op);
             // Full-θ correction: the matrix spans (ρ ‖ ψ) = the operator's whole
             // dimension, so this folds the cross-ρψ and ψψ blocks too, not just ρρ.
             if let Some(kkt_hessian) = kkt_theta_corrections
                 .as_ref()
                 .and_then(|corrections| corrections.hessian.as_ref())
             {
-                hessian.add_rho_block_dense(kkt_hessian)?;
+                crate::solver::objective_base::add_rho_block_dense_to_hessian(
+                    &mut hessian,
+                    kkt_hessian,
+                )?;
             }
             if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
-                hessian.add_rho_block_dense(ph)?;
+                crate::solver::objective_base::add_rho_block_dense_to_hessian(&mut hessian, ph)?;
             }
             log::info!(
                 "[OUTER hessian-elapsed] choice=operator reason=family_op \
@@ -1486,24 +1489,29 @@ pub fn reml_laml_evaluate(
                 Some(&coord_corrections),
             ) {
                 Ok(op) => {
-                    let mut hessian =
-                        crate::solver::rho_optimizer::HessianResult::Operator(Arc::new(op));
+                    let mut hessian = gam_problem::HessianResult::Operator(Arc::new(op));
                     // Full-θ correction (ρρ + cross-ρψ + ψψ); the matrix is the
                     // operator's whole dimension.
                     if let Some(kkt_hessian) = kkt_theta_corrections
                         .as_ref()
                         .and_then(|corrections| corrections.hessian.as_ref())
                     {
-                        hessian.add_rho_block_dense(kkt_hessian)?;
+                        crate::solver::objective_base::add_rho_block_dense_to_hessian(
+                            &mut hessian,
+                            kkt_hessian,
+                        )?;
                     }
                     if let Some((_, _, Some(ref ph))) = prior_cost_gradient {
-                        hessian.add_rho_block_dense(ph)?;
+                        crate::solver::objective_base::add_rho_block_dense_to_hessian(
+                            &mut hessian,
+                            ph,
+                        )?;
                     }
                     hessian
                 }
                 Err(err) if is_hessian_unavailable(&err) => {
                     log::warn!("{err}");
-                    crate::solver::rho_optimizer::HessianResult::Unavailable
+                    gam_problem::HessianResult::Unavailable
                 }
                 Err(err) => return Err(err),
             }
@@ -1555,11 +1563,11 @@ pub fn reml_laml_evaluate(
                         let mut sl = h.slice_mut(ndarray::s![..k, ..k]);
                         sl += ph;
                     }
-                    crate::solver::rho_optimizer::HessianResult::Analytic(h)
+                    gam_problem::HessianResult::Analytic(h)
                 }
                 Err(err) if is_hessian_unavailable(&err) => {
                     log::warn!("{err}");
-                    crate::solver::rho_optimizer::HessianResult::Unavailable
+                    gam_problem::HessianResult::Unavailable
                 }
                 Err(err) => return Err(err),
             }
@@ -1571,7 +1579,7 @@ pub fn reml_laml_evaluate(
         );
         result
     } else {
-        crate::solver::rho_optimizer::HessianResult::Unavailable
+        gam_problem::HessianResult::Unavailable
     };
 
     // Envelope-gradient sanity tripwire — last line of defense.

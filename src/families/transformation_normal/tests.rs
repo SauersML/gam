@@ -1629,11 +1629,8 @@ pub(crate) fn ctn_inner_and_outer_hvp_capabilities_are_advertised() {
         ..BlockwiseFitOptions::default()
     };
     let (gradient, hessian) = custom_family_outer_derivatives(&family, specs, &options);
-    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
-    assert_eq!(
-        hessian,
-        crate::solver::rho_optimizer::DeclaredHessianForm::Either
-    );
+    assert_eq!(gradient, gam_problem::Derivative::Analytic);
+    assert_eq!(hessian, gam_problem::DeclaredHessianForm::Either);
 
     let rho_dim = spec.initial_log_lambdas.len();
     let psi_dim = derivative_blocks[0].len();
@@ -1696,11 +1693,8 @@ pub(crate) fn ctn_large_n_outer_hvp_capability_selects_operator_path() {
         ..BlockwiseFitOptions::default()
     };
     let (gradient, hessian) = custom_family_outer_derivatives(&family, specs, &options);
-    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
-    assert_eq!(
-        hessian,
-        crate::solver::rho_optimizer::DeclaredHessianForm::Either
-    );
+    assert_eq!(gradient, gam_problem::Derivative::Analytic);
+    assert_eq!(hessian, gam_problem::DeclaredHessianForm::Either);
 }
 
 #[test]

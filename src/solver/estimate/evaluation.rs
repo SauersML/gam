@@ -73,7 +73,7 @@ pub(crate) fn sas_log_delta_edge_barriercostgradhess(raw_log_delta: f64) -> (f64
 }
 
 pub(crate) fn materialize_link_outer_hessian(
-    hessian: crate::solver::rho_optimizer::HessianResult,
+    hessian: gam_problem::HessianResult,
     theta_dim: usize,
 ) -> Result<Array2<f64>, EstimationError> {
     match hessian.materialize_dense() {

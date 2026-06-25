@@ -35,11 +35,11 @@ use crate::solver::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 pub(crate) use crate::solver::persistent_warm_start::{
     PersistentWarmStartRecord, load_record, store_record,
 };
-pub(crate) use crate::solver::rho_optimizer::{HessianResult, OuterEval};
 pub(crate) use crate::types::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, RhoPrior,
     SasLinkState, StandardLink,
 };
+pub(crate) use gam_problem::{HessianResult, OuterEval};
 pub(crate) use gam_runtime::warm_start::Fingerprinter;
 pub(crate) use inference_root::hmc_io::BlockExcessTarget;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, s};

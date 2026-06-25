@@ -12,7 +12,7 @@ pub(crate) struct TestOuterHessianOperator {
     pub(crate) matrix: Array2<f64>,
 }
 
-impl crate::solver::rho_optimizer::OuterHessianOperator for TestOuterHessianOperator {
+impl gam_problem::OuterHessianOperator for TestOuterHessianOperator {
     fn dim(&self) -> usize {
         self.matrix.nrows()
     }
@@ -45,7 +45,7 @@ impl CustomFamily for BatchedOuterHessianTestFamily {
     fn outer_hyper_hessian_operator(
         &self,
         block_specs: &[ParameterBlockSpec],
-    ) -> Option<Arc<dyn crate::solver::rho_optimizer::OuterHessianOperator>> {
+    ) -> Option<Arc<dyn gam_problem::OuterHessianOperator>> {
         let _unused_block_specs = block_specs;
         let _ = block_specs;
         Some(Arc::new(TestOuterHessianOperator {
@@ -116,7 +116,7 @@ pub(crate) fn batched_outer_hessian_terms_materialize_to_exact_small_matrix() {
         .expect("batched Hessian hook succeeds")
         .expect("test family exposes batched HVP terms");
     let operator = match terms.outer_hessian {
-        crate::solver::rho_optimizer::HessianResult::Operator(operator) => operator,
+        gam_problem::HessianResult::Operator(operator) => operator,
         _ => panic!("batched hook should expose an operator"),
     };
     let dense = operator
@@ -2300,11 +2300,8 @@ pub(crate) fn custom_family_outer_derivatives_respects_missing_second_order_capa
         &specs,
         &BlockwiseFitOptions::default(),
     );
-    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
-    assert_eq!(
-        hessian,
-        crate::solver::rho_optimizer::DeclaredHessianForm::Unavailable
-    );
+    assert_eq!(gradient, gam_problem::Derivative::Analytic);
+    assert_eq!(hessian, gam_problem::DeclaredHessianForm::Unavailable);
 }
 
 #[derive(Clone)]
@@ -2450,7 +2447,7 @@ pub(crate) fn default_custom_family_exact_hessian_hooks_drive_profiled_outer_hes
 
     assert_eq!(result.gradient.len(), 1);
     match result.outer_hessian {
-        crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => {
+        gam_problem::HessianResult::Analytic(hessian) => {
             assert_eq!(hessian.dim(), (1, 1));
             assert!(hessian[[0, 0]].is_finite());
         }
@@ -2566,11 +2563,8 @@ pub(crate) fn custom_family_outer_derivatives_exposes_surrogate_second_order_geo
         ..BlockwiseFitOptions::default()
     };
     let (gradient, hessian) = custom_family_outer_derivatives(&SurrogateFamily, &specs, &options);
-    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
-    assert_eq!(
-        hessian,
-        crate::solver::rho_optimizer::DeclaredHessianForm::Either
-    );
+    assert_eq!(gradient, gam_problem::Derivative::Analytic);
+    assert_eq!(hessian, gam_problem::DeclaredHessianForm::Either);
 }
 
 #[test]
@@ -2618,11 +2612,8 @@ pub(crate) fn custom_family_outer_derivatives_keeps_strict_second_order_geometry
         ..BlockwiseFitOptions::default()
     };
     let (gradient, hessian) = custom_family_outer_derivatives(&StrictFamily, &specs, &options);
-    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
-    assert_eq!(
-        hessian,
-        crate::solver::rho_optimizer::DeclaredHessianForm::Either
-    );
+    assert_eq!(gradient, gam_problem::Derivative::Analytic);
+    assert_eq!(hessian, gam_problem::DeclaredHessianForm::Either);
 }
 
 #[derive(Clone)]
@@ -2742,16 +2733,14 @@ pub(crate) fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
     .expect("single-block fallback with zero d2H should evaluate");
 
     let h_with = match with_d2.outer_hessian {
-        crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => hessian,
-        crate::solver::rho_optimizer::HessianResult::Operator(_)
-        | crate::solver::rho_optimizer::HessianResult::Unavailable => {
+        gam_problem::HessianResult::Analytic(hessian) => hessian,
+        gam_problem::HessianResult::Operator(_) | gam_problem::HessianResult::Unavailable => {
             panic!("expected dense analytic Hessian")
         }
     };
     let h_without = match without_d2_contribution.outer_hessian {
-        crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => hessian,
-        crate::solver::rho_optimizer::HessianResult::Operator(_)
-        | crate::solver::rho_optimizer::HessianResult::Unavailable => {
+        gam_problem::HessianResult::Analytic(hessian) => hessian,
+        gam_problem::HessianResult::Operator(_) | gam_problem::HessianResult::Unavailable => {
             panic!("expected dense analytic Hessian")
         }
     };
@@ -3141,11 +3130,8 @@ pub(crate) fn custom_family_outer_derivatives_keeps_second_order_for_large_inner
     };
 
     let (gradient, hessian) = custom_family_outer_derivatives(&StrictFamily, &specs, &options);
-    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
-    assert_eq!(
-        hessian,
-        crate::solver::rho_optimizer::DeclaredHessianForm::Either
-    );
+    assert_eq!(gradient, gam_problem::Derivative::Analytic);
+    assert_eq!(hessian, gam_problem::DeclaredHessianForm::Either);
 }
 
 impl CustomFamily for OneBlockIdentityFamily {

@@ -268,7 +268,7 @@ impl OuterDerivativePolicy {
             OuterEvalOrder::ValueGradientHessian => {
                 if matches!(
                     self.declared_hessian_form(),
-                    crate::solver::rho_optimizer::DeclaredHessianForm::Unavailable
+                    gam_problem::DeclaredHessianForm::Unavailable
                 ) {
                     OuterEvalOrder::ValueAndGradient
                 } else {
@@ -283,8 +283,8 @@ impl OuterDerivativePolicy {
     /// `Either` ⇔ capability has Hessian. Work estimates select dense vs
     /// operator assembly later; they must not erase analytic second-order
     /// capability from the planner.
-    pub fn declared_hessian_form(&self) -> crate::solver::rho_optimizer::DeclaredHessianForm {
-        use crate::solver::rho_optimizer::DeclaredHessianForm;
+    pub fn declared_hessian_form(&self) -> gam_problem::DeclaredHessianForm {
+        use gam_problem::DeclaredHessianForm;
         if !self.capability.has_hessian() {
             return DeclaredHessianForm::Unavailable;
         }

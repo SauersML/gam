@@ -129,11 +129,6 @@ pub(crate) mod rho_prior_eval;
 /// `inference` (#1135).
 pub mod rho_uncertainty;
 pub mod solver;
-/// Lower-layer outer-objective contract (the `OuterHessianOperator` trait,
-/// `OuterEval`/`HessianResult`/`EfsEval`, and the capability enums) that the
-/// `families` layer implements and returns. Hosted below `solver` so families
-/// do not import *up* into `crate::solver::rho_optimizer` (#1135).
-pub mod solver_contract;
 pub mod terms;
 pub mod test_support;
 pub mod types;
@@ -170,6 +165,10 @@ pub use solver::estimate::reml::reml_outer_engine::PenaltySubspaceTrace;
 // arrow-border overlap drive `run_per_atom_efs` directly with an explicit
 // `SharedBorderTopology` (`new` for a named border set, `disjoint` /
 // `fully_coupled` for the two extremes).
+pub use gam_problem::{
+    DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterEval,
+    OuterHessianMaterialization, OuterHessianOperator, OuterStrategyError,
+};
 pub use gam_runtime::resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
     ProblemHints, ResidentBytes, ResourcePolicy,
@@ -180,10 +179,6 @@ pub use solver::estimate::reml::per_atom_efs::{
 };
 pub use solver::{
     estimate, gaussian_reml, mixture_link, pirls, seeding, topology_selector, visualizer,
-};
-pub use solver_contract::{
-    DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterEval,
-    OuterHessianMaterialization, OuterHessianOperator, OuterStrategyError,
 };
 pub use terms::{basis, construction, smooth, term_builder};
 

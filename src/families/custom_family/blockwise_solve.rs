@@ -94,7 +94,10 @@ pub(crate) fn add_labeled_rho_prior_to_outer_eval(
     if eval_mode == EvalMode::ValueGradientHessian
         && let Some(prior_hessian) = hessian
     {
-        result.outer_hessian.add_rho_block_dense(&prior_hessian)?;
+        crate::solver::objective_base::add_rho_block_dense_to_hessian(
+            &mut result.outer_hessian,
+            &prior_hessian,
+        )?;
     }
     Ok(result)
 }
@@ -128,19 +131,13 @@ pub(crate) fn pullback_labeled_outer_eval(
     }
     if eval_mode == EvalMode::ValueGradientHessian {
         result.outer_hessian = match result.outer_hessian {
-            crate::solver::rho_optimizer::HessianResult::Analytic(hessian) => {
-                crate::solver::rho_optimizer::HessianResult::Analytic(aggregate_labeled_hessian(
-                    &hessian, layout,
-                )?)
+            gam_problem::HessianResult::Analytic(hessian) => {
+                gam_problem::HessianResult::Analytic(aggregate_labeled_hessian(&hessian, layout)?)
             }
-            crate::solver::rho_optimizer::HessianResult::Operator(operator) => {
-                crate::solver::rho_optimizer::HessianResult::Operator(Arc::new(
-                    LabeledOuterHessianOperator::new(operator, layout),
-                ))
-            }
-            crate::solver::rho_optimizer::HessianResult::Unavailable => {
-                crate::solver::rho_optimizer::HessianResult::Unavailable
-            }
+            gam_problem::HessianResult::Operator(operator) => gam_problem::HessianResult::Operator(
+                Arc::new(LabeledOuterHessianOperator::new(operator, layout)),
+            ),
+            gam_problem::HessianResult::Unavailable => gam_problem::HessianResult::Unavailable,
         };
     }
     result.warm_start.rho = rho.clone();
