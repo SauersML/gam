@@ -1890,8 +1890,21 @@ fn freeze_roundtrip_preserves_hierarchical_smooth_transforms() {
 
 #[test]
 fn spatial_option5_preserves_lazy_thin_plate_terms_at_large_scale() {
-    let n = 17_000usize;
-    let k = 2_000usize;
+    // The thin-plate term goes operator-backed once its projected dense
+    // materialization exceeds the resource policy's byte budget, i.e. once
+    // `n · base_cols · 8` crosses the cap (`base_cols == k` for thin-plate).
+    // We size that with *many rows and few centers* rather than many centers:
+    // the build's only super-linear compute is the O(k^3)
+    // `thin_plate_kernel_constraint_nullspace` RRQR, and the downstream
+    // orthogonality check streams the lazy design in O(n · k) without ever
+    // materializing the n×k block. The previous (17_000 × 2_000) pin forced a
+    // 2_000×2_000 dense RRQR that, under the unoptimized `[profile.test]` build
+    // (opt-level 0), runs for minutes and risks the per-test CI timeout. With
+    // `k = 256` the cubic factorization is microseconds, while `n = 200_000`
+    // gives `200_000 · 256 · 8 ≈ 410 MiB` — above the previous pin's ~272 MiB,
+    // so the lazy switch still fires under the same policy.
+    let n = 200_000usize;
+    let k = 256usize;
     let mut data = Array2::<f64>::zeros((n, 1));
     let mut centers = Array2::<f64>::zeros((k, 1));
     for i in 0..n {
