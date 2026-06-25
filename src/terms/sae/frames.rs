@@ -442,8 +442,10 @@ pub(crate) fn build_framed_device_sae_data(
     DeviceSaePcgData {
         p,
         beta_dim: border_dim,
-        a_phi: Vec::new(),
-        local_jac: Vec::new(),
+        // #1033: empty shared slices — the frames path carries its cross-block
+        // through `frame.frame_blocks`, not the full-`B` `a_phi`/`local_jac`.
+        a_phi: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+        local_jac: std::sync::Arc::from(Vec::new().into_boxed_slice()),
         smooth_blocks,
         sparse_g_blocks: Vec::new(),
         frame: Some(DeviceSaeFrameData {

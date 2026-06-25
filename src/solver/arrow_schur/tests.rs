@@ -3368,8 +3368,8 @@ pub(crate) fn sae_structured_system(
     sys.set_device_sae_pcg_data(DeviceSaePcgData {
         p,
         beta_dim: k,
-        a_phi: a_phi.clone(),
-        local_jac: local_jac.clone(),
+        a_phi: std::sync::Arc::from(a_phi.clone().into_boxed_slice()),
+        local_jac: std::sync::Arc::from(local_jac.clone().into_boxed_slice()),
         smooth_blocks: Vec::new(),
         sparse_g_blocks: Vec::new(),
         frame: None,
@@ -3461,6 +3461,63 @@ pub(crate) fn resident_sae_matvec_matches_generic() {
             "resident SAE matvec must be deterministic run-to-run at index {a}"
         );
     }
+}
+
+/// #1033 large-n sharing invariant. The per-row support `a_phi` and local
+/// Jacobians `local_jac` are now held as `Arc<[…]>` so the assembler can hand
+/// BOTH the host matrix-free row operator (`SaeKroneckerRows`) and the solver's
+/// `DeviceSaePcgData` the SAME backing allocation instead of a second full
+/// `O(n·q·p)` clone. This test pins the no-second-copy contract two ways:
+///   1. `DeviceSaePcgData::a_phi_shared()` must return a refcount bump of the
+///      data's own `a_phi` (`Arc::ptr_eq`), not a fresh deep clone.
+///   2. A `SaeKroneckerRows` built from a shared `Arc` and a `DeviceSaePcgData`
+///      built from a CLONE of that same `Arc` reference the identical buffer.
+/// A regression that reverts either to a `Vec` deep-clone would double the
+/// always-resident per-row Jacobian footprint at the LLM shape (p≈5120) and
+/// fail `Arc::ptr_eq` here, even though every matvec stays numerically equal.
+#[test]
+pub(crate) fn sae_kron_and_device_share_backing_alloc_1033() {
+    use crate::terms::sae::manifold::SaeKroneckerRows;
+    let p = 6usize;
+    let a_phi: std::sync::Arc<[Vec<(usize, f64)>]> = std::sync::Arc::from(
+        vec![vec![(0usize, 2.0f64), (12, 1.0)], vec![(0, 0.5)]].into_boxed_slice(),
+    );
+    let jac: std::sync::Arc<[Vec<f64>]> = std::sync::Arc::from(
+        vec![vec![1.0; 4 * p], vec![2.0; 4 * p]].into_boxed_slice(),
+    );
+    // Assembler shares ONE allocation with both consumers (refcount bumps only).
+    let host = SaeKroneckerRows::new(p, std::sync::Arc::clone(&a_phi), std::sync::Arc::clone(&jac));
+    let device = DeviceSaePcgData {
+        p,
+        beta_dim: 6,
+        a_phi: std::sync::Arc::clone(&a_phi),
+        local_jac: std::sync::Arc::clone(&jac),
+        smooth_blocks: Vec::new(),
+        sparse_g_blocks: Vec::new(),
+        frame: None,
+    };
+    // (1) a_phi_shared is O(1) — same backing buffer, not a deep clone.
+    let reshare = device.a_phi_shared();
+    assert!(
+        std::sync::Arc::ptr_eq(&reshare, &device.a_phi),
+        "a_phi_shared must hand back the SAME allocation, not a re-clone"
+    );
+    // (2) host operator and device data point at the identical Jacobian buffer.
+    assert!(
+        std::sync::Arc::ptr_eq(&host.local_jac, &device.local_jac),
+        "host SaeKroneckerRows and DeviceSaePcgData must share one local_jac alloc"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&host.a_phi, &device.a_phi),
+        "host SaeKroneckerRows and DeviceSaePcgData must share one a_phi alloc"
+    );
+    // strong_count = original + host + device (+ reshare for a_phi) — a deep
+    // clone would instead leave the counts at the lower no-share value.
+    assert_eq!(
+        std::sync::Arc::strong_count(&jac),
+        3,
+        "exactly three references (original, host, device) share the Jacobian"
+    );
 }
 
 /// The #1017 SAE-resident scalar Jacobi (built from the staged `(L_i, Y_i)`

@@ -709,8 +709,15 @@ pub struct DeviceSaeFrameData {
 pub struct DeviceSaePcgData {
     pub p: usize,
     pub beta_dim: usize,
-    pub a_phi: Vec<Vec<(usize, f64)>>,
-    pub local_jac: Vec<Vec<f64>>,
+    // #1033 large-n: the per-row support `a_phi` and local Jacobians `local_jac`
+    // are ALSO held by the host matrix-free row operator (`SaeKroneckerRows`) for
+    // the lifetime of the inner solve. Storing them as `Arc<[…]>` lets the
+    // assembler hand BOTH consumers the SAME backing allocation instead of a
+    // second full `O(n·q·p)` clone (`device_rows = (a_phi.clone(), kron_jac.clone())`
+    // was the dominant always-resident duplication on the CPU non-frames path at
+    // the LLM shape p≈5120). Indexing/`.len()`/iteration are identical to `Vec`.
+    pub a_phi: Arc<[Vec<(usize, f64)>]>,
+    pub local_jac: Arc<[Vec<f64>]>,
     pub smooth_blocks: Vec<DeviceSaeSmoothBlock>,
     pub sparse_g_blocks: Vec<SparseGBlock>,
     /// Frame-factored metadata. `None` ⇒ legacy full-`B` `G ⊗ I_p` path
@@ -727,7 +734,9 @@ impl DeviceSaePcgData {
     /// in the same build), so the resident matvec borrows the index lists without
     /// re-cloning them on every CG iteration.
     pub(crate) fn a_phi_shared(&self) -> Arc<[Vec<(usize, f64)>]> {
-        Arc::from(self.a_phi.clone().into_boxed_slice())
+        // #1033: `a_phi` is already an `Arc<[…]>`; hand back a refcount bump
+        // (`O(1)`) rather than re-cloning every `(idx, weight)` pair per CG build.
+        Arc::clone(&self.a_phi)
     }
 }
 

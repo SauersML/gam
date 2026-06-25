@@ -2492,7 +2492,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         let mut beta_base_host = Vec::<i32>::new();
         let mut phi_host = Vec::<f64>::new();
         row_ptr_host.push(0_i32);
-        for row in &data.a_phi {
+        for row in data.a_phi.iter() {
             for &(base, phi) in row {
                 beta_base_host.push(checked_i32(base)?);
                 phi_host.push(phi);
@@ -2504,7 +2504,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         let mut jac_host = Vec::<f64>::new();
         let mut max_q = 0usize;
         jac_ptr_host.push(0_i32);
-        for row_jac in &data.local_jac {
+        for row_jac in data.local_jac.iter() {
             if row_jac.len() % p != 0 {
                 return Err(ArrowSchurGpuFailure::Unavailable);
             }
@@ -5161,8 +5161,8 @@ mod tests {
         let data = DeviceSaePcgData {
             p,
             beta_dim: border_dim,
-            a_phi: Vec::new(),
-            local_jac: Vec::new(),
+            a_phi: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            local_jac: std::sync::Arc::from(Vec::new().into_boxed_slice()),
             smooth_blocks,
             sparse_g_blocks: Vec::new(),
             frame: Some(DeviceSaeFrameData {
@@ -5415,8 +5415,8 @@ mod tests {
         let data = DeviceSaePcgData {
             p,
             beta_dim: border_dim,
-            a_phi: Vec::new(),
-            local_jac: Vec::new(),
+            a_phi: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+            local_jac: std::sync::Arc::from(Vec::new().into_boxed_slice()),
             smooth_blocks,
             sparse_g_blocks: Vec::new(),
             frame: Some(DeviceSaeFrameData {

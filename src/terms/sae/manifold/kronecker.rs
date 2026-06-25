@@ -68,20 +68,29 @@ pub struct SaeKroneckerRows {
     /// Decoder output dimension `p`.
     pub(crate) p: usize,
     /// Per-row sparse support: `a_phi[i]` is a `Vec<(beta_base_idx, weight)>`.
-    pub(crate) a_phi: Vec<Vec<(usize, f64)>>,
+    ///
+    /// #1033 large-n: held as `Arc<[…]>` so the SAME backing allocation is
+    /// shared with the solver's [`DeviceSaePcgData`] instead of cloned a second
+    /// time (`O(n·k_active)` saved on the always-resident CPU non-frames path).
+    pub(crate) a_phi: std::sync::Arc<[Vec<(usize, f64)>]>,
     /// Per-row local Jacobian `L_i`, shape `(q_i × p)` flattened row-major.
     ///
     /// Element `(c, j)` is at `local_jac[i][c * p + j]`.
     /// For heterogeneous (active-set) systems, each row may have a different
-    /// `q_i = local_jac[i].len() / p`.
-    pub(crate) local_jac: Vec<Vec<f64>>,
+    /// `q_i = local_jac[i].len() / p`. Shared (`Arc<[…]>`) with the solver's
+    /// `DeviceSaePcgData.local_jac` — the dominant `O(n·q·p)` resident slab.
+    pub(crate) local_jac: std::sync::Arc<[Vec<f64>]>,
 }
 
 impl SaeKroneckerRows {
     /// Build from per-row data collected during `assemble_arrow_schur`. The
     /// row count is implicit in `a_phi.len()` and `local_jac.len()`; the
     /// constructor asserts they agree so callers cannot pass mismatched rows.
-    pub fn new(p: usize, a_phi: Vec<Vec<(usize, f64)>>, local_jac: Vec<Vec<f64>>) -> Self {
+    pub fn new(
+        p: usize,
+        a_phi: std::sync::Arc<[Vec<(usize, f64)>]>,
+        local_jac: std::sync::Arc<[Vec<f64>]>,
+    ) -> Self {
         assert_eq!(
             a_phi.len(),
             local_jac.len(),
