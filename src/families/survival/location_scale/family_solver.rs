@@ -1477,6 +1477,58 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         true
     }
 
+    /// Batched all-axes first beta-directional derivative of the joint Jeffreys
+    /// information, building the per-row joint quantities and dynamic geometry
+    /// ONCE and sweeping every canonical axis from them.
+    ///
+    /// The trait default fans `p` independent per-axis calls across the Rayon
+    /// pool, and each call re-enters
+    /// `exact_newton_joint_hessian_directional_derivative` → `…_rescaled`,
+    /// which rebuilds `collect_joint_quantities_rescaled` (the per-row
+    /// third-order survival jet) and `build_dynamic_geometry` from scratch — so
+    /// the same `O(n)` quantity build is recomputed `p` times per all-axes
+    /// object. The Jeffreys/Firth conditioning gate keeps this object live on
+    /// every armed inner-Newton cycle and outer Hessian eval (the
+    /// under-identified constant-scale time ridge of #1389 keeps it armed), so
+    /// the redundant rebuild is a real, repeated cost. Because
+    /// `has_explicit_joint_hessian()` is unconditionally true, the default's
+    /// per-axis `…_with_specs` chain reduces EXACTLY to
+    /// `exact_newton_joint_hessian_directional_derivative_rescaled_from_parts`
+    /// with `log_rescale = hessian_deriv_log_rescale(block_states)`, so reusing a
+    /// single `(q, dynamic)` across the axis sweep is bit-identical to the
+    /// default while paying the quantity build once instead of `p` times.
+    fn joint_jeffreys_information_directional_derivative_all_axes_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+    ) -> Result<Option<Vec<Array2<f64>>>, String> {
+        // Match the trait default's canonical-axis count (`Σ block design ncols`);
+        // for this family it equals the joint block-offset width that
+        // `…_from_parts` validates `d_beta` against.
+        let p_total = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
+        if p_total == 0 {
+            return Ok(None);
+        }
+        let log_rescale = self.hessian_deriv_log_rescale(block_states);
+        let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
+        let dynamic = self.build_dynamic_geometry(block_states)?;
+        let mut axes = Vec::with_capacity(p_total);
+        for a in 0..p_total {
+            let mut e_a = Array1::<f64>::zeros(p_total);
+            e_a[a] = 1.0;
+            match self.exact_newton_joint_hessian_directional_derivative_rescaled_from_parts(
+                &e_a,
+                &q,
+                &dynamic,
+                log_rescale,
+            )? {
+                Some(m) => axes.push(m),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(axes))
+    }
+
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
         true
     }
