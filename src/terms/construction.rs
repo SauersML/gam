@@ -12,6 +12,7 @@ use rayon::iter::{
 };
 use std::collections::{BTreeMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub enum PenaltyRepresentation {
@@ -2408,11 +2409,15 @@ pub fn stable_reparameterization_engine_canonical(
 #[derive(Clone)]
 pub struct KroneckerReparamResult {
     /// Reparameterized marginal designs: `B_k · U_k` for each marginal k.
-    pub reparameterized_marginals: Vec<Array2<f64>>,
+    ///
+    /// `Arc`-shared with the λ-invariant cache so the per-outer-iterate
+    /// memoized engine bumps a refcount instead of deep-copying the
+    /// (n × q) reparameterized marginals every call.
+    pub reparameterized_marginals: Arc<Vec<Array2<f64>>>,
     /// Marginal eigenvalues from each marginal penalty eigendecomposition.
-    pub marginal_eigenvalues: Vec<Array1<f64>>,
+    pub marginal_eigenvalues: Arc<Vec<Array1<f64>>>,
     /// Marginal eigenvector matrices U_k.
-    pub marginal_qs: Vec<Array2<f64>>,
+    pub marginal_qs: Arc<Vec<Array2<f64>>>,
     /// log|S|₊ computed from marginal eigenvalue grid.
     pub log_det: f64,
     /// First derivatives of log|S|₊ w.r.t. ρ_k = log(λ_k).
@@ -2736,11 +2741,14 @@ pub fn kronecker_logdet_and_derivatives(
 #[derive(Clone, Debug)]
 pub struct KroneckerInvariantStructure {
     /// Marginal eigenvalues from each marginal penalty eigendecomposition.
-    pub marginal_eigenvalues: Vec<Array1<f64>>,
+    ///
+    /// `Arc`-shared so handing this structure to the per-iterate memoized
+    /// engine is an O(1) refcount bump, not a deep array copy.
+    pub marginal_eigenvalues: Arc<Vec<Array1<f64>>>,
     /// Marginal eigenvector matrices U_k.
-    pub marginal_qs: Vec<Array2<f64>>,
+    pub marginal_qs: Arc<Vec<Array2<f64>>>,
     /// Reparameterized marginal designs: `B_k · U_k` for each marginal k.
-    pub reparameterized_marginals: Vec<Array2<f64>>,
+    pub reparameterized_marginals: Arc<Vec<Array2<f64>>>,
     /// Max balanced-penalty eigenvalue scale `max_k-grid Σ_k μ_{k,j_k}/||S_k||_F`,
     /// used to form the shrinkage ridge `floor * max_bal`. λ-independent.
     pub max_balanced_eigenvalue: f64,
@@ -2795,9 +2803,9 @@ impl KroneckerInvariantStructure {
         }
 
         Ok(Self {
-            marginal_eigenvalues,
-            marginal_qs,
-            reparameterized_marginals,
+            marginal_eigenvalues: Arc::new(marginal_eigenvalues),
+            marginal_qs: Arc::new(marginal_qs),
+            reparameterized_marginals: Arc::new(reparameterized_marginals),
             max_balanced_eigenvalue,
         })
     }
@@ -2851,9 +2859,11 @@ pub fn kronecker_reparameterization_engine_with_invariant(
     has_double_penalty: bool,
     penalty_shrinkage_floor: Option<f64>,
 ) -> Result<KroneckerReparamResult, EstimationError> {
-    let marginal_eigenvalues = invariant.marginal_eigenvalues.clone();
-    let marginal_qs = invariant.marginal_qs.clone();
-    let reparameterized_marginals = invariant.reparameterized_marginals.clone();
+    // Arc refcount bumps — the underlying eigensystems / reparameterized
+    // marginals are λ-invariant and shared with the cache, not deep-copied.
+    let marginal_eigenvalues = Arc::clone(&invariant.marginal_eigenvalues);
+    let marginal_qs = Arc::clone(&invariant.marginal_qs);
+    let reparameterized_marginals = Arc::clone(&invariant.reparameterized_marginals);
 
     // Compute shrinkage ridge from balanced penalty eigenvalue scale.
     let penalty_shrinkage_ridge = if let Some(floor) = penalty_shrinkage_floor {

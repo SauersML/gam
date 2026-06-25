@@ -163,7 +163,7 @@ impl PirlsPenalty {
 
 #[derive(Clone)]
 pub(crate) struct KroneckerQsTransform {
-    pub(super) marginal_qs: Vec<Array2<f64>>,
+    pub(super) marginal_qs: std::sync::Arc<Vec<Array2<f64>>>,
     pub(super) dims: Vec<usize>,
     pub(super) p: usize,
 }
@@ -173,7 +173,9 @@ impl KroneckerQsTransform {
         let dims = result.marginal_dims.clone();
         let p = dims.iter().product();
         Self {
-            marginal_qs: result.marginal_qs.clone(),
+            // Arc refcount bump — the U_k eigenvector matrices are λ-invariant
+            // and shared with the cache, not deep-copied each outer iterate.
+            marginal_qs: std::sync::Arc::clone(&result.marginal_qs),
             dims,
             p,
         }

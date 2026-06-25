@@ -2305,9 +2305,9 @@ mod tests {
     #[test]
     fn kronecker_diagonal_double_penalty_hits_only_joint_null_space() {
         let kron_result = KroneckerReparamResult {
-            reparameterized_marginals: Vec::new(),
-            marginal_eigenvalues: vec![array![0.0, 2.0], array![0.0, 3.0]],
-            marginal_qs: Vec::new(),
+            reparameterized_marginals: std::sync::Arc::new(Vec::new()),
+            marginal_eigenvalues: std::sync::Arc::new(vec![array![0.0, 2.0], array![0.0, 3.0]]),
+            marginal_qs: std::sync::Arc::new(Vec::new()),
             log_det: 0.0,
             det1: Array1::zeros(3),
             det2: Array2::zeros((3, 3)),

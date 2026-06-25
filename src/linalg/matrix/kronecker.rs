@@ -469,11 +469,33 @@ impl DenseDesignOperator for TensorProductDesignOperator {
                 context: "TensorProductDesignOperator::row_chunk_into shape mismatch",
             });
         }
+        // Reuse two scratch buffers across all rows in the chunk instead of
+        // allocating a fresh `Vec` per row (and a fresh `next` per marginal
+        // per row) inside `row_values`. The Khatri-Rao contraction is written
+        // straight into the contiguous `out` row, bit-identically: same
+        // `prefix * marginal[[row, col]]` products in the same order.
+        let mut cur = Vec::<f64>::with_capacity(self.total_cols);
+        let mut next = Vec::<f64>::with_capacity(self.total_cols);
         for (local_row, global_row) in rows.enumerate() {
-            let row_values = self.row_values(global_row);
-            for (j, &value) in row_values.iter().enumerate() {
-                out[[local_row, j]] = value;
+            cur.clear();
+            cur.push(1.0);
+            for marginal in &self.marginals {
+                let q = marginal.ncols();
+                next.clear();
+                next.resize(cur.len() * q, 0.0);
+                for (prefix_idx, &prefix) in cur.iter().enumerate() {
+                    let off = prefix_idx * q;
+                    for col in 0..q {
+                        next[off + col] = prefix * marginal[[global_row, col]];
+                    }
+                }
+                std::mem::swap(&mut cur, &mut next);
             }
+            let out_row = out
+                .row_mut(local_row)
+                .as_slice_mut()
+                .expect("design chunk row is contiguous in C-major Array2");
+            out_row.copy_from_slice(&cur);
         }
         Ok(())
     }
