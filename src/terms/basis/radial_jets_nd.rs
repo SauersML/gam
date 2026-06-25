@@ -619,6 +619,80 @@ pub fn duchon_sae_atom_basis_with_jet(
     Ok((phi, jet))
 }
 
+/// Reproducing-norm smoothness penalty for the scale-free Duchon SAE atom,
+/// consistent column-for-column with [`duchon_sae_atom_basis_with_jet`].
+///
+/// The atom basis is `[ (Φ_radial·α)·Z | P ]` (the `Z`-constrained, `α`-amplified
+/// kernel block followed by the polynomial nullspace `P`). The native
+/// reproducing (bending-energy) norm of a function in this basis is
+/// `ω = α²·Zᵀ K_CC Z` on the constrained kernel coordinates, with the polynomial
+/// nullspace unpenalized — so the `(n_kernel + n_poly)²` penalty is
+/// `blockdiag(α²·Zᵀ K_CC Z, 0)`.
+///
+/// Unlike the design-path `build_duchon_basis`, this does NOT run the TPRS
+/// generalized-eigen reparameterization / near-null mode dropping (#1347): the
+/// SAE atom keeps ALL `m` evaluator columns (the evaluator re-evaluates Φ at
+/// updated latent coords every inner step, so its width is fixed at `m`), and
+/// the SAE-specific arc-length reweighting in
+/// `SaeManifoldAtom::refresh_intrinsic_smooth_penalty` plays the metric role
+/// TPRS plays on the design path. With coincident/duplicate seed centers (the
+/// over-complete large-K regime) `Zᵀ K_CC Z` is merely rank-deficient — its
+/// degenerate directions get ~zero penalty, which the inner solve's per-row
+/// Tikhonov ridge conditions — rather than changing the basis width and
+/// desyncing `phi` (width `m`) from the penalty (the #1221/#1026 32K bug).
+pub fn duchon_sae_atom_penalty(
+    centers: ArrayView2<'_, f64>,
+    nullspace_order: DuchonNullspaceOrder,
+) -> Result<Array2<f64>, BasisError> {
+    let dim = centers.ncols();
+    if dim == 0 {
+        crate::bail_invalid_basis!(
+            "duchon_sae_atom_penalty: centers must have at least one column"
+        );
+    }
+    let effective_order = duchon_effective_nullspace_order(centers, nullspace_order);
+    let p_order = duchon_p_from_nullspace_order(effective_order);
+    let s_order: f64 = 0.0;
+    let poly_block_centers = polynomial_block_from_order(centers, effective_order);
+    let z = kernel_constraint_nullspace_from_matrix(poly_block_centers.view())?;
+    let n_kernel = z.ncols();
+    let n_poly = poly_block_centers.ncols();
+    let pure_poly_coeff =
+        PolyharmonicBlockCoeff::new(pure_duchon_block_order(p_order, s_order), dim);
+    let kernel_amp = duchon_kernel_amplification(
+        centers,
+        None,
+        p_order,
+        duchon_power_to_usize(s_order),
+        dim,
+        None,
+        None,
+        Some(&pure_poly_coeff),
+    );
+    // Center-to-center reproducing kernel Gram `K_CC[i,j] = φ(|c_i − c_j|)`.
+    let n_centers = centers.nrows();
+    let mut k_cc = Array2::<f64>::zeros((n_centers, n_centers));
+    for i in 0..n_centers {
+        for j in 0..n_centers {
+            let r = euclidean_distance_rows(centers, i, centers, j);
+            k_cc[[i, j]] = pure_poly_coeff.eval(r);
+        }
+    }
+    // ω_kernel = α² · Zᵀ K_CC Z (n_kernel × n_kernel), symmetrized for safety.
+    let kz = fast_ab(&k_cc, &z);
+    let z_t = z.t().to_owned();
+    let ztkz = fast_ab(&z_t, &kz);
+    let amp2 = kernel_amp * kernel_amp;
+    let m = n_kernel + n_poly;
+    let mut penalty = Array2::<f64>::zeros((m, m));
+    for a in 0..n_kernel {
+        for b in 0..n_kernel {
+            penalty[[a, b]] = 0.5 * amp2 * (ztkz[[a, b]] + ztkz[[b, a]]);
+        }
+    }
+    Ok(penalty)
+}
+
 /// Second input-location jet of the scale-free Duchon SAE atom (the analytic
 /// Hessian `∂²Φ / ∂t_a ∂t_c`), consistent with
 /// [`duchon_sae_atom_basis_with_jet`] column-for-column and `α`-for-`α`.

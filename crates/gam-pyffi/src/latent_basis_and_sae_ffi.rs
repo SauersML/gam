@@ -5153,68 +5153,23 @@ fn sae_build_duchon_atom(
     pts: ArrayView2<'_, f64>,
     centers: ArrayView2<'_, f64>,
 ) -> Result<(Array2<f64>, Array3<f64>, Array2<f64>), String> {
-    // The `DuchonCoordinateEvaluator` evaluates the pure polyharmonic basis
-    // (`length_scale = None`, `power = 0`, scale-free) at the resolved nullspace
-    // order, so the matching smoothness penalty is the native reproducing-norm
-    // Gram `ω = α²·Zᵀ K_CC Z`, which the redesigned `build_duchon_basis` emits
-    // as `PenaltySource::Primary` (the structural roughness energy on the same
-    // `[K(·,C)·Z | P]` columns the evaluator produces). The redesign no longer
-    // ships the old mass/tension/stiffness operator triplet for the Euclidean
-    // path, so `operator_penalties` is fully disabled here — the native penalty
-    // path ignores it, and leaving a stale `Active` stiffness would only mislead.
-    //
-    // The nullspace order and power MUST match the evaluator (`power = 0`,
-    // order = `duchon_nullspace_from_m(m)`); with `m = sae_duchon_atom_m(d)` the
-    // polynomial nullspace is large enough that the native Gram is well-posed.
+    // The smoothness penalty is the native reproducing-norm Gram
+    // `ω = α²·Zᵀ K_CC Z`, built directly on the SAME `[ (Φ_radial·α)·Z | P ]`
+    // columns the `DuchonCoordinateEvaluator` produces (issue #247: the seed
+    // must match the refresh evaluator bit-for-bit) and — critically — at the
+    // SAME width `m` as `phi`. It is NOT sourced from `build_duchon_basis`: that
+    // design path runs the TPRS generalized-eigen reparameterization / near-null
+    // mode dropping (#1347), which on coincident/duplicate seed centers (the
+    // over-complete large-K regime) emits a penalty NARROWER than `m`, desyncing
+    // it from the evaluator's fixed-`m` basis — the #1026 32K Duchon shape bug.
+    // `duchon_sae_atom_penalty` keeps all `m` columns; degenerate directions get
+    // ~zero penalty (handled by the inner solve's per-row Tikhonov ridge), the
+    // SAE-specific arc-length reweighting in `refresh_intrinsic_smooth_penalty`
+    // plays TPRS's metric role for the atom.
     let dim = centers.ncols();
     let m: usize = sae_duchon_atom_m(dim);
-    let spec = DuchonBasisSpec {
-        radial_reparam: None,
-        center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
-        length_scale: None,
-        power: 0.0,
-        nullspace_order: duchon_nullspace_from_m(m),
-        identifiability: SpatialIdentifiability::None,
-        aniso_log_scales: None,
-        operator_penalties: DuchonOperatorPenaltySpec {
-            mass: OperatorPenaltySpec::Disabled,
-            tension: OperatorPenaltySpec::Disabled,
-            stiffness: OperatorPenaltySpec::Disabled,
-        },
-        periodic: None,
-        boundary: OneDimensionalBoundary::Open,
-    };
-    // The penalty matrix is the only piece sourced from the full builder; the
-    // design `Phi` and its input-location jet come from the single
-    // amplification-consistent core entry point so the seed atom matches the
-    // `DuchonCoordinateEvaluator` refresh bit-for-bit (issue #247).
-    let built = build_duchon_basis(centers, &spec).map_err(|err| err.to_string())?;
-    // The structural roughness penalty is the native reproducing-norm Gram,
-    // emitted as the `PenaltySource::Primary` block. The redesigned Euclidean
-    // Duchon basis always emits exactly one `Primary` candidate, so assert it as
-    // a structural invariant rather than silently returning `None`.
-    let primary_idx = built
-        .penaltyinfo
-        .iter()
-        .position(|info| matches!(info.source, gam::terms::basis::PenaltySource::Primary))
-        .ok_or_else(|| {
-            format!(
-                "sae_build_duchon_atom: native (Primary) smoothness penalty was not built for \
-                 dim={dim}, m={m}, nullspace_order={:?}; the Euclidean Duchon basis must always \
-                 emit a Primary native-norm Gram",
-                duchon_nullspace_from_m(m),
-            )
-        })?;
-    let penalty = built
-        .penalties
-        .get(primary_idx)
-        .ok_or_else(|| {
-            format!(
-                "sae_build_duchon_atom: native penalty index {primary_idx} exceeds {} penalty matrices",
-                built.penalties.len()
-            )
-        })?
-        .clone();
+    let penalty = gam::terms::basis::duchon_sae_atom_penalty(centers, duchon_nullspace_from_m(m))
+        .map_err(|err| err.to_string())?;
     let evaluator = DuchonCoordinateEvaluator::new(centers.to_owned(), m)?;
     let (phi, jet) = if pts.nrows() == 0 {
         let probe = Array2::<f64>::zeros((1, pts.ncols()));
