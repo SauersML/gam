@@ -211,6 +211,41 @@ fn build_framed_sae_system(install_device_data: bool) -> ArrowSchurSystem {
         sys.gb[a] = 0.05 * ((a as f64 + 1.0) * 0.31).sin();
     }
 
+    // Install the matrix-free per-row `H_tβ` operator (dense-backed), mirroring
+    // the production full-`B` SAE path (`set_row_htbeta_operator`). The operator
+    // reads the same `q × border_dim` row-major slabs already stored on
+    // `sys.rows[i].htbeta`; with it installed the system matches the production
+    // matrix-free shape.
+    let slabs = row_htbeta.clone();
+    let fwd_slabs = slabs.clone();
+    let bd = border_dim;
+    let qd = q;
+    sys.set_row_htbeta_operator(
+        move |row_idx, x, out| {
+            let slab = &fwd_slabs[row_idx];
+            let out_s = out.as_slice_mut().expect("std layout");
+            for r in 0..qd {
+                let mut acc = 0.0;
+                let base = r * bd;
+                for c in 0..bd {
+                    acc += slab[base + c] * x[c];
+                }
+                out_s[r] = acc;
+            }
+        },
+        move |row_idx, v, out| {
+            let slab = &slabs[row_idx];
+            let out_s = out.as_slice_mut().expect("std layout");
+            for r in 0..qd {
+                let vr = v[r];
+                let base = r * bd;
+                for c in 0..bd {
+                    out_s[c] += slab[base + c] * vr;
+                }
+            }
+        },
+    );
+
     // `set_device_sae_pcg_data` asserts `a_phi`/`local_jac` have one entry per
     // row (the full-`B` residency operator's per-row support). The framed kernel
     // consumes `frame.row_htbeta` instead and ignores these, but the installer's
