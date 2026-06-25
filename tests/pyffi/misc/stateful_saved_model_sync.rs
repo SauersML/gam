@@ -10,7 +10,7 @@ use gam::solver::estimate::{
 use gam::solver::pirls::PirlsStatus;
 use gam::types::{
     InverseLink, LatentCLogLogState, LikelihoodScaleMetadata, LikelihoodSpec,
-    LogLikelihoodNormalization, ResponseFamily, SasLinkState, StandardLink,
+    LogLikelihoodNormalization, ResponseFamily, StandardLink,
 };
 use ndarray::{Array1, Array2};
 use serde_json::Value;
@@ -249,7 +249,8 @@ fn saved_model_group_metadata_is_optional_and_roundtrips() {
 #[test]
 fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     let log_delta = -0.4;
-    let sas_state = SasLinkState::new(0.25, log_delta).expect("valid sas state");
+    let sas_state =
+        gam::mixture_link::sas_link_state_from_raw(0.25, log_delta).expect("valid sas state");
     let covariance =
         Array2::from_shape_vec((2, 2), vec![0.1, 0.02, 0.02, 0.2]).expect("2x2 covariance");
     let mut payload = FittedModelPayload::new(

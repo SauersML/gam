@@ -4,7 +4,6 @@ use ad_trait::forward_ad::adfn::adfn;
 use ad_trait::function_engine::FunctionEngine;
 use autodiff::{F1, Float, diff};
 use gam::mixture_link::sas_inverse_link_jetwith_param_partials;
-use gam::types::SasLinkState;
 use num_dual::{DualNum, first_derivative};
 use std::marker::PhantomData;
 
@@ -18,7 +17,7 @@ const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
 const SAS_U_CLAMP: f64 = 50.0;
 
 fn sas_delta_from_raw_log_delta(raw_log_delta: f64) -> f64 {
-    SasLinkState::new(0.0, raw_log_delta)
+    gam::mixture_link::sas_link_state_from_raw(0.0, raw_log_delta)
         .expect("sas state")
         .delta
 }

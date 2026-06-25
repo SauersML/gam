@@ -1514,7 +1514,10 @@ fn exact_spatial_adaptive_binomial_sas_fit_preserves_link_state() {
         Array1::ones(n).view(),
         Array1::zeros(n).view(),
         &spec,
-        LikelihoodSpec::binomial_sas(SasLinkState::new(0.1, -0.2).expect("valid SAS link state")),
+        LikelihoodSpec::binomial_sas(
+            crate::solver::mixture_link::sas_link_state_from_raw(0.1, -0.2)
+                .expect("valid SAS link state"),
+        ),
         &FitOptions {
             sas_link: Some(crate::types::SasLinkSpec {
                 initial_epsilon: 0.1,
