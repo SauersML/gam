@@ -34,6 +34,16 @@ fn assert_present_or_no_runtime(declined: bool, op: &str) {
 
 #[test]
 fn gpu_paths_match_cpu_to_1e8_on_floor_clearing_matrices() {
+    // The floor-clearing fixtures below allocate ~460 MB total; only build them on
+    // a host with a CUDA runtime (where the device path actually runs). On a
+    // CPU-only host there is nothing to validate (the helpers would return None for
+    // lack of a device, not for lack of work) — skip cleanly without the heavy
+    // allocations so CPU CI stays fast and light.
+    if gam::gpu::device_runtime::GpuRuntime::global().is_none() {
+        eprintln!("SKIP gpu_paths_match_cpu_to_1e8_on_floor_clearing_matrices: no CUDA runtime");
+        return;
+    }
+
     // GEMM A·B: 2·m·n·k = 2·400·400·400 ≈ 1.28e8 ≥ 1e8.
     let a = Array2::from_shape_fn((400, 400), |(i, j)| ((i + 1 + j) as f64 * 0.37).sin());
     let b = Array2::from_shape_fn((400, 400), |(i, j)| ((2 * i + j + 1) as f64 * 0.19).cos());
