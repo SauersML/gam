@@ -147,6 +147,12 @@ pub use inference::{
     alo, generative, higher_order, model_comparison, polya_gamma, probability, quadrature,
     rho_posterior, sample, smooth_test,
 };
+// The NUTS/HMC engine module was renamed `inference::hmc` -> `inference::hmc_io`.
+// Its public types/functions (NutsConfig, NutsResult, FamilyNutsInputs,
+// run_nuts_sampling_flattened_family, ...) are still consumed as `gam::hmc::*`
+// by the sampling integration tests and downstream callers, so keep that path
+// stable by re-exporting the renamed module under its old name.
+pub use inference::hmc_io as hmc;
 pub use linalg::{faer_ndarray, matrix, utils};
 // #931-#935 criterion calculus: the profiled-criterion abstraction
 // (CriterionAtom / CriterionSum / Sensitivity) that kills the objective↔gradient

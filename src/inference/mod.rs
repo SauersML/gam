@@ -1,3 +1,11 @@
+// The encoded-dataset layer was hoisted into the `gam-data` foundation crate
+// and is re-exported at the crate root as `gam::data`. It used to live here as
+// `inference::data`, and a large body of integration tests (plus any external
+// consumer) still names `gam::inference::data`. Keep that path valid by
+// aliasing the relocated crate so the extraction does not silently drop a
+// public module path it inherited.
+pub use crate::data;
+
 pub mod alo;
 pub mod atom_lens;
 pub mod certificate_impls;
