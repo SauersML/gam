@@ -3618,6 +3618,8 @@ pub(crate) fn resident_scalar_jacobi_col_dot_hoist_bit_identical() {
             continue;
         }
         let support = &resident.a_phi[row];
+        // #1033: L_i is the shared local_jac slab (was per-row rf.l).
+        let l_i = &resident.local_jac[row];
         for &(beta_base, phi) in support {
             if phi == 0.0 {
                 continue;
@@ -3627,7 +3629,7 @@ pub(crate) fn resident_scalar_jacobi_col_dot_hoist_bit_identical() {
                 let mut col_dot = 0.0_f64;
                 for r in 0..di {
                     let idx = r * p + j;
-                    col_dot += rf.l[idx] * rf.y[idx];
+                    col_dot += l_i[idx] * rf.y[idx];
                 }
                 diag_ref[beta_base + j] -= phi2 * col_dot;
             }
@@ -3830,9 +3832,11 @@ pub(crate) fn factored_residency_matches_dense_g_block() {
             continue;
         }
         let di = rf.di;
+        // #1033: L_i is the shared local_jac slab (was per-row rf.l).
+        let l_i = &resident.local_jac[row];
         // Reconstruct the dense block G_i = L_iᵀ Y_i (p×p) from the stored
         // factors and check the factored GEMV chain against a direct G_i·g.
-        let l = ArrayView2::from_shape((di, p), &rf.l).unwrap();
+        let l = ArrayView2::from_shape((di, p), l_i.as_slice()).unwrap();
         let y = ArrayView2::from_shape((di, p), &rf.y).unwrap();
         let g_dense = l.t().dot(&y); // p×p
 
@@ -3857,7 +3861,7 @@ pub(crate) fn factored_residency_matches_dense_g_block() {
         }
         let mut prod = vec![0.0_f64; p];
         for r in 0..di {
-            let lrow = &rf.l[r * p..r * p + p];
+            let lrow = &l_i[r * p..r * p + p];
             for j in 0..p {
                 prod[j] += lrow[j] * w[r];
             }
@@ -3877,13 +3881,33 @@ pub(crate) fn factored_residency_matches_dense_g_block() {
             );
         }
     }
-    // Storage check: the factored form keeps di·p (not p²) per row.
-    let factored_entries: usize = resident.rows.iter().map(|r| r.l.len() + r.y.len()).sum();
+    // Storage check: the factored form keeps di·p (not p²) per row. L_i is the
+    // shared local_jac slab (#1033, not re-stored in the row factor), so count it
+    // from there; only Y_i is per-row in the factor.
+    let factored_entries: usize = resident
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(row, r)| resident.local_jac[row].len() + r.y.len())
+        .sum();
     let dense_entries: usize = resident.rows.iter().filter(|r| r.di > 0).count() * p * p;
     assert!(
         factored_entries < dense_entries,
         "factored residency must store fewer entries than the dense p×p form \
              ({factored_entries} vs {dense_entries})"
+    );
+
+    // #1033 no-second-copy pin: the resident operator's L_i slab is the SAME
+    // allocation as the assembler's DeviceSaePcgData.local_jac, not a per-row
+    // copy. A regression that re-introduced rf.l (a verbatim copy) would fail
+    // this Arc::ptr_eq even while every matvec above stayed numerically equal.
+    let data = sys
+        .device_sae_pcg
+        .as_ref()
+        .expect("structured SAE system must carry device_sae_pcg");
+    assert!(
+        std::sync::Arc::ptr_eq(&resident.local_jac, &data.local_jac),
+        "resident operator must SHARE the assembler's local_jac slab (#1033), not copy it"
     );
 }
 
@@ -3948,8 +3972,14 @@ pub(crate) fn bench_resident_sae_matvec_speedup() {
     let gen_total = gen_elapsed.as_secs_f64();
     let res_total = res_elapsed.as_secs_f64();
     // Residency footprint: factored `(L_i, Y_i)` = `2·di·p` f64/row vs the
-    // dense `p×p` block = `p²` f64/row.
-    let factored_f64: usize = resident.rows.iter().map(|r| r.l.len() + r.y.len()).sum();
+    // dense `p×p` block = `p²` f64/row. L_i is the shared local_jac slab (#1033),
+    // counted from there; only Y_i is per-row.
+    let factored_f64: usize = resident
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(row, r)| resident.local_jac[row].len() + r.y.len())
+        .sum();
     let dense_f64: usize = resident.rows.iter().filter(|r| r.di > 0).count() * p * p;
     println!(
         "[#1017 SAE resident matvec, n={n} q={q} p={p} k={k} m={m_active}, \

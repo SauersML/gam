@@ -738,6 +738,15 @@ impl DeviceSaePcgData {
         // (`O(1)`) rather than re-cloning every `(idx, weight)` pair per CG build.
         Arc::clone(&self.a_phi)
     }
+
+    /// Share the per-row local Jacobians `local_jac` with the CPU residency
+    /// operator ([`SaeResidentReducedSchur`]) as an `O(1)` refcount bump. The
+    /// staged row factor used to hold a verbatim row-major copy of each
+    /// `local_jac[row]`; sharing the slab removes that second full `O(n·di·p)`
+    /// copy with byte-for-byte identical reads (#1033).
+    pub(crate) fn local_jac_shared(&self) -> Arc<[Vec<f64>]> {
+        Arc::clone(&self.local_jac)
+    }
 }
 
 impl BetaPenaltyOp for SparseBlockKroneckerPenaltyOp {
