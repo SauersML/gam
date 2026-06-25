@@ -22,7 +22,12 @@ use crate::types::{
     SasLinkState, StandardLink,
 };
 use crate::util::span::span_index_for_breakpoints;
-use gam_data::{ColumnKindTag, DataSchema};
+// The data-schema value types live in the `gam-data` foundation crate; they
+// were previously authored here and are still named `gam::inference::model::{
+// ColumnKindTag, DataSchema, SchemaColumn}` by a broad set of integration tests
+// and by saved-payload consumers. Re-export them so that public path stays
+// valid rather than forcing every caller onto the relocated crate path.
+pub use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;

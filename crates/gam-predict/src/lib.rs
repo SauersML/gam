@@ -10,7 +10,11 @@ pub use gam::inference::predict_io::{
 };
 
 use crate::binomial_location_scale::BinomialLocationScalePredictor;
-use crate::dispersion_location_scale::DispersionLocationScalePredictor;
+// Surface the per-family predictors at the crate root so callers (integration
+// tests and downstream users) can name `gam_predict::DispersionLocationScalePredictor`
+// / `gam_predict::StandardPredictor` directly, matching the flat predict API
+// these types had before the engine was peeled into this crate.
+pub use crate::dispersion_location_scale::DispersionLocationScalePredictor;
 use crate::gaussian_location_scale::GaussianLocationScalePredictor;
 use crate::interval_policy::{
     EtaInterval, LinearState, MeanBoundMethod, PredictPass, PredictionTransform, ResponseBounds,
@@ -22,7 +26,7 @@ use crate::linalg::{
     PredictionCovarianceBackend, design_row_chunk, prediction_chunk_rows,
     rowwise_local_covariances_parallel,
 };
-use crate::standard::StandardPredictor;
+pub use crate::standard::StandardPredictor;
 use crate::survival::SurvivalPredictor;
 use crate::transformation_normal::TransformationNormalPredictor;
 use gam::estimate::{BlockRole, EstimationError, FittedLinkState, UnifiedFitResult};

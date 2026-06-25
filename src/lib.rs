@@ -179,6 +179,11 @@ pub use gam_runtime::resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
     ProblemHints, ResidentBytes, ResourcePolicy,
 };
+// The warm-start store (WarmStartStore, Fingerprinter, StoreOptions, ...) was
+// relocated into the `gam-runtime` foundation crate. It was previously reachable
+// as `gam::warm_start`; keep that path stable by re-exporting the module from
+// the crate that now owns it (a normal, non-cyclic dependency).
+pub use gam_runtime::warm_start;
 pub use outer_subsample::{OuterScoreSubsample, RowSet, WeightedOuterRow};
 pub use solver::estimate::reml::per_atom_efs::{
     PerAtomEfsConfig, SharedBorderTopology, run_per_atom_efs,

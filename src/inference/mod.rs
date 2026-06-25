@@ -21,6 +21,10 @@ pub mod generative;
 pub mod harvest;
 pub mod higher_order;
 pub mod hmc_io;
+// `hmc_io` is the post-rename home of the NUTS/HMC engine that integration
+// tests and downstream callers still reach as `inference::hmc`. Keep that path
+// resolvable alongside the crate-root `gam::hmc` alias.
+pub use hmc_io as hmc;
 pub mod lawley;
 pub mod layer_transport;
 pub mod model;
