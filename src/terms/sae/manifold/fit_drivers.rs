@@ -923,7 +923,7 @@ impl SaeManifoldTerm {
     /// chart gauge.
     pub(crate) fn decoder_beta_null_directions(
         &self,
-        penalized_gram_scale: f64,
+        penalized_gram_scale: &[f64],
     ) -> Result<Vec<Array1<f64>>, String> {
         let p = self.output_dim();
         let n = self.n_obs();
@@ -953,10 +953,11 @@ impl SaeManifoldTerm {
             if penalty.dim() != (m, m) {
                 continue;
             }
+            let scale = penalized_gram_scale[atom_idx];
             let mut joint = Array2::<f64>::zeros((m, m));
             for i in 0..m {
                 for j in 0..m {
-                    joint[[i, j]] = gram[[i, j]] + penalized_gram_scale * penalty[[i, j]];
+                    joint[[i, j]] = gram[[i, j]] + scale * penalty[[i, j]];
                 }
             }
             // Symmetrise defensively before the eigendecomposition.
@@ -1089,7 +1090,7 @@ impl SaeManifoldTerm {
         delta_ext_coord: ArrayView1<'_, f64>,
         delta_beta: ArrayView1<'_, f64>,
         raw_step_norm_sq: f64,
-        penalized_gram_scale: f64,
+        penalized_gram_scale: &[f64],
     ) -> Result<f64, String> {
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
@@ -1126,7 +1127,7 @@ impl SaeManifoldTerm {
     pub(crate) fn quotient_residual_norm_sq(
         &self,
         mut residual: Array1<f64>,
-        penalized_gram_scale: f64,
+        penalized_gram_scale: &[f64],
     ) -> Result<f64, String> {
         let mut orthonormal: Vec<Array1<f64>> = Vec::new();
         let gauges = self
@@ -1180,7 +1181,7 @@ impl SaeManifoldTerm {
         grad_ext_coord: ArrayView1<'_, f64>,
         grad_beta: ArrayView1<'_, f64>,
         raw_grad_norm_sq: f64,
-        penalized_gram_scale: f64,
+        penalized_gram_scale: &[f64],
     ) -> Result<f64, String> {
         let n = self.n_obs();
         let q = self.assignment.row_block_dim();
@@ -3247,7 +3248,7 @@ impl SaeManifoldTerm {
                     delta_ext_coord.view(),
                     delta_beta.view(),
                     step_norm_sq,
-                    rho.lambda_smooth(),
+                    &rho.lambda_smooth_vec(),
                 )?;
                 if quotient_step_norm_sq.sqrt() <= step_tolerance {
                     break;

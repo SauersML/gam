@@ -145,6 +145,9 @@ mod tests_olmo;
 #[cfg(test)]
 mod sae_contract_probe_tests;
 
+#[cfg(test)]
+mod lambda_smooth_1556_tests;
+
 pub use arrow_solver::*;
 pub use atom::*;
 pub use certificate::*;

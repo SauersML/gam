@@ -166,7 +166,7 @@ impl AmortizedWarmStartTelemetry {
 /// Outer REML objective for the SAE-manifold term.
 ///
 /// Routes the SAE's smoothing hyperparameters ρ
-/// (`log_lambda_sparse`, `log_lambda_smooth`, per-atom/axis `log_ard`)
+/// (`log_lambda_sparse`, per-atom `log_lambda_smooth`, per-atom/axis `log_ard`)
 /// through the *one* generic [`OuterObjective`] engine + cascade that the
 /// main GAM REML path uses, instead of the SAE's deleted forked
 /// `update_ard_reml` fixed-point rule. Each outer eval runs the inner
@@ -551,7 +551,7 @@ impl SaeManifoldOuterObjective {
         )?;
         let solver = self
             .term
-            .outer_gradient_arrow_solver(&cache, rho_hat.lambda_smooth())?;
+            .outer_gradient_arrow_solver(&cache, &rho_hat.lambda_smooth_vec())?;
         let components = self.term.analytic_outer_rho_gradient_components(
             self.target.view(),
             &rho_hat,
@@ -853,7 +853,7 @@ impl SaeManifoldOuterObjective {
             let pivot_deficit_is_gauge = !(pivot.is_finite() && pivot >= floor)
                 && self
                     .term
-                    .outer_gradient_arrow_solver(&cache, rho.lambda_smooth())
+                    .outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())
                     .is_ok();
             if !(pivot.is_finite() && pivot >= floor) && !pivot_deficit_is_gauge {
                 if eta_step > CURVATURE_WALK_MIN_ETA_STEP {
@@ -1356,8 +1356,10 @@ impl SaeManifoldOuterObjective {
     ///   term the deleted `α=n/‖t‖²` rule dropped, so α cannot collapse on a
     ///   degenerate axis: as `‖t‖²→0`, `tr_kj(H⁻¹)→1/α` bounds the
     ///   denominator and the fixed point has a finite root.
-    /// - λ_smooth: `λ_new = φ̂[p·Σ_k rank S_k − tr(S_β⁻¹ M)] / βᵀ(⊕S_k⊗I_p)β`
-    ///   (Wood-Fasiolo EFS), `step = ln λ_new − log_lambda_smooth`.
+    /// - λ_smooth[k] (per-atom, #1556): `λ_k_new = φ̂[p·rank S_k − tr_k(S_β⁻¹ M_k)]
+    ///   / B_kᵀ(S_k⊗I_p)B_k` (Wood-Fasiolo EFS, already per-coordinate),
+    ///   `step = ln λ_k_new − log_lambda_smooth[k]`, written into each atom's own
+    ///   step slot `1+k`.
     /// - λ_sparse: 0.0 — the assignment-sparsity priors (softmax entropy,
     ///   gated L1, IBP) are non-quadratic, so no Gaussian-logdet FS fixed
     ///   point exists; it stays cost-driven (the cascade still moves it via
@@ -1392,42 +1394,48 @@ impl SaeManifoldOuterObjective {
             .ard_inverse_traces(&cache)
             .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: ARD traces: {e}"))?;
 
-        // Build the flat step vector in `to_flat` layout:
-        // [0]=log_lambda_sparse, [1]=log_lambda_smooth, then per-atom axes.
+        // Build the flat step vector in `to_flat` layout (#1556):
+        // [0]=log_lambda_sparse, [1..1+K]=per-atom log_lambda_smooth, then ARD.
         let n_params = rho.to_flat().len();
         let mut steps = vec![0.0_f64; n_params];
 
         // λ_sparse (index 0): non-quadratic prior → no FS fixed point. Step 0.
         steps[0] = 0.0;
 
-        // λ_smooth (index 1): Wood-Fasiolo EFS multiplicative update.
-        let lambda_smooth = rho.lambda_smooth();
+        // λ_smooth (indices 1..1+K): per-atom Wood-Fasiolo EFS multiplicative
+        // update (#1556). The EFS fixed point is already per-coordinate, so each
+        // atom `k` gets `λ_k_new = φ̂·(rank_k − edof_k)/energy_k` written into its
+        // own step slot. `rank_k = p·rank(S_k)`, `edof_k = tr_k(H⁻¹ M_k)`, and
+        // `energy_k = <B_k, S_k B_k>` are the per-atom splits of the historical
+        // global totals.
+        let k_smooth = rho.log_lambda_smooth.len();
+        let lambda_smooth_vec = rho.lambda_smooth_vec();
         let p_out = self.term.output_dim() as f64;
-        let mut smooth_rank_total = 0usize;
-        for atom in &self.term.atoms {
-            smooth_rank_total += SaeManifoldTerm::symmetric_rank(&atom.smooth_penalty)?;
-        }
-        let rank_total = p_out * (smooth_rank_total as f64);
-        let quad = self.term.decoder_smoothness_quadratic_form();
-        let eff_dof = self
+        let quad_per_atom = self.term.decoder_smoothness_quadratic_form_per_atom();
+        let eff_dof_per_atom = self
             .term
-            .decoder_smoothness_effective_dof(&cache, lambda_smooth)
+            .decoder_smoothness_effective_dof_per_atom(&cache, &lambda_smooth_vec)
             .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: smooth dof: {e}"))?;
-        // λ_new = φ̂ · (penalty_rank − effective_dof) / penalty_energy. The
-        // dispersion factor makes the update target the dimensionless effective
-        // stiffness λ/φ̂ instead of an absolute output-unit penalty weight.
-        // Guard the FS ratio against a vanishing penalty energy or a non-positive
-        // numerator (which can occur transiently far from the optimum) by holding
-        // λ_smooth fixed (step 0) — the cost path still moves it then.
-        if quad > 0.0 && rank_total - eff_dof > 0.0 && lambda_smooth > 0.0 {
-            let lambda_new = dispersion * (rank_total - eff_dof) / quad;
-            if lambda_new.is_finite() && lambda_new > 0.0 {
-                steps[1] = lambda_new.ln() - rho.log_lambda_smooth;
+        for atom_idx in 0..k_smooth {
+            let lambda_k = lambda_smooth_vec[atom_idx];
+            let rank_k =
+                p_out * (SaeManifoldTerm::symmetric_rank(&self.term.atoms[atom_idx].smooth_penalty)?
+                    as f64);
+            let quad_k = quad_per_atom[atom_idx];
+            let eff_dof_k = eff_dof_per_atom[atom_idx];
+            // Guard the FS ratio against a vanishing penalty energy or a
+            // non-positive numerator (transient far from the optimum) by holding
+            // that atom's λ fixed (step 0) — the cost path still moves it then.
+            if quad_k > 0.0 && rank_k - eff_dof_k > 0.0 && lambda_k > 0.0 {
+                let lambda_new = dispersion * (rank_k - eff_dof_k) / quad_k;
+                if lambda_new.is_finite() && lambda_new > 0.0 {
+                    steps[1 + atom_idx] = lambda_new.ln() - rho.log_lambda_smooth[atom_idx];
+                }
             }
         }
 
-        // ARD axes (indices 2..): Mackay fixed point with posterior variance.
-        let mut cursor = 2usize;
+        // ARD axes (indices 1+K..): Mackay fixed point with posterior variance.
+        let mut cursor = 1 + k_smooth;
         for (k, axis_logard) in rho.log_ard.iter().enumerate() {
             let d = axis_logard.len();
             for j in 0..d {
@@ -1591,7 +1599,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // this fallback is never reached.
         let analytic = self
             .term
-            .outer_gradient_arrow_solver(&cache, rho_state.lambda_smooth())
+            .outer_gradient_arrow_solver(&cache, &rho_state.lambda_smooth_vec())
             .and_then(|solver| {
                 self.term.analytic_outer_rho_gradient_components(
                     self.target.view(),

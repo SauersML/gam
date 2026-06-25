@@ -37,8 +37,19 @@ pub struct SaeManifoldRho {
     /// `log(lambda_sparse)` for softmax entropy or JumpReLU gated L1, or the
     /// learnable `log(alpha)` offset for IBP-MAP assignment.
     pub log_lambda_sparse: f64,
-    /// `log(lambda_smooth)` shared by the per-atom decoder penalties.
-    pub log_lambda_smooth: f64,
+    /// Per-atom `log(lambda_smooth)` — one independent decoder-smoothness
+    /// strength per atom `k` (length `K`, atom order). Atom `k`'s bending
+    /// penalty `S_k` is scaled by `lambda_smooth[k] = exp(log_lambda_smooth[k])`,
+    /// so distinct atoms can carry distinct smoothness strengths (#1556). Linear
+    /// atoms have a null `S_k`, so their per-atom entry is a harmless no-op.
+    ///
+    /// Historically this was a single global scalar shared by every atom; the
+    /// ergonomic [`SaeManifoldRho::new`] still accepts a scalar and BROADCASTS it
+    /// to all `K` atoms (so the common "one global λ_smooth" call sites are
+    /// unchanged), while [`SaeManifoldRho::with_per_atom_smooth`] sets a genuinely
+    /// per-atom vector. The EFS / Fellner–Schall multiplicative update is already
+    /// per-coordinate and writes each atom's entry independently.
+    pub log_lambda_smooth: Vec<f64>,
     /// Per-atom, per-axis `log(alpha_kj)` ARD strengths. An empty per-atom
     /// block disables native coordinate ARD for that atom. The inner solve and
     /// every penalty assembler read THIS full table; `ard_sharing` only governs
@@ -51,8 +62,31 @@ pub struct SaeManifoldRho {
 }
 
 impl SaeManifoldRho {
+    /// Build a ρ, BROADCASTING the single scalar `log_lambda_smooth` to all
+    /// `K = log_ard.len()` atoms (#1556). The field is genuinely per-atom; this
+    /// ergonomic constructor only seeds every atom with the same strength so the
+    /// historical "one global λ_smooth" call sites need no change. Use
+    /// [`Self::with_per_atom_smooth`] to seed distinct per-atom strengths.
     #[must_use]
     pub fn new(log_lambda_sparse: f64, log_lambda_smooth: f64, log_ard: Vec<Array1<f64>>) -> Self {
+        let k = log_ard.len();
+        Self {
+            log_lambda_sparse,
+            log_lambda_smooth: vec![log_lambda_smooth; k],
+            log_ard,
+            ard_sharing: ArdSharing::PerAtom,
+        }
+    }
+
+    /// Build a ρ with an explicit per-atom `log_lambda_smooth` vector (length
+    /// `K`, atom order). Each atom `k`'s decoder-smoothness penalty `S_k` is then
+    /// scaled by its own `exp(log_lambda_smooth[k])` (#1556).
+    #[must_use]
+    pub fn with_per_atom_smooth(
+        log_lambda_sparse: f64,
+        log_lambda_smooth: Vec<f64>,
+        log_ard: Vec<Array1<f64>>,
+    ) -> Self {
         Self {
             log_lambda_sparse,
             log_lambda_smooth,
@@ -71,9 +105,10 @@ impl SaeManifoldRho {
         log_lambda_smooth: f64,
         log_ard: Vec<Array1<f64>>,
     ) -> Self {
+        let k = log_ard.len();
         Self {
             log_lambda_sparse,
-            log_lambda_smooth,
+            log_lambda_smooth: vec![log_lambda_smooth; k],
             log_ard,
             ard_sharing: ArdSharing::Shared,
         }
@@ -131,7 +166,9 @@ impl SaeManifoldRho {
         if scale_sparse {
             scaled.log_lambda_sparse += shift;
         }
-        scaled.log_lambda_smooth += shift;
+        for value in &mut scaled.log_lambda_smooth {
+            *value += shift;
+        }
         for atom in &mut scaled.log_ard {
             for value in atom.iter_mut() {
                 *value += shift;
@@ -148,8 +185,30 @@ impl SaeManifoldRho {
         Self::stable_exp_strength(self.log_lambda_sparse)
     }
 
-    pub fn lambda_smooth(&self) -> f64 {
-        Self::stable_exp_strength(self.log_lambda_smooth)
+    /// Number of atoms `K` carried by the per-atom smoothness vector.
+    #[must_use]
+    pub fn k_atoms(&self) -> usize {
+        self.log_lambda_smooth.len()
+    }
+
+    /// Stable smoothness strength `exp(log_lambda_smooth[k])` for atom `k`
+    /// (#1556). The exponent is clamped into the finite-normal band by
+    /// [`Self::stable_exp_strength`] so the strength is always a finite,
+    /// strictly-positive `f64`.
+    #[must_use]
+    pub fn lambda_smooth_for(&self, atom: usize) -> f64 {
+        Self::stable_exp_strength(self.log_lambda_smooth[atom])
+    }
+
+    /// All `K` per-atom smoothness strengths `exp(log_lambda_smooth[k])`, atom
+    /// order. Convenience for threading per-atom λ into the penalty assemblers
+    /// (#1556).
+    #[must_use]
+    pub fn lambda_smooth_vec(&self) -> Vec<f64> {
+        self.log_lambda_smooth
+            .iter()
+            .map(|&v| Self::stable_exp_strength(v))
+            .collect()
     }
 
     /// Exponentiate a learnable log-strength with the exponent clamped into the
@@ -164,28 +223,35 @@ impl SaeManifoldRho {
     /// Flatten ρ into the contiguous outer-coordinate vector the generic
     /// `OuterObjective` engine optimises over.
     ///
-    /// Layout: `[log_lambda_sparse, log_lambda_smooth, <ARD>]`.
+    /// Layout: `[log_lambda_sparse, <K smooth>, <ARD>]`, where `<K smooth>` is
+    /// the per-atom `log_lambda_smooth[k]` in atom order (`k in 0..K`), so the
+    /// smoothness block carries `K` outer coordinates, not 1 (#1556).
     ///
     /// * [`ArdSharing::PerAtom`] — the `<ARD>` block concatenates each atom
     ///   `k`'s per-axis `log_ard[k][j]` in atom order, axis `j` in `0..d_k`.
     ///   Empty per-atom blocks contribute no outer coordinates, so the length is
-    ///   `2 + Σ_k d_k`.
+    ///   `1 + K + Σ_k d_k`.
     /// * [`ArdSharing::Shared`] — the `<ARD>` block is a constant `max_d =
     ///   max_k d_k` SHARED strengths, one per axis index `j`. Each shared value
     ///   is the mean of `log_ard[k][j]` over the atoms that own axis `j` (an
     ///   exact read-back when the table is already broadcast, which it always is
-    ///   under this mode); the length is `2 + max_d` regardless of K.
+    ///   under this mode); the length is `1 + K + max_d` regardless of d.
+    ///   (Smoothness stays per-atom in both modes; `ard_sharing` governs ARD
+    ///   only.)
     ///
     /// [`Self::from_flat`] is the exact inverse and reads the same layout from
     /// `self` (its `log_ard` shape + `ard_sharing`).
     pub fn to_flat(&self) -> Array1<f64> {
         match self.ard_sharing {
             ArdSharing::PerAtom => {
+                let k = self.log_lambda_smooth.len();
                 let ard_len: usize = self.log_ard.iter().map(|a| a.len()).sum();
-                let mut out = Array1::<f64>::zeros(2 + ard_len);
+                let mut out = Array1::<f64>::zeros(1 + k + ard_len);
                 out[0] = self.log_lambda_sparse;
-                out[1] = self.log_lambda_smooth;
-                let mut cursor = 2usize;
+                for (atom, &v) in self.log_lambda_smooth.iter().enumerate() {
+                    out[1 + atom] = v;
+                }
+                let mut cursor = 1 + k;
                 for axis in &self.log_ard {
                     for &v in axis.iter() {
                         out[cursor] = v;
@@ -195,10 +261,13 @@ impl SaeManifoldRho {
                 out
             }
             ArdSharing::Shared => {
+                let k = self.log_lambda_smooth.len();
                 let max_d = self.max_ard_axes();
-                let mut out = Array1::<f64>::zeros(2 + max_d);
+                let mut out = Array1::<f64>::zeros(1 + k + max_d);
                 out[0] = self.log_lambda_sparse;
-                out[1] = self.log_lambda_smooth;
+                for (atom, &v) in self.log_lambda_smooth.iter().enumerate() {
+                    out[1 + atom] = v;
+                }
                 // Per-axis shared value = mean over atoms owning that axis. The
                 // table is broadcast (all owners equal) under this mode, so the
                 // mean is an exact read-back; averaging is only a defensive
@@ -212,7 +281,7 @@ impl SaeManifoldRho {
                             count += 1;
                         }
                     }
-                    out[2 + j] = if count > 0 { acc / count as f64 } else { 0.0 };
+                    out[1 + k + j] = if count > 0 { acc / count as f64 } else { 0.0 };
                 }
                 out
             }
@@ -224,24 +293,27 @@ impl SaeManifoldRho {
     ///
     /// The per-atom dims (and ARD sharing mode) are taken from `&self` (the ARD
     /// layout is a fixed property of the term shape; the engine only moves the
-    /// values). The flat vector must have length `2 + Σ_k len(log_ard[k])` in
-    /// [`ArdSharing::PerAtom`] mode, or `2 + max_k d_k` in [`ArdSharing::Shared`]
-    /// mode (where the few shared per-axis values are BROADCAST back to every
-    /// atom that owns that axis, rebuilding the full per-atom table the inner
-    /// solve consumes).
+    /// values). The flat vector must have length `1 + K + Σ_k len(log_ard[k])` in
+    /// [`ArdSharing::PerAtom`] mode, or `1 + K + max_k d_k` in
+    /// [`ArdSharing::Shared`] mode, where `K = len(log_lambda_smooth)` carries the
+    /// per-atom smoothness coordinates (#1556) and the few shared per-axis ARD
+    /// values are BROADCAST back to every atom that owns that axis, rebuilding the
+    /// full per-atom table the inner solve consumes.
     pub fn from_flat(&self, flat: ArrayView1<'_, f64>) -> SaeManifoldRho {
         match self.ard_sharing {
             ArdSharing::PerAtom => {
+                let k = self.log_lambda_smooth.len();
                 let ard_len: usize = self.log_ard.iter().map(|a| a.len()).sum();
                 assert_eq!(
                     flat.len(),
-                    2 + ard_len,
-                    "SaeManifoldRho::from_flat: flat length {} != 2 + Σ d_k = {}",
+                    1 + k + ard_len,
+                    "SaeManifoldRho::from_flat: flat length {} != 1 + K + Σ d_k = {}",
                     flat.len(),
-                    2 + ard_len
+                    1 + k + ard_len
                 );
+                let log_lambda_smooth: Vec<f64> = (0..k).map(|atom| flat[1 + atom]).collect();
                 let mut log_ard = Vec::with_capacity(self.log_ard.len());
-                let mut cursor = 2usize;
+                let mut cursor = 1 + k;
                 for axis in &self.log_ard {
                     let d = axis.len();
                     let mut block = Array1::<f64>::zeros(d);
@@ -253,20 +325,22 @@ impl SaeManifoldRho {
                 }
                 SaeManifoldRho {
                     log_lambda_sparse: flat[0],
-                    log_lambda_smooth: flat[1],
+                    log_lambda_smooth,
                     log_ard,
                     ard_sharing: ArdSharing::PerAtom,
                 }
             }
             ArdSharing::Shared => {
+                let k = self.log_lambda_smooth.len();
                 let max_d = self.max_ard_axes();
                 assert_eq!(
                     flat.len(),
-                    2 + max_d,
-                    "SaeManifoldRho::from_flat: shared-ARD flat length {} != 2 + max_d = {}",
+                    1 + k + max_d,
+                    "SaeManifoldRho::from_flat: shared-ARD flat length {} != 1 + K + max_d = {}",
                     flat.len(),
-                    2 + max_d
+                    1 + k + max_d
                 );
+                let log_lambda_smooth: Vec<f64> = (0..k).map(|atom| flat[1 + atom]).collect();
                 // Broadcast the shared per-axis strengths into each atom's block,
                 // preserving every atom's own `d_k` (a `d_k`-axis atom reads the
                 // first `d_k` shared values). This rebuilds the full per-atom
@@ -276,13 +350,13 @@ impl SaeManifoldRho {
                     let d = axis.len();
                     let mut block = Array1::<f64>::zeros(d);
                     for (j, slot) in block.iter_mut().enumerate() {
-                        *slot = flat[2 + j];
+                        *slot = flat[1 + k + j];
                     }
                     log_ard.push(block);
                 }
                 SaeManifoldRho {
                     log_lambda_sparse: flat[0],
-                    log_lambda_smooth: flat[1],
+                    log_lambda_smooth,
                     log_ard,
                     ard_sharing: ArdSharing::Shared,
                 }

@@ -343,7 +343,9 @@ mod exact_stationarity_solve_1418_tests {
         // Activate the sparsity / smoothness / ARD prior strengths so the softmax
         // entropy delta and the periodic-ARD `min(V'',0)` delta are live too.
         rho.log_lambda_sparse = -0.5;
-        rho.log_lambda_smooth = -1.0;
+        for value in rho.log_lambda_smooth.iter_mut() {
+            *value = -1.0;
+        }
         for axis in rho.log_ard.iter_mut() {
             for v in axis.iter_mut() {
                 *v = -0.5;

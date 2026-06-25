@@ -3061,7 +3061,7 @@ impl SaeManifoldTerm {
             total
         };
         let assignment_sparsity = assignment_prior_value(&self.assignment, rho);
-        let smoothness = penalty_scale * self.decoder_smoothness_value(rho.lambda_smooth());
+        let smoothness = penalty_scale * self.decoder_smoothness_value(&rho.lambda_smooth_vec());
         let ard = self.ard_value(rho)?;
         Ok(SaeManifoldLoss {
             data_fit,
@@ -3358,7 +3358,7 @@ impl SaeManifoldTerm {
         Ok(total)
     }
 
-    pub(crate) fn decoder_smoothness_value(&self, lambda_smooth: f64) -> f64 {
+    pub(crate) fn decoder_smoothness_value(&self, lambda_smooth: &[f64]) -> f64 {
         // Smoothness penalty value is `0.5·λ·Σ_oc B[:,oc]ᵀ S B[:,oc]`. Form the
         // `S·B` matrix product once per atom (O(M²·p)) and reduce against `B`
         // with a single O(M·p) Hadamard sum, instead of the previous
@@ -3377,10 +3377,27 @@ impl SaeManifoldTerm {
             .collect();
         let sb_all = batched_smooth_sb(&sb_inputs, false);
         let mut acc = 0.0;
-        for (atom, sb) in self.atoms.iter().zip(sb_all.iter()) {
-            acc += 0.5 * lambda_smooth * (&atom.decoder_coefficients * sb).sum();
+        for (atom_idx, (atom, sb)) in self.atoms.iter().zip(sb_all.iter()).enumerate() {
+            acc += 0.5 * lambda_smooth[atom_idx] * (&atom.decoder_coefficients * sb).sum();
         }
         acc
+    }
+
+    /// Per-atom decoder-smoothness values (#1556): entry `k` is
+    /// `0.5·λ_smooth[k]·<B_k, S_k B_k>` (sum = [`Self::decoder_smoothness_value`]).
+    /// This is the explicit `∂loss.smoothness/∂log λ_smooth[k]` gradient entry.
+    pub(crate) fn decoder_smoothness_value_per_atom(&self, lambda_smooth: &[f64]) -> Vec<f64> {
+        let sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
+            .atoms
+            .iter()
+            .map(|atom| (atom.smooth_penalty.view(), atom.decoder_coefficients.view()))
+            .collect();
+        let sb_all = batched_smooth_sb(&sb_inputs, false);
+        let mut per_atom = vec![0.0_f64; self.atoms.len()];
+        for (atom_idx, (atom, sb)) in self.atoms.iter().zip(sb_all.iter()).enumerate() {
+            per_atom[atom_idx] = 0.5 * lambda_smooth[atom_idx] * (&atom.decoder_coefficients * sb).sum();
+        }
+        per_atom
     }
 
     pub(crate) fn ard_value(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
@@ -3583,7 +3600,14 @@ impl SaeManifoldTerm {
         // β-tier decoder smoothness is a global (B-only) penalty; under a
         // minibatch pass it is scaled by the chunk fraction so the per-chunk
         // contributions sum to one global copy.
-        let lambda_smooth = rho.lambda_smooth() * penalty_scale;
+        // Per-atom decoder-smoothness strengths (#1556): atom k's penalty `S_k`
+        // is scaled by `λ_smooth[k]·penalty_scale`. The minibatch `penalty_scale`
+        // multiplies every atom uniformly.
+        let lambda_smooth: Vec<f64> = rho
+            .lambda_smooth_vec()
+            .iter()
+            .map(|&l| l * penalty_scale)
+            .collect();
         let (assignment_grad, assignment_hdiag) =
             assignment_prior_grad_hdiag(&self.assignment, rho)?;
 
@@ -3654,13 +3678,13 @@ impl SaeManifoldTerm {
             for i in 0..m {
                 for j in 0..m {
                     let s_ij = 0.5 * (atom.smooth_penalty[[i, j]] + atom.smooth_penalty[[j, i]]);
-                    scaled_s[[i, j]] = lambda_smooth * s_ij;
+                    scaled_s[[i, j]] = lambda_smooth[atom_idx] * s_ij;
                 }
             }
-            // Gradient: g[beta_i] += (λ S_k B_k)[i, out_col]. The (m×m)·(m×p)
+            // Gradient: g[beta_i] += (λ_k S_k B_k)[i, out_col]. The (m×m)·(m×p)
             // GEMM `½(S+Sᵀ)·B_k` was computed in the multi-GPU batch above; here
-            // we only apply the scalar `lambda_smooth`.
-            let sb = &sym_sb_all[atom_idx] * lambda_smooth;
+            // we only apply atom k's `lambda_smooth[atom_idx]`.
+            let sb = &sym_sb_all[atom_idx] * lambda_smooth[atom_idx];
             for out_col in 0..p {
                 for i in 0..m {
                     let beta_i = off + i * p + out_col;
@@ -6123,7 +6147,7 @@ impl SaeManifoldTerm {
                         grad_ext_coord.view(),
                         sys.gb.view(),
                         grad_norm_sq,
-                        rho_fixed.lambda_smooth(),
+                        &rho_fixed.lambda_smooth_vec(),
                     )
                     .map(|v| v.sqrt())
                     .unwrap_or(grad_norm)
@@ -6281,7 +6305,7 @@ impl SaeManifoldTerm {
                 delta_t.view(),
                 delta_beta.view(),
                 step_norm_sq,
-                rho_fixed.lambda_smooth(),
+                &rho_fixed.lambda_smooth_vec(),
             )?;
             let quotient_step_norm = quotient_step_norm_sq.sqrt();
             // Converge on ANY of: the raw KKT gradient (well-conditioned fit),
@@ -6441,7 +6465,7 @@ impl SaeManifoldTerm {
     pub(crate) fn outer_gradient_arrow_solver<'a>(
         &'a self,
         cache: &'a ArrowFactorCache,
-        penalized_gram_scale: f64,
+        penalized_gram_scale: &[f64],
     ) -> Result<DeflatedArrowSolver<'a>, OuterGradientError> {
         let Err(conditioning_err) = Self::outer_gradient_conditioning_error(cache) else {
             return Ok(DeflatedArrowSolver::plain(cache));
@@ -6729,35 +6753,41 @@ impl SaeManifoldTerm {
     /// in the Laplace dimension accounting (evidence honesty) so the criterion
     /// cannot buy a free evidence boost by hiding decoder freedom in the frame.
     pub(crate) fn reml_occam_term(&self, rho: &SaeManifoldRho) -> Result<f64, String> {
-        let mut penalized_channel_dim = 0usize;
-        for atom in &self.atoms {
+        // #1556: λ_smooth is per-atom, so the Occam penalty normalizer and the
+        // profiled-frame evidence-dimension term are both per-atom sums, each
+        // atom `k` weighted by its own `log λ_smooth[k]`. With a uniform
+        // (broadcast) vector this is bit-for-bit the historical global form.
+        let mut acc = 0.0_f64;
+        for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
             // Penalized decoder dimension: `r_k` coordinate channels carry the
             // `S_k` roughness penalty (full-`B` path ⇒ `r_k == p`).
-            penalized_channel_dim += atom.border_frame_rank() * rank_s;
+            let penalized_channel_dim = atom.border_frame_rank() * rank_s;
+            // Profiled Grassmann dimensions enter the Laplace evidence dimension
+            // count with the OPPOSITE sign of the penalty Occam term (they are
+            // free, unpenalized-by-`S` profiled directions), so `−occam` adds
+            // `+½ r(p−r) log λ_k` to the criterion `V` — the honesty correction.
+            let frame_dim = atom.frame_manifold_dimension();
+            let log_lambda = rho.log_lambda_smooth[atom_idx];
+            acc += 0.5 * ((penalized_channel_dim as f64) - (frame_dim as f64)) * log_lambda;
         }
-        // Profiled Grassmann dimensions enter the Laplace evidence dimension
-        // count with the OPPOSITE sign of the penalty Occam term (they are
-        // free, unpenalized-by-`S` profiled directions), so `−occam` adds
-        // `+½ Σ r(p−r) log λ` to the criterion `V` — the honesty correction.
-        let grassmann_dim = self.grassmann_evidence_dimension();
-        let occam_penalty = 0.5 * (penalized_channel_dim as f64) * rho.log_lambda_smooth;
-        let frame_dim_term = 0.5 * (grassmann_dim as f64) * rho.log_lambda_smooth;
-        // `V = … − occam`, so we want the net occam to SUBTRACT the penalty
-        // normalizer and ADD the frame-dimension count. Returning
-        // `occam_penalty − frame_dim_term` achieves that after the caller's
-        // `− occam`.
-        Ok(occam_penalty - frame_dim_term)
+        // `V = … − occam`, so the net occam SUBTRACTS the penalty normalizer and
+        // ADDS the frame-dimension count after the caller's `− occam`.
+        Ok(acc)
     }
 
-    pub(crate) fn reml_occam_log_lambda_smooth_derivative(&self) -> Result<f64, String> {
-        let mut penalized_channel_dim = 0usize;
+    /// Per-atom derivative `∂(occam)/∂log λ_smooth[k]` (#1556): atom `k`'s entry
+    /// is `½·(r_k·rank(S_k) − frame_dim_k)`, matching the per-atom Occam term in
+    /// [`Self::reml_occam_term`]. Returns one entry per atom in atom order.
+    pub(crate) fn reml_occam_log_lambda_smooth_derivative(&self) -> Result<Vec<f64>, String> {
+        let mut out = Vec::with_capacity(self.atoms.len());
         for atom in &self.atoms {
             let rank_s = Self::symmetric_rank(&atom.smooth_penalty)?;
-            penalized_channel_dim += atom.border_frame_rank() * rank_s;
+            let penalized_channel_dim = atom.border_frame_rank() * rank_s;
+            let frame_dim = atom.frame_manifold_dimension();
+            out.push(0.5 * ((penalized_channel_dim as f64) - (frame_dim as f64)));
         }
-        let grassmann_dim = self.grassmann_evidence_dimension();
-        Ok(0.5 * ((penalized_channel_dim as f64) - (grassmann_dim as f64)))
+        Ok(out)
     }
 
     pub fn reml_criterion_streaming_exact(
@@ -7130,47 +7160,40 @@ impl SaeManifoldTerm {
         Ok(traces)
     }
 
-    /// Decoder smoothness penalty quadratic form `Σ_k Σ_oc B_k[:,oc]ᵀ S_k B_k[:,oc]`.
-    ///
-    /// This is `βᵀ (⊕_k S_k ⊗ I_p) β` — the un-scaled (λ-free) penalty energy
-    /// in the flat β layout, the denominator of the λ_smooth Fellner-Schall
-    /// update. `S_k` is symmetrised defensively (as the assembler does).
-    pub(crate) fn decoder_smoothness_quadratic_form(&self) -> f64 {
-        // `Σ_k Σ_oc B_k[:,oc]ᵀ ½(S_k+S_kᵀ) B_k[:,oc]` = `Σ_k <B_k, ½(S_k+S_kᵀ)·B_k>`.
-        // The per-atom `½(S+Sᵀ)·B_k` GEMMs are independent, so they ride the
-        // multi-GPU batched smoothness GEMM (uniform-shape tiles across every
-        // device) with an exact per-atom CPU fallback.
+    /// Per-atom decoder-smoothness penalty quadratic form (#1556): entry `k` is
+    /// the λ-free `<B_k, ½(S_k+S_kᵀ)·B_k> = Σ_oc B_k[:,oc]ᵀ S_k B_k[:,oc]`, the
+    /// per-atom denominator of atom `k`'s λ_smooth Fellner-Schall update. The sum
+    /// over atoms is `βᵀ(⊕_k S_k ⊗ I_p)β`, the un-scaled total penalty energy.
+    /// `S_k` is symmetrised defensively (as the assembler does); the per-atom
+    /// `½(S+Sᵀ)·B_k` GEMMs ride the multi-GPU batched smoothness GEMM with an
+    /// exact per-atom CPU fallback.
+    pub(crate) fn decoder_smoothness_quadratic_form_per_atom(&self) -> Vec<f64> {
         let sb_inputs: Vec<(ArrayView2<'_, f64>, ArrayView2<'_, f64>)> = self
             .atoms
             .iter()
             .map(|atom| (atom.smooth_penalty.view(), atom.decoder_coefficients.view()))
             .collect();
         let sb_all = batched_smooth_sb(&sb_inputs, true);
-        let mut acc = 0.0_f64;
-        for (atom, sb) in self.atoms.iter().zip(sb_all.iter()) {
-            acc += (&atom.decoder_coefficients * sb).sum();
+        let mut per_atom = vec![0.0_f64; self.atoms.len()];
+        for (atom_idx, (atom, sb)) in self.atoms.iter().zip(sb_all.iter()).enumerate() {
+            per_atom[atom_idx] = (&atom.decoder_coefficients * sb).sum();
         }
-        acc
+        per_atom
     }
 
-    /// Effective penalized dof of the decoder smoothness penalty:
-    /// `tr(S_β⁻¹ · M)` with `M = ⊕_k (λ_smooth · S_k) ⊗ I_p` embedded in the
-    /// flat β layout, where `S_β⁻¹ = (H⁻¹)_ββ` is the Schur-complement inverse.
-    ///
-    /// Built per keystone's documented pattern on
-    /// [`ArrowFactorCache::schur_inverse_apply`]:
-    /// `tr(S_β⁻¹ M) = Σ_col e_colᵀ S_β⁻¹ M e_col`. Column `(k, μ, oc)` of `M`
-    /// (global index `off_k + μ·p + oc`) is `λ·S_k[:,μ] ⊗ e_oc` — nonzero only
-    /// at `off_k + ν·p + oc` for `ν in 0..M_k` — so we materialise just that
-    /// sparse K-vector, apply `S_β⁻¹`, and read back `result[col]`. The
-    /// `⊗ I_p` only couples equal `oc`, but `S_β` itself couples channels
-    /// through the data-fit block, so all `p` channels are summed (no
-    /// channel-block-identity shortcut). Total cost `beta_dim` Schur solves.
-    pub(crate) fn decoder_smoothness_effective_dof(
+    /// Per-atom effective penalized dof of the decoder smoothness penalty
+    /// (#1556): entry `k` is `tr(S_β⁻¹ · M_k)` with `M_k = (λ_smooth[k]·S_k) ⊗ I`
+    /// and `S_β⁻¹ = (H⁻¹)_ββ` the Schur-complement inverse, each atom scaled by
+    /// its OWN `lambda_smooth[atom_idx]`. Built on
+    /// [`ArrowFactorCache::schur_inverse_apply`]: column `(k,μ,oc)` of `M_k` is
+    /// `λ_k·S_k[:,μ] ⊗ e_oc` (sparse), so we apply `S_β⁻¹` to that K-vector and
+    /// read back `result[col]`. The total edf is the sum of the returned vector
+    /// (a uniform/broadcast λ reproduces the historical global trace).
+    pub(crate) fn decoder_smoothness_effective_dof_per_atom(
         &self,
         cache: &ArrowFactorCache,
-        lambda_smooth: f64,
-    ) -> Result<f64, ArrowSchurError> {
+        lambda_smooth: &[f64],
+    ) -> Result<Vec<f64>, ArrowSchurError> {
         let p = self.output_dim();
         let frames_active = self.frames_active();
         let (offsets, out_dim): (Vec<usize>, Box<dyn Fn(usize) -> usize>) = if frames_active {
@@ -7183,41 +7206,47 @@ impl SaeManifoldTerm {
             (self.beta_offsets(), Box::new(move |_k: usize| p))
         };
         let k = cache.k;
-        let mut trace = 0.0_f64;
+        let mut per_atom = vec![0.0_f64; self.atoms.len()];
         let mut m_col = Array1::<f64>::zeros(k);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let s = &atom.smooth_penalty;
             let m = atom.basis_size();
             let off = offsets[atom_idx];
             let r = out_dim(atom_idx);
+            let lambda = lambda_smooth[atom_idx];
+            let mut trace = 0.0_f64;
             for mu in 0..m {
                 for oc in 0..r {
                     let col = off + mu * r + oc;
                     m_col.fill(0.0);
                     for nu in 0..m {
                         let s_nu_mu = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
-                        m_col[off + nu * r + oc] = lambda_smooth * s_nu_mu;
+                        m_col[off + nu * r + oc] = lambda * s_nu_mu;
                     }
                     let z = cache.schur_inverse_apply(m_col.view())?;
                     trace += z[col];
                 }
             }
+            per_atom[atom_idx] = trace;
         }
-        Ok(trace)
+        Ok(per_atom)
     }
 
-    pub(crate) fn decoder_smoothness_effective_dof_with_solver(
+    /// Per-atom effective penalized dof via the deflated solver (#1556): entry
+    /// `k` is `tr((H⁻¹)_ββ · M_k)` for `M_k = (λ_smooth[k]·S_k) ⊗ I`, each atom
+    /// scaled by its OWN `lambda_smooth[atom_idx]`. The total is the sum.
+    pub(crate) fn decoder_smoothness_effective_dof_with_solver_per_atom(
         &self,
         cache: &ArrowFactorCache,
         solver: &DeflatedArrowSolver<'_>,
-        lambda_smooth: f64,
-    ) -> Result<f64, String> {
+        lambda_smooth: &[f64],
+    ) -> Result<Vec<f64>, String> {
         let p = self.output_dim();
         // #972 / #977 T1: the cache's β block is the FACTORED border when frames
         // are active (`cache.k == factored_border_dim`), so the smoothness edf
         // trace `tr((H⁻¹)_ββ · M)` is taken over the same factored layout, with
-        // `M = ⊕_k (λ S_k) ⊗ I_{r_k}` at the factored offsets (the `U_kᵀU_k = I`
-        // collapse means the per-coordinate-channel penalty is `λ S_k`, exactly
+        // `M = ⊕_k (λ_k S_k) ⊗ I_{r_k}` at the factored offsets (the `U_kᵀU_k = I`
+        // collapse means the per-coordinate-channel penalty is `λ_k S_k`, exactly
         // as in the full-`B` `⊗ I_p` case but with `r_k` channels). On the
         // full-`B` path `frames_active` is false: `out_dim_k = p`, the offsets
         // are `beta_offsets`, and this is bit-for-bit the historical trace.
@@ -7232,29 +7261,32 @@ impl SaeManifoldTerm {
             (self.beta_offsets(), Box::new(move |_k: usize| p))
         };
         let k = cache.k;
-        let mut trace = 0.0_f64;
+        let mut per_atom = vec![0.0_f64; self.atoms.len()];
         let mut m_col = Array1::<f64>::zeros(k);
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let s = &atom.smooth_penalty;
             let m = atom.basis_size();
             let off = offsets[atom_idx];
             let r = out_dim(atom_idx);
+            let lambda = lambda_smooth[atom_idx];
+            let mut trace = 0.0_f64;
             for mu in 0..m {
                 for oc in 0..r {
                     let col = off + mu * r + oc;
-                    // M[:,col] = λ · S_k[:,mu] ⊗ e_oc (nonzero at off+ν·r+oc).
+                    // M[:,col] = λ_k · S_k[:,mu] ⊗ e_oc (nonzero at off+ν·r+oc).
                     m_col.fill(0.0);
                     for nu in 0..m {
                         let s_nu_mu = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
-                        m_col[off + nu * r + oc] = lambda_smooth * s_nu_mu;
+                        m_col[off + nu * r + oc] = lambda * s_nu_mu;
                     }
                     let zero_t = Array1::<f64>::zeros(cache.delta_t_len());
                     let z = solver.solve(zero_t.view(), m_col.view())?.beta;
                     trace += z[col];
                 }
             }
+            per_atom[atom_idx] = trace;
         }
-        Ok(trace)
+        Ok(per_atom)
     }
 
     pub(crate) fn assignment_log_strength_hessian_trace(
@@ -8347,40 +8379,43 @@ impl SaeManifoldTerm {
                 }
             }
             self.add_learnable_ibp_forward_alpha_data_rhs(rho, target, cache, &mut t, &mut beta)?;
-        } else if j == 1 {
-            let lambda = rho.lambda_smooth();
+        } else if (1..=rho.log_lambda_smooth.len()).contains(&j) {
+            // #1556: coordinate `j ∈ 1..=K` is the per-atom smoothness strength
+            // `log λ_smooth[j-1]`. `∂(penalty)/∂log λ_k = λ_k·S_k C_k` touches ONLY
+            // atom `k = j-1`'s decoder block; every other atom's RHS is zero.
+            let target_atom = j - 1;
+            let lambda = rho.lambda_smooth_for(target_atom);
             let frames_active = self.last_frames_active && cache.k == self.factored_border_dim();
             let offsets = if frames_active {
                 self.factored_beta_offsets()
             } else {
                 self.beta_offsets()
             };
-            for (atom_idx, atom) in self.atoms.iter().enumerate() {
-                let m = atom.basis_size();
-                let coeffs = if frames_active {
-                    match &atom.decoder_frame {
-                        Some(frame) => frame.project_decoder(atom.decoder_coefficients.view())?,
-                        None => atom.decoder_coefficients.clone(),
+            let atom = &self.atoms[target_atom];
+            let m = atom.basis_size();
+            let coeffs = if frames_active {
+                match &atom.decoder_frame {
+                    Some(frame) => frame.project_decoder(atom.decoder_coefficients.view())?,
+                    None => atom.decoder_coefficients.clone(),
+                }
+            } else {
+                atom.decoder_coefficients.clone()
+            };
+            let r = coeffs.ncols();
+            let off = offsets[target_atom];
+            for mu in 0..m {
+                for channel in 0..r {
+                    let mut acc = 0.0_f64;
+                    for nu in 0..m {
+                        let s_sym =
+                            0.5 * (atom.smooth_penalty[[mu, nu]] + atom.smooth_penalty[[nu, mu]]);
+                        acc += s_sym * coeffs[[nu, channel]];
                     }
-                } else {
-                    atom.decoder_coefficients.clone()
-                };
-                let r = coeffs.ncols();
-                let off = offsets[atom_idx];
-                for mu in 0..m {
-                    for channel in 0..r {
-                        let mut acc = 0.0_f64;
-                        for nu in 0..m {
-                            let s_sym = 0.5
-                                * (atom.smooth_penalty[[mu, nu]] + atom.smooth_penalty[[nu, mu]]);
-                            acc += s_sym * coeffs[[nu, channel]];
-                        }
-                        beta[off + mu * r + channel] = lambda * acc;
-                    }
+                    beta[off + mu * r + channel] = lambda * acc;
                 }
             }
         } else {
-            let mut cursor = 2usize;
+            let mut cursor = 1 + rho.log_lambda_smooth.len();
             for atom in 0..rho.log_ard.len() {
                 for axis in 0..rho.log_ard[atom].len() {
                     if cursor == j {
@@ -9016,16 +9051,37 @@ impl SaeManifoldTerm {
                 .learnable_ibp_data_logdet_alpha_trace(rho, cache, solver)
                 .map_err(OuterGradientError::internal)?;
 
-        explicit[1] = loss.smoothness;
-        logdet_trace[1] = 0.5
-            * self
-                .decoder_smoothness_effective_dof_with_solver(cache, solver, rho.lambda_smooth())
-                .map_err(|err| OuterGradientError::InternalInvariant {
-                    reason: format!("analytic_outer_rho_gradient_components: {err}"),
-                })?;
-        occam[1] = -self
+        // #1556: λ_smooth is per-atom, so the smoothness gradient block occupies
+        // flat indices `1..1+K` (one per atom), not a single index 1. Each atom
+        // `k` carries its own explicit penalty-energy derivative, log|H| trace,
+        // and Occam-normalizer derivative.
+        let k_smooth = rho.log_lambda_smooth.len();
+        let lambda_smooth_vec = rho.lambda_smooth_vec();
+        // Explicit `∂loss.smoothness/∂log λ_k = 0.5·λ_k·<B_k, S_k B_k>` (the
+        // per-atom split). Its sum is the λ-scaled penalty energy; renormalize to
+        // `loss.smoothness` so the total matches the criterion's reported energy
+        // bit-for-bit (folding in any minibatch `penalty_scale` baked into it).
+        let mut smooth_explicit = self.decoder_smoothness_value_per_atom(&lambda_smooth_vec);
+        let smooth_explicit_sum: f64 = smooth_explicit.iter().sum();
+        if smooth_explicit_sum.abs() > 0.0 {
+            let renorm = loss.smoothness / smooth_explicit_sum;
+            for v in smooth_explicit.iter_mut() {
+                *v *= renorm;
+            }
+        }
+        let smooth_logdet = self
+            .decoder_smoothness_effective_dof_with_solver_per_atom(cache, solver, &lambda_smooth_vec)
+            .map_err(|err| OuterGradientError::InternalInvariant {
+                reason: format!("analytic_outer_rho_gradient_components: {err}"),
+            })?;
+        let smooth_occam = self
             .reml_occam_log_lambda_smooth_derivative()
             .map_err(OuterGradientError::internal)?;
+        for atom_idx in 0..k_smooth {
+            explicit[1 + atom_idx] = smooth_explicit[atom_idx];
+            logdet_trace[1 + atom_idx] = 0.5 * smooth_logdet[atom_idx];
+            occam[1 + atom_idx] = -smooth_occam[atom_idx];
+        }
 
         let ard_explicit = self
             .ard_log_precision_explicit_derivatives(rho)
@@ -9035,7 +9091,7 @@ impl SaeManifoldTerm {
             .map_err(|err| OuterGradientError::InternalInvariant {
                 reason: format!("analytic_outer_rho_gradient_components: {err}"),
             })?;
-        let mut cursor = 2usize;
+        let mut cursor = 1 + k_smooth;
         for k in 0..rho.log_ard.len() {
             for axis in 0..rho.log_ard[k].len() {
                 explicit[cursor] = ard_explicit[k][axis];
@@ -9095,7 +9151,7 @@ impl SaeManifoldTerm {
         loss: &SaeManifoldLoss,
         cache: &ArrowFactorCache,
     ) -> Result<SaeOuterRhoGradientComponents, String> {
-        let solver = self.outer_gradient_arrow_solver(cache, rho.lambda_smooth())?;
+        let solver = self.outer_gradient_arrow_solver(cache, &rho.lambda_smooth_vec())?;
         self.analytic_outer_rho_gradient_components(target, rho, loss, cache, &solver)
             .map_err(|e| e.to_string())
     }
@@ -9146,7 +9202,7 @@ impl SaeManifoldTerm {
         };
         let data_fit_priors_value = loss.total() + extra_penalty_energy;
 
-        let solver = self.outer_gradient_arrow_solver(&cache, rho.lambda_smooth())?;
+        let solver = self.outer_gradient_arrow_solver(&cache, &rho.lambda_smooth_vec())?;
         let components =
             self.analytic_outer_rho_gradient_components(target, rho, &loss, &cache, &solver)?;
         Ok(SaeCriterion::assemble(
@@ -9199,9 +9255,11 @@ impl SaeManifoldTerm {
         let p = self.output_dim();
         let n_scalar = (n * p) as f64;
         let rss = 2.0 * loss.data_fit;
-        let smooth_edf = self
-            .decoder_smoothness_effective_dof(cache, rho.lambda_smooth())
-            .map_err(|e| format!("reconstruction_dispersion: smooth edf: {e}"))?;
+        let smooth_edf: f64 = self
+            .decoder_smoothness_effective_dof_per_atom(cache, &rho.lambda_smooth_vec())
+            .map_err(|e| format!("reconstruction_dispersion: smooth edf: {e}"))?
+            .iter()
+            .sum();
         // #972 / #977 T1: the raw decoder-parameter count is `beta_dim` on the
         // full-`B` path, but when frames are active the estimated decoder freedom
         // is the factored border `Σ M_k·r_k` PLUS the `Σ r_k·(p−r_k)` Grassmann
