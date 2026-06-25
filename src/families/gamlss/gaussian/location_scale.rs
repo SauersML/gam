@@ -1088,6 +1088,39 @@ impl CustomFamily for GaussianLocationScaleFamily {
         true
     }
 
+    /// Gaussian location-scale carries a NON-profiled second (log-σ) linear
+    /// predictor, so — unlike an ordinary Gaussian GAM whose scalar dispersion is
+    /// profiled out analytically — its smoothing-parameter selection exhibits the
+    /// same capped-screening over-smoothing bias as a GLM block: the capped
+    /// inner-iteration screening proxy ranks an over-smoothed scale seed cheapest
+    /// (its coefficients collapse into the penalty null space and the proxy looks
+    /// converged), so the log-σ smooth is flattened toward a constant σ, the
+    /// 1/σ² IRLS weights go wrong, and the weight-coupled mean degrades too.
+    ///
+    /// The default trait config classifies this as the generic
+    /// `GeneralizedLinear` profile (seed_budget=1, capped screening, a seed grid
+    /// reaching only ρ≈−2, and the *parsimonious* — smoothing-biased — keep-best),
+    /// every part of which pushes the scale toward over-smoothing. The spatial
+    /// (Matérn/GP) location-scale path already classifies the family as
+    /// `GaussianLocationScale`; this override extends that same correct
+    /// classification to the NON-spatial (thin-plate / P-spline) rho-only path,
+    /// which is the one a `s(x, bs='tp')` location-scale fit actually takes. The
+    /// `GaussianLocationScale` profile reuses Gaussian's flexible seed grid (which
+    /// reaches the low-λ scale basin) and Gaussian's lowest-cost keep-best (no
+    /// smoothing-biased tie-break), while still taking the interior-extreme seed
+    /// promotion so the flexible basin is actually full-solved. The budget mirrors
+    /// the spatial `exact_joint_seed_config(Gaussian)` (max_seeds=4, seed_budget=2).
+    fn outer_seed_config(&self, n_params: usize) -> crate::seeding::SeedConfig {
+        if n_params == 0 {
+            return crate::seeding::SeedConfig::default();
+        }
+        let mut config = crate::seeding::SeedConfig::default();
+        config.risk_profile = crate::seeding::SeedRiskProfile::GaussianLocationScale;
+        config.max_seeds = 4;
+        config.seed_budget = 2;
+        config
+    }
+
     /// Two independent linear predictors: block 0 → μ channel, block 1 → log σ
     /// channel. Declaring the channel topology lets `fit_custom_family` route
     /// the identifiability audit channel-aware even when a caller builds the
