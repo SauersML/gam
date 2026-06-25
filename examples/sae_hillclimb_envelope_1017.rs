@@ -79,7 +79,6 @@ struct Shape {
 }
 
 struct Fixture {
-    shape: Shape,
     term: SaeManifoldTerm,
     target: Array2<f64>,
     rho: SaeManifoldRho,
@@ -275,12 +274,7 @@ fn build_fixture(shape: Shape) -> Result<Fixture, String> {
         LOG_LAMBDA_SMOOTH,
         vec![Array1::<f64>::zeros(0); shape.k],
     );
-    Ok(Fixture {
-        shape,
-        term,
-        target,
-        rho,
-    })
+    Ok(Fixture { term, target, rho })
 }
 
 /// Fraction of target variance explained by `fitted`, in [.., 1.0]; 1.0 is a
