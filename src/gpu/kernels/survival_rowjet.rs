@@ -438,6 +438,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cpu_third_fourth_match_dense_tower_oracle() {
+        // The seeded-jet (OneSeed/TwoSeed, O(K²)) contracted third/fourth in the
+        // CPU fallback must equal the TRUE tensor contraction from the dense
+        // `Tower4<4>` (the K³/K⁴ tensor). This pins the seeded contraction to the
+        // single-source tensor exactly — the same property the device kernel's
+        // JS1/JS2 channels rely on (and the device parity gate then matches THIS
+        // CPU result to ≤1e-9).
+        use crate::families::jet_tower::Tower4;
+        use crate::families::survival::marginal_slope::row_kernel::rigid_row_nll;
+        let rows = fixture(9);
+        let out = survival_rigid_row_jets_cpu(&rows, 0.7, &DIR, &DIRU, &DIRV);
+        for (row, inp) in rows.iter().enumerate() {
+            let in_row = RigidRowInputs {
+                row,
+                wi: inp.wi,
+                di: inp.di,
+                z_sum: inp.z_sum,
+                covariance_ones: inp.cov_ones,
+                probit_scale: 0.7,
+                qd1_lower: f64::NEG_INFINITY,
+            };
+            let vars: [Tower4<4>; 4] =
+                std::array::from_fn(|a| Tower4::variable(inp.primaries[a], a));
+            let tower = rigid_row_nll(&vars, &in_row).expect("dense tower4");
+            let t3 = tower.third_contracted(&DIR);
+            let t4 = tower.fourth_contracted(&DIRU, &DIRV);
+            for a in 0..4 {
+                for b in 0..4 {
+                    assert!(
+                        (t3[a][b] - out.third[row * 16 + a * 4 + b]).abs() <= 1e-12,
+                        "third mismatch row {row} {a},{b}: tensor={} seeded={}",
+                        t3[a][b],
+                        out.third[row * 16 + a * 4 + b]
+                    );
+                    assert!(
+                        (t4[a][b] - out.fourth[row * 16 + a * 4 + b]).abs() <= 1e-12,
+                        "fourth mismatch row {row} {a},{b}: tensor={} seeded={}",
+                        t4[a][b],
+                        out.fourth[row * 16 + a * 4 + b]
+                    );
+                }
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn device_matches_cpu_when_available() {

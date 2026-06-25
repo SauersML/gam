@@ -2550,9 +2550,44 @@ impl LinearOperator for BlockDesignOperator {
         }
 
         // Cross blocks (i, j) for i < j.
+        //
+        // Perf (#1017): the shared weight-scaled design `diag(w)·X_i` is
+        // identical across every pairing `(i, j>i)`. The prior code recomputed
+        // it inside each `cross_block` call (re-scaling X_i by w once per
+        // partner j) and folded the product with a naive O(n·p_i·p_j) triple
+        // loop. We now scale each dense block by `w` exactly ONCE up front and
+        // route every Dense×Dense pair through a single blocked BLAS GEMM
+        // (`fast_atb`), collapsing the c² hand-rolled accumulations into c²
+        // batched matmuls over a design that is weight-scaled c times instead
+        // of O(c²) times. Non-dense pairs keep their specialized kernels.
+        //
+        // Bit-identity: `cross[a,b] = Σ_i w_i · X_i[i,a] · X_j[i,b]` is exactly
+        // `(diag(w)·X_i)ᵀ · X_j`, so pre-scaling then GEMM is the same sum,
+        // reassociated only by the matmul's blocking (≤1e-10).
+        let weighted_dense: Vec<Option<Array2<f64>>> = self
+            .blocks
+            .iter()
+            .map(|block| match block {
+                DesignBlock::Dense(d) => d.as_dense_ref().map(|x| {
+                    // diag(w)·X computed once; signed w (no .max(0.0)) to match
+                    // the asymmetric cross-block kernel's sign-correct form.
+                    x * &weights.view().insert_axis(Axis(1))
+                }),
+                _ => None,
+            })
+            .collect();
+
         for i in 0..self.blocks.len() {
             for j in (i + 1)..self.blocks.len() {
-                let cross = self.cross_block(i, j, weights)?;
+                let cross = match (&weighted_dense[i], &self.blocks[j]) {
+                    // Fused Dense×Dense: single GEMM over the shared,
+                    // already-once-scaled left design.
+                    (Some(wx_i), DesignBlock::Dense(d_j)) => match d_j.as_dense_ref() {
+                        Some(x_j) => fast_atb(wx_i, x_j),
+                        None => self.cross_block(i, j, weights)?,
+                    },
+                    _ => self.cross_block(i, j, weights)?,
+                };
                 let si = self.col_offsets[i];
                 let ei = self.col_offsets[i + 1];
                 let sj = self.col_offsets[j];
