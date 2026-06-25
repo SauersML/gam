@@ -487,8 +487,18 @@ pub struct DecoderIncoherencePenalty {
     /// Output / feature dimension `p_out` (decoder column count, shared by all
     /// atoms).
     pub p_out: usize,
-    /// `(K, K)` joint gate activity. `coactivation[j,k]` is `mean_n gate[n,j]·gate[n,k]`.
-    pub coactivation: Array2<f64>,
+    /// Atom count `K`. The operator only stores the SPARSE list of penalized
+    /// atom pairs (`pairs`), not the dense `K×K` co-activation matrix — at
+    /// `K = 32768` that dense matrix is 8 GiB. Every consumer of this operator
+    /// already skipped pairs whose symmetrized weight is `0`, so storing only
+    /// the nonzero pairs is exactly equivalent to the dense matrix while being
+    /// linear in the number of co-active / near-collinear pairs (#1026).
+    pub k_atoms: usize,
+    /// Sparse penalized atom pairs `(j, k, w)` with `j < k` and the symmetrized
+    /// weight `w = ½·(W[j,k] + W[k,j]) > 0` (this is exactly the value the old
+    /// `pair_weight(j, k)` returned). Pairs with `w == 0` are omitted; the dense
+    /// operator skipped them, so results are byte-identical.
+    pub pairs: Vec<(usize, usize, f64)>,
     /// Base strength. If `learnable_weight` is true the resolved strength is
     /// `weight·exp(rho[rho_index])`; otherwise it is fixed at `weight`.
     pub weight: f64,

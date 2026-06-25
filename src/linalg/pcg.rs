@@ -422,7 +422,6 @@ where
 mod tests {
     use super::*;
     use ndarray::array;
-    use ndarray::Array1;
 
     /// The `Serial` reduction is byte-for-byte the historical `serial_dot`
     /// (a strict left-to-right fold). This pins the main-solve contract: the
