@@ -2437,7 +2437,7 @@ impl KroneckerReparamResult {
     /// Only for fallback paths — avoid in hot loops.
     pub fn materialize_qs(&self) -> Array2<f64> {
         let mut qs = Array2::<f64>::eye(1);
-        for u_k in &self.marginal_qs {
+        for u_k in self.marginal_qs.iter() {
             qs = kronecker_product(&qs, u_k);
         }
         qs

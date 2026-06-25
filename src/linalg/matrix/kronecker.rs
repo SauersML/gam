@@ -491,8 +491,8 @@ impl DenseDesignOperator for TensorProductDesignOperator {
                 }
                 std::mem::swap(&mut cur, &mut next);
             }
-            let out_row = out
-                .row_mut(local_row)
+            let mut out_view = out.row_mut(local_row);
+            let out_row = out_view
                 .as_slice_mut()
                 .expect("design chunk row is contiguous in C-major Array2");
             out_row.copy_from_slice(&cur);
