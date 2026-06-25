@@ -3361,7 +3361,25 @@ mod empirical_rigid_jet_oracle_tests {
                     &grid.weights,
                 );
 
+                // Graded tolerance. Value/gradient/Hessian (orders 0–2) are
+                // read off the lift at the f64 floor and match to 1e-9. The
+                // third/fourth grades (#833 block) are produced by the iterative
+                // filtered-Newton lift (`filtered_implicit_solve_scalar`, one
+                // corrective pass per grade) whereas the witness uses the
+                // order-by-order exact `implicit_solve`; the two are algebraically
+                // identical but reassociate the f64 arithmetic differently, and
+                // that reassociation noise grows with grade — empirically ~1e-9
+                // absolute by T4. The lift is grade-4-complete at iters=4 (bumping
+                // to iters=5 leaves the T4 value unmoved — confirmed reassociation,
+                // not under-iteration/truncation). A graded floor (1e-9 through
+                // order 2, 1e-8 for the T3/T4 grades) tracks the achievable FP
+                // agreement while still rejecting a genuinely dropped IFT / Faà-di-
+                // Bruno term by ~6 orders of magnitude: a real #833-genus omission
+                // shifts the m/g block ~1e-2 (see
+                // `planted_833_style_omission_is_caught_by_exact_tower_932`), which
+                // 1e-8 still catches with an enormous margin.
                 let tol = |scale: f64| 1e-9 * scale.abs().max(1.0);
+                let tol_hi = |scale: f64| 1e-8 * scale.abs().max(1.0);
 
                 // Value.
                 assert!(
@@ -3400,7 +3418,7 @@ mod empirical_rigid_jet_oracle_tests {
                     (1, 1, 1, third[1][1][1]),
                 ] {
                     assert!(
-                        (tower.t3[i][j][k] - prod).abs() <= tol(prod),
+                        (tower.t3[i][j][k] - prod).abs() <= tol_hi(prod),
                         "frailty {frailty_sd:?} row {row}: T3[{i}][{j}][{k}] tower {:+.12e} != production {prod:+.12e}",
                         tower.t3[i][j][k]
                     );
@@ -3415,7 +3433,7 @@ mod empirical_rigid_jet_oracle_tests {
                     (1, 1, 1, 1, fourth[1][1][1][1]),
                 ] {
                     assert!(
-                        (tower.t4[i][j][k][l] - prod).abs() <= tol(prod),
+                        (tower.t4[i][j][k][l] - prod).abs() <= tol_hi(prod),
                         "frailty {frailty_sd:?} row {row}: T4[{i}][{j}][{k}][{l}] tower {:+.12e} != production {prod:+.12e}",
                         tower.t4[i][j][k][l]
                     );
