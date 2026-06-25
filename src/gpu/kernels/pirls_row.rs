@@ -757,7 +757,10 @@ impl PirlsRowBackend {
             KernelMode::SolveRow => solve_row_source_for(family, curvature),
             KernelMode::AlphaLadder => ladder_source_for(family, curvature),
         };
-        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| {
+        // #1551: route through the device-arch-pinned compile — this kernel uses
+        // `atomicAdd(double*, double)` (objective_out), which NVRTC rejects under
+        // its default sub-sm_60 arch, silently disabling the device PIRLS path.
+        let ptx = crate::gpu::device_cache::compile_ptx_arch(&source).gpu_ctx_with(|err| {
             format!(
                 "pirls_row {label}NVRTC compile failed for {family}/{curv}: {err}",
                 family = family.as_str(),
@@ -849,7 +852,8 @@ impl PirlsRowBackend {
             return Ok(existing.clone());
         }
         let source = spec.cuda_source(curvature);
-        let ptx = cudarc::nvrtc::compile_ptx(source).gpu_ctx_with(|err| {
+        // #1551: device-arch-pinned compile (double-atomic objective_out kernel).
+        let ptx = crate::gpu::device_cache::compile_ptx_arch(&source).gpu_ctx_with(|err| {
             format!(
                 "pirls_row JIT NVRTC compile failed for spec_id={} curvature={}: {err}",
                 spec.spec_id,
