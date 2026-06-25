@@ -232,13 +232,10 @@ pub(crate) fn sae_separation_barrier_strength() -> f64 {
 
 /// Set the process-global SAE separation-barrier strength override (one wheel,
 /// many configs). `sep_strength` is NaN to clear back to the compiled default.
-/// `amp_strength` and `gate_mode` are accepted for FFI-signature stability but
-/// ignored: the amplitude (keep-alive) barrier and its active-atom gate were
-/// removed (surplus features are allowed to die into a ridge-parked state).
-/// Called from the gamfit Python FFI sweep driver.
-pub fn set_sae_barrier_overrides(amp_strength: f64, sep_strength: f64, gate_mode: u8) {
-    // `amp_strength` / `gate_mode` are intentionally unused (the amplitude
-    // barrier was removed); kept in the signature for FFI stability.
+/// The amplitude (keep-alive) barrier and its active-atom gate were removed
+/// (surplus features are allowed to die into a ridge-parked state), so this
+/// takes only the separation strength. Called from the gamfit Python FFI.
+pub fn set_sae_barrier_overrides(sep_strength: f64) {
     SAE_SEP_STRENGTH_OVERRIDE_BITS
         .store(sep_strength.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }

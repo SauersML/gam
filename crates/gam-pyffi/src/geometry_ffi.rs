@@ -12,14 +12,14 @@ fn poincare_distance<'py>(
     })
 }
 
-/// #1026/#1522 — set the process-global SAE anti-collapse barrier overrides so a
-/// SINGLE compiled wheel can sweep the (μ_amp × μ_sep × gate) response surface
-/// without recompiling gam per config. `amp_strength`/`sep_strength` are NaN to
-/// restore the compiled default; `gate_mode`: 0 = decoder-norm (default), 1 =
-/// legacy assignment-energy gate, 2 = unconditional.
-#[pyfunction(signature = (amp_strength = f64::NAN, sep_strength = f64::NAN, gate_mode = 0))]
-fn sae_set_barrier_overrides(amp_strength: f64, sep_strength: f64, gate_mode: u8) {
-    gam::terms::sae::manifold::set_sae_barrier_overrides(amp_strength, sep_strength, gate_mode);
+/// #1026/#1522 — set the process-global SAE separation-barrier strength so a
+/// SINGLE compiled wheel can sweep μ_sep without recompiling gam. `sep_strength`
+/// is NaN to restore the compiled default. The amplitude (keep-alive) barrier
+/// and its active-atom gate were removed (surplus features die into a
+/// ridge-parked state), so only the separation strength is tunable.
+#[pyfunction(signature = (sep_strength = f64::NAN))]
+fn sae_set_barrier_overrides(sep_strength: f64) {
+    gam::terms::sae::manifold::set_sae_barrier_overrides(sep_strength);
 }
 
 /// #1026 — set the process-global IBP-α override (flattens the ordered geometric
