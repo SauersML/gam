@@ -444,8 +444,9 @@ pub(crate) fn rank_seeds_with_screening(
         ordered = interior;
         ordered.extend(boundary);
 
-        // Guarantee the flexible (low-λ) basin one full-budget solve for
-        // non-Gaussian models (#1082/#1373). The screening proxy is a
+        // Guarantee the flexible (low-lambda) basin one full-budget solve for
+        // models whose smoothing coordinates are not profiled Gaussian scale
+        // (#1082/#1373 and Gaussian location-scale). The screening proxy is a
         // capped-inner-iteration fit, and an over-smoothed seed converges
         // trivially under that cap (coefficients collapse into the penalty
         // null space, LAML locally flat), so the proxy systematically ranks
@@ -457,16 +458,16 @@ pub(crate) fn rank_seeds_with_screening(
         // never gets solved and the fit over-smooths. Promote the single
         // most-flexible interior seed (smallest Σ of the leading rho_dim
         // coordinates) to the front so it is always among the full solves.
-        // Gaussian REML's profiled-scale basin does not exhibit this bias, so
-        // this is gated to GeneralizedLinear / Survival. Keep-best across the
-        // full-solved seeds means promoting a flexible seed can never worsen
-        // the returned fit — it only lets the optimizer reach the lower-λ
-        // basin; the remaining proxy order is preserved.
-        let non_gaussian = !matches!(
-            config.seed_config.risk_profile,
-            crate::seeding::SeedRiskProfile::Gaussian
-        );
-        if non_gaussian && ordered.len() > 1 {
+        // Ordinary Gaussian REML's profiled-scale basin does not exhibit this
+        // bias, but Gaussian location-scale has a non-profiled log-scale block
+        // and does. Keep-best across the full-solved seeds means promoting a
+        // flexible seed can never worsen the returned fit; the remaining proxy
+        // order is preserved.
+        let promote_extreme_seeds = config
+            .seed_config
+            .risk_profile
+            .promotes_interior_seed_extremes();
+        if promote_extreme_seeds && ordered.len() > 1 {
             let rho_sum =
                 |seed: &Array1<f64>| -> f64 { (0..rho_dim.min(seed.len())).map(|i| seed[i]).sum() };
             if let Some((most_flexible_idx, _)) = ordered
@@ -512,7 +513,7 @@ pub(crate) fn rank_seeds_with_screening(
             // Keep-best semantics mean this can only ADD a basin, never worsen the
             // returned fit: a genuinely separable λ→0 case (#1082) still converges
             // / best-feasibles at slot 0 and the heavy seed is simply dominated.
-            if non_gaussian && ordered.len() > 2 {
+            if promote_extreme_seeds && ordered.len() > 2 {
                 let heaviest_idx = ordered
                     .iter()
                     .enumerate()

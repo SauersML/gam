@@ -104,9 +104,7 @@ mod linux_impl {
     use crate::gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use crate::linalg::matrix::SymmetricMatrix;
     use crate::matrix::DesignMatrix;
-    use crate::solver::active_set::{
-        LinearInequalityConstraints, compute_constraint_kkt_diagnostics,
-    };
+    use crate::solver::active_set::compute_constraint_kkt_diagnostics;
     use crate::solver::gpu::pirls_dispatch_wire::admission_for;
     use crate::solver::gpu::pirls_gpu::{self, cuda};
     use crate::solver::pirls::{
@@ -116,6 +114,7 @@ mod linux_impl {
         computeworkingweight_derivatives_from_eta,
     };
     use crate::types::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor};
+    use gam_problem::LinearInequalityConstraints;
 
     /// All inputs needed for the GPU PIRLS loop end-to-end. Built by the
     /// CPU PIRLS driver right before it would invoke `runworking_model_pirls`,

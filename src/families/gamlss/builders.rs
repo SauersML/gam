@@ -1826,13 +1826,13 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
 
     fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
         // Mirror the Binomial location-scale path: the log-sigma (scale)
-        // block carries an extra full-space shrinkage penalty so its
+        // block carries an extra nullspace shrinkage penalty so its
         // polynomial nullspace (constant log-sigma, plus the linear term for
         // tp/Duchon bases) is not left unpenalized. Without it, outer REML
-        // optimizes lambda_sigma on a flat/ill-conditioned surface, which
-        // over-smooths the scale envelope (bad Pearson/CRPS/PIT/NLL) and can
-        // diverge the coupled inner Newton (log_sigma residual blows up,
-        // beta -> infinity). The strength of this ridge is REML-selected.
+        // optimizes lambda_sigma on a flat/ill-conditioned surface, which can
+        // flatten the scale envelope (bad Pearson/CRPS/PIT/NLL) and diverge
+        // the coupled inner Newton (log_sigma residual blows up, beta ->
+        // infinity). The strength of this shrinkage is REML-selected.
         noise_design.penalties.len() + 1
     }
 
@@ -1841,7 +1841,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
     }
 
     fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
-        crate::seeding::SeedRiskProfile::Gaussian
+        crate::seeding::SeedRiskProfile::GaussianLocationScale
     }
 
     fn build_blocks(
@@ -1952,7 +1952,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
     }
 
     fn noise_penalty_count(&self, noise_design: &TermCollectionDesign) -> usize {
-        // Same full-space log-sigma shrinkage penalty as the non-wiggle
+        // Same nullspace log-sigma shrinkage penalty as the non-wiggle
         // Gaussian builder; see GaussianLocationScaleTermBuilder.
         noise_design.penalties.len() + 1
     }
@@ -1962,7 +1962,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
     }
 
     fn exact_spatial_seed_risk_profile(&self) -> crate::seeding::SeedRiskProfile {
-        crate::seeding::SeedRiskProfile::Gaussian
+        crate::seeding::SeedRiskProfile::GaussianLocationScale
     }
 
     fn require_exact_spatial_joint(&self) -> bool {

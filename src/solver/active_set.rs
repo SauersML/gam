@@ -3,6 +3,7 @@ use crate::faer_ndarray::{FaerArrayView, FaerLinalgError, FaerSvd, array1_to_col
 use crate::linalg::utils::{StableSolver, array_is_finite, boundary_hit_step_fraction};
 use faer::linalg::solvers::{Lblt as FaerLblt, Solve as FaerSolve};
 use faer::{Side, Unbind};
+use gam_problem::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -69,60 +70,6 @@ pub(crate) const ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL: f64 = 1e-3;
 /// descent direction even if the KKT residual has not yet tightened.
 const ACTIVE_SET_MODEL_DESCENT_REL_TOL: f64 = 1e-10;
 
-#[derive(Clone, Debug)]
-pub struct LinearInequalityConstraints {
-    pub a: Array2<f64>,
-    pub b: Array1<f64>,
-}
-
-impl LinearInequalityConstraints {
-    /// Construct with the equal-row-count invariant enforced. The dimensions
-    /// `a.nrows() == b.len()` are required by every downstream KKT / active-set
-    /// routine; routing every construction site through this constructor
-    /// eliminates a class of "rows out of sync" bugs at the type boundary.
-    #[inline]
-    pub fn new(a: Array2<f64>, b: Array1<f64>) -> Result<Self, String> {
-        if a.nrows() != b.len() {
-            return Err(format!(
-                "LinearInequalityConstraints: row count mismatch (A has {} rows, b has length {})",
-                a.nrows(),
-                b.len(),
-            ));
-        }
-        Ok(Self { a, b })
-    }
-
-    /// Internal helper for sites that have *just* produced `(a, b)` with the
-    /// invariant guaranteed (e.g. via a row-by-row push loop). Skips the
-    /// runtime length check; callers that aren't in that position must use
-    /// [`Self::new`] instead.
-    #[inline]
-    pub(crate) fn from_paired(a: Array2<f64>, b: Array1<f64>) -> Self {
-        assert_eq!(a.nrows(), b.len(), "paired constraint shape invariant");
-        Self { a, b }
-    }
-
-    /// Build the per-coordinate `β_i ≥ lower_bounds[i]` inequality system.
-    /// Non-finite entries are treated as "no bound" and skipped; returns
-    /// `None` when every entry is non-finite so callers can short-circuit
-    /// the no-constraint case without allocating the empty A/b pair.
-    pub fn from_per_coordinate_lower_bounds(lower_bounds: &Array1<f64>) -> Option<Self> {
-        let active_rows: Vec<usize> = (0..lower_bounds.len())
-            .filter(|&i| lower_bounds[i].is_finite())
-            .collect();
-        if active_rows.is_empty() {
-            return None;
-        }
-        let p = lower_bounds.len();
-        let mut a = Array2::<f64>::zeros((active_rows.len(), p));
-        let mut b = Array1::<f64>::zeros(active_rows.len());
-        for (r, &idx) in active_rows.iter().enumerate() {
-            a[[r, idx]] = 1.0;
-            b[r] = lower_bounds[idx];
-        }
-        Some(Self::from_paired(a, b))
-    }
-}
 
 /// KKT diagnostics for inequality-constrained Newton subproblems.
 ///
@@ -649,7 +596,8 @@ pub(crate) fn project_point_strictly_into_feasible_cone(
     let beta = if equality_rows.is_empty() {
         // No equalities: the original single strictly-interior QP
         // (`min ½‖β − point‖²` s.t. the margin-shifted one-sided rows).
-        let interior = LinearInequalityConstraints::from_paired(a_ineq, b_ineq);
+        let interior = LinearInequalityConstraints::new(a_ineq, b_ineq)
+            .expect("shifted interior constraint shape invariant");
         let identity = Array2::<f64>::eye(p);
         solve_quadratic_with_linear_constraints(&identity, point, point, &interior, None)
             .ok()?
@@ -713,7 +661,8 @@ pub(crate) fn project_point_strictly_into_feasible_cone(
         let a_red = a_ineq.dot(&z);
         let b_red = &b_ineq - &a_ineq.dot(&beta_p);
         let u0 = z.t().dot(&(point - &beta_p));
-        let reduced = LinearInequalityConstraints::from_paired(a_red, b_red);
+        let reduced = LinearInequalityConstraints::new(a_red, b_red)
+            .expect("reduced constraint shape invariant");
         let identity = Array2::<f64>::eye(z.ncols());
         let (u_sol, _active) =
             solve_quadratic_with_linear_constraints(&identity, &u0, &u0, &reduced, None).ok()?;
@@ -906,7 +855,8 @@ pub(crate) fn compress_active_working_set(
         rank_reduce_rows_pivoted_qr_with_dependence(a_out, b_out, groups_out);
 
     Ok(CompressedActiveWorkingSet {
-        constraints: LinearInequalityConstraints::from_paired(a_out, b_out),
+        constraints: LinearInequalityConstraints::new(a_out, b_out)
+            .expect("compressed active constraint shape invariant"),
         groups: groups_out,
         multiplier_dependence,
         original_active_count: active.len(),
@@ -1770,7 +1720,8 @@ mod tests {
             a[[i, i + 1]] = 2.0;
             a[[i, i + 2]] = -1.0;
         }
-        let constraints = LinearInequalityConstraints::from_paired(a, Array1::zeros(rows));
+        let constraints = LinearInequalityConstraints::new(a, Array1::zeros(rows))
+            .expect("test constraint shape invariant");
 
         let vertex = Array1::<f64>::zeros(p);
         // The vertex is feasible (all rows exactly tight) but on every boundary.
@@ -1813,7 +1764,8 @@ mod tests {
         a[[2, 4]] = 1.0;
         a[[3, 0]] = 1.0;
         a[[4, 0]] = -1.0;
-        let constraints = LinearInequalityConstraints::from_paired(a, Array1::zeros(m));
+        let constraints = LinearInequalityConstraints::new(a, Array1::zeros(m))
+            .expect("test constraint shape invariant");
 
         // A seed that violates the shape bounds (negative curvature coords) and
         // the equality (β_0 ≠ 0).
@@ -1854,7 +1806,8 @@ mod tests {
             a[[i, i + 1]] = 2.0;
             a[[i, i + 2]] = -1.0;
         }
-        let constraints = LinearInequalityConstraints::from_paired(a, Array1::zeros(rows));
+        let constraints = LinearInequalityConstraints::new(a, Array1::zeros(rows))
+            .expect("test constraint shape invariant");
         // A strictly concave coefficient profile (-(j-2)^2): every second
         // difference is -(-2) = +2 > 0 after the concave sign flip, well above
         // the interior margin.

@@ -6960,7 +6960,8 @@ fn exact_joint_seed_config(
         ..Default::default()
     };
     match risk_profile {
-        crate::seeding::SeedRiskProfile::Gaussian => {
+        crate::seeding::SeedRiskProfile::Gaussian
+        | crate::seeding::SeedRiskProfile::GaussianLocationScale => {
             config.max_seeds = 4;
             config.seed_budget = 2;
         }

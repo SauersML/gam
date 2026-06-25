@@ -2160,7 +2160,10 @@ pub(super) fn build_transformed_lower_bound_constraints(
         a.row_mut(r).assign(&qs.row(idx));
         b[r] = lb[idx];
     }
-    Some(LinearInequalityConstraints::from_paired(a, b))
+    Some(
+        LinearInequalityConstraints::new(a, b)
+            .expect("transformed lower-bound constraint shape invariant"),
+    )
 }
 
 pub(super) fn build_transformed_lower_bound_constraints_with_transform(
@@ -2188,7 +2191,10 @@ pub(super) fn build_transformed_lower_bound_constraints_with_transform(
         a.row_mut(r).assign(&row);
         b[r] = lb[idx];
     }
-    Some(LinearInequalityConstraints::from_paired(a, b))
+    Some(
+        LinearInequalityConstraints::new(a, b)
+            .expect("transformed lower-bound constraint shape invariant"),
+    )
 }
 
 pub(super) fn build_transformed_linear_constraints(
@@ -2199,10 +2205,10 @@ pub(super) fn build_transformed_linear_constraints(
     if lc.a.ncols() != qs.nrows() {
         return None;
     }
-    Some(LinearInequalityConstraints::from_paired(
-        lc.a.dot(qs),
-        lc.b.clone(),
-    ))
+    Some(
+        LinearInequalityConstraints::new(lc.a.dot(qs), lc.b.clone())
+            .expect("transformed linear constraint shape invariant"),
+    )
 }
 
 pub(super) fn build_transformed_linear_constraints_with_transform(

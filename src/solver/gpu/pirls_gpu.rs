@@ -2104,7 +2104,7 @@ extern "C" __global__ void status_or(
         /// converged β + reconstructed penalised gradient and emits
         /// the result on `PirlsLoopOutcome::constraint_kkt`. When
         /// `None`, no diagnostics are produced.
-        pub linear_constraints: Option<&'a crate::solver::active_set::LinearInequalityConstraints>,
+        pub linear_constraints: Option<&'a gam_problem::LinearInequalityConstraints>,
         /// Curvature surface the *outer* REML / LAML caller expects on
         /// the returned Hessian. The GPU loop runs under whatever
         /// `curvature: CurvatureMode` it was invoked with; if this

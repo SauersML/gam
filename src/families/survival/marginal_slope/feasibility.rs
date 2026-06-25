@@ -83,7 +83,7 @@ impl SurvivalMarginalSlopeFamily {
             b.slice_mut(s![row_start..row_start + rows_per_coord])
                 .assign(&scalar.b);
         }
-        Ok(LinearInequalityConstraints::from_paired(a, b))
+        LinearInequalityConstraints::new(a, b)
     }
 
     pub(crate) fn validate_time_qd1_feasible(

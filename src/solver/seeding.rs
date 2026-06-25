@@ -257,7 +257,7 @@ pub fn generate_rho_candidates(
     // smoothing levels. Put an aggressively over-smoothed isotropic seed near
     // the front so startup validation can still find a stable basin.
     match config.risk_profile {
-        SeedRiskProfile::Gaussian => {}
+        SeedRiskProfile::Gaussian | SeedRiskProfile::GaussianLocationScale => {}
         SeedRiskProfile::GeneralizedLinear | SeedRiskProfile::Survival => {
             add_seed_dedup(
                 &mut seeds,

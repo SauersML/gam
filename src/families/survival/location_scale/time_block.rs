@@ -224,7 +224,7 @@ pub(crate) fn append_linear_constraints(
             a.slice_mut(s![lhs.a.nrows().., ..]).assign(&rhs.a);
             b.slice_mut(s![..lhs.b.len()]).assign(&lhs.b);
             b.slice_mut(s![lhs.b.len()..]).assign(&rhs.b);
-            Ok(Some(LinearInequalityConstraints::from_paired(a, b)))
+            LinearInequalityConstraints::new(a, b).map(Some)
         }
     }
 }

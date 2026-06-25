@@ -1424,7 +1424,7 @@ pub fn outer_row_weights_by_index(
 /// called with `(row, slack)` when the current `beta` already violates a
 /// constraint row (slack below `-1e-10`).
 pub fn feasible_step_fraction<E>(
-    constraints: &crate::solver::active_set::LinearInequalityConstraints,
+    constraints: &gam_problem::LinearInequalityConstraints,
     beta: &Array1<f64>,
     direction: &Array1<f64>,
     map_dim_err: impl Fn(usize, usize, usize) -> E,

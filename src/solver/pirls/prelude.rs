@@ -68,9 +68,9 @@ pub(crate) use std::collections::HashMap;
 
 pub(crate) use std::sync::{Arc, Mutex, OnceLock};
 
-pub use crate::solver::active_set::{
-    ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintKktDiagnostics, LinearInequalityConstraints,
-};
+pub use crate::solver::active_set::{ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintKktDiagnostics};
+
+pub use gam_problem::LinearInequalityConstraints;
 
 pub(crate) use crate::linalg::utils::{array_is_finite, inf_norm, row_chunk_for_byte_budget};
 

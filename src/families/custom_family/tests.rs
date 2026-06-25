@@ -4604,16 +4604,16 @@ pub(crate) fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction()
 /// the constrained path now routes feasibility through the projection.
 #[test]
 pub(crate) fn cone_projection_preserves_step_where_alpha_crush_collapses_it() {
-    use crate::solver::active_set::{
-        LinearInequalityConstraints, project_point_strictly_into_feasible_cone,
-    };
+    use crate::solver::active_set::project_point_strictly_into_feasible_cone;
+    use gam_problem::LinearInequalityConstraints;
     // One monotonicity row `a·β ≥ 0` with a = [1, 0]; the current iterate
     // β = [0, 0] sits exactly on it (slack = 0). The Newton trial step wants to
     // move DOWN on the binding coordinate (δ_0 = −1, would violate) and freely on
     // the orthogonal coordinate (δ_1 = +5, unconstrained).
     let a = array![[1.0_f64, 0.0]];
     let b = Array1::<f64>::zeros(1);
-    let constraints = LinearInequalityConstraints::from_paired(a, b);
+    let constraints =
+        LinearInequalityConstraints::new(a, b).expect("test constraint shape invariant");
 
     let beta = array![0.0_f64, 0.0];
     let trial_step = array![-1.0_f64, 5.0];

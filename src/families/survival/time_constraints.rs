@@ -228,7 +228,7 @@ pub fn build_time_derivative_guard_constraints(
         }
         b[out_row] = rhs / scale;
     }
-    Ok(Some(LinearInequalityConstraints::from_paired(a, b)))
+    LinearInequalityConstraints::new(a, b).map(Some)
 }
 
 #[cfg(test)]

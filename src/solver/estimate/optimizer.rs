@@ -661,7 +661,10 @@ where
             // weights 1 (or any fixed-dispersion family) the anchor is exactly 0, so
             // those fits stay byte-identical.
             let weight_log_geom_mean: f64 = reml_state.rho_weight_anchor();
-            let gaussian_risk = matches!(reml_seed_config.risk_profile, SeedRiskProfile::Gaussian);
+            let gaussian_risk = matches!(
+                reml_seed_config.risk_profile,
+                SeedRiskProfile::Gaussian | SeedRiskProfile::GaussianLocationScale
+            );
             // The prepass evaluates the *actual* REML/LAML objective on a tiny,
             // deterministic log-λ grid and only changes startup when that same
             // criterion improves.  It is therefore part of initialization, not a
@@ -753,7 +756,7 @@ where
                 // risk_shift is the default seed bias when no caller warm-start is given;
                 // it is NOT applied on top of a caller-supplied rho seed.
                 let risk_shift: f64 = match reml_seed_config.risk_profile {
-                    SeedRiskProfile::Gaussian => 0.0,
+                    SeedRiskProfile::Gaussian | SeedRiskProfile::GaussianLocationScale => 0.0,
                     SeedRiskProfile::GeneralizedLinear => 1.0,
                     SeedRiskProfile::Survival => 2.0,
                 };

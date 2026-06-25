@@ -3,8 +3,9 @@ use crate::estimate::EstimationError;
 use crate::matrix::{
     DesignMatrix, PsdWeightsView, ReparamOperator, SignedWeightsView, SymmetricMatrix,
 };
-use crate::solver::active_set::{ConstraintKktDiagnostics, LinearInequalityConstraints};
+use crate::solver::active_set::ConstraintKktDiagnostics;
 use crate::types::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, RidgePassport};
+use gam_problem::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
