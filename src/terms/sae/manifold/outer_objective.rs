@@ -1309,6 +1309,68 @@ impl SaeManifoldOuterObjective {
         Ok((cost, beta_hat))
     }
 
+    /// Matrix-free outer-ρ gradient: a CENTRAL finite difference of the streaming
+    /// REML cost. Used by `eval` when the dense evidence factor is inadmissible,
+    /// so the exact analytic outer gradient (which reads the dense joint-Hessian
+    /// cache) cannot be formed. ρ is a handful of penalty-like coordinates (the
+    /// shared-ARD parameterization collapses it to `2 + max_d`), so `2·dim` extra
+    /// cost evals per gradient is cheap; and the streaming criterion is
+    /// deterministic (chunk-by-chunk bit-identical), so the difference is
+    /// well-posed rather than stochastic.
+    ///
+    /// The returned `(cost, gradient)` pair is self-consistent — both come from
+    /// the SAME value path (`evaluate_with_refine_policy` with `fold_cotrain =
+    /// false`, the BFGS line-search lane) — so the Armijo test never mixes two
+    /// functions (the #931 objective↔gradient desync class). The collapse barrier
+    /// rides on the cost on both lanes; near a feasible point it is the constant
+    /// 0 so it does not perturb the difference, and a probe that crosses it spikes
+    /// the gradient so BFGS rejects the step (the intended infeasibility wall).
+    ///
+    /// The final evaluation at the base ρ both returns the consistent cost and
+    /// leaves the term warm at exactly that iterate (so `current_rho`/`last_loss`/
+    /// `inner_beta_hint` match the iterate whose gradient was just differenced),
+    /// matching the dense lane's end state.
+    fn eval_matrix_free_fd_gradient(
+        &mut self,
+        rho_state: &SaeManifoldRho,
+    ) -> Result<OuterEval, EstimationError> {
+        // Central-difference step in log-ρ. The optimal step for a central
+        // difference of a function known to a noise floor `ε_f` is `~(3 ε_f)^⅓`;
+        // with the inner joint solve converged to its KKT/step tolerance the
+        // criterion's noise floor is well below 1e-6, so a 1e-3 step sits at/above
+        // that optimum while staying small enough that the `O(h²)` truncation
+        // error is negligible against the BFGS line-search tolerance. It is a
+        // dimensionless log-space step, so it is scale-free across all ρ coords.
+        const SAE_MATRIX_FREE_FD_STEP: f64 = 1.0e-3;
+        let base = rho_state.to_flat();
+        let n = base.len();
+        let mut gradient = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let mut up = base.clone();
+            up[i] += SAE_MATRIX_FREE_FD_STEP;
+            let cost_up = self
+                .evaluate_with_refine_policy(up.view(), false, false)
+                .map(|(c, _)| c)
+                .map_err(EstimationError::RemlOptimizationFailed)?;
+            let mut down = base.clone();
+            down[i] -= SAE_MATRIX_FREE_FD_STEP;
+            let cost_down = self
+                .evaluate_with_refine_policy(down.view(), false, false)
+                .map(|(c, _)| c)
+                .map_err(EstimationError::RemlOptimizationFailed)?;
+            gradient[i] = (cost_up - cost_down) / (2.0 * SAE_MATRIX_FREE_FD_STEP);
+        }
+        let (cost, beta_hat) = self
+            .evaluate_with_refine_policy(base.view(), false, false)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
+        Ok(OuterEval {
+            cost,
+            gradient,
+            hessian: HessianResult::Unavailable,
+            inner_beta_hint: Some(beta_hat),
+        })
+    }
+
     /// #1154 — add the amortized-encoder consistency fold to an already-computed
     /// REML criterion at the converged dictionary for `rho`. The fold has NO
     /// analytic gradient: under Design A the inner solve converges to the same
@@ -1458,17 +1520,22 @@ impl SaeManifoldOuterObjective {
 
 impl OuterObjective for SaeManifoldOuterObjective {
     fn capability(&self) -> OuterCapability {
-        let plan = self.term.streaming_plan();
-        let gradient = if plan.direct_admitted {
-            Derivative::Analytic
-        } else {
-            Derivative::Unavailable
-        };
         OuterCapability {
-            // The full analytic outer-ρ gradient is assembled for every
-            // assignment mode, including IBP-MAP (its empirical-π third channel
-            // landed exactly in `logdet_theta_adjoint`, #1006).
-            gradient,
+            // The outer-ρ gradient is ALWAYS available, so the planner always has
+            // a usable descent lane. Two regimes:
+            //  * Dense-admitted: the exact analytic outer gradient is assembled
+            //    from the joint-Hessian IFT (`outer_gradient_arrow_solver`), for
+            //    every assignment mode incl. IBP-MAP (#1006).
+            //  * Matrix-free (dense evidence factor exceeds the in-core budget,
+            //    e.g. large-K / wide-border duchon): no dense cache exists for the
+            //    analytic path, so `eval` descends ρ with a CENTRAL finite-
+            //    difference of the cheap, deterministic streaming REML cost over
+            //    the low-dim ρ vector. Declaring `Unavailable` here instead routed
+            //    the planner to a BFGS runner that hard-errors on a missing
+            //    gradient ("no non-analytic fallback") — the K≥256 duchon /
+            //    large-K matrix-free hang. `eval` branches on the same admission
+            //    flag and supplies whichever gradient is valid.
+            gradient: Derivative::Analytic,
             hessian: DeclaredHessianForm::Unavailable,
             n_params: self.baseline_rho.to_flat().len(),
             // ρ are all penalty-like / τ coordinates: precisions and
@@ -1529,6 +1596,13 @@ impl OuterObjective for SaeManifoldOuterObjective {
             .term
             .warm_start_latents_from_amortized_encoder(self.target.view(), &rho_state);
         self.record_warm_start(warm_start_outcome);
+        // Matrix-free regime: the dense joint-Hessian cache the analytic outer
+        // gradient needs does not exist (the dense evidence factor exceeds the
+        // in-core budget). Descend ρ with a finite-difference gradient of the
+        // streaming REML cost instead (see `eval_matrix_free_fd_gradient`).
+        if !self.term.streaming_plan().direct_logdet_admitted() {
+            return self.eval_matrix_free_fd_gradient(&rho_state);
+        }
         let (cost, loss, cache) = self
             .term
             .reml_criterion_with_cache(
