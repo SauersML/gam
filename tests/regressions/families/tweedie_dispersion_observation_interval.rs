@@ -27,7 +27,7 @@
 //!      family exists to deliver and the bug silently destroyed.
 
 use csv::StringRecord;
-use gam::predict::{
+use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };

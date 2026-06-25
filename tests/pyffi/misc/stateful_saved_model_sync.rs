@@ -1,5 +1,8 @@
 use gam::families::survival::location_scale::ResidualDistribution;
 use gam::families::survival::lognormal_kernel::FrailtySpec;
+// `predictor()` / `block_roles()` are provided by the predict extension trait,
+// which moved into `gam-predict` when the prediction engine was peeled out.
+use gam_predict::FittedModelPredictExt;
 use gam::inference::model::{
     FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
     PredictModelClass,

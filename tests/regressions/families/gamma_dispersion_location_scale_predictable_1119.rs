@@ -34,7 +34,7 @@
 
 use gam::estimate::BlockRole;
 use gam::gamlss::DispersionFamilyKind;
-use gam::predict::{
+use gam_predict::{
     DispersionLocationScalePredictor, InferenceCovarianceMode, PosteriorMeanOptions, PredictInput,
     PredictableModel,
 };
@@ -346,8 +346,8 @@ fn gamma_dispersion_location_scale_assembles_covariance_and_is_predictable() {
 ///      noise the full-uncertainty path uses, row by row.
 #[test]
 fn gamma_dispersion_posterior_mean_observation_band_is_per_row_not_scalar() {
-    use gam::predict::PredictUncertaintyOptions;
-    use gam::predict::interval_policy::PredictionTransform;
+    use gam_predict::PredictUncertaintyOptions;
+    use gam_predict::interval_policy::PredictionTransform;
 
     init_parallelism();
     let n = 600usize;

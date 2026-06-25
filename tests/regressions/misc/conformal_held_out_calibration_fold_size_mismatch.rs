@@ -27,7 +27,7 @@
 
 use gam::estimate::{FitOptions, fit_gam};
 use gam::matrix::DesignMatrix;
-use gam::predict::{
+use gam_predict::{
     ConformalCalibrationFold, PredictInput, PredictUncertaintyOptions, StandardPredictor,
     predict_full_uncertainty_conformal,
 };

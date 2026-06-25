@@ -1,4 +1,4 @@
-use gam::inference::predict::predict_gam;
+use gam_predict::predict_gam;
 use gam::types::LikelihoodSpec;
 use ndarray::{arr1, arr2};
 

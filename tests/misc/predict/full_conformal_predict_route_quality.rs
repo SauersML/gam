@@ -29,7 +29,7 @@ use gam::estimate::{FitOptions, fit_gam};
 use gam::faer_ndarray::FaerCholesky;
 use gam::inference::full_conformal::{ExactFullConformalSubstrate, bernoulli_full_conformal};
 use gam::matrix::DesignMatrix;
-use gam::predict::{
+use gam_predict::{
     ConformalCalibrationFold, PredictInput, PredictUncertaintyOptions, StandardPredictor,
     predict_full_uncertainty_conformal,
 };
@@ -226,7 +226,7 @@ fn predict_with_conformal(
     cal_y: &Array1<f64>,
     test_design: &Array2<f64>,
     conformal_level: Option<f64>,
-) -> gam::predict::PredictUncertaintyResult {
+) -> gam_predict::PredictUncertaintyResult {
     let predictor = StandardPredictor {
         beta: fit.blocks[0].beta.clone(),
         family: gaussian_spec(),

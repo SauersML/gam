@@ -35,7 +35,7 @@
 use gam::estimate::BlockRole;
 use gam::gamlss::DispersionFamilyKind;
 use gam::generative::NoiseModel;
-use gam::inference::predict::{DispersionLocationScalePredictor, PredictInput, PredictableModel};
+use gam_predict::{DispersionLocationScalePredictor, PredictInput, PredictableModel};
 use gam::smooth::build_term_collection_design;
 use gam::types::LikelihoodSpec;
 use gam::{

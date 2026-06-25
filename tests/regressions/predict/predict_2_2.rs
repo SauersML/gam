@@ -1,6 +1,6 @@
-use gam::inference::predict::linalg::PredictionCovarianceBackend;
+use gam_predict::linalg::PredictionCovarianceBackend;
 use gam::matrix::SymmetricMatrix;
-use gam::predict::{
+use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,
     PredictUncertaintyOptions, enrich_posterior_mean_bounds,
     predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,

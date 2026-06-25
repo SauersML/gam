@@ -1,6 +1,6 @@
 use gam::estimate::FittedLinkState;
 use gam::estimate::{FitOptions, fit_gam};
-use gam::inference::predict::{
+use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };

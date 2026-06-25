@@ -61,7 +61,7 @@ use gam::inference::model_payload_builders::{
     assemble_bernoulli_marginal_slope_payload,
 };
 use gam::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
-use gam::predict::PredictableModel;
+use gam_predict::PredictableModel;
 use gam::probability::normal_cdf;
 use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,

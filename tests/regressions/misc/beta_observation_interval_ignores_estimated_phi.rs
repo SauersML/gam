@@ -24,7 +24,7 @@
 //! precision pinned near `1.0`.
 
 use csv::StringRecord;
-use gam::predict::{
+use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };

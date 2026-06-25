@@ -1,6 +1,6 @@
 use gam::inference::diagnostics::{diagnostics_from_predictions, should_emit_h_min_eig_diag};
 use gam::inference::dispersion_cov::{PhiScaledCovariance, UnscaledPrecision};
-use gam::inference::predict::linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
+use gam_predict::linalg::{PredictionCovarianceBackend, rowwise_local_covariances};
 use gam::inference::probability::{
     normal_cdf, normal_logcdf, normal_pdf, signed_probit_logcdf_and_mills_ratio,
 };
