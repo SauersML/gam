@@ -7268,12 +7268,10 @@ impl JointBetaRhoPosterior {
                         link_params.len()
                     ));
                 }
-                Ok(InverseLink::Sas(
-                    crate::solver::mixture_link::sas_link_state_from_raw(
-                        link_params[0],
-                        link_params[1],
-                    )?,
-                ))
+                Ok(InverseLink::Sas(crate::types::SasLinkState::new(
+                    link_params[0],
+                    link_params[1],
+                )?))
             }
             InverseLink::BetaLogistic(_) => {
                 if link_params.len() != 2 || !link_params.iter().all(|v| v.is_finite()) {
