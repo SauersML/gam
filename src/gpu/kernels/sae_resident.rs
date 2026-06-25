@@ -770,12 +770,7 @@ impl DeviceResidentArrowWorkspace {
         // reuses it. A per-outer ridge escalation (PD failure) still rebuilds, but
         // for a well-posed unchanged operator the build count stays at 1, which is
         // the across-outer amortization this method delivers.
-        let mut resident_frame: Option<(
-            f64,
-            f64,
-            crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle,
-        )> = None;
-        let mut frame_builds = 0_usize;
+        let mut shared = SharedFrameState::default();
         let mut outcomes = Vec::with_capacity(base_gradient_overrides.len());
 
         for (g_t_override, g_beta_override) in base_gradient_overrides {
@@ -801,42 +796,29 @@ impl DeviceResidentArrowWorkspace {
             }
             base.refresh_row_hessian_fingerprint();
 
-            let outcome = self.run_one_outer(
-                &base,
-                half_target_energy,
-                opts,
-                mode,
-                &mut resident_frame,
-                &mut frame_builds,
-            )?;
+            let outcome = self.run_one_outer(&base, half_target_energy, opts, mode, &mut shared)?;
             outcomes.push(outcome);
         }
 
         Ok(OuterSequenceOutcome {
             outers: outcomes,
-            frame_builds,
+            frame_builds: shared.frame_builds,
         })
     }
 
-    /// One outer evaluation's inner Newton loop, optionally reusing a frame
-    /// carried in `resident_frame` across calls. Mirrors `run_inner_loop` but
-    /// takes the base system + a shared frame slot so the across-outer caller can
-    /// keep one frame live for the whole sweep. `frame_builds` is incremented
-    /// every time a frame is actually (re)built, so the caller can assert the
+    /// One outer evaluation's inner Newton loop, optionally reusing the frame
+    /// carried in `shared` across calls. Mirrors `run_inner_loop` but takes the
+    /// base system + the shared across-outer state so the caller can keep one
+    /// frame live for the whole sweep. `shared.frame_builds` is incremented every
+    /// time a frame is actually (re)built, so the caller can assert the
     /// across-outer amortization fired.
-    #[allow(clippy::too_many_arguments)]
     fn run_one_outer(
         &self,
         base: &ArrowSchurSystem,
         half_target_energy: f64,
         opts: &DeviceResidentInnerOptions,
         mode: InnerSolveMode,
-        resident_frame: &mut Option<(
-            f64,
-            f64,
-            crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle,
-        )>,
-        frame_builds: &mut usize,
+        shared: &mut SharedFrameState,
     ) -> Result<DeviceResidentInnerOutcome, DeviceResidentArrowError> {
         let execution_path = mode.execution_path();
         let n = self.shape.n;
@@ -866,17 +848,18 @@ impl DeviceResidentArrowWorkspace {
 
             let solution = match mode {
                 InnerSolveMode::DeviceResident => {
-                    let frame_matches = resident_frame
+                    let frame_matches = shared
+                        .frame
                         .as_ref()
                         .is_some_and(|(rt, rb, _)| *rt == ridge_t && *rb == ridge_beta);
                     let mut frame_build_error: Option<DeviceResidentArrowError> = None;
                     if !frame_matches {
-                        *resident_frame = None;
+                        shared.frame = None;
                         match crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(
                             &residual, ridge_t, ridge_beta,
                         ) {
                             Ok(frame) => {
-                                *frame_builds += 1;
+                                shared.frame_builds += 1;
                                 crate::gpu::profile::telemetry_record_handle_creation(
                                     self.context_id(),
                                 );
@@ -884,12 +867,12 @@ impl DeviceResidentArrowWorkspace {
                                 crate::gpu::profile::telemetry_record_h2d(
                                     self.frame_upload_bytes(),
                                 );
-                                *resident_frame = Some((ridge_t, ridge_beta, frame));
+                                shared.frame = Some((ridge_t, ridge_beta, frame));
                             }
                             Err(err) => frame_build_error = Some(map_gpu_error(err)),
                         }
                     }
-                    match resident_frame.as_ref() {
+                    match shared.frame.as_ref() {
                         Some((_, _, frame)) => {
                             let mut g_t = Vec::with_capacity(n * d);
                             for row in &residual.rows {
@@ -1174,6 +1157,20 @@ pub struct DeviceResidentInnerOutcome {
 pub struct OuterSequenceOutcome {
     pub outers: Vec<DeviceResidentInnerOutcome>,
     pub frame_builds: usize,
+}
+
+/// Across-outer resident-frame state carried through a `device_fit_outer_sequence`
+/// sweep. Holds the single resident frame (keyed by its `(ridge_t, ridge_beta)`)
+/// reused across outers at an unchanged operator, plus the running count of frame
+/// (re)builds so the caller can assert the across-outer amortization fired.
+#[derive(Default)]
+struct SharedFrameState {
+    frame: Option<(
+        f64,
+        f64,
+        crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle,
+    )>,
+    frame_builds: usize,
 }
 
 fn grow_ridge(current: f64, grow: f64) -> f64 {
