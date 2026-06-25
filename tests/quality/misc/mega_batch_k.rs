@@ -511,7 +511,32 @@ fn sphere_strict_lat_bound_at_90() {
         ..FitConfig::default()
     };
     let r = fit_from_formula("y~sphere(lat,lon,k=10)", &d, &cfg);
-    assert!(r.is_ok() || r.is_err());
+    // The data is a constant response (y ≡ 1) on a constant-longitude great-circle
+    // arc — degenerate but well-posed for a sphere smoother (the penalty handles
+    // the rank-deficient lon direction). The fit must therefore SUCCEED and recover
+    // the constant. The previous assertion `r.is_ok() || r.is_err()` was a
+    // tautology that passed for ANY outcome, including a silent solver failure on
+    // this strict-latitude-bound edge case.
+    let result = r.expect("constant-response sphere fit on a constant-lon arc must succeed");
+    let FitResult::Standard(fit) = result else {
+        panic!("sphere fit must return a Standard fit result");
+    };
+    // Predict on the training latitudes (lon ≡ 0) via the same design-apply path the
+    // sibling fit2d helper uses, then assert the constant response is recovered.
+    let lats: Vec<f64> = (0..30).map(|i| -80.0 + i as f64 * 5.0).collect();
+    let mut m = Array2::<f64>::zeros((lats.len(), 3));
+    for (i, &lat) in lats.iter().enumerate() {
+        m[[i, 0]] = lat;
+        m[[i, 1]] = 0.0;
+    }
+    let dsg = build_term_collection_design(m.view(), &fit.resolvedspec).expect("design");
+    let preds = dsg.design.apply(&fit.fit.beta);
+    for &p in preds.iter() {
+        assert!(
+            p.is_finite() && (p - 1.0).abs() < 1e-1,
+            "constant response y≡1 must be recovered to ~1 on the constant-lon arc (got {p})"
+        );
+    }
 }
 #[test]
 fn smooth_x_squared_inflection_at_zero() {
