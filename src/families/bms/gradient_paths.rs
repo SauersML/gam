@@ -2532,6 +2532,13 @@ mod flex_primary_hessian_oracle_tests {
     //! truth the hand Hessian must reproduce.
 
     use super::*;
+    // `BernoulliMarginalSlopeFamily` (and the flex block-config helpers) live in
+    // the sibling `super::family` module and are `pub(super)`; this oracle test
+    // module's `use super::*` does not re-export them, so import the family
+    // namespace explicitly. Mirrors `cell_moment_assembly.rs`'s
+    // `use super::family::*`. Without this the flex oracle fixture fails to
+    // resolve the family type (E0422/E0425/E0433) and blocks the whole lib build.
+    use super::family::*;
     use crate::matrix::DenseDesignMatrix;
     use ndarray::Array1;
     use ndarray::Array2;

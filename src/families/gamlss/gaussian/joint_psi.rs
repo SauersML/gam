@@ -1434,7 +1434,7 @@ mod fisher_single_source_oracle_tests {
                 &array![xi_ls],
             );
             // FD of Fisher mm and ll along the direction.
-            let mm = |m: f64, e: f64| a / (sigma_of(e) * sigma_of(e));
+            let mm = |_m: f64, e: f64| a / (sigma_of(e) * sigma_of(e));
             let ll = |_m: f64, e: f64| {
                 let k = kappa_of(e);
                 2.0 * k * k * a
