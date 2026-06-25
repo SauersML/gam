@@ -29,7 +29,12 @@ ignored = ["grep", "walkdir"]
 path = "src/lib.rs"
 
 [workspace]
-members = ["crates/gam-pyffi"]
+# `gam-core` (issue #1521) is the foundational leaf of the planned workspace
+# split. It lands as an empty scaffold first — additive, no file moves — so the
+# skeleton wires in without conflicting with agents editing the monolith. The
+# serializing `types.rs`/`resource.rs` moves + tree-wide `use crate::` rewrite
+# land later, in a maintainer-declared quiet window.
+members = ["crates/gam-pyffi", "crates/gam-core"]
 resolver = "3"
 
 [lints.rust]
