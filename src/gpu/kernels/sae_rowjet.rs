@@ -170,10 +170,21 @@ void sae_rowjet_softmax(
 
 /// Prepend the `KK` / `PP` macros so the NVRTC compile is a pure `compile_ptx`,
 /// matching `sphere_gpu` / `arrow_schur_nvrtc`.
+///
+/// Also prepend an `INFINITY` definition: the kernel seeds its softmax max
+/// reduction with `-INFINITY`, but NVRTC does NOT predefine `INFINITY` (it is a
+/// `<math.h>` macro, not a CUDA builtin), so without this the whole module
+/// fails to compile and the SAE row-jet path silently falls back to the CPU
+/// (same genus as the `M_PI` NVRTC fix). `__longlong_as_double` is an
+/// always-available NVRTC builtin needing no header.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub fn softmax_kernel_source(k: usize, p: usize) -> String {
-    format!("#define KK {k}\n#define PP {p}\n{SOFTMAX_KERNEL_SOURCE}")
+    format!(
+        "#define KK {k}\n#define PP {p}\n\
+         #define INFINITY (__longlong_as_double(0x7ff0000000000000LL))\n\
+         {SOFTMAX_KERNEL_SOURCE}"
+    )
 }
 
 /// Minimum row count below which the device launch is not worth its fixed cost
