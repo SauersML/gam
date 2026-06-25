@@ -268,6 +268,69 @@ fn symmetric_gram_single_upload_matches_host_reference_or_declines() {
     // the same reference; the decline is the documented fallback.
 }
 
+/// #1412 (mixed-precision solution-only): the PIRLS Newton direction discards
+/// the logdet, so the solve must take the fp32-factor + fp64-refinement path
+/// WITHOUT the redundant fp64 POTRF (which would cancel the mixed-precision
+/// win). The contract that matters for correctness: the solution-only path
+/// returns a FULL-fp64-accurate solution (matches a host SPD solve to
+/// refinement tolerance) even though it reports NO logdet. The logdet-returning
+/// path must still produce a finite logdet. Device-agnostic: on a CPU host both
+/// entry points return `Err` (no runtime), which is the documented fallback.
+#[test]
+fn mixed_precision_solution_only_is_fp64_accurate_or_declines() {
+    let p = 128usize; // ≥ REFINEMENT_MIN_P so the fp32 path is admitted on device
+    // Diagonally-dominant SPD A (well-conditioned so fp32+refinement converges).
+    let a = Array2::from_shape_fn((p, p), |(i, j)| {
+        if i == j {
+            (p as f64) + 1.0
+        } else {
+            0.1 / (1.0 + (i as f64 - j as f64).abs())
+        }
+    });
+    let b = Array1::from_shape_fn(p, |i| ((i as f64 + 1.0) * 0.013).sin());
+    let rhs = b.clone().insert_axis(ndarray::Axis(1)); // p×1
+
+    let host = solve_spd_host(&a, &b);
+
+    // Solution-only mixed-precision path.
+    match gam::gpu::solver::cholesky_solve_only_gpu(a.view(), rhs.view()) {
+        Ok(sol) => {
+            assert_eq!(sol.dim(), (p, 1));
+            let mut max_diff = 0.0_f64;
+            for i in 0..p {
+                max_diff = max_diff.max((sol[[i, 0]] - host[i]).abs());
+            }
+            let scale = 1.0 + host.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            assert!(
+                max_diff < 1e-9 * scale,
+                "solution-only mixed-precision differs from host solve by {max_diff:e} \
+                 (refinement must recover full fp64 accuracy)"
+            );
+
+            // The logdet-returning twin must still hand back a finite logdet on
+            // the same SPD system (it pays the fp64 POTRF; solution agrees).
+            let (sol_ld, logdet) = gam::gpu::solver::cholesky_solve_gpu(a.view(), rhs.view())
+                .expect("logdet path on the same device");
+            assert!(logdet.is_finite(), "logdet path must produce a finite logdet");
+            let mut max_sol_diff = 0.0_f64;
+            for i in 0..p {
+                max_sol_diff = max_sol_diff.max((sol[[i, 0]] - sol_ld[[i, 0]]).abs());
+            }
+            assert!(
+                max_sol_diff < 1e-9 * (1.0 + host.iter().fold(0.0, |m: f64, v| m.max(v.abs()))),
+                "solution-only and logdet paths must agree on the solution ({max_sol_diff:e})"
+            );
+        }
+        Err(_) => {
+            // CPU-only host: the logdet twin must also decline (no runtime).
+            assert!(
+                gam::gpu::solver::cholesky_solve_gpu(a.view(), rhs.view()).is_err(),
+                "on a host without a CUDA runtime both solve entry points must Err"
+            );
+        }
+    }
+}
+
 /// Dense SPD solve `A x = b` by Cholesky (lower) + forward/back substitution —
 /// a self-contained host reference independent of the device path.
 fn solve_spd_host(a: &Array2<f64>, b: &Array1<f64>) -> Array1<f64> {

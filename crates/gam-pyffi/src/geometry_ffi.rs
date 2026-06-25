@@ -4310,6 +4310,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(partial_supervision_solve, module)?)?;
     module.add_function(wrap_pyfunction!(thin_svd_scores, module)?)?;
     module.add_function(wrap_pyfunction!(linear_dictionary_fit, module)?)?;
+    module.add_function(wrap_pyfunction!(sparse_dictionary_fit, module)?)?;
     module.add_function(wrap_pyfunction!(
         identifiable_factor_select_weights_array,
         module
@@ -4696,6 +4697,63 @@ fn linear_dictionary_fit<'py>(
     out.set_item("converged", fit.converged)?;
     out.set_item("assignment", fit.assignment.as_str())?;
     out.set_item("top_k", fit.top_k)?;
+    Ok(out.unbind())
+}
+
+/// #1026 collapsed linear lane — fit a fixed-`K` **sparse, minibatched** linear
+/// dictionary. Unlike `linear_dictionary_fit` (dense `N×K` assignments, full-`K`
+/// scoring) this routes each row against the dictionary in `K`-tiles, keeps only
+/// the top-`active` atoms, and returns fixed-width sparse routing
+/// (`indices[N, active]`, `codes[N, active]`) so very large `K` stays tractable.
+/// All heavy state is FP32. The exact manifold engine is untouched; this is an
+/// additive path.
+#[pyfunction(signature = (
+    x,
+    k,
+    active = 1,
+    minibatch = 512,
+    max_epochs = 30,
+    score_tile = 4096,
+    code_ridge = 1.0e-6,
+    decoder_ridge = 1.0e-6,
+    tolerance = 1.0e-6
+))]
+fn sparse_dictionary_fit<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray2<'py, f32>,
+    k: usize,
+    active: usize,
+    minibatch: usize,
+    max_epochs: usize,
+    score_tile: usize,
+    code_ridge: f32,
+    decoder_ridge: f32,
+    tolerance: f64,
+) -> PyResult<Py<PyDict>> {
+    let x_values = x.as_array().to_owned();
+    let config = SparseDictConfig {
+        n_atoms: k,
+        active,
+        minibatch,
+        max_epochs,
+        score_tile,
+        code_ridge,
+        decoder_ridge,
+        tolerance,
+    };
+    let fit = detach_py_result(py, "sparse_dictionary_fit", move || {
+        fit_sparse_dictionary(x_values.view(), &config)
+    })?;
+    let fitted = fit.reconstruct();
+    let out = PyDict::new(py);
+    out.set_item("decoder", fit.decoder.into_pyarray(py))?;
+    out.set_item("indices", fit.indices.into_pyarray(py))?;
+    out.set_item("codes", fit.codes.into_pyarray(py))?;
+    out.set_item("fitted", fitted.into_pyarray(py))?;
+    out.set_item("explained_variance", fit.explained_variance)?;
+    out.set_item("epochs", fit.epochs)?;
+    out.set_item("converged", fit.converged)?;
+    out.set_item("active", fit.active)?;
     Ok(out.unbind())
 }
 

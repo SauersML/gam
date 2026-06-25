@@ -96,6 +96,7 @@ from ._warnings import GamInferenceWarning, emit_inference_warnings
 from ._rust import adjudicate_atom_shape  # cross-class atom-shape adjudicator (Rust)
 from ._compare import compare_models
 from ._linear_dictionary import LinearDictionaryFit, linear_dictionary_fit
+from ._sparse_dictionary import SparseDictionaryFit, sparse_dictionary_fit
 from ._penalties import (
     ARDPenalty,
     AnalyticPenaltyKind,

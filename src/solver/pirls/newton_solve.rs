@@ -529,8 +529,13 @@ pub(super) fn solve_newton_direction_dense_with_factor(
         let rhs = Array2::from_shape_vec((p, 1), gradient.to_vec()).map_err(|e| {
             EstimationError::InvalidInput(format!("CUDA PIRLS RHS layout failed: {e}"))
         })?;
-        let (solved, _) =
-            crate::solver::gpu::pirls_gpu::cholesky_solve_gpu(hessian.view(), rhs.view())
+        // Solution-only: the Newton direction discards the logdet, so route
+        // through the mixed-precision solution-only path that skips the
+        // redundant fp64 POTRF (the fp32 factor + fp64 refinement already gives
+        // a full-fp64-accurate direction). This is where the mixed-precision
+        // speedup is actually realized for the inner Newton solve.
+        let solved =
+            crate::solver::gpu::pirls_gpu::cholesky_solve_only_gpu(hessian.view(), rhs.view())
                 .map_err(EstimationError::InvalidInput)?;
         direction_out.assign(&solved.column(0));
         direction_out.mapv_inplace(|v| -v);

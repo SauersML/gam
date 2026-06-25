@@ -886,15 +886,22 @@ pub(crate) use cuda::{
 ///    steps. Falls back to fp64 on:
 ///    - fp32 POTRF info ≠ 0 (A is not SPD at f32 precision),
 ///    - non-monotone residual (κ(A)·u_fp32 ≥ 1 regime).
-/// 3. On fp32 success the logdet is computed from the fp64 Cholesky factor
-///    (fp64 POTRF is always run for logdet accuracy). The solution comes from
-///    the refined fp32 path.
+/// 3. On fp32 success the logdet is computed from the fp64 Cholesky factor —
+///    BUT only when `need_logdet` is true. The fp64 POTRF is an O(p³)
+///    factorization that fully negates the mixed-precision speedup (the whole
+///    point is to do the expensive factor in fp32), so a caller that only needs
+///    the *solution* (e.g. the PIRLS Newton direction solve, which discards the
+///    logdet) passes `need_logdet = false` and the redundant fp64 POTRF is
+///    skipped entirely — the returned logdet is `NaN` in that case. The solution
+///    is always full-fp64-accurate via the residual refinement regardless.
 ///
 /// Returns `(solution, logdet, Some(RefinementOutcome))` when the fp32 path
-/// succeeded, or `(solution, logdet, None)` on the fp64 fallback.
+/// succeeded, or `(solution, logdet, None)` on the fp64 fallback. When
+/// `need_logdet` is false and the fp32 path succeeds, the logdet field is `NaN`.
 pub fn iterative_refinement_cholesky_solve(
     hessian: ArrayView2<'_, f64>,
     rhs: ArrayView2<'_, f64>,
+    need_logdet: bool,
 ) -> Result<(Array2<f64>, f64, Option<RefinementOutcome>), String> {
     #[cfg(not(target_os = "linux"))]
     {
@@ -924,13 +931,23 @@ pub fn iterative_refinement_cholesky_solve(
             let rhs_col = rhs.column(0);
             let rhs_slice: Vec<f64> = rhs_col.iter().copied().collect();
             if let Ok(outcome) = cuda::iterative_refinement_solve_impl(hessian, &rhs_slice) {
-                // fp32 + refinement succeeded. Still run fp64 POTRF for logdet
-                // accuracy (the fp64 factor is always authoritative for EDF /
-                // REML curvature). Solution comes from the refined fp32 path.
+                // fp32 + refinement succeeded; the refined solution is full
+                // fp64 accuracy. The logdet, however, needs the fp64 Cholesky
+                // factor (the fp32 diagonal is only fp32-accurate, and the
+                // logdet feeds the REML criterion / EDF). Run the fp64 POTRF
+                // ONLY when the caller actually consumes the logdet: otherwise
+                // that O(p³) factorization is pure overhead that cancels the
+                // mixed-precision win (the expensive factor would then run in
+                // BOTH precisions). A solution-only caller (PIRLS Newton
+                // direction, which discards the logdet) gets the genuine
+                // fp32-factor speedup; logdet is reported as NaN.
+                let mut sol = Array2::<f64>::zeros((p, 1));
+                sol.column_mut(0).assign(&outcome.solution);
+                if !need_logdet {
+                    return Ok((sol, f64::NAN, Some(outcome)));
+                }
                 if let Ok(fp64_result) = cuda::cholesky_solve(hessian, rhs) {
                     let logdet = fp64_result.1;
-                    let mut sol = Array2::<f64>::zeros((p, 1));
-                    sol.column_mut(0).assign(&outcome.solution);
                     return Ok((sol, logdet, Some(outcome)));
                 }
                 // fp64 logdet failed (theoretically impossible for SPD A);
@@ -952,8 +969,23 @@ pub fn cholesky_solve_gpu(
     // Route through iterative refinement. The function falls back to fp64
     // internally, so callers always get a valid result; the refinement
     // outcome metadata is intentionally not surfaced by this thin wrapper.
-    let result = iterative_refinement_cholesky_solve(hessian, rhs)?;
+    // This wrapper returns the logdet, so it must request it (`need_logdet`).
+    let result = iterative_refinement_cholesky_solve(hessian, rhs, /*need_logdet=*/ true)?;
     Ok((result.0, result.1))
+}
+
+/// Solution-only mixed-precision solve: like [`cholesky_solve_gpu`] but skips
+/// the redundant fp64 POTRF when the fp32 + refinement path succeeds, since the
+/// caller does not consume the log-determinant. This is the path that delivers
+/// the full mixed-precision speedup (expensive O(p³) factor stays fp32) for the
+/// PIRLS Newton direction solve, where the logdet is discarded. The solution is
+/// full fp64 accuracy via iterative refinement.
+pub fn cholesky_solve_only_gpu(
+    hessian: ArrayView2<'_, f64>,
+    rhs: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, String> {
+    let result = iterative_refinement_cholesky_solve(hessian, rhs, /*need_logdet=*/ false)?;
+    Ok(result.0)
 }
 
 pub fn cholesky_lower_gpu(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {

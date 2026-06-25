@@ -293,38 +293,51 @@ pub fn evidence_derivatives_hutchinson_cpu(
     fill_rademacher_host(input.seed, p, k, &mut z);
 
     // Solve H W = Z column by column on CPU (matches what the device
-    // does in one batched potrs call).
+    // does in one batched potrs call). The K columns are independent — each
+    // `solve_cholesky` reads the shared (immutable) factor and writes only its
+    // own column of `w` — so they parallelize bit-for-bit (no reduction is
+    // reordered; each w-column is produced by exactly one task with identical
+    // arithmetic). The probes are embarrassingly parallel by construction; the
+    // CRN contract lives in the stateless SplitMix fill above, untouched.
+    use rayon::prelude::*;
     let mut w = vec![0.0_f64; p * k];
-    for col in 0..k {
-        let mut rhs = vec![0.0_f64; p];
-        rhs.copy_from_slice(&z[col * p..(col + 1) * p]);
-        let solved = solve_cholesky(&factor, &rhs);
-        w[col * p..(col + 1) * p].copy_from_slice(&solved);
-    }
+    w.par_chunks_mut(p)
+        .zip(z.par_chunks(p))
+        .for_each(|(w_col, z_col)| {
+            let solved = solve_cholesky(&factor, z_col);
+            w_col.copy_from_slice(&solved);
+        });
 
-    // Per-derivative quadratic forms.
+    // Per-derivative quadratic forms. Each `q[j*k + col]` is an independent
+    // scalar function of probe column `col` only, so we parallelize over the
+    // probe columns. This is bit-identical to the serial fill: a given q entry
+    // is computed by one task with the same per-entry arithmetic, and the
+    // downstream `reduce_mean_stderr` indexes fixed (j, col) positions — no
+    // sum is reordered across threads.
     let mut q = vec![0.0_f64; d * k]; // row-major (d, k): q[j*k + m]
     for (j, derivative) in input.derivatives.iter().enumerate() {
+        let q_row = &mut q[j * k..(j + 1) * k];
         match derivative {
             DerivativeHessian::Dense(matrix) => {
-                for col in 0..k {
-                    let z_col = &z[col * p..(col + 1) * p];
-                    let w_col = &w[col * p..(col + 1) * p];
-                    // y = H_j w
-                    let mut y = vec![0.0_f64; p];
-                    for r in 0..p {
-                        let mut acc = 0.0_f64;
-                        for c in 0..p {
-                            acc += matrix[[r, c]] * w_col[c];
+                q_row
+                    .par_iter_mut()
+                    .zip(z.par_chunks(p).zip(w.par_chunks(p)))
+                    .for_each(|(q_jk, (z_col, w_col))| {
+                        // y = H_j w
+                        let mut y = vec![0.0_f64; p];
+                        for r in 0..p {
+                            let mut acc = 0.0_f64;
+                            for c in 0..p {
+                                acc += matrix[[r, c]] * w_col[c];
+                            }
+                            y[r] = acc;
                         }
-                        y[r] = acc;
-                    }
-                    let mut zy = 0.0_f64;
-                    for i in 0..p {
-                        zy += z_col[i] * y[i];
-                    }
-                    q[j * k + col] = zy;
-                }
+                        let mut zy = 0.0_f64;
+                        for i in 0..p {
+                            zy += z_col[i] * y[i];
+                        }
+                        *q_jk = zy;
+                    });
             }
             DerivativeHessian::WeightedGram {
                 row_weights,
@@ -332,31 +345,32 @@ pub fn evidence_derivatives_hutchinson_cpu(
             } => {
                 let design = input.design.as_ref().expect("design validated");
                 let n = design.nrows();
-                for col in 0..k {
-                    let z_col = &z[col * p..(col + 1) * p];
-                    let w_col = &w[col * p..(col + 1) * p];
-                    // r_z = X z (length n), r_w = X w (length n)
-                    let mut acc = 0.0_f64;
-                    for row in 0..n {
-                        let mut rz = 0.0_f64;
-                        let mut rw = 0.0_f64;
-                        for col_idx in 0..p {
-                            rz += design[[row, col_idx]] * z_col[col_idx];
-                            rw += design[[row, col_idx]] * w_col[col_idx];
-                        }
-                        acc += row_weights[row] * rz * rw;
-                    }
-                    if let Some(pen) = penalty_extra {
-                        for r in 0..p {
-                            let mut row_acc = 0.0_f64;
-                            for c in 0..p {
-                                row_acc += pen[[r, c]] * w_col[c];
+                q_row
+                    .par_iter_mut()
+                    .zip(z.par_chunks(p).zip(w.par_chunks(p)))
+                    .for_each(|(q_jk, (z_col, w_col))| {
+                        // r_z = X z (length n), r_w = X w (length n)
+                        let mut acc = 0.0_f64;
+                        for row in 0..n {
+                            let mut rz = 0.0_f64;
+                            let mut rw = 0.0_f64;
+                            for col_idx in 0..p {
+                                rz += design[[row, col_idx]] * z_col[col_idx];
+                                rw += design[[row, col_idx]] * w_col[col_idx];
                             }
-                            acc += z_col[r] * row_acc;
+                            acc += row_weights[row] * rz * rw;
                         }
-                    }
-                    q[j * k + col] = acc;
-                }
+                        if let Some(pen) = penalty_extra {
+                            for r in 0..p {
+                                let mut row_acc = 0.0_f64;
+                                for c in 0..p {
+                                    row_acc += pen[[r, c]] * w_col[c];
+                                }
+                                acc += z_col[r] * row_acc;
+                            }
+                        }
+                        *q_jk = acc;
+                    });
             }
         }
     }
