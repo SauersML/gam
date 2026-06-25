@@ -1004,8 +1004,8 @@ fn forbid_claude_build_rs_edits(manifest_dir: &Path) {
 
     let info = String::from_utf8_lossy(&output.stdout);
     let info = info.trim();
-    let is_claude = info.to_lowercase().contains("claude")
-        || info.to_lowercase().contains("anthropic");
+    let is_claude =
+        info.to_lowercase().contains("claude") || info.to_lowercase().contains("anthropic");
 
     if is_claude {
         panic!(
@@ -1418,7 +1418,13 @@ fn render_report(sections: &[Section]) {
             let trimmed = line.trim();
             let snippet: String = trimmed.chars().take(160).collect();
             match tag {
-                Some(t) => eprintln!("  error: {}:{}: [{}] {}", rel.display(), line_no, t, snippet),
+                Some(t) => eprintln!(
+                    "  error: {}:{}: [{}] {}",
+                    rel.display(),
+                    line_no,
+                    t,
+                    snippet
+                ),
                 None => eprintln!("  error: {}:{}: {}", rel.display(), line_no, snippet),
             }
         }
@@ -1496,16 +1502,8 @@ fn banned_substrings() -> &'static [(&'static str, &'static str, bool)] {
         // used to satisfy `scan_for_useless_tests` without
         // actually asserting anything about the unit under test. Strict
         // everywhere — tests must verify a real property.
-        (
-            "ends_with(\".rs\")",
-            "ends_with(\".rs\")",
-            false,
-        ),
-        (
-            "ends_with(\".rs\"",
-            "ends_with(\".rs\"",
-            false,
-        ),
+        ("ends_with(\".rs\")", "ends_with(\".rs\")", false),
+        ("ends_with(\".rs\"", "ends_with(\".rs\"", false),
         // Process termination bypasses `Drop`. Build.rs uses
         // `std::process::exit(1)` legitimately at end-of-report and is
         // already exempt from every scanner.
@@ -2188,8 +2186,8 @@ fn scan_for_silent_corruption_laundering(
             let is_okunit = body == benign_okunit;
             let is_none = body == benign_none;
             let is_default = body == benign_default;
-            let is_zeros =
-                (body.starts_with("Array") && body.contains("::zeros")) || body.ends_with("::zeros()");
+            let is_zeros = (body.starts_with("Array") && body.contains("::zeros"))
+                || body.ends_with("::zeros()");
             let is_zero_tuple = body.starts_with('(') && body.ends_with(')') && {
                 let inner = &body[1..body.len() - 1];
                 !inner.is_empty()
@@ -3481,7 +3479,11 @@ fn comment_text_is_owed_work(text: &str) -> bool {
     false
 }
 
-fn scan_for_owed_work_prose(root: &Path, dir: &Path, offenders: &mut Vec<(PathBuf, usize, String)>) {
+fn scan_for_owed_work_prose(
+    root: &Path,
+    dir: &Path,
+    offenders: &mut Vec<(PathBuf, usize, String)>,
+) {
     visit_files(root, dir, &mut |rel, content| {
         let rel_str = rel.to_string_lossy().replace('\\', "/");
         if !rel_str.starts_with("src/") {
@@ -5548,7 +5550,8 @@ fn run_cosmetic_wording_dodge_audit(
                 continue;
             }
 
-            let Some(before) = cosmetic_dodge_blob_at(manifest_dir, &format!("{sha}^"), &rel) else {
+            let Some(before) = cosmetic_dodge_blob_at(manifest_dir, &format!("{sha}^"), &rel)
+            else {
                 continue;
             };
             let Some(after) = cosmetic_dodge_blob_at(manifest_dir, sha, &rel) else {
@@ -6015,12 +6018,12 @@ struct CommentBlock {
 /// nouns/verbs of the deferred work, not glue words.
 fn reword_is_stopword(t: &str) -> bool {
     const STOP: &[&str] = &[
-        "the", "and", "for", "this", "that", "with", "from", "into", "over", "each", "can",
-        "will", "its", "are", "was", "were", "has", "have", "had", "not", "but", "use", "uses",
-        "used", "via", "per", "out", "off", "all", "any", "one", "two", "new", "old", "should",
-        "would", "could", "may", "might", "must", "then", "than", "they", "them", "when", "where",
-        "which", "while", "here", "there", "only", "also", "still", "yet", "now", "later", "our",
-        "your", "their", "been", "being", "such", "some", "more", "most", "less", "few",
+        "the", "and", "for", "this", "that", "with", "from", "into", "over", "each", "can", "will",
+        "its", "are", "was", "were", "has", "have", "had", "not", "but", "use", "uses", "used",
+        "via", "per", "out", "off", "all", "any", "one", "two", "new", "old", "should", "would",
+        "could", "may", "might", "must", "then", "than", "they", "them", "when", "where", "which",
+        "while", "here", "there", "only", "also", "still", "yet", "now", "later", "our", "your",
+        "their", "been", "being", "such", "some", "more", "most", "less", "few",
     ];
     STOP.contains(&t)
 }
@@ -6065,36 +6068,36 @@ fn comment_block_has_deferral_cue(lower_text: &str) -> bool {
     static CUES: OnceLock<Vec<String>> = OnceLock::new();
     let cues = CUES.get_or_init(|| {
         vec![
-        format!("{}{}", "to", "do"),
-        format!("{}{}", "fix", "me"),
-        format!("{}-{}", "follow", "up"),
-        format!("{}{}", "follow", "up"),
-        format!("{}{}", "de", "fer"),
-        format!("{}{}", "stop", "gap"),
-        format!("{}{}", "place", "holder"),
-        format!("{}{}", "w", "ip"),
-        format!("{}{}", "t", "bd"),
-        "revisit".to_string(),
-        "punt".to_string(),
-        "eventually".to_string(),
-        "someday".to_string(),
-        "pending".to_string(),
-        "unimplemented".to_string(),
-        "incomplete".to_string(),
-        "stub".to_string(),
-        "not yet".to_string(),
-        "for now".to_string(),
-        "to be done".to_string(),
-        "to be implemented".to_string(),
-        "come back".to_string(),
-        "needs to".to_string(),
-        "remains to".to_string(),
-        "yet to".to_string(),
-        format!("not wired {}", "into"),
-        format!("not wired {}", "through"),
-        format!("not yet {}", "wired"),
-        format!("deferred to a {}", "follow"),
-        format!("left to a {}", "follow"),
+            format!("{}{}", "to", "do"),
+            format!("{}{}", "fix", "me"),
+            format!("{}-{}", "follow", "up"),
+            format!("{}{}", "follow", "up"),
+            format!("{}{}", "de", "fer"),
+            format!("{}{}", "stop", "gap"),
+            format!("{}{}", "place", "holder"),
+            format!("{}{}", "w", "ip"),
+            format!("{}{}", "t", "bd"),
+            "revisit".to_string(),
+            "punt".to_string(),
+            "eventually".to_string(),
+            "someday".to_string(),
+            "pending".to_string(),
+            "unimplemented".to_string(),
+            "incomplete".to_string(),
+            "stub".to_string(),
+            "not yet".to_string(),
+            "for now".to_string(),
+            "to be done".to_string(),
+            "to be implemented".to_string(),
+            "come back".to_string(),
+            "needs to".to_string(),
+            "remains to".to_string(),
+            "yet to".to_string(),
+            format!("not wired {}", "into"),
+            format!("not wired {}", "through"),
+            format!("not yet {}", "wired"),
+            format!("deferred to a {}", "follow"),
+            format!("left to a {}", "follow"),
         ]
     });
     cues.iter().any(|c| lower_text.contains(c.as_str()))

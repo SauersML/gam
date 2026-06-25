@@ -244,9 +244,10 @@ impl SaeManifoldTerm {
         let mut scratch = vec![0.0_f64; self.k_atoms()];
         for row in 0..n {
             match rho {
-                Some(rho) => self
-                    .assignment
-                    .try_assignments_row_for_rho_into(row, rho, &mut scratch)?,
+                Some(rho) => {
+                    self.assignment
+                        .try_assignments_row_for_rho_into(row, rho, &mut scratch)?
+                }
                 None => {
                     let a = self.assignment.try_assignments_row(row)?;
                     scratch.copy_from_slice(a.as_slice().expect("contiguous assignment row"));

@@ -2284,7 +2284,7 @@ impl WorkingModelSurvival {
             DenseSpectralOperator, DispersionHandling, PenaltyLogdetDerivs,
             compute_block_penalty_logdet_derivs,
         };
-        use crate::reml_contracts::EvalMode;
+        use gam_problem::EvalMode;
 
         let p = beta.len();
         let active_penalty_blocks: Vec<&PenaltyBlock> = self

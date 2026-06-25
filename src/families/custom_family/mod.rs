@@ -36,11 +36,6 @@ pub(crate) use crate::model_types::{
 pub(crate) use crate::pirls::{
     LinearInequalityConstraints, solve_newton_directionwith_lower_bounds,
 };
-pub(crate) use crate::reml_contracts::{
-    BlockLocalDrift, ContractedPsiSecondOrder, ContractedPsiSecondOrderFn,
-    DenseMatrixHyperOperator, DriftDerivResult, FixedDriftDerivFn, HyperCoord, HyperCoordDrift,
-    HyperCoordPair, HyperOperator,
-};
 pub(crate) use crate::solver::active_set::{
     project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
 };
@@ -58,6 +53,11 @@ pub(crate) use crate::solver::estimate::{
 };
 pub(crate) use crate::types::{RidgeDeterminantMode, RidgePolicy};
 pub(crate) use faer::Side;
+pub(crate) use gam_problem::{
+    BlockLocalDrift, ContractedPsiSecondOrder, ContractedPsiSecondOrderFn,
+    DenseMatrixHyperOperator, DriftDerivResult, FixedDriftDerivFn, HyperCoord, HyperCoordDrift,
+    HyperCoordPair, HyperOperator,
+};
 pub(crate) use gam_runtime::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use joint_newton::whitened_spectrum;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
@@ -73,8 +73,8 @@ pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
 pub(crate) use std::sync::{Arc, Mutex, OnceLock, Weak};
 pub(crate) use thiserror::Error;
 
-pub use crate::reml_contracts::EvalMode;
 pub use crate::solver::estimate::reml::reml_outer_engine::PseudoLogdetMode;
+pub use gam_problem::EvalMode;
 
 mod assembly;
 mod block_spec;

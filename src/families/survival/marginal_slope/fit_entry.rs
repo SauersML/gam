@@ -2114,7 +2114,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
          designs: &[TermCollectionDesign],
          eval_mode,
          row_set: &crate::families::row_kernel::RowSet| {
-            use crate::reml_contracts::EvalMode;
+            use gam_problem::EvalMode;
             let row_set_rows = match row_set {
                 crate::families::row_kernel::RowSet::All => outer_row_indices(options, n).len(),
                 crate::families::row_kernel::RowSet::Subsample { rows, .. } => rows.len(),

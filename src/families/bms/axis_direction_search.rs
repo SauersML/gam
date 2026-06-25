@@ -1791,7 +1791,7 @@ impl BernoulliMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<crate::custom_family::ExactNewtonJointPsiSecondOrderContracted>, String>
     {
-        use crate::reml_contracts::DriftDerivResult;
+        use gam_problem::DriftDerivResult;
         let slices = &cache.slices;
         let primary = &cache.primary;
         let n = self.y.len();

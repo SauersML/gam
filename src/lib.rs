@@ -121,7 +121,6 @@ pub mod outer_subsample;
 /// (no solver/inference deps); hosted at the crate root so `solver` and a
 /// relocated `rho_uncertainty` can depend on it downward (#1135).
 pub mod psis;
-pub mod reml_contracts;
 pub mod report;
 pub(crate) mod rho_prior_eval;
 /// Lower-layer ρ-uncertainty (PSIS-on-ρ) diagnostic. Depends only on the

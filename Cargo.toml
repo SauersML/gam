@@ -41,6 +41,7 @@ members = [
     "crates/gam-cli",
     "crates/gam-math",
     "crates/gam-predict",
+    "crates/gam-problem",
     "crates/gam-pyffi",
     "crates/gam-runtime",
 ]
@@ -77,6 +78,7 @@ statrs = "0.18.0"
 libm = "0.2.16"
 gam-data = { path = "crates/gam-data" }
 gam-math = { path = "crates/gam-math" }
+gam-problem = { path = "crates/gam-problem" }
 gam-spec = { path = "crates/gam-spec" }
 gam-runtime = { path = "crates/gam-runtime" }
 pest = "2.8.6"

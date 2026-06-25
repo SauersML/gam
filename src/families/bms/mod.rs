@@ -35,7 +35,6 @@ use crate::probability::{
     normal_cdf, normal_logcdf, normal_pdf, signed_probit_logcdf_and_mills_ratio,
     standard_normal_quantile,
 };
-use crate::reml_contracts::HyperOperator;
 use crate::smooth::{
     ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
     TermCollectionDesign, TermCollectionSpec, apply_spatial_anisotropy_pilot_initializer,
@@ -44,6 +43,7 @@ use crate::smooth::{
 };
 use crate::types::{InverseLink, StandardLink, WigglePenaltyConfig};
 use gam_math::jet_partitions::MultiDirJet;
+use gam_problem::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};

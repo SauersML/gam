@@ -176,7 +176,11 @@ fn first_whole_rho_borrow_after(region: &str, start: usize) -> Option<usize> {
     while let Some(rel) = region[from..].find("&rho") {
         let at = from + rel;
         let after = at + "&rho".len();
-        let next = if after < bytes.len() { bytes[after] } else { b' ' };
+        let next = if after < bytes.len() {
+            bytes[after]
+        } else {
+            b' '
+        };
         if !is_ident_byte(next) && next != b'.' {
             return Some(at);
         }
@@ -189,8 +193,8 @@ fn first_whole_rho_borrow_after(region: &str, start: usize) -> Option<usize> {
 fn sae_manifold_fit_inner_does_not_borrow_rho_after_partial_move() {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let path = Path::new(manifest).join("crates/gam-pyffi/src/latent_basis_and_sae_ffi.rs");
-    let raw = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let raw =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let code = strip_comments(&raw);
 
     // Scope to the body of `sae_manifold_fit_inner`: from its header up to the

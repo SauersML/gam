@@ -798,20 +798,19 @@ impl SurvivalMarginalSlopeFamily {
                 // axis (`edge_axis_a`), used by f_aa_dir/f_au_dir which carry an
                 // a-axis flux in their base (gam#932/#1454).
                 let axis_flux_dir_a = |poly: &[f64], poly_dir: &[f64]| -> f64 {
-                    let eval_edge = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
-                                     z: f64|
-                     -> f64 {
-                        let (z_a, z_a_dir, z_dir) = edge_axis_a(edge, z);
-                        if z_a == 0.0 && z_a_dir == 0.0 && z_dir == 0.0 {
-                            return 0.0;
-                        }
-                        z_a_dir
+                    let eval_edge =
+                        |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+                            let (z_a, z_a_dir, z_dir) = edge_axis_a(edge, z);
+                            if z_a == 0.0 && z_a_dir == 0.0 && z_dir == 0.0 {
+                                return 0.0;
+                            }
+                            z_a_dir
                             * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
                                 neg_cell, poly, z,
                             )
                             + z_a * density_dir_integrand(poly, poly_dir, z)
                             + z_a * z_dir * density_z_derivative(poly, z)
-                    };
+                        };
                     eval_edge(part.right_edge, neg_cell.right)
                         - eval_edge(part.left_edge, neg_cell.left)
                 };

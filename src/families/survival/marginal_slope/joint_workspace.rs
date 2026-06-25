@@ -184,17 +184,15 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
                     cache,
                 )
                 .map(|matrix| {
-                    Some(
-                        Arc::new(crate::reml_contracts::DenseMatrixHyperOperator { matrix })
-                            as Arc<dyn HyperOperator>,
-                    )
+                    Some(Arc::new(gam_problem::DenseMatrixHyperOperator { matrix })
+                        as Arc<dyn HyperOperator>)
                 });
         }
         self.family
             .exact_newton_joint_hessian_directional_derivative(&self.block_states, d_beta_flat)
             .map(|result| {
                 result.map(|matrix| {
-                    Arc::new(crate::reml_contracts::DenseMatrixHyperOperator { matrix })
+                    Arc::new(gam_problem::DenseMatrixHyperOperator { matrix })
                         as Arc<dyn HyperOperator>
                 })
             })
@@ -244,7 +242,7 @@ impl ExactNewtonJointHessianWorkspace for SurvivalMarginalSlopeExactNewtonJointH
             )
             .map(|result| {
                 result.map(|matrix| {
-                    Arc::new(crate::reml_contracts::DenseMatrixHyperOperator { matrix })
+                    Arc::new(gam_problem::DenseMatrixHyperOperator { matrix })
                         as Arc<dyn HyperOperator>
                 })
             })

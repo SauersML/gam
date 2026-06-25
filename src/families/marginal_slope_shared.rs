@@ -1565,7 +1565,7 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
 
     /// Hessian directional derivative for the σ-auxiliary parameter, returned
     /// as a dense matrix (the generic wraps it into
-    /// [`DriftDerivResult::Dense`](crate::reml_contracts::DriftDerivResult::Dense)).
+    /// [`DriftDerivResult::Dense`](gam_problem::DriftDerivResult::Dense)).
     fn sigma_hessian_directional_derivative(
         &self,
         d_beta_flat: &Array1<f64>,
@@ -1573,12 +1573,12 @@ pub trait MarginalSlopePsiFamily: Send + Sync {
 
     /// Hessian directional derivative for a non-σ derivative axis, returned as
     /// a hyper-operator (the generic wraps it into
-    /// [`DriftDerivResult::Operator`](crate::reml_contracts::DriftDerivResult::Operator)).
+    /// [`DriftDerivResult::Operator`](gam_problem::DriftDerivResult::Operator)).
     fn psi_hessian_directional_derivative(
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::reml_contracts::HyperOperator>>, String>;
+    ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String>;
 }
 
 /// Generic exact-Newton joint-ψ workspace shared by the marginal-slope
@@ -1652,16 +1652,16 @@ impl<F: MarginalSlopePsiFamily> crate::custom_family::ExactNewtonJointPsiWorkspa
         &self,
         psi_index: usize,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<crate::reml_contracts::DriftDerivResult>, String> {
+    ) -> Result<Option<gam_problem::DriftDerivResult>, String> {
         if self.family.is_sigma_aux(psi_index) {
             return self
                 .family
                 .sigma_hessian_directional_derivative(d_beta_flat)
-                .map(|result| result.map(crate::reml_contracts::DriftDerivResult::Dense));
+                .map(|result| result.map(gam_problem::DriftDerivResult::Dense));
         }
         self.family
             .psi_hessian_directional_derivative(psi_index, d_beta_flat)
-            .map(|result| result.map(crate::reml_contracts::DriftDerivResult::Operator))
+            .map(|result| result.map(gam_problem::DriftDerivResult::Operator))
     }
 }
 

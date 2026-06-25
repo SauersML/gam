@@ -783,7 +783,7 @@ pub(crate) fn compute_outer_hessian(
         // `Par::Seq`), exactly as the rigid row-kernel all-axes sweep does. The
         // results are collected index-ordered so the subsequent trace/write loop
         // is byte-identical to the prior serial `ext_pair_fn` evaluation order.
-        let ext_pairs: Vec<crate::reml_contracts::HyperCoordPair> = {
+        let ext_pairs: Vec<gam_problem::HyperCoordPair> = {
             use rayon::iter::{IntoParallelIterator, ParallelIterator};
             let pair_count = ext_dim * (ext_dim + 1) / 2;
             (0..pair_count)

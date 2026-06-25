@@ -71,7 +71,7 @@ use crate::families::vector_response::{
 };
 use crate::matrix::{DenseDesignMatrix, DesignMatrix, SymmetricMatrix};
 use crate::pirls::dense_block_xtwx;
-use crate::reml_contracts::{DenseMatrixHyperOperator, HyperOperator};
+use gam_problem::{DenseMatrixHyperOperator, HyperOperator};
 use ndarray::{Array1, Array2, Array3, ArrayView2};
 use std::sync::{Arc, Mutex};
 

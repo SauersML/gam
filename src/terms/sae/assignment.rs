@@ -1897,15 +1897,21 @@ mod fill_into_buffer_1557_tests {
     fn build(n: usize, k: usize, mode: AssignmentMode) -> SaeAssignment {
         // Deterministic, asymmetric logits/coords so every atom takes a distinct
         // value (no accidental ties masking an index bug).
-        let logits =
-            Array2::from_shape_fn((n, k), |(i, kk)| 0.37 + 0.11 * (i as f64) - 0.23 * (kk as f64));
-        let coords: Vec<Array2<f64>> =
-            (0..k).map(|_| Array2::from_shape_fn((n, 1), |(i, _)| 0.1 + 0.05 * (i as f64))).collect();
+        let logits = Array2::from_shape_fn((n, k), |(i, kk)| {
+            0.37 + 0.11 * (i as f64) - 0.23 * (kk as f64)
+        });
+        let coords: Vec<Array2<f64>> = (0..k)
+            .map(|_| Array2::from_shape_fn((n, 1), |(i, _)| 0.1 + 0.05 * (i as f64)))
+            .collect();
         SaeAssignment::from_blocks_with_mode(logits, coords, mode).unwrap()
     }
 
     fn rho(k: usize) -> SaeManifoldRho {
-        SaeManifoldRho::new((1e-2_f64).ln(), (1e-1_f64).ln(), vec![Array1::<f64>::zeros(1); k])
+        SaeManifoldRho::new(
+            (1e-2_f64).ln(),
+            (1e-1_f64).ln(),
+            vec![Array1::<f64>::zeros(1); k],
+        )
     }
 
     fn assert_into_matches_alloc(a: &SaeAssignment) {
@@ -1920,7 +1926,8 @@ mod fill_into_buffer_1557_tests {
             for s in scratch.iter_mut() {
                 *s = f64::NAN;
             }
-            a.try_assignments_row_for_rho_into(row, &rho, &mut scratch).unwrap();
+            a.try_assignments_row_for_rho_into(row, &rho, &mut scratch)
+                .unwrap();
             assert_eq!(allocated.len(), k);
             for kk in 0..k {
                 assert_eq!(

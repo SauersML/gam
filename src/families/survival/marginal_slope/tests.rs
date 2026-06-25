@@ -7066,7 +7066,7 @@ fn survival_psi_workspace_hessian_directional_derivative_is_operator_and_matches
         .expect("workspace drift")
         .expect("workspace drift available");
 
-    let crate::reml_contracts::DriftDerivResult::Operator(op) = result else {
+    let gam_problem::DriftDerivResult::Operator(op) = result else {
         panic!("survival psi drift should use operator representation");
     };
     assert_eq!(op.dim(), dense.nrows());

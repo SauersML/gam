@@ -12,6 +12,33 @@ use std::sync::{Arc, Condvar, Mutex};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
+mod linalg_helpers;
+
+mod gpu {
+    pub(crate) mod linalg_dispatch {
+        use ndarray::{Array2, ArrayView2};
+
+        pub(crate) fn try_fast_atb(
+            a: ArrayView2<'_, f64>,
+            b: ArrayView2<'_, f64>,
+        ) -> Option<Array2<f64>> {
+            let (n_a, p) = a.dim();
+            let (n_b, q) = b.dim();
+            assert_eq!(n_a, n_b, "A and B must have same number of rows");
+            if !crate::linalg_helpers::should_use_faer_matmul(p, q, n_a) {
+                return None;
+            }
+            Some(crate::linalg_helpers::fast_atb_with_parallelism(
+                &a,
+                &b,
+                crate::linalg_helpers::matmul_parallelism(p, q, n_a),
+            ))
+        }
+    }
+}
+
+use linalg_helpers::{dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into};
+
 #[cold]
 fn reml_contract_panic(message: impl Into<String>) -> ! {
     std::panic::panic_any(message.into())
@@ -134,7 +161,7 @@ pub trait HyperOperator: Send + Sync {
     /// Compute the exact projected matrix `F^T B F`.
     fn projected_matrix(&self, factor: &Array2<f64>) -> Array2<f64> {
         let op_factor = self.mul_mat(factor);
-        crate::faer_ndarray::fast_atb(factor, &op_factor)
+        crate::linalg_helpers::fast_atb(factor, &op_factor)
     }
 
     /// Compute the exact projected matrix `F^T B F`, reusing caller-owned
@@ -149,7 +176,7 @@ pub trait HyperOperator: Send + Sync {
             Some(design_id) => {
                 let key = ProjectedFactorKey::from_factor_view(design_id, factor.view());
                 let projected = factor_cache.get_or_insert_with(key, || self.mul_mat(factor));
-                crate::faer_ndarray::fast_atb(factor, projected.as_ref())
+                crate::linalg_helpers::fast_atb(factor, projected.as_ref())
             }
             None => self.projected_matrix(factor),
         }
@@ -847,7 +874,3 @@ pub struct ContractedPsiSecondOrder {
 
 pub type ContractedPsiSecondOrderFn =
     Arc<dyn Fn(&[f64]) -> Result<Option<ContractedPsiSecondOrder>, String> + Send + Sync>;
-
-use crate::solver::estimate::reml::reml_outer_engine::{
-    dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into,
-};

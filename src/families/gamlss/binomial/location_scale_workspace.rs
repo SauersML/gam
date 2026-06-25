@@ -289,7 +289,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
     fn directional_derivative_operator(
         &self,
         d_beta_flat: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::reml_contracts::HyperOperator>>, String> {
+    ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
         let total = pt + pls;
@@ -329,7 +329,7 @@ impl ExactNewtonJointHessianWorkspace for BinomialLocationScaleHessianWorkspace 
         &self,
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
-    ) -> Result<Option<Arc<dyn crate::reml_contracts::HyperOperator>>, String> {
+    ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
         let pt = self.x_t.ncols();
         let pls = self.x_ls.ncols();
         let total = pt + pls;
