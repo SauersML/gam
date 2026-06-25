@@ -15,16 +15,33 @@ impl SaeManifoldTerm {
         let gates = self.assignment.assignments();
         let n = gates.nrows();
         let inv_n = if n > 0 { 1.0 / n as f64 } else { 0.0 };
+        // Coactivation `W = Gᵀ·G / n`. Build it over the per-row ACTIVE support
+        // only: a pair `(j,k)` contributes to row `row` exactly when BOTH gates
+        // are nonzero there, so iterating each row's active atoms and accumulating
+        // their outer product yields the IDENTICAL matrix as the dense `k²·n`
+        // triple loop — every skipped `(j,k,row)` term had a zero gate factor and
+        // contributed nothing. For the sparse IBP/Softmax routing this term exists
+        // to regularize, the per-row active set is `≪ K`, so the cost collapses
+        // from `O(K²·N)` (35e12 products at K=32768) to `O(N·active²)` with no
+        // change to the result — the same coactive-pairs reduction proven exact
+        // for the separation barrier (#1026, `barrier_coactive_pairs`).
         let mut coactivation = Array2::<f64>::zeros((k_atoms, k_atoms));
-        for j in 0..k_atoms {
-            for k in 0..k_atoms {
-                let mut s = 0.0;
-                for row in 0..n {
-                    s += gates[[row, j]] * gates[[row, k]];
+        let mut active: Vec<(usize, f64)> = Vec::with_capacity(k_atoms.min(64));
+        for row in 0..n {
+            active.clear();
+            for j in 0..k_atoms {
+                let g = gates[[row, j]];
+                if g != 0.0 {
+                    active.push((j, g));
                 }
-                coactivation[[j, k]] = s * inv_n;
+            }
+            for &(j, gj) in &active {
+                for &(k, gk) in &active {
+                    coactivation[[j, k]] += gj * gk;
+                }
             }
         }
+        coactivation.mapv_inplace(|v| v * inv_n);
         let mut per_fit: DecoderIncoherencePenalty = (**base).clone();
         per_fit.block_sizes = block_sizes;
         per_fit.p_out = p;
