@@ -566,6 +566,50 @@ pub(crate) fn solve_dense_reduced_system(
     if !options.tolerate_ill_conditioning {
         let schur_kappa = cholesky_factor_kappa_estimate(&factor);
         if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
+            // #1026 — over-complete SAE dictionaries park surplus atoms dead
+            // (β_k → 0), so the reduced Schur is PD (the Cholesky above succeeded)
+            // but ILL-CONDITIONED: the dead decoder subspace carries near-zero
+            // eigenvalues while the live subspace is healthy. The kappa gate's
+            // concern is an inaccurate Δβ from accumulated (H_tt)⁻¹ contamination —
+            // but on the dead subspace the correct Δβ IS ≈0 (those atoms have no
+            // signal), so the only "inaccuracy" is in directions whose true step is
+            // zero. When the spectral PD-floor is enabled (the SAE solve path),
+            // clamp exactly those collapsed directions up to `floor·max(λ)` and
+            // solve against the floored Schur: the live subspace keeps its EXACT
+            // Newton component, the dead subspace is damped to ≈0, and κ is bounded
+            // so Δβ is accurate where it matters. This is the same conditioning the
+            // non-PD branch above applies; here it also covers the PD-but-ill-
+            // conditioned case so the LM loop does not exhaust `ridge_β` trying to
+            // (futilely) lift a fundamentally rank-deficient dead-atom subspace.
+            // Without the floor (BA / non-SAE callers) the strict refusal stands.
+            if let Some(relative_floor) = options.schur_pd_floor
+                && let Some(floored) = spectral_pd_floored_schur(schur, relative_floor)
+                && let Ok(floored_factor) = cholesky_lower(&floored)
+            {
+                let direct =
+                    mixed_precision_reduced_beta(&floored, &floored_factor, rhs_beta, options)
+                        .unwrap_or_else(|| cholesky_solve_vector(&floored_factor, rhs_beta));
+                if step_inside_trust_region(
+                    direct.view(),
+                    options.trust_region.radius,
+                    metric_weights,
+                ) {
+                    return Ok((direct, Some(floored_factor), PcgDiagnostics::default()));
+                }
+                let identity = IdentityPreconditioner;
+                let (delta, diag) = steihaug_dense_system(
+                    &floored,
+                    rhs_beta,
+                    &identity,
+                    &ArrowPcgOptions {
+                        max_iterations: options.trust_region.max_iterations,
+                        relative_tolerance: options.trust_region.steihaug_relative_tolerance,
+                    },
+                    &options.trust_region,
+                    metric_weights,
+                )?;
+                return Ok((delta, Some(floored_factor), diag));
+            }
             return Err(ArrowSchurError::SchurFactorFailed {
                 reason: format!(
                     "reduced Schur complement Cholesky succeeded but is ill-conditioned \
