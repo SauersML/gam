@@ -8,8 +8,16 @@
 //! on the macOS dev box and CPU CI runners. On `gam-gpu-1` (V100), the tests
 //! cover the full pipeline:
 //!
+//! Every fixture is sized with batch (n) ≥ 8 so the workload clears the device
+//! dispatch floor (`small_dense_batched_potrf_min_batch`) and the device path
+//! actually runs on a GPU host. With a CUDA runtime present, an
+//! `ArrowSchurGpuFailure::Unavailable` therefore means the device DECLINED a
+//! workload it must run — a real kernel/dispatch fault — so every such arm
+//! fails loud instead of skip-passing (the device-PCG skip-pass class fixed in
+//! eee12f6b2). Legit skips happen only on non-Linux / no-CUDA hosts.
+//!
 //!   1. Dense full-Hessian parity at `(n=8, d=6, k=4)`, ridge=0.
-//!   2. Multi-size sweep `d ∈ {10, 16, 30}`, `n ∈ {12, 8, 4}`, `k=5`.
+//!   2. Multi-size sweep `d ∈ {10, 16, 30}`, `n ∈ {12, 8, 8}`, `k=5`.
 //!   3. Ridge escalation: `ridge_t` grows from 1e-12 to 1e-2 over five steps,
 //!      every step matches the dense reference at the same ridge.
 //!   4. log|H| parity at three sizes — `2·Σ log L_{i,jj} + 2·Σ log R_{β,aa}`
@@ -160,14 +168,17 @@ fn arrow_schur_gpu_matches_dense_reference_baseline() {
         .expect("dense reference Cholesky must succeed on PD fixture");
     let got = match solve_arrow_newton_step(&sys, ridge_t, ridge_beta) {
         Ok(sol) => sol,
-        Err(ArrowSchurGpuFailure::Unavailable) => {
-            eprintln!(
-                "[arrow_schur_gpu_v100/dense_parity] device declined \
-                 (Unavailable) — treating as infra outage, not a parity \
-                 regression"
-            );
-            return;
-        }
+        // `skip_without_cuda!` above already returned on CPU-only hosts, so by
+        // the time we reach here a CUDA runtime is present. The fixture is sized
+        // to clear the device dispatch floor (batch ≥ 8, p ≤ 32), so an
+        // `Unavailable` here means the device DECLINED a workload it was meant to
+        // run — a real kernel/dispatch fault, not an infra outage. Fail loud
+        // (the device-PCG skip-pass class, eee12f6b2).
+        Err(ArrowSchurGpuFailure::Unavailable) => panic!(
+            "[arrow_schur_gpu_v100/dense_parity] device returned Unavailable on a \
+             floor-clearing fixture with a CUDA runtime present — the device path \
+             declined a workload it must run (kernel/dispatch fault)"
+        ),
         Err(other) => panic!("[arrow_schur_gpu_v100/dense_parity] GPU solve failed: {other:?}"),
     };
     assert_solution_matches(
@@ -188,10 +199,13 @@ fn arrow_schur_gpu_multi_size_groups_match_reference() {
     // called out in math block 3 §16. Each size is its own ArrowSchurSystem
     // because the current uniform-block dispatch (one p-group per launch) is
     // what is on `main`; Layer D will lift this restriction.
+    // Every batch (n) is ≥ 8 so the workload clears the device dispatch floor
+    // (`small_dense_batched_potrf_min_batch`) and the device path actually runs;
+    // an `Unavailable` then signals a real decline, not a sub-floor skip.
     let configurations: [(usize, usize, usize, u64); 3] = [
         (12, 10, 5, 0x12_3456_789A_BCDEF0),
         (8, 16, 5, 0x9F9F_9F9F_9F9F_9F9F),
-        (4, 30, 5, 0x0123_4567_89AB_CDEF),
+        (8, 30, 5, 0x0123_4567_89AB_CDEF),
     ];
     for (n, d, k, seed) in configurations {
         let sys = build_fixture(n, d, k, seed);
@@ -201,13 +215,13 @@ fn arrow_schur_gpu_multi_size_groups_match_reference() {
             .expect("dense reference Cholesky must succeed on PD fixture");
         let got = match solve_arrow_newton_step(&sys, ridge_t, ridge_beta) {
             Ok(sol) => sol,
-            Err(ArrowSchurGpuFailure::Unavailable) => {
-                eprintln!(
-                    "[arrow_schur_gpu_v100/multi_size n={n} d={d} k={k}] \
-                     device declined (Unavailable) — skipping size"
-                );
-                continue;
-            }
+            // Runtime present (gate above) + floor-clearing fixture ⇒ a decline
+            // is a real device fault. Fail loud (device-PCG class, eee12f6b2).
+            Err(ArrowSchurGpuFailure::Unavailable) => panic!(
+                "[arrow_schur_gpu_v100/multi_size n={n} d={d} k={k}] device returned \
+                 Unavailable on a floor-clearing fixture with a CUDA runtime present \
+                 — the device path declined a workload it must run"
+            ),
             Err(other) => panic!(
                 "[arrow_schur_gpu_v100/multi_size n={n} d={d} k={k}] \
                  GPU solve failed: {other:?}"
@@ -227,7 +241,8 @@ fn arrow_schur_gpu_ridge_escalation_matches_reference() {
     // both identically. Equal-ridge solves must match to 1e-10 across the
     // entire span, including the tiny-ridge regime where Cholesky of the
     // bordered system is closest to singular.
-    let sys = build_fixture(6, 12, 4, 0xCAFE_BABE_DEAD_BEEF);
+    // n = 8 clears the device dispatch batch floor so the device path runs.
+    let sys = build_fixture(8, 12, 4, 0xCAFE_BABE_DEAD_BEEF);
     let ridges_t: [f64; 5] = [1e-12, 1e-9, 1e-6, 1e-3, 1e-2];
     let ridges_beta: [f64; 5] = [1e-12, 1e-9, 1e-6, 1e-3, 1e-2];
     for (rt, rb) in ridges_t.into_iter().zip(ridges_beta) {
@@ -235,13 +250,12 @@ fn arrow_schur_gpu_ridge_escalation_matches_reference() {
             .expect("dense reference Cholesky must succeed on PD + ridge fixture");
         let got = match solve_arrow_newton_step(&sys, rt, rb) {
             Ok(sol) => sol,
-            Err(ArrowSchurGpuFailure::Unavailable) => {
-                eprintln!(
-                    "[arrow_schur_gpu_v100/ridge_escalation rt={rt:.0e} \
-                     rb={rb:.0e}] device declined — skipping point"
-                );
-                continue;
-            }
+            // Runtime present + floor-clearing fixture ⇒ decline is a real fault.
+            Err(ArrowSchurGpuFailure::Unavailable) => panic!(
+                "[arrow_schur_gpu_v100/ridge_escalation rt={rt:.0e} rb={rb:.0e}] \
+                 device returned Unavailable on a floor-clearing fixture with a \
+                 CUDA runtime present — the device path declined"
+            ),
             Err(other) => panic!(
                 "[arrow_schur_gpu_v100/ridge_escalation rt={rt:.0e} \
                  rb={rb:.0e}] GPU solve failed: {other:?}"
@@ -261,10 +275,11 @@ fn arrow_schur_gpu_log_det_matches_dense_full_chol() {
     // reference forms `2·Σ log L_full[i,i]` from a single Cholesky of the
     // full assembled matrix. The two routes are algebraically identical and
     // must agree to 1e-10 relative.
+    // Every batch (n) ≥ 8 clears the device dispatch floor so the device runs.
     let configurations: [(usize, usize, usize, u64); 3] = [
-        (5, 8, 3, 0x1111_2222_3333_4444),
+        (8, 8, 3, 0x1111_2222_3333_4444),
         (10, 12, 4, 0x5555_6666_7777_8888),
-        (3, 20, 6, 0x9999_AAAA_BBBB_CCCC),
+        (8, 20, 6, 0x9999_AAAA_BBBB_CCCC),
     ];
     for (n, d, k, seed) in configurations {
         let sys = build_fixture(n, d, k, seed);
@@ -274,13 +289,12 @@ fn arrow_schur_gpu_log_det_matches_dense_full_chol() {
             .expect("dense reference Cholesky must succeed on PD fixture");
         let got = match solve_arrow_newton_step(&sys, ridge_t, ridge_beta) {
             Ok(sol) => sol,
-            Err(ArrowSchurGpuFailure::Unavailable) => {
-                eprintln!(
-                    "[arrow_schur_gpu_v100/log_det_parity n={n} d={d} k={k}] \
-                     device declined — skipping size"
-                );
-                continue;
-            }
+            // Runtime present + floor-clearing fixture ⇒ decline is a real fault.
+            Err(ArrowSchurGpuFailure::Unavailable) => panic!(
+                "[arrow_schur_gpu_v100/log_det_parity n={n} d={d} k={k}] device \
+                 returned Unavailable on a floor-clearing fixture with a CUDA \
+                 runtime present — the device path declined"
+            ),
             Err(other) => panic!(
                 "[arrow_schur_gpu_v100/log_det_parity n={n} d={d} k={k}] \
                  GPU solve failed: {other:?}"
@@ -357,7 +371,9 @@ fn arrow_schur_gpu_dense_reference_matches_cpu_solve() {
 #[test]
 fn arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump() {
     skip_without_cuda!("arrow_schur_gpu_v100/ridge_bump_required");
-    let mut sys = build_fixture(4, 8, 3, 0xDEAD_C0DE_DEAD_C0DE);
+    // n = 8 clears the device dispatch batch floor so the device path runs;
+    // row #2 is poisoned below to force the non-PD pivot diagnostic.
+    let mut sys = build_fixture(8, 8, 3, 0xDEAD_C0DE_DEAD_C0DE);
     // Poison row #2: replace `htt` with `-I` so the unperturbed Cholesky
     // fails at the very first pivot (j=0).
     for r in 0..sys.d {
@@ -381,13 +397,12 @@ fn arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump() {
             );
             bump
         }
-        Err(ArrowSchurGpuFailure::Unavailable) => {
-            eprintln!(
-                "[arrow_schur_gpu_v100/ridge_bump_required] device declined — \
-                 skipping"
-            );
-            return;
-        }
+        // Runtime present + floor-clearing fixture ⇒ decline is a real fault.
+        Err(ArrowSchurGpuFailure::Unavailable) => panic!(
+            "[arrow_schur_gpu_v100/ridge_bump_required] device returned Unavailable \
+             on a floor-clearing fixture with a CUDA runtime present — the device \
+             path declined instead of reporting the non-PD pivot"
+        ),
         Err(other) => panic!(
             "[arrow_schur_gpu_v100/ridge_bump_required] expected \
              RidgeBumpRequired, got {other:?}"
@@ -425,13 +440,12 @@ fn arrow_schur_gpu_ridge_bump_required_on_non_pd_row_recovers_after_bump() {
             }) => {
                 ridge = (ridge + next_bump).max(ridge * 2.0);
             }
-            Err(ArrowSchurGpuFailure::Unavailable) => {
-                eprintln!(
-                    "[arrow_schur_gpu_v100/ridge_bump_required] device \
-                     declined on recovery attempt {attempt} — skipping"
-                );
-                return;
-            }
+            // Runtime present + floor-clearing fixture ⇒ decline is a real fault.
+            Err(ArrowSchurGpuFailure::Unavailable) => panic!(
+                "[arrow_schur_gpu_v100/ridge_bump_required] device returned \
+                 Unavailable on recovery attempt {attempt} (CUDA runtime present, \
+                 floor-clearing fixture) — the device path declined"
+            ),
             Err(other) => panic!(
                 "[arrow_schur_gpu_v100/ridge_bump_required] unexpected error \
                  on recovery attempt {attempt}: {other:?}"
@@ -500,7 +514,15 @@ fn arrow_schur_gpu_v100_hill_climb_speedup_over_cpu_host_loop() {
         Box::new(
             || match solve_arrow_newton_step(&sys, ridge_t, ridge_beta) {
                 Ok(_) => Ok(()),
-                Err(ArrowSchurGpuFailure::Unavailable) => Err("device unavailable".to_string()),
+                // Runtime present (gate above) + a 5000-row fixture far above the
+                // dispatch floor ⇒ Unavailable is a real device decline, not an
+                // infra outage. Fail loud (device-PCG skip-pass class, eee12f6b2)
+                // rather than letting a +inf timing silently skip the speedup gate.
+                Err(ArrowSchurGpuFailure::Unavailable) => panic!(
+                    "[arrow_schur_gpu_v100/hill_climb] Layer A+B+C returned Unavailable \
+                     on a 5000-row fixture with a CUDA runtime present — the device \
+                     path declined a workload it must run"
+                ),
                 Err(other) => Err(format!("{other:?}")),
             },
         ),
@@ -510,7 +532,11 @@ fn arrow_schur_gpu_v100_hill_climb_speedup_over_cpu_host_loop() {
         Box::new(
             || match solve_arrow_newton_step_fused_force(&sys, ridge_t, ridge_beta) {
                 Ok(_) => Ok(()),
-                Err(ArrowSchurGpuFailure::Unavailable) => Err("device unavailable".to_string()),
+                Err(ArrowSchurGpuFailure::Unavailable) => panic!(
+                    "[arrow_schur_gpu_v100/hill_climb] Layer D (fused-force) returned \
+                     Unavailable on a 5000-row fixture with a CUDA runtime present — \
+                     the fused device path declined a workload it must run"
+                ),
                 Err(other) => Err(format!("{other:?}")),
             },
         ),
@@ -523,9 +549,11 @@ fn arrow_schur_gpu_v100_hill_climb_speedup_over_cpu_host_loop() {
         fused_x = cpu_secs / fused_secs.max(f64::MIN_POSITIVE),
     );
 
-    // Only enforce the hill-climb targets when all three paths actually
-    // ran (an Unavailable on either GPU path leaves a +inf, which we
-    // treat as "infra outage, do not fail the suite").
+    // The device paths fail loud on Unavailable above, so a finite timing here
+    // means the path genuinely ran. The speedup MAGNITUDE remains hardware-
+    // dependent (a non-error timing failure leaves +inf), so the charter floors
+    // are enforced only when the timing is finite — but the path can no longer
+    // silently decline to run.
     if cpu_secs.is_finite() && abc_secs.is_finite() {
         let abc_x = cpu_secs / abc_secs;
         assert!(
@@ -557,10 +585,14 @@ fn arrow_schur_gpu_fused_layer_d_matches_layer_a_b_c() {
     //   * (n=12, d=10, k=4) — R rounds to template 4
     //   * (n=8,  d=16, k=8) — R = template 8
     //   * (n=4,  d=30, k=16) — R = template 16, exercises the max-P_MAX path
+    // Every batch (n) ≥ 8 clears the Layer A+B+C device dispatch floor
+    // (`small_dense_batched_potrf_min_batch`) so BOTH device paths actually run;
+    // the fused-force path admits any n ≥ 1, so the R-template coverage is
+    // unchanged (k ∈ {4, 8, 16}).
     let configurations: [(usize, usize, usize, u64); 3] = [
         (12, 10, 4, 0xC0DE_0001_0001_0001),
         (8, 16, 8, 0xC0DE_0002_0002_0002),
-        (4, 30, 16, 0xC0DE_0003_0003_0003),
+        (8, 30, 16, 0xC0DE_0003_0003_0003),
     ];
     for (n, d, k, seed) in configurations {
         let sys = build_fixture(n, d, k, seed);
@@ -568,13 +600,12 @@ fn arrow_schur_gpu_fused_layer_d_matches_layer_a_b_c() {
         let ridge_beta = 1e-9;
         let abc = match solve_arrow_newton_step(&sys, ridge_t, ridge_beta) {
             Ok(sol) => sol,
-            Err(ArrowSchurGpuFailure::Unavailable) => {
-                eprintln!(
-                    "[arrow_schur_gpu_v100/c_vs_d_parity n={n} d={d} k={k}] \
-                     Layer A+B+C declined — skipping"
-                );
-                continue;
-            }
+            // Runtime present + floor-clearing fixture ⇒ decline is a real fault.
+            Err(ArrowSchurGpuFailure::Unavailable) => panic!(
+                "[arrow_schur_gpu_v100/c_vs_d_parity n={n} d={d} k={k}] Layer A+B+C \
+                 returned Unavailable on a floor-clearing fixture with a CUDA \
+                 runtime present — the device path declined"
+            ),
             Err(other) => panic!(
                 "[arrow_schur_gpu_v100/c_vs_d_parity n={n} d={d} k={k}] \
                  Layer A+B+C failed: {other:?}"
@@ -582,13 +613,13 @@ fn arrow_schur_gpu_fused_layer_d_matches_layer_a_b_c() {
         };
         let fused = match solve_arrow_newton_step_fused_force(&sys, ridge_t, ridge_beta) {
             Ok(sol) => sol,
-            Err(ArrowSchurGpuFailure::Unavailable) => {
-                eprintln!(
-                    "[arrow_schur_gpu_v100/c_vs_d_parity n={n} d={d} k={k}] \
-                     Layer D declined — skipping"
-                );
-                continue;
-            }
+            // The fused-force path admits any n ≥ 1 with p ≤ 32, so with a CUDA
+            // runtime present an Unavailable is a real Layer D fault, not a skip.
+            Err(ArrowSchurGpuFailure::Unavailable) => panic!(
+                "[arrow_schur_gpu_v100/c_vs_d_parity n={n} d={d} k={k}] Layer D \
+                 (fused-force) returned Unavailable with a CUDA runtime present — \
+                 the fused device path declined"
+            ),
             Err(other) => panic!(
                 "[arrow_schur_gpu_v100/c_vs_d_parity n={n} d={d} k={k}] \
                  Layer D failed: {other:?}"
