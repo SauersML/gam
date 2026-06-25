@@ -4815,6 +4815,16 @@ mod tests {
         let Ok((device, diag)) =
             solve_reduced_beta_pcg_with_diagnostics(&s, &rhs, max_iterations, relative_tolerance)
         else {
+            // #1017 — fail loud, never skip-pass: this fixture clears the device
+            // offload floor, so a CUDA device that is PRESENT yet declines/returns
+            // Err means the device PCG kernel does not run on GPU (a real fault that
+            // must not masquerade as a pass via this skip). Legit skip ONLY when no
+            // usable CUDA device exists (CPU CI).
+            assert!(
+                crate::gpu::device_runtime::GpuRuntime::global().is_none(),
+                "#1017: CUDA device present but the device reduced-beta PCG declined/faulted \
+                 instead of returning a result — the kernel does not run correctly on GPU"
+            );
             return;
         };
         let max_err = cpu
@@ -5432,8 +5442,15 @@ mod tests {
             400,
             1e-12,
         ) else {
-            // No CUDA device / policy declined — kernel host code is still
-            // compile-validated; the numeric arm needs a GPU node.
+            // #1017 — fail loud, never skip-pass: this fixture clears the device
+            // offload floor, so a CUDA device that is PRESENT yet declines means the
+            // framed device PCG kernel does not run on GPU (the fault must not pass
+            // silently). Legit skip ONLY when no usable CUDA device exists (CPU CI).
+            assert!(
+                crate::gpu::device_runtime::GpuRuntime::global().is_none(),
+                "#1017: CUDA device present but the framed device SAE PCG declined/faulted \
+                 instead of returning a result — the kernel does not run correctly on GPU"
+            );
             return;
         };
 
