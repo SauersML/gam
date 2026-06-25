@@ -593,3 +593,57 @@ fn shared_ard_collapses_outer_param_count_at_large_k() {
         assert!((a - b).abs() <= 1e-12, "shared ARD round-trip must be exact: {a} vs {b}");
     }
 }
+
+/// BEHAVIORAL half of the #1026 shared-ARD collapse: the count-collapse above is
+/// only useful if the SHARED parameterization is still a VALID convergent outer
+/// coordinate — a smaller flat vector is worthless if the inner joint fit no
+/// longer converges under it. This drives the real production inner solve
+/// (`reml_criterion_with_cache`, the same entry the outer optimizer steps on)
+/// at a `new_shared_ard` ρ and asserts:
+///   1. the shared flat coordinate is strictly SHORTER than the per-atom one
+///      (2 + max_d  <  2 + Σ_k d_k for K>1) — the O(1)-in-K collapse, and
+///   2. the inner fit CONVERGES to a FINITE Laplace/REML criterion, i.e. the
+///      shared `from_flat` broadcast feeds the inner solve a well-posed per-atom
+///      precision table that the joint Newton can actually reach a minimum on.
+/// A regression that broke the broadcast (or made the shared coordinate
+/// non-convergent) would either shorten nothing or return a non-finite criterion
+/// here. Built at small K (CPU-feasible) because the shared coordinate's validity
+/// is K-independent — that independence is the whole point of the collapse.
+#[test]
+fn shared_ard_is_a_convergent_outer_coordinate_1026() {
+    // Two distinct, non-collinear decoders so the inner data-fit is well posed
+    // and the joint fit has a genuine (non-degenerate) minimum to converge to.
+    let mut dec0 = Array2::<f64>::zeros((M, P));
+    dec0[[0, 0]] = 0.5;
+    dec0[[1, 1]] = 1.0;
+    dec0[[2, 2]] = 1.0;
+    let mut dec1 = Array2::<f64>::zeros((M, P));
+    dec1[[0, 1]] = 0.5;
+    dec1[[1, 2]] = 1.0;
+    dec1[[2, 0]] = 1.0;
+    let mut term = build_two_atom_term(dec0, dec1);
+    let n = term.n_obs();
+    let target = Array2::from_shape_fn((n, P), |(i, c)| 0.1 * ((i as f64) * 0.3 + (c as f64)).sin());
+
+    // d=1 circle atoms ⇒ max_d = 1. Per-atom flat = 2 + K*d = 2 + 2 = 4; shared
+    // flat = 2 + max_d = 3. The collapse is real even at K=2; it widens as K→∞.
+    let log_ard = vec![Array1::<f64>::from_elem(1, (1.0e-1_f64).ln()); 2];
+    let per_atom = SaeManifoldRho::new((1.0e-2_f64).ln(), (1.0e-2_f64).ln(), log_ard.clone());
+    let shared = SaeManifoldRho::new_shared_ard((1.0e-2_f64).ln(), (1.0e-2_f64).ln(), log_ard);
+    assert_eq!(shared.ard_sharing, ArdSharing::Shared);
+    assert!(
+        shared.to_flat().len() < per_atom.to_flat().len(),
+        "shared ARD outer coordinate ({}) must be strictly shorter than per-atom ({})",
+        shared.to_flat().len(),
+        per_atom.to_flat().len()
+    );
+
+    // Inner-solve knobs mirroring the production outer objective's defaults.
+    let (cost, _loss, _cache) = term
+        .reml_criterion_with_cache(target.view(), &shared, None, 64, 1.0, 1.0e-8, 1.0e-8)
+        .expect("inner joint fit must converge at the shared-ARD ρ");
+    assert!(
+        cost.is_finite(),
+        "shared-ARD inner fit must reach a FINITE REML criterion (convergence); got {cost}"
+    );
+}
