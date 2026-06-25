@@ -2734,4 +2734,77 @@ mod flex_primary_hessian_oracle_tests {
             "flex Hessian FD oracle max rel {max_rel:.3e}"
         );
     }
+
+    /// ARBITER (diagnostic): is the H[0][0] flex-Hessian vs FD-of-gradient gap a
+    /// REAL hand-derivation bug or just FD-truncation / intercept-re-solve noise
+    /// in the witness? Sweep the central-difference step `h` on the worst entry
+    /// (row 2, [q][q]); if the gap scales ~h^2 it is FD truncation (the analytic
+    /// Hessian is right, the witness bound is just too tight); if it stays flat
+    /// as h shrinks it is a genuine dropped/mis-signed term. Richardson-cancel
+    /// the O(h^2) term and report the residual. Panics with the table so the
+    /// harness surfaces the numbers (stdout is otherwise suppressed).
+    #[test]
+    fn arbiter_flex_hessian_h00_fd_step_scaling() {
+        let n = 12usize;
+        let (family, states) = make_flex_oracle_family(n);
+        let cache = family
+            .build_exact_eval_cache(&states)
+            .expect("flex exact eval cache");
+        let primary = &cache.primary;
+        let row = 2usize;
+        let u = primary.q; // intercept / q axis => H[0][0]
+        let v = primary.q;
+
+        let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, row);
+        let (_neglog, _grad, analytic_hess) = family
+            .compute_row_primary_gradient_hessian(row, &states, primary, row_ctx)
+            .expect("analytic flex gradient + hessian");
+        let analytic = analytic_hess[[v, u]];
+
+        let fd_at = |h: f64| -> f64 {
+            let gp = flex_gradient_at_perturbed(&family, &states, primary, row, u, h);
+            let gm = flex_gradient_at_perturbed(&family, &states, primary, row, u, -h);
+            (gp[v] - gm[v]) / (2.0 * h)
+        };
+
+        // Coarse and fine central-difference steps. If the analytic Hessian is
+        // CORRECT and the witness gap is pure O(h^2) FD truncation, halving h
+        // quarters the gap; the Richardson combination cancels that O(h^2) term
+        // and lands on the analytic value to the intercept-re-solve floor
+        // (~1e-9). If instead a hand product-rule term is dropped, the gap is
+        // h-INDEPENDENT and the Richardson residual stays at the bug magnitude.
+        let h = 1e-3_f64;
+        let fd_h = fd_at(h);
+        let fd_half = fd_at(h * 0.5);
+        let fd_quarter = fd_at(h * 0.25);
+        let gap_h = (analytic - fd_h).abs();
+        let gap_half = (analytic - fd_half).abs();
+        let gap_quarter = (analytic - fd_quarter).abs();
+        let rich = (4.0 * fd_half - fd_h) / 3.0;
+        let rich_gap = (analytic - rich).abs();
+        let denom = analytic.abs().max(1.0);
+
+        // DIAGNOSTIC RECORD (shown on failure; this is the dispositive table):
+        let record = format!(
+            "FLEX H[0][0] ARBITER row 2: analytic={analytic:+.12e} \
+             fd(h)={fd_h:+.12e} fd(h/2)={fd_half:+.12e} fd(h/4)={fd_quarter:+.12e} \
+             gap(h)={gap_h:.3e} gap(h/2)={gap_half:.3e} gap(h/4)={gap_quarter:.3e} \
+             ratio_h_over_half={:.3} ratio_half_over_quarter={:.3} \
+             richardson={rich:+.12e} richardson_gap={rich_gap:.3e} (rich_rel={:.3e})",
+            gap_h / gap_half.max(f64::MIN_POSITIVE),
+            gap_half / gap_quarter.max(f64::MIN_POSITIVE),
+            rich_gap / denom,
+        );
+
+        // VERDICT: the analytic Hessian is correct iff the FD gap is O(h^2) — i.e.
+        // the Richardson-extrapolated second derivative (truncation-cancelled)
+        // matches it to the intercept-solve floor. A genuine dropped term leaves
+        // a Richardson residual at the bug scale (~1e-5), failing this with the
+        // record above so the harness surfaces the numbers.
+        assert!(
+            rich_gap / denom <= 1e-7,
+            "{record}\nVERDICT: Richardson residual exceeds the FD-truncation floor — \
+             the hand H[0][0] genuinely diverges (real dropped/mis-signed term), NOT FD noise"
+        );
+    }
 }
