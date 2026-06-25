@@ -1451,7 +1451,13 @@ pub(crate) fn hash_analytic_penalty_kind(
                 hasher.write_usize(m);
             }
             hasher.write_usize(p.p_out);
-            hash_array2(hasher, &p.coactivation);
+            hasher.write_usize(p.k_atoms);
+            hasher.write_usize(p.pairs.len());
+            for &(j, k, w) in &p.pairs {
+                hasher.write_usize(j);
+                hasher.write_usize(k);
+                hasher.write_f64(w);
+            }
             hasher.write_f64(p.weight);
             hasher.write_bool(p.learnable_weight);
             hasher.write_usize(p.rho_index);

@@ -105,54 +105,59 @@ impl SaeManifoldTerm {
             .iter()
             .map(|atom| atom.decoder_coefficients.iter().map(|v| v * v).sum::<f64>())
             .collect();
-        let mut gate = Array2::<f64>::zeros((k_atoms, k_atoms));
-        let mut any_active = false;
+        // Candidate pair set: only co-active atom pairs. The repulsion is the
+        // anti-collapse cure for two atoms that drift onto the SAME decoder
+        // direction WHILE co-firing on the same rows; an atom pair that never
+        // co-fires cannot drive the per-row `H_tt` near-singular, so it does not
+        // need repulsion. Restricting the gate scan to the co-active pairs keeps
+        // the whole path sparse — `O(N·active²)` candidate pairs instead of the
+        // dense `O(K²)` all-pairs scan (fatal at K=32768) — while the C1
+        // smoothstep below still zeroes out every pair that is not near-collinear,
+        // so the engaged gate is the same near-collinear, co-firing pair set.
+        let candidates = self.barrier_coactive_pairs();
+        let mut gate: Vec<(usize, usize, f64)> = Vec::new();
         let s0 = SAE_DECODER_REPULSION_COLLINEARITY_GATE;
-        for j in 0..k_atoms {
-            for k in (j + 1)..k_atoms {
-                // Both decoders need a usable scale; a ~zero decoder has no
-                // direction to be collinear with, so leave the pair at 0 (the
-                // decoder-norm / mass guards own that degeneracy, not this term).
-                if !(norm_sq[j] > 0.0 && norm_sq[k] > 0.0) {
-                    continue;
-                }
-                // Cross-Gram Frobenius energy ‖B_jB_kᵀ‖²_F = Σ_{a,b} C[a,b]² with
-                // C[a,b] = Σ_o B_j[a,o]·B_k[b,o]; normalized by the two norms it
-                // is the squared cosine of the decoder row-spaces ∈ [0, 1].
-                let bj = &self.atoms[j].decoder_coefficients;
-                let bk = &self.atoms[k].decoder_coefficients;
-                let (m_j, p) = (bj.nrows(), bj.ncols());
-                let m_k = bk.nrows();
-                if bk.ncols() != p {
-                    continue;
-                }
-                let mut cross_sq = 0.0_f64;
-                for a in 0..m_j {
-                    for b in 0..m_k {
-                        let mut c = 0.0_f64;
-                        for o in 0..p {
-                            c += bj[[a, o]] * bk[[b, o]];
-                        }
-                        cross_sq += c * c;
+        for (j, k, _qjk) in candidates {
+            // Both decoders need a usable scale; a ~zero decoder has no
+            // direction to be collinear with, so leave the pair at 0 (the
+            // decoder-norm / mass guards own that degeneracy, not this term).
+            if !(norm_sq[j] > 0.0 && norm_sq[k] > 0.0) {
+                continue;
+            }
+            // Cross-Gram Frobenius energy ‖B_jB_kᵀ‖²_F = Σ_{a,b} C[a,b]² with
+            // C[a,b] = Σ_o B_j[a,o]·B_k[b,o]; normalized by the two norms it
+            // is the squared cosine of the decoder row-spaces ∈ [0, 1].
+            let bj = &self.atoms[j].decoder_coefficients;
+            let bk = &self.atoms[k].decoder_coefficients;
+            let (m_j, p) = (bj.nrows(), bj.ncols());
+            let m_k = bk.nrows();
+            if bk.ncols() != p {
+                continue;
+            }
+            let mut cross_sq = 0.0_f64;
+            for a in 0..m_j {
+                for b in 0..m_k {
+                    let mut c = 0.0_f64;
+                    for o in 0..p {
+                        c += bj[[a, o]] * bk[[b, o]];
                     }
-                }
-                let s_jk = cross_sq / (norm_sq[j] * norm_sq[k]);
-                // C1 smoothstep gate: 0 below s0, smooth ramp to 1 at s=1.
-                let gate_value = if s_jk <= s0 {
-                    0.0
-                } else {
-                    let t = ((s_jk - s0) / (1.0 - s0)).clamp(0.0, 1.0);
-                    t * t * (3.0 - 2.0 * t)
-                };
-                if gate_value > 0.0 {
-                    let w = SAE_DECODER_REPULSION_STRENGTH * gate_value;
-                    gate[[j, k]] = w;
-                    gate[[k, j]] = w;
-                    any_active = true;
+                    cross_sq += c * c;
                 }
             }
+            let s_jk = cross_sq / (norm_sq[j] * norm_sq[k]);
+            // C1 smoothstep gate: 0 below s0, smooth ramp to 1 at s=1.
+            let gate_value = if s_jk <= s0 {
+                0.0
+            } else {
+                let t = ((s_jk - s0) / (1.0 - s0)).clamp(0.0, 1.0);
+                t * t * (3.0 - 2.0 * t)
+            };
+            if gate_value > 0.0 {
+                let w = SAE_DECODER_REPULSION_STRENGTH * gate_value;
+                gate.push((j, k, w));
+            }
         }
-        self.decoder_repulsion_gate = if any_active { Some(gate) } else { None };
+        self.decoder_repulsion_gate = if gate.is_empty() { None } else { Some(gate) };
     }
 
     /// #1026 — build the [`DecoderIncoherencePenalty`] operator for the frozen
@@ -162,7 +167,7 @@ impl SaeManifoldTerm {
     pub(crate) fn live_decoder_repulsion_penalty(&self) -> Option<DecoderIncoherencePenalty> {
         let gate = self.decoder_repulsion_gate.as_ref()?;
         let k_atoms = self.k_atoms();
-        if k_atoms < 2 || gate.dim() != (k_atoms, k_atoms) {
+        if k_atoms < 2 || gate.is_empty() {
             return None;
         }
         let p = self.output_dim();
@@ -172,10 +177,10 @@ impl SaeManifoldTerm {
             return None;
         }
         // The operator multiplies its quadratic by `weight·pair_weight`; we want
-        // the effective per-pair weight to be exactly `gate[j,k]` (which already
-        // folds in SAE_DECODER_REPULSION_STRENGTH), so pass weight=1 and feed the
-        // gate as the (non-negative, symmetric) coactivation matrix.
-        DecoderIncoherencePenalty::new(
+        // the effective per-pair weight to be exactly the gate weight (which
+        // already folds in SAE_DECODER_REPULSION_STRENGTH), so pass weight=1 and
+        // feed the frozen gate directly as the sparse symmetrized pair list.
+        DecoderIncoherencePenalty::new_sparse(
             PsiSlice {
                 range: 0..m_total * p,
                 latent_dim: Some(m_total),

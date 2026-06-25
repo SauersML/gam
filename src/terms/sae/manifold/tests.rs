@@ -1943,8 +1943,8 @@ pub(crate) fn decoder_repulsion_gate_off_when_separated_on_when_collinear() {
         .as_ref()
         .expect("collinear decoders must ENGAGE the repulsion gate");
     assert!(
-        gate[[0, 1]] > 0.0 && gate[[1, 0]] > 0.0,
-        "engaged gate must be positive and symmetric: {gate:?}"
+        gate.iter().any(|&(j, k, w)| j == 0 && k == 1 && w > 0.0),
+        "engaged gate must carry a positive weight on pair (0,1): {gate:?}"
     );
     assert!(
         col.decoder_repulsion_value(1.0) > 0.0,
