@@ -146,8 +146,161 @@ fn duchon_probe() {
     println!("        mgcv baseline: rmse=0.0233 edf=38.70 | bars: rmse<0.15 AND rmse<=0.0256");
 }
 
+fn splitmix64(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+fn next_unit(s: &mut u64) -> f64 {
+    (splitmix64(s) >> 11) as f64 / (1u64 << 53) as f64
+}
+
+fn tpte_probe() {
+    // EXACT reproduction of quality_vs_mgcv_tensor_additive_tp_te::gam_additive_tp_plus_te_matches_mgcv
+    // s(x1,x2,bs="tp",k=10) + te(z,w,k=6), noise-free additive truth, n=500.
+    const N: usize = 500;
+    let mut state: u64 = 20260530;
+    let mut x1 = vec![];
+    let mut x2 = vec![];
+    let mut z = vec![];
+    let mut w = vec![];
+    let mut truth = vec![];
+    for _ in 0..N {
+        let a = next_unit(&mut state);
+        let b = next_unit(&mut state);
+        let c = next_unit(&mut state);
+        let d = next_unit(&mut state);
+        let f1 = (PI * a).sin() * (-b).exp();
+        let f2 = c * c * (PI * d).cos();
+        x1.push(a);
+        x2.push(b);
+        z.push(c);
+        w.push(d);
+        truth.push(f1 + f2);
+    }
+    let signal_range =
+        truth.iter().copied().fold(f64::NEG_INFINITY, f64::max) - truth.iter().copied().fold(f64::INFINITY, f64::min);
+    let headers = ["x1", "x2", "z", "w", "y"].into_iter().map(String::from).collect();
+    let rows: Vec<csv::StringRecord> = (0..N)
+        .map(|i| {
+            csv::StringRecord::from(vec![
+                format!("{:.17e}", x1[i]),
+                format!("{:.17e}", x2[i]),
+                format!("{:.17e}", z[i]),
+                format!("{:.17e}", w[i]),
+                format!("{:.17e}", truth[i]),
+            ])
+        })
+        .collect();
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode tpte");
+    let col = ds.column_map();
+    let (x1i, x2i, zi, wi) = (col["x1"], col["x2"], col["z"], col["w"]);
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ s(x1, x2, bs=\"tp\", k=10) + te(z, w, k=6)", &ds, &cfg)
+        .expect("gam tp+te fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit");
+    };
+    let mut grid = Array2::<f64>::zeros((N, ds.headers.len()));
+    for i in 0..N {
+        grid[[i, x1i]] = x1[i];
+        grid[[i, x2i]] = x2[i];
+        grid[[i, zi]] = z[i];
+        grid[[i, wi]] = w[i];
+    }
+    let design = build_term_collection_design(grid.view(), &fit.resolvedspec).expect("design");
+    let gam_fitted: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
+    let r = rmse(&gam_fitted, &truth);
+    let edf = fit.fit.edf_total().unwrap_or(f64::NAN);
+    println!(
+        "TP+TE   gam rmse_vs_truth={r:.6} ({:.3}% range)  edf={edf:.2}  lambdas={:?}",
+        100.0 * r / signal_range,
+        fit.fit.lambdas
+    );
+    println!("        mgcv baseline: rmse=0.029546 (1.247% range) edf=38.66 | bars: <2% AND <=1.37%");
+}
+
+fn sz_probe() {
+    // EXACT reproduction of quality_vs_mgcv_factor_smooth_sz::gam_factor_smooth_sz_matches_mgcv
+    // y ~ s(group, x, bs="sz"); 6 groups x 60 = 360 rows; f_g(x)=sin(2pi x)*z_g, sum z_g=0.
+    const N_GROUPS: usize = 6;
+    const PER_GROUP: usize = 60;
+    const SEED: u64 = 77;
+    const NOISE_SD: f64 = 0.2;
+    let mut rng = StdRng::seed_from_u64(SEED);
+    let ux = Uniform::new(0.0, 1.0).unwrap();
+    let znorm = Normal::new(0.0, 0.8).unwrap();
+    let epsd = Normal::new(0.0, 0.2).unwrap();
+    let mut z: Vec<f64> = (0..N_GROUPS).map(|_| znorm.sample(&mut rng)).collect();
+    let zbar: f64 = z.iter().sum::<f64>() / N_GROUPS as f64;
+    for zi in z.iter_mut() {
+        *zi -= zbar;
+    }
+    let two_pi = 2.0 * PI;
+    let n = N_GROUPS * PER_GROUP;
+    let mut group_code = vec![];
+    let mut group_str = vec![];
+    let mut x = vec![];
+    let mut y = vec![];
+    let mut truth = vec![];
+    for g in 0..N_GROUPS {
+        for _ in 0..PER_GROUP {
+            let xi = ux.sample(&mut rng);
+            let fi = (two_pi * xi).sin() * z[g];
+            let yi = fi + epsd.sample(&mut rng);
+            group_code.push(g as f64);
+            group_str.push(format!("g{g}"));
+            x.push(xi);
+            y.push(yi);
+            truth.push(fi);
+        }
+    }
+    let headers: Vec<String> = vec!["group".into(), "x".into(), "y".into()];
+    let rows: Vec<csv::StringRecord> = (0..n)
+        .map(|i| {
+            csv::StringRecord::from(vec![group_str[i].clone(), x[i].to_string(), y[i].to_string()])
+        })
+        .collect();
+    let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode sz");
+    let col = ds.column_map();
+    let (group_idx, x_idx) = (col["group"], col["x"]);
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula("y ~ s(group, x, bs=\"sz\")", &ds, &cfg).expect("gam sz fit");
+    let FitResult::Standard(fit) = result else {
+        panic!("expected standard fit");
+    };
+    let n_cols = ds.headers.len();
+    let mut train_grid = Array2::<f64>::zeros((n, n_cols));
+    for i in 0..n {
+        train_grid[[i, group_idx]] = group_code[i];
+        train_grid[[i, x_idx]] = x[i];
+    }
+    let train_design =
+        build_term_collection_design(train_grid.view(), &fit.resolvedspec).expect("rebuild sz");
+    let intercept = fit.fit.beta[train_design.intercept_range.start];
+    let gam_fitted: Vec<f64> = train_design.design.apply(&fit.fit.beta).to_vec();
+    let gam_term: Vec<f64> = gam_fitted.iter().map(|v| v - intercept).collect();
+    let r = rmse(&gam_term, &truth);
+    let edf = fit.fit.edf_total().unwrap_or(f64::NAN);
+    println!(
+        "SZ      gam rmse_vs_truth={r:.5}  edf={edf:.2}  log_lambdas={:?}",
+        fit.fit.log_lambdas
+    );
+    println!("        noise_sd bar={NOISE_SD} ; mgcv match-or-beat 1.10x (was reported ~1.23x gap)");
+}
+
 fn main() {
     init_parallelism();
     matern_probe();
     duchon_probe();
+    tpte_probe();
+    sz_probe();
 }
