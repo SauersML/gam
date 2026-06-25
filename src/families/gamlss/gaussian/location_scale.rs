@@ -14,11 +14,17 @@ pub struct GaussianLocationScaleFamily {
     /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
     /// when the family is built without an explicit policy.
     pub policy: crate::resource::ResourcePolicy,
-    /// Cached per-observation row scalars keyed by 6-element fingerprint
-    /// (first, mid, last elements of both eta vectors).
-    /// Avoids recomputing O(n) scalars K+ times per REML gradient/Hessian evaluation.
+    /// Cached per-observation row scalars keyed by the FULL `(η_μ, η_logσ)`
+    /// predictor pair the scalars were computed at. The row scalars are a
+    /// deterministic function of `(η_μ, η_logσ)` (plus the fixed `y`/`weights`),
+    /// so a hit is only valid when both eta vectors match bit-for-bit element by
+    /// element — a lossy 3-point fingerprint could collide two genuinely
+    /// different predictors and serve STALE scalars, so the key is the whole
+    /// vectors. The compare is O(n), far cheaper than the O(n) transcendental
+    /// recompute it guards, and is hit K+ times per REML gradient/Hessian
+    /// evaluation under the same predictors.
     pub cached_row_scalars:
-        std::sync::RwLock<Option<(f64, f64, f64, f64, f64, f64, Arc<GaussianJointRowScalars>)>>,
+        std::sync::RwLock<Option<(Array1<f64>, Array1<f64>, Arc<GaussianJointRowScalars>)>>,
 }
 
 impl Clone for GaussianLocationScaleFamily {
@@ -43,23 +49,24 @@ impl GaussianLocationScaleFamily {
     pub const BLOCK_MU: usize = 0;
     pub const BLOCK_LOG_SIGMA: usize = 1;
 
-    /// Cheap order-preserving fingerprint of an η vector: (first, middle, last)
-    /// element. Within one outer REML evaluation η_μ and η_logσ are the fixed
-    /// inner-converged predictors, so every exact-joint consumer
-    /// (Hessian / directional / second-directional / ψ paths) is handed the
-    /// identical pair; the fingerprint lets us recompute the O(n) transcendental
-    /// row-scalar stack (`gaussian_jointrow_scalars`: one `sigma_link` jet +
-    /// `exp`/reciprocal per row) ONCE and share an `Arc` across all of them.
-    /// An empty vector fingerprints to all-`f64::NAN`, which never compares
-    /// equal to a stored fingerprint (NaN != NaN), so the empty case always
-    /// recomputes; the underlying constructor handles n = 0.
+    /// Bit-exact equality of two η vectors as a cache key. Within one outer REML
+    /// evaluation η_μ and η_logσ are the fixed inner-converged predictors, so
+    /// every exact-joint consumer (Hessian / directional / second-directional /
+    /// ψ paths) is handed the identical pair; matching the full vectors lets us
+    /// recompute the O(n) transcendental row-scalar stack
+    /// (`gaussian_jointrow_scalars`: one `sigma_link` jet + `exp`/reciprocal per
+    /// row) ONCE and share an `Arc` across all of them — without ever serving a
+    /// stale cache hit to a different predictor. Comparison is on the raw bit
+    /// patterns so a stored entry whose key contains any `NaN` (e.g. a degenerate
+    /// predictor) never spuriously matches a fresh `NaN`-free key and vice versa,
+    /// and `±0.0` are kept distinct; the underlying constructor handles n = 0.
     #[inline]
-    fn eta_fingerprint(eta: &Array1<f64>) -> (f64, f64, f64) {
-        let n = eta.len();
-        if n == 0 {
-            return (f64::NAN, f64::NAN, f64::NAN);
-        }
-        (eta[0], eta[n / 2], eta[n - 1])
+    fn eta_keys_match(stored: &Array1<f64>, query: &Array1<f64>) -> bool {
+        stored.len() == query.len()
+            && stored
+                .iter()
+                .zip(query.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
     }
 
     pub(crate) fn get_or_compute_row_scalars(
@@ -67,20 +74,12 @@ impl GaussianLocationScaleFamily {
         etamu: &Array1<f64>,
         eta_ls: &Array1<f64>,
     ) -> Result<Arc<GaussianJointRowScalars>, String> {
-        let (m0, m1, m2) = Self::eta_fingerprint(etamu);
-        let (l0, l1, l2) = Self::eta_fingerprint(eta_ls);
-        // Fast path: fingerprint hit under a shared read lock. NaN fingerprints
-        // (empty η) never match because NaN != NaN, so they fall through and
-        // recompute.
+        // Fast path: full-key hit under a shared read lock. A cached entry is
+        // only reused when BOTH eta vectors match the query bit-for-bit, so a
+        // distinct predictor can never be served stale scalars.
         if let Ok(guard) = self.cached_row_scalars.read() {
-            if let Some((cm0, cm1, cm2, cl0, cl1, cl2, rows)) = guard.as_ref() {
-                if *cm0 == m0
-                    && *cm1 == m1
-                    && *cm2 == m2
-                    && *cl0 == l0
-                    && *cl1 == l1
-                    && *cl2 == l2
-                {
+            if let Some((cmu, cls, rows)) = guard.as_ref() {
+                if Self::eta_keys_match(cmu, etamu) && Self::eta_keys_match(cls, eta_ls) {
                     return Ok(Arc::clone(rows));
                 }
             }
@@ -96,7 +95,7 @@ impl GaussianLocationScaleFamily {
             &self.weights,
         )?);
         if let Ok(mut guard) = self.cached_row_scalars.write() {
-            *guard = Some((m0, m1, m2, l0, l1, l2, Arc::clone(&rows)));
+            *guard = Some((etamu.clone(), eta_ls.clone(), Arc::clone(&rows)));
         }
         Ok(rows)
     }

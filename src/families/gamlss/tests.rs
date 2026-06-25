@@ -6144,7 +6144,7 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
     // After the first consumer, the cache must be populated; grab the stored Arc.
     let stored = {
         let guard = family.cached_row_scalars.read().expect("lock");
-        let (_, _, _, _, _, _, rows) = guard.as_ref().expect("cache populated after first call");
+        let (_, _, rows) = guard.as_ref().expect("cache populated after first call");
         std::sync::Arc::clone(rows)
     };
     let d1 = family
