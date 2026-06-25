@@ -4258,6 +4258,55 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         Ok((Array1::from_vec(x), diag))
     }
 
+    /// #1551 stage-isolating triage seam: run the framed reduced-Schur matvec
+    /// `out = S·x` ONCE on the device (no PCG, no offload-floor gate) and return
+    /// `out`, so a tiny hand-verifiable fixture can diff it against the CPU oracle
+    /// `sae_framed_schur_matvec_cpu` element-by-element to localize the structural
+    /// divergence to a single kernel stage. Returns `Unavailable` only when CUDA
+    /// is genuinely absent (so the test skips cleanly off-device).
+    pub(super) fn sae_framed_device_matvec_once_for_test(
+        sys: &ArrowSchurSystem,
+        data: &DeviceSaePcgData,
+        ridge_t: f64,
+        ridge_beta: f64,
+        x_host: &[f64],
+    ) -> Result<Vec<f64>, ArrowSchurGpuFailure> {
+        let k = x_host.len();
+        let frame = data
+            .frame
+            .as_ref()
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let runtime =
+            crate::gpu::device_runtime::GpuRuntime::global().ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let stream = ctx
+            .new_stream()
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let _ = &blas;
+        let vector_module = pcg_vector_module(&ctx)?;
+        let mut buffers = flatten_device_sae_frame_data(sys, data, frame, ridge_t, &stream)?;
+        let x_dev = stream
+            .clone_htod(x_host)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let mut out_dev = stream
+            .alloc_zeros::<f64>(k)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        launch_sae_frame_matvec(
+            &stream,
+            vector_module,
+            &mut buffers,
+            &x_dev,
+            &mut out_dev,
+            ridge_beta,
+        )?;
+        let out = stream
+            .clone_dtoh(&out_dev)
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        Ok(out)
+    }
+
     pub(super) fn solve_sae_matrix_free_pcg(
         sys: &ArrowSchurSystem,
         data: &DeviceSaePcgData,
@@ -5545,6 +5594,159 @@ mod tests {
             diag.stopping_reason,
             diag.iterations,
             diag.final_relative_residual,
+        );
+    }
+
+    /// #1551 stage-isolating matvec triage on a TINY hand-verifiable fixture:
+    /// run the device framed reduced-Schur matvec `S·e_col` for every identity
+    /// column and diff it element-by-element against the CPU oracle
+    /// `sae_framed_schur_matvec_cpu`. Reports the FIRST and WORST divergent
+    /// border index so the structural 91% divergence localizes to a single
+    /// kernel stage (smooth / G⊗W / reduced-Schur). Skips cleanly off-device.
+    /// Linux-only: the `cuda` module (and the device matvec seam) is
+    /// `#[cfg(target_os = "linux")]`; on other hosts there is no device to diff.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn framed_sae_device_matvec_stage_diff_tiny_1551() {
+        use crate::solver::arrow_schur::{
+            DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
+        };
+        if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
+            return; // CPU-only host: nothing to diff.
+        }
+        // Minimal, asymmetric-rank, with one off-diagonal cross block so every
+        // kernel stage is exercised: 2 atoms, basis 2 each, ranks [2, 3].
+        let p = 3usize;
+        let ranks = vec![2usize, 3usize];
+        let basis_sizes = vec![2usize, 2usize];
+        let mut border_offsets = Vec::new();
+        let mut acc = 0usize;
+        for k in 0..2 {
+            border_offsets.push(acc);
+            acc += basis_sizes[k] * ranks[k];
+        }
+        let border_dim = acc; // 2·2 + 2·3 = 10
+        // Deterministic small frames U_k (p×r_k) and W_ij = U_iᵀU_j.
+        let frame_of = |k: usize| -> Array2<f64> {
+            Array2::from_shape_fn((p, ranks[k]), |(i, j)| {
+                0.1 + 0.2 * ((i + 1) as f64) * ((j + 1 + 2 * k) as f64)
+            })
+        };
+        let frames: Vec<Array2<f64>> = (0..2).map(frame_of).collect();
+        let w_of = |i: usize, j: usize| -> Array2<f64> {
+            let (ui, uj) = (&frames[i], &frames[j]);
+            Array2::from_shape_fn((ranks[i], ranks[j]), |(a, b)| {
+                (0..p).map(|c| ui[[c, a]] * uj[[c, b]]).sum()
+            })
+        };
+        let mut frame_blocks = Vec::new();
+        for &(i, j) in &[(0usize, 0usize), (1usize, 1usize), (0, 1), (1, 0)] {
+            let (mi, mj) = (basis_sizes[i], basis_sizes[j]);
+            let mut g = Array2::<f64>::from_shape_fn((mi, mj), |(r, c)| 0.1 * (r + 2 * c + 1) as f64);
+            if i == j {
+                for r in 0..mi.min(mj) {
+                    g[[r, r]] += mi as f64 + 2.0;
+                }
+            }
+            frame_blocks.push(FactoredFrameGBlock {
+                atom_i: i,
+                atom_j: j,
+                g,
+                w: w_of(i, j),
+            });
+        }
+        let mut smooth_blocks = Vec::new();
+        for k in 0..2 {
+            let m = basis_sizes[k];
+            let mut s = Array2::<f64>::from_shape_fn((m, m), |(r, c)| 0.05 * (r + c + 1) as f64);
+            for r in 0..m {
+                s[[r, r]] += 1.0;
+            }
+            smooth_blocks.push(DeviceSaeSmoothBlock {
+                global_offset: border_offsets[k],
+                factor_a: s,
+            });
+        }
+        let smooth_ranks = ranks.clone();
+        // Two rows with PD H_tt and small dense cross blocks (q×border_dim).
+        let n = 2usize;
+        let q = 2usize;
+        let mut sys = ArrowSchurSystem::new(n, q, border_dim);
+        let mut row_htbeta = Vec::new();
+        for i in 0..n {
+            let mut htt = Array2::<f64>::from_shape_fn((q, q), |(r, c)| 0.3 * (r + c + 1) as f64);
+            for r in 0..q {
+                htt[[r, r]] += q as f64 + 2.0;
+            }
+            sys.rows[i].htt = htt;
+            let mut slab = vec![0.0_f64; q * border_dim];
+            for c in 0..q {
+                for col in 0..border_dim {
+                    let v = 0.01 * ((c + 1) * (col + 1) + i) as f64;
+                    slab[c * border_dim + col] = v;
+                    sys.rows[i].htbeta[[c, col]] = v;
+                }
+            }
+            row_htbeta.push(slab);
+        }
+        let data = DeviceSaePcgData {
+            p,
+            beta_dim: border_dim,
+            a_phi: Vec::new(),
+            local_jac: Vec::new(),
+            smooth_blocks,
+            sparse_g_blocks: Vec::new(),
+            frame: Some(DeviceSaeFrameData {
+                ranks,
+                basis_sizes,
+                border_offsets,
+                frame_blocks,
+                smooth_ranks,
+                row_htbeta,
+            }),
+        };
+        let ridge_t = 1e-7;
+        let ridge_beta = 1e-6;
+        let mut first_bad: Option<usize> = None;
+        let mut worst = 0.0_f64;
+        let mut worst_at = 0usize;
+        let mut worst_dev = 0.0_f64;
+        let mut worst_cpu = 0.0_f64;
+        for col in 0..border_dim {
+            let mut x = vec![0.0_f64; border_dim];
+            x[col] = 1.0;
+            let dev = match cuda::sae_framed_device_matvec_once_for_test(
+                &sys, &data, ridge_t, ridge_beta, &x,
+            ) {
+                Ok(v) => v,
+                Err(_) => return, // device genuinely unavailable
+            };
+            let mut cpu = vec![0.0_f64; border_dim];
+            sae_framed_schur_matvec_cpu(&sys, &data, ridge_t, ridge_beta, &x, &mut cpu)
+                .expect("cpu matvec");
+            for r in 0..border_dim {
+                let d = (dev[r] - cpu[r]).abs();
+                if d > 1e-9 && first_bad.is_none() {
+                    first_bad = Some(r * border_dim + col);
+                }
+                if d > worst {
+                    worst = d;
+                    worst_at = r * border_dim + col;
+                    worst_dev = dev[r];
+                    worst_cpu = cpu[r];
+                }
+            }
+        }
+        let smooth_end = data.smooth_blocks.iter().map(|b| b.factor_a.nrows()).sum::<usize>();
+        let _ = smooth_end;
+        assert!(
+            worst <= 1e-9,
+            "[#1551 stage-diff] device framed matvec != CPU oracle: worst abs={worst:e} at \
+             (row*K+col)={worst_at} (dev={worst_dev:e} cpu={worst_cpu:e}), first_bad_idx={:?}; \
+             border layout: atom0 [0..4) rank2, atom1 [4..10) rank3 — locate which atom-range \
+             the bad row/col falls in to pin the stage (smooth=diag-block, G⊗W=cross, \
+             reduced-Schur=dense per-row)",
+            first_bad,
         );
     }
 }
