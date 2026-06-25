@@ -105,6 +105,14 @@ ad_trait = "0.3.0"
 criterion = "0.8"
 tempfile = "3.27.0"
 approx = "0.5.1"
+# The prediction engine (predict_gamwith_uncertainty, PredictUncertaintyOptions,
+# InferenceCovarianceMode, MeanIntervalMethod, ...) was peeled out of `gam` into
+# the upper-leaf `gam-predict` crate. `gam-predict` depends on `gam`, so it
+# cannot be a normal dependency, but the integration tests that exercise
+# prediction need it: a dev-dependency that points back at the owning crate is
+# the standard, cycle-free way to give the test build access to a peeled-off
+# leaf.
+gam-predict = { path = "crates/gam-predict" }
 
 [[bench]]
 name = "closed_form_pair_block"

@@ -38,7 +38,7 @@
 //! rho-marginalized `Vp` whenever the fitted smooth exposes that correction.
 
 use csv::StringRecord;
-use gam::predict::{
+use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };

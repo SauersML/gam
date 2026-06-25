@@ -38,7 +38,7 @@
 //! apples-to-apples.
 
 use csv::StringRecord;
-use gam::estimate::{
+use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };

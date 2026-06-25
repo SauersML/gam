@@ -60,7 +60,7 @@
 //! weakened to force a pass: a genuinely mis-calibrated band failing here is a
 //! real bug.
 
-use gam::estimate::{
+use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };

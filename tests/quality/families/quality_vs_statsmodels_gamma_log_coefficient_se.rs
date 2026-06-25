@@ -26,7 +26,7 @@
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
-use gam::predict::{
+use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };
