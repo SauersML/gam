@@ -73,7 +73,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 
 use crate::gpu::gpu_error::GpuError;
-use crate::linalg::pcg::pcg_core;
+use crate::linalg::pcg::{DotReduction, pcg_core};
 
 // ────────────────────────────────────────────────────────────────────────
 // Public types
@@ -750,11 +750,19 @@ where
 ///
 /// Thin wrapper over the shared [`pcg_core`] (`linalg::pcg`): unpreconditioned
 /// (all-ones Jacobi diagonal), no residual refresh (`refresh_period = 0`), and
-/// no diagnostics — exactly the serial recurrence this used to inline. On a
-/// breakdown (lost SPD near convergence, non-finite scalar) the core stops and
-/// leaves the last valid iterate in `w`, which is the historical "accept
-/// current w" behavior. The serial inner products in `pcg_core` reproduce the
-/// byte-for-byte iterates of the previous hand-rolled loop.
+/// no diagnostics. On a breakdown (lost SPD near convergence, non-finite
+/// scalar) the core stops and leaves the last valid iterate in `w`, which is
+/// the historical "accept current w" behavior.
+///
+/// Reduction: [`DotReduction::Reordered`]. This is the stochastic Hutchinson
+/// trace probe, NOT the main solve. The per-probe CG residual (`rel_tol`
+/// ≈ 1e-6) sits orders of magnitude below the estimator's own sampling SE, and
+/// the adaptive-K stopping rule budgets against that SE — so reordering the
+/// inner-product accumulation (ILP/SIMD reduction) only perturbs bits already
+/// dominated by Monte-Carlo noise. The CRN reproducibility that matters here is
+/// in the SplitMix probe RNG (`rademacher_entry`), which is untouched; we do
+/// NOT need the cross-thread bit-identity that the main SPD solve contracts
+/// for, so we trade it for add-side ILP on the hot per-iteration folds.
 fn cg_solve<F>(hvp: &mut F, b: &[f64], w: &mut [f64], rel_tol: f64, max_iters: usize)
 where
     F: FnMut(&[f64], &mut [f64]),
@@ -779,6 +787,7 @@ where
         max_iters,
         0,
         false,
+        DotReduction::Reordered,
         &mut solution,
     );
 }
