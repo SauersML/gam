@@ -10,6 +10,19 @@
 
 #define K 4
 
+// NVRTC does NOT include <math.h>/<cmath>, so the math.h constant macros
+// (M_PI, M_SQRT2, ...) are undefined here — defining them explicitly (full f64
+// values) is required or the NVRTC compile fails with "identifier M_PI is
+// undefined" and the dispatcher silently falls back to the CPU. The intrinsics
+// erfc / erfcx / exp / log / sqrt / isfinite / isnan / fmin / fmax and the
+// constants INFINITY / NAN ARE provided by NVRTC.
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#ifndef M_SQRT2
+#define M_SQRT2 1.41421356237309504880
+#endif
+
 // ---- transcendentals, bit-mirroring the Rust f64 ops ----
 // erfcx_nonnegative (src/inference/probability.rs)
 __device__ __forceinline__ double erfcx_nn(double x){
