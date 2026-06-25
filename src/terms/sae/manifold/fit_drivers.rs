@@ -238,11 +238,21 @@ impl SaeManifoldTerm {
     ) -> Result<Array1<f64>, String> {
         let n = self.n_obs();
         let mut weights = Array1::<f64>::zeros(n);
+        // #1557 — reuse a single K-sized scratch row across all N rows instead of
+        // allocating a fresh `Array1` per row. The row is consumed immediately
+        // (only `assignments[atom_idx]` is read), so reuse is alias-free.
+        let mut scratch = vec![0.0_f64; self.k_atoms()];
         for row in 0..n {
-            let assignments = match rho {
-                Some(rho) => self.assignment.try_assignments_row_for_rho(row, rho)?,
-                None => self.assignment.try_assignments_row(row)?,
+            match rho {
+                Some(rho) => self
+                    .assignment
+                    .try_assignments_row_for_rho_into(row, rho, &mut scratch)?,
+                None => {
+                    let a = self.assignment.try_assignments_row(row)?;
+                    scratch.copy_from_slice(a.as_slice().expect("contiguous assignment row"));
+                }
             };
+            let assignments = &scratch;
             let mut w = assignments[atom_idx].max(0.0);
             if let Some(row_weights) = self.row_loss_weights.as_ref() {
                 w *= row_weights[row].max(0.0);
@@ -1756,9 +1766,13 @@ impl SaeManifoldTerm {
         let residual = self.reconstruction_residual(target, rho)?;
         let dphi_deta = self.curvature_basis_eta_derivatives()?;
         // ∂fitted_i/∂η = Σ_{k'} a_ik' (dΦ_{k'}[i,:]) · B_{k'}.
+        // #1557 — reuse one K-sized scratch row across both N-loops below; each
+        // row is consumed immediately within its loop body (alias-free).
+        let mut a = vec![0.0_f64; self.k_atoms()];
         let mut dfitted = Array2::<f64>::zeros((n, p));
         for row in 0..n {
-            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -1780,7 +1794,8 @@ impl SaeManifoldTerm {
         // ∂g_β/∂η[k,μ,c] = Σ_i a_ik (dΦ_k[i,μ] r_i[c] + Φ^η_k[i,μ] dfitted_i[c]).
         let mut out = Array1::<f64>::zeros(self.beta_dim());
         for row in 0..n {
-            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -1841,9 +1856,13 @@ impl SaeManifoldTerm {
             curved_cols.push(cols);
         }
         // ∂fitted_i/∂η = Σ_{k'} a_ik' (dΦ_{k'}[i,:])·B_{k'} — identical to the β path.
+        // #1557 — reuse one K-sized scratch row across both N-loops (alias-free:
+        // each row is consumed within its loop body before the next fill).
+        let mut a = vec![0.0_f64; self.k_atoms()];
         let mut dfitted = Array2::<f64>::zeros((n, p));
         for row in 0..n {
-            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -1866,7 +1885,8 @@ impl SaeManifoldTerm {
         let mut full_buf = vec![0.0_f64; p];
         let mut curved_buf = vec![0.0_f64; p];
         for row in 0..n {
-            let a = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, &mut a)?;
             for (atom_idx, atom) in self.atoms.iter().enumerate() {
                 let a_k = a[atom_idx];
                 if a_k == 0.0 {
@@ -1917,10 +1937,18 @@ impl SaeManifoldTerm {
             return Ok(());
         }
         let mut max_mass = vec![0.0_f64; k];
+        // #1557 — reuse a single K-sized scratch row across all N rows; only
+        // `a[atom]` is read per row (alias-free reuse).
+        let mut a = vec![0.0_f64; k];
         for row in 0..n {
-            let a = match rho {
-                Some(rho) => self.assignment.try_assignments_row_for_rho(row, rho),
-                None => self.assignment.try_assignments_row(row),
+            match rho {
+                Some(rho) => self
+                    .assignment
+                    .try_assignments_row_for_rho_into(row, rho, &mut a),
+                None => self
+                    .assignment
+                    .try_assignments_row(row)
+                    .map(|row_a| a.copy_from_slice(row_a.as_slice().expect("contiguous row"))),
             }
             .map_err(|e| format!("SaeManifoldTerm::enforce_active_mass_guard: {e}"))?;
             for atom in 0..k {

@@ -3991,6 +3991,9 @@ impl SaeManifoldTerm {
             pub(crate) error_metric: Array1<f64>,
             pub(crate) jac_white: Vec<f64>,
             pub(crate) decoded_scratch: Vec<f64>,
+            // #1557 — per-worker scratch for the row assignment vector (filled via
+            // `_into`, not allocated per row); full `k_atoms`, global-atom indexed.
+            pub(crate) assignments: Array1<f64>,
         }
         // #1410: size the per-worker scratch by the COMPACT row dimensions, not
         // full `K`/`q`. With a compact layout the assembly only ever touches each
@@ -4072,6 +4075,7 @@ impl SaeManifoldTerm {
                         error_metric: Array1::<f64>::zeros(p),
                         jac_white: vec![0.0_f64; scratch_q * w_dim.max(p)],
                         decoded_scratch: vec![0.0_f64; p],
+                        assignments: Array1::<f64>::zeros(k_atoms),
                     },
                     |scratch, row| -> Result<SaeAssemblyRow, String> {
                         let RowScratch {
@@ -4083,10 +4087,14 @@ impl SaeManifoldTerm {
                             error_metric,
                             jac_white,
                             decoded_scratch,
+                            assignments,
                         } = scratch;
                         let mut gb_delta: Vec<(usize, f64)> = Vec::new();
                         let mut g_blocks: SaeGBlocks = std::collections::BTreeMap::new();
-                        let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+                        // #1557 — fill per-worker scratch (bit-identical to alloc path).
+                        let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
+                        self.assignment
+                            .try_assignments_row_for_rho_into(row, rho, a_scratch)?;
                         // Reconstruction uses the row's active support: for the dense
                         // full-support layout this is all atoms (exact); for a compact
                         // layout the dropped atoms carry negligible `O(a)` reconstruction
@@ -7492,9 +7500,12 @@ impl SaeManifoldTerm {
         let mut fitted = Array1::<f64>::zeros(p);
         let mut f_rho = Array1::<f64>::zeros(p);
         let mut residual = Array1::<f64>::zeros(p);
+        // #1557 — reuse one K-sized scratch row across all N rows (alias-free).
+        let mut assignments = vec![0.0_f64; k_atoms];
         let mut total = 0.0_f64;
         for row in 0..n {
-            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, &mut assignments)?;
             fitted.fill(0.0);
             f_rho.fill(0.0);
             for k in 0..k_atoms {
@@ -7589,19 +7600,17 @@ impl SaeManifoldTerm {
         let border_atom: Vec<usize> = border.iter().map(|c| c.atom).collect();
 
         let mut trace = 0.0_f64;
+        // #1557 — reuse one K-sized scratch row across all N rows (alias-free).
+        let mut assignments = Array1::<f64>::zeros(self.k_atoms());
         for row in 0..n {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
             let vars = self.row_vars_for_cache_row(row, cache)?;
-            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
-            let jets = self.row_jets_for_logdet(
-                rho,
-                row,
-                vars,
-                assignments.view(),
-                &second_jets,
-                &border,
-            )?;
+            let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, a_scratch)?;
+            let jets =
+                self.row_jets_for_logdet(rho, row, vars, assignments.view(), &second_jets, &border)?;
             // Atom index (k-weight) of each local t-var.
             let var_atom: Vec<usize> = jets
                 .vars
@@ -7713,8 +7722,11 @@ impl SaeManifoldTerm {
         let mut fitted = Array1::<f64>::zeros(p);
         let mut f_rho = Array1::<f64>::zeros(p);
         let mut residual = Array1::<f64>::zeros(p);
+        // #1557 — reuse one K-sized scratch row across all N rows (alias-free).
+        let mut assignments = vec![0.0_f64; k_atoms];
         for row in 0..self.n_obs() {
-            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, &mut assignments)?;
             fitted.fill(0.0);
             f_rho.fill(0.0);
             for k in 0..k_atoms {
@@ -8525,19 +8537,17 @@ impl SaeManifoldTerm {
         // (H⁻¹)_ik,ik) — the inputs to the IBP cross-row empirical-`M_k` channel.
         let mut ibp_logit_sites: Vec<(usize, usize, usize, f64)> = Vec::new();
 
+        // #1557 — reuse one K-sized scratch row across all N rows (alias-free).
+        let mut assignments = Array1::<f64>::zeros(self.k_atoms());
         for row in 0..n {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
             let vars = self.row_vars_for_cache_row(row, cache)?;
-            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
-            let jets = self.row_jets_for_logdet(
-                rho,
-                row,
-                vars,
-                assignments.view(),
-                &second_jets,
-                &border,
-            )?;
+            let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, a_scratch)?;
+            let jets =
+                self.row_jets_for_logdet(rho, row, vars, assignments.view(), &second_jets, &border)?;
 
             let mut inv_vv = Array2::<f64>::zeros((q, q));
             let mut inv_vbeta = Array2::<f64>::zeros((q, cache.k));
@@ -8838,19 +8848,17 @@ impl SaeManifoldTerm {
         let mut decoded = vec![0.0_f64; p];
         let mut fitted = Array1::<f64>::zeros(p);
         let mut error = Array1::<f64>::zeros(p);
+        // #1557 — reuse one K-sized scratch row across all N rows (alias-free).
+        let mut assignments = Array1::<f64>::zeros(self.k_atoms());
         for row in 0..n {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
             let vars = self.row_vars_for_cache_row(row, cache)?;
-            let assignments = self.assignment.try_assignments_row_for_rho(row, rho)?;
-            let jets = self.row_jets_for_logdet(
-                rho,
-                row,
-                vars,
-                assignments.view(),
-                &second_jets,
-                &border,
-            )?;
+            let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
+            self.assignment
+                .try_assignments_row_for_rho_into(row, rho, a_scratch)?;
+            let jets =
+                self.row_jets_for_logdet(rho, row, vars, assignments.view(), &second_jets, &border)?;
             let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
 
             // √w-scaled metric-applied per-row residual `error_metric = √w·M_n r_n`
@@ -8914,8 +8922,8 @@ impl SaeManifoldTerm {
                 // on `ka == kb`; the off-diagonal `H_entropy` entries come from the
                 // shared `(a, l, m)` algebra. The softmax row `a_soft` is the one
                 // irreducible `O(K)` term, computed once per row.
-                let a_soft = self.assignment.try_assignments_row_for_rho(row, rho)?;
-                let a_soft = a_soft
+                // #1557 — reuse this iteration's `assignments` (bit-identical).
+                let a_soft = assignments
                     .as_slice()
                     .expect("softmax assignments row must be contiguous");
                 let m = softmax_majorizer_log_mean(a_soft);
