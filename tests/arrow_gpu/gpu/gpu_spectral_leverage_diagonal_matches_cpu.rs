@@ -31,8 +31,19 @@ fn gpu_spectral_leverage_diagonal_matches_cpu_when_available() {
     let Some(gpu_lev) =
         gpu::linalg_dispatch::try_fast_spectral_leverage_diagonal(&design, g.view())
     else {
-        // No usable GPU (or below the dispatch floor): the CPU faer stream in
-        // `DenseSpectralOperator::xt_logdet_kernel_x_diagonal` is the only path.
+        // The fixture (2·n·p² = 1.92e8 ≥ 1e8, n = 60_000 ≥ 50_000) clears the
+        // XtDiagX dispatch floor, so with a CUDA runtime present the device path
+        // MUST engage. A `None` here therefore means the device declined a
+        // workload it was sized to run — a real device/dispatch fault, not a
+        // legitimate skip (the device-PCG skip-pass class, eee12f6b2). The old
+        // bare `return` asserted nothing and passed silently on a GPU host.
+        assert!(
+            gam::gpu::device_runtime::GpuRuntime::global().is_none(),
+            "GPU spectral-leverage diagonal declined (returned None) on a host WITH a \
+             CUDA runtime present, despite a fixture sized to clear the XtDiagX floor \
+             — a real device/dispatch fault, not a no-CUDA skip."
+        );
+        eprintln!("SKIP gpu_spectral_leverage_diagonal_matches_cpu: no CUDA runtime");
         return;
     };
 
