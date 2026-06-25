@@ -4832,23 +4832,46 @@ fn survival_score_grid_from_times<'py>(
         return Ok(Array1::from_vec(vec![0.0, 1.0]).into_pyarray(py).unbind());
     }
     times.sort_by(|a, b| a.total_cmp(b));
-    let median = if times.len() % 2 == 1 {
-        times[times.len() / 2]
-    } else {
-        0.5 * (times[times.len() / 2 - 1] + times[times.len() / 2])
-    };
-    let mut grid = vec![0.0, 1.0, 2.0, 5.0, 10.0, median];
-    grid.retain(|value| value.is_finite() && *value >= 0.0);
-    grid.sort_by(|a, b| a.total_cmp(b));
-    grid.dedup_by(|a, b| *a == *b);
-    if grid.is_empty() {
-        grid.push(0.0);
+    let max_t = *times.last().unwrap();
+    // Data-driven, quantile-spaced evaluation grid spanning [0, max(t)]. The old
+    // grid was a fixed {0,1,2,5,10,median} set whose magic constants only made
+    // sense for O(1)–O(10) survival times; on any other time scale it either ran
+    // far past the data (so an integrated Brier was dominated by an empty
+    // extrapolation tail) or never reached it. Concentrating the interior knots
+    // at empirical quantiles resolves the event-dense region well for both the
+    // survival-matrix evaluation and the integrated IPCW Brier integration.
+    const INTERIOR: usize = 24;
+    let mut grid: Vec<f64> = Vec::with_capacity(INTERIOR + 2);
+    grid.push(0.0);
+    for j in 1..=INTERIOR {
+        let p = j as f64 / (INTERIOR as f64 + 1.0);
+        grid.push(quantile_of_sorted(&times, p));
     }
+    grid.push(max_t);
+    grid.sort_by(|a, b| a.total_cmp(b));
+    // Strictly increasing: drop points that collapse onto their predecessor
+    // (heavy ties pull many quantiles to the same value).
+    grid.dedup_by(|a, b| (*a - *b).abs() <= f64::EPSILON * a.abs().max(*b).max(1.0));
     grid[0] = 0.0;
-    if grid.len() == 1 {
-        grid.push(grid[0].max(1.0));
+    if grid.len() < 2 {
+        grid = vec![0.0, max_t.max(1.0)];
     }
     Ok(Array1::from_vec(grid).into_pyarray(py).unbind())
+}
+
+/// Type-7 (NumPy default) linear-interpolation quantile of an ascending slice.
+fn quantile_of_sorted(sorted: &[f64], p: f64) -> f64 {
+    match sorted.len() {
+        0 => f64::NAN,
+        1 => sorted[0],
+        n => {
+            let h = (n as f64 - 1.0) * p.clamp(0.0, 1.0);
+            let lo = h.floor() as usize;
+            let hi = (lo + 1).min(n - 1);
+            let frac = h - lo as f64;
+            sorted[lo] + frac * (sorted[hi] - sorted[lo])
+        }
+    }
 }
 
 #[pyfunction]
@@ -5116,13 +5139,15 @@ fn survival_lifted_metrics_from_predictions<'py>(
     let out = PyDict::new(py);
     let none_result = |out: &Bound<'_, PyDict>| -> PyResult<Py<PyDict>> {
         out.set_item("brier", py.None())?;
+        out.set_item("hazard_quadratic_score", py.None())?;
         out.set_item("logloss", py.None())?;
         out.set_item("lifted_brier", py.None())?;
+        out.set_item("lifted_hazard_quadratic_score", py.None())?;
         out.set_item("lifted_logloss", py.None())?;
         out.set_item("nagelkerke_r2", py.None())?;
         Ok(out.clone().unbind())
     };
-    let obs: Vec<bool> = events.into_iter().map(|value| value > 0.5).collect();
+    let obs: Vec<bool> = events.iter().map(|value| *value > 0.5).collect();
     let mut surv = survival_matrix.as_array().to_owned();
     if event_times.len() != obs.len()
         || surv.nrows() != event_times.len()
@@ -5156,7 +5181,9 @@ fn survival_lifted_metrics_from_predictions<'py>(
         }
     }
     let mut log_losses = vec![0.0; event_times.len()];
-    let mut brier_losses = vec![0.0; event_times.len()];
+    // The "hazard quadratic" per-subject score 0.5∫h² − δ·h(T): a proper score
+    // for the hazard model, but NOT the (IPCW) Brier score — see #1563.
+    let mut hazard_quadratic_losses = vec![0.0; event_times.len()];
     for (row, &time) in event_times.iter().enumerate() {
         if !time.is_finite() || time <= 0.0 {
             return none_result(&out);
@@ -5182,13 +5209,44 @@ fn survival_lifted_metrics_from_predictions<'py>(
             )
         };
         log_losses[row] = hcum_z - if obs[row] { h_z.max(eps).ln() } else { 0.0 };
-        brier_losses[row] = 0.5 * h2_int - if obs[row] { h_z } else { 0.0 };
+        hazard_quadratic_losses[row] = 0.5 * h2_int - if obs[row] { h_z } else { 0.0 };
     }
     let logloss = log_losses.iter().sum::<f64>() / log_losses.len() as f64;
-    let brier = brier_losses.iter().sum::<f64>() / brier_losses.len() as f64;
-    out.set_item("brier", brier)?;
+    let hazard_quadratic =
+        hazard_quadratic_losses.iter().sum::<f64>() / hazard_quadratic_losses.len() as f64;
+
+    // Genuine integrated IPCW Brier score (Graf et al. 1999), comparable to
+    // scikit-survival's `integrated_brier_score`, pec, and `survival::brier`.
+    // This is what `brier` now reports; the hazard quadratic score above (which
+    // this field previously mis-reported as `brier`) is exposed honestly under
+    // `hazard_quadratic_score`. The censoring distribution G(t) is estimated by
+    // Kaplan–Meier on the evaluation set itself, so the metric is self-contained
+    // and identical for every model scored against the same fold (fair ranking).
+    // Integration is capped at the largest observed time to avoid the
+    // extrapolation tail where the IPCW weights blow up.
+    let censoring_km =
+        gam::families::survival::predict::KaplanMeier::fit_censoring(&event_times, &events);
+    let horizon = event_times
+        .iter()
+        .copied()
+        .filter(|value| value.is_finite())
+        .fold(f64::NEG_INFINITY, f64::max);
+    let ibs = gam::families::survival::predict::integrated_ipcw_brier_score(
+        surv.view(),
+        &event_times,
+        &events,
+        &grid,
+        horizon,
+        |t| censoring_km.at(t),
+    );
+    match ibs {
+        Some(value) => out.set_item("brier", value)?,
+        None => out.set_item("brier", py.None())?,
+    }
+    out.set_item("hazard_quadratic_score", hazard_quadratic)?;
     out.set_item("logloss", logloss)?;
     out.set_item("lifted_brier", py.None())?;
+    out.set_item("lifted_hazard_quadratic_score", py.None())?;
     out.set_item("lifted_logloss", py.None())?;
 
     let mut nagelkerke = None;
@@ -5221,7 +5279,7 @@ fn survival_lifted_metrics_from_predictions<'py>(
                 }
             }
             let mut null_log_losses = vec![0.0; event_times.len()];
-            let mut null_brier_losses = vec![0.0; event_times.len()];
+            let mut null_hazard_quadratic_losses = vec![0.0; event_times.len()];
             for (row, &time) in event_times.iter().enumerate() {
                 let mut j = grid.partition_point(|value| *value < time);
                 if j >= grid.len() {
@@ -5244,13 +5302,33 @@ fn survival_lifted_metrics_from_predictions<'py>(
                     )
                 };
                 null_log_losses[row] = hcum_z - if obs[row] { h_z.max(eps).ln() } else { 0.0 };
-                null_brier_losses[row] = 0.5 * h2_int - if obs[row] { h_z } else { 0.0 };
+                null_hazard_quadratic_losses[row] =
+                    0.5 * h2_int - if obs[row] { h_z } else { 0.0 };
             }
             let null_logloss = null_log_losses.iter().sum::<f64>() / null_log_losses.len() as f64;
-            let null_brier = null_brier_losses.iter().sum::<f64>() / null_brier_losses.len() as f64;
+            let null_hazard_quadratic = null_hazard_quadratic_losses.iter().sum::<f64>()
+                / null_hazard_quadratic_losses.len() as f64;
+            // `lifted_brier` is the relative IPCW-Brier skill of the model over
+            // the Kaplan–Meier null curve — consistent with `brier` now being a
+            // genuine Brier score. The hazard-quadratic relative skill (what
+            // this used to report) is preserved as `lifted_hazard_quadratic_score`.
+            let null_ibs = gam::families::survival::predict::integrated_ipcw_brier_score(
+                null_surv.view(),
+                &event_times,
+                &events,
+                &grid,
+                horizon,
+                |t| censoring_km.at(t),
+            );
+            if let (Some(model_ibs), Some(null_ibs)) = (ibs, null_ibs) {
+                out.set_item(
+                    "lifted_brier",
+                    (null_ibs - model_ibs) / null_ibs.abs().max(eps),
+                )?;
+            }
             out.set_item(
-                "lifted_brier",
-                (null_brier - brier) / null_brier.abs().max(eps),
+                "lifted_hazard_quadratic_score",
+                (null_hazard_quadratic - hazard_quadratic) / null_hazard_quadratic.abs().max(eps),
             )?;
             out.set_item(
                 "lifted_logloss",
