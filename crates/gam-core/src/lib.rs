@@ -7,17 +7,19 @@
 //! pushing the foundational, near-static types into this leaf keeps everything
 //! above it cached across the common edit.
 //!
-//! Window 1 (this crate) owns the two fully leaf-clean modules — `types` and
-//! `resource` — which between them are referenced by ~130 files in `gam` and
-//! depend on nothing upstream once their two stray edges were inlined
-//! (`LikelihoodSpec::supports_firth`'s Fisher-weight-jet classifier and a dead
-//! `PeeledHull` re-export). The `gam` crate re-exports both modules
-//! (`pub use gam_core::{types, resource};`) so every existing `crate::types::*`
-//! / `crate::resource::*` path resolves unchanged — no tree-wide rewrite.
+//! Planned contents (moved in the serializing window, held until post-#932):
+//! the contents of `gam::types`, `gam::resource`, `gam::model_types`, and the
+//! shared error enums that today force `linalg`/`gpu`/`solver`/`terms` to all
+//! reference each other through `crate::`. Moving them here breaks the
+//! `families ↔ solver ↔ terms` reference cycles by giving every layer a common
+//! upstream to name instead of naming each other.
 //!
-//! Later windows move `model_types` (after its 17 upward edges to
-//! terms/linalg/families/solver are broken) and then peel off `linalg`, `gpu`,
-//! `solver`, `terms`, `families`, and `inference` as their own crates.
+//! Until that window, this crate is intentionally minimal so the workspace
+//! skeleton lands additively without colliding with in-flight edits to the
+//! monolith.
 
-pub mod resource;
-pub mod types;
+/// Marker for the gam-core scaffold (issue #1521). Replaced by the real shared
+/// types when the maintainer declares the migration window. Present so the
+/// crate exposes a public item and compiles as a non-empty library under the
+/// workspace's `warnings = "deny"` lint.
+pub const WORKSPACE_SPLIT_PHASE: &str = "1-skeleton";

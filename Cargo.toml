@@ -41,10 +41,6 @@ resolver = "3"
 warnings = "deny"
 
 [dependencies]
-# Foundational leaf crate of the workspace split (issue #1521). Hosts `types`
-# and `resource`, which `gam` re-exports so existing `crate::types` /
-# `crate::resource` paths across the tree resolve unchanged.
-gam-core = { path = "crates/gam-core" }
 clap = { version = "4.6.1", features = ["derive"] }
 comfy-table = "7.2.2"
 rayon = "1.12.0"

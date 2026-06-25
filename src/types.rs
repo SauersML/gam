@@ -2,14 +2,11 @@ use ndarray::{Array1, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
+pub use crate::terms::geometry::PeeledHull;
+
 /// Lower floor on positive working weights shared by likelihood families and
 /// PIRLS row assembly so weighted normal equations stay numerically well posed.
-///
-/// `pub` (not `pub(crate)`) because consumers now live in the `gam` crate
-/// (`solver::pirls`) while this constant lives in the `gam-core` leaf (#1521);
-/// a crate boundary makes `pub(crate)` invisible to them, so the shared floor
-/// must be a public item of `gam-core`.
-pub const MIN_WEIGHT: f64 = 1e-12;
+pub(crate) const MIN_WEIGHT: f64 = 1e-12;
 
 /// Hyperprior placed on a coefficient group's precision / log-precision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -312,26 +309,6 @@ impl LatentCLogLogState {
         }
         Ok(Self { latent_sd })
     }
-}
-
-/// Whether the inverse link exposes the Fisher-weight jet that the Firth
-/// penalty's higher-order correction consumes. Inlined here (issue #1521) so
-/// `LikelihoodSpec::supports_firth` has no upward dependency on
-/// `solver::mixture_link` — the match is over link variants that are all
-/// defined in this module, so the predicate is self-contained. The canonical
-/// jet evaluation still lives in `solver::mixture_link`; this is purely the
-/// "does that path exist for this link" classifier.
-#[inline]
-fn inverse_link_has_fisher_weight_jet(link: &InverseLink) -> bool {
-    matches!(
-        link,
-        InverseLink::Standard(
-            StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog,
-        ) | InverseLink::LatentCLogLog(_)
-            | InverseLink::Sas(_)
-            | InverseLink::BetaLogistic(_)
-            | InverseLink::Mixture(_)
-    )
 }
 
 /// Parameterized inverse-link selector used where mu/derivatives are evaluated.
@@ -1594,7 +1571,7 @@ impl LikelihoodSpec {
     #[inline]
     pub fn supports_firth(&self) -> bool {
         matches!(self.response, ResponseFamily::Binomial)
-            && inverse_link_has_fisher_weight_jet(&self.link)
+            && crate::mixture_link::inverse_link_has_fisher_weight_jet(&self.link)
     }
 
     /// Family-level fixed-dispersion contract. Returns the dispersion parameter
