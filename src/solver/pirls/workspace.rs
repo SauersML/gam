@@ -38,6 +38,17 @@ pub struct PirlsWorkspace {
     pub hessian_buf: Array2<f64>,
     // Reusable n-length buffer for X*β matvec (avoids per-iteration allocation in update).
     pub matvec_buf: Array1<f64>,
+    // #1412: device-resident design `X` for the GPU `XᵀWX` Gram. The inner P-IRLS
+    // loop rebuilds the Gram once per Newton/LM iterate with the SAME design `X`
+    // (only the working weights `w` move), so re-uploading the full n×p `X` on
+    // every iterate starves the device on H2D staging (measured ~98% of the
+    // pipeline at <20% utilisation). This caches the device-resident `X` keyed on
+    // its host data pointer + shape, so the first Gram of an inner solve uploads
+    // `X` and every later iterate crosses only the n-vector `w` H2D and the p×p
+    // Gram D2H. `None` whenever CUDA is unavailable / the shape is below the GPU
+    // Gram threshold / the upload failed — the caller keeps its per-call path.
+    pub(crate) resident_design_gram:
+        Option<(usize, usize, usize, crate::gpu::linalg_dispatch::ResidentDesignGram)>,
 }
 
 impl PirlsWorkspace {
@@ -78,6 +89,7 @@ impl PirlsWorkspace {
             weighted_x_chunk: Array2::zeros((0, 0).f()),
             hessian_buf: Array2::zeros((0, 0).f()),
             matvec_buf: Array1::zeros(n),
+            resident_design_gram: None,
         }
     }
 

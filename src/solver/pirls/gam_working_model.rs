@@ -323,6 +323,36 @@ impl<'a> GamWorkingModel<'a> {
                     workspace.hessian_buf.fill(0.0);
                 }
                 if crate::gpu::cuda_selected() {
+                    // #1412: keep the n×p design `X` device-resident across the
+                    // inner P-IRLS iterates. The Gram is rebuilt once per
+                    // Newton/LM iterate with the SAME `X` (only `w` moves), so
+                    // re-uploading the full `X` on every iterate starves the
+                    // device on H2D staging. Cache the resident `X` keyed on its
+                    // host data pointer + shape: the first iterate uploads `X`,
+                    // every later iterate crosses only `w` (n doubles) H2D and
+                    // the p×p Gram D2H. The resident `gram` is bit-identical to
+                    // the per-call `weighted_crossprod_gpu` on the same device
+                    // (same column-major `X`, same `cublasDdgmm` row-scale, same
+                    // `gemm` reduction order). If residency declines (CUDA
+                    // unavailable / below the GPU Gram threshold / upload
+                    // failure) keep the per-call path.
+                    let key = (x_dense.as_ptr() as usize, x_dense.nrows(), p);
+                    let cache_hit = matches!(
+                        &workspace.resident_design_gram,
+                        Some((k0, k1, k2, _)) if (*k0, *k1, *k2) == key
+                    );
+                    if !cache_hit {
+                        workspace.resident_design_gram =
+                            crate::gpu::linalg_dispatch::ResidentDesignGram::try_new(
+                                x_dense.view(),
+                            )
+                            .map(|g| (key.0, key.1, key.2, g));
+                    }
+                    if let Some((_, _, _, gram)) = workspace.resident_design_gram.as_ref() {
+                        if let Some(h) = gram.gram(weights.view()) {
+                            return Ok(h);
+                        }
+                    }
                     return crate::solver::gpu::pirls_gpu::weighted_crossprod_gpu(
                         x_dense.view(),
                         weights.view(),
