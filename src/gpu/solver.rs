@@ -63,6 +63,30 @@ mod cuda {
         Ok((solved, cholesky_logdet_from_col_major(&factor_col, p)))
     }
 
+    /// fp64 log-determinant of an SPD matrix via POTRF only.
+    ///
+    /// This is [`cholesky_solve`] stripped of the triangular solve (POTRS) and
+    /// the solution download/layout conversion: the log-determinant depends
+    /// solely on the Cholesky factor's diagonal, so when a caller already holds
+    /// the solution (e.g. from fp32 + iterative refinement) and needs *only* an
+    /// accurate fp64 logdet, doing a full solve here would burn an O(p²·nrhs)
+    /// POTRS plus a host round-trip on a solution that is immediately discarded.
+    pub(super) fn cholesky_logdet(hessian: ArrayView2<'_, f64>) -> Result<f64, String> {
+        let (_, stream) = context_and_stream()?;
+        let (p, p2) = hessian.dim();
+        if p == 0 || p != p2 {
+            return Err("Cholesky logdet dimension mismatch".to_string());
+        }
+        let solver = DnHandle::new(stream.clone()).map_err(|e| format!("cusolver init: {e}"))?;
+        let h_col = to_col_major(&hessian);
+        let mut h_dev = pinned_htod(&stream, &h_col)?;
+        potrf_in_place(&solver, &stream, p, &mut h_dev)?;
+        let factor_col = stream
+            .clone_dtoh(&h_dev)
+            .map_err(|e| format!("download Cholesky factor: {e}"))?;
+        Ok(cholesky_logdet_from_col_major(&factor_col, p))
+    }
+
     pub(super) fn cholesky_lower(hessian: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
         let (_, stream) = context_and_stream()?;
         cholesky_lower_on_stream(hessian, &stream)
@@ -946,8 +970,7 @@ pub fn iterative_refinement_cholesky_solve(
                 if !need_logdet {
                     return Ok((sol, f64::NAN, Some(outcome)));
                 }
-                if let Ok(fp64_result) = cuda::cholesky_solve(hessian, rhs) {
-                    let logdet = fp64_result.1;
+                if let Ok(logdet) = cuda::cholesky_logdet(hessian) {
                     return Ok((sol, logdet, Some(outcome)));
                 }
                 // fp64 logdet failed (theoretically impossible for SPD A);
