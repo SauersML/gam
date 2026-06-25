@@ -4812,20 +4812,34 @@ mod tests {
         let max_iterations = 200usize;
         let relative_tolerance = 1.0e-12;
         let cpu = dense_pcg_cpu_reference(&s, &rhs, max_iterations, relative_tolerance);
-        let Ok((device, diag)) =
-            solve_reduced_beta_pcg_with_diagnostics(&s, &rhs, max_iterations, relative_tolerance)
-        else {
+        let (device, diag) = match solve_reduced_beta_pcg_with_diagnostics(
+            &s,
+            &rhs,
+            max_iterations,
+            relative_tolerance,
+        ) {
+            Ok(result) => result,
             // #1017 — fail loud, never skip-pass: this fixture clears the device
             // offload floor, so a CUDA device that is PRESENT yet declines/returns
             // Err means the device PCG kernel does not run on GPU (a real fault that
             // must not masquerade as a pass via this skip). Legit skip ONLY when no
-            // usable CUDA device exists (CPU CI).
-            assert!(
-                crate::gpu::device_runtime::GpuRuntime::global().is_none(),
-                "#1017: CUDA device present but the device reduced-beta PCG declined/faulted \
-                 instead of returning a result — the kernel does not run correctly on GPU"
-            );
-            return;
+            // usable CUDA device exists (CPU CI). The exact `ArrowSchurGpuFailure`
+            // variant is the diagnostic that distinguishes a dispatch-policy decline
+            // (`Unavailable`, e.g. `route_through_gpu` Gemv floor / context-init /
+            // nextest env) from a numeric guard (`SchurFactorFailed`) from a true
+            // kernel fault — so print it before the assert.
+            Err(failure) => {
+                eprintln!(
+                    "[#1551 decline-tag] device_resident_pcg: ArrowSchurGpuFailure::{failure:?}"
+                );
+                assert!(
+                    crate::gpu::device_runtime::GpuRuntime::global().is_none(),
+                    "#1017: CUDA device present but the device reduced-beta PCG \
+                     declined/faulted instead of returning a result (tag: {failure:?}) — \
+                     the kernel does not run correctly on GPU"
+                );
+                return;
+            }
         };
         let max_err = cpu
             .iter()
@@ -5433,7 +5447,7 @@ mod tests {
         let rhs: Array1<f64> =
             Array1::from_shape_fn(border_dim, |a| ((a as f64 + 1.0) * 0.17).sin());
 
-        let Ok((device, _diag)) = solve_sae_matrix_free_pcg(
+        let (device, _diag) = match solve_sae_matrix_free_pcg(
             &sys,
             &data,
             ridge_t,
@@ -5441,17 +5455,29 @@ mod tests {
             &rhs,
             400,
             1e-12,
-        ) else {
+        ) {
+            Ok(result) => result,
             // #1017 — fail loud, never skip-pass: this fixture clears the device
             // offload floor, so a CUDA device that is PRESENT yet declines means the
             // framed device PCG kernel does not run on GPU (the fault must not pass
             // silently). Legit skip ONLY when no usable CUDA device exists (CPU CI).
-            assert!(
-                crate::gpu::device_runtime::GpuRuntime::global().is_none(),
-                "#1017: CUDA device present but the framed device SAE PCG declined/faulted \
-                 instead of returning a result — the kernel does not run correctly on GPU"
-            );
-            return;
+            // Print the exact `ArrowSchurGpuFailure` variant: the framed path can
+            // decline at the `GpuRuntime::global().filter(should_offload)` admission
+            // (`Unavailable`), a per-row/Schur numeric guard (`SchurFactorFailed` /
+            // `RidgeBumpRequired`), or a `frame.is_some()` mis-route — the tag tells
+            // us which, distinguishing a dispatch/env decline from a kernel fault.
+            Err(failure) => {
+                eprintln!(
+                    "[#1551 decline-tag] framed_sae_device_pcg: ArrowSchurGpuFailure::{failure:?}"
+                );
+                assert!(
+                    crate::gpu::device_runtime::GpuRuntime::global().is_none(),
+                    "#1017: CUDA device present but the framed device SAE PCG \
+                     declined/faulted instead of returning a result (tag: {failure:?}) — \
+                     the kernel does not run correctly on GPU"
+                );
+                return;
+            }
         };
 
         // CPU dense reduced-system solve of the SAME framed system: form S via
