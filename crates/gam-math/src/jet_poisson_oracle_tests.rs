@@ -4,9 +4,9 @@
 //! every family's [`super::row_kernel::RowKernel`] derivative tower (value / ∇ /
 //! H / contracted-third / contracted-fourth) is MECHANICALLY derived from a
 //! single row-NLL expression rather than hand-written. The jet machinery itself
-//! ([`super::jet_scalar::JetScalar`] with the packed [`super::jet_scalar::Order2`]
-//! / [`super::jet_scalar::OneSeed`] / [`super::jet_scalar::TwoSeed`] scalars and
-//! the dense [`super::jet_tower::Tower4`]) already lives in the tree and the two
+//! ([`crate::jet_scalar::JetScalar`] with the packed [`crate::jet_scalar::Order2`]
+//! / [`crate::jet_scalar::OneSeed`] / [`crate::jet_scalar::TwoSeed`] scalars and
+//! the dense [`crate::jet_tower::Tower4`]) already lives in the tree and the two
 //! production `RowKernel` families (survival marginal-slope, Bernoulli rigid) are
 //! pinned against it.
 //!
@@ -50,8 +50,8 @@
 //!   ℓ(p) = μ − y·η + ln Γ(y + 1) = e^{η} − y·η + ln Γ(y + 1).
 //! ```
 
-use super::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
-use super::jet_tower::Tower4;
+use crate::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
+use crate::jet_tower::Tower4;
 
 /// One Poisson-log row fixture: the response `y` (a count, as `f64`) and the
 /// three bilinear-predictor coefficients `(a, b, d)` defining
@@ -166,12 +166,12 @@ pub fn poisson_closed_form_tower(row: &PoissonRow, p0: [f64; 2]) -> Tower4<2> {
 
 /// `ln Γ(x)` for the data-only Poisson normalizer `ln Γ(y+1)`. Reuses the SAME
 /// centralised `ln Γ` primitive the family jets draw on — the value entry
-/// (`[0]`) of [`super::jet_tower::ln_gamma_derivative_stack`], which is
+/// (`[0]`) of [`crate::jet_tower::ln_gamma_derivative_stack`], which is
 /// `statrs::function::gamma::ln_gamma` — rather than re-deriving it, per the #932
 /// instruction to reuse the shared special-function primitives.
 #[inline]
 fn ln_gamma_real(x: f64) -> f64 {
-    super::jet_tower::ln_gamma_derivative_stack(x)[0]
+    crate::jet_tower::ln_gamma_derivative_stack(x)[0]
 }
 
 /// A tiny deterministic LCG so the test points are pseudo-random yet fixed

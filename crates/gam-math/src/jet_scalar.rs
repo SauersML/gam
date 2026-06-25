@@ -1,6 +1,6 @@
 //! Order-specific Taylor-jet SCALAR algebras (#932 cutover, doc §A).
 //!
-//! [`super::jet_tower::Tower4`] carries the full value/gradient/Hessian/`t3`/`t4`
+//! [`crate::jet_tower::Tower4`] carries the full value/gradient/Hessian/`t3`/`t4`
 //! tensor stack: it answers EVERY channel a [`super::row_kernel::RowKernel`]
 //! consumer can ask for, but at `K = 9` that is a ~50 KiB per-row object whose
 //! by-value copies overflowed the stack and timed out the location-scale fit —
@@ -16,7 +16,7 @@
 //! | `row_fourth_contracted(u, v)` | `Σ_{cd} ℓ_{abcd} u_c v_d` | [`TwoSeed`] | 2.8 KiB |
 //!
 //! Each is built on [`Order2`] (value/grad/Hessian), which is the production
-//! [`super::jet_tower::Tower2`] re-expressed behind a generic interface: a row
+//! [`crate::jet_tower::Tower2`] re-expressed behind a generic interface: a row
 //! loss written ONCE against [`JetScalar`] re-instantiates at whatever order /
 //! representation a consumer needs, with the contraction folded INTO the
 //! differentiation (the nilpotent ε / δ directions), so `t3` / `t4` are never
@@ -28,9 +28,9 @@
 //!
 //! * [`Order2`] is the order-≤2 truncation of the Leibniz / Faà di Bruno rules.
 //!   Those order-2 terms read ONLY the order-≤2 channels of their inputs (see
-//!   [`super::jet_tower::Tower4::mul`]: `out.h[i][j]` never touches `t3`/`t4`),
+//!   [`crate::jet_tower::Tower4::mul`]: `out.h[i][j]` never touches `t3`/`t4`),
 //!   so its `(v, g, H)` is BIT-IDENTICAL to a full `Tower4<K>` — and identical
-//!   to [`super::jet_tower::Tower2`], over which it is a thin newtype.
+//!   to [`crate::jet_tower::Tower2`], over which it is a thin newtype.
 //! * [`OneSeed`] carries an [`Order2`] base plus one nilpotent ε (`ε² = 0`)
 //!   holding another [`Order2`]. Seeding ε with the fixed direction `u` makes the
 //!   ε-component of the Hessian channel the contracted third `Σ_c ℓ_{abc} u_c`
@@ -43,7 +43,7 @@
 //!
 //! # Stability discipline
 //!
-//! As in [`super::jet_tower`], humans own primitive stability and the algebra
+//! As in [`crate::jet_tower`], humans own primitive stability and the algebra
 //! owns combinatorics: tail-critical special functions enter ONLY as
 //! hand-certified `[f64; 5]` derivative stacks through [`JetScalar::compose_unary`]
 //! (each scalar consumes the leading entries its order needs), never by
@@ -52,22 +52,22 @@
 //! # Production scalars and the test-only all-channels oracle
 //!
 //! The `JetScalar` trait below is production: it is the bound on
-//! [`super::jet_tower::RowNllProgramGeneric::row_nll_generic`], the seam a family
+//! [`crate::jet_tower::RowNllProgramGeneric::row_nll_generic`], the seam a family
 //! row loss is written against. The order-specific scalars that *consume* it —
 //! [`Order2`] (value/grad/Hessian), [`OneSeed`] (contracted third) and
 //! [`TwoSeed`] (contracted fourth) — are production: the survival location-scale
 //! `RowKernel<9>` builds its joint Hessian / directional derivatives through them
 //! (`survival::location_scale::row_kernel`), paying only the small packed scalar
-//! per row instead of the ~50 KiB dense [`super::jet_tower::Tower4`].
+//! per row instead of the ~50 KiB dense [`crate::jet_tower::Tower4`].
 //!
-//! The [`super::jet_tower::Tower4`] all-channels `JetScalar` impl is test-only: it
+//! The [`crate::jet_tower::Tower4`] all-channels `JetScalar` impl is test-only: it
 //! is the oracle that pins the contracted scalars against the dense
 //! value/grad/Hessian/`t3`/`t4` truth, so it lives in the `#[cfg(test)]` module.
 
 /// A truncated-Taylor scalar carrying derivatives in `K` primaries.
 ///
 /// All concrete scalars here ([`Order2`], [`OneSeed`], [`TwoSeed`]) and the full
-/// [`super::jet_tower::Tower4`] implement the SAME algebra; only the carried
+/// [`crate::jet_tower::Tower4`] implement the SAME algebra; only the carried
 /// channel set differs. A row loss written once against this interface yields a
 /// different channel set per instantiation, all exact for the channel they serve
 /// (doc §A.0).
@@ -99,7 +99,7 @@ pub trait JetScalar<const K: usize>: Copy {
     /// derivative stack `d = [f(u), f′(u), f″(u), f‴(u), f⁗(u)]` at
     /// `u = self.value()`.
     ///
-    /// This is the SAME `[f64; 5]` stack shape [`super::jet_tower::Tower4`] and
+    /// This is the SAME `[f64; 5]` stack shape [`crate::jet_tower::Tower4`] and
     /// the families' `unary_derivatives_*` helpers (built on erfcx / log_ndtr)
     /// already produce, so those stacks plug in directly. Each scalar consumes
     /// only the leading entries its order needs (order-2 reads `d[0..=2]`; the
@@ -127,7 +127,7 @@ pub trait JetScalar<const K: usize>: Copy {
     }
 
     /// `ln(self)`. Caller guarantees positivity. Same derivative stack
-    /// [`super::jet_tower::Tower4::ln`] uses, so any program written over both
+    /// [`crate::jet_tower::Tower4::ln`] uses, so any program written over both
     /// matches term-for-term.
     fn ln(&self) -> Self {
         let u = self.value();
@@ -143,7 +143,7 @@ pub trait JetScalar<const K: usize>: Copy {
     }
 
     /// `self^a` for real exponent `a`. Caller guarantees a positive base.
-    /// Mirrors [`super::jet_tower::Tower4::powf`] (falling-factorial stack).
+    /// Mirrors [`crate::jet_tower::Tower4::powf`] (falling-factorial stack).
     fn powf(&self, a: f64) -> Self {
         let u = self.value();
         self.compose_unary([
@@ -156,20 +156,20 @@ pub trait JetScalar<const K: usize>: Copy {
     }
 
     /// `ln Γ(self)`. Caller guarantees a positive argument. Uses the SAME
-    /// hand-certified derivative stack [`super::jet_tower::Tower4::ln_gamma`]
-    /// consumes ([`super::jet_tower::ln_gamma_derivative_stack`]), so any
+    /// hand-certified derivative stack [`crate::jet_tower::Tower4::ln_gamma`]
+    /// consumes ([`crate::jet_tower::ln_gamma_derivative_stack`]), so any
     /// program written over both matches term-for-term.
     fn ln_gamma(&self) -> Self {
-        self.compose_unary(crate::families::jet_tower::ln_gamma_derivative_stack(
+        self.compose_unary(crate::jet_tower::ln_gamma_derivative_stack(
             self.value(),
         ))
     }
 
     /// `ψ(self) = d/dx ln Γ(x)` (digamma). Caller guarantees a positive
     /// argument. Same hand-certified stack
-    /// [`super::jet_tower::digamma_derivative_stack`].
+    /// [`crate::jet_tower::digamma_derivative_stack`].
     fn digamma(&self) -> Self {
-        self.compose_unary(crate::families::jet_tower::digamma_derivative_stack(
+        self.compose_unary(crate::jet_tower::digamma_derivative_stack(
             self.value(),
         ))
     }
@@ -220,7 +220,7 @@ impl<const K: usize> std::ops::Mul for Order2<K> {
     type Output = Self;
     #[inline]
     fn mul(self, o: Self) -> Self {
-        Order2(super::jet_tower::Tower2::mul(&self.0, &o.0))
+        Order2(crate::jet_tower::Tower2::mul(&self.0, &o.0))
     }
 }
 
@@ -282,16 +282,16 @@ pub fn filtered_implicit_solve_scalar<const K: usize, S: JetScalar<K>>(
 
 /// Truncated SECOND-order scalar: value `v`, gradient `g_a`, Hessian `H_{ab}`.
 ///
-/// This is a thin newtype over the production [`super::jet_tower::Tower2`], so
+/// This is a thin newtype over the production [`crate::jet_tower::Tower2`], so
 /// its `(v, g, H)` channels are obtained by the SAME formulas — and are
-/// therefore bit-identical to both [`super::jet_tower::Tower2`] and the order-≤2
-/// channels of a full [`super::jet_tower::Tower4`] (doc §A.1, "Bit-identity with
+/// therefore bit-identical to both [`crate::jet_tower::Tower2`] and the order-≤2
+/// channels of a full [`crate::jet_tower::Tower4`] (doc §A.1, "Bit-identity with
 /// the full tower"). The wrapper exists only to satisfy the generic
 /// [`JetScalar`] interface (the `compose_unary` / `add` / `sub` / `neg` /
 /// `recip` the trait demands, which `Tower2` does not expose by that shape) —
 /// every channel is delegated to `Tower2` arithmetic unchanged.
 #[derive(Clone, Copy, Debug)]
-pub struct Order2<const K: usize>(pub super::jet_tower::Tower2<K>);
+pub struct Order2<const K: usize>(pub crate::jet_tower::Tower2<K>);
 
 impl<const K: usize> Order2<K> {
     /// Read the gradient channel `g_a = ∂ℓ/∂p_a`.
@@ -309,10 +309,10 @@ impl<const K: usize> Order2<K> {
 
 impl<const K: usize> JetScalar<K> for Order2<K> {
     fn constant(c: f64) -> Self {
-        Order2(super::jet_tower::Tower2::constant(c))
+        Order2(crate::jet_tower::Tower2::constant(c))
     }
     fn variable(x: f64, axis: usize) -> Self {
-        Order2(super::jet_tower::Tower2::variable(x, axis))
+        Order2(crate::jet_tower::Tower2::variable(x, axis))
     }
     fn value(&self) -> f64 {
         self.0.v
@@ -326,7 +326,7 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
         Order2(self.0 + o.0.scale(-1.0))
     }
     fn mul(&self, o: &Self) -> Self {
-        Order2(super::jet_tower::Tower2::mul(&self.0, &o.0))
+        Order2(crate::jet_tower::Tower2::mul(&self.0, &o.0))
     }
     fn neg(&self) -> Self {
         Order2(self.0.scale(-1.0))
@@ -597,7 +597,7 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
 
 // ── Tower4<K>: full dense tower as a JetScalar (the all-channels scalar) ─
 
-/// The full dense [`super::jet_tower::Tower4`] is itself a [`JetScalar`]: it
+/// The full dense [`crate::jet_tower::Tower4`] is itself a [`JetScalar`]: it
 /// carries EVERY channel, so a row expression written ONCE against [`JetScalar`]
 /// can be evaluated at `Tower4` to obtain the full `(v, g, H, t3, t4)` in one
 /// pass. This is BOTH the #932 oracle ground truth the packed [`Order2`] /
@@ -609,12 +609,12 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
 /// separately hand-written jet. The packed scalars serve the consumers that
 /// need only `(v, g, H)` (`Order2`) or one / two contractions
 /// (`OneSeed` / `TwoSeed`) without paying for the dense tensors.
-impl<const K: usize> JetScalar<K> for super::jet_tower::Tower4<K> {
+impl<const K: usize> JetScalar<K> for crate::jet_tower::Tower4<K> {
     fn constant(c: f64) -> Self {
-        super::jet_tower::Tower4::constant(c)
+        crate::jet_tower::Tower4::constant(c)
     }
     fn variable(x: f64, axis: usize) -> Self {
-        super::jet_tower::Tower4::variable(x, axis)
+        crate::jet_tower::Tower4::variable(x, axis)
     }
     fn value(&self) -> f64 {
         self.v
@@ -626,23 +626,23 @@ impl<const K: usize> JetScalar<K> for super::jet_tower::Tower4<K> {
         *self - *o
     }
     fn mul(&self, o: &Self) -> Self {
-        super::jet_tower::Tower4::mul(self, o)
+        crate::jet_tower::Tower4::mul(self, o)
     }
     fn neg(&self) -> Self {
         self.scale(-1.0)
     }
     fn scale(&self, s: f64) -> Self {
-        super::jet_tower::Tower4::scale(self, s)
+        crate::jet_tower::Tower4::scale(self, s)
     }
     fn compose_unary(&self, d: [f64; 5]) -> Self {
-        super::jet_tower::Tower4::compose_unary(self, d)
+        crate::jet_tower::Tower4::compose_unary(self, d)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::jet_tower::{evaluate_program, RowNllProgram, Tower4};
+    use crate::jet_tower::{evaluate_program, RowNllProgram, Tower4};
 
     /// A small polynomial-plus-unary row expression written ONCE, generically
     /// over `S: JetScalar<2>`, so it can be evaluated against every scalar:

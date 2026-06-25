@@ -1,0 +1,17 @@
+[package]
+name = "gam-math"
+version = "0.3.123"
+edition = "2024"
+rust-version = "1.93"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+libm = "0.2.16"
+statrs = "0.18.0"
+
+[lints.rust]
+warnings = "deny"

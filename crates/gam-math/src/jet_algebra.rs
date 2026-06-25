@@ -3,11 +3,11 @@
 //! Two jet representations live in this crate and historically each carried
 //! its own hand-written copy of the same calculus:
 //!
-//! * [`super::jet_tower::Tower4`] — full dense derivative tensors
+//! * [`crate::jet_tower::Tower4`] — full dense derivative tensors
 //!   (`v`, `g`, `h`, `t3`, `t4`) in `K` primary variables, with the
 //!   Leibniz product and Faà di Bruno composition written out term-by-term
 //!   per derivative order.
-//! * [`super::jet_partitions::MultiDirJet`] — bitmask-coefficient jet over
+//! * [`crate::jet_partitions::MultiDirJet`] — bitmask-coefficient jet over
 //!   distinct seeded directions, with the same two rules written as general
 //!   submask / set-partition loops.
 //!
@@ -166,7 +166,7 @@ impl SlotBuf {
         self.len += 1;
     }
     /// Append a slot index. Public to the crate so other jet layouts (the
-    /// bitmask [`super::jet_partitions`]) can build a slot list to hand the
+    /// bitmask [`crate::jet_partitions`]) can build a slot list to hand the
     /// shared walkers.
     #[inline]
     pub(crate) fn push_slot(&mut self, v: usize) {
@@ -211,8 +211,8 @@ fn recurse(
 
 #[cfg(test)]
 mod tests {
-    use super::super::jet_partitions::MultiDirJet;
-    use super::super::jet_tower::Tower4;
+    use crate::jet_partitions::MultiDirJet;
+    use crate::jet_tower::Tower4;
 
     /// Bit-exact equivalence proof: evaluate the SAME polynomial-plus-unary
     /// composition on both jet layouts and assert every shared derivative

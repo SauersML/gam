@@ -2,7 +2,7 @@
 //! latent-survival row kernels.
 //!
 //! The layout stores one coefficient per direction mask. The calculus itself
-//! lives in [`super::jet_algebra`]: this module only maps slot lists to masks.
+//! lives in [`crate::jet_algebra`]: this module only maps slot lists to masks.
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub static COMPOSE_UNARY_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -76,7 +76,7 @@ impl MultiDirJet {
             // same submask enumeration the hand loop used — now one kernel
             // shared with `Tower4::mul` (#1151).
             let bits = bit_positions(mask);
-            *slot = super::jet_algebra::leibniz_product(
+            *slot = crate::jet_algebra::leibniz_product(
                 bits.as_slice(),
                 |t| self.coeffs[mask_of(t)],
                 |c| other.coeffs[mask_of(c)],
@@ -87,11 +87,11 @@ impl MultiDirJet {
 
     pub(crate) fn compose_unary(&self, derivs: [f64; 5]) -> Self {
         COMPOSE_UNARY_CALLS.fetch_add(1, Ordering::Relaxed);
-        <Self as super::jet_algebra::JetAlgebra<5>>::compose_unary(self, derivs)
+        <Self as crate::jet_algebra::JetAlgebra<5>>::compose_unary(self, derivs)
     }
 }
 
-impl super::jet_algebra::JetAlgebra<5> for MultiDirJet {
+impl crate::jet_algebra::JetAlgebra<5> for MultiDirJet {
     #[inline]
     fn derivative(&self, slots: &[usize]) -> f64 {
         self.coeffs[mask_of(slots)]
@@ -112,8 +112,8 @@ impl super::jet_algebra::JetAlgebra<5> for MultiDirJet {
 
 /// The set-bit positions of `mask`, low to high — the differentiation slots of
 /// that coefficient.
-fn bit_positions(mask: usize) -> super::jet_algebra::SlotBuf {
-    let mut out = super::jet_algebra::SlotBuf::new();
+fn bit_positions(mask: usize) -> crate::jet_algebra::SlotBuf {
+    let mut out = crate::jet_algebra::SlotBuf::new();
     let mut m = mask;
     while m != 0 {
         let bit = m.trailing_zeros() as usize;
