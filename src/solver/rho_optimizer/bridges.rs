@@ -2069,14 +2069,26 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
 /// Euclidean norm of the bound-PROJECTED gradient at `x` under box bounds
 /// `(lower, upper)` — the KKT residual of a box-constrained minimization.
 ///
-/// For a component sitting on its lower bound (`x_i ≤ lo_i`), a negative
-/// `g_i` would drive `x_i` further below the bound, which is infeasible; the
-/// projected gradient zeroes that out-of-feasible-set pull (`min(g_i, 0)` is
-/// the active part, so the *retained* contribution is `max(g_i, 0)`).
-/// Symmetrically at the upper bound the retained part is `min(g_i, 0)`. Interior
-/// components keep `g_i`. A point is a constrained stationary optimum iff this
-/// projected norm is ~0, matching `opt`'s `GradientTolerance{ projected: true }`
-/// exit. With no bounds this is just `‖g‖₂`.
+/// The descent direction for minimization is `-g_i`. For a component sitting on
+/// its lower bound (`x_i ≤ lo_i`) the only feasible moves are upward (`+`): a
+/// POSITIVE `g_i` asks for a downward step (`-g_i < 0`) that would drive `x_i`
+/// below the bound — infeasible — so it is a KKT multiplier and is zeroed, while
+/// a NEGATIVE `g_i` is a genuine feasible (upward) descent that must be kept; the
+/// *retained* contribution is therefore `min(g_i, 0)`. Symmetrically at the upper
+/// bound the feasible direction is downward, the infeasible pull is `g_i < 0`,
+/// and the retained part is `max(g_i, 0)`. Interior components keep `g_i`. A
+/// point is a constrained stationary optimum iff this projected norm is ~0,
+/// matching `opt`'s `GradientTolerance{ projected: true }` exit. With no bounds
+/// this is just `‖g‖₂`.
+///
+/// This matches the KKT convention used by the P-IRLS
+/// [`crate::solver::pirls::newton_solve::projected_gradient_norm`] (which drops
+/// the `g_i > 0` infeasible-multiplier at an active lower bound and keeps the
+/// `g_i < 0` feasible descent). An earlier version had both branches inverted —
+/// it zeroed the *feasible-descent* component and kept the infeasible pull — so a
+/// coordinate with a real interior descent off an active bound was reported as
+/// constrained-stationary, which let the outer cost-stall guard certify a railed
+/// optimum as converged (the #1074 quakes-trend / #1082 / #1426 railing).
 #[inline]
 pub(crate) fn projected_gradient_norm(
     x: &Array1<f64>,
@@ -2087,10 +2099,15 @@ pub(crate) fn projected_gradient_norm(
         Some((lower, upper)) => (0..gradient.len())
             .map(|i| {
                 let gi = gradient[i];
-                // Active lower bound: drop the negative (out-of-bounds) pull.
-                let gi = if x[i] <= lower[i] { gi.max(0.0) } else { gi };
-                // Active upper bound: drop the positive (out-of-bounds) pull.
-                let gi = if x[i] >= upper[i] { gi.min(0.0) } else { gi };
+                // Active lower bound: feasible moves are upward, so a positive
+                // g_i (its downward step `-g_i` exits the box) is the infeasible
+                // KKT-multiplier pull → drop it, keeping the feasible-descent
+                // negative part.
+                let gi = if x[i] <= lower[i] { gi.min(0.0) } else { gi };
+                // Active upper bound: feasible moves are downward, so a negative
+                // g_i (its upward step `-g_i` exits the box) is the infeasible
+                // pull → drop it, keeping the feasible-descent positive part.
+                let gi = if x[i] >= upper[i] { gi.max(0.0) } else { gi };
                 gi * gi
             })
             .sum::<f64>(),
@@ -2098,6 +2115,10 @@ pub(crate) fn projected_gradient_norm(
     };
     sumsq.sqrt()
 }
+
+#[cfg(test)]
+#[path = "projected_gradient_tests.rs"]
+mod projected_gradient_tests;
 
 pub(crate) const LOWER_BOUND_SEPARATION_ACTIVE_MIN: usize = 2;
 
