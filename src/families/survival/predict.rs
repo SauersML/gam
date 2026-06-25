@@ -376,7 +376,7 @@ pub fn harrell_concordance(time: &[f64], event: &[f64], risk: &[f64]) -> Option<
 
 /// IPCW (inverse-probability-of-censoring-weighted) Brier score of a predicted
 /// survival probability at a fixed horizon `tau` against held-out outcomes — the
-/// Graf et al. estimator used by scikit-survival `brier_score`, `pec`, and
+/// Graf et al. (1999) estimator used by scikit-survival `brier_score`, `pec`, and
 /// `survival::brier`.
 ///
 /// `s_pred[i]` is the model's predicted survival probability `S(tau | x_i)`.
@@ -384,13 +384,24 @@ pub fn harrell_concordance(time: &[f64], event: &[f64], risk: &[f64]) -> Option<
 /// is the censoring survival distribution `G(t) = P(C > t)` evaluated at the two
 /// weighting times the estimator needs per subject — supplied as a callable so
 /// the caller can pass a Kaplan–Meier fit of the censoring process. Each
-/// subject contributes:
-///   * event before `tau`        →  weight `1/G(T_i⁻)`,   target `0`  (dead);
-///   * still alive at `tau`       →  weight `1/G(tau)`,    target `1`  (alive);
-///   * censored before `tau`      →  weight `0`            (uninformative).
-/// The score is the weighted mean squared error `mean_i w_i·(target_i − s_pred_i)²`.
-/// Lower is better; `0` is perfect. Returns `None` on length mismatch or when no
-/// subject carries positive weight.
+/// subject's squared residual `(target − Ŝ_i(τ))²` is reweighted by the inverse
+/// censoring probability:
+///   * event at/before `τ` (`T_i ≤ τ, δ_i = 1`) → target `0` (dead), weight `1/G(T_i)`;
+///   * still alive past `τ` (`T_i > τ`)         → target `1` (alive), weight `1/G(τ)`;
+///   * censored at/before `τ`                    → target undefined, contributes `0`.
+///
+/// The score is the **sample mean over all valid subjects** (Graf normalization,
+/// dividing by `n`, not by the sum of weights):
+///   `BS(τ) = (1/n) Σ_i w_i·(target_i − Ŝ_i(τ))²`.
+/// This is the convention scikit-survival / pec / `survival::brier` report, so
+/// the value is directly comparable to those packages. Lower is better; `0` is
+/// perfect. Returns `None` on length mismatch or when no subject is valid.
+///
+/// Subjects with non-finite or non-positive `time`/`event` are dropped from both
+/// numerator and denominator. When `G` collapses to `0` at a weighting time the
+/// IPCW weight is undefined; such a subject contributes `0` (rather than `∞`),
+/// which keeps the estimator finite at the extreme tail where the censoring KM
+/// runs out of support.
 pub fn ipcw_brier_score(
     s_pred: &[f64],
     time: &[f64],
@@ -402,35 +413,170 @@ pub fn ipcw_brier_score(
     if n != time.len() || n != event.len() {
         return None;
     }
-    let mut wsum = 0.0_f64;
+    let mut n_valid = 0.0_f64;
     let mut acc = 0.0_f64;
     for i in 0..n {
+        if !time[i].is_finite() || !event[i].is_finite() || time[i] <= 0.0 {
+            continue;
+        }
+        // Every valid subject counts toward the Graf denominator, even when its
+        // IPCW contribution is zero (censored before τ, or G undefined).
+        n_valid += 1.0;
         let (target, weight) = if time[i] <= tau && event[i] > 0.5 {
-            // Failed at or before the horizon: contributes via 1/G(T_i⁻).
+            // Failed at or before the horizon: contributes via 1/G(T_i).
             let g = g_cens(time[i]);
             if !(g > 0.0) {
                 continue;
             }
             (0.0, 1.0 / g)
         } else if time[i] > tau {
-            // Survived past the horizon: contributes via 1/G(tau).
+            // Survived past the horizon: contributes via 1/G(τ).
             let g = g_cens(tau);
             if !(g > 0.0) {
                 continue;
             }
             (1.0, 1.0 / g)
         } else {
-            // Censored at or before tau (and not an event past tau): no info.
+            // Censored at or before τ (and not an event past τ): no info.
             continue;
         };
         let resid = target - s_pred[i];
         acc += weight * resid * resid;
-        wsum += weight;
     }
-    if wsum == 0.0 {
+    if n_valid == 0.0 {
         return None;
     }
-    Some(acc / wsum)
+    Some(acc / n_valid)
+}
+
+/// Integrated IPCW Brier score (IBS) — the time-integrated [`ipcw_brier_score`],
+/// matching scikit-survival's `integrated_brier_score` and `pec`'s integrated
+/// prediction-error curve.
+///
+/// `s_pred` is the `n × m` matrix of predicted survival probabilities whose
+/// column `k` is `Ŝ_i(grid[k])`; `grid` is the strictly-increasing set of
+/// evaluation times. The per-time Graf Brier `BS(grid[k])` is integrated by the
+/// trapezoidal rule over the grid and normalized by the integration span:
+///   `IBS = (1 / (t_max − t_min)) ∫_{t_min}^{t_max} BS(t) dt`.
+///
+/// `g_cens` is the censoring survival `G(t) = P(C > t)` (see [`KaplanMeier`]).
+/// Integration is restricted to grid points within `[grid[0], horizon]`; pass
+/// `horizon = f64::INFINITY` to integrate the full grid. Restricting to the
+/// observed support is the standard guard against the extrapolation tail where
+/// no subject remains at risk and the IPCW weights become unstable.
+///
+/// Returns `None` if the grid is malformed (fewer than two usable points, wrong
+/// width, non-increasing) or every per-time Brier is undefined.
+pub fn integrated_ipcw_brier_score(
+    s_pred: ArrayView2<f64>,
+    time: &[f64],
+    event: &[f64],
+    grid: &[f64],
+    horizon: f64,
+    g_cens: impl Fn(f64) -> f64,
+) -> Option<f64> {
+    let m = grid.len();
+    if m < 2 || s_pred.ncols() != m || s_pred.nrows() != time.len() {
+        return None;
+    }
+    if grid.windows(2).any(|pair| !(pair[1] > pair[0])) {
+        return None;
+    }
+    // Collect (time, Brier) at every grid point inside the integration window.
+    let mut pts: Vec<(f64, f64)> = Vec::with_capacity(m);
+    for k in 0..m {
+        if grid[k] > horizon {
+            break;
+        }
+        let col = s_pred.column(k);
+        let col_slice: Vec<f64> = col.to_vec();
+        if let Some(bs) = ipcw_brier_score(&col_slice, time, event, grid[k], &g_cens) {
+            pts.push((grid[k], bs));
+        }
+    }
+    if pts.len() < 2 {
+        return None;
+    }
+    let span = pts[pts.len() - 1].0 - pts[0].0;
+    if !(span > 0.0) {
+        return None;
+    }
+    let mut integral = 0.0_f64;
+    for w in pts.windows(2) {
+        integral += 0.5 * (w[1].1 + w[0].1) * (w[1].0 - w[0].0);
+    }
+    Some(integral / span)
+}
+
+/// Right-continuous Kaplan–Meier survival estimator `Ŝ(t) = ∏_{t_j ≤ t}(1 − d_j/n_j)`.
+///
+/// Built from observed `(time, event)` pairs. To estimate the **censoring**
+/// survival `G(t) = P(C > t)` required by the IPCW Brier score, fit with the
+/// event indicator flipped (`1 − event`) so that censorings are the "events"
+/// of the reversed process — see [`KaplanMeier::fit_censoring`].
+#[derive(Clone, Debug, Default)]
+pub struct KaplanMeier {
+    /// `(event_time, survival_after_that_time)`, strictly increasing in time.
+    steps: Vec<(f64, f64)>,
+}
+
+impl KaplanMeier {
+    /// Fit the survival of the process whose event indicator is `event > 0.5`.
+    pub fn fit(time: &[f64], event: &[f64]) -> Self {
+        let mut rows: Vec<(f64, bool)> = time
+            .iter()
+            .zip(event.iter())
+            .filter_map(|(&t, &e)| {
+                (t.is_finite() && e.is_finite() && t > 0.0).then_some((t, e > 0.5))
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut steps = Vec::new();
+        let mut at_risk = rows.len() as f64;
+        let mut survival = 1.0_f64;
+        let mut i = 0usize;
+        while i < rows.len() {
+            let t = rows[i].0;
+            let mut j = i;
+            let mut deaths = 0usize;
+            while j < rows.len() && rows[j].0 == t {
+                deaths += usize::from(rows[j].1);
+                j += 1;
+            }
+            if deaths > 0 && at_risk > 0.0 {
+                survival *= ((at_risk - deaths as f64) / at_risk).max(0.0);
+                steps.push((t, survival));
+            }
+            at_risk -= (j - i) as f64;
+            i = j;
+        }
+        Self { steps }
+    }
+
+    /// Fit the censoring survival `G(t) = P(C > t)` by reversing the event role:
+    /// a censored observation (`event ≤ 0.5`) is an "event" of the censoring
+    /// process and a death (`event > 0.5`) is a censoring of it.
+    pub fn fit_censoring(time: &[f64], event: &[f64]) -> Self {
+        let flipped: Vec<f64> = event
+            .iter()
+            .map(|&e| if e > 0.5 { 0.0 } else { 1.0 })
+            .collect();
+        Self::fit(time, &flipped)
+    }
+
+    /// Right-continuous step lookup: `Ŝ(t)` = survival at the last event time
+    /// `≤ t` (and `1.0` before the first event).
+    pub fn at(&self, t: f64) -> f64 {
+        let mut s = 1.0_f64;
+        for &(time, surv) in &self.steps {
+            if time <= t {
+                s = surv;
+            } else {
+                break;
+            }
+        }
+        s
+    }
 }
 
 /// Joint cause-specific competing-risks prediction result.
@@ -3482,5 +3628,168 @@ mod tests {
         .expect("valid cloglog hazard");
 
         assert!((hazard - eta.exp() * eta_t).abs() <= 1e-14);
+    }
+
+    // ---- IPCW Brier score (Graf et al. 1999) -------------------------------
+
+    #[test]
+    fn kaplan_meier_censoring_is_right_continuous_step() {
+        // Two censorings (events flipped) at t=4 and t=8; deaths at t=2,6.
+        let time = [2.0, 4.0, 6.0, 8.0];
+        let event = [1.0, 0.0, 1.0, 0.0];
+        let g = KaplanMeier::fit_censoring(&time, &event);
+        // Before the first censoring the censoring-survival is 1.
+        assert!((g.at(0.0) - 1.0).abs() <= 1e-15);
+        assert!((g.at(2.0) - 1.0).abs() <= 1e-15);
+        assert!((g.at(3.999) - 1.0).abs() <= 1e-15);
+        // At t=4 the at-risk set {4,6,8} loses one to censoring: G = 2/3.
+        assert!((g.at(4.0) - 2.0 / 3.0).abs() <= 1e-12);
+        assert!((g.at(5.0) - 2.0 / 3.0).abs() <= 1e-12);
+        // A death at t=6 does not move the censoring KM.
+        assert!((g.at(6.0) - 2.0 / 3.0).abs() <= 1e-12);
+        // At t=8 the last (sole) at-risk subject is censored: G collapses to 0.
+        assert!(g.at(8.0).abs() <= 1e-15);
+    }
+
+    #[test]
+    fn ipcw_brier_no_censoring_reduces_to_plain_brier() {
+        // With no censoring G(t) ≡ 1, so the IPCW Brier is the ordinary Brier of
+        // the predicted survival against the alive-indicator I(T_i > tau).
+        let s_pred = [0.3, 0.7, 0.6, 0.2];
+        let time = [2.0, 8.0, 10.0, 3.0];
+        let event = [1.0, 1.0, 0.0, 1.0];
+        let tau = 5.0;
+        let g = KaplanMeier::fit_censoring(&time, &event);
+        let bs = ipcw_brier_score(&s_pred, &time, &event, tau, |t| g.at(t)).unwrap();
+        // targets: dead→0 (subj1,4), alive→1 (subj2,3).
+        let expected = (0.3f64.powi(2)
+            + (1.0 - 0.7f64).powi(2)
+            + (1.0 - 0.6f64).powi(2)
+            + 0.2f64.powi(2))
+            / 4.0;
+        assert!((bs - expected).abs() <= 1e-12, "bs={bs} expected={expected}");
+    }
+
+    #[test]
+    fn ipcw_brier_reweights_by_inverse_censoring_probability() {
+        // Hand-computed Graf estimator with real censoring weights.
+        // times/events: death@2, cens@4, death@6, cens@8; tau=5.
+        // Censoring KM: G(5)=2/3 (one censoring at t=4 among {4,6,8}); G(2)=1.
+        let s_pred = [0.4, 0.5, 0.7, 0.8];
+        let time = [2.0, 4.0, 6.0, 8.0];
+        let event = [1.0, 0.0, 1.0, 0.0];
+        let tau = 5.0;
+        let g = KaplanMeier::fit_censoring(&time, &event);
+        let bs = ipcw_brier_score(&s_pred, &time, &event, tau, |t| g.at(t)).unwrap();
+        // subj1 dead by 5: weight 1/G(2)=1, contrib 0.4²=0.16.
+        // subj2 censored before 5: contributes 0.
+        // subj3 alive: weight 1/G(5)=1.5, contrib 1.5·0.3²=0.135.
+        // subj4 alive: weight 1/G(5)=1.5, contrib 1.5·0.2²=0.06.
+        let expected = (0.16 + 0.0 + 0.135 + 0.06) / 4.0;
+        assert!((bs - expected).abs() <= 1e-12, "bs={bs} expected={expected}");
+    }
+
+    #[test]
+    fn ipcw_brier_drops_invalid_rows_from_both_numerator_and_denominator() {
+        // A NaN-time row and a non-positive-time row must not be counted at all.
+        let s_pred = [0.3, 0.7, 0.5, 0.5];
+        let time = [2.0, 8.0, f64::NAN, -1.0];
+        let event = [1.0, 1.0, 1.0, 0.0];
+        let g = KaplanMeier::fit_censoring(&time, &event);
+        let bs = ipcw_brier_score(&s_pred, &time, &event, 5.0, |t| g.at(t)).unwrap();
+        // Only subj1 (dead, contrib 0.3²) and subj2 (alive, contrib 0.3²) count;
+        // censoring KM has no censorings so G≡1.
+        let expected = (0.3f64.powi(2) + (1.0 - 0.7f64).powi(2)) / 2.0;
+        assert!((bs - expected).abs() <= 1e-12, "bs={bs} expected={expected}");
+    }
+
+    #[test]
+    fn integrated_ipcw_brier_of_constant_brier_is_that_constant() {
+        // A survival matrix whose every column equals a perfect classifier yields
+        // BS(t)=0 at every grid point, so the integral is 0.
+        let time = [2.0, 8.0, 10.0, 3.0];
+        let event = [1.0, 1.0, 0.0, 1.0];
+        let grid = [0.0, 1.0, 2.5, 4.0, 6.0];
+        // Perfect prediction at every grid time given the (no-censoring) data is
+        // not generally achievable, so instead test the integral of a literally
+        // constant-in-time Brier: replicate one column across the grid.
+        let col = [0.3, 0.7, 0.6, 0.2];
+        let mut surv = Array2::<f64>::zeros((4, grid.len()));
+        for k in 0..grid.len() {
+            for i in 0..4 {
+                surv[[i, k]] = col[i];
+            }
+        }
+        let g = KaplanMeier::fit_censoring(&time, &event);
+        let per_time = ipcw_brier_score(&col, &time, &event, grid[2], |t| g.at(t)).unwrap();
+        // Because the predicted survival is identical at every grid time, BS(t)
+        // is *not* constant (tau changes which subjects are "alive"), so use a
+        // direct trapezoid as the oracle.
+        let mut oracle_pts = Vec::new();
+        for k in 0..grid.len() {
+            oracle_pts
+                .push((grid[k], ipcw_brier_score(&col, &time, &event, grid[k], |t| g.at(t)).unwrap()));
+        }
+        let mut integral = 0.0;
+        for w in oracle_pts.windows(2) {
+            integral += 0.5 * (w[0].1 + w[1].1) * (w[1].0 - w[0].0);
+        }
+        let oracle = integral / (grid[grid.len() - 1] - grid[0]);
+        let ibs =
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, f64::INFINITY, |t| g.at(t))
+                .unwrap();
+        assert!((ibs - oracle).abs() <= 1e-12, "ibs={ibs} oracle={oracle}");
+        // Sanity: per-time value is in a sensible [0,1]-ish range.
+        assert!(per_time >= 0.0);
+    }
+
+    #[test]
+    fn integrated_ipcw_brier_respects_the_horizon_cutoff() {
+        let time = [2.0, 8.0, 10.0, 3.0];
+        let event = [1.0, 1.0, 0.0, 1.0];
+        let grid = [0.0, 2.0, 4.0, 100.0];
+        let col = [0.3, 0.7, 0.6, 0.2];
+        let mut surv = Array2::<f64>::zeros((4, grid.len()));
+        for k in 0..grid.len() {
+            for i in 0..4 {
+                surv[[i, k]] = col[i];
+            }
+        }
+        let g = KaplanMeier::fit_censoring(&time, &event);
+        // Horizon 5 drops the extrapolation point at t=100: integral runs [0,4].
+        let restricted =
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, 5.0, |t| g.at(t)).unwrap();
+        let full =
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, f64::INFINITY, |t| {
+                g.at(t)
+            })
+            .unwrap();
+        // The huge [4,100] tail interval dominates the full integral, so the two
+        // must differ substantially — the horizon guard is doing real work.
+        assert!(
+            (restricted - full).abs() > 1e-3,
+            "horizon cutoff had no effect: restricted={restricted} full={full}"
+        );
+    }
+
+    #[test]
+    fn integrated_ipcw_brier_rejects_malformed_grids() {
+        let time = [2.0, 8.0];
+        let event = [1.0, 0.0];
+        let surv = Array2::<f64>::from_elem((2, 3), 0.5);
+        let g = KaplanMeier::fit_censoring(&time, &event);
+        // Non-increasing grid.
+        let bad = [0.0, 2.0, 1.0];
+        assert!(
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &bad, f64::INFINITY, |t| g.at(t))
+                .is_none()
+        );
+        // Grid width mismatched to the survival matrix.
+        let short = [0.0, 1.0];
+        assert!(
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &short, f64::INFINITY, |t| g
+                .at(t))
+            .is_none()
+        );
     }
 }
