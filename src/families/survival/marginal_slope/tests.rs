@@ -4433,6 +4433,199 @@ fn flex_timewiggle_fast_gradient_matches_dense_joint_gradient() {
     }
 }
 
+/// #932 genus / sibling-of-flex-Hessian witness: the survival marginal-slope
+/// dynamic-q JOINT Hessian is a HAND-assembled chain-rule pullback of the
+/// per-row primary (4×4) Hessian through the `dq`/`d2q` time-wiggle geometry
+/// (`accumulate_dynamic_q_core_hessian` + `row_dynamic_q_geometry_into`). The
+/// flex primary-Hessian bug (a dropped/mis-signed 2nd-order coupling that
+/// shipped because its FD oracle was committed UNRUN) proved that an
+/// unvalidated bespoke pullback can be silently wrong. The ONLY pre-existing
+/// joint-Hessian test here checks `blockwise == joint-dense` — both sides share
+/// THIS pullback, so it cannot catch a wrong pullback. This oracle closes that
+/// gap directly: it central-differences the full joint GRADIENT and compares to
+/// the analytic joint HESSIAN on the TIME-WIGGLE-active path (the only path
+/// where `q` is nonlinear in the coefficients, hence the only path with a
+/// nontrivial `d2q` that a hand-derivation can get wrong). A real wrong
+/// derivative is h-independent and orders above the FD floor; FD truncation
+/// shrinks with h.
+#[test]
+fn timewiggle_joint_hessian_matches_central_fd_of_joint_gradient() {
+    let score_runtime = test_deviation_runtime();
+    let link_runtime = test_deviation_runtime();
+    let marginal_design = array![[0.7, -0.2]];
+    let marginal_beta = array![0.35, -0.1];
+    let logslope_design = array![[1.0]];
+    let logslope_beta = array![0.2];
+    let (time_wiggle_knots, time_wiggle_degree, time_wiggle_ncols) = standard_test_time_wiggle();
+    let family = SurvivalMarginalSlopeFamily {
+        n: 1,
+        event: Arc::new(array![1.0]),
+        weights: Arc::new(array![1.0]),
+        z: Arc::new(array![0.15].insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: None,
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(array![[0.4, -0.1, 0.2, 0.0, 0.0]]),
+        design_exit: DesignMatrix::from(array![[0.6, 0.3, -0.15, 0.0, 0.0]]),
+        design_derivative_exit: DesignMatrix::from(array![[1.0, 0.2, -0.1, 0.0, 0.0]]),
+        offset_entry: Arc::new(array![0.05]),
+        offset_exit: Arc::new(array![0.15]),
+        derivative_offset_exit: Arc::new(array![0.9]),
+        marginal_design: DesignMatrix::from(marginal_design.clone()),
+        logslope_design: DesignMatrix::from(logslope_design.clone()),
+        logslope_surface_ranges: empty_logslope_surface_ranges(),
+        score_warp: Some(score_runtime.clone()),
+        link_dev: Some(link_runtime.clone()),
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: Some(time_wiggle_knots),
+        time_wiggle_degree: Some(time_wiggle_degree),
+        time_wiggle_ncols,
+        intercept_warm_starts: None,
+        auto_subsample_phase_counter: Arc::new(AtomicUsize::new(0)),
+        auto_subsample_last_rho: Arc::new(Mutex::new(None)),
+    };
+    assert!(
+        family.flex_timewiggle_active(),
+        "fixture must engage the nonlinear time-wiggle q geometry"
+    );
+
+    // Base block states. Per-block coefficient consumption (verified against the
+    // geometry / dense entry): the TIME block (0) feeds `q` through its design
+    // directly (its `eta` is unused); the MARGINAL (1) and LOGSLOPE (2) blocks
+    // feed through their `eta = design·beta`; the SCORE-WARP (3) and LINK-DEV
+    // (4) deviation blocks feed through their `beta` directly. A faithful
+    // perturbation therefore rebuilds `eta = design·beta` for blocks 1 and 2.
+    let base_states = vec![
+        ParameterBlockState {
+            beta: array![0.0, 0.08, -0.03, 0.02, -0.01],
+            eta: array![0.0],
+        },
+        ParameterBlockState {
+            beta: marginal_beta.clone(),
+            eta: marginal_design.dot(&marginal_beta),
+        },
+        ParameterBlockState {
+            beta: logslope_beta.clone(),
+            eta: logslope_design.dot(&logslope_beta),
+        },
+        ParameterBlockState {
+            // score-warp block width is `basis_dim * score_dim`; with a
+            // single score column here that is `basis_dim`. Seed it with a
+            // small smoothly-varying nonzero so the deviation block carries
+            // genuine curvature into the joint Hessian.
+            beta: Array1::from_iter(
+                (0..score_runtime.basis_dim() * family.score_dim())
+                    .map(|j| 0.03 * (-0.4_f64).powi(j as i32)),
+            ),
+            eta: Array1::zeros(1),
+        },
+        ParameterBlockState {
+            beta: Array1::from_iter(
+                (0..link_runtime.basis_dim()).map(|j| -0.02 * (0.5_f64).powi(j as i32)),
+            ),
+            eta: Array1::zeros(1),
+        },
+    ];
+    assert_eq!(
+        base_states[3].beta.len(),
+        score_runtime.basis_dim() * family.score_dim()
+    );
+    assert_eq!(base_states[4].beta.len(), link_runtime.basis_dim());
+
+    let slices = block_slices(&family, &base_states);
+    let p_total = slices.total;
+
+    // Rebuild block states from a flat coefficient vector, keeping each block's
+    // `eta` consistent with its `beta` exactly as the production solver does.
+    let states_from_flat = |flat: &Array1<f64>| -> Vec<ParameterBlockState> {
+        let mut states = base_states.clone();
+        states[0].beta = flat.slice(s![slices.time.clone()]).to_owned();
+        states[1].beta = flat.slice(s![slices.marginal.clone()]).to_owned();
+        states[1].eta = marginal_design.dot(&states[1].beta);
+        states[2].beta = flat.slice(s![slices.logslope.clone()]).to_owned();
+        states[2].eta = logslope_design.dot(&states[2].beta);
+        if let Some(range) = slices.score_warp.clone() {
+            states[3].beta = flat.slice(s![range]).to_owned();
+        }
+        if let Some(range) = slices.link_dev.clone() {
+            let block_index = 3 + usize::from(family.score_warp.is_some());
+            states[block_index].beta = flat.slice(s![range]).to_owned();
+        }
+        states
+    };
+
+    // Flatten the base states into the joint coefficient layout.
+    let mut base_flat = Array1::<f64>::zeros(p_total);
+    base_flat
+        .slice_mut(s![slices.time.clone()])
+        .assign(&base_states[0].beta);
+    base_flat
+        .slice_mut(s![slices.marginal.clone()])
+        .assign(&base_states[1].beta);
+    base_flat
+        .slice_mut(s![slices.logslope.clone()])
+        .assign(&base_states[2].beta);
+    if let Some(range) = slices.score_warp.clone() {
+        base_flat.slice_mut(s![range]).assign(&base_states[3].beta);
+    }
+    if let Some(range) = slices.link_dev.clone() {
+        let block_index = 3 + usize::from(family.score_warp.is_some());
+        base_flat
+            .slice_mut(s![range])
+            .assign(&base_states[block_index].beta);
+    }
+
+    let joint_gradient_at = |flat: &Array1<f64>| -> Array1<f64> {
+        let states = states_from_flat(flat);
+        let (_ll, grad) = family
+            .evaluate_exact_newton_joint_gradient_dynamic_q(&states)
+            .expect("perturbed joint gradient");
+        grad
+    };
+
+    let (_ll, _grad, analytic_hessian) = family
+        .evaluate_exact_newton_joint_dynamic_q_dense(&base_states)
+        .expect("analytic joint dense gradient + hessian");
+    assert_eq!(analytic_hessian.shape(), &[p_total, p_total]);
+
+    // Central-difference step. The joint gradient is smooth in every joint
+    // coefficient; 1e-5 balances O(h^2) truncation against the FP cancellation
+    // floor of the per-perturbation primary intercept re-solve.
+    let h = 1e-5;
+    let mut max_rel = 0.0_f64;
+    let mut worst = (0usize, 0usize, 0.0_f64, 0.0_f64);
+    for u in 0..p_total {
+        let mut plus = base_flat.clone();
+        plus[u] += h;
+        let mut minus = base_flat.clone();
+        minus[u] -= h;
+        let grad_plus = joint_gradient_at(&plus);
+        let grad_minus = joint_gradient_at(&minus);
+        for v in 0..p_total {
+            let fd = (grad_plus[v] - grad_minus[v]) / (2.0 * h);
+            let analytic = analytic_hessian[[v, u]];
+            let denom = 1.0 + analytic.abs().max(fd.abs());
+            let rel = (analytic - fd).abs() / denom;
+            if rel > max_rel {
+                max_rel = rel;
+                worst = (v, u, analytic, fd);
+            }
+        }
+    }
+
+    assert!(
+        max_rel <= 1e-6,
+        "timewiggle joint Hessian disagrees with central FD of the joint gradient: \
+         worst entry H[{}][{}] = {:.6e} vs FD {:.6e} (rel {max_rel:.3e}); a chain-rule \
+         pullback term (dq/d2q) is dropped or mis-signed",
+        worst.0,
+        worst.1,
+        worst.2,
+        worst.3,
+    );
+}
+
 #[test]
 fn row_dynamic_q_geometry_into_pooled_matches_fresh_allocation_bitwise() {
     // Regression: `row_dynamic_q_geometry_into` reuses a caller-owned
