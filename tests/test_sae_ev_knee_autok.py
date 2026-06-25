@@ -71,11 +71,24 @@ def test_wager_confirmed_when_manifold_ties_linear_at_lower_k():
 
 def test_wager_refuted_honestly_when_manifold_never_reaches_linear():
     # Manifold tops out below the linear ceiling — the wager loses measurably.
+    #
+    # The advantage is adjudicated at the EV the auto-K choice actually reaches
+    # (recommend_auto_k: target_ev = selection.ev, the manifold's own knee EV),
+    # NOT at the linear ceiling. So the manifold always reaches its own operating
+    # EV (manifold_k is a real K, here at most len(manifold)); refutation shows up
+    # as no compression — manifold_k is not strictly below linear_k — so confirmed
+    # is False, and the residual ev_gap to the linear ceiling is positive.
     manifold = {1: 0.40, 2: 0.55, 3: 0.58}
     linear = {2: 0.60, 4: 0.75, 8: 0.85}
     v = wager_verdict(manifold, linear)
     assert v["confirmed"] is False
-    assert v["manifold_k"] is None
+    # The manifold reaches its own knee EV at some K; the wager is refused
+    # because that buys no parameter-efficiency over linear (manifold_k >= linear_k).
+    assert v["manifold_k"] is not None
+    assert v["linear_k"] is not None
+    assert v["manifold_k"] >= v["linear_k"]
+    assert v["efficiency_ratio"] is None or v["efficiency_ratio"] <= 1.0
+    # The wager loses measurably: the linear ceiling sits above the manifold's best.
     assert v["ev_gap"] == pytest.approx(0.85 - 0.58)
 
 
