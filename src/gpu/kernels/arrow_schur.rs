@@ -4264,47 +4264,58 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
     /// `sae_framed_schur_matvec_cpu` element-by-element to localize the structural
     /// divergence to a single kernel stage. Returns `Unavailable` only when CUDA
     /// is genuinely absent (so the test skips cleanly off-device).
-    pub(super) fn sae_framed_device_matvec_once_for_test(
-        sys: &ArrowSchurSystem,
-        data: &DeviceSaePcgData,
-        ridge_t: f64,
-        ridge_beta: f64,
-        x_host: &[f64],
-    ) -> Result<Vec<f64>, ArrowSchurGpuFailure> {
-        let k = x_host.len();
-        let frame = data
-            .frame
-            .as_ref()
-            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let runtime =
-            crate::gpu::device_runtime::GpuRuntime::global().ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
-            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        let stream = ctx
-            .new_stream()
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        let _ = &blas;
-        let vector_module = pcg_vector_module(&ctx)?;
-        let mut buffers = flatten_device_sae_frame_data(sys, data, frame, ridge_t, &stream)?;
-        let x_dev = stream
-            .clone_htod(x_host)
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        let mut out_dev = stream
-            .alloc_zeros::<f64>(k)
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        launch_sae_frame_matvec(
-            &stream,
-            vector_module,
-            &mut buffers,
-            &x_dev,
-            &mut out_dev,
-            ridge_beta,
-        )?;
-        let out = stream
-            .clone_dtoh(&out_dev)
-            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
-        Ok(out)
+    #[cfg(test)]
+    pub(super) mod stage_diff_test_support {
+        //! #1551 test-only seam: the ban-scanner forbids `#[cfg(test)]` on an
+        //! individual `src/` item and forbids a non-test item referenced only by
+        //! tests, but explicitly permits a `#[cfg(test)] mod`. So the device
+        //! single-shot framed matvec used by the stage-diff parity test lives
+        //! here, where it can reach this module's private kernel launchers.
+        use super::*;
+
+        /// Run the framed reduced-Schur matvec `out = S·x` ONCE on the device
+        /// (no PCG, no offload gate) and return `out`, so a tiny hand-verifiable
+        /// fixture can diff it against the CPU oracle element-by-element.
+        pub fn sae_framed_device_matvec_once(
+            sys: &ArrowSchurSystem,
+            data: &DeviceSaePcgData,
+            ridge_t: f64,
+            ridge_beta: f64,
+            x_host: &[f64],
+        ) -> Result<Vec<f64>, ArrowSchurGpuFailure> {
+            let k = x_host.len();
+            let frame = data
+                .frame
+                .as_ref()
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            let runtime = crate::gpu::device_runtime::GpuRuntime::global()
+                .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            let ctx =
+                crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
+                    .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+            let stream = ctx
+                .new_stream()
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let vector_module = pcg_vector_module(&ctx)?;
+            let mut buffers = flatten_device_sae_frame_data(sys, data, frame, ridge_t, &stream)?;
+            let x_dev = stream
+                .clone_htod(x_host)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            let mut out_dev = stream
+                .alloc_zeros::<f64>(k)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+            launch_sae_frame_matvec(
+                &stream,
+                vector_module,
+                &mut buffers,
+                &x_dev,
+                &mut out_dev,
+                ridge_beta,
+            )?;
+            stream
+                .clone_dtoh(&out_dev)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)
+        }
     }
 
     pub(super) fn solve_sae_matrix_free_pcg(
@@ -5715,7 +5726,7 @@ mod tests {
         for col in 0..border_dim {
             let mut x = vec![0.0_f64; border_dim];
             x[col] = 1.0;
-            let dev = match cuda::sae_framed_device_matvec_once_for_test(
+            let dev = match cuda::stage_diff_test_support::sae_framed_device_matvec_once(
                 &sys, &data, ridge_t, ridge_beta, &x,
             ) {
                 Ok(v) => v,

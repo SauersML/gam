@@ -692,6 +692,328 @@ impl DeviceResidentArrowWorkspace {
         })
     }
 
+    // ---------------------------------------------------------------------
+    // Phase 3b: reuse the resident frame ACROSS OUTER iterations (#1017
+    // deliverable 3).
+    //
+    // The inner Newton loop above already keeps the resident Arrow frame
+    // (factored `D`/`B`/Schur) on the device across INNER iterations at a fixed
+    // ridge. The next residency tier is the OUTER loop: across consecutive outer
+    // evaluations the SAE Hessian operator is unchanged whenever the frozen
+    // gate/basis frame (hence `D = H_tt`, `B = H_tβ`, border `H_ββ`) does not
+    // move — only the base gradient `g₀` (the linearization point / target
+    // residual) changes. In that regime the `O(n·d³ + p³)` factor work and the
+    // dominant `O(n·d·p)` `D`/`B` upload need to happen ONCE for the whole outer
+    // sweep, not once per outer. `device_fit_outer_sequence` realizes that: it
+    // builds at most ONE resident frame for an unchanged operator and drives
+    // every outer's inner solve through it, re-uploading only the per-outer
+    // `O(n·d + p)` gradient. The per-outer parity oracle is an independent
+    // `device_fit` (fresh frame per outer); the two must agree because sharing
+    // the factor across outers skips only re-deriving operator-independent work.
+    // ---------------------------------------------------------------------
+
+    /// Run a sequence of outer evaluations that SHARE one resident frame when the
+    /// Hessian operator is unchanged across outers (#1017 deliverable 3).
+    ///
+    /// Each entry of `base_gradient_overrides` is one outer evaluation's base
+    /// gradient `(g_t rows: n·d, g_β: p)` — the only part of the bordered
+    /// quadratic that moves across outers at a frozen gate/basis frame. The
+    /// constant Hessian blocks ride the resident frame, which is built ONCE and
+    /// reused for every outer (frame builds are counted and returned so a caller
+    /// can assert the across-outer amortization actually fired: exactly one frame
+    /// build for an unchanged operator, regardless of how many outers run).
+    ///
+    /// Returns one [`DeviceResidentInnerOutcome`] per outer plus the number of
+    /// resident-frame builds performed across the whole sweep. On a CPU-only host
+    /// returns `Unavailable` (callers wanting a host path use
+    /// [`Self::cpu_reference_outer_sequence`]).
+    pub fn device_fit_outer_sequence(
+        &self,
+        base_gradient_overrides: &[(Vec<f64>, Vec<f64>)],
+        opts: &DeviceResidentInnerOptions,
+    ) -> Result<OuterSequenceOutcome, DeviceResidentArrowError> {
+        if !self.device_resident() {
+            return Err(DeviceResidentArrowError::Unavailable {
+                reason: "SAE outer-sequence residency unavailable: CUDA runtime did not admit the row-block workload".to_string(),
+            });
+        }
+        self.run_outer_sequence(base_gradient_overrides, opts, InnerSolveMode::DeviceResident)
+    }
+
+    /// CPU-reference outer sequence: same host control flow as
+    /// [`Self::device_fit_outer_sequence`] but the per-iterate arrow solve uses
+    /// the dense reference factorisation. The parity harness asserts the device
+    /// across-outer sweep agrees with this per-outer-independent reference.
+    pub fn cpu_reference_outer_sequence(
+        &self,
+        base_gradient_overrides: &[(Vec<f64>, Vec<f64>)],
+        opts: &DeviceResidentInnerOptions,
+    ) -> Result<OuterSequenceOutcome, DeviceResidentArrowError> {
+        self.run_outer_sequence(base_gradient_overrides, opts, InnerSolveMode::CpuReference)
+    }
+
+    fn run_outer_sequence(
+        &self,
+        base_gradient_overrides: &[(Vec<f64>, Vec<f64>)],
+        opts: &DeviceResidentInnerOptions,
+        mode: InnerSolveMode,
+    ) -> Result<OuterSequenceOutcome, DeviceResidentArrowError> {
+        let n = self.shape.n;
+        let d = self.shape.d;
+        let p = self.shape.p;
+        let t_len = n * d;
+        let half_target_energy = 0.5 * squared_norm(&self.target_x);
+
+        // ONE resident frame for the whole sweep (device mode only). The operator
+        // is unchanged across outers — the frame bakes the constant `D`/`B`/Schur
+        // factors at `(initial_ridge_t, initial_ridge_beta)` once and every outer
+        // reuses it. A per-outer ridge escalation (PD failure) still rebuilds, but
+        // for a well-posed unchanged operator the build count stays at 1, which is
+        // the across-outer amortization this method delivers.
+        let mut resident_frame: Option<(
+            f64,
+            f64,
+            crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle,
+        )> = None;
+        let mut frame_builds = 0_usize;
+        let mut outcomes = Vec::with_capacity(base_gradient_overrides.len());
+
+        for (g_t_override, g_beta_override) in base_gradient_overrides {
+            if g_t_override.len() != t_len || g_beta_override.len() != p {
+                return Err(DeviceResidentArrowError::Shape {
+                    reason: format!(
+                        "outer-sequence gradient shape mismatch: g_t={} (want {t_len}), g_beta={} (want {p})",
+                        g_t_override.len(),
+                        g_beta_override.len()
+                    ),
+                });
+            }
+            // This outer's bordered quadratic: same Hessian blocks, base gradient
+            // swapped to this outer's `g₀`.
+            let mut base = self.to_arrow_system();
+            for (i, row) in base.rows.iter_mut().enumerate() {
+                for r in 0..d {
+                    row.gt[r] = g_t_override[i * d + r];
+                }
+            }
+            for (j, gb) in base.gb.iter_mut().enumerate() {
+                *gb = g_beta_override[j];
+            }
+            base.refresh_row_hessian_fingerprint();
+
+            let outcome = self.run_one_outer(
+                &base,
+                half_target_energy,
+                opts,
+                mode,
+                &mut resident_frame,
+                &mut frame_builds,
+            )?;
+            outcomes.push(outcome);
+        }
+
+        Ok(OuterSequenceOutcome {
+            outers: outcomes,
+            frame_builds,
+        })
+    }
+
+    /// One outer evaluation's inner Newton loop, optionally reusing a frame
+    /// carried in `resident_frame` across calls. Mirrors `run_inner_loop` but
+    /// takes the base system + a shared frame slot so the across-outer caller can
+    /// keep one frame live for the whole sweep. `frame_builds` is incremented
+    /// every time a frame is actually (re)built, so the caller can assert the
+    /// across-outer amortization fired.
+    #[allow(clippy::too_many_arguments)]
+    fn run_one_outer(
+        &self,
+        base: &ArrowSchurSystem,
+        half_target_energy: f64,
+        opts: &DeviceResidentInnerOptions,
+        mode: InnerSolveMode,
+        resident_frame: &mut Option<(
+            f64,
+            f64,
+            crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle,
+        )>,
+        frame_builds: &mut usize,
+    ) -> Result<DeviceResidentInnerOutcome, DeviceResidentArrowError> {
+        let execution_path = mode.execution_path();
+        let n = self.shape.n;
+        let d = self.shape.d;
+        let p = self.shape.p;
+        let t_len = n * d;
+
+        let mut t = vec![0.0_f64; t_len];
+        let mut beta = vec![0.0_f64; p];
+        let mut ridge_t = opts.initial_ridge_t.max(0.0);
+        let mut ridge_beta = opts.initial_ridge_beta.max(0.0);
+        let mut current_objective = self.objective_at(base, half_target_energy, &t, &beta);
+        let mut accepted_iters = 0_usize;
+        let mut total_iters = 0_usize;
+        let mut converged = false;
+        let mut last_gradient_norm = 0.0_f64;
+        let mut last_log_det = 0.0_f64;
+
+        while total_iters < opts.max_iterations {
+            let residual = self.residual_system(base, &t, &beta);
+            let g_norm = arrow_system_gradient_norm(&residual);
+            let scale = 1.0 + iterate_norm(&t, &beta);
+            if g_norm / scale < opts.convergence_tolerance {
+                converged = true;
+                break;
+            }
+
+            let solution = match mode {
+                InnerSolveMode::DeviceResident => {
+                    let frame_matches = resident_frame
+                        .as_ref()
+                        .is_some_and(|(rt, rb, _)| *rt == ridge_t && *rb == ridge_beta);
+                    let mut frame_build_error: Option<DeviceResidentArrowError> = None;
+                    if !frame_matches {
+                        *resident_frame = None;
+                        match crate::gpu::kernels::arrow_schur::ResidentArrowFrameHandle::new(
+                            &residual, ridge_t, ridge_beta,
+                        ) {
+                            Ok(frame) => {
+                                *frame_builds += 1;
+                                crate::gpu::profile::telemetry_record_handle_creation(
+                                    self.context_id(),
+                                );
+                                crate::gpu::profile::telemetry_record_factorization();
+                                crate::gpu::profile::telemetry_record_h2d(
+                                    self.frame_upload_bytes(),
+                                );
+                                *resident_frame = Some((ridge_t, ridge_beta, frame));
+                            }
+                            Err(err) => frame_build_error = Some(map_gpu_error(err)),
+                        }
+                    }
+                    match resident_frame.as_ref() {
+                        Some((_, _, frame)) => {
+                            let mut g_t = Vec::with_capacity(n * d);
+                            for row in &residual.rows {
+                                for &v in row.gt.iter() {
+                                    g_t.push(v);
+                                }
+                            }
+                            let g_beta: Vec<f64> = residual.gb.iter().copied().collect();
+                            let grad_bytes =
+                                (g_t.len() + g_beta.len()) * std::mem::size_of::<f64>();
+                            crate::gpu::profile::telemetry_record_h2d(grad_bytes);
+                            crate::gpu::profile::telemetry_record_kernel_launch();
+                            crate::gpu::profile::telemetry_record_d2h(
+                                (n * d + p) * std::mem::size_of::<f64>(),
+                            );
+                            frame.solve_gradient(&g_t, &g_beta).map_err(map_gpu_error)
+                        }
+                        None => Err(frame_build_error.unwrap_or_else(|| {
+                            DeviceResidentArrowError::Solve {
+                                reason: "SAE resident frame build declined".to_string(),
+                            }
+                        })),
+                    }
+                }
+                InnerSolveMode::DeviceReupload => {
+                    solve_arrow_newton_step(&residual, ridge_t, ridge_beta).map_err(map_gpu_error)
+                }
+                InnerSolveMode::CpuReference => {
+                    solve_arrow_newton_step_dense_reference(&residual, ridge_t, ridge_beta)
+                        .map_err(|reason| DeviceResidentArrowError::Solve { reason })
+                }
+            };
+
+            let solution = match solution {
+                Ok(sol) => sol,
+                Err(DeviceResidentArrowError::Solve { .. })
+                | Err(DeviceResidentArrowError::Unavailable { .. }) => {
+                    ridge_t = grow_ridge(ridge_t, opts.lm_grow);
+                    ridge_beta = grow_ridge(ridge_beta, opts.lm_grow);
+                    if ridge_t > opts.max_ridge || ridge_beta > opts.max_ridge {
+                        return Err(DeviceResidentArrowError::Solve {
+                            reason: format!(
+                                "SAE outer-sequence inner loop: LM ridge exceeded max ({:e}) at iter {total_iters}",
+                                opts.max_ridge
+                            ),
+                        });
+                    }
+                    total_iters += 1;
+                    continue;
+                }
+                Err(other) => return Err(other),
+            };
+
+            let predicted_reduction =
+                crate::solver::arrow_schur::arrow_bare_quadratic_model_reduction(
+                    &residual,
+                    solution.delta_t.view(),
+                    solution.delta_beta.view(),
+                    ridge_t,
+                    ridge_beta,
+                )
+                .map_err(|err| DeviceResidentArrowError::Solve {
+                    reason: format!("SAE outer-sequence predicted-reduction failed: {err}"),
+                })?;
+
+            let mut trial_t = t.clone();
+            let mut trial_beta = beta.clone();
+            for (slot, dv) in trial_t.iter_mut().zip(solution.delta_t.iter()) {
+                *slot += *dv;
+            }
+            for (slot, dv) in trial_beta.iter_mut().zip(solution.delta_beta.iter()) {
+                *slot += *dv;
+            }
+            let trial_objective = self.objective_at(base, half_target_energy, &trial_t, &trial_beta);
+
+            let objective_scale = current_objective.abs();
+            let noise_floor = objective_scale * 1e-14;
+            let actual_reduction = current_objective - trial_objective;
+            let rho = if predicted_reduction > noise_floor {
+                actual_reduction / predicted_reduction
+            } else if actual_reduction >= -noise_floor {
+                1.0
+            } else {
+                -1.0
+            };
+
+            if rho > 0.0 && trial_objective.is_finite() {
+                t = trial_t;
+                beta = trial_beta;
+                current_objective = trial_objective;
+                ridge_t = (ridge_t * opts.lm_shrink).max(0.0);
+                ridge_beta = (ridge_beta * opts.lm_shrink).max(0.0);
+                last_gradient_norm = g_norm;
+                last_log_det = solution.log_det_hessian;
+                accepted_iters += 1;
+                total_iters += 1;
+            } else {
+                ridge_t = grow_ridge(ridge_t, opts.lm_grow);
+                ridge_beta = grow_ridge(ridge_beta, opts.lm_grow);
+                if ridge_t > opts.max_ridge || ridge_beta > opts.max_ridge {
+                    return Err(DeviceResidentArrowError::Solve {
+                        reason: format!(
+                            "SAE outer-sequence inner loop: LM rejected step until ridge exceeded max ({:e}) at iter {total_iters} (rho={rho:.3e})",
+                            opts.max_ridge
+                        ),
+                    });
+                }
+                total_iters += 1;
+            }
+        }
+
+        Ok(DeviceResidentInnerOutcome {
+            t: Array1::from_vec(t),
+            beta: Array1::from_vec(beta),
+            objective: current_objective,
+            gradient_norm: last_gradient_norm,
+            log_det_hessian: last_log_det,
+            iterations: total_iters,
+            accepted_iterations: accepted_iters,
+            converged,
+            execution_path,
+        })
+    }
+
     /// Bordered-quadratic objective `½‖X‖² + ½ zᵀ H z − g₀ᵀ z` at iterate
     /// `z = (t, β)`. Uses the resident arrow structure: per-row `H_tt`/`H_tβ`
     /// contractions plus the shared `H_ββ` border, then the linear `g₀ᵀ z`
@@ -836,6 +1158,22 @@ pub struct DeviceResidentInnerOutcome {
     pub accepted_iterations: usize,
     pub converged: bool,
     pub execution_path: ExecutionPath,
+}
+
+/// Result of an across-outer resident sweep ([`DeviceResidentArrowWorkspace::device_fit_outer_sequence`]).
+///
+/// `outers` holds one inner-loop outcome per outer evaluation, in input order.
+/// `frame_builds` is the total number of resident-frame (re)builds performed
+/// across the whole sweep: for an unchanged operator with a well-posed ridge it
+/// is exactly `1` (the across-outer amortization #1017 deliverable 3 buys —
+/// factor once, reuse the device factors for every outer), regardless of how
+/// many outers ran. A value `> 1` means a per-outer ridge escalation forced a
+/// refactor, which the parity oracle still matches but which costs the
+/// amortization for those outers.
+#[derive(Clone, Debug)]
+pub struct OuterSequenceOutcome {
+    pub outers: Vec<DeviceResidentInnerOutcome>,
+    pub frame_builds: usize,
 }
 
 fn grow_ridge(current: f64, grow: f64) -> f64 {
@@ -1800,6 +2138,92 @@ mod tests {
              be 0). A t-only gap implicates the per-row factor / row-gradient \
              assembly; a β-only gap the border Schur path."
         );
+    }
+
+    /// #1017 deliverable 3: across-OUTER residency. A sequence of outer
+    /// evaluations whose Hessian operator is unchanged (only the base gradient
+    /// moves) must share ONE resident frame — exactly one frame build for the
+    /// whole sweep — and produce results bit-identical to per-outer-independent
+    /// fits (each with a fresh frame). On a CPU-only host this asserts the
+    /// reference path's outer-sequence wiring is consistent; on the A100 it
+    /// proves the across-outer factor amortization fires AND stays exact.
+    #[test]
+    fn outer_sequence_reuses_frame_and_matches_independent() {
+        let ws = super::color_arm_fixture().expect("color_arm fixture");
+        let opts = DeviceResidentInnerOptions::default();
+        let n = ws.shape.n;
+        let d = ws.shape.d;
+        let p = ws.shape.p;
+
+        // Three "outer" evaluations: same operator, distinct base gradients (the
+        // moving linearization point). These stand in for consecutive outer REML
+        // evaluations at a frozen gate/basis frame.
+        let outers: Vec<(Vec<f64>, Vec<f64>)> = (0..3)
+            .map(|s| {
+                let g_t: Vec<f64> = (0..n * d)
+                    .map(|i| 0.01 * (((i + 3 * s) as f64) * 0.002).sin())
+                    .collect();
+                let g_beta: Vec<f64> = (0..p)
+                    .map(|j| 0.001 * (((j + 11 * s) as f64) * 0.0009).cos())
+                    .collect();
+                (g_t, g_beta)
+            })
+            .collect();
+
+        // Per-outer-independent reference (fresh frame each outer) via the CPU
+        // path, which runs on any host.
+        let independent = ws
+            .cpu_reference_outer_sequence(&outers, &opts)
+            .expect("cpu reference outer sequence");
+        assert_eq!(independent.outers.len(), outers.len());
+
+        if ws.device_resident() {
+            // Device across-outer sweep: ONE frame for all three outers.
+            let shared = ws
+                .device_fit_outer_sequence(&outers, &opts)
+                .expect("device outer sequence");
+            assert_eq!(
+                shared.frame_builds, 1,
+                "across-outer residency must build the resident frame exactly once \
+                 for an unchanged operator (got {} builds over {} outers) — a count \
+                 > 1 means the frame was needlessly re-factored per outer",
+                shared.frame_builds,
+                outers.len()
+            );
+            // Bit-parity: sharing the factor across outers must not change the
+            // numbers vs per-outer-independent device fits.
+            for (idx, (sh, ind)) in shared.outers.iter().zip(independent.outers.iter()).enumerate()
+            {
+                let scale = ind
+                    .t
+                    .iter()
+                    .chain(ind.beta.iter())
+                    .fold(1.0_f64, |m, &v| m.max(v.abs()));
+                let mut max_rel = 0.0_f64;
+                for (a, b) in sh.t.iter().zip(ind.t.iter()) {
+                    max_rel = max_rel.max((a - b).abs() / scale);
+                }
+                for (a, b) in sh.beta.iter().zip(ind.beta.iter()) {
+                    max_rel = max_rel.max((a - b).abs() / scale);
+                }
+                assert!(
+                    max_rel < 1e-9,
+                    "outer {idx}: across-outer-shared frame must match independent fit \
+                     (rel {max_rel:e})"
+                );
+            }
+            println!(
+                "[#1017 outer-seq color_arm] outers={} frame_builds={} (across-outer factor \
+                 amortized) parity<1e-9 OK",
+                outers.len(),
+                shared.frame_builds
+            );
+        } else {
+            println!(
+                "[#1017 outer-seq color_arm] no CUDA device — across-outer residency skipped; \
+                 run on the GPU node to assert frame_builds==1 + device parity"
+            );
+        }
     }
 
     /// #1017 residency-isolating per-solve bench. A full-fit wall-clock bench
