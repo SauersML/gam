@@ -2331,15 +2331,12 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         CACHE
             .get_or_compile(ctx, "arrow_pcg_vector", PCG_VECTOR_KERNEL_SOURCE)
             .map_err(|err| {
-                // #1551 decline-site localization: the NVRTC compile / module load
-                // of PCG_VECTOR_KERNEL_SOURCE (which carries the arrow_sae_frame_*
-                // kernels) is a prime suspect for the deterministic setup-stage
-                // `Unavailable` both device-PCG parity tests report. The cache maps
-                // the failure to a descriptive GpuError but every caller collapses it
-                // to `Unavailable`, hiding the NVRTC log. Surface it once here so the
-                // tag run shows whether the frame kernels even compile on the A100.
+                // #1551: an NVRTC compile / module-load failure of
+                // PCG_VECTOR_KERNEL_SOURCE means the device SAE PCG cannot run;
+                // log it (the historical silent collapse to `Unavailable` is what
+                // masked the missing `--gpu-architecture` for so long) and fall
+                // back to the CPU.
                 log::warn!("[#1551] pcg_vector_module get_or_compile failed: {err}");
-                eprintln!("[#1551 decline-site] pcg_vector_module: {err}");
                 ArrowSchurGpuFailure::Unavailable
             })
     }
@@ -4128,9 +4125,6 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             .frame
             .as_ref()
             .ok_or(ArrowSchurGpuFailure::Unavailable)?;
-        // #1551 decline-site localization: every setup stage below collapses its
-        // failure to `Unavailable`, so the coarse parity-test tag cannot say WHICH
-        // stage declined. Print a breadcrumb at each so one A100 tag run pins it.
         let runtime = crate::gpu::device_runtime::GpuRuntime::global()
             .filter(|rt| {
                 rt.policy().reduced_schur_matvec_should_offload(
@@ -4140,43 +4134,15 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
                     max_iterations,
                 )
             })
-            .ok_or_else(|| {
-                eprintln!(
-                    "[#1551 decline-site] framed: admission reduced_schur_matvec_should_offload \
-                     declined (n={} k={} d={} iters={})",
-                    sys.rows.len(),
-                    sys.k,
-                    sys.d,
-                    max_iterations
-                );
-                ArrowSchurGpuFailure::Unavailable
-            })?;
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let ctx = crate::gpu::device_runtime::cuda_context_for(runtime.selected_device().ordinal)
-            .ok_or_else(|| {
-                eprintln!("[#1551 decline-site] framed: cuda_context_for returned None");
-                ArrowSchurGpuFailure::Unavailable
-            })?;
-        let stream = ctx.new_stream().map_err(|e| {
-            eprintln!("[#1551 decline-site] framed: new_stream failed: {e}");
-            ArrowSchurGpuFailure::Unavailable
-        })?;
-        let blas = CudaBlas::new(stream.clone()).map_err(|e| {
-            eprintln!("[#1551 decline-site] framed: CudaBlas::new failed: {e}");
-            ArrowSchurGpuFailure::Unavailable
-        })?;
+            .ok_or(ArrowSchurGpuFailure::Unavailable)?;
+        let stream = ctx
+            .new_stream()
+            .map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
+        let blas = CudaBlas::new(stream.clone()).map_err(|_| ArrowSchurGpuFailure::Unavailable)?;
         let vector_module = pcg_vector_module(&ctx)?;
-        let mut buffers = flatten_device_sae_frame_data(sys, data, frame, ridge_t, &stream)
-            .inspect_err(|e| {
-                // Avoid `{:?}` here (banned hand-rolled dbg!); name the variant via a
-                // plain Display-style discriminant string instead.
-                let which = match e {
-                    ArrowSchurGpuFailure::Unavailable => "Unavailable",
-                    ArrowSchurGpuFailure::SchurFactorFailed { .. } => "SchurFactorFailed",
-                    ArrowSchurGpuFailure::RidgeBumpRequired { .. } => "RidgeBumpRequired",
-                    ArrowSchurGpuFailure::GpuRequiresDenseSystem { .. } => "GpuRequiresDenseSystem",
-                };
-                eprintln!("[#1551 decline-site] framed: flatten_device_sae_frame_data -> {which}");
-            })?;
+        let mut buffers = flatten_device_sae_frame_data(sys, data, frame, ridge_t, &stream)?;
 
         let rhs_norm = rhs_beta.iter().map(|v| v * v).sum::<f64>().sqrt();
         if rhs_norm == 0.0 {
@@ -4465,8 +4431,24 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         relative_tolerance: f64,
     ) -> Result<(Array1<f64>, PcgDiagnostics), ArrowSchurGpuFailure> {
         let k = rhs_beta.len();
+        // #1017 dispatch re-key: this is an ITERATIVE device-resident PCG, not a
+        // single GEMV. `S` (k×k) is uploaded once and reused for `max_iterations`
+        // `S·p` GEMVs while only convergence scalars cross PCIe, so the staging
+        // cost is amortised over the whole CG solve. Gating on the flops of ONE
+        // `Gemv{k,k}` (`2·k²`) understates the work by the iteration count and
+        // declines shapes (e.g. k≈512) whose total iterated arithmetic
+        // `2·k²·iters` clears the device floor by orders of magnitude — the same
+        // single-launch-breakeven miskey #1017 fixed for the framed reduced-Schur
+        // matvec. Key on the CG-amortised total work via a `Gemm{k,k,iters}` whose
+        // `flops()` is exactly `2·k²·iters`; numerics and kernels are untouched,
+        // and the host falls back to the bit-identical CPU PCG when this declines.
+        let cg_iters = max_iterations.max(1);
         let runtime = crate::gpu::linalg_dispatch::route_through_gpu(
-            crate::gpu::linalg_dispatch::DispatchOp::Gemv { m: k, k },
+            crate::gpu::linalg_dispatch::DispatchOp::Gemm {
+                m: k,
+                n: k,
+                k: cg_iters,
+            },
         )
         .ok_or(ArrowSchurGpuFailure::Unavailable)?;
         let stream = crate::gpu::device_runtime::cuda_context_for(runtime.device.ordinal)
