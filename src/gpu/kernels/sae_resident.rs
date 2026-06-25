@@ -1420,8 +1420,15 @@ mod tests {
     /// reference factorisation is well-conditioned. The objective minimiser is
     /// `z* = H^{-1} g₀`, which the inner loop must reach.
     fn small_fixture(seed: u64) -> DeviceResidentArrowWorkspace {
+        // batch (n) = 8 clears the device dispatch floor
+        // (`small_dense_batched_potrf_min_batch = 8`) so that on a CUDA host
+        // `upload_resident_buffers` actually binds a device and
+        // `device_resident()` is TRUE — otherwise the device-resident parity
+        // branch of `device_resident_fit_matches_cpu_reference` is dead on real
+        // GPU hardware (the route declines for batch < 8, so the test only ever
+        // exercised the CPU-decline branch and never validated the device loop).
         let shape = DeviceResidentArrowShape {
-            n: 3,
+            n: 8,
             p: 4,
             basis_cols: 2,
             d: 2,
@@ -1675,6 +1682,19 @@ mod tests {
                 "re-uploading GPU fit must match CPU reference (rel {max_reup_rel:e})"
             );
         } else {
+            // The fixture is sized (batch = 8) to clear the device dispatch floor,
+            // so on a host WITH a CUDA runtime `device_resident()` must be true and
+            // we take the device branch above. Reaching this branch with a runtime
+            // present means the device binding silently failed — which would mask a
+            // real upload/dispatch fault behind the CPU-decline path (the
+            // device-PCG skip-pass class, eee12f6b2). Fail loud unless this is a
+            // genuinely CPU-only host.
+            assert!(
+                crate::gpu::device_runtime::GpuRuntime::global().is_none(),
+                "device_resident() is false on a host WITH a CUDA runtime present, \
+                 despite a floor-clearing fixture (batch=8): the resident device \
+                 buffers failed to bind — a real device fault, not a CPU-only skip."
+            );
             // CPU-only host: the resident path must decline, not disagree.
             let dev = ws.device_fit(&opts);
             assert!(
