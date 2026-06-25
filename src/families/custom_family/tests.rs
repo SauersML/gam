@@ -1439,7 +1439,7 @@ pub(crate) fn binomial_location_scale_wiggle_outer_fixture()
         log_sigma_design: Some(base.log_sigma_design),
         wiggle_knots: knots,
         wiggle_degree: 3,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     BinomialLocationScaleWiggleOuterFixture {
         family,
@@ -2007,7 +2007,7 @@ pub(crate) fn psi_drift_deriv_workspace_preserves_block_local_operator() {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             let _ = block_states;
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -2259,7 +2259,7 @@ pub(crate) fn custom_family_outer_derivatives_respects_missing_second_order_capa
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             let n = block_states[0].eta.len();
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -2275,7 +2275,7 @@ pub(crate) fn custom_family_outer_derivatives_respects_missing_second_order_capa
             block_specs: &[ParameterBlockSpec],
             options: &BlockwiseFitOptions,
         ) -> ExactOuterDerivativeOrder {
-        let _unused_block_specs = block_specs;
+            let _unused_block_specs = block_specs;
             let _ = block_specs;
             let _ = options;
             ExactOuterDerivativeOrder::First
@@ -2535,7 +2535,7 @@ pub(crate) fn custom_family_outer_derivatives_exposes_surrogate_second_order_geo
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             let n = block_states[0].eta.len();
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -2583,7 +2583,7 @@ pub(crate) fn custom_family_outer_derivatives_keeps_strict_second_order_geometry
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             let n = block_states[0].eta.len();
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -3103,7 +3103,7 @@ pub(crate) fn custom_family_outer_derivatives_keeps_second_order_for_large_inner
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             let n = block_states[0].eta.len();
             Ok(FamilyEvaluation {
                 log_likelihood: 0.0,
@@ -4704,7 +4704,7 @@ pub(crate) fn joint_feasibility_alpha_gate_discriminates_healthy_from_crush() {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             // Single-block fixture: the engine always passes exactly one block.
             assert_eq!(block_states.len(), 1);
             Ok(FamilyEvaluation {
@@ -4721,7 +4721,7 @@ pub(crate) fn joint_feasibility_alpha_gate_discriminates_healthy_from_crush() {
             idx: usize,
             arr: &Array1<f64>,
         ) -> Result<Option<f64>, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             // The configured α is returned regardless of the proposed step;
             // assert the engine hands us a well-formed single-block query.
             assert!(idx < block_states.len());
@@ -5422,7 +5422,7 @@ pub(crate) fn binomial_location_scale_outer_fixture(
         link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
         threshold_design: Some(threshold_design),
         log_sigma_design: Some(log_sigma_design),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let specs = vec![thresholdspec, log_sigmaspec];
     let penalty_counts = vec![1usize, 1usize];
@@ -6456,7 +6456,7 @@ pub(crate) fn exact_newton_dh_closure_rejects_non_finite_directional_derivative(
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             let beta = block_states
                 .first()
                 .ok_or_else(|| "missing block 0".to_string())?
@@ -6475,7 +6475,7 @@ pub(crate) fn exact_newton_dh_closure_rejects_non_finite_directional_derivative(
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<Option<Array2<f64>>, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             Ok(Some(array![[1.0]]))
         }
 
@@ -6484,7 +6484,7 @@ pub(crate) fn exact_newton_dh_closure_rejects_non_finite_directional_derivative(
             block_states: &[ParameterBlockState],
             arr: &Array1<f64>,
         ) -> Result<Option<Array2<f64>>, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(Some(array![[f64::NAN]]))
         }
@@ -6795,7 +6795,7 @@ pub(crate) fn uniform_eta_lengths_do_not_panic() {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             let p0 = block_states[0].beta.len();
             let p1 = block_states[1].beta.len();
             let eta0 = &block_states[0].eta;
@@ -6922,7 +6922,7 @@ pub(crate) fn heterogeneous_eta_no_panic_when_all_blocks_converged() {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             let n = self.n;
             let eta0 = &block_states[0].eta;
             let eta1 = &block_states[1].eta;
@@ -6981,7 +6981,7 @@ pub(crate) fn heterogeneous_eta_completes_when_only_small_block_steps() {
             &self,
             block_states: &[ParameterBlockState],
         ) -> Result<FamilyEvaluation, String> {
-        let _unused_block_states = block_states;
+            let _unused_block_states = block_states;
             let n = self.n;
             let eta0 = &block_states[0].eta;
             let eta1 = &block_states[1].eta;
@@ -7836,7 +7836,10 @@ pub(crate) fn joint_newton_collapsed_trust_region_all_reject_exits_before_grindi
     let mut radius = 1.0_f64;
     for _ in 0..200 {
         let rejected = update_joint_trust_region_radius(radius, 0.5 * radius, -1.0, 2.0, 1.0);
-        assert!(!rejected.accepted, "a genuine objective increase must reject");
+        assert!(
+            !rejected.accepted,
+            "a genuine objective increase must reject"
+        );
         radius = rejected.radius;
     }
     assert!(

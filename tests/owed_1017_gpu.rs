@@ -12,11 +12,11 @@
 //! the wide-border (k >> n*d) device solve plus end-to-end device-fit convergence.
 
 use cudarc::cublas::CudaBlas;
-use gam::gpu::device_runtime::{cuda_context_for, GpuRuntime};
+use gam::gpu::device_runtime::{GpuRuntime, cuda_context_for};
 use gam::gpu::kernels::arrow_schur::{
     solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
 };
-use gam::gpu::kernels::sae_resident::{color_arm_fixture, DeviceResidentInnerOptions};
+use gam::gpu::kernels::sae_resident::{DeviceResidentInnerOptions, color_arm_fixture};
 use gam::solver::arrow_schur::ArrowSchurSystem;
 
 fn build_wide_border(n: usize, d: usize, k: usize) -> ArrowSchurSystem {
@@ -63,7 +63,8 @@ fn gpu_probe_first_handle_wide_border_solve_and_device_fit_converge_1017() {
     }
 
     // (1) Probe-first cuBLAS handle creation must succeed (the runtime/context fix).
-    let ctx = cuda_context_for(0).expect("cuda_context_for(0) must return a context when a GPU is present");
+    let ctx = cuda_context_for(0)
+        .expect("cuda_context_for(0) must return a context when a GPU is present");
     let stream = ctx.new_stream().expect("new_stream");
     assert!(
         CudaBlas::new(stream).is_ok(),
@@ -73,8 +74,8 @@ fn gpu_probe_first_handle_wide_border_solve_and_device_fit_converge_1017() {
     // (2) The wide-border (k >> n*d) arrow-Schur GPU solve must match the CPU dense
     // reference — the path no GPU parity test exercised on real hardware.
     let sys = build_wide_border(180, 2, 5120);
-    let cpu = solve_arrow_newton_step_dense_reference(&sys, 0.0, 0.0)
-        .expect("CPU dense reference solve");
+    let cpu =
+        solve_arrow_newton_step_dense_reference(&sys, 0.0, 0.0).expect("CPU dense reference solve");
     let gpu = solve_arrow_newton_step(&sys, 0.0, 0.0)
         .expect("GPU arrow-Schur solve must run on device (not decline)");
     let dt = max_abs_diff(

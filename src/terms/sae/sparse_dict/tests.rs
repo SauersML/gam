@@ -29,7 +29,8 @@ fn planted(k: usize, p: usize, n: usize, second_share: f32) -> (Array2<f32>, Arr
         let secondary = (primary + 1) % k;
         let scale = 0.7 + 0.01 * (row / k) as f32;
         for c in 0..p {
-            x[[row, c]] = scale * atoms[[primary, c]] + second_share * scale * atoms[[secondary, c]];
+            x[[row, c]] =
+                scale * atoms[[primary, c]] + second_share * scale * atoms[[secondary, c]];
         }
     }
     (x, atoms)
@@ -127,11 +128,7 @@ fn held_out_ev(
 /// scored on `x_test`. This is the honest linear baseline the sparse trainer
 /// must match-or-beat — the rank-`r` linear autoencoder's out-of-sample
 /// reconstruction, with NO leakage of the test block into the basis.
-fn pca_ev_held_out(
-    x_train: ArrayView2<'_, f32>,
-    x_test: ArrayView2<'_, f32>,
-    rank: usize,
-) -> f64 {
+fn pca_ev_held_out(x_train: ArrayView2<'_, f32>, x_test: ArrayView2<'_, f32>, rank: usize) -> f64 {
     let p = x_train.ncols();
     let ntr = x_train.nrows();
     let mut means = vec![0.0f64; p];
@@ -253,12 +250,20 @@ fn tile_scorer_matches_untiled_brute_force() {
             (a as u32, acc)
         })
         .collect();
-    brute.sort_by(|x, y| y.1.abs().partial_cmp(&x.1.abs()).unwrap().then(x.0.cmp(&y.0)));
+    brute.sort_by(|x, y| {
+        y.1.abs()
+            .partial_cmp(&x.1.abs())
+            .unwrap()
+            .then(x.0.cmp(&y.0))
+    });
     let scorer = TileScorer::new(4, 7);
     let tiled = scorer.route_row(row.view(), decoder.view());
     assert_eq!(tiled.len(), 4);
     for j in 0..4 {
-        assert_eq!(tiled[j].0, brute[j].0, "tiled top-{j} disagrees with brute force");
+        assert_eq!(
+            tiled[j].0, brute[j].0,
+            "tiled top-{j} disagrees with brute force"
+        );
     }
 }
 

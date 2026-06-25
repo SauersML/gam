@@ -597,11 +597,19 @@ mod tests {
         // 3) Direct predicate properties at the boundary.
         // No net progress across the window => fire (cannot reach tol).
         assert!(slow_geometric_rate_exceeds_projection_cap(
-            1.0, 1.0, LINEAR_RATE_WINDOW, residual_tol, LINEAR_RATE_PROJECTION_CAP
+            1.0,
+            1.0,
+            LINEAR_RATE_WINDOW,
+            residual_tol,
+            LINEAR_RATE_PROJECTION_CAP
         ));
         // Residual already at/under tol => never fire (certificate owns it).
         assert!(!slow_geometric_rate_exceeds_projection_cap(
-            1e-7, 1.0, LINEAR_RATE_WINDOW, residual_tol, LINEAR_RATE_PROJECTION_CAP
+            1e-7,
+            1.0,
+            LINEAR_RATE_WINDOW,
+            residual_tol,
+            LINEAR_RATE_PROJECTION_CAP
         ));
         // A brisk window (0.5×/cycle over 16 cycles, residual 1e-3) projects to
         // only ~10 more cycles to tol => never fire.

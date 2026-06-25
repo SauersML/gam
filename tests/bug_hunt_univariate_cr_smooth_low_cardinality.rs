@@ -100,8 +100,16 @@ fn fit_and_predict(
         panic!("expected a standard Gaussian fit for {formula}");
     };
 
-    let xi = data.headers.iter().position(|h| h == "x").expect("x column");
-    let zi = data.headers.iter().position(|h| h == "z").expect("z column");
+    let xi = data
+        .headers
+        .iter()
+        .position(|h| h == "x")
+        .expect("x column");
+    let zi = data
+        .headers
+        .iter()
+        .position(|h| h == "z")
+        .expect("z column");
     let hlen = data.headers.len();
     let m = pts.len();
     let mut grid = Array2::<f64>::zeros((m, hlen));
@@ -155,7 +163,11 @@ fn univariate_cr_smooth_survives_low_cardinality_covariate() {
         cnt.iter().all(|&c| c > 0),
         "fixture must populate all 3 x levels; got counts {cnt:?}"
     );
-    let mean = [sum[0] / cnt[0] as f64, sum[1] / cnt[1] as f64, sum[2] / cnt[2] as f64];
+    let mean = [
+        sum[0] / cnt[0] as f64,
+        sum[1] / cnt[1] as f64,
+        sum[2] / cnt[2] as f64,
+    ];
     let c1 = mean[1] - mean[0]; // expected +2
     let c2 = mean[2] - mean[0]; // expected -1
 

@@ -106,7 +106,9 @@ fn print_scores(label: &str, kappa_star: f64, seed: u64) -> f64 {
             best_k = *k;
         }
     }
-    eprintln!("[#1464-crit]   --> argmin V_p over probed grid: kappa = {best_k:+.4} (V_p = {best_v})");
+    eprintln!(
+        "[#1464-crit]   --> argmin V_p over probed grid: kappa = {best_k:+.4} (V_p = {best_v})"
+    );
     eprintln!(
         "[#1464-crit]   verdict: criterion prefers {} curvature for this {label} dataset",
         if best_k < 0.0 {

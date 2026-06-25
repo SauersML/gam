@@ -11,10 +11,10 @@
 //! `tests.rs` finite-difference witnesses.
 
 use crate::families::cubic_cell_kernel as exact_kernel;
-use crate::families::jet_partitions::MultiDirJet;
 use crate::families::marginal_slope_shared::{
-    eval_coeff4_at, scale_coeff4, CoeffSupport, ObservedDenestedCellPartials,
+    CoeffSupport, ObservedDenestedCellPartials, eval_coeff4_at, scale_coeff4,
 };
+use gam_math::jet_partitions::MultiDirJet;
 use ndarray::{Array1, Array2};
 // `SurvivalMarginalSlopeFamily` + `FlexPrimarySlices` — for the cell-pair helper
 // impl below (moved from `contraction.rs`). Imported explicitly (not `super::*`,

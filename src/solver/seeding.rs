@@ -822,11 +822,12 @@ mod tests {
     #[test]
     fn objective_grid_can_seed_adjacent_pair_oversmoothing_corner() {
         let base = Array1::zeros(4);
-        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 4, &[], |rho| {
-            let supported_cost = 0.1 * (rho[0].powi(2) + rho[1].powi(2));
-            let unsupported_gap = (rho[2] - 12.0).powi(2) + (rho[3] - 12.0).powi(2);
-            Some(supported_cost + unsupported_gap)
-        });
+        let selected =
+            select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 4, &[], |rho| {
+                let supported_cost = 0.1 * (rho[0].powi(2) + rho[1].powi(2));
+                let unsupported_gap = (rho[2] - 12.0).powi(2) + (rho[3] - 12.0).powi(2);
+                Some(supported_cost + unsupported_gap)
+            });
         assert_eq!(selected.to_vec(), vec![0.0, 0.0, 12.0, 12.0]);
     }
 
@@ -923,9 +924,10 @@ mod tests {
     #[test]
     fn objective_grid_seed_selects_lowest_finite_cost_candidate() {
         let base = Array1::from_vec(vec![0.0, 0.0]);
-        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, &[], |rho| {
-            Some((rho[0] - 6.0).powi(2) + (rho[1] - 6.0).powi(2))
-        });
+        let selected =
+            select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, &[], |rho| {
+                Some((rho[0] - 6.0).powi(2) + (rho[1] - 6.0).powi(2))
+            });
 
         assert!((selected[0] - 6.0).abs() < 1e-12);
         assert!((selected[1] - 6.0).abs() < 1e-12);
@@ -934,13 +936,14 @@ mod tests {
     #[test]
     fn objective_grid_seed_keeps_baseline_when_no_candidate_improves_cost() {
         let base = Array1::from_vec(vec![1.0, -2.0]);
-        let selected = select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, &[], |rho| {
-            if (rho[0] - 1.0).abs() < 1e-12 && (rho[1] + 2.0).abs() < 1e-12 {
-                Some(0.0)
-            } else {
-                Some(1.0)
-            }
-        });
+        let selected =
+            select_objective_seed_on_log_lambda_grid(&base, (-12.0, 12.0), 2, &[], |rho| {
+                if (rho[0] - 1.0).abs() < 1e-12 && (rho[1] + 2.0).abs() < 1e-12 {
+                    Some(0.0)
+                } else {
+                    Some(1.0)
+                }
+            });
 
         assert_eq!(selected, base);
     }

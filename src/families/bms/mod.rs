@@ -10,7 +10,6 @@ use crate::custom_family::{
 };
 use crate::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianOperator};
 use crate::families::cubic_cell_kernel as exact_kernel;
-use crate::families::jet_partitions::MultiDirJet;
 use crate::families::marginal_slope_shared::{
     CoeffSupport, DirectionalScaleJets, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView,
     add_optional_matrix, add_optional_vector, add_two_surface_psi_outer,
@@ -44,6 +43,7 @@ use crate::smooth::{
     spatial_length_scale_term_indices,
 };
 use crate::types::{InverseLink, StandardLink, WigglePenaltyConfig};
+use gam_math::jet_partitions::MultiDirJet;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
@@ -2018,7 +2018,9 @@ pub(crate) mod row_kernel;
 #[cfg(test)]
 mod tests {
     include!("../../../tests/src_modules/misc/families_bms_identifiability_rigid_tests.rs");
-    include!("../../../tests/src_modules/optimization/families_bms_joint_hessian_hvp_correction_tests.rs");
+    include!(
+        "../../../tests/src_modules/optimization/families_bms_joint_hessian_hvp_correction_tests.rs"
+    );
 }
 pub(crate) mod axis_direction_search;
 pub(crate) mod cell_moment_assembly;

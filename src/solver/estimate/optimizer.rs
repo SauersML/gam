@@ -500,75 +500,77 @@ where
     let mut pirls_res;
     let mut negbin_alternation_round: usize = 0;
     loop {
-    (
-        final_rho,
-        final_mixture_state,
-        final_sas_state,
-        final_mixture_param_covariance,
-        final_sas_param_covariance,
-        outer_result,
-    ) = if mixture_dim > 0 && sas_dim > 0 {
-        crate::bail_invalid_estim!("simultaneous mixture and SAS optimization is not supported");
-    } else if mixture_dim == 0 && sas_dim == 0 {
-        use crate::solver::rho_optimizer::{
-            DeclaredHessianForm, Derivative, OuterEvalOrder, OuterProblem,
-        };
+        (
+            final_rho,
+            final_mixture_state,
+            final_sas_state,
+            final_mixture_param_covariance,
+            final_sas_param_covariance,
+            outer_result,
+        ) = if mixture_dim > 0 && sas_dim > 0 {
+            crate::bail_invalid_estim!(
+                "simultaneous mixture and SAS optimization is not supported"
+            );
+        } else if mixture_dim == 0 && sas_dim == 0 {
+            use crate::solver::rho_optimizer::{
+                DeclaredHessianForm, Derivative, OuterEvalOrder, OuterProblem,
+            };
 
-        let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
-        // Standard-GAM dense problem dimensions configure both cost models
-        // the planner uses to decide whether ARC+Hessian or BFGS+gradient
-        // is faster end-to-end at large scale:
-        //
-        //   - per-inner-solve cost (n · p²) gates the single-Hessian-
-        //     assembly downgrade,
-        //   - per-outer-eval cost (k² · n · p²) gates the LAML-Hessian
-        //     pairwise-assembly downgrade — independent of (1) and
-        //     necessary because the LAML outer Hessian's k² pairwise
-        //     inner-derived terms can dominate per-outer work even when
-        //     each individual inner solve is moderate.
-        //
-        // Sparse designs short-circuit the policy because the n · p²
-        // model does not apply to sparse linear algebra; ARC stays in
-        // place and the sparse path's iteration-count advantage holds.
-        // Gaussian-identity REML has two well-conditioned features that
-        // the outer optimizer can exploit:
-        //
-        //   1. The REML cost is dominated by an O(n) likelihood constant,
-        //      so ∂/∂logλ inherits the same scale. A unit-magnitude
-        //      `abs` gradient floor (1e-6) becomes binding at large-scale n
-        //      even after the relative-from-seed component declared
-        //      convergence iters earlier. `with_objective_scale(n)`
-        //      lifts the floor to ~n·1e-9 so the loop terminates once
-        //      the relative reduction is met.
-        //
-        //   2. The Gaussian profile likelihood is quadratic-like in
-        //      log-λ near the optimum, so the analytic Hessian is
-        //      trustworthy and the cubic regularization can start
-        //      smaller than opt's default sigma=1.0. Setting
-        //      sigma=0.25 allows the first ARC step to be ~4× the
-        //      default — matching the 2–4 unit log-λ moves typical of
-        //      Gaussian-identity REML cold starts on tensor smooths.
-        //
-        // Other families (logit, log, survival) keep the conservative
-        // defaults because their objective is non-quadratic in log-λ
-        // and their gradient is not on an O(n) scale.
-        let gaussian_identity = matches!(cfg.link_function(), LinkFunction::Identity);
-        let n_obs = y_o.len();
-        let prefer_gradient_only = k >= REML_SECOND_ORDER_RHO_CAP;
-        let continuation_prewarm = k < REML_CONTINUATION_PREWARM_RHO_CAP;
-        if prefer_gradient_only {
-            log::info!(
-                "[OUTER] rho_dim {k} reaches exact REML Hessian budget \
+            let analytic_outer_hessian_available = reml_state.analytic_outer_hessian_enabled();
+            // Standard-GAM dense problem dimensions configure both cost models
+            // the planner uses to decide whether ARC+Hessian or BFGS+gradient
+            // is faster end-to-end at large scale:
+            //
+            //   - per-inner-solve cost (n · p²) gates the single-Hessian-
+            //     assembly downgrade,
+            //   - per-outer-eval cost (k² · n · p²) gates the LAML-Hessian
+            //     pairwise-assembly downgrade — independent of (1) and
+            //     necessary because the LAML outer Hessian's k² pairwise
+            //     inner-derived terms can dominate per-outer work even when
+            //     each individual inner solve is moderate.
+            //
+            // Sparse designs short-circuit the policy because the n · p²
+            // model does not apply to sparse linear algebra; ARC stays in
+            // place and the sparse path's iteration-count advantage holds.
+            // Gaussian-identity REML has two well-conditioned features that
+            // the outer optimizer can exploit:
+            //
+            //   1. The REML cost is dominated by an O(n) likelihood constant,
+            //      so ∂/∂logλ inherits the same scale. A unit-magnitude
+            //      `abs` gradient floor (1e-6) becomes binding at large-scale n
+            //      even after the relative-from-seed component declared
+            //      convergence iters earlier. `with_objective_scale(n)`
+            //      lifts the floor to ~n·1e-9 so the loop terminates once
+            //      the relative reduction is met.
+            //
+            //   2. The Gaussian profile likelihood is quadratic-like in
+            //      log-λ near the optimum, so the analytic Hessian is
+            //      trustworthy and the cubic regularization can start
+            //      smaller than opt's default sigma=1.0. Setting
+            //      sigma=0.25 allows the first ARC step to be ~4× the
+            //      default — matching the 2–4 unit log-λ moves typical of
+            //      Gaussian-identity REML cold starts on tensor smooths.
+            //
+            // Other families (logit, log, survival) keep the conservative
+            // defaults because their objective is non-quadratic in log-λ
+            // and their gradient is not on an O(n) scale.
+            let gaussian_identity = matches!(cfg.link_function(), LinkFunction::Identity);
+            let n_obs = y_o.len();
+            let prefer_gradient_only = k >= REML_SECOND_ORDER_RHO_CAP;
+            let continuation_prewarm = k < REML_CONTINUATION_PREWARM_RHO_CAP;
+            if prefer_gradient_only {
+                log::info!(
+                    "[OUTER] rho_dim {k} reaches exact REML Hessian budget \
                    ({REML_SECOND_ORDER_RHO_CAP}); routing analytic-gradient quasi-Newton"
-            );
-        }
-        if !continuation_prewarm {
-            log::info!(
-                "[OUTER] rho_dim {k} reaches continuation-prewarm budget \
+                );
+            }
+            if !continuation_prewarm {
+                log::info!(
+                    "[OUTER] rho_dim {k} reaches continuation-prewarm budget \
                    ({REML_CONTINUATION_PREWARM_RHO_CAP}); starting optimizer directly from seeds"
-            );
-        }
-        let problem = OuterProblem::new(k)
+                );
+            }
+            let problem = OuterProblem::new(k)
             .with_gradient(Derivative::Analytic)
             .with_hessian(if analytic_outer_hessian_available {
                 DeclaredHessianForm::Either
@@ -623,726 +625,97 @@ where
             // `te(z,x)`. `None` (coordinate count not matching ρ-dim) leaves the
             // native-order path unchanged.
             .with_rho_canonical_keys(canon_keys.clone());
-        let problem = if let Some(h) = heuristic_lambdas {
-            problem.with_heuristic_lambdas(h.to_vec())
-        } else {
-            problem
-        };
-        let problem = if let Some(h) = heuristic_lambdas.filter(|h| h.len() == k) {
-            problem.with_initial_rho(Array1::from_iter(h.iter().copied()))
-        } else {
-            problem
-        };
-
-        // Geometric-mean log prior-weight anchor `log g(w) = (1/n₊)·Σ log wᵢ`
-        // over the positive-weight rows. The pure-REML optimum for a *profiled*
-        // (Gaussian-identity) fit drifts by `ρ̂ → ρ̂ + log c` under a global
-        // prior-weight rescale `w → c·w` (`H = XᵀWX + λS`, so λ → c·λ keeps the
-        // penalised curvature proportional to the data curvature, β̂ / EDF /
-        // predictions fixed). The outer ρ-search seed and the relative-from-seed
-        // convergence test would otherwise be referenced to a weight-independent
-        // origin (0), so a heavily up-weighted fit starts `log c` further from
-        // its (shifted) optimum and the optimiser stops short — exactly the
-        // weight-scale non-invariance of λ̂ reported in issue #877. Anchoring the
-        // seed at `log g(w)` makes the search start the SAME relative distance
-        // from the optimum regardless of the weight magnitude.
-        //
-        // This is the SAME gated anchor the outer ρ-prior uses
-        // ([`RemlState::rho_weight_anchor`]): it is the geometric-mean
-        // log-weight for a profiled-dispersion family and *exactly 0* for a
-        // fixed-dispersion family (Poisson, binomial, …). For fixed dispersion
-        // `w = c` is exact `c`-fold replication: the two encodings share an
-        // identical LAML objective and optimum, so anchoring the seed by their
-        // (differing) per-row log-weight mean would seed the weighted encoding
-        // `log c` above its true optimum and the relative-convergence test would
-        // stop it short — over-smoothing vs replication (issue #893). With all
-        // weights 1 (or any fixed-dispersion family) the anchor is exactly 0, so
-        // those fits stay byte-identical.
-        let weight_log_geom_mean: f64 = reml_state.rho_weight_anchor();
-        let gaussian_risk = matches!(reml_seed_config.risk_profile, SeedRiskProfile::Gaussian);
-        // The prepass evaluates the *actual* REML/LAML objective on a tiny,
-        // deterministic log-λ grid and only changes startup when that same
-        // criterion improves.  It is therefore part of initialization, not a
-        // compatibility fallback.  Gaussian fits used to skip this when the
-        // weights were on the unit scale, leaving single-start BFGS/ARC tied to
-        // the arbitrary λ=1 origin; flat or multi-penalty REML surfaces could
-        // then spend the finite outer budget getting into the right basin rather
-        // than resolving the optimum that controls EDF and truth recovery.  Run
-        // the same criterion-ranked startup for Gaussian as for GLM/survival,
-        // while retaining the weight-scale anchor from issue #877.
-        let run_gaussian_anchored_prepass = gaussian_risk && weight_log_geom_mean.abs() > 1e-12;
-        // A caller-supplied rho seed (`init_rhos`/`heuristic_lambdas`, now in
-        // rho-space) is an explicit warm-start installed via `with_initial_rho`
-        // above. It still ANCHORS the objective-grid prepass below rather than
-        // short-circuiting it: the grid is criterion-ranked and only adopts a
-        // candidate that STRICTLY lowers the true REML/LAML cost, so a healthy
-        // warm seed is returned unchanged (the grid never beats it → byte-
-        // identical behaviour). What the anchor-and-rank rescues is a warm seed
-        // TRAPPED in a shallow under-smoothing local basin: when the design's
-        // kernel collapses (e.g. the constant-curvature `curv()` smooth fitted
-        // at a trial κ on the +chart side — the geodesic-exponential kernel's
-        // off-diagonals → 1, so its global REML optimum is a LARGE λ that the
-        // local outer optimizer, warm-started from the previous-κ λ̂, slides away
-        // from into the spurious low-λ optimum). The shallow optimum's
-        // spuriously-low deviance made the κ outer objective monotone toward the
-        // +chart bound for any curved data (gam#1464 — hyperbolic truth recovered
-        // as spherical); anchoring the global grid at the warm seed lets the
-        // prepass jump into the correct high-λ basin so the per-κ REML cost
-        // matches the textbook profiled-REML and the curvature SIGN is
-        // identifiable. Same machinery as the gam#1266 double-penalty rescue.
-        let caller_seeded_rho = heuristic_lambdas.is_some_and(|h| h.len() == k);
-        // The grid prepass's lowest-cost sample, kept for the #1371
-        // release-and-rerank guard even when it is not adopted as the initial
-        // seed (i.e. the grid did not strictly move). It is a known-good lower
-        // bound on the achievable REML cost, scored with the SAME functional.
-        // Unconditionally assigned inside the prepass block below (before its
-        // first read by the #1371 guard), so it carries no dead initializer.
-        let release_rerank_seed: Option<Array1<f64>>;
-        // #1548: the well-determined Marra-Wood double-penalty null-space
-        // selection coordinates, recognised exactly as the #1266 shrink-out
-        // escape recognises them (the relaxed `Normal(0, sd=15)` degeneracy
-        // prior, gated by `n ≥ 2·p`). A SUPPORTED such coordinate has a deep
-        // low-λ_null "keep" basin AND a flat high-λ_null annihilation shelf; the
-        // objective-grid prepass below probes the keep corner for exactly these
-        // coordinates so it can seed the well-conditioned keep basin directly
-        // rather than the shelf — see the keep-saturation probe in
-        // `select_objective_seed_on_log_lambda_grid`.
-        let nullspace_seed_coords: Vec<usize> = if n_design_rows >= 2 * p {
-            match reml_state.effective_rho_prior().as_ref() {
-                crate::types::RhoPrior::Independent(per_coord) => (0..k)
-                    .filter(|&i| {
-                        per_coord
-                            .get(i)
-                            .is_some_and(crate::terms::smooth::is_nullspace_degeneracy_prior)
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            }
-        } else {
-            Vec::new()
-        };
-        let prepass_seed: Option<Array1<f64>> = {
-            let bnds = reml_seed_config.bounds;
-            let (lo, hi_seed) = if bnds.0 <= bnds.1 {
-                bnds
+            let problem = if let Some(h) = heuristic_lambdas {
+                problem.with_heuristic_lambdas(h.to_vec())
             } else {
-                (bnds.1, bnds.0)
+                problem
             };
-            // The criterion-ranked prepass evaluates the TRUE REML/LAML cost, so
-            // it is safe — and necessary — to let it explore the full
-            // over-smoothing range the outer optimizer itself can reach
-            // (`RHO_BOUND`), not just the narrower default seed-placement band.
-            // A double-penalty (null-space-shrinkage) smooth on data living in
-            // one penalty's null space has its global REML optimum at a LARGE
-            // wiggliness λ (range block fully smoothed), often beyond the seed
-            // band; the cost surface also has a shallower local optimum at a
-            // moderate λ that leaves wiggle under-penalized (EDF inflated,
-            // gam#1266). If the prepass cannot seed past that local optimum, the
-            // outer EFS — which only takes cost-improving steps — relaxes back
-            // into it. The collapsing-kernel spatial smooth (gam#1464) has the
-            // same shape: the high-λ basin sits beyond a shallow low-λ trap.
-            // Widening only the upper (over-smoothing) bound lets the prepass
-            // place the seed in the correct high-λ basin; the lower
-            // (under-smoothing) bound stays at the default so we never seed an
-            // overfit origin. The seed is still only adopted when it strictly
-            // lowers the REML cost, so well-balanced and single-penalty fits are
-            // unaffected.
-            let hi = hi_seed.max(crate::estimate::RHO_BOUND);
-            // risk_shift is the default seed bias when no caller warm-start is given;
-            // it is NOT applied on top of a caller-supplied rho seed.
-            let risk_shift: f64 = match reml_seed_config.risk_profile {
-                SeedRiskProfile::Gaussian => 0.0,
-                SeedRiskProfile::GeneralizedLinear => 1.0,
-                SeedRiskProfile::Survival => 2.0,
-            };
-            // Anchor the grid at the caller-supplied `heuristic_lambdas` when one
-            // is present (it is already in rho-space, used as-is) — the grid then
-            // searches relative to the warm start and keeps it unless a candidate
-            // is strictly better. Otherwise anchor the default risk-shift origin
-            // to the weight scale (issue #877).
-            let base = if let Some(h) = heuristic_lambdas.as_ref().filter(|h| h.len() == k) {
-                Array1::from_iter(h.iter().map(|&v| v.clamp(lo, hi)))
+            let problem = if let Some(h) = heuristic_lambdas.filter(|h| h.len() == k) {
+                problem.with_initial_rho(Array1::from_iter(h.iter().copied()))
             } else {
-                Array1::from_elem(k, (risk_shift + weight_log_geom_mean).clamp(lo, hi))
+                problem
             };
-            // Run the objective-grid seed search in CANONICAL coordinate order
-            // (#1538/#1539) so its greedy per-axis / pairwise-saturation
-            // refinement — which is order-dependent in native layout — explores
-            // the SAME axes for every term order. The grid builds canonical
-            // candidates; the eval closure maps each back to native order before
-            // scoring with the true `compute_cost`, and the refined seed is
-            // mapped native again for `with_initial_rho`. Without a permutation
-            // this is the identity, so the native-order path is byte-for-byte
-            // unchanged.
-            let refined = if let Some(perm) = canon_perm.as_ref() {
-                let to_native = |canon: &Array1<f64>| -> Array1<f64> {
-                    let mut out = Array1::zeros(canon.len());
-                    for (c, &i) in perm.iter().enumerate() {
-                        out[i] = canon[c];
-                    }
-                    out
-                };
-                let base_canon = Array1::from_iter(perm.iter().map(|&i| base[i]));
-                // Canonical slot `c` carries native coordinate `perm[c]`; a
-                // null-space coordinate must be probed in whichever slot it
-                // occupies in the canonical layout the grid refines.
-                let nullspace_canon: Vec<usize> = (0..k)
-                    .filter(|&c| nullspace_seed_coords.contains(&perm[c]))
-                    .collect();
-                let refined_canon = crate::seeding::select_objective_seed_on_log_lambda_grid(
-                    &base_canon,
-                    (lo, hi),
-                    k,
-                    &nullspace_canon,
-                    |canon_rho| {
-                        let native = to_native(canon_rho);
-                        reml_state.compute_cost(&native).ok().filter(|c| c.is_finite())
-                    },
-                );
-                to_native(&refined_canon)
-            } else {
-                crate::seeding::select_objective_seed_on_log_lambda_grid(
-                    &base,
-                    (lo, hi),
-                    k,
-                    &nullspace_seed_coords,
-                    |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
-                )
-            };
-            // Emit the seed when the grid moved it, or — on the Gaussian
-            // weight-anchored path — whenever the anchored `base` is itself
-            // offset from the unanchored origin (so the shifted optimum is
-            // actually seeded even if the coarse grid leaves `base` unchanged).
-            // Record the grid's best sample for the release-and-rerank guard
-            // unconditionally — whether or not it is strong enough to override
-            // the optimizer's own cold start, it is still a scored lower bound
-            // the certified optimum must not be worse than (#1371).
-            release_rerank_seed = Some(refined.clone());
-            let grid_moved = refined
-                .iter()
-                .zip(base.iter())
-                .any(|(&a, &b)| (a - b).abs() > 1e-12);
-            // For a caller-seeded fit, adopt the grid result only when it
-            // STRICTLY moved the warm seed (i.e. found a strictly-cheaper basin);
-            // an unmoved grid leaves the warm start exactly as installed above, so
-            // healthy warm-started fits stay byte-identical. The Gaussian
-            // weight-anchored emit only applies on the non-caller-seeded origin.
-            if grid_moved || (run_gaussian_anchored_prepass && !caller_seeded_rho) {
-                log::info!(
-                    "[OUTER] standard REML objective-grid selected seed: {:?} -> {:?}",
-                    base.as_slice().unwrap_or(&[]),
-                    refined.as_slice().unwrap_or(&[])
-                );
-                Some(refined)
-            } else {
-                None
-            }
-        };
-        let problem = if let Some(seed) = prepass_seed {
-            problem.with_initial_rho(seed)
-        } else {
-            problem
-        };
-        // #1074 DIAGNOSTIC (log-gated, no behavior change unless the crate
-        // logger is installed): sweep each outer log-λ coordinate over a grid
-        // while holding the others at the baseline, logging the REML cost. Used
-        // to decide whether the spatial range railing is an interior optimum the
-        // optimizer misses (optimizer bug) or a genuine criterion preference for
-        // λ→∞ (criterion). Placed BEFORE the objective takes its `&mut
-        // reml_state` borrow so the immutable `compute_cost` reads are valid.
-        // Emitted at warn level so the default-installed crate logger (Info)
-        // prints it without a level change (the ban-scanner forbids direct
-        // stderr printing and process-env reads).
-        if log::log_enabled!(log::Level::Warn) {
-            let grid = [
-                -5.0_f64, -2.0, 0.0, 2.0, 5.0, 8.0, 10.0, 12.0, 16.0, 20.0, 25.0, 30.0,
-            ];
-            let mut baselines: Vec<(&str, Array1<f64>)> =
-                vec![("zeros", Array1::<f64>::zeros(k))];
-            if k == 4 {
-                baselines.push(("conv", Array1::from(vec![9.0_f64, 30.0, 12.0, 30.0])));
-            }
-            if k == 2 {
-                baselines.push(("conv6", Array1::from(vec![6.0_f64, 6.0])));
-            }
-            for (label, baseline) in &baselines {
-                log::warn!("[#1074-sweep] k={k} baseline={label}={baseline:?}");
-                for coord in 0..k {
-                    let mut line = format!("[#1074-sweep:{label}] coord={coord}:");
-                    for &rho in &grid {
-                        let mut p = baseline.clone();
-                        p[coord] = rho;
-                        let cg = reml_state.compute_cost_and_gradient(&p).ok();
-                        let cell = match cg {
-                            Some((c, g)) => {
-                                format!("{c:.4}(g{}={:.3e})", coord, g.get(coord).copied().unwrap_or(f64::NAN))
-                            }
-                            None => "ERR".to_string(),
-                        };
-                        line.push_str(&format!(" {rho:.0}->{cell}"));
-                    }
-                    log::warn!("{line}");
-                }
-            }
-        }
 
-        // Attach the outer-loop cache session. The session shares its
-        // realized-fit-context key with the inner beta record (different
-        // payload namespace), so a SIGKILL mid-outer-iter leaves both the
-        // last accepted β (inner record) and the best rho seen so far
-        // (outer iterate) on disk for the next run.
-        let problem = match reml_state.outer_cache_session() {
-            Some(session) => problem.with_cache_session(session),
-            None => problem,
-        };
-
-        let obj = problem.build_objective_with_screening_proxy(
-            &mut reml_state,
-            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
-                state.compute_cost(rho)
-            },
-            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
-                outer_eval_idx.fetch_add(1, Ordering::Relaxed);
-                state.compute_outer_eval_with_order(
-                    rho,
-                    if analytic_outer_hessian_available {
-                        OuterEvalOrder::ValueGradientHessian
-                    } else {
-                        OuterEvalOrder::ValueAndGradient
-                    },
-                )
-            },
-            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
-             rho: &Array1<f64>,
-             order: OuterEvalOrder| {
-                outer_eval_idx.fetch_add(1, Ordering::Relaxed);
-                state.compute_outer_eval_with_order(rho, order)
-            },
-            Some(
-                |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>| {
-                    state.reset_outer_seed_state()
-                },
-            ),
-            Some(
-                |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
-                 rho: &Array1<f64>| { state.compute_efs_steps(rho) },
-            ),
-            |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>, rho: &Array1<f64>| {
-                state.compute_screening_proxy(rho)
-            },
-        );
-        // Standard REML's eval closure publishes
-        // `inner_beta_hint = state.current_original_basis_beta()` on
-        // every accepted eval. The continuation pre-warm carries that
-        // hint forward and calls `seed_inner_state(beta)` before the
-        // next eval — see src/solver/reml/continuation.rs:209-212,
-        // 434-438. Without a hook here, `ClosureObjective::seed_inner_state`
-        // (src/solver/rho_optimizer.rs:2097-2107) rejected any
-        // non-empty β fatally, dropping every seed before the inner
-        // solver started (issue #236). Wire the symmetric consumer:
-        // when the pre-warm forwards the cached β, install it into the
-        // same `warm_start_beta` slot the publisher reads from.
-        let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
-
-        let mut strategy_result = problem.run(&mut obj, "standard REML")?;
-        drop(obj);
-        // #1371 release-and-rerank guard. The continuation oversmoothing
-        // warm-start can deliver the inner β on the high-λ null-space
-        // "annihilation" shelf of a double-penalty smooth: there the
-        // null-space coefficients are already shrunk to ~0, so the deviance
-        // ρ-gradient vanishes (∂dev/∂ρ_null → 0) AND the Occam terms
-        // (½ tr(H⁻¹ ∂H/∂ρ) − ½ λ tr(S⁺ S_k)) cancel, leaving the analytic
-        // outer gradient ≈ 0. ARC then certifies that point as a stationary
-        // optimum even though its REML cost is FAR ABOVE a point the seed
-        // prepass already evaluated — driving a genuinely-supported null-space
-        // direction (a real linear trend, gam#1371) to EDF → 0. The seed
-        // prepass's grid-refined seed is a known-good lower bound on the cost
-        // (it was scored with the SAME `compute_cost`), so if the certified
-        // optimum is strictly worse than it, re-rank to the seed: re-running
-        // the inner solve there installs the correct β̂. This cannot regress a
-        // fit whose optimum genuinely IS the high-λ corner (gam#1266: an
-        // unsupported term shrinking out) — there the corner is the
-        // lowest-cost point, no cheaper seed exists, and the guard is a no-op.
-        if let Some(seed) = release_rerank_seed.as_ref() {
-            // The certified cost is the optimizer's OWN authoritative
-            // `final_value`, NOT a fresh `compute_cost(strategy_result.rho)`
-            // re-evaluation (load-bearing, #1426/#1477). The REML/LAML objective
-            // for a non-Gaussian family is NOT a pure function of ρ: it carries a
-            // profiled dispersion / nuisance that is established by the inner
-            // solve at the operating ρ, and `compute_cost` warm-starts the inner
-            // PIRLS from whatever β̂/φ the previous eval left behind. Probing the
-            // under-penalized prepass seed FIRST (necessary so the no-op path can
-            // leave β̂ at the seed for a clean re-install) pollutes that nuisance
-            // state, so a subsequent re-eval of the cleanly-converged ρ comes back
-            // a few REML units ABOVE its true certified cost — e.g. a Gamma/log
-            // optimum certified at 829.857 re-evaluates at 834.90 right after the
-            // seed probe, which is then (wrongly) above the seed's own 833.47 and
-            // the guard "escapes" to the under-penalized seed, shipping a
-            // near-full-basis overfit (EDF ≈ k, falsely tagged converged) that the
-            // seed loop's keep-best had already rejected (#1426 silent overfit;
-            // #1477 Tweedie boundary/EDF blow-up). `final_value` was scored at the
-            // converged ρ with ITS own inner solve, so it is immune to that probe
-            // pollution and is the honest cost to compare the seed against.
-            let cost_converged = strategy_result.final_value;
-            // The seed probe is a non-fatal measurement; a seed that fails to
-            // evaluate simply skips the comparison. It leaves β̂ at the seed, so
-            // the no-op branch below relies on the unified β̂ re-install after the
-            // guard to restore it at `strategy_result.rho`.
+            // Geometric-mean log prior-weight anchor `log g(w) = (1/n₊)·Σ log wᵢ`
+            // over the positive-weight rows. The pure-REML optimum for a *profiled*
+            // (Gaussian-identity) fit drifts by `ρ̂ → ρ̂ + log c` under a global
+            // prior-weight rescale `w → c·w` (`H = XᵀWX + λS`, so λ → c·λ keeps the
+            // penalised curvature proportional to the data curvature, β̂ / EDF /
+            // predictions fixed). The outer ρ-search seed and the relative-from-seed
+            // convergence test would otherwise be referenced to a weight-independent
+            // origin (0), so a heavily up-weighted fit starts `log c` further from
+            // its (shifted) optimum and the optimiser stops short — exactly the
+            // weight-scale non-invariance of λ̂ reported in issue #877. Anchoring the
+            // seed at `log g(w)` makes the search start the SAME relative distance
+            // from the optimum regardless of the weight magnitude.
             //
-            // Probe the seed WITH its outer gradient (not cost alone): the grid
-            // prepass scored the seed by `compute_cost`, which runs the inner
-            // P-IRLS — at an under-penalized (λ→0) ρ the inner solve hits its
-            // iteration cap and reports a spuriously LOW cost (an invalid REML
-            // value the line search could not improve) while the analytic outer
-            // gradient still points strongly toward more penalization. The #1371
-            // false high-λ shelf this guard exists to escape is, by contrast, a
-            // GENUINE cheaper optimum: its seed is stationary. Even with the
-            // pollution-free `final_value` comparison above, a stuck stall can
-            // still under-cut it on raw cost, so only a seed whose cost is
-            // trustworthy (small residual gradient) may override the certified ρ.
-            let seed_eval = reml_state.compute_cost_and_gradient(seed).ok();
-            // Strict relative improvement so a numerically-equal seed (the common
-            // case where the optimizer reached the seed's basin) is left untouched
-            // and the fit stays byte-identical.
-            let floor = 1e-6 * (1.0 + cost_converged.abs());
-            if let Some((cost_seed, grad_seed)) = seed_eval.filter(|(c, _)| c.is_finite())
-                && cost_converged.is_finite()
-                && cost_seed < cost_converged - floor
-            {
-                // Bound-projected residual gradient at the seed (same criterion
-                // `nonconverged_cost_is_trustworthy` / the flat-valley stall guard
-                // use): a component pinned at a bound by a gradient pushing past
-                // it is feasible-stationary and drops out of the norm.
-                let (blo, bhi) = {
-                    let (a, b) = reml_seed_config.bounds;
-                    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
-                    (lo, hi.max(crate::estimate::RHO_BOUND))
-                };
-                let seed_grad_norm = {
-                    let mut sumsq = 0.0;
-                    for (i, &g) in grad_seed.iter().enumerate() {
-                        let s = seed.get(i).copied().unwrap_or(0.0);
-                        let pinned_lo = s <= blo + 1e-9 && g > 0.0;
-                        let pinned_hi = s >= bhi - 1e-9 && g < 0.0;
-                        if !(pinned_lo || pinned_hi) {
-                            sumsq += g * g;
-                        }
-                    }
-                    sumsq.sqrt()
-                };
-                let seed_cost_trustworthy = seed_grad_norm.is_finite()
-                    && seed_grad_norm
-                        <= crate::solver::rho_optimizer::FLAT_VALLEY_STALL_GRAD_CEILING;
-                if seed_cost_trustworthy {
-                    log::info!(
-                        "[OUTER] #1371 release-and-rerank: certified ρ cost {cost_converged:.6e} \
-                         exceeds the prepass seed cost {cost_seed:.6e} (seed |g|={seed_grad_norm:.3e} \
-                         ≤ ceiling); adopting the seed (false high-λ stationary shelf escaped)"
-                    );
-                    strategy_result.rho = seed.clone();
-                    strategy_result.converged = true;
-                } else {
-                    // #1426 leak: the cheaper seed is a stuck under-penalized
-                    // (λ→0) stall, not a genuine optimum — its low cost is an
-                    // inner-cap artifact. Adopting it would ship the near-full-
-                    // basis overfit (EDF ≈ k) and, worse, certify it converged.
-                    // Keep the honest certified ρ. β̂ is restored by the unified
-                    // re-install after the guard.
-                    log::info!(
-                        "[OUTER] #1371 release-and-rerank: prepass seed cost {cost_seed:.6e} is \
-                         cheaper than certified ρ {cost_converged:.6e} but UNTRUSTWORTHY \
-                         (seed |g|={seed_grad_norm:.3e} > ceiling — stuck under-penalized stall, \
-                         #1426); keeping the certified ρ"
-                    );
-                }
-            }
-            // Re-install β̂ at the (possibly newly-adopted) reported ρ so the
-            // cached inner state matches `strategy_result.rho` for the downstream
-            // cap-guard / final assembly — whether the guard fired (β̂ → seed) or
-            // was a no-op (β̂ → the certified ρ, undoing the seed probe).
-            reml_state.compute_cost(&strategy_result.rho)?;
-        }
-        // #1074 UPPER-BOUND INWARD-DESCENT ESCAPE. The outer cost-stall /
-        // convergence check projects out a coordinate sitting on the ρ upper
-        // bound, so a coordinate that was driven to the over-smoothing rail can
-        // be certified "converged" even when the REML criterion is strictly
-        // LOWER at an interior ρ (a feasible inward descent the projection
-        // masks). On `s(long,lat,bs="tp") + s(depth)` the spatial/depth
-        // NULL-SPACE (affine-trend) coordinates rail to ρ=30 while
-        // `compute_cost` is ~23/~5 units lower at ρ≈2, annihilating a SUPPORTED
-        // spatial trend (#1074). This guard runs a bounded, keep-best
-        // coordinate-descent polish on EXACTLY the coordinates pinned at the
-        // upper bound: for each, it line-searches `compute_cost` over a coarse
-        // inward grid and adopts the strictly-best ρ. It uses the same
-        // authoritative `compute_cost` the optimizer minimizes, so it can only
-        // LOWER the certified cost — it never raises it and is a no-op when the
-        // rail genuinely is the optimum (an unsupported term shrinking out,
-        // #1266/#1271: no interior point is cheaper, so nothing is adopted).
-        {
-            let rho_upper = crate::estimate::RHO_BOUND;
-            // Coordinates eligible for the inward (less-smoothing) descent. Two
-            // kinds qualify:
-            //   (1) any coordinate pinned at the ρ upper rail — the original
-            //       #1074 case: the outer convergence check projects out a
-            //       rail-pinned coordinate, masking a feasible interior descent;
-            //   (2) the well-determined double-penalty NULL-SPACE selection
-            //       coordinates (`is_nullspace_degeneracy_prior`). These sit on a
-            //       near-FLAT REML ridge in λ_null, so the outer optimizer can
-            //       certify convergence at ANY high-but-not-railed ρ_null
-            //       depending on its (floating-point) iterate path. Reflecting the
-            //       covariate `x → −x` reverses the basis column order and flips
-            //       that landing shoulder: a SUPPORTED affine trend is kept at
-            //       ρ_null ≈ 0 in one orientation but over-penalized to e.g.
-            //       ρ_null ≈ 25 in the mirror (#1548), even though neither is at
-            //       the exact rail. Descending these to the cheaper interior
-            //       optimum lands BOTH orientations on the same shoulder.
-            // The descent below probes ONLY strictly-lower ρ, so it never
-            // over-smooths (raising λ_null is the #1266 escape's job, with its
-            // EDF parsimony guard against the #1476 concurvity transfer). It is
-            // keep-best + cold-confirmed against the authoritative penalized cost,
-            // so it is an exact no-op wherever the current ρ already is the
-            // optimum — e.g. an unsupported trend correctly shrunk out at the rail
-            // (#1266/#1271), where no interior point is cheaper.
-            let mut descent_coords: Vec<usize> = (0..strategy_result.rho.len())
-                .filter(|&i| strategy_result.rho[i] >= rho_upper - 1e-9)
-                .collect();
-            if n_design_rows >= 2 * p
-                && let crate::types::RhoPrior::Independent(per_coord) =
-                    reml_state.effective_rho_prior().as_ref()
-            {
-                for i in 0..strategy_result.rho.len() {
-                    if strategy_result.rho[i] < rho_upper - 1e-9
-                        && per_coord
-                            .get(i)
-                            .is_some_and(crate::terms::smooth::is_nullspace_degeneracy_prior)
-                    {
-                        descent_coords.push(i);
-                    }
-                }
-            }
-            // Baseline to beat = the optimizer's OWN authoritative converged
-            // cost (`final_value`), which was scored at the converged ρ with its
-            // own inner solve and is immune to warm-start pollution from the
-            // probes below (the #1371 lesson). A probe only wins if it is
-            // strictly cheaper than this honest cost.
-            let base_cost = strategy_result.final_value;
-            if !descent_coords.is_empty() && base_cost.is_finite() {
-                // Inward probe grid (descending from the rail). Bounded and
-                // cheap: at most 2 · |railed| · 8 inner solves, and only when a
-                // coord is actually pinned at the upper rail. Two coordinate-
-                // descent passes pick up cross-coordinate coupling between the
-                // railed axes.
-                const INWARD_GRID: [f64; 8] = [25.0, 20.0, 15.0, 10.0, 5.0, 2.0, 0.0, -2.0];
-                let mut best_rho = strategy_result.rho.clone();
-                let mut best_cost = base_cost;
-                let mut improved = false;
-                for _pass in 0..2 {
-                    let mut pass_improved = false;
-                    for &coord in &descent_coords {
-                        let mut local_best = best_rho.clone();
-                        let mut local_cost = best_cost;
-                        for &cand in &INWARD_GRID {
-                            // Inward escape only ever DESCENDS (less smoothing):
-                            // skip any grid point at or above this coordinate's
-                            // current ρ. Over-smoothing a null-space coordinate is
-                            // the #1266 escape's job (it carries the EDF parsimony
-                            // guard that prevents the #1476 concurvity transfer);
-                            // this guard must never raise λ without it.
-                            if cand >= best_rho[coord] - 1e-9 {
-                                continue;
-                            }
-                            let mut probe = best_rho.clone();
-                            probe[coord] = cand;
-                            if let Ok(c) = reml_state.compute_cost(&probe)
-                                && c.is_finite()
-                                && c < local_cost - 1e-6 * (1.0 + local_cost.abs())
-                            {
-                                local_cost = c;
-                                local_best = probe;
-                            }
-                        }
-                        if local_cost < best_cost - 1e-6 * (1.0 + best_cost.abs()) {
-                            best_rho = local_best;
-                            best_cost = local_cost;
-                            improved = true;
-                            pass_improved = true;
-                        }
-                    }
-                    if !pass_improved {
-                        break;
-                    }
-                }
-                // CONTINUOUS REFINEMENT of each descended coordinate. The coarse
-                // INWARD_GRID snaps λ to a grid node (e.g. ρ_null = 0), but in the
-                // OTHER covariate orientation the outer optimizer reports the
-                // continuous interior minimizer (e.g. ρ_null = −0.37). Leaving one
-                // orientation on the grid node while the other keeps the continuous
-                // optimum leaves a small residual reflection asymmetry (#1548:
-                // ~1.7e-3 mirror drift survives the grid descent alone). Golden-
-                // section the SAME authoritative penalized cost on each moved
-                // coordinate so both orientations converge to the identical
-                // continuous minimum. It can only lower the cost from the grid node
-                // (the bracket straddles it), and the cold confirmation below still
-                // gates adoption, so this never raises the certified cost.
-                if improved {
-                    const GS_R: f64 = 0.618_033_988_749_894_8; // (√5 − 1) / 2
-                    for coord in descent_coords.clone() {
-                        if (best_rho[coord] - strategy_result.rho[coord]).abs() <= 1e-9 {
-                            continue; // coordinate did not descend
-                        }
-                        // Bracket straddling the adopted grid node, never re-entering
-                        // the over-smoothing region above the coordinate's start ρ.
-                        let node = best_rho[coord];
-                        let mut a = node - 3.0;
-                        let mut b = (node + 3.0).min(strategy_result.rho[coord]);
-                        if b <= a + 1e-6 {
-                            continue;
-                        }
-                        let cost_at = |st: &mut RemlState, base: &Array1<f64>, x: f64| -> Option<f64> {
-                            let mut p = base.clone();
-                            p[coord] = x;
-                            st.compute_cost(&p).ok().filter(|c| c.is_finite())
-                        };
-                        let mut c = b - GS_R * (b - a);
-                        let mut d = a + GS_R * (b - a);
-                        let mut fc = cost_at(&mut reml_state, &best_rho, c);
-                        let mut fd = cost_at(&mut reml_state, &best_rho, d);
-                        let mut refine_ok = fc.is_some() && fd.is_some();
-                        for _ in 0..40 {
-                            if (b - a).abs() < 1e-4 {
-                                break;
-                            }
-                            match (fc, fd) {
-                                (Some(vc), Some(vd)) if vc <= vd => {
-                                    b = d;
-                                    d = c;
-                                    fd = fc;
-                                    c = b - GS_R * (b - a);
-                                    fc = cost_at(&mut reml_state, &best_rho, c);
-                                }
-                                (Some(_), Some(_)) => {
-                                    a = c;
-                                    c = d;
-                                    fc = fd;
-                                    d = a + GS_R * (b - a);
-                                    fd = cost_at(&mut reml_state, &best_rho, d);
-                                }
-                                _ => {
-                                    refine_ok = false;
-                                    break;
-                                }
-                            }
-                        }
-                        if refine_ok {
-                            let xm = 0.5 * (a + b);
-                            if let Some(fm) = cost_at(&mut reml_state, &best_rho, xm)
-                                && fm < best_cost
-                            {
-                                best_rho[coord] = xm;
-                                best_cost = fm;
-                            }
-                        }
-                    }
-                }
-                if improved {
-                    // COLD CONFIRMATION (guards against adopting a warm-start /
-                    // inner-cap artifact, the #1426/#1371 trap). The grid probes
-                    // ran warm-started off each other; a λ→0-ish interior point
-                    // can report a spuriously low cost from a capped inner solve.
-                    // Clear the inner cache and re-score the candidate cold; only
-                    // adopt if it STILL strictly beats the authoritative
-                    // `final_value`.
-                    reml_state.reset_outer_seed_state();
-                    let cold = reml_state.compute_cost(&best_rho);
-                    let cold_ok = matches!(cold, Ok(c)
-                        if c.is_finite() && c < base_cost - 1e-6 * (1.0 + base_cost.abs()));
-                    if cold_ok {
-                        let cold_cost = cold.unwrap_or(best_cost);
-                        log::info!(
-                            "[OUTER] #1074/#1548 upper-bound escape: certified ρ cost \
-                             {base_cost:.6e} lowered to {cold_cost:.6e} (cold-confirmed) by \
-                             descending {} over-smoothed coord(s) inward; adopting the cheaper \
-                             interior ρ",
-                            descent_coords.len()
-                        );
-                        strategy_result.rho = best_rho;
-                        strategy_result.final_value = cold_cost;
-                        // β̂ already installed at `best_rho` by the cold eval above.
-                    } else {
-                        // The improvement did not survive a cold re-score — it was
-                        // a warm-start artifact. Keep the certified ρ and restore
-                        // its inner state for downstream assembly.
-                        reml_state.reset_outer_seed_state();
-                        reml_state.compute_cost(&strategy_result.rho)?;
-                    }
-                }
-            }
-        }
-        // #1266 NULL-SPACE SHRINK-OUT ESCAPE (pure-REML; the OUTWARD-direction
-        // dual of the #1074 inward escape above).
-        //
-        // A default double-penalty smooth (mgcv `select = TRUE`) carries a
-        // `DoublePenaltyNullspace` shrinkage ridge on the term's penalty null
-        // space ({1, x} for a 1-D bend) whose only job is SELECTION: drive its
-        // λ_null UP to shrink an UNSUPPORTED term's constant+linear component out
-        // (EDF → 0). On a well-determined Gaussian fit the relaxed ρ-prior places
-        // a WIDE, symmetric `Normal(0, sd=15)` on that coordinate — NOT as a
-        // selection criterion but purely as a degeneracy-breaker: the #1476
-        // concurvity flat-ridge needs strictly-positive outer curvature to
-        // certify an interior allocation. That symmetric prior's `ρ/sd²` gradient
-        // also OPPOSES the (genuinely shallow) REML shrink-out tail, so the outer
-        // optimizer certifies a stationary point at a MODERATE λ_null
-        // (ρ_null ≈ 3.5, EDF ≈ 1.6) instead of following pure REML to the
-        // shrink-out corner — the residual #1266 "Half B" contract violation. The
-        // prior cannot be made one-sided: its high-ρ curvature is exactly what
-        // stops a SUPPORTED concurvity null space from railing out (#1476), so a
-        // data-INDEPENDENT prior cannot separate "shrink the unsupported term"
-        // (#1266) from "keep the supported one" (#1476/#1371) — they overlap in ρ.
-        //
-        // The data-DEPENDENT discriminator is pure data-REML PLUS a parsimony
-        // check. For each well-determined null-space selection coordinate,
-        // line-search the OVER-SMOOTHING (high-ρ) direction on the PURE REML cost
-        // (`compute_cost − configured_ρ_prior`; the prior is a conditioning
-        // device, not a selection criterion), then adopt the strictly-best
-        // COLD-confirmed point ONLY if it also does not increase the model's total
-        // EDF:
-        //   * UNSUPPORTED, uncorrelated null space (#1266 `s(z)`): pure REML
-        //     descends toward shrink-out AND total EDF drops (z carries no signal,
-        //     so nothing absorbs it) → the escape fires, EDF → 0.
-        //   * SUPPORTED null space (#1371 genuine slope): pure REML strictly RISES
-        //     under over-smoothing (killing a real linear trend dumps its variance
-        //     into σ̂²) → no strict improvement → exact no-op.
-        //   * CONCURVITY null space (#1476 `s(x1)+s(x2)`, corr ≈ 0.9): pure REML
-        //     *marginally* prefers over-smoothing one coordinate because the inner
-        //     β re-solve lets the CORRELATED partner absorb the shared signal — the
-        //     "signal transfer" the degeneracy prior exists to forbid. That
-        //     transfer keeps the deviance flat but INFLATES total EDF (the partner
-        //     spends extra basis), so the EDF-non-increase guard vetoes it →
-        //     no-op, the interior allocation is kept. (Pure REML alone cannot see
-        //     this: the concurvity ridge is flat, so the transfer reads as a tiny
-        //     improvement; the parsimony guard is what distinguishes a genuine
-        //     simplification from a lateral reallocation.)
-        //
-        // Unlike #1074 (where the OPTIMIZER's bound projection masks the descent),
-        // here it is the PRIOR that masks it, so the search runs on the pure
-        // (prior-stripped) criterion. SCOPE: eligible coordinates are exactly the
-        // well-determined relaxed null-space degeneracy coordinates
-        // (`is_nullspace_degeneracy_prior`, gated by `n ≥ 2·p`). This deliberately
-        // EXCLUDES the under-determined regime (`n < 2·p`, #1392 wine `p > n`),
-        // where the null-space prior is the AGGRESSIVE PC select-out — a
-        // deliberate, load-bearing selection push onto a genuinely-flat REML
-        // score that stripping would undo.
-        {
-            let well_determined = n_design_rows >= 2 * p;
-            let select_coords: Vec<usize> = if well_determined {
+            // This is the SAME gated anchor the outer ρ-prior uses
+            // ([`RemlState::rho_weight_anchor`]): it is the geometric-mean
+            // log-weight for a profiled-dispersion family and *exactly 0* for a
+            // fixed-dispersion family (Poisson, binomial, …). For fixed dispersion
+            // `w = c` is exact `c`-fold replication: the two encodings share an
+            // identical LAML objective and optimum, so anchoring the seed by their
+            // (differing) per-row log-weight mean would seed the weighted encoding
+            // `log c` above its true optimum and the relative-convergence test would
+            // stop it short — over-smoothing vs replication (issue #893). With all
+            // weights 1 (or any fixed-dispersion family) the anchor is exactly 0, so
+            // those fits stay byte-identical.
+            let weight_log_geom_mean: f64 = reml_state.rho_weight_anchor();
+            let gaussian_risk = matches!(reml_seed_config.risk_profile, SeedRiskProfile::Gaussian);
+            // The prepass evaluates the *actual* REML/LAML objective on a tiny,
+            // deterministic log-λ grid and only changes startup when that same
+            // criterion improves.  It is therefore part of initialization, not a
+            // compatibility fallback.  Gaussian fits used to skip this when the
+            // weights were on the unit scale, leaving single-start BFGS/ARC tied to
+            // the arbitrary λ=1 origin; flat or multi-penalty REML surfaces could
+            // then spend the finite outer budget getting into the right basin rather
+            // than resolving the optimum that controls EDF and truth recovery.  Run
+            // the same criterion-ranked startup for Gaussian as for GLM/survival,
+            // while retaining the weight-scale anchor from issue #877.
+            let run_gaussian_anchored_prepass = gaussian_risk && weight_log_geom_mean.abs() > 1e-12;
+            // A caller-supplied rho seed (`init_rhos`/`heuristic_lambdas`, now in
+            // rho-space) is an explicit warm-start installed via `with_initial_rho`
+            // above. It still ANCHORS the objective-grid prepass below rather than
+            // short-circuiting it: the grid is criterion-ranked and only adopts a
+            // candidate that STRICTLY lowers the true REML/LAML cost, so a healthy
+            // warm seed is returned unchanged (the grid never beats it → byte-
+            // identical behaviour). What the anchor-and-rank rescues is a warm seed
+            // TRAPPED in a shallow under-smoothing local basin: when the design's
+            // kernel collapses (e.g. the constant-curvature `curv()` smooth fitted
+            // at a trial κ on the +chart side — the geodesic-exponential kernel's
+            // off-diagonals → 1, so its global REML optimum is a LARGE λ that the
+            // local outer optimizer, warm-started from the previous-κ λ̂, slides away
+            // from into the spurious low-λ optimum). The shallow optimum's
+            // spuriously-low deviance made the κ outer objective monotone toward the
+            // +chart bound for any curved data (gam#1464 — hyperbolic truth recovered
+            // as spherical); anchoring the global grid at the warm seed lets the
+            // prepass jump into the correct high-λ basin so the per-κ REML cost
+            // matches the textbook profiled-REML and the curvature SIGN is
+            // identifiable. Same machinery as the gam#1266 double-penalty rescue.
+            let caller_seeded_rho = heuristic_lambdas.is_some_and(|h| h.len() == k);
+            // The grid prepass's lowest-cost sample, kept for the #1371
+            // release-and-rerank guard even when it is not adopted as the initial
+            // seed (i.e. the grid did not strictly move). It is a known-good lower
+            // bound on the achievable REML cost, scored with the SAME functional.
+            // Unconditionally assigned inside the prepass block below (before its
+            // first read by the #1371 guard), so it carries no dead initializer.
+            let release_rerank_seed: Option<Array1<f64>>;
+            // #1548: the well-determined Marra-Wood double-penalty null-space
+            // selection coordinates, recognised exactly as the #1266 shrink-out
+            // escape recognises them (the relaxed `Normal(0, sd=15)` degeneracy
+            // prior, gated by `n ≥ 2·p`). A SUPPORTED such coordinate has a deep
+            // low-λ_null "keep" basin AND a flat high-λ_null annihilation shelf; the
+            // objective-grid prepass below probes the keep corner for exactly these
+            // coordinates so it can seed the well-conditioned keep basin directly
+            // rather than the shelf — see the keep-saturation probe in
+            // `select_objective_seed_on_log_lambda_grid`.
+            let nullspace_seed_coords: Vec<usize> = if n_design_rows >= 2 * p {
                 match reml_state.effective_rho_prior().as_ref() {
-                    crate::types::RhoPrior::Independent(per_coord) => (0..strategy_result
-                        .rho
-                        .len())
+                    crate::types::RhoPrior::Independent(per_coord) => (0..k)
                         .filter(|&i| {
-                            per_coord.get(i).is_some_and(
-                                crate::terms::smooth::is_nullspace_degeneracy_prior,
-                            )
+                            per_coord
+                                .get(i)
+                                .is_some_and(crate::terms::smooth::is_nullspace_degeneracy_prior)
                         })
                         .collect(),
                     _ => Vec::new(),
@@ -1350,279 +723,916 @@ where
             } else {
                 Vec::new()
             };
-            // Authoritative pure-REML baseline at the converged ρ: the optimizer's
-            // own `final_value` (immune to warm-start pollution, the #1371 lesson)
-            // minus the configured ρ-prior + soft λ→0 guard it carried. A probe
-            // wins only if it strictly beats THIS pure cost.
-            let conv_prior = reml_state
-                .configured_rho_prior_atom(&strategy_result.rho)
-                .cost()
-                + reml_state
-                    .soft_rho_guard_prior_atom(&strategy_result.rho)
-                    .cost();
-            let base_pure = strategy_result.final_value - conv_prior;
-            if !select_coords.is_empty() && base_pure.is_finite() && conv_prior.is_finite() {
-                // Converged-point total inner EDF, for the PARSIMONY guard below.
-                // The inner P-IRLS solve at the converged ρ is cached, so this is
-                // free. A genuine #1266 shrink-out (an UNSUPPORTED, uncorrelated
-                // term selected out) strictly LOWERS the model's total EDF; a
-                // concurvity TRANSFER (#1476: one null-space shrinks but its
-                // correlated partner absorbs the signal via the inner β re-solve)
-                // INFLATES it. Pure REML alone marginally prefers the transfer on
-                // a flat concurvity ridge — exactly the allocation the degeneracy
-                // prior exists to forbid — so the escape must additionally refuse
-                // any adoption that does not reduce total EDF.
-                let edf_conv = reml_state
-                    .obtain_eval_bundle(&strategy_result.rho)
-                    .ok()
-                    .map(|b| b.pirls_result.edf);
-                // Pure data-REML at ρ: penalized `compute_cost` minus the configured
-                // ρ-prior and the soft λ→0 guard (both `O(K)` functions of ρ alone).
-                // Subtracting them recovers the mgcv-parity criterion selection
-                // must follow; the prior bias on λ_null is removed exactly.
-                let pure_reml = |rho: &Array1<f64>| -> Option<f64> {
-                    let c = reml_state.compute_cost(rho).ok()?;
-                    if !c.is_finite() {
-                        return None;
-                    }
-                    let prior = reml_state.configured_rho_prior_atom(rho).cost()
-                        + reml_state.soft_rho_guard_prior_atom(rho).cost();
-                    if !prior.is_finite() {
-                        return None;
-                    }
-                    Some(c - prior)
+            let prepass_seed: Option<Array1<f64>> = {
+                let bnds = reml_seed_config.bounds;
+                let (lo, hi_seed) = if bnds.0 <= bnds.1 {
+                    bnds
+                } else {
+                    (bnds.1, bnds.0)
                 };
-                // Ascending over-smoothing grid in ABSOLUTE ρ (toward the
-                // shrink-out rail at `RHO_BOUND`); only values strictly above a
-                // coordinate's current ρ are over-smoothing candidates. Bounded:
-                // at most 2 · |select| · 6 inner solves, and only fires when a
-                // null-space coordinate is actually held below the rail.
-                let rho_upper = crate::estimate::RHO_BOUND;
-                const OUTWARD_GRID: [f64; 6] = [6.0, 9.0, 12.0, 18.0, 24.0, 30.0];
-                let mut best_rho = strategy_result.rho.clone();
-                let mut best_pure = base_pure;
-                let mut improved = false;
-                for _pass in 0..2 {
-                    let mut pass_improved = false;
-                    for &coord in &select_coords {
-                        let mut local_best = best_rho.clone();
-                        let mut local_pure = best_pure;
-                        for &cand in &OUTWARD_GRID {
-                            let target = cand.min(rho_upper);
-                            if target <= best_rho[coord] + 1e-9 {
-                                continue;
-                            }
-                            let mut probe = best_rho.clone();
-                            probe[coord] = target;
-                            if let Some(c) = pure_reml(&probe)
-                                && c < local_pure - 1e-6 * (1.0 + local_pure.abs())
-                            {
-                                local_pure = c;
-                                local_best = probe;
-                            }
+                // The criterion-ranked prepass evaluates the TRUE REML/LAML cost, so
+                // it is safe — and necessary — to let it explore the full
+                // over-smoothing range the outer optimizer itself can reach
+                // (`RHO_BOUND`), not just the narrower default seed-placement band.
+                // A double-penalty (null-space-shrinkage) smooth on data living in
+                // one penalty's null space has its global REML optimum at a LARGE
+                // wiggliness λ (range block fully smoothed), often beyond the seed
+                // band; the cost surface also has a shallower local optimum at a
+                // moderate λ that leaves wiggle under-penalized (EDF inflated,
+                // gam#1266). If the prepass cannot seed past that local optimum, the
+                // outer EFS — which only takes cost-improving steps — relaxes back
+                // into it. The collapsing-kernel spatial smooth (gam#1464) has the
+                // same shape: the high-λ basin sits beyond a shallow low-λ trap.
+                // Widening only the upper (over-smoothing) bound lets the prepass
+                // place the seed in the correct high-λ basin; the lower
+                // (under-smoothing) bound stays at the default so we never seed an
+                // overfit origin. The seed is still only adopted when it strictly
+                // lowers the REML cost, so well-balanced and single-penalty fits are
+                // unaffected.
+                let hi = hi_seed.max(crate::estimate::RHO_BOUND);
+                // risk_shift is the default seed bias when no caller warm-start is given;
+                // it is NOT applied on top of a caller-supplied rho seed.
+                let risk_shift: f64 = match reml_seed_config.risk_profile {
+                    SeedRiskProfile::Gaussian => 0.0,
+                    SeedRiskProfile::GeneralizedLinear => 1.0,
+                    SeedRiskProfile::Survival => 2.0,
+                };
+                // Anchor the grid at the caller-supplied `heuristic_lambdas` when one
+                // is present (it is already in rho-space, used as-is) — the grid then
+                // searches relative to the warm start and keeps it unless a candidate
+                // is strictly better. Otherwise anchor the default risk-shift origin
+                // to the weight scale (issue #877).
+                let base = if let Some(h) = heuristic_lambdas.as_ref().filter(|h| h.len() == k) {
+                    Array1::from_iter(h.iter().map(|&v| v.clamp(lo, hi)))
+                } else {
+                    Array1::from_elem(k, (risk_shift + weight_log_geom_mean).clamp(lo, hi))
+                };
+                // Run the objective-grid seed search in CANONICAL coordinate order
+                // (#1538/#1539) so its greedy per-axis / pairwise-saturation
+                // refinement — which is order-dependent in native layout — explores
+                // the SAME axes for every term order. The grid builds canonical
+                // candidates; the eval closure maps each back to native order before
+                // scoring with the true `compute_cost`, and the refined seed is
+                // mapped native again for `with_initial_rho`. Without a permutation
+                // this is the identity, so the native-order path is byte-for-byte
+                // unchanged.
+                let refined = if let Some(perm) = canon_perm.as_ref() {
+                    let to_native = |canon: &Array1<f64>| -> Array1<f64> {
+                        let mut out = Array1::zeros(canon.len());
+                        for (c, &i) in perm.iter().enumerate() {
+                            out[i] = canon[c];
                         }
-                        if local_pure < best_pure - 1e-6 * (1.0 + best_pure.abs()) {
-                            best_rho = local_best;
-                            best_pure = local_pure;
-                            improved = true;
-                            pass_improved = true;
+                        out
+                    };
+                    let base_canon = Array1::from_iter(perm.iter().map(|&i| base[i]));
+                    // Canonical slot `c` carries native coordinate `perm[c]`; a
+                    // null-space coordinate must be probed in whichever slot it
+                    // occupies in the canonical layout the grid refines.
+                    let nullspace_canon: Vec<usize> = (0..k)
+                        .filter(|&c| nullspace_seed_coords.contains(&perm[c]))
+                        .collect();
+                    let refined_canon = crate::seeding::select_objective_seed_on_log_lambda_grid(
+                        &base_canon,
+                        (lo, hi),
+                        k,
+                        &nullspace_canon,
+                        |canon_rho| {
+                            let native = to_native(canon_rho);
+                            reml_state
+                                .compute_cost(&native)
+                                .ok()
+                                .filter(|c| c.is_finite())
+                        },
+                    );
+                    to_native(&refined_canon)
+                } else {
+                    crate::seeding::select_objective_seed_on_log_lambda_grid(
+                        &base,
+                        (lo, hi),
+                        k,
+                        &nullspace_seed_coords,
+                        |rho| reml_state.compute_cost(rho).ok().filter(|c| c.is_finite()),
+                    )
+                };
+                // Emit the seed when the grid moved it, or — on the Gaussian
+                // weight-anchored path — whenever the anchored `base` is itself
+                // offset from the unanchored origin (so the shifted optimum is
+                // actually seeded even if the coarse grid leaves `base` unchanged).
+                // Record the grid's best sample for the release-and-rerank guard
+                // unconditionally — whether or not it is strong enough to override
+                // the optimizer's own cold start, it is still a scored lower bound
+                // the certified optimum must not be worse than (#1371).
+                release_rerank_seed = Some(refined.clone());
+                let grid_moved = refined
+                    .iter()
+                    .zip(base.iter())
+                    .any(|(&a, &b)| (a - b).abs() > 1e-12);
+                // For a caller-seeded fit, adopt the grid result only when it
+                // STRICTLY moved the warm seed (i.e. found a strictly-cheaper basin);
+                // an unmoved grid leaves the warm start exactly as installed above, so
+                // healthy warm-started fits stay byte-identical. The Gaussian
+                // weight-anchored emit only applies on the non-caller-seeded origin.
+                if grid_moved || (run_gaussian_anchored_prepass && !caller_seeded_rho) {
+                    log::info!(
+                        "[OUTER] standard REML objective-grid selected seed: {:?} -> {:?}",
+                        base.as_slice().unwrap_or(&[]),
+                        refined.as_slice().unwrap_or(&[])
+                    );
+                    Some(refined)
+                } else {
+                    None
+                }
+            };
+            let problem = if let Some(seed) = prepass_seed {
+                problem.with_initial_rho(seed)
+            } else {
+                problem
+            };
+            // #1074 DIAGNOSTIC (log-gated, no behavior change unless the crate
+            // logger is installed): sweep each outer log-λ coordinate over a grid
+            // while holding the others at the baseline, logging the REML cost. Used
+            // to decide whether the spatial range railing is an interior optimum the
+            // optimizer misses (optimizer bug) or a genuine criterion preference for
+            // λ→∞ (criterion). Placed BEFORE the objective takes its `&mut
+            // reml_state` borrow so the immutable `compute_cost` reads are valid.
+            // Emitted at warn level so the default-installed crate logger (Info)
+            // prints it without a level change (the ban-scanner forbids direct
+            // stderr printing and process-env reads).
+            if log::log_enabled!(log::Level::Warn) {
+                let grid = [
+                    -5.0_f64, -2.0, 0.0, 2.0, 5.0, 8.0, 10.0, 12.0, 16.0, 20.0, 25.0, 30.0,
+                ];
+                let mut baselines: Vec<(&str, Array1<f64>)> =
+                    vec![("zeros", Array1::<f64>::zeros(k))];
+                if k == 4 {
+                    baselines.push(("conv", Array1::from(vec![9.0_f64, 30.0, 12.0, 30.0])));
+                }
+                if k == 2 {
+                    baselines.push(("conv6", Array1::from(vec![6.0_f64, 6.0])));
+                }
+                for (label, baseline) in &baselines {
+                    log::warn!("[#1074-sweep] k={k} baseline={label}={baseline:?}");
+                    for coord in 0..k {
+                        let mut line = format!("[#1074-sweep:{label}] coord={coord}:");
+                        for &rho in &grid {
+                            let mut p = baseline.clone();
+                            p[coord] = rho;
+                            let cg = reml_state.compute_cost_and_gradient(&p).ok();
+                            let cell = match cg {
+                                Some((c, g)) => {
+                                    format!(
+                                        "{c:.4}(g{}={:.3e})",
+                                        coord,
+                                        g.get(coord).copied().unwrap_or(f64::NAN)
+                                    )
+                                }
+                                None => "ERR".to_string(),
+                            };
+                            line.push_str(&format!(" {rho:.0}->{cell}"));
                         }
-                    }
-                    if !pass_improved {
-                        break;
+                        log::warn!("{line}");
                     }
                 }
-                if improved {
-                    // COLD confirmation (mirror of #1074): the warm grid probes
-                    // ran off each other's inner warm starts and can report a
-                    // spuriously-low cost. Clear the inner cache and re-score the
-                    // candidate cold; adopt only if its PURE REML STILL strictly
-                    // beats the authoritative converged baseline.
-                    reml_state.reset_outer_seed_state();
-                    let cold_penalized = reml_state.compute_cost(&best_rho);
-                    let cold_pure = cold_penalized.as_ref().ok().and_then(|&c| {
-                        c.is_finite().then(|| {
-                            c - reml_state.configured_rho_prior_atom(&best_rho).cost()
-                                - reml_state.soft_rho_guard_prior_atom(&best_rho).cost()
-                        })
-                    });
-                    // Total inner EDF at the candidate (cached from the cold eval).
-                    // The PARSIMONY guard: a genuine shrink-out must not INCREASE
-                    // the model's effective dimension (see `edf_conv`). When either
-                    // EDF is unavailable, refuse the adoption — a shrink that can't
-                    // be certified parsimonious is not worth the #1476 risk.
-                    let edf_best = reml_state
-                        .obtain_eval_bundle(&best_rho)
+            }
+
+            // Attach the outer-loop cache session. The session shares its
+            // realized-fit-context key with the inner beta record (different
+            // payload namespace), so a SIGKILL mid-outer-iter leaves both the
+            // last accepted β (inner record) and the best rho seen so far
+            // (outer iterate) on disk for the next run.
+            let problem = match reml_state.outer_cache_session() {
+                Some(session) => problem.with_cache_session(session),
+                None => problem,
+            };
+
+            let obj = problem.build_objective_with_screening_proxy(
+                &mut reml_state,
+                |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+                 rho: &Array1<f64>| { state.compute_cost(rho) },
+                |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+                 rho: &Array1<f64>| {
+                    outer_eval_idx.fetch_add(1, Ordering::Relaxed);
+                    state.compute_outer_eval_with_order(
+                        rho,
+                        if analytic_outer_hessian_available {
+                            OuterEvalOrder::ValueGradientHessian
+                        } else {
+                            OuterEvalOrder::ValueAndGradient
+                        },
+                    )
+                },
+                |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+                 rho: &Array1<f64>,
+                 order: OuterEvalOrder| {
+                    outer_eval_idx.fetch_add(1, Ordering::Relaxed);
+                    state.compute_outer_eval_with_order(rho, order)
+                },
+                Some(
+                    |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>| {
+                        state.reset_outer_seed_state()
+                    },
+                ),
+                Some(
+                    |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+                     rho: &Array1<f64>| { state.compute_efs_steps(rho) },
+                ),
+                |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+                 rho: &Array1<f64>| { state.compute_screening_proxy(rho) },
+            );
+            // Standard REML's eval closure publishes
+            // `inner_beta_hint = state.current_original_basis_beta()` on
+            // every accepted eval. The continuation pre-warm carries that
+            // hint forward and calls `seed_inner_state(beta)` before the
+            // next eval — see src/solver/reml/continuation.rs:209-212,
+            // 434-438. Without a hook here, `ClosureObjective::seed_inner_state`
+            // (src/solver/rho_optimizer.rs:2097-2107) rejected any
+            // non-empty β fatally, dropping every seed before the inner
+            // solver started (issue #236). Wire the symmetric consumer:
+            // when the pre-warm forwards the cached β, install it into the
+            // same `warm_start_beta` slot the publisher reads from.
+            let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
+
+            let mut strategy_result = problem.run(&mut obj, "standard REML")?;
+            drop(obj);
+            // #1371 release-and-rerank guard. The continuation oversmoothing
+            // warm-start can deliver the inner β on the high-λ null-space
+            // "annihilation" shelf of a double-penalty smooth: there the
+            // null-space coefficients are already shrunk to ~0, so the deviance
+            // ρ-gradient vanishes (∂dev/∂ρ_null → 0) AND the Occam terms
+            // (½ tr(H⁻¹ ∂H/∂ρ) − ½ λ tr(S⁺ S_k)) cancel, leaving the analytic
+            // outer gradient ≈ 0. ARC then certifies that point as a stationary
+            // optimum even though its REML cost is FAR ABOVE a point the seed
+            // prepass already evaluated — driving a genuinely-supported null-space
+            // direction (a real linear trend, gam#1371) to EDF → 0. The seed
+            // prepass's grid-refined seed is a known-good lower bound on the cost
+            // (it was scored with the SAME `compute_cost`), so if the certified
+            // optimum is strictly worse than it, re-rank to the seed: re-running
+            // the inner solve there installs the correct β̂. This cannot regress a
+            // fit whose optimum genuinely IS the high-λ corner (gam#1266: an
+            // unsupported term shrinking out) — there the corner is the
+            // lowest-cost point, no cheaper seed exists, and the guard is a no-op.
+            if let Some(seed) = release_rerank_seed.as_ref() {
+                // The certified cost is the optimizer's OWN authoritative
+                // `final_value`, NOT a fresh `compute_cost(strategy_result.rho)`
+                // re-evaluation (load-bearing, #1426/#1477). The REML/LAML objective
+                // for a non-Gaussian family is NOT a pure function of ρ: it carries a
+                // profiled dispersion / nuisance that is established by the inner
+                // solve at the operating ρ, and `compute_cost` warm-starts the inner
+                // PIRLS from whatever β̂/φ the previous eval left behind. Probing the
+                // under-penalized prepass seed FIRST (necessary so the no-op path can
+                // leave β̂ at the seed for a clean re-install) pollutes that nuisance
+                // state, so a subsequent re-eval of the cleanly-converged ρ comes back
+                // a few REML units ABOVE its true certified cost — e.g. a Gamma/log
+                // optimum certified at 829.857 re-evaluates at 834.90 right after the
+                // seed probe, which is then (wrongly) above the seed's own 833.47 and
+                // the guard "escapes" to the under-penalized seed, shipping a
+                // near-full-basis overfit (EDF ≈ k, falsely tagged converged) that the
+                // seed loop's keep-best had already rejected (#1426 silent overfit;
+                // #1477 Tweedie boundary/EDF blow-up). `final_value` was scored at the
+                // converged ρ with ITS own inner solve, so it is immune to that probe
+                // pollution and is the honest cost to compare the seed against.
+                let cost_converged = strategy_result.final_value;
+                // The seed probe is a non-fatal measurement; a seed that fails to
+                // evaluate simply skips the comparison. It leaves β̂ at the seed, so
+                // the no-op branch below relies on the unified β̂ re-install after the
+                // guard to restore it at `strategy_result.rho`.
+                //
+                // Probe the seed WITH its outer gradient (not cost alone): the grid
+                // prepass scored the seed by `compute_cost`, which runs the inner
+                // P-IRLS — at an under-penalized (λ→0) ρ the inner solve hits its
+                // iteration cap and reports a spuriously LOW cost (an invalid REML
+                // value the line search could not improve) while the analytic outer
+                // gradient still points strongly toward more penalization. The #1371
+                // false high-λ shelf this guard exists to escape is, by contrast, a
+                // GENUINE cheaper optimum: its seed is stationary. Even with the
+                // pollution-free `final_value` comparison above, a stuck stall can
+                // still under-cut it on raw cost, so only a seed whose cost is
+                // trustworthy (small residual gradient) may override the certified ρ.
+                let seed_eval = reml_state.compute_cost_and_gradient(seed).ok();
+                // Strict relative improvement so a numerically-equal seed (the common
+                // case where the optimizer reached the seed's basin) is left untouched
+                // and the fit stays byte-identical.
+                let floor = 1e-6 * (1.0 + cost_converged.abs());
+                if let Some((cost_seed, grad_seed)) = seed_eval.filter(|(c, _)| c.is_finite())
+                    && cost_converged.is_finite()
+                    && cost_seed < cost_converged - floor
+                {
+                    // Bound-projected residual gradient at the seed (same criterion
+                    // `nonconverged_cost_is_trustworthy` / the flat-valley stall guard
+                    // use): a component pinned at a bound by a gradient pushing past
+                    // it is feasible-stationary and drops out of the norm.
+                    let (blo, bhi) = {
+                        let (a, b) = reml_seed_config.bounds;
+                        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+                        (lo, hi.max(crate::estimate::RHO_BOUND))
+                    };
+                    let seed_grad_norm = {
+                        let mut sumsq = 0.0;
+                        for (i, &g) in grad_seed.iter().enumerate() {
+                            let s = seed.get(i).copied().unwrap_or(0.0);
+                            let pinned_lo = s <= blo + 1e-9 && g > 0.0;
+                            let pinned_hi = s >= bhi - 1e-9 && g < 0.0;
+                            if !(pinned_lo || pinned_hi) {
+                                sumsq += g * g;
+                            }
+                        }
+                        sumsq.sqrt()
+                    };
+                    let seed_cost_trustworthy = seed_grad_norm.is_finite()
+                        && seed_grad_norm
+                            <= crate::solver::rho_optimizer::FLAT_VALLEY_STALL_GRAD_CEILING;
+                    if seed_cost_trustworthy {
+                        log::info!(
+                            "[OUTER] #1371 release-and-rerank: certified ρ cost {cost_converged:.6e} \
+                         exceeds the prepass seed cost {cost_seed:.6e} (seed |g|={seed_grad_norm:.3e} \
+                         ≤ ceiling); adopting the seed (false high-λ stationary shelf escaped)"
+                        );
+                        strategy_result.rho = seed.clone();
+                        strategy_result.converged = true;
+                    } else {
+                        // #1426 leak: the cheaper seed is a stuck under-penalized
+                        // (λ→0) stall, not a genuine optimum — its low cost is an
+                        // inner-cap artifact. Adopting it would ship the near-full-
+                        // basis overfit (EDF ≈ k) and, worse, certify it converged.
+                        // Keep the honest certified ρ. β̂ is restored by the unified
+                        // re-install after the guard.
+                        log::info!(
+                            "[OUTER] #1371 release-and-rerank: prepass seed cost {cost_seed:.6e} is \
+                         cheaper than certified ρ {cost_converged:.6e} but UNTRUSTWORTHY \
+                         (seed |g|={seed_grad_norm:.3e} > ceiling — stuck under-penalized stall, \
+                         #1426); keeping the certified ρ"
+                        );
+                    }
+                }
+                // Re-install β̂ at the (possibly newly-adopted) reported ρ so the
+                // cached inner state matches `strategy_result.rho` for the downstream
+                // cap-guard / final assembly — whether the guard fired (β̂ → seed) or
+                // was a no-op (β̂ → the certified ρ, undoing the seed probe).
+                reml_state.compute_cost(&strategy_result.rho)?;
+            }
+            // #1074 UPPER-BOUND INWARD-DESCENT ESCAPE. The outer cost-stall /
+            // convergence check projects out a coordinate sitting on the ρ upper
+            // bound, so a coordinate that was driven to the over-smoothing rail can
+            // be certified "converged" even when the REML criterion is strictly
+            // LOWER at an interior ρ (a feasible inward descent the projection
+            // masks). On `s(long,lat,bs="tp") + s(depth)` the spatial/depth
+            // NULL-SPACE (affine-trend) coordinates rail to ρ=30 while
+            // `compute_cost` is ~23/~5 units lower at ρ≈2, annihilating a SUPPORTED
+            // spatial trend (#1074). This guard runs a bounded, keep-best
+            // coordinate-descent polish on EXACTLY the coordinates pinned at the
+            // upper bound: for each, it line-searches `compute_cost` over a coarse
+            // inward grid and adopts the strictly-best ρ. It uses the same
+            // authoritative `compute_cost` the optimizer minimizes, so it can only
+            // LOWER the certified cost — it never raises it and is a no-op when the
+            // rail genuinely is the optimum (an unsupported term shrinking out,
+            // #1266/#1271: no interior point is cheaper, so nothing is adopted).
+            {
+                let rho_upper = crate::estimate::RHO_BOUND;
+                // Coordinates eligible for the inward (less-smoothing) descent. Two
+                // kinds qualify:
+                //   (1) any coordinate pinned at the ρ upper rail — the original
+                //       #1074 case: the outer convergence check projects out a
+                //       rail-pinned coordinate, masking a feasible interior descent;
+                //   (2) the well-determined double-penalty NULL-SPACE selection
+                //       coordinates (`is_nullspace_degeneracy_prior`). These sit on a
+                //       near-FLAT REML ridge in λ_null, so the outer optimizer can
+                //       certify convergence at ANY high-but-not-railed ρ_null
+                //       depending on its (floating-point) iterate path. Reflecting the
+                //       covariate `x → −x` reverses the basis column order and flips
+                //       that landing shoulder: a SUPPORTED affine trend is kept at
+                //       ρ_null ≈ 0 in one orientation but over-penalized to e.g.
+                //       ρ_null ≈ 25 in the mirror (#1548), even though neither is at
+                //       the exact rail. Descending these to the cheaper interior
+                //       optimum lands BOTH orientations on the same shoulder.
+                // The descent below probes ONLY strictly-lower ρ, so it never
+                // over-smooths (raising λ_null is the #1266 escape's job, with its
+                // EDF parsimony guard against the #1476 concurvity transfer). It is
+                // keep-best + cold-confirmed against the authoritative penalized cost,
+                // so it is an exact no-op wherever the current ρ already is the
+                // optimum — e.g. an unsupported trend correctly shrunk out at the rail
+                // (#1266/#1271), where no interior point is cheaper.
+                let mut descent_coords: Vec<usize> = (0..strategy_result.rho.len())
+                    .filter(|&i| strategy_result.rho[i] >= rho_upper - 1e-9)
+                    .collect();
+                if n_design_rows >= 2 * p
+                    && let crate::types::RhoPrior::Independent(per_coord) =
+                        reml_state.effective_rho_prior().as_ref()
+                {
+                    for i in 0..strategy_result.rho.len() {
+                        if strategy_result.rho[i] < rho_upper - 1e-9
+                            && per_coord
+                                .get(i)
+                                .is_some_and(crate::terms::smooth::is_nullspace_degeneracy_prior)
+                        {
+                            descent_coords.push(i);
+                        }
+                    }
+                }
+                // Baseline to beat = the optimizer's OWN authoritative converged
+                // cost (`final_value`), which was scored at the converged ρ with its
+                // own inner solve and is immune to warm-start pollution from the
+                // probes below (the #1371 lesson). A probe only wins if it is
+                // strictly cheaper than this honest cost.
+                let base_cost = strategy_result.final_value;
+                if !descent_coords.is_empty() && base_cost.is_finite() {
+                    // Inward probe grid (descending from the rail). Bounded and
+                    // cheap: at most 2 · |railed| · 8 inner solves, and only when a
+                    // coord is actually pinned at the upper rail. Two coordinate-
+                    // descent passes pick up cross-coordinate coupling between the
+                    // railed axes.
+                    const INWARD_GRID: [f64; 8] = [25.0, 20.0, 15.0, 10.0, 5.0, 2.0, 0.0, -2.0];
+                    let mut best_rho = strategy_result.rho.clone();
+                    let mut best_cost = base_cost;
+                    let mut improved = false;
+                    for _pass in 0..2 {
+                        let mut pass_improved = false;
+                        for &coord in &descent_coords {
+                            let mut local_best = best_rho.clone();
+                            let mut local_cost = best_cost;
+                            for &cand in &INWARD_GRID {
+                                // Inward escape only ever DESCENDS (less smoothing):
+                                // skip any grid point at or above this coordinate's
+                                // current ρ. Over-smoothing a null-space coordinate is
+                                // the #1266 escape's job (it carries the EDF parsimony
+                                // guard that prevents the #1476 concurvity transfer);
+                                // this guard must never raise λ without it.
+                                if cand >= best_rho[coord] - 1e-9 {
+                                    continue;
+                                }
+                                let mut probe = best_rho.clone();
+                                probe[coord] = cand;
+                                if let Ok(c) = reml_state.compute_cost(&probe)
+                                    && c.is_finite()
+                                    && c < local_cost - 1e-6 * (1.0 + local_cost.abs())
+                                {
+                                    local_cost = c;
+                                    local_best = probe;
+                                }
+                            }
+                            if local_cost < best_cost - 1e-6 * (1.0 + best_cost.abs()) {
+                                best_rho = local_best;
+                                best_cost = local_cost;
+                                improved = true;
+                                pass_improved = true;
+                            }
+                        }
+                        if !pass_improved {
+                            break;
+                        }
+                    }
+                    // CONTINUOUS REFINEMENT of each descended coordinate. The coarse
+                    // INWARD_GRID snaps λ to a grid node (e.g. ρ_null = 0), but in the
+                    // OTHER covariate orientation the outer optimizer reports the
+                    // continuous interior minimizer (e.g. ρ_null = −0.37). Leaving one
+                    // orientation on the grid node while the other keeps the continuous
+                    // optimum leaves a small residual reflection asymmetry (#1548:
+                    // ~1.7e-3 mirror drift survives the grid descent alone). Golden-
+                    // section the SAME authoritative penalized cost on each moved
+                    // coordinate so both orientations converge to the identical
+                    // continuous minimum. It can only lower the cost from the grid node
+                    // (the bracket straddles it), and the cold confirmation below still
+                    // gates adoption, so this never raises the certified cost.
+                    if improved {
+                        const GS_R: f64 = 0.618_033_988_749_894_8; // (√5 − 1) / 2
+                        for coord in descent_coords.clone() {
+                            if (best_rho[coord] - strategy_result.rho[coord]).abs() <= 1e-9 {
+                                continue; // coordinate did not descend
+                            }
+                            // Bracket straddling the adopted grid node, never re-entering
+                            // the over-smoothing region above the coordinate's start ρ.
+                            let node = best_rho[coord];
+                            let mut a = node - 3.0;
+                            let mut b = (node + 3.0).min(strategy_result.rho[coord]);
+                            if b <= a + 1e-6 {
+                                continue;
+                            }
+                            let cost_at =
+                                |st: &mut RemlState, base: &Array1<f64>, x: f64| -> Option<f64> {
+                                    let mut p = base.clone();
+                                    p[coord] = x;
+                                    st.compute_cost(&p).ok().filter(|c| c.is_finite())
+                                };
+                            let mut c = b - GS_R * (b - a);
+                            let mut d = a + GS_R * (b - a);
+                            let mut fc = cost_at(&mut reml_state, &best_rho, c);
+                            let mut fd = cost_at(&mut reml_state, &best_rho, d);
+                            let mut refine_ok = fc.is_some() && fd.is_some();
+                            for _ in 0..40 {
+                                if (b - a).abs() < 1e-4 {
+                                    break;
+                                }
+                                match (fc, fd) {
+                                    (Some(vc), Some(vd)) if vc <= vd => {
+                                        b = d;
+                                        d = c;
+                                        fd = fc;
+                                        c = b - GS_R * (b - a);
+                                        fc = cost_at(&mut reml_state, &best_rho, c);
+                                    }
+                                    (Some(_), Some(_)) => {
+                                        a = c;
+                                        c = d;
+                                        fc = fd;
+                                        d = a + GS_R * (b - a);
+                                        fd = cost_at(&mut reml_state, &best_rho, d);
+                                    }
+                                    _ => {
+                                        refine_ok = false;
+                                        break;
+                                    }
+                                }
+                            }
+                            if refine_ok {
+                                let xm = 0.5 * (a + b);
+                                if let Some(fm) = cost_at(&mut reml_state, &best_rho, xm)
+                                    && fm < best_cost
+                                {
+                                    best_rho[coord] = xm;
+                                    best_cost = fm;
+                                }
+                            }
+                        }
+                    }
+                    if improved {
+                        // COLD CONFIRMATION (guards against adopting a warm-start /
+                        // inner-cap artifact, the #1426/#1371 trap). The grid probes
+                        // ran warm-started off each other; a λ→0-ish interior point
+                        // can report a spuriously low cost from a capped inner solve.
+                        // Clear the inner cache and re-score the candidate cold; only
+                        // adopt if it STILL strictly beats the authoritative
+                        // `final_value`.
+                        reml_state.reset_outer_seed_state();
+                        let cold = reml_state.compute_cost(&best_rho);
+                        let cold_ok = matches!(cold, Ok(c)
+                        if c.is_finite() && c < base_cost - 1e-6 * (1.0 + base_cost.abs()));
+                        if cold_ok {
+                            let cold_cost = cold.unwrap_or(best_cost);
+                            log::info!(
+                                "[OUTER] #1074/#1548 upper-bound escape: certified ρ cost \
+                             {base_cost:.6e} lowered to {cold_cost:.6e} (cold-confirmed) by \
+                             descending {} over-smoothed coord(s) inward; adopting the cheaper \
+                             interior ρ",
+                                descent_coords.len()
+                            );
+                            strategy_result.rho = best_rho;
+                            strategy_result.final_value = cold_cost;
+                            // β̂ already installed at `best_rho` by the cold eval above.
+                        } else {
+                            // The improvement did not survive a cold re-score — it was
+                            // a warm-start artifact. Keep the certified ρ and restore
+                            // its inner state for downstream assembly.
+                            reml_state.reset_outer_seed_state();
+                            reml_state.compute_cost(&strategy_result.rho)?;
+                        }
+                    }
+                }
+            }
+            // #1266 NULL-SPACE SHRINK-OUT ESCAPE (pure-REML; the OUTWARD-direction
+            // dual of the #1074 inward escape above).
+            //
+            // A default double-penalty smooth (mgcv `select = TRUE`) carries a
+            // `DoublePenaltyNullspace` shrinkage ridge on the term's penalty null
+            // space ({1, x} for a 1-D bend) whose only job is SELECTION: drive its
+            // λ_null UP to shrink an UNSUPPORTED term's constant+linear component out
+            // (EDF → 0). On a well-determined Gaussian fit the relaxed ρ-prior places
+            // a WIDE, symmetric `Normal(0, sd=15)` on that coordinate — NOT as a
+            // selection criterion but purely as a degeneracy-breaker: the #1476
+            // concurvity flat-ridge needs strictly-positive outer curvature to
+            // certify an interior allocation. That symmetric prior's `ρ/sd²` gradient
+            // also OPPOSES the (genuinely shallow) REML shrink-out tail, so the outer
+            // optimizer certifies a stationary point at a MODERATE λ_null
+            // (ρ_null ≈ 3.5, EDF ≈ 1.6) instead of following pure REML to the
+            // shrink-out corner — the residual #1266 "Half B" contract violation. The
+            // prior cannot be made one-sided: its high-ρ curvature is exactly what
+            // stops a SUPPORTED concurvity null space from railing out (#1476), so a
+            // data-INDEPENDENT prior cannot separate "shrink the unsupported term"
+            // (#1266) from "keep the supported one" (#1476/#1371) — they overlap in ρ.
+            //
+            // The data-DEPENDENT discriminator is pure data-REML PLUS a parsimony
+            // check. For each well-determined null-space selection coordinate,
+            // line-search the OVER-SMOOTHING (high-ρ) direction on the PURE REML cost
+            // (`compute_cost − configured_ρ_prior`; the prior is a conditioning
+            // device, not a selection criterion), then adopt the strictly-best
+            // COLD-confirmed point ONLY if it also does not increase the model's total
+            // EDF:
+            //   * UNSUPPORTED, uncorrelated null space (#1266 `s(z)`): pure REML
+            //     descends toward shrink-out AND total EDF drops (z carries no signal,
+            //     so nothing absorbs it) → the escape fires, EDF → 0.
+            //   * SUPPORTED null space (#1371 genuine slope): pure REML strictly RISES
+            //     under over-smoothing (killing a real linear trend dumps its variance
+            //     into σ̂²) → no strict improvement → exact no-op.
+            //   * CONCURVITY null space (#1476 `s(x1)+s(x2)`, corr ≈ 0.9): pure REML
+            //     *marginally* prefers over-smoothing one coordinate because the inner
+            //     β re-solve lets the CORRELATED partner absorb the shared signal — the
+            //     "signal transfer" the degeneracy prior exists to forbid. That
+            //     transfer keeps the deviance flat but INFLATES total EDF (the partner
+            //     spends extra basis), so the EDF-non-increase guard vetoes it →
+            //     no-op, the interior allocation is kept. (Pure REML alone cannot see
+            //     this: the concurvity ridge is flat, so the transfer reads as a tiny
+            //     improvement; the parsimony guard is what distinguishes a genuine
+            //     simplification from a lateral reallocation.)
+            //
+            // Unlike #1074 (where the OPTIMIZER's bound projection masks the descent),
+            // here it is the PRIOR that masks it, so the search runs on the pure
+            // (prior-stripped) criterion. SCOPE: eligible coordinates are exactly the
+            // well-determined relaxed null-space degeneracy coordinates
+            // (`is_nullspace_degeneracy_prior`, gated by `n ≥ 2·p`). This deliberately
+            // EXCLUDES the under-determined regime (`n < 2·p`, #1392 wine `p > n`),
+            // where the null-space prior is the AGGRESSIVE PC select-out — a
+            // deliberate, load-bearing selection push onto a genuinely-flat REML
+            // score that stripping would undo.
+            {
+                let well_determined = n_design_rows >= 2 * p;
+                let select_coords: Vec<usize> = if well_determined {
+                    match reml_state.effective_rho_prior().as_ref() {
+                        crate::types::RhoPrior::Independent(per_coord) => {
+                            (0..strategy_result.rho.len())
+                                .filter(|&i| {
+                                    per_coord.get(i).is_some_and(
+                                        crate::terms::smooth::is_nullspace_degeneracy_prior,
+                                    )
+                                })
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
+                // Authoritative pure-REML baseline at the converged ρ: the optimizer's
+                // own `final_value` (immune to warm-start pollution, the #1371 lesson)
+                // minus the configured ρ-prior + soft λ→0 guard it carried. A probe
+                // wins only if it strictly beats THIS pure cost.
+                let conv_prior = reml_state
+                    .configured_rho_prior_atom(&strategy_result.rho)
+                    .cost()
+                    + reml_state
+                        .soft_rho_guard_prior_atom(&strategy_result.rho)
+                        .cost();
+                let base_pure = strategy_result.final_value - conv_prior;
+                if !select_coords.is_empty() && base_pure.is_finite() && conv_prior.is_finite() {
+                    // Converged-point total inner EDF, for the PARSIMONY guard below.
+                    // The inner P-IRLS solve at the converged ρ is cached, so this is
+                    // free. A genuine #1266 shrink-out (an UNSUPPORTED, uncorrelated
+                    // term selected out) strictly LOWERS the model's total EDF; a
+                    // concurvity TRANSFER (#1476: one null-space shrinks but its
+                    // correlated partner absorbs the signal via the inner β re-solve)
+                    // INFLATES it. Pure REML alone marginally prefers the transfer on
+                    // a flat concurvity ridge — exactly the allocation the degeneracy
+                    // prior exists to forbid — so the escape must additionally refuse
+                    // any adoption that does not reduce total EDF.
+                    let edf_conv = reml_state
+                        .obtain_eval_bundle(&strategy_result.rho)
                         .ok()
                         .map(|b| b.pirls_result.edf);
-                    let edf_non_increasing = match (edf_best, edf_conv) {
-                        (Some(eb), Some(ec)) => eb <= ec + 1e-6,
-                        _ => false,
+                    // Pure data-REML at ρ: penalized `compute_cost` minus the configured
+                    // ρ-prior and the soft λ→0 guard (both `O(K)` functions of ρ alone).
+                    // Subtracting them recovers the mgcv-parity criterion selection
+                    // must follow; the prior bias on λ_null is removed exactly.
+                    let pure_reml = |rho: &Array1<f64>| -> Option<f64> {
+                        let c = reml_state.compute_cost(rho).ok()?;
+                        if !c.is_finite() {
+                            return None;
+                        }
+                        let prior = reml_state.configured_rho_prior_atom(rho).cost()
+                            + reml_state.soft_rho_guard_prior_atom(rho).cost();
+                        if !prior.is_finite() {
+                            return None;
+                        }
+                        Some(c - prior)
                     };
-                    if let (Ok(penalized), Some(cold_pure)) = (cold_penalized, cold_pure)
-                        && cold_pure.is_finite()
-                        && cold_pure < base_pure - 1e-6 * (1.0 + base_pure.abs())
-                        && edf_non_increasing
-                    {
-                        // β̂ already installed at `best_rho` by the cold eval above.
-                        // Report the PENALIZED cost there as the objective so the
-                        // cached inner state and `final_value` agree with the
-                        // adopted ρ for the downstream cap-guard / assembly.
-                        log::info!(
-                            "[OUTER] #1266 null-space shrink-out escape: pure REML \
+                    // Ascending over-smoothing grid in ABSOLUTE ρ (toward the
+                    // shrink-out rail at `RHO_BOUND`); only values strictly above a
+                    // coordinate's current ρ are over-smoothing candidates. Bounded:
+                    // at most 2 · |select| · 6 inner solves, and only fires when a
+                    // null-space coordinate is actually held below the rail.
+                    let rho_upper = crate::estimate::RHO_BOUND;
+                    const OUTWARD_GRID: [f64; 6] = [6.0, 9.0, 12.0, 18.0, 24.0, 30.0];
+                    let mut best_rho = strategy_result.rho.clone();
+                    let mut best_pure = base_pure;
+                    let mut improved = false;
+                    for _pass in 0..2 {
+                        let mut pass_improved = false;
+                        for &coord in &select_coords {
+                            let mut local_best = best_rho.clone();
+                            let mut local_pure = best_pure;
+                            for &cand in &OUTWARD_GRID {
+                                let target = cand.min(rho_upper);
+                                if target <= best_rho[coord] + 1e-9 {
+                                    continue;
+                                }
+                                let mut probe = best_rho.clone();
+                                probe[coord] = target;
+                                if let Some(c) = pure_reml(&probe)
+                                    && c < local_pure - 1e-6 * (1.0 + local_pure.abs())
+                                {
+                                    local_pure = c;
+                                    local_best = probe;
+                                }
+                            }
+                            if local_pure < best_pure - 1e-6 * (1.0 + best_pure.abs()) {
+                                best_rho = local_best;
+                                best_pure = local_pure;
+                                improved = true;
+                                pass_improved = true;
+                            }
+                        }
+                        if !pass_improved {
+                            break;
+                        }
+                    }
+                    if improved {
+                        // COLD confirmation (mirror of #1074): the warm grid probes
+                        // ran off each other's inner warm starts and can report a
+                        // spuriously-low cost. Clear the inner cache and re-score the
+                        // candidate cold; adopt only if its PURE REML STILL strictly
+                        // beats the authoritative converged baseline.
+                        reml_state.reset_outer_seed_state();
+                        let cold_penalized = reml_state.compute_cost(&best_rho);
+                        let cold_pure = cold_penalized.as_ref().ok().and_then(|&c| {
+                            c.is_finite().then(|| {
+                                c - reml_state.configured_rho_prior_atom(&best_rho).cost()
+                                    - reml_state.soft_rho_guard_prior_atom(&best_rho).cost()
+                            })
+                        });
+                        // Total inner EDF at the candidate (cached from the cold eval).
+                        // The PARSIMONY guard: a genuine shrink-out must not INCREASE
+                        // the model's effective dimension (see `edf_conv`). When either
+                        // EDF is unavailable, refuse the adoption — a shrink that can't
+                        // be certified parsimonious is not worth the #1476 risk.
+                        let edf_best = reml_state
+                            .obtain_eval_bundle(&best_rho)
+                            .ok()
+                            .map(|b| b.pirls_result.edf);
+                        let edf_non_increasing = match (edf_best, edf_conv) {
+                            (Some(eb), Some(ec)) => eb <= ec + 1e-6,
+                            _ => false,
+                        };
+                        if let (Ok(penalized), Some(cold_pure)) = (cold_penalized, cold_pure)
+                            && cold_pure.is_finite()
+                            && cold_pure < base_pure - 1e-6 * (1.0 + base_pure.abs())
+                            && edf_non_increasing
+                        {
+                            // β̂ already installed at `best_rho` by the cold eval above.
+                            // Report the PENALIZED cost there as the objective so the
+                            // cached inner state and `final_value` agree with the
+                            // adopted ρ for the downstream cap-guard / assembly.
+                            log::info!(
+                                "[OUTER] #1266 null-space shrink-out escape: pure REML \
                              {base_pure:.6e} → {cold_pure:.6e} (cold-confirmed), total \
                              EDF {edf_conv:?} → {edf_best:?} (parsimonious) by \
                              over-smoothing {} selection coord(s); adopting the \
                              shrink-out ρ (penalized cost {penalized:.6e})",
-                            select_coords.len()
-                        );
-                        strategy_result.rho = best_rho;
-                        strategy_result.final_value = penalized;
-                    } else {
-                        // The improvement did not survive a cold re-score (or the
-                        // re-score failed) — a warm-start artifact. Keep the
-                        // certified ρ and restore its inner state.
-                        reml_state.reset_outer_seed_state();
-                        reml_state.compute_cost(&strategy_result.rho)?;
-                    }
-                }
-            }
-        }
-        // Convergence guard for the outer-aware inner-PIRLS schedule
-        // (path #3): the BFGS bridge stores a coarsen-then-tighten cap
-        // into `reml_state.outer_inner_cap` on every accepted gradient
-        // eval. After the outer optimizer returns, the cached warm-start
-        // β was computed at whatever cap the schedule last set — which
-        // for fast-converging fits (≤5 BFGS iters) is a coarse cap of
-        // 5/10/20 rather than the full inner budget. Reset the cap to 0
-        // and run one final cost eval at the converged ρ so the cached
-        // β is at full inner tolerance.
-        run_outer_inner_cap_guard(
-            &mut reml_state,
-            &strategy_result.rho,
-            RemlInnerCapGuardArm::Standard,
-        )?;
-        // Honour an explicit caller rho seed as the accepted log-λ: when the
-        // caller pins `init_rhos`, the outer search is warm-started there and
-        // the seed is the requested operating point, so report it verbatim
-        // rather than the optimizer's (possibly clamped) returned rho.
-        //
-        // EXCEPTION (gam#1464): a caller seed that arrives as a warm-start hint
-        // (the spatial-κ sweep reuses the previous-κ λ̂ as `heuristic_lambdas`)
-        // must NOT pin the fit at a seed the optimizer has just been able to
-        // strictly improve on. At a collapsing kernel (the constant-curvature
-        // `curv()` smooth on the +κ side) the warm seed sits in a shallow
-        // under-smoothing basin whose spuriously-low deviance, if reported
-        // verbatim, makes the κ outer objective rail to the +chart bound for any
-        // curved data. The objective-grid prepass and the #1371 release-and-
-        // rerank guard above redirect `strategy_result.rho` into the correct
-        // high-λ basin; defer to that converged ρ whenever it is STRICTLY cheaper
-        // than the caller seed under the same REML cost. A genuine user pin (or a
-        // healthy warm start) converges at the seed, so the seed stays cheapest
-        // and is honoured verbatim, byte-for-byte as before.
-        let accepted_rho = match heuristic_lambdas.filter(|h| h.len() == k) {
-            Some(h) => {
-                let seed = Array1::from_iter(h.iter().copied());
-                let prefer_converged = {
-                    let cost_seed = reml_state.compute_cost(&seed).ok();
-                    let cost_converged = reml_state.compute_cost(&strategy_result.rho).ok();
-                    // Restore the cached β̂ to the converged operating point after
-                    // the seed probe (the no-op path below expects β̂ at
-                    // `strategy_result.rho`). Propagate any failure rather than
-                    // swallowing it: proceeding with β̂ at the wrong operating
-                    // point would silently corrupt the reported fit.
-                    reml_state.compute_cost(&strategy_result.rho)?;
-                    match (cost_seed, cost_converged) {
-                        (Some(cs), Some(cc)) if cs.is_finite() && cc.is_finite() => {
-                            cc < cs - 1e-6 * (1.0 + cs.abs())
+                                select_coords.len()
+                            );
+                            strategy_result.rho = best_rho;
+                            strategy_result.final_value = penalized;
+                        } else {
+                            // The improvement did not survive a cold re-score (or the
+                            // re-score failed) — a warm-start artifact. Keep the
+                            // certified ρ and restore its inner state.
+                            reml_state.reset_outer_seed_state();
+                            reml_state.compute_cost(&strategy_result.rho)?;
                         }
-                        _ => false,
                     }
-                };
-                if prefer_converged {
-                    log::info!(
-                        "[OUTER] #1464 warm-seed override: converged ρ is strictly cheaper than \
+                }
+            }
+            // Convergence guard for the outer-aware inner-PIRLS schedule
+            // (path #3): the BFGS bridge stores a coarsen-then-tighten cap
+            // into `reml_state.outer_inner_cap` on every accepted gradient
+            // eval. After the outer optimizer returns, the cached warm-start
+            // β was computed at whatever cap the schedule last set — which
+            // for fast-converging fits (≤5 BFGS iters) is a coarse cap of
+            // 5/10/20 rather than the full inner budget. Reset the cap to 0
+            // and run one final cost eval at the converged ρ so the cached
+            // β is at full inner tolerance.
+            run_outer_inner_cap_guard(
+                &mut reml_state,
+                &strategy_result.rho,
+                RemlInnerCapGuardArm::Standard,
+            )?;
+            // Honour an explicit caller rho seed as the accepted log-λ: when the
+            // caller pins `init_rhos`, the outer search is warm-started there and
+            // the seed is the requested operating point, so report it verbatim
+            // rather than the optimizer's (possibly clamped) returned rho.
+            //
+            // EXCEPTION (gam#1464): a caller seed that arrives as a warm-start hint
+            // (the spatial-κ sweep reuses the previous-κ λ̂ as `heuristic_lambdas`)
+            // must NOT pin the fit at a seed the optimizer has just been able to
+            // strictly improve on. At a collapsing kernel (the constant-curvature
+            // `curv()` smooth on the +κ side) the warm seed sits in a shallow
+            // under-smoothing basin whose spuriously-low deviance, if reported
+            // verbatim, makes the κ outer objective rail to the +chart bound for any
+            // curved data. The objective-grid prepass and the #1371 release-and-
+            // rerank guard above redirect `strategy_result.rho` into the correct
+            // high-λ basin; defer to that converged ρ whenever it is STRICTLY cheaper
+            // than the caller seed under the same REML cost. A genuine user pin (or a
+            // healthy warm start) converges at the seed, so the seed stays cheapest
+            // and is honoured verbatim, byte-for-byte as before.
+            let accepted_rho = match heuristic_lambdas.filter(|h| h.len() == k) {
+                Some(h) => {
+                    let seed = Array1::from_iter(h.iter().copied());
+                    let prefer_converged = {
+                        let cost_seed = reml_state.compute_cost(&seed).ok();
+                        let cost_converged = reml_state.compute_cost(&strategy_result.rho).ok();
+                        // Restore the cached β̂ to the converged operating point after
+                        // the seed probe (the no-op path below expects β̂ at
+                        // `strategy_result.rho`). Propagate any failure rather than
+                        // swallowing it: proceeding with β̂ at the wrong operating
+                        // point would silently corrupt the reported fit.
+                        reml_state.compute_cost(&strategy_result.rho)?;
+                        match (cost_seed, cost_converged) {
+                            (Some(cs), Some(cc)) if cs.is_finite() && cc.is_finite() => {
+                                cc < cs - 1e-6 * (1.0 + cs.abs())
+                            }
+                            _ => false,
+                        }
+                    };
+                    if prefer_converged {
+                        log::info!(
+                            "[OUTER] #1464 warm-seed override: converged ρ is strictly cheaper than \
                          the caller warm seed; reporting the optimizer's ρ instead of the seed"
-                    );
-                    strategy_result.rho.clone()
-                } else {
-                    seed
+                        );
+                        strategy_result.rho.clone()
+                    } else {
+                        seed
+                    }
                 }
-            }
-            None => strategy_result.rho.clone(),
-        };
-        (
-            accepted_rho,
-            cfg.link_kind.mixture_state().cloned(),
-            cfg.link_kind.sas_state().copied(),
-            None,
-            None,
-            strategy_result,
-        )
-    } else {
-        let use_mixture = mixture_dim > 0;
-        let use_sas = sas_dim > 0;
-        let use_beta_logistic =
-            use_sas && matches!(cfg.link_function(), LinkFunction::BetaLogistic);
-        let theta_dim = k + mixture_dim + sas_dim;
-        let sasspec = sas_optspec;
-        let mixspec = mixture_optspec
-            .clone()
-            .or_else(|| {
-                if use_mixture {
-                    None
-                } else {
-                    Some(MixtureLinkSpec {
-                        components: Vec::new(),
-                        initial_rho: Array1::zeros(0),
-                    })
-                }
-            })
-            .ok_or_else(|| EstimationError::InvalidInput("missing mixture spec".to_string()))?;
-        let mut heuristic_theta = Vec::new();
-        if let Some(hvals) = heuristic_lambdas
-            && hvals.len() == k
-        {
-            heuristic_theta.extend_from_slice(hvals);
-            if use_mixture {
-                heuristic_theta.extend_from_slice(mixspec.initial_rho.as_slice().unwrap_or(&[]));
-            }
-            if let Some(spec) = sasspec {
-                heuristic_theta.push(spec.initial_epsilon);
-                heuristic_theta.push(spec.initial_log_delta);
-            }
-        }
-        let heuristic_theta_ref = if heuristic_theta.len() == theta_dim {
-            Some(heuristic_theta.as_slice())
+                None => strategy_result.rho.clone(),
+            };
+            (
+                accepted_rho,
+                cfg.link_kind.mixture_state().cloned(),
+                cfg.link_kind.sas_state().copied(),
+                None,
+                None,
+                strategy_result,
+            )
         } else {
-            None
-        };
-        let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
-        let mut reml_seed_config_mix = reml_seed_config;
-        reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
-        if theta_dim >= REML_SEED_SCREENING_RHO_CAP {
-            reml_seed_config_mix.max_seeds = 1;
-            reml_seed_config_mix.seed_budget = 1;
-        }
-        use crate::solver::rho_optimizer::{
-            DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
-        };
-        let initial_link_kind = cfg.link_kind.clone();
-        let prefer_gradient_only = theta_dim >= REML_SECOND_ORDER_RHO_CAP;
-        let continuation_prewarm = theta_dim < REML_CONTINUATION_PREWARM_RHO_CAP;
-        if prefer_gradient_only {
-            log::info!(
-                "[OUTER] theta_dim {theta_dim} reaches exact REML Hessian budget \
+            let use_mixture = mixture_dim > 0;
+            let use_sas = sas_dim > 0;
+            let use_beta_logistic =
+                use_sas && matches!(cfg.link_function(), LinkFunction::BetaLogistic);
+            let theta_dim = k + mixture_dim + sas_dim;
+            let sasspec = sas_optspec;
+            let mixspec = mixture_optspec
+                .clone()
+                .or_else(|| {
+                    if use_mixture {
+                        None
+                    } else {
+                        Some(MixtureLinkSpec {
+                            components: Vec::new(),
+                            initial_rho: Array1::zeros(0),
+                        })
+                    }
+                })
+                .ok_or_else(|| EstimationError::InvalidInput("missing mixture spec".to_string()))?;
+            let mut heuristic_theta = Vec::new();
+            if let Some(hvals) = heuristic_lambdas
+                && hvals.len() == k
+            {
+                heuristic_theta.extend_from_slice(hvals);
+                if use_mixture {
+                    heuristic_theta
+                        .extend_from_slice(mixspec.initial_rho.as_slice().unwrap_or(&[]));
+                }
+                if let Some(spec) = sasspec {
+                    heuristic_theta.push(spec.initial_epsilon);
+                    heuristic_theta.push(spec.initial_log_delta);
+                }
+            }
+            let heuristic_theta_ref = if heuristic_theta.len() == theta_dim {
+                Some(heuristic_theta.as_slice())
+            } else {
+                None
+            };
+            let aux_dim_outer = if use_mixture { mixture_dim } else { sas_dim };
+            let mut reml_seed_config_mix = reml_seed_config;
+            reml_seed_config_mix.num_auxiliary_trailing = aux_dim_outer;
+            if theta_dim >= REML_SEED_SCREENING_RHO_CAP {
+                reml_seed_config_mix.max_seeds = 1;
+                reml_seed_config_mix.seed_budget = 1;
+            }
+            use crate::solver::rho_optimizer::{
+                DeclaredHessianForm, Derivative, HessianResult, OuterEval, OuterProblem,
+            };
+            let initial_link_kind = cfg.link_kind.clone();
+            let prefer_gradient_only = theta_dim >= REML_SECOND_ORDER_RHO_CAP;
+            let continuation_prewarm = theta_dim < REML_CONTINUATION_PREWARM_RHO_CAP;
+            if prefer_gradient_only {
+                log::info!(
+                    "[OUTER] theta_dim {theta_dim} reaches exact REML Hessian budget \
                    ({REML_SECOND_ORDER_RHO_CAP}); routing analytic-gradient quasi-Newton"
-            );
-        }
-        if !continuation_prewarm {
-            log::info!(
-                "[OUTER] theta_dim {theta_dim} reaches continuation-prewarm budget \
+                );
+            }
+            if !continuation_prewarm {
+                log::info!(
+                    "[OUTER] theta_dim {theta_dim} reaches continuation-prewarm budget \
                    ({REML_CONTINUATION_PREWARM_RHO_CAP}); starting optimizer directly from seeds"
-            );
-        }
-        let problem = OuterProblem::new(theta_dim)
+                );
+            }
+            let problem = OuterProblem::new(theta_dim)
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Either)
             .with_prefer_gradient_only(prefer_gradient_only)
@@ -1639,98 +1649,101 @@ where
             .with_screening_cap(Arc::clone(&reml_state.screening_max_inner_iterations))
             .with_outer_inner_cap(reml_inner_progress_feedback(&reml_state))
             .with_rho_bound(crate::estimate::RHO_BOUND);
-        let problem = if let Some(h) = heuristic_theta_ref {
-            problem.with_heuristic_lambdas(h.to_vec())
-        } else {
-            problem
-        };
-        let problem = if let Some(h) = heuristic_theta_ref {
-            problem.with_initial_rho(Array1::from_iter(h.iter().copied()))
-        } else {
-            problem
-        };
-        let problem = match reml_state.outer_cache_session() {
-            Some(session) => problem.with_cache_session(session),
-            None => problem,
-        };
-        // Shared helper: parse theta into rho + link params, update link state.
-        let apply_link_theta = |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
-                                theta: &Array1<f64>|
-         -> Result<Array1<f64>, EstimationError> {
-            let rho = theta.slice(s![..k]).to_owned();
-            let mut cfg_eval = cfg.clone();
-            if use_mixture {
-                let mix_rho = theta.slice(s![k..(k + mixture_dim)]).to_owned();
-                cfg_eval.link_kind = InverseLink::Mixture(
-                    state_fromspec(&MixtureLinkSpec {
-                        components: mixspec.components.clone(),
-                        initial_rho: mix_rho,
-                    })
-                    .map_err(|e| {
-                        EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
-                    })?,
-                );
-            }
-            if use_sas {
-                let epsilon = if use_beta_logistic {
-                    theta[k]
-                } else {
-                    let (v, _) = sas_effective_epsilon(theta[k]);
-                    v
-                };
-                let delta_like = theta[k + 1];
-                cfg_eval.link_kind = if use_beta_logistic {
-                    InverseLink::BetaLogistic(
-                        state_from_beta_logisticspec(SasLinkSpec {
-                            initial_epsilon: epsilon,
-                            initial_log_delta: delta_like,
-                        })
-                        .map_err(|e| {
-                            EstimationError::InvalidInput(format!(
-                                "invalid Beta-Logistic link: {e}"
-                            ))
-                        })?,
-                    )
-                } else {
-                    InverseLink::Sas(
-                        state_from_sasspec(SasLinkSpec {
-                            initial_epsilon: epsilon,
-                            initial_log_delta: delta_like,
-                        })
-                        .map_err(|e| {
-                            EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
-                        })?,
-                    )
-                };
-            }
-            state.set_link_states(
-                cfg_eval.link_kind.mixture_state().cloned(),
-                cfg_eval.link_kind.sas_state().copied(),
-            );
-            Ok(rho)
-        };
-
-        // SAS ridge/barrier cost correction (shared between cost_fn, eval_fn, efs_fn).
-        let sas_ridge_cost = |theta: &Array1<f64>| -> f64 {
-            let sasridge = if use_sas && !use_beta_logistic {
-                sasridgeweight
+            let problem = if let Some(h) = heuristic_theta_ref {
+                problem.with_heuristic_lambdas(h.to_vec())
             } else {
-                0.0
+                problem
             };
-            if use_sas && sasridge > 0.0 {
-                let log_delta = theta[k + 1];
-                let mut extra = 0.5 * sasridge * log_delta * log_delta;
-                if !use_beta_logistic {
-                    let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
-                    extra += barriercost;
-                }
-                extra
+            let problem = if let Some(h) = heuristic_theta_ref {
+                problem.with_initial_rho(Array1::from_iter(h.iter().copied()))
             } else {
-                0.0
-            }
-        };
+                problem
+            };
+            let problem = match reml_state.outer_cache_session() {
+                Some(session) => problem.with_cache_session(session),
+                None => problem,
+            };
+            // Shared helper: parse theta into rho + link params, update link state.
+            let apply_link_theta =
+                |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
+                 theta: &Array1<f64>|
+                 -> Result<Array1<f64>, EstimationError> {
+                    let rho = theta.slice(s![..k]).to_owned();
+                    let mut cfg_eval = cfg.clone();
+                    if use_mixture {
+                        let mix_rho = theta.slice(s![k..(k + mixture_dim)]).to_owned();
+                        cfg_eval.link_kind = InverseLink::Mixture(
+                            state_fromspec(&MixtureLinkSpec {
+                                components: mixspec.components.clone(),
+                                initial_rho: mix_rho,
+                            })
+                            .map_err(|e| {
+                                EstimationError::InvalidInput(format!(
+                                    "invalid blended inverse link: {e}"
+                                ))
+                            })?,
+                        );
+                    }
+                    if use_sas {
+                        let epsilon = if use_beta_logistic {
+                            theta[k]
+                        } else {
+                            let (v, _) = sas_effective_epsilon(theta[k]);
+                            v
+                        };
+                        let delta_like = theta[k + 1];
+                        cfg_eval.link_kind = if use_beta_logistic {
+                            InverseLink::BetaLogistic(
+                                state_from_beta_logisticspec(SasLinkSpec {
+                                    initial_epsilon: epsilon,
+                                    initial_log_delta: delta_like,
+                                })
+                                .map_err(|e| {
+                                    EstimationError::InvalidInput(format!(
+                                        "invalid Beta-Logistic link: {e}"
+                                    ))
+                                })?,
+                            )
+                        } else {
+                            InverseLink::Sas(
+                                state_from_sasspec(SasLinkSpec {
+                                    initial_epsilon: epsilon,
+                                    initial_log_delta: delta_like,
+                                })
+                                .map_err(|e| {
+                                    EstimationError::InvalidInput(format!("invalid SAS link: {e}"))
+                                })?,
+                            )
+                        };
+                    }
+                    state.set_link_states(
+                        cfg_eval.link_kind.mixture_state().cloned(),
+                        cfg_eval.link_kind.sas_state().copied(),
+                    );
+                    Ok(rho)
+                };
 
-        let obj = problem.build_objective(
+            // SAS ridge/barrier cost correction (shared between cost_fn, eval_fn, efs_fn).
+            let sas_ridge_cost = |theta: &Array1<f64>| -> f64 {
+                let sasridge = if use_sas && !use_beta_logistic {
+                    sasridgeweight
+                } else {
+                    0.0
+                };
+                if use_sas && sasridge > 0.0 {
+                    let log_delta = theta[k + 1];
+                    let mut extra = 0.5 * sasridge * log_delta * log_delta;
+                    if !use_beta_logistic {
+                        let (barriercost, _) = sas_log_delta_edge_barriercostgrad(log_delta);
+                        extra += barriercost;
+                    }
+                    extra
+                } else {
+                    0.0
+                }
+            };
+
+            let obj = problem.build_objective(
             &mut reml_state,
             |state: &mut &mut crate::solver::estimate::reml::RemlState<'_>,
              theta: &Array1<f64>| {
@@ -1844,218 +1857,218 @@ where
                 },
             ),
         );
-        // Same publish/consume symmetry as the standard REML arm above
-        // (issue #236). The mixture/SAS eval closure also surfaces
-        // `inner_beta_hint = state.current_original_basis_beta()` (see
-        // src/solver/estimate.rs:3275), so continuation pre-warm needs
-        // a real seed hook to install it.
-        let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
-        let outer_result = problem.run(&mut obj, "mixture/SAS flexible link")?;
-        drop(obj);
-        // Convergence guard for the outer-aware inner-PIRLS schedule
-        // (path #3) — see the matching comment in the standard REML arm
-        // above. Reset the cap and run one final compute_cost at the
-        // converged ρ so the cached warm-start β is at full inner
-        // tolerance regardless of where the BFGS schedule was when the
-        // optimizer terminated.
-        run_outer_inner_cap_guard(
-            &mut reml_state,
-            &outer_result.rho,
-            RemlInnerCapGuardArm::MixtureSas,
-        )?;
-        let final_rho = outer_result.rho.slice(s![..k]).to_owned();
-        let final_mix_state = if use_mixture {
-            let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
-            Some(
-                state_fromspec(&MixtureLinkSpec {
-                    components: mixspec.components.clone(),
-                    initial_rho: final_mix_rho,
-                })
-                .map_err(|e| {
-                    EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
-                })?,
-            )
-        } else {
-            None
-        };
-        let final_sas_state = if use_sas {
-            let epsilon_eff = if use_beta_logistic {
-                outer_result.rho[k]
+            // Same publish/consume symmetry as the standard REML arm above
+            // (issue #236). The mixture/SAS eval closure also surfaces
+            // `inner_beta_hint = state.current_original_basis_beta()` (see
+            // src/solver/estimate.rs:3275), so continuation pre-warm needs
+            // a real seed hook to install it.
+            let mut obj = obj.with_seed_inner_state(with_reml_beta_seed_hook());
+            let outer_result = problem.run(&mut obj, "mixture/SAS flexible link")?;
+            drop(obj);
+            // Convergence guard for the outer-aware inner-PIRLS schedule
+            // (path #3) — see the matching comment in the standard REML arm
+            // above. Reset the cap and run one final compute_cost at the
+            // converged ρ so the cached warm-start β is at full inner
+            // tolerance regardless of where the BFGS schedule was when the
+            // optimizer terminated.
+            run_outer_inner_cap_guard(
+                &mut reml_state,
+                &outer_result.rho,
+                RemlInnerCapGuardArm::MixtureSas,
+            )?;
+            let final_rho = outer_result.rho.slice(s![..k]).to_owned();
+            let final_mix_state = if use_mixture {
+                let final_mix_rho = outer_result.rho.slice(s![k..(k + mixture_dim)]).to_owned();
+                Some(
+                    state_fromspec(&MixtureLinkSpec {
+                        components: mixspec.components.clone(),
+                        initial_rho: final_mix_rho,
+                    })
+                    .map_err(|e| {
+                        EstimationError::InvalidInput(format!("invalid blended inverse link: {e}"))
+                    })?,
+                )
             } else {
-                let (v, _) = sas_effective_epsilon(outer_result.rho[k]);
-                v
+                None
             };
-            Some(if use_beta_logistic {
-                state_from_beta_logisticspec(SasLinkSpec {
-                    initial_epsilon: epsilon_eff,
-                    initial_log_delta: outer_result.rho[k + 1],
-                })
-                .map_err(|e| {
-                    EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
-                })?
-            } else {
-                state_from_sasspec(SasLinkSpec {
-                    initial_epsilon: epsilon_eff,
-                    initial_log_delta: outer_result.rho[k + 1],
-                })
-                .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?
-            })
-        } else {
-            cfg.link_kind.sas_state().copied()
-        };
-        let aux_param_covariance = None;
-        let (mix_cov, sas_cov) = if use_mixture {
-            (aux_param_covariance, None)
-        } else if use_sas {
-            (None, aux_param_covariance)
-        } else {
-            (None, None)
-        };
-        (
-            final_rho,
-            final_mix_state,
-            final_sas_state,
-            mix_cov,
-            sas_cov,
-            outer_result,
-        )
-    };
-    // Reuse the Gaussian-Identity XᵀWX cache the outer loop already populated,
-    // so the final accept-fit skips the streaming GEMM as well.
-    //
-    // When the outer loop conditioned the response (centering for #1000, scaling
-    // for #1127), that cache holds `XᵀW((y−center)/scale)`; the accept-fit runs
-    // on the *original* response `y_o`, so reusing the conditioned `XᵀWy` would
-    // solve on the shifted/rescaled scale and report every fitted value, residual
-    // and dispersion off the user's scale. Rebuild the cross-product from the
-    // original response in that case — the constant `XᵀWX` block is the only part
-    // the cache would have saved, a one-off cost paid only on the rare
-    // large-mean / small-magnitude responses that trigger conditioning.
-    let final_cache_handle = if response_center.is_some() || response_scale.is_some() {
-        None
-    } else {
-        reml_state.gaussian_fixed_cache_if_eligible()
-    };
-    let pirls_res_pair = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
-        LogSmoothingParamsView::new(final_rho.view()),
-        pirls::PirlsProblem {
-            x: reml_state.x(),
-            offset: offset_o.view(),
-            y: y_o.view(),
-            priorweights: w_o.view(),
-            covariate_se: None,
-            gaussian_fixed_cache: final_cache_handle.as_deref(),
-            // The final reported fit must be exact at the converged ρ/ψ — never
-            // serve the frozen-W first-step approximation here.
-            glm_first_step_gram: None,
-        },
-        pirls::PenaltyConfig {
-            canonical_penalties: reml_state.canonical_penalties(),
-            balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
-            reparam_invariant: None,
-            p,
-            coefficient_lower_bounds: None,
-            linear_constraints_original: fit_linear_constraints.as_ref(),
-            penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
-            kronecker_factored: None,
-        },
-        &pirls::PirlsConfig {
-            link_kind: if let Some(state) = final_mixture_state.clone() {
-                InverseLink::Mixture(state)
-            } else if let Some(state) = final_sas_state {
-                if matches!(cfg.link_function(), LinkFunction::BetaLogistic) {
-                    InverseLink::BetaLogistic(state)
+            let final_sas_state = if use_sas {
+                let epsilon_eff = if use_beta_logistic {
+                    outer_result.rho[k]
                 } else {
-                    InverseLink::Sas(state)
-                }
+                    let (v, _) = sas_effective_epsilon(outer_result.rho[k]);
+                    v
+                };
+                Some(if use_beta_logistic {
+                    state_from_beta_logisticspec(SasLinkSpec {
+                        initial_epsilon: epsilon_eff,
+                        initial_log_delta: outer_result.rho[k + 1],
+                    })
+                    .map_err(|e| {
+                        EstimationError::InvalidInput(format!("invalid Beta-Logistic link: {e}"))
+                    })?
+                } else {
+                    state_from_sasspec(SasLinkSpec {
+                        initial_epsilon: epsilon_eff,
+                        initial_log_delta: outer_result.rho[k + 1],
+                    })
+                    .map_err(|e| EstimationError::InvalidInput(format!("invalid SAS link: {e}")))?
+                })
             } else {
-                cfg.link_kind.clone()
+                cfg.link_kind.sas_state().copied()
+            };
+            let aux_param_covariance = None;
+            let (mix_cov, sas_cov) = if use_mixture {
+                (aux_param_covariance, None)
+            } else if use_sas {
+                (None, aux_param_covariance)
+            } else {
+                (None, None)
+            };
+            (
+                final_rho,
+                final_mix_state,
+                final_sas_state,
+                mix_cov,
+                sas_cov,
+                outer_result,
+            )
+        };
+        // Reuse the Gaussian-Identity XᵀWX cache the outer loop already populated,
+        // so the final accept-fit skips the streaming GEMM as well.
+        //
+        // When the outer loop conditioned the response (centering for #1000, scaling
+        // for #1127), that cache holds `XᵀW((y−center)/scale)`; the accept-fit runs
+        // on the *original* response `y_o`, so reusing the conditioned `XᵀWy` would
+        // solve on the shifted/rescaled scale and report every fitted value, residual
+        // and dispersion off the user's scale. Rebuild the cross-product from the
+        // original response in that case — the constant `XᵀWX` block is the only part
+        // the cache would have saved, a one-off cost paid only on the rare
+        // large-mean / small-magnitude responses that trigger conditioning.
+        let final_cache_handle = if response_center.is_some() || response_scale.is_some() {
+            None
+        } else {
+            reml_state.gaussian_fixed_cache_if_eligible()
+        };
+        let pirls_res_pair = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
+            LogSmoothingParamsView::new(final_rho.view()),
+            pirls::PirlsProblem {
+                x: reml_state.x(),
+                offset: offset_o.view(),
+                y: y_o.view(),
+                priorweights: w_o.view(),
+                covariate_se: None,
+                gaussian_fixed_cache: final_cache_handle.as_deref(),
+                // The final reported fit must be exact at the converged ρ/ψ — never
+                // serve the frozen-W first-step approximation here.
+                glm_first_step_gram: None,
             },
-            ..cfg.as_pirls_config()
-        },
-        None,
-        None,
-        // Final, reported fit at the REML-selected λ: refine the family's
-        // estimated dispersion nuisance at the converged η. For Gamma this
-        // re-estimates the shape so `dispersion_phi()` and every SE / interval
-        // reflect the conditional noise, not the spread of μ (#678); for Beta
-        // it drives the precision φ and the mean β̂ to their joint fixed point,
-        // undoing the slope attenuation from a φ frozen at the null predictor
-        // (#769). λ is fixed here, so there is no scale↔λ feedback.
-        true,
-    )?;
-    pirls_res = pirls_res_pair.0;
+            pirls::PenaltyConfig {
+                canonical_penalties: reml_state.canonical_penalties(),
+                balanced_penalty_root: Some(reml_state.balanced_penalty_root()),
+                reparam_invariant: None,
+                p,
+                coefficient_lower_bounds: None,
+                linear_constraints_original: fit_linear_constraints.as_ref(),
+                penalty_shrinkage_floor: opts.penalty_shrinkage_floor,
+                kronecker_factored: None,
+            },
+            &pirls::PirlsConfig {
+                link_kind: if let Some(state) = final_mixture_state.clone() {
+                    InverseLink::Mixture(state)
+                } else if let Some(state) = final_sas_state {
+                    if matches!(cfg.link_function(), LinkFunction::BetaLogistic) {
+                        InverseLink::BetaLogistic(state)
+                    } else {
+                        InverseLink::Sas(state)
+                    }
+                } else {
+                    cfg.link_kind.clone()
+                },
+                ..cfg.as_pirls_config()
+            },
+            None,
+            None,
+            // Final, reported fit at the REML-selected λ: refine the family's
+            // estimated dispersion nuisance at the converged η. For Gamma this
+            // re-estimates the shape so `dispersion_phi()` and every SE / interval
+            // reflect the conditional noise, not the spread of μ (#678); for Beta
+            // it drives the precision φ and the mean β̂ to their joint fixed point,
+            // undoing the slope attenuation from a φ frozen at the null predictor
+            // (#769). λ is fixed here, so there is no scale↔λ feedback.
+            true,
+        )?;
+        pirls_res = pirls_res_pair.0;
 
-    // Negative-Binomial outer θ↔λ alternation decision (#1448, supersedes the
-    // #1082 drift diagnostic).
-    //
-    // θ was frozen at the λ-search value (`frozen_negbin_theta`) so `F(ρ)` is
-    // stationary in ρ; the accept-fit above ML-refreshed θ at the converged η.
-    // If that refreshed θ_final drifted from the search θ_frozen by more than the
-    // joint-stationarity tolerance, the ρ we just selected was optimal for the
-    // OLD θ, not θ_final: re-freeze the search at θ_final, reset the outer seed
-    // state (eval bundle, PIRLS cache, warm-start signals, inner caps — all keyed
-    // to the old θ), and run the ρ search again. Iterate to the (ρ, θ) joint
-    // fixed point or until the round cap, after which we accept the last fit and
-    // log the residual drift. For non-NB / user-fixed-θ fits the criterion below
-    // is never met (θ is not estimated), so the loop breaks on round 0 and the
-    // fit is byte-identical to the pre-#1448 single pass.
-    let mut should_alternate = false;
-    if pirls_res.likelihood.negbin_theta_is_estimated() {
-        let frozen_bits = reml_state.frozen_negbin_theta.load(Ordering::Relaxed);
-        if frozen_bits != 0
-            && let Some(theta_final) = pirls_res.likelihood.negbin_theta()
-        {
-            let theta_frozen = f64::from_bits(frozen_bits);
-            if theta_frozen.is_finite() && theta_frozen > 0.0 && theta_final.is_finite() {
-                let rel_drift =
-                    (theta_final - theta_frozen).abs() / theta_frozen.max(f64::MIN_POSITIVE);
-                let drift_pct = rel_drift * 100.0;
-                if rel_drift > NEGBIN_THETA_JOINT_DRIFT_TOL {
-                    if negbin_alternation_round + 1 < NEGBIN_OUTER_ALTERNATION_MAX_ROUNDS {
-                        log::info!(
-                            "[OUTER] negative-binomial θ↔λ alternation round {}: θ drifted \
+        // Negative-Binomial outer θ↔λ alternation decision (#1448, supersedes the
+        // #1082 drift diagnostic).
+        //
+        // θ was frozen at the λ-search value (`frozen_negbin_theta`) so `F(ρ)` is
+        // stationary in ρ; the accept-fit above ML-refreshed θ at the converged η.
+        // If that refreshed θ_final drifted from the search θ_frozen by more than the
+        // joint-stationarity tolerance, the ρ we just selected was optimal for the
+        // OLD θ, not θ_final: re-freeze the search at θ_final, reset the outer seed
+        // state (eval bundle, PIRLS cache, warm-start signals, inner caps — all keyed
+        // to the old θ), and run the ρ search again. Iterate to the (ρ, θ) joint
+        // fixed point or until the round cap, after which we accept the last fit and
+        // log the residual drift. For non-NB / user-fixed-θ fits the criterion below
+        // is never met (θ is not estimated), so the loop breaks on round 0 and the
+        // fit is byte-identical to the pre-#1448 single pass.
+        let mut should_alternate = false;
+        if pirls_res.likelihood.negbin_theta_is_estimated() {
+            let frozen_bits = reml_state.frozen_negbin_theta.load(Ordering::Relaxed);
+            if frozen_bits != 0
+                && let Some(theta_final) = pirls_res.likelihood.negbin_theta()
+            {
+                let theta_frozen = f64::from_bits(frozen_bits);
+                if theta_frozen.is_finite() && theta_frozen > 0.0 && theta_final.is_finite() {
+                    let rel_drift =
+                        (theta_final - theta_frozen).abs() / theta_frozen.max(f64::MIN_POSITIVE);
+                    let drift_pct = rel_drift * 100.0;
+                    if rel_drift > NEGBIN_THETA_JOINT_DRIFT_TOL {
+                        if negbin_alternation_round + 1 < NEGBIN_OUTER_ALTERNATION_MAX_ROUNDS {
+                            log::info!(
+                                "[OUTER] negative-binomial θ↔λ alternation round {}: θ drifted \
                              {drift_pct:.1}% (θ_frozen={theta_frozen:.6e} → θ_final={theta_final:.6e}); \
                              re-freezing at θ_final and re-running the ρ search (#1448).",
-                            negbin_alternation_round + 1
-                        );
-                        // Re-freeze the λ-search θ at the refreshed value. The
-                        // capture in `solve_for_unified_rho` only writes when the
-                        // frozen slot is 0, so a non-zero value here pins every
-                        // subsequent λ-search inner solve to θ_final rather than
-                        // re-deriving it from the seed η.
-                        reml_state
-                            .frozen_negbin_theta
-                            .store(theta_final.to_bits(), Ordering::Relaxed);
-                        // The cached criterion / factor bundle and warm-start
-                        // signals were all computed at θ_frozen; drop them so the
-                        // next round's ρ search recomputes `F(ρ) = REML(ρ, θ_final)`.
-                        reml_state.reset_outer_seed_state();
-                        should_alternate = true;
-                    } else {
-                        log::warn!(
-                            "[OUTER] negative-binomial θ↔λ alternation hit the round cap \
+                                negbin_alternation_round + 1
+                            );
+                            // Re-freeze the λ-search θ at the refreshed value. The
+                            // capture in `solve_for_unified_rho` only writes when the
+                            // frozen slot is 0, so a non-zero value here pins every
+                            // subsequent λ-search inner solve to θ_final rather than
+                            // re-deriving it from the seed η.
+                            reml_state
+                                .frozen_negbin_theta
+                                .store(theta_final.to_bits(), Ordering::Relaxed);
+                            // The cached criterion / factor bundle and warm-start
+                            // signals were all computed at θ_frozen; drop them so the
+                            // next round's ρ search recomputes `F(ρ) = REML(ρ, θ_final)`.
+                            reml_state.reset_outer_seed_state();
+                            should_alternate = true;
+                        } else {
+                            log::warn!(
+                                "[OUTER] negative-binomial θ↔λ alternation hit the round cap \
                              ({NEGBIN_OUTER_ALTERNATION_MAX_ROUNDS}) with residual θ drift \
                              {drift_pct:.1}% (θ_frozen={theta_frozen:.6e} → θ_final={theta_final:.6e}); \
                              accepting the last fit (#1448)."
-                        );
-                    }
-                } else {
-                    log::debug!(
-                        "[OUTER] negative-binomial (ρ, θ) jointly stationary after {} \
+                            );
+                        }
+                    } else {
+                        log::debug!(
+                            "[OUTER] negative-binomial (ρ, θ) jointly stationary after {} \
                          alternation round(s): drift {drift_pct:.2}% \
                          (θ_frozen={theta_frozen:.6e} → θ_final={theta_final:.6e}).",
-                        negbin_alternation_round + 1
-                    );
+                            negbin_alternation_round + 1
+                        );
+                    }
                 }
             }
         }
-    }
-    if should_alternate {
-        negbin_alternation_round += 1;
-        continue;
-    }
-    break;
+        if should_alternate {
+            negbin_alternation_round += 1;
+            continue;
+        }
+        break;
     } // negbin θ↔λ alternation loop (#1448)
     // Ensure we don't report 0 iterations to the caller; at least 1 is more meaningful.
     let iters = std::cmp::max(1, outer_result.iterations);

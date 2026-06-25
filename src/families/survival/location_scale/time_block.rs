@@ -1157,9 +1157,7 @@ pub(crate) fn prepare_identified_time_block(
     // are a property of individual I-spline columns, not of the affine
     // generators that span their null space — and the row-wise guard takes over
     // that role exactly.)
-    if reduce_to_parametric
-        && let Some(z) = time_parametric_null_space_basis(&input.penalties, p)
-    {
+    if reduce_to_parametric && let Some(z) = time_parametric_null_space_basis(&input.penalties, p) {
         let r = z.ncols();
         // Canonical log-t gauge (issue #892). In the reduced constant-scale
         // parametric-AFT regime the I-spline time-warp collapses onto its log-t

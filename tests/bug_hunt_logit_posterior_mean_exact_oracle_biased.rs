@@ -18,7 +18,9 @@
 //! NO Gauss-Hermite, NO Faddeeva) on a fine grid. It must FAIL before the fix
 //! (errors ~1e-5 at the hard cases) and PASS after (errors < 1e-7).
 
-use gam::inference::quadrature::{QuadratureContext, logit_posterior_mean, logit_posterior_mean_exact};
+use gam::inference::quadrature::{
+    QuadratureContext, logit_posterior_mean, logit_posterior_mean_exact,
+};
 
 /// Standard-normal pdf.
 fn phi(z: f64) -> f64 {

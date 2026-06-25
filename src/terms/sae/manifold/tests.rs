@@ -3324,8 +3324,7 @@ fn planted_softmax_sae_term(
     )
     .unwrap();
     let term = SaeManifoldTerm::new(atoms, assignment).unwrap();
-    let target =
-        Array2::<f64>::from_shape_fn((n, p), |(row, c)| 0.05 * ((row + c) as f64).sin());
+    let target = Array2::<f64>::from_shape_fn((n, p), |(row, c)| 0.05 * ((row + c) as f64).sin());
     (term, target)
 }
 
@@ -8256,7 +8255,10 @@ pub(crate) fn gradient_lane_analytic_fallback_recovers_singular_outer_gradient_1
     assert!(
         objective
             .term
-            .outer_gradient_arrow_solver(&singular_cache, &objective.current_rho.lambda_smooth_vec())
+            .outer_gradient_arrow_solver(
+                &singular_cache,
+                &objective.current_rho.lambda_smooth_vec()
+            )
             .is_err(),
         "fixture precondition: the gauge-deflated analytic outer gradient must          REJECT this near-singular cache (no matching gauge/β-null to deflate)"
     );
@@ -8613,12 +8615,18 @@ pub(crate) fn affine_canonicalization_test_term() -> SaeManifoldTerm {
 #[test]
 pub(crate) fn affine_canonicalization_transports_live_penalty_instead_of_recomputing() {
     let mut term = affine_canonicalization_test_term();
-    let before: f64 = term.decoder_smoothness_quadratic_form_per_atom().iter().sum();
+    let before: f64 = term
+        .decoder_smoothness_quadratic_form_per_atom()
+        .iter()
+        .sum();
     let old_smooth_penalty = term.atoms[0].smooth_penalty.clone();
     let old_decoder = term.atoms[0].decoder_coefficients.clone();
 
     term.canonicalize_atom_affine_gauge(0, None).unwrap();
-    let after: f64 = term.decoder_smoothness_quadratic_form_per_atom().iter().sum();
+    let after: f64 = term
+        .decoder_smoothness_quadratic_form_per_atom()
+        .iter()
+        .sum();
     let invariant_gap = (after - before).abs() / before.abs().max(1.0);
     assert!(
         invariant_gap < 1.0e-9,
@@ -9974,5 +9982,3 @@ pub(crate) fn ibp_map_outer_objective_advertises_analytic_gradient() {
     let obj = SaeManifoldOuterObjective::new(term, target, None, rho, 5, 0.4, 1.0e-6, 1.0e-6);
     assert_eq!(obj.capability().gradient, Derivative::Analytic);
 }
-
-

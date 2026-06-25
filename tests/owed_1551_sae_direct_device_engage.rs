@@ -33,12 +33,13 @@
 //!
 //! Uses only the public crate API.
 
+use gam::gpu::GpuRuntime;
 use gam::gpu::kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
 use gam::gpu::policy::GpuDispatchPolicy;
-use gam::gpu::GpuRuntime;
 use gam::solver::arrow_schur::{
-    solve_arrow_newton_step_with_options, ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode,
-    BetaPenaltyOp, DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
+    ArrowSchurSystem, ArrowSolveOptions, ArrowSolverMode, BetaPenaltyOp, DeviceSaeFrameData,
+    DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
+    solve_arrow_newton_step_with_options,
 };
 use ndarray::Array2;
 
@@ -185,9 +186,7 @@ fn build_framed_sae_system(install_device_data: bool) -> ArrowSchurSystem {
     // Dense H_ββ matching the device penalty side EXACTLY (the device PCG penalty
     // matvec is `sae_framed_penalty_matvec_cpu`; here we materialise the same
     // operator densely so the CPU dense reference's reduced system agrees).
-    use gam::solver::arrow_schur::{
-        FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp,
-    };
+    use gam::solver::arrow_schur::{FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp};
     let data_op =
         FactoredFrameKroneckerOp::new(ranks.clone(), basis_sizes.clone(), frame_blocks.clone())
             .expect("frame op");
@@ -347,8 +346,9 @@ fn sae_direct_mode_routing_reachable_and_non_regressing_1551() {
     // Production entry on the device-frame system. On a device-absent host the
     // #1551 device branch declines (`GpuRuntime::global()` is None) and the solve
     // is the bit-identical CPU Direct path.
-    let (delta_t, delta_beta, cache) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
-        .expect("production Direct-mode SAE solve must succeed on a CPU host");
+    let (delta_t, delta_beta, cache) =
+        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &options)
+            .expect("production Direct-mode SAE solve must succeed on a CPU host");
     assert!(
         !cache.pcg_diagnostics.used_device_arrow,
         "no CUDA runtime present but used_device_arrow was set true"
@@ -390,8 +390,14 @@ fn sae_direct_mode_routing_reachable_and_non_regressing_1551() {
     );
 
     // Loose physical cross-check: reduced-Schur Direct step vs the full dense joint.
-    let ref_dt = max_abs_diff(cpu_dt.as_slice().unwrap(), reference.delta_t.as_slice().unwrap());
-    let ref_db = max_abs_diff(cpu_db.as_slice().unwrap(), reference.delta_beta.as_slice().unwrap());
+    let ref_dt = max_abs_diff(
+        cpu_dt.as_slice().unwrap(),
+        reference.delta_t.as_slice().unwrap(),
+    );
+    let ref_db = max_abs_diff(
+        cpu_db.as_slice().unwrap(),
+        reference.delta_beta.as_slice().unwrap(),
+    );
     assert!(
         ref_dt <= 1e-2 && ref_db <= 1e-2,
         "reduced-Schur step vs dense joint (max|Δt|={ref_dt:.3e}, max|Δβ|={ref_db:.3e})"

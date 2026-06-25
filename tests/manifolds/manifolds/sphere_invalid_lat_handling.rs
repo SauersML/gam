@@ -29,7 +29,8 @@ fn make_data_with_lats(lats: &[f64]) -> gam::data::EncodedDataset {
             ]));
         }
     }
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
+    encode_recordswith_inferred_schema(headers, rows)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
 }
 
 #[test]
@@ -84,7 +85,8 @@ fn assert_predict_with_invalid_lat_rejects_cleanly(formula: &str) {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(formula, &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit ok", e));
+    let result = fit_from_formula(formula, &data, &cfg)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit ok", e));
     let FitResult::Standard(fit) = result else {
         panic!("expected standard fit")
     };
@@ -117,7 +119,7 @@ fn sphere_harmonic_predict_with_lat_above_90_rejects_cleanly() {
 }
 
 #[test]
-fn sphere_lat_exactly_at_pole_accepts() { 
+fn sphere_lat_exactly_at_pole_accepts() {
     init_parallelism();
     let lats: Vec<f64> = (0..20)
         .map(|i| -75.0 + 8.0 * i as f64)
@@ -128,8 +130,12 @@ fn sphere_lat_exactly_at_pole_accepts() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "lat=±90 exactly must be accepted as the pole", e));
+    fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "lat=±90 exactly must be accepted as the pole", e
+        )
+    });
 }
 
 #[test]
@@ -150,7 +156,12 @@ fn sphere_lat_at_90_plus_tiny_eps_fails_with_useful_message() {
     };
     let err = fit_from_formula("y ~ sphere(lat, lon, k=10)", &data, &cfg)
         .err()
-        .unwrap_or_else(|| panic!("{} failed", "90.0 + 1e-12 should still fail strict validation"));
+        .unwrap_or_else(|| {
+            panic!(
+                "{} failed",
+                "90.0 + 1e-12 should still fail strict validation"
+            )
+        });
     let msg = err.to_string().to_lowercase();
     assert!(
         msg.contains("latitude") && msg.contains("90"),

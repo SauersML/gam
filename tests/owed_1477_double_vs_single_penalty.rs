@@ -130,7 +130,10 @@ fn build_data(seed: u64) -> gam::data::EncodedDataset {
     for _ in 0..N {
         let xi = rng.next_unit();
         let yi = rng.next_tweedie(truth_mean(xi), P_TWEEDIE, PHI);
-        assert!(yi.is_finite() && yi >= 0.0, "Tweedie y must be non-negative finite");
+        assert!(
+            yi.is_finite() && yi >= 0.0,
+            "Tweedie y must be non-negative finite"
+        );
         x.push(xi);
         y.push(yi);
     }
@@ -166,7 +169,11 @@ fn fit_tweedie(double_penalty: bool, data: &gam::data::EncodedDataset, grid_x: &
         build_term_collection_design(grid.view(), &fit.resolvedspec).expect("rebuild design");
     let eta = design.design.apply(&fit.fit.beta);
     let mean_on_grid: Vec<f64> = eta.iter().map(|e| e.exp()).collect();
-    FitOut { edf, converged, mean_on_grid }
+    FitOut {
+        edf,
+        converged,
+        mean_on_grid,
+    }
 }
 
 #[test]
@@ -188,8 +195,13 @@ fn tweedie_default_double_penalty_matches_single_penalty_no_overshrink_1477() {
         eprintln!(
             "[#1477 dp/sp] seed={seed} dp_rmse={dp_rmse:.4} (edf {:.2}, conv {}) \
              sp_rmse={sp_rmse:.4} (edf {:.2}, conv {}) x=1: dp={:.3} sp={:.3} truth={:.3}",
-            dp.edf, dp.converged, sp.edf, sp.converged,
-            dp.mean_on_grid[last], sp.mean_on_grid[last], truth[last]
+            dp.edf,
+            dp.converged,
+            sp.edf,
+            sp.converged,
+            dp.mean_on_grid[last],
+            sp.mean_on_grid[last],
+            truth[last]
         );
 
         // CONTRAST: the double-penalty `ps` mean must track the single-penalty
@@ -211,7 +223,8 @@ fn tweedie_default_double_penalty_matches_single_penalty_no_overshrink_1477() {
             dp.edf <= sp.edf + 1.5,
             "seed {seed}: Tweedie double-penalty ps EDF {:.2} inflated far above single-penalty \
              EDF {:.2} — a near-full-basis overfit (#1477/#1426).",
-            dp.edf, sp.edf
+            dp.edf,
+            sp.edf
         );
 
         // HONEST VERDICT: a converged double-penalty fit must not be a

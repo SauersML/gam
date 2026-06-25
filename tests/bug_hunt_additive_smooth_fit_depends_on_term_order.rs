@@ -113,8 +113,16 @@ fn fit_and_predict(
     let edf = fit.fit.edf_total().expect("fit reports total edf");
     let lambdas = fit.fit.lambdas.to_vec();
 
-    let xi = data.headers.iter().position(|h| h == "x").expect("x column");
-    let zi = data.headers.iter().position(|h| h == "z").expect("z column");
+    let xi = data
+        .headers
+        .iter()
+        .position(|h| h == "x")
+        .expect("x column");
+    let zi = data
+        .headers
+        .iter()
+        .position(|h| h == "z")
+        .expect("z column");
     let hlen = data.headers.len();
     let m = pts.len();
     let mut grid = Array2::<f64>::zeros((m, hlen));
@@ -174,7 +182,9 @@ fn additive_smooth_fit_is_invariant_to_term_order() {
              s(z)+s(x): edf={edf_b:.3} λ̂={lam_b:?} | max|Δμ̂|/range={rel:.3e}"
         );
     }
-    eprintln!("[term-order] worst max|Δμ̂|/range across seeds = {worst_rel:.3e} (seed {worst_seed})");
+    eprintln!(
+        "[term-order] worst max|Δμ̂|/range across seeds = {worst_rel:.3e} (seed {worst_seed})"
+    );
 
     assert!(
         worst_rel < REL_TOL,

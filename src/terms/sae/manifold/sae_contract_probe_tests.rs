@@ -5,18 +5,17 @@
 //! coordinate gradients/Hessians match finite differences on the penalized
 //! objective contract.
 
-use super::*;
 use super::tests::{
     TestPeriodicEvaluator, diagonal_latent_cache, periodic_basis,
     warmstart_test_objective_with_evaluator,
 };
+use super::*;
 use crate::terms::{AssignmentMode, LatentManifold, SaeAssignment};
 use approx::assert_abs_diff_eq;
 use ndarray::array;
 use std::sync::Arc;
 
-pub(crate) fn euclidean_line_contract_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho)
-{
+pub(crate) fn euclidean_line_contract_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let n = 150usize;
     let p = 8usize;
     let mut coords = Array2::<f64>::zeros((n, 1));
@@ -374,8 +373,7 @@ fn cotrained_criterion_folds_faithful_amortized_encoder_on_known_manifold() {
     let heldout_amplitudes = Array1::<f64>::ones(n_holdout);
     let mut target_norm_bound = 0.0_f64;
     for row in 0..n_holdout {
-        target_norm_bound =
-            target_norm_bound.max(heldout.row(row).dot(&heldout.row(row)).sqrt());
+        target_norm_bound = target_norm_bound.max(heldout.row(row).dot(&heldout.row(row)).sqrt());
     }
     let atlas = crate::terms::sae::encode::EncodeAtlas::build(
         &term.atoms,
@@ -1044,7 +1042,9 @@ fn jumprelu_hdiag_third_derivative_matches_central_difference_1415() {
     // Include the exact threshold (logit == θ ⇒ a = 1/2) plus in-band points.
     let logits = Array2::<f64>::from_shape_vec(
         (n, k),
-        vec![0.1, 0.0, 0.2, -0.05, 0.05, 0.15, 0.25, 0.3, -0.1, 0.12, 0.18, 0.08],
+        vec![
+            0.1, 0.0, 0.2, -0.05, 0.05, 0.15, 0.25, 0.3, -0.1, 0.12, 0.18, 0.08,
+        ],
     )
     .expect("valid logit grid");
     let atoms: Vec<SaeManifoldAtom> = (0..k)

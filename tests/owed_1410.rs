@@ -46,9 +46,7 @@ fn compact_layout(
         // Pick `active_per_row` distinct atoms, rotating across rows so the
         // active sets differ per row (the production reduction takes a max over
         // rows, so heterogeneous rows are the meaningful case).
-        let mut active: Vec<usize> = (0..active_per_row)
-            .map(|j| (row + j) % k_atoms)
-            .collect();
+        let mut active: Vec<usize> = (0..active_per_row).map(|j| (row + j) % k_atoms).collect();
         active.sort_unstable();
         active.dedup();
 

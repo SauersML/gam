@@ -147,10 +147,10 @@ pub(crate) struct SurvivalLocationScaleSpec {
     pub linkwiggle_block: Option<LinkWiggleBlockInput>,
     /// Explicit persistent warm-start cache session. See
     /// [`BlockwiseFitOptions::cache_session`].
-    pub cache_session: Option<std::sync::Arc<crate::warm_start::Session>>,
+    pub cache_session: Option<std::sync::Arc<gam_runtime::warm_start::Session>>,
     /// Persistent warm-start mirror sessions; see
     /// [`BlockwiseFitOptions::cache_mirror_sessions`].
-    pub cache_mirror_sessions: Vec<std::sync::Arc<crate::warm_start::Session>>,
+    pub cache_mirror_sessions: Vec<std::sync::Arc<gam_runtime::warm_start::Session>>,
 }
 
 #[derive(Clone)]
@@ -196,10 +196,10 @@ pub struct SurvivalLocationScaleTermSpec {
     pub initial_log_sigma_log_lambdas: Option<Array1<f64>>,
     /// Explicit persistent warm-start cache session. See
     /// [`crate::families::custom_family::BlockwiseFitOptions::cache_session`].
-    pub cache_session: Option<std::sync::Arc<crate::warm_start::Session>>,
+    pub cache_session: Option<std::sync::Arc<gam_runtime::warm_start::Session>>,
     /// Explicit persistent warm-start mirror sessions. See
     /// [`crate::families::custom_family::BlockwiseFitOptions::cache_mirror_sessions`].
-    pub cache_mirror_sessions: Vec<std::sync::Arc<crate::warm_start::Session>>,
+    pub cache_mirror_sessions: Vec<std::sync::Arc<gam_runtime::warm_start::Session>>,
 }
 
 pub const DEFAULT_SURVIVAL_LOCATION_SCALE_DERIVATIVE_GUARD: f64 = 1e-6;

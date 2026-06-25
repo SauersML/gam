@@ -1082,9 +1082,11 @@ pub(crate) fn joint_training_design_preflight(
     // proceed.
     let under_determined = p_joint > n;
     let underdetermination = if under_determined {
-        format!(" UNDER-DETERMINED: p_joint={p_joint} > n={n} — the unpenalized joint rank is \
+        format!(
+            " UNDER-DETERMINED: p_joint={p_joint} > n={n} — the unpenalized joint rank is \
                   capped at min(n, p_joint)={}, identifiability rests entirely on the penalties.",
-                 n.min(p_joint))
+            n.min(p_joint)
+        )
     } else {
         String::new()
     };

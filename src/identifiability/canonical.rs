@@ -1841,8 +1841,8 @@ mod tests {
     use super::*;
     use crate::families::custom_family::AdditiveBlockJacobian;
     use crate::linalg::matrix::DenseDesignMatrix;
-    use ndarray::Array2;
     use crate::test_support::spec_from_dense;
+    use ndarray::Array2;
 
     fn linspace(n: usize) -> ndarray::Array1<f64> {
         if n <= 1 {

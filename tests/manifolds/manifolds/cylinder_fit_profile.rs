@@ -21,7 +21,8 @@ fn dataset(n: usize) -> gam::data::EncodedDataset {
             StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
+    encode_recordswith_inferred_schema(headers, rows)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
 }
 
 fn time<T>(label: &str, f: impl FnOnce() -> T) -> T {
@@ -44,12 +45,14 @@ fn cylinder_fit_n_10k_stages() {
 
     // Stage 1: parse + materialize (formula → FitRequest)
     time("materialize", || {
-        materialize(formula, &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "materialize", e))
+        materialize(formula, &data, &cfg)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "materialize", e))
     });
 
     // Stage 2: full fit
     let total = Instant::now();
-    let res = fit_from_formula(formula, &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "cylinder fit", e));
+    let res = fit_from_formula(formula, &data, &cfg)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "cylinder fit", e));
     eprintln!(
         "[stage] total fit_from_formula N={n}: {:.3} ms",
         total.elapsed().as_secs_f64() * 1e3
@@ -72,7 +75,7 @@ fn cylinder_fit_n_10k_stages() {
 }
 
 #[test]
-fn cylinder_fit_n_10k_repeated_for_warmup_amortization() { 
+fn cylinder_fit_n_10k_repeated_for_warmup_amortization() {
     // Measure 5 sequential fits at N=10K to see if there's any one-time
     // setup cost that the first fit pays for (rayon pool, BLAS init, etc.)
     init_parallelism();
@@ -84,7 +87,8 @@ fn cylinder_fit_n_10k_repeated_for_warmup_amortization() {
     };
     for i in 0..5 {
         let t = Instant::now();
-        fit_from_formula(formula, &data, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit", e));
+        fit_from_formula(formula, &data, &cfg)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit", e));
         eprintln!(
             "[scale] cylinder te N=10000 iter {}: {:.3} ms",
             i,
@@ -94,7 +98,7 @@ fn cylinder_fit_n_10k_repeated_for_warmup_amortization() {
 }
 
 #[test]
-fn cylinder_fit_scaling_curve() { 
+fn cylinder_fit_scaling_curve() {
     // Time the same fit at N = 1k, 3k, 10k, 30k, 100k to see how it scales.
     init_parallelism();
     let formula = "y ~ te(theta, h, periodic=[0], period=[6.283185307179586, None])";

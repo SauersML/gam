@@ -1686,7 +1686,7 @@ fn cause_specific_survival_rho_prior(
 }
 
 fn hash_workflow_array_view(
-    hasher: &mut crate::warm_start::Fingerprinter,
+    hasher: &mut gam_runtime::warm_start::Fingerprinter,
     array: ArrayView1<'_, f64>,
 ) {
     hasher.write_usize(array.len());
@@ -1696,7 +1696,7 @@ fn hash_workflow_array_view(
 }
 
 fn hash_workflow_u8_array(
-    hasher: &mut crate::warm_start::Fingerprinter,
+    hasher: &mut gam_runtime::warm_start::Fingerprinter,
     array: ArrayView1<'_, u8>,
 ) {
     hasher.write_usize(array.len());
@@ -1705,7 +1705,10 @@ fn hash_workflow_u8_array(
     }
 }
 
-fn hash_workflow_array2(hasher: &mut crate::warm_start::Fingerprinter, array: ArrayView2<'_, f64>) {
+fn hash_workflow_array2(
+    hasher: &mut gam_runtime::warm_start::Fingerprinter,
+    array: ArrayView2<'_, f64>,
+) {
     hasher.write_usize(array.nrows());
     hasher.write_usize(array.ncols());
     for row in array.rows() {
@@ -1716,7 +1719,7 @@ fn hash_workflow_array2(hasher: &mut crate::warm_start::Fingerprinter, array: Ar
 }
 
 fn hash_workflow_design_matrix(
-    hasher: &mut crate::warm_start::Fingerprinter,
+    hasher: &mut gam_runtime::warm_start::Fingerprinter,
     matrix: &crate::matrix::DesignMatrix,
 ) {
     let dense = matrix.to_dense();
@@ -1741,7 +1744,7 @@ fn persistent_survival_transformation_key(
     opts: &crate::pirls::WorkingModelPirlsOptions,
     n_cols: usize,
 ) -> String {
-    let mut hasher = crate::warm_start::Fingerprinter::new();
+    let mut hasher = gam_runtime::warm_start::Fingerprinter::new();
     hasher.write_str("gamfit-persistent-survival-transformation-working-pirls");
     // Use the cache schema tag (NOT CARGO_PKG_VERSION) so routine
     // library version bumps don't invalidate users' on-disk warm-start
@@ -2795,7 +2798,7 @@ pub(crate) fn crossfit_score_calibration(
     data: &Dataset,
     col_map: &HashMap<String, usize>,
     recipe: Option<&CtnStage1Recipe>,
-    policy: &crate::resource::ResourcePolicy,
+    policy: &gam_runtime::resource::ResourcePolicy,
 ) -> Result<Option<CrossFitScoreCalibration>, String> {
     let Some(recipe) = recipe else {
         return Ok(None);

@@ -393,7 +393,6 @@ fn parse_block_diagnostics(err: &str) -> Option<(usize, f64, f64)> {
 /// asserted away.
 #[test]
 fn reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope() {
-
     let on = run_fit();
     eprintln!(
         "[confound-cure ON] max|β_m|={:.4e} conv={} |g|={:?} finite={} err={:?}",
@@ -507,7 +506,6 @@ fn reduced_basis_orthogonalization_bounds_beta_and_reduces_logslope() {
 /// claim is "the robust fit returns a finite bounded estimate and never errors".
 #[test]
 fn robust_cures_confounded_bms_never_fails_with_bounded_beta() {
-
     let on = run_fit();
 
     eprintln!(

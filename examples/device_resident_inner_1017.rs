@@ -32,7 +32,7 @@
 //! On a CPU-only host it prints a skip line (the device paths decline cleanly).
 
 use gam::gpu::kernels::sae_resident::{
-    color_arm_fixture, DeviceResidentInnerOptions, DeviceResidentInnerOutcome,
+    DeviceResidentInnerOptions, DeviceResidentInnerOutcome, color_arm_fixture,
 };
 use std::time::{Duration, Instant};
 

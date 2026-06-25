@@ -2708,8 +2708,7 @@ mod tests {
         // construction) — the raw block boundaries advance by each block's raw
         // width. This exercises the SMGS construction hook directly on the
         // compiled output rather than asserting against a hypothetical shape.
-        let v_per_term: Vec<Array2<f64>> =
-            compiled.blocks.iter().map(|b| b.t_lw.clone()).collect();
+        let v_per_term: Vec<Array2<f64>> = compiled.blocks.iter().map(|b| b.t_lw.clone()).collect();
         let r_per_term: Vec<Option<Array2<f64>>> = vec![None; v_per_term.len()];
         let gauge = Gauge::from_v_and_r(&v_per_term, &r_per_term);
 

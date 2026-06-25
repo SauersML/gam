@@ -507,8 +507,7 @@ impl ResidentDesignGram {
         #[cfg(target_os = "linux")]
         {
             let runtime = route_through_gpu(DispatchOp::XtDiagX { n, p })?;
-            let inner =
-                super::blas::ResidentWeightedGram::new(runtime.device.ordinal, x)?;
+            let inner = super::blas::ResidentWeightedGram::new(runtime.device.ordinal, x)?;
             Some(Self { inner })
         }
     }

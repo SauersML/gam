@@ -17,5 +17,5 @@ pub mod reml_trace;
 pub mod row_hessian_ops;
 pub mod sae_resident;
 pub mod sae_rowjet;
-pub mod survival_rowjet;
 pub(crate) mod sigma_cubature;
+pub mod survival_rowjet;

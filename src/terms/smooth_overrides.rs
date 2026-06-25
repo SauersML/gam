@@ -31,8 +31,6 @@ use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use crate::inference::data::EncodedDataset as Dataset;
-use crate::inference::model::ColumnKindTag;
 use crate::terms::basis::{
     BSplineBasisSpec, BSplineKnotSpec, CenterStrategy, ConstantCurvatureBasisSpec, DuchonBasisSpec,
     DuchonNullspaceOrder, MaternBasisSpec, MaternNu, MeasureJetBasisSpec, OneDimensionalBoundary,
@@ -42,6 +40,7 @@ use crate::terms::smooth::{
     BySmoothKind, ByVariableSpec, SmoothBasisSpec, SmoothTermSpec, TensorBSplineSpec,
     TermCollectionSpec, parse_shape_constraint,
 };
+use gam_data::{ColumnKindTag, EncodedDataset as Dataset};
 
 /// Apply the Python-side `smooths={...}` registry to a built term collection.
 ///
@@ -1222,7 +1221,7 @@ mod tests {
         }
     }
 
-    use crate::inference::model::{DataSchema, SchemaColumn};
+    use gam_data::{DataSchema, SchemaColumn};
 
     /// Minimal dataset carrying only the `headers` + `column_kinds` that
     /// `apply_smooth_overrides` reads (it never touches `values`/`schema`).

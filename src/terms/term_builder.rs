@@ -20,21 +20,19 @@ use crate::basis::{
     default_num_centers, default_spatial_center_strategy, default_spherical_harmonic_degree,
     plan_spatial_basis,
 };
-use crate::inference::data::{DataError, EncodedDataset as Dataset};
 use crate::inference::formula_dsl::{
     ParsedTerm, SmoothKind, option_bool, option_f64, option_f64_strict, option_usize,
     option_usize_any, option_usize_any_strict, option_usize_strict, strip_quotes,
 };
-use crate::inference::model::ColumnKindTag;
-use crate::resource::ResourcePolicy;
 use crate::smooth::{
-    ByVarKind, FactorSmoothFlavour, FactorSmoothSpec,
-    LinearCoefficientGeometry, LinearTermSpec, RandomEffectTermSpec, ShapeConstraint,
-    SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
-    TensorBSplinePenaltyDecomposition, TensorBSplineSpec, TermCollectionSpec,
+    ByVarKind, FactorSmoothFlavour, FactorSmoothSpec, LinearCoefficientGeometry, LinearTermSpec,
+    RandomEffectTermSpec, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec,
+    TensorBSplineIdentifiability, TensorBSplinePenaltyDecomposition, TensorBSplineSpec,
+    TermCollectionSpec,
 };
 use crate::types::ColIdx;
-
+use gam_data::{ColumnKindTag, DataError, EncodedDataset as Dataset};
+use gam_runtime::resource::ResourcePolicy;
 
 /// Floor on the derived default Matérn length scale, guarding against a zero or
 /// vanishingly small scale when the data span is degenerate.
@@ -63,7 +61,6 @@ const CYCLIC_DEFAULT_BASIS_DIM: usize = 12;
 /// over-fitting each group's within-group noise (gam#903). Overridden by an
 /// explicit `k`/`basis_dim`.
 const FACTOR_SMOOTH_DEFAULT_BASIS_DIM: usize = 10;
-
 
 /// Default row-chunk size for the out-of-core PCA-basis smooth when the
 /// `chunk_size=` option is absent. Streams the design in row blocks to bound
@@ -529,19 +526,20 @@ pub fn build_termspec(
                             // unpenalized treatment-coded main effect, which would
                             // double-represent the factor (two `g` design blocks +
                             // a spurious extra smoothing parameter).
-                            let penalized_group_owner_present = terms.iter().any(|other| match other {
-                                ParsedTerm::RandomEffect { name } => name == &by_name,
-                                ParsedTerm::Linear {
-                                    name,
-                                    explicit: false,
-                                    ..
-                                } if name == &by_name => col_map
-                                    .get(name)
-                                    .and_then(|c| ds.column_kinds.get(*c).copied())
-                                    .map(|kind| matches!(kind, ColumnKindTag::Categorical))
-                                    .unwrap_or(false),
-                                _ => false,
-                            });
+                            let penalized_group_owner_present =
+                                terms.iter().any(|other| match other {
+                                    ParsedTerm::RandomEffect { name } => name == &by_name,
+                                    ParsedTerm::Linear {
+                                        name,
+                                        explicit: false,
+                                        ..
+                                    } if name == &by_name => col_map
+                                        .get(name)
+                                        .and_then(|c| ds.column_kinds.get(*c).copied())
+                                        .map(|kind| matches!(kind, ColumnKindTag::Categorical))
+                                        .unwrap_or(false),
+                                    _ => false,
+                                });
                             // Add an unpenalized treatment-coded fixed main
                             // effect for a standalone factor-by smooth, unless
                             // the same factor already has an explicit
@@ -552,9 +550,7 @@ pub fn build_termspec(
                             // owner of level offsets; adding a no-pooling fixed
                             // factor effect would bypass random-effect
                             // shrinkage and degrade BLUP-style predictions.
-                            if !random_terms
-                                .iter()
-                                .any(|rt| rt.name == by_name)
+                            if !random_terms.iter().any(|rt| rt.name == by_name)
                                 && !penalized_group_owner_present
                             {
                                 random_terms.push(RandomEffectTermSpec {
@@ -3092,8 +3088,9 @@ pub fn build_smooth_basis(
                     // tensor axis requesting a linear margin) falls through to
                     // the B-spline branch below, exactly as before #1074 — mgcv
                     // likewise does not build a `cr` margin below k=3.
-                    let cr_knots = crate::terms::basis::select_cr_knots(ds.values.column(c), k_axis)
-                        .map_err(|e| e.to_string())?;
+                    let cr_knots =
+                        crate::terms::basis::select_cr_knots(ds.values.column(c), k_axis)
+                            .map_err(|e| e.to_string())?;
                     (
                         BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots },
                         OneDimensionalBoundary::Open,
@@ -3384,7 +3381,9 @@ fn capped_cr_marginal_knotspec(
         ));
     }
     let cr_knots = crate::terms::basis::select_cr_knots(col, k_cr).map_err(|e| e.to_string())?;
-    Ok(Some(BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots }))
+    Ok(Some(BSplineKnotSpec::NaturalCubicRegression {
+        knots: cr_knots,
+    }))
 }
 
 /// Smallest number of distinct covariate values seen within any single group
@@ -4207,7 +4206,7 @@ fn parse_spatial_identifiability(
 mod tests {
     use super::*;
     use crate::inference::formula_dsl::parse_formula;
-    use crate::inference::model::{DataSchema, SchemaColumn};
+    use gam_data::{DataSchema, SchemaColumn};
     use ndarray::Array2;
     use std::collections::BTreeMap;
 
@@ -4531,7 +4530,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("periodic boundary should build");
         let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4568,7 +4567,7 @@ mod tests {
                 &ds,
                 &col_map,
                 &mut notes,
-                &crate::resource::ResourcePolicy::default_library(),
+                &gam_runtime::resource::ResourcePolicy::default_library(),
             )
             .unwrap_or_else(|err| panic!("bs='{selector}' must build a 1-D smooth, got: {err:?}"));
             let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4615,7 +4614,7 @@ mod tests {
                 &ds,
                 &col_map,
                 &mut notes,
-                &crate::resource::ResourcePolicy::default_library(),
+                &gam_runtime::resource::ResourcePolicy::default_library(),
             )
             .unwrap_or_else(|err| {
                 panic!("`{formula}` must degree-reduce, not error; got: {err:?}")
@@ -4675,7 +4674,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("monotone smooth should build");
         assert_eq!(
@@ -4690,7 +4689,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes_bad,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect_err("bogus shape must error");
         assert!(
@@ -4720,7 +4719,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("build sphere termspec");
         let SmoothBasisSpec::Sphere { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4751,7 +4750,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("build default duchon termspec");
         let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4779,7 +4778,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("build hybrid duchon termspec");
         let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -4906,7 +4905,7 @@ mod tests {
                 &ds,
                 &col_map,
                 &mut notes,
-                &crate::resource::ResourcePolicy::default_library(),
+                &gam_runtime::resource::ResourcePolicy::default_library(),
             )
             .unwrap_or_else(|err| panic!("fs k={k} should degree-reduce, got: {err:?}"));
             let SmoothBasisSpec::FactorSmooth { spec } = &terms.smooth_terms[0].basis else {
@@ -4989,7 +4988,9 @@ mod tests {
         // is full-rank for the data, so it can still represent any 3 group means.
         let ds = continuous_dataset(
             &["y", "x"],
-            (0..90).map(|i| vec![(i % 3) as f64, (i % 3) as f64]).collect(),
+            (0..90)
+                .map(|i| vec![(i % 3) as f64, (i % 3) as f64])
+                .collect(),
         );
         let col_map = ds.column_map();
         let parsed = parse_formula("y ~ s(x, bs=cr, k=10)").expect("parse cr smooth");
@@ -4999,7 +5000,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("cr k=10 must cap to data support instead of erroring");
         let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -5025,7 +5026,9 @@ mod tests {
         // marginal — the default basis the same data already fits — NOT hard-fail.
         let ds = continuous_dataset(
             &["y", "x"],
-            (0..80).map(|i| vec![(i % 2) as f64, (i % 2) as f64]).collect(),
+            (0..80)
+                .map(|i| vec![(i % 2) as f64, (i % 2) as f64])
+                .collect(),
         );
         let col_map = ds.column_map();
         let parsed = parse_formula("y ~ s(x, bs=cr, k=10)").expect("parse cr smooth");
@@ -5035,19 +5038,24 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("binary cr must degrade to B-spline instead of erroring");
         let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
             panic!("expected BSpline1D for s(x, bs=cr)");
         };
         assert!(
-            !matches!(spec.knotspec, BSplineKnotSpec::NaturalCubicRegression { .. }),
+            !matches!(
+                spec.knotspec,
+                BSplineKnotSpec::NaturalCubicRegression { .. }
+            ),
             "binary covariate must NOT build a cr basis, got {:?}",
             spec.knotspec
         );
         assert!(
-            notes.iter().any(|n| n.contains("Degraded to the linear B-spline")),
+            notes
+                .iter()
+                .any(|n| n.contains("Degraded to the linear B-spline")),
             "degradation not reported in inference notes: {notes:?}"
         );
     }
@@ -5066,16 +5074,23 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("sz k=10 must cap the cr marginal instead of erroring");
         let SmoothBasisSpec::FactorSmooth { spec } = &terms.smooth_terms[0].basis else {
             panic!("expected FactorSmooth for s(x, g, bs=sz)");
         };
         let BSplineKnotSpec::NaturalCubicRegression { knots } = &spec.marginal.knotspec else {
-            panic!("expected cr marginal knotspec, got {:?}", spec.marginal.knotspec);
+            panic!(
+                "expected cr marginal knotspec, got {:?}",
+                spec.marginal.knotspec
+            );
         };
-        assert_eq!(knots.len(), 3, "sz cr marginal not capped to 3 distinct values");
+        assert_eq!(
+            knots.len(),
+            3,
+            "sz cr marginal not capped to 3 distinct values"
+        );
         assert_eq!(knots.as_slice().unwrap(), &[0.0, 1.0, 2.0]);
     }
 
@@ -5222,7 +5237,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("build tensor terms");
         let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -5289,7 +5304,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("build tensor with binary margin");
         let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -5353,7 +5368,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("uniform k=5 must auto-cap the binary margin instead of erroring");
         let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -5408,7 +5423,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("build tensor terms with per-margin k");
         let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -5456,7 +5471,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("build tensor terms without per-margin k");
         let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -5493,7 +5508,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("build multi-smooth terms");
         let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
@@ -5534,7 +5549,7 @@ mod tests {
             &ds,
             &col_map,
             &mut notes,
-            &crate::resource::ResourcePolicy::default_library(),
+            &gam_runtime::resource::ResourcePolicy::default_library(),
         )
         .expect("build multi-smooth terms");
         let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {

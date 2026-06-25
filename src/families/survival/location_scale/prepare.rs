@@ -758,7 +758,7 @@ pub(crate) fn prepare_survival_location_scale_model(
         x_link_wiggle: wigglespec.as_ref().map(|s| s.design.clone()),
         wiggle_knots: spec.linkwiggle_block.as_ref().map(|w| w.knots.clone()),
         wiggle_degree: spec.linkwiggle_block.as_ref().map(|w| w.degree),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let mut blockspecs = vec![timespec, thresholdspec, log_sigmaspec];

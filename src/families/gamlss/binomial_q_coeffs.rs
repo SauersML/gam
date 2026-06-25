@@ -133,7 +133,7 @@ mod oracle_tests {
     //! compiled form. If the hand factorization ever drifts from the jet these
     //! channels disagree.
     use super::*;
-    use crate::families::jet_tower::{Tower2, Tower4};
+    use gam_math::jet_tower::{Tower2, Tower4};
 
     /// Distinct seed-direction indices for the `q`-map jet: the two
     /// Hessian-block axes `a`/`b` and the two directional axes `u`/`v`.
@@ -228,7 +228,9 @@ mod oracle_tests {
     fn stream(seed: u64) -> impl FnMut() -> f64 {
         let mut s = seed;
         move || {
-            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((s >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
         }
     }
@@ -265,8 +267,7 @@ mod oracle_tests {
             let prod = directionalhessian_coeff_fromobjective_q_terms(
                 m[0], m[1], m[2], dq, q_a, q_b, q_ab, dq_a, dq_b, dq_ab,
             );
-            let tower =
-                tower_order3(m[0], m[1], m[2], dq, q_a, q_b, q_ab, dq_a, dq_b, dq_ab);
+            let tower = tower_order3(m[0], m[1], m[2], dq, q_a, q_b, q_ab, dq_a, dq_b, dq_ab);
             close("D_u H_ab", prod, tower);
         }
     }
@@ -351,16 +352,16 @@ mod oracle_tests {
                 m1, m2, m3, m4, dq_u, dqv, d2q_uv, q_t, qw, q_tw, dq_t_u, dq_tv, dqw_u, dqwv,
                 d2q_t_uv, d2qw_uv, dq_tw_u, dq_twv, d2q_tw_uv,
             );
-            let alpha_b =
-                m4 * dq_u * dqv * q_t + m3 * (d2q_uv * q_t + dq_u * dq_tv + dqv * dq_t_u) + m2 * d2q_t_uv;
+            let alpha_b = m4 * dq_u * dqv * q_t
+                + m3 * (d2q_uv * q_t + dq_u * dq_tv + dqv * dq_t_u)
+                + m2 * d2q_t_uv;
             let alpha_d = m3 * (dq_u * q_t * dq0v + dqv * q_t * dq0_u + dq_u * dqv * q0_t)
-                + m2
-                    * (dq_t_u * dq0v
-                        + dq_tv * dq0_u
-                        + q_t * d2q0_uv
-                        + d2q_uv * q0_t
-                        + dq_u * dq0_tv
-                        + dqv * dq0_t_u)
+                + m2 * (dq_t_u * dq0v
+                    + dq_tv * dq0_u
+                    + q_t * d2q0_uv
+                    + d2q_uv * q0_t
+                    + dq_u * dq0_tv
+                    + dqv * dq0_t_u)
                 + m1 * d2q0_t_uv;
             let alpha_dd = m2 * (q_t * dq0_u * dq0v + dq_u * dq0v * q0_t + dqv * dq0_u * q0_t)
                 + m1 * (d2q0_uv * q0_t + dq0_u * dq0_tv + dq0v * dq0_t_u);
@@ -402,7 +403,13 @@ mod oracle_tests {
                 + c_ww_dd_pair * dr * drk;
             max_ww = max_ww.max((coeff_ww - recon_ww).abs() / coeff_ww.abs().max(1.0));
         }
-        assert!(max_xw < 1e-12, "alpha_xw drifted from single source: {max_xw:.3e}");
-        assert!(max_ww < 1e-12, "c_ww drifted from single source: {max_ww:.3e}");
+        assert!(
+            max_xw < 1e-12,
+            "alpha_xw drifted from single source: {max_xw:.3e}"
+        );
+        assert!(
+            max_ww < 1e-12,
+            "c_ww drifted from single source: {max_ww:.3e}"
+        );
     }
 }

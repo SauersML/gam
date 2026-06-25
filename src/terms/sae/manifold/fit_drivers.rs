@@ -1595,10 +1595,8 @@ impl SaeManifoldTerm {
             .sum::<usize>()
             .min(n)
             .min(p);
-        let ev_floor = crate::terms::sae::manifold::outer_objective::collapse_ev_bar(
-            target,
-            dictionary_rank,
-        );
+        let ev_floor =
+            crate::terms::sae::manifold::outer_objective::collapse_ev_bar(target, dictionary_rank);
         if !(ev.is_finite() && ev <= ev_floor) {
             return Ok(false);
         }
@@ -1886,8 +1884,7 @@ impl SaeManifoldTerm {
                     );
                     let mut acc = 0.0_f64;
                     for c in 0..p {
-                        acc += curved_buf[c] * residual[[row, c]]
-                            + full_buf[c] * dfitted[[row, c]];
+                        acc += curved_buf[c] * residual[[row, c]] + full_buf[c] * dfitted[[row, c]];
                     }
                     out[row * q + off + axis] += a_k * acc;
                 }
@@ -2918,9 +2915,13 @@ impl SaeManifoldTerm {
 
         // Full path: the historical joint assembler (β tier materialised, then
         // discarded by the fixed-decoder step which reads only htt/gt).
-        let full_sys = self.assemble_arrow_schur(target, rho, analytic_penalties).map_err(|err| {
-            format!("SaeManifoldTerm::fixed_decoder_step_lean_vs_full_1407: full assemble: {err}")
-        })?;
+        let full_sys = self
+            .assemble_arrow_schur(target, rho, analytic_penalties)
+            .map_err(|err| {
+                format!(
+                    "SaeManifoldTerm::fixed_decoder_step_lean_vs_full_1407: full assemble: {err}"
+                )
+            })?;
         let full_step = Self::fixed_decoder_step_from_rows(&full_sys, ridge_ext_coord)?;
 
         Ok((lean_step, full_step))
@@ -3542,12 +3543,9 @@ impl SaeManifoldTerm {
                     // any loss scale. Anything else (already-converged decoder, a
                     // round that traded data-fit for penalty, or a refit/projection
                     // failure) restores the pre-round state and stops.
-                    let accept_floor =
-                        SAE_FINAL_EV_DEGRADATION_TOL * (1.0 + best_objective.abs());
+                    let accept_floor = SAE_FINAL_EV_DEGRADATION_TOL * (1.0 + best_objective.abs());
                     match round {
-                        Ok(value)
-                            if value.is_finite() && value < best_objective - accept_floor =>
-                        {
+                        Ok(value) if value.is_finite() && value < best_objective - accept_floor => {
                             best_objective = value;
                         }
                         _ => {

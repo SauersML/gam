@@ -43,13 +43,11 @@
 //! contract — the regression the #979 optimisation must never introduce — fails
 //! the first assertion; a both-wrong batched+per-axis pair fails the second.
 
-
 use gam::families::custom_family::{
     CustomFamily, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
 };
 use gam::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
 use ndarray::{Array1, Array2};
-
 
 /// `g'(η) = σ(1−σ)(1−2σ)`.
 fn g_weight_deriv(eta: f64) -> f64 {

@@ -301,10 +301,7 @@ fn collect_findings() -> Option<Vec<Finding>> {
             }
 
             // ---- Pattern 1: hard failure removed + benign substitute added ----
-            let removed_hard = h
-                .removed
-                .iter()
-                .any(|l| needles.line_has_hard_failure(l));
+            let removed_hard = h.removed.iter().any(|l| needles.line_has_hard_failure(l));
             let added_hard = h.added.iter().any(|l| needles.line_has_hard_failure(l));
             let added_benign = h
                 .added
@@ -345,7 +342,7 @@ fn collect_findings() -> Option<Vec<Finding>> {
             if let (Some(old_e), Some(new_e)) = (removed_exp, added_exp) {
                 if new_e < old_e {
                     findings.push(Finding {
-                            short: sha.chars().take(9).collect(),
+                        short: sha.chars().take(9).collect(),
                         file: h.file.clone(),
                         kind: "tolerance loosened",
                         detail: format!("bound exponent 1e-{old_e} -> 1e-{new_e}"),

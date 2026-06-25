@@ -46,7 +46,8 @@ fn two_smooth_multinomial_dataset() -> gam::data::EncodedDataset {
             ])
         })
         .collect::<Vec<_>>();
-    encode_recordswith_inferred_schema(headers, rows).expect("encode two-smooth multinomial dataset")
+    encode_recordswith_inferred_schema(headers, rows)
+        .expect("encode two-smooth multinomial dataset")
 }
 
 #[test]
@@ -106,10 +107,7 @@ fn multinomial_lambda_labels_are_one_per_penalty_component() {
     assert!(joined.contains("s(x)"), "labels must name s(x): {joined}");
     assert!(joined.contains("s(z)"), "labels must name s(z): {joined}");
     assert!(
-        model
-            .lambda_labels
-            .iter()
-            .any(|l| l.contains("null space")),
+        model.lambda_labels.iter().any(|l| l.contains("null space")),
         "the double penalty's null-space λ must carry a distinguishing role label: {joined}"
     );
 

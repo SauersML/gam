@@ -1418,8 +1418,8 @@ impl SaeManifoldOuterObjective {
             .map_err(|e| format!("SaeManifoldOuterObjective::efs_step: smooth dof: {e}"))?;
         for atom_idx in 0..k_smooth {
             let lambda_k = lambda_smooth_vec[atom_idx];
-            let rank_k =
-                p_out * (SaeManifoldTerm::symmetric_rank(&self.term.atoms[atom_idx].smooth_penalty)?
+            let rank_k = p_out
+                * (SaeManifoldTerm::symmetric_rank(&self.term.atoms[atom_idx].smooth_penalty)?
                     as f64);
             let quad_k = quad_per_atom[atom_idx];
             let eff_dof_k = eff_dof_per_atom[atom_idx];
@@ -2406,11 +2406,9 @@ mod linear_parity_anchor_1026_tests {
             let (term, target) = linear_term(k, n, p);
             let anchor = linear_span_anchor(&term, target.view())
                 .expect("linear anchor must solve on finite linear data");
-            let ev_anchor = reconstruction_explained_variance(
-                target.view(),
-                anchor.reconstruction.view(),
-            )
-            .expect("anchor EV must be finite");
+            let ev_anchor =
+                reconstruction_explained_variance(target.view(), anchor.reconstruction.view())
+                    .expect("anchor EV must be finite");
             // Each LINEAR atom has basis_size 2 ({1, t}); the sequential
             // Eckart-Young deflation captures top-2 of the residual per atom, so
             // K atoms capture rank min(2K, n, p). Compare to that PCA ceiling.
@@ -2421,10 +2419,7 @@ mod linear_parity_anchor_1026_tests {
                  PCA ceiling={ceiling:.8}  gap={:.2e}",
                 ceiling - ev_anchor
             );
-            assert!(
-                ev_anchor.is_finite(),
-                "K={k}: anchor EV must be finite"
-            );
+            assert!(ev_anchor.is_finite(), "K={k}: anchor EV must be finite");
             // The anchor's sequential rank-`basis_size`-per-atom residual
             // deflation is the greedy Eckart-Young projection onto the top-(K·basis)
             // right-singular subspace — essentially the rank-(K·basis) PCA optimum.
@@ -2485,7 +2480,10 @@ mod linear_parity_anchor_1026_tests {
                 2 * k,
                 ceiling - ev_anchor
             );
-            assert!(ev_anchor.is_finite(), "K={k}: large-K anchor EV must be finite");
+            assert!(
+                ev_anchor.is_finite(),
+                "K={k}: large-K anchor EV must be finite"
+            );
             // The non-trivially-ranked ceiling (e.g. K=8 ⇒ rank-16 ceiling on
             // rank-24 data is < 1.0) must be reached by the greedy deflation to the
             // same small margin as the small fixture; a scale-only regression would
@@ -2552,8 +2550,7 @@ mod linear_parity_anchor_1026_tests {
             // `decoder_coordinates` is n×rank, so `fast_abt` gives the n×p image).
             let coords = &atom_anchor.decoder_coordinates;
             let frame_matrix = atom_anchor.frame.frame().to_owned();
-            let image =
-                fast_abt(coords, &frame_matrix).mapv(|v| v * atom_anchor.gate_weight);
+            let image = fast_abt(coords, &frame_matrix).mapv(|v| v * atom_anchor.gate_weight);
             for row in 0..n {
                 if row % k == atom_idx {
                     for col in 0..p {
@@ -2659,12 +2656,16 @@ mod linear_parity_anchor_1026_tests {
         // Atom coords seeded to the true linear factor (d = 1); the unit-gate atom
         // can then reproduce X exactly. STRONGLY row-varying gate logits.
         let coords = Array2::from_shape_fn((n, 1), |(i, _)| zf[i]);
-        let logits = Array2::from_shape_fn((n, 1), |(i, _)| -3.0 + 6.0 * (i as f64) / (n as f64 - 1.0));
+        let logits =
+            Array2::from_shape_fn((n, 1), |(i, _)| -3.0 + 6.0 * (i as f64) / (n as f64 - 1.0));
 
         let fit_ev = |ungated: bool| -> f64 {
             let term = single_linear_atom_term(coords.clone(), logits.clone(), p, ungated);
-            let init_rho =
-                SaeManifoldRho::new((1.0e-4_f64).ln(), (1.0e-2_f64).ln(), vec![Array1::<f64>::zeros(1)]);
+            let init_rho = SaeManifoldRho::new(
+                (1.0e-4_f64).ln(),
+                (1.0e-2_f64).ln(),
+                vec![Array1::<f64>::zeros(1)],
+            );
             let outer = SaeManifoldOuterObjective::new(
                 term,
                 target.clone(),
@@ -2779,7 +2780,8 @@ mod linear_parity_anchor_1026_tests {
             );
             coords_blocks.push(coords);
         }
-        let logits = Array2::from_shape_fn((n, 2), |(i, k)| 0.4 + 0.03 * (i as f64) - 0.07 * (k as f64));
+        let logits =
+            Array2::from_shape_fn((n, 2), |(i, k)| 0.4 + 0.03 * (i as f64) - 0.07 * (k as f64));
         let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
             logits,
             coords_blocks,
@@ -2816,13 +2818,15 @@ mod linear_parity_anchor_1026_tests {
             );
             for j in 0..block.htt.ncols() {
                 assert_eq!(
-                    block.htt[[ungated_slot, j]], 0.0,
+                    block.htt[[ungated_slot, j]],
+                    0.0,
                     "#1026 row {row_idx}: ungated logit htt row entry ({ungated_slot},{j}) \
                      must be EXACTLY 0; got {}",
                     block.htt[[ungated_slot, j]]
                 );
                 assert_eq!(
-                    block.htt[[j, ungated_slot]], 0.0,
+                    block.htt[[j, ungated_slot]],
+                    0.0,
                     "#1026 row {row_idx}: ungated logit htt col entry ({j},{ungated_slot}) \
                      must be EXACTLY 0; got {}",
                     block.htt[[j, ungated_slot]]
@@ -2891,7 +2895,12 @@ mod linear_parity_anchor_1026_tests {
         // routing-bound evidence; the gated degradation magnitude is observed (it
         // depends on the REML basin / inner-solve dynamics that the no-MSI build
         // cannot pre-calibrate), so only the two PROVABLY-TRUE facts are asserted.
-        for &log_lam in &[(1.0e-3_f64).ln(), (1.0_f64).ln(), (1.0e2_f64).ln(), (1.0e4_f64).ln()] {
+        for &log_lam in &[
+            (1.0e-3_f64).ln(),
+            (1.0_f64).ln(),
+            (1.0e2_f64).ln(),
+            (1.0e4_f64).ln(),
+        ] {
             let ev_ungated = fit_ev(true, log_lam);
             let ev_gated = fit_ev(false, log_lam);
             println!(
@@ -2973,7 +2982,8 @@ mod linear_parity_anchor_1026_tests {
         let bc = Array1::from_shape_fn(p, |c| (((c * 3 + 2) % 5) as f64 - 2.0) * 0.7);
         let two_pi = std::f64::consts::TAU;
         let target = Array2::from_shape_fn((n, p), |(i, c)| {
-            a0[c] + a1[c] * zf[i]
+            a0[c]
+                + a1[c] * zf[i]
                 + bs[c] * (two_pi * theta[i]).sin()
                 + bc[c] * (two_pi * theta[i]).cos()
         });

@@ -65,6 +65,7 @@
 //! `#[ignore]`. R-free: every bar is OBJECTIVE truth recovery / a spectral
 //! identity, never "reproduce a reference tool's fitted output".
 
+use csv::StringRecord;
 use gam::basis::PenaltySource;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -72,7 +73,6 @@ use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::{Array2, ArrayView2};
 use std::f64::consts::PI;
 
@@ -316,14 +316,15 @@ fn fit_cell(
     };
     // `double_penalty=` is a per-smooth formula option (term_builder.rs); the
     // default for `s()` is `true`, so we set it explicitly in both arms.
-    let formula = format!(
-        "y ~ s(x, bs=\"ps\", k={K}, double_penalty={})",
-        dp.flag()
-    );
+    let formula = format!("y ~ s(x, bs=\"ps\", k={K}, double_penalty={})", dp.flag());
     let result = fit_from_formula(&formula, data, &cfg)
         .unwrap_or_else(|e| panic!("{} {} fit failed: {e:?}", family.label(), dp.label()));
     let FitResult::Standard(fit) = result else {
-        panic!("expected a Standard GAM fit for {} {}", family.label(), dp.label());
+        panic!(
+            "expected a Standard GAM fit for {} {}",
+            family.label(),
+            dp.label()
+        );
     };
     let edf_total = fit.fit.edf_total().expect("edf_total available");
 
@@ -345,7 +346,11 @@ fn fit_cell(
     // is fixed by the spec, so any evaluation grid yields the same constrained
     // penalty blocks; we use the training rows to be unambiguous).
     let penalties = match dp {
-        DoublePenalty::On => Some(extract_constrained_penalties(data, &fit.resolvedspec, x_idx)),
+        DoublePenalty::On => Some(extract_constrained_penalties(
+            data,
+            &fit.resolvedspec,
+            x_idx,
+        )),
         DoublePenalty::Off => None,
     };
 
@@ -562,7 +567,8 @@ fn double_penalty_projector_holds_across_family_dp_prior_factorial_1477_1476() {
                         // centering for this k=10 order-2 P-spline), not the
                         // rank-2 congruence of the raw projector.
                         assert_eq!(
-                            rank_p, nullity_s,
+                            rank_p,
+                            nullity_s,
                             "cell {cell} seed {seed}: rank(P)={rank_p} must equal \
                              nullity(S_c)={nullity_s} (= p - rank(S_c) = {} - {rank_s}); \
                              the pre-fix raw-chart ridge had rank 2 here.",

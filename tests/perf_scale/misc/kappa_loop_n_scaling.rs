@@ -639,7 +639,9 @@ fn simulate_1d_poisson(n: usize) -> (Array2<f64>, Array1<f64>) {
         x[[i, 0]] = t;
         let mu = (0.6 * t.sin()).exp();
         // Deterministic Poisson(mu) via inverse-CDF on a fixed per-row uniform.
-        let u = (((i as u64).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)
+        let u = (((i as u64)
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407)
             >> 11) as f64)
             / ((1u64 << 53) as f64);
         let mut k = 0u32;
@@ -722,7 +724,10 @@ fn kappa_glm_poisson_loop_n_scaling_report() {
     let bounds = (1e-2, 1e2);
     let warm = run_fit_poisson(1000, bounds);
     match &warm {
-        Ok(t) => eprintln!("[kappa-glm] warm Poisson κ fit primed caches in {:.4}s", t.wall_s),
+        Ok(t) => eprintln!(
+            "[kappa-glm] warm Poisson κ fit primed caches in {:.4}s",
+            t.wall_s
+        ),
         Err(reason) => {
             // The GLM frozen-W lane is a best-effort accelerator; if this fixture
             // does not converge in the CI budget, report and return rather than
@@ -756,10 +761,7 @@ fn kappa_glm_poisson_loop_n_scaling_report() {
         callback_avg.push(per_cb.max(1e-6));
         eprintln!(
             "[kappa-glm] {n:>9}  {:>10.4}  {:>12.5}  {:>9}  {:>9}",
-            kappa.wall_s,
-            per_cb,
-            timing.slow_path_resets,
-            calls
+            kappa.wall_s, per_cb, timing.slow_path_resets, calls
         );
     }
 

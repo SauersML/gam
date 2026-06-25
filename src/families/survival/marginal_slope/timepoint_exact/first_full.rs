@@ -11,8 +11,6 @@
 
 use super::*;
 
-
-
 pub(super) fn moving_density_boundary_flux(
     axis: usize,
     primary: &FlexPrimarySlices,
@@ -69,10 +67,7 @@ pub(super) fn moving_density_boundary_flux(
     right - left
 }
 
-
 impl SurvivalMarginalSlopeFamily {
-
-
     pub(crate) fn compute_survival_timepoint_first_order_exact(
         &self,
         row: usize,
@@ -163,20 +158,13 @@ impl SurvivalMarginalSlopeFamily {
                         &chi_u_poly,
                         &poly_mul(&poly_mul(&chi_poly, &eta_poly), &eta_u_poly),
                     );
-                    d_u[u] =
-                        exact_kernel::cell_polynomial_integral_from_moments(
-                            &integrand,
-                            &state.moments,
-                            "survival D_t first derivative",
-                        )? + moving_density_boundary_flux(
-                            u,
-                            primary,
-                            &a_u,
-                            entry,
-                            &chi_poly,
-                            b,
-                            true,
-                        );
+                    d_u[u] = exact_kernel::cell_polynomial_integral_from_moments(
+                        &integrand,
+                        &state.moments,
+                        "survival D_t first derivative",
+                    )? + moving_density_boundary_flux(
+                        u, primary, &a_u, entry, &chi_poly, b, true,
+                    );
                 }
                 Ok(d_u)
             })
@@ -253,5 +241,4 @@ impl SurvivalMarginalSlopeFamily {
             d_u,
         })
     }
-
 }

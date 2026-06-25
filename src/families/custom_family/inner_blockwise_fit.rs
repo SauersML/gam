@@ -828,7 +828,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             let tr_row_measure_top =
                 crate::solver::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
             let hessian_started = std::time::Instant::now();
-            let hessian_scope_guard = crate::process_monitor::track_scope(format!(
+            let hessian_scope_guard = gam_runtime::process_monitor::track_scope(format!(
                 "joint Newton hessian_qp cycle={cycle} n={total_joint_n} p={total_p}"
             ));
             log::info!(
@@ -5115,13 +5115,14 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 let oldest = *residual_rate_history.front().unwrap();
                 // Single source of truth for the slow-geometric-rate projection
                 // (gam#979): deterministic cycle-count projection, no wall-clock.
-                let too_slow = crate::solver::loop_guard::slow_geometric_rate_exceeds_projection_cap(
-                    residual,
-                    oldest,
-                    LINEAR_RATE_WINDOW,
-                    residual_tol,
-                    LINEAR_RATE_PROJECTION_CAP,
-                );
+                let too_slow =
+                    crate::solver::loop_guard::slow_geometric_rate_exceeds_projection_cap(
+                        residual,
+                        oldest,
+                        LINEAR_RATE_WINDOW,
+                        residual_tol,
+                        LINEAR_RATE_PROJECTION_CAP,
+                    );
                 if too_slow {
                     log::warn!(
                         "[PIRLS/joint-Newton convergence] cycle {:>3} | slow-geometric-rate stall early-exit (gam#979): residual={:.3e} (tol={:.3e}) descending at ~{:.4}×/cycle over the last {} cycles — projected >{} more cycles to reach tol; the residual is converging but far too slowly to finish in a practical budget (the survival marginal-slope oversmoothed-ρ endgame), so returning unconverged with finite β instead of grinding to inner_max_cycles={}.",

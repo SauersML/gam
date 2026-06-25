@@ -9,24 +9,24 @@ pub static COMPOSE_UNARY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub static MUL_CALLS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone)]
-pub(crate) struct MultiDirJet {
-    pub(crate) coeffs: Vec<f64>,
+pub struct MultiDirJet {
+    pub coeffs: Vec<f64>,
 }
 
 impl MultiDirJet {
-    pub(crate) fn zero(n_dirs: usize) -> Self {
+    pub fn zero(n_dirs: usize) -> Self {
         Self {
             coeffs: vec![0.0; 1usize << n_dirs],
         }
     }
 
-    pub(crate) fn constant(n_dirs: usize, value: f64) -> Self {
+    pub fn constant(n_dirs: usize, value: f64) -> Self {
         let mut out = Self::zero(n_dirs);
         out.coeffs[0] = value;
         out
     }
 
-    pub(crate) fn linear(n_dirs: usize, base: f64, first: &[f64]) -> Self {
+    pub fn linear(n_dirs: usize, base: f64, first: &[f64]) -> Self {
         let mut out = Self::constant(n_dirs, base);
         for (idx, &value) in first.iter().take(n_dirs).enumerate() {
             out.coeffs[1usize << idx] = value;
@@ -34,7 +34,7 @@ impl MultiDirJet {
         out
     }
 
-    pub(crate) fn with_coeffs(n_dirs: usize, coeffs: &[(usize, f64)]) -> Self {
+    pub fn with_coeffs(n_dirs: usize, coeffs: &[(usize, f64)]) -> Self {
         let mut out = Self::zero(n_dirs);
         for &(mask, value) in coeffs {
             if mask < out.coeffs.len() {
@@ -44,11 +44,11 @@ impl MultiDirJet {
         out
     }
 
-    pub(crate) fn coeff(&self, mask: usize) -> f64 {
+    pub fn coeff(&self, mask: usize) -> f64 {
         self.coeffs[mask]
     }
 
-    pub(crate) fn add(&self, other: &Self) -> Self {
+    pub fn add(&self, other: &Self) -> Self {
         Self {
             coeffs: self
                 .coeffs
@@ -59,13 +59,13 @@ impl MultiDirJet {
         }
     }
 
-    pub(crate) fn scale(&self, scalar: f64) -> Self {
+    pub fn scale(&self, scalar: f64) -> Self {
         Self {
             coeffs: self.coeffs.iter().map(|value| scalar * value).collect(),
         }
     }
 
-    pub(crate) fn mul(&self, other: &Self) -> Self {
+    pub fn mul(&self, other: &Self) -> Self {
         MUL_CALLS.fetch_add(1, Ordering::Relaxed);
         let count = self.coeffs.len();
         let mut out = vec![0.0; count];
@@ -85,7 +85,7 @@ impl MultiDirJet {
         Self { coeffs: out }
     }
 
-    pub(crate) fn compose_unary(&self, derivs: [f64; 5]) -> Self {
+    pub fn compose_unary(&self, derivs: [f64; 5]) -> Self {
         COMPOSE_UNARY_CALLS.fetch_add(1, Ordering::Relaxed);
         <Self as crate::jet_algebra::JetAlgebra<5>>::compose_unary(self, derivs)
     }

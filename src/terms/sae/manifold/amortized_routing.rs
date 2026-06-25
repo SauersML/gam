@@ -63,9 +63,8 @@ impl SaeManifoldTerm {
                 }
                 // Reconstruct the amplitude-1 image γ_k(t̂) = Bᵀ φ(t̂).
                 let t_hat: Vec<f64> = result.coords.row(row).iter().copied().collect();
-                let coord_2d = Array2::from_shape_vec((1, atom.latent_dim), t_hat).map_err(|e| {
-                    format!("chart_geometry_routing_logits: coord reshape: {e}")
-                })?;
+                let coord_2d = Array2::from_shape_vec((1, atom.latent_dim), t_hat)
+                    .map_err(|e| format!("chart_geometry_routing_logits: coord reshape: {e}"))?;
                 let (phi, _jet) = evaluator.evaluate(coord_2d.view())?;
                 let mut gamma = vec![0.0_f64; p];
                 for basis_col in 0..m {

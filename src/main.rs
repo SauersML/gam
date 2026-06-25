@@ -43,7 +43,7 @@ pub(crate) use gam::generative::{generativespec_from_predict, sampleobservation_
 
 pub(crate) use gam::hmc::NutsConfig;
 
-pub(crate) use gam::inference::data::{
+pub(crate) use gam::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy,
     load_dataset_projected as load_dataset_auto_projected,
     load_dataset_projected_with_categorical_roles as load_dataset_auto_projected_with_categorical_roles,
@@ -60,10 +60,10 @@ pub(crate) use gam::inference::formula_dsl::{
 };
 
 pub(crate) use gam::inference::model::{
-    ColumnKindTag, DataSchema, FittedFamily, FittedModel as SavedModel, FittedModelPayload,
-    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedLatentZNormalization,
-    load_survival_time_basis_config_from_model,
+    FittedFamily, FittedModel as SavedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind,
+    PredictModelClass, SavedLatentZNormalization, load_survival_time_basis_config_from_model,
 };
+pub(crate) use gam_data::{ColumnKindTag, DataSchema};
 
 pub(crate) use gam::inference::model_payload_builders::{
     BernoulliMarginalSlopeInputs, LatentWindowInputs, LocationScaleInputs, LocationScaleResponse,
@@ -263,7 +263,7 @@ const CLI_WORKER_STACK_SIZE: usize = 512 << 20;
 
 fn main() {
     gam::init_parallelism();
-    gam::process_monitor::start();
+    gam_runtime::process_monitor::start();
     // Drive the whole command on a dedicated wide-stack thread (see
     // `CLI_WORKER_STACK_SIZE`). `run` returns the same `CliResult` it would on
     // the main thread; a `join` error means `run` itself panicked, which the

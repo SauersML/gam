@@ -1235,7 +1235,7 @@ impl TransformationNormalPsiWorkspace {
         let p_cov = self.family.covariate_design.ncols();
         let p_total = self.family.response_val_basis.ncols() * p_cov;
         let policy = ResourcePolicy::default_library();
-        let rows_per_chunk = crate::resource::rows_for_target_bytes(
+        let rows_per_chunk = gam_runtime::resource::rows_for_target_bytes(
             policy.row_chunk_target_bytes,
             p_cov.saturating_mul(n_psi + 2).max(1),
         )

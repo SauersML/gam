@@ -378,7 +378,6 @@ impl PredictableModel for SurvivalPredictor {
         predict_with_uncertainty_generic(self, input)
     }
 
-
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,

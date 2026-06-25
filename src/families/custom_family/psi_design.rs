@@ -1734,7 +1734,7 @@ pub(crate) fn weighted_crossprod_psi_maps(
     // materialized at full n x p_right size. Chunk size is governed by the
     // resource policy's row_chunk_target_bytes.
     let policy = ResourcePolicy::default_library();
-    let rows_per_chunk = crate::resource::rows_for_target_bytes(
+    let rows_per_chunk = gam_runtime::resource::rows_for_target_bytes(
         policy.row_chunk_target_bytes,
         p_left.saturating_add(p_right).max(1),
     );

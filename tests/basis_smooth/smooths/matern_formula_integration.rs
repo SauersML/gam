@@ -50,7 +50,10 @@ fn matern_2d_dataset() -> gam::data::EncodedDataset {
 /// penalized trace is bounded by the block rank, so clamping it to `[0, rank]`
 /// keeps a fully-penalized redundant direction at its saturated trace instead of
 /// `+∞`. The fit must succeed and recover the signal.
-fn matern_1d_uniform_dataset(n: usize, seed: u64) -> (gam::data::EncodedDataset, Vec<f64>, Vec<f64>) {
+fn matern_1d_uniform_dataset(
+    n: usize,
+    seed: u64,
+) -> (gam::data::EncodedDataset, Vec<f64>, Vec<f64>) {
     // Small deterministic LCG so the test has no extra RNG dependency.
     let mut s = seed
         .wrapping_mul(2862933555777941757)
@@ -64,7 +67,10 @@ fn matern_1d_uniform_dataset(n: usize, seed: u64) -> (gam::data::EncodedDataset,
     let mut xs: Vec<f64> = (0..n).map(|_| nextf()).collect();
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mut ys = Vec::with_capacity(n);
-    let headers = ["x", "y"].into_iter().map(str::to_string).collect::<Vec<_>>();
+    let headers = ["x", "y"]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     let rows = xs
         .iter()
         .map(|&x| {
@@ -92,8 +98,9 @@ fn univariate_matern_fits_ordinary_uniform_1d_data_1379() {
             family: Some("gaussian".to_string()),
             ..FitConfig::default()
         };
-        let result = fit_from_formula("y ~ matern(x)", &data, &config)
-            .unwrap_or_else(|e| panic!("matern(x) failed to fit ordinary 1-D data at seed {seed}: {e}"));
+        let result = fit_from_formula("y ~ matern(x)", &data, &config).unwrap_or_else(|e| {
+            panic!("matern(x) failed to fit ordinary 1-D data at seed {seed}: {e}")
+        });
         let FitResult::Standard(fit) = result else {
             panic!("expected standard Gaussian fit at seed {seed}");
         };
@@ -107,7 +114,11 @@ fn univariate_matern_fits_ordinary_uniform_1d_data_1379() {
         );
         // Gaussian identity link: fitted mean = design · beta (no offset here).
         let fitted = fit.design.design.to_dense().dot(&fit.fit.beta);
-        assert_eq!(fitted.len(), ys.len(), "fitted length mismatch at seed {seed}");
+        assert_eq!(
+            fitted.len(),
+            ys.len(),
+            "fitted length mismatch at seed {seed}"
+        );
         assert!(
             fitted.iter().all(|v| v.is_finite()),
             "matern(x) produced non-finite fitted values at seed {seed}"

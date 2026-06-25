@@ -207,9 +207,9 @@ impl From<crate::terms::term_builder::TermBuilderError> for WorkflowError {
 /// workflow bucket (`SchemaMismatch` for row/column shape problems,
 /// `InvalidConfig` for parse / encoding / empty / invalid-value sources)
 /// since they don't have a dedicated structured destination yet.
-impl From<crate::inference::data::DataError> for WorkflowError {
-    fn from(err: crate::inference::data::DataError) -> Self {
-        use crate::inference::data::DataError;
+impl From<gam_data::DataError> for WorkflowError {
+    fn from(err: gam_data::DataError) -> Self {
+        use gam_data::DataError;
         match err {
             DataError::ColumnNotFound {
                 name,

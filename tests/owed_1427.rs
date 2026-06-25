@@ -220,7 +220,12 @@ fn recovery_dataset(seed: u64, n_per_group: usize) -> gam::data::EncodedDataset 
 
 /// Predict a Standard Gaussian fit on a fresh single-feature grid via the
 /// frozen resolved spec (identity link ⇒ η == μ).
-fn predict_standard(fit: &StandardFitResult, n_cols: usize, x_idx: usize, grid: &[f64]) -> Vec<f64> {
+fn predict_standard(
+    fit: &StandardFitResult,
+    n_cols: usize,
+    x_idx: usize,
+    grid: &[f64],
+) -> Vec<f64> {
     let mut g = Array2::<f64>::zeros((grid.len(), n_cols));
     for (r, &xj) in grid.iter().enumerate() {
         g[[r, x_idx]] = xj;

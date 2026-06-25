@@ -562,10 +562,7 @@ pub trait PredictionTransform {
     /// `None` (the default) for families without an observation-scale noise
     /// term. Only consulted by the full-uncertainty driver and only when the
     /// caller requested observation intervals.
-    fn observation_noise(
-        &self,
-        _: &PredictInput,
-    ) -> Result<Option<Array1<f64>>, EstimationError> {
+    fn observation_noise(&self, _: &PredictInput) -> Result<Option<Array1<f64>>, EstimationError> {
         Ok(None)
     }
 

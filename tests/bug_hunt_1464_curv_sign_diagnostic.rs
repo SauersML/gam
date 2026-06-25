@@ -12,7 +12,9 @@
 
 use gam::geometry::constant_curvature::ConstantCurvature;
 use gam::smooth::get_constant_curvature_kappa;
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 
 use csv::StringRecord;
 
@@ -87,8 +89,12 @@ fn curv_full_fit_sign_diagnostic() {
     let kappa_spherical = fit_kappa_hat(2.0, 0x5151_0001);
     let kappa_hyperbolic = fit_kappa_hat(-2.0, 0x5151_0003);
 
-    eprintln!("[#1464-diag] spherical  (planted kappa* = +2.0): final kappa_hat = {kappa_spherical}");
-    eprintln!("[#1464-diag] hyperbolic (planted kappa* = -2.0): final kappa_hat = {kappa_hyperbolic}");
+    eprintln!(
+        "[#1464-diag] spherical  (planted kappa* = +2.0): final kappa_hat = {kappa_spherical}"
+    );
+    eprintln!(
+        "[#1464-diag] hyperbolic (planted kappa* = -2.0): final kappa_hat = {kappa_hyperbolic}"
+    );
     eprintln!(
         "[#1464-diag] separation |spherical - hyperbolic| = {}",
         (kappa_spherical - kappa_hyperbolic).abs()

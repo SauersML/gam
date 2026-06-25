@@ -10,16 +10,6 @@ pub(crate) mod fast_channel;
 pub(crate) mod fnv1a;
 pub mod gamlss;
 pub mod inverse_link;
-pub(crate) mod jet_algebra;
-pub(crate) mod jet_partitions;
-// #932 FD-free Poisson-log exactness oracle. Test-only: the single-expression
-// row NLL and the hand-derived closed-form tower exist solely to cross-check the
-// jet algebra under `cargo test`, so the module is gated out of production builds
-// (its items would otherwise read as dead code there).
-#[cfg(test)]
-mod jet_poisson_oracle_tests;
-pub(crate) mod jet_scalar;
-pub mod jet_tower;
 pub mod joint_penalty;
 pub(crate) mod location_scale_engine;
 pub mod marginal_slope_orthogonal;

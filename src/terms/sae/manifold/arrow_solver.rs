@@ -309,7 +309,10 @@ pub(crate) fn sae_dot(a: &[f64], b: &[f64]) -> f64 {
 /// arrow vectors. Used by the #1418 `B`-preconditioned CG inner solve.
 pub(crate) fn sae_inner(a: &SaeArrowVector, b: &SaeArrowVector) -> f64 {
     sae_dot(a.t.as_slice().unwrap_or(&[]), b.t.as_slice().unwrap_or(&[]))
-        + sae_dot(a.beta.as_slice().unwrap_or(&[]), b.beta.as_slice().unwrap_or(&[]))
+        + sae_dot(
+            a.beta.as_slice().unwrap_or(&[]),
+            b.beta.as_slice().unwrap_or(&[]),
+        )
 }
 
 /// Euclidean norm `‖a‖` over the concatenated `(t, β)` blocks of an arrow vector.

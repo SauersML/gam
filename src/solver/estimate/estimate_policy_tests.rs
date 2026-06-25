@@ -284,7 +284,12 @@ fn prefit_binomial_detects_unpenalized_realized_design_separator() {
         &design,
         &[true, true],
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "separation screen must complete without a layout error", e))
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "separation screen must complete without a layout error", e
+        )
+    })
     .expect("second column exactly separates the binary response");
 
     assert_eq!(diagnostic.column_index, 1);
@@ -307,7 +312,10 @@ fn prefit_binomial_screen_respects_penalties_and_fractional_responses() {
             &design,
             &[true, false],
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "separation screen must complete without a layout error", e)),
+        .unwrap_or_else(|e| panic!(
+            "{} failed: {:?}",
+            "separation screen must complete without a layout error", e
+        )),
         None,
         "a separating column with effective quadratic penalty should not be pre-fit rejected"
     );
@@ -318,7 +326,10 @@ fn prefit_binomial_screen_respects_penalties_and_fractional_responses() {
             &design,
             &[true, true],
         )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "separation screen must complete without a layout error", e)),
+        .unwrap_or_else(|e| panic!(
+            "{} failed: {:?}",
+            "separation screen must complete without a layout error", e
+        )),
         None,
         "fractional binomial proportions are not exact binary separation"
     );
@@ -421,7 +432,12 @@ fn prefit_rank_check_detects_unpenalized_duplicate_column() {
     let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
     let diagnostic =
         detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "rank check should stream dense design", e))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{} failed: {:?}",
+                    "rank check should stream dense design", e
+                )
+            })
             .expect("duplicate unpenalized columns are rank deficient");
 
     match diagnostic {
@@ -505,7 +521,12 @@ fn prefit_rank_check_detects_near_degenerate_unpenalized_design() {
     let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(x));
     let diagnostic =
         detect_prefit_unpenalized_rank_deficiency_in_design(w.view(), &design, &[true, true, true])
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "rank check should stream dense design", e))
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{} failed: {:?}",
+                    "rank check should stream dense design", e
+                )
+            })
             .expect("near-collinear unpenalized columns are near-degenerate");
 
     match diagnostic {

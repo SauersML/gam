@@ -68,7 +68,9 @@ fn gpu_solver_matches_cpu_to_numeric_tolerance_on_small_input() {
                  {err}. A 3×3 SPD solve has no dispatch floor, so a runtime-present \
                  decline is a real device-kernel fault, not a legitimate skip."
             );
-            eprintln!("SKIP gpu_solver_matches_cpu_to_numeric_tolerance_on_small_input: no CUDA runtime ({err})");
+            eprintln!(
+                "SKIP gpu_solver_matches_cpu_to_numeric_tolerance_on_small_input: no CUDA runtime ({err})"
+            );
             return;
         }
     };

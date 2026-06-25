@@ -8,9 +8,9 @@
 use super::*;
 use crate::families::marginal_slope_shared::SparsePrimaryCoeffJetView;
 use crate::families::survival::marginal_slope::flex_oracle_structs_tests::{
+    COEFF_SUPPORT_GHW, COEFF_SUPPORT_GW, SurvivalFlexTimepointBiDirectionalExact,
     coeff4_composite_bilinear, coeff4_fixed_bilinear, neg_cell_of, poly_add_jets, poly_coeff_mask,
     poly_mul_jets, poly_scale_jets, scalar_composite_bilinear,
-    SurvivalFlexTimepointBiDirectionalExact, COEFF_SUPPORT_GHW, COEFF_SUPPORT_GW,
 };
 
 #[inline]
@@ -204,7 +204,9 @@ impl SurvivalMarginalSlopeFamily {
                                         z: f64|
                      -> f64 {
                         match edge {
-                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing {
+                                ..
+                            } => {
                                 let direct_g = if axis == primary.g { z } else { 0.0 };
                                 -direct_g / b
                             }
@@ -213,9 +215,9 @@ impl SurvivalMarginalSlopeFamily {
                     };
                     let a_vel = |edge: crate::families::cubic_cell_kernel::PartitionEdge| -> f64 {
                         match edge {
-                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
-                                -1.0 / b
-                            }
+                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing {
+                                ..
+                            } => -1.0 / b,
                             crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
                         }
                     };
@@ -235,11 +237,10 @@ impl SurvivalMarginalSlopeFamily {
                     let za_r = a_vel(part.right_edge);
                     let za_l = a_vel(part.left_edge);
                     // f_aa diagonal: DOUBLED a-axis flux + (a,a) self-flux.
-                    f_aa += 2.0
-                        * super::first_full_exact_oracle_tests::moving_density_boundary_flux_a(
+                    f_aa +=
+                        2.0 * super::first_full_exact_oracle_tests::moving_density_boundary_flux_a(
                             entry, &da, b,
-                        )
-                        + self_flux(za_r, za_r, za_l, za_l);
+                        ) + self_flux(za_r, za_r, za_l, za_l);
                     for u in 0..p {
                         let cu = fx.coeff_u[u].map(|value| -value);
                         let zu_r = crossing_vel(u, part.right_edge, cell.right);
@@ -249,21 +250,9 @@ impl SurvivalMarginalSlopeFamily {
                             // Asymmetric flux pair DOUBLED on the diagonal (matching
                             // the base fix); off-diagonal second term is 0 unless v==g.
                             let mut boundary = super::first_full::moving_density_boundary_flux(
-                                v,
-                                primary,
-                                &au,
-                                entry,
-                                &cu,
-                                b,
-                                false,
+                                v, primary, &au, entry, &cu, b, false,
                             ) + super::first_full::moving_density_boundary_flux(
-                                u,
-                                primary,
-                                &au,
-                                entry,
-                                &cv,
-                                b,
-                                false,
+                                u, primary, &au, entry, &cv, b, false,
                             );
                             let zv_r = crossing_vel(v, part.right_edge, cell.right);
                             let zv_l = crossing_vel(v, part.left_edge, cell.left);
@@ -1089,10 +1078,12 @@ impl SurvivalMarginalSlopeFamily {
                 };
                 // `cell_density_boundary_integrand(cell, poly, z) = poly(z)·w(z)`
                 // as a bilinear jet, with both `poly` and the edge `z`/η moving.
-                let boundary_integrand_jet =
-                    |poly: &[MultiDirJet], z_jet: &MultiDirJet, weight: &MultiDirJet| -> MultiDirJet {
-                        eval_poly_jets_at_jet(poly, z_jet).mul(weight)
-                    };
+                let boundary_integrand_jet = |poly: &[MultiDirJet],
+                                              z_jet: &MultiDirJet,
+                                              weight: &MultiDirJet|
+                 -> MultiDirJet {
+                    eval_poly_jets_at_jet(poly, z_jet).mul(weight)
+                };
                 // `G_z` of the calibration F integrand `G = Φ(−η)·φ(z)`:
                 //   G_z = −η_z·φ(η)φ(z) − z·Φ(−η)·φ(z),
                 // every factor a bilinear jet at the moving edge (η_z = ∂η/∂z).
@@ -1153,9 +1144,7 @@ impl SurvivalMarginalSlopeFamily {
                         gz.mul(&vel_x(z_jet)).mul(&vel_y(z_jet))
                     })
                 };
-                let theta_v = |axis: usize| {
-                    move |z_jet: &MultiDirJet| theta_vel_jet(axis, z_jet)
-                };
+                let theta_v = |axis: usize| move |z_jet: &MultiDirJet| theta_vel_jet(axis, z_jet);
                 let a_v = |z_jet: &MultiDirJet| z_jet.scale(0.0).add(&a_vel_jet);
 
                 // f_a: the base intercept-density's §D moving-boundary flux,

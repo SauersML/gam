@@ -123,7 +123,11 @@ fn difference_penalty_annihilates_constant_and_greville_linear() {
     let g_lin = greville.clone();
 
     let quad = |v: &Array1<f64>| -> f64 { v.dot(&s.dot(v)) };
-    let scale = s.iter().map(|x| x.abs()).fold(0.0_f64, f64::max).max(1e-300);
+    let scale = s
+        .iter()
+        .map(|x| x.abs())
+        .fold(0.0_f64, f64::max)
+        .max(1e-300);
 
     let q_const = quad(&ones);
     let q_lin = quad(&g_lin);

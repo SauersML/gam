@@ -4165,8 +4165,8 @@ mod tests {
             // here is a real device fault on a CUDA host, not a no-CUDA skip. Fail
             // loud (the device-PCG skip-pass class, eee12f6b2) — the old arms
             // returned and the test passed while exercising nothing.
-            let backend =
-                HvpKernelBackend::probe().expect("[bms_flex_row hvp parity] backend probe must succeed on CUDA host");
+            let backend = HvpKernelBackend::probe()
+                .expect("[bms_flex_row hvp parity] backend probe must succeed on CUDA host");
             let stream = backend.stream.clone();
             let d_h = stream
                 .clone_htod(&row_hessians)
@@ -4829,8 +4829,9 @@ mod tests {
             // dense-block kernel.
             // Past the GpuRuntime::global() Some-gate: probe/upload failures are
             // real device faults on a CUDA host — fail loud (device-PCG class).
-            let backend = HvpKernelBackend::probe()
-                .expect("[bms_flex_row dense_block parity] backend probe must succeed on CUDA host");
+            let backend = HvpKernelBackend::probe().expect(
+                "[bms_flex_row dense_block parity] backend probe must succeed on CUDA host",
+            );
             let stream = backend.stream.clone();
             let d_h = stream
                 .clone_htod(&row_hessians)

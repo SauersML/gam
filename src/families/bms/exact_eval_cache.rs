@@ -410,12 +410,12 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// trace paths. Only populated when those paths actually execute.
     /// `RayonSafeOnce` keeps lazy initialization safe from parallel row passes.
     pub(super) row_cell_moments_d15:
-        crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
+        gam_runtime::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
     /// Lazily-built degree-21 bundle for outer d²H (2nd-derivative of Hessian)
     /// trace paths. Only populated when those paths actually execute.
     /// `RayonSafeOnce` keeps lazy initialization safe from parallel row passes.
     pub(super) row_cell_moments_d21:
-        crate::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
+        gam_runtime::resource::RayonSafeOnce<Result<Option<RowCellMomentsBundle>, String>>,
     /// Flexible-path per-β per-row primary Hessians (`r×r` blocks flattened
     /// row-major into one wide `Array2`).  The matrix-free inner Newton/CG
     /// loop contracts the same primary Hessian against many trial directions
@@ -438,7 +438,7 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// safe when the first caller is already inside a Rayon row pass; failure
     /// is sticky and propagated identically to every caller.
     pub(super) rigid_third_full:
-        crate::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
+        gam_runtime::resource::RayonSafeOnce<Result<Vec<[[[f64; 2]; 2]; 2]>, String>>,
 
     /// Per-row uncontracted fourth-derivative tensor in the rigid path —
     /// the second-order analogue of `rigid_third_full`. The outer-Hessian
@@ -448,7 +448,7 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// so caching them lets every pair contraction be a 16-multiply 2×2
     /// bilinear instead of a fresh 8-direction empirical jet.
     pub(super) rigid_fourth_full:
-        crate::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
+        gam_runtime::resource::RayonSafeOnce<Result<Vec<[[[[f64; 2]; 2]; 2]; 2]>, String>>,
 
     /// Flexible-path per-row axis-projected third-derivative tensors. See
     /// [`FlexAxisThirdRowTensors`] for the contraction algebra. Only consulted
@@ -460,15 +460,15 @@ pub(super) struct BernoulliMarginalSlopeExactEvalCache {
     /// derivative passes are row-subsampled, so per-row laziness builds (and
     /// risks erroring on) only the rows actually consumed, not all `n`. Each
     /// inner build is fallible and sticky (same contract as `rigid_third_full`).
-    pub(super) flex_axis_third_tensors: crate::resource::RayonSafeOnce<
-        Vec<crate::resource::RayonSafeOnce<Result<FlexAxisThirdRowTensors, String>>>,
+    pub(super) flex_axis_third_tensors: gam_runtime::resource::RayonSafeOnce<
+        Vec<gam_runtime::resource::RayonSafeOnce<Result<FlexAxisThirdRowTensors, String>>>,
     >,
 
     /// Flexible-path per-row axis-projected fourth-derivative tensors. Built
     /// independently from `flex_axis_third_tensors` so first-order outer work
     /// never forces degree-21 fourth-order cell moments.
-    pub(super) flex_axis_fourth_tensors: crate::resource::RayonSafeOnce<
-        Vec<crate::resource::RayonSafeOnce<Result<FlexAxisFourthRowTensors, String>>>,
+    pub(super) flex_axis_fourth_tensors: gam_runtime::resource::RayonSafeOnce<
+        Vec<gam_runtime::resource::RayonSafeOnce<Result<FlexAxisFourthRowTensors, String>>>,
     >,
 
     /// Lazily-built full-data outer row list (`index = position`, `weight = 1.0`,

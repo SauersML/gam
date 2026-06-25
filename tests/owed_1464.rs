@@ -95,10 +95,7 @@ fn base_spec(kappa: f64) -> ConstantCurvatureBasisSpec {
 /// argmin of the κ-fair sign score over the chart window `[−half, half]`, with
 /// `half = 0.5 / max‖x‖²` (the production κ window).
 fn kappa_fair_argmin(x: &Array2<f64>, y: &Array1<f64>) -> f64 {
-    let max_r2 = x
-        .outer_iter()
-        .map(|r| r.dot(&r))
-        .fold(1e-8_f64, f64::max);
+    let max_r2 = x.outer_iter().map(|r| r.dot(&r)).fold(1e-8_f64, f64::max);
     let half = 0.5 / max_r2;
     let steps = 24usize;
     let mut best_k = f64::NAN;
@@ -123,8 +120,10 @@ fn kappa_fair_argmin(x: &Array2<f64>, y: &Array1<f64>) -> f64 {
 #[test]
 fn kappa_fair_data_fit_identifies_curvature_sign_on_generic_radial_signal() {
     // Two seeds each so the assertion is not a single-realization fluke.
-    for &(seed_sph, seed_hyp) in &[(0x5151_0001_u64, 0x5151_0003_u64), (0x7777_0002, 0x7777_0004)]
-    {
+    for &(seed_sph, seed_hyp) in &[
+        (0x5151_0001_u64, 0x5151_0003_u64),
+        (0x7777_0002, 0x7777_0004),
+    ] {
         let (x_sph, y_sph) = curved_dataset(2.0, seed_sph);
         let (x_hyp, y_hyp) = curved_dataset(-2.0, seed_hyp);
 

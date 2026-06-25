@@ -19,8 +19,10 @@ use rand_distr::{Distribution, Normal, Uniform};
 
 fn make_dataset(n: usize) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(7);
-    let u_lat = Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
-    let u_lon = Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
+    let u_lat =
+        Uniform::new(-80.0_f64, 80.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
+    let u_lon =
+        Uniform::new(-179.0_f64, 179.0).unwrap_or_else(|e| panic!("{} failed: {:?}", "uniform", e));
     let noise = Normal::new(0.0, 0.05).unwrap_or_else(|e| panic!("{} failed: {:?}", "normal", e));
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(n);
@@ -37,11 +39,12 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
             y.to_string(),
         ]));
     }
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
+    encode_recordswith_inferred_schema(headers, rows)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "encode", e))
 }
 
 #[test]
-fn sphere_m_sweep_lambda_diagnostic() { 
+fn sphere_m_sweep_lambda_diagnostic() {
     init_parallelism();
     let data = make_dataset(400);
     let cfg = FitConfig {
@@ -106,8 +109,8 @@ fn sphere_m_sweep_lambda_diagnostic() {
             design_input[[i, 0]] = *lat;
             design_input[[i, 1]] = *lon;
         }
-        let design =
-            build_term_collection_design(design_input.view(), &fit.resolvedspec).unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
+        let design = build_term_collection_design(design_input.view(), &fit.resolvedspec)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "design", e));
         let pred = design.design.apply(&fit.fit.beta).to_vec();
         let mean_pred = pred.iter().sum::<f64>() / pred.len() as f64;
         let var_pred =

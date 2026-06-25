@@ -1094,7 +1094,12 @@ impl SurvivalLocationScaleFamily {
             .ok_or_else(|| "joint d_beta must be contiguous".to_string())?;
         Ok(Some(
             super::row_kernel::survival_ls_wiggle_directional_derivative_dense(
-                self, q, dynamic, deriv_log_scale, &rows, d,
+                self,
+                q,
+                dynamic,
+                deriv_log_scale,
+                &rows,
+                d,
             )?,
         ))
     }
@@ -1767,9 +1772,9 @@ impl CustomFamily for SurvivalLocationScaleFamily {
             // #932: link-wiggle joint Hessian via the single-source §13 warp
             // kernel; non-wiggle rows keep the bespoke path below.
             let dynamic = self.build_dynamic_geometry(block_states)?;
-            return Ok(Some(super::row_kernel::survival_ls_wiggle_joint_hessian_dense(
-                self, &q, &dynamic, 0.0,
-            )?));
+            return Ok(Some(
+                super::row_kernel::survival_ls_wiggle_joint_hessian_dense(self, &q, &dynamic, 0.0)?,
+            ));
         }
         if self.row_kernel_joint_hessian_supported() {
             let dynamic = self.build_dynamic_geometry(block_states)?;

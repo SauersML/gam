@@ -27,7 +27,7 @@ fn quasi_uniform_sphere(n: usize) -> Array2<f64> {
 }
 
 #[test]
-fn wahba_kernel_spectrum_orders_1_to_4() { 
+fn wahba_kernel_spectrum_orders_1_to_4() {
     let centers = quasi_uniform_sphere(30);
     let k = centers.nrows();
 
@@ -55,7 +55,9 @@ fn wahba_kernel_spectrum_orders_1_to_4() {
             }
         }
 
-        let (evals, _) = kmat.eigh(Side::Lower).unwrap_or_else(|e| panic!("{} failed: {:?}", "eigendecomposition", e));
+        let (evals, _) = kmat
+            .eigh(Side::Lower)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "eigendecomposition", e));
         let mut evec: Vec<f64> = evals.iter().copied().collect();
         evec.sort_by(|a, b| a.partial_cmp(b).unwrap());
 

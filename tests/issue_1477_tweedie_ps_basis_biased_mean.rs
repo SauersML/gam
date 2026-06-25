@@ -22,6 +22,7 @@
 //! worse than gam's own `cr` by more than 40% (isolating the ps path). This test
 //! FAILS on current `main` and is the gate the non-Gaussian PS fix must turn green.
 
+use csv::StringRecord;
 use gam::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -30,7 +31,6 @@ use gam::{
     FitConfig, FitResult, StandardFitResult, encode_recordswith_inferred_schema, fit_from_formula,
     init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -51,7 +51,13 @@ fn encode(cols: &[(&str, &[f64])]) -> EncodedDataset {
     let n = cols[0].1.len();
     let headers: Vec<String> = cols.iter().map(|(h, _)| (*h).to_string()).collect();
     let rows: Vec<StringRecord> = (0..n)
-        .map(|i| StringRecord::from(cols.iter().map(|(_, c)| c[i].to_string()).collect::<Vec<_>>()))
+        .map(|i| {
+            StringRecord::from(
+                cols.iter()
+                    .map(|(_, c)| c[i].to_string())
+                    .collect::<Vec<_>>(),
+            )
+        })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode tweedie dataset")
 }
@@ -116,13 +122,17 @@ fn fit_mu(formula: &str, ds: &EncodedDataset, x_idx: usize, grid: &[f64]) -> (Ve
         family: Some("tweedie".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(formula, ds, &cfg).unwrap_or_else(|e| panic!("gam fit {formula}: {e:?}"));
+    let result =
+        fit_from_formula(formula, ds, &cfg).unwrap_or_else(|e| panic!("gam fit {formula}: {e:?}"));
     let FitResult::Standard(fit) = result else {
         panic!("Tweedie(log) is a scalar GLM => expected FitResult::Standard");
     };
     let edf = fit.fit.edf_total().expect("gam reports total edf");
     let width = ds.headers.len();
-    let mu: Vec<f64> = gam_eta(&fit, width, x_idx, grid).iter().map(|e| e.exp()).collect();
+    let mu: Vec<f64> = gam_eta(&fit, width, x_idx, grid)
+        .iter()
+        .map(|e| e.exp())
+        .collect();
     (mu, edf)
 }
 
@@ -150,7 +160,10 @@ fn gam_tweedie_ps_basis_recovers_unbiased_mean() {
         y.push(yi);
     }
     let zeros = y.iter().filter(|&&v| v == 0.0).count();
-    assert!(zeros > 0, "Tweedie 1<p<2 must be zero-inflated; got {zeros} zeros");
+    assert!(
+        zeros > 0,
+        "Tweedie 1<p<2 must be zero-inflated; got {zeros} zeros"
+    );
 
     let ds = encode(&[("x", &x), ("y", &y)]);
     let x_idx = ds.column_map()["x"];

@@ -1,15 +1,15 @@
 use super::*;
 use crate::basis::{DuchonNullspaceOrder, minimum_duchon_power_for_operator_penalties};
-use crate::inference::data::load_dataset_projected;
 use crate::inference::formula_dsl::{default_linkwiggle_formulaspec, parse_linkwiggle_formulaspec};
-use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use crate::smooth::SmoothBasisSpec;
 use crate::solver::rho_optimizer::{HessianSource, OuterPlan, OuterResult, Solver};
+use gam_data::load_dataset_projected;
+use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
 use ndarray::Array2;
 use std::fs;
 use tempfile::tempdir;
 
-fn load_survival_dataset() -> crate::inference::data::EncodedDataset {
+fn load_survival_dataset() -> gam_data::EncodedDataset {
     let td = tempdir().expect("tempdir");
     let data_path = td.path().join("survival.csv");
     fs::write(
@@ -1319,11 +1319,8 @@ fn gaussian_location_scale_dataset() -> Dataset {
             format!("{x:.17e}"),
         ]));
     }
-    crate::inference::data::encode_recordswith_inferred_schema(
-        vec!["y".to_string(), "x".to_string()],
-        records,
-    )
-    .expect("encode gaussian location-scale dataset")
+    gam_data::encode_recordswith_inferred_schema(vec!["y".to_string(), "x".to_string()], records)
+        .expect("encode gaussian location-scale dataset")
 }
 
 fn binomial_location_scale_dataset() -> Dataset {
@@ -1339,11 +1336,8 @@ fn binomial_location_scale_dataset() -> Dataset {
             format!("{x:.17e}"),
         ]));
     }
-    crate::inference::data::encode_recordswith_inferred_schema(
-        vec!["y".to_string(), "x".to_string()],
-        records,
-    )
-    .expect("encode binomial location-scale dataset")
+    gam_data::encode_recordswith_inferred_schema(vec!["y".to_string(), "x".to_string()], records)
+        .expect("encode binomial location-scale dataset")
 }
 
 fn small_wiggle_cfg() -> LinkWiggleConfig {

@@ -456,7 +456,7 @@ impl BernoulliMarginalSlopeFamily {
         });
         let context_row_count = selected_context_rows.as_ref().map_or(n, |rows| rows.len());
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS exact-cache build n={n} context_rows={context_row_count} p={} flex={flex_active}",
             slices.total
         ));
@@ -671,13 +671,13 @@ impl BernoulliMarginalSlopeFamily {
             row_contexts,
             row_cell_moments,
             cell_family_forest,
-            row_cell_moments_d15: crate::resource::RayonSafeOnce::new(),
-            row_cell_moments_d21: crate::resource::RayonSafeOnce::new(),
+            row_cell_moments_d15: gam_runtime::resource::RayonSafeOnce::new(),
+            row_cell_moments_d21: gam_runtime::resource::RayonSafeOnce::new(),
             row_primary_hessians: RowPrimaryEvalCache::Empty,
-            rigid_third_full: crate::resource::RayonSafeOnce::new(),
-            rigid_fourth_full: crate::resource::RayonSafeOnce::new(),
-            flex_axis_third_tensors: crate::resource::RayonSafeOnce::new(),
-            flex_axis_fourth_tensors: crate::resource::RayonSafeOnce::new(),
+            rigid_third_full: gam_runtime::resource::RayonSafeOnce::new(),
+            rigid_fourth_full: gam_runtime::resource::RayonSafeOnce::new(),
+            flex_axis_third_tensors: gam_runtime::resource::RayonSafeOnce::new(),
+            flex_axis_fourth_tensors: gam_runtime::resource::RayonSafeOnce::new(),
             full_data_outer_rows: std::sync::OnceLock::new(),
         })
     }
@@ -836,7 +836,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(None);
         }
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS row-cell-moments n={n} selected_rows={selected_row_count} degree={max_degree}"
         ));
         if log_exact_work(n) {
@@ -977,7 +977,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS row-cell-moments upgrade n={n} degree={}->{required_degree}",
             base.max_degree
         ));
@@ -1670,7 +1670,7 @@ impl BernoulliMarginalSlopeFamily {
                 && n > 0
             {
                 let started = std::time::Instant::now();
-                let process_monitor_guard = crate::process_monitor::track_scope(format!(
+                let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
                     "BMS row-primary-hessian-tiles n={n} r={r} bytes={} tile_rows={} global_budget={}",
                     plan.bytes, BMS_ROW_PRIMARY_HESSIAN_TILE_ROWS, plan.global_pin_budget_bytes
                 ));
@@ -1750,7 +1750,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(RowPrimaryEvalCache::Empty);
         }
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS row-primary-hessian-cache n={n} r={r} bytes={} single_budget={} global_budget={}",
             plan.bytes, plan.single_cache_budget_bytes, plan.global_pin_budget_bytes
         ));
@@ -3268,7 +3268,7 @@ impl BernoulliMarginalSlopeFamily {
         // global row), then build only the requested row on first touch.
         let slots = cache.flex_axis_third_tensors.get_or_compute(|| {
             (0..self.y.len())
-                .map(|_| crate::resource::RayonSafeOnce::new())
+                .map(|_| gam_runtime::resource::RayonSafeOnce::new())
                 .collect::<Vec<_>>()
         });
         let stored = slots[row].get_or_compute(|| -> Result<FlexAxisThirdRowTensors, String> {
@@ -3314,7 +3314,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         let slots = cache.flex_axis_fourth_tensors.get_or_compute(|| {
             (0..self.y.len())
-                .map(|_| crate::resource::RayonSafeOnce::new())
+                .map(|_| gam_runtime::resource::RayonSafeOnce::new())
                 .collect::<Vec<_>>()
         });
         let stored = slots[row].get_or_compute(|| -> Result<FlexAxisFourthRowTensors, String> {
@@ -6761,7 +6761,7 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS dense-H build n={n} p={}",
             slices.total
         ));
@@ -6961,7 +6961,7 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS fused exact-gradient+dense-H n={n} p={}",
             slices.total
         ));
@@ -7270,7 +7270,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         let n = self.y.len();
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS exact-loglik eval n={n} p={}",
             cache.slices.total
         ));

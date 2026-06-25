@@ -13,7 +13,7 @@ pub struct GaussianLocationScaleFamily {
     /// per-call materialization decision) made during exact-Newton joint psi
     /// derivative evaluation. Defaults to `ResourcePolicy::default_library()`
     /// when the family is built without an explicit policy.
-    pub policy: crate::resource::ResourcePolicy,
+    pub policy: gam_runtime::resource::ResourcePolicy,
     /// Cached per-observation row scalars keyed by the FULL `(η_μ, η_logσ)`
     /// predictor pair the scalars were computed at. The row scalars are a
     /// deterministic function of `(η_μ, η_logσ)` (plus the fixed `y`/`weights`),
@@ -479,7 +479,7 @@ impl GaussianLocationScaleFamily {
         psi_index: usize,
         xmu: &Array2<f64>,
         x_ls: &Array2<f64>,
-        policy: &crate::resource::ResourcePolicy,
+        policy: &gam_runtime::resource::ResourcePolicy,
     ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         let Some(parts) = locscale_joint_psi_direction_parts(
             block_states,

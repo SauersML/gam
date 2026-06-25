@@ -556,7 +556,6 @@ impl NuclearNormPenalty {
 
         Ok((right_filter, right_filter_derivative))
     }
-
 }
 
 impl AnalyticPenalty for NuclearNormPenalty {

@@ -497,7 +497,7 @@ pub(crate) fn binomial_location_scale_core(
 /// tensors are unchanged. Value-channel consumers (`Order2` joint-Hessian, the
 /// dense `Tower4` oracle / gradient path) pass `true` and get the exact `−ll`.
 #[inline]
-pub(crate) fn binomial_location_scale_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+pub(crate) fn binomial_location_scale_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
     y: f64,
     weight: f64,
     eta_t: f64,
@@ -556,8 +556,8 @@ pub(crate) fn binomial_location_scale_nll_tower(
     d3mu_dq3: f64,
     link_kind: &InverseLink,
     include_fourth: bool,
-) -> Result<crate::families::jet_tower::Tower4<2>, String> {
-    use crate::families::jet_tower::Tower4;
+) -> Result<gam_math::jet_tower::Tower4<2>, String> {
+    use gam_math::jet_tower::Tower4;
     binomial_location_scale_nll_generic::<Tower4<2>>(
         y,
         weight,
@@ -585,7 +585,7 @@ pub(crate) fn binomial_location_scale_nll_tower(
 /// [`binomial_location_scale_nll_generic`].
 #[inline]
 pub(crate) fn binomial_location_scale_nll_generic_from_core_row<
-    S: crate::families::jet_scalar::JetScalar<2>,
+    S: gam_math::jet_scalar::JetScalar<2>,
 >(
     y: f64,
     weight: f64,
@@ -637,7 +637,7 @@ pub(crate) fn binomial_location_scale_first_directional_coefficients(
     let triples: Result<Vec<(f64, f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| {
-            use crate::families::jet_scalar::OneSeed;
+            use gam_math::jet_scalar::OneSeed;
             let dir = [d_eta_t[i], d_eta_ls[i]];
             // PACKED contracted-third scalar: seed each primary's ε-direction
             // with `dir`, so the ε-Hessian channel is `Σ_c ℓ_{abc} dir_c`
@@ -689,7 +689,7 @@ pub(crate) fn binomial_location_scalesecond_directional_coefficients(
     let triples: Result<Vec<(f64, f64, f64)>, String> = (0..n)
         .into_par_iter()
         .map(|i| -> Result<(f64, f64, f64), String> {
-            use crate::families::jet_scalar::TwoSeed;
+            use gam_math::jet_scalar::TwoSeed;
             let dir_u = [d_eta_t_u[i], d_eta_ls_u[i]];
             let dir_v = [d_eta_t_v[i], d_eta_ls_v[i]];
             // PACKED contracted-fourth scalar: seed ε with `dir_u` and δ with
@@ -730,8 +730,8 @@ mod packed_scalar_oracle_tests {
     //! replaced — value/grad/Hessian for `Order2`, the contracted third for
     //! `OneSeed`, the contracted fourth for `TwoSeed`.
     use super::*;
-    use crate::families::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
     use crate::types::{InverseLink, StandardLink};
+    use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 
     fn rel_close(a: f64, b: f64, label: &str) {
         let band = 1e-9 + 1e-9 * a.abs().max(b.abs());

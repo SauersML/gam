@@ -92,9 +92,7 @@ fn poisson_tensor_grid(seed: u64) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
 fn encode_xzy(x: &[f64], z: &[f64], y: &[f64]) -> gam::data::EncodedDataset {
     let headers = vec!["x".to_string(), "z".to_string(), "y".to_string()];
     let rows: Vec<StringRecord> = (0..x.len())
-        .map(|i| {
-            StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()])
-        })
+        .map(|i| StringRecord::from(vec![x[i].to_string(), z[i].to_string(), y[i].to_string()]))
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode xzy dataset")
 }

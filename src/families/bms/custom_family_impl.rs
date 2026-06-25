@@ -1177,7 +1177,7 @@ impl BernoulliMarginalSlopeExactNewtonJointHessianWorkspace {
         options: BlockwiseFitOptions,
     ) -> Result<Self, String> {
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS Hessian-workspace build n={} p={} subsample_rows={}",
             family.y.len(),
             block_slices(&family).total,
@@ -1441,7 +1441,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         // does not apply here — keep full-data semantics.
         let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS Hessian-Hv call={call} n={} p={}",
             self.family.y.len(),
             self.cache.slices.total
@@ -1471,7 +1471,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
     fn hessian_matvec_into(&self, v: &Array1<f64>, out: &mut Array1<f64>) -> Result<bool, String> {
         let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS Hessian-Hv (into) call={call} n={} p={}",
             self.family.y.len(),
             self.cache.slices.total
@@ -1521,7 +1521,7 @@ impl ExactNewtonJointHessianWorkspace for BernoulliMarginalSlopeExactNewtonJoint
         }
         let call = self.matvec_calls.fetch_add(1, Ordering::Relaxed) + 1;
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS Hessian-Hv (mat) call={call} n={} p={} n_rhs={}",
             self.family.y.len(),
             total,

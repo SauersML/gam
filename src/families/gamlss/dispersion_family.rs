@@ -16,13 +16,13 @@ use crate::custom_family::{
     FamilyEvaluation, ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,
 };
 use crate::families::block_layout::block_count::validate_block_count;
-use crate::families::jet_scalar::JetScalar;
 use crate::gamlss::GamlssError;
 use crate::matrix::LinearOperator;
 use crate::model_types::UnifiedFitResult;
 use crate::smooth::{
     SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
 };
+use gam_math::jet_scalar::JetScalar;
 use ndarray::{Array1, Array2, s};
 use statrs::function::gamma::ln_gamma;
 
@@ -176,7 +176,7 @@ pub(super) struct DispersionRowKernel {
 /// the natural parameters `(μ, θ)`. Instantiated at `Order2<2>` for the
 /// production `(v, g, H)` hot path and at `Tower4<2>` for the test oracle.
 #[inline]
-fn dispersion_nb_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+fn dispersion_nb_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
     yi: f64,
     mu_value: f64,
     theta_value: f64,
@@ -207,19 +207,14 @@ pub(crate) fn dispersion_nb_nll_order2(
     mu_value: f64,
     theta_value: f64,
     wi: f64,
-) -> crate::families::jet_scalar::Order2<2> {
-    dispersion_nb_nll_generic::<crate::families::jet_scalar::Order2<2>>(
-        yi,
-        mu_value,
-        theta_value,
-        wi,
-    )
+) -> gam_math::jet_scalar::Order2<2> {
+    dispersion_nb_nll_generic::<gam_math::jet_scalar::Order2<2>>(yi, mu_value, theta_value, wi)
 }
 
 /// Gamma row NLL written ONCE over a generic [`JetScalar<2>`] (#932), seeded on
 /// `(μ, ν)`.
 #[inline]
-fn dispersion_gamma_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+fn dispersion_gamma_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
     yi: f64,
     y_pos: f64,
     mu_value: f64,
@@ -246,8 +241,8 @@ pub(crate) fn dispersion_gamma_nll_order2(
     mu_value: f64,
     nu_value: f64,
     wi: f64,
-) -> crate::families::jet_scalar::Order2<2> {
-    dispersion_gamma_nll_generic::<crate::families::jet_scalar::Order2<2>>(
+) -> gam_math::jet_scalar::Order2<2> {
+    dispersion_gamma_nll_generic::<gam_math::jet_scalar::Order2<2>>(
         yi, y_pos, mu_value, nu_value, wi,
     )
 }
@@ -255,7 +250,7 @@ pub(crate) fn dispersion_gamma_nll_order2(
 /// Beta row NLL written ONCE over a generic [`JetScalar<2>`] (#932), seeded on
 /// `(μ, φ)`.
 #[inline]
-fn dispersion_beta_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+fn dispersion_beta_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
     yi: f64,
     mu_value: f64,
     phi_value: f64,
@@ -286,10 +281,8 @@ pub(crate) fn dispersion_beta_nll_order2(
     mu_value: f64,
     phi_value: f64,
     wi: f64,
-) -> crate::families::jet_scalar::Order2<2> {
-    dispersion_beta_nll_generic::<crate::families::jet_scalar::Order2<2>>(
-        yi, mu_value, phi_value, wi,
-    )
+) -> gam_math::jet_scalar::Order2<2> {
+    dispersion_beta_nll_generic::<gam_math::jet_scalar::Order2<2>>(yi, mu_value, phi_value, wi)
 }
 
 /// Tweedie compound Poisson–Gamma row NLL written ONCE over `Tower4<2>`, seeded
@@ -317,7 +310,7 @@ pub(crate) fn dispersion_beta_nll_order2(
 /// in the gamlss test module) can pin the production `Order2<2>` path against it;
 /// production consumes it through [`dispersion_tweedie_nll_order2`].
 #[inline]
-pub(crate) fn dispersion_tweedie_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+pub(crate) fn dispersion_tweedie_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
     yi: f64,
     eta_mu: f64,
     eta_d: f64,
@@ -362,10 +355,8 @@ pub(crate) fn dispersion_tweedie_nll_order2(
     eta_d: f64,
     p: f64,
     wi: f64,
-) -> crate::families::jet_scalar::Order2<2> {
-    dispersion_tweedie_nll_generic::<crate::families::jet_scalar::Order2<2>>(
-        yi, eta_mu, eta_d, p, wi,
-    )
+) -> gam_math::jet_scalar::Order2<2> {
+    dispersion_tweedie_nll_generic::<gam_math::jet_scalar::Order2<2>>(yi, eta_mu, eta_d, p, wi)
 }
 
 #[inline]
@@ -403,7 +394,7 @@ pub(crate) fn dispersion_row_cross_weight(
 
 #[inline]
 pub(crate) fn tower_score_info(
-    tower: &crate::families::jet_scalar::Order2<2>,
+    tower: &gam_math::jet_scalar::Order2<2>,
     idx: usize,
     wi: f64,
 ) -> (f64, f64) {
@@ -1137,8 +1128,8 @@ mod tests {
     pub(crate) fn beta_fisher_cross_info_mu_phi(mu: f64, phi: f64) -> f64 {
         let a = mu * phi;
         let b = (1.0 - mu) * phi;
-        phi * (mu * crate::families::jet_tower::trigamma_derivative_stack(a)[0]
-            - (1.0 - mu) * crate::families::jet_tower::trigamma_derivative_stack(b)[0])
+        phi * (mu * gam_math::jet_tower::trigamma_derivative_stack(a)[0]
+            - (1.0 - mu) * gam_math::jet_tower::trigamma_derivative_stack(b)[0])
     }
 
     pub(crate) fn assert_close(label: &str, got: f64, want: f64, tol: f64) {
@@ -1155,13 +1146,13 @@ mod tests {
         let phi = 10.0;
         let a = mu * phi;
         let b = (1.0 - mu) * phi;
-        let digamma_a = crate::families::jet_tower::digamma_derivative_stack(a)[0];
-        let digamma_b = crate::families::jet_tower::digamma_derivative_stack(b)[0];
+        let digamma_a = gam_math::jet_tower::digamma_derivative_stack(a)[0];
+        let digamma_b = gam_math::jet_tower::digamma_derivative_stack(b)[0];
         let score_neutral_y = 1.0 / (1.0 + (-(digamma_a - digamma_b)).exp());
 
         let tower = dispersion_beta_nll_order2(score_neutral_y, mu, phi, 1.0);
         let trigamma_a = std::f64::consts::PI * std::f64::consts::PI / 6.0;
-        let trigamma_b = crate::families::jet_tower::trigamma_derivative_stack(b)[0];
+        let trigamma_b = gam_math::jet_tower::trigamma_derivative_stack(b)[0];
         let analytic = phi * (mu * trigamma_a - (1.0 - mu) * trigamma_b);
         let helper = beta_fisher_cross_info_mu_phi(mu, phi);
 
@@ -1188,8 +1179,8 @@ mod tests {
     /// packed-scalar cutover replaced.
     #[test]
     pub(crate) fn order2_matches_dense_tower_all_channels() {
-        use crate::families::jet_scalar::{JetScalar, Order2};
-        use crate::families::jet_tower::Tower4;
+        use gam_math::jet_scalar::{JetScalar, Order2};
+        use gam_math::jet_tower::Tower4;
 
         fn check_o2_vs_tower4(label: &str, o2: Order2<2>, t4: Tower4<2>) {
             let band = |a: f64, b: f64| 1e-9 + 1e-9 * a.abs().max(b.abs());

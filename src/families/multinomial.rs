@@ -67,11 +67,8 @@ use crate::families::custom_family::{
 use crate::families::multinomial_reml::MultinomialFamily;
 use crate::families::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector_glm};
 use crate::families::vector_response::{MultinomialLogitLikelihood, validate_multinomial_simplex};
-use crate::inference::data::EncodedDataset;
 use crate::inference::formula_dsl::parse_formula;
-use crate::inference::model::ColumnKindTag;
 use crate::model_types::EstimationError;
-use crate::resource::ProblemHints;
 use crate::solver::fit_orchestration::{
     FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,
 };
@@ -81,6 +78,9 @@ use crate::terms::smooth::{
 };
 use crate::terms::term_builder::resolve_role_col;
 use crate::types::ResponseColumnKind;
+use gam_data::ColumnKindTag;
+use gam_data::EncodedDataset;
+use gam_runtime::resource::ProblemHints;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -2161,8 +2161,14 @@ mod fisher_override_tests {
         let base = MULTINOMIAL_FORMULA_PRIOR_PSEUDO_OBS * MULTINOMIAL_FORMULA_FISHER_INFO_PER_OBS;
         let sparse = MULTINOMIAL_FORMULA_SPARSE_PRIOR_PSEUDO_OBS_MAX
             * MULTINOMIAL_FORMULA_FISHER_INFO_PER_OBS;
-        assert!((base - 2.0e-4).abs() < 1e-18, "derived base floor must equal the calibrated 2e-4");
-        assert!((sparse - 1.0e-3).abs() < 1e-18, "derived sparse floor must equal the calibrated 1e-3");
+        assert!(
+            (base - 2.0e-4).abs() < 1e-18,
+            "derived base floor must equal the calibrated 2e-4"
+        );
+        assert!(
+            (sparse - 1.0e-3).abs() < 1e-18,
+            "derived sparse floor must equal the calibrated 1e-3"
+        );
 
         // Well-supported (n_c >= n_ref=50) sits exactly at the base floor.
         assert!((floor_for_min_count(50) - base).abs() < 1e-18);
@@ -2174,7 +2180,10 @@ mod fisher_override_tests {
         // step jumped 5x). Floor is monotone non-increasing in support.
         let f49 = floor_for_min_count(49);
         let f50 = floor_for_min_count(50);
-        assert!(f49 >= f50 && f49 <= f50 * 1.05, "floor must be continuous across c0, got {f49} vs {f50}");
+        assert!(
+            f49 >= f50 && f49 <= f50 * 1.05,
+            "floor must be continuous across c0, got {f49} vs {f50}"
+        );
         let f25 = floor_for_min_count(25);
         assert!(
             f25 > f50 && f25 < floor_for_min_count(10),

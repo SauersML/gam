@@ -83,7 +83,9 @@ impl CubicRegressionBasis {
     /// of `F`. We assemble it directly from `D` and the interior block of `F`.
     pub fn penalty(&self) -> Array2<f64> {
         let k = self.knots.len();
-        let h: Vec<f64> = (0..k - 1).map(|i| self.knots[i + 1] - self.knots[i]).collect();
+        let h: Vec<f64> = (0..k - 1)
+            .map(|i| self.knots[i + 1] - self.knots[i])
+            .collect();
         // D is (k-2) x k.
         let mut d = Array2::<f64>::zeros((k - 2, k));
         for i in 0..k - 2 {
@@ -167,7 +169,7 @@ impl CubicRegressionBasis {
             .expect("contiguous knots")
             .binary_search_by(|probe| probe.partial_cmp(&x).unwrap_or(std::cmp::Ordering::Less))
         {
-            Ok(idx) => idx,  // x equals a knot: use interval starting at idx
+            Ok(idx) => idx,      // x equals a knot: use interval starting at idx
             Err(idx) => idx - 1, // x in (knot[idx-1], knot[idx])
         };
         if j >= k - 1 {
@@ -271,9 +273,7 @@ fn thomas_solve_multi(
     for i in 1..m {
         let denom = diag[i] - off[i - 1] * c_prime[i - 1];
         if denom.abs() < 1e-300 {
-            crate::bail_invalid_basis!(
-                "singular tridiagonal pivot at row {i} in cr penalty solve"
-            );
+            crate::bail_invalid_basis!("singular tridiagonal pivot at row {i} in cr penalty solve");
         }
         if i < m - 1 {
             c_prime[i] = off[i] / denom;
@@ -300,10 +300,7 @@ fn thomas_solve_multi(
 /// the min/max, and the interior knots are at the `1/(k-1) … (k-2)/(k-1)`
 /// quantiles of the *unique* observed values. Returns a strictly increasing
 /// length-`k` knot vector.
-pub fn select_cr_knots(
-    data: ArrayView1<'_, f64>,
-    k: usize,
-) -> Result<Array1<f64>, BasisError> {
+pub fn select_cr_knots(data: ArrayView1<'_, f64>, k: usize) -> Result<Array1<f64>, BasisError> {
     if k < 3 {
         crate::bail_invalid_basis!("cubic regression spline requires k >= 3, got {k}");
     }

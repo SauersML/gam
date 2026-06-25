@@ -14,8 +14,8 @@ pub(crate) use crate::terms::analytic_penalties::{
     AnalyticPenaltyKind, AnalyticPenaltyRegistry, PenaltyTier,
 };
 pub(crate) use crate::terms::latent::{LatentCoordValues, LatentManifold};
-pub(crate) use crate::warm_start::Fingerprinter;
 pub(crate) use faer::Side;
+pub(crate) use gam_runtime::warm_start::Fingerprinter;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 pub(crate) use std::ops::Range;
 pub(crate) use std::sync::Arc;

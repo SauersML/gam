@@ -33,12 +33,12 @@
 //! issue's own reproducer geometry and asserts the fitted curve (predictions on
 //! a fixed grid) is bit-stable under pure row permutations.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -124,9 +124,7 @@ fn fit_predict(bs: &str, x: &[f64], y: &[f64], grid: &[f64]) -> Vec<f64> {
 fn worst_permutation_drift(bs: &str) -> (f64, f64) {
     let n = 300usize;
     let (x, y) = make_data(n, 7);
-    let grid: Vec<f64> = (0..40)
-        .map(|i| -1.8 + 3.6 * i as f64 / 39.0)
-        .collect();
+    let grid: Vec<f64> = (0..40).map(|i| -1.8 + 3.6 * i as f64 / 39.0).collect();
 
     let base = fit_predict(bs, &x, &y, &grid);
     let signal_range = {

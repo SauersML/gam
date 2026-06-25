@@ -57,7 +57,10 @@ fn monotone_csv(n: usize) -> String {
 
 fn write_temp_csv(contents: &str) -> std::path::PathBuf {
     let mut path = std::env::temp_dir();
-    path.push(format!("gam_issue_1509_monotone_{}.csv", std::process::id()));
+    path.push(format!(
+        "gam_issue_1509_monotone_{}.csv",
+        std::process::id()
+    ));
     let mut file = std::fs::File::create(&path).expect("create #1509 synthetic csv");
     file.write_all(contents.as_bytes())
         .expect("write #1509 synthetic csv");
@@ -120,7 +123,11 @@ fn posterior_draws_of_monotone_smooth_stay_in_the_cone() {
         .expect("monotone smooth must assemble shape inequality constraints");
     let a = &constraints.a;
     let b = &constraints.b;
-    assert_eq!(a.ncols(), p, "constraint columns must match coefficient count");
+    assert_eq!(
+        a.ncols(),
+        p,
+        "constraint columns must match coefficient count"
+    );
     assert!(a.nrows() > 0, "expected at least one monotonicity row");
 
     // Sanity: the fitted mode is in the cone (the fit honours the constraint).

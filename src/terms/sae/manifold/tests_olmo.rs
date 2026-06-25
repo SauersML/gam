@@ -335,7 +335,8 @@ pub(crate) fn olmo_real_outer_fit_does_not_pin_at_collapse_sentinel() {
     for k in [1usize, 2, 8] {
         let f = arrival_floor_k(anchor_ev, k);
         assert!(
-            f >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR && f < anchor_ev.max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR + 1e-9),
+            f >= SAE_FIT_DATA_COLLAPSE_EV_FLOOR
+                && f < anchor_ev.max(SAE_FIT_DATA_COLLAPSE_EV_FLOOR + 1e-9),
             "real-data anchor floor {f:.5} (K={k}) fell outside [{SAE_FIT_DATA_COLLAPSE_EV_FLOOR}, \
              anchor ceiling {anchor_ev:.5}) (#1189)."
         );

@@ -83,6 +83,7 @@ pub use crate::inference::predict::{
     predict_gam_posterior_mean, predict_gam_posterior_meanwith_backend,
     predict_gam_posterior_meanwith_fit, predict_gamwith_uncertainty,
 };
+pub(crate) use crate::model_types::result_types::dispersion_from_likelihood;
 pub use crate::model_types::{
     AdaptiveRegularizationOptions, BlockRole, FitArtifacts, FitGeometry, FitInference, FitOptions,
     FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts, ensure_finite_scalar,
@@ -110,11 +111,10 @@ pub use fit::{fit_gam, fit_gam_with_penalty_specs, fit_gamwith_heuristic_lambdas
 pub(crate) use joint_hyper::ExternalJointHyperEvaluator;
 pub(crate) use optimizer::optimize_external_designwith_heuristic_lambdas_andwarm_start;
 pub use optimizer::{optimize_external_design, optimize_external_designwith_heuristic_lambdas};
-pub(crate) use crate::model_types::result_types::dispersion_from_likelihood;
 pub(crate) use penalty::{
     ParametricColumnConditioning, REML_CONTINUATION_PREWARM_RHO_CAP, REML_SECOND_ORDER_RHO_CAP,
-    REML_SEED_SCREENING_RHO_CAP, faer_frob_inner, kahan_sum,
-    map_hessian_to_original_basis, scaled_covariance,
+    REML_SEED_SCREENING_RHO_CAP, faer_frob_inner, kahan_sum, map_hessian_to_original_basis,
+    scaled_covariance,
 };
 pub(crate) use prefit::{
     reject_prefit_binomial_separation, reject_prefit_unpenalized_rank_deficiency,

@@ -80,12 +80,7 @@ fn cli_numeric_coded_group_column_forced_to_factor_matches_python_and_keeps_cont
     // covariate `age`, and a numeric response `y`.
     let header = "y,age,region";
     let rows = [
-        "1.0,40,2",
-        "2.0,55,0",
-        "3.0,33,1",
-        "4.0,61,3",
-        "5.0,47,2",
-        "6.0,29,0",
+        "1.0,40,2", "2.0,55,0", "3.0,33,1", "4.0,61,3", "5.0,47,2", "6.0,29,0",
     ];
     let path = write_csv("group", header, &rows);
     let requested: Vec<String> = vec!["y".into(), "age".into(), "region".into()];
@@ -106,7 +101,12 @@ fn cli_numeric_coded_group_column_forced_to_factor_matches_python_and_keeps_cont
     // canonical, row-order-independent factor encoding).
     assert_eq!(
         region.levels,
-        vec!["0".to_string(), "1".to_string(), "2".to_string(), "3".to_string()],
+        vec![
+            "0".to_string(),
+            "1".to_string(),
+            "2".to_string(),
+            "3".to_string()
+        ],
         "forced-categorical levels must be the sorted distinct numeric labels"
     );
 

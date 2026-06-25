@@ -50,7 +50,7 @@
 //!
 //! Stage 2 of #944 (exact ∂/∂κ and ∂²/∂κ² of distance/log so κ can join
 //! the outer REML optimization as a ψ-coordinate) is implemented as a
-//! CLIENT of [`crate::families::jet_tower::Tower4`]: the same geometric
+//! CLIENT of [`gam_math::jet_tower::Tower4`]: the same geometric
 //! program is evaluated with κ seeded as a 1-variable jet, the scalar
 //! primitives `C/S/T` entering through their hand-certified `[f64; 5]`
 //! derivative stacks via `compose_unary`. Humans own primitive stability,
@@ -76,7 +76,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use super::manifold::{GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold};
-use crate::families::jet_tower::Tower4;
+use gam_math::jet_tower::Tower4;
 
 /// Branch threshold for the `C`/`S` series in `u = κt²`. The series terms
 /// decay factorially, so at `|u| ≤ 0.5` the truncation error of

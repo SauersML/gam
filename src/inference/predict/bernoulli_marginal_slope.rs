@@ -2271,7 +2271,6 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
         predict_with_uncertainty_generic(self, input)
     }
 
-
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,

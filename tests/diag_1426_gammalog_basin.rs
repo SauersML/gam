@@ -195,9 +195,15 @@ fn diag_1426_gammalog_basin_dump() {
 
     // The two reported failing datasets (overfit, EDF≈24) ...
     let edf_lcg7 = dump_components("lcg_seed7_OVERFIT", &build_data_lcg(7, 1500));
-    let edf_sm900006 = dump_components("splitmix_900006_OVERFIT", &build_data_splitmix(900006, 1500));
+    let edf_sm900006 = dump_components(
+        "splitmix_900006_OVERFIT",
+        &build_data_splitmix(900006, 1500),
+    );
     // ... and a healthy contrast (the bug-hunt control seed lands EDF≈9.4).
-    let edf_sm900000 = dump_components("splitmix_900000_HEALTHY", &build_data_splitmix(900000, 1500));
+    let edf_sm900000 = dump_components(
+        "splitmix_900000_HEALTHY",
+        &build_data_splitmix(900000, 1500),
+    );
 
     eprintln!(
         "[#1426 basin] SUMMARY edf_lcg7={edf_lcg7:.3} edf_splitmix900006={edf_sm900006:.3} \

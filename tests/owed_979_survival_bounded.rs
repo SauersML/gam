@@ -102,7 +102,8 @@ fn survival_marginal_slope_returns_bounded_not_hang_979() {
     std::thread::spawn(move || {
         let start = Instant::now();
         let outcome = fit_from_formula(&formula, &data, &config);
-        tx.send((outcome.is_ok(), start.elapsed().as_secs_f64())).ok();
+        tx.send((outcome.is_ok(), start.elapsed().as_secs_f64()))
+            .ok();
     });
 
     // Generous allowance over the budget for post-deadline cleanup + final refit.

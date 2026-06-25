@@ -169,7 +169,10 @@ fn report(
         cat = cat.label(),
         ws = if extra.is_empty() { "" } else { " " },
     );
-    assert!(!matches!(cat, Category::Collapsed), "probe {probe} collapsed");
+    assert!(
+        !matches!(cat, Category::Collapsed),
+        "probe {probe} collapsed"
+    );
     cat
 }
 

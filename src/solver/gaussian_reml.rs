@@ -797,11 +797,7 @@ fn solve_block_orthogonal_rho(
         // was masking: the clamp existed only to keep an over-long step from
         // reaching `block_orthogonal_eval`, which errors on a non-finite λ.
         let descent = grad.signum();
-        let step = if hess > 1.0e-10 {
-            grad / hess
-        } else {
-            descent
-        };
+        let step = if hess > 1.0e-10 { grad / hess } else { descent };
         let mut best_rho = rho;
         let mut best_eval = current;
         let mut best_phi =
@@ -3751,12 +3747,12 @@ mod tests {
 
     #[test]
     fn scalar_backward_matches_forward_finite_difference_for_all_x_y_and_weight_entries() {
-                assert_backward_matches_forward_finite_difference(1);
+        assert_backward_matches_forward_finite_difference(1);
     }
 
     #[test]
     fn multi_output_backward_matches_forward_finite_difference_for_all_x_y_and_weight_entries() {
-                assert_backward_matches_forward_finite_difference(3);
+        assert_backward_matches_forward_finite_difference(3);
     }
 
     #[test]

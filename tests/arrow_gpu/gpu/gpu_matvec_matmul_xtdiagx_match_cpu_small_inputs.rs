@@ -64,7 +64,9 @@ fn gpu_paths_match_cpu_to_1e8_on_floor_clearing_matrices() {
 
     // GEMV A·v: 2·m·k = 2·50000·1100 = 1.1e8 ≥ 1e8. A thin-tall shape keeps the
     // CPU reference dot (≈5.5e7 flops) cheap while clearing the GEMM FLOP floor.
-    let av_a = Array2::from_shape_fn((50000, 1100), |(i, j)| ((i * 3 + j + 1) as f64 * 0.013).sin());
+    let av_a = Array2::from_shape_fn((50000, 1100), |(i, j)| {
+        ((i * 3 + j + 1) as f64 * 0.013).sin()
+    });
     let v = Array1::from_shape_fn(1100, |i| ((i + 1) as f64 * 0.07).cos());
     match gpu::try_fast_av(av_a.view(), v.view()) {
         Some(av_gpu) => {

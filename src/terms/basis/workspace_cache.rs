@@ -34,16 +34,16 @@ pub(crate) struct OwnedDataCacheKey {
 #[derive(Debug)]
 pub(crate) struct BasisCacheContext {
     pub(crate) constraint_nullspace: ConstraintNullspaceCache,
-    pub(crate) owned_data: crate::resource::ByteLruCache<OwnedDataCacheKey, Arc<Array2<f64>>>,
+    pub(crate) owned_data: gam_runtime::resource::ByteLruCache<OwnedDataCacheKey, Arc<Array2<f64>>>,
 }
 
 impl BasisCacheContext {
-    pub(crate) fn with_policy(policy: &crate::resource::ResourcePolicy) -> Self {
+    pub(crate) fn with_policy(policy: &gam_runtime::resource::ResourcePolicy) -> Self {
         Self {
             constraint_nullspace: ConstraintNullspaceCache::default(),
-            owned_data: crate::resource::ByteLruCache::with_max_entries(
+            owned_data: gam_runtime::resource::ByteLruCache::with_max_entries(
                 policy.max_owned_data_cache_bytes,
-                crate::resource::OWNED_DATA_CACHE_MAX_ENTRIES,
+                gam_runtime::resource::OWNED_DATA_CACHE_MAX_ENTRIES,
             ),
         }
     }
@@ -51,7 +51,7 @@ impl BasisCacheContext {
 
 impl Default for BasisCacheContext {
     fn default() -> Self {
-        Self::with_policy(&crate::resource::ResourcePolicy::default_library())
+        Self::with_policy(&gam_runtime::resource::ResourcePolicy::default_library())
     }
 }
 
@@ -61,13 +61,13 @@ impl Default for BasisCacheContext {
 /// and to keep caching scoped to a caller-controlled lifecycle.
 ///
 /// Owned-data cache entries are byte-limited via the
-/// [`crate::resource::ResourcePolicy`] provided at construction; use
+/// [`gam_runtime::resource::ResourcePolicy`] provided at construction; use
 /// [`BasisWorkspace::with_policy`] for large-scale workloads where a single
 /// entry can be multiple gigabytes.
 #[derive(Debug)]
 pub struct BasisWorkspace {
     pub(crate) cache: BasisCacheContext,
-    pub(crate) policy: crate::resource::ResourcePolicy,
+    pub(crate) policy: gam_runtime::resource::ResourcePolicy,
 }
 
 impl BasisWorkspace {
@@ -75,7 +75,7 @@ impl BasisWorkspace {
         Self::default()
     }
 
-    pub fn with_policy(policy: crate::resource::ResourcePolicy) -> Self {
+    pub fn with_policy(policy: gam_runtime::resource::ResourcePolicy) -> Self {
         Self {
             cache: BasisCacheContext::with_policy(&policy),
             policy,
@@ -83,11 +83,11 @@ impl BasisWorkspace {
     }
 
     pub fn default_library() -> Self {
-        Self::with_policy(crate::resource::ResourcePolicy::default_library())
+        Self::with_policy(gam_runtime::resource::ResourcePolicy::default_library())
     }
 
     /// Returns the resource policy this workspace was configured with.
-    pub fn policy(&self) -> &crate::resource::ResourcePolicy {
+    pub fn policy(&self) -> &gam_runtime::resource::ResourcePolicy {
         &self.policy
     }
 }

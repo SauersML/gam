@@ -690,7 +690,10 @@ pub fn build_cubic_regression_basis_1d(
     // value-at-knot parameterization. Reject it explicitly; every other
     // `BSplineIdentifiability` variant is a pure design+penalty congruence and
     // is delegated to the shared dense policy below.
-    if matches!(spec.identifiability, BSplineIdentifiability::RemoveLinearTrend) {
+    if matches!(
+        spec.identifiability,
+        BSplineIdentifiability::RemoveLinearTrend
+    ) {
         crate::bail_invalid_basis!(
             "natural cubic regression spline (bs=\"cr\"/\"cs\") does not support \
              RemoveLinearTrend identifiability; use the default sum-to-zero centering"
@@ -714,9 +717,7 @@ pub fn build_cubic_regression_basis_1d(
         kronecker_factors: None,
         op: None,
     }];
-    if want_nullspace
-        && let Some(shrinkage) = build_nullspace_shrinkage_penalty(&s_bend_raw)?
-    {
+    if want_nullspace && let Some(shrinkage) = build_nullspace_shrinkage_penalty(&s_bend_raw)? {
         let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage.sym_penalty);
         penalties_raw.push(PenaltyCandidate {
             matrix: ridge_norm,

@@ -18,7 +18,9 @@
 
 use gam::geometry::constant_curvature::ConstantCurvature;
 use gam::smooth::get_constant_curvature_kappa;
-use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 
 use csv::StringRecord;
 

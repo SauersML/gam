@@ -826,7 +826,7 @@ pub struct MatrixFreeSpdOperator {
     // reconstruction `H·I`; `None` means no direct build is available and the
     // matvec path is used (the result is bit-for-bit the prior behavior).
     pub(crate) dense_assemble: Option<Arc<dyn Fn() -> Option<Array2<f64>> + Send + Sync>>,
-    pub(crate) cached_logdet: crate::resource::RayonSafeOnce<f64>,
+    pub(crate) cached_logdet: gam_runtime::resource::RayonSafeOnce<f64>,
     pub(crate) n_dim: usize,
     // `RayonSafeOnce`, not `OnceLock`: `materialize_dense_operator` invokes
     // `apply`, which for operator-source joint Hessians dispatches a nested
@@ -837,7 +837,7 @@ pub struct MatrixFreeSpdOperator {
     // for workers. `RayonSafeOnce` keeps init lock-free — racers may
     // duplicate the dim²-matvec build, but the first to publish wins and
     // steady-state matches `OnceLock`.
-    pub(crate) dense_spectral: crate::resource::RayonSafeOnce<Option<DenseSpectralOperator>>,
+    pub(crate) dense_spectral: gam_runtime::resource::RayonSafeOnce<Option<DenseSpectralOperator>>,
     // Pseudo-logdet convention threaded from the family. The dense outer path
     // already plumbs `PseudoLogdetMode` into `BlockCoupledOperator`; the
     // matrix-free path materializes a `DenseSpectralOperator` lazily and must
@@ -878,9 +878,9 @@ impl MatrixFreeSpdOperator {
         Self {
             apply,
             dense_assemble,
-            cached_logdet: crate::resource::RayonSafeOnce::new(),
+            cached_logdet: gam_runtime::resource::RayonSafeOnce::new(),
             n_dim: dim,
-            dense_spectral: crate::resource::RayonSafeOnce::new(),
+            dense_spectral: gam_runtime::resource::RayonSafeOnce::new(),
             mode,
         }
     }

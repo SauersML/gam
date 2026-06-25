@@ -260,10 +260,13 @@ fn real_fitted_bound_torus_atom_runs_carve_and_blocks_fission() {
     );
 
     // The carve also recorded a Keep decision for the parent.
-    let parent_kept = report
-        .fission_carve_results
-        .iter()
-        .any(|r| r.atom == 0 && matches!(r.decision, gam::terms::structure::anova_atom::FissionDecision::Keep));
+    let parent_kept = report.fission_carve_results.iter().any(|r| {
+        r.atom == 0
+            && matches!(
+                r.decision,
+                gam::terms::structure::anova_atom::FissionDecision::Keep
+            )
+    });
     assert!(
         parent_kept,
         "the bound parent's carve result must record a Keep decision; results = {:?}",

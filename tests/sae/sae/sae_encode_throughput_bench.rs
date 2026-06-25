@@ -449,8 +449,7 @@ fn sae_encode_throughput_decision_gate() {
     // identity so a future edit that decouples the floor from the gate (the
     // #1412 defect) cannot silently reintroduce a CPU floor that passes while the
     // GPU target is missed.
-    let projection_clears_gate = projected_gpu_small
-        >= GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU
+    let projection_clears_gate = projected_gpu_small >= GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU
         && projected_gpu_large >= GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU;
     assert_eq!(
         surrogate_unneeded, projection_clears_gate,

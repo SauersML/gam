@@ -823,11 +823,9 @@ impl LatentIdMode {
             // Beautiful unification: return a proper error instead of a
             // panic guard (removes the tracked ban stub while keeping the
             // gate).
-            return Err(
-                "LatentIdMode::DimSelection is not a standalone gauge fix; \
+            return Err("LatentIdMode::DimSelection is not a standalone gauge fix; \
                  pair ARD with AuxPrior or Isometry"
-                    .to_string(),
-            );
+                .to_string());
         }
         if let Self::AuxOutcome { head, .. } = self
             && head.effective_labeled_count() <= 0.0

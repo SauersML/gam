@@ -47,8 +47,12 @@ pub struct PirlsWorkspace {
     // `X` and every later iterate crosses only the n-vector `w` H2D and the p×p
     // Gram D2H. `None` whenever CUDA is unavailable / the shape is below the GPU
     // Gram threshold / the upload failed — the caller keeps its per-call path.
-    pub(crate) resident_design_gram:
-        Option<(usize, usize, usize, crate::gpu::linalg_dispatch::ResidentDesignGram)>,
+    pub(crate) resident_design_gram: Option<(
+        usize,
+        usize,
+        usize,
+        crate::gpu::linalg_dispatch::ResidentDesignGram,
+    )>,
 }
 
 impl PirlsWorkspace {

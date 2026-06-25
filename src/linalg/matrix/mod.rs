@@ -3,14 +3,14 @@ use crate::faer_ndarray::{
     effective_global_parallelism, fast_ab, fast_atb, fast_atv, fast_atv_into, fast_av,
     fast_av_into, fast_xt_diag_x, stream_weighted_crossprod_into,
 };
-use crate::resource::{
-    MaterializationPolicy, MatrixMaterializationError, ResourcePolicy, rows_for_target_bytes,
-};
 use crate::types::RidgePolicy;
 use faer::Accum;
 use faer::Par;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
+use gam_runtime::resource::{
+    MaterializationPolicy, MatrixMaterializationError, ResourcePolicy, rows_for_target_bytes,
+};
 use ndarray::{
     Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, ShapeBuilder, s,
 };
@@ -127,7 +127,7 @@ pub fn panic_or_error_if_large_scale_mode_and_to_dense_called_with_policy(
     // large scale.
     if matches!(
         policy.derivative_storage_mode,
-        crate::resource::DerivativeStorageMode::AnalyticOperatorRequired
+        gam_runtime::resource::DerivativeStorageMode::AnalyticOperatorRequired
     ) {
         return Err(MatrixError::DensificationRefused {
             reason: format!(
@@ -1027,7 +1027,7 @@ pub trait DenseDesignOperator: LinearOperator + Send + Sync {
         if !policy.allow_operator_materialization {
             return Err(MatrixMaterializationError::Forbidden {
                 context,
-                mode: crate::resource::DerivativeStorageMode::AnalyticOperatorRequired,
+                mode: gam_runtime::resource::DerivativeStorageMode::AnalyticOperatorRequired,
             });
         }
         if bytes > policy.max_single_dense_bytes {
@@ -3060,7 +3060,7 @@ impl CoefficientTransformOperator {
                 let auto_policy = ResourcePolicy::for_problem(
                     self.n,
                     self.p_out,
-                    crate::resource::ProblemHints::default(),
+                    gam_runtime::resource::ProblemHints::default(),
                 );
                 let cache_policy = ResourcePolicy {
                     max_single_materialization_bytes: Self::MATERIALIZE_MAX_BYTES,
@@ -3257,7 +3257,7 @@ impl ResidualisedDesignOperator {
                 let auto_policy = ResourcePolicy::for_problem(
                     self.n,
                     self.p_out,
-                    crate::resource::ProblemHints::default(),
+                    gam_runtime::resource::ProblemHints::default(),
                 );
                 let cache_policy = ResourcePolicy {
                     max_single_materialization_bytes: Self::MATERIALIZE_MAX_BYTES,
@@ -5776,18 +5776,17 @@ mod tests {
     use super::{
         BlockDesignOperator, ChunkedKernelDesignOperator, CoefficientTransformOperator,
         DenseDesignMatrix, DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
-        MultiChannelOperator,
-        PsdWeightsView, ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator,
-        SignedWeightsView, SparseDesignMatrix, dense_operator_to_dense_by_chunks,
-        dense_transpose_weighted_response, fast_atv, fast_av, streaming_sparse_csc_xt_diag_x,
-        weighted_crossprod_dense_view,
+        MultiChannelOperator, PsdWeightsView, ReparamOperator, ResidualisedDesignOperator,
+        RowwiseKroneckerOperator, SignedWeightsView, SparseDesignMatrix,
+        dense_operator_to_dense_by_chunks, dense_transpose_weighted_response, fast_atv, fast_av,
+        streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view,
     };
     use crate::linalg::matrix::LinearOperator;
     use crate::linalg::utils::{PcgSolveInfo, StableSolver};
-    use crate::resource::{MatrixMaterializationError, ResourcePolicy};
     use crate::test_support::no_densify_design;
     use crate::types::RidgePolicy;
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
+    use gam_runtime::resource::{MatrixMaterializationError, ResourcePolicy};
     use ndarray::{Array1, Array2, ArrayViewMut2, Axis, array, s};
     use std::ops::Range;
     use std::sync::Arc;

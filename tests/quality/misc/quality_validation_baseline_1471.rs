@@ -92,7 +92,13 @@ fn encode(cols: &[(&str, &[f64])]) -> EncodedDataset {
     }
     let headers: Vec<String> = cols.iter().map(|(h, _)| (*h).to_string()).collect();
     let rows: Vec<StringRecord> = (0..n)
-        .map(|i| StringRecord::from(cols.iter().map(|(_, c)| c[i].to_string()).collect::<Vec<_>>()))
+        .map(|i| {
+            StringRecord::from(
+                cols.iter()
+                    .map(|(_, c)| c[i].to_string())
+                    .collect::<Vec<_>>(),
+            )
+        })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode baseline dataset")
 }
@@ -187,7 +193,10 @@ fn tweedie_log_smooth_recovers_truth_and_matches_mgcv() {
             y.push(yi);
         }
         let zeros = y.iter().filter(|&&v| v == 0.0).count();
-        assert!(zeros > 0, "Tweedie 1<p<2 must be zero-inflated; got {zeros} zeros");
+        assert!(
+            zeros > 0,
+            "Tweedie 1<p<2 must be zero-inflated; got {zeros} zeros"
+        );
 
         let ds = encode(&[("x", &x), ("y", &y)]);
         let x_idx = ds.column_map()["x"];
@@ -198,9 +207,8 @@ fn tweedie_log_smooth_recovers_truth_and_matches_mgcv() {
             ..FitConfig::default()
         };
         // gam: matched basis (tp) + matched penalty model (double_penalty=false).
-        let result =
-            fit_from_formula("y ~ s(x, bs=\"tp\", k=10, double_penalty=false)", &ds, &cfg)
-                .expect("gam tweedie fit");
+        let result = fit_from_formula("y ~ s(x, bs=\"tp\", k=10, double_penalty=false)", &ds, &cfg)
+            .expect("gam tweedie fit");
         let FitResult::Standard(fit) = result else {
             panic!("Tweedie(log) is a scalar GLM family => expected FitResult::Standard");
         };
@@ -327,9 +335,12 @@ fn smooth_plus_linear_same_var_recovers_truth_and_matches_mgcv() {
     };
     // gam: matched basis (cr) + matched penalty model (double_penalty=false). The
     // parametric `linear(x)` term is unpenalized on both sides (mgcv `+ x` too).
-    let result =
-        fit_from_formula("y ~ s(x, bs=\"cr\", k=10, double_penalty=false) + linear(x)", &ds, &cfg)
-            .expect("gam s(x)+x fit");
+    let result = fit_from_formula(
+        "y ~ s(x, bs=\"cr\", k=10, double_penalty=false) + linear(x)",
+        &ds,
+        &cfg,
+    )
+    .expect("gam s(x)+x fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for s(x)+linear(x)");
     };
@@ -580,7 +591,8 @@ fn concurvity_two_smooths_corr_090_recovers_truth_and_matches_mgcv() {
         mgcv_edf_per[0] > 1.5 && mgcv_edf_per[1] > 1.5,
         "mgcv reference itself collapsed a smooth — the per-term bar is unfair: \
          mgcv EDF s(x)={:.3}, s(z)={:.3}",
-        mgcv_edf_per[0], mgcv_edf_per[1]
+        mgcv_edf_per[0],
+        mgcv_edf_per[1]
     );
 
     // (c) per-PARTIAL truth recovery: each isolated smooth curve must track its
@@ -689,8 +701,7 @@ fn cyclic_tensor_periodic_clamped_wraps_and_matches_mgcv() {
         ..FitConfig::default()
     };
     // gam analog of mgcv te(bs=c("cc","cr")): periodic t margin, clamped x margin.
-    let formula =
-        "y ~ te(t, x, boundary=['periodic','clamped'], period=[2*pi, None], k=8)";
+    let formula = "y ~ te(t, x, boundary=['periodic','clamped'], period=[2*pi, None], k=8)";
     let result = fit_from_formula(formula, &ds, &cfg).expect("gam cyclic tensor fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for the cyclic tensor smooth");
@@ -837,7 +848,10 @@ fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
     x.sort_by(|a, b| a.partial_cmp(b).expect("finite x"));
     // eta = 1.0 + 0.9*sin(2π x); mu = exp(eta) in ~[1.1, 6.7] (well away from 0,
     // so the Gaussian-approximate interval is a fair comparison for both tools).
-    let mu_true: Vec<f64> = x.iter().map(|&v| (1.0 + 0.9 * (TAU * v).sin()).exp()).collect();
+    let mu_true: Vec<f64> = x
+        .iter()
+        .map(|&v| (1.0 + 0.9 * (TAU * v).sin()).exp())
+        .collect();
 
     let poisson_log = LikelihoodSpec::new(
         ResponseFamily::Poisson,
@@ -860,9 +874,8 @@ fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
             family: Some("poisson".to_string()),
             ..FitConfig::default()
         };
-        let result =
-            fit_from_formula("y ~ s(x, bs=\"cr\", k=10, double_penalty=false)", &ds, &cfg)
-                .expect("gam poisson fit");
+        let result = fit_from_formula("y ~ s(x, bs=\"cr\", k=10, double_penalty=false)", &ds, &cfg)
+            .expect("gam poisson fit");
         let FitResult::Standard(fit) = result else {
             panic!("poisson => FitResult::Standard");
         };
@@ -890,7 +903,11 @@ fn poisson_response_ci_is_calibrated_and_matches_mgcv() {
             },
         )
         .expect("gam poisson response-scale uncertainty");
-        gam_cov += covered(&pred.mean_lower.to_vec(), &pred.mean_upper.to_vec(), &mu_true);
+        gam_cov += covered(
+            &pred.mean_lower.to_vec(),
+            &pred.mean_upper.to_vec(),
+            &mu_true,
+        );
 
         let r = run_r(
             &[Column::new("x", &x), Column::new("y", &y)],

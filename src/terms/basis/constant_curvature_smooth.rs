@@ -659,8 +659,12 @@ pub fn build_constant_curvature_basis(
     // the Occam term stops rewarding the collapse and V_p regains an interior
     // minimum near the data-generating κ. At κ = 0, L_S = ℓ_ref = L, so the κ = 0
     // build is byte-identical.
-    let (ell_eff_penalty, _, _) =
-        constant_curvature_effective_length_jet(centers.view(), centers.view(), length_scale, spec.kappa)?;
+    let (ell_eff_penalty, _, _) = constant_curvature_effective_length_jet(
+        centers.view(),
+        centers.view(),
+        length_scale,
+        spec.kappa,
+    )?;
     let raw_penalty = constant_curvature_kernel_matrix(
         centers.view(),
         centers.view(),
@@ -892,7 +896,9 @@ fn constant_curvature_profile_design_penalty(
     spec: &ConstantCurvatureBasisSpec,
 ) -> Result<(Array2<f64>, Array2<f64>), BasisError> {
     if data.ncols() == 0 {
-        crate::bail_invalid_basis!("constant-curvature profile score needs at least one feature column");
+        crate::bail_invalid_basis!(
+            "constant-curvature profile score needs at least one feature column"
+        );
     }
     if !spec.kappa.is_finite() {
         crate::bail_invalid_basis!("constant-curvature profile score needs a finite kappa");
@@ -921,8 +927,12 @@ fn constant_curvature_profile_design_penalty(
     let gauge = crate::solver::gauge::Gauge::from_block_transforms(&[z]);
     let raw_design = constant_curvature_kernel_matrix(data, centers.view(), spec.kappa, ell_eff)?;
     let b = gauge.restrict_design(&raw_design);
-    let raw_penalty =
-        constant_curvature_kernel_matrix(centers.view(), centers.view(), spec.kappa, ell_eff_penalty)?;
+    let raw_penalty = constant_curvature_kernel_matrix(
+        centers.view(),
+        centers.view(),
+        spec.kappa,
+        ell_eff_penalty,
+    )?;
     let s = symmetrize(&gauge.restrict_penalty(&raw_penalty));
     Ok((b, s))
 }
@@ -1171,8 +1181,12 @@ pub fn build_constant_curvature_basis_kappa_derivatives(
     // of logdet|S|₊ stays EXACT for the penalty-resolution-invariant value build
     // above. q_S = d/L_S with both d and L_S moving in κ, so the quotient chain
     // rule inside `constant_curvature_kernel_kappa_jets_scaled` carries the L_S jet.
-    let l_jet_penalty =
-        constant_curvature_effective_length_jet(centers.view(), centers.view(), length_scale, spec.kappa)?;
+    let l_jet_penalty = constant_curvature_effective_length_jet(
+        centers.view(),
+        centers.view(),
+        length_scale,
+        spec.kappa,
+    )?;
     let (_k_cc, dk_cc, dkk_cc) = constant_curvature_kernel_kappa_jets_scaled(
         centers.view(),
         centers.view(),
@@ -1718,8 +1732,8 @@ mod tests {
         let ell = realized_constant_curvature_length_scale(centers.view(), 0.0).unwrap();
 
         for &kappa in &[-2.0_f64, -0.5, 0.0, 0.5, 2.0] {
-            let k =
-                constant_curvature_kernel_matrix(centers.view(), centers.view(), kappa, ell).unwrap();
+            let k = constant_curvature_kernel_matrix(centers.view(), centers.view(), kappa, ell)
+                .unwrap();
             // Primary penalty exactly as the basis builder forms it: symmetrized
             // gauge-restricted kernel Gram.
             let raw = symmetrize(&z.t().dot(&k).dot(&z));

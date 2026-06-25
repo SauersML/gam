@@ -119,8 +119,12 @@ fn nb_dispersion_honors_user_fixed_theta_1463() {
 #[test]
 fn nb_dispersion_falls_back_to_seed_when_unfitted_1463() {
     let seeded = LikelihoodSpec::negative_binomial_log(2.5);
-    let theta = family_noise_parameter(LikelihoodScaleMetadata::Unspecified, WRONG_RESIDUAL_SCALE, &seeded)
-        .expect("unfitted NB still resolves to its seed");
+    let theta = family_noise_parameter(
+        LikelihoodScaleMetadata::Unspecified,
+        WRONG_RESIDUAL_SCALE,
+        &seeded,
+    )
+    .expect("unfitted NB still resolves to its seed");
     assert_eq!(
         theta, 2.5,
         "an unfitted NB model must fall back to the spec seed theta, not the residual scale"
@@ -142,8 +146,7 @@ fn dispersion_picker_is_not_negbin_for_other_families_1463() {
         response: ResponseFamily::Gaussian,
         link: gam::types::InverseLink::Standard(gam::types::StandardLink::Identity),
     };
-    let sigma = family_noise_parameter(scale, 1.75, &gaussian)
-        .expect("Gaussian generative sigma");
+    let sigma = family_noise_parameter(scale, 1.75, &gaussian).expect("Gaussian generative sigma");
     assert_eq!(
         sigma, 1.75,
         "Gaussian generative noise is the residual scale, not an NB theta"

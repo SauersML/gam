@@ -4,7 +4,7 @@
 
 use super::*;
 
-use crate::families::jet_scalar::{JetScalar, OneSeed, TwoSeed};
+use gam_math::jet_scalar::{JetScalar, OneSeed, TwoSeed};
 
 // ── Static-sparsity (v,g,H) scalar (#932 perf) ─────────────────────────
 //
@@ -335,8 +335,10 @@ pub(crate) fn rigid_row_nll<S: JetScalar<4>>(
 
     let neg_eta1 = eta1.neg();
     reject_nonfinite_margin(neg_eta1.value(), wi * (1.0 - di))?;
-    let exit =
-        neg_eta1.compose_unary(unary_derivatives_neglog_phi(neg_eta1.value(), wi * (1.0 - di)));
+    let exit = neg_eta1.compose_unary(unary_derivatives_neglog_phi(
+        neg_eta1.value(),
+        wi * (1.0 - di),
+    ));
 
     let event_density = if di > 0.0 {
         eta1.compose_unary(unary_derivatives_log_normal_pdf(eta1.value()))
@@ -365,14 +367,14 @@ pub(crate) fn rigid_row_kernel_nll_tower(
     family: &SurvivalMarginalSlopeFamily,
     block_states: &[ParameterBlockState],
     row: usize,
-    p: &[crate::families::jet_tower::Tower4<4>; 4],
+    p: &[gam_math::jet_tower::Tower4<4>; 4],
     context: &str,
-) -> Result<crate::families::jet_tower::Tower4<4>, String> {
+) -> Result<gam_math::jet_tower::Tower4<4>, String> {
     let inputs = rigid_row_inputs(family, block_states, row, context)?;
     rigid_row_nll(p, &inputs)
 }
 
-impl crate::families::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRowKernel {
+impl gam_math::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRowKernel {
     fn n_rows(&self) -> usize {
         self.family.n
     }
@@ -384,8 +386,8 @@ impl crate::families::jet_tower::RowNllProgram<4> for SurvivalMarginalSlopeRowKe
     fn row_nll(
         &self,
         row: usize,
-        p: &[crate::families::jet_tower::Tower4<4>; 4],
-    ) -> Result<crate::families::jet_tower::Tower4<4>, String> {
+        p: &[gam_math::jet_tower::Tower4<4>; 4],
+    ) -> Result<gam_math::jet_tower::Tower4<4>, String> {
         rigid_row_kernel_nll_tower(
             &self.family,
             &self.block_states,
@@ -444,9 +446,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     fn batched_value_grad_hess_all(
         &self,
     ) -> Option<Result<(Vec<f64>, Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>), String>> {
-        use crate::gpu::kernels::survival_rowjet::{
-            survival_rigid_row_jets, SurvivalRowInputs,
-        };
+        use crate::gpu::kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_jets};
         let n = self.family.n;
         let probit_scale = self.family.probit_frailty_scale();
         let qd1_lower = self.family.time_derivative_lower_bound();
@@ -798,11 +798,11 @@ impl SurvivalMarginalSlopeRowKernel {
     /// what a fresh per-axis `row_third_contracted` / `row_fourth_contracted`
     /// rebuild would produce — the build-once batched overrides below contract
     /// against these cached towers without changing any downstream arithmetic.
-    fn build_row_towers(&self) -> Result<Vec<crate::families::jet_tower::Tower4<4>>, String> {
+    fn build_row_towers(&self) -> Result<Vec<gam_math::jet_tower::Tower4<4>>, String> {
         let n = <Self as RowKernel<4>>::n_rows(self);
         (0..n)
             .into_par_iter()
-            .map(|row| crate::families::jet_tower::evaluate_program::<4, Self>(self, row))
+            .map(|row| gam_math::jet_tower::evaluate_program::<4, Self>(self, row))
             .collect()
     }
 

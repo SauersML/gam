@@ -26,9 +26,7 @@
 //! cargo run --release --example resident_frame_amortization_1017
 //! ```
 
-use gam::gpu::kernels::arrow_schur::{
-    solve_arrow_newton_step, ResidentArrowFrameHandle,
-};
+use gam::gpu::kernels::arrow_schur::{ResidentArrowFrameHandle, solve_arrow_newton_step};
 use gam::gpu::kernels::sae_resident::color_arm_fixture;
 use gam::solver::arrow_schur::ArrowSchurSystem;
 use std::time::{Duration, Instant};
@@ -62,7 +60,9 @@ fn main() {
     let frame = match ResidentArrowFrameHandle::new(&sys, ridge_t, ridge_beta) {
         Ok(f) => f,
         Err(err) => {
-            println!("AMORT_1017 NO_GPU_RUNTIME — resident frame declined ({err:?}); run on the A100 node");
+            println!(
+                "AMORT_1017 NO_GPU_RUNTIME — resident frame declined ({err:?}); run on the A100 node"
+            );
             return;
         }
     };
@@ -70,14 +70,9 @@ fn main() {
 
     // ---- parity: one resident solve vs one re-upload solve on the SAME frame ----
     let resident_sol = frame.solve_gradient(&g_t, &g_beta).expect("resident solve");
-    let reupload_sol =
-        solve_arrow_newton_step(&sys, ridge_t, ridge_beta).expect("reupload solve");
+    let reupload_sol = solve_arrow_newton_step(&sys, ridge_t, ridge_beta).expect("reupload solve");
     let mut max_diff = 0.0_f64;
-    for (a, b) in resident_sol
-        .delta_t
-        .iter()
-        .zip(reupload_sol.delta_t.iter())
-    {
+    for (a, b) in resident_sol.delta_t.iter().zip(reupload_sol.delta_t.iter()) {
         max_diff = max_diff.max((a - b).abs());
     }
     for (a, b) in resident_sol

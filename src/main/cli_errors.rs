@@ -76,8 +76,8 @@ impl From<gam::inference::formula_dsl::FormulaDslError> for CliError {
     }
 }
 
-impl From<gam::inference::data::DataError> for CliError {
-    fn from(err: gam::inference::data::DataError) -> Self {
+impl From<gam::data::DataError> for CliError {
+    fn from(err: gam::data::DataError) -> Self {
         // Data-loader failures land in the user-facing argument-validation
         // surface: the path / schema / columns the user pointed us at could
         // not be opened or parsed. The classifier still runs on the rendered

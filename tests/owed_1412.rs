@@ -11,7 +11,7 @@
 
 use gam::gpu::linalg_dispatch::ResidentDesignGram;
 use gam::gpu::policy::{
-    GpuDispatchPolicy, GpuThroughputVerdict, GPU_THROUGHPUT_TARGET_ROWS_PER_SEC,
+    GPU_THROUGHPUT_TARGET_ROWS_PER_SEC, GpuDispatchPolicy, GpuThroughputVerdict,
 };
 use ndarray::{Array1, Array2};
 
@@ -25,7 +25,10 @@ fn throughput_verdict_is_a_function_of_the_measurement() {
 
     // A measurement well below target must NOT claim success.
     let slow = GpuThroughputVerdict::from_measurement(target * 0.25);
-    assert!(!slow.meets_target, "below-target measurement must fail the gate");
+    assert!(
+        !slow.meets_target,
+        "below-target measurement must fail the gate"
+    );
     assert!((slow.fraction_of_target - 0.25).abs() < 1e-9);
 
     // A measurement exactly at target passes.
@@ -48,9 +51,15 @@ fn unusable_measurement_never_meets_target() {
         let v = GpuThroughputVerdict::from_measurement(bad);
         if bad.is_infinite() && bad > 0.0 {
             // +inf is technically ≥ target, but is not a usable measurement.
-            assert!(!v.meets_target, "non-finite throughput is not a measurement");
+            assert!(
+                !v.meets_target,
+                "non-finite throughput is not a measurement"
+            );
         } else {
-            assert!(!v.meets_target, "non-positive/NaN throughput cannot meet target");
+            assert!(
+                !v.meets_target,
+                "non-positive/NaN throughput cannot meet target"
+            );
         }
         assert_eq!(v.fraction_of_target, 0.0);
     }
@@ -212,12 +221,16 @@ fn resident_normal_equations_matches_host_solve_or_declines() {
         );
 
         // Shape guards: wrong-length w or rhs is rejected.
-        assert!(handle
-            .solve_normal_equations(Array1::zeros(n + 1).view(), rhs.view(), ridge)
-            .is_none());
-        assert!(handle
-            .solve_normal_equations(w.view(), Array1::zeros(p + 1).view(), ridge)
-            .is_none());
+        assert!(
+            handle
+                .solve_normal_equations(Array1::zeros(n + 1).view(), rhs.view(), ridge)
+                .is_none()
+        );
+        assert!(
+            handle
+                .solve_normal_equations(w.view(), Array1::zeros(p + 1).view(), ridge)
+                .is_none()
+        );
     }
     // CPU-only host: try_new returned None; nothing to assert beyond the clean
     // decline already covered by the gram test.
@@ -311,7 +324,10 @@ fn mixed_precision_solution_only_is_fp64_accurate_or_declines() {
             // the same SPD system (it pays the fp64 POTRF; solution agrees).
             let (sol_ld, logdet) = gam::gpu::solver::cholesky_solve_gpu(a.view(), rhs.view())
                 .expect("logdet path on the same device");
-            assert!(logdet.is_finite(), "logdet path must produce a finite logdet");
+            assert!(
+                logdet.is_finite(),
+                "logdet path must produce a finite logdet"
+            );
             let mut max_sol_diff = 0.0_f64;
             for i in 0..p {
                 max_sol_diff = max_sol_diff.max((sol[[i, 0]] - sol_ld[[i, 0]]).abs());

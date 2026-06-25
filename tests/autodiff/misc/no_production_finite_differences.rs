@@ -53,15 +53,15 @@ const SANCTIONED_FD_FILES: &[&str] = &[
     // (the `fd_directional` / `fd_error` / `fd_step` fields), all gated behind
     // `outer_fd_audit_eligible` and bounded by an explicit Richardson error bar.
     "solver/rho_optimizer/fd_audit.rs",
-    "solver/rho_optimizer.rs",     // module decl + re-export of the audit oracle
+    "solver/rho_optimizer.rs", // module decl + re-export of the audit oracle
     "solver/rho_optimizer/run.rs", // builds the FD-audit certificate from the oracle
     "terms/smooth/spatial_optimization.rs", // FD-audit eligibility gate (diagnostic only)
-    "families/custom_family/fit.rs",        // FD-audit eligibility gate (diagnostic only)
-    "model_types/result_types.rs",          // stores the audit certificate fields
-    "inference/certificate_impls.rs",       // serialises the audit certificate
-    "report/mod.rs",                        // reports the audit certificate
-    "main/run_sample_generate_report.rs",   // copies certificate fields into the report
-    "terms/sae/certificates.rs",            // SAE analogue of the audit certificate
+    "families/custom_family/fit.rs", // FD-audit eligibility gate (diagnostic only)
+    "model_types/result_types.rs", // stores the audit certificate fields
+    "inference/certificate_impls.rs", // serialises the audit certificate
+    "report/mod.rs",           // reports the audit certificate
+    "main/run_sample_generate_report.rs", // copies certificate fields into the report
+    "terms/sae/certificates.rs", // SAE analogue of the audit certificate
     // ── Tracked REDUCIBLE production FD (NOT theoretically irreducible) ──
     // These two were re-challenged under #1440. Neither is theoretically
     // irreducible; both are listed only so the lint stays green while the analytic

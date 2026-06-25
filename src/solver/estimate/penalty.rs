@@ -464,7 +464,6 @@ pub(crate) fn map_hessian_to_original_basis(
     Ok(h)
 }
 
-
 /// Scale a posterior covariance `H^{-1}` by the coefficient-covariance scale.
 ///
 /// `Vb = H^{-1} * scale`. The multiplier is supplied by

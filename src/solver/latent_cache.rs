@@ -26,7 +26,7 @@ use crate::terms::latent::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
 };
 use crate::terms::smooth::{TermCollectionDesign, TermCollectionSpec};
-use crate::warm_start::{Fingerprint, Fingerprinter};
+use gam_runtime::warm_start::{Fingerprint, Fingerprinter};
 
 const DEFAULT_LATENT_CACHE_CAPACITY: usize = 4;
 const DEFAULT_PERSISTENT_LATENT_CACHE_CAPACITY: usize = 16;

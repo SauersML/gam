@@ -562,7 +562,11 @@ mod tests {
     /// Assert two center sets are equal up to ordering, by greedily matching each
     /// row of `expected` to its nearest row of `actual` and requiring the match
     /// residual to be below `tol`. Both sets must have the same number of rows.
-    fn assert_center_sets_match(expected: ArrayView2<'_, f64>, actual: ArrayView2<'_, f64>, tol: f64) {
+    fn assert_center_sets_match(
+        expected: ArrayView2<'_, f64>,
+        actual: ArrayView2<'_, f64>,
+        tol: f64,
+    ) {
         assert_eq!(expected.nrows(), actual.nrows(), "center counts differ");
         let k = expected.nrows();
         let mut used = vec![false; k];

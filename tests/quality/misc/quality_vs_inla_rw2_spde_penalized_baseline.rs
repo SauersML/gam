@@ -370,9 +370,19 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla_on_real_data() {
     eprintln!(
         "[#1074-quakestp] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged={} iters={}",
         fit.fit.edf_total().unwrap_or(f64::NAN),
-        fit.fit.edf_by_block().iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-        fit.fit.log_lambdas.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-        fit.fit.reml_score, fit.fit.outer_converged, fit.fit.outer_iterations,
+        fit.fit
+            .edf_by_block()
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>(),
+        fit.fit
+            .log_lambdas
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>(),
+        fit.fit.reml_score,
+        fit.fit.outer_converged,
+        fit.fit.outer_iterations,
     );
 
     // ---- gam predictions at the held-out TEST rows ------------------------
@@ -531,7 +541,11 @@ fn diag_rw2_lidar_1074() {
     let mut train_rows: Vec<usize> = Vec::new();
     let mut test_rows: Vec<usize> = Vec::new();
     for (rank, &row) in order.iter().enumerate() {
-        if rank % 5 == 2 { test_rows.push(row); } else { train_rows.push(row); }
+        if rank % 5 == 2 {
+            test_rows.push(row);
+        } else {
+            train_rows.push(row);
+        }
     }
     let train_range: Vec<f64> = train_rows.iter().map(|&i| range[i]).collect();
     let train_logratio: Vec<f64> = train_rows.iter().map(|&i| logratio[i]).collect();
@@ -539,23 +553,39 @@ fn diag_rw2_lidar_1074() {
     let test_logratio: Vec<f64> = test_rows.iter().map(|&i| logratio[i]).collect();
     let mut train_values = Array2::<f64>::zeros((train_rows.len(), ds.headers.len()));
     for (out_row, &in_row) in train_rows.iter().enumerate() {
-        train_values.slice_mut(s![out_row, ..]).assign(&ds.values.slice(s![in_row, ..]));
+        train_values
+            .slice_mut(s![out_row, ..])
+            .assign(&ds.values.slice(s![in_row, ..]));
     }
     let mut train_ds = ds.clone();
     train_ds.values = train_values;
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
-    let result = fit_from_formula("logratio ~ s(range, bs='ps', penalty_order=2)", &train_ds, &cfg).unwrap();
-    let FitResult::Standard(fit) = result else { panic!() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
+    let result = fit_from_formula(
+        "logratio ~ s(range, bs='ps', penalty_order=2)",
+        &train_ds,
+        &cfg,
+    )
+    .unwrap();
+    let FitResult::Standard(fit) = result else {
+        panic!()
+    };
 
     // train-row predictions (in-sample)
     let mut train_grid = Array2::<f64>::zeros((train_rows.len(), ds.headers.len()));
-    for (i, &r) in train_range.iter().enumerate() { train_grid[[i, range_idx]] = r; }
+    for (i, &r) in train_range.iter().enumerate() {
+        train_grid[[i, range_idx]] = r;
+    }
     let train_design = build_term_collection_design(train_grid.view(), &fit.resolvedspec).unwrap();
     let train_pred: Vec<f64> = train_design.design.apply(&fit.fit.beta).to_vec();
 
     // held-out predictions
     let mut test_grid = Array2::<f64>::zeros((test_rows.len(), ds.headers.len()));
-    for (i, &r) in test_range.iter().enumerate() { test_grid[[i, range_idx]] = r; }
+    for (i, &r) in test_range.iter().enumerate() {
+        test_grid[[i, range_idx]] = r;
+    }
     let test_design = build_term_collection_design(test_grid.view(), &fit.resolvedspec).unwrap();
     let test_pred: Vec<f64> = test_design.design.apply(&fit.fit.beta).to_vec();
 
@@ -563,18 +593,31 @@ fn diag_rw2_lidar_1074() {
     let test_r2 = held_out_r2(&test_pred, &test_logratio);
     eprintln!(
         "[#1074-rw2] n={n} n_train={} n_test={} edf={:.3} log_lambdas={:?} train_R2={:.4} heldout_R2={:.4}",
-        train_rows.len(), test_rows.len(), fit.fit.edf_total().unwrap(),
-        fit.fit.log_lambdas.iter().map(|v| (v*1000.0).round()/1000.0).collect::<Vec<_>>(),
-        train_r2, test_r2,
+        train_rows.len(),
+        test_rows.len(),
+        fit.fit.edf_total().unwrap(),
+        fit.fit
+            .log_lambdas
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>(),
+        train_r2,
+        test_r2,
     );
-    eprintln!("[#1074-rw2] range_min={:.1} range_max={:.1} beta_len={} design_ncol={}",
+    eprintln!(
+        "[#1074-rw2] range_min={:.1} range_max={:.1} beta_len={} design_ncol={}",
         range.iter().cloned().fold(f64::INFINITY, f64::min),
         range.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
-        fit.fit.beta.len(), test_design.design.ncols());
+        fit.fit.beta.len(),
+        test_design.design.ncols()
+    );
     // sample test points sorted by range
     let mut idx: Vec<usize> = (0..test_rows.len()).collect();
     idx.sort_by(|&a, &b| test_range[a].partial_cmp(&test_range[b]).unwrap());
     for &i in idx.iter().step_by(idx.len().max(8) / 8) {
-        eprintln!("[#1074-rw2]   range={:.1} pred={:.4} actual={:.4}", test_range[i], test_pred[i], test_logratio[i]);
+        eprintln!(
+            "[#1074-rw2]   range={:.1} pred={:.4} actual={:.4}",
+            test_range[i], test_pred[i], test_logratio[i]
+        );
     }
 }

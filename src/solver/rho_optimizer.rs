@@ -13,7 +13,7 @@
 //! falls back to BFGS or an EFS variant instead of synthesizing second-order
 //! curvature numerically.
 
-use crate::warm_start::{LoadSource, Session as CacheSession};
+use gam_runtime::warm_start::{LoadSource, Session as CacheSession};
 
 use crate::estimate::EstimationError;
 

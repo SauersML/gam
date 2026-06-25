@@ -95,7 +95,9 @@ fn main() {
         println!("THROUGHPUT_1412 NO_GPU_RUNTIME — skipped (no CUDA device visible)");
         return;
     }
-    println!("THROUGHPUT_1412 device_count={dev_count} target_rows_per_sec={TARGET_ROWS_PER_SEC:.0}");
+    println!(
+        "THROUGHPUT_1412 device_count={dev_count} target_rows_per_sec={TARGET_ROWS_PER_SEC:.0}"
+    );
 
     let mut rng: u64 = 0x1412_a100_dead_beef;
     let reps = 10usize;
@@ -201,18 +203,13 @@ fn main() {
                     total += start.elapsed();
                 }
                 let s = total.as_secs_f64() / reps as f64;
-                if ok && s > 0.0 {
-                    n as f64 / s
-                } else {
-                    0.0
-                }
+                if ok && s > 0.0 { n as f64 / s } else { 0.0 }
             }
             None => 0.0,
         };
 
         // ---- batched-Cholesky: stack of K small d×d Schur blocks ----
-        let mut blocks: Vec<Array2<f64>> =
-            (0..k_batch).map(|_| spd_block(d, &mut rng)).collect();
+        let mut blocks: Vec<Array2<f64>> = (0..k_batch).map(|_| spd_block(d, &mut rng)).collect();
         // Warm + dispatch check (operates in place; clone for the warm pass).
         let mut warm_blocks = blocks.clone();
         let chol_on_device =
@@ -279,7 +276,11 @@ fn main() {
             chol_s * 1e3,
             pipeline_rows_per_sec / TARGET_ROWS_PER_SEC,
             resident_rows_per_sec / TARGET_ROWS_PER_SEC,
-            if gemm_rows_per_sec > 0.0 { solve_rps / gemm_rows_per_sec } else { 0.0 },
+            if gemm_rows_per_sec > 0.0 {
+                solve_rps / gemm_rows_per_sec
+            } else {
+                0.0
+            },
             solve_rps / TARGET_ROWS_PER_SEC,
         );
     }

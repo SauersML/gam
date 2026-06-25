@@ -124,7 +124,7 @@ pub(crate) fn required_columns_for_survival(
 pub(crate) fn load_dataset_projected(
     path: &Path,
     requested_columns: &[String],
-) -> Result<Dataset, gam::inference::data::DataError> {
+) -> Result<Dataset, gam::data::DataError> {
     load_dataset_auto_projected(path, requested_columns)
 }
 
@@ -167,13 +167,13 @@ fn collect_categorical_role_columns(terms: &[ParsedTerm], out: &mut BTreeSet<Str
 /// columns plus a categorical/multinomial response) and load the dataset with
 /// those columns forced to a factor encoding. See
 /// [`collect_categorical_role_columns`] and
-/// `gam::inference::data::load_dataset_projected_with_categorical_roles`.
+/// `gam::data::load_dataset_projected_with_categorical_roles`.
 pub(crate) fn load_fit_dataset_with_roles(
     path: &Path,
     requested_columns: &[String],
     parsed: &ParsedFormula,
     response_is_categorical: bool,
-) -> Result<Dataset, gam::inference::data::DataError> {
+) -> Result<Dataset, gam::data::DataError> {
     let mut roles = BTreeSet::<String>::new();
     collect_categorical_role_columns(&parsed.terms, &mut roles);
     if response_is_categorical {

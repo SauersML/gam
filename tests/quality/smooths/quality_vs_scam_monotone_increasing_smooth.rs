@@ -66,12 +66,19 @@ fn gam_monotone_increasing_smooth_recovers_truth_and_matches_scam() {
 
     let mut x: Vec<f64> = (0..N).map(|_| unif.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).expect("finite x"));
-    let y: Vec<f64> = x.iter().map(|&xi| truth(xi) + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|&xi| truth(xi) + noise.sample(&mut rng))
+        .collect();
 
     // Signal range of the truth; the noise floor (sigma) is the recovery bar.
     let signal = {
         let lo = x.iter().cloned().map(truth).fold(f64::INFINITY, f64::min);
-        let hi = x.iter().cloned().map(truth).fold(f64::NEG_INFINITY, f64::max);
+        let hi = x
+            .iter()
+            .cloned()
+            .map(truth)
+            .fold(f64::NEG_INFINITY, f64::max);
         hi - lo
     };
 
@@ -132,7 +139,11 @@ fn gam_monotone_increasing_smooth_recovers_truth_and_matches_scam() {
         ),
     );
     let scam_grid = r.vector("pred");
-    assert_eq!(scam_grid.len(), grid.len(), "scam prediction length mismatch");
+    assert_eq!(
+        scam_grid.len(),
+        grid.len(),
+        "scam prediction length mismatch"
+    );
 
     // ---- OBJECTIVE METRICS -------------------------------------------------
     let gam_err = rmse(&gam_grid, &truth_grid);

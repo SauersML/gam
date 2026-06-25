@@ -354,10 +354,7 @@ impl SaeAssignment {
     /// inert, like an ungated atom's). Passing `None` restores the free-logit
     /// path.
     #[must_use = "build error must be handled"]
-    pub fn with_frozen_routing(
-        mut self,
-        predicted: Option<Array2<f64>>,
-    ) -> Result<Self, String> {
+    pub fn with_frozen_routing(mut self, predicted: Option<Array2<f64>>) -> Result<Self, String> {
         if let Some(ref p) = predicted {
             if p.dim() != (self.n_obs(), self.k_atoms()) {
                 return Err(format!(
@@ -1410,8 +1407,7 @@ pub(crate) fn ibp_assignment_third_channels(
         penalty.weight = rho.lambda_sparse();
         Array1::zeros(0)
     };
-    let mut channels =
-        penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view());
+    let mut channels = penalty.hessian_diag_logit_third_channels(target.view(), rho_view.view());
     // #1026/#1033 — zero the log-det third-derivative channels of FIXED-logit
     // atoms (ungated, or all atoms under frozen routing) so the #1006 θ-adjoint
     // differentiates the SAME (fixed-logit-zeroed) `htt` that
@@ -1638,28 +1634,39 @@ mod frozen_routing_1033_tests {
     use super::*;
 
     fn ibp_assignment(n: usize, k: usize) -> SaeAssignment {
-        let logits = Array2::from_shape_fn((n, k), |(i, kk)| 0.3 + 0.05 * (i as f64) - 0.1 * (kk as f64));
-        let coords: Vec<Array2<f64>> =
-            (0..k).map(|_| Array2::from_shape_fn((n, 1), |(i, _)| (i as f64) * 0.1)).collect();
+        let logits = Array2::from_shape_fn((n, k), |(i, kk)| {
+            0.3 + 0.05 * (i as f64) - 0.1 * (kk as f64)
+        });
+        let coords: Vec<Array2<f64>> = (0..k)
+            .map(|_| Array2::from_shape_fn((n, 1), |(i, _)| (i as f64) * 0.1))
+            .collect();
         // learnable_alpha = false: alpha is ρ-independent, isolating the routing.
-        SaeAssignment::from_blocks_with_mode(logits, coords, AssignmentMode::ibp_map(0.5, 1.0, false))
-            .unwrap()
+        SaeAssignment::from_blocks_with_mode(
+            logits,
+            coords,
+            AssignmentMode::ibp_map(0.5, 1.0, false),
+        )
+        .unwrap()
     }
 
     #[test]
     fn frozen_routing_decouples_gates_from_logit_updates_1033() {
         let (n, k) = (6usize, 3usize);
-        let mut a = ibp_assignment(n, k).freeze_routing_from_current_logits().unwrap();
+        let mut a = ibp_assignment(n, k)
+            .freeze_routing_from_current_logits()
+            .unwrap();
         assert!(a.routing_is_frozen());
         // Gates BEFORE mutating the free logits.
         let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k]);
-        let before: Vec<Array1<f64>> =
-            (0..n).map(|r| a.try_assignments_row_for_rho(r, &rho).unwrap()).collect();
+        let before: Vec<Array1<f64>> = (0..n)
+            .map(|r| a.try_assignments_row_for_rho(r, &rho).unwrap())
+            .collect();
         // Simulate an inner-fit logit update (what the ρ-search would otherwise do
         // every eval): perturb every free logit substantially.
         a.logits.mapv_inplace(|v| v + 5.0);
-        let after: Vec<Array1<f64>> =
-            (0..n).map(|r| a.try_assignments_row_for_rho(r, &rho).unwrap()).collect();
+        let after: Vec<Array1<f64>> = (0..n)
+            .map(|r| a.try_assignments_row_for_rho(r, &rho).unwrap())
+            .collect();
         // FROZEN routing reads the snapshot, so the gates are UNCHANGED by the
         // free-logit perturbation — the routing is decoupled from inner-fit drift.
         for r in 0..n {
@@ -1677,11 +1684,21 @@ mod frozen_routing_1033_tests {
     #[test]
     fn frozen_routing_gates_are_rho_invariant_1033() {
         let (n, k) = (5usize, 2usize);
-        let a = ibp_assignment(n, k).freeze_routing_from_current_logits().unwrap();
+        let a = ibp_assignment(n, k)
+            .freeze_routing_from_current_logits()
+            .unwrap();
         // Two different ρ (different sparse + smooth strengths). With frozen routing
         // and learnable_alpha=false, the gate value must be identical at both ρ.
-        let rho_a = SaeManifoldRho::new((1e-3_f64).ln(), (1e-2_f64).ln(), vec![Array1::<f64>::zeros(1); k]);
-        let rho_b = SaeManifoldRho::new((1e3_f64).ln(), (1e1_f64).ln(), vec![Array1::<f64>::zeros(1); k]);
+        let rho_a = SaeManifoldRho::new(
+            (1e-3_f64).ln(),
+            (1e-2_f64).ln(),
+            vec![Array1::<f64>::zeros(1); k],
+        );
+        let rho_b = SaeManifoldRho::new(
+            (1e3_f64).ln(),
+            (1e1_f64).ln(),
+            vec![Array1::<f64>::zeros(1); k],
+        );
         for r in 0..n {
             let ga = a.try_assignments_row_for_rho(r, &rho_a).unwrap();
             let gb = a.try_assignments_row_for_rho(r, &rho_b).unwrap();
@@ -1699,26 +1716,38 @@ mod frozen_routing_1033_tests {
     #[test]
     fn frozen_routing_fixes_all_logits_and_thaw_restores_free_path_1033() {
         let (n, k) = (4usize, 3usize);
-        let mut a = ibp_assignment(n, k).freeze_routing_from_current_logits().unwrap();
+        let mut a = ibp_assignment(n, k)
+            .freeze_routing_from_current_logits()
+            .unwrap();
         // Under frozen routing EVERY logit is fixed (not a free Newton coord).
         let mask = a.fixed_logit_mask();
         assert_eq!(mask.len(), k);
-        assert!(mask.iter().all(|&f| f), "frozen routing must fix ALL logits");
+        assert!(
+            mask.iter().all(|&f| f),
+            "frozen routing must fix ALL logits"
+        );
         for kk in 0..k {
-            assert!(a.logit_is_fixed(kk), "atom {kk} logit must be fixed under frozen routing");
+            assert!(
+                a.logit_is_fixed(kk),
+                "atom {kk} logit must be fixed under frozen routing"
+            );
         }
         // Thawing restores the free-logit path (no fixed logits, no ungated).
         a.thaw_routing();
         assert!(!a.routing_is_frozen());
-        assert!(a.fixed_logit_mask().iter().all(|&f| !f), "thaw must restore the free-logit path");
+        assert!(
+            a.fixed_logit_mask().iter().all(|&f| !f),
+            "thaw must restore the free-logit path"
+        );
     }
 
     #[test]
     fn frozen_routing_rejects_softmax_1033() {
         let (n, k) = (4usize, 3usize);
         let logits = Array2::from_shape_fn((n, k), |(i, kk)| 0.1 * (i as f64) - 0.05 * (kk as f64));
-        let coords: Vec<Array2<f64>> =
-            (0..k).map(|_| Array2::from_shape_fn((n, 1), |(i, _)| (i as f64) * 0.1)).collect();
+        let coords: Vec<Array2<f64>> = (0..k)
+            .map(|_| Array2::from_shape_fn((n, 1), |(i, _)| (i as f64) * 0.1))
+            .collect();
         let a = SaeAssignment::from_blocks_with_mode(logits, coords, AssignmentMode::softmax(1.0))
             .unwrap();
         // Softmax + frozen routing is rejected (the coupled-simplex entropy

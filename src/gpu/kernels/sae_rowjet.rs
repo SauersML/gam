@@ -25,7 +25,7 @@
 //! # Single source, exactly
 //!
 //! The device kernel is a byte-faithful port of the [`Order2<K>`] =
-//! [`Tower2<K>`] scalar arithmetic in [`crate::families::jet_tower`]: `add` /
+//! [`Tower2<K>`] scalar arithmetic in [`gam_math::jet_tower`]: `add` /
 //! `scale` / truncated-Leibniz `mul`, and order-2 Faà di Bruno `compose_unary`
 //! for `exp` and `recip` (the `1/u` stack `[1/u, −1/u², 2/u³]`). It runs
 //! [`SaeReconstructionRowProgram::all_gates`]' algebra (shared softmax
@@ -269,7 +269,10 @@ fn softmax_program(
 
 fn softmax_values(logits: &[f64], inv_tau: f64) -> Vec<f64> {
     let shift = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max) * inv_tau;
-    let exps: Vec<f64> = logits.iter().map(|&l| (l * inv_tau - shift).exp()).collect();
+    let exps: Vec<f64> = logits
+        .iter()
+        .map(|&l| (l * inv_tau - shift).exp())
+        .collect();
     let denom: f64 = exps.iter().sum();
     exps.iter().map(|e| e / denom).collect()
 }
@@ -449,12 +452,18 @@ mod device {
         let mut decoded = vec![0.0_f64; n * k * p];
         for (row, inp) in rows.iter().enumerate() {
             assert_eq!(inp.logits.len(), k, "SAE device row-jet logits length");
-            assert_eq!(inp.decoded.len(), k * p, "SAE device row-jet decoded length");
+            assert_eq!(
+                inp.decoded.len(),
+                k * p,
+                "SAE device row-jet decoded length"
+            );
             logits[row * k..(row + 1) * k].copy_from_slice(&inp.logits);
             decoded[row * k * p..(row + 1) * k * p].copy_from_slice(&inp.decoded);
         }
 
-        let logits_dev = stream.clone_htod(&logits).gpu_ctx("sae_rowjet htod logits")?;
+        let logits_dev = stream
+            .clone_htod(&logits)
+            .gpu_ctx("sae_rowjet htod logits")?;
         let decoded_dev = stream
             .clone_htod(&decoded)
             .gpu_ctx("sae_rowjet htod decoded")?;
@@ -465,7 +474,8 @@ mod device {
             .alloc_zeros::<f64>(n * k * k * p)
             .gpu_ctx("sae_rowjet alloc second")?;
 
-        let n_i32 = i32::try_from(n).map_err(|_| crate::gpu_err!("sae_rowjet n={n} overflows i32"))?;
+        let n_i32 =
+            i32::try_from(n).map_err(|_| crate::gpu_err!("sae_rowjet n={n} overflows i32"))?;
         let block: u32 = u32::try_from(p.max(1).min(256))
             .map_err(|_| crate::gpu_err!("sae_rowjet block size overflow"))?;
         let cfg = LaunchConfig {
@@ -570,7 +580,10 @@ mod tests {
                     for b in 0..k {
                         let ab = out.second[((row * k + a) * k + b) * p + c];
                         let ba = out.second[((row * k + b) * k + a) * p + c];
-                        assert!((ab - ba).abs() <= 1e-12, "asymmetry row={row} c={c} {a},{b}");
+                        assert!(
+                            (ab - ba).abs() <= 1e-12,
+                            "asymmetry row={row} c={c} {a},{b}"
+                        );
                     }
                 }
             }
@@ -630,6 +643,9 @@ mod tests {
         for (x, y) in cpu.second.iter().zip(&got.second) {
             maxabs = maxabs.max((x - y).abs());
         }
-        assert!(maxabs <= 1e-9, "device vs CPU row-jet max abs diff {maxabs} > 1e-9");
+        assert!(
+            maxabs <= 1e-9,
+            "device vs CPU row-jet max abs diff {maxabs} > 1e-9"
+        );
     }
 }

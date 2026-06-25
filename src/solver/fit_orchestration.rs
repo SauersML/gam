@@ -56,7 +56,7 @@ use crate::families::transformation_normal::{
 
 use crate::families::wiggle::WiggleBlockConfig;
 
-use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
+use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
 
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 
@@ -120,7 +120,7 @@ use crate::families::survival::location_scale::{
     residual_distribution_inverse_link,
 };
 
-use crate::inference::data::EncodedDataset as Dataset;
+use gam_data::EncodedDataset as Dataset;
 
 use crate::inference::formula_dsl::{
     LinkChoice, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm, effectivelinkwiggle_formulaspec,

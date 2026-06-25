@@ -203,9 +203,7 @@ pub(crate) fn build_rs_ban_gates_are_invoked_and_wired() {
             t.starts_with(scan_prefix.as_str()) && l.contains(&invocation_token)
         })
         .count();
-    let push_guards = src
-        .matches(&format!(".is_{}()", "empty"))
-        .count();
+    let push_guards = src.matches(&format!(".is_{}()", "empty")).count();
     assert!(
         scan_invocations >= 24,
         "build.rs `scan_for_*` mentions dropped to {scan_invocations} (floor 24) — \

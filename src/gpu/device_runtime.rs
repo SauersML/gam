@@ -333,7 +333,10 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
         // context, and the later cublasCreate on the primary-context stream fails
         // CUBLAS/CUSOLVER_STATUS_NOT_INITIALIZED (the probe-first GPU-dead bug).
         let bound = catch_unwind(AssertUnwindSafe(|| ctx.bind_to_thread()));
-        log::trace!("[GPU] cuda_context_for cached bind ok={}", matches!(bound, Ok(Ok(()))));
+        log::trace!(
+            "[GPU] cuda_context_for cached bind ok={}",
+            matches!(bound, Ok(Ok(())))
+        );
         ensure_cuda_runtime_device(ordinal);
         return Some(ctx);
     }
@@ -351,7 +354,10 @@ pub fn cuda_context_for(ordinal: usize) -> Option<Arc<CudaContext>> {
     // an entry created on another thread; rebind so the primary context is current on
     // THIS thread before the runtime touch (same probe-first NOT_INITIALIZED guard).
     let bound = catch_unwind(AssertUnwindSafe(|| out.bind_to_thread()));
-    log::trace!("[GPU] cuda_context_for fresh bind ok={}", matches!(bound, Ok(Ok(()))));
+    log::trace!(
+        "[GPU] cuda_context_for fresh bind ok={}",
+        matches!(bound, Ok(Ok(())))
+    );
     ensure_cuda_runtime_device(ordinal);
     Some(out)
 }

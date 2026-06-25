@@ -35,7 +35,12 @@ path = "src/lib.rs"
 # adding a `publish = false` path-dependency under a publishable crate. The
 # measured first cut is the opposite direction — peel upper leaves (predict, CLI)
 # off a temporarily-monolithic engine. See the #1521 thread for the plan.
-members = ["crates/gam-pyffi"]
+members = [
+    "crates/gam-data",
+    "crates/gam-math",
+    "crates/gam-pyffi",
+    "crates/gam-runtime",
+]
 resolver = "3"
 
 [lints.rust]
@@ -67,6 +72,9 @@ crossterm = "0.29.0"
 rand_distr = "0.6.0"
 statrs = "0.18.0"
 libm = "0.2.16"
+gam-data = { path = "crates/gam-data" }
+gam-math = { path = "crates/gam-math" }
+gam-runtime = { path = "crates/gam-runtime" }
 pest = "2.8.6"
 pest_derive = "2.8.6"
 arrow = { version = "54", default-features = false, features = ["ffi"] }

@@ -400,9 +400,7 @@ pub(crate) struct FramedDeviceArgs<'a> {
 pub(crate) fn build_framed_device_sae_data(
     args: FramedDeviceArgs<'_>,
 ) -> crate::solver::arrow_schur::DeviceSaePcgData {
-    use crate::solver::arrow_schur::{
-        DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock,
-    };
+    use crate::solver::arrow_schur::{DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock};
     let FramedDeviceArgs {
         p,
         border_dim,

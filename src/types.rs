@@ -2,7 +2,6 @@ use ndarray::{Array1, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
-
 /// Lower floor on positive working weights shared by likelihood families and
 /// PIRLS row assembly so weighted normal equations stay numerically well posed.
 pub const MIN_WEIGHT: f64 = 1e-12;
@@ -320,9 +319,8 @@ impl LatentCLogLogState {
 fn inverse_link_has_fisher_weight_jet(link: &InverseLink) -> bool {
     matches!(
         link,
-        InverseLink::Standard(
-            StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog,
-        ) | InverseLink::LatentCLogLog(_)
+        InverseLink::Standard(StandardLink::Logit | StandardLink::Probit | StandardLink::CLogLog,)
+            | InverseLink::LatentCLogLog(_)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
             | InverseLink::Mixture(_)

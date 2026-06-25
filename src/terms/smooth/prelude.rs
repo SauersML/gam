@@ -59,7 +59,7 @@ use crate::mixture_link::{
 
 use crate::pirls::LinearInequalityConstraints;
 
-use crate::resource::MatrixMaterializationError;
+use gam_runtime::resource::MatrixMaterializationError;
 
 use crate::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily,

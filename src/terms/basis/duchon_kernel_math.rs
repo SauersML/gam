@@ -1475,12 +1475,7 @@ pub(crate) fn duchon_hybrid_operator_stable_integral(
     let t_r = q_rr * inv_r - q_r * inv_r * inv_r;
     let t_rr = q_rrr * inv_r - 2.0 * q_rr * inv_r * inv_r + 2.0 * q_r * inv_r * inv_r * inv_r;
 
-    Ok(DuchonRegularizedOperatorCore {
-        q,
-        t,
-        t_r,
-        t_rr,
-    })
+    Ok(DuchonRegularizedOperatorCore { q, t, t_r, t_rr })
 }
 
 /// Whether the cancellation-free [`duchon_hybrid_kernel_stable_integral`] is
@@ -2206,7 +2201,10 @@ mod duchon_hybrid_psd_tests {
         // `duchon_function_norm_penalty` PSD test.
         let (nullspace_order, default_power) = duchon_cubic_default(d);
         assert!(matches!(nullspace_order, DuchonNullspaceOrder::Linear));
-        assert!((default_power - 7.5).abs() < 1e-12, "cubic-default power for d=16 is 7.5");
+        assert!(
+            (default_power - 7.5).abs() < 1e-12,
+            "cubic-default power for d=16 is 7.5"
+        );
         let power = 7.0_f64;
         assert_eq!(duchon_power_to_usize(power), 7);
         // The reroute must engage for this fixture (s = 7 ≥ 1, 2p = 4 < d = 16).
@@ -2272,8 +2270,7 @@ mod duchon_hybrid_psd_tests {
             }
             for (n, &coeff) in coeffs.b.iter().enumerate().skip(1) {
                 if coeff != 0.0 {
-                    reference += coeff
-                        * duchon_matern_block(r, kappa, n, d).expect("matern block");
+                    reference += coeff * duchon_matern_block(r, kappa, n, d).expect("matern block");
                 }
             }
 

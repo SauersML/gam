@@ -59,8 +59,8 @@ fn numeric_data_2d(n: usize, seed: u64) -> (Vec<[f64; 2]>, gam::data::EncodedDat
     let rows: Vec<StringRecord> = pts
         .iter()
         .map(|p| {
-            let y = (2.0 * std::f64::consts::PI * p[0]).sin() * (p[1] - 0.5)
-                + noise.sample(&mut rng);
+            let y =
+                (2.0 * std::f64::consts::PI * p[0]).sin() * (p[1] - 0.5) + noise.sample(&mut rng);
             StringRecord::from(vec![p[0].to_string(), p[1].to_string(), y.to_string()])
         })
         .collect();
@@ -70,7 +70,11 @@ fn numeric_data_2d(n: usize, seed: u64) -> (Vec<[f64; 2]>, gam::data::EncodedDat
 
 /// Numeric covariate + a balanced grouping factor for factor-smooth (fs) and
 /// random-effect (re) terms.
-fn grouped_data(n: usize, levels: usize, seed: u64) -> (Vec<f64>, Vec<String>, gam::data::EncodedDataset) {
+fn grouped_data(
+    n: usize,
+    levels: usize,
+    seed: u64,
+) -> (Vec<f64>, Vec<String>, gam::data::EncodedDataset) {
     let mut rng = StdRng::seed_from_u64(seed);
     let noise = Normal::new(0.0, 0.05).expect("normal");
     let x: Vec<f64> = (0..n)
@@ -87,9 +91,7 @@ fn grouped_data(n: usize, levels: usize, seed: u64) -> (Vec<f64>, Vec<String>, g
         .collect();
     let headers = ["x", "g", "y"].into_iter().map(String::from).collect();
     let rows: Vec<StringRecord> = (0..n)
-        .map(|i| {
-            StringRecord::from(vec![x[i].to_string(), g[i].clone(), y[i].to_string()])
-        })
+        .map(|i| StringRecord::from(vec![x[i].to_string(), g[i].clone(), y[i].to_string()]))
         .collect();
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode");
     (x, g, data)
@@ -207,8 +209,7 @@ fn predict_at_training_matches_fitted_poisson_log_link() {
     for (i, &t) in x.iter().enumerate() {
         new_data[[i, 0]] = t;
     }
-    let (max_diff, bad, _n) =
-        replay_max_diff("y ~ s(x, k=10)", &cfg, &data, new_data);
+    let (max_diff, bad, _n) = replay_max_diff("y ~ s(x, k=10)", &cfg, &data, new_data);
     eprintln!("[replay-poisson] max_diff={max_diff:.3e} bad={bad}");
     assert!(
         max_diff <= TOL,
@@ -230,10 +231,7 @@ fn predict_at_training_matches_fitted_tensor_bases() {
         new_data[[i, 0]] = p[0];
         new_data[[i, 1]] = p[1];
     }
-    let bases: &[(&str, &str)] = &[
-        ("te", "y ~ te(x, z, k=5)"),
-        ("ti", "y ~ ti(x, z, k=5)"),
-    ];
+    let bases: &[(&str, &str)] = &[("te", "y ~ te(x, z, k=5)"), ("ti", "y ~ ti(x, z, k=5)")];
     let mut failures = Vec::<String>::new();
     for (label, formula) in bases {
         let (max_diff, bad, _n) = replay_max_diff(formula, &gaussian, &data, new_data.clone());

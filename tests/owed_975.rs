@@ -165,12 +165,36 @@ fn bound_mixed(x1: f64, x2: f64) -> f64 {
 
 fn panel() -> Vec<PanelCase> {
     vec![
-        PanelCase { name: "sep_sin_lin", truth: sep_sin_lin, bound: false },
-        PanelCase { name: "sep_quad_cos", truth: sep_quad_cos, bound: false },
-        PanelCase { name: "sep_two_sines", truth: sep_two_sines, bound: false },
-        PanelCase { name: "bound_product", truth: bound_product, bound: true },
-        PanelCase { name: "bound_sin_of_product", truth: bound_sin_of_product, bound: true },
-        PanelCase { name: "bound_mixed", truth: bound_mixed, bound: true },
+        PanelCase {
+            name: "sep_sin_lin",
+            truth: sep_sin_lin,
+            bound: false,
+        },
+        PanelCase {
+            name: "sep_quad_cos",
+            truth: sep_quad_cos,
+            bound: false,
+        },
+        PanelCase {
+            name: "sep_two_sines",
+            truth: sep_two_sines,
+            bound: false,
+        },
+        PanelCase {
+            name: "bound_product",
+            truth: bound_product,
+            bound: true,
+        },
+        PanelCase {
+            name: "bound_sin_of_product",
+            truth: bound_sin_of_product,
+            bound: true,
+        },
+        PanelCase {
+            name: "bound_mixed",
+            truth: bound_mixed,
+            bound: true,
+        },
     ]
 }
 
@@ -185,8 +209,7 @@ fn carve_classifies_bound_vs_separable_feature_pairs_975() {
 
     // For a readable failure, collect every verdict before asserting so the
     // panel-wide confusion matrix is visible in one place.
-    let verdicts: Vec<(&PanelCase, Verdict)> =
-        panel.iter().map(|c| (c, carve_case(c))).collect();
+    let verdicts: Vec<(&PanelCase, Verdict)> = panel.iter().map(|c| (c, carve_case(c))).collect();
 
     let mut wrong: Vec<String> = Vec::new();
     let mut max_sep_fraction = 0.0_f64; // worst (largest) separable interaction energy

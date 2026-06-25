@@ -313,7 +313,11 @@ pub fn reml_laml_evaluate(
         let (w, cost_correction, branch) =
             if let Some(kernel) = solution.penalty_subspace_trace.as_ref() {
                 let w = kernel.apply_pseudo_inverse(r);
-                (w, -0.5_f64 * kernel.bilinear_pseudo_inverse(r, r), "projected")
+                (
+                    w,
+                    -0.5_f64 * kernel.bilinear_pseudo_inverse(r, r),
+                    "projected",
+                )
             } else {
                 // Full-H IFT mode response `w = H⁻¹ r`. The cached
                 // `DenseSpectralOperator` (materialized once for `log_det_h`
@@ -617,7 +621,7 @@ pub fn reml_laml_evaluate(
             );
             // Named heartbeat scope so the active-scope line attributes the
             // coord_corrections wall time (the biobank's dominant REML stage).
-            let coord_corr_scope = crate::process_monitor::track_scope(format!(
+            let coord_corr_scope = gam_runtime::process_monitor::track_scope(format!(
                 "reml_laml coord_corrections batched k={k} ext_dim={ext_dim} n={} dim={}",
                 solution.n_observations,
                 hop.dim()

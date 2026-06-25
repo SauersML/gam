@@ -16,7 +16,6 @@
 //!
 //! On non-Linux builds the entire module degrades to a CPU-fallback shim.
 
-
 use ndarray::{Array1, Array2};
 
 use crate::linalg::triangular::{CholeskyGuard, cholesky_factor_in_place, cholesky_solve_vector};
@@ -3876,8 +3875,16 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             }
         }
 
-        let htod_i = |v: &[i32]| stream.clone_htod(v).map_err(|_| ArrowSchurGpuFailure::Unavailable);
-        let htod_f = |v: &[f64]| stream.clone_htod(v).map_err(|_| ArrowSchurGpuFailure::Unavailable);
+        let htod_i = |v: &[i32]| {
+            stream
+                .clone_htod(v)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)
+        };
+        let htod_f = |v: &[f64]| {
+            stream
+                .clone_htod(v)
+                .map_err(|_| ArrowSchurGpuFailure::Unavailable)
+        };
         Ok(DeviceSaeFrameBuffers {
             s_off: htod_i(&s_off)?,
             s_m: htod_i(&s_m)?,
@@ -5372,12 +5379,9 @@ mod tests {
 
         // Dense H_ββ from the SAME penalty ops (so the dense reference's S
         // matches the device penalty side exactly).
-        let data_op = FactoredFrameKroneckerOp::new(
-            ranks.clone(),
-            basis_sizes.clone(),
-            frame_blocks.clone(),
-        )
-        .expect("frame op");
+        let data_op =
+            FactoredFrameKroneckerOp::new(ranks.clone(), basis_sizes.clone(), frame_blocks.clone())
+                .expect("frame op");
         let mut hbb = data_op.to_dense();
         for k in 0..n_atoms {
             let op = IdentityRightKroneckerPenaltyOp {
@@ -5492,8 +5496,8 @@ mod tests {
     #[test]
     fn framed_sae_device_pcg_matches_cpu_when_cuda_admits() {
         use crate::solver::arrow_schur::{
-            DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock, FactoredFrameGBlock,
-            FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp, BetaPenaltyOp,
+            BetaPenaltyOp, DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock,
+            FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp,
         };
 
         // Large enough to clear the device-offload policy floor (k ≥ 32 and
@@ -5627,12 +5631,9 @@ mod tests {
             }
             row_htbeta.push(slab);
         }
-        let data_op = FactoredFrameKroneckerOp::new(
-            ranks.clone(),
-            basis_sizes.clone(),
-            frame_blocks.clone(),
-        )
-        .expect("frame op");
+        let data_op =
+            FactoredFrameKroneckerOp::new(ranks.clone(), basis_sizes.clone(), frame_blocks.clone())
+                .expect("frame op");
         let mut hbb = data_op.to_dense();
         for k in 0..n_atoms {
             let op = IdentityRightKroneckerPenaltyOp {
@@ -5670,31 +5671,24 @@ mod tests {
         let rhs: Array1<f64> =
             Array1::from_shape_fn(border_dim, |a| ((a as f64 + 1.0) * 0.17).sin());
 
-        let (device, diag) = match solve_sae_matrix_free_pcg(
-            &sys,
-            &data,
-            ridge_t,
-            ridge_beta,
-            &rhs,
-            400,
-            1e-12,
-        ) {
-            Ok(result) => result,
-            // #1017 — fail loud, never skip-pass: this fixture clears the device
-            // offload floor, so a CUDA device that is PRESENT yet declines means the
-            // framed device PCG kernel does not run on GPU (the fault must not pass
-            // silently). Legit skip ONLY when no usable CUDA device exists (CPU CI).
-            // The exact `ArrowSchurGpuFailure` variant is folded into the assert.
-            Err(failure) => {
-                assert!(
-                    crate::gpu::device_runtime::GpuRuntime::global().is_none(),
-                    "#1017: CUDA device present but the framed device SAE PCG \
+        let (device, diag) =
+            match solve_sae_matrix_free_pcg(&sys, &data, ridge_t, ridge_beta, &rhs, 400, 1e-12) {
+                Ok(result) => result,
+                // #1017 — fail loud, never skip-pass: this fixture clears the device
+                // offload floor, so a CUDA device that is PRESENT yet declines means the
+                // framed device PCG kernel does not run on GPU (the fault must not pass
+                // silently). Legit skip ONLY when no usable CUDA device exists (CPU CI).
+                // The exact `ArrowSchurGpuFailure` variant is folded into the assert.
+                Err(failure) => {
+                    assert!(
+                        crate::gpu::device_runtime::GpuRuntime::global().is_none(),
+                        "#1017: CUDA device present but the framed device SAE PCG \
                      declined/faulted instead of returning a result (tag: {failure:?}) — \
                      the kernel does not run correctly on GPU"
-                );
-                return;
-            }
-        };
+                    );
+                    return;
+                }
+            };
 
         // CPU dense reduced-system solve of the SAME framed system: form S via
         // the CPU oracle matvec on the identity, then solve S·δβ = rhs.
@@ -5752,5 +5746,4 @@ mod tests {
             diag.final_relative_residual,
         );
     }
-
 }

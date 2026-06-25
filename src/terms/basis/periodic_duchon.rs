@@ -1365,9 +1365,8 @@ fn reject_nonpsd_then_clamp_noise(matrix: &Array2<f64>) -> Result<Array2<f64>, B
     if n == 0 || n != sym.ncols() {
         return Ok(sym);
     }
-    let (evals, _) = FaerEigh::eigh(&sym, Side::Lower).map_err(|e| {
-        BasisError::InvalidInput(format!("Duchon penalty PSD check failed: {e}"))
-    })?;
+    let (evals, _) = FaerEigh::eigh(&sym, Side::Lower)
+        .map_err(|e| BasisError::InvalidInput(format!("Duchon penalty PSD check failed: {e}")))?;
     if evals.is_empty() {
         return Ok(sym);
     }
@@ -1661,12 +1660,8 @@ mod mixed_periodicity_psd_tests {
         // Anchor the periodic span to exactly [0, 2π] so the auto-derived period
         // is the geometric period; this mirrors the Python cylinder fixture.
         let two_pi = std::f64::consts::TAU;
-        let theta = [
-            0.0, 0.6, 1.2, 1.9, 2.5, 3.1, 3.8, 4.4, 5.0, 5.6, two_pi,
-        ];
-        let y = [
-            0.5, 0.1, 0.9, 0.3, 0.7, 0.2, 0.8, 0.4, 0.6, 0.15, 0.5,
-        ];
+        let theta = [0.0, 0.6, 1.2, 1.9, 2.5, 3.1, 3.8, 4.4, 5.0, 5.6, two_pi];
+        let y = [0.5, 0.1, 0.9, 0.3, 0.7, 0.2, 0.8, 0.4, 0.6, 0.15, 0.5];
         let mut centers = Array2::<f64>::zeros((theta.len(), 2));
         for i in 0..theta.len() {
             centers[[i, 0]] = theta[i];
@@ -1763,12 +1758,7 @@ mod mixed_periodicity_psd_tests {
         // null space must therefore have exactly 2 columns: a constant column and
         // a `y` column (NOT a θ column — periodic axes contribute only the
         // constant).
-        let points = array![
-            [0.0_f64, 0.10],
-            [1.0, 0.40],
-            [2.0, 0.70],
-            [3.0, 0.95],
-        ];
+        let points = array![[0.0_f64, 0.10], [1.0, 0.40], [2.0, 0.70], [3.0, 0.95],];
         let periodic_per_axis = [true, false];
         let block = mixed_periodicity_nullspace_poly_block(points.view(), 2, &periodic_per_axis);
         assert_eq!(
@@ -1792,7 +1782,10 @@ mod mixed_periodicity_psd_tests {
             depends_on_theta |= is_theta && !is_const;
         }
         assert!(has_const, "null space must include the constant 1");
-        assert!(has_y, "null space must include the nonperiodic coordinate y (gam#1423)");
+        assert!(
+            has_y,
+            "null space must include the nonperiodic coordinate y (gam#1423)"
+        );
         assert!(
             !depends_on_theta,
             "periodic axis θ must contribute only the constant, never a linear θ column"

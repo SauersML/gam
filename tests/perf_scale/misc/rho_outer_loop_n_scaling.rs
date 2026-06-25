@@ -173,7 +173,6 @@ fn run_fit(n: usize, outer_iters: usize) -> Result<f64, String> {
 /// inner solve should stay roughly flat across an n-sweep, not grow with n.
 #[test]
 fn rho_outer_loop_is_n_independent() {
-
     // Prime caches / JIT-warm allocator behaviour with a throwaway small fit so
     // the first timed point isn't penalised by one-time process warmup.
     let _ = run_fit(2_000, 1);

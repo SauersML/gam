@@ -7,8 +7,8 @@
 //! witnesses). `compute_survival_timepoint_first_order_exact` (grad-only) +
 //! `FluxVelocity` / `moving_density_boundary_flux` stay production in `first_full`.
 
-use super::*;
 use super::first_full::moving_density_boundary_flux;
+use super::*;
 use crate::families::survival::marginal_slope::flex_oracle_structs_tests::neg_cell_of;
 
 /// Horner evaluation of `Σ_k coefficients[k]·zᵏ`.
@@ -41,11 +41,7 @@ fn poly_eval_deriv_slice(coefficients: &[f64], z: f64) -> f64 {
 /// term — the `a`-axis boundary flux was omitted (gam#932/#1454), the dominant
 /// residual in the intercept-solve `a_uv` Hessian. This mirrors the θ-axis
 /// [`moving_density_boundary_flux`] for the `z_a = −1/b` velocity.
-pub(crate) fn moving_density_boundary_flux_a(
-    entry: &CachedCellEntry,
-    poly: &[f64],
-    b: f64,
-) -> f64 {
+pub(crate) fn moving_density_boundary_flux_a(entry: &CachedCellEntry, poly: &[f64], b: f64) -> f64 {
     if b == 0.0 {
         return 0.0;
     }
@@ -113,13 +109,7 @@ impl SurvivalMarginalSlopeFamily {
                         &state.moments,
                         "survival D_t first derivative",
                     )? + moving_density_boundary_flux(
-                        u,
-                        primary,
-                        a_u,
-                        entry,
-                        &chi_poly,
-                        b,
-                        true,
+                        u, primary, a_u, entry, &chi_poly, b, true,
                     );
                 }
                 Ok(d_u)
@@ -491,15 +481,14 @@ impl SurvivalMarginalSlopeFamily {
                         crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
                     }
                 };
-                let a_edge_vel =
-                    |edge: crate::families::cubic_cell_kernel::PartitionEdge| -> f64 {
-                        match edge {
-                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
-                                -1.0 / b
-                            }
-                            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                let a_edge_vel = |edge: crate::families::cubic_cell_kernel::PartitionEdge| -> f64 {
+                    match edge {
+                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                            -1.0 / b
                         }
-                    };
+                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                    }
+                };
                 // ∂_z of the calibration F integrand `G(z) = Φ(−η(z))·φ(z)` (NOT
                 // the bare weight `w = exp(−q)/2π`). The §D self-flux `G_z·z_x·z_y`
                 // uses the BASE integrand whose endpoints the Leibniz boundary
@@ -600,13 +589,7 @@ impl SurvivalMarginalSlopeFamily {
                     let zu_l = edge_vel(u, part.left_edge, cell.left);
                     f_au[u] += moving_density_boundary_flux_a(entry, &neg_coeff_u, b)
                         + moving_density_boundary_flux(
-                            u,
-                            primary,
-                            &a_u,
-                            entry,
-                            &neg_dc_da,
-                            b,
-                            false,
+                            u, primary, &a_u, entry, &neg_dc_da, b, false,
                         )
                         + self_flux_xy(za_r, zu_r, za_l, zu_l);
                 }
@@ -731,5 +714,4 @@ impl SurvivalMarginalSlopeFamily {
             d_uv,
         })
     }
-
 }

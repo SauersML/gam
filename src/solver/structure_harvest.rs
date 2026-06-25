@@ -33,7 +33,7 @@
 //! Pure: no RNG, no clock. Proposal triggers are deterministic functions of the
 //! fitted state; the engine canonicalizes and gates them; the ledger serializes
 //! byte-identically for identical inputs. The structural hashes that dedup the
-//! proposal stream are computed with the same [`crate::warm_start::Fingerprinter`]
+//! proposal stream are computed with the same [`gam_runtime::warm_start::Fingerprinter`]
 //! the [`crate::terms::smooth::TermCollectionSpec`] machinery (#869) uses, fed
 //! the POST-move dictionary shape (atom count, per-atom basis kind + latent dim
 //! + the move that produced it), so two proposals that reach the same dictionary
@@ -66,7 +66,7 @@ use crate::terms::sae::manifold::{
 use crate::terms::structure::anova_atom::{
     CarveReport, FissionDecision, carve, carve_input_from_fitted_atom, fission_decision,
 };
-use crate::warm_start::Fingerprinter;
+use gam_runtime::warm_start::Fingerprinter;
 
 /// Per-row soft-assignment mass below which an atom is treated as INACTIVE on
 /// that row when deriving the discrete co-activation support. A soft softmax /
@@ -1683,7 +1683,6 @@ pub fn run_structure_search_rounds(
         // evidence resumes across corpus shards. A `None` p-value (the Wald
         // test degenerated) is skipped — no fabricated evidence.
 
-
         // Pre-build the birth-decoder list ONCE per round from the residual
         // factor (the birth candidates index into it), so the apply-move
         // closure inside the gate is a pure function of the candidate index.
@@ -2603,10 +2602,6 @@ mod tests {
         );
         assert_eq!(a.term.k_atoms(), b.term.k_atoms());
     }
-
-
-
-
 
     /// #1026 move-equivalence oracle for the candidate-SCORING iteration cap.
     ///

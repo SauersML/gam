@@ -10,10 +10,10 @@
 //! Everything here is pure scalar math with no dependence on the family state,
 //! so it lives in its own seam.
 
-use crate::families::jet_tower::{
+use crate::probability::{log1mexp_positive, normal_logcdf};
+use gam_math::jet_tower::{
     Tower4, unary_derivatives_log1mexp_positive, unary_derivatives_normal_logcdf,
 };
-use crate::probability::{log1mexp_positive, normal_logcdf};
 
 use super::TransformationNormalError;
 

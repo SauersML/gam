@@ -91,9 +91,19 @@ fn gam_duchon_1d_matches_mgcv_ds() {
     eprintln!(
         "[#1074-duchon] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged={} iters={}",
         fit.fit.edf_total().unwrap_or(f64::NAN),
-        fit.fit.edf_by_block().iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-        fit.fit.log_lambdas.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-        fit.fit.reml_score, fit.fit.outer_converged, fit.fit.outer_iterations,
+        fit.fit
+            .edf_by_block()
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>(),
+        fit.fit
+            .log_lambdas
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>(),
+        fit.fit.reml_score,
+        fit.fit.outer_converged,
+        fit.fit.outer_iterations,
     );
 
     // ---- dense test grid interior to [0,1] (avoid extrapolation edges) -----

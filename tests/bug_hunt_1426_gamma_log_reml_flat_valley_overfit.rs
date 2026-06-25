@@ -79,7 +79,10 @@ fn build_data(seed: u64) -> gam::data::EncodedDataset {
         let mu = truth_mean(xi);
         // Gamma(shape=2, scale=mu/2) has mean mu and CV = 1/sqrt(2).
         let yi = rng.next_gamma_shape2(mu / 2.0);
-        assert!(yi.is_finite() && yi > 0.0, "constructed y must be positive finite");
+        assert!(
+            yi.is_finite() && yi > 0.0,
+            "constructed y must be positive finite"
+        );
         x.push(xi);
         y.push(yi);
     }

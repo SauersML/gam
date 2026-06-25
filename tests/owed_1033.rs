@@ -111,16 +111,25 @@ fn build_term_with_n_rows(n: usize) -> (SaeManifoldTerm, Array2<f64>) {
     dec1[[2, 0]] = 1.0; // cos   -> ch0
 
     let make = |name: &str, phi: Array2<f64>, jet, dec: Array2<f64>| {
-        SaeManifoldAtom::new(name, SaeAtomBasisKind::Periodic, D, phi, jet, dec, Array2::<f64>::eye(M))
-            .unwrap()
-            .with_basis_evaluator(Arc::new(PeriodicHarmonicEvaluator::new(M).unwrap()))
+        SaeManifoldAtom::new(
+            name,
+            SaeAtomBasisKind::Periodic,
+            D,
+            phi,
+            jet,
+            dec,
+            Array2::<f64>::eye(M),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(PeriodicHarmonicEvaluator::new(M).unwrap()))
     };
     let atom0 = make("circle_0", phi0, jet0, dec0);
     let atom1 = make("circle_1", phi1, jet1, dec1);
 
     // Mild, non-degenerate logits so both atoms are routed-on.
-    let logits =
-        Array2::from_shape_fn((n, K), |(i, k)| 0.3 + 0.05 * (i as f64).sin() - 0.05 * (k as f64));
+    let logits = Array2::from_shape_fn((n, K), |(i, k)| {
+        0.3 + 0.05 * (i as f64).sin() - 0.05 * (k as f64)
+    });
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
         vec![coords0.clone(), coords1.clone()],
@@ -136,9 +145,8 @@ fn build_term_with_n_rows(n: usize) -> (SaeManifoldTerm, Array2<f64>) {
     // A reconstruction target that is itself the amplitude-1 decode of atom 0
     // plus mild structured noise, so the data-fit term is non-trivial and the
     // converged inner solve (and hence the outer gradient) is well defined.
-    let target = Array2::from_shape_fn((n, P), |(i, c)| {
-        0.1 * ((i as f64) * 0.3 + (c as f64)).sin()
-    });
+    let target =
+        Array2::from_shape_fn((n, P), |(i, c)| 0.1 * ((i as f64) * 0.3 + (c as f64)).sin());
     (term, target)
 }
 

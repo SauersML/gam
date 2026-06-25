@@ -362,7 +362,10 @@ fn diag_matern_internals_1074() {
         1.0 + 0.8 * (4.0 * std::f64::consts::PI * t).sin()
             + 0.4 * (2.0 * std::f64::consts::PI * t).cos()
     };
-    let y: Vec<f64> = x.iter().map(|&t| truth(t) + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|&t| truth(t) + noise.sample(&mut rng))
+        .collect();
     let grid_n = n;
     let x_grid: Vec<f64> = (0..grid_n)
         .map(|i| 0.005 + 0.99 * i as f64 / (grid_n - 1) as f64)
@@ -394,9 +397,14 @@ fn diag_matern_internals_1074() {
             .map(|(a, b)| csv::StringRecord::from(vec![a.to_string(), b.to_string()]))
             .collect();
         let ds = encode_recordswith_inferred_schema(headers, rows).unwrap();
-        let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+        let cfg = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
         let result = fit_from_formula(formula, &ds, &cfg).unwrap();
-        let FitResult::Standard(fit) = result else { panic!() };
+        let FitResult::Standard(fit) = result else {
+            panic!()
+        };
         let mut g = Array2::<f64>::zeros((grid_n, 2));
         for (i, &t) in x_grid.iter().enumerate() {
             g[[i, 0]] = t;
@@ -408,19 +416,33 @@ fn diag_matern_internals_1074() {
         // #1074: the converged Matérn length_scale (= 1/kappa) the REML κ-optimizer
         // landed on, to compare against mgcv's effective range. A too-SHORT range
         // (wiggly kernel) is the suspected source of the EDF inflation vs mgcv.
-        let fitted_ls = fit.resolvedspec.smooth_terms.iter().find_map(|t| {
-            match &t.basis {
+        let fitted_ls = fit
+            .resolvedspec
+            .smooth_terms
+            .iter()
+            .find_map(|t| match &t.basis {
                 gam::smooth::SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
                 _ => None,
-            }
-        });
+            });
         eprintln!(
             "[#1074-diag] {formula} fitted_length_scale={fitted_ls:?} kappa_opt_ran={}\n    edf_total={:.3} edf_by_block={:?}\n    log_lambdas={:?}\n    lambdas={:?}\n    reml={:.4} converged={} outer_iters={} rmse_vs_truth={:.4}",
             fit.kappa_timing.is_some(),
             fit.fit.edf_total().unwrap(),
-            fit.fit.edf_by_block().iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-            fit.fit.log_lambdas.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-            fit.fit.lambdas.iter().map(|v| (v * 1e6).round() / 1e6).collect::<Vec<_>>(),
+            fit.fit
+                .edf_by_block()
+                .iter()
+                .map(|v| (v * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>(),
+            fit.fit
+                .log_lambdas
+                .iter()
+                .map(|v| (v * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>(),
+            fit.fit
+                .lambdas
+                .iter()
+                .map(|v| (v * 1e6).round() / 1e6)
+                .collect::<Vec<_>>(),
             fit.fit.reml_score,
             fit.fit.outer_converged,
             fit.fit.outer_iterations,

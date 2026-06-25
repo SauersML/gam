@@ -88,8 +88,7 @@ fn throughput_gate_floor_is_derived_from_the_gpu_gate() {
     // The floor must literally be gate / scaling, so it cannot be decoupled from
     // the deployment target and silently weakened.
     assert!(
-        BENCH_SRC
-            .contains("GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU / CPU_TO_GPU_SCALING"),
+        BENCH_SRC.contains("GPU_DEPLOYMENT_GATE_ROWS_PER_SEC_PER_GPU / CPU_TO_GPU_SCALING"),
         "#1412: the CPU floor must be defined as GPU_gate / CPU_TO_GPU_SCALING so \
          the CPU-floor verdict and the projected-GPU verdict are the same decision"
     );

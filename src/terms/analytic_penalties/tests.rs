@@ -1950,8 +1950,8 @@ fn accumulate_psd_majorizer_dense_matches_unit_probe_loop() {
     }
     assert!(!pairs.is_empty(), "fixture must exercise at least one pair");
     let weight = 0.83_f64;
-    let pen =
-        DecoderIncoherencePenalty::new_sparse(target, block_sizes, p, pairs, weight, false).unwrap();
+    let pen = DecoderIncoherencePenalty::new_sparse(target, block_sizes, p, pairs, weight, false)
+        .unwrap();
 
     let rho = Array1::<f64>::zeros(0);
     let beta: Array1<f64> = (0..total).map(|_| next() - 0.5).collect();
@@ -1990,7 +1990,10 @@ fn accumulate_psd_majorizer_dense_matches_unit_probe_loop() {
             sym_max = sym_max.max((hbb[[i, j]] - hbb[[j, i]]).abs());
         }
     }
-    assert!(sym_max <= 1.0e-12, "scattered hbb not symmetric: {sym_max:.3e}");
+    assert!(
+        sym_max <= 1.0e-12,
+        "scattered hbb not symmetric: {sym_max:.3e}"
+    );
 }
 
 #[test]

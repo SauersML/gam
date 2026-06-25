@@ -116,7 +116,6 @@ fn penalized_fit(x: &Array2<f64>, s: &Array2<f64>, g: &Array1<f64>, lambda: f64)
 
 #[test]
 fn duchon_xz_fit_invariant_to_diagonal_translation_1375() {
-
     let n = 220usize;
     let base = synthetic_xz(n, 0x1375_2026);
 

@@ -89,7 +89,6 @@ impl PredictableModel for TransformationNormalPredictor {
         })
     }
 
-
     fn predict_full_uncertainty(
         &self,
         input: &PredictInput,

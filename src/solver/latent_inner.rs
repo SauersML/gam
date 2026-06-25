@@ -499,7 +499,7 @@ mod tests {
             arr: ArrayView1<'_, f64>,
             latent_coords: &LatentCoordValues,
         ) -> Result<ArrowSchurSystem, String> {
-        let _unused_latent_coords = latent_coords;
+            let _unused_latent_coords = latent_coords;
             assert!(arr.iter().all(|v| !v.is_nan()));
             let mut sys = ArrowSchurSystem::new(self.n, self.d, self.k);
             for j in 0..self.k {
@@ -518,7 +518,7 @@ mod tests {
             arr: ArrayView1<'_, f64>,
             latent_coords: &LatentCoordValues,
         ) -> Result<f64, String> {
-        let _unused_latent_coords = latent_coords;
+            let _unused_latent_coords = latent_coords;
             assert!(arr.iter().all(|v| !v.is_nan()));
             Ok(0.0)
         }

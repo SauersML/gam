@@ -1215,11 +1215,7 @@ pub fn generic_row_kernel<const K: usize, P: RowNllProgramGeneric<K> + ?Sized>(
         <crate::jet_scalar::Order2<K> as crate::jet_scalar::JetScalar<K>>::variable(base[a], a)
     });
     let s = prog.row_nll_generic(row, &vars)?;
-    Ok((
-        crate::jet_scalar::JetScalar::value(&s),
-        s.g(),
-        s.h(),
-    ))
+    Ok((crate::jet_scalar::JetScalar::value(&s), s.g(), s.h()))
 }
 
 /// Evaluate a generic program at the one-seed scalar
@@ -2361,13 +2357,80 @@ mod tests {
     }
 }
 
-/// Stable derivative stack for `log Φ(x)` through fourth order.
-///
-/// The value and Mills ratio come from the shared probit primitive, so the
-/// deep left tail uses the same erfcx path as production log-CDF code.
 #[inline]
-pub(crate) fn unary_derivatives_normal_logcdf(x: f64) -> [f64; 5] {
-    let (log_cdf, lambda) = crate::probability::signed_probit_logcdf_and_mills_ratio(x);
+fn normal_pdf(x: f64) -> f64 {
+    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
+    INV_SQRT_2PI * (-0.5 * x * x).exp()
+}
+
+#[inline]
+fn normal_cdf(x: f64) -> f64 {
+    0.5 * statrs::function::erf::erfc(-x / std::f64::consts::SQRT_2)
+}
+
+#[inline]
+fn erfcx_nonnegative(x: f64) -> f64 {
+    if !x.is_finite() {
+        return if x.is_sign_positive() {
+            0.0
+        } else {
+            f64::INFINITY
+        };
+    }
+    if x <= 0.0 {
+        return 1.0;
+    }
+    if x < 26.0 {
+        ((x * x).min(700.0)).exp() * statrs::function::erf::erfc(x)
+    } else {
+        let inv = 1.0 / x;
+        let inv2 = inv * inv;
+        let poly = 1.0 - 0.5 * inv2 + 0.75 * inv2 * inv2 - 1.875 * inv2 * inv2 * inv2
+            + 6.5625 * inv2 * inv2 * inv2 * inv2;
+        inv * poly / std::f64::consts::PI.sqrt()
+    }
+}
+
+#[inline]
+fn log1mexp_positive(a: f64) -> f64 {
+    assert!(a >= 0.0, "log1mexp_positive requires a >= 0: a={a}");
+    if a > core::f64::consts::LN_2 {
+        (-(-a).exp()).ln_1p()
+    } else if a > 0.0 {
+        (-(-a).exp_m1()).ln()
+    } else {
+        f64::NEG_INFINITY
+    }
+}
+
+#[inline]
+fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
+    if x == f64::INFINITY {
+        return (0.0, 0.0);
+    }
+    if x == f64::NEG_INFINITY {
+        return (f64::NEG_INFINITY, f64::INFINITY);
+    }
+    if x.is_nan() {
+        return (f64::NAN, f64::NAN);
+    }
+    if x < 0.0 {
+        let u = -x / std::f64::consts::SQRT_2;
+        let ex = erfcx_nonnegative(u).max(1e-300);
+        let log_cdf = -u * u + (0.5 * ex).ln();
+        let lambda = (2.0 / std::f64::consts::PI).sqrt() / ex;
+        (log_cdf, lambda)
+    } else {
+        let cdf = normal_cdf(x).clamp(1e-300, 1.0);
+        let lambda = normal_pdf(x) / cdf;
+        (cdf.ln(), lambda)
+    }
+}
+
+/// Stable derivative stack for `log Phi(x)` through fourth order.
+#[inline]
+pub fn unary_derivatives_normal_logcdf(x: f64) -> [f64; 5] {
+    let (log_cdf, lambda) = signed_probit_logcdf_and_mills_ratio(x);
     let lambda2 = lambda * lambda;
     let lambda3 = lambda2 * lambda;
     let x2 = x * x;
@@ -2383,10 +2446,10 @@ pub(crate) fn unary_derivatives_normal_logcdf(x: f64) -> [f64; 5] {
 
 /// Stable derivative stack for `log(1 - exp(-x))`, `x > 0`, through fourth order.
 #[inline]
-pub(crate) fn unary_derivatives_log1mexp_positive(x: f64) -> [f64; 5] {
+pub fn unary_derivatives_log1mexp_positive(x: f64) -> [f64; 5] {
     let r = 1.0 / x.exp_m1();
     [
-        crate::probability::log1mexp_positive(x),
+        log1mexp_positive(x),
         r,
         -r * (1.0 + r),
         r * (1.0 + r) * (1.0 + 2.0 * r),

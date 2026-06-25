@@ -53,13 +53,22 @@ fn smooth_multinomial_dataset() -> gam::data::EncodedDataset {
 fn multinomial_edf_per_class_is_per_class_not_per_block_overcount() {
     init_parallelism();
     let data = smooth_multinomial_dataset();
-    let model =
-        fit_penalized_multinomial_formula(&data, "y ~ s(x)", &FitConfig::default(), 1.0, 100, 1.0e-7)
-            .expect("multinomial smooth fit must succeed");
+    let model = fit_penalized_multinomial_formula(
+        &data,
+        "y ~ s(x)",
+        &FitConfig::default(),
+        1.0,
+        100,
+        1.0e-7,
+    )
+    .expect("multinomial smooth fit must succeed");
 
     let m = model.n_active_classes; // K - 1
     let p_per_class = model.p_per_class;
-    assert!(m >= 1 && p_per_class >= 1, "fixture must fit a non-trivial model");
+    assert!(
+        m >= 1 && p_per_class >= 1,
+        "fixture must fit a non-trivial model"
+    );
 
     // Premise guard: the default `s(x)` double penalty must give each class block
     // MORE than one penalty block, otherwise the per-block list would coincide

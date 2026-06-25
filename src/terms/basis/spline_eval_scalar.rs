@@ -1174,12 +1174,7 @@ pub(crate) fn evaluate_bspline_derivative_recurrence_into(
     // boundary spans here.
     if depth == 0
         && (open_knot_derivative_exterior_is_zero(x, knot_vector, degree)
-            || linear_extension_higher_derivative_is_zero(
-                x,
-                knot_vector,
-                degree,
-                derivative_order,
-            ))
+            || linear_extension_higher_derivative_is_zero(x, knot_vector, degree, derivative_order))
     {
         out.fill(0.0);
         return Ok(());

@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use ndarray::{array, Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, array};
 
 use gam::terms::latent::LatentManifold;
 use gam::terms::sae::assignment::{AssignmentMode, SaeAssignment};
@@ -130,14 +130,7 @@ fn fixed_decoder_encode_keeps_decoder_frozen_1407() {
     );
 
     let loss = term
-        .run_fixed_decoder_arrow_schur(
-            target.view(),
-            &mut rho,
-            None,
-            8,
-            1.0,
-            1.0e-6,
-        )
+        .run_fixed_decoder_arrow_schur(target.view(), &mut rho, None, 8, 1.0, 1.0e-6)
         .expect("fixed-decoder encode runs to completion");
     assert!(
         loss.total().is_finite(),

@@ -1,7 +1,7 @@
 use super::family::clamp_bernoulli_link_probability;
 use super::*;
-use crate::families::jet_tower::Tower4;
 use crate::matrix::{LinearOperator, SignedWeightsView};
+use gam_math::jet_tower::Tower4;
 
 pub(crate) fn standardize_latent_z_with_policy(
     z: &Array1<f64>,
@@ -1417,9 +1417,7 @@ pub(super) fn rigid_standard_normal_neglog_only(
 /// non-finite (non-`+∞`-excluded) NaN before calling; the seeded-evaluation
 /// wrappers below do that.
 #[inline]
-pub(crate) fn rigid_standard_normal_row_nll_generic<
-    S: crate::families::jet_scalar::JetScalar<2>,
->(
+pub(crate) fn rigid_standard_normal_row_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
     p: &[S; 2],
     marginal: BernoulliMarginalLinkMap,
     z: f64,
@@ -1453,7 +1451,7 @@ pub(crate) fn rigid_standard_normal_row_nll_generic<
 /// ([`rigid_standard_normal_signed_jet`]) evaluates it at `Tower4<2>` — so the
 /// signed margin has a single source (#932), with no second hand-packed jet.
 #[inline]
-pub(crate) fn rigid_standard_normal_signed_margin<S: crate::families::jet_scalar::JetScalar<2>>(
+pub(crate) fn rigid_standard_normal_signed_margin<S: gam_math::jet_scalar::JetScalar<2>>(
     p: &[S; 2],
     marginal: BernoulliMarginalLinkMap,
     z: f64,
@@ -1484,8 +1482,8 @@ pub(crate) fn rigid_standard_normal_signed_margin<S: crate::families::jet_scalar
 /// This is the genuine production consumer of the generic program seam: the row
 /// NLL is written ONCE in [`rigid_standard_normal_row_nll_generic`] over
 /// `S: JetScalar<2>`, and this single-row program routes it through the
-/// [`crate::families::jet_tower`] `generic_*` evaluators
-/// ([`generic_full_tower`](crate::families::jet_tower::generic_full_tower) for
+/// [`gam_math::jet_tower`] `generic_*` evaluators
+/// ([`generic_full_tower`](gam_math::jet_tower::generic_full_tower) for
 /// the uncontracted tensors, and the cheap order-2 / contracted scalars for the
 /// value/grad/Hessian and directional channels). Primaries are
 /// `[marginal η, slope g]`; the marginal link map and per-row data
@@ -1499,7 +1497,7 @@ pub(crate) struct RigidStandardNormalRow {
     pub(crate) probit_scale: f64,
 }
 
-impl crate::families::jet_tower::RowNllProgramGeneric<2> for RigidStandardNormalRow {
+impl gam_math::jet_tower::RowNllProgramGeneric<2> for RigidStandardNormalRow {
     fn n_rows(&self) -> usize {
         1
     }
@@ -1511,7 +1509,7 @@ impl crate::families::jet_tower::RowNllProgramGeneric<2> for RigidStandardNormal
         Ok([self.marginal.eta_value(), self.g])
     }
 
-    fn row_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+    fn row_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
         p: &[S; 2],
@@ -1553,7 +1551,7 @@ pub(crate) fn rigid_standard_normal_tower(
         w,
         probit_scale,
     };
-    crate::families::jet_tower::generic_full_tower(&program, 0)
+    gam_math::jet_tower::generic_full_tower(&program, 0)
 }
 
 /// Branch-free `signed`-margin jet for the rigid standard-normal row kernel.
@@ -1698,7 +1696,7 @@ pub(super) fn rigid_standard_normal_row_kernel(
         w,
         probit_scale,
     };
-    crate::families::jet_tower::generic_row_kernel(&program, 0)
+    gam_math::jet_tower::generic_row_kernel(&program, 0)
 }
 
 /// Mixed `(primary, z)` second derivative of the rigid standard-normal row
@@ -1757,7 +1755,7 @@ pub(super) fn rigid_standard_normal_mixed_z_sensitivity(
     // (`Tower2::mul`/`compose_unary` match `Tower4` term-for-term), so the read
     // entries are unchanged; the `q3`/`q4` marginal-link channels are dropped
     // because no order-≤2 channel of the composed jet reads them.
-    use crate::families::jet_tower::Tower2;
+    use gam_math::jet_tower::Tower2;
     let mut q = Tower2::<3>::constant(marginal.q);
     q.g[0] = marginal.q1;
     q.h[0][0] = marginal.q2;
@@ -2117,7 +2115,7 @@ mod jet_tower_oracle_tests {
         let tower = rigid_standard_normal_tower(marginal, g, z, y, w, probit_scale)?;
         Ok((tower.t3, tower.t4))
     }
-    use crate::families::jet_tower::{
+    use gam_math::jet_tower::{
         KernelChannels, RowNllProgram, evaluate_program, verify_kernel_channels,
     };
 
@@ -2399,7 +2397,7 @@ mod jet_tower_oracle_tests {
     /// `generic_*` evaluator end-to-end through a real production consumer.
     #[test]
     fn rigid_bernoulli_generic_program_matches_tower4_program_all_channels() {
-        use crate::families::jet_tower::{
+        use gam_math::jet_tower::{
             generic_fourth_contracted, generic_full_tower, generic_row_kernel,
             generic_third_contracted,
         };
@@ -2598,7 +2596,7 @@ mod flex_primary_hessian_oracle_tests {
             logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(logslope_x.clone())),
             score_warp: Some(score_prepared.runtime.clone()),
             link_dev: Some(link_prepared.runtime.clone()),
-            policy: crate::resource::ResourcePolicy::default_library(),
+            policy: gam_runtime::resource::ResourcePolicy::default_library(),
             cell_moment_lru: Arc::new(exact_kernel::CellMomentLruCache::new(1024)),
             cell_moment_cache_stats: Arc::new(exact_kernel::CellMomentCacheStats::default()),
             intercept_warm_starts: None,

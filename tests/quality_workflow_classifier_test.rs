@@ -3,11 +3,11 @@ use std::process::Command;
 #[test]
 fn test_reference_quality_classifier() {
     let yaml = std::fs::read_to_string(".github/workflows/reference-quality.yml").unwrap();
-    
+
     // Extract the classifier logic
     let start_marker = "gamfit_re='IntegrationFailed|InvalidConfig";
     let _end_marker = "outcome=METRIC_OFF;";
-    
+
     let mut classifier_code = String::new();
     let mut in_block = false;
     for line in yaml.lines() {
@@ -23,11 +23,15 @@ fn test_reference_quality_classifier() {
             }
         }
     }
-    
-    assert!(classifier_code.contains("gamfit_re="), "Could not extract classifier logic");
-    
+
+    assert!(
+        classifier_code.contains("gamfit_re="),
+        "Could not extract classifier logic"
+    );
+
     // Now create a bash script that we can call
-    let test_script = format!(r#"#!/bin/bash
+    let test_script = format!(
+        r#"#!/bin/bash
 outcome=$1
 rc=$2
 log=$3
@@ -47,24 +51,30 @@ refmarker=$(grep -aE 'there is no package called|could not find function|Error i
 {}
 
 echo "$outcome,$cause"
-"#, classifier_code);
+"#,
+        classifier_code
+    );
 
     let script_path = "/tmp/test_classifier.sh";
     std::fs::write(script_path, test_script).unwrap();
-    std::process::Command::new("chmod").args(&["+x", script_path]).status().unwrap();
+    std::process::Command::new("chmod")
+        .args(&["+x", script_path])
+        .status()
+        .unwrap();
 
-    let run_case = |outcome: &str, rc: i32, log_content: &str, test_name: &str| -> (String, String) {
-        let log_path = "/tmp/test_classifier.log";
-        std::fs::write(log_path, log_content).unwrap();
-        let output = Command::new(script_path)
-            .args(&[outcome, &rc.to_string(), log_path, test_name])
-            .output()
-            .unwrap();
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let trimmed = stdout.trim();
-        let parts: Vec<&str> = trimmed.split(',').collect();
-        (parts[0].to_string(), parts[1].to_string())
-    };
+    let run_case =
+        |outcome: &str, rc: i32, log_content: &str, test_name: &str| -> (String, String) {
+            let log_path = "/tmp/test_classifier.log";
+            std::fs::write(log_path, log_content).unwrap();
+            let output = Command::new(script_path)
+                .args(&[outcome, &rc.to_string(), log_path, test_name])
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let trimmed = stdout.trim();
+            let parts: Vec<&str> = trimmed.split(',').collect();
+            (parts[0].to_string(), parts[1].to_string())
+        };
 
     // Test 1: PASS
     let (out, cause) = run_case("", 0, "Some output", "test1");
@@ -72,7 +82,12 @@ echo "$outcome,$cause"
     assert_eq!(cause, "ok");
 
     // Test 2: GAM_ERROR (LayoutError)
-    let (out, cause) = run_case("", 101, "thread 'main' panicked at src/foo.rs:10:\nLayoutError: bad layout", "test2");
+    let (out, cause) = run_case(
+        "",
+        101,
+        "thread 'main' panicked at src/foo.rs:10:\nLayoutError: bad layout",
+        "test2",
+    );
     assert_eq!(out, "GAM_ERROR");
     assert_eq!(cause, "gam_fit_failed");
 
@@ -82,12 +97,22 @@ echo "$outcome,$cause"
     assert_eq!(cause, "quality_metric");
 
     // Test 4: TEST_ERROR
-    let (out, cause) = run_case("", 101, "thread 'main' panicked at src/test_support/reference.rs:20:\nData mismatch", "test4");
+    let (out, cause) = run_case(
+        "",
+        101,
+        "thread 'main' panicked at src/test_support/reference.rs:20:\nData mismatch",
+        "test4",
+    );
     assert_eq!(out, "TEST_ERROR");
     assert_eq!(cause, "test_setup");
 
     // Test 5: REF_ERROR
-    let (out, cause) = run_case("", 1, "Error in library(mgcv) : there is no package called 'mgcv'", "test5");
+    let (out, cause) = run_case(
+        "",
+        1,
+        "Error in library(mgcv) : there is no package called 'mgcv'",
+        "test5",
+    );
     assert_eq!(out, "REF_ERROR");
     assert_eq!(cause, "reference_tool");
 }

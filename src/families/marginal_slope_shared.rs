@@ -31,8 +31,8 @@
 
 use crate::custom_family::{CustomFamilyBlockPsiDerivative, ParameterBlockSpec};
 use crate::families::cubic_cell_kernel::{self, DenestedPartitionCell, LocalSpanCubic};
-use crate::families::jet_partitions::MultiDirJet;
 use crate::outer_subsample::{OuterScoreSubsample, WeightedOuterRow};
+use gam_math::jet_partitions::MultiDirJet;
 use ndarray::{Array1, Array2, Axis};
 use std::ops::Range;
 use std::sync::Arc;
@@ -1778,7 +1778,7 @@ mod tests {
     // assignment is caught) and makes the scale jet load-bearing (so a
     // mis-wired obj/grad/hess scale is caught).
 
-    use crate::families::jet_partitions::MultiDirJet;
+    use gam_math::jet_partitions::MultiDirJet;
 
     /// Deterministic LCG so the fixture is reproducible without pulling in
     /// an RNG dependency.

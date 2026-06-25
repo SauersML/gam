@@ -520,7 +520,9 @@ impl DeviceResidentArrowWorkspace {
                                     self.context_id(),
                                 );
                                 crate::gpu::profile::telemetry_record_factorization();
-                                crate::gpu::profile::telemetry_record_h2d(self.frame_upload_bytes());
+                                crate::gpu::profile::telemetry_record_h2d(
+                                    self.frame_upload_bytes(),
+                                );
                                 resident_frame = Some((ridge_t, ridge_beta, frame));
                             }
                             Err(err) => frame_build_error = Some(map_gpu_error(err)),
@@ -737,7 +739,11 @@ impl DeviceResidentArrowWorkspace {
                 reason: "SAE outer-sequence residency unavailable: CUDA runtime did not admit the row-block workload".to_string(),
             });
         }
-        self.run_outer_sequence(base_gradient_overrides, opts, InnerSolveMode::DeviceResident)
+        self.run_outer_sequence(
+            base_gradient_overrides,
+            opts,
+            InnerSolveMode::DeviceResident,
+        )
     }
 
     /// CPU-reference outer sequence: same host control flow as
@@ -946,7 +952,8 @@ impl DeviceResidentArrowWorkspace {
             for (slot, dv) in trial_beta.iter_mut().zip(solution.delta_beta.iter()) {
                 *slot += *dv;
             }
-            let trial_objective = self.objective_at(base, half_target_energy, &trial_t, &trial_beta);
+            let trial_objective =
+                self.objective_at(base, half_target_energy, &trial_t, &trial_beta);
 
             let objective_scale = current_objective.abs();
             let noise_floor = objective_scale * 1e-14;
@@ -2180,7 +2187,8 @@ mod tests {
                 .device_fit_outer_sequence(&outers, &opts)
                 .expect("device outer sequence");
             assert_eq!(
-                shared.frame_builds, 1,
+                shared.frame_builds,
+                1,
                 "across-outer residency must build the resident frame exactly once \
                  for an unchanged operator (got {} builds over {} outers) — a count \
                  > 1 means the frame was needlessly re-factored per outer",
@@ -2189,7 +2197,11 @@ mod tests {
             );
             // Bit-parity: sharing the factor across outers must not change the
             // numbers vs per-outer-independent device fits.
-            for (idx, (sh, ind)) in shared.outers.iter().zip(independent.outers.iter()).enumerate()
+            for (idx, (sh, ind)) in shared
+                .outers
+                .iter()
+                .zip(independent.outers.iter())
+                .enumerate()
             {
                 let scale = ind
                     .t

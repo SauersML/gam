@@ -340,7 +340,7 @@ impl BernoulliMarginalSlopeFamily {
         // single-source row jet every channel uses, with the grid intercept
         // a(m, g) lifted directly in the packed `Order2<2>` algebra (no hand
         // intercept-derivative formulas, no dense extra-variable tower).
-        let jet = self.empirical_rigid_row_nll_jet::<crate::families::jet_scalar::Order2<2>>(
+        let jet = self.empirical_rigid_row_nll_jet::<gam_math::jet_scalar::Order2<2>>(
             row,
             marginal,
             slope,
@@ -349,7 +349,7 @@ impl BernoulliMarginalSlopeFamily {
             2,
         )?;
         Ok((
-            crate::families::jet_scalar::JetScalar::value(&jet),
+            gam_math::jet_scalar::JetScalar::value(&jet),
             jet.g(),
             jet.h(),
         ))
@@ -386,7 +386,7 @@ impl BernoulliMarginalSlopeFamily {
         // channel of the SAME single-source row jet, evaluated at the packed
         // `Tower4<2>` (nilpotency 4 → 4 lift grades). No hand intercept-third
         // formulas; the grid intercept rides through the filtered lift.
-        let jet = self.empirical_rigid_row_nll_jet::<crate::families::jet_tower::Tower4<2>>(
+        let jet = self.empirical_rigid_row_nll_jet::<gam_math::jet_tower::Tower4<2>>(
             row,
             marginal,
             slope,
@@ -427,7 +427,7 @@ impl BernoulliMarginalSlopeFamily {
         // `g_aa·a_ggg` term whose omission shifted the m/g block ~1.8%) is now
         // generated mechanically by the filtered lift — that whole genus cannot
         // recur because there is no separate channel to drop.
-        let jet = self.empirical_rigid_row_nll_jet::<crate::families::jet_tower::Tower4<2>>(
+        let jet = self.empirical_rigid_row_nll_jet::<gam_math::jet_tower::Tower4<2>>(
             row,
             marginal,
             slope,
@@ -444,7 +444,7 @@ impl BernoulliMarginalSlopeFamily {
     /// empirical rigid"). The grid intercept `a(m, g)` solving the calibration
     /// `Σ_k π_k Φ(a + s·g·x_k) = μ(m)` is lifted DIRECTLY in `S` by the filtered
     /// Hensel operator
-    /// ([`crate::families::jet_scalar::filtered_implicit_solve_scalar`]) — no
+    /// ([`gam_math::jet_scalar::filtered_implicit_solve_scalar`]) — no
     /// dense extra-variable tower and no hand-written intercept-derivative
     /// formulas — then the observed signed-probit NLL is composed on top.
     /// Reading `(value, g, H)` off `Order2<2>` serves `primary_grad_hess`;
@@ -456,7 +456,7 @@ impl BernoulliMarginalSlopeFamily {
     /// normal-CDF derivative stack at the fixed base index `η_k0 = a0 + s·g·x_k`
     /// is built ONCE — one transcendental pass — and the cheap polynomial
     /// composition repeats per lift grade.
-    fn empirical_rigid_row_nll_jet<S: crate::families::jet_scalar::JetScalar<2>>(
+    fn empirical_rigid_row_nll_jet<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
         marginal: BernoulliMarginalLinkMap,
@@ -512,7 +512,7 @@ impl BernoulliMarginalSlopeFamily {
             }
             acc
         };
-        let a_jet = crate::families::jet_scalar::filtered_implicit_solve_scalar::<2, S>(
+        let a_jet = gam_math::jet_scalar::filtered_implicit_solve_scalar::<2, S>(
             a0, inv_fa, lift_iters, constraint,
         );
 
@@ -523,7 +523,7 @@ impl BernoulliMarginalSlopeFamily {
         let eta = a_jet.add(&g_jet.scale(s * z));
         let sign = 2.0 * self.y[row] - 1.0;
         let signed = eta.scale(sign);
-        let m_signed = crate::families::jet_scalar::JetScalar::value(&signed);
+        let m_signed = gam_math::jet_scalar::JetScalar::value(&signed);
         if !(m_signed.is_finite() || m_signed == f64::INFINITY) {
             return Err(format!(
                 "empirical rigid jet: non-finite signed margin {m_signed} at row {row}"
@@ -752,7 +752,13 @@ impl BernoulliMarginalSlopeFamily {
             for _ in 0..4 {
                 let scalar_a = MultiDirJet::constant(0, intercept_root);
                 let (f, f_a) = self.empirical_flex_calibration_jets(
-                    primary, &scalar_a, &scalar_mu, &scalar_b, beta_h, beta_w, scalar_dirs,
+                    primary,
+                    &scalar_a,
+                    &scalar_mu,
+                    &scalar_b,
+                    beta_h,
+                    beta_w,
+                    scalar_dirs,
                     grid,
                 )?;
                 let d = f_a.coeff(0);
@@ -1218,7 +1224,7 @@ impl BernoulliMarginalSlopeFamily {
     where
         T: Copy + Send + Default,
         R: Fn(usize, BernoulliMarginalLinkMap, f64) -> Result<T, String> + Sync,
-        E: Fn(&crate::families::jet_tower::Tower4<2>) -> T + Sync,
+        E: Fn(&gam_math::jet_tower::Tower4<2>) -> T + Sync,
     {
         let n = self.y.len();
         let marginal_eta = &block_states[0].eta;
@@ -2980,7 +2986,7 @@ mod empirical_rigid_jet_oracle_tests {
         grid: EmpiricalZGrid,
     ) -> BernoulliMarginalSlopeFamily {
         let n = y.len();
-        let policy = crate::resource::ResourcePolicy::default_library();
+        let policy = gam_runtime::resource::ResourcePolicy::default_library();
         let dummy = || {
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
                 n, 1,
@@ -3234,7 +3240,7 @@ mod empirical_rigid_jet_oracle_tests {
 
     /// Exact `Tower4<2>` row NLL over the primaries θ = (m = marginal η, g =
     /// slope), with the calibrated intercept `a(m, g)` solved as an exact
-    /// implicit tower via [`crate::families::jet_tower::implicit_solve`]. Reads
+    /// implicit tower via [`gam_math::jet_tower::implicit_solve`]. Reads
     /// value / gradient / Hessian / third / fourth straight off the tower.
     ///
     /// `m` enters the constraint ONLY through the marginal target `μ(m)` (its
@@ -3248,11 +3254,11 @@ mod empirical_rigid_jet_oracle_tests {
         slope: f64,
         nodes: &[f64],
         measure_weights: &[f64],
-    ) -> crate::families::jet_tower::Tower4<2> {
+    ) -> gam_math::jet_tower::Tower4<2> {
         // `unary_derivatives_{normal_cdf,neglog_phi}` are in scope via the
         // file-level `use super::gradient_paths::*` (the same glob the flex
         // tower witness relies on).
-        use crate::families::jet_tower::{Tower4, implicit_solve};
+        use gam_math::jet_tower::{Tower4, implicit_solve};
 
         let s = family.probit_frailty_scale();
         // Scalar intercept anchor (order-0 root) from the independent bracketed
@@ -3269,8 +3275,13 @@ mod empirical_rigid_jet_oracle_tests {
         let g_var = Tower4::<3>::variable(slope, 2);
         // μ(m) as a unary composition of the marginal η slot — derivatives are
         // exactly the production link map (correct for ANY marginal link).
-        let mu_tower =
-            m_var.compose_unary([marginal.mu, marginal.mu1, marginal.mu2, marginal.mu3, marginal.mu4]);
+        let mu_tower = m_var.compose_unary([
+            marginal.mu,
+            marginal.mu1,
+            marginal.mu2,
+            marginal.mu3,
+            marginal.mu4,
+        ]);
         let mut f_constraint = Tower4::<3>::constant(0.0) - mu_tower;
         for (&node, &weight) in nodes.iter().zip(measure_weights.iter()) {
             // η_k = a + (s·g)·node_k.
@@ -3279,8 +3290,8 @@ mod empirical_rigid_jet_oracle_tests {
             f_constraint = f_constraint + cdf.scale(weight);
         }
         // Eliminate a → exact intercept tower a(m, g) as a Tower4<2>.
-        let a_tower: Tower4<2> =
-            implicit_solve::<3, 2>(&f_constraint, a0).expect("rigid empirical implicit intercept tower");
+        let a_tower: Tower4<2> = implicit_solve::<3, 2>(&f_constraint, a0)
+            .expect("rigid empirical implicit intercept tower");
 
         // Row NLL over θ = (m, g): observed index η = a(m, g) + s·g·z, signed by
         // (2y − 1), through the SAME signed-probit −logΦ scalar kernel
@@ -3578,7 +3589,7 @@ mod empirical_flex_jet_oracle_tests {
         // One observation row carrying the latent score / response / weight the
         // kernel reads at `self.{z,y,weights}[row]`.
         let n = 1usize;
-        let policy = crate::resource::ResourcePolicy::default_library();
+        let policy = gam_runtime::resource::ResourcePolicy::default_library();
         let dummy = || {
             DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
                 n, 1,
@@ -3844,15 +3855,15 @@ mod empirical_flex_jet_oracle_tests {
     /// inactive deviation coefficients are folded in as constants from `beta`.
     fn witness_eta_tower<const K: usize>(
         fx: &FlexFixture,
-        a: &crate::families::jet_tower::Tower4<K>,
-        b: &crate::families::jet_tower::Tower4<K>,
-        beta0: &crate::families::jet_tower::Tower4<K>,
+        a: &gam_math::jet_tower::Tower4<K>,
+        b: &gam_math::jet_tower::Tower4<K>,
+        beta0: &gam_math::jet_tower::Tower4<K>,
         beta: &[f64],
         node: f64,
         node_arg: f64,
         scale: f64,
-    ) -> crate::families::jet_tower::Tower4<K> {
-        use crate::families::jet_tower::Tower4;
+    ) -> gam_math::jet_tower::Tower4<K> {
+        use gam_math::jet_tower::Tower4;
         let stacks = witness_basis_stacks_at(fx, node_arg);
         let beta_tower = |j: usize| -> Tower4<K> {
             if j == 0 {
@@ -3884,8 +3895,8 @@ mod empirical_flex_jet_oracle_tests {
     /// Exact `Tower4<3>` row NLL over θ = (q, b, β₀), with the calibrated
     /// intercept solved as an exact implicit tower. Read value/grad/Hessian/
     /// third/fourth straight off the returned tower.
-    fn flex_tower_witness(fx: &FlexFixture, p0: &[f64]) -> crate::families::jet_tower::Tower4<3> {
-        use crate::families::jet_tower::{Tower4, implicit_solve};
+    fn flex_tower_witness(fx: &FlexFixture, p0: &[f64]) -> gam_math::jet_tower::Tower4<3> {
+        use gam_math::jet_tower::{Tower4, implicit_solve};
         let q0 = p0[fx.primary.q];
         let b0 = p0[fx.primary.logslope];
         let dev_range = if fx.is_score_warp {
@@ -3971,7 +3982,7 @@ mod empirical_flex_jet_oracle_tests {
     /// mapping test primary indices (q, b, dev0) to tower slots (0, 1, 2).
     fn tower_channel(
         fx: &FlexFixture,
-        tower: &crate::families::jet_tower::Tower4<3>,
+        tower: &gam_math::jet_tower::Tower4<3>,
         axes: &[usize],
     ) -> f64 {
         let dev0 = if fx.is_score_warp {

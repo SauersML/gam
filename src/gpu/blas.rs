@@ -29,7 +29,7 @@ mod cuda_impl {
         cublasDiagType_t, cublasFillMode_t, cublasOperation_t, cublasSideMode_t, cublasStatus_t,
     };
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig, Gemv, GemvConfig, StridedBatchedConfig};
-    use cudarc::cusolver::{sys as cusolver_sys, DnHandle};
+    use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
     use std::sync::Arc;
 
@@ -867,7 +867,7 @@ mod cuda_impl {
 
 #[cfg(target_os = "linux")]
 pub(crate) use cuda_impl::{
-    gemm_abt_strided_batched_cuda, gemm_broadcast_b_batched_cuda, gemm_cuda, gemm_on_ordinal_cuda,
-    gemv_cuda, joint_hessian_2x2_cuda, trsm_cuda, xt_diag_x_cuda, xt_diag_x_on_ordinal_cuda,
-    xt_diag_y_cuda, ResidentWeightedGram,
+    ResidentWeightedGram, gemm_abt_strided_batched_cuda, gemm_broadcast_b_batched_cuda, gemm_cuda,
+    gemm_on_ordinal_cuda, gemv_cuda, joint_hessian_2x2_cuda, trsm_cuda, xt_diag_x_cuda,
+    xt_diag_x_on_ordinal_cuda, xt_diag_y_cuda,
 };

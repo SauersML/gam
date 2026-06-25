@@ -457,9 +457,7 @@ impl PredictionTransform for BinomialLocationScalePredictor {
                     covariance_corrected_used,
                 })
             }
-            PredictPass::PosteriorMean => {
-                self.posterior_mean_state(input, fit)
-            }
+            PredictPass::PosteriorMean => self.posterior_mean_state(input, fit),
         }
     }
 
@@ -503,7 +501,6 @@ impl PredictableModel for BinomialLocationScalePredictor {
     ) -> Result<PredictionWithSE, EstimationError> {
         self.predict_with_uncertainty_inner(input)
     }
-
 
     fn predict_full_uncertainty(
         &self,

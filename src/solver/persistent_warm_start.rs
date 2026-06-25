@@ -1,4 +1,4 @@
-use crate::warm_start::{EntryKind, Fingerprinter, StoreOptions, WarmStartStore};
+use gam_runtime::warm_start::{EntryKind, Fingerprinter, StoreOptions, WarmStartStore};
 use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -282,18 +282,20 @@ fn persistent_store() -> Option<WarmStartStore> {
         .clone()
 }
 
-/// Open a [`crate::warm_start::Session`] for outer-iterate (rho-axis) checkpoints.
+/// Open a [`gam_runtime::warm_start::Session`] for outer-iterate (rho-axis) checkpoints.
 ///
 /// Uses a different fingerprint tag than the inner `warm-start-key`
 /// absorption (see [`load_json_record`]) so the outer-iterate keyspace
 /// is disjoint from the inner beta-record keyspace —
 /// the two layers persist different payload shapes and must not alias.
-pub(crate) fn open_outer_session(key: &str) -> Option<std::sync::Arc<crate::warm_start::Session>> {
+pub(crate) fn open_outer_session(
+    key: &str,
+) -> Option<std::sync::Arc<gam_runtime::warm_start::Session>> {
     let store = persistent_store()?;
     let mut fp = Fingerprinter::new();
     fp.absorb_str(b"outer-iterate-key", key);
     let fp = fp.finalize();
-    Some(std::sync::Arc::new(crate::warm_start::Session::open(
+    Some(std::sync::Arc::new(gam_runtime::warm_start::Session::open(
         store, fp,
     )))
 }

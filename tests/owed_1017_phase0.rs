@@ -71,7 +71,9 @@ fn bare_atom(name: &str) -> FittedAtom {
 
 /// A `FittedSaeManifold` carrying `n_atoms` bare atoms named `atom_0..`.
 fn model_with_atoms(n_atoms: usize) -> FittedSaeManifold {
-    let atoms: Vec<FittedAtom> = (0..n_atoms).map(|k| bare_atom(&format!("atom_{k}"))).collect();
+    let atoms: Vec<FittedAtom> = (0..n_atoms)
+        .map(|k| bare_atom(&format!("atom_{k}")))
+        .collect();
     FittedSaeManifold {
         atoms,
         jacobian_rows: Vec::new(),
@@ -156,7 +158,10 @@ fn ladder_parallel_matches_sequential_1017() {
     // Input-order preservation: report k is atom k in both paths.
     for (k, (par, seq)) in parallel.iter().zip(sequential.iter()).enumerate() {
         assert_eq!(par.atom_index, k, "parallel report {k} out of input order");
-        assert_eq!(seq.atom_index, k, "sequential report {k} out of input order");
+        assert_eq!(
+            seq.atom_index, k,
+            "sequential report {k} out of input order"
+        );
         assert_eq!(par.atom_name, format!("atom_{k}"));
     }
     // Byte-exact parity of the full report payloads.

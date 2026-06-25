@@ -265,8 +265,8 @@ fn underscore_param_name(param: &str) -> Option<String> {
 fn assert_fn_has_no_underscore_param(rel_path: &str, fn_name: &str) {
     let manifest = env!("CARGO_MANIFEST_DIR");
     let path = Path::new(manifest).join(rel_path);
-    let content = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let content =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     let cleaned = cleaned_source(&content);
     let Some(params) = fn_param_list(&cleaned, fn_name) else {
         // The function was removed/renamed entirely — the offending parameter

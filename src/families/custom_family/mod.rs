@@ -41,7 +41,6 @@ pub(crate) use crate::reml_contracts::{
     DenseMatrixHyperOperator, DriftDerivResult, FixedDriftDerivFn, HyperCoord, HyperCoordDrift,
     HyperCoordPair, HyperOperator,
 };
-pub(crate) use crate::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use crate::solver::active_set::{
     project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
 };
@@ -59,6 +58,7 @@ pub(crate) use crate::solver::estimate::{
 };
 pub(crate) use crate::types::{RidgeDeterminantMode, RidgePolicy};
 pub(crate) use faer::Side;
+pub(crate) use gam_runtime::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use joint_newton::whitened_spectrum;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
 pub(crate) use persistent_warm_start::{

@@ -1803,7 +1803,9 @@ mod tests {
             phi[[row, 0]] = 1.0;
             for col in 1..m {
                 // Deterministic LCG in [-1, 1).
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let u = ((s >> 11) as f64) / ((1u64 << 53) as f64);
                 phi[[row, col]] = 2.0 * u - 1.0;
             }
@@ -1837,7 +1839,9 @@ mod tests {
         let mut s = 0xD00D_u64;
         for r in 0..(m_a * m_b) {
             for c in 0..p {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let u = ((s >> 11) as f64) / ((1u64 << 53) as f64);
                 decoder[[r, c]] = 2.0 * u - 1.0;
             }
@@ -1869,12 +1873,18 @@ mod tests {
         for c in input.coeffs {
             assert_eq!(c.dim(), (m_a, m_b));
         }
-        assert_eq!(bundle.joint_covariance.dim(), (p * m_a * m_b, p * m_a * m_b));
+        assert_eq!(
+            bundle.joint_covariance.dim(),
+            (p * m_a * m_b, p * m_a * m_b)
+        );
 
         // The carve runs end-to-end on the producer's output.
         let report = carve(&input, 0.05).expect("carve on producer output");
         assert_eq!(report.notion, BindingNotion::Representational);
-        assert!(report.edge_p_value.is_some(), "binding p-value must be produced");
+        assert!(
+            report.edge_p_value.is_some(),
+            "binding p-value must be produced"
+        );
     }
 
     /// A non-separable fused basis (not a Kronecker product of two factors) is

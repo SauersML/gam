@@ -104,12 +104,7 @@ fn max_lambda(fit: &FitResult) -> f64 {
     let FitResult::Standard(std_fit) = fit else {
         panic!("expected a standard Gaussian fit");
     };
-    std_fit
-        .fit
-        .lambdas
-        .iter()
-        .copied()
-        .fold(0.0_f64, f64::max)
+    std_fit.fit.lambdas.iter().copied().fold(0.0_f64, f64::max)
 }
 
 #[test]

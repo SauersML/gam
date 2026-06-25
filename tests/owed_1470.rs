@@ -26,13 +26,13 @@
 //! asserts they are within a small factor. Truth is exact (noiseless `y`), so
 //! recovery RMSE is an absolute quality metric, not a tool-match.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use std::f64::consts::PI;
 

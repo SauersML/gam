@@ -289,7 +289,7 @@ pub fn start() {
     process_monitor();
 }
 
-pub(crate) fn track_scope(label: impl Into<String>) -> ProcessScopeGuard {
+pub fn track_scope(label: impl Into<String>) -> ProcessScopeGuard {
     push_scope(label.into(), None)
 }
 

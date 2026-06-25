@@ -275,7 +275,10 @@ fn aniso_matern_full_outer_loop_recovers_planted_signal_r2() {
     };
 
     let pred = fitted.design.design.to_dense().dot(&fitted.fit.beta);
-    assert!(pred.iter().all(|v: &f64| v.is_finite()), "predictions must be finite");
+    assert!(
+        pred.iter().all(|v: &f64| v.is_finite()),
+        "predictions must be finite"
+    );
 
     // R² against the planted truth. The signal is noise-free and 1-D-effective
     // (sin(2·x1)), so a correctly-directed anisotropic fit — which tightens the
@@ -461,16 +464,14 @@ fn fit_aniso_recovery(double_penalty: bool, num_centers: usize) -> AnisoRecovery
 #[test]
 fn aniso_matern_recovery_ablation_measures_true_ceiling() {
     let configs = [
-        (true, 30usize),  // the failing merge-gate config
-        (false, 30usize), // same budget, single (bending) penalty only
-        (true, 60usize),  // more capacity, double penalty
-        (false, 60usize), // more capacity, single penalty
+        (true, 30usize),   // the failing merge-gate config
+        (false, 30usize),  // same budget, single (bending) penalty only
+        (true, 60usize),   // more capacity, double penalty
+        (false, 60usize),  // more capacity, single penalty
         (false, 120usize), // ample capacity, single penalty
     ];
 
-    println!(
-        "\n#1376 aniso-Matérn recovery ablation (noise-free y=sin(2·x1), n=180, ν=5/2):"
-    );
+    println!("\n#1376 aniso-Matérn recovery ablation (noise-free y=sin(2·x1), n=180, ν=5/2):");
     println!(
         "  {:>6} {:>8} {:>8} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9}",
         "dpen", "centers", "R2", "ss_res", "ss_tot", "eta0", "eta1", "ell", "amp_ratio"
@@ -495,7 +496,10 @@ fn aniso_matern_recovery_ablation_measures_true_ceiling() {
         );
 
         assert!(rep.r2.is_finite(), "R² must be finite");
-        assert!(rep.ss_res.is_finite() && rep.ss_tot > 0.0, "SS must be finite/positive");
+        assert!(
+            rep.ss_res.is_finite() && rep.ss_tot > 0.0,
+            "SS must be finite/positive"
+        );
         assert!(
             rep.eta.len() == 2 && rep.eta.iter().all(|v| v.is_finite()),
             "two finite eta contrasts expected"

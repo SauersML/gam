@@ -73,16 +73,17 @@ pub(crate) use gam::geometry::simplex::{closure as simplex_closure, simplex_frec
 
 pub(crate) use gam::inference::hmc::{NutsConfig, NutsResult};
 
-pub(crate) use gam::inference::data::{
-    EncodedDataset, UnseenCategoryPolicy, encode_recordswith_schema, infer_and_encode_column_major,
+pub(crate) use gam::data::{
+    ColumnKindTag, DataSchema, EncodedDataset, SchemaColumn, UnseenCategoryPolicy,
+    encode_recordswith_schema, infer_and_encode_column_major,
 };
 
 pub(crate) use gam::inference::formula_dsl::{parse_formula, parse_surv_response};
 
 pub(crate) use gam::inference::model::{
-    ColumnKindTag, DataSchema, FittedFamily, FittedModel, FittedModelPayload, GroupMetadata,
-    MODEL_PAYLOAD_VERSION, ModelKind, PredictModelClass, SavedDeploymentExtension,
-    SavedLatentZNormalization, SchemaColumn, append_deployment_extension_columns,
+    FittedFamily, FittedModel, FittedModelPayload, GroupMetadata, MODEL_PAYLOAD_VERSION, ModelKind,
+    PredictModelClass, SavedDeploymentExtension, SavedLatentZNormalization,
+    append_deployment_extension_columns,
 };
 
 pub(crate) use gam::inference::model_payload_builders::{
@@ -158,9 +159,7 @@ pub(crate) use gam::terms::dictionary::{
     LinearDictionaryAssignment, LinearDictionaryConfig, fit_linear_dictionary,
 };
 
-pub(crate) use gam::terms::sae::sparse_dict::{
-    SparseDictConfig, fit_sparse_dictionary,
-};
+pub(crate) use gam::terms::sae::sparse_dict::{SparseDictConfig, fit_sparse_dictionary};
 
 pub(crate) use gam::terms::sae::manifold::{
     AssignmentMode, CylinderHarmonicEvaluator, DuchonCoordinateEvaluator, EuclideanPatchEvaluator,

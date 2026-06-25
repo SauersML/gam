@@ -90,7 +90,6 @@ impl TensorProductDesignOperator {
         })
     }
 
-
     /// Compute Xβ via column-wise BLAS matvecs across all n observations.
     ///
     /// β is conceptually a (q₁, q₂, …, qₖ) tensor.  We iterate over all

@@ -160,18 +160,14 @@ pub trait JetScalar<const K: usize>: Copy {
     /// consumes ([`crate::jet_tower::ln_gamma_derivative_stack`]), so any
     /// program written over both matches term-for-term.
     fn ln_gamma(&self) -> Self {
-        self.compose_unary(crate::jet_tower::ln_gamma_derivative_stack(
-            self.value(),
-        ))
+        self.compose_unary(crate::jet_tower::ln_gamma_derivative_stack(self.value()))
     }
 
     /// `ψ(self) = d/dx ln Γ(x)` (digamma). Caller guarantees a positive
     /// argument. Same hand-certified stack
     /// [`crate::jet_tower::digamma_derivative_stack`].
     fn digamma(&self) -> Self {
-        self.compose_unary(crate::jet_tower::digamma_derivative_stack(
-            self.value(),
-        ))
+        self.compose_unary(crate::jet_tower::digamma_derivative_stack(self.value()))
     }
 }
 
@@ -642,7 +638,7 @@ impl<const K: usize> JetScalar<K> for crate::jet_tower::Tower4<K> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jet_tower::{evaluate_program, RowNllProgram, Tower4};
+    use crate::jet_tower::{RowNllProgram, Tower4, evaluate_program};
 
     /// A small polynomial-plus-unary row expression written ONCE, generically
     /// over `S: JetScalar<2>`, so it can be evaluated against every scalar:
@@ -795,7 +791,11 @@ mod tests {
         let truth4 = t.fourth_contracted(&U, &V);
         for a in 0..2 {
             for b in 0..2 {
-                close(fourth[a][b], truth4[a][b], &format!("seam fourth[{a}][{b}]"));
+                close(
+                    fourth[a][b],
+                    truth4[a][b],
+                    &format!("seam fourth[{a}][{b}]"),
+                );
             }
         }
     }
@@ -817,7 +817,11 @@ mod tests {
         for a in 0..2 {
             close(s.g[a], t.g[a], &format!("tower-jetscalar grad[{a}]"));
             for b in 0..2 {
-                close(s.h[a][b], t.h[a][b], &format!("tower-jetscalar hess[{a}][{b}]"));
+                close(
+                    s.h[a][b],
+                    t.h[a][b],
+                    &format!("tower-jetscalar hess[{a}][{b}]"),
+                );
                 for c in 0..2 {
                     close(
                         s.t3[a][b][c],

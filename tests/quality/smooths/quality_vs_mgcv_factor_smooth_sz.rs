@@ -119,9 +119,19 @@ fn gam_factor_smooth_sz_matches_mgcv() {
     eprintln!(
         "[#1074-sz] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged={} iters={}",
         gam_edf,
-        fit.fit.edf_by_block().iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-        fit.fit.log_lambdas.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-        fit.fit.reml_score, fit.fit.outer_converged, fit.fit.outer_iterations,
+        fit.fit
+            .edf_by_block()
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>(),
+        fit.fit
+            .log_lambdas
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>(),
+        fit.fit.reml_score,
+        fit.fit.outer_converged,
+        fit.fit.outer_iterations,
     );
 
     // gam fitted values at the training rows (identity link => design*beta).

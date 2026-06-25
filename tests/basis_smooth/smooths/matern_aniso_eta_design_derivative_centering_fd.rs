@@ -182,7 +182,9 @@ fn aniso_design_raw_psi_second_diagonal_matches_single_axis_fd() {
         let analytic = &deriv.design_second_diag[a];
         assert_eq!(fd.raw_dim(), analytic.raw_dim(), "shape mismatch axis {a}");
         let scale = analytic.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
-        let max_err = (&fd - analytic).iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+        let max_err = (&fd - analytic)
+            .iter()
+            .fold(0.0_f64, |m, &v| m.max(v.abs()));
         assert!(
             max_err < 2e-3 * scale.max(1.0),
             "aniso design raw-psi second-diagonal mismatch on axis {a}: max_err={max_err:.3e} \

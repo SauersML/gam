@@ -139,12 +139,14 @@ fn realized_design_uses_effective_length_kernel_gram_1404() {
     else {
         panic!("expected ConstantCurvature metadata");
     };
-    assert_eq!(*meta_len, LENGTH_SCALE, "metadata stores κ=0 reference length");
+    assert_eq!(
+        *meta_len, LENGTH_SCALE,
+        "metadata stores κ=0 reference length"
+    );
     let z = constraint_transform.as_ref().expect("constraint transform");
 
-    let ell_eff =
-        constant_curvature_effective_length(pts.view(), pts.view(), LENGTH_SCALE, kappa)
-            .expect("effective length");
+    let ell_eff = constant_curvature_effective_length(pts.view(), pts.view(), LENGTH_SCALE, kappa)
+        .expect("effective length");
     assert!(
         (ell_eff - LENGTH_SCALE).abs() > 1e-6,
         "at κ=0.4 the effective length must differ from the reference (got {ell_eff})"
@@ -210,9 +212,8 @@ fn primary_penalty_is_raw_kernel_gram_no_ridge_1404() {
         panic!("expected ConstantCurvature metadata");
     };
     let z = constraint_transform.as_ref().expect("constraint transform");
-    let ell_eff =
-        constant_curvature_effective_length(pts.view(), pts.view(), LENGTH_SCALE, kappa)
-            .expect("effective length");
+    let ell_eff = constant_curvature_effective_length(pts.view(), pts.view(), LENGTH_SCALE, kappa)
+        .expect("effective length");
     let raw = constant_curvature_kernel_matrix(pts.view(), pts.view(), kappa, ell_eff)
         .expect("raw kernel");
     let gram = z.t().dot(&raw).dot(z);

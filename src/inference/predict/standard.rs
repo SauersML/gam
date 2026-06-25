@@ -228,9 +228,7 @@ impl PredictionTransform for StandardPredictor {
                     covariance_corrected_used,
                 })
             }
-            PredictPass::PosteriorMean => {
-                self.wiggle_posterior_mean_state(input, fit)
-            }
+            PredictPass::PosteriorMean => self.wiggle_posterior_mean_state(input, fit),
         }
     }
 
@@ -334,7 +332,6 @@ impl PredictableModel for StandardPredictor {
             mean_se,
         })
     }
-
 
     fn predict_full_uncertainty(
         &self,

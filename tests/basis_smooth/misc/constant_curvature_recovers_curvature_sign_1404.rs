@@ -101,7 +101,9 @@ fn profiled_reml(b: &Array2<f64>, y: &Array1<f64>, s: &Array2<f64>) -> f64 {
     for grid in -24i32..=24 {
         let lam = (0.5 * f64::from(grid)).exp();
         let h = {
-            let m = &btb + &s_sym.mapv(|v| v * lam) + &(Array2::<f64>::eye(p) * (1e-10 * s_max.max(1.0)));
+            let m = &btb
+                + &s_sym.mapv(|v| v * lam)
+                + &(Array2::<f64>::eye(p) * (1e-10 * s_max.max(1.0)));
             (&m + &m.t()) * 0.5
         };
         let (hv, hq) = FaerEigh::eigh(&h, faer::Side::Lower).unwrap();

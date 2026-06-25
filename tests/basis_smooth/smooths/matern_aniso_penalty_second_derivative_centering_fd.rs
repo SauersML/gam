@@ -75,11 +75,18 @@ fn aniso_penalty_raw_psi_second_derivative_matches_single_axis_fd() {
     let dim = psi0.len();
     assert_eq!(deriv.penalties_second_diag.len(), dim);
     let num_blocks = deriv.penalties_second_diag[0].len();
-    assert!(num_blocks >= 1, "expected at least the primary penalty block");
+    assert!(
+        num_blocks >= 1,
+        "expected at least the primary penalty block"
+    );
 
     let realized_at = |psi: &[f64]| realized_penalties_at_psi(&data, &spec, psi);
     let s0 = realized_at(&psi0);
-    assert_eq!(s0.len(), num_blocks, "block count must match realized penalty");
+    assert_eq!(
+        s0.len(),
+        num_blocks,
+        "block count must match realized penalty"
+    );
 
     let h = 1e-4;
     for a in 0..dim {
@@ -99,7 +106,9 @@ fn aniso_penalty_raw_psi_second_derivative_matches_single_axis_fd() {
                 "shape mismatch axis {a} block {blk}"
             );
             let scale = analytic.iter().fold(1.0_f64, |m, &v| m.max(v.abs()));
-            let max_err = (&fd - analytic).iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
+            let max_err = (&fd - analytic)
+                .iter()
+                .fold(0.0_f64, |m, &v| m.max(v.abs()));
             // Second-difference FD has O(h²) truncation + O(ε/h²) round-off; with
             // h=1e-4 the achievable tolerance is ~1e-3·scale.
             assert!(

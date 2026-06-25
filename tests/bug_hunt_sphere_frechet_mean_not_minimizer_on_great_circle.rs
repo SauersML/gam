@@ -28,19 +28,14 @@
 //! assertion holds without edits.
 
 use gam::geometry::sphere::sphere_frechet_mean;
-use ndarray::{array, ArrayView1, ArrayView2};
+use ndarray::{ArrayView1, ArrayView2, array};
 
 /// Sum of squared geodesic distances on the unit sphere (uniform weights).
 fn karcher_objective(points: ArrayView2<'_, f64>, mu: ArrayView1<'_, f64>) -> f64 {
     let mu_norm = (mu.iter().map(|v| v * v).sum::<f64>()).sqrt();
     let mut acc = 0.0;
     for row in points.rows() {
-        let dot: f64 = row
-            .iter()
-            .zip(mu.iter())
-            .map(|(a, b)| a * b)
-            .sum::<f64>()
-            / mu_norm;
+        let dot: f64 = row.iter().zip(mu.iter()).map(|(a, b)| a * b).sum::<f64>() / mu_norm;
         let d = dot.clamp(-1.0, 1.0).acos();
         acc += d * d;
     }
@@ -51,11 +46,7 @@ fn karcher_objective(points: ArrayView2<'_, f64>, mu: ArrayView1<'_, f64>) -> f6
 fn sphere_frechet_mean_is_a_genuine_minimizer_on_an_equatorial_triangle() {
     // Equilateral triangle on the equator: angles 0, 2π/3, 4π/3.
     let s = (3.0_f64).sqrt() / 2.0; // sin(2π/3) = √3/2
-    let points = array![
-        [1.0, 0.0, 0.0],
-        [-0.5, s, 0.0],
-        [-0.5, -s, 0.0],
-    ];
+    let points = array![[1.0, 0.0, 0.0], [-0.5, s, 0.0], [-0.5, -s, 0.0],];
 
     let mu = sphere_frechet_mean(points.view(), None, 1.0e-12, 256)
         .expect("spherical Fréchet mean should be identifiable for a triangle on the equator");

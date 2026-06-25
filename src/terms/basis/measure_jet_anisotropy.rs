@@ -52,7 +52,7 @@ use faer::Side;
 
 use crate::linalg::faer_ndarray::FaerEigh;
 
-use super::{measure_jet_energy_form, BasisError, MeasureJetBand};
+use super::{BasisError, MeasureJetBand, measure_jet_energy_form};
 
 /// Truncation radius of the Gaussian profile in units of the scale ε,
 /// mirroring `measure_jet_smooth`: weights beyond `3ε` (metric distance) are

@@ -4197,7 +4197,7 @@ fn string_records_from_rows(
             // before the schema-guided encode matches a cell against a level.
             let cleaned: Vec<&str> = row
                 .iter()
-                .map(|cell| gam::inference::data::strip_categorical_sentinel(cell).0)
+                .map(|cell| gam::data::strip_categorical_sentinel(cell).0)
                 .collect();
             Ok(StringRecord::from(cleaned))
         })

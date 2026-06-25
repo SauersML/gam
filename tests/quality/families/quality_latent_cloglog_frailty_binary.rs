@@ -38,8 +38,8 @@
 //! is recovery of the analytically-known generating marginal, with the plain
 //! cloglog GAM as the misspecified tool-free baseline.
 
-use gam::families::inverse_link::apply_inverse_link_spec_vec;
 use gam::estimate::FittedLinkState;
+use gam::families::inverse_link::apply_inverse_link_spec_vec;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::rmse;
@@ -86,7 +86,11 @@ fn gam_latent_cloglog_recovers_frailty_marginal_probability() {
         // Conditional cloglog probability given the latent frailty draw.
         let eta_cond = eta_true(xi) + ui;
         let p_cond = 1.0 - (-(eta_cond.exp())).exp();
-        let draw = if u01.sample(&mut rng) < p_cond { 1.0 } else { 0.0 };
+        let draw = if u01.sample(&mut rng) < p_cond {
+            1.0
+        } else {
+            0.0
+        };
         x.push(xi);
         y.push(draw);
     }
@@ -126,17 +130,16 @@ fn gam_latent_cloglog_recovers_frailty_marginal_probability() {
     let x_idx = col["x"];
     let p_cols = ds.headers.len();
 
-    let eta_at_train = |resolvedspec: &gam::smooth::TermCollectionSpec,
-                        beta: &ndarray::Array1<f64>|
-     -> Vec<f64> {
-        let mut grid = Array2::<f64>::zeros((N, p_cols));
-        for i in 0..N {
-            grid[[i, x_idx]] = x[i];
-        }
-        let design = build_term_collection_design(grid.view(), resolvedspec)
-            .expect("rebuild s(x) design at training points");
-        design.design.apply(beta).to_vec()
-    };
+    let eta_at_train =
+        |resolvedspec: &gam::smooth::TermCollectionSpec, beta: &ndarray::Array1<f64>| -> Vec<f64> {
+            let mut grid = Array2::<f64>::zeros((N, p_cols));
+            for i in 0..N {
+                grid[[i, x_idx]] = x[i];
+            }
+            let design = build_term_collection_design(grid.view(), resolvedspec)
+                .expect("rebuild s(x) design at training points");
+            design.design.apply(beta).to_vec()
+        };
 
     // ---- fit gam with the latent-cloglog binomial family --------------------
     let cfg_latent = FitConfig {
@@ -148,7 +151,10 @@ fn gam_latent_cloglog_recovers_frailty_marginal_probability() {
     let FitResult::Standard(fit_latent) = result_latent else {
         panic!("expected a standard GAM fit for latent-cloglog-binomial s(x)");
     };
-    let latent_edf = fit_latent.fit.edf_total().expect("gam reports total edf (latent)");
+    let latent_edf = fit_latent
+        .fit
+        .edf_total()
+        .expect("gam reports total edf (latent)");
 
     // The fitted family must actually be latent-cloglog.
     let latent_state_link = match &fit_latent.fit.fitted_link {

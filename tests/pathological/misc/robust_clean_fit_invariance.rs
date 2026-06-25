@@ -223,7 +223,6 @@ fn run_clean_fit() -> CleanFit {
 /// `ker(S)` — does not bias genuine smooth fits.
 #[test]
 fn full_span_jeffreys_is_invisible_on_clean_well_identified_bms_fit() {
-
     let fit = run_clean_fit();
 
     assert!(fit.all_finite, "non-finite β on a clean fit");

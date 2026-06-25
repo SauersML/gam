@@ -105,7 +105,7 @@ impl From<String> for PredictInputError {
     }
 }
 
-impl From<crate::inference::data::DataError> for PredictInputError {
+impl From<gam_data::DataError> for PredictInputError {
     /// Inbound conversion from the typed data-layer error channel
     /// (`resolve_col` / `resolve_role_col` returning
     /// `DataError::ColumnNotFound` for formula-referenced columns missing
@@ -115,7 +115,7 @@ impl From<crate::inference::data::DataError> for PredictInputError {
     /// classification, but the FFI boundary path that needs the structured
     /// payload (issue #305) routes through `WorkflowError::ColumnNotFound`,
     /// not through this conversion.
-    fn from(err: crate::inference::data::DataError) -> PredictInputError {
+    fn from(err: gam_data::DataError) -> PredictInputError {
         PredictInputError::InvalidInput {
             reason: err.to_string(),
         }

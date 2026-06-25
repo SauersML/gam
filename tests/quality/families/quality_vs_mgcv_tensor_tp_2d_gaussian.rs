@@ -95,9 +95,19 @@ fn gam_thin_plate_2d_matches_mgcv_gaussian() {
     eprintln!(
         "[#1074-tp2d] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged={} iters={}",
         fit.fit.edf_total().unwrap_or(f64::NAN),
-        fit.fit.edf_by_block().iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-        fit.fit.log_lambdas.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-        fit.fit.reml_score, fit.fit.outer_converged, fit.fit.outer_iterations,
+        fit.fit
+            .edf_by_block()
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>(),
+        fit.fit
+            .log_lambdas
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>(),
+        fit.fit.reml_score,
+        fit.fit.outer_converged,
+        fit.fit.outer_iterations,
     );
 
     // gam fitted values at the training grid: rebuild the design from the

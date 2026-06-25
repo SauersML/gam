@@ -60,7 +60,10 @@ fn build_data(seed: u64) -> gam::data::EncodedDataset {
     for _ in 0..N {
         let xi = rng.next_unit();
         let yi = rng.next_gamma_shape2(truth_mean(xi) / 2.0);
-        assert!(yi.is_finite() && yi > 0.0, "constructed y must be positive finite");
+        assert!(
+            yi.is_finite() && yi > 0.0,
+            "constructed y must be positive finite"
+        );
         x.push(xi);
         y.push(yi);
     }

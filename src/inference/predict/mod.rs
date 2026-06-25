@@ -861,10 +861,7 @@ pub struct PredictionWithSE {
 /// back so [`PredictableModel::predict_dispersion_scale`] can evaluate it.
 pub trait PerRowDispersionChannel {
     /// Per-row dispersion in the generative `NoiseModel`'s own units.
-    fn per_row_dispersion(
-        &self,
-        input: &PredictInput,
-    ) -> Result<Array1<f64>, EstimationError>;
+    fn per_row_dispersion(&self, input: &PredictInput) -> Result<Array1<f64>, EstimationError>;
 }
 
 /// Trait for models that can produce predictions from new data.

@@ -41,7 +41,6 @@
 //! `bump = scale · ε^½ · 1024` to `ridge_t` and re-launches, the same Ceres-
 //! style geometric escalation the CPU path already implements.
 
-
 use crate::solver::arrow_schur::ArrowSchurSystem;
 
 /// Fused-kernel dispatch admission. Returns `true` when the workload shape

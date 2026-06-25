@@ -112,7 +112,10 @@ fn rhs_for(k: usize) -> Array1<f64> {
     Array1::from_iter((0..k).map(|j| 0.3 * ((j + 1) as f64).sin() + 0.1 * (j as f64).cos()))
 }
 
-fn study(sys: &ArrowSchurSystem, k: usize) -> Vec<(SchurPreconditionerKind, Option<PrecondLadderRow>)> {
+fn study(
+    sys: &ArrowSchurSystem,
+    k: usize,
+) -> Vec<(SchurPreconditionerKind, Option<PrecondLadderRow>)> {
     let (pcg, trust) = tight_options(k);
     let rhs = rhs_for(k);
     arrow_precond_ladder_iteration_study(sys, 1e-8, &rhs, &pcg, &trust)
@@ -153,8 +156,14 @@ fn precond_ladder_converges_and_richer_tiers_help_on_dense_coupling() {
     let diag = row_of(&rows, SchurPreconditionerKind::Diagonal);
     let block = row_of(&rows, SchurPreconditionerKind::BetaBlockJacobi);
     let cluster = row_of(&rows, SchurPreconditionerKind::ClusterJacobi);
-    let schwarz = row_of(&rows, SchurPreconditionerKind::AdditiveSchwarz { overlap: 1 });
-    let diag_schwarz = row_of(&rows, SchurPreconditionerKind::DiagAssembledSchwarz { overlap: 1 });
+    let schwarz = row_of(
+        &rows,
+        SchurPreconditionerKind::AdditiveSchwarz { overlap: 1 },
+    );
+    let diag_schwarz = row_of(
+        &rows,
+        SchurPreconditionerKind::DiagAssembledSchwarz { overlap: 1 },
+    );
     let ic0 = row_of(&rows, SchurPreconditionerKind::BlockIncompleteCholesky);
 
     // The full per-tier iteration table — the #299 deliverable measurement.
@@ -229,7 +238,11 @@ fn ic0_reduces_pcg_iterations_versus_block_jacobi_on_banded_coupling() {
 
     eprintln!(
         "[#299 banded] block_jacobi_iters={} (conv={}) ic0_iters={} (conv={}) ic0_rel_resid={:e}",
-        block.iterations, block.converged, ic0.iterations, ic0.converged, ic0.final_relative_residual
+        block.iterations,
+        block.converged,
+        ic0.iterations,
+        ic0.converged,
+        ic0.final_relative_residual
     );
 
     assert!(

@@ -143,7 +143,10 @@ fn hetero_multinomial_recovers_true_simplex_at_true_df_basis_1373() {
         true_prob_by_code.push(p);
     }
 
-    let headers: Vec<String> = ["x1", "x2", "x3", "y"].iter().map(|s| s.to_string()).collect();
+    let headers: Vec<String> = ["x1", "x2", "x3", "y"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let rows: Vec<StringRecord> = (0..N_HETERO)
         .map(|i| {
             StringRecord::from(vec![
@@ -169,10 +172,18 @@ fn hetero_multinomial_recovers_true_simplex_at_true_df_basis_1373() {
         1e-8,
     )
     .expect("gam hetero multinomial fit");
-    assert_eq!(model.class_levels.len(), K, "gam should recover K=3 classes");
+    assert_eq!(
+        model.class_levels.len(),
+        K,
+        "gam should recover K=3 classes"
+    );
 
     let gam_probs = predict_multinomial_formula(&model, &ds).expect("gam predict probabilities");
-    assert_eq!(gam_probs.dim(), (N_HETERO, K), "gam probability matrix shape");
+    assert_eq!(
+        gam_probs.dim(),
+        (N_HETERO, K),
+        "gam probability matrix shape"
+    );
 
     // Probabilities must lie on the simplex (closure + range), independent of R.
     let mut worst_row_sum_err = 0.0_f64;

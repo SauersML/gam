@@ -155,9 +155,6 @@ fn matern_log_kappa_derivative_is_all_finite() {
         "matern d(design)/d(log kappa)",
     );
     for (k, pen) in dpsi.penalties_derivative.iter().enumerate() {
-        assert_all_finite(
-            pen.view(),
-            &format!("matern d(penalty #{k})/d(log kappa)"),
-        );
+        assert_all_finite(pen.view(), &format!("matern d(penalty #{k})/d(log kappa)"));
     }
 }

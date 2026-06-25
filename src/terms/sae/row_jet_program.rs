@@ -20,7 +20,7 @@
 //! `Γ_a = tr(H⁻¹ ∂H/∂θ_a)` is the consumer of those very channels.
 //!
 //! This module writes that reconstruction **once** over the
-//! [`Tower4<K>`](crate::families::jet_tower::Tower4) scalar so the
+//! [`Tower4<K>`](gam_math::jet_tower::Tower4) scalar so the
 //! value/gradient/Hessian/third channels of one row come from ONE jet
 //! evaluation. [`SaeReconstructionRowProgram`] is generic over the gate kind
 //! and the per-row basis jets; the gate, basis and decoder compose with plain
@@ -40,8 +40,8 @@
 //! correctness proof of the hand kernel; disagreement names a dropped or
 //! sign-flipped cross block loudly. That oracle is the riding test below.
 
-use crate::families::jet_scalar::{JetScalar, Order2};
-use crate::families::jet_tower::Tower4;
+use gam_math::jet_scalar::{JetScalar, Order2};
+use gam_math::jet_tower::Tower4;
 
 /// `1/self` for any [`JetScalar`] via Faà di Bruno on `f(u) = 1/u`
 /// (stack `[1/u, -1/u², 2/u³, -6/u⁴, 24/u⁵]`). Caller guarantees `self.value()`
@@ -53,13 +53,7 @@ fn recip<const K: usize, S: JetScalar<K>>(s: &S) -> S {
     let u3 = u2 * u;
     let u4 = u3 * u;
     let u5 = u4 * u;
-    s.compose_unary([
-        1.0 / u,
-        -1.0 / u2,
-        2.0 / u3,
-        -6.0 / u4,
-        24.0 / u5,
-    ])
+    s.compose_unary([1.0 / u, -1.0 / u2, 2.0 / u3, -6.0 / u4, 24.0 / u5])
 }
 
 /// Sentinel in [`SaeReconstructionRowProgram::coord_slot`] for an atom
@@ -154,7 +148,11 @@ impl AtomRowBasisJet {
     }
 
     /// `decoded_{k,c}(t)` as a tower: `Σ_b Φ_b(t)·B_{b,c}`.
-    fn decoded_tower<const K: usize, S: JetScalar<K>>(&self, out_col: usize, coord_slots: &[usize]) -> S {
+    fn decoded_tower<const K: usize, S: JetScalar<K>>(
+        &self,
+        out_col: usize,
+        coord_slots: &[usize],
+    ) -> S {
         let mut acc = S::constant(0.0);
         for basis_col in 0..self.n_basis() {
             let b = self.decoder[basis_col][out_col];
@@ -329,7 +327,7 @@ impl SaeReconstructionRowProgram {
     }
 
     /// The reconstruction output column `c` as the PACKED order-2 jet
-    /// [`Order2<K>`](crate::families::jet_scalar::Order2): value `.value()`,
+    /// [`Order2<K>`](gam_math::jet_scalar::Order2): value `.value()`,
     /// gradient `.g()[a] = ∂ẑ_c/∂p_a`, Hessian `.h()[a][b] = ∂²ẑ_c/∂p_a∂p_b`.
     ///
     /// This is the production path (#932): the arrow-Schur logdet consumer reads
@@ -458,7 +456,7 @@ impl SaeReconstructionRowProgram {
     }
 
     /// The β **border-channel** local-variable sub-jet as the PACKED order-2 jet
-    /// [`Order2<K>`](crate::families::jet_scalar::Order2). The consumer reads only
+    /// [`Order2<K>`](gam_math::jet_scalar::Order2). The consumer reads only
     /// `.value()` (the `beta` channel) and `.g()[a]` (the `beta_deriv` /
     /// `beta_l_deriv` mixed channel — the reconstruction is linear in β so the
     /// Hessian-in-β vanishes and only value+gradient are needed). Built from the

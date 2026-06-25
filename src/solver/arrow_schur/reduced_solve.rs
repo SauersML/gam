@@ -459,7 +459,11 @@ pub(crate) fn spectral_pd_floored_schur(
     let mut conditioned = Array2::<f64>::zeros((n, n));
     for eig_idx in 0..evals.len() {
         let lambda = evals[eig_idx];
-        let lambda_floored = if lambda.is_finite() { lambda.max(floor) } else { floor };
+        let lambda_floored = if lambda.is_finite() {
+            lambda.max(floor)
+        } else {
+            floor
+        };
         for i in 0..n {
             let vi = evecs[[i, eig_idx]];
             if vi == 0.0 {
@@ -496,10 +500,9 @@ pub(crate) fn solve_dense_reduced_system(
                             // subspace keeps its exact eigenvalues, so its Δβ is
                             // the exact Newton component; only the collapsed
                             // subspace is minimally damped.
-                            let direct = mixed_precision_reduced_beta(
-                                &floored, &factor, rhs_beta, options,
-                            )
-                            .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));
+                            let direct =
+                                mixed_precision_reduced_beta(&floored, &factor, rhs_beta, options)
+                                    .unwrap_or_else(|| cholesky_solve_vector(&factor, rhs_beta));
                             if step_inside_trust_region(
                                 direct.view(),
                                 options.trust_region.radius,
@@ -2634,8 +2637,7 @@ impl BlockIncompleteCholeskyPreconditioner {
                     // scalar reciprocal diagonal (mirrors the ClusterJacobi
                     // non-PD fallback), which is always applicable for a
                     // PD-floored Schur diagonal.
-                    let inv =
-                        build_schur_scalar_inv(sys, htt_factors, ridge_beta, backend, cols)?;
+                    let inv = build_schur_scalar_inv(sys, htt_factors, ridge_beta, backend, cols)?;
                     components.push(Ic0Factor::Scalar {
                         cols: cols.clone(),
                         inv,
@@ -2729,8 +2731,7 @@ pub(crate) fn incomplete_cholesky_level0(
     let mut val: Vec<f64> = Vec::new();
     // For O(1) "is (i,j) in pattern + where" lookups during the recurrence, keep
     // a per-column map from global row -> position in that column's value slice.
-    let mut col_pos: Vec<std::collections::HashMap<usize, usize>> =
-        Vec::with_capacity(b);
+    let mut col_pos: Vec<std::collections::HashMap<usize, usize>> = Vec::with_capacity(b);
     for j in 0..b {
         let ajj = a[[j, j]];
         let scale_j = ajj.abs().max(0.0).sqrt();
@@ -2896,7 +2897,10 @@ pub fn arrow_precond_ladder_iteration_study(
         AdditiveSchwarzPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend, 1)
             .ok()
             .and_then(|p| run(&|r| p.apply(r)));
-    out.push((SchurPreconditionerKind::AdditiveSchwarz { overlap: 1 }, schwarz_row));
+    out.push((
+        SchurPreconditionerKind::AdditiveSchwarz { overlap: 1 },
+        schwarz_row,
+    ));
 
     let diag_schwarz_row = DiagAssembledSchwarzPreconditioner::from_arrow_schur(
         sys,
@@ -2912,10 +2916,14 @@ pub fn arrow_precond_ladder_iteration_study(
         diag_schwarz_row,
     ));
 
-    let ic0_row =
-        BlockIncompleteCholeskyPreconditioner::from_arrow_schur(sys, &htt_factors, ridge_beta, &backend)
-            .ok()
-            .and_then(|p| run(&|r| p.apply(r)));
+    let ic0_row = BlockIncompleteCholeskyPreconditioner::from_arrow_schur(
+        sys,
+        &htt_factors,
+        ridge_beta,
+        &backend,
+    )
+    .ok()
+    .and_then(|p| run(&|r| p.apply(r)));
     out.push((SchurPreconditionerKind::BlockIncompleteCholesky, ic0_row));
 
     Ok(out)

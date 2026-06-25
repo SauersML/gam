@@ -102,10 +102,10 @@ pub fn survival_rigid_row_jets_cpu(
     dir_u: &[f64; 4],
     dir_v: &[f64; 4],
 ) -> SurvivalRowJetChannels {
-    use crate::families::jet_scalar::{JetScalar, OneSeed, TwoSeed};
     use crate::families::survival::marginal_slope::row_kernel::{
-        SparseOrder2, rigid_row_nll, RIGID_LINEAR_MASK,
+        RIGID_LINEAR_MASK, SparseOrder2, rigid_row_nll,
     };
+    use gam_math::jet_scalar::{JetScalar, OneSeed, TwoSeed};
     let n = rows.len();
     let mut value = vec![0.0_f64; n];
     let mut grad = vec![0.0_f64; n * 4];
@@ -226,7 +226,7 @@ pub const SURVIVAL_ROWJET_SOURCE: &str = include_str!("survival_rowjet_kernel.cu
 
 #[cfg(target_os = "linux")]
 mod device {
-    use super::{SurvivalRowInputs, SurvivalRowJetChannels, SURVIVAL_ROWJET_SOURCE};
+    use super::{SURVIVAL_ROWJET_SOURCE, SurvivalRowInputs, SurvivalRowJetChannels};
     use crate::gpu::gpu_error::{GpuError, GpuResultExt};
     use std::sync::{Arc, Mutex, OnceLock};
 
@@ -261,7 +261,10 @@ mod device {
         }
         let ptx = cudarc::nvrtc::compile_ptx(SURVIVAL_ROWJET_SOURCE)
             .gpu_ctx_with(|err| format!("survival_rowjet NVRTC compile: {err}"))?;
-        let m = b.ctx.load_module(ptx).gpu_ctx("survival_rowjet module load")?;
+        let m = b
+            .ctx
+            .load_module(ptx)
+            .gpu_ctx("survival_rowjet module load")?;
         if let Ok(mut guard) = b.module.lock() {
             guard.get_or_insert_with(|| m.clone());
         }
@@ -371,14 +374,24 @@ mod device {
         let mut hess = vec![0.0_f64; n * 16];
         let mut third = vec![0.0_f64; n * 16];
         let mut fourth = vec![0.0_f64; n * 16];
-        stream.memcpy_dtoh(&value_d, &mut value).gpu_ctx("dtoh value")?;
-        stream.memcpy_dtoh(&grad_d, &mut grad).gpu_ctx("dtoh grad")?;
-        stream.memcpy_dtoh(&hess_d, &mut hess).gpu_ctx("dtoh hess")?;
-        stream.memcpy_dtoh(&third_d, &mut third).gpu_ctx("dtoh third")?;
+        stream
+            .memcpy_dtoh(&value_d, &mut value)
+            .gpu_ctx("dtoh value")?;
+        stream
+            .memcpy_dtoh(&grad_d, &mut grad)
+            .gpu_ctx("dtoh grad")?;
+        stream
+            .memcpy_dtoh(&hess_d, &mut hess)
+            .gpu_ctx("dtoh hess")?;
+        stream
+            .memcpy_dtoh(&third_d, &mut third)
+            .gpu_ctx("dtoh third")?;
         stream
             .memcpy_dtoh(&fourth_d, &mut fourth)
             .gpu_ctx("dtoh fourth")?;
-        stream.synchronize().gpu_ctx("survival_rowjet synchronize")?;
+        stream
+            .synchronize()
+            .gpu_ctx("survival_rowjet synchronize")?;
 
         Ok(SurvivalRowJetChannels {
             n_rows: n,
@@ -425,8 +438,8 @@ mod tests {
         // thing the production `SurvivalMarginalSlopeRowKernel` calls. Cross-check
         // the (v,g,H) channels against a direct `Order2<4>` evaluation so the
         // flattening/layout is pinned to the single source.
-        use crate::families::jet_scalar::{JetScalar, Order2};
         use crate::families::survival::marginal_slope::row_kernel::rigid_row_nll;
+        use gam_math::jet_scalar::{JetScalar, Order2};
         let rows = fixture(7);
         let out = survival_rigid_row_jets_cpu(&rows, 0.7, &DIR, &DIRU, &DIRV);
         for (row, inp) in rows.iter().enumerate() {
@@ -463,8 +476,8 @@ mod tests {
         // single-source tensor exactly — the same property the device kernel's
         // JS1/JS2 channels rely on (and the device parity gate then matches THIS
         // CPU result to ≤1e-9).
-        use crate::families::jet_tower::Tower4;
         use crate::families::survival::marginal_slope::row_kernel::rigid_row_nll;
+        use gam_math::jet_tower::Tower4;
         let rows = fixture(9);
         let out = survival_rigid_row_jets_cpu(&rows, 0.7, &DIR, &DIRU, &DIRV);
         for (row, inp) in rows.iter().enumerate() {

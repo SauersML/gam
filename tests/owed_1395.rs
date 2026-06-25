@@ -609,8 +609,10 @@ fn owed_1395_matrix_free_pseudo_laplace_rho_gradient_matches_num_dual() {
         // chain-rule). The matrix-free 0.5·tr(H⁻¹ ∂H/∂ρ) term goes through the
         // same exact dense trace_hinv kernel as the objective's logdet, so the
         // analytic gradient must match this to tight tolerance.
-        let (value_nd, grad_nd) =
-            first_derivative(|x| diagonal_pseudo_laplace_rho_objective_numdual(x, &targets), rho);
+        let (value_nd, grad_nd) = first_derivative(
+            |x| diagonal_pseudo_laplace_rho_objective_numdual(x, &targets),
+            rho,
+        );
         assert_eq!(result.gradient.len(), 1, "scalar ρ gradient expected");
         let obj_tol = 1e-9 * (1.0 + value_nd.abs());
         assert!(

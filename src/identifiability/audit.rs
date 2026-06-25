@@ -3111,9 +3111,9 @@ fn dominant_block_for_direction(
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    use ndarray::Array2;
+
     use linspace as linspace_minus_one_to_one;
+    use ndarray::Array2;
 
     use crate::test_support::spec_from_dense;
 

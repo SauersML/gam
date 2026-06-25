@@ -2927,7 +2927,11 @@ mod tests {
         let eta = family.collect_eta_matrix(&states).expect("eta collect");
 
         let hand = family.assemble_all_axis_directional_derivatives(eta.view());
-        assert_eq!(hand.len(), total, "one directional matrix per canonical axis");
+        assert_eq!(
+            hand.len(),
+            total,
+            "one directional matrix per canonical axis"
+        );
 
         let eps = 1.0e-6;
         let mut max_rel = 0.0_f64;

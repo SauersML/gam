@@ -88,9 +88,9 @@ fn scanner_keeps_a_tracked_allowlist_constant() {
 #[test]
 fn known_sanctioned_fd_sites_stay_enumerated() {
     for site in [
-        "solver/pirls/reweight.rs",            // geodesic-acceleration curvature probe
+        "solver/pirls/reweight.rs", // geodesic-acceleration curvature probe
         "terms/sae/chart_canonicalization.rs", // SAE sphere-boost GN chart Jacobian
-        "solver/rho_optimizer/fd_audit.rs",    // FD-audit oracle (diagnostic only)
+        "solver/rho_optimizer/fd_audit.rs", // FD-audit oracle (diagnostic only)
     ] {
         assert!(
             SCANNER_SRC.contains(site),

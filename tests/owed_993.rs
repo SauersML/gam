@@ -225,9 +225,7 @@ fn producer_decoder_covariance_matches_dense_reference() {
         assert_eq!(vb_prod.dim(), (mm, mm));
 
         // Compare the two posteriors entrywise, relative to the reference scale.
-        let scale = vb_ref
-            .iter()
-            .fold(1e-30_f64, |mx, &v| mx.max(v.abs()));
+        let scale = vb_ref.iter().fold(1e-30_f64, |mx, &v| mx.max(v.abs()));
         let mut max_rel = 0.0_f64;
         for i in 0..mm {
             for j in 0..mm {
@@ -243,7 +241,10 @@ fn producer_decoder_covariance_matches_dense_reference() {
 
         // Spot-check the diagonal slice the band would read is positive.
         let diag0 = vb_prod[[0, 0]];
-        assert!(diag0 > 0.0, "covariance diagonal must be positive; got {diag0}");
+        assert!(
+            diag0 > 0.0,
+            "covariance diagonal must be positive; got {diag0}"
+        );
         let _ = &beta_ref.slice(s![.., d]);
     }
 }
@@ -277,8 +278,8 @@ fn fit_tensor_surface_recovers_planted_separable_surface() {
     for r in 0..n {
         let t1 = coords[[r, 0]];
         let t2 = coords[[r, 1]];
-        responses[[r, 0]] = (2.0 * std::f64::consts::PI * t1).sin()
-            + 0.7 * (2.0 * std::f64::consts::PI * t2).cos();
+        responses[[r, 0]] =
+            (2.0 * std::f64::consts::PI * t1).sin() + 0.7 * (2.0 * std::f64::consts::PI * t2).cos();
     }
 
     let fit = fit_tensor_surface(phi_a.view(), phi_b.view(), responses.view())

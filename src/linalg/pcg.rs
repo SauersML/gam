@@ -158,8 +158,8 @@ fn reordered_dot(a: &ArrayView1<f64>, b: &ArrayView1<f64>) -> f64 {
                 }
             }
             // Pairwise lane combine (balanced tree, not a serial sweep).
-            let mut s = ((acc[0] + acc[1]) + (acc[2] + acc[3]))
-                + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
+            let mut s =
+                ((acc[0] + acc[1]) + (acc[2] + acc[3])) + ((acc[4] + acc[5]) + (acc[6] + acc[7]));
             for i in (chunks * LANES)..n {
                 s += av[i] * bv[i];
             }
@@ -459,10 +459,8 @@ mod tests {
     #[test]
     fn dot_reordered_matches_serial_to_loose_tol() {
         for &n in &[7usize, 8, 9, 16, 100, 513, 1024, 4096] {
-            let a: Array1<f64> =
-                Array1::from_shape_fn(n, |i| ((i * 7 + 1) as f64).sin() * 3.0);
-            let b: Array1<f64> =
-                Array1::from_shape_fn(n, |i| ((i * 13 + 3) as f64).cos() * 2.0);
+            let a: Array1<f64> = Array1::from_shape_fn(n, |i| ((i * 7 + 1) as f64).sin() * 3.0);
+            let b: Array1<f64> = Array1::from_shape_fn(n, |i| ((i * 13 + 3) as f64).cos() * 2.0);
             let s = dot(&a.view(), &b.view(), DotReduction::Serial);
             let r = dot(&a.view(), &b.view(), DotReduction::Reordered);
             let rel = (s - r).abs() / s.abs().max(1e-300);

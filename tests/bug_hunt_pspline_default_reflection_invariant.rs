@@ -115,7 +115,9 @@ fn pspline_default_is_reflection_invariant() {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0_f64, f64::max);
 
-        eprintln!("seed {seed}: reflection drift={drift:.6}  lam_fwd={lam_fwd:?}  lam_rev={lam_rev:?}");
+        eprintln!(
+            "seed {seed}: reflection drift={drift:.6}  lam_fwd={lam_fwd:?}  lam_rev={lam_rev:?}"
+        );
 
         if drift > worst_drift {
             worst_drift = drift;

@@ -43,7 +43,7 @@ use std::time::Instant;
 
 use csv::StringRecord;
 use gam::{
-    encode_recordswith_inferred_schema, fit_from_formula, init_parallelism, FitConfig, FitResult,
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
 
 /// A tiny deterministic LCG. This is a hang/finiteness regression, not a

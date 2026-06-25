@@ -3482,11 +3482,14 @@ pub(crate) fn sae_kron_and_device_share_backing_alloc_1033() {
     let a_phi: std::sync::Arc<[Vec<(usize, f64)>]> = std::sync::Arc::from(
         vec![vec![(0usize, 2.0f64), (12, 1.0)], vec![(0, 0.5)]].into_boxed_slice(),
     );
-    let jac: std::sync::Arc<[Vec<f64>]> = std::sync::Arc::from(
-        vec![vec![1.0; 4 * p], vec![2.0; 4 * p]].into_boxed_slice(),
-    );
+    let jac: std::sync::Arc<[Vec<f64>]> =
+        std::sync::Arc::from(vec![vec![1.0; 4 * p], vec![2.0; 4 * p]].into_boxed_slice());
     // Assembler shares ONE allocation with both consumers (refcount bumps only).
-    let host = SaeKroneckerRows::new(p, std::sync::Arc::clone(&a_phi), std::sync::Arc::clone(&jac));
+    let host = SaeKroneckerRows::new(
+        p,
+        std::sync::Arc::clone(&a_phi),
+        std::sync::Arc::clone(&jac),
+    );
     let device = DeviceSaePcgData {
         p,
         beta_dim: 6,

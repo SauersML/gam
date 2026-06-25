@@ -7,8 +7,8 @@
 use super::*;
 use crate::families::marginal_slope_shared::SparsePrimaryCoeffJetView;
 use crate::families::survival::marginal_slope::flex_oracle_structs_tests::{
-    neg_cell_of, poly_add_jets, poly_coeff_mask, poly_mul_jets, poly_scale_jets,
-    SurvivalFlexTimepointDirectionalExact, COEFF_SUPPORT_GHW, COEFF_SUPPORT_GW,
+    COEFF_SUPPORT_GHW, COEFF_SUPPORT_GW, SurvivalFlexTimepointDirectionalExact, neg_cell_of,
+    poly_add_jets, poly_coeff_mask, poly_mul_jets, poly_scale_jets,
 };
 
 #[inline]
@@ -68,10 +68,8 @@ impl SurvivalMarginalSlopeFamily {
                 let state = &cell_entry.state;
                 let fixed = &cell_entry.fixed;
                 let neg_dc_da = fixed.dc_da.map(|v| -v);
-                calibration_f_a += exact_kernel::cell_first_derivative_from_moments(
-                    &neg_dc_da,
-                    &state.moments,
-                )?;
+                calibration_f_a +=
+                    exact_kernel::cell_first_derivative_from_moments(&neg_dc_da, &state.moments)?;
                 let mut neg_coeff_dir = [0.0; 4];
                 for c in 0..p {
                     if dir[c] == 0.0 {
@@ -489,15 +487,14 @@ impl SurvivalMarginalSlopeFamily {
                 // with the f_uv boundary terms (and with first_full.rs), so the
                 // a_uv consumer below sees a consistent moving-boundary Hessian
                 // (gam#932/#1454).
-                let a_edge_vel =
-                    |edge: crate::families::cubic_cell_kernel::PartitionEdge| -> f64 {
-                        match edge {
-                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing {
-                                ..
-                            } => -1.0 / b,
-                            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                let a_edge_vel = |edge: crate::families::cubic_cell_kernel::PartitionEdge| -> f64 {
+                    match edge {
+                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                            -1.0 / b
                         }
-                    };
+                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => 0.0,
+                    }
+                };
                 let flux_a = |poly: &[f64]| -> f64 {
                     let v_r = a_edge_vel(part.right_edge);
                     let v_l = a_edge_vel(part.left_edge);
@@ -545,9 +542,8 @@ impl SurvivalMarginalSlopeFamily {
                     let neg_coeff_u = fixed.coeff_u[u].map(|value| -value);
                     let zu_r = edge_vel(u, part.right_edge, cell.right);
                     let zu_l = edge_vel(u, part.left_edge, cell.left);
-                    f_au[u] += flux_a(&neg_coeff_u)
-                        + flux(u, &neg_dc_da)
-                        + self_flux_ax(zu_r, zu_l);
+                    f_au[u] +=
+                        flux_a(&neg_coeff_u) + flux(u, &neg_dc_da) + self_flux_ax(zu_r, zu_l);
                 }
             }
         }
@@ -687,20 +683,21 @@ impl SurvivalMarginalSlopeFamily {
                 //           = -z_a·dir_g/b = dir_g/b².
                 // (gam#932/#1454: f_aa_dir/f_au_dir need the a-axis analogs of the
                 // axis_flux_dir / self_flux_dir terms f_uv_dir already carries.)
-                let edge_axis_a =
-                    |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> (f64, f64, f64) {
-                        match edge {
-                            crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
-                                let z_dir = -(a_dir + z * dir_g) / b;
-                                let z_a = -1.0 / b;
-                                let z_a_dir = dir_g / (b * b);
-                                (z_a, z_a_dir, z_dir)
-                            }
-                            crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
-                                (0.0, 0.0, 0.0)
-                            }
+                let edge_axis_a = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                   z: f64|
+                 -> (f64, f64, f64) {
+                    match edge {
+                        crate::families::cubic_cell_kernel::PartitionEdge::Crossing { .. } => {
+                            let z_dir = -(a_dir + z * dir_g) / b;
+                            let z_a = -1.0 / b;
+                            let z_a_dir = dir_g / (b * b);
+                            (z_a, z_a_dir, z_dir)
                         }
-                    };
+                        crate::families::cubic_cell_kernel::PartitionEdge::Fixed(_) => {
+                            (0.0, 0.0, 0.0)
+                        }
+                    }
+                };
                 let density_z_derivative = |poly: &[f64], z: f64| -> f64 {
                     let eta = neg_cell.eta(z);
                     let eta_z = neg_cell.c1 + 2.0 * neg_cell.c2 * z + 3.0 * neg_cell.c3 * z * z;
@@ -801,19 +798,20 @@ impl SurvivalMarginalSlopeFamily {
                 // axis (`edge_axis_a`), used by f_aa_dir/f_au_dir which carry an
                 // a-axis flux in their base (gam#932/#1454).
                 let axis_flux_dir_a = |poly: &[f64], poly_dir: &[f64]| -> f64 {
-                    let eval_edge =
-                        |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
-                            let (z_a, z_a_dir, z_dir) = edge_axis_a(edge, z);
-                            if z_a == 0.0 && z_a_dir == 0.0 && z_dir == 0.0 {
-                                return 0.0;
-                            }
-                            z_a_dir
-                                * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
-                                    neg_cell, poly, z,
-                                )
-                                + z_a * density_dir_integrand(poly, poly_dir, z)
-                                + z_a * z_dir * density_z_derivative(poly, z)
-                        };
+                    let eval_edge = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
+                                     z: f64|
+                     -> f64 {
+                        let (z_a, z_a_dir, z_dir) = edge_axis_a(edge, z);
+                        if z_a == 0.0 && z_a_dir == 0.0 && z_dir == 0.0 {
+                            return 0.0;
+                        }
+                        z_a_dir
+                            * crate::families::cubic_cell_kernel::cell_density_boundary_integrand(
+                                neg_cell, poly, z,
+                            )
+                            + z_a * density_dir_integrand(poly, poly_dir, z)
+                            + z_a * z_dir * density_z_derivative(poly, z)
+                    };
                     eval_edge(part.right_edge, neg_cell.right)
                         - eval_edge(part.left_edge, neg_cell.left)
                 };
@@ -821,19 +819,14 @@ impl SurvivalMarginalSlopeFamily {
                 // edge-kinematics pairs (x, y given as (z, z_dir) triples), so it
                 // serves the (a,a) and (a,u) cases f_aa_dir/f_au_dir need, the
                 // exact mirror of `self_flux_dir` for θ-axes (gam#932/#1454).
-                let self_flux_dir_kin = |zx: f64,
-                                         zx_dir: f64,
-                                         zy: f64,
-                                         zy_dir: f64,
-                                         z_dir: f64,
-                                         z: f64|
-                 -> f64 {
-                    if zx == 0.0 && zx_dir == 0.0 && zy == 0.0 && zy_dir == 0.0 {
-                        return 0.0;
-                    }
-                    let g_z_total_dir = density_w_z_dir(z) + z_dir * density_w_zz(z);
-                    g_z_total_dir * zx * zy + density_w_z(z) * (zx_dir * zy + zx * zy_dir)
-                };
+                let self_flux_dir_kin =
+                    |zx: f64, zx_dir: f64, zy: f64, zy_dir: f64, z_dir: f64, z: f64| -> f64 {
+                        if zx == 0.0 && zx_dir == 0.0 && zy == 0.0 && zy_dir == 0.0 {
+                            return 0.0;
+                        }
+                        let g_z_total_dir = density_w_z_dir(z) + z_dir * density_w_zz(z);
+                        g_z_total_dir * zx * zy + density_w_z(z) * (zx_dir * zy + zx * zy_dir)
+                    };
 
                 f_a_dir += first_boundary(&neg_dc_da);
                 // D_dir of f_aa's base a-axis boundary `flux_a(dc_da) +
@@ -856,12 +849,11 @@ impl SurvivalMarginalSlopeFamily {
                     // DOUBLED on the (a,a) diagonal (matching the base f_aa
                     // diagonal flux fix, gam#1454).
                     f_aa_dir += 2.0 * axis_flux_dir_a(&neg_dc_da, &neg_dc_da_dir);
-                    let aa_self = |edge: crate::families::cubic_cell_kernel::PartitionEdge,
-                                   z: f64|
-                     -> f64 {
-                        let (z_a, z_a_dir, z_dir) = edge_axis_a(edge, z);
-                        self_flux_dir_kin(z_a, z_a_dir, z_a, z_a_dir, z_dir, z)
-                    };
+                    let aa_self =
+                        |edge: crate::families::cubic_cell_kernel::PartitionEdge, z: f64| -> f64 {
+                            let (z_a, z_a_dir, z_dir) = edge_axis_a(edge, z);
+                            self_flux_dir_kin(z_a, z_a_dir, z_a, z_a_dir, z_dir, z)
+                        };
                     f_aa_dir += aa_self(part.right_edge, neg_cell.right)
                         - aa_self(part.left_edge, neg_cell.left);
                 }

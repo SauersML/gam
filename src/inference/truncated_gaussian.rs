@@ -137,24 +137,30 @@ pub fn sample_truncated_gaussian_posterior(
     }
 
     // H = L Lᵀ.
-    let chol = penalized_hessian.cholesky(faer::Side::Lower).map_err(|err| {
-        format!("truncated-Gaussian posterior: Cholesky of the penalised Hessian failed: {err:?}")
-    })?;
+    let chol = penalized_hessian
+        .cholesky(faer::Side::Lower)
+        .map_err(|err| {
+            format!(
+                "truncated-Gaussian posterior: Cholesky of the penalised Hessian failed: {err:?}"
+            )
+        })?;
     let l = chol.lower_triangular();
 
     // Whitened constraint rows Fᵢ = √φ · L⁻¹ aᵢ and slacks gᵢ = aᵢᵀ mode − bᵢ.
     // `F` is `m × p`; `forward_substitution_lower_matrix` solves `L M = Aᵀ`
     // column-by-column giving `M = L⁻¹ Aᵀ` (`p × m`), so `F = √φ · Mᵀ`.
     let (f_rows, g, f_sq_norm) = if m == 0 {
-        (Array2::<f64>::zeros((0, p)), Array1::<f64>::zeros(0), Vec::new())
+        (
+            Array2::<f64>::zeros((0, p)),
+            Array1::<f64>::zeros(0),
+            Vec::new(),
+        )
     } else {
         let at = a.t().to_owned();
         let mut f = forward_substitution_lower_matrix(&l, &at).reversed_axes(); // m × p
         f.mapv_inplace(|v| v * sqrt_phi);
         let g = a.dot(mode) - b;
-        let f_sq_norm: Vec<f64> = (0..m)
-            .map(|i| f.row(i).dot(&f.row(i)))
-            .collect();
+        let f_sq_norm: Vec<f64> = (0..m).map(|i| f.row(i).dot(&f.row(i))).collect();
         (f, g, f_sq_norm)
     };
 
@@ -168,7 +174,9 @@ pub fn sample_truncated_gaussian_posterior(
     let mut beta = Array1::<f64>::zeros(p);
 
     for chain in 0..n_chains {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(seed ^ ((chain as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+        let mut rng = rand::rngs::StdRng::seed_from_u64(
+            seed ^ ((chain as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+        );
         // Each chain starts at the mode (z = 0), which is feasible.
         z.fill(0.0);
         for draw in 0..n_samples {
@@ -176,14 +184,7 @@ pub fn sample_truncated_gaussian_posterior(
             for vi in v.iter_mut() {
                 *vi = standard_normal(&mut rng);
             }
-            simulate_constrained_trajectory(
-                &mut z,
-                &mut v,
-                &f_rows,
-                &g,
-                &f_sq_norm,
-                max_bounces,
-            );
+            simulate_constrained_trajectory(&mut z, &mut v, &f_rows, &g, &f_sq_norm, max_bounces);
             // Back-transform: β = mode + √φ · L⁻ᵀ z.
             back_substitution_lower_transpose_guarded_into(&l, &z, &mut beta);
             let row = chain * n_samples + draw;
@@ -449,7 +450,10 @@ mod tests {
             .expect("sampler");
         let mean = s.column(0).mean().unwrap();
         let expect = 2.0 * (2.0 / std::f64::consts::PI).sqrt();
-        assert!((mean - expect).abs() < 0.03, "scaled mean {mean} vs {expect}");
+        assert!(
+            (mean - expect).abs() < 0.03,
+            "scaled mean {mean} vs {expect}"
+        );
     }
 
     /// A monotone-cone style polytope: several coordinate lower bounds
@@ -497,8 +501,7 @@ mod tests {
         // β ≥ 0 and −β ≥ −1  ⟺  0 ≤ β ≤ 1.
         let c = constraints(array![[1.0], [-1.0]], array![0.0, -1.0]);
         let n = 80_000;
-        let s = sample_truncated_gaussian_posterior(&mode, &h, 1.0, &c, n, 1, 5)
-            .expect("sampler");
+        let s = sample_truncated_gaussian_posterior(&mode, &h, 1.0, &c, n, 1, 5).expect("sampler");
         assert_all_feasible(&s, &c);
         assert!(s.column(0).iter().all(|&v| v > 0.0 && v < 1.0));
         // Symmetric truncation around the centred mode ⇒ mean ≈ 0.5.

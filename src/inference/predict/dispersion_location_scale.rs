@@ -354,10 +354,7 @@ impl PredictableModel for DispersionLocationScalePredictor {
 }
 
 impl PerRowDispersionChannel for DispersionLocationScalePredictor {
-    fn per_row_dispersion(
-        &self,
-        input: &PredictInput,
-    ) -> Result<Array1<f64>, EstimationError> {
+    fn per_row_dispersion(&self, input: &PredictInput) -> Result<Array1<f64>, EstimationError> {
         // Per-row precision `exp(eta_d(x))` mapped into the generative
         // NoiseModel's dispersion units (#1125): NB θ, Gamma shape and Beta φ
         // ARE the precision; Tweedie φ is its reciprocal.

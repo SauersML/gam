@@ -35,7 +35,10 @@ fn matern_probe() {
     let mut x: Vec<f64> = (0..n).map(|_| ux.sample(&mut rng)).collect();
     x.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let truth = |t: f64| 1.0 + 0.8 * (4.0 * PI * t).sin() + 0.4 * (2.0 * PI * t).cos();
-    let y: Vec<f64> = x.iter().map(|&t| truth(t) + noise.sample(&mut rng)).collect();
+    let y: Vec<f64> = x
+        .iter()
+        .map(|&t| truth(t) + noise.sample(&mut rng))
+        .collect();
 
     let headers = ["x", "y"].into_iter().map(String::from).collect();
     let rows: Vec<csv::StringRecord> = x
@@ -180,9 +183,12 @@ fn tpte_probe() {
         w.push(d);
         truth.push(f1 + f2);
     }
-    let signal_range =
-        truth.iter().copied().fold(f64::NEG_INFINITY, f64::max) - truth.iter().copied().fold(f64::INFINITY, f64::min);
-    let headers = ["x1", "x2", "z", "w", "y"].into_iter().map(String::from).collect();
+    let signal_range = truth.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+        - truth.iter().copied().fold(f64::INFINITY, f64::min);
+    let headers = ["x1", "x2", "z", "w", "y"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     let rows: Vec<csv::StringRecord> = (0..N)
         .map(|i| {
             csv::StringRecord::from(vec![
@@ -222,7 +228,9 @@ fn tpte_probe() {
         100.0 * r / signal_range,
         fit.fit.lambdas
     );
-    println!("        mgcv baseline: rmse=0.029546 (1.247% range) edf=38.66 | bars: <2% AND <=1.37%");
+    println!(
+        "        mgcv baseline: rmse=0.029546 (1.247% range) edf=38.66 | bars: <2% AND <=1.37%"
+    );
 }
 
 fn sz_probe() {
@@ -263,7 +271,11 @@ fn sz_probe() {
     let headers: Vec<String> = vec!["group".into(), "x".into(), "y".into()];
     let rows: Vec<csv::StringRecord> = (0..n)
         .map(|i| {
-            csv::StringRecord::from(vec![group_str[i].clone(), x[i].to_string(), y[i].to_string()])
+            csv::StringRecord::from(vec![
+                group_str[i].clone(),
+                x[i].to_string(),
+                y[i].to_string(),
+            ])
         })
         .collect();
     let ds = encode_recordswith_inferred_schema(headers, rows).expect("encode sz");
@@ -294,7 +306,9 @@ fn sz_probe() {
         "SZ      gam rmse_vs_truth={r:.5}  edf={edf:.2}  log_lambdas={:?}",
         fit.fit.log_lambdas
     );
-    println!("        noise_sd bar={NOISE_SD} ; mgcv match-or-beat 1.10x (was reported ~1.23x gap)");
+    println!(
+        "        noise_sd bar={NOISE_SD} ; mgcv match-or-beat 1.10x (was reported ~1.23x gap)"
+    );
 }
 
 fn main() {

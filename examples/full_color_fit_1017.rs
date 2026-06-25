@@ -28,7 +28,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gam::gpu::profile::{telemetry_reset, telemetry_snapshot, GpuExecutionTelemetry};
+use gam::gpu::profile::{GpuExecutionTelemetry, telemetry_reset, telemetry_snapshot};
 use gam::solver::arrow_schur::ArrowSolveOptions;
 use gam::terms::{
     AnalyticPenaltyRegistry, AssignmentMode, LatentManifold, PeriodicHarmonicEvaluator,
@@ -104,7 +104,9 @@ fn build_color_term() -> Result<(SaeManifoldTerm, Array2<f64>, SaeManifoldRho), 
     for atom_idx in 0..K {
         let evaluator = PeriodicHarmonicEvaluator::new(3).map_err(|e| e.to_string())?;
         let coords = circle_coords(N, atom_idx);
-        let (phi, jet) = evaluator.evaluate(coords.view()).map_err(|e| e.to_string())?;
+        let (phi, jet) = evaluator
+            .evaluate(coords.view())
+            .map_err(|e| e.to_string())?;
         let width = phi.ncols();
         let atom = SaeManifoldAtom::new(
             format!("circle_{atom_idx}"),
@@ -141,12 +143,20 @@ fn build_color_term() -> Result<(SaeManifoldTerm, Array2<f64>, SaeManifoldRho), 
 fn delta(before: &GpuExecutionTelemetry, after: &GpuExecutionTelemetry) -> String {
     format!(
         "handles=+{} kernels=+{} factorizations=+{} h2d=+{}KB d2h=+{}KB cpu_fallbacks=+{}",
-        after.handle_creation_count.saturating_sub(before.handle_creation_count),
-        after.kernel_launch_count.saturating_sub(before.kernel_launch_count),
-        after.factorization_count.saturating_sub(before.factorization_count),
+        after
+            .handle_creation_count
+            .saturating_sub(before.handle_creation_count),
+        after
+            .kernel_launch_count
+            .saturating_sub(before.kernel_launch_count),
+        after
+            .factorization_count
+            .saturating_sub(before.factorization_count),
         (after.h2d_bytes.saturating_sub(before.h2d_bytes)) / 1024,
         (after.d2h_bytes.saturating_sub(before.d2h_bytes)) / 1024,
-        after.cpu_fallback_count.saturating_sub(before.cpu_fallback_count),
+        after
+            .cpu_fallback_count
+            .saturating_sub(before.cpu_fallback_count),
     )
 }
 
@@ -210,10 +220,7 @@ fn main() -> std::process::ExitCode {
             let start = Instant::now();
             let sys2 = t.assemble_arrow_schur(target.view(), &rho, Some(&registry));
             let a2_ms = start.elapsed().as_secs_f64() * 1e3;
-            println!(
-                "FULLCOLOR_1017 assemble2 ms={a2_ms:.3} ok={}",
-                sys2.is_ok()
-            );
+            println!("FULLCOLOR_1017 assemble2 ms={a2_ms:.3} ok={}", sys2.is_ok());
             let _ = std::io::stdout().flush();
         }
 

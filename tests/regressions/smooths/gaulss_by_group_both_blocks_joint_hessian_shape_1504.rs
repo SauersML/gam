@@ -90,8 +90,9 @@ fn gaulss_by_group_smooth_in_both_blocks_fits_without_hessian_shape_mismatch() {
         noise_formula: Some("s(x, bs='tp', by=group)".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, bs='tp', by=group)", &data, &cfg)
-        .expect("#1504: gaulss by-group fit in both blocks must not crash on a Hessian shape mismatch");
+    let result = fit_from_formula("y ~ s(x, bs='tp', by=group)", &data, &cfg).expect(
+        "#1504: gaulss by-group fit in both blocks must not crash on a Hessian shape mismatch",
+    );
 
     let FitResult::GaussianLocationScale(fit) = result else {
         panic!("expected a GaussianLocationScale fit result for a noise_formula model");
@@ -113,7 +114,10 @@ fn gaulss_by_group_smooth_in_both_blocks_fits_without_hessian_shape_mismatch() {
         .beta;
 
     assert!(!beta_mean.is_empty(), "mean block must have coefficients");
-    assert!(!beta_logsig.is_empty(), "log-σ block must have coefficients");
+    assert!(
+        !beta_logsig.is_empty(),
+        "log-σ block must have coefficients"
+    );
     assert!(
         beta_mean.iter().all(|b| b.is_finite()),
         "mean coefficients must all be finite: {beta_mean:?}"

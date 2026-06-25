@@ -204,7 +204,11 @@ fn gam_gaussian_location_scale_matches_gamboostlss() {
     let r = run_r(&[Column::new("x", &x), Column::new("y", &y)], &body);
     let boost_mu = r.vector("mu");
     let boost_sigma = r.vector("sigma");
-    assert_eq!(boost_mu.len(), grid_n, "gamboostLSS mu grid length mismatch");
+    assert_eq!(
+        boost_mu.len(),
+        grid_n,
+        "gamboostLSS mu grid length mismatch"
+    );
     assert_eq!(
         boost_sigma.len(),
         grid_n,

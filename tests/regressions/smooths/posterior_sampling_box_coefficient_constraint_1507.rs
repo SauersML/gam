@@ -92,7 +92,11 @@ fn saved_standard_gaussian_model(
 }
 
 /// The slope is the single non-intercept coefficient (column index 1).
-fn slope_draws(model: &FittedModel, ds: &gam::inference::data::EncodedDataset, p: usize) -> Vec<f64> {
+fn slope_draws(
+    model: &FittedModel,
+    ds: &gam::inference::data::EncodedDataset,
+    p: usize,
+) -> Vec<f64> {
     let col = ds.column_map();
     let cfg = NutsConfig {
         n_samples: 1500,
@@ -124,11 +128,7 @@ fn posterior_respects_nonnegative_coefficient_bound() {
     let (model, p) = saved_standard_gaussian_model("y ~ nonnegative(x)", &ds);
 
     // Sanity: the constraint is active — the fitted slope pins to ~0.
-    let fitted_slope = model
-        .unified
-        .as_ref()
-        .expect("unified fit")
-        .beta[1];
+    let fitted_slope = model.unified.as_ref().expect("unified fit").beta[1];
     assert!(
         fitted_slope.abs() < 1e-4,
         "expected an active nonnegative bound (slope≈0); got {fitted_slope}"
@@ -157,11 +157,7 @@ fn posterior_respects_two_sided_linear_coefficient_bounds() {
 
     // True slope -3 < lower bound -1, so the box constraint is active and the
     // fitted slope pins to ~-1.
-    let fitted_slope = model
-        .unified
-        .as_ref()
-        .expect("unified fit")
-        .beta[1];
+    let fitted_slope = model.unified.as_ref().expect("unified fit").beta[1];
     assert!(
         (fitted_slope - (-1.0)).abs() < 1e-4,
         "expected an active lower bound (slope≈-1); got {fitted_slope}"

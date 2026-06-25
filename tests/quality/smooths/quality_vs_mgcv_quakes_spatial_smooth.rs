@@ -369,7 +369,8 @@ fn diag_quakes_spatial_1074() {
     log::set_max_level(log::LevelFilter::Debug);
     let ds = load_csvwith_inferred_schema(Path::new(QUAKES_CSV)).unwrap();
     let col = ds.column_map();
-    let (long_idx, lat_idx, depth_idx, mag_idx) = (col["long"], col["lat"], col["depth"], col["mag"]);
+    let (long_idx, lat_idx, depth_idx, mag_idx) =
+        (col["long"], col["lat"], col["depth"], col["mag"]);
     let long: Vec<f64> = ds.values.column(long_idx).to_vec();
     let lat: Vec<f64> = ds.values.column(lat_idx).to_vec();
     let depth: Vec<f64> = ds.values.column(depth_idx).to_vec();
@@ -381,11 +382,16 @@ fn diag_quakes_spatial_1074() {
     let p = ds.headers.len();
     let mut train_values = Array2::<f64>::zeros((train_rows.len(), p));
     for (out_row, &src_row) in train_rows.iter().enumerate() {
-        for c in 0..p { train_values[[out_row, c]] = ds.values[[src_row, c]]; }
+        for c in 0..p {
+            train_values[[out_row, c]] = ds.values[[src_row, c]];
+        }
     }
     let mut train_ds = ds.clone();
     train_ds.values = train_values;
-    let cfg = FitConfig { family: Some("gaussian".to_string()), ..FitConfig::default() };
+    let cfg = FitConfig {
+        family: Some("gaussian".to_string()),
+        ..FitConfig::default()
+    };
 
     for formula in [
         "mag ~ s(long, lat, bs=\"tp\") + s(depth)",
@@ -395,11 +401,15 @@ fn diag_quakes_spatial_1074() {
         "mag ~ s(long, lat, bs=\"tp\", k=60) + s(depth)",
     ] {
         let result = fit_from_formula(formula, &train_ds, &cfg).unwrap();
-        let FitResult::Standard(fit) = result else { panic!() };
+        let FitResult::Standard(fit) = result else {
+            panic!()
+        };
         // held-out
         let mut tg = Array2::<f64>::zeros((test_rows.len(), p));
         for (i, &r) in test_rows.iter().enumerate() {
-            tg[[i, long_idx]] = long[r]; tg[[i, lat_idx]] = lat[r]; tg[[i, depth_idx]] = depth[r];
+            tg[[i, long_idx]] = long[r];
+            tg[[i, lat_idx]] = lat[r];
+            tg[[i, depth_idx]] = depth[r];
         }
         let td = gam::smooth::build_term_collection_design(tg.view(), &fit.resolvedspec).unwrap();
         use gam::matrix::LinearOperator;
@@ -407,9 +417,18 @@ fn diag_quakes_spatial_1074() {
         let truth: Vec<f64> = test_rows.iter().map(|&i| mag[i]).collect();
         eprintln!(
             "[#1074-quakes] edf_total={:.3} beta_len={} edf_by_block={:?} log_lambdas={:?} heldout_R2={:.4} :: {formula}",
-            fit.fit.edf_total().unwrap(), fit.fit.beta.len(),
-            fit.fit.edf_by_block().iter().map(|v| (v*100.0).round()/100.0).collect::<Vec<_>>(),
-            fit.fit.log_lambdas.iter().map(|v| (v*1000.0).round()/1000.0).collect::<Vec<_>>(),
+            fit.fit.edf_total().unwrap(),
+            fit.fit.beta.len(),
+            fit.fit
+                .edf_by_block()
+                .iter()
+                .map(|v| (v * 100.0).round() / 100.0)
+                .collect::<Vec<_>>(),
+            fit.fit
+                .log_lambdas
+                .iter()
+                .map(|v| (v * 1000.0).round() / 1000.0)
+                .collect::<Vec<_>>(),
             r2(&pred, &truth),
         );
     }

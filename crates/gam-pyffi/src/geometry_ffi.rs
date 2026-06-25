@@ -3698,7 +3698,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     // inside long PIRLS line-searches still surface a process-alive
     // signal with current memory footprint. Unconditional — does not
     // depend on any family pushing a tracked scope.
-    gam::process_monitor::start();
+    gam_runtime::process_monitor::start();
     module.add("__doc__", "PyO3 boundary for the gam Rust engine.")?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     // gamfit exception hierarchy (see the comment block at the
@@ -5657,13 +5657,13 @@ fn validate_formula_json_impl(
         dataset.headers.push(VALIDATION_PLACEHOLDER_Z.to_string());
         dataset
             .column_kinds
-            .push(gam::inference::model::ColumnKindTag::Continuous);
+            .push(gam::data::ColumnKindTag::Continuous);
         dataset
             .schema
             .columns
-            .push(gam::inference::model::SchemaColumn {
+            .push(gam::data::SchemaColumn {
                 name: VALIDATION_PLACEHOLDER_Z.to_string(),
-                kind: gam::inference::model::ColumnKindTag::Continuous,
+                kind: gam::data::ColumnKindTag::Continuous,
                 levels: Vec::new(),
             });
         fit_config.z_column = Some(VALIDATION_PLACEHOLDER_Z.to_string());

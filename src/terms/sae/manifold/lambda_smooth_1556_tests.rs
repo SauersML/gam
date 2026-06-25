@@ -52,5 +52,9 @@ pub(crate) fn sae_manifold_lambda_smooth_is_per_atom_and_roundtrips_1556() {
             epsilon = 0.0
         );
     }
-    assert_abs_diff_eq!(restored.log_lambda_sparse, rho.log_lambda_sparse, epsilon = 0.0);
+    assert_abs_diff_eq!(
+        restored.log_lambda_sparse,
+        rho.log_lambda_sparse,
+        epsilon = 0.0
+    );
 }

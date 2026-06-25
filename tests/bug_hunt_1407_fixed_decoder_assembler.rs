@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use ndarray::{array, Array1, Array2, Array3};
+use ndarray::{Array1, Array2, Array3, array};
 
 use gam::terms::latent::LatentManifold;
 use gam::terms::sae::assignment::{AssignmentMode, SaeAssignment};

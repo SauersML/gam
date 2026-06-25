@@ -44,7 +44,7 @@ pub(crate) trait LocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
     /// message so the originating family stays visible after unification.
     const LABEL: &'static str;
 
-    fn ws_policy(&self) -> &crate::resource::ResourcePolicy;
+    fn ws_policy(&self) -> &gam_runtime::resource::ResourcePolicy;
 
     fn ws_exact_joint_dense_block_designs<'a>(
         &'a self,
@@ -58,7 +58,7 @@ pub(crate) trait LocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
         psi_index: usize,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
-        policy: &crate::resource::ResourcePolicy,
+        policy: &gam_runtime::resource::ResourcePolicy,
     ) -> Result<Option<Self::Direction>, String>;
 
     fn ws_psi_second_order_terms_from_parts(
@@ -87,7 +87,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
     type Direction = LocationScaleJointPsiDirection;
     const LABEL: &'static str = "GaussianLocationScaleFamily";
 
-    fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
+    fn ws_policy(&self) -> &gam_runtime::resource::ResourcePolicy {
         &self.policy
     }
 
@@ -105,7 +105,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
         psi_index: usize,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
-        policy: &crate::resource::ResourcePolicy,
+        policy: &gam_runtime::resource::ResourcePolicy,
     ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         self.exact_newton_joint_psi_direction(
             block_states,
@@ -162,7 +162,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
     type Direction = LocationScaleJointPsiDirection;
     const LABEL: &'static str = "GaussianLocationScaleWiggleFamily";
 
-    fn ws_policy(&self) -> &crate::resource::ResourcePolicy {
+    fn ws_policy(&self) -> &gam_runtime::resource::ResourcePolicy {
         &self.policy
     }
 
@@ -180,7 +180,7 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
         psi_index: usize,
         design_loc: &Array2<f64>,
         design_scale: &Array2<f64>,
-        policy: &crate::resource::ResourcePolicy,
+        policy: &gam_runtime::resource::ResourcePolicy,
     ) -> Result<Option<LocationScaleJointPsiDirection>, String> {
         self.exact_newton_joint_psi_direction(
             block_states,
@@ -1330,7 +1330,8 @@ mod fisher_single_source_oracle_tests {
         let hll = (row_nll(y, mu, eta_ls + h, a) - 2.0 * row_nll(y, mu, eta_ls, a)
             + row_nll(y, mu, eta_ls - h, a))
             / (h * h);
-        let hml = (row_nll(y, mu + h, eta_ls + h, a) - row_nll(y, mu + h, eta_ls - h, a)
+        let hml = (row_nll(y, mu + h, eta_ls + h, a)
+            - row_nll(y, mu + h, eta_ls - h, a)
             - row_nll(y, mu - h, eta_ls + h, a)
             + row_nll(y, mu - h, eta_ls - h, a))
             / (4.0 * h * h);
@@ -1441,11 +1442,8 @@ mod fisher_single_source_oracle_tests {
                 &array![a],
             )
             .expect("row scalars");
-            let (w_u, _c_u, d_u) = gaussian_joint_first_directionalweights(
-                &rows,
-                &array![xi_mu],
-                &array![xi_ls],
-            );
+            let (w_u, _c_u, d_u) =
+                gaussian_joint_first_directionalweights(&rows, &array![xi_mu], &array![xi_ls]);
             // FD of Fisher mm and ll along the direction.
             let mm = |_m: f64, e: f64| a / (sigma_of(e) * sigma_of(e));
             let ll = |_m: f64, e: f64| {
@@ -1479,7 +1477,9 @@ mod fisher_single_source_oracle_tests {
         // coefficients, assembled mechanically from the already-pinned
         // first-directional single source.
         let cases = [
-            (0.3_f64, -0.4_f64, 1.0_f64, 0.5_f64, -0.7_f64, 0.8_f64, 0.2_f64),
+            (
+                0.3_f64, -0.4_f64, 1.0_f64, 0.5_f64, -0.7_f64, 0.8_f64, 0.2_f64,
+            ),
             (-1.2, 0.7, 2.5, 1.1, 0.3, -0.6, 0.9),
             (0.0, 1.5, 0.4, -0.2, 0.9, 0.4, -0.5),
         ];
@@ -1509,11 +1509,8 @@ mod fisher_single_source_oracle_tests {
                     &array![a],
                 )
                 .expect("row scalars");
-                let (w_u, _c, d_u) = gaussian_joint_first_directionalweights(
-                    &r,
-                    &array![xi_mu_u],
-                    &array![xi_ls_u],
-                );
+                let (w_u, _c, d_u) =
+                    gaussian_joint_first_directionalweights(&r, &array![xi_mu_u], &array![xi_ls_u]);
                 (w_u[0], d_u[0])
             };
             let (wp, dp) = first_w_and_d(mu + t * xi_mu_v, eta_ls + t * xi_ls_v);

@@ -2205,8 +2205,7 @@ pub(crate) fn joint_collapsed_floor_all_reject_exit(
     all_attempts_rejected_at_floor_this_cycle: bool,
 ) -> bool {
     all_attempts_rejected_at_floor_this_cycle
-        && consecutive_all_reject_at_floor_cycles
-            >= JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES
+        && consecutive_all_reject_at_floor_cycles >= JOINT_COLLAPSED_FLOOR_ALL_REJECT_MAX_CYCLES
 }
 
 /// True iff the joint trust radius has reached its absolute `1e-12` floor and can

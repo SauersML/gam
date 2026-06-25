@@ -1,7 +1,7 @@
-use crate::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use csv::{ReaderBuilder, StringRecord};
 use ndarray::{Array2, Axis};
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::Path;
@@ -155,6 +155,27 @@ impl From<DataError> for String {
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DataSchema {
+    pub columns: Vec<SchemaColumn>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SchemaColumn {
+    pub name: String,
+    pub kind: ColumnKindTag,
+    #[serde(default)]
+    pub levels: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ColumnKindTag {
+    Continuous,
+    Binary,
+    Categorical,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnseenCategoryPolicy {
@@ -314,9 +335,7 @@ pub fn load_dataset_projected_with_categorical_roles(
         DataFormat::Tsv => {
             load_delimited_inferred(path, b'\t', requested_columns, categorical_roles)
         }
-        DataFormat::Parquet => {
-            load_parquet_inferred(path, requested_columns, categorical_roles)
-        }
+        DataFormat::Parquet => load_parquet_inferred(path, requested_columns, categorical_roles),
     }
 }
 

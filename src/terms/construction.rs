@@ -3263,7 +3263,11 @@ mod tests {
                         assert_eq!(a.to_bits(), b.to_bits());
                     }
                 }
-                for (mq, uq) in memoized.marginal_qs.iter().zip(unmemoized.marginal_qs.iter()) {
+                for (mq, uq) in memoized
+                    .marginal_qs
+                    .iter()
+                    .zip(unmemoized.marginal_qs.iter())
+                {
                     for (a, b) in mq.iter().zip(uq.iter()) {
                         assert_eq!(a.to_bits(), b.to_bits());
                     }

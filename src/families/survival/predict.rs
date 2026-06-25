@@ -170,11 +170,11 @@ impl From<String> for SurvivalPredictError {
     }
 }
 
-impl From<crate::inference::data::DataError> for SurvivalPredictError {
+impl From<gam_data::DataError> for SurvivalPredictError {
     /// Column-resolution failures from `resolve_role_col` / `resolve_col`
     /// land as `InvalidInput` since they reflect a mismatch between the
     /// caller-supplied predict frame and the model's expected schema.
-    fn from(err: crate::inference::data::DataError) -> SurvivalPredictError {
+    fn from(err: gam_data::DataError) -> SurvivalPredictError {
         SurvivalPredictError::InvalidInput {
             reason: err.to_string(),
         }

@@ -45,7 +45,7 @@
 //! (`γ` pinned at 0 with collapsed effective range ⇒ a "not a smooth 1-D
 //! topology" diagnostic handed to the mixture rung).
 
-use crate::families::jet_tower::Tower4;
+use gam_math::jet_tower::Tower4;
 use ndarray::{Array1, Array2, ArrayView1};
 
 /// One-variable γ-jet: value, ∂/∂γ, ∂²/∂γ².

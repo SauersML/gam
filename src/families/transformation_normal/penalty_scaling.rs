@@ -148,7 +148,7 @@ pub(crate) fn chunked_weighted_bt_d(
     let pb = b.ncols();
     let pd = d.ncols();
     let rows_per_chunk =
-        crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, pb + pd);
+        gam_runtime::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, pb + pd);
     let mut out = Array2::<f64>::zeros((pb, pd));
     if n == 0 || pb == 0 || pd == 0 {
         return out;
@@ -210,7 +210,7 @@ pub(crate) fn chunked_weighted_bt_d_designmatrix(
     let pb = b.ncols();
     let pd = d.ncols();
     let rows_per_chunk =
-        crate::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, pb + pd);
+        gam_runtime::resource::rows_for_target_bytes(policy.row_chunk_target_bytes, pb + pd);
     let mut out = Array2::<f64>::zeros((pb, pd));
     if n == 0 || pb == 0 || pd == 0 {
         return Ok(out);

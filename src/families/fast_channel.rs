@@ -81,10 +81,10 @@ pub(crate) fn faa_top4(m: [f64; 4], q: &[f64; 16]) -> f64 {
 #[cfg(test)]
 mod oracle_tests {
     //! Pin each compiled top-channel sum BIT-FOR-BIT against the general runtime
-    //! partition walker [`crate::families::jet_algebra::faa_di_bruno`]. If a
+    //! partition walker [`gam_math::jet_algebra::faa_di_bruno`]. If a
     //! `faa_top*` ever diverges from the universal rule these disagree.
     use super::*;
-    use crate::families::jet_algebra::faa_di_bruno;
+    use gam_math::jet_algebra::faa_di_bruno;
 
     fn stream(seed: u64) -> impl FnMut() -> f64 {
         let mut s = seed;

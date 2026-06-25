@@ -30,8 +30,8 @@ fn dispersion_tweedie_nll_tower(
     eta_d: f64,
     p: f64,
     wi: f64,
-) -> crate::families::jet_tower::Tower4<2> {
-    dispersion_tweedie_nll_generic::<crate::families::jet_tower::Tower4<2>>(yi, eta_mu, eta_d, p, wi)
+) -> gam_math::jet_tower::Tower4<2> {
+    dispersion_tweedie_nll_generic::<gam_math::jet_tower::Tower4<2>>(yi, eta_mu, eta_d, p, wi)
 }
 use crate::basis::{
     CenterStrategy, Dense, KnotSource, MaternBasisSpec, MaternIdentifiability, MaternNu,
@@ -375,7 +375,7 @@ pub(crate) fn binomial_location_scale_joint_hessian_matches_single_sourced_tower
             link_kind: link.clone(),
             threshold_design: None,
             log_sigma_design: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
+            policy: gam_runtime::resource::ResourcePolicy::default_library(),
         };
         let states = vec![
             ParameterBlockState {
@@ -505,7 +505,7 @@ pub(crate) fn binomial_wiggle_joint_hessian_reduces_to_nonwiggle_at_zero_betaw_9
             log_sigma_design: Some(log_sigma_design),
             wiggle_knots: knots.clone(),
             wiggle_degree: 2,
-            policy: crate::resource::ResourcePolicy::default_library(),
+            policy: gam_runtime::resource::ResourcePolicy::default_library(),
         };
         // βw = 0 ⇒ etaw = 0, m = 1, g2 = 0, q = q0.
         let q0 = Array1::from_iter(
@@ -547,7 +547,7 @@ pub(crate) fn binomial_wiggle_joint_hessian_reduces_to_nonwiggle_at_zero_betaw_9
             link_kind: link.clone(),
             threshold_design: None,
             log_sigma_design: None,
-            policy: crate::resource::ResourcePolicy::default_library(),
+            policy: gam_runtime::resource::ResourcePolicy::default_library(),
         };
         let nonwiggle_states = vec![
             ParameterBlockState {
@@ -582,7 +582,7 @@ pub(crate) fn binomial_wiggle_joint_hessian_reduces_to_nonwiggle_at_zero_betaw_9
 }
 
 pub(crate) fn hand_trigamma(x: f64) -> f64 {
-    crate::families::jet_tower::trigamma_derivative_stack(x)[0]
+    gam_math::jet_tower::trigamma_derivative_stack(x)[0]
 }
 
 pub(crate) fn hand_dispersion_row_kernel(
@@ -1301,7 +1301,7 @@ pub(crate) fn binomial_location_scale_loglik_uses_tail_stable_standard_links() {
         link_kind: InverseLink::Standard(StandardLink::Logit),
         threshold_design: Some(design.clone()),
         log_sigma_design: Some(design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let logit_states = vec![
         ParameterBlockState {
@@ -1324,7 +1324,7 @@ pub(crate) fn binomial_location_scale_loglik_uses_tail_stable_standard_links() {
         link_kind: InverseLink::Standard(StandardLink::CLogLog),
         threshold_design: Some(design.clone()),
         log_sigma_design: Some(design),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let cloglog_states = vec![
         ParameterBlockState {
@@ -1388,7 +1388,7 @@ pub(crate) fn gaussian_location_scale_coefficient_cost_delegates_to_joint_couple
         weights: Array1::from_elem(n, 1.0),
         mu_design: None,
         log_sigma_design: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let specs = vec![
@@ -1444,7 +1444,7 @@ pub(crate) fn large_n_gaussian_location_scale_keeps_exact_outer_hessian_plan() {
         weights: Array1::from_elem(n, 1.0),
         mu_design: None,
         log_sigma_design: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let specs = vec![
@@ -1545,7 +1545,7 @@ pub(crate) fn gls_workspace_fixture() -> (
         weights,
         mu_design: Some(mu_design.clone()),
         log_sigma_design: Some(log_sigma_design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let states = vec![
@@ -1619,7 +1619,7 @@ pub(crate) fn bls_workspace_fixture() -> (
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: Some(threshold_design.clone()),
         log_sigma_design: Some(log_sigma_design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let states = vec![
         ParameterBlockState {
@@ -1956,7 +1956,7 @@ pub(crate) fn binomial_location_scale_operator_workspace_never_densifies_specs()
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: None,
         log_sigma_design: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let states = vec![
         ParameterBlockState {
@@ -2547,7 +2547,7 @@ pub(crate) fn bls_wiggle_workspace_fixture() -> (
         log_sigma_design: Some(log_sigma_design.clone()),
         wiggle_knots: knots,
         wiggle_degree: 2,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let q0 = Array1::from_iter(
         eta_t
@@ -2955,7 +2955,7 @@ pub(crate) fn gaussian_location_scale_wiggle_workspace_matvec_matches_dense() {
         log_sigma_design: Some(log_sigma_design.clone()),
         wiggle_knots: knots,
         wiggle_degree: 2,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let states = vec![
@@ -3091,7 +3091,7 @@ pub(crate) fn gls_wiggle_workspace_fixture() -> (
         log_sigma_design: Some(log_sigma_design.clone()),
         wiggle_knots: knots,
         wiggle_degree: 2,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     // The wiggle block has dynamic geometry (q0-dependent basis): the
@@ -3388,7 +3388,7 @@ pub(crate) fn zeroweightrows_stay_inactive_in_builtin_diagonal_families() {
         weights: weights.clone(),
         mu_design: None,
         log_sigma_design: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let gaussian_eval = gaussian
@@ -3634,7 +3634,7 @@ pub(crate) fn gaussian_log_sigmaweight_directional_derivative_iszero_on_active_f
         weights: Array1::from_vec(vec![1.0]),
         mu_design: None,
         log_sigma_design: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let states = vec![
@@ -3667,7 +3667,7 @@ pub(crate) fn gaussian_log_sigmaweight_directional_derivative_matches_finite_dif
         weights: Array1::from_vec(vec![1.0]),
         mu_design: None,
         log_sigma_design: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let etamu = Array1::from_vec(vec![0.1]);
@@ -3790,7 +3790,7 @@ pub(crate) fn gaussian_diagonal_log_sigma_block_uses_fisher_score_step_in_far_ta
         weights: array![1.0],
         mu_design: None,
         log_sigma_design: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let eta_mu = array![0.0];
@@ -3866,7 +3866,7 @@ pub(crate) fn gaussian_exact_joint_path_stays_finite_in_exp_link_far_tail() {
         weights: array![1.0],
         mu_design: Some(mu_design.clone()),
         log_sigma_design: Some(log_sigma_design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let beta_mu = array![0.0];
@@ -4070,7 +4070,7 @@ pub(crate) fn binomial_location_scale_exact_probit_tailobjects_stay_finite() {
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: Some(threshold_design.clone()),
         log_sigma_design: Some(log_sigma_design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let beta_t = array![250.0];
     let beta_ls = array![0.0];
@@ -4137,7 +4137,7 @@ pub(crate) fn binomial_location_scale_many_smoothing_params_keeps_second_order_o
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: None,
         log_sigma_design: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let specs = vec![
         spec_with_penalties("threshold", n, 3, 2),
@@ -5099,7 +5099,7 @@ pub(crate) fn wiggle_family_evaluate_returns_exact_newton_blocks() {
         log_sigma_design: Some(log_sigma_design),
         wiggle_knots: knots,
         wiggle_degree: 2,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let eta_t = Array1::from_vec(vec![0.4; n]);
@@ -5184,7 +5184,7 @@ pub(crate) fn wiggle_family_exact_newton_directional_derivative_matches_finite_d
         log_sigma_design: Some(log_sigma_design.clone()),
         wiggle_knots: knots,
         wiggle_degree: 3,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let beta_t = Array1::from_vec(vec![0.25]);
@@ -5289,7 +5289,7 @@ pub(crate) fn wiggle_threshold_block_exacthessian_matches_autodiffobjective() {
         log_sigma_design: Some(log_sigma_design.clone()),
         wiggle_knots: knots.clone(),
         wiggle_degree: 3,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let beta_t0 = 0.25;
@@ -5360,7 +5360,7 @@ pub(crate) fn gaussian_log_sigma_psi_terms_match_autodiff_scalar_objective() {
         log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
             x_ls0_mat.clone(),
         ))),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let specs = vec![
@@ -5621,7 +5621,7 @@ pub(crate) fn gaussian_log_sigma_psi_second_order_terms_match_autodiff_scalar_ob
         log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
             x_ls0_mat.clone(),
         ))),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let specs = vec![
@@ -6111,7 +6111,7 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
         log_sigma_design: Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
             x_ls.clone(),
         ))),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
         cached_row_scalars: std::sync::RwLock::new(None),
     };
     let states = vec![
@@ -6148,9 +6148,7 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
         std::sync::Arc::clone(rows)
     };
     let d1 = family
-        .exact_newton_joint_hessian_directional_derivative_from_designs(
-            &states, &xmu_d, &xls_d, &u,
-        )
+        .exact_newton_joint_hessian_directional_derivative_from_designs(&states, &xmu_d, &xls_d, &u)
         .expect("dH")
         .expect("dH present");
     let d2 = family
@@ -6210,7 +6208,9 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
     let mut eta_ls_interior = eta_ls.clone();
     let interior = eta_ls_interior.len() / 4; // an index that is NOT 0, n/2, or n-1
     assert!(
-        interior != 0 && interior != eta_ls_interior.len() / 2 && interior != eta_ls_interior.len() - 1,
+        interior != 0
+            && interior != eta_ls_interior.len() / 2
+            && interior != eta_ls_interior.len() - 1,
         "collision probe needs an interior index distinct from the 3 sampled points"
     );
     eta_ls_interior[interior] += 0.5;
@@ -6221,8 +6221,8 @@ pub(crate) fn gaussian_row_scalar_cache_is_exact_and_eliminates_recompute() {
         !std::sync::Arc::ptr_eq(&primed, &collide),
         "η differing only at an interior index must MISS, not collide on a 3-point fingerprint"
     );
-    let recomputed_collide =
-        gaussian_jointrow_scalars(&y, &etamu, &eta_ls_interior, &weights).expect("collide reference");
+    let recomputed_collide = gaussian_jointrow_scalars(&y, &etamu, &eta_ls_interior, &weights)
+        .expect("collide reference");
     for (a, b) in collide.w.iter().zip(recomputed_collide.w.iter()) {
         assert_eq!(
             a.to_bits(),
@@ -6501,7 +6501,7 @@ pub(crate) fn wiggle_family_block_hessians_match_jointhessian_principal_blocks()
         log_sigma_design: Some(log_sigma_design.clone()),
         wiggle_knots: knots,
         wiggle_degree: 3,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let beta_t = Array1::from_vec(vec![0.25]);
@@ -6602,7 +6602,7 @@ pub(crate) fn wiggle_nontrivial_fixture() -> (
         log_sigma_design: Some(log_sigma_design.clone()),
         wiggle_knots: knots,
         wiggle_degree: 3,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     (
         family,
@@ -6843,7 +6843,7 @@ pub(crate) fn wiggle_family_joint_exacthessian_directional_derivative_matches_fi
         log_sigma_design: Some(log_sigma_design.clone()),
         wiggle_knots: knots,
         wiggle_degree: 3,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let beta_t = Array1::from_vec(vec![0.25]);
@@ -6955,7 +6955,7 @@ pub(crate) fn wiggle_family_joint_exacthessiansecond_directional_derivative_matc
         log_sigma_design: Some(log_sigma_design.clone()),
         wiggle_knots: knots,
         wiggle_degree: 4,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let rebuild_states = |beta_t: &Array1<f64>,
@@ -7054,7 +7054,7 @@ pub(crate) fn wiggle_family_joint_hessian_cross_blocks_match_finite_difference_o
         log_sigma_design: Some(log_sigma_design.clone()),
         wiggle_knots: knots,
         wiggle_degree: 3,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let rebuild_states = |beta_t: &Array1<f64>,
@@ -7210,7 +7210,7 @@ pub(crate) fn nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: Some(threshold_design.clone()),
         log_sigma_design: Some(log_sigma_design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let beta_t = array![0.2, -0.15];
@@ -7282,7 +7282,7 @@ pub(crate) fn nonwiggle_family_joint_exacthessian_directional_derivative_matches
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: Some(threshold_design.clone()),
         log_sigma_design: Some(log_sigma_design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let rebuild_states = |beta_t: &Array1<f64>, beta_ls: &Array1<f64>| {
@@ -7355,7 +7355,7 @@ pub(crate) fn nonwiggle_family_joint_exacthessiansecond_directional_derivative_m
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: Some(threshold_design.clone()),
         log_sigma_design: Some(log_sigma_design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let rebuild_states = |beta_t: &Array1<f64>, beta_ls: &Array1<f64>| {
@@ -7535,7 +7535,7 @@ pub(crate) fn binomial_location_scale_generative_matches_coremu() {
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: None,
         log_sigma_design: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let states = vec![
         ParameterBlockState {
@@ -7581,7 +7581,7 @@ pub(crate) fn wiggle_geometry_and_generative_use_same_sigma_link_as_core() {
         log_sigma_design: None,
         wiggle_knots: knots,
         wiggle_degree: 2,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let core_for_q0 =
@@ -7714,7 +7714,7 @@ pub(crate) fn binomial_location_scale_batched_gradient_matches_finite_difference
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: Some(base.threshold_design),
         log_sigma_design: Some(base.log_sigma_design),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let specs = vec![base.threshold_spec, base.log_sigma_spec];
@@ -7802,7 +7802,7 @@ pub(crate) fn binomial_mean_wiggle_operator_fixture() -> (
         link_kind: InverseLink::Standard(StandardLink::Logit),
         wiggle_knots: knots,
         wiggle_degree: degree,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let basis = family.wiggle_design(eta.view()).expect("wiggle basis");
     let beta_w = Array1::from_iter((0..basis.ncols()).map(|j| 0.015 * (j as f64 + 1.0)));
@@ -7870,7 +7870,7 @@ pub(crate) fn binomial_location_scale_expected_info_derivatives_match_finite_dif
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: Some(base.threshold_design.clone()),
         log_sigma_design: Some(base.log_sigma_design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let specs = vec![base.threshold_spec, base.log_sigma_spec];
     let x_t = specs[BinomialLocationScaleFamily::BLOCK_T]
@@ -8007,7 +8007,7 @@ pub(crate) fn expected_info_jeffreys_does_not_reward_probit_saturation() {
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: Some(base.threshold_design.clone()),
         log_sigma_design: Some(base.log_sigma_design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let specs = vec![base.threshold_spec, base.log_sigma_spec];
     let x_t = specs[BinomialLocationScaleFamily::BLOCK_T]
@@ -8101,7 +8101,7 @@ pub(crate) fn binomial_location_scale_expected_info_contracted_trace_matches_sec
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: Some(base.threshold_design.clone()),
         log_sigma_design: Some(base.log_sigma_design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let specs = vec![base.threshold_spec, base.log_sigma_spec];
     let x_t = specs[BinomialLocationScaleFamily::BLOCK_T]
@@ -8167,7 +8167,7 @@ pub(crate) fn binomial_location_scale_expected_hphi_drift_matches_finite_differe
         link_kind: InverseLink::Standard(StandardLink::Probit),
         threshold_design: Some(base.threshold_design.clone()),
         log_sigma_design: Some(base.log_sigma_design.clone()),
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let specs = vec![base.threshold_spec, base.log_sigma_spec];
     let x_t = specs[BinomialLocationScaleFamily::BLOCK_T]
@@ -8384,7 +8384,7 @@ pub(crate) fn binomial_mean_wiggle_planner_keeps_second_order_at_large_n() {
         wiggle_knots: initializewiggle_knots_from_seed(Array1::linspace(-1.0, 1.0, 9).view(), 3, 4)
             .expect("large-n knots"),
         wiggle_degree: 3,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let specs = vec![
         ParameterBlockSpec {
@@ -8715,7 +8715,7 @@ pub(crate) fn gaussian_location_scale_psi_joint_hessian_pins_fisher_cross_zero()
 #[test]
 pub(crate) fn binomial_location_scale_wiggle_hessian_row_pieces_match_jet_tower_932() {
     use super::binomial_q_derivs::binomial_neglog_q_derivatives_dispatch;
-    use crate::families::jet_tower::Tower2;
+    use gam_math::jet_tower::Tower2;
 
     let (probit_family, states, _specs, _xt, _xls, _wd) = bls_wiggle_workspace_fixture();
     let n = probit_family.y.len();

@@ -39,12 +39,12 @@
 //! covariate, and (2) a near-linear truth on a `year`-scale axis is recovered
 //! with a sane held-out R² rather than the catastrophic negative value.
 
+use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 
 /// Fit `y ~ s(x, bs="ps", k=10, double_penalty=<dp>)` on `(x, y)` and return the
@@ -105,7 +105,11 @@ fn fit_predict_ps(x: &[f64], y: &[f64], grid: &[f64]) -> Vec<f64> {
 fn r2_of(pred: &[f64], y_test: &[f64]) -> f64 {
     let n = y_test.len() as f64;
     let mean = y_test.iter().sum::<f64>() / n;
-    let ss_tot: f64 = y_test.iter().map(|&y| (y - mean).powi(2)).sum::<f64>().max(1e-12);
+    let ss_tot: f64 = y_test
+        .iter()
+        .map(|&y| (y - mean).powi(2))
+        .sum::<f64>()
+        .max(1e-12);
     let ss_res: f64 = pred
         .iter()
         .zip(y_test.iter())

@@ -4,7 +4,6 @@ pub mod certificate_impls;
 pub mod certificates;
 pub mod checkpoint_dynamics;
 pub mod conformal;
-pub mod data;
 pub mod diagnostics;
 pub mod dispersion_cov;
 pub mod fisher_rao;

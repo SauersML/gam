@@ -16,7 +16,7 @@ impl BernoulliMarginalSlopeFamily {
         let primary = &cache.primary;
         let n = self.y.len();
         let started = std::time::Instant::now();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS exact-gradient eval n={n} p={}",
             slices.total
         ));
@@ -2723,7 +2723,7 @@ impl BernoulliMarginalSlopeFamily {
         let n_dirs = d_beta_flats.len();
         let flex_active = self.effective_flex_active(block_states)?;
         let bundle_present = cache.row_cell_moments.is_some();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS batched dH n={n} rows={n_rows} p={} dirs={n_dirs} flex={flex_active} cell_moments_bundle={bundle_present}",
             slices.total
         ));
@@ -3464,7 +3464,7 @@ impl BernoulliMarginalSlopeFamily {
         let n_unique_dirs = unique_dirs.len();
         let flex_active = self.effective_flex_active(block_states)?;
         let bundle_present = cache.row_cell_moments.is_some();
-        let process_monitor_guard = crate::process_monitor::track_scope(format!(
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
             "BMS batched d2H n={n} rows={n_rows} p={} pairs={n_pairs} unique_dirs={n_unique_dirs} flex={flex_active} cell_moments_bundle={bundle_present}",
             slices.total
         ));

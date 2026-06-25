@@ -34,7 +34,8 @@ fn cylinder_data(n: usize) -> gam::data::EncodedDataset {
             StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "cyl", e))
+    encode_recordswith_inferred_schema(headers, rows)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "cyl", e))
 }
 
 fn periodic_1d_data(n: usize) -> gam::data::EncodedDataset {
@@ -46,7 +47,8 @@ fn periodic_1d_data(n: usize) -> gam::data::EncodedDataset {
             StringRecord::from(vec![theta.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "p1d", e))
+    encode_recordswith_inferred_schema(headers, rows)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "p1d", e))
 }
 
 fn bc_1d_data(n: usize) -> gam::data::EncodedDataset {
@@ -59,7 +61,8 @@ fn bc_1d_data(n: usize) -> gam::data::EncodedDataset {
             StringRecord::from(vec![x.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "bc", e))
+    encode_recordswith_inferred_schema(headers, rows)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "bc", e))
 }
 
 fn sphere_data(n: usize) -> gam::data::EncodedDataset {
@@ -78,7 +81,8 @@ fn sphere_data(n: usize) -> gam::data::EncodedDataset {
             StringRecord::from(vec![lat.to_string(), lon.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "sphere", e))
+    encode_recordswith_inferred_schema(headers, rows)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "sphere", e))
 }
 
 fn time_fit(formula: &str, data: &gam::data::EncodedDataset, cfg: &FitConfig) -> (f64, usize) {
@@ -96,7 +100,7 @@ fn time_fit(formula: &str, data: &gam::data::EncodedDataset, cfg: &FitConfig) ->
 }
 
 #[test]
-fn large_scale_perf_cylinder_n1m() { 
+fn large_scale_perf_cylinder_n1m() {
     init_parallelism();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -112,7 +116,7 @@ fn large_scale_perf_cylinder_n1m() {
 }
 
 #[test]
-fn large_scale_perf_periodic_1d_n1m() { 
+fn large_scale_perf_periodic_1d_n1m() {
     init_parallelism();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -128,7 +132,7 @@ fn large_scale_perf_periodic_1d_n1m() {
 }
 
 #[test]
-fn large_scale_perf_bc_1d_n1m() { 
+fn large_scale_perf_bc_1d_n1m() {
     init_parallelism();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -140,7 +144,7 @@ fn large_scale_perf_bc_1d_n1m() {
 }
 
 #[test]
-fn large_scale_perf_sphere_wahba_n100k() { 
+fn large_scale_perf_sphere_wahba_n100k() {
     // Sphere Wahba kernel is O(N·K), so at N=1M K=50 = 50M kernel evals,
     // which dominates. Cap at N=100K for now to keep the test under a
     // minute.
@@ -155,7 +159,7 @@ fn large_scale_perf_sphere_wahba_n100k() {
 }
 
 #[test]
-fn large_scale_perf_sphere_harmonic_n1m() { 
+fn large_scale_perf_sphere_harmonic_n1m() {
     init_parallelism();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -196,11 +200,12 @@ fn noisy_cylinder_data(n: usize, noise_sd: f64, seed: u64) -> gam::data::Encoded
             StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
         .collect();
-    encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "noisy", e))
+    encode_recordswith_inferred_schema(headers, rows)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "noisy", e))
 }
 
 #[test]
-fn large_scale_perf_cylinder_noisy_n100k_accuracy() { 
+fn large_scale_perf_cylinder_noisy_n100k_accuracy() {
     // Fit on noisy data, check that |residuals| has expected scale.
     init_parallelism();
     let cfg = FitConfig {
@@ -219,7 +224,7 @@ fn large_scale_perf_cylinder_noisy_n100k_accuracy() {
 }
 
 #[test]
-fn large_scale_perf_mixed_three_smooths_n100k() { 
+fn large_scale_perf_mixed_three_smooths_n100k() {
     // Compound model: periodic 1D + BC 1D + sphere harmonic. Tests that
     // mixed-feature models build and fit at large scale.
     init_parallelism();
@@ -254,7 +259,8 @@ fn large_scale_perf_mixed_three_smooths_n100k() {
             ])
         })
         .collect();
-    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "mixed", e));
+    let data = encode_recordswith_inferred_schema(headers, rows)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "mixed", e));
     let (ms, p) = time_fit(
         "y ~ cyclic(theta, period_start=0, period_end=6.283185307179586) + s(x, bc=anchored) + sphere(lat, lon, method=harmonic, max_degree=3)",
         &data,
@@ -264,7 +270,7 @@ fn large_scale_perf_mixed_three_smooths_n100k() {
 }
 
 #[test]
-fn large_scale_perf_binomial_cylinder_n100k() { 
+fn large_scale_perf_binomial_cylinder_n100k() {
     init_parallelism();
     let n = 100_000;
     let headers = vec!["theta".into(), "h".into(), "y".into()];
@@ -282,7 +288,8 @@ fn large_scale_perf_binomial_cylinder_n100k() {
             StringRecord::from(vec![theta.to_string(), h.to_string(), y.to_string()])
         })
         .collect();
-    let data = encode_recordswith_inferred_schema(headers, rows).unwrap_or_else(|e| panic!("{} failed: {:?}", "bin", e));
+    let data = encode_recordswith_inferred_schema(headers, rows)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "bin", e));
     let cfg = FitConfig {
         family: Some("binomial".to_string()),
         ..FitConfig::default()
@@ -387,7 +394,8 @@ fn time_design_build_and_apply(
     use rand_distr::{Distribution, Normal};
 
     let t_build = Instant::now();
-    let design = build_term_collection_design(data.view(), spec).unwrap_or_else(|e| panic!("{} failed: {:?}", "te(x, h) design build", e));
+    let design = build_term_collection_design(data.view(), spec)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "te(x, h) design build", e));
     let ms_build = t_build.elapsed().as_secs_f64() * 1e3;
     let term = &design.smooth.term_designs[0];
     let p = term.ncols();

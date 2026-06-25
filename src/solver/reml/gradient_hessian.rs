@@ -4536,12 +4536,14 @@ impl<'a> RemlState<'a> {
         }
     }
 
-    /// Outer-loop [`crate::warm_start::Session`] for this fit, derived from the
+    /// Outer-loop [`gam_runtime::warm_start::Session`] for this fit, derived from the
     /// same realized-fit-context key as the inner beta record. Disjoint
     /// keyspace, so inner and outer payloads don't collide.
     ///
     /// Returns `None` if no platform cache directory is discoverable.
-    pub(crate) fn outer_cache_session(&self) -> Option<std::sync::Arc<crate::warm_start::Session>> {
+    pub(crate) fn outer_cache_session(
+        &self,
+    ) -> Option<std::sync::Arc<gam_runtime::warm_start::Session>> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
         }

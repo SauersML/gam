@@ -134,7 +134,10 @@ fn build_data(seed: u64) -> (gam::data::EncodedDataset, Vec<f64>) {
     for _ in 0..N {
         let xi = rng.next_unit();
         let yi = rng.next_tweedie(truth_mean(xi), P_TWEEDIE, PHI);
-        assert!(yi.is_finite() && yi >= 0.0, "Tweedie y must be non-negative finite");
+        assert!(
+            yi.is_finite() && yi >= 0.0,
+            "Tweedie y must be non-negative finite"
+        );
         x.push(xi);
         y.push(yi);
     }

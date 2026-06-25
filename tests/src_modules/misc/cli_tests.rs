@@ -154,8 +154,8 @@ fn bounded_cli_dataset() -> Dataset {
 }
 
 fn bounded_cli_termspec() -> TermCollectionSpec {
-    let parsed =
-        parse_formula("y ~ bounded(x, min=-2, max=2) + link(type=logit)").unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
+    let parsed = parse_formula("y ~ bounded(x, min=-2, max=2) + link(type=logit)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     let ds = bounded_cli_dataset();
     let col_map = HashMap::from([("x".to_string(), 0usize), ("y".to_string(), 1usize)]);
     let mut inference_notes = Vec::<String>::new();
@@ -557,7 +557,8 @@ mod saved_survival_marginal_slope_test_support {
 }
 
 fn csv_mean_at(path: &std::path::Path, row_idx: usize) -> f64 {
-    let mut rdr = csv::Reader::from_path(path).unwrap_or_else(|e| panic!("{} failed: {:?}", "open prediction csv", e));
+    let mut rdr = csv::Reader::from_path(path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "open prediction csv", e));
     let rows = rdr
         .deserialize::<BTreeMap<String, String>>()
         .collect::<Result<Vec<_>, _>>()
@@ -676,8 +677,8 @@ fn cli_firth_validation_uses_shared_family_support_rule() {
 
 #[test]
 fn cli_firth_validation_accepts_binomial_cloglog() {
-    let link_choice =
-        parse_link_choice(Some("binomial-cloglog"), false).unwrap_or_else(|e| panic!("{} failed: {:?}", "parse cloglog link", e));
+    let link_choice = parse_link_choice(Some("binomial-cloglog"), false)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse cloglog link", e));
     let validation = validate_cli_firth_configuration(CliFirthValidation {
         enabled: true,
         family: LikelihoodSpec::binomial_cloglog(),
@@ -699,7 +700,8 @@ fn cli_firth_validation_accepts_bounded_binomial_logit_terms() {
         "fixture must exercise bounded coefficient geometry"
     );
 
-    let link_choice = parse_link_choice(Some("binomial-logit"), false).unwrap_or_else(|e| panic!("{} failed: {:?}", "parse logit link", e));
+    let link_choice = parse_link_choice(Some("binomial-logit"), false)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse logit link", e));
     validate_cli_firth_configuration(CliFirthValidation {
         enabled: true,
         family: LikelihoodSpec::binomial_logit(),
@@ -707,7 +709,12 @@ fn cli_firth_validation_accepts_bounded_binomial_logit_terms() {
         is_survival: false,
         link_choice: link_choice.as_ref(),
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "--firth is a likelihood policy, not a bounded-term policy", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "--firth is a likelihood policy, not a bounded-term policy", e
+        )
+    });
 }
 
 #[test]
@@ -730,7 +737,8 @@ fn cli_sample_bounded_model_reaches_sampler_config_validation() {
     let data_path = td.path().join("bounded.csv");
     let out_path = td.path().join("draws.csv");
 
-    fs::write(&data_path, "x,y\n0.0,0.0\n0.5,1.0\n1.0,1.0\n").unwrap_or_else(|e| panic!("{} failed: {:?}", "write data", e));
+    fs::write(&data_path, "x,y\n0.0,0.0\n0.5,1.0\n1.0,1.0\n")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write data", e));
 
     let mut payload = test_payload(
         "y ~ bounded(x, min=-2, max=2)",
@@ -771,7 +779,8 @@ fn cli_sample_bounded_model_reaches_sampler_config_validation() {
     payload.data_schema = Some(bounded_cli_schema());
     payload.resolved_termspec = Some(bounded_cli_termspec());
     payload.set_training_feature_metadata(vec!["x".to_string(), "y".to_string()], vec![]);
-    write_model_json(&model_path, &SavedModel::from_payload(payload)).unwrap_or_else(|e| panic!("{} failed: {:?}", "write model", e));
+    write_model_json(&model_path, &SavedModel::from_payload(payload))
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write model", e));
 
     let err = run_sample(SampleArgs {
         model: model_path,
@@ -796,7 +805,8 @@ fn cli_sample_bounded_model_reaches_sampler_config_validation() {
 
 #[test]
 fn required_columns_for_fit_includes_auxiliary_formula_columns() {
-    let parsed = parse_formula("y ~ x + s(pc1, pc2, type=tensor)").unwrap_or_else(|e| panic!("{} failed: {:?}", "parse main formula", e));
+    let parsed = parse_formula("y ~ x + s(pc1, pc2, type=tensor)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse main formula", e));
     let mut args = location_scale_fit_args(
         PathBuf::from("train.csv"),
         PathBuf::from("model.json"),
@@ -806,7 +816,8 @@ fn required_columns_for_fit_includes_auxiliary_formula_columns() {
     args.logslope_formula = Some("slope_x + slope_z".to_string());
     args.z_column = Some("z_anchor".to_string());
 
-    let required = required_columns_for_fit(&args, &parsed).unwrap_or_else(|e| panic!("{} failed: {:?}", "required columns", e));
+    let required = required_columns_for_fit(&args, &parsed)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "required columns", e));
 
     assert_eq!(
         required,
@@ -1093,7 +1104,7 @@ fn cli_resolve_family_rejects_theta_without_negative_binomial() {
 }
 
 #[test]
-fn cli_firth_validation_allows_flexible_logit_base_link() { 
+fn cli_firth_validation_allows_flexible_logit_base_link() {
     let choice = LinkChoice {
         mode: LinkMode::Flexible,
         link: LinkFunction::Logit,
@@ -1107,7 +1118,12 @@ fn cli_firth_validation_allows_flexible_logit_base_link() {
         is_survival: false,
         link_choice: Some(&choice),
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "flexible logit should remain eligible for Firth", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "flexible logit should remain eligible for Firth", e
+        )
+    });
 }
 
 #[test]
@@ -1129,7 +1145,8 @@ fn cli_firth_validation_rejects_survival_models() {
 
 #[test]
 fn cli_firth_preflight_accepts_redundant_survival_marginal_slope_flag() {
-    let parsed = parse_formula("Surv(t0, t1, event) ~ x").unwrap_or_else(|e| panic!("{} failed: {:?}", "parse survival formula", e));
+    let parsed = parse_formula("Surv(t0, t1, event) ~ x")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse survival formula", e));
     let mut args = location_scale_fit_args(
         PathBuf::from("train.csv"),
         PathBuf::from("model.json"),
@@ -1164,7 +1181,8 @@ fn cli_predict_noise_without_explicit_link_uses_binomial_logit_base_link() {
     ))
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "location-scale fit should succeed", e));
 
-    let saved = SavedModel::load_from_path(&model_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+    let saved = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
     assert_eq!(
         saved.link.as_ref(),
         Some(&InverseLink::Standard(StandardLink::Logit))
@@ -1239,15 +1257,24 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         pilot_subsample_threshold: 0,
         out: Some(model_path.clone()),
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "survival predict-noise fit should succeed", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "survival predict-noise fit should succeed", e
+        )
+    });
 
-    let saved = SavedModel::load_from_path(&model_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted survival model", e));
+    let saved = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted survival model", e));
     assert_eq!(saved.formula, "Surv(entry, exit, event) ~ 1");
     assert_eq!(saved.formula_noise.as_deref(), Some("1"));
     assert_eq!(saved.survival_likelihood.as_deref(), Some("location-scale"));
     assert!(saved.survival_beta_log_sigma.is_some());
     assert!(saved.resolved_termspec_noise.is_some());
-    let fit_result = saved.fit_result.as_ref().unwrap_or_else(|| panic!("{} failed", "saved fit_result"));
+    let fit_result = saved
+        .fit_result
+        .as_ref()
+        .unwrap_or_else(|| panic!("{} failed", "saved fit_result"));
     let covariance = fit_result
         .beta_covariance()
         .or(fit_result.beta_covariance_corrected())
@@ -1284,9 +1311,15 @@ fn cli_surv_predict_noise_routes_to_survival_location_scale() {
         mode: PredictModeArg::PosteriorMean,
         no_bias_correction: false,
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved survival posterior-mean predict should succeed", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "saved survival posterior-mean predict should succeed", e
+        )
+    });
 
-    let pred_text = fs::read_to_string(&pred_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read survival prediction csv", e));
+    let pred_text = fs::read_to_string(&pred_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "read survival prediction csv", e));
     let header = pred_text.lines().next().unwrap_or("");
     for required in ["mean", "std_error", "mean_lower", "mean_upper"] {
         assert!(
@@ -1371,9 +1404,15 @@ fn cli_predict_noise_with_explicit_probit_keeps_binomial_probit_base_link() {
         "y ~ x1 + link(type=probit)",
         "x2",
     ))
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "explicit probit location-scale fit should succeed", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "explicit probit location-scale fit should succeed", e
+        )
+    });
 
-    let saved = SavedModel::load_from_path(&model_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+    let saved = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
     assert_eq!(
         saved.link.as_ref(),
         Some(&InverseLink::Standard(StandardLink::Probit))
@@ -1438,9 +1477,15 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         pilot_subsample_threshold: 0,
         out: Some(model_path.clone()),
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "bernoulli marginal-slope fit should succeed", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "bernoulli marginal-slope fit should succeed", e
+        )
+    });
 
-    let saved = SavedModel::load_from_path(&model_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+    let saved = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
     let fit_result = saved
         .fit_result
         .as_ref()
@@ -1464,9 +1509,15 @@ fn cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds
         mode: PredictModeArg::PosteriorMean,
         no_bias_correction: false,
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "default posterior-mean marginal-slope predict should succeed", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "default posterior-mean marginal-slope predict should succeed", e
+        )
+    });
 
-    let pred_text = fs::read_to_string(&pred_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read prediction csv", e));
+    let pred_text = fs::read_to_string(&pred_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "read prediction csv", e));
     let header = pred_text.lines().next().unwrap_or("");
     for required in ["mean", "std_error", "mean_lower", "mean_upper"] {
         assert!(
@@ -1661,9 +1712,12 @@ fn saved_bernoulli_marginal_slope_replays_main_and_logslope_deviation_runtimes()
     payload.link_deviation_runtime = Some(saved_runtime());
 
     let saved = SavedModel::from_payload(payload);
-    let runtime = saved
-        .saved_prediction_runtime()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved marginal-slope runtime should replay", e));
+    let runtime = saved.saved_prediction_runtime().unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "saved marginal-slope runtime should replay", e
+        )
+    });
     assert!(
         runtime.score_warp.is_some(),
         "logslope-formula linkwiggle should persist score-warp runtime"
@@ -1766,12 +1820,21 @@ fn nonlinear_saved_model_with_hessian_only_remains_persistable_and_predictable()
     payload.resolved_termspec = Some(empty_termspec());
 
     let model = SavedModel::from_payload(payload);
-    model
-        .save_to_path(&model_path)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "hessian-only nonlinear model should save", e));
-    let loaded = SavedModel::load_from_path(&model_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "reload hessian-only model", e));
-    let covariance = covariance_from_model(&loaded, CovarianceModeArg::Conditional)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "recover covariance from saved penalized Hessian", e));
+    model.save_to_path(&model_path).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "hessian-only nonlinear model should save", e
+        )
+    });
+    let loaded = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "reload hessian-only model", e));
+    let covariance =
+        covariance_from_model(&loaded, CovarianceModeArg::Conditional).unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "recover covariance from saved penalized Hessian", e
+            )
+        });
     assert_eq!(covariance.dim(), (1, 1));
     assert!((covariance[[0, 0]] - 0.5).abs() < 1e-12);
 }
@@ -1828,7 +1891,8 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
     };
     run_fit(fit_args).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit should succeed", e));
 
-    let saved = SavedModel::load_from_path(&model_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+    let saved = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
     let fit_result = saved
         .fit_result
         .as_ref()
@@ -1851,9 +1915,15 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         mode: PredictModeArg::PosteriorMean,
         no_bias_correction: false,
     };
-    run_predict(predict_args).unwrap_or_else(|e| panic!("{} failed: {:?}", "default posterior-mean predict should succeed", e));
+    run_predict(predict_args).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "default posterior-mean predict should succeed", e
+        )
+    });
 
-    let pred_text = fs::read_to_string(&pred_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read prediction csv", e));
+    let pred_text = fs::read_to_string(&pred_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "read prediction csv", e));
     let header = pred_text.lines().next().unwrap_or("");
     for required in ["mean", "std_error", "mean_lower", "mean_upper"] {
         assert!(
@@ -1920,7 +1990,8 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
     };
     run_fit(fit_args).unwrap_or_else(|e| panic!("{} failed: {:?}", "Firth fit should succeed", e));
 
-    let saved = SavedModel::load_from_path(&model_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+    let saved = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
     let fit_result = saved
         .fit_result
         .as_ref()
@@ -1943,10 +2014,15 @@ fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
         mode: PredictModeArg::PosteriorMean,
         no_bias_correction: false,
     };
-    run_predict(predict_args)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "default posterior-mean predict should succeed after Firth fit", e));
+    run_predict(predict_args).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "default posterior-mean predict should succeed after Firth fit", e
+        )
+    });
 
-    let pred_text = fs::read_to_string(&pred_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read prediction csv", e));
+    let pred_text = fs::read_to_string(&pred_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "read prediction csv", e));
     let header = pred_text.lines().next().unwrap_or("");
     for required in ["mean", "std_error", "mean_lower", "mean_upper"] {
         assert!(
@@ -2128,10 +2204,12 @@ fn intercept_only_binomial_mean_wiggle_model(
         ModelKind::Standard,
         FittedFamily::Standard {
             likelihood: family,
-            link: Some(
-                StandardLink::try_from(link)
-                    .unwrap_or_else(|e| panic!("{} failed: {:?}", "binomial mean-wiggle test helper requires a standard link", e)),
-            ),
+            link: Some(StandardLink::try_from(link).unwrap_or_else(|e| {
+                panic!(
+                    "{} failed: {:?}",
+                    "binomial mean-wiggle test helper requires a standard link", e
+                )
+            })),
             latent_cloglog_state: None,
             mixture_state: None,
             sas_state: None,
@@ -2140,8 +2218,12 @@ fn intercept_only_binomial_mean_wiggle_model(
     );
     payload.fit_result = Some(fit_result);
     payload.link = Some(InverseLink::Standard(
-        StandardLink::try_from(link)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "binomial mean-wiggle test helper requires a standard link", e)),
+        StandardLink::try_from(link).unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "binomial mean-wiggle test helper requires a standard link", e
+            )
+        }),
     ));
     payload.linkwiggle_knots = Some(wiggle_knots);
     payload.linkwiggle_degree = Some(wiggle_degree);
@@ -2155,8 +2237,10 @@ fn posterior_mean_prediction_for_model(model: &SavedModel) -> f64 {
     let model_path = td.path().join("model.json");
     let data_path = td.path().join("new_data.csv");
     let out_path = td.path().join("pred.csv");
-    write_model_json(&model_path, model).unwrap_or_else(|e| panic!("{} failed: {:?}", "write saved model", e));
-    fs::write(&data_path, "unused\n0\n").unwrap_or_else(|e| panic!("{} failed: {:?}", "write prediction data", e));
+    write_model_json(&model_path, model)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write saved model", e));
+    fs::write(&data_path, "unused\n0\n")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write prediction data", e));
     let args = PredictArgs {
         model: model_path,
         new_data: data_path,
@@ -2170,7 +2254,8 @@ fn posterior_mean_prediction_for_model(model: &SavedModel) -> f64 {
         mode: PredictModeArg::PosteriorMean,
         no_bias_correction: false,
     };
-    run_predict(args).unwrap_or_else(|e| panic!("{} failed: {:?}", "predict binomial location-scale", e));
+    run_predict(args)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "predict binomial location-scale", e));
     csv_mean_at(&out_path, 0)
 }
 
@@ -2192,8 +2277,11 @@ fn standard_fixed_link_wiggle_prediction_runs() {
         2,
     );
 
-    let predictor = model.predictor().unwrap_or_else(|| panic!("{} failed", "predictor"));
-    let fit = super::fit_result_from_saved_model_for_prediction(&model).unwrap_or_else(|e| panic!("{} failed: {:?}", "fit result", e));
+    let predictor = model
+        .predictor()
+        .unwrap_or_else(|| panic!("{} failed", "predictor"));
+    let fit = super::fit_result_from_saved_model_for_prediction(&model)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit result", e));
     let input = super::PredictInput {
         design: super::DesignMatrix::from(Array2::<f64>::ones((3, 1))),
         offset: Array1::zeros(3),
@@ -2334,7 +2422,9 @@ fn classify_cli_errorspecializes_thin_plate_knot_count_error() {
             "failed to build term collection design: Invalid input: thin-plate spline requires at least d+1 knots (7), got 3"
                 .to_string(),
         );
-    let advice = err.advice().unwrap_or_else(|| panic!("{} failed", "thin-plate advice"));
+    let advice = err
+        .advice()
+        .unwrap_or_else(|| panic!("{} failed", "thin-plate advice"));
     assert!(advice.contains("Increase the number of centers/knots"));
     assert!(!advice.contains("Shape mismatch detected"));
 }
@@ -2353,7 +2443,9 @@ fn classify_cli_errorspecializes_duchon_power_too_low() {
              raise power to >= 9 (or reduce the joint smooth's dimension)."
             .to_string(),
     );
-    let advice = err.advice().unwrap_or_else(|| panic!("{} failed", "duchon advice"));
+    let advice = err
+        .advice()
+        .unwrap_or_else(|| panic!("{} failed", "duchon advice"));
     assert!(advice.contains("power"));
     assert!(!advice.contains("Shape mismatch detected"));
 }
@@ -2364,7 +2456,9 @@ fn classify_cli_errorspecializes_thin_plate_knot_error() {
             "failed to build term collection design: Invalid input: thin-plate spline requires at least d+1 knots (13), got 12"
                 .to_string(),
         );
-    let advice = err.advice().unwrap_or_else(|| panic!("{} failed", "thin-plate advice"));
+    let advice = err
+        .advice()
+        .unwrap_or_else(|| panic!("{} failed", "thin-plate advice"));
     assert!(advice.contains("Increase the number of centers/knots"));
     assert!(!advice.contains("Shape mismatch detected"));
 }
@@ -2436,8 +2530,10 @@ fn concordance_depends_on_score_semantics() {
 
 #[test]
 fn chi_square_tail_probability_is_monotone_in_statistic() {
-    let p_small = chi_square_survival_approx(0.5, 4.0).unwrap_or_else(|| panic!("{} failed", "p_small"));
-    let p_large = chi_square_survival_approx(12.0, 4.0).unwrap_or_else(|| panic!("{} failed", "p_large"));
+    let p_small =
+        chi_square_survival_approx(0.5, 4.0).unwrap_or_else(|| panic!("{} failed", "p_small"));
+    let p_large =
+        chi_square_survival_approx(12.0, 4.0).unwrap_or_else(|| panic!("{} failed", "p_large"));
     assert!(p_large < p_small);
     assert!((0.0..=1.0).contains(&p_small));
     assert!((0.0..=1.0).contains(&p_large));
@@ -2520,19 +2616,34 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
         artifacts: Default::default(),
         inner_cycles: 3,
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "construct compactable unified fit result", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "construct compactable unified fit result", e
+        )
+    });
 
     compact_fit_result_for_batch(&mut fit);
 
-    let inf = fit.inference.as_ref().unwrap_or_else(|| panic!("{} failed", "inference kept"));
-    let geom = fit.geometry.as_ref().unwrap_or_else(|| panic!("{} failed", "geometry kept"));
+    let inf = fit
+        .inference
+        .as_ref()
+        .unwrap_or_else(|| panic!("{} failed", "inference kept"));
+    let geom = fit
+        .geometry
+        .as_ref()
+        .unwrap_or_else(|| panic!("{} failed", "geometry kept"));
     assert_eq!(inf.working_weights.len(), 0);
     assert_eq!(inf.working_response.len(), 0);
     assert!(inf.reparam_qs.is_none());
     assert_eq!(geom.working_weights.len(), 0);
     assert_eq!(geom.working_response.len(), 0);
-    fit.validate_numeric_finiteness()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "compacted fit result remains persistable", e));
+    fit.validate_numeric_finiteness().unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "compacted fit result remains persistable", e
+        )
+    });
 }
 
 #[test]
@@ -2560,9 +2671,10 @@ fn core_saved_fit_result_json_roundtripswith_finite_summary() {
             reml_score: 0.95,
         },
     );
-    let payload = serde_json::to_string(&fit).unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize fit result", e));
-    let parsed: gam::estimate::UnifiedFitResult =
-        serde_json::from_str(&payload).unwrap_or_else(|e| panic!("{} failed: {:?}", "deserialize fit result", e));
+    let payload = serde_json::to_string(&fit)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize fit result", e));
+    let parsed: gam::estimate::UnifiedFitResult = serde_json::from_str(&payload)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "deserialize fit result", e));
     assert_eq!(parsed.outer_gradient_norm, Some(0.25));
     assert_eq!(parsed.deviance, 1.5);
     assert_eq!(parsed.reml_score, 0.95);
@@ -2570,7 +2682,8 @@ fn core_saved_fit_result_json_roundtripswith_finite_summary() {
 
 #[test]
 fn parse_bounded_linear_term_defaults_to_no_prior() {
-    let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1) + z").unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
+    let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1) + z")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
     match &parsed.terms[0] {
         ParsedTerm::BoundedLinear {
@@ -2592,8 +2705,8 @@ fn parse_bounded_linear_term_defaults_to_no_prior() {
 
 #[test]
 fn parse_bounded_linear_termwith_center_pull() {
-    let parsed =
-        parse_formula("y ~ bounded(mu_hat, min=0, max=1, pull=\"center\") + z").unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
+    let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, pull=\"center\") + z")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
     match &parsed.terms[0] {
         ParsedTerm::BoundedLinear {
@@ -2617,8 +2730,8 @@ fn parse_bounded_linear_termwith_center_pull() {
 
 #[test]
 fn parse_bounded_linear_termwith_uniform_prior() {
-    let parsed =
-        parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=\"uniform\") + z").unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
+    let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=\"uniform\") + z")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
     match &parsed.terms[0] {
         ParsedTerm::BoundedLinear {
@@ -2935,8 +3048,8 @@ fn warns_for_nested_smooth_terms_with_hierarchical_ownership() {
 
 #[test]
 fn parse_linear_termwith_box_constraints() {
-    let parsed =
-        parse_formula("y ~ linear(mu_hat, min=0, max=1) + nonpositive(z)").unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
+    let parsed = parse_formula("y ~ linear(mu_hat, min=0, max=1) + nonpositive(z)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
     match &parsed.terms[0] {
         ParsedTerm::Linear {
@@ -2969,7 +3082,8 @@ fn parse_linear_termwith_box_constraints() {
 
 #[test]
 fn build_termspec_leaves_parametric_linear_terms_unpenalized_by_default() {
-    let parsed = parse_formula("y ~ x + linear(z) + nonnegative(w)").unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
+    let parsed = parse_formula("y ~ x + linear(z) + nonnegative(w)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     let ds = Dataset {
         headers: vec!["x".to_string(), "z".to_string(), "w".to_string()],
         values: array![[1.0, 2.0, 3.0], [1.5, 2.5, 3.5], [2.0, 3.0, 4.0],],
@@ -3028,7 +3142,8 @@ fn build_termspec_leaves_parametric_linear_terms_unpenalized_by_default() {
 fn build_termspec_accepts_joint_thinplate_above_three_dimensions() {
     // TPS supports arbitrary dimensions via the general polyharmonic kernel
     // with auto-selected penalty order m = floor(d/2) + 1.
-    let parsed = parse_formula("y ~ thinplate(pc1, pc2, pc3, pc4, centers=6)").unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
+    let parsed = parse_formula("y ~ thinplate(pc1, pc2, pc3, pc4, centers=6)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     let n = 20;
     let mut rng = 42u64;
     let mut vals = Array2::<f64>::zeros((n, 4));
@@ -3096,8 +3211,11 @@ fn build_termspec_accepts_joint_thinplate_above_three_dimensions() {
 
 #[test]
 fn parse_linkwiggle_defaults_to_all_penalty_orders() {
-    let parsed = parse_formula("y ~ x + linkwiggle(degree=4, internal_knots=9)").unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
-    let lw = parsed.linkwiggle.unwrap_or_else(|| panic!("{} failed", "expected linkwiggle config"));
+    let parsed = parse_formula("y ~ x + linkwiggle(degree=4, internal_knots=9)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
+    let lw = parsed
+        .linkwiggle
+        .unwrap_or_else(|| panic!("{} failed", "expected linkwiggle config"));
     assert_eq!(lw.degree, 4);
     assert_eq!(lw.num_internal_knots, 9);
     assert_eq!(lw.penalty_orders, vec![1, 2, 3]);
@@ -3121,7 +3239,10 @@ fn marginal_slope_linkwiggle_routes_into_anchored_deviation_config() {
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     let routed = super::deviation_block_config_from_formula_linkwiggle(
-        parsed.linkwiggle.as_ref().unwrap_or_else(|| panic!("{} failed", "linkwiggle config")),
+        parsed
+            .linkwiggle
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} failed", "linkwiggle config")),
     )
     .expect("cubic linkwiggle must route into the deviation config");
     assert_eq!(routed.degree, 3);
@@ -3146,9 +3267,17 @@ fn marginal_slope_linkwiggle_rejects_non_cubic_degree_at_routing_boundary() {
         let parsed = parse_formula(&format!(
             "y ~ x + linkwiggle(degree={deg}, internal_knots=9)"
         ))
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "non-cubic linkwiggle must still parse at the shared layer", e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "non-cubic linkwiggle must still parse at the shared layer", e
+            )
+        });
         let err = super::deviation_block_config_from_formula_linkwiggle(
-            parsed.linkwiggle.as_ref().unwrap_or_else(|| panic!("{} failed", "linkwiggle config")),
+            parsed
+                .linkwiggle
+                .as_ref()
+                .unwrap_or_else(|| panic!("{} failed", "linkwiggle config")),
         )
         .expect_err("non-cubic linkwiggle must be rejected when routed into the cubic block");
         assert!(
@@ -3183,8 +3312,12 @@ fn marginal_slope_deviation_routing_splits_main_and_logslope_linkwiggles() {
         parsed_logslope.linkwiggle.as_ref(),
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "routing", e));
-    let link_dev = routed.link_dev.unwrap_or_else(|| panic!("{} failed", "main link-deviation config"));
-    let score_warp = routed.score_warp.unwrap_or_else(|| panic!("{} failed", "logslope score-warp config"));
+    let link_dev = routed
+        .link_dev
+        .unwrap_or_else(|| panic!("{} failed", "main link-deviation config"));
+    let score_warp = routed
+        .score_warp
+        .unwrap_or_else(|| panic!("{} failed", "logslope score-warp config"));
     assert_eq!(link_dev.degree, 3);
     assert_eq!(link_dev.num_internal_knots, 9);
     assert_eq!(link_dev.penalty_order, 3);
@@ -3221,7 +3354,8 @@ fn marginal_slope_routing_rejects_non_cubic_in_either_slot() {
 
 #[test]
 fn bernoulli_marginal_slope_accepts_only_probit_base_link() {
-    let parsed = parse_formula("y ~ x + link(type=probit)").unwrap_or_else(|e| panic!("{} failed: {:?}", "main formula", e));
+    let parsed = parse_formula("y ~ x + link(type=probit)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "main formula", e));
     let resolved = super::resolve_bernoulli_marginal_slope_base_link(
         parsed.linkspec.as_ref(),
         "bernoulli marginal-slope",
@@ -3235,7 +3369,8 @@ fn bernoulli_marginal_slope_accepts_only_probit_base_link() {
         "y ~ x + link(type=beta-logistic, beta_logistic_init=\"0.3,0.7\")",
         "y ~ x + link(type=blended(logit,probit,cloglog), rho=\"0.4,-0.1\")",
     ] {
-        let parsed = parse_formula(formula).unwrap_or_else(|e| panic!("{} failed: {:?}", "main formula", e));
+        let parsed =
+            parse_formula(formula).unwrap_or_else(|e| panic!("{} failed: {:?}", "main formula", e));
         let err = super::resolve_bernoulli_marginal_slope_base_link(
             parsed.linkspec.as_ref(),
             "bernoulli marginal-slope",
@@ -3250,7 +3385,8 @@ fn bernoulli_marginal_slope_accepts_only_probit_base_link() {
 
 #[test]
 fn bernoulli_marginal_slope_rejects_flexible_and_unbounded_base_links() {
-    let parsed = parse_formula("y ~ x + link(type=flexible(logit))").unwrap_or_else(|e| panic!("{} failed: {:?}", "main formula", e));
+    let parsed = parse_formula("y ~ x + link(type=flexible(logit))")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "main formula", e));
     let err = super::resolve_bernoulli_marginal_slope_base_link(
         parsed.linkspec.as_ref(),
         "bernoulli marginal-slope",
@@ -3258,7 +3394,8 @@ fn bernoulli_marginal_slope_rejects_flexible_and_unbounded_base_links() {
     .expect_err("flexible link should be rejected");
     assert!(err.contains("does not accept flexible"));
 
-    let parsed = parse_formula("y ~ x + link(type=log)").unwrap_or_else(|e| panic!("{} failed: {:?}", "main formula", e));
+    let parsed = parse_formula("y ~ x + link(type=log)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "main formula", e));
     let err = super::resolve_bernoulli_marginal_slope_base_link(
         parsed.linkspec.as_ref(),
         "bernoulli marginal-slope",
@@ -3271,7 +3408,9 @@ fn bernoulli_marginal_slope_rejects_flexible_and_unbounded_base_links() {
 fn parse_timewiggle_defaults_to_all_penalty_orders() {
     let parsed = parse_formula("Surv(entry, exit, event) ~ timewiggle(degree=4, internal_knots=9)")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
-    let tw = parsed.timewiggle.unwrap_or_else(|| panic!("{} failed", "expected timewiggle config"));
+    let tw = parsed
+        .timewiggle
+        .unwrap_or_else(|| panic!("{} failed", "expected timewiggle config"));
     assert_eq!(tw.degree, 4);
     assert_eq!(tw.num_internal_knots, 9);
     assert_eq!(tw.penalty_orders, vec![1, 2, 3]);
@@ -3321,7 +3460,12 @@ fn bernoulli_marginal_slope_saved_model_persists_exact_kernel_metadata_only() {
         InverseLink::Standard(StandardLink::Probit),
         gam::families::survival::lognormal_kernel::FrailtySpec::None,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build bernoulli marginal-slope saved model", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "build bernoulli marginal-slope saved model", e
+        )
+    });
     assert_eq!(
         model.payload().latent_z_normalization,
         Some(SavedLatentZNormalization { mean: 0.2, sd: 1.3 })
@@ -3452,8 +3596,10 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
 
     // Full snapshot parity: serialize both, normalize away the
     // deliberately source-specific fields, and require byte equality.
-    let mut cli_json = serde_json::to_value(&cli_payload).unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize CLI payload", e));
-    let mut ffi_json = serde_json::to_value(&ffi_payload).unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize FFI payload", e));
+    let mut cli_json = serde_json::to_value(&cli_payload)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize CLI payload", e));
+    let mut ffi_json = serde_json::to_value(&ffi_payload)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize FFI payload", e));
     for json in [&mut cli_json, &mut ffi_json] {
         // Field names are kebab-case under the payload's
         // `#[serde(rename_all = "kebab-case")]`.
@@ -3540,9 +3686,16 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         InverseLink::Standard(StandardLink::Probit),
         gam::families::survival::lognormal_kernel::FrailtySpec::None,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build bernoulli marginal-slope saved model", e));
-    write_model_json(&model_path, &model).unwrap_or_else(|e| panic!("{} failed: {:?}", "write saved marginal-slope model", e));
-    fs::write(&data_path, "z\n3.0\n").unwrap_or_else(|e| panic!("{} failed: {:?}", "write prediction data", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "build bernoulli marginal-slope saved model", e
+        )
+    });
+    write_model_json(&model_path, &model)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write saved marginal-slope model", e));
+    fs::write(&data_path, "z\n3.0\n")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write prediction data", e));
 
     run_predict(PredictArgs {
         model: model_path,
@@ -3557,7 +3710,12 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
         mode: PredictModeArg::Map,
         no_bias_correction: false,
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved marginal-slope predict should succeed", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "saved marginal-slope predict should succeed", e
+        )
+    });
 
     let predicted = csv_mean_at(&out_path, 0);
     let expected = normal_cdf(1.0);
@@ -3600,7 +3758,12 @@ fn saved_marginal_slope_models_require_latent_z_normalization() {
         InverseLink::Standard(StandardLink::Probit),
         gam::families::survival::lognormal_kernel::FrailtySpec::None,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build bernoulli marginal-slope saved model", e))
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "build bernoulli marginal-slope saved model", e
+        )
+    })
     .payload()
     .clone();
     bernoulli.latent_z_normalization = None;
@@ -3664,7 +3827,9 @@ fn parse_link_formula_config_extracts_link_and_inits() {
             "y ~ x + link(type=sas, sas_init=\"0.1,-0.2\", rho=\"0.3\", beta_logistic_init=\"0.0,0.0\")",
         )
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
-    let cfg = parsed.linkspec.unwrap_or_else(|| panic!("{} failed", "expected link formula config"));
+    let cfg = parsed
+        .linkspec
+        .unwrap_or_else(|| panic!("{} failed", "expected link formula config"));
     assert_eq!(cfg.link, "sas");
     assert_eq!(cfg.sas_init.as_deref(), Some("0.1,-0.2"));
     assert_eq!(cfg.mixture_rho.as_deref(), Some("0.3"));
@@ -3690,7 +3855,8 @@ fn parse_duchon_power_defaults_to_cubic_rule_placeholder() {
     // column context, hands back the canonical 1.5 placeholder.
     let options = BTreeMap::new();
     assert_eq!(
-        parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "default Duchon power", e)),
+        parse_duchon_power(&options)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "default Duchon power", e)),
         1.5
     );
 }
@@ -3700,7 +3866,8 @@ fn parse_duchon_power_prefers_explicit_power() {
     let mut options = BTreeMap::new();
     options.insert("power".to_string(), "0".to_string());
     assert_eq!(
-        parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "power should parse", e)),
+        parse_duchon_power(&options)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "power should parse", e)),
         0.0
     );
 }
@@ -3712,7 +3879,8 @@ fn parse_duchon_power_accepts_fractional_power() {
     let mut options = BTreeMap::new();
     options.insert("power".to_string(), "0.5".to_string());
     assert_eq!(
-        parse_duchon_power(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "fractional power should parse", e)),
+        parse_duchon_power(&options)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "fractional power should parse", e)),
         0.5
     );
 }
@@ -3756,14 +3924,16 @@ fn parse_duchon_power_rejects_conflicting_power_and_nu() {
 fn parse_duchon_order_accepts_supportedvalues() {
     let options = BTreeMap::new();
     assert_eq!(
-        parse_duchon_order(&options).unwrap_or_else(|e| panic!("{} failed: {:?}", "default Duchon order", e)),
+        parse_duchon_order(&options)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "default Duchon order", e)),
         DuchonNullspaceOrder::Linear
     );
 
     let mut linear = BTreeMap::new();
     linear.insert("order".to_string(), "1".to_string());
     assert_eq!(
-        parse_duchon_order(&linear).unwrap_or_else(|e| panic!("{} failed: {:?}", "linear Duchon order", e)),
+        parse_duchon_order(&linear)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "linear Duchon order", e)),
         DuchonNullspaceOrder::Linear
     );
 }
@@ -3773,7 +3943,8 @@ fn parse_duchon_order_accepts_higher_polynomial_degrees_and_rejects_malformedval
     let mut quadratic = BTreeMap::new();
     quadratic.insert("order".to_string(), "2".to_string());
     assert_eq!(
-        parse_duchon_order(&quadratic).unwrap_or_else(|e| panic!("{} failed: {:?}", "quadratic Duchon order", e)),
+        parse_duchon_order(&quadratic)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "quadratic Duchon order", e)),
         DuchonNullspaceOrder::Degree(2)
     );
 
@@ -3786,8 +3957,8 @@ fn parse_duchon_order_accepts_higher_polynomial_degrees_and_rejects_malformedval
 
 #[test]
 fn parse_formula_retains_explicit_duchon_power_and_order_options() {
-    let parsed =
-        parse_formula("y ~ s(pc1, type=duchon, centers=12, power=0, order=1)").unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
+    let parsed = parse_formula("y ~ s(pc1, type=duchon, centers=12, power=0, order=1)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     match &parsed.terms[0] {
         ParsedTerm::Smooth { options, .. } => {
             assert_eq!(options.get("power").map(String::as_str), Some("0"));
@@ -3800,7 +3971,12 @@ fn parse_formula_retains_explicit_duchon_power_and_order_options() {
 #[test]
 fn build_termspec_rejects_duchon_double_penalty_option() {
     let parsed = parse_formula("y ~ s(pc1, pc2, type=duchon, centers=8, double_penalty=true)")
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula should parse before basis validation", e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "formula should parse before basis validation", e
+            )
+        });
     let ds = Dataset {
         headers: vec!["pc1".to_string(), "pc2".to_string()],
         values: array![[0.1, 0.2], [0.2, 0.3], [0.3, 0.4]],
@@ -3847,7 +4023,8 @@ fn build_termspec_escalates_explicit_duchon_power_below_d2_collocation_minimum()
     // the user-requested nullspace order, and emits an inference note.
     let formula = "y ~ s(pc1, pc2, pc3, pc4, type=duchon, centers=8, order=1, \
                        power=1, length_scale=1)";
-    let parsed = parse_formula(formula).unwrap_or_else(|e| panic!("{} failed: {:?}", "formula should parse", e));
+    let parsed = parse_formula(formula)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula should parse", e));
     let ds = Dataset {
         headers: vec![
             "pc1".to_string(),
@@ -3912,7 +4089,12 @@ fn build_termspec_escalates_explicit_duchon_power_below_d2_collocation_minimum()
         &mut inference_notes,
         &gam::ResourcePolicy::default_library(),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "explicit power=1 should auto-escalate, not reject", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "explicit power=1 should auto-escalate, not reject", e
+        )
+    });
     assert_eq!(spec.smooth_terms.len(), 1);
     match &spec.smooth_terms[0].basis {
         gam::smooth::SmoothBasisSpec::Duchon { spec: duchon, .. } => {
@@ -3952,7 +4134,8 @@ fn survival_prediction_csv_includes_explicit_semantics_columns() {
     write_survival_prediction_csv(&path, eta.view(), surv.view(), None, None, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival prediction csv", e));
 
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
         header, "eta,survival_prob,failure_prob,risk_score",
@@ -3976,7 +4159,8 @@ fn survival_binary_prediction_csv_includes_explicit_semantics_columns() {
     write_survival_binary_prediction_csv(&path, eta.view(), event.view(), None, None, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival binary prediction csv", e));
 
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
         header, "eta,mean,event_prob,failure_prob,survival_prob,risk_score",
@@ -4012,9 +4196,15 @@ fn survival_prediction_csv_emits_bounds_without_std_error() {
         Some(lower.view()),
         Some(upper.view()),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival prediction csv with bounds", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "write survival prediction csv with bounds", e
+        )
+    });
 
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
         header, "eta,survival_prob,failure_prob,risk_score,mean_lower,mean_upper",
@@ -4101,9 +4291,15 @@ fn survival_binary_prediction_csv_emits_bounds_without_std_error() {
         Some(lower.view()),
         Some(upper.view()),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival binary prediction csv with bounds", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "write survival binary prediction csv with bounds", e
+        )
+    });
 
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
         header, "eta,mean,event_prob,failure_prob,survival_prob,risk_score,mean_lower,mean_upper",
@@ -4175,7 +4371,8 @@ fn prediction_csv_can_prepend_id_column() {
     prepend_id_column_to_prediction_csv(&path, "person_id", &["p1".to_string(), "p2".to_string()])
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "prepend id column", e));
 
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read prediction csv", e));
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "read prediction csv", e));
     let mut lines = text.lines();
     assert_eq!(lines.next(), Some("person_id,eta,mean"));
     assert_eq!(lines.next(), Some("p1,0.500000000000,0.620000000000"));
@@ -4204,9 +4401,15 @@ fn gaussian_location_scale_prediction_csv_includes_sigma_column() {
         None,
         None,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "write gaussian location-scale prediction csv", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "write gaussian location-scale prediction csv", e
+        )
+    });
 
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
         header, "eta,mean,sigma",
@@ -4238,9 +4441,15 @@ fn gaussian_location_scale_prediction_csv_includes_boundswhen_present() {
         Some(mean_lower.view()),
         Some(mean_upper.view()),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "write gaussian location-scale prediction csv with bounds", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "write gaussian location-scale prediction csv with bounds", e
+        )
+    });
 
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
         header, "eta,mean,sigma,mean_lower,mean_upper",
@@ -4269,7 +4478,12 @@ fn gaussian_location_scale_predict_restores_sigma_to_response_units() {
         None,
         None,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "write gaussian location-scale prediction csv", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "write gaussian location-scale prediction csv", e
+        )
+    });
     assert!((csv_mean_at(&out_path, 0) - 12.0).abs() < 1e-12);
     assert!((csv_sigma_at(&out_path, 0) - 5.0).abs() < 1e-12);
 }
@@ -4811,7 +5025,12 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
         &primary_offset,
         &noise_offset,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "operator-backed saved survival predictor should build without densifying", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "operator-backed saved survival predictor should build without densifying", e
+        )
+    });
 
     assert!(
         pred_input.design.as_dense_ref().is_none(),
@@ -4829,7 +5048,12 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
 
     let prediction = predictor
         .predict_plugin_response(&pred_input)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "operator-backed saved survival predictor should score", e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "operator-backed saved survival predictor should score", e
+            )
+        });
     let q_exit = time_exit_dense.dot(&array![0.6])
         + cov_dense.dot(&array![0.5, -0.25])
         + &eta_offset_exit
@@ -4970,9 +5194,12 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
     payload.logslope_baseline = Some(0.0);
     payload.link = Some(InverseLink::Standard(StandardLink::Probit));
     let model = SavedModel::from_payload(payload);
-    model
-        .validate_for_persistence()
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved survival marginal-slope payload should validate", e));
+    model.validate_for_persistence().unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "saved survival marginal-slope payload should validate", e
+        )
+    });
 
     let time_build = gam::families::survival::construction::SurvivalTimeBuildOutput {
         x_entry_time: DesignMatrix::from(array![[1.0]]),
@@ -5009,10 +5236,20 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
         &primary_offset,
         &noise_offset,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved survival marginal-slope predictor should build", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "saved survival marginal-slope predictor should build", e
+        )
+    });
     let prediction = predictor
         .predict_plugin_response(&pred_input)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved survival marginal-slope predictor should score", e));
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "saved survival marginal-slope predictor should score", e
+            )
+        });
 
     let z_normalized = array![1.0];
     let (expected_eta, expected_mean) =
@@ -5204,7 +5441,8 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "expected survival predict", e));
 
-    let mut rdr = csv::Reader::from_path(&out_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "open prediction csv", e));
+    let mut rdr = csv::Reader::from_path(&out_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "open prediction csv", e));
     let rows = rdr
         .deserialize::<BTreeMap<String, String>>()
         .collect::<Result<Vec<_>, _>>()
@@ -5247,11 +5485,21 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         time_cfg,
         Some((2, 1e-4)),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build latent survival test time basis", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "build latent survival test time basis", e
+        )
+    });
     let p_time = time_build.x_exit_time.ncols();
     let time_anchor =
         gam::families::survival::construction::resolve_survival_time_anchor_value(&age_entry, None)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "resolve latent survival test time anchor", e));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{} failed: {:?}",
+                    "resolve latent survival test time anchor", e
+                )
+            });
     let blocks = vec![
         gam::estimate::FittedBlock {
             beta: Array1::zeros(p_time),
@@ -5338,9 +5586,15 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         &Array1::zeros(data.nrows()),
         &Array1::zeros(data.nrows()),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "latent survival predict should succeed", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "latent survival predict should succeed", e
+        )
+    });
 
-    let csv = fs::read_to_string(&out_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "prediction csv", e));
+    let csv = fs::read_to_string(&out_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "prediction csv", e));
     let lines = csv.lines().collect::<Vec<_>>();
     assert_eq!(lines.len(), 3);
     assert_eq!(lines[0], "eta,survival_prob,failure_prob,risk_score");
@@ -5361,7 +5615,8 @@ fn explicit_latent_binary_family_requires_matching_saved_likelihood_metadata() {
     );
     payload.survival_likelihood = Some("latent-binary".to_string());
     let model = SavedModel::from_payload(payload);
-    let mode = super::require_saved_survival_likelihood_mode(&model).unwrap_or_else(|e| panic!("{} failed: {:?}", "latent-binary mode", e));
+    let mode = super::require_saved_survival_likelihood_mode(&model)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "latent-binary mode", e));
     assert_eq!(mode, SurvivalLikelihoodMode::LatentBinary);
 }
 
@@ -5380,7 +5635,8 @@ fn explicit_latent_survival_family_requires_matching_saved_likelihood_metadata()
     );
     payload.survival_likelihood = Some("latent".to_string());
     let model = SavedModel::from_payload(payload);
-    let mode = super::require_saved_survival_likelihood_mode(&model).unwrap_or_else(|e| panic!("{} failed: {:?}", "latent mode", e));
+    let mode = super::require_saved_survival_likelihood_mode(&model)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "latent mode", e));
     assert_eq!(mode, SurvivalLikelihoodMode::Latent);
 }
 
@@ -5481,7 +5737,12 @@ fn saved_baseline_timewiggle_reconstruction_keeps_requested_order_one_penalty() 
         primary_order,
         saved_cfg.double_penalty,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "rebuild saved baseline-timewiggle block", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "rebuild saved baseline-timewiggle block", e
+        )
+    });
     gam::families::wiggle::append_selected_wiggle_penalty_orders(&mut block, &extra_orders)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "append saved extra penalties", e));
 
@@ -5513,7 +5774,12 @@ fn parse_survival_baseline_accepts_gompertz_makeham() {
 fn parse_survival_baseline_seeds_missing_gompertz_makeham_terms() {
     let cfg =
         parse_survival_baseline_config("gompertz-makeham", None, Some(0.08), Some(0.015), None)
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "missing makeham should seed a default", e));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{} failed: {:?}",
+                    "missing makeham should seed a default", e
+                )
+            });
     assert_eq!(cfg.target, SurvivalBaselineTarget::GompertzMakeham);
     assert_eq!(cfg.shape, Some(0.08));
     assert_eq!(cfg.rate, Some(0.015));
@@ -5530,11 +5796,13 @@ fn evaluate_survival_baseline_matches_gompertz_makeham_formula() {
         makeham: Some(0.003),
     };
     let age = 11.5;
-    let (eta, derivative) =
-        evaluate_survival_baseline(age, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate gompertz-makeham baseline", e));
+    let (eta, derivative) = evaluate_survival_baseline(age, &cfg)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate gompertz-makeham baseline", e));
     let shape = cfg.shape.unwrap_or_else(|| panic!("{} failed", "shape"));
     let rate = cfg.rate.unwrap_or_else(|| panic!("{} failed", "rate"));
-    let makeham = cfg.makeham.unwrap_or_else(|| panic!("{} failed", "makeham"));
+    let makeham = cfg
+        .makeham
+        .unwrap_or_else(|| panic!("{} failed", "makeham"));
     let cumulative_hazard = makeham * age + (rate / shape) * ((shape * age).exp() - 1.0);
     let expected_eta = cumulative_hazard.ln();
     let expected_derivative = (makeham + rate * (shape * age).exp()) / cumulative_hazard;
@@ -5552,9 +5820,11 @@ fn evaluate_survival_baseline_handles_nearzero_gompertz_makeham_shape() {
         makeham: Some(0.003),
     };
     let age = 11.5;
-    let (eta, derivative) =
-        evaluate_survival_baseline(age, &cfg).unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate near-zero gompertz-makeham", e));
-    let cumulative_hazard = (cfg.rate.unwrap_or_else(|| panic!("{} failed", "rate")) + cfg.makeham.expect("makeham")) * age;
+    let (eta, derivative) = evaluate_survival_baseline(age, &cfg)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate near-zero gompertz-makeham", e));
+    let cumulative_hazard = (cfg.rate.unwrap_or_else(|| panic!("{} failed", "rate"))
+        + cfg.makeham.expect("makeham"))
+        * age;
     let expected_eta = cumulative_hazard.ln();
     let expected_derivative = 1.0 / age;
     assert!((eta - expected_eta).abs() <= 1e-12);
@@ -5676,7 +5946,8 @@ fn parse_survival_inverse_link_accepts_sas_init() {
     };
     args.link = Some("sas".to_string());
     args.sas_init = Some("0.15,-0.70".to_string());
-    let link = parse_survival_inverse_link(&args).unwrap_or_else(|e| panic!("{} failed: {:?}", "sas survival link", e));
+    let link = parse_survival_inverse_link(&args)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "sas survival link", e));
     match link {
         InverseLink::Sas(state) => {
             assert!((state.epsilon - 0.15).abs() < 1e-12);
@@ -5781,7 +6052,8 @@ fn parse_survival_inverse_link_accepts_beta_logistic_init() {
     let mut args = survival_args_for_inverse_link_test();
     args.link = Some("beta-logistic".to_string());
     args.beta_logistic_init = Some("0.25,0.80".to_string());
-    let link = parse_survival_inverse_link(&args).unwrap_or_else(|e| panic!("{} failed: {:?}", "beta-logistic survival link", e));
+    let link = parse_survival_inverse_link(&args)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "beta-logistic survival link", e));
     match link {
         InverseLink::BetaLogistic(state) => {
             assert!((state.epsilon - 0.25).abs() < 1e-12);
@@ -5875,8 +6147,8 @@ fn parse_survival_inverse_link_supports_loglog_and_cauchit() {
 
 #[test]
 fn flexible_link_injects_default_linkwiggle_config() {
-    let link_choice =
-        parse_link_choice(Some("flexible(logit)"), false).unwrap_or_else(|e| panic!("{} failed: {:?}", "parse flexible link choice", e));
+    let link_choice = parse_link_choice(Some("flexible(logit)"), false)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse flexible link choice", e));
     let cfg = effectivelinkwiggle_formulaspec(None, link_choice.as_ref())
         .unwrap_or_else(|| panic!("{} failed", "flexible link should inject wiggle config"));
     let defaults = WigglePenaltyConfig::cubic_triple_operator_default();
@@ -5929,7 +6201,8 @@ fn parse_survival_inverse_link_accepts_flexible_standard_links() {
         hazard_loading: None,
     };
     args.link = Some("flexible(logit)".to_string());
-    let link = parse_survival_inverse_link(&args).unwrap_or_else(|e| panic!("{} failed: {:?}", "flexible survival link", e));
+    let link = parse_survival_inverse_link(&args)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "flexible survival link", e));
     assert!(matches!(link, InverseLink::Standard(StandardLink::Logit)));
 }
 
@@ -6057,7 +6330,12 @@ fn ispline_time_basis_derivative_uses_cumulative_bspline_chain_rule() {
         bspline_degree,
         BasisOptions::first_derivative(),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build bspline derivative for derivative check", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "build bspline derivative for derivative check", e
+        )
+    });
     let db_exit = db_exit.as_ref();
     let p_time = built.x_exit_time.ncols();
     let (exit_full, _) = create_basis::<Dense>(
@@ -6066,7 +6344,12 @@ fn ispline_time_basis_derivative_uses_cumulative_bspline_chain_rule() {
         degree,
         BasisOptions::i_spline(),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build ispline exit basis for keep-cols", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "build ispline exit basis for keep-cols", e
+        )
+    });
     let log_entry = age_entry.mapv(|t| t.max(1e-9).ln());
     let (entry_full, _) = create_basis::<Dense>(
         log_entry.view(),
@@ -6074,7 +6357,12 @@ fn ispline_time_basis_derivative_uses_cumulative_bspline_chain_rule() {
         degree,
         BasisOptions::i_spline(),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build ispline entry basis for keep-cols", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "build ispline entry basis for keep-cols", e
+        )
+    });
     let entry_full = entry_full.as_ref();
     let exit_full = exit_full.as_ref();
 
@@ -6204,109 +6492,113 @@ fn ispline_time_basis_is_unit_invariant_up_to_derivative_scale() {
 
 #[test]
 fn structural_survival_fit_is_time_unit_invariant() {
-    let fit_structural_survival_eta =
-        |age_entry: &Array1<f64>, age_exit: &Array1<f64>, event_target: &Array1<u8>, knots| {
-            let time_build = build_survival_time_basis(
-                age_entry,
-                age_exit,
-                SurvivalTimeBasisConfig::ISpline {
-                    degree: 2,
-                    knots,
-                    keep_cols: Vec::new(),
-                    smooth_lambda: 5e-1,
-                },
-                None,
-            )
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "build structural survival time basis", e));
-            let p_time = time_build.x_exit_time.ncols();
-            let penalties = gam::families::survival::PenaltyBlocks::new(
-                time_build
-                    .penalties
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.nrows() == p_time && s.ncols() == p_time)
-                    .map(|(idx, s)| gam::families::survival::PenaltyBlock {
-                        matrix: s.clone(),
-                        lambda: 5e-1,
-                        range: 0..p_time,
-                        nullspace_dim: time_build.nullspace_dims.get(idx).copied().unwrap_or(0),
-                    })
-                    .collect(),
-            );
-            let event_competing = Array1::zeros(age_entry.len());
-            let weights = Array1::ones(age_entry.len());
-            let eta_offset_entry = Array1::zeros(age_entry.len());
-            let eta_offset_exit = Array1::zeros(age_entry.len());
-            let derivative_offset_exit = Array1::zeros(age_entry.len());
-            let tb_entry_d = time_build.x_entry_time.to_dense();
-            let tb_exit_d = time_build.x_exit_time.to_dense();
-            let tb_deriv_d = time_build.x_derivative_time.to_dense();
-            let mut model = gam::families::survival::royston_parmar::working_model_from_flattened(
-                penalties,
-                gam::families::survival::SurvivalMonotonicityPenalty { tolerance: 0.0 },
-                gam::families::survival::SurvivalSpec::Net,
-                gam::families::survival::royston_parmar::RoystonParmarInputs {
-                    age_entry: age_entry.view(),
-                    age_exit: age_exit.view(),
-                    event_target: event_target.view(),
-                    event_competing: event_competing.view(),
-                    weights: weights.view(),
-                    x_entry: tb_entry_d.view(),
-                    x_exit: tb_exit_d.view(),
-                    x_derivative: tb_deriv_d.view(),
-                    monotonicity_constraint_rows: None,
-                    monotonicity_constraint_offsets: None,
-                    eta_offset_entry: Some(eta_offset_entry.view()),
-                    eta_offset_exit: Some(eta_offset_exit.view()),
-                    derivative_offset_exit: Some(derivative_offset_exit.view()),
-                },
-            )
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "construct structural survival model", e));
-            model
-                .set_structural_monotonicity(true, p_time)
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "enable structural monotonicity", e));
-            let mut beta0 = Array1::<f64>::zeros(p_time);
-            beta0.fill(0.1);
-            let mut constrained_model = model;
-            let lb = Array1::from_elem(p_time, 0.0_f64);
-            let summary = gam::pirls::runworking_model_pirls(
-                &mut constrained_model,
-                gam::types::Coefficients::new(beta0),
-                &gam::pirls::WorkingModelPirlsOptions {
-                    max_iterations: 400,
-                    convergence_tolerance: 1e-6,
-                    max_step_halving: 40,
-                    min_step_size: 1e-12,
-                    firth_bias_reduction: false,
-                    coefficient_lower_bounds: Some(lb),
-                    linear_constraints: None,
-                    initial_lm_lambda: None,
-                    adaptive_kkt_tolerance: None,
-                    geodesic_acceleration: false,
-                    arrow_schur: None,
-                },
-                |_| {},
-            )
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit structural survival model", e));
-            assert!(
-                matches!(
-                    summary.status,
-                    gam::pirls::PirlsStatus::Converged
-                        | gam::pirls::PirlsStatus::StalledAtValidMinimum
-                ),
-                "unexpected PIRLS status: {:?} after {} iterations, grad_norm={:.3e}",
+    let fit_structural_survival_eta = |age_entry: &Array1<f64>,
+                                       age_exit: &Array1<f64>,
+                                       event_target: &Array1<u8>,
+                                       knots| {
+        let time_build = build_survival_time_basis(
+            age_entry,
+            age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 2,
+                knots,
+                keep_cols: Vec::new(),
+                smooth_lambda: 5e-1,
+            },
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "build structural survival time basis", e));
+        let p_time = time_build.x_exit_time.ncols();
+        let penalties = gam::families::survival::PenaltyBlocks::new(
+            time_build
+                .penalties
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.nrows() == p_time && s.ncols() == p_time)
+                .map(|(idx, s)| gam::families::survival::PenaltyBlock {
+                    matrix: s.clone(),
+                    lambda: 5e-1,
+                    range: 0..p_time,
+                    nullspace_dim: time_build.nullspace_dims.get(idx).copied().unwrap_or(0),
+                })
+                .collect(),
+        );
+        let event_competing = Array1::zeros(age_entry.len());
+        let weights = Array1::ones(age_entry.len());
+        let eta_offset_entry = Array1::zeros(age_entry.len());
+        let eta_offset_exit = Array1::zeros(age_entry.len());
+        let derivative_offset_exit = Array1::zeros(age_entry.len());
+        let tb_entry_d = time_build.x_entry_time.to_dense();
+        let tb_exit_d = time_build.x_exit_time.to_dense();
+        let tb_deriv_d = time_build.x_derivative_time.to_dense();
+        let mut model = gam::families::survival::royston_parmar::working_model_from_flattened(
+            penalties,
+            gam::families::survival::SurvivalMonotonicityPenalty { tolerance: 0.0 },
+            gam::families::survival::SurvivalSpec::Net,
+            gam::families::survival::royston_parmar::RoystonParmarInputs {
+                age_entry: age_entry.view(),
+                age_exit: age_exit.view(),
+                event_target: event_target.view(),
+                event_competing: event_competing.view(),
+                weights: weights.view(),
+                x_entry: tb_entry_d.view(),
+                x_exit: tb_exit_d.view(),
+                x_derivative: tb_deriv_d.view(),
+                monotonicity_constraint_rows: None,
+                monotonicity_constraint_offsets: None,
+                eta_offset_entry: Some(eta_offset_entry.view()),
+                eta_offset_exit: Some(eta_offset_exit.view()),
+                derivative_offset_exit: Some(derivative_offset_exit.view()),
+            },
+        )
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "construct structural survival model", e));
+        model
+            .set_structural_monotonicity(true, p_time)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "enable structural monotonicity", e));
+        let mut beta0 = Array1::<f64>::zeros(p_time);
+        beta0.fill(0.1);
+        let mut constrained_model = model;
+        let lb = Array1::from_elem(p_time, 0.0_f64);
+        let summary = gam::pirls::runworking_model_pirls(
+            &mut constrained_model,
+            gam::types::Coefficients::new(beta0),
+            &gam::pirls::WorkingModelPirlsOptions {
+                max_iterations: 400,
+                convergence_tolerance: 1e-6,
+                max_step_halving: 40,
+                min_step_size: 1e-12,
+                firth_bias_reduction: false,
+                coefficient_lower_bounds: Some(lb),
+                linear_constraints: None,
+                initial_lm_lambda: None,
+                adaptive_kkt_tolerance: None,
+                geodesic_acceleration: false,
+                arrow_schur: None,
+            },
+            |_| {},
+        )
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit structural survival model", e));
+        assert!(
+            matches!(
                 summary.status,
-                summary.iterations,
-                summary.lastgradient_norm
-            );
-            let beta = summary.beta.as_ref().to_owned();
-            let eta = time_build.x_exit_time.dot(&beta);
-            let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0));
-            let state = constrained_model
-                .update_state(&beta)
-                .unwrap_or_else(|e| panic!("{} failed: {:?}", "evaluate fitted structural survival state", e));
-            (eta, surv, state.deviance)
-        };
+                gam::pirls::PirlsStatus::Converged | gam::pirls::PirlsStatus::StalledAtValidMinimum
+            ),
+            "unexpected PIRLS status: {:?} after {} iterations, grad_norm={:.3e}",
+            summary.status,
+            summary.iterations,
+            summary.lastgradient_norm
+        );
+        let beta = summary.beta.as_ref().to_owned();
+        let eta = time_build.x_exit_time.dot(&beta);
+        let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0));
+        let state = constrained_model.update_state(&beta).unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "evaluate fitted structural survival state", e
+            )
+        });
+        (eta, surv, state.deviance)
+    };
 
     let age_entry_days = Array1::from_vec(vec![10.0, 20.0, 40.0, 80.0, 120.0, 160.0]);
     let age_exit_days = Array1::from_vec(vec![15.0, 35.0, 60.0, 100.0, 150.0, 220.0]);
@@ -6488,9 +6780,15 @@ fn survival_timewiggle_with_parametric_baseline_skips_base_basis_requirement() {
         frailty_sd: None,
         hazard_loading: None,
     };
-    super::run_survival(args).unwrap_or_else(|e| panic!("{} failed: {:?}", "survival timewiggle fit should succeed", e));
+    super::run_survival(args).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "survival timewiggle fit should succeed", e
+        )
+    });
 
-    let saved = SavedModel::load_from_path(&out_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted survival model", e));
+    let saved = SavedModel::load_from_path(&out_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted survival model", e));
     assert_eq!(saved.survival_time_basis.as_deref(), Some("none"));
     assert!(saved.baseline_timewiggle_knots.is_some());
     assert!(saved.beta_baseline_timewiggle.is_some());
@@ -6616,9 +6914,15 @@ fn survival_location_scale_saved_fit_preserves_linkwiggle_metadata() {
         frailty_sd: None,
         hazard_loading: None,
     })
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "survival location-scale linkwiggle fit should succeed", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "survival location-scale linkwiggle fit should succeed", e
+        )
+    });
 
-    let saved = SavedModel::load_from_path(&out_path).unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted survival model", e));
+    let saved = SavedModel::load_from_path(&out_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted survival model", e));
     let fit = saved
         .fit_result
         .as_ref()
@@ -6655,7 +6959,12 @@ fn ispline_time_basis_inference_falls_backwhen_quantile_knots_degenerate() {
         },
         Some((6, 1e-6)),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build ispline time basis with fallback knot inference", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "build ispline time basis with fallback knot inference", e
+        )
+    });
 
     assert_eq!(built.basisname, "ispline");
     assert!(built.knots.as_ref().is_some_and(|k| !k.is_empty()));
@@ -6683,12 +6992,19 @@ fn bspline_time_basis_inference_uses_unique_support_for_origin_entries() {
         },
         Some((6, 1e-6)),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build bspline time basis with repeated origin entries", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "build bspline time basis with repeated origin entries", e
+        )
+    });
 
-    let knots = built
-        .knots
-        .as_ref()
-        .unwrap_or_else(|| panic!("{} failed", "bspline time basis should retain inferred knots"));
+    let knots = built.knots.as_ref().unwrap_or_else(|| {
+        panic!(
+            "{} failed",
+            "bspline time basis should retain inferred knots"
+        )
+    });
     let lower_boundary = knots[0];
     let upper_boundary = knots[knots.len() - 1];
     for &k in &knots[4..(knots.len() - 4)] {
@@ -6733,10 +7049,10 @@ fn survival_initial_time_coefficient_targets_safe_interior_derivative() {
     let event_target = Array1::from_vec(vec![1u8, 0u8]);
     let event_competing = Array1::from_vec(vec![0u8, 0u8]);
     let sampleweight = Array1::from_vec(vec![1.0, 1.0]);
-    let x_entry =
-        Array2::from_shape_vec((2, 3), vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "entry design", e));
-    let x_exit =
-        Array2::from_shape_vec((2, 3), vec![0.2, 0.4, 1.0, 0.3, 0.5, 1.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "exit design", e));
+    let x_entry = Array2::from_shape_vec((2, 3), vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0])
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "entry design", e));
+    let x_exit = Array2::from_shape_vec((2, 3), vec![0.2, 0.4, 1.0, 0.3, 0.5, 1.0])
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "exit design", e));
     let x_derivative = Array2::from_shape_vec((2, 3), vec![3e-5, 2e-5, 0.0, 4e-5, 1e-5, 0.0])
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "derivative design", e));
     let mut model = gam::families::survival::WorkingModelSurvival::from_engine_inputs(
@@ -6787,7 +7103,8 @@ fn survival_feasible_initial_beta_handles_sparse_overlapping_constraints() {
 #[test]
 fn survival_feasible_initial_beta_respects_offset_shifted_constraints() {
     let constraints = gam::pirls::LinearInequalityConstraints {
-        a: Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.25, 1.0]).unwrap_or_else(|e| panic!("{} failed: {:?}", "constraint rows", e)),
+        a: Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.25, 1.0])
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "constraint rows", e)),
         b: Array1::from_vec(vec![-0.5, 0.4]),
     };
 
@@ -6890,7 +7207,12 @@ fn ispline_time_basis_derivative_is_finite_at_zero_entry_times() {
         },
         Some((6, 1e-6)),
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "build ispline time basis with zero entry times", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "build ispline time basis with zero entry times", e
+        )
+    });
 
     assert!(
         built
@@ -6928,7 +7250,10 @@ fn ispline_time_basis_reuses_saved_keep_cols_on_narrow_prediction_range() {
         SurvivalTimeBasisConfig::ISpline {
             degree: 2,
             knots,
-            keep_cols: trained.keep_cols.clone().unwrap_or_else(|| panic!("{} failed", "saved keep cols")),
+            keep_cols: trained
+                .keep_cols
+                .clone()
+                .unwrap_or_else(|| panic!("{} failed", "saved keep cols")),
             smooth_lambda: 1e-2,
         },
         None,
@@ -6979,7 +7304,8 @@ fn saved_linkwiggle_derivative_matches_exact_constrained_basis_chain_rule() {
     payload.beta_link_wiggle = Some(beta_link_wiggle.clone());
     let model = SavedModel::from_payload(payload);
 
-    let exact = test_saved_linkwiggle_derivative_q0(&q0, &model).unwrap_or_else(|e| panic!("{} failed: {:?}", "exact derivative", e));
+    let exact = test_saved_linkwiggle_derivative_q0(&q0, &model)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "exact derivative", e));
     let constrained_deriv = test_saved_linkwiggle_design(&q0, &model)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "design path should succeed", e))
         .expect("wiggle design")
@@ -7021,16 +7347,20 @@ fn required_columns_include_the_by_smooth_grouping_variable() {
     // that column and the fit aborts before any numerics. Covers the factor
     // (`s(x, by=g)`), numeric varying-coefficient, and tensor (`te(..., by=w)`)
     // forms — all share the ParsedTerm::Smooth representation.
-    let factor = parse_formula("y ~ s(x, by=g)").unwrap_or_else(|e| panic!("{} failed: {:?}", "parse factor by-smooth", e));
-    let cols = required_columns_for_formula(&factor).unwrap_or_else(|e| panic!("{} failed: {:?}", "required columns", e));
+    let factor = parse_formula("y ~ s(x, by=g)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse factor by-smooth", e));
+    let cols = required_columns_for_formula(&factor)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "required columns", e));
     assert!(
         cols.contains(&"g".to_string()),
         "by= grouping column 'g' must be required, got {cols:?}"
     );
     assert!(cols.contains(&"x".to_string()) && cols.contains(&"y".to_string()));
 
-    let tensor = parse_formula("y ~ te(x, z, by=w)").unwrap_or_else(|e| panic!("{} failed: {:?}", "parse tensor by-smooth", e));
-    let tcols = required_columns_for_formula(&tensor).unwrap_or_else(|e| panic!("{} failed: {:?}", "required columns", e));
+    let tensor = parse_formula("y ~ te(x, z, by=w)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse tensor by-smooth", e));
+    let tcols = required_columns_for_formula(&tensor)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "required columns", e));
     for needed in ["x", "y", "z", "w"] {
         assert!(
             tcols.contains(&needed.to_string()),
@@ -7079,7 +7409,8 @@ fn auxiliary_formula_rejects_explicit_survival_response() {
 
 #[test]
 fn parse_surv_response_extracts_entry_exit_event_columns() {
-    let surv = parse_surv_response("Surv(entry_time, exit_time, event)").unwrap_or_else(|e| panic!("{} failed: {:?}", "parse Surv lhs", e));
+    let surv = parse_surv_response("Surv(entry_time, exit_time, event)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse Surv lhs", e));
     assert_eq!(
         surv,
         Some((
@@ -7094,7 +7425,8 @@ fn parse_surv_response_extracts_entry_exit_event_columns() {
 fn parse_surv_response_accepts_two_arg_right_censored_shorthand() {
     // Surv(time, event): R survival / mgcv default, entry synthesized
     // as zero downstream. Confirmed by the None in slot 0.
-    let surv = parse_surv_response("Surv(exit_time, event)").unwrap_or_else(|e| panic!("{} failed: {:?}", "parse 2-arg Surv lhs", e));
+    let surv = parse_surv_response("Surv(exit_time, event)")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse 2-arg Surv lhs", e));
     assert_eq!(
         surv,
         Some((None, "exit_time".to_string(), "event".to_string()))
@@ -7152,7 +7484,8 @@ fn data_schema_rejects_unseen_categorical_levels() {
 fn probit_q0_helper_matches_manual_threshold_over_sigma() {
     let eta_t = array![0.8, -0.4, 1.2];
     let eta_ls = array![-1.0, 0.0, 1.5];
-    let q0 = compute_probit_q0_from_eta(eta_t.view(), eta_ls.view()).unwrap_or_else(|e| panic!("{} failed: {:?}", "compute probit q0", e));
+    let q0 = compute_probit_q0_from_eta(eta_t.view(), eta_ls.view())
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "compute probit q0", e));
     for i in 0..q0.len() {
         let expected =
             -eta_t[i] * gam::families::sigma_link::exp_sigma_inverse_from_eta_scalar(eta_ls[i]);
@@ -7164,8 +7497,8 @@ fn probit_q0_helper_matches_manual_threshold_over_sigma() {
 fn wiggle_domain_summary_counts_out_of_range_q0() {
     let q0 = array![-2.5, -0.5, 0.0, 1.0, 2.5];
     let knots = array![-1.0, -1.0, -1.0, -0.25, 0.25, 1.0, 1.0, 1.0];
-    let summary =
-        summarizewiggle_domain(q0.view(), knots.view(), 2).unwrap_or_else(|e| panic!("{} failed: {:?}", "summarize wiggle domain", e));
+    let summary = summarizewiggle_domain(q0.view(), knots.view(), 2)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "summarize wiggle domain", e));
     assert_eq!(summary.domain_min, -1.0);
     assert_eq!(summary.domain_max, 1.0);
     assert_eq!(summary.outside_count, 2);
@@ -7176,8 +7509,8 @@ fn wiggle_domain_summary_counts_out_of_range_q0() {
 fn wiggle_domain_summary_inside_range_reportszero_outside() {
     let q0 = array![-0.75, -0.25, 0.0, 0.6];
     let knots = array![-1.0, -1.0, -1.0, -0.2, 0.2, 1.0, 1.0, 1.0];
-    let summary =
-        summarizewiggle_domain(q0.view(), knots.view(), 2).unwrap_or_else(|e| panic!("{} failed: {:?}", "summarize wiggle domain", e));
+    let summary = summarizewiggle_domain(q0.view(), knots.view(), 2)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "summarize wiggle domain", e));
     assert_eq!(summary.outside_count, 0);
     assert!((summary.outside_fraction - 0.0).abs() < 1e-12);
 }
@@ -7199,7 +7532,8 @@ fn saved_linkwiggle_design_returnsnonewhen_metadata_missing() {
     );
     payload.link = Some(InverseLink::Standard(StandardLink::Probit));
     let model = SavedModel::from_payload(payload);
-    let design = test_saved_linkwiggle_design(&q0, &model).unwrap_or_else(|e| panic!("{} failed: {:?}", "wiggle design", e));
+    let design = test_saved_linkwiggle_design(&q0, &model)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "wiggle design", e));
     assert!(design.is_none());
 }
 
@@ -7282,7 +7616,12 @@ fn binomial_location_scale_wiggle_uses_unified_generate_path() {
         &Array1::zeros(data.nrows()),
         false,
     )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "generate binomial location-scale through unified predictor", e));
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "generate binomial location-scale through unified predictor", e
+        )
+    });
     assert!(spec.mean.iter().all(|value| value.is_finite()));
     assert!(matches!(spec.noise, gam::generative::NoiseModel::Bernoulli));
 }

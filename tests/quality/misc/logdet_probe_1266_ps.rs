@@ -98,11 +98,16 @@ fn diag_1266_dump_ps_double_penalty_logdet() {
         ));
     }
 
-    let lines = DIAG_LINES_1266.lock().map(|g| g.clone()).unwrap_or_default();
+    let lines = DIAG_LINES_1266
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
 
     let mut report = String::new();
     report.push_str("\n============ #1266 ps DOUBLE-PENALTY LOGDET PROBE ============\n");
-    report.push_str(&format!("edf_total={edf_total:.4} (mgcv select=TRUE ≈ 2.10)\n"));
+    report.push_str(&format!(
+        "edf_total={edf_total:.4} (mgcv select=TRUE ≈ 2.10)\n"
+    ));
     report.push_str(&format!("edf_by_block={edf_by_block:?}\n"));
     report.push_str(&format!("lambdas={lambdas:?}\n"));
     report.push_str(&format!("log_lambdas(rho)={log_lambdas:?}\n"));
@@ -119,5 +124,8 @@ fn diag_1266_dump_ps_double_penalty_logdet() {
     // `println!` (NOT eprintln) so the trace shows under `--nocapture` without a
     // banned debug-format eprintln and without a permanent-red panic.
     println!("{report}");
-    assert!(edf_total.is_finite(), "ps double-penalty fit edf must be finite");
+    assert!(
+        edf_total.is_finite(),
+        "ps double-penalty fit edf must be finite"
+    );
 }

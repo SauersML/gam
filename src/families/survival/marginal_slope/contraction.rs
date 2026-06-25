@@ -3,7 +3,7 @@
 
 use super::*;
 
-use crate::families::jet_scalar::{JetScalar, OneSeed, TwoSeed};
+use gam_math::jet_scalar::{JetScalar, OneSeed, TwoSeed};
 
 impl SurvivalMarginalSlopeFamily {
     /// Build the row's third-order contracted tensor
@@ -220,5 +220,4 @@ impl SurvivalMarginalSlopeFamily {
         }
         Ok(out)
     }
-
 }

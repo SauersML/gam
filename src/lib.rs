@@ -138,17 +138,11 @@ pub mod solver;
 pub mod solver_contract;
 pub mod terms;
 pub mod test_support;
-pub mod util;
-pub mod warm_start;
-
-/// `resource` keeps its crate-root home (not under `solver`) so the `families`
-/// layer names it without importing *up* (#1135).
-pub mod resource;
 pub mod types;
+pub mod util;
 
-pub mod process_monitor;
-
-pub use data::{encode_recordswith_inferred_schema, load_csvwith_inferred_schema};
+pub use gam_data as data;
+pub use gam_data::{encode_recordswith_inferred_schema, load_csvwith_inferred_schema};
 pub use geometry::{
     CircleManifold, EuclideanManifold, GeodesicIntegrator, GeometryError, GeometryResult,
     GrassmannManifold, ManifoldSpec, ProductManifold, RiemannianLBFGS, RiemannianManifold,
@@ -157,7 +151,7 @@ pub use geometry::{
 };
 pub use gpu::GpuPolicy;
 pub use inference::{
-    alo, conformal, data, generative, higher_order, hmc, model_comparison, polya_gamma, predict,
+    alo, conformal, generative, higher_order, hmc, model_comparison, polya_gamma, predict,
     probability, quadrature, rho_posterior, sample, smooth_test,
 };
 pub use linalg::{faer_ndarray, matrix, utils};
@@ -178,11 +172,11 @@ pub use solver::estimate::reml::reml_outer_engine::PenaltySubspaceTrace;
 // arrow-border overlap drive `run_per_atom_efs` directly with an explicit
 // `SharedBorderTopology` (`new` for a named border set, `disjoint` /
 // `fully_coupled` for the two extremes).
-pub use outer_subsample::{OuterScoreSubsample, RowSet, WeightedOuterRow};
-pub use resource::{
+pub use gam_runtime::resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
     ProblemHints, ResidentBytes, ResourcePolicy,
 };
+pub use outer_subsample::{OuterScoreSubsample, RowSet, WeightedOuterRow};
 pub use solver::estimate::reml::per_atom_efs::{
     PerAtomEfsConfig, SharedBorderTopology, run_per_atom_efs,
 };
@@ -209,10 +203,9 @@ pub use solver::fit_orchestration::{
     SurvivalMarginalSlopeFitRequest, SurvivalTransformationFitRequest,
     SurvivalTransformationFitResult, SurvivalTransformationTermSpec,
     TransformationNormalFitRequest, WorkflowError, constant_curvature_profiled_reml_scores,
-    fit_from_formula, fit_model,
-    fit_residual_cascade_from_formula, fit_spline_scan_from_formula, is_binary_response,
-    materialize, prepare_survival_time_stack, residual_cascade_fast_path, resolve_family,
-    resolve_offset_column, resolve_weight_column, spline_scan_fast_path,
+    fit_from_formula, fit_model, fit_residual_cascade_from_formula, fit_spline_scan_from_formula,
+    is_binary_response, materialize, prepare_survival_time_stack, residual_cascade_fast_path,
+    resolve_family, resolve_offset_column, resolve_weight_column, spline_scan_fast_path,
 };
 pub use solver::protocol::{
     LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,

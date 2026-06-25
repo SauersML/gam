@@ -1,6 +1,6 @@
 use super::*;
 
-use crate::families::jet_scalar::{JetScalar, Order2, OneSeed, TwoSeed};
+use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SurvivalExactRowKernel {
@@ -48,8 +48,8 @@ impl SurvivalExactRowKernel {
     }
 
     #[inline]
-    pub(crate) fn nll_index_tower(self) -> crate::families::jet_tower::Tower4<3> {
-        use crate::families::jet_tower::Tower4;
+    pub(crate) fn nll_index_tower(self) -> gam_math::jet_tower::Tower4<3> {
+        use gam_math::jet_tower::Tower4;
 
         let u0 = Tower4::<3>::variable(0.0, 0);
         let u1 = Tower4::<3>::variable(0.0, 1);
@@ -371,7 +371,6 @@ impl SurvivalLsRowKernel<'_> {
             .ok_or_else(|| format!("survival location-scale row {row} has no exact kernel"))?;
         Ok((p, kernel))
     }
-
 }
 
 /// The survival location-scale row negative log-likelihood, written ONCE over a
@@ -645,12 +644,42 @@ impl<'a, const KW: usize> SurvivalLsWiggleRowKernel<'a, KW> {
         // Base exit/entry indices where the warp basis is evaluated.
         let q_exit = dynamic.q_exit.clone();
         let q_entry = dynamic.q_entry.clone();
-        let b_u0_0 = survival_wiggle_basis_with_options(q_entry.view(), knots, degree, BasisOptions::value())?;
-        let b_u0_1 = survival_wiggle_basis_with_options(q_entry.view(), knots, degree, BasisOptions::first_derivative())?;
-        let b_u0_2 = survival_wiggle_basis_with_options(q_entry.view(), knots, degree, BasisOptions::second_derivative())?;
-        let b_u1_0 = survival_wiggle_basis_with_options(q_exit.view(), knots, degree, BasisOptions::value())?;
-        let b_u1_1 = survival_wiggle_basis_with_options(q_exit.view(), knots, degree, BasisOptions::first_derivative())?;
-        let b_u1_2 = survival_wiggle_basis_with_options(q_exit.view(), knots, degree, BasisOptions::second_derivative())?;
+        let b_u0_0 = survival_wiggle_basis_with_options(
+            q_entry.view(),
+            knots,
+            degree,
+            BasisOptions::value(),
+        )?;
+        let b_u0_1 = survival_wiggle_basis_with_options(
+            q_entry.view(),
+            knots,
+            degree,
+            BasisOptions::first_derivative(),
+        )?;
+        let b_u0_2 = survival_wiggle_basis_with_options(
+            q_entry.view(),
+            knots,
+            degree,
+            BasisOptions::second_derivative(),
+        )?;
+        let b_u1_0 = survival_wiggle_basis_with_options(
+            q_exit.view(),
+            knots,
+            degree,
+            BasisOptions::value(),
+        )?;
+        let b_u1_1 = survival_wiggle_basis_with_options(
+            q_exit.view(),
+            knots,
+            degree,
+            BasisOptions::first_derivative(),
+        )?;
+        let b_u1_2 = survival_wiggle_basis_with_options(
+            q_exit.view(),
+            knots,
+            degree,
+            BasisOptions::second_derivative(),
+        )?;
         let b_u1_3 = survival_wiggle_third_basis(q_exit.view(), knots, degree)?;
         let pw = b_u1_0.ncols();
         if SLS_ROW_K + pw != KW {
@@ -768,12 +797,7 @@ impl<const KW: usize> crate::families::row_kernel::RowKernel<KW>
         }
     }
 
-    fn add_pullback_hessian(
-        &self,
-        row: usize,
-        h: &[[f64; KW]; KW],
-        target: &mut Array2<f64>,
-    ) {
+    fn add_pullback_hessian(&self, row: usize, h: &[[f64; KW]; KW], target: &mut Array2<f64>) {
         let rows: Vec<Option<(usize, Array1<f64>)>> =
             (0..KW).map(|ch| self.jrow(ch, row)).collect();
         for a in 0..KW {

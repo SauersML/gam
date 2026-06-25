@@ -251,7 +251,10 @@ fn ibp_rho_sparse_logdet_trace_includes_cross_row_offdiagonal_1416() {
         .expect("analytic outer-rho gradient components");
     let analytic = components.gradient();
     let n_params = f.rho.to_flat().len();
-    assert!(n_params >= 1, "outer-rho vector must carry log_lambda_sparse at coord 0");
+    assert!(
+        n_params >= 1,
+        "outer-rho vector must carry log_lambda_sparse at coord 0"
+    );
 
     for coord in 0..n_params {
         let fd = centered_fd(&converged, &f.target, &f.rho, coord, inner_iters);

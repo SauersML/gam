@@ -5228,7 +5228,13 @@ mod tests {
     fn test_logit_posterior_mean_exact_symmetry_identity() {
         // sigmoid is odd-symmetric about 1/2, so E[sigmoid(η;μ)] +
         // E[sigmoid(η;−μ)] = 1 exactly; the oracle must honor it to ~f64.
-        let cases = [(-3.0, 0.5), (-1.2, 1.7), (0.0, 2.2), (2.3, 0.8), (3.0, 0.05)];
+        let cases = [
+            (-3.0, 0.5),
+            (-1.2, 1.7),
+            (0.0, 2.2),
+            (2.3, 0.8),
+            (3.0, 0.05),
+        ];
         for (mu, sigma) in cases {
             let p = logit_posterior_mean_exact(mu, sigma);
             let q = logit_posterior_mean_exact(-mu, sigma);
@@ -5331,7 +5337,10 @@ mod tests {
     fn test_faddeeva_weideman_matches_known_values() {
         // w(0) = 1.
         let w0 = faddeeva_upper_halfplane(Complex { re: 0.0, im: 0.0 });
-        assert!((w0.re - 1.0).abs() < 1e-13 && w0.im.abs() < 1e-13, "w(0)={w0:?}");
+        assert!(
+            (w0.re - 1.0).abs() < 1e-13 && w0.im.abs() < 1e-13,
+            "w(0)={w0:?}"
+        );
         // w(i·y) is purely real and equals erfcx(y) for y>0 (reference: wofz).
         let on_axis = [
             (0.1, 0.8964569799691268),

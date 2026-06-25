@@ -59,8 +59,8 @@ impl SurvivalExactRowKernel {
     fn location_scale_nll_tower(
         self,
         row: SurvivalLsLocationScaleRow,
-    ) -> crate::families::jet_tower::Tower4<2> {
-        use crate::families::jet_tower::Tower4;
+    ) -> gam_math::jet_tower::Tower4<2> {
+        use gam_math::jet_tower::Tower4;
 
         let eta_location = Tower4::<2>::variable(row.eta_location, 0);
         let eta_logscale = Tower4::<2>::variable(row.eta_logscale, 1);
@@ -107,7 +107,7 @@ impl SurvivalExactRowKernel {
     }
 }
 
-impl crate::families::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNllProgram<'_> {
+impl gam_math::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNllProgram<'_> {
     fn n_rows(&self) -> usize {
         1
     }
@@ -122,9 +122,9 @@ impl crate::families::jet_tower::RowNllProgram<2> for SurvivalLsLocationScaleNll
     fn row_nll(
         &self,
         row: usize,
-        p: &[crate::families::jet_tower::Tower4<2>; 2],
-    ) -> Result<crate::families::jet_tower::Tower4<2>, String> {
-        use crate::families::jet_tower::Tower4;
+        p: &[gam_math::jet_tower::Tower4<2>; 2],
+    ) -> Result<gam_math::jet_tower::Tower4<2>, String> {
+        use gam_math::jet_tower::Tower4;
 
         if row != 0 {
             return Err("survival LS location-scale jet row out of range".to_string());
@@ -453,7 +453,7 @@ fn survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     }
 }
 
@@ -770,7 +770,7 @@ fn survival_ls_exact_row_kernel(
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let inv_sigma = (-row.eta_logscale).exp();
     let state = family.row_predictor_state(
@@ -813,7 +813,7 @@ fn survival_ls_default_guard_unit_family() -> SurvivalLocationScaleFamily {
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     }
 }
 
@@ -919,7 +919,7 @@ fn hand_survival_ls_channels(
 fn hand_survival_ls_kernel_channels(
     channels: &SlsHandWitnessChannels,
     dirs: &[[f64; 2]],
-) -> crate::families::jet_tower::KernelChannels<2> {
+) -> gam_math::jet_tower::KernelChannels<2> {
     let third = dirs
         .iter()
         .map(|dir| (*dir, channels.third_contracted(dir)))
@@ -932,7 +932,7 @@ fn hand_survival_ls_kernel_channels(
             (*u, v, channels.fourth_contracted(u, &v))
         })
         .collect::<Vec<_>>();
-    crate::families::jet_tower::KernelChannels {
+    gam_math::jet_tower::KernelChannels {
         value: channels.value,
         gradient: channels.gradient,
         hessian: channels.hessian,
@@ -943,7 +943,7 @@ fn hand_survival_ls_kernel_channels(
 
 #[test]
 fn survival_ls_location_scale_jet_program_matches_exact_row_kernel_all_channels() {
-    use crate::families::jet_tower::{evaluate_program, verify_kernel_channels};
+    use gam_math::jet_tower::{evaluate_program, verify_kernel_channels};
 
     let dirs = [[0.7, -1.1], [-0.4, 0.9], [1.3, 0.25]];
     let rows = vec![
@@ -1027,7 +1027,7 @@ struct SurvivalLsJointNllProgram<'a> {
     weight: Vec<f64>,
 }
 
-impl crate::families::jet_tower::RowNllProgram<SLS_ROW_K> for SurvivalLsJointNllProgram<'_> {
+impl gam_math::jet_tower::RowNllProgram<SLS_ROW_K> for SurvivalLsJointNllProgram<'_> {
     fn n_rows(&self) -> usize {
         self.primaries.len()
     }
@@ -1042,9 +1042,9 @@ impl crate::families::jet_tower::RowNllProgram<SLS_ROW_K> for SurvivalLsJointNll
     fn row_nll(
         &self,
         row: usize,
-        p: &[crate::families::jet_tower::Tower4<SLS_ROW_K>; SLS_ROW_K],
-    ) -> Result<crate::families::jet_tower::Tower4<SLS_ROW_K>, String> {
-        use crate::families::jet_tower::Tower4;
+        p: &[gam_math::jet_tower::Tower4<SLS_ROW_K>; SLS_ROW_K],
+    ) -> Result<gam_math::jet_tower::Tower4<SLS_ROW_K>, String> {
+        use gam_math::jet_tower::Tower4;
 
         let w = *self
             .weight
@@ -1130,7 +1130,7 @@ fn survival_ls_joint_oracle_family(
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     }
 }
 
@@ -1205,8 +1205,8 @@ fn survival_ls_joint_row_kernel_agrees_with_jet_tower_program_all_channels() {
 }
 
 fn survival_ls_joint_jet_tower_oracle_body() {
-    use crate::families::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
     use crate::families::row_kernel::RowKernel;
+    use gam_math::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
 
     // Channel layout per row:
     // [h0, h1, d_raw, eta_t_exit, eta_t_entry, eta_t_deriv,
@@ -1370,8 +1370,8 @@ fn survival_ls_packed_directional_matches_dense_tower_932() {
 }
 
 fn survival_ls_packed_directional_matches_dense_tower_body() {
-    use crate::families::jet_tower::evaluate_program;
     use crate::families::row_kernel::RowKernel;
+    use gam_math::jet_tower::evaluate_program;
 
     let primaries: Vec<[f64; SLS_ROW_K]> = vec![
         [0.2, 0.9, 1.3, 0.6, 0.4, 0.25, 0.3, 0.1, -0.2],
@@ -1447,8 +1447,8 @@ fn survival_ls_packed_directional_matches_dense_tower_body() {
                 }
                 for v in &dirs {
                     let dense_fourth = tower.fourth_contracted(u, v);
-                    let packed_fourth =
-                        RowKernel::row_fourth_contracted(&kernel, row, u, v).expect("packed fourth");
+                    let packed_fourth = RowKernel::row_fourth_contracted(&kernel, row, u, v)
+                        .expect("packed fourth");
                     for a in 0..SLS_ROW_K {
                         for b in 0..SLS_ROW_K {
                             let want = dense_fourth[a][b];
@@ -1506,8 +1506,8 @@ fn survival_ls_packed_directional_matches_dense_tower_high_curvature_932() {
 }
 
 fn survival_ls_packed_directional_high_curvature_body() {
-    use crate::families::jet_tower::evaluate_program;
     use crate::families::row_kernel::RowKernel;
+    use gam_math::jet_tower::evaluate_program;
 
     // Channel layout (matches `SurvivalLsJointNllProgram::row_nll`):
     //   [0]=t_entry [1]=t_exit [2]=t_deriv [3]=thr_exit [4]=thr_entry
@@ -1626,8 +1626,8 @@ fn survival_ls_packed_directional_high_curvature_body() {
                 }
                 for v in &dirs {
                     let dense_fourth = tower.fourth_contracted(u, v);
-                    let packed_fourth =
-                        RowKernel::row_fourth_contracted(&kernel, row, u, v).expect("packed fourth");
+                    let packed_fourth = RowKernel::row_fourth_contracted(&kernel, row, u, v)
+                        .expect("packed fourth");
                     for a in 0..SLS_ROW_K {
                         for b in 0..SLS_ROW_K {
                             let want = dense_fourth[a][b];
@@ -2150,7 +2150,11 @@ fn survival_ls_block_gradient_tower_body() {
             pos, total,
             "{distribution:?}: flattened bespoke gradient width {pos} != joint total {total}"
         );
-        assert_eq!(g_tower_nll.len(), total, "{distribution:?}: tower gradient width");
+        assert_eq!(
+            g_tower_nll.len(),
+            total,
+            "{distribution:?}: tower gradient width"
+        );
 
         // ∇ℓ_bespoke == −∇nll_tower.
         for i in 0..total {
@@ -5896,7 +5900,7 @@ fn heart_failure_structural_time_small() {
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     // Build initial states with beta=0 and a feasible positive derivative offset.
@@ -6025,7 +6029,7 @@ fn evaluate_survival_location_scale_rejects_non_finite_d_eta_dt() {
         wiggle_knots: None,
         wiggle_degree: None,
         location_log_time: None,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
 
     let mut eta_time = Array1::<f64>::zeros(3 * n);
@@ -6226,8 +6230,8 @@ fn positive_log_cumulative_hazard_maps_to_baseline_cloglog_survival() {
 /// `row_kernel_joint_hessian_supported` on link-wiggle rows.
 #[test]
 fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
-    use crate::families::jet_scalar::JetScalar;
-    use crate::families::jet_tower::{RowNllProgramGeneric, generic_row_kernel};
+    use gam_math::jet_scalar::JetScalar;
+    use gam_math::jet_tower::{RowNllProgramGeneric, generic_row_kernel};
 
     const PW: usize = 2;
     const KW: usize = SLS_ROW_K + PW; // 9 base channels + 2 wiggle amplitudes
@@ -6287,7 +6291,10 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
             let g = m1.mul(&g0);
 
             let mut nll = u0w
-                .compose_unary(survival_ls_log_survival_stack(&self.link, JetScalar::value(&u0w))?)
+                .compose_unary(survival_ls_log_survival_stack(
+                    &self.link,
+                    JetScalar::value(&u0w),
+                )?)
                 .scale(self.w);
             let censored_weight = self.w * (1.0 - self.d);
             if censored_weight != 0.0 {
@@ -6396,7 +6403,7 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
 /// cross-block in the hand assembler (the #736 genus) shifts an entry past 1e-9.
 #[test]
 fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
-    use crate::families::jet_scalar::{JetScalar, Order2};
+    use gam_math::jet_scalar::{JetScalar, Order2};
 
     // event rows (d=1) so entry-logS + exit-logphi + qdot-log_g are all live;
     // moderate-tail primaries clear of the monotonicity guard.
@@ -6421,33 +6428,62 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
     // A small monotone wiggle basis; degree/knots chosen for a few columns.
     let knots = array![-2.0, -1.0, 0.0, 1.0, 2.0];
     let degree = 3usize;
-    let xwiggle = survival_wiggle_basis_with_options(
-        q0_exit.view(),
-        &knots,
-        degree,
-        BasisOptions::value(),
-    )
-    .expect("wiggle design B(q0_exit)");
+    let xwiggle =
+        survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value())
+            .expect("wiggle design B(q0_exit)");
     let pw = xwiggle.ncols();
     let betaw = Array1::from_shape_fn(pw, |b| 0.25 - 0.08 * b as f64);
 
     // Per-row basis derivative stacks at the BASE indices (the warp composes the
     // basis onto the index jet). Exit needs B,B',B'',B'''; entry needs B,B',B''.
-    let bx0 = survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value()).unwrap();
-    let bx1 = survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::first_derivative()).unwrap();
-    let bx2 = survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::second_derivative()).unwrap();
+    let bx0 =
+        survival_wiggle_basis_with_options(q0_exit.view(), &knots, degree, BasisOptions::value())
+            .unwrap();
+    let bx1 = survival_wiggle_basis_with_options(
+        q0_exit.view(),
+        &knots,
+        degree,
+        BasisOptions::first_derivative(),
+    )
+    .unwrap();
+    let bx2 = survival_wiggle_basis_with_options(
+        q0_exit.view(),
+        &knots,
+        degree,
+        BasisOptions::second_derivative(),
+    )
+    .unwrap();
     let bx3 = survival_wiggle_third_basis(q0_exit.view(), &knots, degree).unwrap();
-    let be0 = survival_wiggle_basis_with_options(q0_entry.view(), &knots, degree, BasisOptions::value()).unwrap();
-    let be1 = survival_wiggle_basis_with_options(q0_entry.view(), &knots, degree, BasisOptions::first_derivative()).unwrap();
-    let be2 = survival_wiggle_basis_with_options(q0_entry.view(), &knots, degree, BasisOptions::second_derivative()).unwrap();
+    let be0 =
+        survival_wiggle_basis_with_options(q0_entry.view(), &knots, degree, BasisOptions::value())
+            .unwrap();
+    let be1 = survival_wiggle_basis_with_options(
+        q0_entry.view(),
+        &knots,
+        degree,
+        BasisOptions::first_derivative(),
+    )
+    .unwrap();
+    let be2 = survival_wiggle_basis_with_options(
+        q0_entry.view(),
+        &knots,
+        degree,
+        BasisOptions::second_derivative(),
+    )
+    .unwrap();
 
     // The single-source §13 warp evaluated on a generic jet scalar, KW = 9 + pw.
     fn wiggle_nll<const KW: usize, S: JetScalar<KW>>(
         vars: &[S; KW],
         kernel: &SurvivalExactRowKernel,
         pw: usize,
-        b0e: &[f64], b1e: &[f64], b2e: &[f64],
-        b0x: &[f64], b1x: &[f64], b2x: &[f64], b3x: &[f64],
+        b0e: &[f64],
+        b1e: &[f64],
+        b2e: &[f64],
+        b0x: &[f64],
+        b1x: &[f64],
+        b2x: &[f64],
+        b3x: &[f64],
     ) -> S {
         let inv_sigma_entry = vars[7].neg().exp();
         let u0 = vars[0].sub(&vars[4].mul(&inv_sigma_entry));
@@ -6465,17 +6501,50 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         }
         let g = m1.mul(&g0);
         let mut nll = u0w
-            .compose_unary([kernel.log_s0, -kernel.r0, -kernel.dr0, -kernel.ddr0, -kernel.dddr0])
+            .compose_unary([
+                kernel.log_s0,
+                -kernel.r0,
+                -kernel.dr0,
+                -kernel.ddr0,
+                -kernel.dddr0,
+            ])
             .scale(kernel.w);
         let cw = kernel.w * (1.0 - kernel.d);
         if cw != 0.0 {
-            nll = nll.add(&u1w.compose_unary([kernel.log_s1, -kernel.r1, -kernel.dr1, -kernel.ddr1, -kernel.dddr1]).scale(-cw));
+            nll = nll.add(
+                &u1w.compose_unary([
+                    kernel.log_s1,
+                    -kernel.r1,
+                    -kernel.dr1,
+                    -kernel.ddr1,
+                    -kernel.dddr1,
+                ])
+                .scale(-cw),
+            );
         }
         let ew = kernel.w * kernel.d;
         if ew != 0.0 {
             nll = nll
-                .add(&u1w.compose_unary([kernel.logphi1, kernel.dlogphi1, kernel.d2logphi1, kernel.d3logphi1, kernel.d4logphi1]).scale(-ew))
-                .add(&g.compose_unary([kernel.log_g, kernel.d_log_g, kernel.d2_log_g, kernel.d3_log_g, kernel.d4_log_g]).scale(-ew));
+                .add(
+                    &u1w.compose_unary([
+                        kernel.logphi1,
+                        kernel.dlogphi1,
+                        kernel.d2logphi1,
+                        kernel.d3logphi1,
+                        kernel.d4logphi1,
+                    ])
+                    .scale(-ew),
+                )
+                .add(
+                    &g.compose_unary([
+                        kernel.log_g,
+                        kernel.d_log_g,
+                        kernel.d2_log_g,
+                        kernel.d3_log_g,
+                        kernel.d4_log_g,
+                    ])
+                    .scale(-ew),
+                );
         }
         nll
     }
@@ -6486,17 +6555,27 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         ResidualDistribution::Logistic,
     ] {
         let inverse_link = residual_distribution_inverse_link(distribution);
-        let mut family = survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
-        family.x_link_wiggle = Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(xwiggle.clone())));
+        let mut family =
+            survival_ls_joint_oracle_family(&inverse_link, &primaries, &event, &weight);
+        family.x_link_wiggle = Some(DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            xwiggle.clone(),
+        )));
         family.wiggle_knots = Some(knots.clone());
         family.wiggle_degree = Some(degree);
 
         let mut states = survival_ls_joint_oracle_states(&primaries);
         let etaw = xwiggle.dot(&betaw);
-        states.push(ParameterBlockState { beta: betaw.clone(), eta: etaw });
+        states.push(ParameterBlockState {
+            beta: betaw.clone(),
+            eta: etaw,
+        });
 
-        let q = family.collect_joint_quantities(&states).expect("joint quantities");
-        let dynamic = family.build_dynamic_geometry(&states).expect("dynamic geometry");
+        let q = family
+            .collect_joint_quantities(&states)
+            .expect("joint quantities");
+        let dynamic = family
+            .build_dynamic_geometry(&states)
+            .expect("dynamic geometry");
         let bespoke = family
             .assemble_joint_hessian_from_quantities(&q, &states)
             .expect("bespoke joint Hessian")
@@ -6546,15 +6625,25 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
                         vars[9 + b] = <Order2<$kw> as JetScalar<$kw>>::variable(betaw[b], 9 + b);
                     }
                     let out = wiggle_nll::<$kw, Order2<$kw>>(
-                        &vars, &kernel, pw,
-                        &be0.row(row).to_vec(), &be1.row(row).to_vec(), &be2.row(row).to_vec(),
-                        &bx0.row(row).to_vec(), &bx1.row(row).to_vec(), &bx2.row(row).to_vec(), &bx3.row(row).to_vec(),
+                        &vars,
+                        &kernel,
+                        pw,
+                        &be0.row(row).to_vec(),
+                        &be1.row(row).to_vec(),
+                        &be2.row(row).to_vec(),
+                        &bx0.row(row).to_vec(),
+                        &bx1.row(row).to_vec(),
+                        &bx2.row(row).to_vec(),
+                        &bx3.row(row).to_vec(),
                     );
                     let h = out.h();
                     // Channel design rows: base 0..8 via channel_row, βw -> e_b.
                     let mut jrows: Vec<(usize, Vec<f64>)> = Vec::with_capacity(9 + pw);
                     for ch in 0..9usize {
-                        match (base_kernel.channel_block(ch), base_kernel.channel_row(ch, row)) {
+                        match (
+                            base_kernel.channel_block(ch),
+                            base_kernel.channel_row(ch, row),
+                        ) {
                             (Some(bk), Some(r)) => jrows.push((offsets[bk], r.to_vec())),
                             _ => jrows.push((usize::MAX, vec![])),
                         }
@@ -6566,14 +6655,22 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
                     }
                     for a in 0..(9 + pw) {
                         let (oa, ra) = &jrows[a];
-                        if *oa == usize::MAX { continue; }
+                        if *oa == usize::MAX {
+                            continue;
+                        }
                         for bcol in 0..(9 + pw) {
                             let hab = h[a][bcol];
-                            if hab == 0.0 { continue; }
+                            if hab == 0.0 {
+                                continue;
+                            }
                             let (ob, rb) = &jrows[bcol];
-                            if *ob == usize::MAX { continue; }
+                            if *ob == usize::MAX {
+                                continue;
+                            }
                             for (ia, &va) in ra.iter().enumerate() {
-                                if va == 0.0 { continue; }
+                                if va == 0.0 {
+                                    continue;
+                                }
                                 let wv = hab * va;
                                 for (ib, &vb) in rb.iter().enumerate() {
                                     h_tower[[oa + ia, ob + ib]] += wv * vb;

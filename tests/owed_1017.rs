@@ -147,7 +147,10 @@ fn matvec_dispatch_predicate_admits_sae_llm_shape_rejects_tiny() {
         .pcg
         .max_iterations
         .min(options.trust_region.max_iterations);
-    assert!(cg_iters >= 1, "default PCG budget must launch at least one apply");
+    assert!(
+        cg_iters >= 1,
+        "default PCG budget must launch at least one apply"
+    );
 
     let (n_llm, k_llm, d_llm) = (2_000usize, 2_048usize, 8usize);
     assert!(
@@ -282,7 +285,12 @@ fn dense_reference_step_dimensions_are_well_formed() {
         .expect("dense-reference oracle must solve");
     assert_eq!(sol.delta_t.len(), n * d);
     assert_eq!(sol.delta_beta.len(), k);
-    assert!(sol.delta_t.iter().chain(sol.delta_beta.iter()).all(|v| v.is_finite()));
+    assert!(
+        sol.delta_t
+            .iter()
+            .chain(sol.delta_beta.iter())
+            .all(|v| v.is_finite())
+    );
 }
 
 /// Assemble the dense bordered Hessian `H` and base gradient `g₀` from an arrow

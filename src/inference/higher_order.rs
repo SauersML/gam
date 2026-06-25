@@ -32,7 +32,7 @@ pub fn bartlett_factor_from_mean(mean_w: f64, ref_df: f64) -> Option<f64> {
 /// single-predictor (`K = 1`) GLM-type family: `ℓ'ᵢ, ℓ''ᵢ, ℓ'''ᵢ, ℓ''''ᵢ`.
 ///
 /// These are exactly the diagonal channels of the `K = 1` #932 row tower
-/// ([`crate::families::jet_tower::Tower4`]): the tower carries the row *negative*
+/// ([`gam_math::jet_tower::Tower4`]): the tower carries the row *negative*
 /// log-likelihood, so `ℓ⁽ᵏ⁾ᵢ = −towerᵢ.derivative_k`. [`row_derivs_from_nll_tower`]
 /// performs that sign flip; constructing this struct directly lets callers feed
 /// closed-form derivatives (e.g. the Gaussian fixture) without a tower.

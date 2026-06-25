@@ -11,10 +11,10 @@
 //! other link falls back to the generic inverse-link jet plus the analytic
 //! fourth derivative of the inverse-link pdf. All functions here are pure.
 
-use crate::families::jet_tower::Tower4;
 use crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use crate::types::{InverseLink, StandardLink};
+use gam_math::jet_tower::Tower4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BinomialClosedFormLink {

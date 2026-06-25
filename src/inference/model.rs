@@ -27,6 +27,7 @@ use crate::types::{
     SasLinkState, StandardLink,
 };
 use crate::util::span::span_index_for_breakpoints;
+use gam_data::{ColumnKindTag, DataSchema};
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -64,11 +65,6 @@ pub const MODEL_PAYLOAD_VERSION: u32 = 7;
 /// before the field existed deserialize as `None`.
 pub type GroupMetadata = BTreeMap<String, JsonValue>;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DataSchema {
-    pub columns: Vec<SchemaColumn>,
-}
-
 /// Saved exact spline-scan fit (#1030/#1034): the predict-time feature column
 /// plus the lossless smoother state the Gaussian-bridge `predict` replays.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,14 +83,6 @@ pub struct SavedResidualCascade {
     /// Training column names for the d ∈ {2, 3} scattered-smooth coordinates.
     pub feature_columns: Vec<String>,
     pub state: crate::solver::residual_cascade::ResidualCascadeState,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SchemaColumn {
-    pub name: String,
-    pub kind: ColumnKindTag,
-    #[serde(default)]
-    pub levels: Vec<String>,
 }
 
 /// Typed error surface for `src/inference/model.rs` saved-model code.
@@ -238,14 +226,6 @@ impl TransformationScoreCalibration {
         }
         Ok::<(), _>(())
     }
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "kebab-case")]
-pub enum ColumnKindTag {
-    Continuous,
-    Binary,
-    Categorical,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2184,7 +2164,10 @@ fn collect_by_variable_numeric_axes(
     use crate::smooth::{BySmoothKind, ByVarKind, SmoothBasisSpec};
     match basis {
         SmoothBasisSpec::ByVariable {
-            inner, by_col, kind, ..
+            inner,
+            by_col,
+            kind,
+            ..
         } => {
             if matches!(kind, BySmoothKind::Numeric) && *by_col < n_training_headers {
                 out.insert(*by_col);
@@ -4757,6 +4740,7 @@ mod tests {
     use crate::pirls::PirlsStatus;
     use crate::solver::estimate::{FitArtifacts, FittedBlock, FittedLinkState};
     use crate::types::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
+    use gam_data::SchemaColumn;
     use ndarray::{Array1, Array2, array};
 
     fn empty_termspec() -> TermCollectionSpec {

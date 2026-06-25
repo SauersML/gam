@@ -127,7 +127,11 @@ fn radical_inverse(mut i: usize, base: usize) -> f64 {
 #[test]
 fn high_dim_hybrid_duchon_matern_penalty_is_psd_1424() {
     let data = high_dim_hybrid_data();
-    assert_eq!(data.ncols(), 6, "this regression is the d = 6 hybrid regime");
+    assert_eq!(
+        data.ncols(),
+        6,
+        "this regression is the d = 6 hybrid regime"
+    );
     let spec = DuchonBasisSpec {
         radial_reparam: None,
         center_strategy: CenterStrategy::UserProvided(data.clone()),

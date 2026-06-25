@@ -20,8 +20,8 @@ mod sphere_spec;
 mod sphere_spectral;
 
 // ---- Measure-jet smooth (V0 / V∞) ----
-mod measure_jet_moments;
 mod measure_jet_anisotropy;
+mod measure_jet_moments;
 mod measure_jet_predict;
 mod measure_jet_smooth;
 
@@ -32,8 +32,8 @@ mod polylog;
 mod bspline_build;
 mod bspline_eval;
 mod center_selection;
-mod cubic_regression;
 pub mod closed_form_operator;
+mod cubic_regression;
 mod duchon_kernel_math;
 mod duchon_psi_derivatives;
 mod duchon_thinplate;
@@ -92,10 +92,9 @@ pub use measure_jet_smooth::{
 };
 
 pub use measure_jet_anisotropy::{
-    MeasureJetAnisotropyJets, LIndex, lower_triangular_indices,
-    measure_jet_anisotropy_energy_form, measure_jet_anisotropy_energy_form_with_jets,
+    LIndex, MeasureJetAnisotropyJets, lower_triangular_indices, measure_jet_anisotropy_energy_form,
+    measure_jet_anisotropy_energy_form_with_jets,
 };
-
 
 pub use sphere_spec::{
     SphereMethod, SphereWahbaKernel, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
@@ -115,8 +114,8 @@ pub(crate) use cyclic::{
 pub use bspline_build::*;
 pub use bspline_eval::*;
 pub use center_selection::*;
-pub use cubic_regression::*;
 pub use closed_form_operator::ClosedFormPenaltyOperator;
+pub use cubic_regression::*;
 pub use duchon_kernel_math::*;
 pub use duchon_psi_derivatives::*;
 pub use duchon_thinplate::*;

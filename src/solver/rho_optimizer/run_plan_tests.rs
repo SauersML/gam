@@ -3753,15 +3753,15 @@ fn run_bfgs_projects_seed_before_seed_validation_eval() {
 
 fn tmp_cache_session(label: &str) -> (tempfile::TempDir, Arc<CacheSession>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = crate::warm_start::WarmStartStore::open(
+    let store = gam_runtime::warm_start::WarmStartStore::open(
         dir.path().to_path_buf(),
-        crate::warm_start::StoreOptions {
+        gam_runtime::warm_start::StoreOptions {
             size_budget_bytes: 1024 * 1024,
             ttl: std::time::Duration::from_secs(60),
         },
     )
     .unwrap();
-    let mut fp = crate::warm_start::Fingerprinter::new();
+    let mut fp = gam_runtime::warm_start::Fingerprinter::new();
     fp.absorb_str(b"outer-test", label);
     let key = fp.finalize();
     (dir, Arc::new(CacheSession::open(store, key)))
@@ -3847,15 +3847,15 @@ fn iterate_payload_round_trips_converged_outer_hessian() {
 
     // The classifier surfaces the square Hessian as a (dim, flat) pair on the
     // Seed decision so the resume path can reconstruct and invert it.
-    let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::WarmStartEntry {
+    let loaded = gam_runtime::warm_start::LoadedEntry {
+        entry: gam_runtime::warm_start::WarmStartEntry {
             payload: bytes,
             objective: Some(1.0),
             iteration: Some(0),
-            kind: crate::warm_start::EntryKind::Checkpoint,
+            kind: gam_runtime::warm_start::EntryKind::Checkpoint,
             written_unix_secs: 0,
         },
-        source: crate::warm_start::LoadSource::Preloaded,
+        source: gam_runtime::warm_start::LoadSource::Preloaded,
     };
     let CacheSeedDecision::Seed {
         hessian: decoded_h, ..
@@ -3960,15 +3960,15 @@ fn classify_extracts_beta_from_v2_payload() {
     let rho = array![1.0, 2.0];
     let beta = array![10.0, 20.0, 30.0];
     let payload = encode_iterate(&rho, Some(&beta), None, 1.0, 0).expect("encode");
-    let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::WarmStartEntry {
+    let loaded = gam_runtime::warm_start::LoadedEntry {
+        entry: gam_runtime::warm_start::WarmStartEntry {
             payload,
             objective: Some(1.0),
             iteration: Some(0),
-            kind: crate::warm_start::EntryKind::Checkpoint,
+            kind: gam_runtime::warm_start::EntryKind::Checkpoint,
             written_unix_secs: 0,
         },
-        source: crate::warm_start::LoadSource::Preloaded,
+        source: gam_runtime::warm_start::LoadSource::Preloaded,
     };
     let CacheSeedDecision::Seed {
         beta: decoded_beta, ..
@@ -3980,15 +3980,15 @@ fn classify_extracts_beta_from_v2_payload() {
 
     // ρ-only payload (legacy or family-without-β) decodes to empty beta.
     let payload = encode_iterate(&rho, None, None, 1.0, 0).expect("encode");
-    let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::WarmStartEntry {
+    let loaded = gam_runtime::warm_start::LoadedEntry {
+        entry: gam_runtime::warm_start::WarmStartEntry {
             payload,
             objective: Some(1.0),
             iteration: Some(0),
-            kind: crate::warm_start::EntryKind::Checkpoint,
+            kind: gam_runtime::warm_start::EntryKind::Checkpoint,
             written_unix_secs: 0,
         },
-        source: crate::warm_start::LoadSource::Preloaded,
+        source: gam_runtime::warm_start::LoadSource::Preloaded,
     };
     let CacheSeedDecision::Seed {
         beta: decoded_beta, ..
@@ -4165,15 +4165,15 @@ fn cache_entry_classifier_honors_finite_seeds_regardless_of_saturation() {
     // making the cold-β failure mode impossible to re-create from cache.
     for rho_seed in [array![9.0, 0.0], array![10.0, -10.0], array![-10.0, 10.0]] {
         let payload = encode_iterate(&rho_seed, None, None, 1.0, 0).expect("encode");
-        let loaded = crate::warm_start::LoadedEntry {
-            entry: crate::warm_start::WarmStartEntry {
+        let loaded = gam_runtime::warm_start::LoadedEntry {
+            entry: gam_runtime::warm_start::WarmStartEntry {
                 payload,
                 objective: Some(1.0),
                 iteration: Some(0),
-                kind: crate::warm_start::EntryKind::Checkpoint,
+                kind: gam_runtime::warm_start::EntryKind::Checkpoint,
                 written_unix_secs: 0,
             },
-            source: crate::warm_start::LoadSource::Preloaded,
+            source: gam_runtime::warm_start::LoadSource::Preloaded,
         };
 
         assert!(cache_entry_would_help_outer(&loaded, 2));
@@ -4200,15 +4200,15 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
     // cost), but the entry-level objective is NaN — discard as
     // non-finite-payload.
     let payload = encode_iterate(&array![0.5, 0.5], None, None, 1.0, 0).expect("encode");
-    let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::WarmStartEntry {
+    let loaded = gam_runtime::warm_start::LoadedEntry {
+        entry: gam_runtime::warm_start::WarmStartEntry {
             payload,
             objective: Some(f64::NAN),
             iteration: Some(0),
-            kind: crate::warm_start::EntryKind::Checkpoint,
+            kind: gam_runtime::warm_start::EntryKind::Checkpoint,
             written_unix_secs: 0,
         },
-        source: crate::warm_start::LoadSource::Preloaded,
+        source: gam_runtime::warm_start::LoadSource::Preloaded,
     };
     assert!(matches!(
         classify_cache_entry_for_outer(&loaded, 2),
@@ -4221,15 +4221,15 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
     // Dimension mismatch: 2-D payload viewed as a 3-D problem → decode
     // rejects shape → "payload-shape-mismatch".
     let payload = encode_iterate(&array![0.5, 0.5], None, None, 1.0, 0).expect("encode");
-    let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::WarmStartEntry {
+    let loaded = gam_runtime::warm_start::LoadedEntry {
+        entry: gam_runtime::warm_start::WarmStartEntry {
             payload,
             objective: Some(1.0),
             iteration: Some(0),
-            kind: crate::warm_start::EntryKind::Checkpoint,
+            kind: gam_runtime::warm_start::EntryKind::Checkpoint,
             written_unix_secs: 0,
         },
-        source: crate::warm_start::LoadSource::Preloaded,
+        source: gam_runtime::warm_start::LoadSource::Preloaded,
     };
     assert!(matches!(
         classify_cache_entry_for_outer(&loaded, 3),
@@ -4243,15 +4243,15 @@ fn cache_entry_classifier_rejects_only_structural_failures() {
 #[test]
 fn exact_final_warm_start_hit_is_helpful_even_at_boundary() {
     let payload = encode_iterate(&array![10.0, -10.0], None, None, 1.0, 3).expect("encode");
-    let loaded = crate::warm_start::LoadedEntry {
-        entry: crate::warm_start::WarmStartEntry {
+    let loaded = gam_runtime::warm_start::LoadedEntry {
+        entry: gam_runtime::warm_start::WarmStartEntry {
             payload,
             objective: Some(1.0),
             iteration: Some(3),
-            kind: crate::warm_start::EntryKind::Final,
+            kind: gam_runtime::warm_start::EntryKind::Final,
             written_unix_secs: 0,
         },
-        source: crate::warm_start::LoadSource::Exact,
+        source: gam_runtime::warm_start::LoadSource::Exact,
     };
 
     assert!(cache_entry_would_help_outer(&loaded, 2));

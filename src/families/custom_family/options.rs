@@ -578,13 +578,13 @@ pub struct BlockwiseFitOptions {
     /// Callers that need cross-process reuse must supply the session
     /// explicitly; ordinary workflow fits leave this empty so refit-heavy
     /// loops do not touch the shared on-disk store.
-    pub cache_session: Option<Arc<crate::warm_start::Session>>,
+    pub cache_session: Option<Arc<gam_runtime::warm_start::Session>>,
     /// Optional mirror sessions that receive a copy of the final-result
     /// finalize() write. Callers can use this to broadcast a converged ρ to
     /// additional keyspace(s) so future fits with related structure can
     /// warm-start from this run. Writes still pass through the session rate
     /// limiter, so mirroring checkpoints does not add unbounded I/O.
-    pub cache_mirror_sessions: Vec<Arc<crate::warm_start::Session>>,
+    pub cache_mirror_sessions: Vec<Arc<gam_runtime::warm_start::Session>>,
     /// Optional bundle of cross-block (full-width) penalties, paired with
     /// their current `log λ` values from the outer ρ vector. When `Some`,
     /// the inner joint-Newton primitives add the contributions

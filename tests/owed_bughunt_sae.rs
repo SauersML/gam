@@ -6,9 +6,9 @@
 //!
 //! No `let _`, no `#[allow(...)]`, no env vars, no `#[cfg(feature=...)]`.
 
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 
-use gam::geometry::poincare::{tangent_decode_backward, tangent_decode_forward, BOUNDARY_EPS};
+use gam::geometry::poincare::{BOUNDARY_EPS, tangent_decode_backward, tangent_decode_forward};
 
 /// Bug-hunt finding: the Poincaré tangent decoder's forward radial coefficient
 /// `exp_coeff(s) = min(tanh(s), 1 - BOUNDARY_EPS)/s` CLAMPS once the tangent

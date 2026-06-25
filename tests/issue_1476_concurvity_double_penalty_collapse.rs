@@ -22,6 +22,7 @@
 //! assert gam recovers the truth and is no worse than mgcv by more than 25%. This
 //! test FAILS on current `main` and is the gate the nullspace fix must turn green.
 
+use csv::StringRecord;
 use gam::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -29,7 +30,6 @@ use gam::test_support::reference::{Column, rmse, run_r};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -45,7 +45,13 @@ fn encode(cols: &[(&str, &[f64])]) -> EncodedDataset {
     let n = cols[0].1.len();
     let headers: Vec<String> = cols.iter().map(|(h, _)| (*h).to_string()).collect();
     let rows: Vec<StringRecord> = (0..n)
-        .map(|i| StringRecord::from(cols.iter().map(|(_, c)| c[i].to_string()).collect::<Vec<_>>()))
+        .map(|i| {
+            StringRecord::from(
+                cols.iter()
+                    .map(|(_, c)| c[i].to_string())
+                    .collect::<Vec<_>>(),
+            )
+        })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode concurvity dataset")
 }
@@ -87,7 +93,10 @@ fn gam_concurvity_recovers_both_smooths_not_nullspace_collapse() {
     let mu: Vec<f64> = (0..N)
         .map(|i| (TAU * x1[i]).sin() + (f2[i] - f2_mean))
         .collect();
-    let y: Vec<f64> = mu.iter().map(|&m| m + NOISE * nrm.sample(&mut rng)).collect();
+    let y: Vec<f64> = mu
+        .iter()
+        .map(|&m| m + NOISE * nrm.sample(&mut rng))
+        .collect();
 
     // ---- fit gam: y ~ s(x1) + s(x2), gaussian/identity, REML -----------------
     let ds = encode(&[("x1", &x1), ("x2", &x2), ("y", &y)]);

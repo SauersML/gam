@@ -112,9 +112,19 @@ fn gam_te_3d_recovers_nonadditive_surface() {
     eprintln!(
         "[#1074-te3d] edf_total={:.3} edf_by_block={:?} log_lambdas={:?} reml={:.4} converged={} iters={}",
         fit.fit.edf_total().unwrap_or(f64::NAN),
-        fit.fit.edf_by_block().iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-        fit.fit.log_lambdas.iter().map(|v| (v * 1000.0).round() / 1000.0).collect::<Vec<_>>(),
-        fit.fit.reml_score, fit.fit.outer_converged, fit.fit.outer_iterations,
+        fit.fit
+            .edf_by_block()
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>(),
+        fit.fit
+            .log_lambdas
+            .iter()
+            .map(|v| (v * 1000.0).round() / 1000.0)
+            .collect::<Vec<_>>(),
+        fit.fit.reml_score,
+        fit.fit.outer_converged,
+        fit.fit.outer_iterations,
     );
 
     // gam fitted values at the training grid: rebuild the design from the frozen
@@ -140,13 +150,19 @@ fn gam_te_3d_recovers_nonadditive_surface() {
             let dd = build_term_collection_design(grid.view(), &df.resolvedspec).unwrap();
             let dfit: Vec<f64> = dd.design.apply(&df.fit.beta).to_vec();
             let drmse = {
-                let m = dfit.iter().zip(y.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f64>()
+                let m = dfit
+                    .iter()
+                    .zip(y.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f64>()
                     / dfit.len() as f64;
                 m.sqrt()
             };
             eprintln!(
                 "[#1074-te3d-diag] {diag_formula} :: edf={:.3} converged={} rmse_vs_truth={:.5}",
-                df.fit.edf_total().unwrap_or(f64::NAN), df.fit.outer_converged, drmse,
+                df.fit.edf_total().unwrap_or(f64::NAN),
+                df.fit.outer_converged,
+                drmse,
             );
         }
     }

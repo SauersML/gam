@@ -177,148 +177,159 @@ fn ln_gamma_real(x: f64) -> f64 {
 /// A tiny deterministic LCG so the test points are pseudo-random yet fixed
 /// across runs (NO `rand`, NO date/clock seeding — per the #932 rules).
 struct Lcg(u64);
-    impl Lcg {
-        fn next_f64(&mut self) -> f64 {
-            // Numerical Recipes LCG constants; take the high 53 bits as a
-            // uniform in [0, 1).
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
-        }
-        /// Uniform in `[lo, hi)`.
-        fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
-            lo + (hi - lo) * self.next_f64()
-        }
+impl Lcg {
+    fn next_f64(&mut self) -> f64 {
+        // Numerical Recipes LCG constants; take the high 53 bits as a
+        // uniform in [0, 1).
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 11) as f64) / ((1u64 << 53) as f64)
     }
-
-    const REL_TOL: f64 = 1e-9;
-
-    fn close(a: f64, b: f64, label: &str) {
-        let band = REL_TOL + REL_TOL * a.abs().max(b.abs());
-        assert!(
-            (a - b).abs() <= band,
-            "{label}: jet {a:+.15e} vs hand {b:+.15e} (band {band:.3e})"
-        );
+    /// Uniform in `[lo, hi)`.
+    fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
+        lo + (hi - lo) * self.next_f64()
     }
+}
 
-    /// The mechanically jet-derived Poisson tower (value / ∇ / H / t3 / t4) must
-    /// equal the INDEPENDENT hand-derived closed form to 1e-9 at several fixed
-    /// pseudo-random `(p₀, y, a, b, d)` points. This is the FD-free exactness
-    /// check #932 item #2 asks for, on a clean exponential family.
-    #[test]
-    fn poisson_jet_tower_matches_hand_derived_closed_form() {
-        let mut rng = Lcg(0x9322_0451_dead_beef);
-        for trial in 0..16 {
-            // Counts y ∈ {0, …, 7}; predictor coefficients and base point kept
-            // in a tame range so η stays moderate (no exp overflow), exercising
-            // both the y = 0 and y > 0 branches of (m − y).
-            let y = (rng.uniform(0.0, 8.0)).floor();
-            let row = PoissonRow {
-                y,
-                a: rng.uniform(-1.2, 1.2),
-                b: rng.uniform(-1.2, 1.2),
-                d: rng.uniform(-0.9, 0.9),
-            };
-            let p0 = [rng.uniform(-0.8, 0.8), rng.uniform(-0.8, 0.8)];
+const REL_TOL: f64 = 1e-9;
 
-            let jet = poisson_jet_tower(&row, p0);
-            let hand = poisson_closed_form_tower(&row, p0);
+fn close(a: f64, b: f64, label: &str) {
+    let band = REL_TOL + REL_TOL * a.abs().max(b.abs());
+    assert!(
+        (a - b).abs() <= band,
+        "{label}: jet {a:+.15e} vs hand {b:+.15e} (band {band:.3e})"
+    );
+}
 
-            close(jet.v, hand.v, &format!("trial {trial} value"));
-            for i in 0..2 {
-                close(jet.g[i], hand.g[i], &format!("trial {trial} grad[{i}]"));
-                for j in 0..2 {
-                    close(jet.h[i][j], hand.h[i][j], &format!("trial {trial} hess[{i}][{j}]"));
-                    for k in 0..2 {
+/// The mechanically jet-derived Poisson tower (value / ∇ / H / t3 / t4) must
+/// equal the INDEPENDENT hand-derived closed form to 1e-9 at several fixed
+/// pseudo-random `(p₀, y, a, b, d)` points. This is the FD-free exactness
+/// check #932 item #2 asks for, on a clean exponential family.
+#[test]
+fn poisson_jet_tower_matches_hand_derived_closed_form() {
+    let mut rng = Lcg(0x9322_0451_dead_beef);
+    for trial in 0..16 {
+        // Counts y ∈ {0, …, 7}; predictor coefficients and base point kept
+        // in a tame range so η stays moderate (no exp overflow), exercising
+        // both the y = 0 and y > 0 branches of (m − y).
+        let y = (rng.uniform(0.0, 8.0)).floor();
+        let row = PoissonRow {
+            y,
+            a: rng.uniform(-1.2, 1.2),
+            b: rng.uniform(-1.2, 1.2),
+            d: rng.uniform(-0.9, 0.9),
+        };
+        let p0 = [rng.uniform(-0.8, 0.8), rng.uniform(-0.8, 0.8)];
+
+        let jet = poisson_jet_tower(&row, p0);
+        let hand = poisson_closed_form_tower(&row, p0);
+
+        close(jet.v, hand.v, &format!("trial {trial} value"));
+        for i in 0..2 {
+            close(jet.g[i], hand.g[i], &format!("trial {trial} grad[{i}]"));
+            for j in 0..2 {
+                close(
+                    jet.h[i][j],
+                    hand.h[i][j],
+                    &format!("trial {trial} hess[{i}][{j}]"),
+                );
+                for k in 0..2 {
+                    close(
+                        jet.t3[i][j][k],
+                        hand.t3[i][j][k],
+                        &format!("trial {trial} t3[{i}][{j}][{k}]"),
+                    );
+                    for l in 0..2 {
                         close(
-                            jet.t3[i][j][k],
-                            hand.t3[i][j][k],
-                            &format!("trial {trial} t3[{i}][{j}][{k}]"),
+                            jet.t4[i][j][k][l],
+                            hand.t4[i][j][k][l],
+                            &format!("trial {trial} t4[{i}][{j}][{k}][{l}]"),
                         );
-                        for l in 0..2 {
-                            close(
-                                jet.t4[i][j][k][l],
-                                hand.t4[i][j][k][l],
-                                &format!("trial {trial} t4[{i}][{j}][{k}][{l}]"),
-                            );
-                        }
                     }
                 }
             }
         }
     }
+}
 
-    /// The PRODUCTION packed scalars — `Order2` (value/∇/H), `OneSeed` (contracted
-    /// third), `TwoSeed` (contracted fourth) — evaluated on the SAME single
-    /// `poisson_row_nll` expression must reproduce the hand-derived closed form's
-    /// corresponding channels. This pins the cutover path the families actually
-    /// use (the small packed scalars, not the dense `Tower4`) against external
-    /// calculus, with the contraction directions folded into the nilpotent seeds.
-    #[test]
-    fn poisson_packed_scalars_match_hand_derived_contractions() {
-        let mut rng = Lcg(0x0bad_f00d_1234_5678);
-        let dirs: [[f64; 2]; 3] = [[0.7, -0.4], [-0.9, 1.3], [1.1, 0.6]];
+/// The PRODUCTION packed scalars — `Order2` (value/∇/H), `OneSeed` (contracted
+/// third), `TwoSeed` (contracted fourth) — evaluated on the SAME single
+/// `poisson_row_nll` expression must reproduce the hand-derived closed form's
+/// corresponding channels. This pins the cutover path the families actually
+/// use (the small packed scalars, not the dense `Tower4`) against external
+/// calculus, with the contraction directions folded into the nilpotent seeds.
+#[test]
+fn poisson_packed_scalars_match_hand_derived_contractions() {
+    let mut rng = Lcg(0x0bad_f00d_1234_5678);
+    let dirs: [[f64; 2]; 3] = [[0.7, -0.4], [-0.9, 1.3], [1.1, 0.6]];
 
-        for trial in 0..12 {
-            let y = (rng.uniform(0.0, 8.0)).floor();
-            let row = PoissonRow {
-                y,
-                a: rng.uniform(-1.2, 1.2),
-                b: rng.uniform(-1.2, 1.2),
-                d: rng.uniform(-0.9, 0.9),
-            };
-            let p0 = [rng.uniform(-0.8, 0.8), rng.uniform(-0.8, 0.8)];
-            let hand = poisson_closed_form_tower(&row, p0);
+    for trial in 0..12 {
+        let y = (rng.uniform(0.0, 8.0)).floor();
+        let row = PoissonRow {
+            y,
+            a: rng.uniform(-1.2, 1.2),
+            b: rng.uniform(-1.2, 1.2),
+            d: rng.uniform(-0.9, 0.9),
+        };
+        let p0 = [rng.uniform(-0.8, 0.8), rng.uniform(-0.8, 0.8)];
+        let hand = poisson_closed_form_tower(&row, p0);
 
-            // Order2: value / gradient / Hessian.
-            let o2: [Order2<2>; 2] = std::array::from_fn(|axis| Order2::variable(p0[axis], axis));
-            let s2 = poisson_row_nll(&row, &o2);
-            close(s2.value(), hand.v, &format!("trial {trial} Order2 value"));
+        // Order2: value / gradient / Hessian.
+        let o2: [Order2<2>; 2] = std::array::from_fn(|axis| Order2::variable(p0[axis], axis));
+        let s2 = poisson_row_nll(&row, &o2);
+        close(s2.value(), hand.v, &format!("trial {trial} Order2 value"));
+        for i in 0..2 {
+            close(
+                s2.g()[i],
+                hand.g[i],
+                &format!("trial {trial} Order2 grad[{i}]"),
+            );
+            for j in 0..2 {
+                close(
+                    s2.h()[i][j],
+                    hand.h[i][j],
+                    &format!("trial {trial} Order2 hess[{i}][{j}]"),
+                );
+            }
+        }
+
+        // OneSeed: contracted third Σ_c ℓ_{abc}·dir_c for each direction,
+        // checked against the hand tower's own contraction of t3.
+        for (di, dir) in dirs.iter().enumerate() {
+            let os: [OneSeed<2>; 2] =
+                std::array::from_fn(|axis| OneSeed::seed_direction(p0[axis], axis, dir[axis]));
+            let third = poisson_row_nll(&row, &os).contracted_third();
+            let truth = hand.third_contracted(dir);
             for i in 0..2 {
-                close(s2.g()[i], hand.g[i], &format!("trial {trial} Order2 grad[{i}]"));
                 for j in 0..2 {
                     close(
-                        s2.h()[i][j],
-                        hand.h[i][j],
-                        &format!("trial {trial} Order2 hess[{i}][{j}]"),
+                        third[i][j],
+                        truth[i][j],
+                        &format!("trial {trial} dir {di} OneSeed third[{i}][{j}]"),
                     );
                 }
             }
+        }
 
-            // OneSeed: contracted third Σ_c ℓ_{abc}·dir_c for each direction,
-            // checked against the hand tower's own contraction of t3.
-            for (di, dir) in dirs.iter().enumerate() {
-                let os: [OneSeed<2>; 2] =
-                    std::array::from_fn(|axis| OneSeed::seed_direction(p0[axis], axis, dir[axis]));
-                let third = poisson_row_nll(&row, &os).contracted_third();
-                let truth = hand.third_contracted(dir);
-                for i in 0..2 {
-                    for j in 0..2 {
-                        close(
-                            third[i][j],
-                            truth[i][j],
-                            &format!("trial {trial} dir {di} OneSeed third[{i}][{j}]"),
-                        );
-                    }
-                }
-            }
-
-            // TwoSeed: contracted fourth Σ_{cd} ℓ_{abcd}·u_c·v_d for direction
-            // pairs, checked against the hand tower's own contraction of t4.
-            for (ui, u) in dirs.iter().enumerate() {
-                let v = dirs[(ui + 1) % dirs.len()];
-                let ts: [TwoSeed<2>; 2] =
-                    std::array::from_fn(|axis| TwoSeed::seed(p0[axis], axis, u[axis], v[axis]));
-                let fourth = poisson_row_nll(&row, &ts).contracted_fourth();
-                let truth = hand.fourth_contracted(u, &v);
-                for i in 0..2 {
-                    for j in 0..2 {
-                        close(
-                            fourth[i][j],
-                            truth[i][j],
-                            &format!("trial {trial} pair {ui} TwoSeed fourth[{i}][{j}]"),
-                        );
-                    }
+        // TwoSeed: contracted fourth Σ_{cd} ℓ_{abcd}·u_c·v_d for direction
+        // pairs, checked against the hand tower's own contraction of t4.
+        for (ui, u) in dirs.iter().enumerate() {
+            let v = dirs[(ui + 1) % dirs.len()];
+            let ts: [TwoSeed<2>; 2] =
+                std::array::from_fn(|axis| TwoSeed::seed(p0[axis], axis, u[axis], v[axis]));
+            let fourth = poisson_row_nll(&row, &ts).contracted_fourth();
+            let truth = hand.fourth_contracted(u, &v);
+            for i in 0..2 {
+                for j in 0..2 {
+                    close(
+                        fourth[i][j],
+                        truth[i][j],
+                        &format!("trial {trial} pair {ui} TwoSeed fourth[{i}][{j}]"),
+                    );
                 }
             }
         }
     }
+}

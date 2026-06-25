@@ -47,8 +47,26 @@ const P: usize = 3; // output channels
 /// with caller-supplied decoders. Latent dim 1, IBP-MAP routing (the production
 /// real-data path in the #1026 thread).
 fn build_two_atom_term(dec0: Array2<f64>, dec1: Array2<f64>) -> SaeManifoldTerm {
-    let coords0 = array![[0.05], [0.22], [0.55], [0.81], [0.34], [0.66], [0.12], [0.90]];
-    let coords1 = array![[0.15], [0.31], [0.64], [0.92], [0.47], [0.09], [0.73], [0.40]];
+    let coords0 = array![
+        [0.05],
+        [0.22],
+        [0.55],
+        [0.81],
+        [0.34],
+        [0.66],
+        [0.12],
+        [0.90]
+    ];
+    let coords1 = array![
+        [0.15],
+        [0.31],
+        [0.64],
+        [0.92],
+        [0.47],
+        [0.09],
+        [0.73],
+        [0.40]
+    ];
     let eval = PeriodicHarmonicEvaluator::new(M).unwrap();
     let (phi0, jet0) = eval.evaluate(coords0.view()).unwrap();
     let (phi1, jet1) = eval.evaluate(coords1.view()).unwrap();
@@ -69,9 +87,7 @@ fn build_two_atom_term(dec0: Array2<f64>, dec1: Array2<f64>) -> SaeManifoldTerm 
     let atom1 = make("circle_1", phi1, jet1, dec1);
     let n = coords0.nrows();
     // Mild, non-degenerate logits so both atoms are routed-on (gate map active).
-    let logits = Array2::from_shape_fn((n, 2), |(i, k)| {
-        0.3 + 0.1 * (i as f64) - 0.05 * (k as f64)
-    });
+    let logits = Array2::from_shape_fn((n, 2), |(i, k)| 0.3 + 0.1 * (i as f64) - 0.05 * (k as f64));
     let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
         logits,
         vec![coords0, coords1],
@@ -386,20 +402,24 @@ fn reduced_schur_pd_floor_is_noop_on_healthy_system_1026() {
     let mut floored = ArrowSolveOptions::direct();
     floored.schur_pd_floor = Some(1.0e-8);
 
-    let (dt_strict, db_strict, _c0) =
-        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &strict)
-            .expect("healthy PD Schur must solve without the floor");
-    let (dt_floor, db_floor, _c1) =
-        solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &floored)
-            .expect("healthy PD Schur must also solve with the floor enabled");
+    let (dt_strict, db_strict, _c0) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &strict)
+        .expect("healthy PD Schur must solve without the floor");
+    let (dt_floor, db_floor, _c1) = solve_arrow_newton_step_with_options(&sys, 0.0, 0.0, &floored)
+        .expect("healthy PD Schur must also solve with the floor enabled");
 
     // Cholesky of the genuine PD Schur is taken FIRST; the floor branch is never
     // reached, so the two steps are bit-for-bit identical.
     for (a, b) in dt_strict.iter().zip(dt_floor.iter()) {
-        assert_eq!(a, b, "healthy-system Δt must be identical with/without the floor");
+        assert_eq!(
+            a, b,
+            "healthy-system Δt must be identical with/without the floor"
+        );
     }
     for (a, b) in db_strict.iter().zip(db_floor.iter()) {
-        assert_eq!(a, b, "healthy-system Δβ must be identical with/without the floor");
+        assert_eq!(
+            a, b,
+            "healthy-system Δβ must be identical with/without the floor"
+        );
     }
 }
 
@@ -538,8 +558,9 @@ fn shared_ard_collapses_outer_param_count_at_large_k() {
     // d=1 atoms (the worst case: one ARD axis per atom).
     let d_per_atom = 1usize;
     for &k in &[2usize, 32usize, 1000usize, 32_768usize] {
-        let log_ard: Vec<ndarray::Array1<f64>> =
-            (0..k).map(|_| ndarray::Array1::<f64>::zeros(d_per_atom)).collect();
+        let log_ard: Vec<ndarray::Array1<f64>> = (0..k)
+            .map(|_| ndarray::Array1::<f64>::zeros(d_per_atom))
+            .collect();
 
         let per_atom = SaeManifoldRho::new(-0.5, -0.5, log_ard.clone());
         assert_eq!(per_atom.ard_sharing, ArdSharing::PerAtom);
@@ -590,7 +611,10 @@ fn shared_ard_collapses_outer_param_count_at_large_k() {
     // table is uniform across owners, which the broadcast guarantees).
     let reflat = rebuilt.to_flat();
     for (a, b) in moved.iter().zip(reflat.iter()) {
-        assert!((a - b).abs() <= 1e-12, "shared ARD round-trip must be exact: {a} vs {b}");
+        assert!(
+            (a - b).abs() <= 1e-12,
+            "shared ARD round-trip must be exact: {a} vs {b}"
+        );
     }
 }
 
@@ -623,7 +647,8 @@ fn shared_ard_is_a_convergent_outer_coordinate_1026() {
     dec1[[2, 0]] = 1.0;
     let mut term = build_two_atom_term(dec0, dec1);
     let n = term.n_obs();
-    let target = Array2::from_shape_fn((n, P), |(i, c)| 0.1 * ((i as f64) * 0.3 + (c as f64)).sin());
+    let target =
+        Array2::from_shape_fn((n, P), |(i, c)| 0.1 * ((i as f64) * 0.3 + (c as f64)).sin());
 
     // d=1 circle atoms ⇒ max_d = 1. Per-atom flat = 2 + K*d = 2 + 2 = 4; shared
     // flat = 2 + max_d = 3. The collapse is real even at K=2; it widens as K→∞.

@@ -116,8 +116,16 @@ fn fit_and_predict(
     let edf = fit.fit.edf_total().expect("fit reports total edf");
     let lambdas = fit.fit.lambdas.to_vec();
 
-    let xi = data.headers.iter().position(|h| h == "x").expect("x column");
-    let zi = data.headers.iter().position(|h| h == "z").expect("z column");
+    let xi = data
+        .headers
+        .iter()
+        .position(|h| h == "x")
+        .expect("x column");
+    let zi = data
+        .headers
+        .iter()
+        .position(|h| h == "z")
+        .expect("z column");
     let hlen = data.headers.len();
     let m = pts.len();
     let mut grid = Array2::<f64>::zeros((m, hlen));

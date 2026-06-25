@@ -1284,7 +1284,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
         link_kind: spec.link_kind,
         wiggle_knots: spec.wiggle_knots,
         wiggle_degree: spec.wiggle_degree,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let blocks = vec![
         // The wiggle block is a DYNAMIC monotone I-spline basis that the
@@ -1886,7 +1886,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
             weights: self.weights.clone(),
             mu_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(preparednoise_design),
-            policy: crate::resource::ResourcePolicy::default_library(),
+            policy: gam_runtime::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         }
     }
@@ -2037,7 +2037,7 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
             log_sigma_design: Some(preparednoise_design),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
-            policy: crate::resource::ResourcePolicy::default_library(),
+            policy: gam_runtime::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         }
     }
@@ -2159,7 +2159,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
             link_kind: self.link_kind.clone(),
             threshold_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(identifiednoise_design),
-            policy: crate::resource::ResourcePolicy::default_library(),
+            policy: gam_runtime::resource::ResourcePolicy::default_library(),
         }
     }
 
@@ -2311,7 +2311,7 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
             log_sigma_design: Some(identifiednoise_design),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
-            policy: crate::resource::ResourcePolicy::default_library(),
+            policy: gam_runtime::resource::ResourcePolicy::default_library(),
         }
     }
 
@@ -2776,7 +2776,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
         link_kind: link_kind_cloned.clone(),
         wiggle_knots: wiggle_knots_cloned.clone(),
         wiggle_degree,
-        policy: crate::resource::ResourcePolicy::default_library(),
+        policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
     let screening_cap = Arc::new(AtomicUsize::new(0));
     let mut outer_options = options.clone();

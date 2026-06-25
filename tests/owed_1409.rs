@@ -162,7 +162,9 @@ fn top_k_cap_shrinks_softmax_block_vs_uncapped_at_small_k_1409() {
     let p = 3usize;
     let k_atoms = 8usize;
     let top_k = 2usize;
-    let planted: Vec<Vec<usize>> = (0..n).map(|row| vec![row % k_atoms, (row + 3) % k_atoms]).collect();
+    let planted: Vec<Vec<usize>> = (0..n)
+        .map(|row| vec![row % k_atoms, (row + 3) % k_atoms])
+        .collect();
 
     let dims = |cap: Option<usize>| -> Vec<usize> {
         let (mut term, target) = planted_softmax_term(n, k_atoms, &planted, p);
@@ -192,7 +194,8 @@ fn top_k_cap_shrinks_softmax_block_vs_uncapped_at_small_k_1409() {
             capped[row] < uncapped[row],
             "row {row}: top_k cap must SHRINK the assembled block (capped {} < uncapped {}) — \
              a no-op cap that only post-projects would leave the block at the uncapped size",
-            capped[row], uncapped[row]
+            capped[row],
+            uncapped[row]
         );
     }
 }

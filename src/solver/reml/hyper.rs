@@ -1364,7 +1364,7 @@ impl<'a> RemlState<'a> {
                 n_obs,
                 p_dim,
                 implicit_n_axes,
-                &crate::resource::ResourcePolicy::default_library(),
+                &gam_runtime::resource::ResourcePolicy::default_library(),
             );
         let x_design_shared: Option<std::sync::Arc<DesignMatrix>> = if use_implicit_requested {
             Some(std::sync::Arc::new(

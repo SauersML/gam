@@ -22,6 +22,7 @@
 //!
 //! No `let _`, no `#[allow(...)]`, no env vars, no `#[cfg(feature=...)]`.
 
+use csv::StringRecord;
 use gam::data::EncodedDataset;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -29,7 +30,6 @@ use gam::test_support::reference::rmse;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use csv::StringRecord;
 use ndarray::Array2;
 use std::f64::consts::TAU;
 
@@ -68,7 +68,13 @@ fn encode(cols: &[(&str, &[f64])]) -> EncodedDataset {
     let n = cols[0].1.len();
     let headers: Vec<String> = cols.iter().map(|(h, _)| (*h).to_string()).collect();
     let rows: Vec<StringRecord> = (0..n)
-        .map(|i| StringRecord::from(cols.iter().map(|(_, c)| c[i].to_string()).collect::<Vec<_>>()))
+        .map(|i| {
+            StringRecord::from(
+                cols.iter()
+                    .map(|(_, c)| c[i].to_string())
+                    .collect::<Vec<_>>(),
+            )
+        })
         .collect();
     encode_recordswith_inferred_schema(headers, rows).expect("encode concurvity dataset")
 }
@@ -129,9 +135,7 @@ fn fit_concurvity(
         ..FitConfig::default()
     };
     let dp = if double_penalty { "true" } else { "false" };
-    let formula = format!(
-        "y ~ s(x1, double_penalty={dp}) + s(x2, double_penalty={dp})"
-    );
+    let formula = format!("y ~ s(x1, double_penalty={dp}) + s(x2, double_penalty={dp})");
     let result = fit_from_formula(&formula, &ds, &cfg)
         .unwrap_or_else(|e| panic!("gam concurvity fit (dp={dp}) failed: {e:?}"));
     let edf1 = term_edf(&result, "x1");
