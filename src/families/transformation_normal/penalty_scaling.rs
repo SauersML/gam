@@ -100,7 +100,7 @@ pub(crate) fn factored_weighted_cross(
     // no unsafe, no shared writes. `with_nested_parallel` pins the inner
     // `chunked_weighted_bt_d` GEMM to `Par::Seq` so the row fan-out does not
     // multiply against the faer pool (gam#1082).
-    use crate::faer_ndarray::with_nested_parallel;
+    use gam_problem::with_nested_parallel;
     use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
     out.axis_chunks_iter_mut(ndarray::Axis(0), pb.max(1))

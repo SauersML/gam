@@ -151,7 +151,7 @@ use crate::model_types::{ActiveLinearConstraintBlock, KktResidualSubspace, Proje
 pub use gam_problem::{
     ContractedPsiSecondOrderFn, DenseMatrixHyperOperator, DriftDerivResult, EvalMode,
     FixedDriftDerivFn, HyperCoord, HyperCoordDrift, HyperCoordPair, HyperOperator,
-    ProjectedFactorCache, ProjectedFactorKey,
+    ProjectedFactorCache, ProjectedFactorKey, PseudoLogdetMode,
 };
 
 // ─────────────────────────────────────────────────────────────────────────

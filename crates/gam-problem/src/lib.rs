@@ -16,6 +16,8 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 mod macros;
 
 mod linalg_helpers;
+mod pseudo_logdet;
+mod seeding;
 pub mod solver_contract;
 
 mod gpu {
@@ -42,6 +44,9 @@ mod gpu {
 }
 
 use linalg_helpers::{dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into};
+pub use linalg_helpers::{in_nested_parallel_region, with_nested_parallel};
+pub use pseudo_logdet::PseudoLogdetMode;
+pub use seeding::{SeedConfig, SeedRiskProfile, clamp_seed_rho_to_bounds, normalize_seed_bounds};
 pub use solver_contract::{
     DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterEval,
     OuterHessianMaterialization, OuterHessianOperator, OuterStrategyError,

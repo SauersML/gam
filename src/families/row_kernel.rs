@@ -1090,7 +1090,7 @@ pub fn row_kernel_directional_derivative_all_axes<const K: usize>(
         .map(|a| {
             let mut axis = vec![0.0_f64; p];
             axis[a] = 1.0;
-            crate::linalg::faer_ndarray::with_nested_parallel(|| {
+            gam_problem::with_nested_parallel(|| {
                 row_kernel_directional_derivative(kern, rows, &axis)
             })
         })
@@ -1168,7 +1168,7 @@ pub fn row_kernel_second_directional_derivative_all_axes<const K: usize>(
         .map(|a| {
             let mut axis = vec![0.0_f64; p];
             axis[a] = 1.0;
-            crate::linalg::faer_ndarray::with_nested_parallel(|| {
+            gam_problem::with_nested_parallel(|| {
                 row_kernel_second_directional_derivative(kern, rows, d_beta_u, &axis)
             })
         })

@@ -1,56 +1,5 @@
 use super::*;
 
-/// How the penalized Hessian's log-determinant and its derivatives treat the
-/// spectrum below the stability floor `ε = spectral_epsilon(·)`.
-///
-/// Two conventions, both mathematically internally consistent:
-///
-/// ## `Smooth` (default — appropriate for almost all GLM/GAM families)
-///
-/// Eigenvalues above the structural positive-eigenvalue threshold — the same
-/// ~100·p·ε_mach·‖H‖ cutoff that `fixed_subspace_penalty_rank_and_logdet`
-/// applies to `log|S|_+` — contribute to `log|H|` via the smooth regularizer
-/// `r_ε(σ) = ½(σ + √(σ² + 4ε²))`.  Gradients use `φ'(σ) = 1/√(σ² + 4ε²)`
-/// so that `d log|H|_reg/dρ = Σ φ'(σ_j) · u_j^T (dH/dρ) u_j` is the EXACT
-/// derivative of the scalar objective `Σ log r_ε(σ_j)` over the active set.
-/// For a well-conditioned H the threshold sits far below every genuine
-/// eigenvalue and every pair is active, so behaviour matches the previous
-/// unfiltered soft-floor formulation.  In the rank-deficient regime where
-/// `rank(X) + rank(S) < p` (e.g. small-n high-dim Duchon), H has eigenvalues
-/// inside the numerical noise band; those directions are also null in S, so
-/// excluding them from BOTH `log|H|` and `log|S|_+` keeps the LAML ratio
-/// well-defined on the identified subspace rather than driving
-/// `½ log|H| − ½ log|S|_+` to −∞.
-///
-/// ## `HardPseudo` (opt-in for structurally rank-deficient families)
-///
-/// When the model is known to carry a numerical null-space direction that
-/// is not informative — e.g. multi-block GAMLSS wiggle models where the
-/// threshold + constant wiggle-intercept are collinear — the smooth floor
-/// still contributes to `log|H|_reg` through that direction, and its
-/// first-order `dσ/dρ = u^T (dH/dρ) u` estimate is unreliable because the
-/// eigenvector u for a near-zero σ is a random linear combination of
-/// whatever the numerical eigensolver selected inside the null space.
-///
-/// Under `HardPseudo`, eigenvalues satisfying `σ_j ≤ ε` are EXCLUDED from
-/// `log|H|`, `tr(G_ε · A)`, `tr(H⁻¹ · ·)`, and every cross-trace.  This is
-/// the exact pseudo-logdeterminant on the active eigenspace:
-///
-///   log|H|₊  = Σ_{σ_j > ε} log σ_j
-///   d/dρ_k   = Σ_{σ_j > ε} (1/σ_j) · u_j^T (dH/dρ_k) u_j
-///
-/// with the smooth floor `r_ε(σ)` retained in place of `log σ` / `1/σ` so
-/// there is no discontinuity as an eigenvalue crosses ε.  The key property
-/// is that null-space directions drop out of both the cost and the
-/// gradient in a matched way; first-order perturbation theory applies only to
-/// directions that actually have curvature to perturb.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PseudoLogdetMode {
-    #[default]
-    Smooth,
-    HardPseudo,
-}
-
 // ═══════════════════════════════════════════════════════════════════════════
 //  Dense spectral HessianOperator implementation
 // ═══════════════════════════════════════════════════════════════════════════

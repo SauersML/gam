@@ -1006,7 +1006,7 @@ where
                 // fan-out (the rayon×BLAS oversubscription guard from the
                 // nested-BLAS fix). Bit-identical: faer partitions matmul output,
                 // never the contracted axis.
-                crate::linalg::faer_ndarray::with_nested_parallel(|| hessian_dir(&axis))
+                gam_problem::with_nested_parallel(|| hessian_dir(&axis))
             })
             .collect();
         // Resolve in index order so the first anomaly (Err, then None, then a
@@ -1201,9 +1201,7 @@ where
                 let mut axis_b = Array1::<f64>::zeros(p);
                 axis_b[b] = 1.0;
                 // Pin nested faer GEMM to `Par::Seq` (see the value-path note).
-                crate::linalg::faer_ndarray::with_nested_parallel(|| {
-                    hessian_second_dir(&axis_a, &axis_b)
-                })
+                gam_problem::with_nested_parallel(|| hessian_second_dir(&axis_a, &axis_b))
             })
             .collect();
         // Resolve in pair order so the first anomaly (Err, then None, then a
@@ -1372,7 +1370,7 @@ impl JeffreysHphiDriftBase {
                 .map(|a| {
                     let mut axis = Array1::<f64>::zeros(p);
                     axis[a] = 1.0;
-                    crate::linalg::faer_ndarray::with_nested_parallel(|| base_hessian_dir(&axis))
+                    gam_problem::with_nested_parallel(|| base_hessian_dir(&axis))
                 })
                 .collect();
             let mut hdots = Vec::with_capacity(p);
@@ -1504,7 +1502,7 @@ impl JeffreysHphiDriftBase {
                 .zip(aw_rows.axis_iter_mut(ndarray::Axis(0)).into_par_iter())
                 .zip(hdots.into_par_iter())
                 .for_each(|((mut a_row, mut aw_row), hdot_a)| {
-                    crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                    gam_problem::with_nested_parallel(|| {
                         let d_a_raw = z_j.t().dot(&hdot_a.dot(&z_j));
                         let mut d_a = Array2::<f64>::zeros((m, m));
                         for i in 0..m {
@@ -1568,7 +1566,7 @@ impl JeffreysHphiDriftBase {
                 .map(|a| {
                     let mut axis = Array1::<f64>::zeros(p);
                     axis[a] = 1.0;
-                    crate::linalg::faer_ndarray::with_nested_parallel(|| pert_hessian_dir(&axis))
+                    gam_problem::with_nested_parallel(|| pert_hessian_dir(&axis))
                 })
                 .collect();
             let mut pert_hdots = Vec::with_capacity(p);
@@ -1759,7 +1757,7 @@ impl JeffreysHphiDriftBase {
                 .zip(a_rows.axis_iter(ndarray::Axis(0)).into_par_iter())
                 .zip(pert_hdots.into_par_iter())
                 .for_each(|(((mut da_row, mut dw_row), a_flat), pert_hdot_a)| {
-                    crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                    gam_problem::with_nested_parallel(|| {
                         let mut a_a = Array2::<f64>::zeros((m, m));
                         {
                             let mut col = 0usize;

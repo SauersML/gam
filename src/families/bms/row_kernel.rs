@@ -879,7 +879,7 @@ impl BernoulliRigidRowKernel {
             // Exactness-preserving: faer partitions the GEMM *output*, never the
             // contracted row axis, so `Par::Seq` and `Par::rayon` produce
             // bit-identical Grams.
-            crate::faer_ndarray::with_nested_parallel(|| {
+            gam_problem::with_nested_parallel(|| {
                 let len = end - start;
                 let mut acc = BernoulliBlockHessianAccumulator::new(slices);
                 let mut w_mm = Array1::<f64>::zeros(len);
@@ -980,7 +980,7 @@ impl BernoulliRigidRowKernel {
                 // Rayon worker at `Par::Seq` so they do not re-fan the global pool
                 // against the outer `chunks.into_par_iter()`. Exactness-preserving:
                 // faer partitions the GEMM output, not the contracted row axis.
-                crate::faer_ndarray::with_nested_parallel(|| {
+                gam_problem::with_nested_parallel(|| {
                     let len = end - start;
                     let mut acc = BernoulliBlockHessianAccumulator::new(slices);
                     let mut w_mm = Array1::<f64>::zeros(len);
@@ -1119,7 +1119,7 @@ impl BernoulliRigidRowKernel {
         let mut uq = Array1::<f64>::zeros(n);
         let mut ug = Array1::<f64>::zeros(n);
         for &(start, end) in &chunks {
-            crate::faer_ndarray::with_nested_parallel(|| -> Result<(), String> {
+            gam_problem::with_nested_parallel(|| -> Result<(), String> {
                 let x_chunk: ndarray::CowArray<'_, f64, ndarray::Ix2> =
                     match self.family.marginal_design.as_dense_ref() {
                         Some(x_full) => x_full.slice(s![start..end, ..]).into(),
@@ -1159,7 +1159,7 @@ impl BernoulliRigidRowKernel {
         // Index-ordered collection keeps the output bit-identical to a serial
         // axis loop.
         let build_axis = |axis_global: usize| -> Result<Array2<f64>, String> {
-            crate::faer_ndarray::with_nested_parallel(|| {
+            gam_problem::with_nested_parallel(|| {
                 // Resolve the axis to its block and the local design column.
                 let marginal_axis = axis_global < p_m;
                 let local_col = if marginal_axis {
@@ -1323,7 +1323,7 @@ impl BernoulliRigidRowKernel {
         // `Par::Seq`. Index-ordered collection keeps the output bit-identical to
         // a serial axis loop.
         let build_axis = |axis_global: usize| -> Result<Array2<f64>, String> {
-            crate::faer_ndarray::with_nested_parallel(|| {
+            gam_problem::with_nested_parallel(|| {
                 let marginal_axis = axis_global < p_m;
                 let local_col = if marginal_axis {
                     axis_global

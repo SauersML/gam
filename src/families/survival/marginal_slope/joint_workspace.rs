@@ -335,7 +335,7 @@ impl crate::families::marginal_slope_shared::MarginalSlopePsiFamily
         let per_axis: Result<Vec<Option<ExactNewtonJointPsiTerms>>, String> = psi_indices
             .into_par_iter()
             .map(|psi_index| {
-                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                gam_problem::with_nested_parallel(|| {
                     self.family.psi_terms_inner_with_options(
                         &self.block_states,
                         &self.derivative_blocks,

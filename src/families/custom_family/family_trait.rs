@@ -1111,7 +1111,7 @@ pub trait CustomFamily {
             .map(|a| {
                 let mut axis = Array1::<f64>::zeros(p);
                 axis[a] = 1.0;
-                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                gam_problem::with_nested_parallel(|| {
                     self.joint_jeffreys_information_directional_derivative_with_specs(
                         block_states,
                         specs,

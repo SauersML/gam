@@ -2938,7 +2938,7 @@ impl BernoulliMarginalSlopeFamily {
                     // pool and the inner `fast_ab` / weighted-Gram GEMMs do not
                     // re-fan it and oversubscribe — same discipline as the FLEX
                     // chunked path.
-                    .map(|chunk| crate::faer_ndarray::with_nested_parallel(|| chunk_body(chunk)))
+                    .map(|chunk| gam_problem::with_nested_parallel(|| chunk_body(chunk)))
                     .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
                         for (l, r) in left.iter_mut().zip(right.iter()) {
                             l.add(r);
@@ -3128,7 +3128,7 @@ impl BernoulliMarginalSlopeFamily {
                     // `Par::Seq` so they do not re-fan the global Rayon pool
                     // against this already-parallel chunk fan-out. The serial
                     // path above intentionally keeps top-level pool parallelism.
-                    .map(|chunk| crate::faer_ndarray::with_nested_parallel(|| chunk_body(chunk)))
+                    .map(|chunk| gam_problem::with_nested_parallel(|| chunk_body(chunk)))
                     .try_reduce(make_accs, |mut left, right| -> Result<_, String> {
                         for (l, r) in left.iter_mut().zip(right.iter()) {
                             l.add(r);
@@ -3986,7 +3986,7 @@ impl BernoulliMarginalSlopeFamily {
                     // chunk fold — the rayon×BLAS oversubscription behind the
                     // intermittent `hessian_qp` stalls. Bit-identical: faer
                     // partitions the matmul output, never the contracted axis.
-                    crate::faer_ndarray::with_nested_parallel(|| {
+                    gam_problem::with_nested_parallel(|| {
                         let start = chunk_idx * row_chunk;
                         let end = (start + row_chunk).min(n);
                         let rows = end - start;

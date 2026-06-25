@@ -2382,7 +2382,7 @@ impl BernoulliMarginalSlopeFamily {
                 // oversubscription that intermittently stalled the joint-Newton
                 // `hessian_qp` cycle). Bit-identical: faer partitions the matmul
                 // output, never the contracted axis.
-                crate::faer_ndarray::with_nested_parallel(|| {
+                gam_problem::with_nested_parallel(|| {
                 let start = chunk_idx * rows_per_chunk;
                 let end = (start + rows_per_chunk).min(n);
                 let rows = start..end;

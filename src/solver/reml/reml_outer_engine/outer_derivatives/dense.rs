@@ -791,7 +791,7 @@ pub(crate) fn compute_outer_hessian(
                 .map(|pair_idx| {
                     let (ii, jj) =
                         crate::linalg::matrix::upper_triangle_pair_from_index(pair_idx, ext_dim);
-                    crate::linalg::faer_ndarray::with_nested_parallel(|| ext_pair_fn(ii, jj))
+                    gam_problem::with_nested_parallel(|| ext_pair_fn(ii, jj))
                 })
                 .collect()
         };

@@ -851,7 +851,7 @@ impl SurvivalMarginalSlopeRowKernel {
             .map(|a| {
                 let mut axis = vec![0.0_f64; p];
                 axis[a] = 1.0;
-                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                gam_problem::with_nested_parallel(|| {
                     self.chunked_pullback_reduce(p, |row, acc| {
                         let dir = self.jacobian_action(row, &axis);
                         let third = towers[row].third_contracted(&dir);
@@ -878,7 +878,7 @@ impl SurvivalMarginalSlopeRowKernel {
             .map(|a| {
                 let mut axis = vec![0.0_f64; p];
                 axis[a] = 1.0;
-                crate::linalg::faer_ndarray::with_nested_parallel(|| {
+                gam_problem::with_nested_parallel(|| {
                     self.chunked_pullback_reduce(p, |row, acc| {
                         let dir_u = self.jacobian_action(row, d_beta_u);
                         let dir_v = self.jacobian_action(row, &axis);
