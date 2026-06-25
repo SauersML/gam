@@ -3704,11 +3704,30 @@ impl SaeManifoldTerm {
         grams: &[Array2<f64>],
         n_total: usize,
     ) -> Result<(), String> {
+        // #1026/#1522 — in an OVER-COMPLETE dictionary (K chosen larger than the
+        // number of real features, the explicit 32K-atom regime) surplus atoms
+        // SHOULD die: a dead atom's assignment weights all vanish, so its weighted
+        // design `D_k` is rank-0 and its decoder Gram `G_k = D_kᵀD_k` is the zero
+        // matrix. A rank-0 block is just the EXTREME of rank-deficiency, and the
+        // exact same Arrow-Schur ridge that regularises a partially-deficient
+        // block (`solve_with_lm_escalation_inner` + the reduced-Schur PD floor)
+        // parks a fully-deficient one: `H_block → ridge·I` with a zero data
+        // gradient, so `β_k → 0` — a cleanly dead atom contributing nothing to the
+        // reconstruction. Treating a single dead atom among many as a FATAL audit
+        // failure (the old policy) is exactly what made the over-complete fit
+        // unfittable: the seed died, the continuation spine re-failed identically,
+        // and the outer loop livelocked. So rank-0 now takes the same ridge-park
+        // INFO path as any other rank deficiency. The genuine pathology — a design
+        // with NO identifiable signal anywhere — is still caught: if EVERY atom is
+        // rank-0 the whole dictionary is unidentifiable and we fail loudly.
+        let mut any_identifiable = false;
+        let mut audited_atoms = 0usize;
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let m = atom.basis_size();
             if m == 0 {
                 continue;
             }
+            audited_atoms += 1;
             let rank = crate::identifiability::audit::rank_of_gram(&grams[atom_idx], n_total)
                 .map_err(|e| {
                     format!(
@@ -3717,24 +3736,32 @@ impl SaeManifoldTerm {
                         atom.name,
                     )
                 })?;
+            if rank > 0 {
+                any_identifiable = true;
+            }
             if rank < m {
                 let dropped = m - rank;
-                if rank == 0 {
-                    return Err(format!(
-                        "SaeManifoldTerm: pre-fit identifiability audit: decoder atom '{}' has \
-                         rank-0 weighted design (n={n_total}, M_k={m}); all assignment weights \
-                         vanish or the basis is degenerate, so the Arrow-Schur Newton system for \
-                         this block is singular",
-                        atom.name,
-                    ));
-                }
                 log::info!(
                     "[SAE-AUDIT] decoder atom '{}' weighted design is rank-deficient \
                      (rank={rank}/{m}, {dropped} weakly-identified column(s), n={n_total}); the \
-                     Arrow-Schur ridge will regularise the deficient directions",
+                     Arrow-Schur ridge will regularise the deficient directions{}",
                     atom.name,
+                    if rank == 0 {
+                        " (atom is fully unweighted — parked dead, β_k → 0)"
+                    } else {
+                        ""
+                    },
                 );
             }
+        }
+        if audited_atoms > 0 && !any_identifiable {
+            return Err(format!(
+                "SaeManifoldTerm: pre-fit identifiability audit: ALL {audited_atoms} decoder \
+                 atoms have rank-0 weighted design (n={n_total}); the entire dictionary is \
+                 unidentifiable — every atom's assignment weights vanish or every basis is \
+                 degenerate, so the joint Arrow-Schur Newton system is singular with no \
+                 ridge-recoverable signal"
+            ));
         }
         Ok(())
     }

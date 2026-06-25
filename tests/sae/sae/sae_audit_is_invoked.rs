@@ -129,11 +129,14 @@ fn run_joint_fit_passes_with_full_rank_atoms() {
 }
 
 #[test]
-fn run_joint_fit_fails_with_rank_zero_atom() {
-    // One atom whose basis evaluations are identically zero — its weighted
-    // design D_k is rank 0, so the decoder block Hessian G_k ⊗ I_p is singular.
-    // The pre-fit per-atom audit must catch this and the fit must error before
-    // any Newton step.
+fn run_joint_fit_parks_single_rank_zero_atom_among_live() {
+    // #1026/#1522 — one atom whose basis evaluations are identically zero (its
+    // weighted design D_k is rank 0) ALONGSIDE a full-rank atom. In an
+    // over-complete dictionary a surplus atom whose assignment weights all
+    // vanish SHOULD die gracefully: the Arrow-Schur ridge parks its singular
+    // block (β_k → 0) exactly as it regularises any rank-deficient block. The
+    // pre-fit audit must therefore NOT reject the fit — a single dead atom among
+    // identifiable ones is the intended over-complete outcome, not a fatal error.
     let phi0 = distinct_phi(0);
     let phi_zero = Array2::<f64>::zeros((N, M));
     let atom0 = make_atom("atom_ok", phi0);
@@ -146,8 +149,32 @@ fn run_joint_fit_fails_with_rank_zero_atom() {
     let result =
         term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 1, 1.0, 1.0e-3, 1.0e-3);
     assert!(
+        result.is_ok(),
+        "run_joint_fit_arrow_schur must PARK a single rank-0 atom among live atoms (graceful \
+         death in an over-complete dictionary), not reject the fit; got: {result:?}",
+    );
+}
+
+#[test]
+fn run_joint_fit_fails_when_all_atoms_rank_zero() {
+    // The genuine pathology the audit must still catch loudly: EVERY atom has a
+    // rank-0 weighted design, so the whole dictionary is unidentifiable and the
+    // joint Newton system has no ridge-recoverable signal anywhere. This must
+    // error before any Newton step, mentioning identifiability.
+    let phi_zero_a = Array2::<f64>::zeros((N, M));
+    let phi_zero_b = Array2::<f64>::zeros((N, M));
+    let atom0 = make_atom("atom_dead_a", phi_zero_a);
+    let atom1 = make_atom("atom_dead_b", phi_zero_b);
+    let assignment = make_assignment(2);
+    let mut term = SaeManifoldTerm::new(vec![atom0, atom1], assignment).unwrap();
+    let mut rho = make_rho(2);
+    let target = zero_target();
+
+    let result =
+        term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 1, 1.0, 1.0e-3, 1.0e-3);
+    assert!(
         result.is_err(),
-        "run_joint_fit_arrow_schur must fail when an atom has a rank-0 weighted design; got Ok(…)",
+        "run_joint_fit_arrow_schur must fail when ALL atoms have rank-0 weighted design; got Ok(…)",
     );
     let msg = result.unwrap_err();
     assert!(
