@@ -50,12 +50,32 @@ fn gpu_solver_matches_cpu_to_numeric_tolerance_on_small_input() {
 
     let cpu_sol = cpu_cholesky_solve(&h, &rhs);
 
-    if let Ok((gpu_sol, _)) = gam::gpu::solver::cholesky_solve_gpu(h.view(), rhs.view()) {
-        for i in 0..cpu_sol.nrows() {
+    // `cholesky_solve_gpu` requires a CUDA runtime (`iterative_refinement_cholesky_solve`
+    // returns Err when `GpuRuntime::global()` is None) and otherwise routes a dense
+    // SPD solve through `cuda::cholesky_solve` — which has NO batch/size floor, so a
+    // 3×3 system runs on device whenever a runtime is present. Therefore:
+    //   * no runtime  → Err is a legitimate CPU-only skip,
+    //   * runtime     → Err means the device solve FAULTED, which must fail loud
+    //                   (the device-PCG skip-pass class fixed in eee12f6b2; the old
+    //                   `if let Ok(..)` arm silently passed on a GPU kernel fault).
+    let result = gam::gpu::solver::cholesky_solve_gpu(h.view(), rhs.view());
+    let gpu_sol = match result {
+        Ok((sol, _)) => sol,
+        Err(err) => {
             assert!(
-                close(gpu_sol[[i, 0]], cpu_sol[[i, 0]], 1e-8),
-                "GPU solver output should match CPU solver output to within numeric tolerance on a small SPD input."
+                gam::gpu::device_runtime::GpuRuntime::global().is_none(),
+                "GPU Cholesky solve returned Err on a host WITH a CUDA runtime present: \
+                 {err}. A 3×3 SPD solve has no dispatch floor, so a runtime-present \
+                 decline is a real device-kernel fault, not a legitimate skip."
             );
+            eprintln!("SKIP gpu_solver_matches_cpu_to_numeric_tolerance_on_small_input: no CUDA runtime ({err})");
+            return;
         }
+    };
+    for i in 0..cpu_sol.nrows() {
+        assert!(
+            close(gpu_sol[[i, 0]], cpu_sol[[i, 0]], 1e-8),
+            "GPU solver output should match CPU solver output to within numeric tolerance on a small SPD input."
+        );
     }
 }
