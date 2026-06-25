@@ -1781,27 +1781,17 @@ impl OuterObjective for SaeManifoldOuterObjective {
         if !self.term.streaming_plan().direct_logdet_admitted() {
             return false;
         }
-        // K >= 2: routing multimodality makes blind multistart hopeless — the
-        // certified walk is the entry of record. K = 1 with a curved-capable
-        // chart (duchon / euclidean patch): the Eckart-Young LINEAR optimum is
-        // a genuine local minimum (a straight line through an arc), and cold
-        // seeds converge INTO it — the walk exists precisely to track from
-        // that anchor into the curved branch, and with the gauge-quotient
-        // pivot invariant it arrives in a handful of legs, replacing the
-        // 12-seed cascade outright. K = 1 periodic atoms keep the cascade:
-        // their circular topology is baked into the basis, so the linear
-        // basin is not an attractor for them and the walk buys nothing.
-        if self.term.k_atoms() >= 2 {
-            return true;
-        }
-        self.term.atoms.iter().any(|atom| {
-            matches!(
-                atom.basis_kind,
-                SaeAtomBasisKind::Duchon
-                    | SaeAtomBasisKind::EuclideanPatch
-                    | SaeAtomBasisKind::Poincare
-            )
-        })
+        // #1026 — the curvature-homotopy predictor-corrector ENTRY walk is the
+        // GAM-inherited expensive entry: it runs many dense joint-Hessian spine
+        // solves before the outer loop even starts. Empirically this fixed
+        // overhead alone times out even a well-posed K=8 fit (`n_iter`/refine
+        // budget makes no difference — saelowi: K=8 n_iter=1 KILLED), so a
+        // "normal SAE" entry (PCA decoder-projection seed → short outer loop)
+        // is the right strategy: skip the certified walk and let the cheap
+        // seeded cascade enter. The PCA seed already lands each row in the
+        // decisive basin; the walk's multimodality insurance is not worth its
+        // per-fit cost for the dictionary-fit use case.
+        false
     }
 
     /// The SAE-manifold objective has a certified anchor (#1007): its `η = 0`
