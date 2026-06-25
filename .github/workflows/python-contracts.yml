@@ -15,9 +15,12 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
-      - "tests/test_bug_hunt_numeric_by_variable_clamped_to_training_range_at_predict.py"
-      - "tests/test_bug_hunt_curv_smooth_hyperbolic_recovered_as_spherical.py"
-      - "tests/test_bug_hunt_poisson_zero_count_fit_unpredictable_mean.py"
+      # Any Python test or the gamfit package itself: the #1512 full-suite
+      # triage step below runs the whole tests/ directory on a fresh wheel, so a
+      # PR touching any test_*.py (or gamfit/) gets a fast pass/fail inventory
+      # without waiting on the multi-hour Rust suite in test.yml.
+      - "tests/**"
+      - "gamfit/**"
       - "src/inference/model.rs"
       - "src/inference/predict/mod.rs"
       - "src/inference/predict/standard.rs"
@@ -123,3 +126,42 @@ jobs:
         # the finite plug-in mean g^-1(eta_hat) instead of returning None.
         working-directory: ${{ runner.temp }}
         run: python -m pytest "$GITHUB_WORKSPACE/tests/test_bug_hunt_poisson_zero_count_fit_unpredictable_mean.py" -v --tb=short
+
+      - name: Install full-suite test runners (xdist + timeout)
+        # The full tests/ triage below fits hundreds of real models; xdist
+        # parallelizes across the runner's cores and pytest-timeout bounds any
+        # single hang so one stuck fit cannot wedge the whole job.
+        run: python -m pip install 'pytest-xdist>=3' 'pytest-timeout>=2'
+
+      - name: Triage full Python suite on the fresh wheel (#1512)
+        # #1512 authoritative full-suite triage. test.yml already runs
+        # `pytest tests/` but only AFTER the multi-hour Rust nextest suite, so a
+        # fresh-build pass/fail inventory of the 240 test files is hours away.
+        # This step runs the SAME directory-level invocation here, against the
+        # maturin wheel just built+installed above, so the inventory lands in
+        # ~30 min. It is the instrument for classifying the orphaned repros
+        # (real-bug vs stale-test) without a stale local extension.
+        #
+        # Run from runner.temp so the INSTALLED wheel's gamfit._rust wins over
+        # the source-tree ./gamfit (same reason as the contract steps above).
+        # `continue-on-error` until the inventory is triaged to green; the
+        # JUnit artifact is the durable record either way.
+        working-directory: ${{ runner.temp }}
+        continue-on-error: true
+        run: |
+          python -m pytest "$GITHUB_WORKSPACE/tests/" \
+            -m "not slow" \
+            --continue-on-collection-errors \
+            -p no:cacheprovider \
+            -n auto --timeout=300 \
+            -o addopts="--import-mode=importlib" \
+            --junitxml="$RUNNER_TEMP/py1512_junit.xml" \
+            -q --tb=line
+
+      - name: Upload full-suite JUnit inventory (#1512)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: py1512-junit
+          path: ${{ runner.temp }}/py1512_junit.xml
+          if-no-files-found: warn
