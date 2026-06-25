@@ -4860,8 +4860,8 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
             let data = DeviceSaePcgData {
                 p,
                 beta_dim: border_dim,
-                a_phi: Vec::new(),
-                local_jac: Vec::new(),
+                a_phi: std::sync::Arc::from(Vec::new().into_boxed_slice()),
+                local_jac: std::sync::Arc::from(Vec::new().into_boxed_slice()),
                 smooth_blocks,
                 sparse_g_blocks: Vec::new(),
                 frame: Some(DeviceSaeFrameData {
