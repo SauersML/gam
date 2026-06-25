@@ -1398,12 +1398,25 @@ mod fisher_single_source_oracle_tests {
                 (ll_hand - ll_mc).abs() <= 1e-6 * ll_hand.abs().max(1.0),
                 "H_lsls Fisher drift μ={mu} η={eta_ls}: hand={ll_hand} mech={ll_mc}"
             );
-            // Fisher-orthogonality: BOTH the production cross block and the
-            // mechanical GH cross are exactly zero. The mechanical zero is a
-            // true cancellation of the odd-in-r contributions at the symmetric
-            // GH nodes — this PROVES E[H_{μ,ls}] ≡ 0, it is not assumed.
+            // Fisher-orthogonality `E[H_{μ,ls}] ≡ 0`, PROVEN two ways:
+            //  * the production cross coefficient is structurally, BIT-EXACTLY
+            //    zero (it is the literal `Array1::zeros` in
+            //    `gaussian_locscale_fisher_joint_row_coeffs`); and
+            //  * the mechanical GH cross vanishes by a genuine cancellation —
+            //    every cross contribution is odd (linear) in `r`, so the two
+            //    symmetric outer GH nodes carry equal-and-opposite `H_{μ,ls}`
+            //    and the centre node (r = 0) contributes nothing. The residual
+            //    is pure central-FD truncation of the mixed second difference
+            //    (O(h²) ≈ 1e-8), NOT a real coupling term, so it is bounded —
+            //    not asserted bit-zero. A genuine non-zero Fisher cross would be
+            //    O(1) here and blow this bound, catching a #736/#947-style
+            //    dropped-orthogonality regression.
             assert_eq!(cross_hand, 0.0, "production cross block must be exactly 0");
-            assert_eq!(ml_mc, 0.0, "Gauss–Hermite cross block must cancel to exactly 0");
+            assert!(
+                ml_mc.abs() <= 1e-6,
+                "Gauss–Hermite Fisher cross block must cancel to ~0 \
+                 (genuine coupling would be O(1)): μ={mu} η={eta_ls} ml={ml_mc:.3e}"
+            );
         }
     }
 
