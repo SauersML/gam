@@ -80,11 +80,39 @@ pub fn fused_path_admitted(n: usize, p: usize, r: usize) -> bool {
 /// configuration in math block 3 §8.
 pub const MAX_FUSED_P: usize = 32;
 
-/// Compile-time `R` widths the NVRTC fused kernel is templated on. The Arrow-
-/// Schur driver always builds the system at a single uniform `R = K` (the
-/// shared β width), so the host JIT selects exactly one template
-/// instantiation per `(P, R)` pair encountered. Caching matches the
+/// Compile-time `R` (= border width `K`) widths the NVRTC fused kernel is
+/// templated on. The Arrow-Schur driver always builds the system at a single
+/// uniform `R = K` (the shared β width), so the host JIT selects exactly one
+/// template instantiation per `(P, R)` pair encountered. Caching matches the
 /// `S2ModuleCacheKey` pattern in `crate::terms::basis::sphere_gpu`.
+///
+/// # Why the fused kernel tops out at R = 32 — and why real SAE borders still
+/// # run on-device (issue #1017 deliverable 4)
+///
+/// The fused single-kernel's whole advantage is keeping the per-row whitened
+/// cross tile `Y_i = L_i^{-1} B_i` (a `P × R` block) AND the `R × R` Schur
+/// partial resident in **shared memory** between the four sub-steps, so the
+/// four cuSOLVER/cuBLAS launches collapse into one block with no global-memory
+/// round-trip. That residency is hard-bounded by the SM shared-memory budget:
+/// the per-block footprint is `P*P + P*R + P + R*R + R` doubles, dominated by
+/// the `R*R` Schur tile. At `R = 32` that is ~24.5 KiB (3 blocks/SM on a 96 KiB
+/// SM); at the real SAE border `R = K ≈ 2048` the `R*R` tile alone is
+/// `2048² · 8 B = 32 MiB`, ~140× the entire 228 KiB opt-in shared budget of an
+/// A100 SM. So widening `R` past ~32 is **physically impossible** for this
+/// shared-memory-resident design, not a missing template — the kernel would
+/// need a fundamentally different (global-memory, tiled-GEMM) Schur path, which
+/// is just the cuSOLVER/cuBLAS path the unfused route already provides.
+///
+/// Crucially, a wide border is **NOT** a CPU fallback. When `K > 32`,
+/// `ceil_to_template_r` returns `None`, `plan_fused_launch` declines, and
+/// `system_admits_fused_path` is `false`, so `solve_arrow_newton_step` falls
+/// through to the **unfused cuSOLVER/cuBLAS device path** (`cuda::solve`) — the
+/// batched per-row POTRF + cuBLAS TRSM + cuSOLVER border POTRF that the
+/// `color_arm` (K=5120) and `qwen_non_gating` (K=2048) resident frames run.
+/// Those borders execute entirely on the GPU; the fused kernel is a
+/// small-border micro-optimization, and the residency win this issue measures
+/// (`ResidentArrowFrame`) is realized on the unfused device path, independent
+/// of the fused kernel's `R` ceiling.
 pub const FUSED_R_TEMPLATES: &[usize] = &[4, 5, 6, 8, 10, 12, 16, 20, 24, 32];
 
 /// Smallest entry in `FUSED_R_TEMPLATES` that is ≥ `r`. Used both by the
