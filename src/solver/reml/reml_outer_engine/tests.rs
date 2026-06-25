@@ -905,20 +905,10 @@ pub(crate) fn ift_projected_pseudo_inverse_saves_orders_of_magnitude_on_cross_co
 }
 
 pub(crate) fn make_factor_key(seed: u64) -> ProjectedFactorKey {
-    // Build a unique-by-seed key without going through
-    // `from_factor_view` so the test can inject fingerprints
-    // directly. Using public construction via a real ArrayView2
-    // would couple this test to ndarray pointer aliasing.
-    ProjectedFactorKey {
-        design_id: 1,
-        factor_ptr: seed as usize,
-        rows: 1,
-        cols: 1,
-        row_stride: 1,
-        col_stride: 1,
-        value_hash: seed,
-        value_hash2: seed.wrapping_mul(31),
-    }
+    // Build a unique-by-seed key without going through `from_factor_view` so the
+    // test can inject fingerprints directly. The struct fields are private to
+    // `gam-problem`; its `synthetic` constructor exposes exactly this affordance.
+    ProjectedFactorKey::synthetic(seed)
 }
 
 #[test]
@@ -985,53 +975,9 @@ pub(crate) fn projected_factor_cache_wait_for_subscriber(
     key: ProjectedFactorKey,
     timeout: std::time::Duration,
 ) -> bool {
-    let marker = {
-        let inner = cache
-            .inner
-            .lock()
-            .expect("projected factor cache lock poisoned");
-        let Some(m) = inner.in_progress.get(&key) else {
-            return false;
-        };
-        Arc::clone(m)
-    };
-    if marker
-        .waiter_count
-        .load(std::sync::atomic::Ordering::Acquire)
-        > 0
-    {
-        return true;
-    }
-    let (lock, cv) = &marker.subscriber_arrived;
-    let mut guard = lock
-        .lock()
-        .expect("subscriber-arrived notification lock poisoned");
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if marker
-            .waiter_count
-            .load(std::sync::atomic::Ordering::Acquire)
-            > 0
-        {
-            return true;
-        }
-        let now = std::time::Instant::now();
-        if now >= deadline {
-            return false;
-        }
-        let (next_guard, result) = cv
-            .wait_timeout(guard, deadline - now)
-            .expect("subscriber-arrived wait poisoned");
-        guard = next_guard;
-        if result.timed_out()
-            && marker
-                .waiter_count
-                .load(std::sync::atomic::Ordering::Acquire)
-                == 0
-        {
-            return false;
-        }
-    }
+    // The subscriber condvar/waiter-counter are private to the cache (which now
+    // lives in `gam-problem`); delegate to the cache's own wait affordance.
+    cache.wait_for_subscriber(key, timeout)
 }
 
 #[test]
