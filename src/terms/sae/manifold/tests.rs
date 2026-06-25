@@ -2985,6 +2985,73 @@ pub(crate) fn reml_retries_refinement_after_non_pd_undamped_evidence_factor() {
     assert_abs_diff_eq!(stream_loss.total(), full_loss.total(), epsilon = 1.0e-8);
 }
 
+/// #1033 large-n: chunking the per-row assembly fold (so the transient
+/// `Vec<SaeAssemblyRow>` is bounded to `O(chunk)` instead of `O(n)`) must
+/// produce a BIT-IDENTICAL Arrow-Schur system to the single-pass fold. The fold
+/// is row-ascending across chunks, so every floating-point `+=` into `sys.gb`,
+/// each row's `htt`/`gt`, and the `g_blocks`/`kron_*` accumulators lands in the
+/// exact same order regardless of chunk width. We assemble once at the full
+/// width (`chunk_override = None` ⇒ the admission plan, which is `n` in-core)
+/// and once at a tiny width that forces the multi-chunk path on the same small
+/// fixture, then assert every system field agrees to the last bit (`to_bits`).
+/// A regression that reordered the fold (e.g. folding chunks out of order, or
+/// parallel-reducing across chunk boundaries) would perturb the low bits here.
+#[test]
+pub(crate) fn chunked_assembly_fold_is_bit_identical_1033() {
+    let (mut term_full, target, rho) = small_two_atom_periodic_term();
+    let mut term_chunked = term_full.clone();
+
+    // Single-pass fold (production default at this in-core size: chunk == n).
+    term_full.assembly_chunk_override = None;
+    let sys_full = term_full
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("single-pass assembly must succeed");
+
+    // Force the multi-chunk fold path: width 2 over the 5-row fixture exercises
+    // chunk boundaries [0,2) [2,4) [4,5).
+    term_chunked.assembly_chunk_override = Some(2);
+    let sys_chunked = term_chunked
+        .assemble_arrow_schur(target.view(), &rho, None)
+        .expect("chunked assembly must succeed");
+
+    assert_eq!(
+        sys_full.rows.len(),
+        sys_chunked.rows.len(),
+        "chunked and single-pass assemblies must yield the same row count"
+    );
+    assert_eq!(sys_full.gb.len(), sys_chunked.gb.len());
+    for (i, (gf, gc)) in sys_full.gb.iter().zip(sys_chunked.gb.iter()).enumerate() {
+        assert_eq!(
+            gf.to_bits(),
+            gc.to_bits(),
+            "sys.gb[{i}] must be bit-identical (single-pass {gf} vs chunked {gc})"
+        );
+    }
+    for (row, (rf, rc)) in sys_full
+        .rows
+        .iter()
+        .zip(sys_chunked.rows.iter())
+        .enumerate()
+    {
+        assert_eq!(rf.htt.dim(), rc.htt.dim(), "row {row} htt shape");
+        assert_eq!(rf.gt.len(), rc.gt.len(), "row {row} gt len");
+        for (a, (hf, hc)) in rf.htt.iter().zip(rc.htt.iter()).enumerate() {
+            assert_eq!(
+                hf.to_bits(),
+                hc.to_bits(),
+                "row {row} htt[{a}] must be bit-identical: {hf} vs {hc}"
+            );
+        }
+        for (a, (gf, gc)) in rf.gt.iter().zip(rc.gt.iter()).enumerate() {
+            assert_eq!(
+                gf.to_bits(),
+                gc.to_bits(),
+                "row {row} gt[{a}] must be bit-identical: {gf} vs {gc}"
+            );
+        }
+    }
+}
+
 #[test]
 pub(crate) fn reconstruction_dispersion_uses_ard_shrunk_coordinate_edf() {
     let n = 24usize;

@@ -212,6 +212,7 @@ impl SaeManifoldTerm {
             collapse_events: Vec::new(),
             row_loss_weights: None,
             last_frames_active: false,
+            assembly_chunk_override: None,
             fixed_decoder_assembly: false,
             softmax_active_cap: None,
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
@@ -4012,7 +4013,34 @@ impl SaeManifoldTerm {
             None => (k_atoms, q),
         };
         use rayon::iter::{IntoParallelIterator, ParallelIterator};
-        let row_results: Vec<SaeAssemblyRow> = (0..n)
+        // #1033 large-n: fold the per-row assembly results in row-ordered CHUNKS
+        // rather than collecting all `n` `SaeAssemblyRow`s at once. The previous
+        // path materialized the FULL `Vec<SaeAssemblyRow>` (every row's htt/gt
+        // block + per-row `g_blocks` + `kron_a_phi`/`kron_jac`) AND the fold
+        // destinations simultaneously — a ~2× transient peak over the resident
+        // system during the fold, the assembly-side OOM cliff at large `n`. By
+        // collecting one chunk, folding it into `sys.rows`/`g_blocks`/`kron_*`,
+        // and dropping the chunk's `Vec` before the next chunk, the transient
+        // intermediate is bounded to `O(chunk_size)` while the resident output is
+        // unchanged. The fold stays STRICTLY row-ascending (chunk `[c0..c1)` then
+        // `[c1..c2)`, rows in order within each chunk), so every `+=` into
+        // `sys.gb`, the `g_blocks` BTreeMap, and the `kron_*` pushes lands in the
+        // identical order as the single-pass fold — bit-for-bit the same system.
+        // Chunk width is the admission plan's `chunk_size` (the same value
+        // `streaming_plan` sizes for the matrix-free window), floored so a tiny
+        // plan still makes forward progress.
+        let assembly_chunk_rows = self
+            .assembly_chunk_override
+            .unwrap_or(admission_plan.chunk_size)
+            .clamp(1, n.max(1));
+        let mut g_blocks: SaeGBlocks = std::collections::BTreeMap::new();
+        let mut kron_a_phi: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n);
+        let mut kron_jac: Vec<Vec<f64>> = Vec::with_capacity(n);
+        let mut chunk_start = 0usize;
+        while chunk_start < n {
+            let chunk_end = (chunk_start + assembly_chunk_rows).min(n);
+            let mut fold_offset_in_chunk = 0usize;
+            let row_results: Vec<SaeAssemblyRow> = (chunk_start..chunk_end)
             .into_par_iter()
             .map_init(
                 || RowScratch {
@@ -4642,42 +4670,53 @@ impl SaeManifoldTerm {
             )
             .collect::<Result<Vec<_>, String>>()?;
 
-        let mut g_blocks: SaeGBlocks = std::collections::BTreeMap::new();
-        let mut kron_a_phi: Vec<Vec<(usize, f64)>> = Vec::with_capacity(n);
-        let mut kron_jac: Vec<Vec<f64>> = Vec::with_capacity(n);
-        for (row, row_result) in row_results.into_iter().enumerate() {
-            assert_eq!(
-                row, row_result.row,
-                "parallel SAE row assembly returned rows out of order"
-            );
-            for (idx, value) in row_result.gb_delta {
-                sys.gb[idx] += value;
-            }
-            for ((atom_i, atom_j), data) in row_result.g_blocks {
-                let m_i = data.nrows();
-                let m_j = data.ncols();
-                let blk = g_blocks
-                    .entry((atom_i, atom_j))
-                    .or_insert_with(|| Array2::<f64>::zeros((m_i, m_j)));
-                for li in 0..m_i {
-                    for lj in 0..m_j {
-                        blk[[li, lj]] += data[[li, lj]];
+            // Fold THIS chunk's rows (ascending) into the global accumulators.
+            // The parallel collect preserves index order within the chunk and
+            // chunks are visited in ascending `chunk_start` order, so the overall
+            // fold order is `0,1,2,…,n-1` — identical to the former single-pass
+            // fold. The `row == chunk_start + fold_offset_in_chunk` assert pins
+            // that strict sequential arrival (the invariant the `kron_*`
+            // row-aligned pushes depend on).
+            for row_result in row_results.into_iter() {
+                let row = row_result.row;
+                assert_eq!(
+                    row, chunk_start + fold_offset_in_chunk,
+                    "parallel SAE row assembly returned rows out of order"
+                );
+                fold_offset_in_chunk += 1;
+                for (idx, value) in row_result.gb_delta {
+                    sys.gb[idx] += value;
+                }
+                for ((atom_i, atom_j), data) in row_result.g_blocks {
+                    let m_i = data.nrows();
+                    let m_j = data.ncols();
+                    let blk = g_blocks
+                        .entry((atom_i, atom_j))
+                        .or_insert_with(|| Array2::<f64>::zeros((m_i, m_j)));
+                    for li in 0..m_i {
+                        for lj in 0..m_j {
+                            blk[[li, lj]] += data[[li, lj]];
+                        }
                     }
                 }
+                if !frames_engaged && !fixed_decoder {
+                    // Rows arrive in ascending order across chunks, so pushing
+                    // here yields `kron_*[row]` aligned to the row index exactly
+                    // as the single-pass `push` did.
+                    kron_a_phi.push(
+                        row_result
+                            .kron_a_phi
+                            .expect("full-B SAE row assembly must return a_phi rows"),
+                    );
+                    kron_jac.push(
+                        row_result
+                            .kron_jac
+                            .expect("full-B SAE row assembly must return local Jacobian rows"),
+                    );
+                }
+                sys.rows[row] = row_result.block;
             }
-            if !frames_engaged && !fixed_decoder {
-                kron_a_phi.push(
-                    row_result
-                        .kron_a_phi
-                        .expect("full-B SAE row assembly must return a_phi rows"),
-                );
-                kron_jac.push(
-                    row_result
-                        .kron_jac
-                        .expect("full-B SAE row assembly must return local Jacobian rows"),
-                );
-            }
-            sys.rows[row] = row_result.block;
+            chunk_start = chunk_end;
         }
         // #1407: fixed-decoder early return. The per-row htt/gt are now fully
         // assembled (data GN + assignment/ARD prior). Apply only the htt/gt

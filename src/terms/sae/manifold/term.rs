@@ -323,6 +323,13 @@ pub struct SaeManifoldTerm {
     /// lock-step with the assembled system so the step interpretation cannot
     /// drift from the layout the system was built in.
     pub(crate) last_frames_active: bool,
+    /// #1033 test seam: force the large-`n` assembly fold to use this row chunk
+    /// width instead of the streaming-plan's `chunk_size`. `None` ⇒ production
+    /// behavior (the admission plan picks the window). Tests set a tiny value to
+    /// drive the multi-chunk fold path on a small problem and assert it is
+    /// bit-identical to the single-pass (`chunk_size == n`) fold. Never set in
+    /// production; it only re-partitions the fold, never changes per-row math.
+    pub(crate) assembly_chunk_override: Option<usize>,
     /// #1407: when set, `assemble_arrow_schur` emits ONLY the per-row block-
     /// diagonal `htt`/`gt` (the data-fit Gauss-Newton + assignment/ARD prior
     /// curvature and gradient), skipping the entire β decoder tier — the β Gram
@@ -464,6 +471,7 @@ impl Clone for SaeManifoldTerm {
             collapse_events: self.collapse_events.clone(),
             row_loss_weights: self.row_loss_weights.clone(),
             last_frames_active: self.last_frames_active,
+            assembly_chunk_override: self.assembly_chunk_override,
             fixed_decoder_assembly: false,
             // Persisted configuration (like the assignment mode), carried across
             // clones so a cloned term optimizes the same compact top-`k` problem.
