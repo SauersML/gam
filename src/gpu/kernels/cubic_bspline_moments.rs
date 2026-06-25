@@ -2692,13 +2692,24 @@ mod cubic_bspline_moments_tests {
         assert_eq!(CubicMomentBackend::compiled(), cfg!(target_os = "linux"));
         let probe = CubicMomentBackend::probe();
         if cfg!(target_os = "linux") {
-            // Linux probe may succeed or fail depending on libcuda availability;
-            // both are acceptable. The hard requirement is "does not panic" —
-            // reaching this assertion at all is the proof of that.
-            assert!(
-                probe.is_ok() || probe.is_err(),
-                "probe must return a Result"
-            );
+            // `probe()` must not panic (reaching here proves that). Strengthen the
+            // old tautological `is_ok() || is_err()` placeholder: when a CUDA
+            // runtime IS present the probe must SUCCEED — a probe failure with a
+            // live runtime is a real backend-init fault (device-PCG skip-pass
+            // class, eee12f6b2). With no runtime, an Err is the legitimate outcome.
+            if crate::gpu::device_runtime::GpuRuntime::global().is_some() {
+                assert!(
+                    probe.is_ok(),
+                    "CubicMomentBackend::probe() must succeed when a CUDA runtime is \
+                     present, got {:?}",
+                    probe.err()
+                );
+            } else {
+                assert!(
+                    probe.is_err(),
+                    "probe() must return Err on a Linux host with no CUDA runtime"
+                );
+            }
         } else {
             assert!(probe.is_err(), "non-Linux probe must return Err");
         }
