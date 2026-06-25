@@ -1745,6 +1745,22 @@ impl OuterObjective for SaeManifoldOuterObjective {
     /// handling flips from REJECT to DEMOTE-WITH-REASON so the candidate set
     /// never empties on a structural diagnosis.
     fn requires_continuation_path_entry(&self) -> bool {
+        // The continuation-path predictor-corrector is a DENSE-factor algorithm:
+        // its predictor takes the joint-Hessian IFT step
+        // (`ArrowFactorCache::full_inverse_apply`) and its corrector re-converges
+        // through the dense `reml_criterion_with_cache`. Neither exists in the
+        // matrix-free (streaming) regime — there the dense evidence factor
+        // exceeds the in-core budget, so `reml_criterion_with_cache` returns the
+        // `cost-only streaming route is required` error on EVERY spine eval. With
+        // the walk still requested, each error surfaces as `SpineStruggled`, the
+        // path re-enters the heavier (dense) regime, and re-fails identically —
+        // an unbounded livelock that times out (the K≥256 32K-dictionary hang).
+        // In the streaming regime the entry of record is the streaming-aware
+        // value cascade (`eval_cost` → `reml_criterion_streaming_exact`), so skip
+        // the continuation walk entirely. Dense-admitted fits are unchanged.
+        if !self.term.streaming_plan().direct_logdet_admitted() {
+            return false;
+        }
         // K >= 2: routing multimodality makes blind multistart hopeless — the
         // certified walk is the entry of record. K = 1 with a curved-capable
         // chart (duchon / euclidean patch): the Eckart-Young LINEAR optimum is
