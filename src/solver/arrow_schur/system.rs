@@ -3272,7 +3272,10 @@ impl ArrowFactorCache {
                     return Err(ArrowSchurError::SchurFactorFailed {
                         reason: format!(
                             "full_inverse_apply: H_βt^({i}) apply failed (htbeta cache \
-                             could not supply row {i})"
+                             could not supply row {i}; htbeta={:?}, di={}, k={})",
+                            self.htbeta,
+                            self.row_dims.get(i).copied().unwrap_or(self.d),
+                            self.k
                         ),
                     });
                 }
