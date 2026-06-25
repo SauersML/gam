@@ -124,6 +124,10 @@ pub mod outer_subsample;
 pub mod psis;
 pub mod reml_contracts;
 pub mod report;
+/// Lower-layer resource-policy/materialization-budget types. Hosted at the
+/// crate root (not under `solver`) so the `families` layer can name them
+/// without importing *up* into `solver` (#1135).
+pub mod resource;
 pub(crate) mod rho_prior_eval;
 /// Lower-layer ρ-uncertainty (PSIS-on-ρ) diagnostic. Depends only on the
 /// lower-layer `crate::psis`; hosted at the crate root so `solver` (its primary
@@ -138,15 +142,9 @@ pub mod solver;
 pub mod solver_contract;
 pub mod terms;
 pub mod test_support;
+pub mod types;
 pub mod util;
 pub mod warm_start;
-
-/// `types` and `resource` live in the `gam-core` leaf crate (issue #1521) and
-/// are re-exported here so every existing `crate::types::*` / `crate::resource::*`
-/// path across the tree resolves unchanged — a compile-unit split, not a source
-/// rewrite. `resource` keeps its crate-root home (not under `solver`) so the
-/// `families` layer names it without importing *up* (#1135).
-pub use gam_core::{resource, types};
 
 pub mod process_monitor;
 

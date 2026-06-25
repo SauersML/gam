@@ -234,8 +234,7 @@ mod tests {
     /// never reach (#1133).
     #[test]
     fn spec_path_evaluates_sas_link_bit_identical_to_solver_jet() {
-        let state = crate::solver::mixture_link::sas_link_state_from_raw(0.7, -0.4)
-            .expect("valid SAS link state");
+        let state = crate::types::SasLinkState::new(0.7, -0.4).expect("valid SAS link state");
         let link = InverseLink::Sas(state);
         let eta = [-2.0_f64, -0.5, 0.0, 0.5, 2.0, 4.0];
 

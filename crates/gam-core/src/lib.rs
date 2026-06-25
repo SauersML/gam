@@ -1,15 +1,25 @@
 //! `gam-core` — foundational shared types for the gam workspace.
 //!
-//! Leaf crate of the issue #1521 workspace split: the high-churn code
-//! (families, terms, solver) becomes a downstream compile unit so a change to a
-//! family or term no longer recompiles these near-static types. Window 1 owns
-//! the two fully leaf-clean modules `types` and `resource`, which `gam`
-//! re-exports (`pub use gam_core::{resource, types};`) so every existing
-//! `crate::types::*` / `crate::resource::*` path resolves unchanged.
+//! This is the leaf crate of the issue #1521 workspace split. The split makes
+//! the high-churn code (families, terms, solver) a *downstream* compile unit so
+//! a change to a family or term no longer invalidates the whole 770k-LOC crate:
+//! Rust only recompiles a crate when it or an upstream dependency changes, so
+//! pushing the foundational, near-static types into this leaf keeps everything
+//! above it cached across the common edit.
 //!
-//! Every item these modules expose to `gam` is `pub` (not `pub(crate)`): across
-//! a crate boundary `pub(crate)` is private to `gam-core`, so the shared floor
-//! `MIN_WEIGHT`, the diagnostic helper, and all referenced types are public.
+//! Planned contents (moved in the serializing window, held until post-#932):
+//! the contents of `gam::types`, `gam::resource`, `gam::model_types`, and the
+//! shared error enums that today force `linalg`/`gpu`/`solver`/`terms` to all
+//! reference each other through `crate::`. Moving them here breaks the
+//! `families ↔ solver ↔ terms` reference cycles by giving every layer a common
+//! upstream to name instead of naming each other.
+//!
+//! Until that window, this crate is intentionally minimal so the workspace
+//! skeleton lands additively without colliding with in-flight edits to the
+//! monolith.
 
-pub mod resource;
-pub mod types;
+/// Marker for the gam-core scaffold (issue #1521). Replaced by the real shared
+/// types when the maintainer declares the migration window. Present so the
+/// crate exposes a public item and compiles as a non-empty library under the
+/// workspace's `warnings = "deny"` lint.
+pub const WORKSPACE_SPLIT_PHASE: &str = "1-skeleton";

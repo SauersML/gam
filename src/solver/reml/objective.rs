@@ -3891,8 +3891,7 @@ mod tk_math_tests {
         let ys = [0.0_f64, 1.0];
         let configs = [(-0.25_f64, 0.35_f64), (0.4_f64, -0.2_f64)];
         for &(epsilon, log_delta) in &configs {
-            let state = crate::mixture_link::sas_link_state_from_raw(epsilon, log_delta)
-                .expect("sas state");
+            let state = SasLinkState::new(epsilon, log_delta).expect("sas state");
             let link = InverseLink::Sas(state);
             for &eta in &etas {
                 let jet = sas_inverse_link_jet(eta, state.epsilon, state.log_delta);

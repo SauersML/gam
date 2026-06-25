@@ -610,30 +610,23 @@ pub struct LogLogLinkKernel;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CauchitLinkKernel;
 
-/// Construct SAS state from raw optimizer parameters using the same bounded
-/// transform used everywhere in fitting/evaluation.
-///
-/// A free function rather than an inherent `SasLinkState::new` because
-/// `SasLinkState` now lives in the `gam-core` crate (#1521) while the bounded
-/// `delta` transform is solver-side math; the orphan rule forbids an inherent
-/// `impl` on a foreign-crate type, so the constructor is hosted here next to
-/// the transform. `SasLinkState`'s fields are `pub`, so it builds directly.
-pub fn sas_link_state_from_raw(
-    raw_epsilon: f64,
-    raw_log_delta: f64,
-) -> Result<SasLinkState, String> {
-    if !raw_epsilon.is_finite() || !raw_log_delta.is_finite() {
-        return Err("SAS link parameters must be finite".to_string());
+impl SasLinkState {
+    /// Construct SAS state from raw optimizer parameters using the same bounded
+    /// transform used everywhere in fitting/evaluation.
+    pub fn new(raw_epsilon: f64, raw_log_delta: f64) -> Result<Self, String> {
+        if !raw_epsilon.is_finite() || !raw_log_delta.is_finite() {
+            return Err("SAS link parameters must be finite".to_string());
+        }
+        Ok(Self {
+            epsilon: raw_epsilon,
+            log_delta: raw_log_delta,
+            delta: sas_delta_from_raw_log_delta(raw_log_delta),
+        })
     }
-    Ok(SasLinkState {
-        epsilon: raw_epsilon,
-        log_delta: raw_log_delta,
-        delta: sas_delta_from_raw_log_delta(raw_log_delta),
-    })
 }
 
 pub fn state_from_sasspec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
-    sas_link_state_from_raw(spec.initial_epsilon, spec.initial_log_delta)
+    SasLinkState::new(spec.initial_epsilon, spec.initial_log_delta)
 }
 
 pub fn state_from_beta_logisticspec(spec: SasLinkSpec) -> Result<SasLinkState, String> {
@@ -2480,7 +2473,7 @@ mod tests {
         // out-of-band state arguments — the parameterized link state lives on
         // `spec.link`. Verify that supplying explicit SAS/Mixture link states
         // through the spec produces finite jets at a representative eta.
-        let sas_state = sas_link_state_from_raw(0.0, 0.0).expect("sas state");
+        let sas_state = SasLinkState::new(0.0, 0.0).expect("sas state");
         let sas_spec = crate::types::LikelihoodSpec {
             response: crate::types::ResponseFamily::Binomial,
             link: InverseLink::Sas(sas_state),
@@ -2774,7 +2767,7 @@ mod tests {
 
     #[test]
     fn inverse_link_pdfthird_derivative_matches_d3_finite_difference() {
-        let sas = InverseLink::Sas(sas_link_state_from_raw(-0.25, 0.35).expect("sas state"));
+        let sas = InverseLink::Sas(SasLinkState::new(-0.25, 0.35).expect("sas state"));
         let beta_logistic = InverseLink::BetaLogistic(SasLinkState {
             epsilon: 0.18,
             log_delta: -0.22,
