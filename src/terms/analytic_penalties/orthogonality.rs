@@ -811,6 +811,104 @@ impl DecoderIncoherencePenalty {
         }
         out
     }
+
+    /// Scatter the Gauss-Newton (PSD majorizer) curvature DIRECTLY into a dense
+    /// `β × β` block, accumulating `scale · H_GN` onto `hbb`.
+    ///
+    /// This produces exactly the operator [`AnalyticPenalty::psd_majorizer_hvp`]
+    /// applies (the `include_residual = false` branch of [`Self::hvp_impl`]), but
+    /// assembled block-by-block over the penalized atom pairs instead of
+    /// reconstructed column-by-column from `β` unit-probe HVPs. Since `H_GN` is
+    /// pair-local — it couples only the `(j, k)` pairs in `self.pairs`, each within
+    /// their `(M·p)` decoder blocks — reading off the four output loops of
+    /// `hvp_impl` at a unit probe gives, per pair `(j, k)` with
+    /// `w = w_sym · λ · scale` and `G_x = B_xᵀ B_x` (the `p × p` decoder output
+    /// Gram of atom `x`):
+    ///   * j-block diagonal  `H[(j,a,o),(j,a,o')] += w · G_k[o,o']`
+    ///   * k-block diagonal  `H[(k,b,o),(k,b,o')] += w · G_j[o,o']`
+    ///   * off-diagonal      `H[(j,a,o₁),(k,b,o₂)] += w · B_j[a,o₂] · B_k[b,o₁]`
+    ///     and its symmetric transpose into the `(k, j)` block.
+    ///
+    /// Cost is `O(Σ_pairs (M_j·M_k + M_j + M_k)·p²)`, versus the probe loop's
+    /// `O(β · Σ_pairs M_j·M_k·p)`: once `β = K·M·p` and the collinearity gate
+    /// admits `O(K)` co-active pairs, the probe loop spends `O(K²)` time
+    /// rebuilding a matrix this assembles in `O(K)` (#1026).
+    pub(crate) fn accumulate_psd_majorizer_dense(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        scale: f64,
+        hbb: &mut Array2<f64>,
+    ) {
+        if target.len() != self.target.len() {
+            return;
+        }
+        let offsets = self.block_offsets();
+        let weight = self.resolved_weight(rho);
+        let p = self.p_out;
+        for &(j, k, w_sym) in &self.pairs {
+            let w = w_sym * weight * scale;
+            if w == 0.0 {
+                continue;
+            }
+            let off_j = offsets[j];
+            let off_k = offsets[k];
+            let m_j = self.block_sizes[j];
+            let m_k = self.block_sizes[k];
+            // Per-pair output Grams G_j = B_jᵀB_j and G_k = B_kᵀB_k (p × p), which
+            // drive the within-block diagonal curvature of the partner atom.
+            let mut g_j = vec![0.0_f64; p * p];
+            let mut g_k = vec![0.0_f64; p * p];
+            for o in 0..p {
+                for o2 in 0..p {
+                    let mut sj = 0.0;
+                    for a in 0..m_j {
+                        sj += target[off_j + a * p + o] * target[off_j + a * p + o2];
+                    }
+                    g_j[o * p + o2] = sj;
+                    let mut sk = 0.0;
+                    for b in 0..m_k {
+                        sk += target[off_k + b * p + o] * target[off_k + b * p + o2];
+                    }
+                    g_k[o * p + o2] = sk;
+                }
+            }
+            // j-block diagonal: H[(j,a,o),(j,a,o')] += w · G_k[o,o'].
+            for a in 0..m_j {
+                let base = off_j + a * p;
+                for o in 0..p {
+                    for o2 in 0..p {
+                        hbb[[base + o, base + o2]] += w * g_k[o * p + o2];
+                    }
+                }
+            }
+            // k-block diagonal: H[(k,b,o),(k,b,o')] += w · G_j[o,o'].
+            for b in 0..m_k {
+                let base = off_k + b * p;
+                for o in 0..p {
+                    for o2 in 0..p {
+                        hbb[[base + o, base + o2]] += w * g_j[o * p + o2];
+                    }
+                }
+            }
+            // Off-diagonal coupling: H[(j,a,o₁),(k,b,o₂)] += w · B_j[a,o₂]·B_k[b,o₁],
+            // and the symmetric transpose into the (k, j) block.
+            for a in 0..m_j {
+                for b in 0..m_k {
+                    for o1 in 0..p {
+                        let row_j = off_j + a * p + o1;
+                        let bk_b_o1 = target[off_k + b * p + o1];
+                        for o2 in 0..p {
+                            let col_k = off_k + b * p + o2;
+                            let contrib = w * target[off_j + a * p + o2] * bk_b_o1;
+                            hbb[[row_j, col_k]] += contrib;
+                            hbb[[col_k, row_j]] += contrib;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 impl AnalyticPenalty for DecoderIncoherencePenalty {

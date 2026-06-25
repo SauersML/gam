@@ -219,15 +219,17 @@ impl SaeManifoldTerm {
         if !dense_beta_curvature {
             return true;
         }
-        let mut probe = Array1::<f64>::zeros(beta_dim);
-        for j in 0..beta_dim {
-            probe.fill(0.0);
-            probe[j] = 1.0;
-            let hv = per_fit.psd_majorizer_hvp(target_beta.view(), rho_local.view(), probe.view());
-            for i in 0..beta_dim {
-                sys.hbb[[i, j]] += penalty_scale * hv[i];
-            }
-        }
+        // The repulsion's PSD (Gauss-Newton) curvature is pair-local: scatter it
+        // straight into `sys.hbb` block-by-block over the frozen gate pairs rather
+        // than reconstructing the dense `β × β` matrix with `β` unit-probe HVPs.
+        // At `β = K·M·p` with `O(K)` collinear gate pairs the probe loop is `O(K²)`
+        // (minutes in debug at K≈512); the direct scatter is `O(K)`.
+        per_fit.accumulate_psd_majorizer_dense(
+            target_beta.view(),
+            rho_local.view(),
+            penalty_scale,
+            &mut sys.hbb,
+        );
         true
     }
 
@@ -571,17 +573,17 @@ impl SaeManifoldTerm {
             if !dense_beta_curvature {
                 return true;
             }
-            // `hbb` is the PSD Newton / PIRLS curvature block: probe the PSD
-            // majorizer (the Gauss-Newton Hessian, which is already PSD here).
-            let mut probe = Array1::<f64>::zeros(beta_dim);
-            for j in 0..beta_dim {
-                probe.fill(0.0);
-                probe[j] = 1.0;
-                let hv = per_fit.psd_majorizer_hvp(target_beta, rho_local, probe.view());
-                for i in 0..beta_dim {
-                    sys.hbb[[i, j]] += penalty_scale * hv[i];
-                }
-            }
+            // `hbb` is the PSD Newton / PIRLS curvature block. The Gauss-Newton
+            // (PSD) majorizer is pair-local, so scatter it directly into `sys.hbb`
+            // over the co-active atom pairs instead of probing all `β` unit columns:
+            // the cross-atom incoherence term has `O(K)` co-active pairs but the
+            // probe loop is `O(β·pairs) = O(K²)`, the high-K assembly cliff.
+            per_fit.accumulate_psd_majorizer_dense(
+                target_beta,
+                rho_local,
+                penalty_scale,
+                &mut sys.hbb,
+            );
             return true;
         }
         if let AnalyticPenaltyKind::MechanismSparsity(base) = penalty {

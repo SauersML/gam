@@ -1915,6 +1915,84 @@ fn decoder_incoherence_sparse_matches_dense_operator() {
     );
 }
 
+/// The direct dense scatter `accumulate_psd_majorizer_dense` must reproduce the
+/// exact matrix built by the historical β-column unit-probe loop
+/// (`hbb[:, j] += scale · psd_majorizer_hvp(e_j)`), bit-for-bit. That loop is the
+/// `O(β·pairs)` high-K assembly cliff the SAE decoder-repulsion / incoherence
+/// paths used to pay; the scatter is the `O(pairs·(M·p)²)` replacement, so it
+/// must be numerically identical to remain a pure performance fix.
+#[test]
+fn accumulate_psd_majorizer_dense_matches_unit_probe_loop() {
+    let p = 3usize;
+    let block_sizes = vec![2usize, 1usize, 3usize, 2usize];
+    let k = block_sizes.len();
+    let total: usize = block_sizes.iter().map(|m| m * p).sum();
+    let target = PsiSlice {
+        range: 0..total,
+        latent_dim: Some(total / p),
+    };
+    let mut seed = 0xD1B54A32D192ED03_u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 11) as f64 / (1_u64 << 53) as f64
+    };
+    // Random nonzero symmetrized co-active pairs (some pairs dropped to zero).
+    let mut pairs = Vec::new();
+    for j in 0..k {
+        for kk in (j + 1)..k {
+            let raw = next();
+            if raw >= 0.25 {
+                pairs.push((j, kk, raw));
+            }
+        }
+    }
+    assert!(!pairs.is_empty(), "fixture must exercise at least one pair");
+    let weight = 0.83_f64;
+    let pen =
+        DecoderIncoherencePenalty::new_sparse(target, block_sizes, p, pairs, weight, false).unwrap();
+
+    let rho = Array1::<f64>::zeros(0);
+    let beta: Array1<f64> = (0..total).map(|_| next() - 0.5).collect();
+    let scale = 0.7_f64;
+
+    // Reference: the unit-probe column loop the fix replaces.
+    let mut hbb_ref = Array2::<f64>::zeros((total, total));
+    let mut probe = Array1::<f64>::zeros(total);
+    for col in 0..total {
+        probe.fill(0.0);
+        probe[col] = 1.0;
+        let hv = pen.psd_majorizer_hvp(beta.view(), rho.view(), probe.view());
+        for row in 0..total {
+            hbb_ref[[row, col]] += scale * hv[row];
+        }
+    }
+
+    // Direct block scatter.
+    let mut hbb = Array2::<f64>::zeros((total, total));
+    pen.accumulate_psd_majorizer_dense(beta.view(), rho.view(), scale, &mut hbb);
+
+    let max_abs = hbb
+        .iter()
+        .zip(hbb_ref.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_abs <= 1.0e-12,
+        "dense scatter vs unit-probe loop max abs mismatch = {max_abs:.3e}"
+    );
+
+    // The scattered curvature must be symmetric (it is a Gauss-Newton majorizer).
+    let mut sym_max = 0.0_f64;
+    for i in 0..total {
+        for j in 0..total {
+            sym_max = sym_max.max((hbb[[i, j]] - hbb[[j, i]]).abs());
+        }
+    }
+    assert!(sym_max <= 1.0e-12, "scattered hbb not symmetric: {sym_max:.3e}");
+}
+
 #[test]
 fn nested_prefix_rejects_non_monotone_prefixes() {
     let target = PsiSlice::full(12, Some(4));
