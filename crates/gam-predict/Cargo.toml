@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 gam = { path = "../.." }
+gam-data = { path = "../gam-data" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
