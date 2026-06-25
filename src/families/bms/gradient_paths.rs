@@ -1417,7 +1417,9 @@ pub(super) fn rigid_standard_normal_neglog_only(
 /// non-finite (non-`+∞`-excluded) NaN before calling; the seeded-evaluation
 /// wrappers below do that.
 #[inline]
-pub(crate) fn rigid_standard_normal_row_nll_generic<S: crate::families::jet_scalar::JetScalar<2>>(
+pub(crate) fn rigid_standard_normal_row_nll_generic<
+    S: crate::families::jet_scalar::JetScalar<2>,
+>(
     p: &[S; 2],
     marginal: BernoulliMarginalLinkMap,
     z: f64,
@@ -1451,9 +1453,7 @@ pub(crate) fn rigid_standard_normal_row_nll_generic<S: crate::families::jet_scal
 /// ([`rigid_standard_normal_signed_jet`]) evaluates it at `Tower4<2>` — so the
 /// signed margin has a single source (#932), with no second hand-packed jet.
 #[inline]
-pub(crate) fn rigid_standard_normal_signed_margin<
-    S: crate::families::jet_scalar::JetScalar<2>,
->(
+pub(crate) fn rigid_standard_normal_signed_margin<S: crate::families::jet_scalar::JetScalar<2>>(
     p: &[S; 2],
     marginal: BernoulliMarginalLinkMap,
     z: f64,
@@ -2098,6 +2098,25 @@ mod jet_tower_oracle_tests {
     //!   transcendental).
 
     use super::*;
+
+    /// #932 combined third+fourth primary tensors read off ONE shared
+    /// `rigid_standard_normal_tower` jet (the redundancy-free form of the
+    /// separate `_third_full` / `_fourth_full` builds, bit-identical to them).
+    /// Lives in this `#[cfg(test)]` module — its only consumers are the
+    /// bit-identity checks below — so it is not a production `src` item with no
+    /// production caller (production reads the separate builders) and is not dead
+    /// code in the non-test lib build.
+    fn rigid_standard_normal_third_and_fourth_full(
+        marginal: BernoulliMarginalLinkMap,
+        g: f64,
+        z: f64,
+        y: f64,
+        w: f64,
+        probit_scale: f64,
+    ) -> Result<([[[f64; 2]; 2]; 2], [[[[f64; 2]; 2]; 2]; 2]), String> {
+        let tower = rigid_standard_normal_tower(marginal, g, z, y, w, probit_scale)?;
+        Ok((tower.t3, tower.t4))
+    }
     use crate::families::jet_tower::{
         KernelChannels, RowNllProgram, evaluate_program, verify_kernel_channels,
     };
@@ -2320,15 +2339,31 @@ mod jet_tower_oracle_tests {
                     eta[r],
                 )
                 .expect("link map");
-                let t3_sep =
-                    rigid_standard_normal_third_full(marginal, g[r], z[r], y[r], w[r], probit_scale)
-                        .expect("separate third");
+                let t3_sep = rigid_standard_normal_third_full(
+                    marginal,
+                    g[r],
+                    z[r],
+                    y[r],
+                    w[r],
+                    probit_scale,
+                )
+                .expect("separate third");
                 let t4_sep = rigid_standard_normal_fourth_full(
-                    marginal, g[r], z[r], y[r], w[r], probit_scale,
+                    marginal,
+                    g[r],
+                    z[r],
+                    y[r],
+                    w[r],
+                    probit_scale,
                 )
                 .expect("separate fourth");
                 let (t3_comb, t4_comb) = rigid_standard_normal_third_and_fourth_full(
-                    marginal, g[r], z[r], y[r], w[r], probit_scale,
+                    marginal,
+                    g[r],
+                    z[r],
+                    y[r],
+                    w[r],
+                    probit_scale,
                 )
                 .expect("combined third+fourth");
                 // Exact bitwise equality (same tower) — no tolerance.
@@ -2365,8 +2400,8 @@ mod jet_tower_oracle_tests {
     #[test]
     fn rigid_bernoulli_generic_program_matches_tower4_program_all_channels() {
         use crate::families::jet_tower::{
-            generic_full_tower, generic_row_kernel, generic_third_contracted,
-            generic_fourth_contracted,
+            generic_fourth_contracted, generic_full_tower, generic_row_kernel,
+            generic_third_contracted,
         };
 
         let eta = [0.3_f64, -0.7, 0.05, 0.9, -1.2, 2.1, -2.4];
@@ -2508,7 +2543,9 @@ mod flex_primary_hessian_oracle_tests {
     /// without the test crate (the family struct is `pub(super)`). Builds a small
     /// flex BMS family with both a score-warp and a link-deviation block so the
     /// flex Hessian assembly exercises every primary block (q, logslope, h, w).
-    fn make_flex_oracle_family(n: usize) -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
+    fn make_flex_oracle_family(
+        n: usize,
+    ) -> (BernoulliMarginalSlopeFamily, Vec<ParameterBlockState>) {
         let score_seed = Array1::linspace(-2.0, 2.0, n.max(6));
         let link_seed = Array1::linspace(-1.8, 1.8, n.max(6));
         let cfg = DeviationBlockConfig {
@@ -2647,7 +2684,10 @@ mod flex_primary_hessian_oracle_tests {
             .expect("flex exact eval cache");
         let primary = &cache.primary;
         let r = primary.total;
-        assert!(r >= 4, "flex fixture must carry q + logslope + deviation blocks");
+        assert!(
+            r >= 4,
+            "flex fixture must carry q + logslope + deviation blocks"
+        );
 
         // Central-difference step. The flex gradient is smooth in every primary
         // coordinate; 1e-4 balances truncation (O(h^2)) against the cancellation
@@ -2682,6 +2722,9 @@ mod flex_primary_hessian_oracle_tests {
             }
         }
         // Surface the achieved tightness for the record.
-        assert!(max_rel <= 1e-6, "flex Hessian FD oracle max rel {max_rel:.3e}");
+        assert!(
+            max_rel <= 1e-6,
+            "flex Hessian FD oracle max rel {max_rel:.3e}"
+        );
     }
 }
