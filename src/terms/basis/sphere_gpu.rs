@@ -1461,10 +1461,10 @@ mod sphere_gpu_tests {
             eprintln!("[sphere_gpu test] no CUDA runtime — skipping raw-kernel parity");
             return;
         };
-        if let Err(err) = SphereGpuBackend::probe() {
-            eprintln!("[sphere_gpu test] backend probe failed: {err}");
-            return;
-        }
+        // Past the runtime Some-gate: a probe failure is a real device fault on a
+        // CUDA host — fail loud (device-PCG skip-pass class, eee12f6b2).
+        SphereGpuBackend::probe()
+            .expect("[sphere_gpu test] backend probe must succeed on a CUDA host");
 
         let data_ll = small_latlon_grid(7, 9);
         let centers_ll = small_latlon_grid(5, 7);
@@ -1528,10 +1528,11 @@ mod sphere_gpu_tests {
             eprintln!("[sphere_gpu test] no CUDA runtime — skipping end-to-end dispatch parity");
             return;
         };
-        if SphereGpuBackend::probe().is_err() {
-            eprintln!("[sphere_gpu test] backend probe failed — skipping");
-            return;
-        }
+        // Past the runtime Some-gate: a backend probe failure is a real device
+        // fault on a CUDA host, not a no-CUDA skip — fail loud (device-PCG
+        // skip-pass class, eee12f6b2) instead of masking it as a pass.
+        SphereGpuBackend::probe()
+            .expect("[sphere_gpu test] backend probe must succeed on a CUDA host");
         use crate::basis::{
             CenterStrategy, SphereMethod, SphericalSplineBasisSpec, SphericalSplineIdentifiability,
             build_spherical_spline_basis, sobolev_s2_truncated_coefficients,
@@ -1609,10 +1610,10 @@ mod sphere_gpu_tests {
             eprintln!("[sphere_gpu test] no CUDA runtime — skipping householder parity");
             return;
         };
-        if SphereGpuBackend::probe().is_err() {
-            eprintln!("[sphere_gpu test] backend probe failed — skipping");
-            return;
-        }
+        // Past the runtime Some-gate: a probe failure is a real device fault on a
+        // CUDA host — fail loud (device-PCG skip-pass class, eee12f6b2).
+        SphereGpuBackend::probe()
+            .expect("[sphere_gpu test] backend probe must succeed on a CUDA host");
         let data_ll = small_latlon_grid(6, 8);
         let centers_ll = small_latlon_grid(4, 5);
         let data_xyz = latlon_to_xyz_host(data_ll.view(), false).unwrap();
@@ -1855,13 +1856,10 @@ mod sphere_gpu_tests {
             );
             return;
         };
-        if SphereGpuBackend::probe().is_err() {
-            eprintln!(
-                "[sphere gpu parity] sphere GPU backend probe failed — skipping \
-                 device parity (CPU oracle exercised by sibling tests)"
-            );
-            return;
-        }
+        // Past the runtime Some-gate: a probe failure is a real device fault on a
+        // CUDA host — fail loud (device-PCG skip-pass class, eee12f6b2).
+        SphereGpuBackend::probe()
+            .expect("[sphere gpu parity] sphere GPU backend probe must succeed on a CUDA host");
 
         // Fixture: 25 × 40 lat/lon grid → n = 1000.
         let data_ll = small_latlon_grid(25, 40);
