@@ -2712,7 +2712,29 @@ fn sae_manifold_fit_inner<'py>(
     // joint-Hessian shape bands assembled above are stale and must be recomputed
     // from the final post-search per-atom inner fits (below).
     let mut structure_changed = false;
-    let structure_search_json = {
+    let structure_search_json = 'structure: {
+        // #1026 — structure search is a post-fit DISCOVERY pass: each round refits
+        // the full dictionary over ALL N rows, so its cost is ~(moves·rounds)
+        // full-dictionary refits. At large user-fixed K it is intractable (dozens
+        // of refits) and is refinement, not discovery, of a dictionary the caller
+        // already sized. Scale rounds down with K and SKIP entirely past a ceiling,
+        // so a fixed-K performance run returns the fitted dictionary without paying
+        // the search. Small K (the discovery regime) keeps the full 3-round harvest.
+        let structure_max_rounds = {
+            let k_now = term.k_atoms().max(1);
+            if k_now <= 2 {
+                3
+            } else if k_now <= 8 {
+                2
+            } else if k_now <= 64 {
+                1
+            } else {
+                0
+            }
+        };
+        if structure_max_rounds == 0 {
+            break 'structure None;
+        }
         // Per-round harvest breadth derived from the fitted K (magic-by-default):
         // propose at most a handful of each move kind, scaled gently with the
         // dictionary size, with a small fixed floor so even a K=1 fit can grow
@@ -2759,7 +2781,7 @@ fn sae_manifold_fit_inner<'py>(
         let config = gam::solver::structure_harvest::RoundDriverConfig {
             n_shards: 4,
             budget,
-            max_rounds: 3,
+            max_rounds: structure_max_rounds,
             harvest_params,
         };
         match gam::solver::structure_harvest::run_production_structure_search(
