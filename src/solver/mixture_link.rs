@@ -613,11 +613,10 @@ pub struct CauchitLinkKernel;
 /// Construct SAS state from raw optimizer parameters using the same bounded
 /// transform used everywhere in fitting/evaluation.
 ///
-/// A free function rather than an inherent `SasLinkState::new` because
-/// `SasLinkState` now lives in the `gam-core` crate (#1521) while the bounded
-/// `delta` transform is solver-side math; the orphan rule forbids an inherent
-/// `impl` on a foreign-crate type, so the constructor is hosted here next to
-/// the transform. `SasLinkState`'s fields are `pub`, so it builds directly.
+/// A free function rather than an inherent `SasLinkState::new` because the
+/// bounded `delta` transform is solver-side math, so the constructor is hosted
+/// here next to the transform rather than on the type. `SasLinkState`'s fields
+/// are `pub`, so it builds directly.
 pub fn sas_link_state_from_raw(
     raw_epsilon: f64,
     raw_log_delta: f64,

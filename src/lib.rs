@@ -141,12 +141,10 @@ pub mod test_support;
 pub mod util;
 pub mod warm_start;
 
-/// `types` and `resource` live in the `gam-core` leaf crate (issue #1521) and
-/// are re-exported here so every existing `crate::types::*` / `crate::resource::*`
-/// path across the tree resolves unchanged — a compile-unit split, not a source
-/// rewrite. `resource` keeps its crate-root home (not under `solver`) so the
-/// `families` layer names it without importing *up* (#1135).
-pub use gam_core::{resource, types};
+/// `resource` keeps its crate-root home (not under `solver`) so the `families`
+/// layer names it without importing *up* (#1135).
+pub mod resource;
+pub mod types;
 
 pub mod process_monitor;
 

@@ -29,22 +29,19 @@ ignored = ["grep", "walkdir"]
 path = "src/lib.rs"
 
 [workspace]
-# `gam-core` (issue #1521) is the foundational leaf of the planned workspace
-# split. It lands as an empty scaffold first — additive, no file moves — so the
-# skeleton wires in without conflicting with agents editing the monolith. The
-# serializing `types.rs`/`resource.rs` moves + tree-wide `use crate::` rewrite
-# land later, in a maintainer-declared quiet window.
-members = ["crates/gam-pyffi", "crates/gam-core"]
+# A `gam-core` leaf-crate split was attempted under #1521 but reverted: with the
+# entire high-churn engine still living in `gam`, a `gam-core` leaf produced no
+# rebuild cut (a families/solver/terms edit still recompiles all of `gam`) while
+# adding a `publish = false` path-dependency under a publishable crate. The
+# measured first cut is the opposite direction — peel upper leaves (predict, CLI)
+# off a temporarily-monolithic engine. See the #1521 thread for the plan.
+members = ["crates/gam-pyffi"]
 resolver = "3"
 
 [lints.rust]
 warnings = "deny"
 
 [dependencies]
-# Foundational leaf crate of the workspace split (issue #1521). Hosts `types`
-# and `resource`, which `gam` re-exports so existing `crate::types` /
-# `crate::resource` paths resolve unchanged.
-gam-core = { path = "crates/gam-core" }
 clap = { version = "4.6.1", features = ["derive"] }
 comfy-table = "7.2.2"
 rayon = "1.12.0"
