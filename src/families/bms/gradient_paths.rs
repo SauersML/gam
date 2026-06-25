@@ -1966,27 +1966,6 @@ pub(super) fn rigid_standard_normal_fourth_full(
 /// where ONCE suffices. The two tensors are the `.t3` / `.t4` channels of the
 /// same tower, so this builder evaluates that tower ONCE and returns both.
 ///
-/// EXACTNESS. The returned `(t3, t4)` are bit-identical to
-/// `rigid_standard_normal_third_full` / `rigid_standard_normal_fourth_full`
-/// respectively — it is literally the same `rigid_standard_normal_tower` call,
-/// so no accuracy and no generality (the unified single-source jet) is lost; the
-/// only thing removed is the redundant second transcendental. The codegen-level
-/// redundancy (two `#[inline(never)]` tower builds are NOT CSE'd into one) was
-/// verified by emitting asm for the two-call vs combined shapes: two calls to
-/// the transcendental collapse to one.
-#[inline]
-pub(super) fn rigid_standard_normal_third_and_fourth_full(
-    marginal: BernoulliMarginalLinkMap,
-    g: f64,
-    z: f64,
-    y: f64,
-    w: f64,
-    probit_scale: f64,
-) -> Result<([[[f64; 2]; 2]; 2], [[[[f64; 2]; 2]; 2]; 2]), String> {
-    let tower = rigid_standard_normal_tower(marginal, g, z, y, w, probit_scale)?;
-    Ok((tower.t3, tower.t4))
-}
-
 /// Contract a symmetric 4-tensor on its last two indices with two
 /// primary-space directions `u = (u_eta, u_g)` and `v = (v_eta, v_g)`,
 /// producing the symmetric 2×2 matrix the outer-Hessian pipeline expects:

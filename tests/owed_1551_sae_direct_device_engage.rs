@@ -247,12 +247,7 @@ fn max_abs_diff(a: &[f64], b: &[f64]) -> f64 {
 }
 
 fn trace(msg: &str) {
-    use std::io::Write;
-    if let Ok(path) = std::env::var("OWED_1551_TRACE") {
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            writeln!(f, "{msg}").ok();
-        }
-    }
+    eprintln!("[owed_1551 trace] {msg}");
 }
 
 #[test]

@@ -291,6 +291,13 @@ fn fill_row_channels(
                         }
                     }
                 )*
+                // SAFETY: `k` is the SAE atom count, which the device row-jet
+                // path only accepts in `1..=16` (the dispatch arms above cover
+                // exactly that range, matching the host `Order2<K>` monomorphic
+                // instantiations). The caller gates the GPU fast path on this
+                // bound, so this arm is unreachable for any constructed model; a
+                // panic here means an upstream contract was violated and must
+                // fail loudly rather than silently produce a wrong Hessian.
                 _ => panic!("SAE device row-jet supports K in 1..=16, got {k}"),
             }
         };
@@ -398,8 +405,8 @@ mod device {
         let mut logits = vec![0.0_f64; n * k];
         let mut decoded = vec![0.0_f64; n * k * p];
         for (row, inp) in rows.iter().enumerate() {
-            debug_assert_eq!(inp.logits.len(), k);
-            debug_assert_eq!(inp.decoded.len(), k * p);
+            assert_eq!(inp.logits.len(), k, "SAE device row-jet logits length");
+            assert_eq!(inp.decoded.len(), k * p, "SAE device row-jet decoded length");
             logits[row * k..(row + 1) * k].copy_from_slice(&inp.logits);
             decoded[row * k * p..(row + 1) * k * p].copy_from_slice(&inp.decoded);
         }

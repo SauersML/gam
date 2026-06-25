@@ -63,16 +63,15 @@ impl<const LIN: u32> SparseOrder2<LIN> {
         self.hess
     }
 
-    /// Debug-only guard for the index-affine contract: the linear×linear
-    /// self-Hessian block must be exactly zero wherever we elide its read.
+    /// Guard for the index-affine contract: the linear×linear self-Hessian
+    /// block must be exactly zero wherever we elide its read.
     #[inline(always)]
     fn check_contract(&self) {
-        #[cfg(debug_assertions)]
         for i in 0..4 {
             if axis_is_linear(LIN, i) {
                 for j in 0..4 {
                     if axis_is_linear(LIN, j) {
-                        debug_assert!(
+                        assert!(
                             self.hess[i][j] == 0.0,
                             "static-sparsity contract violated: linear×linear Hessian h[{i}][{j}]={} != 0 (axes {i},{j} both declared linear but the program forms curvature between them)",
                             self.hess[i][j]
