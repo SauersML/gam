@@ -22,6 +22,15 @@
 #ifndef M_SQRT2
 #define M_SQRT2 1.41421356237309504880
 #endif
+// NVRTC also leaves INFINITY / NAN undefined (they come from <math.h>). Define
+// them as the exact IEEE-754 f64 bit patterns via the NVRTC-provided bit-cast
+// intrinsic: +inf = 0x7ff0…0, quiet NaN = 0x7ff8…0.
+#ifndef INFINITY
+#define INFINITY (__longlong_as_double(0x7ff0000000000000LL))
+#endif
+#ifndef NAN
+#define NAN (__longlong_as_double(0x7ff8000000000000LL))
+#endif
 
 // ---- transcendentals, bit-mirroring the Rust f64 ops ----
 // erfcx_nonnegative (src/inference/probability.rs)

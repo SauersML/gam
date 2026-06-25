@@ -64,7 +64,6 @@ pub(super) fn run(
         let improve = ev - prev_ev;
         if improve.abs() <= config.tolerance && epoch > 0 {
             converged = true;
-            prev_ev = ev;
             break;
         }
         prev_ev = ev;
