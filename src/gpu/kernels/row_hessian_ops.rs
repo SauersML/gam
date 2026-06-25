@@ -594,13 +594,11 @@ mod tests {
         let cpu_y = cpu_row_hessian_matvec(&matvec_inputs);
         let gpu_y = match launch_row_hessian_matvec(matvec_inputs) {
             Ok(out) => out.y_rows,
-            Err(err) => {
-                eprintln!(
-                    "[row_hessian_ops parity] matvec launch failed: {err}; \
-                     treating as CI infra outage, not parity regression"
-                );
-                return;
-            }
+            Err(err) => panic!(
+                "[row_hessian_ops parity] matvec kernel launch FAILED after the CUDA \
+                 runtime was confirmed present ({err}) — a real device-kernel regression, \
+                 not a CI infra outage. (#1017: GPU faults must fail loud, never skip-pass.)"
+            ),
         };
         let tol_abs = 2e-8_f64;
         let tol_rel = 2e-7_f64;
@@ -624,13 +622,11 @@ mod tests {
         let cpu_d = cpu_row_hessian_diag(&diag_inputs);
         let gpu_d = match launch_row_hessian_diag(diag_inputs) {
             Ok(out) => out.d_rows,
-            Err(err) => {
-                eprintln!(
-                    "[row_hessian_ops parity] diag launch failed: {err}; \
-                     treating as CI infra outage, not parity regression"
-                );
-                return;
-            }
+            Err(err) => panic!(
+                "[row_hessian_ops parity] diag kernel launch FAILED after the CUDA \
+                 runtime was confirmed present ({err}) — a real device-kernel regression, \
+                 not a CI infra outage. (#1017: GPU faults must fail loud, never skip-pass.)"
+            ),
         };
         assert_eq!(cpu_d.len(), gpu_d.len(), "diag output length mismatch");
         for (i, (&c, &g)) in cpu_d.iter().zip(gpu_d.iter()).enumerate() {
