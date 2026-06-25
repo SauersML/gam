@@ -199,6 +199,23 @@ pub(crate) const SAE_DECODER_REPULSION_STRENGTH: f64 = 1.0e-3;
 /// choice of decoder scale.
 pub(crate) const SAE_DECODER_REPULSION_COLLINEARITY_GATE: f64 = 0.5;
 
+/// Relative-mass floor defining when two atoms genuinely CO-FIRE on a row, used
+/// by the anti-collapse co-activation scan (`barrier_coactive_pairs`). An atom
+/// whose assignment mass on a row is below this fraction of that row's peak mass
+/// is treated as NOT firing there: it contributes `≤ floor·peak` reconstruction
+/// mass, so the co-activation it would register and the anti-collapse repulsion /
+/// separation it would receive are negligible.
+///
+/// For structurally sparse assignments (JumpReLU hard gate, IBP-MAP) the surviving
+/// active atoms sit far above this floor and the hard zeros are excluded anyway,
+/// so the co-active support is unchanged. It is load-bearing for SOFTMAX, whose
+/// normalization gives EVERY atom a tiny but strictly nonzero tail mass: a plain
+/// `a ≠ 0` test would mark all `K` atoms co-active on every row and collapse the
+/// scan to the dense `O(N·K²)` all-pairs cost (minutes at `K = 10⁴`). Matches the
+/// `1e-3` relative cutoff the compact row layout uses (`from_dense_weights`), so
+/// the penalty support and the assembled Newton support stay consistent.
+pub(crate) const SAE_COACTIVE_RELATIVE_MASS_FLOOR: f64 = 1.0e-3;
+
 // ── #1026 / #1522 interior-point COLLAPSE-PREVENTION barriers ────────────────
 //
 // The collinearity-gated `SAE_DECODER_REPULSION_*` term above is a SEPARATOR for

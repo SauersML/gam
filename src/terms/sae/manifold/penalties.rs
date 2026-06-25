@@ -293,14 +293,34 @@ impl SaeManifoldTerm {
         }
         // Sparse numerator: accumulate Σ_i a_ij a_ik only over the pairs that
         // co-fire, visiting rows in increasing order so each pair's running sum
-        // matches the dense `Σ_row` loop bit-for-bit.
+        // matches the dense `Σ_row` loop for the co-firing support.
+        //
+        // "Co-firing" on a row means carrying NON-NEGLIGIBLE mass relative to that
+        // row's peak (`SAE_COACTIVE_RELATIVE_MASS_FLOOR`), not merely `a ≠ 0`. For
+        // structurally sparse modes (JumpReLU/IBP) the active atoms sit far above
+        // the floor and the hard zeros are excluded either way, so the support is
+        // unchanged. For SOFTMAX — where normalization leaves every atom a tiny but
+        // strictly positive tail mass — the bare `a ≠ 0` test marked all `K` atoms
+        // active on every row and degenerated this scan to the dense `O(N·K²)`
+        // all-pairs cost (minutes at `K = 10⁴`). A sub-floor atom contributes
+        // `≤ floor·peak` mass, so the co-activation and anti-collapse force it would
+        // register are negligible; dropping it keeps the scan `O(N·active²)` and the
+        // co-active support consistent with the compact row layout's cutoff.
         let mut num: std::collections::BTreeMap<(usize, usize), f64> =
             std::collections::BTreeMap::new();
         let mut active: Vec<usize> = Vec::new();
         for row in 0..n {
             active.clear();
+            let mut peak = 0.0_f64;
             for k in 0..k_atoms {
-                if gates[[row, k]] != 0.0 {
+                let a = gates[[row, k]].abs();
+                if a > peak {
+                    peak = a;
+                }
+            }
+            let floor = SAE_COACTIVE_RELATIVE_MASS_FLOOR * peak;
+            for k in 0..k_atoms {
+                if gates[[row, k]].abs() > floor {
                     active.push(k);
                 }
             }
