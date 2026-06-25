@@ -294,16 +294,10 @@ impl SaeManifoldTerm {
             ));
         }
 
-        // #1026 — this per-atom inner-fit diagnostic materializes a dense
-        // `(N × K × P)` decoded tensor (and per-atom inner Hessians). At large K
-        // that is hundreds of GiB (≈256 GiB at K=32768, P=32) and OOMs before any
-        // diagnostic value is produced. `atom_inner_fits` is a PURE diagnostic
-        // (identifiability/audit), so past a memory ceiling record all-`None` slots
-        // — the same representation a degenerate atom gets — and skip the dense
-        // build entirely. The fit itself is unaffected; only this audit field is
-        // absent at scales where it could not be computed anyway.
-        const ATOM_INNER_FIT_CELL_CEILING: usize = 64_000_000; // ≈512 MiB f64 of N·K·P
-        if n.saturating_mul(k_atoms).saturating_mul(p) > ATOM_INNER_FIT_CELL_CEILING {
+        // #1026 — `atom_inner_fits` is a pure diagnostic; skip its dense (N×K×P)
+        // tensor (~256 GiB at K=32768,P=32) past a cell ceiling — all-None slots,
+        // never OOM. The fit is unaffected; only this audit field is absent.
+        if n.saturating_mul(k_atoms).saturating_mul(p) > 64_000_000 {
             self.atom_inner_fits = Some((0..k_atoms).map(|_| None).collect());
             return Ok(());
         }
