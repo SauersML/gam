@@ -1344,22 +1344,42 @@ impl SaeManifoldOuterObjective {
         const SAE_MATRIX_FREE_FD_STEP: f64 = 1.0e-3;
         let base = rho_state.to_flat();
         let n = base.len();
+        // Converge at the base ρ FIRST and capture the converged decoder β. Each
+        // ±h FD probe is then WARM-STARTED from that β: because the step is tiny
+        // (1e-3 in log-ρ) the perturbed inner solve re-converges from the
+        // near-optimal decoder in a couple of Newton rounds and exits early,
+        // instead of paying a full cold inner fit (~tens of seconds at the wide
+        // duchon border). This turns the FD gradient from `2·dim` cold solves into
+        // `2·dim` warm refinements, which is what makes the matrix-free outer loop
+        // tractable. The warm start changes only the basin ENTRY: under Design A
+        // the inner solve still converges to the same stationary point, so the
+        // differenced criterion value is unchanged.
+        let (_cost_base, base_beta) = self
+            .evaluate_with_refine_policy(base.view(), false, false)
+            .map_err(EstimationError::RemlOptimizationFailed)?;
         let mut gradient = Array1::<f64>::zeros(n);
         for i in 0..n {
             let mut up = base.clone();
             up[i] += SAE_MATRIX_FREE_FD_STEP;
+            self.seeded_beta = Some(base_beta.clone());
             let cost_up = self
                 .evaluate_with_refine_policy(up.view(), false, false)
                 .map(|(c, _)| c)
                 .map_err(EstimationError::RemlOptimizationFailed)?;
             let mut down = base.clone();
             down[i] -= SAE_MATRIX_FREE_FD_STEP;
+            self.seeded_beta = Some(base_beta.clone());
             let cost_down = self
                 .evaluate_with_refine_policy(down.view(), false, false)
                 .map(|(c, _)| c)
                 .map_err(EstimationError::RemlOptimizationFailed)?;
             gradient[i] = (cost_up - cost_down) / (2.0 * SAE_MATRIX_FREE_FD_STEP);
         }
+        // The FD probes left the term at the last perturbed iterate; re-seed the
+        // base β and re-converge at base ρ so the returned cost and the warm
+        // `current_rho`/`last_loss`/`inner_beta_hint` all match the point whose
+        // gradient we just differenced (the dense lane's end-state contract).
+        self.seeded_beta = Some(base_beta.clone());
         let (cost, beta_hat) = self
             .evaluate_with_refine_policy(base.view(), false, false)
             .map_err(EstimationError::RemlOptimizationFailed)?;
