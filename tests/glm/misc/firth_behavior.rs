@@ -120,61 +120,6 @@ fn fit_beta_norm(
         .sqrt()
 }
 
-fn proxycostwith_pirls(
-    x: &Array2<f64>,
-    y: &Array1<f64>,
-    w: &Array1<f64>,
-    penalties: &[CanonicalPenalty],
-    s: &Array2<f64>,
-    rho: f64,
-    firth: bool,
-) -> f64 {
-    let cfg = PirlsConfig {
-        likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
-            ResponseFamily::Binomial,
-            InverseLink::Standard(StandardLink::Logit),
-        )),
-        link_kind: InverseLink::Standard(StandardLink::Logit),
-        max_iterations: 500,
-        convergence_tolerance: 1e-10,
-        firth_bias_reduction: firth,
-        initial_lm_lambda: None,
-        geodesic_acceleration: false,
-        arrow_schur: None,
-    };
-    let offset = Array1::<f64>::zeros(y.len());
-    let p = x.ncols();
-    let (fit, _) = fit_model_for_fixed_rho(
-        LogSmoothingParamsView::new(array![rho].view()),
-        PirlsProblem {
-            x: x.view(),
-            offset: offset.view(),
-            y: y.view(),
-            priorweights: w.view(),
-            covariate_se: None,
-            gaussian_fixed_cache: None,
-            glm_first_step_gram: None,
-        },
-        PenaltyConfig {
-            canonical_penalties: penalties,
-            balanced_penalty_root: None,
-            reparam_invariant: None,
-            p,
-            coefficient_lower_bounds: None,
-            linear_constraints_original: None,
-            penalty_shrinkage_floor: None,
-            kronecker_factored: None,
-        },
-        &cfg,
-        None,
-    )
-    .expect("fit");
-    let lambda = rho.exp();
-    let b = fit.beta_transformed.as_ref().to_owned();
-    let penalty = 0.5 * lambda * b.dot(&s.dot(&b));
-    fit.deviance + penalty
-}
-
 #[test]
 fn firthfd_step_size_sensitivity() {
     let (x, y, w, s_dense, s_list) = make_problem(31);
@@ -227,61 +172,251 @@ fn firthfd_step_size_sensitivity() {
     assert!(consistent_count >= step_sizes.len() / 2);
 }
 
-#[test]
-fn firth_beta_monotonicity_comparison() {
-    let (x, y, w, s_dense, _) = make_problem(31);
-    let penalties = canonicalize_test_penalties(&[s_dense.clone()]);
-    let deltas = [
-        -0.010_f64, -0.005, -0.002, -0.001, 0.0, 0.001, 0.002, 0.005, 0.010,
-    ];
-    let betas_firth: Vec<f64> = deltas
-        .iter()
-        .map(|&d| fit_beta_norm(&x, &y, &w, &penalties, 12.0 + d, true))
-        .collect();
-    let betas_no_firth: Vec<f64> = deltas
-        .iter()
-        .map(|&d| fit_beta_norm(&x, &y, &w, &penalties, 12.0 + d, false))
-        .collect();
-    let count_sign_changes = |values: &[f64]| -> usize {
-        values
-            .windows(2)
-            .filter(|w| (w[1] - w[0]).signum() != 0.0)
-            .zip(values.windows(2).skip(1))
-            .filter(|(a, b)| (a[1] - a[0]).signum() * (b[1] - b[0]).signum() < 0.0)
-            .count()
-    };
-    let changes_firth = count_sign_changes(&betas_firth);
-    let changes_no_firth = count_sign_changes(&betas_no_firth);
-    assert!(changes_no_firth <= changes_firth || changes_no_firth <= 2);
+/// Completely-separable logistic fixture: the response is a perfect step
+/// function of the second design column (`y == 1  ⇔  x[:,1] > 0`), so the
+/// unpenalised logistic MLE diverges (β → ∞ along that column). This is the
+/// canonical regime in which Firth's Jeffreys-prior bias reduction earns its
+/// keep — it returns finite, shrunk estimates where the plain MLE runs away.
+/// The response is a deterministic threshold (no Bernoulli draw), so the
+/// separation is *exact* and the fits are reproducible on every platform.
+fn separable_problem(n: usize, p: usize) -> (Array2<f64>, Array1<f64>, Array2<f64>) {
+    let mut rng = StdRng::seed_from_u64(31);
+    let mut x = Array2::<f64>::zeros((n, p));
+    for i in 0..n {
+        x[[i, 0]] = 1.0;
+        for j in 1..p {
+            x[[i, j]] = rng.random_range(-1.0..1.0);
+        }
+    }
+    let y = Array1::from_shape_fn(n, |i| if x[[i, 1]] > 0.0 { 1.0 } else { 0.0 });
+    let mut s = Array2::<f64>::zeros((p, p));
+    for j in 1..p {
+        s[[j, j]] = 1.0;
+    }
+    (x, y, s)
 }
 
+// ---------------------------------------------------------------------------
+// Issue #1554. The two tests below replace a pair of "oscillation count"
+// asserts that were self-masking in two compounding ways:
+//
+//   * they compared the *wrong* direction (`no_firth <= firth`) with a vacuous
+//     `|| <= N` escape hatch that passed for any value of the other count, and
+//   * — confirmed by direct measurement (MSI) — the metric they used had **no
+//     signal at all**: at the heavily-penalised operating point (ρ = 12) both
+//     the cost and the ‖β‖ profiles are perfectly monotone in ρ for *both*
+//     Firth and no-Firth, so every count was 0 and `0 <= 0` could never fail.
+//
+// A well-converged penalised fit is a smooth function of ρ (implicit function
+// theorem), so "Firth reduces oscillation of the converged ρ-profile" is not an
+// observable property of this solver. The property the tests were *reaching
+// for* — Firth stabilises a degenerate fit — is real and robust, but it lives
+// under complete separation at weak penalty, not at ρ = 12. The replacements
+// assert that genuine bias-reduction behaviour directly, in both coordinate and
+// objective space, with >10× margins.
+// ---------------------------------------------------------------------------
+
+/// Coordinate-space view: under complete separation the unpenalised logistic
+/// MLE diverges. As the ridge is relaxed (ρ → −∞, λ → 0) the no-Firth
+/// coefficient norm runs away without bound, while Firth's Jeffreys penalty
+/// pins it to a finite limit. The damping — the ratio ‖β‖_noFirth / ‖β‖_Firth —
+/// therefore grows monotonically as the problem degenerates. This is the
+/// property the old signal-free "oscillation count" assert was a proxy for.
 #[test]
-fn firthcost_oscillationvs_no_firth() {
-    let (x, y, w, s_dense, s_list) = make_problem(31);
-    let penalties = canonicalize_test_penalties(&[s_dense.clone()]);
-    let s = &s_dense;
-    assert_eq!(s_list.len(), 1);
-    let steps: Vec<f64> = (-20..=20).map(|i| i as f64 * 0.001).collect();
-    let cost_firth: Vec<f64> = steps
+fn firth_dampens_separation_runaway_in_coefficients() {
+    let n = 40;
+    let p = 6;
+    let (x, y, s) = separable_problem(n, p);
+    let w = Array1::<f64>::ones(n);
+    let penalties = canonicalize_test_penalties(&[s.clone()]);
+    // ρ from weak penalty (deep separation, λ → 0) up to a balanced regime.
+    let rhos: Vec<f64> = (-16..=0).map(|i| i as f64).collect();
+    let bf: Vec<f64> = rhos
         .iter()
-        .map(|&d| proxycostwith_pirls(&x, &y, &w, &penalties, s, 12.0 + d, true))
+        .map(|&r| fit_beta_norm(&x, &y, &w, &penalties, r, true))
         .collect();
-    let cost_no_firth: Vec<f64> = steps
+    let bnf: Vec<f64> = rhos
         .iter()
-        .map(|&d| proxycostwith_pirls(&x, &y, &w, &penalties, s, 12.0 + d, false))
+        .map(|&r| fit_beta_norm(&x, &y, &w, &penalties, r, false))
         .collect();
-    let count_direction_changes = |costs: &[f64]| -> usize {
-        let mut changes = 0;
-        for i in 1..costs.len() - 1 {
-            let left = costs[i] - costs[i - 1];
-            let right = costs[i + 1] - costs[i];
-            if left * right < 0.0 {
-                changes += 1;
-            }
-        }
-        changes
+    let ratio: Vec<f64> = bf.iter().zip(&bnf).map(|(&f, &nf)| nf / f).collect();
+    eprintln!("rhos          = {rhos:?}");
+    eprintln!("||b||_firth   = {bf:?}");
+    eprintln!("||b||_nofirth = {bnf:?}");
+    eprintln!("ratio nf/f    = {ratio:?}");
+
+    // (1) Firth shrinks: ‖β‖_Firth ≤ ‖β‖_noFirth at every ρ.
+    for (i, (&f, &nf)) in bf.iter().zip(&bnf).enumerate() {
+        assert!(
+            f <= nf + 1e-9,
+            "Firth must not inflate ‖β‖ vs no-Firth at ρ={}: firth={f} nofirth={nf}",
+            rhos[i]
+        );
+    }
+
+    // (2) No-Firth runaway: at the weakest penalty the plain MLE has blown up,
+    //     dwarfing its own balanced-penalty value.
+    let bnf_weak = bnf[0]; // ρ = -16
+    let bnf_balanced = *bnf.last().unwrap(); // ρ = 0
+    assert!(
+        bnf_weak > 50.0,
+        "no-Firth ‖β‖ should run away under separation as λ→0, got {bnf_weak}"
+    );
+    assert!(
+        bnf_weak > 10.0 * bnf_balanced,
+        "no-Firth ‖β‖ should explode as λ→0: weak={bnf_weak} balanced={bnf_balanced}"
+    );
+
+    // (3) Firth boundedness: the Firth estimate converges to a finite limit as
+    //     λ → 0 — it barely moves across the deep-separation plateau and never
+    //     approaches the no-Firth runaway.
+    let bf_weak = bf[0]; // ρ = -16
+    let bf_plateau = bf[6]; // ρ = -10
+    assert!(
+        bf_weak < 0.5 * bnf_weak,
+        "Firth must stay far below the no-Firth runaway: firth={bf_weak} nofirth={bnf_weak}"
+    );
+    assert!(
+        (bf_weak - bf_plateau).abs() / bf_plateau < 0.05,
+        "Firth ‖β‖ should plateau to a finite limit as λ→0: ρ=-16 {bf_weak} vs ρ=-10 {bf_plateau}"
+    );
+
+    // (4) Monotone damping: the ratio strictly increases as the penalty weakens
+    //     (ρ decreases) — i.e. it is strictly decreasing in ρ — and the damping
+    //     is large, not marginal, at λ → 0.
+    for i in 0..ratio.len() - 1 {
+        assert!(
+            ratio[i] > ratio[i + 1],
+            "damping ratio must strengthen as λ→0: ratio[ρ={}]={} !> ratio[ρ={}]={}",
+            rhos[i],
+            ratio[i],
+            rhos[i + 1],
+            ratio[i + 1]
+        );
+    }
+    assert!(
+        ratio[0] > 5.0,
+        "expected strong damping at λ→0, ratio={}",
+        ratio[0]
+    );
+}
+
+/// Objective-space view: under complete separation the no-Firth model drives
+/// its deviance toward 0 — a perfect, degenerate fit bought by inflating β — as
+/// λ → 0, while Firth keeps the deviance bounded above a positive floor. Firth
+/// *refuses* the degenerate fit in exchange for finite estimates, so at weak
+/// penalty its deviance EXCEEDS no-Firth's (the opposite of the unregularised
+/// intuition). A robust witness that the Jeffreys term is active in the inner
+/// objective, not merely bolted on after the solve.
+#[test]
+fn firth_refuses_degenerate_separation_fit_in_deviance() {
+    let n = 40;
+    let p = 6;
+    let (x, y, s) = separable_problem(n, p);
+    let w = Array1::<f64>::ones(n);
+    let penalties = canonicalize_test_penalties(&[s.clone()]);
+    let rhos: Vec<f64> = (-16..=0).map(|i| i as f64).collect();
+    let df: Vec<f64> = rhos
+        .iter()
+        .map(|&r| fit_deviance(&x, &y, &w, &penalties, r, true))
+        .collect();
+    let dnf: Vec<f64> = rhos
+        .iter()
+        .map(|&r| fit_deviance(&x, &y, &w, &penalties, r, false))
+        .collect();
+    eprintln!("rhos        = {rhos:?}");
+    eprintln!("dev_firth   = {df:?}");
+    eprintln!("dev_nofirth = {dnf:?}");
+
+    // (1) No-Firth collapses to a degenerate perfect fit as λ → 0.
+    let dnf_weak = dnf[0]; // ρ = -16
+    assert!(
+        dnf_weak < 1e-2,
+        "no-Firth deviance should collapse toward 0 under separation, got {dnf_weak}"
+    );
+
+    // (2) Firth refuses it: deviance bounded above a positive floor and ~flat
+    //     across the deep-separation plateau (the finite-estimate limit).
+    let df_weak = df[0]; // ρ = -16
+    let df_plateau = df[6]; // ρ = -10
+    assert!(
+        df_weak > 1.0,
+        "Firth deviance must stay bounded away from 0 under separation, got {df_weak}"
+    );
+    assert!(
+        (df_weak - df_plateau).abs() / df_plateau < 0.05,
+        "Firth deviance should plateau as λ→0: ρ=-16 {df_weak} vs ρ=-10 {df_plateau}"
+    );
+
+    // (3) Sign flip: at weak penalty Firth deviance exceeds no-Firth by a wide
+    //     margin — it trades fit quality for stability.
+    assert!(
+        df_weak > 100.0 * dnf_weak,
+        "Firth must refuse the degenerate fit: firth={df_weak} nofirth={dnf_weak}"
+    );
+
+    // (4) No-Firth deviance falls monotonically toward 0 as λ → 0: it keeps
+    //     buying a better separation fit with larger β as the penalty relaxes.
+    //     ρ increases left→right, so deviance must increase with ρ.
+    for i in 0..dnf.len() - 1 {
+        assert!(
+            dnf[i] < dnf[i + 1],
+            "no-Firth deviance should fall as λ→0: dev[ρ={}]={} !< dev[ρ={}]={}",
+            rhos[i],
+            dnf[i],
+            rhos[i + 1],
+            dnf[i + 1]
+        );
+    }
+}
+
+fn fit_deviance(
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    w: &Array1<f64>,
+    penalties: &[CanonicalPenalty],
+    rho: f64,
+    firth: bool,
+) -> f64 {
+    let p = x.ncols();
+    let cfg = PirlsConfig {
+        likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Logit),
+        )),
+        link_kind: InverseLink::Standard(StandardLink::Logit),
+        max_iterations: 500,
+        convergence_tolerance: 1e-10,
+        firth_bias_reduction: firth,
+        initial_lm_lambda: None,
+        geodesic_acceleration: false,
+        arrow_schur: None,
     };
-    let firth_changes = count_direction_changes(&cost_firth);
-    let no_firth_changes = count_direction_changes(&cost_no_firth);
-    assert!(no_firth_changes <= firth_changes || no_firth_changes <= 5);
+    let offset = Array1::<f64>::zeros(y.len());
+    let (fit, _) = fit_model_for_fixed_rho(
+        LogSmoothingParamsView::new(array![rho].view()),
+        PirlsProblem {
+            x: x.view(),
+            offset: offset.view(),
+            y: y.view(),
+            priorweights: w.view(),
+            covariate_se: None,
+            gaussian_fixed_cache: None,
+            glm_first_step_gram: None,
+        },
+        PenaltyConfig {
+            canonical_penalties: penalties,
+            balanced_penalty_root: None,
+            reparam_invariant: None,
+            p,
+            coefficient_lower_bounds: None,
+            linear_constraints_original: None,
+            penalty_shrinkage_floor: None,
+            kronecker_factored: None,
+        },
+        &cfg,
+        None,
+    )
+    .expect("fit");
+    fit.deviance
 }
