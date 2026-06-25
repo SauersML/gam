@@ -7,15 +7,14 @@ publish = false
 description = "Foundational shared types for the gam workspace (issue #1521 phase-1 leaf crate)."
 license = "AGPL-3.0-or-later"
 
-# SCAFFOLD ONLY (issue #1521). This crate is the planned foundation of the
-# workspace split: `types.rs`, `resource.rs`, `model_types`, and the shared
-# error enums move here so every downstream crate (linalg → gpu → solver →
-# terms → families → inference → gam) depends on a leaf that almost never
-# churns, making the common-case recompile incremental instead of a ~15-minute
-# full rebuild. The MOVES are a serializing, tree-wide `use crate::` rewrite and
-# are held until the maintainer declares a quiet window (post-#932). Until then
-# this crate is intentionally near-empty so the skeleton can land additively
-# without conflicting with the agents currently editing the monolith.
+# Foundational leaf of the workspace split (issue #1521). Window 1 owns the two
+# fully leaf-clean modules `types` and `resource`: every downstream crate
+# (linalg → gpu → solver → terms → families → inference → gam) names this leaf
+# instead of forcing `crate::`-cycles through each other, so a change to a
+# family/term no longer recompiles these near-static types. `gam` re-exports
+# both modules, so existing `crate::types::*`/`crate::resource::*` paths in the
+# 130 consuming files resolve unchanged — no tree-wide rewrite. `model_types`
+# and the other layers move in later windows.
 [lib]
 name = "gam_core"
 path = "src/lib.rs"
@@ -23,4 +22,11 @@ path = "src/lib.rs"
 [lints.rust]
 warnings = "deny"
 
+# Versions/features pinned to match the root `gam` crate so the shared
+# Cargo.lock resolves to a single copy of each dependency. `ndarray`'s `serde`
+# feature backs the `#[derive(Serialize)]` on the `Array1`-carrying types;
+# `rayon` matches the workspace-wide ndarray feature set.
 [dependencies]
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
