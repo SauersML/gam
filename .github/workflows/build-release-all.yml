@@ -216,7 +216,7 @@ jobs:
           RUSTFLAGS: "-C target-cpu=${{ matrix.cpu }}"
           # Embed commit-addressable release tag in binary for version command
           GAM_RELEASE_TAG: "main-${{ github.sha }}"
-        run: cargo +nightly build --release --target ${{ matrix.target }}
+        run: cargo +nightly build --release --target ${{ matrix.target }} -p gam-cli
 
 
       - name: Package (Unix)
