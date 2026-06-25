@@ -189,16 +189,33 @@ pub fn survival_rigid_row_jets(
     #[cfg(target_os = "linux")]
     {
         if rows.len() >= DEVICE_ROW_THRESHOLD {
-            if let Ok(out) =
-                device::survival_rigid_row_jets_device(rows, probit_scale, dir, dir_u, dir_v)
-            {
-                return out;
+            match device::survival_rigid_row_jets_device(rows, probit_scale, dir, dir_u, dir_v) {
+                Ok(out) => return out,
+                Err(e) => {
+                    // Fall through to CPU on any device error (the GPU path is an
+                    // accelerator, never the only correct path). Log WHY so a
+                    // silent CPU fallback on an admitted device is diagnosable.
+                    log::info!("[GPU] survival_rowjet device path fell back to CPU: {e}");
+                }
             }
-            // Fall through to CPU on any device error (the GPU path is an
-            // accelerator, never the only correct path).
         }
     }
     survival_rigid_row_jets_cpu(rows, probit_scale, dir, dir_u, dir_v)
+}
+
+/// Diagnostic: run ONLY the device path and return its `Result` (the error
+/// string on failure). Linux-only; intended for A100 verification harnesses to
+/// surface a compile/launch failure that the silent-fallback dispatcher hides.
+#[cfg(target_os = "linux")]
+pub fn survival_rigid_row_jets_device_only(
+    rows: &[SurvivalRowInputs],
+    probit_scale: f64,
+    dir: &[f64; 4],
+    dir_u: &[f64; 4],
+    dir_v: &[f64; 4],
+) -> Result<SurvivalRowJetChannels, String> {
+    device::survival_rigid_row_jets_device(rows, probit_scale, dir, dir_u, dir_v)
+        .map_err(|e| e.to_string())
 }
 
 /// The NVRTC source: a byte-faithful port of the seeded-jet arithmetic.
