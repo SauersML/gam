@@ -6699,3 +6699,51 @@ fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
         }
     }
 }
+
+/// #1569: the post-update monotone-cone feasibility check
+/// ([`validate_linear_constraints`]) must accept any β the DOWNSTREAM gates
+/// (`check_linear_feasibility` / `project_onto_linear_constraints`) already
+/// certify as feasible — both certify to the absolute
+/// [`MONOTONE_CONE_FEASIBILITY_GATE_TOL`] (`1e-8`, gam#797/#1108). A binding
+/// guard row left at slack ~-5e-9 by accumulated inner-solve round-off is
+/// numerically AT the boundary, not a violation; the previous `1e-10·scale`
+/// threshold hard-errored it, failing an otherwise-feasible survival-LS fit on a
+/// pure numerical-precision mismatch. The floor at the gate tolerance fixes that
+/// while still rejecting a genuine violation an order of magnitude past the gate.
+#[test]
+fn validate_linear_constraints_accepts_roundoff_feasible_iterate_1569() {
+    // One guard row `β_0 ≥ 0`: A = [[1]], b = [0], so the row scale is 1 and the
+    // effective tolerance is `max(1e-10·1, 1e-8) = 1e-8`.
+    let constraints = LinearInequalityConstraints {
+        a: array![[1.0]],
+        b: array![0.0],
+    };
+
+    // Round-off-feasible: slack = -5e-9, INSIDE the 1e-8 downstream gate. The
+    // rest of the pipeline treats this iterate as feasible, so the post-update
+    // sanity check must NOT reject it.
+    let roundoff = Array1::from_vec(vec![-5e-9]);
+    assert!(
+        validate_linear_constraints("test", &roundoff, &constraints).is_ok(),
+        "a β at slack -5e-9 (feasible to the 1e-8 gate) must not be rejected"
+    );
+
+    // Strictly interior: trivially accepted.
+    let interior = Array1::from_vec(vec![0.5]);
+    assert!(validate_linear_constraints("test", &interior, &constraints).is_ok());
+
+    // Round-off-feasible exactly at the previous (too-strict) 1e-10 boundary —
+    // also accepted now (it is well inside the gate).
+    let near_old_floor = Array1::from_vec(vec![-9e-10]);
+    assert!(validate_linear_constraints("test", &near_old_floor, &constraints).is_ok());
+
+    // Genuine violation an order of magnitude PAST the gate: slack = -1e-7. Must
+    // still be REJECTED — the floor only relaxes round-off, not real violations.
+    let violation = Array1::from_vec(vec![-1e-7]);
+    let err = validate_linear_constraints("test", &violation, &constraints)
+        .expect_err("a β at slack -1e-7 (10x past the 1e-8 gate) must be rejected");
+    assert!(
+        err.contains("violates represented linear constraint"),
+        "unexpected error message: {err}"
+    );
+}
