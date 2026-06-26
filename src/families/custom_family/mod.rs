@@ -61,10 +61,6 @@ pub(crate) use gam_problem::{
 pub(crate) use gam_runtime::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use joint_newton::whitened_spectrum;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
-pub(crate) use persistent_warm_start::{
-    capture_fit_artifact, consume_fit_artifact, load_persistent_custom_family_warm_start,
-    store_persistent_custom_family_warm_start, update_custom_outer_inner_cap_from_warm_start,
-};
 pub(crate) use std::any::Any;
 pub(crate) use std::cell::RefCell;
 pub(crate) use std::collections::{BTreeMap, HashMap};
@@ -96,7 +92,6 @@ mod psi_hyper;
 mod warm_start;
 
 mod coefficient_groups;
-mod persistent_warm_start;
 
 // `pub use ...::*` preserves each item's own visibility (pub stays pub,
 // pub(crate) stays pub(crate)) so the prior flat-namespace API is unchanged.

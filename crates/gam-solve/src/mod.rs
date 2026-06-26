@@ -2,6 +2,7 @@ pub(crate) mod active_set;
 pub mod arrow_schur;
 pub mod continuation_path;
 pub mod cross_node;
+pub(crate) mod custom_family_persistent_warm_start;
 pub mod estimate;
 pub mod evidence;
 pub mod fit_orchestration;
@@ -43,6 +44,15 @@ pub mod topology_selector;
 pub mod visualizer;
 pub(crate) mod warm_start_artifact;
 pub(crate) mod warm_start_transfer;
+
+// Re-export the custom-family persistent warm-start entry points at the crate
+// root so the scattered custom-family solver modules (`fit`, `blockwise_solve`,
+// …) resolve them through their `use super::*` prelude exactly as they did when
+// these lived in `custom_family/mod.rs`.
+pub(crate) use custom_family_persistent_warm_start::{
+    capture_fit_artifact, consume_fit_artifact, load_persistent_custom_family_warm_start,
+    store_persistent_custom_family_warm_start, update_custom_outer_inner_cap_from_warm_start,
+};
 
 pub use evidence::{
     EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, GaussianMixtureConfig,

@@ -15,12 +15,16 @@ pub mod families {
     }
 }
 
-pub mod joint_penalty;
-pub mod outer_subsample;
+// `joint_penalty` and `outer_subsample` are neutral low-layer primitives that
+// live in `gam-problem` (below the `CustomFamily` trait). Re-export the modules
+// and their public types so existing `gam_model_api::{joint_penalty,
+// outer_subsample}::*` and `crate::{OuterScoreSubsample, JointPenaltyBundle, …}`
+// paths stay stable without duplicating the sources.
+pub use gam_problem::{joint_penalty, outer_subsample};
 
 pub use families::custom_family::*;
-pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
-pub use outer_subsample::{OuterScoreSubsample, RowSet, WeightedOuterRow};
+pub use gam_problem::joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
+pub use gam_problem::outer_subsample::{OuterScoreSubsample, RowSet, WeightedOuterRow};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OuterEvalOrder {

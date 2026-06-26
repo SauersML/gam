@@ -86,11 +86,10 @@ pub struct BatchedOuterGradientTerms {
 }
 
 /// Scale-aware exact joint curvature payload for the outer REML evaluator.
-pub struct ExactNewtonOuterCurvature {
-    pub hessian: Array2<f64>,
-    pub rho_curvature_scale: f64,
-    pub hessian_logdet_correction: f64,
-}
+/// The neutral definition lives in `gam-problem`; re-exported here so the
+/// `custom_family::ExactNewtonOuterCurvature` path keeps resolving without a
+/// duplicate definition.
+pub use gam_problem::ExactNewtonOuterCurvature;
 
 /// User-defined family contract for multi-block generalized models.
 pub trait CustomFamily {

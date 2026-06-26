@@ -3130,8 +3130,9 @@ pub fn build_smooth_basis(
                     // tensor axis requesting a linear margin) falls through to
                     // the B-spline branch below, exactly as before #1074 — mgcv
                     // likewise does not build a `cr` margin below k=3.
-                    let cr_knots = crate::basis::select_cr_knots(ds.values.column(c), k_axis)
-                        .map_err(|e| e.to_string())?;
+                    let cr_knots =
+                        crate::basis::select_cr_knots(ds.values.column(c), k_axis)
+                            .map_err(|e| e.to_string())?;
                     (
                         BSplineKnotSpec::NaturalCubicRegression { knots: cr_knots },
                         OneDimensionalBoundary::Open,

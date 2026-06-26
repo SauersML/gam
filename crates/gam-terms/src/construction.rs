@@ -1000,7 +1000,9 @@ impl CanonicalPenalty {
     }
 
     /// Convert to a PenaltyCoordinate for the unified REML evaluator.
-    pub fn to_penalty_coordinate(&self) -> gam_problem::PenaltyCoordinate {
+    pub fn to_penalty_coordinate(
+        &self,
+    ) -> gam_problem::PenaltyCoordinate {
         use gam_problem::PenaltyCoordinate;
         if self.is_block_local() {
             PenaltyCoordinate::from_block_root_with_mean(

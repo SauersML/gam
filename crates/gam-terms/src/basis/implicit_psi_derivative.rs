@@ -929,7 +929,10 @@ impl ImplicitDesignPsiDerivative {
         }
     }
 
-    pub fn append_full_transform(mut self, transform: &Array2<f64>) -> Result<Self, BasisError> {
+    pub fn append_full_transform(
+        mut self,
+        transform: &Array2<f64>,
+    ) -> Result<Self, BasisError> {
         if transform.nrows() != self.p_out() {
             crate::bail_dim_basis!(
                 "implicit psi derivative transform has {} rows but operator has {} output columns",

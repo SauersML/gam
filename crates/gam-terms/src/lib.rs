@@ -18,14 +18,6 @@ macro_rules! bail_dim_basis {
     };
 }
 
-pub mod analytic_penalties;
-pub mod basis;
-pub mod chunked_kernel_design;
-pub mod dictionary;
-pub mod geometry;
-pub mod kronecker;
-pub mod latent;
-
 #[macro_export]
 macro_rules! gpu_bail {
     ($($arg:tt)*) => {
@@ -35,10 +27,32 @@ macro_rules! gpu_bail {
     };
 }
 
-pub mod construction {
-    pub use crate::kronecker::{KroneckerInvariantStructure, kronecker_product};
-}
+pub mod analytic_penalties;
+pub mod basis;
+pub mod chunked_kernel_design;
+pub mod construction;
+pub mod decoders;
+pub mod dictionary;
+pub mod geometry;
+pub mod kronecker;
+pub mod latent;
+pub mod smooth;
+pub mod smooth_overrides;
+pub mod structure;
+pub mod term_builder;
 
 pub mod terms {
     pub use crate::*;
 }
+
+pub use analytic_penalties::{
+    ARDPenalty, AnalyticPenalty, AnalyticPenaltyKind, AnalyticPenaltyOp, AnalyticPenaltyRegistry,
+    BlockOrthogonalityPenalty, BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind,
+    EdgeRestriction, FrozenAnalyticPenaltyOp, IBPAssignmentPenalty, IbpHessianDiagThirdChannels,
+    IsometryDuchonRadialSource, IsometryPenalty, IsometryReference, IvaeRidgeMeanGauge,
+    JumpReLUPenalty, MechanismSparsityPenalty, NestedPrefixPenalty, NuclearNormPenalty,
+    OrthogonalityPenalty, ParametricRowPrecisionPriorPenalty, PenaltyConcavity, PenaltyTier,
+    PsiSlice, RowPrecisionPriorPenalty, ScadMcpPenalty, ScalarWeightSchedule,
+    ShapeMonotonicityPenalty, SheafConsistencyPenalty, SoftmaxAssignmentSparsityPenalty,
+    SparsityKind, SparsityPenalty, TopKActivationPenalty, TotalVariationPenalty, WeightField,
+};

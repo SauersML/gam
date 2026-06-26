@@ -19,6 +19,7 @@ pub mod basis_error;
 pub mod block_role;
 pub mod block_spec;
 pub mod coefficient_prior_mean;
+pub mod custom_family_blockwise;
 pub mod custom_family_error;
 pub mod diagnostics;
 pub mod dispersion;
@@ -30,14 +31,18 @@ pub mod finite_validation;
 pub mod fisher_rao;
 pub mod gauge;
 pub mod identifiability_audit;
+pub mod joint_penalty;
 mod linalg_helpers;
 mod linear_constraints;
 pub mod monotone_root_error;
+pub mod outer_subsample;
 pub mod penalty_coordinate;
 pub mod penalty_matrix;
 mod pseudo_logdet;
+pub mod psi_design_contract;
 pub mod psi_terms;
 pub mod row_metric;
+pub mod schedule;
 mod seeding;
 pub mod solver_contract;
 pub mod types;
@@ -73,6 +78,10 @@ pub use block_spec::{
     ParameterBlockSpec, ParameterBlockState, RowScaledJacobian, TensorChannelHessian,
 };
 pub use coefficient_prior_mean::{CoefficientPriorMean, PriorMeanError};
+pub use custom_family_blockwise::{
+    CUSTOM_FAMILY_RIDGE_FLOOR, CUSTOM_FAMILY_WEIGHT_FLOOR, ExactNewtonOuterCurvature,
+    validate_blockspec_consistency,
+};
 pub use custom_family_error::CustomFamilyError;
 pub use dispersion::Dispersion;
 pub use dispersion_cov::{DispersionExt, PhiScaledCovariance, UnscaledPrecision, se_from_covariance};
@@ -97,11 +106,16 @@ pub use monotone_root_error::MonotoneRootError;
 pub use penalty_coordinate::PenaltyCoordinate;
 pub use penalty_matrix::PenaltyMatrix;
 pub use pseudo_logdet::PseudoLogdetMode;
+pub use psi_design_contract::{
+    CustomFamilyBlockPsiDerivative, CustomFamilyPsiDerivativeOperator, JointHessianSourcePreference,
+    MaterializablePsiDerivativeOperator, MaterializationIntent, SharedDerivativeBlocks,
+};
 pub use psi_terms::{
     ExactNewtonJointPsiSecondOrderContracted, ExactNewtonJointPsiSecondOrderTerms,
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
 };
 pub use row_metric::{MetricProvenance, RowMetric, WeightField};
+pub use schedule::{GumbelTemperatureSchedule, ScheduleKind, SearchStrategy};
 pub use seeding::{SeedConfig, SeedRiskProfile, clamp_seed_rho_to_bounds, normalize_seed_bounds};
 pub use solver_contract::{
     DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterEval,

@@ -156,7 +156,7 @@ macro_rules! define_analytic_penalty_kind {
     };
 }
 
-analytic_penalty_registry!(define_analytic_penalty_kind);
+crate::analytic_penalty_registry!(define_analytic_penalty_kind);
 
 impl AnalyticPenaltyKind {
     pub(crate) fn isometry_scalar_weight(&self) -> Option<f64> {
