@@ -908,7 +908,11 @@ impl CriterionAtom for JeffreysLogdetAtom {
 /// and diagonal Hessian from this same object, so configured-prior cost and
 /// gradient can no longer come from separate wrapper calls.
 pub struct ConfiguredRhoPriorAtom {
-    pub eval: crate::rho_prior_eval::RhoPriorEval,
+    // #1521: `RhoPriorEval` is `pub(crate)`; keep this field `pub(crate)` so the
+    // now-`pub` `atoms` module does not expose a private-in-public type
+    // (`private_interfaces` under `warnings = "deny"`). The field is only read
+    // in-crate; the root facade re-exports neither this atom nor the field.
+    pub(crate) eval: crate::rho_prior_eval::RhoPriorEval,
 }
 
 impl ConfiguredRhoPriorAtom {

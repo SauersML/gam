@@ -25,7 +25,6 @@ pub(crate) use gam_terms::construction::{
     create_balanced_penalty_root_from_canonical, precompute_reparam_invariant_from_canonical,
 };
 pub(crate) use gam_linalg::faer_ndarray::array2_to_matmut;
-use crate::inference as inference_root;
 pub(crate) use gam_linalg::utils::{
     StableSolver, boundary_hit_indices, symmetric_spectrum_condition_number,
 };
@@ -41,7 +40,10 @@ pub(crate) use gam_problem::{
 };
 pub(crate) use gam_problem::{HessianResult, OuterEval};
 pub(crate) use gam_runtime::warm_start::Fingerprinter;
-pub(crate) use inference_root::hmc_io::BlockExcessTarget;
+// #1521 trait-inversion: the `BlockExcessTarget` evaluator trait (implemented by
+// `Gam784BlockTarget`, consumed by the up-tier #784 sampler) lives in the neutral
+// `gam_problem` contract so gam-solve has no back-edge into the gam-inference SCC.
+pub(crate) use gam_problem::laplace_sampler_contract::BlockExcessTarget;
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, s};
 pub(crate) use std::collections::{HashMap, VecDeque};
 pub(crate) use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};

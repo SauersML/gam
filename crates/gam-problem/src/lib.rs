@@ -50,6 +50,11 @@ pub mod rho_posterior;
 pub mod row_measure;
 pub mod row_metric;
 pub mod schedule;
+// #1521 contract-downs: pure-data carriers + caller-supplied sampler/verdict
+// traits so gam-solve can call up-tier work (NUTS sampling, topology verdicts)
+// without a back-edge into gam-inference/gam-sae; computation stays UP.
+pub mod laplace_sampler_contract;
+pub mod topology_certificates;
 mod seeding;
 pub mod solver_contract;
 pub mod types;

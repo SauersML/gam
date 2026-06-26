@@ -1622,16 +1622,32 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 && precision.nrows() == precision.ncols()
                 && joint_mode.iter().all(|v| v.is_finite())
             {
-                use crate::inference as inference_root;
-                use inference_root::hmc_io as engine_hmc;
-
-                let sampling_config = engine_hmc::NutsConfig::for_dimension(joint_mode.len());
-                match engine_hmc::sample_gaussian_mode_posterior(
-                    joint_mode.view(),
-                    precision.view(),
-                    &sampling_config,
-                ) {
-                    Ok(posterior) => {
+                // #1521 trait-inversion: the never-fail Gaussian mode-posterior
+                // sampler (NUTS config auto-derived from the dimension) lives UP
+                // in the gam-inference `hmc_io` tier; gam-solve calls it through
+                // the neutral `gam_problem` sampler contract instead of a
+                // back-edge into the inference SCC. When the sampler tier is not
+                // linked / registered, retain the optimizer-conditional
+                // covariance (the existing never-fail fallback) — still no
+                // dead-end.
+                let posterior_result =
+                    gam_problem::laplace_sampler_contract::gaussian_mode_posterior_sampler().map(
+                        |sampler| {
+                            sampler.sample_gaussian_mode_posterior(
+                                joint_mode.view(),
+                                precision.view(),
+                            )
+                        },
+                    );
+                match posterior_result {
+                    None => {
+                        log::info!(
+                            "[robust] never-fail posterior sampling unavailable (sampler tier not \
+                             linked); retaining optimizer-conditional covariance (still no \
+                             dead-end)",
+                        );
+                    }
+                    Some(Ok(posterior)) => {
                         let dim = joint_mode.len();
                         let n = posterior.samples.nrows();
                         if n > 1 {
@@ -1724,7 +1740,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                             }
                         }
                     }
-                    Err(reason) => {
+                    Some(Err(reason)) => {
                         log::warn!(
                             "[robust] never-fail posterior sampling could not factor the precision \
                              ({reason}); retaining optimizer-conditional covariance (still no dead-end)",

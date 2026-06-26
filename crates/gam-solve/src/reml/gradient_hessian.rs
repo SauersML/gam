@@ -2198,11 +2198,12 @@ impl<'a> RemlState<'a> {
         bundle: &EvalShared,
         n_ext: usize,
     ) -> Result<TkCorrectionTerms, EstimationError> {
-        use crate::inference as inference_root;
-        use inference_root::hmc_io::{
-            block_sampled_marginal_correction, laplace_directional_cubic_diagnostic,
-            laplace_trustworthiness_from_skewness,
-        };
+        // #1521 trait-inversion: the #784 importance-sampling correction and its
+        // eigen-diagnostic live UP in the gam-inference `hmc_io` tier; gam-solve
+        // calls them through the neutral `gam_problem` sampler contract instead
+        // of a back-edge into the inference SCC. The pure threshold math
+        // (`laplace_trustworthiness_from_skewness`) moved down outright.
+        use gam_problem::laplace_sampler_contract::laplace_trustworthiness_from_skewness;
 
         let n_rho = self.canonical_penalties.len();
         let zero = || TkCorrectionTerms {
@@ -2247,10 +2248,17 @@ impl<'a> RemlState<'a> {
             return Ok(zero());
         }
 
+        // Resolve the injected gam-inference sampler. When the sampler tier is
+        // not linked / registered, decline the correction (zero contribution) —
+        // the same safe no-op as every other decline branch here.
+        let Some(sampler) = gam_problem::laplace_sampler_contract::laplace_marginal_sampler() else {
+            return Ok(zero());
+        };
+
         // Step 1: per-direction skewness diagnostic γ_r.
-        let (max_abs, directional) =
-            laplace_directional_cubic_diagnostic(h_total, x_design, c_weights, false)
-                .map_err(EstimationError::InvalidInput)?;
+        let (max_abs, directional) = sampler
+            .directional_cubic_diagnostic(h_total, x_design, c_weights, false)
+            .map_err(EstimationError::InvalidInput)?;
         if !max_abs.is_finite() || max_abs == 0.0 {
             return Ok(zero());
         }
@@ -2361,8 +2369,9 @@ impl<'a> RemlState<'a> {
             base_deviance: pirls_result.deviance,
         };
 
-        let sampled =
-            block_sampled_marginal_correction(&target).map_err(EstimationError::InvalidInput)?;
+        let sampled = sampler
+            .block_sampled_marginal_correction(&target)
+            .map_err(EstimationError::InvalidInput)?;
 
         // Trust gate: an importance estimate with too few effective draws is
         // noisier than the Laplace error it is meant to correct, so we keep the

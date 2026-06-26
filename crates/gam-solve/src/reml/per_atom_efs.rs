@@ -143,7 +143,15 @@ impl PerAtomEfsResult {
     /// Lift the per-atom result into the shared [`OuterResult`] shape the
     /// generic runner returns, so the coordinator can route this primary
     /// through the same downstream consumers as the dense path.
-    pub fn into_outer_result(self, plan_used: OuterPlan) -> OuterResult {
+    //
+    // #1521: `OuterPlan` / `OuterResult` live in the private `rho_optimizer::run`
+    // module (re-exported only as `OuterProblem`), so they are not pub-reachable.
+    // Keep this method `pub(crate)` so the now-`pub` `per_atom_efs` module does
+    // not expose a private-in-public type (`private_interfaces` under
+    // `warnings = "deny"`). Called only in-crate (`rho_optimizer::run`); the root
+    // facade re-exports `run_per_atom_efs` / `PerAtomEfsConfig` /
+    // `SharedBorderTopology`, never this convenience method.
+    pub(crate) fn into_outer_result(self, plan_used: OuterPlan) -> OuterResult {
         OuterResult {
             rho: self.rho,
             final_value: self.final_value,
