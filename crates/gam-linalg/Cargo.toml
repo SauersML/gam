@@ -7,13 +7,6 @@ rust-version = "1.93"
 [lints.rust]
 warnings = "deny"
 
-[features]
-# Exposes `gam_linalg::test_support` (operator-backed design fixtures) to
-# downstream crates' tests. Off by default so the fixtures never reach a
-# release build or the published `.crate`; enable it from a `[dev-dependencies]`
-# entry, not `[dependencies]`.
-test-support = []
-
 [dependencies]
 dyn-stack = "0.13.2"
 faer = "0.24.0"

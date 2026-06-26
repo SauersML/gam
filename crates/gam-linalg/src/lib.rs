@@ -32,7 +32,6 @@ pub mod pairwise_reduce;
 pub mod parallel;
 pub mod pcg;
 pub mod sparse_exact;
-#[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod triangular;
 pub mod types;

@@ -2,10 +2,12 @@
 //!
 //! These fixtures exercise `gam-linalg`'s operator-backed design machinery, so
 //! they live here — the crate that owns [`LinearOperator`], [`DesignMatrix`],
-//! and friends — rather than in a downstream crate. They compile only for this
-//! crate's own tests (`cfg(test)`) or when a downstream crate opts in via the
-//! `test-support` feature, so they never reach a release build or the published
-//! `.crate`.
+//! and friends — rather than in a downstream crate. Following the workspace
+//! convention for `test_support` modules (and matching the root `gam` crate),
+//! this is a plain always-compiled `pub mod`: feature gates and `#[cfg(test)]`
+//! module gates are banned here, and a `cfg(test)` module would be invisible to
+//! downstream crates' test builds anyway. The contents are `pub`, so they are
+//! reachable (no dead-code lint) yet only ever called from `#[cfg(test)]` code.
 
 use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
 use gam_runtime::resource::MatrixMaterializationError;

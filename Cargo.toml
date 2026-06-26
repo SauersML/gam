@@ -115,12 +115,6 @@ approx = "0.5.1"
 # the standard, cycle-free way to give the test build access to a peeled-off
 # leaf.
 gam-predict = { path = "crates/gam-predict" }
-# `no_densify_design` and the operator-backed design fixtures it builds are
-# linalg fixtures; they live in `gam-linalg` (the crate that owns the operator
-# traits) and are shared with this crate's tests via the `test-support` feature.
-# Cargo unifies this with the normal `gam-linalg` dependency for the test build
-# only — the feature stays off in release and in the published `.crate`.
-gam-linalg = { path = "crates/gam-linalg", features = ["test-support"] }
 
 [[bench]]
 name = "closed_form_pair_block"
