@@ -2261,62 +2261,6 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         )
                     }
                 };
-                // SPECTRUM-BRANCH α-CRUSH BYPASS (gam#1569). The gam#979 bypass
-                // above is reachable only on the box-truncation branch
-                // (`joint_spectrum == None`). The CONSTRAINED coupled solve —
-                // notably the survival location-scale joint Newton — takes the
-                // SPECTRUM branch instead: its QP path also builds
-                // `joint_spectrum` for the Newton-decrement certificate
-                // (gam#1040/#1088), so `joint_spectrum.is_some()` and the trial
-                // step reached `apply_joint_feasibility_limit` and was globally
-                // α-crushed whenever the monotone time-derivative cap collapsed α.
-                //
-                // That is exactly the aggressive heteroscedastic regime of #1569:
-                // a free `η_σ` driven negative makes `inv_sigma = exp(−η_σ)` large,
-                // which inflates the time-channel residual and the time-block
-                // Newton step (∝ `inv_sigma`); the oversized time step drives a
-                // monotone time-derivative row to slack≈0, so the
-                // fraction-to-boundary `α` collapses to ~1e-4 and the crush scales
-                // the WHOLE joint step — gutting the `η_σ`/location correction that
-                // would shrink `inv_sigma`. The inner Newton then grinds its cycle
-                // budget on every outer ρ-eval and the outer refit fails
-                // ("exited the joint Newton path before convergence").
-                //
-                // Extend the bypass to this branch: when the constrained trial is
-                // within trust and the α-crush would gut it, SKIP the crush and let
-                // the magnitude-preserving cone projection below enforce monotone
-                // feasibility — correcting only the binding time direction while
-                // the scale/location correction proceeds. The trust-region ratio
-                // test still governs the (uncrushed) step's acceptance, so a
-                // genuine `η_σ` overshoot is rejected and the radius shrinks; it is
-                // simply no longer coupled to the monotone time cap. Gated on
-                // `joint_spectrum.is_some()` (the spectrum branch, mutually
-                // exclusive with the box-truncation branch the gam#979 bypass
-                // already covers) AND a constrained candidate, so every
-                // unconstrained / non-spectrum arm is byte-identical.
-                if !qp_feasible_bypass
-                    && joint_spectrum.is_some()
-                    && search_joint_active_set.is_some()
-                {
-                    let pre_proj_norm = joint_trust_region_metric_step_norm(
-                        &trial_delta,
-                        &joint_trust_metric_diag,
-                    );
-                    let within_trust = pre_proj_norm.is_finite()
-                        && joint_trust_radius.is_finite()
-                        && pre_proj_norm <= joint_trust_radius * (1.0 + 1e-12);
-                    if within_trust
-                        && let Ok((alpha, _)) = compute_joint_feasibility_alpha(
-                            family,
-                            &states,
-                            &ranges,
-                            &trial_delta,
-                        )
-                        && alpha < JOINT_FEASIBILITY_ALPHA_CRUSH_THRESHOLD
-                    {
-                        qp_feasible_bypass = true;
-                    }
-                }
                 // FEASIBILITY ENFORCEMENT (gam#979 survival flex non-convergence).
                 //
                 // The global `apply_joint_feasibility_limit` enforces feasibility
