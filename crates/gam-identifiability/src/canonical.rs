@@ -2449,7 +2449,7 @@ mod tests {
         }
     }
 
-    use gam_test_support::spec_from_dense_with_priority;
+    use gam_test_support::{spec_from_dense, spec_from_dense_with_priority};
 
     /// #933: a `jacobian_callback`-only block (no `stacked_design`) whose audit
     /// attributes a dropped column is now SAFELY REDUCED rather than kept at raw
@@ -3139,33 +3139,4 @@ mod tests {
             "threshold keeps exactly its `age` column after the intercept drop",
         );
     }
-}
-
-#[cfg(test)]
-fn spec_from_dense(name: &str, design: ndarray::Array2<f64>) -> ParameterBlockSpec {
-    let n = design.nrows();
-    ParameterBlockSpec {
-        name: name.to_string(),
-        design: DesignMatrix::Dense(DenseDesignMatrix::from(design)),
-        offset: ndarray::Array1::<f64>::zeros(n),
-        penalties: Vec::new(),
-        nullspace_dims: Vec::new(),
-        initial_log_lambdas: ndarray::Array1::<f64>::zeros(0),
-        initial_beta: None,
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    }
-}
-
-#[cfg(test)]
-fn spec_from_dense_with_priority(
-    name: &str,
-    design: ndarray::Array2<f64>,
-    priority: u8,
-) -> ParameterBlockSpec {
-    let mut spec = spec_from_dense(name, design);
-    spec.gauge_priority = priority;
-    spec
 }
