@@ -1616,7 +1616,7 @@ pub(crate) fn total_quadratic_penalty(
     s_lambdas: &[Array2<f64>],
     ridge: f64,
     ridge_policy: RidgePolicy,
-    joint_full_width: Option<&gam_models::joint_penalty::JointPenaltyBundle>,
+    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
     specs: Option<&[ParameterBlockSpec]>,
 ) -> f64 {
     let per_block: f64 = if total_quadratic_penalty_parallel_worthwhile(states, s_lambdas) {

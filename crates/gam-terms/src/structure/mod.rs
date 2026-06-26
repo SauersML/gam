@@ -1,2 +1,2 @@
 pub mod anova_atom;
-pub(crate) mod coefficient_group_resolver;
+pub mod coefficient_group_resolver;

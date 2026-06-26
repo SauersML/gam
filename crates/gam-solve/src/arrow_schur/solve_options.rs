@@ -239,7 +239,7 @@ pub struct ArrowSolveOptions {
     ///
     /// When set, `run_pcg_with_preconditioner` delegates each `S·p` call to
     /// this closure instead of the CPU `schur_matvec`. Constructed by
-    /// `gam_gpu::gpu_kernels::arrow_schur::gpu_schur_matvec_backend` when `cuda_selected()`
+    /// `crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend` when `cuda_selected()`
     /// and the system has dense per-row H_tβ slabs. `None` means CPU-only PCG.
     pub gpu_matvec: Option<GpuSchurMatvec>,
     /// Skip the ill-conditioning *rejection* (the κ-based

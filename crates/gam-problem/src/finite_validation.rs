@@ -1,6 +1,7 @@
 //! Shared finite-value validation helpers for estimation/result contracts.
 
 use crate::EstimationError;
+use ndarray::Array1;
 
 pub fn ensure_finite_scalar_estimation(
     name: &str,
@@ -28,6 +29,16 @@ where
                 "{label}[{idx}] must be finite, got {value}"
             )));
         }
+    }
+    Ok(())
+}
+
+#[inline]
+pub fn bail_if_cached_beta_non_finite(beta: &Array1<f64>) -> Result<(), EstimationError> {
+    if beta.iter().any(|v| !v.is_finite()) {
+        return Err(EstimationError::InvalidInput(
+            "cached inner beta contains non-finite entries".to_string(),
+        ));
     }
     Ok(())
 }

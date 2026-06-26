@@ -54,7 +54,7 @@ pub(crate) fn apply_joint_block_penalty(
     s_lambdas: &[Array2<f64>],
     vector: &Array1<f64>,
     diagonal_ridge: f64,
-    joint_full_width: Option<&gam_models::joint_penalty::JointPenaltyBundle>,
+    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
 ) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(vector.len());
     apply_joint_block_penalty_into(
@@ -82,7 +82,7 @@ pub(crate) fn apply_joint_block_penalty_into(
     vector: &Array1<f64>,
     diagonal_ridge: f64,
     out: &mut Array1<f64>,
-    joint_full_width: Option<&gam_models::joint_penalty::JointPenaltyBundle>,
+    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
 ) {
     assert_eq!(out.len(), vector.len());
     assert!(s_lambdas.len() <= ranges.len());
@@ -222,7 +222,7 @@ pub(crate) fn joint_penalty_preconditioner_diag(
     ranges: &[(usize, usize)],
     s_lambdas: &[Array2<f64>],
     diagonal_ridge: f64,
-    joint_full_width: Option<&gam_models::joint_penalty::JointPenaltyBundle>,
+    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
 ) -> Array1<f64> {
     assert!(s_lambdas.len() <= ranges.len());
     let mut diag = base_diagonal.clone();
@@ -304,7 +304,7 @@ pub(crate) fn add_joint_penalty_to_matrix(
     ranges: &[(usize, usize)],
     s_lambdas: &[Array2<f64>],
     diagonal_ridge: f64,
-    joint_full_width: Option<&gam_models::joint_penalty::JointPenaltyBundle>,
+    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
 ) {
     for (b, s_lambda) in s_lambdas.iter().enumerate() {
         let (start, end) = ranges[b];

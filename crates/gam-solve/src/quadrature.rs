@@ -177,9 +177,8 @@ use crate::estimate::EstimationError;
 use crate::mixture_link::{
     beta_logistic_inverse_link_jet, component_inverse_link_jet, sas_inverse_link_jet,
 };
-use gam_math::probability::{
-    erfcx_nonnegative, stable_polynomial_times_exp_neg as cloglog_stable_poly_times_exp_neg,
-};
+use gam_math::probability::erfcx_nonnegative;
+use gam_math::special::stable_polynomial_times_exp_neg as cloglog_stable_poly_times_exp_neg;
 use gam_problem::types::{
     InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkComponent, LinkFunction,
     MixtureLinkState, ResponseFamily, SasLinkState, StandardLink,

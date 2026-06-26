@@ -4182,7 +4182,7 @@ pub(crate) fn apply_joint_penalized_hessian_into(
     diagonal_ridge: f64,
     vector: &Array1<f64>,
     out: &mut Array1<f64>,
-    joint_full_width: Option<&gam_models::joint_penalty::JointPenaltyBundle>,
+    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
 ) -> Result<(), String> {
     let mut penalty = Array1::<f64>::zeros(vector.len());
     apply_joint_penalized_hessian_into_with_workspace(
@@ -4213,7 +4213,7 @@ pub(crate) fn apply_joint_penalized_hessian_into_with_workspace(
     vector: &Array1<f64>,
     out: &mut Array1<f64>,
     penalty_scratch: &mut Array1<f64>,
-    joint_full_width: Option<&gam_models::joint_penalty::JointPenaltyBundle>,
+    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
 ) -> Result<(), String> {
     match source {
         JointHessianSource::Dense(h_joint) => {
@@ -4243,7 +4243,7 @@ pub(crate) fn stabilized_joint_solver_diagonal_ridge<F: CustomFamily + ?Sized>(
     s_lambdas: &[Array2<f64>],
     base_diagonal_ridge: f64,
     ridge_floor: f64,
-    joint_full_width: Option<&gam_models::joint_penalty::JointPenaltyBundle>,
+    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
 ) -> f64 {
     if use_exact_newton_strict_spd(family) {
         return base_diagonal_ridge;
@@ -4291,7 +4291,7 @@ pub(crate) fn joint_preconditioned_descent_delta(
     s_lambdas: &[Array2<f64>],
     diagonal_ridge: f64,
     rhs: &Array1<f64>,
-    joint_full_width: Option<&gam_models::joint_penalty::JointPenaltyBundle>,
+    joint_full_width: Option<&gam_problem::JointPenaltyBundle>,
 ) -> Result<Array1<f64>, String> {
     let base_diagonal = match source {
         JointHessianSource::Dense(h_joint) => h_joint.diag().to_owned(),

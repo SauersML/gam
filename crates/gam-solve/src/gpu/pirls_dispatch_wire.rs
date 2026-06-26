@@ -100,7 +100,7 @@ mod linux_impl {
     use gam_terms::construction::ReparamResult;
     use gam_gpu::cuda_selected;
     use gam_gpu::device_runtime::GpuRuntime;
-    use gam_gpu::gpu_kernels::pirls_row::{CurvatureMode, PirlsRowFamily};
+    use crate::gpu_kernels::pirls_row::{CurvatureMode, PirlsRowFamily};
     use gam_gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use gam_linalg::matrix::SymmetricMatrix;
     use gam_linalg::matrix::DesignMatrix;
@@ -388,8 +388,8 @@ mod linux_impl {
         // iterate to the outer REML loop.
         {
             const FORBIDDEN_ROW: u32 =
-                gam_gpu::gpu_kernels::pirls_row::status_flags::INVALID_RESPONSE
-                    | gam_gpu::gpu_kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
+                crate::gpu_kernels::pirls_row::status_flags::INVALID_RESPONSE
+                    | crate::gpu_kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
             if (per_row_status_or & FORBIDDEN_ROW) != 0 && !matches!(status, PirlsStatus::Unstable)
             {
                 return Err(format!(

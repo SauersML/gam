@@ -201,7 +201,7 @@ pub(crate) fn sigma_cubature_dispatch(
 ///   2. Materialises `x_transformed = X_original · Qs` on the host
 ///      (dense-only; sparse design returns `Ok(None)`).
 ///   3. Passes the per-sigma inputs to
-///      [`gam_gpu::gpu_kernels::sigma_cubature::try_gpu_sigma_stream_pool_eval`]
+///      [`crate::gpu_kernels::sigma_cubature::try_gpu_sigma_stream_pool_eval`]
 ///      which allocates a stream pool (N_streams = min(8, M)), rotates
 ///      sigma points across streams, runs `pirls_loop_on_stream` on each,
 ///      and returns one `(H_original⁻¹, β_original)` pair per point.
@@ -217,8 +217,8 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
 ) -> Result<Option<Vec<SigmaPointResult>>, gam_gpu::GpuError> {
     use gam_terms::construction::{EngineDims, stable_reparameterization_engine_canonical};
     use gam_gpu::device_runtime::GpuRuntime;
-    use gam_gpu::gpu_kernels::sigma_cubature::try_gpu_sigma_stream_pool_eval;
-    use gam_gpu::pirls_dispatch_wire::admission_for;
+    use crate::gpu_kernels::sigma_cubature::try_gpu_sigma_stream_pool_eval;
+    use crate::gpu::pirls_dispatch_wire::admission_for;
 
     if sigma_points.is_empty() {
         return Ok(Some(Vec::new()));
@@ -250,7 +250,7 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
     // This is a moderate-cost eigendecomposition (O(p³) per point); it
     // runs sequentially here because the downstream GPU launches dominate.
     let engine_dims = EngineDims::new(p, state.canonical_penalties.len());
-    let mut per_sigma: Vec<gam_gpu::gpu_kernels::sigma_cubature::SigmaPointGpuInput> =
+    let mut per_sigma: Vec<crate::gpu_kernels::sigma_cubature::SigmaPointGpuInput> =
         Vec::with_capacity(sigma_points.len());
 
     for rho in sigma_points {
@@ -271,7 +271,7 @@ pub(crate) fn sigma_cubature_evaluate_gpu_stream_pool(
         // for the standard sigma-cubature path (no explicit prior-mean offset).
         let linear_shift = ndarray::Array1::<f64>::zeros(p);
 
-        per_sigma.push(gam_gpu::gpu_kernels::sigma_cubature::SigmaPointGpuInput {
+        per_sigma.push(crate::gpu_kernels::sigma_cubature::SigmaPointGpuInput {
             s_transformed: reparam.s_transformed,
             qs: reparam.qs,
             linear_shift,

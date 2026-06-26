@@ -2011,7 +2011,7 @@ pub(crate) fn matvec_gate_engages_for_llm_shape_off_for_tiny() {
 }
 
 /// #1017 Phase-1 dispatch re-key (kernel side): the device matrix-free SAE
-/// reduced-Schur PCG (`gam_gpu::gpu_kernels::arrow_schur::gpu_schur_matvec_backend`)
+/// reduced-Schur PCG (`crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend`)
 /// previously gated on the dense-Direct floor `dense_hessian_work_target_is_gpu(n,
 /// k)`, the same floor `try_device_arrow_direct` (the single dense factorization)
 /// uses. That is the wrong gate for the amortised matvec: it keys on `2·n·k²`,

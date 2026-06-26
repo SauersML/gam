@@ -218,7 +218,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         );
     }
     let ridge = effective_solverridge(options.ridge_floor);
-    let joint_bundle: Option<&gam_models::joint_penalty::JointPenaltyBundle> =
+    let joint_bundle: Option<&gam_problem::JointPenaltyBundle> =
         options.joint_penalties.as_deref();
     if let Some(bundle) = joint_bundle {
         for (i, spec) in bundle.specs.iter().enumerate() {
@@ -6212,7 +6212,7 @@ pub(crate) fn polish_joint_newton_step<F: CustomFamily + Clone + Send + Sync + '
     options: &BlockwiseFitOptions,
     s_lambdas: &[Array2<f64>],
     ridge: f64,
-    joint_bundle: Option<&gam_models::joint_penalty::JointPenaltyBundle>,
+    joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
     inner_tol: f64,
     cached_active_sets: &[Option<Vec<usize>>],
     states: &mut Vec<ParameterBlockState>,
@@ -6468,7 +6468,7 @@ pub(crate) fn assemble_inner_blockwise_result<F: CustomFamily + Clone + Send + S
     options: &BlockwiseFitOptions,
     s_lambdas: Vec<Array2<f64>>,
     ridge: f64,
-    joint_bundle: Option<&gam_models::joint_penalty::JointPenaltyBundle>,
+    joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
     cached_active_sets: Vec<Option<Vec<usize>>>,
     cached_eval: &FamilyEvaluation,
     converged: bool,

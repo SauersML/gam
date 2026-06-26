@@ -49,7 +49,7 @@ pub struct PirlsStepStreamInput<'a> {
 ///
 /// Where the host-input form uploads `weights` + `gradient` per Newton
 /// step, this form reads them straight from the
-/// [`gam_gpu::gpu_kernels::pirls_row::RowOutputDevBuffers`] populated by the
+/// [`crate::gpu_kernels::pirls_row::RowOutputDevBuffers`] populated by the
 /// device-side row-reweight kernel — no host round-trip for the row
 /// state. Only the penalty matrix still crosses the host boundary
 /// because the outer REML loop updates Sλ + LM ridge between PIRLS
@@ -2007,11 +2007,11 @@ extern "C" __global__ void status_or(
         pub beta_dev: CudaSlice<f64>,
         pub eta_dev: CudaSlice<f64>,
         /// Solve-row buffers: `grad_eta`, `w_solver`, `deviance`, `status`.
-        pub row_solve: gam_gpu::gpu_kernels::pirls_row::SolveRowBuffers,
+        pub row_solve: crate::gpu_kernels::pirls_row::SolveRowBuffers,
         /// Alpha-ladder buffers: `objective[7]`, `status[7]`.
-        pub alpha_ladder: gam_gpu::gpu_kernels::pirls_row::AlphaLadderDevBuffers,
+        pub alpha_ladder: crate::gpu_kernels::pirls_row::AlphaLadderDevBuffers,
         /// Full final-row buffers: all 9 fields, written once at convergence.
-        pub row_final: gam_gpu::gpu_kernels::pirls_row::RowOutputDevBuffers,
+        pub row_final: crate::gpu_kernels::pirls_row::RowOutputDevBuffers,
         pub direction_dev: CudaSlice<f64>,
         pub xd_dev: CudaSlice<f64>,
         pub scalar_dev: CudaSlice<f64>,
@@ -2036,13 +2036,13 @@ extern "C" __global__ void status_or(
             Ok(Self {
                 beta_dev: alloc_f64("beta", p)?,
                 eta_dev: alloc_f64("eta", n)?,
-                row_solve: gam_gpu::gpu_kernels::pirls_row::SolveRowBuffers::allocate(stream, n)
+                row_solve: crate::gpu_kernels::pirls_row::SolveRowBuffers::allocate(stream, n)
                     .map_err(|e| format!("pirls loop alloc row_solve: {e}"))?,
-                alpha_ladder: gam_gpu::gpu_kernels::pirls_row::AlphaLadderDevBuffers::allocate(
+                alpha_ladder: crate::gpu_kernels::pirls_row::AlphaLadderDevBuffers::allocate(
                     stream,
                 )
                 .map_err(|e| format!("pirls loop alloc alpha_ladder: {e}"))?,
-                row_final: gam_gpu::gpu_kernels::pirls_row::RowOutputDevBuffers::allocate(stream, n)
+                row_final: crate::gpu_kernels::pirls_row::RowOutputDevBuffers::allocate(stream, n)
                     .map_err(|e| format!("pirls loop alloc row_final: {e}"))?,
                 direction_dev: alloc_f64("direction", p)?,
                 xd_dev: alloc_f64("xd", n)?,
@@ -2263,7 +2263,7 @@ extern "C" __global__ void status_or(
         pub max_abs_eta: f64,
         /// Bitwise-OR of all per-row status flags across the n rows at
         /// the final accepted PIRLS step. Carries
-        /// [`gam_gpu::gpu_kernels::pirls_row::status_flags`] bits so callers can
+        /// [`crate::gpu_kernels::pirls_row::status_flags`] bits so callers can
         /// distinguish saturation (`ETA_CLAMPED`), numerical floor
         /// (`MU_FLOORED`), or invalid input (`INVALID_RESPONSE`,
         /// `ZERO_PRIOR_WEIGHT`). A value of 0 means no per-row
@@ -2279,8 +2279,8 @@ extern "C" __global__ void status_or(
         shared: &PirlsGpuSharedData,
         ws: &mut SigmaPirlsGpuWorkspace,
         loop_ws: &mut PirlsLoopWorkspace,
-        family: gam_gpu::gpu_kernels::pirls_row::PirlsRowFamily,
-        curvature: gam_gpu::gpu_kernels::pirls_row::CurvatureMode,
+        family: crate::gpu_kernels::pirls_row::PirlsRowFamily,
+        curvature: crate::gpu_kernels::pirls_row::CurvatureMode,
         // Active Gamma dispersion shape (α > 0). Forwarded to every
         // `launch_row_reweight_on_stream` call. Pass `1.0` for non-Gamma fits.
         gamma_shape: f64,
@@ -2336,7 +2336,7 @@ extern "C" __global__ void status_or(
             )
             .map_err(|e| format!("upload beta0: {e}"))?;
 
-        let backend = gam_gpu::gpu_kernels::pirls_row::PirlsRowBackend::probe()
+        let backend = crate::gpu_kernels::pirls_row::PirlsRowBackend::probe()
             .map_err(|e| format!("pirls_row backend: {e}"))?;
         let loop_module = PIRLS_LOOP_CACHE
             .get_or_compile(&shared.ctx, "pirls_loop", PIRLS_LOOP_PTX_SOURCE)
@@ -2382,7 +2382,7 @@ extern "C" __global__ void status_or(
             n,
         )?;
         // Initial solve-row pass on the starting η (4-output kernel only).
-        gam_gpu::gpu_kernels::pirls_row::launch_solve_row_on_stream(
+        crate::gpu_kernels::pirls_row::launch_solve_row_on_stream(
             backend,
             family,
             curvature,
@@ -2495,7 +2495,7 @@ extern "C" __global__ void status_or(
                 .alpha_ladder
                 .zero(&ws.stream)
                 .map_err(|e| format!("ladder zero it={it}: {e}"))?;
-            gam_gpu::gpu_kernels::pirls_row::launch_alpha_ladder_on_stream(
+            crate::gpu_kernels::pirls_row::launch_alpha_ladder_on_stream(
                 backend,
                 family,
                 curvature,
@@ -2541,14 +2541,14 @@ extern "C" __global__ void status_or(
                 beta_host.dot(&s_beta) - 2.0 * beta_host.dot(&linear_shift) + constant_shift;
 
             const FORBIDDEN_LINESEARCH: u32 =
-                gam_gpu::gpu_kernels::pirls_row::status_flags::INVALID_RESPONSE
-                    | gam_gpu::gpu_kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
+                crate::gpu_kernels::pirls_row::status_flags::INVALID_RESPONSE
+                    | crate::gpu_kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
             let mut alpha = 0.0_f64;
             let mut accepted_dev = prev_deviance;
             let mut accepted_objective = prev_objective;
             let mut halving_count: usize = 0;
             for (k, (&dev_k, &st)) in obj_host.iter().zip(stat_host.iter()).enumerate() {
-                let a = gam_gpu::gpu_kernels::pirls_row::ALPHA_LADDER[k];
+                let a = crate::gpu_kernels::pirls_row::ALPHA_LADDER[k];
                 let pen_k = penalty_beta + a * linear_coeff + a * a * dtsd;
                 let obj_k = dev_k + pen_k;
                 // Match the CPU oracle's acceptance test (#263):
@@ -2615,7 +2615,7 @@ extern "C" __global__ void status_or(
                 *b += alpha * d;
             }
             // Refresh the 4-output solve-row buffers for the next Newton iter.
-            gam_gpu::gpu_kernels::pirls_row::launch_solve_row_on_stream(
+            crate::gpu_kernels::pirls_row::launch_solve_row_on_stream(
                 backend,
                 family,
                 curvature,
@@ -2647,7 +2647,7 @@ extern "C" __global__ void status_or(
             {
                 converged = true;
                 // Final-row mode: write all 9 output fields once at convergence.
-                gam_gpu::gpu_kernels::pirls_row::launch_row_reweight_on_stream(
+                crate::gpu_kernels::pirls_row::launch_row_reweight_on_stream(
                     backend,
                     family,
                     curvature,
@@ -2692,7 +2692,7 @@ extern "C" __global__ void status_or(
         }
 
         // Final-row mode: write all 9 output fields once at max-iter exit.
-        gam_gpu::gpu_kernels::pirls_row::launch_row_reweight_on_stream(
+        crate::gpu_kernels::pirls_row::launch_row_reweight_on_stream(
             backend,
             family,
             curvature,
@@ -2803,8 +2803,8 @@ extern "C" __global__ void status_or(
             &mut loop_ws.status_u32_dev,
             "final_row_status",
         )?;
-        const FORBIDDEN_FINAL: u32 = gam_gpu::gpu_kernels::pirls_row::status_flags::INVALID_RESPONSE
-            | gam_gpu::gpu_kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
+        const FORBIDDEN_FINAL: u32 = crate::gpu_kernels::pirls_row::status_flags::INVALID_RESPONSE
+            | crate::gpu_kernels::pirls_row::status_flags::ZERO_PRIOR_WEIGHT;
 
         // Stability classification — Unstable supersedes both
         // converged and MaxIterationsReached because a non-finite η /
@@ -3335,7 +3335,7 @@ pub fn solve_pirls_step_on_stream(
 
 /// Stage 3.2 device-input PIRLS step. Reads `w_solver` and `grad_eta`
 /// from caller-supplied device buffers (typically populated by
-/// [`gam_gpu::gpu_kernels::pirls_row::launch_row_reweight_on_stream`]) instead of
+/// [`crate::gpu_kernels::pirls_row::launch_row_reweight_on_stream`]) instead of
 /// uploading them from host arrays. Math is bit-identical to
 /// [`solve_pirls_step_on_stream`]; this entry differs only by skipping
 /// the per-iter `weights` and `gradient` host-to-device transfers — only
@@ -3363,8 +3363,8 @@ pub fn pirls_loop_on_stream(
     shared: &PirlsGpuSharedData,
     ws: &mut SigmaPirlsGpuWorkspace,
     loop_ws: &mut cuda::PirlsLoopWorkspace,
-    family: gam_gpu::gpu_kernels::pirls_row::PirlsRowFamily,
-    curvature: gam_gpu::gpu_kernels::pirls_row::CurvatureMode,
+    family: crate::gpu_kernels::pirls_row::PirlsRowFamily,
+    curvature: crate::gpu_kernels::pirls_row::CurvatureMode,
     // Active Gamma dispersion shape (α > 0). Pass `1.0` for non-Gamma fits.
     gamma_shape: f64,
     beta0: ndarray::ArrayView1<'_, f64>,
@@ -3668,7 +3668,7 @@ mod stream_device_parity_tests {
     /// 13k-line state machine.
     #[test]
     fn hill_climb_loop_beats_cpu_10x_on_large_scale_logit() {
-        use gam_gpu::gpu_kernels::pirls_row::{
+        use crate::gpu_kernels::pirls_row::{
             CurvatureMode, PirlsRowFamily, RowInput, row_reweight_cpu,
         };
         use std::time::Instant;
@@ -3834,8 +3834,8 @@ mod stream_device_parity_tests {
             &shared,
             &mut ws,
             &mut loop_ws,
-            gam_gpu::gpu_kernels::pirls_row::PirlsRowFamily::GaussianIdentity,
-            gam_gpu::gpu_kernels::pirls_row::CurvatureMode::Fisher,
+            crate::gpu_kernels::pirls_row::PirlsRowFamily::GaussianIdentity,
+            crate::gpu_kernels::pirls_row::CurvatureMode::Fisher,
             1.0,
             beta0.view(),
             penalty.view(),

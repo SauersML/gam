@@ -58,28 +58,14 @@ pub(crate) use crate::pirls::solve_newton_directionwith_lower_bounds;
 pub(crate) use faer::Side;
 pub(crate) use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_atb, fast_av};
 pub(crate) use gam_linalg::matrix::{
-    DesignMatrix, EmbeddedColumnBlock, LinearOperator, SignedWeightsView, SymmetricMatrix,
-    dense_rowwise_kronecker,
+    DesignMatrix, LinearOperator, SignedWeightsView, SymmetricMatrix,
 };
-pub(crate) use gam_linalg::{RidgeDeterminantMode, RidgePolicy};
-pub(crate) use gam_problem::finite_validation::{
-    ensure_finite_scalar_estimation, validate_all_finite_estimation,
-};
-pub(crate) use gam_problem::{
-    BlockLocalDrift, ContractedPsiSecondOrder, ContractedPsiSecondOrderFn,
-    DenseMatrixHyperOperator, DriftDerivResult, FixedDriftDerivFn, HyperCoord, HyperCoordDrift,
-    HyperCoordPair, HyperOperator,
-};
-pub(crate) use gam_problem::{LinearInequalityConstraints, PenaltyMatrix};
-pub(crate) use gam_runtime::resource::{DerivativeStorageMode, ResourcePolicy};
 pub(crate) use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, s};
 pub(crate) use std::any::Any;
 pub(crate) use std::cell::RefCell;
-pub(crate) use std::collections::{BTreeMap, HashMap};
-pub(crate) use std::ops::Range;
+pub(crate) use std::collections::BTreeMap;
 pub(crate) use std::sync::atomic::{AtomicUsize, Ordering};
-pub(crate) use std::sync::{Arc, Mutex, OnceLock, Weak};
-pub(crate) use thiserror::Error;
+pub(crate) use std::sync::{Arc, Mutex, OnceLock};
 
 // --- descended carriers + the `CustomFamily` trait + fit options + ψ design --
 // `pub use gam_problem::*` brings the block data model (`ParameterBlockSpec`,
@@ -89,8 +75,8 @@ pub(crate) use thiserror::Error;
 // `pub use gam_model_api::families::custom_family::*` brings `CustomFamily`,
 // `BlockwiseFitOptions`, `block_offsets_from_specs`, the outer-derivative
 // policy/cost types, and the ψ design-derivative operators.
-pub use gam_model_api::families::custom_family::*;
-pub use gam_problem::*;
+pub(crate) use gam_model_api::families::custom_family::*;
+pub(crate) use gam_problem::*;
 
 // `whitened_spectrum` is a submodule hosted inside `joint_newton`; re-export it
 // at the carrier scope so the trust-region tests reach it through `super::*`.
@@ -114,7 +100,11 @@ mod warm_start;
 // `pub use ...::*` preserves each item's own visibility (pub stays pub,
 // pub(crate) stays pub(crate)) so the prior flat-namespace API is unchanged.
 pub use assembly::*;
-pub use block_spec::*;
+pub use self::block_spec::{
+    CoefficientBlockSelector, CoefficientGroupSpec, CoefficientLabel, RealizedCoefficientGroup,
+    RealizedCoefficientGroupSpecs, coefficient_label,
+};
+pub(crate) use self::block_spec::{custom_family_block_role, validate_blockspecs};
 pub(crate) use blockwise_solve::*;
 pub use coefficient_groups::*;
 pub(crate) use covariance::*;

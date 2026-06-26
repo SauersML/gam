@@ -254,7 +254,7 @@ pub(crate) fn maybe_inject_gpu_schur_matvec(
         return None;
     }
     let matvec =
-        gam_gpu::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta)
+        crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend(sys, ridge_t, ridge_beta)
             .ok()?;
     let mut device_options = options.clone();
     device_options.gpu_matvec = Some(matvec);
@@ -307,7 +307,7 @@ pub(crate) fn try_device_arrow_direct(
     if !admitted {
         return None;
     }
-    match gam_gpu::gpu_kernels::arrow_schur::solve_arrow_newton_step(sys, ridge_t, ridge_beta) {
+    match crate::gpu_kernels::arrow_schur::solve_arrow_newton_step(sys, ridge_t, ridge_beta) {
         Ok(solution) => {
             let diagnostics = PcgDiagnostics {
                 used_device_arrow: true,
@@ -320,7 +320,7 @@ pub(crate) fn try_device_arrow_direct(
         // matching CPU error variant so `solve_with_lm_escalation_inner` bumps
         // the ridge and retries (it re-enters here and may route to device again
         // at the larger ridge, or fall to CPU if the device keeps declining).
-        Err(gam_gpu::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired {
+        Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired {
             row,
             bump,
         }) => Some(Err(ArrowSchurError::PerRowFactorFailed {
@@ -331,7 +331,7 @@ pub(crate) fn try_device_arrow_direct(
         // must respond to (bump the β-ridge and retry); surface it as the
         // matching CPU error rather than re-running the same factorisation on
         // the CPU only to fail identically.
-        Err(gam_gpu::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed {
+        Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed {
             reason,
         }) => Some(Err(ArrowSchurError::SchurFactorFailed { reason })),
         // Unavailable (transient / below device policy) and
@@ -410,7 +410,7 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
     // the (irrelevant, never-truncated) trust-region radius.
     let max_iterations = options.pcg.max_iterations.max(sys.k.saturating_add(1));
     let relative_tolerance = options.pcg.relative_tolerance.min(1e-12);
-    match gam_gpu::gpu_kernels::arrow_schur::solve_sae_matrix_free_pcg(
+    match crate::gpu_kernels::arrow_schur::solve_sae_matrix_free_pcg(
         sys,
         device_data.as_ref(),
         ridge_t,
@@ -468,14 +468,14 @@ pub(crate) fn try_device_arrow_direct_sae_pcg(
         // escalation must respond to; surface the matching CPU error variant so
         // the ridge is bumped and the solve retried (rather than silently
         // continuing on a wrong step).
-        Err(gam_gpu::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired {
+        Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::RidgeBumpRequired {
             row,
             bump,
         }) => Some(Err(ArrowSchurError::PerRowFactorFailed {
             row,
             reason: format!("device SAE PCG per-row block non-PD; suggested ridge bump {bump:e}"),
         })),
-        Err(gam_gpu::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed {
+        Err(crate::gpu_kernels::arrow_schur::ArrowSchurGpuFailure::SchurFactorFailed {
             reason,
         }) => Some(Err(ArrowSchurError::SchurFactorFailed { reason })),
         // Unavailable / transient / framed-mismatch all mean "device declined" —
@@ -1665,7 +1665,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
                         .relative_tolerance
                         .max(options.trust_region.steihaug_relative_tolerance);
                     if let Ok((delta, mut diag)) =
-                        gam_gpu::gpu_kernels::arrow_schur::solve_sae_matrix_free_pcg(
+                        crate::gpu_kernels::arrow_schur::solve_sae_matrix_free_pcg(
                             sys,
                             device_data.as_ref(),
                             ridge_t,

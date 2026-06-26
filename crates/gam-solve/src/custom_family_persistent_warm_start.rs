@@ -12,10 +12,9 @@
 //! consumed elsewhere in the parent are re-imported so every call site is
 //! unchanged.
 
-use super::{
-    BlockwiseFitOptions, CachedInnerMode, ConstrainedWarmStart, CustomFamily, ParameterBlockSpec,
-    PenaltyMatrix, normalize_active_sets,
-};
+use crate::custom_family::{CachedInnerMode, ConstrainedWarmStart, normalize_active_sets};
+use gam_model_api::families::custom_family::{BlockwiseFitOptions, CustomFamily};
+use gam_problem::{ParameterBlockSpec, PenaltyMatrix};
 use gam_linalg::matrix::DesignMatrix;
 use crate::persistent_warm_start::{
     PersistentBlockInnerSummary, PersistentBlockWarmStartRecord, load_block_record,

@@ -77,15 +77,7 @@ pub fn make_beta_seed_validator(
 /// ([`make_beta_seed_validator`]) and the bare warm-start length-then-finite
 /// guards in `custom_family` all route through this so the predicate and the
 /// error construction (`EstimationError::InvalidInput`) never drift apart.
-#[inline]
-pub fn bail_if_cached_beta_non_finite(
-    beta: &Array1<f64>,
-) -> Result<(), crate::model_types::EstimationError> {
-    if beta.iter().any(|v| !v.is_finite()) {
-        crate::bail_invalid_estim!("cached inner beta contains non-finite entries");
-    }
-    Ok(())
-}
+pub use gam_problem::bail_if_cached_beta_non_finite;
 
 /// Positive floor applied to the time-derivative slope `a1 = q'(t)·c` before
 /// taking `ln(a1)` or `1/a1` in the survival marginal-slope likelihood. The

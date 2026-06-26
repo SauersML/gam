@@ -96,8 +96,8 @@ pub use estimation_error::EstimationError;
 pub use execution_path::ExecutionPath;
 pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 pub use finite_validation::{
-    ensure_finite_scalar, ensure_finite_scalar_estimation, validate_all_finite,
-    validate_all_finite_estimation,
+    bail_if_cached_beta_non_finite, ensure_finite_scalar, ensure_finite_scalar_estimation,
+    validate_all_finite, validate_all_finite_estimation,
 };
 pub use fisher_rao::{
     FisherRaoDefiniteness, normalize_fisher_rao_blocks, normalize_fisher_rao_blocks_pd,
@@ -107,6 +107,7 @@ pub use gauge::Gauge;
 pub use identifiability_audit::{
     AliasedPair, BlockIdentity, DroppedColumn, IdentifiabilityAudit, MapUniquenessError,
 };
+pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
 use linalg_helpers::{dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into};
 pub use linear_constraints::LinearInequalityConstraints;
 pub use monotone_root_error::MonotoneRootError;

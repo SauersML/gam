@@ -119,7 +119,7 @@ pub type StreamingArrowRowBuilder =
 /// build. The CPU-driven Steihaug-CG outer loop uploads `x` (K doubles),
 /// receives `out` (K doubles), and handles the H_ββ contribution on the CPU side.
 ///
-/// Constructed by `gam_gpu::gpu_kernels::arrow_schur::gpu_schur_matvec_backend` when
+/// Constructed by `crate::gpu_kernels::arrow_schur::gpu_schur_matvec_backend` when
 /// `cuda_selected()` and K ≥ 5000. The closure is `Send + Sync` so PCG callers
 /// can hold it in an `Arc`.
 pub type GpuSchurMatvec = Arc<dyn Fn(&Array1<f64>, &mut Array1<f64>) + Send + Sync>;

@@ -77,7 +77,7 @@ pub(crate) fn constrained_warm_start_from_cached_beta(
             expected
         );
     }
-    gam_models::marginal_slope_shared::bail_if_cached_beta_non_finite(beta)?;
+    gam_problem::bail_if_cached_beta_non_finite(beta)?;
 
     let mut offset = 0usize;
     let mut block_beta = Vec::with_capacity(specs.len());
@@ -752,7 +752,7 @@ impl CustomFamilyWarmStart {
                 expected
             );
         }
-        gam_models::marginal_slope_shared::bail_if_cached_beta_non_finite(beta)?;
+        gam_problem::bail_if_cached_beta_non_finite(beta)?;
         let mut offset = 0usize;
         let mut block_beta = Vec::with_capacity(block_col_counts.len());
         for &width in block_col_counts {
