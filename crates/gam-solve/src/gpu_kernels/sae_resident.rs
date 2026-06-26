@@ -516,11 +516,11 @@ impl DeviceResidentArrowWorkspace {
                                 // border Schur factor once; record both so a
                                 // silent decline (no rebuild ⇒ no factor count)
                                 // is visible in the telemetry.
-                                crate::profile::telemetry_record_handle_creation(
+                                gam_gpu::profile::telemetry_record_handle_creation(
                                     self.context_id(),
                                 );
-                                crate::profile::telemetry_record_factorization();
-                                crate::profile::telemetry_record_h2d(
+                                gam_gpu::profile::telemetry_record_factorization();
+                                gam_gpu::profile::telemetry_record_h2d(
                                     self.frame_upload_bytes(),
                                 );
                                 resident_frame = Some((ridge_t, ridge_beta, frame));
@@ -544,9 +544,9 @@ impl DeviceResidentArrowWorkspace {
                             // reads back only δ.
                             let grad_bytes =
                                 (g_t.len() + g_beta.len()) * std::mem::size_of::<f64>();
-                            crate::profile::telemetry_record_h2d(grad_bytes);
-                            crate::profile::telemetry_record_kernel_launch();
-                            crate::profile::telemetry_record_d2h(
+                            gam_gpu::profile::telemetry_record_h2d(grad_bytes);
+                            gam_gpu::profile::telemetry_record_kernel_launch();
+                            gam_gpu::profile::telemetry_record_d2h(
                                 (n * d + p) * std::mem::size_of::<f64>(),
                             );
                             frame.solve_gradient(&g_t, &g_beta).map_err(map_gpu_error)
@@ -564,11 +564,11 @@ impl DeviceResidentArrowWorkspace {
                     // minus the across-iteration buffer/factor reuse — so EVERY
                     // iterate creates handles, factorizes, launches, and re-uploads
                     // the full slabs.
-                    crate::profile::telemetry_record_handle_creation(self.context_id());
-                    crate::profile::telemetry_record_factorization();
-                    crate::profile::telemetry_record_h2d(self.frame_upload_bytes());
-                    crate::profile::telemetry_record_kernel_launch();
-                    crate::profile::telemetry_record_d2h(
+                    gam_gpu::profile::telemetry_record_handle_creation(self.context_id());
+                    gam_gpu::profile::telemetry_record_factorization();
+                    gam_gpu::profile::telemetry_record_h2d(self.frame_upload_bytes());
+                    gam_gpu::profile::telemetry_record_kernel_launch();
+                    gam_gpu::profile::telemetry_record_d2h(
                         (n * d + p) * std::mem::size_of::<f64>(),
                     );
                     solve_arrow_newton_step(&residual, ridge_t, ridge_beta).map_err(map_gpu_error)
@@ -866,11 +866,11 @@ impl DeviceResidentArrowWorkspace {
                         ) {
                             Ok(frame) => {
                                 shared.frame_builds += 1;
-                                crate::profile::telemetry_record_handle_creation(
+                                gam_gpu::profile::telemetry_record_handle_creation(
                                     self.context_id(),
                                 );
-                                crate::profile::telemetry_record_factorization();
-                                crate::profile::telemetry_record_h2d(
+                                gam_gpu::profile::telemetry_record_factorization();
+                                gam_gpu::profile::telemetry_record_h2d(
                                     self.frame_upload_bytes(),
                                 );
                                 shared.frame = Some((ridge_t, ridge_beta, frame));
@@ -889,9 +889,9 @@ impl DeviceResidentArrowWorkspace {
                             let g_beta: Vec<f64> = residual.gb.iter().copied().collect();
                             let grad_bytes =
                                 (g_t.len() + g_beta.len()) * std::mem::size_of::<f64>();
-                            crate::profile::telemetry_record_h2d(grad_bytes);
-                            crate::profile::telemetry_record_kernel_launch();
-                            crate::profile::telemetry_record_d2h(
+                            gam_gpu::profile::telemetry_record_h2d(grad_bytes);
+                            gam_gpu::profile::telemetry_record_kernel_launch();
+                            gam_gpu::profile::telemetry_record_d2h(
                                 (n * d + p) * std::mem::size_of::<f64>(),
                             );
                             frame.solve_gradient(&g_t, &g_beta).map_err(map_gpu_error)
