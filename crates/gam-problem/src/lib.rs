@@ -21,6 +21,7 @@ pub mod block_spec;
 pub mod coefficient_prior_mean;
 pub mod custom_family_error;
 pub mod diagnostics;
+pub mod dispersion;
 pub mod estimation_error;
 pub mod family_options;
 pub mod fisher_rao;
@@ -70,6 +71,7 @@ pub use block_spec::{
 };
 pub use coefficient_prior_mean::{CoefficientPriorMean, PriorMeanError};
 pub use custom_family_error::CustomFamilyError;
+pub use dispersion::Dispersion;
 pub use estimation_error::EstimationError;
 pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 pub use fisher_rao::{
