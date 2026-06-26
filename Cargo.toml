@@ -1,6 +1,6 @@
 [package]
 name = "gam"
-version = "0.3.123"
+version = "0.3.124"
 edition = "2024"
 rust-version = "1.93"
 autobins = false
@@ -77,12 +77,17 @@ crossterm = "0.29.0"
 rand_distr = "0.6.0"
 statrs = "0.18.0"
 libm = "0.2.16"
-gam-data = { path = "crates/gam-data" }
-gam-math = { path = "crates/gam-math" }
-gam-problem = { path = "crates/gam-problem" }
-gam-spec = { path = "crates/gam-spec" }
-gam-runtime = { path = "crates/gam-runtime" }
-gam-linalg = { path = "crates/gam-linalg" }
+# Foundation crates extracted under #1521. They publish to crates.io as part of
+# the gam family so the published `gam` crate's path dependencies resolve to real
+# registry versions. The exact `=` pin keeps the family lock-stepped: a given
+# `gam` release only ever builds against the foundation crates it was compiled
+# against (their cross-crate surface is internal and unstable).
+gam-data = { path = "crates/gam-data", version = "=0.3.124" }
+gam-math = { path = "crates/gam-math", version = "=0.3.124" }
+gam-problem = { path = "crates/gam-problem", version = "=0.3.124" }
+gam-spec = { path = "crates/gam-spec", version = "=0.3.124" }
+gam-runtime = { path = "crates/gam-runtime", version = "=0.3.124" }
+gam-linalg = { path = "crates/gam-linalg", version = "=0.3.124" }
 pest = "2.8.6"
 pest_derive = "2.8.6"
 arrow = { version = "54", default-features = false, features = ["ffi"] }

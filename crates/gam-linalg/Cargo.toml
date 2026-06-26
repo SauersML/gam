@@ -1,8 +1,11 @@
 [package]
 name = "gam-linalg"
-version = "0.3.123"
+version = "0.3.124"
 edition = "2024"
 rust-version = "1.93"
+description = "Dense/sparse linear-algebra and ridge-solver foundation for the gam penalized-likelihood engine"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/SauersML/gam"
 
 [lints.rust]
 warnings = "deny"
@@ -10,7 +13,7 @@ warnings = "deny"
 [dependencies]
 dyn-stack = "0.13.2"
 faer = "0.24.0"
-gam-runtime = { path = "../gam-runtime" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.124" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 num-traits = "0.2"

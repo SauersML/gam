@@ -1,3 +1,85 @@
+## v0.3.124 — gam 0.3.124 / gamfit 0.1.226 (2026-06-26)
+
+crates.io + PyPI release of the open-issue fix wave landed since gam 0.3.123 /
+gamfit 0.1.225. Two themes dominate: a survival/location-scale correctness pass
+that makes saved-model prediction total and adds a genuine IPCW Brier score, and
+the build-system work of #1521 — the monolithic `gam` crate is split into
+foundation crates so an edit recompiles a sub-crate, not all 653 files. As a
+consequence of that split the published `gam` crate now depends on the gam
+foundation crates (`gam-runtime`, `gam-data`, `gam-math`, `gam-spec`,
+`gam-linalg`, `gam-problem`), which are published to crates.io alongside it as a
+version-locked family; the `gamfit` wheel is unaffected (it builds from source).
+The pre-release hardening also restored the `cargo check --workspace
+--all-targets` green invariant that two integration-test targets had regressed,
+and removed leftover split-WIP scratch from the tree.
+
+**Survival & location-scale**
+- **#1564**: saved-model survival prediction is now total. The Royston–Parmar
+  hazard guard accepts a zero log-cumulative-hazard time-derivative (the I-spline
+  baseline is flat past its last interior knot, so `d(log Λ)/dt = 0` is a
+  legitimate boundary value on the default prediction grid's top node) and
+  resolves the saturated `Λ = +∞ × 0` corner to `0`, not `NaN`. A `finite_safe_json`
+  serde adapter encodes `±∞`/`NaN` payload values as explicit string tokens so the
+  engine→Python boundary no longer rejects non-finite `f64` as `null`.
+- **#1563**: survival metrics now report a genuine integrated IPCW Brier score
+  (Graf 1999) built on a Kaplan–Meier censoring estimator over a data-driven
+  quantile grid, validated end-to-end against an independent Python oracle. The
+  prior hazard-quadratic score is honestly renamed.
+- **survival location-scale**: the log-σ (scale) design is kept raw instead of
+  being residualized against the location design — a smooth that drives both the
+  location and scale channels is separately identifiable, and residualizing
+  erased the heteroscedastic signal and tripped a joint-gradient shape check on
+  every smooth-scale fit. Cross-block identifiability is supplied by the
+  per-channel audit assignment, matching the Gaussian location-scale path.
+  Gaussian location-scale seed basins are also promoted/classified correctly.
+
+**Manifold SAE (#1026, #1522)**
+- **#1556**: manifold-SAE smoothness `λ_smooth` is genuinely per-atom (the outer
+  ρ carries one coordinate per atom, not a shared scalar).
+- Surplus/dead atoms are now parked gracefully instead of failing the pre-fit
+  audit; per-atom ARD collapses to shared hyperparameters at large K; the outer ρ
+  is routed through Fellner–Schall (REML); the over-complete reduced Schur is
+  spectral-floored; and the large-K matrix-free regime is bounded by a wall-clock
+  deadline so it cannot livelock. GPU device PCG for the SAE row-jet landed and is
+  arch-pinned through NVRTC so the double-atomic kernels actually engage the
+  device (#1017, #1033, #1551).
+
+**GPU survival row-jet (#932)**
+- An A100 survival rigid row-jet NVRTC kernel with a CPU-fallback dispatcher
+  (≤1e-9 exactness), with device-fallback-reason logging and a device-only
+  diagnostic entry.
+
+**Inference, conformal & bases**
+- **#1546**: the jackknife+ conformal interval uses `α = 1 − level` (delivered
+  coverage), not `(1 − level)/2`.
+- **#1548**: the default `s(x, bs="ps")` penalty is canonicalized so it is
+  reflection-invariant; **#1549**: the ALR tangent coordinates are whitened by
+  `G^{1/2}` so the smoothing penalty is Aitchison-isometric; **#1545**: the sphere
+  Fréchet-mean Karcher descent is seeded from the full eigenbasis so the
+  least-dominant axis is covered.
+- **#1074**: `projected_gradient_norm` sign is corrected so a railed-but-descending
+  ρ is not certified stationary.
+
+**Python bridge & wheel**
+- **#1565**: the `smooths={}` descriptor bridge is repaired (`slots=True`
+  `super().__init__` across all sites; `double_penalty=False` is emitted).
+- **#1559**: the `gam-pyffi` wheel build no longer fails on an `E0382` partial move
+  (`log_lambda_smooth` is cloned instead of moved out of a still-borrowed ρ).
+- **#1558**: the CUDA-unavailable diagnostic consumes `need_logdet` on every target.
+
+**Build system (#1521) & release hygiene**
+- The `gam` engine is split into foundation crates (`gam-math`, `gam-runtime`,
+  `gam-data`, `gam-spec`, `gam-linalg`, `gam-problem`) plus the upper leaves
+  (`gam-predict`, `gam-inference`, `gam-cli`), cutting per-change recompile from
+  the full 653-file monolith to a sub-crate + facade. The families↔solver↔terms
+  SCC stays in `gam`; its decomposition is tracked as separate contract-inversion
+  work.
+- Restored `cargo check --workspace --all-targets` to green: the `sae` and
+  `perf_scale` integration-test targets had regressed against the post-split
+  `gam::resource` module path and the per-atom `SaeManifoldRho` API. Removed the
+  orphaned, unwired `gam-problem` `penalty_matrix.rs` staging file and the
+  leftover split-WIP scratch notes from the tree.
+
 ## v0.3.123 — gam 0.3.123 / gamfit 0.1.225 (2026-06-24)
 
 crates.io + PyPI release of the open-issue fix wave landed since gam 0.3.122 /
