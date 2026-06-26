@@ -369,26 +369,38 @@ struct SampleConfigPayload {
     seed: u64,
 }
 
+// Every f64-bearing field below routes through `finite_safe_json` so that the
+// non-finite values a survival surface can legitimately carry (`+∞` cumulative
+// hazard / hazard in a saturated tail, or a genuine `NaN` worth surfacing for
+// debugging) survive the JSON round-trip instead of degrading to a bare `null`
+// that the typed deserializer then rejects (#1564). The serialize and
+// deserialize structs use the SAME adapters, so the wire format is symmetric.
 #[derive(Serialize)]
 struct SurvivalPredictionPayload {
     class: &'static str,
     model_class: String,
     likelihood_mode: String,
+    #[serde(with = "crate::finite_safe_json::vec")]
     times: Vec<f64>,
+    #[serde(with = "crate::finite_safe_json::matrix")]
     hazard: Vec<Vec<f64>>,
+    #[serde(with = "crate::finite_safe_json::matrix")]
     survival: Vec<Vec<f64>>,
+    #[serde(with = "crate::finite_safe_json::matrix")]
     cumulative_hazard: Vec<Vec<f64>>,
+    #[serde(with = "crate::finite_safe_json::vec")]
     linear_predictor: Vec<f64>,
+    #[serde(with = "crate::finite_safe_json::map")]
     columns: BTreeMap<String, Vec<f64>>,
     /// Delta-method standard errors on the survival surface, when the
     /// caller requested uncertainty via `interval=...`.  Same shape as
     /// `survival`.  `None` otherwise.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", with = "crate::finite_safe_json::opt_matrix")]
     survival_se: Option<Vec<Vec<f64>>>,
     /// Delta-method SE on the linear predictor at each row's own exit
     /// time, when uncertainty was requested.  Length equals
     /// `linear_predictor.len()`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none", with = "crate::finite_safe_json::opt_vec")]
     eta_se: Option<Vec<f64>>,
 }
 
@@ -396,13 +408,21 @@ struct SurvivalPredictionPayload {
 struct SurvivalPredictionJsonPayload {
     class: String,
     model_class: Option<String>,
+    #[serde(default, with = "crate::finite_safe_json::opt_vec")]
     times: Option<Vec<f64>>,
+    #[serde(default, with = "crate::finite_safe_json::opt_matrix")]
     hazard: Option<Vec<Vec<f64>>>,
+    #[serde(default, with = "crate::finite_safe_json::opt_matrix")]
     survival: Option<Vec<Vec<f64>>>,
+    #[serde(default, with = "crate::finite_safe_json::opt_matrix")]
     cumulative_hazard: Option<Vec<Vec<f64>>>,
+    #[serde(default, with = "crate::finite_safe_json::opt_vec")]
     linear_predictor: Option<Vec<f64>>,
+    #[serde(default, with = "crate::finite_safe_json::opt_map")]
     columns: Option<BTreeMap<String, Vec<f64>>>,
+    #[serde(default, with = "crate::finite_safe_json::opt_matrix")]
     survival_se: Option<Vec<Vec<f64>>>,
+    #[serde(default, with = "crate::finite_safe_json::opt_vec")]
     eta_se: Option<Vec<f64>>,
 }
 

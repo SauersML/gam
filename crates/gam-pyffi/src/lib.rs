@@ -42,6 +42,8 @@ mod summary_render;
 
 mod survival_surface_io;
 
+mod finite_safe_json;
+
 include!("model_ffi.rs");
 include!("latent_basis_and_sae_ffi.rs");
 include!("reml_latent_fit_ffi.rs");

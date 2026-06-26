@@ -2016,7 +2016,21 @@ fn royston_parmar_survival_hazard_components(
     eta: f64,
     eta_derivative: f64,
 ) -> Result<(f64, f64), SurvivalPredictError> {
-    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative > 0.0) {
+    // `eta = log Λ(t)`; `eta_derivative = dΛ/dt / Λ · Λ = h(t)`-chain, i.e. the
+    // time-derivative `d(log Λ)/dt`. Reject only the true bug signals: a
+    // non-finite `eta`, and a derivative that is NaN or genuinely negative.
+    //
+    // `eta_derivative == 0` is a VALID boundary value, not a failure. The RP
+    // baseline `log Λ(t)` is an I-spline (monotone non-decreasing cumulative
+    // hazard): beyond its last interior knot every I-spline basis is flat, so
+    // its time-derivative is exactly 0 and the instantaneous hazard there is 0
+    // (`S(t)` locally constant). Any RP model predicted on a grid that extends
+    // past its training support hits this regime on the tail nodes. The earlier
+    // strict `> 0.0` gate spuriously failed those predictions (#1564). The
+    // probit / marginal-slope sibling guard
+    // (`probit_survival_hazard_components`) already accepts the full `[0, ∞)`
+    // range and maps a zero derivative to a zero hazard; the RP guard must match.
+    if !(eta.is_finite() && eta_derivative.is_finite() && eta_derivative >= 0.0) {
         return Err(SurvivalPredictError::NumericalFailure {
             reason: format!(
                 "saved Royston-Parmar survival prediction produced invalid log-cumulative-hazard derivative: eta={eta}, eta_t={eta_derivative}"
@@ -2024,7 +2038,16 @@ fn royston_parmar_survival_hazard_components(
         });
     }
     let cumulative_hazard = eta.exp();
-    let hazard = cumulative_hazard * eta_derivative;
+    // `h(t) = Λ(t) · d(log Λ)/dt`. Compute the zero-derivative boundary FIRST so
+    // the `Λ = +∞` (saturated tail, `eta >~ 709.78`) × `0` (flat I-spline)
+    // indeterminate form resolves to the mathematically correct `0`, not the
+    // `NaN` that `f64::INFINITY * 0.0` produces. A flat cumulative hazard has
+    // zero instantaneous hazard regardless of its (possibly saturated) level.
+    let hazard = if eta_derivative == 0.0 {
+        0.0
+    } else {
+        cumulative_hazard * eta_derivative
+    };
     // Royston-Parmar parameterizes `eta = log Lambda(t)`, so `Lambda = exp(eta)`
     // is unbounded above and `exp(eta)` saturates to `+∞` in f64 once
     // `eta >~ 709.78` — exactly the regime a saturated RP fit produces in the
@@ -3513,13 +3536,52 @@ mod tests {
     }
 
     #[test]
-    fn royston_parmar_hazard_rejects_nonpositive_log_hazard_derivative() {
-        let err = royston_parmar_survival_hazard_components(0.0, 0.0)
-            .expect_err("zero derivative should be invalid");
+    fn royston_parmar_hazard_rejects_negative_log_hazard_derivative() {
+        // A negative time-derivative of log Λ(t) means a *decreasing* cumulative
+        // hazard — not a valid survival model. Only the genuinely-negative slope
+        // is rejected; the zero boundary is valid (see the sibling test below).
+        let err = royston_parmar_survival_hazard_components(0.0, -0.5)
+            .expect_err("negative derivative should be invalid");
         assert!(
             err.to_string()
                 .contains("invalid log-cumulative-hazard derivative")
         );
+    }
+
+    #[test]
+    fn royston_parmar_hazard_accepts_zero_derivative_as_flat_boundary() {
+        // #1564: a monotone I-spline cumulative hazard is flat beyond its last
+        // interior knot, so `d(log Λ)/dt == 0` exactly on any grid node past the
+        // training support. That is a *valid* prediction (zero instantaneous
+        // hazard, locally constant survival), not a numerical failure. The old
+        // strict `> 0.0` gate rejected it and crashed saved-model RP predict.
+        let eta = 1.9909019457445971_f64; // the exact η from the #1564 report
+        let (cum, hazard) = royston_parmar_survival_hazard_components(eta, 0.0)
+            .expect("zero derivative is a valid flat boundary, not an error");
+        assert!((cum - eta.exp()).abs() <= 1e-12, "cum = Λ(t) = exp(η)");
+        assert_eq!(hazard, 0.0, "flat cumulative hazard ⇒ zero instantaneous hazard");
+        // Survival is finite and well-defined at the boundary.
+        let survival = (-cum).exp().clamp(0.0, 1.0);
+        assert!(survival.is_finite() && (0.0..=1.0).contains(&survival));
+    }
+
+    #[test]
+    fn royston_parmar_hazard_zero_derivative_in_saturated_tail_is_zero_not_nan() {
+        // The dangerous corner: a saturated tail (η large ⇒ Λ = exp(η) = +∞) that
+        // also lands past the I-spline support (derivative == 0). The naive
+        // product `+∞ * 0.0` is `NaN`, which would (a) trip the components guard
+        // and (b) serialize to JSON `null` and break the Python parse (#1564,
+        // bug 1). The hazard must resolve to the mathematically correct `0`.
+        let eta = 1000.0_f64;
+        assert!(eta.exp().is_infinite(), "test premise: exp(1000) overflows to +∞");
+        assert!(
+            (f64::INFINITY * 0.0).is_nan(),
+            "test premise: the naive product is NaN"
+        );
+        let (cum, hazard) = royston_parmar_survival_hazard_components(eta, 0.0)
+            .expect("saturated + flat boundary must be valid");
+        assert!(cum.is_infinite() && cum > 0.0, "cum saturates to +∞");
+        assert_eq!(hazard, 0.0, "hazard at a flat boundary is 0, never NaN");
     }
 
     #[test]
