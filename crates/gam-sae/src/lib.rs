@@ -8,6 +8,7 @@ pub mod chart_canonicalization;
 pub mod corpus;
 pub mod criterion_atoms;
 pub mod encode;
+pub mod gpu_kernels;
 pub mod frames;
 pub mod hybrid_split;
 pub mod identifiability;
@@ -15,3 +16,10 @@ pub mod k_selection;
 pub mod manifold;
 pub mod row_jet_program;
 pub mod sparse_dict;
+
+// The pre-split engine referenced GPU infrastructure as `crate::gpu::*`; after
+// the #1521 split that code lives in the `gam-gpu` crate. Alias it back so the
+// `crate::gpu::{device_runtime, pool, linalg_dispatch, ...}` call sites in
+// `manifold/` and `gpu_kernels/` resolve unchanged (same shim the top-level
+// `gam` crate uses).
+pub use gam_gpu as gpu;

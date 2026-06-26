@@ -6,6 +6,7 @@ rust-version = "1.93"
 
 [dependencies]
 faer = "0.24.0"
+gam-gpu = { path = "../gam-gpu", version = "=0.3.124" }
 gam-linalg = { path = "../gam-linalg", version = "=0.3.124" }
 gam-math = { path = "../gam-math", version = "=0.3.124" }
 gam-problem = { path = "../gam-problem", version = "=0.3.124" }
@@ -18,6 +19,9 @@ ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rand = "0.10.1"
 rayon = "1.12.0"
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }
 
 [dev-dependencies]
 approx = "0.5.1"

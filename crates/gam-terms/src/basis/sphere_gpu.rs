@@ -157,7 +157,7 @@ impl DeviceS2KernelMatrix {
     pub fn copy_to_host_col_major(&self, dst: &mut [f64]) -> Result<(), GpuError> {
         let needed = self.ld * self.cols;
         if dst.len() != needed {
-            crate::gpu_bail!(
+            gam_gpu::gpu_bail!(
                 "DeviceS2KernelMatrix::copy_to_host_col_major: dst.len()={} expected {}",
                 dst.len(),
                 needed
@@ -176,7 +176,7 @@ impl DeviceS2KernelMatrix {
     pub fn copy_to_host_col_major(&self, dst: &mut [f64]) -> Result<(), GpuError> {
         let needed = self.ld * self.cols;
         if dst.len() != needed {
-            crate::gpu_bail!(
+            gam_gpu::gpu_bail!(
                 "DeviceS2KernelMatrix::copy_to_host_col_major: dst.len()={} expected {}",
                 dst.len(),
                 needed
@@ -217,21 +217,21 @@ impl<'a> S2KernelBuildInputs<'a> {
             });
         }
         if self.data_xyz.len() != 3 * self.n {
-            crate::gpu_bail!(
+            gam_gpu::gpu_bail!(
                 "S2KernelBuildInputs: data_xyz.len()={} != 3*n={}",
                 self.data_xyz.len(),
                 3 * self.n
             );
         }
         if self.centers_xyz.len() != 3 * self.m {
-            crate::gpu_bail!(
+            gam_gpu::gpu_bail!(
                 "S2KernelBuildInputs: centers_xyz.len()={} != 3*m={}",
                 self.centers_xyz.len(),
                 3 * self.m
             );
         }
         if self.coeffs.len() != self.lmax + 1 {
-            crate::gpu_bail!(
+            gam_gpu::gpu_bail!(
                 "S2KernelBuildInputs: coeffs.len()={} != lmax+1={}",
                 self.coeffs.len(),
                 self.lmax + 1
@@ -590,9 +590,9 @@ pub fn build_kernel_matrix_device(
             shared_mem_bytes: 0,
         };
         let n_i32: i32 =
-            i32::try_from(n).map_err(|_| crate::gpu_err!("sphere n={n} overflows i32"))?;
+            i32::try_from(n).map_err(|_| gam_gpu::gpu_err!("sphere n={n} overflows i32"))?;
         let m_i32: i32 =
-            i32::try_from(m).map_err(|_| crate::gpu_err!("sphere m={m} overflows i32"))?;
+            i32::try_from(m).map_err(|_| gam_gpu::gpu_err!("sphere m={m} overflows i32"))?;
         let ld_i64: i64 = ld as i64;
 
         let mut builder = stream.launch_builder(&func);
@@ -640,20 +640,20 @@ pub fn build_householder_constrained_design_device(
 ) -> Result<DeviceS2KernelMatrix, GpuError> {
     inputs.validate()?;
     if v.len() != inputs.m {
-        crate::gpu_bail!(
+        gam_gpu::gpu_bail!(
             "build_householder_constrained_design_device: v.len()={} != m={}",
             v.len(),
             inputs.m
         );
     }
     if inputs.m < 2 {
-        crate::gpu_bail!(
+        gam_gpu::gpu_bail!(
             "build_householder_constrained_design_device: m must be >= 2 (got {})",
             inputs.m
         );
     }
     if !beta.is_finite() {
-        crate::gpu_bail!(
+        gam_gpu::gpu_bail!(
             "build_householder_constrained_design_device: beta must be finite (got {beta})"
         );
     }
@@ -705,9 +705,9 @@ pub fn build_householder_constrained_design_device(
             shared_mem_bytes: 0,
         };
         let n_i32: i32 =
-            i32::try_from(n).map_err(|_| crate::gpu_err!("sphere-hh n={n} overflows i32"))?;
+            i32::try_from(n).map_err(|_| gam_gpu::gpu_err!("sphere-hh n={n} overflows i32"))?;
         let m_i32: i32 =
-            i32::try_from(m).map_err(|_| crate::gpu_err!("sphere-hh m={m} overflows i32"))?;
+            i32::try_from(m).map_err(|_| gam_gpu::gpu_err!("sphere-hh m={m} overflows i32"))?;
         let ld_out_i64: i64 = ld_out as i64;
 
         let mut builder = stream.launch_builder(&func);
@@ -836,14 +836,14 @@ pub fn constrained_penalty_host(
 ) -> Result<Array2<f64>, GpuError> {
     let (m1, m2) = c.dim();
     if m1 != m2 {
-        crate::gpu_bail!("constrained_penalty_host: C must be square, got {m1}x{m2}");
+        gam_gpu::gpu_bail!("constrained_penalty_host: C must be square, got {m1}x{m2}");
     }
     let m = m1;
     if w.len() != m {
-        crate::gpu_bail!("constrained_penalty_host: w.len()={} != m={}", w.len(), m);
+        gam_gpu::gpu_bail!("constrained_penalty_host: w.len()={} != m={}", w.len(), m);
     }
     if m < 2 {
-        crate::gpu_bail!("constrained_penalty_host: m must be >= 2 (got {m})");
+        gam_gpu::gpu_bail!("constrained_penalty_host: m must be >= 2 (got {m})");
     }
     let (v, beta) = householder_reflector_from_weights(w);
 
@@ -936,10 +936,10 @@ pub fn solve_penalised_ls_device(
     let n = x_s_device.rows;
     let p = x_s_device.cols;
     if wy.len() != n {
-        crate::gpu_bail!("solve_penalised_ls_device: wy.len()={} != n={n}", wy.len());
+        gam_gpu::gpu_bail!("solve_penalised_ls_device: wy.len()={} != n={n}", wy.len());
     }
     if r_s.dim() != (p, p) {
-        crate::gpu_bail!(
+        gam_gpu::gpu_bail!(
             "solve_penalised_ls_device: r_s.dim()={:?} != ({p}, {p})",
             r_s.dim()
         );
@@ -986,9 +986,9 @@ pub fn solve_penalised_ls_device(
 
     let solver = DnHandle::new(stream.clone()).gpu_ctx("solve_penalised_ls_device DnHandle")?;
     let n_aug_i: i32 = i32::try_from(n_aug)
-        .map_err(|_| crate::gpu_err!("solve_penalised_ls_device: n_aug={n_aug} overflows i32"))?;
+        .map_err(|_| gam_gpu::gpu_err!("solve_penalised_ls_device: n_aug={n_aug} overflows i32"))?;
     let p_i: i32 = i32::try_from(p)
-        .map_err(|_| crate::gpu_err!("solve_penalised_ls_device: p={p} overflows i32"))?;
+        .map_err(|_| gam_gpu::gpu_err!("solve_penalised_ls_device: p={p} overflows i32"))?;
 
     // 2) Workspace size for geqrf.
     let mut lwork: i32 = 0;
@@ -1007,11 +1007,11 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            crate::gpu_bail!("cusolverDnDgeqrf_bufferSize status={status:?}");
+            gam_gpu::gpu_bail!("cusolverDnDgeqrf_bufferSize status={status:?}");
         }
     }
     let lwork_us = usize::try_from(lwork)
-        .map_err(|_| crate::gpu_err!("solve_penalised_ls_device: negative lwork={lwork}"))?;
+        .map_err(|_| gam_gpu::gpu_err!("solve_penalised_ls_device: negative lwork={lwork}"))?;
     let mut workspace = stream
         .alloc_zeros::<f64>(lwork_us.max(1))
         .gpu_ctx("solve_penalised_ls_device alloc workspace")?;
@@ -1044,7 +1044,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            crate::gpu_bail!("cusolverDnDgeqrf status={status:?}");
+            gam_gpu::gpu_bail!("cusolverDnDgeqrf status={status:?}");
         }
     }
 
@@ -1073,7 +1073,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            crate::gpu_bail!("cusolverDnDormqr_bufferSize status={status:?}");
+            gam_gpu::gpu_bail!("cusolverDnDormqr_bufferSize status={status:?}");
         }
     }
     if ormqr_lwork > lwork {
@@ -1109,7 +1109,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cusolver_sys::cusolverStatus_t::CUSOLVER_STATUS_SUCCESS {
-            crate::gpu_bail!("cusolverDnDormqr status={status:?}");
+            gam_gpu::gpu_bail!("cusolverDnDormqr status={status:?}");
         }
     }
 
@@ -1143,7 +1143,7 @@ pub fn solve_penalised_ls_device(
             )
         };
         if status != cudarc::cublas::sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-            crate::gpu_bail!("cublasDtrsm_v2 status={status:?}");
+            gam_gpu::gpu_bail!("cublasDtrsm_v2 status={status:?}");
         }
     }
 

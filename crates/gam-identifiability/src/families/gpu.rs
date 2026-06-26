@@ -80,8 +80,8 @@ pub fn try_primary_state_gram_cuda(
 #[cfg(target_os = "linux")]
 mod cuda_impl {
     use super::{CHANNELS, GramBundle, PACKED_LEN, packed_index};
-    use crate::gpu::device_runtime::{GpuRuntime, cuda_context_for};
-    use crate::gpu::driver::{to_col_major, to_i32};
+    use gam_gpu::device_runtime::{GpuRuntime, cuda_context_for};
+    use gam_gpu::driver::{to_col_major, to_i32};
     use cudarc::cublas::sys::{cublasOperation_t, cublasSideMode_t, cublasStatus_t};
     use cudarc::cublas::{CudaBlas, Gemm, GemmConfig};
     use cudarc::driver::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
@@ -93,8 +93,8 @@ mod cuda_impl {
     /// Process-wide PTX cache for the fused primary-state Gram kernel.
     /// NVRTC-compiled on the first `compute_grams_fused` call that
     /// reaches a CUDA context; reused on every subsequent call.
-    pub(super) static FUSED_GRAM_PTX_CACHE: crate::gpu::device_cache::PtxModuleCache =
-        crate::gpu::device_cache::PtxModuleCache::new();
+    pub(super) static FUSED_GRAM_PTX_CACHE: gam_gpu::device_cache::PtxModuleCache =
+        gam_gpu::device_cache::PtxModuleCache::new();
 
     /// Device-resident cache of channel-block designs plus a reusable
     /// row-scale scratch buffer. Built once per identifiability compile;
@@ -751,7 +751,7 @@ mod tests {
         }
         #[cfg(target_os = "linux")]
         {
-            if crate::gpu::device_runtime::GpuRuntime::global().is_none() {
+            if gam_gpu::device_runtime::GpuRuntime::global().is_none() {
                 eprintln!("[identifiability_compile] no CUDA runtime — skipping parity check");
                 return;
             }
