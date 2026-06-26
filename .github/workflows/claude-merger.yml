@@ -76,7 +76,7 @@ jobs:
         id: claude
         uses: anthropics/claude-code-action@v1
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_KEY }}
           PYPI_API_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
