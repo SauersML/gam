@@ -29,8 +29,10 @@ pub use hmc_io as hmc;
 pub use gam_terms::inference::lawley;
 pub use gam_sae::inference::layer_transport;
 pub mod model_comparison;
-pub mod pg_gate_evidence;
-pub mod pg_moments;
+// #1521: pg_gate_evidence/pg_moments descended into gam-solve (reached downward
+// by gam_sae::structure_harvest); re-exported here so `gam::inference::{
+// pg_gate_evidence, pg_moments}` resolves unchanged.
+pub use gam_solve::inference::{pg_gate_evidence, pg_moments};
 pub mod gpu_polya_gamma;
 pub mod polya_gamma;
 pub mod polya_gamma_core;

@@ -96,6 +96,21 @@ pub fn init_parallelism() {
         gam_linalg::gpu_hook::register_gpu_dispatch(Box::new(
             crate::gpu::linalg_dispatch::CudaGemmDispatch,
         ));
+        // #1521 trait-inversion injection: the gam-inference-tier samplers
+        // (`hmc_io` NUTS / importance sampling) implement the neutral
+        // `gam_problem` contracts; register the monolith impls DOWN into the
+        // process-level registries so gam-solve's REML/custom-family paths can
+        // call THROUGH them without a back-edge into the inference SCC. First
+        // writer wins; ignore the boxed-value `Err` of a redundant re-init.
+        let _ = gam_problem::laplace_sampler_contract::set_laplace_marginal_sampler(Box::new(
+            crate::inference::hmc_io::HmcIoLaplaceMarginalSampler,
+        ));
+        let _ = gam_problem::laplace_sampler_contract::set_gaussian_mode_posterior_sampler(
+            Box::new(crate::inference::hmc_io::HmcIoGaussianModePosteriorSampler),
+        );
+        let _ = gam_problem::rho_posterior::set_rho_posterior_escalator(Box::new(
+            crate::inference::rho_posterior::HmcIoRhoPosteriorEscalator,
+        ));
         // Ignore the error returned when the global pool was already built by
         // an earlier caller: we cannot resize an existing pool, and the only
         // path that strictly needs the wide stack (the CLI) reaches this first.

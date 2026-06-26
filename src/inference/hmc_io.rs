@@ -4940,33 +4940,6 @@ impl HamiltonianTarget<Array1<f64>> for GaussianModeTarget {
     }
 }
 
-/// Summary of a never-fail Gaussian-posterior fallback draw.
-///
-/// Returned by [`sample_gaussian_mode_posterior`]. Carries the same kind of
-/// posterior summary the optimizer cascade would have produced on success: a
-/// finite mode, per-coordinate posterior SEs, and the raw draws (so callers can
-/// form calibrated intervals for any derived quantity). The `rhat`/`ess`
-/// fields report the sampling diagnostics. The target is exactly Gaussian, so a
-/// well-mixed chain is an honest summary — but the seed precision can be a
-/// Jeffreys-augmented Hessian at a NON-converged mode, where a divergent
-/// (`rhat ≫ 1`) / near-zero-`ess` chain would otherwise produce a finite, narrow
-/// interval around an arbitrary point on an unidentified direction. Callers MUST
-/// therefore gate on `rhat`/`ess` before treating the sampled covariance as
-/// data-driven (see `fit_custom_family`, which checks `rhat ≤ 1.05` and an
-/// ESS floor and inflates / flags the result as low-confidence otherwise).
-pub struct GaussianModePosterior {
-    /// Coefficient draws in original (un-whitened) space: `(n_draws, dim)`.
-    pub samples: Array2<f64>,
-    /// Posterior mean (≈ the seeded mode for a Gaussian target).
-    pub posterior_mean: Array1<f64>,
-    /// Per-coordinate posterior standard deviation (honest SEs).
-    pub posterior_std: Array1<f64>,
-    /// Split-chain R̂ mixing diagnostic.
-    pub rhat: f64,
-    /// Effective sample size.
-    pub ess: f64,
-}
-
 /// Sample the proper Gaussian posterior `N(mode, H⁻¹)` defined by a mode and a
 /// (penalized, Jeffreys-augmented) SPD precision `hessian`.
 ///
@@ -6453,334 +6426,65 @@ fn cubic_power_iteration_refinement(
     best
 }
 
-/// Per-direction adaptive Laplace-trustworthiness verdict for the inner
-/// marginalization loop (issue #784).
-///
-/// The Laplace approximation to the coefficient marginal likelihood replaces
-/// the local log-posterior `F(β) = −ℓ(β) + ½βᵀS(ρ)β` by its second-order
-/// Taylor expansion at the mode β̂.  In a whitened Hessian eigendirection
-/// `v_r` (curvature `λ_r`) the leading correction to that Gaussian summary is
-/// governed by the standardized third cumulant
-///   γ_r = T₃[v_r,v_r,v_r] / λ_r^{3/2},  T₃[a,b,c] = Σ_i c_i x_{ia} x_{ib} x_{ic}
-/// (`c_i = ∂W_i/∂η_i`, the same per-row weight the unified Hessian uses).  The
-/// Edgeworth/Tierney–Kadane expansion of the marginal integral contributes a
-/// *relative* correction `(5/24) γ_r²` from this direction; the Laplace floor
-/// error is `O(1/n)`.  A direction is therefore "Laplace-trustworthy" exactly
-/// when its skewness contribution sits at or below that floor.
-///
-/// This is the missing adaptive, block-local primitive #784 calls for: instead
-/// of an all-or-nothing Laplace-vs-sampling switch, each curvature direction is
-/// judged on its own, so the cheap Gaussian summary is kept where it holds and
-/// the higher-order correction (and, ultimately, directional sampling) is spent
-/// only on the curvature-heavy directions where it fails.
-#[derive(Clone, Debug)]
-pub struct LaplaceTrustworthiness {
-    /// Per-eigendirection standardized skewness `γ_r` (aligned with the
-    /// `directional` output of [`laplace_directional_cubic_diagnostic`]).
-    pub directional_skewness: Array1<f64>,
-    /// Indices of the directions whose skewness exceeds the auto-derived
-    /// validity threshold (the curvature-heavy, non-Gaussian block).
-    pub untrustworthy_directions: Vec<usize>,
-    /// The auto-derived per-direction skewness threshold `τ(n)` actually used.
-    pub threshold: f64,
-    /// `max_r |γ_r|` across all directions (the global non-Gaussianity scale).
-    pub max_abs_skewness: f64,
-}
+// ───────────────── #1521 laplace-sampler contract re-exports ─────────────────
+//
+// The neutral DATA carriers + the caller-supplied [`BlockExcessTarget`]
+// evaluator + the pure threshold math were contract-downed to the neutral
+// `gam-problem` crate (#1521) so gam-solve (whose `Gam784BlockTarget`
+// IMPLEMENTS `BlockExcessTarget`) and this gam-inference-tier sampler share one
+// set of types without an SCC edge. The COMPUTATION (NUTS, importance sampling,
+// the directional-cubic eigen diagnostic) stays UP in this module and
+// constructs these types under their original names via this re-export.
+pub use gam_problem::laplace_sampler_contract::{
+    BlockExcessTarget, BlockSampledMarginal, BlockSampledMoments, GaussianModePosterior,
+    LaplaceTrustworthiness, laplace_skewness_threshold, laplace_trustworthiness_from_skewness,
+};
 
-impl LaplaceTrustworthiness {
-    /// Whether any curvature direction is too non-Gaussian for the plain
-    /// Laplace summary, i.e. whether the adaptive higher-order correction /
-    /// directional sampling fallback should engage at all.
-    pub fn fallback_required(&self) -> bool {
-        !self.untrustworthy_directions.is_empty()
-    }
-}
+/// Monolith (gam-inference-tier) implementor of the contract-downed
+/// [`LaplaceMarginalSampler`](gam_problem::laplace_sampler_contract::LaplaceMarginalSampler):
+/// wraps the `hmc_io` directional-cubic eigen diagnostic and the
+/// importance-sampled #784 block correction. Registered at process init via
+/// `gam_problem::laplace_sampler_contract::set_laplace_marginal_sampler`.
+pub struct HmcIoLaplaceMarginalSampler;
 
-/// Auto-derive the per-direction skewness threshold `τ(n)` separating
-/// Laplace-trustworthy directions from those that need the higher-order
-/// correction / sampling fallback.  MAGIC: derived purely from problem
-/// characteristics (the effective sample size), with no tunable flag.
-///
-/// Derivation.  The standardized third cumulant of a well-specified GLM mode
-/// scales as `γ_r = O(n^{-1/2})`, so the Laplace skewness term `(5/24) γ_r²`
-/// is `O(1/n)` — the same order as the Laplace floor error that is always
-/// present and uncorrectable at this expansion order.  We declare a direction
-/// untrustworthy once its skewness term provably dominates that floor, i.e.
-///   (5/24) γ_r² > 1 / n_eff   ⇔   |γ_r| > sqrt( (24/5) / n_eff ).
-/// `n_eff` is the effective sample size carried by the curvature in that block
-/// (passed in by the caller as the trace-equivalent count); using the local
-/// count rather than the global `n` is what makes the verdict block-local.
-pub fn laplace_skewness_threshold(n_eff: f64) -> f64 {
-    // Guard a degenerate / empty effective count: with no curvature support
-    // there is nothing the Gaussian summary can be wrong about, so demand an
-    // unreachable skewness (treat every direction as trustworthy).
-    if !(n_eff > 0.0) {
-        return f64::INFINITY;
-    }
-    ((24.0 / 5.0) / n_eff).sqrt()
-}
-
-/// Adaptive, block-local Laplace-trustworthiness verdict (issue #784).
-///
-/// Given the per-direction standardized skewness `directional_skewness`
-/// (as produced by [`laplace_directional_cubic_diagnostic`]) and the effective
-/// sample size `n_eff` supporting the local curvature, flags exactly the
-/// directions whose skewness exceeds the auto-derived threshold
-/// [`laplace_skewness_threshold`].  Those flagged directions are the
-/// curvature-heavy block that the inner loop should hand to the higher-order
-/// correction / directional sampler instead of summarizing with plain Laplace.
-///
-/// This function performs no linear algebra of its own — it consumes the cubic
-/// diagnostic that already exists and converts it into an actionable, local
-/// activation set, which is precisely the seam the inner marginalization loop
-/// was missing.
-pub fn laplace_trustworthiness_from_skewness(
-    directional_skewness: &Array1<f64>,
-    n_eff: f64,
-) -> LaplaceTrustworthiness {
-    let threshold = laplace_skewness_threshold(n_eff);
-    let mut untrustworthy_directions = Vec::new();
-    let mut max_abs_skewness = 0.0_f64;
-    for (r, &gamma) in directional_skewness.iter().enumerate() {
-        let abs_gamma = if gamma.is_finite() { gamma.abs() } else { 0.0 };
-        max_abs_skewness = max_abs_skewness.max(abs_gamma);
-        if abs_gamma > threshold {
-            untrustworthy_directions.push(r);
-        }
-    }
-    LaplaceTrustworthiness {
-        directional_skewness: directional_skewness.clone(),
-        untrustworthy_directions,
-        threshold,
-        max_abs_skewness,
-    }
-}
-
-/// Caller-supplied evaluator for the *non-Gaussian remainder* of the local
-/// log-posterior, restricted to the curvature-heavy block subspace (issue
-/// #784).
-///
-/// The inner marginalization summarizes the coefficient posterior by its
-/// Laplace (Gaussian) moments.  In the curvature-heavy block this Gaussian
-/// summary is wrong; the exact summary is the integral of the true target.
-/// Writing the block displacement as `β = β̂ + V_b t` (with `V_b` the
-/// untrustworthy H-eigenvectors and `λ_r` their curvatures), the only thing
-/// the sampler needs from the family + penalty is the **excess over the local
-/// Gaussian**:
-///
-///   ΔF(t) = [F(β̂ + V_b t) − F(β̂)] − ½ Σ_r λ_r t_r²
-///   F(β)  = −ℓ(β) + ½ βᵀ S(ρ) β.
-///
-/// `ΔF` is identically zero for a purely Gaussian (quadratic) `F`, so it
-/// isolates exactly the cubic-and-higher non-Gaussianity that defeats Laplace.
-/// `rho_gradient` returns `∂ΔF/∂ρ_k` at the same `t`, which lets the marginal
-/// correction expose a ρ-gradient consistent with its own value (Fisher's
-/// identity over the same draws) — required so the outer REML/LAML stays
-/// consistent and smoothing selection is not biased.
-pub trait BlockExcessTarget {
-    /// Dimension `m` of the block subspace (number of untrustworthy
-    /// directions being sampled).
-    fn block_dim(&self) -> usize;
-    /// Number of outer ρ coordinates the gradient is reported against.
-    fn rho_dim(&self) -> usize;
-    /// Block curvatures `λ_r` (the H-eigenvalues of the sampled directions),
-    /// length `block_dim()`.
-    fn block_curvatures(&self) -> &Array1<f64>;
-    /// Non-Gaussian remainder `ΔF(t)` at whitened block displacement `t`
-    /// (length `block_dim()`).
-    fn excess(&self, t: &Array1<f64>) -> f64;
-    /// ρ-gradient `∂ΔF/∂ρ_k` at the same `t`, length `rho_dim()` — the
-    /// explicit penalty-score channel (a) of the gradient exactness contract
-    /// on [`block_sampled_marginal_correction`].
-    fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64>;
-    /// Per-row displaced score `∂(D(η̂+s(t))/2φ)/∂η` evaluated at `η̂ + s(t)`
-    /// (length = number of observation rows). This is the only per-draw
-    /// ingredient of the exact-gradient channels (b)–(d) that the assembly
-    /// side cannot reconstruct from fixed fields: everything else (`X V_b`,
-    /// penalty scores, `W`, `c`, the H-eigenpairs) is draw-independent and
-    /// contracts against the moments in [`BlockSampledMoments`].
-    fn displaced_neg_score(&self, t: &Array1<f64>) -> Array1<f64>;
-    /// The same per-row score channel at the undisplaced mode `η̂`.
-    fn base_neg_score(&self) -> Array1<f64>;
-
-    /// Fused `(excess(t), displaced_neg_score(t))` for a single `t`.
-    ///
-    /// The importance sampler needs BOTH the excess (for the weight) and the
-    /// displaced per-row score (for the (b)–(d) moment channels) at every
-    /// feasible draw. Both are functions of the SAME displacement `s = X_t·δ`
-    /// and the SAME per-row inverse-link jet at `η̂ + s`; computing them
-    /// separately repeats the O(n·p) design matvec and the O(n) jet sweep. The
-    /// returned score is `None` exactly when the excess is non-finite (an
-    /// infeasible draw the sampler discards before reading the score). The
-    /// default impl preserves the two-call behavior; implementors override to
-    /// share the displacement + jet across both channels.
-    fn excess_with_displaced_neg_score(&self, t: &Array1<f64>) -> (f64, Option<Array1<f64>>) {
-        let excess = self.excess(t);
-        if excess.is_finite() {
-            (excess, Some(self.displaced_neg_score(t)))
-        } else {
-            (excess, None)
-        }
-    }
-
-    /// Batched [`Self::excess_with_displaced_neg_score`] over many whitened
-    /// draws at once.
-    ///
-    /// `draws` holds one draw per COLUMN (shape `block_dim() × n_draws`); the
-    /// returned vector has one `(excess, Option<displaced_neg_score>)` entry per
-    /// column, in column order, EXACTLY matching a per-column call to
-    /// [`Self::excess_with_displaced_neg_score`]. The only thing batching is
-    /// allowed to change is HOW the shared linear algebra is computed (a single
-    /// BLAS-3 matrix–matrix product over all columns instead of `n_draws`
-    /// separate matrix–vector products), never WHAT is computed: the per-draw
-    /// excess, feasibility verdict, and per-row score must be the same values
-    /// the serial path produces (to floating-point reassociation tolerance).
-    ///
-    /// The default impl preserves the per-column behavior exactly; the GLM
-    /// implementor overrides it to share the `X · V_b` and `X · Δ` products
-    /// across all draws (#784 hot path, #1082).
-    fn excess_with_displaced_neg_score_batch(
+impl gam_problem::laplace_sampler_contract::LaplaceMarginalSampler for HmcIoLaplaceMarginalSampler {
+    fn directional_cubic_diagnostic(
         &self,
-        draws: &Array2<f64>,
-    ) -> Vec<(f64, Option<Array1<f64>>)> {
-        let n_draws = draws.ncols();
-        let mut out = Vec::with_capacity(n_draws);
-        let mut t = Array1::<f64>::zeros(draws.nrows());
-        for s in 0..n_draws {
-            t.assign(&draws.column(s));
-            out.push(self.excess_with_displaced_neg_score(&t));
-        }
-        out
+        hessian: &Array2<f64>,
+        design: &DesignMatrix,
+        c_weights: &Array1<f64>,
+        refine_supremum: bool,
+    ) -> Result<(f64, Array1<f64>), String> {
+        laplace_directional_cubic_diagnostic(hessian, design, c_weights, refine_supremum)
+    }
+
+    fn block_sampled_marginal_correction(
+        &self,
+        target: &dyn BlockExcessTarget,
+    ) -> Result<BlockSampledMarginal, String> {
+        block_sampled_marginal_correction(target)
     }
 }
 
-/// Self-normalized importance-weighted moments of the per-draw gradient
-/// channels — the sampler-side half of the #784 exact-gradient seam (see the
-/// gradient exactness contract on [`block_sampled_marginal_correction`]).
-/// All expectations are under `p ∝ q·e^{−ΔF}` over the SAME fixed-seed draws
-/// that produced `value`, so the spliced value and its assembled gradient can
-/// never desync (#901 bug class).
-#[derive(Clone, Debug)]
-pub struct BlockSampledMoments {
-    /// `E_p[t]`, length `m`.
-    pub e_t: Array1<f64>,
-    /// `E_p[t tᵀ]`, shape `m × m`.
-    pub e_tt: Array2<f64>,
-    /// `E_p[ngs(η̂+s)]`, length n — the displaced per-row score moment.
-    pub e_neg_score: Array1<f64>,
-    /// Column `r` = `E_p[t_r · ngs(η̂+s)]`, shape `n × m`.
-    pub e_t_neg_score: Array2<f64>,
-}
+/// Monolith (gam-inference-tier) implementor of the contract-downed
+/// [`GaussianModePosteriorSampler`](gam_problem::laplace_sampler_contract::GaussianModePosteriorSampler):
+/// the never-fail Gaussian mode-posterior rung. Builds the NUTS config from the
+/// problem dimension internally (so `NutsConfig` never crosses the contract)
+/// and wraps `hmc_io::sample_gaussian_mode_posterior`. Registered at process
+/// init via `gam_problem::laplace_sampler_contract::set_gaussian_mode_posterior_sampler`.
+pub struct HmcIoGaussianModePosteriorSampler;
 
-/// Block-local sampled marginal correction (issue #784).
-///
-/// `value` is `Δ_b = A_exact − A_Lap`, the log-ratio of the true block free
-/// energy to its Laplace value, to be **added** to the marginal log-likelihood
-/// (equivalently **subtracted** from the REML/LAML cost).  `rho_gradient` is
-/// `∂Δ_b/∂ρ` restricted to the explicit penalty-score channel, computed from
-/// the same importance draws.  Both are exactly zero when the block is
-/// Gaussian.
-///
-/// ## Gradient exactness contract (#901 follow-up): the explicit channel is
-/// ## NOT the total derivative of the realized estimator
-///
-/// With a fixed-seed draw set `z_s`, the realized estimator is a
-/// deterministic function of θ = (ρ, ψ):
-///
-/// ```text
-///   Δ_b(θ) = log mean_s exp(−ΔF(t_s(θ); fields(θ))),   t_{s,r} = z_{s,r}/√λ_r(θ)
-/// ```
-///
-/// and a centered finite difference of the outer cost differentiates THIS
-/// function. Its exact derivative is the importance-weighted average of the
-/// TOTAL per-draw derivative, which has four channels:
-///
-/// ```text
-///   dΔF_s/dθ_j = (a) ∂ΔF/∂θ_j |_{t, fields}          explicit penalty score
-///              + (b) Σ_r (∂ΔF/∂t_r)(−½ t_{s,r}) d log λ_r/dθ_j   draw rescale
-///              + (c) Σ_r t_{s,r} (∂ΔF/∂δ)ᵀ dV_b[:,r]/dθ_j        frame rotation
-///              + (d) (∂ΔF/∂β̂-fields) · dβ̂/dθ_j                   mode motion
-/// ```
-///
-/// where `dλ_r/dθ_j = u_rᵀ Ḣ_j u_r` and `dV_b[:,r]/dθ_j = Σ_{q≠r} u_q
-/// (u_qᵀ Ḣ_j u_r)/(λ_r − λ_q)` are first-order eigenpair perturbations under
-/// the TOTAL Hessian drift `Ḣ_j = A_j + D_β H[v_j]`, and `v_j = dβ̂/dθ_j` is
-/// the IFT mode response. Channel (d) is NOT absorbed by the envelope
-/// theorem: the envelope argument kills `∂V/∂β̂ · dβ̂/dθ` only for the
-/// Laplace objective in which β̂ is stationary — `Δ_b` is an additional
-/// functional of β̂ (through η̂, the base deviance, the penalty scores, and
-/// W) with no stationarity of its own.
-///
-/// The sampler returns channel (a) in `rho_gradient` plus the moment set
-/// in [`BlockSampledMoments`]; the GLM runtime caller
-/// (`block_local_sampled_correction`) assembles channels (b)–(d) from those
-/// moments for every ρ coordinate, and DECLINES the splice when external
-/// (ψ) coordinates are present (their field-motion moments are not yet
-/// carried). Splicing a value whose gradient misses any channel is an
-/// objective↔gradient desync (the #752/#748/#808/#901 bug class): the outer
-/// optimizer would descend a surface that is not the one being evaluated.
-///
-/// The principled completion (deliberately NOT a partial sum of cheap
-/// channels — a half-exact gradient still desyncs): the sampler returns
-/// importance-weighted MOMENTS, and the OUTER gradient assembly — which
-/// already owns the total drift `Ḣ_j = A_j + D_β H[v_j]`, the IFT mode
-/// response `v_j`, and the spectral decomposition of `H` — contracts them
-/// per coordinate. The decisive reduction (this is what makes the exact
-/// gradient cheap) is that channels (b) and (c) collapse into ONE extra
-/// low-rank trace against the SAME `Ḣ_j` the logdet gradient already
-/// traces, and channel (d) into one dot product with the SAME `v_j`:
-///
-/// ```text
-///   sampler moments (self-normalized, same draws as the value):
-///     M_r  = E_p[ (∂ΔF/∂t_r) · (−½ t_r) ]               (m scalars)
-///     R_r  = E_p[ t_r · ∂ΔF/∂δ ]                        (m p-vectors)
-///     g_d  = E_p[ ∂ΔF/∂β̂ ]                              (one p-vector)
-///
-///   assembly-side fixed matrices (built once per evaluation):
-///     Q_b  = Σ_r (M_r / λ_r) · u_r u_rᵀ                  (rank m)
-///     Q_c  = sym( Σ_r Σ_{q≠r} u_q (R_rᵀ u_q)/(λ_r − λ_q) · u_rᵀ )
-///            (rank ≤ 2m; q ranges over ALL eigenpairs of H, so the
-///             frame-rotation channel is exact, not block-restricted)
-///
-///   then for EVERY outer coordinate θ_j:
-///     dΔ_b/dθ_j = −( explicit_j + tr(Ḣ_j · (Q_b + Q_c)) + v_jᵀ g_d )
-/// ```
-///
-/// `∂ΔF/∂t = V_bᵀ ∂ΔF/∂δ`; `∂ΔF/∂δ = Xᵀ score(η̂+s) + Σ_k λ_k S_k β̂ −
-/// XᵀW(Xδ)` costs one displaced-score pass per draw (the link jet is already
-/// evaluated for the value); `∂ΔF/∂β̂[v] = (score_disp − score_base)ᵀXv +
-/// Σ_k λ_k vᵀS_k δ − ½ Σ_i c_i (Xv)_i (Xδ)_i²`, whose E_p-moment is the
-/// p-vector `g_d = Xᵀ E_p[score_disp − score_base] + Σ_k λ_k S_k E_p[δ] −
-/// ½ Xᵀ(c ⊙ E_p[(Xδ)²])`. Because draws are pathwise (`t = z/√λ`, fixed z),
-/// there is NO density-score term: the q-Gaussian reparameterization is
-/// exactly the channels above. Eigenvalue near-degeneracies `λ_r ≈ λ_q`
-/// make `Q_c` blow up — those are genuine non-differentiability points of
-/// the eigenframe (same constant-stratum caveat as the pseudo-logdet rank);
-/// the correct response is to decline the splice there, not to clamp.
-///
-/// This keeps a single source of truth: the same `Ḣ_j` that drives the
-/// logdet trace drives the eigenpair perturbations here, so the two
-/// corrections cannot disagree about what "the direction θ_j" means — and
-/// the trace plumbing (`DriftDerivResult` dense/operator probing) is reused
-/// verbatim, with `Q_b + Q_c` probed as a rank-≤3m factor pair. Until that
-/// seam exists, treat an engaged #784 fallback as gradient-degrading and FD
-/// drivers that engage it as measuring channels (b)–(d), not Monte-Carlo
-/// noise.
-#[derive(Clone, Debug)]
-pub struct BlockSampledMarginal {
-    /// `Δ_b`: additive correction to the block marginal log-likelihood.
-    pub value: f64,
-    /// `∂Δ_b/∂ρ`, length `rho_dim()` — explicit channel (a) ONLY. The caller
-    /// owns the remaining channels (b)–(d), assembled from `moments`.
-    pub rho_gradient: Array1<f64>,
-    /// Importance-sampling effective sample size (draws), for diagnostics /
-    /// trust gating.
-    pub importance_ess: f64,
-    /// Number of draws used.
-    pub n_draws: usize,
-    /// Gradient-channel moments for the exact (b)–(d) assembly; `None` only
-    /// when the block is empty (`m == 0`, where the correction is zero).
-    pub moments: Option<BlockSampledMoments>,
+impl gam_problem::laplace_sampler_contract::GaussianModePosteriorSampler
+    for HmcIoGaussianModePosteriorSampler
+{
+    fn sample_gaussian_mode_posterior(
+        &self,
+        mode: ArrayView1<f64>,
+        precision: ArrayView2<f64>,
+    ) -> Result<GaussianModePosterior, String> {
+        let config = NutsConfig::for_dimension(mode.len());
+        sample_gaussian_mode_posterior(mode, precision, &config)
+    }
 }
 
 /// Auto-derive the number of importance draws for the block-local sampled
@@ -6822,7 +6526,7 @@ fn block_sampling_draws(block_dim: usize) -> usize {
 /// Determinism: draws come from a fixed-seed RNG so the inner evaluation is a
 /// pure function of `(β̂, H, ρ)` and the outer optimizer sees a smooth,
 /// reproducible objective rather than Monte-Carlo jitter across evaluations.
-pub fn block_sampled_marginal_correction<T: BlockExcessTarget>(
+pub fn block_sampled_marginal_correction<T: BlockExcessTarget + ?Sized>(
     target: &T,
 ) -> Result<BlockSampledMarginal, String> {
     use rand::SeedableRng;

@@ -579,13 +579,18 @@ impl<'a> RemlState<'a> {
     ) {
         // DATA types contract-downed to gam-problem (#1521); the certificate /
         // escalation COMPUTATION (`rho_posterior_certificate`,
-        // `escalate_rho_posterior`) still lives UP in the monolith
-        // `inference::rho_posterior` (it pulls the gam-inference `hmc_io` NUTS
-        // sampler). FLAG #1521: this remains an upward-compute back-edge — it
-        // must be resolved together with the `hmc_io` edge (trait-inversion of
-        // the Tier-2 sampler, or moving this seam UP).
+        // `escalate_rho_posterior`) lives UP in the monolith
+        // `inference::rho_posterior` (its Tier-2 NUTS pulls the gam-inference
+        // `hmc_io` sampler), so it is called DOWN here through the contract-down
+        // `gam_problem::rho_posterior` escalator registry (#1521 trait-inversion
+        // — the upward-compute back-edge is gone). When the sampler tier is not
+        // linked / not yet registered, decline the certificate AND escalation
+        // (`(None, None)`): intervals stay plug-in + first-order corrected, the
+        // existing decline outcome — a safe no-op.
         use gam_problem::rho_posterior::RhoCertificate;
-        use crate::inference::rho_posterior::{escalate_rho_posterior, rho_posterior_certificate};
+        let Some(escalator) = gam_problem::rho_posterior::rho_posterior_escalator() else {
+            return (None, None);
+        };
         if final_rho.is_empty() {
             return (None, None);
         }
@@ -606,20 +611,20 @@ impl<'a> RemlState<'a> {
         // the BASE REML Hessian — and its full per-evaluation ALO diagnostic
         // suite would otherwise dominate the thousands of leapfrog evaluations.
         let certificate = self.without_alo_stabilization(|| {
-            rho_posterior_certificate(
+            escalator.rho_posterior_certificate(
                 final_rho,
                 &outer_hessian,
-                |rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
+                &|rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
                 n_samples,
             )
         });
         let escalation = match certificate.as_ref().map(|c| c.certificate) {
             Some(RhoCertificate::Escalate) => self.without_alo_stabilization(|| {
-                Some(escalate_rho_posterior(
+                Some(escalator.escalate_rho_posterior(
                     final_rho,
                     &outer_hessian,
-                    |rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
-                    |rho| {
+                    &mut |rho| self.without_persistent_warm_start_store(|| self.compute_cost(rho).ok()),
+                    &mut |rho| {
                         self.without_persistent_warm_start_store(|| {
                             // NUTS leapfrog gradients need the criterion value and
                             // gradient at the same rho; compute them through one

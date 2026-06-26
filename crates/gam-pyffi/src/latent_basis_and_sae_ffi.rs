@@ -2787,7 +2787,7 @@ fn sae_manifold_fit_inner<'py>(
         let k_now = term.k_atoms().max(1);
         let births_per_round = (k_now + 1).min(4);
         let fissions_per_round = k_now.min(4);
-        let harvest_params = gam::solver::structure_harvest::HarvestParams {
+        let harvest_params = gam::terms::sae::structure_harvest::HarvestParams {
             max_fusions: 4,
             max_fissions: fissions_per_round,
             max_births: births_per_round,
@@ -2803,7 +2803,7 @@ fn sae_manifold_fit_inner<'py>(
         // to the full-iter inner optimum — only the gate's ranking reads the
         // capped score (#1026, verified move-equivalent on a tractable proxy).
         const STRUCTURE_SCORING_INNER_MAX_ITER: usize = 8;
-        let refit_params = gam::solver::structure_harvest::ProductionRefitParams {
+        let refit_params = gam::terms::sae::structure_harvest::ProductionRefitParams {
             inner_max_iter: max_iter,
             scoring_inner_max_iter: STRUCTURE_SCORING_INNER_MAX_ITER.min(max_iter),
             learning_rate,
@@ -2821,13 +2821,13 @@ fn sae_manifold_fit_inner<'py>(
             max_moves,
             alpha: 0.05,
         };
-        let config = gam::solver::structure_harvest::RoundDriverConfig {
+        let config = gam::terms::sae::structure_harvest::RoundDriverConfig {
             n_shards: 4,
             budget,
             max_rounds: structure_max_rounds,
             harvest_params,
         };
-        match gam::solver::structure_harvest::run_production_structure_search(
+        match gam::terms::sae::structure_harvest::run_production_structure_search(
             term,
             rho,
             z_view.view(),
@@ -2839,7 +2839,7 @@ fn sae_manifold_fit_inner<'py>(
                 structure_changed = result.structure_changed();
                 term = result.term;
                 rho = result.rho;
-                gam::solver::structure_harvest::rounds_to_json(&result.rounds).ok()
+                gam::terms::sae::structure_harvest::rounds_to_json(&result.rounds).ok()
             }
             Err(e) => {
                 // Structure search is a post-fit audit pass; a failure must not

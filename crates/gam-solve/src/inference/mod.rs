@@ -26,6 +26,21 @@ pub mod certificate_impls;
 /// Descended from the monolith `inference::residual_factor` (#1521): its only
 /// dependencies are `gam_problem::RowMetric` plus `gam-linalg`
 /// (`faer_ndarray::{FaerCholesky, FaerEigh}`) — all at or below the gam-solve
-/// tier. Consumed in-crate by [`crate::structure_harvest`]; the monolith crate
+/// tier. Reached downward from `gam_sae::structure_harvest`; the monolith crate
 /// root re-exports it so `gam::inference::residual_factor` resolves unchanged.
 pub mod residual_factor;
+
+/// Deterministic Pólya–Gamma gate-block evidence (#1016): Schur-eliminates a
+/// logit gate sub-block with a true PG-augmented quadratic. Descended from the
+/// monolith `inference::pg_gate_evidence` (#1521): depends only on
+/// `gam-linalg` (`matrix::FactorizedSystem`, `faer_ndarray`) plus the in-crate
+/// [`pg_moments`]. Reached downward from `gam_sae::structure_harvest`; the
+/// monolith crate root re-exports it so `gam::inference::pg_gate_evidence`
+/// resolves unchanged.
+pub mod pg_gate_evidence;
+
+/// Closed-form Pólya–Gamma moments (#1016). Pure functions of `(b, c)` with no
+/// RNG. Descended from the monolith `inference::pg_moments` (#1521); the
+/// monolith crate root re-exports it so `gam::inference::pg_moments` resolves
+/// unchanged.
+pub mod pg_moments;

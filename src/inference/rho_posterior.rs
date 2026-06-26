@@ -49,6 +49,38 @@ pub use gam_problem::rho_posterior::{
     RhoPosteriorMixture, RhoPosteriorSamples,
 };
 
+/// Monolith (gam-inference-tier) implementor of the contract-downed
+/// [`RhoPosteriorEscalator`](gam_problem::rho_posterior::RhoPosteriorEscalator)
+/// (#1521): wraps the real `hmc_io`-backed Tier-0 PSIS certificate
+/// ([`rho_posterior_certificate`]) and the auto-selected Tier-1/Tier-2
+/// escalation ([`escalate_rho_posterior`], whose Tier-2 NUTS pulls the
+/// gam-inference sampler). Injected at process init via
+/// `gam_problem::rho_posterior::set_rho_posterior_escalator`; gam-solve's REML
+/// evaluator calls through `gam_problem::rho_posterior::rho_posterior_escalator`.
+pub struct HmcIoRhoPosteriorEscalator;
+
+impl gam_problem::rho_posterior::RhoPosteriorEscalator for HmcIoRhoPosteriorEscalator {
+    fn rho_posterior_certificate(
+        &self,
+        rho_hat: &Array1<f64>,
+        outer_hessian: &Array2<f64>,
+        criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
+        n_samples: Option<usize>,
+    ) -> Option<RhoPosteriorCertificate> {
+        rho_posterior_certificate(rho_hat, outer_hessian, criterion, n_samples)
+    }
+
+    fn escalate_rho_posterior(
+        &self,
+        rho_hat: &Array1<f64>,
+        outer_hessian: &Array2<f64>,
+        criterion: &mut dyn FnMut(&Array1<f64>) -> Option<f64>,
+        criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send),
+    ) -> RhoPosteriorEscalation {
+        escalate_rho_posterior(rho_hat, outer_hessian, criterion, criterion_and_grad)
+    }
+}
+
 /// One deterministic Tier-1 quadrature node for `π(ρ|y)`.
 #[derive(Debug, Clone)]
 pub struct RhoQuadratureNode {

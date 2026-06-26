@@ -1527,7 +1527,7 @@ impl SaeManifoldTerm {
     /// [`Self::run_joint_fit_arrow_schur`]; this lets a structure-search driver
     /// (or a streaming chunk loop reconciling per-chunk guard outcomes) feed a
     /// collapse observation back onto the term so the next
-    /// [`gam_solve::structure_harvest::harvest_move_proposals`] pass sees it
+    /// [`crate::structure_harvest::harvest_move_proposals`] pass sees it
     /// as a death trigger.
     pub fn record_collapse_event(&mut self, event: CollapseEvent) {
         self.collapse_events.push(event);

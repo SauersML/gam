@@ -1,5 +1,5 @@
 //! #997 — the wiring seam between a fitted [`SaeManifoldTerm`] and the
-//! evidence-guarded move engine of [`crate::structure_search`].
+//! evidence-guarded move engine of [`gam_solve::structure_search`].
 //!
 //! #976 closed with the move engine (`search`) and its triggers
 //! (`gam_sae::atom_codes::SparseAtomCodes::coactivation`, ARD precisions,
@@ -44,23 +44,23 @@ use std::sync::Arc;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
+use gam_solve::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
 use gam_terms::inference::structure_evidence::{ClaimKind, StructureLedger};
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
-use crate::structure_search::{
+use gam_solve::structure_search::{
     CollapseAction, MoveBudget, MoveProposal, SearchLedger, SearchOutcome, StructureMove, search,
 };
-use crate::{
+use gam_solve::{
     AutoTopologyKind, TopologyAutoFitEvidence, TopologyAutoSelector, TopologyScoreScale,
     select_topology_with_fit,
 };
 use gam_terms::latent::{LatentIdMode, LatentManifold};
-use crate::terms::sae::atom_codes::SparseAtomCodes;
-use crate::terms::sae::basis::{
+use crate::atom_codes::SparseAtomCodes;
+use crate::basis::{
     CylinderHarmonicEvaluator, EuclideanPatchEvaluator, PeriodicHarmonicEvaluator,
     SaeBasisSecondJet, SphereChartEvaluator, TorusHarmonicEvaluator,
 };
-use crate::terms::sae::manifold::{
+use crate::manifold::{
     SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm,
 };
 use gam_terms::structure::anova_atom::{
@@ -732,7 +732,7 @@ fn duplicate_atom(
     }
     let mut coords = term.assignment.coords.clone();
     coords.push(term.assignment.coords[parent].clone());
-    let assignment = crate::terms::sae::manifold::SaeAssignment::with_mode(
+    let assignment = crate::manifold::SaeAssignment::with_mode(
         logits,
         coords,
         term.assignment.mode,
@@ -1336,7 +1336,7 @@ const BIRTH_SEED_LOGIT: f64 = -4.0;
 /// the discovered dictionary, at two rungs:
 ///
 /// * **Existence** — the #984 held-out e-value birth gate (run inside
-///   [`crate::structure_search::search`]) decides whether the atom is
+///   [`gam_solve::structure_search::search`]) decides whether the atom is
 ///   born at all. Only a residual factor whose held-out reconstruction
 ///   likelihood-ratio crosses the Ville threshold earns an atom; the rest stay
 ///   contested in the [`SearchLedger`].
@@ -1466,7 +1466,7 @@ fn born_atom(
     }
     let mut coords = term.assignment.coords.clone();
     coords.push(born_coord_block);
-    let assignment = crate::terms::sae::manifold::SaeAssignment::with_mode(
+    let assignment = crate::manifold::SaeAssignment::with_mode(
         logits,
         coords,
         term.assignment.mode,
@@ -1590,7 +1590,7 @@ impl StructureSearchResult {
     /// valid.
     #[must_use]
     pub fn structure_changed(&self) -> bool {
-        use crate::structure_search::MoveVerdict;
+        use gam_solve::structure_search::MoveVerdict;
         self.rounds.iter().any(|round| {
             round.moves.iter().any(|record| {
                 matches!(
@@ -1731,8 +1731,8 @@ pub fn run_structure_search_rounds(
         let applied = round_ledger.moves.iter().any(|m| {
             matches!(
                 m.verdict,
-                crate::structure_search::MoveVerdict::Accepted { .. }
-                    | crate::structure_search::MoveVerdict::Demoted { .. }
+                gam_solve::structure_search::MoveVerdict::Accepted { .. }
+                    | gam_solve::structure_search::MoveVerdict::Demoted { .. }
             )
         });
         rounds.push(round_ledger);
@@ -1870,7 +1870,7 @@ fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64 {
 /// A degenerate/non-PD gate block contributes `0` (no gate evidence) rather than
 /// poisoning the reconstruction likelihood — a conservative, valid degradation.
 fn gate_block_log_evidence(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64 {
-    use crate::inference::pg_gate_evidence::{GateBlock, pg_gate_evidence};
+    use gam_solve::inference::pg_gate_evidence::{GateBlock, pg_gate_evidence};
 
     let logits = &term.assignment.logits;
     let n_full = logits.nrows();
@@ -2074,9 +2074,9 @@ pub fn rounds_to_json(rounds: &[SearchLedger]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::structure_search::{CollapseAction, CollapseEvent};
+    use gam_solve::structure_search::{CollapseAction, CollapseEvent};
     use gam_terms::latent::LatentManifold;
-    use crate::terms::sae::manifold::{
+    use crate::manifold::{
         AssignmentMode, PeriodicHarmonicEvaluator, SaeAssignment, SaeAtomBasisKind,
         SaeBasisEvaluator, SaeManifoldAtom,
     };
@@ -2162,7 +2162,7 @@ mod tests {
     /// (the #1230 bug); a false positive needlessly discards exact bands.
     #[test]
     fn structure_changed_is_true_only_when_a_move_lands() {
-        use crate::structure_search::{MoveRecord, MoveVerdict};
+        use gam_solve::structure_search::{MoveRecord, MoveVerdict};
 
         fn ledger_with(verdicts: Vec<MoveVerdict>) -> SearchLedger {
             SearchLedger {

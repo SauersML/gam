@@ -11,6 +11,7 @@
 //! back-edge into gam-inference.
 
 use ndarray::{Array1, Array2};
+use std::sync::OnceLock;
 
 /// Reliability tier read off the Pareto tail-shape `k̂` of the `ρ`-importance
 /// weights.
@@ -127,4 +128,67 @@ pub enum RhoPosteriorEscalation {
     /// tier failed); intervals remain plug-in + first-order corrected, and the
     /// fit reports WHY.
     Unavailable { n_params: usize, reason: String },
+}
+
+// ───────────────────────── injected escalator trait (#1521) ──────────────────
+
+/// The gam-inference-tier producer of the Tier-0 `ρ`-certificate and the
+/// auto-selected Tier-1/Tier-2 escalation (trait-inversion #1521).
+///
+/// The COMPUTATION — the PSIS certificate, the Gauss-Hermite quadrature, and
+/// the Tier-2 NUTS over `ρ` — pulls the gam-inference `hmc_io` sampler, so it
+/// STAYS UP in the monolith `inference::rho_posterior`. That module implements
+/// this trait over its real `rho_posterior_certificate` / `escalate_rho_posterior`
+/// functions and injects the impl DOWN via [`set_rho_posterior_escalator`];
+/// gam-solve's REML evaluator calls THROUGH [`rho_posterior_escalator`]. Only
+/// neutral types (ndarray + the contract-downed `ρ`-posterior carriers) and
+/// caller-supplied criterion closures cross this surface — no gam-inference type
+/// is threaded, so the trait can live in this neutral crate.
+///
+/// When no impl is registered (a build that never links the sampler tier) the
+/// getter returns `None` and gam-solve declines the certificate/escalation
+/// entirely (`(None, None)`), leaving the plug-in + first-order intervals — its
+/// existing decline outcome, no behavioral cliff and no stub.
+pub trait RhoPosteriorEscalator: Send + Sync {
+    /// Tier-0 PSIS `ρ`-certificate. `criterion` evaluates the outer criterion
+    /// `−log π(ρ|y)` at a trial `ρ` (`None` for infeasible `ρ`). Returns `None`
+    /// when the certificate cannot be formed (see the monolith implementation).
+    fn rho_posterior_certificate(
+        &self,
+        rho_hat: &Array1<f64>,
+        outer_hessian: &Array2<f64>,
+        criterion: &dyn Fn(&Array1<f64>) -> Option<f64>,
+        n_samples: Option<usize>,
+    ) -> Option<RhoPosteriorCertificate>;
+
+    /// Auto-selected escalation (Tier-1 quadrature / Tier-2 NUTS / honest
+    /// `Unavailable`). `criterion` returns the exact profiled criterion value,
+    /// `criterion_and_grad` the value plus the exact LAML `ρ`-gradient; both are
+    /// `None` for infeasible `ρ`.
+    fn escalate_rho_posterior(
+        &self,
+        rho_hat: &Array1<f64>,
+        outer_hessian: &Array2<f64>,
+        criterion: &mut dyn FnMut(&Array1<f64>) -> Option<f64>,
+        criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Option<(f64, Array1<f64>)> + Send),
+    ) -> RhoPosteriorEscalation;
+}
+
+static RHO_POSTERIOR_ESCALATOR: OnceLock<Box<dyn RhoPosteriorEscalator>> = OnceLock::new();
+
+/// Register the monolith's `hmc_io`-backed `ρ`-posterior certificate/escalation
+/// producer. Called once at process init by the gam-inference tier. First writer
+/// wins; a later call is ignored (returns `Err` with the boxed value) so a
+/// re-init can never swap a live producer mid-run.
+pub fn set_rho_posterior_escalator(
+    escalator: Box<dyn RhoPosteriorEscalator>,
+) -> Result<(), Box<dyn RhoPosteriorEscalator>> {
+    RHO_POSTERIOR_ESCALATOR.set(escalator)
+}
+
+/// The registered `ρ`-posterior certificate/escalation producer, or `None` when
+/// the sampler tier is not linked / not yet initialized (gam-solve then declines
+/// the certificate and escalation — a safe no-op leaving plug-in intervals).
+pub fn rho_posterior_escalator() -> Option<&'static dyn RhoPosteriorEscalator> {
+    RHO_POSTERIOR_ESCALATOR.get().map(|b| b.as_ref())
 }

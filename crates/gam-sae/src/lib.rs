@@ -17,6 +17,7 @@ pub mod k_selection;
 pub mod manifold;
 pub mod row_jet_program;
 pub mod sparse_dict;
+pub mod structure_harvest;
 
 // The pre-split engine referenced GPU infrastructure as `crate::gpu::*`; after
 // the #1521 split that code lives in the `gam-gpu` crate. Alias it back so the

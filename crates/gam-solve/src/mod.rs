@@ -57,7 +57,6 @@ pub mod sensitivity;
 pub mod spline_scan;
 pub(crate) mod startup_stats;
 pub mod streaming_border;
-pub mod structure_harvest;
 pub mod structure_search;
 pub mod topology_formula;
 pub mod topology_selector;
