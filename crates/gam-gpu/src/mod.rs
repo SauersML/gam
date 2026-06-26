@@ -7,6 +7,15 @@
 // enable the `cuda` feature, so cudarc is never loaded by default CPU-only
 // builds.
 
+// `gpu_error` is declared first so its `#[macro_use]` macros (`gpu_err!`,
+// `gpu_bail!`) are in textual scope for every module below — `backend_probe`
+// in particular calls `gpu_err!` unqualified. Referring to these
+// `#[macro_export]` macros by absolute path (`crate::gpu_err`) is rejected
+// here: `lib.rs` pulls this module tree in via `include!`, which makes every
+// exported macro "macro-expanded", and absolute-path access to those is a
+// denied future-incompat lint.
+#[macro_use]
+pub mod gpu_error;
 pub mod backend_probe;
 pub mod blas;
 #[cfg(target_os = "linux")]
@@ -15,8 +24,6 @@ pub mod cpu_traits;
 pub mod device;
 pub mod device_cache;
 pub mod driver;
-#[macro_use]
-pub mod gpu_error;
 pub mod device_runtime;
 pub mod linalg_dispatch;
 pub mod memory;

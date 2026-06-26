@@ -25,13 +25,15 @@
 //! The migration is atomic: no backend re-implements the prologue, and
 //! there is no transitional shim.
 
-// `CudaBackendParts` is intentionally NOT re-exported here: it is the internal
-// trio bundle that `probe_cuda_backend` returns and `CudaBackendContext::from_parts`
-// consumes. Callers move that value through without ever naming the type, so
-// hoisting the name into this scope is a dead re-export that `-D warnings` rejects.
-// It stays `pub(crate)` inside `linux` for the in-module producers/consumers.
+// `CudaBackendParts` is re-exported alongside the probe entry points: sibling
+// crates (`gam-terms`, `gam-models`, ...) call `probe_cuda_backend` and receive
+// a `CudaBackendParts` value (without ever naming the type), so `probe_cuda_backend`'s
+// public return type must itself be reachable or `-D warnings` rejects the leak
+// (`private_interfaces`). It carries no fields a caller can misuse out of context.
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{CudaBackendContext, probe_backend_with_compile, probe_cuda_backend};
+pub use linux::{
+    CudaBackendContext, CudaBackendParts, probe_backend_with_compile, probe_cuda_backend,
+};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -39,7 +41,6 @@ mod linux {
     use crate::device_cache::{DeviceArena, PtxModuleCache};
     use crate::device_runtime::{GpuRuntime, cuda_context_for};
     use crate::gpu_error::GpuError;
-    use crate::gpu_err;
     use cudarc::driver::{CudaContext, CudaStream};
     use std::sync::{Arc, Mutex};
 
@@ -49,10 +50,10 @@ mod linux {
     /// backends layer their own caches and optional eager compilation on
     /// top of these.
     #[derive(Debug)]
-    pub(crate) struct CudaBackendParts {
-        pub(crate) ctx: Arc<CudaContext>,
-        pub(crate) stream: Arc<CudaStream>,
-        pub(crate) capability: GpuCapability,
+    pub struct CudaBackendParts {
+        pub ctx: Arc<CudaContext>,
+        pub stream: Arc<CudaStream>,
+        pub capability: GpuCapability,
     }
 
     /// Probe the process-wide CUDA backend for the calling module.
@@ -63,7 +64,7 @@ mod linux {
     /// `label` names the calling module (e.g. `"bms_flex"`) and is woven
     /// into both failure messages so the uniform contract still attributes
     /// errors to their originating backend.
-    pub(crate) fn probe_cuda_backend(label: &'static str) -> Result<CudaBackendParts, GpuError> {
+    pub fn probe_cuda_backend(label: &'static str) -> Result<CudaBackendParts, GpuError> {
         let runtime = GpuRuntime::global().ok_or_else(|| GpuError::DriverLibraryUnavailable {
             reason: format!("{label} backend: no CUDA runtime available"),
         })?;
@@ -90,7 +91,7 @@ mod linux {
     /// messages — live in the shared probe; `build` receives the resolved
     /// [`CudaBackendParts`] (so it can clone the `Arc<CudaContext>` /
     /// `Arc<CudaStream>` it needs) and returns the backend's own state `T`.
-    pub(crate) fn probe_backend_with_compile<F, T>(
+    pub fn probe_backend_with_compile<F, T>(
         label: &'static str,
         build: F,
     ) -> Result<T, GpuError>
@@ -111,11 +112,11 @@ mod linux {
     /// wrap one of these as their `inner` context so the host-side
     /// scaffolding (arena pooling, module cache, mutex around alloc) is
     /// uniform instead of duplicated per backend.
-    pub(crate) struct CudaBackendContext {
-        pub(crate) ctx: Arc<CudaContext>,
-        pub(crate) stream: Arc<CudaStream>,
-        pub(crate) module: PtxModuleCache,
-        pub(crate) arena: Mutex<DeviceArena>,
+    pub struct CudaBackendContext {
+        pub ctx: Arc<CudaContext>,
+        pub stream: Arc<CudaStream>,
+        pub module: PtxModuleCache,
+        pub arena: Mutex<DeviceArena>,
     }
 
     impl CudaBackendContext {
@@ -124,7 +125,7 @@ mod linux {
         /// (the backend's eager-compile step fills it), and an empty device
         /// arena. The probe's compute `capability` is consumed by the probe
         /// path itself and is not retained here.
-        pub(crate) fn from_parts(parts: CudaBackendParts) -> Self {
+        pub fn from_parts(parts: CudaBackendParts) -> Self {
             CudaBackendContext {
                 ctx: parts.ctx,
                 stream: parts.stream,

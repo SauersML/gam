@@ -668,7 +668,7 @@ mod cuda {
         Ok((ctx, stream))
     }
 
-    pub(crate) fn context_and_stream() -> Result<
+    pub fn context_and_stream() -> Result<
         (
             std::sync::Arc<CudaContext>,
             std::sync::Arc<cudarc::driver::CudaStream>,
@@ -686,7 +686,7 @@ mod cuda {
         context_and_stream_for(runtime.selected_device().ordinal)
     }
 
-    pub(crate) fn pinned_htod<
+    pub fn pinned_htod<
         T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits + Copy,
     >(
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
@@ -710,7 +710,7 @@ mod cuda {
         stream.clone_htod(src).map_err(|e| format!("cuda H2D: {e}"))
     }
 
-    pub(crate) fn potrf_in_place(
+    pub fn potrf_in_place(
         solver: &DnHandle,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
@@ -719,7 +719,7 @@ mod cuda {
         potrf_in_place_generic::<f64>(solver, stream, p, h)
     }
 
-    pub(crate) fn potrs_in_place(
+    pub fn potrs_in_place(
         solver: &DnHandle,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
@@ -734,7 +734,7 @@ mod cuda {
     ///
     /// Called once at workspace construction to size the persistent workspace
     /// buffer. Returns the number of f64 elements required.
-    pub(crate) fn potrf_query_lwork(
+    pub fn potrf_query_lwork(
         solver: &DnHandle,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
@@ -752,7 +752,7 @@ mod cuda {
     /// (as reported by [`potrf_query_lwork`] at workspace construction).
     /// `info_dev` is a 1-element device i32 buffer; after a failed
     /// factorization it holds a positive integer but stays device-resident.
-    pub(crate) fn potrf_in_place_reuse(
+    pub fn potrf_in_place_reuse(
         solver: &DnHandle,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
@@ -791,7 +791,7 @@ mod cuda {
     ///
     /// Does not allocate, does not download `info`. The caller is responsible
     /// for calling [`check_deferred_potrs_info`] at end-of-fit.
-    pub(crate) fn potrs_in_place_reuse(
+    pub fn potrs_in_place_reuse(
         solver: &DnHandle,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
@@ -832,7 +832,7 @@ mod cuda {
     /// Called once at end-of-fit (or whenever the convergence loop exits) to
     /// surface any factorization failure that was deferred device-side by
     /// [`potrf_in_place_reuse`].
-    pub(crate) fn check_deferred_potrf_info(
+    pub fn check_deferred_potrf_info(
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         info_dev: &CudaSlice<i32>,
     ) -> Result<(), String> {
@@ -852,7 +852,7 @@ mod cuda {
     /// Download the POTRS deferred info scalar and return an error if non-zero.
     ///
     /// Mirrors [`check_deferred_potrf_info`] for the triangular-solve step.
-    pub(crate) fn check_deferred_potrs_info(
+    pub fn check_deferred_potrs_info(
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         info_dev: &CudaSlice<i32>,
     ) -> Result<(), String> {
@@ -869,7 +869,7 @@ mod cuda {
         }
     }
 
-    pub(crate) fn cholesky_logdet_from_col_major(factor: &[f64], p: usize) -> f64 {
+    pub fn cholesky_logdet_from_col_major(factor: &[f64], p: usize) -> f64 {
         let factor = MatRef::from_column_major_slice(factor, p, p);
         cholesky_factor_logdet(factor)
     }
@@ -890,12 +890,19 @@ mod cuda {
     }
 }
 
+// These solver entry points are consumed by sibling crates (`gam-solve`'s
+// pirls/reml GPU paths, `gam-models`, ...) via `gam_gpu::solver::*`, so they
+// are part of gam-gpu's public surface. `potrf_in_place_generic` is the
+// only one with no cross-crate consumer; it stays crate-private and is
+// reached internally through `crate::solver::potrf_in_place_generic`.
 #[cfg(target_os = "linux")]
-pub(crate) use cuda::{
+pub use cuda::{
     check_deferred_potrf_info, check_deferred_potrs_info, cholesky_logdet_from_col_major,
-    context_and_stream, pinned_htod, potrf_in_place, potrf_in_place_generic, potrf_in_place_reuse,
-    potrf_query_lwork, potrs_in_place, potrs_in_place_reuse,
+    context_and_stream, pinned_htod, potrf_in_place, potrf_in_place_reuse, potrf_query_lwork,
+    potrs_in_place, potrs_in_place_reuse,
 };
+#[cfg(target_os = "linux")]
+pub(crate) use cuda::potrf_in_place_generic;
 
 /// Solve `A x = b` with fp32 Cholesky factorization + fp64-residual iterative
 /// refinement, automatically falling back to fp64 when the policy rejects the

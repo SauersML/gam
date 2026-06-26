@@ -81,8 +81,15 @@ macro_rules! gpu_err {
 /// statement. Use inside functions that return `Result<_, GpuError>`.
 #[macro_export]
 macro_rules! gpu_bail {
+    // The `gpu_err!` construction is inlined here rather than invoked as
+    // `$crate::gpu_err!`: because `lib.rs` includes this module tree via
+    // `include!`, the `#[macro_export]` `gpu_err` counts as macro-expanded,
+    // and referring to it by the absolute `$crate::` path trips a denied
+    // future-incompat lint. Keep this body in sync with `gpu_err!`.
     ($($arg:tt)*) => {
-        return ::std::result::Result::Err($crate::gpu_err!($($arg)*))
+        return ::std::result::Result::Err(
+            $crate::gpu_error::GpuError::DriverCallFailed { reason: ::std::format!($($arg)*) },
+        )
     };
 }
 
