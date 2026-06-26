@@ -1,29 +1,33 @@
 //! Regression for #1564 (bug 2): saved Royston-Parmar (`transformation`)
-//! survival prediction must not fail when the prediction grid extends past the
-//! training support.
+//! survival prediction must not fail at the top of its default time grid.
 //!
 //! Root cause: the RP baseline `log Λ(t)` is a monotone I-spline cumulative
-//! hazard. Beyond its last interior knot every I-spline basis is flat, so the
-//! time-derivative `d(log Λ)/dt` is exactly `0` and the instantaneous hazard
-//! there is `0` (the survival curve is locally constant — the model has no
-//! information past its support and accumulates no further hazard). The saved
-//! predict path drove `royston_parmar_survival_hazard_components`, whose guard
-//! required a STRICTLY positive derivative and therefore aborted with
-//! `eta_t=0` on every grid node past the support. A multi-smooth clinical fit
-//! evaluated on a fixed 25-point grid hits this on its tail nodes, so the whole
-//! prediction failed.
+//! hazard. At the top boundary of the fitted knot span the I-spline saturates
+//! (the rightmost retained basis reaches its plateau and the would-be-rising
+//! tail columns were dropped as constant over training), so the time-derivative
+//! `d(log Λ)/dt` is exactly `0` there — and the instantaneous hazard is `0`
+//! (the survival curve is locally flat). The saved predict path drove
+//! `royston_parmar_survival_hazard_components`, whose guard required a STRICTLY
+//! positive derivative and therefore aborted with `eta_t=0`.
 //!
-//! The fix relaxes the guard to accept `eta_derivative >= 0` (still rejecting
-//! NaN and genuinely-negative / non-monotone slopes) and maps the zero-boundary
-//! to a zero hazard, matching the probit / marginal-slope sibling guard.
+//! The Python prediction surface always evaluates a grid whose top node sits at
+//! `max_observed_exit * (1 + 1e-6)` (see `default_survival_time_grid`), i.e.
+//! exactly in this saturated regime, so **every** transformation-RP surface
+//! prediction failed on its last grid node — the user saw no survival curves at
+//! all. The fix relaxes the guard to accept `eta_derivative >= 0` (still
+//! rejecting NaN and genuinely-negative / non-monotone slopes) and maps the
+//! zero boundary to a zero hazard, matching the probit / marginal-slope guard.
 //!
-//! This test fits the default `transformation` (Royston-Parmar) likelihood
-//! through the real `gam fit` path, loads the saved model, and drives the
-//! library predict surface on a grid that deliberately extends to 3× the
-//! largest observed time — the exact code path the Python
-//! `model.predict(...).survival_at(grid)` FFI uses. It asserts the surface is
-//! finite, monotone, in `[0, 1]`, that the tail (beyond support) is flat with
-//! exactly-zero hazard, and — critically — that predict returns `Ok` at all.
+//! This test reproduces the failure on real data: the UCI Heart Failure Clinical
+//! Records dataset (Chicco & Jurman, 2020; CC BY 4.0) with the exact
+//! multi-smooth formula from the #1564 report. It fits through the real `gam
+//! fit` path, loads the saved model, and drives the library predict surface on
+//! the default-style grid — the exact code path the Python
+//! `model.predict(...).survival_at(grid)` FFI uses. It asserts predict returns
+//! `Ok` (the regression), that the surface is finite / monotone / in `[0, 1]`,
+//! and — to prove the `eta_t=0` path is genuinely exercised — that at least one
+//! grid node carries an exactly-zero hazard atop a finite positive cumulative
+//! hazard.
 
 use std::path::Path;
 use std::process::Command;
@@ -36,132 +40,86 @@ use gam::inference::model::FittedModel;
 use gam::test_support::cli_harness::run_or_panic;
 use ndarray::Array1;
 
-const N: usize = 220;
+/// gam-format Royston-Parmar survival fixture derived from the UCI Heart Failure
+/// Clinical Records dataset (n=299). Columns mirror the #1564 bug-2 formula.
+const HEART_FAILURE_CSV: &str = include_str!("../../fixtures/survival/heart_failure_rp.csv");
 
-/// Deterministic right-censored Weibull-latent data with two covariates and a
-/// moderate event rate (~0.35), echoing the clinical fits in the #1564 report.
-fn build_dataset() -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
-    let mut state: u64 = 0xD1B54A32D192ED03;
-    let mut next_u01 = || {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        ((state >> 11) as f64) / ((1u64 << 53) as f64)
-    };
+const SURVIVAL_FORMULA: &str = "Surv(entry, exit, event) ~ s(age) \
+    + s(log_creatinine_phosphokinase) + s(ejection_fraction) + s(log_platelets) \
+    + s(log_serum_creatinine) + s(serum_sodium) + linear(anaemia) \
+    + linear(diabetes) + linear(high_blood_pressure) + linear(sex) + linear(smoking)";
 
-    let shape = 1.3_f64;
-    let mut age = Vec::with_capacity(N);
-    let mut x1 = Vec::with_capacity(N);
-    let mut exit = Vec::with_capacity(N);
-    let mut event = Vec::with_capacity(N);
-    for _ in 0..N {
-        let a = 40.0 + 30.0 * next_u01();
-        let cov = 2.0 * next_u01() - 1.0;
-        let eta = -3.0 + 0.04 * (a - 55.0) + 0.6 * cov;
-        let u = 1e-9_f64.max(next_u01());
-        let t_lat = (-eta / shape).exp() * (-u.ln()).powf(1.0 / shape);
-        let cens = -next_u01().max(1e-12).ln() * 9.0;
-        let ex = t_lat.min(cens).max(1e-3);
-        let ev = if t_lat <= cens { 1.0 } else { 0.0 };
-        age.push(a);
-        x1.push(cov);
-        exit.push(ex);
-        event.push(ev);
-    }
-    (age, x1, exit, event)
+/// Parse the fixture into (header, rows-of-cells).
+fn fixture_records() -> (Vec<String>, Vec<Vec<String>>) {
+    let mut reader = csv::Reader::from_reader(HEART_FAILURE_CSV.as_bytes());
+    let headers: Vec<String> = reader
+        .headers()
+        .expect("fixture header")
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let rows: Vec<Vec<String>> = reader
+        .records()
+        .map(|r| r.expect("fixture row").iter().map(|s| s.to_string()).collect())
+        .collect();
+    (headers, rows)
 }
 
-fn write_training_csv(path: &Path, age: &[f64], x1: &[f64], exit: &[f64], event: &[f64]) {
-    let mut writer = csv::Writer::from_path(path).expect("create training csv");
-    writer
-        .write_record(["entry", "exit", "event", "age", "x1"])
-        .expect("write header");
-    for i in 0..age.len() {
-        writer
-            .write_record([
-                "0.0".to_string(),
-                format!("{:.12}", exit[i]),
-                format!("{}", event[i] as i64),
-                format!("{:.12}", age[i]),
-                format!("{:.12}", x1[i]),
-            ])
-            .expect("write training row");
-    }
-    writer.flush().expect("flush training csv");
-}
-
-/// Predict rows with a large `exit` placeholder so every grid time stays inside
-/// the surface frame (isolating the beyond-support flat-hazard path from any
-/// grid-truncation behavior).
-fn predict_dataset(big_exit: f64) -> EncodedDataset {
-    let headers = vec![
-        "entry".to_string(),
-        "exit".to_string(),
-        "event".to_string(),
-        "age".to_string(),
-        "x1".to_string(),
-    ];
-    let rows = vec![
-        StringRecord::from(vec![
-            "0.0".to_string(),
-            format!("{big_exit:.12}"),
-            "1".to_string(),
-            "57.0".to_string(),
-            "0.4".to_string(),
-        ]),
-        StringRecord::from(vec![
-            "0.0".to_string(),
-            format!("{big_exit:.12}"),
-            "1".to_string(),
-            "63.0".to_string(),
-            "-0.5".to_string(),
-        ]),
-    ];
-    encode_recordswith_inferred_schema(headers, rows).expect("encode predict rows")
+/// Build a small predict frame from the first `k` subjects with a large `exit`
+/// placeholder so the surface frame is never the binding constraint on the grid.
+fn predict_dataset(headers: &[String], rows: &[Vec<String>], k: usize, big_exit: f64) -> EncodedDataset {
+    let exit_idx = headers.iter().position(|h| h == "exit").expect("exit column");
+    let event_idx = headers.iter().position(|h| h == "event").expect("event column");
+    let records: Vec<StringRecord> = rows
+        .iter()
+        .take(k)
+        .map(|row| {
+            let mut cells = row.clone();
+            cells[exit_idx] = format!("{big_exit:.6}");
+            cells[event_idx] = "1".to_string();
+            StringRecord::from(cells)
+        })
+        .collect();
+    encode_recordswith_inferred_schema(headers.to_vec(), records).expect("encode predict rows")
 }
 
 #[test]
-fn royston_parmar_saved_predict_beyond_support_does_not_fail() {
-    let (age, x1, exit, event) = build_dataset();
-    let event_rate = event.iter().sum::<f64>() / event.len() as f64;
-    assert!(
-        (0.2..0.7).contains(&event_rate),
-        "fixture must have a moderate event rate, got {event_rate}"
-    );
+fn royston_parmar_saved_predict_at_grid_top_does_not_fail() {
+    let (headers, rows) = fixture_records();
+    let exit_idx = headers.iter().position(|h| h == "exit").expect("exit column");
+    let max_exit = rows
+        .iter()
+        .map(|row| row[exit_idx].parse::<f64>().expect("numeric exit"))
+        .fold(f64::MIN, f64::max);
+    assert!(max_exit > 0.0, "fixture must have positive exit times");
 
     let dir = tempfile::tempdir().expect("create tempdir");
     let train_path = dir.path().join("train.csv");
     let model_path = dir.path().join("model.json");
-    write_training_csv(&train_path, &age, &x1, &exit, &event);
+    std::fs::write(&train_path, HEART_FAILURE_CSV).expect("write training fixture");
 
     // Default survival likelihood is `transformation` (Royston-Parmar) with an
-    // I-spline baseline log-cumulative-hazard — exactly the configuration the
-    // #1564 report fit.
+    // I-spline baseline log-cumulative-hazard — exactly the #1564 configuration.
     let mut fit_cmd = Command::new(gam::gam_binary!());
     fit_cmd
         .arg("fit")
         .arg(&train_path)
-        .arg("Surv(entry, exit, event) ~ s(age) + s(x1)")
+        .arg(SURVIVAL_FORMULA)
         .arg("--out")
         .arg(&model_path);
-    run_or_panic(fit_cmd, "gam fit Surv ~ s(age)+s(x1) (transformation)");
+    run_or_panic(fit_cmd, "gam fit multi-smooth Royston-Parmar survival");
     assert!(model_path.is_file(), "gam fit did not write {model_path:?}");
 
-    let model = FittedModel::load_from_path(&model_path).expect("load saved RP survival model");
+    let model = FittedModel::load_from_path(Path::new(&model_path)).expect("load saved RP model");
 
-    let max_exit = exit.iter().cloned().fold(f64::MIN, f64::max);
-    // The final nodes sit at 2× and 3× the largest observed time, i.e. well past
-    // the I-spline support, where the log-cumulative-hazard is flat.
-    let grid = [
-        0.5,
-        2.0,
-        max_exit * 0.5,
-        max_exit,
-        max_exit * 2.0,
-        max_exit * 3.0,
-    ];
-    let big_exit = max_exit * 3.0 + 5.0;
-    let dataset = predict_dataset(big_exit);
+    // The default prediction grid (`default_survival_time_grid`): 64 linear
+    // nodes from 0 to `max_exit * (1 + 1e-6)`. The top node lands in the
+    // saturated I-spline regime where `d(log Λ)/dt == 0`.
+    let hi = max_exit * (1.0 + 1.0e-6);
+    let step = hi / 63.0;
+    let grid: Vec<f64> = (0..64).map(|i| step * (i as f64)).collect();
+
+    let dataset = predict_dataset(&headers, &rows, 6, max_exit + 5.0);
     let col_map = dataset.column_map();
     let payload = model.payload();
     let training_headers = payload.training_headers.as_ref();
@@ -180,17 +138,14 @@ fn royston_parmar_saved_predict_beyond_support_does_not_fail() {
         with_uncertainty: false,
     };
 
-    // The core assertion: predict must NOT error on the beyond-support tail.
+    // The core regression: predict must NOT abort with `eta_t=0` at the grid top.
     let result = predict_survival(request)
-        .expect("RP saved predict must succeed past the training support (#1564)");
+        .expect("RP saved predict must succeed at the default grid top (#1564)");
 
     assert_eq!(result.survival.nrows(), n, "one survival row per predict row");
-    assert_eq!(
-        result.survival.ncols(),
-        grid.len(),
-        "survival surface must cover every grid time"
-    );
+    assert_eq!(result.survival.ncols(), grid.len(), "surface covers every grid time");
 
+    let mut zero_hazard_nodes = 0usize;
     for r in 0..n {
         let surv: Vec<f64> = result.survival.row(r).to_vec();
         let haz: Vec<f64> = result.hazard.row(r).to_vec();
@@ -215,27 +170,19 @@ fn royston_parmar_saved_predict_beyond_support_does_not_fail() {
             );
         }
 
-        // The two tail nodes (2× and 3× max observed time) are past the
-        // I-spline support: the cumulative hazard is flat, so the instantaneous
-        // hazard is exactly zero and the survival probability stops decreasing.
-        let last = grid.len() - 1;
-        assert_eq!(
-            haz[last], 0.0,
-            "hazard beyond support must be exactly 0 (flat I-spline), got {}",
-            haz[last]
-        );
-        assert!(
-            (cum[last] - cum[last - 1]).abs() <= 1e-9,
-            "cumulative hazard must be flat across the beyond-support tail: \
-             {} vs {}",
-            cum[last - 1],
-            cum[last]
-        );
-        assert!(
-            (surv[last] - surv[last - 1]).abs() <= 1e-9,
-            "survival must be flat across the beyond-support tail: {} vs {}",
-            surv[last - 1],
-            surv[last]
-        );
+        // Count the exactly-zero-hazard nodes (the `eta_t=0` boundary) that sit
+        // atop a finite positive cumulative hazard. Each one is a node that the
+        // pre-fix strict `> 0.0` guard would have rejected.
+        for j in 0..grid.len() {
+            if haz[j] == 0.0 && cum[j] > 1e-9 {
+                zero_hazard_nodes += 1;
+            }
+        }
     }
+
+    assert!(
+        zero_hazard_nodes > 0,
+        "expected at least one exactly-zero-hazard grid node (the #1564 eta_t=0 \
+         boundary); without one this fixture would not guard the regression"
+    );
 }

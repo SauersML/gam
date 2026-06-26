@@ -2016,9 +2016,10 @@ fn royston_parmar_survival_hazard_components(
     eta: f64,
     eta_derivative: f64,
 ) -> Result<(f64, f64), SurvivalPredictError> {
-    // `eta = log Λ(t)`; `eta_derivative = dΛ/dt / Λ · Λ = h(t)`-chain, i.e. the
-    // time-derivative `d(log Λ)/dt`. Reject only the true bug signals: a
-    // non-finite `eta`, and a derivative that is NaN or genuinely negative.
+    // `eta = log Λ(t)` and `eta_derivative = d(log Λ)/dt`, so the instantaneous
+    // hazard is `h(t) = Λ(t) · eta_derivative = dΛ/dt`. Reject only the true bug
+    // signals: a non-finite `eta`, and a derivative that is NaN or genuinely
+    // negative.
     //
     // `eta_derivative == 0` is a VALID boundary value, not a failure. The RP
     // baseline `log Λ(t)` is an I-spline (monotone non-decreasing cumulative
