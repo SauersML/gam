@@ -13,7 +13,36 @@ permissions:
   actions: write
 
 jobs:
+  gate:
+    name: Gate scheduled runs on recent changes
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - id: check
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "Event ${{ github.event_name }} is not a schedule; running."
+            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          latest=$(git log -1 --format=%ct)
+          now=$(date +%s)
+          age_min=$(( (now - latest) / 60 ))
+          window=360
+          if [ "$age_min" -lt "$window" ]; then
+            echo "Last commit ${age_min}m ago (< ${window}m); running scheduled job."
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Last commit ${age_min}m ago (>= ${window}m); nothing changed, skipping."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
   check_unreleased:
+    needs: gate
+    if: ${{ github.event_name != 'schedule' || needs.gate.outputs.run == 'true' }}
     # Gate: the agent only has work when `main` has advanced since the
     # last release. On scheduled runs with nothing new to ship, skip the
     # heavy job so we don't burn a runner just to have Claude exit.
