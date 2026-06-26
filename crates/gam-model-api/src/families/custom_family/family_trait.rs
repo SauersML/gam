@@ -2,7 +2,31 @@
 //! (`FamilyEvaluation`, joint-gradient/batched-term carriers) and the eval-scope /
 //! outer-eval-context enums that parameterize trait calls.
 
-use super::*;
+use crate::families::custom_family::joint_newton_defaults::{
+    exact_newton_joint_hessian_directional_derivative_from_blocks,
+    exact_newton_joint_hessian_directional_derivative_from_working_sets,
+    exact_newton_joint_hessian_from_exact_blocks, exact_newton_joint_hessian_from_working_sets,
+    exact_newton_joint_hessiansecond_directional_derivative_from_blocks,
+    joint_hessian_has_cross_block_coupling,
+};
+use crate::families::custom_family::options::{
+    BlockwiseFitOptions, OuterDerivativePolicy, assert_derivative_blocks_match_specs,
+    assert_rho_matches_specs, assert_states_match_specs, assert_valid_blockspecs,
+    assert_valid_options, default_coefficient_hessian_cost, default_outer_derivative_policy_costs,
+    exact_outer_order_with_outer_hvp, validate_hessian_workspace_ready,
+};
+use crate::families::custom_family::psi_design::{
+    CustomFamilyBlockPsiDerivative, ExactNewtonJointHessianWorkspace,
+};
+use gam_linalg::matrix::DesignMatrix;
+use gam_problem::{
+    BlockGeometryDirectionalDerivative, BlockWorkingSet, ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace, ExactNewtonOuterObjective,
+    ExactOuterDerivativeOrder, LinearInequalityConstraints, ParameterBlockSpec,
+    ParameterBlockState, PseudoLogdetMode,
+};
+use ndarray::{Array1, Array2};
+use std::sync::Arc;
 
 /// Family evaluation over all parameter blocks.
 #[derive(Clone, Debug)]
@@ -59,6 +83,13 @@ pub struct BatchedOuterGradientTerms {
     pub trace_h_inv_hdot: Array1<f64>,
     /// `tr(S⁺ · ∂S/∂θ_j)` for each j (penalty pseudo-logdet first derivative).
     pub trace_s_pinv_sdot: Array1<f64>,
+}
+
+/// Scale-aware exact joint curvature payload for the outer REML evaluator.
+pub struct ExactNewtonOuterCurvature {
+    pub hessian: Array2<f64>,
+    pub rho_curvature_scale: f64,
+    pub hessian_logdet_correction: f64,
 }
 
 /// User-defined family contract for multi-block generalized models.

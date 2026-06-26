@@ -7,6 +7,8 @@ edition = "2024"
 warnings = "deny"
 
 [dependencies]
+gam-linalg = { path = "../gam-linalg", version = "=0.3.124" }
 gam-problem = { path = "../gam-problem", version = "=0.3.124" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.124" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
