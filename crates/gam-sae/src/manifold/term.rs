@@ -300,7 +300,7 @@ pub struct SaeManifoldTerm {
     /// unrepresentable. `None` ⇒ Euclidean / isotropic (magic-by-default: the
     /// metric is selected by whether per-row Fisher factors were installed, not
     /// by a flag), which is bit-for-bit the historical isotropic `φ̂` path.
-    pub(crate) row_metric: Option<crate::inference::row_metric::RowMetric>,
+    pub(crate) row_metric: Option<gam_problem::RowMetric>,
     /// #976 Layer-1 guard ledger for the most recent joint fit: every
     /// active-mass breach with the action taken (re-seed / terminal). Cleared
     /// at the start of each `run_joint_fit_arrow_schur`; read post-fit via

@@ -66,7 +66,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1};
 
-use crate::inference::row_metric::{MetricProvenance, RowMetric};
+use gam_problem::{MetricProvenance, RowMetric};
 use crate::terms::sae::manifold::SaeManifoldTerm;
 
 /// Number of sub-steps the latent path `[t_from, t_to]` is integrated over for

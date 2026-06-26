@@ -41,16 +41,16 @@
 //! being collapsed into the boolean.
 //!
 //! The whole computation is performed in the inner product carried by the fit's
-//! [`crate::inference::row_metric::RowMetric`]: the curvature root `R` is built
+//! [`gam_problem::RowMetric`]: the curvature root `R` is built
 //! from the metric-whitened Jacobian, so the certificate's "computed in metric
-//! X" line reads straight off [`crate::inference::row_metric::RowMetric::provenance`]
-//! ([`crate::inference::row_metric::MetricProvenance`]) and cannot misreport —
+//! X" line reads straight off [`gam_problem::RowMetric::provenance`]
+//! ([`gam_problem::MetricProvenance`]) and cannot misreport —
 //! there is only one metric object.
 
 use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, transport_ladder};
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
 use crate::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
-use crate::inference::row_metric::{MetricProvenance, RowMetric};
+use gam_problem::{MetricProvenance, RowMetric};
 use crate::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,

@@ -575,7 +575,7 @@ impl SaeManifoldTerm {
         self.row_loss_weights = None;
     }
 
-    /// Install the single per-row [`RowMetric`](crate::inference::row_metric::RowMetric)
+    /// Install the single per-row [`RowMetric`](gam_problem::RowMetric)
     /// that both the reconstruction likelihood and the isometry gauge read.
     /// Installing per-row output-Fisher factors here flips the provenance to
     /// `OutputFisher` *and* is the only way the gauge acquires a non-identity
@@ -585,7 +585,7 @@ impl SaeManifoldTerm {
     /// The metric's row count and output dimension must match the term.
     pub fn set_row_metric(
         &mut self,
-        metric: crate::inference::row_metric::RowMetric,
+        metric: gam_problem::RowMetric,
     ) -> Result<(), String> {
         if metric.n_rows() != self.n_obs() {
             return Err(format!(
@@ -607,24 +607,24 @@ impl SaeManifoldTerm {
 
     /// The installed per-row metric, if any. `None` ⇒ Euclidean / isotropic.
     /// Consumed by the gauge wiring (to build the matching `WeightField`) and by
-    /// Object 4 (to read the [`MetricProvenance`](crate::inference::row_metric::MetricProvenance)).
-    pub fn row_metric(&self) -> Option<&crate::inference::row_metric::RowMetric> {
+    /// Object 4 (to read the [`MetricProvenance`](gam_problem::MetricProvenance)).
+    pub fn row_metric(&self) -> Option<&gam_problem::RowMetric> {
         self.row_metric.as_ref()
     }
 
     /// The per-row inner product the additive diagnostics read through: the
-    /// installed [`RowMetric`](crate::inference::row_metric::RowMetric) when one
+    /// installed [`RowMetric`](gam_problem::RowMetric) when one
     /// was set (output-Fisher harvest present), otherwise a freshly-built
     /// Euclidean metric of the term's own `(n_obs, output_dim)` shape. Either way
     /// a metric always exists, so the diagnostics are never gated by a flag — the
     /// Euclidean fallback is the bit-identical isotropic path.
     pub(crate) fn diagnostic_metric(
         &self,
-    ) -> Result<crate::inference::row_metric::RowMetric, String> {
+    ) -> Result<gam_problem::RowMetric, String> {
         match self.row_metric() {
             Some(metric) => Ok(metric.clone()),
             None => {
-                crate::inference::row_metric::RowMetric::euclidean(self.n_obs(), self.output_dim())
+                gam_problem::RowMetric::euclidean(self.n_obs(), self.output_dim())
             }
         }
     }
@@ -833,7 +833,7 @@ impl SaeManifoldTerm {
         &self,
         atom_idx: usize,
         assignments: ArrayView2<'_, f64>,
-        metric: &crate::inference::row_metric::RowMetric,
+        metric: &gam_problem::RowMetric,
         active_threshold: f64,
     ) -> Result<(f64, f64), String> {
         let atom = &self.atoms[atom_idx];
@@ -969,7 +969,7 @@ impl SaeManifoldTerm {
     /// (`frame_k[i, a]` at offset `atom_offset(k) + i·latent_dim_k + a`).
     pub(crate) fn to_residual_gauge_model(
         &self,
-        metric: crate::inference::row_metric::RowMetric,
+        metric: gam_problem::RowMetric,
         per_atom_ard_variances: Option<&[Option<Array1<f64>>]>,
         isometry_pin_active: bool,
     ) -> Result<
@@ -1215,7 +1215,7 @@ impl SaeManifoldTerm {
 
     pub(crate) fn residual_gauge_streamed_data_curvature(
         &self,
-        metric: &crate::inference::row_metric::RowMetric,
+        metric: &gam_problem::RowMetric,
         atom_offsets: &[usize],
         atom_axis_dim: &[usize],
         param_dim: usize,

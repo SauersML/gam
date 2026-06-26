@@ -45,7 +45,7 @@
 //! estimation roles instead of the likelihood.
 
 use crate::inference::row_measure::{RowSamplingMeasure, per_row_fisher_mass};
-use crate::inference::row_metric::{MetricProvenance, RowMetric};
+use gam_problem::{MetricProvenance, RowMetric};
 
 /// The Fisher-bearing tier: which corpus rows carry factors, and the metric
 /// over exactly those rows.

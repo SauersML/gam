@@ -23,11 +23,13 @@ pub mod block_spec;
 pub mod coefficient_prior_mean;
 pub mod custom_family_error;
 pub mod family_options;
+pub mod fisher_rao;
 pub mod gauge;
 pub mod identifiability_audit;
 pub mod penalty_coordinate;
 pub mod penalty_matrix;
 pub mod psi_terms;
+pub mod row_metric;
 mod pseudo_logdet;
 mod seeding;
 pub mod solver_contract;
@@ -67,6 +69,9 @@ pub use block_spec::{
 };
 pub use coefficient_prior_mean::{CoefficientPriorMean, PriorMeanError};
 pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
+pub use fisher_rao::{
+    FisherRaoDefiniteness, normalize_fisher_rao_blocks, normalize_fisher_rao_blocks_pd,
+};
 pub use gauge::Gauge;
 pub use identifiability_audit::{
     AliasedPair, BlockIdentity, DroppedColumn, IdentifiabilityAudit, MapUniquenessError,
@@ -79,6 +84,7 @@ pub use psi_terms::{
     ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
 };
 pub use pseudo_logdet::PseudoLogdetMode;
+pub use row_metric::{MetricProvenance, RowMetric, WeightField};
 pub use seeding::{SeedConfig, SeedRiskProfile, clamp_seed_rho_to_bounds, normalize_seed_bounds};
 pub use solver_contract::{
     DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterEval,

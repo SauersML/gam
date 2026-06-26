@@ -56,7 +56,7 @@
 //! external tangent supplied, and it collapses to the constant `p` under
 //! Euclidean — which is precisely the uniform-measure degeneracy we want.
 
-use crate::inference::row_metric::{MetricProvenance, RowMetric};
+use gam_problem::{MetricProvenance, RowMetric};
 use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
 use crate::linalg::utils::splitmix64_hash;
 use faer::Side;

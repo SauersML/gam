@@ -1,4 +1,5 @@
 use super::*;
+pub use gam_problem::WeightField;
 
 // ---------------------------------------------------------------------------
 // Isometry penalty
@@ -29,38 +30,6 @@ impl std::fmt::Debug for IsometryReference {
     }
 }
 
-/// Per-observation behavioral-metric field `W_n ∈ ℝ^{p × p}`, stored in
-/// **low-rank factored form** `W_n = U_n U_n^T` with `U_n ∈ ℝ^{p × r_n}`.
-///
-/// The canonical coordinate is the one where one unit of motion in `t` is one
-/// unit of behavioral change in the output space, so the `W_n` weighting is
-/// load-bearing: the pullback metric is `g_n = J_n^T W_n J_n`. Storing as
-/// `U_n` lets every contraction in this module run in
-/// `(J^T U_n)(U_n^T J)` order, which is `O(p · r · d + r · d²)` per row — we
-/// **never** materialize the `p × p` `W_n`, which is essential when `p`
-/// (number of observation channels) is large but rank is small (e.g. one or
-/// two behavioral dimensions per latent observation).
-///
-/// `Identity` is the gauge-fix default and corresponds to `U_n = I_p` so the
-/// pullback reduces to the standard `J_n^T J_n`. `Factored` stores the
-/// per-row `U_n` blocks contiguously: every row's factor is `p × rank`, and
-/// rows may share the same rank (uniform-rank case) or vary if the field is
-/// data-driven. For the uniform-rank case the storage is
-/// `(n_obs, p * rank)` row-major.
-#[derive(Clone)]
-pub enum WeightField {
-    /// `W_n = I_p` for every `n`. Reduces to the bare pullback `J^T J`.
-    Identity,
-    /// Per-row low-rank factor `U_n ∈ ℝ^{p × rank}`. Storage layout: a
-    /// `(n_obs, p * rank)` row-major matrix where row `n` packs `U_n` in
-    /// column-major-within-row order `U_n[i, k] = u[n, i * rank + k]`.
-    Factored {
-        u: Arc<Array2<f64>>,
-        rank: usize,
-        p_out: usize,
-    },
-}
-
 /// Radial Duchon decoder metadata used to materialize
 /// `∂J_n[i, a] / ∂t_{n, c}` from `φ'(r)` and `φ''(r)` on demand.
 ///
@@ -80,46 +49,6 @@ pub struct IsometryDuchonRadialSource {
     /// hybrid Green's function `φ_{p,s,κ}` rather than a hard-coded `s = 0`
     /// surrogate (issue #440).
     pub power: usize,
-}
-
-impl std::fmt::Debug for WeightField {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            WeightField::Identity => f.write_str("Identity"),
-            WeightField::Factored { u, rank, p_out } => f
-                .debug_struct("Factored")
-                .field("shape", &format_args!("{}×{}", u.nrows(), u.ncols()))
-                .field("rank", rank)
-                .field("p_out", p_out)
-                .finish(),
-        }
-    }
-}
-
-impl WeightField {
-    /// Apply `U_n^T J_n` for a specific row, given both the row's `J_n` flat
-    /// `(p * d)` slice and the row's `U_n` flat `(p * rank)` slice. Returns
-    /// the `(rank × d)` matrix and its row count.
-    fn project_jac_row_with_u(
-        u_row: &[f64],
-        jac_row: &[f64],
-        p: usize,
-        rank: usize,
-        d: usize,
-    ) -> Array2<f64> {
-        // M[k, a] = Σ_i U[i, k] · J[i, a].
-        let mut m = Array2::<f64>::zeros((rank, d));
-        for k in 0..rank {
-            for a in 0..d {
-                let mut s = 0.0;
-                for i in 0..p {
-                    s += u_row[i * rank + k] * jac_row[i * d + a];
-                }
-                m[[k, a]] = s;
-            }
-        }
-        m
-    }
 }
 
 /// Isometry-to-reference penalty (canonical-coordinate gauge term).
@@ -519,7 +448,7 @@ impl IsometryPenalty {
     }
 
     /// Attach the gauge metric **from the single
-    /// [`RowMetric`](crate::inference::row_metric::RowMetric)** that also drives
+    /// [`RowMetric`](gam_problem::RowMetric)** that also drives
     /// the reconstruction likelihood. This is the only way an `IsometryPenalty`
     /// acquires a non-identity behavioral metric: the independent
     /// `WeightField` setter has been removed so a gauge-metric ≠
@@ -531,7 +460,7 @@ impl IsometryPenalty {
     /// `p_out` is taken from the metric so the gauge's output dimension is
     /// pinned to the metric's.
     #[must_use]
-    pub fn with_row_metric(mut self, metric: &crate::inference::row_metric::RowMetric) -> Self {
+    pub fn with_row_metric(mut self, metric: &gam_problem::RowMetric) -> Self {
         // Only a metric that drives the gauge installs a non-identity pullback
         // weight. A Euclidean metric reduces the gauge pullback to the bare
         // `J_nᵀ J_n`, so its `to_weight_field()` is `Identity` and the existing

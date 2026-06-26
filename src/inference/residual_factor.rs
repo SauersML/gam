@@ -1,5 +1,5 @@
 //! #974 — the structured-residual covariance estimator and the single producer
-//! of [`MetricProvenance::WhitenedStructured`](crate::inference::row_metric::MetricProvenance::WhitenedStructured).
+//! of [`MetricProvenance::WhitenedStructured`](gam_problem::MetricProvenance::WhitenedStructured).
 //!
 //! # What this estimates
 //!
@@ -38,8 +38,8 @@
 //!
 //! [`StructuredResidualModel::row_metric`] materializes the **per-row precision
 //! factor** `U_n ∈ ℝ^{p×p}` with `U_n U_nᵀ = Σ_n^{-1}`, packaged as a
-//! [`RowMetric`](crate::inference::row_metric::RowMetric) with
-//! [`MetricProvenance::WhitenedStructured`](crate::inference::row_metric::MetricProvenance::WhitenedStructured).
+//! [`RowMetric`](gam_problem::RowMetric) with
+//! [`MetricProvenance::WhitenedStructured`](gam_problem::MetricProvenance::WhitenedStructured).
 //! Whitening a residual `r_n` through it (`U_nᵀ r_n`) yields a vector whose
 //! squared Euclidean norm is `r_nᵀ Σ_n^{-1} r_n` — the Mahalanobis residual under
 //! the estimated noise model, which is exactly the likelihood-correct data-fit.
@@ -49,13 +49,13 @@
 //!
 //! This is the first real producer of `WhitenedStructured`, and therefore the
 //! first metric whose `whitens_likelihood()` is `true`: see
-//! [`RowMetric::whitens_likelihood`](crate::inference::row_metric::RowMetric::whitens_likelihood).
+//! [`RowMetric::whitens_likelihood`](gam_problem::RowMetric::whitens_likelihood).
 
 use std::sync::Arc;
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::inference::row_metric::RowMetric;
+use gam_problem::RowMetric;
 use crate::linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use faer::Side;
 
@@ -85,8 +85,8 @@ const SCALE_REL_FLOOR: f64 = 1e-4;
 /// The fitted structured residual-covariance model: low-rank factor `Λ`,
 /// idiosyncratic diagonal `D`, and the smooth activity-scale `c(z)` evaluated at
 /// every row. Produces per-row precision factors and the
-/// [`MetricProvenance::WhitenedStructured`](crate::inference::row_metric::MetricProvenance::WhitenedStructured)
-/// [`RowMetric`](crate::inference::row_metric::RowMetric).
+/// [`MetricProvenance::WhitenedStructured`](gam_problem::MetricProvenance::WhitenedStructured)
+/// [`RowMetric`](gam_problem::RowMetric).
 #[derive(Clone, Debug)]
 pub struct StructuredResidualModel {
     /// Output dimensionality `p` (residual width).
@@ -368,8 +368,8 @@ impl StructuredResidualModel {
 
     /// Build the per-row precision factor stack `U_n ∈ ℝ^{p×p}` with
     /// `U_n U_nᵀ = Σ_n^{-1}` and package it as a
-    /// [`MetricProvenance::WhitenedStructured`](crate::inference::row_metric::MetricProvenance::WhitenedStructured)
-    /// [`RowMetric`](crate::inference::row_metric::RowMetric). This is the single
+    /// [`MetricProvenance::WhitenedStructured`](gam_problem::MetricProvenance::WhitenedStructured)
+    /// [`RowMetric`](gam_problem::RowMetric). This is the single
     /// production site of `WhitenedStructured`.
     ///
     /// The precision is formed in **Woodbury form**:

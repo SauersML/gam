@@ -11,7 +11,7 @@
 //! optional and may be absent. The corrected paradigm:
 //!
 //! * **The SAE fit stays on activations.** The reconstruction likelihood
-//!   whitens through the [`RowMetric`](crate::inference::row_metric::RowMetric)
+//!   whitens through the [`RowMetric`](gam_problem::RowMetric)
 //!   exactly as before; with the default Euclidean provenance that is the
 //!   bit-for-bit isotropic path. The Fisher metric **never** replaces the loss.
 //! * **The lens is an additive report.** It reads the *already-fitted* model and
@@ -33,7 +33,7 @@
 //! * **coupling** (behavioral, *the only place Fisher enters*): the output-Fisher
 //!   mass along the atom's decoder tangent `dg_k/dt`, averaged over the atom's
 //!   active rows. This is computed through
-//!   [`RowMetric::fisher_mass`](crate::inference::row_metric::RowMetric::fisher_mass)
+//!   [`RowMetric::fisher_mass`](gam_problem::RowMetric::fisher_mass)
 //!   — a *reported* score, never folded into a loss or criterion. Under a
 //!   Euclidean / no-Fisher provenance the coupling is **not available** (`None`),
 //!   degrading gracefully exactly as the harvest of the Fisher factors is
@@ -51,7 +51,7 @@
 
 use ndarray::{ArrayView1, ArrayView2};
 
-use crate::inference::row_metric::{MetricProvenance, RowMetric};
+use gam_problem::{MetricProvenance, RowMetric};
 use crate::terms::sae::manifold::SaeManifoldTerm;
 
 /// Below this active mass a row is not "truly active" for an atom, so it

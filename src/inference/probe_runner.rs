@@ -29,7 +29,7 @@
 
 use ndarray::array;
 
-use crate::inference::row_metric::RowMetric;
+use gam_problem::RowMetric;
 use crate::inference::steering::{SteerPlan, steer_delta};
 use crate::inference::structure_evidence::{
     CandidateProbe, ClaimKind, ProbePlan, StructureLedger, plan_probe_for_contested_claim,
