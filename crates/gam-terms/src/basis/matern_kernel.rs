@@ -337,7 +337,7 @@ pub fn build_thin_plate_basiswithworkspace(
 ///
 /// Returns the per-block penalty matrices (term-local frame, same order/count
 /// the cold build emits) and the active per-block nullspace dims.
-pub(crate) fn thin_plate_penalties_at_length_scale(
+pub fn thin_plate_penalties_at_length_scale(
     centers: ArrayView2<'_, f64>,
     identifiability_transform: Option<&Array2<f64>>,
     radial_reparam: Option<&Array2<f64>>,

@@ -1,6 +1,6 @@
 use crate::basis::BasisError;
 use faer::{Mat, MatRef, Side};
-use gam_linalg::faer_ndarray::{FaerEigh, FaerLinalgError};
+use gam_linalg::faer_ndarray::FaerLinalgError;
 use ndarray::{Array1, Array2, Axis};
 use rayon::prelude::*;
 use std::sync::Arc;

@@ -432,7 +432,7 @@ impl LatentCoordValues {
     /// At `r = 0` the unit vector `(t − c)/r` is undefined; the radial scalar
     /// path therefore asks the kernel for the finite `q` limit and surfaces
     /// `BasisError::DegenerateAtCollision` when that limit does not exist.
-    pub(crate) fn design_gradient_wrt_t(
+    pub fn design_gradient_wrt_t(
         &self,
         centers: ArrayView2<'_, f64>,
         radial_kind: &RadialScalarKind,
@@ -479,7 +479,7 @@ impl LatentCoordValues {
     /// pre-builds that jet using the matching `*_first_derivative_nd` helper
     /// in [`crate::basis`] and passes it in via
     /// [`InputLocationDerivative::Jet`].
-    pub(crate) fn design_gradient_wrt_t_dispatch(
+    pub fn design_gradient_wrt_t_dispatch(
         &self,
         input: InputLocationDerivative<'_>,
     ) -> Result<Array3<f64>, BasisError> {

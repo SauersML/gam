@@ -1972,10 +1972,8 @@ pub fn initial_aniso_contrasts(centers: ArrayView2<'_, f64>) -> Vec<f64> {
 /// strategies and the pure-Duchon `scale_dims` path), selected by
 /// [`resolve_matern_forward_aniso`].
 pub(crate) fn centered_aniso_contrasts(aniso: Option<&[f64]>) -> Option<Vec<f64>> {
-    use crate::smooth::center_aniso_log_scales as center;
-
     match aniso {
-        Some(v) if v.len() > 1 => Some(center(v)),
+        Some(v) if v.len() > 1 => Some(center_aniso_log_scales(v)),
         Some(v) => Some(v.to_vec()),
         None => None,
     }
@@ -2002,8 +2000,6 @@ pub(crate) fn auto_seed_aniso_contrasts(
     centers: ArrayView2<'_, f64>,
     aniso: Option<&[f64]>,
 ) -> Option<Vec<f64>> {
-    use crate::smooth::center_aniso_log_scales as center;
-
     let eta = match aniso {
         Some(v) if v.len() > 1 => v,
         Some(v) => return Some(v.to_vec()),
@@ -2011,14 +2007,31 @@ pub(crate) fn auto_seed_aniso_contrasts(
     };
     let all_zero = eta.iter().all(|&e| e == 0.0);
     if !all_zero {
-        return Some(center(eta));
+        return Some(center_aniso_log_scales(eta));
     }
     let contrasts = initial_aniso_contrasts(centers);
     if contrasts.is_empty() {
-        Some(center(eta))
+        Some(center_aniso_log_scales(eta))
     } else {
-        Some(center(&contrasts))
+        Some(center_aniso_log_scales(&contrasts))
     }
+}
+
+fn center_aniso_log_scales(eta: &[f64]) -> Vec<f64> {
+    if eta.len() <= 1 {
+        return eta.to_vec();
+    }
+    let mean = eta.iter().sum::<f64>() / eta.len() as f64;
+    eta.iter()
+        .map(|&v| {
+            let centered = v - mean;
+            if centered.abs() <= 1e-15 {
+                0.0
+            } else {
+                centered
+            }
+        })
+        .collect()
 }
 
 /// How the Matérn forward design build interprets an *exactly all-zero*

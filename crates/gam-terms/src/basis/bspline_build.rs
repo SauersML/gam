@@ -1336,7 +1336,7 @@ fn apply_bspline_identifiability_policy_in_chart(
     Ok((design_c, penalties_c, z_opt))
 }
 
-pub(crate) fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, BasisError> {
+pub fn estimate_penalty_nullity(penalty: &Array2<f64>) -> Result<usize, BasisError> {
     if penalty.nrows() != penalty.ncols() {
         crate::bail_dim_basis!("penalty matrix must be square when estimating nullspace");
     }

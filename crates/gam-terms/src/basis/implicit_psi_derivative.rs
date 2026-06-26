@@ -175,7 +175,7 @@ impl JetLatentCoordLocalDesignJacobian {
 ///
 /// This is the close condition for #767: a new coordinate type touches zero
 /// operator-surface code; it provides only its local Jacobian and geometry.
-pub(crate) trait LocalDesignJacobianProvider: Send + Sync + std::fmt::Debug {
+pub trait LocalDesignJacobianProvider: Send + Sync + std::fmt::Debug {
     /// Number of data rows `n` the operator spans.
     fn n_data(&self) -> usize;
 
@@ -281,7 +281,7 @@ impl LatentCoordDesignDerivative {
         Self { provider }
     }
 
-    pub(crate) fn new_matern(
+    pub fn new_matern(
         latent: Arc<crate::latent::LatentCoordValues>,
         centers: Arc<Array2<f64>>,
         length_scale: f64,
@@ -309,7 +309,7 @@ impl LatentCoordDesignDerivative {
         )))
     }
 
-    pub(crate) fn new_duchon(
+    pub fn new_duchon(
         latent: Arc<crate::latent::LatentCoordValues>,
         centers: Arc<Array2<f64>>,
         length_scale: Option<f64>,
@@ -364,7 +364,7 @@ impl LatentCoordDesignDerivative {
         )))
     }
 
-    pub(crate) fn new_sphere(
+    pub fn new_sphere(
         latent: Arc<crate::latent::LatentCoordValues>,
         centers: Arc<Array2<f64>>,
         penalty_order: usize,
@@ -389,7 +389,7 @@ impl LatentCoordDesignDerivative {
         Self::from_jet(latent, jet, ident_transform)
     }
 
-    pub(crate) fn new_periodic_bspline(
+    pub fn new_periodic_bspline(
         latent: Arc<crate::latent::LatentCoordValues>,
         data_range: (f64, f64),
         degree: usize,
@@ -408,7 +408,7 @@ impl LatentCoordDesignDerivative {
         Self::from_jet(latent, jet, ident_transform)
     }
 
-    pub(crate) fn new_tensor_bspline(
+    pub fn new_tensor_bspline(
         latent: Arc<crate::latent::LatentCoordValues>,
         knots_per_axis: Vec<Array1<f64>>,
         degrees: Vec<usize>,
@@ -426,7 +426,7 @@ impl LatentCoordDesignDerivative {
         Self::from_jet(latent, jet, ident_transform)
     }
 
-    pub(crate) fn new_pca(
+    pub fn new_pca(
         latent: Arc<crate::latent::LatentCoordValues>,
         basis_matrix: Arc<Array2<f64>>,
     ) -> Result<Self, BasisError> {
@@ -449,7 +449,7 @@ impl LatentCoordDesignDerivative {
         Self::from_jet(latent, jet, None)
     }
 
-    pub(crate) fn from_jet(
+    pub fn from_jet(
         latent: Arc<crate::latent::LatentCoordValues>,
         jet: Array3<f64>,
         ident_transform: Option<Array2<f64>>,
@@ -882,7 +882,7 @@ impl ImplicitDesignPsiDerivative {
             .map_or(self.n_axes, Vec::len)
     }
 
-    pub(crate) fn is_duchon_family(&self) -> bool {
+    pub fn is_duchon_family(&self) -> bool {
         self.streaming.as_ref().is_some_and(|state| {
             matches!(
                 state.radial_kind,
@@ -929,7 +929,7 @@ impl ImplicitDesignPsiDerivative {
         }
     }
 
-    pub(crate) fn append_full_transform(
+    pub fn append_full_transform(
         mut self,
         transform: &Array2<f64>,
     ) -> Result<Self, BasisError> {

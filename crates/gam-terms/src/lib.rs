@@ -25,7 +25,15 @@ pub mod dictionary;
 pub mod geometry;
 pub mod kronecker;
 pub mod latent;
-pub mod smooth_overrides;
+
+#[macro_export]
+macro_rules! gpu_bail {
+    ($($arg:tt)*) => {
+        return ::std::result::Result::Err(gam_gpu::gpu_error::GpuError::DriverCallFailed {
+            reason: ::std::format!($($arg)*),
+        })
+    };
+}
 
 pub mod construction {
     pub use crate::kronecker::{KroneckerInvariantStructure, kronecker_product};

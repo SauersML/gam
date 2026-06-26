@@ -1,7 +1,8 @@
 use gam_linalg::faer_ndarray::{
-    FaerEigh, FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_abt, fast_ata, fast_atb,
+    FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_abt, fast_ata, fast_atb,
     rrqr_nullspace_basis, rrqr_with_permutation,
 };
+pub(crate) use gam_linalg::faer_ndarray::FaerEigh;
 
 use gam_linalg::utils::KahanSum;
 
