@@ -10,6 +10,7 @@ warnings = "deny"
 [dependencies]
 faer = "0.24.0"
 gam-geometry = { path = "../gam-geometry", version = "=0.3.124" }
+gam-data = { path = "../gam-data", version = "=0.3.124" }
 gam-gpu = { path = "../gam-gpu", version = "=0.3.124" }
 gam-linalg = { path = "../gam-linalg", version = "=0.3.124" }
 gam-math = { path = "../gam-math", version = "=0.3.124" }
@@ -18,11 +19,16 @@ gam-runtime = { path = "../gam-runtime", version = "=0.3.124" }
 gam-spec = { path = "../gam-spec", version = "=0.3.124" }
 libm = "0.2.16"
 log = "0.4.29"
+memmap2 = "0.9.10"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+rand = "0.10.1"
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 smallvec = "1"
+statrs = "0.18.0"
+thiserror = "2.0.18"
+wide = "0.7"
 
 [dev-dependencies]
 approx = "0.5.1"
