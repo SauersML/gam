@@ -132,6 +132,20 @@ enum RemlInnerCapGuardArm {
     MixtureSas,
 }
 
+/// Re-run one full-inner-tolerance `compute_cost` at the converged operating
+/// point so the cached warm-start β is no longer pinned to whatever coarse cap
+/// the outer-aware inner-PIRLS schedule last set (path #3; see the call-site
+/// comments).
+///
+/// `rho` MUST be the smoothing-only penalty-block log-λ — its length equals the
+/// number of penalty blocks, because `compute_cost` exponentiates the whole
+/// vector into the penalty λ vector. For the parameterized-link arms
+/// (`MixtureSas`: SAS / Beta-Logistic / mixture / blended) the outer optimizer
+/// works in an augmented θ that trails the link parameters after the smoothing
+/// block; the caller must slice that block out (and install the link state on
+/// `state`) via `apply_link_theta` BEFORE calling this guard. Passing the raw
+/// augmented θ here over-counts the lambdas and faults the reparameterizer
+/// ("Lambda count mismatch", #1571). The `arm` only selects the log label.
 fn run_outer_inner_cap_guard(
     state: &mut crate::solver::estimate::reml::RemlState<'_>,
     rho: &Array1<f64>,
@@ -1870,12 +1884,31 @@ where
             // Convergence guard for the outer-aware inner-PIRLS schedule
             // (path #3) — see the matching comment in the standard REML arm
             // above. Reset the cap and run one final compute_cost at the
-            // converged ρ so the cached warm-start β is at full inner
+            // converged θ so the cached warm-start β is at full inner
             // tolerance regardless of where the BFGS schedule was when the
             // optimizer terminated.
+            //
+            // The outer vector here is the AUGMENTED θ = [ρ_smooth (k) | link
+            // params (mixture_dim and/or sas_dim)], not a smoothing-only ρ.
+            // `compute_cost` exponentiates its argument wholesale into the
+            // penalty λ vector (loop_driver.rs `rho.mapv(exp)`), so the guard
+            // must receive exactly the same smoothing-only ρ — and the same
+            // installed link state — the outer evaluator operated on, never the
+            // raw augmented θ. Feeding the full θ in made the guard hand `k +
+            // mixture_dim + sas_dim` "lambdas" to a `k`-penalty reparameterizer,
+            // which faults with "Lambda count mismatch" (#1571). Route θ through
+            // the same `apply_link_theta` the eval closure (optimizer.rs:1759)
+            // and the accept-fit slice (the `final_rho` line just below) use: it
+            // installs the converged mixture/SAS link state onto `reml_state`
+            // and returns the smoothing-only ρ block.
+            let guard_rho = {
+                let mut state_ref: &mut crate::solver::estimate::reml::RemlState<'_> =
+                    &mut reml_state;
+                apply_link_theta(&mut state_ref, &outer_result.rho)?
+            };
             run_outer_inner_cap_guard(
                 &mut reml_state,
-                &outer_result.rho,
+                &guard_rho,
                 RemlInnerCapGuardArm::MixtureSas,
             )?;
             let final_rho = outer_result.rho.slice(s![..k]).to_owned();
