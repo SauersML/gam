@@ -728,7 +728,7 @@ where
             // `select_objective_seed_on_log_lambda_grid`.
             let nullspace_seed_coords: Vec<usize> = if n_design_rows >= 2 * p {
                 match reml_state.effective_rho_prior().as_ref() {
-                    crate::types::RhoPrior::Independent(per_coord) => (0..k)
+                    gam_problem::RhoPrior::Independent(per_coord) => (0..k)
                         .filter(|&i| {
                             per_coord
                                 .get(i)
@@ -1132,7 +1132,7 @@ where
                     .filter(|&i| strategy_result.rho[i] >= rho_upper - 1e-9)
                     .collect();
                 if n_design_rows >= 2 * p
-                    && let crate::types::RhoPrior::Independent(per_coord) =
+                    && let gam_problem::RhoPrior::Independent(per_coord) =
                         reml_state.effective_rho_prior().as_ref()
                 {
                     for i in 0..strategy_result.rho.len() {
@@ -1362,7 +1362,7 @@ where
                 let well_determined = n_design_rows >= 2 * p;
                 let select_coords: Vec<usize> = if well_determined {
                     match reml_state.effective_rho_prior().as_ref() {
-                        crate::types::RhoPrior::Independent(per_coord) => {
+                        gam_problem::RhoPrior::Independent(per_coord) => {
                             (0..strategy_result.rho.len())
                                 .filter(|&i| {
                                     per_coord.get(i).is_some_and(

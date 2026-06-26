@@ -83,9 +83,9 @@ pub(crate) const MIN_DERIV: f64 = 1e-8;
 /// at large scale.
 ///
 /// This is the canonical positive-weight floor (`1e-12`); the value is owned by
-/// [`crate::types::MIN_WEIGHT`] so every floored family shares one definition
+/// [`gam_problem::MIN_WEIGHT`] so every floored family shares one definition
 /// rather than re-declaring it per module.
-use crate::types::MIN_WEIGHT;
+use gam_problem::MIN_WEIGHT;
 
 /// Hard symmetric clamp on η used by the Poisson / Gaussian / Gamma working-
 /// model log-likelihood loops to keep `exp(η)` and `log(σ)` finite under the

@@ -22,7 +22,7 @@ pub(crate) fn outerobjectivegradienthessian<F: CustomFamily + Clone + Send + Syn
         penalty_counts,
         rho,
         warm_start,
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
         eval_mode,
     )?;
     Ok((

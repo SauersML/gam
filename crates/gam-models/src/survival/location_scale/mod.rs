@@ -110,7 +110,7 @@ use crate::model_types::{
 
 use gam_terms::construction::kronecker_product;
 
-use crate::types::{InverseLink, StandardLink};
+use gam_problem::{InverseLink, StandardLink};
 
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};
 

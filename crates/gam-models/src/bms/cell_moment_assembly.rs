@@ -2998,7 +2998,7 @@ mod empirical_rigid_jet_oracle_tests {
             z: Arc::new(Array1::from_vec(z)),
             latent_measure: LatentMeasureKind::GlobalEmpirical { grid },
             gaussian_frailty_sd: frailty_sd,
-            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+            base_link: InverseLink::Standard(gam_problem::StandardLink::Probit),
             marginal_design: dummy(),
             logslope_design: dummy(),
             score_warp: None,
@@ -3045,7 +3045,7 @@ mod empirical_rigid_jet_oracle_tests {
 
             for row in 0..n {
                 let marginal = bernoulli_marginal_link_map(
-                    &InverseLink::Standard(crate::types::StandardLink::Probit),
+                    &InverseLink::Standard(gam_problem::StandardLink::Probit),
                     m[row],
                 )
                 .expect("marginal link map");
@@ -3181,7 +3181,7 @@ mod empirical_rigid_jet_oracle_tests {
         let family = empirical_family(vec![y0], vec![z0], vec![w0], None, grid.clone());
         let s = family.probit_frailty_scale();
         let marginal = bernoulli_marginal_link_map(
-            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            &InverseLink::Standard(gam_problem::StandardLink::Probit),
             m0,
         )
         .expect("link map");
@@ -3328,7 +3328,7 @@ mod empirical_rigid_jet_oracle_tests {
 
             for row in 0..n {
                 let marginal = bernoulli_marginal_link_map(
-                    &InverseLink::Standard(crate::types::StandardLink::Probit),
+                    &InverseLink::Standard(gam_problem::StandardLink::Probit),
                     m[row],
                 )
                 .expect("marginal link map");
@@ -3465,7 +3465,7 @@ mod empirical_rigid_jet_oracle_tests {
         let (z0, y0, w0) = (0.5_f64, 1.0_f64, 1.0_f64);
         let family = empirical_family(vec![y0], vec![z0], vec![w0], None, grid.clone());
         let marginal = bernoulli_marginal_link_map(
-            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            &InverseLink::Standard(gam_problem::StandardLink::Probit),
             m0,
         )
         .expect("link map");
@@ -3601,7 +3601,7 @@ mod empirical_flex_jet_oracle_tests {
             z: Arc::new(Array1::from_vec(vec![0.45])),
             latent_measure: LatentMeasureKind::GlobalEmpirical { grid: grid.clone() },
             gaussian_frailty_sd: None,
-            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+            base_link: InverseLink::Standard(gam_problem::StandardLink::Probit),
             marginal_design: dummy(),
             logslope_design: dummy(),
             score_warp: if is_score_warp {
@@ -3775,7 +3775,7 @@ mod empirical_flex_jet_oracle_tests {
         let beta = Array1::from_iter(dev_range.clone().map(|i| p[i]));
         let scale = fx.family.probit_frailty_scale();
         let marginal = bernoulli_marginal_link_map(
-            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            &InverseLink::Standard(gam_problem::StandardLink::Probit),
             q,
         )
         .expect("witness link map");
@@ -3908,7 +3908,7 @@ mod empirical_flex_jet_oracle_tests {
         let beta0_0 = beta[0];
         let scale = fx.family.probit_frailty_scale();
         let marginal = bernoulli_marginal_link_map(
-            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            &InverseLink::Standard(gam_problem::StandardLink::Probit),
             q0,
         )
         .expect("witness link map");
@@ -4089,7 +4089,7 @@ mod empirical_flex_jet_oracle_tests {
         // Converged intercept seed for the value-pinning + jet Newton.
         let scale = fx.family.probit_frailty_scale();
         let marginal = bernoulli_marginal_link_map(
-            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            &InverseLink::Standard(gam_problem::StandardLink::Probit),
             q,
         )
         .expect("link map");
@@ -4313,7 +4313,7 @@ mod empirical_flex_jet_oracle_tests {
         let scale = fx.family.probit_frailty_scale();
         let beta: Array1<f64> = Array1::from_iter(dev_range.clone().map(|i| p0[i]));
         let marginal = bernoulli_marginal_link_map(
-            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            &InverseLink::Standard(gam_problem::StandardLink::Probit),
             q0,
         )
         .expect("link map");

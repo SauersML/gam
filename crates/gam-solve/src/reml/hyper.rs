@@ -2805,7 +2805,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn build_sas_link_ext_coords(
         &self,
         bundle: &EvalShared,
-        sas_state: &crate::types::SasLinkState,
+        sas_state: &gam_problem::SasLinkState,
         is_beta_logistic: bool,
     ) -> Result<Vec<super::reml_outer_engine::HyperCoord>, EstimationError> {
         use crate::mixture_link::{
@@ -2982,7 +2982,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn build_mixture_link_ext_coords(
         &self,
         bundle: &EvalShared,
-        mix_state: &crate::types::MixtureLinkState,
+        mix_state: &gam_problem::MixtureLinkState,
     ) -> Result<Vec<super::reml_outer_engine::HyperCoord>, EstimationError> {
         use crate::mixture_link::mixture_inverse_link_jetwith_rho_partials_into;
 
@@ -3175,7 +3175,7 @@ mod tests {
 
         let firth_op = Arc::new(
             super::super::RemlState::build_firth_dense_operator_for_link(
-                &crate::types::InverseLink::Standard(crate::types::StandardLink::Logit),
+                &gam_problem::InverseLink::Standard(gam_problem::StandardLink::Logit),
                 &x,
                 &eta,
                 ndarray::Array1::ones(x.nrows()).view(),
@@ -3261,7 +3261,7 @@ mod tests {
         let eta = x.dot(&beta);
         let firth_op = Arc::new(
             super::super::RemlState::build_firth_dense_operator_for_link(
-                &crate::types::InverseLink::Standard(crate::types::StandardLink::Logit),
+                &gam_problem::InverseLink::Standard(gam_problem::StandardLink::Logit),
                 &x,
                 &eta,
                 ndarray::Array1::ones(x.nrows()).view(),

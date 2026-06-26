@@ -44,7 +44,7 @@ use gam_terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design,
 };
-use crate::types::MIN_WEIGHT;
+use gam_problem::MIN_WEIGHT;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
 use std::collections::BTreeMap;
 use std::sync::Arc;

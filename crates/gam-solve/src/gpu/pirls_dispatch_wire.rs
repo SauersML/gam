@@ -15,7 +15,7 @@
 //! no-op stub.
 
 use gam_gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
-use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 
 /// Result of mapping the engine-level `(ResponseFamily, InverseLink)` pair
 /// to the six built-in JIT-cached families the Stage 3.3 PIRLS loop can
@@ -113,7 +113,7 @@ mod linux_impl {
         calculate_loglikelihood_omitting_constants, compute_observed_hessian_curvature_arrays,
         computeworkingweight_derivatives_from_eta,
     };
-    use crate::types::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor};
+    use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor};
     use gam_problem::LinearInequalityConstraints;
 
     /// All inputs needed for the GPU PIRLS loop end-to-end. Built by the
@@ -214,7 +214,7 @@ mod linux_impl {
     /// other transformed design so that CPU-default / no-runtime /
     /// policy-rejected paths pay zero `fast_ab` cost.
     pub fn try_gpu_pirls_loop_admit(
-        likelihood: &crate::types::GlmLikelihoodSpec,
+        likelihood: &gam_problem::GlmLikelihoodSpec,
         n: usize,
         p: usize,
     ) -> bool {
@@ -712,9 +712,9 @@ mod linux_impl {
         /// Stabilisation ridge δ.
         pub ridge: f64,
         /// GLM likelihood spec.
-        pub likelihood: &'a crate::types::GlmLikelihoodSpec,
+        pub likelihood: &'a gam_problem::GlmLikelihoodSpec,
         /// Inverse link.
-        pub inverse_link: &'a crate::types::InverseLink,
+        pub inverse_link: &'a gam_problem::InverseLink,
         /// Original design X for computing η = offset + X·Qs·β.
         pub x_original: &'a DesignMatrix,
         /// Response y, length n.
@@ -736,7 +736,7 @@ mod linux_impl {
     /// Cheap admission gate for the GPU Gaussian-identity exact PLS path.
     /// Returns `true` iff cuda_selected(), runtime available, and the likelihood
     /// is Gaussian-identity.
-    pub fn try_gpu_gaussian_pls_admit(likelihood: &crate::types::GlmLikelihoodSpec) -> bool {
+    pub fn try_gpu_gaussian_pls_admit(likelihood: &gam_problem::GlmLikelihoodSpec) -> bool {
         if !gam_gpu::cuda_selected() {
             return false;
         }
@@ -770,7 +770,7 @@ mod linux_impl {
             array1_l2_norm, calculate_deviance, calculate_loglikelihood_omitting_constants,
             computeworkingweight_derivatives_from_eta,
         };
-        use crate::types::{RidgePassport, RidgePolicy};
+        use gam_problem::{RidgePassport, RidgePolicy};
         use ndarray::Array1;
 
         let pls = pirls_gpu::solve_gaussian_pls_gpu(
@@ -991,15 +991,15 @@ pub use linux_impl::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{LikelihoodSpec, MixtureLinkState};
+    use gam_problem::{LikelihoodSpec, MixtureLinkState};
     use ndarray::Array1;
 
     fn dummy_mixture_state() -> MixtureLinkState {
         // K=2 components with the free logit at 0; softmax weights are uniform.
         MixtureLinkState {
             components: vec![
-                crate::types::LinkComponent::Logit,
-                crate::types::LinkComponent::Probit,
+                gam_problem::LinkComponent::Logit,
+                gam_problem::LinkComponent::Probit,
             ],
             rho: Array1::from(vec![0.0_f64]),
             pi: Array1::from(vec![0.5_f64, 0.5_f64]),

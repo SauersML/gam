@@ -7,7 +7,7 @@ pub fn fit_gamwith_heuristic_lambdas<X>(
     offset: ArrayView1<'_, f64>,
     s_list: &[BlockwisePenalty],
     heuristic_lambdas: Option<&[f64]>,
-    family: crate::types::LikelihoodSpec,
+    family: gam_problem::LikelihoodSpec,
     opts: &FitOptions,
 ) -> Result<UnifiedFitResult, EstimationError>
 where
@@ -34,7 +34,7 @@ pub(crate) fn fit_gamwith_heuristic_lambdas_andwarm_start<X>(
     s_list: &[BlockwisePenalty],
     heuristic_lambdas: Option<&[f64]>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
-    family: crate::types::LikelihoodSpec,
+    family: gam_problem::LikelihoodSpec,
     opts: &FitOptions,
 ) -> Result<UnifiedFitResult, EstimationError>
 where
@@ -62,7 +62,7 @@ pub fn fit_gam_with_penalty_specs<X>(
     offset: ArrayView1<'_, f64>,
     penalty_specs: Vec<PenaltySpec>,
     nullspace_dims: Vec<usize>,
-    family: crate::types::LikelihoodSpec,
+    family: gam_problem::LikelihoodSpec,
     opts: &FitOptions,
 ) -> Result<UnifiedFitResult, EstimationError>
 where
@@ -91,7 +91,7 @@ fn fit_gamwith_penalty_specs_andwarm_start<X>(
     nullspace_dims: Vec<usize>,
     heuristic_lambdas: Option<&[f64]>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
-    family: crate::types::LikelihoodSpec,
+    family: gam_problem::LikelihoodSpec,
     opts: &FitOptions,
 ) -> Result<UnifiedFitResult, EstimationError>
 where
@@ -126,7 +126,7 @@ where
             );
         }
     }
-    let resolved_family: crate::types::LikelihoodSpec = if let Some(mix_spec) =
+    let resolved_family: gam_problem::LikelihoodSpec = if let Some(mix_spec) =
         opts.mixture_link.as_ref()
     {
         if !family.is_binomial() {
@@ -345,7 +345,7 @@ pub fn fit_gam<X>(
     weights: ArrayView1<'_, f64>,
     offset: ArrayView1<'_, f64>,
     s_list: &[BlockwisePenalty],
-    family: crate::types::LikelihoodSpec,
+    family: gam_problem::LikelihoodSpec,
     opts: &FitOptions,
 ) -> Result<UnifiedFitResult, EstimationError>
 where

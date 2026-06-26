@@ -39,7 +39,7 @@ pub struct ExternalOptimResult {
 
 #[derive(Clone)]
 pub struct ExternalOptimOptions {
-    pub family: crate::types::LikelihoodSpec,
+    pub family: gam_problem::LikelihoodSpec,
     pub latent_cloglog: Option<LatentCLogLogState>,
     pub mixture_link: Option<MixtureLinkSpec>,
     pub optimize_mixture: bool,
@@ -65,7 +65,7 @@ pub struct ExternalOptimOptions {
     pub penalty_shrinkage_floor: Option<f64>,
     /// Fixed prior on smoothing parameters for explicit joint HMC sampling
     /// flows. Standard fitting stays on the REML/Laplace path.
-    pub rho_prior: crate::types::RhoPrior,
+    pub rho_prior: gam_problem::RhoPrior,
     /// Kronecker-factored penalty system for tensor-product smooth terms.
     pub kronecker_penalty_system: Option<gam_terms::smooth::KroneckerPenaltySystem>,
     /// Full Kronecker factored basis for P-IRLS factored reparameterization.
@@ -80,7 +80,7 @@ pub struct ExternalOptimOptions {
 }
 
 pub(crate) fn resolve_external_family(
-    family: &crate::types::LikelihoodSpec,
+    family: &gam_problem::LikelihoodSpec,
     firth_override: Option<bool>,
 ) -> Result<(GlmLikelihoodSpec, bool), EstimationError> {
     let external_glm_supported = match (&family.response, family.link_function()) {
@@ -124,7 +124,7 @@ pub(crate) fn resolve_external_family(
     }
 
     if let ResponseFamily::Tweedie { p } = &family.response {
-        if !crate::types::is_valid_tweedie_power(*p) {
+        if !gam_problem::is_valid_tweedie_power(*p) {
             crate::bail_invalid_estim!("optimize_external_design requires a GLM family; Tweedie variance power must be finite and strictly between 1 and 2; use PoissonLog or GammaLog for boundary cases"
                     .to_string(),);
         }
@@ -137,7 +137,7 @@ pub(crate) fn resolve_external_family(
 
 #[inline]
 pub(crate) fn effective_sas_link_for_family(
-    family: &crate::types::LikelihoodSpec,
+    family: &gam_problem::LikelihoodSpec,
     sas_link: Option<SasLinkSpec>,
 ) -> Option<SasLinkSpec> {
     if (family.is_binomial_sas() || family.is_binomial_beta_logistic()) && sas_link.is_none() {

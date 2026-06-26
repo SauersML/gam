@@ -131,7 +131,7 @@ pub struct InnerSolution<'dp> {
     /// Configured prior over rho coordinates. The evaluator receives the
     /// realized cost/gradient tuple separately; this copy lets EFS use the
     /// conjugate Gamma rate in its multiplicative denominator.
-    pub rho_prior: crate::types::RhoPrior,
+    pub rho_prior: gam_problem::RhoPrior,
 
     // === Model dimensions ===
     /// Number of observations.
@@ -259,7 +259,7 @@ pub struct InnerSolutionBuilder<'dp> {
     pub(crate) hessian_logdet_correction: f64,
     pub(crate) penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
     pub(crate) rho_curvature_scale: f64,
-    pub(crate) rho_prior: crate::types::RhoPrior,
+    pub(crate) rho_prior: gam_problem::RhoPrior,
     pub(crate) nullspace_dim_override: Option<f64>,
     // Extended hyperparameter coordinates
     pub(crate) ext_coords: Vec<HyperCoord>,
@@ -300,7 +300,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             rho_curvature_scale: 1.0,
-            rho_prior: crate::types::RhoPrior::Flat,
+            rho_prior: gam_problem::RhoPrior::Flat,
             nullspace_dim_override: None,
             ext_coords: Vec::new(),
             ext_coord_pair_fn: None,
@@ -347,7 +347,7 @@ impl<'dp> InnerSolutionBuilder<'dp> {
         self
     }
 
-    pub fn rho_prior(mut self, prior: crate::types::RhoPrior) -> Self {
+    pub fn rho_prior(mut self, prior: gam_problem::RhoPrior) -> Self {
         self.rho_prior = prior;
         self
     }

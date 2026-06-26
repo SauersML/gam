@@ -37,7 +37,7 @@ use crate::probability::signed_probit_logcdf_and_mills_ratio;
 use gam_solve::mixture_link::inverse_link_jet_for_inverse_link;
 use gam_terms::term_builder::resolve_role_col;
 use gam_terms::smooth::{TermCollectionSpec, build_term_collection_design};
-use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 
 /// Resolved survival entry/exit column indices for a saved survival model.
 ///

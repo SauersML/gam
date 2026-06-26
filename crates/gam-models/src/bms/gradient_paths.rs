@@ -2153,7 +2153,7 @@ mod jet_tower_oracle_tests {
             // the production signed-jet, which seeds the q tensor slots directly).
             let eta_marginal = p[0];
             let link = bernoulli_marginal_link_map(
-                &InverseLink::Standard(crate::types::StandardLink::Probit),
+                &InverseLink::Standard(gam_problem::StandardLink::Probit),
                 eta_marginal.v,
             )?;
             let q = eta_marginal.compose_unary([link.q, link.q1, link.q2, link.q3, link.q4]);
@@ -2175,7 +2175,7 @@ mod jet_tower_oracle_tests {
     /// `libm::erfc`, for the central-FD value-channel witness.
     fn scalar_nll(eta_marginal: f64, g: f64, z: f64, y: f64, w: f64, s: f64) -> f64 {
         let link = bernoulli_marginal_link_map(
-            &InverseLink::Standard(crate::types::StandardLink::Probit),
+            &InverseLink::Standard(gam_problem::StandardLink::Probit),
             eta_marginal,
         )
         .unwrap();
@@ -2216,7 +2216,7 @@ mod jet_tower_oracle_tests {
 
                 // Production scalar kernel channels (the hand path under audit).
                 let marginal = bernoulli_marginal_link_map(
-                    &InverseLink::Standard(crate::types::StandardLink::Probit),
+                    &InverseLink::Standard(gam_problem::StandardLink::Probit),
                     eta[row],
                 )
                 .expect("link map");
@@ -2333,7 +2333,7 @@ mod jet_tower_oracle_tests {
         for &probit_scale in &[1.0_f64, 0.8] {
             for r in 0..eta.len() {
                 let marginal = bernoulli_marginal_link_map(
-                    &InverseLink::Standard(crate::types::StandardLink::Probit),
+                    &InverseLink::Standard(gam_problem::StandardLink::Probit),
                     eta[r],
                 )
                 .expect("link map");
@@ -2432,7 +2432,7 @@ mod jet_tower_oracle_tests {
                 let truth = evaluate_program(&tower_program, row).expect("Tower4 program tower");
 
                 let marginal = bernoulli_marginal_link_map(
-                    &InverseLink::Standard(crate::types::StandardLink::Probit),
+                    &InverseLink::Standard(gam_problem::StandardLink::Probit),
                     eta[row],
                 )
                 .expect("link map");
@@ -2591,7 +2591,7 @@ mod flex_primary_hessian_oracle_tests {
             z: Arc::new(z.clone()),
             latent_measure: LatentMeasureKind::StandardNormal,
             gaussian_frailty_sd: Some(0.15),
-            base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+            base_link: InverseLink::Standard(gam_problem::StandardLink::Probit),
             marginal_design: DesignMatrix::Dense(DenseDesignMatrix::from(marginal_x.clone())),
             logslope_design: DesignMatrix::Dense(DenseDesignMatrix::from(logslope_x.clone())),
             score_warp: Some(score_prepared.runtime.clone()),

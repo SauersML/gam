@@ -1,7 +1,7 @@
 use super::*;
 use gam_linalg::matrix::symmetrize_in_place;
 use crate::mixture_link::fisher_weight_jet5_for_inverse_link;
-use crate::types::InverseLink;
+use gam_problem::InverseLink;
 
 pub(crate) const FIRTH_DERIVATIVE_PARALLEL_MIN_N: usize = 16_384;
 
@@ -2711,7 +2711,7 @@ impl FirthDenseOperator {
 mod tests {
     use super::*;
     use crate::mixture_link::logit_inverse_link_jet5;
-    use crate::types::StandardLink;
+    use gam_problem::StandardLink;
     use ndarray::{Array1, Array2, array};
 
     pub(crate) fn build_logit_firth_dense_operator(

@@ -28,7 +28,7 @@ use gam_linalg::sparse_exact::{
 };
 use gam_linalg::utils::{array_is_finite, inf_norm};
 use crate::loop_guard::{FlatStreak, IterationBound, LoopVerdict, RejectEscalator};
-use crate::types::Coefficients;
+use gam_problem::Coefficients;
 use faer::sparse::SparseColMat;
 use ndarray::{Array1, Zip};
 

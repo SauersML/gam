@@ -31,7 +31,7 @@
 //! [`weighted_design_products`], [`row_linalg`], and [`joint_packing`].
 
 use gam_terms::basis::{BasisOptions, PenaltyInfo, PenaltySource};
-use crate::types::MIN_WEIGHT;
+use gam_problem::MIN_WEIGHT;
 
 use crate::custom_family::{
     AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, BlockwiseFitOptions,
@@ -105,7 +105,7 @@ use gam_terms::smooth::{
 
 use crate::model_types::validate_all_finite_estimation;
 
-use crate::types::{InverseLink, RidgePolicy, StandardLink};
+use gam_problem::{InverseLink, RidgePolicy, StandardLink};
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 

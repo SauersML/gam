@@ -99,7 +99,7 @@ pub(crate) use gam_terms::smooth::{
 
 pub(crate) use gam_problem::HyperOperator;
 
-pub(crate) use crate::types::{InverseLink, StandardLink};
+pub(crate) use gam_problem::{InverseLink, StandardLink};
 
 pub(crate) use crate::fnv1a::Fnv1a;
 

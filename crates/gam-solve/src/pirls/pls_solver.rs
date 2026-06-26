@@ -20,7 +20,7 @@ use crate::estimate::EstimationError;
 use gam_linalg::faer_ndarray::{FaerLinalgError, array1_to_col_matmut};
 use gam_linalg::utils::{StableSolver, array_is_finite};
 use gam_linalg::matrix::{DesignMatrix, LinearOperator, SymmetricMatrix};
-use crate::types::{Coefficients, LinkFunction};
+use gam_problem::{Coefficients, LinkFunction};
 use faer::sparse::SparseColMat;
 use ndarray::{Array1, Array2, ArrayView1, ShapeBuilder};
 use std::sync::Arc;

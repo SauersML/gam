@@ -8,7 +8,7 @@ use super::reml::hyper::link_binomial_aux;
 use super::*;
 use gam_linalg::utils::{StableSolver, max_abs_diag};
 use crate::mixture_link::{sas_inverse_link_jet, sas_inverse_link_jetwith_param_partials};
-use crate::types::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink};
+use gam_problem::{InverseLink, LikelihoodSpec, LinkFunction, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, array};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

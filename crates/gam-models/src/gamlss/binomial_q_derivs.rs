@@ -13,7 +13,7 @@
 
 use gam_solve::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link;
 use crate::probability::signed_probit_logcdf_and_mills_ratio;
-use crate::types::{InverseLink, StandardLink};
+use gam_problem::{InverseLink, StandardLink};
 use gam_math::jet_tower::Tower4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

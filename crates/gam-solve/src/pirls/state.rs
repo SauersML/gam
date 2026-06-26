@@ -4,7 +4,7 @@ use gam_linalg::matrix::{
     DesignMatrix, PsdWeightsView, ReparamOperator, SignedWeightsView, SymmetricMatrix,
 };
 use crate::active_set::ConstraintKktDiagnostics;
-use crate::types::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, RidgePassport};
+use gam_problem::{Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, RidgePassport};
 use gam_problem::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};

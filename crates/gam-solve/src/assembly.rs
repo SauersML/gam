@@ -30,7 +30,7 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
-    rho_prior: crate::types::RhoPrior,
+    rho_prior: gam_problem::RhoPrior,
     deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
     ext_bundle: Option<ExtCoordBundle>,
     firth_value: Option<f64>,
@@ -367,7 +367,7 @@ pub(crate) fn unified_joint_cost_gradient(
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
-    rho_prior: crate::types::RhoPrior,
+    rho_prior: gam_problem::RhoPrior,
     deriv_provider: Box<dyn HessianDerivativeProvider + '_>,
     eval_mode: EvalMode,
     ext_bundle: Option<ExtCoordBundle>,
@@ -438,7 +438,7 @@ pub(crate) fn unified_joint_efs_eval(
     include_logdet_h: bool,
     include_logdet_s: bool,
     options: &BlockwiseFitOptions,
-    rho_prior: crate::types::RhoPrior,
+    rho_prior: gam_problem::RhoPrior,
     deriv_provider: Box<dyn HessianDerivativeProvider + '_>,
     ext_bundle: Option<ExtCoordBundle>,
 ) -> Result<gam_problem::EfsEval, String> {
@@ -713,7 +713,7 @@ pub(crate) fn joint_outer_evaluate(
     project_hessian_logdet: bool,
     eval_mode: EvalMode,
     options: &BlockwiseFitOptions,
-    rho_prior: crate::types::RhoPrior,
+    rho_prior: gam_problem::RhoPrior,
     pseudo_logdet_mode: PseudoLogdetMode,
     compute_dh: &DriftDerivFn<'_>,
     compute_dh_many: Option<&DriftDerivManyFn<'_>>,
@@ -1306,7 +1306,7 @@ pub(crate) fn joint_outer_evaluate_efs(
     strict_spd: bool,
     project_hessian_logdet: bool,
     options: &BlockwiseFitOptions,
-    rho_prior: crate::types::RhoPrior,
+    rho_prior: gam_problem::RhoPrior,
     pseudo_logdet_mode: PseudoLogdetMode,
     compute_dh: &DriftDerivFn<'_>,
     compute_dh_many: Option<&DriftDerivManyFn<'_>>,
@@ -1546,7 +1546,7 @@ pub(crate) fn outerobjectivegradienthessian_internal<
     penalty_counts: &[usize],
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: crate::types::RhoPrior,
+    rho_prior: gam_problem::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let derivative_blocks = vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()];
@@ -1571,7 +1571,7 @@ pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>
     penalty_counts: &[usize],
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: crate::types::RhoPrior,
+    rho_prior: gam_problem::RhoPrior,
 ) -> Result<(gam_problem::EfsEval, ConstrainedWarmStart, bool), String> {
     let include_logdet_h = include_exact_newton_logdet_h(family, options);
     let include_logdet_s = include_exact_newton_logdet_s(family, options);

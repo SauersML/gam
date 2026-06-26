@@ -2084,10 +2084,10 @@ extern "C" __global__ void status_or(
         /// `computeworkingweight_derivatives_from_eta` to produce
         /// `solve_dmu_deta` / `solve_d2mu_deta2` / `solve_d3mu_deta3`
         /// and the score-side `c` / `d` arrays.
-        pub likelihood: &'a crate::types::GlmLikelihoodSpec,
+        pub likelihood: &'a gam_problem::GlmLikelihoodSpec,
         /// Inverse link the row kernel was driven by; pairs with
         /// `likelihood` for the family-specific derivatives.
-        pub inverse_link: &'a crate::types::InverseLink,
+        pub inverse_link: &'a gam_problem::InverseLink,
         /// Response vector `y` (length `n`) — same view passed to the
         /// row kernel. Needed for observed-curvature finalization.
         pub y: ndarray::ArrayView1<'a, f64>,
@@ -2121,7 +2121,7 @@ extern "C" __global__ void status_or(
         /// uses `RidgePassport::scaled_identity(objective_ridge,
         /// RidgePolicy::explicit_stabilization_full())`, which mirrors
         /// the CPU oracle's default for a no-escalation fit.
-        pub ridge_passport: Option<crate::types::RidgePassport>,
+        pub ridge_passport: Option<gam_problem::RidgePassport>,
         /// Firth bias-reduction diagnostics. Today the GPU loop does
         /// not implement Firth; pass `None` to land
         /// `FirthDiagnostics::Inactive` on the outcome. A future
@@ -2219,7 +2219,7 @@ extern "C" __global__ void status_or(
         /// When `extra.ridge_passport` is `Some`, this is the supplied
         /// value verbatim. Otherwise a default `scaled_identity(
         /// objective_ridge, explicit_stabilization_full())` passport.
-        pub ridge_passport: crate::types::RidgePassport,
+        pub ridge_passport: gam_problem::RidgePassport,
         /// Firth diagnostics. `Inactive` unless the caller passes an
         /// `Active` value through `extra.firth`.
         pub firth: crate::pirls::FirthDiagnostics,
@@ -2835,7 +2835,7 @@ extern "C" __global__ void status_or(
 
         // RidgePassport is built from objective_ridge only — step_lm_lambda
         // is a solve-only artefact and must never contaminate EDF / REML.
-        let default_ridge = crate::types::RidgePassport::scaled_identity(
+        let default_ridge = gam_problem::RidgePassport::scaled_identity(
             objective_ridge,
             gam_linalg::RidgePolicy::explicit_stabilization_full(),
         );

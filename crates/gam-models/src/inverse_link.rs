@@ -118,9 +118,9 @@ pub fn apply_inverse_link_vec(eta: &[f64], family_kind: &str) -> Result<Vec<f64>
 /// solver evaluator.
 pub fn apply_inverse_link_spec_vec(
     eta: &[f64],
-    link: &crate::types::InverseLink,
+    link: &gam_problem::InverseLink,
 ) -> Result<Vec<f64>, String> {
-    use crate::types::{InverseLink, StandardLink};
+    use gam_problem::{InverseLink, StandardLink};
 
     // Standard links have a documented EXACT public response transform (notably
     // the unclamped `exp(η)` for Log) that diverges from the solver's clamped
@@ -153,7 +153,7 @@ pub fn apply_inverse_link_spec_vec(
 mod tests {
     use super::{apply_inverse_link_spec_vec, apply_inverse_link_vec};
     use gam_solve::mixture_link::inverse_link_mu_d1_for_inverse_link;
-    use crate::types::{
+    use gam_problem::{
         InverseLink, LatentCLogLogState, LinkComponent, MixtureLinkSpec, StandardLink,
     };
 

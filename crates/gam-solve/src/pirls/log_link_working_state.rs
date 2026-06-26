@@ -19,7 +19,7 @@ use super::{
     working_deriv_slices, working_slices,
 };
 use crate::estimate::EstimationError;
-use crate::types::{InverseLink, MIN_WEIGHT};
+use gam_problem::{InverseLink, MIN_WEIGHT};
 use ndarray::{Array1, ArrayView1};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 

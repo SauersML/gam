@@ -38,12 +38,12 @@ pub use crate::model_types::{CoefficientPriorMean, Dispersion, EstimationError, 
 use crate::pirls::{self, PirlsResult};
 use gam_problem::{SeedConfig, SeedRiskProfile};
 use gam_terms::smooth::BlockwisePenalty;
-use crate::types::{
+use gam_problem::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata,
     LikelihoodSpec, LinkFunction, LogLikelihoodNormalization, LogSmoothingParamsView,
     ResponseFamily, RidgePassport, StandardLink,
 };
-use crate::types::{MixtureLinkSpec, SasLinkSpec};
+use gam_problem::{MixtureLinkSpec, SasLinkSpec};
 
 // Ndarray and faer linear algebra helpers
 use ndarray::{Array1, Array2, ArrayView1, Axis, s};

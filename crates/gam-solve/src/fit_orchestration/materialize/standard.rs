@@ -99,7 +99,7 @@ pub(crate) fn materialize_standard<'a>(
                 "latent-coordinate smooth term disappeared during formula materialization"
                     .to_string()
             })?;
-        coord.term_index = crate::types::SmoothTermIdx::new(resolved_idx);
+        coord.term_index = gam_problem::SmoothTermIdx::new(resolved_idx);
         if coord.manifold_auto {
             let inferred = natural_latent_manifold_for_basis(
                 &spec.smooth_terms[coord.term_index.get()].basis,

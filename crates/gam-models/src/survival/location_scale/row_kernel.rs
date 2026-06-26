@@ -2420,7 +2420,7 @@ impl SurvivalLocationScaleFamily {
             )),
             InverseLink::Standard(StandardLink::Logit) => {
                 let mu = gam_solve::mixture_link::component_inverse_link_jet(
-                    crate::types::LinkComponent::Logit,
+                    gam_problem::LinkComponent::Logit,
                     eta,
                 )
                 .mu;
@@ -2493,7 +2493,7 @@ impl SurvivalLocationScaleFamily {
             }
             InverseLink::Standard(StandardLink::Logit) => {
                 let mu = gam_solve::mixture_link::component_inverse_link_jet(
-                    crate::types::LinkComponent::Logit,
+                    gam_problem::LinkComponent::Logit,
                     eta,
                 )
                 .mu;

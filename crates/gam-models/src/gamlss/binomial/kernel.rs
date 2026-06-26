@@ -730,7 +730,7 @@ mod packed_scalar_oracle_tests {
     //! replaced — value/grad/Hessian for `Order2`, the contracted third for
     //! `OneSeed`, the contracted fourth for `TwoSeed`.
     use super::*;
-    use crate::types::{InverseLink, StandardLink};
+    use gam_problem::{InverseLink, StandardLink};
     use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 
     fn rel_close(a: f64, b: f64, label: &str) {

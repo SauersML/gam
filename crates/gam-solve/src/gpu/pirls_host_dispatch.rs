@@ -27,7 +27,7 @@ use crate::pirls::{
     GaussianFixedCache, LinearInequalityConstraints, PirlsConfig, PirlsCoordinateFrame,
     PirlsPenalty, PirlsResult, WorkingModelPirlsResult,
 };
-use crate::types::LinkFunction;
+use gam_problem::LinkFunction;
 use ndarray::{Array1, Array2, ArrayView1};
 use std::sync::Arc;
 

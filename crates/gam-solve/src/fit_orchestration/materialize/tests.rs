@@ -1679,7 +1679,7 @@ fn resolve_family_accepts_mgcv_parenthesized_family_link_syntax() {
     // resolver (`sphere_logit_predict_finite_at_pole`, `sphere_binomial_*`),
     // and would otherwise be rejected as `unknown family`.
     use crate::fit_orchestration::resolve_family;
-    use crate::types::{
+    use gam_problem::{
         InverseLink, LinkFunction, ResponseColumnKind, ResponseFamily, StandardLink,
     };
     let y = ndarray::array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0];

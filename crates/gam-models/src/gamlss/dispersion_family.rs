@@ -112,8 +112,8 @@ impl DispersionFamilyKind {
     /// NegativeBinomial / Gamma / Tweedie, logit for Beta. Single source of
     /// truth shared by the CLI and FFI save paths so the persisted
     /// `base_link` never diverges from the fitted channel.
-    pub fn base_link(self) -> crate::types::InverseLink {
-        use crate::types::{InverseLink, StandardLink};
+    pub fn base_link(self) -> gam_problem::InverseLink {
+        use gam_problem::{InverseLink, StandardLink};
         if self.mean_is_logit() {
             InverseLink::Standard(StandardLink::Logit)
         } else {
@@ -128,8 +128,8 @@ impl DispersionFamilyKind {
     /// and are not consumed as fixed values at predict time. This is the single
     /// source of truth for the persisted location-scale likelihood so the CLI
     /// and FFI save paths cannot diverge.
-    pub fn likelihood_spec(self) -> crate::types::LikelihoodSpec {
-        use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+    pub fn likelihood_spec(self) -> gam_problem::LikelihoodSpec {
+        use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
         let response = match self {
             DispersionFamilyKind::NegativeBinomial => ResponseFamily::NegativeBinomial {
                 theta: 1.0,

@@ -27,7 +27,7 @@ use crate::wiggle::{
 use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix, symmetrize_in_place};
 use crate::probability::{normal_pdf, standard_normal_quantile};
-use crate::types::{InverseLink, StandardLink};
+use gam_problem::{InverseLink, StandardLink};
 use ndarray::{Array1, Array2, array, s};
 use rayon::prelude::*;
 

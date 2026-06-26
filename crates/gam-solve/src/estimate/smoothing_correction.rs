@@ -88,13 +88,13 @@ pub(crate) const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 /// numerical stability when smoothing parameters are weakly identified.
 ///
 /// **Stabilization semantics:** this ridge is a
-/// [`crate::types::StabilizationKind::NumericalPerturbation`] (not an
+/// [`gam_problem::StabilizationKind::NumericalPerturbation`] (not an
 /// `ExplicitPrior`). It enters only the inverse used to build `V_rho` for
 /// the smoothing-correction propagation step. It does NOT enter the LAML
 /// objective, its gradient, the saved coefficients, or any user-visible
 /// summary — the rho-Hessian itself is recomputed from first principles
 /// in every place that consults it. Classified as
-/// [`crate::types::StabilizationKind::NumericalPerturbation`]; no ledger
+/// [`gam_problem::StabilizationKind::NumericalPerturbation`]; no ledger
 /// record is emitted at this site because the perturbation never escapes the
 /// local `V_rho` inverse (it touches no saved coefficient, objective, or
 /// user-visible summary).

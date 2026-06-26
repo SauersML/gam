@@ -326,7 +326,7 @@ pub struct InnerAssembly<'dp> {
     pub penalty_logdet: PenaltyLogdetDerivs,
     pub dispersion: DispersionHandling,
     pub rho_curvature_scale: f64,
-    pub rho_prior: crate::types::RhoPrior,
+    pub rho_prior: gam_problem::RhoPrior,
     pub hessian_logdet_correction: f64,
     pub penalty_subspace_trace: Option<Arc<PenaltySubspaceTrace>>,
 

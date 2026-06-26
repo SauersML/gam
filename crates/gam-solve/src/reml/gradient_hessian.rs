@@ -2947,7 +2947,7 @@ impl<'a> RemlState<'a> {
 
     pub(crate) fn set_link_states(
         &mut self,
-        mixture_link_state: Option<crate::types::MixtureLinkState>,
+        mixture_link_state: Option<gam_problem::MixtureLinkState>,
         sas_link_state: Option<SasLinkState>,
     ) {
         let changed = self.runtime_mixture_link_state != mixture_link_state
@@ -5423,7 +5423,7 @@ impl<'a> RemlState<'a> {
         let family_ok = matches!(spec.response, ResponseFamily::Gaussian);
         let link_ok = matches!(
             self.config.link_kind,
-            crate::types::InverseLink::Standard(StandardLink::Identity)
+            gam_problem::InverseLink::Standard(StandardLink::Identity)
         );
         family_ok
             && link_ok

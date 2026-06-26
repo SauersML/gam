@@ -390,7 +390,7 @@ fn latent_metadata_cache_digest(latent: &LatentCoordValues) -> CacheDigest {
 pub(crate) fn latent_design_context_cache_digest(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
-    term_index: crate::types::SmoothTermIdx,
+    term_index: gam_problem::SmoothTermIdx,
     analytic_rho_count: usize,
     feature_cols: &[usize],
 ) -> Result<CacheDigest, EstimationError> {

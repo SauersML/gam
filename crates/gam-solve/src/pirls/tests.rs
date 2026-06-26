@@ -27,7 +27,7 @@ mod tests {
     use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
     use crate::probability::standard_normal_quantile;
     use crate::active_set;
-    use crate::types::{
+    use gam_problem::{
         Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkComponent, LinkFunction,
         LogSmoothingParamsView, MIN_WEIGHT, MixtureLinkSpec, ResponseFamily, StandardLink,
     };
@@ -2050,7 +2050,7 @@ mod tests {
 #[cfg(test)]
 mod root_cause_tests {
     use super::*;
-    use crate::types::LogSmoothingParamsView;
+    use gam_problem::LogSmoothingParamsView;
     use approx::assert_relative_eq;
     use ndarray::{Array1, Array2, array};
 

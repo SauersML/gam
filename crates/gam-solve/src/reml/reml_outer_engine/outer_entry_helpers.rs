@@ -315,14 +315,14 @@ pub(crate) fn efs_q_eff(a_i: f64, dispersion: &DispersionHandling, dp_cgrad: f64
 }
 
 pub(crate) fn gamma_precision_rate_for_rho(
-    prior: &crate::types::RhoPrior,
+    prior: &gam_problem::RhoPrior,
     idx: usize,
 ) -> Option<f64> {
     match prior {
-        crate::types::RhoPrior::GammaPrecision { rate, .. } => Some(*rate),
-        crate::types::RhoPrior::Independent(priors) => {
+        gam_problem::RhoPrior::GammaPrecision { rate, .. } => Some(*rate),
+        gam_problem::RhoPrior::Independent(priors) => {
             priors.get(idx).and_then(|prior| match prior {
-                crate::types::RhoPrior::GammaPrecision { rate, .. } => Some(*rate),
+                gam_problem::RhoPrior::GammaPrecision { rate, .. } => Some(*rate),
                 _ => None,
             })
         }
@@ -334,7 +334,7 @@ pub(crate) fn gamma_precision_rate_for_rho(
 pub(crate) fn efs_q_eff_with_gamma_rate(
     base_q_eff: f64,
     lambda: f64,
-    prior: &crate::types::RhoPrior,
+    prior: &gam_problem::RhoPrior,
     idx: usize,
 ) -> f64 {
     match gamma_precision_rate_for_rho(prior, idx) {

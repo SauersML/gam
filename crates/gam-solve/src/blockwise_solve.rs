@@ -40,7 +40,7 @@ pub(crate) fn aggregate_labeled_hessian(
 /// malformed prior surfaces as a structured [`CustomFamilyError`] rather than
 /// being folded into the objective.
 pub(crate) fn rho_prior_cost_gradient_hessian(
-    prior: &crate::types::RhoPrior,
+    prior: &gam_problem::RhoPrior,
     rho: &Array1<f64>,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
     use crate::rho_prior_eval::{InvalidPriorPolicy, RhoPriorError};
@@ -58,7 +58,7 @@ pub(crate) fn rho_prior_cost_gradient_hessian(
 pub(crate) fn add_labeled_rho_prior_to_outer_eval(
     mut result: OuterObjectiveEvalResult,
     rho: &Array1<f64>,
-    rho_prior: &crate::types::RhoPrior,
+    rho_prior: &gam_problem::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, String> {
     // For tied physical penalties, the likelihood/LAML contribution is first
@@ -73,7 +73,7 @@ pub(crate) fn add_labeled_rho_prior_to_outer_eval(
     // where E maps each physical penalty piece to its outer label.  This is
     // the same change-of-variables identity used for overlapping/nested group
     // penalties; the prior is not repeated for each physical child component.
-    if matches!(rho_prior, crate::types::RhoPrior::Flat) {
+    if matches!(rho_prior, gam_problem::RhoPrior::Flat) {
         return Ok(result);
     }
     let (cost, gradient, hessian) = rho_prior_cost_gradient_hessian(rho_prior, rho)?;
@@ -121,7 +121,7 @@ pub(crate) fn pullback_labeled_outer_eval(
     mut result: OuterObjectiveEvalResult,
     rho: &Array1<f64>,
     layout: &PenaltyLabelLayout,
-    rho_prior: &crate::types::RhoPrior,
+    rho_prior: &gam_problem::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, String> {
     if eval_mode == EvalMode::ValueOnly {
@@ -153,7 +153,7 @@ pub(crate) fn outerobjectivegradienthessian_labeled<
     layout: &PenaltyLabelLayout,
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: &crate::types::RhoPrior,
+    rho_prior: &gam_problem::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, String> {
     let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
@@ -165,7 +165,7 @@ pub(crate) fn outerobjectivegradienthessian_labeled<
         &layout.penalty_counts,
         &physical_rho,
         physical_warm_start.as_ref().or(warm_start),
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
         eval_mode,
     )?;
     pullback_labeled_outer_eval(base, rho, layout, rho_prior, eval_mode)
@@ -180,7 +180,7 @@ pub(crate) fn custom_family_seed_screening_proxy_labeled<
     layout: &PenaltyLabelLayout,
     rho: &Array1<f64>,
     warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: &crate::types::RhoPrior,
+    rho_prior: &gam_problem::RhoPrior,
 ) -> Result<(f64, ConstrainedWarmStart, bool), String> {
     let physical_rho = expand_labeled_log_lambdas(rho, layout)?;
     let per_block = split_log_lambdas(&physical_rho, &layout.penalty_counts)?;
@@ -2029,10 +2029,10 @@ pub(crate) const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
 /// mirrored in tests that override it.
 ///
 /// Sourced from the canonical positive-weight floor
-/// ([`crate::types::MIN_WEIGHT`] = `1e-12`) so every floored family shares one
+/// ([`gam_problem::MIN_WEIGHT`] = `1e-12`) so every floored family shares one
 /// definition; this alias keeps the descriptive local name at the `minweight`
 /// defaults.
-pub(crate) const CUSTOM_FAMILY_WEIGHT_FLOOR: f64 = crate::types::MIN_WEIGHT;
+pub(crate) const CUSTOM_FAMILY_WEIGHT_FLOOR: f64 = gam_problem::MIN_WEIGHT;
 
 /// Default initial ridge δ for the explicit-stabilization Cholesky escalation
 /// schedule. Enters the quadratic term, the Laplace Hessian, and the penalty

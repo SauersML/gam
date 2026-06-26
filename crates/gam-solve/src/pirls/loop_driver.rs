@@ -61,7 +61,7 @@ use crate::mixture_link::inverse_link_has_fisher_weight_jet;
 use crate::probability::standard_normal_quantile;
 use crate::active_set;
 use crate::gpu::pirls_host_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
-use crate::types::{
+use gam_problem::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LinearPredictor, LinkFunction,
     LogSmoothingParamsView, MixtureLinkState, ResponseFamily, RidgePassport, RidgePolicy,
     SasLinkState, StandardLink,

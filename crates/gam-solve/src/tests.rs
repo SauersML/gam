@@ -499,7 +499,7 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
         true,
         EvalMode::ValueAndGradient,
         &options,
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
         PseudoLogdetMode::Smooth,
         &no_dh,
         None,
@@ -537,7 +537,7 @@ pub(crate) fn joint_outer_gradient_uses_projected_trace_for_rank_deficient_penal
         false,
         EvalMode::ValueAndGradient,
         &options,
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
         PseudoLogdetMode::Smooth,
         &no_dh,
         None,
@@ -674,7 +674,7 @@ pub(crate) fn joint_outer_gradient_projected_trace_drops_joint_null() {
         true,
         EvalMode::ValueAndGradient,
         &options,
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
         PseudoLogdetMode::Smooth,
         &no_dh,
         None,
@@ -815,7 +815,7 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
             true,
             EvalMode::ValueAndGradient,
             &options,
-            crate::types::RhoPrior::Flat,
+            gam_problem::RhoPrior::Flat,
             PseudoLogdetMode::Smooth,
             &no_dh,
             None,
@@ -854,7 +854,7 @@ pub(crate) fn large_scale_rho_scan_joint_outer_evaluate_is_projection_invariant(
             false,
             EvalMode::ValueAndGradient,
             &options,
-            crate::types::RhoPrior::Flat,
+            gam_problem::RhoPrior::Flat,
             PseudoLogdetMode::Smooth,
             &no_dh,
             None,
@@ -1190,7 +1190,7 @@ pub(crate) fn large_scale_multiblock_outer_gradient_with_realistic_drift_is_boun
         true,
         EvalMode::ValueAndGradient,
         &options,
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
         PseudoLogdetMode::Smooth,
         &compute_dh,
         None,
@@ -1434,7 +1434,7 @@ pub(crate) fn binomial_location_scale_wiggle_outer_fixture()
     let family = BinomialLocationScaleWiggleFamily {
         y: base.y,
         weights: base.weights,
-        link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
+        link_kind: gam_problem::InverseLink::Standard(gam_problem::StandardLink::Probit),
         threshold_design: Some(base.threshold_design),
         log_sigma_design: Some(base.log_sigma_design),
         wiggle_knots: knots,
@@ -2505,7 +2505,7 @@ pub(crate) fn custom_family_seed_screening_proxy_accepts_finite_partial_inner_fi
         &layout,
         &array![0.0],
         None,
-        &crate::types::RhoPrior::Flat,
+        &gam_problem::RhoPrior::Flat,
     )
     .expect("screening proxy should score a finite partial inner solve");
 
@@ -2711,7 +2711,7 @@ pub(crate) fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
         &rho,
         &[vec![]],
         None,
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
         EvalMode::ValueGradientHessian,
     )
     .expect("single-block fallback with exact d2H should evaluate");
@@ -2727,7 +2727,7 @@ pub(crate) fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
         &rho,
         &[vec![]],
         None,
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
         EvalMode::ValueGradientHessian,
     )
     .expect("single-block fallback with zero d2H should evaluate");
@@ -5405,7 +5405,7 @@ pub(crate) fn binomial_location_scale_outer_fixture(
     let family = BinomialLocationScaleFamily {
         y,
         weights,
-        link_kind: crate::types::InverseLink::Standard(crate::types::StandardLink::Probit),
+        link_kind: gam_problem::InverseLink::Standard(gam_problem::StandardLink::Probit),
         threshold_design: Some(threshold_design),
         log_sigma_design: Some(log_sigma_design),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),

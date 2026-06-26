@@ -3,7 +3,7 @@
 //! tweedie response validators and the special-function helpers they need.
 
 use super::*;
-use crate::types::MIN_WEIGHT;
+use gam_problem::MIN_WEIGHT;
 
 #[inline]
 pub(crate) fn standard_inverse_link_jet(

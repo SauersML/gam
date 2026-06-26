@@ -3,7 +3,7 @@
 //! `\eta`.
 
 use super::*;
-use crate::types::MIN_WEIGHT;
+use gam_problem::MIN_WEIGHT;
 
 pub fn update_glmvectors(
     y: ArrayView1<f64>,

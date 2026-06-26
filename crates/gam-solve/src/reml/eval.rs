@@ -2289,7 +2289,7 @@ mod smoothing_correction_outcome_tests {
     #[test]
     pub(crate) fn cubature_smoothing_correction_is_response_scale_equivariant() {
         use crate::estimate::PenaltySpec;
-        use crate::types::{
+        use gam_problem::{
             GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink,
         };
 

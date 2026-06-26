@@ -77,7 +77,7 @@ use gam_terms::smooth::{
     freeze_term_collection_from_design,
 };
 use gam_terms::term_builder::resolve_role_col;
-use crate::types::ResponseColumnKind;
+use gam_problem::ResponseColumnKind;
 use gam_data::ColumnKindTag;
 use gam_data::EncodedDataset;
 use gam_runtime::resource::ProblemHints;
@@ -88,7 +88,7 @@ use std::sync::Arc;
 /// Solver-only numerical stabilization floor for the formula-driven
 /// multinomial REML inner solve (gam#747).
 ///
-/// Installed with [`RidgePolicy::solver_only`](crate::types::RidgePolicy::solver_only)
+/// Installed with [`RidgePolicy::solver_only`](gam_problem::RidgePolicy::solver_only)
 /// so it stabilizes the inner joint-Newton **linear solve** but never enters
 /// the REML objective, the penalty log-determinant, or the Laplace Hessian.
 ///
@@ -1471,7 +1471,7 @@ pub fn fit_penalized_multinomial_formula(
         // optimized objective is the true penalized REML criterion (value tracks
         // its analytic gradient), and the smooth directions remain governed
         // solely by their own REML-selected `λ`.
-        ridge_policy: crate::types::RidgePolicy::solver_only(),
+        ridge_policy: gam_problem::RidgePolicy::solver_only(),
         use_outer_hessian,
         // #715 real-data arm ("canonical-gauge null direction rejects all REML
         // seeds"): skip the multi-seed outer screening cascade and let the
@@ -1549,7 +1549,7 @@ pub fn fit_penalized_multinomial_formula(
             &firth_family,
             &blocks,
             firth_refit_options,
-            crate::types::RhoPrior::Flat,
+            gam_problem::RhoPrior::Flat,
         )
         .map_err(|err| {
             EstimationError::InvalidInput(format!(
@@ -1574,7 +1574,7 @@ pub fn fit_penalized_multinomial_formula(
         &family,
         &blocks,
         &unbiased_probe_options,
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
     );
     let fit = match probe_attempt {
         Ok(probe_fit) => {
@@ -1619,7 +1619,7 @@ pub fn fit_penalized_multinomial_formula(
                     &family,
                     resolve_blocks,
                     &options,
-                    crate::types::RhoPrior::Flat,
+                    gam_problem::RhoPrior::Flat,
                 ) {
                     Ok(full_unbiased_fit) => {
                         let full_separation = multinomial_formula_separation_evidence(

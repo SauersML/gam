@@ -3146,7 +3146,7 @@ impl<'a> RemlState<'a> {
         if let Some(sas_state) = &self.runtime_sas_link_state {
             let is_beta_logistic = matches!(
                 self.config.link_function(),
-                crate::types::LinkFunction::BetaLogistic
+                gam_problem::LinkFunction::BetaLogistic
             );
             self.build_sas_link_ext_coords(bundle, sas_state, is_beta_logistic)
         } else if let Some(mix_state) = &self.runtime_mixture_link_state {
@@ -3385,7 +3385,7 @@ mod tk_math_tests {
         sas_inverse_link_pdfthird_derivative, state_fromspec,
     };
     use crate::pirls::{VarianceJet, e_obs_from_jets};
-    use crate::types::{LinkComponent, MixtureLinkSpec};
+    use gam_problem::{LinkComponent, MixtureLinkSpec};
     use faer::Side;
     use ndarray::array;
     use num_dual::{Dual3_64, Dual64, DualNum, third_derivative};

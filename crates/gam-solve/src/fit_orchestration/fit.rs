@@ -1099,7 +1099,7 @@ fn optimize_survival_transformation_smoothing(
         };
         let summary = crate::pirls::runworking_model_pirls(
             &mut candidate,
-            crate::types::Coefficients::new(beta0.clone()),
+            gam_problem::Coefficients::new(beta0.clone()),
             &opts,
             |_| {},
         )
@@ -1322,8 +1322,8 @@ fn survival_unified_fit_result(
         log_lambdas,
         lambdas,
         likelihood_family: Some(LikelihoodSpec::royston_parmar()),
-        likelihood_scale: crate::types::LikelihoodScaleMetadata::Unspecified,
-        log_likelihood_normalization: crate::types::LogLikelihoodNormalization::UserProvided,
+        likelihood_scale: gam_problem::LikelihoodScaleMetadata::Unspecified,
+        log_likelihood_normalization: gam_problem::LogLikelihoodNormalization::UserProvided,
         log_likelihood: state.log_likelihood,
         deviance: state.deviance,
         reml_score,
@@ -1610,9 +1610,9 @@ fn cause_specific_survival_rho_prior(
     cause_count: usize,
     penalty_count: usize,
     penalty_block_gamma_priors: &[(String, f64, f64)],
-) -> Result<crate::types::RhoPrior, String> {
+) -> Result<gam_problem::RhoPrior, String> {
     if penalty_block_gamma_priors.is_empty() {
-        return Ok(crate::types::RhoPrior::Flat);
+        return Ok(gam_problem::RhoPrior::Flat);
     }
     let mut keyed = BTreeMap::<String, (f64, f64)>::new();
     for (label, shape, rate) in penalty_block_gamma_priors {
@@ -1642,7 +1642,7 @@ fn cause_specific_survival_rho_prior(
         }
     }
     let mut consumed = Vec::<String>::new();
-    let mut priors = Vec::<crate::types::RhoPrior>::with_capacity(cause_count * penalty_count);
+    let mut priors = Vec::<gam_problem::RhoPrior>::with_capacity(cause_count * penalty_count);
     for cause in 0..cause_count {
         for penalty_idx in 0..penalty_count {
             let label = format!(
@@ -1651,12 +1651,12 @@ fn cause_specific_survival_rho_prior(
             );
             if let Some((shape, rate)) = keyed.get(&label) {
                 consumed.push(label);
-                priors.push(crate::types::RhoPrior::GammaPrecision {
+                priors.push(gam_problem::RhoPrior::GammaPrecision {
                     shape: *shape,
                     rate: *rate,
                 });
             } else {
-                priors.push(crate::types::RhoPrior::Flat);
+                priors.push(gam_problem::RhoPrior::Flat);
             }
         }
     }
@@ -1682,7 +1682,7 @@ fn cause_specific_survival_rho_prior(
         }
         .into());
     }
-    Ok(crate::types::RhoPrior::Independent(priors))
+    Ok(gam_problem::RhoPrior::Independent(priors))
 }
 
 fn hash_workflow_array_view(
@@ -2132,7 +2132,7 @@ pub(crate) fn fit_survival_transformation_model(
                 };
                 let summary = crate::pirls::runworking_model_pirls(
                     &mut model,
-                    crate::types::Coefficients::new(beta0),
+                    gam_problem::Coefficients::new(beta0),
                     &opts,
                     |_| {},
                 )
@@ -2246,7 +2246,7 @@ pub(crate) fn fit_survival_transformation_model(
     };
     let summary = crate::pirls::runworking_model_pirls(
         &mut model,
-        crate::types::Coefficients::new(beta_start),
+        gam_problem::Coefficients::new(beta_start),
         &opts,
         |_| {},
     )

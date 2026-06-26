@@ -35,6 +35,7 @@ pub mod psi_terms;
 pub mod row_metric;
 mod seeding;
 pub mod solver_contract;
+pub mod types;
 
 mod gpu {
     pub(crate) mod linalg_dispatch {
@@ -94,6 +95,7 @@ pub use solver_contract::{
     DeclaredHessianForm, Derivative, EfsEval, HessianResult, OuterEval,
     OuterHessianMaterialization, OuterHessianOperator, OuterStrategyError,
 };
+pub use types::*;
 
 #[cold]
 fn reml_contract_panic(message: impl Into<String>) -> ! {

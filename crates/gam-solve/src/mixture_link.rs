@@ -4,7 +4,7 @@ use crate::probability::{
     stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
 };
 use crate::quadrature::latent_cloglog_jet5;
-use crate::types::{
+use gam_problem::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,
     MixtureLinkState, ResponseFamily, SasLinkSpec, SasLinkState, StandardLink,
 };
@@ -2289,7 +2289,7 @@ pub fn sas_inverse_link_jetwith_param_partials(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, SasLinkState};
+    use gam_problem::{InverseLink, LikelihoodSpec, LinkComponent, MixtureLinkSpec, SasLinkState};
 
     #[test]
     fn softmax_jacobian_matchesfd() {
@@ -2480,8 +2480,8 @@ mod tests {
         // `spec.link`. Verify that supplying explicit SAS/Mixture link states
         // through the spec produces finite jets at a representative eta.
         let sas_state = sas_link_state_from_raw(0.0, 0.0).expect("sas state");
-        let sas_spec = crate::types::LikelihoodSpec {
-            response: crate::types::ResponseFamily::Binomial,
+        let sas_spec = gam_problem::LikelihoodSpec {
+            response: gam_problem::ResponseFamily::Binomial,
             link: InverseLink::Sas(sas_state),
         };
         let sas_jet = inverse_link_jet_for_family(&sas_spec, 0.1).expect("sas jet");
@@ -2493,8 +2493,8 @@ mod tests {
             rho: ndarray::array![0.0],
             pi: ndarray::array![0.5, 0.5],
         };
-        let mix_spec = crate::types::LikelihoodSpec {
-            response: crate::types::ResponseFamily::Binomial,
+        let mix_spec = gam_problem::LikelihoodSpec {
+            response: gam_problem::ResponseFamily::Binomial,
             link: InverseLink::Mixture(mix_state),
         };
         let mix_jet = inverse_link_jet_for_family(&mix_spec, 0.1).expect("mix jet");

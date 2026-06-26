@@ -2,7 +2,7 @@ use crate::estimate::EstimationError;
 use gam_linalg::faer_ndarray::{FaerSymmetricFactor, array2_to_matmut};
 use gam_linalg::utils::{StableSolver, array_is_finite};
 use gam_linalg::matrix::SymmetricMatrix;
-use crate::types::Coefficients;
+use gam_problem::Coefficients;
 use ndarray::{Array1, Array2};
 
 use super::{PirlsPenalty, PirlsWorkspace};

@@ -2,7 +2,7 @@ use super::*;
 use crate::custom_family::BlockWorkingSet;
 use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use gam_solve::gauge::Gauge;
-use crate::types::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
+use gam_problem::{LinkComponent, MixtureLinkSpec, SasLinkSpec};
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::{Array1, array};
 

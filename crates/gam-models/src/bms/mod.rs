@@ -41,7 +41,7 @@ use gam_terms::smooth::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };
-use crate::types::{InverseLink, StandardLink, WigglePenaltyConfig};
+use gam_problem::{InverseLink, StandardLink, WigglePenaltyConfig};
 use gam_math::jet_partitions::MultiDirJet;
 use gam_problem::HyperOperator;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};

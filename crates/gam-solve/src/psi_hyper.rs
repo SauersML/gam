@@ -873,7 +873,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal<
     rho_current: &Array1<f64>,
     derivative_blocks: &[Vec<CustomFamilyBlockPsiDerivative>],
     warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: crate::types::RhoPrior,
+    rho_prior: gam_problem::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     evaluate_custom_family_hyper_internal_shared(
@@ -899,7 +899,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
     rho_current: &Array1<f64>,
     derivative_blocks: SharedDerivativeBlocks,
     warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: crate::types::RhoPrior,
+    rho_prior: gam_problem::RhoPrior,
     eval_mode: EvalMode,
 ) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
     if derivative_blocks.len() != specs.len() {
@@ -1097,7 +1097,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
 
         let robust_jeffreys_hphi =
             custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?;
-        let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
+        let has_configured_rho_prior = !matches!(rho_prior, gam_problem::RhoPrior::Flat);
         let batched_gradient_contract_allows_override =
             batched_outer_gradient_contract_allows_override(
                 robust_jeffreys_hphi
@@ -1202,7 +1202,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                         false,
                         EvalMode::ValueOnly,
                         options,
-                        crate::types::RhoPrior::Flat,
+                        gam_problem::RhoPrior::Flat,
                         family.pseudo_logdet_mode(),
                         &no_dh,
                         None,
@@ -1479,7 +1479,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
     // replaced. See `BatchedOuterGradientTerms`. The replacement is permitted
     // only when it differentiates the same objective: if robust Jeffreys
     // curvature is nonzero, the unified H_phi-aware evaluator owns the gradient.
-    let has_configured_rho_prior = !matches!(rho_prior, crate::types::RhoPrior::Flat);
+    let has_configured_rho_prior = !matches!(rho_prior, gam_problem::RhoPrior::Flat);
     let robust_jeffreys_hphi =
         custom_family_outer_jeffreys_hphi(family, &inner.block_states, specs, &ranges)?;
     let batched_gradient_contract_allows_override = batched_outer_gradient_contract_allows_override(
@@ -1598,7 +1598,7 @@ pub(crate) fn evaluate_custom_family_hyper_internal_shared<
                         false,
                         EvalMode::ValueOnly,
                         options,
-                        crate::types::RhoPrior::Flat,
+                        gam_problem::RhoPrior::Flat,
                         family.pseudo_logdet_mode(),
                         compute_dh.as_ref(),
                         compute_dh_many.as_deref(),
@@ -2060,7 +2060,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
             .as_ref()
             .map(|w| &w.inner)
             .or_else(|| warm_start.map(|w| &w.inner)),
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
         eval_mode,
     )?;
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
@@ -2092,7 +2092,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_shared<
             .as_ref()
             .map(|w| &w.inner)
             .or_else(|| warm_start.map(|w| &w.inner)),
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
         eval_mode,
     )?;
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
@@ -2484,7 +2484,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_internal_shared<
         // the VGH ψ path (gam#808/#787); no batched override here.
         family.use_projected_penalty_logdet(),
         options,
-        crate::types::RhoPrior::Flat,
+        gam_problem::RhoPrior::Flat,
         family.pseudo_logdet_mode(),
         &compute_dh,
         compute_dh_many.as_deref(),
@@ -2562,7 +2562,7 @@ pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
             &penalty_counts,
             rho_current,
             warm_start.map(|w| &w.inner),
-            crate::types::RhoPrior::Flat,
+            gam_problem::RhoPrior::Flat,
         )
         .map_err(CustomFamilyError::from)?
     } else {

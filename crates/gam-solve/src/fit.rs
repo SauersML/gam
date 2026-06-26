@@ -10,7 +10,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<crate::model_types::UnifiedFitResult, CustomFamilyError> {
-    fit_custom_family_with_rho_prior(family, specs, options, crate::types::RhoPrior::Flat)
+    fit_custom_family_with_rho_prior(family, specs, options, gam_problem::RhoPrior::Flat)
 }
 
 /// Lift reduced-space `ParameterBlockState`s back to the raw block
@@ -521,7 +521,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-    rho_prior: crate::types::RhoPrior,
+    rho_prior: gam_problem::RhoPrior,
 ) -> Result<crate::model_types::UnifiedFitResult, CustomFamilyError> {
     // Multi-output families that omitted the per-block channel callback get it
     // installed here from their declared `output_channel_assignment`, so the

@@ -88,10 +88,10 @@ impl ResidualDistributionOps for ResidualDistribution {
         match self {
             ResidualDistribution::Gaussian => normal_cdf(z),
             ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).mu
+                component_inverse_link_jet(gam_problem::LinkComponent::CLogLog, z).mu
             }
             ResidualDistribution::Logistic => {
-                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).mu
+                component_inverse_link_jet(gam_problem::LinkComponent::Logit, z).mu
             }
         }
     }
@@ -100,10 +100,10 @@ impl ResidualDistributionOps for ResidualDistribution {
         match self {
             ResidualDistribution::Gaussian => normal_pdf(z),
             ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).d1
+                component_inverse_link_jet(gam_problem::LinkComponent::CLogLog, z).d1
             }
             ResidualDistribution::Logistic => {
-                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).d1
+                component_inverse_link_jet(gam_problem::LinkComponent::Logit, z).d1
             }
         }
     }
@@ -112,10 +112,10 @@ impl ResidualDistributionOps for ResidualDistribution {
         match self {
             ResidualDistribution::Gaussian => -z * normal_pdf(z),
             ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).d2
+                component_inverse_link_jet(gam_problem::LinkComponent::CLogLog, z).d2
             }
             ResidualDistribution::Logistic => {
-                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).d2
+                component_inverse_link_jet(gam_problem::LinkComponent::Logit, z).d2
             }
         }
     }
@@ -127,10 +127,10 @@ impl ResidualDistributionOps for ResidualDistribution {
                 (z * z - 1.0) * f
             }
             ResidualDistribution::Gumbel => {
-                component_inverse_link_jet(crate::types::LinkComponent::CLogLog, z).d3
+                component_inverse_link_jet(gam_problem::LinkComponent::CLogLog, z).d3
             }
             ResidualDistribution::Logistic => {
-                component_inverse_link_jet(crate::types::LinkComponent::Logit, z).d3
+                component_inverse_link_jet(gam_problem::LinkComponent::Logit, z).d3
             }
         }
     }

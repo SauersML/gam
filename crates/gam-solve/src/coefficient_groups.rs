@@ -39,12 +39,12 @@ pub(crate) fn coefficient_group_block_index(
 }
 
 pub(crate) fn validate_group_rho_prior_coordinate(
-    prior: &crate::types::RhoPrior,
+    prior: &gam_problem::RhoPrior,
     context: &str,
 ) -> Result<(), String> {
     match prior {
-        crate::types::RhoPrior::Flat => Ok(()),
-        crate::types::RhoPrior::Normal { mean, sd } => {
+        gam_problem::RhoPrior::Flat => Ok(()),
+        gam_problem::RhoPrior::Normal { mean, sd } => {
             if !mean.is_finite() {
                 return Err(format!(
                     "{context} Normal log-precision prior requires finite mean, got {mean}"
@@ -57,7 +57,7 @@ pub(crate) fn validate_group_rho_prior_coordinate(
             }
             Ok(())
         }
-        crate::types::RhoPrior::GammaPrecision { shape, rate } => {
+        gam_problem::RhoPrior::GammaPrecision { shape, rate } => {
             if !shape.is_finite() || *shape <= 0.0 {
                 return Err(CustomFamilyError::DimensionMismatch {
                     reason: format!(
@@ -73,10 +73,10 @@ pub(crate) fn validate_group_rho_prior_coordinate(
             }
             Ok(())
         }
-        crate::types::RhoPrior::PenalizedComplexity { upper, tail_prob } => {
+        gam_problem::RhoPrior::PenalizedComplexity { upper, tail_prob } => {
             validate_penalized_complexity_prior(context, *upper, *tail_prob)
         }
-        crate::types::RhoPrior::Independent(_) => Err(CustomFamilyError::ConstraintViolation {
+        gam_problem::RhoPrior::Independent(_) => Err(CustomFamilyError::ConstraintViolation {
             reason: format!("{context} must be a scalar rho prior, not a nested Independent prior"),
         }
         .into()),
@@ -104,12 +104,12 @@ pub(crate) fn validate_penalized_complexity_prior(
 }
 
 pub(crate) fn expand_custom_group_base_prior(
-    base_prior: &crate::types::RhoPrior,
+    base_prior: &gam_problem::RhoPrior,
     base_count: usize,
     context: &str,
-) -> Result<Vec<crate::types::RhoPrior>, String> {
+) -> Result<Vec<gam_problem::RhoPrior>, String> {
     match base_prior {
-        crate::types::RhoPrior::Independent(priors) => {
+        gam_problem::RhoPrior::Independent(priors) => {
             if priors.len() != base_count {
                 return Err(CustomFamilyError::DimensionMismatch { reason: format!(
                     "{context} base Independent rho prior length mismatch: got {}, expected {base_count}",
@@ -131,7 +131,7 @@ pub(crate) fn expand_custom_group_base_prior(
 pub fn realize_coefficient_groups_for_custom_family(
     specs: &[ParameterBlockSpec],
     groups: &[CoefficientGroupSpec],
-    base_prior: crate::types::RhoPrior,
+    base_prior: gam_problem::RhoPrior,
 ) -> Result<RealizedCoefficientGroupSpecs, String> {
     use gam_terms::structure::coefficient_group_resolver::{
         ResolvedGroup, ResolvedGroupHierarchy,
@@ -221,7 +221,7 @@ pub fn realize_coefficient_groups_for_custom_family(
         let group_prior = match group.prior.as_ref() {
             Some(prior) => prior.to_rho_prior(),
             None => match &base_prior {
-                crate::types::RhoPrior::Independent(_) => {
+                gam_problem::RhoPrior::Independent(_) => {
                     return Err(CustomFamilyError::ConstraintViolation { reason: format!(
                         "coefficient group '{}' must declare a prior when base_prior is Independent",
                         group.label
@@ -293,7 +293,7 @@ pub fn realize_coefficient_groups_for_custom_family(
         specs: realized_specs,
         groups: realized_groups,
         penalty_labels,
-        rho_prior: crate::types::RhoPrior::Independent(priors),
+        rho_prior: gam_problem::RhoPrior::Independent(priors),
         outer_labels,
     })
 }

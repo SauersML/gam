@@ -8,7 +8,7 @@ use crate::model_types::EstimationError;
 use gam_solve::pirls::{
     LinearInequalityConstraints, WorkingModel as PirlsWorkingModel, WorkingState, array1_l2_norm,
 };
-use crate::types::{Coefficients, LinearPredictor};
+use gam_problem::{Coefficients, LinearPredictor};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3, Axis};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -1971,7 +1971,7 @@ impl WorkingModelSurvival {
         self.penalties.addhessian_inplace(&mut h);
         // SURVIVAL_STABILIZATION_RIDGE is an `ExplicitPrior`-kind
         // stabilization in the canonical ledger taxonomy
-        // (`crate::types::StabilizationKind::ExplicitPrior`): δ enters the
+        // (`gam_problem::StabilizationKind::ExplicitPrior`): δ enters the
         // gradient (`grad += δ β`), the Hessian (`H += δ I`), the scalar
         // penalty term added to the objective (`0.5 δ ‖β‖²`), and is
         // serialized through `WorkingState::ridge_used` so downstream
@@ -2399,7 +2399,7 @@ impl WorkingModelSurvival {
                 include_logdet_s: true,
             },
             rho_curvature_scale: 1.0,
-            rho_prior: crate::types::RhoPrior::Flat,
+            rho_prior: gam_problem::RhoPrior::Flat,
             hessian_logdet_correction: 0.0,
             penalty_subspace_trace: None,
             deriv_provider: Some(Box::new(provider)),

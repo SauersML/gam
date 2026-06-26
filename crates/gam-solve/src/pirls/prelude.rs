@@ -28,9 +28,9 @@ pub(crate) use crate::mixture_link::{
 
 pub(crate) use crate::active_set;
 
-pub(crate) use crate::types::{Coefficients, LinearPredictor, StandardLink};
+pub(crate) use gam_problem::{Coefficients, LinearPredictor, StandardLink};
 
-pub(crate) use crate::types::{
+pub(crate) use gam_problem::{
     GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkFunction, MixtureLinkState, ResponseFamily,
     SasLinkState, is_valid_tweedie_power,
 };

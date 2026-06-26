@@ -4,7 +4,7 @@ use gam_linalg::sparse_exact::SparseExactFactor;
 use crate::pirls::PIRLS_CACHE_BYTE_BUDGET;
 use crate::pirls::assemble_and_factor_sparse_penalized_system;
 use gam_terms::basis::LocalDesignJacobianProvider;
-use crate::types::SasLinkState;
+use gam_problem::SasLinkState;
 use gam_problem::OuterEval;
 use ndarray::{Array1, Array2, s};
 use std::collections::{HashMap, VecDeque};
@@ -337,7 +337,7 @@ mod tests {
     use gam_linalg::matrix::symmetrize_in_place;
     use crate::pirls::PirlsCoordinateFrame;
     use gam_terms::basis::{ImplicitDesignPsiDerivative, RadialScalarKind};
-    use crate::types::{
+    use gam_problem::{
         GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink,
     };
     use faer::Side;
@@ -1480,7 +1480,7 @@ mod tests {
         let beta = array![0.1, -0.2, 0.3, 0.05];
         let eta = x.dot(&beta);
         let op = super::RemlState::build_firth_dense_operator_for_link(
-            &crate::types::InverseLink::Standard(crate::types::StandardLink::Logit),
+            &gam_problem::InverseLink::Standard(gam_problem::StandardLink::Logit),
             &x,
             &eta,
             ndarray::Array1::ones(x.nrows()).view(),
@@ -4618,7 +4618,7 @@ impl PenaltySubspaceCacheKey {
     /// `Hash` impl. Two calls at the same `(E, ridge)` yield equal keys.
     pub(crate) fn from_inputs(
         e_transformed: &ndarray::Array2<f64>,
-        ridge_passport: &crate::types::RidgePassport,
+        ridge_passport: &gam_problem::RidgePassport,
     ) -> Self {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -4734,7 +4734,7 @@ impl EvalCacheManager {
     pub(super) fn cached_penalty_subspace<F>(
         &self,
         e_transformed: &ndarray::Array2<f64>,
-        ridge_passport: &crate::types::RidgePassport,
+        ridge_passport: &gam_problem::RidgePassport,
         build: F,
     ) -> Result<Arc<outer_eval::PenaltySubspace>, EstimationError>
     where
@@ -4822,7 +4822,7 @@ pub(crate) struct RemlState<'a> {
     pub(crate) sparse_penalty_block_count: Option<usize>,
     pub(crate) p: usize,
     pub(crate) config: Arc<RemlConfig>,
-    pub(crate) runtime_mixture_link_state: Option<crate::types::MixtureLinkState>,
+    pub(crate) runtime_mixture_link_state: Option<gam_problem::MixtureLinkState>,
     pub(crate) runtime_sas_link_state: Option<SasLinkState>,
     pub(crate) nullspace_dims: Vec<usize>,
     pub(crate) coefficient_lower_bounds: Option<Array1<f64>>,
@@ -4830,7 +4830,7 @@ pub(crate) struct RemlState<'a> {
     /// Relative shrinkage floor for penalized block eigenvalues (rho-independent).
     pub(crate) penalty_shrinkage_floor: Option<f64>,
     /// Explicit prior on log smoothing parameters used by the REML/LAML objective.
-    pub(crate) rho_prior: crate::types::RhoPrior,
+    pub(crate) rho_prior: gam_problem::RhoPrior,
 
     pub(crate) cache_manager: EvalCacheManager,
     pub(crate) arena: RemlArena,

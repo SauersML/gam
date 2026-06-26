@@ -807,7 +807,7 @@ pub(super) fn prepare_standard_latent_coord(
         rewritten,
         StandardLatentCoordConfig {
             values: latent_values,
-            term_index: crate::types::SmoothTermIdx::placeholder(),
+            term_index: gam_problem::SmoothTermIdx::placeholder(),
             feature_cols,
             manifold: spec.manifold.manifold,
             manifold_auto: spec.manifold.auto,

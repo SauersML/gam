@@ -11,7 +11,7 @@ use crate::quadrature::{
     normal_expectation_1d_adaptive, normal_expectation_1d_adaptive_pair,
     probit_posterior_meanvariance, survival_posterior_mean, survival_posterior_meanvariance,
 };
-use crate::types::{
+use gam_problem::{
     InverseLink, LikelihoodScaleMetadata, LikelihoodSpec, LinkFunction, ResponseFamily,
     StandardLink,
 };
@@ -143,36 +143,36 @@ pub fn strategy_from_fit(
 
 impl ResolvedFamilyStrategy {
     #[inline]
-    fn mixture_state(&self) -> Option<&crate::types::MixtureLinkState> {
+    fn mixture_state(&self) -> Option<&gam_problem::MixtureLinkState> {
         self.spec.link.mixture_state()
     }
 
     #[inline]
-    fn sas_state(&self) -> Option<&crate::types::SasLinkState> {
+    fn sas_state(&self) -> Option<&gam_problem::SasLinkState> {
         self.spec.link.sas_state()
     }
 
     #[inline]
-    fn latent_cloglog_state(&self) -> Option<&crate::types::LatentCLogLogState> {
+    fn latent_cloglog_state(&self) -> Option<&gam_problem::LatentCLogLogState> {
         self.spec.link.latent_cloglog_state()
     }
 
     #[inline]
     fn require_latent_cloglog_state(
         &self,
-    ) -> Result<&crate::types::LatentCLogLogState, EstimationError> {
+    ) -> Result<&gam_problem::LatentCLogLogState, EstimationError> {
         self.latent_cloglog_state()
             .ok_or_else(|| missing_state(&self.spec, "latent cloglog"))
     }
 
     #[inline]
-    fn require_sas_state(&self) -> Result<&crate::types::SasLinkState, EstimationError> {
+    fn require_sas_state(&self) -> Result<&gam_problem::SasLinkState, EstimationError> {
         self.sas_state()
             .ok_or_else(|| missing_state(&self.spec, "SAS link"))
     }
 
     #[inline]
-    fn require_mixture_state(&self) -> Result<&crate::types::MixtureLinkState, EstimationError> {
+    fn require_mixture_state(&self) -> Result<&gam_problem::MixtureLinkState, EstimationError> {
         self.mixture_state()
             .ok_or_else(|| missing_state(&self.spec, "mixture link"))
     }
@@ -473,7 +473,7 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
 mod log_link_public_jet_tests {
     use super::*;
     use gam_solve::mixture_link::inverse_link_jet_for_family;
-    use crate::types::LikelihoodSpec;
+    use gam_problem::LikelihoodSpec;
     use ndarray::Array1;
 
     /// The PUBLIC predict surface for a log-link family (Poisson/Gamma/Tweedie/
