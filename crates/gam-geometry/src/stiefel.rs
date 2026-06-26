@@ -1,10 +1,10 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::geometry::manifold::{
+use crate::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, flatten, from_flat, identity,
     matrix_exp, qr_thin, sym, tangent_basis_metric_orthonormal,
 };
-use crate::geometry::sphere::SphereManifold;
+use crate::sphere::SphereManifold;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StiefelManifold {
@@ -107,7 +107,7 @@ impl RiemannianManifold for StiefelManifold {
         )?;
         // Route the four large-n products (n×k · k×n and n×n · n×k) through
         // the GPU-dispatched shims; small frames stay on faer.
-        use crate::linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
+        use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
         let a = fast_atb(&y, &delta); // k×k: A = YᵀΔ (skew on the tangent space)
         let delta_yt = fast_abt(&delta, &y); // n×n: Δ Yᵀ
         let y_dt = fast_abt(&y, &delta); // n×n: Y Δᵀ = (Δ Yᵀ)ᵀ
@@ -166,7 +166,7 @@ impl RiemannianManifold for StiefelManifold {
     /// off the `YᵀΔ = 0` subspace).
     ///
     /// With the row-major flatten `vec(Δ)[i·k + j] = Δ[i, j]`
-    /// (see [`flatten`](crate::geometry::manifold)), the metric factorizes as
+    /// (see [`flatten`](crate::manifold)), the metric factorizes as
     /// the Kronecker product `(I − ½YYᵀ) ⊗ I_k`: entry `M[i, p]` of the n×n
     /// matrix `M = I − ½YYᵀ` scales the `k×k` identity block coupling rows `i`
     /// and `p`, i.e. `G[i·k + j, p·k + q] = M[i, p] · δ_{j, q}`.
@@ -184,7 +184,7 @@ impl RiemannianManifold for StiefelManifold {
         // M = I_n − ½ Y Yᵀ (n×n, symmetric positive definite for Yᵀ Y = I_k).
         // Y Yᵀ (n×k · k×n) carries the large ambient dimension n, GPU-dispatched
         // via fast_abt.
-        let yyt = crate::linalg::faer_ndarray::fast_abt(&y, &y);
+        let yyt = gam_linalg::faer_ndarray::fast_abt(&y, &y);
         let mut m = identity(self.n);
         for i in 0..self.n {
             for p in 0..self.n {
@@ -239,7 +239,7 @@ impl RiemannianManifold for StiefelManifold {
         point: ArrayView1<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+        use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
         let y = from_flat(point, self.n, self.k)?;
         let z = from_flat(vec, self.n, self.k)?;
         // Tangent projection z − Y·sym(Yᵀz): YᵀZ (k×n · n×k) and Y·S (n×k · k×k)
@@ -276,7 +276,7 @@ impl RiemannianManifold for StiefelManifold {
         if let Some(sphere) = self.as_sphere() {
             return sphere.riemannian_gradient(point, euclidean_grad);
         }
-        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+        use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
         let y = from_flat(point, self.n, self.k)?;
         let e = from_flat(euclidean_grad, self.n, self.k)?;
         // grad = E − Y (Eᵀ Y): Eᵀ Y is k×k, Y·(EᵀY) carries the ambient n.
@@ -337,7 +337,7 @@ impl RiemannianManifold for StiefelManifold {
         // Every dense product below either contracts or carries the large
         // ambient dimension n (k×n · n×k, n×k · k×n, or n×n · n×k); route
         // them all through the GPU-dispatched fast_ab/fast_atb/fast_abt shims.
-        use crate::linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
+        use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
         let y = from_flat(point, self.n, self.k)?;
         let z = from_flat(tangent_vec, self.n, self.k)?; // raw (unprojected) input
         let s_proj = sym(&fast_atb(&y, &z)); // S = sym(Yᵀz)
@@ -425,7 +425,7 @@ fn matrix_exp_vjp(b: &Array2<f64>, cotangent: &Array2<f64>) -> GeometryResult<Ar
 #[cfg(test)]
 mod tangent_basis_tests {
     use super::StiefelManifold;
-    use crate::geometry::manifold::RiemannianManifold;
+    use crate::manifold::RiemannianManifold;
     use ndarray::Array1;
 
     /// The Stiefel `tangent_basis` must be orthonormal under the canonical

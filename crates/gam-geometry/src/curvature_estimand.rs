@@ -2,7 +2,7 @@
 //!
 //! #944 stage 3. The κ-jets (`distance_kappa_jet` / `log_map_kappa_jet` /
 //! `exp_map_kappa_jet`) and the analytic Jacobi-field `exp_map_vjp` for the
-//! [`ConstantCurvature`](crate::geometry::ConstantCurvature) chart are landed and
+//! [`ConstantCurvature`](crate::ConstantCurvature) chart are landed and
 //! FD-gated. This module turns the fitted curvature `κ̂` from "we chose
 //! hyperbolic space" into a reported estimate with a confidence interval and a
 //! likelihood-ratio test of flatness — and exposes the κ-derivative of the

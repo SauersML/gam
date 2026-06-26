@@ -17,7 +17,10 @@ mod macros;
 
 mod linalg_helpers;
 mod linear_constraints;
+pub mod coefficient_prior_mean;
+pub mod gauge;
 pub mod penalty_coordinate;
+pub mod penalty_matrix;
 mod pseudo_logdet;
 mod seeding;
 pub mod solver_contract;
@@ -47,8 +50,11 @@ mod gpu {
 
 pub use gam_linalg::faer_ndarray::{in_nested_parallel_region, with_nested_parallel};
 use linalg_helpers::{dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into};
+pub use coefficient_prior_mean::{CoefficientPriorMean, PriorMeanError};
+pub use gauge::Gauge;
 pub use linear_constraints::LinearInequalityConstraints;
 pub use penalty_coordinate::PenaltyCoordinate;
+pub use penalty_matrix::PenaltyMatrix;
 pub use pseudo_logdet::PseudoLogdetMode;
 pub use seeding::{SeedConfig, SeedRiskProfile, clamp_seed_rho_to_bounds, normalize_seed_bounds};
 pub use solver_contract::{

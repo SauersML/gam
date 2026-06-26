@@ -1,6 +1,6 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, array};
 
-use crate::geometry::manifold::{
+use crate::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, identity, wrap_angle,
     zero_christoffel,
 };
@@ -99,7 +99,7 @@ impl RiemannianManifold for CircleManifold {
 #[cfg(test)]
 mod tests {
     use super::CircleManifold;
-    use crate::geometry::manifold::{GeometryError, RiemannianManifold};
+    use crate::manifold::{GeometryError, RiemannianManifold};
     use ndarray::array;
 
     #[test]

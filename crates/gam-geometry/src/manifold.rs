@@ -256,23 +256,23 @@ impl ManifoldSpec {
     /// [`Product`]: Self::Product
     pub fn build(&self) -> GeometryResult<Box<dyn RiemannianManifold>> {
         match self {
-            Self::Euclidean(dim) => Ok(Box::new(crate::geometry::EuclideanManifold::new(*dim))),
-            Self::Circle => Ok(Box::new(crate::geometry::CircleManifold::new())),
-            Self::Sphere { intrinsic_dim } => Ok(Box::new(crate::geometry::SphereManifold::new(
+            Self::Euclidean(dim) => Ok(Box::new(crate::EuclideanManifold::new(*dim))),
+            Self::Circle => Ok(Box::new(crate::CircleManifold::new())),
+            Self::Sphere { intrinsic_dim } => Ok(Box::new(crate::SphereManifold::new(
                 *intrinsic_dim,
             ))),
-            Self::Torus { dim } => Ok(Box::new(crate::geometry::TorusManifold::new(*dim))),
+            Self::Torus { dim } => Ok(Box::new(crate::TorusManifold::new(*dim))),
             Self::Grassmann { k, n } => {
-                Ok(Box::new(crate::geometry::GrassmannManifold::new(*k, *n)?))
+                Ok(Box::new(crate::GrassmannManifold::new(*k, *n)?))
             }
-            Self::Stiefel { k, n } => Ok(Box::new(crate::geometry::StiefelManifold::new(*k, *n)?)),
-            Self::Spd { n } => Ok(Box::new(crate::geometry::SpdManifold::new(*n))),
+            Self::Stiefel { k, n } => Ok(Box::new(crate::StiefelManifold::new(*k, *n)?)),
+            Self::Spd { n } => Ok(Box::new(crate::SpdManifold::new(*n))),
             Self::Product(parts) => {
                 let mut built = Vec::with_capacity(parts.len());
                 for part in parts {
                     built.push(part.build()?);
                 }
-                Ok(Box::new(crate::geometry::ProductManifold::new(built)))
+                Ok(Box::new(crate::ProductManifold::new(built)))
             }
         }
     }
@@ -328,7 +328,7 @@ pub(crate) fn fast_ab_rows_multi_gpu(
     a: ArrayView2<'_, f64>,
     b: ArrayView2<'_, f64>,
 ) -> Array2<f64> {
-    use crate::linalg::faer_ndarray::fast_ab;
+    use gam_linalg::faer_ndarray::fast_ab;
     let (m, k) = a.dim();
     let (kb, n) = b.dim();
     assert_eq!(k, kb, "fast_ab_rows_multi_gpu inner dimension mismatch");
@@ -336,8 +336,7 @@ pub(crate) fn fast_ab_rows_multi_gpu(
     // Only worth the reshape/stitch overhead when the pool actually has more than
     // one device and there are enough rows to tile across it; otherwise the plain
     // single-device shim is strictly better.
-    let multi_gpu =
-        crate::gpu::device_runtime::GpuRuntime::global().is_some_and(|rt| rt.device_count() > 1);
+    let multi_gpu = gam_linalg::gpu_hook::gpu_dispatch().is_some_and(|d| d.device_count() > 1);
     // The batch axis must clear the multi-GPU floor used inside the dispatch
     // layer (64) for the split to engage, so we need at least that many tiles.
     const MIN_TILES: usize = 64;
@@ -353,7 +352,8 @@ pub(crate) fn fast_ab_rows_multi_gpu(
             .to_owned()
             .into_shape_with_order((tiles, rows_per_tile, k));
         if let Ok(a3) = a3 {
-            if let Some(result3) = crate::gpu::try_fast_ab_broadcast_b_batched(a3.view(), b.view())
+            if let Some(result3) = gam_linalg::gpu_hook::gpu_dispatch()
+                .and_then(|d| d.try_fast_ab_broadcast_b_batched(a3.view(), b.view()))
             {
                 let mut out = Array2::<f64>::zeros((m, n));
                 for t in 0..tiles {
@@ -398,7 +398,7 @@ pub(crate) fn quad_form(
     // metric Gram–Schmidt tangent basis. Route it through the GPU-dispatched
     // fast_av shim so large-ambient metrics (SPD/Stiefel/Grassmann n²×n²) offload
     // to the GPU; the trailing a·(Gb) is an O(n) dot.
-    let gb = crate::linalg::faer_ndarray::fast_av(&g, &b);
+    let gb = gam_linalg::faer_ndarray::fast_av(&g, &b);
     dot(a, gb.view())
 }
 
@@ -804,7 +804,7 @@ pub(crate) fn spectral_map_spd(
     }
     // Reconstruction V·f(Λ)·Vᵀ: two dense n×n products GPU-dispatched via
     // fast_ab/fast_abt for large ambient dimension.
-    use crate::linalg::faer_ndarray::{fast_ab, fast_abt};
+    use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
     Ok(fast_abt(&fast_ab(&evecs, &diag), &evecs))
 }
 
@@ -819,7 +819,7 @@ pub(crate) fn spectral_map_symmetric(
         diag[[i, i]] = f(evals[i])?;
     }
     // Reconstruction V·f(Λ)·Vᵀ, GPU-dispatched via fast_ab/fast_abt.
-    use crate::linalg::faer_ndarray::{fast_ab, fast_abt};
+    use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
     Ok(fast_abt(&fast_ab(&evecs, &diag), &evecs))
 }
 
@@ -838,7 +838,7 @@ pub(crate) fn spectral_map_symmetric(
 pub(crate) fn thin_svd_gram(
     y: &Array2<f64>,
 ) -> GeometryResult<(Array2<f64>, Array1<f64>, Array2<f64>)> {
-    use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+    use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
     let (n, k) = y.dim();
     let gram = fast_atb(y, y);
     let (evals, v) = jacobi_symmetric(&gram)?;
@@ -899,7 +899,7 @@ pub(crate) fn matrix_exp(a: &Array2<f64>) -> GeometryResult<Array2<f64>> {
     //   term_k = term_{k-1} · A_scaled / k.
     // Both the Taylor term recurrence and the scaling-and-squaring use dense
     // n×n products; GPU-dispatch them via fast_ab for large blocks.
-    use crate::linalg::faer_ndarray::fast_ab;
+    use gam_linalg::faer_ndarray::fast_ab;
     let mut result = identity(n);
     let mut term = identity(n);
     for k in 1..=12 {

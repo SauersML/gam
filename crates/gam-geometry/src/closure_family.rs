@@ -28,7 +28,7 @@
 //!
 //! ## Why this is the #944 pattern
 //!
-//! Exactly like [`crate::geometry::constant_curvature`]'s `M_κ`, `γ` is one
+//! Exactly like [`crate::constant_curvature`]'s `M_κ`, `γ` is one
 //! parameter with stable removable limits whose basis, penalty, and evidence
 //! derivatives flow through `Tower4<1>` jets, so the parameter joins the same
 //! ψ-channel the curvature does. `cos`/`sin` are entire, so the γ-jet of the

@@ -1,6 +1,6 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::geometry::manifold::{
+use crate::manifold::{
     GeometryError, GeometryResult, RiemannianManifold, check_len, cholesky_spd, dot, flatten,
     from_flat, inverse, spectral_map_spd, spectral_map_symmetric, sym,
     tangent_basis_metric_orthonormal,
@@ -51,7 +51,7 @@ impl SpdManifold {
         u: &Array2<f64>,
         v: &Array2<f64>,
     ) -> GeometryResult<f64> {
-        use crate::linalg::faer_ndarray::fast_ab;
+        use gam_linalg::faer_ndarray::fast_ab;
         let pinv = inverse(p)?;
         // Affine-invariant inner product tr(P⁻¹U P⁻¹V): a chain of dense n×n
         // products that the auto-dispatch fast_ab shim offloads to the GPU for
@@ -91,7 +91,7 @@ impl RiemannianManifold for SpdManifold {
         point: ArrayView1<'_, f64>,
         tangent_vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        use crate::linalg::faer_ndarray::fast_ab;
+        use gam_linalg::faer_ndarray::fast_ab;
         let p = self.matrix(point)?;
         let u = sym(&from_flat(tangent_vec, self.n, self.n)?);
         let sqrt_p = spectral_map_spd(&p, |x| Ok(x.sqrt()))?;
@@ -111,7 +111,7 @@ impl RiemannianManifold for SpdManifold {
         p_from: ArrayView1<'_, f64>,
         p_to: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        use crate::linalg::faer_ndarray::fast_ab;
+        use gam_linalg::faer_ndarray::fast_ab;
         let p = self.matrix(p_from)?;
         let q = self.matrix(p_to)?;
         let sqrt_p = spectral_map_spd(&p, |x| Ok(x.sqrt()))?;
@@ -136,7 +136,7 @@ impl RiemannianManifold for SpdManifold {
         }
         let p = self.matrix(point_along.row(0))?;
         let q = self.matrix(point_along.row(point_along.nrows() - 1))?;
-        use crate::linalg::faer_ndarray::{fast_ab, fast_abt};
+        use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
         let u = sym(&from_flat(vec, self.n, self.n)?);
         let inv_sqrt_p = spectral_map_spd(&p, |x| Ok(1.0 / x.sqrt()))?;
         let middle = fast_ab(&fast_ab(&inv_sqrt_p, &q), &inv_sqrt_p);
@@ -201,7 +201,7 @@ impl RiemannianManifold for SpdManifold {
         let p = self.matrix(point)?;
         let u = sym(&from_flat(tangent_pair.0, self.n, self.n)?);
         let v = sym(&from_flat(tangent_pair.1, self.n, self.n)?);
-        use crate::linalg::faer_ndarray::fast_ab;
+        use gam_linalg::faer_ndarray::fast_ab;
         let inv_sqrt_p = spectral_map_spd(&p, |x| Ok(1.0 / x.sqrt()))?;
         // Whitened tangents Ã = P^{-1/2} U P^{-1/2} and their commutator [Ã,B̃]:
         // dense n×n matmul chains GPU-dispatched via fast_ab.
@@ -252,7 +252,7 @@ impl RiemannianManifold for SpdManifold {
         point: ArrayView1<'_, f64>,
         euclidean_grad: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        use crate::linalg::faer_ndarray::fast_ab;
+        use gam_linalg::faer_ndarray::fast_ab;
         let p = self.matrix(point)?;
         let e = sym(&from_flat(euclidean_grad, self.n, self.n)?);
         // P · sym(E) · P (dense n×n chain, GPU-dispatched via fast_ab).
@@ -283,7 +283,7 @@ impl RiemannianManifold for SpdManifold {
 /// symmetric) flat tangent vector `v` at base point `P`, computed without
 /// forming the `n²×n²` Kronecker metric. `pinv = P⁻¹`.
 fn affine_sq_norm(n: usize, pinv: &Array2<f64>, v: ArrayView1<'_, f64>) -> GeometryResult<f64> {
-    use crate::linalg::faer_ndarray::fast_ab;
+    use gam_linalg::faer_ndarray::fast_ab;
     let vm = sym(&from_flat(v, n, n)?);
     // tr(P⁻¹ V P⁻¹ V).
     let a = fast_ab(&fast_ab(pinv, &vm), &fast_ab(pinv, &vm));
@@ -367,7 +367,7 @@ pub fn spd_frechet_mean(
         ));
     }
     let spd = SpdManifold::new(n);
-    let w = crate::geometry::normalize_weights(m, weights)
+    let w = crate::normalize_weights(m, weights)
         .map_err(|_| GeometryError::InvalidPoint("SPD Fréchet mean: invalid weights"))?;
 
     // Owned flat samples (each validated as an SPD point on first log_map use).
@@ -489,7 +489,7 @@ pub fn spd_frechet_mean(
 #[cfg(test)]
 mod tangent_basis_tests {
     use super::SpdManifold;
-    use crate::geometry::manifold::RiemannianManifold;
+    use crate::manifold::RiemannianManifold;
     use ndarray::Array1;
 
     /// The SPD `tangent_basis` must be orthonormal under the affine-invariant
@@ -523,7 +523,7 @@ mod tangent_basis_tests {
 #[cfg(test)]
 mod frechet_mean_tests {
     use super::{SpdManifold, spd_frechet_mean};
-    use crate::geometry::manifold::RiemannianManifold;
+    use crate::manifold::RiemannianManifold;
     use ndarray::{Array1, Array2};
 
     /// Row-major flat `n×n` diagonal matrix from its diagonal.

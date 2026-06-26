@@ -1,11 +1,11 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::geometry::manifold::{
+use crate::manifold::{
     GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, flatten,
     from_flat, identity, inverse, jacobi_symmetric, projected_standard_basis_tangent, qr_thin,
     thin_svd_gram,
 };
-use crate::geometry::sphere::SphereManifold;
+use crate::sphere::SphereManifold;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrassmannManifold {
@@ -42,7 +42,7 @@ impl GrassmannManifold {
     /// two share the same geodesics, exponential, logarithm, parallel
     /// transport, and (constant `+1`) sectional curvature, so we reuse the
     /// [`SphereManifold`] formulas — exactly as `St(n, 1)` does in
-    /// [`StiefelManifold`](crate::geometry::stiefel::StiefelManifold). This is
+    /// [`StiefelManifold`](crate::stiefel::StiefelManifold). This is
     /// essential at the principal-angle-`π/2` cut-locus boundary, where the
     /// `(YᵀZ)⁻¹` form used by the general-`k` `log_map` is singular but the
     /// sphere logarithm (denominator `1 + Y·Z`) is well defined, so e.g.
@@ -90,7 +90,7 @@ impl RiemannianManifold for GrassmannManifold {
         }
         // Geodesic frame Y·V·cos(Σ)·Vᵀ + U·sin(Σ)·Vᵀ: dense products carrying the
         // large ambient dimension n, GPU-dispatched via fast_ab/fast_abt.
-        use crate::linalg::faer_ndarray::{fast_ab, fast_abt};
+        use gam_linalg::faer_ndarray::{fast_ab, fast_abt};
         let yv_cos = fast_ab(&fast_ab(&y, &v), &cos_d);
         let u_sin = fast_ab(&u, &sin_d);
         let next = &fast_abt(&yv_cos, &v) + &fast_abt(&u_sin, &v);
@@ -138,7 +138,7 @@ impl RiemannianManifold for GrassmannManifold {
             }
             return sphere.log_map(p_from, p_to);
         }
-        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+        use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
         let y = from_flat(p_from, self.n, self.k)?;
         let z = from_flat(p_to, self.n, self.k)?;
         // YᵀZ (k×n · n×k), the normal Z − Y(YᵀZ) and M = normal·(YᵀZ)⁻¹ (n×k · k×k),
@@ -168,7 +168,7 @@ impl RiemannianManifold for GrassmannManifold {
             diag[[i, i]] = sigma[i];
         }
         // Δ = U·Σ·Vᵀ: n×k · k×k · k×k, GPU-dispatched.
-        Ok(flatten(&crate::linalg::faer_ndarray::fast_abt(
+        Ok(flatten(&gam_linalg::faer_ndarray::fast_abt(
             &fast_ab(&u, &diag),
             &v,
         )))
@@ -244,7 +244,7 @@ impl RiemannianManifold for GrassmannManifold {
         // Coordinates of H in the U-frame: ut_h = Uᵀ H (k×n · n×k). The transport
         // operator's three dense terms all carry the large ambient dimension n;
         // GPU-dispatch via fast_ab/fast_atb.
-        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+        use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
         let ut_h = fast_atb(&u, &h);
         // Geodesic-aligned components: U cos(Σ) Uᵀ H − Y V sin(Σ) Uᵀ H.
         let aligned = &fast_ab(&fast_ab(&u, &cos_d), &ut_h)
@@ -307,7 +307,7 @@ impl RiemannianManifold for GrassmannManifold {
         )?;
         // Tangent Gram matrices (each k×n · n×k, carrying the large ambient
         // dimension n), GPU-dispatched via fast_atb.
-        use crate::linalg::faer_ndarray::fast_atb;
+        use gam_linalg::faer_ndarray::fast_atb;
         let gxx = fast_atb(&x, &x);
         let gyy = fast_atb(&y, &y);
         let gxy = fast_atb(&x, &y);
@@ -355,7 +355,7 @@ impl RiemannianManifold for GrassmannManifold {
         point: ArrayView1<'_, f64>,
         vec: ArrayView1<'_, f64>,
     ) -> GeometryResult<Array1<f64>> {
-        use crate::linalg::faer_ndarray::{fast_ab, fast_atb};
+        use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
         let y = from_flat(point, self.n, self.k)?;
         let z = from_flat(vec, self.n, self.k)?;
         // Z − Y(YᵀZ): YᵀZ (k×n · n×k) and Y·(YᵀZ) (n×k · k×k) both carry n,

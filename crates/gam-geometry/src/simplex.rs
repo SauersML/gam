@@ -1,6 +1,6 @@
 use ndarray::{Array2, ArrayView1, ArrayView2};
 
-use crate::geometry::normalize_weights;
+use crate::normalize_weights;
 
 pub fn validate_simplex_array(points: ArrayView2<'_, f64>) -> Result<(), String> {
     let (n, d) = points.dim();

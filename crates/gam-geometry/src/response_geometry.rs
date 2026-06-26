@@ -13,7 +13,7 @@
 //!
 //! Every primitive here delegates to the canonical landed math
 //! ([`RiemannianManifold::exp_map`]/[`log_map`](RiemannianManifold::log_map) and
-//! the Poincaré [`exp_map`](crate::geometry::poincare::exp_map)/[`log_map`](crate::geometry::poincare::log_map));
+//! the Poincaré [`exp_map`](crate::poincare::exp_map)/[`log_map`](crate::poincare::log_map));
 //! the only new code is the batched row loop, the base-point dimension wiring,
 //! and a generic Riemannian Karcher (Fréchet) mean shared by all four. There is
 //! no separate per-manifold mean: the SPD safeguarded Karcher iteration is
@@ -23,12 +23,12 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::geometry::constant_curvature::ConstantCurvature;
-use crate::geometry::manifold::{
+use crate::constant_curvature::ConstantCurvature;
+use crate::manifold::{
     GEOMETRY_EPS, RiemannianManifold, flatten, from_flat, jacobi_symmetric, spectral_map_symmetric,
     sym,
 };
-use crate::geometry::{
+use crate::{
     GeometryError, GeometryResult, GrassmannManifold, SpdManifold, StiefelManifold,
 };
 
@@ -315,7 +315,7 @@ impl ResponseManifold {
     ) -> GeometryResult<Array1<f64>> {
         match self {
             Self::Poincare { curvature, .. } => {
-                crate::geometry::poincare::log_map(base, value, *curvature)
+                crate::poincare::log_map(base, value, *curvature)
             }
             // ConstantCurvature implements RiemannianManifold::log_map directly.
             Self::ConstantCurvature { .. }
@@ -336,7 +336,7 @@ impl ResponseManifold {
     ) -> GeometryResult<Array1<f64>> {
         match self {
             Self::Poincare { curvature, .. } => {
-                crate::geometry::poincare::exp_map(base, tangent, *curvature)
+                crate::poincare::exp_map(base, tangent, *curvature)
             }
             Self::ConstantCurvature { .. }
             | Self::Spd { .. }
@@ -395,7 +395,7 @@ impl ResponseManifold {
                 Ok(frobenius_distance(value, flatten(&psd).view()))
             }
             Self::Grassmann { k, n } | Self::Stiefel { k, n } => {
-                use crate::linalg::faer_ndarray::fast_atb;
+                use gam_linalg::faer_ndarray::fast_atb;
                 let frame = from_flat(value, *n, *k)?;
                 let gram = fast_atb(&frame, &frame);
                 let (evals, _) = jacobi_symmetric(&gram)?;
@@ -421,7 +421,7 @@ impl ResponseManifold {
     ) -> GeometryResult<f64> {
         match self {
             Self::Poincare { curvature, .. } => {
-                let lam = crate::geometry::poincare::conformal_factor(base, *curvature)?;
+                let lam = crate::poincare::conformal_factor(base, *curvature)?;
                 Ok(lam * lam * v.iter().map(|x| x * x).sum::<f64>())
             }
             Self::ConstantCurvature { .. }
@@ -675,7 +675,7 @@ pub fn dispatch_exp_map(
 /// `ξ = Σ_i w_i log_P(X_i)` (`= −½ grad V`), a unit Karcher step `exp_P(t·ξ)`
 /// with Armijo backtracking plus a round-off cushion, a best-iterate stall
 /// guard, and the metric-norm stationarity test `‖ξ‖_P ≤ tol`. The SPD-specific
-/// version in [`crate::geometry::spd::spd_frechet_mean`] remains for the affine
+/// version in [`crate::spd::spd_frechet_mean`] remains for the affine
 /// inverse it caches per step; this generic form pays a metric-tensor solve but
 /// covers all four geometries uniformly.
 pub fn response_frechet_mean(
@@ -695,7 +695,7 @@ pub fn response_frechet_mean(
     if !(tol.is_finite() && tol > 0.0) {
         return Err("response geometry Fréchet mean tolerance must be finite and positive".into());
     }
-    let w = crate::geometry::normalize_weights(m, weights)
+    let w = crate::normalize_weights(m, weights)
         .map_err(|_| "response geometry Fréchet mean: invalid weights".to_string())?;
     let samples: Vec<Array1<f64>> = (0..m).map(|i| values.row(i).to_owned()).collect();
 
@@ -981,9 +981,9 @@ pub struct ResponseCurvatureFit {
     /// `κ·r²` band where κ̂ is a genuine interior point estimate.
     pub sign_resolved: bool,
     /// Profile-likelihood CI for κ and the geometry verdict from its sign.
-    pub profile_ci: crate::geometry::curvature_estimand::KappaProfileCi,
+    pub profile_ci: crate::curvature_estimand::KappaProfileCi,
     /// Interior-point χ²₁ likelihood-ratio test of flatness (κ = 0).
-    pub flatness: crate::geometry::curvature_estimand::FlatnessTest,
+    pub flatness: crate::curvature_estimand::FlatnessTest,
 }
 
 /// Chart-validity bounds on κ for a constant-curvature response geometry built
@@ -1160,10 +1160,10 @@ pub fn response_curvature_criterion(
 /// every `V_p` evaluation scores the SAME geometry without re-entangling κ with the
 /// chart scale (the #1104 fix). The exact outer
 /// curvature `V_p''(κ̂)` is taken by a central second difference of the same
-/// criterion and handed to [`profile_ci_walk`](crate::geometry::profile_ci_walk)
+/// criterion and handed to [`profile_ci_walk`](crate::profile_ci_walk)
 /// to size the initial Wald step; the CI itself is the exact χ²₁ profile crossing.
 /// Flatness is the interior-point χ²₁ LR test
-/// [`flatness_lr_test`](crate::geometry::flatness_lr_test). κ = 0 is an interior
+/// [`flatness_lr_test`](crate::flatness_lr_test). κ = 0 is an interior
 /// point of the analytic `S^d ← ℝ^d → H^d` family, so no boundary correction is
 /// applied. Returns the κ̂, its tangent base point, the profile CI, and the Wilks
 /// flatness test for the fit summary.
@@ -1280,10 +1280,10 @@ pub fn fit_response_curvature(
         f64::NAN
     };
 
-    let profile_ci = crate::geometry::curvature_estimand::profile_ci_walk(
+    let profile_ci = crate::curvature_estimand::profile_ci_walk(
         &mut v_p, kappa_hat, v_pp, kappa_min, kappa_max, level, ktol,
     )?;
-    let flatness = crate::geometry::curvature_estimand::flatness_lr_test(&mut v_p, kappa_hat)?;
+    let flatness = crate::curvature_estimand::flatness_lr_test(&mut v_p, kappa_hat)?;
 
     // The sign of κ̂ is statistically resolved iff the profile CI excludes 0 — the
     // CI is the honest sign-bearing summary (it reports Flat under-resolution rather
@@ -1292,7 +1292,7 @@ pub fn fit_response_curvature(
     // flip sign on Monte-Carlo noise, so `false` here means "do not quote κ̂'s sign".
     let sign_resolved = !matches!(
         profile_ci.verdict,
-        crate::geometry::curvature_estimand::CurvatureVerdict::Flat
+        crate::curvature_estimand::CurvatureVerdict::Flat
     );
 
     Ok(ResponseCurvatureFit {

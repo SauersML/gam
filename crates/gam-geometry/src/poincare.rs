@@ -54,7 +54,7 @@
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::geometry::manifold::{GeometryError, GeometryResult};
+use crate::manifold::{GeometryError, GeometryResult};
 
 /// Numerical floor for denominators that vanish only when a point sits on
 /// the ball boundary. Anything inside the ball satisfies
@@ -536,7 +536,7 @@ pub fn tangent_decode_forward(
     // whole observation batch. Row-tile gates across ALL GPUs (each device runs
     // one cuBLAS call over its batch-row tile with tangents broadcast); single
     // device / small batch falls back to the auto-dispatch shim.
-    let v = crate::geometry::manifold::fast_ab_rows_multi_gpu(gates, tangents.view());
+    let v = crate::manifold::fast_ab_rows_multi_gpu(gates, tangents.view());
     let (batch, d) = v.dim();
     let mut x_hat = Array2::<f64>::zeros((batch, d));
     for b in 0..batch {
@@ -656,7 +656,7 @@ pub fn tangent_decode_backward(
     // Step 2: grad_gates = grad_v @ tangentsᵀ (batch×d · d×F); grad_tangents =
     // gatesᵀ @ grad_v (F×batch · batch×d). Both are full-batch GEMMs,
     // GPU-dispatched via fast_abt / fast_atb.
-    use crate::linalg::faer_ndarray::{fast_abt, fast_atb};
+    use gam_linalg::faer_ndarray::{fast_abt, fast_atb};
     let grad_gates = fast_abt(&grad_v, &cache.tangents);
     let grad_tangents = fast_atb(&cache.gates, &grad_v);
 
@@ -907,7 +907,7 @@ pub fn lorentz_decode_forward(
 
     // Aggregate in tangent space (batch×F · F×d GEMM over the whole batch,
     // row-tiled across ALL GPUs), exp back, then project hyperboloid -> ball.
-    let v = crate::geometry::manifold::fast_ab_rows_multi_gpu(gates, tangents.view());
+    let v = crate::manifold::fast_ab_rows_multi_gpu(gates, tangents.view());
     let mut out = Array2::<f64>::zeros((batch, d));
     for b in 0..batch {
         let v_row: Array1<f64> = v.row(b).to_owned();

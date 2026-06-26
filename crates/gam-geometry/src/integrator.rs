@@ -1,6 +1,6 @@
 use ndarray::{Array1, Array2, ArrayView1};
 
-use crate::geometry::manifold::{GeometryResult, RiemannianManifold, check_len};
+use crate::manifold::{GeometryResult, RiemannianManifold, check_len};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GeodesicIntegrator {

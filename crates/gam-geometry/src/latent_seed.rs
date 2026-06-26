@@ -14,7 +14,7 @@
 //! Riemannian outer optimizer then converges to the global configuration instead
 //! of a random local one.
 
-use crate::linalg::faer_ndarray::FaerEigh;
+use gam_linalg::faer_ndarray::FaerEigh;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView2};
 

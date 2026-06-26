@@ -1,9 +1,9 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::geometry::manifold::{
+use crate::manifold::{
     GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity, norm,
 };
-use crate::geometry::normalize_weights;
+use crate::normalize_weights;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SphereManifold {
@@ -424,7 +424,7 @@ pub fn response_sphere_log_map(
     // (atan2 angle, tangent scaling) is identical to the elementwise form.
     // f64 throughout.
     let base_col = b_mat.slice(ndarray::s![0..1, ..]).t().to_owned();
-    let dots_mat = crate::geometry::manifold::fast_ab_rows_multi_gpu(y.view(), base_col.view());
+    let dots_mat = crate::manifold::fast_ab_rows_multi_gpu(y.view(), base_col.view());
     let dots = dots_mat.column(0).to_owned();
     let mut out = Array2::<f64>::zeros((n, d));
     for row in 0..n {
@@ -482,7 +482,7 @@ pub fn response_sphere_exp_map(
     // fallback. The per-row geodesic step that follows is identical scalar math.
     // f64 throughout.
     let base_col = b_mat.slice(ndarray::s![0..1, ..]).t().to_owned();
-    let radials_mat = crate::geometry::manifold::fast_ab_rows_multi_gpu(tangent, base_col.view());
+    let radials_mat = crate::manifold::fast_ab_rows_multi_gpu(tangent, base_col.view());
     let radials = radials_mat.column(0).to_owned();
     let mut out = Array2::<f64>::zeros((n, d));
     for row in 0..n {
@@ -565,7 +565,7 @@ fn sphere_mean_candidates(
     let mut candidates: Vec<Array1<f64>> = Vec::new();
     // Weighted extrinsic mean `Σ wᵢ pᵢ = Pᵀ w`: a single matrix–vector product
     // over all points, dispatched to GPU by `fast_atv` for large batches.
-    let extrinsic = crate::linalg::faer_ndarray::fast_atv(&values, &weights);
+    let extrinsic = gam_linalg::faer_ndarray::fast_atv(&values, &weights);
     let ex_norm = norm(extrinsic.view());
     if ex_norm > 0.0 {
         candidates.push(extrinsic.mapv(|v| v / ex_norm));
@@ -684,12 +684,12 @@ fn sphere_eigenbasis(moment: ArrayView2<'_, f64>) -> Vec<Array1<f64>> {
 /// Build the weighted second-moment matrix `M = Σ wᵢ pᵢ pᵢᵀ = Pᵀ diag(w) P`.
 ///
 /// This is a single weighted cross-product over ALL `n` points, so it routes
-/// through [`crate::linalg::faer_ndarray::fast_xt_diag_x`], whose auto-dispatch
+/// through [`gam_linalg::faer_ndarray::fast_xt_diag_x`], whose auto-dispatch
 /// shim runs the `Pᵀ diag(w) P` Gram on the GPU (`crate::gpu::try_fast_xt_diag_x`)
 /// when the batch is large enough and otherwise on faer. The result is bit-for-bit
 /// the same `d×d` symmetric Gram as the explicit triple loop (f64 throughout).
 fn sphere_second_moment(values: ArrayView2<'_, f64>, weights: ArrayView1<'_, f64>) -> Array2<f64> {
-    crate::linalg::faer_ndarray::fast_xt_diag_x(&values, &weights)
+    gam_linalg::faer_ndarray::fast_xt_diag_x(&values, &weights)
 }
 
 /// Dominant eigenvector of a symmetric PSD matrix via power iteration.

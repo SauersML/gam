@@ -1168,7 +1168,9 @@ pub fn canonicalize_penalty_spec(
     };
 
     let block_dim = col_range.len();
-    let prior_mean = prior_mean_spec.evaluate(block_dim, &format!("{context}: penalty {idx}"))?;
+    let prior_mean = prior_mean_spec
+        .evaluate(block_dim, &format!("{context}: penalty {idx}"))
+        .map_err(|e| EstimationError::InvalidInput(e.0))?;
 
     // ── Ridge fast path: closed-form, no eigendecomposition ──
     if let Some(PenaltyStructureHint::Ridge(scale)) = hint {

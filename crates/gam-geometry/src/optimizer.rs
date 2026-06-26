@@ -1,6 +1,6 @@
 use ndarray::{Array1, ArrayView1};
 
-use crate::geometry::manifold::{GeometryResult, RiemannianManifold, check_len, quad_form};
+use crate::manifold::{GeometryResult, RiemannianManifold, check_len, quad_form};
 
 /// Linear factor of the Steihaug truncated-CG forcing sequence: the inner CG
 /// solve is terminated once the residual drops to `min(η·‖r₀‖, ‖r₀‖²)`. The
@@ -312,7 +312,7 @@ impl RiemannianTrustRegion {
         let max_cg = 2 * n + 1;
         for _ in 0..max_cg {
             let hp = objective.hessian_vector_product(x, p.view())?.ok_or(
-                crate::geometry::manifold::GeometryError::Unsupported(
+                crate::manifold::GeometryError::Unsupported(
                     "Hessian–vector product became unavailable mid-subproblem",
                 ),
             )?;
@@ -408,7 +408,7 @@ fn model_reduction(
 ) -> GeometryResult<f64> {
     let lin = g_inner(manifold, x, grad, eta)?;
     let heta = objective.hessian_vector_product(x, eta)?.ok_or(
-        crate::geometry::manifold::GeometryError::Unsupported(
+        crate::manifold::GeometryError::Unsupported(
             "Hessian–vector product unavailable while scoring the model",
         ),
     )?;
@@ -666,7 +666,7 @@ fn two_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::EuclideanManifold;
+    use crate::EuclideanManifold;
     use ndarray::{Array1, ArrayView1};
 
     /// Scalar objective `f(x) = x²` on the 1-D Euclidean line. Gradient `2x`,
@@ -815,7 +815,7 @@ mod tests {
         let a = ndarray::array![[4.0, 1.0, 0.0], [1.0, 3.0, 1.0], [0.0, 1.0, 2.0],];
         let b = Array1::from_vec(vec![1.0, 2.0, -1.0]);
         // Reference solution A x = b.
-        let x_ref = crate::geometry::manifold::inverse(&a).unwrap().dot(&b);
+        let x_ref = crate::manifold::inverse(&a).unwrap().dot(&b);
         let mut obj = Quadratic { a, b };
         let tr = RiemannianTrustRegion {
             radius: 1.0,
@@ -844,7 +844,7 @@ mod tests {
         let manifold = EuclideanManifold::new(3);
         let a = ndarray::array![[5.0, 1.0, 0.5], [1.0, 4.0, 1.0], [0.5, 1.0, 3.0],];
         let b = Array1::from_vec(vec![2.0, -1.0, 0.5]);
-        let x_ref = crate::geometry::manifold::inverse(&a).unwrap().dot(&b);
+        let x_ref = crate::manifold::inverse(&a).unwrap().dot(&b);
         let mut obj = Quadratic { a, b };
         let lbfgs = RiemannianLBFGS {
             history: 10,

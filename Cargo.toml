@@ -39,6 +39,7 @@ members = [
     "crates/gam-spec",
     "crates/gam-inference",
     "crates/gam-linalg",
+    "crates/gam-geometry",
     "crates/gam-cli",
     "crates/gam-math",
     "crates/gam-predict",
@@ -88,6 +89,7 @@ gam-problem = { path = "crates/gam-problem", version = "=0.3.124" }
 gam-spec = { path = "crates/gam-spec", version = "=0.3.124" }
 gam-runtime = { path = "crates/gam-runtime", version = "=0.3.124" }
 gam-linalg = { path = "crates/gam-linalg", version = "=0.3.124" }
+gam-geometry = { path = "crates/gam-geometry", version = "=0.3.124" }
 pest = "2.8.6"
 pest_derive = "2.8.6"
 arrow = { version = "54", default-features = false, features = ["ffi"] }

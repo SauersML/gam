@@ -1,6 +1,6 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-use crate::geometry::manifold::{
+use crate::manifold::{
     GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold, check_len, dot, identity,
     zero_christoffel,
 };
@@ -122,7 +122,7 @@ impl RiemannianManifold for EuclideanManifold {
 #[cfg(test)]
 mod tests {
     use super::EuclideanManifold;
-    use crate::geometry::manifold::{GeometryError, RiemannianManifold};
+    use crate::manifold::{GeometryError, RiemannianManifold};
     use ndarray::array;
 
     #[test]

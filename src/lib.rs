@@ -119,7 +119,7 @@ mod gpu_dispatch_registration_tests {
 
 pub mod config_resolve;
 pub mod families;
-pub mod geometry;
+pub use gam_geometry as geometry;
 pub mod gpu;
 pub mod identifiability;
 pub mod inference;

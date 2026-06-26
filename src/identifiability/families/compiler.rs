@@ -1183,6 +1183,23 @@ pub struct CompiledMap {
     pub raw_block_ranges: Vec<std::ops::Range<usize>>,
 }
 
+/// Neutral view of this compiled reparametrisation for the gauge layer
+/// (#1521): `Gauge::from_compiled_map` lives DOWN in `gam-problem` and
+/// names only the `CompiledBlockMap` trait, never the concrete
+/// `CompiledMap` (which lives ABOVE `gam-problem`). This `impl` supplies
+/// the inverted dependency edge.
+impl gam_problem::gauge::CompiledBlockMap for CompiledMap {
+    fn raw_from_compiled(&self) -> &Array2<f64> {
+        &self.raw_from_compiled
+    }
+    fn raw_block_ranges(&self) -> &[std::ops::Range<usize>] {
+        &self.raw_block_ranges
+    }
+    fn compiled_block_ranges(&self) -> &[std::ops::Range<usize>] {
+        &self.compiled_block_ranges
+    }
+}
+
 /// Closed-form Gram-based identifiability compile.
 ///
 /// Sequential algorithm operating purely on the raw-width Grams

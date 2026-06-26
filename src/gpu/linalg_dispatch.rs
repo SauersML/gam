@@ -69,6 +69,18 @@ impl gam_linalg::gpu_hook::GpuGemmDispatch for CudaGemmDispatch {
     ) -> Option<Array2<f64>> {
         try_fast_joint_hessian_2x2(x_a, x_b, w_aa, w_ab, w_bb)
     }
+
+    fn device_count(&self) -> usize {
+        GpuRuntime::global().map_or(0, |rt| rt.device_count())
+    }
+
+    fn try_fast_ab_broadcast_b_batched(
+        &self,
+        a3: ArrayView3<'_, f64>,
+        b: ArrayView2<'_, f64>,
+    ) -> Option<Array3<f64>> {
+        try_fast_ab_broadcast_b_batched(a3, b)
+    }
 }
 
 /// Discriminator used by [`route_through_gpu`] to apply the right
