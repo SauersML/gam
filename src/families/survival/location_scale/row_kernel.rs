@@ -1358,6 +1358,62 @@ impl SurvivalLocationScaleFamily {
         }
     }
 
+    /// Scale-aware joint-step damping for the log-σ block (#1569).
+    ///
+    /// Returns the largest fraction `α ∈ (0, 1]` of the proposed log-σ
+    /// coefficient step `delta` that keeps the per-row change in the log-σ
+    /// linear predictor `η_σ = X_lsβ_ls` bounded by
+    /// [`MAX_LOG_SIGMA_PREDICTOR_STEP`]. Because `η_σ` enters the survival index
+    /// only through `inv_sigma = exp(−η_σ)`, an unbounded `Δη_σ` would change
+    /// `inv_sigma` — and hence the time/threshold residual and gradient — by an
+    /// exponential factor, breaking the local quadratic model the joint
+    /// trust-region globalization relies on (see the constant's note). Capping
+    /// `‖Δη_σ‖_∞` keeps every accepted step inside that model-trust region.
+    ///
+    /// This is the log-σ analogue of [`Self::max_feasible_time_step`]'s monotone
+    /// barrier: `max_feasible_step_size` applies the MIN block-α to the whole
+    /// joint step, so the Newton direction is preserved and the cap only ever
+    /// shortens the step. At a stationary point `Δη_σ → 0 < CAP`, so `α → 1` and
+    /// the converged fit is unchanged.
+    pub(crate) fn max_feasible_log_sigma_step(
+        &self,
+        delta: &Array1<f64>,
+    ) -> Result<Option<f64>, String> {
+        if delta.len() != self.x_log_sigma.ncols() {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "survival location-scale log-sigma step dimension mismatch: delta={}, design cols={}",
+                    delta.len(),
+                    self.x_log_sigma.ncols()
+                ),
+            }
+            .into());
+        }
+        // Largest |Δη_σ| over all observed rows under a full (α = 1) step,
+        // across the exit design and (for time-varying σ) the entry design.
+        let mut max_abs = 0.0_f64;
+        for design in
+            std::iter::once(&self.x_log_sigma).chain(self.x_log_sigma_entry.as_ref())
+        {
+            let d_eta = design.matrixvectormultiply(delta);
+            for &v in d_eta.iter() {
+                if !v.is_finite() {
+                    // A non-finite predictor change is a catastrophic proposal;
+                    // report a zero feasible step so the joint globalization
+                    // shrinks the radius and re-solves rather than evaluating the
+                    // likelihood at it.
+                    return Ok(Some(0.0));
+                }
+                max_abs = max_abs.max(v.abs());
+            }
+        }
+        if max_abs <= MAX_LOG_SIGMA_PREDICTOR_STEP {
+            Ok(Some(1.0))
+        } else {
+            Ok(Some((MAX_LOG_SIGMA_PREDICTOR_STEP / max_abs).clamp(0.0, 1.0)))
+        }
+    }
+
     #[inline]
     pub(crate) fn expected_blocks(&self) -> usize {
         if self.x_link_wiggle.is_some() { 4 } else { 3 }

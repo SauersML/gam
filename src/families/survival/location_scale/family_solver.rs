@@ -2186,6 +2186,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if block_idx == Self::BLOCK_TIME {
             return self.max_feasible_time_step(&block_states[Self::BLOCK_TIME].beta, delta);
         }
+        if block_idx == Self::BLOCK_LOG_SIGMA {
+            // Scale-aware joint-step damping (#1569): bound the per-row change in
+            // η_σ so exp(−η_σ) cannot move by more than a factor e^CAP in one
+            // accepted step, keeping the coupled smooth-scale joint-Newton inside
+            // the trust region of the scale nonlinearity.
+            return self.max_feasible_log_sigma_step(delta);
+        }
         if block_idx == Self::BLOCK_LINK_WIGGLE {
             return self
                 .max_feasible_link_wiggle_step(&block_states[Self::BLOCK_LINK_WIGGLE].beta, delta);

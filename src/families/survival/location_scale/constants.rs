@@ -45,6 +45,37 @@ pub(crate) const LEVENBERG_DAMPING_GROWTH: f64 = 10.0;
 
 pub(crate) const LEVENBERG_MAX_DAMPING_REL: f64 = 1e8;
 
+/// Per-step cap on the absolute change in the log-σ linear predictor `η_σ`
+/// during the coupled smooth-scale joint Newton (#1569).
+///
+/// The standardized survival index is `u = h(t) − η_t · exp(−η_σ)`: the scale
+/// predictor enters the likelihood ONLY through `inv_sigma = exp(−η_σ)` (see
+/// `row_kernel::row_primary_values`). The map is exponential, so a single joint
+/// Newton step that drives `η_σ` sharply negative multiplies `inv_sigma` — and
+/// with it the time/threshold-channel standardized residual `u`, its Gaussian
+/// score `−u`, and the whole time-block gradient — by an *exponential* factor,
+/// far outside the region where the local quadratic model that the trust-region
+/// globalization trusts is valid. The trust region then rejects the catapulted
+/// step, collapses its radius, and the inner joint-Newton grinds its full cycle
+/// budget on every outer ρ-eval without certifying stationarity (the aggressive
+/// heteroscedastic stall that e3da155e4 / #1564 called out as remaining work and
+/// that #1569 makes good on).
+///
+/// Capping the per-step change in `η_σ` so `inv_sigma` moves by at most a factor
+/// `e^CAP` per accepted step keeps every step inside the model-trust region of
+/// the scale nonlinearity — the natural trust region for a parameter that enters
+/// through `exp`. It is wired through the family's `max_feasible_step_size` hook,
+/// so the existing joint feasibility-α machinery scales the WHOLE joint step by
+/// the min block-α and the Newton DIRECTION is preserved (only the length is
+/// damped). This is a step-LENGTH limit, not a reparameterization: at a
+/// stationary point the Newton step in `η_σ` → 0 < CAP, so α → 1 and the
+/// converged β is unchanged — the cap is fixed-point preserving and byte-
+/// identical on any fit whose scale steps already stay within `e^CAP` (e.g. the
+/// mild gamlss-oracle gate). `2.0` lets σ change by up to `e^2 ≈ 7.4×` in one
+/// step — loose enough never to bind on a well-behaved fit, tight enough that a
+/// single step can never catapult `η_σ` across the exponential cliff.
+pub(crate) const MAX_LOG_SIGMA_PREDICTOR_STEP: f64 = 2.0;
+
 /// Outer (smoothing-parameter) loop budget for the blockwise location-scale
 /// fit: at most this many outer iterations, stopping once the outer relative
 /// change falls below the tolerance. The dead-flat time-smoothing ridge of the
