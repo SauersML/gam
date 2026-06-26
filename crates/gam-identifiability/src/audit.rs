@@ -3035,6 +3035,51 @@ mod tests {
         ndarray::Array1::linspace(-1.0, 1.0, n)
     }
 
+    /// A dense block whose columns are the Legendre polynomials `P_d(x)` for the
+    /// requested `degrees`, sampled on `x ∈ [-1, 1]`.
+    ///
+    /// Legendre polynomials are mutually orthogonal under the continuous
+    /// `[-1, 1]` inner product, so on a dense uniform grid their sampled columns
+    /// are *genuinely* linearly independent with a healthy singular spectrum
+    /// (the discrete Gram is diagonally dominant for moderate degree). This is
+    /// what lets a fixture seed exactly one rank deficiency — an exact duplicated
+    /// column — and assert "exactly one drop" *robustly*: every other direction
+    /// sits orders of magnitude above the joint RRQR's resolution floor, so no
+    /// BLAS-dependent round-off near the tolerance can demote a second column.
+    ///
+    /// Contrast a basis of Gaussian RBFs + high-frequency `sin`/`cos`: those are
+    /// smooth and heavily overlap each other and the low-order polynomials, so
+    /// the joint design carries near-degenerate directions at `σ ≈ 1e-7…1e-8`.
+    /// The audit ranks the penalty-augmented *Gram* `JᵀJ (+ SᵀS)` (a deliberate
+    /// perf choice — it avoids re-streaming the n×p design at biobank scale), and
+    /// forming the Gram squares the condition number, so its effective rank
+    /// resolution is `√ε · σ_max ≈ 1e-8 · σ_max`, not the nominal column-scaled
+    /// tolerance `≈ 7e-10`. Any genuine singular value below that floor collapses
+    /// into round-off and is demoted as if it were an exact alias — which is why
+    /// the earlier RBF/trig fixture spuriously dropped 3 columns instead of 1 on
+    /// this runner's BLAS. Orthogonal polynomials keep every kept direction far
+    /// above the floor, so the rank verdict is backend-independent.
+    fn legendre_columns(x: &ndarray::Array1<f64>, degrees: &[usize]) -> Array2<f64> {
+        let n = x.len();
+        let max_deg = degrees.iter().copied().max().unwrap_or(0);
+        // p[d] holds the column vector P_d(x) via the standard three-term
+        // recurrence (d+1) P_{d+1} = (2d+1) x P_d − d P_{d-1}.
+        let mut p: Vec<ndarray::Array1<f64>> = Vec::with_capacity(max_deg + 1);
+        p.push(ndarray::Array1::<f64>::ones(n));
+        if max_deg >= 1 {
+            p.push(x.clone());
+        }
+        for d in 1..max_deg {
+            let next = (((2 * d + 1) as f64) * x * &p[d] - (d as f64) * &p[d - 1]) / ((d + 1) as f64);
+            p.push(next);
+        }
+        let mut out = Array2::<f64>::zeros((n, degrees.len()));
+        for (c, &deg) in degrees.iter().enumerate() {
+            out.column_mut(c).assign(&p[deg]);
+        }
+        out
+    }
+
     /// Test 1: a model with no aliasing → audit returns clean, no
     /// drops, fatal=false.
     #[test]
@@ -3246,86 +3291,54 @@ mod tests {
     }
 
     /// Test 5: end-to-end shape on a large-scale-like configuration —
-    /// 4 blocks, ~50 total columns, with one intentional cross-block
-    /// linear alias seeded in. The audit must complete in well under
-    /// a second and produce a single attributed drop with the
-    /// expected joint rank.
+    /// 4 blocks, 20 total columns, with one intentional cross-block linear
+    /// alias seeded in. The audit must complete in well under a second and
+    /// produce a *single* attributed drop with the expected joint rank.
+    ///
+    /// The blocks are built from orthogonal Legendre polynomials so the only
+    /// rank deficiency in the joint design is the one we seed (`alias_block`'s
+    /// first column is exactly `x`, duplicating `parametric`'s `x` column).
+    /// Every other direction is genuinely independent with a singular value far
+    /// above the joint RRQR's resolution floor — see [`legendre_columns`] for
+    /// why that matters (the earlier RBF + `sin`/`cos` fixture carried real
+    /// near-degeneracies at `σ ≈ 1e-7…1e-8` that the Gram-based rank verdict
+    /// could not resolve, so it spuriously demoted 3 columns instead of 1).
     #[test]
     fn audit_large_scale_shape_end_to_end() {
         let n = 1024;
         let x = linspace_minus_one_to_one(n);
-        // Block 0: parametric intercept + age-linear.
-        let mut parametric = Array2::<f64>::zeros((n, 2));
-        for i in 0..n {
-            parametric[[i, 0]] = 1.0;
-            parametric[[i, 1]] = x[i];
-        }
-        // Block 1: smooth in x — 8 genuinely independent radial basis
-        // columns (Gaussian bumps at 8 distinct, well-separated knots). The
-        // earlier `(x − (k−4)·0.2)²` construction was rank-3 (every column
-        // expands to `x² − 2(k−4)(0.2)x + const` ∈ span{1, x, x²}), so 5 of
-        // the 8 columns were genuinely redundant and RRQR correctly demoted
-        // them — contradicting the fixture's "8 independent columns, one
-        // seeded drop" premise. Gaussian RBFs at distinct centres are
-        // linearly independent and do not lie in span{1, x}, so the block
-        // contributes its full rank-8 and the ONLY drop is the seeded x~x
-        // alias in block 3.
-        let mut s_x = Array2::<f64>::zeros((n, 8));
-        let rbf_width = 0.30_f64;
-        for i in 0..n {
-            for k in 0..8 {
-                let center = (k as f64 - 3.5) * 0.25;
-                let d = (x[i] - center) / rbf_width;
-                s_x[[i, k]] = (-0.5 * d * d).exp();
-            }
-        }
-        // Block 2: smooth in sin(x) — 6 columns. No alias with block 1.
-        // Start at frequency 4 (k+4), NOT 1: sin(x) and sin(2x) share their
-        // leading Taylor term with `x` (sin(x) = x − x³/6 + …), and the joint
-        // design [1, x, RBFs, sin(x), sin(2x), …, x_alias, cos(kx)] inherits
-        // a numerical near-degeneracy at σ ≈ 1.8e-10 — the right singular
-        // vector is dominated by ≈ +0.88·sin(x) − 0.31·sin(2x) − 0.24·x − …,
-        // i.e. a `sin(x) ≈ x + …` Taylor identity. That σ lands BELOW the
-        // joint RRQR rank tolerance (≈ 7.3e-10) and so RRQR demotes a SECOND
-        // column on top of the seeded x~x alias, producing `dropped.len() == 2`
-        // and failing the "exactly the seeded alias" assertion. Frequencies
-        // ≥ 4 keep the next-smallest σ at ≈ 6e-8, comfortably above tol, so
-        // only the genuine x~x seeded alias is demoted.
-        let mut s_sin = Array2::<f64>::zeros((n, 6));
-        for i in 0..n {
-            for k in 0..6 {
-                s_sin[[i, k]] = ((k as f64 + 4.0) * x[i]).sin();
-            }
-        }
-        // Block 3: deliberately seeded alias — first column is exactly
-        // `x` (duplicates parametric block's column 1).
-        let mut alias_block = Array2::<f64>::zeros((n, 4));
-        for i in 0..n {
-            alias_block[[i, 0]] = x[i];
-            alias_block[[i, 1]] = x[i].cos();
-            alias_block[[i, 2]] = (2.0 * x[i]).cos();
-            alias_block[[i, 3]] = (3.0 * x[i]).cos();
-        }
+        // Block 0: parametric intercept + age-linear == Legendre P0, P1 = [1, x].
+        let parametric = legendre_columns(&x, &[0, 1]);
+        // Block 1: an 8-column smooth, Legendre P2..P9 — orthogonal to each
+        // other and to the parametric block, every column genuinely full-rank.
+        let s_x = legendre_columns(&x, &[2, 3, 4, 5, 6, 7, 8, 9]);
+        // Block 2: a second 6-column smooth, Legendre P10..P15 — likewise
+        // mutually independent and independent of blocks 0/1.
+        let s_smooth = legendre_columns(&x, &[10, 11, 12, 13, 14, 15]);
+        // Block 3: the deliberately seeded alias. Its first column is *exactly*
+        // `x` (== parametric column 1, i.e. Legendre P1), so it duplicates a
+        // direction another block already owns; the remaining columns are the
+        // independent Legendre P16..P18.
+        let mut alias_block = legendre_columns(&x, &[1, 16, 17, 18]);
+        alias_block.column_mut(0).assign(&x); // P1 ≡ x, made explicit/exact.
         let specs = [
             spec_from_dense("parametric", parametric),
             spec_from_dense("s_x", s_x),
-            spec_from_dense("s_sin", s_sin),
+            spec_from_dense("s_smooth", s_smooth),
             spec_from_dense("alias_block", alias_block),
         ];
         let audit = audit_identifiability(&specs).expect("large-scale audit must succeed");
         // The seeded x~x alias is exactly the large-scale failure shape the
-        // task #5 halt gate exists to refuse: two distinct blocks
-        // contributing the same direction at overlap 1.0. Must be fatal.
+        // halt gate exists to refuse: two distinct blocks contributing the same
+        // direction at overlap 1.0. Must be fatal.
         assert!(
             audit.fatal,
             "seeded large-scale exact x~x alias must be fatal under the halt gate: {}",
             audit.summary,
         );
-        assert!(
-            !audit.dropped_columns.is_empty(),
-            "seeded x~x alias must produce at least one dropped column",
-        );
-        // The alias is exactly one direction; expect exactly one drop.
+        // The alias is exactly one direction in a design that is otherwise full
+        // rank, so the audit must demote exactly one column — no more (which
+        // would mean a spurious drop) and no fewer.
         assert_eq!(
             audit.dropped_columns.len(),
             1,
@@ -3333,11 +3346,67 @@ mod tests {
              got {:?}",
             audit.dropped_columns,
         );
+        // …and it must be the lower-priority duplicate (alias_block col 0), not
+        // the `parametric` column that legitimately owns the `x` direction.
+        let dropped = &audit.dropped_columns[0];
+        assert_eq!(
+            (dropped.block.as_str(), dropped.column),
+            ("alias_block", 0),
+            "the seeded duplicate (alias_block col 0) must be the demoted column, \
+             not the original; got {dropped:?}",
+        );
         // Total effective dim = 2 + 8 + 6 + 4 − 1 = 19.
         let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
         assert_eq!(
             total_kept, 19,
             "large-scale: expected 19 kept directions; got {total_kept} ({})",
+            audit.summary,
+        );
+    }
+
+    /// Regression guard for the *spurious-demotion* failure mode (the root cause
+    /// behind the earlier flaky `audit_large_scale_shape_end_to_end`): a joint
+    /// design that is genuinely **full rank** — no exact alias anywhere — must
+    /// produce **zero** drops and a non-fatal verdict, even when its blocks span
+    /// a wide range of column scales.
+    ///
+    /// The earlier fixture failed because the Gram-based rank verdict squares the
+    /// condition number and so cannot resolve singular values below `√ε · σ_max`;
+    /// genuine but small directions collapsed into round-off and were demoted as
+    /// if aliased. Here every Legendre direction sits orders of magnitude above
+    /// that floor, so the correct verdict is "keep everything". If a future
+    /// change tightens the rank logic in a way that over-demotes legitimate
+    /// columns, this test catches it without depending on any seeded alias.
+    #[test]
+    fn audit_well_conditioned_full_rank_no_spurious_drops() {
+        let n = 1024;
+        let x = linspace_minus_one_to_one(n);
+        // Three blocks of orthogonal Legendre polynomials, 20 columns total,
+        // every column genuinely independent — no exact or near alias.
+        let parametric = legendre_columns(&x, &[0, 1]);
+        let s_a = legendre_columns(&x, &[2, 3, 4, 5, 6, 7, 8, 9]);
+        let s_b = legendre_columns(&x, &[10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+        let specs = [
+            spec_from_dense("parametric", parametric),
+            spec_from_dense("s_a", s_a),
+            spec_from_dense("s_b", s_b),
+        ];
+        let audit =
+            audit_identifiability(&specs).expect("full-rank audit must succeed");
+        assert!(
+            !audit.fatal,
+            "a full-rank design must not be fatal: {}",
+            audit.summary,
+        );
+        assert!(
+            audit.dropped_columns.is_empty(),
+            "a full-rank design must drop no columns (spurious demotion); got {:?}",
+            audit.dropped_columns,
+        );
+        let total_kept: usize = audit.blocks.iter().map(|b| b.effective_dim).sum();
+        assert_eq!(
+            total_kept, 20,
+            "full-rank design must keep all 20 directions; got {total_kept} ({})",
             audit.summary,
         );
     }
