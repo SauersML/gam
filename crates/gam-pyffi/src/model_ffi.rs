@@ -6429,3 +6429,72 @@ impl SigmaEffMode {
         }
     }
 }
+
+#[cfg(test)]
+mod survival_payload_nonfinite_tests {
+    use super::{SurvivalPredictionJsonPayload, SurvivalPredictionPayload};
+    use std::collections::BTreeMap;
+
+    /// #1564 (bug 1): the REAL survival prediction payload structs must round-trip
+    /// the non-finite values a saturated Royston-Parmar tail legitimately carries.
+    /// A saturated fit has `Λ(t) = exp(η) = +∞` (with `S(t) = 0`); before the fix
+    /// `serde_json` wrote that `+∞` as a bare `null`, and the typed parse then
+    /// failed with `invalid type: null, expected f64`. This test serializes the
+    /// producer payload and parses it back through the consumer payload — the
+    /// exact engine→Python boundary — asserting the `+∞` (and a defensive `NaN`)
+    /// survive.
+    #[test]
+    fn saturated_survival_payload_round_trips_through_real_structs() {
+        let mut columns = BTreeMap::new();
+        columns.insert("survival_prob".to_string(), vec![0.0, 0.0]);
+        columns.insert("failure_prob".to_string(), vec![1.0, 1.0]);
+
+        let payload = SurvivalPredictionPayload {
+            class: "survival_prediction",
+            model_class: "survival transformation".to_string(),
+            likelihood_mode: "transformation".to_string(),
+            times: vec![1.0, 2.0],
+            // Saturated tail: cumulative hazard overflows to +∞, S(t) = 0.
+            hazard: vec![vec![0.5, f64::INFINITY], vec![0.25, 0.0]],
+            survival: vec![vec![0.6, 0.0], vec![0.7, 0.0]],
+            cumulative_hazard: vec![vec![0.5, f64::INFINITY], vec![0.36, f64::INFINITY]],
+            linear_predictor: vec![1.99, 1000.0],
+            columns,
+            // Defensive: a delta-method SE that blew up to NaN must also survive
+            // rather than crash the parse.
+            survival_se: Some(vec![vec![0.01, f64::NAN], vec![0.02, f64::NAN]]),
+            eta_se: Some(vec![0.1, f64::INFINITY]),
+        };
+
+        let json = serde_json::to_string(&payload).expect("serialize must succeed");
+        // The pre-fix `null` encoding is gone; the boundary now uses explicit
+        // tokens that the consumer can parse.
+        assert!(!json.contains("null"), "no bare nulls in payload: {json}");
+        assert!(json.contains("\"Infinity\""), "json: {json}");
+
+        let parsed: SurvivalPredictionJsonPayload =
+            serde_json::from_str(&json).expect("parse must succeed (was the #1564 failure)");
+
+        assert_eq!(parsed.class, "survival_prediction");
+        let cum = parsed.cumulative_hazard.expect("cumulative_hazard present");
+        assert!(cum[0][1].is_infinite() && cum[0][1] > 0.0);
+        assert!(cum[1][1].is_infinite() && cum[1][1] > 0.0);
+        let haz = parsed.hazard.expect("hazard present");
+        assert!(haz[0][1].is_infinite());
+        assert_eq!(haz[1][1], 0.0);
+        let se = parsed.survival_se.expect("survival_se present");
+        assert!(se[0][1].is_nan());
+        let eta_se = parsed.eta_se.expect("eta_se present");
+        assert!(eta_se[1].is_infinite());
+        // Finite fields are untouched.
+        assert_eq!(parsed.times.expect("times present"), vec![1.0, 2.0]);
+        assert_eq!(
+            parsed
+                .columns
+                .expect("columns present")
+                .get("survival_prob")
+                .unwrap(),
+            &vec![0.0, 0.0]
+        );
+    }
+}
