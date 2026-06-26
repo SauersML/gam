@@ -656,9 +656,9 @@ pub(crate) fn fit_survival_location_scale_terms(
     // pays for a stalled fixed-point attempt before landing on BFGS.
     let outer_policy = {
         let capability = if analytic_joint_hessian_available {
-            crate::families::custom_family::ExactOuterDerivativeOrder::Second
+            crate::custom_family::ExactOuterDerivativeOrder::Second
         } else {
-            crate::families::custom_family::ExactOuterDerivativeOrder::First
+            crate::custom_family::ExactOuterDerivativeOrder::First
         };
         // Honest per-eval work model so the route planner has a real cost
         // signal for the exact gradient / joint-Hessian routes (#721). The
@@ -684,7 +684,7 @@ pub(crate) fn fit_survival_location_scale_terms(
                 .max(1) as u128;
         let predicted_hessian_work = (hess_cost as u128).saturating_mul(outer_coords);
         let predicted_gradient_work = (grad_cost as u128).saturating_mul(outer_coords);
-        crate::families::custom_family::OuterDerivativePolicy {
+        crate::custom_family::OuterDerivativePolicy {
             capability,
             predicted_gradient_work,
             predicted_hessian_work,

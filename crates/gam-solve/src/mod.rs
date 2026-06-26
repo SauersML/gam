@@ -2,6 +2,7 @@ pub(crate) mod active_set;
 pub mod arrow_schur;
 pub mod continuation_path;
 pub mod cross_node;
+pub mod custom_family;
 pub(crate) mod custom_family_persistent_warm_start;
 pub mod estimate;
 pub mod evidence;
@@ -45,14 +46,14 @@ pub mod visualizer;
 pub(crate) mod warm_start_artifact;
 pub(crate) mod warm_start_transfer;
 
-// Re-export the custom-family persistent warm-start entry points at the crate
-// root so the scattered custom-family solver modules (`fit`, `blockwise_solve`,
-// …) resolve them through their `use super::*` prelude exactly as they did when
-// these lived in `custom_family/mod.rs`.
-pub(crate) use custom_family_persistent_warm_start::{
-    capture_fit_artifact, consume_fit_artifact, load_persistent_custom_family_warm_start,
-    store_persistent_custom_family_warm_start, update_custom_outer_inner_cap_from_warm_start,
-};
+// The custom-family blockwise carrier (`fit`, `blockwise_solve`, `joint_newton`,
+// …). Its prelude (`crate::custom_family`) re-exports the persistent
+// warm-start entry points from `custom_family_persistent_warm_start`, the
+// descended block data model + `CustomFamilyError` + `PenaltyMatrix` from
+// `gam-problem`, and the `CustomFamily` trait + fit options + ψ design operators
+// from `gam-model-api`, so each carrier submodule resolves them through its
+// `use super::*` prelude exactly as it did when these lived in
+// `families/custom_family/mod.rs`.
 
 pub use evidence::{
     EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, GaussianMixtureConfig,

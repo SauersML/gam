@@ -1283,7 +1283,7 @@ pub(crate) fn probit_binomial_incompatible_tail_keeps_mills_score() {
 
 #[test]
 pub(crate) fn binomial_location_scale_loglik_uses_tail_stable_standard_links() {
-    use crate::families::custom_family::{CustomFamily, ParameterBlockState};
+    use crate::custom_family::{CustomFamily, ParameterBlockState};
 
     let n = 2usize;
     let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::from_elem(
@@ -7653,7 +7653,7 @@ pub(crate) fn wiggle_geometry_and_generative_use_same_sigma_link_as_core() {
 
 #[test]
 pub(crate) fn poisson_extreme_eta_stays_finite_with_safe_exp() {
-    use crate::families::custom_family::{CustomFamily, ParameterBlockState};
+    use crate::custom_family::{CustomFamily, ParameterBlockState};
     let poisson = PoissonLogFamily {
         y: Array1::from_vec(vec![1.0, 2.0, 3.0]),
         weights: Array1::from_vec(vec![1.0, 1.0, 1.0]),
@@ -7665,7 +7665,7 @@ pub(crate) fn poisson_extreme_eta_stays_finite_with_safe_exp() {
     }]);
     if let Ok(eval) = eval_result {
         match &eval.blockworking_sets[0] {
-            crate::families::custom_family::BlockWorkingSet::Diagonal {
+            crate::custom_family::BlockWorkingSet::Diagonal {
                 working_response,
                 working_weights,
             } => {
@@ -7697,7 +7697,7 @@ pub(crate) fn poisson_extreme_eta_stays_finite_with_safe_exp() {
 /// dispatcher will trip the FD check via stale (zero) gradients.
 #[test]
 pub(crate) fn binomial_location_scale_batched_gradient_matches_finite_difference() {
-    use crate::families::custom_family::BlockwiseFitOptions;
+    use crate::custom_family::BlockwiseFitOptions;
 
     // 7-row, two-block intercept-only problem with a unit-Identity
     // penalty per block. Larger n risks PIRLS taking many iterations and

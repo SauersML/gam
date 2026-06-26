@@ -1234,7 +1234,7 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     /// declines (`None`) so the generic Horvitz–Thompson per-axis path runs.
     fn directional_derivative_all_axes_dense_override(
         &self,
-        rows: &crate::families::row_kernel::RowSet,
+        rows: &crate::row_kernel::RowSet,
         p: usize,
     ) -> Option<Result<Vec<Array2<f64>>, String>> {
         if p != self.n_coefficients() {
@@ -1244,7 +1244,7 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
                 self.n_coefficients(),
             )));
         }
-        let crate::families::row_kernel::RowSet::All = rows else {
+        let crate::row_kernel::RowSet::All = rows else {
             return None;
         };
         Some((|| {

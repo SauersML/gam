@@ -61,7 +61,7 @@
 //! deterministically via the per-block `gauge_priority` listed below.
 
 use crate::block_layout::block_count::validate_block_count;
-use crate::families::custom_family::{
+use crate::custom_family::{
     AdditiveBlockJacobian, BlockWorkingSet, CustomFamily, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, FamilyEvaluation, JointHessianSourcePreference,
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix,

@@ -211,10 +211,10 @@ impl CustomFamily for TransformationNormalFamily {
 
     fn outer_derivative_policy(
         &self,
-        specs: &[crate::families::custom_family::ParameterBlockSpec],
+        specs: &[crate::custom_family::ParameterBlockSpec],
         psi_dim: usize,
-        options: &crate::families::custom_family::BlockwiseFitOptions,
-    ) -> crate::families::custom_family::OuterDerivativePolicy {
+        options: &crate::custom_family::BlockwiseFitOptions,
+    ) -> crate::custom_family::OuterDerivativePolicy {
         // The generic default model in `CustomFamily::outer_derivative_policy`
         // uses `coefficient_hessian_cost × (rho_dim + psi_dim)`, which
         // overstates CTN's actual per-eval Hessian work because the SCOP
@@ -249,7 +249,7 @@ impl CustomFamily for TransformationNormalFamily {
         let dense_hess = work_grad.saturating_mul(p_eff);
         let mfree_hess = work_grad.saturating_mul(rho_dim.max(1));
         let work_hess = dense_hess.min(mfree_hess);
-        crate::families::custom_family::OuterDerivativePolicy {
+        crate::custom_family::OuterDerivativePolicy {
             capability,
             predicted_hessian_work: work_hess,
             predicted_gradient_work: work_grad,

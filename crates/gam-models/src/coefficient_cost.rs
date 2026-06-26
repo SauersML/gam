@@ -15,7 +15,7 @@
 //! every such family. This module is the single source of truth for that
 //! branch so a retune of the gate or either op-count touches exactly one site.
 
-use crate::families::custom_family::{
+use crate::custom_family::{
     ParameterBlockSpec, joint_coupled_coefficient_hessian_cost, use_joint_matrix_free_path,
 };
 

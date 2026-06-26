@@ -300,7 +300,7 @@ pub fn fit_transformation_normal(
     let rho_lower = Array1::<f64>::from_elem(n_penalties, rho_floor);
     let rho_upper = Array1::<f64>::from_elem(n_penalties, 12.0);
     let probe_blocks = vec![probe_block.clone()];
-    let (_, cap_hessian) = crate::families::custom_family::custom_family_outer_derivatives(
+    let (_, cap_hessian) = crate::custom_family::custom_family_outer_derivatives(
         &probe_family,
         &probe_blocks,
         &options,

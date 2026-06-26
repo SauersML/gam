@@ -803,9 +803,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         gam_terms::smooth::TermCollectionDesign,
         gam_terms::smooth::TermCollectionDesign,
         Option<gam_solve::gauge::Gauge>,
-        Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
-        Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
-        Option<Vec<crate::families::custom_family::PenaltyMatrix>>,
+        Option<Vec<crate::custom_family::PenaltyMatrix>>,
+        Option<Vec<crate::custom_family::PenaltyMatrix>>,
+        Option<Vec<crate::custom_family::PenaltyMatrix>>,
         Option<SmgsRecompileAfterAcceptContext>,
     );
     let (
@@ -1918,7 +1918,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // reached from `custom_family_outer_derivatives` below, firing a bare
     // `assert!` panic that PyO3 re-raises as an opaque "panicked inside Rust
     // boundary" GamError instead of an actionable message.
-    crate::families::custom_family::validate_blockspecs(&initial_blocks).map_err(|reason| {
+    crate::custom_family::validate_blockspecs(&initial_blocks).map_err(|reason| {
         format!("[survival-marginal-slope] assembled block specs invalid: {reason}")
     })?;
     let initial_family = make_family(

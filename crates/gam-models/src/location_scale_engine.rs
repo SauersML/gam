@@ -31,7 +31,7 @@ pub(crate) const EXACT_JOINT_RHO_BOUND: f64 = 12.0;
 /// count.
 pub(crate) fn location_scale_coefficient_hessian_cost(
     n: u64,
-    specs: &[crate::families::custom_family::ParameterBlockSpec],
+    specs: &[crate::custom_family::ParameterBlockSpec],
 ) -> u64 {
     crate::coefficient_cost::joint_coupled_operator_aware_hessian_cost(n, specs)
 }

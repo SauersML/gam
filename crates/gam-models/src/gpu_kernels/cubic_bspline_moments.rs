@@ -304,11 +304,11 @@ pub fn moment_1d_local(c: [f64; PROD_LEN], width: f64, nu: usize) -> f64 {
 
 // Canonical 20-point Gauss-Legendre nodes/weights on [-1, 1] (Abramowitz &
 // Stegun 25.4), shared with the bivariate-normal cell integrator. The single
-// source of truth lives in `crate::families::cubic_cell_kernel`; this parity
+// source of truth lives in `crate::cubic_cell_kernel`; this parity
 // gate references it so the two cubic-cell consumers can never silently drift.
 // 20 points integrate any polynomial of degree ≤ 39 exactly in finite
 // arithmetic — far more than our degree-≤ (6 + ν) integrand needs.
-use crate::families::cubic_cell_kernel::{GL20_NODES, GL20_WEIGHTS};
+use crate::cubic_cell_kernel::{GL20_NODES, GL20_WEIGHTS};
 
 /// Gauss-Legendre reference: ∫_L^R (x − m)^ν · P(x − L) dx with P given by the
 /// product-polynomial coefficient vector. Used solely as a parity gate.

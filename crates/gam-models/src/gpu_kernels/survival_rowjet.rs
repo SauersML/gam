@@ -1,7 +1,7 @@
 //! Survival marginal-slope rigid per-row NLL jet on the GPU (#932 → A100 cutover).
 //!
 //! The rigid survival marginal-slope `RowKernel<4>`
-//! ([`crate::families::survival::marginal_slope::row_kernel::rigid_row_nll`], the
+//! ([`crate::survival::marginal_slope::row_kernel::rigid_row_nll`], the
 //! #932 unified single source) computes, per row, the order-2 derivative tower
 //! `(v, g[4], H[4][4])` of the negative log-likelihood
 //!
@@ -50,7 +50,7 @@
 //! device error) it falls back to the CPU `rigid_row_nll` — the SAME unified jet —
 //! so the result is identical and the path is never GPU-only.
 
-use crate::families::survival::marginal_slope::row_kernel::RigidRowInputs;
+use crate::survival::marginal_slope::row_kernel::RigidRowInputs;
 
 /// Per-row order-≤2 + contracted third/fourth channels for a batch of rows,
 /// flattened row-major. `K = 4` (the rigid survival primaries `q0,q1,qd1,g`).
@@ -102,7 +102,7 @@ pub fn survival_rigid_row_jets_cpu(
     dir_u: &[f64; 4],
     dir_v: &[f64; 4],
 ) -> SurvivalRowJetChannels {
-    use crate::families::survival::marginal_slope::row_kernel::{
+    use crate::survival::marginal_slope::row_kernel::{
         RIGID_LINEAR_MASK, SparseOrder2, rigid_row_nll,
     };
     use gam_math::jet_scalar::{JetScalar, OneSeed, TwoSeed};
@@ -438,7 +438,7 @@ mod tests {
         // thing the production `SurvivalMarginalSlopeRowKernel` calls. Cross-check
         // the (v,g,H) channels against a direct `Order2<4>` evaluation so the
         // flattening/layout is pinned to the single source.
-        use crate::families::survival::marginal_slope::row_kernel::rigid_row_nll;
+        use crate::survival::marginal_slope::row_kernel::rigid_row_nll;
         use gam_math::jet_scalar::{JetScalar, Order2};
         let rows = fixture(7);
         let out = survival_rigid_row_jets_cpu(&rows, 0.7, &DIR, &DIRU, &DIRV);
@@ -476,7 +476,7 @@ mod tests {
         // single-source tensor exactly — the same property the device kernel's
         // JS1/JS2 channels rely on (and the device parity gate then matches THIS
         // CPU result to ≤1e-9).
-        use crate::families::survival::marginal_slope::row_kernel::rigid_row_nll;
+        use crate::survival::marginal_slope::row_kernel::rigid_row_nll;
         use gam_math::jet_tower::Tower4;
         let rows = fixture(9);
         let out = survival_rigid_row_jets_cpu(&rows, 0.7, &DIR, &DIRU, &DIRV);

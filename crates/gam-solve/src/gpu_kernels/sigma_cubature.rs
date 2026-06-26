@@ -216,7 +216,7 @@ mod linux_impl {
     ) -> ndarray::Array2<f64> {
         let tmp = qs.dot(h_transformed);
         let mut h_orig = tmp.dot(&qs.t());
-        crate::families::custom_family::symmetrize_dense_in_place(&mut h_orig);
+        crate::custom_family::symmetrize_dense_in_place(&mut h_orig);
         h_orig
     }
 

@@ -33,7 +33,7 @@
 //!   built on the shared [`crate::penalized_vector_glm`] engine.
 //!
 //! * **REML / LAML smoothing-parameter selection** — [`fit_penalized_multinomial_formula`]
-//!   routes through [`crate::families::custom_family::fit_custom_family_with_rho_prior`]
+//!   routes through [`crate::custom_family::fit_custom_family_with_rho_prior`]
 //!   so the per-active-class `λ_a` are selected by the outer REML/LAML loop;
 //!   the caller's `init_lambda` is only a warm-start seed. The multinomial
 //!   [`crate::multinomial_reml::MultinomialFamily`] `CustomFamily`
@@ -61,7 +61,7 @@
 //! [`crate::binomial_multi`] is the same engine with a row-diagonal
 //! Fisher block instead.
 
-use crate::families::custom_family::{
+use crate::custom_family::{
     BlockwiseFitOptions, ParameterBlockState, PenaltyMatrix, fit_custom_family_with_rho_prior,
 };
 use crate::multinomial_reml::MultinomialFamily;

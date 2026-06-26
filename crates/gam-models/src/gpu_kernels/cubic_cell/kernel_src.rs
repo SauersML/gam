@@ -11,7 +11,7 @@
 
 use std::fmt::Write as _;
 
-use crate::families::cubic_cell_kernel::{GL_NODES_FOR_GPU_KERNEL, GL_WEIGHTS_FOR_GPU_KERNEL};
+use crate::cubic_cell_kernel::{GL_NODES_FOR_GPU_KERNEL, GL_WEIGHTS_FOR_GPU_KERNEL};
 
 /// Emit the full NVRTC source for one `max_degree` specialization. The kernel
 /// symbol is `cubic_deriv_moments_d{max_degree}`. Output is deterministic:

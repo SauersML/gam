@@ -12,7 +12,7 @@
 
 use super::{PenaltyBlockInfo, TermCollectionDesign};
 use crate::basis::BasisError;
-use crate::estimate::PenaltySpec;
+use crate::PenaltySpec;
 use gam_spec::CoefficientGroupPrior;
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};

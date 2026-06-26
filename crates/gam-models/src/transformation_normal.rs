@@ -39,7 +39,7 @@ pub(crate) use gam_terms::basis::{
     create_ispline_derivative_dense,
 };
 pub(crate) use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
-pub(crate) use crate::families::custom_family::{
+pub(crate) use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyBlockPsiDerivative,
     CustomFamilyPsiDerivativeOperator, CustomFamilyWarmStart, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, ExactNewtonJointPsiSecondOrderTerms,

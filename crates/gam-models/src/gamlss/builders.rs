@@ -1498,7 +1498,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     Ok(policy_blocks) => {
                         let policy_family =
                             builder.build_family(&mean_boot_design, &noise_boot_design);
-                        crate::families::custom_family::CustomFamily::outer_derivative_policy(
+                        crate::custom_family::CustomFamily::outer_derivative_policy(
                             &policy_family,
                             &policy_blocks,
                             psi_dim,
@@ -1518,11 +1518,11 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                              routing outer optimizer through gradient-only BFGS"
                         );
                         let capability = if analytic_joint_derivatives_available {
-                            crate::families::custom_family::ExactOuterDerivativeOrder::Second
+                            crate::custom_family::ExactOuterDerivativeOrder::Second
                         } else {
-                            crate::families::custom_family::ExactOuterDerivativeOrder::First
+                            crate::custom_family::ExactOuterDerivativeOrder::First
                         };
-                        crate::families::custom_family::OuterDerivativePolicy {
+                        crate::custom_family::OuterDerivativePolicy {
                             capability,
                             predicted_gradient_work: u128::MAX,
                             predicted_hessian_work: u128::MAX,
@@ -1539,7 +1539,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     // path can supply — the macro's hyper evaluator returns
                     // an error otherwise.
                     policy.capability =
-                        crate::families::custom_family::ExactOuterDerivativeOrder::First;
+                        crate::custom_family::ExactOuterDerivativeOrder::First;
                 }
                 policy
             };

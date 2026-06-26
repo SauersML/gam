@@ -7,7 +7,7 @@
 //! `Device` residency variant lands with the NVRTC kernel wiring on Linux.
 //!
 //! The host path defers all heavy math to the existing CPU evaluator
-//! `crate::families::cubic_cell_kernel::evaluate_cell_derivative_moments_uncached`.
+//! `crate::cubic_cell_kernel::evaluate_cell_derivative_moments_uncached`.
 //! This module's only jobs are:
 //!
 //! 1. validate the host view (lengths, supported degree, mode),
@@ -25,7 +25,7 @@
 //! (`build_host_moments` + `HostMomentBatch`) lives in the test module below
 //! as a comparison oracle for the device kernel's row-major moment buffer.
 
-use crate::families::cubic_cell_kernel::{
+use crate::cubic_cell_kernel::{
     DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
 };
 use crate::gpu_kernels::cubic_cell::branch::classify_cell_for_gpu;
@@ -96,7 +96,7 @@ pub(crate) fn build_host_cell_status(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::cubic_cell_kernel::{
+    use crate::cubic_cell_kernel::{
         DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
     };
     use crate::gpu_kernels::cubic_cell::{

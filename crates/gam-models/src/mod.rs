@@ -18,6 +18,7 @@ pub mod marginal_slope_shared;
 pub mod monotone_root;
 pub mod multinomial;
 pub(crate) mod multinomial_reml;
+pub mod outer_subsample;
 pub mod parameter_block;
 pub mod penalized_vector_glm;
 pub(crate) mod row_kernel;

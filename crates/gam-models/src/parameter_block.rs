@@ -1,4 +1,4 @@
-use crate::families::custom_family::{ParameterBlockSpec, PenaltyMatrix};
+use crate::custom_family::{ParameterBlockSpec, PenaltyMatrix};
 use gam_linalg::matrix::DesignMatrix;
 use crate::model_types::PenaltySpec;
 use ndarray::Array1;

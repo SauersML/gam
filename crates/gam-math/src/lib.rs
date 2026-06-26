@@ -7,3 +7,4 @@ pub mod special;
 
 #[cfg(test)]
 mod jet_poisson_oracle_tests;
+pub mod quantile;

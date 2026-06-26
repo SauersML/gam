@@ -17,7 +17,7 @@
 //! 3-way event dispatch is [`latent_survival_event_type_for`]. Reached from the
 //! formula DSL via `SurvInterval(L, R, event) ~ ...`.
 
-use crate::families::custom_family::{
+use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, ExactNewtonJointGradientEvaluation,
     ExactNewtonJointHessianWorkspace, FamilyEvaluation, ParameterBlockSpec, ParameterBlockState,
     PenaltyMatrix, fit_custom_family, fit_custom_family_fixed_log_lambdas,
@@ -4440,7 +4440,7 @@ impl CustomFamily for LatentBinaryFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::custom_family::BlockWorkingSet;
+    use crate::custom_family::BlockWorkingSet;
     use gam_linalg::matrix::DenseDesignMatrix;
     use ndarray::array;
 
@@ -4988,7 +4988,7 @@ mod tests {
 
     #[test]
     fn latent_family_planner_keeps_outer_hessian_at_large_n() {
-        use crate::families::custom_family::custom_family_outer_derivatives;
+        use crate::custom_family::custom_family_outer_derivatives;
         use gam_problem::{DeclaredHessianForm, Derivative};
 
         let options = BlockwiseFitOptions::default();

@@ -1,5 +1,5 @@
 use crate::basis::analyze_penalty_block;
-use crate::estimate::EstimationError;
+use crate::EstimationError;
 use crate::smooth::PenaltyStructureHint;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
@@ -1132,14 +1132,14 @@ pub fn report_penalty_pair_redundancy(canonical: &[CanonicalPenalty]) -> Vec<(us
 /// This is O(block_dim^3) instead of O(p^3) for block-local penalties.
 /// Returns `None` if the penalty has rank zero (should be dropped).
 pub fn canonicalize_penalty_spec(
-    spec: &crate::estimate::PenaltySpec,
+    spec: &crate::PenaltySpec,
     p: usize,
     idx: usize,
     context: &str,
 ) -> Result<Option<CanonicalPenalty>, EstimationError> {
-    use crate::estimate::PenaltySpec;
+    use crate::PenaltySpec;
 
-    crate::estimate::validate_penalty_spec_shape(idx, spec, p, context)?;
+    crate::validate_penalty_spec_shape(idx, spec, p, context)?;
 
     let (local_matrix, col_range, prior_mean_spec, hint, op) = match spec {
         PenaltySpec::Block {
@@ -1309,7 +1309,7 @@ pub fn canonicalize_penalty_spec(
 /// Canonicalize a batch of penalty specs, dropping zero-rank penalties.
 /// Returns (active_penalties, active_nullspace_dims).
 pub fn canonicalize_penalty_specs(
-    specs: &[crate::estimate::PenaltySpec],
+    specs: &[crate::PenaltySpec],
     nullspace_dims: &[usize],
     p: usize,
     context: &str,
@@ -2974,7 +2974,7 @@ mod tests {
         report_penalty_pair_redundancy, stable_reparameterizationwith_invariant,
     };
     use crate::construction::kronecker_product;
-    use crate::estimate::EstimationError;
+    use crate::EstimationError;
     use faer::Mat;
     use gam_linalg::faer_ndarray::FaerEigh;
     use gam_linalg::utils::inf_norm;

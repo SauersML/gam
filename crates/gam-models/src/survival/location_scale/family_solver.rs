@@ -1528,8 +1528,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         // cover.
         if self.row_kernel_directional_supported() {
             let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_rescale);
-            let rows = crate::families::row_kernel::RowSet::All;
-            let axes = crate::families::row_kernel::row_kernel_directional_derivative_all_axes(
+            let rows = crate::row_kernel::RowSet::All;
+            let axes = crate::row_kernel::row_kernel_directional_derivative_all_axes(
                 &kernel, &rows,
             )?;
             return Ok(Some(axes));

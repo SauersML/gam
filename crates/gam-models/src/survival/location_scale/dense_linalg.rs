@@ -66,9 +66,9 @@ pub(crate) fn mask_row_vec<'a>(
 /// per-row weight view by `m` before the cross product.
 #[inline]
 pub(crate) fn mxtwx_psi(
-    left: crate::families::custom_family::CustomFamilyPsiLinearMapRef<'_>,
+    left: crate::custom_family::CustomFamilyPsiLinearMapRef<'_>,
     weights: ArrayView1<'_, f64>,
-    right: crate::families::custom_family::CustomFamilyPsiLinearMapRef<'_>,
+    right: crate::custom_family::CustomFamilyPsiLinearMapRef<'_>,
     mask: Option<&Array1<f64>>,
 ) -> Result<Array2<f64>, String> {
     match mask {

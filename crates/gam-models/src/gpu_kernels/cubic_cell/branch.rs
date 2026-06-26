@@ -1,6 +1,6 @@
 //! Host-side branch classifier for the GPU cubic-cell substrate.
 //!
-//! The classifier mirrors `crate::families::cubic_cell_kernel::branch_cell`
+//! The classifier mirrors `crate::cubic_cell_kernel::branch_cell`
 //! plus the semi-infinite-tail handling baked into
 //! `evaluate_cell_state_dispatched`. Tagging happens once on the host so the
 //! GPU dispatcher can launch a per-branch specialized kernel without warp
@@ -9,7 +9,7 @@
 //! The host classifier and the device kernel use the *same* CPU functions to
 //! decide cell branch, so a future kernel landing cannot drift on tolerance.
 
-use crate::families::cubic_cell_kernel::{DenestedCubicCell, ExactCellBranch, branch_cell};
+use crate::cubic_cell_kernel::{DenestedCubicCell, ExactCellBranch, branch_cell};
 use crate::gpu_kernels::cubic_cell::{
     CubicCellMomentStatus, GpuCellBranchTag, GpuDenestedCubicCell,
 };
@@ -70,7 +70,7 @@ fn is_affine_quadcubic_zero(cell: GpuDenestedCubicCell) -> bool {
     // Match the CPU dispatcher's tolerance for "semi-infinite cell must be
     // affine" exactly so host and device agree byte-for-byte on which tails
     // are accepted.
-    use crate::families::cubic_cell_kernel::NORMALIZED_CELL_BRANCH_TOL;
+    use crate::cubic_cell_kernel::NORMALIZED_CELL_BRANCH_TOL;
     cell.c2.abs() <= NORMALIZED_CELL_BRANCH_TOL && cell.c3.abs() <= NORMALIZED_CELL_BRANCH_TOL
 }
 

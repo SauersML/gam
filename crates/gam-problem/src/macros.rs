@@ -17,3 +17,43 @@ macro_rules! impl_reason_error_boilerplate {
         }
     };
 }
+
+#[macro_export]
+macro_rules! bail_invalid_estim {
+    ($fmt:literal $(, $($arg:tt)*)?) => {
+        return Err($crate::EstimationError::InvalidInput(format!($fmt $(, $($arg)*)?)))
+    };
+    ($msg:expr $(,)?) => {
+        return Err($crate::EstimationError::InvalidInput($msg))
+    };
+}
+
+#[macro_export]
+macro_rules! bail_invalid_basis {
+    ($fmt:literal $(, $($arg:tt)*)?) => {
+        return Err($crate::BasisError::InvalidInput(format!($fmt $(, $($arg)*)?)))
+    };
+    ($msg:expr $(,)?) => {
+        return Err($crate::BasisError::InvalidInput($msg))
+    };
+}
+
+#[macro_export]
+macro_rules! bail_dim_basis {
+    ($fmt:literal $(, $($arg:tt)*)?) => {
+        return Err($crate::BasisError::DimensionMismatch(format!($fmt $(, $($arg)*)?)))
+    };
+    ($msg:expr $(,)?) => {
+        return Err($crate::BasisError::DimensionMismatch($msg))
+    };
+}
+
+#[macro_export]
+macro_rules! bail_dim_custom {
+    ($fmt:literal $(, $($arg:tt)*)?) => {
+        return Err($crate::CustomFamilyError::DimensionMismatch { reason: format!($fmt $(, $($arg)*)?) })
+    };
+    ($msg:expr $(,)?) => {
+        return Err($crate::CustomFamilyError::DimensionMismatch { reason: $msg })
+    };
+}

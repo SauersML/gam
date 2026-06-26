@@ -1,7 +1,7 @@
 //! Block 9 Phase 2/3 — device kernels that consume the row-primary Hessian
 //! cache (the per-row `r × r` blocks materialised by
-//! [`crate::families::bms::BernoulliMarginalSlopeFamily::build_row_primary_hessian_cache`]
-//! and stored in [`crate::families::bms::RowPrimaryEvalCache`])
+//! [`crate::bms::BernoulliMarginalSlopeFamily::build_row_primary_hessian_cache`]
+//! and stored in [`crate::bms::RowPrimaryEvalCache`])
 //! and emit either:
 //!
 //! * **Phase 2 — per-row matvec** `y_i = H_i · v_i` for every row `i ∈ [0, n)`,
@@ -39,11 +39,11 @@ use gam_gpu::gpu_error::GpuError;
 use gam_gpu::gpu_error::GpuResultExt;
 
 /// Hard ceiling on `r` (primary local dimension). Matches the BMS-FLEX row
-/// kernel's [`crate::families::bms::gpu::row::MAX_R`] so the same cached Hessian
+/// kernel's [`crate::bms::gpu::row::MAX_R`] so the same cached Hessian
 /// bundle can feed both kernels without revalidation. Linux-only because
 /// the consumers (`validate` impls and the launcher) are Linux-only.
 #[cfg(target_os = "linux")]
-pub(crate) const MAX_R: usize = crate::families::bms::gpu::row::MAX_R;
+pub(crate) const MAX_R: usize = crate::bms::gpu::row::MAX_R;
 
 /// `blockDim.x` for the per-row matvec / diagonal kernels. One CUDA block per
 /// row; the 32 threads of the block parallelise the inner `r`-loop. Linux-only
@@ -412,7 +412,7 @@ fn launch_diag_linux(inputs: RowHessianDiagInputs<'_>) -> Result<RowHessianDiagO
 
 /// CPU oracle for [`launch_row_hessian_matvec`]. Mirrors the per-row
 /// `scratch.hess.dot(&row_dir)` contraction in CPU
-/// [`crate::families::bms::BernoulliMarginalSlopeFamily::exact_newton_joint_hessian_matvec_from_cache`].
+/// [`crate::bms::BernoulliMarginalSlopeFamily::exact_newton_joint_hessian_matvec_from_cache`].
 /// Used by the parity test below; kept `pub(crate)` so future Phase 5
 /// dispatcher work can reuse the exact reference algebra.
 pub(crate) fn cpu_row_hessian_matvec(inputs: &RowHessianMatvecInputs<'_>) -> Vec<f64> {
@@ -435,7 +435,7 @@ pub(crate) fn cpu_row_hessian_matvec(inputs: &RowHessianMatvecInputs<'_>) -> Vec
 
 /// CPU oracle for [`launch_row_hessian_diag`]. Mirrors the per-row
 /// `row_hess[[u, u]]` reads in CPU
-/// [`crate::families::bms::BernoulliMarginalSlopeFamily::exact_newton_joint_hessian_diagonal_from_cache`].
+/// [`crate::bms::BernoulliMarginalSlopeFamily::exact_newton_joint_hessian_diagonal_from_cache`].
 pub(crate) fn cpu_row_hessian_diag(inputs: &RowHessianDiagInputs<'_>) -> Vec<f64> {
     let n = inputs.n_rows;
     let r = inputs.r;

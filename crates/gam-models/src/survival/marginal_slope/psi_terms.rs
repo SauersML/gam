@@ -234,7 +234,7 @@ impl SurvivalMarginalSlopeFamily {
         // Build the psi design map once; rowwise loop does direct row_vector(row)
         // calls via the PsiDesignMap API.
         let policy = gam_runtime::resource::ResourcePolicy::default_library();
-        let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
+        let psi_map = crate::custom_family::resolve_custom_family_x_psi_map(
             deriv,
             self.n,
             p_psi,
@@ -470,7 +470,7 @@ impl SurvivalMarginalSlopeFamily {
         // once outside the row pass so the row hot loop sees only borrows.
         struct AxisCtx<'a> {
             block_idx: usize,
-            psi_map: crate::families::custom_family::PsiDesignMap,
+            psi_map: crate::custom_family::PsiDesignMap,
             loading: Array1<f64>,
             beta_psi: &'a Array1<f64>,
         }
@@ -486,7 +486,7 @@ impl SurvivalMarginalSlopeFamily {
                 return Ok(None);
             };
             let deriv = &derivative_blocks[block_idx][local_idx];
-            let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
+            let psi_map = crate::custom_family::resolve_custom_family_x_psi_map(
                 deriv,
                 self.n,
                 p_psi,
@@ -748,7 +748,7 @@ impl SurvivalMarginalSlopeFamily {
         // Build psi design maps once outside the row loop; rowwise calls use
         // the direct row_vector(row) API.
         let policy = gam_runtime::resource::ResourcePolicy::default_library();
-        let psi_map_i = crate::families::custom_family::resolve_custom_family_x_psi_map(
+        let psi_map_i = crate::custom_family::resolve_custom_family_x_psi_map(
             deriv_i,
             self.n,
             p_psi_i,
@@ -756,7 +756,7 @@ impl SurvivalMarginalSlopeFamily {
             label_i,
             &policy,
         )?;
-        let psi_map_j = crate::families::custom_family::resolve_custom_family_x_psi_map(
+        let psi_map_j = crate::custom_family::resolve_custom_family_x_psi_map(
             deriv_j,
             self.n,
             p_psi_j,
@@ -766,7 +766,7 @@ impl SurvivalMarginalSlopeFamily {
         )?;
         let psi_map_ij = if same_block {
             Some(
-                crate::families::custom_family::resolve_custom_family_x_psi_psi_map(
+                crate::custom_family::resolve_custom_family_x_psi_psi_map(
                     deriv_i,
                     deriv_j,
                     local_idx_j,
@@ -1232,7 +1232,7 @@ impl SurvivalMarginalSlopeFamily {
 
         // Build the psi design map once; rowwise calls use direct row_vector(row).
         let policy = gam_runtime::resource::ResourcePolicy::default_library();
-        let psi_map = crate::families::custom_family::resolve_custom_family_x_psi_map(
+        let psi_map = crate::custom_family::resolve_custom_family_x_psi_map(
             deriv,
             self.n,
             p_psi,

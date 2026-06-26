@@ -1,5 +1,5 @@
 use gam_linalg::faer_ndarray::{fast_atv, fast_av, fast_xt_diag_x, fast_xt_diag_y};
-use crate::families::custom_family::{
+use crate::custom_family::{
     BlockWorkingSet, CustomFamily, FamilyEvaluation, ParameterBlockState,
     projected_linear_constraint_stationarity_vector,
 };
@@ -435,7 +435,7 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
 
     fn output_channel_assignment(
         &self,
-        specs: &[crate::families::custom_family::ParameterBlockSpec],
+        specs: &[crate::custom_family::ParameterBlockSpec],
     ) -> Option<Vec<usize>> {
         if specs.len() != self.blocks.len() {
             return Some((0..self.blocks.len()).collect());
@@ -445,16 +445,16 @@ impl CustomFamily for CauseSpecificRoystonParmarFamily {
 
     fn coefficient_hessian_cost(
         &self,
-        specs: &[crate::families::custom_family::ParameterBlockSpec],
+        specs: &[crate::custom_family::ParameterBlockSpec],
     ) -> u64 {
-        crate::families::custom_family::default_coefficient_hessian_cost(specs)
+        crate::custom_family::default_coefficient_hessian_cost(specs)
     }
 
     fn block_linear_constraints(
         &self,
         _: &[ParameterBlockState],
         block_idx: usize,
-        spec: &crate::families::custom_family::ParameterBlockSpec,
+        spec: &crate::custom_family::ParameterBlockSpec,
     ) -> Result<Option<LinearInequalityConstraints>, String> {
         let block = self.blocks.get(block_idx).ok_or_else(|| {
             SurvivalError::CauseSpecificDimensionMismatch {

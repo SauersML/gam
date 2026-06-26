@@ -195,10 +195,10 @@ pub struct SurvivalLocationScaleTermSpec {
     /// Same semantics as `initial_threshold_log_lambdas`.
     pub initial_log_sigma_log_lambdas: Option<Array1<f64>>,
     /// Explicit persistent warm-start cache session. See
-    /// [`crate::families::custom_family::BlockwiseFitOptions::cache_session`].
+    /// [`crate::custom_family::BlockwiseFitOptions::cache_session`].
     pub cache_session: Option<std::sync::Arc<gam_runtime::warm_start::Session>>,
     /// Explicit persistent warm-start mirror sessions. See
-    /// [`crate::families::custom_family::BlockwiseFitOptions::cache_mirror_sessions`].
+    /// [`crate::custom_family::BlockwiseFitOptions::cache_mirror_sessions`].
     pub cache_mirror_sessions: Vec<std::sync::Arc<gam_runtime::warm_start::Session>>,
 }
 

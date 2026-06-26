@@ -349,7 +349,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn cubic_cell_device_residency_matches_cpu_all_branches() {
-        use crate::families::cubic_cell_kernel::{
+        use crate::cubic_cell_kernel::{
             DenestedCubicCell, evaluate_cell_derivative_moments_uncached,
         };
         if GpuRuntime::global().is_none() {

@@ -163,7 +163,7 @@ impl RowSet {
     /// on the `Subsample` variant so downstream row-set consumers can validate
     /// Horvitz-Thompson weights against the population size.
     pub fn from_options(
-        opts: &crate::families::custom_family::BlockwiseFitOptions,
+        opts: &crate::custom_family::BlockwiseFitOptions,
         n_total: usize,
     ) -> Self {
         match opts.outer_score_subsample.as_ref() {

@@ -30,7 +30,7 @@ use crate::smooth::{
     TensorBSplineIdentifiability, TensorBSplinePenaltyDecomposition, TensorBSplineSpec,
     TermCollectionSpec,
 };
-use crate::types::ColIdx;
+use gam_problem::types::ColIdx;
 use gam_data::{ColumnKindTag, DataError, EncodedDataset as Dataset};
 use gam_runtime::resource::ResourcePolicy;
 
