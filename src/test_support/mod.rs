@@ -5,11 +5,15 @@ pub mod fd_checker;
 pub mod reference;
 
 use crate::families::custom_family::{ParameterBlockSpec, PenaltyMatrix};
-use crate::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
-use gam_runtime::resource::MatrixMaterializationError;
-use ndarray::{Array1, Array2, Axis, array, s};
-use std::ops::Range;
-use std::sync::Arc;
+use crate::matrix::{DenseDesignMatrix, DesignMatrix};
+use ndarray::{Array1, Array2, array};
+
+// `no_densify_design` (and the operator-backed fixture behind it) is a
+// linear-algebra fixture; it lives in `gam-linalg` alongside the operator traits
+// it exercises and is re-exported here so this crate's tests keep their familiar
+// `crate::test_support::no_densify_design` path. Single source of truth — the
+// previous duplicate copy drifted out of the crate that owns the types.
+pub use gam_linalg::test_support::no_densify_design;
 
 pub struct BinomialLocationScaleBaseFixture {
     pub n: usize,
@@ -64,67 +68,6 @@ pub fn binomial_location_scale_base_fixture() -> BinomialLocationScaleBaseFixtur
         threshold_spec,
         log_sigma_spec,
     }
-}
-
-#[derive(Clone)]
-struct NoDensifyOperator {
-    dense: Array2<f64>,
-}
-
-impl LinearOperator for NoDensifyOperator {
-    fn nrows(&self) -> usize {
-        self.dense.nrows()
-    }
-
-    fn ncols(&self) -> usize {
-        self.dense.ncols()
-    }
-
-    fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
-        self.dense.dot(vector)
-    }
-
-    fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
-        self.dense.t().dot(vector)
-    }
-
-    fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
-        if weights.len() != self.nrows() {
-            return Err(format!(
-                "NoDensifyOperator weight length mismatch: weights={}, nrows={}",
-                weights.len(),
-                self.nrows()
-            ));
-        }
-        let weighted = &self.dense * &weights.view().insert_axis(Axis(1));
-        Ok(self.dense.t().dot(&weighted))
-    }
-}
-
-impl DenseDesignOperator for NoDensifyOperator {
-    fn row_chunk_into(
-        &self,
-        rows: Range<usize>,
-        mut out: ndarray::ArrayViewMut2<'_, f64>,
-    ) -> Result<(), MatrixMaterializationError> {
-        out.assign(&self.dense.slice(s![rows, ..]));
-        Ok(())
-    }
-
-    fn to_dense(&self) -> Array2<f64> {
-        // `NoDensifyOperator` is a test fixture asserting that
-        // operator-aware code paths never densify.
-        // SAFETY: a call here means a code path under test bypassed
-        // `row_chunk_into` and tried to materialize — the regression
-        // this fixture is designed to catch.
-        panic!("NoDensifyOperator must stay lazy")
-    }
-}
-
-pub fn no_densify_design(dense: Array2<f64>) -> DesignMatrix {
-    DesignMatrix::from(DenseDesignMatrix::from(Arc::new(NoDensifyOperator {
-        dense,
-    })))
 }
 
 /// Assert that a central difference of an array-producing function matches the analytical derivative.
