@@ -1,5 +1,5 @@
+use crate::LinalgError;
 use crate::faer_ndarray::{FaerArrayView, FaerColView};
-use crate::linalg::LinalgError;
 use faer::Side;
 use faer::linalg::solvers::Solve;
 use faer::sparse::linalg::solvers::Llt as SparseLlt;

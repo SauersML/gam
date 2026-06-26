@@ -23,6 +23,54 @@ use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
 use super::device_runtime::GpuRuntime;
 
+pub struct CudaGemmDispatch;
+
+impl gam_linalg::gpu_hook::GpuGemmDispatch for CudaGemmDispatch {
+    fn try_fast_atb(&self, a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+        try_fast_atb(a, b)
+    }
+
+    fn try_fast_ab(&self, a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> Option<Array2<f64>> {
+        try_fast_ab(a, b)
+    }
+
+    fn try_fast_av(&self, a: ArrayView2<'_, f64>, v: ArrayView1<'_, f64>) -> Option<Array1<f64>> {
+        try_fast_av(a, v)
+    }
+
+    fn try_fast_atv(&self, a: ArrayView2<'_, f64>, v: ArrayView1<'_, f64>) -> Option<Array1<f64>> {
+        try_fast_atv(a, v)
+    }
+
+    fn try_fast_xt_diag_x(
+        &self,
+        x: ArrayView2<'_, f64>,
+        w: ArrayView1<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        try_fast_xt_diag_x(x, w)
+    }
+
+    fn try_fast_xt_diag_y(
+        &self,
+        x: ArrayView2<'_, f64>,
+        w: ArrayView1<'_, f64>,
+        y: ArrayView2<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        try_fast_xt_diag_y(x, w, y)
+    }
+
+    fn try_fast_joint_hessian_2x2(
+        &self,
+        x_a: ArrayView2<'_, f64>,
+        x_b: ArrayView2<'_, f64>,
+        w_aa: ArrayView1<'_, f64>,
+        w_ab: ArrayView1<'_, f64>,
+        w_bb: ArrayView1<'_, f64>,
+    ) -> Option<Array2<f64>> {
+        try_fast_joint_hessian_2x2(x_a, x_b, w_aa, w_ab, w_bb)
+    }
+}
+
 /// Discriminator used by [`route_through_gpu`] to apply the right
 /// size threshold from [`super::policy::GpuDispatchPolicy`].
 #[derive(Clone, Copy, Debug)]

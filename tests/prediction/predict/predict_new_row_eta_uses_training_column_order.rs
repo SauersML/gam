@@ -1,5 +1,5 @@
-use gam_predict::predict_gam;
 use gam::types::LikelihoodSpec;
+use gam_predict::predict_gam;
 use ndarray::{arr1, arr2};
 
 #[test]

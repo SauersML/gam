@@ -44,8 +44,8 @@ mod gpu {
     }
 }
 
+pub use gam_linalg::faer_ndarray::{in_nested_parallel_region, with_nested_parallel};
 use linalg_helpers::{dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into};
-pub use linalg_helpers::{in_nested_parallel_region, with_nested_parallel};
 pub use linear_constraints::LinearInequalityConstraints;
 pub use pseudo_logdet::PseudoLogdetMode;
 pub use seeding::{SeedConfig, SeedRiskProfile, clamp_seed_rho_to_bounds, normalize_seed_bounds};

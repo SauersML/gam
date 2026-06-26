@@ -61,7 +61,6 @@ use gam::inference::model_payload_builders::{
     assemble_bernoulli_marginal_slope_payload,
 };
 use gam::matrix::{DenseDesignMatrix, DenseDesignOperator, DesignMatrix, LinearOperator};
-use gam_predict::PredictableModel;
 use gam::probability::normal_cdf;
 use gam::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
@@ -73,6 +72,7 @@ use gam::types::{
     InverseLink, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization, StandardLink,
     WigglePenaltyConfig,
 };
+use gam_predict::PredictableModel;
 use ndarray::{Array1, Array2, ArrayViewMut2, array, s};
 use rand::SeedableRng;
 use rand::rngs::StdRng;

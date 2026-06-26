@@ -5,7 +5,6 @@ use crate::faer_ndarray::{
 };
 use crate::types::RidgePolicy;
 use faer::Accum;
-use faer::Par;
 use faer::linalg::matmul::matmul;
 use faer::sparse::{SparseColMat, SparseRowMat, Triplet};
 use gam_runtime::resource::{
@@ -15,7 +14,6 @@ use ndarray::{
     Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, ArrayViewMut2, Axis, ShapeBuilder, s,
 };
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
-use rayon::slice::ParallelSliceMut;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::ops::Deref;
@@ -35,7 +33,6 @@ const MAX_PERSISTENT_SPARSE_DENSE_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_SPARSE_TO_DENSE_BYTES: usize = MAX_SINGLE_DENSE_MATERIALIZATION_BYTES;
 const CHUNKED_DENSE_MATERIALIZATION_BYTES: usize = 8 * 1024 * 1024;
 const OPERATOR_ROW_CHUNK_SIZE: usize = 256;
-const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
 /// Minimum n*p product for the dense-row parallel fold/reduce paths
 /// (`diag_gram`, `apply_weighted_normal`, dense transpose reductions).
 /// Below this, the sequential row loop wins on overhead.
@@ -46,7 +43,7 @@ const SPARSE_ROW_PARALLEL_MIN_FLOPS: u64 = 100_000;
 /// product matvecs.  Beyond this threshold, fall back to per-column GEMV.
 const TENSOR_GEMM_MAX_INTERMEDIATE_BYTES: usize = 128 * 1024 * 1024; // 128 MB
 
-pub use crate::linalg::utils::PcgSolveInfo;
+pub use crate::utils::PcgSolveInfo;
 
 mod sparse_hessian;
 pub use sparse_hessian::SparseHessianAccumulator;
@@ -98,11 +95,7 @@ fn dense_operator_to_dense_by_chunks<O: DenseDesignOperator + ?Sized>(
     Ok(out)
 }
 
-pub(crate) fn checked_dense_nbytes(
-    nrows: usize,
-    ncols: usize,
-    context: &str,
-) -> Result<usize, String> {
+pub fn checked_dense_nbytes(nrows: usize, ncols: usize, context: &str) -> Result<usize, String> {
     nrows
         .checked_mul(ncols)
         .and_then(|cells| cells.checked_mul(std::mem::size_of::<f64>()))
@@ -186,7 +179,7 @@ fn weighted_crossprod_dense_view(
     }
 
     let min_parallel_work = WEIGHTED_CROSSPROD_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
-    let Some(chunk_rows) = crate::solver::parallel_strategy::row_reduction_chunk_rows(
+    let Some(chunk_rows) = crate::parallel::row_reduction_chunk_rows(
         n,
         p_left.saturating_mul(p_right),
         p_left.saturating_mul(p_right),
@@ -504,7 +497,7 @@ fn sparse_csr_weighted_xtwx(
     }
 
     let min_parallel_work = SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
-    let Some(chunk_rows) = crate::solver::parallel_strategy::row_reduction_chunk_rows(
+    let Some(chunk_rows) = crate::parallel::row_reduction_chunk_rows(
         n,
         avg.min(usize::MAX as u64) as usize,
         p.saturating_mul(p),
@@ -571,7 +564,7 @@ fn sparse_csr_weighted_xtwx_rows(
     xtwx
 }
 
-pub(crate) fn streaming_sparse_csc_xt_diag_x(
+pub fn streaming_sparse_csc_xt_diag_x(
     col_ptr: &[usize],
     row_idx: &[usize],
     vals: &[f64],
@@ -646,8 +639,7 @@ fn sparse_csr_diag_gram(
         return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     }
     let min_parallel_work = SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
-    let Some(chunk_rows) =
-        crate::solver::parallel_strategy::row_reduction_chunk_rows(n, 1, p, min_parallel_work)
+    let Some(chunk_rows) = crate::parallel::row_reduction_chunk_rows(n, 1, p, min_parallel_work)
     else {
         return sparse_csr_diag_gram_rows(row_ptr, col_idx, vals, p, weights, 0..n);
     };
@@ -2094,7 +2086,7 @@ pub enum DesignBlock {
 }
 
 impl DesignBlock {
-    pub(crate) fn nrows(&self) -> usize {
+    pub fn nrows(&self) -> usize {
         match self {
             Self::Dense(d) => d.nrows(),
             Self::Sparse(s) => s.nrows(),
@@ -2103,7 +2095,7 @@ impl DesignBlock {
         }
     }
 
-    pub(crate) fn ncols(&self) -> usize {
+    pub fn ncols(&self) -> usize {
         match self {
             Self::Dense(d) => d.ncols(),
             Self::Sparse(s) => s.ncols(),
@@ -2974,10 +2966,6 @@ impl DenseDesignOperator for MultiChannelOperator {
 mod kronecker;
 pub use kronecker::*;
 
-// Spatial-kernel design operators (#1145): see `kernels.rs`.
-mod kernels;
-pub use kernels::*;
-
 /// Coefficient-side transform operator: represents X_eff = X_inner * T without
 /// materializing the product. Preserves the sparsity/operator structure of the
 /// inner design by applying T on the coefficient side:
@@ -3804,7 +3792,7 @@ pub trait LinearOperator {
             };
             let preconditioner = normal_op.jacobi_preconditioner()?;
             let attempt_started = std::time::Instant::now();
-            let solved = crate::linalg::utils::solve_spd_pcg_with_info(
+            let solved = crate::utils::solve_spd_pcg_with_info(
                 |v| normal_op.apply(v),
                 rhs,
                 &preconditioner,
@@ -3872,7 +3860,7 @@ pub trait LinearOperator {
             }
             system += pen;
         }
-        let factor = crate::linalg::utils::StableSolver::new("linear operator system")
+        let factor = crate::utils::StableSolver::new("linear operator system")
             .factorize(&system)
             .map_err(|e| format!("factorize_system failed: {e:?}"))?;
         Ok(Box::new(factor))
@@ -3933,7 +3921,7 @@ pub trait LinearOperator {
             }
             system += pen;
         }
-        crate::linalg::utils::StableSolver::new("linear operator system")
+        crate::utils::StableSolver::new("linear operator system")
             .solvevectorwithridge_retries(&system, rhs, baseridge)
             .ok_or_else(|| "solve_systemwith_policy failed after ridge retries".to_string())
     }
@@ -4203,7 +4191,7 @@ impl LinearOperator for DesignMatrix {
             Self::Dense(_) => self.factorize_system_dense(weights, penalty),
             Self::Sparse(matrix) => {
                 let system = assemble_sparseweighted_gram_system(matrix, weights, penalty)?;
-                let factor = crate::linalg::sparse_exact::factorize_sparse_spd(&system)
+                let factor = crate::sparse_exact::factorize_sparse_spd(&system)
                     .map_err(|e| format!("factorize_system failed: {e:?}"))?;
                 Ok(Box::new(factor))
             }
@@ -4526,7 +4514,7 @@ impl DesignMatrix {
             }
             system += pen;
         }
-        let factor = crate::linalg::utils::StableSolver::new("linear operator system")
+        let factor = crate::utils::StableSolver::new("linear operator system")
             .factorize(&system)
             .map_err(|e| format!("factorize_system failed: {e:?}"))?;
         Ok(Box::new(factor))
@@ -5774,17 +5762,16 @@ impl From<&DesignMatrix> for DesignBlock {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockDesignOperator, ChunkedKernelDesignOperator, CoefficientTransformOperator,
-        DenseDesignMatrix, DenseDesignOperator, DesignBlock, DesignMatrix, EmbeddedColumnBlock,
-        MultiChannelOperator, PsdWeightsView, ReparamOperator, ResidualisedDesignOperator,
-        RowwiseKroneckerOperator, SignedWeightsView, SparseDesignMatrix,
-        dense_operator_to_dense_by_chunks, dense_transpose_weighted_response, fast_atv, fast_av,
-        streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view,
+        BlockDesignOperator, CoefficientTransformOperator, DenseDesignMatrix, DenseDesignOperator,
+        DesignBlock, DesignMatrix, EmbeddedColumnBlock, MultiChannelOperator, PsdWeightsView,
+        ReparamOperator, ResidualisedDesignOperator, RowwiseKroneckerOperator, SignedWeightsView,
+        SparseDesignMatrix, dense_operator_to_dense_by_chunks, dense_transpose_weighted_response,
+        fast_atv, fast_av, streaming_sparse_csc_xt_diag_x, weighted_crossprod_dense_view,
     };
-    use crate::linalg::matrix::LinearOperator;
-    use crate::linalg::utils::{PcgSolveInfo, StableSolver};
+    use crate::matrix::LinearOperator;
     use crate::test_support::no_densify_design;
     use crate::types::RidgePolicy;
+    use crate::utils::{PcgSolveInfo, StableSolver};
     use faer::sparse::{SparseColMat, SymbolicSparseColMat, Triplet};
     use gam_runtime::resource::{MatrixMaterializationError, ResourcePolicy};
     use ndarray::{Array1, Array2, ArrayViewMut2, Axis, array, s};
@@ -6123,70 +6110,6 @@ mod tests {
         ReparamOperator::new(DesignMatrix::Dense(DenseDesignMatrix::from(x)), qs);
     }
 
-    #[test]
-    fn chunked_kernel_operator_uses_center_rows_for_column_count() {
-        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]]);
-        let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]]);
-        let kernel =
-            |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
-        let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
-            .expect("chunked kernel operator");
-
-        assert_eq!(operator.ncols(), 3);
-        let chunk = operator.row_chunk_combined(0..2);
-        assert_eq!(chunk.dim(), (2, 3));
-    }
-
-    #[test]
-    fn chunked_kernel_operator_rejects_incompatible_optional_shapes() {
-        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]]);
-        let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]]);
-        let kernel = |_: &[f64], _: &[f64]| 0.0;
-        let bad_gauge = Arc::new(crate::solver::gauge::Gauge::from_block_transforms(&[
-            Array2::<f64>::zeros((2, 1)),
-        ]));
-        let bad_poly = Arc::new(Array2::<f64>::zeros((3, 1)));
-
-        let gauge_err = match ChunkedKernelDesignOperator::new(
-            data.clone(),
-            centers.clone(),
-            kernel,
-            Some(bad_gauge),
-            None,
-        ) {
-            // SAFETY: test asserting validation rejects mismatched gauge raw width; Ok means the validator regressed.
-            Ok(_) => panic!("gauge raw width should match centers rows"),
-            Err(err) => err,
-        };
-        assert!(gauge_err.contains("kernel gauge raw width 2 != centers rows 3"));
-
-        let poly_err =
-            match ChunkedKernelDesignOperator::new(data, centers, kernel, None, Some(bad_poly)) {
-                // SAFETY: test asserting validation rejects mismatched poly rows; Ok means the validator regressed.
-                Ok(_) => panic!("poly rows should match data rows"),
-                Err(err) => err,
-            };
-        assert!(poly_err.contains("poly_basis rows 3 != data rows 2"));
-    }
-
-    #[test]
-    fn chunked_kernel_operator_canonicalizes_non_contiguous_inputs() {
-        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]].reversed_axes());
-        let centers = Arc::new(array![[0.0, 1.0, 2.0], [0.0, 1.0, -1.0]].reversed_axes());
-        assert!(!data.is_standard_layout());
-        assert!(!centers.is_standard_layout());
-
-        let kernel =
-            |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
-        let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
-            .expect("chunked kernel operator");
-        let chunk = operator.row_chunk_combined(0..2);
-
-        assert_eq!(chunk.dim(), (2, 3));
-        assert_eq!(chunk[[0, 0]], 0.0);
-        assert_eq!(chunk[[1, 1]], 1.5);
-    }
-
     /// Locks in the dispatch path for the BLAS-3 cross-block fast path:
     /// when a `CoefficientTransformOperator` is wrapped as
     /// `DenseDesignMatrix::Lazy`, `DenseDesignMatrix::as_dense_ref` must reach
@@ -6220,38 +6143,6 @@ mod tests {
         let dense_ref = dense_design
             .as_dense_ref()
             .expect("DenseDesignMatrix::as_dense_ref must reach the cached X·T");
-        assert_eq!(dense_ref.dim(), expected.dim());
-        for ((r, c), v) in expected.indexed_iter() {
-            assert!((dense_ref[[r, c]] - v).abs() < 1e-12);
-        }
-    }
-
-    /// Same dispatch lock-in as the test above, but for
-    /// `ChunkedKernelDesignOperator`. The cross-block fast path in
-    /// `BlockDesignOperator::cross_block` matches on
-    /// `(DesignBlock::Dense(_), DesignBlock::Dense(_))` and gates the BLAS-3
-    /// route on `as_dense_ref()` returning `Some`; if the override drifts off
-    /// `DenseDesignOperator` the kernel block silently routes through
-    /// `weighted_cross_chunked` instead.
-    #[test]
-    fn chunked_kernel_operator_exposes_cached_dense_to_block_dispatch() {
-        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5], [2.0, -1.0]]);
-        let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0]]);
-        let kernel =
-            |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
-        let op = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
-            .expect("chunked kernel operator");
-        let expected = op.to_dense();
-
-        let dense_design = DenseDesignMatrix::from(Arc::new(op));
-
-        let probe = Array1::from_elem(3, 1.0);
-        let warmed = dense_design.apply_transpose(&probe);
-        assert_eq!(warmed.len(), expected.ncols());
-
-        let dense_ref = dense_design
-            .as_dense_ref()
-            .expect("DenseDesignMatrix::as_dense_ref must reach the cached kernel block");
         assert_eq!(dense_ref.dim(), expected.dim());
         for ((r, c), v) in expected.indexed_iter() {
             assert!((dense_ref[[r, c]] - v).abs() < 1e-12);

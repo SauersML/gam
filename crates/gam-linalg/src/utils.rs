@@ -1,11 +1,10 @@
-use crate::construction::calculate_condition_number;
-use crate::estimate::EstimationError;
+use crate::LinalgError;
 use crate::faer_ndarray::{
     FaerArrayView, FaerLinalgError, array2_to_matmut, factorize_symmetricwith_fallback,
 };
-use crate::faer_ndarray::{FaerCholesky, FaerEigh};
-use crate::linalg::pcg::{DotReduction, PcgCoreResult, PcgDiagnostics, PcgStop, pcg_core};
+use crate::faer_ndarray::{FaerCholesky, FaerEigh, FaerSvd};
 use crate::matrix::symmetrize_in_place;
+use crate::pcg::{DotReduction, PcgCoreResult, PcgDiagnostics, PcgStop, pcg_core};
 use faer::Side;
 use ndarray::{
     Array1, Array2, Array3, ArrayBase, ArrayView1, ArrayView2, ArrayView3, Data, Dimension, s,
@@ -21,7 +20,7 @@ use ndarray::{
 /// pure-hash flavour (single `u64 -> u64` with no externally retained
 /// state) use [`splitmix64_hash`].
 #[inline]
-pub(crate) const fn splitmix64(state: &mut u64) -> u64 {
+pub const fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = *state;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -46,7 +45,7 @@ pub const fn splitmix64_hash(x: u64) -> u64 {
 /// `families/latent_survival.rs` and `families/survival_location_scale.rs`,
 /// where it stacks per-segment offset vectors (entry / exit / derivative) into
 /// one design offset.
-pub(crate) fn stack_offsets(blocks: &[&Array1<f64>]) -> Array1<f64> {
+pub fn stack_offsets(blocks: &[&Array1<f64>]) -> Array1<f64> {
     let total: usize = blocks.iter().map(|block| block.len()).sum();
     let mut out = Array1::<f64>::zeros(total);
     let mut row = 0usize;
@@ -64,7 +63,7 @@ pub(crate) fn stack_offsets(blocks: &[&Array1<f64>]) -> Array1<f64> {
 /// byte-identical module-local copies in `solver/pirls` (sparse-native nnz
 /// counting) and `terms/smooth` (linear-fit column conditioning). With `p == 0`
 /// there is no per-row footprint, so the whole design is one chunk.
-pub(crate) fn row_chunk_for_byte_budget(n: usize, p: usize) -> usize {
+pub fn row_chunk_for_byte_budget(n: usize, p: usize) -> usize {
     const TARGET_BYTES: usize = 8 * 1024 * 1024;
     const MIN_ROWS: usize = 256;
     const MAX_ROWS: usize = 65_536;
@@ -81,7 +80,7 @@ pub(crate) fn row_chunk_for_byte_budget(n: usize, p: usize) -> usize {
 /// the byte-identical double-loop reduction that lived as module-local copies
 /// (`trace_product_dense` in `solver/gaussian_reml`, `trace_projected_cross` in
 /// `solver/reml/unified`).
-pub(crate) fn trace_of_product(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> f64 {
+pub fn trace_of_product(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> f64 {
     let mut value = 0.0;
     for i in 0..a.nrows() {
         for j in 0..a.ncols() {
@@ -128,7 +127,7 @@ pub fn stable_logistic(x: f64) -> f64 {
 
 /// Generic finiteness check for any `f64` ndarray view (1-D, 2-D, etc.).
 #[inline]
-pub(crate) fn array_is_finite<S, D>(values: &ArrayBase<S, D>) -> bool
+pub fn array_is_finite<S, D>(values: &ArrayBase<S, D>) -> bool
 where
     S: Data<Elem = f64>,
     D: Dimension,
@@ -145,19 +144,67 @@ pub fn inf_norm<I: IntoIterator<Item = f64>>(values: I) -> f64 {
     values.into_iter().fold(0.0_f64, |acc, x| acc.max(x.abs()))
 }
 
+pub fn calculate_condition_number(matrix: &Array2<f64>) -> Result<f64, FaerLinalgError> {
+    let (rows, cols) = matrix.dim();
+    if rows == 0 || cols == 0 {
+        return Ok(1.0);
+    }
+
+    // Fast path for (near-)symmetric square matrices.
+    if rows == cols {
+        let mut max_abs = 0.0_f64;
+        let mut max_asym = 0.0_f64;
+        for i in 0..rows {
+            for j in 0..cols {
+                max_abs = max_abs.max(matrix[[i, j]].abs());
+            }
+            for j in 0..i {
+                let diff = (matrix[[i, j]] - matrix[[j, i]]).abs();
+                if diff > max_asym {
+                    max_asym = diff;
+                }
+            }
+        }
+        let sym_tol = max_abs.max(1.0) * 1e-12;
+        if max_asym <= sym_tol {
+            let (evals, _) = matrix.eigh(Side::Lower)?;
+            let mut max_abs_eval = 0.0_f64;
+            let mut min_abs_eval = f64::INFINITY;
+            for &lam in evals.iter() {
+                let s = lam.abs();
+                max_abs_eval = max_abs_eval.max(s);
+                min_abs_eval = min_abs_eval.min(s);
+            }
+            if min_abs_eval < 1e-12 {
+                return Ok(f64::INFINITY);
+            }
+            return Ok(max_abs_eval / min_abs_eval);
+        }
+    }
+
+    // General matrix fallback.
+    let (_, s, _) = matrix.svd(false, false)?;
+    let max_sv = s.iter().fold(0.0_f64, |max, &val| max.max(val));
+    let min_sv = s.iter().fold(f64::INFINITY, |min, &val| min.min(val));
+    if min_sv < 1e-12 {
+        return Ok(f64::INFINITY);
+    }
+    Ok(max_sv / min_sv)
+}
+
 const HESSIAN_CONDITION_TARGET: f64 = 1e10;
 const MAX_FACTORIZATION_ATTEMPTS: usize = 4;
 const MAX_SOLVE_RETRIES: usize = 8;
 
 #[derive(Default, Clone, Copy)]
-pub(crate) struct KahanSum {
+pub struct KahanSum {
     sum: f64,
     c: f64,
 }
 
 impl KahanSum {
     #[inline]
-    pub(crate) fn add(&mut self, value: f64) {
+    pub fn add(&mut self, value: f64) {
         let y = value - self.c;
         let t = self.sum + y;
         self.c = (t - self.sum) - y;
@@ -165,7 +212,7 @@ impl KahanSum {
     }
 
     #[inline]
-    pub(crate) fn sum(self) -> f64 {
+    pub fn sum(self) -> f64 {
         self.sum
     }
 }
@@ -182,23 +229,20 @@ impl KahanSum {
 /// calling this function and pass through a `RidgePassport` /
 /// `StabilizationLedger::explicit_prior` so the same δ is also accounted
 /// for in objective, logdet, and saved state.
-pub(crate) fn matrix_inversewith_regularization(
-    matrix: &Array2<f64>,
-    label: &str,
-) -> Option<Array2<f64>> {
+pub fn matrix_inversewith_regularization(matrix: &Array2<f64>, label: &str) -> Option<Array2<f64>> {
     StableSolver::new(label).inversewith_regularization(matrix)
 }
 
-pub(crate) struct StableSolver<'a> {
+pub struct StableSolver<'a> {
     label: &'a str,
 }
 
 impl<'a> StableSolver<'a> {
-    pub(crate) fn new(label: &'a str) -> Self {
+    pub fn new(label: &'a str) -> Self {
         Self { label }
     }
 
-    pub(crate) fn factorize(
+    pub fn factorize(
         &self,
         matrix: &Array2<f64>,
     ) -> Result<crate::faer_ndarray::FaerSymmetricFactor, FaerLinalgError> {
@@ -209,7 +253,7 @@ impl<'a> StableSolver<'a> {
     /// Generic factorize accepting any 2-D ndarray storage (owned or view).
     /// Useful for hot loops that solve a contiguous subblock of a hoisted
     /// workspace buffer without reallocating an owned `Array2`.
-    pub(crate) fn factorize_any<S>(
+    pub fn factorize_any<S>(
         &self,
         matrix: &ArrayBase<S, ndarray::Ix2>,
     ) -> Result<crate::faer_ndarray::FaerSymmetricFactor, FaerLinalgError>
@@ -220,7 +264,7 @@ impl<'a> StableSolver<'a> {
         factorize_symmetricwith_fallback(view.as_ref(), Side::Lower)
     }
 
-    pub(crate) fn inversewith_regularization(&self, matrix: &Array2<f64>) -> Option<Array2<f64>> {
+    pub fn inversewith_regularization(&self, matrix: &Array2<f64>) -> Option<Array2<f64>> {
         let p = matrix.nrows();
         if p == 0 || matrix.ncols() != p {
             return None;
@@ -243,7 +287,7 @@ impl<'a> StableSolver<'a> {
         Some(inv)
     }
 
-    pub(crate) fn solvevectorwithridge_retries(
+    pub fn solvevectorwithridge_retries(
         &self,
         matrix: &Array2<f64>,
         rhs: &Array1<f64>,
@@ -317,7 +361,7 @@ impl<'a> StableSolver<'a> {
     /// threshold. For p ≲ a few hundred (joint Newton at large scale
     /// has p = 33) the eigendecomposition is sub-millisecond and saves
     /// the entire outer optimisation from rejecting ill-conditioned ρ.
-    pub(crate) fn solve_with_pseudoinverse_fallback(
+    pub fn solve_with_pseudoinverse_fallback(
         &self,
         matrix: &Array2<f64>,
         rhs: &Array1<f64>,
@@ -419,7 +463,7 @@ impl<'a> StableSolver<'a> {
     }
 }
 
-pub(crate) fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
+pub fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
     matrix
         .diag()
         .iter()
@@ -429,7 +473,7 @@ pub(crate) fn max_abs_diag(matrix: &Array2<f64>) -> f64 {
         .max(1.0)
 }
 
-pub(crate) fn row_mismatch_message(
+pub fn row_mismatch_message(
     y_len: usize,
     w_len: usize,
     x_rows: usize,
@@ -466,7 +510,7 @@ pub fn predict_gam_dimension_mismatch_message(
     None::<String>
 }
 
-pub(crate) fn add_relative_diag_ridge(matrix: &mut Array2<f64>, scale: f64, floor: f64) -> f64 {
+pub fn add_relative_diag_ridge(matrix: &mut Array2<f64>, scale: f64, floor: f64) -> f64 {
     let ridge = scale
         * matrix
             .diag()
@@ -480,7 +524,7 @@ pub(crate) fn add_relative_diag_ridge(matrix: &mut Array2<f64>, scale: f64, floo
     ridge
 }
 
-pub(crate) fn boundary_hit_indices(
+pub fn boundary_hit_indices(
     values: ArrayView1<'_, f64>,
     bound: f64,
     tolerance: f64,
@@ -506,7 +550,7 @@ pub(crate) fn boundary_hit_indices(
 /// zero and the ratio max/min becomes meaningless (it can be negative or
 /// infinite even when the matrix is well-scaled). When the spectrum sign is
 /// unknown, inspect inertia directly via [`symmetric_extremes`].
-pub(crate) fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
+pub fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
     matrix
         .eigh(Side::Lower)
         .ok()
@@ -525,7 +569,7 @@ pub(crate) fn symmetric_spectrum_condition_number(matrix: &Array2<f64>) -> f64 {
 /// Estimate min/max eigenvalues of a symmetric matrix via a short
 /// `eigh` call. Used by the inertia-aware stabilization rule below.
 /// Returns `None` if the eigensolver fails.
-pub(crate) fn symmetric_extremes(matrix: &Array2<f64>) -> Option<(f64, f64)> {
+pub fn symmetric_extremes(matrix: &Array2<f64>) -> Option<(f64, f64)> {
     let (evals, _) = matrix.eigh(Side::Lower).ok()?;
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
@@ -544,7 +588,7 @@ pub(crate) fn symmetric_extremes(matrix: &Array2<f64>) -> Option<(f64, f64)> {
     }
 }
 
-pub(crate) fn addridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
+pub fn addridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
     if ridge <= 0.0 {
         return matrix.clone();
     }
@@ -556,7 +600,7 @@ pub(crate) fn addridge(matrix: &Array2<f64>, ridge: f64) -> Array2<f64> {
     regularized
 }
 
-pub(crate) fn boundary_hit_step_fraction(
+pub fn boundary_hit_step_fraction(
     slack: f64,
     directional_slack_change: f64,
     current_step_limit: f64,
@@ -786,7 +830,7 @@ where
 }
 
 #[derive(Clone)]
-pub(crate) struct RidgePlanner {
+pub struct RidgePlanner {
     cond_estimate: Option<f64>,
     ridge: f64,
     attempts: usize,
@@ -794,7 +838,7 @@ pub(crate) struct RidgePlanner {
 }
 
 impl RidgePlanner {
-    pub(crate) fn new(matrix: &Array2<f64>) -> Self {
+    pub fn new(matrix: &Array2<f64>) -> Self {
         let scale = max_abs_diag(matrix);
         let min_step = scale * 1e-10;
         // Most Hessians factorize on the first attempt. Avoid an eager exact
@@ -813,7 +857,7 @@ impl RidgePlanner {
         }
     }
 
-    pub(crate) fn ridge(&self) -> f64 {
+    pub fn ridge(&self) -> f64 {
         self.ridge
     }
 
@@ -829,7 +873,7 @@ impl RidgePlanner {
             .filter(|c| c.is_finite() && *c > 0.0)
     }
 
-    pub(crate) fn bumpwith_matrix(&mut self, matrix: &Array2<f64>) {
+    pub fn bumpwith_matrix(&mut self, matrix: &Array2<f64>) {
         self.attempts += 1;
         let min_step = self.scale * 1e-10;
         let base = self.ridge.max(min_step);
@@ -891,7 +935,7 @@ impl RidgePlanner {
         self.ridge = next_ridge;
     }
 
-    pub(crate) fn attempts(&self) -> usize {
+    pub fn attempts(&self) -> usize {
         self.attempts
     }
 }
@@ -1101,12 +1145,14 @@ pub fn gaussian_weighted_ridge_batch(
 /// relative tolerance. Returns `(rank, pinv)`.
 pub fn block_penalty_rank_and_pinv(
     penalty: &Array2<f64>,
-) -> Result<(usize, Array2<f64>), EstimationError> {
-    let (eigs, vecs) = penalty.to_owned().eigh(Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned {
-            condition_number: f64::INFINITY,
-        }
-    })?;
+) -> Result<(usize, Array2<f64>), LinalgError> {
+    let (eigs, vecs) =
+        penalty
+            .to_owned()
+            .eigh(Side::Lower)
+            .map_err(|_| LinalgError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
     let max_abs = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
     let tol = (1.0e-10 * max_abs).max(1.0e-14);
     let mut rank = 0_usize;
@@ -1127,7 +1173,7 @@ pub fn block_penalty_rank_and_pinv(
 pub fn invert_spd_with_ridge(
     matrix: &Array2<f64>,
     ridge_rel: f64,
-) -> Result<Array2<f64>, EstimationError> {
+) -> Result<Array2<f64>, LinalgError> {
     let n = matrix.nrows();
     let eye = Array2::<f64>::eye(n);
     let scale = (0..n).map(|i| matrix[[i, i]].abs()).fold(1.0_f64, f64::max);
@@ -1143,7 +1189,7 @@ pub fn invert_spd_with_ridge(
             return Ok(chol.solve_mat(&eye));
         }
     }
-    Err(EstimationError::ModelIsIllConditioned {
+    Err(LinalgError::ModelIsIllConditioned {
         condition_number: f64::INFINITY,
     })
 }
@@ -1155,15 +1201,15 @@ pub fn solve_symmetric_vector_with_floor(
     matrix: &Array2<f64>,
     rhs: &Array1<f64>,
     ridge_rel: f64,
-) -> Result<Array1<f64>, EstimationError> {
+) -> Result<Array1<f64>, LinalgError> {
     let n = matrix.nrows();
     let mut sym = matrix.clone();
     symmetrize_in_place(&mut sym);
-    let (eigs, vecs) =
-        sym.eigh(Side::Lower)
-            .map_err(|_| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
+    let (eigs, vecs) = sym
+        .eigh(Side::Lower)
+        .map_err(|_| LinalgError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })?;
     let max_eig = eigs.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
     let floor = (ridge_rel * max_eig.max(1.0)).max(1.0e-12);
     let projected = vecs.t().dot(rhs);
@@ -1182,7 +1228,7 @@ pub fn solve_symmetric_vector_with_floor(
     if out.iter().all(|value| value.is_finite()) {
         Ok(out)
     } else {
-        Err(EstimationError::ModelIsIllConditioned {
+        Err(LinalgError::ModelIsIllConditioned {
             condition_number: f64::INFINITY,
         })
     }

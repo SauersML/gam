@@ -319,16 +319,18 @@ mod tests {
         assert!(back.survival_se.expect("se present")[0][0].is_infinite());
         assert!(back.eta_se.expect("eta_se present")[0].is_nan());
         assert_eq!(back.times.expect("times present"), vec![0.5, 1.0, 2.0]);
-        assert_eq!(back.columns.expect("columns present")["survival_prob"], vec![
-            1.0, 0.0
-        ]);
+        assert_eq!(
+            back.columns.expect("columns present")["survival_prob"],
+            vec![1.0, 0.0]
+        );
     }
 
     #[test]
     fn plain_numbers_and_missing_optional_fields_still_parse() {
         // Finite-only payloads keep the ordinary JSON-number wire form, and a
         // payload that omits the optional uncertainty fields parses to `None`.
-        let json = r#"{"cumulative_hazard":[[0.0,1.0]],"linear_predictor":[0.5],"columns":{"a":[1.0]}}"#;
+        let json =
+            r#"{"cumulative_hazard":[[0.0,1.0]],"linear_predictor":[0.5],"columns":{"a":[1.0]}}"#;
         let back: ConsumerProbe = serde_json::from_str(json).expect("plain numbers parse");
         assert_eq!(back.cumulative_hazard.unwrap(), vec![vec![0.0, 1.0]]);
         assert_eq!(back.linear_predictor.unwrap(), vec![0.5]);

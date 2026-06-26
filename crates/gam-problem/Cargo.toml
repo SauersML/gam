@@ -10,6 +10,7 @@ path = "src/lib.rs"
 
 [dependencies]
 faer = "0.24.0"
+gam-linalg = { path = "../gam-linalg" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
 

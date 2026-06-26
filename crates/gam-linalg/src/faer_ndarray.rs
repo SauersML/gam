@@ -14,6 +14,27 @@ use thiserror::Error;
 
 const RRQR_RANK_ALPHA: f64 = 100.0;
 
+thread_local! {
+    static NESTED_PARALLEL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct NestedParallelGuard;
+
+impl NestedParallelGuard {
+    #[inline]
+    fn enter() -> Self {
+        NESTED_PARALLEL_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Self
+    }
+}
+
+impl Drop for NestedParallelGuard {
+    #[inline]
+    fn drop(&mut self) {
+        NESTED_PARALLEL_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
 /// Run `body` with the current thread marked as inside a data-parallel row
 /// region, so any faer GEMM it issues (directly or transitively) pins to
 /// `Par::Seq` via [`effective_global_parallelism`] instead of re-fanning the
@@ -25,14 +46,17 @@ const RRQR_RANK_ALPHA: f64 = 100.0;
 /// performs GEMM, to prevent the Rayon-pool × faer-pool oversubscription.
 #[inline]
 pub fn with_nested_parallel<T>(body: impl FnOnce() -> T) -> T {
-    gam_problem::with_nested_parallel(body)
+    let guard = NestedParallelGuard::enter();
+    let out = body();
+    drop(guard);
+    out
 }
 
 /// `true` when the current thread is inside at least one [`NestedParallelGuard`]
 /// scope, i.e. a parallel row reduction is already in flight on this thread.
 #[inline]
 pub fn in_nested_parallel_region() -> bool {
-    gam_problem::in_nested_parallel_region()
+    NESTED_PARALLEL_DEPTH.with(|depth| depth.get() > 0)
 }
 
 /// faer parallelism policy that respects nested data-parallel regions: returns
@@ -74,7 +98,7 @@ pub enum FaerSymmetricFactor {
 }
 
 #[inline]
-pub(crate) fn cholesky_factor_logdet(factor: MatRef<'_, f64>) -> f64 {
+pub fn cholesky_factor_logdet(factor: MatRef<'_, f64>) -> f64 {
     2.0 * diagonal_log_sum(factor.diagonal())
 }
 
@@ -188,7 +212,7 @@ const fn should_use_faer_matmul(m: usize, n: usize, k: usize) -> bool {
 }
 
 #[inline]
-pub(crate) fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
+pub fn matmul_parallelism(m: usize, n: usize, k: usize) -> Par {
     // Prefer a work-based policy over per-dimension thresholds.
     // Tall/skinny products (e.g. N x p with large N, modest p) should still
     // parallelize when total work is high.
@@ -307,7 +331,9 @@ pub fn fast_atb<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_atb(a.view(), b.view()) {
+    if let Some(out) =
+        crate::gpu_hook::gpu_dispatch().and_then(|d| d.try_fast_atb(a.view(), b.view()))
+    {
         return out;
     }
     let (n_a, p) = a.dim();
@@ -399,7 +425,9 @@ pub fn fast_ab<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     b: &ArrayBase<S2, Ix2>,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_ab(a.view(), b.view()) {
+    if let Some(out) =
+        crate::gpu_hook::gpu_dispatch().and_then(|d| d.try_fast_ab(a.view(), b.view()))
+    {
         return out;
     }
     let n = a.nrows();
@@ -416,7 +444,9 @@ pub fn fast_av<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
-    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_av(a.view(), v.view()) {
+    if let Some(out) =
+        crate::gpu_hook::gpu_dispatch().and_then(|d| d.try_fast_av(a.view(), v.view()))
+    {
         return out;
     }
     fast_av_impl(a, v)
@@ -557,7 +587,9 @@ pub fn fast_atv<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
     a: &ArrayBase<S1, Ix2>,
     v: &ArrayBase<S2, Ix1>,
 ) -> Array1<f64> {
-    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_atv(a.view(), v.view()) {
+    if let Some(out) =
+        crate::gpu_hook::gpu_dispatch().and_then(|d| d.try_fast_atv(a.view(), v.view()))
+    {
         return out;
     }
     fast_atv_impl(a, v)
@@ -658,7 +690,9 @@ pub fn fast_xt_diag_x<S1: Data<Elem = f64>, S2: Data<Elem = f64>>(
         w.len(),
         "fast_xt_diag_x row/weight length mismatch"
     );
-    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_xt_diag_x(x.view(), w.view()) {
+    if let Some(out) =
+        crate::gpu_hook::gpu_dispatch().and_then(|d| d.try_fast_xt_diag_x(x.view(), w.view()))
+    {
         return out;
     }
     let p = x.ncols();
@@ -899,7 +933,8 @@ pub fn fast_xt_diag_y<S1: Data<Elem = f64>, S2: Data<Elem = f64>, S3: Data<Elem 
         w.len(),
         "fast_xt_diag_y row/weight length mismatch"
     );
-    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_xt_diag_y(x.view(), w.view(), y.view())
+    if let Some(out) = crate::gpu_hook::gpu_dispatch()
+        .and_then(|d| d.try_fast_xt_diag_y(x.view(), w.view(), y.view()))
     {
         return out;
     }
@@ -1016,13 +1051,15 @@ pub fn fast_joint_hessian_2x2<
     w_ab: &ArrayBase<S4, Ix1>,
     w_bb: &ArrayBase<S5, Ix1>,
 ) -> Array2<f64> {
-    if let Some(out) = crate::gpu::linalg_dispatch::try_fast_joint_hessian_2x2(
-        x_a.view(),
-        x_b.view(),
-        w_aa.view(),
-        w_ab.view(),
-        w_bb.view(),
-    ) {
+    if let Some(out) = crate::gpu_hook::gpu_dispatch().and_then(|d| {
+        d.try_fast_joint_hessian_2x2(
+            x_a.view(),
+            x_b.view(),
+            w_aa.view(),
+            w_ab.view(),
+            w_bb.view(),
+        )
+    }) {
         return out;
     }
     fast_joint_hessian_2x2_impl(x_a, x_b, w_aa, w_ab, w_bb)
@@ -1765,7 +1802,7 @@ pub const fn default_rrqr_rank_alpha() -> f64 {
 /// `column_permutation[j]` of `A`. With rank `r < min(m, n)`, the trailing
 /// `min(m, n) - r` entries of `column_permutation` name the columns that the
 /// pivoted QR demoted past the rank threshold — i.e., the columns identified
-/// as redundant. Identifiability auditors (`crate::identifiability::audit`)
+/// as redundant. Identifiability auditors (`identifiability::audit`)
 /// use that suffix to attribute `DroppedColumn` entries to specific original
 /// columns.
 pub struct RrqrWithPermutation {

@@ -1,5 +1,6 @@
 pub mod analytic_penalties;
 pub mod basis;
+pub(crate) mod chunked_kernel_design;
 pub mod construction;
 pub mod decoders;
 pub mod dictionary;

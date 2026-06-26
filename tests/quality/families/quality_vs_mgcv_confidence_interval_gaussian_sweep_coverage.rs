@@ -38,14 +38,14 @@
 //! apples-to-apples.
 
 use csv::StringRecord;
-use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    predict_gamwith_uncertainty,
-};
 use gam::smooth::build_term_collection_design;
 use gam::types::LikelihoodSpec;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
+use gam_predict::{
+    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
+    predict_gamwith_uncertainty,
 };
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;

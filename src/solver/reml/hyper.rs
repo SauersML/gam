@@ -1089,8 +1089,10 @@ impl<'a> RemlState<'a> {
         let rho = theta.slice(s![..rho_dim]).to_owned();
 
         if !hyper_dirs.is_empty() {
-            let requested_hessian =
-                matches!(order, crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian);
+            let requested_hessian = matches!(
+                order,
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
+            );
             // Firth pair Hessian terms are now available via Primitive A
             // (hphi_tau_tau_partial_apply) and Primitive B
             // (d_beta_hphi_tau_partial_apply); the policy no longer needs to
@@ -1125,7 +1127,9 @@ impl<'a> RemlState<'a> {
             } else {
                 order
             } {
-                crate::solver::rho_optimizer::OuterEvalOrder::Value => super::reml_outer_engine::EvalMode::ValueOnly,
+                crate::solver::rho_optimizer::OuterEvalOrder::Value => {
+                    super::reml_outer_engine::EvalMode::ValueOnly
+                }
                 crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient => {
                     super::reml_outer_engine::EvalMode::ValueAndGradient
                 }

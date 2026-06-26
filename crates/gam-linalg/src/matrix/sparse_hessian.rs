@@ -120,7 +120,7 @@ pub struct SparseHessianAccumulator {
     sym: Arc<SparseHessianSymbolic>,
     /// Values buffer, length `sym.nnz`. Crate-visible for reductions; callers
     /// must not resize it because unchecked accumulation relies on this invariant.
-    pub(crate) values: Vec<f64>,
+    pub values: Vec<f64>,
 }
 
 // Manual Clone: only the values buffer is duplicated; the symbolic pattern is

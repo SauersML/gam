@@ -1,9 +1,9 @@
 use gam::estimate::{FitOptions, fit_gam};
 use gam::pirls::update_glmvectors_by_family;
-use gam_predict::predict_gam;
 use gam::probability::normal_cdf;
 use gam::smooth::BlockwisePenalty;
 use gam::types::{GlmLikelihoodSpec, InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use gam_predict::predict_gam;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

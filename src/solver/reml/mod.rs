@@ -978,7 +978,10 @@ mod tests {
         // Trigger a full outer eval so execute_pirls_if_needed inserts at
         // least one entry into the cross-call PIRLS LRU.
         state
-            .compute_outer_eval_with_order(&rho, crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient)
+            .compute_outer_eval_with_order(
+                &rho,
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
+            )
             .expect("outer eval should succeed");
 
         let populated_len = state.cache_manager.pirls_cache.read().unwrap().map.len();
@@ -1357,7 +1360,10 @@ mod tests {
             "Firth logit should no longer disable analytic outer Hessian planning"
         );
         let outer = state
-            .compute_outer_eval_with_order(&rho, crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian)
+            .compute_outer_eval_with_order(
+                &rho,
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
+            )
             .expect("outer Hessian eval should succeed");
         assert!(
             outer.hessian.is_analytic(),
@@ -1415,7 +1421,10 @@ mod tests {
         .expect("state");
         let rho = array![0.15, -0.25];
         let eval = state
-            .compute_outer_eval_with_order(&rho, crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian)
+            .compute_outer_eval_with_order(
+                &rho,
+                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian,
+            )
             .expect("analytic Hessian eval");
         let h = match eval.hessian {
             HessianResult::Analytic(hessian) => hessian,
@@ -1430,11 +1439,17 @@ mod tests {
             rp[col] += delta;
             rm[col] -= delta;
             let gp = state
-                .compute_outer_eval_with_order(&rp, crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient)
+                .compute_outer_eval_with_order(
+                    &rp,
+                    crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
+                )
                 .expect("plus grad")
                 .gradient;
             let gm = state
-                .compute_outer_eval_with_order(&rm, crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient)
+                .compute_outer_eval_with_order(
+                    &rm,
+                    crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
+                )
                 .expect("minus grad")
                 .gradient;
             for row in 0..rho.len() {

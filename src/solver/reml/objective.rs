@@ -2904,8 +2904,10 @@ impl<'a> RemlState<'a> {
         &self,
         p: &Array1<f64>,
     ) -> Result<(f64, Array1<f64>), EstimationError> {
-        let eval =
-            self.compute_outer_eval_with_order(p, crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient)?;
+        let eval = self.compute_outer_eval_with_order(
+            p,
+            crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient,
+        )?;
         Ok((eval.cost, eval.gradient))
     }
 
@@ -2917,8 +2919,10 @@ impl<'a> RemlState<'a> {
         self.arena
             .lastgradient_used_stochastic_fallback
             .store(false, Ordering::Relaxed);
-        let allow_second_order = matches!(order, crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian)
-            && self.analytic_outer_hessian_enabled();
+        let allow_second_order = matches!(
+            order,
+            crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
+        ) && self.analytic_outer_hessian_enabled();
         let t_eval_start = std::time::Instant::now();
         {
             let prefix: Vec<String> = p.iter().take(4).map(|v| format!("{:.3}", v)).collect();
@@ -3018,9 +3022,8 @@ impl<'a> RemlState<'a> {
             // Value+gradient: this evaluator's assembly contract requires a
             // gradient (see the `result.gradient` demand below), so fulfil it as
             // value+gradient with the Hessian skipped.
-            crate::solver::rho_optimizer::OuterEvalOrder::Value | crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient => {
-                None
-            }
+            crate::solver::rho_optimizer::OuterEvalOrder::Value
+            | crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient => None,
             crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian => {
                 if allow_second_order {
                     Some(self.selecthessian_strategy_policy(&bundle))

@@ -326,11 +326,7 @@ impl OuterEval {
         }
     }
 
-    pub fn value_only(
-        cost: f64,
-        n_params: usize,
-        inner_beta_hint: Option<Array1<f64>>,
-    ) -> Self {
+    pub fn value_only(cost: f64, n_params: usize, inner_beta_hint: Option<Array1<f64>>) -> Self {
         Self {
             cost,
             gradient: Array1::zeros(n_params),

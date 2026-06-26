@@ -27,12 +27,12 @@
 
 use gam::estimate::{FitOptions, fit_gam};
 use gam::matrix::DesignMatrix;
+use gam::smooth::BlockwisePenalty;
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam_predict::{
     ConformalCalibrationFold, PredictInput, PredictUncertaintyOptions, StandardPredictor,
     predict_full_uncertainty_conformal,
 };
-use gam::smooth::BlockwisePenalty;
-use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;

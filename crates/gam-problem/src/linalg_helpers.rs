@@ -2,43 +2,9 @@ use faer::{MatRef, Par, get_global_parallelism};
 use ndarray::{Array2, ArrayBase, ArrayView1, ArrayViewMut1, Data, Ix2};
 use std::marker::PhantomData;
 
-thread_local! {
-    static NESTED_PARALLEL_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-struct NestedParallelGuard;
-
-impl NestedParallelGuard {
-    #[inline]
-    fn enter() -> Self {
-        NESTED_PARALLEL_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
-        Self
-    }
-}
-
-impl Drop for NestedParallelGuard {
-    #[inline]
-    fn drop(&mut self) {
-        NESTED_PARALLEL_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
-    }
-}
-
-#[inline]
-pub fn with_nested_parallel<T>(body: impl FnOnce() -> T) -> T {
-    let guard = NestedParallelGuard::enter();
-    let out = body();
-    drop(guard);
-    out
-}
-
-#[inline]
-pub fn in_nested_parallel_region() -> bool {
-    NESTED_PARALLEL_DEPTH.with(|depth| depth.get() > 0)
-}
-
 #[inline]
 pub(crate) fn effective_global_parallelism() -> Par {
-    if in_nested_parallel_region() {
+    if gam_linalg::faer_ndarray::in_nested_parallel_region() {
         Par::Seq
     } else {
         get_global_parallelism()

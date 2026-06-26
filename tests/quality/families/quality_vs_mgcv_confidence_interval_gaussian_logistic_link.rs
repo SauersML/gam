@@ -60,16 +60,16 @@
 //! weakened to force a pass: a genuinely mis-calibrated band failing here is a
 //! real bug.
 
-use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    predict_gamwith_uncertainty,
-};
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, run_r};
 use gam::types::LikelihoodSpec;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
+use gam_predict::{
+    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
+    predict_gamwith_uncertainty,
 };
 use ndarray::{Array1, Array2};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};

@@ -1,7 +1,7 @@
 use faer::Side;
 use ndarray::{Array1, Array2};
 
-use crate::linalg::faer_ndarray::FaerEigh;
+use crate::faer_ndarray::FaerEigh;
 
 #[derive(Debug, Clone, Copy)]
 pub struct SymmetricLanczosOptions {

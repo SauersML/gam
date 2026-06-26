@@ -1,11 +1,11 @@
-use gam_predict::linalg::PredictionCovarianceBackend;
 use gam::matrix::SymmetricMatrix;
+use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use gam_predict::linalg::PredictionCovarianceBackend;
 use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictPosteriorMeanResult,
     PredictUncertaintyOptions, enrich_posterior_mean_bounds,
     predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
-use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use ndarray::{Array1, Array2, array};
 
 fn like(response: ResponseFamily, link: StandardLink) -> LikelihoodSpec {

@@ -1,0 +1,20 @@
+[package]
+name = "gam-linalg"
+version = "0.3.123"
+edition = "2024"
+rust-version = "1.93"
+
+[lints.rust]
+warnings = "deny"
+
+[dependencies]
+dyn-stack = "0.13.2"
+faer = "0.24.0"
+gam-runtime = { path = "../gam-runtime" }
+log = "0.4.29"
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+num-traits = "0.2"
+rayon = "1.12.0"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+wide = "0.7"

@@ -81,13 +81,13 @@ impl SymmetricMatrix {
     pub fn factorize(&self) -> Result<Box<dyn FactorizedSystem>, String> {
         match self {
             Self::Dense(mat) => {
-                let factor = crate::linalg::utils::StableSolver::new("unnamed")
+                let factor = crate::utils::StableSolver::new("unnamed")
                     .factorize(mat)
                     .map_err(|e| format!("Dense SymmetricMatrix factorization failed: {e:?}"))?;
                 Ok(Box::new(factor))
             }
             Self::Sparse(mat) => {
-                let factor = crate::linalg::sparse_exact::factorize_sparse_spd(mat)
+                let factor = crate::sparse_exact::factorize_sparse_spd(mat)
                     .map_err(|e| format!("Sparse SymmetricMatrix factorization failed: {e:?}"))?;
                 Ok(Box::new(factor))
             }
@@ -120,7 +120,7 @@ impl SymmetricMatrix {
         }
     }
 
-    pub(crate) fn add_dense(&self, other: &Array2<f64>) -> Result<Self, String> {
+    pub fn add_dense(&self, other: &Array2<f64>) -> Result<Self, String> {
         if self.nrows() != other.nrows() || self.ncols() != other.ncols() {
             return Err(format!(
                 "SymmetricMatrix::add_dense shape mismatch: lhs {}x{}, rhs {}x{}",
@@ -137,9 +137,8 @@ impl SymmetricMatrix {
                 Ok(Self::Dense(out))
             }
             Self::Sparse(mat) => {
-                let other_sparse =
-                    crate::linalg::sparse_exact::dense_to_sparse_symmetric_upper(other, 0.0)
-                        .map_err(|e| format!("SymmetricMatrix::add_dense failed: {e}"))?;
+                let other_sparse = crate::sparse_exact::dense_to_sparse_symmetric_upper(other, 0.0)
+                    .map_err(|e| format!("SymmetricMatrix::add_dense failed: {e}"))?;
                 Ok(Self::Sparse(add_sparse_symmetric_upper(
                     mat,
                     &other_sparse,

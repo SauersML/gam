@@ -70,7 +70,6 @@ pub(crate) const ACTIVE_SET_KKT_DEGENERATE_STATIONARITY_TOL: f64 = 1e-3;
 /// descent direction even if the KKT residual has not yet tightened.
 const ACTIVE_SET_MODEL_DESCENT_REL_TOL: f64 = 1e-10;
 
-
 /// KKT diagnostics for inequality-constrained Newton subproblems.
 ///
 /// Constraints are represented as `A * beta >= b` in the same coefficient

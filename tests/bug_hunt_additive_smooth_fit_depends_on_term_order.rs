@@ -38,10 +38,10 @@
 //! ~10 %) and turns GREEN once additive REML is made term-order invariant.
 
 use csv::StringRecord;
-use gam_predict::predict_gam;
 use gam::smooth::build_term_collection_design;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
+use gam_predict::predict_gam;
 use ndarray::{Array1, Array2};
 
 /// Deterministic SplitMix64 — no Python, no external RNG crate.

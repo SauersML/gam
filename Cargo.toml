@@ -38,6 +38,7 @@ members = [
     "crates/gam-data",
     "crates/gam-spec",
     "crates/gam-inference",
+    "crates/gam-linalg",
     "crates/gam-cli",
     "crates/gam-math",
     "crates/gam-predict",
@@ -81,6 +82,7 @@ gam-math = { path = "crates/gam-math" }
 gam-problem = { path = "crates/gam-problem" }
 gam-spec = { path = "crates/gam-spec" }
 gam-runtime = { path = "crates/gam-runtime" }
+gam-linalg = { path = "crates/gam-linalg" }
 pest = "2.8.6"
 pest_derive = "2.8.6"
 arrow = { version = "54", default-features = false, features = ["ffi"] }

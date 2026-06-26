@@ -93,6 +93,9 @@ const RAYON_WORKER_STACK_SIZE: usize = 64 << 20;
 pub fn init_parallelism() {
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
+        gam_linalg::gpu_hook::register_gpu_dispatch(Box::new(
+            crate::gpu::linalg_dispatch::CudaGemmDispatch,
+        ));
         // Ignore the error returned when the global pool was already built by
         // an earlier caller: we cannot resize an existing pool, and the only
         // path that strictly needs the wide stack (the CLI) reaches this first.
@@ -105,13 +108,22 @@ pub fn init_parallelism() {
     });
 }
 
+#[cfg(test)]
+mod gpu_dispatch_registration_tests {
+    #[test]
+    fn init_parallelism_registers_gpu_dispatch_hook() {
+        crate::init_parallelism();
+        assert!(gam_linalg::gpu_hook::gpu_dispatch().is_some());
+    }
+}
+
 pub mod config_resolve;
 pub mod families;
 pub mod geometry;
 pub mod gpu;
 pub mod identifiability;
 pub mod inference;
-pub mod linalg;
+pub use gam_linalg as linalg;
 pub mod model_types;
 /// Lower-layer outer-iteration row-subsampling/chunking primitives (RowSet,
 /// ARROW_ROW_CHUNK). Hosted at the crate root so `families` can name them
@@ -152,8 +164,8 @@ pub use inference::{
 // run_nuts_sampling_flattened_family, ...) are still consumed as `gam::hmc::*`
 // by the sampling integration tests and downstream callers, so keep that path
 // stable by re-exporting the renamed module under its old name.
+pub use gam_linalg::{faer_ndarray, matrix, utils};
 pub use inference::hmc_io as hmc;
-pub use linalg::{faer_ndarray, matrix, utils};
 // #931-#935 criterion calculus: the profiled-criterion abstraction
 // (CriterionAtom / CriterionSum / Sensitivity) that kills the objective↔gradient
 // desync class. Exposed as the staged public criterion-calculus interface it is

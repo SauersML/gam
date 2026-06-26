@@ -30,21 +30,21 @@ use ndarray::{Array1, ArrayView1, ArrayViewMut1, Zip};
 /// Floor on the requested PCG relative tolerance. Asking for convergence tighter
 /// than this is below the achievable accuracy of the SPD energy minimization in
 /// `f64`, so we clamp the target to avoid iterating on numerical noise.
-pub(crate) const PCG_REL_TOL_FLOOR: f64 = 1e-12;
+pub const PCG_REL_TOL_FLOOR: f64 = 1e-12;
 
 /// Floor applied to each positive preconditioner diagonal entry before
 /// reciprocation. Exactly-zero entries are rejected as non-positive rather than
 /// being treated as numerical noise.
-pub(crate) const PCG_PRECONDITIONER_FLOOR: f64 = 1e-12;
+pub const PCG_PRECONDITIONER_FLOOR: f64 = 1e-12;
 
 /// Per-iteration trace of the PCG recurrence, sufficient to reconstruct the
 /// Lanczos tridiagonal and hence Ritz-based condition estimates. Populated only
 /// when the caller requests diagnostics.
 #[derive(Debug, Clone)]
-pub(crate) struct PcgDiagnostics {
-    pub(crate) residuals: Vec<f64>,
-    pub(crate) alpha: Vec<f64>,
-    pub(crate) beta: Vec<f64>,
+pub struct PcgDiagnostics {
+    pub residuals: Vec<f64>,
+    pub alpha: Vec<f64>,
+    pub beta: Vec<f64>,
 }
 
 impl PcgDiagnostics {
@@ -67,7 +67,7 @@ impl PcgDiagnostics {
 
 /// Why the core stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PcgStop {
+pub enum PcgStop {
     /// `‖r‖ ≤ tol`; the recorded iterate is the converged solution.
     Converged,
     /// Hit `max_iters` without reaching tolerance.
@@ -86,12 +86,12 @@ pub(crate) enum PcgStop {
 /// Result of a [`pcg_core`] run. The solution is written into the caller's
 /// buffer; this carries the metadata about how the run terminated.
 #[derive(Debug, Clone)]
-pub(crate) struct PcgCoreResult {
-    pub(crate) stop: PcgStop,
-    pub(crate) iterations: usize,
-    pub(crate) rhs_norm: f64,
-    pub(crate) final_residual_norm: f64,
-    pub(crate) diagnostics: Option<PcgDiagnostics>,
+pub struct PcgCoreResult {
+    pub stop: PcgStop,
+    pub iterations: usize,
+    pub rhs_norm: f64,
+    pub final_residual_norm: f64,
+    pub diagnostics: Option<PcgDiagnostics>,
 }
 
 /// How the PCG inner products `rᵀz` and `pᵀAp` are accumulated.
@@ -101,7 +101,7 @@ pub(crate) struct PcgCoreResult {
 /// may ignore: it selects between two numerically distinct reductions, and the
 /// caller is responsible for picking the one its contract allows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum DotReduction {
+pub enum DotReduction {
     /// Strict left-to-right sequential fold. Bit-identical regardless of host
     /// thread count or SIMD width — this is what lets the GPU wrapper reproduce
     /// the byte-for-byte iterates of the old serial `cg_solve`, and what the
@@ -207,7 +207,7 @@ fn dot(a: &ArrayView1<f64>, b: &ArrayView1<f64>, reduction: DotReduction) -> f64
 /// length as `rhs`). On [`PcgStop::Converged`]/[`PcgStop::MaxIters`]/
 /// [`PcgStop::Breakdown`] it holds the last valid iterate; on
 /// [`PcgStop::BadPreconditioner`] it is left as the zero initial guess.
-pub(crate) fn pcg_core<F>(
+pub fn pcg_core<F>(
     mut apply: F,
     rhs: &ArrayView1<f64>,
     precond_diag: &ArrayView1<f64>,

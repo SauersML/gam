@@ -36,7 +36,7 @@ const RANK_DEFICIENT_PIVOT_FLOOR: f64 = 1e-14;
 /// pathological inputs; this enum names those two policies exactly so callers
 /// keep their original behavior while sharing one factorization kernel.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CholeskyGuard {
+pub enum CholeskyGuard {
     /// Read the matrix as-is: no up-front scan of the input entries, and a pivot
     /// is rejected only when the accumulated diagonal value is `<= 0.0`. A
     /// non-finite (`NaN`/`+inf`) diagonal accumulator is *not* rejected here
@@ -56,7 +56,7 @@ pub(crate) enum CholeskyGuard {
 /// Only the on-and-below-diagonal entries of `a` are read. Returns `None` when
 /// `a` is not square, when [`CholeskyGuard::FiniteStrict`] is requested and `a`
 /// contains a non-finite entry, or when a pivot is rejected by the guard.
-pub(crate) fn cholesky_factor_in_place(
+pub fn cholesky_factor_in_place(
     a: ArrayView2<'_, f64>,
     guard: CholeskyGuard,
 ) -> Option<Array2<f64>> {
@@ -127,7 +127,7 @@ fn back_kernel(l: ArrayView2<'_, f64>, y: ArrayView1<'_, f64>) -> Array1<f64> {
 
 /// Solve the upper-triangular system `Lᵀ x = y` by back substitution, where `L`
 /// is supplied as the lower-triangular factor.
-pub(crate) fn back_substitution_lower_transpose<'l, 'y>(
+pub fn back_substitution_lower_transpose<'l, 'y>(
     l: impl Into<ArrayView2<'l, f64>>,
     y: impl Into<ArrayView1<'y, f64>>,
 ) -> Array1<f64> {
@@ -175,7 +175,7 @@ pub fn back_substitution_lower_transpose_guarded_into(
 }
 
 /// Solve `A x = b` where `A = L Lᵀ` and `L` is the lower Cholesky factor.
-pub(crate) fn cholesky_solve_vector<'l, 'b>(
+pub fn cholesky_solve_vector<'l, 'b>(
     l: impl Into<ArrayView2<'l, f64>>,
     b: impl Into<ArrayView1<'b, f64>>,
 ) -> Array1<f64> {
@@ -186,7 +186,7 @@ pub(crate) fn cholesky_solve_vector<'l, 'b>(
 
 /// Solve `A X = B` (multiple right-hand sides) where `A = L Lᵀ`, column by
 /// column.
-pub(crate) fn cholesky_solve_matrix<'l, 'b>(
+pub fn cholesky_solve_matrix<'l, 'b>(
     l: impl Into<ArrayView2<'l, f64>>,
     b: impl Into<ArrayView2<'b, f64>>,
 ) -> Array2<f64> {
@@ -205,7 +205,7 @@ pub(crate) fn cholesky_solve_matrix<'l, 'b>(
 
 /// Solve the lower-triangular system `L Y = B` (multiple right-hand sides) for
 /// `Y`, column by column — forward substitution only, no back solve.
-pub(crate) fn forward_substitution_lower_matrix<'l, 'b>(
+pub fn forward_substitution_lower_matrix<'l, 'b>(
     l: impl Into<ArrayView2<'l, f64>>,
     b: impl Into<ArrayView2<'b, f64>>,
 ) -> Array2<f64> {

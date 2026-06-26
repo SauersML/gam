@@ -954,7 +954,10 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         order: crate::solver::rho_optimizer::OuterEvalOrder,
         design_revision: Option<u64>,
     ) -> Result<(f64, Array1<f64>, gam_problem::HessianResult), EstimationError> {
-        let order = if matches!(order, crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian) {
+        let order = if matches!(
+            order,
+            crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
+        ) {
             // Firth pair Hessian terms are now available via Primitive A +
             // Primitive B in the reduced Firth dense operator; the tau-tau
             // policy no longer needs the Firth+Logit gap downgrade.

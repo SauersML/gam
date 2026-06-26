@@ -1,10 +1,22 @@
-//! Spatial-kernel design operators, split out of `matrix/mod.rs` by
-//! concern (#1145). Re-exported from `matrix` so the public paths
-//! `crate::matrix::{SpatialKernelEvaluator, ChunkedKernelDesignOperator}`
-//! stay stable.
+//! Spatial-kernel design operators for basis construction.
 
-use super::*;
 use crate::solver::gauge::Gauge;
+use faer::Accum;
+use faer::Par;
+use faer::linalg::matmul::matmul;
+use gam_linalg::faer_ndarray::{
+    CrossprodAccum, CrossprodStructure, FaerArrayView, array2_to_matmut,
+    effective_global_parallelism, fast_atv, fast_av, stream_weighted_crossprod_into,
+};
+use gam_linalg::matrix::{DenseDesignOperator, LinearOperator};
+use gam_runtime::resource::MatrixMaterializationError;
+use ndarray::{Array1, Array2, ArrayViewMut2, s};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::slice::ParallelSliceMut;
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
+
+const KERNEL_OPERATOR_ROW_CHUNK_SIZE: usize = 2048;
 
 pub trait SpatialKernelEvaluator: Send + Sync + 'static {
     fn eval(&self, x: &[f64], c: &[f64]) -> f64;
@@ -380,5 +392,100 @@ impl<K: SpatialKernelEvaluator> DenseDesignOperator for ChunkedKernelDesignOpera
             return combined.clone();
         }
         self.row_chunk_combined(0..self.n)
+    }
+}
+
+#[cfg(test)]
+mod chunked_kernel_operator_tests {
+    use super::*;
+    use gam_linalg::matrix::DenseDesignMatrix;
+    use ndarray::{Array1, Array2, array};
+    use std::sync::Arc;
+    #[test]
+    fn chunked_kernel_operator_uses_center_rows_for_column_count() {
+        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]]);
+        let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]]);
+        let kernel =
+            |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
+        let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
+            .expect("chunked kernel operator");
+
+        assert_eq!(operator.ncols(), 3);
+        let chunk = operator.row_chunk_combined(0..2);
+        assert_eq!(chunk.dim(), (2, 3));
+    }
+
+    #[test]
+    fn chunked_kernel_operator_rejects_incompatible_optional_shapes() {
+        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]]);
+        let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]]);
+        let kernel = |_: &[f64], _: &[f64]| 0.0;
+        let bad_gauge = Arc::new(crate::solver::gauge::Gauge::from_block_transforms(&[
+            Array2::<f64>::zeros((2, 1)),
+        ]));
+        let bad_poly = Arc::new(Array2::<f64>::zeros((3, 1)));
+
+        let gauge_err = match ChunkedKernelDesignOperator::new(
+            data.clone(),
+            centers.clone(),
+            kernel,
+            Some(bad_gauge),
+            None,
+        ) {
+            // SAFETY: test asserting validation rejects mismatched gauge raw width; Ok means the validator regressed.
+            Ok(_) => panic!("gauge raw width should match centers rows"),
+            Err(err) => err,
+        };
+        assert!(gauge_err.contains("kernel gauge raw width 2 != centers rows 3"));
+
+        let poly_err =
+            match ChunkedKernelDesignOperator::new(data, centers, kernel, None, Some(bad_poly)) {
+                // SAFETY: test asserting validation rejects mismatched poly rows; Ok means the validator regressed.
+                Ok(_) => panic!("poly rows should match data rows"),
+                Err(err) => err,
+            };
+        assert!(poly_err.contains("poly_basis rows 3 != data rows 2"));
+    }
+
+    #[test]
+    fn chunked_kernel_operator_canonicalizes_non_contiguous_inputs() {
+        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5]].reversed_axes());
+        let centers = Arc::new(array![[0.0, 1.0, 2.0], [0.0, 1.0, -1.0]].reversed_axes());
+        assert!(!data.is_standard_layout());
+        assert!(!centers.is_standard_layout());
+
+        let kernel =
+            |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
+        let operator = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
+            .expect("chunked kernel operator");
+        let chunk = operator.row_chunk_combined(0..2);
+
+        assert_eq!(chunk.dim(), (2, 3));
+        assert_eq!(chunk[[0, 0]], 0.0);
+        assert_eq!(chunk[[1, 1]], 1.5);
+    }
+    #[test]
+    fn chunked_kernel_operator_exposes_cached_dense_to_block_dispatch() {
+        let data = Arc::new(array![[0.0, 1.0], [1.0, 0.5], [2.0, -1.0]]);
+        let centers = Arc::new(array![[0.0, 0.0], [1.0, 1.0]]);
+        let kernel =
+            |x: &[f64], c: &[f64]| x.iter().zip(c.iter()).map(|(xi, ci)| xi * ci).sum::<f64>();
+        let op = ChunkedKernelDesignOperator::new(data, centers, kernel, None, None)
+            .expect("chunked kernel operator");
+        let expected = op.to_dense();
+
+        let dense_design = DenseDesignMatrix::from(Arc::new(op));
+
+        let probe = Array1::from_elem(3, 1.0);
+        let warmed = dense_design.apply_transpose(&probe);
+        assert_eq!(warmed.len(), expected.ncols());
+
+        let dense_ref = dense_design
+            .as_dense_ref()
+            .expect("DenseDesignMatrix::as_dense_ref must reach the cached kernel block");
+        assert_eq!(dense_ref.dim(), expected.dim());
+        for ((r, c), v) in expected.indexed_iter() {
+            assert!((dense_ref[[r, c]] - v).abs() < 1e-12);
+        }
     }
 }

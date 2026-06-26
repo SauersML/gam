@@ -38,15 +38,15 @@
 //! rho-marginalized `Vp` whenever the fitted smooth exposes that correction.
 
 use csv::StringRecord;
-use gam_predict::{
-    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
-    predict_gamwith_uncertainty,
-};
 use gam::smooth::build_term_collection_design;
 use gam::test_support::reference::{Column, relative_l2, run_r};
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
+use gam_predict::{
+    InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
+    predict_gamwith_uncertainty,
 };
 use ndarray::Array1;
 use rand::SeedableRng;

@@ -41,7 +41,7 @@ fn decode_multi_index(mut flat: usize, dims: &[usize], out: &mut [usize]) {
     }
 }
 
-pub(crate) fn upper_triangle_pair_from_index(pair_idx: usize, n: usize) -> (usize, usize) {
+pub fn upper_triangle_pair_from_index(pair_idx: usize, n: usize) -> (usize, usize) {
     let span = 2 * n + 1;
     let discriminant = span * span - 8 * pair_idx;
     let row = ((span as f64 - (discriminant as f64).sqrt()) * 0.5) as usize;

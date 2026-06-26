@@ -3560,7 +3560,10 @@ mod tests {
         let (cum, hazard) = royston_parmar_survival_hazard_components(eta, 0.0)
             .expect("zero derivative is a valid flat boundary, not an error");
         assert!((cum - eta.exp()).abs() <= 1e-12, "cum = Λ(t) = exp(η)");
-        assert_eq!(hazard, 0.0, "flat cumulative hazard ⇒ zero instantaneous hazard");
+        assert_eq!(
+            hazard, 0.0,
+            "flat cumulative hazard ⇒ zero instantaneous hazard"
+        );
         // Survival is finite and well-defined at the boundary.
         let survival = (-cum).exp().clamp(0.0, 1.0);
         assert!(survival.is_finite() && (0.0..=1.0).contains(&survival));
@@ -3574,7 +3577,10 @@ mod tests {
         // and (b) serialize to JSON `null` and break the Python parse (#1564,
         // bug 1). The hazard must resolve to the mathematically correct `0`.
         let eta = 1000.0_f64;
-        assert!(eta.exp().is_infinite(), "test premise: exp(1000) overflows to +∞");
+        assert!(
+            eta.exp().is_infinite(),
+            "test premise: exp(1000) overflows to +∞"
+        );
         assert!(
             (f64::INFINITY * 0.0).is_nan(),
             "test premise: the naive product is NaN"
@@ -3725,12 +3731,13 @@ mod tests {
         let g = KaplanMeier::fit_censoring(&time, &event);
         let bs = ipcw_brier_score(&s_pred, &time, &event, tau, |t| g.at(t)).unwrap();
         // targets: dead→0 (subj1,4), alive→1 (subj2,3).
-        let expected = (0.3f64.powi(2)
-            + (1.0 - 0.7f64).powi(2)
-            + (1.0 - 0.6f64).powi(2)
-            + 0.2f64.powi(2))
-            / 4.0;
-        assert!((bs - expected).abs() <= 1e-12, "bs={bs} expected={expected}");
+        let expected =
+            (0.3f64.powi(2) + (1.0 - 0.7f64).powi(2) + (1.0 - 0.6f64).powi(2) + 0.2f64.powi(2))
+                / 4.0;
+        assert!(
+            (bs - expected).abs() <= 1e-12,
+            "bs={bs} expected={expected}"
+        );
     }
 
     #[test]
@@ -3749,7 +3756,10 @@ mod tests {
         // subj3 alive: weight 1/G(5)=1.5, contrib 1.5·0.3²=0.135.
         // subj4 alive: weight 1/G(5)=1.5, contrib 1.5·0.2²=0.06.
         let expected = (0.16 + 0.0 + 0.135 + 0.06) / 4.0;
-        assert!((bs - expected).abs() <= 1e-12, "bs={bs} expected={expected}");
+        assert!(
+            (bs - expected).abs() <= 1e-12,
+            "bs={bs} expected={expected}"
+        );
     }
 
     #[test]
@@ -3763,7 +3773,10 @@ mod tests {
         // Only subj1 (dead, contrib 0.3²) and subj2 (alive, contrib 0.3²) count;
         // censoring KM has no censorings so G≡1.
         let expected = (0.3f64.powi(2) + (1.0 - 0.7f64).powi(2)) / 2.0;
-        assert!((bs - expected).abs() <= 1e-12, "bs={bs} expected={expected}");
+        assert!(
+            (bs - expected).abs() <= 1e-12,
+            "bs={bs} expected={expected}"
+        );
     }
 
     #[test]
@@ -3790,8 +3803,10 @@ mod tests {
         // direct trapezoid as the oracle.
         let mut oracle_pts = Vec::new();
         for k in 0..grid.len() {
-            oracle_pts
-                .push((grid[k], ipcw_brier_score(&col, &time, &event, grid[k], |t| g.at(t)).unwrap()));
+            oracle_pts.push((
+                grid[k],
+                ipcw_brier_score(&col, &time, &event, grid[k], |t| g.at(t)).unwrap(),
+            ));
         }
         let mut integral = 0.0;
         for w in oracle_pts.windows(2) {
@@ -3799,8 +3814,10 @@ mod tests {
         }
         let oracle = integral / (grid[grid.len() - 1] - grid[0]);
         let ibs =
-            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, f64::INFINITY, |t| g.at(t))
-                .unwrap();
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, f64::INFINITY, |t| {
+                g.at(t)
+            })
+            .unwrap();
         assert!((ibs - oracle).abs() <= 1e-12, "ibs={ibs} oracle={oracle}");
         // Sanity: per-time value is in a sensible [0,1]-ish range.
         assert!(per_time >= 0.0);
@@ -3821,7 +3838,8 @@ mod tests {
         let g = KaplanMeier::fit_censoring(&time, &event);
         // Horizon 5 drops the extrapolation point at t=100: integral runs [0,4].
         let restricted =
-            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, 5.0, |t| g.at(t)).unwrap();
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, 5.0, |t| g.at(t))
+                .unwrap();
         let full =
             integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, f64::INFINITY, |t| {
                 g.at(t)
@@ -3844,8 +3862,9 @@ mod tests {
         // Non-increasing grid.
         let bad = [0.0, 2.0, 1.0];
         assert!(
-            integrated_ipcw_brier_score(surv.view(), &time, &event, &bad, f64::INFINITY, |t| g.at(t))
-                .is_none()
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &bad, f64::INFINITY, |t| g
+                .at(t))
+            .is_none()
         );
         // Grid width mismatched to the survival matrix.
         let short = [0.0, 1.0];

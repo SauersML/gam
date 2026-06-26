@@ -6,9 +6,9 @@ use crate::faer_ndarray::{
 use crate::linalg::utils::KahanSum;
 
 use crate::matrix::{
-    ChunkedKernelDesignOperator, CoefficientTransformOperator, DenseDesignOperator, DesignMatrix,
-    LinearOperator,
+    CoefficientTransformOperator, DenseDesignOperator, DesignMatrix, LinearOperator,
 };
+use crate::terms::chunked_kernel_design::ChunkedKernelDesignOperator;
 
 use crate::probability::{
     binomial_coefficient_f64 as binomial_f64,

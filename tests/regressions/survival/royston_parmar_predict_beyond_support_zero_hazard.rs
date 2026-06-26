@@ -152,7 +152,8 @@ fn royston_parmar_saved_predict_at_grid_top_does_not_fail() {
         let cum: Vec<f64> = result.cumulative_hazard.row(r).to_vec();
 
         assert!(
-            surv.iter().all(|s| s.is_finite() && (0.0..=1.0).contains(s)),
+            surv.iter()
+                .all(|s| s.is_finite() && (0.0..=1.0).contains(s)),
             "survival must be finite and in [0,1]: {surv:?}"
         );
         assert!(

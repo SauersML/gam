@@ -26,14 +26,14 @@
 //! symmetric band undershoots the Gamma upper quantile, ~0.052 measured).
 
 use gam::estimate::BlockRole;
-use gam_predict::{
-    DispersionLocationScalePredictor, InferenceCovarianceMode, PredictInput,
-    PredictUncertaintyOptions, PredictableModel,
-};
 use gam::smooth::build_term_collection_design;
 use gam::{
     DispersionLocationScaleFitResult, FitConfig, FitResult, encode_recordswith_inferred_schema,
     fit_from_formula, init_parallelism,
+};
+use gam_predict::{
+    DispersionLocationScalePredictor, InferenceCovarianceMode, PredictInput,
+    PredictUncertaintyOptions, PredictableModel,
 };
 use ndarray::{Array1, Array2};
 

@@ -3,8 +3,8 @@ use gam::generative::{
 };
 use gam::hmc::NutsResult;
 use gam::polya_gamma::PolyaGamma;
-use gam_predict::PredictResult;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use gam_predict::PredictResult;
 use ndarray::{Array1, Array2, Axis};
 use rand::{SeedableRng, rngs::StdRng};
 

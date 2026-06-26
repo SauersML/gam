@@ -35,13 +35,13 @@
 use gam::estimate::BlockRole;
 use gam::gamlss::DispersionFamilyKind;
 use gam::generative::NoiseModel;
-use gam_predict::{DispersionLocationScalePredictor, PredictInput, PredictableModel};
 use gam::smooth::build_term_collection_design;
 use gam::types::LikelihoodSpec;
 use gam::{
     DispersionLocationScaleFitResult, FitConfig, FitResult, encode_recordswith_inferred_schema,
     fit_from_formula, init_parallelism,
 };
+use gam_predict::{DispersionLocationScalePredictor, PredictInput, PredictableModel};
 use ndarray::{Array1, Array2};
 
 /// Deterministic seeded uniform in [0,1) (Numerical Recipes LCG, high bits) with
