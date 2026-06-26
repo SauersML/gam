@@ -485,7 +485,10 @@ pub struct PredictionFingerprint {
 }
 
 impl QualityDiagnostics {
-    pub fn from_standard_fit(label: impl Into<String>, fit: &crate::StandardFitResult) -> Self {
+    pub fn from_standard_fit(
+        label: impl Into<String>,
+        fit: &gam_models::fit_orchestration::StandardFitResult,
+    ) -> Self {
         let design = design_diagnostics(&fit.design.design).ok();
         let penalties = penalty_diagnostics(
             &fit.design.penalties,
@@ -605,9 +608,9 @@ pub fn prediction_fingerprint(values: &[f64]) -> PredictionFingerprint {
 }
 
 pub fn design_diagnostics(
-    design: &crate::matrix::DesignMatrix,
+    design: &gam_linalg::matrix::DesignMatrix,
 ) -> Result<DesignDiagnostics, String> {
-    use crate::faer_ndarray::FaerSvd;
+    use gam_linalg::faer_ndarray::FaerSvd;
     let dense = design
         .try_to_dense_by_chunks_budgeted("quality diagnostics design SVD", 256 * 1024 * 1024)?;
     let (_u, s, _vt) = dense.svd(false, false).map_err(|e| e.to_string())?;
@@ -634,10 +637,10 @@ pub fn design_diagnostics(
 }
 
 pub fn penalty_diagnostics(
-    penalties: &[crate::terms::smooth::BlockwisePenalty],
+    penalties: &[gam_terms::smooth::BlockwisePenalty],
     lambdas: &[f64],
 ) -> Vec<PenaltyDiagnostics> {
-    use crate::faer_ndarray::FaerEigh;
+    use gam_linalg::faer_ndarray::FaerEigh;
     use faer::Side;
     penalties
         .iter()

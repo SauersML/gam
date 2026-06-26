@@ -937,7 +937,7 @@ fn fit_multinomial_formula_pyfunc<'py>(
         let saved = gam::families::multinomial::fit_penalized_multinomial_formula(
             &dataset,
             &formula,
-            &gam::solver::fit_orchestration::FitConfig::default(),
+            &gam::families::fit_orchestration::FitConfig::default(),
             init_lambda,
             max_iter,
             tol,

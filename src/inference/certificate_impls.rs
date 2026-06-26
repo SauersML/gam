@@ -15,9 +15,9 @@ use crate::inference::row_measure::{CoresetCertificate, CoresetMarginVerdict};
 use crate::solver::logdet_bounds::{LogdetEnclosure, MarginVerdict};
 use crate::solver::rho_optimizer::CriterionCertificate;
 use crate::solver::structure_search::{CollapseAction, CollapseEvent};
-use crate::terms::sae::encode::EncodeResult;
-use crate::terms::sae::identifiability::ResidualGaugeReport;
-use crate::terms::sae::manifold::{CertificateInputs, GlobalOptimalityVerdict};
+use gam_sae::encode::EncodeResult;
+use gam_sae::identifiability::ResidualGaugeReport;
+use gam_sae::manifold::{CertificateInputs, GlobalOptimalityVerdict};
 
 /// Helper: insert a scalar only when finite, else record it as text "n/a" so the
 /// evidence is explicit about a missing quantity (never a silent 0.0).

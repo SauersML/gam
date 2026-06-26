@@ -582,9 +582,9 @@ pub(crate) fn run_fit(args: FitArgs) -> Result<(), String> {
     // `1e-10`/`true` — the structural defect behind #1191/#1196.)
     // `fit_max_iter`/`fit_tol` remain the inputs to the separate forced-Firth
     // external-design branch below.
-    let base_fit_options = gam::solver::fit_orchestration::canonical_standard_fit_options(
+    let base_fit_options = gam::families::fit_orchestration::canonical_standard_fit_options(
         &fit_config,
-        gam::solver::fit_orchestration::StandardFitOptionsInputs {
+        gam::families::fit_orchestration::StandardFitOptionsInputs {
             latent_cloglog: latent_cloglog_state,
             mixture_link: mixture_linkspec.clone(),
             optimize_mixture: true,

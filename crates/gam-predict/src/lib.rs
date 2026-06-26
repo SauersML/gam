@@ -1447,7 +1447,7 @@ pub struct PredictUncertaintyOptions {
     /// `mean_lower` / `mean_upper` bounds are REPLACED by a split-conformal /
     /// conformalized-scale-regression interval `μ̂(x) ± q̂·s(x)` whose finite-
     /// sample marginal coverage is `≥ level` regardless of model
-    /// misspecification (see [`gam::inference::conformal`]). The multiplier
+    /// misspecification (see [`crate::conformal`]). The multiplier
     /// `q̂` is calibrated at miscoverage `α = 1 − level` from the model's own
     /// approximate-leave-one-out held-out residuals. This is applied by
     /// [`predict_full_uncertainty_conformal`], which is the only path that
@@ -2695,7 +2695,7 @@ where
 /// predictor is independent of every calibration point, split-conformal needs
 /// no leave-one-out correction — the nonconformity score is the plain held-out
 /// residual `r_i = y_cal_i − μ̂(x_cal_i)`, normalized by `s(x_cal_i)`. See
-/// [`gam::inference::conformal::ConformalCalibrator::from_held_out_fold`].
+/// [`crate::conformal::ConformalCalibrator::from_held_out_fold`].
 pub struct ConformalCalibrationFold<'a> {
     /// Predict input over the held-out calibration design (design + offset, and
     /// any noise/auxiliary blocks the model needs).
@@ -2707,7 +2707,7 @@ pub struct ConformalCalibrationFold<'a> {
 /// Full-uncertainty prediction with opt-in distribution-free conformal
 /// calibration of the response-scale interval.
 ///
-/// This is the real predict-path caller of [`gam::inference::conformal`].
+/// This is the real predict-path caller of [`crate::conformal`].
 /// It always runs the model's own [`PredictableModel::predict_full_uncertainty`]
 /// (so the point predictions, η/mean SEs, observation interval, and provenance
 /// are exactly the model-based ones). Then, when `options.conformal_level` is
@@ -2733,7 +2733,7 @@ pub struct ConformalCalibrationFold<'a> {
 ///
 /// The conformal interval carries finite-sample marginal coverage `≥ level`
 /// regardless of model misspecification; see the module docs of
-/// [`gam::inference::conformal`] for the response-scale decision and the
+/// [`crate::conformal`] for the response-scale decision and the
 /// exact order-statistic multiplier.
 pub fn predict_full_uncertainty_conformal<M: PredictableModel + ?Sized>(
     model: &M,

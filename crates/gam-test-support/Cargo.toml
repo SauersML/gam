@@ -1,0 +1,26 @@
+[package]
+name = "gam-test-support"
+version = "0.3.124"
+edition = "2024"
+rust-version = "1.93"
+description = "Shared test-support helpers (FD harness, fixtures, reference-tool + CLI harnesses) for the gam workspace"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/SauersML/gam"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+gam-linalg = { path = "../gam-linalg", version = "=0.3.124" }
+gam-models = { path = "../gam-models", version = "=0.3.124" }
+gam-problem = { path = "../gam-problem", version = "=0.3.124" }
+gam-terms = { path = "../gam-terms", version = "=0.3.124" }
+csv = "1.4.0"
+faer = "0.24.0"
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+
+[dev-dependencies]
+approx = "0.5.1"
+
+[lints.rust]
+warnings = "deny"

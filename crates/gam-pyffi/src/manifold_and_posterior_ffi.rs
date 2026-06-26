@@ -5716,7 +5716,7 @@ fn build_survival_transformation_ffi_payload(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
-    rp_result: gam::solver::fit_orchestration::SurvivalTransformationFitResult,
+    rp_result: gam::families::fit_orchestration::SurvivalTransformationFitResult,
 ) -> Result<FittedModelPayload, String> {
     use gam::families::survival::construction::survival_likelihood_modename;
     use ndarray::s;
@@ -6031,7 +6031,7 @@ fn build_survival_location_scale_ffi_payload(
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
     weights: &Array1<f64>,
-    ls_result: gam::solver::fit_orchestration::SurvivalLocationScaleFitResult,
+    ls_result: gam::families::fit_orchestration::SurvivalLocationScaleFitResult,
 ) -> Result<FittedModelPayload, String> {
     use gam::families::survival::construction::{
         build_survival_time_basis, parse_survival_baseline_config, parse_survival_likelihood_mode,

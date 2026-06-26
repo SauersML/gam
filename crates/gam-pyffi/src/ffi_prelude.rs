@@ -10,7 +10,7 @@ pub(crate) use csv::StringRecord;
 
 pub(crate) use faer::Side;
 
-pub(crate) use gam::solver::fit_orchestration::DispersionLocationScaleFitResult;
+pub(crate) use gam::families::fit_orchestration::DispersionLocationScaleFitResult;
 
 pub(crate) use gam::terms::basis::create_duchon_basis_1d_derivative_dense;
 
@@ -191,7 +191,7 @@ pub(crate) use gam::families::transformation_normal::TransformationNormalFitResu
 
 pub(crate) use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, RhoPrior, StandardLink};
 
-pub(crate) use gam::solver::fit_orchestration::{
+pub(crate) use gam::families::fit_orchestration::{
     FitConfig, FitRequest, FitResult, WorkflowError, fit_model, materialize, resolve_offset_column,
 };
 

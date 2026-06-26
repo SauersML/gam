@@ -1319,14 +1319,6 @@ fn maybe_smooth_identifiability_transform(
     }
 }
 
-fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialIdentifiability> {
-    match &termspec.basis {
-        SmoothBasisSpec::ThinPlate { spec, .. } => Some(&spec.identifiability),
-        SmoothBasisSpec::Duchon { spec, .. } => Some(&spec.identifiability),
-        _ => None,
-    }
-}
-
 /// Whether this smooth's *realized* design (the basis evaluated at the n data
 /// rows) must be residualized against the model's parametric block (intercept +
 /// any overlapping linear columns) by `apply_global_smooth_identifiability`.
@@ -4622,56 +4614,6 @@ fn relax_smoothing_rho_prior(
 /// #1392 under-smoothing drag; widening it further weakens termination
 /// curvature without further benefit.
 const RELAX_UNDERDETERMINED_RHO_SD: f64 = 15.0;
-
-/// Standard deviation of the wide, weakly-informative symmetric `Normal` prior
-/// placed on a relaxable double-penalty smooth's `DoublePenaltyNullspace`
-/// selection coordinate when the fit is WELL-determined (`n ≥ 2·p`); see
-/// [`relax_smoothing_rho_prior`].
-///
-/// In the well-determined regime the null-space coordinate must be NEITHER the
-/// strong select-out PC prior (its finite mode `λ* ≈ 8483` over-shrinks a
-/// genuinely-supported collinear null space — the #1476 over-shrink) NOR fully
-/// `Flat` (under concurvity the shared-linear ridge is degenerate, and zero
-/// curvature lets one smooth's `λ_nullspace` rail to ≈1e13, collapsing it to
-/// `EDF ≈ 0`). A wide symmetric Gaussian threads both: like
-/// [`RELAX_UNDERDETERMINED_RHO_SD`] it contributes strictly-positive curvature
-/// `1/sd²` that breaks the concurvity flat-ridge degeneracy (so REML certifies an
-/// interior, signal-preserving allocation) while its gradient `ρ/sd²` at any
-/// plausible optimum is negligible — adding NO select-out bias, so a supported
-/// null space is left for REML to size. The same `sd = 15` calibration applies:
-/// ±2σ spans the feasible ρ range (`|ρ| ≤ 30`).
-const NULLSPACE_WELLDET_DEGENERACY_RHO_SD: f64 = 15.0;
-
-/// True iff `prior` is the well-determined double-penalty null-space *degeneracy*
-/// prior that [`relax_smoothing_rho_prior`] places on a `DoublePenaltyNullspace`
-/// selection coordinate in the well-determined regime — the wide, symmetric
-/// `Normal(0, NULLSPACE_WELLDET_DEGENERACY_RHO_SD)` whose ONLY job is to break
-/// the #1476 concurvity flat-ridge degeneracy with strictly-positive curvature,
-/// NOT to bias selection.
-///
-/// The post-convergence #1266 null-space shrink-out escape in the outer
-/// optimizer ([`gam_solve::estimate::optimizer`]) keys on this predicate to
-/// recognise EXACTLY those coordinates: their symmetric conditioning prior also
-/// (wrongly) opposes the genuine REML shrink-out tail of an *unsupported* term,
-/// so the optimizer's converged λ_null must be re-selected by pure data-REML.
-/// The recognizer lives next to the prior's construction so the two cannot drift
-/// apart; the Half B regression gate
-/// (`default_double_penalty_shrinks_irrelevant_covariate_edf_below_one`) is the
-/// backstop that catches any drift.
-///
-/// In the well-determined relaxed `Independent` prior this `Normal(0, sd=15)`
-/// signature is UNIQUE to the null-space coordinate: the relaxed bending
-/// coordinate is `Flat`, non-relaxable coordinates keep the tighter base
-/// `Normal(0, 3)`, and the under-determined bending `Normal(0, 15)` is excluded
-/// by the optimizer's own `n ≥ 2·p` determinacy gate before this predicate is
-/// consulted.
-pub(crate) fn is_nullspace_degeneracy_prior(prior: &gam_spec::RhoPrior) -> bool {
-    matches!(
-        prior,
-        gam_spec::RhoPrior::Normal { mean, sd }
-            if *mean == 0.0 && *sd == NULLSPACE_WELLDET_DEGENERACY_RHO_SD
-    )
-}
 
 /// Distance-scale bound `upper` (`P(d > upper) = tail_prob` on the marginal-SD
 /// scale `d = exp(-ρ/2)`) of the penalized-complexity prior placed on a

@@ -6,7 +6,7 @@ use gam::inference::formula_dsl::parse_link_choice;
 use gam::inference::model::GroupMetadata;
 use gam::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 use gam_models::fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors;
-use gam::solver::fit_orchestration::{CtnStage1Recipe, FitConfig};
+use gam_models::fit_orchestration::{CtnStage1Recipe, FitConfig};
 use gam::transformation_normal::TransformationNormalConfig;
 use gam::types::{InverseLink, LinkFunction, MixtureLinkSpec, SasLinkSpec, StandardLink};
 use ndarray::Array1;

@@ -4862,7 +4862,7 @@ fn fit_dataset_impl(
             // structural; every other shape falls through to the dense fit
             // below. Mirrors the CLI run_fit path so CLI and FFI saves agree.
             if let Some(inputs) =
-                gam::solver::fit_orchestration::spline_scan_fast_path(&standard_request)
+                gam::families::fit_orchestration::spline_scan_fast_path(&standard_request)
             {
                 let scan = gam::solver::spline_scan::fit_spline_scan(
                     &inputs.x,
@@ -4871,7 +4871,7 @@ fn fit_dataset_impl(
                     inputs.order,
                 )
                 .map_err(|reason| {
-                    gam::solver::fit_orchestration::WorkflowError::IntegrationFailed { reason }
+                    gam::families::fit_orchestration::WorkflowError::IntegrationFailed { reason }
                 })?;
                 let feature_col = match &standard_request.spec.smooth_terms[0].basis {
                     gam::terms::smooth::SmoothBasisSpec::BSpline1D { feature_col, .. } => {
@@ -4879,7 +4879,7 @@ fn fit_dataset_impl(
                     }
                     _ => {
                         return Err(
-                            gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                            gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                                 reason: "spline-scan detection accepted a non-1D basis".to_string(),
                             },
                         );
@@ -4887,7 +4887,7 @@ fn fit_dataset_impl(
                 };
                 let feature_column =
                     dataset.headers.get(feature_col).cloned().ok_or_else(|| {
-                        gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                        gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                             reason: format!(
                                 "spline-scan feature column {feature_col} has no header"
                             ),
@@ -4907,7 +4907,7 @@ fn fit_dataset_impl(
                 scan_payload.inference_notes = inference_notes;
                 let model = FittedModel::from_payload(scan_payload);
                 return serde_json::to_vec(&model).map_err(|err| {
-                    gam::solver::fit_orchestration::WorkflowError::IntegrationFailed {
+                    gam::families::fit_orchestration::WorkflowError::IntegrationFailed {
                         reason: format!("failed to serialize model: {err}"),
                     }
                 });
@@ -4917,7 +4917,7 @@ fn fit_dataset_impl(
             let standard_result = match fit_result {
                 FitResult::Standard(standard_result) => standard_result,
                 _ => {
-                    return Err(gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                    return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the standard workflow to return a standard fit result"
                             .to_string(),
                     });
@@ -4942,7 +4942,7 @@ fn fit_dataset_impl(
             let tn_result = match fit_result {
                 FitResult::TransformationNormal(result) => result,
                 _ => {
-                    return Err(gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                    return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the transformation-normal workflow to return a transformation-normal fit result"
                             .to_string(),
                     });
@@ -4957,7 +4957,7 @@ fn fit_dataset_impl(
             let ms_result = match fit_result {
                 FitResult::BernoulliMarginalSlope(result) => result,
                 _ => {
-                    return Err(gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                    return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the bernoulli marginal-slope workflow to return a marginal-slope fit result"
                             .to_string(),
                     });
@@ -4978,7 +4978,7 @@ fn fit_dataset_impl(
             let ms_result = match fit_result {
                 FitResult::SurvivalMarginalSlope(result) => result,
                 _ => {
-                    return Err(gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                    return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the survival marginal-slope workflow to return a survival marginal-slope fit result"
                             .to_string(),
                     });
@@ -4997,7 +4997,7 @@ fn fit_dataset_impl(
             let ls_result = match fit_result {
                 FitResult::GaussianLocationScale(result) => result,
                 _ => {
-                    return Err(gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                    return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the gaussian location-scale workflow to return a gaussian location-scale fit result"
                             .to_string(),
                     });
@@ -5025,7 +5025,7 @@ fn fit_dataset_impl(
             let ls_result = match fit_result {
                 FitResult::BinomialLocationScale(result) => result,
                 _ => {
-                    return Err(gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                    return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the binomial location-scale workflow to return a binomial location-scale fit result"
                             .to_string(),
                     });
@@ -5046,7 +5046,7 @@ fn fit_dataset_impl(
             let ls_result = match fit_result {
                 FitResult::SurvivalLocationScale(result) => result,
                 _ => {
-                    return Err(gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                    return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the survival location-scale workflow to return a survival location-scale fit result"
                             .to_string(),
                     });
@@ -5065,7 +5065,7 @@ fn fit_dataset_impl(
             let rp_result = match fit_result {
                 FitResult::SurvivalTransformation(result) => result,
                 _ => {
-                    return Err(gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                    return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the survival transformation workflow to return a survival transformation fit result"
                             .to_string(),
                     });
@@ -5079,7 +5079,7 @@ fn fit_dataset_impl(
             let lat_result = match fit_result {
                 FitResult::LatentSurvival(result) => result,
                 _ => {
-                    return Err(gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                    return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the latent survival workflow to return a latent survival fit result"
                             .to_string(),
                     });
@@ -5093,7 +5093,7 @@ fn fit_dataset_impl(
             let lat_result = match fit_result {
                 FitResult::LatentBinary(result) => result,
                 _ => {
-                    return Err(gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                    return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the latent binary workflow to return a latent binary fit result"
                             .to_string(),
                     });
@@ -5113,7 +5113,7 @@ fn fit_dataset_impl(
             let ls_result = match fit_result {
                 FitResult::DispersionLocationScale(result) => result,
                 _ => {
-                    return Err(gam::solver::fit_orchestration::WorkflowError::SchemaMismatch {
+                    return Err(gam::families::fit_orchestration::WorkflowError::SchemaMismatch {
                         reason: "python binding expected the dispersion location-scale workflow to return a dispersion location-scale fit result"
                             .to_string(),
                     });
@@ -5133,7 +5133,7 @@ fn fit_dataset_impl(
     payload.inference_notes = inference_notes;
     let model = FittedModel::from_payload(payload);
     serde_json::to_vec(&model).map_err(|err| {
-        gam::solver::fit_orchestration::WorkflowError::IntegrationFailed {
+        gam::families::fit_orchestration::WorkflowError::IntegrationFailed {
             reason: format!("failed to serialize model: {err}"),
         }
     })

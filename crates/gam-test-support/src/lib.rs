@@ -4,8 +4,9 @@ pub mod cli_harness;
 pub mod fd_checker;
 pub mod reference;
 
-use crate::families::custom_family::{ParameterBlockSpec, PenaltyMatrix};
-use crate::matrix::{DenseDesignMatrix, DesignMatrix};
+use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+use gam_problem::PenaltyMatrix;
+use gam_problem::block_spec::ParameterBlockSpec;
 use ndarray::{Array1, Array2, array};
 
 // `no_densify_design` (and the operator-backed fixture behind it) is a
@@ -186,12 +187,12 @@ pub fn assert_matrix_derivativefd(fd: &Array2<f64>, analytic: &Array2<f64>, tol:
 pub fn spec_from_dense(
     name: &str,
     design: ndarray::Array2<f64>,
-) -> crate::families::custom_family::ParameterBlockSpec {
+) -> gam_problem::block_spec::ParameterBlockSpec {
     let n = design.nrows();
-    crate::families::custom_family::ParameterBlockSpec {
+    gam_problem::block_spec::ParameterBlockSpec {
         name: name.to_string(),
-        design: crate::linalg::matrix::DesignMatrix::Dense(
-            crate::linalg::matrix::DenseDesignMatrix::from(design),
+        design: gam_linalg::matrix::DesignMatrix::Dense(
+            gam_linalg::matrix::DenseDesignMatrix::from(design),
         ),
         offset: ndarray::Array1::<f64>::zeros(n),
         penalties: Vec::new(),
@@ -209,7 +210,7 @@ pub fn spec_from_dense_with_priority(
     name: &str,
     design: ndarray::Array2<f64>,
     priority: u8,
-) -> crate::families::custom_family::ParameterBlockSpec {
+) -> gam_problem::block_spec::ParameterBlockSpec {
     let mut s = spec_from_dense(name, design);
     s.gauge_priority = priority;
     s

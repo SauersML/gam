@@ -1126,48 +1126,6 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
     Ok(hyper_dirs)
 }
 
-/// Whether a spatial term contributes per-axis ψ entries to the outer joint
-/// hyperparameter vector.
-///
-/// A term enrolls per-axis log-κ ψ when (a) it carries `aniso_log_scales`
-/// matching its feature dimension, (b) its dimension is `> 1`, and (c) its
-/// basis supports REML-side anisotropic κ optimization. Duchon is explicitly
-/// excluded: its anisotropy η is a fixed, geometry-derived basis parameter,
-/// never a REML hyper axis. A hybrid Duchon (explicit κ) still optimizes its
-/// scalar length scale through the regular isotropic-κ path, so it
-/// contributes a single ψ entry, not one per axis.
-///
-/// This predicate is the *single source of truth* for the joint-θ layout:
-/// `has_aniso_terms`, `spatial_dims_per_term`, `from_length_scales_aniso`,
-/// and the hyper_dirs builder `try_build_spatial_log_kappa_derivativeinfo_list`
-/// all consult it, so the outer optimizer's `n_params = rho_dim + Σ ψ_per_term`
-/// always matches the gradient length produced by the inner unified evaluator.
-fn spatial_term_uses_per_axis_psi(resolvedspec: &TermCollectionSpec, term_idx: usize) -> bool {
-    // Measure-jet enrolls a multi-coordinate DIAL group (α, lnτ[, s]) —
-    // grouped like per-axis anisotropy in the θ layout, but the coordinates
-    // are geometry dials, not axis scales. Enrollment is owned by
-    // `measure_jet_enrolls_psi`.
-    if let Some(mj) = measure_jet_term_spec(resolvedspec, term_idx) {
-        return measure_jet_enrolls_psi(mj);
-    }
-    let Some(d) = get_spatial_feature_dim(resolvedspec, term_idx) else {
-        return false;
-    };
-    if d <= 1 {
-        return false;
-    }
-    let Some(eta) = get_spatial_aniso_log_scales(resolvedspec, term_idx) else {
-        return false;
-    };
-    if eta.len() != d {
-        return false;
-    }
-    !matches!(
-        resolvedspec.smooth_terms.get(term_idx).map(|t| &t.basis),
-        Some(SmoothBasisSpec::Duchon { .. })
-    )
-}
-
 /// Compute `dims_per_term` for a list of spatial term indices.
 ///
 /// Returns a vector where entry i is the number of stored ψ values for
@@ -4445,34 +4403,6 @@ fn run_exact_joint_spatial_optimization(
     ))
 }
 
-fn set_spatial_length_scale(
-    spec: &mut TermCollectionSpec,
-    term_idx: usize,
-    length_scale: f64,
-) -> Result<(), EstimationError> {
-    let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
-        crate::bail_invalid_estim!("spatial length-scale term index {term_idx} out of range");
-    };
-    match &mut term.basis {
-        SmoothBasisSpec::ThinPlate { spec, .. } => {
-            spec.length_scale = length_scale;
-            Ok(())
-        }
-        SmoothBasisSpec::Matern { spec, .. } => {
-            spec.length_scale = length_scale;
-            Ok(())
-        }
-        SmoothBasisSpec::Duchon { spec, .. } => {
-            spec.length_scale = Some(length_scale);
-            Ok(())
-        }
-        _ => Err(EstimationError::InvalidInput(format!(
-            "term '{}' does not expose a spatial length scale",
-            term.name
-        ))),
-    }
-}
-
 /// Apply a length scale to a single `SmoothTermSpec` (independent of any
 /// outer `TermCollectionSpec`). Mirrors `set_spatial_length_scale` but on a
 /// term in isolation; used by the incremental realizer's cached planned spec.
@@ -4522,17 +4452,6 @@ fn set_single_term_spatial_aniso_log_scales(
             term.name
         ))),
     }
-}
-
-pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> Option<f64> {
-    spec.smooth_terms
-        .get(term_idx)
-        .and_then(|term| match &term.basis {
-            SmoothBasisSpec::ThinPlate { spec, .. } => Some(spec.length_scale),
-            SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
-            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale,
-            _ => None,
-        })
 }
 
 /// Freeze the design-moving representer length-scale dial on every measure-jet

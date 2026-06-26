@@ -57,7 +57,7 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use gam_linalg::triangular::{back_substitution_lower_transpose, cholesky_solve_vector};
 
 #[cfg(target_os = "linux")]
-use crate::gpu_error::GpuError;
+use gam_gpu::gpu_error::GpuError;
 
 // ────────────────────────────────────────────────────────────────────────
 // Public types
@@ -637,8 +637,8 @@ mod linux_cuda {
         PG1_MAX_B, PgSeed, PolyaGammaBatchInput, SADDLE_MAX_B, SADDLE_MIN_B, XorwowState,
         pg_convolution_cpu_oracle, pg_normal_cpu_oracle,
     };
-    use crate::gpu_error::{GpuError, GpuResultExt};
-    use crate::solver::context_and_stream;
+    use gam_gpu::gpu_error::{GpuError, GpuResultExt};
+    use gam_gpu::solver::context_and_stream;
     use cudarc::driver::{CudaContext, CudaModule, CudaStream, LaunchConfig, PushKernelArg};
     use ndarray::Array1;
     use std::sync::Arc;

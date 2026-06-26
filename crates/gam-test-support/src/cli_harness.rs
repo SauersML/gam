@@ -20,7 +20,7 @@ use std::process::Command;
 #[macro_export]
 macro_rules! gam_binary {
     () => {
-        $crate::test_support::cli_harness::resolve_gam_binary(option_env!("CARGO_BIN_EXE_gam"))
+        $crate::cli_harness::resolve_gam_binary(option_env!("CARGO_BIN_EXE_gam"))
     };
 }
 
