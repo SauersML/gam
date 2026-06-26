@@ -97,10 +97,22 @@ fn top_k_bounds_softmax_assembly_dim_independent_of_total_k_1409() {
     let n = 8usize;
     let p = 4usize;
     let top_k = 3usize;
-    // Planted top-`top_k` support per row, spread across the full K range.
-    let planted: Vec<Vec<usize>> = (0..n).map(|row| vec![row, 300 + row, 700 + row]).collect();
+    // Two separated totals at a 2× ratio. The K-INVARIANCE of the per-row dim is
+    // the contract, NOT the absolute K: `assemble_arrow_schur`'s softmax majorizer
+    // setup is irreducibly O(K) (each atom's entropy-Hessian Gershgorin entry
+    // couples all K assignment masses), so a large absolute K costs minutes of
+    // wall-clock yet proves nothing more than a 2× ratio at a moderate K. Matches
+    // the sibling #1450 gate's small-K design (`tests/owed_1450.rs`).
+    const K_SMALL: usize = 512;
+    const K_LARGE: usize = 1_024;
+    // Planted top-`top_k` support per row, spread low/mid/high across the K range
+    // (the same intended active set at BOTH K, all within K_SMALL) so a correct
+    // selection must scan all K, not just a prefix.
+    let planted: Vec<Vec<usize>> = (0..n)
+        .map(|row| vec![row, K_SMALL / 2 + row, K_SMALL - 100 + row])
+        .collect();
 
-    // Assemble at two widely separated K with the same explicit top_k cap.
+    // Assemble at the two separated K with the same explicit top_k cap.
     let assemble_dims = |k_atoms: usize| -> Vec<usize> {
         let (mut term, target) = planted_softmax_term(n, k_atoms, &planted, p);
         // The #1409 fix: fold top_k into the optimization.
@@ -108,7 +120,7 @@ fn top_k_bounds_softmax_assembly_dim_independent_of_total_k_1409() {
         let rho = SaeManifoldRho::new(0.0, 0.0, vec![ndarray::Array1::<f64>::zeros(1); k_atoms]);
         let sys = term
             .assemble_arrow_schur(target.view(), &rho, None)
-            .expect("compact softmax assembly under top_k must succeed at large K");
+            .expect("compact softmax assembly under top_k must succeed at high K");
         // Each per-row block must be square and consistent (htt vs gt).
         for r in &sys.rows {
             assert_eq!(r.htt.nrows(), r.htt.ncols());
@@ -117,33 +129,33 @@ fn top_k_bounds_softmax_assembly_dim_independent_of_total_k_1409() {
         sys.rows.iter().map(|r| r.htt.nrows()).collect()
     };
 
-    let dims_1k = assemble_dims(1_000);
-    let dims_10k = assemble_dims(10_000);
+    let dims_small = assemble_dims(K_SMALL);
+    let dims_large = assemble_dims(K_LARGE);
 
     // Per-row block dim is bounded by the active contract `top_k·(1 + d)` for
     // d = 1 coord per atom, i.e. `top_k·2`. A full-`K` softmax block would be
-    // `(K - 1)` free logits + `K` coord axes, i.e. ~3000 / ~30000.
+    // `(K - 1)` free logits + `K` coord axes, i.e. ~1023 / ~2047.
     let bound = top_k * (1 + 1);
     for row in 0..n {
         assert!(
-            dims_1k[row] <= bound,
-            "row {row}: K=1000 compact dim {} exceeds O(top_k) bound {bound} — \
+            dims_small[row] <= bound,
+            "row {row}: K={K_SMALL} compact dim {} exceeds O(top_k) bound {bound} — \
              top_k did not bound the optimization (post-fit projection regression)",
-            dims_1k[row]
+            dims_small[row]
         );
         assert_eq!(
-            dims_1k[row], dims_10k[row],
+            dims_small[row], dims_large[row],
             "row {row}: per-row assembly dim must be INDEPENDENT of total K under an \
-             explicit top_k cap: K=1000 gave {} but K=10000 gave {} — a post-fit \
+             explicit top_k cap: K={K_SMALL} gave {} but K={K_LARGE} gave {} — a post-fit \
              projection over a full-K solve would scale with K",
-            dims_1k[row], dims_10k[row]
+            dims_small[row], dims_large[row]
         );
     }
 
     // The compact total assembly work must be orders of magnitude below the
-    // full-`K` dense block even at the smaller K=1000.
-    let compact_work: usize = dims_1k.iter().map(|&q| q * q).sum();
-    let dense_q = (1_000 - 1) + 1_000; // (K-1) free logits + K coord axes
+    // full-`K` dense block even at the smaller K_SMALL.
+    let compact_work: usize = dims_small.iter().map(|&q| q * q).sum();
+    let dense_q = (K_SMALL - 1) + K_SMALL; // (K-1) free logits + K coord axes
     let dense_work = n * dense_q * dense_q;
     assert!(
         compact_work * 100 < dense_work,

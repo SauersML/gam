@@ -100,13 +100,26 @@ fn softmax_topk_engages_compact_per_row_layout_in_assembly_1408() {
     let n = 8usize;
     let p = 4usize;
     let top_k = 3usize;
-    // Each row's planted support spread across the full K range so a correct
-    // selection must scan all K (not just a low-index prefix).
-    let planted: Vec<Vec<usize>> = (0..n).map(|row| vec![row, 300 + row, 700 + row]).collect();
+    // Two separated totals at a 2× ratio. K-invariance of the per-row block dim
+    // is the contract; the ABSOLUTE K is irrelevant to it, and a large absolute K
+    // buys nothing while costing minutes of wall-clock — `assemble_arrow_schur`'s
+    // softmax majorizer setup is irreducibly O(K) (each atom's entropy-Hessian
+    // Gershgorin entry couples all K assignment masses), so a 2× ratio at a
+    // moderate K proves "dims don't scale with K" exactly as a 10× ratio at a
+    // huge K would, only cheaply. This mirrors the sibling #1450 gate
+    // (`tests/owed_1450.rs`), which fixes the same absolute-K-is-gratuitous bound.
+    const K_SMALL: usize = 512;
+    const K_LARGE: usize = 1_024;
+    // Each row's planted support spread low/mid/high across the K range (the same
+    // intended active set at BOTH K, all within K_SMALL) so a correct selection
+    // must scan all K, not just a low-index prefix.
+    let planted: Vec<Vec<usize>> = (0..n)
+        .map(|row| vec![row, K_SMALL / 2 + row, K_SMALL - 100 + row])
+        .collect();
 
-    // Assemble at two widely-separated K with the SAME top_k and planted support;
-    // the public per-row block dims must be identical (independent of K) and
-    // bounded by O(top_k).
+    // Assemble at the two K with the SAME top_k and planted support; the public
+    // per-row block dims must be identical (independent of K) and bounded by
+    // O(top_k).
     let assemble_dims = |k_atoms: usize| -> Vec<usize> {
         let (mut term, target) = planted_softmax_sae_term(n, k_atoms, &planted, p);
         // Fold top_k into the OPTIMIZATION — the #1408/#1409 fix.
@@ -114,7 +127,7 @@ fn softmax_topk_engages_compact_per_row_layout_in_assembly_1408() {
         let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::<f64>::zeros(1); k_atoms]);
         let sys = term
             .assemble_arrow_schur(target.view(), &rho, None)
-            .expect("compact softmax assembly must succeed at large K");
+            .expect("compact softmax assembly must succeed at high K");
         // Each per-row block must be square and consistent with its gradient.
         for r in &sys.rows {
             assert_eq!(r.htt.nrows(), r.htt.ncols());
@@ -123,37 +136,37 @@ fn softmax_topk_engages_compact_per_row_layout_in_assembly_1408() {
         sys.rows.iter().map(|r| r.htt.nrows()).collect()
     };
 
-    let dims_1k = assemble_dims(1_000);
-    let dims_10k = assemble_dims(10_000);
+    let dims_small = assemble_dims(K_SMALL);
+    let dims_large = assemble_dims(K_LARGE);
 
     // (a) O(top_k) bound: per-row block dim is at most `top_k·(1 + d)` for d=1
     // coord (= |active| logit slots + Σ active coord axes). A full-K softmax
-    // block would be ~ (K-1) + K = ~2000 at K=1000 — far above this bound.
+    // block would be ~ (K-1) + K = ~1023 at K=512 — far above this bound.
     let bound = top_k * (1 + 1);
     for row in 0..n {
         assert!(
-            dims_1k[row] <= bound,
-            "row {row} K=1000 compact per-row dim {} exceeds O(top_k) bound {bound} \
+            dims_small[row] <= bound,
+            "row {row} K={K_SMALL} compact per-row dim {} exceeds O(top_k) bound {bound} \
              — softmax did not engage the compact layout (#1408 regression)",
-            dims_1k[row]
+            dims_small[row]
         );
     }
 
-    // (b) K-independence: identical per-row dims at K=1000 and K=10000. The buggy
-    // full-K path would give ~2000 vs ~20000.
+    // (b) K-independence: identical per-row dims at K_SMALL and K_LARGE. The buggy
+    // full-K path would give ~1023 vs ~2047 (scaling with K).
     for row in 0..n {
         assert_eq!(
-            dims_1k[row], dims_10k[row],
+            dims_small[row], dims_large[row],
             "row {row} per-row dim must be INDEPENDENT of total K (#1408 compact contract): \
-             K=1000 gave {} but K=10000 gave {}",
-            dims_1k[row], dims_10k[row]
+             K={K_SMALL} gave {} but K={K_LARGE} gave {}",
+            dims_small[row], dims_large[row]
         );
     }
 
     // (c) Quantitative: total compact work is < 1/100 of the full-K dense block
-    // even at the smaller K=1000.
-    let compact_work: usize = dims_1k.iter().map(|&q| q * q).sum();
-    let dense_q = (1_000 - 1) + 1_000; // (K-1) free logits + K coord axes
+    // even at the smaller K_SMALL.
+    let compact_work: usize = dims_small.iter().map(|&q| q * q).sum();
+    let dense_q = (K_SMALL - 1) + K_SMALL; // (K-1) free logits + K coord axes
     let dense_work = n * dense_q * dense_q;
     assert!(
         compact_work * 100 < dense_work,
