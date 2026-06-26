@@ -3,6 +3,7 @@
 //! `outer_objective.rs` by concern (#1145). Re-exported via `custom_family`.
 
 use super::*;
+use gam_problem::{ensure_finite_scalar_estimation, validate_all_finite_estimation};
 
 pub(crate) fn screened_outer_warm_start<'a>(
     warm_start: Option<&'a ConstrainedWarmStart>,

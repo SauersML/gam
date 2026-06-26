@@ -25,6 +25,7 @@ pub mod dispersion;
 pub mod dispersion_cov;
 pub mod estimation_error;
 pub mod family_options;
+pub mod finite_validation;
 pub mod fisher_rao;
 pub mod gauge;
 pub mod identifiability_audit;
@@ -76,6 +77,10 @@ pub use dispersion::Dispersion;
 pub use dispersion_cov::{DispersionExt, PhiScaledCovariance, UnscaledPrecision, se_from_covariance};
 pub use estimation_error::EstimationError;
 pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
+pub use finite_validation::{
+    ensure_finite_scalar, ensure_finite_scalar_estimation, validate_all_finite,
+    validate_all_finite_estimation,
+};
 pub use fisher_rao::{
     FisherRaoDefiniteness, normalize_fisher_rao_blocks, normalize_fisher_rao_blocks_pd,
 };

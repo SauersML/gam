@@ -1230,18 +1230,7 @@ pub struct UnifiedFitResult {
     pub inner_cycles: usize,
 }
 
-pub(crate) fn ensure_finite_scalar_estimation(
-    name: &str,
-    value: f64,
-) -> Result<(), EstimationError> {
-    if value.is_finite() {
-        Ok(())
-    } else {
-        Err(EstimationError::InvalidInput(format!(
-            "{name} must be finite, got {value}"
-        )))
-    }
-}
+pub(crate) use gam_problem::ensure_finite_scalar_estimation;
 
 fn validate_likelihood_scale_estimation(
     scale: LikelihoodScaleMetadata,
@@ -1288,33 +1277,8 @@ fn validate_likelihood_scale_estimation(
     }
 }
 
-pub(crate) fn validate_all_finite_estimation<I>(
-    label: &str,
-    values: I,
-) -> Result<(), EstimationError>
-where
-    I: IntoIterator<Item = f64>,
-{
-    for (idx, value) in values.into_iter().enumerate() {
-        if !value.is_finite() {
-            crate::bail_invalid_estim!("{label}[{idx}] must be finite, got {value}");
-        }
-    }
-    Ok(())
-}
-
-/// Public wrapper returning `String` errors for use outside the estimation module.
-pub fn ensure_finite_scalar(name: &str, value: f64) -> Result<(), String> {
-    ensure_finite_scalar_estimation(name, value).map_err(|e| e.to_string())
-}
-
-/// Public wrapper returning `String` errors for use outside the estimation module.
-pub fn validate_all_finite<I: IntoIterator<Item = f64>>(
-    label: &str,
-    values: I,
-) -> Result<(), String> {
-    validate_all_finite_estimation(label, values).map_err(|e| e.to_string())
-}
+pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
+pub(crate) use gam_problem::validate_all_finite_estimation;
 
 impl FitGeometry {
     pub fn validate_numeric_finiteness(&self) -> Result<(), EstimationError> {

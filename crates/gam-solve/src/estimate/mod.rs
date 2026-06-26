@@ -76,14 +76,11 @@ mod summary;
 pub(crate) use crate::model_types::result_types::dispersion_from_likelihood;
 pub use crate::model_types::{
     AdaptiveRegularizationOptions, BlockRole, FitArtifacts, FitGeometry, FitInference, FitOptions,
-    FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts, ensure_finite_scalar,
+    FittedBlock, FittedLinkState, UnifiedFitResult, UnifiedFitResultParts,
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
-    validate_all_finite, validate_dense_hessian_export,
-    validate_explicit_dense_hessian_for_whitening,
+    validate_dense_hessian_export, validate_explicit_dense_hessian_for_whitening,
 };
-pub(crate) use crate::model_types::{
-    ensure_finite_scalar_estimation, validate_all_finite_estimation,
-};
+pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
 pub use evaluation::{
     evaluate_external_ift_residual_at_perturbed_rho, evaluate_externalcost_andridge,
     evaluate_externalgradient,
