@@ -1639,8 +1639,8 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
     // not transfer (observed grows on saturated rows where expected decays),
     // so the pre-check is bypassed and the exact gate always runs.
     let outer_precheck_eligible = include_logdet_h
-        && family.joint_jeffreys_information_matches_observed_hessian()
-        && total >= crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM;
+        && total > 0
+        && family.joint_jeffreys_information_matches_observed_hessian();
     let outer_jeffreys_precheck_skips = match preferred_workspace.as_ref() {
         Some(ws) if outer_precheck_eligible && ws.hessian_matvec_available() => {
             let hv = |v: &Array1<f64>| -> Result<Array1<f64>, String> {
@@ -1652,8 +1652,43 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
                     _ => Ok(Array1::from_elem(total, f64::NAN)),
                 }
             };
-            crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_via_matvec(hv, total)
+            if total >= crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM
+            {
+                // Wide joint system: bound the spectrum from a few matvecs (no dense
+                // H, no O(p³) eigh).
+                crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_via_matvec(
+                    hv, total,
+                )
                 .unwrap_or(false)
+            } else {
+                // Small joint system: the dense p×p eigh is itself cheap, so form H
+                // once via `total` matvecs and run the EXACT conditioning gate — the
+                // same #1389 fix as the inner-Newton skip, applied to the OUTER LAML
+                // logdet H_Φ so the per-outer-eval Jeffreys all-axes sweep is also
+                // skipped on a well-conditioned small fit (the constant-scale
+                // survival location-scale non-termination paid this term on every
+                // outer eval as well as every inner cycle). A non-finite matvec (the
+                // declined-apply sentinel) is treated as "cannot certify ⇒ run the
+                // exact term", preserving the conservative never-skip-on-unresolved
+                // contract.
+                (|| -> Result<bool, String> {
+                    let mut h = Array2::<f64>::zeros((total, total));
+                    let mut e_a = Array1::<f64>::zeros(total);
+                    for a in 0..total {
+                        e_a[a] = 1.0;
+                        let col = hv(&e_a)?;
+                        e_a[a] = 0.0;
+                        if col.len() != total || col.iter().any(|v| !v.is_finite()) {
+                            return Ok(false);
+                        }
+                        for r in 0..total {
+                            h[[r, a]] = col[r];
+                        }
+                    }
+                    crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_dense(h.view())
+                })()
+                .unwrap_or(false)
+            }
         }
         _ => false,
     };
