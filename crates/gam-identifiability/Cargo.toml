@@ -9,11 +9,14 @@ warnings = "deny"
 [dependencies]
 faer = "0.24.0"
 gam-linalg = { path = "../gam-linalg", version = "=0.3.124" }
+gam-math = { path = "../gam-math", version = "=0.3.124" }
 gam-problem = { path = "../gam-problem", version = "=0.3.124" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.124" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }

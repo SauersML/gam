@@ -45,10 +45,6 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2, Array3};
 
-use gam_problem::{
-    BlockEffectiveJacobian, CustomFamilyError, FamilyLinearizationState, ParameterBlockSpec,
-    PenaltyMatrix,
-};
 use crate::audit::{
     IdentifiabilityAudit, audit_identifiability, audit_identifiability_channel_aware,
     block_structural_penalty_dense, priority_tiered_rank_from_gram, rank_of_gram,
@@ -61,6 +57,10 @@ use gam_linalg::faer_ndarray::{
 };
 use gam_linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use gam_problem::Gauge;
+use gam_problem::{
+    BlockEffectiveJacobian, CustomFamilyError, FamilyLinearizationState, ParameterBlockSpec,
+    PenaltyMatrix,
+};
 
 enum BlockJacobianSource {
     Callback(Arc<dyn BlockEffectiveJacobian>),
@@ -986,10 +986,7 @@ fn canonicalize_for_identifiability_inner(
         // branch — they are vetoed above.)
         let reduced_jacobian_callback = match spec.jacobian_callback.as_ref() {
             Some(cb) if !dropped_sorted.is_empty() => Some(Arc::new(
-                gam_problem::GaugeComposedJacobian::new(
-                    Arc::clone(cb),
-                    Arc::new(t_i.clone()),
-                ),
+                gam_problem::GaugeComposedJacobian::new(Arc::clone(cb), Arc::new(t_i.clone())),
             )
                 as Arc<dyn BlockEffectiveJacobian>),
             other => other.cloned(),
@@ -1839,9 +1836,9 @@ fn pull_back_penalty(penalty: &PenaltyMatrix, kept: &[usize]) -> PenaltyMatrix {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gam_problem::AdditiveBlockJacobian;
     use gam_linalg::matrix::DenseDesignMatrix;
-    
+    use gam_problem::AdditiveBlockJacobian;
+
     use ndarray::Array2;
 
     fn linspace(n: usize) -> ndarray::Array1<f64> {

@@ -30,14 +30,14 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2, Array3};
 
-use gam_problem::{FamilyChannelHessian, PenaltyMatrix};
 use crate::families::compiler::{
     BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
-use gam_linalg::faer_ndarray::{FaerEigh, fast_ab};
-use gam_linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use crate::solver::gauge::assemble_block_triangular_t;
 use faer::Side;
+use gam_linalg::faer_ndarray::{FaerEigh, fast_ab};
+use gam_linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
+use gam_problem::{FamilyChannelHessian, PenaltyMatrix};
 
 const K_SURVIVAL: usize = 4;
 
@@ -244,9 +244,9 @@ impl FamilyChannelHessian for SurvivalRowHessian {
             }
             None => {
                 // β ≈ 0: return the frozen pilot W unchanged.
-                Ok(Arc::new(
-                    gam_problem::TensorChannelHessian { h: self.h.clone() },
-                ))
+                Ok(Arc::new(gam_problem::TensorChannelHessian {
+                    h: self.h.clone(),
+                }))
             }
             Some(sc) => {
                 let n = self.h.shape()[0];

@@ -88,10 +88,11 @@
 use faer::Side;
 use ndarray::{Array1, Array2};
 
-use gam_problem::{CustomFamilyError, FamilyLinearizationState, ParameterBlockSpec};
 use gam_linalg::faer_ndarray::{
     FaerEigh, default_rrqr_rank_alpha, fast_atb, rrqr_with_permutation,
 };
+use gam_problem::{EstimationError, FamilyLinearizationState, ParameterBlockSpec};
+use gam_runtime::loop_progress::LoopProgress;
 
 const DEFAULT_GAUGE_PRIORITY: u8 = 100;
 
@@ -1149,7 +1150,7 @@ fn audit_identifiability_impl(
     };
     let pairwise_block_progress_ticker = (n.saturating_mul(p_total)
         >= AUDIT_PROGRESS_TICKER_WORK_THRESHOLD)
-        .then(crate::util::loop_progress::LoopProgress::default_interval);
+        .then(LoopProgress::default_interval);
     // The full joint Gram `G = Xᵀ·X` was already assembled once (before the joint
     // RRQR) and is reused here: every cross-block column dot product below is an
     // O(1) lookup `joint_gram[[ja, jb]]` instead of an O(n) scalar pass, so the
@@ -1762,9 +1763,7 @@ struct ChannelAwareStreamedGeometry {
 }
 
 fn channel_aware_streamed_geometry(
-    operators: &[std::sync::Arc<
-        dyn crate::families::compiler::RowJacobianOperator,
-    >],
+    operators: &[std::sync::Arc<dyn crate::families::compiler::RowJacobianOperator>],
     row_hess: &dyn crate::families::compiler::RowHessian,
     row_structural: &dyn crate::families::compiler::RowHessian,
     col_offsets: &[usize],
@@ -1891,9 +1890,7 @@ fn accumulate_channel_metric_gram(
 
 pub fn audit_identifiability_channel_aware(
     specs: &[ParameterBlockSpec],
-    operators: &[std::sync::Arc<
-        dyn crate::families::compiler::RowJacobianOperator,
-    >],
+    operators: &[std::sync::Arc<dyn crate::families::compiler::RowJacobianOperator>],
     row_hess: &dyn crate::families::compiler::RowHessian,
 ) -> Result<IdentifiabilityAudit, EstimationError> {
     use crate::families::compiler::{IdentityRowHessian, compile_from_raw_grams};
@@ -3029,8 +3026,6 @@ mod tests {
 
     use linspace as linspace_minus_one_to_one;
     use ndarray::Array2;
-
-    
 
     fn linspace(n: usize) -> ndarray::Array1<f64> {
         if n <= 1 {

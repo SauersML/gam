@@ -9,6 +9,18 @@
 //!   per-family row-Hessian implementations.
 //! - [`marginal_slope`] — survival marginal-slope identifiability.
 
+#[macro_export]
+macro_rules! bail_dim_custom {
+    ($fmt:literal $(, $($arg:tt)*)?) => {
+        return Err(gam_problem::CustomFamilyError::DimensionMismatch {
+            reason: format!($fmt $(, $($arg)*)?),
+        })
+    };
+    ($msg:expr $(,)?) => {
+        return Err(gam_problem::CustomFamilyError::DimensionMismatch { reason: $msg })
+    };
+}
+
 pub mod audit;
 pub mod canonical;
 pub mod families;

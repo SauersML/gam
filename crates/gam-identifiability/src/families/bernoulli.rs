@@ -14,10 +14,8 @@
 
 use ndarray::{Array1, Array2, Array3};
 
+use crate::families::compiler::{RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with};
 use gam_problem::FamilyChannelHessian;
-use crate::families::compiler::{
-    RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
-};
 
 /// Standard normal pdf.
 #[inline]
@@ -28,7 +26,7 @@ fn phi(x: f64) -> f64 {
 /// Standard normal cdf. Wrapper for the codebase's `normal_cdf`.
 #[inline]
 fn cdf(x: f64) -> f64 {
-    crate::inference::probability::normal_cdf(x)
+    gam_math::probability::normal_cdf(x)
 }
 
 /// Probit IRLS row weight `w_i · φ(η)² / (Φ(η) · Φ(−η))`. Clamped strictly

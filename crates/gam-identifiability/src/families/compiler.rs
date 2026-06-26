@@ -16,11 +16,11 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2, Array3, Axis, s};
 
+use faer::Side;
 use gam_linalg::faer_ndarray::{
     FaerEigh, default_rrqr_rank_alpha, fast_ab, fast_ata, fast_atb, fast_xt_diag_y,
     rrqr_with_permutation,
 };
-use faer::Side;
 
 /// Slack factor (multiples of machine ε) for the rank-revealing eigenvalue
 /// threshold used when pseudo-inverting a Gram matrix or selecting the

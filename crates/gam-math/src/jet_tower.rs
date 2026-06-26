@@ -1599,7 +1599,11 @@ mod tests {
 
         assert_eq!(prog3.v.to_bits(), prog4.v.to_bits(), "value mismatch");
         for i in 0..3 {
-            assert_eq!(prog3.g[i].to_bits(), prog4.g[i].to_bits(), "g[{i}] mismatch");
+            assert_eq!(
+                prog3.g[i].to_bits(),
+                prog4.g[i].to_bits(),
+                "g[{i}] mismatch"
+            );
             for j in 0..3 {
                 assert_eq!(
                     prog3.h[i][j].to_bits(),
@@ -2592,17 +2596,6 @@ mod tests {
 }
 
 #[inline]
-fn normal_pdf(x: f64) -> f64 {
-    const INV_SQRT_2PI: f64 = 0.398_942_280_401_432_7;
-    INV_SQRT_2PI * (-0.5 * x * x).exp()
-}
-
-#[inline]
-fn normal_cdf(x: f64) -> f64 {
-    0.5 * statrs::function::erf::erfc(-x / std::f64::consts::SQRT_2)
-}
-
-#[inline]
 fn erfcx_nonnegative(x: f64) -> f64 {
     if !x.is_finite() {
         return if x.is_sign_positive() {
@@ -2655,8 +2648,8 @@ fn signed_probit_logcdf_and_mills_ratio(x: f64) -> (f64, f64) {
         let lambda = (2.0 / std::f64::consts::PI).sqrt() / ex;
         (log_cdf, lambda)
     } else {
-        let cdf = normal_cdf(x).clamp(1e-300, 1.0);
-        let lambda = normal_pdf(x) / cdf;
+        let cdf = crate::probability::normal_cdf(x).clamp(1e-300, 1.0);
+        let lambda = crate::probability::normal_pdf(x) / cdf;
         (cdf.ln(), lambda)
     }
 }
