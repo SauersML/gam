@@ -1528,7 +1528,7 @@ pub(crate) fn adjudicate_atom_shape<'py>(
 /// the cross-fit concurrency gain at the battery's true cell shapes.
 #[pyfunction]
 pub(crate) fn sweep_color_arm_throughput<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-    use gam::gpu::kernels::sae_resident::{
+    use gam::solver::gpu_kernels::sae_resident::{
         DeviceResidentInnerOptions, assert_sweep_parity_vs_sequential, color_arm_variant_matrix,
         run_variant_sweep_multiplexed,
     };

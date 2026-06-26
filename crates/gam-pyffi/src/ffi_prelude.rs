@@ -118,7 +118,7 @@ pub(crate) use gam::families::fit_orchestration::drivers::{
     build_term_collection_design, freeze_term_collection_from_design,
 };
 
-pub(crate) use gam::solver::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;
+pub(crate) use gam::families::fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;
 
 pub(crate) use gam::solver::evidence::{
     RemlCandidate, compare_reml_fits as compare_reml_fits_core, log_bayes_factor,
@@ -180,11 +180,15 @@ pub(crate) use gam::terms::smooth::BlockwisePenalty;
 
 pub(crate) use gam::terms::{
     AnalyticPenalty as AnalyticPenaltyTrait, AnalyticPenaltyKind, AnalyticPenaltyRegistry,
-    EdgeRestriction as CoreEdgeRestriction, GatedSAEDecoder,
-    IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty, MaternBasisGradientTarget,
+    EdgeRestriction as CoreEdgeRestriction,
+    IvaeRidgeMeanGauge as IvaeRidgeMeanGaugePenalty,
     MechanismSparsityPenalty as CoreMechanismSparsityPenalty, ParametricRowPrecisionPriorPenalty,
     PenaltyTier, PsiSlice, RowPrecisionPriorPenalty,
-    SheafConsistencyPenalty as CoreSheafConsistencyPenalty, StreamingMaternBasisGradientEvaluator,
+    SheafConsistencyPenalty as CoreSheafConsistencyPenalty,
+};
+pub(crate) use gam::terms::decoders::gated_decoder::GatedSAEDecoder;
+pub(crate) use gam::terms::basis::matern_gradient::{
+    MaternBasisGradientTarget, StreamingMaternBasisGradientEvaluator,
 };
 
 pub(crate) use gam::families::transformation_normal::TransformationNormalFitResult;

@@ -568,18 +568,24 @@ impl<'a> RemlState<'a> {
     /// `RemlState` is gone would need an owned rebuild recipe; running at the
     /// live seam avoids that entirely.
     ///
-    /// [`Escalate`]: crate::inference::rho_posterior::RhoCertificate::Escalate
+    /// [`Escalate`]: gam_problem::rho_posterior::RhoCertificate::Escalate
     pub(crate) fn rho_posterior_inference(
         &self,
         final_rho: &Array1<f64>,
         n_samples: Option<usize>,
     ) -> (
-        Option<crate::inference::rho_posterior::RhoPosteriorCertificate>,
-        Option<crate::inference::rho_posterior::RhoPosteriorEscalation>,
+        Option<gam_problem::rho_posterior::RhoPosteriorCertificate>,
+        Option<gam_problem::rho_posterior::RhoPosteriorEscalation>,
     ) {
-        use crate::inference::rho_posterior::{
-            RhoCertificate, escalate_rho_posterior, rho_posterior_certificate,
-        };
+        // DATA types contract-downed to gam-problem (#1521); the certificate /
+        // escalation COMPUTATION (`rho_posterior_certificate`,
+        // `escalate_rho_posterior`) still lives UP in the monolith
+        // `inference::rho_posterior` (it pulls the gam-inference `hmc_io` NUTS
+        // sampler). FLAG #1521: this remains an upward-compute back-edge — it
+        // must be resolved together with the `hmc_io` edge (trait-inversion of
+        // the Tier-2 sampler, or moving this seam UP).
+        use gam_problem::rho_posterior::RhoCertificate;
+        use crate::inference::rho_posterior::{escalate_rho_posterior, rho_posterior_certificate};
         if final_rho.is_empty() {
             return (None, None);
         }

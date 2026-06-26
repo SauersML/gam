@@ -819,14 +819,14 @@ pub struct FitArtifacts {
     /// when there are no smoothing parameters or the outer Hessian was
     /// unavailable. Re-derivable from the fit, so it is not serialized.
     #[serde(default, skip_serializing, skip_deserializing)]
-    pub rho_posterior_certificate: Option<crate::inference::rho_posterior::RhoPosteriorCertificate>,
+    pub rho_posterior_certificate: Option<gam_problem::rho_posterior::RhoPosteriorCertificate>,
     /// Escalation outcome (#938) when the Tier-0 certificate read `Escalate`:
     /// the Tier-1 quadrature mixture (`K ≤ 4`), the Tier-2 NUTS draws
     /// (`K ≤ 16`), or an honest `Unavailable` report. `None` whenever the
     /// certificate did not escalate (or is itself absent). Computed at the same
     /// live-objective seam as the certificate; re-derivable, not serialized.
     #[serde(default, skip_serializing, skip_deserializing)]
-    pub rho_posterior_escalation: Option<crate::inference::rho_posterior::RhoPosteriorEscalation>,
+    pub rho_posterior_escalation: Option<gam_problem::rho_posterior::RhoPosteriorEscalation>,
     /// Regularized inverse REML/LAML outer Hessian over `rho = log(lambda)`,
     /// aligned with [`UnifiedFitResult::lambdas`]. This is the narrow #740
     /// handoff consumed by estimated-lambda Lawley LR corrections; it is

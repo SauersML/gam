@@ -67,7 +67,7 @@ use crate::custom_family::{
 use crate::multinomial_reml::MultinomialFamily;
 use crate::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector_glm};
 use crate::vector_response::{MultinomialLogitLikelihood, validate_multinomial_simplex};
-use crate::inference::formula_dsl::parse_formula;
+use gam_terms::inference::formula_dsl::parse_formula;
 use crate::model_types::EstimationError;
 use crate::fit_orchestration::{
     FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,

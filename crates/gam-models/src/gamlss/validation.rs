@@ -199,7 +199,7 @@ pub(super) fn validate_binomial_location_scalewiggle_termspec(
     validate_binomial_response(&spec.y, context)?;
     validate_binomial_log_sigma_identifiable(&spec.log_sigmaspec, context)?;
     validate_blockrows("wiggle", n, &spec.wiggle_block)?;
-    crate::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle(
+    gam_terms::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle(
         &spec.link_kind,
         context,
     )?;

@@ -43,6 +43,10 @@ mod pseudo_logdet;
 pub mod psi_design_contract;
 pub mod psi_terms;
 pub mod riemannian_retraction;
+// `ρ`-posterior certificate/escalation DATA types contract-downed (#1521) so
+// gam-solve can store/return them without a back-edge into gam-inference; the
+// computation stays UP in the monolith `inference::rho_posterior`.
+pub mod rho_posterior;
 pub mod row_measure;
 pub mod row_metric;
 pub mod schedule;

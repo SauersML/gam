@@ -24,7 +24,7 @@ use crate::wiggle::{
     WiggleBlockConfig, append_selected_wiggle_penalty_orders, buildwiggle_block_input_from_seed,
     monotone_wiggle_basis_with_derivative_order, split_wiggle_penalty_orders,
 };
-use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
+use gam_terms::inference::formula_dsl::LinkWiggleFormulaSpec;
 use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix, SparseDesignMatrix, symmetrize_in_place};
 use crate::probability::{normal_pdf, standard_normal_quantile};
 use gam_problem::{InverseLink, StandardLink};
@@ -3581,7 +3581,7 @@ mod tests {
         survival_baseline_theta_from_config,
     };
     use crate::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
-    use crate::inference::formula_dsl::LinkWiggleFormulaSpec;
+    use gam_terms::inference::formula_dsl::LinkWiggleFormulaSpec;
     use crate::probability::normal_cdf;
     use ndarray::{Array1, Array2, array};
 

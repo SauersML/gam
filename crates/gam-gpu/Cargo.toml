@@ -23,4 +23,5 @@ serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }
 
 [dev-dependencies]
+gam-problem = { path = "../gam-problem", version = "=0.3.124" }
 rand = "0.10.1"

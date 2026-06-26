@@ -156,6 +156,31 @@ macro_rules! define_analytic_penalty_kind {
     };
 }
 
+#[macro_export]
+macro_rules! analytic_penalty_registry {
+    ($macro:ident) => {
+        $macro! {
+            register!(Isometry, IsometryPenalty);
+            register!(Sparsity, SparsityPenalty);
+            register!(SoftmaxAssignmentSparsity, SoftmaxAssignmentSparsityPenalty);
+            register!(IBPAssignment, IBPAssignmentPenalty);
+            register!(Ard, ARDPenalty);
+            register!(TopKActivation, TopKActivationPenalty);
+            register!(JumpReLU, JumpReLUPenalty);
+            register!(TotalVariation, TotalVariationPenalty);
+            register!(NuclearNorm, NuclearNormPenalty);
+            register!(BlockSparsity, BlockSparsityPenalty);
+            register!(MechanismSparsity, MechanismSparsityPenalty);
+            register!(RowPrecisionPrior, RowPrecisionPriorPenalty);
+            register!(IvaeRidgeMeanGauge, IvaeRidgeMeanGauge);
+            register!(ParametricRowPrecisionPrior, ParametricRowPrecisionPriorPenalty);
+            register!(ScadMcp, ScadMcpPenalty);
+            register!(BlockOrthogonality, BlockOrthogonalityPenalty);
+            register!(Orthogonality, OrthogonalityPenalty);
+        }
+    };
+}
+
 crate::analytic_penalty_registry!(define_analytic_penalty_kind);
 
 impl AnalyticPenaltyKind {

@@ -1255,7 +1255,7 @@ pub(crate) fn fit_binomial_mean_wiggle(
         }
         .into());
     }
-    crate::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle(
+    gam_terms::inference::formula_dsl::require_binomial_inverse_link_supports_joint_wiggle(
         &spec.link_kind,
         "fit_binomial_mean_wiggle",
     )?;
