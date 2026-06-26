@@ -2127,6 +2127,16 @@ pub(crate) const LOWER_BOUND_SEPARATION_ACTIVE_MIN: usize = 2;
 /// those λ→0 axes can keep lowering the raw REML score even though the move is
 /// infeasible; once several such axes are active, repeated ARC trials there are
 /// constrained-stationary separation probes, not useful descent.
+///
+/// Sign convention (mirrors the KKT split in [`projected_gradient_norm`], fixed
+/// in a14b712 for the #1074/#1082 railing class): the optimizer MINIMIZES the
+/// cost and `gradient` is ∂cost/∂ρ, so at an active lower bound the descent step
+/// `-g_i` exits the box exactly when `g_i > 0` — a POSITIVE gradient is the
+/// infeasible outward/separation pull this counts. A NEGATIVE `g_i` is feasible
+/// interior descent (kept by `projected_gradient_norm`'s `g_i.min(0.0)`) and is
+/// NOT outward, so it must NOT be counted; doing so (the prior `< -outward_floor`
+/// inversion) certified railed/under-fit axes that still had real descent as
+/// separation-stationary.
 #[inline]
 pub(crate) fn lower_bound_outward_active_count(
     x: &Array1<f64>,
@@ -2140,9 +2150,13 @@ pub(crate) fn lower_bound_outward_active_count(
     let tol = 1.0e-10;
     let outward_floor = grad_threshold.max(COST_STALL_PROJECTED_GRAD_FLOOR);
     (0..x.len().min(gradient.len()).min(lower.len()))
-        .filter(|&i| x[i] <= lower[i] + tol && gradient[i] < -outward_floor)
+        .filter(|&i| x[i] <= lower[i] + tol && gradient[i] > outward_floor)
         .count()
 }
+
+#[cfg(test)]
+#[path = "lower_bound_outward_tests.rs"]
+mod lower_bound_outward_tests;
 
 #[inline]
 pub(crate) fn project_to_bounds(

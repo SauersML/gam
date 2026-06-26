@@ -1957,13 +1957,19 @@ fn lower_bound_outward_axes_mark_separation_stationarity() {
     let lower = array![-10.0, -10.0, -10.0, -10.0];
     let upper = array![10.0, 10.0, 10.0, 10.0];
     let rho = array![-10.0, -10.0, 0.25, 1.0];
-    let gradient = array![-2.0e-2, -4.0e-2, 3.0, -1.0];
+    // #1074/#1082 sign fix (mirrors a14b712): "outward" at an active LOWER bound
+    // means the minimization descent step -g_i exits BELOW the box, i.e. g_i > 0.
+    // Idx 0,1 are pinned at the lower bound with strong POSITIVE gradients (the
+    // genuine outward/separation pull) and must be counted; idx 2,3 are interior
+    // and must not. (The earlier fixture used negative gradients here, which is
+    // feasible interior descent under the corrected convention, not outward.)
+    let gradient = array![2.0e-2, 4.0e-2, 3.0, -1.0];
 
     assert_eq!(
         lower_bound_outward_active_count(&rho, &gradient, Some(&(lower, upper)), 1.0e-3),
         LOWER_BOUND_SEPARATION_ACTIVE_MIN,
-        "two lower-bound axes with outward gradients are enough to identify \
-         a separation-bound stationary probe"
+        "two lower-bound axes with outward (positive) gradients are enough to \
+         identify a separation-bound stationary probe"
     );
 }
 
