@@ -853,7 +853,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // unmemoized engine.
         let invariant = kron.invariant_structure()?;
         let kron_result = gam_terms::construction::kronecker_reparameterization_engine_with_invariant(
-            &invariant,
+            invariant.as_ref(),
             &kron.marginal_dims,
             lambdas_slice,
             kron.has_double_penalty,

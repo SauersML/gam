@@ -95,7 +95,7 @@ impl RadialScalarKind {
         }
     }
 
-    pub(crate) fn eval_design_triplet(&self, r: f64) -> Result<(f64, f64, f64), BasisError> {
+    pub fn eval_design_triplet(&self, r: f64) -> Result<(f64, f64, f64), BasisError> {
         match self {
             RadialScalarKind::Matern { length_scale, nu } => {
                 let (phi, q, t, _, _) =
