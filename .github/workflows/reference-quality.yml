@@ -291,6 +291,15 @@ jobs:
           # debug build no user experiences.
           cargo build --keep-going --profile release-dev --test quality 2>&1 | tail -120 \
             || echo "build reported errors; missing quality binary is flagged BUILDFAIL in the run step"
+          # A handful of quality tests (RMST, competing risks) shell out to the
+          # real `gam` CLI to exercise the end-to-end formula fit path. The CLI
+          # binary was peeled into the `gam-cli` workspace member (#1521), so it
+          # is NOT pulled in by `--test quality` and must be built explicitly
+          # under the SAME profile — otherwise those tests spawn a nonexistent
+          # `target/release-dev/gam` and report TEST_ERROR every run.
+          echo "building the gam CLI binary (gam-cli) so CLI-shelling quality tests can spawn it"
+          cargo build --keep-going --profile release-dev -p gam-cli --bin gam 2>&1 | tail -40 \
+            || echo "gam CLI build reported errors; CLI-shelling quality tests will report TEST_ERROR"
 
       - name: Run quality suite (resilient + streaming; full per-test capture)
         shell: bash
