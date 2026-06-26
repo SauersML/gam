@@ -36,9 +36,7 @@ pub enum CustomFamilyError {
     /// classifier) can extract the alias pairs and the summary string
     /// without reparsing.
     #[error("identifiability audit refused the fit: {}", audit.summary)]
-    IdentifiabilityFailure {
-        audit: IdentifiabilityAudit,
-    },
+    IdentifiabilityFailure { audit: IdentifiabilityAudit },
     /// MAP estimate uniqueness condition `ker(J^T W J) ∩ ker(S) = {0}` is
     /// violated.  A null direction of `J^T W J` carries zero penalty
     /// curvature, so the posterior is flat along that direction and the
@@ -46,9 +44,7 @@ pub enum CustomFamilyError {
     /// dominant block so the caller can add the missing penalty or remove
     /// the unpenalised direction.
     #[error("MAP estimate non-unique: {}", error)]
-    MapUniquenessFailure {
-        error: MapUniquenessError,
-    },
+    MapUniquenessFailure { error: MapUniquenessError },
 }
 
 impl From<String> for CustomFamilyError {

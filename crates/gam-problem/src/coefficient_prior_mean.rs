@@ -107,11 +107,7 @@ impl CoefficientPriorMean {
         }
     }
 
-    pub fn evaluate(
-        &self,
-        block_dim: usize,
-        context: &str,
-    ) -> Result<Array1<f64>, PriorMeanError> {
+    pub fn evaluate(&self, block_dim: usize, context: &str) -> Result<Array1<f64>, PriorMeanError> {
         let values = match self {
             Self::Zero => Array1::zeros(block_dim),
             Self::Scalar(value) => {

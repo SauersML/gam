@@ -64,9 +64,7 @@ impl PenaltyMatrix {
     pub fn to_dense(&self) -> Array2<f64> {
         match self {
             Self::Dense(m) => m.clone(),
-            Self::KroneckerFactored { left, right } => {
-                kronecker_product(left, right)
-            }
+            Self::KroneckerFactored { left, right } => kronecker_product(left, right),
             Self::Blockwise {
                 local,
                 col_range,
