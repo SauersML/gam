@@ -61,8 +61,16 @@ impl RidgePolicy {
         }
     }
 
-    /// Solver-only stabilization: the ridge `delta I` stabilizes the inner linear
-    /// solve but is excluded from the REML/LAML objective.
+    /// Solver-only stabilization: the ridge `δI` stabilizes the inner linear
+    /// solve (it bounds the Newton step `(H+δI)⁻¹∇`) but is **excluded** from
+    /// the REML/LAML objective — no `½·δ·‖β‖²` quadratic-penalty term, no
+    /// `δ`-shift of the penalty log-determinant, no `δ`-shift of the Laplace
+    /// Hessian. Use this when a numerical floor is needed purely to keep the
+    /// linear algebra finite during screening and must NOT bias the
+    /// smoothing-parameter selection or shrink identified coefficients off the
+    /// MLE. With every `include_*` false the optimized objective equals the
+    /// true penalized REML criterion, so the value surface and its analytic
+    /// gradient describe the same objective (gam#747/#748).
     pub const fn solver_only() -> Self {
         Self {
             rho_independent: true,
