@@ -2769,6 +2769,54 @@ mod tests {
     }
 
     #[test]
+    pub(crate) fn dense_skip_below_size_threshold_matches_exact_gate() {
+        // #1389: below the size threshold the EXACT dense gate replaces the old
+        // unconditional "never skip". A well-conditioned SMALL spectrum must be
+        // declared skippable AND be byte-identical to forming the gated-off term —
+        // the per-cycle / per-outer-eval Jeffreys all-axes sweep the constant-scale
+        // survival location-scale fit was paying on a system this size — while a
+        // near-separating small spectrum must NOT skip so the exact term still fires
+        // where the curvature is needed.
+        let p = CHEAP_CONDITIONING_PRECHECK_MIN_DIM - 1; // a small joint system
+        let z = Array2::<f64>::eye(p);
+        let hdir = |_d: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
+            Ok(Some(Array2::<f64>::zeros((p, p))))
+        };
+
+        // Well-conditioned: λ_min = 100 clears both gate knots. The exact
+        // eigenvalues need NO safety margin (unlike the conservative matvec bound),
+        // so this small system — which the old floor refused to ever skip — is now
+        // skippable, and the exact term on the same H is the zero term.
+        let mut h_ok = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            h_ok[[i, i]] = 100.0;
+        }
+        assert!(
+            jeffreys_term_skippable_dense(h_ok.view()).unwrap(),
+            "a well-conditioned small system must be skippable"
+        );
+        let (phi, grad, hphi) = joint_jeffreys_term(h_ok.view(), z.view(), hdir).unwrap();
+        assert_eq!(
+            phi, 0.0,
+            "dense-skip ⇒ exact phi must be zero (byte-identical)"
+        );
+        assert!(grad.iter().all(|v| *v == 0.0));
+        assert!(hphi.iter().all(|v| *v == 0.0));
+
+        // Near-separating: one near-zero eigenvalue (λ_min = 1e-3) below the
+        // absolute gate (1.0). The Firth term is genuinely needed ⇒ must NOT skip.
+        let mut h_bad = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            h_bad[[i, i]] = 50.0;
+        }
+        h_bad[[7, 7]] = 1e-3;
+        assert!(
+            !jeffreys_term_skippable_dense(h_bad.view()).unwrap(),
+            "a near-separating small system must NOT be skipped (term is needed)"
+        );
+    }
+
+    #[test]
     pub(crate) fn cheap_precheck_bails_on_nonfinite_matvec() {
         // A matvec that returns non-finite values cannot certify conditioning ⇒
         // the pre-check must return false (never skip on an unresolved estimate).
