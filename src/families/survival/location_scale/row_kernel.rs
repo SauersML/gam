@@ -1203,6 +1203,89 @@ impl crate::families::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'
             std::array::from_fn(|a| TwoSeed::seed(p[a], a, dir_u[a], dir_v[a]));
         Ok(sls_row_nll(&vars, &kernel)?.contracted_fourth())
     }
+
+    /// Batched all-axes first directional derivative with the per-row NLL
+    /// derivative stack built ONCE and reused across every swept axis.
+    ///
+    /// The generic per-axis dispatcher computes the `p` matrices `{∂H/∂β[e_a]}`
+    /// by running `p` independent single-direction sweeps. Each sweep, for each
+    /// row, calls `row_third_contracted` → `row_nll_inputs` →
+    /// `exact_row_kernel_rescaled`, the special-function-heavy derivative ladder
+    /// (`exp` / `log` / log-Φ derivatives). That ladder is INDEPENDENT of the
+    /// swept axis, so the per-axis path rebuilds it `p` times per row — the
+    /// dominant cost of the inner-Newton Jeffreys term and the outer-REML
+    /// Jeffreys `H_Φ` drift, which probe this every joint evaluation. Here each
+    /// row's `(primary, kernel)` is materialized a single time, then every axis
+    /// closes against the cached stack with only the cheap `OneSeed` jet
+    /// arithmetic and the design-row pullback.
+    ///
+    /// **Correctness contract.** Output `a` equals, bit-for-bit, the generic
+    /// per-axis `row_kernel_directional_derivative(self, rows, e_a)`: the same
+    /// `RowSet` reduction primitive (chunk-index-order
+    /// `par_try_reduce_fold`), the same per-row
+    /// `jacobian_action → sls_row_nll(seed_direction(..)).contracted_third() →
+    /// add_pullback_hessian` pipeline, reading a cached `(primary, kernel)` that
+    /// is identical (a pure function of `row`) to the per-call rebuild. Only the
+    /// full-data unit-weight `RowSet::All` case is accelerated; a subsample
+    /// declines (`None`) so the generic Horvitz–Thompson per-axis path runs.
+    fn directional_derivative_all_axes_dense_override(
+        &self,
+        rows: &crate::families::row_kernel::RowSet,
+        p: usize,
+    ) -> Option<Result<Vec<Array2<f64>>, String>> {
+        if p != self.n_coefficients() {
+            return Some(Err(format!(
+                "directional_derivative_all_axes_dense_override: axis count {p} disagrees \
+                 with n_coefficients() {}",
+                self.n_coefficients(),
+            )));
+        }
+        let crate::families::row_kernel::RowSet::All = rows else {
+            return None;
+        };
+        Some((|| {
+            let n = self.n_rows();
+            // One special-function-heavy per-row NLL stack build, shared by every axis.
+            let inputs: Vec<([f64; SLS_ROW_K], SurvivalExactRowKernel)> = (0..n)
+                .into_par_iter()
+                .map(|row| self.row_nll_inputs(row))
+                .collect::<Result<Vec<_>, String>>()?;
+            (0..p)
+                .into_par_iter()
+                .map(|a| {
+                    let mut e_a = vec![0.0_f64; p];
+                    e_a[a] = 1.0;
+                    gam_problem::with_nested_parallel(|| {
+                        rows.par_try_reduce_fold(
+                            n,
+                            || Array2::<f64>::zeros((p, p)),
+                            |mut acc, row, w| -> Result<_, String> {
+                                let dir_k = self.jacobian_action(row, &e_a);
+                                let (primary, kernel) = &inputs[row];
+                                let vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(
+                                    |c| OneSeed::seed_direction(primary[c], c, dir_k[c]),
+                                );
+                                let third = sls_row_nll(&vars, kernel)?.contracted_third();
+                                if w == 1.0 {
+                                    self.add_pullback_hessian(row, &third, &mut acc);
+                                } else {
+                                    let mut scaled = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
+                                    for x in 0..SLS_ROW_K {
+                                        for y in 0..SLS_ROW_K {
+                                            scaled[x][y] = w * third[x][y];
+                                        }
+                                    }
+                                    self.add_pullback_hessian(row, &scaled, &mut acc);
+                                }
+                                Ok(acc)
+                            },
+                            |x, y| Ok(x + y),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })())
+    }
 }
 
 impl SurvivalLocationScaleFamily {
