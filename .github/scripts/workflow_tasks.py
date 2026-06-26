@@ -71,7 +71,9 @@ def build_matrix():
         for name in names:
             m = pattern.match(name)
             if not m:
-                selected.append(name)
+                # Unparsed names are re-added below via `from_unparsed`; do not
+                # touch `selected` here (it is not defined yet — appending would
+                # raise NameError on every workflow_dispatch run).
                 continue
             family = m.group(1)
             n_val = int(m.group(2))
@@ -95,9 +97,25 @@ def build_matrix():
         selected.extend(from_unparsed)
         selected = sorted(list(set(selected)))
 
-    matrix = {"scenario": selected}
+    # benchmark.yml fans the selected scenarios across two jobs:
+    #   `bench-shard`        (max-parallel 8, gated on `parallel_count != '0'`)
+    #   `bench-shard-serial` (max-parallel 1, gated on `serial_count != '0'`)
+    # and reads `prepare`'s `parallel_matrix` / `parallel_count` /
+    # `serial_matrix` / `serial_count` outputs to do so. Emitting only a single
+    # `matrix` output here (the historical shape) left all four of those
+    # downstream outputs empty, so `fromJSON('')` expanded to nothing and BOTH
+    # shard jobs ran zero scenarios — the suite went green while benchmarking
+    # nothing (#1560). Split `selected` into the serial and parallel buckets and
+    # emit exactly the four outputs the workflow consumes.
+    serial = [s for s in selected if s in SERIAL_SCENARIOS]
+    parallel = [s for s in selected if s not in SERIAL_SCENARIOS]
+    parallel_matrix = {"scenario": parallel}
+    serial_matrix = {"scenario": serial}
     with open(os.environ["GITHUB_OUTPUT"], "a") as f:
-        f.write(f"matrix={json.dumps(matrix)}\n")
+        f.write(f"parallel_matrix={json.dumps(parallel_matrix)}\n")
+        f.write(f"parallel_count={len(parallel)}\n")
+        f.write(f"serial_matrix={json.dumps(serial_matrix)}\n")
+        f.write(f"serial_count={len(serial)}\n")
         f.write(f"is_nightly={'true' if is_nightly else 'false'}\n")
 
 def extract_maturin_wheel(out_dir_arg="gamfit"):
