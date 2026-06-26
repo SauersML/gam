@@ -1965,11 +1965,21 @@ pub(crate) fn run_outer_with_plan(
         // (optimizer.rs:135) and the accept-fit's "full inner budget" intent
         // (gradient_hessian.rs:6469), then restore the prior cap so any later
         // schedule-driven evaluation sees the value it expects.
-        let _finalize_cap_guard = config
+        // Held in a named binding and dropped explicitly after the finalize
+        // (which restores the prior cap), rather than `let _guard`: the
+        // workspace ban-scanner (build.rs) forbids every underscore-leading
+        // `let` pattern, and a plain `let guard` would trip `unused_variables`
+        // under `warnings = "deny"`. The explicit `drop(...)` is the idiomatic
+        // "use" (see e.g. `hessian_scope_guard` in custom_family). The guard's
+        // Drop runs before `?` propagates a finalize error, so the cap is
+        // restored on both the success and the abort path.
+        let finalize_cap_guard = config
             .outer_inner_cap
             .as_ref()
             .map(|feedback| FinalizeInnerCapGuard::lift(feedback.cap.as_ref()));
-        obj.finalize_outer_result(&result.rho, the_plan)?;
+        let finalize_outcome = obj.finalize_outer_result(&result.rho, the_plan);
+        drop(finalize_cap_guard);
+        finalize_outcome?;
         return Ok(result);
     }
 
