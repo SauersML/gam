@@ -50,7 +50,7 @@ impl SmoothError {
         }
     }
     #[inline]
-    pub(super) fn dimension_mismatch(reason: impl Into<String>) -> Self {
+    pub fn dimension_mismatch(reason: impl Into<String>) -> Self {
         SmoothError::DimensionMismatch {
             reason: reason.into(),
         }

@@ -1557,7 +1557,7 @@ pub(crate) fn resolve_smooth_type_name(
 /// B-spline, cyclic, tensor, and factor-smooth bases use their own modest
 /// knot-based defaults, so they are unaffected by — and must not be perturbed
 /// by — secondary-predictor basis-parsimony adjustments (#501).
-pub(crate) fn smooth_type_uses_spatial_center_heuristic(canonical_type: &str) -> bool {
+pub fn smooth_type_uses_spatial_center_heuristic(canonical_type: &str) -> bool {
     matches!(canonical_type, "tps" | "matern" | "duchon")
 }
 

@@ -340,7 +340,7 @@ fn trace_penalty_in_orthogonal_basis(
     trace.sum()
 }
 
-pub(crate) fn trace_reduced_penalty_covariance(
+pub fn trace_reduced_penalty_covariance(
     reduced_penalty: &Array2<f64>,
     covariance_basis: &Array2<f64>,
 ) -> f64 {
@@ -359,7 +359,7 @@ pub(crate) fn trace_reduced_penalty_covariance(
     trace.sum()
 }
 
-pub(crate) fn trace_penalty_covariance_in_orthogonal_basis(
+pub fn trace_penalty_covariance_in_orthogonal_basis(
     matrix: &Array2<f64>,
     orthogonal: &Array2<f64>,
     covariance_basis: &Array2<f64>,

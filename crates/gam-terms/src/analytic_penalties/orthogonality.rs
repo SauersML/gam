@@ -833,7 +833,7 @@ impl DecoderIncoherencePenalty {
     /// `O(β · Σ_pairs M_j·M_k·p)`: once `β = K·M·p` and the collinearity gate
     /// admits `O(K)` co-active pairs, the probe loop spends `O(K²)` time
     /// rebuilding a matrix this assembles in `O(K)` (#1026).
-    pub(crate) fn accumulate_psd_majorizer_dense(
+    pub fn accumulate_psd_majorizer_dense(
         &self,
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,

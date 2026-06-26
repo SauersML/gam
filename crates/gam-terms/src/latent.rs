@@ -1055,7 +1055,7 @@ impl LatentCoordValues {
         &self.manifold
     }
 
-    pub(crate) fn retraction_registry(&self) -> &LatentRetractionRegistry {
+    pub fn retraction_registry(&self) -> &LatentRetractionRegistry {
         &self.retraction_registry
     }
 
@@ -1067,7 +1067,7 @@ impl LatentCoordValues {
     /// non-Euclidean manifolds installed via `from_matrix_with_manifold` /
     /// `with_manifold`, which left the registry at its `all_euclidean`
     /// default. See `retract_flat_delta` for the matching update path.
-    pub(crate) fn effective_is_all_euclidean(&self) -> bool {
+    pub fn effective_is_all_euclidean(&self) -> bool {
         self.manifold.is_euclidean() && self.retraction_registry.is_all_euclidean()
     }
 
@@ -1078,7 +1078,7 @@ impl LatentCoordValues {
     /// the manifold is Euclidean but an explicit override retraction was
     /// supplied (e.g. via the JSON `retraction:` key) the registry's
     /// weights win.
-    pub(crate) fn effective_metric_weights(&self) -> Vec<f64> {
+    pub fn effective_metric_weights(&self) -> Vec<f64> {
         if self.manifold.is_euclidean() {
             self.retraction_registry.metric_weights(self.latent_dim)
         } else {
@@ -1090,7 +1090,7 @@ impl LatentCoordValues {
     /// the declared manifold is non-Euclidean it is authoritative; when it is
     /// Euclidean, an explicit override retraction (if any) decides. Returns a
     /// `Vec` of length `latent_dim`.
-    pub(crate) fn effective_axis_periods(&self) -> Vec<Option<f64>> {
+    pub fn effective_axis_periods(&self) -> Vec<Option<f64>> {
         let periods = if self.manifold.is_euclidean() {
             self.retraction_registry.axis_periods(self.latent_dim)
         } else {

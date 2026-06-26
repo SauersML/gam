@@ -12,9 +12,8 @@ use input_standardization::{
 
 use shape_constraints::{
     build_shape_constraint_design_1d, build_shape_linear_constraints_1d,
-    linear_constraints_from_lower_bounds_global, merge_linear_constraints_global,
-    shape_lower_bounds_local, shape_order_and_sign, shape_supports_basis,
-    shape_uses_box_reparameterization,
+    merge_linear_constraints_global, shape_lower_bounds_local, shape_order_and_sign,
+    shape_supports_basis, shape_uses_box_reparameterization,
 };
 
 pub fn describe_thin_plate_center_request(strategy: &CenterStrategy) -> String {
@@ -3009,6 +3008,69 @@ pub fn center_aniso_log_scales(eta: &[f64]) -> Vec<f64> {
         .collect()
 }
 
+/// Whether a spatial term contributes per-axis ψ entries to the outer joint
+/// hyperparameter vector.
+pub fn spatial_term_uses_per_axis_psi(resolvedspec: &TermCollectionSpec, term_idx: usize) -> bool {
+    if let Some(mj) = measure_jet_term_spec(resolvedspec, term_idx) {
+        return measure_jet_enrolls_psi(mj);
+    }
+    let Some(d) = get_spatial_feature_dim(resolvedspec, term_idx) else {
+        return false;
+    };
+    if d <= 1 {
+        return false;
+    }
+    let Some(eta) = get_spatial_aniso_log_scales(resolvedspec, term_idx) else {
+        return false;
+    };
+    if eta.len() != d {
+        return false;
+    }
+    !matches!(
+        resolvedspec.smooth_terms.get(term_idx).map(|term| &term.basis),
+        Some(SmoothBasisSpec::Duchon { .. })
+    )
+}
+
+pub fn set_spatial_length_scale(
+    spec: &mut TermCollectionSpec,
+    term_idx: usize,
+    length_scale: f64,
+) -> Result<(), EstimationError> {
+    let Some(term) = spec.smooth_terms.get_mut(term_idx) else {
+        crate::bail_invalid_estim!("spatial length-scale term index {term_idx} out of range");
+    };
+    match &mut term.basis {
+        SmoothBasisSpec::ThinPlate { spec, .. } => {
+            spec.length_scale = length_scale;
+            Ok(())
+        }
+        SmoothBasisSpec::Matern { spec, .. } => {
+            spec.length_scale = length_scale;
+            Ok(())
+        }
+        SmoothBasisSpec::Duchon { spec, .. } => {
+            spec.length_scale = Some(length_scale);
+            Ok(())
+        }
+        _ => Err(EstimationError::InvalidInput(format!(
+            "term '{}' does not expose a spatial length scale",
+            term.name
+        ))),
+    }
+}
+
+pub fn get_spatial_length_scale(spec: &TermCollectionSpec, term_idx: usize) -> Option<f64> {
+    spec.smooth_terms
+        .get(term_idx)
+        .and_then(|term| match &term.basis {
+            SmoothBasisSpec::ThinPlate { spec, .. } => Some(spec.length_scale),
+            SmoothBasisSpec::Matern { spec, .. } => Some(spec.length_scale),
+            SmoothBasisSpec::Duchon { spec, .. } => spec.length_scale,
+            _ => None,
+        })
+}
+
 pub fn spatial_term_supports_hyper_optimization(spec: &TermCollectionSpec, term_idx: usize) -> bool {
     // Ordinary penalized thin-plate regression splines do not have an
     // identifiable kernel scale once REML is already learning the smoothing
@@ -3393,6 +3455,29 @@ pub fn set_single_term_constant_curvature_kappa(
 pub fn spatial_term_has_locked_kappa(spec: &TermCollectionSpec, term_idx: usize) -> bool {
     get_spatial_length_scale(spec, term_idx).is_some()
         && !spatial_term_uses_per_axis_psi(spec, term_idx)
+}
+
+pub fn spatial_identifiability_policy(termspec: &SmoothTermSpec) -> Option<&SpatialIdentifiability> {
+    match &termspec.basis {
+        SmoothBasisSpec::ThinPlate { spec, .. } => Some(&spec.identifiability),
+        SmoothBasisSpec::Duchon { spec, .. } => Some(&spec.identifiability),
+        _ => None,
+    }
+}
+
+/// Standard deviation of the wide, weakly-informative symmetric `Normal` prior
+/// placed on a relaxable double-penalty smooth's `DoublePenaltyNullspace`
+/// selection coordinate when the fit is well-determined.
+pub const NULLSPACE_WELLDET_DEGENERACY_RHO_SD: f64 = 15.0;
+
+/// True iff `prior` is the well-determined double-penalty null-space
+/// degeneracy prior placed on a `DoublePenaltyNullspace` selection coordinate.
+pub fn is_nullspace_degeneracy_prior(prior: &gam_spec::RhoPrior) -> bool {
+    matches!(
+        prior,
+        gam_spec::RhoPrior::Normal { mean, sd }
+            if *mean == 0.0 && *sd == NULLSPACE_WELLDET_DEGENERACY_RHO_SD
+    )
 }
 
 /// Per-term data-derived ψ = log κ bounds.
@@ -3890,12 +3975,12 @@ impl SpatialLengthScaleOptimizationOptions {
 
 #[derive(Debug, Clone)]
 pub struct RandomEffectBlock {
-    name: String,
+    pub name: String,
     /// O(n) group-label vector: group_ids[i] = column index in [0, num_groups).
     /// `None` if the observation's level is not in the kept set.
-    group_ids: Vec<Option<usize>>,
-    num_groups: usize,
-    kept_levels: Vec<u64>,
+    pub group_ids: Vec<Option<usize>>,
+    pub num_groups: usize,
+    pub kept_levels: Vec<u64>,
 }
 
 pub const BLOCK_SPARSE_ZERO_EPS: f64 = 1e-12;
@@ -5880,7 +5965,7 @@ impl DenseDesignOperator for PcaScoresMemmapDesignOperator {
         Ok(())
     }
 
-    pub fn to_dense(&self) -> Array2<f64> {
+    fn to_dense(&self) -> Array2<f64> {
         let mut out = Array2::<f64>::zeros((self.nrows, self.ncols));
         self.row_chunk_into(0..self.nrows, out.view_mut())
             .expect("lazy Pca full materialization failed");
