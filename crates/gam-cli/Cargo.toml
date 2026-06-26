@@ -29,11 +29,11 @@ statrs = "0.18.0"
 thiserror = "2.0.18"
 
 [dev-dependencies]
-# The shared CLI test suite (tests/src_modules/misc/cli_tests.rs) is pulled into
-# the gam-cli binary's TEST build via `#[path]` (see src/main.rs). It uses
-# `rand_distr` for noise generation and `tempfile` for scratch dirs, so these
-# must be declared here even though the non-test binary does not need them.
-# Versions match the rest of the workspace (root Cargo.toml).
+# The binary's `#[cfg(test)] mod cli_tests` pulls in the shared CLI test suite
+# (tests/src_modules/misc/cli_tests.rs) by `#[path]` (see src/main.rs). That
+# suite synthesises data with `rand_distr` and writes scratch files with
+# `tempfile`; both were dev-deps of the monolithic gam crate that originally
+# compiled the suite, and must follow it here. Versions match the workspace root.
 rand_distr = "0.6.0"
 tempfile = "3.27.0"
 
