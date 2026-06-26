@@ -571,6 +571,187 @@ impl<const K: usize> std::ops::Mul<f64> for Tower2<K> {
     }
 }
 
+/// Truncated THIRD-order multivariate Taylor scalar in `K` variables.
+///
+/// The value/gradient/Hessian/third-derivative sibling of [`Tower4`], standing
+/// between [`Tower2`] and [`Tower4`]. Every channel it carries (`v`, `g`, `h`,
+/// `t3`) is computed by the SAME shared Leibniz / Faà-di-Bruno kernels
+/// [`Tower4`] uses for those orders, and the order-≤3 terms of those kernels
+/// read only the order-≤3 channels of their inputs (the order-3 Faà-di-Bruno
+/// partitions never reach the f⁗ stack slot or the inner `t4` tensor — see
+/// [`Tower4::compose_unary`]). So for any program written over both towers the
+/// order-≤3 outputs are *bit-identical*: dropping the fourth tensor cannot
+/// perturb the value, gradient, Hessian, or third derivatives.
+///
+/// It exists purely for performance, exactly like [`Tower2`]: a consumer that
+/// needs up to third derivatives (the survival location-scale row kernel reads
+/// `g`, the diagonal `h`, and the diagonal `t3`, but never `t4`) pays the
+/// `K³` third-tensor arithmetic but skips the `K⁴` fourth-tensor
+/// product/composition that otherwise dominates the per-row cost.
+#[derive(Clone, Copy, Debug)]
+pub struct Tower3<const K: usize> {
+    /// Value ℓ.
+    pub v: f64,
+    /// Gradient ∂ℓ/∂p_a.
+    pub g: [f64; K],
+    /// Hessian ∂²ℓ/∂p_a∂p_b (symmetric).
+    pub h: [[f64; K]; K],
+    /// Third derivatives ∂³ℓ/∂p_a∂p_b∂p_c (fully symmetric).
+    pub t3: [[[f64; K]; K]; K],
+}
+
+impl<const K: usize> Tower3<K> {
+    /// The additive identity.
+    pub fn zero() -> Self {
+        Self {
+            v: 0.0,
+            g: [0.0; K],
+            h: [[0.0; K]; K],
+            t3: [[[0.0; K]; K]; K],
+        }
+    }
+
+    /// A constant: value `c`, all derivatives zero.
+    pub fn constant(c: f64) -> Self {
+        let mut out = Self::zero();
+        out.v = c;
+        out
+    }
+
+    /// The seeded variable `p_idx` with current value `value`:
+    /// unit first derivative in slot `idx`, zero elsewhere and above.
+    pub fn variable(value: f64, idx: usize) -> Self {
+        let mut out = Self::constant(value);
+        out.g[idx] = 1.0;
+        out
+    }
+
+    /// Read the (fully symmetric) derivative tensor entry whose differentiation
+    /// axes are `labels` (length 0..=3): value, `g`, `h`, `t3`.
+    #[inline]
+    fn deriv(&self, labels: &[usize]) -> f64 {
+        assert!(
+            labels.len() <= 3,
+            "Tower3 carries at most third-order derivatives"
+        );
+        match labels.len() {
+            0 => self.v,
+            1 => self.g[labels[0]],
+            2 => self.h[labels[0]][labels[1]],
+            _ => self.t3[labels[0]][labels[1]][labels[2]],
+        }
+    }
+
+    /// Exact truncated (order ≤ 3) Leibniz product. The `v`/`g`/`h`/`t3`
+    /// channels match [`Tower4::mul`] term-for-term.
+    pub fn mul(&self, o: &Self) -> Self {
+        let a = self;
+        let b = o;
+        let mut out = Self::zero();
+        out.v = a.v * b.v;
+        for i in 0..K {
+            let labels = [i];
+            out.g[i] = jet_algebra::leibniz_product(&labels, |t| a.deriv(t), |c| b.deriv(c));
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let labels = [i, j];
+                out.h[i][j] = jet_algebra::leibniz_product(&labels, |t| a.deriv(t), |c| b.deriv(c));
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    let labels = [i, j, k];
+                    out.t3[i][j][k] =
+                        jet_algebra::leibniz_product(&labels, |t| a.deriv(t), |c| b.deriv(c));
+                }
+            }
+        }
+        out
+    }
+
+    /// Exact (order ≤ 3) multivariate Faà di Bruno composition `f ∘ self`.
+    ///
+    /// `d = [f(u), f′(u), f″(u), f‴(u)]` evaluated at `u = self.v`. The
+    /// `v`/`g`/`h`/`t3` channels match [`Tower4::compose_unary`] term-for-term
+    /// (which uses only `d[0..=3]` for those orders), so this is a strict
+    /// truncation, not an approximation. The full-order `[f64; 5]` derivative
+    /// stacks the families already produce can be passed by slicing their first
+    /// four entries.
+    pub fn compose_unary(&self, d: [f64; 4]) -> Self {
+        <Self as jet_algebra::JetAlgebra<4>>::compose_unary(self, d)
+    }
+
+    /// Multiply every channel by a plain scalar.
+    pub fn scale(&self, s: f64) -> Self {
+        let mut out = *self;
+        out.v *= s;
+        for i in 0..K {
+            out.g[i] *= s;
+            for j in 0..K {
+                out.h[i][j] *= s;
+                for k in 0..K {
+                    out.t3[i][j][k] *= s;
+                }
+            }
+        }
+        out
+    }
+}
+
+impl<const K: usize> jet_algebra::JetAlgebra<4> for Tower3<K> {
+    #[inline]
+    fn derivative(&self, labels: &[usize]) -> f64 {
+        self.deriv(labels)
+    }
+
+    fn map_derivatives<F>(&self, mut f: F) -> Self
+    where
+        F: FnMut(&[usize]) -> f64,
+    {
+        let mut out = Self::zero();
+        out.v = f(&[]);
+        for i in 0..K {
+            let labels = [i];
+            out.g[i] = f(&labels);
+        }
+        for i in 0..K {
+            for j in 0..K {
+                let labels = [i, j];
+                out.h[i][j] = f(&labels);
+            }
+        }
+        for i in 0..K {
+            for j in 0..K {
+                for k in 0..K {
+                    let labels = [i, j, k];
+                    out.t3[i][j][k] = f(&labels);
+                }
+            }
+        }
+        out
+    }
+}
+
+impl<const K: usize> std::ops::Add for Tower3<K> {
+    type Output = Self;
+    fn add(self, o: Self) -> Self {
+        let mut out = self;
+        out.v += o.v;
+        for i in 0..K {
+            out.g[i] += o.g[i];
+            for j in 0..K {
+                out.h[i][j] += o.h[i][j];
+                for k in 0..K {
+                    out.t3[i][j][k] += o.t3[i][j][k];
+                }
+            }
+        }
+        out
+    }
+}
+
 pub fn ln_gamma_derivative_stack(x: f64) -> [f64; 5] {
     [
         statrs::function::gamma::ln_gamma(x),
@@ -1382,6 +1563,59 @@ pub fn verify_kernel_channels<const K: usize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Tower3<K>` must be bit-identical to `Tower4<K>` on every channel it
+    /// carries (value, gradient, Hessian, third derivatives). The order-≤3
+    /// Leibniz / Faà-di-Bruno terms read only order-≤3 inner channels, so
+    /// dropping the fourth tensor cannot perturb them. Exercises products
+    /// (Leibniz cross-terms), unary composition, scaling, and addition — the
+    /// same operations the survival location-scale `nll_index_tower` composes —
+    /// across all mixed partials, not just the diagonal entries that kernel reads.
+    #[test]
+    fn tower3_matches_tower4_through_third_order() {
+        let s_a: [f64; 5] = [
+            0.3_f64.sin(),
+            0.3_f64.cos(),
+            -0.3_f64.sin(),
+            -0.3_f64.cos(),
+            0.3_f64.sin(),
+        ];
+        let s_b: [f64; 5] = [1.1, -0.4, 0.8, -0.2, 0.05];
+        let s4 = |s: [f64; 5]| [s[0], s[1], s[2], s[3]];
+
+        let a4 = Tower4::<3>::variable(0.4, 0);
+        let b4 = Tower4::<3>::variable(-0.7, 1);
+        let c4 = Tower4::<3>::variable(0.9, 2);
+        let prog4 = (a4.mul(&b4) + c4).compose_unary(s_a).scale(1.3)
+            + a4.mul(&c4).scale(-0.7)
+            + b4.compose_unary(s_b).scale(0.25);
+
+        let a3 = Tower3::<3>::variable(0.4, 0);
+        let b3 = Tower3::<3>::variable(-0.7, 1);
+        let c3 = Tower3::<3>::variable(0.9, 2);
+        let prog3 = (a3.mul(&b3) + c3).compose_unary(s4(s_a)).scale(1.3)
+            + a3.mul(&c3).scale(-0.7)
+            + b3.compose_unary(s4(s_b)).scale(0.25);
+
+        assert_eq!(prog3.v.to_bits(), prog4.v.to_bits(), "value mismatch");
+        for i in 0..3 {
+            assert_eq!(prog3.g[i].to_bits(), prog4.g[i].to_bits(), "g[{i}] mismatch");
+            for j in 0..3 {
+                assert_eq!(
+                    prog3.h[i][j].to_bits(),
+                    prog4.h[i][j].to_bits(),
+                    "h[{i}][{j}] mismatch"
+                );
+                for k in 0..3 {
+                    assert_eq!(
+                        prog3.t3[i][j][k].to_bits(),
+                        prog4.t3[i][j][k].to_bits(),
+                        "t3[{i}][{j}][{k}] mismatch"
+                    );
+                }
+            }
+        }
+    }
 
     /// Binomial-logit row NLL, K=1: ℓ(η) = ln(1 + e^η) − y·η.
     /// The entire tower has textbook closed forms in μ = σ(η); this test
