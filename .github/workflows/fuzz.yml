@@ -17,36 +17,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  gate:
-    name: Gate scheduled runs on recent changes
-    runs-on: ubuntu-latest
-    outputs:
-      run: ${{ steps.check.outputs.run }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
-      - id: check
-        shell: bash
-        run: |
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "Event ${{ github.event_name }} is not a schedule; running."
-            echo "run=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          latest=$(git log -1 --format=%ct)
-          now=$(date +%s)
-          age_min=$(( (now - latest) / 60 ))
-          window=1560
-          if [ "$age_min" -lt "$window" ]; then
-            echo "Last commit ${age_min}m ago (< ${window}m); running scheduled job."
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Last commit ${age_min}m ago (>= ${window}m); nothing changed, skipping."
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
   fuzz:
-    needs: gate
-    if: ${{ github.event_name != 'schedule' || needs.gate.outputs.run == 'true' }}
     name: Fuzz vs mgcv
     runs-on: ubuntu-latest
     timeout-minutes: 60
