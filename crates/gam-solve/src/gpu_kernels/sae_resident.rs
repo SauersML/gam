@@ -12,7 +12,7 @@ use ndarray::Array1;
 use crate::gpu_kernels::arrow_schur::{
     ArrowSchurGpuFailure, solve_arrow_newton_step, solve_arrow_newton_step_dense_reference,
 };
-use crate::model_types::ExecutionPath;
+use gam_problem::ExecutionPath;
 
 /// Per-iterate solve backend for the resident inner Newton loop.
 ///

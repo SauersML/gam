@@ -24,6 +24,7 @@ pub mod diagnostics;
 pub mod dispersion;
 pub mod dispersion_cov;
 pub mod estimation_error;
+pub mod execution_path;
 pub mod family_options;
 pub mod finite_validation;
 pub mod fisher_rao;
@@ -76,6 +77,7 @@ pub use custom_family_error::CustomFamilyError;
 pub use dispersion::Dispersion;
 pub use dispersion_cov::{DispersionExt, PhiScaledCovariance, UnscaledPrecision, se_from_covariance};
 pub use estimation_error::EstimationError;
+pub use execution_path::ExecutionPath;
 pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 pub use finite_validation::{
     ensure_finite_scalar, ensure_finite_scalar_estimation, validate_all_finite,

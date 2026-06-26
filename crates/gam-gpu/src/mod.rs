@@ -456,7 +456,7 @@ mod policy_tests {
 
     #[test]
     fn execution_path_defaults_to_cpu() {
-        use crate::model_types::ExecutionPath;
+        use gam_problem::ExecutionPath;
         // The truthful execution-path classifier must default to the CPU path,
         // so a result struct that is never told otherwise cannot claim the
         // device (the original `used_device: bool` defaulted the same way, but
