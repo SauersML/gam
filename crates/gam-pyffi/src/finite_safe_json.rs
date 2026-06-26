@@ -19,9 +19,16 @@
 //! parser), while `+∞ / -∞ / NaN` become the JSON strings `"Infinity" /
 //! "-Infinity" / "NaN"`. The matching deserializer accepts a number OR one of
 //! those tokens (case-insensitively, also tolerating `inf` / `-inf`), so the
-//! round-trip is total over all of `f64`. Both the serialize and deserialize
-//! payload structs reference the same `#[serde(with = …)]` adapters below, so
-//! the wire format stays symmetric by construction.
+//! round-trip is total over all of `f64`.
+//!
+//! The producer struct (`SurvivalPredictionPayload`, serialize-only) and the
+//! consumer struct (`SurvivalPredictionJsonPayload`, deserialize-only) sit on
+//! opposite ends of one in-process boundary, so the adapters below are
+//! intentionally one-directional: the producer's required fields use the
+//! `serialize`-only `vec` / `matrix` / `map` adapters, while the consumer's
+//! tolerant `Option` fields use the matching `opt_*` `deserialize` adapters.
+//! The encoded form is identical either way, so the boundary stays symmetric
+//! even though no single struct round-trips through both directions.
 //!
 //! The payload is an in-process, predict-time transport (engine → Python, never
 //! persisted in the saved model), so changing its non-finite encoding has no
@@ -133,53 +140,31 @@ fn unwrap_matrix(raw: Vec<Vec<SafeF64>>) -> Vec<Vec<f64>> {
     raw.into_iter().map(unwrap_vec).collect()
 }
 
-/// `#[serde(with = "finite_safe_json::vec")]` for a `Vec<f64>` field.
+/// Serialize a required `Vec<f64>` field — `#[serde(with = "…::vec")]`.
 pub mod vec {
-    use super::{Deserialize, Deserializer, SafeF64, SafeSlice, Serialize, Serializer, unwrap_vec};
+    use super::{SafeSlice, Serialize, Serializer};
 
     pub fn serialize<S: Serializer>(value: &[f64], serializer: S) -> Result<S::Ok, S::Error> {
         SafeSlice(value).serialize(serializer)
     }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<f64>, D::Error> {
-        Ok(unwrap_vec(Vec::<SafeF64>::deserialize(deserializer)?))
-    }
 }
 
-/// `#[serde(with = "finite_safe_json::matrix")]` for a `Vec<Vec<f64>>` field.
+/// Serialize a required `Vec<Vec<f64>>` field — `#[serde(with = "…::matrix")]`.
 pub mod matrix {
-    use super::{
-        Deserialize, Deserializer, SafeF64, SafeSlice, SerializeSeq, Serializer, unwrap_matrix,
-    };
+    use super::{SafeSlice, SerializeSeq, Serializer};
 
-    pub fn serialize<S: Serializer>(
-        value: &[Vec<f64>],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(value: &[Vec<f64>], serializer: S) -> Result<S::Ok, S::Error> {
         let mut seq = serializer.serialize_seq(Some(value.len()))?;
         for row in value {
             seq.serialize_element(&SafeSlice(row))?;
         }
         seq.end()
     }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<Vec<f64>>, D::Error> {
-        Ok(unwrap_matrix(Vec::<Vec<SafeF64>>::deserialize(
-            deserializer,
-        )?))
-    }
 }
 
-/// `#[serde(with = "finite_safe_json::map")]` for a `BTreeMap<String, Vec<f64>>`.
+/// Serialize a required `BTreeMap<String, Vec<f64>>` — `#[serde(with = "…::map")]`.
 pub mod map {
-    use super::{
-        BTreeMap, Deserialize, Deserializer, SafeF64, SafeSlice, SerializeMap, Serializer,
-        unwrap_vec,
-    };
+    use super::{BTreeMap, SafeSlice, SerializeMap, Serializer};
 
     pub fn serialize<S: Serializer>(
         value: &BTreeMap<String, Vec<f64>>,
@@ -191,21 +176,11 @@ pub mod map {
         }
         map.end()
     }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<BTreeMap<String, Vec<f64>>, D::Error> {
-        let raw = BTreeMap::<String, Vec<SafeF64>>::deserialize(deserializer)?;
-        Ok(raw
-            .into_iter()
-            .map(|(key, values)| (key, unwrap_vec(values)))
-            .collect())
-    }
 }
 
-/// `#[serde(with = "finite_safe_json::opt_vec")]` for an `Option<Vec<f64>>`.
+/// Serialize/deserialize an `Option<Vec<f64>>` — `#[serde(with = "…::opt_vec")]`.
 pub mod opt_vec {
-    use super::{Deserialize, Deserializer, SafeF64, SafeSlice, Serialize, Serializer, unwrap_vec};
+    use super::{Deserialize, Deserializer, SafeF64, SafeSlice, Serializer, unwrap_vec};
 
     pub fn serialize<S: Serializer>(
         value: &Option<Vec<f64>>,
@@ -224,7 +199,7 @@ pub mod opt_vec {
     }
 }
 
-/// `#[serde(with = "finite_safe_json::opt_matrix")]` for `Option<Vec<Vec<f64>>>`.
+/// Serialize/deserialize an `Option<Vec<Vec<f64>>>` — `#[serde(with = "…::opt_matrix")]`.
 pub mod opt_matrix {
     use super::{Deserialize, Deserializer, SafeF64, Serialize, Serializer, matrix, unwrap_matrix};
 
@@ -254,31 +229,9 @@ pub mod opt_matrix {
     }
 }
 
-/// `#[serde(with = "finite_safe_json::opt_map")]` for
-/// `Option<BTreeMap<String, Vec<f64>>>`.
+/// Deserialize an `Option<BTreeMap<String, Vec<f64>>>` — `#[serde(with = "…::opt_map")]`.
 pub mod opt_map {
-    use super::{
-        BTreeMap, Deserialize, Deserializer, SafeF64, Serialize, Serializer, map, unwrap_vec,
-    };
-
-    pub fn serialize<S: Serializer>(
-        value: &Option<BTreeMap<String, Vec<f64>>>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        match value {
-            Some(columns) => serializer.serialize_some(&MapRef(columns)),
-            None => serializer.serialize_none(),
-        }
-    }
-
-    /// Adapter so `serialize_some` reuses the borrow-only [`map`] encoder.
-    struct MapRef<'a>(&'a BTreeMap<String, Vec<f64>>);
-
-    impl Serialize for MapRef<'_> {
-        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            map::serialize(self.0, serializer)
-        }
-    }
+    use super::{BTreeMap, Deserialize, Deserializer, SafeF64, unwrap_vec};
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
@@ -297,35 +250,48 @@ pub mod opt_map {
 mod tests {
     use super::*;
 
-    /// The exact failure mode from #1564: a payload carrying `+∞` (saturated
-    /// cumulative hazard) must serialize AND parse back, recovering the `+∞`.
-    #[derive(Serialize, Deserialize, PartialEq, Debug)]
-    struct Probe {
+    /// Mirrors the real `SurvivalPredictionPayload` (serialize-only producer):
+    /// required fields plus the optional uncertainty fields.
+    #[derive(Serialize)]
+    struct ProducerProbe {
+        #[serde(with = "vec")]
+        times: Vec<f64>,
         #[serde(with = "matrix")]
         cumulative_hazard: Vec<Vec<f64>>,
         #[serde(with = "vec")]
         linear_predictor: Vec<f64>,
         #[serde(with = "map")]
         columns: BTreeMap<String, Vec<f64>>,
+        #[serde(skip_serializing_if = "Option::is_none", with = "opt_matrix")]
+        survival_se: Option<Vec<Vec<f64>>>,
+        #[serde(skip_serializing_if = "Option::is_none", with = "opt_vec")]
+        eta_se: Option<Vec<f64>>,
+    }
+
+    /// Mirrors the real `SurvivalPredictionJsonPayload` (deserialize-only,
+    /// tolerant `Option` consumer).
+    #[derive(Deserialize)]
+    struct ConsumerProbe {
+        #[serde(default, with = "opt_vec")]
+        times: Option<Vec<f64>>,
+        #[serde(default, with = "opt_matrix")]
+        cumulative_hazard: Option<Vec<Vec<f64>>>,
+        #[serde(default, with = "opt_vec")]
+        linear_predictor: Option<Vec<f64>>,
+        #[serde(default, with = "opt_map")]
+        columns: Option<BTreeMap<String, Vec<f64>>>,
         #[serde(default, with = "opt_matrix")]
         survival_se: Option<Vec<Vec<f64>>>,
         #[serde(default, with = "opt_vec")]
         eta_se: Option<Vec<f64>>,
-        #[serde(default, with = "opt_map")]
-        extra: Option<BTreeMap<String, Vec<f64>>>,
-    }
-
-    fn nan_eq(a: f64, b: f64) -> bool {
-        (a.is_nan() && b.is_nan()) || a == b
     }
 
     #[test]
     fn nonfinite_values_round_trip_losslessly() {
         let mut columns = BTreeMap::new();
         columns.insert("survival_prob".to_string(), vec![1.0, 0.0]);
-        let mut extra = BTreeMap::new();
-        extra.insert("k".to_string(), vec![f64::NAN, 2.5]);
-        let probe = Probe {
+        let probe = ProducerProbe {
+            times: vec![0.5, 1.0, 2.0],
             cumulative_hazard: vec![
                 vec![0.0, 1.5, f64::INFINITY],
                 vec![f64::NEG_INFINITY, f64::NAN, 7.0],
@@ -334,7 +300,6 @@ mod tests {
             columns,
             survival_se: Some(vec![vec![f64::INFINITY, 0.1]]),
             eta_se: Some(vec![f64::NAN, 0.25]),
-            extra: Some(extra),
         };
 
         let json = serde_json::to_string(&probe).expect("serialize must not fail");
@@ -345,26 +310,30 @@ mod tests {
         assert!(json.contains("\"NaN\""), "json: {json}");
         assert!(!json.contains("null"), "no bare nulls expected: {json}");
 
-        let back: Probe = serde_json::from_str(&json).expect("parse must succeed");
-        assert!(back.cumulative_hazard[0][2].is_infinite() && back.cumulative_hazard[0][2] > 0.0);
-        assert!(back.cumulative_hazard[1][0].is_infinite() && back.cumulative_hazard[1][0] < 0.0);
-        assert!(back.cumulative_hazard[1][1].is_nan());
-        assert!(back.linear_predictor[1].is_infinite());
-        assert!(back.survival_se.as_ref().unwrap()[0][0].is_infinite());
-        assert!(back.eta_se.as_ref().unwrap()[0].is_nan());
-        assert!(nan_eq(back.extra.as_ref().unwrap()["k"][0], f64::NAN));
+        let back: ConsumerProbe = serde_json::from_str(&json).expect("parse must succeed");
+        let cum = back.cumulative_hazard.expect("cumulative_hazard present");
+        assert!(cum[0][2].is_infinite() && cum[0][2] > 0.0);
+        assert!(cum[1][0].is_infinite() && cum[1][0] < 0.0);
+        assert!(cum[1][1].is_nan());
+        assert!(back.linear_predictor.expect("lp present")[1].is_infinite());
+        assert!(back.survival_se.expect("se present")[0][0].is_infinite());
+        assert!(back.eta_se.expect("eta_se present")[0].is_nan());
+        assert_eq!(back.times.expect("times present"), vec![0.5, 1.0, 2.0]);
+        assert_eq!(back.columns.expect("columns present")["survival_prob"], vec![
+            1.0, 0.0
+        ]);
     }
 
     #[test]
-    fn legacy_null_is_no_longer_produced_but_plain_numbers_still_parse() {
-        // Finite-only payloads keep the ordinary JSON-number wire form, so a
-        // value written by either side parses with no token machinery engaged.
+    fn plain_numbers_and_missing_optional_fields_still_parse() {
+        // Finite-only payloads keep the ordinary JSON-number wire form, and a
+        // payload that omits the optional uncertainty fields parses to `None`.
         let json = r#"{"cumulative_hazard":[[0.0,1.0]],"linear_predictor":[0.5],"columns":{"a":[1.0]}}"#;
-        let back: Probe = serde_json::from_str(json).expect("plain numbers parse");
-        assert_eq!(back.cumulative_hazard, vec![vec![0.0, 1.0]]);
-        assert_eq!(back.linear_predictor, vec![0.5]);
+        let back: ConsumerProbe = serde_json::from_str(json).expect("plain numbers parse");
+        assert_eq!(back.cumulative_hazard.unwrap(), vec![vec![0.0, 1.0]]);
+        assert_eq!(back.linear_predictor.unwrap(), vec![0.5]);
         assert!(back.survival_se.is_none());
         assert!(back.eta_se.is_none());
-        assert!(back.extra.is_none());
+        assert!(back.times.is_none());
     }
 }
