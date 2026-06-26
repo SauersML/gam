@@ -15,6 +15,8 @@ faer = "0.24.0"
 gam-linalg = { path = "../gam-linalg", version = "=0.3.124" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
 
 [lints.rust]
 warnings = "deny"

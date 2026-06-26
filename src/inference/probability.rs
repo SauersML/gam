@@ -195,26 +195,12 @@ pub fn stable_polynomial_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
     scale * tail
 }
 
-/// Numerically stable `C(n,k) = n! / (k!·(n−k)!)` as `f64`.  Uses the
-/// symmetry `C(n,k) = C(n, n−k)` to keep the loop count `min(k, n−k)`
-/// and the multiplicative recurrence `C(n,j+1) = C(n,j)·(n−j)/(j+1)`,
-/// avoiding the overflow of separate factorial evaluations.  Returns
-/// `0.0` for `k > n` and exact integer results within `2^53`.
-#[inline]
-pub fn binomial_coefficient_f64(n: usize, k: usize) -> f64 {
-    if k > n {
-        return 0.0;
-    }
-    if k == 0 || k == n {
-        return 1.0;
-    }
-    let k_eff = k.min(n - k);
-    let mut out = 1.0;
-    for j in 0..k_eff {
-        out *= (n - j) as f64 / (j + 1) as f64;
-    }
-    out
-}
+/// Numerically stable `C(n,k) = n! / (k!·(n−k)!)` as `f64`.  The
+/// implementation now lives in the lowest crate (`gam-math`) so the
+/// terms/basis cluster can consume it without reaching up into `inference`;
+/// re-exported here to keep `crate::probability::binomial_coefficient_f64`
+/// resolving for all existing callers.
+pub use gam_math::special::binomial_coefficient_f64;
 
 /// Numerically stable `ln Φ(x)` for the standard normal CDF.  For `x ≥ 0`
 /// computes `ln(Φ(x))` directly with a small floor against underflow; for

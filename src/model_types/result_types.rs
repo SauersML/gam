@@ -1072,35 +1072,11 @@ pub(crate) fn validate_fitted_link_estimation(
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Role of a coefficient block within a multi-parameter model.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BlockRole {
-    /// Single-parameter GAM (standard GLM/GAM mean model).
-    Mean,
-    /// Location parameter in GAMLSS / survival location-scale.
-    Location,
-    /// Scale (log-sigma) parameter in GAMLSS / survival location-scale.
-    Scale,
-    /// Time/baseline hazard block in survival models.
-    Time,
-    /// Threshold block in survival models.
-    Threshold,
-    /// Link-wiggle correction block.
-    LinkWiggle,
-}
-
-impl BlockRole {
-    #[inline]
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Mean => "mean",
-            Self::Location => "location",
-            Self::Scale => "scale",
-            Self::Time => "time",
-            Self::Threshold => "threshold",
-            Self::LinkWiggle => "link-wiggle",
-        }
-    }
-}
+///
+/// This type now lives in the neutral `gam-problem` crate; re-exported here so
+/// all existing `crate::model_types::BlockRole` / `gam::estimate::BlockRole`
+/// references keep resolving.
+pub use gam_problem::BlockRole;
 
 /// Inference quantities for one coefficient block.
 #[derive(Clone, Debug, Serialize, Deserialize)]

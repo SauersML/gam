@@ -1340,8 +1340,16 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
     }
 }
 
-impl BlockWorkingSet {
-    pub(crate) fn updater(&self) -> Box<dyn ParameterBlockUpdater + '_> {
+/// Extension trait providing `updater()` on the relocated `gam_problem::BlockWorkingSet`.
+/// `BlockWorkingSet` now lives in gam-problem (a neutral crate), so this inherent-style
+/// method — which produces a `Box<dyn ParameterBlockUpdater>` (a gam-crate trait) — must be
+/// an extension trait rather than an inherent impl on the foreign type.
+pub(crate) trait BlockWorkingSetUpdaterExt {
+    fn updater(&self) -> Box<dyn ParameterBlockUpdater + '_>;
+}
+
+impl BlockWorkingSetUpdaterExt for BlockWorkingSet {
+    fn updater(&self) -> Box<dyn ParameterBlockUpdater + '_> {
         match self {
             BlockWorkingSet::Diagonal {
                 working_response,

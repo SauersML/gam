@@ -4,6 +4,7 @@
 //! `custom_family` so existing paths stay stable.
 
 use super::*;
+use super::blockwise_solve::BlockWorkingSetUpdaterExt;
 
 pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,

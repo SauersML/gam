@@ -17,10 +17,17 @@ mod macros;
 
 mod linalg_helpers;
 mod linear_constraints;
+pub mod basis_error;
+pub mod block_role;
+pub mod block_spec;
 pub mod coefficient_prior_mean;
+pub mod custom_family_error;
+pub mod family_options;
 pub mod gauge;
+pub mod identifiability_audit;
 pub mod penalty_coordinate;
 pub mod penalty_matrix;
+pub mod psi_terms;
 mod pseudo_logdet;
 mod seeding;
 pub mod solver_contract;
@@ -50,11 +57,27 @@ mod gpu {
 
 pub use gam_linalg::faer_ndarray::{in_nested_parallel_region, with_nested_parallel};
 use linalg_helpers::{dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into};
+pub use basis_error::BasisError;
+pub use block_role::BlockRole;
+pub use custom_family_error::CustomFamilyError;
+pub use block_spec::{
+    AdditiveBlockJacobian, BlockEffectiveJacobian, BlockGeometryDirectionalDerivative,
+    BlockWorkingSet, FamilyChannelHessian, FamilyLinearizationState, GaugeComposedJacobian,
+    ParameterBlockSpec, ParameterBlockState, RowScaledJacobian, TensorChannelHessian,
+};
 pub use coefficient_prior_mean::{CoefficientPriorMean, PriorMeanError};
+pub use family_options::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 pub use gauge::Gauge;
+pub use identifiability_audit::{
+    AliasedPair, BlockIdentity, DroppedColumn, IdentifiabilityAudit, MapUniquenessError,
+};
 pub use linear_constraints::LinearInequalityConstraints;
 pub use penalty_coordinate::PenaltyCoordinate;
 pub use penalty_matrix::PenaltyMatrix;
+pub use psi_terms::{
+    ExactNewtonJointPsiSecondOrderContracted, ExactNewtonJointPsiSecondOrderTerms,
+    ExactNewtonJointPsiTerms, ExactNewtonJointPsiWorkspace,
+};
 pub use pseudo_logdet::PseudoLogdetMode;
 pub use seeding::{SeedConfig, SeedRiskProfile, clamp_seed_rho_to_bounds, normalize_seed_bounds};
 pub use solver_contract::{

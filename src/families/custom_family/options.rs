@@ -4,30 +4,12 @@
 
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExactNewtonOuterObjective {
-    RidgedQuadraticReml,
-    StrictPseudoLaplace,
-}
-
-/// Highest exact outer derivative order a family wants to expose at the
-/// current realized problem scale.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ExactOuterDerivativeOrder {
-    Zeroth,
-    First,
-    Second,
-}
-
-impl ExactOuterDerivativeOrder {
-    pub const fn has_gradient(self) -> bool {
-        !matches!(self, Self::Zeroth)
-    }
-
-    pub const fn has_hessian(self) -> bool {
-        matches!(self, Self::Second)
-    }
-}
+// Moved to `gam-problem` (#1521 CustomFamily-cone inversion): the neutral,
+// dependency-free outer-objective + exact-derivative-order capability enums now
+// live in `gam_problem::family_options` and are re-exported here so every
+// `custom_family::ExactNewtonOuterObjective` / `ExactOuterDerivativeOrder` path
+// keeps resolving byte-for-byte.
+pub use gam_problem::{ExactNewtonOuterObjective, ExactOuterDerivativeOrder};
 
 /// Exact outer derivative order for families that expose second-order
 /// coefficient geometry.
