@@ -122,11 +122,45 @@ pub(crate) fn jeffreys_term_skippable_for_source(
     source: &JointHessianSource,
     total_p: usize,
 ) -> Result<bool, String> {
-    // Below the dense-eigh-is-cheap threshold the inner `jeffreys_term_skippable_via_matvec`
-    // short-circuits to `false` anyway; bail early so small fits (e.g. BMS p≈51)
-    // pay nothing for the pre-check and run the exact dense path unchanged.
+    // Small joint system: the dense reduced eigendecomposition is itself cheap
+    // (`O(p³)` with `p` in the tens), so run the EXACT conditioning gate directly
+    // instead of forcing the always-on Jeffreys term on every cycle. The previous
+    // unconditional `false` here meant a small fit ALWAYS paid the full
+    // `O(p·n·special-fn)` all-axes Jeffreys directional-derivative sweep (and its
+    // per-row allocations) on EVERY inner-Newton cycle and EVERY outer LAML eval —
+    // the constant-scale survival location-scale #1389 non-termination, where a
+    // bounded `n=300` fit ran past the 600s per-test CI cap. Form the
+    // `total_p × total_p` H once (a clone for the dense source, `total_p` matvecs
+    // for the operator — both cheap below the threshold) and apply the SAME
+    // `conditioning_gate_weight` the term assembly uses, so a well-conditioned
+    // cycle skips a provably-zero term (byte-identical to forming it) while a
+    // near-separating cycle still falls through to the exact term and keeps the
+    // Firth bound exactly where the ridge needs it.
     if total_p < crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM {
-        return Ok(false);
+        let h_dense = match source {
+            JointHessianSource::Dense(matrix) => matrix.clone(),
+            JointHessianSource::Operator { apply, .. } => {
+                let mut h = Array2::<f64>::zeros((total_p, total_p));
+                let mut e_a = Array1::<f64>::zeros(total_p);
+                for a in 0..total_p {
+                    e_a[a] = 1.0;
+                    let col = apply(&e_a)?;
+                    e_a[a] = 0.0;
+                    if col.len() != total_p {
+                        // Operator returned an unexpected shape: fall through to the
+                        // exact term rather than risk a wrong skip.
+                        return Ok(false);
+                    }
+                    for r in 0..total_p {
+                        h[[r, a]] = col[r];
+                    }
+                }
+                h
+            }
+        };
+        return crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_dense(
+            h_dense.view(),
+        );
     }
     // Matrix-free Hessian-vector product against the OBSERVED joint information.
     // For families whose Jeffreys information IS the observed Hessian (the trait

@@ -752,6 +752,55 @@ where
     Ok(absolute_clears && relative_clears)
 }
 
+/// EXACT dense counterpart to [`jeffreys_term_skippable_via_matvec`] for SMALL
+/// joint systems (`p < CHEAP_CONDITIONING_PRECHECK_MIN_DIM`), where forming the
+/// `p × p` reduced information and eigendecomposing it is itself `O(p³)`-cheap (`p`
+/// in the tens). On the full span (`Z_J = I`, so `H_id = H`) the conditioning gate
+/// depends only on `H`'s extreme eigenvalues, so this eigendecomposes `H` EXACTLY
+/// and returns whether [`conditioning_gate_weight`] is exactly `0` — i.e. whether
+/// the term [`joint_jeffreys_term`] would form is exactly the zero term. A `true`
+/// here is therefore byte-identical to forming the gated-off term, with NO
+/// conservative margin needed (the eigenvalues are exact, not bounded).
+///
+/// This is what lets a small fit SKIP the always-on Jeffreys term on its
+/// well-conditioned cycles instead of paying the full `O(p·n·special-fn)` all-axes
+/// directional-derivative sweep (and its per-row allocations) — the per-cycle /
+/// per-outer-eval cost behind the constant-scale survival location-scale #1389
+/// non-termination, where a bounded `n=300` fit ran past the 600s per-test CI cap.
+/// On a genuinely near-separating cycle the gate weight is non-zero and this
+/// returns `false`, so the exact term still fires exactly where the curvature is
+/// needed. The previous behaviour — an unconditional "never skip" below the size
+/// threshold — assumed the exact dense path was cheap, which is true for the
+/// eigendecomposition but NOT for the family's all-axes directional-derivative
+/// sweep that the un-skipped term forces on every cycle.
+pub fn jeffreys_term_skippable_dense(h: ArrayView2<'_, f64>) -> Result<bool, String> {
+    let p = h.nrows();
+    if p == 0 || h.ncols() != p {
+        // No system / non-square: nothing to certify, fall through to the exact path.
+        return Ok(false);
+    }
+    // Symmetrize defensively: the joint Hessian is symmetric up to round-off, and
+    // `eigh` reads one triangle — averaging the two makes the spectrum independent
+    // of which triangle is trusted.
+    let mut h_sym = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        for j in 0..p {
+            h_sym[[i, j]] = 0.5 * (h[[i, j]] + h[[j, i]]);
+        }
+    }
+    let (evals, _evecs) = h_sym.eigh(Side::Lower).map_err(|e| {
+        format!("jeffreys_term_skippable_dense: reduced-information eigendecomposition failed: {e}")
+    })?;
+    let lambda_max = evals.iter().copied().fold(0.0_f64, f64::max);
+    let lambda_min = evals.iter().copied().fold(f64::INFINITY, f64::min);
+    if !(lambda_min.is_finite() && lambda_max.is_finite()) {
+        return Ok(false);
+    }
+    // Skip iff the term's OWN conditioning gate is exactly off at this spectrum —
+    // the same predicate `joint_jeffreys_term` applies, so skipping is exact.
+    Ok(conditioning_gate_weight(lambda_min, lambda_max) == 0.0)
+}
+
 /// Orthonormal basis of one block's Jeffreys span.
 ///
 /// `columns` is `p x m` with orthonormal columns spanning `ker(S_aggregate)`
