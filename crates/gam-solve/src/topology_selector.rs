@@ -1323,8 +1323,8 @@ impl EvidenceCertification {
     /// (`gam_inference::certificate_impls::coreset_race_verdict`,
     /// `gam_inference::certificate_impls::enclosure_margin_verdict`) supply
     /// the underlying mapping so there is one source of truth.
-    pub fn race_verdict(&self, race_lead: f64) -> crate::inference::certificates::Verdict {
-        use crate::inference::certificates::Verdict;
+    pub fn race_verdict(&self, race_lead: f64) -> gam_problem::topology_certificates::Verdict {
+        use gam_problem::topology_certificates::Verdict;
         if !(race_lead.is_finite() && race_lead > 0.0) {
             return Verdict::Insufficient;
         }
@@ -1845,7 +1845,7 @@ mod tests {
     /// the required margin, else `Insufficient` (never a silent pass).
     #[test]
     fn race_verdict_maps_onto_unified_ladder() {
-        use crate::inference::certificates::Verdict;
+        use gam_problem::topology_certificates::Verdict;
         assert_eq!(
             EvidenceCertification::Exact.race_verdict(1e-6),
             Verdict::Certified

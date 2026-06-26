@@ -42,7 +42,11 @@ mod marginal_slope_predict_tests;
 pub mod probability;
 pub use gam_sae::inference::probe_runner;
 pub mod quadrature;
-pub mod residual_factor;
+// `residual_factor` descended into gam-solve (#1521): the structured-residual
+// covariance estimator (#974) whose deps are all ≤ gam-solve (`gam_problem::RowMetric`
+// + `gam-linalg`). Re-exported here so `gam::inference::residual_factor` (named by
+// `tests/identifiability/misc/structured_residual_974.rs`) resolves unchanged.
+pub use gam_solve::inference::residual_factor;
 pub mod rho_posterior;
 pub use gam_sae::inference::riesz;
 pub use gam_solve::row_sampling_measure as row_measure;

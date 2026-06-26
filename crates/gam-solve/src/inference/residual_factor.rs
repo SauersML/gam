@@ -56,7 +56,7 @@ use std::sync::Arc;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use gam_problem::RowMetric;
-use crate::linalg::faer_ndarray::{FaerCholesky, FaerEigh};
+use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use faer::Side;
 
 /// Number of (scale | factor) ↔ (factor | scale) alternation sweeps. Fixed and
