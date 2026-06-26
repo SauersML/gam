@@ -10,6 +10,26 @@ pub(crate) const SURVIVAL_ROW_PARALLEL_CHUNK: usize = 64;
 /// floating-point noise about an active constraint, not a real violation.
 pub(crate) const CONSTRAINT_NONNEGATIVITY_REL_TOL: f64 = 1e-10;
 
+/// Absolute feasibility tolerance of the monotone time-derivative cone that the
+/// DOWNSTREAM consumers actually enforce — the active-set QP entry gate
+/// (`check_linear_feasibility`) and the cone projection
+/// (`project_onto_linear_constraints`) both certify feasibility to this `1e-8`
+/// (gam#1108/#797). The strictly-interior projection lands with ~1e-6 of margin,
+/// so a converged iterate clears this gate with room, but accumulated round-off
+/// over an inner solve can leave a binding guard row at slack ~-1e-9..-1e-8 —
+/// numerically AT the boundary, not a real violation.
+///
+/// The post-update sanity check ([`validate_linear_constraints`]) must therefore
+/// accept any β the consumer gate accepts: its tolerance is floored at this
+/// value so it never rejects a round-off-feasible iterate the rest of the
+/// pipeline treats as feasible. Before #1569 it used only the much stricter
+/// `CONSTRAINT_NONNEGATIVITY_REL_TOL` (1e-10·scale); once the spectrum-branch
+/// α-crush bypass (gam#1569) let the aggressive heteroscedastic survival-LS solve
+/// run to its final inner refit, that refit's cone-projected β routinely landed
+/// at slack ~-6.6e-9 — feasible to the 1e-8 gate but a hard error at 1e-10 — so
+/// the otherwise-converged fit failed on a pure numerical-precision mismatch.
+pub(crate) const MONOTONE_CONE_FEASIBILITY_GATE_TOL: f64 = 1e-8;
+
 /// Maximum number of Dykstra alternating-projection sweeps when projecting an
 /// initial coefficient guess onto the represented linear inequality
 /// constraints. The projection converges geometrically; this caps the rare
@@ -44,37 +64,6 @@ pub(crate) const LEVENBERG_INITIAL_DAMPING_REL: f64 = 1e-8;
 pub(crate) const LEVENBERG_DAMPING_GROWTH: f64 = 10.0;
 
 pub(crate) const LEVENBERG_MAX_DAMPING_REL: f64 = 1e8;
-
-/// Per-step cap on the absolute change in the log-σ linear predictor `η_σ`
-/// during the coupled smooth-scale joint Newton (#1569).
-///
-/// The standardized survival index is `u = h(t) − η_t · exp(−η_σ)`: the scale
-/// predictor enters the likelihood ONLY through `inv_sigma = exp(−η_σ)` (see
-/// `row_kernel::row_primary_values`). The map is exponential, so a single joint
-/// Newton step that drives `η_σ` sharply negative multiplies `inv_sigma` — and
-/// with it the time/threshold-channel standardized residual `u`, its Gaussian
-/// score `−u`, and the whole time-block gradient — by an *exponential* factor,
-/// far outside the region where the local quadratic model that the trust-region
-/// globalization trusts is valid. The trust region then rejects the catapulted
-/// step, collapses its radius, and the inner joint-Newton grinds its full cycle
-/// budget on every outer ρ-eval without certifying stationarity (the aggressive
-/// heteroscedastic stall that e3da155e4 / #1564 called out as remaining work and
-/// that #1569 makes good on).
-///
-/// Capping the per-step change in `η_σ` so `inv_sigma` moves by at most a factor
-/// `e^CAP` per accepted step keeps every step inside the model-trust region of
-/// the scale nonlinearity — the natural trust region for a parameter that enters
-/// through `exp`. It is wired through the family's `max_feasible_step_size` hook,
-/// so the existing joint feasibility-α machinery scales the WHOLE joint step by
-/// the min block-α and the Newton DIRECTION is preserved (only the length is
-/// damped). This is a step-LENGTH limit, not a reparameterization: at a
-/// stationary point the Newton step in `η_σ` → 0 < CAP, so α → 1 and the
-/// converged β is unchanged — the cap is fixed-point preserving and byte-
-/// identical on any fit whose scale steps already stay within `e^CAP` (e.g. the
-/// mild gamlss-oracle gate). `2.0` lets σ change by up to `e^2 ≈ 7.4×` in one
-/// step — loose enough never to bind on a well-behaved fit, tight enough that a
-/// single step can never catapult `η_σ` across the exponential cliff.
-pub(crate) const MAX_LOG_SIGMA_PREDICTOR_STEP: f64 = 2.0;
 
 /// Outer (smoothing-parameter) loop budget for the blockwise location-scale
 /// fit: at most this many outer iterations, stopping once the outer relative

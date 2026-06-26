@@ -490,7 +490,7 @@ pub fn project_onto_linear_constraints(
     // contract the consumer enforces. The strict-interior projection clears it
     // by orders of magnitude; the boundary projection sits at the gate, so we
     // accept it only when it genuinely lands inside.
-    const DOWNSTREAM_FEASIBILITY_GATE_TOL: f64 = 1e-8;
+    const DOWNSTREAM_FEASIBILITY_GATE_TOL: f64 = MONOTONE_CONE_FEASIBILITY_GATE_TOL;
     let worst_raw_violation = |b: &Array1<f64>| -> (f64, usize) {
         let mut worst = 0.0_f64;
         let mut worst_row = 0usize;
@@ -628,7 +628,14 @@ pub(crate) fn validate_linear_constraints(
             .sum::<f64>()
             .max(constraints.b[row].abs())
             .max(1.0);
-        let tol = CONSTRAINT_NONNEGATIVITY_REL_TOL * scale;
+        // Floor the relative tolerance at the absolute downstream feasibility
+        // gate (#1569): this post-update check must accept any β the consumer
+        // gates (`check_linear_feasibility` / `project_onto_linear_constraints`,
+        // both `1e-8`) accept, or it hard-errors a round-off-feasible iterate the
+        // rest of the pipeline treats as feasible (the survival-LS final-refit
+        // cone-projected β at slack ~-6.6e-9).
+        let tol =
+            (CONSTRAINT_NONNEGATIVITY_REL_TOL * scale).max(MONOTONE_CONE_FEASIBILITY_GATE_TOL);
         if slack < -tol && (worst_row.is_none() || slack < worst_slack) {
             worst_row = Some(row);
             worst_slack = slack;

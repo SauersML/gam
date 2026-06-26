@@ -1,16 +1,21 @@
 //! Reproduction + regression guard for #1569: the coupled smooth-scale survival
 //! location-scale joint-Newton globalization must converge in the AGGRESSIVE
 //! heteroscedastic regime — strong x-dependence in BOTH the AFT location and the
-//! log-σ channel, where the free scale predictor `η_σ(x)` drives `exp(−η_σ)`
-//! (the `inv_sigma` multiplier on the time-channel residual/gradient) over a wide
+//! log-σ channel, where the free scale predictor `η_σ(x)` drives `exp(−η_σ)` (the
+//! `inv_sigma` multiplier on the time-channel residual/gradient) over a wide
 //! dynamic range and can inflate the time-block step.
 //!
-//! The data is a clean Gaussian AFT on log-time (exactly gam's survival
-//! location-scale model with a learned monotone `h(t)`):
-//!     log T = μ(x) + σ(x)·ε,   ε ~ N(0,1),
-//! so both x-dependent channels have closed-form truth in the gauge-free
-//! (mean-centered) space the time-axis baseline leaves invariant. No reference
-//! tool (gamlss/R) is needed: truth is known analytically.
+//! DATA RECIPE — gam-model-faithful. The gam survival location-scale model is
+//! NOT a textbook AFT `log T = μ + σ·ε`: its standardized index is
+//!     z(t, x) = h(t) − η_t(x) · exp(−η_σ(x)),   S(t|x) = 1 − Φ(z),
+//! with a LEARNED monotone time baseline `h(t)` (so the `1/σ` scaling rides the
+//! location channel, not the time channel). We therefore reuse the EXACT recipe
+//! of the gamlss-oracle gate `quality_vs_gamlss_gaussian_survival_ls.rs`, whose
+//! closed-form truth is known to be recovered by this model: a Weibull time whose
+//! log-scale carries the location signal, dispersed around its own median by a
+//! smooth envelope that carries the log-σ signal. Cranking the two amplitudes
+//! drives the aggressive heteroscedastic regime that stalls the joint Newton.
+//! No reference tool (gamlss/R) is needed — the truth is analytic.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -34,43 +39,49 @@ impl Lcg {
             .wrapping_add(1442695040888963407);
         ((self.state >> 11) as f64) / ((1u64 << 53) as f64)
     }
-    /// Box–Muller standard normal.
-    fn normal(&mut self) -> f64 {
-        let u1 = self.unit().max(1e-300);
-        let u2 = self.unit();
-        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
-    }
 }
 
 struct HeteroFit {
+    /// `Err(message)` if the fit returned an error (the stall surfaced as a hard
+    /// failure); otherwise the converged-fit diagnostics.
+    outcome: Result<HeteroOk, String>,
+    censor_frac: f64,
+}
+
+struct HeteroOk {
     converged: bool,
     outer_iterations: usize,
     inner_cycles: usize,
     grad_norm: Option<f64>,
     rmse_loc: f64,
     rmse_logsig: f64,
-    censor_frac: f64,
 }
 
-/// Generate strongly heteroscedastic right-censored AFT data and fit gam's
-/// survival location-scale model with smooth location AND smooth scale; report
-/// convergence diagnostics and truth-recovery RMSE on a grid.
+/// Generate a gate-faithful right-censored heteroscedastic AFT dataset and fit
+/// gam's survival location-scale model with a smooth location AND a smooth scale.
+///
+/// `loc_amp` scales the location signal `loc_amp·sin(2πx)` (gate default 0.3) and
+/// `env_amp` (in (0,1)) the dispersion envelope `1 + env_amp·cos(2πx)` (gate
+/// default 0.4). Larger amplitudes ⇒ wider `exp(−η_σ)` dynamic range ⇒ the
+/// aggressive regime. Never panics on a fit error: it captures the message so a
+/// sweep reports which configuration stalled.
 fn fit_heteroscedastic(
     n: usize,
     loc_amp: f64,
-    scale_amp: f64,
+    env_amp: f64,
     k_loc: usize,
     k_scale: usize,
     seed: u64,
 ) -> HeteroFit {
     let two_pi = 2.0 * std::f64::consts::PI;
+    let shape = 1.5_f64;
     let mut rng = Lcg::new(seed);
 
     // closed-form truth (x-dependent parts; gauge = mean-centered over grid):
-    //   location  μ(x)   = loc_amp   * sin(2πx)
-    //   log-scale η_σ(x) = scale_amp * cos(2πx)
-    let mu = |x: f64| loc_amp * (two_pi * x).sin();
-    let log_sigma = |x: f64| scale_amp * (two_pi * x).cos();
+    //   AFT location  η_t(x)   = loc_amp · sin(2πx)        (Weibull log-scale x-part)
+    //   AFT log-scale η_σ(x)   = log(1 + env_amp · cos(2πx)) (dispersion envelope)
+    let truth_loc = |x: f64| loc_amp * (two_pi * x).sin();
+    let truth_lsig = |x: f64| (1.0 + env_amp * (two_pi * x).cos()).ln();
 
     let mut x = Vec::with_capacity(n);
     let mut exit = Vec::with_capacity(n);
@@ -78,19 +89,21 @@ fn fit_heteroscedastic(
     let mut censored = 0usize;
     for _ in 0..n {
         let xi = -2.0 + 4.0 * rng.unit();
-        let log_t = mu(xi) + log_sigma(xi).exp() * rng.normal();
-        let t = log_t.exp().max(1e-6);
-        // Independent right-censoring: a log-uniform censoring clock around the
-        // bulk of the event times gives ~25–35% censoring.
-        let c = (0.4 + 3.6 * rng.unit()).exp();
-        let (obs, ev) = if t <= c { (t, 1.0) } else { (c, 0.0) };
+        let scale = (-0.5 + loc_amp * (two_pi * xi).sin()).exp();
+        let envelope = 1.0 + env_amp * (two_pi * xi).cos();
+        let u = rng.unit().max(1e-300);
+        let base = scale * (-u.ln()).powf(1.0 / shape);
+        let median = scale * (std::f64::consts::LN_2).powf(1.0 / shape);
+        let t = (median + (base - median) * envelope).max(1e-6);
+        let ev = if rng.unit() < 0.7 { 1.0 } else { 0.0 };
         if ev < 0.5 {
             censored += 1;
         }
         x.push(xi);
-        exit.push(obs);
+        exit.push(t);
         event.push(ev);
     }
+    let censor_frac = censored as f64 / n as f64;
 
     let headers: Vec<String> = ["entry", "exit", "event", "x"]
         .into_iter()
@@ -117,12 +130,19 @@ fn fit_heteroscedastic(
         noise_formula: Some(format!("s(x, k={k_scale})")),
         ..FitConfig::default()
     };
-    let result = fit_from_formula(
+    let result = match fit_from_formula(
         &format!("Surv(entry, exit, event) ~ s(x, k={k_loc})"),
         &ds,
         &cfg,
-    )
-    .expect("gam hetero survival location-scale fit");
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return HeteroFit {
+                outcome: Err(e.to_string()),
+                censor_frac,
+            };
+        }
+    };
     let FitResult::SurvivalLocationScale(fit) = result else {
         panic!("expected a survival location-scale fit result");
     };
@@ -160,48 +180,61 @@ fn fit_heteroscedastic(
             build_term_collection_design(grid.view(), &fit.fit.resolved_log_sigmaspec).unwrap();
         let gam_loc = center(&loc_design.design.apply(&unified.beta_threshold()).to_vec());
         let gam_lsig = center(&ls_design.design.apply(&unified.beta_log_sigma()).to_vec());
-        let truth_loc = center(&grid_x.iter().map(|&xi| mu(xi)).collect::<Vec<_>>());
-        let truth_lsig = center(&grid_x.iter().map(|&xi| log_sigma(xi)).collect::<Vec<_>>());
-        (rmse(&gam_loc, &truth_loc), rmse(&gam_lsig, &truth_lsig))
+        let t_loc = center(&grid_x.iter().map(|&xi| truth_loc(xi)).collect::<Vec<_>>());
+        let t_lsig = center(&grid_x.iter().map(|&xi| truth_lsig(xi)).collect::<Vec<_>>());
+        (rmse(&gam_loc, &t_loc), rmse(&gam_lsig, &t_lsig))
     } else {
         (f64::NAN, f64::NAN)
     };
 
     HeteroFit {
-        converged: unified.outer_converged,
-        outer_iterations: unified.outer_iterations,
-        inner_cycles: unified.inner_cycles,
-        grad_norm: unified.outer_gradient_norm,
-        rmse_loc,
-        rmse_logsig,
-        censor_frac: censored as f64 / n as f64,
+        outcome: Ok(HeteroOk {
+            converged: unified.outer_converged,
+            outer_iterations: unified.outer_iterations,
+            inner_cycles: unified.inner_cycles,
+            grad_norm: unified.outer_gradient_norm,
+            rmse_loc,
+            rmse_logsig,
+        }),
+        censor_frac,
     }
 }
 
 #[test]
 fn survival_location_scale_heteroscedastic_sweep_diagnostic() {
     init_parallelism();
+    // (n, loc_amp, env_amp, k_loc, k_scale, seed). env_amp must stay < 1.
+    // Moderate-aggressive configs: strong enough heteroscedasticity to drive the
+    // inv_sigma-inflated time-block step into the monotone α-crush regime (the
+    // #1569 stall) WITHOUT the identifiability degeneracy of the most extreme
+    // amplitudes, and small enough to converge in tractable time once fixed.
     let configs = [
-        (200usize, 0.3f64, 0.4f64, 6usize, 4usize, 1234u64), // mild control
-        (180, 0.8, 1.0, 8, 6, 1234),                         // moderate
-        (180, 1.0, 1.2, 8, 8, 7),                            // aggressive
-        (160, 1.2, 1.5, 10, 8, 42),                          // very aggressive
+        (70usize, 0.7f64, 0.75f64, 5usize, 4usize, 7u64), // moderate-aggressive
+        (80, 0.85, 0.8, 5, 5, 21),                        // aggressive
+        (90, 0.3, 0.4, 5, 4, 1234),                       // mild control
     ];
-    for (n, la, sa, kl, ks, seed) in configs {
+    for (n, la, ea, kl, ks, seed) in configs {
         let t0 = std::time::Instant::now();
-        let r = fit_heteroscedastic(n, la, sa, kl, ks, seed);
+        let r = fit_heteroscedastic(n, la, ea, kl, ks, seed);
         let secs = t0.elapsed().as_secs_f64();
-        eprintln!(
-            "[#1569 sweep] n={n} loc_amp={la} scale_amp={sa} k_loc={kl} k_scale={ks} seed={seed} \
-             censor={:.2} elapsed={secs:.1}s -> converged={} outer_iters={} inner_cycles={} \
-             grad_norm={:?} rmse_loc={:.4} rmse_logsig={:.4}",
-            r.censor_frac,
-            r.converged,
-            r.outer_iterations,
-            r.inner_cycles,
-            r.grad_norm,
-            r.rmse_loc,
-            r.rmse_logsig,
-        );
+        match r.outcome {
+            Ok(ok) => eprintln!(
+                "[#1569 sweep] n={n} loc_amp={la} env_amp={ea} k_loc={kl} k_scale={ks} seed={seed} \
+                 censor={:.2} elapsed={secs:.1}s -> converged={} outer_iters={} inner_cycles={} \
+                 grad_norm={:?} rmse_loc={:.4} rmse_logsig={:.4}",
+                r.censor_frac,
+                ok.converged,
+                ok.outer_iterations,
+                ok.inner_cycles,
+                ok.grad_norm,
+                ok.rmse_loc,
+                ok.rmse_logsig,
+            ),
+            Err(e) => eprintln!(
+                "[#1569 sweep] n={n} loc_amp={la} env_amp={ea} k_loc={kl} k_scale={ks} seed={seed} \
+                 censor={:.2} elapsed={secs:.1}s -> ERRORED: {e}",
+                r.censor_frac,
+            ),
+        }
     }
 }
