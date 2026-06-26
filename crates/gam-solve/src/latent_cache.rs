@@ -56,7 +56,7 @@ impl LatentFingerprint {
     }
 }
 
-pub(crate) type CacheDigest = Fingerprint;
+pub type CacheDigest = Fingerprint;
 
 /// Open a [`Fingerprinter`] pre-seeded with a length-prefixed namespace
 /// string so different cache-digest call sites cannot alias.
@@ -322,7 +322,7 @@ fn latent_metadata_cache_digest(latent: &LatentCoordValues) -> CacheDigest {
     hasher.finalize()
 }
 
-pub(crate) fn latent_design_context_cache_digest(
+pub fn latent_design_context_cache_digest(
     data: ArrayView2<'_, f64>,
     spec: &TermCollectionSpec,
     term_index: gam_problem::SmoothTermIdx,
@@ -516,7 +516,7 @@ impl BasisDerivativeJets {
 }
 
 #[derive(Clone)]
-pub(crate) struct CachedDesign {
+pub struct CachedDesign {
     pub(crate) latent_id: u64,
     pub(crate) fingerprint: LatentFingerprint,
     basis_digest: CacheDigest,
@@ -524,19 +524,19 @@ pub(crate) struct CachedDesign {
     design_context_digest: CacheDigest,
     latent_bits: Arc<[u64]>,
     cacheable: bool,
-    pub(crate) design: TermCollectionDesign,
-    pub(crate) hyper_dirs: Vec<DirectionalHyperParam>,
+    pub design: TermCollectionDesign,
+    pub hyper_dirs: Vec<DirectionalHyperParam>,
     pub(crate) radial_distances: RadialDistanceMatrices,
     pub(crate) basis_derivative_jets: BasisDerivativeJets,
 }
 
-pub(crate) struct ComputedLatentDesign {
-    pub(crate) design: TermCollectionDesign,
-    pub(crate) hyper_dirs: Vec<DirectionalHyperParam>,
+pub struct ComputedLatentDesign {
+    pub design: TermCollectionDesign,
+    pub hyper_dirs: Vec<DirectionalHyperParam>,
 }
 
-pub(crate) struct LatentDesignLookup<'a> {
-    pub(crate) cached: &'a CachedDesign,
+pub struct LatentDesignLookup<'a> {
+    pub cached: &'a CachedDesign,
     pub(crate) entry_id: u64,
 }
 
@@ -663,7 +663,7 @@ impl PersistentLatentDesignCache {
     }
 }
 
-pub(crate) struct LatentDesignCache {
+pub struct LatentDesignCache {
     entries: Vec<LatentDesignCacheEntry>,
     capacity: usize,
     clock: u64,
@@ -705,7 +705,7 @@ impl LatentDesignCache {
         self.iteration = self.iteration.wrapping_add(1);
     }
 
-    pub(crate) fn lookup_or_compute<F>(
+    pub fn lookup_or_compute<F>(
         &mut self,
         latent: Arc<LatentCoordValues>,
         basis_kind: LatentBasisKind,

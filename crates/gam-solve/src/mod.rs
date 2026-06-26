@@ -6,7 +6,6 @@ pub mod custom_family;
 pub(crate) mod custom_family_persistent_warm_start;
 pub mod estimate;
 pub mod evidence;
-pub mod fit_orchestration;
 pub mod gauge;
 pub mod gaussian_reml;
 pub mod glm_sufficient_lane;
@@ -23,10 +22,9 @@ pub mod mixture_link;
 pub(crate) mod objective_base;
 pub mod orthogonal_reparam;
 pub(crate) mod parallel_strategy;
-pub(crate) mod persistent_warm_start;
+pub mod persistent_warm_start;
 pub mod pirls;
 pub(crate) mod priority_selection;
-pub mod protocol;
 pub mod psi_gram_tensor;
 pub mod residual_cascade;
 pub mod rho_optimizer;
@@ -97,6 +95,5 @@ pub use estimate::reml::reml_outer_engine::CorrectedCovarianceError;
 /// analytic-penalty registry through the single shared descriptor parser that
 /// also serves the in-process workflow pipeline. Exposed here so PyFFI can name
 /// it without the (crate-private) `workflow` module being publicly reachable.
-pub use fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors;
 pub mod model_types;
 pub mod quadrature;

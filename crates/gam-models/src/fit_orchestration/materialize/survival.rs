@@ -1,7 +1,7 @@
 use super::*;
 
 fn resolve_survival_marginal_slope_base_link(
-    linkspec: Option<&crate::inference::formula_dsl::LinkFormulaSpec>,
+    linkspec: Option<&gam_terms::inference::formula_dsl::LinkFormulaSpec>,
 ) -> Result<InverseLink, String> {
     let Some(linkspec) = linkspec else {
         return Ok(InverseLink::Standard(StandardLink::Probit));
@@ -53,7 +53,7 @@ pub(crate) fn materialize_survival<'a>(
             .iter()
             .copied()
             .enumerate()
-            .map(|(i, value)| crate::families::survival::survival_event_code_from_value(value, i))
+            .map(|(i, value)| crate::survival::survival_event_code_from_value(value, i))
             .collect::<Result<Vec<_>, _>>()?,
     );
     let pairs: Result<Vec<(f64, f64)>, String> = (0..n)
@@ -141,7 +141,7 @@ pub(crate) fn materialize_survival<'a>(
             ),
         });
     }
-    let cause_count = crate::families::survival::cause_count_from_event_codes(event_codes.view())
+    let cause_count = crate::survival::cause_count_from_event_codes(event_codes.view())
         .into_workflow_result()?;
     if cause_count > 1
         && !matches!(
@@ -753,7 +753,7 @@ pub(crate) fn materialize_survival<'a>(
     };
 
     let build_time_block =
-        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig| {
+        |candidate: &crate::survival::construction::SurvivalBaselineConfig| {
             let prepared = prepare_survival_time_stack(
                 &age_entry,
                 &age_exit,
@@ -788,7 +788,7 @@ pub(crate) fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity: crate::families::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
+                time_monotonicity: crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
@@ -805,7 +805,7 @@ pub(crate) fn materialize_survival<'a>(
     let location_scale_smoothing_warm_start: RefCell<Option<(Array1<f64>, Array1<f64>)>> =
         RefCell::new(None);
     let build_location_scale_request =
-        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig,
+        |candidate: &crate::survival::construction::SurvivalBaselineConfig,
          allow_inverse_link_optimization: bool| {
             let (prepared, time_block) = build_time_block(candidate)?;
             let (initial_threshold_log_lambdas, initial_log_sigma_log_lambdas) =
@@ -859,7 +859,7 @@ pub(crate) fn materialize_survival<'a>(
         };
 
     let build_marginal_slope_request =
-        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig| {
+        |candidate: &crate::survival::construction::SurvivalBaselineConfig| {
             let (prepared, time_block) = build_time_block(candidate)?;
             Ok::<_, String>(SurvivalMarginalSlopeFitRequest {
                 data: data.values.view(),
@@ -906,7 +906,7 @@ pub(crate) fn materialize_survival<'a>(
         };
 
     let build_latent_survival_request =
-        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig| {
+        |candidate: &crate::survival::construction::SurvivalBaselineConfig| {
             let loading = latent_loading.ok_or_else(|| {
                 "internal error: latent survival loading missing after frailty validation"
                     .to_string()
@@ -957,7 +957,7 @@ pub(crate) fn materialize_survival<'a>(
                     }
                     let event_target = event.mapv(|v| {
                         if v >= 0.5 {
-                            crate::families::survival::latent::LATENT_SURVIVAL_EVENT_INTERVAL
+                            crate::survival::latent::LATENT_SURVIVAL_EVENT_INTERVAL
                         } else {
                             0
                         }
@@ -992,7 +992,7 @@ pub(crate) fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity: crate::families::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
+                time_monotonicity: crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
@@ -1022,7 +1022,7 @@ pub(crate) fn materialize_survival<'a>(
         };
 
     let build_latent_binary_request =
-        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig| {
+        |candidate: &crate::survival::construction::SurvivalBaselineConfig| {
             let loading = latent_loading.ok_or_else(|| {
                 "internal error: latent binary loading missing after frailty validation".to_string()
             })?;
@@ -1054,7 +1054,7 @@ pub(crate) fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity: crate::families::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
+                time_monotonicity: crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,

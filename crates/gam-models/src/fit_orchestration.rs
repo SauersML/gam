@@ -3,21 +3,21 @@
 // / materialization concerns each own a real module; the parent re-exports every
 // module's items so callers keep the flat `solver::fit_orchestration::Foo` namespace.
 
-use crate::custom_family::{
+use gam_solve::custom_family::{
     AdditiveBlockJacobian, BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix,
     fit_custom_family_with_rho_prior,
 };
 
-use crate::estimate::{
+use gam_solve::estimate::{
     AdaptiveRegularizationOptions, FitOptions, FittedLinkState, UnifiedFitResult,
 };
 
-use crate::families::bms::{
+use crate::bms::{
     BernoulliMarginalSlopeFitResult, BernoulliMarginalSlopeTermSpec, DeviationBlockConfig,
     fit_bernoulli_marginal_slope_terms,
 };
 
-use crate::families::gamlss::{
+use crate::gamlss::{
     BinomialLocationScaleFitResult, BinomialLocationScaleTermSpec, BlockwiseTermFitResult,
     BlockwiseTermFitResultParts, BlockwiseTermWiggleFitResult, DispersionFamilyKind,
     DispersionGlmLocationScaleTermSpec, GaussianLocationScaleFitResult,
@@ -30,51 +30,54 @@ use crate::families::gamlss::{
     select_gaussian_location_scale_link_wiggle_basis_from_pilot,
 };
 
-use crate::families::survival::latent::{
+use crate::survival::latent::{
     LatentBinaryTermFitResult, LatentBinaryTermSpec, LatentSurvivalTermFitResult,
     LatentSurvivalTermSpec, fit_latent_binary_terms, fit_latent_survival_terms,
     latent_hazard_loading,
 };
 
-use crate::families::survival::lognormal_kernel::FrailtySpec;
+use crate::survival::lognormal_kernel::FrailtySpec;
 
-use crate::families::survival::location_scale::{
+use crate::survival::location_scale::{
     SurvivalLocationScaleTermFitResult, SurvivalLocationScaleTermSpec,
     fit_survival_location_scale_terms, fit_survival_location_scale_terms_with_selected_wiggle,
     select_survival_link_wiggle_basis_from_pilot,
 };
 
-use crate::families::survival::marginal_slope::{
+use crate::survival::marginal_slope::{
     SurvivalMarginalSlopeFitResult, SurvivalMarginalSlopeTermSpec,
     fit_survival_marginal_slope_terms,
 };
 
-use crate::families::transformation_normal::{
+use crate::transformation_normal::{
     TransformationNormalConfig, TransformationNormalFitResult, TransformationWarmStart,
     fit_transformation_normal,
 };
 
-use crate::families::wiggle::WiggleBlockConfig;
+use crate::wiggle::WiggleBlockConfig;
 
 use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
 
-use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
+use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
 
 use gam_terms::smooth::{
     AdaptiveRegularizationDiagnostics, CoefficientGroupSpec, LinearTermSpec,
-    SpatialLengthScaleOptimizationOptions, SpatialLengthScaleOptimizationTiming,
-    StandardLatentCoordConfig, TermCollectionDesign, TermCollectionSpec,
-    build_term_collection_design,
+    SpatialLengthScaleOptimizationOptions, StandardLatentCoordConfig, TermCollectionDesign,
+    TermCollectionSpec,
+};
+
+use crate::fit_orchestration::drivers::{
+    SpatialLengthScaleOptimizationTiming, build_term_collection_design,
     fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_priors,
     fit_term_collectionwith_latent_coord_optimization,
     fit_term_collectionwith_spatial_length_scale_optimization, freeze_term_collection_from_design,
 };
 
-use crate::latent_cache::LatentRetractionRegistry;
+use gam_problem::LatentRetractionRegistry;
 
-use crate::riemannian_retraction::{ProductRetraction, RetractionKind};
+use gam_problem::riemannian_retraction::{ProductRetraction, RetractionKind};
 
-use crate::families::survival::PenaltyBlock;
+use crate::survival::PenaltyBlock;
 
 use gam_terms::latent::{
     AuxPriorFamily, AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold,
@@ -98,7 +101,7 @@ use std::sync::Arc;
 // High-level formula-to-fit API imports. These are shared by the fitting,
 // orchestration-entry, and materialization concerns, so they live at the parent
 // level where every submodule's `use super::*;` picks them up.
-use crate::families::survival::construction::{
+use crate::survival::construction::{
     SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalTimeBasisConfig,
     add_survival_time_derivative_guard_offset, append_zero_tail_columns,
     baseline_chain_rule_gradient, build_latent_survival_baseline_offsets,
@@ -115,14 +118,14 @@ use crate::families::survival::construction::{
     survival_derivative_guard_for_likelihood,
 };
 
-use crate::families::survival::location_scale::{
+use crate::survival::location_scale::{
     SurvivalCovariateTermBlockTemplate, TimeBlockInput, TimeWiggleBlockInput,
     residual_distribution_inverse_link,
 };
 
 use gam_data::EncodedDataset as Dataset;
 
-use crate::inference::formula_dsl::{
+use gam_terms::inference::formula_dsl::{
     LinkChoice, LinkWiggleFormulaSpec, ParsedFormula, ParsedTerm, effectivelinkwiggle_formulaspec,
     marginal_slope_logslope_surfaces, parse_formula, parse_link_choice,
     parse_matching_auxiliary_formula, parse_surv_interval_response, parse_surv_response,
@@ -141,6 +144,8 @@ use gam_terms::term_builder::{
 /// so the descriptor schema, defaults, shape checks, and error messages are
 /// identical for every caller.
 pub mod descriptors;
+
+pub mod drivers;
 
 mod entry;
 mod error;

@@ -201,7 +201,7 @@
 use faer::Side;
 use ndarray::{Array1, Array2};
 
-use crate::faer_ndarray::{FaerCholesky, FaerEigh, fast_av};
+use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_av};
 
 /// One maximal interval of candidate values retained in the prediction set.
 /// Endpoints may be infinite (honest unboundedness in low-information /

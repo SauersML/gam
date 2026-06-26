@@ -5,7 +5,7 @@ use pest::iterators::Pair;
 use pest_derive::Parser;
 
 use crate::smooth::BoundedCoefficientPriorSpec;
-use crate::types::{
+use gam_problem::types::{
     InverseLink, LikelihoodSpec, LinkComponent, LinkFunction, StandardLink, WigglePenaltyConfig,
 };
 
@@ -104,7 +104,7 @@ pub enum FormulaDslError {
     MalformedConfig { reason: String },
 }
 
-crate::impl_reason_error_boilerplate! {
+gam_linalg::impl_reason_error_boilerplate! {
     FormulaDslError {
         ParseError,
         UnknownIdentifier,

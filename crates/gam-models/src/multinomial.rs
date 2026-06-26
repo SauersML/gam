@@ -69,7 +69,7 @@ use crate::penalized_vector_glm::{PenalizedVectorGlmInputs, fit_penalized_vector
 use crate::vector_response::{MultinomialLogitLikelihood, validate_multinomial_simplex};
 use crate::inference::formula_dsl::parse_formula;
 use crate::model_types::EstimationError;
-use gam_solve::fit_orchestration::{
+use crate::fit_orchestration::{
     FitConfig, build_termspec_with_geometry_and_overrides, resolved_resource_policy,
 };
 use gam_terms::smooth::{
@@ -1085,7 +1085,7 @@ fn build_formula_design_for_multinomial(
     let col_map = data.column_map();
     let y_col = resolve_role_col(&col_map, &parsed.response, "response")
         .map_err(|err| EstimationError::InvalidInput(format!("multinomial fit: {err}")))?;
-    let y_kind = gam_solve::fit_orchestration::response_column_kind(data, y_col);
+    let y_kind = crate::fit_orchestration::response_column_kind(data, y_col);
     let policy = resolved_resource_policy(config, data, ProblemHints::default());
     let mut inference_notes: Vec<String> = Vec::new();
     let spec = build_termspec_with_geometry_and_overrides(

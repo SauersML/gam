@@ -52,10 +52,10 @@ pub mod model_types {
 /// submodules are still in the uncarved monolith (see blocker report) and are
 /// intentionally *not* shimmed here — there is no leaf crate to re-export them
 /// from yet.
-pub mod inference {
-    pub use gam_math::probability;
-    pub use gam_solve::quadrature;
-}
+pub mod inference;
+
+pub mod fit_orchestration;
+pub mod protocol;
 
 pub mod binomial_multi;
 pub mod block_layout;

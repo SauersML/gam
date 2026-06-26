@@ -83,7 +83,7 @@ use crate::wiggle::{
     select_wiggle_basis_from_seed, validate_monotone_wiggle_beta_nonnegative,
 };
 
-use crate::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
+use crate::inference::generative::{CustomFamilyGenerative, GenerativeSpec, NoiseModel};
 
 use gam_linalg::matrix::SymmetricMatrix;
 

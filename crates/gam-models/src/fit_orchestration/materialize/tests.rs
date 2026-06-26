@@ -1,8 +1,8 @@
 use super::*;
 use gam_terms::basis::{DuchonNullspaceOrder, minimum_duchon_power_for_operator_penalties};
-use crate::inference::formula_dsl::{default_linkwiggle_formulaspec, parse_linkwiggle_formulaspec};
+use gam_terms::inference::formula_dsl::{default_linkwiggle_formulaspec, parse_linkwiggle_formulaspec};
 use gam_terms::smooth::SmoothBasisSpec;
-use crate::rho_optimizer::{HessianSource, OuterPlan, OuterResult, Solver};
+use gam_solve::rho_optimizer::{HessianSource, OuterPlan, OuterResult, Solver};
 use gam_data::load_dataset_projected;
 use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
 use ndarray::Array2;
@@ -232,14 +232,14 @@ fn survival_marginal_slope_matern_logslope_penalties_keep_surface_width() {
             request.spec.logslopespec.clone(),
         ];
         let (designs, frozen_specs) =
-            gam_terms::smooth::build_term_collection_designs_and_freeze_joint(
+            crate::fit_orchestration::drivers::build_term_collection_designs_and_freeze_joint(
                 data.values.view(),
                 &specs,
             )
             .unwrap_or_else(|err| {
                 panic!("joint freeze should preserve per-block penalty geometry {case}: {err}")
             });
-        let (rebuilt, _) = gam_terms::smooth::build_term_collection_designs_and_freeze_joint(
+        let (rebuilt, _) = crate::fit_orchestration::drivers::build_term_collection_designs_and_freeze_joint(
             data.values.view(),
             &frozen_specs,
         )

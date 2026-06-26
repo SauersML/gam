@@ -48,7 +48,7 @@ pub enum WorkflowError {
     /// source retains the parser-layer category and argument context.
     FormulaDsl {
         context: &'static str,
-        source: crate::inference::formula_dsl::FormulaDslError,
+        source: gam_terms::inference::formula_dsl::FormulaDslError,
     },
     /// A formula referenced a column that does not exist in the input data.
     /// Carries the structured payload through to the FFI boundary so the
@@ -157,8 +157,8 @@ impl From<&str> for WorkflowError {
 /// `fit_from_formula` (via `parse_formula`, `parse_surv_response`, etc.) flows
 /// up with its parser-layer source attached instead of stringifying into a
 /// generic workflow configuration bucket.
-impl From<crate::inference::formula_dsl::FormulaDslError> for WorkflowError {
-    fn from(err: crate::inference::formula_dsl::FormulaDslError) -> Self {
+impl From<gam_terms::inference::formula_dsl::FormulaDslError> for WorkflowError {
+    fn from(err: gam_terms::inference::formula_dsl::FormulaDslError) -> Self {
         Self::FormulaDsl {
             context: "workflow formula materialization",
             source: err,

@@ -1,7 +1,7 @@
-use crate::custom_family::{CustomFamily, ParameterBlockState};
-use crate::estimate::EstimationError;
+use gam_solve::custom_family::{CustomFamily, ParameterBlockState};
+use gam_solve::estimate::EstimationError;
 use crate::inference::predict_io::PredictResult;
-use crate::types::{
+use gam_problem::types::{
     LikelihoodScaleMetadata, LikelihoodSpec, ResponseFamily, is_valid_tweedie_power,
 };
 use ndarray::{Array1, Array2};
@@ -542,7 +542,7 @@ pub trait CustomFamilyGenerative: CustomFamily {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::family_runtime::{FamilyStrategy, strategy_for_spec};
+    use crate::family_runtime::{FamilyStrategy, strategy_for_spec};
 
     /// The canonical dispersion picker must read the *fitted* dispersion off the
     /// scale metadata, never the construction seed embedded in the response

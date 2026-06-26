@@ -12,21 +12,21 @@ pub struct PreparedSurvivalTimeStack {
     pub time_design_derivative_exit: gam_linalg::matrix::DesignMatrix,
     pub time_penalties: Vec<Array2<f64>>,
     pub time_nullspace_dims: Vec<usize>,
-    pub timewiggle_build: Option<crate::families::survival::construction::SurvivalTimeWiggleBuild>,
+    pub timewiggle_build: Option<crate::survival::construction::SurvivalTimeWiggleBuild>,
     pub timewiggle_block: Option<TimeWiggleBlockInput>,
 }
 
 pub fn prepare_survival_time_stack(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
-    baseline_cfg: &crate::families::survival::construction::SurvivalBaselineConfig,
+    baseline_cfg: &crate::survival::construction::SurvivalBaselineConfig,
     likelihood_mode: SurvivalLikelihoodMode,
     inverse_link: Option<&InverseLink>,
     time_anchor: f64,
     derivative_guard: f64,
-    time_build: &crate::families::survival::construction::SurvivalTimeBuildOutput,
+    time_build: &crate::survival::construction::SurvivalTimeBuildOutput,
     effective_timewiggle: Option<&LinkWiggleFormulaSpec>,
-    latent_loading: Option<crate::families::survival::lognormal_kernel::HazardLoading>,
+    latent_loading: Option<crate::survival::lognormal_kernel::HazardLoading>,
 ) -> Result<PreparedSurvivalTimeStack, String> {
     let (
         mut eta_offset_entry,
@@ -79,8 +79,8 @@ pub fn prepare_survival_time_stack(
             && baseline_cfg.target == SurvivalBaselineTarget::Linear
         {
             let scale =
-                crate::families::survival::construction::positive_survival_time_seed(age_exit);
-            conditioning_cfg = crate::families::survival::construction::SurvivalBaselineConfig {
+                crate::survival::construction::positive_survival_time_seed(age_exit);
+            conditioning_cfg = crate::survival::construction::SurvivalBaselineConfig {
                 target: SurvivalBaselineTarget::Weibull,
                 scale: Some(scale),
                 shape: Some(1.0),

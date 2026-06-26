@@ -116,7 +116,7 @@ pub(crate) fn materialize_standard<'a>(
         let sigma = match config.frailty.clone().unwrap_or(FrailtySpec::None) {
             FrailtySpec::HazardMultiplier {
                 sigma_fixed: Some(sigma),
-                loading: crate::families::survival::lognormal_kernel::HazardLoading::Full,
+                loading: crate::survival::lognormal_kernel::HazardLoading::Full,
             } => sigma,
             FrailtySpec::HazardMultiplier {
                 sigma_fixed: Some(_),

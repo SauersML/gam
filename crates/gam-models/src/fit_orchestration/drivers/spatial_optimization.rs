@@ -13,7 +13,7 @@ fn try_build_spatial_term_log_kappa_derivative(
         Array2<f64>,
         Vec<Array2<f64>>,
         Vec<Array2<f64>>,
-        Option<std::sync::Arc<crate::basis::ImplicitDesignPsiDerivative>>,
+        Option<std::sync::Arc<gam_terms::basis::ImplicitDesignPsiDerivative>>,
     )>,
     EstimationError,
 > {
@@ -102,7 +102,7 @@ fn try_build_spatial_term_log_kappa_derivative(
             if spec_local.radial_reparam.is_none() {
                 spec_local.radial_reparam = radial_reparam.clone();
             }
-            crate::basis::build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
+            gam_terms::basis::build_duchon_basis_log_kappa_derivativeswith_collocationwithworkspace(
                 x.view(),
                 &spec_local,
                 centers.view(),
@@ -246,10 +246,10 @@ fn try_build_spatial_log_kappa_hyper_dirs(
 }
 
 pub(crate) fn try_build_latent_coord_hyper_dirs(
-    latent: std::sync::Arc<crate::latent::LatentCoordValues>,
+    latent: std::sync::Arc<gam_terms::latent::LatentCoordValues>,
     resolvedspec: &TermCollectionSpec,
     design: &TermCollectionDesign,
-    latent_terms: &[crate::types::SmoothTermIdx],
+    latent_terms: &[gam_problem::types::SmoothTermIdx],
     analytic_rho_count: usize,
 ) -> Result<Option<Vec<DirectionalHyperParam>>, EstimationError> {
     if latent_terms.is_empty() || latent.is_empty() {
@@ -295,7 +295,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
                 identifiability_transform,
                 ..
             },
-        ) => crate::basis::LatentCoordDesignDerivative::new_matern(
+        ) => gam_terms::basis::LatentCoordDesignDerivative::new_matern(
             latent.clone(),
             std::sync::Arc::new(centers.clone()),
             *length_scale,
@@ -314,7 +314,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
                 identifiability_transform,
                 ..
             },
-        ) => crate::basis::LatentCoordDesignDerivative::new_duchon(
+        ) => gam_terms::basis::LatentCoordDesignDerivative::new_duchon(
             latent.clone(),
             std::sync::Arc::new(centers.clone()),
             *length_scale,
@@ -332,8 +332,8 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
                 constraint_transform,
                 ..
             },
-        ) if matches!(*method, crate::basis::SphereMethod::Wahba) => {
-            crate::basis::LatentCoordDesignDerivative::new_sphere(
+        ) if matches!(*method, gam_terms::basis::SphereMethod::Wahba) => {
+            gam_terms::basis::LatentCoordDesignDerivative::new_sphere(
                 latent.clone(),
                 std::sync::Arc::new(centers.clone()),
                 *penalty_order,
@@ -356,7 +356,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
             // actually built at fit time after auto-shrink.
             let effective_degree = meta_degree.unwrap_or(spec.degree);
             if let Some((domain_start, period, num_basis)) = periodic {
-                crate::basis::LatentCoordDesignDerivative::new_periodic_bspline(
+                gam_terms::basis::LatentCoordDesignDerivative::new_periodic_bspline(
                     latent.clone(),
                     (*domain_start, *domain_start + *period),
                     effective_degree,
@@ -365,7 +365,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
                 )
                 .map_err(EstimationError::from)?
             } else {
-                crate::basis::LatentCoordDesignDerivative::new_tensor_bspline(
+                gam_terms::basis::LatentCoordDesignDerivative::new_tensor_bspline(
                     latent.clone(),
                     vec![knots.clone()],
                     vec![effective_degree],
@@ -382,7 +382,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
                 identifiability_transform,
                 ..
             },
-        ) => crate::basis::LatentCoordDesignDerivative::new_tensor_bspline(
+        ) => gam_terms::basis::LatentCoordDesignDerivative::new_tensor_bspline(
             latent.clone(),
             knots.clone(),
             degrees.clone(),
@@ -390,7 +390,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
         )
         .map_err(EstimationError::from)?,
         (SmoothBasisSpec::Pca { .. }, BasisMetadata::Pca { basis_matrix, .. }) => {
-            crate::basis::LatentCoordDesignDerivative::new_pca(
+            gam_terms::basis::LatentCoordDesignDerivative::new_pca(
                 latent.clone(),
                 std::sync::Arc::new(basis_matrix.clone()),
             )
@@ -410,7 +410,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     let mut hyper_dirs = Vec::with_capacity(operator.n_axes());
     for flat_axis in 0..operator.n_axes() {
         let dir = DirectionalHyperParam::new_compact(
-            crate::estimate::reml::HyperDesignDerivative::from_latent_coord(
+            gam_solve::estimate::reml::HyperDesignDerivative::from_latent_coord(
                 operator.clone(),
                 flat_axis,
                 global_range.clone(),
@@ -425,7 +425,7 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     }
     let direct_dim = latent_coord_direct_hyper_count(latent.id_mode(), latent.latent_dim());
     if analytic_rho_count + direct_dim > 0 {
-        let zero_x = crate::estimate::reml::HyperDesignDerivative::from(Array2::<f64>::zeros((
+        let zero_x = gam_solve::estimate::reml::HyperDesignDerivative::from(Array2::<f64>::zeros((
             design.design.nrows(),
             p_total,
         )));
@@ -446,10 +446,10 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
 }
 
 fn latent_coord_direct_hyper_count(
-    id_mode: &crate::latent::LatentIdMode,
+    id_mode: &gam_terms::latent::LatentIdMode,
     latent_dim: usize,
 ) -> usize {
-    use crate::latent::{AuxPriorStrength, LatentIdMode};
+    use gam_terms::latent::{AuxPriorStrength, LatentIdMode};
     match id_mode {
         LatentIdMode::AuxPrior { strength, .. } => match strength {
             AuxPriorStrength::Auto => 1,
@@ -477,10 +477,10 @@ fn latent_coord_direct_hyper_count(
 }
 
 fn latent_coord_initial_direct_hypers(
-    id_mode: &crate::latent::LatentIdMode,
+    id_mode: &gam_terms::latent::LatentIdMode,
     latent_dim: usize,
 ) -> Result<Array1<f64>, EstimationError> {
-    use crate::latent::{AuxPriorStrength, LatentIdMode};
+    use gam_terms::latent::{AuxPriorStrength, LatentIdMode};
     let mut values = Vec::with_capacity(latent_coord_direct_hyper_count(id_mode, latent_dim));
     match id_mode {
         LatentIdMode::AuxPrior { strength, .. } => {
@@ -550,9 +550,9 @@ fn latent_id_objective_contribution(
     theta: &Array1<f64>,
     rho_dim: usize,
     analytic_rho_count: usize,
-    latent: &crate::latent::LatentCoordValues,
+    latent: &gam_terms::latent::LatentCoordValues,
 ) -> Result<LatentIdObjectiveContribution, EstimationError> {
-    use crate::latent::{AuxPriorStrength, LatentIdMode, aux_prior_targets};
+    use gam_terms::latent::{AuxPriorStrength, LatentIdMode, aux_prior_targets};
     let n_obs = latent.n_obs();
     let latent_dim = latent.latent_dim();
     let flat_len = latent.len();
@@ -722,7 +722,7 @@ fn add_latent_id_objective_to_eval(
     theta: &Array1<f64>,
     rho_dim: usize,
     analytic_rho_count: usize,
-    latent: &crate::latent::LatentCoordValues,
+    latent: &gam_terms::latent::LatentCoordValues,
     eval: &mut (
         f64,
         Array1<f64>,
@@ -749,8 +749,8 @@ fn add_latent_id_objective_to_eval(
 fn analytic_penalty_objective_contribution(
     theta: &Array1<f64>,
     rho_dim: usize,
-    latent: &crate::latent::LatentCoordValues,
-    registry: &crate::AnalyticPenaltyRegistry,
+    latent: &gam_terms::latent::LatentCoordValues,
+    registry: &gam_terms::AnalyticPenaltyRegistry,
 ) -> Result<LatentIdObjectiveContribution, EstimationError> {
     let flat_len = latent.len();
     let t_start = rho_dim;
@@ -771,7 +771,7 @@ fn analytic_penalty_objective_contribution(
     for (penalty, (rho_slice, tier, name)) in registry.penalties.iter().zip(registry.rho_layout()) {
         let rho_local = rho.slice(s![rho_slice.clone()]);
         match tier {
-            crate::PenaltyTier::Psi => {
+            gam_terms::PenaltyTier::Psi => {
                 cost += penalty.value(target_t.view(), rho_local);
                 let grad = penalty.grad_target(target_t.view(), rho_local);
                 if grad.len() != flat_len {
@@ -796,8 +796,8 @@ fn analytic_penalty_objective_contribution(
                     gradient[rho_start + rho_slice.start + local_idx] += grad_rho_local[local_idx];
                 }
             }
-            crate::PenaltyTier::Beta => {}
-            crate::PenaltyTier::Rho => {}
+            gam_terms::PenaltyTier::Beta => {}
+            gam_terms::PenaltyTier::Rho => {}
         }
     }
     Ok(LatentIdObjectiveContribution { cost, gradient })
@@ -806,8 +806,8 @@ fn analytic_penalty_objective_contribution(
 fn add_analytic_penalty_hessian_to_eval(
     theta: &Array1<f64>,
     rho_dim: usize,
-    latent: &crate::latent::LatentCoordValues,
-    registry: &crate::AnalyticPenaltyRegistry,
+    latent: &gam_terms::latent::LatentCoordValues,
+    registry: &gam_terms::AnalyticPenaltyRegistry,
     eval: &mut (
         f64,
         Array1<f64>,
@@ -846,7 +846,7 @@ fn add_analytic_penalty_hessian_to_eval(
     for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
     {
         let rho_local = rho.slice(s![rho_slice]);
-        if !matches!(tier, crate::PenaltyTier::Psi) {
+        if !matches!(tier, gam_terms::PenaltyTier::Psi) {
             continue;
         }
         if let Some(diag) = penalty.hessian_diag(target_t.view(), rho_local) {
@@ -885,8 +885,8 @@ fn add_analytic_penalty_hessian_to_eval(
 fn add_analytic_penalty_objective_to_eval(
     theta: &Array1<f64>,
     rho_dim: usize,
-    latent: &crate::latent::LatentCoordValues,
-    registry: &crate::AnalyticPenaltyRegistry,
+    latent: &gam_terms::latent::LatentCoordValues,
+    registry: &gam_terms::AnalyticPenaltyRegistry,
     eval: &mut (
         f64,
         Array1<f64>,
@@ -910,7 +910,7 @@ fn add_analytic_penalty_objective_to_eval(
 fn spatial_log_kappa_hyper_dirs_frominfo_list(
     info_list: Vec<SpatialPsiDerivative>,
 ) -> Result<Vec<DirectionalHyperParam>, EstimationError> {
-    use crate::estimate::reml::ImplicitDerivLevel;
+    use gam_solve::estimate::reml::ImplicitDerivLevel;
     use std::collections::HashMap;
 
     let log_kappa_dim = info_list.len();
@@ -948,14 +948,14 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
         let mut xsecond = vec![None; log_kappa_dim];
         // Diagonal second derivative (same axis).
         xsecond[i] = Some(if let Some(ref op) = implicit_operator {
-            crate::estimate::reml::HyperDesignDerivative::from_implicit(
+            gam_solve::estimate::reml::HyperDesignDerivative::from_implicit(
                 op.clone(),
                 ImplicitDerivLevel::SecondDiag(implicit_axis),
                 global_range.clone(),
                 total_p,
             )
         } else {
-            crate::estimate::reml::HyperDesignDerivative::from_embedded(
+            gam_solve::estimate::reml::HyperDesignDerivative::from_embedded(
                 x_psi_psi_local,
                 global_range.clone(),
                 total_p,
@@ -975,14 +975,14 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
                     let j = base + b_axis;
                     if j < log_kappa_dim {
                         xsecond[j] = Some(if let Some(ref op) = implicit_operator {
-                            crate::estimate::reml::HyperDesignDerivative::from_implicit(
+                            gam_solve::estimate::reml::HyperDesignDerivative::from_implicit(
                                 op.clone(),
                                 ImplicitDerivLevel::SecondCross(implicit_axis, b_axis),
                                 global_range.clone(),
                                 total_p,
                             )
                         } else {
-                            crate::estimate::reml::HyperDesignDerivative::from_embedded(
+                            gam_solve::estimate::reml::HyperDesignDerivative::from_embedded(
                                 cross_mat,
                                 global_range.clone(),
                                 total_p,
@@ -996,7 +996,7 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             .iter()
             .copied()
             .zip(s_psi_components_local.into_iter().map(|local| {
-                crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
+                gam_solve::estimate::reml::HyperPenaltyDerivative::from_embedded(
                     local,
                     global_range.clone(),
                     total_p,
@@ -1007,7 +1007,7 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
             .iter()
             .copied()
             .zip(s_psi_psi_components_local.into_iter().map(|local| {
-                crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
+                gam_solve::estimate::reml::HyperPenaltyDerivative::from_embedded(
                     local,
                     global_range.clone(),
                     total_p,
@@ -1043,7 +1043,7 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
                 let group_indices_inner = group_indices;
                 Some(std::sync::Arc::new(
                     move |j: usize| -> Result<
-                        Option<Vec<crate::estimate::reml::PenaltyDerivativeComponent>>,
+                        Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
                         EstimationError,
                     > {
                         let Some(other_axis_in_group) =
@@ -1063,14 +1063,14 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
                                 .iter()
                                 .copied()
                                 .zip(cross_pens.into_iter().map(|local| {
-                                    crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
+                                    gam_solve::estimate::reml::HyperPenaltyDerivative::from_embedded(
                                         local,
                                         global_range_inner.clone(),
                                         total_p_inner,
                                     )
                                 }))
                                 .map(|(penalty_index, matrix)| {
-                                    crate::estimate::reml::PenaltyDerivativeComponent {
+                                    gam_solve::estimate::reml::PenaltyDerivativeComponent {
                                         penalty_index,
                                         matrix,
                                     }
@@ -1083,7 +1083,7 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
                         dyn Fn(
                                 usize,
                             ) -> Result<
-                                Option<Vec<crate::estimate::reml::PenaltyDerivativeComponent>>,
+                                Option<Vec<gam_solve::estimate::reml::PenaltyDerivativeComponent>>,
                                 EstimationError,
                             > + Send
                             + Sync
@@ -1095,14 +1095,14 @@ fn spatial_log_kappa_hyper_dirs_frominfo_list(
         // First derivative: use implicit operator when available to avoid
         // storing dense (n x p) matrices for all D axes simultaneously.
         let x_first_hyper = if let Some(ref op) = implicit_operator {
-            crate::estimate::reml::HyperDesignDerivative::from_implicit(
+            gam_solve::estimate::reml::HyperDesignDerivative::from_implicit(
                 op.clone(),
                 ImplicitDerivLevel::First(implicit_axis),
                 global_range.clone(),
                 total_p,
             )
         } else {
-            crate::estimate::reml::HyperDesignDerivative::from_embedded(
+            gam_solve::estimate::reml::HyperDesignDerivative::from_embedded(
                 x_psi_local,
                 global_range.clone(),
                 total_p,
@@ -1366,7 +1366,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
             .realizer
             .canonical_penalty_derivatives_at_psi(&self.spatial_terms, psi)
             .map_err(EstimationError::InvalidInput)?;
-        let zero_x = crate::estimate::reml::HyperDesignDerivative::zero(
+        let zero_x = gam_solve::estimate::reml::HyperDesignDerivative::zero(
             self.realizer.design().design.nrows(),
             p_total,
         );
@@ -1376,7 +1376,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
             .map(|(penalty_index, local)| {
                 (
                     penalty_index,
-                    crate::estimate::reml::HyperPenaltyDerivative::from_embedded(
+                    gam_solve::estimate::reml::HyperPenaltyDerivative::from_embedded(
                         local,
                         global_range.clone(),
                         p_total,
@@ -1519,7 +1519,7 @@ impl<'d> SingleBlockExactJointDesignCache<'d> {
     fn canonical_penalties_at(
         &mut self,
         theta: &Array1<f64>,
-    ) -> Result<(Vec<crate::construction::CanonicalPenalty>, Vec<usize>), String> {
+    ) -> Result<(Vec<gam_terms::construction::CanonicalPenalty>, Vec<usize>), String> {
         let psi = &theta
             .as_slice()
             .ok_or_else(|| "canonical_penalties_at: theta is not contiguous".to_string())?
@@ -1534,26 +1534,26 @@ struct SingleBlockLatentCoordDesignCache {
     spec: TermCollectionSpec,
     design: TermCollectionDesign,
     current_theta: Option<Array1<f64>>,
-    current_latent: Option<std::sync::Arc<crate::latent::LatentCoordValues>>,
-    current_hyper_dirs: Option<Vec<crate::estimate::reml::DirectionalHyperParam>>,
+    current_latent: Option<std::sync::Arc<gam_terms::latent::LatentCoordValues>>,
+    current_hyper_dirs: Option<Vec<gam_solve::estimate::reml::DirectionalHyperParam>>,
     current_design_cache_id: Option<u64>,
-    latent_design_cache: crate::solver::latent_cache::LatentDesignCache,
+    latent_design_cache: gam_solve::latent_cache::LatentDesignCache,
     last_cost: Option<f64>,
     last_eval: Option<(
         f64,
         Array1<f64>,
         gam_problem::HessianResult,
     )>,
-    term_index: crate::types::SmoothTermIdx,
+    term_index: gam_problem::types::SmoothTermIdx,
     feature_cols: Vec<usize>,
     rho_dim: usize,
     n_obs: usize,
     latent_dim: usize,
-    id_mode: crate::latent::LatentIdMode,
-    manifold: crate::latent::LatentManifold,
-    retraction_registry: crate::solver::latent_cache::LatentRetractionRegistry,
+    id_mode: gam_terms::latent::LatentIdMode,
+    manifold: gam_terms::latent::LatentManifold,
+    retraction_registry: gam_solve::latent_cache::LatentRetractionRegistry,
     latent_id: u64,
-    analytic_penalties: Option<std::sync::Arc<crate::AnalyticPenaltyRegistry>>,
+    analytic_penalties: Option<std::sync::Arc<gam_terms::AnalyticPenaltyRegistry>>,
     analytic_rho_count: usize,
     design_revision: u64,
     // Stamp the outer-iter the cached cost/eval was computed under; analytic
@@ -1606,7 +1606,7 @@ impl SingleBlockLatentCoordDesignCache {
             current_latent: None,
             current_hyper_dirs: None,
             current_design_cache_id: None,
-            latent_design_cache: crate::solver::latent_cache::LatentDesignCache::default(),
+            latent_design_cache: gam_solve::latent_cache::LatentDesignCache::default(),
             last_cost: None,
             last_eval: None,
             term_index: latent.term_index,
@@ -1633,14 +1633,14 @@ impl SingleBlockLatentCoordDesignCache {
         &self.design
     }
 
-    fn latent(&self) -> Result<std::sync::Arc<crate::latent::LatentCoordValues>, String> {
+    fn latent(&self) -> Result<std::sync::Arc<gam_terms::latent::LatentCoordValues>, String> {
         self.current_latent
             .as_ref()
             .cloned()
             .ok_or_else(|| "latent-coordinate cache has not been realized".to_string())
     }
 
-    fn analytic_penalties(&self) -> Option<std::sync::Arc<crate::AnalyticPenaltyRegistry>> {
+    fn analytic_penalties(&self) -> Option<std::sync::Arc<gam_terms::AnalyticPenaltyRegistry>> {
         self.analytic_penalties.clone()
     }
 
@@ -1648,14 +1648,14 @@ impl SingleBlockLatentCoordDesignCache {
         self.analytic_rho_count
     }
 
-    fn hyper_dirs(&self) -> Result<Vec<crate::estimate::reml::DirectionalHyperParam>, String> {
+    fn hyper_dirs(&self) -> Result<Vec<gam_solve::estimate::reml::DirectionalHyperParam>, String> {
         self.current_hyper_dirs
             .as_ref()
             .cloned()
             .ok_or_else(|| "latent-coordinate hyper_dirs cache has not been realized".to_string())
     }
 
-    fn latent_basis_kind(&self) -> Result<crate::solver::latent_cache::LatentBasisKind, String> {
+    fn latent_basis_kind(&self) -> Result<gam_solve::latent_cache::LatentBasisKind, String> {
         let smooth_term = self
             .design
             .smooth
@@ -1687,14 +1687,14 @@ impl SingleBlockLatentCoordDesignCache {
                     aniso_log_scales,
                     ..
                 },
-            ) => Ok(crate::solver::latent_cache::LatentBasisKind::Matern {
+            ) => Ok(gam_solve::latent_cache::LatentBasisKind::Matern {
                 centers: centers.clone(),
                 length_scale: *length_scale,
                 nu: *nu,
                 aniso_log_scales: aniso_log_scales
                     .clone()
                     .unwrap_or_else(|| vec![0.0; centers.ncols()]),
-                chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
+                chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
                     self.n_obs,
                     centers.nrows(),
                 ),
@@ -1709,7 +1709,7 @@ impl SingleBlockLatentCoordDesignCache {
                     aniso_log_scales,
                     ..
                 },
-            ) => Ok(crate::solver::latent_cache::LatentBasisKind::Duchon {
+            ) => Ok(gam_solve::latent_cache::LatentBasisKind::Duchon {
                 centers: centers.clone(),
                 length_scale: *length_scale,
                 power: *power,
@@ -1726,11 +1726,11 @@ impl SingleBlockLatentCoordDesignCache {
                     method,
                     ..
                 },
-            ) if matches!(*method, crate::basis::SphereMethod::Wahba) => {
-                Ok(crate::solver::latent_cache::LatentBasisKind::Sphere {
+            ) if matches!(*method, gam_terms::basis::SphereMethod::Wahba) => {
+                Ok(gam_solve::latent_cache::LatentBasisKind::Sphere {
                     centers: centers.clone(),
                     penalty_order: *penalty_order,
-                    chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
+                    chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
                         self.n_obs,
                         centers.nrows(),
                     ),
@@ -1751,12 +1751,12 @@ impl SingleBlockLatentCoordDesignCache {
                 let effective_degree = meta_degree.unwrap_or(spec.degree);
                 if let Some((domain_start, period, num_basis)) = periodic {
                     Ok(
-                        crate::solver::latent_cache::LatentBasisKind::PeriodicBspline {
+                        gam_solve::latent_cache::LatentBasisKind::PeriodicBspline {
                             domain_start: *domain_start,
                             period: *period,
                             degree: effective_degree,
                             num_basis: *num_basis,
-                            chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
+                            chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
                                 self.n_obs, *num_basis,
                             ),
                         },
@@ -1764,10 +1764,10 @@ impl SingleBlockLatentCoordDesignCache {
                 } else {
                     let num_basis_est = knots.len().saturating_sub(effective_degree + 1);
                     Ok(
-                        crate::solver::latent_cache::LatentBasisKind::TensorBspline {
+                        gam_solve::latent_cache::LatentBasisKind::TensorBspline {
                             knots: vec![knots.clone()],
                             degrees: vec![effective_degree],
-                            chunk_size: crate::basis::auto_streaming_chunk_size_for_dense(
+                            chunk_size: gam_terms::basis::auto_streaming_chunk_size_for_dense(
                                 self.n_obs,
                                 num_basis_est,
                             ),
@@ -1779,7 +1779,7 @@ impl SingleBlockLatentCoordDesignCache {
                 SmoothBasisSpec::TensorBSpline { .. },
                 BasisMetadata::TensorBSpline { knots, degrees, .. },
             ) => Ok(
-                crate::solver::latent_cache::LatentBasisKind::TensorBspline {
+                gam_solve::latent_cache::LatentBasisKind::TensorBspline {
                     knots: knots.clone(),
                     degrees: degrees.clone(),
                     chunk_size: None,
@@ -1803,13 +1803,13 @@ impl SingleBlockLatentCoordDesignCache {
                             "latent-coordinate Pca cache key requires center_mean when centered",
                         )
                     })?;
-                    Some(crate::solver::latent_cache::pca_center_mean_fingerprint(
+                    Some(gam_solve::latent_cache::pca_center_mean_fingerprint(
                         mean,
                     ))
                 } else {
                     None
                 };
-                Ok(crate::solver::latent_cache::LatentBasisKind::Pca {
+                Ok(gam_solve::latent_cache::LatentBasisKind::Pca {
                     basis_matrix: basis_matrix.clone(),
                     centered: *centered,
                     center_mean_fingerprint,
@@ -1855,7 +1855,7 @@ impl SingleBlockLatentCoordDesignCache {
             .slice(s![self.rho_dim..self.rho_dim + latent_flat_len])
             .to_owned();
         let latent = std::sync::Arc::new(
-            crate::latent::LatentCoordValues::from_flat_with_manifold_and_retraction_and_id(
+            gam_terms::latent::LatentCoordValues::from_flat_with_manifold_and_retraction_and_id(
                 flat,
                 self.n_obs,
                 self.latent_dim,
@@ -1889,7 +1889,7 @@ impl SingleBlockLatentCoordDesignCache {
         let analytic_rho_count = self.analytic_rho_count;
         let data = self.data.view();
         let design_context_digest =
-            crate::solver::latent_cache::latent_design_context_cache_digest(
+            gam_solve::latent_cache::latent_design_context_cache_digest(
                 data,
                 &spec,
                 term_index,
@@ -1924,7 +1924,7 @@ impl SingleBlockLatentCoordDesignCache {
                         "failed to build latent-coordinate hyper_dirs".to_string(),
                     )
                 })?;
-                Ok(crate::solver::latent_cache::ComputedLatentDesign {
+                Ok(gam_solve::latent_cache::ComputedLatentDesign {
                     design: rebuilt,
                     hyper_dirs,
                 })
@@ -1958,7 +1958,7 @@ impl SingleBlockLatentCoordDesignCache {
             .as_ref()
             .is_some_and(|cached| theta_values_match(cached, theta))
             && self.last_outer_iter
-                == Some(crate::solver::estimate::reml::outer_eval::current_outer_iter())
+                == Some(gam_solve::estimate::reml::outer_eval::current_outer_iter())
         {
             self.last_eval
                 .as_ref()
@@ -1982,7 +1982,7 @@ impl SingleBlockLatentCoordDesignCache {
             .as_ref()
             .is_some_and(|cached| theta_values_match(cached, theta))
             && self.last_outer_iter
-                == Some(crate::solver::estimate::reml::outer_eval::current_outer_iter())
+                == Some(gam_solve::estimate::reml::outer_eval::current_outer_iter())
         {
             self.last_eval.clone()
         } else {
@@ -2001,13 +2001,13 @@ impl SingleBlockLatentCoordDesignCache {
         self.last_cost = Some(eval.0);
         self.last_eval = Some(eval);
         self.last_outer_iter =
-            Some(crate::solver::estimate::reml::outer_eval::current_outer_iter());
+            Some(gam_solve::estimate::reml::outer_eval::current_outer_iter());
     }
 
     fn store_cost(&mut self, cost: f64) {
         self.last_cost = Some(cost);
         self.last_outer_iter =
-            Some(crate::solver::estimate::reml::outer_eval::current_outer_iter());
+            Some(gam_solve::estimate::reml::outer_eval::current_outer_iter());
     }
 
     fn reset(&mut self) {
@@ -2093,7 +2093,7 @@ pub fn fixed_kappa_profiled_reml_score(
     if family == LikelihoodSpec::gaussian_identity() && is_unweighted && is_zero_offset {
         let x_term = select_columns(data, &feature_cols).map_err(EstimationError::from)?;
         let score =
-            crate::basis::constant_curvature_honest_profiled_reml_score(x_term.view(), y, &probe_basis)
+            gam_terms::basis::constant_curvature_honest_profiled_reml_score(x_term.view(), y, &probe_basis)
                 .map_err(|e| {
                     EstimationError::InvalidInput(format!(
                         "fixed-κ honest profiled-REML score at κ={kappa} failed: {e}"
@@ -2155,7 +2155,7 @@ pub fn fixed_kappa_profiled_reml_score(
 /// rails κ̂ to the 0 boundary (the observed hyperbolic κ̂ = 0). The cure is to
 /// stop using the sign-blind criterion to *choose* κ at all for these terms and
 /// instead use the κ-fair criterion
-/// [`crate::basis::constant_curvature_kappa_fair_sign_score`], whose generic
+/// [`gam_terms::basis::constant_curvature_kappa_fair_sign_score`], whose generic
 /// radial-peak-fitting power is subtracted out so only the genuine
 /// curvature-shape signal remains — its argmin is sign-AND-magnitude correct
 /// (spherical κ̂ > 0, hyperbolic κ̂ < 0, materially distinguished).
@@ -2197,7 +2197,7 @@ fn constant_curvature_kappa_fair_argmin(
         let kappa = kappa_min + (kappa_max - kappa_min) * t;
         let mut probe_spec = base_spec.clone();
         probe_spec.kappa = kappa;
-        match crate::basis::constant_curvature_kappa_fair_sign_score(x_term.view(), y, &probe_spec) {
+        match gam_terms::basis::constant_curvature_kappa_fair_sign_score(x_term.view(), y, &probe_spec) {
             Ok(score) => {
                 if best.as_ref().is_none_or(|(b, _)| score < *b) {
                     best = Some((score, kappa));
@@ -2273,7 +2273,7 @@ fn select_constant_curvature_kappa_sign_seed(
     for &kappa in &probes {
         let mut probe_spec = base_spec.clone();
         probe_spec.kappa = kappa;
-        match crate::basis::constant_curvature_kappa_fair_sign_score(
+        match gam_terms::basis::constant_curvature_kappa_fair_sign_score(
             x_term.view(),
             y,
             &probe_spec,
@@ -2450,7 +2450,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // keeps the historical ±12 box byte-for-byte.
     let has_constant_curvature_term = !constant_curvature_term_indices(resolvedspec).is_empty();
     let rho_upper_bound = if has_constant_curvature_term {
-        crate::estimate::RHO_BOUND
+        gam_solve::estimate::RHO_BOUND
     } else {
         JOINT_RHO_BOUND
     };
@@ -3007,10 +3007,10 @@ struct SpatialJointContext<'d> {
     rho_dim: usize,
     kind: SpatialHyperKind,
     cache: SingleBlockExactJointDesignCache<'d>,
-    evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
+    evaluator: gam_solve::estimate::ExternalJointHyperEvaluator<'d>,
     frozen_glm_inputs: Option<SpatialFrozenGlmInputs>,
     frozen_glm_psi_bounds: Option<(f64, f64)>,
-    frozen_glm_tensor: Option<crate::solver::glm_sufficient_lane::FrozenWeightGramTensor>,
+    frozen_glm_tensor: Option<gam_solve::glm_sufficient_lane::FrozenWeightGramTensor>,
     frozen_glm_tensor_attempted: bool,
     /// #1033: memo of the frozen-W trial Fisher weights keyed on the warm β that
     /// produced them. `stage_frozen_glm_trial_statistics` runs on EVERY κ trial
@@ -3270,7 +3270,7 @@ impl<'d> SpatialJointContext<'d> {
     fn eval_full(
         &mut self,
         theta: &Array1<f64>,
-        order: crate::solver::rho_optimizer::OuterEvalOrder,
+        order: gam_solve::rho_optimizer::OuterEvalOrder,
         analytic_outer_hessian_available: bool,
     ) -> Result<
         (
@@ -3280,7 +3280,7 @@ impl<'d> SpatialJointContext<'d> {
         ),
         EstimationError,
     > {
-        use crate::solver::rho_optimizer::OuterEvalOrder;
+        use gam_solve::rho_optimizer::OuterEvalOrder;
         let allow_second_order = matches!(order, OuterEvalOrder::ValueGradientHessian)
             && analytic_outer_hessian_available;
         if let Some(eval) = self.cache.memoized_eval(theta) {
@@ -3744,7 +3744,7 @@ fn run_exact_joint_spatial_optimization(
         baseline_design.smooth.terms.len(),
         spatial_terms.len()
     );
-    use crate::solver::rho_optimizer::OuterEvalOrder;
+    use gam_solve::rho_optimizer::OuterEvalOrder;
     use gam_problem::{DeclaredHessianForm, Derivative, OuterEval};
 
     let theta_dim = theta0.len();
@@ -3811,7 +3811,7 @@ fn run_exact_joint_spatial_optimization(
             dims_per_term.to_vec(),
         )
         .map_err(EstimationError::InvalidInput)?,
-        evaluator: crate::estimate::ExternalJointHyperEvaluator::new(
+        evaluator: gam_solve::estimate::ExternalJointHyperEvaluator::new(
             y,
             weights,
             &baseline_design.design,
@@ -3996,9 +3996,9 @@ fn run_exact_joint_spatial_optimization(
     );
     if outer_fd_audit_eligible {
         // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
-        let audit = (|| -> Result<crate::solver::rho_optimizer::OuterGradientFdAudit, String> {
+        let audit = (|| -> Result<gam_solve::rho_optimizer::OuterGradientFdAudit, String> {
             let mut eval_at = |theta: &Array1<f64>,
-                               mode: crate::solver::estimate::reml::reml_outer_engine::EvalMode|
+                               mode: gam_solve::estimate::reml::reml_outer_engine::EvalMode|
              -> Result<
                 (
                     f64,
@@ -4007,7 +4007,7 @@ fn run_exact_joint_spatial_optimization(
                 ),
                 String,
             > {
-                use crate::solver::estimate::reml::reml_outer_engine::EvalMode;
+                use gam_solve::estimate::reml::reml_outer_engine::EvalMode;
                 let order = if matches!(mode, EvalMode::ValueGradientHessian) {
                     OuterEvalOrder::ValueGradientHessian
                 } else {
@@ -4024,7 +4024,7 @@ fn run_exact_joint_spatial_optimization(
                     format!("psi_kappa[{}]", i - rho_dim_audit)
                 }
             };
-            crate::solver::rho_optimizer::outer_gradient_fd_audit(
+            gam_solve::rho_optimizer::outer_gradient_fd_audit(
                 // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
                 theta0,
                 1e-4,
@@ -4688,7 +4688,7 @@ fn freeze_smooth_basis_from_metadata(
                 radial_reparam,
             },
         ) => {
-            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.center_strategy = gam_terms::basis::CenterStrategy::UserProvided(centers.clone());
             s.length_scale = *length_scale;
             s.identifiability = match identifiability_transform {
                 Some(z) => SpatialIdentifiability::FrozenTransform {
@@ -4732,7 +4732,7 @@ fn freeze_smooth_basis_from_metadata(
                 feature_cols: feature_cols.clone(),
                 spec: DuchonBasisSpec {
                     periodic: meta_periodic.clone(),
-                    center_strategy: crate::basis::CenterStrategy::UserProvided(centers.clone()),
+                    center_strategy: gam_terms::basis::CenterStrategy::UserProvided(centers.clone()),
                     length_scale: *length_scale,
                     power: *power,
                     nullspace_order: *nullspace_order,
@@ -4756,7 +4756,7 @@ fn freeze_smooth_basis_from_metadata(
                 constraint_transform,
             },
         ) => {
-            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.center_strategy = gam_terms::basis::CenterStrategy::UserProvided(centers.clone());
             s.penalty_order = *penalty_order;
             s.method = *method;
             s.max_degree = *max_degree;
@@ -4782,7 +4782,7 @@ fn freeze_smooth_basis_from_metadata(
                 constraint_transform,
             },
         ) => {
-            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.center_strategy = gam_terms::basis::CenterStrategy::UserProvided(centers.clone());
             s.kappa = *kappa;
             // Pin the REALIZED kernel range so a `0.0` auto-sentinel spec
             // replays the exact fit-time geometry at predict time (and at the
@@ -4820,7 +4820,7 @@ fn freeze_smooth_basis_from_metadata(
                 constraint_transform,
             },
         ) => {
-            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.center_strategy = gam_terms::basis::CenterStrategy::UserProvided(centers.clone());
             // Pin the realized geometry so auto sentinels cannot re-derive it
             // from predict rows. Field semantics are owned elsewhere:
             // length_scale replays VERBATIM (build dispatch round-trip
@@ -4868,7 +4868,7 @@ fn freeze_smooth_basis_from_metadata(
                 nullspace_shrinkage_survived: meta_nullspace_survived,
             },
         ) => {
-            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.center_strategy = gam_terms::basis::CenterStrategy::UserProvided(centers.clone());
             s.length_scale = *length_scale;
             s.nu = *nu;
             s.include_intercept = *include_intercept;
@@ -4910,7 +4910,7 @@ fn freeze_smooth_basis_from_metadata(
                 ..
             },
         ) => {
-            s.center_strategy = crate::basis::CenterStrategy::UserProvided(centers.clone());
+            s.center_strategy = gam_terms::basis::CenterStrategy::UserProvided(centers.clone());
             s.length_scale = *length_scale;
             s.power = *power;
             s.nullspace_order = *nullspace_order;
@@ -5281,7 +5281,7 @@ fn wrap_local_build_as_realization(
     // Stage-2 joint-null absorption rotation, same logic as the main
     // aggregation loop in `build_smooth_design_withworkspace_unvalidated`:
     // apply Q when Some AND the smooth has no shape constraints.
-    let applied_rotation: Option<crate::basis::JointNullRotation> = match (
+    let applied_rotation: Option<gam_terms::basis::JointNullRotation> = match (
         local.joint_null_rotation.take(),
         lb_local.is_some(),
         local.linear_constraints.is_some(),
@@ -5680,7 +5680,7 @@ struct FrozenTermCollectionIncrementalRealizer<'d> {
     /// Persistent workspace for basis cache reuse across κ proposals.
     /// Distance matrices are cached here so they're computed once and
     /// reused across repeated `apply_log_kappa_to_term` calls.
-    basisworkspace: crate::basis::BasisWorkspace,
+    basisworkspace: gam_terms::basis::BasisWorkspace,
     /// Per-term cached realization geometry for incremental κ updates.
     ///
     /// On the first κ-driven rebuild of term `i`, this slot is populated with a
@@ -5798,7 +5798,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             dropped_penaltyinfo_by_term,
             smooth_penalty_ranges,
             full_penalty_ranges,
-            basisworkspace: crate::basis::BasisWorkspace::new(),
+            basisworkspace: gam_terms::basis::BasisWorkspace::new(),
             spatial_realization_geometry: vec![None; geometry_slots],
             design_revision: 0,
         })
@@ -5876,7 +5876,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         &mut self,
         spatial_terms: &[usize],
         psi: &[f64],
-    ) -> Result<(Vec<crate::construction::CanonicalPenalty>, Vec<usize>), String> {
+    ) -> Result<(Vec<gam_terms::construction::CanonicalPenalty>, Vec<usize>), String> {
         if spatial_terms.len() != 1 {
             return Err(format!(
                 "n-free penalty re-key requires exactly one spatial term, found {}",
@@ -5919,7 +5919,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
             } => {
                 let operator_penalties = match &termspec.basis {
                     SmoothBasisSpec::Duchon { spec, .. } => spec.operator_penalties.clone(),
-                    _ => crate::basis::DuchonOperatorPenaltySpec::default(),
+                    _ => gam_terms::basis::DuchonOperatorPenaltySpec::default(),
                 };
                 // Slow-path Duchon realization stores centers/collocation points
                 // in standardized coordinates and compensates the user-facing
@@ -5933,7 +5933,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     }
                     None => ls_opt,
                 };
-                crate::basis::duchon_penalties_at_length_scale(
+                gam_terms::basis::duchon_penalties_at_length_scale(
                     centers.view(),
                     identifiability_transform.as_ref(),
                     operator_collocation_points.as_ref().map(|p| p.view()),
@@ -6007,7 +6007,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     SmoothBasisSpec::ThinPlate { spec, .. } => spec.double_penalty,
                     _ => false,
                 };
-                crate::basis::thin_plate_penalties_at_length_scale(
+                gam_terms::basis::thin_plate_penalties_at_length_scale(
                     centers.view(),
                     identifiability_transform.as_ref(),
                     radial_reparam.as_ref(),
@@ -6037,10 +6037,10 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 templates.len()
             ));
         }
-        let specs: Vec<crate::estimate::PenaltySpec> = templates
+        let specs: Vec<gam_solve::estimate::PenaltySpec> = templates
             .iter()
             .zip(locals.into_iter())
-            .map(|(tmpl, local)| crate::estimate::PenaltySpec::Block {
+            .map(|(tmpl, local)| gam_solve::estimate::PenaltySpec::Block {
                 local,
                 col_range: tmpl.col_range.clone(),
                 prior_mean: tmpl.prior_mean.clone(),
@@ -6048,7 +6048,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                 op: tmpl.op.clone(),
             })
             .collect();
-        crate::construction::canonicalize_penalty_specs(
+        gam_terms::construction::canonicalize_penalty_specs(
             &specs,
             &nullspace_dims,
             p_total,
@@ -6129,7 +6129,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     .map(|points| points.view())
                     .unwrap_or_else(|| centers.view());
                 let (_native_sources, mut first, _native_second) =
-                    crate::basis::build_duchon_native_penalty_psi_derivatives(
+                    gam_terms::basis::build_duchon_native_penalty_psi_derivatives(
                         centers.view(),
                         &spec,
                         identifiability_transform.as_ref(),
@@ -6137,7 +6137,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     )
                     .map_err(|e| e.to_string())?;
                 let (_operator_sources, operator_first, _operator_second) =
-                    crate::basis::build_duchon_operator_penalty_psi_derivatives(
+                    gam_terms::basis::build_duchon_operator_penalty_psi_derivatives(
                         collocation,
                         centers.view(),
                         &spec,
@@ -6166,10 +6166,10 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     None => ls,
                 };
                 let penalty_centers =
-                    crate::basis::expand_periodic_centers(&centers.to_owned(), periodic.as_deref())
+                    gam_terms::basis::expand_periodic_centers(&centers.to_owned(), periodic.as_deref())
                         .map_err(|e| e.to_string())?;
                 let aniso_for_penalty = aniso_from_psi.as_deref().or(aniso_log_scales.as_deref());
-                let (first, _second) = crate::basis::build_matern_operator_penalty_psi_derivatives(
+                let (first, _second) = gam_terms::basis::build_matern_operator_penalty_psi_derivatives(
                     penalty_centers.view(),
                     effective_ls,
                     *nu,
@@ -6204,7 +6204,7 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                     spec.radial_reparam = radial_reparam.clone();
                 }
                 let (primary, _primary_second) =
-                    crate::basis::build_thin_plate_penalty_psi_derivativeswithworkspace(
+                    gam_terms::basis::build_thin_plate_penalty_psi_derivativeswithworkspace(
                         centers.view(),
                         &spec,
                         identifiability_transform.as_ref(),
@@ -7075,7 +7075,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     // ±12 box and seed grid byte-for-byte for every other spatial/Matérn/Duchon/
     // sphere/survival joint fit.
     has_constant_curvature: bool,
-) -> crate::solver::rho_optimizer::OuterProblem {
+) -> gam_solve::rho_optimizer::OuterProblem {
     let mut seed_heuristic = theta0.to_vec();
     for value in &mut seed_heuristic[..rho_dim] {
         *value = value.exp();
@@ -7085,11 +7085,11 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     // reference and the seed-grid clamp; the actual box is the per-dim
     // `lower`/`upper` arrays passed in.
     let rho_ceiling = if has_constant_curvature {
-        crate::estimate::RHO_BOUND
+        gam_solve::estimate::RHO_BOUND
     } else {
         12.0
     };
-    let mut problem = crate::solver::rho_optimizer::OuterProblem::new(n_params)
+    let mut problem = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_gradient(gradient)
         .with_hessian(hessian)
         .with_prefer_gradient_only(prefer_gradient_only)
@@ -7103,7 +7103,7 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         // stationarity cannot be enforced, so the ladder routes correctly
         // to a joint gradient-based solver instead of grinding HybridEFS
         // for thousands of iterations.
-        .with_fallback_policy(crate::solver::rho_optimizer::FallbackPolicy::Automatic)
+        .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Automatic)
         .with_psi_dim(auxiliary_dim)
         .with_tolerance(tolerance)
         .with_max_iter(max_iter)
@@ -7190,7 +7190,7 @@ pub fn optimize_spatial_length_scale_exact_joint<FitOut, FitFn, ExactFn, ExactEf
     analytic_joint_hessian_available: bool,
     disable_fixed_point: bool,
     screening_cap: Option<Arc<AtomicUsize>>,
-    outer_derivative_policy: crate::families::custom_family::OuterDerivativePolicy,
+    outer_derivative_policy: gam_model_api::families::custom_family::OuterDerivativePolicy,
     mut fit_fn: FitFn,
     mut exact_fn: ExactFn,
     mut exact_efs_fn: ExactEfsFn,
@@ -7207,8 +7207,8 @@ where
         &Array1<f64>,
         &[TermCollectionSpec],
         &[TermCollectionDesign],
-        crate::solver::estimate::reml::reml_outer_engine::EvalMode,
-        &crate::outer_subsample::RowSet,
+        gam_solve::estimate::reml::reml_outer_engine::EvalMode,
+        &gam_problem::outer_subsample::RowSet,
     ) -> Result<
         (
             f64,
@@ -7223,7 +7223,7 @@ where
         &[TermCollectionDesign],
     ) -> Result<gam_problem::EfsEval, String>,
     SeedFn:
-        FnMut(&Array1<f64>) -> Result<crate::solver::rho_optimizer::SeedOutcome, EstimationError>,
+        FnMut(&Array1<f64>) -> Result<gam_solve::rho_optimizer::SeedOutcome, EstimationError>,
 {
     let n_blocks = block_specs.len();
     if block_term_indices.len() != n_blocks {
@@ -7399,8 +7399,8 @@ where
         n_total: usize,
         k_target: usize,
         seed: u64,
-    ) -> crate::outer_subsample::OuterScoreSubsample {
-        use crate::outer_subsample::OuterScoreSubsample;
+    ) -> gam_problem::outer_subsample::OuterScoreSubsample {
+        use gam_problem::outer_subsample::OuterScoreSubsample;
         let k = k_target.min(n_total);
         if k == 0 || n_total == 0 {
             return OuterScoreSubsample::from_uniform_inclusion_mask(Vec::new(), n_total, seed);
@@ -7427,14 +7427,14 @@ where
         OuterScoreSubsample::from_uniform_inclusion_mask(mask, n_total, seed)
     }
 
-    let current_row_set: std::cell::RefCell<crate::outer_subsample::RowSet> = if use_staged_kappa {
+    let current_row_set: std::cell::RefCell<gam_problem::outer_subsample::RowSet> = if use_staged_kappa {
         let pilot = build_uniform_pilot_subsample(n_total, KAPPA_PILOT_K, n_total as u64);
-        std::cell::RefCell::new(crate::outer_subsample::RowSet::Subsample {
+        std::cell::RefCell::new(gam_problem::outer_subsample::RowSet::Subsample {
             rows: std::sync::Arc::clone(&pilot.rows),
             n_full: n_total,
         })
     } else {
-        std::cell::RefCell::new(crate::outer_subsample::RowSet::All)
+        std::cell::RefCell::new(gam_problem::outer_subsample::RowSet::All)
     };
 
     let exact_fn_cell = std::cell::RefCell::new(&mut exact_fn);
@@ -7474,7 +7474,7 @@ where
         (theta_norm, log_kappa_norm)
     };
 
-    use crate::solver::rho_optimizer::OuterEvalOrder;
+    use gam_solve::rho_optimizer::OuterEvalOrder;
     use gam_problem::{DeclaredHessianForm, Derivative, OuterEval};
 
     // Joint design width across blocks → the `p` reported to the outer solver's
@@ -7585,7 +7585,7 @@ where
             // reject. The line search then backtracks to its accepted iterate in
             // O(1) per probe and the driver returns the best-so-far fit. The
             // guard is a no-op when no deadline is armed.
-            if crate::solver::rho_optimizer::outer_wall_clock_deadline_exceeded() {
+            if gam_solve::rho_optimizer::outer_wall_clock_deadline_exceeded() {
                 return Ok(OuterEval::infeasible(theta.len()));
             }
             if let Err(err) = ctx.cache.ensure_theta(theta) {
@@ -7608,9 +7608,9 @@ where
             let need_hessian = matches!(clamped, OuterEvalOrder::ValueGradientHessian)
                 && analytic_outer_hessian_available;
             let eval_mode = if need_hessian {
-                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
+                gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
             } else {
-                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient
+                gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient
             };
             let t0 = std::time::Instant::now();
             let result = {
@@ -7680,7 +7680,7 @@ where
                 // treats as a rejected step, so the search collapses to its best
                 // accepted iterate in bounded time instead of paying a full
                 // cycle-0 inner setup per probe. No-op when no deadline is armed.
-                if crate::solver::rho_optimizer::outer_wall_clock_deadline_exceeded() {
+                if gam_solve::rho_optimizer::outer_wall_clock_deadline_exceeded() {
                     return Ok(f64::INFINITY);
                 }
                 if let Err(err) = ctx.cache.ensure_theta(theta) {
@@ -7705,7 +7705,7 @@ where
                         theta,
                         &specs,
                         &designs,
-                        crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
+                        gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
                         &row_set_borrow,
                     )
                 };
@@ -7911,7 +7911,7 @@ where
             KAPPA_POLISH_K,
             (n_total as u64).wrapping_add(0xA5A5A5A5),
         );
-        *current_row_set.borrow_mut() = crate::outer_subsample::RowSet::Subsample {
+        *current_row_set.borrow_mut() = gam_problem::outer_subsample::RowSet::Subsample {
             rows: std::sync::Arc::clone(&polish.rows),
             n_full: n_total,
         };
@@ -7931,7 +7931,7 @@ where
                 &theta_star,
                 &specs,
                 &designs,
-                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient,
+                gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient,
                 &row_set_borrow,
             )?
         };
@@ -7942,7 +7942,7 @@ where
             );
         }
     }
-    *current_row_set.borrow_mut() = crate::outer_subsample::RowSet::All;
+    *current_row_set.borrow_mut() = gam_problem::outer_subsample::RowSet::All;
     if use_staged_kappa {
         log::info!(
             "[KAPPA-STAGED] rotating to full data for final coefficient fit (n={})",
@@ -7980,7 +7980,7 @@ fn try_exact_joint_latent_coord_optimization(
     options: &FitOptions,
     latent: &StandardLatentCoordConfig,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
-    use crate::solver::rho_optimizer::OuterEvalOrder;
+    use gam_solve::rho_optimizer::OuterEvalOrder;
     use gam_problem::{DeclaredHessianForm, Derivative, OuterEval};
 
     let rho_dim = best.fit.lambdas.len();
@@ -8028,7 +8028,7 @@ fn try_exact_joint_latent_coord_optimization(
     struct LatentJointContext<'d> {
         rho_dim: usize,
         cache: SingleBlockLatentCoordDesignCache,
-        evaluator: crate::estimate::ExternalJointHyperEvaluator<'d>,
+        evaluator: gam_solve::estimate::ExternalJointHyperEvaluator<'d>,
     }
 
     impl<'d> LatentJointContext<'d> {
@@ -8072,7 +8072,7 @@ fn try_exact_joint_latent_coord_optimization(
             if let Some(registry) = registry_for_key {
                 let mut registry = registry.as_ref().clone();
                 registry.apply_weight_schedules(
-                    crate::solver::estimate::reml::outer_eval::current_outer_iter() as usize,
+                    gam_solve::estimate::reml::outer_eval::current_outer_iter() as usize,
                 );
                 add_analytic_penalty_objective_to_eval(
                     theta,
@@ -8119,7 +8119,7 @@ fn try_exact_joint_latent_coord_optimization(
             if let Some(registry) = registry_for_key {
                 let mut registry = registry.as_ref().clone();
                 registry.apply_weight_schedules(
-                    crate::solver::estimate::reml::outer_eval::current_outer_iter() as usize,
+                    gam_solve::estimate::reml::outer_eval::current_outer_iter() as usize,
                 );
                 let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
                 let contribution = analytic_penalty_objective_contribution(
@@ -8191,7 +8191,7 @@ fn try_exact_joint_latent_coord_optimization(
                     let cost = if let Some(registry) = registry_for_key {
                         let mut registry = registry.as_ref().clone();
                         registry.apply_weight_schedules(
-                            crate::solver::estimate::reml::outer_eval::current_outer_iter()
+                            gam_solve::estimate::reml::outer_eval::current_outer_iter()
                                 as usize,
                         );
                         match analytic_penalty_objective_contribution(
@@ -8224,7 +8224,7 @@ fn try_exact_joint_latent_coord_optimization(
             rho_dim,
         )
         .map_err(EstimationError::InvalidInput)?,
-        evaluator: crate::estimate::ExternalJointHyperEvaluator::new(
+        evaluator: gam_solve::estimate::ExternalJointHyperEvaluator::new(
             y,
             weights,
             &best.design.design,
@@ -8686,7 +8686,7 @@ pub fn curvature_inference_forspec(
     // flat κ̂ ≈ 0) the raw production V_p is the right, scale-correct criterion and
     // already sizes flatness correctly, so we keep it — this preserves the
     // spherical and flat statistics unchanged.
-    let cc_fair_inputs: Option<(Array2<f64>, crate::basis::ConstantCurvatureBasisSpec)> =
+    let cc_fair_inputs: Option<(Array2<f64>, gam_terms::basis::ConstantCurvatureBasisSpec)> =
         if kappa_hat < 0.0 {
             match resolvedspec.smooth_terms.get(term_idx).map(|t| &t.basis) {
                 Some(SmoothBasisSpec::ConstantCurvature {
@@ -8717,7 +8717,7 @@ pub fn curvature_inference_forspec(
         let score = if let Some((x_term, base_spec)) = &cc_fair_inputs {
             let mut probe_spec = base_spec.clone();
             probe_spec.kappa = kappa;
-            crate::basis::constant_curvature_kappa_fair_sign_score(x_term.view(), y, &probe_spec)
+            gam_terms::basis::constant_curvature_kappa_fair_sign_score(x_term.view(), y, &probe_spec)
                 .map_err(|e| format!("κ-fair criterion at κ={kappa} failed: {e}"))?
         } else {
             fixed_kappa_profiled_reml_score(
@@ -8851,7 +8851,7 @@ fn fitted_rho_penalty_components(
     penalties: &[BlockwisePenalty],
     lambdas: &[f64],
     p_total: usize,
-) -> Result<Vec<crate::inference::lawley::RhoPenaltyComponent>, EstimationError> {
+) -> Result<Vec<gam_terms::inference::lawley::RhoPenaltyComponent>, EstimationError> {
     if penalties.len() != lambdas.len() {
         return Err(EstimationError::InvalidInput(format!(
             "smooth_term_lr_inference: penalty/lambda count mismatch ({} penalties, {} lambdas)",
@@ -8877,7 +8877,7 @@ fn fitted_rho_penalty_components(
         s_component
             .slice_mut(s![r.start..r.end, r.start..r.end])
             .scaled_add(lambda, &penalty.local);
-        components.push(crate::inference::lawley::RhoPenaltyComponent { s_component });
+        components.push(gam_terms::inference::lawley::RhoPenaltyComponent { s_component });
     }
     Ok(components)
 }
@@ -8914,7 +8914,7 @@ fn fitted_rho_penalty_components(
 /// 4. When the family has closed-form cumulant jets, evaluate Lawley's ε at the
 ///    **null** linear predictor (an expectation evaluated at the null fit), fold
 ///    the full λ-scaled penalty `S_λ` into the information, and Bartlett-correct
-///    `W` with [`crate::inference::lawley::lawley_lr_bartlett_factor`]. The
+///    `W` with [`gam_terms::inference::lawley::lawley_lr_bartlett_factor`]. The
 ///    null annihilates the tested block's penalty (`S_λ β₀ = 0` on that block),
 ///    so the penalized Lawley expansion applies verbatim.
 /// 5. Otherwise (no closed-form jets, or a null refit that did not converge) the
@@ -8931,7 +8931,7 @@ pub fn smooth_term_lr_inference_forspec(
     family: LikelihoodSpec,
     options: &FitOptions,
 ) -> Result<Vec<SmoothTermLrInference>, EstimationError> {
-    use crate::inference::lawley::{
+    use gam_terms::inference::lawley::{
         LAWLEY_PAIR_MATRIX_MAX_ROWS, known_scale_expected_jets_with_dispersion,
         lawley_lr_bartlett_factor, lawley_lr_mean_shift_with_rho_variation,
     };
@@ -9088,7 +9088,7 @@ pub fn smooth_term_lr_inference_forspec(
                     {
                         let mean_w = ref_df + total_shift;
                         if let Some(c_est) =
-                            crate::inference::higher_order::bartlett_factor_from_mean(
+                            gam_terms::inference::higher_order::bartlett_factor_from_mean(
                                 mean_w, ref_df,
                             )
                             && c_est.is_finite()

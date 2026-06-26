@@ -92,7 +92,7 @@ fn apply_paren_link(
     name: &str,
 ) -> Result<(LikelihoodSpec, bool), String> {
     let (base_spec, base_pinned) = base;
-    let link = crate::inference::formula_dsl::parse_linkname(link_str).map_err(|_| {
+    let link = gam_terms::inference::formula_dsl::parse_linkname(link_str).map_err(|_| {
         let reason: String = WorkflowError::InvalidConfig {
             reason: format!(
                 "family '{name}' names an unknown link '{link_str}'; \
@@ -379,10 +379,10 @@ pub fn resolve_family(
                     // `InverseLink`) that this entry point produces.
                     //
                     // The principled coefficient-space solver lives in
-                    // `crate::families::multinomial::fit_penalized_multinomial`,
+                    // `crate::multinomial::fit_penalized_multinomial`,
                     // which routes the canonical
                     // `MultinomialLogitLikelihood: VectorLikelihood` through
-                    // `crate::pirls::dense_block_xtwx` in output-major
+                    // `gam_solve::pirls::dense_block_xtwx` in output-major
                     // coefficient ordering. The forthcoming
                     // `gamfit.fit_multinomial(...)` Python entry exposes that
                     // path with formula → design wiring; until that wrapper
@@ -392,7 +392,7 @@ pub fn resolve_family(
                         reason: format!(
                             "family '{name}' is a vector-response family; use \
                              the dedicated multinomial entry point \
-                             (`crate::families::multinomial::fit_penalized_multinomial` \
+                             (`crate::multinomial::fit_penalized_multinomial` \
                              in Rust, or `gamfit.fit_multinomial(...)` in Python) \
                              rather than the scalar `fit(family=...)` path"
                         ),
@@ -507,7 +507,7 @@ pub fn resolve_family(
             // NB theta, Tweedie p, Beta phi).
             if matches!(
                 choice.mode,
-                crate::inference::formula_dsl::LinkMode::Flexible
+                gam_terms::inference::formula_dsl::LinkMode::Flexible
             ) && !matches!(explicit_spec.response, ResponseFamily::Binomial)
             {
                 return Err(WorkflowError::InvalidConfig {

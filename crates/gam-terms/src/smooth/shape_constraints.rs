@@ -29,7 +29,7 @@ pub(super) fn shape_order_and_sign(shape: ShapeConstraint) -> Option<(usize, f64
     }
 }
 
-pub(super) fn shape_lower_bounds_local(shape: ShapeConstraint, dim: usize) -> Option<Array1<f64>> {
+pub fn shape_lower_bounds_local(shape: ShapeConstraint, dim: usize) -> Option<Array1<f64>> {
     let (order, _) = shape_order_and_sign(shape)?;
     let mut lb = Array1::<f64>::from_elem(dim, f64::NEG_INFINITY);
     for j in order..dim {
@@ -350,13 +350,13 @@ pub(super) fn build_shape_linear_constraints_1d(
     Ok(Some(LinearInequalityConstraints { a, b }))
 }
 
-pub(super) fn linear_constraints_from_lower_bounds_global(
+pub fn linear_constraints_from_lower_bounds_global(
     lower_bounds: &Array1<f64>,
 ) -> Option<LinearInequalityConstraints> {
     LinearInequalityConstraints::from_per_coordinate_lower_bounds(lower_bounds)
 }
 
-pub(super) fn merge_linear_constraints_global(
+pub fn merge_linear_constraints_global(
     first: Option<LinearInequalityConstraints>,
     second: Option<LinearInequalityConstraints>,
 ) -> Option<LinearInequalityConstraints> {

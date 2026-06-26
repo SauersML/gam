@@ -23,7 +23,7 @@ pub struct StandardFitOptionsInputs {
     pub optimize_mixture: bool,
     pub sas_link: Option<SasLinkSpec>,
     pub optimize_sas: bool,
-    pub linear_constraints: Option<crate::pirls::LinearInequalityConstraints>,
+    pub linear_constraints: Option<gam_solve::pirls::LinearInequalityConstraints>,
     pub firth_bias_reduction: bool,
     pub adaptive_regularization: Option<AdaptiveRegularizationOptions>,
     /// `Some` only when a caller (the forced-Firth CLI branch) overrides the
@@ -286,8 +286,8 @@ fn constant_gaussian_standard_fit(
     let lambdas = Array1::<f64>::ones(design.penalties.len());
     let log_lambdas = Array1::<f64>::zeros(design.penalties.len());
     let fit =
-        crate::estimate::UnifiedFitResult::try_from_parts(crate::estimate::UnifiedFitResultParts {
-            blocks: vec![crate::estimate::FittedBlock {
+        gam_solve::estimate::UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {
+            blocks: vec![gam_solve::estimate::FittedBlock {
                 beta: beta.clone(),
                 role: gam_problem::BlockRole::Mean,
                 edf: design.intercept_range.len() as f64,
@@ -311,13 +311,13 @@ fn constant_gaussian_standard_fit(
             covariance_conditional: None,
             covariance_corrected: None,
             inference: None,
-            fitted_link: crate::estimate::FittedLinkState::Standard(None),
+            fitted_link: gam_solve::estimate::FittedLinkState::Standard(None),
             geometry: None,
             block_states: Vec::new(),
-            pirls_status: crate::pirls::PirlsStatus::Converged,
+            pirls_status: gam_solve::pirls::PirlsStatus::Converged,
             max_abs_eta: intercept.abs(),
             constraint_kkt: None,
-            artifacts: crate::estimate::FitArtifacts {
+            artifacts: gam_solve::estimate::FitArtifacts {
                 pirls: None,
                 ..Default::default()
             },
@@ -338,7 +338,7 @@ fn constant_gaussian_standard_fit(
         resolvedspec,
         adaptive_diagnostics: None,
         kappa_timing: None,
-        saved_link_state: crate::estimate::FittedLinkState::Standard(None),
+        saved_link_state: gam_solve::estimate::FittedLinkState::Standard(None),
         wiggle_knots: None,
         wiggle_degree: None,
     })
@@ -394,7 +394,7 @@ pub fn fit_from_formula(
             return constant_gaussian_standard_fit(request).map(FitResult::Standard);
         }
         if let Some(inputs) = spline_scan_fast_path(request) {
-            let scan = crate::spline_scan::fit_spline_scan(
+            let scan = gam_solve::spline_scan::fit_spline_scan(
                 &inputs.x,
                 &inputs.y,
                 &inputs.w,
@@ -415,7 +415,7 @@ pub fn fit_from_formula(
         // payload from this `ResidualCascadeFit`'s `to_state` snapshot.
         if let Some(inputs) = residual_cascade_fast_path(request) {
             let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
-            if let Ok(fit) = crate::residual_cascade::fit_residual_cascade(
+            if let Ok(fit) = gam_solve::residual_cascade::fit_residual_cascade(
                 &coord_refs,
                 &inputs.y,
                 &inputs.w,
@@ -746,9 +746,9 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
 /// Materializes the formula exactly like [`fit_from_formula`], then runs the
 /// [`spline_scan_fast_path`] detection on the resulting standard request.
 /// When detection fires the fit is routed through
-/// [`crate::spline_scan::fit_spline_scan`] — the exact diffuse
+/// [`gam_solve::spline_scan::fit_spline_scan`] — the exact diffuse
 /// REML Kalman/RTS scan — and the full in-memory posterior
-/// ([`crate::spline_scan::SplineScanFit`]: knots, smoothed
+/// ([`gam_solve::spline_scan::SplineScanFit`]: knots, smoothed
 /// states, pointwise variances, lag-one gains, σ², log λ, exact EDF, and an
 /// exact `predict`) is returned. `Ok(None)` means the model is not the
 /// scan-eligible shape and the caller should use the dense
@@ -759,7 +759,7 @@ pub fn fit_spline_scan_from_formula(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
-) -> Result<Option<crate::spline_scan::SplineScanFit>, WorkflowError> {
+) -> Result<Option<gam_solve::spline_scan::SplineScanFit>, WorkflowError> {
     let mat = materialize(formula, data, config)?;
     let FitRequest::Standard(request) = mat.request else {
         return Ok(None);
@@ -767,7 +767,7 @@ pub fn fit_spline_scan_from_formula(
     let Some(inputs) = spline_scan_fast_path(&request) else {
         return Ok(None);
     };
-    crate::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
+    gam_solve::spline_scan::fit_spline_scan(&inputs.x, &inputs.y, &inputs.w, inputs.order)
         .map(Some)
         .map_err(|reason| WorkflowError::IntegrationFailed { reason })
 }
@@ -799,7 +799,7 @@ pub fn constant_curvature_profiled_reml_scores(
                 .to_string(),
         });
     };
-    let term_idx = *gam_terms::smooth::constant_curvature_term_indices(&request.spec)
+    let term_idx = *crate::fit_orchestration::drivers::constant_curvature_term_indices(&request.spec)
         .first()
         .ok_or_else(|| WorkflowError::IntegrationFailed {
             reason: "constant_curvature_profiled_reml_scores: formula has no constant-curvature \
@@ -808,7 +808,7 @@ pub fn constant_curvature_profiled_reml_scores(
         })?;
     let mut out = Vec::with_capacity(kappas.len());
     for &kappa in kappas {
-        let score = gam_terms::smooth::fixed_kappa_profiled_reml_score(
+        let score = crate::fit_orchestration::drivers::fixed_kappa_profiled_reml_score(
             request.data.view(),
             request.y.view(),
             request.weights.view(),
@@ -880,7 +880,7 @@ fn cascade_sobolev_order(requested: f64, d: usize) -> f64 {
 ///
 /// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric (the
 /// spec's isotropic radial distance); the quasi-uniformity guard inside
-/// [`crate::residual_cascade::fit_residual_cascade`] (issue caveat 2)
+/// [`gam_solve::residual_cascade::fit_residual_cascade`] (issue caveat 2)
 /// is the no-regression gate that refuses the iterative solve — and forces the
 /// caller back to the dense path — when a near-degenerate metric would break
 /// the BPX iteration bound.
@@ -998,7 +998,7 @@ pub fn residual_cascade_fast_path(
 /// Materializes the formula exactly like [`fit_from_formula`], runs the
 /// [`residual_cascade_fast_path`] detection, and — when it fires AND the
 /// quasi-uniformity guard inside the cascade certifies the metric — returns the
-/// certified [`ResidualCascadeFit`](crate::residual_cascade::ResidualCascadeFit).
+/// certified [`ResidualCascadeFit`](gam_solve::residual_cascade::ResidualCascadeFit).
 /// `Ok(None)` means EITHER the model is not the cascade-eligible shape OR the
 /// quasi-uniformity guard rejected the metric; in both cases the caller falls
 /// back to the dense [`fit_from_formula`] path (the cascade is a different
@@ -1009,7 +1009,7 @@ pub fn fit_residual_cascade_from_formula(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
-) -> Result<Option<crate::residual_cascade::ResidualCascadeFit>, WorkflowError> {
+) -> Result<Option<gam_solve::residual_cascade::ResidualCascadeFit>, WorkflowError> {
     let mat = materialize(formula, data, config)?;
     let FitRequest::Standard(request) = mat.request else {
         return Ok(None);
@@ -1018,7 +1018,7 @@ pub fn fit_residual_cascade_from_formula(
         return Ok(None);
     };
     let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
-    match crate::residual_cascade::fit_residual_cascade(
+    match gam_solve::residual_cascade::fit_residual_cascade(
         &coord_refs,
         &inputs.y,
         &inputs.w,

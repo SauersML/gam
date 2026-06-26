@@ -136,7 +136,7 @@ pub(super) fn validate_penalized_complexity_prior(
     Ok::<(), _>(())
 }
 
-pub(super) fn realize_penalty_block_gamma_priors<F>(
+pub fn realize_penalty_block_gamma_priors<F>(
     design: &TermCollectionDesign,
     mut callback: F,
 ) -> Result<gam_spec::RhoPrior, BasisError>
@@ -156,7 +156,7 @@ where
     Ok(gam_spec::RhoPrior::Independent(priors))
 }
 
-pub(super) fn realize_keyed_penalty_block_gamma_priors(
+pub fn realize_keyed_penalty_block_gamma_priors(
     design: &TermCollectionDesign,
     priors: &[(String, f64, f64)],
 ) -> Result<gam_spec::RhoPrior, BasisError> {
@@ -412,7 +412,7 @@ fn resolve_group_columns(
     Ok(cols)
 }
 
-pub(super) fn realize_coefficient_groups(
+pub fn realize_coefficient_groups(
     design: &TermCollectionDesign,
     groups: &[CoefficientGroupSpec],
     base_prior: &gam_spec::RhoPrior,

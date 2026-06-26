@@ -1,5 +1,5 @@
 use super::*;
-use crate::inference::formula_dsl::LinkMode;
+use gam_terms::inference::formula_dsl::LinkMode;
 
 pub(crate) fn reject_marginal_slope_controls_for_transformation_normal(
     config: &FitConfig,
@@ -106,7 +106,7 @@ pub(super) fn effective_link_choice_for_materialize(
 /// resolved response family is not binomial.
 ///
 /// `flexible(base)` adds a jointly-fit anchored spline offset to the base link.
-/// The whole offset engine ([`crate::families::gamlss::gaussian::BinomialMeanWiggleFamily`]
+/// The whole offset engine ([`crate::gamlss::gaussian::BinomialMeanWiggleFamily`]
 /// and the location-scale wiggle solver) is specialised to the binomial mean
 /// likelihood: it differentiates the binomial neg-log-likelihood through the
 /// warped link to fourth order under a monotone-spline constraint. For a

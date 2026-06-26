@@ -13,7 +13,7 @@ pub(crate) fn survival_inverse_link_has_free_parameters(link: &InverseLink) -> b
 /// survival location-scale inverse-link profiling path to turn the optimized
 /// `rho` into the concrete `InverseLink` before the final fixed-link refit.
 pub(crate) fn recover_converged_survival_inverse_link<R>(
-    result: crate::rho_optimizer::OuterResult,
+    result: gam_solve::rho_optimizer::OuterResult,
     context: &str,
     recover: R,
 ) -> Result<InverseLink, String>
@@ -185,9 +185,9 @@ pub(crate) fn fit_standard_model(
         )
         .map_err(|e| e.to_string())?;
         let resolvedspec =
-            gam_terms::smooth::freeze_term_collection_from_design(&request.spec, &fitted.design)
+            crate::fit_orchestration::drivers::freeze_term_collection_from_design(&request.spec, &fitted.design)
                 .map_err(|e| e.to_string())?;
-        gam_terms::smooth::FittedTermCollectionWithSpec {
+        crate::fit_orchestration::drivers::FittedTermCollectionWithSpec {
             fit: fitted.fit,
             design: fitted.design,
             resolvedspec,
@@ -875,7 +875,7 @@ pub(crate) fn fit_binomial_location_scale_model(
     fit_location_scale_with_optional_wiggle::<BinomialLocationScaleWorkflow>(request)
 }
 
-fn survival_working_reml_score(state: &crate::pirls::WorkingState) -> f64 {
+fn survival_working_reml_score(state: &gam_solve::pirls::WorkingState) -> f64 {
     0.5 * (state.deviance + state.penalty_term)
 }
 
@@ -896,7 +896,7 @@ fn survival_working_reml_score(state: &crate::pirls::WorkingState) -> f64 {
 fn fitted_weibull_baseline_from_linear_time_beta(
     beta: &Array1<f64>,
     anchor: f64,
-) -> Option<crate::families::survival::construction::SurvivalBaselineConfig> {
+) -> Option<crate::survival::construction::SurvivalBaselineConfig> {
     if beta.len() < 2 {
         return None;
     }
@@ -909,7 +909,7 @@ fn fitted_weibull_baseline_from_linear_time_beta(
     }
     let scale = anchor;
     Some(
-        crate::families::survival::construction::SurvivalBaselineConfig {
+        crate::survival::construction::SurvivalBaselineConfig {
             target: SurvivalBaselineTarget::Weibull,
             scale: Some(scale),
             shape: Some(shape),
@@ -933,7 +933,7 @@ fn fitted_weibull_baseline_from_linear_time_beta(
 /// path runs its own `runworking_model_pirls` optimizer and therefore never
 /// reached that block, leaving edf uncomputed (issue #565).
 fn survival_transformation_edf(
-    state: &crate::pirls::WorkingState,
+    state: &gam_solve::pirls::WorkingState,
     penalty_blocks: &[PenaltyBlock],
 ) -> Result<(f64, Vec<f64>, Vec<f64>, Array2<f64>), String> {
     let h_dense = state.hessian.to_dense();
@@ -1030,13 +1030,13 @@ fn survival_transformation_edf(
 /// at its fixed seed). Returns `None` when there are no smoothing blocks to
 /// select (e.g. the Weibull linear-time path), so the caller keeps the seed.
 fn optimize_survival_transformation_smoothing(
-    model: &crate::families::survival::WorkingModelSurvival,
+    model: &crate::survival::WorkingModelSurvival,
     penalty_blocks: &[PenaltyBlock],
     num_smoothing: usize,
     beta0: &Array1<f64>,
     structural_lower_bounds: Option<&Array1<f64>>,
 ) -> Result<Option<Vec<f64>>, String> {
-    use crate::rho_optimizer::OuterProblem;
+    use gam_solve::rho_optimizer::OuterProblem;
     use gam_problem::{Derivative, HessianResult, OuterEval};
     if num_smoothing == 0 {
         return Ok(None);
@@ -1084,7 +1084,7 @@ fn optimize_survival_transformation_smoothing(
         candidate
             .set_penalty_lambdas(&lambdas)
             .map_err(|e| e.to_string())?;
-        let opts = crate::pirls::WorkingModelPirlsOptions {
+        let opts = gam_solve::pirls::WorkingModelPirlsOptions {
             max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
             convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
             adaptive_kkt_tolerance: None,
@@ -1097,7 +1097,7 @@ fn optimize_survival_transformation_smoothing(
             geodesic_acceleration: false,
             arrow_schur: None,
         };
-        let summary = crate::pirls::runworking_model_pirls(
+        let summary = gam_solve::pirls::runworking_model_pirls(
             &mut candidate,
             gam_problem::Coefficients::new(beta0.clone()),
             &opts,
@@ -1141,7 +1141,7 @@ fn optimize_survival_transformation_smoothing(
         };
         let inner_converged = matches!(
             summary.status,
-            crate::pirls::PirlsStatus::Converged | crate::pirls::PirlsStatus::StalledAtValidMinimum
+            gam_solve::pirls::PirlsStatus::Converged | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
         );
         if !inner_converged {
             return bad_trial("inner PIRLS did not converge");
@@ -1197,11 +1197,11 @@ fn optimize_survival_transformation_smoothing(
         |_: &mut (), rho: &Array1<f64>| {
             eval_at(rho)
                 .map(|(c, _)| c)
-                .map_err(crate::estimate::EstimationError::InvalidInput)
+                .map_err(gam_solve::estimate::EstimationError::InvalidInput)
         },
         |_: &mut (), rho: &Array1<f64>| {
             let (cost, gradient) =
-                eval_at(rho).map_err(crate::estimate::EstimationError::InvalidInput)?;
+                eval_at(rho).map_err(gam_solve::estimate::EstimationError::InvalidInput)?;
             Ok(OuterEval {
                 cost,
                 gradient,
@@ -1214,7 +1214,7 @@ fn optimize_survival_transformation_smoothing(
             fn(
                 &mut (),
                 &Array1<f64>,
-            ) -> Result<gam_problem::EfsEval, crate::estimate::EstimationError>,
+            ) -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
         >,
     );
     // The outer selector only ever IMPROVES on the seed; it must never be able
@@ -1253,8 +1253,8 @@ fn optimize_survival_transformation_smoothing(
 fn survival_unified_fit_result(
     beta: Array1<f64>,
     lambdas: Array1<f64>,
-    summary: &crate::pirls::WorkingModelPirlsResult,
-    state: &crate::pirls::WorkingState,
+    summary: &gam_solve::pirls::WorkingModelPirlsResult,
+    state: &gam_solve::pirls::WorkingState,
     penalty_blocks: &[PenaltyBlock],
 ) -> Result<UnifiedFitResult, String> {
     let log_lambdas = lambdas.mapv(|v| v.max(LOG_LAMBDA_UNDERFLOW_FLOOR).ln());
@@ -1272,16 +1272,16 @@ fn survival_unified_fit_result(
     // residual `outer_gradient_norm`.
     let outer_converged = matches!(
         summary.status,
-        crate::pirls::PirlsStatus::Converged | crate::pirls::PirlsStatus::StalledAtValidMinimum
+        gam_solve::pirls::PirlsStatus::Converged | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
     );
-    crate::estimate::validate_all_finite("survival fit beta", beta.iter().copied())?;
-    crate::estimate::validate_all_finite("survival fit lambdas", lambdas.iter().copied())?;
-    crate::estimate::ensure_finite_scalar("survival fit log_likelihood", state.log_likelihood)?;
-    crate::estimate::ensure_finite_scalar("survival fit deviance", state.deviance)?;
-    crate::estimate::ensure_finite_scalar("survival fit penalty", state.penalty_term)?;
-    crate::estimate::ensure_finite_scalar("survival fit reml_score", reml_score)?;
-    crate::estimate::ensure_finite_scalar("survival fit gradient_norm", summary.lastgradient_norm)?;
-    crate::estimate::ensure_finite_scalar("survival fit max_abs_eta", summary.max_abs_eta)?;
+    gam_solve::estimate::validate_all_finite("survival fit beta", beta.iter().copied())?;
+    gam_solve::estimate::validate_all_finite("survival fit lambdas", lambdas.iter().copied())?;
+    gam_solve::estimate::ensure_finite_scalar("survival fit log_likelihood", state.log_likelihood)?;
+    gam_solve::estimate::ensure_finite_scalar("survival fit deviance", state.deviance)?;
+    gam_solve::estimate::ensure_finite_scalar("survival fit penalty", state.penalty_term)?;
+    gam_solve::estimate::ensure_finite_scalar("survival fit reml_score", reml_score)?;
+    gam_solve::estimate::ensure_finite_scalar("survival fit gradient_norm", summary.lastgradient_norm)?;
+    gam_solve::estimate::ensure_finite_scalar("survival fit max_abs_eta", summary.max_abs_eta)?;
 
     // Penalized effective degrees of freedom from the converged penalized
     // Hessian and penalty roots (issue #565). `lambdas` is built one entry per
@@ -1292,7 +1292,7 @@ fn survival_unified_fit_result(
     assert_eq!(edf_by_block.len(), lambdas.len());
     assert_eq!(penalty_block_trace.len(), lambdas.len());
 
-    let inference = crate::estimate::FitInference {
+    let inference = gam_solve::estimate::FitInference {
         edf_by_block: edf_by_block.clone(),
         penalty_block_trace,
         edf_total,
@@ -1301,7 +1301,7 @@ fn survival_unified_fit_result(
         working_weights: Array1::zeros(0),
         working_response: Array1::zeros(0),
         reparam_qs: None,
-        dispersion: crate::estimate::Dispersion::Known(1.0),
+        dispersion: gam_solve::estimate::Dispersion::Known(1.0),
         beta_covariance: None,
         beta_standard_errors: None,
         beta_covariance_corrected: None,
@@ -1312,8 +1312,8 @@ fn survival_unified_fit_result(
         bias_correction_beta: None,
     };
 
-    UnifiedFitResult::try_from_parts(crate::estimate::UnifiedFitResultParts {
-        blocks: vec![crate::estimate::FittedBlock {
+    UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {
+        blocks: vec![gam_solve::estimate::FittedBlock {
             beta: beta.clone(),
             role: gam_problem::BlockRole::Mean,
             edf: edf_total,
@@ -1343,7 +1343,7 @@ fn survival_unified_fit_result(
         pirls_status: summary.status,
         max_abs_eta: summary.max_abs_eta,
         constraint_kkt: None,
-        artifacts: crate::estimate::FitArtifacts {
+        artifacts: gam_solve::estimate::FitArtifacts {
             pirls: None,
             ..Default::default()
         },
@@ -1384,7 +1384,7 @@ pub(crate) fn replicate_pooled_baseline_seed_per_cause(
 fn fit_cause_specific_survival_transformation_custom(
     spec: &SurvivalTransformationTermSpec,
     resolvedspec: TermCollectionSpec,
-    baseline_cfg: crate::families::survival::construction::SurvivalBaselineConfig,
+    baseline_cfg: crate::survival::construction::SurvivalBaselineConfig,
     prepared: PreparedSurvivalTimeStack,
     dense_cov_design: &Array2<f64>,
     penalty_blocks: Vec<PenaltyBlock>,
@@ -1393,7 +1393,7 @@ fn fit_cause_specific_survival_transformation_custom(
     penalty_block_gamma_priors: &[(String, f64, f64)],
 ) -> Result<SurvivalTransformationFitResult, String> {
     let cause_count =
-        crate::families::survival::cause_count_from_event_codes(spec.event_target.view())
+        crate::survival::cause_count_from_event_codes(spec.event_target.view())
             .into_workflow_result()?;
     if cause_count == 0 {
         return Err(WorkflowError::MissingDependency {
@@ -1449,7 +1449,7 @@ fn fit_cause_specific_survival_transformation_custom(
         let event_target = spec
             .event_target
             .mapv(|observed| u8::from(observed == cause_code));
-        family_blocks.push(crate::families::survival::CauseSpecificRoystonParmarBlock {
+        family_blocks.push(crate::survival::CauseSpecificRoystonParmarBlock {
             age_entry: spec.age_entry.clone(),
             age_exit: spec.age_exit.clone(),
             event_target,
@@ -1546,7 +1546,7 @@ fn fit_cause_specific_survival_transformation_custom(
         });
     }
 
-    let family = crate::families::survival::CauseSpecificRoystonParmarFamily::new(family_blocks)?;
+    let family = crate::survival::CauseSpecificRoystonParmarFamily::new(family_blocks)?;
     let fit_options = BlockwiseFitOptions {
         compute_covariance: false,
         ..Default::default()
@@ -1559,7 +1559,7 @@ fn fit_cause_specific_survival_transformation_custom(
     let mut fit = fit_custom_family_with_rho_prior(&family, &block_specs, &fit_options, rho_prior)
         .map_err(|err| format!("cause-specific survival custom-family fit failed: {err}"))?;
     fit.likelihood_family = Some(LikelihoodSpec::royston_parmar());
-    let time_basis = crate::families::survival::construction::SavedSurvivalTimeBasis::from_build(
+    let time_basis = crate::survival::construction::SavedSurvivalTimeBasis::from_build(
         &spec.time_build,
         spec.time_anchor,
     );
@@ -1727,7 +1727,7 @@ fn hash_workflow_design_matrix(
 }
 
 fn survival_transformation_log_lambdas(
-    penalty_blocks: &[crate::families::survival::PenaltyBlock],
+    penalty_blocks: &[crate::survival::PenaltyBlock],
 ) -> Vec<f64> {
     penalty_blocks
         .iter()
@@ -1737,11 +1737,11 @@ fn survival_transformation_log_lambdas(
 
 fn persistent_survival_transformation_key(
     spec: &SurvivalTransformationTermSpec,
-    baseline_cfg: &crate::families::survival::construction::SurvivalBaselineConfig,
+    baseline_cfg: &crate::survival::construction::SurvivalBaselineConfig,
     dense_cov_design: ArrayView2<'_, f64>,
     prepared: &PreparedSurvivalTimeStack,
-    penalty_blocks: &[crate::families::survival::PenaltyBlock],
-    opts: &crate::pirls::WorkingModelPirlsOptions,
+    penalty_blocks: &[crate::survival::PenaltyBlock],
+    opts: &gam_solve::pirls::WorkingModelPirlsOptions,
     n_cols: usize,
 ) -> String {
     let mut hasher = gam_runtime::warm_start::Fingerprinter::new();
@@ -1749,7 +1749,7 @@ fn persistent_survival_transformation_key(
     // Use the cache schema tag (NOT CARGO_PKG_VERSION) so routine
     // library version bumps don't invalidate users' on-disk warm-start
     // caches.
-    hasher.write_str(&crate::persistent_warm_start::cache_schema_tag());
+    hasher.write_str(&gam_solve::persistent_warm_start::cache_schema_tag());
     hasher.write_str(&format!("{:?}", spec.likelihood_mode));
     hasher.write_f64(spec.time_anchor);
     hasher.write_f64(spec.ridge_lambda);
@@ -1840,7 +1840,7 @@ fn load_survival_transformation_persistent_warm_start(
     n_cols: usize,
     rho: &[f64],
 ) -> Option<(Array1<f64>, Option<f64>)> {
-    let record = crate::persistent_warm_start::load_record(key)?;
+    let record = gam_solve::persistent_warm_start::load_record(key)?;
     if !record.is_compatible(key, spec.age_entry.len(), n_cols)
         || record.rho.len() != rho.len()
         || !record
@@ -1864,7 +1864,7 @@ fn store_survival_transformation_persistent_warm_start(
     n_cols: usize,
     rho: Vec<f64>,
     beta: &Array1<f64>,
-    summary: &crate::pirls::WorkingModelPirlsResult,
+    summary: &gam_solve::pirls::WorkingModelPirlsResult,
 ) {
     if beta.len() != n_cols
         || beta.iter().any(|value| !value.is_finite())
@@ -1872,7 +1872,7 @@ fn store_survival_transformation_persistent_warm_start(
     {
         return;
     }
-    let mut record = crate::persistent_warm_start::PersistentWarmStartRecord::new(
+    let mut record = gam_solve::persistent_warm_start::PersistentWarmStartRecord::new(
         key.to_string(),
         spec.age_entry.len(),
         n_cols,
@@ -1882,7 +1882,7 @@ fn store_survival_transformation_persistent_warm_start(
     record.last_inner_iters = summary.iterations;
     record.last_inner_converged = matches!(
         summary.status,
-        crate::pirls::PirlsStatus::Converged | crate::pirls::PirlsStatus::StalledAtValidMinimum
+        gam_solve::pirls::PirlsStatus::Converged | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
     );
     record.last_pirls_lm_lambda = (summary.final_lm_lambda.is_finite()
         && summary.final_lm_lambda > 0.0)
@@ -1890,7 +1890,7 @@ fn store_survival_transformation_persistent_warm_start(
     record.last_pirls_accept_rho = summary
         .final_accept_rho
         .filter(|value| value.is_finite() && *value >= 0.0);
-    if let Err(err) = crate::persistent_warm_start::store_record(&record) {
+    if let Err(err) = gam_solve::persistent_warm_start::store_record(&record) {
         log::warn!(
             "[warm-start-cache] failed to persist survival transformation warm start: {err}"
         );
@@ -1900,7 +1900,7 @@ fn store_survival_transformation_persistent_warm_start(
 pub(crate) fn fit_survival_transformation_model(
     request: SurvivalTransformationFitRequest<'_>,
 ) -> Result<SurvivalTransformationFitResult, String> {
-    use crate::families::survival::{
+    use crate::survival::{
         PenaltyBlock, PenaltyBlocks, SurvivalMonotonicityPenalty, SurvivalSpec,
     };
 
@@ -1913,17 +1913,17 @@ pub(crate) fn fit_survival_transformation_model(
     let covariate_design =
         build_term_collection_design(data, &spec.covariate_spec).map_err(|err| err.to_string())?;
     let resolvedspec =
-        gam_terms::smooth::freeze_term_collection_from_design(&spec.covariate_spec, &covariate_design)
+        crate::fit_orchestration::drivers::freeze_term_collection_from_design(&spec.covariate_spec, &covariate_design)
             .map_err(|err| err.to_string())?;
     let dense_cov_design = covariate_design.design.to_dense();
     let p_cov = dense_cov_design.ncols();
     let cause_count =
-        crate::families::survival::cause_count_from_event_codes(spec.event_target.view())
+        crate::survival::cause_count_from_event_codes(spec.event_target.view())
             .into_workflow_result()?;
     let exact_derivative_guard = survival_derivative_guard_for_likelihood(spec.likelihood_mode);
 
     let build_working_model =
-        |candidate: &crate::families::survival::construction::SurvivalBaselineConfig| {
+        |candidate: &crate::survival::construction::SurvivalBaselineConfig| {
             let prepared = prepare_survival_time_stack(
                 &spec.age_entry,
                 &spec.age_exit,
@@ -2028,11 +2028,11 @@ pub(crate) fn fit_survival_transformation_model(
             // cause-specific blocks are built.
             let baseline_event_indicator = spec.event_target.mapv(|label| u8::from(label > 0));
             let mut model =
-                crate::families::survival::royston_parmar::working_model_from_time_covariateshared(
+                crate::survival::royston_parmar::working_model_from_time_covariateshared(
                     PenaltyBlocks::new(penalty_blocks.clone()),
                     SurvivalMonotonicityPenalty { tolerance: 0.0 },
                     SurvivalSpec::Net,
-                    crate::families::survival::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
+                    crate::survival::royston_parmar::RoystonParmarSharedTimeCovariateInputs {
                         age_entry: spec.age_entry.view(),
                         age_exit: spec.age_exit.view(),
                         event_target: baseline_event_indicator.view(),
@@ -2117,7 +2117,7 @@ pub(crate) fn fit_survival_transformation_model(
             |candidate| {
                 let (_, _, beta0, structural_lower_bounds, mut model, _) =
                     build_working_model(candidate)?;
-                let opts = crate::pirls::WorkingModelPirlsOptions {
+                let opts = gam_solve::pirls::WorkingModelPirlsOptions {
                     max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
                     convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
                     adaptive_kkt_tolerance: None,
@@ -2130,7 +2130,7 @@ pub(crate) fn fit_survival_transformation_model(
                     geodesic_acceleration: false,
                     arrow_schur: None,
                 };
-                let summary = crate::pirls::runworking_model_pirls(
+                let summary = gam_solve::pirls::runworking_model_pirls(
                     &mut model,
                     gam_problem::Coefficients::new(beta0),
                     &opts,
@@ -2208,7 +2208,7 @@ pub(crate) fn fit_survival_transformation_model(
             block.lambda = lam;
         }
     }
-    let opts = crate::pirls::WorkingModelPirlsOptions {
+    let opts = gam_solve::pirls::WorkingModelPirlsOptions {
         max_iterations: SURVIVAL_TRANSFORMATION_PIRLS_MAX_ITERATIONS,
         convergence_tolerance: SURVIVAL_TRANSFORMATION_PIRLS_CONVERGENCE_TOL,
         adaptive_kkt_tolerance: None,
@@ -2244,7 +2244,7 @@ pub(crate) fn fit_survival_transformation_model(
         }
         None => beta0,
     };
-    let summary = crate::pirls::runworking_model_pirls(
+    let summary = gam_solve::pirls::runworking_model_pirls(
         &mut model,
         gam_problem::Coefficients::new(beta_start),
         &opts,
@@ -2252,7 +2252,7 @@ pub(crate) fn fit_survival_transformation_model(
     )
     .map_err(|err| format!("survival PIRLS failed: {err}"))?;
     match summary.status {
-        crate::pirls::PirlsStatus::Converged | crate::pirls::PirlsStatus::StalledAtValidMinimum => {
+        gam_solve::pirls::PirlsStatus::Converged | gam_solve::pirls::PirlsStatus::StalledAtValidMinimum => {
         }
         ref other => {
             // Non-fatal inner non-convergence at the selected λ (gam#1123). A
@@ -2323,7 +2323,7 @@ pub(crate) fn fit_survival_transformation_model(
     let fit = survival_unified_fit_result(beta, lambdas, &summary, &state, &penalty_blocks)?;
 
     let time_base_ncols = spec.time_build.x_exit_time.ncols();
-    let time_basis = crate::families::survival::construction::SavedSurvivalTimeBasis::from_build(
+    let time_basis = crate::survival::construction::SavedSurvivalTimeBasis::from_build(
         &spec.time_build,
         spec.time_anchor,
     );
@@ -2435,7 +2435,7 @@ pub(crate) fn fit_survival_location_scale_model(
         where
             R: Fn(&Array1<f64>) -> Option<InverseLink>,
         {
-            use crate::rho_optimizer::OuterProblem;
+            use gam_solve::rho_optimizer::OuterProblem;
             use gam_problem::{DeclaredHessianForm, Derivative, HessianResult, OuterEval};
             let dim = init.len();
             // Box bounds keep line-search probes inside a physically admissible
@@ -2502,11 +2502,11 @@ pub(crate) fn fit_survival_location_scale_model(
             let cost_fn = move |_: &mut (), theta: &Array1<f64>| {
                 cost_eval(theta)
                     .map(|(cost, _)| cost)
-                    .map_err(crate::estimate::EstimationError::InvalidInput)
+                    .map_err(gam_solve::estimate::EstimationError::InvalidInput)
             };
             let eval_fn = move |_: &mut (), theta: &Array1<f64>| {
                 let (cost, gradient) =
-                    eval_link(theta).map_err(crate::estimate::EstimationError::InvalidInput)?;
+                    eval_link(theta).map_err(gam_solve::estimate::EstimationError::InvalidInput)?;
                 Ok(OuterEval {
                     cost,
                     gradient,
@@ -2524,7 +2524,7 @@ pub(crate) fn fit_survival_location_scale_model(
                         &mut (),
                         &Array1<f64>,
                     )
-                        -> Result<gam_problem::EfsEval, crate::estimate::EstimationError>,
+                        -> Result<gam_problem::EfsEval, gam_solve::estimate::EstimationError>,
                 >,
             );
             let result = problem
@@ -2838,7 +2838,7 @@ pub(crate) fn crossfit_score_calibration(
     let full_cov_design = build_term_collection_design(data.values.view(), &covariate_spec_raw)
         .map_err(|e| e.to_string())?;
     let frozen_cov_spec =
-        gam_terms::smooth::freeze_term_collection_from_design(&covariate_spec_raw, &full_cov_design)
+        crate::fit_orchestration::drivers::freeze_term_collection_from_design(&covariate_spec_raw, &full_cov_design)
             .map_err(|e| e.to_string())?;
     let p_cov = full_cov_design.design.ncols();
 
@@ -2853,7 +2853,7 @@ pub(crate) fn crossfit_score_calibration(
     let min_complement = folds.iter().map(|held| n - held.len()).min().unwrap_or(n);
     let mut fold_config = recipe.config.clone();
     fold_config.response_num_internal_knots =
-        crate::families::transformation_normal::effective_response_num_internal_knots(
+        crate::transformation_normal::effective_response_num_internal_knots(
             &recipe.config,
             min_complement,
             p_cov,
@@ -2911,7 +2911,7 @@ pub(crate) fn crossfit_score_calibration(
         let held_resp = crossfit_select_rows_1d(&response_full, held);
         let held_offset = crossfit_select_rows_1d(&offset_full, held);
 
-        let jac = crate::families::marginal_slope_orthogonal::score_influence_jacobian(
+        let jac = crate::marginal_slope_orthogonal::score_influence_jacobian(
             &fold_fit,
             &held_resp,
             held_cov.view(),

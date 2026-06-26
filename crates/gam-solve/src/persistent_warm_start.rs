@@ -18,7 +18,7 @@ const CACHE_TTL_SECS: u64 = 60 * 60 * 24 * 365 * 10;
 /// invariants altered, payload semantics shift). This is **deliberately
 /// separate** from `CARGO_PKG_VERSION` so a routine library version bump
 /// does NOT invalidate every user's warm-start cache.
-pub(crate) fn cache_schema_tag() -> String {
+pub fn cache_schema_tag() -> String {
     // Bumped from `schema2-` → `schema3-` when the three hand-written
     // hashers (`Fingerprinter`, `StableHasher`, `CacheDigestBuilder`) were
     // unified onto `Fingerprinter`. Prior on-disk warm-start entries are
@@ -42,7 +42,7 @@ pub(crate) fn cache_schema_tag() -> String {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct PersistentWarmStartRecord {
+pub struct PersistentWarmStartRecord {
     pub version: u32,
     pub key: String,
     pub package_version: String,
@@ -201,7 +201,7 @@ impl PersistentWarmStartRecord {
     }
 }
 
-pub(crate) fn load_record(key: &str) -> Option<PersistentWarmStartRecord> {
+pub fn load_record(key: &str) -> Option<PersistentWarmStartRecord> {
     load_json_record(key)
 }
 
@@ -209,7 +209,7 @@ pub(crate) fn load_block_record(key: &str) -> Option<PersistentBlockWarmStartRec
     load_json_record(key)
 }
 
-pub(crate) fn store_record(record: &PersistentWarmStartRecord) -> Result<(), String> {
+pub fn store_record(record: &PersistentWarmStartRecord) -> Result<(), String> {
     store_json_record(&record.key, record)
 }
 

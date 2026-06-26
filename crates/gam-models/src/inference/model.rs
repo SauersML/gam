@@ -1,27 +1,27 @@
-use crate::basis::BasisOptions;
-use crate::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
-use crate::families::bms::{
+use gam_terms::basis::BasisOptions;
+use gam_solve::estimate::{BlockRole, FittedLinkState, UnifiedFitResult};
+use crate::bms::{
     LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
 };
-use crate::families::survival::construction::{
+use crate::survival::construction::{
     SurvivalBaselineConfig, SurvivalTimeBasisConfig, parse_survival_baseline_config,
 };
-use crate::families::survival::location_scale::ResidualDistribution;
-use crate::families::survival::lognormal_kernel::FrailtySpec;
-use crate::families::wiggle::{
+use crate::survival::location_scale::ResidualDistribution;
+use crate::survival::lognormal_kernel::FrailtySpec;
+use crate::wiggle::{
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
-use crate::inference::formula_dsl::{
+use gam_terms::inference::formula_dsl::{
     inverse_link_supports_joint_wiggle, joint_wiggle_unsupported_link_message, parse_formula,
     parse_surv_interval_response, parse_surv_response, parsed_term_column_names,
 };
-use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
-use crate::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
-use crate::types::{
+use gam_solve::mixture_link::{state_from_beta_logisticspec, state_from_sasspec};
+use gam_terms::smooth::{AdaptiveRegularizationDiagnostics, TermCollectionSpec};
+use gam_problem::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily, SasLinkSpec,
     SasLinkState, StandardLink,
 };
-use crate::util::span::span_index_for_breakpoints;
+use gam_runtime::span::span_index_for_breakpoints;
 // The data-schema value types live in the `gam-data` foundation crate; they
 // were previously authored here and are still named `gam::inference::model::{
 // ColumnKindTag, DataSchema, SchemaColumn}` by a broad set of integration tests
@@ -71,7 +71,7 @@ pub type GroupMetadata = BTreeMap<String, JsonValue>;
 pub struct SavedSplineScan {
     /// Training column name feeding the single 1-D smooth at predict time.
     pub feature_column: String,
-    pub state: crate::solver::spline_scan::SplineScanState,
+    pub state: gam_solve::spline_scan::SplineScanState,
 }
 
 /// Saved multiresolution residual-cascade fit (#1032): the predict-time feature
@@ -82,7 +82,7 @@ pub struct SavedSplineScan {
 pub struct SavedResidualCascade {
     /// Training column names for the d ∈ {2, 3} scattered-smooth coordinates.
     pub feature_columns: Vec<String>,
-    pub state: crate::solver::residual_cascade::ResidualCascadeState,
+    pub state: gam_solve::residual_cascade::ResidualCascadeState,
 }
 
 /// Typed error surface for `src/inference/model.rs` saved-model code.
@@ -130,15 +130,15 @@ crate::impl_reason_error_boilerplate! {
 // `Result<_, SurvivalPredictError>` call sites can propagate with `?`.
 // Survival prediction keeps the model-layer source so the chain identifies
 // the payload/schema failure that triggered the prediction error.
-impl From<FittedModelError> for crate::model_types::EstimationError {
+impl From<FittedModelError> for gam_solve::model_types::EstimationError {
     fn from(err: FittedModelError) -> Self {
-        crate::model_types::EstimationError::InvalidInput(err.to_string())
+        gam_solve::model_types::EstimationError::InvalidInput(err.to_string())
     }
 }
 
-impl From<FittedModelError> for crate::families::survival::predict::SurvivalPredictError {
+impl From<FittedModelError> for crate::survival::predict::SurvivalPredictError {
     fn from(err: FittedModelError) -> Self {
-        crate::families::survival::predict::SurvivalPredictError::ModelPayload {
+        crate::survival::predict::SurvivalPredictError::ModelPayload {
             context: "saved-model survival prediction payload",
             source: err,
         }
@@ -793,7 +793,7 @@ impl FittedModelPayload {
     /// missed `survival_time_basis`.
     pub fn apply_survival_time_basis(
         &mut self,
-        snapshot: &crate::families::survival::construction::SavedSurvivalTimeBasis,
+        snapshot: &crate::survival::construction::SavedSurvivalTimeBasis,
     ) {
         self.survival_time_basis = Some(snapshot.basisname.clone());
         self.survival_time_degree = snapshot.degree;
@@ -930,7 +930,7 @@ pub struct SavedBaselineTimeWiggleRuntime {
 
 // Re-export so saved-model consumers can refer to the anchor-block tag
 // without reaching across module boundaries.
-pub use crate::families::bms::deviation_runtime::ParametricAnchorBlock;
+pub use crate::bms::deviation_runtime::ParametricAnchorBlock;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SavedCompiledFlexBlock {
@@ -1030,8 +1030,8 @@ pub fn location_scale_noise_beta(fit: &UnifiedFitResult) -> Option<Array1<f64>> 
 /// threshold-scale predictor. The binomial location-scale (BMS ordinal) path is
 /// the only other non-Gaussian location-scale family, with a `Binomial`
 /// response.
-fn is_dispersion_location_scale_response(response: &crate::types::ResponseFamily) -> bool {
-    use crate::types::ResponseFamily;
+fn is_dispersion_location_scale_response(response: &gam_problem::types::ResponseFamily) -> bool {
+    use gam_problem::types::ResponseFamily;
     matches!(
         response,
         ResponseFamily::NegativeBinomial { .. }
@@ -1411,12 +1411,12 @@ impl SavedCompiledFlexBlock {
                     .to_string(),
             });
         }
-        if self.kernel != crate::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL {
+        if self.kernel != crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL {
             return Err(FittedModelError::IncompatibleConfig {
                 reason: format!(
                     "saved anchored deviation runtime uses unsupported kernel '{}'; expected {}",
                     self.kernel,
-                    crate::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL
+                    crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL
                 ),
             });
         }
@@ -1689,7 +1689,7 @@ impl SavedCompiledFlexBlock {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1707,7 +1707,7 @@ impl SavedCompiledFlexBlock {
         &self,
         beta: &Array1<f64>,
         span_idx: usize,
-    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
             return Err(FittedModelError::SchemaMismatch {
@@ -1720,7 +1720,7 @@ impl SavedCompiledFlexBlock {
         }
         let left = points[span_idx];
         let right = points[span_idx + 1];
-        Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
+        Ok(crate::cubic_cell_kernel::LocalSpanCubic {
             left,
             right,
             c0: self.span_c0[span_idx]
@@ -1750,7 +1750,7 @@ impl SavedCompiledFlexBlock {
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1767,7 +1767,7 @@ impl SavedCompiledFlexBlock {
         &self,
         span_idx: usize,
         basis_idx: usize,
-    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         let points = &self.breakpoints;
         if span_idx + 1 >= points.len() {
             return Err(FittedModelError::SchemaMismatch {
@@ -1778,7 +1778,7 @@ impl SavedCompiledFlexBlock {
                 ),
             });
         }
-        Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
+        Ok(crate::cubic_cell_kernel::LocalSpanCubic {
             left: points[span_idx],
             right: points[span_idx + 1],
             c0: self.span_c0[span_idx][basis_idx],
@@ -1792,7 +1792,7 @@ impl SavedCompiledFlexBlock {
         &self,
         basis_idx: usize,
         value: f64,
-    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if basis_idx >= self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1804,7 +1804,7 @@ impl SavedCompiledFlexBlock {
         }
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
-            return Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
+            return Ok(crate::cubic_cell_kernel::LocalSpanCubic {
                 left: left_ep,
                 right: left_ep + 1.0,
                 c0: self.span_c0[0][basis_idx],
@@ -1814,7 +1814,7 @@ impl SavedCompiledFlexBlock {
             });
         }
         if value > right_ep {
-            return Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
+            return Ok(crate::cubic_cell_kernel::LocalSpanCubic {
                 left: right_ep,
                 right: right_ep + 1.0,
                 c0: self.right_boundary_basis_value(basis_idx),
@@ -1831,7 +1831,7 @@ impl SavedCompiledFlexBlock {
         &self,
         beta: &Array1<f64>,
         value: f64,
-    ) -> Result<crate::families::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
+    ) -> Result<crate::cubic_cell_kernel::LocalSpanCubic, FittedModelError> {
         self.validate_exact_replay_contract()?;
         if beta.len() != self.basis_dim {
             return Err(FittedModelError::SchemaMismatch {
@@ -1844,7 +1844,7 @@ impl SavedCompiledFlexBlock {
         }
         let (left_ep, right_ep) = self.support_interval()?;
         if value < left_ep {
-            return Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
+            return Ok(crate::cubic_cell_kernel::LocalSpanCubic {
                 left: left_ep,
                 right: left_ep + 1.0,
                 c0: self.span_c0[0]
@@ -1858,7 +1858,7 @@ impl SavedCompiledFlexBlock {
             });
         }
         if value > right_ep {
-            return Ok(crate::families::cubic_cell_kernel::LocalSpanCubic {
+            return Ok(crate::cubic_cell_kernel::LocalSpanCubic {
                 left: right_ep,
                 right: right_ep + 1.0,
                 c0: (0..self.basis_dim)
@@ -2077,11 +2077,11 @@ impl FittedFamily {
 /// (`by=`, factor-smooth, sum-to-zero) delegate to their inner smooth; `Sphere`
 /// and `Pca` are intentionally not collected.
 fn collect_smooth_extrapolation_axes(
-    basis: &crate::smooth::SmoothBasisSpec,
+    basis: &gam_terms::smooth::SmoothBasisSpec,
     n_training_headers: usize,
     out: &mut std::collections::HashSet<usize>,
 ) {
-    use crate::smooth::SmoothBasisSpec;
+    use gam_terms::smooth::SmoothBasisSpec;
     let push = |col: usize, out: &mut std::collections::HashSet<usize>| {
         if col < n_training_headers {
             out.insert(col);
@@ -2157,11 +2157,11 @@ fn collect_smooth_extrapolation_axes(
 /// here. Returned indices reference `self.training_headers`, matching the
 /// iteration in `axis_clip_to_training_ranges`.
 fn collect_by_variable_numeric_axes(
-    basis: &crate::smooth::SmoothBasisSpec,
+    basis: &gam_terms::smooth::SmoothBasisSpec,
     n_training_headers: usize,
     out: &mut std::collections::HashSet<usize>,
 ) {
-    use crate::smooth::{BySmoothKind, ByVarKind, SmoothBasisSpec};
+    use gam_terms::smooth::{BySmoothKind, ByVarKind, SmoothBasisSpec};
     match basis {
         SmoothBasisSpec::ByVariable {
             inner,
@@ -2334,8 +2334,8 @@ impl FittedModel {
         &self,
         training_headers: &[String],
     ) -> std::collections::HashSet<usize> {
-        use crate::basis::BSplineKnotSpec;
-        use crate::smooth::SmoothBasisSpec;
+        use gam_terms::basis::BSplineKnotSpec;
+        use gam_terms::smooth::SmoothBasisSpec;
         let mut out: std::collections::HashSet<usize> = std::collections::HashSet::new();
         let Some(spec) = self.resolved_termspec.as_ref() else {
             return out;
@@ -2512,7 +2512,7 @@ impl FittedModel {
         &self,
         training_headers: &[String],
     ) -> std::collections::HashMap<usize, (f64, f64)> {
-        use crate::smooth::SmoothBasisSpec;
+        use gam_terms::smooth::SmoothBasisSpec;
         let mut out: std::collections::HashMap<usize, (f64, f64)> =
             std::collections::HashMap::new();
         let Some(spec) = self.resolved_termspec.as_ref() else {
@@ -3309,10 +3309,10 @@ impl FittedModel {
     /// For every frozen measure-jet term in `resolved_termspec` this prices
     /// the off-support ignorance of the fitted multiscale spectrum at each
     /// query row: support curve from the frozen nodes/masses/band
-    /// ([`crate::basis::measure_jet_support_curve`]), fitted per-scale
+    /// ([`gam_terms::basis::measure_jet_support_curve`]), fitted per-scale
     /// amplitudes λ̂_ℓ read from the fit's `lambdas` through the replayed
     /// design's penalty layout, folded through
-    /// [`crate::basis::measure_jet_extrapolation_variance`] and scaled by
+    /// [`gam_terms::basis::measure_jet_extrapolation_variance`] and scaled by
     /// the fit's coefficient-covariance scale φ̂ so the result sits on Vp's
     /// η-variance scale. Terms not yet frozen (no `frozen_quadrature` or
     /// non-`UserProvided` centers) are skipped with a warning. Returns
@@ -3334,8 +3334,8 @@ impl FittedModel {
         data: ndarray::ArrayView2<'_, f64>,
         col_map: &HashMap<String, usize>,
     ) -> Result<Option<Array1<f64>>, FittedModelError> {
-        use crate::basis::{CenterStrategy, MeasureJetExtrapolationSpectrum, PenaltySource};
-        use crate::smooth::{SmoothBasisSpec, build_term_collection_design};
+        use gam_terms::basis::{CenterStrategy, MeasureJetExtrapolationSpectrum, PenaltySource};
+        use gam_terms::smooth::{SmoothBasisSpec, build_term_collection_design};
         let Some(saved_spec) = self.resolved_termspec.as_ref() else {
             return Ok(None);
         };
@@ -3355,7 +3355,7 @@ impl FittedModel {
                     fit_result payload; refit"
                     .to_string(),
             })?;
-        let spec = crate::families::survival::predict::resolve_termspec_for_prediction(
+        let spec = crate::survival::predict::resolve_termspec_for_prediction(
             &self.resolved_termspec,
             self.training_headers.as_ref(),
             col_map,
@@ -3538,7 +3538,7 @@ impl FittedModel {
                     queries.column_mut(j).mapv_inplace(|v| v / scale);
                 }
             }
-            let support = crate::basis::measure_jet_support_curve(
+            let support = gam_terms::basis::measure_jet_support_curve(
                 queries.view(),
                 centers.view(),
                 frozen.masses.view(),
@@ -3551,7 +3551,7 @@ impl FittedModel {
                 ),
             })?;
             for i in 0..data.nrows() {
-                let v = crate::basis::measure_jet_extrapolation_variance(
+                let v = gam_terms::basis::measure_jet_extrapolation_variance(
                     support.row(i),
                     &frozen.eps_band,
                     &frozen.support_means,
@@ -3666,11 +3666,11 @@ impl FittedModel {
     /// `predict` replays the training Gaussian bridge bit-for-bit.
     pub fn saved_spline_scan(
         &self,
-    ) -> Result<Option<(&str, crate::solver::spline_scan::SplineScanFit)>, FittedModelError> {
+    ) -> Result<Option<(&str, gam_solve::spline_scan::SplineScanFit)>, FittedModelError> {
         let Some(saved) = self.spline_scan.as_ref() else {
             return Ok(None);
         };
-        let fit = crate::solver::spline_scan::SplineScanFit::from_state(&saved.state)
+        let fit = gam_solve::spline_scan::SplineScanFit::from_state(&saved.state)
             .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
         Ok(Some((saved.feature_column.as_str(), fit)))
     }
@@ -3684,14 +3684,14 @@ impl FittedModel {
     ) -> Result<
         Option<(
             &[String],
-            crate::solver::residual_cascade::ResidualCascadeFit,
+            gam_solve::residual_cascade::ResidualCascadeFit,
         )>,
         FittedModelError,
     > {
         let Some(saved) = self.residual_cascade.as_ref() else {
             return Ok(None);
         };
-        let fit = crate::solver::residual_cascade::ResidualCascadeFit::from_state(&saved.state)
+        let fit = gam_solve::residual_cascade::ResidualCascadeFit::from_state(&saved.state)
             .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
         Ok(Some((saved.feature_columns.as_slice(), fit)))
     }
@@ -3756,7 +3756,7 @@ impl FittedModel {
                         .to_string(),
                 });
             }
-            crate::solver::spline_scan::SplineScanFit::from_state(&scan.state)
+            gam_solve::spline_scan::SplineScanFit::from_state(&scan.state)
                 .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
             // A scan model carries NO dense design, so the dense-path
             // requirements below (resolved_termspec, fit_result finiteness,
@@ -3808,7 +3808,7 @@ impl FittedModel {
                     ),
                 });
             }
-            crate::solver::residual_cascade::ResidualCascadeFit::from_state(&cascade.state)
+            gam_solve::residual_cascade::ResidualCascadeFit::from_state(&cascade.state)
                 .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
             if self.data_schema.is_none() {
                 return Err(FittedModelError::MissingField {
@@ -4392,7 +4392,7 @@ fn array2_to_nestedvec(a: &ndarray::Array2<f64>) -> Vec<Vec<f64>> {
     a.rows().into_iter().map(|row| row.to_vec()).collect()
 }
 
-use crate::solver::estimate::{ensure_finite_scalar, validate_all_finite};
+use gam_solve::estimate::{ensure_finite_scalar, validate_all_finite};
 
 fn validate_frozen_term_collectionspec(
     spec: &TermCollectionSpec,
@@ -4518,11 +4518,11 @@ pub fn load_survival_time_basis_config_from_model(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
-    use crate::families::survival::lognormal_kernel::FrailtySpec;
-    use crate::pirls::PirlsStatus;
-    use crate::solver::estimate::{FitArtifacts, FittedBlock, FittedLinkState};
-    use crate::types::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
+    use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
+    use crate::survival::lognormal_kernel::FrailtySpec;
+    use gam_solve::pirls::PirlsStatus;
+    use gam_solve::estimate::{FitArtifacts, FittedBlock, FittedLinkState};
+    use gam_problem::types::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
     use gam_data::SchemaColumn;
     use ndarray::{Array1, Array2, array};
 
@@ -4542,7 +4542,7 @@ mod tests {
         let x: Vec<f64> = (0..40).map(|i| i as f64 / 39.0).collect();
         let y: Vec<f64> = x.iter().map(|&v| (4.0 * v).sin() + 0.1 * v).collect();
         let w = vec![1.0_f64; x.len()];
-        let fit = crate::solver::spline_scan::fit_spline_scan(&x, &y, &w, 2).expect("scan fit");
+        let fit = gam_solve::spline_scan::fit_spline_scan(&x, &y, &w, 2).expect("scan fit");
         let make_payload = || {
             crate::inference::model_payload_builders::assemble_spline_scan_payload(
                 "y ~ s(x)".to_string(),
@@ -4921,7 +4921,7 @@ mod tests {
         let mut group_spec = empty_termspec();
         group_spec
             .random_effect_terms
-            .push(crate::smooth::RandomEffectTermSpec {
+            .push(gam_terms::smooth::RandomEffectTermSpec {
                 name: "g".to_string(),
                 feature_col: 0,
                 drop_first_level: false,
@@ -5018,7 +5018,7 @@ mod tests {
 
     #[test]
     fn apply_survival_time_basis_writes_all_required_fields() {
-        use crate::families::survival::construction::SavedSurvivalTimeBasis;
+        use crate::survival::construction::SavedSurvivalTimeBasis;
 
         let fit = saved_fit(vec![
             FittedBlock {

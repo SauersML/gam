@@ -72,7 +72,7 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
     }
 }
 
-pub(super) fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
+pub fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
     match &term.basis {
         SmoothBasisSpec::ByVariable { inner, .. }
         | SmoothBasisSpec::FactorSumToZero { inner, .. } => {

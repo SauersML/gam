@@ -26,7 +26,7 @@ use ndarray::{Array2, ArrayView2};
 ///
 /// Returns `None` only when there is no axis or too few rows to estimate a
 /// spread, or when the caller already supplies frozen scales (prediction path).
-pub(crate) fn compute_spatial_input_scales(x: ArrayView2<'_, f64>) -> Option<Vec<f64>> {
+pub fn compute_spatial_input_scales(x: ArrayView2<'_, f64>) -> Option<Vec<f64>> {
     let d = x.ncols();
     if d == 0 {
         return None;
@@ -46,7 +46,7 @@ pub(crate) fn compute_spatial_input_scales(x: ArrayView2<'_, f64>) -> Option<Vec
 }
 
 /// Apply per-column standardization to a data matrix using precomputed scales.
-pub(crate) fn apply_input_standardization(x: &mut Array2<f64>, scales: &[f64]) {
+pub fn apply_input_standardization(x: &mut Array2<f64>, scales: &[f64]) {
     for j in 0..x.ncols() {
         let inv = 1.0 / scales[j];
         x.column_mut(j).mapv_inplace(|v| v * inv);
@@ -74,7 +74,7 @@ fn geometric_mean_scale(scales: &[f64]) -> f64 {
     log_mean.exp()
 }
 
-pub(crate) fn compensate_length_scale_for_standardization(
+pub fn compensate_length_scale_for_standardization(
     length_scale: f64,
     scales: &[f64],
 ) -> f64 {
@@ -86,7 +86,7 @@ pub(crate) fn compensate_length_scale_for_standardization(
     }
 }
 
-pub(crate) fn compensate_optional_length_scale_for_standardization(
+pub fn compensate_optional_length_scale_for_standardization(
     length_scale: Option<f64>,
     scales: &[f64],
 ) -> Option<f64> {

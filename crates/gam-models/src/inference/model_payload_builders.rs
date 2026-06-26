@@ -15,27 +15,27 @@
 //! content to the same assembler, payload drift becomes impossible by
 //! construction.
 
-use crate::estimate::UnifiedFitResult;
-use crate::families::bms::deviation_runtime::AnchorComponentTag;
-use crate::families::bms::{
+use gam_solve::estimate::UnifiedFitResult;
+use crate::bms::deviation_runtime::AnchorComponentTag;
+use crate::bms::{
     DeviationRuntime, LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
 };
-use crate::families::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
-use crate::families::scale_design::ScaleDeviationTransform;
-use crate::families::survival::construction::{
+use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
+use crate::scale_design::ScaleDeviationTransform;
+use crate::survival::construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, survival_baseline_targetname,
 };
-use crate::families::survival::location_scale::{
+use crate::survival::location_scale::{
     ResidualDistribution, residual_distribution_from_inverse_link,
 };
-use crate::families::transformation_normal::TransformationNormalFamily;
+use crate::transformation_normal::TransformationNormalFamily;
 use crate::inference::model::{
     FittedFamily, FittedModelPayload, MODEL_PAYLOAD_VERSION, ModelKind, SavedAnchorComponent,
     SavedAnchorKind, SavedCompiledFlexBlock, SavedLatentZNormalization, SavedResidualCascade,
     SavedSplineScan, TransformationScoreCalibration,
 };
-use crate::smooth::TermCollectionSpec;
-use crate::types::{
+use gam_terms::smooth::TermCollectionSpec;
+use gam_problem::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, StandardLink, inverse_link_to_binomial_spec,
 };
 use gam_data::DataSchema;
@@ -175,7 +175,7 @@ pub struct BernoulliMarginalSlopeInputs<'a> {
     pub score_warp_runtime: Option<&'a DeviationRuntime>,
     pub link_dev_runtime: Option<&'a DeviationRuntime>,
     pub base_link: InverseLink,
-    pub frailty: crate::families::survival::lognormal_kernel::FrailtySpec,
+    pub frailty: crate::survival::lognormal_kernel::FrailtySpec,
 }
 
 /// Drop the #461 training-only influence-absorber coefficients `γ` from a fitted
@@ -282,7 +282,7 @@ fn truncate_marginal_slope_influence_absorber(
     let covariance_conditional = drop_gamma_block(covariance_conditional);
     let covariance_corrected = drop_gamma_block(covariance_corrected);
 
-    UnifiedFitResult::try_from_parts(crate::estimate::UnifiedFitResultParts {
+    UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {
         blocks,
         log_lambdas,
         lambdas,
@@ -328,7 +328,7 @@ fn truncate_marginal_slope_influence_absorber(
 pub fn assemble_spline_scan_payload(
     formula: String,
     feature_column: String,
-    fit: &crate::solver::spline_scan::SplineScanFit,
+    fit: &gam_solve::spline_scan::SplineScanFit,
     data_schema: DataSchema,
     training_headers: Vec<String>,
     training_feature_ranges: Vec<(f64, f64)>,
@@ -363,7 +363,7 @@ pub fn assemble_spline_scan_payload(
 pub fn assemble_residual_cascade_payload(
     formula: String,
     feature_columns: Vec<String>,
-    fit: &crate::solver::residual_cascade::ResidualCascadeFit,
+    fit: &gam_solve::residual_cascade::ResidualCascadeFit,
     data_schema: DataSchema,
     training_headers: Vec<String>,
     training_feature_ranges: Vec<(f64, f64)>,
@@ -373,7 +373,7 @@ pub fn assemble_residual_cascade_payload(
         formula,
         ModelKind::Standard,
         FittedFamily::Standard {
-            likelihood: crate::types::LikelihoodSpec::gaussian_identity(),
+            likelihood: gam_problem::types::LikelihoodSpec::gaussian_identity(),
             link: None,
             latent_cloglog_state: None,
             mixture_state: None,
@@ -690,7 +690,7 @@ pub struct SurvivalMarginalSlopeInputs<'a> {
     pub formula: String,
     pub data_schema: DataSchema,
     pub fit_result: UnifiedFitResult,
-    pub frailty: crate::families::survival::lognormal_kernel::FrailtySpec,
+    pub frailty: crate::survival::lognormal_kernel::FrailtySpec,
     pub survival_entry: Option<String>,
     pub survival_exit: String,
     pub survival_event: String,
@@ -727,7 +727,7 @@ fn new_royston_parmar_survival_payload(
     data_schema: DataSchema,
     survival_likelihood_label: &str,
     survival_distribution: Option<ResidualDistribution>,
-    frailty: crate::families::survival::lognormal_kernel::FrailtySpec,
+    frailty: crate::survival::lognormal_kernel::FrailtySpec,
 ) -> FittedModelPayload {
     let mut payload = FittedModelPayload::new(
         MODEL_PAYLOAD_VERSION,
@@ -852,7 +852,7 @@ pub fn assemble_survival_transformation_payload(
         inputs.data_schema,
         &inputs.survival_likelihood_label,
         None,
-        crate::families::survival::lognormal_kernel::FrailtySpec::None,
+        crate::survival::lognormal_kernel::FrailtySpec::None,
     );
     payload.survival_entry = inputs.survival_entry;
     payload.survival_exit = Some(inputs.survival_exit);
@@ -943,7 +943,7 @@ pub fn assemble_survival_location_scale_payload(
         inputs.data_schema,
         &inputs.survival_likelihood_label,
         survival_distribution,
-        crate::families::survival::lognormal_kernel::FrailtySpec::None,
+        crate::survival::lognormal_kernel::FrailtySpec::None,
     );
     payload.link = Some(inputs.fitted_inverse_link);
     payload.linkwiggle_degree = inputs.linkwiggle_degree;

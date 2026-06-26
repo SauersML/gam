@@ -216,7 +216,7 @@ pub use families::custom_family;
 pub use families::gamlss;
 pub use families::transformation_normal;
 pub use gpu::GpuDeviceInfo;
-pub use solver::fit_orchestration::{
+pub use gam_models::fit_orchestration::{
     BernoulliMarginalSlopeFitRequest, BinomialLocationScaleFitRequest, CrossFitScoreCalibration,
     CtnStage1Recipe, DispersionLocationScaleFitRequest, DispersionLocationScaleFitResult,
     FitConfig, FitRequest, FitResult, GaussianLocationScaleFitRequest, LatentBinaryFitRequest,

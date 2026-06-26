@@ -1,17 +1,17 @@
-use crate::families::bms::{
+use crate::bms::{
     EmpiricalZGrid, LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
     bernoulli_marginal_link_map, empirical_intercept_from_marginal,
 };
-use crate::families::marginal_slope_shared::{
+use crate::marginal_slope_shared::{
     ObservedDenestedCellPartials, eval_coeff4_at,
     probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
 };
-use crate::families::survival::lognormal_kernel::FrailtySpec;
+use crate::survival::lognormal_kernel::FrailtySpec;
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
-use crate::matrix::DesignMatrix;
-use crate::probability::{normal_cdf, normal_pdf};
-use crate::solver::estimate::{EstimationError, UnifiedFitResult};
-use crate::types::{InverseLink, LikelihoodSpec};
+use gam_linalg::matrix::DesignMatrix;
+use gam_math::probability::{normal_cdf, normal_pdf};
+use gam_solve::estimate::{EstimationError, UnifiedFitResult};
+use gam_problem::types::{InverseLink, LikelihoodSpec};
 use ndarray::{Array1, Array2, ArrayView1};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 

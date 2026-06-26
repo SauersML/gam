@@ -68,7 +68,7 @@ pub struct SurvivalLocationScaleFitRequest<'a> {
     pub wiggle: Option<LinkWiggleConfig>,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
     pub optimize_inverse_link: bool,
-    /// See [`crate::custom_family::BlockwiseFitOptions::cache_session`].
+    /// See [`gam_solve::custom_family::BlockwiseFitOptions::cache_session`].
     /// Threaded into the internally constructed `BlockwiseFitOptions` by
     /// `fit_survival_location_scale_model`.
     pub cache_session: Option<std::sync::Arc<gam_runtime::warm_start::Session>>,
@@ -77,7 +77,7 @@ pub struct SurvivalLocationScaleFitRequest<'a> {
 pub struct SurvivalTransformationFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: SurvivalTransformationTermSpec,
-    /// See [`crate::custom_family::BlockwiseFitOptions::cache_session`].
+    /// See [`gam_solve::custom_family::BlockwiseFitOptions::cache_session`].
     /// Threaded into the internally constructed `BlockwiseFitOptions` by
     /// `fit_survival_transformation_model`.
     pub cache_session: Option<std::sync::Arc<gam_runtime::warm_start::Session>>,
@@ -91,10 +91,10 @@ pub struct SurvivalTransformationTermSpec {
     pub weights: Array1<f64>,
     pub covariate_spec: TermCollectionSpec,
     pub covariate_offset: Array1<f64>,
-    pub baseline_cfg: crate::families::survival::SurvivalBaselineConfig,
-    pub likelihood_mode: crate::families::survival::SurvivalLikelihoodMode,
+    pub baseline_cfg: crate::survival::SurvivalBaselineConfig,
+    pub likelihood_mode: crate::survival::SurvivalLikelihoodMode,
     pub time_anchor: f64,
-    pub time_build: crate::families::survival::SurvivalTimeBuildOutput,
+    pub time_build: crate::survival::SurvivalTimeBuildOutput,
     pub timewiggle: Option<LinkWiggleFormulaSpec>,
     pub weibull_seed: Option<(f64, f64)>,
     pub ridge_lambda: f64,
@@ -174,13 +174,13 @@ pub struct SurvivalLocationScaleFitResult {
 pub struct SurvivalTransformationFitResult {
     pub fit: UnifiedFitResult,
     pub resolvedspec: TermCollectionSpec,
-    pub baseline_cfg: crate::families::survival::SurvivalBaselineConfig,
-    pub likelihood_mode: crate::families::survival::SurvivalLikelihoodMode,
+    pub baseline_cfg: crate::survival::SurvivalBaselineConfig,
+    pub likelihood_mode: crate::survival::SurvivalLikelihoodMode,
     /// Persistable snapshot of the time basis used during the fit. Replaces
     /// six previously flat fields (basisname / degree / knots / keep_cols /
     /// smooth_lambda / anchor) so the FFI save path consumes a single
     /// source-of-truth value rather than threading siblings independently.
-    pub time_basis: crate::families::survival::SavedSurvivalTimeBasis,
+    pub time_basis: crate::survival::SavedSurvivalTimeBasis,
     pub time_base_ncols: usize,
     pub baseline_timewiggle: Option<TimeWiggleBlockInput>,
 }
@@ -206,7 +206,7 @@ pub enum FitResult {
     /// posterior get it here without paying the dense O(n·k²)+O(k³) route; the
     /// CLI/FFI save paths build the persistence payload from the same
     /// `SplineScanFit` via `assemble_spline_scan_payload`.
-    SplineScan(crate::spline_scan::SplineScanFit),
+    SplineScan(gam_solve::spline_scan::SplineScanFit),
     /// O(n log n) multiresolution residual-cascade smooth (#1032). UNLIKE the
     /// 1-D scan, the cascade is NOT the same posterior as the Duchon/Matérn term
     /// it stands in for (a different finite basis — the multilevel Wendland
@@ -216,11 +216,11 @@ pub enum FitResult {
     /// in-cascade quasi-uniformity guard certifies the metric; every other shape
     /// (and a rejected metric) falls through to the dense `fit_model` path. The
     /// cascade-bearing model carries the
-    /// [`ResidualCascadeFit`](crate::residual_cascade::ResidualCascadeFit)
+    /// [`ResidualCascadeFit`](gam_solve::residual_cascade::ResidualCascadeFit)
     /// directly — knots-free nested geometry, coefficients, the factored
     /// precision, and an exact per-row `predict`; the CLI/FFI save paths build
     /// the persistence payload from its `to_state` snapshot.
-    ResidualCascade(crate::residual_cascade::ResidualCascadeFit),
+    ResidualCascade(gam_solve::residual_cascade::ResidualCascadeFit),
 }
 
 /// Result of a dispersion-channel GAMLSS location-scale fit (#913). Wraps the
@@ -476,7 +476,7 @@ pub struct FitConfig {
     /// Formula-path latent topology selector descriptor. The selector itself
     /// fits candidates through the ordinary workflow; this slot lets callers
     /// request and validate that path from the same config registry.
-    pub topology_auto_selector: Option<crate::topology_selector::TopologyAutoSelector>,
+    pub topology_auto_selector: Option<gam_solve::topology_selector::TopologyAutoSelector>,
     /// `gamfit.fit(..., smooths={...})` Python kwarg routed through the FFI
     /// bridge. JSON object keyed by formula symbol (single column name or
     /// comma-joined tuple) → smooth descriptor (`{"kind": "duchon",

@@ -14,7 +14,7 @@ fn build_term_collection_design_inner(
     // [intercept | linear | random_effects | smooth].
     let (smooth_raw_result, (random_blocks_result, linear_block_result)) = rayon::join(
         || {
-            let mut ws = crate::basis::BasisWorkspace::new();
+            let mut ws = gam_terms::basis::BasisWorkspace::new();
             build_smooth_design_withworkspace_unvalidated(data, &spec.smooth_terms, &mut ws)
         },
         || {
@@ -254,7 +254,7 @@ fn build_term_collection_design_inner(
     }
 
     if smooth.penaltyinfo.len() != smooth.penalties.len() {
-        crate::bail_invalid_basis!(
+        gam_problem::bail_invalid_basis!(
             "smooth penalty metadata mismatch: penalties={}, metadata={}",
             smooth.penalties.len(),
             smooth.penaltyinfo.len()
@@ -402,15 +402,15 @@ fn smooth_basis_has_one_sided_anchored_bspline(basis: &SmoothBasisSpec) -> bool 
 }
 
 fn bspline_conditions_have_one_sided_anchor(
-    conditions: &crate::basis::BSplineBoundaryConditions,
+    conditions: &gam_terms::basis::BSplineBoundaryConditions,
 ) -> bool {
     let left_anchored = matches!(
         conditions.left,
-        crate::basis::BSplineEndpointBoundaryCondition::Anchored { .. }
+        gam_terms::basis::BSplineEndpointBoundaryCondition::Anchored { .. }
     );
     let right_anchored = matches!(
         conditions.right,
-        crate::basis::BSplineEndpointBoundaryCondition::Anchored { .. }
+        gam_terms::basis::BSplineEndpointBoundaryCondition::Anchored { .. }
     );
     left_anchored != right_anchored
 }
@@ -586,7 +586,7 @@ fn apply_global_smooth_identifiability(
     // This yields a deterministic hierarchical decomposition: lower-order smooths
     // own their subspaces, and broader smooths fit only the residual structure.
     if smoothspecs.len() != smooth.terms.len() {
-        crate::bail_dim_basis!(
+        gam_problem::bail_dim_basis!(
             "smooth spec count ({}) does not match built term count ({})",
             smoothspecs.len(),
             smooth.terms.len()
@@ -713,7 +713,7 @@ fn apply_global_smooth_identifiability(
             };
         let z_opt = if let Some(z) = replay_z {
             if design_local.ncols() != z.nrows() {
-                crate::bail_dim_basis!(
+                gam_problem::bail_dim_basis!(
                     "frozen global-orthogonality transform mismatch for term '{}': rebuilt design has {} columns but the persisted fit-time transform has {} rows",
                     term.name,
                     design_local.ncols(),
@@ -755,7 +755,7 @@ fn apply_global_smooth_identifiability(
             const ORTHOGONALITY_REL_RESIDUAL_TOL: f64 = 1e-8;
             let tol = ORTHOGONALITY_REL_RESIDUAL_TOL;
             if rel > tol {
-                crate::bail_invalid_basis!(
+                gam_problem::bail_invalid_basis!(
                     "smooth orthogonality residual too large for term '{}': {:.3e} > {:.1e}",
                     term.name,
                     rel,
@@ -771,7 +771,7 @@ fn apply_global_smooth_identifiability(
             .cloned()
             .collect::<Vec<_>>();
         if active_penaltyinfo.len() != term.penalties_local.len() {
-            crate::bail_invalid_basis!(
+            gam_problem::bail_invalid_basis!(
                 "internal penalty metadata mismatch for term '{}': activeinfos={}, penalties={}",
                 term.name,
                 active_penaltyinfo.len(),
@@ -880,7 +880,7 @@ fn apply_global_smooth_identifiability(
                 // projector spans only that block's null space, then embed back
                 // into the term-local `q×q` frame at the same offset.
                 let block = s_full.slice(s![*plo..*phi, *plo..*phi]).to_owned();
-                let rebuilt_block = crate::basis::build_nullspace_shrinkage_penalty(&block)?
+                let rebuilt_block = gam_terms::basis::build_nullspace_shrinkage_penalty(&block)?
                     .map(|shrink| shrink.sym_penalty);
                 match rebuilt_block {
                     Some(ridge_block) => {
@@ -992,7 +992,7 @@ fn apply_global_smooth_identifiability(
             .filter(|info| info.active)
             .collect::<Vec<_>>();
         if activeinfos.len() != local_penalties[idx].len() {
-            crate::bail_invalid_basis!(
+            gam_problem::bail_invalid_basis!(
                 "internal penalty info mismatch for term '{}': activeinfos={}, penalties={}",
                 smooth.terms[idx].name,
                 activeinfos.len(),
@@ -1154,7 +1154,7 @@ fn build_parametric_constraint_block_for_term(
     // factor main effect), not against the global `[1 | overlapping axes]`.
     if let Some((by_col, value_bits)) = factor_by_level_gate(termspec) {
         if by_col >= p_data {
-            crate::bail_dim_basis!(
+            gam_problem::bail_dim_basis!(
                 "factor-by smooth term '{}' by column {by_col} out of bounds for {p_data} columns",
                 termspec.name
             );
@@ -1173,7 +1173,7 @@ fn build_parametric_constraint_block_for_term(
     let mut parametric_cols = smooth_intrinsic_parametric_feature_cols(linear_terms, termspec);
     for &feature_col in &parametric_cols {
         if feature_col >= p_data {
-            crate::bail_dim_basis!(
+            gam_problem::bail_dim_basis!(
                 "smooth term feature column {feature_col} out of bounds for {p_data} columns"
             );
         }
@@ -1183,7 +1183,7 @@ fn build_parametric_constraint_block_for_term(
         .filter(|linear| feature_cols.contains(&linear.feature_col))
     {
         if linear.feature_col >= p_data {
-            crate::bail_dim_basis!(
+            gam_problem::bail_dim_basis!(
                 "linear term '{}' feature column {} out of bounds for {} columns",
                 linear.name,
                 linear.feature_col,
@@ -1295,7 +1295,7 @@ fn maybe_smooth_identifiability_transform(
         spatial_identifiability_policy(termspec)
     {
         if design_local.ncols() != transform.nrows() {
-            crate::bail_dim_basis!(
+            gam_problem::bail_dim_basis!(
                 "frozen spatial identifiability transform mismatch: design has {} columns but transform has {} rows",
                 design_local.ncols(),
                 transform.nrows()
@@ -1411,8 +1411,8 @@ fn smooth_requires_parametric_orthogonality(termspec: &SmoothTermSpec) -> bool {
         // through this post-build transform would also renormalize away the
         // harmonic engine's physical spectral penalty scale.
         SmoothBasisSpec::Sphere { spec, .. } => {
-            matches!(spec.method, crate::basis::SphereMethod::Wahba)
-                && !matches!(spec.wahba_kernel, crate::basis::SphereWahbaKernel::Pseudo)
+            matches!(spec.method, gam_terms::basis::SphereMethod::Wahba)
+                && !matches!(spec.wahba_kernel, gam_terms::basis::SphereWahbaKernel::Pseudo)
                 && matches!(
                     spec.identifiability,
                     SphericalSplineIdentifiability::CenterSumToZero
@@ -1687,7 +1687,7 @@ fn with_identifiability_transform(
             // caller that reaches this arm with a transform fails at fit time
             // rather than corrupting the saved coefficient chart.
             if transform.is_some() {
-                crate::bail_invalid_basis!(
+                gam_problem::bail_invalid_basis!(
                     "FactorSmooth metadata cannot absorb an identifiability transform; \
                      route it through the term-level frozen_global_orthogonality carrier"
                 );
@@ -1718,7 +1718,7 @@ fn with_identifiability_transform(
             // themselves), so the caller cannot meaningfully attach a
             // post-hoc Z transform here.
             if transform.is_some() {
-                crate::bail_invalid_basis!(
+                gam_problem::bail_invalid_basis!(
                     "PCA bases do not expose a composable identifiability transform"
                 );
             }
@@ -1782,7 +1782,7 @@ pub fn fit_term_collection_with_coefficient_groups(
     let mut grouped_options = base_fit_opts.clone();
     grouped_options.rho_prior = realized.rho_prior;
     let fitted = FittedTermCollection {
-        fit: crate::estimate::fit_gam_with_penalty_specs(
+        fit: gam_solve::estimate::fit_gam_with_penalty_specs(
             design.design.clone(),
             y,
             weights,
@@ -1898,7 +1898,7 @@ pub fn fit_term_collection_with_coefficient_groups_and_penalty_block_gamma_prior
     let mut grouped_options = base_fit_opts.clone();
     grouped_options.rho_prior = realized.rho_prior;
     let fitted = FittedTermCollection {
-        fit: crate::estimate::fit_gam_with_penalty_specs(
+        fit: gam_solve::estimate::fit_gam_with_penalty_specs(
             design.design.clone(),
             y,
             weights,
@@ -2994,7 +2994,7 @@ fn extract_spatial_operator_runtime_caches(
                         (None, _) => None,
                     };
                     let ops =
-                        crate::basis::build_duchon_collocation_operator_matriceswithworkspace(
+                        gam_terms::basis::build_duchon_collocation_operator_matriceswithworkspace(
                             centers.view(),
                             collocation_points.view(),
                             None,
@@ -3446,8 +3446,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     initial_theta[at + 2] = eps_c_init.max(adaptive_opts.min_epsilon).ln();
 
     let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
-    let zero_psi_op: std::sync::Arc<dyn crate::custom_family::CustomFamilyPsiDerivativeOperator> =
-        std::sync::Arc::new(crate::custom_family::ZeroPsiDerivativeOperator::new(
+    let zero_psi_op: std::sync::Arc<dyn gam_solve::custom_family::CustomFamilyPsiDerivativeOperator> =
+        std::sync::Arc::new(gam_solve::custom_family::ZeroPsiDerivativeOperator::new(
             baseline.design.design.nrows(),
             baseline.design.design.ncols(),
         ));
@@ -3585,7 +3585,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         ..BlockwiseFitOptions::default()
     };
 
-    use crate::solver::rho_optimizer::OuterProblem;
+    use gam_solve::rho_optimizer::OuterProblem;
     use gam_problem::{DeclaredHessianForm, Derivative, HessianResult, OuterEval};
 
     struct SpatialAdaptiveOuterState {
@@ -3640,14 +3640,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         (rho, adaptive_params)
     };
     let analytic_outer_hessian_available =
-        crate::custom_family::joint_exact_analytic_outer_hessian_available()
+        gam_solve::custom_family::joint_exact_analytic_outer_hessian_available()
             && base_family
                 .exact_outer_derivative_order(std::slice::from_ref(&blockspec), &outer_opts)
                 .has_hessian()
-            && crate::custom_family::exact_newton_outer_geometry_supports_second_order_solver(
+            && gam_solve::custom_family::exact_newton_outer_geometry_supports_second_order_solver(
                 &base_family,
             );
-    let outer_max_iter = crate::custom_family::cost_gated_first_order_max_iter(
+    let outer_max_iter = gam_solve::custom_family::cost_gated_first_order_max_iter(
         options.max_iter,
         base_family.coefficient_gradient_cost(std::slice::from_ref(&blockspec)),
         analytic_outer_hessian_available,
@@ -3671,7 +3671,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         } else {
             DeclaredHessianForm::Unavailable
         })
-        .with_fallback_policy(crate::solver::rho_optimizer::FallbackPolicy::Disabled)
+        .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Disabled)
         .with_psi_dim(n_theta.saturating_sub(rho_dim))
         .with_tolerance(options.tol)
         .with_max_iter(outer_max_iter)
@@ -3686,7 +3686,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
 
     let eval_outer = |st: &mut SpatialAdaptiveOuterState,
                       theta: &Array1<f64>,
-                      order: crate::solver::rho_optimizer::OuterEvalOrder|
+                      order: gam_solve::rho_optimizer::OuterEvalOrder|
      -> Result<OuterEval, EstimationError> {
         let theta = clamp_theta(theta);
 
@@ -3699,7 +3699,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 .all(|(&a, &b)| (a - b).abs() <= 1e-12)
             && (!matches!(
                 order,
-                crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
+                gam_solve::rho_optimizer::OuterEvalOrder::ValueGradientHessian
             ) || analytic_outer_hessian_available)
         {
             st.warm_cache = Some(cached_warm.clone());
@@ -3708,7 +3708,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 gradient: cached_grad.clone(),
                 hessian: if matches!(
                     order,
-                    crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
+                    gam_solve::rho_optimizer::OuterEvalOrder::ValueGradientHessian
                 ) && analytic_outer_hessian_available
                 {
                     cached_hess.clone()
@@ -3723,7 +3723,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         let family_eval = base_family.with_adaptive_params(adaptive_params, zero_quadratic.clone());
         let need_hessian = matches!(
             order,
-            crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
+            gam_solve::rho_optimizer::OuterEvalOrder::ValueGradientHessian
         ) && analytic_outer_hessian_available;
         let result = evaluate_custom_family_joint_hyper(
             &family_eval,
@@ -3733,9 +3733,9 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
             &derivative_blocks,
             st.warm_cache.as_ref(),
             if need_hessian {
-                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
+                gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueGradientHessian
             } else {
-                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient
+                gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueAndGradient
             },
         )
         .map_err(|e| {
@@ -3811,7 +3811,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 &rho,
                 &derivative_blocks,
                 st.warm_cache.as_ref(),
-                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
+                gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
             )
             .map_err(|e| {
                 EstimationError::RemlOptimizationFailed(format!(
@@ -3832,15 +3832,15 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 st,
                 theta,
                 if analytic_outer_hessian_available {
-                    crate::solver::rho_optimizer::OuterEvalOrder::ValueGradientHessian
+                    gam_solve::rho_optimizer::OuterEvalOrder::ValueGradientHessian
                 } else {
-                    crate::solver::rho_optimizer::OuterEvalOrder::ValueAndGradient
+                    gam_solve::rho_optimizer::OuterEvalOrder::ValueAndGradient
                 },
             )
         },
         |st: &mut SpatialAdaptiveOuterState,
          theta: &Array1<f64>,
-         order: crate::solver::rho_optimizer::OuterEvalOrder| {
+         order: gam_solve::rho_optimizer::OuterEvalOrder| {
             eval_outer(st, theta, order)
         },
         Some(|st: &mut SpatialAdaptiveOuterState| {
@@ -3897,7 +3897,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 &rho,
                 &derivative_blocks,
                 st.warm_cache.as_ref(),
-                crate::solver::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
+                gam_solve::estimate::reml::reml_outer_engine::EvalMode::ValueOnly,
             )
             .map_err(|e| {
                 EstimationError::RemlOptimizationFailed(format!(
@@ -4213,7 +4213,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                     out
                 },
                 reparam_qs: None,
-                dispersion: crate::estimate::Dispersion::Known(1.0),
+                dispersion: gam_solve::estimate::Dispersion::Known(1.0),
                 beta_covariance: beta_covariance
                     .clone()
                     .map(gam_problem::dispersion_cov::PhiScaledCovariance::from),
@@ -4225,19 +4225,19 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 weighted_gram: None,
                 bias_correction_beta: None,
             };
-            let geometry = Some(crate::estimate::FitGeometry {
+            let geometry = Some(gam_solve::estimate::FitGeometry {
                 penalized_hessian: penalized_hessian.into(),
                 working_weights: inf.working_weights.clone(),
                 working_response: inf.working_response.clone(),
             });
             let covariance_conditional = beta_covariance;
             let pirls_status_val = if final_fit.outer_converged {
-                crate::pirls::PirlsStatus::Converged
+                gam_solve::pirls::PirlsStatus::Converged
             } else {
-                crate::pirls::PirlsStatus::StalledAtValidMinimum
+                gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
             };
             UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
-                blocks: vec![crate::estimate::FittedBlock {
+                blocks: vec![gam_solve::estimate::FittedBlock {
                     beta: beta.clone(),
                     role: gam_problem::BlockRole::Mean,
                     edf: edf_total,
@@ -4268,7 +4268,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 pirls_status: pirls_status_val,
                 max_abs_eta,
                 constraint_kkt: None,
-                artifacts: crate::estimate::FitArtifacts {
+                artifacts: gam_solve::estimate::FitArtifacts {
                     pirls: None,
                     ..Default::default()
                 },
@@ -4325,7 +4325,7 @@ fn relax_smoothing_rho_prior(
     options: &FitOptions,
     design: &TermCollectionDesign,
 ) -> gam_spec::RhoPrior {
-    use crate::basis::BasisMetadata;
+    use gam_terms::basis::BasisMetadata;
     let base = &options.rho_prior;
     // Only a single scalar prior that actually caps log-λ needs relaxing;
     // `Flat` already imposes no cap and `Independent` is assumed caller-built.
@@ -4461,7 +4461,7 @@ fn relax_smoothing_rho_prior(
             // shape-constrained term needs the cap KEPT, exactly the
             // under-determined case this gate protects. (Unconstrained #1266/#1271
             // selection terms still relax.)
-            && matches!(t.shape, crate::smooth::ShapeConstraint::None)
+            && matches!(t.shape, gam_terms::smooth::ShapeConstraint::None)
         })
         .map(|t| t.name.as_str())
         .collect();
@@ -4650,7 +4650,7 @@ const NULLSPACE_WELLDET_DEGENERACY_RHO_SD: f64 = 15.0;
 /// NOT to bias selection.
 ///
 /// The post-convergence #1266 null-space shrink-out escape in the outer
-/// optimizer ([`crate::solver::estimate::optimizer`]) keys on this predicate to
+/// optimizer ([`gam_solve::estimate::optimizer`]) keys on this predicate to
 /// recognise EXACTLY those coordinates: their symmetric conditioning prior also
 /// (wrongly) opposes the genuine REML shrink-out tail of an *unsupported* term,
 /// so the optimizer's converged λ_null must be re-selected by pure data-REML.
@@ -6402,7 +6402,7 @@ fn expect_single_block_state<'a>(
     block_states: &'a [ParameterBlockState],
     family_name: &str,
 ) -> Result<&'a ParameterBlockState, String> {
-    crate::families::block_layout::block_count::validate_block_count::<SmoothError>(
+    crate::block_layout::block_count::validate_block_count::<SmoothError>(
         family_name,
         1,
         block_states.len(),
@@ -7254,7 +7254,7 @@ fn fit_bounded_term_collection_with_design(
     let cov_scale = glm_likelihood
         .coefficient_covariance_scale(standard_deviation * standard_deviation)
         .max(f64::MIN_POSITIVE);
-    let dispersion = crate::estimate::dispersion_from_likelihood(&glm_likelihood, standard_deviation);
+    let dispersion = gam_solve::estimate::dispersion_from_likelihood(&glm_likelihood, standard_deviation);
     // Apply the dispersion scale to the unscaled inverse, producing the reported
     // `Vb = cov_scale · H_user⁻¹` and its diagonal standard errors. The stored
     // `penalized_hessian` stays UNSCALED (`H_user`) per the dispersion-ownership
@@ -7270,7 +7270,7 @@ fn fit_bounded_term_collection_with_design(
         .as_ref()
         .map(|cov| Array1::from_iter((0..cov.nrows()).map(|i| cov[[i, i]].max(0.0).sqrt())));
 
-    let geometry = Some(crate::estimate::FitGeometry {
+    let geometry = Some(gam_solve::estimate::FitGeometry {
         penalized_hessian: penalized_hessian.clone().into(),
         working_weights: eta_state.fisherweight.clone(),
         working_response: {
@@ -7321,12 +7321,12 @@ fn fit_bounded_term_collection_with_design(
             };
             let covariance_conditional = beta_covariance;
             let pirls_status_val = if fit.outer_converged {
-                crate::pirls::PirlsStatus::Converged
+                gam_solve::pirls::PirlsStatus::Converged
             } else {
-                crate::pirls::PirlsStatus::StalledAtValidMinimum
+                gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
             };
             UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
-                blocks: vec![crate::estimate::FittedBlock {
+                blocks: vec![gam_solve::estimate::FittedBlock {
                     beta: beta_user.clone(),
                     role: gam_problem::BlockRole::Mean,
                     edf: edf_total,
@@ -7351,13 +7351,13 @@ fn fit_bounded_term_collection_with_design(
                 covariance_conditional,
                 covariance_corrected: None,
                 inference: Some(inf),
-                fitted_link: crate::estimate::FittedLinkState::Standard(None),
+                fitted_link: gam_solve::estimate::FittedLinkState::Standard(None),
                 geometry,
                 block_states: Vec::new(),
                 pirls_status: pirls_status_val,
                 max_abs_eta,
                 constraint_kkt: None,
-                artifacts: crate::estimate::FitArtifacts {
+                artifacts: gam_solve::estimate::FitArtifacts {
                     pirls: None,
                     ..Default::default()
                 },
@@ -7932,13 +7932,13 @@ fn external_opts_for_design(
 /// running the full outer smoothing loop. The returned tuple is
 /// `(cost, gradient, hessian)` in the joint [ρ, ψ] space.
 fn evaluate_joint_reml_outer_eval_at_theta(
-    evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+    evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>,
     design: &TermCollectionDesign,
     theta: &Array1<f64>,
     rho_dim: usize,
-    hyper_dirs: Vec<crate::estimate::reml::DirectionalHyperParam>,
+    hyper_dirs: Vec<gam_solve::estimate::reml::DirectionalHyperParam>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
-    order: crate::solver::rho_optimizer::OuterEvalOrder,
+    order: gam_solve::rho_optimizer::OuterEvalOrder,
     design_revision: Option<u64>,
 ) -> Result<
     (
@@ -7964,11 +7964,11 @@ fn evaluate_joint_reml_outer_eval_at_theta(
 }
 
 fn evaluate_joint_reml_efs_at_theta(
-    evaluator: &mut crate::estimate::ExternalJointHyperEvaluator<'_>,
+    evaluator: &mut gam_solve::estimate::ExternalJointHyperEvaluator<'_>,
     design: &TermCollectionDesign,
     theta: &Array1<f64>,
     rho_dim: usize,
-    hyper_dirs: Vec<crate::estimate::reml::DirectionalHyperParam>,
+    hyper_dirs: Vec<gam_solve::estimate::reml::DirectionalHyperParam>,
     warm_start_beta: Option<ArrayView1<'_, f64>>,
     design_revision: Option<u64>,
 ) -> Result<gam_problem::EfsEval, EstimationError> {
