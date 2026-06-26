@@ -140,7 +140,10 @@ pub mod report;
 /// so the public `gam::rho_uncertainty` path is preserved.
 pub use gam_solve::rho_uncertainty;
 pub use gam_solve as solver;
-pub use gam_terms as terms;
+pub mod terms {
+    pub use gam_terms::*;
+    pub use gam_sae as sae;
+}
 /// Shared test-support helpers (FD harness, fixtures, reference-tool + CLI
 /// harnesses) carved into the `gam-test-support` crate under #1521 so the
 /// workspace's other crates can reach them cross-crate. Re-exported here as

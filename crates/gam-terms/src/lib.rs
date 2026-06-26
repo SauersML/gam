@@ -54,6 +54,9 @@ pub mod smooth_overrides;
 pub mod structure;
 pub mod term_builder;
 
+#[path = "smooth/torch_dispatch.rs"]
+pub mod torch_dispatch;
+
 pub mod terms {
     pub use crate::*;
 }
