@@ -1933,6 +1933,139 @@ fn cli_fit_saves_covariance_so_default_binomial_predict_succeeds() {
     }
 }
 
+/// Build a standard (non-survival, non-location-scale) binomial `FitArgs` for the
+/// given formula, writing the model to `out`. Shared by the parameterized-link
+/// cap-guard regression tests below.
+fn binomial_link_fit_args(data: PathBuf, out: PathBuf, formula: &str) -> FitArgs {
+    FitArgs {
+        data,
+        formula_positional: formula.to_string(),
+        predict_noise: None,
+        logslope_formula: None,
+        z_column: None,
+        weights_column: None,
+        offset_column: None,
+        noise_offset_column: None,
+        frailty_kind: None,
+        frailty_sd: None,
+        hazard_loading: None,
+        transformation_normal: false,
+        firth: false,
+        family: FamilyArg::Auto,
+        negative_binomial_theta: None,
+        survival_likelihood: "transformation".to_string(),
+        survival_time_anchor: None,
+        baseline_target: "linear".to_string(),
+        baseline_scale: None,
+        baseline_shape: None,
+        baseline_rate: None,
+        baseline_makeham: None,
+        time_basis: "ispline".to_string(),
+        time_degree: 3,
+        time_num_internal_knots: 8,
+        time_smooth_lambda: 1e-2,
+        ridge_lambda: 1e-6,
+        threshold_time_k: None,
+        threshold_time_degree: 3,
+        sigma_time_k: None,
+        sigma_time_degree: 3,
+        adaptive_regularization: false,
+        scale_dimensions: false,
+        pilot_subsample_threshold: 0,
+        out: Some(out),
+    }
+}
+
+/// Regression for #1571: a binomial `s(x) + link(type=sas)` fit through the CLI
+/// fit path must not abort with "Lambda count mismatch".
+///
+/// The sinh-arcsinh link optimizes its two parameters (ε, log δ) jointly with the
+/// smoothing log-λ in one augmented outer vector θ = [ρ_smooth (k) | ε, log δ].
+/// On realistic data the outer-aware inner-PIRLS schedule lifts its iteration cap
+/// during the search, which fires the post-convergence cap guard
+/// (`run_outer_inner_cap_guard`). That guard used to forward the FULL augmented θ
+/// to `compute_cost`, which exponentiates the whole vector into the penalty λ
+/// vector — handing `k + 2` "lambdas" to the `k`-penalty reparameterizer and
+/// faulting. The fix routes θ through `apply_link_theta` first (installing the
+/// converged link state and slicing the smoothing-only ρ block), exactly as the
+/// outer evaluator and the accept-fit already do.
+///
+/// Data is the committed n≈2000 binomial fixture, large enough to drive the
+/// schedule into lifting the cap so the guard actually runs.
+#[test]
+fn cli_binomial_sas_link_fit_survives_outer_inner_cap_guard() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/bug_hunt_sas_link_cap_guard.csv");
+    assert!(
+        fixture.exists(),
+        "missing committed fixture: {}",
+        fixture.display()
+    );
+    let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let model_path = td.path().join("model.json");
+
+    let fit_args =
+        binomial_link_fit_args(fixture, model_path.clone(), "y ~ s(x) + link(type=sas)");
+    let result = run_fit(fit_args);
+    if let Err(e) = &result {
+        let msg = format!("{e:?}");
+        assert!(
+            !msg.contains("Lambda count mismatch"),
+            "SAS cap-guard regression (#1571): augmented θ leaked into compute_cost: {msg}"
+        );
+        panic!("binomial s(x) + link(type=sas) fit should succeed, got: {msg}");
+    }
+
+    // The fit must have persisted a usable model.
+    let saved = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted SAS model", e));
+    assert!(
+        saved.fit_result.is_some(),
+        "SAS fit should persist a fit result"
+    );
+}
+
+/// Regression for #1571 from a different angle: a PARAMETRIC-ONLY binomial
+/// `x + link(type=beta-logistic)` fit (0 penalty blocks, 2 link parameters) must
+/// also survive the shared `MixtureSas` cap guard. Here the augmented θ is the
+/// pure link block [ε, log δ] with k = 0, so the pre-fix guard faulted with
+/// "expected 0 lambdas for 0 penalties, got 2" — the same leak, the opposite
+/// extreme (no smoothing block at all), through a different parameterized link.
+#[test]
+fn cli_binomial_beta_logistic_parametric_fit_survives_outer_inner_cap_guard() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/bug_hunt_sas_link_cap_guard.csv");
+    assert!(
+        fixture.exists(),
+        "missing committed fixture: {}",
+        fixture.display()
+    );
+    let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let model_path = td.path().join("model.json");
+
+    let fit_args = binomial_link_fit_args(
+        fixture,
+        model_path.clone(),
+        "y ~ x + link(type=beta-logistic)",
+    );
+    let result = run_fit(fit_args);
+    if let Err(e) = &result {
+        let msg = format!("{e:?}");
+        assert!(
+            !msg.contains("Lambda count mismatch"),
+            "beta-logistic cap-guard regression (#1571): augmented θ leaked into compute_cost: {msg}"
+        );
+        panic!("binomial x + link(type=beta-logistic) fit should succeed, got: {msg}");
+    }
+
+    let saved = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted beta-logistic model", e));
+    assert!(
+        saved.fit_result.is_some(),
+        "beta-logistic fit should persist a fit result"
+    );
+}
+
 #[test]
 fn cli_firth_fit_saves_covariance_so_default_binomial_predict_succeeds() {
     let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
