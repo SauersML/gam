@@ -16,6 +16,7 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 mod macros;
 
 pub mod basis_error;
+pub mod block_count_error;
 pub mod block_role;
 pub mod block_spec;
 pub mod coefficient_prior_mean;
@@ -42,6 +43,7 @@ mod pseudo_logdet;
 pub mod psi_design_contract;
 pub mod psi_terms;
 pub mod riemannian_retraction;
+pub mod row_measure;
 pub mod row_metric;
 pub mod schedule;
 mod seeding;
@@ -49,6 +51,7 @@ pub mod solver_contract;
 pub mod types;
 
 pub use riemannian_retraction::LatentRetractionRegistry;
+pub use row_measure::RowSubsampleMask;
 
 mod gpu {
     pub(crate) mod linalg_dispatch {
@@ -74,6 +77,7 @@ mod gpu {
 }
 
 pub use basis_error::BasisError;
+pub use block_count_error::BlockCountMismatch;
 pub use block_role::BlockRole;
 pub use block_spec::{
     AdditiveBlockJacobian, BlockEffectiveJacobian, BlockGeometryDirectionalDerivative,

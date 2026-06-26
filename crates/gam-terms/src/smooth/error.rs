@@ -9,7 +9,7 @@
 //! `Result<_, String>`; typed `Err(...)` values flow through
 //! `From<SmoothError> for String` at those boundaries via `.into()`.
 
-use crate::families::block_layout::block_count::BlockCountMismatch;
+use gam_problem::BlockCountMismatch;
 
 /// Typed errors emitted by smooth-term helpers in the `smooth` module.
 #[derive(Clone, Debug)]

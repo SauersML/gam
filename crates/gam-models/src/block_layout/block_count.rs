@@ -17,37 +17,11 @@
 ///
 /// This is the neutral carrier produced by [`validate_block_count`]; each
 /// module converts it into its own error type via `From<BlockCountMismatch>`.
-pub struct BlockCountMismatch {
-    /// Human-readable family / term name used as the message prefix.
-    pub family: String,
-    /// Number of parameter blocks the family requires.
-    pub expected: usize,
-    /// Number of parameter blocks that were actually supplied.
-    pub got: usize,
-}
-
-impl BlockCountMismatch {
-    /// The canonical arity-mismatch message, e.g.
-    /// `"FooFamily expects 2 blocks, got 1"` (plural) or
-    /// `"BarFamily expects 1 block, got 0"` (singular when `expected == 1`).
-    pub fn message(&self) -> String {
-        let unit = if self.expected == 1 {
-            "block"
-        } else {
-            "blocks"
-        };
-        format!(
-            "{} expects {} {unit}, got {}",
-            self.family, self.expected, self.got
-        )
-    }
-}
-
-impl From<BlockCountMismatch> for String {
-    fn from(err: BlockCountMismatch) -> String {
-        err.message()
-    }
-}
+///
+/// The type itself has descended to `gam-problem` so lower tiers can route
+/// their error enums through `From<BlockCountMismatch>` without depending on
+/// `gam-models`; it is re-exported here unchanged.
+pub use gam_problem::BlockCountMismatch;
 
 /// Reject any `got` block count that does not exactly equal `expected`.
 ///

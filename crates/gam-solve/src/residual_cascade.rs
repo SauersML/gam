@@ -1,7 +1,7 @@
 //! Multiresolution residual cascade for scattered 2-3D smooths at huge n
 //! (compute-first primitive #3, #1032; siblings: the 1-D scan in
 //! [`crate::spline_scan`], the 2-D grid in
-//! [`crate::grid_spline_2d`]).
+//! [`gam_terms::grid_spline_2d`]).
 //!
 //! Model. In metric-scaled coordinates `z = diag(metric)·x` the smooth is
 //!   `f(z) = P(z)'γ + Σ_l Σ_j c_{l,j} · φ((z − ξ_{l,j})/δ_l)`,
@@ -93,7 +93,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::grid_spline_2d::{chol_solve, cholesky_logdet};
+use gam_terms::grid_spline_2d::{chol_solve, cholesky_logdet};
 
 /// Bump support radius as a multiple of the level's covering radius:
 /// `δ_l = OVERLAP·h_l`. Separation ≥ h_l caps the bumps covering a point at

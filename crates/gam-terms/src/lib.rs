@@ -44,6 +44,7 @@ pub mod construction;
 pub mod decoders;
 pub mod dictionary;
 pub mod geometry;
+pub mod grid_spline_2d;
 pub mod inference;
 pub mod kronecker;
 pub mod latent;

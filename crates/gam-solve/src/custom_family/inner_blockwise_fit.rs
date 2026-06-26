@@ -5,6 +5,7 @@
 
 use super::*;
 use super::blockwise_solve::BlockWorkingSetUpdaterExt;
+use crate::row_measure::RowSubsampleMaskExt;
 
 pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,

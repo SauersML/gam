@@ -71,7 +71,7 @@ fn cache_digest_builder(namespace: &str) -> Fingerprinter {
 }
 
 #[derive(Clone)]
-pub(crate) enum LatentBasisKind {
+pub enum LatentBasisKind {
     // Basis/evaluator family for Phi(t); the per-row latent values live in LatentCoordValues.
     Matern {
         centers: Array2<f64>,
@@ -255,7 +255,7 @@ impl LatentBasisKind {
     }
 }
 
-pub(crate) fn pca_center_mean_fingerprint(mean: &Array1<f64>) -> u64 {
+pub fn pca_center_mean_fingerprint(mean: &Array1<f64>) -> u64 {
     let mut hasher = Fingerprinter::new();
     hasher.write_usize(mean.len());
     for &value in mean.iter() {
