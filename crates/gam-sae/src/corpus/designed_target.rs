@@ -37,7 +37,7 @@ use ndarray::Array2;
 use super::object_store::designed_sampling_mandatory;
 use super::shard_reader::CorpusRowSource;
 use crate::inference::harvest::TieredHarvest;
-use crate::inference::row_measure::{MeasureProvenance, RowSamplingMeasure};
+use gam_solve::row_sampling_measure::{MeasureProvenance, RowSamplingMeasure};
 
 /// Default designed-sample budget once [`designed_sampling_mandatory`] fires.
 /// Auto-derived policy, not a knob: 2·10⁶ rows is comfortably in-memory at any

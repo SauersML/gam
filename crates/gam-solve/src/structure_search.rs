@@ -33,7 +33,7 @@
 //! thresholds are invalid (the null sits on the boundary of the alternative;
 //! the new atom's parameters vanish under the null). Acceptance here is
 //! therefore routed through the universal-inference e-process gates of
-//! [`crate::inference::structure_evidence`]:
+//! [`gam_terms::inference::structure_evidence`]:
 //!
 //! * **Birth / fission / fusion** each assert structure BEYOND what the
 //!   current dictionary class expresses, so each runs an [`AtomBirthGate`]
@@ -70,7 +70,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-use crate::inference::structure_evidence::{
+use gam_terms::inference::structure_evidence::{
     ClaimKind, GateVerdict, StructureLedger, run_atom_birth_gate,
 };
 

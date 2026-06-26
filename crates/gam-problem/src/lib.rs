@@ -41,11 +41,14 @@ pub mod penalty_matrix;
 mod pseudo_logdet;
 pub mod psi_design_contract;
 pub mod psi_terms;
+pub mod riemannian_retraction;
 pub mod row_metric;
 pub mod schedule;
 mod seeding;
 pub mod solver_contract;
 pub mod types;
+
+pub use riemannian_retraction::LatentRetractionRegistry;
 
 mod gpu {
     pub(crate) mod linalg_dispatch {

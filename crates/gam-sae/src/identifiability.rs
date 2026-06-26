@@ -51,7 +51,7 @@ use crate::inference::layer_transport::{ChartTopology, TransportLadderReport, tr
 use crate::inference::probe_runner::{ProbeRunner, RealizedProbe};
 use crate::inference::riesz::{RieszInput, SmoothFunctional, debias_with_dense_hessian};
 use gam_problem::{MetricProvenance, RowMetric};
-use crate::inference::structure_evidence::{StructureCertificate, StructureLedger};
+use gam_terms::inference::structure_evidence::{StructureCertificate, StructureLedger};
 use gam_linalg::faer_ndarray::{
     FaerCholesky, FaerEigh, FaerQr, FaerSvd, default_rrqr_rank_alpha, rrqr_with_permutation,
 };
@@ -903,7 +903,7 @@ pub struct FittedAtom {
 /// channel linearly, so the normal-equation weight is its square), and
 /// dispersion the fitted reconstruction dispersion. That is an ordinary
 /// penalized WLS smooth — exactly what [`crate::inference::riesz`],
-/// [`crate::inference::lawley`], and the κ-profile machinery consume. The
+/// [`gam_terms::inference::lawley`], and the κ-profile machinery consume. The
 /// channel `j` is the atom's dominant decoder output direction (largest column
 /// norm of `B_k`), i.e. the channel that carries the atom's signal.
 #[derive(Debug, Clone)]
@@ -1013,7 +1013,7 @@ pub struct AtomFunctionalEstimate {
 
 /// Any-n-valid structure evidence that one atom's inner smooth `h_k(t)` is
 /// genuinely non-constant (#1103): the same split-likelihood-ratio e-value the
-/// atom-birth gate uses ([`crate::inference::structure_evidence`]), under the
+/// atom-birth gate uses ([`gam_terms::inference::structure_evidence`]), under the
 /// null H0 = "the atom's decoder curve is constant in its latent coordinate".
 ///
 /// This replaces the earlier Lawley–Bartlett-corrected χ² test. That correction
@@ -2657,7 +2657,7 @@ pub struct DictionaryReport {
     /// What cannot be distinguished in principle ([`residual_gauge`]).
     pub gauge: ResidualGaugeReport,
     /// What the data established
-    /// ([`crate::inference::structure_evidence::StructureLedger::certify`]).
+    /// ([`gam_terms::inference::structure_evidence::StructureLedger::certify`]).
     pub structure: StructureCertificate,
     /// Per-atom inter-layer transport ladders (#1096). Empty when the caller
     /// has not supplied at least one atom's canonical coordinates across two or
@@ -2796,7 +2796,7 @@ fn atom_functional_report(fit: &AtomInnerFit) -> AtomFunctionalReport {
 /// "the smooth is constant": only the intercept column 0 is free.
 ///
 /// We compute the universal-inference e-value the atom-birth gate
-/// ([`crate::inference::structure_evidence::split_likelihood_log_e_value`]) uses:
+/// ([`gam_terms::inference::structure_evidence::split_likelihood_log_e_value`]) uses:
 ///
 /// * Split the active rows deterministically into an ESTIMATION fold (even
 ///   index) and an EVALUATION fold (odd index).
@@ -2906,7 +2906,7 @@ fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance
     }
     let log_lik_alt = -0.5 * sse_alt / phi;
     let log_lik_null_sup = -0.5 * sse_null / phi;
-    let log_e = crate::inference::structure_evidence::split_likelihood_log_e_value(
+    let log_e = gam_terms::inference::structure_evidence::split_likelihood_log_e_value(
         log_lik_alt,
         log_lik_null_sup,
     );
@@ -2989,7 +2989,7 @@ pub fn dictionary_report(
 /// it selects the contested claim furthest from certification, realizes candidate
 /// latent moves of its atom through `crate::inference::steering::steer_delta`,
 /// and routes their doses through
-/// `crate::inference::structure_evidence::plan_probe_for_contested_claim` to pick
+/// `gam_terms::inference::structure_evidence::plan_probe_for_contested_claim` to pick
 /// the most discriminating one. The returned
 /// [`crate::inference::probe_runner::RealizedProbe`] carries both the experiment
 /// plan and the chosen intervention's on-manifold activation delta with its

@@ -57,8 +57,8 @@
 //! Euclidean — which is precisely the uniform-measure degeneracy we want.
 
 use gam_problem::{MetricProvenance, RowMetric};
-use crate::linalg::faer_ndarray::{FaerEigh, FaerSvd};
-use crate::linalg::utils::splitmix64_hash;
+use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
+use gam_linalg::utils::splitmix64_hash;
 use faer::Side;
 use ndarray::{Array2, ArrayView2};
 

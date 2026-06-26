@@ -33,7 +33,7 @@
 //!    defect `d(t) = h_ac(t) ⊖ h_bc(h_ab(t))` (circular difference on circle
 //!    charts) is evaluated on a grid, studentized by the composed
 //!    delta-method bands, and tested with the existing
-//!    [`wood_smooth_test`](crate::inference::smooth_test::wood_smooth_test)
+//!    [`wood_smooth_test`](gam_terms::inference::smooth_test::wood_smooth_test)
 //!    machinery applied to a REML smooth of the defect.
 //!
 //! # Gauge discipline
@@ -58,14 +58,14 @@
 //! circular domains, and the open B-spline basis with the standard difference
 //! penalty on interval domains — constructed directly, not via the string DSL.
 
-use crate::faer_ndarray::FaerEigh;
-use crate::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
-use crate::terms::basis::{
+use gam_linalg::faer_ndarray::FaerEigh;
+use gam_terms::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
+use gam_terms::basis::{
     BasisOptions, Dense, KnotSource, PeriodicBSplineBasisSpec, build_periodic_bspline_basis_1d,
     create_basis, create_cyclic_difference_penalty_matrix, create_difference_penalty_matrix,
     periodic_bspline_first_derivative_nd,
 };
-use crate::terms::sae::chart_canonicalization::CanonicalChartTopology;
+use crate::chart_canonicalization::CanonicalChartTopology;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, Axis};
 use statrs::distribution::{ContinuousCDF, Normal};

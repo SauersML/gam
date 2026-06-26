@@ -38,7 +38,7 @@
 //! claim's history and restart its e-process from 1, which is exactly the
 //! optional-stopping abuse the ledger exists to prevent.
 
-use crate::inference::structure_evidence::StructureLedger;
+use gam_terms::inference::structure_evidence::StructureLedger;
 use gam_terms::smooth::TermCollectionSpec;
 use gam_runtime::warm_start::store::{EntryKind, StoreOptions, WarmStartStore};
 use gam_runtime::warm_start::{Fingerprint, Fingerprinter};
@@ -169,7 +169,7 @@ pub fn deserialize_ledger(bytes: &[u8]) -> Result<StructureLedger, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::structure_evidence::ClaimKind;
+    use gam_terms::inference::structure_evidence::ClaimKind;
 
     /// The canonical payload round-trips with evidence intact — the
     /// resume contract at the encoding layer (the disk tier underneath is

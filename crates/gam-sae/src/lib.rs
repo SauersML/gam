@@ -12,6 +12,7 @@ pub mod gpu_kernels;
 pub mod frames;
 pub mod hybrid_split;
 pub mod identifiability;
+pub mod inference;
 pub mod k_selection;
 pub mod manifold;
 pub mod row_jet_program;

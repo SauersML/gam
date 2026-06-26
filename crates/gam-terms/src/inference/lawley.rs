@@ -86,8 +86,8 @@
 
 use ndarray::{Array1, Array2, ArrayView2};
 
-use crate::linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
-use crate::linalg::matrix::FactorizedSystem;
+use gam_linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
+use gam_linalg::matrix::FactorizedSystem;
 use faer::Side;
 
 /// Order-2 jet (value, first, second η-derivative) product.
@@ -687,7 +687,7 @@ pub fn lawley_lr_bartlett_factor_with_rho_variation(
 /// `None` for pairs whose cumulant jets are not derived yet — the consumer
 /// then reports first-order inference only (#939).
 pub fn known_scale_expected_jets(
-    family: &crate::types::LikelihoodSpec,
+    family: &gam_spec::LikelihoodSpec,
     eta: f64,
 ) -> Option<RowExpectedJets> {
     known_scale_expected_jets_with_dispersion(family, eta, 1.0)
@@ -701,11 +701,11 @@ pub fn known_scale_expected_jets(
 /// [`known_scale_expected_jets`]; the per-term LR Bartlett path (#1063) needs it
 /// for the estimated-scale Gaussian/Gamma families whose ε depends on φ.
 pub fn known_scale_expected_jets_with_dispersion(
-    family: &crate::types::LikelihoodSpec,
+    family: &gam_spec::LikelihoodSpec,
     eta: f64,
     dispersion: f64,
 ) -> Option<RowExpectedJets> {
-    use crate::types::{InverseLink, ResponseFamily, StandardLink};
+    use gam_spec::{InverseLink, ResponseFamily, StandardLink};
     match (&family.response, &family.link) {
         (ResponseFamily::Poisson, InverseLink::Standard(StandardLink::Log)) => {
             Some(RowExpectedJets::poisson_log(eta))

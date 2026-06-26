@@ -922,7 +922,7 @@ impl MultinomialSavedModel {
 
     /// Wood (2013) rank-truncated Wald smooth-significance test per
     /// `(active class, smooth term)` (#1101), reusing the exact scalar-summary
-    /// kernel [`crate::inference::smooth_test::wood_smooth_test`]. For active
+    /// kernel [`gam_terms::inference::smooth_test::wood_smooth_test`]. For active
     /// class `a` and term span `[c0, c1)` within the class block, the global
     /// coefficient range is `a·P + c0 .. a·P + c1`; the joint covariance and
     /// influence are sliced there. The term EDF is the influence-block trace
@@ -972,8 +972,8 @@ impl MultinomialSavedModel {
                     .map(|f| (start..end).map(|i| f[[i, i]]).sum::<f64>())
                     .filter(|v| v.is_finite() && *v > 0.0)
                     .unwrap_or(block_len);
-                let result = crate::inference::smooth_test::wood_smooth_test(
-                    crate::inference::smooth_test::SmoothTestInput {
+                let result = gam_terms::inference::smooth_test::wood_smooth_test(
+                    gam_terms::inference::smooth_test::SmoothTestInput {
                         beta: theta.view(),
                         covariance: &cov,
                         influence_matrix: influence.as_ref(),
@@ -981,7 +981,7 @@ impl MultinomialSavedModel {
                         edf,
                         nullspace_dim: span.nullspace_dim,
                         residual_df: f64::INFINITY,
-                        scale: crate::inference::smooth_test::SmoothTestScale::Known,
+                        scale: gam_terms::inference::smooth_test::SmoothTestScale::Known,
                     },
                 );
                 if let Some(res) = result {

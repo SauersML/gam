@@ -2444,7 +2444,7 @@ pub struct StandardLatentCoordConfig {
     pub feature_cols: Vec<usize>,
     pub manifold: crate::latent::LatentManifold,
     pub manifold_auto: bool,
-    pub retraction_registry: crate::solver::latent_cache::LatentRetractionRegistry,
+    pub retraction_registry: gam_problem::LatentRetractionRegistry,
     pub analytic_penalties: Option<std::sync::Arc<crate::AnalyticPenaltyRegistry>>,
 }
 

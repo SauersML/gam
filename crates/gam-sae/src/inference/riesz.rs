@@ -1,6 +1,6 @@
-use crate::faer_ndarray::FaerCholesky;
-use crate::model_types::EstimationError;
-use crate::solver::sensitivity::FitSensitivity;
+use gam_linalg::faer_ndarray::FaerCholesky;
+use gam_solve::model_types::EstimationError;
+use gam_solve::sensitivity::FitSensitivity;
 use faer::Side;
 use ndarray::{Array1, ArrayView1, ArrayView2};
 
@@ -57,7 +57,7 @@ impl<'a> SmoothFunctional<'a> {
         match self {
             Self::PointEvaluation { design_row } => {
                 if design_row.is_empty() || design_row.iter().any(|value| !value.is_finite()) {
-                    crate::bail_invalid_estim!(
+                    gam_problem::bail_invalid_estim!(
                         "Riesz point-evaluation functional requires a finite non-empty design row"
                     );
                 }
@@ -77,7 +77,7 @@ impl<'a> SmoothFunctional<'a> {
             } => weighted_row_mean(*value_design, *weights, "average-value"),
             Self::Linear { gradient } => {
                 if gradient.is_empty() || gradient.iter().any(|value| !value.is_finite()) {
-                    crate::bail_invalid_estim!(
+                    gam_problem::bail_invalid_estim!(
                         "Riesz linear functional requires a finite non-empty gradient"
                     );
                 }
@@ -123,7 +123,7 @@ pub fn debias_with_sensitivity(
     validate_input(input)?;
     let p = input.beta.len();
     if sensitivity.dim() != p {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "Riesz sensitivity dimension {} must equal beta length {p}",
             sensitivity.dim()
         );
@@ -132,7 +132,7 @@ pub fn debias_with_sensitivity(
     let g = input.functional_gradient.to_owned();
     let coefficients = sensitivity.apply(&g);
     if coefficients.iter().any(|value| !value.is_finite()) {
-        crate::bail_invalid_estim!("Riesz H^-1 gradient solve produced non-finite values");
+        gam_problem::bail_invalid_estim!("Riesz H^-1 gradient solve produced non-finite values");
     }
 
     let theta_plugin = g.dot(&input.beta);
@@ -149,7 +149,7 @@ pub fn debias_with_sensitivity(
         || !se.is_finite()
         || !penalty_bias.is_finite()
     {
-        crate::bail_invalid_estim!("Riesz debiasing produced non-finite estimate");
+        gam_problem::bail_invalid_estim!("Riesz debiasing produced non-finite estimate");
     }
 
     Ok(RieszDebiasReport {
@@ -179,7 +179,7 @@ pub fn contrast_gradient(
     design_row_b: ArrayView1<'_, f64>,
 ) -> Result<Array1<f64>, EstimationError> {
     if design_row_a.is_empty() || design_row_a.len() != design_row_b.len() {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "Riesz contrast functional requires two non-empty design rows of equal length, got {} and {}",
             design_row_a.len(),
             design_row_b.len()
@@ -188,7 +188,7 @@ pub fn contrast_gradient(
     if design_row_a.iter().any(|value| !value.is_finite())
         || design_row_b.iter().any(|value| !value.is_finite())
     {
-        crate::bail_invalid_estim!("Riesz contrast functional requires finite design rows");
+        gam_problem::bail_invalid_estim!("Riesz contrast functional requires finite design rows");
     }
     Ok(&design_row_a.to_owned() - &design_row_b)
 }
@@ -201,12 +201,12 @@ fn weighted_row_mean(
     let n = rows.nrows();
     let p = rows.ncols();
     if n == 0 || p == 0 {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "Riesz {what} functional requires non-empty basis rows, got {n}x{p}"
         );
     }
     if rows.iter().any(|value| !value.is_finite()) {
-        crate::bail_invalid_estim!("Riesz {what} functional requires finite basis rows");
+        gam_problem::bail_invalid_estim!("Riesz {what} functional requires finite basis rows");
     }
 
     let mut gradient = Array1::<f64>::zeros(p);
@@ -221,14 +221,14 @@ fn weighted_row_mean(
         }
         Some(w) => {
             if w.len() != n || w.iter().any(|value| !value.is_finite()) {
-                crate::bail_invalid_estim!(
+                gam_problem::bail_invalid_estim!(
                     "Riesz {what} weights must be finite with length {n}, got {}",
                     w.len()
                 );
             }
             let weight_sum = w.sum();
             if !(weight_sum.is_finite() && weight_sum > 0.0) {
-                crate::bail_invalid_estim!("Riesz {what} weights must have positive finite sum");
+                gam_problem::bail_invalid_estim!("Riesz {what} weights must have positive finite sum");
             }
             for row_idx in 0..n {
                 let scale = w[row_idx] / weight_sum;
@@ -245,7 +245,7 @@ fn validate_input(input: &RieszInput<'_>) -> Result<(), EstimationError> {
     let p = input.beta.len();
     let n = input.row_scores.nrows();
     if p == 0 || n == 0 {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "Riesz input requires non-empty beta and row scores, got beta length {p}, row count {n}"
         );
     }
@@ -253,7 +253,7 @@ fn validate_input(input: &RieszInput<'_>) -> Result<(), EstimationError> {
         || input.row_scores.ncols() != p
         || input.penalty_beta.len() != p
     {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "Riesz input dimension mismatch: beta={p}, gradient={}, row_scores={}x{}, penalty_beta={}",
             input.functional_gradient.len(),
             input.row_scores.nrows(),
@@ -263,7 +263,7 @@ fn validate_input(input: &RieszInput<'_>) -> Result<(), EstimationError> {
     }
     if let Some(leverage) = input.leverage {
         if leverage.len() != n || leverage.iter().any(|value| !value.is_finite()) {
-            crate::bail_invalid_estim!(
+            gam_problem::bail_invalid_estim!(
                 "Riesz leverage must be finite with length {n}, got {}",
                 leverage.len()
             );
@@ -274,7 +274,7 @@ fn validate_input(input: &RieszInput<'_>) -> Result<(), EstimationError> {
         // check below, and `h_ii ≥ 1` is a structurally singular removal).
         for (row_idx, &h_ii) in leverage.iter().enumerate() {
             if !(0.0..1.0).contains(&h_ii) {
-                crate::bail_invalid_estim!(
+                gam_problem::bail_invalid_estim!(
                     "Riesz leverage must lie in [0, 1) for own-observation removal; row {row_idx} has {h_ii}"
                 );
             }
@@ -288,7 +288,7 @@ fn validate_input(input: &RieszInput<'_>) -> Result<(), EstimationError> {
         || input.row_scores.iter().any(|value| !value.is_finite())
         || input.penalty_beta.iter().any(|value| !value.is_finite())
     {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "Riesz input requires finite beta, gradient, row scores, and penalty gradient"
         );
     }
@@ -300,14 +300,14 @@ fn validate_square_hessian(
     p: usize,
 ) -> Result<(), EstimationError> {
     if penalized_hessian.nrows() != p || penalized_hessian.ncols() != p {
-        crate::bail_invalid_estim!(
+        gam_problem::bail_invalid_estim!(
             "Riesz penalized Hessian must be {p}x{p}, got {}x{}",
             penalized_hessian.nrows(),
             penalized_hessian.ncols()
         );
     }
     if penalized_hessian.iter().any(|value| !value.is_finite()) {
-        crate::bail_invalid_estim!("Riesz penalized Hessian must be finite");
+        gam_problem::bail_invalid_estim!("Riesz penalized Hessian must be finite");
     }
     Ok(())
 }
@@ -329,7 +329,7 @@ fn influence_values(
                 // value here means a near-1 leverage that makes the removal
                 // singular.
                 if !denom.is_finite() || denom <= f64::EPSILON {
-                    crate::bail_invalid_estim!(
+                    gam_problem::bail_invalid_estim!(
                         "Riesz own-observation removal is singular at row {row_idx}: leverage={}",
                         leverage[row_idx]
                     );
@@ -339,7 +339,7 @@ fn influence_values(
         };
     }
     if influence.iter().any(|value| !value.is_finite()) {
-        crate::bail_invalid_estim!("Riesz influence values must be finite");
+        gam_problem::bail_invalid_estim!("Riesz influence values must be finite");
     }
     Ok(influence)
 }
@@ -352,7 +352,7 @@ fn centered(values: &Array1<f64>) -> Array1<f64> {
 fn plugin_standard_error(centered_influence: &Array1<f64>) -> Result<f64, EstimationError> {
     let n = centered_influence.len();
     if n < 2 {
-        crate::bail_invalid_estim!("Riesz plug-in SE requires at least two observations");
+        gam_problem::bail_invalid_estim!("Riesz plug-in SE requires at least two observations");
     }
     let variance = centered_influence.dot(centered_influence) / (n - 1) as f64;
     Ok(variance.sqrt() / (n as f64).sqrt())

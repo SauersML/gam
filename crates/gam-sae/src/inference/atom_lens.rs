@@ -1,5 +1,5 @@
 //! Two-score per-atom **lens** (#980, amended): an *additive* per-atom report on
-//! a fitted [`SaeManifoldTerm`](crate::terms::sae::manifold::SaeManifoldTerm).
+//! a fitted [`SaeManifoldTerm`](crate::manifold::SaeManifoldTerm).
 //!
 //! # The amendment this file encodes
 //!
@@ -52,7 +52,7 @@
 use ndarray::{ArrayView1, ArrayView2};
 
 use gam_problem::{MetricProvenance, RowMetric};
-use crate::terms::sae::manifold::SaeManifoldTerm;
+use crate::manifold::SaeManifoldTerm;
 
 /// Below this active mass a row is not "truly active" for an atom, so it
 /// contributes to neither the presence average nor the coupling average. The
@@ -65,7 +65,7 @@ pub const SAE_TRUST_ACTIVE_MASS_FLOOR: f64 = 1e-6;
 /// One atom's lens entry.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AtomLensEntry {
-    /// The atom's name (mirrors [`crate::terms::sae::manifold::SaeManifoldAtom::name`]).
+    /// The atom's name (mirrors [`crate::manifold::SaeManifoldAtom::name`]).
     pub name: String,
     /// **presence** (representational, activation-side, Fisher-free): mean active
     /// mass on truly-active rows × amplitude-weighted decoder norm. Always

@@ -45,7 +45,7 @@ use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::inference::residual_factor::{ResidualFactorInput, StructuredResidualModel};
-use crate::inference::structure_evidence::{ClaimKind, StructureLedger};
+use gam_terms::inference::structure_evidence::{ClaimKind, StructureLedger};
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::structure_search::{
     CollapseAction, MoveBudget, MoveProposal, SearchLedger, SearchOutcome, StructureMove, search,
@@ -1496,7 +1496,7 @@ fn born_atom(
 /// predictable-plugin e-process streams the shards: shard `k` is evaluated under
 /// a candidate that has not yet seen its rows, then folded into the estimation
 /// set (un-masked) for shard `k+1` — exactly the contract
-/// [`run_atom_birth_gate`](crate::inference::structure_evidence::run_atom_birth_gate)
+/// [`run_atom_birth_gate`](gam_terms::inference::structure_evidence::run_atom_birth_gate)
 /// guarantees the call order of.
 #[derive(Clone, Debug)]
 pub struct RowBlockShard {
@@ -2559,7 +2559,7 @@ mod tests {
         let run = || {
             let (term, rho) = planted_term(&active);
             let target = Array2::<f64>::zeros((n, term.output_dim()));
-            let mut ledger = crate::inference::structure_evidence::StructureLedger::new();
+            let mut ledger = gam_terms::inference::structure_evidence::StructureLedger::new();
             let budget = MoveBudget {
                 max_moves: 4,
                 alpha: 0.05,

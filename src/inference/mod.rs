@@ -7,10 +7,10 @@
 pub use crate::data;
 
 pub mod alo;
-pub mod atom_lens;
+pub use gam_sae::inference::atom_lens;
 pub mod certificate_impls;
 pub mod certificates;
-pub mod checkpoint_dynamics;
+pub use gam_sae::inference::checkpoint_dynamics;
 pub use gam_problem::diagnostics;
 pub use gam_problem::dispersion_cov;
 pub mod fisher_rao;
@@ -18,15 +18,15 @@ pub mod formula_dsl;
 pub mod full_conformal;
 pub mod functionals;
 pub mod generative;
-pub mod harvest;
-pub mod higher_order;
+pub use gam_sae::inference::harvest;
+pub use gam_terms::inference::higher_order;
 pub mod hmc_io;
 // `hmc_io` is the post-rename home of the NUTS/HMC engine that integration
 // tests and downstream callers still reach as `inference::hmc`. Keep that path
 // resolvable alongside the crate-root `gam::hmc` alias.
 pub use hmc_io as hmc;
-pub mod lawley;
-pub mod layer_transport;
+pub use gam_terms::inference::lawley;
+pub use gam_sae::inference::layer_transport;
 pub mod model;
 pub mod model_comparison;
 pub mod model_payload_builders;
@@ -40,16 +40,16 @@ pub mod predict_io;
 #[cfg(test)]
 mod marginal_slope_predict_tests;
 pub mod probability;
-pub mod probe_runner;
+pub use gam_sae::inference::probe_runner;
 pub mod quadrature;
 pub mod residual_factor;
 pub mod rho_posterior;
-pub mod riesz;
-pub mod row_measure;
+pub use gam_sae::inference::riesz;
+pub use gam_solve::row_sampling_measure as row_measure;
 pub mod row_metric;
 pub mod sample;
 pub mod skovgaard;
-pub mod smooth_test;
-pub mod steering;
-pub mod structure_evidence;
+pub use gam_terms::inference::smooth_test;
+pub use gam_sae::inference::steering;
+pub use gam_terms::inference::structure_evidence;
 pub mod truncated_gaussian;

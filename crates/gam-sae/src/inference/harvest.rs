@@ -44,7 +44,7 @@
 //! from the tier — the same #973 honesty discipline, applied to the metric's
 //! estimation roles instead of the likelihood.
 
-use crate::inference::row_measure::{RowSamplingMeasure, per_row_fisher_mass};
+use gam_solve::row_sampling_measure::{RowSamplingMeasure, per_row_fisher_mass};
 use gam_problem::{MetricProvenance, RowMetric};
 
 /// The Fisher-bearing tier: which corpus rows carry factors, and the metric
@@ -67,7 +67,7 @@ struct FisherTier {
 ///
 /// This object owns the corpus↔tier index mapping and the graceful-absence
 /// semantics; it deliberately does **not** own activations (those stream
-/// through [`crate::terms::sae::corpus`]) — it is the metric side of the
+/// through [`crate::corpus`]) — it is the metric side of the
 /// harvest, keyed by the same stable row ids.
 pub struct TieredHarvest {
     /// Total corpus rows (tier 1).
@@ -265,7 +265,7 @@ impl TieredHarvest {
         &self,
         budget: usize,
         seed: u64,
-    ) -> crate::inference::row_measure::DesignedRowSample {
+    ) -> gam_solve::row_sampling_measure::DesignedRowSample {
         self.corpus_measure().designed_subsample(budget, seed)
     }
 }
@@ -273,7 +273,7 @@ impl TieredHarvest {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::row_measure::MeasureProvenance;
+    use gam_solve::row_sampling_measure::MeasureProvenance;
     use ndarray::Array2;
     use std::sync::Arc;
 

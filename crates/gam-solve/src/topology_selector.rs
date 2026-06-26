@@ -35,7 +35,7 @@
 //! exist only during the race; it is not retained for the saved-model
 //! prediction path. That OOS-retention package is out of scope here.
 
-use crate::inference::row_measure::CoresetCertificate;
+use crate::row_sampling_measure::CoresetCertificate;
 use crate::evidence::{
     GaussianMixtureConfig, StackingConfig, StackingWeights, TopologyScoreScale,
     UNION_STRUCTURE_LADDER, UnionStructure, UnionStructureFit, fit_gaussian_mixture,

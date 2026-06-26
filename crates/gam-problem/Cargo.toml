@@ -12,6 +12,7 @@ path = "src/lib.rs"
 
 [dependencies]
 faer = "0.24.0"
+gam-geometry = { path = "../gam-geometry", version = "=0.3.124" }
 gam-linalg = { path = "../gam-linalg", version = "=0.3.124" }
 gam-spec = { path = "../gam-spec", version = "=0.3.124" }
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }

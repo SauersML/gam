@@ -17,7 +17,7 @@
 //!   the "layer" axis: [`fit_transport_map`] aligns the atom's latent chart
 //!   across consecutive checkpoints (topology compatibility, isometry defect,
 //!   winding degree), packaged as a [`LayerTransportReport`].
-//! * [`crate::inference::structure_evidence`] — each consecutive-step contrast
+//! * [`gam_terms::inference::structure_evidence`] — each consecutive-step contrast
 //!   feeds one anytime-valid e-value (the studentized displacement mapped to a
 //!   two-sided p-value and run through the frozen κ = ½ p→e calibrator) into a
 //!   per-step [`StructureLedger`] claim under the null "the atom did not change
@@ -46,7 +46,7 @@ use crate::inference::layer_transport::{ChartTopology, LayerTransportReport, fit
 use crate::inference::riesz::{
     RieszDebiasReport, RieszInput, SmoothFunctional, debias_with_dense_hessian,
 };
-use crate::inference::structure_evidence::{ClaimKind, StructureLedger, log_e_from_p_calibrator};
+use gam_terms::inference::structure_evidence::{ClaimKind, StructureLedger, log_e_from_p_calibrator};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView4};
 use statrs::distribution::{ContinuousCDF, Normal};
 

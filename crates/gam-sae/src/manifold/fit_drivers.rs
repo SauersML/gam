@@ -2656,10 +2656,10 @@ impl SaeManifoldTerm {
     /// Row visitation order for the discovery/seeding pass, drawn from the
     /// per-row Fisher-mass enrichment measure (#980, role (c)).
     ///
-    /// Builds [`RowSamplingMeasure::from_metric`](crate::inference::row_measure::RowSamplingMeasure::from_metric)
+    /// Builds [`RowSamplingMeasure::from_metric`](gam_solve::row_sampling_measure::RowSamplingMeasure::from_metric)
     /// from the term's installed [`RowMetric`] (Euclidean fallback when none is
     /// installed), draws a length-`n` systematic-resampling
-    /// [`enrichment_order`](crate::inference::row_measure::RowSamplingMeasure::enrichment_order),
+    /// [`enrichment_order`](gam_solve::row_sampling_measure::RowSamplingMeasure::enrichment_order),
     /// and reduces it to a first-seen unique permutation. Behaviorally-live rows
     /// (high Fisher mass) appear earliest; any row the measure never named is
     /// appended in index order so **every** row is still visited exactly once.
@@ -2687,7 +2687,7 @@ impl SaeManifoldTerm {
             // the order is attention-only and must never gate the seed.
             Err(_) => return (0..n).collect(),
         };
-        let measure = crate::inference::row_measure::RowSamplingMeasure::from_metric(&metric);
+        let measure = gam_solve::row_sampling_measure::RowSamplingMeasure::from_metric(&metric);
         // Seed the deterministic systematic-resampling draw from the row count so
         // the ordering is reproducible across runs (no clock randomness).
         let drawn = measure.enrichment_order(n, n as u64);

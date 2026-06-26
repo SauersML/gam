@@ -12,7 +12,7 @@
 //! penalty even the one-parameter statistic becomes `(n / (n + λ))χ²₁` rather
 //! than a central χ²/F reference target.
 
-use crate::faer_ndarray::FaerEigh;
+use gam_linalg::faer_ndarray::FaerEigh;
 use ndarray::{Array1, Array2, ArrayView1, s};
 use statrs::distribution::{ChiSquared, ContinuousCDF, FisherSnedecor};
 use std::ops::Range;

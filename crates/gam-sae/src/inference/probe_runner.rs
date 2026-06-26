@@ -1,6 +1,6 @@
 //! `ProbeRunner` — the closed loop between the steering primitive
 //! ([`crate::inference::steering`]) and the anytime-valid structure-evidence
-//! ledger ([`crate::inference::structure_evidence`]).
+//! ledger ([`gam_terms::inference::structure_evidence`]).
 //!
 //! Both halves are implemented and tested in isolation; nothing wired them into
 //! a runnable experiment loop. This is that bridge. The evidence module decides
@@ -31,14 +31,14 @@ use ndarray::array;
 
 use gam_problem::RowMetric;
 use crate::inference::steering::{SteerPlan, steer_delta};
-use crate::inference::structure_evidence::{
+use gam_terms::inference::structure_evidence::{
     CandidateProbe, ClaimKind, ProbePlan, StructureLedger, plan_probe_for_contested_claim,
 };
-use crate::terms::sae::manifold::SaeManifoldTerm;
+use crate::manifold::SaeManifoldTerm;
 
 /// The level the contested-claim selection and budget are computed at. Fixed so
 /// a probe can never be shopped across α after seeing the evidence (mirrors
-/// [`crate::inference::structure_evidence::AtomBirthGate`]'s construction-time α).
+/// [`gam_terms::inference::structure_evidence::AtomBirthGate`]'s construction-time α).
 const PROBE_DESIGN_ALPHA: f64 = 0.05;
 
 /// Latent step length each candidate probe moves the contested atom by, per

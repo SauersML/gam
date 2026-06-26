@@ -164,3 +164,68 @@ impl Retraction for RetractionKind {
         }
     }
 }
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LatentRetractionRegistry {
+    block: Option<RetractionKind>,
+}
+
+impl LatentRetractionRegistry {
+    pub fn all_euclidean() -> Self {
+        Self { block: None }
+    }
+
+    pub fn new(block: RetractionKind) -> Self {
+        if block.is_euclidean() {
+            Self::all_euclidean()
+        } else {
+            Self { block: Some(block) }
+        }
+    }
+
+    pub fn is_all_euclidean(&self) -> bool {
+        self.block.is_none()
+    }
+
+    pub(crate) fn ambient_dim(&self, fallback_dim: usize) -> usize {
+        self.block
+            .as_ref()
+            .map_or(fallback_dim, RetractionKind::ambient_dim)
+    }
+
+    pub fn metric_weights(&self, fallback_dim: usize) -> Vec<f64> {
+        self.block
+            .as_ref()
+            .map_or_else(|| vec![1.0; fallback_dim], RetractionKind::metric_weights)
+    }
+
+    /// Per-ambient-axis periodicity for the override retraction, falling back
+    /// to all-non-periodic (`None`) of length `fallback_dim` when no override
+    /// is installed.
+    pub fn axis_periods(&self, fallback_dim: usize) -> Vec<Option<f64>> {
+        self.block
+            .as_ref()
+            .map_or_else(|| vec![None; fallback_dim], RetractionKind::axis_periods)
+    }
+
+    pub fn validate_dim(&self, latent_dim: usize, context: &str) -> Result<(), String> {
+        let dim = self.ambient_dim(latent_dim);
+        if dim != latent_dim {
+            return Err(format!(
+                "{context} retraction ambient dimension {dim} does not match latent d={latent_dim}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn retract(&self, base: &mut ArrayViewMut1<f64>, tangent: ArrayView1<f64>) {
+        assert_eq!(base.len(), tangent.len());
+        if let Some(block) = self.block.as_ref() {
+            block.retract(base, tangent);
+        } else {
+            for (value, delta) in base.iter_mut().zip(tangent.iter()) {
+                *value += *delta;
+            }
+        }
+    }
+}
