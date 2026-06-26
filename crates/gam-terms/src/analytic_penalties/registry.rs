@@ -156,31 +156,14 @@ macro_rules! define_analytic_penalty_kind {
     };
 }
 
-#[macro_export]
-macro_rules! analytic_penalty_registry {
-    ($macro:ident) => {
-        $macro! {
-            register!(Isometry, IsometryPenalty);
-            register!(Sparsity, SparsityPenalty);
-            register!(SoftmaxAssignmentSparsity, SoftmaxAssignmentSparsityPenalty);
-            register!(IBPAssignment, IBPAssignmentPenalty);
-            register!(Ard, ARDPenalty);
-            register!(TopKActivation, TopKActivationPenalty);
-            register!(JumpReLU, JumpReLUPenalty);
-            register!(TotalVariation, TotalVariationPenalty);
-            register!(NuclearNorm, NuclearNormPenalty);
-            register!(BlockSparsity, BlockSparsityPenalty);
-            register!(MechanismSparsity, MechanismSparsityPenalty);
-            register!(RowPrecisionPrior, RowPrecisionPriorPenalty);
-            register!(IvaeRidgeMeanGauge, IvaeRidgeMeanGauge);
-            register!(ParametricRowPrecisionPrior, ParametricRowPrecisionPriorPenalty);
-            register!(ScadMcp, ScadMcpPenalty);
-            register!(BlockOrthogonality, BlockOrthogonalityPenalty);
-            register!(Orthogonality, OrthogonalityPenalty);
-        }
-    };
-}
-
+// The single source of truth for the penalty registry list is the
+// `analytic_penalty_registry!` macro re-used (via the `manifest` module's
+// `#[path]` include) from `src/terms/analytic_penalties/manifest.rs`, which the
+// root `gam` crate also consumes. Defining a second `#[macro_export]` copy here
+// both collided in the crate-root macro namespace (E0428) and silently dropped
+// four penalty kinds (Monotonicity, NestedPrefix, DecoderIncoherence,
+// SheafConsistency) that the `AnalyticPenaltyKind` consumers below still match
+// on — expand the canonical list so every registered variant is generated.
 crate::analytic_penalty_registry!(define_analytic_penalty_kind);
 
 impl AnalyticPenaltyKind {
