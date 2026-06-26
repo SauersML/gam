@@ -36,6 +36,8 @@ pub mod polya_gamma;
 pub mod polya_gamma_core;
 pub mod posterior;
 pub mod predict_io;
+#[cfg(test)]
+mod marginal_slope_predict_tests;
 pub mod probability;
 pub mod probe_runner;
 pub mod quadrature;
