@@ -3,6 +3,7 @@ pub mod block_layout;
 pub mod bms;
 pub mod cell_moment_family;
 pub(crate) mod coefficient_cost;
+pub mod gpu_kernels;
 pub mod cubic_cell_kernel;
 pub mod custom_family;
 pub mod family_runtime;

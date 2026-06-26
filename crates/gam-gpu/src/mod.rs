@@ -1,11 +1,11 @@
-//! GPU acceleration support.
-//!
-//! Infrastructure modules live at this level and are intentionally callable
-//! from CPU-only builds: all public entry points are available without CUDA,
-//! and the runtime reports an unavailable backend instead of changing
-//! numerical results. CUDA-specific code is compiled only for Linux builds that
-//! enable the `cuda` feature, so cudarc is never loaded by default CPU-only
-//! builds.
+// GPU acceleration support.
+//
+// Infrastructure modules live at this level and are intentionally callable
+// from CPU-only builds: all public entry points are available without CUDA,
+// and the runtime reports an unavailable backend instead of changing
+// numerical results. CUDA-specific code is compiled only for Linux builds that
+// enable the `cuda` feature, so cudarc is never loaded by default CPU-only
+// builds.
 
 pub mod backend_probe;
 pub mod blas;

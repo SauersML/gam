@@ -767,7 +767,7 @@ pub fn reml_laml_evaluate(
         // ── Block 2.5: GPU-adaptive Hutchinson bypass.
         //
         // When the gate fires we replace the CPU stochastic estimator with
-        // the device-resident path in `gpu::kernels::reml_trace::evidence_traces_adaptive`,
+        // the device-resident path in `gam_gpu::gpu_kernels::reml_trace::evidence_traces_adaptive`,
         // which factors `H` once on device (potrf), then for an adaptive
         // K-schedule (16→32→64→128) solves `H W = Z` in one batched potrs
         // and reduces `q_{j,k} = z_k^T H_j w_k` on device. CRN is preserved
@@ -777,7 +777,7 @@ pub fn reml_laml_evaluate(
         //     matrix, so each `H_j` can be packed as
         //     `DerivativeHessian::Dense(...)` without re-walking penalty
         //     operators on device.
-        //   * `gpu::kernels::reml_trace::should_bypass_cpu_with_gpu_adaptive(...)`
+        //   * `gam_gpu::gpu_kernels::reml_trace::should_bypass_cpu_with_gpu_adaptive(...)`
         //     — `p ≥ 512`, plain SPD logdet kernel, dense backend, projected
         //     penalty subspace inactive.
         // Both must hold; otherwise we fall through to the existing CPU

@@ -7,6 +7,7 @@ pub mod certificates;
 pub mod chart_canonicalization;
 pub mod corpus;
 pub mod criterion_atoms;
+pub mod gpu_kernels;
 pub mod encode;
 pub mod frames;
 pub mod hybrid_split;

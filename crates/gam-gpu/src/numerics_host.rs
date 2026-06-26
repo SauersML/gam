@@ -21,6 +21,6 @@
 /// differences `log cdf` and cancels the erfc bias) break against itself
 /// at the ~2e-7 floor instead of the genuine 5-point-stencil truncation
 /// floor near 1e-12.
-pub(crate) fn erfc(x: f64) -> f64 {
+pub fn erfc(x: f64) -> f64 {
     libm::erfc(x)
 }

@@ -8,6 +8,7 @@ pub mod fit_orchestration;
 pub mod gauge;
 pub mod gaussian_reml;
 pub mod glm_sufficient_lane;
+pub mod gpu_kernels;
 pub mod gpu;
 pub mod grid_spline_2d;
 pub mod inner_status;

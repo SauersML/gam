@@ -60,7 +60,7 @@ use gam_linalg::faer_ndarray::{
     default_rrqr_rank_alpha, fast_ata, fast_atb, rrqr_with_permutation,
 };
 use gam_linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
-use crate::solver::gauge::Gauge;
+use gam_problem::Gauge;
 
 enum BlockJacobianSource {
     Callback(Arc<dyn BlockEffectiveJacobian>),
@@ -1841,7 +1841,7 @@ mod tests {
     use super::*;
     use gam_problem::AdditiveBlockJacobian;
     use gam_linalg::matrix::DenseDesignMatrix;
-    use crate::test_support::spec_from_dense;
+    
     use ndarray::Array2;
 
     fn linspace(n: usize) -> ndarray::Array1<f64> {
@@ -3142,4 +3142,33 @@ mod tests {
             "threshold keeps exactly its `age` column after the intercept drop",
         );
     }
+}
+
+#[cfg(test)]
+fn spec_from_dense(name: &str, design: ndarray::Array2<f64>) -> ParameterBlockSpec {
+    let n = design.nrows();
+    ParameterBlockSpec {
+        name: name.to_string(),
+        design: DesignMatrix::Dense(DenseDesignMatrix::from(design)),
+        offset: ndarray::Array1::<f64>::zeros(n),
+        penalties: Vec::new(),
+        nullspace_dims: Vec::new(),
+        initial_log_lambdas: ndarray::Array1::<f64>::zeros(0),
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }
+}
+
+#[cfg(test)]
+fn spec_from_dense_with_priority(
+    name: &str,
+    design: ndarray::Array2<f64>,
+    priority: u8,
+) -> ParameterBlockSpec {
+    let mut spec = spec_from_dense(name, design);
+    spec.gauge_priority = priority;
+    spec
 }

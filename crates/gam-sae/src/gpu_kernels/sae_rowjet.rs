@@ -349,7 +349,7 @@ pub fn sae_row_jets_softmax(
 /// `H_tt[a][b] = Σ_c first[a][c]·first[b][c]` (the `⟨J_a, J_b⟩` block #932
 /// documents at `construction.rs:7588`). Returns one `K×K` row-major slab per
 /// row, flattened `[n_rows * K * K]` — exactly the `row_hessian_slabs` layout the
-/// resident workspace ([`crate::gpu_kernels::sae_resident::DeviceResidentArrowSlabs`])
+/// resident workspace ([`gam_solve::gpu_kernels::sae_resident::DeviceResidentArrowSlabs`])
 /// uploads, so a production resident bridge can feed these directly.
 ///
 /// This is the bit-exact CPU contraction of the channels [`sae_row_jets_softmax`]

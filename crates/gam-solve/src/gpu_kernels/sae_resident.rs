@@ -52,7 +52,7 @@ impl InnerSolveMode {
         }
     }
 }
-use crate::solver::arrow_schur::{ArrowSchurError, ArrowSchurSystem};
+use crate::arrow_schur::{ArrowSchurError, ArrowSchurSystem};
 
 /// SAE shape used by the resident inner-iteration workspace.
 ///
@@ -605,7 +605,7 @@ impl DeviceResidentArrowWorkspace {
             // Predicted reduction from the bare quadratic model on the residual
             // system, identical formula to the production trust-region ratio.
             let predicted_reduction =
-                crate::solver::arrow_schur::arrow_bare_quadratic_model_reduction(
+                crate::arrow_schur::arrow_bare_quadratic_model_reduction(
                     &residual,
                     solution.delta_t.view(),
                     solution.delta_beta.view(),
@@ -933,7 +933,7 @@ impl DeviceResidentArrowWorkspace {
             };
 
             let predicted_reduction =
-                crate::solver::arrow_schur::arrow_bare_quadratic_model_reduction(
+                crate::arrow_schur::arrow_bare_quadratic_model_reduction(
                     &residual,
                     solution.delta_t.view(),
                     solution.delta_beta.view(),
@@ -1109,7 +1109,7 @@ impl DeviceResidentArrowWorkspace {
 }
 
 /// Options for the device-resident inner Newton loop. Defaults mirror the
-/// production [`crate::solver::latent_inner::LatentInnerOptions`] trust-region
+/// production [`crate::latent_inner::LatentInnerOptions`] trust-region
 /// schedule so device and CPU paths run identical host-side control flow.
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceResidentInnerOptions {
@@ -1529,7 +1529,7 @@ where
         ) -> Result<DeviceResidentInnerOutcome, DeviceResidentArrowError>
         + Sync,
 {
-    let rows = crate::solver::topology_selector::run_topology_race_parallel(
+    let rows = crate::topology_selector::run_topology_race_parallel(
         workspaces,
         move |workspace: DeviceResidentArrowWorkspace| {
             run_one(&workspace, &opts).map(|outcome| MultiplexedFit { outcome })
@@ -2079,7 +2079,7 @@ mod tests {
     /// CUDA required.
     #[test]
     fn resident_inner_solve_matches_production_arrow_core() {
-        use crate::solver::arrow_schur::{ArrowSolveOptions, solve_arrow_newton_step_core};
+        use crate::arrow_schur::{ArrowSolveOptions, solve_arrow_newton_step_core};
 
         let ws = small_fixture(0x1017_F17);
         let opts = DeviceResidentInnerOptions::default();

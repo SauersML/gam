@@ -40,13 +40,23 @@ pub enum GpuError {
     NoDeviceKernel { reason: String },
 }
 
-crate::impl_reason_error_boilerplate! {
-    GpuError {
-        DriverLibraryUnavailable,
-        DriverSymbolMissing,
-        DriverCallFailed,
-        CalibrationFailed,
-        NoDeviceKernel,
+impl std::fmt::Display for GpuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DriverLibraryUnavailable { reason }
+            | Self::DriverSymbolMissing { reason }
+            | Self::DriverCallFailed { reason }
+            | Self::CalibrationFailed { reason }
+            | Self::NoDeviceKernel { reason } => f.write_str(reason),
+        }
+    }
+}
+
+impl std::error::Error for GpuError {}
+
+impl From<GpuError> for String {
+    fn from(err: GpuError) -> String {
+        err.to_string()
     }
 }
 

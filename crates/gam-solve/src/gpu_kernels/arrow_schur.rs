@@ -19,7 +19,7 @@
 use ndarray::{Array1, Array2};
 
 use gam_linalg::triangular::{CholeskyGuard, cholesky_factor_in_place, cholesky_solve_vector};
-use crate::solver::arrow_schur::{ArrowSchurSystem, DeviceSaePcgData, PcgDiagnostics};
+use crate::arrow_schur::{ArrowSchurSystem, DeviceSaePcgData, PcgDiagnostics};
 
 /// Outcome of a single Arrow-Schur Newton solve.
 pub struct ArrowSchurGpuSolution {
@@ -195,7 +195,7 @@ fn pack_host(sys: &ArrowSchurSystem, ridge_t: f64) -> (Vec<f64>, Vec<f64>, Vec<f
 #[cfg(target_os = "linux")]
 #[inline]
 fn pack_block(
-    row: &crate::solver::arrow_schur::ArrowRowBlock,
+    row: &crate::arrow_schur::ArrowRowBlock,
     ridge_t: f64,
     d: usize,
     k: usize,
@@ -386,7 +386,7 @@ pub fn gpu_schur_matvec_backend(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
-) -> Result<crate::solver::arrow_schur::GpuSchurMatvec, ArrowSchurGpuFailure> {
+) -> Result<crate::arrow_schur::GpuSchurMatvec, ArrowSchurGpuFailure> {
     // Matrix-free H_tβ operator present: drive the row-procedural sparse
     // Kronecker apply (active atoms only) instead of the dense forward kernel.
     if sys.htbeta_matvec.is_some() {
@@ -429,7 +429,7 @@ fn build_row_procedural_matvec(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
     ridge_beta: f64,
-) -> Result<crate::solver::arrow_schur::GpuSchurMatvec, ArrowSchurGpuFailure> {
+) -> Result<crate::arrow_schur::GpuSchurMatvec, ArrowSchurGpuFailure> {
     use std::sync::Arc;
     let n = sys.rows.len();
     let k = sys.k;
@@ -491,7 +491,7 @@ fn build_row_procedural_matvec(
     let penalty_op = sys.effective_penalty_op();
     let row_dims: Vec<usize> = sys.rows.iter().map(|row| row.htt.nrows()).collect();
 
-    let closure: crate::solver::arrow_schur::GpuSchurMatvec =
+    let closure: crate::arrow_schur::GpuSchurMatvec =
         Arc::new(move |x: &Array1<f64>, out: &mut Array1<f64>| {
             assert_eq!(x.len(), k, "row-procedural matvec: x.len() != k");
             assert_eq!(out.len(), k, "row-procedural matvec: out.len() != k");
@@ -533,7 +533,7 @@ fn build_row_procedural_matvec(
             // `run_topology_race_parallel`) — the same nested-rayon guard the
             // CPU `schur_matvec` uses. Buffers (`v_i`, `neg`) are reused across
             // rows within a chunk, so the per-row allocation churn is gone.
-            let parallel = n >= crate::solver::arrow_schur::SCHUR_MATVEC_PARALLEL_ROW_MIN
+            let parallel = n >= crate::arrow_schur::SCHUR_MATVEC_PARALLEL_ROW_MIN
                 && rayon::current_thread_index().is_none();
             if parallel {
                 use rayon::prelude::*;
@@ -932,7 +932,7 @@ mod cuda {
     use super::{ArrowSchurGpuFailure, ArrowSchurGpuSolution, pack_block, pack_host};
     use gam_gpu::driver::to_i32;
     use gam_gpu::linalg_dispatch::{DispatchOp, route_through_gpu};
-    use crate::solver::arrow_schur::{
+    use crate::arrow_schur::{
         ArrowSchurSystem, DeviceSaeFrameData, DeviceSaePcgData, PcgDiagnostics, PcgStopReason,
     };
     use cudarc::cublas::sys::{
@@ -3516,7 +3516,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         sys: &ArrowSchurSystem,
         ridge_t: f64,
         ridge_beta: f64,
-    ) -> Result<crate::solver::arrow_schur::GpuSchurMatvec, super::ArrowSchurGpuFailure> {
+    ) -> Result<crate::arrow_schur::GpuSchurMatvec, super::ArrowSchurGpuFailure> {
         let n = sys.rows.len();
         let d = sys.d;
         let k = sys.k;
@@ -3637,7 +3637,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         let hbb_is_kk = sys.hbb.dim() == (k, k);
         let hbb_matvec_opt = sys.hbb_matvec.clone();
 
-        let closure: crate::solver::arrow_schur::GpuSchurMatvec =
+        let closure: crate::arrow_schur::GpuSchurMatvec =
             Arc::new(move |x: &Array1<f64>, out: &mut Array1<f64>| {
                 assert_eq!(x.len(), k, "gpu_schur_matvec: x.len() != k");
                 assert_eq!(out.len(), k, "gpu_schur_matvec: out.len() != k");
@@ -4731,7 +4731,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
         //! seam, which the ban-scanner forbids). A bare `#[cfg(test)] mod tests`
         //! is the one form the scanner permits.
         use super::*;
-        use crate::solver::arrow_schur::{
+        use crate::arrow_schur::{
             ArrowSchurSystem, DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock,
             FactoredFrameGBlock,
         };
@@ -4927,7 +4927,7 @@ extern "C" __global__ void arrow_sae_frame_diag_sub(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::arrow_schur::ArrowSchurSystem;
+    use crate::arrow_schur::ArrowSchurSystem;
     use ndarray::{Array2, ArrayView1};
 
     fn build_fixture(n: usize, d: usize, k: usize, seed: u64) -> ArrowSchurSystem {
@@ -5155,7 +5155,7 @@ mod tests {
     /// fixed-order serial accumulation.
     #[test]
     fn row_procedural_matvec_parallel_deterministic_and_matches_serial() {
-        use crate::solver::arrow_schur::SCHUR_MATVEC_PARALLEL_ROW_MIN;
+        use crate::arrow_schur::SCHUR_MATVEC_PARALLEL_ROW_MIN;
         let n = SCHUR_MATVEC_PARALLEL_ROW_MIN + 96; // trips the parallel path
         let d = 3usize;
         let k = 24usize;
@@ -5239,7 +5239,7 @@ mod tests {
     /// (`r_k < p` framed + `r_k = p` un-framed). Size-independent gate.
     #[test]
     fn framed_sae_schur_matvec_matches_dense_reference() {
-        use crate::solver::arrow_schur::{
+        use crate::arrow_schur::{
             BetaPenaltyOp, DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock,
             FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp,
         };
@@ -5495,7 +5495,7 @@ mod tests {
     /// declines (`solve_sae_matrix_free_pcg` → `Unavailable`).
     #[test]
     fn framed_sae_device_pcg_matches_cpu_when_cuda_admits() {
-        use crate::solver::arrow_schur::{
+        use crate::arrow_schur::{
             BetaPenaltyOp, DeviceSaeFrameData, DeviceSaePcgData, DeviceSaeSmoothBlock,
             FactoredFrameGBlock, FactoredFrameKroneckerOp, IdentityRightKroneckerPenaltyOp,
         };

@@ -19,7 +19,6 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use super::gpu_error::GpuError;
-use crate::gpu_err;
 
 pub type CuResult = i32;
 // NOTE (#1017): the `DriverApi` / `CudaWorkingState` / `DeviceAllocation` cluster
@@ -37,7 +36,9 @@ pub fn check_cuda(result: CuResult, name: &str) -> Result<(), GpuError> {
     if result == 0 {
         Ok(())
     } else {
-        Err(gpu_err!("{name} failed with CUDA driver error {result}"))
+        Err(GpuError::DriverCallFailed {
+            reason: format!("{name} failed with CUDA driver error {result}"),
+        })
     }
 }
 

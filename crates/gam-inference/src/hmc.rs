@@ -32,7 +32,7 @@ use gam::estimate::{
 };
 use gam::faer_ndarray::{FaerCholesky, FaerEigh, fast_ata_into, fast_atv, fast_av_into};
 use gam::families::wiggle::monotone_wiggle_basis_with_derivative_order;
-use gam::gpu::kernels::polya_gamma::{PgSeed, PolyaGammaBatchInput};
+use gam::inference::gpu_polya_gamma::{PgSeed, PolyaGammaBatchInput};
 use gam::linalg::triangular::back_substitution_lower_transpose_guarded_into;
 use gam::matrix::DesignMatrix;
 use gam::solver::mixture_link::{
@@ -4126,7 +4126,7 @@ fn draw_logit_pg1_omega(
         }
         .into());
     }
-    let draws = gam::gpu::kernels::polya_gamma::draw_batch(PolyaGammaBatchInput {
+    let draws = gam::inference::gpu_polya_gamma::draw_batch(PolyaGammaBatchInput {
         shapes,
         tilts,
         seed: PgSeed(seed),

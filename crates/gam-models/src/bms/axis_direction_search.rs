@@ -266,7 +266,7 @@ impl BernoulliMarginalSlopeFamily {
         // Host-pin shortcut: when the per-row Hessian is materialised on host
         // (the legacy path before Phase 3), build the joint-β image by
         // batching the per-row primary directions and dispatching the
-        // per-row matvec helper from `gpu::kernels::row_hessian_ops`. On Linux this
+        // per-row matvec helper from `gam_gpu::gpu_kernels::row_hessian_ops`. On Linux this
         // can be GPU-accelerated by `launch_row_hessian_matvec`; on every
         // host the CPU oracle `cpu_row_hessian_matvec` is the in-process
         // fallback so the call sites stay consistent. The design pullback
@@ -848,7 +848,7 @@ impl BernoulliMarginalSlopeFamily {
         }
 
         // Host-pin shortcut: extract every row's primary diagonal via the
-        // per-row diagonal helper from `gpu::kernels::row_hessian_ops`, then perform
+        // per-row diagonal helper from `gam_gpu::gpu_kernels::row_hessian_ops`, then perform
         // the design² accumulation on host (matches the rayon-loop algebra
         // below without rebuilding `r²` blocks per row). On Linux this uses
         // the GPU `launch_row_hessian_diag` kernel; on every host the CPU

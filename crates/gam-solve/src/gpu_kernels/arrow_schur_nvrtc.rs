@@ -41,7 +41,7 @@
 //! `bump = scale · ε^½ · 1024` to `ridge_t` and re-launches, the same Ceres-
 //! style geometric escalation the CPU path already implements.
 
-use crate::solver::arrow_schur::ArrowSchurSystem;
+use crate::arrow_schur::ArrowSchurSystem;
 
 /// Fused-kernel dispatch admission. Returns `true` when the workload shape
 /// makes the Layer D NVRTC fused path strictly preferable to the cuSOLVER /
@@ -839,7 +839,7 @@ mod tests {
     // is checkable on any host before a V100/A100 window is available.
     // ----------------------------------------------------------------------
     use crate::gpu_kernels::arrow_schur::solve_arrow_newton_step_dense_reference;
-    use crate::solver::arrow_schur::ArrowSchurSystem;
+    use crate::arrow_schur::ArrowSchurSystem;
 
     /// Deterministic SPD bordered system: per-row `H_tt = JJᵀ + (2+i)I` (PD),
     /// arbitrary `H_tβ`, SPD border `H_ββ = MMᵀ + p·I`, fixed gradients. No RNG

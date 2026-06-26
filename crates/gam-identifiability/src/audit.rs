@@ -88,11 +88,10 @@
 use faer::Side;
 use ndarray::{Array1, Array2};
 
-use gam_problem::{FamilyLinearizationState, ParameterBlockSpec};
+use gam_problem::{CustomFamilyError, FamilyLinearizationState, ParameterBlockSpec};
 use gam_linalg::faer_ndarray::{
     FaerEigh, default_rrqr_rank_alpha, fast_atb, rrqr_with_permutation,
 };
-use crate::solver::estimate::EstimationError;
 
 const DEFAULT_GAUGE_PRIORITY: u8 = 100;
 
@@ -3031,7 +3030,7 @@ mod tests {
     use linspace as linspace_minus_one_to_one;
     use ndarray::Array2;
 
-    use crate::test_support::spec_from_dense;
+    
 
     fn linspace(n: usize) -> ndarray::Array1<f64> {
         if n <= 1 {

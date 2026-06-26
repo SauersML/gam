@@ -4,7 +4,7 @@
 //! sigma point through the unified PIRLS stream-pool executor, returns the
 //! per-point `(H_original^-1, beta_original)` pairs, and hands the shared
 //! covariance accumulation back to
-//! [`crate::solver::reml::eval::accumulate_sigma_cubature_total_covariance`].
+//! [`crate::reml::eval::accumulate_sigma_cubature_total_covariance`].
 
 use ndarray::{Array1, Array2, ArrayView1};
 
@@ -13,10 +13,10 @@ use gam_gpu::gpu_error::GpuError;
 /// Per-sigma-point GPU PIRLS input: penalty, reparameterisation transform,
 /// and prior-mean shifts for one ρ / σ point.
 ///
-/// Built by [`crate::solver::reml::eval::sigma_cubature_evaluate_gpu_stream_pool`]
+/// Built by [`crate::reml::eval::sigma_cubature_evaluate_gpu_stream_pool`]
 /// from the reparameterisation engine output before the stream pool is allocated.
 /// The shared model data (`X_original`, `y`, `prior_w`, `offset`) is uploaded
-/// ONCE into [`crate::solver::gpu::pirls_gpu::PirlsGpuSharedData`]; only the
+/// ONCE into [`crate::gpu::pirls_gpu::PirlsGpuSharedData`]; only the
 /// small per-point algebra (p×p Qs, p×p S, length-p shift, scalar) needs
 /// uploading per sigma point.
 pub struct SigmaPointGpuInput {
@@ -233,7 +233,7 @@ mod linux_impl {
         max_iter: usize,
     ) -> Result<Option<Vec<SigmaPointResult>>, crate::GpuError> {
         use crate::gpu_kernels::sigma_cubature::pool_size;
-        use crate::solver::gpu::pirls_gpu;
+        use crate::gpu::pirls_gpu;
 
         let m = per_sigma.len();
         let p = x_original.ncols();
@@ -268,8 +268,8 @@ mod linux_impl {
 
         // Allocate N_streams workspace pairs bound to independent streams.
         let mut workspace_pairs: Vec<(
-            crate::solver::gpu::pirls_gpu::SigmaPirlsGpuWorkspace,
-            crate::solver::gpu::pirls_gpu::cuda::PirlsLoopWorkspace,
+            crate::gpu::pirls_gpu::SigmaPirlsGpuWorkspace,
+            crate::gpu::pirls_gpu::cuda::PirlsLoopWorkspace,
         )> = Vec::with_capacity(n_streams);
         for _ in 0..n_streams {
             let ws = pirls_gpu::allocate_sigma_pirls_workspace(&bootstrap_shared)
@@ -361,7 +361,7 @@ mod linux_impl {
         use ndarray::Array1;
         // XᵀWX = Xᵀ·diag(prior_w)·X (constant across all sigma points).
         // Computed on the GPU via weighted_crossprod_gpu.
-        let xtwx = crate::solver::gpu::pirls_gpu::weighted_crossprod_gpu(x_original, prior_w)
+        let xtwx = crate::gpu::pirls_gpu::weighted_crossprod_gpu(x_original, prior_w)
             .map_err(|e| gam_gpu::gpu_err!("gaussian sigma: XᵀWX gpu failed: {e}"))?;
 
         // XᵀW(y − offset) = Xᵀ·diag(prior_w)·(y − offset).
@@ -376,7 +376,7 @@ mod linux_impl {
 
         let mut outcomes: Vec<SigmaPointResult> = Vec::with_capacity(per_sigma.len());
         for (idx, pt) in per_sigma.iter().enumerate() {
-            let pls = crate::solver::gpu::pirls_gpu::solve_gaussian_pls_gpu(
+            let pls = crate::gpu::pirls_gpu::solve_gaussian_pls_gpu(
                 xtwx.view(),
                 xtwy.view(),
                 pt.s_transformed.view(),

@@ -853,7 +853,7 @@ mod linux_cuda {
     };
     use gam_gpu::driver::to_col_major;
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
-    use crate::solver::{
+    use gam_gpu::solver::{
         cholesky_logdet_from_col_major, context_and_stream, pinned_htod, potrf_in_place,
         potrs_in_place,
     };
