@@ -72,7 +72,7 @@ use gam::types::{
     InverseLink, LikelihoodScaleMetadata, LinkFunction, LogLikelihoodNormalization, StandardLink,
     WigglePenaltyConfig,
 };
-use gam_predict::PredictableModel;
+use gam_predict::{FittedModelPredictExt, PredictableModel};
 use ndarray::{Array1, Array2, ArrayViewMut2, array, s};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
