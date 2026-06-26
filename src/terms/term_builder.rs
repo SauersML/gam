@@ -1571,25 +1571,67 @@ pub fn build_smooth_basis(
     policy: &ResourcePolicy,
     smooth_coordinate_count: usize,
 ) -> Result<SmoothBasisSpec, String> {
-    // Fail fast on degenerate input columns: a smooth over a column that takes
-    // only one finite value can only ever fit the response mean — the design
-    // matrix is rank-1, and the user almost certainly didn't mean to model a
-    // constant predictor as a smooth. Without this guard, `smooth(x)` and
-    // `matern(x)` silently fit the mean of `y` regardless of `x`, and the
-    // user has no way to tell from looking at the predictions (they're all
-    // the same number). Duchon already errors loudly via the basis layer
-    // ("smooth basis collapses onto the parametric block"); this lift makes
-    // the same diagnosis explicit and uniform across smooth families.
-    for (var, &col) in vars.iter().zip(cols.iter()) {
-        if matches!(ds.column_kinds.get(col), Some(ColumnKindTag::Categorical)) {
-            continue;
+    // Fail fast on degenerate input: a smooth whose (non-categorical) coordinate
+    // columns collapse to a SINGLE distinct point can only ever fit the response
+    // mean — its design matrix is rank-1. For a UNIVARIATE smooth this is exactly
+    // "the one column is constant": `smooth(x)`/`matern(x)` on constant `x` would
+    // otherwise silently fit the mean of `y` with no visible cue (Duchon already
+    // errors loudly via the basis layer; this makes the diagnosis explicit and
+    // uniform). For a MULTIVARIATE smooth (tensor, sphere, tps, ...) a single
+    // constant coordinate is NOT degenerate — the basis still varies along the
+    // other coordinate(s) and the penalty absorbs the rank-deficient direction
+    // (e.g. a constant-longitude meridian arc on the sphere is a well-posed 1-D
+    // slice of S²). Such a term is degenerate only when EVERY coordinate is
+    // constant at once, i.e. the joint input is a single point. Test the JOINT
+    // cardinality, not each column independently, so the loud diagnosis still
+    // fires for the genuinely rank-1 case without rejecting well-posed
+    // lower-dimensional slices.
+    let coord_cols: Vec<(&String, usize)> = vars
+        .iter()
+        .zip(cols.iter().copied())
+        .filter(|(_, col)| !matches!(ds.column_kinds.get(*col), Some(ColumnKindTag::Categorical)))
+        .collect();
+    if !coord_cols.is_empty() {
+        let views: Vec<ArrayView1<'_, f64>> = coord_cols
+            .iter()
+            .map(|(_, col)| ds.values.column(*col))
+            .collect();
+        let n_rows = views[0].len();
+        let mut distinct_points = std::collections::HashSet::<Vec<u64>>::new();
+        for r in 0..n_rows {
+            let key: Vec<u64> = views
+                .iter()
+                .map(|v| {
+                    let x = v[r];
+                    let norm = if x == 0.0 { 0.0 } else { x };
+                    norm.to_bits()
+                })
+                .collect();
+            distinct_points.insert(key);
+            if distinct_points.len() > 1 {
+                break;
+            }
         }
-        if unique_count_column(ds.values.column(col)) <= 1 {
-            return Err(TermBuilderError::degenerate_data(format!(
-                "smooth term over '{var}' has only one unique value in the training data \
-                 — a smooth on a constant column is degenerate and would only fit the response mean. \
-                 Remove `{var}` from the smooth, drop the term, or check the data."
-            ))
+        if distinct_points.len() <= 1 {
+            return Err(TermBuilderError::degenerate_data(if coord_cols.len() == 1 {
+                let var = coord_cols[0].0;
+                format!(
+                    "smooth term over '{var}' has only one unique value in the training data \
+                     — a smooth on a constant column is degenerate and would only fit the response mean. \
+                     Remove `{var}` from the smooth, drop the term, or check the data."
+                )
+            } else {
+                let names = coord_cols
+                    .iter()
+                    .map(|(v, _)| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "smooth term over ({names}) has only one unique joint coordinate in the training \
+                     data — every coordinate is constant, so the smooth is degenerate and would only \
+                     fit the response mean. Drop the term or check the data."
+                )
+            })
             .to_string());
         }
     }
