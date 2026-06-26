@@ -41,6 +41,28 @@ pub(crate) fn dense_matvec_scaled_add_into(
     }
 }
 
+pub(crate) fn dense_transpose_matvec_scaled_add_into(
+    matrix: &Array2<f64>,
+    x: ArrayView1<'_, f64>,
+    scale: f64,
+    mut out: ArrayViewMut1<'_, f64>,
+) {
+    assert_eq!(matrix.nrows(), x.len());
+    assert_eq!(matrix.ncols(), out.len());
+    if scale == 0.0 {
+        return;
+    }
+    for (row, x_value) in matrix.rows().into_iter().zip(x.iter().copied()) {
+        let row_scale = scale * x_value;
+        if row_scale == 0.0 {
+            continue;
+        }
+        for (out_value, entry) in out.iter_mut().zip(row.iter().copied()) {
+            *out_value += row_scale * entry;
+        }
+    }
+}
+
 #[inline]
 pub(crate) fn dense_bilinear(
     matrix: &Array2<f64>,

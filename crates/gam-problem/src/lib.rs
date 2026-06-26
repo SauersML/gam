@@ -17,6 +17,7 @@ mod macros;
 
 mod linalg_helpers;
 mod linear_constraints;
+pub mod penalty_coordinate;
 mod pseudo_logdet;
 mod seeding;
 pub mod solver_contract;
@@ -47,6 +48,7 @@ mod gpu {
 pub use gam_linalg::faer_ndarray::{in_nested_parallel_region, with_nested_parallel};
 use linalg_helpers::{dense_bilinear, dense_matvec_into, dense_matvec_scaled_add_into};
 pub use linear_constraints::LinearInequalityConstraints;
+pub use penalty_coordinate::PenaltyCoordinate;
 pub use pseudo_logdet::PseudoLogdetMode;
 pub use seeding::{SeedConfig, SeedRiskProfile, clamp_seed_rho_to_bounds, normalize_seed_bounds};
 pub use solver_contract::{
