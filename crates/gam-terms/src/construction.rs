@@ -1,11 +1,11 @@
 use crate::basis::analyze_penalty_block;
 use crate::estimate::EstimationError;
-use gam_linalg::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
-use gam_linalg::utils::KahanSum;
-use gam_linalg::matrix::symmetrize_in_place;
 use crate::smooth::PenaltyStructureHint;
 use faer::linalg::matmul::matmul;
 use faer::{Accum, Mat, MatRef, Par, Side};
+use gam_linalg::faer_ndarray::{FaerEigh, FaerLinalgError, FaerSvd};
+use gam_linalg::matrix::symmetrize_in_place;
+use gam_linalg::utils::KahanSum;
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut2, Axis, s};
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator, ParallelIterator,
@@ -1000,9 +1000,7 @@ impl CanonicalPenalty {
     }
 
     /// Convert to a PenaltyCoordinate for the unified REML evaluator.
-    pub fn to_penalty_coordinate(
-        &self,
-    ) -> gam_problem::PenaltyCoordinate {
+    pub fn to_penalty_coordinate(&self) -> gam_problem::PenaltyCoordinate {
         use gam_problem::PenaltyCoordinate;
         if self.is_block_local() {
             PenaltyCoordinate::from_block_root_with_mean(
@@ -2975,9 +2973,9 @@ mod tests {
     };
     use crate::construction::kronecker_product;
     use crate::estimate::EstimationError;
+    use faer::Mat;
     use gam_linalg::faer_ndarray::FaerEigh;
     use gam_linalg::utils::inf_norm;
-    use faer::Mat;
     use ndarray::{Array1, Array2, array};
 
     /// Build CanonicalPenalty values from full-width roots for tests.

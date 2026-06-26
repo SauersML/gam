@@ -417,9 +417,7 @@ pub(super) fn realize_coefficient_groups(
     groups: &[CoefficientGroupSpec],
     base_prior: &gam_spec::RhoPrior,
 ) -> Result<RealizedCoefficientGroups, BasisError> {
-    use crate::structure::coefficient_group_resolver::{
-        ResolvedGroup, ResolvedGroupHierarchy,
-    };
+    use crate::structure::coefficient_group_resolver::{ResolvedGroup, ResolvedGroupHierarchy};
 
     let p = design.design.ncols();
     // Carrier-specific validation and selector resolution. The standard-term

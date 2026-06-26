@@ -1,5 +1,5 @@
-use gam_linalg::faer_ndarray::FaerCholesky;
 use faer::Side;
+use gam_linalg::faer_ndarray::FaerCholesky;
 use ndarray::{Array2, ArrayView2};
 
 /// Inputs to the closed-form Gaussian REML/Laplace score of a trained
