@@ -1371,8 +1371,49 @@ mod tests {
         assert!(err.contains("not supported on Duchon"), "got: {err}");
 
         // A Duchon descriptor without double_penalty (or with it false) is fine.
+        // Duchon's structural norm penalty already spans the null space, so
+        // `apply_duchon` only rejects `Some(true)` — `false` must pass through
+        // (relevant since #1565 now always emits the key, including `false`).
         let mut duchon_ok = duchon_spec();
         apply_duchon(&mut duchon_ok, &obj(json!({"m": 2})), "x").unwrap();
+        let mut duchon_false = duchon_spec();
+        apply_duchon(
+            &mut duchon_false,
+            &obj(json!({"double_penalty": false})),
+            "x",
+        )
+        .expect("double_penalty: false must be accepted by Duchon");
+    }
+
+    /// Regression for gam issue #1565: the Python `Smooth.to_rust_descriptor`
+    /// used to drop `double_penalty=False`, so the flag could not be toggled
+    /// through the `smooths={}` descriptor bridge. The Rust applier already
+    /// consumes both `true` and `false`; this test locks that half so the
+    /// bridge can't regress once the Python side transmits the explicit flag.
+    #[test]
+    fn double_penalty_toggles_bspline_both_ways() {
+        // Explicit `true` turns the second (nullspace-shrinkage) penalty on.
+        let mut spec_true = open_bspline_spec();
+        assert!(!spec_true.double_penalty, "fixture must start single-penalty");
+        apply_bspline_1d(
+            &mut spec_true,
+            &obj(json!({"kind": "bspline", "double_penalty": true})),
+            "x",
+        )
+        .expect("double_penalty: true must apply to a 1D B-spline");
+        assert!(spec_true.double_penalty);
+
+        // Explicit `false` keeps / restores the single-penalty smooth — the
+        // toggle the Python side could not previously request.
+        let mut spec_false = open_bspline_spec();
+        spec_false.double_penalty = true; // pretend it was on
+        apply_bspline_1d(
+            &mut spec_false,
+            &obj(json!({"kind": "bspline", "double_penalty": false})),
+            "x",
+        )
+        .expect("double_penalty: false must apply to a 1D B-spline");
+        assert!(!spec_false.double_penalty);
     }
 
     #[test]
