@@ -98,3 +98,5 @@ pub use estimate::reml::reml_outer_engine::CorrectedCovarianceError;
 /// also serves the in-process workflow pipeline. Exposed here so PyFFI can name
 /// it without the (crate-private) `workflow` module being publicly reachable.
 pub use fit_orchestration::descriptors::build_analytic_penalty_registry_from_descriptors;
+pub mod model_types;
+pub mod quadrature;
