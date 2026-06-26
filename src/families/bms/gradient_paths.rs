@@ -1297,10 +1297,7 @@ pub(super) fn empirical_rigid_calibration_eval(
     Ok((f, f_prime, f_double_prime))
 }
 
-// `pub` (was `pub(crate)`) so the cross-crate `gam-predict` latent-measure
-// tests can compute the expected intercept after the #1521 split moved them
-// out of `gam` (#1567).
-pub fn empirical_intercept_from_marginal(
+pub(crate) fn empirical_intercept_from_marginal(
     target_mu: f64,
     target_q: f64,
     slope: f64,

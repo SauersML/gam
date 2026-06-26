@@ -275,9 +275,7 @@ pub(super) struct ThetaHints {
     pub(super) link_dev_beta: Option<Array1<f64>>,
 }
 
-// `pub` (was `pub(crate)`) so the cross-crate `gam-predict` saved-runtime tests
-// can drive this builder after the #1521 split moved them out of `gam` (#1567).
-pub fn build_score_warp_deviation_block_from_seed(
+pub(crate) fn build_score_warp_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {

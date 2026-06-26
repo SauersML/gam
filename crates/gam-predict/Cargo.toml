@@ -20,8 +20,7 @@ statrs = "0.18.0"
 # faer triplets (gam::matrix::SparseDesignMatrix wraps a faer SparseColMat), so
 # faer is a genuine test-only dependency here. The library itself does not need
 # it — the monolithic gam crate (which still re-exports faer types) covers the
-# non-test paths. See #1567: the #1521 split moved these faer-using tests into
-# gam-predict without carrying the dependency. Pinned to the workspace `0.24.0`.
+# non-test paths.
 faer = "0.24.0"
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 
