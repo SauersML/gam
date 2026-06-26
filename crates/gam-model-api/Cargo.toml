@@ -1,0 +1,12 @@
+[package]
+name = "gam-model-api"
+version = "0.3.124"
+edition = "2024"
+
+[lints.rust]
+warnings = "deny"
+
+[dependencies]
+gam-problem = { path = "../gam-problem", version = "=0.3.124" }
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+rayon = "1.12.0"

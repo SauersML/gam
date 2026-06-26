@@ -1,0 +1,26 @@
+[package]
+name = "gam-sae"
+version = "0.3.124"
+edition = "2024"
+rust-version = "1.93"
+
+[dependencies]
+faer = "0.24.0"
+gam-linalg = { path = "../gam-linalg", version = "=0.3.124" }
+gam-math = { path = "../gam-math", version = "=0.3.124" }
+gam-problem = { path = "../gam-problem", version = "=0.3.124" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.124" }
+gam-solve = { path = "../gam-solve", version = "=0.3.124" }
+gam-terms = { path = "../gam-terms", version = "=0.3.124" }
+log = "0.4.29"
+memmap2 = "0.9.10"
+ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
+rand = "0.10.1"
+rayon = "1.12.0"
+serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
+
+[dev-dependencies]
+approx = "0.5.1"
+
+[lints.rust]
+warnings = "deny"

@@ -118,10 +118,10 @@ mod gpu_dispatch_registration_tests {
 }
 
 pub mod config_resolve;
-pub mod families;
+pub use gam_models as families;
 pub use gam_geometry as geometry;
-pub mod gpu;
-pub mod identifiability;
+pub use gam_gpu as gpu;
+pub use gam_identifiability as identifiability;
 pub mod inference;
 pub use gam_linalg as linalg;
 pub mod model_types;
@@ -140,8 +140,8 @@ pub(crate) mod rho_prior_eval;
 /// consumer) can depend on it downward instead of importing *up* into
 /// `inference` (#1135).
 pub mod rho_uncertainty;
-pub mod solver;
-pub mod terms;
+pub use gam_solve as solver;
+pub use gam_terms as terms;
 pub mod test_support;
 pub mod types;
 pub mod util;

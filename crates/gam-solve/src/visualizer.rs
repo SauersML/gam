@@ -1,0 +1,1856 @@
+use crossterm::execute;
+use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
+use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
+use log::{LevelFilter, Log, Metadata, Record};
+use ratatui::prelude::*;
+use ratatui::text::{Line as TextLine, Span};
+use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap};
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, Write};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const INTERACTIVE_DRAW_INTERVAL: Duration = Duration::from_millis(40);
+const DUMB_DRAW_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_HISTORY_POINTS: usize = 1200;
+const MAX_DIAGNOSTIC_LINES: usize = 10;
+// Ring of recent log records mirrored into the model so the chart's
+// Diagnostics panel can stream them live, and so the panic hook can dump
+// the last N lines to stderr (where `tee` captures them) before the
+// process aborts. Sized to fill a typical terminal-bottom panel several
+// times over without unbounded growth on long fits.
+const LOG_TAIL_CAP: usize = 200;
+
+static LOGGER: ProgressLogger = ProgressLogger;
+static LOG_START: OnceLock<Instant> = OnceLock::new();
+static LOG_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+struct ProgressLogger;
+
+impl Log for ProgressLogger {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        let lines = format_log_record(record);
+        // Mirror into the active visualizer's log_tail so the chart's
+        // Diagnostics panel streams live records, and so the panic hook
+        // can replay them after a crash. Best-effort: if the feed is
+        // gone or the lock is contended past a brief poll, we just skip
+        // — the canonical log destination is stderr.
+        if let Some(feed) = current_active_feed() {
+            let mut model = lock_model(&feed.model);
+            for line in &lines {
+                model.log_tail.push_back(line.clone());
+                while model.log_tail.len() > LOG_TAIL_CAP {
+                    model.log_tail.pop_front();
+                }
+            }
+        }
+        let log_lock_guard = LOG_WRITE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let mut stderr = io::stderr().lock();
+        for line in lines {
+            writeln!(stderr, "{line}").ok();
+        }
+        drop(log_lock_guard);
+    }
+
+    fn flush(&self) {}
+}
+
+fn format_log_record(record: &Record<'_>) -> Vec<String> {
+    let elapsed = LOG_START.get_or_init(Instant::now).elapsed();
+    let prefix = format!("[{}]", human_elapsed(elapsed));
+    sanitize_log_message(&record.args().to_string())
+        .lines()
+        .map(|line| format!("{prefix} {line}"))
+        .collect()
+}
+
+fn sanitize_log_message(message: &str) -> String {
+    let mut sanitized = String::with_capacity(message.len());
+    let mut chars = message.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => {
+                strip_escape_sequence(&mut chars);
+            }
+            '\r' => sanitized.push('\n'),
+            '\n' | '\t' => sanitized.push(ch),
+            ch if ch.is_control() => {}
+            ch => sanitized.push(ch),
+        }
+    }
+    sanitized
+}
+
+fn strip_escape_sequence<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    match chars.next() {
+        Some('[') => {
+            for seq_ch in chars.by_ref() {
+                if ('@'..='~').contains(&seq_ch) {
+                    break;
+                }
+            }
+        }
+        Some(']') => strip_string_escape(chars),
+        Some('P' | 'X' | '^' | '_') => strip_string_escape(chars),
+        Some(_) | None => {}
+    }
+}
+
+fn strip_string_escape<I>(chars: &mut std::iter::Peekable<I>)
+where
+    I: Iterator<Item = char>,
+{
+    while let Some(seq_ch) = chars.next() {
+        if seq_ch == '\x07' {
+            break;
+        }
+        if seq_ch == '\x1b' && chars.next_if_eq(&'\\').is_some() {
+            break;
+        }
+    }
+}
+
+fn human_elapsed(elapsed: Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs / 60) % 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes:02}m {seconds:02}s")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds:02}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+pub fn init_logging() {
+    LOG_START.get_or_init(Instant::now);
+    if log::set_logger(&LOGGER).is_ok() {
+        log::set_max_level(LevelFilter::Info);
+    }
+    // Log the GPU backend inventory once at startup so the "are GPUs being
+    // used?" answer is visible at the top of the log, before any solver
+    // dispatch site lazily checks for device support.
+    gam_gpu::log_backend_inventory_once();
+}
+
+#[derive(Clone, Debug, Default)]
+struct LaneState {
+    label: String,
+    current: usize,
+    total: Option<usize>,
+    done: bool,
+}
+
+#[derive(Clone, Debug)]
+struct VisualizerModel {
+    history_cost_accepted: Vec<(f64, f64)>,
+    history_cost_trial: Vec<(f64, f64)>,
+    history_grad_log: Vec<(f64, f64)>,
+    // Most recent (iter, cost, grad_norm) pushed by the outer optimizer.
+    // `record_outer_accept` promotes this point into the accepted series
+    // when the trust-region accepts the step; rejected trials remain only
+    // in `history_cost_trial`. None until the first eval.
+    last_trial: Option<(f64, f64, f64)>,
+    // Monotone outer-eval counter used as the chart x-coordinate. Bridges
+    // run `eval_grad`/`eval_hessian` once per trial; this advances on each
+    // push so trial scatter and accepted line share a common axis.
+    outer_eval_counter: f64,
+    start_time: Instant,
+    current_iter: f64,
+    best_cost: f64,
+    current_status: String,
+    current_stage: String,
+    current_detail: String,
+    current_eval_state: String,
+    current_cost: f64,
+    current_grad: f64,
+    primary_lane: LaneState,
+    secondary_lane: LaneState,
+    edf_terms: Vec<(String, f64, f64)>,
+    diagnostics_lines: Vec<String>,
+    // Tail of the log stream, mirrored by `ProgressLogger`. Rendered as
+    // the chart's bottom "Recent log" panel and replayed to stderr by
+    // the panic hook so a crash leaves the last few hundred log lines
+    // in the tee'd run file even though the alt-screen swallowed them
+    // on the terminal.
+    log_tail: VecDeque<String>,
+    diagnostics_condition: Option<f64>,
+    diagnostics_step_size: Option<f64>,
+    diagnostics_ridge: Option<f64>,
+}
+
+impl Default for VisualizerModel {
+    fn default() -> Self {
+        Self {
+            history_cost_accepted: Vec::new(),
+            history_cost_trial: Vec::new(),
+            history_grad_log: Vec::new(),
+            last_trial: None,
+            outer_eval_counter: 0.0,
+            start_time: Instant::now(),
+            current_iter: 0.0,
+            best_cost: f64::INFINITY,
+            current_status: "Initializing...".to_string(),
+            current_stage: "init".to_string(),
+            current_detail: String::new(),
+            current_eval_state: String::new(),
+            current_cost: f64::NAN,
+            current_grad: f64::NAN,
+            primary_lane: LaneState::default(),
+            secondary_lane: LaneState::default(),
+            edf_terms: Vec::new(),
+            diagnostics_lines: Vec::new(),
+            log_tail: VecDeque::with_capacity(LOG_TAIL_CAP),
+            diagnostics_condition: None,
+            diagnostics_step_size: None,
+            diagnostics_ridge: None,
+        }
+    }
+}
+
+enum VisualizerState {
+    Disabled,
+    Interactive(InteractiveVisualizer),
+    Dumb(DumbVisualizer),
+}
+
+pub struct VisualizerSession {
+    state: SharedState,
+    model: SharedModel,
+    // True when this session installed itself into the static ACTIVE_FEED
+    // (i.e. it's an enabled session). Only enabled sessions own the feed
+    // slot; disabled (default) sessions must NOT clear it on Drop, or a
+    // concurrent enabled session's optimizer pushes would silently land
+    // in a dead slot. Without this guard, tests that mix new(true) and
+    // new(false) in parallel race over the static slot.
+    owns_active_feed: bool,
+}
+
+type SharedModel = Arc<Mutex<VisualizerModel>>;
+type SharedState = Arc<Mutex<VisualizerState>>;
+
+#[derive(Clone)]
+struct ActiveFeed {
+    model: SharedModel,
+    state: SharedState,
+}
+
+static ACTIVE_FEED: OnceLock<Mutex<Option<ActiveFeed>>> = OnceLock::new();
+
+fn active_feed_slot() -> &'static Mutex<Option<ActiveFeed>> {
+    ACTIVE_FEED.get_or_init(|| Mutex::new(None))
+}
+
+fn install_active_feed(feed: ActiveFeed) {
+    // Tolerate poison: if a previous holder panicked we still want to
+    // install our feed cleanly so subsequent optimizer pushes land in this
+    // session, not in a half-dead slot. Without this the second `new(true)`
+    // call after any panic would silently drop the install and the chart
+    // would stop receiving data for the rest of the process lifetime.
+    let mut guard = active_feed_slot().lock().unwrap_or_else(|p| p.into_inner());
+    *guard = Some(feed);
+}
+
+fn clear_active_feed() {
+    let mut guard = active_feed_slot().lock().unwrap_or_else(|p| p.into_inner());
+    *guard = None;
+}
+
+fn current_active_feed() -> Option<ActiveFeed> {
+    let guard = active_feed_slot().lock().unwrap_or_else(|p| p.into_inner());
+    guard.as_ref().cloned()
+}
+
+/// Hook for the outer optimizer: record a single objective+gradient evaluation
+/// as a trial point. Threads through `Arc<Mutex<...>>` so deep solver call
+/// stacks can publish samples without holding the session. No-op when no
+/// visualizer is active (e.g. unit tests, embedded use). The renderer is
+/// throttled internally (~40 ms interactive, ~1 s dumb) so spamming this from
+/// a tight loop is safe.
+pub fn record_outer_eval(cost: f64, grad_norm: f64) {
+    let Some(feed) = current_active_feed() else {
+        return;
+    };
+    {
+        let mut model = lock_model(&feed.model);
+        model.outer_eval_counter += 1.0;
+        let iter = model.outer_eval_counter;
+        model.current_iter = iter;
+        model.current_cost = cost;
+        model.current_grad = grad_norm;
+        model.current_eval_state = "trial".to_string();
+        if cost.is_finite() && cost.abs() < 1e15 {
+            push_sample(&mut model.history_cost_trial, (iter, cost));
+        }
+        if grad_norm.is_finite() {
+            let g_log = grad_norm.max(1e-12).log10();
+            push_sample(&mut model.history_grad_log, (iter, g_log));
+        }
+        model.last_trial = Some((iter, cost, grad_norm));
+    }
+    maybe_redraw_throttled(&feed);
+}
+
+/// Hook for the outer optimizer: promote the most recent trial point into the
+/// accepted series after the optimizer's trust-region/line-search accepts it.
+/// Paired with `record_outer_eval` in the bridges. Safe to call from any
+/// thread; no-op when no visualizer is active or when no trial has been
+/// recorded yet.
+pub fn record_outer_accept() {
+    let Some(feed) = current_active_feed() else {
+        return;
+    };
+    {
+        let mut model = lock_model(&feed.model);
+        if let Some((iter, cost, _grad)) = model.last_trial {
+            if cost.is_finite() && cost.abs() < 1e15 {
+                push_sample(&mut model.history_cost_accepted, (iter, cost));
+                if cost < model.best_cost {
+                    model.best_cost = cost;
+                }
+            }
+            model.current_eval_state = "accepted".to_string();
+        }
+    }
+    maybe_redraw_throttled(&feed);
+}
+
+/// Throttled redraw helper for optimizer pushes. Avoids cloning the
+/// `VisualizerModel` on the hot path: only snapshots when the renderer's
+/// throttle says it's actually time to draw. At large scale (10⁴+ outer
+/// evals per fit) this matters — naively cloning a 1200-point history on
+/// every push is O(N²) total work just to render frames the throttle drops.
+///
+/// Lock order is model → state, matching `VisualizerSession`'s own methods.
+/// We pre-take the model snapshot before state to avoid deadlock with a
+/// concurrent session method that holds model and tries to take state.
+/// The cost is one bool check (the "due" predicate would race anyway): if
+/// the renderer becomes due between our snapshot and our state lock, we
+/// still render with a freshly-taken snapshot — correct, just possibly one
+/// frame earlier than the strict throttle would allow.
+fn maybe_redraw_throttled(feed: &ActiveFeed) {
+    // Cheap probe without crossing locks in the wrong order: peek at
+    // state's last_draw to decide whether to take the snapshot at all.
+    {
+        let state = lock_state(&feed.state);
+        let due = match &*state {
+            VisualizerState::Disabled => return,
+            VisualizerState::Interactive(vis) => {
+                vis.last_draw.elapsed() >= INTERACTIVE_DRAW_INTERVAL
+            }
+            VisualizerState::Dumb(vis) => vis.last_draw.elapsed() >= DUMB_DRAW_INTERVAL,
+        };
+        if !due {
+            return;
+        }
+        // Drop the state lock here so we can take model → state in the
+        // canonical order on the path that actually clones+renders.
+    }
+    let snapshot = lock_model(&feed.model).clone();
+    let mut state = lock_state(&feed.state);
+    match &mut *state {
+        VisualizerState::Disabled => {}
+        VisualizerState::Interactive(vis) => vis.maybe_draw(&snapshot, false),
+        VisualizerState::Dumb(vis) => vis.maybe_draw(&snapshot, false),
+    }
+}
+
+struct InteractiveVisualizer {
+    terminal: Terminal<CrosstermBackend<File>>,
+    // Independent File handle on /dev/tty kept solely for teardown: at
+    // drop time we write LeaveAlternateScreen here so the user's
+    // terminal returns to the main buffer cleanly. Cloning the fd makes
+    // this safe to use even while the ratatui Terminal still owns its
+    // own handle.
+    tty_for_teardown: File,
+    last_draw: Instant,
+}
+
+// Process-wide handle on /dev/tty used by the panic hook to leave the
+// alternate screen even when the panicking thread isn't the one that
+// installed the visualizer. We can't reach into the InteractiveVisualizer
+// from a panic hook (it's behind a Mutex and the panic might be holding
+// it), so we cache a clone of the fd here at activation time.
+static TTY_HANDLE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+
+fn tty_handle_slot() -> &'static Mutex<Option<File>> {
+    TTY_HANDLE.get_or_init(|| Mutex::new(None))
+}
+
+fn install_tty_handle(handle: File) {
+    if let Ok(mut g) = tty_handle_slot().lock() {
+        *g = Some(handle);
+    }
+}
+
+fn clear_tty_handle() {
+    if let Ok(mut g) = tty_handle_slot().lock() {
+        *g = None;
+    }
+}
+
+#[cfg(unix)]
+fn open_dev_tty() -> io::Result<File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+}
+
+#[cfg(not(unix))]
+fn open_dev_tty() -> io::Result<File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "/dev/tty not available on this platform",
+    ))
+}
+
+// Install once. The hook restores terminal state and dumps the log tail
+// to stderr so a crash mid-fit (a) leaves the shell prompt usable
+// instead of stuck in alt-screen + raw mode, and (b) preserves the last
+// few hundred log records in whatever was capturing stderr — typically
+// the `tee` pipe in run.sh that backs the run's $RESULTS file.
+fn install_panic_hook() {
+    PANIC_HOOK_INSTALLED.get_or_init(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            // Restore terminal first so subsequent stderr writes scroll
+            // in the main buffer rather than under the alt-screen.
+            disable_raw_mode().ok();
+            // try_lock, not lock: the panicking thread may already
+            // hold the tty slot mutex (e.g. mid-install). std Mutex is
+            // non-reentrant, so re-entry would deadlock the panic hook
+            // itself and leave the terminal frozen in alt-screen + raw
+            // mode. Best-effort teardown is strictly better than hung
+            // teardown — the user's shell can recover from a dropped
+            // escape sequence but not from a hung Rust process.
+            if let Ok(mut guard) = tty_handle_slot().try_lock()
+                && let Some(file) = guard.as_mut()
+            {
+                drop(execute!(file, LeaveAlternateScreen));
+                drop(file.flush());
+            }
+            // Replay recent log tail so the tee'd run file ends with
+            // real context, not just a bare panic message. Same
+            // try_lock discipline as above.
+            drop(writeln!(io::stderr(), "\n=== visualizer crash ==="));
+            let mut dumped = false;
+            if let Some(slot) = ACTIVE_FEED.get()
+                && let Ok(guard) = slot.try_lock()
+                && let Some(feed) = guard.as_ref()
+                && let Ok(model) = feed.model.try_lock()
+            {
+                drop(writeln!(
+                    io::stderr(),
+                    "last {} log line(s):",
+                    model.log_tail.len()
+                ));
+                for line in &model.log_tail {
+                    drop(writeln!(io::stderr(), "{line}"));
+                }
+                dumped = true;
+            }
+            if !dumped {
+                drop(writeln!(
+                    io::stderr(),
+                    "(log tail unavailable — visualizer locks contended)"
+                ));
+            }
+            drop(writeln!(io::stderr(), "=== end crash report ===\n"));
+            prev(info);
+        }));
+    });
+}
+
+struct DumbVisualizer {
+    last_draw: Instant,
+    last_lines: Vec<String>,
+}
+
+impl InteractiveVisualizer {
+    fn new() -> io::Result<Self> {
+        // Never claim the alt-screen during the test binary: shared
+        // global terminal state racing with parallel tests is a recipe
+        // for hangs, and the existing "use Dumb when not attached to
+        // TTY" tests rely on this short-circuit to assert their
+        // invariants without needing to fake a tty.
+        {
+            // Route the chart to /dev/tty rather than stdout, so it
+            // works even when the parent shell pipes stdout/stderr
+            // through `tee` (as run.sh does to capture $RESULTS). Logs
+            // continue to go to stderr → tee → file; the chart goes to
+            // the real controlling terminal. Two independent surfaces,
+            // no cross-contamination.
+            let tty_write = open_dev_tty()?;
+            let tty_for_teardown = tty_write.try_clone()?;
+            let tty_for_hook = tty_write.try_clone()?;
+            enable_raw_mode()?;
+            let mut tty_init = tty_write.try_clone()?;
+            execute!(tty_init, EnterAlternateScreen)?;
+            install_tty_handle(tty_for_hook);
+            install_panic_hook();
+            let backend = CrosstermBackend::new(tty_write);
+            let terminal = Terminal::new(backend)?;
+            Ok(Self {
+                terminal,
+                tty_for_teardown,
+                last_draw: Instant::now() - INTERACTIVE_DRAW_INTERVAL,
+            })
+        }
+    }
+
+    fn maybe_draw(&mut self, model: &VisualizerModel, force: bool) {
+        if !force && self.last_draw.elapsed() < INTERACTIVE_DRAW_INTERVAL {
+            return;
+        }
+        self.draw(model).ok();
+        self.last_draw = Instant::now();
+    }
+
+    fn draw(&mut self, model: &VisualizerModel) -> io::Result<()> {
+        let cost_accepted = model.history_cost_accepted.clone();
+        let cost_trial = model.history_cost_trial.clone();
+        let grad_data = model.history_grad_log.clone();
+        let status = model.current_status.clone();
+        let stage = model.current_stage.clone();
+        let detail = model.current_detail.clone();
+        let eval_state = model.current_eval_state.clone();
+        let iter = model.current_iter;
+        let best = model.best_cost;
+        let elapsed = model.start_time.elapsed().as_secs();
+        let current_cost = model.current_cost;
+        let current_grad = model.current_grad;
+        let primary_lane = model.primary_lane.clone();
+        let secondary_lane = model.secondary_lane.clone();
+        let edf_terms = model.edf_terms.clone();
+        let diagnostics_lines = model.diagnostics_lines.clone();
+        let log_tail: Vec<String> = model.log_tail.iter().cloned().collect();
+        let diagnostics_condition = model.diagnostics_condition;
+        let diagnostics_step_size = model.diagnostics_step_size;
+        let diagnostics_ridge = model.diagnostics_ridge;
+        let status_class = classify_model_status(model);
+        let accent = status_color(status_class);
+        let primary_class = classify_lane_status(&primary_lane, status_class);
+        let secondary_class = classify_lane_status(&secondary_lane, status_class);
+
+        self.terminal.draw(|f| {
+            let area = f.area();
+            let compact = area.height < 30 || area.width < 120;
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(if compact {
+                    [Constraint::Percentage(68), Constraint::Percentage(32)]
+                } else {
+                    [Constraint::Percentage(72), Constraint::Percentage(28)]
+                })
+                .split(area);
+            let top_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints(if compact {
+                    [Constraint::Percentage(58), Constraint::Percentage(42)]
+                } else {
+                    [Constraint::Percentage(62), Constraint::Percentage(38)]
+                })
+                .split(chunks[0]);
+
+            let (min_y, max_y) = if cost_accepted.is_empty() && cost_trial.is_empty() {
+                (0.0, 1.0)
+            } else {
+                let minval = cost_accepted
+                    .iter()
+                    .chain(cost_trial.iter())
+                    .map(|(_, y)| *y)
+                    .fold(f64::INFINITY, f64::min);
+                let maxval = cost_accepted
+                    .iter()
+                    .chain(cost_trial.iter())
+                    .map(|(_, y)| *y)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                (minval, maxval)
+            };
+            let window = (max_y - min_y).max(1.0);
+
+            // Order matters: ratatui's Chart draws datasets in declaration
+            // order, so the LAST dataset wins overlaps. We want the accepted
+            // descent line visible on top of the trial scatter — without
+            // this swap the light-blue dots cover the cyan line wherever
+            // the optimizer accepted a probe, making the descent invisible
+            // on solvers with high accept ratios (BFGS, late ARC).
+            let datasets = vec![
+                Dataset::default()
+                    .name("Trial")
+                    .marker(symbols::Marker::Dot)
+                    .graph_type(GraphType::Scatter)
+                    .style(Style::default().fg(Color::LightBlue))
+                    .data(&cost_trial),
+                Dataset::default()
+                    .name("Accepted")
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Cyan))
+                    .data(&cost_accepted),
+            ];
+
+            let chart = Chart::new(datasets)
+                .block(
+                    Block::default()
+                        .title(" Objective (LAML / REML) ")
+                        .border_style(Style::default().fg(accent))
+                        .borders(Borders::ALL),
+                )
+                .x_axis(
+                    Axis::default()
+                        // The chart axis is keyed by the bridge-eval counter
+                        // (one tick per `record_outer_eval`), not by the
+                        // optimizer's iter index. Each accepted outer iter
+                        // typically produces 1-3 evals depending on the
+                        // solver (BFGS: 1, ARC: ~2, MFTR-operator: 1), so
+                        // "Outer Eval" is the honest label — calling it
+                        // "Outer Iteration" would imply a denser-than-actual
+                        // accept rate on multi-eval solvers.
+                        .title("Outer Eval")
+                        .bounds([0.0, iter.max(10.0)])
+                        .labels(vec![
+                            Line::from("0"),
+                            Line::from(format!("{:.0}", iter.max(10.0))),
+                        ]),
+                )
+                .y_axis(
+                    Axis::default()
+                        .title("Objective Value")
+                        .bounds([min_y - window * 0.1, max_y + window * 0.1])
+                        .labels(vec![
+                            Line::from(format!("{:.2}", min_y)),
+                            Line::from(format!("{:.2}", max_y)),
+                        ]),
+                );
+            f.render_widget(chart, top_chunks[0]);
+
+            let right_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(if compact {
+                    [Constraint::Percentage(36), Constraint::Percentage(64)]
+                } else {
+                    [Constraint::Percentage(34), Constraint::Percentage(66)]
+                })
+                .split(top_chunks[1]);
+
+            let summary_lines = summary_panel_lines(
+                &stage,
+                &detail,
+                &status,
+                elapsed,
+                &primary_lane,
+                &secondary_lane,
+                primary_class,
+                secondary_class,
+            );
+            let summary_panel = Paragraph::new(summary_lines)
+                .block(
+                    Block::default()
+                        .title(" Session ")
+                        .border_style(Style::default().fg(accent))
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: true });
+            f.render_widget(summary_panel, right_chunks[0]);
+
+            let mut model_lines = Vec::<String>::new();
+            if edf_terms.is_empty() {
+                model_lines
+                    .push("  Waiting for effective degrees of freedom updates...".to_string());
+            } else {
+                let maxrows = right_chunks[1]
+                    .height
+                    .saturating_sub(if compact { 3 } else { 4 })
+                    as usize;
+                let mut shown_terms = edf_terms.clone();
+                shown_terms
+                    .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                if shown_terms.len() > maxrows.saturating_sub(1) && maxrows > 1 {
+                    shown_terms.truncate(maxrows - 1);
+                    model_lines.push(format!("showing top {} terms by EDF", shown_terms.len()));
+                }
+                let namew = shown_terms
+                    .iter()
+                    .map(|(name, _, _)| name.len())
+                    .max()
+                    .unwrap_or(8)
+                    .min(if compact { 14 } else { 20 })
+                    .max(6);
+                for (name, edf, ref_df) in shown_terms {
+                    let ratio = if ref_df > 0.0 {
+                        (edf / ref_df).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let barwidth = if compact { 12 } else { 20 };
+                    let bar = unicode_bar(ratio, barwidth);
+                    let displayname = if name.len() > namew {
+                        let keep = namew.saturating_sub(1);
+                        format!("{}…", &name[..keep])
+                    } else {
+                        name
+                    };
+                    model_lines.push(format!(
+                        "{:<namew$} effective {:>6.2} of {:>6.2} reference  {}",
+                        displayname,
+                        edf,
+                        ref_df,
+                        bar,
+                        namew = namew
+                    ));
+                }
+            }
+
+            let model_panel = Paragraph::new(model_lines.join("\n"))
+                .block(
+                    Block::default()
+                        .title(" Effective Degrees of Freedom ")
+                        .border_style(Style::default().fg(Color::LightCyan))
+                        .borders(Borders::ALL),
+                )
+                .style(Style::default().fg(Color::White))
+                .wrap(Wrap { trim: true });
+            f.render_widget(model_panel, right_chunks[1]);
+
+            // The bottom panel mixes three streams that each want their
+            // own visual treatment, so build it as Vec<Line> with
+            // per-line styling rather than a single Paragraph of joined
+            // strings:
+            //   1. Solver metrics (default white) — current eval state
+            //   2. Numerical health (dim, color value if anomalous)
+            //   3. Pinned warnings/errors from push_diagnostic (yellow/red)
+            //   4. Live log stream from log_tail (severity-colored)
+            let label = |s: &'static str| Span::styled(s, Style::default().fg(Color::DarkGray));
+            let value = |s: String| Span::styled(s, Style::default().fg(Color::White).bold());
+            let mut diag_lines: Vec<TextLine<'static>> = Vec::new();
+            diag_lines.push(TextLine::from(vec![
+                label("Stage:   "),
+                value(stage.clone()),
+                Span::raw("   "),
+                label("Detail: "),
+                Span::styled(detail.clone(), Style::default().fg(Color::Gray)),
+            ]));
+            diag_lines.push(TextLine::from(vec![
+                label("Eval:    "),
+                value(format!("{:.0} {eval_state}", iter)),
+                Span::raw("   "),
+                label("Status: "),
+                Span::styled(status.clone(), Style::default().fg(accent)),
+            ]));
+            diag_lines.push(TextLine::from(vec![
+                label("Best:    "),
+                value(format!("{best:.6}")),
+                Span::raw("   "),
+                label("Current: "),
+                value(format!("{current_cost:.6}")),
+                Span::raw("   "),
+                label("|grad|: "),
+                value(format!("{current_grad:.3e}")),
+                Span::raw("   "),
+                label("Elapsed: "),
+                value(format!("{elapsed}s")),
+            ]));
+            let fmt_opt = |v: Option<f64>| {
+                v.map(|x| format!("{x:.3e}"))
+                    .unwrap_or_else(|| "n/a".to_string())
+            };
+            diag_lines.push(TextLine::from(vec![
+                label("κ(H): "),
+                value(fmt_opt(diagnostics_condition)),
+                Span::raw("   "),
+                label("|Δρ|: "),
+                value(fmt_opt(diagnostics_step_size)),
+                Span::raw("   "),
+                label("ridge: "),
+                value(fmt_opt(diagnostics_ridge)),
+                Span::raw("   "),
+                label("log10|grad|: "),
+                value(format!(
+                    "{:.3}",
+                    grad_data.last().map(|(_, y)| *y).unwrap_or(0.0)
+                )),
+            ]));
+            diag_lines.push(TextLine::from(""));
+
+            // Pinned warnings/errors from push_diagnostic. These are
+            // explicit "look at me" signals from the solver; surface
+            // them above the log stream and color by content so the
+            // user's eye lands on them first.
+            if !diagnostics_lines.is_empty() {
+                diag_lines.push(TextLine::from(Span::styled(
+                    "Warnings & notices:",
+                    Style::default().fg(Color::LightYellow).bold(),
+                )));
+                let pinned_cap = if compact { 2 } else { 3 };
+                let start = diagnostics_lines.len().saturating_sub(pinned_cap);
+                for line in diagnostics_lines.iter().skip(start) {
+                    let color = log_line_severity_color(line);
+                    diag_lines.push(TextLine::from(vec![
+                        Span::styled("  • ", Style::default().fg(color)),
+                        Span::styled(line.clone(), Style::default().fg(color)),
+                    ]));
+                }
+                diag_lines.push(TextLine::from(""));
+            }
+
+            // Live log stream — the "tail -f" inside the chart. Color
+            // each line by severity so warnings/errors leap out of the
+            // info stream. Without this the panel reads as a wall of
+            // identically-colored text and the user has to actually
+            // read each line to notice problems.
+            diag_lines.push(TextLine::from(Span::styled(
+                "Recent log (live):",
+                Style::default().fg(Color::LightCyan).bold(),
+            )));
+            let base_reserved = diag_lines.len() + 1;
+            let availrows = chunks[1].height.saturating_sub(2) as usize;
+            let max_log_lines = availrows.saturating_sub(base_reserved).max(1);
+            if log_tail.is_empty() {
+                diag_lines.push(TextLine::from(Span::styled(
+                    "  (no log records yet)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+            } else {
+                let start = log_tail.len().saturating_sub(max_log_lines);
+                for line in log_tail.into_iter().skip(start) {
+                    let color = log_line_severity_color(&line);
+                    diag_lines.push(TextLine::from(vec![
+                        Span::styled("  ", Style::default()),
+                        Span::styled(line, Style::default().fg(color)),
+                    ]));
+                }
+            }
+            diag_lines.push(TextLine::from(Span::styled(
+                "Press Ctrl+C to abort  ·  logs also stream to stderr",
+                Style::default().fg(Color::DarkGray).italic(),
+            )));
+
+            let diagnostics_panel = Paragraph::new(diag_lines)
+                .block(
+                    Block::default()
+                        .title(" Diagnostics ")
+                        .border_style(Style::default().fg(accent))
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false });
+            f.render_widget(diagnostics_panel, chunks[1]);
+        })?;
+        Ok(())
+    }
+
+    fn teardown(&mut self, model: &VisualizerModel) {
+        self.maybe_draw(model, true);
+        disable_raw_mode().ok();
+        execute!(self.tty_for_teardown, LeaveAlternateScreen).ok();
+        drop(self.tty_for_teardown.flush());
+        clear_tty_handle();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StatusClass {
+    Running,
+    Success,
+    Warning,
+    Error,
+}
+
+impl DumbVisualizer {
+    fn new() -> Self {
+        Self {
+            last_draw: Instant::now() - DUMB_DRAW_INTERVAL,
+            last_lines: Vec::new(),
+        }
+    }
+
+    fn maybe_draw(&mut self, model: &VisualizerModel, force: bool) {
+        if !force && self.last_draw.elapsed() < DUMB_DRAW_INTERVAL {
+            return;
+        }
+        self.draw(model, force);
+        self.last_draw = Instant::now();
+    }
+
+    fn draw(&mut self, model: &VisualizerModel, force: bool) {
+        let lines = dumb_render_lines(model);
+        if !force && lines == self.last_lines {
+            return;
+        }
+        self.last_lines = lines.clone();
+        drop(lines);
+    }
+
+    fn teardown(&mut self, model: &VisualizerModel) {
+        self.maybe_draw(model, true);
+    }
+}
+
+impl Default for VisualizerSession {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(VisualizerState::Disabled)),
+            model: Arc::new(Mutex::new(VisualizerModel::default())),
+            owns_active_feed: false,
+        }
+    }
+}
+
+fn lock_model(model: &SharedModel) -> std::sync::MutexGuard<'_, VisualizerModel> {
+    match model.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+fn lock_state(state: &SharedState) -> std::sync::MutexGuard<'_, VisualizerState> {
+    match state.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    }
+}
+
+fn redraw_state(state: &SharedState, snapshot: &VisualizerModel, force: bool) {
+    let mut state = lock_state(state);
+    match &mut *state {
+        VisualizerState::Disabled => {}
+        VisualizerState::Interactive(vis) => vis.maybe_draw(snapshot, force),
+        VisualizerState::Dumb(vis) => vis.maybe_draw(snapshot, force),
+    }
+}
+
+impl VisualizerSession {
+    pub fn new(enabled: bool) -> Self {
+        init_logging();
+        if !enabled {
+            return Self::default();
+        }
+        // Disable live progress rendering. The renderer's carriage/cursor
+        // control interacts badly with captured large-scale logs and makes the
+        // canonical run file harder to read than plain records. Keep an
+        // active feed so solver internals can still publish progress samples,
+        // but route the session to a silent dumb renderer.
+        let state_inner = if live_visualization_enabled() {
+            match InteractiveVisualizer::new() {
+                Ok(v) => VisualizerState::Interactive(v),
+                Err(_) => VisualizerState::Dumb(DumbVisualizer::new()),
+            }
+        } else {
+            VisualizerState::Dumb(DumbVisualizer::new())
+        };
+        let session = Self {
+            state: Arc::new(Mutex::new(state_inner)),
+            model: Arc::new(Mutex::new(VisualizerModel::default())),
+            owns_active_feed: true,
+        };
+        install_active_feed(ActiveFeed {
+            model: session.model.clone(),
+            state: session.state.clone(),
+        });
+        session
+    }
+
+    pub fn is_active(&self) -> bool {
+        !matches!(&*lock_state(&self.state), VisualizerState::Disabled)
+    }
+
+    pub fn update(
+        &mut self,
+        cost: f64,
+        grad_norm: f64,
+        status_msg: &str,
+        iter: f64,
+        eval_state: &str,
+        total_steps: Option<usize>,
+    ) {
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.current_iter = iter;
+            model.current_cost = cost;
+            model.current_grad = grad_norm;
+            model.current_eval_state = eval_state.to_string();
+            model.current_status = status_msg.to_string();
+
+            if let Some(total) = total_steps {
+                model.primary_lane.total = Some(total);
+                model.primary_lane.current = iter.max(0.0).round() as usize;
+            }
+
+            if cost.is_finite() && cost.abs() < 1e15 {
+                let target_series = if eval_state == "trial" {
+                    &mut model.history_cost_trial
+                } else {
+                    &mut model.history_cost_accepted
+                };
+                push_sample(target_series, (iter, cost));
+                if cost < model.best_cost {
+                    model.best_cost = cost;
+                }
+            }
+
+            if grad_norm.is_finite() {
+                let grad_log = grad_norm.max(1e-12).log10();
+                push_sample(&mut model.history_grad_log, (iter, grad_log));
+            }
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, false);
+    }
+
+    pub fn set_stage(&mut self, stage: &str, detail: &str) {
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.current_stage = stage.to_string();
+            model.current_detail = detail.to_string();
+            model.current_status = detail.to_string();
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
+    }
+
+    pub fn start_workflow(&mut self, label: &str, total: usize) {
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.primary_lane = started_lane(label, total);
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
+    }
+
+    /// Start a primary workflow whose total step count is unknown in advance.
+    /// Renders as `Workflow: <label> | step=N | objective=… | …` rather than a
+    /// percentage bar — used by callers like the Python bindings where the
+    /// pyffi entry point doesn't pre-compute a fit-step total and a perpetual
+    /// 0% bar would be misleading. The optimizer-pushed `objective` / `|grad|`
+    /// fields still populate via the same `record_outer_eval` path.
+    pub fn start_workflow_open_ended(&mut self, label: &str) {
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.primary_lane = LaneState {
+                label: label.to_string(),
+                current: 0,
+                total: None,
+                done: false,
+            };
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
+    }
+
+    pub fn advance_workflow(&mut self, current: usize) {
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            if model.primary_lane.label.is_empty() {
+                return;
+            }
+            advance_lane(&mut model.primary_lane, current);
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, false);
+    }
+
+    pub fn start_secondary_workflow(&mut self, label: &str, total: usize) {
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.secondary_lane = started_lane(label, total);
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
+    }
+
+    pub fn advance_secondary_workflow(&mut self, current: usize) {
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            if model.secondary_lane.label.is_empty() {
+                return;
+            }
+            advance_lane(&mut model.secondary_lane, current);
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, false);
+    }
+
+    pub fn finish_secondary_progress(&mut self, message: &str) {
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            if model.secondary_lane.label.is_empty() {
+                return;
+            }
+            if let Some(total) = model.secondary_lane.total {
+                model.secondary_lane.current = total;
+            }
+            model.secondary_lane.done = true;
+            model.diagnostics_lines.push(message.to_string());
+            if model.diagnostics_lines.len() > MAX_DIAGNOSTIC_LINES {
+                let overflow = model.diagnostics_lines.len() - MAX_DIAGNOSTIC_LINES;
+                model.diagnostics_lines.drain(0..overflow);
+            }
+            let snap = model.clone();
+            model.secondary_lane = LaneState::default();
+            snap
+        };
+        redraw_state(&self.state, &snapshot, true);
+    }
+
+    pub fn finish_progress(&mut self, message: &str) {
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            if model.primary_lane.label.is_empty() {
+                return;
+            }
+            if let Some(total) = model.primary_lane.total {
+                model.primary_lane.current = total;
+            }
+            model.primary_lane.done = true;
+            model.diagnostics_lines.push(message.to_string());
+            if model.diagnostics_lines.len() > MAX_DIAGNOSTIC_LINES {
+                let overflow = model.diagnostics_lines.len() - MAX_DIAGNOSTIC_LINES;
+                model.diagnostics_lines.drain(0..overflow);
+            }
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
+    }
+
+    pub fn push_diagnostic(&mut self, message: &str) {
+        let snapshot = {
+            let mut model = lock_model(&self.model);
+            model.diagnostics_lines.push(message.to_string());
+            if model.diagnostics_lines.len() > MAX_DIAGNOSTIC_LINES {
+                let overflow = model.diagnostics_lines.len() - MAX_DIAGNOSTIC_LINES;
+                model.diagnostics_lines.drain(0..overflow);
+            }
+            model.clone()
+        };
+        redraw_state(&self.state, &snapshot, true);
+    }
+
+    pub fn teardown(&mut self) {
+        if self.owns_active_feed {
+            clear_active_feed();
+            self.owns_active_feed = false;
+        }
+        let snapshot = lock_model(&self.model).clone();
+        let mut state = lock_state(&self.state);
+        match &mut *state {
+            VisualizerState::Disabled => {}
+            VisualizerState::Interactive(vis) => vis.teardown(&snapshot),
+            VisualizerState::Dumb(vis) => vis.teardown(&snapshot),
+        }
+        *state = VisualizerState::Disabled;
+    }
+}
+
+impl Drop for VisualizerSession {
+    fn drop(&mut self) {
+        self.teardown();
+    }
+}
+
+fn push_sample(series: &mut Vec<(f64, f64)>, sample: (f64, f64)) {
+    series.push(sample);
+    if series.len() > MAX_HISTORY_POINTS {
+        let mut compacted = Vec::with_capacity(series.len() / 2 + 1);
+        for (idx, point) in series.iter().enumerate() {
+            if idx % 2 == 0 {
+                compacted.push(*point);
+            }
+        }
+        *series = compacted;
+    }
+}
+
+fn classify_model_status(model: &VisualizerModel) -> StatusClass {
+    let status = model.current_status.to_ascii_lowercase();
+    let detail = model.current_detail.to_ascii_lowercase();
+    let recent_diag = model
+        .diagnostics_lines
+        .last()
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if contains_error_signal(&status)
+        || contains_error_signal(&detail)
+        || contains_error_signal(&recent_diag)
+    {
+        StatusClass::Error
+    } else if contains_warning_signal(&status)
+        || contains_warning_signal(&detail)
+        || contains_warning_signal(&recent_diag)
+    {
+        StatusClass::Warning
+    } else if contains_success_signal(&status) || contains_success_signal(&detail) {
+        StatusClass::Success
+    } else {
+        StatusClass::Running
+    }
+}
+
+fn classify_lane_status(lane: &LaneState, model_class: StatusClass) -> StatusClass {
+    if lane.done {
+        StatusClass::Success
+    } else {
+        model_class
+    }
+}
+
+fn contains_error_signal(text: &str) -> bool {
+    ["error", "failed", "indefinite", "abort"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn contains_warning_signal(text: &str) -> bool {
+    ["warning", "stalled", "max iterations", "non-finite"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+fn contains_success_signal(text: &str) -> bool {
+    ["complete", "converged", "finished", "done"]
+        .iter()
+        .any(|needle| text.contains(needle))
+}
+
+// Severity color for a single log line in the Diagnostics panel.
+// Inspects the formatted record text — log records arrive here already
+// formatted by `format_log_record` and may carry tags like "[WARN]" /
+// "[ERROR]" injected by individual emitters (e.g. PIRLS warnings), or
+// natural-language signals matched by the same predicates the model
+// status uses. Keeping these in one place means a line that contributes
+// to "model status = Warning" also reads as warning-colored in the
+// log scroll, so the two surfaces never disagree.
+fn log_line_severity_color(line: &str) -> Color {
+    let lower = line.to_ascii_lowercase();
+    if contains_error_signal(&lower) || lower.contains("[error]") || lower.contains("panic") {
+        Color::LightRed
+    } else if contains_warning_signal(&lower) || lower.contains("[warn") {
+        Color::LightYellow
+    } else if contains_success_signal(&lower) {
+        Color::LightGreen
+    } else {
+        Color::Gray
+    }
+}
+
+fn status_color(class: StatusClass) -> Color {
+    match class {
+        StatusClass::Running => Color::Cyan,
+        StatusClass::Success => Color::Green,
+        StatusClass::Warning => Color::Yellow,
+        StatusClass::Error => Color::Red,
+    }
+}
+
+fn status_label(class: StatusClass) -> &'static str {
+    match class {
+        StatusClass::Running => "RUNNING",
+        StatusClass::Success => "CONVERGED",
+        StatusClass::Warning => "WARNING",
+        StatusClass::Error => "ERROR",
+    }
+}
+
+fn summary_panel_lines(
+    stage: &str,
+    detail: &str,
+    status: &str,
+    elapsed: u64,
+    primary_lane: &LaneState,
+    secondary_lane: &LaneState,
+    primary_class: StatusClass,
+    secondary_class: StatusClass,
+) -> Vec<TextLine<'static>> {
+    let model_class =
+        if secondary_class == StatusClass::Error || primary_class == StatusClass::Error {
+            StatusClass::Error
+        } else if secondary_class == StatusClass::Warning || primary_class == StatusClass::Warning {
+            StatusClass::Warning
+        } else if primary_class == StatusClass::Success
+            && (secondary_lane.label.is_empty() || secondary_class == StatusClass::Success)
+        {
+            StatusClass::Success
+        } else {
+            StatusClass::Running
+        };
+    let mut lines = vec![
+        TextLine::from(vec![
+            Span::styled(
+                format!(" {} ", status_label(model_class)),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(status_color(model_class))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                stage.to_ascii_uppercase(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        TextLine::from(Span::styled(
+            detail.to_string(),
+            Style::default().fg(Color::Gray),
+        )),
+        TextLine::from(Span::styled(
+            format!("Elapsed {}s", elapsed),
+            Style::default().fg(Color::DarkGray),
+        )),
+        lane_line("Outer", primary_lane, primary_class),
+    ];
+    if !secondary_lane.label.is_empty() {
+        lines.push(lane_line("Inner", secondary_lane, secondary_class));
+    }
+    lines.push(TextLine::from(Span::styled(
+        status.to_string(),
+        Style::default().fg(status_color(model_class)),
+    )));
+    lines
+}
+
+fn lane_line(name: &str, lane: &LaneState, class: StatusClass) -> TextLine<'static> {
+    let color = status_color(class);
+    let label = if lane.label.is_empty() {
+        format!("{name}: idle")
+    } else {
+        match lane.total {
+            Some(total) if total > 0 => {
+                let ratio = lane.current.min(total) as f64 / total as f64;
+                format!(
+                    "{name}: {} ▕{}▏ {}/{}",
+                    lane.label,
+                    unicode_bar(ratio, 12),
+                    lane.current.min(total),
+                    total
+                )
+            }
+            _ => format!("{name}: {} step {}", lane.label, lane.current),
+        }
+    };
+    TextLine::from(Span::styled(label, Style::default().fg(color)))
+}
+
+fn dumb_render_lines(model: &VisualizerModel) -> Vec<String> {
+    if model.current_stage == "init"
+        && model.current_detail.is_empty()
+        && model.diagnostics_lines.is_empty()
+        && !model.current_cost.is_finite()
+        && !model.current_grad.is_finite()
+    {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let elapsed = model.start_time.elapsed().as_secs();
+    let status_class = classify_model_status(model);
+    let detail = if model.current_detail.is_empty() {
+        model.current_status.as_str()
+    } else {
+        model.current_detail.as_str()
+    };
+    lines.push(format!(
+        "[{}] {} | {} | elapsed={}s",
+        status_label(status_class),
+        model.current_stage,
+        detail,
+        elapsed,
+    ));
+    if !model.primary_lane.label.is_empty() {
+        lines.push(render_dumb_lane("Workflow", &model.primary_lane, model));
+    }
+    if !model.secondary_lane.label.is_empty() {
+        lines.push(render_dumb_lane("Inner", &model.secondary_lane, model));
+    }
+    // Inline ASCII sparkline of the accepted-cost descent. Only meaningful
+    // once the optimizer has accepted ≥ 3 distinct iterates; below that the
+    // line carries no shape information and would just add visual noise.
+    // Live monotonic optimizers (BFGS, ARC) produce a descending sparkline
+    // that lets a user reading piped output mentally verify "yes, the
+    // objective is still going down" without having to diff the numbers.
+    if let Some(spark) = cost_sparkline(&model.history_cost_accepted, 24) {
+        lines.push(format!("Descent: {spark}"));
+    }
+    if let Some(last) = model.diagnostics_lines.last() {
+        lines.push(format!("Note: {last}"));
+    }
+    lines
+}
+
+/// Render a Unicode block sparkline of the accepted-cost series. Returns
+/// `None` when there are fewer than 3 distinct samples — a 0-, 1-, or 2-point
+/// sparkline conveys nothing. Width `slots` is the target character count;
+/// dense series get bucketed (mean per bucket) so the sparkline always fits.
+fn cost_sparkline(series: &[(f64, f64)], slots: usize) -> Option<String> {
+    if slots == 0 || series.len() < 3 {
+        return None;
+    }
+    let costs: Vec<f64> = series
+        .iter()
+        .map(|(_, c)| *c)
+        .filter(|c| c.is_finite())
+        .collect();
+    if costs.len() < 3 {
+        return None;
+    }
+    let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+    for &c in &costs {
+        lo = lo.min(c);
+        hi = hi.max(c);
+    }
+    // Skip when the range is degenerate: every sample numerically identical.
+    // A flat sparkline reads as "stuck", which would mislead — better to show
+    // nothing and let the `objective=`/`Δ=` fields carry the truth.
+    if !(hi.is_finite() && lo.is_finite()) || (hi - lo) <= 0.0 {
+        return None;
+    }
+    // Bucket the series down to `slots` cells when longer. Each cell shows
+    // the mean cost in its bucket — preserves the descent envelope on long
+    // runs where naive subsampling would alias the trajectory.
+    let buckets = slots.min(costs.len());
+    let mut cells: Vec<f64> = Vec::with_capacity(buckets);
+    let n = costs.len() as f64;
+    for k in 0..buckets {
+        let start = ((k as f64 / buckets as f64) * n).floor() as usize;
+        let end = (((k + 1) as f64 / buckets as f64) * n).ceil() as usize;
+        let slice = &costs[start.min(costs.len())..end.min(costs.len())];
+        if slice.is_empty() {
+            cells.push(*costs.last().unwrap());
+        } else {
+            let m = slice.iter().sum::<f64>() / slice.len() as f64;
+            cells.push(m);
+        }
+    }
+    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    let range = hi - lo;
+    let mut out = String::with_capacity(buckets);
+    for c in cells {
+        let t = ((c - lo) / range).clamp(0.0, 1.0);
+        let idx = (t * (BLOCKS.len() as f64 - 1.0)).round() as usize;
+        out.push(BLOCKS[idx.min(BLOCKS.len() - 1)]);
+    }
+    Some(out)
+}
+
+fn render_dumb_lane(prefix: &str, lane: &LaneState, model: &VisualizerModel) -> String {
+    match lane.total {
+        Some(total) if total > 0 => {
+            let ratio = lane.current.min(total) as f64 / total as f64;
+            let mut parts = vec![
+                format!("{prefix}: {}", lane.label),
+                format!(
+                    "{:>3}% ▕{}▏",
+                    (ratio * 100.0).round() as usize,
+                    unicode_bar(ratio, 16)
+                ),
+            ];
+            if let Some(eta) = estimate_eta(model, lane) {
+                parts.push(format!("ETA: {eta}"));
+            }
+            append_optimizer_metrics(&mut parts, model);
+            parts.join(" | ")
+        }
+        _ => {
+            let mut parts = vec![
+                format!("{prefix}: {}", lane.label),
+                format!("step={}", lane.current),
+            ];
+            append_optimizer_metrics(&mut parts, model);
+            parts.join(" | ")
+        }
+    }
+}
+
+/// Append the optimizer-progress fields (objective + best-so-far + signed Δ
+/// vs previous accepted + gradient norm) to a dumb-mode lane line. Centralised
+/// so both branches in `render_dumb_lane` show the same trail of fields, and
+/// new optimizer metrics (e.g. trust-region radius, accept rho) can be added
+/// in one place. The Δ field needs ≥ 2 accepted samples; until then we omit
+/// it rather than print "Δ=n/a" which competes for line width with the
+/// existing ETA / |grad| fields.
+fn append_optimizer_metrics(parts: &mut Vec<String>, model: &VisualizerModel) {
+    if model.current_cost.is_finite() {
+        let mut obj = format!("objective={}", format_metric(model.current_cost, "{:.4}"));
+        let has_best = model.best_cost.is_finite() && model.best_cost.abs() < 1e15;
+        let has_delta = model.history_cost_accepted.len() >= 2;
+        if has_best || has_delta {
+            let mut extras: Vec<String> = Vec::new();
+            if has_best {
+                extras.push(format!("best={}", format_metric(model.best_cost, "{:.4}")));
+            }
+            if has_delta {
+                let n = model.history_cost_accepted.len();
+                let last = model.history_cost_accepted[n - 1].1;
+                let prev = model.history_cost_accepted[n - 2].1;
+                let delta = last - prev;
+                extras.push(format!("Δ={:+.3e}", delta));
+            }
+            obj.push_str(&format!(" ({})", extras.join(", ")));
+        }
+        parts.push(obj);
+    }
+    if model.current_grad.is_finite() {
+        parts.push(format!(
+            "|grad|={}",
+            format_metric(model.current_grad, "{:.3e}")
+        ));
+    }
+}
+
+fn estimate_eta(model: &VisualizerModel, lane: &LaneState) -> Option<String> {
+    let Some(total) = lane.total else {
+        return None;
+    };
+    if lane.current == 0 || lane.current >= total {
+        return None;
+    }
+    let elapsed = model.start_time.elapsed().as_secs_f64();
+    if elapsed < 1.0 {
+        return None;
+    }
+    let rate = lane.current as f64 / elapsed.max(1e-6);
+    if rate <= 0.0 {
+        return None;
+    }
+    let remaining = total.saturating_sub(lane.current) as f64 / rate.max(1e-6);
+    Some(format!("{:.0}s", remaining.max(0.0)))
+}
+
+fn format_metric(value: f64, fmt: &str) -> String {
+    if value.is_finite() {
+        if fmt == "{:.3e}" {
+            format!("{value:.3e}")
+        } else {
+            format!("{value:.4}")
+        }
+    } else {
+        "n/a".to_string()
+    }
+}
+
+fn unicode_bar(ratio: f64, width: usize) -> String {
+    const STEPS: [char; 9] = [' ', '▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+    let clamped = ratio.clamp(0.0, 1.0);
+    let filled = clamped * width as f64;
+    let full = filled.floor() as usize;
+    let partial = ((filled - full as f64) * 8.0).round() as usize;
+    let mut out = String::with_capacity(width);
+    for idx in 0..width {
+        if idx < full {
+            out.push('█');
+        } else if idx == full && partial > 0 {
+            out.push(STEPS[partial.min(8)]);
+        } else {
+            out.push(' ');
+        }
+    }
+    out
+}
+
+fn normalize_total(total: usize) -> usize {
+    total.max(1)
+}
+
+fn live_visualization_enabled() -> bool {
+    false
+}
+
+fn started_lane(label: &str, total: usize) -> LaneState {
+    LaneState {
+        label: label.to_string(),
+        current: 0,
+        total: Some(normalize_total(total)),
+        done: false,
+    }
+}
+
+fn advance_lane(lane: &mut LaneState, current: usize) {
+    let next = match lane.total {
+        Some(total) => current.min(total),
+        None => current,
+    };
+    lane.current = lane.current.max(next);
+    lane.done = false;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl VisualizerSession {
+        pub(super) fn is_interactive(&self) -> bool {
+            matches!(&*lock_state(&self.state), VisualizerState::Interactive(_))
+        }
+    }
+
+    #[test]
+    fn unicode_bar_uses_partial_blocks() {
+        let bar = unicode_bar(0.53, 8);
+        assert!(bar.contains('█'));
+        assert!(bar.contains('▎') || bar.contains('▍') || bar.contains('▌') || bar.contains('▋'));
+    }
+
+    fn snapshot(session: &VisualizerSession) -> VisualizerModel {
+        lock_model(&session.model).clone()
+    }
+
+    #[test]
+    fn dumb_renderer_throttles_to_seconds_and_formats_eta() {
+        let mut session = VisualizerSession::new(false);
+        lock_model(&session.model).start_time = Instant::now() - Duration::from_secs(4);
+        session.set_stage("fit", "optimizing");
+        session.start_workflow("REML", 10);
+        session.advance_workflow(4);
+        session.update(42.0, 1e-3, "optimizing", 4.0, "accepted", Some(10));
+        let lines = dumb_render_lines(&snapshot(&session));
+        assert!(lines.iter().any(|line| line.contains("Workflow: REML")));
+        assert!(lines.iter().any(|line| line.contains("ETA:")));
+    }
+
+    #[test]
+    fn dumb_renderer_suppresses_uninitialized_frames() {
+        let session = VisualizerSession::new(false);
+        let lines = dumb_render_lines(&snapshot(&session));
+        assert!(lines.is_empty());
+    }
+
+    #[test]
+    fn log_sanitizer_splits_carriage_returns_and_drops_controls() {
+        let sanitized = sanitize_log_message(
+            "abc\rdef\u{1b}[2K\nghi\tjkl\u{1b}]0;title\u{7}mno\u{1b}Pprivate\u{1b}\\pqr",
+        );
+        assert_eq!(sanitized, "abc\ndef\nghi\tjklmnopqr");
+    }
+
+    #[test]
+    fn dumb_renderer_omits_placeholder_metrics() {
+        let mut session = VisualizerSession::new(false);
+        session.set_stage("fit", "loading survival data");
+        session.start_workflow("Survival Fit", 5);
+        session.advance_workflow(1);
+        let lines = dumb_render_lines(&snapshot(&session));
+        assert!(!lines.iter().any(|line| line.contains("n/a")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Workflow: Survival Fit"))
+        );
+    }
+
+    #[test]
+    fn diagnostics_ring_buffer_drops_old_messages() {
+        let mut session = VisualizerSession::new(false);
+        for idx in 0..20 {
+            session.push_diagnostic(&format!("line {idx}"));
+        }
+        let snap = snapshot(&session);
+        assert_eq!(snap.diagnostics_lines.len(), MAX_DIAGNOSTIC_LINES);
+        assert_eq!(
+            snap.diagnostics_lines.first().map(String::as_str),
+            Some("line 10")
+        );
+    }
+
+    #[test]
+    fn finishing_secondary_progress_clears_inner_lane() {
+        let mut session = VisualizerSession::new(false);
+        session.start_secondary_workflow("inner", 5);
+        session.advance_secondary_workflow(2);
+        assert_eq!(snapshot(&session).secondary_lane.label, "inner");
+        session.finish_secondary_progress("done");
+        let snap = snapshot(&session);
+        assert!(snap.secondary_lane.label.is_empty());
+        assert_eq!(
+            snap.diagnostics_lines.last().map(String::as_str),
+            Some("done")
+        );
+    }
+
+    #[test]
+    fn enabled_session_uses_dumb_mode_when_not_attached_to_tty() {
+        // Must lock against the other new(true) tests: an enabled session
+        // installs itself into the static ACTIVE_FEED and clears it on
+        // Drop, so a concurrent test that asserts feed contents would
+        // observe stale or empty state if this test interleaved with it.
+        let _guard = FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let session = VisualizerSession::new(true);
+        assert!(session.is_active());
+        assert!(!session.is_interactive());
+    }
+
+    #[test]
+    fn finish_progress_keeps_completion_diagnostic() {
+        let mut session = VisualizerSession::new(false);
+        session.start_workflow("outer", 10);
+        session.advance_workflow(5);
+        session.finish_progress("outer complete");
+        let snap = snapshot(&session);
+        assert_eq!(
+            snap.diagnostics_lines.last().map(String::as_str),
+            Some("outer complete")
+        );
+        assert!(snap.primary_lane.done);
+        assert_eq!(snap.primary_lane.current, 10);
+    }
+
+    #[test]
+    fn workflow_normalizes_zero_total_and_never_goes_backwards() {
+        let mut session = VisualizerSession::new(false);
+        session.start_workflow("outer", 0);
+        assert_eq!(snapshot(&session).primary_lane.total, Some(1));
+        session.advance_workflow(1);
+        session.advance_workflow(0);
+        assert_eq!(snapshot(&session).primary_lane.current, 1);
+    }
+
+    #[test]
+    fn secondary_workflow_ignores_advances_before_start() {
+        let mut session = VisualizerSession::new(false);
+        session.advance_secondary_workflow(3);
+        assert!(snapshot(&session).secondary_lane.label.is_empty());
+        session.start_secondary_workflow("inner", 2);
+        session.advance_secondary_workflow(5);
+        assert_eq!(snapshot(&session).secondary_lane.current, 2);
+    }
+
+    #[test]
+    fn warning_status_is_reflected_in_dumb_render() {
+        let mut session = VisualizerSession::new(false);
+        session.set_stage("fit", "optimizing");
+        session.push_diagnostic("warning: matrix ill-conditioned");
+        let lines = dumb_render_lines(&snapshot(&session));
+        assert!(lines.first().is_some_and(|line| line.contains("[WARNING]")));
+    }
+
+    // The static `ACTIVE_FEED` registry is shared across the whole test
+    // process, and cargo runs tests in parallel by default. Any test that
+    // both constructs an enabled `VisualizerSession` and asserts on the
+    // global feed contents must serialize against every other such test,
+    // because a concurrent test's session would overwrite or clear our
+    // feed mid-assertion. Existing `new(false)` tests don't touch the
+    // static and are exempt from this lock.
+    static FEED_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn record_outer_eval_populates_trial_series_when_session_is_active() {
+        let _guard = FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let session = VisualizerSession::new(true);
+        record_outer_eval(123.4, 1e-2);
+        // Read through the session's own Arc instead of the static feed:
+        // even if another test in the same process clobbers ACTIVE_FEED
+        // between push and check, the session still holds the original
+        // model Arc and the data the optimizer wrote into it is preserved.
+        let model = lock_model(&session.model);
+        assert_eq!(model.history_cost_trial.len(), 1);
+        assert!(model.last_trial.is_some());
+        assert_eq!(model.current_eval_state, "trial");
+    }
+
+    #[test]
+    fn record_outer_accept_promotes_last_trial_into_accepted_series() {
+        let _guard = FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let session = VisualizerSession::new(true);
+        record_outer_eval(50.0, 1e-3);
+        record_outer_accept();
+        let model = lock_model(&session.model);
+        assert_eq!(model.history_cost_accepted.len(), 1);
+        assert_eq!(model.history_cost_accepted[0].1, 50.0);
+        assert_eq!(model.current_eval_state, "accepted");
+    }
+
+    #[test]
+    fn open_ended_workflow_renders_step_form_with_objective() {
+        // Open-ended workflow is the pyffi entry-point lane: total is None,
+        // so the dumb renderer must fall through to the `step=N | objective=…`
+        // branch. The Python bindings rely on this — if it accidentally
+        // routed back to the percent-bar branch, every gamfit fit would
+        // display a stuck 0% bar for the entire run.
+        let mut session = VisualizerSession::new(false);
+        session.set_stage("fit", "optimizing");
+        session.start_workflow_open_ended("Fit");
+        {
+            let mut model = lock_model(&session.model);
+            model.current_cost = 12.5;
+            model.current_grad = 1e-3;
+            model.primary_lane.current = 7;
+        }
+        let lines = dumb_render_lines(&lock_model(&session.model).clone());
+        let lane_line = lines
+            .iter()
+            .find(|l| l.contains("Workflow: Fit"))
+            .expect("workflow lane present");
+        assert!(
+            lane_line.contains("step=7"),
+            "expected step= form, got: {lane_line}"
+        );
+        assert!(lane_line.contains("objective=12.5000"), "got: {lane_line}");
+        assert!(lane_line.contains("|grad|=1.000e-3"), "got: {lane_line}");
+        assert!(
+            !lane_line.contains('%'),
+            "open-ended lane must not show percent bar, got: {lane_line}"
+        );
+    }
+
+    #[test]
+    fn sparkline_returns_none_for_too_few_or_flat_samples() {
+        // < 3 samples: descent shape is undefined, no point rendering.
+        assert!(cost_sparkline(&[], 8).is_none());
+        assert!(cost_sparkline(&[(0.0, 1.0)], 8).is_none());
+        assert!(cost_sparkline(&[(0.0, 1.0), (1.0, 1.0)], 8).is_none());
+        // Flat series (range = 0): would print a constant low-block row,
+        // which reads as "stuck" — better to suppress so the lane line's
+        // numeric Δ tells the truth.
+        let flat = vec![(0.0, 5.0), (1.0, 5.0), (2.0, 5.0)];
+        assert!(cost_sparkline(&flat, 8).is_none());
+    }
+
+    #[test]
+    fn sparkline_renders_descending_shape() {
+        // Monotone descent: every cell to the right should be ≤ the cell
+        // to its left in the block ramp (we use BLOCKS in ascending height
+        // order). Without this, the visual would mislead — the most common
+        // optimizer path is monotone descent, so the sparkline must read
+        // as a downhill ramp for that case.
+        let descending: Vec<(f64, f64)> = (0..8).map(|i| (i as f64, 8.0 - i as f64)).collect();
+        let spark = cost_sparkline(&descending, 8).expect("non-empty");
+        let chars: Vec<char> = spark.chars().collect();
+        const RANK: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+        let rank = |c: char| RANK.iter().position(|&r| r == c).unwrap_or(0);
+        for w in chars.windows(2) {
+            assert!(
+                rank(w[0]) >= rank(w[1]),
+                "expected descending heights, got {:?}",
+                chars
+            );
+        }
+    }
+
+    #[test]
+    fn dropping_session_clears_active_feed() {
+        // The Drop impl must call clear_active_feed before tearing down the
+        // renderer; otherwise a subsequent optimizer push would target a
+        // half-dead session and either write to a Disabled renderer (silent
+        // data loss for the chart) or, in tests, leak a stale Arc that
+        // racing tests then mutate.
+        let _guard = FEED_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        {
+            let _session = VisualizerSession::new(true);
+            assert!(current_active_feed().is_some());
+        }
+        assert!(current_active_feed().is_none());
+    }
+}
