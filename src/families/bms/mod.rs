@@ -99,10 +99,14 @@ impl From<WigglePenaltyConfig> for DeviationBlockConfig {
     }
 }
 
+// `pub` (was `pub(crate)`) so `build_score_warp_deviation_block_from_seed`'s
+// return value is nameable from the cross-crate `gam-predict` saved-runtime
+// tests after the #1521 split (#1567). The `block` field stays `pub(crate)`
+// (in-crate-only); only `runtime` is read by those tests.
 #[derive(Clone)]
-pub(crate) struct DeviationPrepared {
+pub struct DeviationPrepared {
     pub(crate) block: ParameterBlockInput,
-    pub(crate) runtime: DeviationRuntime,
+    pub runtime: DeviationRuntime,
 }
 
 impl std::fmt::Debug for DeviationPrepared {
@@ -2041,13 +2045,18 @@ pub use block_specs::{BmsLogslopeJacobian, BmsMarginalJacobian};
 pub(crate) use family::{
     BernoulliMarginalLinkMap, bernoulli_marginal_link_map,
     build_link_deviation_block_from_knots_design_seed_and_weights,
-    build_score_warp_deviation_block_from_seed,
 };
+// Exposed `pub` for the cross-crate `gam-predict` saved-runtime tests (#1567):
+// the #1521 split moved those tests out of `gam`, so they can no longer reach
+// this builder through in-crate visibility.
+pub use family::build_score_warp_deviation_block_from_seed;
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
+// Exposed `pub` for the cross-crate `gam-predict` latent-measure tests (#1567);
+// see the note on `build_score_warp_deviation_block_from_seed` above.
+pub use gradient_paths::empirical_intercept_from_marginal;
 pub(crate) use gradient_paths::{
-    empirical_intercept_from_marginal, signed_probit_neglog_derivatives_up_to_fourth,
-    unary_derivatives_log, unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi,
-    unary_derivatives_sqrt,
+    signed_probit_neglog_derivatives_up_to_fourth, unary_derivatives_log,
+    unary_derivatives_log_normal_pdf, unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };
 pub(crate) use install_flex::{
     install_compiled_flex_block_into_runtime, project_monotone_feasible_beta,

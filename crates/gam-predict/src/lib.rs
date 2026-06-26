@@ -2915,10 +2915,12 @@ mod tests {
         BlockRole, FitArtifacts, FittedBlock, FittedLinkState, UnifiedFitResult,
         UnifiedFitResultParts,
     };
-    use gam::families::bms::LatentMeasureKind;
-    use gam::inference::model::SavedLatentZNormalization;
+    use gam::families::bms::{
+        EmpiricalZGrid, LatentMeasureKind, empirical_intercept_from_marginal,
+    };
+    use gam::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
+    use gam::inference::probability::normal_pdf;
     use gam::pirls::PirlsStatus;
-    use gam::probability::normal_pdf;
     use gam::types::{LinkFunction, StandardLink};
     use ndarray::{Array1, Array2, array};
 

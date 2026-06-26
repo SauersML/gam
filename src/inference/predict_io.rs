@@ -341,7 +341,10 @@ impl BernoulliMarginalSlopePredictor {
         Ok(eta.mapv(normal_pdf))
     }
 
-    pub(crate) fn probit_frailty_scale(&self) -> f64 {
+    // `pub` (was `pub(crate)`) so the cross-crate `gam-predict` rigid-frailty
+    // test can compute the expected probit frailty scale after the #1521 split
+    // moved it out of `gam` (#1567).
+    pub fn probit_frailty_scale(&self) -> f64 {
         marginal_slope_probit_frailty_scale(self.gaussian_frailty_sd)
     }
 
