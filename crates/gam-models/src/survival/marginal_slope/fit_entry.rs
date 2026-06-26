@@ -162,7 +162,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
              budget-sensitive tiny survival fits use the raw parametric design"
         );
     } else {
-        use gam_identifiability::marginal_slope::{
+        use crate::survival::marginal_slope::identifiability::{
             SurvivalRowHessian, compile_survival_parametric_designs,
         };
         let n_rows = spec.time_block.design_entry.nrows();
@@ -837,7 +837,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             None,
         )
     } else {
-        use gam_identifiability::marginal_slope::{
+        use crate::survival::marginal_slope::identifiability::{
             CompiledSurvivalDesignsVMExact, apply_compiled_map_to_designs,
             extract_term_partition_from_penalty_ranges,
         };
@@ -1113,7 +1113,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                         // in the correct identifiable quotient (the closed-form
                         // fast path engages). Only when the full row Hessian ALSO
                         // deletes the channel is the alias real → unreduced design.
-                        use gam_identifiability::marginal_slope::{
+                        use crate::survival::marginal_slope::identifiability::{
                             SurvivalRowHessian, compile_survival_parametric_designs_per_term,
                             compiled_map_from_per_term,
                         };
@@ -2367,7 +2367,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             solved.fit.block_states.first().map(|s| s.beta.clone())
         };
         let recompile_result = (|| -> Result<(usize, usize, usize), String> {
-            use gam_identifiability::marginal_slope::{
+            use crate::survival::marginal_slope::identifiability::{
                 SurvivalRowHessian, compile_survival_parametric_designs_per_term,
             };
             let beta_time = raw_time_beta

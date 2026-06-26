@@ -1,5 +1,5 @@
 //! Survival marginal-slope concrete impls for the family-agnostic
-//! identifiability compiler (`crate::families::compiler`).
+//! identifiability compiler (`gam_identifiability::families::compiler`).
 //!
 //! Survival's row primary state is the 4-vector `u_i = (q0, q1, qd1, g)`,
 //! so `K = 4`. The row Hessian is the 4×4 second-derivative block of the
@@ -30,10 +30,10 @@ use std::sync::Arc;
 
 use ndarray::{Array1, Array2, Array3};
 
-use crate::families::compiler::{
+use gam_identifiability::families::compiler::{
     BlockOrder, RowHessian, RowJacobianOperator, scale_jacobian_by_sqrt_h_with,
 };
-use crate::solver::gauge::assemble_block_triangular_t;
+use gam_problem::gauge::assemble_block_triangular_t;
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerEigh, fast_ab};
 use gam_linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
@@ -101,7 +101,7 @@ impl SurvivalRowHessian {
         let mut h_full = Array3::<f64>::zeros((n, K_SURVIVAL, K_SURVIVAL));
         for i in 0..n {
             let (_, _grad, hess) =
-                crate::families::survival::marginal_slope::row_primary_for_compiler(
+                crate::survival::marginal_slope::row_primary_for_compiler(
                     q0[i],
                     q1[i],
                     qd1[i],
@@ -220,7 +220,7 @@ impl FamilyChannelHessian for SurvivalRowHessian {
         beta: &[f64],
         family_scalars: Option<&Arc<dyn std::any::Any + Send + Sync>>,
     ) -> Result<Arc<dyn FamilyChannelHessian>, String> {
-        use crate::families::survival::marginal_slope::SurvivalMarginalSlopeFamilyScalars;
+        use crate::survival::marginal_slope::SurvivalMarginalSlopeFamilyScalars;
 
         let scalars_opt =
             family_scalars.and_then(|a| a.downcast_ref::<SurvivalMarginalSlopeFamilyScalars>());
@@ -291,10 +291,10 @@ impl FamilyChannelHessian for SurvivalRowHessian {
                     let z = sc.z_i[i];
                     // Use unit weight and d=1 (event indicator 1) for the audit path.
                     // The derivative_guard is the family default (small but non-zero).
-                    match crate::families::survival::marginal_slope::row_primary_for_compiler(
+                    match crate::survival::marginal_slope::row_primary_for_compiler(
                         q0, q1, qd1, g, z, 1.0,  // w = unit weight
                         1.0,  // d = event
-                        crate::families::survival::marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
+                        crate::survival::marginal_slope::DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
                         sc.s, // probit_scale from scalars
                     ) {
                         Ok((_nll, _grad, hess)) => {
@@ -377,7 +377,7 @@ pub fn survival_row_nll_grad_hess(
     derivative_guard: f64,
     probit_scale: f64,
 ) -> Result<(f64, [f64; 4], [[f64; 4]; 4]), String> {
-    crate::families::survival::marginal_slope::row_primary_for_compiler(
+    crate::survival::marginal_slope::row_primary_for_compiler(
         q0,
         q1,
         qd1,
@@ -733,7 +733,7 @@ pub fn compile_survival_parametric_designs_per_term(
     logslope_partition: &[std::ops::Range<usize>],
     row_hess: &dyn RowHessian,
 ) -> Result<SurvivalParametricCompiledPerTerm, String> {
-    use crate::families::compiler::compile;
+    use gam_identifiability::families::compiler::compile;
 
     let p_time = time_dq0.ncols();
     let p_marg = marginal_dq.ncols();
@@ -910,11 +910,11 @@ pub fn extract_term_partition_from_penalty_ranges(
 /// with `local = V_term^T · local · V_term` and `col_range` shifted to
 /// compiled coordinates.
 pub fn pull_back_blockwise_penalty_per_term(
-    pen: &crate::terms::smooth::BlockwisePenalty,
+    pen: &gam_terms::smooth::BlockwisePenalty,
     raw_partition: &[std::ops::Range<usize>],
     v_per_term: &[Array2<f64>],
-) -> Result<crate::terms::smooth::BlockwisePenalty, String> {
-    use crate::terms::smooth::BlockwisePenalty;
+) -> Result<gam_terms::smooth::BlockwisePenalty, String> {
+    use gam_terms::smooth::BlockwisePenalty;
     if raw_partition.len() != v_per_term.len() {
         return Err(format!(
             "pull_back_blockwise_penalty_per_term: partition len {} != v_per_term len {}",
@@ -1059,7 +1059,7 @@ pub fn build_global_t_matrix(spec: &GlobalTSpec) -> Array2<f64> {
 /// every earlier block's θ_a, so the pulled-back penalty is generally
 /// dense across the full compiled width.
 pub fn pull_back_penalty_through_t(
-    pen: &crate::terms::smooth::BlockwisePenalty,
+    pen: &gam_terms::smooth::BlockwisePenalty,
     anchor_offset: usize,
     t: &Array2<f64>,
 ) -> PenaltyMatrix {
@@ -1119,7 +1119,7 @@ pub fn pull_back_penalty_through_t(
 /// matrix that cannot live in a single block's `penalties` slot and
 /// would violate the `p_b × p_b` block-spec validation.
 pub fn pull_back_blockwise_penalty_through_block_v(
-    pen: &crate::terms::smooth::BlockwisePenalty,
+    pen: &gam_terms::smooth::BlockwisePenalty,
     v_block: &Array2<f64>,
 ) -> Result<PenaltyMatrix, String> {
     let raw_p = v_block.nrows();
@@ -1175,9 +1175,9 @@ pub struct CompiledSurvivalDesignsPerTerm {
     pub time_design_derivative_exit: DesignMatrix,
     pub marginal_design: DesignMatrix,
     pub logslope_design: DesignMatrix,
-    pub time_penalties: Vec<crate::terms::smooth::BlockwisePenalty>,
-    pub marginal_penalties: Vec<crate::terms::smooth::BlockwisePenalty>,
-    pub logslope_penalties: Vec<crate::terms::smooth::BlockwisePenalty>,
+    pub time_penalties: Vec<gam_terms::smooth::BlockwisePenalty>,
+    pub marginal_penalties: Vec<gam_terms::smooth::BlockwisePenalty>,
+    pub logslope_penalties: Vec<gam_terms::smooth::BlockwisePenalty>,
     /// Block-diagonal V for each block: rows = raw block width,
     /// cols = compiled block width. Used by `lift_smgs_block_betas_to_raw`
     /// at fit result to map compiled β back to raw β before serialise.
@@ -1199,17 +1199,17 @@ pub fn apply_per_term_survival_parametric_compile_to_designs(
     time_design_derivative_exit: DesignMatrix,
     marginal_design: DesignMatrix,
     logslope_design: DesignMatrix,
-    time_penalties: &[crate::terms::smooth::BlockwisePenalty],
-    marginal_penalties: &[crate::terms::smooth::BlockwisePenalty],
-    logslope_penalties: &[crate::terms::smooth::BlockwisePenalty],
+    time_penalties: &[gam_terms::smooth::BlockwisePenalty],
+    marginal_penalties: &[gam_terms::smooth::BlockwisePenalty],
+    logslope_penalties: &[gam_terms::smooth::BlockwisePenalty],
 ) -> Result<CompiledSurvivalDesignsPerTerm, String> {
     let v_time = compiled.v_time_block_diag();
     let v_marginal = compiled.v_marginal_block_diag();
     let v_logslope = compiled.v_logslope_block_diag();
-    let pull_set = |pens: &[crate::terms::smooth::BlockwisePenalty],
+    let pull_set = |pens: &[gam_terms::smooth::BlockwisePenalty],
                     partition: &[std::ops::Range<usize>],
                     v_per_term: &[Array2<f64>]|
-     -> Result<Vec<crate::terms::smooth::BlockwisePenalty>, String> {
+     -> Result<Vec<gam_terms::smooth::BlockwisePenalty>, String> {
         pens.iter()
             .map(|p| pull_back_blockwise_penalty_per_term(p, partition, v_per_term))
             .collect()
@@ -1267,7 +1267,7 @@ pub fn apply_per_term_survival_parametric_compile_to_designs(
 /// into the three *block* ranges (raw = summed per-term raw widths, compiled =
 /// summed per-term kept widths). The resulting `CompiledMap` is interchangeable
 /// with one from
-/// [`crate::families::compiler::compile_from_raw_grams`], so the
+/// [`gam_identifiability::families::compiler::compile_from_raw_grams`], so the
 /// existing [`apply_compiled_map_to_designs`] +
 /// [`Gauge::from_compiled_map`] machinery consumes it unchanged.
 ///
@@ -1280,7 +1280,7 @@ pub fn apply_per_term_survival_parametric_compile_to_designs(
 /// goes to Newton in place of the rank-deficient raw basis.
 pub fn compiled_map_from_per_term(
     compiled: &SurvivalParametricCompiledPerTerm,
-) -> crate::families::compiler::CompiledMap {
+) -> gam_identifiability::families::compiler::CompiledMap {
     // Per-term V's and R's in global compile order: time terms, then marginal,
     // then logslope — exactly the order `r_lw_per_term` is stored in.
     let mut v_all: Vec<Array2<f64>> = Vec::new();
@@ -1311,7 +1311,7 @@ pub fn compiled_map_from_per_term(
         (kept_time + kept_marg)..(kept_time + kept_marg + kept_log),
     ];
 
-    crate::families::compiler::CompiledMap {
+    gam_identifiability::families::compiler::CompiledMap {
         raw_from_compiled: t_full,
         compiled_block_ranges,
         raw_block_ranges,
@@ -1346,15 +1346,15 @@ pub fn compiled_map_from_per_term(
 /// block (time, no anchor → `R = []`) and matches the sibling per-block
 /// compile path for the rest.
 pub fn apply_compiled_map_to_designs(
-    map: &crate::families::compiler::CompiledMap,
+    map: &gam_identifiability::families::compiler::CompiledMap,
     time_design_entry: DesignMatrix,
     time_design_exit: DesignMatrix,
     time_design_derivative_exit: DesignMatrix,
     marginal_design: DesignMatrix,
     logslope_design: DesignMatrix,
-    time_penalties: &[crate::terms::smooth::BlockwisePenalty],
-    marginal_penalties: &[crate::terms::smooth::BlockwisePenalty],
-    logslope_penalties: &[crate::terms::smooth::BlockwisePenalty],
+    time_penalties: &[gam_terms::smooth::BlockwisePenalty],
+    marginal_penalties: &[gam_terms::smooth::BlockwisePenalty],
+    logslope_penalties: &[gam_terms::smooth::BlockwisePenalty],
 ) -> Result<CompiledSurvivalDesignsVMExact, String> {
     if map.raw_block_ranges.len() != 3 || map.compiled_block_ranges.len() != 3 {
         return Err(format!(
@@ -1428,7 +1428,7 @@ pub fn apply_compiled_map_to_designs(
     // jamming that joint-width matrix into a single block's `penalties`
     // produced the `block 0 penalty 0 must be 12x12, got 17x17` mismatch
     // that surfaced as the `assert_valid_blockspecs` FFI panic.
-    let pull_set = |pens: &[crate::terms::smooth::BlockwisePenalty],
+    let pull_set = |pens: &[gam_terms::smooth::BlockwisePenalty],
                     v_block: &Array2<f64>,
                     channel: &str|
      -> Result<Vec<PenaltyMatrix>, String> {
@@ -1514,7 +1514,7 @@ pub fn compile_survival_parametric_designs(
     logslope_dg: Array2<f64>,
     row_hess: &dyn RowHessian,
 ) -> Result<SurvivalParametricCompiled, String> {
-    use crate::families::compiler::compile;
+    use gam_identifiability::families::compiler::compile;
 
     let p_time_raw = time_dq0.ncols();
     let p_marg_raw = marginal_dq.ncols();
@@ -1900,7 +1900,7 @@ pub fn materialise_compiled_primary_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::solver::gauge::Gauge;
+    use gam_problem::Gauge;
 
     #[test]
     fn psd_clamp_zeros_negative_eigenvalues() {
@@ -2018,7 +2018,7 @@ mod tests {
 
     #[test]
     fn pull_back_blockwise_penalty_per_term_full_term_identity_v() {
-        use crate::terms::smooth::BlockwisePenalty;
+        use gam_terms::smooth::BlockwisePenalty;
         // Single-term partition, identity V → pullback returns input.
         let v_term = Array2::<f64>::eye(3);
         let v_per_term = vec![v_term];
@@ -2038,7 +2038,7 @@ mod tests {
 
     #[test]
     fn pull_back_blockwise_penalty_per_term_drops_one_column() {
-        use crate::terms::smooth::BlockwisePenalty;
+        use gam_terms::smooth::BlockwisePenalty;
         // 3-column term, V drops one column (3 → 2): V is the 3×2
         // matrix with columns e_1 and e_2 (drop the constant).
         let mut v_term = Array2::<f64>::zeros((3, 2));
@@ -2062,7 +2062,7 @@ mod tests {
 
     #[test]
     fn pull_back_blockwise_penalty_per_term_routes_to_correct_term() {
-        use crate::terms::smooth::BlockwisePenalty;
+        use gam_terms::smooth::BlockwisePenalty;
         // Two-term partition: term0 = 0..2, term1 = 2..5.
         // V_term0 = 2×2 identity; V_term1 drops 1 col (3 → 2).
         let v0 = Array2::<f64>::eye(2);
@@ -2196,7 +2196,7 @@ mod tests {
 
     #[test]
     fn pull_back_penalty_through_t_identity_returns_zero_embedded_raw() {
-        use crate::terms::smooth::BlockwisePenalty;
+        use gam_terms::smooth::BlockwisePenalty;
         let v_a = Array2::<f64>::eye(2);
         let v_b = Array2::<f64>::eye(2);
         let t = assemble_block_triangular_t(&[v_a, v_b], &[None, None]);
@@ -2228,7 +2228,7 @@ mod tests {
 
     #[test]
     fn pull_back_penalty_through_t_nontrivial_t_has_off_block_coupling() {
-        use crate::terms::smooth::BlockwisePenalty;
+        use gam_terms::smooth::BlockwisePenalty;
         let v_a = Array2::<f64>::eye(2);
         let v_b = Array2::<f64>::eye(2);
         let r_ab = Array2::<f64>::from_shape_fn((2, 2), |(i, j)| 1.0 + (i + j) as f64);
@@ -2267,7 +2267,7 @@ mod tests {
 
     #[test]
     fn pull_back_penalty_through_t_round_trip_quadratic_form() {
-        use crate::terms::smooth::BlockwisePenalty;
+        use gam_terms::smooth::BlockwisePenalty;
         let v_a = Array2::<f64>::from_shape_fn((3, 2), |(i, j)| {
             ((i + 1) as f64).sin() + 0.3 * (j as f64)
         });
@@ -2347,8 +2347,8 @@ mod tests {
     /// ordinary survival data.
     #[test]
     fn compiled_map_penalty_pullback_is_per_block_width_with_nonzero_residual() {
-        use crate::families::compiler::CompiledMap;
-        use crate::terms::smooth::BlockwisePenalty;
+        use gam_identifiability::families::compiler::CompiledMap;
+        use gam_terms::smooth::BlockwisePenalty;
 
         let n = 10;
         // Time raw 3 → compiled 3 (block 0: no anchor, V pure, R=None).
@@ -2566,7 +2566,7 @@ mod tests {
     /// with the compiled rank-drop — the construction contract end to end.
     #[test]
     fn compile_survival_three_block_with_shared_constant_drops_one_direction() {
-        use crate::families::compiler::compile;
+        use gam_identifiability::families::compiler::compile;
 
         let n = 32;
         let p_time = 3;
@@ -3397,9 +3397,9 @@ mod tests {
         // The cross-block carry (-R) must sit in the strict upper triangle, so
         // the map agrees with the lift assembled directly from V and R.
         let ordering = [
-            crate::families::compiler::BlockOrder::Time,
-            crate::families::compiler::BlockOrder::Marginal,
-            crate::families::compiler::BlockOrder::Logslope,
+            gam_identifiability::families::compiler::BlockOrder::Time,
+            gam_identifiability::families::compiler::BlockOrder::Marginal,
+            gam_identifiability::families::compiler::BlockOrder::Logslope,
         ];
         let lift_from_map = Gauge::from_compiled_map(&map, &ordering);
         let v_all = vec![v_time, v_marg, v_log];

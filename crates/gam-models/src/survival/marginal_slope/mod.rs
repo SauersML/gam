@@ -13,6 +13,8 @@
 //! the `CustomFamily` impl, block Jacobians, fit setup, and the entry point.
 //!
 
+pub(crate) mod identifiability;
+
 pub(crate) use crate::custom_family::{
     BlockWorkingSet, BlockwiseFitOptions, CustomFamily, CustomFamilyWarmStart,
     ExactNewtonJointGradientEvaluation, ExactNewtonJointHessianWorkspace,

@@ -7,7 +7,6 @@
 //! - [`canonical`] — canonicalization of specs for identifiability.
 //! - [`families`] — the family-agnostic block compiler, its GPU paths, and the
 //!   per-family row-Hessian implementations.
-//! - [`marginal_slope`] — survival marginal-slope identifiability.
 
 #[macro_export]
 macro_rules! bail_dim_custom {
@@ -25,5 +24,4 @@ pub mod audit;
 pub mod canonical;
 pub mod families;
 pub mod kernel;
-pub mod marginal_slope;
 pub mod precondition;
