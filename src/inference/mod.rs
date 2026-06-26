@@ -12,7 +12,7 @@ pub mod certificate_impls;
 pub mod certificates;
 pub mod checkpoint_dynamics;
 pub use gam_problem::diagnostics;
-pub mod dispersion_cov;
+pub use gam_problem::dispersion_cov;
 pub mod fisher_rao;
 pub mod formula_dsl;
 pub mod full_conformal;

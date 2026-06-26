@@ -1,5 +1,5 @@
 use super::*;
-use crate::inference::dispersion_cov::se_from_covariance;
+use gam_problem::dispersion_cov::se_from_covariance;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Optimize smoothing parameters for an external design using the same REML/LAML machinery.
@@ -2539,7 +2539,7 @@ where
         if let Some(ref h_inv) = beta_covariance_unscaled {
             // Full inverse available: wrap as phi-scaled covariance, compute
             // frequentist quantities, and pass to smoothing-correction cubature.
-            beta_covariance = Some(crate::inference::dispersion_cov::PhiScaledCovariance::wrap(
+            beta_covariance = Some(gam_problem::dispersion_cov::PhiScaledCovariance::wrap(
                 scaled_covariance(h_inv.clone(), cov_scale),
             ));
 

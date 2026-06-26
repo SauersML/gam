@@ -4216,7 +4216,7 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
                 dispersion: crate::estimate::Dispersion::Known(1.0),
                 beta_covariance: beta_covariance
                     .clone()
-                    .map(crate::inference::dispersion_cov::PhiScaledCovariance::from),
+                    .map(gam_problem::dispersion_cov::PhiScaledCovariance::from),
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,
@@ -7310,7 +7310,7 @@ fn fit_bounded_term_collection_with_design(
                 dispersion,
                 beta_covariance: beta_covariance
                     .clone()
-                    .map(crate::inference::dispersion_cov::PhiScaledCovariance::from),
+                    .map(gam_problem::dispersion_cov::PhiScaledCovariance::from),
                 beta_standard_errors,
                 beta_covariance_corrected: None,
                 beta_standard_errors_corrected: None,

@@ -310,7 +310,7 @@ pub fn laplace_gaussian_fallback(
     cfg: &NutsConfig,
     rationale: &'static str,
 ) -> Result<NutsResult, String> {
-    use crate::inference::dispersion_cov::DispersionExt as _;
+    use gam_problem::dispersion_cov::DispersionExt as _;
     // Defense in depth: this is `pub`, so guard the same degenerate
     // draw/chain counts the NUTS / PG paths reject (issue #399) rather than
     // papering over `n_chains == 0` / `n_samples == 0` with `.max(1)`, which
@@ -721,7 +721,7 @@ fn sample_standard_truncated(
     let penalized_hessian =
         explicit_fit_hessian_for_whitening(&fit, p, "saved standard constrained model")?;
     let sqrt_phi = {
-        use crate::inference::dispersion_cov::DispersionExt as _;
+        use gam_problem::dispersion_cov::DispersionExt as _;
         fit.dispersion().unwrap_or_default().sqrt_phi()
     };
     let samples = crate::inference::truncated_gaussian::sample_truncated_gaussian_posterior(

@@ -27,18 +27,15 @@
 //! explicit can wrap with `PhiScaledCovariance::wrap` /
 //! `UnscaledPrecision::wrap` at the boundary.
 //!
-//! `Dispersion` lives in `solver::estimate` and is re-exported here as the
-//! single source of truth. The helper methods on the local
-//! `DispersionExt` trait give terse `phi() / inv_phi() / sqrt_phi()`
-//! call-sites for the sampling code; we do not duplicate the enum because
-//! `solver::estimate::Dispersion` already implements `phi()` and
-//! `is_estimated()`.
+//! `Dispersion` lives in `gam-problem` as the neutral scale contract. The
+//! helper methods on the local `DispersionExt` trait give terse
+//! `phi()` / `inv_phi()` / `sqrt_phi()` call-sites for sampling code.
 
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 
-pub use crate::model_types::Dispersion;
+pub use crate::Dispersion;
 
 /// Compute standard errors from a covariance matrix (sqrt of diagonal).
 pub fn se_from_covariance(cov: &Array2<f64>) -> Array1<f64> {

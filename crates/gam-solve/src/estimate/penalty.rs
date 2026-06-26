@@ -1,5 +1,5 @@
 use super::*;
-use crate::inference::dispersion_cov::se_from_covariance;
+use gam_problem::dispersion_cov::se_from_covariance;
 
 pub(crate) const REML_SECOND_ORDER_RHO_CAP: usize = 4;
 /// Continuation prewarm is a seed-polishing pass, not part of the REML

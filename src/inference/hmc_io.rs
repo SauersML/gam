@@ -1523,7 +1523,7 @@ fn gaussian_logp_and_grad_into(
     eta: &Array1<f64>,
     weighted_residual: &mut Array1<f64>,
 ) -> (f64, Array1<f64>) {
-    use gam::inference::dispersion_cov::DispersionExt as _;
+    use gam_problem::dispersion_cov::DispersionExt as _;
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
     let inv_phi = data.dispersion.inv_phi();
@@ -1585,7 +1585,7 @@ fn tweedie_log_quasilogp_and_grad(
     eta: &Array1<f64>,
     p: f64,
 ) -> (f64, Array1<f64>) {
-    use gam::inference::dispersion_cov::DispersionExt as _;
+    use gam_problem::dispersion_cov::DispersionExt as _;
     use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
     let n = data.n_samples;
     // Family mapping: Tweedie p is the variant payload; phi is data.dispersion.

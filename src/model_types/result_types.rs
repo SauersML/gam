@@ -156,7 +156,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: Vec::new(),
                 edf_total: 28.0,
                 smoothing_correction: None,
-                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(
+                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(
                     36,
                 )),
                 working_weights: Array1::ones(1),
@@ -242,7 +242,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: vec![3.0],
                 edf_total,
                 smoothing_correction: None,
-                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(
+                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(
                     p,
                 )),
                 working_weights: Array1::ones(1),
@@ -314,7 +314,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: traces,
                 edf_total,
                 smoothing_correction: None,
-                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(
+                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(
                     p,
                 )),
                 working_weights: Array1::ones(1),
@@ -508,7 +508,7 @@ mod per_term_edf_tests {
                 penalty_block_trace: traces,
                 edf_total: p as f64,
                 smoothing_correction: None,
-                penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision::wrap(eye(
+                penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision::wrap(eye(
                     p,
                 )),
                 working_weights: Array1::ones(1),
@@ -935,7 +935,7 @@ pub struct FitInference {
     /// covariance `Vb` know they must pair this with [`Self::dispersion`].
     /// `#[serde(transparent)]` on the newtype keeps the on-disk encoding
     /// identical to the pre-newtype `Array2<f64>` storage.
-    pub penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision,
+    pub penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision,
     pub working_weights: Array1<f64>,
     pub working_response: Array1<f64>,
     pub reparam_qs: Option<Array2<f64>>,
@@ -946,7 +946,7 @@ pub struct FitInference {
     /// `Vb`): `Vb = H^{-1} * phi`, where `H = X'W_HX + S(lambda)` and `phi`
     /// is [`dispersion`](Self::dispersion). Do not use an unscaled `H^{-1}`
     /// for standard errors when scale is estimated.
-    pub beta_covariance: Option<crate::inference::dispersion_cov::PhiScaledCovariance>,
+    pub beta_covariance: Option<gam_problem::dispersion_cov::PhiScaledCovariance>,
     /// Marginal SEs from `beta_covariance`.
     pub beta_standard_errors: Option<Array1<f64>>,
     /// Optional smoothing-parameter-corrected Bayesian covariance (mgcv `Vp`):
@@ -1098,7 +1098,7 @@ pub struct FitGeometry {
     /// Joint penalized Hessian `H = X'W_HX + S(λ)` at convergence.
     /// Stored as [`UnscaledPrecision`] so the dispersion-ownership invariant
     /// (this matrix is *not* φ-scaled) is enforced at the type level.
-    pub penalized_hessian: crate::inference::dispersion_cov::UnscaledPrecision,
+    pub penalized_hessian: gam_problem::dispersion_cov::UnscaledPrecision,
     /// Score-side Fisher IRLS weights paired with `working_response`.
     pub working_weights: Array1<f64>,
     /// IRLS working response at convergence.
@@ -2107,7 +2107,7 @@ impl UnifiedFitResult {
     /// the type level.
     pub fn penalized_hessian_unscaled(
         &self,
-    ) -> Option<&crate::inference::dispersion_cov::UnscaledPrecision> {
+    ) -> Option<&gam_problem::dispersion_cov::UnscaledPrecision> {
         self.inference
             .as_ref()
             .map(|inf| &inf.penalized_hessian)
@@ -2121,7 +2121,7 @@ impl UnifiedFitResult {
     /// code so the φ-scaled invariant is type-enforced.
     pub fn beta_covariance_phi_scaled(
         &self,
-    ) -> Option<&crate::inference::dispersion_cov::PhiScaledCovariance> {
+    ) -> Option<&gam_problem::dispersion_cov::PhiScaledCovariance> {
         self.inference
             .as_ref()
             .and_then(|inf| inf.beta_covariance.as_ref())
