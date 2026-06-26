@@ -191,6 +191,13 @@ pub use gam_runtime::resource::{
     ByteLruCache, DerivativeStorageMode, MaterializationPolicy, MatrixMaterializationError,
     ProblemHints, ResidentBytes, ResourcePolicy,
 };
+// Also keep the module path `gam::resource::…` reachable (it was previously
+// `gam::resource`, before the move into the `gam-runtime` foundation crate).
+// Integration tests and downstream code import the policy surface by module
+// path (e.g. `gam::resource::STRICT_POLICY_NROWS_THRESHOLD`, which is not in
+// the flattened re-export above); mirror the `warm_start` module re-export
+// below so both the flattened items and the module path stay stable.
+pub use gam_runtime::resource;
 // The warm-start store (WarmStartStore, Fingerprinter, StoreOptions, ...) was
 // relocated into the `gam-runtime` foundation crate. It was previously reachable
 // as `gam::warm_start`; keep that path stable by re-exporting the module from

@@ -208,7 +208,7 @@ fn measure_arm(z: &Array2<f64>, p: usize, seed_logit: f64) -> ArmMetrics {
     ArmMetrics {
         mean_zeta,
         radius_ratio: mean_fit_r / mean_data_r,
-        lambda_smooth: rho.lambda_smooth(),
+        lambda_smooth: rho.lambda_smooth_for(0),
     }
 }
 
