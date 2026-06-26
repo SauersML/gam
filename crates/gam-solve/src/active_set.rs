@@ -122,7 +122,7 @@ pub struct ConstraintKktDiagnostics {
     /// convergence on the scale-invariant ratio
     /// `stationarity / max(gradient_scale, 1)` (its `stationarity_rel` path
     /// against `ACTIVE_SET_KKT_STATIONARITY_TOL`); the outer validation gate
-    /// [`crate::reml::outer_eval`]`::enforce_constraint_kkt` consults this
+    /// [`crate::estimate::reml::outer_eval`]`::enforce_constraint_kkt` consults this
     /// field to apply the identical relative test, so the two stop on the same
     /// contract instead of the gate spuriously aborting a constrained optimum
     /// the solver legitimately reached (issue #989). Defaults to `0.0` when

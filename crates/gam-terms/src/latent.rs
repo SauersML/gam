@@ -220,7 +220,7 @@ impl LatentManifold {
     }
 
     /// Whether the Euclidean→Riemannian geometry transform applied by
-    /// [`crate::solver::arrow_schur::ArrowSchurSystem::apply_riemannian_latent_geometry`]
+    /// `crate::solver::arrow_schur::ArrowSchurSystem::apply_riemannian_latent_geometry`
     /// is the **identity** on the per-row gradient, `H_tt`, and `H_tβ` blocks
     /// for *every* coordinate `t` on this chart.
     ///

@@ -1312,7 +1312,7 @@ impl EvidenceCertification {
         }
     }
 
-    /// The unified [`Verdict`](crate::inference::certificates::Verdict) for a race
+    /// The unified `Verdict` (`gam_inference::certificates::Verdict`) for a race
     /// won by lead `race_lead` over the runner-up, on the shared certificate
     /// ladder (task #16). The race transfers its approximate-evidence verdict to
     /// the full corpus only when the lead strictly clears [`Self::required_margin`]
@@ -1320,8 +1320,8 @@ impl EvidenceCertification {
     /// so the verdict is `Insufficient`, never a silent pass. Exact evidence with
     /// any positive lead is `Certified`. A non-finite or non-positive lead leaves
     /// the race undecided (`Insufficient`); the per-family margin verdicts
-    /// ([`crate::inference::certificate_impls::coreset_race_verdict`],
-    /// [`crate::inference::certificate_impls::enclosure_margin_verdict`]) supply
+    /// (`gam_inference::certificate_impls::coreset_race_verdict`,
+    /// `gam_inference::certificate_impls::enclosure_margin_verdict`) supply
     /// the underlying mapping so there is one source of truth.
     pub fn race_verdict(&self, race_lead: f64) -> crate::inference::certificates::Verdict {
         use crate::inference::certificates::Verdict;

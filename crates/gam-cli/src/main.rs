@@ -100,8 +100,10 @@ pub(crate) use gam::probability::{normal_cdf, standard_normal_quantile};
 pub(crate) use gam::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, SmoothBasisSpec,
     SmoothStructureAnalysis, SmoothTermSpec, SpatialLengthScaleOptimizationOptions,
-    TermCollectionSpec, analyze_smooth_ownership, build_term_collection_design,
-    fit_term_collection_forspec, freeze_term_collection_from_design, smooth_term_feature_cols,
+    TermCollectionSpec, analyze_smooth_ownership, smooth_term_feature_cols,
+};
+pub(crate) use gam::families::fit_orchestration::drivers::{
+    build_term_collection_design, fit_term_collection_forspec, freeze_term_collection_from_design,
 };
 
 pub(crate) use gam::smooth_test::SmoothTestScale;

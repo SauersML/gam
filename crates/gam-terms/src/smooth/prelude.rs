@@ -39,10 +39,6 @@ use gam_linalg::matrix::{
     TensorProductDesignOperator,
 };
 
-use crate::mixture_link::{
-    logit_inverse_link_jet5, state_from_beta_logisticspec, state_from_sasspec, state_fromspec,
-};
-
 use gam_problem::LinearInequalityConstraints;
 
 use gam_runtime::resource::MatrixMaterializationError;
@@ -52,7 +48,7 @@ use gam_spec::{
     SasLinkState, StandardLink,
 };
 
-use crate::util::quantile::quantile_from_sorted;
+use gam_math::quantile::quantile_from_sorted;
 
 use faer::sparse::{SparseColMat, Triplet};
 

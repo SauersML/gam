@@ -124,7 +124,7 @@ impl DispersionFamilyKind {
     /// The family's canonical [`LikelihoodSpec`] (mean response × mean link).
     /// The overdispersion parameter is estimated by the log-precision channel,
     /// so the response-family placeholder parameters (`phi`, `theta`) mirror
-    /// the [`resolve_family`](gam_solve::fit_orchestration::resolve_family) defaults
+    /// the [`resolve_family`](crate::fit_orchestration::materialize::resolve_family) defaults
     /// and are not consumed as fixed values at predict time. This is the single
     /// source of truth for the persisted location-scale likelihood so the CLI
     /// and FFI save paths cannot diverge.

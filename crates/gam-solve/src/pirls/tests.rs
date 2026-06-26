@@ -25,7 +25,7 @@ mod tests {
     };
     use gam_linalg::matrix::DesignMatrix;
     use crate::mixture_link::{InverseLinkJet as MixtureInverseLinkJet, state_fromspec};
-    use crate::probability::standard_normal_quantile;
+    use gam_math::probability::standard_normal_quantile;
     use crate::active_set;
     use gam_problem::{
         Coefficients, GlmLikelihoodSpec, InverseLink, LikelihoodSpec, LinkComponent, LinkFunction,

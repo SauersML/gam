@@ -4,7 +4,7 @@
 //! sigma point through the unified PIRLS stream-pool executor, returns the
 //! per-point `(H_original^-1, beta_original)` pairs, and hands the shared
 //! covariance accumulation back to
-//! [`crate::reml::eval::accumulate_sigma_cubature_total_covariance`].
+//! [`crate::estimate::reml::eval::accumulate_sigma_cubature_total_covariance`].
 
 use ndarray::{Array1, Array2, ArrayView1};
 
@@ -13,7 +13,7 @@ use gam_gpu::gpu_error::GpuError;
 /// Per-sigma-point GPU PIRLS input: penalty, reparameterisation transform,
 /// and prior-mean shifts for one ρ / σ point.
 ///
-/// Built by [`crate::reml::eval::sigma_cubature_evaluate_gpu_stream_pool`]
+/// Built by [`crate::estimate::reml::eval::sigma_cubature_evaluate_gpu_stream_pool`]
 /// from the reparameterisation engine output before the stream pool is allocated.
 /// The shared model data (`X_original`, `y`, `prior_w`, `offset`) is uploaded
 /// ONCE into [`crate::gpu::pirls_gpu::PirlsGpuSharedData`]; only the

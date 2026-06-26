@@ -91,10 +91,12 @@ pub(crate) use gam_solve::pirls::LinearInequalityConstraints;
 pub(crate) use crate::probability::signed_probit_logcdf_and_mills_ratio;
 
 pub(crate) use gam_terms::smooth::{
-    BlockwisePenalty, ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions,
-    SpatialLogKappaCoords, TermCollectionDesign, TermCollectionSpec,
-    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices,
+    BlockwisePenalty, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec,
+};
+pub(crate) use crate::fit_orchestration::drivers::{
+    ExactJointHyperSetup, build_term_collection_designs_and_freeze_joint,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 
 pub(crate) use gam_problem::HyperOperator;

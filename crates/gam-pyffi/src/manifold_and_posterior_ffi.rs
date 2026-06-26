@@ -426,7 +426,7 @@ fn posterior_predict_table_impl(
         &col_map,
         "resolved_termspec",
     )?;
-    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
+    let design = gam::families::fit_orchestration::drivers::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("failed to build design matrix: {err}"))?;
     let base_dense = design
         .design
@@ -1999,7 +1999,7 @@ fn summary_smooth_terms(
     // levels in those columns so `fs`/`sz` designs replay cleanly.
     let factor_levels = frozen_factor_levels_by_col(spec);
     let data = representative_data_from_ranges(ranges, &factor_levels);
-    let Ok(design) = gam::terms::smooth::build_term_collection_design(data.view(), spec) else {
+    let Ok(design) = gam::families::fit_orchestration::drivers::build_term_collection_design(data.view(), spec) else {
         return Vec::new();
     };
 
@@ -2495,7 +2495,7 @@ fn curvature_inference_json_impl(
         if !matches!(term.basis, SmoothBasisSpec::ConstantCurvature { .. }) {
             continue;
         }
-        let report = gam::terms::smooth::curvature_inference_forspec(
+        let report = gam::families::fit_orchestration::drivers::curvature_inference_forspec(
             standard.data.view(),
             standard.y.view(),
             standard.weights.view(),
@@ -2579,7 +2579,7 @@ fn smooth_term_lr_inference_json_impl(
     };
 
     let family = model.likelihood();
-    let reports = gam::terms::smooth::smooth_term_lr_inference_forspec(
+    let reports = gam::families::fit_orchestration::drivers::smooth_term_lr_inference_forspec(
         standard.data.view(),
         standard.y.view(),
         standard.weights.view(),

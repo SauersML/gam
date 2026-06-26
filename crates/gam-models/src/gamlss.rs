@@ -96,9 +96,11 @@ use gam_solve::pirls::LinearInequalityConstraints;
 use crate::probability::{normal_logcdf, normal_logsf, standard_normal_quantile};
 
 use gam_terms::smooth::{
-    BlockwisePenalty, ExactJointHyperSetup, PenaltyBlockInfo,
-    SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_design, freeze_term_collection_from_design,
+    BlockwisePenalty, PenaltyBlockInfo, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
+    TermCollectionDesign, TermCollectionSpec,
+};
+use crate::fit_orchestration::drivers::{
+    ExactJointHyperSetup, build_term_collection_design, freeze_term_collection_from_design,
     optimize_spatial_length_scale_exact_joint, spatial_dims_per_term,
     spatial_length_scale_term_indices,
 };

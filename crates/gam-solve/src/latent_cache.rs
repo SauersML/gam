@@ -404,10 +404,10 @@ fn hash_latent_id_mode(id_mode: &LatentIdMode, hasher: &mut Fingerprinter) {
 }
 
 fn hash_behavioral_head(
-    head: &crate::terms::decoders::behavioral_head::BehavioralHead,
+    head: &gam_terms::decoders::behavioral_head::BehavioralHead,
     hasher: &mut Fingerprinter,
 ) {
-    use crate::terms::decoders::behavioral_head::AuxOutcomeFamily;
+    use gam_terms::decoders::behavioral_head::AuxOutcomeFamily;
     match head.family() {
         AuxOutcomeFamily::Binomial => hasher.write_usize(0),
         AuxOutcomeFamily::Multinomial { n_classes } => {

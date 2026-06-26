@@ -471,7 +471,7 @@ impl RowSamplingMeasure {
     /// Construct from raw per-row masses, normalizing to a proper measure.
     /// Falls back to uniform if the masses carry no usable signal.
     ///
-    /// Crate-visible so the two-tier harvest ([`crate::inference::harvest`])
+    /// Crate-visible so the two-tier harvest (`gam_inference::harvest`)
     /// can lift designed-subsample Fisher masses to a full-corpus measure
     /// through the same validation/normalization path.
     pub(crate) fn from_masses(metric_provenance: MetricProvenance, masses: Vec<f64>) -> Self {

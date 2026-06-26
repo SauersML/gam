@@ -62,10 +62,12 @@ pub(crate) use crate::model_types::UnifiedFitResult;
 pub(crate) use gam_solve::pirls::LinearInequalityConstraints;
 pub(crate) use crate::probability::standard_normal_quantile;
 pub(crate) use gam_terms::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design, optimize_spatial_length_scale_exact_joint,
-    spatial_length_scale_term_indices,
+    SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
+    TermCollectionSpec,
+};
+pub(crate) use crate::fit_orchestration::drivers::{
+    ExactJointHyperSetup, build_term_collection_design, freeze_term_collection_from_design,
+    optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 pub(crate) use gam_problem::{
     DriftDerivResult, HyperOperator, ProjectedFactorCache, ProjectedFactorKey,

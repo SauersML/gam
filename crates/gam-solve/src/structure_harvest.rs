@@ -2,7 +2,7 @@
 //! evidence-guarded move engine of [`crate::structure_search`].
 //!
 //! #976 closed with the move engine (`search`) and its triggers
-//! ([`crate::terms::sae::atom_codes::SparseAtomCodes::coactivation`], ARD precisions,
+//! (`gam_sae::atom_codes::SparseAtomCodes::coactivation`, ARD precisions,
 //! terminal [`CollapseEvent`]s) on main but deliberately unwired: nothing
 //! harvested move proposals from a fitted dictionary or drove `search` around
 //! the production fit. This module is that seam. It owns three things:
@@ -277,7 +277,7 @@ fn proposal(term: &SaeManifoldTerm, mv: StructureMove, trigger: f64) -> MoveProp
 
 /// Harvest the canonical move-proposal stream from a fitted term, its ρ, and the
 /// per-row reconstruction residuals `R = target − fitted` (used for the birth
-/// channel under the [`WhitenedStructured`](crate::inference::row_metric::MetricProvenance::WhitenedStructured)
+/// channel under the `WhitenedStructured` (`gam_inference::row_metric::MetricProvenance::WhitenedStructured`)
 /// residual-factor metric — never raw-Euclidean Λ, per the #974 rescope).
 ///
 /// The four channels (#976/#997):
@@ -1864,7 +1864,7 @@ fn eval_log_lik(term: &SaeManifoldTerm, shard: &RowBlockShard) -> f64 {
 /// coordinate), tilt `ψ̂ =` the atom's per-row logit, binomial response `y =`
 /// the binarized activation (`b = 1`), under a unit ridge gate prior. The
 /// returned value is the log-evidence `−neg_log_evidence` from
-/// [`crate::inference::pg_gate_evidence::pg_gate_evidence`], summed over atoms,
+/// `gam_inference::pg_gate_evidence::pg_gate_evidence`, summed over atoms,
 /// so the K-dependent `−½·d_g·log(2π)` normalizer enters the gate's split-LR.
 ///
 /// A degenerate/non-PD gate block contributes `0` (no gate evidence) rather than

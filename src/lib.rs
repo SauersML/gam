@@ -130,16 +130,15 @@ pub mod model_types;
 /// without importing up into `solver`.
 pub mod outer_subsample;
 /// Lower-layer Pareto-smoothed importance-sampling primitive. Self-contained
-/// (no solver/inference deps); hosted at the crate root so `solver` and a
-/// relocated `rho_uncertainty` can depend on it downward (#1135).
-pub mod psis;
+/// (no solver/inference deps); descended into `gam-solve` (#1521) and
+/// re-exported here so existing `crate::psis` / `gam::psis` callers (including
+/// `inference::{rho_posterior, model_comparison}`) resolve it downward.
+pub use gam_solve::psis;
 pub mod report;
-pub(crate) mod rho_prior_eval;
 /// Lower-layer ρ-uncertainty (PSIS-on-ρ) diagnostic. Depends only on the
-/// lower-layer `crate::psis`; hosted at the crate root so `solver` (its primary
-/// consumer) can depend on it downward instead of importing *up* into
-/// `inference` (#1135).
-pub mod rho_uncertainty;
+/// lower-layer `psis`; descended into `gam-solve` (#1521) and re-exported here
+/// so the public `gam::rho_uncertainty` path is preserved.
+pub use gam_solve::rho_uncertainty;
 pub use gam_solve as solver;
 pub use gam_terms as terms;
 pub mod test_support;
@@ -230,6 +229,6 @@ pub use gam_models::fit_orchestration::{
     is_binary_response, materialize, prepare_survival_time_stack, residual_cascade_fast_path,
     resolve_family, resolve_offset_column, resolve_weight_column, spline_scan_fast_path,
 };
-pub use solver::protocol::{
+pub use families::protocol::{
     LatentScoreSemantics, MarginalSlopeCalibrationProtocol, SurvivalMarginalSlopeProtocol,
 };

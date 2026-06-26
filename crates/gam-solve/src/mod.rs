@@ -26,9 +26,26 @@ pub mod persistent_warm_start;
 pub mod pirls;
 pub(crate) mod priority_selection;
 pub mod psi_gram_tensor;
+// Pareto-smoothed importance sampling (descended #1521): leaf numerics with no
+// crate-internal dependencies, consumed by `reml::objective`, `rho_uncertainty`,
+// and the monolith's `inference::{rho_posterior, model_comparison}` (which now
+// reach it via the `gam-solve` re-export at the monolith crate root).
+pub mod psis;
+// Rho-prior penalty/barrier evaluation (descended #1521): depends only on
+// `gam_spec::RhoPrior`; consumed by `custom_family::blockwise_solve` and
+// `reml::atoms`.
+pub(crate) mod rho_prior_eval;
+// Rho-uncertainty (Pareto-k heavy-tail) diagnostics (descended #1521): depends
+// only on the descended `crate::psis`; consumed by `rho_optimizer::run`.
+pub mod rho_uncertainty;
 pub mod residual_cascade;
 pub mod rho_optimizer;
 pub(crate) use gam_problem::riemannian_retraction;
+// The `#[macro_export]` error-bail macros live in `gam-problem` (its crate
+// root). Importing them here makes `crate::bail_invalid_estim!` /
+// `crate::bail_dim_custom!` resolve at every gam-solve call site exactly as
+// they did when these macros lived at the monolith crate root.
+pub(crate) use gam_problem::{bail_dim_custom, bail_invalid_estim};
 pub mod row_measure;
 pub mod row_sampling_measure;
 pub mod seeding;

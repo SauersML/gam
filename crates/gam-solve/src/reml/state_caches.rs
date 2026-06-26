@@ -1022,7 +1022,7 @@ pub(in crate::estimate) fn latent_id_mode_cache_fingerprint(
             hash_aux_prior_strength(&mut hasher, *strength);
         }
         LatentIdMode::AuxOutcome { head, .. } => {
-            use crate::terms::decoders::behavioral_head::AuxOutcomeFamily;
+            use gam_terms::decoders::behavioral_head::AuxOutcomeFamily;
             hasher.write_str("aux-outcome");
             match head.family() {
                 AuxOutcomeFamily::Binomial => hasher.write_str("binomial"),
@@ -1068,7 +1068,7 @@ pub(crate) fn hash_scalar_weight_schedule(
     hasher: &mut Fingerprinter,
     schedule: &gam_terms::analytic_penalties::ScalarWeightSchedule,
 ) {
-    use crate::terms::sae::manifold::ScheduleKind;
+    use gam_problem::schedule::ScheduleKind;
 
     hasher.write_f64(schedule.w_start);
     hasher.write_f64(schedule.w_end);
@@ -1101,9 +1101,9 @@ pub(crate) fn hash_weight_schedule_option(
 
 pub(crate) fn hash_gumbel_temperature_schedule(
     hasher: &mut Fingerprinter,
-    schedule: &crate::terms::sae::manifold::GumbelTemperatureSchedule,
+    schedule: &gam_problem::schedule::GumbelTemperatureSchedule,
 ) {
-    use crate::terms::sae::manifold::ScheduleKind;
+    use gam_problem::schedule::ScheduleKind;
 
     hasher.write_f64(schedule.tau_start);
     hasher.write_f64(schedule.tau_min);
@@ -1123,7 +1123,7 @@ pub(crate) fn hash_gumbel_temperature_schedule(
 
 pub(crate) fn hash_gumbel_schedule_option(
     hasher: &mut Fingerprinter,
-    schedule: &Option<crate::terms::sae::manifold::GumbelTemperatureSchedule>,
+    schedule: &Option<gam_problem::schedule::GumbelTemperatureSchedule>,
 ) {
     match schedule {
         Some(schedule) => {

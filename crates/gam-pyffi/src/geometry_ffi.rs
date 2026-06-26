@@ -6381,7 +6381,7 @@ fn predict_table_jackknife_plus_impl(
         &col_map,
         "resolved_termspec",
     )?;
-    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
+    let design = gam::families::fit_orchestration::drivers::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("jackknife+ conformal: failed to build test design: {err}"))?;
     let x_test = design
         .design
@@ -6498,7 +6498,7 @@ fn predict_table_full_conformal_impl(
         &col_map,
         "resolved_termspec",
     )?;
-    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
+    let design = gam::families::fit_orchestration::drivers::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("full conformal: failed to build test design: {err}"))?;
     let x_test = design
         .design
@@ -6931,7 +6931,7 @@ fn design_matrix_dense(
         &col_map,
         "resolved_termspec",
     )?;
-    let design = gam::terms::smooth::build_term_collection_design(dataset.values.view(), &spec)
+    let design = gam::families::fit_orchestration::drivers::build_term_collection_design(dataset.values.view(), &spec)
         .map_err(|err| format!("failed to build design matrix: {err}"))?;
     let dense = design
         .design

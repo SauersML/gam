@@ -12,7 +12,7 @@
 //!   and corrected by a FISSION move.
 //! * **Feature shattering** (one curved family smeared across many
 //!   near-duplicate flat atoms): shattered atoms have dependent codes
-//!   ([`crate::terms::sae::atom_codes::CoactivationStats::dependence`]) and joint
+//!   (`gam_sae::atom_codes::CoactivationStats::dependence`) and joint
 //!   structure when refit together — corrected by a FUSION move.
 //!
 //! This module owns the MOVE ENGINE: canonical deterministic proposal order,

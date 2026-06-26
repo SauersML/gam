@@ -21,7 +21,7 @@ use gam::inference::model::{
 };
 use gam::linalg::utils::inf_norm;
 use gam::matrix::DesignMatrix;
-use gam::smooth::build_term_collection_design;
+use gam::families::fit_orchestration::drivers::build_term_collection_design;
 use gam::term_builder::resolve_role_col;
 
 /// Typed errors emitted while assembling a [`PredictInput`] from a saved model.

@@ -36,8 +36,11 @@ use crate::probability::{
     standard_normal_quantile,
 };
 use gam_terms::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionDesign, TermCollectionSpec, apply_spatial_anisotropy_pilot_initializer,
+    SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionDesign,
+    TermCollectionSpec,
+};
+use crate::fit_orchestration::drivers::{
+    ExactJointHyperSetup, apply_spatial_anisotropy_pilot_initializer,
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint,
     spatial_length_scale_term_indices,
 };

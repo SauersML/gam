@@ -1519,7 +1519,7 @@ pub struct RemlCandidate {
     pub score: f64,
     pub edf: Option<f64>,
     /// Log-likelihood at the converged mode, on the engine's
-    /// constants-omitted scale (same as [`crate::inference::model_comparison`]).
+    /// constants-omitted scale (same as `gam_inference::model_comparison`).
     /// Present when the fit carries it; `None` for legacy payloads.
     pub log_lik: Option<f64>,
     /// Response-family tag (e.g. "gaussian", "gamma", "binomial"). Carried so

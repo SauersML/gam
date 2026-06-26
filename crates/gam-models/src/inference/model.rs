@@ -3335,7 +3335,8 @@ impl FittedModel {
         col_map: &HashMap<String, usize>,
     ) -> Result<Option<Array1<f64>>, FittedModelError> {
         use gam_terms::basis::{CenterStrategy, MeasureJetExtrapolationSpectrum, PenaltySource};
-        use gam_terms::smooth::{SmoothBasisSpec, build_term_collection_design};
+        use crate::fit_orchestration::drivers::build_term_collection_design;
+        use gam_terms::smooth::SmoothBasisSpec;
         let Some(saved_spec) = self.resolved_termspec.as_ref() else {
             return Ok(None);
         };

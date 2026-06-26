@@ -28,7 +28,7 @@
 //! diagonal entry is non-zero; an all-zero curvature contribution collapses to
 //! `None` so callers can skip adding an empty block.
 
-use crate::types::RhoPrior;
+use gam_spec::RhoPrior;
 use ndarray::{Array1, Array2};
 
 /// Calibrated exponential rate `θ = −ln(tail_prob) / upper` of a

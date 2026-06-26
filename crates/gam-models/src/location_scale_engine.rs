@@ -11,8 +11,10 @@
 //! the single home for that assembly so improvements to it land once.
 
 use gam_terms::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords,
-    TermCollectionSpec, spatial_length_scale_term_indices,
+    SpatialLengthScaleOptimizationOptions, SpatialLogKappaCoords, TermCollectionSpec,
+};
+use crate::fit_orchestration::drivers::{
+    ExactJointHyperSetup, spatial_length_scale_term_indices,
 };
 use ndarray::{Array1, ArrayView2};
 

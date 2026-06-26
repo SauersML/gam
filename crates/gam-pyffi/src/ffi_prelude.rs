@@ -112,8 +112,10 @@ pub(crate) use gam::geometry::sinkhorn_barycenter::{
 pub(crate) use gam::report::{CoefficientRow, EdfBlockRow, ReportInput, render_html};
 
 pub(crate) use gam::terms::smooth::{
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design, smooth_term_feature_cols,
+    TermCollectionDesign, TermCollectionSpec, smooth_term_feature_cols,
+};
+pub(crate) use gam::families::fit_orchestration::drivers::{
+    build_term_collection_design, freeze_term_collection_from_design,
 };
 
 pub(crate) use gam::solver::build_analytic_penalty_registry_from_descriptors as build_analytic_penalty_registry_from_json;

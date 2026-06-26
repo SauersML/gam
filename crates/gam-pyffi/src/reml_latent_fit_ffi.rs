@@ -1474,7 +1474,7 @@ fn gaussian_reml_fit_formula_table_impl(
         return Err("shared-tangent Gaussian REML fitting does not support offsets".to_string());
     }
     let design =
-        gam::terms::smooth::build_term_collection_design(standard.data.view(), &standard.spec)
+        gam::families::fit_orchestration::drivers::build_term_collection_design(standard.data.view(), &standard.spec)
             .map_err(|err| format!("failed to build formula design matrix: {err}"))?;
     let x = design
         .design

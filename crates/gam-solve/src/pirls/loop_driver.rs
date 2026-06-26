@@ -58,7 +58,7 @@ use crate::estimate::EstimationError;
 use gam_linalg::faer_ndarray::fast_ab;
 use gam_linalg::matrix::{DesignMatrix, LinearOperator, ReparamOperator, SymmetricMatrix};
 use crate::mixture_link::inverse_link_has_fisher_weight_jet;
-use crate::probability::standard_normal_quantile;
+use gam_math::probability::standard_normal_quantile;
 use crate::active_set;
 use crate::gpu::pirls_host_dispatch::{try_gaussian_pls_gpu, try_pirls_loop_gpu};
 use gam_problem::{

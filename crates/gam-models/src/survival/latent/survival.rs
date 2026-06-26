@@ -40,9 +40,9 @@ use crate::model_types::UnifiedFitResult;
 use gam_solve::pirls::LinearInequalityConstraints;
 use crate::probability::signed_log_sum_exp;
 use crate::quadrature::{IntegratedExpectationMode, QuadratureContext};
-use gam_terms::smooth::{
-    TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
-    freeze_term_collection_from_design,
+use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec};
+use crate::fit_orchestration::drivers::{
+    build_term_collection_design, freeze_term_collection_from_design,
 };
 use gam_problem::MIN_WEIGHT;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};

@@ -97,8 +97,10 @@ use crate::probability::erfcx_nonnegative;
 use crate::probability::{normal_cdf, normal_pdf};
 
 use gam_terms::smooth::{
-    ExactJointHyperSetup, SpatialLengthScaleOptimizationOptions, TermCollectionDesign,
-    TermCollectionSpec, build_term_collection_design, freeze_term_collection_from_design,
+    SpatialLengthScaleOptimizationOptions, TermCollectionDesign, TermCollectionSpec,
+};
+use crate::fit_orchestration::drivers::{
+    ExactJointHyperSetup, build_term_collection_design, freeze_term_collection_from_design,
     optimize_spatial_length_scale_exact_joint, spatial_length_scale_term_indices,
 };
 

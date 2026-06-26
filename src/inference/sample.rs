@@ -47,9 +47,8 @@ use crate::inference::model::{
     FittedModel as SavedModel, PredictModelClass, load_survival_time_basis_config_from_model,
 };
 use crate::linalg::triangular::back_substitution_lower_transpose_guarded_into;
-use crate::smooth::{
-    LinearCoefficientGeometry, build_term_collection_design, weighted_blockwise_penalty_sum,
-};
+use crate::families::fit_orchestration::drivers::build_term_collection_design;
+use crate::smooth::{LinearCoefficientGeometry, weighted_blockwise_penalty_sum};
 use crate::term_builder::resolve_role_col;
 use crate::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 
@@ -514,13 +513,13 @@ fn sample_standard(
         // `intercept_range.end + j` of the model's coefficient vector. Bounds
         // are on the original (user/data) scale, which is also the scale the
         // saved beta and penalized Hessian live on.
-        let bounded_columns: Vec<crate::smooth::BoundedSampleColumn> = spec
+        let bounded_columns: Vec<crate::families::fit_orchestration::drivers::BoundedSampleColumn> = spec
             .linear_terms
             .iter()
             .enumerate()
             .filter_map(|(j, term)| match term.coefficient_geometry {
                 LinearCoefficientGeometry::Bounded { min, max, .. } => {
-                    Some(crate::smooth::BoundedSampleColumn {
+                    Some(crate::families::fit_orchestration::drivers::BoundedSampleColumn {
                         col_idx: design.intercept_range.end + j,
                         min,
                         max,
@@ -633,7 +632,7 @@ fn sample_standard(
 fn sample_standard_bounded(
     model: &SavedModel,
     cfg: &NutsConfig,
-    bounded_columns: &[crate::smooth::BoundedSampleColumn],
+    bounded_columns: &[crate::families::fit_orchestration::drivers::BoundedSampleColumn],
 ) -> Result<NutsResult, String> {
     validate_nuts_config(cfg).map_err(String::from)?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
@@ -659,7 +658,7 @@ fn sample_standard_bounded(
     // (gam#1514); the truncated-constraint path does the analogous √φ lift.
     let sqrt_cov_scale = fit.coefficient_covariance_scale().max(0.0).sqrt();
     let n_total = cfg.n_samples.saturating_mul(cfg.n_chains);
-    let samples = crate::smooth::sample_bounded_latent_posterior_internal(
+    let samples = crate::families::fit_orchestration::drivers::sample_bounded_latent_posterior_internal(
         &mode,
         user_hessian,
         bounded_columns,

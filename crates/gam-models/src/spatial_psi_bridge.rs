@@ -15,9 +15,9 @@ use crate::custom_family::{
     EmbeddedImplicitPsiDerivativeOperator, build_embedded_dense_psi_operator,
 };
 use gam_linalg::matrix::{EmbeddedColumnBlock, EmbeddedSquareBlock};
-use gam_terms::smooth::{
-    TermCollectionDesign, TermCollectionSpec, spatial_length_scale_term_indices,
-    try_build_spatial_log_kappa_derivativeinfo_list,
+use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec};
+use crate::fit_orchestration::drivers::{
+    spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
 };
 use ndarray::Array2;
 use std::collections::HashMap;
@@ -247,9 +247,9 @@ mod tests {
     use super::*;
     use gam_terms::basis::{CenterStrategy, MaternBasisSpec, MaternIdentifiability, MaternNu};
     use crate::custom_family::resolve_custom_family_x_psi_psi_map;
-    use gam_terms::smooth::{
-        ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, build_term_collection_design,
-        freeze_term_collection_from_design,
+    use gam_terms::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
+    use crate::fit_orchestration::drivers::{
+        build_term_collection_design, freeze_term_collection_from_design,
     };
     use gam_runtime::resource::ResourcePolicy;
 

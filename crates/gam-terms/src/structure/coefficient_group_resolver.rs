@@ -4,7 +4,7 @@
 //! rho-prior entries in two places: standard term collections (carrier =
 //! columns of the realized design matrix, [`crate::smooth`]) and custom
 //! families (carrier = `(block, column)` coordinates of parameter blocks,
-//! [`crate::families::custom_family`]). The carrier differs but the *policy* is
+//! `crate::families::custom_family`). The carrier differs but the *policy* is
 //! identical: validate labels, build the parent/child hierarchy, reject cycles,
 //! require each child to be a subset of its parent, require an interior node's
 //! coefficients to be exactly the union of its children, and expand interior

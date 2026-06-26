@@ -1,8 +1,6 @@
 use crate::estimate::EstimationError;
-use crate::probability::{
-    normal_cdf, normal_pdf,
-    stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
-};
+use gam_math::probability::{normal_cdf, normal_pdf};
+use gam_math::special::stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg;
 use crate::quadrature::latent_cloglog_jet5;
 use gam_problem::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, LinkComponent, LinkFunction, MixtureLinkSpec,

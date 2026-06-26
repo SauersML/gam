@@ -3896,9 +3896,9 @@ mod tests {
         // Validate the closed-form jet against central finite differences of
         // the reference scalar weight.
         fn reference_probit_weight(eta: f64) -> f64 {
-            let p = crate::probability::normal_cdf(eta);
+            let p = gam_math::probability::normal_cdf(eta);
             let q = 1.0 - p;
-            let phi = crate::probability::normal_pdf(eta);
+            let phi = gam_math::probability::normal_pdf(eta);
             if p <= 0.0 || q <= 0.0 {
                 return 0.0;
             }
