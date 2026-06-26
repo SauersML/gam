@@ -2139,8 +2139,8 @@ pub(crate) fn pairwise_distance_bounds_sampled(points: ArrayView2<'_, f64>) -> O
 #[cfg(test)]
 mod duchon_hybrid_psd_tests {
     use super::*;
-    use gam_linalg::faer_ndarray::FaerEigh;
     use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
 
     /// Deterministic, well-separated centers on `[-1, 1]^d` (a Halton-style
     /// low-discrepancy lattice over the radical-inverse base sequence). Mirrors

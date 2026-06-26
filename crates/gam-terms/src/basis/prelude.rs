@@ -10,7 +10,7 @@ use gam_linalg::matrix::{
 };
 use crate::chunked_kernel_design::ChunkedKernelDesignOperator;
 
-use crate::probability::{
+use gam_math::special::{
     binomial_coefficient_f64 as binomial_f64,
     stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg,
 };

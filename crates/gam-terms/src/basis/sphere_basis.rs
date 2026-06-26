@@ -458,8 +458,8 @@ fn solve_spd_columns_ridged(
     a: ArrayView2<'_, f64>,
     b: ArrayView2<'_, f64>,
 ) -> Result<Array2<f64>, BasisError> {
-    use gam_linalg::faer_ndarray::{FaerArrayView, FaerLlt, FaerSolve};
     use faer::Side;
+    use gam_linalg::faer_ndarray::{FaerArrayView, FaerLlt, FaerSolve};
 
     let n = a.nrows();
     if n == 0 || a.ncols() != n || b.nrows() != n {
@@ -981,11 +981,9 @@ pub(crate) fn build_matern_basis_seeded(
         } else {
             None
         };
-        let kernel_gauge = z_opt.as_ref().map(|z| {
-            Arc::new(gam_problem::Gauge::from_block_transforms(&[
-                z.clone()
-            ]))
-        });
+        let kernel_gauge = z_opt
+            .as_ref()
+            .map(|z| Arc::new(gam_problem::Gauge::from_block_transforms(&[z.clone()])));
         let design = if let Some(eta) = aniso.as_ref() {
             let metric_weights = eta.iter().map(|&v| (2.0 * v).exp()).collect::<Vec<_>>();
             let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
@@ -1578,8 +1576,7 @@ pub(crate) fn build_matern_operator_penalty_psi_derivatives(
         }
     }
 
-    let coefficient_gauge =
-        z_opt.map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
+    let coefficient_gauge = z_opt.map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
     let project = |mat: Array2<f64>| {
         if let Some(gauge) = coefficient_gauge.as_ref() {
             gauge.restrict_design(&mat)
@@ -2015,8 +2012,8 @@ pub(crate) fn build_duchon_operator_penalty_psi_derivatives(
     // coordinate system so identifiability transforms line up, but leave its
     // operator columns and psi-derivatives at zero so it remains unpenalized.
 
-    let coefficient_gauge = identifiability_transform
-        .map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
+    let coefficient_gauge =
+        identifiability_transform.map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
     let project = |mat: Array2<f64>| {
         if let Some(gauge) = coefficient_gauge.as_ref() {
             gauge.restrict_design(&mat)
@@ -2233,8 +2230,8 @@ pub(crate) fn build_duchon_native_penalty_psi_derivatives(
     let omega_psi = project_kernel(&kernel_psi);
     let omega_psi_psi = project_kernel(&kernel_psi_psi);
 
-    let outer_gauge = identifiability_transform
-        .map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
+    let outer_gauge =
+        identifiability_transform.map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
     let embed = |block: Array2<f64>| {
         let mut out = Array2::<f64>::zeros((total_cols, total_cols));
         out.slice_mut(s![..kernel_cols, ..kernel_cols])

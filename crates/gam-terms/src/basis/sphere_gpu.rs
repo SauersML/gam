@@ -1846,8 +1846,8 @@ mod sphere_gpu_tests {
         use crate::basis::{
             select_spherical_farthest_point_centers, spherical_wahba_kernel_matrix_with_kind,
         };
-        use gam_linalg::faer_ndarray::FaerCholesky;
         use faer::Side;
+        use gam_linalg::faer_ndarray::FaerCholesky;
 
         let Some(_runtime) = gam_gpu::device_runtime::GpuRuntime::global() else {
             eprintln!(

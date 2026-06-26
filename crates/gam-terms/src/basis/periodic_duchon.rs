@@ -1358,8 +1358,8 @@ pub(crate) fn duchon_constrained_bending_penalty(
 /// error rather than masked, because clamping a −0.26 mode silently fabricates
 /// a different penalty.
 fn reject_nonpsd_then_clamp_noise(matrix: &Array2<f64>) -> Result<Array2<f64>, BasisError> {
-    use gam_linalg::faer_ndarray::FaerEigh;
     use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
     let sym = symmetrize_penalty(matrix);
     let n = sym.nrows();
     if n == 0 || n != sym.ncols() {
@@ -1633,8 +1633,8 @@ mod mixed_periodicity_psd_tests {
     //! space must contain polynomials of total degree `< m` in the NON-periodic
     //! coordinates, not just constants).
     use super::*;
-    use gam_linalg::faer_ndarray::FaerEigh;
     use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
     use ndarray::{Array2, array};
 
     fn cylinder_spec() -> DuchonBasisSpec {
@@ -1883,8 +1883,8 @@ mod hybrid_high_dim_psd_tests {
     //! cancellation-free single-integral kernel evaluation
     //! (`duchon_hybrid_kernel_stable_integral`) restores genuine PSD-ness.
     use super::*;
-    use gam_linalg::faer_ndarray::FaerEigh;
     use faer::Side;
+    use gam_linalg::faer_ndarray::FaerEigh;
     use ndarray::Array2;
 
     /// Deterministic pseudo-random centers in `[-1, 1]^d` (no RNG dependency in

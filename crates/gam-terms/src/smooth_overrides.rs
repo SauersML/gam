@@ -1394,7 +1394,10 @@ mod tests {
     fn double_penalty_toggles_bspline_both_ways() {
         // Explicit `true` turns the second (nullspace-shrinkage) penalty on.
         let mut spec_true = open_bspline_spec();
-        assert!(!spec_true.double_penalty, "fixture must start single-penalty");
+        assert!(
+            !spec_true.double_penalty,
+            "fixture must start single-penalty"
+        );
         apply_bspline_1d(
             &mut spec_true,
             &obj(json!({"kind": "bspline", "double_penalty": true})),

@@ -161,46 +161,17 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
     }
 }
 
-#[inline]
-fn horner_polynomial(x: f64, coeffs: &[f64]) -> f64 {
-    coeffs.iter().rev().fold(0.0, |acc, &c| acc * x + c)
-}
-
-/// Evaluate `(Σ_k coeffs[k]·x^k) · exp(−x)` without overflow.  For moderate
-/// `x ≤ 600` uses Horner + `exp(−x)` directly; for very large `x` rewrites
-/// `xᵈ · exp(−x) = exp(d·ln x − x)` and runs Horner in `1/x`, which keeps
-/// both the polynomial sum and its multiplier inside double range.  Returns
-/// `0.0` for non-finite `x` or empty `coeffs`.
-#[inline]
-pub fn stable_polynomial_times_exp_neg(x: f64, coeffs: &[f64]) -> f64 {
-    if coeffs.is_empty() || !x.is_finite() {
-        return 0.0;
-    }
-    // Below this argument `(-x).exp()` is still well-resolved, so the direct
-    // Horner-times-exp form is both accurate and cheapest. Above it the factor
-    // underflows toward zero and we switch to the convergent asymptotic tail
-    // series to retain the leading significant digits.
-    const DIRECT_EXP_SWITCH: f64 = 600.0;
-    if x <= DIRECT_EXP_SWITCH {
-        return horner_polynomial(x, coeffs) * (-x).exp();
-    }
-
-    let inv_x = x.recip();
-    let mut tail = 0.0;
-    for &c in coeffs {
-        tail = tail * inv_x + c;
-    }
-    let degree = (coeffs.len() - 1) as f64;
-    let scale = (degree * x.ln() - x).exp();
-    scale * tail
-}
-
 /// Numerically stable `C(n,k) = n! / (k!·(n−k)!)` as `f64`.  The
 /// implementation now lives in the lowest crate (`gam-math`) so the
 /// terms/basis cluster can consume it without reaching up into `inference`;
 /// re-exported here to keep `crate::probability::binomial_coefficient_f64`
 /// resolving for all existing callers.
 pub use gam_math::special::binomial_coefficient_f64;
+
+/// Evaluate `(Σ_k coeffs[k]·x^k) · exp(−x)` without overflow. The
+/// implementation lives in `gam-math` so terms/basis code can consume it without
+/// reaching up into `inference`.
+pub use gam_math::special::stable_polynomial_times_exp_neg;
 
 /// Numerically stable `ln Φ(x)` for the standard normal CDF.  For `x ≥ 0`
 /// computes `ln(Φ(x))` directly with a small floor against underflow; for

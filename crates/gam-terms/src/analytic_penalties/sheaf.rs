@@ -38,9 +38,9 @@
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1};
 
+use crate::analytic_penalties::{AnalyticPenalty, PenaltyTier};
 use gam_linalg::faer_ndarray::FaerEigh;
 use gam_linalg::lanczos::{SymmetricLanczosOptions, symmetric_lanczos_eigenpairs};
-use crate::analytic_penalties::{AnalyticPenalty, PenaltyTier};
 
 /// Threshold above which `harmonic_modes` switches from a dense faer eigen
 /// solve to a matrix-free Lanczos null-space count. The dense path

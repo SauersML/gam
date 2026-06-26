@@ -693,9 +693,9 @@ pub fn build_constant_curvature_basis(
     let gauge = gam_problem::Gauge::from_block_transforms(&[z.clone()]);
     let penalty = gauge.restrict_penalty(&raw_penalty);
     let raw_design = constant_curvature_kernel_matrix(data, centers.view(), spec.kappa, ell_eff)?;
-    let design = gam_linalg::matrix::DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-        gauge.restrict_design(&raw_design),
-    ));
+    let design = gam_linalg::matrix::DesignMatrix::Dense(
+        gam_linalg::matrix::DenseDesignMatrix::from(gauge.restrict_design(&raw_design)),
+    );
     // Keep the RKHS penalty RAW (the symmetric kernel Gram zᵀKz) with
     // normalization_scale = 1, rather than Frobenius-normalizing it. The Gram's
     // eigenvalues ARE the physical RKHS roughness energies of each coefficient
@@ -1754,8 +1754,7 @@ mod tests {
             // nothing: matching that pattern would make `double_penalty` a no-op,
             // confirming the identity ridge is the only selectable double penalty.
             let null_shrink =
-                crate::basis::bspline_build::build_nullspace_shrinkage_penalty(&raw)
-                    .unwrap();
+                crate::basis::bspline_build::build_nullspace_shrinkage_penalty(&raw).unwrap();
             assert!(
                 null_shrink.is_none(),
                 "build_nullspace_shrinkage_penalty must return None on the full-rank \

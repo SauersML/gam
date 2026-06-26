@@ -20,8 +20,8 @@ use std::sync::Arc;
 use faer::Side;
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 
-use gam_linalg::faer_ndarray::{FaerEigh, fast_av_view_into};
 use crate::basis::closed_form_operator::ClosedFormPenaltyOperator;
+use gam_linalg::faer_ndarray::{FaerEigh, fast_av_view_into};
 
 /// Square symmetric PSD penalty operator.
 ///

@@ -1,5 +1,5 @@
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use faer::Side;
+use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 
 const DEFAULT_MAX_ITER: usize = 30;

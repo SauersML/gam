@@ -321,7 +321,9 @@ fn build_duchon_basis_uncached(
                 Some(Arc::new(poly_block.clone())),
             )
             .map_err(BasisError::InvalidInput)?;
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(base_op)))
+            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
+                base_op,
+            )))
         } else {
             let coeffs = coeffs.clone();
             let kernel = move |data_row: &[f64], center_row: &[f64]| -> f64 {
@@ -352,7 +354,9 @@ fn build_duchon_basis_uncached(
                 Some(Arc::new(poly_block)),
             )
             .map_err(BasisError::InvalidInput)?;
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(base_op)))
+            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
+                base_op,
+            )))
         };
         let identifiability_transform = spatial_identifiability_transform_from_design_matrix(
             data,
@@ -448,7 +452,9 @@ fn build_duchon_basis_uncached(
             "Duchon",
         )?;
         let design = if let Some(z) = identifiability_transform.as_ref() {
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(fast_ab(&basis, z)))
+            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(fast_ab(
+                &basis, z,
+            )))
         } else {
             DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(basis))
         };
@@ -894,8 +900,7 @@ pub(crate) fn thin_plate_radial_reparam_from_centers(
         }
         thin_plate_kernel_from_dist2(dist2 / length_scale_sq, d)
     })?;
-    let kernel_gauge =
-        gam_problem::Gauge::from_block_transforms(&[kernel_transform.clone()]);
+    let kernel_gauge = gam_problem::Gauge::from_block_transforms(&[kernel_transform.clone()]);
     let omega_constrained = symmetrize_penalty(&kernel_gauge.restrict_penalty(&omega));
     thin_plate_radial_reparam_from_constrained_penalty(&omega_constrained)
 }

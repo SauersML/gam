@@ -7,7 +7,7 @@
 //! partial-fraction helpers.
 
 use gam_linalg::utils::KahanSum;
-use crate::probability::binomial_coefficient_f64 as binomial_f64;
+use gam_math::special::binomial_coefficient_f64 as binomial_f64;
 use statrs::function::gamma::{gamma as gamma_fn, ln_gamma};
 use std::sync::OnceLock;
 

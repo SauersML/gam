@@ -1647,8 +1647,7 @@ pub struct KroneckerFactoredBasis {
     /// on first use via [`Self::invariant_structure`]. NOT serialized and reset
     /// to empty on `Clone` (it is purely a within-fit performance cache; a fresh
     /// owner recomputes on first demand, keeping every result bit-identical).
-    invariant:
-        std::sync::OnceLock<std::sync::Arc<crate::construction::KroneckerInvariantStructure>>,
+    invariant: std::sync::OnceLock<std::sync::Arc<crate::kronecker::KroneckerInvariantStructure>>,
 }
 
 impl Clone for KroneckerFactoredBasis {
@@ -1700,10 +1699,7 @@ impl KroneckerFactoredBasis {
     /// immutable for the fit's lifetime, no invalidation is needed.
     pub fn invariant_structure(
         &self,
-    ) -> Result<
-        std::sync::Arc<crate::construction::KroneckerInvariantStructure>,
-        crate::estimate::EstimationError,
-    > {
+    ) -> Result<std::sync::Arc<crate::kronecker::KroneckerInvariantStructure>, BasisError> {
         // Fast path: already memoized.
         if let Some(s) = self.invariant.get() {
             return Ok(std::sync::Arc::clone(s));
@@ -1712,12 +1708,11 @@ impl KroneckerFactoredBasis {
         // concurrent racer already won, `get_or_init` drops our `computed` and
         // returns the stored one; either way the value is the unique function of
         // the fixed marginal data, so the returned Arc is correct.
-        let computed =
-            std::sync::Arc::new(crate::construction::KroneckerInvariantStructure::compute(
-                &self.marginal_designs,
-                &self.marginal_penalties,
-                &self.marginal_dims,
-            )?);
+        let computed = std::sync::Arc::new(crate::kronecker::KroneckerInvariantStructure::compute(
+            &self.marginal_designs,
+            &self.marginal_penalties,
+            &self.marginal_dims,
+        )?);
         let installed = self.invariant.get_or_init(|| computed);
         Ok(std::sync::Arc::clone(installed))
     }
@@ -2095,9 +2090,9 @@ pub(crate) fn wrap_dense_design_with_transform(
             let op = CoefficientTransformOperator::new(inner, transform.clone()).map_err(|e| {
                 BasisError::InvalidInput(format!("{label} coefficient transform failed: {e}"))
             })?;
-            Ok(DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-                Arc::new(op),
-            )))
+            Ok(DesignMatrix::Dense(
+                gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(op)),
+            ))
         }
         DesignMatrix::Sparse(_) => Err(BasisError::InvalidInput(format!(
             "{label} coefficient transform requires a dense/operator-backed design"

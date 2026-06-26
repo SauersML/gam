@@ -1334,8 +1334,8 @@ impl AnalyticPenalty for JumpReLUPenalty {
 #[cfg(test)]
 mod fisher_majorizer_1419_tests {
     use super::*;
-    use gam_linalg::faer_ndarray::FaerEigh;
     use approx::assert_abs_diff_eq;
+    use gam_linalg::faer_ndarray::FaerEigh;
     use ndarray::Array2;
 
     /// #1419 — the Fisher information metric `G = scale·(diag(a) − a aᵀ)` is PSD

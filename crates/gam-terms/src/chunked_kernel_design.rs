@@ -1,6 +1,5 @@
 //! Spatial-kernel design operators for basis construction.
 
-use gam_problem::Gauge;
 use faer::Accum;
 use faer::Par;
 use faer::linalg::matmul::matmul;
@@ -9,6 +8,7 @@ use gam_linalg::faer_ndarray::{
     effective_global_parallelism, fast_atv, fast_av, stream_weighted_crossprod_into,
 };
 use gam_linalg::matrix::{DenseDesignOperator, LinearOperator};
+use gam_problem::Gauge;
 use gam_runtime::resource::MatrixMaterializationError;
 use ndarray::{Array1, Array2, ArrayViewMut2, s};
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};

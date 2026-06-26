@@ -506,123 +506,41 @@ pub fn build_bspline_basis_1d(
         .iter()
         .map(|candidate| candidate.matrix.clone())
         .collect();
-    let (design, transformed_candidates, identifiability_transform) =
-        if let Some(sparse_basis) = design_sparse_opt {
-            match &spec.identifiability {
-                BSplineIdentifiability::None => {
-                    let transformed_candidates = penalties_raw
-                        .into_iter()
-                        .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                            Ok(PenaltyCandidate {
-                                nullspace_dim_hint: candidate.nullspace_dim_hint,
-                                matrix: candidate.matrix,
-                                source: candidate.source,
-                                normalization_scale: candidate.normalization_scale,
-                                kronecker_factors: None,
-                                op: None,
-                            })
+    let (design, transformed_candidates, identifiability_transform) = if let Some(sparse_basis) =
+        design_sparse_opt
+    {
+        match &spec.identifiability {
+            BSplineIdentifiability::None => {
+                let transformed_candidates = penalties_raw
+                    .into_iter()
+                    .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
+                        Ok(PenaltyCandidate {
+                            nullspace_dim_hint: candidate.nullspace_dim_hint,
+                            matrix: candidate.matrix,
+                            source: candidate.source,
+                            normalization_scale: candidate.normalization_scale,
+                            kronecker_factors: None,
+                            op: None,
                         })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    (
-                        DesignMatrix::Sparse(gam_linalg::matrix::SparseDesignMatrix::new(sparse_basis)),
-                        transformed_candidates,
-                        None,
-                    )
-                }
-                BSplineIdentifiability::WeightedSumToZero { weights } => {
-                    let (constrained_basis, z) = apply_sum_to_zero_constraint_sparse(
-                        &sparse_basis,
-                        weights.as_ref().map(|w| w.view()),
-                    )?;
-                    let gauge = gam_problem::Gauge::sum_to_zero(z);
-                    let z = gauge.block_transform(0);
-                    let transformed_candidates = penalties_raw
-                        .into_iter()
-                        .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
-                            let matrix = gauge.restrict_penalty(&candidate.matrix);
-                            Ok(PenaltyCandidate {
-                                nullspace_dim_hint: candidate.nullspace_dim_hint,
-                                matrix,
-                                source: candidate.source,
-                                normalization_scale: candidate.normalization_scale,
-                                kronecker_factors: None,
-                                op: None,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    // `apply_sum_to_zero_constraint_sparse` now returns a dense
-                    // constrained basis `B_c = B Z` with orthonormal `Z`. The
-                    // densification is the honest cost of using an orthonormal
-                    // null-space basis (so that `ZZᵀ` is a true projector); the
-                    // post-constraint matrix has `k-1` columns, which is the
-                    // smooth's typical working dimension, so this stays small.
-                    (
-                        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
-                            constrained_basis,
-                        ))),
-                        transformed_candidates,
-                        Some(z),
-                    )
-                }
-                BSplineIdentifiability::RemoveLinearTrend
-                | BSplineIdentifiability::OrthogonalToDesignColumns { .. }
-                | BSplineIdentifiability::FrozenTransform { .. } => {
-                    crate::bail_invalid_basis!(
-                        "sparse B-spline identifiability only supports None or \
-                     WeightedSumToZero; RemoveLinearTrend, \
-                     OrthogonalToDesignColumns, and FrozenTransform require \
-                     the dense path"
-                            .to_string(),
-                    );
-                }
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                (
+                    DesignMatrix::Sparse(gam_linalg::matrix::SparseDesignMatrix::new(sparse_basis)),
+                    transformed_candidates,
+                    None,
+                )
             }
-        } else {
-            let raw_design = design_dense_opt.expect("dense B-spline basis should be present");
-            // A `FrozenTransform` already maps from the RAW knot basis with the
-            // endpoint boundary projection baked in (it was composed as
-            // `boundary ∘ identifiability` at fit time). Re-deriving and re-applying
-            // the boundary nullspace transform here would project the raw basis a
-            // second time and shrink its width before the frozen transform replays,
-            // so a frozen anchored/clamped spec must NOT re-run the boundary step.
-            // Skipping it lets the frozen spec keep its original
-            // `boundary_conditions` (the single source of truth the intercept-
-            // suppression decision reads, #1238/#1265) without double-projecting.
-            let boundary_transform = if matches!(
-                spec.identifiability,
-                BSplineIdentifiability::FrozenTransform { .. }
-            ) {
-                None
-            } else {
-                bspline_boundary_nullspace_transform(&knots, spec.degree, spec.boundary_conditions)?
-            };
-            let (boundary_design, boundary_penalties) =
-                if let Some(z_bc) = boundary_transform.as_ref() {
-                    (
-                        fast_ab(&raw_design, z_bc),
-                        penalties_raw_mats
-                            .into_iter()
-                            .map(|s| project_penalty_matrix(&s, Some(z_bc)))
-                            .collect(),
-                    )
-                } else {
-                    (raw_design, penalties_raw_mats)
-                };
-            let (design, penalties, identifiability_local) =
-                apply_bspline_identifiability_policy_in_chart(
-                    boundary_design,
-                    boundary_penalties,
-                    &knots,
-                    spec.degree,
-                    &spec.identifiability,
-                    boundary_transform.as_ref(),
+            BSplineIdentifiability::WeightedSumToZero { weights } => {
+                let (constrained_basis, z) = apply_sum_to_zero_constraint_sparse(
+                    &sparse_basis,
+                    weights.as_ref().map(|w| w.view()),
                 )?;
-            let identifiability_transform =
-                compose_optional_bspline_transform(boundary_transform, identifiability_local)?;
-            let transformed_candidates = penalties
-                .into_iter()
-                .zip(penalties_raw.into_iter())
-                .map(
-                    |(matrix, candidate)| -> Result<PenaltyCandidate, BasisError> {
+                let gauge = gam_problem::Gauge::sum_to_zero(z);
+                let z = gauge.block_transform(0);
+                let transformed_candidates = penalties_raw
+                    .into_iter()
+                    .map(|candidate| -> Result<PenaltyCandidate, BasisError> {
+                        let matrix = gauge.restrict_penalty(&candidate.matrix);
                         Ok(PenaltyCandidate {
                             nullspace_dim_hint: candidate.nullspace_dim_hint,
                             matrix,
@@ -631,15 +549,98 @@ pub fn build_bspline_basis_1d(
                             kronecker_factors: None,
                             op: None,
                         })
-                    },
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                // `apply_sum_to_zero_constraint_sparse` now returns a dense
+                // constrained basis `B_c = B Z` with orthonormal `Z`. The
+                // densification is the honest cost of using an orthonormal
+                // null-space basis (so that `ZZᵀ` is a true projector); the
+                // post-constraint matrix has `k-1` columns, which is the
+                // smooth's typical working dimension, so this stays small.
+                (
+                    DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(
+                        constrained_basis,
+                    ))),
+                    transformed_candidates,
+                    Some(z),
                 )
-                .collect::<Result<Vec<_>, _>>()?;
-            (
-                DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design)),
-                transformed_candidates,
-                identifiability_transform,
-            )
+            }
+            BSplineIdentifiability::RemoveLinearTrend
+            | BSplineIdentifiability::OrthogonalToDesignColumns { .. }
+            | BSplineIdentifiability::FrozenTransform { .. } => {
+                crate::bail_invalid_basis!(
+                    "sparse B-spline identifiability only supports None or \
+                     WeightedSumToZero; RemoveLinearTrend, \
+                     OrthogonalToDesignColumns, and FrozenTransform require \
+                     the dense path"
+                        .to_string(),
+                );
+            }
+        }
+    } else {
+        let raw_design = design_dense_opt.expect("dense B-spline basis should be present");
+        // A `FrozenTransform` already maps from the RAW knot basis with the
+        // endpoint boundary projection baked in (it was composed as
+        // `boundary ∘ identifiability` at fit time). Re-deriving and re-applying
+        // the boundary nullspace transform here would project the raw basis a
+        // second time and shrink its width before the frozen transform replays,
+        // so a frozen anchored/clamped spec must NOT re-run the boundary step.
+        // Skipping it lets the frozen spec keep its original
+        // `boundary_conditions` (the single source of truth the intercept-
+        // suppression decision reads, #1238/#1265) without double-projecting.
+        let boundary_transform = if matches!(
+            spec.identifiability,
+            BSplineIdentifiability::FrozenTransform { .. }
+        ) {
+            None
+        } else {
+            bspline_boundary_nullspace_transform(&knots, spec.degree, spec.boundary_conditions)?
         };
+        let (boundary_design, boundary_penalties) = if let Some(z_bc) = boundary_transform.as_ref()
+        {
+            (
+                fast_ab(&raw_design, z_bc),
+                penalties_raw_mats
+                    .into_iter()
+                    .map(|s| project_penalty_matrix(&s, Some(z_bc)))
+                    .collect(),
+            )
+        } else {
+            (raw_design, penalties_raw_mats)
+        };
+        let (design, penalties, identifiability_local) =
+            apply_bspline_identifiability_policy_in_chart(
+                boundary_design,
+                boundary_penalties,
+                &knots,
+                spec.degree,
+                &spec.identifiability,
+                boundary_transform.as_ref(),
+            )?;
+        let identifiability_transform =
+            compose_optional_bspline_transform(boundary_transform, identifiability_local)?;
+        let transformed_candidates = penalties
+            .into_iter()
+            .zip(penalties_raw.into_iter())
+            .map(
+                |(matrix, candidate)| -> Result<PenaltyCandidate, BasisError> {
+                    Ok(PenaltyCandidate {
+                        nullspace_dim_hint: candidate.nullspace_dim_hint,
+                        matrix,
+                        source: candidate.source,
+                        normalization_scale: candidate.normalization_scale,
+                        kronecker_factors: None,
+                        op: None,
+                    })
+                },
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        (
+            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(design)),
+            transformed_candidates,
+            identifiability_transform,
+        )
+    };
     let transformed_candidates =
         rebuild_double_penalty_nullspace_in_constrained_chart(transformed_candidates)?;
     let (penalties, nullspace_dims, penaltyinfo, null_eigenvectors, ops) =
@@ -1992,7 +1993,7 @@ pub(crate) fn validated_kronecker_factors(
     };
     let mut kron = first.clone();
     for factor in rest {
-        kron = crate::construction::kronecker_product(&kron, factor);
+        kron = crate::kronecker::kronecker_product(&kron, factor);
     }
     if kron.dim() != matrix.dim() {
         return None;

@@ -12,11 +12,11 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1};
 use rayon::prelude::*;
 use smallvec::SmallVec;
 
-use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
 use crate::basis::{
     closed_form_anisotropic_pair_block, closed_form_anisotropic_pair_value_with_powers,
     closed_form_penalty, pure_duchon_diagonal_epsilon,
 };
+use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
 
 /// Matrix-free closed-form anisotropic Duchon penalty operator.
 ///
@@ -263,8 +263,8 @@ impl ClosedFormPenaltyOperator {
         for i in 0..n {
             dense[[i, i]] += lambda;
         }
-        let (evals, _) =
-            gam_linalg::faer_ndarray::FaerEigh::eigh(&dense, faer::Side::Lower).map_err(|e| {
+        let (evals, _) = gam_linalg::faer_ndarray::FaerEigh::eigh(&dense, faer::Side::Lower)
+            .map_err(|e| {
                 format!("ClosedFormPenaltyOperator logdet eigendecomposition failed: {e}")
             })?;
         let mut logdet = 0.0;
@@ -610,8 +610,8 @@ mod tests {
             }
         }
         let est = op.log_det_plus_lambda_i(lambda).expect("exact logdet");
-        use gam_linalg::faer_ndarray::FaerEigh;
         use faer::Side;
+        use gam_linalg::faer_ndarray::FaerEigh;
         let (evals, _) = FaerEigh::eigh(&reg, Side::Lower).expect("eigh");
         let mut reference = 0.0_f64;
         for (idx, &lam) in evals.iter().enumerate() {

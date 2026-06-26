@@ -1404,9 +1404,9 @@ pub fn build_measure_jet_basis(
     };
     let raw_design = measure_jet_design_matrix(data, centers.view(), length_scale)?;
     let constrained_design = coefficient_gauge.restrict_design(&raw_design);
-    let design = gam_linalg::matrix::DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
-        constrained_design,
-    ));
+    let design = gam_linalg::matrix::DesignMatrix::Dense(
+        gam_linalg::matrix::DenseDesignMatrix::from(constrained_design),
+    );
     let support_means = measure_jet_support_means(centers.view(), masses.view(), &eps_band)?;
     // Spectral/geometric split. With the auto order sentinel (order_s == 0.0)
     // the term emits one candidate PER scale: the multi-penalty REML engine

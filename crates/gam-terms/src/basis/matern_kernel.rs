@@ -128,16 +128,15 @@ pub fn build_thin_plate_basiswithworkspace(
             shared_data,
             Arc::new(centers.clone()),
             kernel_fn,
-            Some(Arc::new(
-                gam_problem::Gauge::from_block_transforms(&[
-                    reduced_kernel_transform.clone()
-                ]),
-            )),
+            Some(Arc::new(gam_problem::Gauge::from_block_transforms(&[
+                reduced_kernel_transform.clone(),
+            ]))),
             Some(Arc::new(poly_block)),
         )
         .map_err(BasisError::InvalidInput)?;
-        let base_design =
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Arc::new(base_op)));
+        let base_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+            Arc::new(base_op),
+        ));
         let identifiability_transform = thin_plate_identifiability_transform_from_design_matrix(
             &base_design,
             reduced_kernel_transform.ncols(),
@@ -203,7 +202,9 @@ pub fn build_thin_plate_basiswithworkspace(
                 gauge.restrict_design(&tps.basis),
             ))
         } else {
-            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(tps.basis.clone()))
+            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
+                tps.basis.clone(),
+            ))
         };
         let (penalty_bending_norm, c_bending) = normalize_penalty(&tps.penalty_bending);
         let mut candidates = vec![PenaltyCandidate {
@@ -390,8 +391,8 @@ pub(crate) fn thin_plate_penalties_at_length_scale(
             op: None,
         });
     }
-    if let Some(gauge) = identifiability_transform
-        .map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]))
+    if let Some(gauge) =
+        identifiability_transform.map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]))
     {
         candidates = candidates
             .into_iter()
@@ -1359,8 +1360,7 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
     // Project through the ψ-independent coefficient section. Gauge owns the
     // coordinate restriction; these raw operator derivatives are kernel math
     // evaluated before the same section is applied.
-    let coefficient_gauge =
-        z_opt.map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
+    let coefficient_gauge = z_opt.map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()]));
     let project = |mat: Array2<f64>| -> Array2<f64> {
         if let Some(gauge) = coefficient_gauge.as_ref() {
             gauge.restrict_design(&mat)
@@ -1539,8 +1539,7 @@ pub(crate) fn build_matern_operator_penalty_aniso_derivatives(
         aniso_log_scales: eta.to_vec(),
         length_scale,
         nu,
-        coefficient_gauge: z_opt
-            .map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()])),
+        coefficient_gauge: z_opt.map(|z| gam_problem::Gauge::from_block_transforms(&[z.clone()])),
         penaltyinfo,
         d0,
         d1,
@@ -2074,7 +2073,7 @@ pub fn closed_form_matern_pair_block(
     // Coefficients C(q, j) · (−κ²)^{q−j} for j = 0..q.
     let mut binom_coeffs: Vec<f64> = Vec::with_capacity(q + 1);
     for j in 0..=q {
-        let cqj = crate::probability::binomial_coefficient_f64(q, j);
+        let cqj = gam_math::special::binomial_coefficient_f64(q, j);
         let sign_pow = if (q - j).is_multiple_of(2) { 1.0 } else { -1.0 };
         let coeff = cqj * sign_pow * kappa_sq.powi((q - j) as i32);
         binom_coeffs.push(coeff);
@@ -3047,8 +3046,7 @@ pub(crate) fn build_thin_plate_penalty_matrices(
         thin_plate_kernel_from_dist2(dist2 / length_scale_sq, d)
     })?;
     let omega_constrained = {
-        let kernel_gauge =
-            gam_problem::Gauge::from_block_transforms(&[kernel_transform.clone()]);
+        let kernel_gauge = gam_problem::Gauge::from_block_transforms(&[kernel_transform.clone()]);
         // `kernel_transform` spans the side-constraint nullspace, so the
         // congruence transform preserves the thin-plate PSD construction.
         // Symmetrize to remove roundoff asymmetry without paying for a full EVD
