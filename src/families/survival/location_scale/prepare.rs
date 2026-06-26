@@ -483,28 +483,29 @@ pub(crate) fn prepare_survival_location_scale_model(
     let log_sigma_full_ncols = log_sigma_prep.design_exit.ncols();
     // The scale channel enters the survival location-scale likelihood as
     // `z = (h(t) - eta_t(x)) / exp(eta_sigma)`: `eta_sigma` is MULTIPLICATIVE,
-    // not an additive predictor. The constant (intercept) direction of the
-    // scale block is therefore the free overall sigma parameter — it is NOT
-    // aliased with the additive location/time constant that `time_transform`
-    // and `threshold` share, so no higher-priority block owns the scale-block
-    // gauge direction. The only genuine alias the scale block can carry is
-    // between its NON-intercept covariate columns and the location predictor,
-    // and that aliasing is already removed by the scale-deviation
-    // reparameterisation below (which residualises columns from
-    // `non_intercept_start` onward against the primary location design).
-    // Hence the scale block drops NO leading columns: dropping its lone
-    // intercept (the constant-sigma case, `non_intercept_start == full_ncols`)
-    // would canonicalise a genuinely identifiable free parameter to width 0
-    // and refuse the coupled three-block startup certification (#736), and
-    // over-reducing it desynchronises the raw/active block widths at the
-    // covariance-lift boundary (#735).
+    // not an additive predictor. The location predictor (`eta_t`) and the
+    // log-scale predictor (`eta_sigma`) are SEPARATELY identifiable even when
+    // they are spanned by the same covariate basis — they enter the likelihood
+    // through different sufficient statistics (the standardized residual `z`
+    // versus the `-log sigma` / `z²` curvature), exactly as in the Gaussian
+    // location-scale model. Residualizing the scale design against the location
+    // design — the former scale-deviation reparameterization — therefore
+    // imposes a spurious constraint: when `s(x)` drives BOTH channels, every
+    // scale column lies in the location design's span, the residual collapses to
+    // ~0, and the genuine heteroscedastic signal is erased. The flat identity
+    // audit then drops those zeroed columns from the reduced spec while the
+    // family keeps the full-width `x_log_sigma`, tripping
+    // `exact_newton_joint_gradient_evaluation`'s "joint gradient length mismatch
+    // for block 2" shape check. Identifiability across the location/scale blocks
+    // is instead supplied by `output_channel_assignment` (each block drives its
+    // own audit channel), so the scale design is kept RAW — an identity
+    // reparameterization — matching `identified_gaussian_log_sigma_design`.
     let log_sigma_fixed_cols = 0usize;
-    let scale_transform = build_scale_deviation_transform_design(
-        &survival_primary_design,
-        &log_sigma_prep.design_exit,
-        &spec.weights,
+    let scale_transform = ScaleDeviationTransform::identity(
+        survival_primary_design.ncols(),
+        log_sigma_prep.design_exit.ncols(),
         non_intercept_start,
-    )?;
+    );
     let log_sigma_full_design = build_scale_deviation_operator(
         survival_primary_design.clone(),
         log_sigma_prep.design_exit.clone(),

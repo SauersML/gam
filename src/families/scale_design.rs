@@ -78,6 +78,33 @@ pub struct ScaleDeviationTransform {
     pub projection_ridge_alpha: f64,
 }
 
+impl ScaleDeviationTransform {
+    /// Identity (no-op) reparameterization: zero projection, zero centering,
+    /// unit rescale. [`build_scale_deviation_operator`] with this transform
+    /// returns the raw scale design verbatim, and the saved-payload round-trip
+    /// replays the same identity at prediction time.
+    ///
+    /// A location and a scale predictor remain SEPARATELY identifiable even when
+    /// they share a covariate basis: they enter the likelihood through different
+    /// sufficient statistics (the standardized residual versus its square / the
+    /// log-scale), so residualizing the scale design against the location design
+    /// — replacing `X_σ` with `(I − P_{X_μ}) X_σ` — imposes a spurious
+    /// constraint and erases real heteroscedastic signal whenever the two blocks
+    /// overlap. The Gaussian location-scale path already keeps its log-σ design
+    /// un-residualized (`identified_gaussian_log_sigma_design`); this constructor
+    /// lets the survival location-scale path do the same while preserving the
+    /// transform plumbing (payload serialization, prediction-time replay).
+    pub fn identity(p_primary: usize, p_noise: usize, non_intercept_start: usize) -> Self {
+        ScaleDeviationTransform {
+            projection_coef: Array2::<f64>::zeros((p_primary, p_noise)),
+            weighted_column_mean: Array1::<f64>::zeros(p_noise),
+            rescale: Array1::<f64>::ones(p_noise),
+            non_intercept_start,
+            projection_ridge_alpha: 0.0,
+        }
+    }
+}
+
 /// Build a [`ScaleDeviationTransform`] from saved projection metadata.
 ///
 /// Returns `Ok(None)` only when the payload is completely absent; partial
