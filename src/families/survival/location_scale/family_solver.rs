@@ -1512,6 +1512,29 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let log_rescale = self.hessian_deriv_log_rescale(block_states);
         let q = self.collect_joint_quantities_rescaled(block_states, log_rescale)?;
         let dynamic = self.build_dynamic_geometry(block_states)?;
+
+        // Base (non-wiggle) path: sweep every canonical axis through the batched
+        // all-axes dispatcher. The dispatcher routes to
+        // `SurvivalLsRowKernel::directional_derivative_all_axes_dense_override`,
+        // which builds the special-function-heavy per-row NLL derivative stack
+        // (`row_nll_inputs` → `exact_row_kernel_rescaled`) ONCE and reuses it for
+        // every one of the `p_total` axes. The previous per-axis loop ran
+        // `p_total` independent single-direction sweeps, each rebuilding that
+        // per-row stack from scratch — an `O(p_total · n · special-fn)` cost the
+        // inner-Newton Jeffreys term and the outer-REML Jeffreys drift pay on
+        // every joint evaluation. The dispatcher's override is bit-for-bit equal
+        // to this loop (same kernel, same `RowSet::All` reduction); the wiggle
+        // branch keeps the bespoke per-axis dense path the dispatcher does not
+        // cover.
+        if self.row_kernel_directional_supported() {
+            let kernel = self.survival_ls_row_kernel_rescaled(&q, &dynamic, log_rescale);
+            let rows = crate::families::row_kernel::RowSet::All;
+            let axes = crate::families::row_kernel::row_kernel_directional_derivative_all_axes(
+                &kernel, &rows,
+            )?;
+            return Ok(Some(axes));
+        }
+
         let mut axes = Vec::with_capacity(p_total);
         for a in 0..p_total {
             let mut e_a = Array1::<f64>::zeros(p_total);
