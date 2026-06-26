@@ -28,7 +28,6 @@ use std::time::Instant;
 
 // Crate-level imports
 use gam_terms::construction::{CanonicalPenalty, ReparamInvariant};
-use crate::inference::diagnostics::should_emit_h_min_eig_diag;
 use gam_linalg::utils::{
     KahanSum, add_relative_diag_ridge, matrix_inversewith_regularization, row_mismatch_message,
 };

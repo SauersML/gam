@@ -20,6 +20,7 @@ pub mod block_role;
 pub mod block_spec;
 pub mod coefficient_prior_mean;
 pub mod custom_family_error;
+pub mod diagnostics;
 pub mod estimation_error;
 pub mod family_options;
 pub mod fisher_rao;

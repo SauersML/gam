@@ -297,7 +297,7 @@ impl<'a> RemlState<'a> {
                 if let Ok((eigs, _)) = pht_dense.eigh(Side::Lower)
                     && let Some(min_eig) = eigs.iter().cloned().reduce(f64::min)
                 {
-                    if should_emit_h_min_eig_diag(min_eig) {
+                    if gam_problem::diagnostics::should_emit_h_min_eig_diag(min_eig) {
                         log::debug!(
                             "[Diag] H min_eig={:.3e} (ridge={:.3e})",
                             min_eig,

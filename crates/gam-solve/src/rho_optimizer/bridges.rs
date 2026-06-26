@@ -2786,7 +2786,7 @@ pub(crate) fn outer_result_with_gradient(
     result
 }
 
-use crate::inference::diagnostics::format_top_abs as format_top_abs_components;
+use gam_problem::diagnostics::format_top_abs as format_top_abs_components;
 
 pub(crate) fn bfgs_line_search_failure_message(
     context: &str,
