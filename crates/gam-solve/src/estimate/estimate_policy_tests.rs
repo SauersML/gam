@@ -1031,7 +1031,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     let score_m = score_at(theta[1] - 1e-4 * (1.0 + theta[1].abs()));
     let fd_du_raw = (&score_p - &score_m).mapv(|v| v / (2.0 * 1e-4 * (1.0 + theta[1].abs())));
     let du_raw = du_by_eps.mapv(|v| v * d_eps_d_raw);
-    crate::test_support::assert_matrix_derivativefd(
+    gam_test_support::assert_matrix_derivativefd(
         &fd_du_raw.insert_axis(Axis(1)),
         &du_raw.insert_axis(Axis(1)),
         2e-3,
@@ -1124,7 +1124,7 @@ fn sas_beta_raw_epsilon_sensitivity_matchesfd_at_seed19() {
     // ~0.22-magnitude component, so a relative bound is the principled
     // comparison here rather than an absolute one tuned for the small
     // entries (gam#855).
-    crate::test_support::assert_matrix_derivativefd_rel(
+    gam_test_support::assert_matrix_derivativefd_rel(
         &fd_beta.insert_axis(Axis(1)),
         &dbeta_exact.insert_axis(Axis(1)),
         2e-2,
@@ -1294,7 +1294,7 @@ fn sas_true_score_beta_jacobian_matchesfd_at_seed19() {
         fd_j.column_mut(j).assign(&fd_col);
     }
 
-    crate::test_support::assert_matrix_derivativefd(
+    gam_test_support::assert_matrix_derivativefd(
         &fd_j,
         &analytic_j,
         2e-3,

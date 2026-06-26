@@ -39,3 +39,4 @@ cudarc = { version = "0.19.6", default-features = false, features = ["std", "dri
 
 [dev-dependencies]
 approx = "0.5.1"
+gam-test-support = { path = "../gam-test-support", version = "=0.3.124" }

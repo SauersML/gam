@@ -6,7 +6,11 @@
 // public module path it inherited.
 pub use crate::data;
 
-pub mod alo;
+// `alo` descended into gam-solve (#1521): genuine REML-evidence numerics whose
+// deps are all ≤ gam-solve. Re-exported here so `gam::inference::alo` (named by
+// gam-predict/gam-inference conformal, model_comparison, the CLI) resolves
+// unchanged.
+pub use gam_solve::inference::alo;
 pub use gam_sae::inference::atom_lens;
 pub mod certificate_impls;
 pub mod certificates;

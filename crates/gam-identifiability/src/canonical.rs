@@ -2449,7 +2449,7 @@ mod tests {
         }
     }
 
-    use crate::test_support::spec_from_dense_with_priority;
+    use gam_test_support::spec_from_dense_with_priority;
 
     /// #933: a `jacobian_callback`-only block (no `stacked_design`) whose audit
     /// attributes a dropped column is now SAFELY REDUCED rather than kept at raw

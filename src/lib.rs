@@ -141,7 +141,14 @@ pub mod report;
 pub use gam_solve::rho_uncertainty;
 pub use gam_solve as solver;
 pub use gam_terms as terms;
-pub mod test_support;
+/// Shared test-support helpers (FD harness, fixtures, reference-tool + CLI
+/// harnesses) carved into the `gam-test-support` crate under #1521 so the
+/// workspace's other crates can reach them cross-crate. Re-exported here as
+/// `gam::test_support` (and the two `#[macro_export]` macros below) so the
+/// integration tests under `tests/` keep their `gam::test_support::*` /
+/// `gam::gam_binary!` / `gam::assert_central_difference_array!` paths unchanged.
+pub use gam_test_support as test_support;
+pub use gam_test_support::{assert_central_difference_array, gam_binary};
 pub mod types;
 pub mod util;
 

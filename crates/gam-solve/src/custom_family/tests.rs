@@ -183,7 +183,7 @@ pub(crate) fn batched_outer_gradient_override_rejected_when_jeffreys_curvature_i
 
 use gam_models::gamlss::{BinomialLocationScaleFamily, BinomialLocationScaleWiggleFamily};
 use gam_linalg::matrix::DesignMatrix;
-use crate::test_support::binomial_location_scale_base_fixture;
+use gam_test_support::binomial_location_scale_base_fixture;
 use approx::assert_relative_eq;
 use faer::sparse::{SparseColMat, Triplet};
 use ndarray::{Array1, Array2, array};
@@ -8365,7 +8365,7 @@ pub(crate) fn joint_trust_region_rosenbrock_like_quadratic_is_armijo_safe() {
 // Inline RED REPRO moved to tests/joint_newton_isotropic_tr_starvation.rs
 // so it survives in-progress refactors of the surrounding test
 // support module (this `mod tests { }` currently does not compile due
-// to `crate::test_support::*` / `test_outerobjective_andgradient` WIP).
+// to `gam_test_support::*` / `test_outerobjective_andgradient` WIP).
 
 /// Synthetic 3-block fixture where the joint penalized Hessian is
 /// rank-deficient inside block 2 (block-diagonal H with two

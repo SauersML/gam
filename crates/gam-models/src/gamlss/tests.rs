@@ -41,7 +41,7 @@ use crate::wiggle::{
     initializewiggle_knots_from_seed, monotone_wiggle_internal_degree, split_wiggle_penalty_orders,
 };
 use gam_terms::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
-use crate::test_support::{binomial_location_scale_base_fixture, no_densify_design};
+use gam_test_support::{binomial_location_scale_base_fixture, no_densify_design};
 use ndarray::{Array2, Axis, array};
 use num_dual::{
     DualNum, second_derivative, second_partial_derivative, third_partial_derivative_vec,
@@ -5256,7 +5256,7 @@ pub(crate) fn wiggle_family_exact_newton_directional_derivative_matches_finite_d
         let h_plus = extract(family.evaluate(&plus_states).expect("plus eval"), block_idx);
         let h_base = extract(base_eval.clone(), block_idx);
         let fd = (h_plus - h_base) / eps;
-        crate::test_support::assert_matrix_derivativefd(
+        gam_test_support::assert_matrix_derivativefd(
             &fd,
             &analytic,
             5e-4,
@@ -6549,7 +6549,7 @@ pub(crate) fn wiggle_family_block_hessians_match_jointhessian_principal_blocks()
             BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton block"),
         };
         let joint_block = joint.slice(s![start..end, start..end]).to_owned();
-        crate::test_support::assert_matrix_derivativefd(
+        gam_test_support::assert_matrix_derivativefd(
             &joint_block,
             &blockhessian,
             1e-10,
@@ -6722,7 +6722,7 @@ pub(crate) fn wiggle_familygradients_match_finite_differencewith_nontrivial_desi
             let f_minus = objective(&beta_t_minus, &beta_ls_minus, &betaw_minus);
             fd[j] = (f_plus - f_minus) / (2.0 * eps);
         }
-        crate::test_support::assert_matrix_derivativefd(
+        gam_test_support::assert_matrix_derivativefd(
             &fd.insert_axis(Axis(1)),
             &(-&analytic).insert_axis(Axis(1)),
             2e-4,
@@ -6816,7 +6816,7 @@ pub(crate) fn wiggle_family_joint_hessian_matches_fd_gradients_with_nontrivial_d
         }
     }
 
-    crate::test_support::assert_matrix_derivativefd(&fd, &h_joint, 4e-4, "wiggle joint hessian");
+    gam_test_support::assert_matrix_derivativefd(&fd, &h_joint, 4e-4, "wiggle joint hessian");
 }
 
 #[test]
@@ -6927,7 +6927,7 @@ pub(crate) fn wiggle_family_joint_exacthessian_directional_derivative_matches_fi
         .expect("plus joint hessian")
         .expect("expected plus joint hessian");
     let fd = (h_plus - base_h) / eps;
-    crate::test_support::assert_matrix_derivativefd(&fd, &analytic, 2e-3, "joint dH");
+    gam_test_support::assert_matrix_derivativefd(&fd, &analytic, 2e-3, "joint dH");
 }
 
 #[test]
@@ -7027,7 +7027,7 @@ pub(crate) fn wiggle_family_joint_exacthessiansecond_directional_derivative_matc
         .expect("expected joint exact dH minus");
     let fd = (d_h_plus - d_h_minus) / (2.0 * eps);
 
-    crate::test_support::assert_matrix_derivativefd(&fd, &analytic, 4e-3, "joint d2H");
+    gam_test_support::assert_matrix_derivativefd(&fd, &analytic, 4e-3, "joint d2H");
 }
 
 #[test]
@@ -7171,9 +7171,9 @@ pub(crate) fn wiggle_family_joint_hessian_cross_blocks_match_finite_difference_o
         .slice(ndarray::s![pt..pt + pls, pt + pls..pt + pls + pw])
         .to_owned();
 
-    crate::test_support::assert_matrix_derivativefd(&fd_t_ls, &h_t_ls, 2e-4, "H_t_ls");
-    crate::test_support::assert_matrix_derivativefd(&fd_tw, &h_tw, 4e-4, "H_tw");
-    crate::test_support::assert_matrix_derivativefd(&fd_lsw, &h_lsw, 6e-4, "H_lsw");
+    gam_test_support::assert_matrix_derivativefd(&fd_t_ls, &h_t_ls, 2e-4, "H_t_ls");
+    gam_test_support::assert_matrix_derivativefd(&fd_tw, &h_tw, 4e-4, "H_tw");
+    gam_test_support::assert_matrix_derivativefd(&fd_lsw, &h_lsw, 6e-4, "H_lsw");
 }
 
 #[test]
@@ -7238,7 +7238,7 @@ pub(crate) fn nonwiggle_family_evaluate_returns_exact_newton_blockswhen_designs_
             BlockWorkingSet::Diagonal { .. } => panic!("expected exact newton block"),
         };
         let joint_block = joint.slice(s![start..end, start..end]).to_owned();
-        crate::test_support::assert_matrix_derivativefd(
+        gam_test_support::assert_matrix_derivativefd(
             &joint_block,
             &blockhessian,
             1e-10,
@@ -7317,7 +7317,7 @@ pub(crate) fn nonwiggle_family_joint_exacthessian_directional_derivative_matches
         .expect("plus joint hessian")
         .expect("expected plus joint hessian");
     let fd = (h_plus - base_h) / eps;
-    crate::test_support::assert_matrix_derivativefd(&fd, &analytic, 2e-3, "nonwiggle joint dH");
+    gam_test_support::assert_matrix_derivativefd(&fd, &analytic, 2e-3, "nonwiggle joint dH");
 }
 
 #[test]
@@ -7398,7 +7398,7 @@ pub(crate) fn nonwiggle_family_joint_exacthessiansecond_directional_derivative_m
         .expect("joint dH minus")
         .expect("expected joint exact dH minus");
     let fd = (d_h_plus - d_h_minus) / (2.0 * eps);
-    crate::test_support::assert_matrix_derivativefd(&fd, &analytic, 4e-3, "nonwiggle joint d2H");
+    gam_test_support::assert_matrix_derivativefd(&fd, &analytic, 4e-3, "nonwiggle joint d2H");
 }
 
 #[test]

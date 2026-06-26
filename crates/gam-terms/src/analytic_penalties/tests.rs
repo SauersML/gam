@@ -222,7 +222,7 @@ fn ibp_assignment_grad_target_matches_value_finite_difference() {
     let rho = Array1::<f64>::zeros(0);
     let g = pen.grad_target(t.view(), rho.view());
     let eps = 1.0e-6;
-    let fd = crate::test_support::fd_checker::numerical_gradient_central_diff(
+    let fd = gam_test_support::fd_checker::numerical_gradient_central_diff(
         |tv| pen.value(tv.view(), rho.view()),
         &t,
         eps,
@@ -1001,7 +1001,7 @@ fn block_orthogonality_grad_matches_finite_difference() {
     let rho = array![0.0_f64];
     let g = pen.grad_target(t.view(), rho.view());
     let eps = 1e-6;
-    let fd = crate::test_support::fd_checker::numerical_gradient_central_diff(
+    let fd = gam_test_support::fd_checker::numerical_gradient_central_diff(
         |tv| pen.value(tv.view(), rho.view()),
         &t,
         eps,
@@ -1145,7 +1145,7 @@ fn mechanism_sparsity_grad_matches_finite_difference() {
     let rho = array![0.0_f64];
     let g = pen.grad_target(t.view(), rho.view());
     let eps = 1e-6;
-    let fd = crate::test_support::fd_checker::numerical_gradient_central_diff(
+    let fd = gam_test_support::fd_checker::numerical_gradient_central_diff(
         |tv| pen.value(tv.view(), rho.view()),
         &t,
         eps,
@@ -1252,7 +1252,7 @@ fn nested_prefix_grad_matches_finite_difference() {
     let rho = array![0.0_f64, 0.0, 0.0];
     let g = pen.grad_target(t.view(), rho.view());
     let eps = 1e-6;
-    let fd = crate::test_support::fd_checker::numerical_gradient_central_diff(
+    let fd = gam_test_support::fd_checker::numerical_gradient_central_diff(
         |tv| pen.value(tv.view(), rho.view()),
         &t,
         eps,

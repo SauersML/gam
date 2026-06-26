@@ -1,10 +1,10 @@
 use crate::estimate::EstimationError;
 use crate::estimate::{FitGeometry, UnifiedFitResult};
-use crate::faer_ndarray::{FaerArrayView, FaerCholesky};
-use crate::linalg::utils::StableSolver;
-use crate::matrix::{PsdWeightsView, SignedWeightsView};
 use crate::pirls;
-use crate::types::LinkFunction;
+use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky};
+use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
+use gam_linalg::utils::StableSolver;
+use gam_problem::LinkFunction;
 use faer::Mat as FaerMat;
 use faer::linalg::matmul::matmul;
 use faer::prelude::ReborrowMut;
@@ -437,8 +437,8 @@ fn compute_alo_diagnostics_from_pirls_impl(
 /// Newton closure would only add an O(n) nonlinear solve to diagnostics and
 /// quality sweeps without changing the answer, so it is excluded here and falls
 /// back to the (exact, for this family) one-step formula.
-fn alo_link_needs_exact_curvature_refinement(likelihood: &crate::types::GlmLikelihoodSpec) -> bool {
-    use crate::types::ResponseFamily;
+fn alo_link_needs_exact_curvature_refinement(likelihood: &gam_problem::GlmLikelihoodSpec) -> bool {
+    use gam_problem::ResponseFamily;
     matches!(
         (&likelihood.spec.response, likelihood.link_function()),
         (ResponseFamily::Binomial, LinkFunction::Logit)
@@ -1166,7 +1166,7 @@ pub fn compute_case_deletion_from_pirls(
     base: &pirls::PirlsResult,
     y: ArrayView1<f64>,
     link: LinkFunction,
-) -> Result<Option<crate::solver::sensitivity::CaseDeletionInfluence>, EstimationError> {
+) -> Result<Option<crate::sensitivity::CaseDeletionInfluence>, EstimationError> {
     let x_dense_arc = base
         .x_transformed
         .try_to_dense_arc("case-deletion diagnostics require dense transformed design")
@@ -1224,7 +1224,7 @@ pub fn compute_case_deletion_from_pirls(
     let working_weights = base.finalweights.clone();
     let working_residual = &base.solveworking_response - &base.final_eta;
 
-    let sensitivity = crate::solver::sensitivity::FitSensitivity::from_faer_cholesky(&factor, p);
+    let sensitivity = crate::sensitivity::FitSensitivity::from_faer_cholesky(&factor, p);
     Ok(sensitivity.case_deletion(
         x_dense,
         working_weights.view(),
@@ -1942,8 +1942,8 @@ mod tests {
         alo_eta_updatewith_offset, bayesvar_eta, compute_alo_from_input_inner,
         percentile_from_sorted, percentile_index, sandwichvar_eta,
     };
-    use crate::matrix::{PsdWeightsView, SignedWeightsView};
-    use crate::types::LinkFunction;
+    use gam_linalg::matrix::{PsdWeightsView, SignedWeightsView};
+    use gam_problem::LinkFunction;
 
     #[test]
     fn alo_offset_update_matches_centered_algebra() {

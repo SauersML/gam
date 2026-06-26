@@ -1,6 +1,6 @@
 use super::*;
 use crate::custom_family::custom_family_outer_derivatives;
-use crate::test_support::assert_matrix_derivativefd;
+use gam_test_support::assert_matrix_derivativefd;
 use ndarray::array;
 
 pub(crate) fn dense_first_order_psi_hessian(terms: &ExactNewtonJointPsiTerms) -> Array2<f64> {

@@ -4447,7 +4447,7 @@ fn exact_newton_block_directional_derivatives_matchfd_for_non_probit_links() {
                 extracthessian(family.evaluate(&plus_states).expect("plus eval"), block_idx);
             let h_base = extracthessian(base_eval.clone(), block_idx);
             let fd = (h_plus - h_base) / eps;
-            crate::test_support::assert_matrix_derivativefd(
+            gam_test_support::assert_matrix_derivativefd(
                 &fd,
                 &analytic,
                 5e-4,
@@ -4529,7 +4529,7 @@ fn joint_exact_newton_hessian_matches_negative_gradient_jacobian_for_non_probit_
             fd.column_mut(j).assign(&col);
         }
 
-        crate::test_support::assert_matrix_derivativefd(
+        gam_test_support::assert_matrix_derivativefd(
             &fd,
             &analytic,
             2e-4,

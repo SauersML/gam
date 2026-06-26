@@ -11,6 +11,10 @@ pub mod gaussian_reml;
 pub mod glm_sufficient_lane;
 pub mod gpu_kernels;
 pub mod gpu;
+// Descended inference-tier numerics (#1521): ALO REML-evidence diagnostics whose
+// deps are all ≤ gam-solve. Re-exported at the monolith root as
+// `gam::inference::*` so cross-crate callers resolve unchanged.
+pub mod inference;
 pub mod inner_status;
 pub mod latent_cache;
 pub mod latent_inner;
