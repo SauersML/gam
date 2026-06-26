@@ -40,6 +40,41 @@ pub(crate) const PREWARM_COST_BUDGET_COEFF_PRODUCT: usize =
 static OUTER_WALL_CLOCK_DEADLINE: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 
+/// RAII guard that lifts the outer-aware inner-PIRLS iteration cap
+/// (`RemlState::outer_inner_cap`, shared into the outer optimizer via
+/// `InnerProgressFeedback::cap`) to 0 ("no cap") for the duration of the
+/// finalize evaluation at the converged outer point, then restores whatever
+/// value the search-time schedule had last published on drop. This mirrors the
+/// post-run convergence guard `run_outer_inner_cap_guard`
+/// (`src/solver/estimate/optimizer.rs:135`), which does the same `swap(0, …)` /
+/// restore, but happens INSIDE `run_outer_with_plan` so the finalize inner
+/// solve runs at full inner budget and a search-time throttle (e.g. 3 iters)
+/// can never escalate a capped `MaxIterationsReached` into a fatal
+/// `PirlsDidNotConverge` (#1572).
+struct FinalizeInnerCapGuard<'a> {
+    cap: &'a std::sync::atomic::AtomicUsize,
+    prev_cap: usize,
+}
+
+impl<'a> FinalizeInnerCapGuard<'a> {
+    fn lift(cap: &'a std::sync::atomic::AtomicUsize) -> Self {
+        let prev_cap = cap.swap(0, std::sync::atomic::Ordering::Relaxed);
+        if prev_cap != 0 {
+            log::debug!(
+                "[OUTER] finalize: lifting throttled inner-PIRLS cap (prev_cap={prev_cap}) \
+                 for full-budget evaluation at θ̂"
+            );
+        }
+        Self { cap, prev_cap }
+    }
+}
+
+impl Drop for FinalizeInnerCapGuard<'_> {
+    fn drop(&mut self) {
+        self.cap.store(self.prev_cap, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Arm the global outer wall-clock deadline for the current fit. `pub` so FFI
 /// fit entries (the SAE manifold fit is orchestrated from the `gam-pyffi` crate)
 /// can bound their outer search the same way the in-crate survival entry does
@@ -1916,6 +1951,24 @@ pub(crate) fn run_outer_with_plan(
     }
 
     if let Some(result) = best {
+        // The finalize evaluation re-installs the selected outer result by
+        // re-running the inner P-IRLS at θ̂. During the outer search the ARC /
+        // BFGS bridge schedule throttles `RemlState::outer_inner_cap` down to a
+        // small adaptive cap (e.g. 3 iters) so early, far-from-converged outer
+        // steps spend a coarse inner solve. That cap MUST NOT leak into the
+        // finalize solve at the optimum: the inner Newton there can need many
+        // iterations (SAS link drives η to extreme magnitudes mid-search,
+        // #1572), and a capped `MaxIterationsReached` is escalated to a fatal
+        // `PirlsDidNotConverge` ("did not converge within 3 iterations"),
+        // aborting the whole fit. Lift the cap to 0 (no cap) for the finalize,
+        // mirroring the post-run `run_outer_inner_cap_guard`
+        // (optimizer.rs:135) and the accept-fit's "full inner budget" intent
+        // (gradient_hessian.rs:6469), then restore the prior cap so any later
+        // schedule-driven evaluation sees the value it expects.
+        let _finalize_cap_guard = config
+            .outer_inner_cap
+            .as_ref()
+            .map(|feedback| FinalizeInnerCapGuard::lift(feedback.cap.as_ref()));
         obj.finalize_outer_result(&result.rho, the_plan)?;
         return Ok(result);
     }
