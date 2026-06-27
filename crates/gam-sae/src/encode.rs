@@ -99,6 +99,16 @@ pub(crate) const ENCODE_BATCH_PARALLEL_ROW_MIN: usize = 256;
 /// ever adds exact-fallback work (correct, slower); it never certifies a mis-route.
 pub(crate) const CANDIDATE_ROUTING_MIN_ALIGNMENT: f64 = 0.5;
 
+/// Bounded plain-Newton warm-up steps the certified encoder takes from an
+/// uncertified chart-center start to navigate INTO the Kantorovich basin before
+/// flagging the row for the exact fallback (#1154/#1026). The Kantorovich
+/// quantity `h = β·η·L` scales with amplitude through `L`, so at unit amplitude a
+/// chart-center start can be positive-definite yet have `h > ½`; a few Newton
+/// steps reach an iterate where `h ≤ ½` and the encode is certified-exact from
+/// there. Bounded so a genuinely non-convergent row still falls back quickly; each
+/// step is one grad/Hessian eval plus a `d×d` solve (`d` = latent dim).
+pub(crate) const SAE_ENCODE_BASIN_WARMUP_STEPS: usize = 8;
+
 /// A chart region on an atom's latent coordinate: a center `t_c` plus a
 /// certified in-chart radius. Over the ball `‖t − t_c‖ ≤ radius` the jet sup
 /// bounds returned by [`BasisHessianLipschitz`] hold, so the Kantorovich
@@ -1075,6 +1085,62 @@ fn refine_certified_start(
     }))
 }
 
+/// Certify an encode probe from `t_start`, navigating into the Kantorovich basin
+/// first if needed (#1154/#1026). The Kantorovich quantity `h = β·η·L` scales with
+/// amplitude through `L`, so at unit amplitude a positive-definite chart-center /
+/// distilled start can sit OUTSIDE the certified ball (`h > ½`). Rather than
+/// flagging it uncertified immediately — which made the encoder certify ZERO
+/// held-out rows at amplitude 1.0 and fall back to the exact solve for everything —
+/// take up to [`SAE_ENCODE_BASIN_WARMUP_STEPS`] plain Newton steps toward the root,
+/// re-certifying at each iterate. The certificate at the landing point is a full
+/// Kantorovich guarantee from there (`h ≤ ½` ⇒ Newton converges to the in-ball
+/// root), so this only ever WIDENS the certified set; it never certifies a
+/// non-convergent start. An indefinite Hessian (`β`/`η` non-finite — at/past a
+/// basin boundary) is not steppable, so we stop and return `None` (flag). On
+/// success the start is then refined `newton_steps` further by
+/// [`refine_certified_start`].
+#[allow(clippy::too_many_arguments)]
+fn certify_with_basin_warmup(
+    atom: &SaeManifoldAtom,
+    evaluator: &dyn SaeBasisEvaluator,
+    t_start: Array1<f64>,
+    x: ArrayView1<'_, f64>,
+    amplitude: f64,
+    lipschitz: f64,
+    ridge: f64,
+    newton_steps: usize,
+) -> Result<Option<CertifiedEncodeProbe>, String> {
+    let mut t = t_start;
+    let (mut cert, mut delta) =
+        row_certificate(atom, evaluator, t.view(), x, amplitude, lipschitz, ridge)?;
+    let mut warmups = 0usize;
+    while !cert.certified() {
+        if warmups >= SAE_ENCODE_BASIN_WARMUP_STEPS
+            || !(cert.beta.is_finite() && cert.eta.is_finite())
+        {
+            return Ok(None);
+        }
+        t = &t + &delta;
+        let (next_cert, next_delta) =
+            row_certificate(atom, evaluator, t.view(), x, amplitude, lipschitz, ridge)?;
+        cert = next_cert;
+        delta = next_delta;
+        warmups += 1;
+    }
+    refine_certified_start(
+        atom,
+        evaluator,
+        t,
+        x,
+        amplitude,
+        lipschitz,
+        ridge,
+        newton_steps,
+        cert,
+        delta,
+    )
+}
+
 fn kantorovich_root_radius(cert: RowCertificate) -> f64 {
     if !cert.certified() || !(cert.eta.is_finite() && cert.eta >= 0.0) {
         return f64::INFINITY;
@@ -1288,19 +1354,9 @@ impl EncodeAtlas {
         x: ArrayView1<'_, f64>,
         amplitude: f64,
     ) -> Result<(Array1<f64>, RowCertificate), String> {
-        let (cert, delta) = row_certificate(
-            atom,
-            evaluator,
-            t.view(),
-            x,
-            amplitude,
-            chart.lipschitz,
-            self.config.ridge,
-        )?;
-        if !cert.certified() {
-            return Ok((t, cert));
-        }
-        let Some(probe) = refine_certified_start(
+        // Certify from the warm start, navigating into the Kantorovich basin first
+        // if the unit-amplitude start has h > ½ (see `certify_with_basin_warmup`).
+        let Some(probe) = certify_with_basin_warmup(
             atom,
             evaluator,
             t,
@@ -1309,8 +1365,6 @@ impl EncodeAtlas {
             chart.lipschitz,
             self.config.ridge,
             self.config.newton_steps,
-            cert,
-            delta,
         )?
         else {
             return Ok((
@@ -1451,19 +1505,7 @@ impl EncodeAtlas {
         // two probes' final Kantorovich root-radius bounds. This avoids the
         // self-referential gate where the "exact" probe is warm-started by the
         // same distilled prediction it is supposed to audit.
-        let (cert, delta) = row_certificate(
-            atom,
-            evaluator.as_ref(),
-            t_hat.view(),
-            x,
-            amplitude,
-            chart.lipschitz,
-            self.config.ridge,
-        )?;
-        if !cert.certified() {
-            return Ok((t_hat, cert));
-        }
-        let Some(amortized_probe) = refine_certified_start(
+        let Some(amortized_probe) = certify_with_basin_warmup(
             atom,
             evaluator.as_ref(),
             t_hat,
@@ -1472,8 +1514,6 @@ impl EncodeAtlas {
             chart.lipschitz,
             self.config.ridge,
             self.config.newton_steps,
-            cert,
-            delta,
         )?
         else {
             return Ok((
@@ -1483,22 +1523,7 @@ impl EncodeAtlas {
         };
 
         let cold_start = chart.region.center.clone();
-        let (cold_cert, cold_delta) = row_certificate(
-            atom,
-            evaluator.as_ref(),
-            cold_start.view(),
-            x,
-            amplitude,
-            chart.lipschitz,
-            self.config.ridge,
-        )?;
-        if !cold_cert.certified() {
-            return Ok((
-                amortized_probe.coord,
-                uncertified_certificate(chart.lipschitz),
-            ));
-        }
-        let Some(cold_probe) = refine_certified_start(
+        let Some(cold_probe) = certify_with_basin_warmup(
             atom,
             evaluator.as_ref(),
             cold_start,
@@ -1507,8 +1532,6 @@ impl EncodeAtlas {
             chart.lipschitz,
             self.config.ridge,
             self.config.newton_steps,
-            cold_cert,
-            cold_delta,
         )?
         else {
             return Ok((
