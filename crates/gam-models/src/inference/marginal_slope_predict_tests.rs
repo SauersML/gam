@@ -2,32 +2,32 @@
 //! and the saved score-warp deviation runtime it carries.
 //!
 //! These exercise gam-crate types ([`BernoulliMarginalSlopePredictor`], the
-//! [`gam_models::bms`] deviation runtimes, and [`SavedCompiledFlexBlock`])
+//! [`crate::bms`] deviation runtimes, and [`SavedCompiledFlexBlock`])
 //! through crate-internal (`pub(crate)`) seams —
 //! [`BernoulliMarginalSlopePredictor::probit_frailty_scale`],
 //! [`build_score_warp_deviation_block_from_seed`], and
-//! [`empirical_intercept_from_marginal`]. They were swept into `gam-predict`'s
-//! lib test module by the #1521 crate split, which is what left that crate's
-//! test build red (the seams are not visible across the crate boundary). The
-//! code under test is gam-owned, so they are homed back here next to it; the
-//! genuinely gam-predict tests (its `point_state`/interval wrappers) stay in
-//! `gam-predict`.
+//! [`empirical_intercept_from_marginal`]. The #1521 crate split swept them up
+//! into the carved `gam-inference` crate's lib test module, which left that
+//! crate's test build red: the seams are `pub(crate)` to `gam-models` and are
+//! not visible across the crate boundary. The code under test lives here in
+//! `gam-models` (`crate::inference::predict_io`, `crate::bms`), so the tests are
+//! homed back next to it.
 
-use gam_models::bms::{
+use crate::bms::{
     EmpiricalZGrid, LatentMeasureKind, empirical_intercept_from_marginal,
 };
-use crate::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
-use crate::predict_io::{BernoulliMarginalSlopePredictor, PredictInput};
+use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
+use crate::inference::predict_io::{BernoulliMarginalSlopePredictor, PredictInput};
 use gam_linalg::matrix::DesignMatrix;
 use crate::probability::normal_cdf;
 use gam_problem::types::InverseLink;
 use ndarray::{Array1, Array2, array};
 
 fn saved_runtime_from_deviation_runtime(
-    runtime: &gam_models::bms::DeviationRuntime,
+    runtime: &crate::bms::DeviationRuntime,
 ) -> SavedCompiledFlexBlock {
     SavedCompiledFlexBlock {
-        kernel: gam_models::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
+        kernel: crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL.to_string(),
         breakpoints: runtime.breakpoints().to_vec(),
         basis_dim: runtime.basis_dim(),
         span_c0: runtime
@@ -58,9 +58,9 @@ fn saved_runtime_from_deviation_runtime(
 #[test]
 fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_runtime_kernel() {
     let seed = array![-1.5, -0.2, 0.6, 1.4];
-    let prepared = gam_models::bms::build_score_warp_deviation_block_from_seed(
+    let prepared = crate::bms::build_score_warp_deviation_block_from_seed(
         &seed,
-        &gam_models::bms::DeviationBlockConfig {
+        &crate::bms::DeviationBlockConfig {
             degree: 3,
             num_internal_knots: 3,
             ..Default::default()
@@ -98,9 +98,9 @@ fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_ru
         .unwrap_err();
     assert!(err.to_string().contains("DenestedCubicTransport"));
 
-    let err = gam_models::bms::build_score_warp_deviation_block_from_seed(
+    let err = crate::bms::build_score_warp_deviation_block_from_seed(
         &seed,
-        &gam_models::bms::DeviationBlockConfig {
+        &crate::bms::DeviationBlockConfig {
             degree: 2,
             num_internal_knots: 3,
             ..Default::default()
@@ -121,9 +121,9 @@ fn bernoulli_marginal_slope_predictor_rejects_structurally_invalid_or_unknown_ru
 #[test]
 fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
     let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-    let prepared = gam_models::bms::build_score_warp_deviation_block_from_seed(
+    let prepared = crate::bms::build_score_warp_deviation_block_from_seed(
         &seed,
-        &gam_models::bms::DeviationBlockConfig {
+        &crate::bms::DeviationBlockConfig {
             num_internal_knots: 4,
             ..Default::default()
         },
@@ -167,13 +167,13 @@ fn saved_anchored_deviation_runtime_local_cubic_reconstructs_values() {
 
 #[test]
 fn saved_anchored_deviation_runtime_design_with_anchor_rows_applies_residual() {
-    use gam_models::bms::deviation_runtime::ParametricAnchorBlock;
-    use crate::model::{SavedAnchorComponent, SavedAnchorKind};
+    use crate::bms::deviation_runtime::ParametricAnchorBlock;
+    use crate::inference::model::{SavedAnchorComponent, SavedAnchorKind};
 
     let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-    let prepared = gam_models::bms::build_score_warp_deviation_block_from_seed(
+    let prepared = crate::bms::build_score_warp_deviation_block_from_seed(
         &seed,
-        &gam_models::bms::DeviationBlockConfig {
+        &crate::bms::DeviationBlockConfig {
             num_internal_knots: 4,
             ..Default::default()
         },
@@ -408,9 +408,9 @@ fn bernoulli_marginal_slope_predictor_rejects_nonprobit_base_link_scale() {
 #[test]
 fn saved_anchored_deviation_runtime_basis_cubic_matches_basis_column() {
     let seed = array![-2.0, -0.75, 0.0, 1.0, 3.0];
-    let prepared = gam_models::bms::build_score_warp_deviation_block_from_seed(
+    let prepared = crate::bms::build_score_warp_deviation_block_from_seed(
         &seed,
-        &gam_models::bms::DeviationBlockConfig {
+        &crate::bms::DeviationBlockConfig {
             num_internal_knots: 4,
             ..Default::default()
         },

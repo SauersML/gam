@@ -40,8 +40,6 @@ pub mod polya_gamma_core;
 pub mod posterior;
 pub use gam_models::inference::{full_conformal, generative, model, model_payload_builders, predict_io};
 pub use gam_terms::inference::formula_dsl;
-#[cfg(test)]
-mod marginal_slope_predict_tests;
 pub mod probability;
 pub use gam_sae::inference::probe_runner;
 pub mod quadrature;
