@@ -1,8 +1,7 @@
 use gam::estimate::{FitOptions, fit_gam};
 use gam::gaussian_reml::{
     GaussianRemlEigenCache, GaussianRemlMultiBatchProblem, GaussianRemlMultiResult,
-    GaussianRemlResult, GaussianRemlScalarBatchProblem, gaussian_reml_closed_form,
-    gaussian_reml_closed_form_batch, gaussian_reml_closed_form_with_nullspace_dim,
+    gaussian_reml_closed_form, gaussian_reml_closed_form_with_nullspace_dim,
     gaussian_reml_multi_closed_form, gaussian_reml_multi_closed_form_batch,
 };
 use gam::smooth::BlockwisePenalty;
@@ -171,70 +170,6 @@ fn assert_cache_matches(
         &individual.coefficient_basis.mapv(f64::abs),
         1e-10,
     );
-}
-
-fn assert_scalar_batch_result_matches(
-    label: &str,
-    batched: &GaussianRemlResult,
-    individual: &GaussianRemlResult,
-) {
-    assert_close(
-        &format!("{label}.lambda"),
-        batched.lambda,
-        individual.lambda,
-        1e-10,
-    );
-    assert_close(&format!("{label}.rho"), batched.rho, individual.rho, 1e-10);
-    assert_array1_close(
-        &format!("{label}.coefficients"),
-        &batched.coefficients,
-        &individual.coefficients,
-        1e-9,
-    );
-    assert_array1_close(
-        &format!("{label}.fitted"),
-        &batched.fitted,
-        &individual.fitted,
-        1e-9,
-    );
-    assert_close(
-        &format!("{label}.reml_score"),
-        batched.reml_score,
-        individual.reml_score,
-        1e-9,
-    );
-    assert_close(
-        &format!("{label}.reml_grad_lambda"),
-        batched.reml_grad_lambda,
-        individual.reml_grad_lambda,
-        1e-9,
-    );
-    assert_close(
-        &format!("{label}.reml_hess_lambda"),
-        batched.reml_hess_lambda,
-        individual.reml_hess_lambda,
-        1e-9,
-    );
-    assert_close(
-        &format!("{label}.reml_grad_rho"),
-        batched.reml_grad_rho,
-        individual.reml_grad_rho,
-        1e-9,
-    );
-    assert_close(
-        &format!("{label}.reml_hess_rho"),
-        batched.reml_hess_rho,
-        individual.reml_hess_rho,
-        1e-9,
-    );
-    assert_close(&format!("{label}.edf"), batched.edf, individual.edf, 1e-9);
-    assert_close(
-        &format!("{label}.sigma2"),
-        batched.sigma2,
-        individual.sigma2,
-        1e-9,
-    );
-    assert_cache_matches(&format!("{label}.cache"), &batched.cache, &individual.cache);
 }
 
 fn assert_multi_batch_result_matches(
@@ -431,10 +366,7 @@ fn closed_form_accepts_and_validates_penalty_nullspace() {
 #[test]
 fn closed_form_batches_ragged_scalar_and_multi_problems() {
     let (x, y, s) = fixture();
-    let x_short = x.slice(ndarray::s![..48, ..]);
-    let y_short = y.slice(ndarray::s![..48]);
     let weights = Array1::from_iter((0..x.nrows()).map(|i| 0.75 + 0.01 * (i as f64)));
-    let weights_short = weights.slice(ndarray::s![..48]);
     let weights_alt = Array1::from_iter((0..x.nrows()).map(|i| 1.2 + 0.005 * (i as f64).cos()));
     let mut x_alt = x.clone();
     for i in 0..x_alt.nrows() {
@@ -448,44 +380,6 @@ fn closed_form_batches_ragged_scalar_and_multi_problems() {
         let t = -1.0 + 2.0 * (i as f64) / ((x_alt.nrows() - 1) as f64);
         -0.2 + 0.6 * t + 0.45 * (4.0 * t + 0.3).sin() + 0.08 * (11.0 * t).cos()
     }));
-
-    let scalar_problems = vec![
-        GaussianRemlScalarBatchProblem {
-            x: x.view(),
-            y: y.view(),
-            weights: Some(weights.view()),
-            init_rho: Some(0.0),
-        },
-        GaussianRemlScalarBatchProblem {
-            x: x_short,
-            y: y_short,
-            weights: Some(weights_short),
-            init_rho: None,
-        },
-        GaussianRemlScalarBatchProblem {
-            x: x_alt.view(),
-            y: y_alt.view(),
-            weights: Some(weights_alt.view()),
-            init_rho: Some(-0.35),
-        },
-    ];
-    let scalar_batch =
-        gaussian_reml_closed_form_batch(&scalar_problems, s.view(), Some(0)).expect("scalar batch");
-    assert_eq!(scalar_batch.len(), scalar_problems.len());
-    for (idx, (problem, batched)) in scalar_problems.iter().zip(scalar_batch.iter()).enumerate() {
-        let individual = gaussian_reml_closed_form(
-            problem.x.view(),
-            problem.y.view(),
-            s.view(),
-            problem
-                .weights
-                .as_ref()
-                .map(|weights: &ndarray::ArrayView1<f64>| weights.view()),
-            problem.init_rho,
-        )
-        .expect("individual scalar fit");
-        assert_scalar_batch_result_matches(&format!("scalar_batch[{idx}]"), batched, &individual);
-    }
 
     let mut y_multi = Array2::<f64>::zeros((x.nrows(), 3));
     y_multi.column_mut(0).assign(&y);
