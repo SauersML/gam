@@ -21,6 +21,12 @@ PSIS-LOO elpd); the `gamfit` Python API is unchanged.
   longer differ by ~1750 nats (#1582); the Gaussian log density now obeys the
   change-of-variables law `elpd(c·y) − elpd(y) = −n·ln c` (#1583). An estimated
   dispersion now also adds its degree of freedom to the conditional AIC.
+- The Binomial normalizer `ln C(n, n·y)` is now exact: `binomial_coefficient_f64`
+  carries its multiplicative recurrence in integer (`u128`) arithmetic instead of
+  dividing in `f64`, so the coefficient is bit-exact for every value at or below
+  `2^53` (the prior all-`f64` recurrence drifted off the true integer well below
+  that — e.g. `C(54,24)` came back one short, `C(55,25)` non-integer), keeping the
+  reported Binomial log-likelihood / AIC / elpd exact.
 
 **Survival & links**
 - **#1569**: the post-update monotone-cone feasibility tolerance is floored at
