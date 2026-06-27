@@ -354,6 +354,7 @@ mod device_dispatch {
     use super::kernel_src::DENESTED_PARTITION_CELLS_KERNEL_SRC;
     use super::{PartitionCellsOutput, PartitionCellsRowInputs, trivial_partition_cell};
     use gam_gpu::device_cache::PtxModuleCache;
+    use gam_gpu::gpu_err as gam_gpu_err;
     use gam_gpu::gpu_error::{GpuError, GpuResultExt};
     use gam_gpu::solver::context_and_stream;
     use cudarc::driver::{LaunchConfig, PushKernelArg};
@@ -544,6 +545,7 @@ mod device_dispatch {
 #[cfg(not(target_os = "linux"))]
 mod device_dispatch {
     use super::{PartitionCellsOutput, PartitionCellsRowInputs};
+    use gam_gpu::gpu_err as gam_gpu_err;
     use gam_gpu::gpu_error::GpuError;
 
     pub(super) fn partition_cells_baseline(

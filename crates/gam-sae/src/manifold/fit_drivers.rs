@@ -3756,7 +3756,7 @@ impl SaeManifoldTerm {
                 continue;
             }
             audited_atoms += 1;
-            let rank = crate::identifiability::audit::rank_of_gram(&grams[atom_idx], n_total)
+            let rank = gam_identifiability::audit::rank_of_gram(&grams[atom_idx], n_total)
                 .map_err(|e| {
                     format!(
                         "SaeManifoldTerm: pre-fit decoder audit (atom '{}'): \

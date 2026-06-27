@@ -109,6 +109,9 @@ mod system;
 mod tests;
 
 pub(crate) use factorization::*;
+// `SPECTRAL_DEFLATION_REL_FLOOR` is consumed cross-crate (gam-sae streaming plan)
+// so it needs a `pub` re-export path; the rest of `factorization` stays crate-local.
+pub use factorization::SPECTRAL_DEFLATION_REL_FLOOR;
 pub use newton_step::*;
 pub use penalty_ops::*;
 pub use prelude::*;

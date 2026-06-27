@@ -1537,7 +1537,7 @@ pub(crate) fn include_exact_newton_logdet_h<F: CustomFamily + ?Sized>(
         )
 }
 
-pub(crate) fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
+pub fn custom_family_outer_derivatives<F: CustomFamily + ?Sized>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,

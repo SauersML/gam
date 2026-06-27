@@ -1910,7 +1910,7 @@ pub(crate) fn lognormal_laplace_unit_term_shared(
 /// `ln L(1; shifted_mu, σ) = ln S(shifted_mu, σ)`. Used by the lognormal kernel
 /// bundle so kernel log-magnitudes survive value-space underflow (#798).
 #[inline]
-pub(crate) fn lognormal_laplace_unit_log_term_shared(
+pub fn lognormal_laplace_unit_log_term_shared(
     ctx: &QuadratureContext,
     shifted_mu: f64,
     sigma: f64,

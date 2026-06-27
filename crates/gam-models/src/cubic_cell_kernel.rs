@@ -1554,7 +1554,7 @@ pub(crate) static CELL_MOMENT_REALLOCS: std::sync::atomic::AtomicUsize =
 /// bivariate normal CDF representation — 20 points give >30-digit accuracy for
 /// the smooth arcsin-transformed integrand, ensuring the BVN value is exact to
 /// f64 precision for all (h, k, ρ) — and shared with the cubic-cell B-spline
-/// moment parity gate in [`gam_gpu::gpu_kernels::cubic_bspline_moments`].
+/// moment parity gate in [`crate::gpu_kernels::cubic_bspline_moments`].
 pub(crate) const GL20_NODES: [f64; 20] = [
     -0.993_128_599_185_094_9,
     -0.963_971_927_277_913_8,

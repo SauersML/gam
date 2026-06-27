@@ -433,7 +433,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
 
     /// Batched all-rows `(nll, grad, hess)` via the A100 NVRTC survival row-jet
     /// (#932-GPU). Gathers every row's primaries + scalar inputs, then calls the
-    /// device dispatcher ([`gam_gpu::gpu_kernels::survival_rowjet`]) which runs the
+    /// device dispatcher ([`crate::gpu_kernels::survival_rowjet`]) which runs the
     /// SAME unified `rigid_row_nll` jet on device for all `n` rows in parallel and
     /// falls back to the CPU jet on no-GPU / small-`n` / any device error. The
     /// result is bit-close (≤1e-9; measured 4.7e-12) to the per-row `row_kernel`
@@ -446,7 +446,7 @@ impl RowKernel<4> for SurvivalMarginalSlopeRowKernel {
     fn batched_value_grad_hess_all(
         &self,
     ) -> Option<Result<(Vec<f64>, Vec<[f64; 4]>, Vec<[[f64; 4]; 4]>), String>> {
-        use gam_gpu::gpu_kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_jets};
+        use crate::gpu_kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_jets};
         let n = self.family.n;
         let probit_scale = self.family.probit_frailty_scale();
         let qd1_lower = self.family.time_derivative_lower_bound();

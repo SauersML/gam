@@ -1156,9 +1156,9 @@ impl BernoulliMarginalSlopeFamily {
         // used unconditionally — the substrate dispatch below only fires
         // when `build_device_moments` is true, but the small Vec push cost
         // per cell is negligible compared to the moment compute itself.
-        let mut gpu_cells: Vec<gam_gpu::gpu_kernels::cubic_cell::GpuDenestedCubicCell> =
+        let mut gpu_cells: Vec<crate::gpu_kernels::cubic_cell::GpuDenestedCubicCell> =
             Vec::with_capacity(total_cells_us);
-        let mut gpu_branches: Vec<gam_gpu::gpu_kernels::cubic_cell::GpuCellBranchTag> =
+        let mut gpu_branches: Vec<crate::gpu_kernels::cubic_cell::GpuCellBranchTag> =
             Vec::with_capacity(total_cells_us);
 
         // Reusable per-row coefficient buffers. Same layout as
@@ -1319,7 +1319,7 @@ impl BernoulliMarginalSlopeFamily {
                 // resulting `[total_cells, MOMENT_STRIDE]` device buffer
                 // is indexed identically to the host `cell_moments` vec.
                 assert_eq!(gpu_cells.len(), cell_idx);
-                gpu_cells.push(gam_gpu::gpu_kernels::cubic_cell::GpuDenestedCubicCell {
+                gpu_cells.push(crate::gpu_kernels::cubic_cell::GpuDenestedCubicCell {
                     left: cell.left,
                     right: cell.right,
                     c0: cell.c0,
@@ -1328,11 +1328,11 @@ impl BernoulliMarginalSlopeFamily {
                     c3: cell.c3,
                 });
                 let branch = if !cell.left.is_finite() || !cell.right.is_finite() {
-                    gam_gpu::gpu_kernels::cubic_cell::GpuCellBranchTag::AffineTail
+                    crate::gpu_kernels::cubic_cell::GpuCellBranchTag::AffineTail
                 } else if cell.c2 == 0.0 && cell.c3 == 0.0 {
-                    gam_gpu::gpu_kernels::cubic_cell::GpuCellBranchTag::Affine
+                    crate::gpu_kernels::cubic_cell::GpuCellBranchTag::Affine
                 } else {
-                    gam_gpu::gpu_kernels::cubic_cell::GpuCellBranchTag::NonAffineFinite
+                    crate::gpu_kernels::cubic_cell::GpuCellBranchTag::NonAffineFinite
                 };
                 gpu_branches.push(branch);
 
@@ -1453,7 +1453,7 @@ impl BernoulliMarginalSlopeFamily {
         //    without any cross-context copying.
         #[cfg(target_os = "linux")]
         let cell_moments_device: Option<cudarc::driver::CudaSlice<f64>> = if build_device_moments {
-            use gam_gpu::gpu_kernels::cubic_cell::{
+            use crate::gpu_kernels::cubic_cell::{
                 CubicCellDerivativeMomentHostView, CubicCellDerivativeMomentOutput,
                 CubicCellMomentResidency, try_build_cubic_cell_derivative_moments,
             };
@@ -1509,7 +1509,7 @@ impl BernoulliMarginalSlopeFamily {
                     let refused = status
                         .iter()
                         .filter(|&&s| {
-                            s != gam_gpu::gpu_kernels::cubic_cell::CubicCellMomentStatus::Ok as u8
+                            s != crate::gpu_kernels::cubic_cell::CubicCellMomentStatus::Ok as u8
                         })
                         .count();
                     if refused > 0 {

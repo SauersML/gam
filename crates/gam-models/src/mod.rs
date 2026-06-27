@@ -44,6 +44,9 @@ pub mod seeding {
 pub mod model_types {
     pub use gam_solve::model_types::*;
     pub(crate) use gam_problem::validate_all_finite_estimation;
+    // Finite-scalar guard consumed as `crate::model_types::ensure_finite_scalar_estimation`
+    // (survival/location_scale); it lives in `gam-problem::finite_validation`.
+    pub use gam_problem::ensure_finite_scalar_estimation;
 }
 
 /// `crate::inference::{quadrature, probability}` → the carved homes of the two

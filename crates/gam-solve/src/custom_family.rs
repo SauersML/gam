@@ -108,6 +108,11 @@ pub(crate) use self::block_spec::{custom_family_block_role, validate_blockspecs}
 pub(crate) use blockwise_solve::*;
 pub use coefficient_groups::*;
 pub(crate) use covariance::*;
+// Two covariance helpers are part of the public flat-namespace API consumed by
+// the relocated families (`crate::custom_family::{use_joint_matrix_free_path,
+// projected_linear_constraint_stationarity_vector}`); surface them publicly
+// (the `pub(crate) use covariance::*` glob above keeps them crate-internal).
+pub use covariance::{projected_linear_constraint_stationarity_vector, use_joint_matrix_free_path};
 pub use fit::*;
 pub(crate) use inner_blockwise_fit::*;
 pub(crate) use jeffreys::*;

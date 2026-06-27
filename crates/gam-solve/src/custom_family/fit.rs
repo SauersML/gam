@@ -1770,7 +1770,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     )
 }
 
-pub(crate) fn fit_custom_family_fixed_log_lambdas<
+pub fn fit_custom_family_fixed_log_lambdas<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
     family: &F,
@@ -1834,7 +1834,7 @@ pub(crate) fn fit_custom_family_fixed_log_lambdas<
     )
 }
 
-pub(crate) fn fit_custom_family_fixed_log_lambda_warm_start<
+pub fn fit_custom_family_fixed_log_lambda_warm_start<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
     family: &F,

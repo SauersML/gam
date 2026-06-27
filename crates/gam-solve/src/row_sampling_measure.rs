@@ -474,7 +474,7 @@ impl RowSamplingMeasure {
     /// Crate-visible so the two-tier harvest (`gam_inference::harvest`)
     /// can lift designed-subsample Fisher masses to a full-corpus measure
     /// through the same validation/normalization path.
-    pub(crate) fn from_masses(metric_provenance: MetricProvenance, masses: Vec<f64>) -> Self {
+    pub fn from_masses(metric_provenance: MetricProvenance, masses: Vec<f64>) -> Self {
         let n = masses.len();
         if n == 0 {
             return Self::uniform(0);
@@ -927,7 +927,7 @@ const BSS_SCORE_TOL: f64 = 1e-10;
 /// `δ` never enters the measure — consistent with the `RowMetric` #747
 /// discipline, and irrelevant anyway because the measure feeds no criterion.
 /// Pure read; touches nothing.
-pub(crate) fn per_row_fisher_mass(metric: &RowMetric) -> Vec<f64> {
+pub fn per_row_fisher_mass(metric: &RowMetric) -> Vec<f64> {
     metric.row_traces().to_vec()
 }
 

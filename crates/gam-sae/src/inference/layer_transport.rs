@@ -1482,7 +1482,7 @@ pub fn composition_defect(
     // valid for arbitrary dependence among the tested pointwise contrasts.
     let normal =
         Normal::new(0.0, 1.0).map_err(|e| format!("standard normal construction failed: {e}"))?;
-    let pointwise = (2.0 * (1.0 - normal.cdf(max_z))).clamp(0.0, 1.0);
+    let pointwise: f64 = (2.0 * (1.0 - normal.cdf(max_z))).clamp(0.0, 1.0);
     let max_studentized_p_value = (n_grid as f64 * pointwise).min(1.0);
 
     Ok(CompositionDefectReport {

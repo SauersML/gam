@@ -442,7 +442,7 @@ fn no_change_log_e_value(theta_hat: f64, se: f64) -> Result<f64, String> {
     // Two-sided p-value of the studentized displacement; clamp to (0, 1] so the
     // calibrator (which rejects p = 0) sees a finite, valid argument even at a
     // numerically saturated tail.
-    let p = (2.0 * (1.0 - normal.cdf(z))).clamp(f64::MIN_POSITIVE, 1.0);
+    let p: f64 = (2.0 * (1.0 - normal.cdf(z))).clamp(f64::MIN_POSITIVE, 1.0);
     log_e_from_p_calibrator(p)
 }
 

@@ -2066,7 +2066,7 @@ pub fn evaluate_custom_family_joint_hyper<F: CustomFamily + Clone + Send + Sync 
     Ok(outer_eval_result_to_joint_hyper_result(eval_result))
 }
 
-pub(crate) fn evaluate_custom_family_joint_hyper_shared<
+pub fn evaluate_custom_family_joint_hyper_shared<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
     family: &F,
@@ -2153,7 +2153,7 @@ pub(crate) fn derivative_quality_options_and_warm_start(
     (eval_options, psi_safe_warm_start)
 }
 
-pub(crate) fn joint_hyper_options_for_outer_tolerance(
+pub fn joint_hyper_options_for_outer_tolerance(
     options: &BlockwiseFitOptions,
     outer_tol: f64,
 ) -> BlockwiseFitOptions {
@@ -2536,7 +2536,7 @@ pub fn evaluate_custom_family_joint_hyper_efs<F: CustomFamily + Clone + Send + S
     )
 }
 
-pub(crate) fn evaluate_custom_family_joint_hyper_efs_shared<
+pub fn evaluate_custom_family_joint_hyper_efs_shared<
     F: CustomFamily + Clone + Send + Sync + 'static,
 >(
     family: &F,

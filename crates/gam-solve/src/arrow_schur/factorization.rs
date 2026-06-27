@@ -360,7 +360,7 @@ pub(crate) fn factor_gauge_deflated_evidence_row(
 /// unit-stiffness deflated rather than ridge-damped. Matches the magnitude of
 /// the gauge Rayleigh qualifier and the `SAE_MANIFOLD_SPECTRAL_RANK_CUTOFF`
 /// data-null detection so the three deflation paths agree on what "flat" means.
-pub(crate) const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
+pub const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
 
 /// Hysteresis half-width (as a fraction of `SPECTRAL_DEFLATION_REL_FLOOR`)
 /// applied to the spectral-deflation decision for *positive* near-floor

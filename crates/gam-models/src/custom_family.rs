@@ -23,6 +23,15 @@ pub use gam_model_api::families::custom_family::*;
 // privately and does not re-export — surface them in the flat namespace.
 pub use gam_problem::{CustomFamilyError, ParameterBlockSpec, ParameterBlockState};
 
+// Block-Jacobian / working-set / family-linearization / penalty carriers that
+// descended to `gam-problem` (#1521) and are *not* surfaced by either crate's
+// `custom_family` glob above. Named re-exports here keep the prior
+// `crate::custom_family::{AdditiveBlockJacobian, …}` paths resolving.
+pub use gam_problem::{
+    AdditiveBlockJacobian, BlockEffectiveJacobian, BlockWorkingSet, FamilyChannelHessian,
+    FamilyLinearizationState, PenaltyMatrix,
+};
+
 // Solver half (inner blockwise solve, joint Newton, outer objective, Jeffreys,
 // covariance, the `fit_custom_family_with_rho_prior` drivers, JOINT_MATRIX_FREE_MIN_DIM,
 // …). These live in `gam-solve` as the orphan top-level modules (`fit`,

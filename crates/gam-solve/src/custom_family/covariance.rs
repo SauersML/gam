@@ -41,7 +41,7 @@ pub(crate) fn joint_observation_count(states: &[ParameterBlockState]) -> usize {
 /// slope kernels and the initial joint Hessian is ill-conditioned. Keep the
 /// matrix-free route for genuinely wide joint systems, where `total_p` dense
 /// products and factorization dominate.
-pub(crate) fn use_joint_matrix_free_path(total_p: usize, total_n: usize) -> bool {
+pub fn use_joint_matrix_free_path(total_p: usize, total_n: usize) -> bool {
     total_p >= JOINT_MATRIX_FREE_MIN_DIM
         || (total_n >= JOINT_MATRIX_FREE_MIN_ROWS
             && total_p >= JOINT_MATRIX_FREE_MIN_DIM_AT_LARGE_N)
@@ -467,7 +467,7 @@ pub(crate) fn linear_constraint_primal_violation(
     Some(primal_violation)
 }
 
-pub(crate) fn projected_linear_constraint_stationarity_vector(
+pub fn projected_linear_constraint_stationarity_vector(
     residual: &Array1<f64>,
     beta: &Array1<f64>,
     constraints: &LinearInequalityConstraints,

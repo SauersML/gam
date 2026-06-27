@@ -6,7 +6,7 @@ pub(crate) const MIN_CONDITIONAL_PRECISION: f64 = 1.0e-12;
 /// entropic / softmax-assignment penalties, keeping `ln(a)` finite (and the
 /// `a·ln(a)` contribution → 0) as `a → 0` without changing the value anywhere a
 /// is not numerically zero.
-pub(crate) const ENTROPY_LOG_PROBABILITY_FLOOR: f64 = 1e-300;
+pub const ENTROPY_LOG_PROBABILITY_FLOOR: f64 = 1e-300;
 
 /// Half-width of the open-interval clamp `[ε, 1−ε]` applied to IBP-assignment
 /// probabilities before `ln`/`1/p` so the Bernoulli cross-entropy and its score
@@ -87,7 +87,7 @@ impl PsiSlice {
 /// clamp band is symmetric in log-strength about zero, matched to the largest /
 /// smallest positive normal `f64`, leaving a safety margin so subsequent
 /// multiplications by `O(1)` factors stay finite.
-pub(crate) fn resolve_learnable_weight(base_weight: f64, rho: f64) -> f64 {
+pub fn resolve_learnable_weight(base_weight: f64, rho: f64) -> f64 {
     // Largest / smallest log-magnitude that keeps the strength a finite normal
     // `f64` with headroom for downstream `O(1)` arithmetic.
     const MAX_LOG_STRENGTH: f64 = 700.0;

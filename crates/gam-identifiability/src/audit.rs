@@ -2822,7 +2822,7 @@ pub(crate) fn count_rank(singular_values: &[f64], n: usize, p: usize) -> usize {
 /// Negative eigenvalues from finite-precision accumulation are clamped to zero
 /// before the square root. Returns the count of singular values above the
 /// tolerance, identical in convention to [`count_rank`].
-pub(crate) fn rank_of_gram(gram: &Array2<f64>, n_total: usize) -> Result<usize, EstimationError> {
+pub fn rank_of_gram(gram: &Array2<f64>, n_total: usize) -> Result<usize, EstimationError> {
     let p = gram.ncols();
     if p == 0 {
         return Ok(0);

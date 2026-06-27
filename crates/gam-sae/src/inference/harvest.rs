@@ -230,7 +230,7 @@ impl TieredHarvest {
         if self.n_rows == 0 {
             return RowSamplingMeasure::uniform(0);
         }
-        let tier_mass = per_row_fisher_mass(&tier.metric);
+        let tier_mass: Vec<f64> = per_row_fisher_mass(&tier.metric);
         let mut corrected = vec![0.0_f64; tier.rows.len()];
         let mut total = 0.0_f64;
         let mut usable = true;

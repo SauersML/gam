@@ -17,7 +17,7 @@ use ndarray::{Array1, Array2, Array3};
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
-use gam_terms::sae::manifold::{GumbelTemperatureSchedule, ScheduleKind};
+use gam_problem::schedule::{GumbelTemperatureSchedule, ScheduleKind};
 use gam_terms::{
     ARDPenalty, AnalyticPenaltyKind, AnalyticPenaltyRegistry, BlockOrthogonalityPenalty,
     BlockSparsityPenalty, DecoderIncoherencePenalty, DifferenceOpKind, IBPAssignmentPenalty,

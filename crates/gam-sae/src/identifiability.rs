@@ -7,7 +7,7 @@
 //! has converged, **which gauge group is the model identified up to?** It does
 //! so by running the same penalty-aware RRQR rank machinery the cross-block
 //! identifiability audit uses
-//! ([`crate::identifiability::audit::audit_identifiability`] /
+//! ([`gam_identifiability::audit::audit_identifiability`] /
 //! [`gam_linalg::faer_ndarray::rrqr_with_permutation`]) — but on the
 //! **symmetry generators** of the fitted model rather than on stacked design
 //! columns.
