@@ -107,7 +107,20 @@ pub(crate) fn materialize_survival<'a>(
         None
     };
 
-    let survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
+    let mut survival_mode = parse_survival_likelihood_mode(&config.survival_likelihood)?;
+    // `linkwiggle(...)` is a flexible-link feature defined only for the
+    // location-scale and marginal-slope survival models; it is meaningless under
+    // the default `transformation` (Royston-Parmar) likelihood. When the user
+    // adds `linkwiggle(...)` to a `Surv(...)` formula without overriding the
+    // (default) `survival_likelihood='transformation'`, the formula itself
+    // selects the location-scale AFT model whose link the wiggle flexes — so
+    // promote rather than reject. An EXPLICIT incompatible likelihood
+    // (weibull/latent/latent-binary) is still a hard error below.
+    if parsed.linkwiggle.is_some()
+        && survival_mode == SurvivalLikelihoodMode::Transformation
+    {
+        survival_mode = SurvivalLikelihoodMode::LocationScale;
+    }
     if age_right.is_some() && survival_mode != SurvivalLikelihoodMode::Latent {
         return Err(WorkflowError::InvalidConfig {
             reason: format!(

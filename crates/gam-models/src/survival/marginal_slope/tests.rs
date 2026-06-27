@@ -4699,7 +4699,15 @@ fn timewiggle_joint_hessian_matches_central_fd_of_joint_gradient() {
         let grad_plus = joint_gradient_at(&plus);
         let grad_minus = joint_gradient_at(&minus);
         for v in 0..p_total {
-            let fd = (grad_plus[v] - grad_minus[v]) / (2.0 * h);
+            // The joint "gradient" returned by the exact-Newton path is the
+            // score (∇ of the log-likelihood = −∇nll), while the joint dense
+            // Hessian is the observed information (+∇²nll = −∇(score)). The
+            // analytic Hessian therefore equals the NEGATED Jacobian of the
+            // joint gradient, so the central FD must carry the leading minus —
+            // exactly as every sibling FD-vs-Hessian oracle in the codebase
+            // does (cf. survival/location_scale `fd_neggrad_jac`). Omitting it
+            // produced an exact sign flip on every entry.
+            let fd = -(grad_plus[v] - grad_minus[v]) / (2.0 * h);
             let analytic = analytic_hessian[[v, u]];
             let denom = 1.0 + analytic.abs().max(fd.abs());
             let rel = (analytic - fd).abs() / denom;
