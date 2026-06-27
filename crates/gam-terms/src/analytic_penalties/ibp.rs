@@ -229,10 +229,32 @@ impl IBPAssignmentPenalty {
         // tensor — the issue's one-operator non-negotiable.
         let mut cross_row_d = Array1::<f64>::zeros(self.k_max);
         let mut cross_row_dd = Array1::<f64>::zeros(self.k_max);
+        // logα-derivative of the rank-one coefficient, ONLY for learnable-α. It is
+        // the SAME `∂s'_k/∂logα` the diagonal `hessian_diag_log_alpha_derivative`
+        // uses, so the cross-row channel of the log-det α-gradient matches the
+        // diagonal instead of injecting the undifferentiated value `s'_k`.
+        let mut cross_row_d_logalpha = Array1::<f64>::zeros(self.k_max);
         for k in 0..self.k_max {
             cross_row_d[k] = self.weight * score_derivative[k];
             // ∂d_k/∂M_k = w·∂s'_k/∂M_k = w·s''_k.
             cross_row_dd[k] = self.weight * score_second_derivative[k];
+            if self.learnable_alpha {
+                let pk = pi[k].clamp(IBP_PROBABILITY_CLAMP, 1.0 - IBP_PROBABILITY_CLAMP);
+                let mass = active_mass[k];
+                let raw = (mass + a - 1.0) / denom;
+                // Same interior gate / zero-π-Jacobian convention as
+                // `hessian_diag_log_alpha_derivative`; at the clamp the derivative is 0.
+                if raw > IBP_INTERIOR_TOL && raw < 1.0 - IBP_INTERIOR_TOL {
+                    let one_minus = 1.0 - pk;
+                    let dpi_da = (n as f64 - mass) / (denom * denom);
+                    let inv_p = 1.0 / pk;
+                    let inv_q = 1.0 / one_minus;
+                    let a_channel = inv_p + inv_q;
+                    let d_a_channel_da = dpi_da * (-inv_p * inv_p + inv_q * inv_q);
+                    let d_score_derivative_da = a_channel / (denom * denom) - d_a_channel_da / denom;
+                    cross_row_d_logalpha[k] = self.weight * a * d_score_derivative_da;
+                }
+            }
         }
 
         IbpHessianDiagThirdChannels {
@@ -242,6 +264,7 @@ impl IBPAssignmentPenalty {
             m_channel,
             cross_row_d,
             cross_row_dd,
+            cross_row_d_logalpha,
             logit_curvature,
         }
     }
@@ -390,6 +413,17 @@ pub struct IbpHessianDiagThirdChannels {
     /// `∂M_k/∂ℓ_wk = J_wk`, the θ-derivative of the rank-one block carries
     /// `∂d_k/∂ℓ_wk = cross_row_dd[k]·J_wk`. Length `K`.
     pub cross_row_dd: Array1<f64>,
+    /// `cross_row_d_logalpha[k] = w·∂s'_k/∂logα`: the **logα-derivative** of the
+    /// column Woodbury coefficient `d_k`, for the learnable-α log-det ρ-gradient
+    /// `½ tr(H⁻¹ ∂H_p/∂logα)`. The cross-row rank-one block is
+    /// `W_k = d_k·u_k u_kᵀ` with `u_k = z_jac[·,k]` α-independent (the concrete
+    /// Jacobian depends on logits, not α), so `∂W_k/∂logα = (∂d_k/∂logα)·u_k u_kᵀ`
+    /// and the correct cross-row coefficient is `∂d_k/∂logα`, NOT the value `d_k`.
+    /// The diagonal channel (`hessian_diag_log_alpha_derivative`) already uses this
+    /// α-derivative; the off-diagonal must match it. Zero unless `learnable_alpha`
+    /// (the fixed-α path scales linearly with `λ`, so `∂H_p/∂ρ = H_p` uses the
+    /// value `cross_row_d` instead). Length `K`.
+    pub cross_row_d_logalpha: Array1<f64>,
     /// `logit_curvature[i*K+k] = c_ik = ∂J_ik/∂ℓ_ik = z(1−z)(1−2z)/τ²`: the
     /// per-logit second derivative of the concrete map (#1416). The
     /// cross-row rank-one block's `J_ik` factors depend on `ℓ_ik`, so its

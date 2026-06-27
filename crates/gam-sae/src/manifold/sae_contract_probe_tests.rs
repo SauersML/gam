@@ -1367,3 +1367,87 @@ fn jumprelu_hdiag_third_derivative_matches_central_difference_1415() {
         "fixture must include a logit exactly at the threshold to pin −λ/(8τ³)"
     );
 }
+
+/// Direct FD regression guard for the Kantorovich-certificate primitives
+/// `encode_grad_hess` and `beta_eta_newton` (encode.rs). These are load-bearing
+/// for `certified_encode` (the #1026/#1154 basin path) yet were previously only
+/// exercised *indirectly* through the full encode. This pins, at the scalar
+/// periodic (circle) coordinate that #1026 actually uses:
+///   - the gradient `g = ∂f/∂t` of `f(t) = ½‖z·decode(t) − x‖²` (amplitude factor),
+///   - the full Hessian `H = ∂²f/∂t²` INCLUDING the residual·second-jet curvature
+///     term `r·∂²m` (the term whose absence would silently make H Gauss-Newton),
+///   - `β = 1/λ_min(H) = ‖H⁻¹‖₂` and the Newton step `δ = −H⁻¹g` (NOT the classic
+///     `1/‖H‖₂` error).
+/// A non-stationary, off-manifold target is chosen so both the residual and the
+/// curvature term are nonzero (a stationary point would zero `r` and hide bugs).
+#[test]
+fn encode_grad_hess_and_beta_eta_match_finite_differences() {
+    use crate::encode::{beta_eta_newton, encode_grad_hess};
+    use ndarray::Array2;
+
+    // Periodic (circle) atom: real second jet via TestPeriodicEvaluator (d=1).
+    let train = Array2::from_shape_fn((24, 1), |(r, _)| (r as f64 + 0.5) / 24.0);
+    let (phi, jet) = periodic_basis(&train);
+    let m = phi.ncols();
+    let p = 4usize;
+    let decoder = Array2::from_shape_fn((m, p), |(b, c)| {
+        (1.0 / (1.0 + b as f64)) * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
+    });
+    let atom = SaeManifoldAtom::new(
+        "circle",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jet,
+        decoder.clone(),
+        Array2::<f64>::eye(m),
+    )
+    .unwrap();
+    let eval = TestPeriodicEvaluator;
+    let amplitude = 0.8_f64;
+
+    // Objective f(t) = ½‖amp·decode(t) − x‖², with decode(t) = Φ(t)·decoder.
+    let decode = |t: f64| -> ndarray::Array1<f64> {
+        let coords = Array2::from_shape_fn((1, 1), |_| t);
+        let (ph, _) = periodic_basis(&coords);
+        amplitude * ph.dot(&decoder).row(0).to_owned()
+    };
+    // Off-manifold, non-stationary target ⇒ residual r ≠ 0 (exercises curvature).
+    let t0 = 0.137_f64;
+    let x = &decode(0.42) + &ndarray::Array1::from_vec(vec![0.3, -0.2, 0.15, -0.25]);
+    let f = |t: f64| -> f64 {
+        let r = &decode(t) - &x;
+        0.5 * r.dot(&r)
+    };
+
+    // Analytic g, H (ridge = 0 so H is exactly ∂²f/∂t²).
+    let t_view = ndarray::Array1::from_vec(vec![t0]);
+    let (g, h) = encode_grad_hess(&atom, &eval, t_view.view(), x.view(), amplitude, 0.0)
+        .expect("encode_grad_hess runs")
+        .expect("second jet present ⇒ Some");
+
+    // Central FD of f → gradient.
+    let eps = 1e-6;
+    let g_fd = (f(t0 + eps) - f(t0 - eps)) / (2.0 * eps);
+    assert_abs_diff_eq!(g[0], g_fd, epsilon = 1e-6);
+
+    // Central FD of f → second derivative (includes the residual·curvature term).
+    let h_fd = (f(t0 + eps) - 2.0 * f(t0) + f(t0 - eps)) / (eps * eps);
+    // Second-difference truncation/roundoff floor is ~1e-4 at this ε.
+    assert_abs_diff_eq!(h[[0, 0]], h_fd, epsilon = 5e-3);
+
+    // beta_eta_newton on a known SPD H: build a positive-definite 1×1 from H by
+    // ridging if the off-manifold curvature happened to be indefinite here.
+    let mut hpd = h.clone();
+    if hpd[[0, 0]] <= 0.0 {
+        hpd[[0, 0]] = 1.5;
+    }
+    let (beta, eta, delta) = beta_eta_newton(hpd.view(), g.view())
+        .expect("beta_eta_newton runs")
+        .expect("SPD ⇒ Some");
+    // β = 1/λ_min = ‖H⁻¹‖₂ (the correct operator norm, not 1/‖H‖₂).
+    assert_abs_diff_eq!(beta * hpd[[0, 0]], 1.0, epsilon = 1e-12);
+    // δ = −H⁻¹ g, η = ‖δ‖.
+    assert_abs_diff_eq!(delta[0], -g[0] / hpd[[0, 0]], epsilon = 1e-12);
+    assert_abs_diff_eq!(eta, (g[0] / hpd[[0, 0]]).abs(), epsilon = 1e-12);
+}

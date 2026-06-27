@@ -361,6 +361,56 @@ fn ibp_cross_row_woodbury_dd_and_logit_curvature_match_finite_difference() {
 }
 
 #[test]
+fn ibp_cross_row_d_logalpha_matches_finite_difference() {
+    // #1417 fix: the cross-row rank-one coefficient's logα-derivative used by the
+    // LEARNABLE-α log-det ρ-gradient. For learnable α, `α(ρ₀)=α_base·e^{ρ₀}` so
+    // `∂logα/∂ρ₀=1`, hence `∂(cross_row_d[k])/∂ρ₀ = ∂d_k/∂logα = cross_row_d_logalpha[k]`.
+    // Central-difference the VALUE channel `cross_row_d` w.r.t. ρ₀ and compare.
+    // (The pre-fix bug used the value `cross_row_d` itself in the off-diagonal of
+    // the logα trace — inconsistent with the α-differentiated diagonal channel.)
+    let pen = IBPAssignmentPenalty::new(3, 6.0, 0.8, true);
+    let t = array![
+        0.2_f64, -0.3, 0.7, -0.1, 0.4, 0.5, 0.6, -0.2, 0.3, 0.1, 0.8, -0.4
+    ];
+    let rho = array![0.15_f64];
+    let k = pen.k_max;
+    let ch = pen.hessian_diag_logit_third_channels(t.view(), rho.view());
+    let eps = 1.0e-6;
+    let mut rp = rho.clone();
+    let mut rm = rho.clone();
+    rp[0] += eps;
+    rm[0] -= eps;
+    let plus = pen.hessian_diag_logit_third_channels(t.view(), rp.view());
+    let minus = pen.hessian_diag_logit_third_channels(t.view(), rm.view());
+    let mut max_err = 0.0_f64;
+    let mut saw_nonzero = false;
+    for col in 0..k {
+        let fd = (plus.cross_row_d[col] - minus.cross_row_d[col]) / (2.0 * eps);
+        let err = (ch.cross_row_d_logalpha[col] - fd).abs();
+        max_err = max_err.max(err);
+        if ch.cross_row_d_logalpha[col].abs() > 1.0e-9 {
+            saw_nonzero = true;
+        }
+        assert_abs_diff_eq!(ch.cross_row_d_logalpha[col], fd, epsilon = 1.0e-6);
+    }
+    assert!(
+        saw_nonzero,
+        "fixture must exercise a nonzero logα cross-row coefficient (else vacuous)"
+    );
+    assert!(
+        max_err < 1.0e-6,
+        "cross_row_d_logalpha vs FD max abs err = {max_err:.3e}"
+    );
+    // Fixed-α leaves the channel at zero (the value `cross_row_d` is used there).
+    let fixed = IBPAssignmentPenalty::new(3, 6.0, 0.8, false);
+    let chf = fixed.hessian_diag_logit_third_channels(t.view(), Array1::<f64>::zeros(0).view());
+    assert!(
+        chf.cross_row_d_logalpha.iter().all(|&v| v == 0.0),
+        "fixed-α must leave cross_row_d_logalpha zero"
+    );
+}
+
+#[test]
 fn ibp_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
     let pen = IBPAssignmentPenalty::new(3, 6.0, 0.8, true);
     let t = array![

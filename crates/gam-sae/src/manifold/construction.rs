@@ -7441,9 +7441,28 @@ impl SaeManifoldTerm {
             if let Some(channels) = ibp_assignment_third_channels(&self.assignment, rho)? {
                 let n = self.n_obs();
                 let total_t = cache.delta_t_len();
+                // This trace is ½ ∂log|H|/∂ρ. For FIXED-α IBP the whole prior
+                // scales with λ=eᵖ so ∂H_p/∂ρ = H_p and the rank-one coefficient
+                // is the VALUE `cross_row_d[k] = w·s'_k`. For LEARNABLE-α this trace
+                // is ½ ∂log|H|/∂logα, and the rank-one block's logα-derivative is
+                // `∂d_k/∂logα = w·∂s'_k/∂logα` (`cross_row_d_logalpha[k]`) — the same
+                // α-derivative the DIAGONAL channel (`hessian_diag_log_alpha_derivative`)
+                // already uses. Using the value `s'_k` here (the pre-fix bug) made the
+                // off-diagonal inconsistent with the diagonal and the α-gradient wrong.
+                let learnable_alpha = matches!(
+                    self.assignment.mode,
+                    AssignmentMode::IBPMap {
+                        learnable_alpha: true,
+                        ..
+                    }
+                );
                 let mut cross = 0.0_f64;
                 for k in 0..k_atoms {
-                    let d_k = channels.cross_row_d[k];
+                    let d_k = if learnable_alpha {
+                        channels.cross_row_d_logalpha[k]
+                    } else {
+                        channels.cross_row_d[k]
+                    };
                     if d_k == 0.0 {
                         continue;
                     }
