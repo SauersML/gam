@@ -45,7 +45,7 @@
 // dispatch helper and by the `cfg(test)` CPU parity harness (`test_support`). Gating
 // the import to match keeps it from reading as an unused import on the non-linux
 // release builds (mac/windows), where neither consumer is compiled.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 use crate::arrow_schur::ArrowSchurSystem;
 
 /// Fused-kernel dispatch admission. Returns `true` when the workload shape
@@ -361,7 +361,7 @@ void arrow_schur_back_sub_pgroup(
 // as never-read dead code on the non-linux release builds, where the sole caller
 // (`solve_arrow_newton_step_fused_force`) returns `Unavailable` without ever
 // inspecting a plan.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug)]
 pub struct FusedLaunchPlan {
     pub p_max: usize,
@@ -375,7 +375,7 @@ pub struct FusedLaunchPlan {
 /// Plan one fused launch from the static `(n, p, r)` triple. Returns `None`
 /// when the workload exceeds the kernel's `P_MAX` ceiling or when `r` cannot
 /// be ceiled into a template width.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 #[inline]
 #[must_use]
 pub fn plan_fused_launch(n: usize, p: usize, r: usize) -> Option<FusedLaunchPlan> {
@@ -819,6 +819,7 @@ mod tests {
         assert!(fused_path_admitted(50, 30, 8));
     }
 
+    #[cfg(target_os = "linux")] // exercises `plan_fused_launch`, gated to its linux home (CI tests run on linux)
     #[test]
     fn plan_fused_launch_clamps_p_max_and_blocks_count() {
         let plan = plan_fused_launch(7, 10, 4).expect("admissible");

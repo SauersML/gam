@@ -242,7 +242,7 @@ pub fn solve_arrow_newton_step_fused_force(
         // No NVRTC toolchain off linux: the fused path is unconditionally
         // unavailable, so the shape-admission probe (`plan_fused_launch`) is
         // never needed here and is compiled only for linux + tests.
-        let _ = sys;
+        drop(sys);
         Err(ArrowSchurGpuFailure::Unavailable)
     }
     #[cfg(target_os = "linux")]
