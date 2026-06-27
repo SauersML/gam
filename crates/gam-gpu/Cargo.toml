@@ -1,15 +1,18 @@
 [package]
 name = "gam-gpu"
-version = "0.3.124"
+version = "0.3.126"
 edition = "2024"
+description = "GPU (CUDA/NVRTC) dispatch, device runtime, and BLAS kernels for the gam penalized-likelihood engine"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/SauersML/gam"
 
 [lints.rust]
 warnings = "deny"
 
 [dependencies]
 faer = "0.24.0"
-gam-linalg = { path = "../gam-linalg", version = "=0.3.124" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.124" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.126" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.126" }
 libloading = "0.8.9"
 libm = "0.2.16"
 log = "0.4.29"
@@ -21,4 +24,4 @@ serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }
 
 [dev-dependencies]
-gam-problem = { path = "../gam-problem", version = "=0.3.124" }
+gam-problem = { path = "../gam-problem", version = "=0.3.126" }

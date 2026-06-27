@@ -1,18 +1,21 @@
 [package]
 name = "gam-identifiability"
-version = "0.3.124"
+version = "0.3.126"
 edition = "2024"
+description = "Design identifiability auditing and rank reduction for the gam penalized-likelihood engine"
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/SauersML/gam"
 
 [lints.rust]
 warnings = "deny"
 
 [dependencies]
 faer = "0.24.0"
-gam-gpu = { path = "../gam-gpu", version = "=0.3.124" }
-gam-linalg = { path = "../gam-linalg", version = "=0.3.124" }
-gam-math = { path = "../gam-math", version = "=0.3.124" }
-gam-problem = { path = "../gam-problem", version = "=0.3.124" }
-gam-runtime = { path = "../gam-runtime", version = "=0.3.124" }
+gam-gpu = { path = "../gam-gpu", version = "=0.3.126" }
+gam-linalg = { path = "../gam-linalg", version = "=0.3.126" }
+gam-math = { path = "../gam-math", version = "=0.3.126" }
+gam-problem = { path = "../gam-problem", version = "=0.3.126" }
+gam-runtime = { path = "../gam-runtime", version = "=0.3.126" }
 log = "0.4.29"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 rayon = "1.12.0"
@@ -20,7 +23,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.149", features = ["float_roundtrip"] }
 
 [dev-dependencies]
-gam-test-support = { path = "../gam-test-support", version = "=0.3.124" }
+gam-test-support = { path = "../gam-test-support", version = "=0.3.126" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 cudarc = { version = "0.19.6", default-features = false, features = ["std", "driver", "runtime", "nvrtc", "cublas", "cublaslt", "cusparse", "cusolver", "cusolvermg", "curand", "nvtx", "cupti", "fallback-dynamic-loading", "cuda-12080"] }

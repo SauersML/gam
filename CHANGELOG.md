@@ -1,3 +1,56 @@
+## v0.3.126 — gam 0.3.126 / gamfit 0.1.228 (2026-06-27)
+
+crates.io + PyPI release of the open-issue fix wave landed since gam 0.3.124 /
+gamfit 0.1.226, plus the completion of the #1521 engine carve so the whole
+workspace — every crate library, the `gamfit` (gam-pyffi) wheel, and the
+`gam` build.rs ban-scanner — compiles green again. The most user-visible change
+is a correctness fix to the reported model-comparison statistics (AIC and
+PSIS-LOO elpd); the `gamfit` Python API is unchanged.
+
+**Reported log-likelihood / AIC / elpd (#1581, #1582, #1583)**
+- The user-facing `log_likelihood` (and the conditional/corrected AIC and the
+  PSIS-LOO `elpd` derived from it) is now the **fully normalized, scale-aware**
+  log predictive density on the response's own measure, not the REML building
+  block that deliberately drops every family normalizer and the Gaussian scale.
+  New reporting kernels in `gam-solve` carry each family's full normalizer:
+  Poisson `−lnΓ(y+1)`, Binomial `ln C(n, n·y)`, the Gamma saturated term, the
+  Tweedie Jørgensen saddlepoint density, and Gaussian `−½[ln(2πφ̂) − ln wᵢ +
+  wᵢ(y−μ)²/φ̂]` with the profiled `σ̂²` concretized into the scale (no silent
+  unit-variance fallback). Symptoms fixed: a discrete model no longer reports a
+  positive elpd (#1581); a Poisson fit and an NB(θ→∞) fit on identical data no
+  longer differ by ~1750 nats (#1582); the Gaussian log density now obeys the
+  change-of-variables law `elpd(c·y) − elpd(y) = −n·ln c` (#1583). An estimated
+  dispersion now also adds its degree of freedom to the conditional AIC.
+
+**Survival & links**
+- **#1569**: the post-update monotone-cone feasibility tolerance is floored at
+  the same `1e-8` gate every downstream consumer enforces, so a cone-projected β
+  feasible to the gate is no longer rejected by a stricter post-update check (the
+  fragile spectrum-branch α-crush bypass was reverted after it could not be shown
+  robust on the dense survival monotone cone).
+- **#1571 / #1572 / #1573**: SAS / Beta-Logistic / mixture parameterized-link
+  fits no longer abort with a "Lambda count mismatch": the post-convergence
+  inner-cap guard now routes the augmented θ through the same `apply_link_theta`
+  the eval closure uses, handing `compute_cost` exactly the smoothing-only ρ
+  block (and installing the converged link state) instead of the raw augmented θ.
+
+**Identifiability (#1580)**
+- The large-scale identifiability-audit regression is rebuilt on orthogonal
+  Legendre polynomials so its single seeded rank deficiency is resolved
+  backend-independently (the penalty-augmented Gram path's `√ε` resolution made
+  the prior RBF/trig fixture spuriously demote extra columns on some BLAS).
+
+**Build system (#1521)**
+- Completion of the engine carve: the published `gam` crate now depends on the
+  full gam crate family (foundations plus `gam-model-api`/`gam-gpu`/
+  `gam-identifiability`/`gam-terms`/`gam-solve`/`gam-custom-family`/
+  `gam-model-kernels`/`gam-models`/`gam-sae`/`gam-test-support`), published to
+  crates.io alongside it as a version-locked family; the `gamfit` wheel is
+  unaffected (it builds from source). A sweep of latent carve breakages —
+  cross-crate visibility, stranded duplicate definitions, a stale shared-include
+  depth, mis-scoped GPU macros, and dead re-export shims — is repaired so
+  `cargo check --workspace` is green end-to-end.
+
 ## v0.3.124 — gam 0.3.124 / gamfit 0.1.226 (2026-06-26)
 
 crates.io + PyPI release of the open-issue fix wave landed since gam 0.3.123 /
