@@ -606,7 +606,18 @@ pub(crate) fn reject_constrained_post_update_repair(
         .fold(0.0_f64, f64::max);
     let raw_scale = raw_beta.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
     let updated_scale = updated_beta.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
-    let tol = 1e-10 * (1.0 + raw_scale.max(updated_scale));
+    // Calibrate to the constrained QP's OWN primal feasibility tolerance. The
+    // active-set solve holds a binding coordinate at its boundary only up to
+    // `ACTIVE_SET_PRIMAL_FEASIBILITY_TOL` (1e-8), so an accepted step can leave a
+    // bound coordinate a few ULPs to ~1e-8 inside the feasible side; a post-update
+    // feasibility projection that snaps such sub-tolerance slop EXACTLY onto the
+    // boundary (e.g. the monotone link-wiggle β≥0 clamp) does not change the KKT
+    // point to feasibility tolerance — it is not the "repair an unrepresented
+    // constraint" this guard rejects. A genuine post-hoc repair moves β by ≫1e-8
+    // and still fails. The previous `1e-10` band was an order of magnitude tighter
+    // than the solver can deliver, so it flagged legitimate KKT-slop cleanup.
+    let tol = gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+        * (1.0 + raw_scale.max(updated_scale));
     if max_change > tol {
         return Err(CustomFamilyError::ConstraintViolation {
             reason: format!(

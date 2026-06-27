@@ -869,10 +869,49 @@ fn canonicalize_for_identifiability_inner(
             .iter()
             .any(|spec| spec.name == name && spec.stacked_design.is_some())
     };
-    let dropped_on_owned_block = audit
-        .dropped_columns
-        .iter()
-        .any(|drop| owns_stacked_geometry(&drop.block));
+    // #319 / #933 interaction: a `jacobian_callback`-only block whose effective
+    // (linearized) Jacobian is IDENTICALLY ZERO is a dynamically-realized block —
+    // e.g. the monotone link-wiggle I-spline, which modulates the inverse link
+    // NONLINEARLY through q0 so its ADDITIVE Jacobian is zero (#319). Its real
+    // geometry is rebuilt at RAW width every inner iteration by the family's
+    // `block_geometry`, which asserts the rebuilt design matches
+    // `spec.design.ncols()`. The channel-aware audit (multi-output location-scale
+    // families) sees a zero structural Gram and demotes ALL its columns; the
+    // per-block selection-`T` reduction below would then collapse the block to 0
+    // columns and desynchronise the raw-width rebuild from the reduced β
+    // ("dynamic wiggle design col mismatch: got N, expected 0"). `gauge_priority`
+    // cannot rescue it — the channel-aware path attributes drops by structural
+    // rank, and a zero-Jacobian block shares no measurable direction to win on.
+    // #933 narrowed this veto to `stacked_design` blocks assuming every
+    // `jacobian_callback` block reduces safely at the gauge-composed width; that
+    // holds only for NONZERO-Jacobian callbacks (which capture the reduced
+    // design), not for a zero-Jacobian dynamic block. Treat the latter like a
+    // `stacked_design` block: keep raw width, defer its weak directions to the
+    // penalty / monotonicity-constraint path.
+    let owns_dynamic_zero_jacobian_geometry = |name: &str| -> bool {
+        specs.iter().any(|spec| {
+            if spec.name != name || spec.stacked_design.is_some() || spec.jacobian_callback.is_none()
+            {
+                return false;
+            }
+            let zeros = vec![0.0; spec.design.ncols()];
+            let state = FamilyLinearizationState {
+                beta: &zeros,
+                family_scalars: None,
+                channel_hessian: None,
+                probit_frailty_scale: 1.0,
+            };
+            spec.effective_jacobian_at(
+                "canonicalize_for_identifiability: dynamic zero-Jacobian veto probe",
+                &state,
+            )
+            .map(|j| j.iter().all(|v| *v == 0.0))
+            .unwrap_or(false)
+        })
+    };
+    let dropped_on_owned_block = audit.dropped_columns.iter().any(|drop| {
+        owns_stacked_geometry(&drop.block) || owns_dynamic_zero_jacobian_geometry(&drop.block)
+    });
     if dropped_on_owned_block {
         let raw_widths: Vec<usize> = specs.iter().map(|spec| spec.design.ncols()).collect();
         let dropped_summary = audit
