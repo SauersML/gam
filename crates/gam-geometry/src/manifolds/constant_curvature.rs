@@ -50,7 +50,7 @@
 //!
 //! Stage 2 of #944 (exact ∂/∂κ and ∂²/∂κ² of distance/log so κ can join
 //! the outer REML optimization as a ψ-coordinate) is implemented as a
-//! CLIENT of [`gam_math::jet_tower::Tower4`]: the same geometric
+//! CLIENT of [`gam_math::jet_tower::Tower2`]: the same geometric
 //! program is evaluated with κ seeded as a 1-variable jet, the scalar
 //! primitives `C/S/T` entering through their hand-certified `[f64; 5]`
 //! derivative stacks via `compose_unary`. Humans own primitive stability,
@@ -76,7 +76,7 @@
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 use crate::manifold::{GEOMETRY_EPS, GeometryError, GeometryResult, RiemannianManifold};
-use gam_math::jet_tower::Tower4;
+use gam_math::jet_tower::Tower2;
 
 /// Branch threshold for the `C`/`S` series in `u = κt²`. The series terms
 /// decay factorially, so at `|u| ≤ 0.5` the truncation error of
@@ -607,13 +607,24 @@ impl RiemannianManifold for ConstantCurvature {
 // ── κ-jets: stage 2 of #944, powered by the #932 tower ───────────────
 //
 // Each function below is the SAME geometric program as its f64 twin
-// above, evaluated with κ seeded as `Tower4::<1>::variable(κ, 0)` and the
+// above, evaluated with κ seeded as `Tower2::<1>::variable(κ, 0)` and the
 // scalar primitives entering through their certified derivative stacks.
 // Points are chart constants; everything κ-dependent is a tower. The
 // returned channels are exact ∂/∂κ and ∂²/∂κ² — the design/penalty
 // movement the outer ψ-channel consumes.
 
-type KJet = Tower4<1>;
+type KJet = Tower2<1>;
+
+#[inline]
+fn stack2(stack: [f64; 5]) -> [f64; 3] {
+    [stack[0], stack[1], stack[2]]
+}
+
+#[inline]
+fn kjet_recip(z: KJet) -> KJet {
+    let r = 1.0 / z.v;
+    z.compose_unary([r, -r * r, 2.0 * r * r * r])
+}
 
 fn kjet_mobius_w(
     kappa: KJet,
@@ -626,15 +637,15 @@ fn kjet_mobius_w(
     let xy = -x.dot(&y);
     let xx = x.dot(&x);
     let yy = y.dot(&y);
-    let a = -(kappa * (2.0 * xy + yy)) + 1.0;
+    let a = (kappa * (2.0 * xy + yy)).scale(-1.0) + 1.0;
     let b = kappa * xx + 1.0;
-    let denom = (kappa * kappa) * (xx * yy) - kappa * (2.0 * xy) + 1.0;
+    let denom = (kappa * kappa) * (xx * yy) + (kappa * (2.0 * xy)).scale(-1.0) + 1.0;
     if denom.v.abs() <= MOBIUS_DENOM_EPS {
         return Err(GeometryError::Singular(
             "Möbius addition at the κ>0 antipodal point",
         ));
     }
-    let inv = denom.recip();
+    let inv = kjet_recip(denom);
     Ok((0..x.len())
         .map(|i| (a * (-x[i]) + b * y[i]) * inv)
         .collect())
@@ -661,7 +672,7 @@ pub fn distance_kappa_jet(
         return Ok((0.0, 0.0, 0.0));
     }
     let arg = kappa * nw2;
-    let t = arg.compose_unary(t_stacks(arg.v));
+    let t = arg.compose_unary(stack2(t_stacks(arg.v)));
     let d = nw2.sqrt() * t * 2.0;
     Ok((d.v, d.g[0], d.h[0][0]))
 }
@@ -685,7 +696,7 @@ pub fn log_map_kappa_jet(
         nw2 = nw2 + *wi * *wi;
     }
     let arg = kappa * nw2;
-    let t = arg.compose_unary(t_stacks(arg.v));
+    let t = arg.compose_unary(stack2(t_stacks(arg.v)));
     let gauge = kappa * p_from.dot(&p_from) + 1.0;
     let coeff = gauge * t;
     let d = p_from.len();
@@ -704,7 +715,7 @@ pub fn log_map_kappa_jet(
 /// `(exp, ∂exp/∂κ, ∂²exp/∂κ²)` of the geodesic exp map, componentwise — the
 /// κ-movement of the exponential chart, completing the κ-jet trio. Same
 /// program as [`ConstantCurvature::exp_map`] (`x ⊕_κ [tn_κ(λ_x‖v‖/2)·v̂]`)
-/// evaluated over `Tower4<1>` with κ seeded: the gauge `1+κ‖x‖²`, the
+/// evaluated over `Tower2<1>` with κ seeded: the gauge `1+κ‖x‖²`, the
 /// generalized tangent `tn_κ(t) = t·S(κt²)/C(κt²)`, and the Möbius addition
 /// all become towers, with `C`/`S` entering through their certified stacks via
 /// `compose_unary`. Value and κ-derivatives are one expression, so they cannot
@@ -728,18 +739,18 @@ pub fn exp_map_kappa_jet(
     let xx = point.dot(&point);
     // gauge = 1 + κ‖x‖²  (tower);  t = ‖v‖ / gauge = λ_x‖v‖/2.
     let gauge = kappa * xx + 1.0;
-    let t = gauge.recip() * n;
+    let t = kjet_recip(gauge) * n;
     // tn_κ(t) = t·S(κt²)/C(κt²), the primitives composed at the tower arg κt².
     let arg = kappa * (t * t);
     let (cstk, sstk) = cs_stacks(arg.v);
-    let c = arg.compose_unary(cstk);
+    let c = arg.compose_unary(stack2(cstk));
     if c.v.abs() <= GEOMETRY_EPS {
         return Err(GeometryError::Singular(
             "constant-curvature exp-jet at a conjugate point (cos(√κ t) = 0)",
         ));
     }
-    let s = arg.compose_unary(sstk);
-    let tn = t * s * c.recip();
+    let s = arg.compose_unary(stack2(sstk));
+    let tn = t * s * kjet_recip(c);
     // step = (tn / ‖v‖) · v   (tower vector; v is a chart constant).
     let scale = tn * (1.0 / n);
     let step: Vec<KJet> = (0..d).map(|i| scale * tangent_vec[i]).collect();
@@ -752,16 +763,16 @@ pub fn exp_map_kappa_jet(
     }
     let two_k_xs = (kappa * 2.0) * xs; // 2κ⟨x,step⟩
     // denom = 1 − 2κ⟨x,step⟩ + κ²‖x‖²‖step‖²  (no Sub on the tower; Neg+Add).
-    let denom = -two_k_xs + (kappa * kappa) * (ss * xx) + 1.0;
+    let denom = two_k_xs.scale(-1.0) + (kappa * kappa) * (ss * xx) + 1.0;
     if denom.v.abs() <= MOBIUS_DENOM_EPS {
         return Err(GeometryError::Singular(
             "Möbius addition at the κ>0 antipodal point",
         ));
     }
     // a = 1 − 2κ⟨x,step⟩ − κ‖step‖²;  b = 1 + κ‖x‖² = gauge.
-    let a = -two_k_xs + (-(kappa * ss)) + 1.0;
+    let a = two_k_xs.scale(-1.0) + (kappa * ss).scale(-1.0) + 1.0;
     let b = gauge;
-    let inv = denom.recip();
+    let inv = kjet_recip(denom);
     let mut value = Array1::zeros(d);
     let mut dk = Array1::zeros(d);
     let mut dkk = Array1::zeros(d);
