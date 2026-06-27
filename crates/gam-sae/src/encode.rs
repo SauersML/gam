@@ -1099,7 +1099,6 @@ fn refine_certified_start(
 /// basin boundary) is not steppable, so we stop and return `None` (flag). On
 /// success the start is then refined `newton_steps` further by
 /// [`refine_certified_start`].
-#[allow(clippy::too_many_arguments)]
 fn certify_with_basin_warmup(
     atom: &SaeManifoldAtom,
     evaluator: &dyn SaeBasisEvaluator,
