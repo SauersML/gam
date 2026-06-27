@@ -1907,7 +1907,7 @@ impl JeffreysHphiDriftBase {
 /// path; it prepares a [`JeffreysHphiDriftBase`] and applies one perturbation.
 /// The batched mode-response drift instead prepares the base ONCE and applies it
 /// across every direction (see `custom_family_outer_jeffreys_hphi_drift_batched`).
-pub(crate) fn joint_jeffreys_hphi_perturbation_derivative<BaseFn, PertFn>(
+pub fn joint_jeffreys_hphi_perturbation_derivative<BaseFn, PertFn>(
     h_joint: ArrayView2<'_, f64>,
     z_j: ArrayView2<'_, f64>,
     base_hessian_dir: BaseFn,

@@ -34,6 +34,14 @@ pub(crate) use dense::*;
 pub(crate) use kkt::*;
 pub(crate) use operator::*;
 pub(crate) use routing::*;
+// Surface the outer-Hessian routing predicates/thresholds publicly so the
+// relocated families' cross-crate regression tests (#1521 carve) reach them
+// through the flat `gam_solve::estimate::reml::reml_outer_engine::<Name>` path;
+// the `pub(crate) use routing::*` glob above otherwise caps them at crate scope.
+pub use routing::{
+    MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N, MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
+    OuterHessianRoutePlan, outer_hessian_route_plan, prefer_outer_hessian_operator,
+};
 pub(crate) use traces::*;
 
 // ═══════════════════════════════════════════════════════════════════════════

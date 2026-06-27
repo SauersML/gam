@@ -5,7 +5,7 @@
 
 use super::*;
 
-pub(crate) const JOINT_MATRIX_FREE_MIN_DIM: usize = 512;
+pub const JOINT_MATRIX_FREE_MIN_DIM: usize = 512;
 
 pub(crate) const JOINT_MATRIX_FREE_MIN_ROWS: usize = 50_000;
 

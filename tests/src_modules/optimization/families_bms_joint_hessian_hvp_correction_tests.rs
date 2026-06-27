@@ -136,10 +136,10 @@ fn make_flex_hvp_cache_test_family(
         weights: Arc::new(weights),
         z: Arc::new(z.clone()),
         gaussian_frailty_sd: Some(0.15),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             marginal_x.clone(),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             logslope_x.clone(),
         )),
         score_warp: Some(score_prepared.runtime.clone()),
@@ -899,10 +899,10 @@ fn bernoulli_large_scale_outer_derivatives_keep_analytic_hessian_route() {
     let (gradient, hessian) =
         crate::custom_family::custom_family_outer_derivatives(&family, &specs, &options);
 
-    assert_eq!(gradient, crate::solver::rho_optimizer::Derivative::Analytic);
+    assert_eq!(gradient, gam_problem::Derivative::Analytic);
     assert_eq!(
         hessian,
-        crate::solver::rho_optimizer::DeclaredHessianForm::Either
+        gam_problem::DeclaredHessianForm::Either
     );
 }
 
@@ -1099,10 +1099,10 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
         y: Arc::new(y),
         weights: Arc::new(weights),
         z: Arc::new(z),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             marginal.clone(),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(logslope)),
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(logslope)),
         ..default_test_family()
     };
 
@@ -1219,10 +1219,10 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
         );
 
         let hess_dense = match &contracted.hessian[i] {
-            crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Operator(op) => {
+            gam_problem::DriftDerivResult::Operator(op) => {
                 op.to_dense()
             }
-            crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult::Dense(m) => {
+            gam_problem::DriftDerivResult::Dense(m) => {
                 m.clone()
             }
         };
@@ -1251,9 +1251,9 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
 #[test]
 fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
     use crate::custom_family::CustomFamilyBlockPsiDerivative;
-    use crate::families::custom_family::{build_contracted_psi_hook, build_psi_pair_callbacks};
-    use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
-    use crate::solver::estimate::reml::reml_outer_engine::DriftDerivResult;
+    use gam_custom_family::{build_contracted_psi_hook, build_psi_pair_callbacks};
+    use gam_problem::DriftDerivResult;
+    use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 
     let n = 40usize;
     let y: Array1<f64> =
@@ -1273,10 +1273,10 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         y: Arc::new(y),
         weights: Arc::new(weights),
         z: Arc::new(z),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             marginal.clone(),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(logslope)),
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(logslope)),
         ..default_test_family()
     };
 
@@ -1526,11 +1526,9 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
 
 #[test]
 fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
-    use crate::families::custom_family::build_psi_hyper_coords;
-    use crate::solver::estimate::reml::penalty_logdet::PenaltyPseudologdet;
-    use crate::solver::estimate::reml::reml_outer_engine::{
-        DenseSpectralOperator, HessianOperator,
-    };
+    use gam_custom_family::build_psi_hyper_coords;
+    use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
+    use gam_solve::estimate::reml::reml_outer_engine::{DenseSpectralOperator, HessianOperator};
 
     let n = 32usize;
     let y: Array1<f64> =
@@ -1550,10 +1548,10 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
         y: Arc::new(y),
         weights: Arc::new(weights),
         z: Arc::new(z),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             marginal.clone(),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(logslope)),
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(logslope)),
         ..default_test_family()
     };
 
@@ -1816,16 +1814,22 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
 #[test]
 fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     use crate::custom_family::PenaltyMatrix;
-    use crate::families::custom_family::evaluate_custom_family_joint_hyper;
-    use crate::families::spatial_psi_bridge::build_block_spatial_psi_derivatives;
-    use crate::solver::estimate::reml::reml_outer_engine::EvalMode;
-    use crate::terms::basis::{CenterStrategy, MaternBasisSpec, MaternNu};
-    use crate::terms::smooth::{
+    use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
+    use gam_custom_family::evaluate_custom_family_joint_hyper;
+    use gam_problem::EvalMode;
+    use gam_terms::basis::{CenterStrategy, MaternBasisSpec, MaternNu};
+    use gam_terms::smooth::{
         ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, build_term_collection_design,
         freeze_term_collection_from_design,
     };
 
-    crate::init_parallelism();
+    // #1521 carve: the monolith's `gam::init_parallelism()` lives in the root
+    // `gam` crate, which this leaf (`gam-models`) cannot depend on. Its sampler/
+    // GPU/rho-posterior hook registrations are irrelevant to this FD-of-gradient
+    // joint-hyper test; the only numerically-relevant part is enabling faer's
+    // global Rayon parallelism, which we reproduce here (idempotent, first call
+    // wins) so the parallel matmul/factorization paths match the monolith run.
+    faer::set_global_parallelism(faer::Par::rayon(0));
 
     // Larger, well-identified, NON-separable fixture so the coupled
     // marginal-slope inner Newton converges (a hard-threshold y on small n +
@@ -1928,7 +1932,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
         let marginal_mat =
             Array2::from_shape_fn((n, 2), |(r, c)| if c == 0 { 1.0 } else { marginal_cov[r] });
         let marginal_design =
-            DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(marginal_mat));
+            DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(marginal_mat));
         let logslope_design = design.design.clone();
 
         let family = BernoulliMarginalSlopeFamily {
@@ -2025,7 +2029,7 @@ fn profiled_theta_hvp_outer_hessian_matches_fd_of_gradient_psi_and_mixed() {
     // #1165: assert the operator's single-vector HVP directly before dense
     // materialization can symmetrize/probe around a row-specific ψ correction.
     let hess0_operator = match &hess0 {
-        crate::solver::rho_optimizer::HessianResult::Operator(op) => Arc::clone(op),
+        gam_problem::HessianResult::Operator(op) => Arc::clone(op),
         other => panic!("ψ-active BMS outer Hessian must be an operator, got {other:?}"),
     };
     let hess0_dense = hess0
@@ -2182,7 +2186,7 @@ impl gam_math::jet_tower::RowNllProgram<2> for BernoulliRigidNllProgram {
 #[test]
 fn bernoulli_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
     use gam_math::jet_tower::{KernelChannels, evaluate_program, verify_kernel_channels};
-    use crate::families::row_kernel::RowKernel;
+    use crate::row_kernel::RowKernel;
 
     let n = 6usize;
     let dirs: [[f64; 2]; 3] = [[0.8, -0.6], [-0.35, 1.1], [1.4, 0.25]];
@@ -2275,7 +2279,7 @@ fn bernoulli_rigid_row_kernel_agrees_with_jet_tower_program_all_channels() {
 ///      Gram reduction order (same contract as `hessian_dense_blas3`).
 #[test]
 fn bernoulli_rigid_batched_all_axes_second_directional_matches_per_axis_scatter() {
-    use crate::families::row_kernel::{
+    use crate::row_kernel::{
         RowSet, row_kernel_second_directional_derivative,
         row_kernel_second_directional_derivative_all_axes,
     };
@@ -2389,7 +2393,7 @@ fn bernoulli_rigid_batched_all_axes_second_directional_matches_per_axis_scatter(
 ///      Gram reduction order (same contract as `hessian_dense_blas3`).
 #[test]
 fn bernoulli_rigid_batched_all_axes_first_directional_matches_per_axis_scatter() {
-    use crate::families::row_kernel::{
+    use crate::row_kernel::{
         RowSet, row_kernel_directional_derivative, row_kernel_directional_derivative_all_axes,
     };
 
@@ -2796,7 +2800,7 @@ fn score_zeta_sensitivity_equals_jacobian_transpose_of_mixed_z_partial() {
         )
         .expect("assemble correction");
     // PSD.
-    use crate::faer_ndarray::FaerEigh;
+    use gam_linalg::faer_ndarray::FaerEigh;
     let (evals, _) = term.eigh(faer::Side::Lower).expect("eig");
     let min_eval = evals.iter().fold(f64::INFINITY, |a, &b| a.min(b));
     assert!(

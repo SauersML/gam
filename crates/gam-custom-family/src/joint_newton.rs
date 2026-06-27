@@ -42,7 +42,7 @@ pub(crate) fn exact_newton_joint_hessian_symmetrized<
 // (`custom_family_blockwise`, re-exported as `gam_problem::ExactNewtonOuterCurvature`).
 // The carve left a byte-identical, never-referenced copy here; removed.
 
-pub(crate) enum JointHessianSource {
+pub enum JointHessianSource {
     Dense(Array2<f64>),
     Operator {
         apply: Arc<dyn Fn(&Array1<f64>) -> Result<Array1<f64>, String> + Send + Sync>,
@@ -234,7 +234,7 @@ pub(crate) fn materialize_joint_hessian_source(
     }
 }
 
-pub(crate) fn exact_newton_joint_hessian_source_from_workspace(
+pub fn exact_newton_joint_hessian_source_from_workspace(
     workspace: &Arc<dyn ExactNewtonJointHessianWorkspace>,
     total: usize,
     intent: MaterializationIntent,

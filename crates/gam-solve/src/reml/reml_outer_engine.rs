@@ -208,6 +208,12 @@ pub use hyper_operator::*;
 pub use inner_solution::*;
 pub(crate) use objective::*;
 pub(crate) use outer_derivatives::*;
+// Re-surface the outer-Hessian routing predicates/thresholds at the flat
+// `reml_outer_engine` namespace for the #1521-carve cross-crate family tests.
+pub use outer_derivatives::{
+    MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N, MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD,
+    OuterHessianRoutePlan, outer_hessian_route_plan, prefer_outer_hessian_operator,
+};
 pub use outer_entry_helpers::*;
 pub use penalty_coordinate::*;
 pub use sparse_cholesky_backends::*;

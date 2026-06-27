@@ -28,7 +28,7 @@ fn bernoulli_marginal_slope_probit_link() -> InverseLink {
 }
 
 fn dense_design(matrix: Array2<f64>) -> DesignMatrix {
-    DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(matrix))
+    DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(matrix))
 }
 
 fn test_family_with_dense_designs(
@@ -77,7 +77,7 @@ fn default_test_family() -> BernoulliMarginalSlopeFamily {
         logslope_design: empty_design,
         latent_measure: LatentMeasureKind::StandardNormal,
         gaussian_frailty_sd: None,
-        base_link: InverseLink::Standard(crate::types::StandardLink::Probit),
+        base_link: InverseLink::Standard(gam_spec::StandardLink::Probit),
         score_warp: None,
         link_dev: None,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
@@ -94,7 +94,7 @@ fn bernoulli_marginal_slope_outer_seed_config_screens_glm_stability_anchors() {
     let config = default_test_family().outer_seed_config(6);
     assert_eq!(
         config.risk_profile,
-        crate::seeding::SeedRiskProfile::GeneralizedLinear
+        gam_solve::seeding::SeedRiskProfile::GeneralizedLinear
     );
     assert_eq!(config.seed_budget, 1);
     // The BMS marginal-slope startup screen caps inner iterations at the first
@@ -106,7 +106,7 @@ fn bernoulli_marginal_slope_outer_seed_config_screens_glm_stability_anchors() {
     assert_eq!(config.screen_max_inner_iterations, 8);
     assert_eq!(config.max_seeds, 6);
 
-    let seeds = crate::seeding::generate_rho_candidates(6, None, &config);
+    let seeds = gam_solve::seeding::generate_rho_candidates(6, None, &config);
     for anchor in [2.0, 4.0] {
         assert!(
             seeds
@@ -368,7 +368,7 @@ fn cross_block_identifiability_anchor_wider_than_candidate_no_false_alias() {
     // a weighted projection (I − P_A) C and accepts directions with
     // positive eigenvalues of C̃ᵀ W C̃, so this case keeps a strictly
     // positive number of directions.
-    use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     let n = 64usize;
     let z = Array1::from_iter((0..n).map(|i| {
         let t = (i as f64) / (n as f64 - 1.0);
@@ -441,7 +441,7 @@ fn cross_block_identifiability_anchor_wider_than_candidate_no_false_alias() {
 /// except the one anchored column.
 #[test]
 fn cross_block_identifiability_minimal_counterexample_keeps_orthogonal_complement() {
-    use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     let n = 64usize;
     let z = Array1::from_iter((0..n).map(|i| {
         let t = (i as f64) / (n as f64 - 1.0);
@@ -525,7 +525,7 @@ fn cross_block_identifiability_minimal_counterexample_keeps_orthogonal_complemen
 /// `~ eps² · ‖C‖_F²`, well below `drop_tol = ‖C‖_F² · 64·n·eps²`.
 #[test]
 fn cross_block_identifiability_true_alias_returns_fully_aliased_outcome() {
-    use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     let n = 64usize;
     let z = Array1::from_iter((0..n).map(|i| {
         let t = (i as f64) / (n as f64 - 1.0);
@@ -656,8 +656,8 @@ fn cross_block_identifiability_outcome_fully_aliased_extracts_reason() {
 /// an ill-conditioned `AᵀWA` built from raw I-spline columns.
 #[test]
 fn cross_block_identifiability_partial_alias_keeps_residual_rank() {
-    use crate::faer_ndarray::FaerQr;
-    use crate::linalg::matrix::{DenseDesignMatrix, DesignMatrix};
+    use gam_linalg::faer_ndarray::FaerQr;
+    use gam_linalg::matrix::{DenseDesignMatrix, DesignMatrix};
     let n = 96usize;
     let z = Array1::from_iter((0..n).map(|i| {
         let t = (i as f64) / (n as f64 - 1.0);
@@ -832,10 +832,10 @@ fn bernoulli_margslope_warm_start_cache_persists_across_eval_cache_builds() {
             y: Arc::new(y.clone()),
             weights: Arc::new(weights.clone()),
             z: Arc::new(z.clone()),
-            marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
                 Array2::ones((n, 1)),
             )),
-            logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+            logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
                 Array2::ones((n, 1)),
             )),
             score_warp: Some(score_prepared.runtime.clone()),
@@ -922,10 +922,10 @@ fn bernoulli_margslope_flex_ll_early_exit_is_exact_or_provably_rejected() {
         y: Arc::new(y),
         weights: Arc::new(weights),
         z: Arc::new(z),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones(
             (n, 1),
         ))),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::ones(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::ones(
             (n, 1),
         ))),
         score_warp: Some(score_prepared.runtime.clone()),
@@ -2148,7 +2148,7 @@ fn score_warp_basis_smoothness_penalty_is_full_rank() {
     // Cross-check via eigendecomposition that all eigenvalues exceed the
     // numerical positive-eigenvalue threshold — confirms full rank
     // beyond the rank-reporting heuristic.
-    use crate::faer_ndarray::FaerEigh;
+    use gam_linalg::faer_ndarray::FaerEigh;
     let (evals, _) = penalty
         .eigh(faer::Side::Lower)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "eigendecomposition of transformed-basis penalty", e));
@@ -2156,7 +2156,7 @@ fn score_warp_basis_smoothness_penalty_is_full_rank() {
         .as_slice()
         .expect("contiguous transformed-basis penalty eigenvalues");
     let threshold =
-        crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
+        gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
     let smallest = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
         smallest > threshold,
@@ -2195,7 +2195,7 @@ fn link_deviation_basis_smoothness_penalty_is_full_rank() {
         "smoothness-null-space-drop basis must have zero nullity at the max configured \
              derivative order; got {nullity}"
     );
-    use crate::faer_ndarray::FaerEigh;
+    use gam_linalg::faer_ndarray::FaerEigh;
     let (evals, _) = penalty
         .eigh(faer::Side::Lower)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "eigendecomposition of transformed-basis penalty", e));
@@ -2203,7 +2203,7 @@ fn link_deviation_basis_smoothness_penalty_is_full_rank() {
         .as_slice()
         .expect("contiguous transformed-basis penalty eigenvalues");
     let threshold =
-        crate::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
+        gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(evals_slice);
     let smallest = evals_slice.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
         smallest > threshold,
@@ -2217,7 +2217,7 @@ fn bernoulli_marginal_slope_rejects_nonprobit_base_link() {
     let y = array![0.0, 1.0];
     let weights = array![1.0, 1.0];
     let z = array![-0.4, 0.9];
-    let design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]]));
+    let design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0], [1.0]]));
     let spec = BernoulliMarginalSlopeTermSpec {
         y,
         weights,
@@ -2462,10 +2462,10 @@ fn exact_layout_ignores_dummy_beta_widths_for_empty_design_blocks() {
         y: Arc::new(Array1::zeros(seed.len())),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
         score_warp: Some(score_prepared.runtime.clone()),
@@ -2526,10 +2526,10 @@ fn score_warp_block_exposes_structural_derivative_lower_bounds() {
         y: Arc::new(Array1::zeros(seed.len())),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
         score_warp: Some(prepared.runtime.clone()),
@@ -2577,10 +2577,10 @@ fn post_update_block_beta_rejects_infeasible_score_warp_step() {
         y: Arc::new(Array1::zeros(seed.len())),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
         score_warp: Some(prepared.runtime.clone()),
@@ -2818,7 +2818,7 @@ fn deviation_penalties_are_integrated_function_penalties() {
         .zip(prepared.block.nullspace_dims.iter())
         .zip(expected_orders.iter())
     {
-        let crate::solver::estimate::PenaltySpec::Dense(actual) = penalty else {
+        let gam_solve::estimate::PenaltySpec::Dense(actual) = penalty else {
             panic!("deviation penalties should be dense local Gram matrices");
         };
         let (expected, expected_nullity) = prepared
@@ -2839,7 +2839,7 @@ fn deviation_penalties_are_integrated_function_penalties() {
         }
     }
 
-    let crate::solver::estimate::PenaltySpec::Dense(l2_penalty) = &prepared.block.penalties[1]
+    let gam_solve::estimate::PenaltySpec::Dense(l2_penalty) = &prepared.block.penalties[1]
     else {
         panic!("deviation double penalty should be dense");
     };
@@ -3399,12 +3399,12 @@ fn observed_denested_partials_include_third_a_derivative_for_piecewise_cubic_lin
         y: Arc::new(array![0.0, 1.0, 1.0]),
         weights: Arc::new(array![1.0, 0.7, 1.3]),
         z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
         ])),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
@@ -3563,12 +3563,12 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
         y: Arc::new(array![0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(3)),
         z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
         ])),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
@@ -3624,11 +3624,11 @@ fn flexible_family_routes_outer_derivatives_by_scale() {
     );
     assert_eq!(
         large_flex_gradient,
-        crate::solver::rho_optimizer::Derivative::Analytic
+        gam_problem::Derivative::Analytic
     );
     assert_eq!(
         large_flex_hessian,
-        crate::solver::rho_optimizer::DeclaredHessianForm::Either
+        gam_problem::DeclaredHessianForm::Either
     );
 
     let mut large_rigid_family = large_flex_family.clone();
@@ -3658,9 +3658,8 @@ fn bms_advertises_exact_outer_hvp_and_plans_arc_outer_newton() {
     // kernels by the generic custom-family joint-hyper assembler — never a
     // finite-difference or quasi-Newton surrogate — so the REML/LAML optimum
     // is bit-identical to the first-order path.
-    use crate::solver::rho_optimizer::{
-        DeclaredHessianForm, Derivative, OuterCapability, Solver, plan,
-    };
+    use gam_problem::{DeclaredHessianForm, Derivative};
+    use gam_solve::rho_optimizer::{OuterCapability, Solver, plan};
 
     let arc_plan = |hessian: DeclaredHessianForm, n_params: usize, psi_dim: usize| {
         // `(Analytic, Either)` is matched as `(Analytic, Analytic)` by the
@@ -3741,11 +3740,11 @@ fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
     use crate::custom_family::{
         default_coefficient_hessian_cost, exact_outer_order_from_capability,
     };
-    use crate::matrix::DesignMatrix;
+    use gam_linalg::matrix::DesignMatrix;
     use ndarray::Array2;
 
     // Small problem (K=4, n=10, p=8): combined cost ≪ threshold → Second.
-    let small_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros(
+    let small_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros(
         (10, 8),
     )));
     let small_specs: Vec<ParameterBlockSpec> = (0..2)
@@ -3775,7 +3774,7 @@ fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
     // on a K²·n·p² work estimate. The new contract keeps exact analytic
     // Hessians exposed; representation and runtime cost are handled by the
     // Hessian operator layer.
-    let big_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+    let big_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
         5_000, 500,
     ))));
     let big_specs: Vec<ParameterBlockSpec> = (0..2)
@@ -3812,7 +3811,7 @@ fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
     // for no reason).
     let ctn_specs = vec![ParameterBlockSpec {
         name: "ctn".to_string(),
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
             1, 1,
         )))),
         offset: ndarray::Array1::zeros(1),
@@ -3844,7 +3843,7 @@ fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
     );
     let huge_k_specs = vec![ParameterBlockSpec {
         name: "k".to_string(),
-        design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
             1, 1,
         )))),
         offset: ndarray::Array1::zeros(1),
@@ -3869,7 +3868,7 @@ fn exact_outer_order_stays_second_order_at_large_scale_work_scale() {
 #[test]
 fn bernoulli_marginal_slope_coefficient_cost_uses_joint_coupled_formula() {
     use crate::custom_family::default_coefficient_hessian_cost;
-    use crate::matrix::DesignMatrix;
+    use gam_linalg::matrix::DesignMatrix;
 
     // Two-block rigid marginal-slope shape: marginal p=20, log-slope p=8,
     // n=1000. The default block-diagonal formula gives Σ n·p_b² =
@@ -3879,10 +3878,10 @@ fn bernoulli_marginal_slope_coefficient_cost_uses_joint_coupled_formula() {
     let n = 1000usize;
     let p_marg = 20usize;
     let p_log = 8usize;
-    let marg_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+    let marg_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
         n, p_marg,
     ))));
-    let log_design = DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::zeros((
+    let log_design = DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::zeros((
         n, p_log,
     ))));
     let family = BernoulliMarginalSlopeFamily {
@@ -3943,8 +3942,8 @@ fn rigid_fast_path_matches_loglik_finite_differences() {
         y: Arc::new(array![1.0]),
         weights: Arc::new(array![1.2]),
         z: Arc::new(array![0.3]),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
         ..default_test_family()
     };
     let states_at = |q: f64, g: f64| {
@@ -4066,10 +4065,10 @@ fn w_only_gradient_hessian_finite_and_symmetric() {
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
         link_dev: Some(prepared.runtime.clone()),
@@ -4161,10 +4160,10 @@ fn h_only_gradient_hessian_finite_and_symmetric() {
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
         score_warp: Some(prepared.runtime.clone()),
@@ -4251,10 +4250,10 @@ fn w_only_exact_outer_directional_derivatives_are_present_and_finite() {
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
         link_dev: Some(prepared.runtime.clone()),
@@ -4378,7 +4377,7 @@ fn h_only_exact_outer_directional_derivatives_are_present_and_finite() {
         .len();
     let beta_score = Array1::from_iter((0..score_dim).map(|idx| 0.04 * (idx as f64 + 1.0)));
     let scalar_design = || {
-        DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(Array2::from_elem(
+        DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::from_elem(
             (seed.len(), 1),
             1.0,
         )))
@@ -4486,10 +4485,10 @@ fn h_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
         score_warp: Some(prepared.runtime.clone()),
@@ -4602,10 +4601,10 @@ fn w_only_row_primary_higher_order_contractions_are_finite_and_symmetric() {
         y: Arc::new(array![0.0, 1.0, 0.0, 1.0, 0.0]),
         weights: Arc::new(Array1::ones(seed.len())),
         z: Arc::new(seed.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             Array2::zeros((seed.len(), 0)),
         )),
         link_dev: Some(prepared.runtime.clone()),
@@ -6059,12 +6058,12 @@ fn w_only_gradient_matches_loglik_finite_differences() {
         y: Arc::new(y.clone()),
         weights: Arc::new(weights.clone()),
         z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
         ])),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
@@ -6167,12 +6166,12 @@ fn h_only_gradient_matches_loglik_finite_differences() {
         y: Arc::new(y.clone()),
         weights: Arc::new(weights.clone()),
         z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
         ])),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
@@ -6284,12 +6283,12 @@ fn flexible_denested_gradient_matches_loglik_finite_differences() {
         y: Arc::new(y.clone()),
         weights: Arc::new(weights.clone()),
         z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
         ])),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
@@ -6427,12 +6426,12 @@ fn flexible_exact_outer_directional_derivatives_are_present_and_finite() {
         y: Arc::new(y.clone()),
         weights: Arc::new(weights.clone()),
         z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
         ])),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(array![
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![
             [1.0],
             [1.0],
             [1.0]
@@ -6558,10 +6557,10 @@ fn flexible_evaluate_block_diagonals_match_joint_exact_oracle() {
         y: Arc::new(y.clone()),
         weights: Arc::new(weights.clone()),
         z: Arc::new(z.clone()),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             marginal_x.clone(),
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             logslope_x.clone(),
         )),
         score_warp: Some(score_prepared.runtime.clone()),
@@ -7703,10 +7702,10 @@ fn make_block_psi_test_family(n: usize) -> BernoulliMarginalSlopeFamily {
         y: Arc::new(y),
         weights: Arc::new(weights),
         z: Arc::new(z),
-        marginal_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        marginal_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             marginal_design,
         )),
-        logslope_design: DesignMatrix::Dense(crate::matrix::DenseDesignMatrix::from(
+        logslope_design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(
             logslope_design,
         )),
         ..default_test_family()

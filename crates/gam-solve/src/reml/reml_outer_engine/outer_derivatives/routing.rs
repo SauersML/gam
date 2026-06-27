@@ -15,11 +15,11 @@ pub(crate) const MATRIX_FREE_OUTER_HESSIAN_DIM_THRESHOLD: usize = 512;
 /// Sample-count threshold for the (`n`, `p`) crossover branch: when `n` is
 /// large enough that per-row work dominates, the operator path wins even
 /// at moderate `p`.
-pub(crate) const MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD: usize = 50_000;
+pub const MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD: usize = 50_000;
 
 /// Coefficient dimension paired with [`MATRIX_FREE_OUTER_HESSIAN_LARGE_N_THRESHOLD`]
 /// in the (`n`, `p`) crossover branch.
-pub(crate) const MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N: usize = 32;
+pub const MATRIX_FREE_OUTER_HESSIAN_DIM_AT_LARGE_N: usize = 32;
 
 /// `n · p` linear-work cutoff: per-eval `O(K · n · p²)` dense assembly
 /// dominates once `n · p` crosses this threshold even when both `n` and `p`
@@ -52,11 +52,11 @@ pub(crate) const STOCHASTIC_TRACE_DIM_THRESHOLD: usize = 500;
 pub(crate) const REML_TRACE_SLOW_LOG_MS: f64 = 100.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct OuterHessianRoutePlan {
-    pub(crate) use_operator: bool,
-    pub(crate) reason: &'static str,
-    pub(crate) scale_prefers_operator: bool,
-    pub(crate) dense_workspace_bytes: usize,
+pub struct OuterHessianRoutePlan {
+    pub use_operator: bool,
+    pub reason: &'static str,
+    pub scale_prefers_operator: bool,
+    pub dense_workspace_bytes: usize,
 }
 
 impl OuterHessianRoutePlan {
@@ -175,7 +175,7 @@ pub(crate) fn callback_outer_hessian_scale_decision(
     }
 }
 
-pub(crate) fn outer_hessian_route_plan(
+pub fn outer_hessian_route_plan(
     n: usize,
     p: usize,
     k: usize,
@@ -216,7 +216,7 @@ pub(crate) fn outer_hessian_route_plan(
 /// representation, never capability — the operator path delivers the same
 /// math as the dense path while avoiding large dense `p × p` drift storage
 /// and pairwise row assembly when the model says those dominate.
-pub(crate) fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> bool {
+pub fn prefer_outer_hessian_operator(n: usize, p: usize, k: usize) -> bool {
     generic_outer_hessian_scale_decision(n, p, k).prefers_operator
 }
 

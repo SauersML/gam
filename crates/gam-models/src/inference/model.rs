@@ -4678,6 +4678,7 @@ mod tests {
             penalized_objective: 0.0,
             used_device: false,
             outer_iterations: 0,
+            outer_cost_evals: 0,
             outer_converged: true,
             outer_gradient_norm: None,
             standard_deviation: 1.0,
