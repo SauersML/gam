@@ -243,16 +243,25 @@ impl crate::jet_algebra::JetAlgebra<DERIVS> for MultiDirJet {
     }
 }
 
+/// A flattened set-partition table for a fixed slot count. `parts[i] = (off,
+/// order)` describes one partition: its `order` block submasks (compacted) are
+/// `flat[off .. off + order]`. Flattening keeps the hot composition loop on one
+/// contiguous slice instead of chasing per-partition `Vec` pointers.
+struct PartTable {
+    flat: Vec<u32>,
+    parts: Vec<(usize, u8)>,
+}
+
 thread_local! {
-    /// Cached set-partition tables, indexed by slot count `m`. Entry `m` lists
+    /// Cached set-partition tables, indexed by slot count `m`. Entry `m` holds
     /// every partition of `{0..m}` into `< DERIVS` blocks, in the shared
-    /// walker's recursion order, each block stored as a compacted submask. Pure
-    /// function of `m`, so caching is sound and deterministic.
-    static PARTITION_TABLES: RefCell<Vec<Rc<Vec<Vec<u32>>>>> = const { RefCell::new(Vec::new()) };
+    /// walker's recursion order, each block a compacted submask. Pure function
+    /// of `m`, so caching is sound and deterministic.
+    static PARTITION_TABLES: RefCell<Vec<Rc<PartTable>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Return cached partition tables for slot counts `0..=n_dirs`.
-fn partition_tables(n_dirs: usize) -> Vec<Rc<Vec<Vec<u32>>>> {
+fn partition_tables(n_dirs: usize) -> Vec<Rc<PartTable>> {
     PARTITION_TABLES.with(|cell| {
         let mut tables = cell.borrow_mut();
         while tables.len() <= n_dirs {
@@ -266,9 +275,9 @@ fn partition_tables(n_dirs: usize) -> Vec<Rc<Vec<Vec<u32>>>> {
 /// Enumerate the set-partitions of `{0..m}` with fewer than `DERIVS` blocks, in
 /// the exact DFS order of [`crate::jet_algebra`]'s `for_each_partition`
 /// recursion ("place each element into an existing block, else open a new one"),
-/// each block recorded as a compacted submask of `{0..m}`.
-fn build_partitions(m: usize) -> Vec<Vec<u32>> {
-    fn recurse(elem: usize, m: usize, blocks: &mut [u32; 8], n_blocks: usize, out: &mut Vec<Vec<u32>>) {
+/// each block recorded as a compacted submask of `{0..m}`, flattened.
+fn build_partitions(m: usize) -> PartTable {
+    fn recurse(elem: usize, m: usize, blocks: &mut [u32; 8], n_blocks: usize, out: &mut PartTable) {
         // Partitions with `>= DERIVS` blocks are truncated (their `f^{(order)}`
         // is beyond the stack); the block count never decreases, so the whole
         // subtree contributes nothing and is pruned — matching the walker's
@@ -277,7 +286,9 @@ fn build_partitions(m: usize) -> Vec<Vec<u32>> {
             return;
         }
         if elem == m {
-            out.push(blocks[..n_blocks].to_vec());
+            let off = out.flat.len();
+            out.flat.extend_from_slice(&blocks[..n_blocks]);
+            out.parts.push((off, n_blocks as u8));
             return;
         }
         for b in 0..n_blocks {
@@ -288,7 +299,10 @@ fn build_partitions(m: usize) -> Vec<Vec<u32>> {
         blocks[n_blocks] = 1u32 << elem;
         recurse(elem + 1, m, blocks, n_blocks + 1, out);
     }
-    let mut out = Vec::new();
+    let mut out = PartTable {
+        flat: Vec::new(),
+        parts: Vec::new(),
+    };
     let mut blocks = [0u32; 8];
     recurse(0, m, &mut blocks, 0, &mut out);
     out
