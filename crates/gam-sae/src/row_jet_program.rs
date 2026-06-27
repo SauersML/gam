@@ -1073,8 +1073,8 @@ impl SaeReconstructionRowProgram {
     /// the caller can fall back to the scalar per-row path.
     #[must_use]
     pub fn reconstruction_all_columns_batch4<const K: usize>(
-        rows: [&Self; LANES],
-    ) -> Option<[Vec<Order2<K>>; LANES]> {
+        rows: [&Self; 4],
+    ) -> Option<[Vec<Order2<K>>; 4]> {
         let head = rows[0];
         if head.n_primaries != K {
             return None;
@@ -1134,9 +1134,9 @@ impl SaeReconstructionRowProgram {
     /// rows are not softmax-aligned.
     #[must_use]
     pub fn beta_border_order1_batch4<const K: usize>(
-        rows: [&Self; LANES],
+        rows: [&Self; 4],
         channels: &[(usize, usize)],
-    ) -> Option<[Vec<Order1<K>>; LANES]> {
+    ) -> Option<[Vec<Order1<K>>; 4]> {
         let head = rows[0];
         if head.n_primaries != K {
             return None;

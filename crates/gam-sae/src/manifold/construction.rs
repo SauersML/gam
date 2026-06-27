@@ -7619,15 +7619,30 @@ impl SaeManifoldTerm {
         let mut trace = 0.0_f64;
         // #1557 — reuse one K-sized scratch row across all N rows (alias-free).
         let mut assignments = Array1::<f64>::zeros(self.k_atoms());
+        // #932 SIMD: jets are built in aligned 4-row SIMD batches through a
+        // bounded (≤4-row) look-ahead window; unaligned / non-softmax / remainder
+        // rows fall back to the scalar per-row path (bit-identical either way).
+        let mut jet_window: std::collections::VecDeque<SaeRowJets> =
+            std::collections::VecDeque::new();
+        let mut jet_window_next = 0usize;
         for row in 0..n {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
-            let vars = self.row_vars_for_cache_row(row, cache)?;
             let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
             self.assignment
                 .try_assignments_row_for_rho_into(row, rho, a_scratch)?;
-            let jets =
-                self.row_jets_for_logdet(rho, row, vars, assignments.view(), &second_jets, &border)?;
+            if jet_window.is_empty() {
+                jet_window_next = self.refill_jet_window(
+                    rho,
+                    jet_window_next,
+                    n,
+                    cache,
+                    &second_jets,
+                    &border,
+                    &mut jet_window,
+                )?;
+            }
+            let jets = jet_window.pop_front().expect("jet window must be non-empty");
             // Atom index (k-weight) of each local t-var.
             let var_atom: Vec<usize> = jets
                 .vars
@@ -8277,6 +8292,164 @@ impl SaeManifoldTerm {
         })
     }
 
+    /// Build [`SaeRowJets`] for FOUR rows at once via the 4-row SIMD batch
+    /// (#932), returning `None` (so the caller falls back to the scalar per-row
+    /// `row_jets_for_logdet`) when the four rows are not softmax-aligned (same
+    /// primary layout / temperature). Each lane's `SaeRowJets` is BIT-IDENTICAL
+    /// to `row_jets_for_logdet` on that row: the batch primitives
+    /// (`reconstruction_all_columns_batch4` / `beta_border_order1_batch4`) are
+    /// proven lane-`i` `to_bits`-identical to the scalar `*_packed` paths, and the
+    /// `√w` / `output_c` scaling here mirrors the scalar fills term-for-term.
+    fn row_jets_for_logdet_batch4(
+        &self,
+        rho: &SaeManifoldRho,
+        rows: [usize; 4],
+        cache: &ArrowFactorCache,
+        second_jets: &[Array4<f64>],
+        border: &[SaeBorderChannel],
+    ) -> Result<Option<[SaeRowJets; 4]>, String> {
+        let p = self.output_dim();
+        let k_atoms = self.k_atoms();
+        let mut progs: Vec<crate::row_jet_program::SaeReconstructionRowProgram> =
+            Vec::with_capacity(4);
+        let mut vars_each: Vec<Vec<SaeLocalRowVar>> = Vec::with_capacity(4);
+        let mut sqrt_w = [1.0_f64; 4];
+        for (i, &row) in rows.iter().enumerate() {
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            let mut a = Array1::<f64>::zeros(k_atoms);
+            self.assignment.try_assignments_row_for_rho_into(
+                row,
+                rho,
+                a.as_slice_mut().expect("contiguous assignment scratch"),
+            )?;
+            let prog =
+                self.reconstruction_row_program_for_logdet(rho, row, &vars, a.view(), second_jets)?;
+            sqrt_w[i] = self
+                .row_loss_weights
+                .as_deref()
+                .map_or(1.0, |w| w[row].sqrt());
+            vars_each.push(vars);
+            progs.push(prog);
+        }
+        let refs = [&progs[0], &progs[1], &progs[2], &progs[3]];
+        macro_rules! dispatch {
+            ($($k:literal),* $(,)?) => {
+                match progs[0].n_primaries {
+                    $( $k => Self::batch4_assemble::<$k>(refs, &vars_each, &sqrt_w, border, p), )*
+                    _ => Ok(None),
+                }
+            };
+        }
+        dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
+    }
+
+    /// Assemble the four lanes of a SIMD batch into per-row [`SaeRowJets`],
+    /// applying the identical `√w` / `output_c` scaling the scalar fills use.
+    /// Returns `None` if the rows are not batchable (the batch primitives
+    /// decline), so the caller can fall back to scalar.
+    fn batch4_assemble<const K: usize>(
+        rows: [&crate::row_jet_program::SaeReconstructionRowProgram; 4],
+        vars_each: &[Vec<SaeLocalRowVar>],
+        sqrt_w: &[f64; 4],
+        border: &[SaeBorderChannel],
+        p: usize,
+    ) -> Result<Option<[SaeRowJets; 4]>, String> {
+        use crate::row_jet_program::SaeReconstructionRowProgram;
+        let recon = match SaeReconstructionRowProgram::reconstruction_all_columns_batch4::<K>(rows) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        let chans: Vec<(usize, usize)> = border.iter().map(|c| (c.atom, c.basis_col)).collect();
+        let bjets = match SaeReconstructionRowProgram::beta_border_order1_batch4::<K>(rows, &chans) {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let mut outs: Vec<SaeRowJets> = Vec::with_capacity(4);
+        for lane in 0..4 {
+            let sqrt = sqrt_w[lane];
+            let mut first = vec![vec![0.0_f64; p]; K];
+            let mut second = vec![vec![vec![0.0_f64; p]; K]; K];
+            for (out_col, tower) in recon[lane].iter().enumerate() {
+                let g = tower.g();
+                let h = tower.h();
+                for a in 0..K {
+                    first[a][out_col] = sqrt * g[a];
+                    for b in 0..K {
+                        second[a][b][out_col] = sqrt * h[a][b];
+                    }
+                }
+            }
+            let mut beta = vec![vec![0.0_f64; p]; border.len()];
+            let mut beta_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; K];
+            let mut beta_l_deriv = vec![vec![vec![0.0_f64; p]; border.len()]; K];
+            for (beta_pos, channel) in border.iter().enumerate() {
+                let s = &bjets[lane][beta_pos];
+                let s_v = s.value();
+                let s_g = s.g();
+                for out_col in 0..p {
+                    let out_c = channel.output[out_col];
+                    beta[beta_pos][out_col] = sqrt * s_v * out_c;
+                    for a in 0..K {
+                        let mixed = sqrt * s_g[a] * out_c;
+                        beta_deriv[a][beta_pos][out_col] = mixed;
+                        beta_l_deriv[a][beta_pos][out_col] = mixed;
+                    }
+                }
+            }
+            outs.push(SaeRowJets {
+                vars: vars_each[lane].clone(),
+                first,
+                second,
+                beta,
+                beta_deriv,
+                beta_l_deriv,
+            });
+        }
+        let arr: [SaeRowJets; 4] = outs
+            .try_into()
+            .map_err(|_| "batch4_assemble produced wrong lane count".to_string())?;
+        Ok(Some(arr))
+    }
+
+    /// Refill the bounded (≤4-row) look-ahead jet window starting at `start`,
+    /// using the 4-row SIMD batch when the next four rows are softmax-aligned and
+    /// falling back to one scalar row otherwise (also the `<4` remainder).
+    /// Returns the next unbuilt row index. Bit-identical to per-row
+    /// `row_jets_for_logdet` either way.
+    fn refill_jet_window(
+        &self,
+        rho: &SaeManifoldRho,
+        start: usize,
+        n: usize,
+        cache: &ArrowFactorCache,
+        second_jets: &[Array4<f64>],
+        border: &[SaeBorderChannel],
+        window: &mut std::collections::VecDeque<SaeRowJets>,
+    ) -> Result<usize, String> {
+        if start + 4 <= n {
+            if let Some(batch) = self.row_jets_for_logdet_batch4(
+                rho,
+                [start, start + 1, start + 2, start + 3],
+                cache,
+                second_jets,
+                border,
+            )? {
+                window.extend(batch);
+                return Ok(start + 4);
+            }
+        }
+        let vars = self.row_vars_for_cache_row(start, cache)?;
+        let mut a = Array1::<f64>::zeros(self.k_atoms());
+        self.assignment.try_assignments_row_for_rho_into(
+            start,
+            rho,
+            a.as_slice_mut().expect("contiguous assignment scratch"),
+        )?;
+        let jets = self.row_jets_for_logdet(rho, start, vars, a.view(), second_jets, border)?;
+        window.push_back(jets);
+        Ok(start + 1)
+    }
+
     pub(crate) fn assignment_prior_hdiag_derivative_entry(
         &self,
         rho: &SaeManifoldRho,
@@ -8561,15 +8734,30 @@ impl SaeManifoldTerm {
 
         // #1557 — reuse one K-sized scratch row across all N rows (alias-free).
         let mut assignments = Array1::<f64>::zeros(self.k_atoms());
+        // #932 SIMD: jets are built in aligned 4-row SIMD batches through a
+        // bounded (≤4-row) look-ahead window; unaligned / non-softmax / remainder
+        // rows fall back to the scalar per-row path (bit-identical either way).
+        let mut jet_window: std::collections::VecDeque<SaeRowJets> =
+            std::collections::VecDeque::new();
+        let mut jet_window_next = 0usize;
         for row in 0..n {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
-            let vars = self.row_vars_for_cache_row(row, cache)?;
             let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
             self.assignment
                 .try_assignments_row_for_rho_into(row, rho, a_scratch)?;
-            let jets =
-                self.row_jets_for_logdet(rho, row, vars, assignments.view(), &second_jets, &border)?;
+            if jet_window.is_empty() {
+                jet_window_next = self.refill_jet_window(
+                    rho,
+                    jet_window_next,
+                    n,
+                    cache,
+                    &second_jets,
+                    &border,
+                    &mut jet_window,
+                )?;
+            }
+            let jets = jet_window.pop_front().expect("jet window must be non-empty");
 
             let mut inv_vv = Array2::<f64>::zeros((q, q));
             let mut inv_vbeta = Array2::<f64>::zeros((q, cache.k));
@@ -8872,15 +9060,30 @@ impl SaeManifoldTerm {
         let mut error = Array1::<f64>::zeros(p);
         // #1557 — reuse one K-sized scratch row across all N rows (alias-free).
         let mut assignments = Array1::<f64>::zeros(self.k_atoms());
+        // #932 SIMD: jets are built in aligned 4-row SIMD batches through a
+        // bounded (≤4-row) look-ahead window; unaligned / non-softmax / remainder
+        // rows fall back to the scalar per-row path (bit-identical either way).
+        let mut jet_window: std::collections::VecDeque<SaeRowJets> =
+            std::collections::VecDeque::new();
+        let mut jet_window_next = 0usize;
         for row in 0..n {
             let q = cache.row_dims[row];
             let base = cache.row_offsets[row];
-            let vars = self.row_vars_for_cache_row(row, cache)?;
             let a_scratch = assignments.as_slice_mut().expect("contiguous scratch");
             self.assignment
                 .try_assignments_row_for_rho_into(row, rho, a_scratch)?;
-            let jets =
-                self.row_jets_for_logdet(rho, row, vars, assignments.view(), &second_jets, &border)?;
+            if jet_window.is_empty() {
+                jet_window_next = self.refill_jet_window(
+                    rho,
+                    jet_window_next,
+                    n,
+                    cache,
+                    &second_jets,
+                    &border,
+                    &mut jet_window,
+                )?;
+            }
+            let jets = jet_window.pop_front().expect("jet window must be non-empty");
             let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
 
             // √w-scaled metric-applied per-row residual `error_metric = √w·M_n r_n`
