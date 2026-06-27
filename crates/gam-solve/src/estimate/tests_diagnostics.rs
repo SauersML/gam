@@ -6,6 +6,7 @@
 //! differences from the test crate. They are compiled only under `cfg(test)`.
 
 use super::*;
+use super::joint_hyper::ExternalJointHyperEvaluator;
 
 impl<'a> ExternalJointHyperEvaluator<'a> {
     /// DEBUG ONLY: run PIRLS at `theta` (cost-only path) and return the dense

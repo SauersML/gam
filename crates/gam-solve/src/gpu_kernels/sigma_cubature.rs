@@ -184,6 +184,7 @@ fn validate_sigma_point_inputs(p: usize, per_sigma: &[SigmaPointGpuInput]) -> Re
 mod linux_impl {
     use crate::gpu_kernels::pirls_row::{CurvatureMode, PirlsRowFamily};
     use crate::gpu_kernels::sigma_cubature::SigmaPointGpuInput;
+    use gam_gpu::gpu_error::GpuError;
     use gam_gpu::policy::{PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
     use gam_linalg::utils::matrix_inversewith_regularization;
     use ndarray::{Array1, Array2, ArrayView1};
@@ -231,7 +232,7 @@ mod linux_impl {
         gamma_shape: f64,
         convergence_tol: f64,
         max_iter: usize,
-    ) -> Result<Option<Vec<SigmaPointResult>>, crate::GpuError> {
+    ) -> Result<Option<Vec<SigmaPointResult>>, GpuError> {
         use crate::gpu_kernels::sigma_cubature::pool_size;
         use crate::gpu::pirls_gpu;
 
@@ -357,7 +358,7 @@ mod linux_impl {
         offset: ArrayView1<'_, f64>,
         per_sigma: &[SigmaPointGpuInput],
         p: usize,
-    ) -> Result<Option<Vec<SigmaPointResult>>, crate::GpuError> {
+    ) -> Result<Option<Vec<SigmaPointResult>>, GpuError> {
         use ndarray::Array1;
         // XᵀWX = Xᵀ·diag(prior_w)·X (constant across all sigma points).
         // Computed on the GPU via weighted_crossprod_gpu.

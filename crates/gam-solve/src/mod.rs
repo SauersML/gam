@@ -44,7 +44,6 @@ pub(crate) mod rho_prior_eval;
 pub mod rho_uncertainty;
 pub mod residual_cascade;
 pub mod rho_optimizer;
-pub(crate) use gam_problem::riemannian_retraction;
 // The `#[macro_export]` error-bail macros live in `gam-problem` (its crate
 // root). Importing them here makes `crate::bail_invalid_estim!` /
 // `crate::bail_dim_custom!` resolve at every gam-solve call site exactly as

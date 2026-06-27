@@ -1010,7 +1010,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
         // ── 2. Allocate Z (p, K) and fill with Rademacher entries on device.
         let total_z = p
             .checked_mul(k)
-            .ok_or_else(|| gpu_err!("reml_trace Z size overflow: p={p}, K={k}"))?;
+            .ok_or_else(|| gam_gpu::gpu_err!("reml_trace Z size overflow: p={p}, K={k}"))?;
         let mut z_dev = stream
             .alloc_zeros::<f64>(total_z)
             .gpu_ctx("reml_trace alloc Z")?;
@@ -1061,7 +1061,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     .map_err(|reason| GpuError::DriverCallFailed { reason })?;
                 let mut y_dev = stream
                     .alloc_zeros::<f64>(total_z)
-                    .map_err(|err| gpu_err!("reml_trace alloc Y_j (j={j}): {err}"))?;
+                    .map_err(|err| gam_gpu::gpu_err!("reml_trace alloc Y_j (j={j}): {err}"))?;
                 gemm_nn(
                     &blas,
                     GemmShape {
@@ -1112,7 +1112,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
             let mut rz_dev = stream
                 .alloc_zeros::<f64>(
                     n.checked_mul(k)
-                        .ok_or_else(|| gpu_err!("reml_trace RZ overflow: n={n}, K={k}"))?,
+                        .ok_or_else(|| gam_gpu::gpu_err!("reml_trace RZ overflow: n={n}, K={k}"))?,
                 )
                 .gpu_ctx("reml_trace alloc RZ")?;
             let mut rw_dev = stream
@@ -1167,7 +1167,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                     );
                 };
                 let slice = row_weights.as_slice().ok_or_else(|| {
-                    gpu_err!("reml_trace structural H_j={j} row_weights not contiguous")
+                    gam_gpu::gpu_err!("reml_trace structural H_j={j} row_weights not contiguous")
                 })?;
                 a_stack.extend_from_slice(slice);
             }
@@ -1175,7 +1175,7 @@ extern "C" __global__ void reduce_q_weighted_gram(
                 .map_err(|reason| GpuError::DriverCallFailed { reason })?;
             let mut q_dev = stream
                 .alloc_zeros::<f64>(d_gram * k)
-                .map_err(|err| gpu_err!("reml_trace alloc Q_gram: {err}"))?;
+                .map_err(|err| gam_gpu::gpu_err!("reml_trace alloc Q_gram: {err}"))?;
             launch_reduce_q_weighted_gram(
                 &stream,
                 module_handle,
