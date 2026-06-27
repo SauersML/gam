@@ -48,6 +48,22 @@ fn main() {
     let truth_grid: Vec<f64> = x_grid.iter().map(|&t| truth(t)).collect();
     let edge = grid_n / 10;
 
+    // Dump the exact (x,y) data and the (x_grid, truth_grid) so an external R
+    // run can fit mgcv on the identical data and report its converged range/edf.
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create("/tmp/matern_nu_data.csv").unwrap();
+        writeln!(f, "x,y").unwrap();
+        for i in 0..n {
+            writeln!(f, "{},{}", x[i], y[i]).unwrap();
+        }
+        let mut g = std::fs::File::create("/tmp/matern_nu_grid.csv").unwrap();
+        writeln!(g, "xg,truth").unwrap();
+        for i in 0..grid_n {
+            writeln!(g, "{},{}", x_grid[i], truth_grid[i]).unwrap();
+        }
+    }
+
     let fit_grid = |formula: &str| -> Option<(Vec<f64>, f64, Option<f64>, Vec<f64>, f64)> {
         let cfg = FitConfig {
             family: Some("gaussian".to_string()),
