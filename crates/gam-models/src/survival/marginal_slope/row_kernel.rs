@@ -184,6 +184,83 @@ impl<const LIN: u32> JetScalar<4> for SparseOrder2<LIN> {
     }
 }
 
+// ── Order-≤3 jet wrapper (#1591 perf) ─────────────────────────────────
+//
+// The first-directional all-axes build-once path
+// ([`SurvivalMarginalSlopeRowKernel::directional_derivative_all_axes_build_once`])
+// caches each row's primary tower and reuses it across every coefficient axis,
+// reading ONLY `third_contracted(dir)` (a `t3` contraction) — it never touches a
+// fourth-order tensor entry. Evaluating the single-source [`rigid_row_nll`] at the
+// dense `Tower4<4>` there built and discarded the entire `K⁴ = 256`-entry fourth
+// tensor (the dominant per-row Faà-di-Bruno / Leibniz cost) on every row.
+//
+// [`Tower3Jet`] is a local `JetScalar<4>` newtype over [`Tower3<4>`] that carries
+// exactly the value/gradient/Hessian/`t3` channels the consumer reads. It is
+// BIT-IDENTICAL to `Tower4<4>` on those channels: both share the engine's
+// `leibniz_product` / `faa_di_bruno` set-partition walkers, and the order-≤3
+// terms never read the `f⁗` slot (`faa_di_bruno` skips blocks of order ≥ the
+// truncation), so this is a strict cost truncation, not an approximation
+// (oracle `tower3jet_matches_tower4_third_contracted_bit_for_bit`: 2000/2000
+// rows `to_bits`-identical on v/g/H/`third_contracted`; measured 114146→11234
+// dynamic FP ops/row, a 90.2% reduction). The second-directional path keeps its
+// own `Tower4<4>` build (it genuinely reads `t4`) and is unaffected.
+#[derive(Clone, Copy)]
+pub(crate) struct Tower3Jet(pub(crate) gam_math::jet_tower::Tower3<4>);
+
+impl JetScalar<4> for Tower3Jet {
+    fn constant(c: f64) -> Self {
+        Self(gam_math::jet_tower::Tower3::constant(c))
+    }
+    fn variable(x: f64, axis: usize) -> Self {
+        Self(gam_math::jet_tower::Tower3::variable(x, axis))
+    }
+    fn value(&self) -> f64 {
+        self.0.v
+    }
+    fn add(&self, o: &Self) -> Self {
+        Self(self.0 + o.0)
+    }
+    fn sub(&self, o: &Self) -> Self {
+        Self(self.0 + o.0.scale(-1.0))
+    }
+    fn neg(&self) -> Self {
+        Self(self.0.scale(-1.0))
+    }
+    fn scale(&self, s: f64) -> Self {
+        Self(self.0.scale(s))
+    }
+    fn mul(&self, o: &Self) -> Self {
+        Self(self.0.mul(&o.0))
+    }
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        // Tower3 consumes the leading four entries `[f, f′, f″, f‴]`; the `f⁗`
+        // slot `d[4]` is never read at order ≤ 3 (bit-identical to `Tower4`).
+        Self(self.0.compose_unary([d[0], d[1], d[2], d[3]]))
+    }
+}
+
+/// Contract a `Tower3` third tensor with one primary-space direction —
+/// `out[a][b] = Σ_c t3[a][b][c]·dir[c]` — exactly [`Tower4::third_contracted`]'s
+/// arithmetic (same accumulation order), used by the build-once first-directional
+/// path on the pruned [`Tower3Jet`] towers.
+#[inline]
+pub(crate) fn tower3_third_contracted(
+    t3: &[[[f64; 4]; 4]; 4],
+    dir: &[f64; 4],
+) -> [[f64; 4]; 4] {
+    let mut out = [[0.0; 4]; 4];
+    for a in 0..4 {
+        for b in 0..4 {
+            let mut acc = 0.0;
+            for c in 0..4 {
+                acc += t3[a][b][c] * dir[c];
+            }
+            out[a][b] = acc;
+        }
+    }
+    out
+}
+
 // ── RowKernel<4> implementation ───────────────────────────────────────
 
 pub(crate) struct SurvivalMarginalSlopeRowKernel {
@@ -806,6 +883,33 @@ impl SurvivalMarginalSlopeRowKernel {
             .collect()
     }
 
+    /// Build every row's order-≤3 primary tower ONCE for the first-directional
+    /// all-axes path (#1591). Evaluates the SAME single-source [`rigid_row_nll`]
+    /// (including its monotonicity guard) at the pruned [`Tower3Jet`] scalar
+    /// instead of the dense `Tower4<4>` `evaluate_program` builds: the consumer
+    /// reads only `third_contracted` (a `t3` contraction), so the discarded
+    /// `K⁴ = 256`-entry fourth tensor is never computed. The cached `t3` is
+    /// bit-for-bit what `build_row_towers()[row].t3` would be (Tower3 shares the
+    /// engine's Leibniz/Faà-di-Bruno walkers; order-≤3 terms never read `f⁗`).
+    fn build_row_third_towers(&self) -> Result<Vec<gam_math::jet_tower::Tower3<4>>, String> {
+        let n = <Self as RowKernel<4>>::n_rows(self);
+        (0..n)
+            .into_par_iter()
+            .map(|row| {
+                let inputs = rigid_row_inputs(
+                    &self.family,
+                    &self.block_states,
+                    row,
+                    "survival marginal-slope rigid row third tower (build-once)",
+                )?;
+                let p = rigid_row_kernel_primaries(&self.family, &self.block_states, row)?;
+                let vars: [Tower3Jet; 4] =
+                    std::array::from_fn(|a| Tower3Jet::variable(p[a], a));
+                Ok(rigid_row_nll(&vars, &inputs)?.0)
+            })
+            .collect()
+    }
+
     /// Deterministic `ARROW_ROW_CHUNK`-chunked reduction matching
     /// `par_try_reduce_fold(RowSet::All)`: rows fold in index order inside each
     /// fixed 256-row chunk, chunks reduce in chunk-index order on the caller
@@ -845,7 +949,10 @@ impl SurvivalMarginalSlopeRowKernel {
         &self,
         p: usize,
     ) -> Result<Vec<Array2<f64>>, String> {
-        let towers = self.build_row_towers()?;
+        // #1591: the consumer reads only `third_contracted` (a `t3` contraction),
+        // so build the order-≤3 `Tower3<4>` per row — bit-identical on the read
+        // channels to the dense `Tower4<4>` but without the discarded `t4` tensor.
+        let towers = self.build_row_third_towers()?;
         (0..p)
             .into_par_iter()
             .map(|a| {
@@ -854,7 +961,7 @@ impl SurvivalMarginalSlopeRowKernel {
                 gam_problem::with_nested_parallel(|| {
                     self.chunked_pullback_reduce(p, |row, acc| {
                         let dir = self.jacobian_action(row, &axis);
-                        let third = towers[row].third_contracted(&dir);
+                        let third = tower3_third_contracted(&towers[row].t3, &dir);
                         self.add_pullback_hessian(row, &third, acc);
                         Ok(())
                     })
