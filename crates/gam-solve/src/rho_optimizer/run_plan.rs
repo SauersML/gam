@@ -1855,8 +1855,22 @@ pub(crate) fn run_outer_with_plan(
                 // keep-best reject an overshoot — is never evaluated. Bounded to
                 // the existing seed_budget (typically 2 for non-Gaussian ARC), so
                 // this solves at most one additional seed before the break.
-                let non_gaussian_await_parsimony_seed =
-                    parsimonious_keep_best && seed_budget > 1 && started_seeds < seed_budget;
+                //
+                // #1575: but the heavy seed is only ever DECISIVE when slot 0
+                // could be beaten (an under-penalized overshoot, a flat-valley
+                // near-tie, or a non-converged stall). When slot 0 instead
+                // converged to a curvature-pinned, well-penalized optimum (every
+                // smoothing λ ≥ 1, residual gradient 100× inside the parsimony tie
+                // band), the heavy seed merely re-derives the identical cost/ρ —
+                // doubling the binomial/survival outer cost-eval count for
+                // nothing. Waive the await in exactly that redundant case; every
+                // overshoot/stall/flat-valley path keeps the full guard.
+                let non_gaussian_await_parsimony_seed = parsimonious_keep_best
+                    && seed_budget > 1
+                    && started_seeds < seed_budget
+                    && !best
+                        .as_ref()
+                        .is_some_and(|b| parsimony_second_seed_is_redundant(b, rho_dim));
                 if best.as_ref().is_some_and(|b| b.converged)
                     && !quality_compare_remaining_gaussian_seeds
                     && !non_gaussian_await_parsimony_seed

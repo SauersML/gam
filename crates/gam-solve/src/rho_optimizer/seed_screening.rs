@@ -601,6 +601,80 @@ pub(crate) fn candidate_improves_best(candidate: &OuterResult, best: Option<&Out
 /// made on a secondary principle (parsimony) rather than on LAML noise.
 pub(crate) const PARSIMONY_TIE_REL_BAND: f64 = 1e-3;
 
+/// Score-relative gradient band, two orders of magnitude (100×) inside
+/// [`PARSIMONY_TIE_REL_BAND`], within which a CONVERGED slot-0 optimum counts as
+/// *curvature-pinned*: a sharp stationary point, not a point loitering on the
+/// flat LAML valley where the parsimony tie-break could still slide ρ toward
+/// more smoothing.
+///
+/// The outer solver certifies `converged` against the comparatively loose
+/// `outer_gradient_tolerance` (an absolute floor that for a GLM REML/LAML fit is
+/// typically `1e-4`-ish). That is enough to *publish* an optimum but NOT enough
+/// to prove the optimum is sharp rather than flat-valley: the parsimony
+/// tie-break operates within a `1e-3` relative cost band, so a converged point
+/// whose residual gradient is only `~1e-4` may still be epsilon-from a
+/// heavier-penalized basin the second seed would surface. Requiring the residual
+/// to be `100×` *inside* that band makes "sharp" mean "the local curvature
+/// pins ρ here", which is exactly the regime where the second parsimony seed is
+/// provably redundant.
+pub(crate) const PARSIMONY_SHARP_GRAD_REL_BAND: f64 = 1e-5;
+
+/// Whether the deliberately-promoted parsimonious second seed (slot 1) of a
+/// non-Gaussian (GeneralizedLinear / Survival) multi-start is provably redundant
+/// given slot 0's converged result, so the multi-start may break after slot 0.
+///
+/// The #1373/#1426/#1477 guard places the flexible (low-λ) seed at slot 0 and
+/// the heavy (high-λ) seed at slot 1 so keep-best can reject an under-penalized
+/// slot-0 outcome. But the heavy seed can only ever *change* the published
+/// answer when slot 0 lands somewhere it could be beaten:
+///   - an **under-penalized** basin — some smoothing λ < 1 (ρ < 0) — that scores
+///     an epsilon-better LAML while overshooting on the response scale (#1373);
+///   - a **non-sharp** converged optimum sitting on the flat LAML valley, where
+///     the parsimony tie-break ([`candidate_improves_best_parsimonious`]) would
+///     prefer the heavier basin; or
+///   - a **non-converged** stall (#1426/#1477) whose cached cost is untrustworthy
+///     (handled by the converged guard below, never reaching this predicate).
+///
+/// When slot 0 instead CONVERGED to a curvature-pinned optimum (score-relative
+/// `|g| ≤ PARSIMONY_SHARP_GRAD_REL_BAND·(1+|score|)`) whose every leading
+/// smoothing λ ≥ 1 (ρ ≥ 0), it is already both well-penalized and sharp: there
+/// is no flatter valley to slide down and no under-penalized basin for the heavy
+/// seed to improve on, so slot 1 merely re-derives slot 0's optimum. This is the
+/// #1575 binomial-REML pathology — the heavy seed re-ran the entire smoothing-
+/// parameter optimization only to converge to the identical cost and ρ, doubling
+/// the outer cost-eval count for nothing. Skipping it halves that work with no
+/// change to the published fit.
+///
+/// Conservative by construction: every condition is a *necessary* feature of the
+/// redundant case, so any borderline fit this rejects simply runs slot 1 exactly
+/// as before. The waiver can only ever remove wasted work, never quality.
+#[inline]
+pub(crate) fn parsimony_second_seed_is_redundant(
+    slot0_best: &OuterResult,
+    rho_dim: usize,
+) -> bool {
+    // A non-converged slot 0 is precisely the #1426/#1477 case the heavy seed
+    // exists to rescue; never waive it. With no smoothing dimension the parsimony
+    // tie-break is a no-op, so there is nothing for the second seed to decide.
+    if !slot0_best.converged || rho_dim == 0 {
+        return false;
+    }
+    // Curvature-pinned: a measured residual gradient well inside the flat-valley
+    // band. A missing/NaN gradient cannot certify sharpness — fall back to
+    // running slot 1.
+    let curvature_pinned = slot0_best.final_grad_norm.is_some_and(|g| {
+        g.is_finite() && g <= PARSIMONY_SHARP_GRAD_REL_BAND * (1.0 + slot0_best.final_value.abs())
+    });
+    if !curvature_pinned {
+        return false;
+    }
+    // Well-penalized: every leading smoothing coordinate has λ ≥ 1 (ρ ≥ 0), so
+    // slot 0 is not the under-penalized basin #1373's heavy seed guards against.
+    // Trailing auxiliary coordinates (e.g. a GAMLSS log-scale predictor) are not
+    // smoothing parameters and are intentionally excluded.
+    (0..rho_dim.min(slot0_best.rho.len())).all(|i| slot0_best.rho[i] >= 0.0)
+}
+
 /// Total penalty magnitude `Σρ` over the leading `rho_dim` smoothing
 /// coordinates. Larger `Σρ` = larger λ = MORE smoothing = the more parsimonious
 /// (lower effective-df) fit.
