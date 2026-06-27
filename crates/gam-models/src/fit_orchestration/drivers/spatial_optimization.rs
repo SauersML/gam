@@ -2257,6 +2257,134 @@ fn select_constant_curvature_kappa_sign_seed(
     })
 }
 
+/// Number of length-scale restarts in the #1074 GP-range multi-start pre-scan
+/// (inclusive log-κ grid endpoints), spanning the per-term data-derived κ window.
+const SPATIAL_RANGE_PRESCAN_GRID: usize = 7;
+
+/// #1074 — kernel-range multi-start for isotropic Matérn/Duchon GP smooths.
+///
+/// The joint `[ρ, ψ]` REML objective of an isotropic radial GP smooth is
+/// genuinely MULTIMODAL in the kernel range `ψ = log κ`: a long-range (stiff)
+/// basin and a short-range (flexible) basin can each be a local optimum,
+/// separated by a barrier the local ARC/BFGS joint solver cannot cross. From the
+/// single data-window-midpoint seed the local solver descends into whichever
+/// basin holds the seed. For the ROUGHEST kernels (Matérn ν=3/2) the midpoint is
+/// the long-range basin, which over-smooths the domain boundary and leaves the
+/// global short-range optimum unreached — the observed `matern_varying_nu` ν=3/2
+/// failure recovered the interior fine but the edges 4× worse than the interior,
+/// at a REML score ~16 nats WORSE than the reachable short-range optimum (the
+/// criterion is correct; only the optimizer was stuck).
+///
+/// The cure is the textbook remedy for a multimodal length-scale likelihood: a
+/// coarse grid restart. For each isotropic spatial term we evaluate the profiled
+/// REML (ρ optimised at fixed κ — exactly [`fit_term_collection_forspec`]) at a
+/// log-κ grid spanning the term's data-derived window, and adopt the best-scoring
+/// length scale as the seed handed to the joint solver, which then polishes
+/// locally inside the global basin. Coordinate descent across terms (each scanned
+/// with the others held at their running best) keeps the cost linear in the term
+/// count. Only a STRICT REML improvement over the incumbent seed is adopted, so
+/// the pre-scan can never regress a fit that the midpoint seed already solved
+/// well — it only rescues the ones stuck in the wrong basin.
+///
+/// Gated to the isotropic, non-constant-curvature case: anisotropic ψ-per-axis
+/// terms and constant-curvature `curv()` terms carry their own dedicated seeding
+/// (the η-aware constructors and the #1464 κ-fair sign-basin scan respectively),
+/// so they are left untouched. Returns the `(term_idx, length_scale)` overrides
+/// that strictly improve REML; an empty vector means the incumbent seed already
+/// sits in the best-scoring basin and nothing downstream changes.
+fn prescan_isotropic_spatial_range_seed(
+    data: ArrayView2<'_, f64>,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+    resolvedspec: &TermCollectionSpec,
+    baseline_score: f64,
+    family: &LikelihoodSpec,
+    options: &FitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    spatial_terms: &[usize],
+) -> Result<Vec<(usize, f64)>, EstimationError> {
+    // Anisotropic and constant-curvature terms have their own seeding paths.
+    if has_aniso_terms(resolvedspec, spatial_terms)
+        || !constant_curvature_term_indices(resolvedspec).is_empty()
+    {
+        return Ok(Vec::new());
+    }
+    let dims = spatial_dims_per_term(resolvedspec, spatial_terms);
+    // The grid coordinate-descends term by term; `working` carries the chosen
+    // length scales of already-scanned terms so a later term is scored against
+    // the improved earlier ones, not the stale midpoint seed.
+    let mut working = resolvedspec.clone();
+    let mut best_score = if baseline_score.is_finite() {
+        baseline_score
+    } else {
+        f64::INFINITY
+    };
+    let mut overrides: Vec<(usize, f64)> = Vec::new();
+    for (slot, &term_idx) in spatial_terms.iter().enumerate() {
+        // Isotropic terms contribute a single ψ; a per-axis (anisotropic) slot
+        // is excluded by the gate above, but stay defensive.
+        if dims.get(slot).copied().unwrap_or(1) != 1 {
+            continue;
+        }
+        // Only terms that actually carry a free length scale (Matérn / hybrid
+        // Duchon). Pure Duchon / TPS without a length scale are skipped.
+        if get_spatial_length_scale(&working, term_idx).is_none() {
+            continue;
+        }
+        let (psi_lo, psi_hi) = spatial_term_psi_bounds(data, &working, term_idx, kappa_options);
+        if !(psi_lo.is_finite() && psi_hi.is_finite()) || psi_hi <= psi_lo {
+            continue;
+        }
+        let mut term_best: Option<f64> = None;
+        for g in 0..SPATIAL_RANGE_PRESCAN_GRID {
+            let frac = g as f64 / (SPATIAL_RANGE_PRESCAN_GRID - 1) as f64;
+            let psi = psi_lo + (psi_hi - psi_lo) * frac;
+            // `apply_log_kappa_to_term` converts the optimizer's ψ to the spec
+            // length scale as `ℓ = exp(-ψ)`; mirror it so the grid lives in the
+            // SAME coordinate the joint solver and the ψ window use.
+            let ls = (-psi).exp();
+            if !ls.is_finite() || ls <= 0.0 {
+                continue;
+            }
+            let mut probe = working.clone();
+            if set_spatial_length_scale(&mut probe, term_idx, ls).is_err() {
+                continue;
+            }
+            let fit = match fit_term_collection_forspec(
+                data,
+                y,
+                weights,
+                offset,
+                &probe,
+                family.clone(),
+                options,
+            ) {
+                Ok(fit) => fit,
+                // A grid point can hit an infeasible kernel geometry (rank
+                // collapse at an extreme range); skip it, don't abort the scan.
+                Err(_) => continue,
+            };
+            let score = fit_score(&fit.fit);
+            // Strict improvement only — guards against adopting a numerically
+            // equal basin and against ever regressing the incumbent seed.
+            if score.is_finite() && score < best_score - 1e-7 * best_score.abs().max(1.0) {
+                best_score = score;
+                term_best = Some(ls);
+            }
+        }
+        if let Some(ls) = term_best {
+            set_spatial_length_scale(&mut working, term_idx, ls)?;
+            overrides.push((term_idx, ls));
+            log::info!(
+                "[spatial-kappa] #1074 range pre-scan: term {term_idx} re-seeded at \
+                 length_scale={ls:.5} (profiled REML {best_score:.5}, was {baseline_score:.5})"
+            );
+        }
+    }
+    Ok(overrides)
+}
+
 fn try_exact_joint_spatial_length_scale_optimization(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -7832,7 +7960,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     }
 
     let baseline_options = superseded_fit_options(options);
-    let best = fit_term_collection_forspec(
+    let mut best = fit_term_collection_forspec(
         data,
         y.view(),
         weights.view(),
@@ -7851,11 +7979,56 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     // length-scale parameter to optimize, and the downstream kappa solver
     // (which assumes hybrid Duchon for log-κ derivatives) errors out. Refresh
     // the index list so it reflects the post-freeze spec.
-    let spatial_terms = spatial_length_scale_term_indices(&resolvedspec);
+    let mut spatial_terms = spatial_length_scale_term_indices(&resolvedspec);
     // Sync knot-cloud-derived aniso contrasts from the basis metadata back
     // into the spec so the optimizer starts from the geometry-informed η values
     // rather than the zero sentinel from --scale-dimensions.
     sync_aniso_contrasts_from_metadata(&mut resolvedspec, &best.design.smooth);
+    // #1074: kernel-range multi-start. The single midpoint seed can strand the
+    // joint [ρ, ψ] solver in a long-range local optimum for the roughest kernels
+    // (Matérn ν=3/2); a coarse log-κ grid restart re-seeds the spec's length
+    // scale in the globally best-scoring basin before the joint solve refines it.
+    // Strict-improvement-only, so a fit the midpoint already solved well is left
+    // byte-identical. Isotropic/non-CC only (gated inside the helper).
+    let mut prescan_improved = false;
+    if !spatial_terms.is_empty() {
+        let baseline_score = fit_score(&best.fit);
+        let range_overrides = prescan_isotropic_spatial_range_seed(
+            data,
+            y.view(),
+            weights.view(),
+            offset.view(),
+            &resolvedspec,
+            baseline_score,
+            &family,
+            &baseline_options,
+            kappa_options,
+            &spatial_terms,
+        )?;
+        if !range_overrides.is_empty() {
+            prescan_improved = true;
+            for (term_idx, length_scale) in range_overrides {
+                set_spatial_length_scale(&mut resolvedspec, term_idx, length_scale)?;
+            }
+            // Recompute the baseline (and re-freeze) at the re-seeded geometry so
+            // the joint solver's ψ seed, ρ seed, accept/reject gate, and the
+            // frozen-baseline fallback all start from the better basin.
+            best = fit_term_collection_forspec(
+                data,
+                y.view(),
+                weights.view(),
+                offset.view(),
+                &resolvedspec,
+                family.clone(),
+                &baseline_options,
+            )?;
+            resolvedspec = freeze_term_collection_from_design(&resolvedspec, &best.design)?;
+            // A re-seeded length scale can, in rare geometries, re-trigger the
+            // freeze-time basis promotion (ThinPlate → pure Duchon); refresh the
+            // spatial-term index list so the joint solve sees the current spec.
+            spatial_terms = spatial_length_scale_term_indices(&resolvedspec);
+        }
+    }
     if spatial_terms.is_empty() {
         let fitted = fit_term_collection_forspecwith_heuristic_lambdas(
             data,
@@ -7879,27 +8052,52 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     if !initial_score.is_finite() {
         log::debug!("[spatial-kappa] initial profiled score is non-finite");
     }
-    let exact_joint = require_successful_spatial_optimization_result(
-        initial_score,
-        try_exact_joint_spatial_length_scale_optimization(
-            data,
-            y.view(),
-            weights.view(),
-            offset.view(),
-            &resolvedspec,
-            &best,
-            family,
-            options,
-            kappa_options,
-            &spatial_terms,
-        )
-        .map(|opt| {
-            opt.map(|fit| {
-                let score = fit_score(&fit.fit);
-                (fit, score)
-            })
-        }),
-    )?;
+    let joint_result = try_exact_joint_spatial_length_scale_optimization(
+        data,
+        y.view(),
+        weights.view(),
+        offset.view(),
+        &resolvedspec,
+        &best,
+        family.clone(),
+        options,
+        kappa_options,
+        &spatial_terms,
+    )
+    .map(|opt| {
+        opt.map(|fit| {
+            let score = fit_score(&fit.fit);
+            (fit, score)
+        })
+    });
+    // #1074: when the multi-start pre-scan already placed the seed in a good,
+    // finite basin, a HARD joint-solve failure (e.g. a NaN covariance from κ
+    // railing into the kernel-collapse corner during the local polish) must not
+    // sink the whole fit — the pre-scan geometry is itself a valid κ-optimized
+    // result (ρ profiled at the best-scoring fixed κ). Fall back to it, exactly
+    // as the NonConverged / worsened-score gates inside the joint solver already
+    // fall back to the frozen baseline. Only the local polish (a fraction of a
+    // REML nat) is forgone. Scoped to the pre-scan-improved case so ordinary
+    // joint failures keep raising as before.
+    let exact_joint = if prescan_improved && !matches!(joint_result, Ok(Some(_))) {
+        let reason = match &joint_result {
+            Err(e) => format!("error: {e}"),
+            _ => "unavailable".to_string(),
+        };
+        log::info!(
+            "[spatial-kappa] #1074 joint polish yielded no usable candidate \
+             ({reason}); returning the multi-start pre-scan geometry (REML {initial_score:.5})"
+        );
+        FittedTermCollectionWithSpec {
+            fit: best.fit,
+            design: best.design,
+            resolvedspec,
+            adaptive_diagnostics: best.adaptive_diagnostics,
+            kappa_timing: None,
+        }
+    } else {
+        require_successful_spatial_optimization_result(initial_score, joint_result)?
+    };
     log_spatial_aniso_scales(&exact_joint.resolvedspec);
     Ok(exact_joint)
 }
