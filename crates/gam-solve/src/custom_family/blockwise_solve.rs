@@ -1963,23 +1963,6 @@ pub(crate) fn symmetrize_dense_in_place(matrix: &mut Array2<f64>) {
     gam_linalg::matrix::symmetrize_in_place(matrix);
 }
 
-pub(crate) fn validate_flat_direction_length(
-    direction: &Array1<f64>,
-    expected: usize,
-    context: &str,
-) -> Result<(), String> {
-    if direction.len() != expected {
-        return Err(CustomFamilyError::DimensionMismatch {
-            reason: format!(
-                "{context}: direction length mismatch: got {}, expected {expected}",
-                direction.len()
-            ),
-        }
-        .into());
-    }
-    Ok::<(), _>(())
-}
-
 pub(crate) fn strict_solve_spd(
     matrix: &Array2<f64>,
     rhs: &Array1<f64>,
@@ -2024,12 +2007,13 @@ pub(crate) const STRICT_SPD_LM_MAX_ESCALATIONS: usize = 16;
 
 pub(crate) const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
 
-// `CUSTOM_FAMILY_WEIGHT_FLOOR` (the IRLS working-weight floor, sourced from
-// `gam_problem::MIN_WEIGHT`) and `CUSTOM_FAMILY_RIDGE_FLOOR` (the initial
-// Cholesky-escalation ridge δ) are single-sourced in `gam-problem`
-// (`custom_family_blockwise`). Re-exported here so existing crate-local paths
-// keep resolving after the #1521 carve instead of holding a second definition.
-pub(crate) use gam_problem::{CUSTOM_FAMILY_RIDGE_FLOOR, CUSTOM_FAMILY_WEIGHT_FLOOR};
+// `CUSTOM_FAMILY_RIDGE_FLOOR` (the initial Cholesky-escalation ridge δ) is
+// single-sourced in `gam-problem` (`custom_family_blockwise`). Re-exported here
+// so existing crate-local paths keep resolving after the #1521 carve instead of
+// holding a second definition. (`CUSTOM_FAMILY_WEIGHT_FLOOR`, the IRLS
+// working-weight floor, is referenced only by the unit tests, which reach it
+// through the canonical `gam_problem::` path directly.)
+pub(crate) use gam_problem::CUSTOM_FAMILY_RIDGE_FLOOR;
 
 /// Relative eigenvalue floor used wherever an eigendecomposition needs to
 /// distinguish "real" curvature from noise: `eps_floor = EVAL_FLOOR · max|λ|`.

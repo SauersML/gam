@@ -247,55 +247,6 @@ pub(crate) fn kronecker_factored_dot_and_quadratic_form_match_dense_row_major_op
 /// structural probe that drives every `_with_specs` dispatch: block-diagonal
 /// (the trait default) is NOT coupling, a single nonzero off-block IS, and a
 /// shape disagreement must never be claimed as coupling.
-#[test]
-pub(crate) fn joint_hessian_coupling_probe_detects_off_diagonal_blocks() {
-    // Two blocks of width 2 each → a 4×4 joint Hessian. Only `beta.len()`
-    // is read, so the `eta` lengths are immaterial.
-    let states = vec![
-        ParameterBlockState {
-            beta: Array1::zeros(2),
-            eta: Array1::zeros(3),
-        },
-        ParameterBlockState {
-            beta: Array1::zeros(2),
-            eta: Array1::zeros(3),
-        },
-    ];
-
-    // Strictly block-diagonal (per-block curvature, zero off-blocks): the
-    // trait default shape, NOT coupling.
-    let block_diagonal = array![
-        [1.0_f64, 0.5, 0.0, 0.0],
-        [0.5, 1.0, 0.0, 0.0],
-        [0.0, 0.0, 2.0, 0.3],
-        [0.0, 0.0, 0.3, 2.0],
-    ];
-    assert!(
-        !joint_hessian_has_cross_block_coupling(&block_diagonal, &states),
-        "block-diagonal joint Hessian must not be treated as coupled"
-    );
-
-    // A single nonzero off-diagonal-block entry (and its transpose) is
-    // genuine cross-block curvature the block-diagonal default can never
-    // produce, so it must be trusted as coupled.
-    let mut coupled = block_diagonal.clone();
-    coupled[[0, 2]] = 1.0e-9;
-    coupled[[2, 0]] = 1.0e-9;
-    assert!(
-        joint_hessian_has_cross_block_coupling(&coupled, &states),
-        "a nonzero off-diagonal block must be detected as coupling"
-    );
-
-    // A matrix whose dimension disagrees with the total β width is
-    // malformed; the probe must answer the coupling question with `false`
-    // rather than claim coupling for a mis-shaped Hessian.
-    let wrong_shape = Array2::<f64>::zeros((3, 3));
-    assert!(
-        !joint_hessian_has_cross_block_coupling(&wrong_shape, &states),
-        "shape disagreement must not be claimed as coupling"
-    );
-}
-
 pub(crate) fn solve_blockweighted_system(
     x: &DesignMatrix,
     y_star: &Array1<f64>,
@@ -3907,7 +3858,7 @@ pub(crate) fn objective_includes_solverridge_quadratic_term() {
         outer_tol: 1e-8,
         outer_rel_cost_tol: None,
         rho_lower_bound: -10.0,
-        minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
+        minweight: gam_problem::CUSTOM_FAMILY_WEIGHT_FLOOR,
         ridge_floor: 1e-4,
         ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
         use_remlobjective: false,
@@ -3962,7 +3913,7 @@ pub(crate) fn inner_block_accepts_penalty_improving_step_even_if_loglik_drops() 
         outer_tol: 1e-8,
         outer_rel_cost_tol: None,
         rho_lower_bound: -10.0,
-        minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
+        minweight: gam_problem::CUSTOM_FAMILY_WEIGHT_FLOOR,
         ridge_floor: 0.0,
         ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
         use_remlobjective: false,
@@ -4020,7 +3971,7 @@ pub(crate) fn exact_newton_backtracking_descent_includes_explicit_ridge() {
         outer_tol: 1e-8,
         outer_rel_cost_tol: None,
         rho_lower_bound: -10.0,
-        minweight: CUSTOM_FAMILY_WEIGHT_FLOOR,
+        minweight: gam_problem::CUSTOM_FAMILY_WEIGHT_FLOOR,
         ridge_floor: 1.0,
         ridge_policy: RidgePolicy::explicit_stabilization_pospart(),
         use_remlobjective: false,

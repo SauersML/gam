@@ -407,3 +407,59 @@ pub(crate) fn validate_flat_direction_length(
     }
     Ok::<(), _>(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::joint_hessian_has_cross_block_coupling;
+    use gam_problem::ParameterBlockState;
+    use ndarray::{Array1, Array2, array};
+
+    #[test]
+    fn joint_hessian_coupling_probe_detects_off_diagonal_blocks() {
+        // Two blocks of width 2 each → a 4×4 joint Hessian. Only `beta.len()`
+        // is read, so the `eta` lengths are immaterial.
+        let states = vec![
+            ParameterBlockState {
+                beta: Array1::zeros(2),
+                eta: Array1::zeros(3),
+            },
+            ParameterBlockState {
+                beta: Array1::zeros(2),
+                eta: Array1::zeros(3),
+            },
+        ];
+
+        // Strictly block-diagonal (per-block curvature, zero off-blocks): the
+        // trait default shape, NOT coupling.
+        let block_diagonal = array![
+            [1.0_f64, 0.5, 0.0, 0.0],
+            [0.5, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 2.0, 0.3],
+            [0.0, 0.0, 0.3, 2.0],
+        ];
+        assert!(
+            !joint_hessian_has_cross_block_coupling(&block_diagonal, &states),
+            "block-diagonal joint Hessian must not be treated as coupled"
+        );
+
+        // A single nonzero off-diagonal-block entry (and its transpose) is
+        // genuine cross-block curvature the block-diagonal default can never
+        // produce, so it must be trusted as coupled.
+        let mut coupled = block_diagonal.clone();
+        coupled[[0, 2]] = 1.0e-9;
+        coupled[[2, 0]] = 1.0e-9;
+        assert!(
+            joint_hessian_has_cross_block_coupling(&coupled, &states),
+            "a nonzero off-diagonal block must be detected as coupling"
+        );
+
+        // A matrix whose dimension disagrees with the total β width is
+        // malformed; the probe must answer the coupling question with `false`
+        // rather than claim coupling for a mis-shaped Hessian.
+        let wrong_shape = Array2::<f64>::zeros((3, 3));
+        assert!(
+            !joint_hessian_has_cross_block_coupling(&wrong_shape, &states),
+            "shape disagreement must not be claimed as coupling"
+        );
+    }
+}
