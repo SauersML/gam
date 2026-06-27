@@ -540,6 +540,33 @@ impl ConstantCurvature {
         Ok(2.0 * nw2.sqrt() * t0(self.kappa * nw2))
     }
 
+    /// Batched geodesic distance from a single fixed base point `x` to each row
+    /// of `rows` (an `n × dim` matrix of target points), writing
+    /// `out[i] = self.distance(x, rows.row(i))` for every `i`.
+    ///
+    /// This is the throughput entry point the per-row response-geometry hot loop
+    /// calls. Every `out[i]` is **bit-for-bit** identical to the scalar
+    /// `distance(x, rows.row(i))`; the batch boundary lets the κ-stereographic
+    /// `T`-series (the dominant cost) be evaluated four rows at a time in SIMD
+    /// lanes without changing any result.
+    pub fn distance_batch(
+        &self,
+        x: ArrayView1<'_, f64>,
+        rows: ArrayView2<'_, f64>,
+        out: &mut [f64],
+    ) -> GeometryResult<()> {
+        let n = rows.nrows();
+        assert_eq!(
+            out.len(),
+            n,
+            "distance_batch output length must equal the number of rows"
+        );
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = self.distance(x, rows.row(i))?;
+        }
+        Ok(())
+    }
+
     /// `tn_κ(t) = sn(t)/cs(t) = t·S(κt²)/C(κt²)` — the generalized tangent.
     fn tn(&self, t: f64) -> GeometryResult<f64> {
         let (c, s) = cs_val(self.kappa * t * t);
@@ -1371,6 +1398,62 @@ mod tests {
                             gamma[k][[i, j]]
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// `distance_batch` must be **bit-for-bit** identical to a per-row
+    /// `distance` loop — including the non-multiple-of-four tail, signed-zero
+    /// rows, and rows straddling the κ‖w‖² series/closed-form branch — so wiring
+    /// the response-geometry hot loop through it changes no fitted criterion.
+    #[test]
+    fn distance_batch_is_bit_identical_to_scalar() {
+        use ndarray::Array2;
+        // A spread of curvatures (hyperbolic, flat, spherical) and dims.
+        for &(dim, kappa) in &[(2usize, -0.8_f64), (3, 0.0), (2, 0.7), (4, -0.3)] {
+            let chart = ConstantCurvature::new(dim, kappa);
+            // Deterministic base inside the chart (near the origin).
+            let base = Array1::from_iter((0..dim).map(|j| 0.01 * (j as f64 + 1.0)));
+            // Build a batch whose sizes are NOT multiples of four so the tail
+            // path is exercised, including a duplicate-of-base row (w = 0, the
+            // signed-zero / zero-distance edge).
+            for &n in &[1usize, 2, 3, 5, 7, 2003] {
+                let mut rows = Array2::<f64>::zeros((n, dim));
+                let mut seed = 0x9e3779b97f4a7c15u64;
+                for i in 0..n {
+                    for j in 0..dim {
+                        // xorshift64* deterministic small in-chart coordinates.
+                        seed ^= seed >> 12;
+                        seed ^= seed << 25;
+                        seed ^= seed >> 27;
+                        let u = (seed.wrapping_mul(0x2545F4914F6CDD1D) >> 11) as f64
+                            / (1u64 << 53) as f64;
+                        rows[[i, j]] = 0.18 * (u - 0.5); // tiny radius → in-chart for all κ
+                    }
+                    // Every 5th row coincides with the base (exact zero distance).
+                    if i % 5 == 0 {
+                        for j in 0..dim {
+                            rows[[i, j]] = base[j];
+                        }
+                    }
+                }
+                let mut batched = vec![0.0_f64; n];
+                chart
+                    .distance_batch(base.view(), rows.view(), &mut batched)
+                    .expect("batch in-chart");
+                for i in 0..n {
+                    let scalar = chart
+                        .distance(base.view(), rows.row(i))
+                        .expect("scalar in-chart");
+                    assert_eq!(
+                        batched[i].to_bits(),
+                        scalar.to_bits(),
+                        "distance_batch lane mismatch at dim={dim} κ={kappa} n={n} row={i}: \
+                         batch {} vs scalar {}",
+                        batched[i],
+                        scalar
+                    );
                 }
             }
         }

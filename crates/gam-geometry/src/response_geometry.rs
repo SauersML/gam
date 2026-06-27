@@ -1123,11 +1123,15 @@ pub fn response_curvature_criterion(
     let mut dispersion = 0.0_f64; // D = Σ s_i²
     let mut ln_jac = 0.0_f64; // Σ ln J_κ(s_i)
     let mut ln_lambda = 0.0_f64; // Σ ln λ_{y_i}
-    for row in values.outer_iter() {
-        // Geodesic radius s_i = d_κ(μ, y_i); also validates y_i is in-chart.
-        let s = chart
-            .distance(base.view(), row)
-            .map_err(|e| format!("response curvature criterion distance: {e}"))?;
+    // Geodesic radii s_i = d_κ(μ, y_i) for every row, computed in a single
+    // batched pass (four rows per SIMD lane-group). `distance_batch` is
+    // bit-for-bit identical to the per-row `distance`, so D, Σ ln J, and Σ ln λ
+    // below are unchanged; it also validates each y_i is in-chart.
+    let mut radii = vec![0.0_f64; n_rows];
+    chart
+        .distance_batch(base.view(), values, &mut radii)
+        .map_err(|e| format!("response curvature criterion distance: {e}"))?;
+    for (row, &s) in values.outer_iter().zip(radii.iter()) {
         dispersion += s * s;
         // ln J_κ(s_i): exp-map volume Jacobian (≥ 0); floor before the log so the
         // conjugate-shell clamp (J → 0 on the κ>0 antipodal shell) is a large
