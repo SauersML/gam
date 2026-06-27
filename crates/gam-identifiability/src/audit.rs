@@ -1992,22 +1992,81 @@ pub fn audit_identifiability_channel_aware(
     }
     let p_total = *col_offsets.last().expect("col_offsets non-empty");
 
-    // The Gram compiler emits kept widths. Attribute any lost width to trailing
-    // local columns, matching the existing audit contract that downstream code
-    // consumes for diagnostics rather than for an automatic callback reparam.
+    // The Gram compiler emits kept WIDTHS (per-block effective rank), but the
+    // structural reduction it performs is a Gram-eigenspace ROTATION
+    // (`keep_positive_eigenspace`), NOT an axis-aligned column selection — so the
+    // compiler never identifies *which* original columns are redundant. The
+    // downstream canonicaliser
+    // (`canonicalize_for_identifiability_inner`) does NOT apply the rotation; it
+    // builds a pure column-SELECTION `T` from `dropped_columns` and certifies it
+    // leaves `J_can` full column rank. Attributing the lost width to the TRAILING
+    // local columns (`kept..p_block`) is therefore only faithful when the
+    // redundant direction happens to be axis-aligned with the trailing columns.
+    // When it is NOT — e.g. the cause-specific competing-risks time block, whose
+    // redundant direction (the anchor-centered constant absorbed by the linear
+    // time term) sits in a non-trailing column — the trailing column-selection
+    // keeps a redundant column and drops an independent one, collapsing `J_can`
+    // below its target rank and tripping the post-T rank invariant (gam#1590).
+    //
+    // Identify the genuinely redundant columns instead: run a uniform-priority
+    // pivoted-Cholesky (`priority_tiered_rank_from_gram`) on each block's own
+    // diagonal sub-Gram (`JᵀJ` within the block's channel, read straight from the
+    // streamed `gram_struct`). Its `column_permutation` orders the columns
+    // accepted-first / demoted-last by residual magnitude, so the LAST
+    // `p_block - kept` entries are exactly the columns that lie in the span of the
+    // kept ones — a maximal independent (full column rank = `kept`) subset
+    // survives. Dropping those keeps the column-selection `T` faithful for ANY
+    // redundancy orientation while preserving the compiler's `kept` rank verdict
+    // (the drop count is pinned to `p_block - kept`, never the pivot's own
+    // tolerance). For the common case where the redundancy already is trailing
+    // this selects the same trailing columns, so axis-aligned channel-aware
+    // families (multinomial softmax, location-scale) are unaffected.
     let mut dropped_columns: Vec<DroppedColumn> = Vec::new();
     for (block_idx, spec) in specs.iter().enumerate() {
         let p_block = spec.design.ncols();
         let kept = compiled_map.compiled_block_ranges[block_idx].len();
-        for local_col in kept..p_block {
+        let n_drop = p_block.saturating_sub(kept);
+        if n_drop == 0 {
+            continue;
+        }
+        let off = col_offsets[block_idx];
+        // Per-block diagonal structural Gram (p_block × p_block).
+        let block_gram = geometry
+            .gram_struct
+            .slice(ndarray::s![off..off + p_block, off..off + p_block])
+            .to_owned();
+        // Uniform priority within the block: the drop decision here is purely the
+        // within-block residual ordering (cross-block gauge priority is handled by
+        // the joint `fatal`/gauge-resolution logic below, not by which physical
+        // column a block sheds).
+        let uniform_priority = vec![0u8; p_block];
+        let pivot = priority_tiered_rank_from_gram(
+            &block_gram,
+            &uniform_priority,
+            n * k,
+            default_rrqr_rank_alpha(),
+        );
+        // The last `n_drop` columns in accept-then-demote order are the
+        // lowest-residual (most redundant) ones. Falls back to trailing columns
+        // only if the permutation is malformed (never expected: it is always a
+        // permutation of `0..p_block`).
+        let mut demoted_locals: Vec<usize> =
+            if pivot.column_permutation.len() == p_block {
+                pivot.column_permutation[p_block - n_drop..].to_vec()
+            } else {
+                (kept..p_block).collect()
+            };
+        demoted_locals.sort_unstable();
+        for local_col in demoted_locals {
             let block_name = spec.name.clone();
             dropped_columns.push(DroppedColumn {
                 block: block_name.clone(),
                 column: local_col,
                 reason: format!(
                     "channel-aware audit (K={k}) demoted block '{block_name}' \
-                     local column {local_col}: column is in the row-Jacobian span \
-                     of earlier blocks under the structural row metric",
+                     local column {local_col}: column lies in the within-block \
+                     row-Jacobian span of the retained columns under the structural \
+                     row metric (pivoted-Cholesky residual-ordered selection)",
                 ),
             });
         }
