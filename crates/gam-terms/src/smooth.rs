@@ -32,8 +32,8 @@ pub use self::structure_analysis::{
 // (`spatial_optimization.rs`).
 mod term_design;
 pub use term_design::{
-    build_term_collection_design, build_term_collection_design_inner,
-    term_collection_has_one_sided_anchored_bspline,
+    build_term_collection_derivative_design, build_term_collection_design,
+    build_term_collection_design_inner, term_collection_has_one_sided_anchored_bspline,
 };
 
 // Spec→spec freezer relocated DOWN from gam-models `fit_orchestration/drivers/
