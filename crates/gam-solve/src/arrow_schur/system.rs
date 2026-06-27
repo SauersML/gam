@@ -315,15 +315,6 @@ impl ArrowSchurSystem {
         Self::new_with_hbb(n, d, k, Array2::<f64>::zeros((k, k)))
     }
 
-    /// Allocate an arrow system with no dense shared `H_ββ` block.
-    ///
-    /// Callers must install a penalty operator before solving if the shared block
-    /// has nonzero curvature. This keeps large structured systems from allocating
-    /// a `k × k` dense placeholder when all β curvature is supplied by operators.
-    pub fn new_with_empty_hbb(n: usize, d: usize, k: usize) -> Self {
-        Self::new_with_empty_hbb_and_htbeta_cols(n, d, k, k)
-    }
-
     /// Allocate an arrow system with no dense shared `H_ββ` block and with
     /// per-row dense `H_tβ` slabs allocated at `htbeta_cols` columns.
     pub fn new_with_empty_hbb_and_htbeta_cols(
@@ -511,16 +502,6 @@ impl ArrowSchurSystem {
             row_gauge_deflation: None,
             ibp_cross_row: None,
         }
-    }
-
-    /// Allocate a heterogeneous-row system using a caller-owned dense
-    /// shared-block buffer. See [`Self::new_with_hbb`] for the reuse contract.
-    pub fn new_with_per_row_dims_and_hbb(
-        per_row_dims: Vec<usize>,
-        k: usize,
-        hbb: Array2<f64>,
-    ) -> Self {
-        Self::new_with_per_row_dims_and_hbb_and_htbeta_cols(per_row_dims, k, hbb, k)
     }
 
     /// Allocate a heterogeneous-row system using a caller-owned dense shared

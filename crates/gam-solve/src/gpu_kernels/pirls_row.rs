@@ -645,12 +645,6 @@ fn standard_normal_pdf(x: f64) -> f64 {
 // CUDA host harness
 // ────────────────────────────────────────────────────────────────────────
 
-/// Sized buffers the row kernel reads/writes on the device.
-#[derive(Clone, Copy, Debug)]
-pub struct PirlsRowDims {
-    pub n: usize,
-}
-
 /// Process-wide cache of compiled per-family modules.
 #[must_use]
 pub struct PirlsRowBackend {

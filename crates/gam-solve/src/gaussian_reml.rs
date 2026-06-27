@@ -208,14 +208,6 @@ pub struct GaussianRemlNoAllocFit {
 }
 
 #[derive(Clone, Debug)]
-pub struct GaussianRemlScalarBatchProblem<'a> {
-    pub x: ArrayView2<'a, f64>,
-    pub y: ArrayView1<'a, f64>,
-    pub weights: Option<ArrayView1<'a, f64>>,
-    pub init_rho: Option<f64>,
-}
-
-#[derive(Clone, Debug)]
 pub struct GaussianRemlMultiBatchProblem<'a> {
     pub x: ArrayView2<'a, f64>,
     pub y: ArrayView2<'a, f64>,

@@ -189,10 +189,6 @@ pub const HUTCHINSON_GPU_MIN_P: usize = 512;
 /// Minimum and maximum probe counts the GPU path accepts (math section 18).
 pub const HUTCHINSON_GPU_MIN_K: usize = 8;
 pub const HUTCHINSON_GPU_MAX_K: usize = 128;
-/// Adaptive schedule: initial probe budget.
-pub const HUTCHINSON_GPU_K_INITIAL: usize = 16;
-/// Adaptive schedule: probe-count step between accuracy checks.
-pub const HUTCHINSON_GPU_K_STEP: usize = 8;
 
 /// True when the GPU Hutchinson path is eligible at the current shape and
 /// configuration. Caller still has to satisfy the CPU-side gate
