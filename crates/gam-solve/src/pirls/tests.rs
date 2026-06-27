@@ -3810,6 +3810,39 @@ mod reporting_loglikelihood_tests {
         assert!((total - pw.sum()).abs() < 1e-12);
     }
 
+    // Zero prior weight excludes an observation: every family contributes
+    // exactly 0 (no −∞ from the Gamma shape→0 or Tweedie −ln w prefactor).
+    #[test]
+    fn zero_prior_weight_contributes_zero_every_family() {
+        let y = array![2.0, 3.0];
+        let mu = array![1.5, 2.5];
+        let w = array![0.0, 0.0];
+        for glm in [
+            canonical(ResponseFamily::Poisson, StandardLink::Log),
+            canonical(ResponseFamily::Gamma, StandardLink::Log),
+            canonical(ResponseFamily::Binomial, StandardLink::Logit),
+            GlmLikelihoodSpec {
+                spec: LikelihoodSpec::new(ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)),
+                scale: LikelihoodScaleMetadata::FixedDispersion { phi: 0.3 },
+            },
+            GlmLikelihoodSpec {
+                spec: LikelihoodSpec::new(ResponseFamily::Tweedie { p: 1.5 }, InverseLink::Standard(StandardLink::Log)),
+                scale: LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            },
+        ] {
+            let yb = array![0.5, 0.6];
+            let (yy, mm) = if matches!(glm.spec.response, ResponseFamily::Binomial) {
+                (yb.clone(), array![0.4, 0.55])
+            } else {
+                (y.clone(), mu.clone())
+            };
+            let pw = pointwise_loglikelihood(yy.view(), &mm, &glm, w.view());
+            for &v in pw.iter() {
+                assert_eq!(v, 0.0, "{:?}: zero-weight row must be 0, got {v}", glm.spec.response);
+            }
+        }
+    }
+
     // calculate_loglikelihood is exactly the sum of the pointwise kernel.
     #[test]
     fn scalar_equals_sum_of_pointwise() {

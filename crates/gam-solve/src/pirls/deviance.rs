@@ -675,6 +675,11 @@ pub(crate) fn binomial_log_coefficient(w: f64, y: f64) -> f64 {
 /// (which scales the shape: `Yᵢ ~ Gamma(shape = w·ν, mean = μ)`).
 #[inline]
 pub(crate) fn gamma_full_loglik(yi: f64, mui: f64, w: f64, nu: f64) -> f64 {
+    if w <= 0.0 {
+        // Zero prior weight excludes the observation (a → 0 would send −lnΓ(a)
+        // to −∞ rather than contributing nothing).
+        return 0.0;
+    }
     let a = (w * nu).max(f64::MIN_POSITIVE);
     // a·ln(a/μ) + (a−1)·ln y − a·y/μ − lnΓ(a)
     a * (a / mui).ln() + (a - 1.0) * yi.ln() - a * yi / mui - ln_gamma(a)
@@ -688,6 +693,11 @@ pub(crate) fn gamma_full_loglik(yi: f64, mui: f64, w: f64, nu: f64) -> f64 {
 /// prefactor. Homogeneous so `elpd(c·y) − elpd(y) = −n ln c` still holds.
 #[inline]
 pub(crate) fn tweedie_saddlepoint_loglik(yi: f64, mui: f64, w: f64, p: f64, phi: f64) -> f64 {
+    if w <= 0.0 {
+        // Zero prior weight excludes the observation (the y>0 prefactor's
+        // −ln wᵢ would otherwise diverge).
+        return 0.0;
+    }
     let exponent = -w * tweedie_unit_deviance(yi, mui, p) / phi;
     if yi <= 0.0 {
         // Exact point mass at zero (no Jacobian prefactor for a mass atom).
