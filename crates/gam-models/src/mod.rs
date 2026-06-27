@@ -1,7 +1,10 @@
 // Declarative `bail_*` / error-boilerplate macros whose target error enums live
 // in this crate. `#[macro_export]` places them at the crate root so the
 // `bail_invalid_surv!` / `impl_reason_error_boilerplate!` call sites
-// across the relocated families resolve unchanged.
+// across the relocated families resolve unchanged. `#[macro_use]` puts them in
+// textual scope so same-crate call sites use the unqualified name (rustc forbids
+// `crate::`-absolute paths to same-crate `macro_export` macros).
+#[macro_use]
 mod macros;
 
 // `bail_*` shorthands whose error types were relocated to the neutral
