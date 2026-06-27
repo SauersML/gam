@@ -6393,14 +6393,19 @@ fn survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932() {
     }
 }
 
-/// #932 (survival link-wiggle GATE verification): the production hand assembler
-/// `assemble_joint_hessian_from_quantities` (which adds the wiggle block via
-/// `assemble_h_wiggle`) must equal the mechanically-derived joint Hessian built
-/// from the SINGLE-SOURCE §13 wiggle row program (`sls_row_nll` extended with the
-/// warp `q = q0 + Σ βw·B(q0)` and the qdot coupling `g = m1·g0`), assembled into
-/// coefficient space by the same `JᵀHJ` pullback the production row kernel uses.
-/// This is the sign-agnostic 1943-style oracle for the wiggle case: any dropped
-/// cross-block in the hand assembler (the #736 genus) shifts an entry past 1e-9.
+/// #932 (survival link-wiggle single-source verification): the production
+/// wiggle joint Hessian — `survival_ls_wiggle_joint_hessian_dense`, the §13
+/// warp row program (`sls_row_nll` extended with `q = q0 + Σ βw·B(q0)` and the
+/// qdot coupling `g = m1·g0`) that every production consumer now routes through
+/// — must equal an INDEPENDENT tower assembled here from `wiggle_nll` with a
+/// hand-rolled `JᵀHJ` pullback. This cross-validates the §13 path AND its
+/// row-kernel pullback against independent code; combined with the FD oracle
+/// `survival_ls_wiggle_jet_program_joint_hessian_matches_fd_932` (which pins the
+/// §13 primary algebra to finite differences), the wiggle joint Hessian is
+/// fully verified. The legacy bespoke `assemble_h_wiggle` is RETIRED for wiggle:
+/// it disagreed with the §13 source by ~15% at `[0][0]` (a dropped warp coupling
+/// — the #736 duplicate-engine genus), so the last production consumer of it (the
+/// trust-region metric floor) was repointed to the §13 source.
 #[test]
 fn survival_ls_wiggle_joint_hessian_matches_assembler_932() {
     use gam_math::jet_scalar::{JetScalar, Order2};
