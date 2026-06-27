@@ -2219,7 +2219,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     fn joint_trust_metric_block_floor(
         &self,
         block_states: &[ParameterBlockState],
-        _specs: &[ParameterBlockSpec],
+        _: &[ParameterBlockSpec],
     ) -> Result<Option<Array1<f64>>, String> {
         // Scale-aware trust-metric floor for the coupled smooth-scale TIME block
         // (issue #1569). See `TIME_BLOCK_TRUST_METRIC_FLOOR_REL`. The time block
