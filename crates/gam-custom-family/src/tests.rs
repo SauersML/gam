@@ -1343,7 +1343,7 @@ pub(crate) fn binomial_location_scale_wiggle_outer_fixture()
 -> BinomialLocationScaleWiggleOuterFixture {
     let base = binomial_location_scale_base_fixture();
     let q_seed = Array1::linspace(-1.4, 1.4, base.n);
-    let knots = gam_models::wiggle::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
+    let knots = gam_terms::basis::initializewiggle_knots_from_seed(q_seed.view(), 3, 4)
         .expect("knots");
     let wiggle_block = gam_models::wiggle::buildwiggle_block_input_from_knots(
         q_seed.view(),
@@ -7599,7 +7599,7 @@ pub(crate) fn spatial_adaptive_zero_xpsi_uses_zero_map_without_dense_allocation(
         implicit_axis: 0,
         implicit_group_id: None,
     };
-    let policy = ResourcePolicy::default_library();
+    let policy = gam_runtime::resource::ResourcePolicy::default_library();
     let map = resolve_custom_family_x_psi_map(
         &deriv,
         n,
@@ -7641,7 +7641,7 @@ pub(crate) fn zero_psi_derivative_operator_resolves_to_zero_design_map() {
         implicit_axis: 0,
         implicit_group_id: None,
     };
-    let policy = ResourcePolicy::default_library();
+    let policy = gam_runtime::resource::ResourcePolicy::default_library();
     let map = resolve_custom_family_x_psi_map(&deriv, n, p, 0..n, "zero", &policy)
         .expect("resolve x_psi map");
     let u = Array1::from_iter((0..p).map(|k| 1.0 + k as f64));
