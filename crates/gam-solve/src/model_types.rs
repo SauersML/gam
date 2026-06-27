@@ -69,7 +69,7 @@ pub struct ProjectedKktResidual {
 impl ProjectedKktResidual {
     /// Construct from `r_A = P_T(Sbeta + Gamma beta - grad ell)`, with active
     /// constraint multipliers removed but before any reduced-range projection.
-    pub(crate) fn from_active_projected(residual: Array1<f64>) -> Self {
+    pub fn from_active_projected(residual: Array1<f64>) -> Self {
         Self {
             residual,
             subspace: KktResidualSubspace::ActiveProjected,

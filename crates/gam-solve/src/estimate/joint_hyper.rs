@@ -284,7 +284,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// takes the design-revision fast path (cache hit) does not advance this, so
     /// a test can assert the n-row reconditioning lane was not re-entered by
     /// checking this counter is unchanged across a repeat-revision eval.
-    pub(crate) fn slow_path_reset_count(&self) -> u64 {
+    pub fn slow_path_reset_count(&self) -> u64 {
         self.slow_path_reset_count.get()
     }
 
@@ -323,7 +323,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.pending_glm_psi_gram_deriv = deriv.map(std::sync::Arc::new);
     }
 
-    pub(crate) fn set_analytic_penalty_registry(
+    pub fn set_analytic_penalty_registry(
         &mut self,
         registry: Option<&gam_terms::AnalyticPenaltyRegistry>,
     ) {
@@ -336,7 +336,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         );
     }
 
-    pub(crate) fn set_persistent_latent_values_fingerprint(
+    pub fn set_persistent_latent_values_fingerprint(
         &mut self,
         id_mode: &gam_terms::latent::LatentIdMode,
     ) {
@@ -348,7 +348,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         );
     }
 
-    pub(crate) fn load_persistent_latent_values(
+    pub fn load_persistent_latent_values(
         &self,
         n_obs: usize,
         latent_dim: usize,
@@ -360,7 +360,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         )
     }
 
-    pub(crate) fn store_persistent_latent_values(&self, values: &Array2<f64>) {
+    pub fn store_persistent_latent_values(&self, values: &Array2<f64>) {
         crate::estimate::reml::RemlState::store_persistent_latent_values(
             &self.reml_state,
             values,
@@ -382,7 +382,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// expansion analytic and the per-trial installed cache frame-exact —
     /// without restricting to identity conditioning. Returns whether a
     /// certified tensor was attached; `false` keeps the exact per-trial path.
-    pub(crate) fn build_and_set_psi_gram_tensor(
+    pub fn build_and_set_psi_gram_tensor(
         &mut self,
         mut eval_raw_design: impl FnMut(f64) -> Result<DesignMatrix, String>,
         weights: ArrayView1<'_, f64>,
@@ -427,7 +427,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
     /// re-keyed without `reset_surface`) and every fast-path trial MUST have a
     /// staged exact penalty (`stage_fast_path_penalty`), else `prepare_eval_state`
     /// hard-errors rather than pairing a stale `S`.
-    pub(crate) fn set_supports_nfree_penalty_rekey(&mut self, supported: bool) {
+    pub fn set_supports_nfree_penalty_rekey(&mut self, supported: bool) {
         self.supports_nfree_penalty_rekey = supported;
     }
 
@@ -563,7 +563,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         self.last_canonical_revision
     }
 
-    pub(crate) fn has_psi_gram_tensor(&self) -> bool {
+    pub fn has_psi_gram_tensor(&self) -> bool {
         self.psi_gram_tensor.is_some()
     }
 

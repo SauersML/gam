@@ -721,7 +721,7 @@ pub struct CustomFamilyWarmStart {
 }
 
 impl CustomFamilyWarmStart {
-    pub(crate) fn compatible_with_rho(&self, rho: &Array1<f64>) -> bool {
+    pub fn compatible_with_rho(&self, rho: &Array1<f64>) -> bool {
         screened_outer_warm_start(Some(&self.inner), rho).is_some()
     }
 
@@ -729,7 +729,7 @@ impl CustomFamilyWarmStart {
     /// Callers that need to evaluate the block's fitted linear predictor
     /// `X·β` (rather than inspect raw coefficient magnitudes) read β through
     /// this view.
-    pub(crate) fn block_beta_view(&self, block_idx: usize) -> Option<ArrayView1<'_, f64>> {
+    pub fn block_beta_view(&self, block_idx: usize) -> Option<ArrayView1<'_, f64>> {
         self.inner.block_beta.get(block_idx).map(|beta| beta.view())
     }
 

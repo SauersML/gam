@@ -923,7 +923,7 @@ impl LatentCoordValues {
         )
     }
 
-    pub(crate) fn from_matrix_with_manifold_and_retraction(
+    pub fn from_matrix_with_manifold_and_retraction(
         matrix: ArrayView2<'_, f64>,
         id_mode: LatentIdMode,
         manifold: LatentManifold,

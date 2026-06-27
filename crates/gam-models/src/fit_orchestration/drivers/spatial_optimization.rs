@@ -8162,6 +8162,7 @@ fn try_exact_joint_latent_coord_optimization(
         .evaluator
         .load_persistent_latent_values(latent.values.n_obs(), latent.values.latent_dim())
     {
+        let cached_t: Array2<f64> = cached_t;
         for (dst, src) in theta0
             .slice_mut(s![rho_dim..rho_dim + latent_flat_dim])
             .iter_mut()

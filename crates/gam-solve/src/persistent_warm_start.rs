@@ -154,7 +154,7 @@ impl PersistentBlockWarmStartRecord {
 }
 
 impl PersistentWarmStartRecord {
-    pub(crate) fn new(key: String, n_rows: usize, n_cols: usize) -> Self {
+    pub fn new(key: String, n_rows: usize, n_cols: usize) -> Self {
         let now = unix_secs_now();
         Self {
             version: CACHE_VERSION,
@@ -176,7 +176,7 @@ impl PersistentWarmStartRecord {
         }
     }
 
-    pub(crate) fn is_compatible(&self, key: &str, n_rows: usize, n_cols: usize) -> bool {
+    pub fn is_compatible(&self, key: &str, n_rows: usize, n_cols: usize) -> bool {
         self.version == CACHE_VERSION
             && self.key == key
             // Note: `package_version` is no longer required to match. A

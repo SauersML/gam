@@ -294,15 +294,10 @@ pub enum HessianSource {
 ///
 /// This enum is for the shared `eval` bridge where the runner needs value-only,
 /// first-order, or second-order information depending on the active plan.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OuterEvalOrder {
-    /// Compute only the objective value.
-    Value,
-    /// Compute value and gradient only.
-    ValueAndGradient,
-    /// Compute value, gradient, and analytic Hessian when available.
-    ValueGradientHessian,
-}
+///
+/// Single-sourced on the lower `gam-model-api` crate so the gam-models
+/// fit_orchestration drivers and the gam-solve runner share one type (#1521).
+pub use gam_model_api::OuterEvalOrder;
 
 /// The outer optimization plan. Produced by [`plan`], consumed by the runner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
