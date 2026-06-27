@@ -336,6 +336,108 @@ impl<const K: usize> JetScalar<K> for Order2<K> {
     }
 }
 
+// ── Order1<K>: value / gradient only (doc §A.1, first-order prune) ──────
+
+/// Truncated FIRST-order scalar: value `v` and gradient `g_a` only — NO Hessian.
+///
+/// This is [`Order2`] with the K×K Hessian channel deleted. Its value and
+/// gradient are computed by the SAME order-≤1 truncation of the Leibniz / Faà
+/// di Bruno rules that [`Order2`] uses for those two channels, with the float
+/// operations applied in the identical order — so its `(v, g)` is BIT-IDENTICAL
+/// to both [`Order2`]'s and a full [`crate::jet_tower::Tower4`]'s order-≤1
+/// channels. Use it at a consumer that reads ONLY value + gradient (the SAE
+/// β-border channel: the reconstruction is linear in β, so the Hessian-in-β
+/// vanishes and the dense K×K Hessian product `Tower2::mul` would build is pure
+/// discarded work). Order-≤1 value/gradient never read any input's Hessian, so
+/// dropping that channel changes neither result nor float-op order — it only
+/// removes the `K²` arithmetic that produced an unread tensor.
+#[derive(Clone, Copy, Debug)]
+pub struct Order1<const K: usize> {
+    /// Value ℓ.
+    pub v: f64,
+    /// Gradient ∂ℓ/∂p_a.
+    pub g: [f64; K],
+}
+
+impl<const K: usize> Order1<K> {
+    /// Read the gradient channel `g_a = ∂ℓ/∂p_a`.
+    #[inline]
+    pub fn g(&self) -> [f64; K] {
+        self.g
+    }
+}
+
+impl<const K: usize> JetScalar<K> for Order1<K> {
+    fn constant(c: f64) -> Self {
+        // Order2::constant -> Tower2::constant: value c, all derivatives zero.
+        Order1 { v: c, g: [0.0; K] }
+    }
+    fn variable(x: f64, axis: usize) -> Self {
+        // Order2::variable -> Tower2::variable: unit first derivative in `axis`.
+        let mut g = [0.0; K];
+        g[axis] = 1.0;
+        Order1 { v: x, g }
+    }
+    fn value(&self) -> f64 {
+        self.v
+    }
+    fn add(&self, o: &Self) -> Self {
+        // Tower2 Add: out.v += o.v; out.g[i] += o.g[i] (same float order).
+        let mut g = self.g;
+        for i in 0..K {
+            g[i] += o.g[i];
+        }
+        Order1 {
+            v: self.v + o.v,
+            g,
+        }
+    }
+    fn sub(&self, o: &Self) -> Self {
+        // Mirror Order2::sub == self + o.scale(-1.0) exactly: scale then add.
+        self.add(&o.scale(-1.0))
+    }
+    fn mul(&self, o: &Self) -> Self {
+        // Tower2::mul value/grad terms, identical float order:
+        //   v = a.v*b.v;  g[i] = a.v*b.g[i] + a.g[i]*b.v.
+        // (The Hessian loop `a.v*b.h + a.g*b.g + ... + a.h*b.v` is the discarded
+        //  work this type exists to skip; it never feeds v or g.)
+        let a = self;
+        let b = o;
+        let mut g = [0.0; K];
+        for i in 0..K {
+            g[i] = a.v * b.g[i] + a.g[i] * b.v;
+        }
+        Order1 { v: a.v * b.v, g }
+    }
+    fn neg(&self) -> Self {
+        // Order2::neg == self.0.scale(-1.0).
+        self.scale(-1.0)
+    }
+    fn scale(&self, s: f64) -> Self {
+        // Tower2::scale: out.v *= s; out.g[i] *= s (same float order).
+        let mut g = self.g;
+        for i in 0..K {
+            g[i] *= s;
+        }
+        Order1 {
+            v: self.v * s,
+            g,
+        }
+    }
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        // Faà di Bruno truncated to order ≤ 1 (matches `faa_di_bruno` /
+        // `Tower2::compose_unary` for the value and gradient channels):
+        //   value channel (m=0): d[0].
+        //   grad channel (positions=[i], single partition {{0}}): d[1]·g[i].
+        // Order-≤1 reads only d[0], d[1]; trailing stack entries are unused.
+        let mut g = [0.0; K];
+        for i in 0..K {
+            g[i] = d[1] * self.g[i];
+        }
+        Order1 { v: d[0], g }
+    }
+}
+
 // ── OneSeed<K>: one-seed directional, contracted third (doc §A.2) ───────
 
 /// One-seed directional scalar: an [`Order2`] base plus ONE nilpotent ε

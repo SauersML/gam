@@ -45,11 +45,18 @@
 //! (`γ` pinned at 0 with collapsed effective range ⇒ a "not a smooth 1-D
 //! topology" diagnostic handed to the mixture rung).
 
-use gam_math::jet_tower::Tower4;
+use gam_math::jet_tower::Tower2;
 use ndarray::{Array1, Array2, ArrayView1};
 
 /// One-variable γ-jet: value, ∂/∂γ, ∂²/∂γ².
-type GJet = Tower4<1>;
+///
+/// `row_jet` reads only the value, `∂/∂γ` (`g[0]`) and `∂²/∂γ²` (`h[0][0]`)
+/// channels, so the minimal carrier is the second-order [`Tower2`], not a
+/// fourth-order tower. The third/fourth derivative tensors a `Tower4` would
+/// build are pure waste here — the `v`/`g`/`h` channels are bit-identical
+/// between the two towers by construction (the order-≤2 Leibniz / Faà-di-Bruno
+/// terms read only order-≤2 channels), so this is a strict, exact prune.
+type GJet = Tower2<1>;
 
 /// The continuous closure family on the window `[0, window]`.
 ///

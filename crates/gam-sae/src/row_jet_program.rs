@@ -40,7 +40,7 @@
 //! correctness proof of the hand kernel; disagreement names a dropped or
 //! sign-flipped cross block loudly. That oracle is the riding test below.
 
-use gam_math::jet_scalar::{JetScalar, Order2};
+use gam_math::jet_scalar::{JetScalar, Order1, Order2};
 use gam_math::jet_tower::Tower4;
 
 /// `1/self` for any [`JetScalar`] via Faà di Bruno on `f(u) = 1/u`
@@ -506,6 +506,42 @@ impl SaeReconstructionRowProgram {
             .map(|&(atom, basis_col)| {
                 let phi =
                     self.atoms[atom].basis_tower::<K, Order2<K>>(basis_col, &self.coord_slot[atom]);
+                gates[atom].mul(&phi)
+            })
+            .collect()
+    }
+
+    /// Packed β border-channel sub-jets for a batch of channels as the
+    /// FIRST-order jet [`Order1<K>`](gam_math::jet_scalar::Order1) — value +
+    /// gradient ONLY, no Hessian. The β-border consumer
+    /// (`fill_beta_border_channels_from_program`) reads exactly `.value()` (the
+    /// `beta` channel) and `.g()[a]` (the mixed `beta_deriv` / `beta_l_deriv`
+    /// channel); the reconstruction is linear in β so the Hessian-in-β vanishes
+    /// and the K×K Hessian that [`Self::beta_border_towers_packed`]'s `Order2`
+    /// builds is computed-and-discarded every call. This method drops that work:
+    /// `Order1`'s value/gradient are BIT-IDENTICAL to `Order2`'s (the order-≤1
+    /// channels never read a Hessian), proven by the `order1_*` oracle, while the
+    /// per-channel `gate.mul(basis)` skips the `K²` Hessian product.
+    ///
+    /// Same hoisting as [`Self::beta_border_towers_packed`]: gate jets built once
+    /// via [`Self::all_gates`], each channel multiplies its atom's gate by its
+    /// basis jet.
+    #[must_use]
+    pub fn beta_border_order1_packed<const K: usize>(
+        &self,
+        channels: &[(usize, usize)],
+    ) -> Vec<Order1<K>> {
+        assert_eq!(
+            self.n_primaries, K,
+            "SaeReconstructionRowProgram: tower arity K={K} must equal n_primaries={}",
+            self.n_primaries
+        );
+        let gates: Vec<Order1<K>> = self.all_gates::<K, Order1<K>>();
+        channels
+            .iter()
+            .map(|&(atom, basis_col)| {
+                let phi =
+                    self.atoms[atom].basis_tower::<K, Order1<K>>(basis_col, &self.coord_slot[atom]);
                 gates[atom].mul(&phi)
             })
             .collect()

@@ -8158,9 +8158,14 @@ impl SaeManifoldTerm {
         // the SAME gate_tower / basis_tower primitives as the reconstruction
         // column. Build all channels at once with the per-atom gate jet hoisted
         // (#932 perf): border channels sharing an atom reuse one gate jet instead
-        // of recomputing it. Bit-identical to per-channel `_packed`.
+        // of recomputing it. The reconstruction is LINEAR in β, so this consumer
+        // reads only the value (`beta`) and gradient (`beta_deriv` /
+        // `beta_l_deriv`) channels — never a Hessian — so the jets are built as
+        // first-order `Order1<K>` (value + grad), skipping the K×K Hessian the
+        // `Order2` path would compute and discard. `Order1`'s value/grad are
+        // bit-identical to `Order2`'s (#1591 order1 oracle).
         let chans: Vec<(usize, usize)> = border.iter().map(|c| (c.atom, c.basis_col)).collect();
-        let sjets = program.beta_border_towers_packed::<K>(&chans);
+        let sjets = program.beta_border_order1_packed::<K>(&chans);
         for (beta_pos, channel) in border.iter().enumerate() {
             let s = &sjets[beta_pos];
             let s_v = s.value();
