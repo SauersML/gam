@@ -1060,6 +1060,30 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                     joint_bundle,
                 ),
             };
+            // Scale-aware trust-metric floor for a free-scale-coupled block
+            // (#1569). A coupled location-scale survival fit drives some rows to
+            // small σ (large `exp(−η_σ)`), which inflates the time block's
+            // likelihood-Hessian diagonal on the rows it loads but UNDERSTATES the
+            // per-coordinate curvature scale for time coefficients loading mostly
+            // on large-σ rows. The affine-covariant Moré–Sorensen step then
+            // over-reaches on those coordinates (a tiny metric entry blows up the
+            // whitened component `c_k/(γ_k+λ)`), the gain ratio never justifies
+            // growing the radius, and the inner solve grinds. The family supplies
+            // a per-coordinate floor auto-derived from the scale-predictor
+            // magnitude (no knob); we take `max(D_i, floor_i)`, so the floor can
+            // only tighten the metric and is a no-op for every family that returns
+            // `None`. It shapes the trajectory only — the converged β, the KKT
+            // certificate, and the REML/LAML the residual feeds are unchanged.
+            let mut joint_trust_metric_diag = joint_trust_metric_diag;
+            if let Some(floor) = family.joint_trust_metric_block_floor(&states, specs)?
+                && floor.len() == joint_trust_metric_diag.len()
+            {
+                for (d, f) in joint_trust_metric_diag.iter_mut().zip(floor.iter()) {
+                    if f.is_finite() && *f > *d {
+                        *d = *f;
+                    }
+                }
+            }
             // HEAD-β JEFFREYS CACHE (gam#729/#808). The full Jeffreys/Firth triple
             // `(Φ, ∇Φ, H_Φ)` costs `p` family directional-derivative calls (the
             // `for k in 0..p` loop in `joint_jeffreys_term`); for a K-block coupled
