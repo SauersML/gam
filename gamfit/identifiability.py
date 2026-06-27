@@ -832,7 +832,7 @@ def identifiable_factor_fit(
         import torch as torch_mod
     except ImportError as exc:  # pragma: no cover - torch is a required extra
         raise ImportError(
-            "identifiable_factor_fit requires PyTorch; install gamfit[torch]"
+            "identifiable_factor_fit requires PyTorch; install with `pip install torch`"
         ) from exc
 
     aux_w = _resolve_weight(aux_prior_weight, "aux_prior_weight")
