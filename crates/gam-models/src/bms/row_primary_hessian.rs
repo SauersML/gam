@@ -1167,6 +1167,11 @@ impl BernoulliMarginalSlopeFamily {
         let mut coeff_au: Vec<[f64; 4]> = vec![[0.0; 4]; r];
         let mut coeff_bu: Vec<[f64; 4]> = vec![[0.0; 4]; r];
         let zero_family: Vec<[f64; 4]> = vec![[0.0; 4]; r];
+        // Reusable per-row observed-point coefficient families (reset to
+        // zero at the top of each row, mirroring coeff_u/au/bu above).
+        let mut g_u_fixed: Vec<[f64; 4]> = vec![[0.0; 4]; r];
+        let mut g_au_fixed: Vec<[f64; 4]> = vec![[0.0; 4]; r];
+        let mut g_bu_fixed: Vec<[f64; 4]> = vec![[0.0; 4]; r];
 
         for row in 0..n {
             let row_ctx = Self::row_ctx(cache, row);
@@ -1361,9 +1366,16 @@ impl BernoulliMarginalSlopeFamily {
             row_xi.push(xi_obs);
 
             // g_u_fixed / g_au_fixed / g_bu_fixed at z_obs (score) / u_obs (link).
-            let mut g_u_fixed: Vec<[f64; 4]> = vec![[0.0; 4]; r];
-            let mut g_au_fixed: Vec<[f64; 4]> = vec![[0.0; 4]; r];
-            let mut g_bu_fixed: Vec<[f64; 4]> = vec![[0.0; 4]; r];
+            // Reset the hoisted buffers to zero before refilling this row.
+            for slot in g_u_fixed.iter_mut() {
+                *slot = [0.0; 4];
+            }
+            for slot in g_au_fixed.iter_mut() {
+                *slot = [0.0; 4];
+            }
+            for slot in g_bu_fixed.iter_mut() {
+                *slot = [0.0; 4];
+            }
             g_u_fixed[1] = obs.dc_db;
             g_au_fixed[1] = obs.dc_dab;
             g_bu_fixed[1] = obs.dc_dbb;

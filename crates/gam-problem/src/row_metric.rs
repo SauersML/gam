@@ -481,6 +481,7 @@ impl RowMetric {
     /// whitens a Jacobian via `factor_entry` produce the identity whitening
     /// without a provenance branch. Reads the **un-floored** factors (criterion
     /// face, #747).
+    #[inline]
     pub fn factor_entry(&self, row: usize, i: usize, k: usize) -> f64 {
         match &self.factors {
             None => {
@@ -584,6 +585,7 @@ impl RowMetric {
     /// This is the criterion-facing squared residual the likelihood sums; it uses
     /// the **un-floored** `U_n U_nᵀ`, so the solver `δ` does not enter it
     /// (#747 invariant). Euclidean provenance returns the bit-identical `‖r_n‖²`.
+    #[inline]
     pub fn quad_form(&self, row: usize, r: ArrayView1<'_, f64>) -> f64 {
         match &self.factors {
             None => r.iter().map(|&v| v * v).sum(),
@@ -631,6 +633,7 @@ impl RowMetric {
     /// Fisher mass of a per-row output vector `x_n ∈ ℝ^p`: the scalar
     /// `x_nᵀ M_n x_n` (alias of [`Self::quad_form`] read as an information mass
     /// rather than a residual square). Factored, never `p × p`, `δ`-free.
+    #[inline]
     pub fn fisher_mass(&self, row: usize, x: ArrayView1<'_, f64>) -> f64 {
         self.quad_form(row, x)
     }

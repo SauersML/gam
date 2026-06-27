@@ -44,6 +44,7 @@ impl MultiDirJet {
         out
     }
 
+    #[inline]
     pub fn coeff(&self, mask: usize) -> f64 {
         self.coeffs[mask]
     }
