@@ -37,7 +37,7 @@ pub mod solver;
 // Domain-specific GPU kernels are isolated from the infrastructure modules.
 pub mod kernels;
 
-pub use cpu_traits::{ExecutionTarget, MatrixLocation};
+pub use cpu_traits::MatrixLocation;
 pub use device::GpuDeviceInfo;
 pub use device_runtime::GpuRuntime;
 pub use gpu_error::GpuError;
