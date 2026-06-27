@@ -546,7 +546,7 @@ jobs:
         run: |
           python -m pip install \
             'pytest>=8' 'numpy>=1.26' 'pandas>=2.0' 'pyarrow>=14' \
-            'matplotlib>=3.8' 'scikit-learn>=1.4'
+            'matplotlib>=3.8' 'scikit-learn>=1.4' 'scipy>=1.11'
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
