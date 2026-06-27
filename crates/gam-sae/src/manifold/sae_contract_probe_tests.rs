@@ -483,17 +483,13 @@ fn cotrain_fold_is_value_lane_only_so_gradient_lane_pair_is_consistent() {
         "both lanes must be finite: value={value_lane}, gradient={gradient_lane}"
     );
 
-    // The amortized warm-start on this arbitrary-target fixture certifies no
-    // rows (the conservative Kantorovich gate), so it leaves the inner coords
-    // untouched — which means the lanes and the bare criterions below all
-    // solve from the identical seed state and the bare comparisons are exact.
-    assert_eq!(
-        objective.warm_start_telemetry().total_rows_warm_started,
-        0,
-        "fixture precondition: warm-start must certify zero rows so the bare \
-         comparisons are drift-free; got {:?}",
-        objective.warm_start_telemetry()
-    );
+    // The amortized warm-start fires on this fixture (the basin-warmup fix lets the
+    // Kantorovich gate certify unit-amplitude rows), so it shifts the inner-coord
+    // seed of the value/gradient lanes. To keep the lane-vs-bare comparisons an
+    // ISOLATION of the consistency fold (not warm-start drift), each bare reference
+    // below is warm-started identically — the SAME `warm_start_latents_from_amortized_encoder`
+    // call the objective's `eval`/`eval_cost` apply — so the only remaining
+    // difference between a lane and its matched bare is the fold itself.
 
     // Bare REML for the VALUE lane, computed on the SAME probe refine policy
     // (`refine_progress_extension = false`) the value lane uses, plus the
@@ -503,6 +499,11 @@ fn cotrain_fold_is_value_lane_only_so_gradient_lane_pair_is_consistent() {
         let mut probe = warmstart_test_objective_with_evaluator();
         let target = probe.target.clone();
         let rho_state = probe.baseline_rho.from_flat(rho_flat.view());
+        // Warm-start identically to the value lane so the fold is isolated.
+        probe
+            .term
+            .warm_start_latents_from_amortized_encoder(target.view(), &rho_state)
+            .ok();
         let (reml, _loss) = probe
             .term
             .reml_criterion_with_refine_policy(
@@ -539,6 +540,11 @@ fn cotrain_fold_is_value_lane_only_so_gradient_lane_pair_is_consistent() {
         let mut probe = warmstart_test_objective_with_evaluator();
         let target = probe.target.clone();
         let rho_state = probe.baseline_rho.from_flat(rho_flat.view());
+        // Warm-start identically to the gradient lane so the fold is isolated.
+        probe
+            .term
+            .warm_start_latents_from_amortized_encoder(target.view(), &rho_state)
+            .ok();
         let (reml, _loss, _cache) = probe
             .term
             .reml_criterion_with_cache(
