@@ -79,14 +79,6 @@ pub fn make_beta_seed_validator(
 /// error construction (`EstimationError::InvalidInput`) never drift apart.
 pub use gam_problem::bail_if_cached_beta_non_finite;
 
-/// Positive floor applied to the time-derivative slope `a1 = q'(t)·c` before
-/// taking `ln(a1)` or `1/a1` in the survival marginal-slope likelihood. The
-/// monotonicity guard already enforces `a1 > derivative_guard`, but this is the
-/// last line of defence against a `ln(0)`/divide-by-zero blowing up the NLL or
-/// score when `a1` underflows to a denormal; set at the smallest power-of-ten
-/// double that keeps `ln` finite and the reciprocal representable.
-pub const SURVIVAL_SLOPE_LOG_DIVIDE_FLOOR: f64 = 1e-300;
-
 #[inline]
 pub const fn eval_coeff4_at(coefficients: &[f64; 4], z: f64) -> f64 {
     ((coefficients[3] * z + coefficients[2]) * z + coefficients[1]) * z + coefficients[0]

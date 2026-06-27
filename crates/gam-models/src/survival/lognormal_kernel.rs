@@ -125,29 +125,6 @@ impl FrailtySpec {
 
 // ─── Probit frailty scaling ──────────────────────────────────────────────────
 
-/// Probit frailty scaling factor s = 1/√(1+σ²) and its derivatives.
-///
-/// For Gaussian frailty on the final probit index:
-///   E[Φ(η + U)] = Φ(η · s)  where s = 1/√(1+σ²)
-///
-/// With t = log(σ), define α = σ²/(1+σ²).  Then:
-///   ∂_t s = -α·s
-///   ∂_{tt} s = α(3α-2)·s
-///   ∂_{ttt} s = α(-15α²+18α-4)·s
-///   ∂_{tttt} s = α(105α³-180α²+84α-8)·s
-#[derive(Clone, Copy, Debug)]
-pub struct ProbitFrailtyScale {
-    /// s = 1/√(1+σ²)
-    pub s: f64,
-}
-
-impl ProbitFrailtyScale {
-    pub fn new(sigma: f64) -> Self {
-        let (s, _) = probit_frailty_scale_components(sigma);
-        Self { s }
-    }
-}
-
 #[inline]
 fn probit_frailty_scale_components(sigma: f64) -> (f64, f64) {
     let abs_sigma = sigma.abs();
@@ -166,9 +143,9 @@ fn probit_frailty_scale_components(sigma: f64) -> (f64, f64) {
 ///
 /// Provides exact closed-form derivatives of s = 1/√(1+σ²) with respect to
 /// t = log(σ) for learnable Gaussian-shift frailty in the marginal-slope
-/// families.  All formulas follow from the recurrence documented on
-/// [`ProbitFrailtyScale`]; the auxiliary quantity α = σ²/(1+σ²) keeps each
-/// expression compact.
+/// families.  For Gaussian frailty on the final probit index
+/// E[Φ(η + U)] = Φ(η · s) with s = 1/√(1+σ²); writing α = σ²/(1+σ²) the
+/// derivatives are ∂_t s = −α·s and ∂_{tt} s = α(3α−2)·s.
 #[derive(Clone, Copy, Debug)]
 pub struct ProbitFrailtyScaleJet {
     /// s = 1/√(1+σ²)
