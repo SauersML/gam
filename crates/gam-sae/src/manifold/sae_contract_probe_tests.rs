@@ -916,6 +916,99 @@ fn cotrained_encoder_recovers_planted_manifold_at_least_as_well_as_sequential() 
     );
 }
 
+/// #1026 — curved-vs-linear reconstruction through the REAL solver at matched K=1,
+/// FAST (fixed-rho `run_joint_fit_arrow_schur` inner solve, not the ~90 s outer
+/// cascade). A periodic atom recovers a planted circle; a degree-1 euclidean
+/// (the principled linear-SAE baseline) atom on the SAME circle target can only fit
+/// a secant and is starved. Curved must clear a high absolute bar AND beat linear by
+/// a wide margin — the shatter penalty measured through the production inner solver,
+/// a cheap gam-sae-suite complement to the full-engine pin in tests/sae.
+#[test]
+fn sae_1026_curved_beats_linear_reconstruction_through_solver() {
+    let n = 48usize;
+    let p = 4usize;
+    let coords = Array2::from_shape_fn((n, 1), |(row, _)| (row as f64 + 0.5) / n as f64);
+
+    // Planted circle target: a smooth periodic decoder over the circle coordinate.
+    let (phi_c, jet_c) = periodic_basis(&coords);
+    let mc = phi_c.ncols();
+    let decoder_c = Array2::from_shape_fn((mc, p), |(b, c)| {
+        (1.0 / (1.0 + b as f64)) * ((b as f64 + 1.0) * (c as f64 + 1.0)).cos()
+    });
+    let target = phi_c.dot(&decoder_c);
+
+    // CURVED arm: one periodic atom on the circle.
+    let curved_ev = {
+        let atom = SaeManifoldAtom::new(
+            "circle",
+            SaeAtomBasisKind::Periodic,
+            1,
+            phi_c.clone(),
+            jet_c,
+            decoder_c.clone(),
+            Array2::<f64>::eye(mc),
+        )
+        .unwrap()
+        .with_basis_evaluator(Arc::new(TestPeriodicEvaluator));
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords.clone()],
+            vec![LatentManifold::Circle { period: 1.0 }],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let mut rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![array![1.0_f64.ln()]]);
+        term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+            .expect("curved inner solve converges on the planted circle");
+        let fitted = term.try_fitted_for_rho(&rho).unwrap();
+        reconstruction_explained_variance(target.view(), fitted.view()).unwrap()
+    };
+
+    // LINEAR arm: one degree-1 euclidean atom on the SAME circle target.
+    let linear_ev = {
+        let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 1).unwrap());
+        let (phi_l, jet_l) = evaluator.evaluate(coords.view()).unwrap();
+        let ml = phi_l.ncols();
+        let atom = SaeManifoldAtom::new(
+            "linear",
+            SaeAtomBasisKind::EuclideanPatch,
+            1,
+            phi_l,
+            jet_l,
+            Array2::<f64>::zeros((ml, p)),
+            Array2::<f64>::eye(ml),
+        )
+        .unwrap()
+        .with_basis_second_jet(evaluator);
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((n, 1)),
+            vec![coords.clone()],
+            vec![LatentManifold::Euclidean],
+            AssignmentMode::softmax(1.0),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        let mut rho = SaeManifoldRho::new(0.0, 0.8_f64.ln(), vec![Array1::<f64>::zeros(1)]);
+        term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 12, 0.1, 1.0e-4, 1.0e-4)
+            .expect("linear inner solve converges");
+        let fitted = term.try_fitted_for_rho(&rho).unwrap();
+        reconstruction_explained_variance(target.view(), fitted.view()).unwrap()
+    };
+
+    eprintln!("#1026 solver reconstruction: curved EV={curved_ev:.4}, linear EV={linear_ev:.4}");
+    assert!(
+        curved_ev > 0.9,
+        "the periodic atom must recover the planted circle through the solver (EV={curved_ev})"
+    );
+    assert!(
+        curved_ev > linear_ev + 0.2,
+        "curved must beat the matched-K linear baseline by a wide margin (the shatter \
+         penalty: a degree-1 secant cannot follow a closed circle): \
+         curved={curved_ev}, linear={linear_ev}"
+    );
+}
+
 #[test]
 pub(crate) fn deflated_solver_matches_plain_solve_when_no_gauge_is_installed() {
     let cache = diagonal_latent_cache(&[2.0_f64, 5.0, 7.0]);
