@@ -317,6 +317,94 @@ impl FlexJet for Jet2 {
     }
 }
 
+// ── Jet1: value + gradient only (grad-only path, no discarded Hessian) ──────
+
+/// The order-≤1 truncation of the same Leibniz / Faà di Bruno rules `Jet2`
+/// realises — value + gradient, **no Hessian channel**. The value and gradient
+/// arithmetic of `Jet2` never reads its own `h` channel (`v`/`g` depend only on
+/// `v`/`g`), so instantiating [`flex_row_nll`] at `Jet1` yields the value and
+/// gradient `f64::to_bits`-identical to the `Jet2` path while eliminating the
+/// entire `O(p²)` Hessian allocation + arithmetic. Used by the grad-only
+/// production caller (`flex_sensitivity.rs`, `want_hess == false`), which builds
+/// and then discards a full `p×p` Hessian under `Jet2`.
+#[derive(Clone)]
+struct Jet1 {
+    v: f64,
+    g: Vec<f64>,
+}
+
+impl Jet1 {
+    /// A jet from a value + gradient view (the grad-only timepoint packs carry no
+    /// `*_uv`, so only the value/gradient channels are ever supplied).
+    fn from_view(v: f64, g: ndarray::ArrayView1<'_, f64>) -> Self {
+        Jet1 {
+            v,
+            g: g.iter().copied().collect(),
+        }
+    }
+
+    /// The seeded primary `p_axis` at value `x`: unit gradient in slot `axis`.
+    fn primary(x: f64, axis: usize, p: usize) -> Self {
+        let mut g = vec![0.0; p];
+        if axis < p {
+            g[axis] = 1.0;
+        }
+        Jet1 { v: x, g }
+    }
+
+    #[inline]
+    fn p(&self) -> usize {
+        self.g.len()
+    }
+}
+
+impl FlexJet for Jet1 {
+    #[inline]
+    fn value(&self) -> f64 {
+        self.v
+    }
+    fn add(&self, o: &Self) -> Self {
+        let p = self.p();
+        let mut g = vec![0.0; p];
+        for i in 0..p {
+            g[i] = self.g[i] + o.g[i];
+        }
+        Jet1 { v: self.v + o.v, g }
+    }
+    fn sub(&self, o: &Self) -> Self {
+        let p = self.p();
+        let mut g = vec![0.0; p];
+        for i in 0..p {
+            g[i] = self.g[i] - o.g[i];
+        }
+        Jet1 { v: self.v - o.v, g }
+    }
+    fn mul(&self, o: &Self) -> Self {
+        let p = self.p();
+        let mut g = vec![0.0; p];
+        for i in 0..p {
+            g[i] = self.v * o.g[i] + self.g[i] * o.v;
+        }
+        Jet1 { v: self.v * o.v, g }
+    }
+    fn scale(&self, s: f64) -> Self {
+        Jet1 {
+            v: self.v * s,
+            g: self.g.iter().map(|&x| x * s).collect(),
+        }
+    }
+    fn compose_unary(&self, d: [f64; 5]) -> Self {
+        // Order-≤1 reads only [f, f'].
+        let p = self.p();
+        let (f, f1) = (d[0], d[1]);
+        let mut g = vec![0.0; p];
+        for i in 0..p {
+            g[i] = f1 * self.g[i];
+        }
+        Jet1 { v: f, g }
+    }
+}
+
 // ── Jet3: one-seed directional, contracted third (doc §A.2) ────────────────
 
 /// An [`Jet2`] base plus one nilpotent ε (`ε² = 0`) holding another [`Jet2`].
@@ -580,6 +668,21 @@ impl SurvivalMarginalSlopeFamily {
         let surv0 = surv_stack(eta0_v)?;
         let surv1 = surv_stack(eta1_v)?;
         let want_hess = eta1_h.is_some();
+        if !want_hess {
+            // Grad-only: the value/gradient channels never read the Hessian, so a
+            // value+gradient-only `Jet1` yields a `to_bits`-identical value+grad
+            // while dropping the discarded `O(p²)` Hessian alloc + arithmetic.
+            let eta0 = Jet1::from_view(eta0_v, eta0_g);
+            let eta1 = Jet1::from_view(eta1_v, eta1_g);
+            let chi1 = Jet1::from_view(chi1_v, chi1_g);
+            let d1 = Jet1::from_view(d1_v, d1_g);
+            let q1j = Jet1::primary(q1, primary.q1, p);
+            let qd1j = Jet1::primary(qd1, primary.qd1, p);
+            let out = flex_row_nll(&eta0, &eta1, &chi1, &d1, &q1j, &qd1j, surv0, surv1, wi, di);
+            let value = out.v + wi * di * std::f64::consts::TAU.ln();
+            let grad = Array1::from(out.g);
+            return Ok((value, grad, Array2::zeros((p, p))));
+        }
         let eta0 = Jet2::from_view(eta0_v, eta0_g, eta0_h);
         let eta1 = Jet2::from_view(eta1_v, eta1_g, eta1_h);
         let chi1 = Jet2::from_view(chi1_v, chi1_g, chi1_h);
@@ -589,11 +692,7 @@ impl SurvivalMarginalSlopeFamily {
         let out = flex_row_nll(&eta0, &eta1, &chi1, &d1, &q1j, &qd1j, surv0, surv1, wi, di);
         let value = out.v + wi * di * std::f64::consts::TAU.ln();
         let grad = Array1::from(out.g);
-        let hess = if want_hess {
-            Array2::from_shape_vec((p, p), out.h).map_err(|e| e.to_string())?
-        } else {
-            Array2::zeros((p, p))
-        };
+        let hess = Array2::from_shape_vec((p, p), out.h).map_err(|e| e.to_string())?;
         Ok((value, grad, hess))
     }
 
