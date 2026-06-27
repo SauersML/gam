@@ -1,6 +1,6 @@
 use gam_linalg::faer_ndarray::{
-    FaerLinalgError, default_rrqr_rank_alpha, fast_ab, fast_abt, fast_ata, fast_atb,
-    rrqr_nullspace_basis, rrqr_with_permutation,
+    default_rrqr_rank_alpha, fast_ab, fast_abt, fast_ata, fast_atb, rrqr_nullspace_basis,
+    rrqr_with_permutation,
 };
 pub(crate) use gam_linalg::faer_ndarray::FaerEigh;
 
@@ -46,8 +46,6 @@ use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use std::sync::Arc;
-
-use thiserror::Error;
 
 #[cfg(test)]
 mod prelude_lock_tests {
