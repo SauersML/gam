@@ -1,33 +1,15 @@
-# Project Specification
-
-- Autodiff is never used outside of tests as hand-derived derivatives
-  enable performance optimizations. Exception: external libraries may use
-  autodiff internally, for example PyTorch.
-- Finite differences are never used outside of tests. The only exception
-  is differentiating observed data when analytic differentiation is not
-  mathematically available.
-- Posterior mean is the default prediction target, never MAP.
-- Analytic closed forms should be supported in general for all model
-  types.
-- Penalties must be on the final function itself, not on model
-  coefficients. Exception: coefficient-space penalties are allowed when
-  they are exactly equivalent to the function-space penalty.
-- Fitting and inference must be fast across data scales, especially
-  large-scale data where solver strategy matters most.
+- Autodiff is never used outside of tests as hand-derived derivatives enable performance optimizations. Exception: not-our-code not-our-problem, e.g., obviously autodiff will be used internally by PyTorch.
+- Finite differences is never used outside of tests. Only exception: differentiating observed data, where it is provably impossible to use a function.
+- Posterior mean must always be the default (never MAP).
+- Analytic, closed-forms should be supported in general for all model types.
+- Penalties must always be on the final function itself, never on the model coefficients. Exception: when it can be proven that penalizing model coefficients is precisely equivalent to the function value approach.
+- Fitting and inference must be fast on all scales of data, but especially large-scale data where it matters the most (with seamless transitions between strategies).
 - Never vendor external software.
-- Python should be a thin wrapper over Rust and should avoid containing
-  math or substantial engine logic. Python, Rust, and CLI behavior should
-  stay in feature parity. Exception: Python logic needed for external
-  integrations such as PyTorch.
-- The program must not run out of memory on reasonably resourced
-  computers.
-- REML or LAML is used for fitting, never GCV.
-- Penalties, as priors toward no effect, should usually be present except
-  for obvious unpenalized terms such as intercepts.
-- Defaults should give the best model for the user.
-- Defaults should generally allow recovery of the null, empirical-Bayes
-  style. Users must opt into overfitting potential.
-- Large changes are acceptable when they materially improve the code.
-- XFAIL tests are not allowed. A failing test should always indicate
-  problematic behavior.
-- The goal of this project is never to copy existing reference implementations.
+- Python should be a thin wrapper over Rust, and should avoid containing math or much logic. The Python library generally be in feature and behavior parity with the Rust library and CLI. Exception to both: if Python logic is necessary for interaction with external software, e.g., PyTorch.
+- The program must never run out of memory on reasonably-resourced computers.
+- REML (or LAML) always used for fitting, never GCV.
+- Penalties (prior towards no effect) should usually be applied, except when obvious (e.g., an intercept generally should not have a penalty).
+- The default choices should give the best model for the user.
+- In general, the default should allow a configuration which recovers the null (empirical Bayes-like). Users must opt-in to overfitting potential, not the other way around.
+- Large, massive changes must be made if that would improve the code--it's not something to be avoided.
+- XFAIL pattern on tests is never allowed. A failing test should always indicate problematic behavior.
