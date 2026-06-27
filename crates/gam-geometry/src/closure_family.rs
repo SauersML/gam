@@ -85,6 +85,11 @@ fn sin_stack(theta: f64) -> [f64; 5] {
     [s, c, -s, -c, s]
 }
 
+#[inline]
+fn stack2(stack: [f64; 5]) -> [f64; 3] {
+    [stack[0], stack[1], stack[2]]
+}
+
 impl ClosureFamily {
     /// Build a closure family of `harmonics` Fourier pairs on `[0, window]`.
     pub fn new(harmonics: usize, window: f64) -> Self {
@@ -114,8 +119,8 @@ impl ClosureFamily {
             // θ = m·γ·s (linear in γ ⇒ its jet is exact and trivial, but we let
             // the tower carry it so the trig composition is exact to 2nd order).
             let theta = g.scale(m as f64 * s);
-            let cos_col = theta.compose_unary(cos_stack(theta.v));
-            let sin_col = theta.compose_unary(sin_stack(theta.v));
+            let cos_col = theta.compose_unary(stack2(cos_stack(theta.v)));
+            let sin_col = theta.compose_unary(stack2(sin_stack(theta.v)));
             let ci = 2 * m - 1;
             let si = 2 * m;
             value[ci] = cos_col.v;
