@@ -72,6 +72,8 @@ use std::sync::OnceLock;
 
 use gam_gpu::gpu_error::GpuError;
 #[cfg(target_os = "linux")]
+use gam_gpu::gpu_err;
+#[cfg(target_os = "linux")]
 use gam_gpu::gpu_error::GpuResultExt;
 
 #[cfg(target_os = "linux")]

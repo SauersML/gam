@@ -34,6 +34,8 @@ use std::sync::OnceLock;
 use cudarc::driver::{CudaModule, CudaStream, LaunchConfig, PushKernelArg};
 
 #[cfg(target_os = "linux")]
+use gam_gpu::gpu_err;
+#[cfg(target_os = "linux")]
 use gam_gpu::gpu_error::GpuError;
 #[cfg(target_os = "linux")]
 use gam_gpu::gpu_error::GpuResultExt;

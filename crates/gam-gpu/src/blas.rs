@@ -738,7 +738,7 @@ mod cuda_impl {
     }
 
     #[inline]
-    pub(crate) fn xt_diag_x_cuda(
+    pub fn xt_diag_x_cuda(
         runtime: &GpuRuntime,
         x: ArrayView2<'_, f64>,
         w: ArrayView1<'_, f64>,
@@ -764,7 +764,7 @@ mod cuda_impl {
     }
 
     #[inline]
-    pub(crate) fn xt_diag_y_cuda(
+    pub fn xt_diag_y_cuda(
         runtime: &GpuRuntime,
         x: ArrayView2<'_, f64>,
         w: ArrayView1<'_, f64>,
@@ -868,6 +868,13 @@ mod cuda_impl {
 #[cfg(target_os = "linux")]
 pub(crate) use cuda_impl::{
     ResidentWeightedGram, gemm_abt_strided_batched_cuda, gemm_broadcast_b_batched_cuda, gemm_cuda,
-    gemm_on_ordinal_cuda, gemv_cuda, joint_hessian_2x2_cuda, trsm_cuda, xt_diag_x_cuda,
-    xt_diag_x_on_ordinal_cuda, xt_diag_y_cuda,
+    gemm_on_ordinal_cuda, gemv_cuda, joint_hessian_2x2_cuda, trsm_cuda, xt_diag_x_on_ordinal_cuda,
 };
+// Cross-crate cuBLAS entry points (gam-models BMS Hessian paths call these
+// directly): the #1521 carve promoted the sibling solver/GEMM entry points to
+// `pub` but left these two `pub(crate)`, so they were invisible to their
+// out-of-crate callers (E0603) on the linux cuda build that the workspace
+// `cargo check` config does not exercise. Promote to match the rest of the
+// cross-crate cuBLAS surface.
+#[cfg(target_os = "linux")]
+pub use cuda_impl::{xt_diag_x_cuda, xt_diag_y_cuda};
