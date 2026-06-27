@@ -417,7 +417,7 @@ impl Lane for f64 {
         self * o
     }
     #[inline]
-    fn lane(self, _i: usize) -> f64 {
+    fn lane(self, _: usize) -> f64 {
         self
     }
     #[inline]
@@ -1931,7 +1931,10 @@ mod batch_tests {
         2.0 * u - 1.0
     }
 
-    fn check_k<const K: usize>(state: &mut u64, batches: usize) {
+    /// Returns the number of (batch, row) pairs whose every channel was
+    /// verified bit-identical, so the caller can assert the expected total ran.
+    fn check_k<const K: usize>(state: &mut u64, batches: usize) -> usize {
+        let mut verified_rows = 0usize;
         for _ in 0..batches {
             // Four independent rows of K primary values.
             let rows: [[f64; K]; 4] =
@@ -1989,8 +1992,10 @@ mod batch_tests {
                         );
                     }
                 }
+                verified_rows += 1;
             }
         }
+        verified_rows
     }
 
     /// ≥2000 random 4-row batches per K, across K ∈ {2,3,4,9}: every channel of
@@ -1998,10 +2003,13 @@ mod batch_tests {
     #[test]
     fn batch_lanes_bit_identical_to_scalar_per_row() {
         let mut state = 0x9E37_79B9_7F4A_7C15_u64;
-        check_k::<2>(&mut state, 2000);
-        check_k::<3>(&mut state, 2000);
-        check_k::<4>(&mut state, 2000);
-        check_k::<9>(&mut state, 2000);
+        let mut verified = 0usize;
+        verified += check_k::<2>(&mut state, 2000);
+        verified += check_k::<3>(&mut state, 2000);
+        verified += check_k::<4>(&mut state, 2000);
+        verified += check_k::<9>(&mut state, 2000);
+        // 4 K-values × 2000 batches × 4 packed rows each, all bit-identical.
+        assert_eq!(verified, 4 * 2000 * 4, "every batch row must be verified");
     }
 
     // ── One-/two-seed lane oracles ──────────────────────────────────────────
