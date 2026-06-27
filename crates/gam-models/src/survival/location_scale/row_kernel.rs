@@ -381,6 +381,25 @@ impl SurvivalLsRowKernel<'_> {
         }
     }
 
+    /// Per-row cached `(coefficient_offset, dense_design_row)` for each of the
+    /// nine primary channels, materialized ONCE so the batched directional
+    /// override reuses it for every swept axis instead of re-running
+    /// [`Self::channel_row`] for every `(row, axis)` pair. Channel `c`'s entry is
+    /// `None` exactly when [`Self::channel_block`]`(c).zip(`[`Self::channel_row`]
+    /// `(c, row))` is — i.e. the time-invariant derivative channels (5/8) whose
+    /// design is absent — so the cached-pullback walk is structurally identical to
+    /// [`Self::add_pullback_hessian`].
+    fn cached_channel_rows(&self, row: usize) -> Vec<Option<(usize, Array1<f64>)>> {
+        (0..SLS_ROW_K)
+            .map(
+                |ch| match (self.channel_block(ch), self.channel_row(ch, row)) {
+                    (Some(blk), Some(r)) => Some((self.offsets[blk], r)),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
     pub(crate) fn row_primary_values(&self, row: usize) -> [f64; SLS_ROW_K] {
         let inv_sigma_exit = self.dynamic.inv_sigma_exit[row];
         let eta_t_exit = -self.dynamic.q_exit[row] / inv_sigma_exit;
@@ -1062,6 +1081,75 @@ pub(crate) fn survival_ls_wiggle_second_directional_derivative_dense(
     }
 }
 
+/// Extract the unit-axis primary direction `J·e_a` from the per-row channel
+/// cache. For the canonical axis `e_a` (a unit vector at global coefficient `a`)
+/// the survival-LS Jacobian action collapses to: channel `c` carries
+/// `design_row_c[a − offset_c]` when `a` lies in channel `c`'s coefficient block,
+/// and `0` otherwise. This is `to_bits`-identical to
+/// [`SurvivalLsRowKernel::jacobian_action`]`(row, e_a)`: that path forms each
+/// channel as `design_row · e_a_block`, a dot product whose only surviving term
+/// is `design_row[a − offset]·1.0`, with every other summand `·0.0` (and
+/// `x + 0.0 == x`, `x·1.0 == x` exactly for finite `x`). Reading the entry
+/// directly avoids the per-axis dot product entirely.
+#[inline]
+fn axis_direction_from_channel_cache(
+    chans: &[Option<(usize, Array1<f64>)>],
+    a: usize,
+) -> [f64; SLS_ROW_K] {
+    let mut dir = [0.0_f64; SLS_ROW_K];
+    for (c, slot) in chans.iter().enumerate() {
+        if let Some((off, ra)) = slot.as_ref()
+            && a >= *off
+            && a - *off < ra.len()
+        {
+            dir[c] = ra[a - *off];
+        }
+    }
+    dir
+}
+
+/// Accumulate `Σ_{x,y} (w·t[x][y]) · (row_x ⊗ row_y)` into the dense `p×p`
+/// `target` using the per-row channel cache, with the float operations in the
+/// EXACT order [`SurvivalLsRowKernel::add_pullback_hessian`] uses (outer `x`,
+/// inner `y`, then `ia`, `ib`; `hab·va` formed before `·vb`). The weight is
+/// folded as `hab = w·t[x][y]`, which is `to_bits`-identical to both branches of
+/// the generic per-axis reducer: the unit-weight branch passes `t` unscaled
+/// (`hab = 1.0·t[x][y] == t[x][y]`) and the Horvitz–Thompson branch first builds
+/// `scaled[x][y] = w·t[x][y]` (`1.0·x == x`, `w·0.0 == ±0.0 == 0.0` so the
+/// `hab == 0.0` skip fires identically).
+#[inline]
+fn pullback_from_channel_cache(
+    chans: &[Option<(usize, Array1<f64>)>],
+    t: &[[f64; SLS_ROW_K]; SLS_ROW_K],
+    w: f64,
+    target: &mut Array2<f64>,
+) {
+    for x in 0..SLS_ROW_K {
+        let Some((off_a, ra)) = chans[x].as_ref() else {
+            continue;
+        };
+        for y in 0..SLS_ROW_K {
+            let hab = w * t[x][y];
+            if hab == 0.0 {
+                continue;
+            }
+            let Some((off_b, rb)) = chans[y].as_ref() else {
+                continue;
+            };
+            for (ia, &va) in ra.iter().enumerate() {
+                if va == 0.0 {
+                    continue;
+                }
+                let wv = hab * va;
+                let mut trow = target.row_mut(off_a + ia);
+                for (ib, &vb) in rb.iter().enumerate() {
+                    trow[off_b + ib] += wv * vb;
+                }
+            }
+        }
+    }
+}
+
 impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
     fn n_rows(&self) -> usize {
         self.family.n
@@ -1306,38 +1394,42 @@ impl crate::row_kernel::RowKernel<SLS_ROW_K> for SurvivalLsRowKernel<'_> {
         };
         Some((|| {
             let n = self.n_rows();
-            // One special-function-heavy per-row NLL stack build, shared by every axis.
+            // Two per-row builds shared by EVERY axis, so the special-function and
+            // design-materialization cost is paid once instead of `p` times:
+            //   * `inputs[row]`  — the special-function-heavy NLL derivative stack
+            //     (`exact_row_kernel_rescaled`: exp / log / log-Φ ladders), and
+            //   * `chans[row]`   — the nine channels' dense design rows, which the
+            //     per-axis pullback previously re-materialized through
+            //     `channel_row`/`add_pullback_hessian` for every `(row, axis)`.
+            // The unit-axis direction is then read straight out of `chans`
+            // (`axis_direction_from_channel_cache`), retiring the per-axis
+            // `jacobian_action` dot products as well. Only the cheap `OneSeed` jet
+            // contraction (which fixes the bit-identity contract) stays in the
+            // `p`-loop.
             let inputs: Vec<([f64; SLS_ROW_K], SurvivalExactRowKernel)> = (0..n)
                 .into_par_iter()
                 .map(|row| self.row_nll_inputs(row))
                 .collect::<Result<Vec<_>, String>>()?;
+            let chans: Vec<Vec<Option<(usize, Array1<f64>)>>> = (0..n)
+                .into_par_iter()
+                .map(|row| self.cached_channel_rows(row))
+                .collect();
             (0..p)
                 .into_par_iter()
                 .map(|a| {
-                    let mut e_a = vec![0.0_f64; p];
-                    e_a[a] = 1.0;
                     gam_problem::with_nested_parallel(|| {
                         rows.par_try_reduce_fold(
                             n,
                             || Array2::<f64>::zeros((p, p)),
                             |mut acc, row, w| -> Result<_, String> {
-                                let dir_k = self.jacobian_action(row, &e_a);
+                                let chrow = &chans[row];
+                                let dir_k = axis_direction_from_channel_cache(chrow, a);
                                 let (primary, kernel) = &inputs[row];
                                 let vars: [OneSeed<SLS_ROW_K>; SLS_ROW_K] = std::array::from_fn(
                                     |c| OneSeed::seed_direction(primary[c], c, dir_k[c]),
                                 );
                                 let third = sls_row_nll(&vars, kernel)?.contracted_third();
-                                if w == 1.0 {
-                                    self.add_pullback_hessian(row, &third, &mut acc);
-                                } else {
-                                    let mut scaled = [[0.0_f64; SLS_ROW_K]; SLS_ROW_K];
-                                    for x in 0..SLS_ROW_K {
-                                        for y in 0..SLS_ROW_K {
-                                            scaled[x][y] = w * third[x][y];
-                                        }
-                                    }
-                                    self.add_pullback_hessian(row, &scaled, &mut acc);
-                                }
+                                pullback_from_channel_cache(chrow, &third, w, &mut acc);
                                 Ok(acc)
                             },
                             |x, y| Ok(x + y),
