@@ -154,15 +154,19 @@ void sae_rowjet_softmax(
   double* F = first + (size_t)row * KK * PP;
   double* S = second + (size_t)row * KK * KK * PP;
   for (int c = threadIdx.x; c < PP; c += blockDim.x) {
-    Jet acc; jet_const(&acc, 0.0);
-    for (int k=0;k<KK;++k){
-      double dval = DEC[k*PP + c];
-      Jet term; jet_scale(&gates[k], dval, &term);
-      Jet na; jet_add(&acc, &term, &na); acc = na;
-    }
     for (int a=0;a<KK;++a){
-      F[a*PP + c] = acc.g[a];
-      for (int b=0;b<KK;++b) S[(a*KK + b)*PP + c] = acc.h[a][b];
+      double fg = 0.0;
+      double sh[KK];
+      for (int b=0;b<KK;++b) sh[b] = 0.0;
+      for (int k=0;k<KK;++k) {
+        double dval = DEC[k*PP + c];
+        fg += gates[k].g[a] * dval;
+        for (int b=0;b<KK;++b) sh[b] += gates[k].h[a][b] * dval;
+      }
+      F[a*PP + c] = fg;
+      for (int b=0;b<KK;++b) {
+        S[(a*KK + b)*PP + c] = sh[b];
+      }
     }
   }
 }
