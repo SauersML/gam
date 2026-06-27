@@ -1235,7 +1235,7 @@ impl BernoulliMarginalSlopeFamily {
                 ));
             }
         };
-        let psi_map = gam_solve::custom_family::resolve_custom_family_x_psi_map(
+        let psi_map = gam_custom_family::resolve_custom_family_x_psi_map(
             deriv,
             n,
             p_psi,
@@ -1465,7 +1465,7 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         // Build psi design maps once outside the row loop.
-        let psi_map_i = gam_solve::custom_family::resolve_custom_family_x_psi_map(
+        let psi_map_i = gam_custom_family::resolve_custom_family_x_psi_map(
             deriv_i,
             n,
             p_psi_i,
@@ -1473,7 +1473,7 @@ impl BernoulliMarginalSlopeFamily {
             label_i,
             &self.policy,
         )?;
-        let psi_map_j = gam_solve::custom_family::resolve_custom_family_x_psi_map(
+        let psi_map_j = gam_custom_family::resolve_custom_family_x_psi_map(
             deriv_j,
             n,
             p_psi_j,
@@ -1483,7 +1483,7 @@ impl BernoulliMarginalSlopeFamily {
         )?;
         let psi_map_ij = if block_i == block_j {
             Some(
-                gam_solve::custom_family::resolve_custom_family_x_psi_psi_map(
+                gam_custom_family::resolve_custom_family_x_psi_psi_map(
                     deriv_i,
                     deriv_j,
                     local_j,
@@ -1810,7 +1810,7 @@ impl BernoulliMarginalSlopeFamily {
         struct AxisInfo {
             pub(crate) block: usize,
             pub(crate) dir_idx: usize,
-            pub(crate) map: gam_solve::custom_family::PsiDesignMap,
+            pub(crate) map: gam_custom_family::PsiDesignMap,
             pub(crate) deriv_block: usize,
             pub(crate) deriv_local: usize,
         }
@@ -1831,7 +1831,7 @@ impl BernoulliMarginalSlopeFamily {
                 _ => return Ok(None),
             };
             let deriv = &derivative_blocks[block][local];
-            let map = gam_solve::custom_family::resolve_custom_family_x_psi_map(
+            let map = gam_custom_family::resolve_custom_family_x_psi_map(
                 deriv,
                 n,
                 p_psi,
@@ -1858,7 +1858,7 @@ impl BernoulliMarginalSlopeFamily {
         // path needs Σ_j α_j (∂²X/∂ψ_i∂ψ_j · β) per output row i.
         let mut cross_maps: std::collections::HashMap<
             (usize, usize),
-            gam_solve::custom_family::PsiDesignMap,
+            gam_custom_family::PsiDesignMap,
         > = std::collections::HashMap::new();
         for i in 0..psi_dim {
             for j in 0..psi_dim {
@@ -1880,7 +1880,7 @@ impl BernoulliMarginalSlopeFamily {
                 };
                 let deriv_i = &derivative_blocks[axes[i].deriv_block][axes[i].deriv_local];
                 let deriv_j = &derivative_blocks[axes[j].deriv_block][axes[j].deriv_local];
-                let map = gam_solve::custom_family::resolve_custom_family_x_psi_psi_map(
+                let map = gam_custom_family::resolve_custom_family_x_psi_psi_map(
                     deriv_i,
                     deriv_j,
                     axes[j].deriv_local,
@@ -2261,7 +2261,7 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         // Build the psi design map once; rowwise calls use direct row_vector(row).
-        let psi_map = gam_solve::custom_family::resolve_custom_family_x_psi_map(
+        let psi_map = gam_custom_family::resolve_custom_family_x_psi_map(
             deriv,
             n,
             p_psi,
@@ -2403,7 +2403,7 @@ impl BernoulliMarginalSlopeFamily {
         };
 
         // Build the psi design map once; rowwise calls use direct row_vector(row).
-        let psi_map = gam_solve::custom_family::resolve_custom_family_x_psi_map(
+        let psi_map = gam_custom_family::resolve_custom_family_x_psi_map(
             deriv,
             n,
             p_psi,

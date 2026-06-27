@@ -5,7 +5,7 @@
 
 use super::*;
 use super::blockwise_solve::BlockWorkingSetUpdaterExt;
-use crate::row_measure::RowSubsampleMaskExt;
+use gam_solve::row_measure::RowSubsampleMaskExt;
 
 pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
@@ -735,8 +735,8 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // discipline (grow on flat, reset on recovery) is the shared
         // loop_guard::FlatStreak so it cannot drift from the other
         // stagnation detectors in the tree (#968).
-        let mut obj_flat_streak = crate::loop_guard::FlatStreak::new(
-            crate::loop_guard::PLATEAU_DEFAULT_WINDOW,
+        let mut obj_flat_streak = gam_solve::loop_guard::FlatStreak::new(
+            gam_solve::loop_guard::PLATEAU_DEFAULT_WINDOW,
         );
         // Total descent budget across the joint-Newton loop, used by
         // the end-of-loop summary to report `descent_total`.
@@ -774,7 +774,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
         // budget is spent returns a catchable error in O(1) instead of paying
         // another cycle 0. A solve started past the deadline cannot improve a
         // within-budget result. No-op when no deadline is armed.
-        if crate::rho_optimizer::outer_wall_clock_deadline_exceeded() {
+        if gam_solve::rho_optimizer::outer_wall_clock_deadline_exceeded() {
             return Err(
                 "coupled exact-joint inner solve abandoned at entry: the fit-level wall-clock \
                  budget was exhausted before this solve began — returning a bounded catchable \
@@ -790,7 +790,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             if cycle >= inner_max_cycles {
                 break;
             }
-            if cycle > 0 && crate::rho_optimizer::outer_wall_clock_deadline_exceeded() {
+            if cycle > 0 && gam_solve::rho_optimizer::outer_wall_clock_deadline_exceeded() {
                 // gam#979: the fit-level wall-clock budget is spent. Stop at the
                 // current best-effort iterate so the outer search (which would
                 // otherwise grind every remaining screening stage / seed / plan
@@ -828,7 +828,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // in the cycle, then hard-fail (Err) just before ρ if any of them
             // diverged. Cf. `src/solver/row_measure.rs`.
             let tr_row_measure_top =
-                crate::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
+                gam_solve::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
             let hessian_started = std::time::Instant::now();
             let hessian_scope_guard = gam_runtime::process_monitor::track_scope(format!(
                 "joint Newton hessian_qp cycle={cycle} n={total_joint_n} p={total_p}"
@@ -899,7 +899,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             };
             // Row measure observed by the Hessian build above.
             let tr_row_measure_hessian =
-                crate::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
+                gam_solve::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
             let joint_hessian_source = match joint_hessian_source {
                 Some(source) => source,
                 None => {
@@ -951,7 +951,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // now, the id captured here will diverge from the rest and the
             // pre-ρ check below will Err. Cf. `src/solver/row_measure.rs`.
             let tr_row_measure_gradient =
-                crate::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
+                gam_solve::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
             if grad_joint.len() != total_p {
                 break;
             }
@@ -1859,7 +1859,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // set on the previous cycle (or at function entry) under `options`;
             // see top-of-cycle capture for rationale.
             let tr_row_measure_old_objective =
-                crate::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
+                gam_solve::row_measure::RowSubsampleMask::from_options(options, total_joint_n);
             let mut accepted = false;
             let mut accepted_joint_workspace: Option<Arc<dyn ExactNewtonJointHessianWorkspace>> =
                 None;
@@ -2317,7 +2317,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 if let Some(constraints) = joint_constraints.as_ref() {
                     let trial_beta = &beta_joint + &trial_delta;
                     if check_linear_feasibility(&trial_beta, constraints, 1e-8).is_err() {
-                        match crate::active_set::project_point_strictly_into_feasible_cone(
+                        match gam_solve::active_set::project_point_strictly_into_feasible_cone(
                             &trial_beta,
                             constraints,
                         ) {
@@ -2673,7 +2673,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // any further auto-install; if either contract is broken the
                 // id will diverge from `tr_row_measure_top` and we Err below.
                 let tr_row_measure_trial =
-                    crate::row_measure::RowSubsampleMask::from_options(
+                    gam_solve::row_measure::RowSubsampleMask::from_options(
                         options,
                         total_joint_n,
                     );
@@ -2921,7 +2921,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                         &mut cached_active_sets,
                         &block_constraints,
                         &states,
-                        crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
+                        gam_solve::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL,
                     );
                     if tight_rows_added > 0 {
                         log::info!(
@@ -4997,7 +4997,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // (gam#553) — and the iterate IS the REML optimum on the
             // identifiable subspace. Report converged.
             let plateau_verdict = obj_flat_streak.note(objective_change <= objective_tol);
-            if plateau_verdict == crate::loop_guard::LoopVerdict::Plateaued
+            if plateau_verdict == gam_solve::loop_guard::LoopVerdict::Plateaued
                 && range_projected_block_stationarity_small()
                 && let Some(range_residual) = projected_residual_range_space_inf(
                     &projected_residual_vec,
@@ -5118,7 +5118,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
                 // Single source of truth for the slow-geometric-rate projection
                 // (gam#979): deterministic cycle-count projection, no wall-clock.
                 let too_slow =
-                    crate::loop_guard::slow_geometric_rate_exceeds_projection_cap(
+                    gam_solve::loop_guard::slow_geometric_rate_exceeds_projection_cap(
                         residual,
                         oldest,
                         LINEAR_RATE_WINDOW,
@@ -5188,7 +5188,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             // flags. The honest status is then non-converged: downgrade it so
             // the outer REML/LAML evaluation rejects this ρ rather than
             // consuming a phantom optimum certified on no finite residual.
-            if !crate::loop_guard::inner_convergence_is_truthful(
+            if !gam_solve::loop_guard::inner_convergence_is_truthful(
                 converged,
                 min_certified_residual,
             ) {
@@ -5612,7 +5612,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
     // clamped-step side condition below stay local — they are policy about
     // what counts as flat, which this loop rightly owns.
     let mut frozen_loglik_streak =
-        crate::loop_guard::FlatStreak::new(DIVERGENCE_FROZEN_LOGLIK_CYCLES);
+        gam_solve::loop_guard::FlatStreak::new(DIVERGENCE_FROZEN_LOGLIK_CYCLES);
     // Coordinate descent visits each block in turn, so `max_proposed_step`
     // (the per-cycle max across blocks) only fires the cap on cycles where
     // the divergent block is the active one. On a near-null direction this
@@ -6110,7 +6110,7 @@ pub(crate) fn inner_blockwise_fit<F: CustomFamily + Clone + Send + Sync + 'stati
             clamped_step_in_frozen_run = false;
         }
         prev_log_likelihood_for_divergence_check = cached_eval.log_likelihood;
-        if frozen_verdict == crate::loop_guard::LoopVerdict::Plateaued
+        if frozen_verdict == gam_solve::loop_guard::LoopVerdict::Plateaued
             && clamped_step_in_frozen_run
         {
             log::warn!(

@@ -110,7 +110,7 @@ pub(crate) fn firth_default_barrier_terms(theta: f64, upper: f64, r: f64) -> (f6
 /// `shape`, an `Independent` whose length disagrees with `ρ`, or a nested
 /// `Independent`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum InvalidPriorPolicy {
+pub enum InvalidPriorPolicy {
     /// Return a descriptive [`RhoPriorError`]. Used by custom-family handling,
     /// which validates configuration up front and reports problems precisely.
     HardError,
@@ -123,7 +123,7 @@ pub(crate) enum InvalidPriorPolicy {
 /// Structured malformed-prior diagnostic produced under
 /// [`InvalidPriorPolicy::HardError`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RhoPriorError {
+pub enum RhoPriorError {
     /// A length / shape disagreement (e.g. an `Independent` prior whose number
     /// of coordinates does not match `ρ`).
     DimensionMismatch { reason: String },
@@ -144,7 +144,7 @@ impl RhoPriorError {
 
 /// Cost, gradient, and (optional) diagonal Hessian of the configured ρ prior.
 #[derive(Debug, Clone)]
-pub(crate) struct RhoPriorEval {
+pub struct RhoPriorEval {
     pub cost: f64,
     pub gradient: Array1<f64>,
     /// Diagonal Hessian, `Some` only when at least one entry is non-zero.
@@ -222,7 +222,7 @@ pub(crate) fn saturated(len: usize) -> RhoPriorEval {
 /// a malformed prior yields the saturated `+inf`/`NaN` contribution and never
 /// errors; under [`InvalidPriorPolicy::HardError`] it returns the structured
 /// [`RhoPriorError`].
-pub(crate) fn evaluate(
+pub fn evaluate(
     prior: &RhoPrior,
     rho: &Array1<f64>,
     policy: InvalidPriorPolicy,
@@ -238,7 +238,7 @@ pub(crate) fn evaluate(
 
 /// Strict evaluation: always errors on a malformed prior. Policy mapping lives
 /// in [`evaluate`].
-pub(crate) fn evaluate_strict(
+pub fn evaluate_strict(
     prior: &RhoPrior,
     rho: &Array1<f64>,
 ) -> Result<RhoPriorEval, RhoPriorError> {

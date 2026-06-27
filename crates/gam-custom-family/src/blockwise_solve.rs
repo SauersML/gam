@@ -34,7 +34,7 @@ pub(crate) fn aggregate_labeled_hessian(
     Ok(out)
 }
 
-/// Adapter over the shared [`rho_prior_eval`](crate::rho_prior_eval)
+/// Adapter over the shared [`rho_prior_eval`](gam_solve::rho_prior_eval)
 /// engine using the custom-family invalid-prior policy
 /// (`HardError`): the prior math is shared with the REML/LAML runtime, and a
 /// malformed prior surfaces as a structured [`CustomFamilyError`] rather than
@@ -43,8 +43,8 @@ pub(crate) fn rho_prior_cost_gradient_hessian(
     prior: &gam_problem::RhoPrior,
     rho: &Array1<f64>,
 ) -> Result<(f64, Array1<f64>, Option<Array2<f64>>), String> {
-    use crate::rho_prior_eval::{InvalidPriorPolicy, RhoPriorError};
-    match crate::rho_prior_eval::evaluate(prior, rho, InvalidPriorPolicy::HardError) {
+    use gam_solve::rho_prior_eval::{InvalidPriorPolicy, RhoPriorError};
+    match gam_solve::rho_prior_eval::evaluate(prior, rho, InvalidPriorPolicy::HardError) {
         Ok(eval) => Ok((eval.cost, eval.gradient, eval.hessian)),
         Err(RhoPriorError::DimensionMismatch { reason }) => {
             Err(CustomFamilyError::DimensionMismatch { reason }.into())
@@ -94,7 +94,7 @@ pub(crate) fn add_labeled_rho_prior_to_outer_eval(
     if eval_mode == EvalMode::ValueGradientHessian
         && let Some(prior_hessian) = hessian
     {
-        crate::objective_base::add_rho_block_dense_to_hessian(
+        gam_solve::objective_base::add_rho_block_dense_to_hessian(
             &mut result.outer_hessian,
             &prior_hessian,
         )?;
@@ -1401,7 +1401,7 @@ pub(crate) fn check_linear_feasibility(
         };
         let beta_inf = beta.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
         let interior_outcome =
-            match crate::active_set::project_point_strictly_into_feasible_cone(
+            match gam_solve::active_set::project_point_strictly_into_feasible_cone(
                 beta,
                 constraints,
             ) {
@@ -1414,7 +1414,7 @@ pub(crate) fn check_linear_feasibility(
             };
         let boundary_outcome = {
             let identity = Array2::<f64>::eye(beta.len());
-            match crate::active_set::solve_quadratic_with_linear_constraints(
+            match gam_solve::active_set::solve_quadratic_with_linear_constraints(
                 &identity,
                 beta,
                 beta,

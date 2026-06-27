@@ -102,7 +102,8 @@ pub mod wiggle;
 // call site across the families that stayed here (and external `gam_models::X`
 // consumers) resolves unchanged — no code is duplicated.
 pub use gam_model_kernels::{
-    cell_moment_family, cubic_cell_kernel, inverse_link, monotone_root, scale_design, sigma_link,
+    cell_moment_family, cubic_cell_kernel, inverse_link, monotone_root, penalized_projection,
+    scale_design, sigma_link,
 };
 
 pub use gam_identifiability::families::compiler::{

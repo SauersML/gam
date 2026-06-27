@@ -9,7 +9,7 @@ pub fn fit_custom_family<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-) -> Result<crate::model_types::UnifiedFitResult, CustomFamilyError> {
+) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
     fit_custom_family_with_rho_prior(family, specs, options, gam_problem::RhoPrior::Flat)
 }
 
@@ -59,7 +59,7 @@ pub(crate) fn lift_fit_geometry_to_raw(
     (lifted_cov, lifted_geom)
 }
 
-fn gauge_is_identity(gauge: &crate::gauge::Gauge) -> bool {
+fn gauge_is_identity(gauge: &gam_solve::gauge::Gauge) -> bool {
     if gauge.raw_total() != gauge.reduced_total() {
         return false;
     }
@@ -109,7 +109,7 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     pub(crate) penalized_objective: f64,
     pub(crate) outer_iterations: usize,
     pub(crate) outer_gradient_norm: Option<f64>,
-    pub(crate) criterion_certificate: Option<crate::rho_optimizer::CriterionCertificate>,
+    pub(crate) criterion_certificate: Option<gam_solve::rho_optimizer::CriterionCertificate>,
     pub(crate) outer_converged: bool,
     pub(crate) context: &'static str,
 }
@@ -117,7 +117,7 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
 pub(crate) fn assemble_custom_family_fit_result(
     inner: BlockwiseInnerResult,
     assembly: BlockwiseFitAssembly<'_>,
-) -> Result<crate::model_types::UnifiedFitResult, CustomFamilyError> {
+) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
     let BlockwiseFitAssembly {
         rho_physical,
         covariance_conditional,
@@ -522,7 +522,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_prior: gam_problem::RhoPrior,
-) -> Result<crate::model_types::UnifiedFitResult, CustomFamilyError> {
+) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
     // Multi-output families that omitted the per-block channel callback get it
     // installed here from their declared `output_channel_assignment`, so the
     // identifiability audit routes channel-aware (single source of truth for
@@ -807,8 +807,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         );
     }
 
-    use crate::model_types::EstimationError;
-    use crate::rho_optimizer::{FallbackPolicy, OuterEvalOrder, OuterProblem};
+    use gam_solve::model_types::EstimationError;
+    use gam_solve::rho_optimizer::{FallbackPolicy, OuterEvalOrder, OuterProblem};
     use gam_problem::OuterEval;
 
     let screening_cap = Arc::new(AtomicUsize::new(0));
@@ -1391,7 +1391,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     }
                     Ok((e.objective, e.gradient, e.outer_hessian))
                 };
-            match crate::rho_optimizer::outer_gradient_fd_audit(
+            match gam_solve::rho_optimizer::outer_gradient_fd_audit(
                 // fd-ok: FD-audit gate, runs diagnostic oracle only, not in fit math
                 &rho0,
                 1e-4,
@@ -1780,7 +1780,7 @@ pub fn fit_custom_family_fixed_log_lambdas<
     outer_iterations: usize,
     outer_gradient_norm: Option<f64>,
     outer_converged: bool,
-) -> Result<crate::model_types::UnifiedFitResult, CustomFamilyError> {
+) -> Result<gam_solve::model_types::UnifiedFitResult, CustomFamilyError> {
     let canonical = gam_identifiability::canonical::canonicalize_for_identifiability(raw_specs)?;
     let specs: &[ParameterBlockSpec] = &canonical.reduced_specs;
     let penalty_counts = validate_blockspecs(specs)?;

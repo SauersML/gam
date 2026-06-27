@@ -683,7 +683,7 @@ pub struct ClosureObjective<
     Fsp = fn(&mut S, &Array1<f64>) -> Result<f64, EstimationError>,
     Fseed = fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>,
 > {
-    pub(crate) state: S,
+    pub state: S,
     pub(crate) cap: OuterCapability,
     pub(crate) cost_fn: Fc,
     pub(crate) eval_fn: Fe,

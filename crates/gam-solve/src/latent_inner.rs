@@ -84,7 +84,7 @@ pub struct LatentInnerOptions {
     /// the scalar-diagonal fallback.
     ///
     /// Derive from `ParameterBlockSpec` slices via
-    /// [`crate::custom_family::block_offsets_from_specs`] or an
+    /// `gam_custom_family::block_offsets_from_specs` or an
     /// equivalent family-owned block layout.
     /// When `None`, the preconditioner falls back to scalar-diagonal Jacobi
     /// (the pre-block-Jacobi behaviour); when `Some([])` (empty slice), the

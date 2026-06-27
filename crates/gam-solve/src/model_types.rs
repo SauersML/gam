@@ -91,7 +91,7 @@ impl ProjectedKktResidual {
 
     /// Attach the KKT tolerance and free-subspace rank to a previously
     /// constructed residual.
-    pub(crate) fn with_metadata(mut self, residual_tol: f64, free_rank: usize) -> Self {
+    pub fn with_metadata(mut self, residual_tol: f64, free_rank: usize) -> Self {
         self.residual_tol = Some(residual_tol);
         self.free_rank = Some(free_rank);
         self

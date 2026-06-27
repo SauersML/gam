@@ -41,7 +41,7 @@ pub fn positive_eigenvalue_threshold(eigenvalues: &[f64]) -> f64 {
 /// identified directly from the eigenspectrum. For PSD penalty sums
 /// S(ρ) = Σ exp(ρ_k) S_k, the positive eigenspace is structurally fixed,
 /// so this function is C∞ in ρ.
-pub(crate) fn exact_pseudo_logdet(eigenvalues: &[f64], threshold: f64) -> f64 {
+pub fn exact_pseudo_logdet(eigenvalues: &[f64], threshold: f64) -> f64 {
     eigenvalues
         .iter()
         .filter(|&&s| s > threshold)

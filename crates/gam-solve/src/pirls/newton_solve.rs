@@ -1381,7 +1381,7 @@ pub(super) fn select_active_set_release(
     }
 }
 
-pub(crate) fn solve_newton_directionwith_lower_bounds(
+pub fn solve_newton_directionwith_lower_bounds(
     hessian: &Array2<f64>,
     gradient: &Array1<f64>,
     beta: &Array1<f64>,

@@ -2246,7 +2246,7 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         row: usize,
         block_idx: usize,
-        psi_map: &gam_solve::custom_family::PsiDesignMap,
+        psi_map: &gam_custom_family::PsiDesignMap,
         block_states: &[ParameterBlockState],
         primary: &PrimarySlices,
     ) -> Result<Array1<f64>, String> {
@@ -2277,7 +2277,7 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         row: usize,
         block_idx: usize,
-        psi_map: &gam_solve::custom_family::PsiDesignMap,
+        psi_map: &gam_custom_family::PsiDesignMap,
         slices: &BlockSlices,
         d_beta_flat: &Array1<f64>,
         primary: &PrimarySlices,
@@ -2420,7 +2420,7 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         row: usize,
         block_idx: usize,
-        psi_map: &gam_solve::custom_family::PsiDesignMap,
+        psi_map: &gam_custom_family::PsiDesignMap,
         slices: &BlockSlices,
     ) -> Result<BlockPsiRow, String> {
         let (local_vec, range) = match block_idx {

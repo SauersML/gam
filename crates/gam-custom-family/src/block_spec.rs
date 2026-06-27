@@ -6,7 +6,7 @@
 //! `BlockWorkingSet`, `BlockGeometryDirectionalDerivative`) and the
 //! effective-Jacobian / channel-Hessian abstractions live in `gam-problem`
 //! (#1521) and reach this module through the parent `use super::*` prelude
-//! (`pub use gam_problem::*`), so existing `crate::custom_family::*` paths stay
+//! (`pub use gam_problem::*`), so existing `crate::*` paths stay
 //! stable. The internal-consistency validator `validate_blockspec_consistency`
 //! also lives in `gam-problem` (`custom_family_blockwise`) and is likewise
 //! pulled in via the prelude. The coefficient group/label/prior types,

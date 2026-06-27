@@ -1,4 +1,4 @@
-use gam_solve::custom_family::{CustomFamily, ParameterBlockState};
+use gam_custom_family::{CustomFamily, ParameterBlockState};
 use gam_solve::estimate::EstimationError;
 use crate::inference::predict_io::PredictResult;
 use gam_problem::types::{

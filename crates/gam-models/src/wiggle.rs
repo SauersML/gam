@@ -22,36 +22,12 @@ pub(crate) struct SelectedWiggleBasis {
     pub block: ParameterBlockInput,
 }
 
-pub(crate) fn initializewiggle_knots_from_seed(
-    seed: ArrayView1<'_, f64>,
-    degree: usize,
-    num_internal_knots: usize,
-) -> Result<Array1<f64>, String> {
-    const MIN_WIGGLE_SEED_SPAN: f64 = 1e-8;
-    const DEFAULT_WIGGLE_HALF_RANGE: f64 = 3.0;
-
-    let mut seed_min = seed.iter().copied().fold(f64::INFINITY, f64::min);
-    let mut seed_max = seed.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    if !seed_min.is_finite() || !seed_max.is_finite() {
-        return Err("non-finite seed for wiggle knot initialization".to_string());
-    }
-    if (seed_max - seed_min).abs() < MIN_WIGGLE_SEED_SPAN {
-        let center = 0.5 * (seed_min + seed_max);
-        seed_min = center - DEFAULT_WIGGLE_HALF_RANGE;
-        seed_max = center + DEFAULT_WIGGLE_HALF_RANGE;
-    }
-    let (_, knots) = create_basis::<Dense>(
-        seed,
-        KnotSource::Generate {
-            data_range: (seed_min, seed_max),
-            num_internal_knots,
-        },
-        degree,
-        BasisOptions::value(),
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(knots)
-}
+// #1521: relocated DOWN into `gam_terms::basis` (was a gamlss/wiggle helper).
+// The knot-generation primitive carries no model-family type, so family modules
+// and this module's own callers consume it from the basis layer via this
+// re-export — keeping every `crate::wiggle::initializewiggle_knots_from_seed`
+// call site (gamlss / bms / transformation-normal) resolving unchanged.
+pub(crate) use gam_terms::basis::initializewiggle_knots_from_seed;
 
 #[inline]
 pub(crate) fn monotone_wiggle_internal_degree(degree: usize) -> Result<usize, String> {

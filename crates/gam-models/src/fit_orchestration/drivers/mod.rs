@@ -24,7 +24,7 @@ use gam_terms::basis::{
     orthogonality_transform_for_design, select_centers_by_strategy,
 };
 
-use gam_solve::custom_family::{
+use gam_custom_family::{
     BlockEffectiveJacobian, BlockGeometryDirectionalDerivative, BlockWorkingSet, BlockwiseFitOptions,
     CustomFamily, CustomFamilyBlockPsiDerivative, CustomFamilyWarmStart, ExactNewtonJointPsiTerms,
     ExactNewtonOuterObjective, FamilyEvaluation, FamilyLinearizationState, ParameterBlockSpec,

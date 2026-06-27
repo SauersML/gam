@@ -34,8 +34,8 @@ pub(crate) fn build_custom_family_inner_assembly<'dp>(
     deriv_provider: Box<dyn HessianDerivativeProvider + 'dp>,
     ext_bundle: Option<ExtCoordBundle>,
     firth_value: Option<f64>,
-) -> Result<(crate::estimate::reml::assembly::InnerAssembly<'dp>, usize), String> {
-    use crate::estimate::reml::assembly::{
+) -> Result<(gam_solve::estimate::reml::assembly::InnerAssembly<'dp>, usize), String> {
+    use gam_solve::estimate::reml::assembly::{
         InnerAssembly, PenaltyBlockDesc, penalty_coords_from_blocks,
     };
 
@@ -480,7 +480,7 @@ pub(crate) fn unified_joint_efs_eval(
     // their gradient contribution without needing per-augmentation
     // post-corrections.
     let eval_mode = EvalMode::ValueAndGradient;
-    let result = crate::estimate::reml::assembly::evaluate_solution(
+    let result = gam_solve::estimate::reml::assembly::evaluate_solution(
         &inner_solution,
         rho_slice,
         eval_mode,

@@ -566,7 +566,7 @@ impl ExactJeffreysTerm {
     /// envelope) disagrees with the finite difference of the Φ-less value
     /// by `(∇Φ)ᵀ ∂β̂/∂ρ` (gam#979). The β-gradient/curvature machinery for
     /// Tier-B lives in the `H_Φ`-aware joint derivative provider, not here.
-    pub(crate) fn value_only(phi: f64) -> Self {
+    pub fn value_only(phi: f64) -> Self {
         Self {
             operator: None,
             value_override: Some(phi),

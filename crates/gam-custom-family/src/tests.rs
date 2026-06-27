@@ -283,7 +283,7 @@ pub(crate) fn default_inner_cycle_budget_covers_large_scale_joint_newton_tail() 
 
 #[test]
 pub(crate) fn startup_validation_failure_routes_to_never_fail_escalation() {
-    use crate::model_types::EstimationError;
+    use gam_solve::model_types::EstimationError;
 
     let all_seeds_rejected = EstimationError::RemlOptimizationFailed(
         "no candidate seeds passed outer startup validation (custom family):\n  generated=4"
@@ -1361,15 +1361,15 @@ pub(crate) fn binomial_location_scale_wiggle_outer_fixture()
             .penalties
             .iter()
             .map(|ps| match ps {
-                crate::model_types::PenaltySpec::Block {
+                gam_solve::model_types::PenaltySpec::Block {
                     local, col_range, ..
                 } => PenaltyMatrix::Blockwise {
                     local: local.clone(),
                     col_range: col_range.clone(),
                     total_dim: wiggle_block.design.ncols(),
                 },
-                crate::model_types::PenaltySpec::Dense(m)
-                | crate::model_types::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                gam_solve::model_types::PenaltySpec::Dense(m)
+                | gam_solve::model_types::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                     PenaltyMatrix::Dense(m.clone())
                 }
             })
@@ -2993,7 +2993,7 @@ pub(crate) fn jeffreys_second_order_completion_pairwise_fallback_when_hook_absen
     )
     .expect("completion")
     .expect("completion present");
-    let direct = crate::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
+    let direct = gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
         h_joint.view(),
         z_joint.view(),
         |u: &Array1<f64>, v: &Array1<f64>| {
@@ -4555,7 +4555,7 @@ pub(crate) fn ridge_stabilization_gap_produces_exact_rho_two_in_null_direction()
 /// the constrained path now routes feasibility through the projection.
 #[test]
 pub(crate) fn cone_projection_preserves_step_where_alpha_crush_collapses_it() {
-    use crate::active_set::project_point_strictly_into_feasible_cone;
+    use gam_solve::active_set::project_point_strictly_into_feasible_cone;
     use gam_problem::LinearInequalityConstraints;
     // One monotonicity row `a·β ≥ 0` with a = [1, 0]; the current iterate
     // β = [0, 0] sits exactly on it (slack = 0). The Newton trial step wants to
@@ -6053,7 +6053,7 @@ pub(crate) fn rank_reduce_drops_exactly_dependent_row() {
     let b = array![0.0, 0.0, 0.0];
     let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
     let (a_out, b_out, member_constraint_ids_out, _) =
-        crate::active_set::rank_reduce_rows_pivoted_qr_with_dependence(
+        gam_solve::active_set::rank_reduce_rows_pivoted_qr_with_dependence(
             a,
             b,
             member_constraint_ids,
@@ -6079,7 +6079,7 @@ pub(crate) fn rank_reduce_preserves_full_rank_matrix() {
     let b = array![0.0, 0.0, 0.0];
     let member_constraint_ids = vec![vec![0], vec![1], vec![2]];
     let (a_out, b_out, member_constraint_ids_out, _) =
-        crate::active_set::rank_reduce_rows_pivoted_qr_with_dependence(
+        gam_solve::active_set::rank_reduce_rows_pivoted_qr_with_dependence(
             a,
             b,
             member_constraint_ids,

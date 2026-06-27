@@ -542,7 +542,7 @@ pub fn compute_corrected_covariance_diagonal_with_constraints(
 /// Returns a strictly positive value for any real `sigma`. For large positive
 /// `sigma` this is approximately `sigma`; near zero it smoothly floors at `epsilon`.
 #[inline]
-pub(crate) fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
+pub fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
     let disc = sigma.hypot(2.0 * epsilon);
     if sigma >= 0.0 {
         0.5 * sigma + 0.5 * disc
@@ -576,6 +576,6 @@ pub(crate) fn spectral_regularize(sigma: f64, epsilon: f64) -> f64 {
 /// meaningful eigenvalue (for p ≤ 10⁶, ε ≤ 1.5e-2; well-conditioned
 /// problems have min σ ≫ ε and are unaffected).
 #[inline]
-pub(crate) fn spectral_epsilon(eigenvalues: &[f64]) -> f64 {
+pub fn spectral_epsilon(eigenvalues: &[f64]) -> f64 {
     f64::EPSILON.sqrt() * (eigenvalues.len() as f64).max(1.0)
 }

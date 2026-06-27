@@ -6,7 +6,7 @@ use gam_problem::OuterStrategyError;
 
 pub use gam_problem::HessianResult;
 
-pub(crate) fn add_rho_block_dense_to_hessian(
+pub fn add_rho_block_dense_to_hessian(
     hessian: &mut HessianResult,
     rho_block: &Array2<f64>,
 ) -> Result<(), String> {

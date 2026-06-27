@@ -19,7 +19,9 @@ pub(crate) mod eval;
 mod firth;
 pub(super) mod hyper;
 mod inner_strategy;
-pub(crate) mod jeffreys_subspace;
+// #1521 carve: promoted `pub(crate)` -> `pub` so the extracted
+// `gam-custom-family` crate reaches the Jeffreys-subspace items it consumes.
+pub mod jeffreys_subspace;
 pub mod outer_eval;
 pub mod penalty_logdet;
 pub mod per_atom_efs;

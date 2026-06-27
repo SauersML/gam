@@ -2,8 +2,10 @@ pub mod active_set;
 pub mod arrow_schur;
 pub mod continuation_path;
 pub mod cross_node;
-pub mod custom_family;
-pub(crate) mod custom_family_persistent_warm_start;
+// The custom-family blockwise carrier (`custom_family` + its persistent
+// warm-start cache) was extracted into the `gam-custom-family` crate (#1521),
+// which sits ABOVE gam-solve. gam-solve core no longer references it; consumers
+// reach it as `gam_custom_family::*` (via the gam-models facade).
 pub mod estimate;
 pub mod evidence;
 pub mod gauge;
@@ -23,7 +25,9 @@ pub mod loop_guard;
 pub mod measure_jet_glm_sufficient;
 pub mod measure_jet_gram_cache;
 pub mod mixture_link;
-pub(crate) mod objective_base;
+// #1521 carve: promoted for `gam-custom-family` (consumes
+// `add_rho_block_dense_to_hessian`).
+pub mod objective_base;
 pub mod orthogonal_reparam;
 pub mod parallel_strategy;
 pub mod persistent_warm_start;
@@ -37,9 +41,9 @@ pub mod psi_gram_tensor;
 // reach it via the `gam-solve` re-export at the monolith crate root).
 pub mod psis;
 // Rho-prior penalty/barrier evaluation (descended #1521): depends only on
-// `gam_spec::RhoPrior`; consumed by `custom_family::blockwise_solve` and
-// `reml::atoms`.
-pub(crate) mod rho_prior_eval;
+// `gam_spec::RhoPrior`; consumed by `reml::atoms` and (after #1521) the
+// extracted `gam-custom-family` crate — promoted `pub(crate)` -> `pub`.
+pub mod rho_prior_eval;
 // Rho-uncertainty (Pareto-k heavy-tail) diagnostics (descended #1521): depends
 // only on the descended `crate::psis`; consumed by `rho_optimizer::run`.
 pub mod rho_uncertainty;
@@ -60,17 +64,11 @@ pub mod streaming_border;
 pub mod structure_search;
 pub mod topology_formula;
 pub mod topology_selector;
-pub(crate) mod warm_start_artifact;
-pub(crate) mod warm_start_transfer;
-
-// The custom-family blockwise carrier (`fit`, `blockwise_solve`, `joint_newton`,
-// …). Its prelude (`crate::custom_family`) re-exports the persistent
-// warm-start entry points from `custom_family_persistent_warm_start`, the
-// descended block data model + `CustomFamilyError` + `PenaltyMatrix` from
-// `gam-problem`, and the `CustomFamily` trait + fit options + ψ design operators
-// from `gam-model-api`, so each carrier submodule resolves them through its
-// `use super::*` prelude exactly as it did when these lived in
-// `families/custom_family/mod.rs`.
+// #1521 carve: promoted `pub(crate)` -> `pub` so the extracted
+// `gam-custom-family` crate (above gam-solve) can reach the warm-start
+// artifact/transfer carriers it consumes.
+pub mod warm_start_artifact;
+pub mod warm_start_transfer;
 
 pub use evidence::{
     EvidenceHvpLogDet, EvidenceIftGradientTerms, EvidenceLogDetSource, GaussianMixtureConfig,

@@ -1346,7 +1346,7 @@ where
 /// own genuinely-`δ`-dependent perturbation work (`Hdot[δ]` and the `p` second
 /// directional derivatives `H²dot[δ,e_a]`). The arithmetic per direction is
 /// byte-identical to [`joint_jeffreys_hphi_perturbation_derivative`].
-pub(crate) struct JeffreysHphiDriftBase {
+pub struct JeffreysHphiDriftBase {
     p: usize,
     m: usize,
     z_j: Array2<f64>,
@@ -1372,7 +1372,7 @@ impl JeffreysHphiDriftBase {
     /// released per-direction code returned the zero matrix there; preparing
     /// returns `None`, and the caller emits the same zero drift for every
     /// direction).
-    pub(crate) fn prepare<BaseFn>(
+    pub fn prepare<BaseFn>(
         h_joint: ArrayView2<'_, f64>,
         z_j: ArrayView2<'_, f64>,
         base_hessian_dir: BaseFn,
@@ -1443,7 +1443,7 @@ impl JeffreysHphiDriftBase {
     /// redundant full-data sweeps the per-axis closure would otherwise trigger
     /// (each parallel cache-miss reruns the entire assembly — #1082/#979). The
     /// reduction is identical to `prepare`, so the prepared base is bit-faithful.
-    pub(crate) fn prepare_with_axes(
+    pub fn prepare_with_axes(
         h_joint: ArrayView2<'_, f64>,
         z_j: ArrayView2<'_, f64>,
         hdots: Vec<Array2<f64>>,
@@ -1638,7 +1638,7 @@ impl JeffreysHphiDriftBase {
     /// `None` ⇒ the family lacks the exact second derivative ⇒ zero drift, exactly
     /// as the per-axis path's first-`None` collapse. The reduction from the axis
     /// matrices onward is shared with (and bit-identical to) the per-axis path.
-    pub(crate) fn perturbation_derivative_batched_axes(
+    pub fn perturbation_derivative_batched_axes(
         &self,
         pert_h: &Array2<f64>,
         pert_axis_matrices: Option<Vec<Array2<f64>>>,

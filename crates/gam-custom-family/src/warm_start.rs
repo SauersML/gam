@@ -171,7 +171,7 @@ pub struct BlockwiseFitResultParts {
     /// First-order optimality certificate from the outer smoothing solve
     /// (#934); `None` when no outer ran (fixed-λ, one-cycle probe) or the
     /// audit could not evaluate.
-    pub criterion_certificate: Option<crate::rho_optimizer::CriterionCertificate>,
+    pub criterion_certificate: Option<gam_solve::rho_optimizer::CriterionCertificate>,
     pub inner_cycles: usize,
     pub outer_converged: bool,
     pub geometry: Option<FitGeometry>,
@@ -421,7 +421,7 @@ pub(crate) fn reduced_blockwise_edf(
 pub fn blockwise_fit_from_parts(
     parts: BlockwiseFitResultParts,
     specs: &[ParameterBlockSpec],
-) -> Result<crate::model_types::UnifiedFitResult, String> {
+) -> Result<gam_solve::model_types::UnifiedFitResult, String> {
     let BlockwiseFitResultParts {
         block_states,
         log_likelihood,
@@ -541,7 +541,7 @@ pub fn blockwise_fit_from_parts(
     }
 
     // Build unified blocks from the blockwise states.
-    use crate::model_types::{FittedBlock, FittedLinkState, UnifiedFitResultParts};
+    use gam_solve::model_types::{FittedBlock, FittedLinkState, UnifiedFitResultParts};
     let expected_rho: usize = specs.iter().map(|s| s.penalties.len()).sum();
     if lambdas.len() != expected_rho {
         return Err(CustomFamilyError::DimensionMismatch { reason: format!(
@@ -625,7 +625,7 @@ pub fn blockwise_fit_from_parts(
     // dispersion-free, and downstream covariance scaling pairs `H` with the
     // family's own dispersion where needed.
     let inference = match (edf_total_opt, geometry.as_ref()) {
-        (Some(edf_total), Some(geom)) => Some(crate::model_types::FitInference {
+        (Some(edf_total), Some(geom)) => Some(gam_solve::model_types::FitInference {
             edf_by_block: edf_by_penalty,
             penalty_block_trace: penalty_trace,
             edf_total,
@@ -634,7 +634,7 @@ pub fn blockwise_fit_from_parts(
             working_weights: geom.working_weights.clone(),
             working_response: geom.working_response.clone(),
             reparam_qs: None,
-            dispersion: crate::model_types::Dispersion::Known(1.0),
+            dispersion: gam_solve::model_types::Dispersion::Known(1.0),
             beta_covariance: None,
             beta_standard_errors: None,
             beta_covariance_corrected: None,
@@ -647,7 +647,7 @@ pub fn blockwise_fit_from_parts(
         _ => None,
     };
 
-    crate::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
+    gam_solve::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
         blocks,
         log_lambdas: log_lambdas.clone(),
         lambdas: lambdas.clone(),
@@ -678,13 +678,13 @@ pub fn blockwise_fit_from_parts(
         // (`pirls_status.is_converged()`, `outer_converged` derivation) do not
         // report a non-converged fit as converged.
         pirls_status: if outer_converged {
-            crate::pirls::PirlsStatus::Converged
+            gam_solve::pirls::PirlsStatus::Converged
         } else {
-            crate::pirls::PirlsStatus::StalledAtValidMinimum
+            gam_solve::pirls::PirlsStatus::StalledAtValidMinimum
         },
         max_abs_eta: 0.0,
         constraint_kkt: None,
-        artifacts: crate::model_types::FitArtifacts {
+        artifacts: gam_solve::model_types::FitArtifacts {
             pirls: None,
             criterion_certificate,
             ..Default::default()
@@ -797,7 +797,7 @@ impl CustomOuterState {
         rho_dim: usize,
         specs: &[ParameterBlockSpec],
         beta: &Array1<f64>,
-    ) -> Result<crate::rho_optimizer::SeedOutcome, EstimationError> {
+    ) -> Result<gam_solve::rho_optimizer::SeedOutcome, EstimationError> {
         // A seed β whose length disagrees with this fit's per-block
         // coefficient widths is NOT an error: the outer warm-start cache
         // looks up a *row-relaxed* prefix (`cache_seed_key`), so two folds
@@ -811,13 +811,13 @@ impl CustomOuterState {
         // ρ seed stand — a ρ-only resume, never a full cold start.
         let expected = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
         if beta.len() != expected {
-            return Ok(crate::rho_optimizer::SeedOutcome::Incompatible);
+            return Ok(gam_solve::rho_optimizer::SeedOutcome::Incompatible);
         }
         let warm_start = constrained_warm_start_from_cached_beta(rho_dim, specs, beta)?;
         self.reset_warm_cache = Some(warm_start.clone());
         self.warm_cache = Some(warm_start);
         self.last_error = None;
-        Ok(crate::rho_optimizer::SeedOutcome::Installed)
+        Ok(gam_solve::rho_optimizer::SeedOutcome::Installed)
     }
 }
 

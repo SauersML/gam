@@ -157,7 +157,7 @@ pub fn build_psi_hyper_coords<F: CustomFamily + Clone + Send + Sync + 'static>(
                 // well-conditioned fit is byte-unchanged.
                 if let Some((z_j, h_joint)) = jeffreys_hphi_ctx.as_ref() {
                     let explicit_hphi =
-                        crate::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_explicit_param_derivative(
+                        gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_explicit_param_derivative(
                             h_joint.view(),
                             z_j.view(),
                             &dense_b,

@@ -1737,8 +1737,8 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
     initial_theta[at + 2] = eps_c_init.max(adaptive_opts.min_epsilon).ln();
 
     let hyperspecs = build_spatial_adaptive_hyperspecs(runtime_caches.len());
-    let zero_psi_op: std::sync::Arc<dyn gam_solve::custom_family::CustomFamilyPsiDerivativeOperator> =
-        std::sync::Arc::new(gam_solve::custom_family::ZeroPsiDerivativeOperator::new(
+    let zero_psi_op: std::sync::Arc<dyn gam_custom_family::CustomFamilyPsiDerivativeOperator> =
+        std::sync::Arc::new(gam_custom_family::ZeroPsiDerivativeOperator::new(
             baseline.design.design.nrows(),
             baseline.design.design.ncols(),
         ));
@@ -1931,14 +1931,14 @@ fn fit_term_collectionwith_exact_spatial_adaptive_regularization(
         (rho, adaptive_params)
     };
     let analytic_outer_hessian_available =
-        gam_solve::custom_family::joint_exact_analytic_outer_hessian_available()
+        gam_custom_family::joint_exact_analytic_outer_hessian_available()
             && base_family
                 .exact_outer_derivative_order(std::slice::from_ref(&blockspec), &outer_opts)
                 .has_hessian()
-            && gam_solve::custom_family::exact_newton_outer_geometry_supports_second_order_solver(
+            && gam_custom_family::exact_newton_outer_geometry_supports_second_order_solver(
                 &base_family,
             );
-    let outer_max_iter = gam_solve::custom_family::cost_gated_first_order_max_iter(
+    let outer_max_iter = gam_custom_family::cost_gated_first_order_max_iter(
         options.max_iter,
         base_family.coefficient_gradient_cost(std::slice::from_ref(&blockspec)),
         analytic_outer_hessian_available,

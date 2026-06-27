@@ -922,7 +922,7 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
 ///
 /// The active set passed via `block_active_sets` is consumed by the inner
 /// projection so the returned vector lies in `range(I − P_normal_cone)`. The
-/// [`crate::model_types::ProjectedKktResidual`] return type makes
+/// [`gam_solve::model_types::ProjectedKktResidual`] return type makes
 /// that invariant visible at every call site — callers cannot forget to
 /// project, and `reml/unified.rs` cannot accidentally accept an unprojected
 /// vector.

@@ -256,7 +256,7 @@ pub struct ArrowSchurInnerConfig {
     /// path without requiring each family's closure to call it manually.
     ///
     /// Derive from `ParameterBlockSpec` slices via
-    /// [`crate::custom_family::block_offsets_from_specs`].  When
+    /// `gam_custom_family::block_offsets_from_specs`.  When
     /// `None`, the preconditioner falls back to scalar-diagonal Jacobi (the
     /// pre-#287 behaviour); when `Some([])` (empty slice), the same fallback
     /// applies.

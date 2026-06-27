@@ -109,7 +109,13 @@ use gam_terms::smooth::build_term_collection_design;
 
 use crate::model_types::validate_all_finite_estimation;
 
-use gam_problem::{InverseLink, RidgePolicy, StandardLink};
+// #1521: relocated DOWN into gam-model-kernels (was gamlss::builders). The
+// penalized-WLS projection carries no gamlss type, so the family stack consumes
+// it from the base kernel crate; this re-export keeps the gamlss-internal
+// (`builders`/`dispersion_family`) call sites resolving unchanged.
+pub(crate) use crate::penalized_projection::solve_penalizedweighted_projection;
+
+use gam_problem::{InverseLink, StandardLink};
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 

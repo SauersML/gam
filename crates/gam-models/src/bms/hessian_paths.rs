@@ -15,7 +15,7 @@ pub(super) struct BlockPsiRow {
 pub(super) struct PsiAxisSpec {
     pub(super) block_idx: usize,
     pub(super) idx_primary: usize,
-    pub(super) psi_map: gam_solve::custom_family::PsiDesignMap,
+    pub(super) psi_map: gam_custom_family::PsiDesignMap,
 }
 
 #[derive(Clone)]

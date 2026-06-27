@@ -48,9 +48,9 @@ pub(crate) use crate::custom_family::{
     ParameterBlockSpec, ParameterBlockState, PenaltyMatrix, evaluate_custom_family_joint_hyper,
     evaluate_custom_family_joint_hyper_efs, fit_custom_family, fit_custom_family_fixed_log_lambdas,
 };
-pub(crate) use crate::gamlss::solve_penalizedweighted_projection;
+pub(crate) use crate::penalized_projection::solve_penalizedweighted_projection;
 pub(crate) use crate::spatial_psi_bridge::build_block_spatial_psi_derivatives;
-pub(crate) use crate::wiggle::initializewiggle_knots_from_seed;
+pub(crate) use gam_terms::basis::initializewiggle_knots_from_seed;
 pub(crate) use crate::inference::model::{
     TRANSFORMATION_SCORE_PIT_CLIP_EPS, TransformationScoreCalibration,
 };

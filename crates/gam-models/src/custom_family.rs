@@ -40,18 +40,12 @@ pub use gam_problem::PseudoLogdetMode;
 
 // Solver half (inner blockwise solve, joint Newton, outer objective, Jeffreys,
 // covariance, the `fit_custom_family_with_rho_prior` drivers, JOINT_MATRIX_FREE_MIN_DIM,
-// …). These live in `gam-solve` as the orphan top-level modules (`fit`,
-// `blockwise_solve`, `joint_newton`, `outer_objective`, `jeffreys`, `covariance`,
-// `psi_hyper`, `inner_blockwise_fit`, `joint_derivatives`, `penalty_labels`,
-// `coefficient_groups`, `assembly`, `warm_start`, `sensitivity`) that still need to
-// be wired into a `gam_solve::custom_family` aggregator module. Until that lands,
-// this import is the single localized blocker for the solver-side symbols.
-pub use gam_solve::custom_family::*;
+// …). Extracted (#1521) into the dedicated `gam-custom-family` crate, which sits
+// ABOVE gam-solve and below gam-models. This glob re-export reconstructs the prior
+// flat namespace so the relocated families resolve `crate::custom_family::*`
+// unchanged.
+pub use gam_custom_family::*;
 
-// Block-spec validator used by `survival/marginal_slope/fit_entry.rs`. Lives in
-// `gam-solve` (`custom_family::block_spec::validate_blockspecs`) but is currently
-// re-exported there as `pub(crate)` (custom_family.rs:108) over a `pub(crate) fn`
-// (block_spec.rs:124), so this path only resolves once the visibility agent
-// promotes both to `pub`. Listed explicitly so the call site compiles the moment
-// that promotion lands.
-pub use gam_solve::custom_family::validate_blockspecs;
+// Block-spec validator used by `survival/marginal_slope/fit_entry.rs`; `pub` in
+// `gam-custom-family` (`block_spec::validate_blockspecs`).
+pub use gam_custom_family::validate_blockspecs;

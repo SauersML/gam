@@ -1257,11 +1257,11 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
                     _ => Ok(Array1::from_elem(total, f64::NAN)),
                 }
             };
-            if total >= crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM
+            if total >= gam_solve::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM
             {
                 // Wide joint system: bound the spectrum from a few matvecs (no dense
                 // H, no O(p³) eigh).
-                crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_via_matvec(
+                gam_solve::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_via_matvec(
                     hv, total,
                 )
                 .unwrap_or(false)
@@ -1290,7 +1290,7 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
                             h[[r, a]] = col[r];
                         }
                     }
-                    crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_dense(h.view())
+                    gam_solve::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_dense(h.view())
                 })()
                 .unwrap_or(false)
             }
@@ -1354,7 +1354,7 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
             let penalties_dense: Vec<Array2<f64>> =
                 spec.penalties.iter().map(|pen| pen.to_dense()).collect();
             let lambdas_vec: Vec<f64> = lambdas.to_vec();
-            match crate::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
+            match gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
                 &penalties_dense,
                 &lambdas_vec,
                 ridge,

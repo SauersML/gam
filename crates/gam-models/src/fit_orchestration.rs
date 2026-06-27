@@ -3,7 +3,7 @@
 // / materialization concerns each own a real module; the parent re-exports every
 // module's items so callers keep the flat `solver::fit_orchestration::Foo` namespace.
 
-use gam_solve::custom_family::{
+use gam_custom_family::{
     AdditiveBlockJacobian, BlockwiseFitOptions, ParameterBlockSpec, PenaltyMatrix,
     fit_custom_family_with_rho_prior,
 };

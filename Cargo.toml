@@ -45,6 +45,7 @@ members = [
     "crates/gam-terms",
     "crates/gam-solve",
     "crates/gam-model-kernels",
+    "crates/gam-custom-family",
     "crates/gam-models",
     "crates/gam-sae",
     "crates/gam-cli",

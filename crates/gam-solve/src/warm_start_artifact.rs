@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 /// On-disk schema version for [`FitArtifact`]. Bump when the serialized
 /// layout changes in a way that makes prior payloads unsafe to consume.
-pub(crate) const FIT_ARTIFACT_SCHEMA: u32 = 1;
+pub const FIT_ARTIFACT_SCHEMA: u32 = 1;
 
 /// Saturation magnitude past which a copied ρ coordinate is considered
 /// pinned at the outer optimizer's box and is NOT transferred. Mirrors the
@@ -86,7 +86,7 @@ pub struct TermIdentityKey(pub Fingerprint);
 /// Build a term identity at the *block-spec* layer (`fit_custom_family` and
 /// friends), where the full `BasisMetadata` / variable names are no longer
 /// reachable — the design has already been assembled into a
-/// [`crate::custom_family::block_spec::ParameterBlockSpec`].
+/// `gam_problem::ParameterBlockSpec`.
 ///
 /// The block `name` (e.g. `"s(x)"`, `"<scale>"`) is produced by the formula /
 /// construction layer and is **fold-invariant**: it encodes the variables and

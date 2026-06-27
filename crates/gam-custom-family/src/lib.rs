@@ -9,7 +9,7 @@
 //!   internal-consistency validator now live in `gam-problem` (#1521); the
 //!   `CustomFamily` trait, fit options, and ψ design-derivative operators live in
 //!   `gam-model-api`. They are re-exported through the prelude below so the prior
-//!   flat-namespace `crate::custom_family::*` API is unchanged.
+//!   flat-namespace `crate::*` API is unchanged.
 //! - [`psi_design`]       — ψ design-derivative operators (now in `gam-model-api`).
 //! - [`blockwise_solve`]  — the inner block-coordinate solve + numeric kernels.
 //! - [`joint_newton`]     — joint (cross-block) Newton + trust region + PCG + KKT.
@@ -28,16 +28,22 @@
 //! Cross-submodule items are `pub(crate)`; each submodule pulls the shared
 //! crate-internal imports below in via `use super::*;`.
 
+// The `#[macro_export]` error-bail macros live in `gam-problem` (its crate
+// root). Importing them here makes `crate::bail_invalid_estim!` /
+// `crate::bail_dim_custom!` resolve at every call site exactly as they did when
+// this carrier lived in `gam-solve` (whose `mod.rs` performed the same import).
+pub(crate) use gam_problem::{bail_dim_custom, bail_invalid_estim};
+
 // --- crate-internal (gam-solve) imports ---------------------------------
-pub(crate) use crate::active_set::{
+pub(crate) use gam_solve::active_set::{
     project_stationarity_residual_on_constraint_cone, solve_quadratic_with_linear_constraints,
 };
 pub(crate) use crate::custom_family_persistent_warm_start::{
     capture_fit_artifact, consume_fit_artifact, load_persistent_custom_family_warm_start,
     store_persistent_custom_family_warm_start, update_custom_outer_inner_cap_from_warm_start,
 };
-pub(crate) use crate::estimate::reml::penalty_logdet::PenaltyPseudologdet;
-pub(crate) use crate::estimate::reml::reml_outer_engine::{
+pub(crate) use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
+pub(crate) use gam_solve::estimate::reml::reml_outer_engine::{
     BlockCoupledOperator, CompositeHyperOperator, DenseSpectralOperator, DispersionHandling,
     ExactJeffreysTerm, HessianDerivativeProvider, HessianOperator, MatrixFreeSpdOperator,
     OuterHessianDerivativeKernel, PenaltySubspaceTrace, StochasticTraceState,
@@ -49,10 +55,10 @@ pub(crate) use crate::estimate::reml::reml_outer_engine::{
 // the model-estimation contract types that still live in the (not-yet-carved)
 // crate-root `model_types` module; `EstimationError` already descended to
 // `gam-problem` and arrives via the `gam_problem::*` glob below.
-pub(crate) use crate::model_types::{
+pub(crate) use gam_solve::model_types::{
     ActiveLinearConstraintBlock, FitGeometry, ProjectedKktResidual,
 };
-pub(crate) use crate::pirls::solve_newton_directionwith_lower_bounds;
+pub(crate) use gam_solve::pirls::solve_newton_directionwith_lower_bounds;
 
 // --- lower-crate imports -------------------------------------------------
 pub(crate) use faer::Side;
@@ -79,8 +85,8 @@ pub(crate) use gam_model_api::families::custom_family::*;
 pub(crate) use gam_problem::*;
 
 // #1521 carve: targeted PUBLIC re-exports so the lifted `fit_orchestration`
-// drivers (now in gam-models) reach these carriers as
-// `gam_solve::custom_family::<X>` (the globs above keep them crate-internal).
+// drivers (in gam-models) reach these carriers as `gam_custom_family::<X>`
+// (the `pub(crate)` globs above keep them crate-internal).
 // Explicit named re-exports shadow the broad `*` globs above (glob imports have
 // lower precedence) and — because every name below resolves to the SAME item in
 // gam-models' own `gam_model_api`/`gam_problem` globs — they do not introduce an
@@ -99,6 +105,12 @@ pub use gam_problem::{
 // `whitened_spectrum` is a submodule hosted inside `joint_newton`; re-export it
 // at the carrier scope so the trust-region tests reach it through `super::*`.
 pub(crate) use joint_newton::whitened_spectrum;
+
+// #1521 carve: the persistent (on-disk) warm-start cache descended into this
+// crate alongside the carrier (was crate-root `custom_family_persistent_warm_start`
+// in gam-solve). Its three entry points are re-imported into the prelude above
+// via `crate::custom_family_persistent_warm_start::{...}`.
+mod custom_family_persistent_warm_start;
 
 mod assembly;
 mod block_spec;
@@ -129,7 +141,7 @@ pub(crate) use blockwise_solve::*;
 pub use coefficient_groups::*;
 pub(crate) use covariance::*;
 // Two covariance helpers are part of the public flat-namespace API consumed by
-// the relocated families (`crate::custom_family::{use_joint_matrix_free_path,
+// the relocated families (`crate::{use_joint_matrix_free_path,
 // projected_linear_constraint_stationarity_vector}`); surface them publicly
 // (the `pub(crate) use covariance::*` glob above keeps them crate-internal).
 pub use covariance::{
@@ -146,7 +158,7 @@ pub(crate) use penalty_labels::*;
 // ψ design-derivative operators / actions / joint-ψ operator / resolvers
 // (relocated from the pre-carve monolith, #1521). `pub use ...::*` preserves
 // each item's visibility so the 18 `pub` symbols surface as
-// `gam_solve::custom_family::*` (and thence `crate::custom_family::*` in
+// `gam_custom_family::*` (and thence `crate::custom_family::*` in
 // gam-models via the facade glob).
 pub use self::psi_design::*;
 pub use psi_hyper::*;

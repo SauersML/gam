@@ -68,7 +68,7 @@ pub(crate) fn build_joint_jeffreys_subspace(
         // reduced block coefficient space. The aggregate penalty only fixes the
         // block dimension; the span no longer depends on `ker(S)`.
         let aggregate = Array2::<f64>::zeros((p_block, p_block));
-        let subspace = crate::estimate::reml::jeffreys_subspace::jeffreys_subspace_from_penalty(
+        let subspace = gam_solve::estimate::reml::jeffreys_subspace::jeffreys_subspace_from_penalty(
             aggregate.view(),
         )?;
         m_total += subspace.span_dim();
@@ -136,7 +136,7 @@ pub(crate) fn jeffreys_term_skippable_for_source(
     // cycle skips a provably-zero term (byte-identical to forming it) while a
     // near-separating cycle still falls through to the exact term and keeps the
     // Firth bound exactly where the ridge needs it.
-    if total_p < crate::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM {
+    if total_p < gam_solve::estimate::reml::jeffreys_subspace::CHEAP_CONDITIONING_PRECHECK_MIN_DIM {
         let h_dense = match source {
             JointHessianSource::Dense(matrix) => matrix.clone(),
             JointHessianSource::Operator { apply, .. } => {
@@ -158,7 +158,7 @@ pub(crate) fn jeffreys_term_skippable_for_source(
                 h
             }
         };
-        return crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_dense(
+        return gam_solve::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_dense(
             h_dense.view(),
         );
     }
@@ -186,7 +186,7 @@ pub(crate) fn jeffreys_term_skippable_for_source(
             JointHessianSource::Operator { apply, .. } => apply(v),
         }
     };
-    crate::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_via_matvec(hv, total_p)
+    gam_solve::estimate::reml::jeffreys_subspace::jeffreys_term_skippable_via_matvec(hv, total_p)
 }
 
 /// Evaluate ONLY the Jeffreys objective value `Phi = 1/2 log|Z_J^T H Z_J|` at
@@ -214,7 +214,7 @@ pub(crate) fn custom_family_joint_jeffreys_value<
         Ok(Some(h)) if h.nrows() == total_p && h.ncols() == total_p => h,
         _ => return 0.0,
     };
-    match crate::estimate::reml::jeffreys_subspace::joint_jeffreys_term(
+    match gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_term(
         h_joint.view(),
         z_joint.view(),
         |_direction: &Array1<f64>| Ok(None),
@@ -260,7 +260,7 @@ pub(crate) fn custom_family_joint_jeffreys_term<F: CustomFamily + Clone + Send +
     // to `(gate_weight·phi, 0, 0)`, exactly as the per-axis first-`None` collapse did.
     let all_axes: Option<Vec<Array2<f64>>> = family
         .joint_jeffreys_information_directional_derivative_all_axes_with_specs(states, specs)?;
-    let term = crate::estimate::reml::jeffreys_subspace::joint_jeffreys_term(
+    let term = gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_term(
         h_joint.view(),
         z_joint.view(),
         |direction: &Array1<f64>| -> Result<Option<Array2<f64>>, String> {
@@ -442,7 +442,7 @@ pub(crate) fn custom_family_joint_jeffreys_second_order_completion<
             Ok(Some(contracted))
         }
         None if allow_pairwise_fallback => {
-            crate::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
+            gam_solve::estimate::reml::jeffreys_subspace::joint_jeffreys_second_order_completion(
                 h_joint.view(),
                 z_joint.view(),
                 |u: &Array1<f64>, v: &Array1<f64>| {
@@ -553,7 +553,8 @@ pub(crate) fn batched_outer_gradient_contract_allows_override(
 /// direction then pays only its own `Hdot[δ]` (one row-stream) and `p`
 /// second-directional `H²dot[δ,e_a]` row-streams. Per-direction output is
 /// byte-identical to the per-direction divided-difference drift
-/// ([`crate::estimate::reml::jeffreys_subspace::joint_jeffreys_hphi_directional_derivative`]),
+/// (`gam_solve::estimate::reml::jeffreys_subspace`'s test-only
+/// `joint_jeffreys_hphi_directional_derivative` oracle),
 /// which the outer LAML gradient folds via `JeffreysHphiAwareJointDerivatives`.
 ///
 /// Returns `None` exactly when there is no coefficient system, the family exposes
@@ -607,13 +608,13 @@ pub(crate) fn custom_family_outer_jeffreys_hphi_drift_batched<
             )?;
         let base = match all_axes {
             Some(hdots) => {
-                crate::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare_with_axes(
+                gam_solve::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare_with_axes(
                     h_joint.view(),
                     z_columns.view(),
                     hdots,
                 )?
             }
-            None => crate::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare(
+            None => gam_solve::estimate::reml::jeffreys_subspace::JeffreysHphiDriftBase::prepare(
                 h_joint.view(),
                 z_columns.view(),
                 |direction: &Array1<f64>| {

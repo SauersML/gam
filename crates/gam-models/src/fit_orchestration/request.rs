@@ -68,7 +68,7 @@ pub struct SurvivalLocationScaleFitRequest<'a> {
     pub wiggle: Option<LinkWiggleConfig>,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
     pub optimize_inverse_link: bool,
-    /// See [`gam_solve::custom_family::BlockwiseFitOptions::cache_session`].
+    /// See [`gam_custom_family::BlockwiseFitOptions::cache_session`].
     /// Threaded into the internally constructed `BlockwiseFitOptions` by
     /// `fit_survival_location_scale_model`.
     pub cache_session: Option<std::sync::Arc<gam_runtime::warm_start::Session>>,
@@ -77,7 +77,7 @@ pub struct SurvivalLocationScaleFitRequest<'a> {
 pub struct SurvivalTransformationFitRequest<'a> {
     pub data: ArrayView2<'a, f64>,
     pub spec: SurvivalTransformationTermSpec,
-    /// See [`gam_solve::custom_family::BlockwiseFitOptions::cache_session`].
+    /// See [`gam_custom_family::BlockwiseFitOptions::cache_session`].
     /// Threaded into the internally constructed `BlockwiseFitOptions` by
     /// `fit_survival_transformation_model`.
     pub cache_session: Option<std::sync::Arc<gam_runtime::warm_start::Session>>,

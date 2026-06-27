@@ -12,11 +12,11 @@
 //! consumed elsewhere in the parent are re-imported so every call site is
 //! unchanged.
 
-use crate::custom_family::{CachedInnerMode, ConstrainedWarmStart, normalize_active_sets};
+use crate::{CachedInnerMode, ConstrainedWarmStart, normalize_active_sets};
 use gam_model_api::families::custom_family::{BlockwiseFitOptions, CustomFamily};
 use gam_problem::{ParameterBlockSpec, PenaltyMatrix};
 use gam_linalg::matrix::DesignMatrix;
-use crate::persistent_warm_start::{
+use gam_solve::persistent_warm_start::{
     PersistentBlockInnerSummary, PersistentBlockWarmStartRecord, load_block_record,
     store_block_record,
 };
@@ -25,12 +25,12 @@ use ndarray::{Array1, Array2};
 use std::any::type_name;
 use std::sync::atomic::Ordering;
 
-use crate::warm_start_artifact::{
+use gam_solve::warm_start_artifact::{
     FIT_ARTIFACT_SCHEMA, FitArtifact, FitDescriptor, GlobalFitSummary, ResponseSig,
     RowPopulationTag, SerializableBasisMeta, TermArtifact, TermIdentityKey, TermRole,
     TransferProvenance, term_identity_from_block,
 };
-use crate::warm_start_transfer::{TermBuildContext, TransferConfig, build_warm_start};
+use gam_solve::warm_start_transfer::{TermBuildContext, TransferConfig, build_warm_start};
 
 /// Build the structural identity of each block at the fit-spec layer. The
 /// returned `TermIdentityKey` is fold-invariant (keyed on block name + penalty
@@ -106,7 +106,7 @@ fn descriptor_for(specs: &[ParameterBlockSpec], family_kind: &str, n_rows: usize
 /// a missing artifact only forfeits a future warm start, never the fit.
 pub(crate) fn capture_fit_artifact<F: CustomFamily + ?Sized>(
     specs: &[ParameterBlockSpec],
-    gauge: &crate::gauge::Gauge,
+    gauge: &gam_solve::gauge::Gauge,
     reduced_block_beta: &[Array1<f64>],
     rho: &Array1<f64>,
     physical_to_outer: &[Option<usize>],
@@ -176,7 +176,7 @@ pub(crate) fn capture_fit_artifact<F: CustomFamily + ?Sized>(
             n_rows,
         },
     };
-    if let Err(err) = crate::persistent_warm_start::store_fit_artifact(&artifact) {
+    if let Err(err) = gam_solve::persistent_warm_start::store_fit_artifact(&artifact) {
         log::debug!("[fit-artifact] capture skipped: {err}");
     }
 }
@@ -187,7 +187,7 @@ pub(crate) fn capture_fit_artifact<F: CustomFamily + ?Sized>(
 /// block-upper-triangular; we take the on-diagonal `(raw_b, reduced_b)` block,
 /// which is exactly the per-block reduction section. Returns `None` on any
 /// partition/shape anomaly so the term falls back to a cold β.
-fn gauge_block_t(gauge: &crate::gauge::Gauge, b: usize) -> Option<Array2<f64>> {
+fn gauge_block_t(gauge: &gam_solve::gauge::Gauge, b: usize) -> Option<Array2<f64>> {
     let r0 = *gauge.block_starts_raw.get(b)?;
     let r1 = *gauge.block_starts_raw.get(b + 1)?;
     let c0 = *gauge.block_starts_reduced.get(b)?;
@@ -216,7 +216,7 @@ fn gauge_block_t(gauge: &crate::gauge::Gauge, b: usize) -> Option<Array2<f64>> {
 /// inner solve replays from the seed rather than reusing a stale mode.
 pub(crate) fn consume_fit_artifact<F: CustomFamily + ?Sized>(
     specs: &[ParameterBlockSpec],
-    gauge: &crate::gauge::Gauge,
+    gauge: &gam_solve::gauge::Gauge,
     physical_to_outer: &[Option<usize>],
     rho_default: &Array1<f64>,
 ) -> Option<ConstrainedWarmStart> {
@@ -224,7 +224,7 @@ pub(crate) fn consume_fit_artifact<F: CustomFamily + ?Sized>(
     let (n_rows, ..) = custom_family_cache_shape(specs);
     let descriptor = descriptor_for(specs, family_kind, n_rows);
     let key_hex = descriptor.descriptor_key().to_hex();
-    let parent = crate::persistent_warm_start::load_fit_artifact_by_descriptor(&key_hex)?;
+    let parent = gam_solve::persistent_warm_start::load_fit_artifact_by_descriptor(&key_hex)?;
 
     // The gauge must partition into exactly the spec blocks for the per-block
     // T extraction to be meaningful; otherwise we transfer ρ only.
@@ -387,7 +387,7 @@ pub(crate) fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
 ) -> Option<String> {
     let mut hasher = Fingerprinter::new();
     hasher.write_str("gamfit-persistent-block-warm-start");
-    hasher.write_str(&crate::persistent_warm_start::cache_schema_tag());
+    hasher.write_str(&gam_solve::persistent_warm_start::cache_schema_tag());
     hasher.write_str(type_name::<F>());
     hasher.write_str(&family.persistent_warm_start_fingerprint(specs, options)?);
     hasher.write_usize(specs.len());

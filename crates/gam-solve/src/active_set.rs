@@ -313,7 +313,7 @@ pub(crate) fn compute_constraint_kkt_diagnostics(
     }
 }
 
-pub(crate) fn project_stationarity_residual_on_constraint_cone(
+pub fn project_stationarity_residual_on_constraint_cone(
     residual: &Array1<f64>,
     active_a: &Array2<f64>,
 ) -> Option<(Array1<f64>, Array1<f64>)> {
@@ -878,7 +878,7 @@ fn identity_multiplier_dependence(groups: &[Vec<usize>]) -> Vec<Vec<ActiveRowDep
         .collect()
 }
 
-pub(crate) fn rank_reduce_rows_pivoted_qr_with_dependence(
+pub fn rank_reduce_rows_pivoted_qr_with_dependence(
     a: Array2<f64>,
     b: Array1<f64>,
     groups: Vec<Vec<usize>>,

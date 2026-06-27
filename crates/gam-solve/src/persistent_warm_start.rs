@@ -62,7 +62,7 @@ pub struct PersistentWarmStartRecord {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct PersistentBlockInnerSummary {
+pub struct PersistentBlockInnerSummary {
     pub log_likelihood: f64,
     pub penalty_value: f64,
     pub cycles: usize,
@@ -81,7 +81,7 @@ impl PersistentBlockInnerSummary {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct PersistentBlockWarmStartRecord {
+pub struct PersistentBlockWarmStartRecord {
     pub version: u32,
     pub key: String,
     pub package_version: String,
@@ -98,7 +98,7 @@ pub(crate) struct PersistentBlockWarmStartRecord {
 }
 
 impl PersistentBlockWarmStartRecord {
-    pub(crate) fn new(
+    pub fn new(
         key: String,
         n_rows: usize,
         block_names: Vec<String>,
@@ -121,7 +121,7 @@ impl PersistentBlockWarmStartRecord {
         }
     }
 
-    pub(crate) fn is_compatible(
+    pub fn is_compatible(
         &self,
         key: &str,
         n_rows: usize,
@@ -205,7 +205,7 @@ pub fn load_record(key: &str) -> Option<PersistentWarmStartRecord> {
     load_json_record(key)
 }
 
-pub(crate) fn load_block_record(key: &str) -> Option<PersistentBlockWarmStartRecord> {
+pub fn load_block_record(key: &str) -> Option<PersistentBlockWarmStartRecord> {
     load_json_record(key)
 }
 
@@ -213,7 +213,7 @@ pub fn store_record(record: &PersistentWarmStartRecord) -> Result<(), String> {
     store_json_record(&record.key, record)
 }
 
-pub(crate) fn store_block_record(record: &PersistentBlockWarmStartRecord) -> Result<(), String> {
+pub fn store_block_record(record: &PersistentBlockWarmStartRecord) -> Result<(), String> {
     store_json_record(&record.key, record)
 }
 
@@ -307,7 +307,7 @@ pub(crate) fn open_outer_session(
 ///
 /// Best-effort: encoding / store failures are swallowed (a warm-start
 /// artifact is never required), oversize payloads are dropped.
-pub(crate) fn store_fit_artifact(
+pub fn store_fit_artifact(
     artifact: &crate::warm_start_artifact::FitArtifact,
 ) -> Result<(), String> {
     if !artifact.is_usable() {
@@ -340,7 +340,7 @@ pub(crate) fn store_fit_artifact(
 /// descriptor-key matches can be different folds / row sets whose objectives
 /// are not on a common scale, so "lowest objective" is the wrong rule.
 /// Returns `None` (cold fallback) on any miss or non-finite payload.
-pub(crate) fn load_fit_artifact_by_descriptor(
+pub fn load_fit_artifact_by_descriptor(
     descriptor_key_hex: &str,
 ) -> Option<crate::warm_start_artifact::FitArtifact> {
     let store = persistent_store()?;

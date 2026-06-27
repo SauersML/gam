@@ -1,5 +1,45 @@
 use super::*;
 
+/// Generate a B-spline knot vector spanning a 1-D seed sample.
+///
+/// Family-agnostic knot-generation helper relocated DOWN into `gam-terms`
+/// under #1521 (was `gam_models::wiggle::initializewiggle_knots_from_seed`): it
+/// only drives the basis builder's `KnotSource::Generate` path and carries no
+/// model-family type, so the wiggle-bearing families (gamlss / bms /
+/// transformation-normal) consume it from the basis layer instead of reaching
+/// across the family stack. A degenerate (near-constant) seed is widened to a
+/// fixed half-range so the generated knots stay well-conditioned.
+pub fn initializewiggle_knots_from_seed(
+    seed: ArrayView1<'_, f64>,
+    degree: usize,
+    num_internal_knots: usize,
+) -> Result<Array1<f64>, String> {
+    const MIN_WIGGLE_SEED_SPAN: f64 = 1e-8;
+    const DEFAULT_WIGGLE_HALF_RANGE: f64 = 3.0;
+
+    let mut seed_min = seed.iter().copied().fold(f64::INFINITY, f64::min);
+    let mut seed_max = seed.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !seed_min.is_finite() || !seed_max.is_finite() {
+        return Err("non-finite seed for wiggle knot initialization".to_string());
+    }
+    if (seed_max - seed_min).abs() < MIN_WIGGLE_SEED_SPAN {
+        let center = 0.5 * (seed_min + seed_max);
+        seed_min = center - DEFAULT_WIGGLE_HALF_RANGE;
+        seed_max = center + DEFAULT_WIGGLE_HALF_RANGE;
+    }
+    let (_, knots) = create_basis::<Dense>(
+        seed,
+        KnotSource::Generate {
+            data_range: (seed_min, seed_max),
+            num_internal_knots,
+        },
+        degree,
+        BasisOptions::value(),
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(knots)
+}
+
 pub fn select_centers_by_strategy(
     data: ArrayView2<'_, f64>,
     strategy: &CenterStrategy,
