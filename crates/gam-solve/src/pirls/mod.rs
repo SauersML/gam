@@ -79,7 +79,12 @@ pub use sparse_system::{SparsePenalizedSystem, assemble_and_factor_sparse_penali
 
 pub use reweight::runworking_model_pirls;
 
-pub(crate) use state::array1_l2_norm;
+pub use state::array1_l2_norm;
+
+// Surface the `WorkingModel` trait (defined in the private `working_model_trait`
+// module) at the `pirls` root so out-of-crate engine implementors (gam-models
+// survival working models) can name and implement it.
+pub use working_model_trait::WorkingModel;
 
 pub use state::{
     AdaptiveKktTolerance, ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind,

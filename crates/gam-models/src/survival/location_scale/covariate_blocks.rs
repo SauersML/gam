@@ -37,7 +37,7 @@ pub(crate) fn validate_cov_block(
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         match s {
-            gam_problem::PenaltySpec::Block {
+            gam_terms::penalty_spec::PenaltySpec::Block {
                 local, col_range, ..
             } => {
                 if col_range.end > p
@@ -53,8 +53,8 @@ pub(crate) fn validate_cov_block(
                     );
                 }
             }
-            gam_problem::PenaltySpec::Dense(m)
-            | gam_problem::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+            gam_terms::penalty_spec::PenaltySpec::Dense(m)
+            | gam_terms::penalty_spec::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
                     crate::bail_dim_sls!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}");
@@ -444,15 +444,15 @@ pub(crate) fn prepare_cov_block_kind(
                 b.penalties
                     .iter()
                     .map(|spec| match spec {
-                        gam_problem::PenaltySpec::Block {
+                        gam_terms::penalty_spec::PenaltySpec::Block {
                             local, col_range, ..
                         } => PenaltyMatrix::Blockwise {
                             local: local.clone(),
                             col_range: col_range.clone(),
                             total_dim: p,
                         },
-                        gam_problem::PenaltySpec::Dense(m)
-                        | gam_problem::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                        gam_terms::penalty_spec::PenaltySpec::Dense(m)
+                        | gam_terms::penalty_spec::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                             PenaltyMatrix::Dense(m.clone())
                         }
                     })
@@ -496,7 +496,7 @@ pub(crate) fn build_survival_covariate_block_from_design(
                 penalties: cov_design
                     .penalties
                     .iter()
-                    .map(gam_problem::PenaltySpec::from_blockwise_ref)
+                    .map(gam_terms::penalty_spec::PenaltySpec::from_blockwise_ref)
                     .collect(),
                 nullspace_dims: cov_design.nullspace_dims.clone(),
                 initial_log_lambdas,

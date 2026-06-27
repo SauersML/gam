@@ -1520,7 +1520,7 @@ pub(crate) fn bs_selector_is_vector(raw: &str) -> bool {
     bracketed && !parse_option_list(trimmed).is_empty()
 }
 
-pub(crate) fn resolve_smooth_type_name(
+pub fn resolve_smooth_type_name(
     kind: SmoothKind,
     n_cols: usize,
     options: &BTreeMap<String, String>,
@@ -3955,7 +3955,7 @@ pub fn validate_known_options(
 /// onto the explicit (hard) center-placement strategy: the cap lowers the
 /// *default* count while the `Auto` strategy is retained, so the count is still
 /// softly reduced when the data can't support it.
-pub(crate) const SECONDARY_CENTER_CAP_OPTION: &str = "__secondary_center_cap";
+pub const SECONDARY_CENTER_CAP_OPTION: &str = "__secondary_center_cap";
 
 /// Apply the secondary-predictor center cap to a *default* spatial center
 /// count. A no-op when the cap option is absent (the common case) or when the
@@ -4006,7 +4006,7 @@ pub fn parse_countwith_basis_alias(
     Ok(primary.or(basis_dim).unwrap_or(default_count))
 }
 
-pub(crate) fn has_explicit_countwith_basis_alias(
+pub fn has_explicit_countwith_basis_alias(
     options: &BTreeMap<String, String>,
     primarykey: &str,
 ) -> bool {

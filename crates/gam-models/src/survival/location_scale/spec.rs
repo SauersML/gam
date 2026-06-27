@@ -116,7 +116,7 @@ pub struct LinkWiggleBlockInput {
     pub design: DesignMatrix,
     pub knots: Array1<f64>,
     pub degree: usize,
-    pub penalties: Vec<gam_problem::PenaltySpec>,
+    pub penalties: Vec<gam_terms::penalty_spec::PenaltySpec>,
     /// Structural nullspace dimension of each penalty matrix.
     pub nullspace_dims: Vec<usize>,
     pub initial_log_lambdas: Option<Array1<f64>>,

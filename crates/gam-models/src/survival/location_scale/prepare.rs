@@ -688,15 +688,15 @@ pub(crate) fn prepare_survival_location_scale_model(
                 w.penalties
                     .iter()
                     .map(|spec| match spec {
-                        gam_problem::PenaltySpec::Block {
+                        gam_terms::penalty_spec::PenaltySpec::Block {
                             local, col_range, ..
                         } => PenaltyMatrix::Blockwise {
                             local: local.clone(),
                             col_range: col_range.clone(),
                             total_dim: p_wiggle,
                         },
-                        gam_problem::PenaltySpec::Dense(m)
-                        | gam_problem::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                        gam_terms::penalty_spec::PenaltySpec::Dense(m)
+                        | gam_terms::penalty_spec::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                             PenaltyMatrix::Dense(m.clone())
                         }
                     })
@@ -1006,7 +1006,7 @@ pub(crate) fn validatewiggle_block(
     }
     for (idx, s) in b.penalties.iter().enumerate() {
         match s {
-            gam_problem::PenaltySpec::Block {
+            gam_terms::penalty_spec::PenaltySpec::Block {
                 local, col_range, ..
             } => {
                 if col_range.end > p
@@ -1022,8 +1022,8 @@ pub(crate) fn validatewiggle_block(
                     );
                 }
             }
-            gam_problem::PenaltySpec::Dense(m)
-            | gam_problem::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+            gam_terms::penalty_spec::PenaltySpec::Dense(m)
+            | gam_terms::penalty_spec::PenaltySpec::DenseWithMean { matrix: m, .. } => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
                     crate::bail_dim_sls!(

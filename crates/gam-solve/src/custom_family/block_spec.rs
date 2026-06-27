@@ -121,7 +121,7 @@ pub(crate) fn custom_family_block_role(
     }
 }
 
-pub(crate) fn validate_blockspecs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, String> {
+pub fn validate_blockspecs(specs: &[ParameterBlockSpec]) -> Result<Vec<usize>, String> {
     // `fit_custom_family` is a fit entry point and genuinely requires at least
     // one parameter block — an empty model has nothing to estimate. This is a
     // *fit-level precondition*, distinct from the *consistency* of the block

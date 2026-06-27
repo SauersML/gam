@@ -2120,7 +2120,7 @@ pub(crate) fn orthogonality_transform_from_cross_and_gram(
     stabilized_orthogonality_transform_from_gram(gram, &transform_raw)
 }
 
-pub(crate) fn orthogonality_transform_for_design(
+pub fn orthogonality_transform_for_design(
     design: &DesignMatrix,
     constraint_matrix: ArrayView2<'_, f64>,
     weights: Option<ArrayView1<'_, f64>>,

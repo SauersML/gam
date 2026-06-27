@@ -48,7 +48,7 @@ pub struct InverseLinkJet {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct LogitJet5 {
+pub struct LogitJet5 {
     pub mu: f64,
     pub d1: f64,
     pub d2: f64,
@@ -71,7 +71,7 @@ fn canonicalize_jet(mut jet: InverseLinkJet) -> InverseLinkJet {
 }
 
 #[inline]
-pub(crate) fn logit_inverse_link_jet5(eta: f64) -> LogitJet5 {
+pub fn logit_inverse_link_jet5(eta: f64) -> LogitJet5 {
     if eta.is_nan() {
         return LogitJet5 {
             mu: f64::NAN,

@@ -181,7 +181,7 @@ impl WorkingState {
 /// One pass, no allocation, O(p). At p≈10⁴ the cost is ≪ the O(np²) PIRLS
 /// inner work, so this is free in any setting where it matters.
 #[inline]
-pub(crate) fn array1_l2_norm(v: &Array1<f64>) -> f64 {
+pub fn array1_l2_norm(v: &Array1<f64>) -> f64 {
     v.iter().map(|x| x * x).sum::<f64>().sqrt()
 }
 

@@ -2854,7 +2854,7 @@ impl ZeroDerivativeMatrix {
 
 /// Which derivative level the implicit operator should compute.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum ImplicitDerivLevel {
+pub enum ImplicitDerivLevel {
     /// ∂X/∂ψ_d
     First(usize),
     /// ∂²X/∂ψ_d²
@@ -3698,18 +3698,18 @@ impl DerivativeStorageBackend for LatentCoordDerivativeOp {
 }
 
 #[derive(Clone)]
-pub(crate) struct HyperDesignDerivative {
+pub struct HyperDesignDerivative {
     pub(crate) storage: DerivativeMatrixStorage,
 }
 
 impl HyperDesignDerivative {
-    pub(crate) fn zero(nrows: usize, ncols: usize) -> Self {
+    pub fn zero(nrows: usize, ncols: usize) -> Self {
         Self {
             storage: DerivativeMatrixStorage::Zero(ZeroDerivativeMatrix::new(nrows, ncols)),
         }
     }
 
-    pub(crate) fn from_embedded(
+    pub fn from_embedded(
         local: Array2<f64>,
         global_range: Range<usize>,
         total_cols: usize,
@@ -3723,7 +3723,7 @@ impl HyperDesignDerivative {
         }
     }
 
-    pub(crate) fn from_implicit(
+    pub fn from_implicit(
         operator: std::sync::Arc<gam_terms::basis::ImplicitDesignPsiDerivative>,
         level: ImplicitDerivLevel,
         global_range: Range<usize>,
@@ -3740,7 +3740,7 @@ impl HyperDesignDerivative {
         }
     }
 
-    pub(crate) fn from_latent_coord(
+    pub fn from_latent_coord(
         operator: std::sync::Arc<gam_terms::basis::LatentCoordDesignDerivative>,
         flat_axis: usize,
         global_range: Range<usize>,
@@ -3848,12 +3848,12 @@ impl From<Array2<f64>> for HyperDesignDerivative {
 }
 
 #[derive(Clone)]
-pub(crate) struct HyperPenaltyDerivative {
+pub struct HyperPenaltyDerivative {
     pub(crate) storage: DerivativeMatrixStorage,
 }
 
 impl HyperPenaltyDerivative {
-    pub(crate) fn from_embedded(
+    pub fn from_embedded(
         local: Array2<f64>,
         global_range: Range<usize>,
         total_dim: usize,
@@ -3918,7 +3918,7 @@ pub(crate) struct PenaltyDerivativeComponent {
 }
 
 #[derive(Clone)]
-pub(crate) struct DirectionalHyperParam {
+pub struct DirectionalHyperParam {
     pub(crate) x_tau_original: HyperDesignDerivative,
     // Canonical penalty representation: every tau direction is decomposed into
     // base-penalty derivatives. There is no separate "assembled total" path.
@@ -3985,7 +3985,7 @@ impl DirectionalHyperParam {
         Ok(out)
     }
 
-    pub(crate) fn new_compact(
+    pub fn new_compact(
         x_tau_original: HyperDesignDerivative,
         penalty_first_components: Vec<(usize, HyperPenaltyDerivative)>,
         x_tau_tau_original: Option<Vec<Option<HyperDesignDerivative>>>,
@@ -4022,7 +4022,7 @@ impl DirectionalHyperParam {
 
     /// Mark this coordinate as non-penalty-like (design-moving).
     /// EFS will skip it; use Newton/BFGS for these coordinates.
-    pub(crate) fn not_penalty_like(mut self) -> Self {
+    pub fn not_penalty_like(mut self) -> Self {
         self.is_penalty_like = false;
         self
     }

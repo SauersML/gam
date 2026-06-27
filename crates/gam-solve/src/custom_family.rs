@@ -105,7 +105,8 @@ pub use self::block_spec::{
     CoefficientBlockSelector, CoefficientGroupSpec, CoefficientLabel, RealizedCoefficientGroup,
     RealizedCoefficientGroupSpecs, coefficient_label,
 };
-pub(crate) use self::block_spec::{custom_family_block_role, validate_blockspecs};
+pub(crate) use self::block_spec::custom_family_block_role;
+pub use self::block_spec::validate_blockspecs;
 pub(crate) use blockwise_solve::*;
 pub use coefficient_groups::*;
 pub(crate) use covariance::*;
