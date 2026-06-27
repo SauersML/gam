@@ -65,24 +65,27 @@ pub(crate) const LEVENBERG_DAMPING_GROWTH: f64 = 10.0;
 
 pub(crate) const LEVENBERG_MAX_DAMPING_REL: f64 = 1e8;
 
-/// Relative floor for the coupled-survival TIME-block trust-region metric
-/// (issue #1569). The time block enters the linear predictor through the
-/// nonlinear scale map `q = −η_t · exp(−η_σ)`, so its likelihood-Hessian
-/// diagonal `Σ_r exp(−2 η_σ,r) X_{rj}²` spans the full dynamic range of the free
-/// scale predictor: when `exp(−η_σ)` is large on a few rows the metric is
-/// dominated by them for the coefficients they load on, while time coefficients
-/// loading mostly on large-σ rows are metric-STARVED. The affine-covariant
+/// Relative floor for the coupled-survival SCALE-COUPLED block trust-region
+/// metric (issue #1569). The free scale predictor `η_σ` enters the likelihood
+/// through the standardized index `u = inv_sigma·(h − η_t)` with
+/// `inv_sigma = exp(−η_σ)`, so `∂u/∂η_t = −inv_sigma`: the LOCATION (threshold)
+/// and LOG-σ channels carry an `exp(−η_σ)` factor in their gradient and an
+/// `exp(−2 η_σ)` factor in their likelihood-Hessian diagonal
+/// `Σ_r exp(−2 η_σ,r) X_{rj}²` (the flexible time baseline `h` does NOT — its
+/// `∂u/∂h = 1` is scale-free). When `exp(−η_σ)` is large on a few rows the metric
+/// is dominated by them for the coefficients they load on, while a coefficient
+/// loading mostly on large-σ rows is metric-STARVED. The affine-covariant
 /// Moré–Sorensen step then over-reaches on the starved coordinates and the inner
-/// trust loop grinds. We floor every time-block metric entry at this fraction of
-/// the block's MAXIMUM metric entry, capping the `exp(−η_σ)`-induced condition
-/// number of the time-block metric so no coordinate is starved. The floor is
-/// derived ENTIRELY from the scale-coupled diagonal (no knob, no flag): it scales
-/// with `exp(−2 η_σ)` automatically and self-vanishes at the KKT fixed point
-/// (it shapes the step norm only, never the converged β). `1e-6` keeps the floor
-/// six orders below the block's dominant curvature so a well-conditioned time
-/// block (constant or mild scale) sees a byte-identical metric, while a sharply
-/// heteroscedastic block has its metric dynamic range capped at `1e6`.
-pub(crate) const TIME_BLOCK_TRUST_METRIC_FLOOR_REL: f64 = 1e-6;
+/// trust loop grinds. We floor every scale-coupled metric entry at this fraction
+/// of the block's MAXIMUM metric entry, capping the `exp(−η_σ)`-induced condition
+/// number so no coordinate is starved. The floor is derived ENTIRELY from the
+/// scale-coupled diagonal (no knob, no flag): it scales with `exp(−2 η_σ)`
+/// automatically and self-vanishes at the KKT fixed point (it shapes the step
+/// norm only, never the converged β). `1e-6` keeps the floor six orders below the
+/// block's dominant curvature so a well-conditioned block (constant or mild
+/// scale) sees a byte-identical metric, while a sharply heteroscedastic block has
+/// its metric dynamic range capped at `1e6`.
+pub(crate) const SCALE_COUPLED_TRUST_METRIC_FLOOR_REL: f64 = 1e-6;
 
 /// Outer (smoothing-parameter) loop budget for the blockwise location-scale
 /// fit: at most this many outer iterations, stopping once the outer relative

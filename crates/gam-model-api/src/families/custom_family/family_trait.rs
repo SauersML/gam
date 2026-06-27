@@ -544,13 +544,16 @@ pub trait CustomFamily {
     /// quality and stalling the inner solve.
     ///
     /// This is exactly the failure mode of a coupled location-scale survival fit
-    /// (#1569): the time block enters the linear predictor through the nonlinear
-    /// scale map `q = −η_t · exp(−η_σ)`, so its likelihood-Hessian diagonal scales
-    /// as `Σ_r exp(−2 η_σ,r) X_{rj}²`. When the free scale predictor drives some
-    /// rows to small σ (large `exp(−η_σ)`), the bare diagonal is dominated by
-    /// those rows for the coefficients they load on, yet UNDERSTATES the curvature
-    /// scale for time coefficients that load mostly on large-σ rows — so the
-    /// whitened step over-reaches on the latter and the trust loop grinds.
+    /// (#1569): the free scale predictor `η_σ` enters the standardized index as
+    /// `u = exp(−η_σ)·(h − η_t)`, so `∂u/∂η_t = −exp(−η_σ)` and the LOCATION and
+    /// LOG-σ channels' likelihood-Hessian diagonals scale as
+    /// `Σ_r exp(−2 η_σ,r) X_{rj}²` (the flexible time baseline `h` has
+    /// `∂u/∂h = 1` and is scale-free, so it is NOT inflated). When the free scale
+    /// predictor drives some rows to small σ (large `exp(−η_σ)`), the bare diagonal
+    /// is dominated by those rows for the coefficients they load on, yet
+    /// UNDERSTATES the curvature scale for coefficients that load mostly on
+    /// large-σ rows — so the whitened step over-reaches on the latter and the
+    /// trust loop grinds.
     ///
     /// A family that owns a free-scale-coupled block may return `Some(floor)` — a
     /// per-coordinate, NON-negative additive floor over the FULL joint coefficient

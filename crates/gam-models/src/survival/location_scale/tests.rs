@@ -6748,23 +6748,35 @@ fn validate_linear_constraints_accepts_roundoff_feasible_iterate_1569() {
     );
 }
 
-/// Build a strongly-heteroscedastic survival LS family whose TIME block has two
-/// coefficients with disjoint row support: coefficient 0 loads only on the
-/// small-σ rows (where the log-scale predictor `η_σ` is very negative ⇒ a LARGE
-/// `inv_sigma = exp(−η_σ)`), and coefficient 1 loads only on the large-σ rows
-/// (small `inv_sigma`). Because the time-channel Jacobian carries `inv_sigma`
-/// per row, the time-time likelihood-Hessian diagonal — which is the joint trust
-/// metric `D` the joint-Newton globalization whitens by — scales as
-/// `Σ_r exp(−2 η_σ,r) X_{rj}²`, so coefficient 0's metric entry is many orders of
-/// magnitude ABOVE coefficient 1's. That is the #1569 metric-starvation regime.
-fn survival_ls_heteroscedastic_two_col_time_family()
+/// Build a strongly-heteroscedastic survival LS family whose LOCATION (threshold)
+/// block has two coefficients with disjoint row support: coefficient 0 loads only
+/// on the small-σ rows (where the log-scale predictor `η_σ` is very negative ⇒ a
+/// LARGE `inv_sigma = exp(−η_σ)`), and coefficient 1 loads only on the large-σ
+/// rows (small `inv_sigma`). The location channel enters the standardized index
+/// as `u = inv_sigma·(h − η_t)`, so `∂u/∂η_t = −inv_sigma` and the
+/// location-location likelihood-Hessian diagonal — part of the joint trust metric
+/// `D` the joint-Newton globalization whitens by — scales as
+/// `Σ_r exp(−2 η_σ,r) X_{rj}²`. Coefficient 0's metric entry is therefore many
+/// orders of magnitude ABOVE coefficient 1's: the #1569 metric-starvation regime.
+/// (The flexible time baseline `h` has `∂u/∂h = 1` and is scale-free, so it is NOT
+/// the inflated block — hence the floor targets location / log-σ, not time.)
+fn survival_ls_heteroscedastic_two_col_location_family()
 -> (SurvivalLocationScaleFamily, Vec<ParameterBlockState>) {
-    // Six rows: the first three sit at small σ (η_σ ≈ −3, inv_sigma ≈ 20), the
-    // last three at large σ (η_σ ≈ +1, inv_sigma ≈ 0.37). The 2-column time
-    // design is block-disjoint so each time coefficient loads on exactly one σ
-    // regime.
+    // Six rows: the first three sit at very small σ (η_σ ≈ −5, inv_sigma ≈ 148),
+    // the last three at large σ (η_σ ≈ +3, inv_sigma ≈ 0.05). The 2-column
+    // LOCATION design is block-disjoint so each location coefficient loads on
+    // exactly one σ regime. The wide Δη_σ = 8 split (`exp(2·8) ≈ 9e6`) pushes the
+    // location-block metric ratio PAST the floor's metric-condition cap (1e6), so
+    // the floor genuinely binds — this is the harder-than-the-gate regime #1569
+    // targets.
     let n = 6usize;
-    let x_time = array![
+    // Benign single-column time baseline (scale-free).
+    let x_time = array![[1.0], [1.0], [1.0], [1.0], [1.0], [1.0]];
+    // log-σ design: a single column; with β_ls = 1 the small-σ rows get η_σ = −5
+    // and the large-σ rows get η_σ = +3.
+    let x_log_sigma = array![[-5.0], [-5.0], [-5.0], [3.0], [3.0], [3.0]];
+    // Location (threshold) design: two disjoint columns, one per σ regime.
+    let x_threshold = array![
         [1.0, 0.0],
         [1.0, 0.0],
         [1.0, 0.0],
@@ -6772,12 +6784,6 @@ fn survival_ls_heteroscedastic_two_col_time_family()
         [0.0, 1.0],
         [0.0, 1.0],
     ];
-    // log-σ design: a single column whose coefficient drives η_σ. We choose the
-    // per-row design value so that with β_ls = 1 the small-σ rows get η_σ = −3 and
-    // the large-σ rows get η_σ = +1.
-    let x_log_sigma = array![[-3.0], [-3.0], [-3.0], [1.0], [1.0], [1.0]];
-    // Threshold (location) design: a benign single column.
-    let x_threshold = array![[1.0], [1.0], [1.0], [1.0], [1.0], [1.0]];
     let family = SurvivalLocationScaleFamily {
         n,
         y: array![1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
@@ -6807,19 +6813,20 @@ fn survival_ls_heteroscedastic_two_col_time_family()
         location_log_time: None,
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
     };
-    // Block betas: a small positive time β (so the time geometry is non-trivial),
-    // a zero location β, and β_ls = 1 so η_σ realizes the −3 / +1 split above.
-    let beta_t = array![0.2, 0.2];
-    let beta_thr = array![0.0];
+    // Block betas: a small time β; zero location β; β_ls = 1 so η_σ realizes the
+    // −3 / +1 split above.
+    let beta_t = array![0.2];
+    let beta_thr = array![0.0, 0.0];
     let beta_ls = array![1.0];
-    let eta_t_row = |i: usize, x: &Array2<f64>| x[[i, 0]] * beta_t[0] + x[[i, 1]] * beta_t[1];
     let mut eta_time = Array1::<f64>::zeros(3 * n);
     for i in 0..n {
-        eta_time[i] = eta_t_row(i, &family.x_time_entry);
-        eta_time[n + i] = eta_t_row(i, &family.x_time_exit);
-        eta_time[2 * n + i] = eta_t_row(i, &family.x_time_deriv);
+        eta_time[i] = x_time[[i, 0]] * beta_t[0];
+        eta_time[n + i] = x_time[[i, 0]] * beta_t[0];
+        eta_time[2 * n + i] = x_time[[i, 0]] * beta_t[0];
     }
-    let eta_thr = Array1::from_iter((0..n).map(|i| x_threshold[[i, 0]] * beta_thr[0]));
+    let eta_thr = Array1::from_iter(
+        (0..n).map(|i| x_threshold[[i, 0]] * beta_thr[0] + x_threshold[[i, 1]] * beta_thr[1]),
+    );
     let eta_ls = Array1::from_iter((0..n).map(|i| x_log_sigma[[i, 0]] * beta_ls[0]));
     let states = vec![
         ParameterBlockState {
@@ -6844,72 +6851,74 @@ fn survival_ls_heteroscedastic_two_col_time_family()
 /// affine-covariant joint-Newton step cannot over-reach on a metric-starved time
 /// coordinate. This is the mechanism-level regression guard for the globalization
 /// fix: it asserts the BEFORE-state (a pathological metric ratio, far worse than
-/// the cap) and the AFTER-state (the floor brings the ratio to exactly the cap).
+/// the cap) and the AFTER-state (the floor brings the ratio to the cap).
 #[test]
-fn survival_ls_scale_aware_time_block_trust_metric_floor_caps_starvation_1569() {
-    let (family, states) = survival_ls_heteroscedastic_two_col_time_family();
+fn survival_ls_scale_aware_location_block_trust_metric_floor_caps_starvation_1569() {
+    let (family, states) = survival_ls_heteroscedastic_two_col_location_family();
     let specs: Vec<ParameterBlockSpec> = Vec::new();
 
     let offsets = family.joint_block_offsets();
-    let (time_start, time_end) = (
-        offsets[SurvivalLocationScaleFamily::BLOCK_TIME],
-        offsets[SurvivalLocationScaleFamily::BLOCK_TIME + 1],
+    let (loc_start, loc_end) = (
+        offsets[SurvivalLocationScaleFamily::BLOCK_THRESHOLD],
+        offsets[SurvivalLocationScaleFamily::BLOCK_THRESHOLD + 1],
     );
-    assert_eq!(time_end - time_start, 2, "two-column time block expected");
+    assert_eq!(loc_end - loc_start, 2, "two-column location block expected");
 
-    // ---- raw (pre-floor) time-block trust metric = time-time Hessian diagonal.
-    // This is exactly the diagonal the generic joint-Newton driver whitens by
-    // before the family floor is applied.
+    // ---- raw (pre-floor) joint trust metric = joint Hessian diagonal. This is
+    // exactly the diagonal the generic joint-Newton driver whitens by before the
+    // family floor is applied.
     let log_scale = family.hessian_deriv_log_rescale(&states);
     let q = family
         .collect_joint_quantities_rescaled(&states, log_scale)
         .expect("joint quantities");
-    let dynamic = family
-        .build_dynamic_geometry(&states)
-        .expect("dynamic geometry");
-    let nll_time = q.time_channel_nll_curvatures();
-    let h_time = mxtwxd(&dynamic.time_jac_entry, &nll_time.h0, None)
-        + mxtwxd(&dynamic.time_jac_exit, &nll_time.h1, None)
-        + mxtwxd(&dynamic.time_jac_deriv, &nll_time.d, None);
-    let raw_diag: Vec<f64> = (0..2).map(|j| h_time[[j, j]].abs()).collect();
+    let h_joint = family
+        .assemble_joint_hessian_from_quantities(&q, &states)
+        .expect("joint hessian")
+        .expect("dense joint hessian");
+    let raw_diag: Vec<f64> = (loc_start..loc_end).map(|j| h_joint[[j, j]].abs()).collect();
     let raw_max = raw_diag.iter().copied().fold(0.0_f64, f64::max);
     let raw_min = raw_diag.iter().copied().fold(f64::INFINITY, f64::min);
     assert!(
         raw_max.is_finite() && raw_min.is_finite() && raw_min > 0.0,
-        "raw time-block metric diagonal must be finite and positive: {raw_diag:?}"
+        "raw location-block metric diagonal must be finite and positive: {raw_diag:?}"
     );
     let raw_ratio = raw_max / raw_min;
 
-    // BEFORE-state: the exp(−η_σ) split (η_σ ∈ {−3, +1}) drives a HUGE dynamic
-    // range into the time-block metric — coefficient 0 (small-σ rows) sees
-    // ~exp(−2·−3)=exp(6) curvature, coefficient 1 (large-σ rows) ~exp(−2·1)=exp(−2),
-    // a ratio of ~exp(8) ≈ 3e3 from the scale alone (further amplified by the
-    // per-row curvatures). It must exceed the metric-condition cap the floor
-    // enforces, so the floor is doing real work on this regime.
-    let cap = 1.0 / TIME_BLOCK_TRUST_METRIC_FLOOR_REL; // 1e6
+    // BEFORE-state: the exp(−η_σ) split (η_σ ∈ {−5, +3}) drives a HUGE dynamic
+    // range into the location-block metric — coefficient 0 (small-σ rows) sees
+    // ~exp(−2·−5)=exp(10) curvature via `∂u/∂η_t = −inv_sigma`, coefficient 1
+    // (large-σ rows) ~exp(−2·3)=exp(−6), a ratio ~exp(16) ≈ 9e6 from the scale
+    // alone. It must EXCEED the metric-condition cap (1e6) the floor enforces, so
+    // the floor genuinely binds and does real work on this regime.
+    let cap = 1.0 / SCALE_COUPLED_TRUST_METRIC_FLOOR_REL; // 1e6
     assert!(
-        raw_ratio > 1.0e3,
-        "expected a pathological pre-floor time-metric ratio (the #1569 \
-         exp(−η_σ) starvation), got {raw_ratio:.3e} (diag={raw_diag:?})"
+        raw_ratio > cap,
+        "expected a pathological pre-floor location-metric ratio above the cap \
+         {cap:.0e} (the #1569 exp(−η_σ) starvation), got {raw_ratio:.3e} \
+         (diag={raw_diag:?})"
     );
 
-    // ---- AFTER-state: the family floor caps the time-block metric ratio.
+    // ---- AFTER-state: the family floor caps the location-block metric ratio.
     let floor = family
         .joint_trust_metric_block_floor(&states, &specs)
         .expect("floor computation")
         .expect("strongly heteroscedastic coupled fit must produce a floor");
     assert_eq!(floor.len(), offsets[offsets.len() - 1], "full-width floor");
-    // The floor is zero OUTSIDE the time block (it must not touch other blocks).
-    for (j, &f) in floor.iter().enumerate() {
-        if j < time_start || j >= time_end {
-            assert_eq!(f, 0.0, "floor must be zero outside the time block at {j}");
-        } else {
-            assert!(f > 0.0, "floor must be positive on the time block at {j}");
-        }
+    // The floor is zero on the (scale-free) TIME block; positive on the
+    // scale-coupled location block.
+    let (time_start, time_end) = (
+        offsets[SurvivalLocationScaleFamily::BLOCK_TIME],
+        offsets[SurvivalLocationScaleFamily::BLOCK_TIME + 1],
+    );
+    for j in time_start..time_end {
+        assert_eq!(floor[j], 0.0, "floor must be zero on the scale-free time block at {j}");
+    }
+    for j in loc_start..loc_end {
+        assert!(floor[j] > 0.0, "floor must be positive on the location block at {j}");
     }
     // Apply the floor exactly as the driver does: D_i ← max(D_i, floor_i).
     let floored: Vec<f64> = (0..2)
-        .map(|j| raw_diag[j].max(floor[time_start + j]))
+        .map(|j| raw_diag[j].max(floor[loc_start + j]))
         .collect();
     let floored_max = floored.iter().copied().fold(0.0_f64, f64::max);
     let floored_min = floored.iter().copied().fold(f64::INFINITY, f64::min);
@@ -6918,16 +6927,16 @@ fn survival_ls_scale_aware_time_block_trust_metric_floor_caps_starvation_1569() 
     // tightens the starved coordinate's metric and never loosens the dominant one.
     assert!(
         floored_ratio <= cap * (1.0 + 1e-9),
-        "floor must cap the time-block metric ratio at {cap:.0e}, got {floored_ratio:.3e}"
+        "floor must cap the location-block metric ratio at {cap:.0e}, got {floored_ratio:.3e}"
     );
     assert!(
         floored_ratio < raw_ratio,
-        "floor must REDUCE the time-block metric ratio: before={raw_ratio:.3e} \
+        "floor must REDUCE the location-block metric ratio: before={raw_ratio:.3e} \
          after={floored_ratio:.3e}"
     );
     // The floor only raised the STARVED coordinate (the dominant one is unchanged).
     assert_eq!(
         floored_max, raw_max,
-        "floor must not loosen the dominant time-coordinate metric"
+        "floor must not loosen the dominant location-coordinate metric"
     );
 }

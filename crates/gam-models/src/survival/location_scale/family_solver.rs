@@ -2221,9 +2221,24 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         block_states: &[ParameterBlockState],
         _: &[ParameterBlockSpec],
     ) -> Result<Option<Array1<f64>>, String> {
-        // Scale-aware trust-metric floor for the coupled smooth-scale TIME block
-        // (issue #1569). See `TIME_BLOCK_TRUST_METRIC_FLOOR_REL`. The time block
-        // is BLOCK_TIME = 0, so its joint range is `[offsets[0], offsets[1])`.
+        // Scale-aware trust-metric floor for the coupled smooth-scale fit
+        // (issue #1569). The free scale predictor `η_σ` enters the likelihood
+        // through the standardized index `u = inv_sigma·(h − η_t)` with
+        // `inv_sigma = exp(−η_σ)`, so `∂u/∂η_t = −inv_sigma`: the LOCATION
+        // (threshold) and LOG-σ channels — but NOT the flexible time baseline
+        // `h`, whose `∂u/∂h = 1` is scale-free — carry an `exp(−η_σ)` factor in
+        // their gradient and an `exp(−2 η_σ)` factor in their likelihood-Hessian
+        // diagonal. When the scale predictor drives some rows to small σ (large
+        // `exp(−η_σ)`), a location/log-σ coefficient loading mostly on the
+        // large-σ rows is METRIC-STARVED relative to one loading on the small-σ
+        // rows; the affine-covariant Moré–Sorensen step then over-reaches on the
+        // starved coordinate, the gain ratio never justifies growing the radius,
+        // and the inner solve grinds. We floor each scale-coupled block's metric
+        // entries at `SCALE_COUPLED_TRUST_METRIC_FLOOR_REL × (block max metric)`,
+        // capping the `exp(−η_σ)`-induced metric condition number so no
+        // coordinate is starved. The floor is derived ENTIRELY from the
+        // scale-coupled Hessian diagonal (no knob); `max(D_i, floor_i)` can only
+        // tighten the metric and self-vanishes at the KKT fixed point.
         let offsets = self.joint_block_offsets();
         if offsets.len() < 2 {
             return Ok(None);
@@ -2231,46 +2246,48 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         let p_total = *offsets
             .last()
             .ok_or_else(|| "missing joint block offsets".to_string())?;
-        let (time_start, time_end) = (offsets[Self::BLOCK_TIME], offsets[Self::BLOCK_TIME + 1]);
-        if time_end <= time_start {
-            return Ok(None);
-        }
-        // The time-block metric is the diagonal of the time-time likelihood
-        // Hessian `Σ_channels Xᵀ W X` (the SAME quantity the driver whitens by).
-        // Rebuild it from the scale-stabilized quantities so a large `exp(−η_σ)`
-        // cannot overflow; the uniform `exp(−L)` rescale cancels in the RELATIVE
-        // floor (`fraction × max(diag)`), so the result is scale-invariant.
+        // Assemble the joint likelihood Hessian once from the scale-stabilized
+        // quantities (the uniform `exp(−L)` rescale cancels in the RELATIVE floor
+        // `fraction × max(diag)`, so the floor is scale-invariant). Its diagonal
+        // is the SAME quantity the generic driver whitens by.
         let log_scale = self.hessian_deriv_log_rescale(block_states);
         let q = self.collect_joint_quantities_rescaled(block_states, log_scale)?;
-        let dynamic = self.build_dynamic_geometry(block_states)?;
-        let nll_time = q.time_channel_nll_curvatures();
-        let h_time = mxtwxd(&dynamic.time_jac_entry, &nll_time.h0, None)
-            + mxtwxd(&dynamic.time_jac_exit, &nll_time.h1, None)
-            + mxtwxd(&dynamic.time_jac_deriv, &nll_time.d, None);
-        if h_time.nrows() != time_end - time_start {
-            // Reduced/parametric time block whose width does not match the
-            // assembled time-time Hessian: leave the metric untouched.
+        let Some(h_joint) = self.assemble_joint_hessian_from_quantities(&q, block_states)? else {
             return Ok(None);
-        }
-        // Maximum time-block curvature scale on the diagonal (carries the
-        // `exp(−2 η_σ)` envelope automatically). Non-finite or non-positive ⇒
-        // nothing to floor against.
-        let max_diag = (0..h_time.nrows())
-            .map(|j| h_time[[j, j]].abs())
-            .filter(|v| v.is_finite())
-            .fold(0.0_f64, f64::max);
-        if !(max_diag.is_finite() && max_diag > 0.0) {
-            return Ok(None);
-        }
-        let floor_value = TIME_BLOCK_TRUST_METRIC_FLOOR_REL * max_diag;
-        if !(floor_value.is_finite() && floor_value > 0.0) {
+        };
+        if h_joint.nrows() != p_total {
             return Ok(None);
         }
         let mut floor = Array1::<f64>::zeros(p_total);
-        for j in time_start..time_end {
-            floor[j] = floor_value;
+        let mut any = false;
+        // Floor every scale-coupled block: the LOCATION (threshold) and LOG-σ
+        // channels carry the `exp(−η_σ)` factor; the flexible time baseline does
+        // NOT, so it is deliberately excluded.
+        for &block in &[Self::BLOCK_THRESHOLD, Self::BLOCK_LOG_SIGMA] {
+            if block + 1 >= offsets.len() {
+                continue;
+            }
+            let (start, end) = (offsets[block], offsets[block + 1]);
+            if end <= start {
+                continue;
+            }
+            let max_diag = (start..end)
+                .map(|j| h_joint[[j, j]].abs())
+                .filter(|v| v.is_finite())
+                .fold(0.0_f64, f64::max);
+            if !(max_diag.is_finite() && max_diag > 0.0) {
+                continue;
+            }
+            let floor_value = SCALE_COUPLED_TRUST_METRIC_FLOOR_REL * max_diag;
+            if !(floor_value.is_finite() && floor_value > 0.0) {
+                continue;
+            }
+            for j in start..end {
+                floor[j] = floor_value;
+            }
+            any = true;
         }
-        Ok(Some(floor))
+        if any { Ok(Some(floor)) } else { Ok(None) }
     }
 
     fn post_update_block_beta(
