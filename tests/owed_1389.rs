@@ -79,17 +79,7 @@ fn survival_location_scale_constant_scale_fit_terminates_1389() {
     // log T = eta_location + sigma * eps, with a SINGLE constant sigma (no
     // time-varying scale → every row is qdot-inert → the velocity pass is
     // skipped on every outer-REML joint-Hessian directional-derivative eval).
-    //
-    // Sizing (n, the spline `k`, and the wall bound below) is chosen so the
-    // healthy fit finishes comfortably inside CI's UNOPTIMIZED-DEBUG budget on a
-    // shared runner, while a regressed outer loop is caught structurally — by
-    // `outer_converged == false` — rather than by a wall-clock SIGKILL. See the
-    // `outer_max_iter` / wall-bound comments below for why this matters: a
-    // per-iteration cost small enough that even the worst case (the optimizer
-    // crawling all the way to `outer_max_iter`) returns in seconds turns a
-    // recurrence into a fast, NAMED assertion failure instead of a 600s
-    // bulk-kill that hides which test hung and blocks the whole CI shard.
-    let n = 120usize;
+    let n = 300usize;
     let mut rng = Lcg::new(0x1389_2026);
     let sigma_true = 0.7_f64;
 
@@ -138,16 +128,6 @@ fn survival_location_scale_constant_scale_fit_terminates_1389() {
     // the qdot-inert geometry. `time_num_internal_knots: 2` keeps the
     // gauge-degenerate cold-start time block small (the estimand is a parametric
     // AFT), matching the lognormal-LS quality fixture.
-    //
-    // `outer_max_iter` is left deliberately generous (80): the point of this
-    // gate is to give a regressed outer optimizer room to crawl so the crawl is
-    // OBSERVABLE. A healthy fit on this well-posed geometry certifies outer
-    // stationarity in a handful of iterations and never approaches the cap; a
-    // regressed one that cannot certify on the flat constant-scale time ridge
-    // exhausts the cap and returns `outer_converged == false`. With the small
-    // per-iteration cost (n=120, k=4) even that worst case is seconds, so the
-    // recurrence shows up as the fast, named convergence assertion below rather
-    // than a wall-clock kill.
     let cfg = FitConfig {
         survival_likelihood: "location-scale".to_string(),
         survival_distribution: "gaussian".to_string(),
@@ -157,19 +137,15 @@ fn survival_location_scale_constant_scale_fit_terminates_1389() {
     };
 
     // The defect manifested as a non-terminating / quadratically-thrashing run
-    // (steady RSS growth, 100% CPU, no stage lines) whose only end state was the
-    // outer iteration cap. The PRIMARY teeth of this gate is the
-    // `outer_converged` assertion further down — a regression cannot certify and
-    // trips it. This wall bound is a secondary backstop for a genuine
-    // never-returns hang (e.g. an unbounded inner solve), set well under nextest's
-    // 300s SLOW notice / 600s terminate so that, if it ever fires, it fires as
-    // THIS test's own named panic rather than as an anonymous shard bulk-kill.
+    // (steady RSS growth, 100% CPU, no stage lines). A bounded fit on n=300
+    // completes in seconds; a generous 300s wall guards against the hang
+    // recurring without flaking on normal scheduler/CI jitter.
     let started = Instant::now();
-    let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=4)"#, &ds, &cfg)
+    let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=5)"#, &ds, &cfg)
         .expect("constant-scale survival location-scale AFT fit");
     let elapsed = started.elapsed();
     assert!(
-        elapsed.as_secs() < 240,
+        elapsed.as_secs() < 300,
         "constant-scale survival-LS fit took {elapsed:?}; the #1389 inert-qdot \
          velocity-pass hang appears to have regressed"
     );

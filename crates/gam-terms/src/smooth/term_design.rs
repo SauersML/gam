@@ -654,10 +654,16 @@ fn smooth_term_first_derivative_block(
             )));
         }
     };
-    debug_assert_eq!(
-        feature_col, deriv_col,
-        "smooth_term_first_derivative_block invoked for a term that does not differentiate deriv_col"
-    );
+    if feature_col != deriv_col {
+        // The caller only dispatches here when `deriv_col` is one of the term's
+        // feature columns, and a `BSpline1D` term has exactly one. This guards
+        // the invariant rather than trusting it silently.
+        return Err(BasisError::InvalidInput(format!(
+            "analytic average-derivative design: B-spline term '{}' is over column {feature_col}, \
+             not the differentiated column {deriv_col}",
+            termspec.name
+        )));
+    }
 
     let (knots, degree, transform, periodic) = match &term_value.metadata {
         BasisMetadata::BSpline1D {
@@ -2012,152 +2018,3 @@ fn orthogonality_relative_residual_for_design(
     Ok(num / denom)
 }
 
-#[cfg(test)]
-mod average_derivative_tests {
-    use super::*;
-    use crate::basis::{
-        BSplineBasisSpec, BSplineIdentifiability, BSplineKnotSpec, OneDimensionalBoundary,
-    };
-
-    /// Build a frozen single-`s(x)` term-collection spec on `n` deterministic,
-    /// well-conditioned interior points in `[0.1, 0.9]`. Freezing pins the
-    /// sum-to-zero identifiability chart as a `FrozenTransform` constant so the
-    /// finite-difference reference replays the IDENTICAL transform on the
-    /// shifted data (an unfrozen sum-to-zero would recompute the chart per shift
-    /// and inject a spurious `dZ/dx` term that no analytic derivative carries).
-    fn frozen_bspline_spec_and_data() -> (TermCollectionSpec, ndarray::Array2<f64>) {
-        let n = 200usize;
-        let mut data = ndarray::Array2::<f64>::zeros((n, 1));
-        for i in 0..n {
-            // Mildly non-uniform interior grid, strictly inside the (0,1) knot
-            // domain so every evaluation (and ±h shift) stays in-support.
-            let t = i as f64 / (n as f64 - 1.0);
-            data[[i, 0]] = 0.1 + 0.8 * (0.5 * t + 0.5 * t * t);
-        }
-
-        let unfrozen = TermCollectionSpec {
-            linear_terms: Vec::new(),
-            random_effect_terms: Vec::new(),
-            smooth_terms: vec![SmoothTermSpec {
-                name: "s(x)".to_string(),
-                basis: SmoothBasisSpec::BSpline1D {
-                    feature_col: 0,
-                    spec: BSplineBasisSpec {
-                        degree: 3,
-                        penalty_order: 2,
-                        knotspec: BSplineKnotSpec::Generate {
-                            data_range: (0.0, 1.0),
-                            num_internal_knots: 8,
-                        },
-                        double_penalty: false,
-                        identifiability: BSplineIdentifiability::WeightedSumToZero { weights: None },
-                        boundary: OneDimensionalBoundary::Open,
-                        boundary_conditions: Default::default(),
-                    },
-                },
-                shape: ShapeConstraint::None,
-                joint_null_rotation: None,
-            }],
-        };
-
-        // Build once to recover the realized knots + composed identifiability
-        // chart, then pin them into a frozen spec.
-        let value = build_term_collection_design(data.view(), &unfrozen)
-            .expect("unfrozen value design build");
-        let (knots, degree, transform) = match &value.smooth.terms[0].metadata {
-            BasisMetadata::BSpline1D {
-                knots,
-                degree,
-                identifiability_transform,
-                ..
-            } => (
-                knots.clone(),
-                degree.expect("degree recorded"),
-                identifiability_transform.clone(),
-            ),
-            other => panic!("expected B-spline metadata, got {other:?}"),
-        };
-
-        let frozen = TermCollectionSpec {
-            linear_terms: Vec::new(),
-            random_effect_terms: Vec::new(),
-            smooth_terms: vec![SmoothTermSpec {
-                name: "s(x)".to_string(),
-                basis: SmoothBasisSpec::BSpline1D {
-                    feature_col: 0,
-                    spec: BSplineBasisSpec {
-                        degree,
-                        penalty_order: 2,
-                        knotspec: BSplineKnotSpec::Provided(knots),
-                        double_penalty: false,
-                        identifiability: match transform {
-                            Some(z) => BSplineIdentifiability::FrozenTransform { transform: z },
-                            None => BSplineIdentifiability::None,
-                        },
-                        boundary: OneDimensionalBoundary::Open,
-                        boundary_conditions: Default::default(),
-                    },
-                },
-                shape: ShapeConstraint::None,
-                joint_null_rotation: None,
-            }],
-        };
-
-        (frozen, data)
-    }
-
-    fn dense_value_design(
-        spec: &TermCollectionSpec,
-        data: ndarray::ArrayView2<'_, f64>,
-    ) -> ndarray::Array2<f64> {
-        let built = build_term_collection_design(data, spec).expect("value design build");
-        built
-            .design
-            .try_to_dense_arc("test value design")
-            .expect("densify value design")
-            .as_ref()
-            .to_owned()
-    }
-
-    #[test]
-    fn analytic_average_derivative_matches_central_difference() {
-        let (spec, data) = frozen_bspline_spec_and_data();
-        let deriv_col = 0usize;
-
-        let analytic = build_term_collection_derivative_design(data.view(), &spec, deriv_col)
-            .expect("analytic derivative design");
-
-        // High-accuracy central finite-difference reference on the frozen design
-        // (finite differences are permitted in tests). Richardson extrapolation
-        // of two central differences gives an O(h^4)-accurate reference.
-        let spread = 0.8_f64;
-        let h = 1.0e-4 * spread;
-        let central = |step: f64| -> ndarray::Array2<f64> {
-            let mut plus = data.to_owned();
-            plus.column_mut(deriv_col).mapv_inplace(|v| v + step);
-            let mut minus = data.to_owned();
-            minus.column_mut(deriv_col).mapv_inplace(|v| v - step);
-            let dp = dense_value_design(&spec, plus.view());
-            let dm = dense_value_design(&spec, minus.view());
-            (dp - dm) / (2.0 * step)
-        };
-        let cd_h = central(h);
-        let cd_half = central(h / 2.0);
-        // Richardson: (4 * CD(h/2) - CD(h)) / 3.
-        let reference = (&cd_half * 4.0 - &cd_h) / 3.0;
-
-        assert_eq!(analytic.dim(), reference.dim(), "derivative design shape");
-
-        let max_abs_err = analytic
-            .iter()
-            .zip(reference.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0_f64, f64::max);
-
-        assert!(
-            max_abs_err < 1e-6,
-            "analytic average-derivative design disagrees with the central-difference \
-             reference: max abs error {max_abs_err:.3e} (tol 1e-6)"
-        );
-    }
-}

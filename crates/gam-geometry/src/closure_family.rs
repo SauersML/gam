@@ -45,7 +45,18 @@
 //! (`γ` pinned at 0 with collapsed effective range ⇒ a "not a smooth 1-D
 //! topology" diagnostic handed to the mixture rung).
 
+use gam_math::jet_tower::Tower2;
 use ndarray::{Array1, Array2, ArrayView1};
+
+/// One-variable γ-jet: value, ∂/∂γ, ∂²/∂γ².
+///
+/// `row_jet` reads only the value, `∂/∂γ` (`g[0]`) and `∂²/∂γ²` (`h[0][0]`)
+/// channels, so the minimal carrier is the second-order [`Tower2`], not a
+/// fourth-order tower. The third/fourth derivative tensors a `Tower4` would
+/// build are pure waste here — the `v`/`g`/`h` channels are bit-identical
+/// between the two towers by construction (the order-≤2 Leibniz / Faà-di-Bruno
+/// terms read only order-≤2 channels), so this is a strict, exact prune.
+type GJet = Tower2<1>;
 
 /// The continuous closure family on the window `[0, window]`.
 ///
@@ -60,6 +71,25 @@ pub struct ClosureFamily {
     pub window: f64,
 }
 
+/// `[f, f′, f″, f‴, f⁗]` of `cos` at angle `θ`.
+#[inline]
+fn cos_stack(theta: f64) -> [f64; 5] {
+    let (s, c) = theta.sin_cos();
+    [c, -s, -c, s, c]
+}
+
+/// `[f, f′, f″, f‴, f⁗]` of `sin` at angle `θ`.
+#[inline]
+fn sin_stack(theta: f64) -> [f64; 5] {
+    let (s, c) = theta.sin_cos();
+    [s, c, -s, -c, s]
+}
+
+#[inline]
+fn stack2(stack: [f64; 5]) -> [f64; 3] {
+    [stack[0], stack[1], stack[2]]
+}
+
 impl ClosureFamily {
     /// Build a closure family of `harmonics` Fourier pairs on `[0, window]`.
     pub fn new(harmonics: usize, window: f64) -> Self {
@@ -72,57 +102,6 @@ impl ClosureFamily {
         1 + 2 * self.harmonics
     }
 
-    /// Write the value / `∂Φ/∂γ` / `∂²Φ/∂γ²` columns of one row directly into
-    /// caller-provided slices (each length `raw_dim`, pre-zeroed).
-    ///
-    /// ## Why this beats the generic γ-jet tower
-    ///
-    /// The angle `θ_m = m·γ·s` is **affine in γ** (`∂θ_m/∂γ = m·s`, `∂²θ_m/∂γ² =
-    /// 0`). Routing that through a second-order `Tower2<1>` jet (`variable`→`scale`→two
-    /// `compose_unary`) re-derives the trivial closed form every call *and*
-    /// calls `sin_cos` twice per harmonic (once inside the `cos` stack, once
-    /// inside the `sin` stack on the **same** angle — a redundant transcendental
-    /// the optimiser only sometimes CSEs across the stack-builder boundary).
-    /// Folding the order-≤2 Faà-di-Bruno terms by hand for the affine angle
-    /// collapses the whole tower to: one `sin_cos` per harmonic feeding both
-    /// columns, then plain fused multiplies. This is **bit-identical** to the
-    /// tower (each output channel reproduces the tower's term/accumulation
-    /// order: `g = f′·θ_g`, `h = f′·θ_h + f″·θ_g²` with `θ_h = 0` and `θ_g =
-    /// m·s`; the dropped `f′·0` term is `+(-0.0)` onto a `0.0` accumulator,
-    /// which IEEE collapses to the same bits) — verified `to_bits`-identical
-    /// over 288 000 channels.
-    #[inline]
-    fn write_row_jet(&self, s: f64, gamma: f64, value: &mut [f64], dg: &mut [f64], dgg: &mut [f64]) {
-        value[0] = 1.0;
-        for m in 1..=self.harmonics {
-            let ms = m as f64 * s; // ∂θ_m/∂γ, == Tower2 scale of the unit seed
-            let theta = gamma * ms; // θ_m = m·γ·s, the tower's `theta.v`
-            let (sn, cs) = theta.sin_cos();
-            let ci = 2 * m - 1;
-            let si = 2 * m;
-            // cos column: v=cos, ∂γ=-sin·θ_g, ∂²γ=-cos·θ_g².
-            value[ci] = cs;
-            dg[ci] = -sn * ms;
-            dgg[ci] = (-cs * ms) * ms;
-            // sin column: v=sin, ∂γ=cos·θ_g, ∂²γ=-sin·θ_g².
-            value[si] = sn;
-            dg[si] = cs * ms;
-            dgg[si] = (-sn * ms) * ms;
-        }
-    }
-
-    /// Value-only fast path: the `cos`/`sin` of one row (no γ-derivatives).
-    #[inline]
-    fn write_row_value(&self, s: f64, gamma: f64, value: &mut [f64]) {
-        value[0] = 1.0;
-        for m in 1..=self.harmonics {
-            let theta = gamma * (m as f64 * s);
-            let (sn, cs) = theta.sin_cos();
-            value[2 * m - 1] = cs;
-            value[2 * m] = sn;
-        }
-    }
-
     /// Raw design row `Φ(s; γ) = [1, cos(γs), sin(γs), cos(2γs), …]` and its γ-jet.
     ///
     /// Returns `(value, d/dγ, d²/dγ²)` per column — the support-moving basis and
@@ -133,13 +112,24 @@ impl ClosureFamily {
         let mut value = Array1::zeros(d);
         let mut dg = Array1::zeros(d);
         let mut dgg = Array1::zeros(d);
-        self.write_row_jet(
-            s,
-            gamma,
-            value.as_slice_mut().expect("contiguous"),
-            dg.as_slice_mut().expect("contiguous"),
-            dgg.as_slice_mut().expect("contiguous"),
-        );
+        // Column 0: constant.
+        value[0] = 1.0;
+        let g = GJet::variable(gamma, 0);
+        for m in 1..=self.harmonics {
+            // θ = m·γ·s (linear in γ ⇒ its jet is exact and trivial, but we let
+            // the tower carry it so the trig composition is exact to 2nd order).
+            let theta = g.scale(m as f64 * s);
+            let cos_col = theta.compose_unary(stack2(cos_stack(theta.v)));
+            let sin_col = theta.compose_unary(stack2(sin_stack(theta.v)));
+            let ci = 2 * m - 1;
+            let si = 2 * m;
+            value[ci] = cos_col.v;
+            dg[ci] = cos_col.g[0];
+            dgg[ci] = cos_col.h[0][0];
+            value[si] = sin_col.v;
+            dg[si] = sin_col.g[0];
+            dgg[si] = sin_col.h[0][0];
+        }
         (value, dg, dgg)
     }
 
@@ -148,11 +138,9 @@ impl ClosureFamily {
         let n = s.len();
         let d = self.raw_dim();
         let mut phi = Array2::zeros((n, d));
-        // Write each row in place — the matrix is row-major contiguous, so this
-        // avoids n temporary `Array1` allocations + copies.
         for (i, &si) in s.iter().enumerate() {
-            let mut row = phi.row_mut(i);
-            self.write_row_value(si, gamma, row.as_slice_mut().expect("contiguous row"));
+            let (v, _, _) = self.row_jet(si, gamma);
+            phi.row_mut(i).assign(&v);
         }
         phi
     }
@@ -169,18 +157,11 @@ impl ClosureFamily {
         let mut phi = Array2::zeros((n, d));
         let mut dphi = Array2::zeros((n, d));
         let mut ddphi = Array2::zeros((n, d));
-        // Write all three rows in place — no per-row `Array1` alloc/assign.
         for (i, &si) in s.iter().enumerate() {
-            let mut prow = phi.row_mut(i);
-            let mut drow = dphi.row_mut(i);
-            let mut ddrow = ddphi.row_mut(i);
-            self.write_row_jet(
-                si,
-                gamma,
-                prow.as_slice_mut().expect("contiguous row"),
-                drow.as_slice_mut().expect("contiguous row"),
-                ddrow.as_slice_mut().expect("contiguous row"),
-            );
+            let (v, dv, ddv) = self.row_jet(si, gamma);
+            phi.row_mut(i).assign(&v);
+            dphi.row_mut(i).assign(&dv);
+            ddphi.row_mut(i).assign(&ddv);
         }
         (phi, dphi, ddphi)
     }

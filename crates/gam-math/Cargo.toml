@@ -13,7 +13,6 @@ path = "src/lib.rs"
 [dependencies]
 libm = "0.2.16"
 statrs = "0.18.0"
-wide = "0.7"
 
 [lints.rust]
 warnings = "deny"
