@@ -18,7 +18,6 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 gam = { path = "../.." }
-gam-inference = { path = "../gam-inference" }
 gam-predict = { path = "../gam-predict" }
 gam-runtime = { path = "../gam-runtime" }
 # `extension-module` tells PyO3 NOT to link libpython (the host interpreter
@@ -40,7 +39,6 @@ faer = "0.24.0"
 statrs = "0.18.0"
 rand = "0.10.1"
 rand_distr = "0.6.0"
-regex = "1.12.2"
 
 [features]
 # Default-on so `maturin build`/`pip install` (which build with default

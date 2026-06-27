@@ -2024,20 +2024,12 @@ pub(crate) const STRICT_SPD_LM_MAX_ESCALATIONS: usize = 16;
 
 pub(crate) const STRICT_SPD_LM_RIDGE_GROWTH: f64 = 10.0;
 
-/// Floor applied to IRLS working weights so downstream divisions cannot hit
-/// exact zero. Used as the default `minweight` in `CustomFamilyOptions` and
-/// mirrored in tests that override it.
-///
-/// Sourced from the canonical positive-weight floor
-/// ([`gam_problem::MIN_WEIGHT`] = `1e-12`) so every floored family shares one
-/// definition; this alias keeps the descriptive local name at the `minweight`
-/// defaults.
-pub(crate) const CUSTOM_FAMILY_WEIGHT_FLOOR: f64 = gam_problem::MIN_WEIGHT;
-
-/// Default initial ridge δ for the explicit-stabilization Cholesky escalation
-/// schedule. Enters the quadratic term, the Laplace Hessian, and the penalty
-/// log-determinant via the active `RidgePolicy`.
-pub(crate) const CUSTOM_FAMILY_RIDGE_FLOOR: f64 = 1e-12;
+// `CUSTOM_FAMILY_WEIGHT_FLOOR` (the IRLS working-weight floor, sourced from
+// `gam_problem::MIN_WEIGHT`) and `CUSTOM_FAMILY_RIDGE_FLOOR` (the initial
+// Cholesky-escalation ridge δ) are single-sourced in `gam-problem`
+// (`custom_family_blockwise`). Re-exported here so existing crate-local paths
+// keep resolving after the #1521 carve instead of holding a second definition.
+pub(crate) use gam_problem::{CUSTOM_FAMILY_RIDGE_FLOOR, CUSTOM_FAMILY_WEIGHT_FLOOR};
 
 /// Relative eigenvalue floor used wherever an eigendecomposition needs to
 /// distinguish "real" curvature from noise: `eps_floor = EVAL_FLOOR · max|λ|`.

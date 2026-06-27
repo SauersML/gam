@@ -430,12 +430,9 @@ pub(crate) fn exact_newton_joint_hessian_symmetrized<
     Ok(Some(h))
 }
 
-/// Scale-aware exact joint curvature payload for the outer REML evaluator.
-pub struct ExactNewtonOuterCurvature {
-    pub hessian: Array2<f64>,
-    pub rho_curvature_scale: f64,
-    pub hessian_logdet_correction: f64,
-}
+// `ExactNewtonOuterCurvature` is single-sourced in `gam-problem`
+// (`custom_family_blockwise`, re-exported as `gam_problem::ExactNewtonOuterCurvature`).
+// The carve left a byte-identical, never-referenced copy here; removed.
 
 pub(crate) enum JointHessianSource {
     Dense(Array2<f64>),

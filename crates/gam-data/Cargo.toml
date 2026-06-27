@@ -14,7 +14,6 @@ path = "src/lib.rs"
 arrow = { version = "54", default-features = false, features = ["ffi"] }
 csv = "1.4.0"
 log = "0.4.29"
-memmap2 = "0.9.10"
 ndarray = { version = "0.17.2", features = ["serde", "rayon"] }
 parquet = { version = "54", default-features = false, features = ["arrow", "snap", "zstd", "lz4"] }
 rayon = "1.12.0"

@@ -2,8 +2,10 @@ pub mod conformal;
 pub mod input;
 pub mod interval_policy;
 pub mod linalg;
+pub mod posterior_bands;
 
 pub use conformal::*;
+pub use posterior_bands::*;
 pub use gam::inference::dispersion_cov::se_from_covariance;
 pub use gam::inference::predict_io::{
     BernoulliMarginalSlopePredictor, PredictInput, PredictResult,

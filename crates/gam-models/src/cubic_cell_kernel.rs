@@ -998,8 +998,6 @@ impl CellMomentDedupStats {
     }
 }
 
-pub const DEFAULT_CELL_MOMENT_DEDUP_EPSILON: f64 = 0.0;
-
 #[inline]
 fn splitmix64(x: u64) -> u64 {
     gam_linalg::utils::splitmix64_hash(x)
@@ -1424,11 +1422,6 @@ pub struct CellMomentCacheStats {
 }
 
 impl CellMomentCacheStats {
-    #[inline]
-    pub fn record_miss(&self) {
-        self.misses.fetch_add(1, Ordering::Relaxed);
-    }
-
     #[inline]
     pub fn snapshot(&self) -> (u64, u64) {
         (

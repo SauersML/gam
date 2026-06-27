@@ -942,10 +942,6 @@ impl DeviationRuntime {
         self.evaluate_span_polynomial_design_raw(values, 3)
     }
 
-    pub fn fourth_derivative_design(&self, values: &Array1<f64>) -> Result<Array2<f64>, String> {
-        self.evaluate_span_polynomial_design_raw(values, 4)
-    }
-
     pub(crate) fn integrated_derivative_penalty_with_nullity(
         &self,
         derivative_order: usize,

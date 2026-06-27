@@ -97,7 +97,7 @@ pub(crate) use gam::inference::model_payload_builders::{
     assemble_transformation_normal_payload,
 };
 
-pub(crate) use gam_inference::posterior_bands::{self, PosteriorPredictBandsPayload};
+pub(crate) use gam_predict::posterior_bands::{self, PosteriorPredictBandsPayload};
 
 pub(crate) use gam_predict::FittedModelPredictExt;
 pub(crate) use gam_predict::input::build_predict_input_for_model;

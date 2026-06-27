@@ -13,7 +13,6 @@ path = "src/lib.rs"
 [dependencies]
 ndarray = { version = "0.17.2", features = ["serde"] }
 serde = { version = "1.0.228", features = ["derive"] }
-thiserror = "2.0.18"
 
 [lints.rust]
 warnings = "deny"

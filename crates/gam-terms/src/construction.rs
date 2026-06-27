@@ -177,10 +177,6 @@ impl PenaltyMatrix {
         );
         dense
     }
-
-    pub fn block_dense(&self) -> Array2<f64> {
-        self.representation.to_block_dense()
-    }
 }
 
 pub(crate) fn array_to_faer(array: &Array2<f64>) -> Mat<f64> {

@@ -1,6 +1,5 @@
 use faer::{MatRef, Par, get_global_parallelism};
 use ndarray::{Array2, ArrayBase, ArrayView1, ArrayViewMut1, Data, Ix2};
-use std::marker::PhantomData;
 
 #[inline]
 pub(crate) fn effective_global_parallelism() -> Par {
@@ -191,72 +190,7 @@ fn mat_to_array(mat: MatRef<'_, f64>) -> Array2<f64> {
     out
 }
 
-pub struct FaerArrayView<'a> {
-    ptr: *const f64,
-    rows: usize,
-    cols: usize,
-    row_stride: isize,
-    col_stride: isize,
-    owned: Option<Array2<f64>>,
-    marker: PhantomData<&'a f64>,
-}
-
-impl<'a> FaerArrayView<'a> {
-    #[inline]
-    pub fn new<S: Data<Elem = f64>>(array: &'a ArrayBase<S, Ix2>) -> Self {
-        let (rows, cols) = array.dim();
-        let strides = array.strides();
-        // Guard against layouts that can alias or reverse memory traversal (e.g.
-        // negative/zero strides). These can violate assumptions in faer kernels.
-        // For such layouts we materialize a compact owned copy.
-        if strides[0] <= 0 || strides[1] <= 0 {
-            let owned = array.to_owned();
-            let owned_strides = owned.strides();
-            return Self {
-                ptr: owned.as_ptr(),
-                rows,
-                cols,
-                row_stride: owned_strides[0],
-                col_stride: owned_strides[1],
-                owned: Some(owned),
-                marker: PhantomData,
-            };
-        }
-
-        Self {
-            ptr: array.as_ptr(),
-            rows,
-            cols,
-            row_stride: strides[0],
-            col_stride: strides[1],
-            owned: None,
-            marker: PhantomData,
-        }
-    }
-
-    #[inline]
-    pub fn as_ref(&self) -> MatRef<'_, f64> {
-        let (ptr, rows, cols, row_stride, col_stride) = if let Some(owned) = &self.owned {
-            let strides = owned.strides();
-            (
-                owned.as_ptr(),
-                owned.nrows(),
-                owned.ncols(),
-                strides[0],
-                strides[1],
-            )
-        } else {
-            (
-                self.ptr,
-                self.rows,
-                self.cols,
-                self.row_stride,
-                self.col_stride,
-            )
-        };
-        // SAFETY: ptr/shape/strides come from either a live ndarray view
-        // (positive strides, validated bounds/alignment) or the owned
-        // compact copy held inside this wrapper — no mutable aliasing.
-        unsafe { MatRef::from_raw_parts(ptr, rows, cols, row_stride, col_stride) }
-    }
-}
+// `FaerArrayView` is single-sourced in `gam-linalg` (`faer_ndarray`); the carve
+// left a byte-identical copy here. Re-use the canonical one (this crate already
+// depends on gam-linalg and calls into `gam_linalg::faer_ndarray`).
+use gam_linalg::faer_ndarray::FaerArrayView;
