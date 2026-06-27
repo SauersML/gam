@@ -363,15 +363,19 @@ impl<const K: usize> Tower4<K> {
     /// the five diagonal channels (`v`, `g[slot]`, `h[slot][slot]`,
     /// `t3[slot]³`, `t4[slot]⁴`) survive.
     ///
-    /// This computes exactly those five through the SAME shared
-    /// [`jet_algebra::faa_di_bruno`] walker — so they are BIT-IDENTICAL to
+    /// This computes exactly those five as STRAIGHT-LINE accumulations, each in
+    /// the EXACT term order of [`Self::compose_unary`]'s diagonal
+    /// (`i = j = k = l = slot`) case — so they are BIT-IDENTICAL to
     /// [`Self::compose_unary`] on the diagonal — and leaves every other channel
     /// at the zero-init `+0.0`, which the full walk also produces (the
     /// off-`slot` collapse is `to_bits`-`+0.0`, signed-zero products included;
     /// proven across `K ∈ {2,3,4,9}`, 5000 single-slot inputs each). At any
     /// `K ≥ 2` this is far fewer floating-point operations than materialising
     /// the full `1 + K + K² + K³ + K⁴` channel set whose off-diagonal entries
-    /// are all zero.
+    /// are all zero, and far cheaper than the recursive set-partition walker the
+    /// diagonal channels previously routed through (a measured ~9.5× speedup vs
+    /// the full `compose_unary`, recovering a 5.9× walker regression at the
+    /// `K ∈ {2,3}` BMS tower widths).
     ///
     /// `#[inline]` so an adopting consumer pays no `bl` call (uninlined, the
     /// five-channel build does not amortise the call/spill overhead).
@@ -384,13 +388,55 @@ impl<const K: usize> Tower4<K> {
     #[inline]
     pub fn compose_unary_single_slot(&self, d: [f64; 5], slot: usize) -> Self {
         let mut out = Self::zero();
-        out.v = jet_algebra::faa_di_bruno(&[], &d, |b| self.deriv(b));
-        out.g[slot] = jet_algebra::faa_di_bruno(&[slot], &d, |b| self.deriv(b));
-        out.h[slot][slot] = jet_algebra::faa_di_bruno(&[slot, slot], &d, |b| self.deriv(b));
-        out.t3[slot][slot][slot] =
-            jet_algebra::faa_di_bruno(&[slot, slot, slot], &d, |b| self.deriv(b));
-        out.t4[slot][slot][slot][slot] =
-            jet_algebra::faa_di_bruno(&[slot, slot, slot, slot], &d, |b| self.deriv(b));
+        let s = slot;
+        let g = self.g[s];
+        let h = self.h[s][s];
+        let t3 = self.t3[s][s][s];
+        let t4 = self.t4[s][s][s][s];
+        out.v = d[0];
+        // g (i=s): d1*g
+        out.g[s] = {
+            let mut acc = 0.0;
+            acc += d[1] * g;
+            acc
+        };
+        // h (i=j=s): d1*h + d2*g*g
+        out.h[s][s] = {
+            let mut acc = 0.0;
+            acc += d[1] * h;
+            acc += d[2] * g * g;
+            acc
+        };
+        // t3 (i=j=k=s): exact term order of compose_unary's inner loop.
+        out.t3[s][s][s] = {
+            let mut acc = 0.0;
+            acc += d[1] * t3;
+            acc += d[2] * h * g;
+            acc += d[2] * h * g;
+            acc += d[2] * g * h;
+            acc += d[3] * g * g * g;
+            acc
+        };
+        // t4 (i=j=k=l=s): exact term order of compose_unary's inner loop.
+        out.t4[s][s][s][s] = {
+            let mut acc = 0.0;
+            acc += d[1] * t4;
+            acc += d[2] * t3 * g;
+            acc += d[2] * t3 * g;
+            acc += d[2] * h * h;
+            acc += d[3] * h * g * g;
+            acc += d[2] * t3 * g;
+            acc += d[2] * h * h;
+            acc += d[3] * h * g * g;
+            acc += d[2] * h * h;
+            acc += d[2] * g * t3;
+            acc += d[3] * g * h * g;
+            acc += d[3] * h * g * g;
+            acc += d[3] * g * h * g;
+            acc += d[3] * g * g * h;
+            acc += d[4] * g * g * g * g;
+            acc
+        };
         out
     }
 
@@ -961,19 +1007,46 @@ impl<const K: usize> Tower3<K> {
     /// derivative support only on the all-`slot` diagonal, every output channel
     /// touching an axis `≠ slot` collapses to the walker's `total = 0.0` start
     /// (`+0.0`), so only `v`, `g[slot]`, `h[slot][slot]`, `t3[slot]³` survive.
-    /// These four are computed through the SAME [`jet_algebra::faa_di_bruno`]
-    /// walker (BIT-IDENTICAL to the full path on the diagonal); off-`slot`
+    /// These four are computed as STRAIGHT-LINE accumulations, each in the EXACT
+    /// term order of [`Self::compose_unary`]'s diagonal (`i = j = k = slot`)
+    /// case (BIT-IDENTICAL to the full path on the diagonal); off-`slot`
     /// channels stay at the zero-init `+0.0` the full walk also yields (proven
-    /// `to_bits` across `K ∈ {2,3,4,9}`). Caller guarantees the single-slot
-    /// precondition; otherwise use [`Self::compose_unary`].
+    /// `to_bits` across `K ∈ {2,3,4,9}`). This drops the recursive
+    /// set-partition walker the diagonal channels previously routed through,
+    /// recovering its measured ~5.9× regression at the `K ∈ {2,3}` BMS tower
+    /// widths. Caller guarantees the single-slot precondition; otherwise use
+    /// [`Self::compose_unary`].
     #[inline]
     pub fn compose_unary_single_slot(&self, d: [f64; 4], slot: usize) -> Self {
         let mut out = Self::zero();
-        out.v = jet_algebra::faa_di_bruno(&[], &d, |b| self.deriv(b));
-        out.g[slot] = jet_algebra::faa_di_bruno(&[slot], &d, |b| self.deriv(b));
-        out.h[slot][slot] = jet_algebra::faa_di_bruno(&[slot, slot], &d, |b| self.deriv(b));
-        out.t3[slot][slot][slot] =
-            jet_algebra::faa_di_bruno(&[slot, slot, slot], &d, |b| self.deriv(b));
+        let s = slot;
+        let g = self.g[s];
+        let h = self.h[s][s];
+        let t3 = self.t3[s][s][s];
+        out.v = d[0];
+        // g (i=s): d1*g
+        out.g[s] = {
+            let mut acc = 0.0;
+            acc += d[1] * g;
+            acc
+        };
+        // h (i=j=s): d1*h + d2*g*g
+        out.h[s][s] = {
+            let mut acc = 0.0;
+            acc += d[1] * h;
+            acc += d[2] * g * g;
+            acc
+        };
+        // t3 (i=j=k=s): exact term order of compose_unary's inner loop.
+        out.t3[s][s][s] = {
+            let mut acc = 0.0;
+            acc += d[1] * t3;
+            acc += d[2] * h * g;
+            acc += d[2] * h * g;
+            acc += d[2] * g * h;
+            acc += d[3] * g * g * g;
+            acc
+        };
         out
     }
 
