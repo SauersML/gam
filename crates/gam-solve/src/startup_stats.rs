@@ -27,7 +27,7 @@
 
 use std::fmt::Write;
 
-use crate::custom_family::KktRefusalDiagnosis;
+use gam_problem::diagnostics::KktRefusalDiagnosis;
 use crate::inner_status::{InnerFailure, classify_inner_error};
 
 /// Records one failed seed candidate along with its structured failure

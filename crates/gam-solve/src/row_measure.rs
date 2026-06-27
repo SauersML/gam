@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use crate::custom_family::BlockwiseFitOptions;
+use gam_model_api::families::custom_family::BlockwiseFitOptions;
 
 pub use gam_problem::RowSubsampleMask;
 

@@ -2305,85 +2305,12 @@ pub(crate) struct KktRefusalReport {
     pub(crate) diagnosis: KktRefusalDiagnosis,
 }
 
-/// Three-way classification of why the cert refused, computed from the
-/// H_pen spectrum and the projected residual at the refusing iterate.
-/// `RankDeficientHPen` is the regression canary the nullspace lead's
-/// smooth-construction rework is intended to eliminate; keep this variant
-/// intact when extending — it doubles as the user-facing signal for
-/// "an unconstrained polynomial null space slipped past absorption."
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum KktRefusalDiagnosis {
-    RankDeficientHPen,
-    PhantomMultiplierWithWellConditionedH,
-    ActiveSetIncomplete,
-    /// Cross-block identifiability aliasing surfaced mid-inner-solve
-    /// (e.g., a binding active set materialised a 2-way alias that
-    /// the pre-fit audit could not see at the cold design). The fix
-    /// is structural — drop or reparameterise the aliased block;
-    /// rho-anneal will not recover.
-    AliasingDetectedAtFit,
-}
-
-impl KktRefusalDiagnosis {
-    pub(crate) fn as_str(&self) -> &'static str {
-        match self {
-            KktRefusalDiagnosis::RankDeficientHPen => "rank_deficient_H_pen",
-            KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH => {
-                "phantom_multiplier_with_well_conditioned_H"
-            }
-            KktRefusalDiagnosis::ActiveSetIncomplete => "active_set_incomplete",
-            KktRefusalDiagnosis::AliasingDetectedAtFit => "aliasing_detected_at_fit",
-        }
-    }
-
-    /// Parse the textual `diagnosis:` field embedded in the structured
-    /// bubbled error string. Returns `None` when no recognised label is
-    /// present (legacy / non-cert-refusal error strings).
-    pub(crate) fn parse_from_error(message: &str) -> Option<Self> {
-        let marker = "diagnosis: ";
-        let start = message.rfind(marker)? + marker.len();
-        let tail = &message[start..];
-        let end = tail
-            .find(|c: char| c == ';' || c == '\n' || c == ' ')
-            .unwrap_or(tail.len());
-        match &tail[..end] {
-            "rank_deficient_H_pen" => Some(KktRefusalDiagnosis::RankDeficientHPen),
-            "phantom_multiplier_with_well_conditioned_H" => {
-                Some(KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH)
-            }
-            "active_set_incomplete" => Some(KktRefusalDiagnosis::ActiveSetIncomplete),
-            "aliasing_detected_at_fit" => Some(KktRefusalDiagnosis::AliasingDetectedAtFit),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn guidance(self) -> &'static str {
-        match self {
-            KktRefusalDiagnosis::RankDeficientHPen => {
-                "check whether the named block has a structural or numerical null direction \
-                 not identified by the likelihood/penalty combination; for Duchon-style \
-                 smooths this may be a polynomial null space, while marginal-slope fits can \
-                 also expose callback-owned weak directions"
-            }
-            KktRefusalDiagnosis::PhantomMultiplierWithWellConditionedH => {
-                "check whether the named block has a near-separated or weakly identified \
-                 direction despite a well-conditioned penalized Hessian; in marginal-slope \
-                 fits this often indicates marginal/logslope coupling rather than a \
-                 Matérn/Duchon polynomial-nullspace failure"
-            }
-            KktRefusalDiagnosis::ActiveSetIncomplete => {
-                "check whether the named block's linear constraints need an additional \
-                 active row or a tighter constrained re-solve; this is an active-set \
-                 certification failure, not a polynomial-nullspace diagnosis"
-            }
-            KktRefusalDiagnosis::AliasingDetectedAtFit => {
-                "check whether the named block aliases another block after runtime \
-                 constraints or callbacks materialize; drop or reparameterize the aliased \
-                 direction before fitting"
-            }
-        }
-    }
-}
+// `KktRefusalDiagnosis` was relocated DOWN to `gam_problem::diagnostics`
+// (issue #1521 crate carve): it is the neutral diagnostic carrier the
+// gam-solve REML/PIRLS core consumes, so it must live below both the core
+// and the extracted custom-family subsystem. Re-exported here under the
+// historical module path so existing references keep resolving.
+pub(crate) use gam_problem::diagnostics::KktRefusalDiagnosis;
 
 /// Relative rank tolerance applied to `|λ|/λ_max` when counting the
 /// nullity of `H_pen`. Matches the threshold the surrounding REML

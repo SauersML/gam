@@ -34,7 +34,7 @@
 
 use ndarray::Array1;
 
-use crate::custom_family::KktRefusalDiagnosis;
+use gam_problem::diagnostics::KktRefusalDiagnosis;
 use crate::estimate::EstimationError;
 use crate::inner_status::{InnerFailure, classify_inner_error};
 use crate::rho_optimizer::{OuterEvalOrder, OuterObjective};

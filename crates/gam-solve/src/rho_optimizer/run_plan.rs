@@ -331,7 +331,7 @@ pub(crate) fn run_outer_with_plan(
     // `STRUCTURAL_EARLY_EXIT_MIN_COUNT` consistent failures. Once set,
     // the remaining ρ candidates are skipped.
     let mut structural_early_exit_key: Option<(
-        crate::custom_family::KktRefusalDiagnosis,
+        gam_problem::diagnostics::KktRefusalDiagnosis,
         Option<String>,
     )> = None;
     // Two matching structural observations are enough to break the

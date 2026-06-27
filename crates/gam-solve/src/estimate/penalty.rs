@@ -461,7 +461,7 @@ pub(crate) fn map_hessian_to_original_basis(
     // symmetric whenever `H_transformed` is.  Average opposite entries
     // explicitly so downstream `validate_dense_hessian_export` doesn't
     // reject otherwise-valid fits over rounding-noise asymmetry.
-    crate::custom_family::symmetrize_dense_in_place(&mut h);
+    gam_linalg::matrix::symmetrize_in_place(&mut h);
     Ok(h)
 }
 

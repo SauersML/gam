@@ -20,7 +20,7 @@
 //! structured labels emitted by `inner_blockwise_fit` and the diagnostician's
 //! `KktRefusalReport`.
 
-use crate::custom_family::KktRefusalDiagnosis;
+use gam_problem::diagnostics::KktRefusalDiagnosis;
 
 /// Structured failure modes for the inner solver. Each variant carries the
 /// original message for logging plus structured fields that the outer cascade

@@ -1,7 +1,11 @@
 //! Declarative `return Err(...)` shorthands for the repetitive `bail_*`
-//! patterns whose error types live in **this** crate (`gam-models`), plus the
-//! shared `impl_reason_error_boilerplate!` derive used by every
-//! `{ reason: String }`-shaped error enum defined here.
+//! patterns whose error types live in **this** crate (`gam-models`).
+//!
+//! The shared `impl_reason_error_boilerplate!` derive used by every
+//! `{ reason: String }`-shaped error enum was carved down into the base kernel
+//! crate (`gam-model-kernels`) under #1521; it is brought back into crate-wide
+//! textual scope via `#[macro_use] extern crate gam_model_kernels;` at the crate
+//! root so the unqualified call sites here resolve unchanged.
 //!
 //! The `bail_*` shorthands for error types that were relocated to the neutral
 //! `gam-problem` crate (`bail_invalid_estim!`, `bail_dim_custom!`) are *not*
@@ -12,27 +16,6 @@
 //!   tnorm   → TransformationNormalError
 //!   surv    → SurvivalError
 //!   sls     → SurvivalLocationScaleError
-
-#[macro_export]
-macro_rules! impl_reason_error_boilerplate {
-    ($type:ident { $($variant:ident),+ $(,)? }) => {
-        impl ::std::fmt::Display for $type {
-            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
-                match self {
-                    $(Self::$variant { reason })|+ => f.write_str(reason),
-                }
-            }
-        }
-
-        impl ::std::error::Error for $type {}
-
-        impl From<$type> for String {
-            fn from(err: $type) -> String {
-                err.to_string()
-            }
-        }
-    };
-}
 
 #[macro_export]
 macro_rules! bail_invalid_tnorm {

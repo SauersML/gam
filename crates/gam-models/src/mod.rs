@@ -1,9 +1,17 @@
-// Declarative `bail_*` / error-boilerplate macros whose target error enums live
-// in this crate. `#[macro_export]` places them at the crate root so the
-// `bail_invalid_surv!` / `impl_reason_error_boilerplate!` call sites
-// across the relocated families resolve unchanged. `#[macro_use]` puts them in
-// textual scope so same-crate call sites use the unqualified name (rustc forbids
-// `crate::`-absolute paths to same-crate `macro_export` macros).
+// The shared `impl_reason_error_boilerplate!` derive was carved down into the
+// base kernel crate (`gam-model-kernels`) under #1521. `#[macro_use]` brings
+// its `#[macro_export]` macro into crate-wide textual scope so the unqualified
+// `impl_reason_error_boilerplate! { .. }` call sites across the families that
+// stayed here (survival / bms / gamlss / transformation_normal / inference)
+// resolve unchanged.
+#[macro_use]
+extern crate gam_model_kernels;
+
+// Declarative `bail_*` macros whose target error enums live in this crate.
+// `#[macro_export]` places them at the crate root so the `bail_invalid_surv!`
+// call sites across the relocated families resolve unchanged. `#[macro_use]`
+// puts them in textual scope so same-crate call sites use the unqualified name
+// (rustc forbids `crate::`-absolute paths to same-crate `macro_export` macros).
 #[macro_use]
 mod macros;
 
@@ -66,34 +74,36 @@ pub mod protocol;
 pub mod binomial_multi;
 pub mod block_layout;
 pub mod bms;
-pub mod cell_moment_family;
 pub(crate) mod coefficient_cost;
 pub mod gpu_kernels;
-pub mod cubic_cell_kernel;
 pub mod custom_family;
 pub mod family_runtime;
 pub(crate) mod fast_channel;
 pub(crate) mod fnv1a;
 pub mod gamlss;
-pub mod inverse_link;
 pub mod joint_penalty;
 pub(crate) mod location_scale_engine;
 pub mod marginal_slope_orthogonal;
 pub mod marginal_slope_shared;
-pub mod monotone_root;
 pub mod multinomial;
 pub(crate) mod multinomial_reml;
 pub mod outer_subsample;
 pub mod parameter_block;
 pub mod penalized_vector_glm;
 pub(crate) mod row_kernel;
-pub mod scale_design;
-pub mod sigma_link;
 pub mod spatial_psi_bridge;
 pub mod survival;
 pub mod transformation_normal;
 pub mod vector_response;
 pub mod wiggle;
+
+// The base kernel layer was carved into `gam-model-kernels` under #1521. These
+// re-exports reconstruct the pre-carve flat namespace so every `crate::X::*`
+// call site across the families that stayed here (and external `gam_models::X`
+// consumers) resolves unchanged — no code is duplicated.
+pub use gam_model_kernels::{
+    cell_moment_family, cubic_cell_kernel, inverse_link, monotone_root, scale_design, sigma_link,
+};
 
 pub use gam_identifiability::families::compiler::{
     BlockOrder, CompiledBlock, CompiledBlocks, CompilerError, RowHessian, RowJacobianOperator,

@@ -1,4 +1,4 @@
-use crate::probability::normal_cdf;
+use gam_math::probability::normal_cdf;
 use gam_runtime::resource::{ByteLruCache, ResidentBytes};
 use smallvec::{SmallVec, smallvec};
 use std::hash::{Hash, Hasher};
@@ -138,10 +138,10 @@ const INV_TWO_PI: f64 = 1.0 / std::f64::consts::TAU;
 /// (`src/gpu/cubic_cell/kernel_src.rs`) to embed as `__constant__` device
 /// memory. Linux-only because the kernel emitter is Linux-only.
 #[cfg(target_os = "linux")]
-pub(crate) const GL_NODES_FOR_GPU_KERNEL: &[f64; 384] = &GL_NODES;
+pub const GL_NODES_FOR_GPU_KERNEL: &[f64; 384] = &GL_NODES;
 /// Companion weights to [`GL_NODES_FOR_GPU_KERNEL`].
 #[cfg(target_os = "linux")]
-pub(crate) const GL_WEIGHTS_FOR_GPU_KERNEL: &[f64; 384] = &GL_WEIGHTS;
+pub const GL_WEIGHTS_FOR_GPU_KERNEL: &[f64; 384] = &GL_WEIGHTS;
 
 const GL_NODES: [f64; 384] = [
     -9.999_804_411_726_474e-1,
@@ -1548,7 +1548,7 @@ pub(crate) static CELL_MOMENT_REALLOCS: std::sync::atomic::AtomicUsize =
 /// the smooth arcsin-transformed integrand, ensuring the BVN value is exact to
 /// f64 precision for all (h, k, ρ) — and shared with the cubic-cell B-spline
 /// moment parity gate in [`crate::gpu_kernels::cubic_bspline_moments`].
-pub(crate) const GL20_NODES: [f64; 20] = [
+pub const GL20_NODES: [f64; 20] = [
     -0.993_128_599_185_094_9,
     -0.963_971_927_277_913_8,
     -0.912_234_428_251_326,
@@ -1572,7 +1572,7 @@ pub(crate) const GL20_NODES: [f64; 20] = [
 ];
 
 /// Companion weights to [`GL20_NODES`]. Symmetric, summing to 2.
-pub(crate) const GL20_WEIGHTS: [f64; 20] = [
+pub const GL20_WEIGHTS: [f64; 20] = [
     0.017_614_007_139_152_12,
     0.040_601_429_800_386_94,
     0.062_672_048_334_109_06,
@@ -4064,7 +4064,7 @@ pub fn evaluate_cell_moments_with_scratch<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::probability::normal_pdf;
+    use gam_math::probability::normal_pdf;
 
     /// Pointwise value of the cell THIRD-derivative integrand
     /// `(d3/dr ds dt) exp(-q(z))/2pi` at a single `z`, evaluated from the SAME
