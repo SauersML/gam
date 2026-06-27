@@ -796,8 +796,12 @@ pub(crate) struct CompressedActiveWorkingSet {
     pub(crate) original_active_count: usize,
 }
 
+// Visible at `pub` (with private fields) so it can appear in the signature of
+// the `pub` cross-crate `rank_reduce_rows_pivoted_qr_with_dependence`, which the
+// gam-custom-family rank-reduction tests call directly after the #1521 crate
+// carve. The fields stay private: external callers ignore the dependence return.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ActiveRowDependence {
+pub struct ActiveRowDependence {
     active_pos: usize,
     coeff: f64,
 }

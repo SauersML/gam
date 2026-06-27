@@ -50,10 +50,10 @@ pub mod rho_uncertainty;
 pub mod residual_cascade;
 pub mod rho_optimizer;
 // The `#[macro_export]` error-bail macros live in `gam-problem` (its crate
-// root). Importing them here makes `crate::bail_invalid_estim!` /
-// `crate::bail_dim_custom!` resolve at every gam-solve call site exactly as
-// they did when these macros lived at the monolith crate root.
-pub(crate) use gam_problem::{bail_dim_custom, bail_invalid_estim};
+// root). Importing `bail_invalid_estim` here makes `crate::bail_invalid_estim!`
+// resolve at every gam-solve call site exactly as it did when these macros
+// lived at the monolith crate root.
+pub(crate) use gam_problem::bail_invalid_estim;
 pub mod row_measure;
 pub mod row_sampling_measure;
 pub mod seeding;
